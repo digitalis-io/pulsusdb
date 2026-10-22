@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn a_statement_keeps_final_only_when_it_numbers() {
         let cfg = TraceReadConfig {
-            spans_v2_table: "spans".to_string(),
+            spans_table: "spans".to_string(),
             error_spans_table: "error_spans".to_string(),
             traces_table: "traces".to_string(),
             resources_table: "resources".to_string(),
@@ -327,7 +327,7 @@ mod tests {
             for nested in [false, true] {
                 for skip in [false, true] {
                     let cfg = TraceReadConfig {
-                        spans_v2_table: "spans".to_string(),
+                        spans_table: "spans".to_string(),
                         error_spans_table: "error_spans".to_string(),
                         traces_table: "traces".to_string(),
                         resources_table: "resources".to_string(),

@@ -4,7 +4,7 @@
 //! (`/api/v2/search/tags`, `/api/v2/search/tag/{tag}/values`)
 //! tag-discovery reshapings, plus the constant `/api/echo`. The
 //! reshapings are in-memory projections over the SAME single
-//! `trace_tag_catalog` read the native §4.3 handlers perform
+//! catalog read the native §4.3 handlers perform
 //! (`engine_for` + `list_tag_names`/`list_tag_values` — zero extra query
 //! work); param parsing is shared with the native handlers
 //! (`params.rs`), so alias error behavior (bogus scope 400, empty key

@@ -227,10 +227,9 @@ impl Date {
     }
 
     /// The UTC start-of-day containing `timestamp_ns` — the per-**day**
-    /// floor `trace_attrs_idx.date` needs (docs/schemas.md §4.1:
-    /// `PARTITION BY date` is daily, unlike `log_streams.month`'s monthly
-    /// [`Date::start_of_month_utc`] floor; issue #54 task-manager
-    /// adjudication #1). Same representability contract as
+    /// floor a daily partition needs (`resources.day` and `traces.day`,
+    /// docs/schemas.md §4.1, unlike `log_streams.month`'s monthly
+    /// [`Date::start_of_month_utc`] floor; issue #54). Same representability contract as
     /// [`Date::start_of_month_utc`]: returns `None` when the day count
     /// falls outside the `u16` `Date` range (before 1970-01-01 or after
     /// 2149-06-06) rather than clamping it, so the caller rejects the record
@@ -274,7 +273,7 @@ impl Date {
     /// [`Date::start_of_day_utc`], additionally rejecting days past
     /// [`Date::LAST_DATETIME_SAFE_DAY`] — for tables whose delete-TTL
     /// evaluates the row timestamp in the 32-bit `DateTime` domain
-    /// (`trace_spans` / `trace_attrs_idx`, docs/schemas.md §4.1, issue
+    /// (`spans` and `log_samples`, `schema/schema.sql`, issue
     /// #131): a day in `49_710..=65_535` partitions correctly (inside the
     /// `Date` range) but its TTL seconds value exceeds `u32::MAX`, so the
     /// caller must reject the record rather than store it with a

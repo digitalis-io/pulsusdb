@@ -388,7 +388,7 @@ async fn explain_lines(client: &ChClient, sql: &str) -> Vec<String> {
 /// sections (each of which reports its own `Granules` line). `None` when
 /// the query prunes so completely that no `Granules` line survives; both
 /// `None` and `Some(0)` mean "zero granules read" (the `last_granules`
-/// parser precedent, live_traces.rs).
+/// parser precedent).
 fn last_selected_granules(plan: &[String]) -> Option<u64> {
     plan.iter()
         .rev()

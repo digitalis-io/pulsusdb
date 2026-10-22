@@ -36,11 +36,11 @@
 //! record of the sender's type (`pulsus_read::TagValue`). Reporting
 //! `string` invents nothing and is what those rows already reported for
 //! non-numeric text. The window has no end on its
-//! own: `trace_tag_catalog` has NO TTL, so legacy rows never age out. It
+//! own: `tag_values` has NO TTL, so legacy rows never age out. It
 //! closes when
 //!
 //! ```sql
-//! SELECT count() FROM trace_tag_catalog WHERE val_type = ''
+//! SELECT count() FROM tag_values WHERE val_type = ''
 //! ```
 //!
 //! returns `0` on every deployment — at which point the empty-`val_type`
@@ -749,7 +749,8 @@ mod tests {
 
     /// AC4's renderer half: one key at two types is TWO entries. The
     /// sorting-key half — that both rows survive the merge at all — is
-    /// gated live in `crates/pulsus-schema/tests/live_traces.rs`.
+    /// held by `tag_values`' sorting key, which ends in `val_type`
+    /// (`crates/pulsus-read/tests/traces_tags_explain.rs`).
     #[test]
     fn one_value_at_two_types_renders_two_entries() {
         let values = tag_values(&[("8080", "int"), ("8080", "string")], false);

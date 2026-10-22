@@ -5,9 +5,9 @@
 //! to drift.
 //!
 //! **Every timestamp of a corpus this module PUSHES is derived from the
-//! clock at push time, and that is not a style preference.** `trace_spans`
-//! and `trace_attrs_idx` carry `TTL … + INTERVAL {{retention_days}} DAY
-//! DELETE` with `ttl_only_drop_parts = 1` while `trace_tag_catalog`
+//! clock at push time, and that is not a style preference.** `spans`
+//! carries `TTL … + INTERVAL {{retention_days}} DAY
+//! DELETE` with `ttl_only_drop_parts = 1` while `tag_values`
 //! carries none, so a corpus older than retention is HALF visible: every
 //! tag-values assertion still passes off the catalog while the span rows
 //! are dropped at insert time. There is no grace window, it behaves

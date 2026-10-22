@@ -49,16 +49,16 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 31 tables, 26 views, and
+/// The inventory, single-node: one database, 25 tables, 22 views, and
 /// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
 /// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 58, "statement count");
+    assert_eq!(stmts.len(), 48, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
-    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 31);
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 26);
+    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 25);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 22);
 
     let text = rendered(&single());
     assert!(
@@ -87,18 +87,18 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     assert!(text.contains("non_replicated_deduplication_window = 10000"));
 }
 
-/// The inventory, clustered: the same statements plus 19 `_dist` wrappers,
+/// The inventory, clustered: the same statements plus 14 `_dist` wrappers,
 /// `ON CLUSTER` on every one, and the macros intact.
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 77, "statement count");
+    assert_eq!(stmts.len(), 62, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        50,
-        "31 tables + 19 wrappers"
+        39,
+        "25 tables + 14 wrappers"
     );
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 26);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 22);
 
     let text = rendered(&clustered());
     assert!(
@@ -107,22 +107,22 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        77,
+        62,
         "every statement carries ON CLUSTER"
     );
 
     // `{shard}` and `{replica}` are the server's own macros and must arrive
-    // literally. 24 tables take a per-shard replica set and 7 take the
-    // cluster-wide one, so 31 paths name `{replica}` and 24 name `{shard}`.
+    // literally. 19 tables take a per-shard replica set and 6 take the
+    // cluster-wide one, so 25 paths name `{replica}` and 19 name `{shard}`.
     assert_eq!(
         text.matches("{shard}").count(),
-        24,
+        19,
         "per-shard replica sets"
     );
-    assert_eq!(text.matches("{replica}").count(), 31, "replicated tables");
+    assert_eq!(text.matches("{replica}").count(), 25, "replicated tables");
     assert_eq!(
         text.matches("/clickhouse/tables/all/").count(),
-        7,
+        6,
         "cluster-wide replica sets"
     );
     assert!(
@@ -178,7 +178,7 @@ fn every_replication_path_names_the_table_of_its_own_create() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 31, "every replicated table's path was checked");
+    assert_eq!(checked, 25, "every replicated table's path was checked");
 }
 
 /// The splitter the script relies on: a statement ends at a line whose last
@@ -358,7 +358,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 31);
+    assert_eq!(on_tables, 25);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -399,10 +399,8 @@ fn the_configured_values_reach_the_statements() {
     assert!(text.contains("replicated_deduplication_window = 21"));
     assert!(text.contains("replicated_deduplication_window = 22"));
     assert!(text.contains("replicated_deduplication_window = 23"));
-    // No table may hard-code the default window instead of the token.
-    // `trace_recent` and `trace_error_spans` did, with the non-replicated
-    // setting name on both variants, so a configured window never reached
-    // them and a clustered deployment carried a name its engine ignores.
+    // No table may hard-code the default window instead of the token: a
+    // configured window would never reach it.
     assert!(
         !text.contains("deduplication_window = 10000"),
         "a table hard-codes the default deduplication window: {}",
@@ -635,12 +633,8 @@ fn each_view_reads_its_landing_table_under_its_discriminator() {
             "structured_metadata",
         ]
     );
-    let trace_spans = pulsus_schema::table_column_names("trace_spans").expect("trace_spans");
-    assert!(
-        !trace_spans
-            .iter()
-            .any(|c| c.starts_with(char::is_uppercase))
-    );
+    let spans = pulsus_schema::table_column_names("spans").expect("spans");
+    assert!(!spans.iter().any(|c| c.starts_with(char::is_uppercase)));
 }
 
 // ---------------------------------------------------------------------------
@@ -757,8 +751,8 @@ fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
     let no_wrapper = tables_without_a_wrapper();
     assert_eq!(
         no_wrapper.len(),
-        12,
-        "three landing tables, the label values, `service_edges` and seven cluster-wide ones: \
+        11,
+        "three landing tables, the label values, `service_edges` and six cluster-wide ones: \
          {no_wrapper:?}"
     );
     let all = tables();
@@ -804,7 +798,7 @@ fn the_trace_sharding_key_passage_names_every_routed_trace_table() {
         .collect();
     assert_eq!(
         routed.len(),
-        8,
+        3,
         "every trace base table but the landing one is routed: {routed:?}"
     );
     for (name, anchor) in [
@@ -934,9 +928,8 @@ fn the_citing_clustering_passages_name_the_section_holding_the_list() {
 /// Chaining one such view onto another's target would count every row
 /// twice, and the server would accept it without comment.
 ///
-/// The sources are pinned as a set too: twenty views read a landing
-/// table, three read `trace_spans` and one reads `trace_attrs_idx` — both
-/// of which the writer fills directly and no view targets.
+/// The sources are pinned as a set too: every insert-triggered view reads a
+/// landing table, which the writers fill directly and no view targets.
 ///
 /// **V1 (issue #599): the one refreshable view is named, not exempted.**
 /// `service_edges_mv` runs on a schedule rather than on an insert, and it
@@ -1010,7 +1003,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
             sources.extend(own);
         }
     }
-    assert_eq!(targets.len(), 26, "twenty-six views");
+    assert_eq!(targets.len(), 22, "twenty-two views");
     assert_eq!(
         refreshable,
         vec![(
@@ -1027,13 +1020,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
     distinct.dedup();
     assert_eq!(
         distinct,
-        vec![
-            "log_landing",
-            "metric_landing",
-            "trace_attrs_idx",
-            "trace_landing",
-            "trace_spans",
-        ],
+        vec!["log_landing", "metric_landing", "trace_landing"],
         "an insert-triggered view reads a table outside the pinned source set"
     );
     for source in &sources {
@@ -1045,7 +1032,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
     }
 }
 
-/// **The cluster-wide replica set is exactly these seven tables.** A data
+/// **The cluster-wide replica set is exactly these six tables.** A data
 /// table given an `/all/` path would make every shard a replica of one
 /// table and silently collapse the cluster to one shard's worth of data.
 #[test]
@@ -1065,7 +1052,6 @@ fn the_cluster_wide_replica_set_is_exactly_the_catalog_tables() {
             "tag_bucket_values",
             "tag_names",
             "tag_values",
-            "trace_tag_catalog",
         ],
         "the shard-less `/clickhouse/tables/all/` path belongs to the catalog \
          tables alone (docs/architecture.md §3)"
@@ -1638,7 +1624,8 @@ SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_rows_to_read = 6000
 /// uncopied entries counted and listed, at most 10,000) and the replica not
 /// under repair for both tables, then each table's queue read entry by entry from
 /// Keeper, and the watermark read only when `service_edges`' queue holds
-/// nothing but merges. Its lines carry the `--@cluster` prefix, which the
+/// nothing but merges and fetches or attaches of parts the replica holds.
+/// Its lines carry the `--@cluster` prefix, which the
 /// render strips with the indentation after it.
 const SERVICE_EDGES_HEAD: &str = r#"AS WITH (SELECT groupArray((replica_path, log_pointer > log_max_index OR (log_pointer = 0 AND log_max_index = 0), zookeeper_path, log_pointer)) FROM system.replicas WHERE database = 'pulsus' AND table IN ('spans', 'service_edges')) AS logs,
 (SELECT groupArray((name, numChildren, value)) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.1, logs))) AND name IN ('queue', 'is_lost')) AS nodes,
@@ -1646,14 +1633,16 @@ const SERVICE_EDGES_HEAD: &str = r#"AS WITH (SELECT groupArray((replica_path, lo
 (SELECT groupArray((toUInt64OrZero(substring(name, 5)), ctime, extract(value, '^format version: \\d+\ncreate_time: [^\n]*\nsource replica: [^\n]*\nblock_id: [^\n]*\n(?:log_entry_id: [^\n]*\n)?([A-Za-z_]+)\n'), extract(value, '\nsource replica: ([^\n]*)\n'))) FROM (SELECT name, ctime, value FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.3 || '/log', arrayFilter(x -> position(x.1, '.spans/') > 0 AND NOT x.2 AND length(loglen) = 1 AND loglen[1].2 <= 10000, logs)))) LIMIT 10001) SETTINGS max_execution_time = 10) AS logents,
 length(logs) = 2 AND arrayAll(x -> x.2 OR (position(x.1, '.spans/') > 0 AND length(loglen) = 1 AND loglen[1].2 <= 10000 AND length(logents) <= 10000), logs) AND arrayCount(n -> n.1 = 'is_lost' AND n.3 = '0', nodes) = 2 AND arrayCount(n -> n.1 = 'queue' AND n.2 <= 1000, nodes) = 2 AS listable,
 (SELECT groupArray((position(path, '.service_edges/') > 0, extract(value, '^format version: \\d+\ncreate_time: [^\n]*\nsource replica: [^\n]*\nblock_id: [^\n]*\n(?:log_entry_id: [^\n]*\n)?([A-Za-z_]+)\n'), parseDateTimeBestEffortOrZero(extract(value, '\ncreate_time: ([^\n]*)\n'), serverTimezone()), extract(value, '\n(?:get|attach)\n([^\n]+)'), extract(value, '\nsource replica: ([^\n]*)\n'))) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.1 || if(listable, '/queue', '/log_pointer'), logs))) SETTINGS max_execution_time = 10) AS entries,
-listable AND arrayCount(e -> e.1, entries) <= 1000 AND arrayCount(e -> NOT e.1, entries) <= 1000 AND arrayAll(e -> NOT e.1 OR e.2 = 'merge', entries) AS edges_ok,
+(SELECT groupArray((partition_id, min_block_number, max_block_number)) FROM system.parts WHERE database = 'pulsus' AND table = 'service_edges' AND active AND has(arrayMap(e -> extract(e.4, '^([^_]+)_[0-9]+_[0-9]+_[0-9]+(?:_[0-9]+)?$'), arrayFilter(e -> e.1, entries)), partition_id)) AS local_edges,
+listable AND arrayCount(e -> e.1, entries) <= 1000 AND arrayCount(e -> NOT e.1, entries) <= 1000 AND arrayAll(e -> NOT e.1 OR e.2 = 'merge' OR (e.2 IN ('get', 'attach') AND e.5 != '' AND arrayExists(p -> p.1 = extract(e.4, '^([^_]+)_[0-9]+_[0-9]+_[0-9]+(?:_[0-9]+)?$') AND p.2 <= toInt64OrZero(extract(e.4, '^[^_]+_([0-9]+)_')) AND toInt64OrZero(extract(e.4, '^[^_]+_[0-9]+_([0-9]+)_')) <= p.3, local_edges)), entries) AS edges_ok,
 (SELECT arraySort(groupArray(minute)) FROM merge('pulsus', '^service_edges$') FINAL WHERE conn_type = '' AND edges_ok) AS ms,
 "#;
 
 /// The clustered view's replica barrier (part C §3), in place of the
 /// single-node `hi` line: a run pairs an empty range and writes no marker
 /// unless every `spans` entry queued on this replica is a merge, a fetch
-/// or an attach of a part it already holds, or a fetch an insert queued at
+/// or an attach of rows it already holds — in the same part or in one that
+/// has since merged it — or a fetch an insert queued at
 /// least 10 s after the interval became eligible, and every uncopied
 /// `spans` log entry is a merge or an insert's fetch committed to the log
 /// at least 10 s after that eligibility. Its lines carry the
@@ -1661,8 +1650,8 @@ listable AND arrayCount(e -> e.1, entries) <= 1000 AND arrayCount(e -> NOT e.1, 
 /// it.
 const SERVICE_EDGES_BARRIER: &str = r#"
 least(ready, lo + INTERVAL 5 MINUTE) AS hi0,
-(SELECT groupArray(name) FROM system.parts WHERE database = 'pulsus' AND table = 'spans' AND active AND has(arrayMap(e -> e.4, entries), name)) AS local_named,
-edges_ok AND arrayAll(x -> x.2 OR arrayAll(e -> e.1 < x.4 OR e.3 = 'merge' OR (e.3 = 'get' AND e.4 != '' AND e.2 >= hi0 + INTERVAL 3 MINUTE + INTERVAL 10 SECOND), logents), logs) AND arrayAll(e -> e.1 OR e.2 = 'merge' OR (e.2 IN ('get', 'attach') AND e.5 != '' AND e.4 != '' AND toUnixTimestamp(e.3) > 0 AND (has(local_named, e.4) OR (e.2 = 'get' AND e.3 >= hi0 + INTERVAL 3 MINUTE + INTERVAL 10 SECOND))), entries) AS caught_up,
+(SELECT groupArray((partition_id, min_block_number, max_block_number)) FROM system.parts WHERE database = 'pulsus' AND table = 'spans' AND active AND has(arrayMap(e -> extract(e.4, '^([^_]+)_[0-9]+_[0-9]+_[0-9]+(?:_[0-9]+)?$'), arrayFilter(e -> NOT e.1, entries)), partition_id)) AS local_named,
+edges_ok AND arrayAll(x -> x.2 OR arrayAll(e -> e.1 < x.4 OR e.3 = 'merge' OR (e.3 = 'get' AND e.4 != '' AND e.2 >= hi0 + INTERVAL 3 MINUTE + INTERVAL 10 SECOND), logents), logs) AND arrayAll(e -> e.1 OR e.2 = 'merge' OR (e.2 IN ('get', 'attach') AND e.5 != '' AND e.4 != '' AND toUnixTimestamp(e.3) > 0 AND (arrayExists(p -> p.1 = extract(e.4, '^([^_]+)_[0-9]+_[0-9]+_[0-9]+(?:_[0-9]+)?$') AND p.2 <= toInt64OrZero(extract(e.4, '^[^_]+_([0-9]+)_')) AND toInt64OrZero(extract(e.4, '^[^_]+_[0-9]+_([0-9]+)_')) <= p.3, local_named) OR (e.2 = 'get' AND e.3 >= hi0 + INTERVAL 3 MINUTE + INTERVAL 10 SECOND))), entries) AS caught_up,
 if(caught_up, hi0, lo) AS hi,
 "#;
 

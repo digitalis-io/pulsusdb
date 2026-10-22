@@ -1,11 +1,7 @@
 //! The trace landing table, its five views and the five tables they
 //! maintain, against a real ClickHouse server (issues #584 to #586).
 //!
-//! `live_traces.rs` is the **old** two-table trace schema's suite and stays
-//! green: the reads that have not moved still answer from `trace_spans` and
-//! `trace_attrs_idx`, and no case here compares the two stores.
-//!
-//! Gated behind `PULSUS_TEST_CLICKHOUSE=1`, mirroring `live_traces.rs`:
+//! Gated behind `PULSUS_TEST_CLICKHOUSE=1`:
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \

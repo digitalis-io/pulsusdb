@@ -340,9 +340,8 @@ fn looks_like_path(s: &str) -> bool {
 }
 
 /// The file extensions a pointer in these documents names.
-const POINTER_EXTENSIONS: [&str; 15] = [
-    "go", "md", "mod", "proto", "rs", "sh", "sql", "test", "toml", "tpl", "ts", "tsx", "y", "yaml",
-    "yml",
+const POINTER_EXTENSIONS: [&str; 14] = [
+    "go", "md", "mod", "proto", "rs", "sql", "test", "toml", "tpl", "ts", "tsx", "y", "yaml", "yml",
 ];
 
 fn digits_at(s: &str) -> (String, usize) {

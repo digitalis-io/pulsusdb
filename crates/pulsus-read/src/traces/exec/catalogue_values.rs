@@ -59,7 +59,7 @@ impl TraceEngine {
             let w = WindowSql::start_closed_end_open(s, e);
             let ctx = PredicateCtx {
                 window: w,
-                spans_table: &self.config.spans_v2_table,
+                spans_table: &self.config.spans_table,
                 resources_table: &self.config.resources_table,
                 indexed: &[],
             };
@@ -121,13 +121,13 @@ impl TraceEngine {
             let w = WindowSql::start_closed_end_open(s, e);
             let ctx = PredicateCtx {
                 window: w,
-                spans_table: &self.config.spans_v2_table,
+                spans_table: &self.config.spans_table,
                 resources_table: &self.config.resources_table,
                 indexed: &[],
             };
             let edge_n = req.narrowing(&ctx);
             edges.push(resource_edge_sql(
-                &self.config.spans_v2_table,
+                &self.config.spans_table,
                 w,
                 edge_n.predicate(),
             ));

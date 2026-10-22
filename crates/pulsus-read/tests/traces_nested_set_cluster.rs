@@ -224,7 +224,7 @@ async fn count(client: &ChClient, sql: &str) -> u64 {
 fn config() -> pulsus_read::TraceReadConfig {
     pulsus_read::TraceReadConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
-        spans_v2_table: "spans_dist".to_string(),
+        spans_table: "spans_dist".to_string(),
         error_spans_table: "error_spans_dist".to_string(),
         traces_table: "traces_dist".to_string(),
         resources_table: "resources".to_string(),
@@ -1028,7 +1028,7 @@ async fn a_compare_top_n_is_ranked_over_every_shard() {
     );
     let read = config();
     let tables = StatementTables {
-        spans: &read.spans_v2_table,
+        spans: &read.spans_table,
         error_spans: &read.error_spans_table,
         resources: &read.resources_table,
         traces: &read.traces_table,
@@ -1333,7 +1333,7 @@ async fn the_service_graph_answers_over_two_shards() {
                 .await
                 .expect("connect the reader"),
             pulsus_read::TraceReadConfig {
-                spans_v2_table: "spans_q".to_string(),
+                spans_table: "spans_q".to_string(),
                 error_spans_table: "error_spans_q".to_string(),
                 ..config()
             },

@@ -5877,7 +5877,7 @@ async fn the_detail_read_does_not_re_scan_the_window() {
 fn engine_config() -> pulsus_read::TraceReadConfig {
     pulsus_read::TraceReadConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
-        spans_v2_table: "spans".to_string(),
+        spans_table: "spans".to_string(),
         error_spans_table: "error_spans".to_string(),
         traces_table: "traces".to_string(),
         resources_table: "resources".to_string(),

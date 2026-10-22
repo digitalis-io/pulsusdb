@@ -36,16 +36,16 @@ pub struct GraphTargetRow {
     pub engine_full: String,
 }
 
-/// One `trace_tag_catalog` row of the §4.3 tag-names read
-/// (`tags_sql::tag_names_sql` — `SELECT DISTINCT scope, key`, issue #58).
+/// One `tag_names` row of the §4.3 tag-names read
+/// (`spans::tags::tag_names_sql` — `SELECT DISTINCT scope, key`, issue #58).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct TagNameRow {
     pub scope: String,
     pub key: String,
 }
 
-/// One `trace_spans` row of the §4.3 span-NAME values read
-/// (`tags_sql::span_name_values_sql` — `SELECT DISTINCT <capped name> AS
+/// One `spans` row of the §4.3 span-NAME values read
+/// (the span-name statement — `SELECT DISTINCT <capped name> AS
 /// val`, issue #478). One column: the type is not read from the store,
 /// because a span name is a `String` column and is always reported
 /// `string`.
@@ -63,8 +63,8 @@ pub struct CatalogValuesRow {
     pub vals: Vec<(String, String)>,
 }
 
-/// One `trace_tag_catalog` row of the §4.3 tag-values read
-/// (`tags_sql::tag_values_sql` — `SELECT DISTINCT val, val_type`, issues
+/// One `tag_values` row of the §4.3 tag-values read
+/// (`spans::tags::tag_values_sql` — `SELECT DISTINCT val, val_type`, issues
 /// #58 and #476). Field order matches the SELECT list exactly (RowBinary
 /// is positional).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]

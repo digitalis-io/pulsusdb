@@ -5,7 +5,7 @@
 //! Every answer here is a compile-time list derived from
 //! `pulsus_traceql`'s own enums — no state, no I/O, and in particular
 //! **no ClickHouse query**. That is the point of the module rather than
-//! an incidental property: `trace_tag_catalog` has no row for a value
+//! an incidental property: `tag_values` has no row for a value
 //! that exists by definition rather than by observation, so a store read
 //! for `status` or `kind` answers with whatever attribute happens to
 //! carry that key. Bypassing the catalog is what makes the answer right;
@@ -15,7 +15,7 @@
 //! **The converse case, and why it is not served here** (issue #478).
 //! `name`'s values exist by OBSERVATION, so an empty static list was the
 //! wrong answer for it in the other direction: the dropdown had nothing to
-//! offer. It is served from `trace_spans` instead — not from the catalog,
+//! offer. It is served from `spans` instead — not from the catalog,
 //! which holds no span-`name` row at all — and
 //! `traces_api::tags::tag_value_source` is the exhaustive dispatch that
 //! decides which intrinsic goes where.
@@ -54,7 +54,7 @@ pub(crate) fn intrinsic_scope_tags() -> &'static [&'static str] {
 ///
 /// **`name` no longer reaches this function** (issue #478). It is the one
 /// intrinsic whose values are observed rather than defined, and it is
-/// served from `trace_spans` — `traces_api::tags::tag_value_source` is
+/// served from `spans` — `traces_api::tags::tag_value_source` is
 /// the exhaustive dispatch that decides. Calling this with
 /// `Intrinsic::Name` still answers an empty list, which is what it always
 /// did; nothing routes here to do so any more.

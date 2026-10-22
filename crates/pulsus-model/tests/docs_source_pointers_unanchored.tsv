@@ -758,6 +758,9 @@ docs/query-lowering.md	plan.rs:3634	ambiguous_basename
 docs/query-lowering.md	plan.rs:3643	ambiguous_basename
 docs/query-lowering.md	plan.rs:3672	ambiguous_basename
 docs/query-lowering.md	plan.rs:4084	ambiguous_basename
+docs/query-lowering.md	schema/schema.sql:419	pinned_to_another_version
+docs/query-lowering.md	schema/schema.sql:431	pinned_to_another_version
+docs/query-lowering.md	schema/schema.sql:631	pinned_to_another_version
 docs/query-lowering.md	search_eval.rs:2226	not_in_this_repository
 docs/query-lowering.md	search_eval.rs:2443	not_in_this_repository
 docs/query-lowering.md	search_eval.rs:2464	not_in_this_repository
@@ -865,6 +868,7 @@ docs/query-to-sql.md	docs/query-lowering.md:794	no_name_the_target_file_holds
 docs/query-to-sql.md	docs/query-lowering.md:795	no_name_the_target_file_holds
 docs/query-to-sql.md	docs/query-lowering.md:829-830	no_name_the_target_file_holds
 docs/query-to-sql.md	docs/query-lowering.md:854-860	no_name_the_target_file_holds
+docs/query-to-sql.md	docs/schemas.md:1110	pinned_to_another_version
 docs/query-to-sql.md	escape.rs:100	no_name_the_target_file_holds
 docs/query-to-sql.md	escape.rs:154-164	no_name_the_target_file_holds
 docs/query-to-sql.md	escape.rs:166-171	no_name_the_target_file_holds
@@ -963,7 +967,11 @@ docs/query-to-sql.md	query_lowering_doc_gate.rs:472	no_name_the_target_file_hold
 docs/query-to-sql.md	query_lowering_doc_gate.rs:545	no_name_the_target_file_holds
 docs/query-to-sql.md	querytext.rs:52	ambiguous_basename
 docs/query-to-sql.md	querytext.rs:53	ambiguous_basename
+docs/query-to-sql.md	schema/schema.sql:421	pinned_to_another_version
+docs/query-to-sql.md	schema/schema.sql:424	pinned_to_another_version
+docs/query-to-sql.md	schema/schema.sql:431	pinned_to_another_version
 docs/query-to-sql.md	schema/schema.sql:528	no_name_the_target_file_holds
+docs/query-to-sql.md	schema/schema.sql:572	pinned_to_another_version
 docs/query-to-sql.md	search_eval.rs:1227	not_in_this_repository
 docs/query-to-sql.md	search_eval.rs:2443	not_in_this_repository
 docs/query-to-sql.md	search_eval.rs:3143	not_in_this_repository
@@ -1082,7 +1090,6 @@ docs/reference-defects-we-do-not-copy.md	vendor/github.com/grafana/jsonparser/pa
 docs/reference-defects-we-do-not-copy.md	vendor/github.com/json-iterator/go/iter_skip.go:83-87	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	write_otlp_handler.go:132-138	not_in_this_repository
 docs/schemas.md	crates/pulsus-config/src/validate.rs:285-287	no_name_the_target_file_holds
-docs/schemas.md	docs/benchmarks/issue560-two-table-reads.sh:32	no_name_the_target_file_holds
 docs/schemas.md	labels.go:667-668	not_in_this_repository
 docs/schemas.md	pkg/distributor/distributor.go:697-722	pinned_to_another_version
 docs/schemas.md	pkg/loghttp/push/otlp.go:602-614	pinned_to_another_version
@@ -1230,13 +1237,13 @@ docs/traceql-schema-migration.md	crates/pulsus-write/tests/trace_ingest_roundtri
 docs/traceql-schema-migration.md	crates/pulsus-write/tests/trace_ingest_roundtrip.rs:291	pinned_to_another_version
 docs/traceql-schema-migration.md	docs/architecture.md:96	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	docs/schemas.md:1034	no_name_the_target_file_holds
+docs/traceql-schema-migration.md	docs/schemas.md:1131	pinned_to_another_version
 docs/traceql-schema-migration.md	docs/schemas.md:395-462	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	docs/schemas.md:425	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	docs/schemas.md:456	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	docs/schemas.md:496	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	docs/schemas.md:520	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	docs/schemas.md:748	no_name_the_target_file_holds
-docs/traceql-schema-migration.md	docs/schemas.md:857	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	docs/schemas.md:925	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	tempodb/encoding/vparquet4/block_traceql.go:128-151	pinned_to_another_version
 docs/traceql-schema-migration.md	tempodb/encoding/vparquet4/block_traceql.go:249-280	pinned_to_another_version

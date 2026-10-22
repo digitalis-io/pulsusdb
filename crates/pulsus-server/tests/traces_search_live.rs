@@ -3409,7 +3409,7 @@ async fn a_mixed_projection_reads_every_field_from_its_own_element() {
 // SEARCH does.
 //
 // Until this change a metrics filter lowered an attribute condition to
-// `(trace_id, span_id) [NOT] IN (SELECT … FROM trace_attrs_idx …)`, which
+// `(trace_id, span_id) [NOT] IN (SELECT …)` over the attribute index, which
 // matches a span when ANY of its attribute rows matches, while a search
 // tested the ONE element the span resolves to. So the two routes gave
 // different answers to the same filter on a span that repeats a key.

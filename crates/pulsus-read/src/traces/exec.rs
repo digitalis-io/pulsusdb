@@ -120,7 +120,7 @@ const CODE_MEMORY_LIMIT_EXCEEDED: i32 = 241;
 ///
 /// **Issue #559 removed the surface this used to name.** Until then the
 /// metrics FILTER lowered an attribute condition to
-/// `(trace_id, span_id) [NOT] IN (SELECT … FROM trace_attrs_idx …)` and
+/// `(trace_id, span_id) [NOT] IN (SELECT …)` over the attribute index, and
 /// this code was that set overflowing; measured, 524,288 matching spans
 /// answered and 524,289 did not. The filter is now a predicate over the
 /// span row's own arrays, so a metrics query with an attribute condition
@@ -209,11 +209,11 @@ pub struct TraceReadConfig {
     /// and service-graph read uses (issue #587). The table co-shards on
     /// `cityHash64(trace_id)`; `_dist` when clustered, as every other read
     /// engine's config.
-    pub spans_v2_table: String,
+    pub spans_table: String,
     /// `error_spans{_dist}` — the error-span table (issue #601 part 4b):
     /// the search statement of a query
     /// [`super::spans::error_spans::admits`] reads it in place of
-    /// [`Self::spans_v2_table`]. Same `_dist` rule.
+    /// [`Self::spans_table`]. Same `_dist` rule.
     pub error_spans_table: String,
     /// `traces{_dist}` — the per-trace table the indexed fetch reads its
     /// bucket set and its extent from (issue #587). Same `_dist` rule.
@@ -745,9 +745,9 @@ impl TraceEngine {
         }
     }
 
-    /// Executes the §4.5 service-graph read (issue #173): one fully-pushed-
-    /// down two-level aggregation over the `trace_edges` half-row ledger —
-    /// per-side dedup, the within-`conn_type` `pair_id` equi-join, and the
+    /// Executes the §4.5 service-graph read (issues #173 and #599): one
+    /// statement over `service_edges` and `spans` (`spans::graph`) — the
+    /// pairing of client and server halves and the
     /// per-`(client, server, conn_type)` rollup all happen in ClickHouse; the
     /// engine only frames at most [`SERVICE_GRAPH_MAX_EDGES`]
     /// edges. The `LIMIT cap + 1` probe row (never returned) flips
@@ -795,7 +795,7 @@ impl TraceEngine {
         self.graph_target
             .0
             .get_or_try_init(|| async {
-                let table = &self.config.spans_v2_table;
+                let table = &self.config.spans_table;
                 let sql = super::spans::graph::graph_target_sql(table);
                 let mut stream = self
                     .dispatch
@@ -856,7 +856,7 @@ impl TraceEngine {
         let settings = fetch_settings(&self.config);
         let sql = span_fetch::indexed_fetch_sql(
             &self.config.traces_table,
-            &self.config.spans_v2_table,
+            &self.config.spans_table,
             &self.config.resources_table,
             hex32,
         );
@@ -979,8 +979,8 @@ impl TraceEngine {
     /// exactly the issue #58 catalog read — same SQL bytes, same
     /// [`catalog_settings`] budget, same one-part index-served cost — so a
     /// dropdown that narrows nothing costs what it always did. With at
-    /// least one term it becomes `attr_values_narrowed_sql` over
-    /// `trace_attrs_idx` intersected with the matching span set, carrying
+    /// least one term it becomes a read of `spans` narrowed to the
+    /// matching span set, carrying
     /// [`metrics_settings`] (the semi-join budget set, and
     /// `distributed_product_mode = 'local'` when clustered so the
     /// membership probe stays shard-local — both tables co-shard on
@@ -1004,7 +1004,7 @@ impl TraceEngine {
         let w = req.window();
         let ctx = PredicateCtx {
             window: w,
-            spans_table: &self.config.spans_v2_table,
+            spans_table: &self.config.spans_table,
             resources_table: &self.config.resources_table,
             indexed: &[],
         };
@@ -1041,10 +1041,10 @@ impl TraceEngine {
     /// Streams the §4.3 SPAN-NAME values read (issue #478 Part 1) —
     /// ALWAYS store-backed, never the catalog.
     ///
-    /// The catalog cannot answer this: `trace_tag_catalog_mv` selects from
-    /// `trace_attrs_idx` alone, so no span-`name` row exists in it. What a
+    /// The catalog cannot answer this: no span-`name` row exists in
+    /// `tag_values`. What a
     /// bare `name` lookup reached before was span EVENT names under a
-    /// reserved intrinsic scope; reading `trace_spans.name` is
+    /// reserved intrinsic scope; reading `spans.name` is
     /// structurally immune to that, because that column holds span names
     /// and nothing else.
     ///
@@ -1061,7 +1061,7 @@ impl TraceEngine {
         let w = req.window();
         let ctx = PredicateCtx {
             window: w,
-            spans_table: &self.config.spans_v2_table,
+            spans_table: &self.config.spans_table,
             resources_table: &self.config.resources_table,
             indexed: &[],
         };
@@ -1172,7 +1172,7 @@ impl TraceEngine {
         let spans = if super::spans::error_spans::admits(&request.query) {
             &self.config.error_spans_table
         } else {
-            &self.config.spans_v2_table
+            &self.config.spans_table
         };
         super::spans::search::plan_statement_sliced(
             request,
@@ -1343,7 +1343,7 @@ fn tag_values_statement(
 ) -> String {
     let vs = ValueScope::from_attr_scope(scope);
     narrowed_values_sql(
-        &config.spans_v2_table,
+        &config.spans_table,
         &config.resources_table,
         &config.traces_table,
         vs,
@@ -1368,7 +1368,7 @@ fn span_names_statement(
     n: &TagNarrowing,
 ) -> String {
     name_values_sql(
-        &config.spans_v2_table,
+        &config.spans_table,
         &config.traces_table,
         w,
         n,
@@ -1530,7 +1530,7 @@ fn fetch_route_and_second(
             FetchRoute::TruncatedSet,
             Some(span_fetch::wide_fetch_sql(
                 &config.traces_table,
-                &config.spans_v2_table,
+                &config.spans_table,
                 &config.resources_table,
                 hex32,
             )),
@@ -1544,7 +1544,7 @@ fn fetch_route_and_second(
         Some(window) => (
             FetchRoute::Fallback,
             Some(span_fetch::fallback_fetch_sql(
-                &config.spans_v2_table,
+                &config.spans_table,
                 &config.resources_table,
                 hex32,
                 window,
@@ -1979,7 +1979,7 @@ mod tests {
     #[test]
     fn trace_read_config_is_cloneable_and_debuggable() {
         let config = TraceReadConfig {
-            spans_v2_table: "spans".to_string(),
+            spans_table: "spans".to_string(),
             error_spans_table: "error_spans".to_string(),
             traces_table: "traces".to_string(),
             resources_table: "resources".to_string(),
@@ -1991,13 +1991,13 @@ mod tests {
             skip_unavailable_shards: false,
         };
         let clone = config.clone();
-        assert_eq!(clone.spans_v2_table, "spans");
-        assert!(format!("{config:?}").contains("spans_v2_table: \"spans\""));
+        assert_eq!(clone.spans_table, "spans");
+        assert!(format!("{config:?}").contains("spans_table: \"spans\""));
     }
 
     fn cfg() -> TraceReadConfig {
         TraceReadConfig {
-            spans_v2_table: "spans".to_string(),
+            spans_table: "spans".to_string(),
             error_spans_table: "error_spans".to_string(),
             traces_table: "traces".to_string(),
             resources_table: "resources".to_string(),

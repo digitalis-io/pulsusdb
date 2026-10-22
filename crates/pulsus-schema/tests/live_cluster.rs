@@ -41,17 +41,10 @@ static TEST_DB_DIST: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_dist");
 static TEST_DB_CATALOG: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_catalog");
-static TEST_DB_SPAN_ARRAYS: pulsus_testkit::TestDb =
-    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_span_arrays");
-// Issue #560: the two derived trace tables, clustered.
-static TEST_DB_DERIVED: pulsus_testkit::TestDb =
-    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_derived");
 // Issue #603: the two deduplication windows a clustered write-path table
 // carries.
 static TEST_DB_DEDUP_WINDOWS: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_dedup_windows");
-static TEST_DB_DERIVED_REPLAY: pulsus_testkit::TestDb =
-    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_derived_replay");
 static TEST_DB_DEDUP_PROFILE: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_dedup_profile");
 // Issues #584 to #586: the trace landing table, its five targets and the two
@@ -263,11 +256,11 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         ("log_streams_idx_dist", LOGS_KEY),
         ("log_samples_dist", LOGS_KEY),
         ("log_metrics_5s_dist", LOGS_KEY),
-        ("trace_spans_dist", TRACES_KEY),
-        ("trace_attrs_idx_dist", TRACES_KEY),
-        // Service-graph edge ledger (M7-E1, issue #173): co-shards with the
-        // rest of the Traces family on `cityHash64(trace_id)`.
-        ("trace_edges_dist", TRACES_KEY),
+        // The trace family's three routed targets (issues #586, #602):
+        // every span of a trace on one shard, `cityHash64(trace_id)`.
+        ("spans_dist", TRACES_KEY),
+        ("traces_dist", TRACES_KEY),
+        ("error_spans_dist", TRACES_KEY),
     ];
     for (table, sharding_expr) in dist_tables {
         assert!(
@@ -312,59 +305,24 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         assert!(ddl.contains(LOGS_KEY));
     }
 
-    let traces_dist = [
-        "trace_spans_dist",
-        "trace_attrs_idx_dist",
-        "trace_edges_dist",
-    ];
+    let traces_dist = ["spans_dist", "traces_dist", "error_spans_dist"];
     for t in traces_dist {
         let ddl = create_table_query(&shard1, &TEST_DB_DIST, t).await;
         assert!(ddl.contains(TRACES_KEY));
     }
 
-    // trace_tag_catalog is a Global catalog table (issue #53 adjudication):
-    // present on every shard, but never wrapped in a `_dist` table — tag
-    // reads serve from the local replica without fan-out.
+    // The trace tag catalogs are global (issue #586): present on every
+    // shard, never wrapped in a `_dist` table — tag reads serve from the local
+    // replica without fan-out.
     for names in [&names1, &names2] {
-        assert!(
-            names.contains(&"trace_tag_catalog".to_string()),
-            "trace_tag_catalog must exist on every shard: {names:?}"
-        );
-        assert!(
-            !names.contains(&"trace_tag_catalog_dist".to_string()),
-            "trace_tag_catalog must NOT have a _dist wrapper: {names:?}"
-        );
-    }
-
-    // Issue #476, and this is the ONLY place it can be checked. Migration
-    // 41's `ADD COLUMN … , MODIFY ORDER BY …` runs `ON CLUSTER` against
-    // the `Replicated*` engine, which a single local ClickHouse cannot
-    // even create (it refuses without ZooKeeper), so nothing about the
-    // clustered form of that ALTER is exercised anywhere else. Asserted on
-    // BOTH shards, and as two separate string comparisons per shard: the
-    // prune that serves every tag-values read depends on the primary key
-    // staying `scope, key, val`, and the two-types-per-value answer
-    // depends on `val_type` reaching the sorting key.
-    //
-    // Migration 40's `_dist` twin of the attribute index is covered by the
-    // same reasoning one table over: it is asserted here because the
-    // wrapper is created from a `CREATE … AS` that does not inherit the
-    // base table's ALTERs.
-    for (shard, label) in [(&shard1, "shard1"), (&shard2, "shard2")] {
-        let keys = table_keys(shard, &TEST_DB_DIST, "trace_tag_catalog").await;
-        assert_eq!(
-            keys.primary_key, "scope, key, val",
-            "{label}: the clustered ALTER must leave the primary key alone"
-        );
-        assert_eq!(
-            keys.sorting_key, "scope, key, val, val_type",
-            "{label}: the clustered ALTER must append val_type to the sorting key"
-        );
-        for table in ["trace_attrs_idx", "trace_attrs_idx_dist"] {
-            let ddl = create_table_query(shard, &TEST_DB_DIST, table).await;
+        for catalog in ["tag_names", "tag_values"] {
             assert!(
-                ddl.contains("val_type"),
-                "{label}: {table} must carry val_type after migrations 39/40: {ddl}"
+                names.contains(&catalog.to_string()),
+                "{catalog} must exist on every shard: {names:?}"
+            );
+            assert!(
+                !names.contains(&format!("{catalog}_dist")),
+                "{catalog} must NOT have a _dist wrapper: {names:?}"
             );
         }
     }
@@ -444,39 +402,8 @@ struct MetricMetadataRow {
 struct TraceTagRow {
     scope: String,
     key: String,
-    val: String,
-    /// Issue #476: the stored OTLP type. Read here as well as written so
-    /// the cross-shard identity check covers the new column rather than
-    /// agreeing on the three it already had.
+    value: String,
     val_type: String,
-}
-
-/// `system.tables`'s two key columns for one table on one shard (issue
-/// #476).
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct TableKeysRow {
-    primary_key: String,
-    sorting_key: String,
-}
-
-async fn table_keys(client: &ChClient, db: &str, table: &str) -> TableKeysRow {
-    let mut stream = client
-        .query_stream::<TableKeysRow>(
-            &format!(
-                "SELECT primary_key, sorting_key FROM system.tables \
-                 WHERE database = '{db}' AND name = '{table}'"
-            ),
-            &QuerySettings::new(),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("query system.tables for {db}.{table}: {e}"));
-    let row = stream
-        .next()
-        .await
-        .unwrap_or_else(|| panic!("{db}.{table} must exist"))
-        .expect("decode system.tables row");
-    drop(stream);
-    row
 }
 
 /// Reads `table` `FINAL` (bookkeeping/catalog tables are `ReplacingMergeTree`
@@ -535,7 +462,7 @@ where
 /// broken one.** A path whose `{shard}` macro was substituted away reaches
 /// the same validation point as a correct one on a single node, and only a
 /// keeper-backed cluster shows the difference: here `metric_metadata` and
-/// `trace_tag_catalog` must share a replica set while every per-shard table
+/// `tag_values` must share a replica set while every per-shard table
 /// must not.
 #[tokio::test]
 async fn the_catalog_tables_are_identical_on_every_shard() {
@@ -584,7 +511,7 @@ async fn the_catalog_tables_are_identical_on_every_shard() {
         "metric_metadata rows must be identical on every shard"
     );
 
-    // trace_tag_catalog (issue #53): the traces tag catalog joins the same
+    // tag_values (issue #586): the trace tag-value catalog joins the same
     // shard-less Global replica set — a row written while connected to
     // shard1 must read back identically from shard2 directly (no `_dist`
     // wrapper exists for it). Unlike metric_metadata (legitimately empty in
@@ -593,267 +520,44 @@ async fn the_catalog_tables_are_identical_on_every_shard() {
     shard1
         .execute(
             &format!(
-                "INSERT INTO {TEST_DB_CATALOG}.trace_tag_catalog \
-                     (scope, key, val, val_type) \
+                "INSERT INTO {TEST_DB_CATALOG}.tag_values \
+                     (scope, key, value, val_type) \
                  VALUES ('span', 'http.status_code', '500', 'int')"
             ),
             &QuerySettings::new(),
             Idempotency::NonIdempotent,
         )
         .await
-        .expect("insert trace_tag_catalog row via shard1");
+        .expect("insert tag_values row via shard1");
     let (tags1, tags2) = poll_until_matching(|| async {
         (
             bookkeeping_rows::<TraceTagRow>(
                 &shard1,
                 &TEST_DB_CATALOG,
-                "trace_tag_catalog",
-                "scope, key, val, val_type",
+                "tag_values",
+                "scope, key, value, val_type",
             )
             .await,
             bookkeeping_rows::<TraceTagRow>(
                 &shard2,
                 &TEST_DB_CATALOG,
-                "trace_tag_catalog",
-                "scope, key, val, val_type",
+                "tag_values",
+                "scope, key, value, val_type",
             )
             .await,
         )
     })
     .await;
-    assert!(
-        !tags1.is_empty(),
-        "trace_tag_catalog must have the inserted row"
-    );
+    assert!(!tags1.is_empty(), "tag_values must have the inserted row");
     assert_eq!(
         tags1, tags2,
-        "trace_tag_catalog rows must be identical on every shard"
+        "tag_values rows must be identical on every shard"
     );
-}
-
-/// The five span-attribute array columns and `attr_num` re-read as BITS.
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
-struct SpanArrayRow {
-    attr_key: Vec<String>,
-    attr_scope: Vec<String>,
-    attr_val: Vec<String>,
-    attr_type: Vec<String>,
-    attr_num_bits: Vec<Option<u64>>,
-}
-
-/// Issue #556 criterion 3, and this is the ONLY place it can be checked.
-/// Migrations 49-58's `_dist` twins run `ON CLUSTER` against the wrapper,
-/// which a single local ClickHouse never creates.
-///
-/// A `_dist` wrapper is created from a `CREATE ... AS` that does NOT
-/// inherit the base table's `ALTER`s, so without the five cluster-only
-/// twins the wrapper's attr columns are `[]` and an insert through it is
-/// `Code: 16 NO_SUCH_COLUMN_IN_TABLE`.
-///
-/// The read back is **polled**, 40 times at 250 ms, exactly as the
-/// `log_samples_dist` read-back above polls the same asynchronous
-/// forwarding. Not a precaution: a `Distributed` insert forwards
-/// asynchronously (`distributed_foreground_insert = 0`), so the read that
-/// follows it can legitimately see nothing.
-#[tokio::test]
-async fn span_attribute_arrays_round_trip_through_the_dist_wrapper() {
-    skip_unless_live!();
-    let shard1 = ChClient::new(shard1_config())
-        .await
-        .expect("connect shard1");
-    let shard2 = ChClient::new(shard2_config())
-        .await
-        .expect("connect shard2");
-
-    shard1
-        .execute(
-            &format!(
-                "DROP DATABASE IF EXISTS {TEST_DB_SPAN_ARRAYS} ON CLUSTER '{CLUSTER_NAME}' SYNC"
-            ),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop test database on cluster");
-    run_init(&shard1, &cluster_ctx(&TEST_DB_SPAN_ARRAYS))
-        .await
-        .expect("run_init (clustered)");
-
-    // The wrapper carries all five columns on BOTH shards.
-    let expected = vec![
-        "attr_key".to_string(),
-        "attr_num".to_string(),
-        "attr_scope".to_string(),
-        "attr_type".to_string(),
-        "attr_val".to_string(),
-    ];
-    for (shard, label) in [(&shard1, "shard1"), (&shard2, "shard2")] {
-        for table in ["trace_spans", "trace_spans_dist"] {
-            let sql = format!(
-                "SELECT name FROM system.columns WHERE database = '{TEST_DB_SPAN_ARRAYS}' \
-                 AND table = '{table}' AND name LIKE 'attr\\\\_%' ORDER BY name"
-            );
-            let mut stream = shard
-                .query_stream::<NameRow>(&sql, &QuerySettings::new())
-                .await
-                .expect("query system.columns");
-            let mut got = Vec::new();
-            while let Some(row) = stream.next().await {
-                got.push(row.expect("decode NameRow").name);
-            }
-            assert_eq!(
-                got, expected,
-                "{label}: {table} must carry the five array columns after migrations 49-58"
-            );
-        }
-    }
-
-    // The base table carries the constraint, and so does the wrapper: it is
-    // created `AS {{db}}.trace_spans`, which copies the whole declaration.
-    // That is new — the wrapper used to predate the `ALTER` that added the
-    // constraint, and a Distributed table refuses `ADD CONSTRAINT`, so the
-    // old build order left it without one. It costs nothing: the base
-    // enforces the same check on the same rows, and the round-trip below is
-    // what shows a valid span still lands through the wrapper.
-    let base_ddl = create_table_query(&shard1, &TEST_DB_SPAN_ARRAYS, "trace_spans").await;
-    let dist_ddl = create_table_query(&shard1, &TEST_DB_SPAN_ARRAYS, "trace_spans_dist").await;
-    for (label, ddl) in [("the base table", &base_ddl), ("the wrapper", &dist_ddl)] {
-        assert!(
-            ddl.contains("attr_arrays_aligned"),
-            "{label} must carry the constraint: {ddl}"
-        );
-    }
-
-    let now_ns = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos(),
-    )
-    .expect("fits i64");
-    let trace_hex = "0102030405060708090a0b0c0d0e0f10";
-    let insert = |arrays: &str| {
-        format!(
-            "INSERT INTO {TEST_DB_SPAN_ARRAYS}.trace_spans_dist \
-             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-              status_code, kind, payload_type, payload, \
-              attr_key, attr_scope, attr_val, attr_type, attr_num) \
-             VALUES (unhex('{trace_hex}'), unhex('0102030405060708'), \
-             unhex('0000000000000000'), 'n', 's', {now_ns}, 1, 0, 2, 1, '', {arrays})"
-        )
-    };
-
-    shard1
-        .execute(
-            &insert("['a','b'], ['span','link:intrinsic'], ['1','2'], ['int','string'], [1, NULL]"),
-            &QuerySettings::new(),
-            Idempotency::NonIdempotent,
-        )
-        .await
-        .expect("an aligned row must insert through the wrapper");
-
-    // Read back through the wrapper from the OTHER shard, polled.
-    let sql = format!(
-        "SELECT attr_key, attr_scope, attr_val, attr_type, \
-         arrayMap(x -> if(isNull(x), NULL, reinterpretAsUInt64(assumeNotNull(x))), attr_num) \
-         AS attr_num_bits \
-         FROM {TEST_DB_SPAN_ARRAYS}.trace_spans_dist WHERE trace_id = unhex('{trace_hex}')"
-    );
-    let mut got = None;
-    for _ in 0..40 {
-        let mut stream = shard2
-            .query_stream::<SpanArrayRow>(&sql, &QuerySettings::new())
-            .await
-            .expect("select the arrays via _dist from the other shard");
-        if let Some(row) = stream.next().await {
-            got = Some(row.expect("decode"));
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    assert_eq!(
-        got,
-        Some(SpanArrayRow {
-            attr_key: vec!["a".to_string(), "b".to_string()],
-            attr_scope: vec!["span".to_string(), "link:intrinsic".to_string()],
-            attr_val: vec!["1".to_string(), "2".to_string()],
-            attr_type: vec!["int".to_string(), "string".to_string()],
-            // The NULL stays at its OWN position; nothing is dropped.
-            attr_num_bits: vec![Some(1.0f64.to_bits()), None],
-        }),
-        "the arrays inserted via _dist must read back cluster-wide through _dist"
-    );
-
-    // A misaligned row through the wrapper is refused by the BASE table's
-    // constraint, and the refusal reaches the client. Asserted on the code
-    // and the constraint name only — the server appends the table's UUID
-    // and, on some insert paths, a wait-phase clause.
-    //
-    // `distributed_foreground_insert = 1` is load-bearing and is not a
-    // convenience. A `Distributed` insert forwards asynchronously by
-    // default, so whether the refusal reaches the client depends on WHICH
-    // shard the row is destined for, measured on this fixture at
-    // ClickHouse 26.3.29.7 with one misaligned row per sharding slot:
-    //
-    //     cityHash64(trace_id) % 2   destination    result at the client
-    //     0                          shard 1, local  HTTP 500, Code: 469
-    //     1                          shard 2, remote HTTP 200; the block is
-    //                                                queued and shard 2
-    //                                                refuses it later
-    //
-    // This row's `trace_id` is in the second class — deliberately, because
-    // the read-back above must cross a shard boundary to be worth making.
-    // Forwarding it in the foreground makes the base table's constraint run
-    // before the client is answered, so the assertion is about the
-    // constraint rather than about where the row happened to land.
-    let err = shard1
-        .execute(
-            &insert("['a','b'], ['span','span'], ['1','2'], ['int','int'], [1]"),
-            &QuerySettings::new().set("distributed_foreground_insert", 1),
-            Idempotency::NonIdempotent,
-        )
-        .await
-        .expect_err("a misaligned row must be refused through the wrapper");
-    match err {
-        pulsus_clickhouse::ChError::Server { code, ref message } => {
-            assert_eq!(code, 469, "VIOLATED_CONSTRAINT; got: {err}");
-            assert!(
-                message.contains("attr_arrays_aligned"),
-                "the refusal must name the constraint; got: {message}"
-            );
-        }
-        other => panic!("expected a server error, got: {other}"),
-    }
-
-    // And nothing of it landed: the aligned row is still the only one.
-    let sql = format!(
-        "SELECT name FROM {TEST_DB_SPAN_ARRAYS}.trace_spans_dist \
-         WHERE trace_id = unhex('{trace_hex}')"
-    );
-    let mut stream = shard1
-        .query_stream::<NameRow>(&sql, &QuerySettings::new())
-        .await
-        .expect("count the rows under this trace id");
-    let mut rows = 0usize;
-    while let Some(row) = stream.next().await {
-        row.expect("decode");
-        rows += 1;
-    }
-    assert_eq!(rows, 1, "the refused row must not be stored");
 }
 
 // ---------------------------------------------------------------------
-// Issue #560 — `trace_recent` and `trace_error_spans`, clustered
+// The two-shard topology the clustered cases assume
 // ---------------------------------------------------------------------
-
-/// The two trace ids issue #560's cluster tests write: measured,
-/// `cityHash64(toFixedString(unhex(id), 16)) % 2` is `0` for the first
-/// and `1` for the second, so the family's sharding key puts them on
-/// different shards.
-const DERIVED_TRACES: [&str; 2] = [
-    "00000000000000000000000000000001",
-    "00000000000000000000000000000003",
-];
 
 /// **The topology this suite claims, established rather than assumed.**
 ///
@@ -1126,21 +830,6 @@ async fn drop_cluster_db(shard1: &ChClient, db: &str) {
     .await;
 }
 
-/// Every one of `tables` exists in `db` on both shards; the missing ones
-/// are listed together.
-async fn assert_clustered_tables(shard1: &ChClient, shard2: &ChClient, db: &str, tables: &[&str]) {
-    let mut missing = Vec::new();
-    for (shard, label) in [(shard1, "shard1"), (shard2, "shard2")] {
-        let names = table_names(shard, db).await;
-        for t in tables {
-            if !names.iter().any(|n| n == t) {
-                missing.push(format!("{label}:{t}"));
-            }
-        }
-    }
-    assert!(missing.is_empty(), "missing clustered tables: {missing:?}");
-}
-
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct HexRow {
     id: String,
@@ -1173,28 +862,6 @@ async fn count_on(client: &ChClient, sql: &str) -> u64 {
     stream.next().await.expect("one row").expect("decode").n
 }
 
-/// The `INSERT` that writes one error span on each of the two traces
-/// through the span table's wrapper.
-fn derived_insert(db: &str, ts_ns: i64) -> String {
-    let values: Vec<String> = DERIVED_TRACES
-        .iter()
-        .enumerate()
-        .map(|(i, id)| {
-            format!(
-                "(unhex('{id}'), unhex('000000000000000{}'), unhex('0000000000000000'), 'op', \
-                 'svc', {}, 1000, 2, 2, 1, '')",
-                i + 1,
-                ts_ns + i as i64
-            )
-        })
-        .collect();
-    format!(
-        "INSERT INTO {db}.trace_spans_dist (trace_id, span_id, parent_id, name, service, \
-         timestamp_ns, duration_ns, status_code, kind, payload_type, payload) VALUES {}",
-        values.join(", ")
-    )
-}
-
 fn cluster_now_ns() -> i64 {
     i64::try_from(
         std::time::SystemTime::now()
@@ -1204,189 +871,6 @@ fn cluster_now_ns() -> i64 {
     )
     .expect("fits i64")
         - 3_600_000_000_000
-}
-
-/// Polls, 40 times at 250 ms, until every shard's local `trace_spans`
-/// holds at least one row (a `Distributed` insert forwards
-/// asynchronously; the flush before this makes it synchronous, and the
-/// poll covers the remainder).
-async fn wait_for_spans(shard1: &ChClient, shard2: &ChClient, db: &str) {
-    for _ in 0..40 {
-        let a = count_on(
-            shard1,
-            &format!("SELECT count() AS n FROM {db}.trace_spans"),
-        )
-        .await;
-        let b = count_on(
-            shard2,
-            &format!("SELECT count() AS n FROM {db}.trace_spans"),
-        )
-        .await;
-        if a > 0 && b > 0 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
-/// Issue #560 criterion 13: both wrappers exist, a clustered write lands
-/// each trace's derived rows on the shard that holds its spans, and each
-/// wrapper reads the union.
-#[tokio::test]
-async fn the_derived_trace_tables_are_written_per_shard_and_read_through_their_wrappers() {
-    skip_unless_live!();
-    let shard1 = ChClient::new(shard1_config())
-        .await
-        .expect("connect shard1");
-    let shard2 = ChClient::new(shard2_config())
-        .await
-        .expect("connect shard2");
-    let db: &str = &TEST_DB_DERIVED;
-    fresh_cluster_db(&shard1, db).await;
-    assert_clustered_tables(
-        &shard1,
-        &shard2,
-        db,
-        &[
-            "trace_recent",
-            "trace_recent_dist",
-            "trace_error_spans",
-            "trace_error_spans_dist",
-        ],
-    )
-    .await;
-
-    exec_on(&shard1, &derived_insert(db, cluster_now_ns())).await;
-    exec_on(
-        &shard1,
-        &format!("SYSTEM FLUSH DISTRIBUTED {db}.trace_spans_dist"),
-    )
-    .await;
-    wait_for_spans(&shard1, &shard2, db).await;
-
-    let mut failures: Vec<String> = Vec::new();
-    let mut shard_sets: Vec<Vec<String>> = Vec::new();
-    for (shard, label) in [(&shard1, "shard1"), (&shard2, "shard2")] {
-        let spans = trace_ids(shard, db, "trace_spans").await;
-        for table in ["trace_recent", "trace_error_spans"] {
-            let got = trace_ids(shard, db, table).await;
-            if got != spans {
-                failures.push(format!(
-                    "{label}: local {table} holds {got:?}, local trace_spans {spans:?}"
-                ));
-            }
-        }
-        shard_sets.push(spans);
-    }
-    let mut sorted = shard_sets.clone();
-    sorted.sort();
-    let want: Vec<Vec<String>> = DERIVED_TRACES
-        .iter()
-        .map(|id| vec![id.to_string()])
-        .collect();
-    if sorted != want {
-        failures.push(format!(
-            "the shards' local span sets are {shard_sets:?}, expected {want:?} in some order"
-        ));
-    }
-    let union: Vec<String> = DERIVED_TRACES.iter().map(|s| s.to_string()).collect();
-    for (shard, label) in [(&shard1, "shard1"), (&shard2, "shard2")] {
-        for table in ["trace_recent_dist", "trace_error_spans_dist"] {
-            let got = trace_ids(shard, db, table).await;
-            if got != union {
-                failures.push(format!(
-                    "{label}: {table} reads {got:?}, expected {union:?}"
-                ));
-            }
-        }
-    }
-    exec_on(
-        &shard1,
-        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
-    )
-    .await;
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
-/// Issue #560 criterion 9, clustered: the same block written twice
-/// through the span table's wrapper leaves every shard's physical counts
-/// unchanged. Merges on both derived tables are stopped on each shard
-/// before the first write, so no merge can bring a duplicate back to one
-/// before the count is read.
-#[tokio::test]
-async fn the_same_block_twice_through_the_wrapper_leaves_every_shard_count_unchanged() {
-    skip_unless_live!();
-    let shard1 = ChClient::new(shard1_config())
-        .await
-        .expect("connect shard1");
-    let shard2 = ChClient::new(shard2_config())
-        .await
-        .expect("connect shard2");
-    let db: &str = &TEST_DB_DERIVED_REPLAY;
-    fresh_cluster_db(&shard1, db).await;
-    assert_clustered_tables(
-        &shard1,
-        &shard2,
-        db,
-        &[
-            "trace_recent",
-            "trace_recent_dist",
-            "trace_error_spans",
-            "trace_error_spans_dist",
-        ],
-    )
-    .await;
-    for shard in [&shard1, &shard2] {
-        for table in ["trace_recent", "trace_error_spans"] {
-            exec_on(shard, &format!("SYSTEM STOP MERGES {db}.{table}")).await;
-        }
-    }
-
-    let insert = derived_insert(db, cluster_now_ns());
-    let union: Vec<String> = DERIVED_TRACES.iter().map(|s| s.to_string()).collect();
-    let mut failures: Vec<String> = Vec::new();
-    for write in 1..=2 {
-        exec_on(&shard1, &insert).await;
-        exec_on(
-            &shard1,
-            &format!("SYSTEM FLUSH DISTRIBUTED {db}.trace_spans_dist"),
-        )
-        .await;
-        wait_for_spans(&shard1, &shard2, db).await;
-        for (shard, label) in [(&shard1, "shard1"), (&shard2, "shard2")] {
-            let mut counts = Vec::new();
-            for table in ["trace_spans", "trace_recent", "trace_error_spans"] {
-                counts
-                    .push(count_on(shard, &format!("SELECT count() AS n FROM {db}.{table}")).await);
-            }
-            eprintln!("write {write}, {label}: trace_spans/recent/error = {counts:?}");
-            if counts != [1, 1, 1] {
-                failures.push(format!(
-                    "write {write}, {label}: local trace_spans/trace_recent/trace_error_spans \
-                     = {counts:?}, expected [1, 1, 1]"
-                ));
-            }
-        }
-        for table in ["trace_recent_dist", "trace_error_spans_dist"] {
-            let got = trace_ids(&shard1, db, table).await;
-            if got != union {
-                failures.push(format!(
-                    "write {write}: {table} reads {got:?}, expected {union:?}"
-                ));
-            }
-        }
-    }
-    for shard in [&shard1, &shard2] {
-        for table in ["trace_recent", "trace_error_spans"] {
-            exec_on(shard, &format!("SYSTEM START MERGES {db}.{table}")).await;
-        }
-    }
-    exec_on(
-        &shard1,
-        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
-    )
-    .await;
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]

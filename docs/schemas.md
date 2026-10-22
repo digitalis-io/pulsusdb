@@ -1,6 +1,6 @@
 # PulsusDB ClickHouse Schemas
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Tag names and unnarrowed tag values are read from `tag_names` and `tag_values` since issue #598 part 1; the passages on `trace_tag_catalog` describe the read before it.** **Since #598 part 2 the narrowed tag values and the span names are read from `spans`.** The authoritative storage design. **`log_patterns` now also carries `level` (keyed after `pattern`) and `log_landing` `pattern_level`, for `/patterns` by level; the §3.1 `log_patterns` text predates that, and `schema/schema.sql` is authoritative.** **Since #597 `compare()` is read from `spans`, `traces` and `resources` in one statement; §4.2's text on `compare()` describes the read before it.** **Since #599 the service graph is read from `service_edges`, per-minute edge totals a refreshable view (`service_edges_mv`) appends from `spans`, over the minutes it has finalized, and from `spans` for the calls not wholly inside those minutes; a half stored after its interval became eligible can be in neither (`docs/api.md` §4.5); the `trace_edges` passages describe the read before it, and that table is still written. §8's "no refreshable-MV or scheduler dependency" no longer holds.** **`metric_exemplars` and landing kind 4 (issue #501) are not described here; `schema/schema.sql` defines them.** Every table is specified with its full DDL, the queries it exists to serve, and the read path those queries take — including the SQL PulsusDB generates. [architecture.md](architecture.md) summarizes these decisions; this document is the reference the schema controller implements. **Stale in §6:** the binary no longer reads a view's projection out of `schema/schema.sql`; the rebuild commands that did are removed. **Since #601 part 4b the trace store holds seven tables, not five, and the counts, targets, storage figures and statement contracts below predate it, except the clustering and sharding-key passages, which name the new tables.** `tag_bucket_values` holds each 5-minute bucket's span-attribute values per service and key, storing at most 101 distinct `(value, type)` pairs: up to 100 answer exactly, and a 101st marks the bucket overflowed. It answers a values read for a `span.<key>` whose `q` is a single filter of exactly one `resource.service.name` equality; when a whole bucket of the window is overflowed, the request is answered by the span read in a second statement — the one exception this part adds to one statement per request. `error_spans` holds the error spans' non-attribute columns; it answers a single-filter, non-structural search or non-`compare()` metrics query with a top-level `status = error` that reads only `status`, `statusMessage`, `kind`, `name`, `duration`, `span:id`, `trace:id`, `resource.service.name`, `traceDuration`, `rootName` or `rootServiceName`. Measured on g1: the store is 43.89 B/span over the seven tables (`tag_bucket_values` 0.734, `error_spans` 0.245), and between replicas an error span's columns cross once more in `error_spans`, 0.253 B/span (0.63% of the span stream), while `tag_bucket_values` replicates to every node. The current statements are `docs/api.md` §4.2 and §4.3 and `schema/schema.sql`. **Since #601 part 4c the trace store holds eight tables: `service_bucket_resources` records which resources each service's spans used in each 5-minute bucket, and answers a values read for a `resource.<key>` whose `q` is exactly one `resource.service.name` equality over the whole window (0.0019 B/span on g1, replicated to every node). A statement that keeps one row per span identity computes every value it reads from those rows inside that step, and a metrics `by()` on a resource attribute reads a label computed once per resource.**
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Tag names and unnarrowed tag values are read from `tag_names` and `tag_values` since issue #598 part 1; the passages on `trace_tag_catalog` describe the read before it.** **Since #598 part 2 the narrowed tag values and the span names are read from `spans`.** The authoritative storage design. **`log_patterns` now also carries `level` (keyed after `pattern`) and `log_landing` `pattern_level`, for `/patterns` by level; the §3.1 `log_patterns` text predates that, and `schema/schema.sql` is authoritative.** **Since #597 `compare()` is read from `spans`, `traces` and `resources` in one statement; §4.2's text on `compare()` describes the read before it.** **Since #599 the service graph is read from `service_edges`, per-minute edge totals a refreshable view (`service_edges_mv`) appends from `spans`, over the minutes it has finalized, and from `spans` for the calls not wholly inside those minutes; a half stored after its interval became eligible can be in neither (`docs/api.md` §4.5); the `trace_edges` passages describe the read before it. §8's "no refreshable-MV or scheduler dependency" no longer holds.** **Issue #602 part 3b-2 deleted the six tables of the previous trace store (`trace_spans`, `trace_attrs_idx`, `trace_tag_catalog`, `trace_edges`, `trace_recent`, `trace_error_spans`) and their views; passages outside §4 and §7 that name them describe the store before it.** **`metric_exemplars` and landing kind 4 (issue #501) are not described here; `schema/schema.sql` defines them.** Every table is specified with its full DDL, the queries it exists to serve, and the read path those queries take — including the SQL PulsusDB generates. [architecture.md](architecture.md) summarizes these decisions; this document is the reference the schema controller implements. **Stale in §6:** the binary no longer reads a view's projection out of `schema/schema.sql`; the rebuild commands that did are removed. **Since #601 part 4b the trace store holds seven tables, not five, and the counts, targets, storage figures and statement contracts below predate it, except the clustering and sharding-key passages, which name the new tables.** `tag_bucket_values` holds each 5-minute bucket's span-attribute values per service and key, storing at most 101 distinct `(value, type)` pairs: up to 100 answer exactly, and a 101st marks the bucket overflowed. It answers a values read for a `span.<key>` whose `q` is a single filter of exactly one `resource.service.name` equality; when a whole bucket of the window is overflowed, the request is answered by the span read in a second statement — the one exception this part adds to one statement per request. `error_spans` holds the error spans' non-attribute columns; it answers a single-filter, non-structural search or non-`compare()` metrics query with a top-level `status = error` that reads only `status`, `statusMessage`, `kind`, `name`, `duration`, `span:id`, `trace:id`, `resource.service.name`, `traceDuration`, `rootName` or `rootServiceName`. Measured on g1: the store is 43.89 B/span over the seven tables (`tag_bucket_values` 0.734, `error_spans` 0.245), and between replicas an error span's columns cross once more in `error_spans`, 0.253 B/span (0.63% of the span stream), while `tag_bucket_values` replicates to every node. The current statements are `docs/api.md` §4.2 and §4.3 and `schema/schema.sql`. **Since #601 part 4c the trace store holds eight tables: `service_bucket_resources` records which resources each service's spans used in each 5-minute bucket, and answers a values read for a `resource.<key>` whose `q` is exactly one `resource.service.name` equality over the whole window (0.0019 B/span on g1, replicated to every node). A statement that keeps one row per span identity computes every value it reads from those rows inside that step, and a metrics `by()` on a resource attribute reads a label computed once per resource.**
 
 **The optimization target is read latency**: dashboard panels, log searches, and trace lookups must be index-served, bounded, and shard-local wherever possible. Ingestion adapts to the schema, never the reverse.
 
@@ -30,7 +30,7 @@ Fixes proposed elsewhere that this design deliberately **rejects**, and why:
 - **`minmax` skip indexes on unclustered string columns** — near-zero granule skipping unless data is physically clustered by that column; where we need that clustering we buy it explicitly (ordering key or projection).
 - **`ReplacingMergeTree` for sample data** — merge-time dedup forces `FINAL` or wrong results. Sample tables are plain `MergeTree`; only metadata tables use `ReplacingMergeTree`, and their read shapes (`LIMIT 1 BY`, `GROUP BY`) are duplicate-tolerant by construction.
 
-Conventions used below: `<db>` defaults to `pulsus`; in clustered mode every table becomes `Replicated*`, and every per-shard table but `log_landing`, `metric_landing`, `trace_landing`, `metric_label_values` and `service_edges` also gets a `_dist` Distributed wrapper — those five and the cluster-wide tables get none (§7 lists all twelve); `retention` clauses show defaults (`PULSUS_RETENTION_DAYS = 7`). Label keys follow the canonical label model ([architecture.md §2.3](architecture.md)): log label keys are normalized at ingest (`service.name` → `service_name`, before fingerprinting); trace attribute keys are stored verbatim; **OTLP metric names and label keys follow Prometheus v3.13.0's OTLP receiver instead** (issue #461) — the metric name gains its unit and type suffixes, attribute keys are sanitized with the reference's `key`/`key_` prefix rule and collisions merge with `;`, resource attributes become `job`/`instance` plus a `target_info` series rather than per-series labels, and the strategy is selectable with `PULSUS_OTLP_TRANSLATION_STRATEGY` ([configuration.md §5](configuration.md)); remote-write names and labels arrive already translated and are stored verbatim; the promoted physical column is named `service` on the logs, traces, and profiles tables (metrics deliberately have none — reads there are `metric_name` + `fingerprint` driven). **Every DDL block in this document mirrors `schema/schema.sql`, which is applied to a fresh ClickHouse in CI** (`crates/pulsus-schema/tests/live_schema.rs`) — an unapplyable table definition is a build failure, not a docs bug. **The generated-SQL examples below are a different matter and no suite executes one**: several carry `{placeholders}` and could not run as written. Each is instead bound to the code that renders it where one exists — §2.3's grouped instant read is asserted byte for byte against its builder by `the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders`, and §4.2's shapes by the TraceQL SQL suites' doc-consistency tests. Latency figures in §9 are targets to validate, not guarantees.
+Conventions used below: `<db>` defaults to `pulsus`; in clustered mode every table becomes `Replicated*`, and every per-shard table but `log_landing`, `metric_landing`, `trace_landing`, `metric_label_values` and `service_edges` also gets a `_dist` Distributed wrapper — those five and the cluster-wide tables get none (§7 lists all eleven); `retention` clauses show defaults (`PULSUS_RETENTION_DAYS = 7`). Label keys follow the canonical label model ([architecture.md §2.3](architecture.md)): log label keys are normalized at ingest (`service.name` → `service_name`, before fingerprinting); trace attribute keys are stored verbatim; **OTLP metric names and label keys follow Prometheus v3.13.0's OTLP receiver instead** (issue #461) — the metric name gains its unit and type suffixes, attribute keys are sanitized with the reference's `key`/`key_` prefix rule and collisions merge with `;`, resource attributes become `job`/`instance` plus a `target_info` series rather than per-series labels, and the strategy is selectable with `PULSUS_OTLP_TRANSLATION_STRATEGY` ([configuration.md §5](configuration.md)); remote-write names and labels arrive already translated and are stored verbatim; the promoted physical column is named `service` on the logs, traces, and profiles tables (metrics deliberately have none — reads there are `metric_name` + `fingerprint` driven). **Every DDL block in this document mirrors `schema/schema.sql`, which is applied to a fresh ClickHouse in CI** (`crates/pulsus-schema/tests/live_schema.rs`) — an unapplyable table definition is a build failure, not a docs bug. **The generated-SQL examples below are a different matter and no suite executes one**: several carry `{placeholders}` and could not run as written. Each is instead bound to the code that renders it where one exists — §2.3's grouped instant read is asserted byte for byte against its builder by `the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders`, and §4.2's shapes by the TraceQL SQL suites' doc-consistency tests. Latency figures in §9 are targets to validate, not guarantees.
 
 ---
 
@@ -809,278 +809,59 @@ The limits are as important as the claim, and are recorded verbatim in that modu
 
 ### 4.1 Tables
 
-```sql
-CREATE TABLE trace_spans (
-    trace_id      FixedString(16),
-    span_id       FixedString(8),
-    parent_id     FixedString(8),
-    name          LowCardinality(String),
-    service       LowCardinality(String),
-    timestamp_ns  Int64  CODEC(DoubleDelta, ZSTD(1)),
-    duration_ns   Int64  CODEC(T64, ZSTD(1)),
-    status_code   Int8,
-    kind          Int8,
-    payload_type  Int8,                          -- 1 = OTLP protobuf, 2 = Zipkin JSON
-    payload       String CODEC(ZSTD(3)),
-    INDEX idx_duration duration_ns TYPE minmax GRANULARITY 4,
-    PROJECTION service_time (
-        SELECT * ORDER BY (service, timestamp_ns)
-    )
-    -- Narrowed by migrations 44/45/46 (issue #555), not part of the frozen
-    -- CREATE: the projection above is dropped and re-added over the 14
-    -- non-payload columns. The final list cannot be printed inside this
-    -- block -- four of its columns (shared, status_message, scope_name,
-    -- scope_version) arrive by later ALTERs and are not declared here, so
-    -- the block would stop parsing. It is printed under the table instead.
-    -- Added by migrations 47/48 (issue #555), not part of the frozen
-    -- CREATE: PROJECTION name_time, the same 14 columns ORDER BY
-    -- (name, timestamp_ns). Also printed under the table.
-    -- Added by migrations 42/43 (issue #478), not part of the frozen
-    -- CREATE: PROJECTION span_name_day (
-    --     SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS d, name, count()
-    --     GROUP BY d, name
-    -- )
-) ENGINE = MergeTree
-PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
-ORDER BY (trace_id, timestamp_ns)
-TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE
-SETTINGS ttl_only_drop_parts = 1;
-```
+Issues #584 to #586, #599 and #601. `schema/schema.sql` is the definition; this section lists what it holds for
+traces and cites the statement each fact is read from. `{{retention_days}}` is `PULSUS_RETENTION_DAYS` and
+`{{trace_landing_retention_hours}}` is `PULSUS_TRACE_LANDING_RETENTION_HOURS` (`docs/configuration.md`).
 
-**The two re-sorted projections as they finally stand** (issue #555). They are declared inside
-`trace_spans`' own `CREATE` in `schema/schema.sql`, and are printed separately here because their
-column list includes `shared`, `status_message`, `scope_name` and `scope_version`, so the
-list cannot appear inside a `CREATE` that does not declare them — ClickHouse answers
-`Code: 47 UNKNOWN_IDENTIFIER`.
+**Tables.** Engines are the single-node form; clustered, each is the `Replicated` engine of the same family, with
+the replica path in the last column.
 
-```sql
-ALTER TABLE trace_spans DROP PROJECTION IF EXISTS service_time;
+| table | engine | sorting key | partition | TTL on | replica path | statement |
+|---|---|---|---|---|---|---|
+| `trace_landing` | `MergeTree` | `(row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)` | hour of `received_ms` | `received_ms` + `{{trace_landing_retention_hours}}` h | per shard | `schema/schema.sql:414-473` |
+| `spans` | `ReplacingMergeTree` | `(intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)` | UTC day of `start_ns` | `start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:336-388` |
+| `error_spans` | `ReplacingMergeTree` | `(intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)` | UTC day of `start_ns` | `start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:860-881` |
+| `traces` | `AggregatingMergeTree` | `trace_id` | `day` | `last_start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:475-492` |
+| `resources` | `ReplacingMergeTree` | `(service, resource_id)` | `day` | end of `day` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:317-334` |
+| `tag_names` | `ReplacingMergeTree` | `(scope, key)` | none | none | cluster-wide | `schema/schema.sql:390-399` |
+| `tag_values` | `ReplacingMergeTree` | `(scope, key, value, val_type)` | none | none | cluster-wide | `schema/schema.sql:401-412` |
+| `tag_bucket_values` | `AggregatingMergeTree` | `(service, scope, key, bucket)` | UTC day of `bucket` | `bucket` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:844-858` |
+| `service_bucket_resources` | `ReplacingMergeTree` | `(service, bucket, resource_id)` | UTC day of `bucket` | `bucket` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:912-924` |
+| `service_edges` | `ReplacingMergeTree(ver)` | `(conn_type, minute, client_minute, client, server)` | `toDate(minute)` | `minute` + `{{retention_days}}` d, less 240 s where `conn_type = ''` | per shard | `schema/schema.sql:750-767` |
 
-ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS service_time (
-    SELECT duration_ns, kind, name, parent_id, payload_type, scope_name,
-           scope_version, service, shared, span_id, status_code,
-           status_message, timestamp_ns, trace_id
-    ORDER BY (service, timestamp_ns)
-);
-ALTER TABLE trace_spans MATERIALIZE PROJECTION service_time;
+- Every TTL is the saturating form `toDateTime(least(… , 4294967295))`, and every table that has one sets
+  `ttl_only_drop_parts = 1`.
+- Every table but `service_edges` carries a deduplication window of `{{trace_dedup_window}}` blocks
+  (`non_replicated_deduplication_window` single-node, `replicated_deduplication_window` clustered).
+- `spans` carries three bloom-filter indexes (`idx_service`, `idx_name`, `idx_resource`) and the
+  `{{trace_attr_indexes}}` token, which renders one index per attribute `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` names
+  (`schema/schema.sql:378-380`; `docs/configuration.md` §3).
+- `trace_landing` sets `async_insert = 0` (`schema/schema.sql:472`).
+- Clustered, `spans`, `traces` and `error_spans` have a `_dist` wrapper sharded on `cityHash64(trace_id)`
+  (`schema/schema.sql:527-529`, `:531-533`, `:883-885`); no other trace table has one (§7).
 
-ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS name_time (
-    SELECT duration_ns, kind, name, parent_id, payload_type, scope_name,
-           scope_version, service, shared, span_id, status_code,
-           status_message, timestamp_ns, trace_id
-    ORDER BY (name, timestamp_ns)
-);
-ALTER TABLE trace_spans MATERIALIZE PROJECTION name_time;
-```
+**Views.** Every insert-triggered view reads `trace_landing`; the refreshable one reads `spans` and its own target.
 
-**The span's own attribute arrays** (issue #556). Five aligned arrays plus the constraint that
-keeps them aligned, declared inside `trace_spans`' own `CREATE` in `schema/schema.sql`. They are
-printed separately here for the same reason as the projections: the constraint's `CHECK` names
-five columns the frozen `CREATE` above does
-not declare, so moving it inside the block stops it parsing —
-`Code: 47 ... Missing columns: 'attr_num' 'attr_key' ... (UNKNOWN_IDENTIFIER)`.
+| view | target | reads | filter | statement |
+|---|---|---|---|---|
+| `spans_mv` | `spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0` | `schema/schema.sql:701-732` |
+| `error_spans_mv` | `error_spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0 AND status_code = 2` | `schema/schema.sql:887-891` |
+| `traces_mv` | `traces` (`_dist` clustered) | `trace_landing` | `row_kind = 0`, grouped by `trace_id` | `schema/schema.sql:819-842` |
+| `tag_bucket_values_mv` | `tag_bucket_values` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by bucket, service, scope, key | `schema/schema.sql:893-910` |
+| `service_bucket_resources_mv` | `service_bucket_resources` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by bucket, service, resource | `schema/schema.sql:926-930` |
+| `resources_mv` | `resources` | `trace_landing` | `row_kind = 1` | `schema/schema.sql:688-699` |
+| `tag_names_mv` | `tag_names` | `trace_landing` | `row_kind = 2` | `schema/schema.sql:734-739` |
+| `tag_values_mv` | `tag_values` | `trace_landing` | `row_kind = 3` | `schema/schema.sql:741-748` |
+| `service_edges_mv` | `service_edges`, `REFRESH EVERY 1 MINUTE APPEND` | `spans`, `service_edges` | the hold rule, `docs/api.md` §4.5 | `schema/schema.sql:769-817` |
 
-Each `ADD COLUMN` also has a cluster-only `_dist` twin (ids 50, 52, 54, 56, 58) that repeats it
-against `trace_spans_dist`, because the wrapper is created from a `CREATE ... AS` that does not
-inherit the base table's `ALTER`s. The constraint has **no** twin: a `Distributed` table refuses
-one (`Code: 48 ... Alter of type 'ADD_CONSTRAINT' is not supported by storage Distributed`), and
-does not need one — a misaligned row sent through the wrapper is refused by the base table's
-constraint.
+So `row_kind` 0 is a span, 1 a resource, 2 a tag name and 3 a tag value: the four filters above are the only
+readers of each kind.
 
-```sql
-ALTER TABLE trace_spans
-ADD COLUMN IF NOT EXISTS attr_key Array(LowCardinality(String));
-ALTER TABLE trace_spans
-ADD COLUMN IF NOT EXISTS attr_scope Array(LowCardinality(String));
-ALTER TABLE trace_spans
-ADD COLUMN IF NOT EXISTS attr_val Array(String);
-ALTER TABLE trace_spans
-ADD COLUMN IF NOT EXISTS attr_type Array(LowCardinality(String));
-ALTER TABLE trace_spans
-ADD COLUMN IF NOT EXISTS attr_num Array(Nullable(Float64));
-ALTER TABLE trace_spans
-ADD CONSTRAINT IF NOT EXISTS attr_arrays_aligned CHECK
-length(attr_key) = length(attr_scope)
-AND length(attr_key) = length(attr_val)
-AND length(attr_key) = length(attr_type)
-AND length(attr_key) = length(attr_num);
-```
-
-- **One table, four physical orders** (finding #5, extended by issues #478 and #555). The base order made trace-by-ID a point read **until issue #587**, which moved the fetch off this table entirely — §4.2's Read-paths entry has what it reads now; the order still serves the search path's `trace_id IN (batch)` hydration; the `service_time` projection is a physically re-sorted copy of the 14 non-payload columns that ClickHouse's optimizer selects automatically for service + time predicates; the `name_time` projection (migrations 47/48) is the same 14 columns sorted `(name, timestamp_ns)`, which is what gives a span-name search a sorted path — neither the base order nor `service_time` leads with `name`; and the `span_name_day` **aggregate** projection (migrations 42/43, `SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS d, name, count() GROUP BY d, name`) holds one row per `(UTC day, span name)` so the §4.3 Span Name dropdown reads the distinct names instead of the spans. `name_time` does not replace it: that one is sorted by `name` but still holds a row per span, where the aggregate holds one per `(UTC day, span name)`. It is selected by the DAY expression the table is partitioned by — the same predicate `tags_sql::span_name_values_sql` emits — and a `timestamp_ns` predicate defeats it, which is why that builder carries no sub-day bound. Being an aggregate projection it is tiny (one row per distinct day-and-name pair); the three projections' write amplification is an explicit trade for the read shapes. **Neither re-sorted copy stores the `payload`** (migrations 44-48, issue #555): the only statement that selects it is the §4.2 trace-by-ID point read, which filters on `trace_id` — the base table's first sort key — so the optimizer never reaches a projection for it. What dropping that second copy costs and saves, on a named corpus with the settings it was taken at, is docs/traceql-schema-migration.md §4-§5; no figure is repeated here, because a number away from its instrument cannot be checked. The `idx_duration` minmax works *within* the projection because slow spans cluster weakly by time — it prunes granules for `duration > X` searches; it is deliberately **not** relied on in the base order (finding: minmax on unclustered data is useless — here the projection provides the clustering context).
-
-```sql
-CREATE TABLE trace_attrs_idx (
-    date          Date,
-    key           LowCardinality(String),
-    val           String,
-    scope         LowCardinality(String),        -- 'resource' | 'span' | 'instrumentation' | 'event' | 'event:intrinsic' | 'link' | 'link:intrinsic'
-    val_num       Nullable(Float64),             -- populated when val parses numeric
-    timestamp_ns  Int64,
-    trace_id      FixedString(16),
-    span_id       FixedString(8),
-    duration_ns   Int64,
-    val_type      LowCardinality(String) DEFAULT '' -- 'string' | 'int' | 'float' | 'bool' (migration 39)
-) ENGINE = ReplacingMergeTree
-PARTITION BY date
-ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)
-TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE
-SETTINGS ttl_only_drop_parts = 1;
-
-CREATE TABLE trace_tag_catalog (
-    scope     LowCardinality(String),
-    key       LowCardinality(String),
-    val       String,
-    val_type  LowCardinality(String)   -- no DEFAULT; migration 41 (see below)
-) ENGINE = ReplacingMergeTree
-ORDER BY (scope, key, val, val_type);   -- PRIMARY KEY stays (scope, key, val)
--- populated by MV over trace_attrs_idx (SELECT scope, key, val, val_type); grows with distinct
--- (scope, key, val, val_type) — no MV-side cardinality bound is enforced today (future work); the §4.3
--- response caps + truncated flag bound what the API returns, not what the catalog stores or a scan reads
-```
-
-- **`scope` discriminates the attribute's origin** (`'resource'`, `'span'`, `'instrumentation'`, `'event'`, `'link'`, or the reserved `'event:intrinsic'` / `'link:intrinsic'`), so identical verbatim `(key, val)` pairs at different scopes stay separable — scoped TraceQL (`resource.foo` vs `span.foo` vs `instrumentation.foo` vs `event.foo` vs `link.foo`) would otherwise be incorrect. In **`trace_attrs_idx`** it sits **after** `(key, val)` in the ordering key: the proven `(key, val)` prefix pruning is preserved, a scoped query fixes `scope` by equality for near-free post-prefix time pruning, and an unscoped legacy tag search still prunes on the bare `(key, val)` prefix. Instrumentation-scope (`InstrumentationScope`) attributes **are** indexed under `scope='instrumentation'` (issue #192, superseding the earlier M4 decision that dropped them), so the `instrumentation.<key>` selector resolves index-served exactly like `resource.`/`span.`; they remain fully preserved in the span payload as well. **Span events (issue #192 PR-B)** are indexed the same way: each event's attributes ride `scope='event'` (verbatim keys, so `event.<key>` resolves), while each event's `name`/`timeSinceStart` intrinsics ride a **dedicated `scope='event:intrinsic'`** (reserved keys `name` / `timeSinceStart`, the latter's ns delta in `val_num`) that the writer emits ONLY from intrinsic code — a hard namespace partition, so no sender-supplied event attribute (even one literally keyed `name`, reachable via `event."name"`) can collide with the `event:name` intrinsic. **Span links (issue #192 PR-C)** mirror events exactly: each link's attributes ride `scope='link'` (so `link.<key>` resolves), while each link's `spanID`/`traceID` intrinsics ride a **dedicated `scope='link:intrinsic'`** (reserved keys `spanID` / `traceID`, `val` = lowercase hex of the referenced id bytes) — the same hard partition. Events and links remain fully preserved in the span payload as well.
-- **`trace_tag_catalog` orders differently — `(scope, key, val)`, scope FIRST** (its DDL above; do not conflate with `trace_attrs_idx`'s `(key, val, scope, …)`): the catalog serves scope-shaped tag discovery, so a scoped tag-names read prunes on the `(scope)` primary-key prefix and a scoped values read on `(scope, key)`; **unscoped** discovery (no scope, or a bare-key values lookup) carries `WHERE scope IN (…)` over the five ATTRIBUTE scopes (issue #475), which is still the leading primary-key column — so it prunes the two writer-reserved intrinsic scopes (`event:intrinsic`, `link:intrinsic`) away and reads only the attribute half, rather than scanning every distinct `(scope, key, val)` tuple. Within that half it is a scan: there is no narrower prefix to prune on (ClickHouse's granule exclusion may still skip granules opportunistically on a bare-key lookup, but that is layout-dependent, never a guarantee). That scan is bounded by the reader's Layer-1 read budget (`max_rows_to_read` = `reader.traceql_scan_budget_rows`, `read_overflow_mode = 'throw'` — the same setting the TraceQL search path applies): a catalog large enough that an unscoped/bare-key read would exceed it aborts with `422 query_too_broad` rather than running unbounded. The §4.3 response caps (`TAG_NAMES_MAX`/`TAG_VALUES_MAX`) bound only what a *successful* request returns, not what a scan reads. Tempo's `/api/v2/search/tags` (T6) is scope-aware.
-- **`timestamp_ns` after the `(key, val, scope)` prefix**: TraceQL searches are always time-bounded, so within each `(key, val)` (or `(key, val, scope)`) prefix the time predicate prunes granules — a 3h search over a busy attribute reads 3h of index, not 7 days (compare finding #5's index, which ordered trace/span IDs before time).
-- **`val_num`** gives numeric comparisons (`span.http.status_code >= 500`) a typed column. Scope this honestly: `val_num` is not in the primary key, so a range predicate scans *all values of that key* in the time range and filters — acceptable for low-cardinality numeric attributes (status codes, retry counts), **not** a general strategy for high-cardinality numerics (sizes, user-defined measurements). Duration, status, kind, name, and service are physical span columns precisely so the common numeric intrinsics never rely on this index. If benchmarks show real workloads need fast range predicates on high-cardinality numeric attributes, the design adds a dedicated numeric index ordered `(key, timestamp_ns, val_num, ...)` — benchmark-gated, not speculative.
-- **`val_type` — the attribute's stored OTLP type (issue #476, migrations 39/40/41).** One of `string`, `int`, `float`, `bool`, written at ingest from the OTLP `AnyValue` kind (`pulsus_write::ingest::traces::AttrValueType`) and projected into the catalog by `trace_tag_catalog_mv`. It exists because the §4.3 tag-values wire `type` used to be **inferred from `val`'s text**, so a string attribute whose value read as a number was reported `int` — and a client that quotes only `string`-typed values then built a query matching nothing. **The type is not derivable from what else is stored:** `val` is the rendered text and `val_num` is a parse of that text, so the string `"1.5"` and the double `1.5` are byte-identical in both. Array, kvlist and bytes values render to a string and are therefore `string` — the column states the type of what was stored.
-  - **On `trace_attrs_idx`** (migration 39, `_dist` twin 40) it is `DEFAULT ''` and stays **out** of the sorting key: the index's `(key, val, scope, …)` prefix and every prune that rides it are unchanged. **Nothing on the SEARCH path reads the column since issue #558** — the kind a search response renders comes from `trace_spans.attr_type`, at the element the value came from. The default matters for a fixture rather than for a request: an `INSERT` into the index that names no `val_type` stores `''` while the span row beside it stores one of the four spellings, and the two stores then disagree. `pulsus_testkit::assert_stores_agree` is what every live search fixture that writes BOTH stores checks that with — two corpora are excluded by construction and say so at the fixture: one writes the index alone so granule selection over it is observable, the other writes a million index rows against sixty-four span rows to measure the generator's memory ceiling.
-
-    Two consequences of `val_type` (and `val_num`) sitting outside this
-    table's ordering key, both measured on ClickHouse 26.3.29.7:
-
-      system.columns is_in_sorting_key    key val scope timestamp_ns trace_id span_id -> 1
-                                          val_type val_num                            -> 0
-
-      merges stopped, two identical INSERTs   raw 2   FINAL 1
-        a duplicate index row is VISIBLE until a merge, which is what the
-        replay corpora reproduce on purpose
-
-      two rows differing ONLY in val_type, then OPTIMIZE ... FINAL
-        1 row left, val_type = the LATER insert's
-        the index cannot hold two kinds for one element; the survivor is
-        decided by insertion order, the same rule the `trace_tag_catalog`
-        bullet below avoids by putting `val_type` IN its key
-  - **On `trace_tag_catalog`** (migration 41) it is **in** the sorting key and carries **no default**. In the key because the type is per VALUE, not per key — one key can hold a string `'8080'` and an int `8080`, whose `val` bytes are identical, and without the extension the `ReplacingMergeTree` collapses the pair with the survivor decided by insertion order. No default because ClickHouse rejects a defaulted column entering a sorting key in the same `ALTER`, and rejects a standalone `MODIFY ORDER BY` afterwards; the single-statement, no-default form is the only accepted one. `MODIFY ORDER BY` **appends**, so `PRIMARY KEY` stays `(scope, key, val)` and the prefix prune that serves every tag-values read is untouched (gated by `crates/pulsus-read/tests/traces_tags_explain.rs`, which asserts both keys and the prune relations).
-  - **Rows written before migration 41 read back `''`** and are reported as `string` on the wire. That is not a recovery — nothing stored can distinguish them — and it is what those rows already reported for non-numeric text. `trace_tag_catalog` has no TTL, so they do not age out; the branch is dead once `SELECT count() FROM trace_tag_catalog WHERE val_type = ''` returns `0` everywhere, which needs a catalog rebuild-or-clear mechanism that does not exist yet.
-- Tag **names** read only `trace_tag_catalog` — name discovery never scans span payloads — and the intrinsic vocabulary (the `intrinsic` scope, the closed `status`/`kind` value sets) is served from the TraceQL grammar with no read at all (issue #475). **Tag values read one of three places** (issue #478): the catalog, for an attribute key with no narrowing `q`, byte-identically to before; `trace_attrs_idx` intersected with the matching span set, for an attribute key narrowed by `q`; and `trace_spans` for `name`/`span:name`, which the catalog cannot answer at all because `trace_tag_catalog_mv` projects `trace_attrs_idx` alone and holds no span-`name` row.
-- **`trace_spans.shared` (issue #173, additive migration).** A `shared UInt8 DEFAULT 0` column is added to `trace_spans` by an additive `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (never a mutation of the frozen CREATE above; pre-#173 rows read back `0`). It is `1` iff the span carried the `zipkin.shared = "true"` attribute at OTLP parse time — the exact wire contract the Zipkin receiver emits (`str_kv("zipkin.shared", "true")`), documented so an OTLP-native sender may set it too. The attribute itself still flows to `trace_attrs_idx` unchanged; the column exists only so the service-graph edge MV below can identify a Zipkin shared span (whose SERVER side is stored under the *client's* `span_id`) and key it by its own id rather than its inherited `parent_id`.
-- **`trace_spans.status_message` (issue #184, migrations 35/36).** A `status_message String DEFAULT ''` column added by the same additive-`ALTER` pattern (id 35 on the base table, id 36 the cluster-gated `_dist` copy; the frozen CREATE above is never mutated, pre-#184 rows read back `''`). It stores the OTLP `Status.message` verbatim — previously dropped at parse time — so the `statusMessage` / `span:statusMessage` TraceQL intrinsic is queryable as a physical span column (a bounded time-window span scan in Phase 1, exact hydrated-column evaluation in Phase 2, byte-capped on read like `name`/`service`).
-- **`trace_spans.attr_key` / `attr_scope` / `attr_val` / `attr_type` / `attr_num` (issue #556, migrations 49-59).** Five **aligned** arrays printed above, added by the same additive-`ALTER` pattern (odd ids on the base table, even ids the cluster-gated `_dist` copies; the frozen CREATE is never mutated, rows written before them read back five EMPTY arrays). Element `i` of each array describes one attribute of that span: its verbatim key, its `scope` discriminator (the same seven spellings `trace_attrs_idx.scope` carries), its rendered value, its declared OTLP kind, and its numeric value or NULL. They carry exactly the attributes that also become `trace_attrs_idx` rows for that span, **in the same order** — the parser derives them from the same records rather than recomputing them, so the number is decided by the whole of (scope, key, value) and not by the value text: a link's `spanID` of `0000000000000001` parses as `1.0` and is stored NULL in both places. Migration 59's `attr_arrays_aligned` CHECK refuses an `INSERT` whose five lengths are not equal (`Code: 469 VIOLATED_CONSTRAINT`); a row naming no array column at all is accepted, because `0 = 0 = 0 = 0 = 0`. A `CHECK` does **not** see an `ALTER TABLE ... UPDATE` mutation, so any later backfill must check alignment itself. **Every phase-2 attribute read comes off these columns** (issues #557 and #558): the batch hydration statement carries one projected SLOT per attribute condition and per projected field — `arrayFirstIndex` over `(attr_key, attr_scope)` locates the element the span's attribute resolves to, and the condition's value test, the rendered value, its numeric reading and its stored kind are all taken at that one element. The event and link VALUE SETS come off the same arrays, expanded with `arrayJoin` over the rows the reader retained. `trace_attrs_idx` serves phase 1 — the candidate generator — and nothing else on the search route. The `timeSinceStart` intrinsic's `attr_num` reproduces `trace_attrs_idx.val_num` bit for bit, including its `i64 as f64` rounding above 2^53.
-- **`trace_spans.scope_name` / `trace_spans.scope_version` (issue #192, migrations 37/38).** Two `LowCardinality(String) DEFAULT ''` columns added by the same additive-`ALTER` pattern (id 37 on the base table, id 38 the cluster-gated `_dist` copy; the frozen CREATE above is never mutated, pre-#192 rows read back `''`). `LowCardinality` (unlike `status_message`'s plain `String`) matches the sibling `name`/`service` columns — instrumentation library name/version are genuinely low-cardinality. They store the OTLP `InstrumentationScope.name`/`version` verbatim so the `instrumentation:name` / `instrumentation:version` TraceQL intrinsics are queryable as physical span columns (bounded time-window span scan in Phase 1, exact hydrated-column evaluation in Phase 2, byte-capped on read like `name`/`service`), and so `compare()` has a per-span source (§4.2).
-
-**Service-graph edge ledger (issue #173, M7-E1).** `trace_edges` is a **ReplacingMergeTree half-row ledger**: one narrow row per edge-relevant span (a CLIENT/PRODUCER or a SERVER/CONSUMER span), with its own plain `timestamp_ns` — no `SimpleAggregateFunction` anywhere. The directed `client → server` edge is assembled at **query time** (§4.2), so pair completion is a pure function of the stored half-row multiset, never of background-merge progress.
-
-```sql
-CREATE TABLE trace_edges (
-    date          Date,
-    side          UInt8,                         -- 0 = client half (kind 3|4), 1 = server half (kind 2|5)
-    trace_id      FixedString(16),
-    span_id       FixedString(8),
-    pair_id       FixedString(8),                -- the edge's CLIENT-side span id (the join key)
-    conn_type     LowCardinality(String),        -- 'rpc' | 'messaging', from the emitting span's own kind
-    timestamp_ns  Int64  CODEC(DoubleDelta, ZSTD(1)),
-    service       LowCardinality(String),
-    duration_ns   Int64  CODEC(T64, ZSTD(1)),
-    failed        UInt8
-) ENGINE = ReplacingMergeTree
-PARTITION BY date
-ORDER BY (side, trace_id, span_id)
-TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE
-SETTINGS ttl_only_drop_parts = 1;
--- populated by trace_edges_mv over trace_spans (a pure per-row projection, kind-filtered); no MV-side
--- GROUP BY/join/state. The CREATE-time TTL is superseded at runtime by apply_ttl's saturating form
--- (the trace-table pattern above): toDateTime(least(intDiv(timestamp_ns, 1000000000) + retention_days*86400, 4294967295)) DELETE
-```
-
-```sql
-CREATE MATERIALIZED VIEW trace_edges_mv TO trace_edges AS
-SELECT
-    toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,
-    toUInt8(kind IN (2, 5)) AS side,
-    trace_id,
-    span_id,
-    if(kind IN (3, 4) OR shared = 1, span_id, parent_id) AS pair_id,
-    if(kind IN (2, 3), 'rpc', 'messaging') AS conn_type,
-    timestamp_ns,
-    service,
-    duration_ns,
-    toUInt8(status_code = 2) AS failed
-FROM trace_spans
-WHERE kind IN (3, 4)
-   OR (kind IN (2, 5) AND (shared = 1 OR parent_id != toFixedString(unhex('0000000000000000'), 8)));
-```
-
-- **`side` leads the ORDER BY** so each per-half read subquery (§4.2) prunes on the PrimaryKey `side` prefix — a second, independently-gateable prune besides the daily-partition MinMax prune. Because `side` is in the `ReplacingMergeTree` dedup key, a Zipkin shared span (issue #75: SERVER side stored under the client's `span_id`) never collapses its two halves.
-- **`pair_id` is the edge's CLIENT-side span id** — the single-valued join key. A client/producer half and a *shared* server half key by their own `span_id` (Zipkin's shared model: both RPC sides carry the same id); a non-shared server half keys by `parent_id`. Edge identity is thus the SERVER-side span (`(trace_id, span_id)`, one row per edge), which preserves client fan-out: a client parenting N servers yields N edges, none `max()`-collapsed across siblings.
-- **`conn_type` is derived from the emitting span's own kind** (`kind ∈ {2,3}` → `'rpc'`, `{4,5}` → `'messaging'`), and the read join (§4.2) requires `c.conn_type = s.conn_type` — so only CLIENT(3)→SERVER(2) and PRODUCER(4)→CONSUMER(5) can pair; the four cross-kind combinations are structurally rejected.
-- **Root non-shared server halves are excluded** (`parent_id` all-zero → no client twin possible); a shared server half is admitted even with a zero parent, since its pair key is its own id.
-- **Replay idempotence is read-time dedup, not ledger-exact.** Byte-identical at-least-once redelivery (the ingest contract) is fully absorbed — the read's per-side `GROUP BY` computes identical `any(...)`/`max(...)` whether zero, some, or all duplicates were physically merged. A *mutated* re-send of the same `(side, trace_id, span_id)` makes `any()` merge-order-sensitive (documented residual, unchanged in kind from the metrics path).
-- **Zipkin shared-span limitation.** The correct handling above (key a shared server half by its own id) depends on the `shared` column; a shared server half whose `zipkin.shared` marker was lost cannot be distinguished from an ordinary server half and would key by its inherited `parent_id`. No historical backfill: the edge MV sees only post-deploy inserts (a one-shot operator `INSERT ... SELECT trace_edges_mv-body FROM trace_spans` recipe reconstructs history from retained spans if needed).
-
-**The two derived trace tables (#560).** `trace_recent` holds one row per (five-minute bucket, trace) and `trace_error_spans` one row per span with `status_code = 2`, both written by views over `trace_spans`, so the empty search `{}` and `{ status = error }` stop scanning the span table (§4.2). The writer still sends one `INSERT` into `trace_spans` and one into `trace_attrs_idx`; both new tables are derived.
-
-```sql
-CREATE TABLE trace_recent (
-    date      Date,
-    bucket    UInt32,                          -- intDiv(timestamp_ns, 300000000000): 288 per UTC day
-    trace_id  FixedString(16),
-    ts_max    SimpleAggregateFunction(max, Int64)  CODEC(T64, ZSTD(1)),
-    ts_min    SimpleAggregateFunction(min, Int64)  CODEC(T64, ZSTD(1))
-) ENGINE = AggregatingMergeTree
-PARTITION BY date
-ORDER BY (bucket, trace_id)
-TTL toDateTime(fromUnixTimestamp64Nano(ts_max)) + INTERVAL 7 DAY DELETE
-SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = 10000;
-
-CREATE TABLE trace_error_spans (
-    date          Date,
-    trace_id      FixedString(16),
-    span_id       FixedString(8),
-    timestamp_ns  Int64  CODEC(DoubleDelta, ZSTD(1)),
-    duration_ns   Int64  CODEC(T64, ZSTD(1)),
-    service       LowCardinality(String),
-    name          LowCardinality(String),
-    kind          Int8
-) ENGINE = ReplacingMergeTree
-PARTITION BY date
-ORDER BY (timestamp_ns, trace_id, span_id)
-TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE
-SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = 10000;
--- Both CREATE-time TTLs are superseded at runtime by apply_ttl's saturating form:
---   trace_recent       toDateTime(least(intDiv(ts_max, 1000000000) + retention_days*86400, 4294967295)) DELETE
---   trace_error_spans  toDateTime(least(intDiv(timestamp_ns, 1000000000) + retention_days*86400, 4294967295)) DELETE
-```
-
-```sql
-CREATE MATERIALIZED VIEW trace_recent_mv TO trace_recent AS
-SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns))  AS date,
-       toUInt32(intDiv(timestamp_ns, 300000000000))   AS bucket,
-       trace_id,
-       max(timestamp_ns)                              AS ts_max,
-       min(timestamp_ns)                              AS ts_min
-FROM trace_spans
-GROUP BY date, bucket, trace_id;
-
-CREATE MATERIALIZED VIEW trace_error_spans_mv TO trace_error_spans AS
-SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,
-       trace_id, span_id, timestamp_ns, duration_ns, service, name, kind
-FROM trace_spans
-WHERE status_code = 2;
-```
-
-- **`ts_min` is what makes the recency read correct.** The read bounds each row by `ts_max >= start AND ts_min <= end - 1` — the window's first included nanosecond and its last (requirement R9). Without `ts_min` every trace whose spans lie wholly after `end` in the window's last bucket is a candidate, and those rank above every genuine one: the empty search returns nothing once they reach the candidate ceiling, which at the mean bucket tail is about 667 traces per second (`docs/traceql-schema-migration.md` §3.6). There is no `ts_max <= end` bound: a trace with a span in the window and a later span in the same bucket is an answer.
-- **`date` is a function of `bucket`.** A UTC day is 288 buckets exactly, so no bucket straddles midnight; `bucket` leads the sort key, so a time predicate prunes granules rather than whole day partitions. The bucket width is the reader's `RECENT_BUCKET_NS` (`crates/pulsus-read/src/traces/window_sql.rs`), bound to the view's literal by a test.
-- **`trace_recent`'s TTL reads `ts_max`, not `date`:** a `date` TTL would expire the whole partition at midnight of `date + N`, under-retaining a span written at 23:59 by almost a day.
-- **A repeated identical span block leaves both tables' physical `count()` unchanged**, immediately, with no merge and no `FINAL`. A view's insert into its target carries a block id derived from the source block (`deduplicate_blocks_in_dependent_materialized_views = 1`), and a target with its own `non_replicated_deduplication_window` recognises the repeat and drops it — the single-node `trace_spans` itself has no window and stores the block twice, as before. The span inserter pins `deduplicate_insert = enable` and `deduplicate_blocks_in_dependent_materialized_views = 1` on every insert into `trace_spans`/`trace_spans_dist` (`crates/pulsus-write/src/writer/trace.rs`, `span_insert_settings`), so this does not depend on the server profile; no other insert carries the pins. A replay whose rows arrive in another order is a different block and is written again; its rows collapse at merge, because both engines are idempotent under a duplicate row, and they change no answer. The window is 10,000 blocks per table.
-- **Neither read uses `FINAL`.** A trace whose spans for one bucket arrive in several inserts has several unmerged rows for one key; the read's `GROUP BY trace_id` finds it through the row of the block that holds its in-window span. An unmerged table can hold a false candidate, never lose a true one.
-
-**What a failing view leaves behind (#560).** Three views now fire on every `trace_spans` insert — `trace_edges_mv`, `trace_recent_mv` and `trace_error_spans_mv` — and this is the first change at which a view's failure means a missing answer, the empty search returning nothing for that block, rather than a missing index row. The insert fails: the caller receives `HTTP 500` with `Code: 395`, and is not told which tables kept the block's rows. The design record measured that outcome over 300 trials of one throwing view and three healthy sibling views over one source table (`docs/traceql-schema-migration.md` §6.3): the throwing view's own target held nothing in 300 of 300; the source rows were present in 297 of 300 and absent in 3; the three healthy siblings committed 28, 25 and 32 times out of 300, and all three together 7 times against about 0.25 if they were independent. Nothing else held on every trial. The writer passes `on_flush_poisoned: None` for `trace_spans`, so nothing replays the block, and no machinery is built for this: a client that retries after the `500` re-runs the views, and the two tables' collapse rules absorb any rows written twice; a client that gives up leaves the block's derived rows partly written, with no record of which.
-
-- **Admitted trace timestamp domain and runtime TTL (issue #131).** Ingest admits a span only if its UTC day lies in `[1970-01-01, 2106-02-06]` (days `0..=49_709`, `pulsus_model::Date::start_of_day_utc_datetime_safe`); a span outside that domain is rejected (OTLP partial success; Zipkin whole-request 400). Two wrap mechanisms motivate the gate: `PARTITION BY toDate(...)` evaluates in the 16-bit `Date` domain and wraps for days past 2149-06-06, and the delete-TTL evaluates the row timestamp in the 32-bit `DateTime` domain and wraps for instants past 2106-02-07T06:28:15Z (u32-seconds maximum, `4294967295`); day `49_710` (2106-02-07) is excluded because only part of it is u32-representable. The CREATE-time TTL shown above is superseded at runtime: `apply_ttl` re-issues `ALTER TABLE ... MODIFY TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + retention_days * 86400, 4294967295)) DELETE` on both trace tables at init and on every rotation tick, so for a stored row with epoch-seconds `s = floor(timestamp_ns / 1e9)` the operative expiry is `expiry(s) = min(s + retention_days * 86400, 4294967295)` — i.e. `min(configured_expiry, 2106-02-07T06:28:15Z)`. If `s + retention_days * 86400 <= 4294967295`, the expiry equals the configured instant, bit-identical to the pre-#131 expression; otherwise the expiry is `4294967295`, the actual retention is `4294967295 - s`, and the shortfall vs the configured value is `s + retention_days * 86400 - 4294967295`, which grows without bound as `retention_days` grows. For the enforced range `retention_days >= 1` (config validation rejects `< 1`, `crates/pulsus-config/src/validate.rs:285-287`), a row at the last admitted day (`49_709`, `s = 4_294_943_999`) has actual retention capped at `4_294_967_295 - 4_294_943_999 = 23_296 s ≈ 0.27 days (~6.5 hours)`. For every enforced `retention_days >= 1`, the saturating form strictly dominates the pre-#131 expression: pre-#131, a row with `s + retention_days * 86400 > 4294967295` wrapped to a ~1970-epoch expiry and its part became drop-eligible immediately or near-immediately after insert (`ttl_only_drop_parts = 1`); under the saturating form the same row becomes drop-eligible no earlier than 2106-02-07T06:28:15Z. The admission cutoff is deliberately not coupled to `retention_days`: retention is runtime-ALTERed after rows are stored (a changed `PULSUS_RETENTION_DAYS` re-ALTERs existing tables on the next rotation tick) and has no upper bound, so no admission-time gate can honor a retention value that did not exist when the row was admitted.
+**What a failing view leaves behind.** A view that throws while the server processes a landing insert fails it. The insert fails: the caller receives `HTTP 500` with `Code: 395`, and is not told which targets kept the block's rows. The design record measured that outcome over 300 trials of one throwing view and three healthy sibling views over one source table (`docs/traceql-schema-migration.md` §6.3): the throwing view's own target held nothing in 300 of 300; the source rows were present in 297 of 300 and absent in 3; the three healthy siblings committed 28, 25 and 32 times out of 300, and all three together 7 times against about 0.25 if they were independent. Nothing else held on every trial. A retry of the same block re-runs every view, and each target's deduplication window or collapse rule absorbs the rows written twice. The same holds for `log_landing` and `metric_landing`.
 
 ### 4.2 Read paths (generated SQL)
 
-**Trace by ID** — since issue #587 the fetch reads the TraceQL design's own three tables (`spans`, `traces`, `resources`) and no longer reads this one. One statement answers an indexed trace and a second answers two cases, each named with its count in `docs/TraceQL/server-implementation.md` §3.5:
+**Trace by ID** — the fetch reads three of §4.1's tables (`spans`, `traces`, `resources`). One statement answers an indexed trace and a second answers two cases, each named with its count in `docs/TraceQL/server-implementation.md` §3.5:
 
 ```text
 statement 1, always, first   the per-trace row by `trace_id` — its own whole sort
@@ -1101,397 +882,13 @@ indexed the trace and the
 request supplied a window
 ```
 
-The full text of all three is `docs/TraceQL/sql-schema.md` §5.4, which is where they are byte-frozen. **No production statement selects the per-span payload column after this change** — the two write-path round-trip suites that still decode it filter on `trace_id`, the base table's first sort key.
+The full text of all three is `docs/TraceQL/sql-schema.md` §5.4, which is where they are byte-frozen.
 
 `kind` is projected (issue #75) as the fetch assembler's `(span_id, kind)` de-duplication key **and** as the rendered value: since issue #587 the response renders `kind` **from the column**, as the protocol's own signed `Int32`, because there is no decoded payload to take it from. Its reason for existing is unchanged — it keeps a Zipkin shared span's SERVER and CLIENT sides (identical `(trace_id, span_id)`, different `kind`) as two distinct spans on retrieval, while remaining a genuine no-op for OTLP (span ids are unique per trace) and still de-duplicating identical at-least-once replays.
 
-**TraceQL search is two-phase** (issue #57): Phase 1 produces a bounded, recency-ranked candidate trace-id set from indexed sources (false positives are harmless — Phase 2 filters; false negatives exist only past the cap and are reported by the response OMITTING `metrics.completedJobs`); Phase 2 hydrates candidates in small batches and evaluates the full query **exactly** in the engine.
+**Search, metrics, tag discovery and the service graph** each run statements compiled from the query over §4.1's tables; `docs/TraceQL/server-implementation.md` describes them and `docs/query-lowering.md` records how each is lowered.
 
-**Phase 1 — per-generator bounded ranked queries.** Each leaf comparison compiles to a generator over its natural indexed source; every generator is its own index-served top-K query (never a `UNION ALL` — the `GROUP BY` stays confined to one leaf's pruned prefix):
-
-```sql
-SELECT trace_id, max(timestamp_ns) AS bound_ts
-FROM <its indexed source>
-WHERE <leaf predicate + date/time pruning>
-GROUP BY trace_id
-ORDER BY bound_ts DESC, trace_id ASC
-LIMIT {PULSUS_TRACEQL_MAX_CANDIDATES + 1}
-```
-
-The generator classes, their prefixes, and their honest costs:
-
-| Leaf class | Source / prefix | Cost profile |
-|---|---|---|
-| attr `=` string/bool | `trace_attrs_idx` `(key, val[, scope])` prefix + date/time pruning | index-served |
-| attr numeric (`val_num <op> N`) | `trace_attrs_idx` **key-only** `(key)` prefix scan + filter | scans all of the key's in-window values (the §4.1 `val_num` honesty note) |
-| attr regex `=~` (anchored `^(?:…)$`) | `trace_attrs_idx` **key-only** `(key)` prefix scan + `match(val, …)` | same key-only scan |
-| `resource.service.name =` | `trace_spans` `service_time` projection PREWHERE + time | index-served |
-| `resource.service.name =~` | its own `trace_attrs_idx` row (`key='service.name' AND scope='resource'`) | key-only scan |
-| `duration <op>` | `trace_spans` + `idx_duration` minmax within the projection | granule-pruned |
-| `name`/`status`/`kind`, except `status = error` | `trace_spans` time-window scan + predicate | no selective index — window-bounded, budget-limited |
-| `status = error` (#560) | `trace_error_spans` date + time prune, no predicate — the view's `WHERE status_code = 2` is the predicate | granule-pruned on the `(timestamp_ns, …)` sort key; one row per error span |
-| `trace:id =` (issue #184) | `trace_spans` `trace_id = unhex('…')` — the `ORDER BY (trace_id, timestamp_ns)` **PK prefix** | index-served (Tier-1 EXPLAIN-gated) |
-| `statusMessage` / `span:id` / `span:parentID` (issue #184) | `trace_spans` time-window scan + predicate (`status_message`, `lower(hex(span_id/parent_id))`) | no selective index — window-bounded, budget-limited |
-| `instrumentation:name` / `instrumentation:version` (issue #192) | `trace_spans` time-window scan + predicate (`scope_name` / `scope_version`) | no selective index — window-bounded, budget-limited |
-| `event.<key>` attr (issue #192 PR-B) | `trace_attrs_idx` `(key, val, scope='event')` prefix (`=`/`=~`) or key-only `(key)` scan | index-served exactly like any attribute |
-| `event:name =` (issue #192 PR-B) | `trace_attrs_idx` `(key='name', val, scope='event:intrinsic')` prefix | index-served (AttrEq) |
-| an event/link intrinsic compared against another FIELD, e.g. `{ .a = event:name }` (issues #351, #558) | the time-range generator, plus one phase-2 statement expanding `trace_spans`'s own arrays over the rows the reader retained | one row per value; bounded by `PULSUS_TRACEQL_EVENT_SET_MAX_VALUES` **before** the expansion, from per-span counts the batch hydration statement already returned |
-| `event:timeSinceStart <op>` (issue #192 PR-B) | `trace_attrs_idx` **key-only** `(key='timeSinceStart')` scan + `val_num <op> ns` under `scope='event:intrinsic'` | key-only scan (numeric filter) |
-| `link.<key>` attr (issue #192 PR-C) | `trace_attrs_idx` `(key, val, scope='link')` prefix (`=`/`=~`) or key-only `(key)` scan | index-served exactly like any attribute |
-| `link:spanID =` / `link:traceID =` (issue #192 PR-C) | `trace_attrs_idx` `(key='spanID'\|'traceID', val, scope='link:intrinsic')` prefix (`val` = lowercase hex) | index-served (AttrEq) |
-| trace-level intrinsics — `traceDuration` / `rootName` / `rootServiceName` / `span:childCount` (issue #184) | the time-range generator | no candidates of their own (a windowed root scan would MISS out-of-window roots); exact via the trace-wide co-loads below — sole-predicate scale routed to #25 |
-| `!=` / `!~` / `{}` match-all | the time-range generator (`trace_recent` over the window, #560) | complete superset; absence is not indexable. Granule-pruned on the leading `bucket` column; the same candidates as a `trace_spans` scan whenever the window's ends lie in different buckets |
-
-**The two derived-table generators (#560).** The time-range generator and `{ status = error }` read the tables §4.1 derives from `trace_spans`, and neither statement carries an `AND (<predicate>)` line — the table is the predicate. For the window `[1700000000000000000, 1700010800000000000)` at `PULSUS_TRACEQL_MAX_CANDIDATES = 100000`:
-
-```sql
--- the time-range generator
-SELECT trace_id, toInt64(max(ts_max)) AS bound_ts
-FROM trace_recent
-WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
-  AND bucket >= 5666666 AND bucket <= 5666702
-  AND ts_max >= 1700000000000000000 AND ts_min <= 1700010799999999999
-GROUP BY trace_id
-ORDER BY bound_ts DESC, trace_id ASC
-LIMIT 100001
-
--- { status = error }
-SELECT trace_id, max(timestamp_ns) AS bound_ts
-FROM trace_error_spans
-WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
-  AND timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
-GROUP BY trace_id
-ORDER BY bound_ts DESC, trace_id ASC
-LIMIT 100001
-```
-
-- **The bucket clause** is `floor(start / 300 s)` to `floor(last included ns / 300 s)`, rendered signed with no clamp; a pre-epoch window renders negative literals, which a `UInt32` column compares correctly.
-- **The candidate set is the span scan's exactly** whenever the window's ends lie in different buckets — every window of 300 s or more. Inside one bucket it is a superset by one shape: a trace with a span before `start` and a span after `end` in that bucket and none between. Phase 2 hydrates it, finds no in-window span and drops it; at the candidate ceiling the response is marked partial, never wrong.
-- **`bound_ts` on `trace_recent` is the trace's newest span in its overlapping buckets**, `>=` the newest in-window span. It is still an upper bound on the public sort key, so threshold termination stops later, never earlier; the response order does not move. The cast is there because `max` over a `SimpleAggregateFunction(max, Int64)` column keeps the wrapper.
-- **Measured on a 2,000,000-span corpus** (12 spans per trace, `docs/benchmarks/issue560-two-table-reads.sh`): `{}` over three hours reads 167,277 rows against 2,000,000 and 22 marks against 248; over 300 s, 8,192 rows against 1,185,089. `{ status = error }` reads 20,000 rows against 2,000,000. The recency read reads more bytes than the span scan only below 1.58 spans per trace.
-- **No aggregate is pushed onto either table**: `aggregate_having_sql` accepts only `trace_spans` and `trace_attrs_idx` as sources.
-
-Within one `{...}` filter, an `&&` needs only its statically most selective conjunct's generator set (matches are a subset of any conjunct's); an `||` needs both sides' sets. Cross-spanset `{A} op {B}` takes the superset union of both operands' generators for **both** `&&` and `||` — exactness is Phase 2's job, never a lossy trace-id reduction. Selectivity is the fixed leaf-class priority above (byte-deterministic, never a runtime probe). Every generator (indexed and fallback alike) carries the reader scan budget (`PULSUS_TRACEQL_SCAN_BUDGET_ROWS` as `max_rows_to_read` + throw): a query too broad to bound fails loud with `422 query_too_broad` — it is never silently slow and never quietly incomplete. Issue #398 adds the per-query memory ceiling `PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES` (`max_memory_usage` + `max_bytes_before_external_group_by=0`, throw-not-spill) to **every** trace read at all three settings origins — search, the independent catalog-discovery root, and the §4.2 trace-by-id point read, which carried no settings at all before — so a memory breach on any of them is a `422`, not a `500`. Phase-1 generators layer their own tighter `PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES` on top and keep their own reason.
-
-The engine merges the per-generator `(trace_id, bound_ts)` tuples in Rust — an explicit `max(bound_ts)` per trace, ranked `(bound_ts DESC, trace_id ASC)`. `bound_ts` (the newest *leaf-matching* span's timestamp) is an upper bound on the trace's final public sort key (the max timestamp of its *exactly-matched* spans, a subset), which licenses the early termination below.
-
-**Phase 2 — streaming batched exact evaluation.** Candidates are consumed newest-bound-first in batches of `BATCH_TRACES` (32). Per batch: spans hydrate by primary key (`WHERE trace_id IN (batch) AND <time>`, `LIMIT {MAX_SPANS_PER_TRACE + 1} BY trace_id` — `MAX_SPANS_PER_TRACE` = 10,000; the `+1` probe distinguishes exactly-at-cap from overflow, and an overflowing trace is evaluated on its truncated span set and the response then omits `metrics.completedJobs`), deduped by `span_id` (at-least-once replays, no `FINAL`). **The deduplication keeps the FIRST row per `span_id` in the hydration read's `(trace_id, timestamp_ns, span_id)` order**, and the selector is then applied to that survivor — so two rows sharing a `(trace_id, span_id)` and disagreeing on a projected column are resolved to one of them, and where their timestamps are equal the choice is merge-order dependent. That resolution is the reason a pushed spanset aggregate is bounded by the six (aggregate, operator) cells it is (issue #492 part 5): the statement aggregates the generator's ROWS and the evaluator its deduplicated, selector-matched spans, so the generator's rows are always a superset and `count()`/`max` read HIGH while `min` reads LOW; each distinct attribute condition is **one predicate column on that same hydration statement** (issue #557) — `arrayFirstIndex` over the span row's `(attr_key, attr_scope)` arrays locates the element the span's attribute resolves to, and the condition's value test is applied to that element — so an attribute condition costs no statement of its own. The engine then evaluates the full boolean tree per span (physical leaves on hydrated columns; an attribute leaf is membership in the set that column filled; `!=`/`!~` match a span iff it is NOT in that set — absent-key spans match, and over the multi-valued `event`/`link` scopes the set is any-element, so the negation is all-match), applies the cross-spanset algebra with matched-span membership preserved (`{A} && {B}` = trace-level intersection, spanset = union of matched spans; `||` = union; the structural relations `>`/`>>`/`<`/`<<`/`~` — issues #172/#183 — compute the child/descendant/parent/ancestor/sibling result over the hydrated spans' `parent_id` graph in O(spans) per trace, budget-charged, cycle-guarded; the **plain** form keeps the **RHS-only** matched set, the **negated** form (`!>` …) keeps the RHS spans NOT satisfying the relation — with an empty LHS the whole RHS set — and the **union** form (`&>` …) keeps both participating sides; field-vs-field comparison `{ .a = .b }` — issue #183 — resolves both operands per span and compares engine-side, its Phase-1 pruning being the attribute operand's key-existence `(key)` scan), evaluates the pipeline (`count`/`sum`/`avg`/`min`/`max` over the matched spans, attribute aggregates via a batched `val_num` read; `select()` projects response fields only), and pushes survivors into a `limit`-size heap of **response summaries only** — never hydrated spans or payloads. Consumption stops when the heap is full and the next candidate's `bound_ts` is strictly below the k-th held sort key (no unseen candidate can enter the top-K), at exhaustion, or at the `PULSUS_TRACEQL_MAX_CANDIDATES` consumption ceiling. Winners get one trace-wide root hydration (a `trace_id` PK read with **no** time predicate — the true root may predate the search window; root = `parent_id` all-zero, else timestamp-earliest).
-
-**Trace-level intrinsics evaluate via trace-wide co-loads** (issue #184 — `traceDuration`/`trace:duration`, `rootName`/`trace:rootName`, `rootServiceName`/`trace:rootService`, `span:childCount`). These are whole-trace values, so evaluating them over the window-bounded hydrated spans would truncate window-spanning traces; instead, Phase 2 issues up to two additional per-batch reads over the candidate `trace_id` set — **deliberately window-free `trace_id IN` PK reads** (the winners' root-hydration contract generalized to the filter phase), making the evaluated values full-trace-exact regardless of the search window or the per-trace hydration cap, with zero write amplification and no rollup table. The trace-context read (`GROUP BY trace_id`): `min(timestamp_ns)`, `max(timestamp_ns + duration_ns)` (→ `traceDuration`), and `argMin(name/service, (toUInt8(parent_id != <zero>), timestamp_ns, span_id))` — the exact `pick_roots` selection order (a true zero-parent root beats any non-root, then earliest `(timestamp_ns, span_id)`), value-projected through the SAME byte-cap expression as the displayed-root read, so the evaluated root strings and the response's root summary can never disagree, capped or not, rooted or root-less. The child-count read: `count(DISTINCT span_id) GROUP BY trace_id, parent_id` (replay-deduped; an absent parent key means 0 children). Both reads are issued only when the plan references the corresponding intrinsics — every other query pays nothing; `trace:id` needs neither (the candidate's id is compared engine-side against its lowercase-hex rendering, and its Phase-1 generator is the `trace_id` PK prefix). A query filtering **only** on a trace-level intrinsic degrades to the same time-range superset class as `{}` today (scale characterization → #25).
-
-**Ordering and partiality contracts** (public, docs/api.md §4.2): `traces[]` is ordered by the max timestamp of each trace's exactly-matched spans, descending, `trace_id` ascending as the tiebreak. Partiality is signalled by omission: the response OMITS `metrics.completedJobs`, leaving `{"totalJobs":1}`, whenever ANY bound engaged before natural exhaustion: (a) a generator returned `cap + 1` rows — and since issue #492 part 4 a generator whose statement carries a pushed spanset aggregate returns a SUPERSET of the traces that pass it (part 5: the aggregate is computed over the generator's rows and the evaluator's is computed over its deduplicated, selector-matched spans, so the statement admits traces phase 2 then drops), so the cap is charged against that superset rather than against the traces the selector matched, and the same query can now be complete where it was partial, (b) the consumption ceiling was reached with a lookahead candidate present, (c) a per-trace span overflow occurred. The engine's own flag is still called `partial`; it has carried no wire field of that name since #464 (docs/api.md §4.2). Budget breaches (scan rows, read/result bytes, or the engine's 256 MiB retention counter — §7) are hard `422`s, never partial results.
-
-**Structural operators need no SQL of their own** (issue #172 design spike, ratified; extended to all 15 forms in #183) **on today's engine; the search statement answers `>`, `<` and `~` itself** (issue #593 part 1): each, plain, `!` or `&`, compiles to one per-span membership predicate whose relation reads the other side through a `(trace_id, …) IN` subquery over the request window, and `>>` and `<<` climb in the same statement (issue #593 part 2), so what follows describes only the previous engine, which no search reaches since issue #602 part 2b and part 2c deletes. On today's engine a structural relation is a per-trace set computation over data Phase 2 must fetch anyway — the hydration read already selects `parent_id`, and both operands' filters need the spans regardless — so `{A} > {B}` / `>>` / `<` / `<<` / `~` and their negated (`!>` …) and union (`&>` …) modifiers all plan as the **superset union of both operands' generators, byte-identical to the equivalent `{A} && {B}` plan** (pinned by an SQL-identity test across all 5 base ops × 3 modifiers), and the parent-id walk runs engine-side in Phase 2: one adjacency pass per trace, O(spans), bounded by `MAX_SPANS_PER_TRACE`, every intermediate charge-before-allocate against the request budget. The one genuinely new #183 read path, field-vs-field comparison (`{ .a = .b }`), prunes Phase-1 on the LHS attribute's **key-existence `(key)` scan** (an index-served superset — a matching span must possess the key) rather than a bare time-range fallback; both operands' `val`/`val_num` reads hydrate per candidate span for the engine-side compare. A recursive CTE was rejected (server-side unbounded graph recursion, cannot express the attr-membership legs without duplicating the Phase-2 evaluator in SQL, no clean mapping onto the layered budget contract) and a `trace_spans` self-join was rejected (handles only `>`, and both operands still need Phase-2 exactness — read amplification without removing any work). Because the SQL stage set is unchanged, the `cityHash64(trace_id)` co-sharding (§7) keeps structural search shard-local with the already-verified evidence, and the scan-budget contract threads through untouched.
-
-The worked example `{ resource.service.name = "checkout" && span.http.status_code >= 500 && duration > 2s }` (last 3h, limit 20) therefore runs: one Phase-1 generator — the service-equality projection read above (`PREWHERE service = 'checkout'`, the conjunction's most selective leaf) — then per batch ONE hydration statement carrying `arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS pi0` and the predicate column `[(pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0)] AS attr_slot`, with `duration_ns > 2000000000` evaluated on the hydrated physical column; the byte-frozen SQL lives in `crates/pulsus-read/tests/golden/traces_search/`.
-
-**TraceQL metrics** (`{...} | rate()` / `| count_over_time()`, issue #59) — one fully-pushed-down, time-bucketed conditional aggregation per request (never the two-phase candidate model). Since issue #596 that is one statement on the span table for every shape but `compare()` (the "value aggregations" bullet below says what it reads); the rest of this section describes the previous planner, which `compare()` still takes. For `{ resource.service.name = "checkout" && span.http.status_code >= 500 && duration > 2s } | rate()` at step 60s:
-
-```sql
-SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t,
-       uniqExact(trace_id, span_id) AS n
-FROM trace_spans
-PREWHERE service = 'checkout'
-WHERE timestamp_ns >= {S - step + 1ns} AND timestamp_ns < {E + 1ns}
-  AND ((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx
-       WHERE date >= toDate({S}) AND date <= toDate({E - 1ns})
-         AND timestamp_ns >= {S} AND timestamp_ns < {E}
-         AND key = 'http.status_code' AND val_num >= 500 AND scope = 'span') AND duration_ns > 2000000000)
-GROUP BY t
-ORDER BY t ASC
-```
-
-- **Counting is `uniqExact(trace_id, span_id)`** — the T5 logical-span identity, so at-least-once replays never inflate a bucket (no `FINAL`). `rate` divides the deduped count by the step **client-side at the encode boundary** (the instant `/query` form drops the `GROUP BY` and divides by the snapped window width); `count_over_time` ships the count as-is — the SQL body is byte-identical for both functions.
-- **Snapped window, RIGHT-CLOSED range buckets:** `{S} = ⌊start/step⌋·step`, `{E} = ⌈end/step⌉·step` (epoch-aligned, outward). The **range** form labels a bucket by its RIGHT edge — label `L` covers the instants `(L − step, L]`, so an instant landing exactly on a grid point belongs to THAT point — and its window is correspondingly `(S − step, E]`, one whole step wider on the left (the extra leading bucket the emitted grid begins with) and inclusive of `E`. Over integer nanoseconds that is exactly the left-closed/right-open `[S − step + 1, E + 1)` the SQL renders, so the time and date clauses are unchanged in shape. The `- 1` inside `toStartOfInterval` and the `+ step` after it are what turn a floor into a ceiling; deleting either makes the boundary go right and moves every sample one step. **The range label's interval is rendered in NANOSECONDS** (`INTERVAL {step_ms * 1000000} NANOSECOND`), unlike the instant form's: measured on 26.3.17.110, `toStartOfInterval(DateTime64(9), INTERVAL n MILLISECOND)` converts to the interval's unit by ROUNDING before it floors, which erases a one-nanosecond shift and degenerates the ceiling back into `left_edge + step`. The **instant** form keeps the plain left-closed/right-open `[S, E)`. Every emitted bucket is full-width, so the rate denominator is always the full step. `toUnixTimestamp64Milli(...)` pins the bucket column to a deterministic `Int64` epoch-milliseconds wire type (covers pre-1970/post-2106 buckets that a `UInt32` epoch-seconds column would wrap — issue #59 re-audit). The bucketing interval is rendered in **milliseconds** (`INTERVAL {step_ms} MILLISECOND`, the unit the step is carried in end to end), not seconds: ClickHouse 26.3.17.110's `toStartOfInterval` downgrades a `DateTime64` argument to a 32-bit `DateTime` for whole-second-and-larger interval units (re-measured on the version move — issue #376), silently clamping pre-1970/post-2106 instants (and then rejecting `toUnixTimestamp64Milli`'s `DateTime64` argument outright); the millisecond-unit form keeps `DateTime64(3)` precision and range end to end.
-- **Access paths:** a root-AND-spine `resource.service.name =` conjunct (never one inside/under an `||`) hoists to `PREWHERE` and selects the `service_time` projection; every attribute leaf is a **locate-then-test predicate on the span row's own arrays** (issue #559) — a `WITH` item `arrayFirstIndex((k, s) -> k = … AND s = …, attr_key, attr_scope) AS <alias>` locates the element the span's attribute resolves to and the `WHERE` clause tests that element, with `NOT (…)` around the positive test implementing the ratified absent-key negation rule; physical leaves render inline on `trace_spans` columns. Two consequences worth stating rather than leaving to be discovered. **A metrics filter now answers a span that repeats a key exactly as a search does** — the index carries no element ordinal, so the old `(trace_id, span_id) [NOT] IN (SELECT … FROM trace_attrs_idx …)` semi-join matched a span when ANY of its attribute rows matched, and the two routes disagreed. **And a filter carrying an attribute condition loses the `service_time` projection**, because that projection holds 14 named columns and not the attribute arrays: measured on a 2,000,000-span corpus — 8 attributes per span, 50 services with `checkout` 1 in 50, `http.status_code = 500` on 1 span in 100, ClickHouse 26.3.29.7 at `max_block_size = 65409`, `use_query_condition_cache = 0`, `optimize_move_to_prewhere = 1`, rebuilt by `docs/benchmarks/issue559-metrics-filter-bytes.sh`'s corpus rules — `{ resource.service.name = "checkout" } | rate()` reads `ReadFromMergeTree (service_time)` at `Granules: 7/245`, 57,344 rows and 1,892,563 bytes, while `{ resource.service.name = "checkout" && span.http.status_code >= 500 } | rate()` reads `ReadFromMergeTree (trace_spans)` at `245/245`, 2,000,000 rows and 290,003,920 bytes, with `query_log.projections` empty. **Granule, row and byte counts are layout-specific** — they hold for that corpus and those settings; what the guarding test asserts is the identity of the table read (`docs/benchmarks/traces-differential-ledger.md`, `traceql-attribute-resolves-to-one-element`).
-- **Bounded state:** the previous planner's reads (`compare()`) carry the trace read budgets plus the IN-set limits — `max_rows_in_set` (1,000,000) / `max_bytes_in_set` (64 MiB), `set_overflow_mode = 'throw'` → `422 query_too_broad`; the narrowed tag-values read carries the same. The metrics statement carries the budgets and no set limit: its sets are the seven fields' (issue #594 part 5), bounded by `reader.traceql_read_max_memory_bytes` (`422`). The bucket count is capped statically at plan time (docs/api.md §4.4).
-- **Clustered:** the reader additionally injects `distributed_product_mode = 'local'`, rewriting an `IN (SELECT … FROM <table>_dist …)` subquery to the **local** shard's table (exact under the `cityHash64(trace_id)` co-sharding, and it kills the `_dist`-inside-`_dist` double-distributed path). The readers on this route that depend on it are `compare()`'s attribute enumeration, the narrowed tag-values read and, since issue #594 part 5, the metrics statement whose filter reads one of the seven trace-level and nested-set fields; a filter on the span row alone sends no subquery. That statement runs with `statement_settings` (`crates/pulsus-read/src/traces/exec.rs`): the metrics settings, `final = 1`, `do_not_merge_across_partitions_select_final = 1`, `max_rows_in_set = 0` and `max_bytes_in_set = 0` (no set limit), and `distributed_product_mode = 'local'`. Its per-trace scalars (the trace-level values, the child-count buckets, `nested_keys`) read `traces_dist`: the coordinator evaluates each once, each shard reading its own `traces` rows, and hands the result to every shard as a constant. Its span read runs on every shard over that shard's `spans`, and the numbering and child-count `IN` subqueries over `spans_dist` inside it read the same shard's `spans` — measured on the two-shard fixture in the second shard's `system.query_log`. The time-bucket `GROUP BY` is **not** shard-local — buckets exist on every shard and the coordinator merges per-bucket partial states, bounded by the point cap × shard count (scale evidence routes to #25).
-- **Value aggregations, grouping, quantiles, histograms, exemplars (issue #182).** **Since issue #596 every shape but `compare()` is one statement on the span table**: `by()` on any key, up to five (four with a quantile or histogram), each key rendered as its text beside its stored type and labelled in that type (`intValue`, `doubleValue`, `boolValue`, `stringValue`); a numeric attribute of any scope or `span:childCount` as the target, its value unscaled (an intrinsic target other than `duration` and `span:childCount` stays `400`); the trace-level values read through one `LEFT JOIN` of `traces`, the nested-set numbers through one `LEFT JOIN` of the numbering, `span:childCount` through one `LEFT JOIN` of child counts per parent; a filter on any of the seven binds the search statement's per-trace scalar, child-count read and numbering instead (#594 part 5); the series cap counted inside the statement; a retried span collapsed by `final = 1`. The rest of this bullet describes the previous planner, which `compare()` still takes: `sum`/`min`/`max`/`avg_over_time(duration)` nest a per-`(t, [group], trace_id, span_id)` dedup inner query (`any(duration_ns)`) then aggregate the outer `toFloat64(sum|min|max|avg(val))`, so replays never inflate `sum`/`avg` (`min`/`max`/`count` are replay-idempotent by construction); the engine scales ns→seconds at the encode boundary. `by(resource.service.name)` adds the physical `service` column to the `SELECT`/`GROUP BY` (`… AS g0`) and runs a **distinct-by-key** cap probe (`SELECT count() FROM (SELECT <keys> … GROUP BY <keys> LIMIT cap+1)`, bounded by `reader.traceql_max_series`, default 1000) **before** the main query — a `cap+1` result is a static `422 query_too_broad`, bucket-count-independent by construction. `quantile_over_time` pushes `CAST(quantilesTDigest(q…)(val) AS Array(Float64))` (the #173 TDigest precedent) — a **deliberate, ledgered divergence** from the reference's bucket-walk percentile (`2026-08-05-traceql-quantile-over-time-tdigest`, docs/api.md §4.4.1); `histogram_over_time` pushes the reference's `Log2Bucketize` as `SELECT t, toUInt64(roundToExp2(val - 1)) * 2 AS bucket, count() AS n … WHERE val >= 2 GROUP BY t, bucket` over the SAME dedup inner query — one row per OCCUPIED `(t, bucket)`, a plain tally, never cumulative, with no bucket ladder (issue #252). Series are framed **ascending by bucket** — a ledgered divergence from the reference's lexicographic-on-`%g` order (`2026-08-05-traceql-histogram-series-order`, docs/api.md §4.4.1); ORDER only, with label values, tallies, counts and membership identical (the label TEXT differs for `2^10`..`2^13` ns, a separate recorded rendering difference with no ordering consequence). The `val >= 2` guard sits on the OUTER query, after the dedup: it reproduces the reference's sub-2ns drop and keeps the inner subquery byte-identical to the value aggregations', so PREWHERE hoisting, `service_time` projection selection and `trace_attrs_idx` granule pruning are untouched. `toUInt64` before the doubling is load-bearing — a duration above `2^62` buckets to `2^63`, which the signed form wraps to a negative `__bucket` label. Rows per step are bounded by the bit width of `Int64` — 63 buckets are reachable (`2^1`..`2^63`), gated against a static ceiling of 64 — so the bucket axis cannot breach `traceql_max_series`; throughput at 1 TB → #25. Exemplars are collected for every range shape by default: a bounded `groupArraySample(K, seed)(tuple(trace_id, timestamp_ns))` per bucket, framed into `trace:id` exemplars whose value is read at the bucket's right-closed label. `K` is the resolved TOTAL budget spread over the grid (at least 1), and the collected list is thinned to that total engine-side — the SQL cannot bound a total, because `groupArraySample`'s own `k` is per group. The extra statement is skipped outright when no framed sample is non-zero, which is the common shape for a sparse panel. `with(exemplars=…)` and the `exemplars` request parameter are the two inputs, hint first (docs/api.md §4.4); `topk`/`bottomk` reduce the (probe-capped) series set client-side per timestamp. `compare({selection})` builds an attribute cross-tab — a replay-deduped base (`GROUP BY t, trace_id, span_id`) `arrayJoin`ed over the `name`/`kind`/`status`/`resource.service.name`/`statusMessage`/`instrumentation:name`/`instrumentation:version` intrinsics and joined to the `DISTINCT (scope.key, val)` index attributes, counting `countIf(is_sel = 0)` (baseline complement) and `countIf(is_sel)` (selection) per `(t, key, value)`, plus per-key totals — bounded by the same `traceql_max_series` distinct-`(key, value)` cap probe. `statusMessage` comes from the per-span `status_message` column; every span has a `""`-or-value (no absent case), and an empty value is emitted verbatim as a DISTINCT `""` value — Tempo v3.0.2 parity (issue #185/#189: no `arrayFilter` fold-to-nil). `instrumentation:name`/`instrumentation:version` source the per-span `scope_name`/`scope_version` columns the same way (issue #192): real per-value baseline/selection counts, a scopeless span contributing the distinct `""` value. `rootName`/`rootServiceName` are resolved by a **window-free** per-trace roots read `LEFT JOIN`ed into the intrinsics branch (`argMin(name/service, root ordering)` over `trace_spans WHERE trace_id IN (SELECT DISTINCT trace_id FROM base)`, no date/time predicate) — byte-identical root selection to the §Phase-2 trace-context co-load, so compare()'s roots can never disagree with search's; it is trace-wide-exact yet bounded by the same `max_rows_in_set`/`max_rows_to_read` throw budgets (scale → issue #25). A trailing `… > 5` result comparison post-filters samples client-side. These endpoints emit the **Tempo-native `{series, metrics}` body** (docs/api.md §4.4), not the Prometheus matrix/vector envelope.
-
-**Service graph** (`GET /api/traces/v1/service_graph`, issue #173) — one fully-pushed-down two-level aggregation over the `trace_edges` half-row ledger (§4.1), both aggregation levels in ClickHouse:
-
-```sql
-SELECT
-    c.service AS client,
-    s.service AS server,
-    s.conn_type AS conn_type,
-    count() AS calls,
-    countIf(greatest(s.failed, c.failed) = 1) AS failed,
-    CAST(quantilesTDigest(0.5, 0.95, 0.99)(s.duration_ns) AS Array(Float64)) AS quantiles_ns
-FROM
-(
-    SELECT trace_id, span_id, any(pair_id) AS pair_id, any(conn_type) AS conn_type,
-           any(service) AS service, max(duration_ns) AS duration_ns, max(failed) AS failed
-    FROM trace_edges
-    WHERE side = 1 AND date >= toDate({S}) AND date <= toDate({E - 1ns})
-      AND timestamp_ns >= {S} AND timestamp_ns < {E}
-    GROUP BY trace_id, span_id
-) AS s
-INNER JOIN
-(
-    SELECT trace_id, pair_id, any(conn_type) AS conn_type,
-           any(service) AS service, max(failed) AS failed
-    FROM trace_edges
-    WHERE side = 0 AND date >= toDate({S}) AND date <= toDate({E - 1ns})
-      AND timestamp_ns >= {S} AND timestamp_ns < {E}
-    GROUP BY trace_id, pair_id
-) AS c
-ON c.trace_id = s.trace_id AND c.pair_id = s.pair_id AND c.conn_type = s.conn_type
-GROUP BY client, server, conn_type
-ORDER BY calls DESC, client ASC, server ASC
-LIMIT {SERVICE_GRAPH_MAX_EDGES + 1}
-```
-
-- **Determinism (merge-invariant).** Every half-row carries its own plain `timestamp_ns`, evaluated per stored row, so window membership of each half is merge-invariant; the per-side `GROUP BY` performs exactly the `ReplacingMergeTree` collapse at read time, so the *edge set* and its replay-deduped `calls`/`failed` counts are a pure function of the deduped in-window half-rows — **byte-identical before and after `OPTIMIZE TABLE trace_edges FINAL`**. The `quantilesTDigest` latency quantiles are the one exception: TDigest is an approximate, merge-order-sensitive estimator, so a merge can shift a quantile slightly — they are stable only within a tolerance band (the live gate bounds the drift at ±5% + 1ns), never asserted byte-equal. An edge is reported iff BOTH halves' own timestamps fall in `[S, E)` (the normative window rule, docs/api.md §4.5); a window edge with one half only is dropped by the `INNER JOIN`.
-- **Pruning (perf mandate).** Each half-scan prunes on the daily-partition `date` MinMax (the Tier-1 EXPLAIN gate) **and** the leading-`side` PrimaryKey prefix. The scan is over the payload-free ledger (~2 narrow rows per RPC edge instance vs full spans). Counting is `count()` over the deduped, `pair_id`-joined edge instances — never a bare count on the raw ledger.
-- **Quantiles wire type.** `quantilesTDigest` over `Int64` is `CAST` to `Array(Float64)` so the wire type is pinned independent of the server's internal default (which is `Array(Float32)` on 26.3.17.110, re-measured on the version move — issue #376) — the whole edge-row decode path carries no f32 (`GraphEdgeRow.quantiles_ns: Vec<f64>`, `[p50, p95, p99]`).
-- **Bounded response, bounded state.** `max_rows_to_read = reader.traceql_scan_budget_rows` (throw) bounds the join's scan + hash-table cost → `422 query_too_broad`; `LIMIT SERVICE_GRAPH_MAX_EDGES + 1` bounds the returned edge set (the extra row flips a non-silent `truncated` flag). The join hash table is bounded by the in-window deduped client halves.
-- **Clustered.** The SQL names the `_dist` ledger on both sides and the reader injects `distributed_product_mode = 'local'` (the ratified §4.2/§4.4 semi-join pattern): halves co-shard on `cityHash64(trace_id)`, so every joinable pair is shard-local, the join executes per shard, and the initiator merges only per-`(client, server, conn_type)` partial states (TDigest states merge), bounded by distinct service-pair labels, not by edge instances (scale evidence routes to #25).
-
----
-
-### 4.3 The landing table and the five tables the TraceQL reads query
-
-Issues #584 to #586. **One push is one `INSERT` of one block into
-`trace_landing`**, and the five tables below are each one materialized view
-away from it; the writer names none of them. The shape, the sealed block, the
-insert loop and its two fates, the budget and the byte accounting are
-`docs/ingest-one-source-table.md`'s and are not restated here.
-
-The six tables are **additional**: the reads that have not moved still answer
-from `trace_spans` and `trace_attrs_idx` (§4.1, §4.2), so a trace push
-performs three inserts — that path's two and this one. **No equivalence
-between the two stores is claimed, required or tested.**
-
-```sql
-CREATE TABLE trace_landing (
-    event_id        UUID DEFAULT generateUUIDv7(),
-    received_ms     Int64  CODEC(DoubleDelta, ZSTD(1)),
-    row_kind        UInt8  CODEC(ZSTD(1)),
-    trace_id        FixedString(16)  CODEC(ZSTD(1)),
-    span_id         FixedString(8)  CODEC(ZSTD(1)),
-    parent_span_id  FixedString(8)  CODEC(ZSTD(1)),
-    start_ns        Int64  CODEC(Delta, ZSTD(1)),
-    duration_ns     Int64  CODEC(T64, ZSTD(1)),
-    resource_id     UInt128  CODEC(ZSTD(1)),
-    name            LowCardinality(String)  CODEC(ZSTD(1)),
-    kind            Int32  CODEC(ZSTD(1)),
-    status_code     Int32  CODEC(ZSTD(1)),
-    status_message  String  CODEC(ZSTD(1)),
-    trace_state     String  CODEC(ZSTD(1)),
-    flags           UInt32  CODEC(ZSTD(1)),
-    scope_name      LowCardinality(String)  CODEC(ZSTD(1)),
-    scope_version   LowCardinality(String)  CODEC(ZSTD(1)),
-    scope_attrs     JSON  CODEC(ZSTD(1)),
-    events          Array(Tuple(time_ns UInt64, name LowCardinality(String), attrs JSON, attrs_other String, dropped_attrs UInt32))  CODEC(ZSTD(1)),
-    dropped_events  UInt32  CODEC(ZSTD(1)),
-    links           Array(Tuple(trace_id String, span_id String, trace_state String, flags UInt32, attrs JSON, attrs_other String, dropped_attrs UInt32))  CODEC(ZSTD(1)),
-    dropped_links   UInt32  CODEC(ZSTD(1)),
-    service         LowCardinality(String)  CODEC(ZSTD(1)),
-    attrs           JSON  CODEC(ZSTD(1)),
-    attrs_other     String  CODEC(ZSTD(1)),
-    dropped_attrs   UInt32  CODEC(ZSTD(1)),
-    day             Date  CODEC(ZSTD(1)),
-    schema_url      String  CODEC(ZSTD(1)),
-    tag_scope       LowCardinality(String)  CODEC(ZSTD(1)),
-    tag_key         String  CODEC(ZSTD(1)),
-    tag_value       String  CODEC(ZSTD(1)),
-    tag_type        LowCardinality(String)  CODEC(ZSTD(1)),
-    scope_schema_url    String               CODEC(ZSTD(1)),
-    scope_dropped_attrs UInt32               CODEC(ZSTD(1)),
-    scope_attrs_other   String               CODEC(ZSTD(1)),
-    end_ns              UInt64               CODEC(Delta, ZSTD(1)),
-    entity_refs         String               CODEC(ZSTD(1)),
-    service_type        LowCardinality(String)  CODEC(ZSTD(1))
-) ENGINE = MergeTree
-PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
-ORDER BY (row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)
-SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, async_insert = 0;
-
-CREATE TABLE spans (
-    trace_id        FixedString(16)          CODEC(ZSTD(1)),
-    span_id         FixedString(8)           CODEC(ZSTD(1)),
-    parent_span_id  FixedString(8)           CODEC(ZSTD(1)),
-    start_ns        Int64                    CODEC(Delta, ZSTD(1)),
-    duration_ns     Int64                    CODEC(T64, ZSTD(1)),
-    service         LowCardinality(String)   CODEC(ZSTD(1)),
-    resource_id     UInt128                  CODEC(ZSTD(1)),
-    name            LowCardinality(String)   CODEC(ZSTD(1)),
-    kind            Int32                    CODEC(ZSTD(1)),
-    status_code     Int32                    CODEC(ZSTD(1)),
-    status_message  String                   CODEC(ZSTD(1)),
-    trace_state     String                   CODEC(ZSTD(1)),
-    flags           UInt32                   CODEC(ZSTD(1)),
-    scope_name      LowCardinality(String)   CODEC(ZSTD(1)),
-    scope_version   LowCardinality(String)   CODEC(ZSTD(1)),
-    scope_attrs     JSON                     CODEC(ZSTD(1)),
-    attrs           JSON                     CODEC(ZSTD(1)),
-    attrs_other     String                   CODEC(ZSTD(1)),
-    dropped_attrs   UInt32                   CODEC(ZSTD(1)),
-    events          Array(Tuple(time_ns UInt64, name LowCardinality(String), attrs JSON, attrs_other String, dropped_attrs UInt32)) CODEC(ZSTD(1)),
-    dropped_events  UInt32                   CODEC(ZSTD(1)),
-    links           Array(Tuple(trace_id String, span_id String, trace_state String, flags UInt32, attrs JSON, attrs_other String, dropped_attrs UInt32)) CODEC(ZSTD(1)),
-    dropped_links   UInt32                   CODEC(ZSTD(1)),
-    scope_schema_url    String               CODEC(ZSTD(1)),
-    scope_dropped_attrs UInt32               CODEC(ZSTD(1)),
-    scope_attrs_other   String               CODEC(ZSTD(1)),
-    end_ns              UInt64               CODEC(Delta, ZSTD(1)),
-    service_type        LowCardinality(String)  CODEC(ZSTD(1)),
-    INDEX idx_service service TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_name name TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_resource resource_id TYPE bloom_filter(0.01) GRANULARITY 1
-    -- INDEX idx_attr_<n> <expression> TYPE bloom_filter(0.01) GRANULARITY 1, one per PULSUS_TRACEQL_INDEXED_ATTRIBUTES item:
-    --   span.<key>:  arrayMap(x -> ifNull(x, ''), arrayConcat(attrs.`P`.:`Array(Nullable(String))`, [attrs.`P`.:String]))
-    --   event.<key>: arrayMap(x -> ifNull(x, ''), arrayConcat(events.attrs.`P`.:String, arrayFlatten(events.attrs.`P`.:`Array(Nullable(String))`)))
-    --   where P is the key with each '.' written '%2E'
-) ENGINE = ReplacingMergeTree
-PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
-ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
-TTL toDateTime(least(intDiv(start_ns, 1000000000) + (7 * 86400), 4294967295))
-SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1;
-
-The `idx_attr_<n>` indexes exist only for the attributes `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` names (`docs/configuration.md` §3); a search whose filter requires `key = "<string>"` on one of them skips the granules that hold no such string.
-
-CREATE TABLE traces (
-    day           Date                                                 CODEC(ZSTD(1)),
-    trace_id      FixedString(16)                                      CODEC(ZSTD(1)),
-    start_ns      SimpleAggregateFunction(min, Int64)                  CODEC(ZSTD(1)),
-    end_ns        SimpleAggregateFunction(max, Int64)                  CODEC(ZSTD(1)),
-    root          SimpleAggregateFunction(min, Tuple(UInt8, Int64, FixedString(8), String, String)) CODEC(ZSTD(1)),
-    services      SimpleAggregateFunction(groupUniqArrayArray, Array(String)) CODEC(ZSTD(1)),
-    last_start_ns SimpleAggregateFunction(max, Int64)                         CODEC(Delta, ZSTD(1)),
-    buckets       SimpleAggregateFunction(groupUniqArrayArray(4096), Array(Int64))  CODEC(ZSTD(1))
-) ENGINE = AggregatingMergeTree
-PARTITION BY day
-ORDER BY trace_id
-TTL toDateTime(least(intDiv(last_start_ns, 1000000000) + (7 * 86400), 4294967295))
-SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;
-
-CREATE TABLE resources (
-    day            Date                    CODEC(ZSTD(1)),
-    resource_id    UInt128                 CODEC(ZSTD(1)),
-    service        LowCardinality(String)  CODEC(ZSTD(1)),
-    attrs          JSON                    CODEC(ZSTD(1)),
-    attrs_other    String                  CODEC(ZSTD(1)),
-    dropped_attrs  UInt32                  CODEC(ZSTD(1)),
-    schema_url     String                  CODEC(ZSTD(1)),
-    entity_refs    String                  CODEC(ZSTD(1))
-) ENGINE = ReplacingMergeTree
-PARTITION BY day
-ORDER BY (service, resource_id)
-TTL toDateTime(least(((toUInt32(day) + 1) * 86400) + (7 * 86400), 4294967295));
-
-CREATE TABLE tag_names (
-    scope  LowCardinality(String)  CODEC(ZSTD(1)),  -- span | resource | event | link | instrumentation
-    key    String                  CODEC(ZSTD(1))
-) ENGINE = ReplacingMergeTree
-ORDER BY (scope, key);
-
-CREATE TABLE tag_values (
-    scope     LowCardinality(String)  CODEC(ZSTD(1)),
-    key       String                  CODEC(ZSTD(1)),
-    value     String                  CODEC(ZSTD(1)),
-    val_type  LowCardinality(String)  CODEC(ZSTD(1))  -- string | int | float | bool
-) ENGINE = ReplacingMergeTree
-ORDER BY (scope, key, value, val_type);
-
-CREATE MATERIALIZED VIEW spans_mv TO spans AS
-SELECT trace_id AS trace_id, span_id AS span_id, parent_span_id AS parent_span_id,
-       start_ns AS start_ns, duration_ns AS duration_ns, service AS service,
-       resource_id AS resource_id, name AS name, kind AS kind,
-       status_code AS status_code, status_message AS status_message,
-       trace_state AS trace_state, flags AS flags,
-       scope_name AS scope_name, scope_version AS scope_version,
-       scope_attrs AS scope_attrs, attrs AS attrs, attrs_other AS attrs_other,
-       dropped_attrs AS dropped_attrs, events AS events, dropped_events AS dropped_events,
-       links AS links, dropped_links AS dropped_links,
-       scope_schema_url AS scope_schema_url,
-       scope_dropped_attrs AS scope_dropped_attrs,
-       scope_attrs_other AS scope_attrs_other, end_ns AS end_ns,
-       service_type AS service_type
-FROM trace_landing WHERE row_kind = 0;
-
-CREATE MATERIALIZED VIEW resources_mv TO resources AS
-SELECT day AS day, resource_id AS resource_id, service AS service, attrs AS attrs,
-       attrs_other AS attrs_other, dropped_attrs AS dropped_attrs, schema_url AS schema_url,
-       entity_refs AS entity_refs
-FROM trace_landing WHERE row_kind = 1;
-
-CREATE MATERIALIZED VIEW traces_mv TO traces AS
-SELECT toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, s AS start_ns, e AS end_ns,
-       r AS root, sv AS services,
-       ls AS last_start_ns, bk AS buckets
-FROM (SELECT trace_id, min(start_ns) AS s,
-             max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), 9223372036854775807))) AS e,
-             min((toUInt8(parent_span_id != toFixedString('', 8)), start_ns, span_id,
-                  if(service_type = 'string', toString(service), ''), toString(name))) AS r,
-             groupUniqArrayIf(toString(service), service_type = 'string') AS sv,
-             max(start_ns) AS ls,
-             groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk
-      FROM trace_landing WHERE row_kind = 0
-      GROUP BY trace_id);
-
-CREATE MATERIALIZED VIEW tag_names_mv TO tag_names AS
-SELECT tag_scope AS scope, tag_key AS key
-FROM trace_landing WHERE row_kind = 2;
-
-CREATE MATERIALIZED VIEW tag_values_mv TO tag_values AS
-SELECT tag_scope AS scope, tag_key AS key, tag_value AS value, tag_type AS val_type
-FROM trace_landing WHERE row_kind = 3;
-```
-
-**Four discriminating values, five views, five targets.** `row_kind` says which
-landed event a row is; a row sets that kind's columns and the rest default.
-
-| `row_kind` | the landed event | emitted |
-|---|---|---|
-| 0 | a span | one per decoded span |
-| 1 | a resource | one per distinct `(resource_id, day)` **in the push** |
-| 2 | a tag name | one per distinct `(scope, key)` **in the push** |
-| 3 | a tag value | one per distinct `(scope, key, value, type)` **in the push** |
-
-- **The discriminator is `row_kind`, not `kind`.** A span carries an OTLP span
-  kind in a column already called `kind`, which `spans` and its
-  `ReplacingMergeTree` key both use; two columns cannot both be `kind`.
-- **`service`, `attrs`, `attrs_other` and `dropped_attrs` are shared between
-  kind 0 and kind 1.** A span's attributes and a resource's are never on one
-  row, so one JSON column serves both, the way `log_landing.timestamp_ns`
-  serves a line time and a pattern bucket.
-- **The sorting key has two runs because the kinds do.** After the
-  discriminator it mirrors `spans`' own `(trace_id, start_ns, span_id, kind)`;
-  `tag_key, tag_value` last order kinds 2 and 3 inside themselves, where the
-  four span columns are all at their defaults.
-- **There is no cache of anything already written, anywhere on this path.**
-  Kinds 1, 2 and 3 are deduplicated **inside the push only**, from the push's
-  own decoded spans. A push that fails re-emits everything next time. The two
-  shipped signals can key a commit-promoted LRU on a time bucket, so a
-  registration lost to a fan-out failure reappears at the next bucket;
-  `tag_names` and `tag_values` are time-less by contract (`docs/api.md` §4.3)
-  and have no heal interval at all.
-- **`async_insert = 0` is on the landing table because the query pin cannot
-  reach the table setting.** `executeQuery.cpp` disjoins
-  `table->areAsynchronousInsertsEnabled()` into a local that both the
-  eligibility and the execution block read, and the query setting's explicit
-  `0` is never consulted again. What the `CREATE` value defends against is a
-  server-wide `<merge_tree>` default; nothing defends against a deliberate
-  `ALTER TABLE … MODIFY SETTING` on this table.
-- **`event_id` is the landed event's identity and the writer never sets it.**
-  It is not the retry mechanism: that is the `insert_deduplication_token` the
-  writer mints per sealed block.
-- **The landing table has no `_dist` wrapper**, for the reason `log_landing`
-  has none: a push carries many trace ids, so inserting the push itself
-  through a `Distributed` wrapper would split one push per shard and one push
-  would stop being one block. The routing happens one step later, on the way
-  out of the two per-trace views (§7).
-- **The catalogs carry no TTL; the other three targets carry one in their
-  `CREATE`.** `spans` expires on `start_ns`, `traces` on `last_start_ns`, and
-  `resources` on the end of its `day`, each plus `PULSUS_RETENTION_DAYS` in the
-  saturating form. `tag_names` and `tag_values` carry a deduplication window
-  and no TTL, because `docs/api.md` §4.3 requires catalog entries to outlive
-  span retention.
-- **Six deduplication windows, one per write-path table.** A view's insert
-  into its target carries a block id derived from the source block, and only a
-  table with a window recognises the repeat.
+**Ordering and partiality contracts** (public, docs/api.md §4.2): `traces[]` is ordered by the max timestamp of each trace's exactly-matched spans, descending, `trace_id` ascending as the tiebreak. Partiality is signalled by omission: the response OMITS `metrics.completedJobs`, leaving `{"totalJobs":1}`, when the engine's own flag, still called `partial`, is set, and the search statement never sets it, so every search answers `{"completedJobs":1,"totalJobs":1}`. Budget breaches are hard `422`s, never partial results.
 
 ## 5. Profiles
 
@@ -1589,14 +986,14 @@ The script reads the same environment variables the binary does ([configuration.
 
 ## 7. Distributed layout
 
-Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family, and every **per-shard** table but the three landing tables, `metric_label_values` and `service_edges` gets a Distributed wrapper. Twelve tables get none. Three are the landing tables — `log_landing`, `metric_landing` and `trace_landing` (issues #603 and #586; the reason, and what it costs, are below, in [ingest-one-source-table.md](ingest-one-source-table.md), and in §4.3's own bullet for the trace landing table). `metric_label_values` is per-shard and gets none because every statement names it locally, inside a read dispatched with `distributed_product_mode = 'local'`, beside the same shard's label index rows (issue #635). `service_edges` is per-shard and has none because the service graph reads it only through `cluster(…, view(…))`, one per-shard statement that also pairs that shard's spans (issue #599). The other seven are the cluster-wide ones, one replica set each spanning every shard (`/clickhouse/tables/all/<db>.<table>`), read from the local replica without fan-out, so a wrapper would put a row on one shard and leave every other shard's read missing it permanently: `metric_metadata`, `trace_tag_catalog`, `resources`, `tag_names`, `tag_values`, `tag_bucket_values` and `service_bucket_resources` — the last row of the table below is theirs. **Sharding keys are chosen so that reads join and aggregate shard-locally** (finding #2):
+Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family, and every **per-shard** table but the three landing tables, `metric_label_values` and `service_edges` gets a Distributed wrapper. Eleven tables get none. Three are the landing tables — `log_landing`, `metric_landing` and `trace_landing` (issues #603 and #586; the reason, and what it costs, are below, and in [ingest-one-source-table.md](ingest-one-source-table.md)). `metric_label_values` is per-shard and gets none because every statement names it locally, inside a read dispatched with `distributed_product_mode = 'local'`, beside the same shard's label index rows (issue #635). `service_edges` is per-shard and has none because the service graph reads it only through `cluster(…, view(…))`, one per-shard statement that also pairs that shard's spans (issue #599). The other six are the cluster-wide ones, one replica set each spanning every shard (`/clickhouse/tables/all/<db>.<table>`), read from the local replica without fan-out, so a wrapper would put a row on one shard and leave every other shard's read missing it permanently: `metric_metadata`, `resources`, `tag_names`, `tag_values`, `tag_bucket_values` and `service_bucket_resources` — the last row of the table below is theirs. **Sharding keys are chosen so that reads join and aggregate shard-locally** (finding #2):
 
 | Table | Sharding key | Why |
 |-------|--------------|-----|
 | `metric_samples`, `metric_hist_samples`, `metric_samples_5m/_1h`, `metric_series` | `cityHash64(fingerprint)` | the fingerprint is the series ID, which includes the metric name (issue #623), so the shard key is the series identity: a series still lives whole on one shard, per-series evaluation and tier `GROUP BY` stay shard-local, and same-labelset metrics spread across the cluster. **One read is not reduced shard-locally, and neither is the one it replaces** (issue #549): the grouped instant read's window pipeline is not pushed to shards, so each shard returns its matched rows and the reduction happens at the coordinator — measured on a two-shard fixture, 40 series over 60 steps, the follower returned 960 rows of 960 on BOTH routes, so the change neither worsens nor improves that hop. What it moves is the coordinator's hop to the client, 2,400 rows to 240 on that fixture |
 | `metric_labels` | `cityHash64(fingerprint)` | one lookup row per series (issue #623). **Nothing is inserted through the wrapper**: one kind-2 landing row writes a series' activity row and its lookup row on the node that took the push, so every series read that nests the two runs shard-local (`distributed_product_mode = 'local'`) and finds a series' lookup row beside its activity |
 | `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_5s`, `log_patterns` | `cityHash64(fingerprint)` | **this expression governs reads, not writes** (issue #603). The writer inserts into `log_landing` under its bare name and the views write that shard's local targets, so a fingerprint's rows sit wherever its pushes landed and can sit on several shards. The reads tolerate it: the stream-resolution `GROUP BY fingerprint HAVING ...` counts distinct `(key, val)` pairs and `log_streams_idx`'s sorting key covers its whole row, so a cross-shard duplicate changes nothing; stage-2 hydration already keeps one row per fingerprint; the rollup, `/patterns` and volume reads merge partial aggregates at the initiator. What it ends is shard-local **label discovery**, whose semi-join asked whether a fingerprint was active *anywhere* and could only be answered per shard while one fingerprint's index and rollup rows co-resided — see the paragraph below the tables  **The key hashes the column rather than being the column** (issue #498): a `Distributed` sharding key must evaluate to an integer type ClickHouse accepts, and `UInt128` is not one. Measured on ClickHouse 26.3.29.7, a two-shard fixture: `Distributed(..., fingerprint)` creates without complaint and then answers every insert with `Code: 53. DB::Exception: Sharding key expression does not evaluate to an integer type`, leaving `count()` at 0; `Distributed(..., cityHash64(fingerprint))` creates, inserts and reads the 128-bit value back intact. One fingerprint still maps to one shard, now through both 64-bit halves rather than the low one. |
-| `trace_spans`, `trace_attrs_idx`, `trace_edges`, `trace_recent`, `trace_error_spans`, `spans`, `traces`, `error_spans` | `cityHash64(trace_id)` | a trace is whole on one shard; span-level intersections, trace assembly, and the service-graph half-row pairing (both edge halves share `trace_id`, so the query-time join is shard-local) are all shard-local. `spans` and `traces` are the two tables the TraceQL read design queries (issues #584 to #586); their wrappers carry the key as a literal rather than through `Ddl::Dist`, for the reason §4.3 gives, and `the_routing_wrappers_use_the_family_sharding_expression` is what keeps the two forms identical |
+| `spans`, `traces`, `error_spans` | `cityHash64(trace_id)` | a trace is whole on one shard; span-level intersections, trace assembly, and the service-graph half-row pairing (both edge halves share `trace_id`, so the query-time join is shard-local) are all shard-local. `spans` and `traces` are the two tables the TraceQL read design queries (issues #584 to #586); their wrappers carry the key as a literal rather than through `Ddl::Dist`, and `the_routing_wrappers_use_the_family_sharding_expression` is what keeps the two forms identical |
 | `profile_samples`, `profile_series`, `profile_series_idx` | `cityHash64(fingerprint)` | same co-sharding argument as logs |
 | `rules`, catalogs, bookkeeping | (replicated to all shards via a shard-less replication path — one cluster-wide replica set, no Distributed writes) | tiny, read-everywhere; **prerequisite: `{replica}` macros must be unique across the whole cluster**, not merely within a shard |
 
@@ -1622,17 +1019,7 @@ CREATE TABLE metric_samples_dist AS metric_samples
 ENGINE = Distributed('{cluster}', pulsus, metric_samples, cityHash64(fingerprint));
 ```
 
-The two derived trace tables (#560) get the same wrapper, from the Traces family's expression, and a block written through `trace_spans_dist` reaches each shard's local `trace_spans`, whose views write that shard's `trace_recent` and `trace_error_spans` — so a trace's derived rows sit on the shard that holds its spans:
-
-```sql
-CREATE TABLE trace_recent_dist AS trace_recent
-ENGINE = Distributed('{cluster}', pulsus, trace_recent, cityHash64(trace_id));
-
-CREATE TABLE trace_error_spans_dist AS trace_error_spans
-ENGINE = Distributed('{cluster}', pulsus, trace_error_spans, cityHash64(trace_id));
-```
-
-A failing view behaves the same way on each shard as on a single node: see §4.1, "What a failing view leaves behind (#560)". Clustered, the repeated-block rule is the `Replicated*` engines' own `replicated_deduplication_window`, and it applies to `trace_spans` as well as to both derived tables.
+A failing view behaves the same way on each shard as on a single node: see §4.1, "What a failing view leaves behind". Clustered, the repeated-block rule is the `Replicated*` engines' own `replicated_deduplication_window`, and it applies to every trace table that carries a window.
 
 Two invariants the schema controller enforces, because co-location silently breaks without them: **every table in a signal family uses the byte-identical sharding expression** (raw, tiers, series/index tables alike — a divergence would put a series' rollups on a different shard than its samples), and **every insert that has a `_dist` wrapper goes through it or computes the same expression client-side** — the trace writer never freelances shard placement. **The two landing tables are the deliberate exception** (issue #603): a logs or metrics push carries many fingerprints, so a `Distributed` insert would split one push into one insert per shard and would return before the shards held the rows — either alone ends "one push is one block", which is the guarantee that change was made for. Those two writes are placed by the connection, and the views put each block's derived rows on the shard that took it. Cluster configs use `internal_replication = true` (the underlying tables are `ReplicatedMergeTree`; the Distributed layer must write each block to one replica and let replication fan it out, or rows duplicate).
 

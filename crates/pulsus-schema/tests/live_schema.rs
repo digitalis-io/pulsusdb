@@ -458,8 +458,7 @@ async fn the_configured_retention_reaches_every_retained_tables_ttl() {
         .expect("run_init (retention_days=7)");
     // The saturating expression (issues #131/#137) is declared in the
     // `CREATE`; ClickHouse normalizes the rendered `{{retention_days}} *
-    // 86400` product by wrapping it in parens (live_traces.rs pins the same
-    // normalization for the ns form).
+    // 86400` product by wrapping it in parens.
     let before_metric = create_table_query(&client, db, "metric_samples").await;
     assert!(
         before_metric.contains("least(intDiv(unix_milli, 1000) + (7 * 86400), 4294967295)"),

@@ -377,7 +377,7 @@ There is no length-prefix-free byte route either: `serialize_bytes` and
 **No table in this workspace had a `JSON` column before this change**:
 `git grep -n 'JSON  *CODEC\|  JSON,' 53c2518e -- crates` returns nothing, and
 the three JSON-ish columns in the shipped schema (`log_streams.labels`,
-`log_landing.labels`, `trace_attrs_idx.val`) are `String`.
+`log_landing.labels` and the attribute index's `val`) are `String`.
 
 ### The change
 

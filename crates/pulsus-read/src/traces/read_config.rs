@@ -22,7 +22,7 @@ impl TraceReadConfig {
             // cluster-wide replica set read from the local replica, the same
             // carve-out the tag catalog has — a `_dist` wrapper would fan a
             // read out to every shard for rows every shard already holds.
-            spans_v2_table: format!("spans{dist}"),
+            spans_table: format!("spans{dist}"),
             error_spans_table: format!("error_spans{dist}"),
             traces_table: format!("traces{dist}"),
             resources_table: "resources".to_string(),
@@ -66,7 +66,7 @@ mod tests {
             config.reader.traceql_max_series = 11;
             config.reader.traceql_read_max_memory_bytes = 13;
             let c = TraceReadConfig::from_config(&config);
-            assert_eq!(c.spans_v2_table, format!("spans{dist}"));
+            assert_eq!(c.spans_table, format!("spans{dist}"));
             assert_eq!(c.error_spans_table, format!("error_spans{dist}"));
             assert_eq!(c.traces_table, format!("traces{dist}"));
             assert_eq!(c.resources_table, "resources");
