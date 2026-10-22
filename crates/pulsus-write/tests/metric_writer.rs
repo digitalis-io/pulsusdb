@@ -376,9 +376,11 @@ fn one_bucket_hist(sum: f64) -> NativeHistogram {
 /// `the_charge_covers_everything_a_queued_block_holds`.
 const MIXED_PUSH_ROWS: u64 = 5;
 const MIXED_PUSH_BUFFER_BYTES: u64 = 178;
-const MIXED_PUSH_BYTES: u64 = MIXED_PUSH_BUFFER_BYTES
-    + MIXED_PUSH_ROWS * LANDING_ROW_SLOT_BYTES
-    + landing_block_overhead_bytes::<MetricLandingRow>();
+fn mixed_push_bytes() -> u64 {
+    MIXED_PUSH_BUFFER_BYTES
+        + MIXED_PUSH_ROWS * LANDING_ROW_SLOT_BYTES
+        + landing_block_overhead_bytes::<MetricLandingRow>()
+}
 
 fn mixed_push(unix_milli: i64, updated_ns: i64, with_descriptor: bool) -> ParsedMetrics {
     let mut out = ParsedMetrics {
@@ -1539,7 +1541,7 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
         AdmitRefusal::PushTooLarge {
             rows: MIXED_PUSH_ROWS,
             row_limit: MIXED_PUSH_ROWS,
-            bytes: MIXED_PUSH_BYTES,
+            bytes: mixed_push_bytes(),
             byte_limit: 16 * 1024 * 1024,
         }
     );
@@ -1582,7 +1584,7 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
     // The byte ceiling, at the push's own estimate and one below it. A byte
     // total omitting any one of the four estimators lands under the limit and is
     // admitted where it must be refused.
-    for (limit, refused) in [(MIXED_PUSH_BYTES, false), (MIXED_PUSH_BYTES - 1, true)] {
+    for (limit, refused) in [(mixed_push_bytes(), false), (mixed_push_bytes() - 1, true)] {
         let cfg = WriterConfig {
             batch_bytes: ByteSize(limit),
             ..Default::default()
@@ -1602,7 +1604,7 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
                 AdmitRefusal::PushTooLarge {
                     rows: MIXED_PUSH_ROWS,
                     row_limit: 1_048_576,
-                    bytes: MIXED_PUSH_BYTES,
+                    bytes: mixed_push_bytes(),
                     byte_limit: limit,
                 }
             );
@@ -1646,7 +1648,7 @@ fn bare_exemplar(unix_milli: i64) -> ExemplarPoint {
 #[tokio::test]
 async fn an_exemplar_counts_toward_both_push_ceilings() {
     const EX_ROWS: u64 = 5;
-    const EX_BYTES: u64 = 164
+    let ex_bytes: u64 = 164
         + 59
         + EX_ROWS * LANDING_ROW_SLOT_BYTES
         + landing_block_overhead_bytes::<MetricLandingRow>();
@@ -1671,14 +1673,14 @@ async fn an_exemplar_counts_toward_both_push_ceilings() {
         AdmitRefusal::PushTooLarge {
             rows: EX_ROWS,
             row_limit: EX_ROWS,
-            bytes: EX_BYTES,
+            bytes: ex_bytes,
             byte_limit: 16 * 1024 * 1024,
         }
     );
     assert_eq!(inserter.call_count(), 0);
     writer.shutdown(Duration::from_secs(2)).await;
 
-    for (limit, refused) in [(EX_BYTES, false), (EX_BYTES - 1, true)] {
+    for (limit, refused) in [(ex_bytes, false), (ex_bytes - 1, true)] {
         let cfg = WriterConfig {
             batch_bytes: ByteSize(limit),
             ..Default::default()
@@ -1692,7 +1694,7 @@ async fn an_exemplar_counts_toward_both_push_ceilings() {
                 AdmitRefusal::PushTooLarge {
                     rows: EX_ROWS,
                     row_limit: 1_048_576,
-                    bytes: EX_BYTES,
+                    bytes: ex_bytes,
                     byte_limit: limit,
                 }
             );
@@ -1762,7 +1764,7 @@ async fn the_queue_charge_covers_the_landing_rows_it_holds() {
     let root = spool_root("queue-charge");
     // One byte under the push's own charge, so the refusal reports it.
     let cfg = WriterConfig {
-        batch_bytes: ByteSize(MIXED_PUSH_BYTES - 1),
+        batch_bytes: ByteSize(mixed_push_bytes() - 1),
         ..Default::default()
     };
     let inserter = MockInserter::always(Act::Ok);
@@ -1806,7 +1808,7 @@ async fn the_queue_charge_covers_the_landing_rows_it_holds() {
         .await
         .expect("settles")
         .expect("commits");
-    assert_eq!(writer.metrics().landing.bytes_total, MIXED_PUSH_BYTES);
+    assert_eq!(writer.metrics().landing.bytes_total, mixed_push_bytes());
     assert_eq!(writer.metrics().queue_bytes, 0);
     writer.shutdown(Duration::from_secs(2)).await;
 
@@ -1988,7 +1990,7 @@ fn a_failed_blocks_reservation_is_held_until_its_spool_copy_is_written() {
         settle_until(|| false).await;
         assert_eq!(
             writer.metrics().queue_bytes,
-            MIXED_PUSH_BYTES,
+            mixed_push_bytes(),
             "the reservation must still be charged while the spool copy is \
              being built and written"
         );
@@ -2483,14 +2485,14 @@ async fn the_queue_byte_allowance_is_aggregate_across_pushes() {
     let cfg = WriterConfig {
         metrics_landing_inserters: 1,
         // Exactly three of the mixed push.
-        ingest_queue_bytes: ByteSize(MIXED_PUSH_BYTES * 3),
+        ingest_queue_bytes: ByteSize(mixed_push_bytes() * 3),
         ..Default::default()
     };
     let root = spool_root("aggregate-bytes");
     let inserter = MockInserter::always(Act::Gate);
     let writer = writer_with(&cfg, &root, inserter.clone());
 
-    // Each push costs MIXED_PUSH_BYTES: the held insert never promotes the series LRU,
+    // Each push costs mixed_push_bytes(): the held insert never promotes the series LRU,
     // so all three emit their two kind-2 rows.
     for unix_milli in [1_000, 1_001, 1_002] {
         writer
@@ -2502,7 +2504,7 @@ async fn the_queue_byte_allowance_is_aggregate_across_pushes() {
             .expect("queue has room for three");
     }
     settle_until(|| inserter.call_count() >= 1).await;
-    assert_eq!(writer.metrics().queue_bytes, MIXED_PUSH_BYTES * 3);
+    assert_eq!(writer.metrics().queue_bytes, mixed_push_bytes() * 3);
 
     let before = writer.metrics();
     let err = writer
@@ -2522,7 +2524,7 @@ async fn the_queue_byte_allowance_is_aggregate_across_pushes() {
     );
     assert_eq!(
         after.queue_bytes,
-        MIXED_PUSH_BYTES * 3,
+        mixed_push_bytes() * 3,
         "the refusal reserved nothing: a reading of four pushes' worth would be the \
          roll-back not happening"
     );
@@ -2671,7 +2673,7 @@ async fn the_landing_loop_counts_what_it_did() {
 
     let landing = writer.metrics().landing;
     assert_eq!(landing.rows_total, MIXED_PUSH_ROWS);
-    assert_eq!(landing.bytes_total, MIXED_PUSH_BYTES);
+    assert_eq!(landing.bytes_total, mixed_push_bytes());
     assert_eq!(
         landing.flushes_total, 1,
         "one insert per push, not one per row"
