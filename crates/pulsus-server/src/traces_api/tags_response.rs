@@ -299,8 +299,7 @@ mod tests {
     use pulsus_read::TagValue;
 
     /// `(value, stored type)` pairs as the engine hands them over —
-    /// ALREADY in the read's `ORDER BY val, val_type` order, which the run
-    /// rule depends on. An empty type is a pre-migration-41 row.
+    /// ALREADY in the read's `ORDER BY val, val_type` order.
     fn tag_values(pairs: &[(&str, &str)], truncated: bool) -> TagValues {
         TagValues {
             values: pairs

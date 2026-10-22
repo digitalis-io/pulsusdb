@@ -3009,8 +3009,8 @@ mod tests {
             );
             assert!(
                 !value.val_type.is_empty(),
-                "an empty val_type renders as `string` too, which is why this is asserted \
-                 separately from the rendering"
+                "an empty val_type would reach the wire as `\"type\":\"\"`, and is asserted \
+                 here on the engine's value"
             );
         }
     }
