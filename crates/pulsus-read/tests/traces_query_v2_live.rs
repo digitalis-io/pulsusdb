@@ -13120,6 +13120,60 @@ async fn bucket_labels_past_32_bit_seconds_are_exact() {
     );
 }
 
+/// Issue #602 part 3a: a bucket label past 2^32 seconds computed by the
+/// statement itself, not filled by the engine. No push stores a span after
+/// 2106-02-06, so the span is landed on that day and copied 30 days on into
+/// `spans` directly: 2106-03-08 23:30:00, past 2^32 s, in the bucket the
+/// statement labels 2106-03-09 00:00:00. A label narrowed through 32-bit
+/// seconds, signed or unsigned, wraps out of the window and loses the
+/// count. **guard**.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_statement_labels_a_bucket_past_32_bit_seconds() {
+    skip_unless_live!();
+    const SHIFT_NS: i64 = 30 * 86_400 * S_NS;
+    let db = pulsus_testkit::test_db("pulsus_read_it_t602_label_2106");
+    let client = fresh_db(&db).await;
+    let span: [MetricSpan; 1] = [("future", 1, 4_294_942_200 * S_NS, S_NS)];
+    land_metric_spans(&client, 0x11, &span, "label_2106").await;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO spans SELECT * REPLACE (start_ns + {SHIFT_NS} AS start_ns, \
+                 end_ns + {SHIFT_NS} AS end_ns) FROM spans"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("copy the span past 2^32 s");
+    let engine = metrics_engine(&db, 1_000).await;
+    // 2106-03-08 23:00:00 to 2106-03-09 02:00:00, hourly.
+    let routed = routed_plan(
+        &engine,
+        "{} | count_over_time()",
+        4_297_532_400,
+        4_297_543_200,
+        3_600_000,
+    );
+    let out = engine.metrics_range_routed(&routed).await;
+    drop_db(&db).await;
+    let got = out.map_err(|e| e.to_string()).map(|o| {
+        o.series
+            .iter()
+            .map(|s| s.samples.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        got,
+        Ok(vec![vec![
+            (4_297_532_400_000, 0.0),
+            (4_297_536_000_000, 1.0),
+            (4_297_539_600_000, 0.0),
+            (4_297_543_200_000, 0.0),
+        ]])
+    );
+}
+
 /// Issue #602 part 3a: a request window that starts before 1970, over
 /// spans stored just after it. The write path stores no span before 1970,
 /// so the statement's grid starts at a negative bucket over positive
