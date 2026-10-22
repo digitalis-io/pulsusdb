@@ -1385,7 +1385,7 @@ const SERIES_ROW_OVERHEAD: usize = 64;
 /// `(String, String)`/map allocations. Charging ≥128 B per label makes such a
 /// fan-out trip the byte budget at ~`MAX_EXPANDED_BYTES / 128` labels — before
 /// materialization — while legitimate few-labels-per-series batches stay well
-/// under budget. Mirrors `otlp_traces`/`otlp_metrics`'s `ATTR_ROW_OVERHEAD`.
+/// under budget. Mirrors `otlp_metrics`'s `SAMPLE_ROW_OVERHEAD`.
 const LABEL_ROW_OVERHEAD: usize = 128;
 /// Estimated fixed heap cost of one [`MetricMetadata`] beyond its
 /// name/help/unit bytes.

@@ -419,41 +419,10 @@ fn requests(nonce: &[u8; 16], spans: &[SpanDef]) -> Vec<ExportTraceServiceReques
         .collect()
 }
 
-/// Lands each request through the product writer: the old tables through
-/// today's trace writer, the new ones through `trace_landing`, one insert a
-/// request.
-async fn pulsus_land(client: &ChClient, db: &str, reqs: &[ExportTraceServiceRequest]) {
-    use pulsus_write::writer::{ChBlockInserter, TraceWriter, TraceWriterTables};
-    use pulsus_write::{ParsedTraceLanding, PushHeaders, TraceSink};
-    use std::sync::Arc;
-    let writer_client = Arc::new(
-        ChClient::new(ch_config(db))
-            .await
-            .expect("connect the writer"),
-    );
-    let mut cfg = pulsus_config::WriterConfig::default();
-    cfg.batch_bytes.0 = 1;
-    let writer = TraceWriter::with_inserters_with_tables(
-        Arc::new(ChBlockInserter::new(writer_client.clone())),
-        Arc::new(ChBlockInserter::new(writer_client.clone())),
-        Arc::new(ChBlockInserter::new(writer_client.clone())),
-        &cfg,
-        TraceWriterTables::traces_default(),
-    );
+/// Lands each request into `trace_landing`, one insert a request.
+async fn pulsus_land(client: &ChClient, reqs: &[ExportTraceServiceRequest]) {
     for (i, req) in reqs.iter().enumerate() {
-        let parsed = pulsus_write::parse_traces(req, now_ns()).expect("the old path parses");
-        let wait = writer
-            .admit_flush(
-                parsed,
-                ParsedTraceLanding::default(),
-                PushHeaders::default(),
-            )
-            .expect("the queue has room");
-        tokio::time::timeout(Duration::from_secs(30), wait)
-            .await
-            .expect("the old path's flush settles")
-            .expect("the old path commits");
-        let landing = parse_trace_landing(req, now_ns()).expect("the landing decode");
+        let landing = parse_trace_landing(req).expect("the landing decode");
         let received_ms = now_ns() / 1_000_000;
         let mut rows: Vec<TraceLandingRow> = Vec::new();
         rows.extend(
@@ -771,7 +740,7 @@ async fn compare_value_differential() {
     let db = pulsus_testkit::test_db(&format!("pulsus_cmpdiff_it_{}", hex(&nonce)));
     init_db(&bootstrap, &db).await;
     let client = ChClient::new(ch_config(&db)).await.expect("connect db");
-    pulsus_land(&client, &db, &requests(&nonce, &spans)).await;
+    pulsus_land(&client, &requests(&nonce, &spans)).await;
     let engine = TraceEngine::new(
         ChClient::new(ch_config(&db)).await.expect("connect engine"),
         engine_config(),

@@ -74,20 +74,6 @@ impl<R: ChRow> BlockInserter<R> for ParkingInserter {
     }
 }
 
-/// An inserter that answers every call at once, for the tables a case does
-/// not watch.
-pub(crate) struct OkInserter;
-
-impl<R: ChRow> BlockInserter<R> for OkInserter {
-    fn insert<'a>(
-        &'a self,
-        _table: &'a str,
-        _rows: &'a [R],
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), ChError>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
 /// A fresh spool root for one case.
 pub(crate) fn spool_root(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(

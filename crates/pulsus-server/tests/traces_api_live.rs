@@ -611,8 +611,8 @@ fn pushed_keys(req: &ExportTraceServiceRequest) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Seeds `spans` through `POST /v1/traces` (sync — no `X-Pulsus-Async`
-/// header, so a `200` means the old path's tables hold the rows; the helper
-/// then waits for them in the landing-fed tables,
+/// header, so a `200` means the landing insert committed; the helper then
+/// waits for the rows in the landing-fed tables,
 /// [`live_db::settle_pushed_spans`]), with
 /// the fixed resource (`service.name=checkout`) and scope (`live-scope`)
 /// context every fetch assertion below checks for.
@@ -2360,11 +2360,11 @@ async fn absent_submessages_are_materialized_present_and_empty_on_the_wire() {
     {
         let mut stream = client
             .query_stream::<SpanCountRow>(
-                &format!("SELECT count() AS n FROM {db}.trace_spans"),
+                &format!("SELECT count() AS n FROM {db}.spans"),
                 &QuerySettings::new(),
             )
             .await
-            .expect("count trace_spans");
+            .expect("count spans");
         while let Some(row) = stream.next().await {
             stored = row.expect("decode count row").n;
         }

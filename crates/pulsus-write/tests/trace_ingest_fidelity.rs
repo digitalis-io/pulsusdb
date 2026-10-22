@@ -1,28 +1,11 @@
-//! Hermetic OTLP-traces parser fidelity gate (issue #54 AC1/AC2):
+//! Hermetic OTLP-traces decode fidelity gate (issue #54 AC1, issue #602):
 //! `tests/fixtures/otlp-traces/*.bin` are committed
 //! `ExportTraceServiceRequest` protobuf payloads (provenance:
-//! `tests/fixtures/otlp-traces/README.md`, same construction method as the
-//! logs/metrics fixture corpora — built programmatically against this
-//! crate's own `opentelemetry-proto` dependency, then `prost`-encoded).
-//! The tests decode a fixture, run `otlp_traces::parse`, and assert
-//! **hand-derived golden rows** — every expected field below is written
-//! out from the pinned parse rules (issue #54 plan), not recomputed by
-//! calling the code under test.
-//!
-//! Unlike the logs `ingest_fidelity.rs` precedent there is **no
-//! live-`cityHash64`-oracle step and no ClickHouse**: traces carry no
-//! fingerprint (`cityHash64(trace_id)` is a server-side Distributed
-//! sharding expression, never a stored value), so the golden is fully
-//! hand-derivable and this suite is hermetic (rides `cargo test
-//! --workspace`). The ClickHouse round-trip lives in
-//! `trace_ingest_roundtrip.rs` (env-gated).
-//!
-//! The one exception to "hand-derived": each `SpanRecord.payload`'s exact
-//! bytes are prost-encoder output, infeasible to write by hand — the
-//! payload is therefore proven **structurally** (AC2): decode it as
-//! `TracesData` and assert the single-`ResourceSpans` shape (this span +
-//! its own resource + its own scope + both schema URLs), the pinned T2/T3
-//! contract.
+//! `tests/fixtures/otlp-traces/README.md`). The test decodes a fixture with
+//! the landing decode and asserts **hand-derived golden rows**: every
+//! expected value below is written out from the fixture constants, not
+//! recomputed by calling the code under test. The ClickHouse round trip of
+//! the same fixture lives in `trace_ingest_roundtrip.rs` (env-gated).
 
 use std::path::{Path, PathBuf};
 
@@ -32,20 +15,14 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, Key
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::span::{Event, Link, SpanKind};
 use opentelemetry_proto::tonic::trace::v1::status::StatusCode;
-use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, TracesData};
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 use prost::Message;
 
-use pulsus_write::{decode_traces, parse_traces};
+use pulsus_clickhouse::json_column::{TraceJson, TraceJsonValue};
+use pulsus_write::{decode_traces, parse_trace_landing};
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/otlp-traces")
-}
-
-/// A `Nullable(Float64)`'s comparable form: its BITS, never its value.
-/// `-0.0 == 0.0` is `true`, so a value comparison passes a stored `-0.0`
-/// mutated to `+0.0`; a bit comparison catches it.
-fn bits(n: &Option<f64>) -> Option<u64> {
-    n.map(f64::to_bits)
 }
 
 fn read_fixture(name: &str) -> Vec<u8> {
@@ -61,22 +38,16 @@ fn read_fixture(name: &str) -> Vec<u8> {
 
 /// 2023-11-14T22:13:20Z. Day 19675 since the Unix epoch
 /// (1_700_000_000 s / 86_400 s = 19675.92... -> floor 19675) — the golden
-/// `date` every attr row must carry.
+/// `day` the resource row must carry.
 const SPAN_A_START_NS: u64 = 1_700_000_000_000_000_000;
 const SPAN_A_END_NS: u64 = SPAN_A_START_NS + 1_000_000_000; // +1s
-/// Span A's single event fires 3 ms after the span starts (issue #192 PR-B):
-/// its `event:timeSinceStart` intrinsic is therefore exactly this many ns.
+/// Span A's single event fires 3 ms after the span starts.
 const SPAN_A_EVENT_NS: u64 = SPAN_A_START_NS + 3_000_000; // +3ms
-const SPAN_A_EVENT_TIME_SINCE_START_NS: i64 = 3_000_000;
-/// Span A's single link (issue #192 PR-C) references another span in another
-/// trace; the `link:spanID`/`link:traceID` intrinsics store these raw bytes
-/// as lowercase hex.
+/// Span A's single link references another span in another trace.
 const LINK_TRACE_ID: [u8; 16] = [
     0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
 ];
 const LINK_SPAN_ID: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
-const LINK_TRACE_ID_HEX: &str = "aabbccddeeff00112233445566778899";
-const LINK_SPAN_ID_HEX: &str = "0123456789abcdef";
 const SPAN_B_START_NS: u64 = SPAN_A_START_NS + 5_000_000; // +5ms
 const SPAN_B_END_NS: u64 = SPAN_B_START_NS + 250_000_000; // +250ms
 const GOLDEN_DAY: u16 = 19_675;
@@ -119,9 +90,8 @@ fn fixture_scope() -> InstrumentationScope {
     InstrumentationScope {
         name: "checkout-instrumentation".to_string(),
         version: "1.2.3".to_string(),
-        // Deliberately non-empty: scope attributes are indexed under
-        // `scope='instrumentation'` (issue #192, superseding the #54
-        // adjudication #2 that dropped them) AND kept in the payload.
+        // Deliberately non-empty: scope attributes are stored on the span
+        // row and catalogued under the `instrumentation` scope.
         attributes: vec![kv(
             "scope.only.attr",
             Value::StringValue("payload-only".to_string()),
@@ -131,7 +101,7 @@ fn fixture_scope() -> InstrumentationScope {
 }
 
 /// Span A: root span (empty parent), Server kind, unset status, and three
-/// attributes — `http.status_code` (Int 500, exercises `val_num`),
+/// attributes — `http.status_code` (Int 500, an `int` value),
 /// `http.method` ("GET"), and `deployment.environment` ("prod") which
 /// ALSO exists at resource scope: the dual-scope same-key golden (issue
 /// #54 plan v2 test-gap fix). It also carries one span **event** (issue
@@ -230,302 +200,166 @@ fn regenerate_fixtures() {
 }
 
 // ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
 // AC1: hand-derived golden rows.
 // ---------------------------------------------------------------------
 
-/// AC1 (issue #54): decode -> parse -> assert the exact `SpanRecord` and
-/// `AttrRecord` vectors against hand-derived expectations from the pinned
-/// parse rules. Payload bytes are excluded here (proven structurally by
-/// the AC2 test below — prost output is not hand-derivable).
+/// Each stored path of `j` with its scalar value rendered, in stored order.
+fn paths(j: &TraceJson) -> Vec<(String, String)> {
+    j.entries()
+        .iter()
+        .map(|e| match &e.value {
+            TraceJsonValue::Scalar(s) => {
+                (e.path.clone(), format!("{}:{}", s.val_type(), s.render()))
+            }
+            other => panic!("fixture carries scalars only, got {other:?}"),
+        })
+        .collect()
+}
+
+fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+    v.iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
+}
+
+/// AC1 (issue #54, re-pointed by issue #602): decode the committed fixture
+/// with the landing decode and assert every span, resource and catalog row
+/// against values written out from the fixture constants.
 #[test]
 fn parse_produces_the_hand_derived_golden_rows() {
     let req = decode_traces(&read_fixture("two_spans_dual_scope.bin")).expect("fixture decodes");
-    let out = parse_traces(&req, 0).expect("within the expansion budget");
+    let out = parse_trace_landing(&req).expect("within the expansion budget");
 
     assert_eq!(out.rejected, 0);
     assert_eq!(out.rejected_message, None);
-
-    // --- spans (all fields except payload, which AC2 proves) ---
     assert_eq!(out.spans.len(), 2);
+    assert_eq!(out.resources.len(), 1, "one resource, one UTC day");
+
+    let r = &out.resources[0];
+    assert_eq!(r.day, GOLDEN_DAY);
+    assert_eq!(r.service, "checkout");
+    assert_eq!(
+        paths(&r.attrs),
+        pairs(&[("deployment%2Eenvironment", "string:prod")]),
+        "service.name is a column, not a resource attribute"
+    );
+    assert_eq!(r.schema_url, "https://opentelemetry.io/schemas/1.21.0");
 
     let a = &out.spans[0];
     assert_eq!(a.trace_id, TRACE_ID);
     assert_eq!(a.span_id, SPAN_A_ID);
-    assert_eq!(a.parent_id, [0u8; 8], "empty parent -> zero sentinel");
+    assert_eq!(a.parent_span_id, [0u8; 8], "empty parent -> zero sentinel");
+    assert_eq!(a.resource_id, r.resource_id);
     assert_eq!(a.name, "GET /checkout");
-    assert_eq!(
-        a.service, "checkout",
-        "resource service.name promoted verbatim"
-    );
-    assert_eq!(a.timestamp_ns, 1_700_000_000_000_000_000);
+    assert_eq!(a.service, "checkout");
+    assert_eq!(a.service_type, "string");
+    assert_eq!(a.start_ns, 1_700_000_000_000_000_000);
     assert_eq!(a.duration_ns, 1_000_000_000);
+    assert_eq!(a.end_ns, SPAN_A_END_NS);
     assert_eq!(a.status_code, 0, "unset status -> code 0");
     assert_eq!(a.kind, 2, "SPAN_KIND_SERVER = 2");
+    assert_eq!(a.scope_name, "checkout-instrumentation");
+    assert_eq!(a.scope_version, "1.2.3");
     assert_eq!(
-        a.scope_name, "checkout-instrumentation",
-        "instrumentation scope name promoted (issue #192)"
+        a.scope_schema_url,
+        "https://opentelemetry.io/schemas/1.21.0"
     );
-    assert_eq!(a.scope_version, "1.2.3", "instrumentation scope version");
+    assert_eq!(
+        paths(&a.scope_attrs),
+        pairs(&[("scope%2Eonly%2Eattr", "string:payload-only")])
+    );
+    assert_eq!(
+        paths(&a.attrs),
+        pairs(&[
+            ("deployment%2Eenvironment", "string:prod"),
+            ("http%2Emethod", "string:GET"),
+            ("http%2Estatus_code", "int:500"),
+        ])
+    );
+    assert_eq!(a.events.len(), 1);
+    assert_eq!(a.events[0].time_ns, SPAN_A_EVENT_NS);
+    assert_eq!(a.events[0].name, "exception");
+    assert_eq!(
+        paths(&a.events[0].attrs),
+        pairs(&[("exception%2Etype", "string:IOError")])
+    );
+    assert_eq!(a.links.len(), 1);
+    assert_eq!(a.links[0].trace_id, LINK_TRACE_ID.to_vec());
+    assert_eq!(a.links[0].span_id, LINK_SPAN_ID.to_vec());
+    assert_eq!(
+        paths(&a.links[0].attrs),
+        pairs(&[("link%2Erelation", "string:child_of")])
+    );
 
     let b = &out.spans[1];
     assert_eq!(b.trace_id, TRACE_ID);
     assert_eq!(b.span_id, SPAN_B_ID);
-    assert_eq!(b.parent_id, SPAN_A_ID);
+    assert_eq!(b.parent_span_id, SPAN_A_ID);
+    assert_eq!(b.resource_id, r.resource_id);
     assert_eq!(b.name, "charge-card");
-    assert_eq!(b.service, "checkout");
-    assert_eq!(b.timestamp_ns, 1_700_000_000_005_000_000);
-    assert_eq!(b.timestamp_ns, 1_700_000_000_000_000_000 + 5_000_000);
+    assert_eq!(b.start_ns, 1_700_000_000_005_000_000);
     assert_eq!(b.duration_ns, 250_000_000);
+    assert_eq!(b.end_ns, SPAN_B_END_NS);
     assert_eq!(b.status_code, 2, "STATUS_CODE_ERROR = 2");
+    assert_eq!(b.status_message, "card declined");
     assert_eq!(b.kind, 3, "SPAN_KIND_CLIENT = 3");
-    assert_eq!(b.scope_name, "checkout-instrumentation");
-    assert_eq!(b.scope_version, "1.2.3");
+    assert!(b.attrs.is_empty() && b.events.is_empty() && b.links.is_empty());
 
-    // --- attrs: keys verbatim (never normalized),
-    // resource-then-span-then-instrumentation order per span, scope
-    // discriminators, val_num only for the numeric parse, day-floored date;
-    // instrumentation-scope attributes are indexed under
-    // `scope='instrumentation'` (issue #192).
-    /// One attr row's golden-comparable projection (`date`/`trace_id`/
-    /// per-span carried columns are asserted separately below).
-    type AttrGolden<'a> = (&'a str, &'a str, &'a str, Option<f64>, [u8; 8]);
-    let rows: Vec<AttrGolden<'_>> = out
-        .attrs
+    // The catalogs: one row per distinct (scope, key) and per distinct
+    // (scope, key, value, type), keys original rather than escaped. The
+    // dual-scope key `deployment.environment` is two rows, one per scope.
+    let names: Vec<(&str, &str)> = out
+        .tag_names
         .iter()
-        .map(|r| {
+        .map(|n| (n.scope.as_str(), n.key.as_str()))
+        .collect();
+    let mut want_names = vec![
+        ("resource", "deployment.environment"),
+        ("resource", "service.name"),
+        ("span", "deployment.environment"),
+        ("span", "http.method"),
+        ("span", "http.status_code"),
+        ("event", "exception.type"),
+        ("link", "link.relation"),
+        ("instrumentation", "scope.only.attr"),
+    ];
+    let mut got_names = names.clone();
+    got_names.sort();
+    want_names.sort();
+    assert_eq!(got_names, want_names);
+
+    let mut values: Vec<(&str, &str, &str, &str)> = out
+        .tag_values
+        .iter()
+        .map(|v| {
             (
-                r.scope.as_str(),
-                r.key.as_str(),
-                r.val.as_str(),
-                r.val_num,
-                r.span_id,
+                v.scope.as_str(),
+                v.key.as_str(),
+                v.value.as_str(),
+                v.val_type,
             )
         })
         .collect();
-    assert_eq!(
-        rows,
-        vec![
-            // span A: resource attrs...
-            ("resource", "service.name", "checkout", None, SPAN_A_ID),
-            (
-                "resource",
-                "deployment.environment",
-                "prod",
-                None,
-                SPAN_A_ID
-            ),
-            // ...then span A's own attrs — note the verbatim dotted keys
-            // (`http.status_code`, not `http_status_code`) and the
-            // dual-scope `deployment.environment`, distinct from the
-            // resource row only by scope.
-            ("span", "http.status_code", "500", Some(500.0), SPAN_A_ID),
-            ("span", "http.method", "GET", None, SPAN_A_ID),
-            ("span", "deployment.environment", "prod", None, SPAN_A_ID),
-            // ...then span A's instrumentation-scope attr (issue #192),
-            // emitted last in the resource→span→instrumentation order.
-            (
-                "instrumentation",
-                "scope.only.attr",
-                "payload-only",
-                None,
-                SPAN_A_ID
-            ),
-            // ...then span A's event rows (issue #192 PR-B): the two
-            // intrinsics under the dedicated `event:intrinsic` scope (name,
-            // then timeSinceStart in ns via val_num) followed by the event's
-            // verbatim attribute under `scope='event'`.
-            ("event:intrinsic", "name", "exception", None, SPAN_A_ID),
-            (
-                "event:intrinsic",
-                "timeSinceStart",
-                "3000000",
-                Some(SPAN_A_EVENT_TIME_SINCE_START_NS as f64),
-                SPAN_A_ID
-            ),
-            ("event", "exception.type", "IOError", None, SPAN_A_ID),
-            // ...then span A's link rows (issue #192 PR-C): the two intrinsics
-            // under the dedicated `link:intrinsic` scope (spanID, then traceID,
-            // as lowercase hex in `val`) followed by the link's verbatim
-            // attribute under `scope='link'`.
-            (
-                "link:intrinsic",
-                "spanID",
-                LINK_SPAN_ID_HEX,
-                None,
-                SPAN_A_ID
-            ),
-            (
-                "link:intrinsic",
-                "traceID",
-                LINK_TRACE_ID_HEX,
-                None,
-                SPAN_A_ID
-            ),
-            ("link", "link.relation", "child_of", None, SPAN_A_ID),
-            // span B: resource attrs (no span attrs) then the scope attr.
-            ("resource", "service.name", "checkout", None, SPAN_B_ID),
-            (
-                "resource",
-                "deployment.environment",
-                "prod",
-                None,
-                SPAN_B_ID
-            ),
-            (
-                "instrumentation",
-                "scope.only.attr",
-                "payload-only",
-                None,
-                SPAN_B_ID
-            ),
-        ]
-    );
-    // Issue #556: each span's five arrays are the projection of ITS OWN
-    // attr rows, in the same order — 12 elements for span A, 3 for span B,
-    // which is the 15-row total split by owning span. Taken from
-    // `out.attrs` filtered by `span_id`, so a slice that took the whole
-    // batch, dropped the NULLs, or re-ordered anything cannot pass.
-    for (record, span_id) in out.spans.iter().zip([SPAN_A_ID, SPAN_B_ID]) {
-        let own: Vec<&pulsus_write::AttrRecord> =
-            out.attrs.iter().filter(|r| r.span_id == span_id).collect();
-        assert_eq!(
-            record.attr_key,
-            own.iter().map(|r| r.key.clone()).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            record.attr_scope,
-            own.iter().map(|r| r.scope.clone()).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            record.attr_val,
-            own.iter().map(|r| r.val.clone()).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            record.attr_type,
-            own.iter().map(|r| r.val_type).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            record.attr_num.iter().map(bits).collect::<Vec<_>>(),
-            own.iter().map(|r| bits(&r.val_num)).collect::<Vec<_>>()
-        );
-    }
-    assert_eq!(out.spans[0].attr_key.len(), 12, "span A's own attributes");
-    assert_eq!(out.spans[1].attr_key.len(), 3, "span B's own attributes");
-    // The three intrinsic elements a value-text rule would get wrong: the
-    // event's timeSinceStart IS numeric, the two link hex ids are NOT,
-    // even though `0123456789abcdef` and `aabb...` are not numeric text
-    // while a link id of all-zeros-then-one would be.
-    assert_eq!(
-        out.spans[0]
-            .attr_num
-            .iter()
-            .map(|n| n.map(f64::to_bits))
-            .collect::<Vec<_>>(),
-        vec![
-            None,
-            None,
-            Some(500.0f64.to_bits()),
-            None,
-            None,
-            None,
-            None,
-            Some((SPAN_A_EVENT_TIME_SINCE_START_NS as f64).to_bits()),
-            None,
-            None,
-            None,
-            None,
-        ]
-    );
-
-    for attr in &out.attrs {
-        assert_eq!(attr.date, GOLDEN_DAY, "per-day floor of the span timestamp");
-        assert_eq!(attr.trace_id, TRACE_ID);
-    }
-    // Per-span carried columns: each attr row carries ITS span's
-    // timestamp/duration.
-    for attr in out.attrs.iter().filter(|r| r.span_id == SPAN_A_ID) {
-        assert_eq!(attr.timestamp_ns, 1_700_000_000_000_000_000);
-        assert_eq!(attr.duration_ns, 1_000_000_000);
-    }
-    for attr in out.attrs.iter().filter(|r| r.span_id == SPAN_B_ID) {
-        assert_eq!(attr.timestamp_ns, 1_700_000_000_005_000_000);
-        assert_eq!(attr.duration_ns, 250_000_000);
-    }
-}
-
-/// The dual-scope golden's sharpest form (issue #54 plan v2 test-gap fix):
-/// the identical verbatim `(key, val)` pair exists at BOTH scopes for span
-/// A, and the two rows differ in nothing but `scope`.
-#[test]
-fn dual_scope_same_key_rows_differ_only_in_scope() {
-    let req = decode_traces(&read_fixture("two_spans_dual_scope.bin")).expect("fixture decodes");
-    let out = parse_traces(&req, 0).expect("within the expansion budget");
-
-    let dual: Vec<_> = out
-        .attrs
-        .iter()
-        .filter(|r| r.key == "deployment.environment" && r.val == "prod" && r.span_id == SPAN_A_ID)
-        .collect();
-    assert_eq!(dual.len(), 2, "one row per scope, no collapse");
-    assert_eq!(dual[0].scope, "resource");
-    assert_eq!(dual[1].scope, "span");
-    // Everything except scope is identical — scope alone separates them.
-    let (x, y) = (dual[0], dual[1]);
-    assert_eq!(x.date, y.date);
-    assert_eq!(x.key, y.key);
-    assert_eq!(x.val, y.val);
-    assert_eq!(x.val_num, y.val_num);
-    assert_eq!(x.timestamp_ns, y.timestamp_ns);
-    assert_eq!(x.trace_id, y.trace_id);
-    assert_eq!(x.span_id, y.span_id);
-    assert_eq!(x.duration_ns, y.duration_ns);
-}
-
-// ---------------------------------------------------------------------
-// AC2: payload reconstruction (the pinned T2/T3 contract).
-// ---------------------------------------------------------------------
-
-/// AC2 (issue #54): each `SpanRecord.payload` decodes as a `TracesData`
-/// with exactly one `ResourceSpans` (resource attrs present) -> one
-/// `ScopeSpans` (scope present, incl. the payload-only scope attribute) ->
-/// one `Span` whose ids/name match the record — self-contained and
-/// independently decodable, so T3 can concatenate per-span payloads into a
-/// valid `TracesData`.
-#[test]
-fn each_payload_reconstructs_a_self_contained_traces_data() {
-    let req = decode_traces(&read_fixture("two_spans_dual_scope.bin")).expect("fixture decodes");
-    let out = parse_traces(&req, 0).expect("within the expansion budget");
-    assert_eq!(out.spans.len(), 2);
-
-    for (record, original) in out.spans.iter().zip([span_a(), span_b()]) {
-        let payload =
-            TracesData::decode(record.payload.as_slice()).expect("payload decodes as TracesData");
-        assert_eq!(payload.resource_spans.len(), 1, "single ResourceSpans");
-        let rs = &payload.resource_spans[0];
-        assert_eq!(
-            rs.resource,
-            Some(fixture_resource()),
-            "the span's own resource travels in its payload"
-        );
-        assert_eq!(rs.schema_url, "https://opentelemetry.io/schemas/1.21.0");
-        assert_eq!(rs.scope_spans.len(), 1, "single ScopeSpans");
-        let ss = &rs.scope_spans[0];
-        assert_eq!(
-            ss.scope,
-            Some(fixture_scope()),
-            "the span's own scope (incl. its payload-only attributes) travels in its payload"
-        );
-        assert_eq!(ss.schema_url, "https://opentelemetry.io/schemas/1.21.0");
-        assert_eq!(ss.spans.len(), 1, "exactly this one span, never a sibling");
-        let span = &ss.spans[0];
-        assert_eq!(
-            span, &original,
-            "the original wire span, byte-identical fields"
-        );
-        assert_eq!(span.trace_id, record.trace_id.to_vec());
-        assert_eq!(span.span_id, record.span_id.to_vec());
-        assert_eq!(span.name, record.name);
-    }
+    values.sort();
+    let mut want_values = vec![
+        ("resource", "deployment.environment", "prod", "string"),
+        ("resource", "service.name", "checkout", "string"),
+        ("span", "deployment.environment", "prod", "string"),
+        ("span", "http.method", "GET", "string"),
+        ("span", "http.status_code", "500", "int"),
+        ("event", "exception.type", "IOError", "string"),
+        ("link", "link.relation", "child_of", "string"),
+        (
+            "instrumentation",
+            "scope.only.attr",
+            "payload-only",
+            "string",
+        ),
+    ];
+    want_values.sort();
+    assert_eq!(values, want_values);
 }
 
 /// The committed fixture bytes match the builder — a drift guard so a
@@ -539,190 +373,4 @@ fn committed_fixture_matches_the_builder() {
         "run `cargo test -p pulsus-write --test trace_ingest_fidelity -- --ignored \
          regenerate_fixtures` and commit the diff"
     );
-}
-
-// ---------------------------------------------------------------------
-// Issue #556 criterion 4: the number is decided by (scope, key, value),
-// never by the value text.
-// ---------------------------------------------------------------------
-
-/// The four `timeSinceStart` values this test pins, straddling the point
-/// where `i64` and `f64` part company. A span whose `start_time_unix_nano`
-/// is `0` makes the delta the event's own time, which is what puts these
-/// magnitudes within reach.
-const TSS_VALUES: [i64; 4] = [
-    9_007_199_254_740_991, // 2^53 - 1
-    9_007_199_254_740_992, // 2^53
-    9_007_199_254_740_993, // 2^53 + 1
-    i64::MAX,
-];
-
-/// Issue #556 criterion 4. The five arrays on a span's row are the
-/// projection of that span's own `AttrRecord`s, so the numeric value is
-/// decided by the whole of (scope, key, value) and NOT by the value text.
-///
-/// Three things it pins that a text rule gets wrong:
-///
-///   - a link's `spanID` of `0000000000000001` and `traceID` of
-///     `00000000000000000000000000000001` both `parse::<f64>()` as
-///     `Some(1.0)`, and both must store NULL;
-///   - `timeSinceStart` agrees with `val_val.parse::<i64>() as f64` bit
-///     for bit at `2^53 - 1`, `2^53`, `2^53 + 1` and `i64::MAX` —
-///     including where the `f64` ROUNDS, which is what `trace_attrs_idx`
-///     has stored since the intrinsic was added and what this must
-///     reproduce rather than improve;
-///   - a stored `-0.0` keeps its sign bit.
-///
-/// The `i64` comparison is deliberately NOT written as a round trip
-/// through `as i64`: `i64::MAX as f64 as i64` saturates back to
-/// `i64::MAX`, so a round-trip comparison reports agreement at the very
-/// value where the loss is largest.
-#[test]
-fn the_span_arrays_are_the_spans_own_attr_rows_element_by_element() {
-    let sp = Span {
-        trace_id: TRACE_ID.to_vec(),
-        span_id: SPAN_A_ID.to_vec(),
-        // `0`, so each event's `timeSinceStart` is its own absolute time.
-        start_time_unix_nano: 0,
-        end_time_unix_nano: 1_000_000_000,
-        name: "numeric-rules".to_string(),
-        kind: SpanKind::Server as i32,
-        attributes: vec![kv("neg", Value::DoubleValue(-0.0))],
-        events: TSS_VALUES
-            .iter()
-            .enumerate()
-            .map(|(i, tss)| Event {
-                time_unix_nano: *tss as u64,
-                name: format!("e{i}"),
-                attributes: vec![],
-                dropped_attributes_count: 0,
-            })
-            .collect(),
-        links: vec![Link {
-            // Hex that PARSES as a number and must still store NULL.
-            trace_id: {
-                let mut t = [0u8; 16];
-                t[15] = 1;
-                t.to_vec()
-            },
-            span_id: {
-                let mut s = [0u8; 8];
-                s[7] = 1;
-                s.to_vec()
-            },
-            trace_state: String::new(),
-            attributes: vec![],
-            dropped_attributes_count: 0,
-            flags: 0,
-        }],
-        status: None,
-        ..Default::default()
-    };
-    let req = ExportTraceServiceRequest {
-        resource_spans: vec![ResourceSpans {
-            resource: None,
-            scope_spans: vec![ScopeSpans {
-                scope: None,
-                spans: vec![sp],
-                schema_url: String::new(),
-            }],
-            schema_url: String::new(),
-        }],
-    };
-    let out = parse_traces(&req, 0).expect("within the expansion budget");
-    assert_eq!(out.spans.len(), 1);
-    let record = &out.spans[0];
-
-    // The arrays ARE the projections of this span's own attr rows.
-    assert_eq!(
-        record.attr_key,
-        out.attrs.iter().map(|r| r.key.clone()).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        record.attr_scope,
-        out.attrs
-            .iter()
-            .map(|r| r.scope.clone())
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        record.attr_val,
-        out.attrs.iter().map(|r| r.val.clone()).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        record.attr_type,
-        out.attrs.iter().map(|r| r.val_type).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        record.attr_num.iter().map(bits).collect::<Vec<_>>(),
-        out.attrs
-            .iter()
-            .map(|r| bits(&r.val_num))
-            .collect::<Vec<_>>()
-    );
-
-    // The eleven elements, in emission order, with every text pinned.
-    assert_eq!(
-        record
-            .attr_scope
-            .iter()
-            .zip(&record.attr_key)
-            .zip(&record.attr_val)
-            .map(|((s, k), v)| (s.as_str(), k.as_str(), v.as_str()))
-            .collect::<Vec<_>>(),
-        vec![
-            ("span", "neg", "-0"),
-            ("event:intrinsic", "name", "e0"),
-            ("event:intrinsic", "timeSinceStart", "9007199254740991"),
-            ("event:intrinsic", "name", "e1"),
-            ("event:intrinsic", "timeSinceStart", "9007199254740992"),
-            ("event:intrinsic", "name", "e2"),
-            ("event:intrinsic", "timeSinceStart", "9007199254740993"),
-            ("event:intrinsic", "name", "e3"),
-            ("event:intrinsic", "timeSinceStart", "9223372036854775807"),
-            ("link:intrinsic", "spanID", "0000000000000001"),
-            (
-                "link:intrinsic",
-                "traceID",
-                "00000000000000000000000000000001"
-            ),
-        ]
-    );
-
-    // The two link hex ids parse as a number and must still be NULL.
-    for i in [9, 10] {
-        assert_eq!(
-            record.attr_val[i].parse::<f64>(),
-            Ok(1.0),
-            "the value TEXT at {i} does parse as a number"
-        );
-        assert_eq!(
-            bits(&record.attr_num[i]),
-            None,
-            "a link's hex id must still store NULL at {i}"
-        );
-    }
-
-    // `timeSinceStart` agrees with its integer's `as f64`, bit for bit,
-    // including where that rounds.
-    for (i, tss) in [(2usize, 0usize), (4, 1), (6, 2), (8, 3)] {
-        let text: i64 = record.attr_val[i].parse().expect("the text is an integer");
-        assert_eq!(text, TSS_VALUES[tss]);
-        assert_eq!(
-            bits(&record.attr_num[i]),
-            Some((text as f64).to_bits()),
-            "element {i}: the stored number must be the integer's `as f64`"
-        );
-    }
-    // And it ROUNDS from 2^53 + 1 on: the stored number for `2^53 + 1` is
-    // the same f64 as for `2^53`, which is why no exact comparison above
-    // that magnitude can be served from this column.
-    assert_eq!(bits(&record.attr_num[6]), bits(&record.attr_num[4]));
-    assert_ne!(record.attr_val[6], record.attr_val[4]);
-
-    // The stored `-0.0` keeps its sign bit. `-0.0 == 0.0` is true, so a
-    // value comparison cannot see this.
-    assert_eq!(bits(&record.attr_num[0]), Some((-0.0f64).to_bits()));
-    assert_eq!(bits(&record.attr_num[0]), Some(9_223_372_036_854_775_808));
-    assert_eq!(record.attr_type[0], pulsus_write::AttrValueType::Float);
 }

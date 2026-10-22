@@ -10,7 +10,7 @@
 //! metrics.totalJobs`),
 //! tags/tag-values containing the corpus's known keys/values, and
 //! TraceQL-metrics counts reconciling with the ingested span count; the
-//! cluster leg adds the shard-local `trace_spans` count-sum check
+//! cluster leg adds the shard-local `spans` count-sum check
 //! (mirrors `scenarios::assert_shard_local_row_counts`).
 //!
 //! [`traces_differential`] (single variant only — task-manager
@@ -1651,10 +1651,10 @@ fn tempo_instant_values(body: &serde_json::Value) -> Result<f64> {
 }
 
 /// Cluster-only shard-local sanity (mirrors
-/// `scenarios::assert_shard_local_row_counts`, table `trace_spans`):
-/// polls until the per-shard local counts sum to the ingested span
-/// total — proves real fan-out through `trace_spans_dist` without
-/// requiring any particular per-shard split.
+/// `scenarios::assert_shard_local_row_counts`, table `spans`): polls
+/// until the per-shard local counts sum to the ingested span total —
+/// proves real fan-out through `spans_dist` without requiring any
+/// particular per-shard split.
 ///
 /// **Run-scoped and replay-immune (issue #60 code review, medium):**
 /// the per-shard count is restricted to THIS corpus's trace ids
@@ -1681,12 +1681,12 @@ async fn assert_shard_local_span_counts(ctx: &Ctx, corpus: &TraceCorpus) -> Resu
                 let (shard1, shard2) =
                     tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
                         Ok((
-                            shard_local_trace_spans_count(&compose, "ch-shard1", &sql)?,
-                            shard_local_trace_spans_count(&compose, "ch-shard2", &sql)?,
+                            shard_local_spans_count(&compose, "ch-shard1", &sql)?,
+                            shard_local_spans_count(&compose, "ch-shard2", &sql)?,
                         ))
                     })
                     .await
-                    .context("shard-local trace_spans count task panicked")??;
+                    .context("shard-local spans count task panicked")??;
                 Ok((shard1 + shard2 == expected_total).then_some(()))
             }
         },
@@ -1694,7 +1694,7 @@ async fn assert_shard_local_span_counts(ctx: &Ctx, corpus: &TraceCorpus) -> Resu
     .await
     .with_context(|| {
         format!(
-            "shard-local run-scoped distinct trace_spans counts never summed to the \
+            "shard-local run-scoped distinct spans counts never summed to the \
              {expected_total} ingested spans"
         )
     })?;
@@ -1712,12 +1712,12 @@ fn scoped_span_count_sql(corpus: &TraceCorpus) -> String {
         .map(|t| format!("unhex('{}')", hex(&t.trace_id)))
         .collect();
     format!(
-        "SELECT uniqExact(trace_id, span_id) FROM pulsus.trace_spans WHERE trace_id IN ({})",
+        "SELECT uniqExact(trace_id, span_id) FROM pulsus.spans WHERE trace_id IN ({})",
         ids.join(", ")
     )
 }
 
-fn shard_local_trace_spans_count(
+fn shard_local_spans_count(
     compose: &crate::engine::Compose,
     shard_service: &str,
     sql: &str,
@@ -3543,7 +3543,7 @@ mod tests {
         let corpus = shipped_corpus(&fixture, fixture.ci.trace_count);
         let sql = scoped_span_count_sql(&corpus);
         assert!(
-            sql.starts_with("SELECT uniqExact(trace_id, span_id) FROM pulsus.trace_spans"),
+            sql.starts_with("SELECT uniqExact(trace_id, span_id) FROM pulsus.spans"),
             "count must be distinct-(trace_id, span_id), got: {sql}"
         );
         // Every corpus trace id is in the predicate — and nothing else:

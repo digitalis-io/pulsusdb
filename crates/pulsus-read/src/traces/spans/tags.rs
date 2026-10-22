@@ -55,8 +55,9 @@ use super::tracelevel::TraceLeaf;
 use crate::traces::sql_text::byte_cap_expr;
 use crate::traces::window_sql::WindowSql;
 
-/// The five scopes the writer catalogues for sender-supplied ATTRIBUTES,
-/// ascending (issue #475). This constant is the single source of truth
+/// The five scopes the writer catalogues (issue #475), ascending —
+/// `pulsus_write::TagScope`'s spellings, which `trace_scope_vocabulary.rs`
+/// asserts as an equality. This constant is the single source of truth
 /// for the whole scope surface: the SQL `IN` list below, the `scope=`
 /// accept list (`traces_api::params::parse_tags_params`) and the `{tag}`
 /// prefix set (`parse_tag_lookup`) all derive from it.
@@ -101,16 +102,6 @@ pub fn tag_values_sql(key_literal: &str, scope_literal: Option<&str>, limit: usi
     sql.push_str(&format!("\nORDER BY val, val_type\nLIMIT {limit}"));
     sql
 }
-
-/// The two scopes the writer reserves for INTRINSIC rows
-/// (`pulsus-write`'s `otlp_traces`), ascending. Their rows hold intrinsic
-/// values under reserved keys (`name`, `timeSinceStart`, `spanID`,
-/// `traceID`), so an attribute lookup must never answer out of them —
-/// which is what a bare-key read did before issue #475. Declared here,
-/// rather than implied by absence, so `trace_scope_vocabulary.rs` can
-/// state the writer/reader relation as an equality instead of two
-/// presence checks.
-pub const RESERVED_INTRINSIC_SCOPES: [&str; 2] = ["event:intrinsic", "link:intrinsic"];
 
 // ---------------------------------------------------------------------
 // Issue #598 part 2: narrowed values and span names from the span store
@@ -665,18 +656,6 @@ pub fn catalogue_resource_values_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Issue #475: the two reader scope lists are disjoint, so a scope
-    /// keyword can never be both an attribute scope and a reserved one.
-    #[test]
-    fn the_two_scope_lists_are_disjoint() {
-        for reserved in RESERVED_INTRINSIC_SCOPES {
-            assert!(
-                !ATTR_SCOPES.contains(&reserved),
-                "{reserved} is in both scope lists"
-            );
-        }
-    }
 
     use crate::logql::escape::ch_string;
     use crate::traces::{TAG_NAMES_MAX, TAG_VALUES_MAX};

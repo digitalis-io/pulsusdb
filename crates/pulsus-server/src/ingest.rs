@@ -33,7 +33,7 @@ use pulsus_write::writer::{
 };
 use pulsus_write::{
     AdmitRefusal, FlushWait, LogSink, LogWriter, MetricSink, MetricWriter, ParsedLogs,
-    ParsedMetrics, ParsedTraceLanding, ParsedTraces, PushHeaders, TraceSink, TraceWriter,
+    ParsedMetrics, ParsedTraceLanding, PushHeaders, TraceSink, TraceWriter,
 };
 
 use crate::app::AppState;
@@ -220,26 +220,20 @@ impl TraceWriterSink {
 }
 
 impl TraceSink for TraceWriterSink {
-    fn admit(
-        &self,
-        batch: ParsedTraces,
-        landing: ParsedTraceLanding,
-        push: PushHeaders,
-    ) -> Result<(), AdmitRefusal> {
+    fn admit(&self, landing: ParsedTraceLanding, push: PushHeaders) -> Result<(), AdmitRefusal> {
         match self.slot.get() {
-            Some(writer) => writer.admit(batch, landing, push),
+            Some(writer) => writer.admit(landing, push),
             None => Err(AdmitRefusal::Backpressure),
         }
     }
 
     fn admit_flush(
         &self,
-        batch: ParsedTraces,
         landing: ParsedTraceLanding,
         push: PushHeaders,
     ) -> Result<FlushWait, AdmitRefusal> {
         match self.slot.get() {
-            Some(writer) => writer.admit_flush(batch, landing, push),
+            Some(writer) => writer.admit_flush(landing, push),
             None => Err(AdmitRefusal::Backpressure),
         }
     }
@@ -458,44 +452,11 @@ mod tests {
         );
     }
 
-    fn traces_batch() -> ParsedTraces {
-        ParsedTraces {
-            spans: vec![pulsus_write::SpanRecord {
-                trace_id: [1; 16],
-                span_id: [2; 8],
-                parent_id: [0; 8],
-                name: "op-a".to_string(),
-                service: "svc".to_string(),
-                timestamp_ns: 1,
-                duration_ns: 1,
-                status_code: 0,
-                status_message: String::new(),
-                kind: 0,
-                shared: 0,
-                scope_name: String::new(),
-                scope_version: String::new(),
-                payload: vec![1],
-                // Hand-built: no attribute arrays (issue #556). Five EMPTY arrays
-                // satisfy the `attr_arrays_aligned` CHECK — 0 = 0 = 0 = 0 = 0.
-                attr_key: Vec::new(),
-                attr_scope: Vec::new(),
-                attr_val: Vec::new(),
-                attr_type: Vec::new(),
-                attr_num: Vec::new(),
-            }],
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn trace_admit_is_backpressure_while_the_slot_is_empty() {
         let sink = TraceWriterSink::new(Arc::new(OnceLock::new()));
         assert_eq!(
-            sink.admit(
-                traces_batch(),
-                ParsedTraceLanding::default(),
-                PushHeaders::default()
-            ),
+            sink.admit(ParsedTraceLanding::default(), PushHeaders::default()),
             Err(AdmitRefusal::Backpressure)
         );
     }
@@ -504,12 +465,8 @@ mod tests {
     fn trace_admit_flush_is_backpressure_while_the_slot_is_empty() {
         let sink = TraceWriterSink::new(Arc::new(OnceLock::new()));
         assert!(
-            sink.admit_flush(
-                traces_batch(),
-                ParsedTraceLanding::default(),
-                PushHeaders::default()
-            )
-            .is_err()
+            sink.admit_flush(ParsedTraceLanding::default(), PushHeaders::default())
+                .is_err()
         );
     }
 }

@@ -1,16 +1,15 @@
 //! The trace landing path: **one push is one `INSERT` of one block into
-//! `trace_landing`** (issue #586), beside the old two-table trace writer,
-//! which keeps writing `trace_spans` and `trace_attrs_idx` until task 20
-//! (#602) because the reads that have not moved still answer from them.
+//! `trace_landing`** (issue #586), the one table a trace push is written to
+//! since issue #602.
 //!
-//! Five materialized views maintain `spans`, `resources`, `traces`,
-//! `tag_names` and `tag_values` from that one source table, and this path
-//! inserts into none of them. The loop, its two fates, the budget, the
-//! shutdown boundary, the byte accounting and the spool copy are
+//! Materialized views maintain `spans`, `resources`, `traces`, `tag_names`,
+//! `tag_values` and the bucket and error tables from that one source table,
+//! and this path inserts into none of them. The loop, its two fates, the
+//! budget, the shutdown boundary, the byte accounting and the spool copy are
 //! `writer::landing`'s, whole; what is here is what traces decides for
 //! itself.
 //!
-//! **Four things, and each is here because of what a trace push carries:**
+//! **Three things, and each is here because of what a trace push carries:**
 //!
 //! * the four landed event shapes a push produces, built from the handler's
 //!   [`ParsedTraceLanding`] rather than decoded here — the decode runs in the
@@ -23,37 +22,31 @@
 //! * the byte charge, which walks two arrays of tuples — a span's events and
 //!   links are client-chosen and unbounded short of the expansion ceiling,
 //!   so a charge that priced the vector headers alone would not bound what
-//!   the queue holds;
-//! * a byte counter of its own, separate from the old path's. One counter
-//!   for both would charge a trace push both paths' bytes against one
-//!   ceiling, so a push the route accepts today would be refused `429` at an
-//!   unchanged setting while the old path is still the one answering the
-//!   client.
+//!   the queue holds.
 //!
 //! **Nothing here subtracts the landing counter.** The reservation is taken
 //! at admission and released exactly once, by whichever ending settles the
 //! block, through `writer::landing`'s `LandingBlock::release` — which owns
-//! when. Admission reserves the old path's bytes first and the landing
-//! path's second, so a refusal between the two rolls back the old path's
-//! reservation and never this one, and a granted landing reservation is
-//! always followed by a queued block.
+//! when. A granted reservation is always followed by a queued block.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pulsus_clickhouse::{MAX_PARTITIONS_PER_INSERT_BLOCK, QuerySettings};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::ingest::traces::ParsedTraceLanding;
 use crate::writer::config::WriterRuntime;
 use crate::writer::drain::{AdmissionPass, DrainBoundary};
+use crate::writer::error::WriteError;
 use crate::writer::landing::{
     LandingBlock, LandingContext, LandingFate, MSG_SHUTDOWN_QUEUED, TerminalCause, landing_charge,
     mint_landing_token, settle_block, spawn_landing_worker,
 };
-use crate::writer::metrics::{TraceLandingSnapshot, TraceWriterMetrics};
+use crate::writer::metrics::{TraceWriterMetrics, TraceWriterMetricsSnapshot};
 use crate::writer::push_dedup::ClaimTicket;
+use crate::writer::push_dedup::DedupMetricsSnapshot;
 use crate::writer::push_dedup::PushDedup;
 use crate::writer::rows::TraceLandingRow;
 use crate::writer::spool::SpoolWriter;
@@ -165,7 +158,7 @@ pub(crate) fn rows_of(received_ms: i64, landing: ParsedTraceLanding) -> Vec<Trac
     rows
 }
 
-/// The landing half of the trace writer: its queue, its insert workers, its
+/// The trace writer's landing queue: its insert workers, its
 /// own byte counter and the token generator.
 pub(crate) struct TraceLandingPath {
     /// The landing queue's sender. Bounded by **bytes, not by length**:
@@ -174,7 +167,7 @@ pub(crate) struct TraceLandingPath {
     /// that comes to.
     tx: mpsc::UnboundedSender<LandingBlock<TraceLandingRow>>,
     ctx: Arc<LandingContext<TraceLandingRow>>,
-    /// This path's own reservation counter, not the old path's.
+    /// The reservation counter `PULSUS_INGEST_QUEUE_BYTES` bounds.
     queued_bytes: Arc<AtomicU64>,
     metrics: Arc<TraceWriterMetrics>,
     /// The token generator. One lock per admitted push: a token minted from
@@ -225,8 +218,7 @@ impl TraceLandingPath {
                 .collect::<Vec<_>>(),
         );
         // The suppression index's `tick()` is a task of its own, as it is on
-        // both shipped signals: the old trace path's two flush loops drive
-        // no index, and `TableContext::dedup` stays `None` for that reason.
+        // the other two signals.
         boundary.track_background(
             dedup.map(|d| spawn_dedup_ticker(d, runtime.batch_age, boundary.watch())),
         );
@@ -266,14 +258,13 @@ impl TraceLandingPath {
     /// Seals one block — minting its token, so two byte-identical pushes
     /// carry different ones — and hands it to the queue.
     ///
-    /// **The block carries no waiter.** The route's answer stays the old
-    /// path's, byte for byte: a landing failure is counted and spooled like
-    /// any other block and changes no status code. Task 20 moves the answer
-    /// to this path when it deletes the old one.
+    /// `waiter` is the sync push's answer: the landing insert's own outcome
+    /// resolves it, so a failed insert is the route's error (issue #602).
     ///
     /// A block that reaches here after the queue closed is settled by a task
     /// of this admission's own, through the same ending a worker gives a
     /// block whose attempt the passed shutdown deadline refuses.
+    #[allow(clippy::too_many_arguments)] // one admission's pass, claim and waiter travel together
     pub(crate) fn queue(
         &self,
         pass: &AdmissionPass<'_>,
@@ -281,6 +272,7 @@ impl TraceLandingPath {
         rows: Vec<TraceLandingRow>,
         bytes: u64,
         claim: ClaimTicket,
+        waiter: Option<oneshot::Sender<Result<(), WriteError>>>,
         admitted_at: tokio::time::Instant,
     ) {
         let token = {
@@ -295,7 +287,7 @@ impl TraceLandingPath {
             bytes,
             QuerySettings::trace_landing_insert(&token, self.ctx.max_rows),
             claim,
-            None,
+            waiter,
             admitted_at,
         );
         if let Err(closed) = self.tx.send(block) {
@@ -309,10 +301,10 @@ impl TraceLandingPath {
         }
     }
 
-    /// This path's own figures, which no exported series carries.
-    pub(crate) fn snapshot(&self) -> TraceLandingSnapshot {
+    /// The trace writer's figures, this path's live reservation among them.
+    pub(crate) fn snapshot(&self, dedup: DedupMetricsSnapshot) -> TraceWriterMetricsSnapshot {
         self.metrics
-            .landing_snapshot(self.queued_bytes.load(Ordering::Relaxed))
+            .snapshot(self.queued_bytes.load(Ordering::Relaxed), dedup)
     }
 }
 

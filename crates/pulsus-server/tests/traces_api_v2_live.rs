@@ -17,7 +17,7 @@
 //!
 //! ## The fixture is derived from the clock, not written as literals
 //!
-//! `trace_spans` carries a delete TTL at `retention_days` (default 7,
+//! `spans` carries a delete TTL at `retention_days` (default 7,
 //! `crates/pulsus-config/src/model.rs:165`) with `ttl_only_drop_parts =
 //! 1`. Fixed calendar timestamps fall outside that window as soon as this
 //! file is a week old: the rows are dropped, every case returns empty,
@@ -821,11 +821,8 @@ async fn the_compare_totals_cover_the_population_whatever_the_selection_window()
 // Issue #586 — the push-suppression index over the trace push
 // ---------------------------------------------------------------------
 //
-// The trace push joins issue #494's suppression index, and it is the one
-// behaviour on the OLD two-table path this change alters: a push the index
-// recognises stores nothing on either path, where today the old path stores
-// it twice. So these cases read BOTH stores, each against its own expected
-// value — no case here compares one with the other.
+// The trace push joins issue #494's suppression index: a push the index
+// recognises stores nothing.
 
 /// `pulsusdb` with extra environment, for the cases that need the compat
 /// endpoints or a short suppression window.
@@ -936,9 +933,9 @@ async fn count_of(db: &str, table_sql: &str) -> u64 {
     .expect("a count")
 }
 
-/// Waits until `count_of` answers `want`, so a case can read the landing
-/// table after a `200` — the landing block carries no waiter, because the
-/// route's answer is the old path's.
+/// Waits until `count_of` answers `want`, so a case can read a table after
+/// a `200` without assuming the write is readable the instant it is
+/// acknowledged.
 async fn settle_count(db: &str, table_sql: &str, want: u64, ctx: &str) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -985,11 +982,7 @@ fn fixture_spans(names: &[&str]) -> Vec<Span> {
         .collect()
 }
 
-/// **A suppressed trace push sends nothing**, on **both** write paths.
-///
-/// This is the one behaviour on the old path that this change alters, so the
-/// case has to see both: a retry that skipped only the landing branch while
-/// `trace_spans` stored twice would pass every other assertion.
+/// **A suppressed trace push sends nothing.**
 #[tokio::test(flavor = "multi_thread")]
 async fn a_suppressed_trace_push_sends_nothing() {
     if !should_run() {
@@ -1021,12 +1014,6 @@ async fn a_suppressed_trace_push_sends_nothing() {
         count_of(db.name(), "spans FINAL").await,
         3,
         "and the target collapses to the body's span count"
-    );
-    assert_eq!(
-        count_of(db.name(), "trace_spans").await,
-        3,
-        "the old path's own table holds the single push's span count, not \
-         twice it: the suppression index is upstream of both paths"
     );
 }
 
@@ -1103,8 +1090,6 @@ async fn distinct_idempotency_keys_store_both_trace_pushes() {
             2,
             "/v1/traces: the target's own collapse, not a discriminator"
         );
-        let old = count_of(db.name(), "trace_spans").await;
-        eprintln!("/v1/traces: trace_spans held {old} rows (recorded)");
     }
 
     {
@@ -1126,8 +1111,6 @@ async fn distinct_idempotency_keys_store_both_trace_pushes() {
         )
         .await;
         assert_eq!(count_of(db.name(), "spans FINAL").await, 2);
-        let old = count_of(db.name(), "trace_spans").await;
-        eprintln!("/api/v2/spans: trace_spans held {old} rows (recorded)");
     }
 }
 
@@ -1330,64 +1313,17 @@ async fn ch_count(client: &ChClient, sql: &str) -> u64 {
         .n
 }
 
-/// §5.0b's **P1**: the trace's rows are **not in the old table**.
-///
-/// **Why every case that reads through a fetch route needs it.** A push
-/// writes the old per-span payload column as well as the landing table,
-/// and the old payload reader round-trips any fixture perfectly — so a
-/// case that pushes through the ingest route and reads through a fetch
-/// route is **green on the unchanged tree** unless something stops it.
-/// This is that something: a scoped `ALTER … DELETE` on the trace's own
-/// rows, polled to completion, so the case says *"this trace is not in the
-/// old table"* rather than *"the old table is empty"*.
-///
-/// On its own this reddens every case whose assertion is on a non-empty
-/// response, because the old point read then answers empty. It does
-/// **not** cover a case whose expected answer IS empty, or one that
-/// asserts the statement rather than the body — [`the_new_statements_ran`]
-/// is what covers those two.
-async fn not_in_the_old_table(admin: &ChClient, db: &str, hex: &str, expected_new_spans: u64) {
-    ch_exec(
-        admin,
-        &format!("ALTER TABLE {db}.trace_spans DELETE WHERE trace_id = unhex('{hex}')"),
-    )
-    .await;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let pending = ch_count(
-            admin,
-            &format!(
-                "SELECT count() AS n FROM system.mutations \
-                 WHERE database = '{db}' AND table = 'trace_spans' AND NOT is_done"
-            ),
-        )
-        .await;
-        if pending == 0 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the scoped delete on the old table did not finish within 10s"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert_eq!(
-        ch_count(
-            admin,
-            &format!("SELECT count() AS n FROM {db}.trace_spans WHERE trace_id = unhex('{hex}')")
-        )
-        .await,
-        0,
-        "P1: the trace must be gone from the old table, or the old reader can answer"
-    );
+/// §5.0b's **P1**: the trace is stored, with the span count the case
+/// expects, so a case is never about an empty table.
+async fn stored_in_spans(admin: &ChClient, db: &str, hex: &str, expected_spans: u64) {
     assert_eq!(
         ch_count(
             admin,
             &format!("SELECT count() AS n FROM {db}.spans FINAL WHERE trace_id = unhex('{hex}')")
         )
         .await,
-        expected_new_spans,
-        "P1: and still present in the new one, or the case is about an empty table"
+        expected_spans,
+        "P1: the trace must be stored, or the case is about an empty table"
     );
 }
 
@@ -1405,9 +1341,8 @@ async fn not_in_the_old_table(admin: &ChClient, db: &str, hex: &str, expected_ne
 /// the run database instead, which is what keeps one run from reading
 /// another's.
 ///
-/// This is what covers the two kinds P1 cannot: a case whose expected
-/// answer is EMPTY, where an empty old-path answer passes P1 silently, and
-/// a case that asserts the statement rather than the body.
+/// This is what covers a case that asserts the statement rather than the
+/// body.
 async fn the_new_statements_ran(admin: &ChClient, db: &str, prefix: &str) {
     let text = recorded_statement(admin, db, &format!("{prefix}-1"))
         .await
@@ -1748,9 +1683,9 @@ fn span_id_of(n: u8) -> [u8; 8] {
 /// | spans starting at `0` and the anchor | **two** span partitions and buckets **0** and **5666666** | the table is partitioned and bucketed on each span's OWN start |
 /// | both spans in **one** push | **1** per-trace row, filed under `1970-01-01` | the view groups per insert block and files under the block's MINIMUM start day |
 ///
-/// **So the precondition is four counts and each is a different
-/// quantity**: `0` in the old table, `2` finalised spans, **`2` raw**
-/// resource rows and **`1` finalised** one. Asserting the raw count and
+/// **So the precondition is three counts and each is a different
+/// quantity**: `2` finalised spans, **`2` raw** resource rows and **`1`
+/// finalised** one. Asserting the raw count and
 /// the finalised count separately is what makes the case say which it
 /// means — the raw count is stable because no merge can combine parts in
 /// different partitions, and the finalised count is stable because `day`
@@ -1912,7 +1847,7 @@ async fn t_w7_a_span_with_every_field_round_trips_as_an_otlp_value() {
     );
 
     // --- the precondition: four counts, four quantities -------------
-    not_in_the_old_table(&admin, db.name(), &hex32, 2).await;
+    stored_in_spans(&admin, db.name(), &hex32, 2).await;
     let resource_counts = {
         let raw = ch_count(
             &admin,
@@ -2298,8 +2233,8 @@ async fn the_fallback_answers_a_trace_the_per_trace_view_has_not_indexed() {
     );
 
     // 6. P1 for both traces.
-    not_in_the_old_table(&admin, db.name(), &unindexed_hex, 3).await;
-    not_in_the_old_table(&admin, db.name(), &indexed_hex, 3).await;
+    stored_in_spans(&admin, db.name(), &unindexed_hex, 3).await;
+    stored_in_spans(&admin, db.name(), &indexed_hex, 3).await;
 
     // (a) the unindexed trace, WITH a window.
     let window = format!(
@@ -2476,8 +2411,8 @@ async fn t_q1_a_fetch_issues_one_statement_and_the_fallback_two() {
         &format!("ATTACH TABLE {db}.traces_mv", db = db.name()),
     )
     .await;
-    not_in_the_old_table(&admin, db.name(), &indexed_hex, 3).await;
-    not_in_the_old_table(&admin, db.name(), &unindexed_hex, 3).await;
+    stored_in_spans(&admin, db.name(), &indexed_hex, 3).await;
+    stored_in_spans(&admin, db.name(), &unindexed_hex, 3).await;
 
     // The indexed fetch: exactly one id, and the second is absent twice
     // over.
@@ -2559,7 +2494,7 @@ async fn a_zipkin_shared_span_comes_back_as_two_spans_in_canonical_order() {
         vec![server_side, client_side, third],
         "the shared-span push",
     );
-    not_in_the_old_table(&admin, db.name(), &hex32, 3).await;
+    stored_in_spans(&admin, db.name(), &hex32, 3).await;
 
     let (fetched, prefix) = fetch_trace(port, &hex32, "", "the shared span");
     the_new_statements_ran(&admin, db.name(), &prefix).await;
@@ -2654,7 +2589,7 @@ async fn a_reordered_attribute_key_passes_and_a_changed_value_fails() {
             }],
             name,
         );
-        not_in_the_old_table(admin, db.name(), hex32, 1).await;
+        stored_in_spans(admin, db.name(), hex32, 1).await;
         let (fetched, prefix) = fetch_trace(port, hex32, "", name);
         the_new_statements_ran(admin, db.name(), &prefix).await;
         fetched
@@ -2931,7 +2866,7 @@ async fn a_trace_landed_by_three_pushes_across_buckets_and_a_day_boundary_fetche
          complete-predicate route cannot fire for this trace"
     );
 
-    not_in_the_old_table(&admin, db.name(), &hex32, 6).await;
+    stored_in_spans(&admin, db.name(), &hex32, 6).await;
 
     // --- the fetch, with NO window ----------------------------------
     let (fetched, prefix) = fetch_trace(port, &hex32, "", "T-W8");
@@ -3105,7 +3040,7 @@ async fn a_span_with_the_maximum_end_timestamp_fetches_and_returns_its_end() {
         "T-W9 push",
     );
     for (hex32, _) in &spans {
-        not_in_the_old_table(&admin, db.name(), hex32, 1).await;
+        stored_in_spans(&admin, db.name(), hex32, 1).await;
     }
 
     // --- group 1: the returned end values ---------------------------
@@ -3295,7 +3230,7 @@ async fn two_resources_differing_only_in_semantics_fetch_as_themselves() {
         "five distinct identities survive finalisation — without the write side's \
          identity section two of them collide and storage keeps whichever landed first"
     );
-    not_in_the_old_table(&admin, db.name(), &hex32, 5).await;
+    stored_in_spans(&admin, db.name(), &hex32, 5).await;
 
     let (fetched, prefix) = fetch_trace(port, &hex32, "", "T-W10");
     the_new_statements_ran(&admin, db.name(), &prefix).await;
@@ -3409,14 +3344,6 @@ async fn two_resources_differing_only_in_semantics_fetch_as_themselves() {
 /// point**: nothing in the response marks the loss, so no presence check,
 /// no type check and no decode check can see it, and the assertion has to
 /// name the value.
-///
-/// ## Provenance
-///
-/// **P1 is load-bearing here in a way it is not everywhere**: the old
-/// payload carries the sender's exact bytes, so the old point read returns
-/// `-1`, `300`, the protocol's maximum and the short link ids
-/// **correctly**. Without P1 all four assertions are green on the old
-/// path.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pushed_span_with_out_of_range_kind_status_event_time_and_short_link_ids_fetches_them_back()
  {
@@ -3460,7 +3387,7 @@ async fn a_pushed_span_with_out_of_range_kind_status_event_time_and_short_link_i
         })
         .collect();
     one_resource_push(port, "checkout", spans, "T-W11 push");
-    not_in_the_old_table(&admin, db.name(), &hex32, 2).await;
+    stored_in_spans(&admin, db.name(), &hex32, 2).await;
 
     let (fetched, prefix) = fetch_trace(port, &hex32, "", "T-W11");
     the_new_statements_ran(&admin, db.name(), &prefix).await;
@@ -3711,7 +3638,7 @@ async fn t_q3_the_fetch_statement_body_is_within_twice_the_stored_bytes() {
             .collect(),
         "T-Q3 push",
     );
-    not_in_the_old_table(&admin, db.name(), &hex32, 40).await;
+    stored_in_spans(&admin, db.name(), &hex32, 40).await;
 
     let (fetched, prefix) = fetch_trace(port, &hex32, "", "T-Q3");
     the_new_statements_ran(&admin, db.name(), &prefix).await;
@@ -4671,14 +4598,13 @@ fn sorted_trace_ids(port: u16, q: &str, start_ns: i64, end_ns: i64, ctx: &str) -
 }
 
 /// Issue #591 part 3's amendment: a search never returns a span past its
-/// retention, whether or not storage has deleted it yet, on either engine.
+/// retention, whether or not storage has deleted it yet.
 ///
 /// Three one-span traces: `A` and `C` an hour past the 7-day cutoff, `B`
 /// an hour inside it. The schema keeps everything (built at the suite's
-/// own retention), so expiry is played by hand and differently on each
-/// table set: today's tables lose `A`, the new tables lose `C`. Without
-/// the clamp each engine returns the expired trace its own tables still
-/// hold.
+/// own retention), so expiry is played by hand: `C` is deleted from the
+/// tables and `A` is not. Without the clamp the search returns `A`, which
+/// storage still holds.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_search_never_returns_a_span_past_retention() {
     if !should_run() {
@@ -4725,13 +4651,6 @@ async fn a_search_never_returns_a_span_past_retention() {
     .expect("the push must be reachable");
     assert_eq!(res.status, 200, "{:?}", String::from_utf8_lossy(&res.body));
     settle_count(db.name(), "spans", 3, "spans").await;
-    settle_count(
-        db.name(),
-        "(SELECT DISTINCT trace_id FROM trace_recent)",
-        3,
-        "trace_recent",
-    )
-    .await;
     settle_count(db.name(), "traces FINAL", 3, "traces").await;
     let data = ch_data(db.name()).await;
     let delete = |table: &str, trace: &str| {
@@ -4740,15 +4659,6 @@ async fn a_search_never_returns_a_span_past_retention() {
              SETTINGS mutations_sync = 2"
         )
     };
-    for table in [
-        "trace_recent",
-        "trace_spans",
-        "trace_attrs_idx",
-        "trace_error_spans",
-        "trace_edges",
-    ] {
-        ch_exec(&data, &delete(table, &"aa".repeat(16))).await;
-    }
     for table in ["spans", "traces"] {
         ch_exec(&data, &delete(table, &"cc".repeat(16))).await;
     }

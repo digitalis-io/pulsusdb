@@ -385,8 +385,8 @@ fn traces_self_round_trip_is_row_identical() {
     let via_json = otlp_traces::decode_json(&json).expect("decode_json traces");
     let via_pb = traces_via_protobuf(&req);
     assert_eq!(
-        otlp_traces::parse(&via_json, NOW_NS).expect("json within budget"),
-        otlp_traces::parse(&via_pb, NOW_NS).expect("pb within budget"),
+        otlp_traces::parse_landing(&via_json).expect("json within budget"),
+        otlp_traces::parse_landing(&via_pb).expect("pb within budget"),
     );
 }
 
@@ -425,8 +425,8 @@ fn traces_golden_json_is_row_identical_to_protobuf() {
         otlp_traces::decode_json(&read_golden("traces.json")).expect("decode traces golden");
     let via_pb = traces_via_protobuf(&traces_request());
     assert_eq!(
-        otlp_traces::parse(&via_json, NOW_NS).expect("json within budget"),
-        otlp_traces::parse(&via_pb, NOW_NS).expect("pb within budget"),
+        otlp_traces::parse_landing(&via_json).expect("json within budget"),
+        otlp_traces::parse_landing(&via_pb).expect("pb within budget"),
     );
 }
 

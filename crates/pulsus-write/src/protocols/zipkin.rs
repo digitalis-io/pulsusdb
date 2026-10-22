@@ -5,14 +5,11 @@
 //! (this span, its `localEndpoint` promoted to a `service.name` resource
 //! attribute, its `remoteEndpoint`/`tags`/`debug`/`shared` as span
 //! attributes, its `annotations` as span events) and the whole batch is
-//! handed to the **existing** `otlp_traces::parse`
+//! handed to the **existing** `otlp_traces::parse_landing`
 //! (`protocols/otlp_traces.rs`). Reusing that one function is the
-//! load-bearing correctness guarantee: id length/validation, the
-//! self-contained single-`ResourceSpans` payload contract, `payload_type =
-//! 1` (OTLP — the reserved `payload_type = 2` "Zipkin JSON" is deliberately
-//! NOT used, which would fork a divergent assembly path), verbatim scoped
-//! attribute indexing, and the `MAX_EXPANDED_BYTES` expansion budget all
-//! come for free and are **byte-identical** to the native OTLP path, so a
+//! load-bearing correctness guarantee: id length/validation, verbatim scoped
+//! attribute storage, and the `MAX_EXPANDED_BYTES` expansion budget all come
+//! for free and are **byte-identical** to the native OTLP path, so a
 //! Zipkin-ingested span is queryable via trace-by-ID (#55) and TraceQL
 //! search (#56) with no read-path divergence.
 //!
@@ -26,7 +23,7 @@
 //! timestamp, fails the whole request with
 //! [`LogsIngestError::ZipkinDecode`] (HTTP 400 / `google.rpc.Status.code =
 //! 3`). [`to_otlp`] validates every id/timestamp up front, so the adapted
-//! request that reaches `otlp_traces::parse` never triggers that parser's
+//! request that reaches `otlp_traces::parse_landing` never triggers that parser's
 //! per-span rejection path.
 //!
 //! **Decode-time byte budget (issue #168):** [`BoundedSpans`] additionally
@@ -331,13 +328,13 @@ where
 /// self-contained block re-carries its resource) and [`MAX_SPANS_PER_REQUEST`]
 /// alone (1M) bounds only the count, not the expanded bytes — so a
 /// large-but-under-count request could exhaust memory here, *ahead* of the
-/// [`otlp_traces::parse`] size gate this batch is later handed to. Each
+/// [`otlp_traces::parse_landing`] size gate this batch is later handed to. Each
 /// block is therefore charged against the SAME
 /// [`otlp_traces::MAX_EXPANDED_BYTES`] budget the moment it is adapted and
 /// BEFORE the rest of the batch is materialized (reserve-before-materialize):
 /// an over-budget request aborts mid-adaptation with
 /// [`LogsIngestError::OversizeMessage`], the identical verdict the
-/// equivalent native OTLP request gets from `parse` (the charge is
+/// equivalent native OTLP request gets from `parse_landing` (the charge is
 /// `otlp_traces`' own per-block measure).
 pub fn to_otlp(spans: Vec<ZipkinSpan>) -> Result<ExportTraceServiceRequest, LogsIngestError> {
     // Never reserve output capacity for the (attacker-influenced, up to
@@ -901,7 +898,7 @@ mod tests {
     /// under [`MAX_SPANS_PER_REQUEST`] but whose adapted OTLP expands past
     /// [`otlp_traces::MAX_EXPANDED_BYTES`] is rejected as the named
     /// oversize error DURING adaptation — charged block-by-block against the
-    /// same budget `otlp_traces::parse` enforces, and aborted the moment the
+    /// same budget `otlp_traces::parse_landing` enforces, and aborted the moment the
     /// running total crosses it, BEFORE the whole batch is materialized.
     ///
     /// Two-sided, retune-proof (all counts derive from the live

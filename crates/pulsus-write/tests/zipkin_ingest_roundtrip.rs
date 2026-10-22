@@ -2,20 +2,19 @@
 //! the Zipkin receiver, both against a fresh, isolated database (`DROP
 //! DATABASE` + `run_init`, so the T1 tables exist), driven through the real
 //! product path — `pulsus_write::ingest_zipkin` -> `zipkin::to_otlp` ->
-//! `otlp_traces::parse` -> `TraceWriter` (sync mode) -> ClickHouse.
+//! the landing decode -> `TraceWriter` (sync mode) -> ClickHouse.
 //!
 //! 1. **Fingerprint identity** (`zipkin_stored_spans_are_byte_identical_to_
 //!    the_equivalent_otlp_ingest`): a Zipkin span and the *equivalent* OTLP
 //!    span, ingested into separate databases, store byte-identical
-//!    `trace_spans` summary columns (trace_id, span_id, parent_id, name,
-//!    service, timestamp_ns, duration_ns, status_code, kind, payload_type)
-//!    — the 64-bit trace-id left-pad and micros→nanos are the load-bearing
+//!    `spans` summary columns (trace_id, span_id, parent_span_id, name,
+//!    service, start_ns, duration_ns, status_code, kind) — the 64-bit trace-id left-pad and micros→nanos are the load-bearing
 //!    pieces. Proves a trace is queryable identically whether it arrives via
 //!    Zipkin or OTLP.
 //!
 //! 2. **Shared-span storage** (`a_zipkin_shared_span_stores_both_the_server_
 //!    and_client_sides`): a Zipkin shared RPC span (same traceId+id, kind
-//!    SERVER vs CLIENT) stores as TWO `trace_spans` rows distinguished only
+//!    SERVER vs CLIENT) stores as TWO `spans` rows distinguished only
 //!    by `kind` — the write-side half of the trace-by-ID shared-span fix
 //!    (the read-side "trace-by-ID returns both" is proven end-to-end in
 //!    `pulsus-server`'s `traces_api_live.rs` and hermetically in
@@ -42,7 +41,7 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::span::SpanKind;
-use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, TracesData};
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
@@ -135,25 +134,24 @@ fn now_micros() -> i64 {
     .expect("fits i64")
 }
 
-/// The `trace_spans` summary columns — everything but the payload blob.
+/// The `spans` summary columns.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 struct SummaryRow {
     trace_id: [u8; 16],
     span_id: [u8; 8],
-    parent_id: [u8; 8],
+    parent_span_id: [u8; 8],
     name: String,
     service: String,
-    timestamp_ns: i64,
+    start_ns: i64,
     duration_ns: i64,
-    status_code: i8,
-    kind: i8,
-    payload_type: i8,
+    status_code: i32,
+    kind: i32,
 }
 
 async fn summary_rows(client: &ChClient, db: &str) -> Vec<SummaryRow> {
     let sql = format!(
-        "SELECT trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-         status_code, kind, payload_type FROM {db}.trace_spans ORDER BY span_id"
+        "SELECT trace_id, span_id, parent_span_id, name, service, start_ns, duration_ns, \
+         status_code, kind FROM {db}.spans ORDER BY span_id, kind"
     );
     let mut stream = client
         .query_stream::<SummaryRow>(&sql, &QuerySettings::new())
@@ -178,7 +176,7 @@ fn str_kv(key: &str, val: &str) -> KeyValue {
 
 /// AC1 (fingerprint identity): the same logical trace, ingested once as
 /// Zipkin v2 JSON and once as the equivalent OTLP, stores byte-identical
-/// `trace_spans` summary columns.
+/// `spans` summary columns.
 #[tokio::test]
 async fn zipkin_stored_spans_are_byte_identical_to_the_equivalent_otlp_ingest() {
     skip_unless_live!();
@@ -258,14 +256,14 @@ async fn zipkin_stored_spans_are_byte_identical_to_the_equivalent_otlp_ingest() 
         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
         "64-bit trace id left-padded to 16 bytes"
     );
-    assert_eq!(zrows[0].timestamp_ns, ts * 1000, "micros → nanos");
+    assert_eq!(zrows[0].start_ns, ts * 1000, "micros → nanos");
     assert_eq!(zrows[0].duration_ns, dur * 1000, "micros → nanos");
-    assert_eq!(zrows[0].kind, SpanKind::Client as i8, "CLIENT → kind 3");
-    assert_eq!(zrows[0].payload_type, 1, "adapts to OTLP payload_type 1");
+    assert_eq!(zrows[0].kind, SpanKind::Client as i32, "CLIENT → kind 3");
+    assert_eq!(zrows[0].parent_span_id, [0, 0, 0, 0, 0, 0, 0, 3]);
 }
 
 /// AC2 (shared-span storage): a Zipkin shared RPC span (same traceId+id,
-/// kind SERVER vs CLIENT) stores as TWO `trace_spans` rows separated only
+/// kind SERVER vs CLIENT) stores as TWO `spans` rows separated only
 /// by `kind` — neither side is dropped on the write path.
 #[tokio::test]
 async fn a_zipkin_shared_span_stores_both_the_server_and_client_sides() {
@@ -301,39 +299,15 @@ async fn a_zipkin_shared_span_stores_both_the_server_and_client_sides() {
     // Same trace_id + span_id, distinct kind (SERVER=2, CLIENT=3).
     assert_eq!(rows[0].span_id, rows[1].span_id, "same span_id");
     assert_eq!(rows[0].trace_id, rows[1].trace_id, "same trace_id");
-    let mut kinds = vec![rows[0].kind, rows[1].kind];
-    kinds.sort();
+    // Ordered by (span_id, kind): SERVER = 2 first, CLIENT = 3 second, and
+    // each side keeps its own endpoint's service.
+    let sides: Vec<(i32, &str)> = rows.iter().map(|r| (r.kind, r.service.as_str())).collect();
     assert_eq!(
-        kinds,
-        vec![SpanKind::Server as i8, SpanKind::Client as i8],
-        "the two sides are SERVER and CLIENT"
+        sides,
+        vec![
+            (SpanKind::Server as i32, "backend"),
+            (SpanKind::Client as i32, "frontend"),
+        ],
+        "the two sides are SERVER and CLIENT, each with its own service"
     );
-
-    // Each stored payload independently decodes and carries its own kind.
-    #[derive(Row, serde::Serialize, serde::Deserialize)]
-    struct PayloadRow {
-        kind: i8,
-        #[serde(with = "serde_bytes")]
-        payload: Vec<u8>,
-    }
-    let mut stream = client
-        .query_stream::<PayloadRow>(
-            &format!("SELECT kind, payload FROM {db}.trace_spans"),
-            &QuerySettings::new(),
-        )
-        .await
-        .expect("select payloads");
-    let mut seen = Vec::new();
-    while let Some(row) = stream.next().await {
-        let row = row.expect("decode payload row");
-        let data = TracesData::decode(row.payload.as_slice()).expect("payload decodes");
-        let span = &data.resource_spans[0].scope_spans[0].spans[0];
-        assert_eq!(
-            span.kind as i8, row.kind,
-            "the decoded payload's kind matches the stored column"
-        );
-        seen.push(row.kind);
-    }
-    seen.sort();
-    assert_eq!(seen, vec![SpanKind::Server as i8, SpanKind::Client as i8]);
 }

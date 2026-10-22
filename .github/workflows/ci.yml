@@ -2099,8 +2099,8 @@ jobs:
         run: cargo test -p pulsus-clickhouse --test live_spreading
 
       # Issue #54 AC5: the OTLP traces round-trip — POST /v1/traces ->
-      # TraceWriter (sync) -> exact count()s on both writer-written trace
-      # tables, plus a live payload/FixedString wire-encoding read-back.
+      # TraceWriter (sync) -> exact count()s on every table the landing
+      # views fill, plus a FixedString id read-back.
       # Reuses this job's ClickHouse 26.8 container.
       - name: Traces ingest round-trip (exact counts)
         env:
@@ -2121,9 +2121,9 @@ jobs:
         run: cargo test -p pulsus-write --test trace_rows_v2
 
       # Issue #586: the trace write path on the landing table — one push is
-      # one insert, the three per-push ceilings, the joint admission over both
-      # write paths, the suppression index over three targets, and the two
-      # trace transports' refusal containers. Every case but one is hermetic;
+      # one insert, the three per-push ceilings, the admission over the
+      # landing queue, the suppression index, and the two trace transports'
+      # refusal containers. Every case but one is hermetic;
       # the one that is not reads `system.asynchronous_insert_log`, which is
       # the only observable that tells a synchronous insert from a queued one.
       # Reuses this job's ClickHouse 26.8 container.
@@ -2134,7 +2134,7 @@ jobs:
         run: cargo test -p pulsus-write --test trace_landing
 
       # Issue #75: the Zipkin v2 JSON ingest round-trip — ingest_zipkin ->
-      # zipkin::to_otlp -> otlp_traces::parse -> TraceWriter (sync) ->
+      # zipkin::to_otlp -> the landing decode -> TraceWriter (sync) ->
       # ClickHouse. Proves fingerprint identity (Zipkin summary columns
       # byte-identical to the equivalent OTLP ingest) and shared-span
       # storage (a shared RPC span stores both the SERVER and CLIENT sides).
@@ -2145,26 +2145,12 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test zipkin_ingest_roundtrip
 
-      # Issue #603: the `log_streams` registration-backfill live failure
-      # injection had its own step here, and its suite is gone with the
-      # mechanism. One push is one insert of one block into `log_landing`,
-      # so there is no separate registration insert to lose and nothing to
-      # heal: a push whose insert failed emits its registration rows again
-      # next time. `trace_attrs_idx`'s backfill is the one left, and keeps
-      # its own step.
-
-      # Issue #139: the trace_attrs_idx registration-backfill live
-      # failure injection — L-T1 (attrs insert swallowed while the span
-      # commits: the span is fetchable by trace_id but the index probe
-      # finds nothing; after the heal the primary-key probe returns the
-      # trace_id, the span matches, and a forced duplicate collapses to
-      # FINAL count 1). The TraceQL-executor end-to-end proof is the
-      # #167 step below. Reuses this job's ClickHouse 26.8 container.
-      - name: Trace attr-index registration backfill (live L-T1 failure injection)
-        env:
-          PULSUS_TEST_CLICKHOUSE: "1"
-          PULSUS_TEST_CH_HTTP_PORT: "19123"
-        run: cargo test -p pulsus-write --test live_trace_attr_backfill
+      # Issues #603 and #602: the two registration-backfill live failure
+      # injections had their own steps here, and their suites are gone with
+      # the mechanism. One push is one insert of one block into its landing
+      # table, so there is no separate registration insert to lose and
+      # nothing to heal: a push whose insert failed emits its registration
+      # rows again next time.
 
       # Live API/engine suites — every env-gated suite runs here; new issues
       # must wire theirs in. Each test self-isolates via its own throwaway

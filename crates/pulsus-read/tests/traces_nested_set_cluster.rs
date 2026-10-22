@@ -181,7 +181,7 @@ fn bodies(base: i64) -> Vec<ExportTraceServiceRequest> {
 }
 
 async fn land(client: &ChClient, req: &ExportTraceServiceRequest, token: &str) {
-    let parsed = parse_trace_landing(req, now_ns()).expect("the landing decode");
+    let parsed = parse_trace_landing(req).expect("the landing decode");
     let received_ms = now_ns() / 1_000_000;
     let mut rows: Vec<TraceLandingRow> = Vec::new();
     rows.extend(
@@ -3610,14 +3610,9 @@ async fn node_writer(config: ChConnConfig) -> pulsus_write::writer::TraceWriter 
     use pulsus_write::writer::{ChBlockInserter, TraceWriter, TraceWriterTables};
     use std::sync::Arc;
     let client = Arc::new(ChClient::new(config).await.expect("connect the writer"));
-    // The product's defaults: a push of 1,000 spans is larger than a
-    // one-byte batch, which the writer refuses.
-    let cfg = pulsus_config::WriterConfig::default();
     TraceWriter::with_inserters_with_tables(
-        Arc::new(ChBlockInserter::new(client.clone())),
-        Arc::new(ChBlockInserter::new(client.clone())),
-        Arc::new(ChBlockInserter::new(client.clone())),
-        &cfg,
+        Arc::new(ChBlockInserter::new(client)),
+        &pulsus_config::WriterConfig::default(),
         TraceWriterTables::traces_default(),
     )
 }
@@ -3706,11 +3701,8 @@ async fn the_job_keeps_up_under_steady_ingest() {
                 tick.tick().await;
                 let req = load_push(seq, 500);
                 seq += 3;
-                let parsed =
-                    pulsus_write::parse_traces(&req, now_ns()).expect("the old path parses");
-                let landing =
-                    pulsus_write::parse_trace_landing(&req, now_ns()).expect("the landing decode");
-                match writer.admit_flush(parsed, landing, PushHeaders::default()) {
+                let landing = pulsus_write::parse_trace_landing(&req).expect("the landing decode");
+                match writer.admit_flush(landing, PushHeaders::default()) {
                     Ok(wait) => {
                         let failures = failures.clone();
                         let first_failure = first_failure.clone();
@@ -5351,15 +5343,9 @@ async fn a_retry_after_a_throwing_view_is_stored_once_the_fault_clears_on_the_cl
 
     let writer = node_writer(shard1_config(&db)).await;
     let req = load_push(0, 3);
-    let decoded = || {
-        (
-            pulsus_write::parse_traces(&req, now_ns()).expect("the old path parses"),
-            pulsus_write::parse_trace_landing(&req, now_ns()).expect("the landing decode"),
-        )
-    };
-    let (parsed, landing) = decoded();
+    let landing = || pulsus_write::parse_trace_landing(&req).expect("the landing decode");
     let first = writer
-        .admit_flush(parsed, landing, PushHeaders::default())
+        .admit_flush(landing(), PushHeaders::default())
         .expect("admitted")
         .await;
     assert!(
@@ -5368,9 +5354,8 @@ async fn a_retry_after_a_throwing_view_is_stored_once_the_fault_clears_on_the_cl
     );
 
     exec(&s1, "DROP VIEW zz_fault_mv").await;
-    let (parsed, landing) = decoded();
     let second = writer
-        .admit_flush(parsed, landing, PushHeaders::default())
+        .admit_flush(landing(), PushHeaders::default())
         .expect("the retry is admitted, not suppressed")
         .await;
     assert!(

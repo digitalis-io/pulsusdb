@@ -131,7 +131,7 @@ pub const SCENARIOS: &[Scenario] = &[
         // Both variants (issue #60 architect plan, mirroring
         // `logs_roundtrip`): the M4 DoD's "collector traces pipeline
         // lands and is searchable" through every native endpoint, with
-        // the cluster leg adding the shard-local `trace_spans`
+        // the cluster leg adding the shard-local `spans`
         // count-sum check. Independent data via its own `run_id`.
         variants: &[Variant::Single, Variant::Cluster],
         run: |ctx| Box::pin(crate::traces::traces_roundtrip(ctx)),

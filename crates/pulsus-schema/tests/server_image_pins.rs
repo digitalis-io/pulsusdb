@@ -72,7 +72,10 @@ fn every_server_image_pin_is_the_floor() {
     if refusal != 1 {
         wrong.push(format!("the refusal leg found {refusal} times, want 1"));
     }
-    assert!(pins >= 90, "{pins} versioned references found");
+    // A floor on the finder, not on the tree: it proves the scan matches
+    // the references it exists for, and sits below the tree's count so that
+    // deleting a suite which names an image does not trip it.
+    assert!(pins >= 80, "{pins} versioned references found");
     assert!(
         wrong.is_empty(),
         "{} findings:\n{}",

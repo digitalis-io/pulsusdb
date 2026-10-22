@@ -169,8 +169,7 @@ impl EndpointHealth {
         // No `.await` ever occurs while this guard is held (probes run
         // between `probe_snapshot` and the `apply_*` call, never inside
         // either), so a panic under the lock is already a bug — `expect`
-        // matches this crate's other non-async-mutex precedent
-        // (`pulsus_write::writer::buffer::TableBuffer::lock`).
+        // is the non-async-mutex convention.
         self.state.lock().expect("endpoint health mutex poisoned")
     }
 

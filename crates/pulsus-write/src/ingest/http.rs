@@ -1,7 +1,7 @@
 //! The `POST /v1/logs`, `POST /v1/metrics`, `POST /v1/traces`, and
 //! `POST /api/v1/write` axum handlers (docs/api.md §1.1-1.2): decompress ->
 //! prost-decode -> `otlp_logs::parse`/`otlp_metrics::parse`/
-//! `otlp_traces::parse`/`remote_write::parse` -> hand rows to a
+//! `otlp_traces::parse_landing`/`remote_write::parse` -> hand rows to a
 //! [`LogSink`]/[`MetricSink`]/[`TraceSink`] -> render the response. A thin
 //! layer over the pure parsers — no batching, no ClickHouse writes
 //! (architect plan, "out of scope"). [`ingest_metrics`]/[`metrics`] (issue
@@ -297,8 +297,6 @@ where
 /// `pulsus-server` mounts this `&dyn TraceSink` core directly rather than
 /// [`traces`]'s generic-`State` form.
 pub async fn ingest_traces(sink: &dyn TraceSink, headers: HeaderMap, body: Body) -> Response {
-    let now_ns = now_unix_nanos();
-
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
         Ok(body) => body,
         Err(err) => return error_response(err),
@@ -309,39 +307,26 @@ pub async fn ingest_traces(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
         Err(err) => return error_response(err),
     };
 
-    // Fallible, unlike the logs/metrics parses: the traces parser's
-    // expansion budget (`otlp_traces::MAX_EXPANDED_BYTES`, a structural
-    // whole-request bound) surfaces here as the same 400/`code = 3`
-    // classification a decode failure gets.
-    let parsed = match otlp_traces::parse(&request, now_ns) {
-        Ok(parsed) => parsed,
-        Err(err) => return error_response(err),
-    };
-    // The landing path's own decode, beside `parse` (issue #586). It runs
-    // **here** rather than in the writer because its own refusal — a value
-    // whose stored JSON paths exceed `format_binary_max_object_size` — is a
-    // decode-class failure and leaves through this route's whole-request
-    // error writer, which an `AdmitRefusal` cannot carry.
-    //
-    // **The route's `rejected` figure stays `parse`'s own**: the two walks
-    // can reject different spans, the OTLP partial-success message carries
-    // one count, and this route's answer is the old path's byte for byte.
-    let landing = match otlp_traces::parse_landing(&request, now_ns) {
+    // Fallible, unlike the logs/metrics parses: the AnyValue depth guard,
+    // the expansion budget (`otlp_traces::MAX_EXPANDED_BYTES`) and the
+    // stored-path count are whole-request bounds and surface here as the
+    // same 400/`code = 3` classification a decode failure gets.
+    let landing = match otlp_traces::parse_landing(&request) {
         Ok(landing) => landing,
         Err(err) => return error_response(err),
     };
-    let rejected = parsed.rejected;
-    let rejected_message = parsed.rejected_message.clone();
+    let rejected = landing.rejected;
+    let rejected_message = landing.rejected_message.clone();
     let push = push_headers(&headers);
 
     if is_async(&headers) {
-        return match sink.admit(parsed, landing, push) {
+        return match sink.admit(landing, push) {
             Ok(()) => export_traces_response(StatusCode::ACCEPTED, rejected, rejected_message),
             Err(refusal) => otlp_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(parsed, landing, push) {
+    match sink.admit_flush(landing, push) {
         Ok(wait) => match wait.await {
             Ok(()) => export_traces_response(StatusCode::OK, rejected, rejected_message),
             Err(err) => error_response(err),
@@ -672,9 +657,9 @@ fn decode_loki_push(
 /// adapter** feeding the *existing* trace-storage path — it decodes the
 /// Zipkin span array, adapts each span into one self-contained OTLP
 /// `ResourceSpans` (`zipkin::to_otlp`), and hands the batch to the same
-/// `otlp_traces::parse` the native `/v1/traces` receiver uses (so
-/// `payload_type = 1`, the id/attr/expansion contracts, and the whole read
-/// path are byte-identical). Structurally the analog of [`ingest_loki_push`]
+/// `otlp_traces::parse_landing` the native `/v1/traces` receiver uses (so
+/// the id/attr/expansion contracts and the whole read path are
+/// byte-identical). Structurally the analog of [`ingest_loki_push`]
 /// (empty-body success, plain-text errors, the shared 64 MiB
 /// [`read_capped_body`] cap), with two Zipkin-specific choices:
 ///
@@ -688,13 +673,11 @@ fn decode_loki_push(
 ///   supported encoding; v1/protobuf/thrift are out of scope), decompressed
 ///   per `Content-Encoding` for gzip; a malformed array or any span with a
 ///   bad id/timestamp is a whole-request `ZipkinDecode` 400 plain-text.
-///   Any per-span rejection surfaced by `otlp_traces::parse` (an
+///   Any per-span rejection surfaced by `otlp_traces::parse_landing` (an
 ///   out-of-`Date`-range timestamp, issue #8) is likewise promoted to a
 ///   whole-request 400 in [`decode_zipkin`], so no partially-accepted batch
 ///   is ever admitted here.
 pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body) -> Response {
-    let now_ns = now_unix_nanos();
-
     // Pre-admission: the reference `http.Error`s the capped body read and
     // the decode alike, so both take `zipkin_decode_error_response`. Past
     // admission it switches writers — see `zipkin_sink_error_response`.
@@ -703,20 +686,20 @@ pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
         Err(err) => return zipkin_decode_error_response(&err),
     };
 
-    let (parsed, landing) = match decode_zipkin(&headers, &body, now_ns) {
-        Ok(parsed) => parsed,
+    let landing = match decode_zipkin(&headers, &body) {
+        Ok(landing) => landing,
         Err(err) => return zipkin_decode_error_response(&err),
     };
     let push = push_headers(&headers);
 
     if is_async(&headers) {
-        return match sink.admit(parsed, landing, push) {
+        return match sink.admit(landing, push) {
             Ok(()) => rw_success_response(StatusCode::ACCEPTED),
             Err(refusal) => zipkin_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(parsed, landing, push) {
+    match sink.admit_flush(landing, push) {
         Ok(wait) => match wait.await {
             // 202 (not 200) on sync success too — the Zipkin oracle answers
             // 202 Accepted regardless of the async header.
@@ -729,44 +712,31 @@ pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
 
 /// Decompresses (honoring `Content-Encoding` for gzip), decodes the Zipkin
 /// v2 JSON span array, adapts it to OTLP, and runs the shared
-/// `otlp_traces::parse`. See [`ingest_zipkin`] for why `Content-Type` is
+/// `otlp_traces::parse_landing`. See [`ingest_zipkin`] for why `Content-Type` is
 /// not consulted.
 ///
-/// **All-or-nothing promotion (issue #8):** `otlp_traces::parse` keeps
+/// **All-or-nothing promotion (issue #8):** the landing decode keeps
 /// per-span partial-success for the native `/v1/traces` path, but Zipkin has
-/// no partial-success channel — a span rejected by `parse` (e.g. a timestamp
-/// whose UTC day is outside the ClickHouse `Date` range, `start_of_day_utc`
-/// ⇒ `None`) must fail the WHOLE request rather than be silently dropped. So
-/// any `parsed.rejected > 0` is promoted here to a whole-request
+/// no partial-success channel — a span the decode rejects (e.g. a timestamp
+/// whose UTC day is outside the admitted day domain) must fail the WHOLE
+/// request rather than be silently dropped. So any `landing.rejected > 0` is
+/// promoted here to a whole-request
 /// [`LogsIngestError::ZipkinDecode`] (400/code 3) before returning — no batch
 /// is admitted, since [`ingest_zipkin`] only admits on `Ok`.
-fn decode_zipkin(
-    headers: &HeaderMap,
-    body: &[u8],
-    now_ns: i64,
-) -> Result<(crate::ingest::traces::ParsedTraces, ParsedTraceLanding), LogsIngestError> {
+fn decode_zipkin(headers: &HeaderMap, body: &[u8]) -> Result<ParsedTraceLanding, LogsIngestError> {
     let encoding = content_encoding(headers)?;
     let decompressed = decompress::decompress(encoding, body)?;
     let spans = zipkin::decode(&decompressed)?;
     let request = zipkin::to_otlp(spans)?;
-    let parsed = otlp_traces::parse(&request, now_ns)?;
-    // The landing path's own decode (issue #586), here because this is where
-    // this route's parse already is — so the all-or-nothing promotion below
-    // stays in one place.
-    let landing = otlp_traces::parse_landing(&request, now_ns)?;
-    // **The promotion reads BOTH batches**, so it does not depend on their
-    // staying identical: a non-zero count on either is the same whole-request
-    // `ZipkinDecode` a non-zero `parse` count already is, and no partly
-    // accepted batch is admitted here.
-    if parsed.rejected > 0 || landing.rejected > 0 {
+    let landing = otlp_traces::parse_landing(&request)?;
+    if landing.rejected > 0 {
         return Err(LogsIngestError::ZipkinDecode(
-            parsed
+            landing
                 .rejected_message
-                .or(landing.rejected_message)
                 .unwrap_or_else(|| "a span was rejected during parsing".to_string()),
         ));
     }
-    Ok((parsed, landing))
+    Ok(landing)
 }
 
 /// `true` when the request's `Content-Type` selects a JSON body — the Loki
@@ -2541,12 +2511,12 @@ mod tests {
     // Mirrors the `/v1/logs`/`/v1/metrics` suites above exactly — same
     // shared helpers, only the sink/request/response types differ.
 
-    use crate::ingest::traces::{ParsedTraces, TraceSink};
+    use crate::ingest::traces::TraceSink;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
     struct MockTraceSink {
         outcome: Outcome,
-        admitted: Mutex<Vec<ParsedTraces>>,
+        admitted: Mutex<Vec<ParsedTraceLanding>>,
         /// Issue #586: the push-identity headers each admission carried, so
         /// a test can assert what the handler read off the request. The
         /// shape [`MockSink`] already has.
@@ -2566,11 +2536,10 @@ mod tests {
     impl TraceSink for MockTraceSink {
         fn admit(
             &self,
-            batch: ParsedTraces,
-            _landing: ParsedTraceLanding,
+            landing: ParsedTraceLanding,
             push: PushHeaders,
         ) -> Result<(), AdmitRefusal> {
-            self.admitted.lock().unwrap().push(batch);
+            self.admitted.lock().unwrap().push(landing);
             self.pushes.lock().unwrap().push(push);
             // Issue #586: the trace sink now has a suppression index and
             // the two per-push ceilings, so it returns the refusal rather
@@ -2583,11 +2552,10 @@ mod tests {
 
         fn admit_flush(
             &self,
-            batch: ParsedTraces,
-            _landing: ParsedTraceLanding,
+            landing: ParsedTraceLanding,
             push: PushHeaders,
         ) -> Result<FlushWait, AdmitRefusal> {
-            self.admitted.lock().unwrap().push(batch);
+            self.admitted.lock().unwrap().push(landing);
             self.pushes.lock().unwrap().push(push);
             if let Some(refusal) = self.outcome.refusal() {
                 return Err(refusal);
@@ -2775,7 +2743,7 @@ mod tests {
     /// element cap — whose lone `AnyValue.bytes_value` scalar ALONE exceeds
     /// `MAX_DECOMPRESSED_BYTES`. `read_capped_body` must reject the raw encoded
     /// body on the `OversizeBody` path (400 / `code = 3`) BEFORE
-    /// `decode_traces_request`/`parse` ever runs, so the oversized scalar never
+    /// `decode_traces_request`/`parse_landing` ever runs, so the oversized scalar never
     /// materializes into the vendored struct and no row is admitted. This is
     /// the pre-decode backstop for scalar `bytes`/`string` fields (which carry
     /// no per-field cap of their own — they are bounded by the shared body cap).
@@ -2868,8 +2836,8 @@ mod tests {
     /// Issue #8 (deferred Zipkin reject): a Zipkin span whose `timestamp`
     /// (microseconds) resolves to a UTC day outside the ClickHouse `Date`
     /// range (`70_000` days ⇒ `start_of_day_utc` returns `None`) is a per-span
-    /// rejection inside `otlp_traces::parse`. Because Zipkin is all-or-nothing,
-    /// `decode_zipkin` must promote that `parsed.rejected > 0` to a
+    /// rejection inside `otlp_traces::parse_landing`. Because Zipkin is
+    /// all-or-nothing, `decode_zipkin` must promote that `landing.rejected > 0` to a
     /// whole-request [`LogsIngestError::ZipkinDecode`] (400/code 3) — NOT a
     /// silent partial drop. The `Err` structurally precludes admission
     /// ([`ingest_zipkin`] admits only on `Ok`).
@@ -2880,12 +2848,8 @@ mod tests {
         let body = format!(
             r#"[{{"traceId":"0000000000000001","id":"0000000000000002","timestamp":{far_future_micros}}}]"#
         );
-        let err = decode_zipkin(
-            &HeaderMap::new(),
-            body.as_bytes(),
-            1_700_000_000_000_000_000,
-        )
-        .expect_err("out-of-Date-range span must reject the whole request");
+        let err = decode_zipkin(&HeaderMap::new(), body.as_bytes())
+            .expect_err("out-of-Date-range span must reject the whole request");
         assert!(
             matches!(err, LogsIngestError::ZipkinDecode(_)),
             "expected a whole-request ZipkinDecode, got {err:?}"
@@ -2896,7 +2860,7 @@ mod tests {
     /// `timestamp` resolves to day 49_710 (2106-02-07) — inside the `Date`
     /// range but past `Date::LAST_DATETIME_SAFE_DAY`, so its trace-TTL
     /// input would exceed the 32-bit DateTime domain — is a per-span
-    /// rejection inside `otlp_traces::parse`, which `decode_zipkin`
+    /// rejection inside `otlp_traces::parse_landing`, which `decode_zipkin`
     /// promotes to a whole-request 400 (`LogsIngestError::ZipkinDecode`).
     /// Before the DateTime-safe gate this request was admitted (202).
     #[test]
@@ -2906,12 +2870,8 @@ mod tests {
         let body = format!(
             r#"[{{"traceId":"0000000000000001","id":"0000000000000002","timestamp":{first_unsafe_micros}}}]"#
         );
-        let err = decode_zipkin(
-            &HeaderMap::new(),
-            body.as_bytes(),
-            1_700_000_000_000_000_000,
-        )
-        .expect_err("DateTime-unsafe-day span must reject the whole request");
+        let err = decode_zipkin(&HeaderMap::new(), body.as_bytes())
+            .expect_err("DateTime-unsafe-day span must reject the whole request");
         assert!(
             matches!(err, LogsIngestError::ZipkinDecode(_)),
             "expected a whole-request ZipkinDecode, got {err:?}"
@@ -2924,10 +2884,9 @@ mod tests {
     #[test]
     fn zipkin_in_range_timestamp_parses_without_rejection() {
         let body = br#"[{"traceId":"0000000000000001","id":"0000000000000002","timestamp":1700000000000000}]"#;
-        let (parsed, landing) = decode_zipkin(&HeaderMap::new(), body, 1_700_000_000_000_000_000)
-            .expect("in-range span parses");
-        assert_eq!(parsed.rejected, 0);
+        let landing = decode_zipkin(&HeaderMap::new(), body).expect("in-range span parses");
         assert_eq!(landing.rejected, 0);
+        assert_eq!(landing.spans.len(), 1);
     }
 
     // -- `/api/v1/write` (issue #28) --------------------------------------

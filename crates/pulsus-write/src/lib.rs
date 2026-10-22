@@ -16,9 +16,8 @@ pub use ingest::metrics::{
     SeriesRef,
 };
 pub use ingest::traces::{
-    AttrRecord, AttrValueType, LandingEvent, LandingLink, LandingResource, LandingSpan,
-    LandingTagName, LandingTagValue, ParsedTraceLanding, ParsedTraces, SpanRecord, TagScope,
-    TraceSink,
+    LandingEvent, LandingLink, LandingResource, LandingSpan, LandingTagName, LandingTagValue,
+    ParsedTraceLanding, TagScope, TraceSink,
 };
 pub use ingest::{
     AdmitRefusal, Backpressure, FlushWait, KEY_REUSED_MESSAGE, LogSink, PushHeaders,
@@ -34,8 +33,7 @@ pub use protocols::otlp_metrics::{
     MetricIngestSettings, decode as decode_metrics, parse as parse_metrics,
 };
 pub use protocols::otlp_traces::{
-    decode as decode_traces, parse as parse_traces, parse_landing as parse_trace_landing,
-    resource_identity,
+    decode as decode_traces, parse_landing as parse_trace_landing, resource_identity,
 };
 pub use protocols::remote_write::{
     WriteRequest, decode as decode_remote_write, parse as parse_remote_write,
@@ -48,10 +46,10 @@ pub use writer::{
     Admission, Capacities, ClaimGuard, ClaimOutcome, DedupMetricsSnapshot, LANDING_ROW_SLOT_BYTES,
     LogPatternRow, LogWriter, MetricHistSampleRow, MetricLandingRow, MetricMetadataRow,
     MetricSampleRow, MetricSeriesRow, MetricWriter, MetricWriterTables, PushDedup, PushDigest,
-    PushIdentity, TRACE_LANDING_ROW_SLOT_BYTES, TargetOutcome, TraceAttrRow, TraceEventTuple,
-    TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue, TraceLandingRow, TraceLinkTuple,
-    TraceSpanRow, TraceWriter, TraceWriterTables, WaitGuard, WaitMode, WriteError, WriterTables,
-    escape_json_path, index_bytes, log_identity, metric_identity, plan_capacities, trace_identity,
+    PushIdentity, TRACE_LANDING_ROW_SLOT_BYTES, TargetOutcome, TraceEventTuple, TraceJson,
+    TraceJsonEntry, TraceJsonScalar, TraceJsonValue, TraceLandingRow, TraceLinkTuple, TraceWriter,
+    TraceWriterTables, WaitGuard, WaitMode, WriteError, WriterTables, escape_json_path,
+    index_bytes, log_identity, metric_identity, plan_capacities, trace_identity,
 };
 
 #[cfg(test)]

@@ -11,16 +11,9 @@ use std::time::Duration;
 
 use pulsus_config::WriterConfig;
 
-/// A small, bounded number of *pre-send* retry attempts (architect plan:
-/// `pulsus_clickhouse::ChClient::insert_block` downgrades every *post-send*
-/// retryable failure to the non-retryable `ChError::InsertUncertain`, so a
-/// retryable error ever reaching the writer's classifier can only be a
-/// pre-send failure — pool acquisition, connection setup). Capped so a
-/// persistently unreachable ClickHouse cannot turn one stalled batch into
-/// an unbounded retry loop; the batch spools to poison once exhausted.
-const RETRY_MAX_ATTEMPTS: u32 = 5;
-/// Base delay for the exponential-backoff-with-full-jitter retry policy
-/// (`writer::table`'s hand-rolled xorshift jitter — no `rand` dependency).
+/// Base delay for the landing workers' exponential-backoff-with-full-jitter
+/// retry policy (`writer::table`'s hand-rolled xorshift jitter — no `rand`
+/// dependency).
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 /// Upper bound on any single retry delay, regardless of attempt count.
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(10);
@@ -38,32 +31,10 @@ const LRU_CAPACITY: usize = 1_000_000;
 /// `uncertain/{table}/` subdirectories, created on first use.
 const SPOOL_DIR: &str = "./spool";
 
-/// Cadence of every registration-backfill re-insert task (issues
-/// #134/#139: `log_streams` and `trace_attrs_idx` — the metrics path has
-/// no backlog, issue #603): every interval, any Poisoned-flush registration
-/// rows still pending in that table's in-memory backlog are re-inserted
-/// once. A documented constant per the issue-#9 constants-not-env-vars
-/// precedent ([`LRU_CAPACITY`]); promote to a `PULSUS_*` var if a
-/// deployment needs to tune it.
-const REGISTRATION_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Byte cap (row `est_bytes` accounting) on each in-memory registration
-/// backfill backlog (issues #134/#139). PER-BACKLOG: with two backlogs
-/// (`log_streams` and `trace_attrs_idx`), the worst-case process-wide
-/// footprint under total ClickHouse failure is 2 × 32 MiB = 64 MiB —
-/// acceptable, since the
-/// sample/span paths are failing too in that state, minting few new
-/// orphans. New keys that would exceed a backlog's cap are rejected and
-/// counted via its `BackfillMetrics::dropped_total`. Same
-/// documented-constant precedent as
-/// [`REGISTRATION_BACKFILL_RETRY_INTERVAL`].
-const REGISTRATION_BACKFILL_MAX_BYTES: u64 = 32 * 1024 * 1024;
-
-/// How long past its buffers' age-flush trigger a claim may stay open
-/// before the suppression index gives up on it and writes a tombstone
-/// (issue #494). Added to `PULSUS_BATCH_MS`, so at the defaults a claim
-/// ages at `120.2 s`: the age-flush trigger plus the bound on the insert
-/// it triggers.
+/// How long past `PULSUS_BATCH_MS` a claim may stay open before the
+/// suppression index gives up on it and writes a tombstone (issue #494): the
+/// bound on the insert the claim waits for. At the defaults a claim ages at
+/// `120.2 s`.
 ///
 /// This is `PULSUS_QUERY_TIMEOUT`'s documented default (`2m`,
 /// docs/configuration.md §1) written as a constant rather than read from
@@ -73,23 +44,20 @@ const REGISTRATION_BACKFILL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// needs to tune it.
 const CLAIM_INSERT_BOUND: Duration = Duration::from_secs(120);
 
-/// The resolved set of tunables a `LogWriter` and its per-table flush
-/// tasks read from on every admit/flush — computed once at construction,
-/// never re-read from the environment afterward.
+/// The resolved set of tunables the three writers and their landing workers
+/// read from — computed once at construction, never re-read from the
+/// environment afterward.
 #[derive(Debug, Clone)]
 pub struct WriterRuntime {
-    /// `PULSUS_BATCH_BYTES`: a table buffer flushes once its current
-    /// generation reaches this many bytes.
+    /// `PULSUS_BATCH_BYTES`: the per-push byte ceiling; a push above it is
+    /// refused `413` whole.
     pub batch_bytes: u64,
-    /// `PULSUS_BATCH_MS`: a table buffer flushes once its oldest
-    /// unflushed row has been buffered this long, even under
-    /// `batch_bytes`.
+    /// `PULSUS_BATCH_MS`: the cadence at which the suppression index ages an
+    /// unsettled claim.
     pub batch_age: Duration,
-    /// `PULSUS_INGEST_QUEUE_BYTES`: the combined buffered-plus-in-flight
-    /// byte bound across both `log_samples` and `log_streams` (the
-    /// backpressure gate).
+    /// `PULSUS_INGEST_QUEUE_BYTES`: the per-writer bound on the bytes its
+    /// queued and in-flight landing blocks hold (the backpressure gate).
     pub queue_bytes_limit: u64,
-    pub retry_max_attempts: u32,
     pub retry_base_delay: Duration,
     pub retry_max_delay: Duration,
     /// A fixed seed for the metrics landing worker's retry-jitter generator.
@@ -105,14 +73,6 @@ pub struct WriterRuntime {
     pub retry_jitter_seed: Option<u64>,
     pub lru_capacity: usize,
     pub spool_dir: PathBuf,
-    /// The registration-backfill re-insert cadence (issues #134/#139),
-    /// shared by both backfill tasks (`log_streams` and
-    /// `trace_attrs_idx`).
-    pub backfill_retry_interval: Duration,
-    /// The PER-BACKLOG registration-backfill byte cap (issues #134/#139)
-    /// — two backlogs ⇒ 64 MiB worst-case process-wide (see
-    /// [`REGISTRATION_BACKFILL_MAX_BYTES`]).
-    pub backfill_max_bytes: u64,
     /// `PULSUS_LOG_PATTERNS` (M7-C3, issue #171): the ingest-time log-pattern
     /// extraction kill-switch. `false` ⇒ zero extraction work and zero
     /// `log_patterns` appends; the read endpoint stays mounted and serves
@@ -187,14 +147,11 @@ impl WriterRuntime {
             batch_bytes: cfg.batch_bytes.0,
             batch_age: Duration::from_millis(cfg.batch_ms),
             queue_bytes_limit: cfg.ingest_queue_bytes.0,
-            retry_max_attempts: RETRY_MAX_ATTEMPTS,
             retry_base_delay: RETRY_BASE_DELAY,
             retry_max_delay: RETRY_MAX_DELAY,
             retry_jitter_seed: None,
             lru_capacity: LRU_CAPACITY,
             spool_dir: PathBuf::from(SPOOL_DIR),
-            backfill_retry_interval: REGISTRATION_BACKFILL_RETRY_INTERVAL,
-            backfill_max_bytes: REGISTRATION_BACKFILL_MAX_BYTES,
             log_patterns: cfg.log_patterns,
             ingest_dedup: cfg.ingest_dedup,
             ingest_dedup_window: cfg.ingest_dedup_window.0,
@@ -236,8 +193,8 @@ mod tests {
         assert_eq!(runtime.queue_bytes_limit, cfg.ingest_queue_bytes.0);
     }
 
-    /// Issue #494: the claim deadline is the age-flush trigger plus the
-    /// bound on the insert it triggers — `120.2 s` at the defaults.
+    /// Issue #494: the claim deadline is `PULSUS_BATCH_MS` plus the bound on
+    /// the insert the claim waits for — `120.2 s` at the defaults.
     #[test]
     fn claim_deadline_is_the_flush_trigger_plus_the_insert_bound() {
         let runtime = WriterRuntime::from_config(&WriterConfig::default());
@@ -275,11 +232,6 @@ mod tests {
             WriterRuntime::from_config(&WriterConfig::default()).retry_jitter_seed,
             None
         );
-    }
-
-    #[test]
-    fn retry_budget_is_bounded() {
-        const { assert!(RETRY_MAX_ATTEMPTS > 0 && RETRY_MAX_ATTEMPTS <= 10) };
     }
 
     #[test]
