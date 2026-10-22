@@ -6,7 +6,6 @@ crates/pulsus-server/tests/fingerprint_collision_live.rs:909-909
 crates/pulsus-server/tests/logs_api_live.rs:1404-1404
 crates/pulsus-write/src/ingest/metrics.rs:94-97
 crates/pulsus-write/src/protocols/otlp_logs.rs:111-113
-crates/pulsus-write/src/writer/backfill.rs:23-28
 crates/pulsus-write/src/writer/mod.rs:36-40
 crates/pulsus-write/src/writer/mod.rs:566-568
 crates/pulsus-write/src/writer/trace.rs:159-159
