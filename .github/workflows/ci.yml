@@ -2608,20 +2608,12 @@ jobs:
       # positive cases the answers over traces split across both shards.
       # The suite also holds the service graph's cluster cases (#599); its
       # output shows each edge-job run's duration (part B §4).
-      # `the_job_keeps_up_under_steady_ingest` runs in the next step, alone
-      # (issue #602 part 3b-1).
+      # `the_job_keeps_up_under_steady_ingest` runs alone in the
+      # `schema-it-cluster-lv1` job (issue #602 part 3b-1).
       - name: Nested-set search over the distributed tables (cluster)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-read --test traces_nested_set_cluster -- --show-output --skip the_job_keeps_up_under_steady_ingest
-
-      # Issue #602 part 3b-1: the edge job under steady ingest, alone. It
-      # loads the whole cluster for sixteen minutes, and a case beside it
-      # would share the runner with that load.
-      - name: The edge job keeps up under steady ingest (cluster)
-        env:
-          PULSUS_TEST_CLICKHOUSE: "1"
-        run: cargo test -p pulsus-read --test traces_nested_set_cluster -- --show-output --exact the_job_keeps_up_under_steady_ingest
 
       # Issue #43: cross-node connection spreading over the two DISTINCT real
       # nodes (SHARD1/SHARD2 default to the fixture IPs 172.28.0.11/12:8123),
@@ -2634,6 +2626,133 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-clickhouse --test live_spreading
+
+      - name: Tear down the cluster
+        if: always()
+        run: docker compose -f ci/clickhouse-cluster/compose.yaml down -v
+
+  # Issue #7: e2e harness skeleton. Both legs build the local `pulsusdb:e2e`
+  # image once via buildx (GHA layer cache, so the image build itself is
+  # fast on both legs) then hand the whole stack lifecycle — up, poll
+  # `/ready`, run scenarios, down — to `pulsus-e2e`, the same binary local
+  # development runs against Podman. Since issue #33, this also gates the
+  # M2 differential-accuracy scenario at its `ci` (~1k series) tier
+  # (`PULSUS_E2E_METRICS_SCALE` defaults to `ci` — `e2e/src/metrics.rs`);
+  # the ~10k `full` tier is `e2e-metrics-full` below.
+  # Issue #602 part 3b-1: the edge job under steady ingest, on a runner of
+  # its own. It loads the whole cluster for sixteen minutes, so it neither
+  # shares the runner with another case nor lengthens `schema-it-cluster`.
+  schema-it-cluster-lv1:
+    runs-on: ubuntu-latest
+    steps:
+      # Issue #602 part 3b-1: the runner's size, so a load-bound case such as
+      # `the_job_keeps_up_under_steady_ingest` can be read against it.
+      - name: Runner size
+        run: |
+          nproc
+          free -g
+
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Start the 2-shard cluster
+        run: docker compose -f ci/clickhouse-cluster/compose.yaml up -d
+
+      - name: Wait for cluster health
+        run: |
+          for _ in $(seq 1 60); do
+            h1=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard1-it 2>/dev/null || echo starting)
+            h1b=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard1b-it 2>/dev/null || echo starting)
+            h2=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard2-it 2>/dev/null || echo starting)
+            hk=$(docker inspect -f '{{.State.Health.Status}}' pulsus-keeper-it 2>/dev/null || echo starting)
+            if [ "$h1" = healthy ] && [ "$h1b" = healthy ] && [ "$h2" = healthy ] && [ "$hk" = healthy ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::cluster did not become healthy in time"
+          docker ps -a
+          exit 1
+
+      # The clustered half of `schema/schema.sh`, created rather than
+      # rendered. **This is the only leg that can tell a correct replication
+      # path from the silently broken one**: a path whose `{shard}` macro was
+      # substituted away reaches the same validation point as a correct one
+      # on a single node, and the difference only shows against a keeper —
+      # every shard joins one replica set. So the check is not "the DDL
+      # applied" but what the macros resolved to, read back from
+      # `system.replicas` per shard.
+      - name: "schema.sh: builds the clustered schema on both shards"
+        env:
+          CLICKHOUSE_SERVER: localhost
+          CLICKHOUSE_HTTP_PORT: "18123"
+          CLICKHOUSE_DB: pulsus
+          PULSUS_CLUSTER: pulsus_test_cluster
+        run: |
+          ask() { curl -sS --fail-with-body "http://localhost:$1/" --data-binary "$2"; }
+          schema/schema.sh
+
+          catalogue() {
+            ask "$1" "SELECT name, create_table_query FROM system.tables \
+                      WHERE database = 'pulsus' ORDER BY name FORMAT TSV"
+          }
+          catalogue 18123 > /tmp/cluster-shard1.tsv
+          catalogue 38123 > /tmp/cluster-shard1b.tsv
+          catalogue 28123 > /tmp/cluster-shard2.tsv
+          objects=$(wc -l < /tmp/cluster-shard1.tsv)
+          if [ "$objects" -ne 61 ]; then
+            echo "::error::expected 61 objects in the clustered schema, got $objects"
+            cut -f1 /tmp/cluster-shard1.tsv
+            exit 1
+          fi
+          if ! diff -u /tmp/cluster-shard1.tsv /tmp/cluster-shard2.tsv; then
+            echo "::error::ON CLUSTER did not land the identical DDL on both shards"
+            exit 1
+          fi
+          if ! diff -u /tmp/cluster-shard1.tsv /tmp/cluster-shard1b.tsv; then
+            echo "::error::ON CLUSTER did not land the identical DDL on shard 1's second replica"
+            exit 1
+          fi
+
+          # Per-shard replica sets must be per shard: `{shard}` resolved to
+          # this node's own macro, so shard 1's paths say /1/ and shard 2's
+          # say /2/. Shard 1 has two replicas (issue #599 part B), so its
+          # per-shard tables hold two and shard 2's hold one. The six
+          # cluster-wide tables take /all/ and hold all three nodes. A
+          # substituted-away macro collapses the first group onto one path
+          # with three replicas, which this catches.
+          paths() {
+            ask "$1" "SELECT countIf(zookeeper_path LIKE '/clickhouse/tables/$2/%'), \
+                             countIf(zookeeper_path LIKE '/clickhouse/tables/all/%'), \
+                             countIf(total_replicas = 1), countIf(total_replicas = 2), \
+                             countIf(total_replicas = 3) \
+                      FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
+          }
+          for pair in "18123 1 19_6_0_19_6" "38123 1 19_6_0_19_6" "28123 2 19_6_19_0_6"; do
+            set -- $pair
+            want=$(printf '%s' "$3" | tr '_' '\t')
+            got=$(paths "$1" "$2")
+            echo "node on $1: per-shard/all/one/two/three-replica = $got"
+            if [ "$got" != "$want" ]; then
+              echo "::error::shard on $1 resolved its replication paths as '$got', expected '$want'"
+              ask "$1" "SELECT table, zookeeper_path, total_replicas FROM system.replicas \
+                        WHERE database = 'pulsus' ORDER BY table FORMAT TSV"
+              exit 1
+            fi
+          done
+
+      - name: The edge job keeps up under steady ingest (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test traces_nested_set_cluster -- --show-output --exact the_job_keeps_up_under_steady_ingest
 
       - name: Tear down the cluster
         if: always()
