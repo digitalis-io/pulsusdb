@@ -24,29 +24,11 @@
 //! parser accepted, `int` for digits, `float` for an `f64` parse — is
 //! DELETED, not kept for legacy rows, along with the `duration` category,
 //! which the catalog can no longer emit and which the reference never
-//! emits for an attribute either. Nothing replaced it: see
-//! `pulsus_read::TagValue` for why the stored columns cannot type a
-//! legacy row either.
-//!
-//! **The legacy window, stated where the code is.** A row written before
-//! migration 41 has `val_type = ""`. It is reported as `string`, and it
-//! CANNOT be corrected from what is stored — a string `"1.5"` and a
-//! double `1.5` are byte-identical in the catalog, and the numeric
-//! companion column is itself a parse of that same text rather than a
-//! record of the sender's type (`pulsus_read::TagValue`). Reporting
-//! `string` invents nothing and is what those rows already reported for
-//! non-numeric text. The window has no end on its
-//! own: `tag_values` has NO TTL, so legacy rows never age out. It
-//! closes when
-//!
-//! ```sql
-//! SELECT count() FROM tag_values WHERE val_type = ''
-//! ```
-//!
-//! returns `0` on every deployment — at which point the empty-`val_type`
-//! branch of [`entry_type`] and the run rule's drop of an untyped sibling
-//! are dead code. Getting there needs a catalog rebuild-or-clear
-//! mechanism, which is deliberately not designed here.
+//! emits for an attribute either. Every source of a row types it: the
+//! writer from the OTLP kind, every read over `spans`, `resources` and the
+//! bucket catalogues by a literal per JSON type (issue #602 part 3c
+//! removed the `string` fallback for an untyped row, which no source
+//! produces).
 
 use std::collections::HashSet;
 
@@ -162,21 +144,6 @@ fn scopes_json(answer: &TagNamesAnswer<'_>, limit: Option<usize>) -> (Vec<Value>
     (out, was_cut)
 }
 
-/// The wire `type` for one catalog row (issue #476): the stored type, or
-/// `string` when the row predates migration 41 and carries none. See the
-/// module doc for why no better answer exists for such a row and for the
-/// query that decides when this branch is dead.
-fn entry_type(val_type: &str) -> &str {
-    if val_type.is_empty() {
-        STRING_TYPE
-    } else {
-        val_type
-    }
-}
-
-/// The wire spelling an untyped legacy row reports.
-const STRING_TYPE: &str = "string";
-
 /// The shared typed `tagValues` array — values stay strings on the wire
 /// (Tempo shape); `type` is the STORED type, or `keyword` for a static
 /// answer (issue #475), which is what makes the datasource emit the value
@@ -187,25 +154,12 @@ const STRING_TYPE: &str = "string";
 /// `{"type":"string"}` with no `value`. Same omission rule
 /// `search_response.rs` already applies to `durationNanos`/`durationMs`.
 ///
-/// **The run rule** (issue #476). Rows arrive `ORDER BY val, val_type`, so
-/// rows sharing a `val` are contiguous and the empty `val_type` sorts
-/// FIRST inside its run. For each run: if any row carries a non-empty
-/// `val_type`, emit one entry per distinct non-empty type and DROP the
-/// empty-`val_type` row; otherwise emit one `string` entry. Without it a
-/// rolling upgrade — an un-upgraded node still writing rows with no
-/// `val_type` beside an upgraded node writing typed ones — shows the same
-/// value twice, `{"type":"string","value":"500"}` beside
-/// `{"type":"int","value":"500"}`, for one attribute. Migration 41 puts
-/// `val_type` in the sorting key precisely so both rows SURVIVE the merge,
-/// so the store cannot collapse them and this pass is the only thing that
-/// can.
-///
-/// Stated edge: if the `LIMIT cap + 1` probe splits a run, the tail is
-/// missing and `truncated` is already `true`; that is not chased further.
+/// Rows arrive `ORDER BY val, val_type` and distinct, so one value stored
+/// at two types is two entries (issue #476).
 ///
 /// One pass over at most `TAG_VALUES_MAX` entries, no extra query, and no
-/// character of `val` is read. The request's `limit` cuts the entries
-/// after the run rule, a static list too; the flag says whether it did.
+/// character of `val` is read. The request's `limit` cuts the entries, a
+/// static list too; the flag says whether it did.
 fn typed_values_json(answer: &TagValuesAnswer<'_>, limit: Option<usize>) -> (Vec<Value>, bool) {
     let mut out = typed_values(answer);
     let was_cut = cut(&mut out, limit);
@@ -223,34 +177,11 @@ fn typed_values(answer: &TagValuesAnswer<'_>) -> Vec<Value> {
     }
     match answer {
         TagValuesAnswer::Static(values) => values.iter().map(|v| entry(KEYWORD_TYPE, v)).collect(),
-        TagValuesAnswer::Catalog(values) => {
-            let mut out: Vec<Value> = Vec::with_capacity(values.values.len());
-            let mut i = 0;
-            while i < values.values.len() {
-                let val = values.values[i].val.as_str();
-                let mut run_end = i;
-                while run_end < values.values.len() && values.values[run_end].val == val {
-                    run_end += 1;
-                }
-                let run = &values.values[i..run_end];
-                let mut emitted = 0;
-                for v in run {
-                    // An untyped row is DROPPED when a typed sibling
-                    // shares its value, and answered by the fallback
-                    // below when it does not.
-                    if v.val_type.is_empty() {
-                        continue;
-                    }
-                    out.push(entry(entry_type(&v.val_type), val));
-                    emitted += 1;
-                }
-                if emitted == 0 {
-                    out.push(entry(entry_type(""), val));
-                }
-                i = run_end;
-            }
-            out
-        }
+        TagValuesAnswer::Catalog(values) => values
+            .values
+            .iter()
+            .map(|v| entry(&v.val_type, &v.val))
+            .collect(),
     }
 }
 
@@ -698,27 +629,7 @@ mod tests {
         );
     }
 
-    // -- issue #476: the stored type, the legacy window, the run rule ----
-
-    /// AC7a's hermetic half. A legacy row whose text READS as a number is
-    /// `string`. `1.5` is the whole assertion: a text parse says `float`,
-    /// so did the classifier this issue deleted, and so does any rule
-    /// sourced from the catalog's numeric companion column, which is
-    /// itself that same parse taken at write time. Only "report the stored
-    /// type, and `string` when there is none" says `string`.
-    #[test]
-    fn a_legacy_row_reports_string_however_its_text_reads() {
-        for text in ["1.5", "12345", "-7", "true", "2s", "alpha", ""] {
-            let values = tag_values(&[(text, "")], false);
-            let rendered = render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None);
-            let expected = if text.is_empty() {
-                json!({"tagValues": [{"type": "string"}]})
-            } else {
-                json!({"tagValues": [{"type": "string", "value": text}]})
-            };
-            assert_eq!(rendered, expected, "legacy row {text:?}");
-        }
-    }
+    // -- issue #476: the stored type ----
 
     /// The stored type is reported verbatim for every spelling the writer
     /// can produce — a permutation break, not a presence check: swapping
@@ -773,57 +684,6 @@ mod tests {
         );
     }
 
-    /// AC19's renderer half: the rolling-upgrade shape. An un-upgraded
-    /// node writes `('span','http.status_code','500','')`; an upgraded one
-    /// writes the same value as `int`. Both rows survive the merge (the
-    /// sorting key keeps them), so only this rule can stop the wire
-    /// showing `500` twice.
-    ///
-    /// The INTEGER fixture is the discriminating one. A pair of legacy
-    /// STRING rows renders `[string, string]` without the rule, which any
-    /// later output deduplication would also collapse — so that fixture
-    /// cannot tell the rule from a dedupe. `[string, int]` is not
-    /// collapsible by value, so only the run rule produces one entry.
-    #[test]
-    fn a_rolling_upgrade_duplicate_collapses_to_the_typed_row() {
-        let values = tag_values(&[("500", ""), ("500", "int")], false);
-        assert_eq!(
-            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None),
-            json!({"tagValues": [{"type": "int", "value": "500"}]})
-        );
-        // ...and the untyped row is dropped, not merely reordered.
-        let rendered = render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None);
-        assert_eq!(rendered["tagValues"].as_array().expect("array").len(), 1);
-    }
-
-    /// The run rule keeps runs apart: a legacy row for one value must not
-    /// be silenced by a typed row for a DIFFERENT value.
-    #[test]
-    fn the_run_rule_does_not_leak_across_values() {
-        let values = tag_values(&[("a", ""), ("b", ""), ("b", "int"), ("c", "")], false);
-        assert_eq!(
-            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None),
-            json!({"tagValues": [
-                {"type": "string", "value": "a"},
-                {"type": "int", "value": "b"},
-                {"type": "string", "value": "c"},
-            ]})
-        );
-    }
-
-    /// The empty string never reaches the wire as a `type`.
-    #[test]
-    fn no_rendered_entry_carries_an_empty_type() {
-        let values = tag_values(&[("x", ""), ("y", "int"), ("y", "")], false);
-        for entry in
-            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None)["tagValues"]
-                .as_array()
-                .expect("array")
-        {
-            assert_ne!(entry["type"], json!(""), "{entry}");
-        }
-    }
-
     /// Issue #478, criterion 5b (wire half). **Span names render as
     /// `string`, whatever they look like**, and the empty name omits the
     /// `value` key entirely.
@@ -835,8 +695,7 @@ mod tests {
     /// `int`.
     ///
     /// This is the WIRE half only. It cannot see whether the engine set
-    /// the type or left it empty — `entry_type("")` renders `string` too —
-    /// which is why `pulsus_read`'s
+    /// the type, which is why `pulsus_read`'s
     /// `traces::exec::tests::a_span_name_value_carries_an_explicit_string_type`
     /// exists beside it.
     #[test]

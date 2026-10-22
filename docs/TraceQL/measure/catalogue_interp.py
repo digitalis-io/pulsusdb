@@ -653,7 +653,7 @@ class Interp:
                                  'spans': [self.span_answer(r, q) for r in sp[:SPSS]]} for a, sp in sets]
             out.append((max(r['start_ns'] for r in rs), tr))
         out.sort(key=lambda x: (-x[0], x[1]['id']))
-        return {'partial': False, 'traces': [tr for _, tr in out[:LIMIT]]}
+        return {'traces': [tr for _, tr in out[:LIMIT]]}
 
     def exemplar_budget(self, q):
         for k, v in q['hints']:

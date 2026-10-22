@@ -559,17 +559,12 @@ fn trace_json(trace: &TraceSearchResult, report: &mut DomainReport) -> Value {
 /// through that client, they disabled it.
 ///
 /// `limit` and `returned` are dropped outright: `limit` is the caller's own
-/// request parameter and `returned` is `traces.len()`. `partial` has no
-/// like-for-like home — `PartialStatus` (`tempo.proto:383-386`) is on
-/// `TraceByIDResponse`, `QueryRangeResponse` and `QueryInstantResponse`,
-/// never on `SearchResponse` — so it rides the pair the search route DOES
-/// use for incompleteness: `completedJobs < totalJobs`
-/// (`modules/frontend/combiner/response_metrics.go:19-38`,
-/// `combiner/search.go:126-135`). We run one plan, so `totalJobs` is 1 and
-/// `completedJobs` is 1 or 0. **A zero `completedJobs` is OMITTED**, the way
-/// protojson omits a default scalar and the way Grafana's own
-/// `(metrics.completedJobs || 0) / (metrics.totalJobs || 1)`
-/// (`src/streaming.ts:316`) reads it.
+/// request parameter and `returned` is `traces.len()`. What remains is the
+/// pair the search route uses for incompleteness, `completedJobs <
+/// totalJobs` (`modules/frontend/combiner/response_metrics.go:19-38`,
+/// `combiner/search.go:126-135`). We run one statement plan and every
+/// search is answered whole or refused (issue #602 part 3c), so the pair is
+/// always `{"completedJobs":1,"totalJobs":1}`.
 pub(crate) fn render(output: &SearchOutput) -> Value {
     // Issue #473: one report for the whole response, so a store full of
     // out-of-domain values logs once rather than once per row.
@@ -579,15 +574,10 @@ pub(crate) fn render(output: &SearchOutput) -> Value {
         .iter()
         .map(|trace| trace_json(trace, &mut report))
         .collect::<Vec<_>>();
-    let mut search_metrics = serde_json::Map::new();
-    if !output.partial {
-        search_metrics.insert("completedJobs".to_string(), Value::from(1u32));
-    }
-    search_metrics.insert("totalJobs".to_string(), Value::from(1u32));
     report.surface();
     json!({
         "traces": traces,
-        "metrics": Value::Object(search_metrics),
+        "metrics": {"completedJobs": 1, "totalJobs": 1},
     })
 }
 
@@ -686,7 +676,6 @@ mod tests {
                 )],
                 groups: None,
             }],
-            partial: true,
             returned: 1,
             limit: 20,
         }
@@ -1497,7 +1486,6 @@ mod tests {
     fn an_empty_output_renders_the_documented_empty_envelope() {
         let v = render(&SearchOutput {
             traces: vec![],
-            partial: false,
             returned: 0,
             limit: 20,
         });
@@ -1704,7 +1692,6 @@ mod tests {
                 )],
                 groups: None,
             }],
-            partial: false,
             returned: 1,
             limit: 20,
         }

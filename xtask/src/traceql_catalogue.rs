@@ -190,7 +190,7 @@ fn search_json(o: &SearchOutput) -> Value {
             })
         })
         .collect();
-    json!({"partial": o.partial, "traces": traces})
+    json!({"traces": traces})
 }
 
 fn labels(ls: &[MetricLabel]) -> Value {

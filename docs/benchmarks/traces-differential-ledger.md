@@ -1333,6 +1333,8 @@ when we are asking it to slow down, so we keep `429`; recorded as
 
 ### `traceql-search-metrics-completed-jobs` (issue #464) — **a repurposing, not a new field**
 
+**Since issue #602 part 3c there is no truncated branch: a search is answered whole or refused, and every answer carries `completedJobs`/`totalJobs` as `1`/`1`. The `0`/`1` case below describes the code before it.**
+
 - **What.** On `GET /api/traces/v1/search` and its `GET /api/search`
   alias, the `metrics` block carries `completedJobs`/`totalJobs` as `1`/`1`
   on a complete result and `0`/`1` on a truncated one, with the zero

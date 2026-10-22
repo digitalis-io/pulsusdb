@@ -1596,7 +1596,6 @@ pub(crate) fn decode_search_charged(
         .map_err(|_| decode("more traces than u32 counts".to_string()))?;
     Ok(SearchOutput {
         traces,
-        partial: false,
         returned,
         limit,
     })

@@ -2442,8 +2442,7 @@ async fn the_stored_attribute_type_reaches_the_wire_and_its_query_returns_the_tr
     // =================================================================
     // AC7b — the same numeric-looking string through the real ingest
     // path. `slo` is the string "1.5", whose `val_num` is Some(1.5), so
-    // this fails for any implementation that consults `val_num` on the
-    // NEW path as well as on the legacy one.
+    // this fails for any implementation that consults `val_num`.
     // =================================================================
     let ctx = "AC7b span.slo native route";
     let got = get_ok_json(port, "/api/traces/v1/tag/span.slo/values", ctx);
@@ -2680,100 +2679,6 @@ async fn the_stored_attribute_type_reaches_the_wire_and_its_query_returns_the_tr
         200,
         "{ctx}: body {:?}",
         String::from_utf8_lossy(&res.body)
-    );
-
-    // =================================================================
-    // AC7a and AC19 — the LEGACY row shapes, written straight into the
-    // catalog because a single binary cannot produce an old-writer row
-    // through the real path. What proves the shape is reachable is the
-    // migration itself: `val_type` is added with NO default, so every
-    // pre-existing row reads back the empty string.
-    // =================================================================
-    client
-        .execute(
-            "INSERT INTO tag_values (scope, key, value, val_type) VALUES \
-             ('span', 'legacy_numeric_text', '1.5', ''), \
-             ('span', 'legacy_plain', 'alpha', ''), \
-             ('span', 'legacy_upgrade', '500', ''), \
-             ('span', 'legacy_upgrade', '500', 'int')",
-            &QuerySettings::default(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("seed legacy catalog rows");
-    client
-        .execute(
-            "OPTIMIZE TABLE tag_values FINAL",
-            &QuerySettings::default(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("merge the catalog");
-
-    // AC7a. `1.5` is the whole criterion: a text parse says `float`, so
-    // did the text classifier this issue deleted, and so does any rule
-    // sourced from the catalog's numeric companion column, which is that
-    // same parse taken at write time. Only "report the stored type, and
-    // `string` when there is none" says `string`.
-    // `alpha` is a CONTROL, not a gate —
-    // it is `string` under every defective implementation too, and is
-    // here only so a failure separates "the rule is wrong" from "the
-    // empty string leaked out as `{\"type\":\"\"}`".
-    let ctx = "AC7a legacy_numeric_text native";
-    let got = get_ok_json(
-        port,
-        "/api/traces/v1/tag/span.legacy_numeric_text/values",
-        ctx,
-    );
-    assert_eq!(
-        got,
-        serde_json::json!({
-            "tagValues": [{"type": "string", "value": "1.5"}],
-            "truncated": false,
-        }),
-        "{ctx}: body {got}"
-    );
-    let ctx = "AC7a legacy_numeric_text v2";
-    let got = get_ok_json(
-        port,
-        "/api/v2/search/tag/span.legacy_numeric_text/values",
-        ctx,
-    );
-    assert_eq!(
-        got,
-        serde_json::json!({"tagValues": [{"type": "string", "value": "1.5"}]}),
-        "{ctx}: the v2 alias carries no truncated key, body {got}"
-    );
-    let ctx = "AC7a legacy_plain control";
-    let got = get_ok_json(port, "/api/traces/v1/tag/span.legacy_plain/values", ctx);
-    assert_eq!(
-        got,
-        serde_json::json!({
-            "tagValues": [{"type": "string", "value": "alpha"}],
-            "truncated": false,
-        }),
-        "{ctx}: body {got}"
-    );
-
-    // AC19 — the rolling-upgrade duplicate. Both rows survive the merge
-    // (AC4 proves the sorting key keeps them), so the single entry can
-    // only come from the renderer's run rule.
-    let ctx = "AC19 rolling upgrade native";
-    let got = get_ok_json(port, "/api/traces/v1/tag/span.legacy_upgrade/values", ctx);
-    assert_eq!(
-        got,
-        serde_json::json!({
-            "tagValues": [{"type": "int", "value": "500"}],
-            "truncated": false,
-        }),
-        "{ctx}: the untyped sibling must be dropped, body {got}"
-    );
-    let ctx = "AC19 rolling upgrade v2";
-    let got = get_ok_json(port, "/api/v2/search/tag/span.legacy_upgrade/values", ctx);
-    assert_eq!(
-        got,
-        serde_json::json!({"tagValues": [{"type": "int", "value": "500"}]}),
-        "{ctx}: body {got}"
     );
 
     // AC6's schema half: `MODIFY ORDER BY` APPENDED. Two separate string
