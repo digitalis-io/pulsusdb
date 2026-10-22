@@ -333,7 +333,7 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
     let keys = stream
         .next()
         .await
-        .expect("trace_tag_catalog must exist")
+        .expect("tag_values must exist")
         .expect("decode system.tables row");
     drop(stream);
     assert_eq!(keys.primary_key, "scope, key, value, val_type");
@@ -523,7 +523,7 @@ fn tight_budget_config() -> TraceReadConfig {
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
-        spans_v2_table: "spans".to_string(),
+        spans_table: "spans".to_string(),
         error_spans_table: "error_spans".to_string(),
         traces_table: "traces".to_string(),
         resources_table: "resources".to_string(),

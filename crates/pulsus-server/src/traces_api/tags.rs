@@ -6,13 +6,12 @@
 //! **Which read answers what** (issue #478 changed this; the module used
 //! to say "catalog ONLY" and that stopped being true):
 //!
-//! * tag NAMES — always `trace_tag_catalog`, still time-less.
-//! * attribute values with no narrowing `q` — `trace_tag_catalog`, the
-//!   same SQL bytes as before.
-//! * attribute values with a narrowing `q` — `trace_attrs_idx`
-//!   intersected with the matching span set.
-//! * `name`/`span:name` — `trace_spans`, always. The catalog holds no
-//!   span-`name` row (its MV projects `trace_attrs_idx` alone), so this
+//! * tag NAMES — always `tag_names`, still time-less.
+//! * attribute values with no narrowing `q` — `tag_values`.
+//! * attribute values with a narrowing `q` — `spans`, or the bucket
+//!   catalogues for a single service equality.
+//! * `name`/`span:name` — `spans`, always. The catalog holds no
+//!   span-`name` row, so this
 //!   is the only place the answer exists. Every OTHER intrinsic still
 //!   answers from the static vocabulary with no query at all, and
 //!   [`tag_value_source`] is the exhaustive dispatch that decides which.
@@ -120,7 +119,7 @@ pub(super) fn ok_json(body: serde_json::Value) -> Response {
 /// the vocabulary answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TagValueSource {
-    /// Read from `trace_spans`. Exactly one intrinsic is here.
+    /// Read from `spans`. Exactly one intrinsic is here.
     Store,
     /// The static closed keyword set, or the empty list for an
     /// open-valued intrinsic. No ClickHouse query at all.

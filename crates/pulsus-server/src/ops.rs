@@ -1042,8 +1042,6 @@ mod tests {
         assert!(!r.contains("pulsus_ingest_metadata_upserts_total"));
         assert!(!r.contains("pulsus_ingest_patterns_dropped_total"));
         assert!(!r.contains("pulsus_ingest_backfill_"));
-        assert!(!r.contains(r#"table="trace_spans""#));
-        assert!(!r.contains(r#"table="trace_attrs_idx""#));
     }
 
     /// AC-3 / reader-only guard: `metrics_handler` with empty writer slots

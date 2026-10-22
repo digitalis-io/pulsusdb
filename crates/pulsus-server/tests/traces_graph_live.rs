@@ -1,6 +1,6 @@
 //! Issue #173 (M7-E1) AC9: the end-to-end service-graph HTTP gate — OTLP
-//! ingest through the *product* path (`POST /v1/traces`, sync) → the edge
-//! MV populates `trace_edges` → `GET /api/traces/v1/service_graph` returns
+//! ingest through the *product* path (`POST /v1/traces`, sync) → the span
+//! view populates `spans` → `GET /api/traces/v1/service_graph` returns
 //! the exact documented JSON edges. This is the full-path gate the no-split
 //! rationale rests on (the read-path SQL is separately gated in
 //! `pulsus-read`'s `traces_spans_graph_sql.rs`).
@@ -15,7 +15,7 @@
 //! - replay idempotence: re-POSTing the byte-identical body leaves the
 //!   response unchanged;
 //! - merge invariance: the edge set/counts are unchanged after
-//!   `OPTIMIZE TABLE trace_edges FINAL`;
+//!   `OPTIMIZE TABLE spans FINAL` and `OPTIMIZE TABLE service_edges FINAL`;
 //! - Zipkin shared-span correctness (AC7f): a shared RPC (both sides under
 //!   the same span id, carrying `zipkin.shared="true"`) produces exactly its
 //!   `client → server` edge, and a shared server half whose `parent_id`
@@ -194,14 +194,16 @@ async fn optimize_edges_final(db: &str) {
     let client = ChClient::new(ch_config(db))
         .await
         .expect("connect for optimize");
-    client
-        .execute(
-            &format!("OPTIMIZE TABLE {db}.trace_edges FINAL"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("optimize trace_edges");
+    for table in ["spans", "service_edges"] {
+        client
+            .execute(
+                &format!("OPTIMIZE TABLE {db}.{table} FINAL"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("optimize {table}: {e}"));
+    }
 }
 
 fn spawn_ready(port: u16, db: &str) -> ChildGuard {

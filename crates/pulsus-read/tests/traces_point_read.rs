@@ -22,7 +22,7 @@
 //!
 //! **What this file no longer carries, and why.** Issue #55's
 //! `EXPLAIN indexes = 1` gate pinned the OLD point read's primary-index
-//! behaviour on `trace_spans`. No production statement looks like that
+//! behaviour on the previous store's span table. No production statement looks like that
 //! after this change, and the three new statements' index story is argued
 //! from the catalogue's sort keys and the statements' literal predicates
 //! rather than asserted by a case: a mark count is a property of parts, so
@@ -203,7 +203,7 @@ async fn scalar_u32(client: &ChClient, sql: &str) -> u32 {
 fn fetch_config() -> TraceReadConfig {
     TraceReadConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
-        spans_v2_table: "spans".to_string(),
+        spans_table: "spans".to_string(),
         error_spans_table: "error_spans".to_string(),
         traces_table: "traces".to_string(),
         resources_table: "resources".to_string(),

@@ -952,8 +952,8 @@ at exit 0 (§11.1), so the quotation above cannot drift without that gate redden
 **This narrows a rule §2.4 already carried and did not bound.** The lattice says `a || b` becomes
 `sql_a OR sql_b` in one statement. That is right **when both sides read the same source**, and wrong
 when they do not: `resource.service.name` is a physical column of `trace_spans`
-(`schema/schema.sql:631`, ordered by `(trace_id, timestamp_ns)`) while
-`span.http.method` is a row of `trace_attrs_idx` (`schema/schema.sql:431`, ordered by
+(`schema/schema.sql:631 @ d60a960d`, ordered by `(trace_id, timestamp_ns)`) while
+`span.http.method` is a row of `trace_attrs_idx` (`schema/schema.sql:431 @ d60a960d`, ordered by
 `(key, val, scope, timestamp_ns, trace_id, span_id)`). A disjunction over one of each is reachable,
 not theoretical.
 
@@ -4140,7 +4140,7 @@ Its three prerequisites, each with what a taker must read first:
 2. **The presence-count discriminator.** A bare `anyIf` maps "the span carries the key with an empty
    value" and "the span carries no such row" onto the same output row. `val_type` cannot tell them
    apart: migration 39 added it with `DEFAULT ''` and pre-existing rows read back `''`
-   (`schema/schema.sql:419`), and `StoredType::from_stored` maps `''` to `Unknown`
+   (`schema/schema.sql:419 @ d60a960d`), and `StoredType::from_stored` maps `''` to `Unknown`
    (`crates/pulsus-read/src/traces/search_eval.rs:183`). The merged statement must carry
    `countIf(key = … AND scope = …) > 0` as its own column, which is what a3 does.
 

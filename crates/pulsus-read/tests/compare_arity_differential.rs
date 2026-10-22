@@ -119,7 +119,7 @@ fn ch_config(database: &str) -> ChConnConfig {
 fn engine_config() -> TraceReadConfig {
     TraceReadConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
-        spans_v2_table: "spans".to_string(),
+        spans_table: "spans".to_string(),
         error_spans_table: "error_spans".to_string(),
         traces_table: "traces".to_string(),
         resources_table: "resources".to_string(),
@@ -156,8 +156,8 @@ struct SpanDef {
     service: String,
     name: &'static str,
     msg: String,
-    /// An optional `span.<key>` attribute, written to `trace_attrs_idx`
-    /// here and emitted as an OTLP span attribute there.
+    /// An optional `span.<key>` attribute, emitted as an OTLP span
+    /// attribute on both sides.
     attr: Option<(&'static str, String)>,
     ts_ns: i64,
 }

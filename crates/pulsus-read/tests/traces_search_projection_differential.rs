@@ -276,7 +276,7 @@ fn ch_config(database: &str) -> ChConnConfig {
 fn engine_config() -> TraceReadConfig {
     TraceReadConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
-        spans_v2_table: "spans".to_string(),
+        spans_table: "spans".to_string(),
         error_spans_table: "error_spans".to_string(),
         traces_table: "traces".to_string(),
         resources_table: "resources".to_string(),

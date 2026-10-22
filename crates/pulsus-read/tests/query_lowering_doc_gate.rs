@@ -139,7 +139,7 @@ fn maximal_shape() -> PlanShape {
             PartShape::Sql(Box::new(SqlPartShape {
                 kind: "sql",
                 also_reads: Vec::new(),
-                name: "trace_attrs_idx".to_string(),
+                name: "log_streams_idx".to_string(),
                 issue: "per_seed:chunks",
                 cut: Some(CutShape {
                     why: "handoff_exceeds_bound",
@@ -164,13 +164,13 @@ fn maximal_shape() -> PlanShape {
             PartShape::Sql(Box::new(SqlPartShape {
                 kind: "sql",
                 also_reads: Vec::new(),
-                name: "trace_spans".to_string(),
+                name: "log_samples".to_string(),
                 issue: "once",
                 cut: Some(CutShape {
                     why: "disjoint_sources",
                     source: None,
                     key: None,
-                    sources: vec!["trace_spans".to_string(), "trace_attrs_idx".to_string()],
+                    sources: vec!["log_samples".to_string(), "log_streams_idx".to_string()],
                     cost: None,
                 }),
                 seed: None,

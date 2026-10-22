@@ -49,7 +49,7 @@
 //! ```
 //!
 //! Both were measured against ClickHouse on a two-partition corpus
-//! (issue #525, `trace_attrs_idx` DDL, 500 000 attribute rows per UTC
+//! (issue #525, a daily-partitioned table, 500 000 rows per UTC
 //! day, one row on the boundary nanosecond). Narrowing the inclusive
 //! window returned 499 999 rows where the correct clause returned
 //! 500 001. Widening the exclusive window returned the same 500 000 rows
@@ -89,8 +89,8 @@
 //!
 //! `DaySpan` (deleted by issue #598) was deliberately NOT expressed here. The
 //! tag-discovery reads carry a day bound and no `timestamp_ns` bound at
-//! all (a sub-day predicate prunes nothing on `trace_spans` and defeats
-//! the `span_name_day` projection — see that type's own doc), so they
+//! all (a sub-day predicate pruned nothing on the previous store's span
+//! table and defeated its name projection), so they
 //! have no row bound for a day bound to agree with, and resolving their
 //! window inclusively at both ends is the deliberately wider read.
 
@@ -114,12 +114,10 @@ pub fn resources_day_bound(lo: &str, hi: &str) -> String {
 
 const NS_PER_DAY: i64 = 86_400_000_000_000;
 
-/// The recency table's bucket width in nanoseconds (issue #560). THE
-/// definition — the reader owns the value, `trace_recent_mv`'s
-/// `intDiv(timestamp_ns, …)` carries the same number as TEXT; the test that
-/// bound the two went with the previous metrics SQL (#602 part 3a). A whole number
-/// of these makes a UTC day (288 of them), so a bucket never straddles
-/// midnight and `trace_recent.date` is a function of `bucket`.
+/// The five-minute bucket width in nanoseconds (issue #560): the width of
+/// `traces.buckets`, `tag_bucket_values.bucket` and
+/// `service_bucket_resources.bucket`. A whole number of these makes a UTC
+/// day (288 of them), so a bucket never straddles midnight.
 pub const RECENT_BUCKET_NS: i64 = 300_000_000_000;
 
 /// Which nanoseconds a trace read's window contains — the ONE
@@ -325,9 +323,10 @@ impl WindowSql {
 
     /// The daily-partition pruning clause on the `date` column —
     /// `date >= toDate('…') AND date <= toDate('…')`, the same
-    /// expression `trace_attrs_idx`/`trace_edges` are partitioned by
-    /// (docs/schemas.md §4.1), so it prunes parts rather than filtering
-    /// rows.
+    /// expression a table partitioned by a `date` column is partitioned
+    /// by, so it prunes parts rather than filtering rows. No production
+    /// statement reads such a column; [`WindowSql::date_clause_on`] is the
+    /// one in use.
     ///
     /// The end day comes from [`WindowSql::last_included_ns`], which is
     /// what makes it agree with [`WindowSql::time_clause`].

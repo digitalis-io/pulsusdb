@@ -930,7 +930,7 @@ pub(crate) enum TagScope {
 
 /// The parsed `/api/traces/v1/tags` request: only `scope` filters.
 /// `start`/`end` are accepted for client compatibility and IGNORED —
-/// `trace_tag_catalog` has no timestamp column, so tag discovery is
+/// `tag_names` has no timestamp column, so tag discovery is
 /// time-less by contract (docs/api.md §4.3, issue #58 frozen-schema
 /// resolution). `limit` is read by [`parse_tag_limit`] and cuts the
 /// rendered lists; any other parameter is ignored.

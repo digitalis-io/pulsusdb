@@ -422,7 +422,7 @@ own planner, lower is better (`crates/pulsus-read/src/traces/filter.rs:84-98`):
 
 `status`, `name` and the empty query `{}` are the three things the Grafana traces
 search form puts in front of a user before they type anything, and all three land
-in rank 4 or 5. `docs/schemas.md:857` already names the class: *"no selective
+in rank 4 or 5. `docs/schemas.md:1131 @ d60a960d` already named the class: *"no selective
 index — window-bounded, budget-limited"*.
 
 The proportions of a real query mix were derived separately, by reading what the

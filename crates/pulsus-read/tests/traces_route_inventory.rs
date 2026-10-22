@@ -204,3 +204,62 @@ fn the_inventory_is_complete_and_exact() {
         "new and refused"
     );
 }
+
+/// The six tables of the previous trace store, each written as two
+/// fragments so this file does not name them and match itself. Their
+/// views (`<name>_mv`) and wrappers (`<name>_dist`) contain these names.
+const OLD_TRACE_TABLES: [&str; 6] = [
+    concat!("trace_", "spans"),
+    concat!("trace_", "attrs_idx"),
+    concat!("trace_", "tag_catalog"),
+    concat!("trace_", "edges"),
+    concat!("trace_", "recent"),
+    concat!("trace_", "error_spans"),
+];
+
+/// Issue #602: no tracked file outside `docs/` names a table of the
+/// previous trace store. `docs/` is excluded because it carries the
+/// history. The allowlist is empty.
+#[test]
+fn no_code_names_an_old_trace_table() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let out = std::process::Command::new("git")
+        .args(["ls-files", "-z", "--", ":!docs/"])
+        .current_dir(&root)
+        .output()
+        .expect("run git ls-files");
+    assert!(out.status.success(), "git ls-files failed: {out:?}");
+    let files: Vec<String> = out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|f| !f.is_empty())
+        .map(|f| String::from_utf8_lossy(f).into_owned())
+        .collect();
+    let this = "crates/pulsus-read/tests/traces_route_inventory.rs";
+    assert!(
+        files.iter().any(|f| f == this),
+        "the sweep searched nothing: the file list does not hold {this} ({} files)",
+        files.len()
+    );
+    let mut hits = Vec::new();
+    for file in &files {
+        let bytes = match std::fs::read(root.join(file)) {
+            Ok(b) => b,
+            // Tracked, but deleted in the working tree.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!("read {file}: {e}"),
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        for (n, line) in text.lines().enumerate() {
+            if OLD_TRACE_TABLES.iter().any(|t| line.contains(t)) {
+                hits.push(format!("{file}:{}: {line}", n + 1));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "{} line(s) outside docs/ name an old trace table:\n{}",
+        hits.len(),
+        hits.join("\n")
+    );
+}

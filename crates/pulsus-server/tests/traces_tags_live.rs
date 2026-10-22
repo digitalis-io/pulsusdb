@@ -2,8 +2,8 @@
 //! for `GET /api/traces/v1/tags` and `GET /api/traces/v1/tag/{tag}/values`:
 //! spawns the real `pulsusdb` binary against a live ClickHouse (the
 //! `traces_search_live.rs` harness), seeds through the *product* ingest
-//! path (`POST /v1/traces`, sync — the MV populates `trace_tag_catalog`
-//! on insert), then asserts:
+//! path (`POST /v1/traces`, sync — the views populate `tag_names` and
+//! `tag_values` on insert), then asserts:
 //!
 //! - the bounded, deduplicated, `(scope, key)`-ordered scoped tag-name
 //!   set, with and without `scope=`, with `start`/`end` proven ignored;
@@ -23,8 +23,8 @@
 //!   (`query_id` cannot be set over HTTP); the discovery Select set —
 //!   matched by the byte-frozen SELECT lists, independent of the FROM
 //!   table — must count EXACTLY the requests this test made and read
-//!   only `trace_tag_catalog`, and zero Selects in the run (any SQL
-//!   text) may touch `trace_spans`/`trace_attrs_idx`;
+//!   only `tag_names` or `tag_values`, and zero Selects in the run (any
+//!   SQL text) may touch `spans`/`error_spans`;
 //! - the issue #61 (T9) seeded wire-shape proof for the four RESHAPING
 //!   Tempo tag aliases, over real HTTP against this non-trivial catalog
 //!   (the spawn sets `PULSUS_COMPAT_ENDPOINTS=true`): v1 flat bare-string
@@ -994,8 +994,8 @@ async fn tag_discovery_against_real_clickhouse() {
     //     requests made above (no >= threshold to hide under) and every
     //     row's `tables` must be exactly the catalog;
     // (b) a text-independent ban: ZERO Selects in this run's database —
-    //     any SQL shape whatsoever — touched trace_spans or
-    //     trace_attrs_idx (this test never calls search/fetch, so any
+    //     any SQL shape whatsoever — touched spans or
+    //     error_spans (this test never calls search/fetch, so any
     //     hit is a discovery regression by construction).
     //
     // **The SUBJECT of both layers is named, not implied** (issue #478).
@@ -1048,8 +1048,9 @@ async fn tag_discovery_against_real_clickhouse() {
     let ban_sql = format!(
         "SELECT toUInt64(count()) AS n FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
-           AND current_database = '{db}' \
-           AND (has(tables, '{db}.trace_spans') OR has(tables, '{db}.trace_attrs_idx'))"
+           AND current_database = '{db}' AND log_comment != '{settle}' \
+           AND (has(tables, '{db}.spans') OR has(tables, '{db}.error_spans'))",
+        settle = live_db::SETTLE_LOG_COMMENT
     );
     let mut stream = admin
         .query_stream::<CountRow>(&ban_sql, &QuerySettings::new())
@@ -1062,8 +1063,8 @@ async fn tag_discovery_against_real_clickhouse() {
     assert_eq!(
         banned,
         Some(0),
-        "no Select in this run — regardless of its SQL text — may touch trace_spans or \
-         trace_attrs_idx"
+        "no Select in this run — regardless of its SQL text — may touch spans or \
+         error_spans"
     );
 
     drop_db(db).await;
@@ -1186,7 +1187,7 @@ async fn assert_query_logging_is_on(admin: &ChClient) {
 }
 
 /// `SYSTEM FLUSH LOGS`, then the number of finished `Select`s whose
-/// `tables` array names any `<db>.trace_*` object.
+/// `tables` array names any of the ten trace tables.
 ///
 /// The counted set is defined by the table read and by nothing else. The
 /// run's identity lives in `db` itself — `pulsus_testkit::test_db`
@@ -1207,7 +1208,7 @@ async fn flush_and_count_trace_reads(admin: &ChClient, db: &str) -> u64 {
     let sql = format!(
         "SELECT toUInt64(count()) AS n FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
-           AND arrayExists(t -> startsWith(t, '{db}.trace_') OR t IN ('{db}.tag_names', '{db}.tag_values', '{db}.spans', '{db}.resources', '{db}.traces'), arrayMap(x -> toString(x), tables))"
+           AND arrayExists(t -> t IN ('{db}.trace_landing', '{db}.spans', '{db}.error_spans', '{db}.traces', '{db}.resources', '{db}.tag_names', '{db}.tag_values', '{db}.tag_bucket_values', '{db}.service_bucket_resources', '{db}.service_edges'), arrayMap(x -> toString(x), tables))"
     );
     let mut stream = admin
         .query_stream::<CountRow>(&sql, &QuerySettings::new())
@@ -1263,7 +1264,7 @@ async fn trace_read_rows(admin: &ChClient, db: &str) -> Vec<(String, Vec<String>
         "SELECT query, arraySort(arrayMap(x -> toString(x), tables)) AS tables \
          FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
-           AND arrayExists(t -> startsWith(t, '{db}.trace_') OR t IN ('{db}.tag_names', '{db}.tag_values', '{db}.spans', '{db}.resources', '{db}.traces'), arrayMap(x -> toString(x), tables))"
+           AND arrayExists(t -> t IN ('{db}.trace_landing', '{db}.spans', '{db}.error_spans', '{db}.traces', '{db}.resources', '{db}.tag_names', '{db}.tag_values', '{db}.tag_bucket_values', '{db}.service_bucket_resources', '{db}.service_edges'), arrayMap(x -> toString(x), tables))"
     );
     let mut stream = admin
         .query_stream::<QueryTablesRow>(&sql, &QuerySettings::new())
@@ -1387,7 +1388,7 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
     let _guard = spawn_ready(port, db);
 
     // **Clock-derived, and it must stay that way** (issue #478). Since
-    // `name` is served from `trace_spans`, this corpus's SPAN rows are
+    // `name` is served from `spans`, this corpus's SPAN rows are
     // read, not only its catalog rows — and the span tables carry a
     // retention TTL with `ttl_only_drop_parts = 1` where the catalog
     // carries none. A literal timestamp older than retention would leave
@@ -1580,22 +1581,22 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
     // What it asserts, and nothing more: during the window between two
     // `SYSTEM FLUSH LOGS` calls, `system.query_log` holds no
     // `QueryFinish` row with `query_kind = 'Select'` any of whose
-    // `tables` entries begins `<db>.trace_`. Every object the traces
-    // schema declares is under that prefix.
+    // `tables` entries is one of the ten trace tables
+    // `flush_and_count_trace_reads` names.
     //
     // WHAT THAT COVERS. Every tag-discovery read the server can issue is
     // built by `tag_names_sql` or `tag_values_sql`
     // (`crates/pulsus-read/src/traces/tags_sql.rs`), and between them
     // those two functions can emit exactly two SQL shapes:
-    // `SELECT DISTINCT scope, key FROM trace_tag_catalog …` and
-    // `SELECT DISTINCT val FROM trace_tag_catalog …`. The table name is a
+    // `SELECT DISTINCT scope, key FROM tag_names …` and
+    // `SELECT DISTINCT val FROM tag_values …`. The table name is a
     // PRIVATE module constant and the only caller-supplied strings land
     // inside `WHERE`, so neither shape's `FROM` can be anything else.
     //
     // **Those two shapes are OBSERVED to log that table**, which is the
     // fact this predicate rests on. It is checked, not assumed, and in
     // two places: the other test in this file asserts `tables` equals
-    // exactly `[<db>.trace_tag_catalog]` for every `SELECT DISTINCT`
+    // exactly `[<db>.tag_names]` or `[<db>.tag_values]` for every `SELECT DISTINCT`
     // discovery row it produces, over both shapes; and step (3) below
     // re-establishes it for the values shape on this run, which is why a
     // control that fails to move the count aborts the gate.
@@ -1614,11 +1615,11 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
     //      text — calling neither builder, never reaching `engine_for`,
     //      never entering `pulsus-read`. Measured in code review (round 1
     //      on this suite): eight completed `SELECT count() FROM
-    //      <db>.trace_tag_catalog` reads issued that way finished with
+    //      <db>.<catalog>` reads issued that way finished with
     //      `current_database = default` and an EMPTY `tables` array, and
     //      this gate passed. That is a real read this predicate cannot
     //      see.
-    //   2. A read of a table that is not `<db>.trace_*`.
+    //   2. A read of a table that is not one of the ten.
     //   3. A query that never reached `QueryFinish` — one that errored or
     //      was cancelled. Such a request also fails its body assertion,
     //      so it surfaces there instead.
@@ -1742,7 +1743,7 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
     //
     // **`name` is deliberately absent from this list** (issue #478), and
     // it is absent BY NAME rather than by a loosened predicate: it is
-    // now served from `trace_spans`, so it reads a trace table and
+    // now served from `spans`, so it reads a trace table and
     // cannot sit inside the zero-delta window. It is re-gated below,
     // after the window closes, against the same colliding corpus —
     // because a change that moves where the names come from is exactly
@@ -1822,13 +1823,13 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
     // colliding corpus rather than assumed dead.
     //
     // This corpus is built so a right and a wrong implementation give
-    // DIFFERENT bytes. `trace_spans.name` holds three span names —
+    // DIFFERENT bytes. `spans.name` holds three span names —
     // `checkout`, `exception`, `payment` — while the catalog holds one
     // `event:intrinsic`/`name` row, `exception`, from the span EVENT. So:
     //
     //   * the old defect (a bare `name` answering out of the catalog's
     //     reserved intrinsic rows) returns exactly `["exception"]`;
-    //   * an answer from `trace_spans` returns all three.
+    //   * an answer from `spans` returns all three.
     //
     // The new read is structurally immune — that column holds span names
     // and nothing else — and this is the check that the claim is true
@@ -1972,7 +1973,7 @@ async fn trace_tag_values_memory_breach_is_422() {
             Idempotency::Idempotent,
         )
         .await
-        .expect("seed trace_tag_catalog");
+        .expect("seed tag_values");
 
     let mut wrong: Vec<String> = Vec::new();
     for path in [
@@ -2036,7 +2037,7 @@ async fn the_default_trace_memory_ceiling_does_not_refuse_a_catalog_read() {
             Idempotency::Idempotent,
         )
         .await
-        .expect("seed trace_tag_catalog");
+        .expect("seed tag_values");
 
     for path in [
         "/api/traces/v1/tag/span.bulk.id/values",
@@ -2217,12 +2218,11 @@ fn trace_ids(json: &serde_json::Value) -> Vec<String> {
 /// all forbidden here; only the trace and span ids above are literals.
 ///
 /// This is not a style preference, and the failure it prevents is silent.
-/// `trace_spans` and `trace_attrs_idx` carry
+/// `spans` carries
 /// `TTL … + INTERVAL {{retention_days}} DAY DELETE` with
-/// `ttl_only_drop_parts = 1` (`crates/pulsus-schema/src/catalog.rs`, the
-/// `trace_attrs_idx` migration; `retention_days` defaults to 7 in
-/// `crates/pulsus-config/src/model.rs`), while `trace_tag_catalog` carries
-/// no TTL at all. A corpus older than retention is therefore HALF
+/// `ttl_only_drop_parts = 1` (`schema/schema.sql`; `retention_days`
+/// defaults to 7 in `crates/pulsus-config/src/model.rs`), while
+/// `tag_names` and `tag_values` carry no TTL at all. A corpus older than retention is therefore HALF
 /// visible: the materialized view fires on the insert block so every
 /// tag-values assertion below still passes, while the span rows are
 /// dropped at insert time — measured on this tree,
@@ -2974,9 +2974,8 @@ async fn six_request_classes_read_exactly_these_tables() {
     for shape in [SHAPE_NAMES, SHAPE_CATALOG_VALUES] {
         for tables in shape_rows(&admin, db, shape).await {
             assert!(
-                !tables.iter().any(|t| t.ends_with(".trace_spans")
-                    || t.ends_with(".trace_attrs_idx")
-                    || t.ends_with(".spans")
+                !tables.iter().any(|t| t.ends_with(".spans")
+                    || t.ends_with(".error_spans")
                     || t.ends_with(".resources")
                     || t.ends_with(".traces")),
                 "a catalog-backed class touched a span table: {tables:?}"

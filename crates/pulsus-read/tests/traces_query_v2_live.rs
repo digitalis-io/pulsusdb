@@ -5877,7 +5877,7 @@ async fn the_detail_read_does_not_re_scan_the_window() {
 fn engine_config() -> pulsus_read::TraceReadConfig {
     pulsus_read::TraceReadConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
-        spans_v2_table: "spans".to_string(),
+        spans_table: "spans".to_string(),
         error_spans_table: "error_spans".to_string(),
         traces_table: "traces".to_string(),
         resources_table: "resources".to_string(),
@@ -8033,7 +8033,7 @@ async fn search_routed_keeps_the_search_bounds() {
 
 /// Section 6.9, issue #602 part 2b: a run-time demand the statement raises
 /// is the request's error, the same error the previous search engine gives — and the
-/// query log shows no read of today's tables after the statement's 395.
+/// query log shows no other read of a table after the statement's 395.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_routed_answers_a_run_time_demand_itself() {
     skip_unless_live!();
@@ -8094,9 +8094,8 @@ async fn search_routed_answers_a_run_time_demand_itself() {
         (r#"{ .a }"#, Ok(1usize)),
     ];
     let mut wrong = Vec::new();
-    // The fork's answers first, and the query log read before today's
-    // engine runs at all: a read of today's tables after the statement's
-    // 395 can then only be the fork's own retry.
+    // The answers first, then the query log: any other read of a table
+    // after the statement's 395 can only be a retry or a fallback.
     let t0 = now_ns();
     let mut routed = Vec::new();
     for (query, _) in &cases {
@@ -8111,12 +8110,12 @@ async fn search_routed_answers_a_run_time_demand_itself() {
         at: i64,
         code: i32,
         statement: u8,
-        today: u8,
+        other: u8,
     }
     let sql = format!(
         "SELECT toUnixTimestamp64Micro(event_time_microseconds) AS at, exception_code AS code, \
          toUInt8(startsWith(query, 'WITH (SELECT (groupArray(trace_id)')) AS statement, \
-         toUInt8(has(tables, '{db}.trace_recent') OR has(tables, '{db}.trace_spans')) AS today \
+         toUInt8(notEmpty(tables) AND NOT startsWith(query, 'WITH (SELECT (groupArray(trace_id)')) AS other \
          FROM system.query_log WHERE has(databases, '{db}') \
          AND type IN ('ExceptionBeforeStart', 'ExceptionWhileProcessing', 'QueryFinish') \
          AND event_time_microseconds >= toDateTime64({}, 6) ORDER BY at",
@@ -8150,9 +8149,9 @@ async fn search_routed_answers_a_run_time_demand_itself() {
             "no 395 row for the statement in the query log: {logged:?}"
         )),
         Some(at) => {
-            if logged.iter().any(|r| r.today == 1 && r.at > at) {
+            if logged.iter().any(|r| r.other == 1 && r.at > at) {
                 wrong.push(format!(
-                    "a read of today's tables after the statement's 395: {logged:?}"
+                    "another read after the statement's 395: {logged:?}"
                 ));
             }
         }
@@ -16407,8 +16406,7 @@ async fn a_service_name_aggregate_reads_only_a_string() {
 
 /// Issue #602 part 1: a grouping the statement serves is capped by the
 /// statement's own group counter, with no preflight — over the cap it
-/// answers the `422` from one statement, which reads `spans` and not
-/// today's `trace_spans`.
+/// answers the `422` from one statement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_covered_grouping_is_capped_by_one_statement() {
     skip_unless_live!();
@@ -16462,41 +16460,8 @@ async fn a_covered_grouping_is_capped_by_one_statement() {
     // The statement count is read once the query log has settled, not
     // straight after a flush, which can return before the row is visible.
     let (statements, _) = settled_statements(&client, &db, t0).await;
-    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, PartialEq)]
-    struct Logged {
-        statements: u64,
-        previous: u64,
-    }
-    #[derive(Row, serde::Serialize, serde::Deserialize)]
-    struct Previous {
-        previous: u64,
-    }
-    let sql = format!(
-        "SELECT countIf(has(tables, '{db}.trace_spans') OR has(tables, '{db}.trace_recent')) AS previous \
-         FROM system.query_log WHERE type = 'QueryFinish' AND query_kind = 'Select' \
-         AND has(databases, '{db}') AND event_time_microseconds >= toDateTime64({}, 6)",
-        t0 as f64 / 1e9
-    );
-    let mut stream = client
-        .query_stream::<Previous>(&sql, &QuerySettings::new())
-        .await
-        .expect("read the query log");
-    let previous = stream
-        .next()
-        .await
-        .expect("one row")
-        .expect("decode the query log row")
-        .previous;
-    let logged = Logged {
-        statements,
-        previous,
-    };
-    let want = Logged {
-        statements: 1,
-        previous: 0,
-    };
-    if logged != want {
-        wrong.push(format!("{query}: logged {logged:?}, want {want:?}"));
+    if statements != 1 {
+        wrong.push(format!("{query}: {statements} statements, want 1"));
     }
     drop_db(&db).await;
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

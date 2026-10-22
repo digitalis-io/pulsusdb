@@ -15,9 +15,9 @@
 //!
 //! The §4.3 tag-discovery routes (issue #58) follow the same split:
 //! `tags.rs` (handlers), `tags_response.rs` (documented JSON shaping +
-//! best-effort type inference) — both served exclusively from the
-//! Global `trace_tag_catalog` via `TraceEngine`, never by scanning span
-//! payloads.
+//! the stored type) — served from `tag_names`, `tag_values`,
+//! `tag_bucket_values`, `service_bucket_resources` and `spans` via
+//! `TraceEngine` (`tags.rs` says which read answers what).
 //!
 //! The §4.4 TraceQL metrics routes (issue #59) live in `metrics.rs`:
 //! thin handlers over `pulsus-read`'s metrics planner/engine, encoding
@@ -25,8 +25,8 @@
 //! envelope.
 //!
 //! The §4.5 service-graph route (issue #173, M7-E1) lives in `graph.rs`: a
-//! thin handler over `pulsus-read`'s `service_graph` two-level aggregation
-//! against the `trace_edges` half-row ledger, shaping the native
+//! thin handler over `pulsus-read`'s `service_graph` statement over
+//! `service_edges` and `spans`, shaping the native
 //! `{"edges":[...],"truncated":...}` JSON envelope. No Tempo-compat alias.
 //!
 //! The §8.1 Tempo compat aliases (issue #61, T9) ship here too:

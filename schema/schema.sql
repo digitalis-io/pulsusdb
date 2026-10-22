@@ -12,8 +12,8 @@
 -- and never add a substitution that matches one.
 --
 -- A REPLICATION PATH NAMES ITS OWN TABLE. The paths are written out rather
--- than derived, so a wrong one is a per-table error. Twenty-three tables take
--- `/clickhouse/tables/{shard}/` and five take `/clickhouse/tables/all/`
+-- than derived, so a wrong one is a per-table error. Nineteen tables take
+-- `/clickhouse/tables/{shard}/` and six take `/clickhouse/tables/all/`
 -- (docs/architecture.md §3). `tests/schema_file.rs` holds the relation.
 --
 -- A STATEMENT ENDS AT A LINE ENDING IN A SEMICOLON, and no other character
@@ -411,65 +411,6 @@ ORDER BY (scope, key, value, val_type)
 --@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
-CREATE TABLE IF NOT EXISTS {{db}}.trace_attrs_idx{{on_cluster}}
-(
-    date Date,
-    key LowCardinality(String),
-    val String,
-    scope LowCardinality(String),
-    val_num Nullable(Float64),
-    timestamp_ns Int64,
-    trace_id FixedString(16),
-    span_id FixedString(8),
-    duration_ns Int64,
-    val_type LowCardinality(String) DEFAULT ''
-)
---@single  ENGINE = ReplacingMergeTree
---@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.trace_attrs_idx', '{replica}')
-PARTITION BY date
-ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)
-TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
-SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192{{storage_policy}};
-
-CREATE TABLE IF NOT EXISTS {{db}}.trace_edges{{on_cluster}}
-(
-    date Date,
-    side UInt8,
-    trace_id FixedString(16),
-    span_id FixedString(8),
-    pair_id FixedString(8),
-    conn_type LowCardinality(String),
-    timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)),
-    service LowCardinality(String),
-    duration_ns Int64 CODEC(T64, ZSTD(1)),
-    failed UInt8
-)
---@single  ENGINE = ReplacingMergeTree
---@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.trace_edges', '{replica}')
-PARTITION BY date
-ORDER BY (side, trace_id, span_id)
-TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
-SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192{{storage_policy}};
-
-CREATE TABLE IF NOT EXISTS {{db}}.trace_error_spans{{on_cluster}}
-(
-    date Date,
-    trace_id FixedString(16),
-    span_id FixedString(8),
-    timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)),
-    duration_ns Int64 CODEC(T64, ZSTD(1)),
-    service LowCardinality(String),
-    name LowCardinality(String),
-    kind Int8
-)
---@single  ENGINE = ReplacingMergeTree
---@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.trace_error_spans', '{replica}')
-PARTITION BY date
-ORDER BY (timestamp_ns, trace_id, span_id)
-TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}, index_granularity = 8192{{storage_policy}};
---@cluster SETTINGS ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, index_granularity = 8192{{storage_policy}};
-
 CREATE TABLE IF NOT EXISTS {{db}}.trace_landing{{on_cluster}}
 (
     event_id UUID DEFAULT generateUUIDv7(),
@@ -531,119 +472,6 @@ TTL toDateTime(least(intDiv(received_ms, 1000) + ({{trace_landing_retention_hour
 --@single  SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, async_insert = 0, index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, async_insert = 0, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
-CREATE TABLE IF NOT EXISTS {{db}}.trace_recent{{on_cluster}}
-(
-    date Date,
-    bucket UInt32,
-    trace_id FixedString(16),
-    ts_max SimpleAggregateFunction(max, Int64) CODEC(T64, ZSTD(1)),
-    ts_min SimpleAggregateFunction(min, Int64) CODEC(T64, ZSTD(1))
-)
---@single  ENGINE = AggregatingMergeTree
---@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.trace_recent', '{replica}')
-PARTITION BY date
-ORDER BY (bucket, trace_id)
-TTL toDateTime(least(intDiv(ts_max, 1000000000) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}, index_granularity = 8192{{storage_policy}};
---@cluster SETTINGS ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, index_granularity = 8192{{storage_policy}};
-
-CREATE TABLE IF NOT EXISTS {{db}}.trace_spans{{on_cluster}}
-(
-    trace_id FixedString(16),
-    span_id FixedString(8),
-    parent_id FixedString(8),
-    name LowCardinality(String),
-    service LowCardinality(String),
-    timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)),
-    duration_ns Int64 CODEC(T64, ZSTD(1)),
-    status_code Int8,
-    kind Int8,
-    payload_type Int8,
-    payload String CODEC(ZSTD(3)),
-    shared UInt8 DEFAULT 0,
-    status_message String DEFAULT '',
-    scope_name LowCardinality(String) DEFAULT '',
-    scope_version LowCardinality(String) DEFAULT '',
-    attr_key Array(LowCardinality(String)),
-    attr_scope Array(LowCardinality(String)),
-    attr_val Array(String),
-    attr_type Array(LowCardinality(String)),
-    attr_num Array(Nullable(Float64)),
-    INDEX idx_duration duration_ns TYPE minmax GRANULARITY 4,
-    CONSTRAINT attr_arrays_aligned CHECK (length(attr_key) = length(attr_scope)) AND (length(attr_key) = length(attr_val)) AND (length(attr_key) = length(attr_type)) AND (length(attr_key) = length(attr_num)),
-    PROJECTION span_name_day
-    (
-        SELECT
-            toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS d,
-            name,
-            count()
-        GROUP BY
-            d,
-            name
-    ),
-    PROJECTION service_time
-    (
-        SELECT
-            duration_ns,
-            kind,
-            name,
-            parent_id,
-            payload_type,
-            scope_name,
-            scope_version,
-            service,
-            shared,
-            span_id,
-            status_code,
-            status_message,
-            timestamp_ns,
-            trace_id
-        ORDER BY
-            service,
-            timestamp_ns
-    ),
-    PROJECTION name_time
-    (
-        SELECT
-            duration_ns,
-            kind,
-            name,
-            parent_id,
-            payload_type,
-            scope_name,
-            scope_version,
-            service,
-            shared,
-            span_id,
-            status_code,
-            status_message,
-            timestamp_ns,
-            trace_id
-        ORDER BY
-            name,
-            timestamp_ns
-    )
-)
---@single  ENGINE = MergeTree
---@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.trace_spans', '{replica}')
-PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
-ORDER BY (trace_id, timestamp_ns)
-TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
-SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192{{storage_policy}};
-
-CREATE TABLE IF NOT EXISTS {{db}}.trace_tag_catalog{{on_cluster}}
-(
-    scope LowCardinality(String),
-    key LowCardinality(String),
-    val String,
-    val_type LowCardinality(String)
-)
---@single  ENGINE = ReplacingMergeTree
---@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.trace_tag_catalog', '{replica}')
-PRIMARY KEY (scope, key, val)
-ORDER BY (scope, key, val, val_type)
-SETTINGS index_granularity = 8192{{storage_policy}};
-
 CREATE TABLE IF NOT EXISTS {{db}}.traces{{on_cluster}}
 (
     day Date CODEC(ZSTD(1)),
@@ -699,21 +527,6 @@ TTL toDateTime(least(intDiv(last_start_ns, 1000000000) + ({{retention_days}} * 8
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.spans{{dist_suffix}}{{on_cluster}} AS {{db}}.spans
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'spans', cityHash64(trace_id))
 --@cluster SETTINGS fsync_after_insert = 1, fsync_directories = 1;
-
---@cluster CREATE TABLE IF NOT EXISTS {{db}}.trace_attrs_idx{{dist_suffix}}{{on_cluster}} AS {{db}}.trace_attrs_idx
---@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'trace_attrs_idx', cityHash64(trace_id));
-
---@cluster CREATE TABLE IF NOT EXISTS {{db}}.trace_edges{{dist_suffix}}{{on_cluster}} AS {{db}}.trace_edges
---@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'trace_edges', cityHash64(trace_id));
-
---@cluster CREATE TABLE IF NOT EXISTS {{db}}.trace_error_spans{{dist_suffix}}{{on_cluster}} AS {{db}}.trace_error_spans
---@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'trace_error_spans', cityHash64(trace_id));
-
---@cluster CREATE TABLE IF NOT EXISTS {{db}}.trace_recent{{dist_suffix}}{{on_cluster}} AS {{db}}.trace_recent
---@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'trace_recent', cityHash64(trace_id));
-
---@cluster CREATE TABLE IF NOT EXISTS {{db}}.trace_spans{{dist_suffix}}{{on_cluster}} AS {{db}}.trace_spans
---@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'trace_spans', cityHash64(trace_id));
 
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.traces{{dist_suffix}}{{on_cluster}} AS {{db}}.traces
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'traces', cityHash64(trace_id))
@@ -934,21 +747,6 @@ AS SELECT
 FROM {{db}}.trace_landing
 WHERE row_kind = 3;
 
-CREATE MATERIALIZED VIEW {{db}}.trace_edges_mv{{on_cluster}} TO {{db}}.trace_edges
-AS SELECT
-    toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,
-    toUInt8(kind IN (2, 5)) AS side,
-    trace_id,
-    span_id,
-    if((kind IN (3, 4)) OR (shared = 1), span_id, parent_id) AS pair_id,
-    if((kind IN (2, 3)), 'rpc', 'messaging') AS conn_type,
-    timestamp_ns,
-    service,
-    duration_ns,
-    toUInt8(status_code = 2) AS failed
-FROM {{db}}.trace_spans
-WHERE (kind IN (3, 4)) OR ((kind IN (2, 5)) AND ((shared = 1) OR (parent_id != toFixedString(unhex('0000000000000000'), 8))));
-
 CREATE TABLE IF NOT EXISTS {{db}}.service_edges{{on_cluster}}
 (
     minute DateTime('UTC') CODEC(Delta, ZSTD(1)),
@@ -976,7 +774,8 @@ CREATE MATERIALIZED VIEW {{db}}.service_edges_mv{{on_cluster}} REFRESH EVERY 1 M
 --@cluster (SELECT groupArray((toUInt64OrZero(substring(name, 5)), ctime, extract(value, '^format version: \\d+\ncreate_time: [^\n]*\nsource replica: [^\n]*\nblock_id: [^\n]*\n(?:log_entry_id: [^\n]*\n)?([A-Za-z_]+)\n'), extract(value, '\nsource replica: ([^\n]*)\n'))) FROM (SELECT name, ctime, value FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.3 || '/log', arrayFilter(x -> position(x.1, '.spans/') > 0 AND NOT x.2 AND length(loglen) = 1 AND loglen[1].2 <= 10000, logs)))) LIMIT 10001) SETTINGS max_execution_time = 10) AS logents,
 --@cluster length(logs) = 2 AND arrayAll(x -> x.2 OR (position(x.1, '.spans/') > 0 AND length(loglen) = 1 AND loglen[1].2 <= 10000 AND length(logents) <= 10000), logs) AND arrayCount(n -> n.1 = 'is_lost' AND n.3 = '0', nodes) = 2 AND arrayCount(n -> n.1 = 'queue' AND n.2 <= 1000, nodes) = 2 AS listable,
 --@cluster (SELECT groupArray((position(path, '.service_edges/') > 0, extract(value, '^format version: \\d+\ncreate_time: [^\n]*\nsource replica: [^\n]*\nblock_id: [^\n]*\n(?:log_entry_id: [^\n]*\n)?([A-Za-z_]+)\n'), parseDateTimeBestEffortOrZero(extract(value, '\ncreate_time: ([^\n]*)\n'), serverTimezone()), extract(value, '\n(?:get|attach)\n([^\n]+)'), extract(value, '\nsource replica: ([^\n]*)\n'))) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.1 || if(listable, '/queue', '/log_pointer'), logs))) SETTINGS max_execution_time = 10) AS entries,
---@cluster listable AND arrayCount(e -> e.1, entries) <= 1000 AND arrayCount(e -> NOT e.1, entries) <= 1000 AND arrayAll(e -> NOT e.1 OR e.2 = 'merge', entries) AS edges_ok,
+--@cluster (SELECT groupArray((partition_id, min_block_number, max_block_number)) FROM system.parts WHERE database = '{{db}}' AND table = 'service_edges' AND active AND has(arrayMap(e -> extract(e.4, '^([^_]+)_[0-9]+_[0-9]+_[0-9]+(?:_[0-9]+)?$'), arrayFilter(e -> e.1, entries)), partition_id)) AS local_edges,
+--@cluster listable AND arrayCount(e -> e.1, entries) <= 1000 AND arrayCount(e -> NOT e.1, entries) <= 1000 AND arrayAll(e -> NOT e.1 OR e.2 = 'merge' OR (e.2 IN ('get', 'attach') AND e.5 != '' AND arrayExists(p -> p.1 = extract(e.4, '^([^_]+)_[0-9]+_[0-9]+_[0-9]+(?:_[0-9]+)?$') AND p.2 <= toInt64OrZero(extract(e.4, '^[^_]+_([0-9]+)_')) AND toInt64OrZero(extract(e.4, '^[^_]+_[0-9]+_([0-9]+)_')) <= p.3, local_edges)), entries) AS edges_ok,
 --@cluster (SELECT arraySort(groupArray(minute)) FROM merge('{{db}}', '^service_edges$') FINAL WHERE conn_type = '' AND edges_ok) AS ms,
      ms[arrayFirstIndex(i -> i = length(ms) OR ms[i + 1] - ms[i] != 300, arrayEnumerate(ms))] AS wm,
      toStartOfInterval(now('UTC') - INTERVAL 3 MINUTE, INTERVAL 5 MINUTE) AS ready,
@@ -984,8 +783,8 @@ CREATE MATERIALIZED VIEW {{db}}.service_edges_mv{{on_cluster}} REFRESH EVERY 1 M
      if(wm = 0, if(oldest = 0, ready - INTERVAL 5 MINUTE, oldest), wm + INTERVAL 1 MINUTE) AS lo,
 --@single  least(ready, lo + INTERVAL 5 MINUTE) AS hi,
 --@cluster least(ready, lo + INTERVAL 5 MINUTE) AS hi0,
---@cluster (SELECT groupArray(name) FROM system.parts WHERE database = '{{db}}' AND table = 'spans' AND active AND has(arrayMap(e -> e.4, entries), name)) AS local_named,
---@cluster edges_ok AND arrayAll(x -> x.2 OR arrayAll(e -> e.1 < x.4 OR e.3 = 'merge' OR (e.3 = 'get' AND e.4 != '' AND e.2 >= hi0 + INTERVAL 3 MINUTE + INTERVAL 10 SECOND), logents), logs) AND arrayAll(e -> e.1 OR e.2 = 'merge' OR (e.2 IN ('get', 'attach') AND e.5 != '' AND e.4 != '' AND toUnixTimestamp(e.3) > 0 AND (has(local_named, e.4) OR (e.2 = 'get' AND e.3 >= hi0 + INTERVAL 3 MINUTE + INTERVAL 10 SECOND))), entries) AS caught_up,
+--@cluster (SELECT groupArray((partition_id, min_block_number, max_block_number)) FROM system.parts WHERE database = '{{db}}' AND table = 'spans' AND active AND has(arrayMap(e -> extract(e.4, '^([^_]+)_[0-9]+_[0-9]+_[0-9]+(?:_[0-9]+)?$'), arrayFilter(e -> NOT e.1, entries)), partition_id)) AS local_named,
+--@cluster edges_ok AND arrayAll(x -> x.2 OR arrayAll(e -> e.1 < x.4 OR e.3 = 'merge' OR (e.3 = 'get' AND e.4 != '' AND e.2 >= hi0 + INTERVAL 3 MINUTE + INTERVAL 10 SECOND), logents), logs) AND arrayAll(e -> e.1 OR e.2 = 'merge' OR (e.2 IN ('get', 'attach') AND e.5 != '' AND e.4 != '' AND toUnixTimestamp(e.3) > 0 AND (arrayExists(p -> p.1 = extract(e.4, '^([^_]+)_[0-9]+_[0-9]+_[0-9]+(?:_[0-9]+)?$') AND p.2 <= toInt64OrZero(extract(e.4, '^[^_]+_([0-9]+)_')) AND toInt64OrZero(extract(e.4, '^[^_]+_[0-9]+_([0-9]+)_')) <= p.3, local_named) OR (e.2 = 'get' AND e.3 >= hi0 + INTERVAL 3 MINUTE + INTERVAL 10 SECOND))), entries) AS caught_up,
 --@cluster if(caught_up, hi0, lo) AS hi,
      toInt64(toUnixTimestamp(lo)) * 1000000000 AS slo,
      toInt64(toUnixTimestamp(hi)) * 1000000000 AS shi,
@@ -1016,40 +815,6 @@ HAVING hi > lo)
 ORDER BY conn_type = '', minute, client_minute, client, server, conn_type
 SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_rows_to_read = {{graph_job_max_rows}}, read_overflow_mode = 'throw', max_execution_time = 50,
          max_insert_threads = 1, max_insert_block_size = 100000000, min_insert_block_size_rows = 100000000, min_insert_block_size_bytes = 10000000000;
-
-CREATE MATERIALIZED VIEW {{db}}.trace_error_spans_mv{{on_cluster}} TO {{db}}.trace_error_spans
-AS SELECT
-    toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,
-    trace_id,
-    span_id,
-    timestamp_ns,
-    duration_ns,
-    service,
-    name,
-    kind
-FROM {{db}}.trace_spans
-WHERE status_code = 2;
-
-CREATE MATERIALIZED VIEW {{db}}.trace_recent_mv{{on_cluster}} TO {{db}}.trace_recent
-AS SELECT
-    toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,
-    toUInt32(intDiv(timestamp_ns, 300000000000)) AS bucket,
-    trace_id,
-    max(timestamp_ns) AS ts_max,
-    min(timestamp_ns) AS ts_min
-FROM {{db}}.trace_spans
-GROUP BY
-    date,
-    bucket,
-    trace_id;
-
-CREATE MATERIALIZED VIEW {{db}}.trace_tag_catalog_mv{{on_cluster}} TO {{db}}.trace_tag_catalog
-AS SELECT
-    scope,
-    key,
-    val,
-    val_type
-FROM {{db}}.trace_attrs_idx;
 
 CREATE MATERIALIZED VIEW {{db}}.traces_mv{{on_cluster}} TO {{db}}.traces{{route_suffix}}
 AS SELECT
