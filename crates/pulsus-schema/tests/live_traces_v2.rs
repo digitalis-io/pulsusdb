@@ -1071,9 +1071,11 @@ async fn dropping_a_day_drops_no_rows_of_another() {
     drop_database(&client, db).await;
 }
 
-/// **T-S1.** The columns that hold attribute values are exactly these. The
-/// landing table's six are new to this case, which is why the expected set
-/// is restated here rather than cited.
+/// **T-S1, whole.** Every table of the database that is not a view and not
+/// of the logs or metrics family is one of the ten trace tables, and every
+/// column of theirs whose type can hold text is listed below as holding
+/// attribute values or as not holding them. The columns that hold
+/// attribute values are exactly [`ATTRIBUTE_COLUMNS`].
 #[tokio::test]
 async fn the_attribute_columns_are_exactly_these() {
     skip_unless_live!();
@@ -1082,55 +1084,158 @@ async fn the_attribute_columns_are_exactly_these() {
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
 
-    // Every column of the nine write-path tables whose declared type carries
-    // a JSON value, plus the two text columns that carry attribute values —
-    // `attrs_other` (a protobuf `KeyValueList`) and the catalogs' own value
-    // column.
-    let sql = format!(
-        "SELECT concat(table, '.', name) AS name FROM (\
-           SELECT table, name, type FROM system.columns \
-           WHERE database = '{db}' \
-             AND table IN ('trace_landing', 'spans', 'resources', 'tag_names', 'tag_values', \
-                           'traces', 'error_spans', 'tag_bucket_values', \
-                           'service_bucket_resources') \
-             AND (position(type, 'JSON') > 0 \
-                  OR name IN ('attrs_other', 'scope_attrs_other', 'value', 'tag_value', \
-                              'vals'))\
-         ) ORDER BY name"
-    );
-    let got: BTreeSet<String> = names(&client, &sql).await.into_iter().collect();
-    let want: BTreeSet<String> = [
-        "resources.attrs",
-        "resources.attrs_other",
-        "spans.attrs",
-        "spans.attrs_other",
-        "spans.events",
-        "spans.links",
-        "spans.scope_attrs",
-        // Issue #587 row 3: the scope's own keys whose values no JSON path
-        // can hold. `resources.entity_refs` and
-        // `trace_landing.entity_refs` are deliberately NOT in this set: an
-        // `EntityRef` carries attribute **keys** that must exist in the
-        // resource's attributes, not attribute values.
-        "spans.scope_attrs_other",
-        // Issue #601 part 4b: each 5-minute bucket's span-attribute values.
-        "tag_bucket_values.vals",
-        "tag_values.value",
-        "trace_landing.attrs",
-        "trace_landing.attrs_other",
-        "trace_landing.events",
-        "trace_landing.links",
-        "trace_landing.scope_attrs",
-        "trace_landing.scope_attrs_other",
-        "trace_landing.tag_value",
-    ]
-    .iter()
-    .map(|s| (*s).to_string())
+    let trace_tables: BTreeSet<String> = names(
+        &client,
+        &format!(
+            "SELECT name FROM system.tables WHERE database = '{db}' \
+             AND engine != 'MaterializedView' \
+             AND NOT startsWith(name, 'log_') AND NOT startsWith(name, 'metric_') \
+             ORDER BY name"
+        ),
+    )
+    .await
+    .into_iter()
     .collect();
-    assert_eq!(got, want, "the attribute-bearing columns");
+    let want_tables: BTreeSet<String> = TRACE_TABLES.iter().map(|s| (*s).to_string()).collect();
 
+    let got: BTreeSet<String> = names(
+        &client,
+        &format!(
+            "SELECT concat(table, '.', name) AS name FROM system.columns \
+             WHERE database = '{db}' AND table IN ({}) \
+               AND match(type, 'String|JSON|Map|Tuple|Array|AggregateFunction') \
+             ORDER BY name",
+            trace_tables
+                .iter()
+                .map(|t| format!("'{t}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .await
+    .into_iter()
+    .collect();
+    let attrs: BTreeSet<String> = ATTRIBUTE_COLUMNS.iter().map(|s| (*s).to_string()).collect();
+    let others: BTreeSet<String> = OTHER_TEXT_COLUMNS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let want: BTreeSet<String> = attrs.union(&others).cloned().collect();
+    let unlisted: Vec<&String> = got.difference(&want).collect();
+    let absent: Vec<&String> = want.difference(&got).collect();
     drop_database(&client, db).await;
+
+    assert_eq!(trace_tables, want_tables, "the trace tables");
+    assert!(
+        attrs.is_disjoint(&others),
+        "a column is listed twice: {:?}",
+        attrs.intersection(&others).collect::<Vec<_>>()
+    );
+    assert!(
+        unlisted.is_empty() && absent.is_empty(),
+        "unlisted columns {unlisted:?}; listed but absent {absent:?}"
+    );
 }
+
+/// The ten trace tables: the nine on the write path and `service_edges`.
+const TRACE_TABLES: [&str; 10] = [
+    "error_spans",
+    "resources",
+    "service_bucket_resources",
+    "service_edges",
+    "spans",
+    "tag_bucket_values",
+    "tag_names",
+    "tag_values",
+    "trace_landing",
+    "traces",
+];
+
+/// The columns that hold attribute values.
+const ATTRIBUTE_COLUMNS: [&str; 17] = [
+    "resources.attrs",
+    "resources.attrs_other",
+    "spans.attrs",
+    "spans.attrs_other",
+    "spans.events",
+    "spans.links",
+    "spans.scope_attrs",
+    // Issue #587 row 3: the scope's own keys whose values no JSON path
+    // can hold.
+    "spans.scope_attrs_other",
+    // Issue #601 part 4b: each 5-minute bucket's span-attribute values.
+    "tag_bucket_values.vals",
+    "tag_values.value",
+    "trace_landing.attrs",
+    "trace_landing.attrs_other",
+    "trace_landing.events",
+    "trace_landing.links",
+    "trace_landing.scope_attrs",
+    "trace_landing.scope_attrs_other",
+    "trace_landing.tag_value",
+];
+
+/// Every other text-capable column of the ten tables. `entity_refs`
+/// carries attribute **keys** that must exist in the resource's
+/// attributes, not attribute values.
+const OTHER_TEXT_COLUMNS: [&str; 56] = [
+    "error_spans.name",
+    "error_spans.service",
+    "error_spans.service_type",
+    "error_spans.span_id",
+    "error_spans.status_message",
+    "error_spans.trace_id",
+    "resources.entity_refs",
+    "resources.schema_url",
+    "resources.service",
+    "service_bucket_resources.service",
+    "service_edges.client",
+    "service_edges.conn_type",
+    "service_edges.q",
+    "service_edges.server",
+    "spans.name",
+    "spans.parent_span_id",
+    "spans.scope_name",
+    "spans.scope_schema_url",
+    "spans.scope_version",
+    "spans.service",
+    "spans.service_type",
+    "spans.span_id",
+    "spans.status_message",
+    "spans.trace_id",
+    "spans.trace_state",
+    "tag_bucket_values.key",
+    "tag_bucket_values.scope",
+    "tag_bucket_values.service",
+    "tag_names.key",
+    "tag_names.scope",
+    "tag_values.key",
+    "tag_values.scope",
+    "tag_values.val_type",
+    "trace_landing.entity_refs",
+    "trace_landing.name",
+    "trace_landing.parent_span_id",
+    "trace_landing.schema_url",
+    "trace_landing.scope_name",
+    "trace_landing.scope_schema_url",
+    "trace_landing.scope_version",
+    "trace_landing.service",
+    "trace_landing.service_type",
+    "trace_landing.span_id",
+    "trace_landing.status_message",
+    "trace_landing.tag_key",
+    "trace_landing.tag_scope",
+    "trace_landing.tag_type",
+    "trace_landing.trace_id",
+    "trace_landing.trace_state",
+    "traces.buckets",
+    "traces.end_ns",
+    "traces.last_start_ns",
+    "traces.root",
+    "traces.services",
+    "traces.start_ns",
+    "traces.trace_id",
+];
 
 /// **T-S3b.** The landing table is priced separately from the five retained
 /// ones: `docs/TraceQL/functional-requirements.md` §8.1's bound is over
@@ -1523,4 +1628,174 @@ async fn shape_absent(client: &ChClient, db: &str, name: &str) -> bool {
     )
     .await
         == 0
+}
+
+/// One raw HTTP request to ClickHouse's own interface: the status and the
+/// body, whatever the status is. `ChClient` turns a failed insert into an
+/// error value; the case below is about what the CALLER is told, so it
+/// reads the wire.
+fn clickhouse_http_post(body: &str) -> (u16, String) {
+    use std::io::{Read, Write};
+    let host = std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let http = test_config().http_port;
+    let mut stream = std::net::TcpStream::connect((host.as_str(), http)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("read timeout");
+    let request = format!(
+        "POST / HTTP/1.0\r\nHost: {host}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("write request");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read response");
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no HTTP status in {text:?}"));
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+/// The `Code: <n>` number in a ClickHouse error body.
+fn error_code(body: &str) -> Option<u32> {
+    let at = body.find("Code: ")? + "Code: ".len();
+    body[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// The `docs/schemas.md` paragraph beginning with the failing-view lead,
+/// up to the next blank line, every whitespace run collapsed.
+fn failing_view_paragraph() -> Option<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/schemas.md");
+    let doc = std::fs::read_to_string(&path).expect("read docs/schemas.md");
+    let lead = "**What a failing view leaves behind.**";
+    let mut lines = doc.lines();
+    let first = lines.by_ref().find(|l| l.trim_start().starts_with(lead))?;
+    let mut out = vec![first.to_string()];
+    for l in lines {
+        if l.trim().is_empty() {
+            break;
+        }
+        out.push(l.to_string());
+    }
+    Some(
+        out.join("\n")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// A view that throws on a landing block fails the insert, and
+/// `docs/schemas.md` §4.1 says what the caller is told. Only the outcomes
+/// that held on every one of the design record's 300 trials are asserted
+/// — the status, the code and the throwing view's empty target. The other
+/// targets' counts are printed, never asserted: they vary run to run
+/// (`docs/traceql-schema-migration.md` §6.3).
+#[tokio::test]
+async fn a_throwing_view_fails_the_landing_insert_and_the_documents_say_so() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_throwing_view");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+
+    let second_span = "0000000000000002";
+    exec(
+        &client,
+        &format!(
+            "CREATE TABLE {db}.throw_target (trace_id FixedString(16)) \
+             ENGINE = MergeTree ORDER BY trace_id"
+        ),
+    )
+    .await;
+    exec(
+        &client,
+        &format!(
+            "CREATE MATERIALIZED VIEW {db}.throw_mv TO {db}.throw_target AS \
+             SELECT trace_id FROM {db}.trace_landing \
+             WHERE throwIf(span_id = unhex('{second_span}'), 'a throwing view') = 0"
+        ),
+    )
+    .await;
+
+    // Two kind-0 rows in one statement, so one block: the second throws.
+    let received_ms = now_unix_millis();
+    let start_ns = received_ms * 1_000_000 - 3_600_000_000_000;
+    let insert = format!(
+        "INSERT INTO {db}.trace_landing \
+         (received_ms, row_kind, trace_id, span_id, parent_span_id, start_ns, duration_ns, \
+          resource_id, name, kind, status_code, service, service_type, attrs, scope_attrs) \
+         SELECT {received_ms}, 0, unhex('00000000000000000000000000000560'), \
+          unhex(if(number = 0, '0000000000000001', '{second_span}')), \
+          toFixedString('', 8), {start_ns} + number * 1000, 1000, 1, 'op', 2, 2, 'svc', \
+          'string', CAST('{{}}' AS JSON), CAST('{{}}' AS JSON) \
+         FROM numbers(2)"
+    );
+    let (status, body) = clickhouse_http_post(&insert);
+    let code = error_code(&body);
+
+    let mut printed = Vec::new();
+    for table in ["trace_landing", "spans", "traces", "error_spans"] {
+        let n = count(&client, &format!("SELECT count() AS n FROM {db}.{table}")).await;
+        printed.push(format!("{table}={n}"));
+    }
+    let throw_target = count(
+        &client,
+        &format!("SELECT count() AS n FROM {db}.throw_target"),
+    )
+    .await;
+    eprintln!(
+        "throwing view: status {status}, code {code:?}, {}, throw_target={throw_target}",
+        printed.join(", ")
+    );
+
+    let mut failures = Vec::new();
+    if status != 500 {
+        failures.push(format!("status {status}, expected 500; body {body:?}"));
+    }
+    if code != Some(395) {
+        failures.push(format!("code {code:?}, expected 395; body {body:?}"));
+    }
+    if throw_target != 0 {
+        failures.push(format!(
+            "throw_target holds {throw_target} rows, expected 0"
+        ));
+    }
+    let sentence = format!(
+        "The insert fails: the caller receives `HTTP {status}` with `Code: {code}`,",
+        code = code.unwrap_or(0)
+    );
+    match failing_view_paragraph() {
+        None => failures.push(
+            "docs/schemas.md has no paragraph beginning \
+             `**What a failing view leaves behind.**`"
+                .to_string(),
+        ),
+        Some(p) => {
+            if !p.contains(&sentence) {
+                failures.push(format!(
+                    "the failing-view paragraph does not say {sentence:?}:\n{p}"
+                ));
+            }
+        }
+    }
+
+    drop_database(&client, db).await;
+    assert!(
+        failures.is_empty(),
+        "{} failure(s):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }

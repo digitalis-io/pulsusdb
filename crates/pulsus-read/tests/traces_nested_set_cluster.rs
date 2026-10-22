@@ -3326,6 +3326,92 @@ async fn the_replica_s_own_parts_do_not_hold_the_run() {
     r.drop().await;
 }
 
+/// KC18: a replica's own insert into `service_edges`, queued as a fetch of
+/// a part it holds, does not hold its run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_replica_s_own_marker_does_not_hold_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new_current("kc18").await;
+    let (db, l) = (r.db.clone(), r.l);
+    push_g(&r.s2, l, 0..8).await;
+    exec(&r.s2, "SYSTEM STOP FETCHES service_edges").await;
+    // The seeded marker again, at `ver` 2 so it is a new block.
+    exec(
+        &r.s2,
+        &format!(
+            "INSERT INTO service_edges SELECT {t}, {t}, '', '', '', 0, 0, \
+             arrayReduce('quantilesTDigestState(0.5, 0.95, 0.99)', [toInt64(0)]), 2",
+            t = format_args!("toDateTime({}, 'UTC')", (l - MINUTE) / S)
+        ),
+    )
+    .await;
+    let me = replica_name(&r.s2).await;
+    let active = strings(
+        &r.s2,
+        &format!(
+            "SELECT name AS s FROM system.parts WHERE database = '{db}' \
+             AND table = 'service_edges' AND active ORDER BY name"
+        ),
+    )
+    .await;
+    let q = wait_queue(
+        &r.s2,
+        &db,
+        "service_edges",
+        "KC18: the insert queued",
+        |q| q.len() == 1,
+    )
+    .await;
+    assert!(
+        q[0].kind == "get" && q[0].source == me && active.contains(&q[0].part),
+        "KC18: the one entry is a get from {me} of a part active here: {q:?}, active {active:?}"
+    );
+    r.wait_eligible().await;
+    sync_replica(&r.s2, &db, "spans", "KC18").await;
+    refresh_on(&r.s2, &db, "KC18: ch-shard2's run").await;
+    assert_covers_g(&r.s2, l, "KC18: ch-shard2's run").await;
+    exec(&r.s2, "SYSTEM START FETCHES service_edges").await;
+    r.drop().await;
+}
+
+/// KC19: a replica's own inserts, queued as fetches of parts a local merge
+/// has since covered, do not hold its run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_replica_s_merged_own_parts_do_not_hold_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new_current("kc19").await;
+    let (db, l) = (r.db.clone(), r.l);
+    exec(&r.s2, "SYSTEM STOP FETCHES spans").await;
+    exec(&r.s2, "SYSTEM START MERGES spans").await;
+    push_g(&r.s2, l, 0..8).await;
+    exec(&r.s2, "OPTIMIZE TABLE spans FINAL").await;
+    let me = replica_name(&r.s2).await;
+    let eligible = log_time(&r.s2, (l + 8 * MINUTE) / S).await;
+    let active = active_spans_parts(&r.s2, &db).await;
+    let q = wait_queue(&r.s2, &db, "spans", "KC19: G's entries queued", |q| {
+        q.len() == 8 && q.iter().all(|e| e.kind == "get")
+    })
+    .await;
+    assert_eq!(
+        active.len(),
+        1,
+        "KC19: one active part after the merge: {active:?}"
+    );
+    for e in &q {
+        assert!(
+            e.source == me && !active.contains(&e.part) && e.create_time < eligible,
+            "KC19: every entry is a get from {me} of a part merged away here, created before \
+             {eligible}: {e:?}, active {active:?}"
+        );
+    }
+    r.wait_eligible().await;
+    sync_replica(&r.s2, &db, "service_edges", "KC19").await;
+    refresh_on(&r.s2, &db, "KC19: ch-shard2's run").await;
+    assert_covers_g(&r.s2, l, "KC19: ch-shard2's run").await;
+    exec(&r.s2, "SYSTEM START FETCHES spans").await;
+    r.drop().await;
+}
+
 /// The state KC9 and KC11 share: G on both replicas, its partition detached
 /// and attached again on `ch-shard1` with the queues of `stopped` stopped.
 async fn attach_g(r: &Replicas, stopped: &ChClient, what: &str) {
@@ -3632,7 +3718,21 @@ async fn last_success(client: &ChClient) -> String {
 
 /// LV1: under steady ingest on every node, with merges and fetches running
 /// and every node's job on its schedule, each shard finalizes every interval
-/// within three minutes of its eligibility.
+/// within one scheduled run of catching up with it (issue #602).
+///
+/// **The bound is relative to replication, not to the clock.** A run
+/// finalizes an interval only once its replica holds every span insert made
+/// before the cut-off (`docs/api.md` §4.5), so how soon that happens is the
+/// host's replication speed, which no product statement bounds. For interval
+/// `i` and a shard, `T` is the later of: the first sample at or after the
+/// cut-off at which a replica of the shard passes [`caught_up_sql`]; and the
+/// first sample at which interval `i - 1` was covered on the shard (the load
+/// start for the first interval), because a run finalizes only the oldest
+/// unfinalized interval. The interval must be covered by `T + 60 s + D +
+/// 15 s`: one schedule period, `D` the longest run seen on the shard in
+/// whole seconds rounded up, and 15 s for the gap between a scheduled start
+/// and the statement plus one loop iteration. An interval with no `T`
+/// fails: replication did not catch up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_job_keeps_up_under_steady_ingest() {
     use pulsus_write::{PushHeaders, TraceSink};
@@ -3772,17 +3872,23 @@ async fn the_job_keeps_up_under_steady_ingest() {
     for (_, c) in &nodes {
         last.push(last_success(c).await);
     }
+    // Server seconds throughout: when each interval was covered on each
+    // shard, and when each node first passed the catch-up check for it.
     let mut covered: Vec<[Option<i64>; 2]> = vec![[None, None]; watched.len()];
+    let mut caught: Vec<[Option<i64>; 3]> = vec![[None, None, None]; watched.len()];
+    let mut longest_ms = [0i64; 2];
     let mut lags: Vec<String> = Vec::new();
-    let mut worst_lag = 0;
     let mut queue_samples: Vec<String> = Vec::new();
-    let end_us = watched.last().expect("an interval").1 + 3 * 60 * 1_000_000 + 1_000_000;
+    let start_s = start_us / 1_000_000;
+    let give_up_us = load_end_us + 5 * 60 * 1_000_000;
     loop {
         let now_us = server_now_us(&r.s1).await;
+        let now_s = now_us / 1_000_000;
         if now_us >= load_end_us {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        if now_us >= end_us && now_us >= load_end_us {
+        let all_covered = covered.iter().all(|c| c.iter().all(Option::is_some));
+        if now_us >= load_end_us && (all_covered || now_us >= give_up_us) {
             break;
         }
         let mut sample = format!("{}", (now_us - start_us) / 1_000_000);
@@ -3794,11 +3900,24 @@ async fn the_job_keeps_up_under_steady_ingest() {
             ));
         }
         queue_samples.push(sample);
-        let ends = [prefix_end(&r.s1).await, prefix_end(&r.s2).await];
-        for (i, (_, at_us)) in watched.iter().enumerate() {
+        for (n, (_, c)) in nodes.iter().enumerate() {
+            let check = caught_up(c, &db).await;
+            for (i, (_, at_us)) in watched.iter().enumerate() {
+                let cutoff_s = at_us / 1_000_000 + 10;
+                if caught[i][n].is_none() && now_s >= cutoff_s && check.passes(cutoff_s) {
+                    caught[i][n] = Some(now_s);
+                }
+            }
+        }
+        // Covered on a shard: the largest prefix end over its replicas.
+        let ends = [
+            prefix_end(&r.s1).await.max(prefix_end(&r.s1b).await),
+            prefix_end(&r.s2).await,
+        ];
+        for (i, (b, _)) in watched.iter().enumerate() {
             for shard in 0..2 {
-                if covered[i][shard].is_none() && ends[shard] >= watched[i].0 + 4 * MINUTE {
-                    covered[i][shard] = Some(now_us - at_us);
+                if covered[i][shard].is_none() && ends[shard] >= b + 4 * MINUTE {
+                    covered[i][shard] = Some(now_s);
                 }
             }
         }
@@ -3812,7 +3931,8 @@ async fn the_job_keeps_up_under_steady_ingest() {
                     ends[0]
                 };
                 let lag = newest_eligible(server_now_us(c).await) - end;
-                worst_lag = worst_lag.max(lag);
+                let shard = usize::from(*node == "ch-shard2");
+                longest_ms[shard] = longest_ms[shard].max(last_duration_ms(c).await);
                 lags.push(format!(
                     "{node} at {}: {} s",
                     (now_us - start_us) / 1_000_000,
@@ -3834,7 +3954,8 @@ async fn the_job_keeps_up_under_steady_ingest() {
         println!("  {s}");
     }
     println!("LV1 lag after each completed run: {lags:?}");
-    println!("LV1 intervals {watched:?}, covered after eligibility (us): {covered:?}");
+    println!("LV1 intervals {watched:?}; covered at (server s): {covered:?}");
+    println!("LV1 caught up at (server s, per node): {caught:?}; longest run (ms): {longest_ms:?}");
     assert_eq!(
         failures.load(std::sync::atomic::Ordering::Relaxed),
         0,
@@ -3849,24 +3970,129 @@ async fn the_job_keeps_up_under_steady_ingest() {
             "LV1: writer {k}'s answer p99 is within 10 s: {p99:?} ms"
         );
     }
-    for ((b, _), shards) in watched.iter().zip(&covered) {
-        for (shard, after) in shards.iter().enumerate() {
-            assert!(
-                after.is_some_and(|us| us <= 3 * 60 * 1_000_000),
-                "LV1: the interval at {b} covered on shard {} within 3 min of eligibility: \
-                 {after:?} us",
-                shard + 1
-            );
+    let shard_nodes: [&[usize]; 2] = [&[0, 1], &[2]];
+    let mut under_load = [false; 2];
+    let mut wrong = Vec::new();
+    for (i, ((b, at_us), shards)) in watched.iter().zip(&covered).enumerate() {
+        for (shard, nodes_of) in shard_nodes.iter().enumerate() {
+            let first = nodes_of.iter().filter_map(|&n| caught[i][n]).min();
+            let previous = if i == 0 {
+                Some(start_s)
+            } else {
+                covered[i - 1][shard]
+            };
+            let Some(t) = first.zip(previous).map(|(a, p)| a.max(p)) else {
+                wrong.push(format!(
+                    "the interval at {b} on shard {}: replication did not catch up",
+                    shard + 1
+                ));
+                continue;
+            };
+            under_load[shard] |= t * 1_000_000 < load_end_us;
+            let bound = t + 60 + (longest_ms[shard] + 999) / 1000 + 15;
+            if shards[shard].is_none_or(|c| c > bound) {
+                wrong.push(format!(
+                    "the interval at {b} on shard {}: caught up {} s after eligibility, \
+                     covered {:?}, bound {} s",
+                    shard + 1,
+                    t - at_us / 1_000_000,
+                    shards[shard].map(|c| c - at_us / 1_000_000),
+                    bound - at_us / 1_000_000
+                ));
+            }
         }
     }
     assert!(
-        worst_lag <= 5 * MINUTE,
-        "LV1: the lag after every completed run is at most 5 min: {lags:?}"
+        under_load.iter().all(|&x| x),
+        "LV1: each shard caught up with an interval while the load ran: {under_load:?}"
     );
+    assert!(wrong.is_empty(), "LV1:\n{}", wrong.join("\n"));
     for c in [&r.s1, &r.s1b, &r.s2] {
         stop_edges_view(c).await;
     }
     r.drop().await;
+}
+
+/// One node's replication state, read by [`caught_up_sql`].
+struct CaughtUp {
+    spans_queue: i64,
+    spans_oldest: i64,
+    spans_copied: bool,
+    spans_pulled: i64,
+    edges_holding: i64,
+    edges_queue: i64,
+    edges_copied: bool,
+}
+
+impl CaughtUp {
+    /// Whether this node has caught up with the interval whose cut-off is
+    /// `cutoff_s`: every span insert from before it is here, and nothing in
+    /// `service_edges` but merges and fetches of parts already here waits.
+    /// Stricter than the job (it counts own fetches of merged parts, which
+    /// the job passes), so it can report catch-up late and never early.
+    fn passes(&self, cutoff_s: i64) -> bool {
+        self.spans_queue <= 1000
+            && (self.spans_oldest == 0 || self.spans_oldest >= cutoff_s)
+            && (self.spans_copied || self.spans_pulled >= cutoff_s)
+            && self.edges_holding == 0
+            && self.edges_queue <= 1000
+            && self.edges_copied
+    }
+}
+
+/// The catch-up check LV1 reads on each node once per loop iteration, its
+/// seven fields joined by spaces.
+fn caught_up_sql(db: &str) -> String {
+    format!(
+        "SELECT concat(toString(s.queue_size), ' ', \
+         toString(toUnixTimestamp(s.inserts_oldest_time)), ' ', \
+         toString(s.log_pointer > s.log_max_index OR (s.log_pointer = 0 AND s.log_max_index = 0)), ' ', \
+         toString(toUnixTimestamp(s.last_queue_update)), ' ', \
+         toString(ifNull((SELECT count() FROM system.replication_queue \
+           WHERE database = '{db}' AND table = 'service_edges' AND type != 'MERGE_PARTS' \
+           AND NOT (type IN ('GET_PART', 'ATTACH_PART') AND source_replica != '' \
+           AND new_part_name IN (SELECT name FROM system.parts \
+             WHERE database = '{db}' AND table = 'service_edges' AND active))), 0)), ' ', \
+         toString(e.queue_size), ' ', \
+         toString(e.log_pointer > e.log_max_index OR (e.log_pointer = 0 AND e.log_max_index = 0))) AS s \
+         FROM system.replicas AS s, system.replicas AS e \
+         WHERE s.database = '{db}' AND s.table = 'spans' \
+           AND e.database = '{db}' AND e.table = 'service_edges'"
+    )
+}
+
+/// This node's [`caught_up_sql`] row.
+async fn caught_up(client: &ChClient, db: &str) -> CaughtUp {
+    let row = strings(client, &caught_up_sql(db)).await;
+    let v: Vec<i64> = row
+        .first()
+        .unwrap_or_else(|| panic!("LV1: the catch-up check returned no row on {db}"))
+        .split(' ')
+        .map(|x| x.parse().expect("a number"))
+        .collect();
+    CaughtUp {
+        spans_queue: v[0],
+        spans_oldest: v[1],
+        spans_copied: v[2] == 1,
+        spans_pulled: v[3],
+        edges_holding: v[4],
+        edges_queue: v[5],
+        edges_copied: v[6] == 1,
+    }
+}
+
+/// The node's job's last successful run's duration, in ms; 0 before the
+/// first. The column is `Nullable`, so it is read through `ifNull`.
+async fn last_duration_ms(client: &ChClient) -> i64 {
+    strings(
+        client,
+        "SELECT toString(ifNull(last_success_duration_ms, 0)) AS s FROM system.view_refreshes \
+         WHERE database = currentDatabase() AND view = 'service_edges_mv'",
+    )
+    .await
+    .first()
+    .and_then(|x| x.parse().ok())
+    .unwrap_or(0)
 }
 
 /// One entry of `db.spans`' replication log at or past this node's

@@ -1397,28 +1397,6 @@ struct MetricSampleRow {
     value: f64,
 }
 
-/// The span columns this test writes: every column without a default,
-/// the five attribute arrays empty. The rest take their defaults.
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
-struct SpanInsertRow {
-    trace_id: [u8; 16],
-    span_id: [u8; 8],
-    parent_id: [u8; 8],
-    name: String,
-    service: String,
-    timestamp_ns: i64,
-    duration_ns: i64,
-    status_code: i8,
-    kind: i8,
-    payload_type: i8,
-    payload: String,
-    attr_key: Vec<String>,
-    attr_scope: Vec<String>,
-    attr_val: Vec<String>,
-    attr_type: Vec<String>,
-    attr_num: Vec<Option<f64>>,
-}
-
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SettingRow {
     v: String,
@@ -1426,12 +1404,11 @@ struct SettingRow {
 
 /// Issue #560 criterion 22, clustered: under a user profile that disables
 /// `deduplicate_insert`, a repeated log block and a repeated metric block
-/// are both stored twice — `insert_block`, which the log and metric
-/// writers reach, carries no pin — while the repeated span block sent
-/// with the span inserter's pins is stored once, in the span table and in
-/// both derived tables.
+/// are both stored twice — `insert_block` carries no pin — while the
+/// repeated trace landing block, sent with the writer's pins, is stored once
+/// in `spans`.
 #[tokio::test]
-async fn a_disabling_profile_keeps_repeated_log_and_metric_blocks_and_drops_the_repeated_span_block()
+async fn a_disabling_profile_keeps_repeated_log_and_metric_blocks_and_drops_the_repeated_trace_block()
  {
     skip_unless_live!();
     let shard1 = ChClient::new(shard1_config())
@@ -1443,18 +1420,6 @@ async fn a_disabling_profile_keeps_repeated_log_and_metric_blocks_and_drops_the_
     let db: &str = &TEST_DB_DEDUP_PROFILE;
     let user = format!("{db}_dedup_off");
     fresh_cluster_db(&shard1, db).await;
-    assert_clustered_tables(
-        &shard1,
-        &shard2,
-        db,
-        &[
-            "trace_recent",
-            "trace_recent_dist",
-            "trace_error_spans",
-            "trace_error_spans_dist",
-        ],
-    )
-    .await;
     // Users are local to each node.
     for shard in [&shard1, &shard2] {
         exec_on(shard, &format!("DROP USER IF EXISTS {user}")).await;
@@ -1467,9 +1432,6 @@ async fn a_disabling_profile_keeps_repeated_log_and_metric_blocks_and_drops_the_
         )
         .await;
         exec_on(shard, &format!("GRANT ALL ON {db}.* TO {user}")).await;
-        for table in ["trace_recent", "trace_error_spans"] {
-            exec_on(shard, &format!("SYSTEM STOP MERGES {db}.{table}")).await;
-        }
     }
 
     let mut cfg = shard1_config();
@@ -1493,26 +1455,6 @@ async fn a_disabling_profile_keeps_repeated_log_and_metric_blocks_and_drops_the_
         unix_milli: now / 1_000_000,
         value: 1.0,
     };
-    let mut trace_id = [0u8; 16];
-    trace_id[15] = 1;
-    let span = SpanInsertRow {
-        trace_id,
-        span_id: [0, 0, 0, 0, 0, 0, 0, 1],
-        parent_id: [0; 8],
-        name: "op".to_string(),
-        service: "svc".to_string(),
-        timestamp_ns: now,
-        duration_ns: 1_000,
-        status_code: 2,
-        kind: 2,
-        payload_type: 1,
-        payload: String::new(),
-        attr_key: Vec::new(),
-        attr_scope: Vec::new(),
-        attr_val: Vec::new(),
-        attr_type: Vec::new(),
-        attr_num: Vec::new(),
-    };
     for _ in 0..2 {
         as_user
             .insert_block("log_samples_dist", std::slice::from_ref(&log))
@@ -1532,28 +1474,24 @@ async fn a_disabling_profile_keeps_repeated_log_and_metric_blocks_and_drops_the_
             &format!("SYSTEM FLUSH DISTRIBUTED {db}.metric_samples_dist"),
         )
         .await;
-        as_user
-            .insert_block_with(
-                "trace_spans_dist",
-                std::slice::from_ref(&span),
-                &QuerySettings::deduplicate_through_views(),
-            )
-            .await
-            .expect("insert the span block");
+        push_landing(
+            &as_user,
+            db,
+            &[("00000000000000000000000000000560", "checkout")],
+            1,
+            "{}",
+            "t32-repeated-trace-block",
+        )
+        .await
+        .expect("push the trace landing block");
         exec_on(
             &shard1,
-            &format!("SYSTEM FLUSH DISTRIBUTED {db}.trace_spans_dist"),
+            &format!("SYSTEM FLUSH DISTRIBUTED {db}.spans_dist"),
         )
         .await;
     }
 
-    let tables = [
-        ("log_samples", 2u64),
-        ("metric_samples", 2),
-        ("trace_spans", 1),
-        ("trace_recent", 1),
-        ("trace_error_spans", 1),
-    ];
+    let tables = [("log_samples", 2u64), ("metric_samples", 2), ("spans", 1)];
     let mut counts = vec![0u64; tables.len()];
     for _ in 0..40 {
         for (i, (table, _)) in tables.iter().enumerate() {
@@ -1579,7 +1517,7 @@ async fn a_disabling_profile_keeps_repeated_log_and_metric_blocks_and_drops_the_
             .expect("read the user's setting");
         settings.push(stream.next().await.expect("a row").expect("decode").v);
     }
-    eprintln!("T32 counts log/metric/span/recent/error={counts:?}; settings={settings:?}");
+    eprintln!("T32 counts log/metric/spans={counts:?}; settings={settings:?}");
 
     let mut mismatches: Vec<String> = Vec::new();
     for (i, (table, want)) in tables.iter().enumerate() {
@@ -1596,9 +1534,6 @@ async fn a_disabling_profile_keeps_repeated_log_and_metric_blocks_and_drops_the_
         }
     }
     for shard in [&shard1, &shard2] {
-        for table in ["trace_recent", "trace_error_spans"] {
-            exec_on(shard, &format!("SYSTEM START MERGES {db}.{table}")).await;
-        }
         exec_on(shard, &format!("DROP USER IF EXISTS {user}")).await;
     }
     exec_on(

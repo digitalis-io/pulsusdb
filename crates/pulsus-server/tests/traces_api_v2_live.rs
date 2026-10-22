@@ -5944,9 +5944,8 @@ async fn a_trace_duration_condition_narrows() {
 //   before its first push and keeps them stopped, and every push that
 //   repeats a span carries one span no other push has, so neither the
 //   writer's retry suppression nor block deduplication drops it;
-// * "from totals" truncates `spans` — and the old route's `trace_spans`
-//   and `trace_edges` — before the request, so the answer can only come
-//   from `service_edges`;
+// * "from totals" truncates `spans` before the request, so the answer can
+//   only come from `service_edges`;
 // * a case whose assertion reads a state the job could move stops the
 //   view first ([`stop_edges_view`] waits until it is disabled), and a
 //   case that counts runs counts them per marker, not per helper call.
@@ -6558,11 +6557,9 @@ async fn newest_ready_marker(client: &ChClient) -> i64 {
 }
 
 /// "From totals" (part A §5.2): with no spans, the answer can only come
-/// from `service_edges`. The old route's tables are emptied too.
+/// from `service_edges`.
 async fn drop_the_spans(client: &ChClient) {
-    for table in ["spans", "trace_spans", "trace_edges"] {
-        ch_exec(client, &format!("TRUNCATE TABLE {table}")).await;
-    }
+    ch_exec(client, "TRUNCATE TABLE spans").await;
 }
 
 /// `system.query_log`'s finished statements carrying `id` as
@@ -6808,7 +6805,7 @@ async fn the_service_graph_cap_sets_truncated() {
 }
 
 /// G4: the request is one statement, reading `service_edges` and `spans`
-/// and not `trace_edges`.
+/// and no other table.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_service_graph_is_one_statement() {
     if !should_run() {
@@ -6835,9 +6832,15 @@ async fn the_service_graph_is_one_statement() {
             "G4: the statement reads {want}: {tables}"
         );
     }
+    let others: Vec<&str> = tables
+        .split(',')
+        .filter(|t| {
+            *t != format!("{}.service_edges", db.name()) && *t != format!("{}.spans", db.name())
+        })
+        .collect();
     assert!(
-        !tables.contains("trace_edges"),
-        "G4: the statement does not read trace_edges: {tables}"
+        others.is_empty(),
+        "G4: the statement reads no other table: {others:?}"
     );
 }
 

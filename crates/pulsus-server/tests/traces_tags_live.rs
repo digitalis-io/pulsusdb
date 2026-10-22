@@ -1048,8 +1048,9 @@ async fn tag_discovery_against_real_clickhouse() {
     let ban_sql = format!(
         "SELECT toUInt64(count()) AS n FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
-           AND current_database = '{db}' \
-           AND (has(tables, '{db}.trace_spans') OR has(tables, '{db}.trace_attrs_idx'))"
+           AND current_database = '{db}' AND log_comment != '{settle}' \
+           AND (has(tables, '{db}.spans') OR has(tables, '{db}.error_spans'))",
+        settle = live_db::SETTLE_LOG_COMMENT
     );
     let mut stream = admin
         .query_stream::<CountRow>(&ban_sql, &QuerySettings::new())
@@ -1062,8 +1063,8 @@ async fn tag_discovery_against_real_clickhouse() {
     assert_eq!(
         banned,
         Some(0),
-        "no Select in this run — regardless of its SQL text — may touch trace_spans or \
-         trace_attrs_idx"
+        "no Select in this run — regardless of its SQL text — may touch spans or \
+         error_spans"
     );
 
     drop_db(db).await;
@@ -1207,7 +1208,7 @@ async fn flush_and_count_trace_reads(admin: &ChClient, db: &str) -> u64 {
     let sql = format!(
         "SELECT toUInt64(count()) AS n FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
-           AND arrayExists(t -> startsWith(t, '{db}.trace_') OR t IN ('{db}.tag_names', '{db}.tag_values', '{db}.spans', '{db}.resources', '{db}.traces'), arrayMap(x -> toString(x), tables))"
+           AND arrayExists(t -> t IN ('{db}.trace_landing', '{db}.spans', '{db}.error_spans', '{db}.traces', '{db}.resources', '{db}.tag_names', '{db}.tag_values', '{db}.tag_bucket_values', '{db}.service_bucket_resources', '{db}.service_edges'), arrayMap(x -> toString(x), tables))"
     );
     let mut stream = admin
         .query_stream::<CountRow>(&sql, &QuerySettings::new())
@@ -1263,7 +1264,7 @@ async fn trace_read_rows(admin: &ChClient, db: &str) -> Vec<(String, Vec<String>
         "SELECT query, arraySort(arrayMap(x -> toString(x), tables)) AS tables \
          FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
-           AND arrayExists(t -> startsWith(t, '{db}.trace_') OR t IN ('{db}.tag_names', '{db}.tag_values', '{db}.spans', '{db}.resources', '{db}.traces'), arrayMap(x -> toString(x), tables))"
+           AND arrayExists(t -> t IN ('{db}.trace_landing', '{db}.spans', '{db}.error_spans', '{db}.traces', '{db}.resources', '{db}.tag_names', '{db}.tag_values', '{db}.tag_bucket_values', '{db}.service_bucket_resources', '{db}.service_edges'), arrayMap(x -> toString(x), tables))"
     );
     let mut stream = admin
         .query_stream::<QueryTablesRow>(&sql, &QuerySettings::new())
@@ -2974,9 +2975,8 @@ async fn six_request_classes_read_exactly_these_tables() {
     for shape in [SHAPE_NAMES, SHAPE_CATALOG_VALUES] {
         for tables in shape_rows(&admin, db, shape).await {
             assert!(
-                !tables.iter().any(|t| t.ends_with(".trace_spans")
-                    || t.ends_with(".trace_attrs_idx")
-                    || t.ends_with(".spans")
+                !tables.iter().any(|t| t.ends_with(".spans")
+                    || t.ends_with(".error_spans")
                     || t.ends_with(".resources")
                     || t.ends_with(".traces")),
                 "a catalog-backed class touched a span table: {tables:?}"

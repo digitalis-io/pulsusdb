@@ -378,6 +378,11 @@ pub fn register_push_target(port: u16, db: &str) {
     targets.push((port, db.to_string()));
 }
 
+/// The `log_comment` [`settle_pushed_spans`]'s reads carry, so a query-log
+/// gate can tell the harness's own reads of `spans` from the server's.
+#[allow(dead_code)]
+pub const SETTLE_LOG_COMMENT: &str = "pulsus-test-settle";
+
 /// After a trace push to the server on `port` is acknowledged, waits until
 /// every table its landing block feeds holds the push (issue #624, part
 /// 3d).
@@ -447,7 +452,10 @@ pub fn settle_pushed_spans(port: u16, keys: &[(Vec<u8>, Vec<u8>)], ctx: &str) {
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 loop {
                     let answer = client
-                        .query_strings(&sql, &QuerySettings::new())
+                        .query_strings(
+                            &sql,
+                            &QuerySettings::new().set("log_comment", SETTLE_LOG_COMMENT),
+                        )
                         .await
                         .unwrap_or_else(|e| panic!("{ctx}: {sql}: {e}"))
                         .into_iter()
