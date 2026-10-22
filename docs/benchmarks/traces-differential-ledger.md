@@ -1398,9 +1398,9 @@ when we are asking it to slow down, so we keep `429`; recorded as
   have.
 
 - **How it is gated.** `crates/pulsus-server/src/traces_api/search_response.rs`'s
-  `the_metrics_block_is_the_reference_jobs_pair_on_both_partiality_branches`
+  `the_metrics_block_is_one_completed_job`
   and `every_metrics_key_is_a_tempopb_search_metrics_field` pin the whole
-  object and the key set per branch;
+  object and the key set;
   `crates/pulsus-server/tests/traces_search_live.rs` asserts the real wire
   bytes against `test/fixtures/traces/search_metrics.json`, and
   `e2e/src/traces.rs` feeds the same two committed blocks to the
