@@ -3572,6 +3572,23 @@ mod trace_landing_tests {
         }
     }
 
+    /// **A spooled span row renders its three ids as lowercase hex** and its
+    /// binary carriers as byte counts (issue #602: the audit record the
+    /// deleted span row's own spool test pinned, on the row that replaces
+    /// it).
+    #[test]
+    fn the_trace_landing_spool_record_renders_its_ids_as_hex() {
+        let v = TraceLandingRow::span(7, span_fixture()).to_spool_value();
+        assert_eq!(v["row_kind"], 0);
+        assert_eq!(v["received_ms"], 7);
+        assert_eq!(v["trace_id"], "ab".repeat(16));
+        assert_eq!(v["span_id"], "cd".repeat(8));
+        assert_eq!(v["parent_span_id"], "ef".repeat(8));
+        assert_eq!(v["attrs_other_bytes"], 3);
+        assert_eq!(v["events"], 1);
+        assert_eq!(v["links"], 1);
+    }
+
     fn resource_fixture() -> LandingResource {
         LandingResource {
             resource_id: Fingerprint::from_raw(7),

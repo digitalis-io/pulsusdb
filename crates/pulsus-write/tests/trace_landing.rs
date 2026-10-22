@@ -60,6 +60,9 @@ enum Act {
     Poison,
     /// Never returns, so the block it was handed stays charged.
     Hang,
+    /// The block was sent and its fate is unknown
+    /// ([`ChError::InsertUncertain`]).
+    Uncertain,
 }
 
 /// A scriptable mock [`BlockInserter`], generic over the row type so one
@@ -170,6 +173,7 @@ impl<R: ChRow + Clone> BlockInserter<R> for MockInserter<R> {
                 Act::Ok => Ok(()),
                 Act::Poison => Err(ChError::Decode("mock poison".to_string())),
                 Act::Hang => std::future::pending::<Result<(), ChError>>().await,
+                Act::Uncertain => Err(ChError::InsertUncertain("mock uncertain".to_string())),
             }
         })
     }
@@ -1751,6 +1755,425 @@ fn zipkin_six_spans() -> Vec<u8> {
     format!("[{}]", spans.join(",")).into_bytes()
 }
 
+// -- issue #602: the acknowledgement and the suppression index ----------
+
+/// **A sync push is answered by its landing insert** (issue #602): a
+/// landing insert that fails is the push's error.
+#[tokio::test]
+async fn a_sync_push_is_answered_by_its_landing_insert() {
+    let root = spool_root("answered-by-landing");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Poison);
+    let (writer, _spans, _attrs) = writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+    let (parsed, landed) = decode_both(&six_spans());
+    let answer = writer
+        .admit_flush(parsed, landed, PushHeaders::default())
+        .expect("queue has room")
+        .await;
+    assert!(
+        answer.is_err(),
+        "the failed landing insert is the answer: {answer:?}"
+    );
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **The answer waits for the landing insert**: while it is in flight the
+/// sync push is not answered.
+#[tokio::test]
+async fn a_sync_push_is_not_answered_while_its_landing_insert_is_in_flight() {
+    let root = spool_root("waits-for-landing");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Hang);
+    let (writer, _spans, _attrs) = writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+    let (parsed, landed) = decode_both(&six_spans());
+    let wait = writer
+        .admit_flush(parsed, landed, PushHeaders::default())
+        .expect("queue has room");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), wait)
+            .await
+            .is_err(),
+        "the push was answered before its landing insert ended"
+    );
+    writer.shutdown(Duration::from_millis(50)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **A retry of a push whose landing insert failed is stored**: the claim's
+/// one target is the landing block, so its failure releases the claim.
+#[tokio::test]
+async fn a_retry_of_a_failed_landing_insert_is_stored() {
+    let root = spool_root("retry-after-failure");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Poison);
+    let (writer, _spans, _attrs) = writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+    let (parsed, landed) = decode_both(&six_spans());
+    let _ = writer
+        .admit_flush(parsed.clone(), landed.clone(), PushHeaders::default())
+        .expect("queue has room")
+        .await;
+    settle_until("the first landing block to settle", || {
+        writer.metrics().spool_poison_total == 1
+    })
+    .await;
+    let _ = writer
+        .admit_flush(parsed, landed, PushHeaders::default())
+        .expect("the retry is admitted")
+        .await;
+    assert_eq!(
+        landing.call_count(),
+        2,
+        "the retry queued a second landing block rather than being suppressed"
+    );
+    assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 0);
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **A retry after an insert whose fate is unknown is stored** (issue
+/// #602): the trace block is replay-safe, so an uncertain ending releases
+/// the claim and the client's retry queues a block of its own. With no
+/// resends configured each push makes exactly one attempt.
+#[tokio::test]
+async fn a_retry_after_an_uncertain_landing_insert_is_stored() {
+    let root = spool_root("retry-after-uncertain");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Uncertain);
+    let cfg = WriterConfig {
+        trace_landing_retries: 0,
+        ..Default::default()
+    };
+    let (writer, _spans, _attrs) = writer_ok_old(&cfg, &root, landing.clone());
+    let (parsed, landed) = decode_both(&six_spans());
+    let first = writer
+        .admit_flush(parsed.clone(), landed.clone(), PushHeaders::default())
+        .expect("queue has room")
+        .await;
+    assert!(first.is_err(), "the uncertain insert is the push's error");
+    let second = writer
+        .admit_flush(parsed, landed, PushHeaders::default())
+        .expect("the retry is admitted")
+        .await;
+    assert!(second.is_err());
+    assert_eq!(
+        landing.call_count(),
+        2,
+        "the retry queued a block of its own rather than being answered the first error"
+    );
+    assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 0);
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// -- issue #602: the protections, on the one decode left --------------
+
+/// Posts `req` as OTLP protobuf through the trace route's own handler.
+async fn post_request(
+    writer: &TraceWriter,
+    req: &ExportTraceServiceRequest,
+) -> axum::response::Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        "application/x-protobuf".parse().unwrap(),
+    );
+    pulsus_write::ingest_traces(writer, headers, Body::from(req.encode_to_vec())).await
+}
+
+/// A writer whose per-push and queue ceilings sit far above the case's own
+/// bound, so only the bound under test can refuse.
+fn roomy_writer(root: &Path, landing: Arc<MockInserter<TraceLandingRow>>) -> TraceWriter {
+    let cfg = WriterConfig {
+        batch_bytes: ByteSize(4 << 30),
+        ingest_queue_bytes: ByteSize(16 << 30),
+        ingest_dedup: false,
+        ..Default::default()
+    };
+    writer_ok_old(&cfg, root, landing).0
+}
+
+/// **`T-X1`.** The expansion bound on the trace route flips once, at the span
+/// count derived here from the wire sizes. Each span carries one array
+/// attribute whose single string is 256 KiB; an array is charged at the
+/// JSON-escape worst case, six times its wire bytes, and the resource's
+/// `service.name` twice (its promoted value and the attribute). Each span
+/// row is charged its own size and its copies of the block's text. `N*` is
+/// the smallest span count whose charge exceeds `MAX_EXPANDED_BYTES`.
+#[tokio::test]
+async fn t_x1_the_expansion_bound_flips_once_at_the_derived_span_count() {
+    use opentelemetry_proto::tonic::common::v1::ArrayValue;
+    let attr = KeyValue {
+        key: "a".to_string(),
+        value: Some(AnyValue {
+            value: Some(Value::ArrayValue(ArrayValue {
+                values: vec![AnyValue {
+                    value: Some(Value::StringValue("x".repeat(256 * 1024))),
+                }],
+            })),
+        }),
+        key_strindex: 0,
+    };
+    let service = kv("service.name", "checkout");
+    let fixed = 2 * service.encoded_len();
+    // The array, charged where it is stored, then what the span copies: its
+    // row and name, the rendered service twice, and a resource row with the
+    // resource's attributes.
+    let per_span = 6 * attr.encoded_len()
+        + std::mem::size_of::<pulsus_write::LandingSpan>()
+        + "GET /api".len()
+        + 2 * "checkout".len()
+        + std::mem::size_of::<pulsus_write::LandingResource>()
+        + service.encoded_len();
+    let max = pulsus_write::protocols::otlp_traces::MAX_EXPANDED_BYTES;
+    let n_star = (max - fixed) / per_span + 1;
+    eprintln!("T-X1: N* = {n_star}");
+    let mut seen = Vec::new();
+    for (n, admitted) in [(n_star - 1, true), (n_star, false), (n_star + 1, false)] {
+        let root = spool_root("t-x1");
+        let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
+        let writer = roomy_writer(&root, landing.clone());
+        let spans = (0..n)
+            .map(|_| span_at(0xa1, 0, base_ns(), vec![attr.clone()]))
+            .enumerate()
+            .map(|(i, mut s)| {
+                s.span_id = (i as u64 + 1).to_be_bytes().to_vec();
+                s
+            })
+            .collect();
+        let (status, _h, body) =
+            parts(post_request(&writer, &request_of("checkout", spans)).await).await;
+        seen.push((n, status.as_u16()));
+        if admitted {
+            assert_eq!(status, StatusCode::OK, "N = {n}");
+            settle_until("the admitted push's landing insert", || {
+                landing.call_count() == 1
+            })
+            .await;
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "N = {n}");
+            let (code, message) = decode_status(&body);
+            assert_eq!(code, 3, "N = {n}: google.rpc.Status code");
+            assert!(
+                message.contains("expanded trace row bytes"),
+                "N = {n}: the expansion bound, not another one: {message}"
+            );
+            assert_eq!(landing.call_count(), 0, "N = {n}: nothing stored");
+        }
+        writer.shutdown(Duration::from_secs(5)).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+    eprintln!("T-X1: (N, status) = {seen:?}");
+}
+
+/// **What every span copies is charged once per span** (issue #602). The
+/// landing decode stores a resource's and a scope's attributes once per
+/// block, but every span row carries its own copy of the rendered service
+/// and of the scope, and every span may open a resource row of its own UTC
+/// day — the service, the resource's attributes, its schema url and its
+/// encoded entity references again. Five shapes, each one 1 MiB value and
+/// `N` spans with no attributes of their own: a scope attribute, a resource
+/// attribute, `service.name`, the resource's schema url, and an entity
+/// reference. `N*` is derived from the wire sizes and `size_of`; the bound
+/// flips there.
+#[tokio::test]
+async fn what_every_span_copies_is_charged_once_per_span() {
+    use opentelemetry_proto::tonic::common::v1::{EntityRef, InstrumentationScope};
+    let big = "x".repeat(1024 * 1024);
+    let max = pulsus_write::protocols::otlp_traces::MAX_EXPANDED_BYTES;
+    let span_row = std::mem::size_of::<pulsus_write::LandingSpan>() + "GET /api".len();
+    let resource_row = std::mem::size_of::<pulsus_write::LandingResource>();
+    let mut wrong = Vec::new();
+    for shape in [
+        "scope attribute",
+        "resource attribute",
+        "service.name",
+        "resource schema url",
+        "entity reference",
+    ] {
+        let mut service = "checkout".to_string();
+        let mut resource_extra = None;
+        let mut scope_attr = None;
+        let mut schema_url = String::new();
+        let mut entity_refs = Vec::new();
+        match shape {
+            "scope attribute" => scope_attr = Some(kv("s", &big)),
+            "resource attribute" => resource_extra = Some(kv("r", &big)),
+            "service.name" => service = big.clone(),
+            "resource schema url" => schema_url = big.clone(),
+            _ => entity_refs.push(EntityRef {
+                r#type: big.clone(),
+                ..Default::default()
+            }),
+        }
+        let service_kv = kv("service.name", &service);
+        // A string attribute is charged its wire bytes. Once per block: the
+        // service's promoted value, every resource attribute (`service.name`
+        // among them) and every scope attribute.
+        let resource_attrs =
+            service_kv.encoded_len() + resource_extra.as_ref().map_or(0, |kv| kv.encoded_len());
+        let scope_attrs = scope_attr.as_ref().map_or(0, |kv| kv.encoded_len());
+        let once = service_kv.encoded_len() + resource_attrs + scope_attrs;
+        // The entity references as the resource row stores them: a resource
+        // carrying only that field, encoded.
+        let refs_len = Resource {
+            entity_refs: entity_refs.clone(),
+            ..Default::default()
+        }
+        .encoded_len();
+        // Once per span: its row and name, the service twice (its row's and
+        // its resource row's), the scope's attributes, and a resource row
+        // with the resource's attributes, schema url and entity references.
+        let per_span = span_row
+            + 2 * service.len()
+            + scope_attrs
+            + resource_row
+            + resource_attrs
+            + schema_url.len()
+            + refs_len;
+        let n_star = (max - once) / per_span + 1;
+        eprintln!("{shape}: N* = {n_star}");
+        for (n, admitted) in [(n_star - 1, true), (n_star, false)] {
+            let root = spool_root("copies");
+            let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
+            let writer = roomy_writer(&root, landing.clone());
+            let mut attributes = vec![service_kv.clone()];
+            attributes.extend(resource_extra.clone());
+            let req = ExportTraceServiceRequest {
+                resource_spans: vec![ResourceSpans {
+                    resource: Some(Resource {
+                        attributes,
+                        dropped_attributes_count: 0,
+                        entity_refs: entity_refs.clone(),
+                    }),
+                    scope_spans: vec![ScopeSpans {
+                        scope: Some(InstrumentationScope {
+                            attributes: scope_attr.clone().into_iter().collect(),
+                            ..Default::default()
+                        }),
+                        spans: (0..n)
+                            .map(|i| {
+                                let mut s = span_at(0xa3, 0, base_ns(), Vec::new());
+                                s.span_id = (i as u64 + 1).to_be_bytes().to_vec();
+                                s
+                            })
+                            .collect(),
+                        schema_url: String::new(),
+                    }],
+                    schema_url: schema_url.clone(),
+                }],
+            };
+            let (status, _h, body) = parts(post_request(&writer, &req).await).await;
+            if admitted {
+                if status != StatusCode::OK {
+                    wrong.push(format!("{shape}: N = {n}: {status}, expected 200"));
+                } else {
+                    settle_until("the admitted push's landing insert", || {
+                        landing.call_count() == 1
+                    })
+                    .await;
+                }
+            } else if status != StatusCode::BAD_REQUEST {
+                wrong.push(format!("{shape}: N = {n}: {status}, expected 400"));
+            } else {
+                let (code, message) = decode_status(&body);
+                if code != 3 || !message.contains("expanded trace row bytes") {
+                    wrong.push(format!("{shape}: N = {n}: code {code}, {message}"));
+                }
+                if landing.call_count() != 0 {
+                    wrong.push(format!("{shape}: N = {n}: something was stored"));
+                }
+            }
+            writer.shutdown(Duration::from_secs(5)).await;
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// **`T-X2`.** An attribute nested one level past `MAX_ANYVALUE_DEPTH` is
+/// `400` on the trace route and stores nothing; at the cap it is stored.
+#[tokio::test]
+async fn t_x2_an_attribute_past_the_depth_cap_is_refused_on_the_route() {
+    use opentelemetry_proto::tonic::common::v1::ArrayValue;
+    use pulsus_write::protocols::otlp_depth::MAX_ANYVALUE_DEPTH;
+    let deep = |levels: usize| {
+        let mut value = AnyValue {
+            value: Some(Value::StringValue("leaf".to_string())),
+        };
+        for _ in 1..levels {
+            value = AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue {
+                    values: vec![value],
+                })),
+            };
+        }
+        KeyValue {
+            key: "deep".to_string(),
+            value: Some(value),
+            key_strindex: 0,
+        }
+    };
+    for (levels, admitted) in [(MAX_ANYVALUE_DEPTH, true), (MAX_ANYVALUE_DEPTH + 1, false)] {
+        let root = spool_root("t-x2");
+        let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
+        let writer = roomy_writer(&root, landing.clone());
+        let req = request_of(
+            "checkout",
+            vec![span_at(0xa2, 0x01, base_ns(), vec![deep(levels)])],
+        );
+        let (status, _h, body) = parts(post_request(&writer, &req).await).await;
+        if admitted {
+            assert_eq!(status, StatusCode::OK, "{levels} levels");
+            settle_until("the admitted push's landing insert", || {
+                landing.call_count() == 1
+            })
+            .await;
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{levels} levels");
+            assert_eq!(
+                decode_status(&body).0,
+                3,
+                "{levels} levels: google.rpc.Status code"
+            );
+            assert_eq!(landing.call_count(), 0, "{levels} levels: nothing stored");
+        }
+        writer.shutdown(Duration::from_secs(5)).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// **`T-X5`.** In one push, a span at `2106-02-07T00:00:00Z` is rejected and
+/// one at `2106-02-06T23:59:59Z` is stored: `200` with a partial success of
+/// one rejected span, and one span row in the landing block.
+#[tokio::test]
+async fn t_x5_the_first_day_past_the_domain_is_rejected_and_the_last_second_before_it_stored() {
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceResponse;
+    const FIRST_UNSAFE_DAY_NS: i64 = 49_710 * NS_PER_DAY; // 2106-02-07T00:00:00Z
+    let root = spool_root("t-x5");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
+    let writer = roomy_writer(&root, landing.clone());
+    let req = request_of(
+        "checkout",
+        vec![
+            span_at(0xa5, 0x01, FIRST_UNSAFE_DAY_NS, Vec::new()),
+            span_at(0xa5, 0x02, FIRST_UNSAFE_DAY_NS - 1_000_000_000, Vec::new()),
+        ],
+    );
+    let (status, _h, body) = parts(post_request(&writer, &req).await).await;
+    assert_eq!(status, StatusCode::OK);
+    let response = ExportTraceServiceResponse::decode(body.as_slice()).expect("an OTLP response");
+    let partial = response.partial_success.expect("a partial success");
+    assert_eq!(
+        partial.rejected_spans, 1,
+        "the first unsafe day's span is rejected"
+    );
+    settle_until("the landing insert", || landing.call_count() == 1).await;
+    assert_eq!(
+        count_of_kind(&landing.rows_of(0), 0),
+        1,
+        "one span row is stored"
+    );
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
 // -- the one live observable ------------------------------------------
 
 /// **No landing insert reaches the asynchronous queue.** It is the one
@@ -3230,4 +3653,84 @@ async fn a_trace_block_queued_when_the_drain_begins_is_sent_inside_the_grace() {
         .unwrap_or(0);
     assert_eq!(spooled, 0, "nothing is filed as never sent");
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// **A retry after a server-declared failure is stored once the fault
+/// clears** (issue #602), on one node. A view that throws fails the landing
+/// insert after the block was sent — an uncertain ending — and may leave
+/// some targets committed and others empty. The trace claim is
+/// replay-safe, so the same push sent again in the same process is a new
+/// block, and once the throwing view is gone every target holds the push.
+#[tokio::test]
+async fn a_retry_after_a_throwing_view_is_stored_once_the_fault_clears() {
+    skip_unless_live!();
+    let (client, db) = live_db(pulsus_testkit::test_db(
+        "pulsus_trace_landing_it_retry_throw",
+    ))
+    .await;
+    for sql in [
+        "CREATE TABLE zz_fault (x UInt8) ENGINE = MergeTree ORDER BY x",
+        "CREATE MATERIALIZED VIEW zz_fault_mv TO zz_fault AS \
+         SELECT throwIf(row_kind = 0, 'injected fault') AS x FROM trace_landing",
+    ] {
+        client
+            .execute(sql, &QuerySettings::new(), Idempotency::NonIdempotent)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let writer_client = Arc::new(
+        ChClient::new(ChConnConfig {
+            database: db.clone(),
+            ..live_config()
+        })
+        .await
+        .expect("connect the writer"),
+    );
+    let cfg = WriterConfig {
+        trace_landing_retries: 0,
+        ..Default::default()
+    };
+    let writer =
+        TraceWriter::new_with_tables(writer_client, &cfg, TraceWriterTables::traces_default());
+    let req = six_spans();
+
+    let (parsed, landed) = decode_both(&req);
+    let first = writer
+        .admit_flush(parsed, landed, PushHeaders::default())
+        .expect("admitted")
+        .await;
+    assert!(
+        first.is_err(),
+        "the throwing view fails the push: {first:?}"
+    );
+
+    client
+        .execute(
+            "DROP VIEW zz_fault_mv",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("clear the fault");
+    let (parsed, landed) = decode_both(&req);
+    let second = writer
+        .admit_flush(parsed, landed, PushHeaders::default())
+        .expect("the retry is admitted, not suppressed")
+        .await;
+    assert!(
+        second.is_ok(),
+        "the retry commits once the fault is gone: {second:?}"
+    );
+
+    assert_eq!(
+        live_count(&client, "SELECT count() AS n FROM spans FINAL").await,
+        6
+    );
+    assert_eq!(
+        live_count(&client, "SELECT count() AS n FROM traces FINAL").await,
+        1
+    );
+    assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 0);
+    writer.shutdown(Duration::from_secs(5)).await;
+    drop_live_db(&db).await;
 }

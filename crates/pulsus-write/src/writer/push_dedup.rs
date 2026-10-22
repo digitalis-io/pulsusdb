@@ -412,6 +412,15 @@ fn trace_content_digest(batch: &ParsedTraces) -> PushDigest {
     d.finish()
 }
 
+/// Tests-first stub (issue #602): the landing decode's digest, which the
+/// implementation replaces. Every push digests alike here.
+#[cfg(test)]
+fn trace_content_digest_of_landing(
+    _landing: &crate::ingest::traces::ParsedTraceLanding,
+) -> PushDigest {
+    DigestBuilder::new().finish()
+}
+
 /// Resolves a trace push's identity — see [`log_identity`].
 pub fn trace_identity(batch: &ParsedTraces, headers: &PushHeaders) -> PushIdentity {
     identity_from(trace_content_digest(batch), headers, None)
@@ -1530,6 +1539,12 @@ impl ClaimTicket {
         }
     }
 
+    /// Tests-first stub (issue #602): marks nothing yet.
+    #[allow(dead_code)]
+    pub(crate) fn replay_safe(self) -> Self {
+        self
+    }
+
     /// An inert ticket, for a buffer with no suppression index behind it.
     pub(crate) fn inert() -> Self {
         ClaimTicket::new(None, true)
@@ -1599,6 +1614,385 @@ impl Drop for WaitGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The trace digest reads every float by its bits** (issue #602): two
+    /// NaN payloads, as a scalar, in a typed array and in a mixed array, and
+    /// `-0.0` against `0.0`, are two contents. A text rendering spells every
+    /// NaN the same, so a changed payload would be suppressed as a repeat.
+    #[test]
+    fn the_trace_digest_reads_every_float_by_its_bits() {
+        use crate::ingest::traces::ParsedTraceLanding;
+        use pulsus_clickhouse::json_column::{
+            TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue,
+        };
+        let nan_a = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan_b = f64::from_bits(0x7ff8_0000_0000_0002);
+        assert!(nan_a.is_nan() && nan_b.is_nan());
+        let digest_of = |value: TraceJsonValue| {
+            let mut landing = ParsedTraceLanding::default();
+            landing
+                .resources
+                .push(crate::ingest::traces::LandingResource {
+                    resource_id: Fingerprint::from_raw(1),
+                    day: 1,
+                    service: String::new(),
+                    attrs: TraceJson::from_entries(vec![TraceJsonEntry {
+                        path: "k".to_string(),
+                        value,
+                    }]),
+                    attrs_other: Vec::new(),
+                    dropped_attrs: 0,
+                    schema_url: String::new(),
+                    entity_refs: Vec::new(),
+                });
+            trace_content_digest_of_landing(&landing)
+        };
+        let d = TraceJsonScalar::Double;
+        for (case, a, b) in [
+            (
+                "scalar NaN",
+                TraceJsonValue::Scalar(d(nan_a)),
+                TraceJsonValue::Scalar(d(nan_b)),
+            ),
+            (
+                "typed-array NaN",
+                TraceJsonValue::DoubleArray(vec![nan_a]),
+                TraceJsonValue::DoubleArray(vec![nan_b]),
+            ),
+            (
+                "mixed-array NaN",
+                TraceJsonValue::MixedArray(vec![d(nan_a)]),
+                TraceJsonValue::MixedArray(vec![d(nan_b)]),
+            ),
+            (
+                "signed zero",
+                TraceJsonValue::Scalar(d(-0.0)),
+                TraceJsonValue::Scalar(d(0.0)),
+            ),
+        ] {
+            assert_ne!(digest_of(a), digest_of(b), "{case}");
+        }
+    }
+
+    /// **Every field of the landing decode moves the trace digest** (issue
+    /// #602). A field the digest leaves out makes two different pushes one
+    /// identity, and the second is suppressed and stored nowhere. Each
+    /// struct is destructured with no `..`, so a field added to it fails to
+    /// compile here until it has an edit of its own.
+    #[test]
+    fn every_landing_field_moves_the_trace_digest() {
+        use crate::ingest::traces::{
+            LandingEvent, LandingLink, LandingResource, LandingSpan, ParsedTraceLanding,
+        };
+        use pulsus_clickhouse::json_column::{
+            TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue,
+        };
+        let json = |v: &str| {
+            TraceJson::from_entries(vec![TraceJsonEntry {
+                path: "k".to_string(),
+                value: TraceJsonValue::Scalar(TraceJsonScalar::Str(v.to_string())),
+            }])
+        };
+        let base = ParsedTraceLanding {
+            spans: vec![LandingSpan {
+                trace_id: [1; 16],
+                span_id: [2; 8],
+                parent_span_id: [3; 8],
+                start_ns: 4,
+                duration_ns: 5,
+                resource_id: Fingerprint::from_raw(6),
+                name: "n".into(),
+                kind: 7,
+                status_code: 8,
+                status_message: "m".into(),
+                trace_state: "t".into(),
+                flags: 9,
+                scope_name: "sn".into(),
+                scope_version: "sv".into(),
+                scope_attrs: json("sa"),
+                scope_schema_url: "su".into(),
+                scope_dropped_attrs: 10,
+                scope_attrs_other: vec![11],
+                end_ns: 12,
+                events: vec![LandingEvent {
+                    time_ns: 13,
+                    name: "e".into(),
+                    attrs: json("ea"),
+                    attrs_other: vec![14],
+                    dropped_attrs: 15,
+                }],
+                dropped_events: 16,
+                links: vec![LandingLink {
+                    trace_id: vec![17],
+                    span_id: vec![18],
+                    trace_state: "lt".into(),
+                    flags: 19,
+                    attrs: json("la"),
+                    attrs_other: vec![20],
+                    dropped_attrs: 21,
+                }],
+                dropped_links: 22,
+                service: "s".into(),
+                service_type: "string",
+                attrs: json("a"),
+                attrs_other: vec![23],
+                dropped_attrs: 24,
+            }],
+            resources: vec![LandingResource {
+                resource_id: Fingerprint::from_raw(6),
+                day: 25,
+                service: "s".into(),
+                attrs: json("ra"),
+                attrs_other: vec![26],
+                dropped_attrs: 27,
+                schema_url: "ru".into(),
+                entity_refs: vec![28],
+            }],
+            tag_names: Vec::new(),
+            tag_values: Vec::new(),
+            rejected: 29,
+            rejected_message: Some("r".into()),
+        };
+        type Edit = Box<dyn Fn(&mut ParsedTraceLanding)>;
+        let edits: Vec<(&str, Edit)> = {
+            let LandingSpan {
+                trace_id: _,
+                span_id: _,
+                parent_span_id: _,
+                start_ns: _,
+                duration_ns: _,
+                resource_id: _,
+                name: _,
+                kind: _,
+                status_code: _,
+                status_message: _,
+                trace_state: _,
+                flags: _,
+                scope_name: _,
+                scope_version: _,
+                scope_attrs: _,
+                scope_schema_url: _,
+                scope_dropped_attrs: _,
+                scope_attrs_other: _,
+                end_ns: _,
+                events: _,
+                dropped_events: _,
+                links: _,
+                dropped_links: _,
+                service: _,
+                service_type: _,
+                attrs: _,
+                attrs_other: _,
+                dropped_attrs: _,
+            } = &base.spans[0];
+            let LandingEvent {
+                time_ns: _,
+                name: _,
+                attrs: _,
+                attrs_other: _,
+                dropped_attrs: _,
+            } = &base.spans[0].events[0];
+            let LandingLink {
+                trace_id: _,
+                span_id: _,
+                trace_state: _,
+                flags: _,
+                attrs: _,
+                attrs_other: _,
+                dropped_attrs: _,
+            } = &base.spans[0].links[0];
+            let LandingResource {
+                resource_id: _,
+                day: _,
+                service: _,
+                attrs: _,
+                attrs_other: _,
+                dropped_attrs: _,
+                schema_url: _,
+                entity_refs: _,
+            } = &base.resources[0];
+            let ParsedTraceLanding {
+                spans: _,
+                resources: _,
+                tag_names: _,
+                tag_values: _,
+                rejected: _,
+                rejected_message: _,
+            } = &base;
+            vec![
+                ("span.trace_id", Box::new(|l| l.spans[0].trace_id[0] ^= 1)),
+                ("span.span_id", Box::new(|l| l.spans[0].span_id[0] ^= 1)),
+                (
+                    "span.parent_span_id",
+                    Box::new(|l| l.spans[0].parent_span_id[0] ^= 1),
+                ),
+                ("span.start_ns", Box::new(|l| l.spans[0].start_ns += 1)),
+                (
+                    "span.duration_ns",
+                    Box::new(|l| l.spans[0].duration_ns += 1),
+                ),
+                (
+                    "span.resource_id",
+                    Box::new(|l| l.spans[0].resource_id = Fingerprint::from_raw(99)),
+                ),
+                ("span.name", Box::new(|l| l.spans[0].name.push('x'))),
+                ("span.kind", Box::new(|l| l.spans[0].kind += 1)),
+                (
+                    "span.status_code",
+                    Box::new(|l| l.spans[0].status_code += 1),
+                ),
+                (
+                    "span.status_message",
+                    Box::new(|l| l.spans[0].status_message.push('x')),
+                ),
+                (
+                    "span.trace_state",
+                    Box::new(|l| l.spans[0].trace_state.push('x')),
+                ),
+                ("span.flags", Box::new(|l| l.spans[0].flags += 1)),
+                (
+                    "span.scope_name",
+                    Box::new(|l| l.spans[0].scope_name.push('x')),
+                ),
+                (
+                    "span.scope_version",
+                    Box::new(|l| l.spans[0].scope_version.push('x')),
+                ),
+                (
+                    "span.scope_attrs",
+                    Box::new(move |l| l.spans[0].scope_attrs = json("other")),
+                ),
+                (
+                    "span.scope_schema_url",
+                    Box::new(|l| l.spans[0].scope_schema_url.push('x')),
+                ),
+                (
+                    "span.scope_dropped_attrs",
+                    Box::new(|l| l.spans[0].scope_dropped_attrs += 1),
+                ),
+                (
+                    "span.scope_attrs_other",
+                    Box::new(|l| l.spans[0].scope_attrs_other.push(0)),
+                ),
+                ("span.end_ns", Box::new(|l| l.spans[0].end_ns += 1)),
+                (
+                    "event.time_ns",
+                    Box::new(|l| l.spans[0].events[0].time_ns += 1),
+                ),
+                (
+                    "event.name",
+                    Box::new(|l| l.spans[0].events[0].name.push('x')),
+                ),
+                (
+                    "event.attrs",
+                    Box::new(move |l| l.spans[0].events[0].attrs = json("other")),
+                ),
+                (
+                    "event.attrs_other",
+                    Box::new(|l| l.spans[0].events[0].attrs_other.push(0)),
+                ),
+                (
+                    "event.dropped_attrs",
+                    Box::new(|l| l.spans[0].events[0].dropped_attrs += 1),
+                ),
+                (
+                    "span.dropped_events",
+                    Box::new(|l| l.spans[0].dropped_events += 1),
+                ),
+                (
+                    "link.trace_id",
+                    Box::new(|l| l.spans[0].links[0].trace_id.push(0)),
+                ),
+                (
+                    "link.span_id",
+                    Box::new(|l| l.spans[0].links[0].span_id.push(0)),
+                ),
+                (
+                    "link.trace_state",
+                    Box::new(|l| l.spans[0].links[0].trace_state.push('x')),
+                ),
+                ("link.flags", Box::new(|l| l.spans[0].links[0].flags += 1)),
+                (
+                    "link.attrs",
+                    Box::new(move |l| l.spans[0].links[0].attrs = json("other")),
+                ),
+                (
+                    "link.attrs_other",
+                    Box::new(|l| l.spans[0].links[0].attrs_other.push(0)),
+                ),
+                (
+                    "link.dropped_attrs",
+                    Box::new(|l| l.spans[0].links[0].dropped_attrs += 1),
+                ),
+                (
+                    "span.dropped_links",
+                    Box::new(|l| l.spans[0].dropped_links += 1),
+                ),
+                ("span.service", Box::new(|l| l.spans[0].service.push('x'))),
+                (
+                    "span.service_type",
+                    Box::new(|l| l.spans[0].service_type = "int"),
+                ),
+                (
+                    "span.attrs",
+                    Box::new(move |l| l.spans[0].attrs = json("other")),
+                ),
+                (
+                    "span.attrs_other",
+                    Box::new(|l| l.spans[0].attrs_other.push(0)),
+                ),
+                (
+                    "span.dropped_attrs",
+                    Box::new(|l| l.spans[0].dropped_attrs += 1),
+                ),
+                (
+                    "resource.resource_id",
+                    Box::new(|l| l.resources[0].resource_id = Fingerprint::from_raw(99)),
+                ),
+                ("resource.day", Box::new(|l| l.resources[0].day += 1)),
+                (
+                    "resource.service",
+                    Box::new(|l| l.resources[0].service.push('x')),
+                ),
+                (
+                    "resource.attrs",
+                    Box::new(move |l| l.resources[0].attrs = json("other")),
+                ),
+                (
+                    "resource.attrs_other",
+                    Box::new(|l| l.resources[0].attrs_other.push(0)),
+                ),
+                (
+                    "resource.dropped_attrs",
+                    Box::new(|l| l.resources[0].dropped_attrs += 1),
+                ),
+                (
+                    "resource.schema_url",
+                    Box::new(|l| l.resources[0].schema_url.push('x')),
+                ),
+                (
+                    "resource.entity_refs",
+                    Box::new(|l| l.resources[0].entity_refs.push(0)),
+                ),
+                ("rejected", Box::new(|l| l.rejected += 1)),
+                ("rejected_message", Box::new(|l| l.rejected_message = None)),
+            ]
+        };
+        let digest = trace_content_digest_of_landing(&base);
+        let mut unmoved = Vec::new();
+        for (field, edit) in &edits {
+            let mut changed = base.clone();
+            edit(&mut changed);
+            if trace_content_digest_of_landing(&changed) == digest {
+                unmoved.push(*field);
+            }
+        }
+        assert!(
+            unmoved.is_empty(),
+            "fields the trace digest does not read: {unmoved:?}"
+        );
+        assert_eq!(edits.len(), 48, "one edit per digested field");
+    }
 
     fn index() -> Arc<PushDedup> {
         PushDedup::new(
@@ -1810,6 +2204,77 @@ mod tests {
             matches!(admit(&d, identity(404)), Admission::Admit(_)),
             "and the push that finds nothing is stored"
         );
+    }
+
+    /// **A repeat that arrives while the claim is pending is not admitted,
+    /// and is answered the outcome the claim settles to** (issue #602, the
+    /// retry contract's pending rows). Three originals: one acknowledged
+    /// target settling not-committed (`Released`, `Failed`); the same with a
+    /// replay-safe ticket settling `Uncertain`, the trace writer's case
+    /// (`Released`, `Failed`); and a push with no rows, sealing with zero
+    /// targets (`Released`, `Ok`). In each, a sync repeat waiting on the
+    /// pending claim receives that outcome, an async repeat is answered at
+    /// once, and a repeat after the claim is released is admitted.
+    #[tokio::test]
+    async fn a_repeat_waiting_on_a_pending_claim_is_answered_the_outcome_it_settles_to() {
+        for (case, targets, replay_safe, outcome, told) in [
+            (
+                "not committed",
+                1,
+                false,
+                Some(TargetOutcome::NotCommitted),
+                ClaimOutcome::Failed,
+            ),
+            (
+                "replay-safe uncertain",
+                1,
+                true,
+                Some(TargetOutcome::Uncertain),
+                ClaimOutcome::Failed,
+            ),
+            ("zero targets", 0, false, None, ClaimOutcome::Ok),
+        ] {
+            let d = index();
+            let id = identity(31);
+            let Admission::Admit(mut guard) = admit(&d, id) else {
+                panic!("{case}: the original must admit");
+            };
+            for _ in 0..targets {
+                guard.note_target(true);
+            }
+            let mut ticket = ClaimTicket::new(Some(Arc::clone(&d)), true);
+            if replay_safe {
+                ticket = ticket.replay_safe();
+            }
+            if targets > 0 {
+                ticket.push(id.key);
+            }
+
+            // The repeat arrives while the claim is pending.
+            let Admission::SuppressedPending { guard: wait, rx } = d.admit(id, WaitMode::Register)
+            else {
+                panic!("{case}: a sync repeat on a pending claim must wait");
+            };
+            assert!(
+                matches!(
+                    d.admit(id, WaitMode::None),
+                    Admission::SuppressedSettled(ClaimOutcome::Ok)
+                ),
+                "{case}: an async repeat on a pending claim is answered at once"
+            );
+
+            guard.seal();
+            match outcome {
+                Some(outcome) => ticket.settle(outcome),
+                None => drop(ticket),
+            }
+            assert_eq!(rx.await.unwrap(), told, "{case}: the waiter's answer");
+            drop(wait);
+            assert!(
+                matches!(admit(&d, id), Admission::Admit(_)),
+                "{case}: a repeat after the claim is released is admitted"
+            );
+        }
     }
 
     #[tokio::test]

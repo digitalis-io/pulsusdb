@@ -4872,4 +4872,28 @@ mod landing_tests {
             "one resource, two days"
         );
     }
+
+    /// **The per-block charge an adapter pays is the landing decode's own**
+    /// (issue #602): a block whose landing charge sits below
+    /// [`MAX_EXPANDED_BYTES`] passes both, and one above it fails both. One
+    /// span carrying one array attribute (charged at
+    /// [`MAX_JSON_ESCAPE_FACTOR`]× its wire bytes) at three quarters of the
+    /// budget, then at five quarters of it.
+    #[test]
+    fn the_per_block_charge_gives_the_landing_decodes_verdict() {
+        for (fraction_of_budget, admitted) in [(3usize, true), (5, false)] {
+            let len = MAX_EXPANDED_BYTES / MAX_JSON_ESCAPE_FACTOR * fraction_of_budget / 4 + 1024;
+            let attr = kv("big", array_value(vec![str_value(&"x".repeat(len))]));
+            let req = request_of("checkout", vec![span_of(vec![attr])]);
+            let mut adapter_total = 0usize;
+            let adapter =
+                charge_resource_spans_expansion(&mut adapter_total, &req.resource_spans[0]);
+            let decode = parse_landing(&req, 0);
+            assert_eq!(
+                (adapter.is_ok(), decode.is_ok()),
+                (admitted, admitted),
+                "{fraction_of_budget}/4 of the budget: the adapter charged {adapter_total}"
+            );
+        }
+    }
 }

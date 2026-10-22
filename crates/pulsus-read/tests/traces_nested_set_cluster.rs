@@ -5311,3 +5311,98 @@ async fn the_resource_catalogue_answers_over_two_shards() {
     .await;
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// **A retry after a server-declared failure is stored once the fault
+/// clears, on the cluster** (issue #602). The landing insert goes to shard 1
+/// under its bare name; a view there throws, so the insert fails after the
+/// block was sent. The trace claim is replay-safe, so the same push sent
+/// again through the same writer is a new block, and once the view is gone
+/// every span and trace is readable through the distributed tables.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_after_a_throwing_view_is_stored_once_the_fault_clears_on_the_cluster() {
+    use pulsus_write::{PushHeaders, TraceSink};
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_retry_throw_{}", now_ns()));
+    let bootstrap = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect shard1");
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    run_init(&bootstrap, &cluster_ctx(&db))
+        .await
+        .expect("run_init");
+    let s1 = ChClient::new(shard1_config(&db))
+        .await
+        .expect("connect shard1");
+    exec(
+        &s1,
+        "CREATE TABLE zz_fault (x UInt8) ENGINE = MergeTree ORDER BY x",
+    )
+    .await;
+    exec(
+        &s1,
+        "CREATE MATERIALIZED VIEW zz_fault_mv TO zz_fault AS \
+         SELECT throwIf(row_kind = 0, 'injected fault') AS x FROM trace_landing",
+    )
+    .await;
+
+    let writer = node_writer(shard1_config(&db)).await;
+    let req = load_push(0, 3);
+    let decoded = || {
+        (
+            pulsus_write::parse_traces(&req, now_ns()).expect("the old path parses"),
+            pulsus_write::parse_trace_landing(&req, now_ns()).expect("the landing decode"),
+        )
+    };
+    let (parsed, landing) = decoded();
+    let first = writer
+        .admit_flush(parsed, landing, PushHeaders::default())
+        .expect("admitted")
+        .await;
+    assert!(
+        first.is_err(),
+        "the throwing view fails the push: {first:?}"
+    );
+
+    exec(&s1, "DROP VIEW zz_fault_mv").await;
+    let (parsed, landing) = decoded();
+    let second = writer
+        .admit_flush(parsed, landing, PushHeaders::default())
+        .expect("the retry is admitted, not suppressed")
+        .await;
+    assert!(
+        second.is_ok(),
+        "the retry commits once the fault is gone: {second:?}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let spans = count(
+            &s1,
+            "SELECT count() AS n FROM (SELECT DISTINCT trace_id, span_id, kind FROM spans_dist)",
+        )
+        .await;
+        let traces = count(
+            &s1,
+            "SELECT count() AS n FROM (SELECT DISTINCT trace_id FROM traces_dist)",
+        )
+        .await;
+        if (spans, traces) == (6, 3) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the retried push is readable: {spans} spans, {traces} traces"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    writer.shutdown(Duration::from_secs(5)).await;
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+}
