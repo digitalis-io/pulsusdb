@@ -6,7 +6,7 @@
 //! `regenerate_spans_metrics_goldens` test and review the diff.
 
 use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams};
-use pulsus_read::{SpanFilterCtx, StatementTables, plan_trace_metrics_routed};
+use pulsus_read::{StatementTables, plan_trace_metrics_routed};
 
 /// `(stem, query)`: every golden, over `start = 1791400000`, `end =
 /// 1791410800`, `step = 60s`, `max_series = 1000` and the default budget.
@@ -97,10 +97,6 @@ fn golden(stem: &str, query: &str) -> String {
             floor_ns: i64::MIN,
         },
         &MetricsCtx {
-            filter: SpanFilterCtx {
-                spans_table: "trace_spans",
-                attrs_table: "trace_attrs_idx",
-            },
             scan_budget_rows: 50_000_000,
             max_series: 1_000,
             distributed: false,
@@ -117,12 +113,11 @@ fn golden(stem: &str, query: &str) -> String {
     // A refusal is rendered rather than panicked on, so a case that does
     // not plan fails at the comparison below, naming itself.
     match routed.as_ref().map(|r| r.statement()) {
-        Ok(Some(s)) => format!(
+        Ok(s) => format!(
             "-- case: {stem}\n-- q: {query}\n\n== range ==\n{}\n\n== instant ==\n{}\n",
             s.range_sql(),
             s.instant_sql()
         ),
-        Ok(None) => format!("-- case: {stem}\n-- q: {query}\n-- no statement\n"),
         Err(e) => format!("-- case: {stem}\n-- q: {query}\n-- no statement: refused: {e}\n"),
     }
 }

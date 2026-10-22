@@ -28,7 +28,7 @@
 
 use pulsus_traceql::{ComparisonOp, Intrinsic, Value};
 
-use crate::traces::filter::{PlanError, parse_num, sql_op};
+use crate::traces::sql_text::{PlanError, parse_num, sql_op};
 use crate::traces::values::cmp_f64;
 use crate::traces::window_sql::WindowSql;
 

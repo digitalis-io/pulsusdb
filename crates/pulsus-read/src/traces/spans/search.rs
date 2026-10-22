@@ -1062,7 +1062,7 @@ fn agg_of(
                 )));
             };
             let plain = format!("replaceRegexpOne({text_sql}, '^[+]', '')");
-            let number = crate::traces::filter::anchored_regex_sql(NUMBER_TEXT)?;
+            let number = crate::traces::sql_text::anchored_regex_sql(NUMBER_TEXT)?;
             AggArg::Attr {
                 v: format!(
                     "if(match({text_sql}, {number}) AND isFinite(toFloat64OrZero({plain})), \
@@ -1345,7 +1345,7 @@ fn trace_comparison(expr: &FieldExpr) -> Option<(Intrinsic, ComparisonOp, &Value
     match (lhs.as_ref(), rhs.as_ref()) {
         (field, FieldExpr::Literal(v)) => trace_level(field).map(|i| (i, *op, v)),
         (FieldExpr::Literal(v), field) => {
-            trace_level(field).map(|i| (i, crate::traces::filter::flip_comparison(*op), v))
+            trace_level(field).map(|i| (i, crate::traces::sql_text::flip_comparison(*op), v))
         }
         _ => None,
     }
@@ -1544,8 +1544,8 @@ pub fn plan_statement_sliced(
 }
 
 /// [`decode_search`], charging every retained entry against `budget`
-/// before the allocation it pays for, with today's engine's own charges in
-/// today's order (issue #591 part 3, section 3.2): the trace buffer, then
+/// before the allocation it pays for, with the previous search engine's
+/// charges in its order (issue #591 part 3, section 3.2): the trace buffer, then
 /// per trace its span buffer, per span its attribute buffer and values,
 /// and the trace's root strings. A breach is today's
 /// `QueryTooBroad(ScanBudgetBytes)`; a malformed value a decode error.
@@ -1603,7 +1603,7 @@ pub(crate) fn decode_search_charged(
 }
 
 /// A `by()` key's value from the statement's text and stored type (issue
-/// #592 part 2), as today's engine types it: `Int64`, `Float64` (its group
+/// #592 part 2), as the previous search engine typed it: `Int64`, `Float64` (its group
 /// bits), `Bool` and `String` in their own arms, an array as its elements
 /// (issue #601 part 1), a span without the key the `nil` group, and a
 /// column key, which has no type, its text.
@@ -1643,7 +1643,7 @@ fn group_value_payload(text: &str, value_type: &str) -> Result<usize, String> {
 }
 
 /// [`decode_search_charged`] for a grouped statement (issue #592 part 2),
-/// in today's engine's order:
+/// in the previous search engine's order:
 /// 1. every group of every row goes to `counter`, so a breach is today's
 ///    `TraceSearchSeriesCap` before anything is built;
 /// 2. the flat response, as [`decode_search_charged`] builds it;

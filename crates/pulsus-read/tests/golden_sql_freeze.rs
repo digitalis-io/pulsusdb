@@ -3,509 +3,52 @@
 //! reviewer can check **from the diff**, instead of a claim to be taken on
 //! trust.
 //!
-//! **The problem it solves.** `golden/traces_metrics/*.sql` is the semantic
-//! witness every TraceQL metrics grammar change is measured against; the
-//! `golden/traces_search/` corpus this digest also covered went with #602
-//! part 2c-2b-1. The goldens live in another crate from `Display`, so they
-//! catch a meaning change our own rendering cannot see. Every such change
-//! therefore reports "the SQL goldens take zero edits" — and until now that
-//! sentence was verifiable only by trusting the author's `git status`, or by
-//! re-listing the paths by hand; a reviewer working from a patch had none.
+//! **What it covers.** The two statement corpora: `golden/traces_spans_search/`
+//! (the search statement, issue #590) and `golden/traces_spans_metrics/`
+//! (the metrics statement, issue #596). The previous metrics SQL's corpus,
+//! `golden/traces_metrics/`, and its digest went with that SQL (#602 part
+//! 3a), as the previous search engine's corpus went with it (#602 part
+//! 2c-2b-1).
 //!
-//! **The mechanism.** One digest over the `traces_metrics` corpus — every
-//! file's relative path AND bytes, in sorted path order — pinned as a
+//! **The mechanism.** One digest per corpus — every entry's path relative
+//! to `tests/golden/` AND bytes, in sorted path order — pinned as a
 //! constant in THIS SOURCE FILE, deliberately not beside the data (the
 //! `accept_surface.rs::the_reference_column_is_frozen_against_silent_re_pinning`
 //! posture): a data-only edit fails here, so any golden movement forces a
-//! visible source-line change in the same diff. `PINNED_SQL_CORPUS`
-//! unchanged in a diff therefore MEANS all 28 files are byte-identical —
-//! one line to look at rather than 28.
+//! visible source-line change in the same diff. Each corpus has its own
+//! digest, so no digest moves when only another corpus does.
 //!
-//! The count is asserted separately from the digest so the failure says
+//! The count is asserted separately from the digests so the failure says
 //! which happened: a file added or removed reads differently from a file
 //! edited, and lumping them into one hash tells a reviewer neither.
 //!
 //! **The unit is the DIRECTORY, not the `.sql` files in it** (Stage C
-//! review, [low]). The first cut walked one level and filtered on the
-//! `.sql` extension, so a `README` dropped in, or a golden tucked into a
-//! subdirectory, moved neither the count nor the digest — the claim
-//! "these directories are frozen" was true only of part of them. The
-//! walk is now recursive and digests EVERY entry it finds, whatever its
-//! extension, keyed by its path RELATIVE to `tests/golden/`. Consequences
-//! worth stating because they are the properties being bought: a file
-//! nested one level down has a different relative path and so moves the
-//! digest; a rename — including a move between the two golden
-//! directories — moves it too, because the path is fed before the bytes;
-//! an EMPTY directory moves it, because directories are entries in their
-//! own right (round 3 — a file-only walk digests nothing for one); and a
-//! symlink FAILS rather than being followed, so the digest cannot depend
-//! on bytes outside the corpus and a directory cycle cannot hang the
-//! walk.
+//! review, [low]). The walk is recursive and digests EVERY entry it finds,
+//! whatever its extension. A file nested one level down has a different
+//! relative path and so moves the digest; a rename moves it too, because
+//! the path is fed before the bytes; an EMPTY directory moves it, because
+//! directories are entries in their own right; and a symlink FAILS rather
+//! than being followed, so the digest cannot depend on bytes outside the
+//! corpus and a directory cycle cannot hang the walk.
 //!
 //! **This is not an immutability claim.** These goldens are regenerated
-//! deliberately when the SQL builders change (issue #57's
-//! `regenerate_goldens`); such a change updates this constant in the same
-//! commit, which is the reviewable act. What the freeze denies is a
-//! SILENT edit, and a claim of zero edits that nobody can check.
+//! deliberately when the statement builders change; such a change updates
+//! the corpus's constant in the same commit, which is the reviewable act.
+//! What the freeze denies is a SILENT edit, and a claim of zero edits that
+//! nobody can check.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// `traces_metrics` (#59/#182), `traces_spans_search` (#590) and
-/// `traces_spans_metrics` (#596 part 1): the three byte-frozen SQL corpora, with their committed sizes. The count is of EVERY file in the
-/// directory tree, not of `.sql` files — today the two coincide, and a file
-/// of any other kind appearing is precisely the thing the count should report.
+/// `traces_spans_search` (#590) and `traces_spans_metrics` (#596 part 1):
+/// the two byte-frozen SQL corpora, with their committed sizes. The count
+/// is of EVERY file in the directory tree, not of `.sql` files — today the
+/// two coincide, and a file of any other kind appearing is precisely the
+/// thing the count should report.
 ///
-/// The first is pinned by [`PINNED_SQL_CORPUS`]; the second and third each by
-/// their own, so no digest moves when only another's does.
-const CORPORA: [(&str, usize); 3] = [
-    ("traces_metrics", 28),
-    ("traces_spans_search", 18),
-    ("traces_spans_metrics", 23),
-];
-
-/// A 64-bit rolling digest over every entry, in sorted path order —
-/// FNV-1a's shape with the same mixing constants `accept_surface.rs`
-/// uses, deliberately, so the two change-detectors in this repo are the
-/// same function (its multiplier is not the textbook FNV prime; for a
-/// change-detector that is immaterial, and matching the existing one is
-/// worth more than the name). No new dependency, and the value is
-/// regenerated from the assertion message.
-///
-/// **The record is LENGTH-PREFIXED, not separator-delimited** (Stage C
-/// review round 4). Framing each entry as `kind · len(path) · path ·
-/// len(bytes) · bytes` makes the encoding injective by construction. The
-/// separator form it replaces was ambiguous: with `0x01` between path and
-/// content and `0x00` after, a file named `a\x01b` holding `X` fed
-/// exactly the same bytes as a file named `a` holding `b\x01X` — two
-/// different corpus states, one digest. Escaping `0x01` would have moved
-/// that question to the next byte; a length prefix removes it.
-///
-/// Verified to certify the PRE-change corpus: recomputed independently
-/// over `49cff9a`'s 63 golden blobs — under this encoding — it was
-/// `0xfd4a_e0c5_99df_bc38`, so the constant pinned the goldens as they
-/// stood before issue #335 Stage C, which is what made "Stage C edits
-/// zero SQL goldens" a checkable statement rather than a claim.
-///
-/// **Never update this to make a run go green.** Moving it means one
-/// thing: the frozen SQL corpus was deliberately regenerated, and the
-/// change says which query's output moved and why.
-///
-/// **Moved on issue #351** (owner ruling, 2026-08-05), for ADDITIONS
-/// only: three new `traces_search` cases pin the multi-valued event/link
-/// value read's SQL — `event_name_vs_attr`, `event_name_vs_name_neq`
-/// (the negated form, whose generator must fall back to the time-range
-/// superset because a span with NO events matches `!=`), and
-/// `event_time_since_start_vs_attr` (the numeric member, read from
-/// `val_num`). The corpus went 63 → 66 entries; **no PRE-EXISTING
-/// golden's bytes changed**, which the separate membership assertion
-/// above makes visible — a count that moves by exactly the number of new
-/// files, beside a digest that moves, reads differently from a digest
-/// that moves alone.
-///
-/// Moved a second time in the same issue, after review: the three NEW
-/// goldens were regenerated when the read dropped its
-/// `groupUniqArray(...) GROUP BY` aggregate for a row-per-value
-/// projection (the Layer-1 residual bound in the `traces::exec` module
-/// doc — an array column is row-unbounded by construction). Still only
-/// those three files; the other 63 are byte-identical to `49cff9a`.
-///
-/// **Moved on issue #252**, for THREE separate reasons in one change —
-/// the situation this test's split count/digest reporting exists for:
-///   1. `histogram_over_time_duration.sql` was REGENERATED. The fixed
-///      14-entry cumulative `le` ladder became the reference's log2
-///      tally (`GROUP BY toUInt64(roundToExp2(val - 1)) * 2` under an
-///      outer `WHERE val >= 2`). Only the OUTER select and its trailing
-///      clauses moved; the inner replay-dedup subquery is byte-identical,
-///      which is what keeps the projection/granule gates valid.
-///   2. Two goldens were ADDED — `docs_histogram_worked_example.sql` and
-///      `docs_quantile_worked_example.sql`, the plans of the two queries
-///      docs/api.md §4.4.1 documents, frozen so a documented example
-///      cannot drift into one that no longer plans.
-///   3. One non-`.sql` file was ADDED — `log2_reference_capture.json`,
-///      the byte-committed capture from the pinned Tempo container. The
-///      walk digests EVERY entry, whatever its extension, so it moves
-///      both numbers by design. (Re-captured during review as corpora
-///      were added to hold down the series-ORDER divergence —
-///      `mix1024`, `mix16k`, `mixladder` — and the label-TEXT one —
-///      `expform`. Each time the count stayed at 20, because those
-///      corpora live INSIDE the existing JSON, and only the digest
-///      moved: the split this test's two assertions exist to make
-///      readable.) Its `_provenance.config` sentence was then CORRECTED
-///      in the same issue — it claimed the reference needs a
-///      `metrics_generator` block to answer TraceQL metrics at all,
-///      which an A/B recorded on issue #252 refuted. Its
-///      `_provenance.note` followed in the next review round — it
-///      blamed metrics visibility lag on block completion, where the
-///      same A/B shows the lag is the step's right edge. Digest-only
-///      both times: no captured value moved.
-///
-/// Corpus 66 -> 69 entries; `quantile_over_time_multi.sql` and the other
-/// 65 pre-existing goldens are byte-identical.
-///
-/// 69 -> 75 (issue #458): six ADDED `traces_metrics` goldens —
-/// `nested_set_root_rate`, `nested_set_nonroot_rate`,
-/// `nested_set_constant_true`, `nested_set_constant_false`,
-/// `service_and_nested_set_root` and `bare_attr_truthiness` — for the two
-/// metrics-filter lowerings that issue adds. **No pre-existing golden
-/// moved:** the new lowerings are reached only where the old code
-/// returned `Err`, so `git diff --stat crates/pulsus-read/tests/golden/`
-/// shows additions and nothing else. The digest moves because the corpus
-/// grew, not because any frozen byte changed.
-///
-/// 75 -> 76 (issue #460): ONE added `traces_metrics` golden,
-/// `compare_status_window.sql` — the four-argument
-/// `compare(f, topN, start, end)` the Traces Drilldown Comparison tab
-/// generates. **No pre-existing golden moved, and `compare_status.sql`
-/// specifically did not**: the `(start, end]` conjunct renders only when
-/// the query carries a window, so the one-argument form's `is_sel` string
-/// is byte-identical to before. That byte-identity is the check, not a
-/// hope — `git diff --stat crates/pulsus-read/tests/golden/` shows one
-/// addition and no modification, and this digest would move if it did
-/// not. The digest moves because the corpus grew.
-///
-/// 76 -> 77 (issue #476 Wave B): ONE added `traces_search` golden,
-/// `service_name_cross_type_eq.sql` — the cross-type `=` on
-/// `resource.service.name` that Wave B turns from a planner `400` into an
-/// accepted query matching no span. **No pre-existing golden moved:** the
-/// new lowering is reached only where the old code returned `Err`, so
-/// `git diff --stat crates/pulsus-read/tests/golden/` shows one addition
-/// and no modification. The digest moves because the corpus grew.
-///
-/// 77 -> 77 (issue #479): **7 modified, none added.** The matched-span
-/// projection fuses the matched `val` into the membership read of every
-/// probe whose value a projection needs, so
-/// `SELECT DISTINCT trace_id, span_id` becomes
-/// `SELECT DISTINCT trace_id, span_id, <byte-capped val> AS v` in exactly
-/// the seven `traces_search` goldens whose `phase2 membership` predicate
-/// is not a plain `val = '…'` string equality:
-/// `arith_attr_pushdown.sql`, `arith_fold.sql`,
-/// `clustered_worked_example.sql`, `event_time_since_start_gt.sql`,
-/// `existence_present.sql`, `val_num_range.sql`, `worked_example.sql`.
-/// `existence_absent.sql` (`{ .a = nil }`) is the control and does NOT
-/// move: its membership SQL is byte-identical to `existence_present`'s,
-/// so the SQL alone cannot discriminate them — the negation does, and a
-/// negated leaf projects nothing. `git diff --name-only -- /// crates/pulsus-read/tests/golden/traces_search/` shows exactly those
-/// seven, and `CORPORA`'s count stays `50`.
-///
-/// **Digest-only on issue #477. The corpus stays at 77 entries: all 26
-/// `traces_metrics` goldens were REGENERATED, 0 added, 0 removed**, and
-/// the 50 `traces_search` goldens are byte-identical to the row above
-/// this one (issue #477 moves no search golden; #479 moved seven, and
-/// this row is stacked on that). Three things moved
-/// in every regenerated file at once, which is why the whole corpus half
-/// moves together.
-///
-/// (1) The range bucket label became RIGHT-CLOSED — `toStartOfInterval(
-/// fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL step_ns
-/// NANOSECOND) + step_ms` in place of the left-edge millisecond form — so
-/// a span landing on a grid point belongs to that point. The unit moved to
-/// nanoseconds with the shift, because a millisecond interval rounds a
-/// one-nanosecond shift away before it floors (measured on 26.3.17.110;
-/// `metrics_sql::range_bucket_expr` carries the figures).
-///
-/// (2) The range window widened to `(aS - step, aE]`, rendered as
-/// `>= 1699999920000000001 AND < 1700010840000000001`, one whole step
-/// earlier and one nanosecond later than the instant window.
-///
-/// (3) Two sections were ADDED per file: a `range series probe` (or
-/// `compare range series probe`) beside the frozen instant one, and an
-/// `exemplars` section, since exemplars are now collected by default
-/// rather than only under a `with()` hint.
-///
-/// The `instant (query)`, `series probe` and `compare series probe`
-/// sections are byte-identical to `2f78c53` in all 26 files — the instant
-/// route is #503's and this change moves none of its bytes. **The
-/// committed base copy lives in `tests/golden/traces_metrics_base/`,
-/// which is a SIBLING of the two walked roots and therefore outside this
-/// corpus**: `CORPORA` is a fixed two-name list, so neither the count
-/// (still 50 + 27 = 77) nor this digest can see it. Do not "fix" either
-/// by adding it — that would freeze the base copy and defeat the
-/// section-wise inverse the base copy exists for.
-///
-/// **Digest-only again on issue #477 wave 2. Still 77 entries; two of
-/// the 26 `traces_metrics` goldens moved and no other file did** —
-/// `rate_by_service.sql` and `sum_over_time_by_service.sql`, the two
-/// grouped cases. Their `exemplars` section gained the group column the
-/// grouped range query already groups by (`, service AS g0` in the
-/// SELECT list, `GROUP BY t, g0`, `ORDER BY t ASC, g0`) so an exemplar
-/// row says which series it belongs to. Nothing else in either file
-/// moves, and the other 24 metrics goldens and all 50 search goldens are
-/// byte-identical to the wave-1 corpus.
-///
-/// **Digest-only a third time, on the wave-2 review's ruling. Still 77
-/// entries; six more of the 26 `traces_metrics` goldens moved and no
-/// other file did** — `quantile_over_time_multi.sql`,
-/// `docs_quantile_worked_example.sql`, `histogram_over_time_duration.sql`,
-/// `docs_histogram_worked_example.sql`, `compare_status.sql` and
-/// `compare_status_window.sql` (six files, three shapes). Only their
-/// `exemplars` section moves, and for one reason: those three shapes
-/// frame MANY series per bucket — one per `p`, one per `__bucket`, one
-/// per `(__meta_type, attribute key)` — while their exemplar statement
-/// returned only the time bucket, so the engine had nothing to join on
-/// and attached every sample to the first series. Each statement now
-/// returns its shape's own identity: the sampled span's duration for
-/// quantile, the log2 bucket bound for histogram, `is_sel` + `akey` for
-/// comparison. The other 20 metrics goldens and all 50 search goldens are
-/// byte-identical to the wave-1-fix corpus.
-///
-/// **Digest-only a fourth time, and this one is a REVERT plus a rebase.
-/// Still 77 entries.** Two things moved the number and they are
-/// independent:
-///
-/// (a) Issue #477's own change: the wave-3 pooled placement domain was
-/// withdrawn (the reference compares an exemplar against a distribution
-/// it never draws — ledger row
-/// `traceql-metrics-quantile-exemplar-placement-domain`), so
-/// `quantile_over_time_multi.sql` and `docs_quantile_worked_example.sql`
-/// went BACK to their wave-2-fix bytes: no `quantilesTDigestState` and no
-/// `quantilesTDigestMerge(…) OVER ()`, just the sampled tuple. Those two
-/// files are byte-identical to the wave-2-fix corpus and the other 24
-/// metrics goldens never moved in wave 3 or 4 at all.
-///
-/// (b) The rebase onto issue #479, whose row above this one moved SEVEN
-/// `traces_search` goldens. Issue #477 moves none of them, so the search
-/// half of the corpus is exactly #479's.
-///
-/// Both together are what this constant is over: with (a) alone it would
-/// be the wave-2-fix value, and with (b) alone #479's.
-/// **Moved on issue #492, for ADDITIONS only. 77 -> 83 entries: six
-/// ADDED `traces_search` goldens, and no pre-existing golden moved by one
-/// byte** — `git diff --stat -- crates/pulsus-read/tests/golden/` shows
-/// six additions and no modification, which is what the separate
-/// membership assertion above makes visible: a count that moves by
-/// exactly the number of new files, beside a digest that moves, reads
-/// differently from a digest that moves alone.
-///
-/// The six are the queries issue #492 names, committed so that "wave 1
-/// moves no SQL" is a claim about text a reviewer can diff rather than a
-/// sentence to take on trust: `issue492_attr_eq`,
-/// `issue492_attr_eq_with_max_duration`, `issue492_by_then_count`,
-/// `issue492_count_then_by`, `issue492_select_span_attr` and
-/// `issue492_mixed_source_or`. Two of them were PAIRS whose SQL was
-/// byte-identical below the header — an aggregate that contributed no
-/// SQL, and a pipeline order the SQL cannot see. Part 4 removed the
-/// first of those two identities on purpose; what asserts the pairs now
-/// is `traces_search_sql.rs`'s
-/// `the_pushed_aggregate_pair_differs_and_the_three_control_pairs_do_not`.
-///
-/// **Adding a golden is not moving SQL, but it does move this digest**,
-/// and moving the digest constant is the reviewable act.
-///
-/// **Digest-only on issue #510. The corpus stays at 83 entries: 13
-/// `traces_search` goldens were regenerated, 0 added, 0 removed**, and
-/// every `traces_metrics` golden is byte-identical to the row above.
-/// `git diff --name-only -- crates/pulsus-read/tests/golden/` lists
-/// exactly those 13 files, and
-/// `git diff -- crates/pulsus-read/tests/golden/traces_search/ | grep -E
-/// '^[-+][^-+]' | sort | uniq -c` shows SIX distinct lines and no others:
-/// three `SELECT` projections, each in its before and after form.
-///
-/// One column was added to each of the three attribute VALUE projections
-/// so the response can render a value in the arm the sender stored it as:
-///
-/// ```text
-/// SELECT trace_id, span_id, any(val_num) AS v                     -> …, any(val_type) AS t   (6 occurrences)
-/// SELECT trace_id, span_id, any(<byte-capped val>) AS v           -> …, any(val_type) AS t   (7 occurrences)
-/// SELECT DISTINCT trace_id, span_id, <byte-capped val> AS v       -> …, val_type AS t        (7 occurrences)
-/// ```
-///
-/// **The hot no-value membership read did NOT move.** `SELECT DISTINCT
-/// trace_id, span_id` — the statement every string-equality attribute
-/// condition issues — appears in the corpus unchanged, which is why no
-/// `-SELECT DISTINCT trace_id, span_id` line is in that diff at all. Only
-/// the `with_value` arm of `membership_sql` grew a column, and
-/// `existence_absent.sql` stays byte-identical while
-/// `existence_present.sql` moves, which is the pair that shows the split
-/// is the projection and not the predicate.
-///
-/// No `WHERE` clause, index prefix, date/time clause or `trace_id IN`
-/// restriction moved in any of the 13, so part and granule selection
-/// cannot have moved either —
-/// `traces_search_explain.rs::attr_value_reads_keep_their_index_selection`
-/// gates that as an identity rather than leaving it as this sentence.
-/// **Moved on issue #492 part 4: 83 -> 91 entries, eight ADDED
-/// `traces_search` goldens and ONE existing golden modified.**
-/// `git diff --stat -- crates/pulsus-read/tests/golden/` shows eight new
-/// files and exactly one modification,
-/// `issue492_attr_eq_with_max_duration.sql`, which gained a single line:
-///
-/// ```text
-/// +HAVING max(duration_ns) > 1000000000
-/// ```
-///
-/// That is the whole SQL change in this part. The spanset aggregate of
-/// `{ span.http.method = "GET" } | max(duration) > 1s` now compiles into
-/// the phase-1 generator statement, so the database discards the traces
-/// that do not qualify instead of returning them to be discarded here.
-/// No `WHERE` clause, index prefix, date/time clause, `GROUP BY`,
-/// `ORDER BY` or `LIMIT` moved in any golden, so part and granule
-/// selection cannot have moved either — `traces_search_pushdown_live.rs`'s
-/// `the_pushed_statement_reads_the_same_granules_as_the_unpushed_one`
-/// gates that as an identity against a running database rather than
-/// leaving it as this sentence.
-///
-/// Four of the eight new goldens carry a `HAVING` and four do not; the
-/// four that do not are the refusals, each rendering the statement its
-/// aggregate-free twin renders.
-///
-/// **Moved on issue #557: 45 of the 72 `traces_search` goldens changed
-/// and the other 27 are byte-identical. No file was added or removed**,
-/// so the entry count stays at 99 and
-/// [`the_sql_golden_corpus_has_exactly_its_committed_membership`] is
-/// green at its unchanged `99`.
-///
-/// One change, in two halves. Every `== phase2 membership[i] ==` section
-/// is GONE — the attribute condition no longer sends a statement of its
-/// own — and each of those 45 files' hydration statement gained a `WITH`
-/// clause and one predicate column per condition:
-///
-/// ```text
-/// -== phase2 membership[0] ==
-/// -SELECT DISTINCT trace_id, span_id, <byte-capped val> AS v, val_type AS t
-/// -FROM trace_attrs_idx
-/// -WHERE date >= … AND (key = 'http.status_code' AND val_num >= 500 AND scope = 'span')
-/// -  AND timestamp_ns > … AND trace_id IN (…)
-///
-/// +WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span',
-/// +                     attr_key, attr_scope) AS pi0
-///  SELECT trace_id, span_id, parent_id, …, scope_version,
-/// +       [(pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0)] AS attr_probe,
-/// +       [<byte-capped attr_val[pi0]>] AS attr_probe_val,
-/// +       [attr_type[pi0]] AS attr_probe_type
-///  FROM trace_spans
-/// ```
-///
-/// The 27 that did not move are the queries that plan NO attribute
-/// condition, and they are the check that the empty-probe render is the
-/// pre-#557 statement byte for byte rather than a statement that merely
-/// looks the same.
-///
-/// **2026-09-18, issue #558**: the three aliases quoted in the block
-/// above are what issue #557 rendered and are left as that record. They
-/// are spelled `attr_slot`, `attr_slot_val` and `attr_slot_type` at the
-/// head, because a slot is now a condition's probe, a projected field's
-/// locator or an event/link set's width, and `probe` named only the
-/// first of the three.
-///
-/// The `WHERE` clause, the `ORDER BY`, the `LIMIT … BY trace_id` and the
-/// `trace_id IN` restriction are untouched in all 45: the probe
-/// expressions are projections, so part and granule selection cannot
-/// move — `traces_search_explain.rs`'s
-/// `the_probe_columns_keep_the_hydration_reads_index_selection` gates
-/// that as an identity rather than leaving it as this sentence.
-///
-/// **Moved on issue #559: 99 -> 100 entries. One `traces_metrics` golden
-/// ADDED, 13 `traces_metrics` goldens and 1 `traces_search` golden
-/// MODIFIED, none removed.** The metrics route's attribute condition
-/// stops being a semi-join against `trace_attrs_idx` and becomes the same
-/// locate-then-test column on the span row the search route's hydration
-/// statement already carried, so the two routes answer a span that
-/// repeats a key the same way:
-///
-/// ```text
-/// -  AND (trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx
-/// -      WHERE date >= … AND timestamp_ns >= … AND key = 'http.status_code'
-/// -        AND val_num >= 500 AND scope = 'span')
-///
-/// +WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span',
-/// +                     attr_key, attr_scope) AS pi0
-///  SELECT …
-///  FROM trace_spans
-///  WHERE timestamp_ns >= … AND timestamp_ns < …
-/// +  AND ((pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0))
-/// ```
-///
-/// The 13 metrics stems are every case whose filter carries an attribute
-/// condition; the 14 that do not are byte-identical, which is the check
-/// that the no-locator render is the pre-#559 statement rather than a
-/// statement that merely looks like it. The one search golden is
-/// `spanset_by_service.sql`, whose `== by() cardinality probe ==` section
-/// is built by `metrics_sql::compile_filter_bool`: it counts the spans a
-/// `| by()` search would return, so leaving it on the index would make
-/// the preflight disagree with the search it guards.
-///
-/// The added file is `traces_metrics/compare_outer_attr.sql`, the one
-/// shape whose outer filter and selection predicate both declare
-/// locators into a single statement (`pi0` and `cpi0`).
-///
-/// No `PREWHERE`, `GROUP BY`, `ORDER BY`, `LIMIT` or window bound moved
-/// in any of the 14 modified files — the `WITH` item is a declaration and
-/// the test replaces one `WHERE` conjunct with another. Part and granule
-/// selection DOES move for a filter carrying an attribute condition,
-/// because `service_time` does not hold the attribute arrays; that is
-/// gated as an identity by `traces_metrics_explain.rs`'s
-/// `metrics_attribute_filter_projection_loss_is_recorded` and recorded in
-/// the differential ledger, not left as this sentence.
-///
-/// **Moved on issue #560: 100 -> 103 entries. Three `traces_search`
-/// goldens ADDED (`empty_selector`, `status_neq_error`, `status_eq_ok`)
-/// and ten MODIFIED, none removed.** Only the phase-1 generator section
-/// moves. The time-range superset reads the recency table instead of
-/// scanning the span table (eight goldens: `child_count`,
-/// `event_name_vs_name_neq`, `existence_absent`, `negated_attr`,
-/// `nested_set_root`, `root_service_eq`, `service_name_cross_type_eq`,
-/// `trace_duration`), and `{ status = error }` reads the error-span table
-/// (`status_only`, `structural_descendant`):
-///
-/// ```text
-/// -SELECT trace_id, max(timestamp_ns) AS bound_ts
-/// -FROM trace_spans
-/// -WHERE timestamp_ns > … AND timestamp_ns <= …
-/// +SELECT trace_id, toInt64(max(ts_max)) AS bound_ts
-/// +FROM trace_recent
-/// +WHERE date >= toDate('…') AND date <= toDate('…')
-/// +  AND bucket >= … AND bucket <= …
-/// +  AND ts_max > … AND ts_min <= …
-///
-///  SELECT trace_id, max(timestamp_ns) AS bound_ts
-/// -FROM trace_spans
-/// -WHERE timestamp_ns > … AND timestamp_ns <= …
-/// -  AND (status_code = 2)
-/// +FROM trace_error_spans
-/// +WHERE date >= toDate('…') AND date <= toDate('…')
-/// +  AND timestamp_ns > … AND timestamp_ns <= …
-/// ```
-///
-/// No phase-2 statement moved in any of the thirteen.
-///
-/// **Moved on issue #583: 75 `traces_search` files MODIFIED, 0 added, 0
-/// removed, and no `traces_metrics` file touched.** Requirement R9 gives
-/// every request window one rule, `start <= ts < end`, so the search
-/// window's operators move and nothing else does — 164 lines across the
-/// 75 files, and no third kind of line:
-///
-/// ```text
-/// -WHERE timestamp_ns > <s> AND timestamp_ns <= <e>        155 lines
-/// +WHERE timestamp_ns >= <s> AND timestamp_ns < <e>
-///
-/// -  AND ts_max > <s> AND ts_min <= <e>                      9 lines
-/// +  AND ts_max >= <s> AND ts_min <= <e - 1>
-/// ```
-///
-/// The `ts_min` literal is the only moved NUMBER: the recency row bound
-/// is rendered from the window's last included nanosecond, which is
-/// `end_ns - 1` under the new convention. Every window in this corpus
-/// starts and ends mid-day, so no day literal and no bucket literal
-/// moves. `compare()`'s selection window is **not** a request window and
-/// keeps the reference's `(start, end]`, which is why
-/// `traces_metrics/compare_status_window.sql` is unchanged and the
-/// `traces_metrics` corpus contributes nothing to this value.
-///
-/// **Moved on issue #602 part 2c-2b-1: 103 -> 28 entries, 75 `traces_search`
-/// files and nothing else removed.** That corpus was the previous search
-/// engine's, deleted with its tests; the digest now covers `traces_metrics`
-/// alone, and no `traces_metrics` file moved. The suites the entries above
-/// name as gates over that corpus went with it.
-///
-/// **Moved on issue #601 part 2: 27 `traces_metrics` files MODIFIED, 0
-/// added, 0 removed, 38 lines, every one in an instant section or an
-/// instant series probe.** The instant form reads exactly the requested
-/// window instead of the window snapped to the step, and these cases ask
-/// for an unaligned one (`1700000000` is not a multiple of 60 s), so the
-/// instant bounds, their day literals and the instant `rate` divisor
-/// (10,860 s → 10,800 s) move. No range section moves.
-const PINNED_SQL_CORPUS: u64 = 0x4c64_a9dc_2a57_af5c;
+/// Each is pinned by its own digest, so no digest moves when only
+/// another's does.
+const CORPORA: [(&str, usize); 2] = [("traces_spans_search", 18), ("traces_spans_metrics", 23)];
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -637,10 +180,7 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
         );
         total += entries.len();
     }
-    assert_eq!(
-        total, 69,
-        "the frozen SQL corpus is 28 + 18 + 23 = 69 entries"
-    );
+    assert_eq!(total, 41, "the frozen SQL corpus is 18 + 23 = 41 entries");
 }
 
 /// The search statement's eighteen goldens: issue #590's seven —
@@ -681,24 +221,10 @@ const PINNED_SPANS_SEARCH_CORPUS: u64 = 0x12e3_5061_8645_68f2;
 /// part 4c, whose key array or attribute target is computed inside the read
 /// that keeps one row per span identity — a count and a rate have no such
 /// read, and a statement with neither reads no value through it), each the
-/// range and instant forms of one request of
-/// `crates/pulsus-read/src/traces/spans/metrics.rs`'s `metrics_statement`,
-/// under [`corpus_digest`]'s encoding.
+/// range and instant forms of one request's statement, rendered by
+/// `crates/pulsus-read/src/traces/spans/metrics.rs`'s
+/// `plan_trace_metrics_routed`, under [`corpus_digest`]'s encoding.
 const PINNED_SPANS_METRICS_CORPUS: u64 = 0x3032_bb57_79ec_d2c5;
-
-#[test]
-fn the_sql_golden_corpus_matches_its_committed_digest() {
-    let h = corpus_digest(&["traces_metrics"]);
-    assert_eq!(
-        h, PINNED_SQL_CORPUS,
-        "the 28 frozen `traces_metrics` SQL goldens changed. This is \
-         not a constant to refresh: it means the \
-         planner's or the SQL builders' output moved. If that was deliberate, regenerate the \
-         goldens, say in the notes which query's SQL changed and why, and update \
-         PINNED_SQL_CORPUS to {h:#x} in the same change — that edit is what makes 'zero SQL \
-         golden edits' checkable from a diff"
-    );
-}
 
 #[test]
 fn the_search_statement_golden_corpus_matches_its_committed_digest() {
@@ -716,7 +242,7 @@ fn the_metrics_statement_golden_corpus_matches_its_committed_digest() {
     let h = corpus_digest(&["traces_spans_metrics"]);
     assert_eq!(
         h, PINNED_SPANS_METRICS_CORPUS,
-        "the 23 metrics statement goldens changed: `metrics_statement`'s output moved. If that \
+        "the 23 metrics statement goldens changed: the metrics statement's output moved. If that \
          was deliberate, regenerate them, say which statement changed and why, and update \
          PINNED_SPANS_METRICS_CORPUS to {h:#x} in the same change"
     );
@@ -795,18 +321,7 @@ fn golden_root() -> PathBuf {
 /// The committed goldens that carry a join today, none of which the
 /// compile core plans. The list is asserted as an EQUALITY, not used as
 /// a skip list: a join in any file it does not name fails this test.
-const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 50] = [
-    "traces_graph/clustered_local_join.sql",
-    "traces_graph/single_node.sql",
-    // Issue #559 added this comparison golden; a comparison cross-tab
-    // joins the attribute enumeration onto the span rows, which is the
-    // same shape the two `compare_status*` goldens already carry and
-    // which this change does not touch.
-    "traces_metrics/compare_outer_attr.sql",
-    "traces_metrics/compare_status.sql",
-    "traces_metrics/compare_status_window.sql",
-    "traces_metrics_base/compare_status.sql",
-    "traces_metrics_base/compare_status_window.sql",
+const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 43] = [
     // Issue #599: the service graph's statement pairs a raw region's
     // spans by `ARRAY JOIN` over each key's server halves, an array of the
     // grouped row itself; built by `spans::graph::spans_graph_sql`, which
@@ -816,7 +331,7 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 50] = [
     // Issue #596 part 1: the metrics statement's `ARRAY JOIN` expands a
     // series' cells, or a bucket's quantiles, into rows — an array of the
     // row itself, not a second table. It is the design's own statement,
-    // built by `spans::metrics::metrics_statement`, which the compile core
+    // built by `spans::metrics::plan_trace_metrics_routed`, which the compile core
     // does not plan; every one of its goldens carries one, and part
     // 2's per-trace, numbering and child-count reads are `LEFT JOIN`s.
     "traces_spans_metrics/arithmetic.sql",
@@ -891,70 +406,25 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 50] = [
 /// added on 2026-09-02 is written without that qualifier — "no emitted
 /// SQL may contain a join until this ADR is amended to name the clause"
 /// (`docs/decisions/0008-sql-composition-for-lowered-pipelines.md:201`,
-/// the same claim in the summary at line 11). The committed goldens in the
-/// table below carry a join and **none is planned by the compile core**:
-///
-/// ```text
-/// file                                           emitted by                        current?
-/// traces_graph/clustered_local_join.sql          service_graph_sql                 no route
-/// traces_graph/single_node.sql                   (graph_sql.rs:92, INNER JOIN      since #599
-///                                                at 109) — one join line each
-/// traces_spans_graph/clustered.sql               spans_graph_sql                   current
-/// traces_spans_graph/single_node.sql             (spans/graph.rs) — one ARRAY
-///                                                JOIN line each
-/// traces_metrics/compare_outer_attr.sql          metrics_compare_sql               current
-/// traces_metrics/compare_status.sql              (metrics_sql.rs:1313, LEFT JOIN
-/// traces_metrics/compare_status_window.sql       at 1385 and INNER JOIN at 1389)
-///                                                for six of the seven join lines
-///                                                in each file, and
-///                                                metrics_compare_exemplar_range_
-///                                                sql (metrics_sql.rs:1512, INNER
-///                                                JOIN at 1562) for the seventh
-/// traces_metrics_base/compare_status.sql         metrics_compare_sql AS IT STOOD   HISTORIC
-/// traces_metrics_base/compare_status_window.sql  AT 2f78c53 — four join lines,
-///                                                no exemplars section, so the
-///                                                exemplar builder contributes
-///                                                nothing to these two
-/// ```
-///
-/// The two `traces_metrics_base/` files are the pre-#477 copies: each is
-/// byte-identical to `git show 2f78c53:crates/pulsus-read/tests/golden/
-/// traces_metrics/<same name>`, and no test regenerates them.
-///
-/// **Since issue #559 nothing ties those two files to today's builder,
-/// and that is a loss, stated rather than glossed.** Until then
-/// `every_instant_side_section_is_byte_identical_to_base` and
-/// `the_declared_inverse_restores_every_moved_section_to_its_base_bytes`
-/// (`tests/traces_metrics_sql.rs`) held the comparison sections against
-/// the current file's. Issue #559 moves the metrics attribute filter onto
-/// the span row, so both comparison cases' statements move on both axes —
-/// which is the change — and both cases left those two tests' domain.
-/// `traces_metrics_base/` is not in `CORPORA`, so the digest above does
-/// not reach it either: **nothing pins those two files' bytes**, and this
-/// list is the record that they exist and why.
-///
-/// All of them come from hand-written builders on routes the compile core
-/// classifies `Never` — `NotASearchLinkLower::capability`
-/// (in the previous search engine's `traces/compile.rs`, deleted by #602 part 2c-2b-2) — so they are
-/// not lowered pipelines and the decision never reached them.
-/// `spans_graph_sql` is called from `TraceEngine::service_graph` and
-/// nowhere else, and since issue #599 no route calls `service_graph_sql`;
-/// `metrics_compare_sql` and `metrics_compare_exemplar_range_sql`
-/// only at `traces/metrics_plan.rs:626/638/650/665`. The sentence
-/// reaches further than the decision it records: a drafting fault in the
-/// record, not shipped code breaking a rule. **The wording belongs to
-/// the amendment round ADR 0008 already reserves.** This test enforced
-/// the rule the ADR can mean — zero joins in the compiled search corpus —
-/// until #602 part 2c-2b-1 deleted that corpus; it now pins the join files
-/// by name, so a join in any other file fails; `docs/query-lowering.md`
-/// §9.8 carries the same record.
+/// the same claim in the summary at line 11). The committed goldens named
+/// above carry a join and **none is planned by the compile core**: each
+/// is a statement of `spans/graph.rs`, `spans/metrics.rs` or
+/// `spans/search.rs`, hand-written builders that are not lowered
+/// pipelines, so the decision never reached them. The previous metrics and
+/// graph SQL's goldens, which carried joins too, went with that SQL (#602
+/// part 3a). The sentence reaches further than the decision it records: a
+/// drafting fault in the record, not shipped code breaking a rule. **The
+/// wording belongs to the amendment round ADR 0008 already reserves.**
+/// This test enforced the rule the ADR can mean — zero joins in the
+/// compiled search corpus — until #602 part 2c-2b-1 deleted that corpus;
+/// it now pins the join files by name, so a join in any other file fails;
+/// `docs/query-lowering.md` §9.8 carries the same record.
 ///
 /// # Why this walks the golden root and not `CORPORA`
 ///
-/// Written over `CORPORA` this gate would be red on day one:
-/// `traces_metrics/` holds some of the join files, and others sit in
-/// `traces_metrics_base/`, which is not in `CORPORA` at all, so the
-/// digest gate above cannot see them either.
+/// Written over `CORPORA` this gate could not see two of the join files:
+/// `traces_spans_graph/` is not in `CORPORA`, so the digest gates above
+/// do not reach it either.
 ///
 /// # Where this stops
 ///
@@ -1005,7 +475,7 @@ fn every_join_in_the_golden_corpus_is_named() {
          any other file means a builder grew one and nobody said so"
     );
     assert_eq!(
-        scanned, 98,
+        scanned, 43,
         "every committed SQL golden in the tree is scanned, not only the two frozen corpora"
     );
 }

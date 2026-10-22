@@ -1030,9 +1030,9 @@ pub fn assert_reference_instance_is_free_of(api_base: &str, trace_hex: &str, own
 /// ```text
 ///   1  crates/pulsus-read/tests/compare_arity_differential.rs  <- covered (#559)
 ///   1  crates/pulsus-read/tests/query_log_gates.rs            <- covered
-///   3  crates/pulsus-read/tests/traces_metrics_explain.rs     <- covered (#559)
-///   2  crates/pulsus-read/tests/traces_metrics_live.rs        <- covered (#559)
-///   1  crates/pulsus-read/tests/traces_metrics_nested_set_live.rs <- covered (#559)
+///   3  crates/pulsus-read/tests/traces_metrics_explain.rs     <- covered (#559); went (#602 part 3a)
+///   2  crates/pulsus-read/tests/traces_metrics_live.rs        <- covered (#559); went (#602 part 3a)
+///   1  crates/pulsus-read/tests/traces_metrics_nested_set_live.rs <- covered (#559); went (#602 part 3a)
 ///   7  crates/pulsus-read/tests/traces_search_explain.rs      <- covered
 ///   6  crates/pulsus-read/tests/traces_search_pushdown_live.rs <- covered
 ///   1  crates/pulsus-read/tests/traces_tags_explain.rs
@@ -1044,11 +1044,9 @@ pub fn assert_reference_instance_is_free_of(api_base: &str, trace_hex: &str, own
 /// **Issue #559 brought the four metrics-route fixtures under it**, and
 /// not for tidiness: that change moved the metrics attribute filter onto
 /// the span row, so a fixture seeding only the index answers `0` to every
-/// attribute query. Measured before the fixtures were fixed,
-/// `traces_metrics_live::metrics_internal_consistency_identities` returned
-/// `0` against an expected `30`, and
-/// `traces_metrics_nested_set_live::nested_set_and_bare_truthiness_answers_match_the_seeded_corpus`
-/// returned `0.0` against `300.0`.
+/// attribute query. Measured before the fixtures were fixed, two tests of
+/// suites that went with the previous metrics SQL (#602 part 3a) returned
+/// `0` against an expected `30` and `0.0` against `300.0`.
 ///
 /// **The uncovered classes are now two**: the trace-tags fixtures
 /// (`traces_tags_explain.rs`) and the schema live suite

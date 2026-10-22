@@ -224,11 +224,6 @@ async fn count(client: &ChClient, sql: &str) -> u64 {
 fn config() -> pulsus_read::TraceReadConfig {
     pulsus_read::TraceReadConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
-        spans_table: "trace_spans_dist".to_string(),
-        attrs_table: "trace_attrs_idx_dist".to_string(),
-        edges_table: "trace_edges_dist".to_string(),
-        recent_table: "trace_recent_dist".to_string(),
-        errors_table: "trace_error_spans_dist".to_string(),
         spans_v2_table: "spans_dist".to_string(),
         error_spans_table: "error_spans_dist".to_string(),
         traces_table: "traces_dist".to_string(),
@@ -542,11 +537,7 @@ async fn a_numbered_search_answers_over_two_shards() {
             &tables,
         );
         let routed = match routed {
-            Ok(r) if r.statement().is_some() => r,
-            Ok(_) => {
-                wrong.push(format!("{query}: no statement"));
-                continue;
-            }
+            Ok(r) => r,
             Err(e) => {
                 wrong.push(format!("{query}: refused: {e}"));
                 continue;
@@ -1057,7 +1048,6 @@ async fn a_compare_top_n_is_ranked_over_every_shard() {
         &tables,
     )
     .expect("planned");
-    assert!(routed.statement().is_some(), "{q}: no statement");
     let out = engine
         .metrics_range_routed(&routed)
         .await

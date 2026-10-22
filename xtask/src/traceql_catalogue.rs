@@ -21,8 +21,8 @@ use pulsus_clickhouse::{ChClient, ChConnConfig, ChPool, ChProto, Idempotency, Qu
 use pulsus_read::traces::spans::attr_index::IndexedAttr;
 use pulsus_read::{
     GroupValue, MetricLabel, MetricLabelValue, MetricsCtx, MetricsParams, SearchOutput,
-    SearchParams, SpanFilterCtx, SpanSummary, StatementTables, TraceEngine, TraceMetricsResult,
-    TraceReadConfig, plan_search_request, plan_trace_metrics_routed,
+    SearchParams, SpanSummary, StatementTables, TraceEngine, TraceMetricsResult, TraceReadConfig,
+    plan_search_request, plan_trace_metrics_routed,
 };
 use pulsus_traceql::PipelineStage;
 use serde_json::{Value, json};
@@ -267,10 +267,6 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         indexed: &indexed,
     };
     let ctx = MetricsCtx {
-        filter: SpanFilterCtx {
-            spans_table: &rc.spans_table,
-            attrs_table: &rc.attrs_table,
-        },
         scan_budget_rows: rc.scan_budget_rows,
         max_series: rc.max_series,
         distributed: rc.distributed,
@@ -340,11 +336,6 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
                 }
             };
             line["route"] = json!("metrics");
-            line["engine"] = json!(if plan.statement().is_some() {
-                "statement"
-            } else {
-                "previous"
-            });
             let (range_engine, prefix) = engine(index, "answer");
             prefixes.push(("answer", prefix));
             let range = range_engine

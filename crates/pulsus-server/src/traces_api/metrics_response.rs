@@ -213,14 +213,13 @@ pub(crate) fn encode_metrics(result: &TraceMetricsResult) -> Response {
 /// Frames the engine result as the instant body. Reproduces BOTH halves of
 /// the reference's rule (`modules/frontend/metrics_query_handler.go:193-201`
 /// @ v3.0.2): the emitted scalar is a function of `Samples[0]` ALONE, and a
-/// series with no samples is skipped. All five of `frame_instant`'s exits
-/// build exactly one sample per series — structurally on the four match arms
-/// (`crates/pulsus-read/src/traces/exec.rs:1290,1314,1358,1398`), and via the
-/// constant instant bucket expression
-/// (`crates/pulsus-read/src/traces/metrics_plan.rs:419`) on the
-/// `PlanKind::Compare` early return (`exec.rs:1256-1263`) — so neither rule is
-/// reachable from this engine today; both are implemented and tested so the
-/// rule lives in the code rather than in an invariant that could lapse.
+/// series with no samples is skipped. The metrics statement's instant form
+/// returns one point per series, a comparison's under its one constant
+/// instant bucket (`crates/pulsus-read/src/traces/spans/metrics.rs`) — so
+/// neither rule is reachable from this engine today; both are implemented
+/// and tested so the rule lives in the code rather than in an invariant that
+/// could lapse. (The previous metrics SQL's instant framing went, #602 part
+/// 3a.)
 fn build_instant(result: &TraceMetricsResult) -> InstantResponse {
     let series = result
         .series
@@ -525,8 +524,9 @@ mod tests {
         }
     }
 
-    /// One engine result, with the ungrouped `__name__` label shape
-    /// `frame_instant` emits (`crates/pulsus-read/src/traces/exec.rs:1358`).
+    /// One engine result, with the ungrouped `__name__` label shape the
+    /// metrics statement's framing emits
+    /// (`crates/pulsus-read/src/traces/exec/metrics_statement.rs`).
     fn named_instant(name: &str, value: f64) -> TraceMetricsResult {
         TraceMetricsResult {
             series: vec![TraceMetricSeries {

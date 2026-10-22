@@ -2,8 +2,8 @@
 //! ingest through the *product* path (`POST /v1/traces`, sync) → the edge
 //! MV populates `trace_edges` → `GET /api/traces/v1/service_graph` returns
 //! the exact documented JSON edges. This is the full-path gate the no-split
-//! rationale rests on (the read-path SQL/pruning is separately gated in
-//! `pulsus-read`'s `traces_graph_explain.rs`).
+//! rationale rests on (the read-path SQL is separately gated in
+//! `pulsus-read`'s `traces_spans_graph_sql.rs`).
 //!
 //! Proves, over HTTP against a real spawned `pulsusdb` + ClickHouse 26.3:
 //! - client fan-out: one CLIENT parenting two SERVER children in different

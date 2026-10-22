@@ -12,7 +12,7 @@
 //!
 //!   * **PulsusDB side** — the spans are written to a throwaway ClickHouse
 //!     DB and `{} | compare({ status = error })` is read back through this
-//!     crate's REAL metrics executor ([`TraceEngine::metrics_range`]).
+//!     crate's own metrics executor ([`TraceEngine::metrics_range_routed`]).
 //!   * **Tempo side** — the same spans are pushed to `grafana/tempo:3.0.2`
 //!     over OTLP and the same query is read back from its
 //!     `/api/metrics/query_range` metrics API (the Tempo-native
@@ -25,7 +25,7 @@
 //! must propagate the ROOT's value across a child of a different
 //! name/service.
 //! Tempo v3.0.2 emits `statusMessage=""` as a DISTINCT value (verified
-//! against the pinned reference, #185), so the metrics_sql builder emits it
+//! against the pinned reference, #185), so the compare() statement emits it
 //! verbatim (no `arrayFilter` fold to nil) to match. The `ci` job's
 //! aggregate `--workspace` run executes this binary, where it self-skips
 //! green; the `schema-it` job supplies its gate and runs it **enforced**
@@ -149,11 +149,6 @@ fn engine_config() -> TraceReadConfig {
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
-        spans_table: "trace_spans".to_string(),
-        attrs_table: "trace_attrs_idx".to_string(),
-        edges_table: "trace_edges".to_string(),
-        recent_table: "trace_recent".to_string(),
-        errors_table: "trace_error_spans".to_string(),
         spans_v2_table: "spans".to_string(),
         error_spans_table: "error_spans".to_string(),
         traces_table: "traces".to_string(),
@@ -322,10 +317,6 @@ async fn pulsus_counts(engine: &TraceEngine, window: (i64, i64)) -> Counts {
         },
     )
     .expect("plan compare");
-    assert!(
-        routed.statement().is_some(),
-        "compare() takes the statement"
-    );
     let res: TraceMetricsResult = engine
         .metrics_range_routed(&routed)
         .await

@@ -7,12 +7,11 @@
 //! (`pulsus-server/src/traces_api`), mirroring the logs layering.
 //!
 //! **Module layout** mirrors [`crate::logql`]'s plan/execute split:
-//! [`filter`] (the shared span-filter compiler — the leaf-level surface
-//! the metrics endpoints consume too), [`spans`] (the search, fetch and
-//! metrics statements over the `spans` design), [`values`] (the response
-//! value types the decode builds), [`metrics_plan`]/
-//! [`metrics_sql`] (the issue #59 TraceQL metrics planner + byte-frozen
-//! single-query pushdown builders), [`log2_histogram`] (the reference's
+//! [`spans`] (the search, fetch, metrics, tag and service-graph statements
+//! over the `spans` design), `sql_text` (the SQL text helpers those
+//! statements share), [`values`] (the response value types the decode
+//! builds), [`metrics_plan`] (the shell planner: a metrics request's
+//! window, axis, pipeline and exemplar budget), [`log2_histogram`] (the reference's
 //! pure `histogram_over_time` bucket rule, issue #252), [`window_sql`] (the issue #525 shared
 //! time-window bound conventions — the one place a window's row bound
 //! and its day-partition bound are rendered from, so the two cannot
@@ -30,16 +29,13 @@
 mod dispatch;
 
 pub mod exec;
-pub mod filter;
-pub mod graph_sql;
 pub mod log2_histogram;
 pub mod metrics_plan;
 pub mod metrics_result;
-pub mod metrics_sql;
 pub mod rows;
 
 // Issue #282 deleted this module's `TraceqlPrevalidated` capability token
-// (issue #240). `filter.rs` now renders every user regex through
+// (issue #240). `sql_text.rs` renders every user regex through
 // `logql::escape::ch_regex_anchored_checked`, which compiles the exact
 // string it escapes, so nothing in `traces/` needs — or can obtain —
 // access to the raw escapers: they are private to `logql::escape` and a
@@ -48,6 +44,7 @@ pub mod rows;
 
 mod read_config;
 pub mod spans;
+mod sql_text;
 pub mod values;
 pub mod window_sql;
 
@@ -58,16 +55,14 @@ pub use exec::{
     TRACE_METRICS_MAX_SET_ROWS, TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValue, TagValues,
     TagValuesRequest, TraceEngine, TraceReadConfig, TraceSearchResult,
 };
-pub use filter::{CompiledLeaf, CompiledSpanFilter, PlanError, SpanFilterCtx, compile_span_filter};
-pub use graph_sql::{GraphWindow, SERVICE_GRAPH_MAX_EDGES, service_graph_sql};
 pub use metrics_plan::{
-    MAX_METRICS_POINTS, MetricFunc, MetricsCtx, MetricsParams, TraceMetricsPlan, plan_trace_metrics,
+    MAX_METRICS_POINTS, MetricsCtx, MetricsParams, TraceMetricsPlan, plan_trace_metrics,
 };
 pub use metrics_result::{
     MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
 };
 pub use rows::{GraphEdgeRow, SpanNameRow, TagNameRow, TagValueRow};
-pub use spans::graph::spans_graph_sql;
+pub use spans::graph::{GraphWindow, SERVICE_GRAPH_MAX_EDGES, spans_graph_sql};
 pub use spans::metrics::{RoutedMetricsPlan, StatementTables, plan_trace_metrics_routed};
 pub use spans::rows::{
     FallbackFetchRow, FetchRoute, FetchWindow, FetchedEventTuple, FetchedLinkTuple,
@@ -75,6 +70,7 @@ pub use spans::rows::{
     IndexedFetchRow, WideFetchRow,
 };
 pub use spans::search::{SearchParams, SearchRequest, plan_search_request};
+pub use sql_text::PlanError;
 pub use values::{
     GroupValue, ProjectedAttribute, SpanSetGroup, SpanSummary, WireKey, go_duration_string,
     non_finite_double_spelling, wire_arm,

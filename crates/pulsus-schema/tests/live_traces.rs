@@ -1182,7 +1182,8 @@ struct EdgeRow {
 }
 
 /// Runs the docs/schemas.md §4.2 service-graph read (calls/failed only; the
-/// quantiles arm is covered by `traces_graph_explain.rs`) over `[s, e)` and
+/// quantiles arm's suite went with the previous graph SQL, #602 part 3a)
+/// over `[s, e)` and
 /// returns the aggregated edges in the query's own order.
 async fn read_edges(client: &ChClient, db: &str, s: i64, e: i64) -> Vec<EdgeRow> {
     let half = |side: u8, group: &str, extra: &str| {

@@ -188,7 +188,7 @@
 //!
 //! TraceQL's production `match(` renderings all route through
 //! `anchored_regex_sql` → `ch_regex_anchored_checked`
-//! (`traces/filter.rs:701-728`, `:1195-1199`); PromQL's sit inside #315's
+//! (`traces/sql_text.rs`'s `anchored_regex_sql`); PromQL's sit inside #315's
 //! sealed leaf (`metrics/series_where.rs:378-400`). That is a **measurement
 //! taken today, with no mechanism keeping it true** — `ch_string` is `pub`,
 //! so either file could acquire the same unanchored bypass this issue exists

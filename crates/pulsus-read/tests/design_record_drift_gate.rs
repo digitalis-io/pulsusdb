@@ -1531,9 +1531,10 @@ enum GateState {
     /// its own negative control, which is what makes a finder that
     /// reports everything present detectable.
     Absent,
-    /// A gate the record names that #602 part 2c-2b-2 deleted with the
-    /// previous search engine: the row's file no longer defines it (or is
-    /// no longer tracked). Not counted as the negative control.
+    /// A gate the record names that #602 deleted — two with the previous
+    /// search engine (part 2c-2b-2), one with the previous metrics SQL (part
+    /// 3a): the row's file no longer defines it (or is no longer tracked).
+    /// Not counted as the negative control.
     Deleted,
 }
 
@@ -1545,11 +1546,13 @@ struct GateRow {
     state: GateState,
 }
 
-/// The record's gates #602 part 2c-2b-2 deleted with the previous search
-/// engine — the only rows `design_record_gates.tsv` may mark `deleted`.
-const DELETED_GATES: [&str; 2] = [
+/// The record's gates #602 deleted — two with the previous search engine
+/// (part 2c-2b-2), the metrics SQL digest with the previous metrics SQL
+/// (part 3a) — the only rows `design_record_gates.tsv` may mark `deleted`.
+const DELETED_GATES: [&str; 3] = [
     "every_traceql_chain_link_has_a_row_in_the_lowering_document",
     "traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states",
+    "the_sql_golden_corpus_matches_its_committed_digest",
 ];
 
 /// `Ok` when the rows marked `deleted` are exactly [`DELETED_GATES`].
@@ -1564,8 +1567,8 @@ fn deleted_rows_are_the_named_ones(rows: &[GateRow]) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "{GATES_TSV} marks {marked:?} deleted; only {named:?} may be, the gates #602 part \
-             2c-2b-2 deleted"
+            "{GATES_TSV} marks {marked:?} deleted; only {named:?} may be, the gates #602 parts \
+             2c-2b-2 and 3a deleted"
         ))
     }
 }
@@ -2002,10 +2005,14 @@ enum ReviewedVerdict {
 // #601 part 4b: coordinates and nothing else. The error-span table's name in
 // the read configuration moved the block down twenty lines: `:2205-2207` is
 // `:2225-2227`. The verdict is unchanged.
+//
+// #602 part 3a: coordinates and nothing else. Deleting the previous metrics
+// SQL's engine code moved the block up 923 lines: `:2225-2227` is
+// `:1302-1304`. The verdict is unchanged.
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 2] = [
     (
         "docs/query-lowering.md",
-        "exec.rs:2225-2227",
+        "exec.rs:1302-1304",
         0,
         ReviewedVerdict::FallbackWrong,
         "the search settings block the same section quotes; it is in traces/exec.rs \
@@ -2342,6 +2349,10 @@ fn census_block() -> String {
             .collect();
         listed.sort();
         listed.dedup();
+        // #602 part 3a: a reason with no row left says nothing.
+        if listed.is_empty() {
+            continue;
+        }
         out.push_str(&format!("{lead} {}.\n\n", listed.join(", ")));
     }
     let mut wrong: Vec<String> = REVIEWED_FALLBACK_DIVERGENCES
@@ -2382,8 +2393,9 @@ fn reason_meaning(reason: &str) -> &'static str {
         }
         "not_a_tracked_file" => {
             "the citation names a file the tree does not hold: a throwaway probe that was never \
-             committed, which §10 records deliberately, or a file of the previous search engine \
-             that #602 part 2c-2b deleted"
+             committed, which §10 records deliberately, a file of the previous search engine \
+             that #602 part 2c-2b deleted, or a file of the previous metrics and graph SQL that \
+             #602 part 3a deleted"
         }
         other => panic!(
             "the frozen dataset holds the reason {other:?}, which this renderer cannot explain; a \

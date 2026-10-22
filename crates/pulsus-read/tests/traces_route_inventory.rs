@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams};
 use pulsus_read::{SearchParams, plan_search_request};
-use pulsus_read::{SpanFilterCtx, StatementTables, plan_trace_metrics_routed};
+use pulsus_read::{StatementTables, plan_trace_metrics_routed};
 use pulsus_traceql::PipelineStage;
 
 fn corpus_dir(sub: &str) -> PathBuf {
@@ -83,8 +83,7 @@ fn route_of(query: &pulsus_traceql::Query) -> &'static str {
 }
 
 /// The engine that answers a query: `refused` when the planner refuses
-/// it, `new` when the route's coverage gives a statement, else `old`. A
-/// metrics query is planned by `plan_trace_metrics_routed` (issue #596
+/// it, else `new`, the statement. A metrics query is planned by `plan_trace_metrics_routed` (issue #596
 /// part 1) over the search's window, step 60 s.
 fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
     const START: i64 = 1_790_000_000_000_000_000;
@@ -97,10 +96,6 @@ fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
             floor_ns: i64::MIN,
         };
         let ctx = MetricsCtx {
-            filter: SpanFilterCtx {
-                spans_table: "trace_spans",
-                attrs_table: "trace_attrs_idx",
-            },
             scan_budget_rows: 50_000_000,
             max_series: 1_000,
             distributed: false,
@@ -115,8 +110,7 @@ fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
         };
         return match plan_trace_metrics_routed(query, &params, &ctx, &tables) {
             Err(_) => "refused",
-            Ok(routed) if routed.statement().is_some() => "new",
-            Ok(_) => "old",
+            Ok(_) => "new",
         };
     }
     let params = SearchParams {
@@ -140,11 +134,10 @@ fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
 
 /// The side a task's queries take: task 9's are the search statement's,
 /// task 14's and 15's the metrics statement's (issue #596 part 1, issue
-/// #597), tasks 10 to 12 today's engine's.
+/// #597).
 fn side_of_task(task: &str) -> &'static str {
     match task {
         "9" | "14" | "15" => "new",
-        "10" | "11" | "12" => "old",
         "refused" => "refused",
         other => panic!("an unknown task {other:?}"),
     }
@@ -205,10 +198,9 @@ fn the_inventory_is_complete_and_exact() {
     assert_eq!(
         (
             sides.get("new").copied().unwrap_or(0),
-            sides.get("old").copied().unwrap_or(0),
             sides.get("refused").copied().unwrap_or(0)
         ),
-        (138, 0, 3),
-        "new, old and refused"
+        (138, 3),
+        "new and refused"
     );
 }

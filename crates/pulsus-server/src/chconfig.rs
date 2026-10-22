@@ -949,9 +949,7 @@ mod tests {
     fn trace_read_config_from_uses_the_base_tables_when_unclustered() {
         let config = Config::default();
         let cfg = trace_read_config_from(&config);
-        assert_eq!(cfg.spans_table, "trace_spans");
-        assert_eq!(cfg.attrs_table, "trace_attrs_idx");
-        assert_eq!(cfg.edges_table, "trace_edges");
+        assert_eq!(cfg.spans_v2_table, "spans");
         assert!(!cfg.distributed);
     }
 
@@ -962,9 +960,7 @@ mod tests {
             ..Config::default()
         };
         let cfg = trace_read_config_from(&config);
-        assert_eq!(cfg.spans_table, "trace_spans_dist");
-        assert_eq!(cfg.attrs_table, "trace_attrs_idx_dist");
-        assert_eq!(cfg.edges_table, "trace_edges_dist");
+        assert_eq!(cfg.spans_v2_table, "spans_dist");
         assert!(cfg.distributed);
     }
 

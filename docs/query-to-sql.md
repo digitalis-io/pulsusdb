@@ -1,6 +1,6 @@
 # Query to SQL
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #597 `compare()` is read from `spans`, `traces` and `resources` in one statement.** This document has four parts, in this order:
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2 — and the previous trace metrics and service-graph SQL, which #602 part 3a deleted; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #597 `compare()` is read from `spans`, `traces` and `resources` in one statement.** This document has four parts, in this order:
 
 1. **[The SQL we send today](#1-the-sql-we-send-today)** — every stage of both query languages, and
    the exact statement text our shipped code produces for it now.
@@ -382,8 +382,8 @@ is not a stage; it is `SpansetExpr` (`ast.rs:99`).
 | `\| coalesce()` | none | *evaluated after the read*, golden `spanset_coalesce.sql` is byte-identical to the plain selector case |
 | `\| select(.foo)` | none — adds a per-batch value read | *evaluated after the read*, golden `spanset_by_attr.sql` second value statement |
 | `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read* (issue #492 item 9). It does decide WHICH generator statement is sent: `filter::collect`'s `&&` fold continues across the `\|`, so `{A} \| {B}` sends the statement `{A && B}` sends |
-| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_plan.rs:403`. On the **search** route they are refused with `400` (`search_plan.rs:2134`, `:2140`, `:2146`) |
-| `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage, after a metrics function | none | *evaluated after the read* on the metrics routes: `metrics_plan.rs:985` records it as the plan's `reduce` and `traces/exec.rs:3162` applies it to the framed series (called at `:1011` @ 1cdb3e5e for range, `:1413` for instant). Its input is the series the first stage produced, not rows, so there is nothing for it to become a `LIMIT … BY` over. On the **search** route it is refused with `400` (`search_plan.rs:2140`) |
+| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_plan.rs:297`. On the **search** route they are refused with `400` (`search_plan.rs:2134`, `:2140`, `:2146`) |
+| `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage, after a metrics function | none | *evaluated after the read* on the metrics routes: `metrics_plan.rs:538` records it as the plan's `reduce` and `traces/exec.rs:3162` @ bf195076 applies it to the framed series (called at `:1011` @ 1cdb3e5e for range, `:1413` @ bf195076 for instant). Its input is the series the first stage produced, not rows, so there is nothing for it to become a `LIMIT … BY` over. On the **search** route it is refused with `400` (`search_plan.rs:2140`) |
 | ordering | `ORDER BY bound_ts DESC, trace_id ASC` on each first statement only | *emitted today*, `search_sql.rs:282`. The final ordering across statements is done in `pulsus-server` |
 | `limit=20` | `LIMIT 100001` on each first statement — the candidate ceiling, not the request limit | *emitted today*, `search_sql.rs:283`. The request limit is applied after the read |
 | the response | none | *never becomes SQL*. Part 5 gives the reason |
@@ -617,7 +617,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read*, `docs/query-lowering.md` §3.1's `Filter` row (issue #492 item 9). Pushing it as a `WHERE` conjunct **onto the leading generator** is unsound whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span comes from the RIGHT operand, so the pushed statement returns a wrong answer rather than a wider one. **That is a fact about one statement shape, not about SQL:** both tables store what the stage reads — `trace_spans.name` (`schema/schema.sql:528`) and the attribute index (`schema/schema.sql:409-427`) — and §5.1 names the rule of ours that holds the two-table form back. It clears exactness, and a mid-pipeline spanset OPERATION is a plan-time `400` |
 | `\| select(.foo)` | **emitted today** (issue #558): three projected expressions on the batch hydration statement, all three subscripted at one `arrayFirstIndex((k, s) -> k = 'foo' AND s = 'span', attr_key, attr_scope)` over the span row's own arrays — the byte-capped value, the numeric reading and the stored kind | *emitted today*, `search_sql.rs:448` and `search_plan.rs:1266`. **The join this row used to describe was never needed.** The refusal recorded in [query-lowering.md](query-lowering.md) §9.8 rested on the value living in a second table; since issue #557 the span row carries its own attributes, so putting the value beside the span reads no second table and contains no join. ADR 0008's unnamed-clause question does not arise |
 | `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_sql.rs:111`. Still `400` on the search route (`search_plan.rs:2134`); this work does not change that |
-| `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage | none | *evaluated after the read*, unchanged. It reduces the SERIES the first stage produced, so no clause of ADR 0008 carries it and no row set exists to apply it to: `metrics_plan.rs:985` records it, `traces/exec.rs:3162` applies it. Still `400` on the search route (`search_plan.rs:2140`) |
+| `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage | none | *evaluated after the read*, unchanged. It reduces the SERIES the first stage produced, so no clause of ADR 0008 carries it and no row set exists to apply it to: `metrics_plan.rs:538` records it, `traces/exec.rs:3162` @ bf195076 applies it. Still `400` on the search route (`search_plan.rs:2140`) |
 | structural relations `>` `>>` `<` `<<` `~` | none | *never becomes SQL*, `docs/query-lowering.md:776`. Part 5 |
 | `traceDuration`, `rootName`, `rootServiceName`, `span:childCount` | none | *never becomes SQL*, `docs/query-lowering.md:778`. Part 5 |
 | ordering | `ORDER BY sort_key DESC, trace_id ASC` | *from the design*, `docs/query-lowering.md:616`. Refuses over a wider-than-needed set: the sort key is the newest matching span's timestamp, so a row the SQL should not have returned changes the order, not only the set |
@@ -820,7 +820,7 @@ after the read, `stage3_keyset` (`sql.rs:877`) when something does.
 
 | stage as written | the fragment it contributes | where it lands | what the database does less of |
 |---|---|---|---|
-| `\|= "text"` | `body LIKE '%text%'` | `WHERE`, third statement | *emitted today*. With a needle of four bytes or more the body's `text(tokenizer = ngrams(4))` index skips granules: measured, a needle occurring once in 100,000 rows cut 124 granules to 10 and read 81,920 rows instead of 1,015,808. A needle shorter than four bytes produces no n-gram and prunes nothing (`escape.rs:81-91`) |
+| `\|= "text"` | `body LIKE '%text%'` | `WHERE`, third statement | *emitted today*. With a needle of four bytes or more the body's `text(tokenizer = ngrams(4))` index skips granules: measured, a needle occurring once in 100,000 rows cut 124 granules to 10 and read 81,920 rows instead of 1,015,808. A needle shorter than four bytes produces no n-gram and prunes nothing (`escape.rs:82-92`) |
 | `!= "text"` | `NOT (body LIKE '%text%')` | `WHERE`, third statement | *emitted today*. A negation cannot prune: a granule is skipped only when it **cannot** contain a match |
 | `\|~ "re"` | `match(body, 're')`, or `match(identity(body), 're')` | `WHERE`, third statement | *emitted today*. Whether a granule can be skipped depends on whether ClickHouse can pull a required substring out of the pattern and test it against the body index. **The n-gram index under-counts one shape** (issue #624 part 3a): a group holding an alternation, where case-insensitivity is on at the group's opening or switched on inside it. Measured on ClickHouse 26.3.29.7, `match(s, '(?i)(denied\|refused)')` over a row `audit DENIED open` counts 0 with `idx_body_ngrams` and 1 without it. Over part 3a's sweep, re-run through the shipped renderer without this rule, each pattern's `count()` against `use_skip_indexes = 0` with the condition cache dropped first, 32 of 176 patterns differ, on the bloom-filter index and on the `text` index alike; 0 differ with it. Such a pattern reads `identity(body)`, which keeps that one predicate off the index and leaves a second pushed filter its pruning; the pattern text is unchanged. `!~` keeps `match(body, …)`: its `NOT match` lost no row over the same sweep |
 | `!~ "re"` | `NOT (match(body, 're'))` | `WHERE`, third statement | *emitted today*. As `!=` |
@@ -1866,7 +1866,7 @@ ADR 0008 does not name, and ADR 0008 now forbids one until it is amended** — �
 
 **What it was said to avoid, and what was measured instead.** This paragraph used to claim the
 form above collapses the per-batch value read into a single read for the whole request. Today the
-value read is issued once per 32 candidates (`search_sql.rs:501`, `exec.rs:120`); at the candidate
+value read is issued once per 32 candidates (`search_sql.rs:501`, `exec.rs:112`); at the candidate
 ceiling that is 3,125 statements over the same `key = 'foo'` prefix, and the `trace_id IN (…32)`
 term in each of them prunes nothing, because `trace_id` is the fifth column of the ordering key
 (`schema/schema.sql:431`). **The collapse does not survive the shipped generator memory ceiling.**
@@ -2007,7 +2007,7 @@ Under `crates/`: the route is mounted at `pulsus-server/src/logs_api/mod.rs:55-5
 `plan.rs:1693` and `plan.rs:1720`; LogQL's compiler keeps or replaces them itself, and does not move
 them into the core (owner decision, #507). Evaluation after the read is `logql/pipeline.rs:1354`. The
 TraceQL equivalents are `traces/search_plan.rs:1121`, `traces/search_sql.rs:170` and
-`traces/exec.rs:2187`.
+`traces/exec.rs:1264`.
 
 ### 3.3 The decision, per step
 
@@ -2619,7 +2619,7 @@ LIMIT 100
 
 `.` in ClickHouse's `match` covers one UTF-8 character. This case checks the pattern arrives
 unanchored and uncorrupted; `pulsus_re2::clickhouse_match_strategy` classifies it `Verbatim`, so it
-renders exactly as written (`escape.rs:172-175`).
+renders exactly as written (`escape.rs:173-176`).
 
 #### LogQL13 — an address filter, which does not become SQL
 
@@ -5273,8 +5273,8 @@ engine will read, and what it will return:
 | TraceQL candidates | `reader.traceql_max_candidates`, default 100,000 | field at `model.rs:547` @ 1cdb3e5e, default at `:665`. Per first statement and for the merged set |
 | TraceQL batch size | 32 traces | `traces/exec.rs:126` @ 1cdb3e5e |
 | spans per trace | 10,000 | `traces/exec.rs:131` @ 1cdb3e5e; a trace over it is reported incomplete |
-| TraceQL span-read bytes | 256 MiB | `traces/exec.rs:92` |
-| ClickHouse result bytes, traces | 64 MiB, refusing rather than truncating | `traces/exec.rs:104`, applied at `:2228` |
+| TraceQL span-read bytes | 256 MiB | `traces/exec.rs:84` |
+| ClickHouse result bytes, traces | 64 MiB, refusing rather than truncating | `traces/exec.rs:96`, applied at `:1305` |
 | rendered SQL text | 8 MiB; at or past it is `422 query_too_broad` | `pulsus-read/src/querytext.rs:52` |
 | syntax tree, reduced statement after `\| logfmt` | `max_ast_elements` 1,000,000 and `max_expanded_ast_elements` 10,000,000 on that statement only; at the server's default of 50,000 it fails with `TOO_BIG_AST` | `logql/sql.rs` `metric_range_reduced` |
 | handover size | at most one set of values written into the text of the next statement. 32,768 literal ids is `Code: 168. DB::Exception: AST is too big. Maximum: 50000.` | ADR 0008 D3 |
@@ -5286,7 +5286,7 @@ engine will read, and what it will return:
   aggregate is evaluated after the read the statement has no `LIMIT` at all, so the grouping is the
   only thing left to bound. The bound is `max_rows_to_group_by` with
   `group_by_overflow_mode = 'throw'`, reported as the existing `422`. The metrics route already has
-  the same mechanism for sets — 1,000,000 rows, `traces/exec.rs:157` — and TraceQL20's series probe
+  the same mechanism for sets — 1,000,000 rows, `traces/exec.rs:148` — and TraceQL20's series probe
   is the same idea applied before the statement runs.
 - **The window on every statement.** Every compiled search statement carries the request's own
   half-open bound, `timestamp_ns >= start AND timestamp_ns < end`

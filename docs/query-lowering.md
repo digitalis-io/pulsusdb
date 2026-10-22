@@ -1,6 +1,6 @@
 # Query lowering: compiling pipeline stages to SQL
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** A LogQL or TraceQL query is a **selector** followed by a **pipeline of stages**. Every stage can
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2 — and the previous trace metrics and service-graph SQL, which #602 part 3a deleted; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** A LogQL or TraceQL query is a **selector** followed by a **pipeline of stages**. Every stage can
 be evaluated in `pulsus-server` over rows ClickHouse has already sent, and some can instead be
 compiled into the SQL we send, so ClickHouse does the work next to the data and returns less.
 This document describes the mechanism that decides which — the lowering core TraceQL's compiler is built on — and reads LogQL's stages against the same questions. LogQL keeps its own compiler; the two are not to be merged (§6).
@@ -846,7 +846,7 @@ measurement.
   the fingerprint list, bounded by `DEFAULT_MAX_STREAMS = 100_000`
   (`crates/pulsus-read/src/logql/params.rs:124`).
 - The TraceQL search response's root summary is read trace-wide with **no time bound**, and
-  `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:305`,
+  `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:276`,
   `crates/pulsus-read/src/traces/search_sql.rs:596`). The seed is the winners' trace ids, bounded
   by the request `limit`.
 
@@ -1257,7 +1257,7 @@ Four consequences fall out of the table rather than being written down.
 - **`Emit` is `Never`, and a lowered TraceQL search is three statements, not one.** The root summary
   is read trace-wide with **no time predicate** (the true root may predate the search window —
   [schemas.md §4.2](schemas.md)), and `TraceSearchResult.root` is not optional
-  (`crates/pulsus-read/src/traces/exec.rs:305`), so every search response needs it. That is exactly
+  (`crates/pulsus-read/src/traces/exec.rs:276`), so every search response needs it. That is exactly
   why the winners' root read exists today (`exec.rs:2165`), and lowering does not remove it: it
   removes the 1,108 round trips between it and the generator. The window-bounded hydration read
   survives lowering for its own reason — `spanSets[].matched` and `spanSets[].spans[]` are written
@@ -1471,7 +1471,7 @@ nobody later reads them as unfinished work.
 | **the nested-set numbering** `nestedSetLeft`, `nestedSetRight`, and `nestedSetParent` outside the root sentinel | a modified-preorder numbering computed per trace at query time from the `parent_id` forest; no stored column carries it. The root sentinel **is** expressible and is already lowered (`metrics_sql.rs:562`) |
 | **trace-level intrinsics** `traceDuration`, `rootName`, `rootServiceName`, `span:childCount` | resolved from a co-load that is deliberately trace-wide with **no time predicate**, because the true root may predate the window. A window-bounded statement cannot read those rows at all. Already refused on the metrics path for this reason (`lower_leaf`, `metrics_sql.rs:546`) |
 | **the `!` operator's whole-query type failure** | `{ !.a }` against a present non-boolean must fail the entire request, not skip the span. SQL evaluates row by row and cannot turn one row's type into a request-level refusal. The matching half is expressible, the failure half is not, and they are one leaf (`LeafEval::BoolTruth`, `filter.rs:524`) |
-| **`Emit` on the traces search route** | the response's root summary is read trace-wide and unwindowed, the same reason as the trace-level intrinsics — and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:305`), so this is unconditional on that route, not a case that sometimes arises. **`Never` is the right classification and it does not mean the evaluator does the work**: the way the evaluator owns this link is to send a second statement, so `plan_of` gives it its own SQL part (`Cut::SourceHandoff`, §2.7.2). "Cannot be lowered into THIS statement" and "is not SQL" are different claims, and only the first is made here |
+| **`Emit` on the traces search route** | the response's root summary is read trace-wide and unwindowed, the same reason as the trace-level intrinsics — and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:276`), so this is unconditional on that route, not a case that sometimes arises. **`Never` is the right classification and it does not mean the evaluator does the work**: the way the evaluator owns this link is to send a second statement, so `plan_of` gives it its own SQL part (`Cut::SourceHandoff`, §2.7.2). "Cannot be lowered into THIS statement" and "is not SQL" are different claims, and only the first is made here |
 
 **Cross-attribute comparison is deliberately not in this table.** `{ .a = .b }` compares two rows
 of the attribute index sharing a `(trace_id, span_id)`; the information is present, and the SQL
@@ -1849,7 +1849,7 @@ output kind**, and each kind has exactly one bound:
 **The cap is keyed on the SQL part, not on the request.** Each `Part::Sql` picks its cap from its
 own `yields` (§2.7.1), and a part whose `issue` is `PerSeed` applies that cap **per issue** against
 a cumulative request-scoped budget — which is exactly what `HYDRATION_BYTE_BUDGET`
-(`crates/pulsus-read/src/traces/exec.rs:92`) and `reader.logql_scan_budget_bytes` already do across
+(`crates/pulsus-read/src/traces/exec.rs:84`) and `reader.logql_scan_budget_bytes` already do across
 today's loops. A plan with three SQL parts therefore has three enforcement points, not one, and
 saying which is which is the whole reason the cap table is keyed this way. The table is the core's:
 LogQL's own compiler places its own caps — the scan budget and the limits in
@@ -1858,7 +1858,7 @@ LogQL's own compiler places its own caps — the scan budget and the limits in
 | `SqlPart::yields` | what crosses | the cap that applies |
 |---|---|---|
 | `Candidates` | up to `reader.traceql_max_candidates` keys | the candidate cap — today's mechanism, unchanged |
-| `Exact` | hydrated rows | `max_result_bytes` (`crates/pulsus-read/src/traces/exec.rs:163-173` @ 1cdb3e5e) plus the `HYDRATION_BYTE_BUDGET` retention counter (`traces/exec.rs:92`) — today's mechanism, unchanged |
+| `Exact` | hydrated rows | `max_result_bytes` (`crates/pulsus-read/src/traces/exec.rs:163-173` @ 1cdb3e5e) plus the `HYDRATION_BYTE_BUDGET` retention counter (`traces/exec.rs:84`) — today's mechanism, unchanged |
 | `Reduced` | at most `limit` rows | **nothing bounds the grouping that produced them** — the gap |
 
 So the placement question is answered once, structurally. The gap needs `max_rows_to_group_by`
@@ -2232,7 +2232,7 @@ never treat it as zero cost.
 
 **A third trap, and it is the one that decided an architectural question.** Our reader sends
 `max_block_size = 4096` on every search statement — `TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096`
-(`crates/pulsus-read/src/traces/exec.rs:113`), set in `search_settings` (`:2230`) and inherited by
+(`crates/pulsus-read/src/traces/exec.rs:105`), set in `search_settings` (`:1307`) and inherited by
 `generator_settings` (`:3267` @ 1cdb3e5e). ClickHouse 26.3.29.7's own default is **65,409**
 (`SELECT value, default FROM system.settings WHERE name = 'max_block_size'` prints `65409 65409`).
 A measurement taken at the server default is a measurement of a system we do not run, and the
@@ -2279,7 +2279,7 @@ So a re-take at the default **refuses a statement the shipped reader would run**
 metered column by anywhere between 0% and 48% on the same statement. Two competent
 measurements of §9.7's headline figure landed a factor of 4.7 apart for exactly this reason, and
 neither was wrong about what it measured. `search_settings_pin_the_layer_1_budget_contract`
-(`crates/pulsus-read/src/traces/exec.rs:4354`) is what keeps 4,096 shipped: it asserts that the
+(`crates/pulsus-read/src/traces/exec.rs:2602`) is what keeps 4,096 shipped: it asserts that the
 rendered search settings contain the substring `max_block_size` and the substring `4096` — as two
 independent substring checks, not bound to each other, so it would not catch a different value
 arriving beside a stray `4096`.
@@ -2403,7 +2403,7 @@ beside the figures they govern rather than once here, and this list is the index
 | `optimize_aggregation_in_order` | **1**, named on the rows that need it | it is what lets the span-ordered index stream the aggregation instead of holding a hash table over every span-group. On the current index order it buys nothing, because `(trace_id, span_id)` is not a prefix of that sorting key |
 | `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:669`), applied by `generator_settings` (`exec.rs:3267` @ 1cdb3e5e) |
 | `max_bytes_before_external_group_by` | **0** | shipped: the generator throws rather than spilling (`exec.rs:3267`) |
-| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:698` @ 1cdb3e5e), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:2225-2227`) |
+| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:698` @ 1cdb3e5e), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:1302-1304`) |
 | `min_bytes_for_wide_part` | **10485760** | pinned in the corpus recipe so the part format is reproducible; ClickHouse's own 26.3 default happens to be the same value, and neither trace `CREATE TABLE` pins it |
 
 **The rule this section follows: every metered figure carries its instrument beside the number.**
@@ -2437,7 +2437,7 @@ between two takes, is over statements and granules. Rows read and metered bytes 
 rather than checked, and they are outside it because they were measured to be, not because
 excluding them was convenient.**
 
-`search_settings_pin_the_layer_1_budget_contract` (`crates/pulsus-read/src/traces/exec.rs:4354`)
+`search_settings_pin_the_layer_1_budget_contract` (`crates/pulsus-read/src/traces/exec.rs:2602`)
 is what keeps 4,096 shipped, and it is worth knowing exactly how much it keeps: it asserts that the
 rendered search settings contain the substring `max_block_size` and the substring `4096`, as two
 independent checks that are not bound to each other. It would not catch a different block size
@@ -3052,7 +3052,7 @@ Code: 158. DB::Exception: Limit for rows or bytes to read exceeded,
 max rows: 50.00 million, current rows: 51.31 million: While executing MergeTreeSelect…
 ```
 
-`map_trace_read_error` turns 158 into `TooBroadReason::TraceScanBudgetRows` (`exec.rs:709`) and
+`map_trace_read_error` turns 158 into `TooBroadReason::TraceScanBudgetRows` (`exec.rs:681`) and
 `ReadError::QueryTooBroad(_)` is `422` (`traces_api/error.rs:366`), so **"it fits" is false at the
 level a user experiences** until `reader.traceql_scan_budget_rows` is raised as well. All five
 classes trip it, at 51.31 / 51.31 / 55.75 / 53.30 / 52.88 million rows in the order of the table
@@ -3328,7 +3328,7 @@ default_format=RowBinaryWithNamesAndTypes&max_block_size=4096&use_query_conditio
 ```
 
 `max_block_size=4096` is the shipped `TRACE_SEARCH_MAX_BLOCK_ROWS`
-(`crates/pulsus-read/src/traces/exec.rs:113`). `use_query_condition_cache=0` is in the instrument so
+(`crates/pulsus-read/src/traces/exec.rs:105`). `use_query_condition_cache=0` is in the instrument so
 that a second take of a statement cannot be served in part from work an earlier take left behind;
 this section does not measure what that setting is worth, it holds it fixed. Table 4's ceiling takes
 are the same string with `max_memory_usage=536870912`.
@@ -4052,9 +4052,9 @@ at line 11). The committed goldens below carry a join and **none is planned by t
   from `service_graph_sql` (`crates/pulsus-read/src/traces/graph_sql.rs:92`, `INNER JOIN` at 109),
   which no route calls since issue #599; #602 deletes it.
 - `traces_spans_graph/clustered.sql` and `traces_spans_graph/single_node.sql`, one `ARRAY JOIN`
-  line each, from `spans_graph_sql` (`crates/pulsus-read/src/traces/spans/graph.rs:131`), the
+  line each, from `spans_graph_sql` (`crates/pulsus-read/src/traces/spans/graph.rs:147`), the
   service graph's statement since issue #599, called from
-  `crates/pulsus-read/src/traces/exec.rs:1693` and nowhere else.
+  `crates/pulsus-read/src/traces/exec.rs:770` and nowhere else.
 - `traces_metrics/compare_outer_attr.sql`, `traces_metrics/compare_status.sql` and
   `traces_metrics/compare_status_window.sql`, seven join lines each. The first was added by issue
   [#559](https://github.com/digitalis-io/pulsusdb/issues/559) — a comparison whose OUTER filter is
@@ -4062,9 +4062,9 @@ at line 11). The committed goldens below carry a join and **none is planned by t
   attribute locators into a single statement. Six of the seven come from `metrics_compare_sql`
   (`crates/pulsus-read/src/traces/metrics_sql.rs:1313`, `LEFT JOIN` at 1385 and `INNER JOIN` at
   1389), which builds one string holding both joins and feeds it to the cross-tab and the probe,
-  and which `metrics_plan.rs` calls three times (`:646`, `:658`, `:670`). The seventh comes from
+  and which `metrics_plan.rs` calls three times (`:646` @ bf195076, `:658` @ bf195076, `:670` @ bf195076). The seventh comes from
   `metrics_compare_exemplar_range_sql` (`metrics_sql.rs:1512`, `INNER JOIN` at 1562, called at
-  `metrics_plan.rs:685`).
+  `metrics_plan.rs:685` @ bf195076).
 - `traces_metrics_base/compare_status.sql` and `traces_metrics_base/compare_status_window.sql`,
   four join lines each. These are **historic**: each is byte-identical to
   `git show 2f78c53:crates/pulsus-read/tests/golden/traces_metrics/` at the same file name, they carry no
@@ -4876,7 +4876,7 @@ worth.
 | selector | target | `Starting …` | exit | state |
 |---|---|---|---|---|
 | `the_sql_golden_corpus_has_exactly_its_committed_membership` | `--test golden_sql_freeze` | `Starting 1 test across 1 binary (1 test skipped)` | 0 | **exists, passes** |
-| `the_sql_golden_corpus_matches_its_committed_digest` | `--test golden_sql_freeze` | `Starting 1 test across 1 binary (1 test skipped)` | 0 | **exists, passes** |
+| `the_sql_golden_corpus_matches_its_committed_digest` | `--test golden_sql_freeze` | `Starting 1 test across 1 binary (1 test skipped)` | 0 | **deleted** with the previous metrics SQL (#602 part 3a) |
 | `skip_block_conditions_are_captured_and_blocks_do_not_swallow_each_other` | `--test explain_indexes` | `Starting 1 test across 1 binary (33 tests skipped)` | 0 | **exists, passes** |
 | `traces::exec::tests::search_settings_pin_the_layer_1_budget_contract` | `--lib` | `Starting 1 test across 1 binary (1207 tests skipped)` | 0 | **exists, passes** — the selector-form demonstration below |
 | `search_settings_pin_the_layer_1_budget_contract` (bare) | `--lib` | `Starting 0 tests across 1 binary (1208 tests skipped)` | 4 | selects nothing **by design** — the same test, wrong form |
@@ -4975,12 +4975,12 @@ the two tables are a cross-check on each other rather than one table quoted twic
 | gate | selector | binary | at base | today |
 |---|---|---|---|---|
 | the SQL golden corpus keeps its membership | `-E 'test(=the_sql_golden_corpus_has_exactly_its_committed_membership)'` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | `Starting 1 test`, passes | **exists** |
-| the SQL golden corpus keeps its digest | `-E 'test(=the_sql_golden_corpus_matches_its_committed_digest)'` | same | `Starting 1 test`, passes | **exists** |
+| the SQL golden corpus keeps its digest | `-E 'test(=the_sql_golden_corpus_matches_its_committed_digest)'` | same | `Starting 1 test`, passes | **deleted** with the previous metrics SQL (#602 part 3a) |
 | the `EXPLAIN` skip-block reader still discriminates | `-E 'test(=skip_block_conditions_are_captured_and_blocks_do_not_swallow_each_other)'` | `crates/pulsus-read/tests/explain_indexes.rs` | `Starting 1 test`, passes | **exists** |
 
 Issue #492 part 1 emits no SQL, so the first two must stay green **unchanged** — measured green today,
 `Starting 1 test` each, exit 0 (§11.0). When the fold is wired, the
-goldens and `PINNED_SQL_CORPUS` (`crates/pulsus-read/tests/golden_sql_freeze.rs:508`) move in the
+goldens and `PINNED_SQL_CORPUS` (`crates/pulsus-read/tests/golden_sql_freeze.rs:508` @ bf195076) move in the
 same commit.
 
 ### 11.2 The gates that reproduce each hand-written walk — all **#492 part 1** at base, none of them there then; all six exist today
@@ -5471,7 +5471,7 @@ choice. What changes is what a reader is entitled to conclude.
 
 | `NeverReason` | what it rules out | why no state can change it |
 |---|---|---|
-| `NeedsUnwindowedRootRead` | folding the winners' root read into the seed statement | the true root may start before the search window, so the root summary is read trace-wide with **no time predicate**, and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:305`). A window-bounded statement cannot produce it, whatever has accumulated |
+| `NeedsUnwindowedRootRead` | folding the winners' root read into the seed statement | the true root may start before the search window, so the root summary is read trace-wide with **no time predicate**, and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:276`). A window-bounded statement cannot produce it, whatever has accumulated |
 | `StructuralRelation` | pushing `>`, `>>`, `<`, `<<`, `~` into the seed statement | the relation holds between two spans of one trace, over a span set our own batching defines. Nothing in the seed statement's row scope can decide it |
 | `NestedSetNumbering` | pushing the modified-preorder numbering | it is computed per trace at query time; no stored column carries it, so there is nothing for SQL to read |
 | `TraceLevelIntrinsic` | pushing `traceDuration`, `rootName`, `rootServiceName` or `span:childCount` | they resolve from co-loads that are deliberately trace-wide and unwindowed, so they evaluate full-trace-exact whatever the search window is. A window-bounded statement cannot read those rows, in any state |
@@ -5539,22 +5539,21 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 669 |
-| of those, citing a bare basename | 482 |
-| of those, written as a continuation of a citation earlier in the paragraph | 70 |
-| of those continuations, on a later line than the citation they continue | 30 |
-| `(document, token)` pairs the rule resolves | 289 |
-| occurrences those resolved pairs cover | 396 |
-| `(document, token)` pairs it cannot resolve | 173 |
-| occurrences those frozen pairs cover | 273 |
-| resolved rows anchored on a token the citing prose prints | 156 |
-| resolved rows anchored on a snapshot of the cited line | 133 |
+| citation occurrences in the five artefacts | 659 |
+| of those, citing a bare basename | 480 |
+| of those, written as a continuation of a citation earlier in the paragraph | 66 |
+| of those continuations, on a later line than the citation they continue | 27 |
+| `(document, token)` pairs the rule resolves | 260 |
+| occurrences those resolved pairs cover | 356 |
+| `(document, token)` pairs it cannot resolve | 194 |
+| occurrences those frozen pairs cover | 303 |
+| resolved rows anchored on a token the citing prose prints | 142 |
+| resolved rows anchored on a snapshot of the cited line | 118 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 86 | the basename matches several tracked files and the citing line prints no identifier that separates them |
-| `blank_target_line` | 3 | the cited line exists and is **empty**, so there is nothing to anchor on |
-| `not_a_tracked_file` | 84 | the citation names a file the tree does not hold: a throwaway probe that was never committed, which §10 records deliberately, or a file of the previous search engine that #602 part 2c-2b deleted |
+| `ambiguous_basename` | 85 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `not_a_tracked_file` | 109 | the citation names a file the tree does not hold: a throwaway probe that was never committed, which §10 records deliberately, a file of the previous search engine that #602 part 2c-2b deleted, or a file of the previous metrics and graph SQL that #602 part 3a deleted |
 
 | the reviewed verdict on a fallback disagreement | cases |
 |---|---|
@@ -5567,15 +5566,11 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 669 citation occurrences the five artefacts make, 482 name a bare basename and 70 are written as a continuation of a citation earlier on the same line. The rule resolves 289 `(document, token)` pairs covering 396 occurrences, and cannot resolve 173 covering 273. Of the resolved rows, 156 are anchored on a token the citing prose prints and 133 on a snapshot of the cited line.
+Of the 659 citation occurrences the five artefacts make, 480 name a bare basename and 66 are written as a continuation of a citation earlier on the same line. The rule resolves 260 `(document, token)` pairs covering 356 occurrences, and cannot resolve 194 covering 303. Of the resolved rows, 142 are anchored on a token the citing prose prints and 118 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 2 citations, all of them read one at a time. 1 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
-The citations pointing at an empty line are `crates/pulsus-read/src/traces/metrics_sql.rs:627` (in `docs/query-lowering.md`), `metrics_sql.rs:951` (cited from 2 documents).
-
-The citations the rule answers differently for two occurrences of are .
-
-The citations where the fallback answers a file the citing prose does not describe are `exec.rs:2225-2227` in `docs/query-lowering.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
+The citations where the fallback answers a file the citing prose does not describe are `exec.rs:1302-1304` in `docs/query-lowering.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
 
 <!-- end generated -->
 
@@ -5647,8 +5642,8 @@ lines needs to print an identifier the cited line carries — the same rule the 
 a reading of the cited line against the claim beside it. The ones that disagreed across their
 occurrences were already read: the review established that their citing prose describes
 `logql/labels.rs`, `logql/sql.rs` and `logql/sql.rs`, and those citations need path-qualifying to
-say so. The `blank_target_line` rows are a smaller job of the same kind: they are citations pointing at
-nothing, and each needs a line number that means something. None of it is part 8's.
+say so. The rows whose cited line was blank all cited the previous metrics SQL, and they went
+with it (#602 part 3a). None of it is part 8's.
 
 **Running the regenerator is not a way to make a red check green.** The `line` and `anchor` of a
 resolved row are what the DOCUMENT claims, so a target that moves means the record's citation is

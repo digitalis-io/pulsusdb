@@ -5093,6 +5093,65 @@ async fn t_x4_the_memory_ceiling_bounds_a_metrics_read() {
     );
 }
 
+/// `T-X3`: the scan budget bounds a metrics read and a search read —
+/// `200` at the default, `422` naming the budget at one row (issue #602
+/// part 3a). **guard**.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_x3_the_scan_budget_bounds_a_metrics_and_a_search_read() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let low_port = 31_665;
+    let default_port = 31_666;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_t602_tx3")).await;
+    let base = metrics_base_ns();
+    let q = "{} | rate() by(resource.service.name)";
+    let search = |port: u16, ctx: &str| {
+        let path = format!(
+            "/api/traces/v1/search?q={}&start={}&end={}",
+            enc("{ }"),
+            base - 1_000_000_000,
+            base + 10_000_000_000
+        );
+        request(port, "GET", &path, None, &[])
+            .unwrap_or_else(|| panic!("{ctx}: request must be reachable (transport failure)"))
+    };
+    {
+        let _server = spawn_ready(default_port, &db);
+        push_fixture_61(default_port, base);
+        let res = metrics_range_q(default_port, q, base, "T-X3 default metrics");
+        assert_eq!(
+            res.status,
+            200,
+            "default metrics: {}",
+            String::from_utf8_lossy(&res.body)
+        );
+        let res = search(default_port, "T-X3 default search");
+        assert_eq!(
+            res.status,
+            200,
+            "default search: {}",
+            String::from_utf8_lossy(&res.body)
+        );
+    }
+    let _server = spawn_ready_with_env(low_port, &db, &[("PULSUS_TRACEQL_SCAN_BUDGET_ROWS", "1")]);
+    for (what, res) in [
+        (
+            "metrics",
+            metrics_range_q(low_port, q, base, "T-X3 low metrics"),
+        ),
+        ("search", search(low_port, "T-X3 low search")),
+    ] {
+        let body = String::from_utf8_lossy(&res.body).to_string();
+        assert_eq!(res.status, 422, "low {what}: {body}");
+        assert!(
+            body.contains("trace scan budget of 1 rows exceeded"),
+            "low {what}: {body}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unnarrowed_value_list_reads_tag_values_alone() {
     if !should_run() {

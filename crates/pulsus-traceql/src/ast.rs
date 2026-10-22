@@ -885,8 +885,8 @@ impl fmt::Display for StatusValue {
 /// not read it back.** `pulsus-read` renders `unspecified` into a
 /// `by(kind)` group value and a `select(kind)` projection
 /// (the search statement's decode) and into the `by(kind)`
-/// series label of served SQL (`traces/metrics_sql.rs`'s `KIND_MAP`, which
-/// maps code 0 to `'unspecified'`). The reference offers the same word
+/// series label of the metrics statement, which maps code 0 to
+/// `'unspecified'`. The reference offers the same word
 /// back from `/api/v2/search/tag/kind/values`, and the Grafana datasource
 /// writes an enum-intrinsic ad-hoc value UNQUOTED — so the query a user
 /// gets handed is `{kind=unspecified}`. The reference served it 200; we

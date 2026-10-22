@@ -63,10 +63,6 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
     // static 422 point-cap rejection) resolve without ClickHouse.
     let read_config = crate::chconfig::trace_read_config_from(&state.config);
     let ctx = pulsus_read::MetricsCtx {
-        filter: pulsus_read::SpanFilterCtx {
-            spans_table: &read_config.spans_table,
-            attrs_table: &read_config.attrs_table,
-        },
         scan_budget_rows: read_config.scan_budget_rows,
         max_series: read_config.max_series,
         distributed: read_config.distributed,
@@ -81,8 +77,8 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
         // than the retention cutoff, whether or not storage still holds it.
         floor_ns: params::retention_floor_ns(state.config.retention_days, now_ns),
     };
-    // Issue #596 part 1: the statement on `spans` where it serves the
-    // query, today's planner on the query itself where it does not.
+    // Issue #596 part 1: the statement on `spans` answers every query
+    // (issue #602 part 3a).
     let indexed = pulsus_read::traces::spans::attr_index::IndexedAttr::from_config(
         &state.config.traceql_indexed_attributes,
     );

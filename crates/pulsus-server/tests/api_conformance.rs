@@ -973,8 +973,8 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                 // recorded as `traceql-metrics-zero-fill-without-a-block`
                 // in docs/benchmarks/traces-differential-ledger.md and
                 // gated at the engine level by
-                // `crates/pulsus-read/tests/traces_metrics_live.rs`'s
-                // `a_no_match_range_query_returns_a_zero_filled_series`.
+                // `crates/pulsus-read/tests/traces_query_v2_live.rs`'s
+                // `an_empty_window`.
                 // This is that contract at the HTTP boundary.
                 //
                 // The expected grid is arithmetic on the literals in

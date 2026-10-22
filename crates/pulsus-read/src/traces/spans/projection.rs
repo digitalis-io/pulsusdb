@@ -47,7 +47,7 @@ use crate::logql::error::ReadError;
 use crate::logql::escape;
 use crate::traces::PlanError;
 use crate::traces::exec::ByteBudget;
-use crate::traces::filter::flip_comparison;
+use crate::traces::sql_text::flip_comparison;
 use crate::traces::values::{GroupValue, ProjectedAttribute, WireKey, go_duration_string};
 use pulsus_clickhouse::ChError;
 
@@ -254,7 +254,8 @@ impl Projection {
         }
     }
 
-    /// `select(field)` (issue #592 part 1), as today's engine projects it:
+    /// `select(field)` (issue #592 part 1), as the previous search engine
+    /// projected it:
     /// a span-row column on every span, `resource.service.name` included,
     /// as the span's own service, empty or not; any other attribute where
     /// the span holds it; nothing for the fields the envelope carries
@@ -827,8 +828,8 @@ fn comparison_value(
     let place = place_of(field);
     // Section 3.6's refusal comes before every operator's own rule, `!=`
     // and `!~` included: such a comparison projects nothing, but its
-    // predicate matches any pair of elements where today's engine reads
-    // each element against itself, so the statement must not serve it.
+    // predicate matches any pair of elements where the previous search
+    // engine read each element against itself, so the statement must not serve it.
     if matches!(place, Place::Set) {
         refuse_two_occurrences(field, lhs, rhs)?;
     }

@@ -73,7 +73,7 @@ use pulsus_traceql::{
 };
 
 use crate::logql::escape;
-use crate::traces::filter::{
+use crate::traces::sql_text::{
     PlanError, anchored_regex_sql, flip_comparison, kind_code, parse_num, render_num, sql_op,
     status_code,
 };
@@ -233,8 +233,8 @@ pub fn compile_span_predicate_in(
 }
 
 /// The leaf, for a caller that has already normalised to
-/// `(field, op, value)` — `filter::compile_leaf`'s shape, so the two
-/// compilers read against each other.
+/// `(field, op, value)` — the shape of the previous filter compiler's leaf,
+/// which went with the previous metrics SQL (#602 part 3a).
 pub fn compile_span_leaf(
     field: &Field,
     op: ComparisonOp,
@@ -509,7 +509,8 @@ fn not_of_field(expr: &FieldExpr) -> Option<&Field> {
 
 /// `(!operand) op literal` → the value `operand` must hold:
 /// `= b` wants `!b`, `!= b` wants `b`, and anything else matches nothing
-/// (`None`). The shipped rule, `filter.rs`'s `BoolMatch::of_comparison`.
+/// (`None`). The previous filter compiler's rule (`BoolMatch::of_comparison`,
+/// which went with the previous metrics SQL, #602 part 3a).
 fn bool_want(op: ComparisonOp, literal: &Value) -> Option<bool> {
     match (op, literal) {
         (ComparisonOp::Eq, Value::Bool(v)) => Some(!v),
@@ -3784,8 +3785,8 @@ fn leaf_parts(
             true,
             format!("(coalesce({} = {b}, false))", read(Read::Bool)),
         ),
-        // The message `filter.rs` produces for the same pair, so
-        // `{ span.k = error }` is the same `400` on both compilers.
+        // The message the previous filter compiler produced for the same
+        // pair (it went with the previous metrics SQL, #602 part 3a).
         _ => {
             return Err(PlanError::TypeMismatch(format!(
                 "attribute {key:?} does not support operator {op} on this value type"
@@ -3842,9 +3843,10 @@ fn intrinsic_leaf(
 /// **All eight operators**, which is where this compiler differs from the
 /// shipped one. `{ name > "x" }` is a reference `200` — strings order —
 /// and our own validator accepts it
-/// (`crates/pulsus-traceql/src/validate.rs`); `filter.rs`'s
-/// `string_op_leaf` answers `400` there, and that is strictness this
-/// compiler does not inherit.
+/// (`crates/pulsus-traceql/src/validate.rs`); the previous filter
+/// compiler's `string_op_leaf` answered `400` there (it went with the
+/// previous metrics SQL, #602 part 3a), strictness this compiler does not
+/// inherit.
 fn string_column_leaf(
     intrinsic: Intrinsic,
     column: &str,
@@ -3879,9 +3881,9 @@ pub(super) fn string_column_text(
 }
 
 /// `instrumentation:name` / `instrumentation:version`, and
-/// `resource.service.name`'s refusals and non-string fold, which keep
-/// `filter.rs`'s rule unchanged — the cross-type `=`/`!=` fold to `false`
-/// included. `name` is the field as the messages spell it.
+/// `resource.service.name`'s refusals and non-string fold, which keep the
+/// previous filter compiler's rule (it went with the previous metrics SQL,
+/// #602 part 3a) — the cross-type `=`/`!=` fold to `false` included. `name` is the field as the messages spell it.
 ///
 /// `docs/api.md` names these two fields (with `resource.service.name`) and
 /// says of them that a cross-type `=~`/`!~` and **any ordered comparison
@@ -3914,8 +3916,8 @@ fn untyped_string_leaf(
         }),
         // A cross-type `=`/`!=` is a query the reference's own validator
         // accepts and answers, so it matches no span rather than being a
-        // plan error. Both spellings fold to `false`, as `filter.rs`'s
-        // `never_matching_leaf` does.
+        // plan error. Both spellings fold to `false`, as the previous filter
+        // compiler's `never_matching_leaf` did.
         _ if matches!(op, ComparisonOp::Eq | ComparisonOp::Neq) => Ok("false".to_string()),
         _ => Err(PlanError::TypeMismatch(format!(
             "{name} requires a string value"
@@ -3963,8 +3965,9 @@ fn status_leaf(op: ComparisonOp, value: &Value) -> Result<String, PlanError> {
 /// `end_ns - start_ns`, which is the same number on the worked fixture and
 /// so is not what distinguishes them.
 ///
-/// The operand is checked BEFORE the operator, which is `filter.rs`'s own
-/// order: that is what makes `{ duration =~ "x" }` answer "requires a
+/// The operand is checked BEFORE the operator, the previous filter
+/// compiler's order (it went with the previous metrics SQL, #602 part 3a):
+/// that is what makes `{ duration =~ "x" }` answer "requires a
 /// duration literal" on both compilers rather than two different messages
 /// for one query.
 fn duration_leaf(op: ComparisonOp, value: &Value) -> Result<String, PlanError> {

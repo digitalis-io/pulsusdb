@@ -42,42 +42,22 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "span-name values read (issue #478) - same class again: outside the search budget by design (no ByteBudget on this path), hard-bounded by the SQL LIMIT to TAG_VALUES_MAX + 1 rows, each at most the 8192-byte string-column cap"),
     ("exec.rs", "new", "Vec::new", 1,
      "the engine's indexed attributes (issue #595 part 2): an empty Vec::new() at construction, once per engine and never per query - nothing to charge"),
-    ("exec.rs", "frame_range_series", "Vec::new", 4,
-     "metrics range series/samples (issue #59/#182) - outside the search ByteBudget by design (no ByteBudget on this path); hard-bounded by MAX_METRICS_POINTS + 1 emitted buckets x the series count (grouped series pre-capped by reader.traceql_max_series via the distinct-by-key probe; the quantile series count is the requested quantile list, and since issue #252 the histogram's is data-dependent but hard-bounded by the bit width of Int64 (63 reachable buckets)). Issue #477 split this function out of frame_range so the densify post-pass has its own charge row below; the bound is unchanged"),
-    ("exec.rs", "frame_range_series", ".collect", 3,
-     "same bound as frame_range_series Vec::new: quantile per-series init, the issue #252 histogram's per-bucket tally map -> series map, and grouped by-partition framing, all bounded by the fixed/probe-capped/64-bucket series count x MAX_METRICS_POINTS + 1 buckets"),
     ("exec.rs", "densify", "Vec::with_capacity", 1,
-     "issue #477: the densified sample vector, allocated at exactly RangeAxis::points, which the planner capped at MAX_METRICS_POINTS + 1 before any SQL ran - the fill is computed from the window and the step, so it reads no row and adds no scan; same metrics carve-out as frame_range_series"),
+     "issue #477: the densified sample vector, allocated at exactly RangeAxis::points, which the planner capped at MAX_METRICS_POINTS + 1 before any SQL ran - the fill is computed from the window and the step, so it reads no row and adds no scan; outside the search ByteBudget by design, as every metrics framing"),
     ("exec.rs", "densify", ".collect", 1,
      "same bound as densify Vec::with_capacity: the framed (label -> value) lookup map, bounded by the already-materialized sample count of the series being densified"),
-    ("exec.rs", "frame_instant", "Vec::new", 2,
-     "metrics instant series/samples - one sample per series; series count fixed (quantile), <= 63 reachable buckets (issue #252 histogram) or probe-capped (grouped), same design carve-out as frame_range_series"),
-    ("exec.rs", "frame_instant", ".collect", 2,
-     "same bound as frame_instant Vec::new: per-series instant framing over the fixed/probe-capped/64-bucket series count"),
-    ("exec.rs", "apply_series_reduce", ".collect", 2,
-     "topk/bottomk client-side reduction (issue #182 P5) over the ALREADY-materialized (probe-capped) series set; the per-timestamp rank/keep buffers are bounded by that series count"),
-    ("exec.rs", "attach_range_exemplars", "Vec::new", 1,
-     "exemplar list (issue #182 P5) - bounded by the total exemplar budget (issue #477: MAX_EXEMPLARS for the whole response, thinned to it after collection), and DURING collection by EXEMPLAR_COLLECTION_CEILING, which decimate_if_full enforces by halving the list in place (issue #477 wave 2: the statement now returns one row per bucket AND series identity - a log2 duration bucket, or a comparison side and attribute key - so the row count is no longer bounded by the bucket grid alone); outside the search ByteBudget by design"),
-    ("exec.rs", "attach_range_exemplars", ".collect", 5,
-     "issue #477 wave 2: the per-series value-at-bucket lookup maps (one Vec of BTreeMaps over the ALREADY-materialized series, each bounded by MAX_METRICS_POINTS buckets) plus ONE series-identity index per shape - group value, log2 bucket bound, or (meta type, attribute key) - each bounded by the same probe-capped series count. Exactly one of the three index maps is built per query (the match arms are exclusive); all are built from the framed answer and read no row; same metrics carve-out"),
     ("exec.rs", "thin_collected_exemplars", ".collect", 1,
      "issue #477: the even-stride reduction of an already-materialized exemplar list down to the total exemplar budget - the kept vector is bounded by that budget (MAX_EXEMPLARS), strictly smaller than the list it replaces, and the stride is taken over the WHOLE response so a grouped answer cannot multiply the budget by its series count; same metrics carve-out"),
-    ("exec.rs", "frame_compare", "Vec::new", 7,
-     "compare() meta-series (issue #182 P6b) - outside the search ByteBudget by design; the cross-tab (key,value) cardinality is pre-capped by reader.traceql_max_series via the distinct-(key,value) probe (enforce_series_cap runs it first), and the per-key nil/total buffers are bounded by the bucket count (MAX_METRICS_POINTS). Issue #460 adds the two topN rank-and-keep buffers (rank_base/rank_sel), allocated ONCE outside the per-key loop and cleared per key, each bounded by that key's distinct value count and so by the same probe cap"),
-    ("exec.rs", "frame_compare", ".collect", 4,
-     "same bound as frame_compare Vec::new: per-(key,value) baseline/selection sample vectors + the fixed well-known-absent key=nil/total vectors (WELL_KNOWN_COMPARE_KEYS, a bounded 25-key constant), all bounded by the probe-capped series count x MAX_METRICS_POINTS buckets"),
     ("exec.rs", "frame_compare_rows", "Vec::new", 6,
-     "issue #597: the compare() statement's series - outside the search ByteBudget, as frame_compare; the rows are bounded inside the statement, which throws past reader.traceql_max_series counted as the values kept after topN on both sides plus four per key, plus the 25 well-known keys (WELL_KNOWN_COMPARE_KEYS), each series at most MAX_METRICS_POINTS buckets; the exemplar list as attach_range_exemplars, thinned to the total budget"),
+     "issue #597: the compare() statement's series - outside the search ByteBudget by design; the rows are bounded inside the statement, which throws past reader.traceql_max_series counted as the values kept after topN on both sides plus four per key, plus the 25 well-known keys (WELL_KNOWN_COMPARE_KEYS), each series at most MAX_METRICS_POINTS buckets; the exemplar list is bounded by EXEMPLAR_COLLECTION_CEILING while collected and thinned to the total exemplar budget"),
     ("exec.rs", "frame_compare_rows", ".collect", 7,
      "same bound as frame_compare_rows Vec::new: per-series sample vectors and the value-at-bucket and total-series index maps over the already-materialized series"),
-    ("exec.rs", "keep_top_n", ".collect", 1,
-     "compare()'s topN kept-value set (issue #460): built once per attribute PER SIDE and dropped before the next attribute, bounded by min(top_n, that attribute's distinct value count) - and that distinct count is itself pre-capped by reader.traceql_max_series via the distinct-(key,value) probe enforce_series_cap runs first; same metrics carve-out from the search ByteBudget as frame_compare"),
     ("exec.rs", "hex16", "String::with_capacity", 1,
-     "a single 32-char trace-id hex string per exemplar (bounded set, see attach_range_exemplars); metrics carve-out"),
+     "a single 32-char trace-id hex string per exemplar (bounded by the total exemplar budget); metrics carve-out"),
     ("exec.rs", "hex16", "format!", 1,
      "per-byte hex formatting of the 16-byte trace id (32 chars total); metrics carve-out"),
     ("exec.rs", "service_graph", "Vec::new", 1,
-     "service-graph edges (issue #173) - same class as list_tag_names/metrics_range: outside the search ByteBudget by design (no ByteBudget on this path); hard-bounded by the SQL LIMIT to SERVICE_GRAPH_MAX_EDGES + 1 rows"),
+     "service-graph edges (issue #173) - same class as list_tag_names: outside the search ByteBudget by design (no ByteBudget on this path); hard-bounded by the SQL LIMIT to SERVICE_GRAPH_MAX_EDGES + 1 rows"),
     // ---- values.rs: the value types moved out of the deleted search_eval.rs ----
     ("values.rs", "new", "HashSet::", 1,
      "GroupCardinalityCounter::new: the empty distinct-group set (HashSet::new allocates nothing; each distinct tuple is charged group_tuple_bytes in observe() BEFORE insert, released on the success path)"),
@@ -235,12 +215,7 @@ fn no_charge_rationale_describes_a_per_bucket_exemplar_cap() {
             "{file}/{func}/{token}: describes a per-bucket exemplar bound, and the bound is a total"
         );
     }
-    let (_, _, _, _, charge) = ALLOWLIST
-        .iter()
-        .find(|(_, f, t, _, _)| *f == "attach_range_exemplars" && *t == "Vec::new")
-        .expect("the exemplar allocation row exists");
-    assert!(
-        charge.contains("total exemplar budget"),
-        "the exemplar list's rationale must state the bound it actually has: {charge}"
-    );
+    // Its second half read the exemplar list's row, `attach_range_exemplars`,
+    // which went with the previous metrics SQL (#602 part 3a); the statement
+    // bounds its exemplars in SQL.
 }

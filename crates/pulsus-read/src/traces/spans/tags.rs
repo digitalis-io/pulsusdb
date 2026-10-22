@@ -52,7 +52,7 @@ use pulsus_traceql::{
 use super::predicate::{PredicateCtx, SpanPredicate, attr_path, compile_span_predicate_in};
 use super::projection::ceiling_sql;
 use super::tracelevel::TraceLeaf;
-use crate::traces::filter::byte_cap_expr;
+use crate::traces::sql_text::byte_cap_expr;
 use crate::traces::window_sql::WindowSql;
 
 /// The five scopes the writer catalogues for sender-supplied ATTRIBUTES,

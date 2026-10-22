@@ -720,7 +720,7 @@ fn check_d8_the_like_renderer_states_its_pruning_residual() {
 
 /// D7 (secondary; D1–D6 cannot see other files): the exemption
 /// call-site table. One entry since issue #282 retired TraceQL's
-/// placeholder token — `traces/filter.rs` renders through
+/// placeholder token — `traces/sql_text.rs` renders through
 /// `ch_regex_anchored_checked` and holds no capability at all.
 ///
 /// Issue #315 moved the entry from `metrics/sql.rs` to
@@ -2101,7 +2101,9 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // statement 1: the probe line and the label-values regex in each.
     ("pulsus-read/src/metrics/series_where.rs", 26),
     ("pulsus-read/src/metrics/sql.rs", 24),
-    ("pulsus-read/src/traces/filter.rs", 12),
+    // Issue #602 part 3a removes `traces/filter.rs` and its twelve with the
+    // previous metrics SQL; its regex renderer moved to `traces/sql_text.rs`,
+    // which spells no `match(`.
     // Issue #602 part 2c-2b-2 removes `traces/search_plan.rs` and its two.
     // Issues #588 and #589. The span-scope predicate compiler: four render
     // sites, each spelled once for `=~` and once for `!~` — an attribute's
@@ -2109,18 +2111,18 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // instrumentation columns, and the three id columns' hex text — and
     // two spelled once, the `link:` ids' hex text and `.service.name`'s
     // `service` column in the unscoped chain. Every one takes its pattern
-    // from `anchored_regex_sql`, the leaf `filter.rs` uses. No production
+    // from `anchored_regex_sql`, the leaf `sql_text.rs` holds. No production
     // caller yet.
     ("pulsus-read/src/traces/spans/predicate.rs", 10),
     // Issue #592 part 3. The aggregate's number test: an attribute's
     // stored text matched against the writer's number grammar, its pattern
-    // from `anchored_regex_sql`, the leaf `filter.rs` uses.
+    // from `anchored_regex_sql`, the leaf `sql_text.rs` holds.
     ("pulsus-read/src/traces/spans/search.rs", 1),
 ];
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 117;
+const MATCH_RENDER_TOTAL: usize = 105;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.

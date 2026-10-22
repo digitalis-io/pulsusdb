@@ -436,11 +436,9 @@ impl GroupCardinalityCounter {
     }
 }
 
-/// The engine's numeric comparator. `pub(super)` so the metrics filter
-/// compiler's `nestedSetParent` lowering (issue #458) decides the root
-/// sentinel's truth with the SAME operator table Phase 2 uses — a
-/// re-spelling in `metrics_sql` could drift the metrics answer from the
-/// search answer with nothing to catch it.
+/// The engine's numeric comparator. It was shared with the previous metrics
+/// filter compiler's `nestedSetParent` lowering (issue #458), which went
+/// with the previous metrics SQL (#602 part 3a).
 pub(crate) fn cmp_f64(op: ComparisonOp, lhs: f64, rhs: f64) -> bool {
     match op {
         ComparisonOp::Eq => lhs == rhs,

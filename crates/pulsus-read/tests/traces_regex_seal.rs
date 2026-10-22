@@ -24,11 +24,7 @@ fn read(rel: &str) -> String {
 /// escape-module table is edited to match.
 #[test]
 fn traces_holds_no_capability_token_for_the_raw_escapers() {
-    for rel in [
-        "src/traces/mod.rs",
-        "src/traces/filter.rs",
-        "src/traces/metrics_sql.rs",
-    ] {
+    for rel in ["src/traces/mod.rs", "src/traces/sql_text.rs"] {
         let text = read(rel);
         for banned in [
             "TraceqlPrevalidated",
