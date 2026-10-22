@@ -6525,7 +6525,14 @@ fn relative_answer(
                     }
                 }
             }
-            format!("Ok({o:?})")
+            // The record was taken when `SearchOutput` still carried
+            // `partial`, always `false`; it is the previous engine's answer
+            // and cannot be taken again, so the answer is written in the
+            // record's form (issue #602 part 3c).
+            format!(
+                "Ok(SearchOutput {{ traces: {:?}, partial: false, returned: {}, limit: {} }})",
+                o.traces, o.returned, o.limit
+            )
         }
     }
 }
@@ -10770,7 +10777,7 @@ fn last_bytes(out: &pulsus_read::traces::SearchOutput) -> Vec<String> {
         .collect()
 }
 
-/// `(answer, statements, explain stages, partial)` for `query` over
+/// `(answer, statements, explain stages)` for `query` over
 /// `[e - 3 h, e)` at `limit`; a trace that matched more than one span is
 /// written `…2a×2`.
 async fn sliced_run(
@@ -10780,7 +10787,7 @@ async fn sliced_run(
     e: i64,
     query: &str,
     limit: u32,
-) -> (Vec<String>, u64, String, bool) {
+) -> (Vec<String>, u64, String) {
     let plan = plan_of(
         engine,
         &parse_query(query),
@@ -10795,7 +10802,7 @@ async fn sliced_run(
         .unwrap_or_else(|err| panic!("{query}: {err}"));
     let (n, _) = settled_statements(client, db, t0).await;
     let stages: Vec<&str> = explain.stages.iter().map(|s| s.name).collect();
-    (last_bytes(&out), n, stages.join(" "), out.partial)
+    (last_bytes(&out), n, stages.join(" "))
 }
 
 /// The explain stages of `slices` sliced statements, then the whole
@@ -10892,11 +10899,11 @@ async fn the_newest_slice_first_plan_answers_fixture_p() {
             stages595(1, true),
         ),
     ] {
-        let (got, n, seen, partial) = sliced_run(&engine, &client, &db, e, query, limit).await;
-        if got != want || n != statements || seen != stages || partial {
+        let (got, n, seen) = sliced_run(&engine, &client, &db, e, query, limit).await;
+        if got != want || n != statements || seen != stages {
             wrong.push(format!(
-                "{query} limit {limit}: {got:?} in {n} statements ({seen}), partial {partial}; \
-                 want {want:?} in {statements} ({stages}), partial false"
+                "{query} limit {limit}: {got:?} in {n} statements ({seen}); \
+                 want {want:?} in {statements} ({stages})"
             ));
         }
     }
@@ -10918,13 +10925,12 @@ async fn the_statement_count_reaches_its_bound_and_no_further() {
     .await;
     let engine = engine_of(&db).await;
     let want: Vec<String> = (1..=19_u8).map(|n| format!("…{n:02x}")).collect();
-    let (got, n, seen, partial) =
-        sliced_run(&engine, &client, &db, e, "{ span.app.bound }", 20).await;
+    let (got, n, seen) = sliced_run(&engine, &client, &db, e, "{ span.app.bound }", 20).await;
     drop_db(&db).await;
     assert_eq!(
-        (got, n, seen, partial),
-        (want, 7, stages595(6, true), false),
-        "the answer, the statement count, the explain stages and partial"
+        (got, n, seen),
+        (want, 7, stages595(6, true)),
+        "the answer, the statement count and the explain stages"
     );
 }
 
@@ -11134,9 +11140,9 @@ async fn a_slice_the_budget_refuses_falls_back_to_the_window() {
         .collect();
     let stages: Vec<&str> = explain.stages.iter().map(|s| s.name).collect();
     assert_eq!(
-        (last_bytes(&out), stages.join(" "), out.partial),
-        (want, stages595(1, true), false),
-        "the answer, the explain stages and partial"
+        (last_bytes(&out), stages.join(" ")),
+        (want, stages595(1, true)),
+        "the answer and the explain stages"
     );
 }
 

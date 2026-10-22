@@ -1333,6 +1333,8 @@ when we are asking it to slow down, so we keep `429`; recorded as
 
 ### `traceql-search-metrics-completed-jobs` (issue #464) — **a repurposing, not a new field**
 
+**Since issue #602 part 3c there is no truncated branch: a search is answered whole or refused, and every answer carries `completedJobs`/`totalJobs` as `1`/`1`. The `0`/`1` case below describes the code before it.**
+
 - **What.** On `GET /api/traces/v1/search` and its `GET /api/search`
   alias, the `metrics` block carries `completedJobs`/`totalJobs` as `1`/`1`
   on a complete result and `0`/`1` on a truncated one, with the zero
@@ -1396,9 +1398,9 @@ when we are asking it to slow down, so we keep `429`; recorded as
   have.
 
 - **How it is gated.** `crates/pulsus-server/src/traces_api/search_response.rs`'s
-  `the_metrics_block_is_the_reference_jobs_pair_on_both_partiality_branches`
+  `the_metrics_block_is_one_completed_job`
   and `every_metrics_key_is_a_tempopb_search_metrics_field` pin the whole
-  object and the key set per branch;
+  object and the key set;
   `crates/pulsus-server/tests/traces_search_live.rs` asserts the real wire
   bytes against `test/fixtures/traces/search_metrics.json`, and
   `e2e/src/traces.rs` feeds the same two committed blocks to the

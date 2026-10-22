@@ -70,8 +70,8 @@ pub struct CatalogValuesRow {
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct TagValueRow {
     pub val: String,
-    /// The stored OTLP type (`string`/`int`/`float`/`bool`), or the EMPTY
-    /// string for a row written before issue #476's migration 41 added the
-    /// column. The renderer reports an empty one as `string`.
+    /// The stored OTLP type (`string`/`int`/`float`/`bool`), which the
+    /// writer always sets (`TraceJsonScalar::val_type`). The renderer
+    /// reports it verbatim.
     pub val_type: String,
 }

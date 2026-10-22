@@ -402,16 +402,23 @@ awk -v n="$rewrite_start" 'NR == n { print $0 " (follow-up issue 999999)"; next 
 mv "$work/patched" "$work/tree/$rewrite_file"
 expect_fail "new issue number #999999"
 
-echo "self-test: a number the merged upstream head introduced is still not licensed"
+echo "self-test: a number the merged upstream head carries is still not licensed"
 # The added-lines comparison runs against the merged upstream head, not
 # the base, so that main's own issue numbers are not reported as ones
 # this change invented. The hole that would open is "any number main
 # mentions is allowed". It is not: the allowed set is still the base's
-# protected blocks plus the `refs=` column, and a number this change puts
-# on a NEW line is caught whatever main says elsewhere in the file.
+# protected blocks, the `refs=` column and `#494`, and a number this
+# change puts on a NEW line is caught whatever main says elsewhere in the
+# file.
 #
-# The number is derived — present in the rewrite file at the merged head
-# and absent from it at the base — so the attack cannot go stale.
+# The number is derived from the rewrite file at the merged head, and is
+# one the check does not allow for that file. One main introduced since
+# the base is preferred; when main introduced none, any number the file
+# carries outside its protected blocks tests the same hole. Measured: at
+# a merged head whose `docs/schemas.md` gained only `#494` over the base,
+# the derivation that required a number absent at the base chose `#494`,
+# which the check allows in every file, and the attack reported itself
+# uncaught against an UNCHANGED tree.
 copy_tree
 MERGEDREV=$(git -C "$REPO" rev-parse "$PULSUSDB_DOC_SITES_UPSTREAM^{commit}")
 if [ "$MERGEDREV" != "$(git -C "$REPO" rev-parse "$BASE^{commit}")" ]; then
@@ -432,9 +439,24 @@ if [ "$MERGEDREV" != "$(git -C "$REPO" rev-parse "$BASE^{commit}")" ]; then
       n = split($3, r, ",")
       for (i = 1; i <= n; i++) { print r[i] }
     }' "$REPO/ci/checks/doc_sites.txt" | LC_ALL=C sort -u > "$work/licensed.refs"
+  # **And the ones the check allows without a column**: the references
+  # inside this file's protected base blocks, and `#494`, which
+  # `doc_sites.sh` allows in every file. Picking one of those tests that
+  # allowance, not the rule.
+  git show "$BASE:$rewrite_file" > "$work/base.file"
+  awk '$1 == "rewrite" { print $2 }' "$REPO/ci/checks/doc_sites.txt" \
+    | while IFS= read -r site; do
+        [ "${site%%:*}" = "$rewrite_file" ] || continue
+        range=${site#*:}
+        sed -n "${range%%-*},${range#*-}p" "$work/base.file"
+      done | grep -oE '#[0-9]+' > "$work/allowed.raw" || true
+  printf '#494\n' >> "$work/allowed.raw"
+  cat "$work/licensed.refs" >> "$work/allowed.raw"
+  LC_ALL=C sort -u "$work/allowed.raw" > "$work/allowed.refs"
   from_main=$(LC_ALL=C comm -13 "$work/base.refs" "$work/merged.refs" \
-    | LC_ALL=C comm -23 - "$work/licensed.refs" | head -1)
-  [ -n "$from_main" ] || fail "the merged head introduced no unlicensed reference into $rewrite_file"
+    | LC_ALL=C comm -23 - "$work/allowed.refs" | head -1)
+  [ -n "$from_main" ] || from_main=$(LC_ALL=C comm -23 "$work/merged.refs" "$work/allowed.refs" | head -1)
+  [ -n "$from_main" ] || fail "the merged head carries no reference the check disallows in $rewrite_file"
   awk -v n="$rewrite_start" -v ref="$from_main" \
     'NR == n { print $0 " (follow-up " ref ")"; next } { print }' \
     "$work/tree/$rewrite_file" > "$work/patched"

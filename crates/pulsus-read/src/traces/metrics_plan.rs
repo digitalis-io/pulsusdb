@@ -368,7 +368,7 @@ pub fn plan_trace_metrics(
     // Issue #477 (a)/(b): the RANGE form reads the right-closed instants
     // `(aS - step, aE]`, which over integer nanoseconds is exactly the
     // left-closed/right-open `[aS - step + 1, aE + 1)` the existing
-    // `time_clause`/`date_clause` render — so neither of those moves. One
+    // `span_time_clause`/`span_day_clause` render — so neither moves. One
     // whole step wider on the left, because the leading bucket's value is
     // measured to come from that data; and one nanosecond wider on the
     // right, because `aE` itself belongs to the last bucket.

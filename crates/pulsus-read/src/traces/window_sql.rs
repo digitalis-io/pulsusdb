@@ -23,7 +23,7 @@
 //!       reads partitions ... D            (no row in D+1 can match)
 //! ```
 //!
-//! The row bound (`timestamp_ns` operators) and the day bound (the
+//! The row bound (`time_clause_on`) and the day bound (the
 //! `date` partition prune) are two renderings of ONE fact: which
 //! nanosecond is the last the window contains. Before this module they
 //! were written out separately in three files, so the day bound could be
@@ -128,11 +128,11 @@ pub const RECENT_BUCKET_NS: i64 = 300_000_000_000;
 /// window and both clauses follow it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowBounds {
-    /// `timestamp_ns > start_ns AND timestamp_ns <= end_ns`. `end_ns`
+    /// `<column> > start_ns AND <column> <= end_ns`. `end_ns`
     /// itself is IN the window, so the last included nanosecond is
     /// `end_ns` and the end day is `end_ns`'s day.
     StartOpenEndClosed,
-    /// `timestamp_ns >= start_ns AND timestamp_ns < end_ns`. `end_ns`
+    /// `<column> >= start_ns AND <column> < end_ns`. `end_ns`
     /// itself is OUT of the window, so the last included nanosecond is
     /// `end_ns - 1` and the end day is `(end_ns - 1)`'s day — a window
     /// ending exactly at midnight never drags in the next day's
@@ -155,8 +155,8 @@ pub struct WindowSql {
 }
 
 impl WindowSql {
-    /// A window rendering `timestamp_ns > start_ns AND timestamp_ns <=
-    /// end_ns` — `end_ns` is IN the window.
+    /// A window rendering `<column> > start_ns AND <column> <= end_ns` —
+    /// `end_ns` is IN the window.
     pub fn start_open_end_closed(start_ns: i64, end_ns: i64) -> Self {
         WindowSql {
             start_ns,
@@ -165,8 +165,8 @@ impl WindowSql {
         }
     }
 
-    /// A window rendering `timestamp_ns >= start_ns AND timestamp_ns <
-    /// end_ns` — `end_ns` is OUT of the window.
+    /// A window rendering `<column> >= start_ns AND <column> < end_ns` —
+    /// `end_ns` is OUT of the window.
     pub fn start_closed_end_open(start_ns: i64, end_ns: i64) -> Self {
         WindowSql {
             start_ns,
@@ -191,7 +191,7 @@ impl WindowSql {
 
     /// The first nanosecond the window contains — the mirror of
     /// [`WindowSql::last_included_ns`], for a clause whose operators are
-    /// written out rather than rendered by [`WindowSql::time_clause`].
+    /// written out rather than rendered by [`WindowSql::time_clause_on`].
     ///
     /// The search and metrics statements' slice and numbering bounds are
     /// such clauses (`spans/search.rs`, `spans/tracelevel.rs`,
@@ -206,14 +206,8 @@ impl WindowSql {
         }
     }
 
-    /// The row-level bound on `timestamp_ns`, operators chosen by the
-    /// convention.
-    pub fn time_clause(self) -> String {
-        self.time_clause_on("timestamp_ns")
-    }
-
-    /// [`WindowSql::time_clause`] over a named column, because the trace
-    /// fetch's span table calls the same quantity `start_ns` (issue #587).
+    /// The row-level bound on `column`, operators chosen by the
+    /// convention (issue #587).
     ///
     /// **Factored, not duplicated.** A second rendering of the row bound
     /// is a second place the convention's operators can be written down,
@@ -237,9 +231,8 @@ impl WindowSql {
         self.time_clause_on("start_ns")
     }
 
-    /// The span table's daily-partition bound (issue #588), the SECOND
-    /// production delegation to [`date_clause_on`] —
-    /// [`WindowSql::date_clause`] is the first.
+    /// The span table's daily-partition bound (issue #588), the
+    /// production delegation to [`date_clause_on`].
     ///
     /// The expression is byte-identical to `spans`' own `PARTITION BY`
     /// (`schema/schema.sql`), **including the explicit `'UTC'`**: a bare
@@ -321,15 +314,12 @@ impl WindowSql {
         )
     }
 
-    /// The daily-partition pruning clause on the `date` column —
-    /// `date >= toDate('…') AND date <= toDate('…')`, the same
-    /// expression a table partitioned by a `date` column is partitioned
-    /// by, so it prunes parts rather than filtering rows. No production
-    /// statement reads such a column; [`WindowSql::date_clause_on`] is the
-    /// one in use.
+    /// The daily-partition pruning clause on `column` —
+    /// `<column> >= toDate('…') AND <column> <= toDate('…')`, so it prunes
+    /// parts rather than filtering rows (issue #587).
     ///
     /// The end day comes from [`WindowSql::last_included_ns`], which is
-    /// what makes it agree with [`WindowSql::time_clause`].
+    /// what makes it agree with [`WindowSql::time_clause_on`].
     ///
     /// The START day is `start_ns`'s own day under BOTH conventions,
     /// including `StartOpenEndClosed` where `start_ns` is excluded. A
@@ -340,13 +330,6 @@ impl WindowSql {
     /// because narrowing it would move committed SQL; it is recorded
     /// here so the asymmetry reads as a decision rather than an
     /// oversight.
-    pub fn date_clause(self) -> String {
-        self.date_clause_on("date")
-    }
-
-    /// [`WindowSql::date_clause`] over a named column (issue #587), the
-    /// same factoring as [`WindowSql::time_clause_on`] and for the same
-    /// reason.
     pub fn date_clause_on(self, column: &str) -> String {
         let start_days = self.start_ns.div_euclid(NS_PER_DAY);
         let end_days = self.last_included_ns().div_euclid(NS_PER_DAY);
@@ -407,16 +390,16 @@ mod tests {
     #[test]
     fn the_closed_end_convention_renders_its_operators() {
         assert_eq!(
-            WindowSql::start_open_end_closed(10, 20).time_clause(),
-            "timestamp_ns > 10 AND timestamp_ns <= 20"
+            WindowSql::start_open_end_closed(10, 20).span_time_clause(),
+            "start_ns > 10 AND start_ns <= 20"
         );
     }
 
     #[test]
     fn the_open_end_convention_renders_its_operators() {
         assert_eq!(
-            WindowSql::start_closed_end_open(10, 20).time_clause(),
-            "timestamp_ns >= 10 AND timestamp_ns < 20"
+            WindowSql::start_closed_end_open(10, 20).span_time_clause(),
+            "start_ns >= 10 AND start_ns < 20"
         );
     }
 
@@ -425,7 +408,7 @@ mod tests {
     #[test]
     fn a_closed_end_at_midnight_keeps_the_day_the_boundary_starts() {
         assert_eq!(
-            WindowSql::start_open_end_closed(PREV_MIDNIGHT_NS, MIDNIGHT_NS).date_clause(),
+            WindowSql::start_open_end_closed(PREV_MIDNIGHT_NS, MIDNIGHT_NS).date_clause_on("date"),
             "date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')"
         );
     }
@@ -435,7 +418,7 @@ mod tests {
     #[test]
     fn an_open_end_at_midnight_drops_the_day_the_boundary_starts() {
         assert_eq!(
-            WindowSql::start_closed_end_open(PREV_MIDNIGHT_NS, MIDNIGHT_NS).date_clause(),
+            WindowSql::start_closed_end_open(PREV_MIDNIGHT_NS, MIDNIGHT_NS).date_clause_on("date"),
             "date >= toDate('2023-11-14') AND date <= toDate('2023-11-14')"
         );
     }
@@ -450,8 +433,8 @@ mod tests {
         let closed = WindowSql::start_open_end_closed(PREV_MIDNIGHT_NS, MIDNIGHT_NS);
         let open = WindowSql::start_closed_end_open(PREV_MIDNIGHT_NS, MIDNIGHT_NS);
         assert_ne!(
-            closed.date_clause(),
-            open.date_clause(),
+            closed.date_clause_on("date"),
+            open.date_clause_on("date"),
             "a window ending exactly at midnight touches one more day when its end is \
              INCLUDED than when it is EXCLUDED; if these render alike, one convention has \
              been given the other's day rule — and the two directions differ: widening the \
@@ -468,8 +451,8 @@ mod tests {
     fn the_two_conventions_agree_about_a_window_ending_mid_day() {
         let mid = MIDNIGHT_NS + 4_400_000_000_000;
         assert_eq!(
-            WindowSql::start_open_end_closed(PREV_MIDNIGHT_NS, mid).date_clause(),
-            WindowSql::start_closed_end_open(PREV_MIDNIGHT_NS, mid).date_clause()
+            WindowSql::start_open_end_closed(PREV_MIDNIGHT_NS, mid).date_clause_on("date"),
+            WindowSql::start_closed_end_open(PREV_MIDNIGHT_NS, mid).date_clause_on("date")
         );
     }
 
@@ -479,11 +462,11 @@ mod tests {
     #[test]
     fn a_pre_epoch_open_end_at_midnight_drops_the_day_the_boundary_starts() {
         assert_eq!(
-            WindowSql::start_closed_end_open(-2 * NS_PER_DAY, -NS_PER_DAY).date_clause(),
+            WindowSql::start_closed_end_open(-2 * NS_PER_DAY, -NS_PER_DAY).date_clause_on("date"),
             "date >= toDate('1969-12-30') AND date <= toDate('1969-12-30')"
         );
         assert_eq!(
-            WindowSql::start_open_end_closed(-2 * NS_PER_DAY, -NS_PER_DAY).date_clause(),
+            WindowSql::start_open_end_closed(-2 * NS_PER_DAY, -NS_PER_DAY).date_clause_on("date"),
             "date >= toDate('1969-12-30') AND date <= toDate('1969-12-31')"
         );
     }
@@ -542,19 +525,6 @@ mod tests {
         assert_ne!(w.span_time_clause(), inclusive.span_time_clause());
         assert_ne!(w.resources_day_clause(), inclusive.resources_day_clause());
         assert_ne!(w.span_bucket_clause(), inclusive.span_bucket_clause());
-    }
-
-    /// The row bound factored on a column name renders the same text for
-    /// the old column as it did before the factoring — the refactor's own
-    /// guard, so the search path's committed SQL cannot move underneath
-    /// it.
-    #[test]
-    fn the_factored_row_and_day_bounds_still_render_the_original_columns() {
-        let w = WindowSql::start_closed_end_open(PREV_MIDNIGHT_NS, MIDNIGHT_NS);
-        assert_eq!(w.time_clause(), w.time_clause_on("timestamp_ns"));
-        assert_eq!(w.date_clause(), w.date_clause_on("date"));
-        assert!(w.time_clause().starts_with("timestamp_ns >= "));
-        assert!(w.date_clause().starts_with("date >= toDate('"));
     }
 
     /// The resource-day bound's one owning text, called with bound NAMES

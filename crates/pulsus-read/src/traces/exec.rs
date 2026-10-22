@@ -298,13 +298,13 @@ pub struct TraceSearchResult {
 
 /// The search result: `traces` ordered by the public contract (max
 /// matched-span `timestamp_ns` DESC, `trace_id` ASC — docs/api.md §4.2).
+///
+/// It carries no completeness flag: a search is answered whole or refused
+/// (issue #602 part 3c), so the response's `metrics` block is always one
+/// completed job of one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchOutput {
     pub traces: Vec<TraceSearchResult>,
-    /// Any internal bound engaged before natural exhaustion. Not a wire
-    /// field: the response renderer turns it into the reference's own
-    /// incompleteness signal, `completedJobs < totalJobs` (issue #464).
-    pub partial: bool,
     /// `traces.len()`. Not a wire field either (issue #464 retired the
     /// invented `metrics.returned`); it stays because the read-path bench
     /// reports it from this struct.
@@ -394,11 +394,11 @@ pub struct TagNames {
 /// One catalog tag value and the OTLP type it was stored with (issue
 /// #476).
 ///
-/// `val_type` is the EMPTY string for a row written before migration 41
-/// added the column. Nothing stored distinguishes such a row's original
-/// type — `val` is the rendered text and `val_num` is a parse of that
-/// text — so the renderer reports it as `string` and derives nothing from
-/// the characters.
+/// `val_type` is `string`, `int`, `float` or `bool`, never empty: the
+/// writer stores the OTLP kind (`TraceJsonScalar::val_type`), and every
+/// read over `spans`, `resources` and the bucket catalogues types each
+/// value by a literal per JSON type. The renderer reports it verbatim and
+/// derives nothing from the characters (issue #602 part 3c).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagValue {
     pub val: String,
@@ -418,11 +418,11 @@ pub const SPAN_NAME_VALUE_TYPE: &str = "string";
 /// decided (issue #478).
 ///
 /// A function rather than an inline struct literal because this is the
-/// assertion criterion 5a is about: `entry_type("")` renders `string`
-/// too, so a read that left the type EMPTY would produce byte-identical
-/// wire output while meaning "a legacy row of unknown type" instead of "a
-/// String column". The two are only distinguishable here, at the engine
-/// boundary, which is where the gate has to sit.
+/// assertion criterion 5a is about: the renderer copies `val_type`
+/// verbatim (issue #602 part 3c), so a read that left the type EMPTY
+/// would put `"type":""` on the wire. The type is decided here, at the
+/// engine boundary, from the column, which is where the gate has to
+/// sit.
 fn span_name_value(val: String) -> TagValue {
     TagValue {
         val,
@@ -1049,11 +1049,11 @@ impl TraceEngine {
     /// and nothing else.
     ///
     /// Every value is typed `string` EXPLICITLY rather than left empty:
-    /// `traces_api::tags_response::entry_type` renders an empty
-    /// `val_type` as `string` too, so an unset type would produce
-    /// byte-identical output while meaning something different (issue
-    /// #476's legacy-row branch). The type is set here, where it is a
-    /// fact about the column rather than a fallback.
+    /// the renderer copies `val_type` verbatim (issue #602 part 3c), so
+    /// an unset type would reach the wire as `"type":""`. The type is set
+    /// here, where it is a fact about the column (issue #476 introduced
+    /// the stored type).
+    ///
     pub async fn list_span_name_values(
         &self,
         req: TagValuesRequest<'_>,
@@ -2906,9 +2906,9 @@ mod tests {
     /// would type `int`, `float`, `bool` and `duration`; the reference
     /// types all of them `string`, because a span name is a String
     /// column. The empty-type case is the trap this test exists for:
-    /// `tags_response::entry_type("")` also renders `string`, so a read
-    /// that set no type at all would be invisible on the wire — the
-    /// assertion is on `val_type` itself, not on the rendering.
+    /// the renderer copies `val_type` verbatim, so a read that set no
+    /// type would put `"type":""` on the wire — the assertion is on
+    /// `val_type` itself, not on the rendering.
     /// Issue #398 AC T1: **all three** of this module's settings origins
     /// carry the surface-wide memory ceiling and throw rather than spill.
     ///
@@ -3009,8 +3009,8 @@ mod tests {
             );
             assert!(
                 !value.val_type.is_empty(),
-                "an empty val_type renders as `string` too, which is why this is asserted \
-                 separately from the rendering"
+                "an empty val_type would reach the wire as `\"type\":\"\"`, and is asserted \
+                 here on the engine's value"
             );
         }
     }

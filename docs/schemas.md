@@ -888,7 +888,7 @@ The full text of all three is `docs/TraceQL/sql-schema.md` §5.4, which is where
 
 **Search, metrics, tag discovery and the service graph** each run statements compiled from the query over §4.1's tables; `docs/TraceQL/server-implementation.md` describes them and `docs/query-lowering.md` records how each is lowered.
 
-**Ordering and partiality contracts** (public, docs/api.md §4.2): `traces[]` is ordered by the max timestamp of each trace's exactly-matched spans, descending, `trace_id` ascending as the tiebreak. Partiality is signalled by omission: the response OMITS `metrics.completedJobs`, leaving `{"totalJobs":1}`, when the engine's own flag, still called `partial`, is set, and the search statement never sets it, so every search answers `{"completedJobs":1,"totalJobs":1}`. Budget breaches are hard `422`s, never partial results.
+**Ordering and partiality contracts** (public, docs/api.md §4.2): `traces[]` is ordered by the max timestamp of each trace's exactly-matched spans, descending, `trace_id` ascending as the tiebreak. A search is answered whole or refused, so every search answers `{"completedJobs":1,"totalJobs":1}`. Budget breaches are hard `422`s, never partial results.
 
 ## 5. Profiles
 
