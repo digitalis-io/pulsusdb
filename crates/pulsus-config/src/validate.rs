@@ -152,15 +152,16 @@ pub const PROMQL_MAX_METRIC_FANOUT_CEILING: u64 = 1_000_000;
 /// (pinned by a unit test in `pulsus-clickhouse`).
 pub const POOL_SIZE_CEILING: u32 = 8_000;
 
-/// `writer.batch_bytes` — the byte-flush trigger (`should_flush`'s
-/// `bytes >= max_bytes`). A huge value defeats the byte trigger, leaving
-/// batch size bounded only by time x ingest rate. 1024x the 16 MiB
-/// default (the power-of-two byte analogue of the 1000x policy).
+/// `writer.batch_bytes` — the per-push byte ceiling: a push whose estimated
+/// landing bytes exceed it is refused `413` whole. A huge value defeats the
+/// ceiling, leaving one push's block bounded only by the queue. 1024x the
+/// 16 MiB default (the power-of-two byte analogue of the 1000x policy).
 pub const BATCH_BYTES_CEILING: u64 = 16 * 1024 * 1024 * 1024;
 
-/// `writer.batch_ms` — the age-flush trigger. A huge value disables the
-/// staleness/loss-window guard for a trickle stream (the byte trigger
-/// does not bound AGE). 1000x the default of 200 ms.
+/// `writer.batch_ms` — the cadence at which the push-suppression index ages
+/// an unsettled claim. A huge value keeps an unsettled claim open, so a
+/// client's retry of a push that never settled is suppressed for that long.
+/// 1000x the default of 200 ms.
 pub const BATCH_MS_CEILING: u64 = 200_000;
 
 /// `writer.ingest_queue_bytes` — the 503 backpressure admission bound
@@ -751,25 +752,24 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     // Rule 14: positive-value guards.
     positive_duration("query_timeout", cfg.query_timeout)?;
     positive_bytes("writer.batch_bytes", cfg.writer.batch_bytes)?;
-    // Issue #133: a huge byte trigger defeats the byte-flush guard,
-    // leaving batch size bounded only by time x ingest rate.
+    // Issue #133: a huge value defeats the per-push byte ceiling.
     if cfg.writer.batch_bytes.0 > BATCH_BYTES_CEILING {
         return Err(ceiling_err(
             "writer.batch_bytes",
             BATCH_BYTES_CEILING,
             1,
-            "the byte-flush trigger",
+            "the per-push byte ceiling",
         ));
     }
     positive_u64("writer.batch_ms", cfg.writer.batch_ms)?;
-    // Issue #133: a huge age defeats the age-flush (staleness) guard for
-    // a trickle stream.
+    // Issue #133: a huge age keeps an unsettled push-suppression claim
+    // open.
     if cfg.writer.batch_ms > BATCH_MS_CEILING {
         return Err(ceiling_err(
             "writer.batch_ms",
             BATCH_MS_CEILING,
             1,
-            "the age-flush trigger",
+            "the ageing of an unsettled push-suppression claim",
         ));
     }
     positive_bytes("writer.ingest_queue_bytes", cfg.writer.ingest_queue_bytes)?;

@@ -2800,7 +2800,7 @@ GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT 100001
 drops any of them answers differently from the evaluator.
 
 - **Compare `val_num`, not `val`, and gate on `isNotNull(val_num)`.** The `f64` rounding happens at
-  ingest — `numeric_val_num` (`crates/pulsus-write/src/protocols/otlp_traces.rs:760`) is
+  ingest — `numeric_val_num` (`crates/pulsus-write/src/protocols/otlp_traces.rs:760` @ d60a960d) is
   `val.parse::<f64>().filter(is_finite)` — so both sides of the comparison already read the rounded
   number and there is no unrounded side to disagree with. But the `val` String still holds the
   original text:
@@ -5539,15 +5539,15 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 659 |
+| citation occurrences in the five artefacts | 658 |
 | of those, citing a bare basename | 480 |
 | of those, written as a continuation of a citation earlier in the paragraph | 66 |
 | of those continuations, on a later line than the citation they continue | 27 |
-| `(document, token)` pairs the rule resolves | 260 |
-| occurrences those resolved pairs cover | 356 |
+| `(document, token)` pairs the rule resolves | 259 |
+| occurrences those resolved pairs cover | 355 |
 | `(document, token)` pairs it cannot resolve | 194 |
 | occurrences those frozen pairs cover | 303 |
-| resolved rows anchored on a token the citing prose prints | 142 |
+| resolved rows anchored on a token the citing prose prints | 141 |
 | resolved rows anchored on a snapshot of the cited line | 118 |
 
 | reason it cannot be resolved | pairs | what it means |
@@ -5566,7 +5566,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 659 citation occurrences the five artefacts make, 480 name a bare basename and 66 are written as a continuation of a citation earlier on the same line. The rule resolves 260 `(document, token)` pairs covering 356 occurrences, and cannot resolve 194 covering 303. Of the resolved rows, 142 are anchored on a token the citing prose prints and 118 on a snapshot of the cited line.
+Of the 658 citation occurrences the five artefacts make, 480 name a bare basename and 66 are written as a continuation of a citation earlier on the same line. The rule resolves 259 `(document, token)` pairs covering 355 occurrences, and cannot resolve 194 covering 303. Of the resolved rows, 141 are anchored on a token the citing prose prints and 118 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 2 citations, all of them read one at a time. 1 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

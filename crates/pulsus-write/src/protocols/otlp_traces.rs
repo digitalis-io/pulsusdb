@@ -1,54 +1,28 @@
-//! OTLP traces parser (issue #54, docs/architecture.md §4): a pure
-//! `bytes -> ExportTraceServiceRequest -> ParsedTraces` pipeline with no
-//! I/O. Unlike the logs/metrics parsers there is **no** label model here:
-//! traces carry no fingerprint (a span's identity is `(trace_id,
-//! span_id)`, distribution shards by the server-side `cityHash64(trace_id)`
-//! — docs/architecture.md §2.2), and attribute keys are stored **verbatim**
-//! in the index (docs/architecture.md §2.3), discriminated by a `scope`
-//! column (`'resource'`, `'span'`, `'instrumentation'`) so scoped TraceQL
-//! selectors never collide across scopes. `InstrumentationScope` attributes
-//! are indexed under `scope='instrumentation'` (issue #192, superseding the
-//! #54 adjudication #2 that dropped them) so the `instrumentation.<key>`
-//! selector resolves; the scope's `name`/`version` are promoted onto the
-//! `SpanRecord`'s `scope_name`/`scope_version` columns for the
-//! `instrumentation:name`/`instrumentation:version` intrinsics. Everything
-//! remains fully preserved in the span payload as well. Span **events**
-//! (issue #192 PR-B) are indexed the same way: each event's attributes
-//! ride `scope='event'` (verbatim keys, so `event.<key>` resolves), and
-//! each event's `name`/`timeSinceStart` intrinsics ride a dedicated
-//! `scope='event:intrinsic'` (reserved keys `name`/`timeSinceStart`,
-//! `val_num` = ns for `timeSinceStart`) — a hard namespace partition so no
-//! sender-supplied event attribute can collide with an intrinsic row. Span
-//! **links** (issue #192 PR-C) mirror events exactly: each link's attributes
-//! ride `scope='link'`, and each link's `spanID`/`traceID` intrinsics ride a
-//! dedicated `scope='link:intrinsic'` (reserved keys `spanID`/`traceID`,
-//! `val` = lowercase hex of the referenced id bytes).
+//! OTLP traces decode (issues #54 and #586, docs/architecture.md §4): a pure
+//! `bytes -> ExportTraceServiceRequest -> ParsedTraceLanding` pipeline with
+//! no I/O. Unlike the logs/metrics parsers there is **no** label model here:
+//! traces carry no fingerprint (a span's identity is `(trace_id, span_id)`,
+//! distribution shards by the server-side `cityHash64(trace_id)` —
+//! docs/architecture.md §2.2). [`parse_landing`] produces the four landed
+//! event shapes one push lands in `trace_landing`: one span row per span,
+//! one resource row per distinct `(resource_id, day)`, and the push's
+//! distinct tag names and tag values, keyed by scope (`span`, `resource`,
+//! `event`, `link`, `instrumentation`).
 //!
-//! **Payload contract (pinned for T2/T3, issue #54 adjudication #3):**
-//! every [`SpanRecord::payload`] is a self-contained single-`ResourceSpans`
-//! [`TracesData`] — this span, its own resource, its own scope, both
-//! schema URLs — so the trace-by-ID fetch path decodes each span's payload
-//! independently and concatenates the results into a valid `TracesData`.
-//!
-//! **Expansion budget (issue #54 code-review [high] fix):** that payload
-//! contract and the per-span attribute fan-out make this the one parser
-//! whose output is **multiplicative** in its input — every span's payload
-//! re-carries its whole resource + scope, and every resource attribute
-//! becomes one attr row *per span*. A body inside the 64 MiB decompressed
-//! cap can therefore describe gigabytes of parse output (e.g. 32 MiB of
-//! resource attributes × thousands of near-empty spans), all allocated
-//! *before* the writer's byte-reservation backpressure ever runs. [`parse`]
-//! guards this with [`MAX_EXPANDED_BYTES`]: an allocation-free,
-//! wire-length-based estimate of each span's produced rows — with
-//! worst-case rendering-expansion multipliers for the attribute kinds
-//! whose stored `val` can outgrow its wire bytes (JSON escaping up to 6×,
-//! base64 4/3; see [`attr_budget_charge`]) — is accumulated
-//! and checked **before** that span's rows are materialized
-//! (reserve-before-materialize, the writer's own admission pattern); the
-//! moment the running total exceeds the budget the whole request fails
-//! atomically with [`LogsIngestError::OversizeMessage`] (the same
-//! structural-oversize class `remote_write::decode`'s count bounds use —
-//! HTTP 400 / `google.rpc.Status.code = 3`), never a partial write.
+//! **Expansion budget (issue #54 code-review [high] fix):** a body inside
+//! the 64 MiB decompressed cap can describe far more decoded output than its
+//! own size — an escape-dense array renders up to 6× its wire bytes as text,
+//! and every span row carries its own copy of its resource's service and of
+//! its scope. [`parse_landing`] guards this with [`MAX_EXPANDED_BYTES`]: an
+//! allocation-free, wire-length-based estimate of what it materializes —
+//! every attribute where it is stored, with worst-case rendering-expansion
+//! multipliers for the kinds whose rendering can outgrow their wire bytes
+//! (JSON escaping up to 6×, base64 4/3; see [`attr_budget_charge`]), and
+//! every span row with its copies ([`span_row_charge`]) — is accumulated and
+//! checked **before** it is materialized; the moment the running total
+//! exceeds the budget the whole request fails atomically with
+//! [`LogsIngestError::OversizeMessage`] (HTTP 400 / `google.rpc.Status.code
+//! = 3`), never a partial write.
 //! Diagnostic/rejection messages are bounded by [`diag_snippet`]'s hard
 //! truncation instead of budget accounting (they are not payload — see
 //! that helper's doc comment).
@@ -59,116 +33,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::EntityRef;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
-use opentelemetry_proto::tonic::common::v1::{
-    AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList,
-};
+use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, KeyValue, KeyValueList};
 use opentelemetry_proto::tonic::resource::v1::Resource;
-use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, TracesData};
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
-use pulsus_model::{Date, Fingerprint};
+use pulsus_model::Fingerprint;
 
 use crate::error::LogsIngestError;
 use crate::ingest::traces::{
-    AttrRecord, AttrValueType, LandingEvent, LandingLink, LandingResource, LandingSpan,
-    LandingTagName, LandingTagValue, ParsedTraceLanding, ParsedTraces, SpanRecord, TagScope,
+    LandingEvent, LandingLink, LandingResource, LandingSpan, LandingTagName, LandingTagValue,
+    ParsedTraceLanding, TagScope,
 };
 use pulsus_clickhouse::json_column::{TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue};
 
-/// The `scope` discriminator value for a resource attribute row.
-const SCOPE_RESOURCE: &str = "resource";
-/// The `scope` discriminator value for a span attribute row.
-const SCOPE_SPAN: &str = "span";
-/// The `scope` discriminator value for an instrumentation-scope attribute
-/// row (issue #192) — `scope_spans.scope.attributes`, indexed verbatim so
-/// the `instrumentation.<key>` TraceQL selector resolves.
-const SCOPE_INSTRUMENTATION: &str = "instrumentation";
-/// The `scope` discriminator value for a span-event **attribute** row
-/// (issue #192 PR-B) — `span.events[].attributes`, indexed verbatim so the
-/// `event.<key>` TraceQL selector resolves. Multi-valued (0..N per span),
-/// exactly like resource/span attributes.
-const SCOPE_EVENT: &str = "event";
-/// The **dedicated intrinsic-scope** discriminator for span-event
-/// intrinsics (issue #192 PR-B, plan v2 Δ1): a hard namespace partition
-/// disjoint from the sender-supplied [`SCOPE_EVENT`] attribute scope. The
-/// writer emits this scope *only* from the intrinsic-emission code below,
-/// never from a sender attribute (whose keys are stored verbatim), so no
-/// OTLP event attribute — even one literally keyed `name`/`timeSinceStart`,
-/// reachable via `event."name"` — can collide with an intrinsic row.
-const SCOPE_EVENT_INTRINSIC: &str = "event:intrinsic";
-/// The reserved intrinsic key for a span event's name, under
-/// [`SCOPE_EVENT_INTRINSIC`] — resolves the `event:name` intrinsic.
-const EVENT_INTRINSIC_NAME_KEY: &str = "name";
-/// The reserved intrinsic key for a span event's time-since-span-start (ns,
-/// carried in `val_num`), under [`SCOPE_EVENT_INTRINSIC`] — resolves the
-/// `event:timeSinceStart` intrinsic.
-const EVENT_INTRINSIC_TIME_SINCE_START_KEY: &str = "timeSinceStart";
-/// The `scope` discriminator value for a span-link **attribute** row (issue
-/// #192 PR-C) — `span.links[].attributes`, indexed verbatim so the
-/// `link.<key>` TraceQL selector resolves. Multi-valued (0..N per span),
-/// exactly like span events.
-const SCOPE_LINK: &str = "link";
-/// The **dedicated intrinsic-scope** discriminator for span-link intrinsics
-/// (issue #192 PR-C, plan v2 Δ1): a hard namespace partition disjoint from
-/// the sender-supplied [`SCOPE_LINK`] attribute scope, mirroring
-/// [`SCOPE_EVENT_INTRINSIC`]. The writer emits this scope *only* from the
-/// intrinsic-emission code below, so no OTLP link attribute — even one
-/// literally keyed `spanID`/`traceID`, reachable via `link."spanID"` — can
-/// collide with an intrinsic row.
-const SCOPE_LINK_INTRINSIC: &str = "link:intrinsic";
-/// The reserved intrinsic key for a span link's referenced span id
-/// (lowercase hex in `val`), under [`SCOPE_LINK_INTRINSIC`] — resolves the
-/// `link:spanID` intrinsic.
-const LINK_INTRINSIC_SPAN_ID_KEY: &str = "spanID";
-/// The reserved intrinsic key for a span link's referenced trace id
-/// (lowercase hex in `val`), under [`SCOPE_LINK_INTRINSIC`] — resolves the
-/// `link:traceID` intrinsic.
-const LINK_INTRINSIC_TRACE_ID_KEY: &str = "traceID";
-
-/// The per-request cap on [`parse`]'s **estimated expanded output bytes**
-/// (see the module doc's "Expansion budget" section). Derivation: the
-/// decompressed body is already capped at 64 MiB
-/// (`crate::ingest::decompress::MAX_DECOMPRESSED_BYTES`); a legitimate
-/// batch's expansion over its wire size comes from each span's payload
-/// re-carrying its resource + scope (collector resources are ≤ a few KiB —
-/// even 10k spans × 4 KiB is ~40 MiB of duplication) plus per-row fixed
-/// columns, so 4× the body cap (256 MiB) accommodates every legitimate
-/// shape with ample headroom, while a pathological fan-out (32 MiB
-/// resource × 1000 empty spans ≈ 32 GiB) trips within its first handful
-/// of spans. Byte-denominated rather than row-counted because each
-/// estimated row carries a fixed >= [`ATTR_ROW_OVERHEAD`]-byte floor, so
-/// the byte budget bounds the row count for free (≤ ~4M rows). This is an
-/// order-of-magnitude admission DoS guard, deliberately distinct from the
-/// writer's exact `est_bytes` queue reservation, which still runs (and can
-/// still push back) at sink admission.
+/// The per-request cap on [`parse_landing`]'s **estimated materialized
+/// bytes** (see the module doc's "Expansion budget" section): 4× the 64 MiB
+/// decompressed-body cap. Every span row is charged at least
+/// `size_of::<LandingSpan>()`, so it bounds the span count as well. This is
+/// an order-of-magnitude admission DoS guard, deliberately distinct from the
+/// writer's per-push byte ceiling and queue reservation, which still run at
+/// sink admission.
 pub const MAX_EXPANDED_BYTES: usize = 4 * crate::ingest::decompress::MAX_DECOMPRESSED_BYTES;
-
-/// Estimated fixed heap cost of one [`AttrRecord`] beyond its key/value
-/// wire bytes: the fixed-width columns (`date`/`val_num`/`timestamp_ns`/
-/// `trace_id`/`span_id`/`duration_ns` ≈ 51 bytes) plus the `scope` string
-/// and container overhead, floored to a round constant.
-const ATTR_ROW_OVERHEAD: usize = 64;
-/// Estimated heap cost of one span-row ARRAY element (issue #556) beyond a
-/// second copy of its rendered key/value text. Priced in the
-/// `TraceSpanRow` shape the writer queue holds, so the admission charge
-/// and the queue reservation count the same object — a charge priced in
-/// the narrower `SpanRecord` shape stops dominating the reservation it is
-/// meant to pre-filter.
-const ATTR_ARRAY_ELEMENT_OVERHEAD: usize = crate::writer::rows::ARRAY_ELEMENT_SLOT_BYTES
-    + crate::writer::rows::VAL_TYPE_SPELLING_BYTES
-    + SCOPE_SPELLING_BYTES;
-/// The longest scope spelling the writer emits (`instrumentation` and
-/// `event:intrinsic` are both 15 bytes); a fixed term, because the scope
-/// is not a field of the `KeyValue` this allocation-free charge can read.
-const SCOPE_SPELLING_BYTES: usize = 15;
-/// The five `Vec` headers one span's attribute arrays carry, charged once
-/// per span (issue #556).
-const ATTR_ARRAY_HEADER_OVERHEAD: usize = 5 * std::mem::size_of::<Vec<String>>();
-/// Estimated fixed heap cost of one [`SpanRecord`] beyond its name/service/
-/// payload bytes (ids + fixed-width columns + container overhead).
-const SPAN_ROW_OVERHEAD: usize = 128;
-/// Estimated `TracesData`/`ResourceSpans`/`ScopeSpans` nesting overhead
-/// (tags + length prefixes) added to a payload's summed part lengths.
-const PAYLOAD_ENVELOPE_OVERHEAD: usize = 32;
 
 /// The maximum per-byte expansion `serde_json` string escaping can produce:
 /// a control byte (e.g. NUL) renders as its 6-byte `\uXXXX` escape. The
@@ -251,8 +136,9 @@ pub fn decode(body: &[u8]) -> Result<ExportTraceServiceRequest, LogsIngestError>
 
 /// Decodes a (decompressed) OTLP/JSON (proto3-JSON) `/v1/traces` request body
 /// — the `Content-Type: application/json` sibling of [`decode`] (issue #76),
-/// feeding the same [`parse`] as protobuf (so the [`MAX_EXPANDED_BYTES`]
-/// expansion budget, enforced in `parse`, applies to JSON unchanged). A
+/// feeding the same [`parse_landing`] as protobuf (so the
+/// [`MAX_EXPANDED_BYTES`] expansion budget it enforces applies to JSON
+/// unchanged). A
 /// malformed body maps to 400/code 3 via [`LogsIngestError::DecodeJson`].
 pub fn decode_json(body: &[u8]) -> Result<ExportTraceServiceRequest, LogsIngestError> {
     // Issue #115 track 6a: bounded proto3-JSON building wrappers replace the
@@ -260,537 +146,6 @@ pub fn decode_json(body: &[u8]) -> Result<ExportTraceServiceRequest, LogsIngestE
     // body DURING deserialization at the SAME per-level / aggregate / depth
     // thresholds the protobuf wire pre-scan (`otlp_prescan`) enforces.
     crate::protocols::otlp_json::decode_traces(body)
-}
-
-/// Parses a decoded `ExportTraceServiceRequest` into normalized rows.
-/// Pure: a function of `req` and `now_ns` only, no I/O, no clock reads —
-/// the caller (the ingest handler) is the only clock/IO boundary. `now_ns`
-/// is the fallback `timestamp_ns` for a span whose `start_time_unix_nano`
-/// is `0` ("unknown or missing" per the OTLP wire format), mirroring
-/// `otlp_logs::resolve_timestamp_ns`'s now-fallback (unlike a metric
-/// sample, a span with no timestamp is still a usable record).
-///
-/// `Err` iff the request's estimated expanded output exceeds
-/// [`MAX_EXPANDED_BYTES`] (see the module doc's "Expansion budget"
-/// section) — a whole-request, atomic structural failure, exactly like a
-/// decode error; everything else (bad ids, bad timestamps) stays a
-/// per-span partial-success rejection inside the `Ok`.
-pub fn parse(
-    req: &ExportTraceServiceRequest,
-    now_ns: i64,
-) -> Result<ParsedTraces, LogsIngestError> {
-    // Whole-request `AnyValue` recursion-depth guard (finding #54): reject a
-    // maliciously deep attribute tree before any value is rendered or a row
-    // materialized, so the recursive `any_value_to_string` render below can
-    // never overflow the stack.
-    crate::protocols::otlp_depth::ensure_trace_anyvalue_depth(req)?;
-
-    let mut out = ParsedTraces::default();
-    let mut expanded_bytes: usize = 0;
-
-    for resource_spans in &req.resource_spans {
-        let resource = resource_spans.resource.as_ref();
-        // Check-then-render (issue #54 code-review round 3 [high] fix):
-        // the promoted `service` column is itself a rendered untrusted
-        // `AnyValue` — an escape-dense array-kind `service.name` expands
-        // up to 6x its wire bytes the moment it is rendered, so the
-        // rendering must be charged (same conservative
-        // [`attr_budget_charge`] the attr rows use) and admitted BEFORE it
-        // happens. Zero-span blocks are charged too, deliberately: the
-        // rendering is the materialization being guarded, and it happens
-        // once per `ResourceSpans` block regardless of span count.
-        let service_kv = find_service_kv(resource);
-        if let Some(kv) = service_kv {
-            charge_budget(&mut expanded_bytes, attr_budget_charge(kv))?;
-        }
-        let service = service_kv
-            .map(|kv| any_value_to_string(kv.value.as_ref()))
-            .unwrap_or_default();
-        // Hoisted per resource/scope (not recomputed per span): with a
-        // pathological multi-MiB resource, walking its wire length per
-        // span would itself be quadratic work before the budget trips.
-        let resource_wire_len = resource.map(Message::encoded_len).unwrap_or(0);
-        for scope_spans in &resource_spans.scope_spans {
-            let ctx = SpanContext {
-                resource,
-                resource_spans,
-                scope_spans,
-                service: &service,
-                now_ns,
-                payload_base_estimate: resource_wire_len
-                    + scope_spans
-                        .scope
-                        .as_ref()
-                        .map(Message::encoded_len)
-                        .unwrap_or(0)
-                    + resource_spans.schema_url.len()
-                    + scope_spans.schema_url.len()
-                    + PAYLOAD_ENVELOPE_OVERHEAD,
-            };
-            for span in &scope_spans.spans {
-                parse_span(&mut out, &mut expanded_bytes, span, &ctx)?;
-            }
-        }
-    }
-
-    Ok(out)
-}
-
-/// The per-`ScopeSpans` context [`parse_span`] reads: the span's
-/// resource/scope envelope, the promoted service, the clock fallback, and
-/// the precomputed per-span payload-size estimate base (resource + scope +
-/// schema URLs wire lengths — identical for every span in this scope).
-/// Bundled to keep `parse_span`'s argument count within clippy's default
-/// threshold, mirroring `otlp_metrics::DataPointContext`.
-struct SpanContext<'a> {
-    resource: Option<&'a Resource>,
-    resource_spans: &'a ResourceSpans,
-    scope_spans: &'a ScopeSpans,
-    service: &'a str,
-    now_ns: i64,
-    payload_base_estimate: usize,
-}
-
-/// Parses one `Span` into a [`SpanRecord`] plus its indexed resource ⊕
-/// span [`AttrRecord`]s, or rejects it wholesale into partial success
-/// (invalid IDs, unrepresentable timestamp) — a rejected span contributes
-/// no attr rows either. `Err` only on the [`MAX_EXPANDED_BYTES`] budget
-/// (whole-request abort), checked against `expanded_bytes` **before** this
-/// span's rows/payload are materialized.
-fn parse_span(
-    out: &mut ParsedTraces,
-    expanded_bytes: &mut usize,
-    span: &Span,
-    ctx: &SpanContext<'_>,
-) -> Result<(), LogsIngestError> {
-    let Ok(trace_id) = <[u8; 16]>::try_from(span.trace_id.as_slice()) else {
-        reject_span(
-            out,
-            format!(
-                "span {:?}: trace_id must be exactly 16 bytes, got {}",
-                diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
-                span.trace_id.len()
-            ),
-        );
-        return Ok(());
-    };
-    let Ok(span_id) = <[u8; 8]>::try_from(span.span_id.as_slice()) else {
-        reject_span(
-            out,
-            format!(
-                "span {:?}: span_id must be exactly 8 bytes, got {}",
-                diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
-                span.span_id.len()
-            ),
-        );
-        return Ok(());
-    };
-    // Empty means "root span" (no parent) and maps to the all-zero sentinel;
-    // any other non-8-byte length is malformed.
-    let parent_id = if span.parent_span_id.is_empty() {
-        [0u8; 8]
-    } else {
-        match <[u8; 8]>::try_from(span.parent_span_id.as_slice()) {
-            Ok(parent_id) => parent_id,
-            Err(_) => {
-                reject_span(
-                    out,
-                    format!(
-                        "span {:?}: parent_span_id must be empty or exactly 8 bytes, got {}",
-                        diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
-                        span.parent_span_id.len()
-                    ),
-                );
-                return Ok(());
-            }
-        }
-    };
-
-    let timestamp_ns = if span.start_time_unix_nano == 0 {
-        ctx.now_ns
-    } else {
-        match i64::try_from(span.start_time_unix_nano) {
-            Ok(ts) => ts,
-            Err(_) => {
-                reject_span(
-                    out,
-                    format!(
-                        "span {:?}: start_time_unix_nano {} exceeds the representable i64 \
-                         nanosecond range",
-                        diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
-                        span.start_time_unix_nano
-                    ),
-                );
-                return Ok(());
-            }
-        }
-    };
-    let duration_ns = resolve_duration_ns(span.start_time_unix_nano, span.end_time_unix_nano);
-
-    // Truncating `as` casts, deliberate: `Status.code` is a 0..=2 enum and
-    // `Span.kind` a 0..=5 enum on the wire, both well inside i8; an
-    // out-of-enum-range value (only producible by a non-conformant sender)
-    // is stored as its truncated discriminant rather than rejected — the
-    // columns are plain Int8, not enums (docs/schemas.md §4.1).
-    let status_code = span.status.as_ref().map(|s| s.code).unwrap_or(0) as i8;
-    // OTLP `Status.message` verbatim (issue #184), `""` when absent — the
-    // parser previously dropped it. Bytes charged in `span_expansion_charge`.
-    let status_message = span
-        .status
-        .as_ref()
-        .map(|s| s.message.clone())
-        .unwrap_or_default();
-    let kind = span.kind as i8;
-    let shared = shared_flag(span);
-
-    // OTLP `InstrumentationScope.name`/`version` verbatim (issue #192), `""`
-    // when the scope is absent — promoted onto the span row for the
-    // `instrumentation:name`/`instrumentation:version` intrinsics. Bytes
-    // charged in `span_expansion_charge`.
-    let (scope_name, scope_version) = ctx
-        .scope_spans
-        .scope
-        .as_ref()
-        .map(|s| (s.name.clone(), s.version.clone()))
-        .unwrap_or_default();
-
-    let resource_attrs = ctx.resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
-    // The instrumentation-scope attributes (issue #192): indexed per span in
-    // this scope under `scope='instrumentation'`, exactly as resource attrs
-    // re-emit per span — so `instrumentation.<key>` membership resolves
-    // against the owning span's rows.
-    let scope_attrs = ctx
-        .scope_spans
-        .scope
-        .as_ref()
-        .map(|s| s.attributes.as_slice())
-        .unwrap_or(&[]);
-
-    // Expansion-budget reservation (module doc, issue #54 code-review
-    // [high] fix): estimate this span's produced bytes from wire lengths
-    // only — `encoded_len` never allocates — and check the running total
-    // BEFORE materializing a single row, so an over-budget request is
-    // rejected without ever paying for the expansion it describes.
-    // (`ctx.service` is already-rendered here, charged pre-render by
-    // `parse` — its `.len()` below is the exact per-span clone cost.)
-    charge_budget(
-        expanded_bytes,
-        span_expansion_charge(
-            span,
-            ctx.resource,
-            ctx.scope_spans.scope.as_ref(),
-            ctx.service.len(),
-            ctx.payload_base_estimate,
-        ),
-    )?;
-
-    let date = match Date::start_of_day_utc_datetime_safe(timestamp_ns) {
-        Some(date) => date.days_since_epoch(),
-        None => {
-            // The timestamp is representable as `i64` ns but its day falls
-            // outside the storage-safe range: before 1970-01-01, or past
-            // day 49_709 (2106-02-06) — the last UTC day fully inside the
-            // 32-bit DateTime domain the trace tables' delete-TTL evaluates
-            // in (issue #131; days 49_710..=65_535 would partition
-            // correctly but wrap in the TTL expression, and later days fall
-            // outside the `Date` range entirely). Saturating would orphan
-            // or silently early-expire the span, so it is rejected
-            // wholesale into partial success.
-            reject_span(
-                out,
-                format!(
-                    "span {:?}: start_time_unix_nano {} is outside the supported \
-                     storage time range (1970-01-01 to 2106-02-06 UTC)",
-                    diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
-                    span.start_time_unix_nano
-                ),
-            );
-            return Ok(());
-        }
-    };
-    // Where this span's OWN attr rows begin (issue #556). Every
-    // `out.attrs.push` in this file is inside `parse_span`, between here
-    // and the `out.spans.push` below, and every rejection path returns
-    // BEFORE the first of them — so a rejected span contributes neither a
-    // row nor an element, and `out.attrs[attrs_start..]` is exactly this
-    // span's slice.
-    let attrs_start = out.attrs.len();
-    for (scope, attrs) in [
-        (SCOPE_RESOURCE, resource_attrs),
-        (SCOPE_SPAN, span.attributes.as_slice()),
-        (SCOPE_INSTRUMENTATION, scope_attrs),
-    ] {
-        for kv in attrs {
-            out.attrs.push(attr_record(
-                kv,
-                scope,
-                date,
-                timestamp_ns,
-                trace_id,
-                span_id,
-                duration_ns,
-            ));
-        }
-    }
-
-    // Span events (issue #192 PR-B): each event fans out into indexed rows —
-    // two intrinsic rows under the dedicated `event:intrinsic` scope (the
-    // event `name`, and its `timeSinceStart` in ns carried in `val_num`)
-    // followed by one `event`-scoped row per event attribute (verbatim key).
-    // Emitted AFTER the resource/span/instrumentation attrs, charged in
-    // `span_expansion_charge` in lockstep. Membership resolves against this
-    // owning span's rows, exactly as attributes do.
-    for event in &span.events {
-        // Intrinsic: event name (dedicated `event:intrinsic` scope,
-        // reserved key `name`).
-        out.attrs.push(AttrRecord {
-            date,
-            key: EVENT_INTRINSIC_NAME_KEY.to_string(),
-            scope: SCOPE_EVENT_INTRINSIC.to_string(),
-            val: event.name.clone(),
-            // An event name is an OTLP `string` field.
-            val_type: AttrValueType::String,
-            val_num: numeric_val_num(&event.name),
-            timestamp_ns,
-            trace_id,
-            span_id,
-            duration_ns,
-        });
-        // Intrinsic: timeSinceStart (ns in `val_num`, key-only `val_num`
-        // scan resolves `event:timeSinceStart <op> <duration>`).
-        let time_since_start =
-            resolve_time_since_start_ns(span.start_time_unix_nano, event.time_unix_nano);
-        out.attrs.push(AttrRecord {
-            date,
-            key: EVENT_INTRINSIC_TIME_SINCE_START_KEY.to_string(),
-            scope: SCOPE_EVENT_INTRINSIC.to_string(),
-            val: time_since_start.to_string(),
-            // A nanosecond count, computed as an `i64`.
-            val_type: AttrValueType::Int,
-            val_num: Some(time_since_start as f64),
-            timestamp_ns,
-            trace_id,
-            span_id,
-            duration_ns,
-        });
-        for kv in &event.attributes {
-            out.attrs.push(attr_record(
-                kv,
-                SCOPE_EVENT,
-                date,
-                timestamp_ns,
-                trace_id,
-                span_id,
-                duration_ns,
-            ));
-        }
-    }
-
-    // Span links (issue #192 PR-C): each link fans out exactly like an event —
-    // two intrinsic rows under the dedicated `link:intrinsic` scope (the
-    // referenced `spanID`/`traceID` as lowercase hex in `val`) followed by one
-    // `link`-scoped row per link attribute (verbatim key). The referenced ids
-    // are stored as `val` (not `val_num` — hex is non-numeric), so `AttrEq`
-    // resolves them. Emitted AFTER the events, charged in
-    // `span_expansion_charge` in lockstep.
-    for link in &span.links {
-        // Intrinsic: link:spanID (dedicated `link:intrinsic` scope, reserved
-        // key `spanID`, lowercase hex of the link's raw span-id bytes).
-        out.attrs.push(AttrRecord {
-            date,
-            key: LINK_INTRINSIC_SPAN_ID_KEY.to_string(),
-            scope: SCOPE_LINK_INTRINSIC.to_string(),
-            val: hex_lower(&link.span_id),
-            // Lowercase hex text.
-            val_type: AttrValueType::String,
-            val_num: None,
-            timestamp_ns,
-            trace_id,
-            span_id,
-            duration_ns,
-        });
-        // Intrinsic: link:traceID (reserved key `traceID`, lowercase hex of
-        // the link's raw trace-id bytes).
-        out.attrs.push(AttrRecord {
-            date,
-            key: LINK_INTRINSIC_TRACE_ID_KEY.to_string(),
-            scope: SCOPE_LINK_INTRINSIC.to_string(),
-            val: hex_lower(&link.trace_id),
-            // Lowercase hex text.
-            val_type: AttrValueType::String,
-            val_num: None,
-            timestamp_ns,
-            trace_id,
-            span_id,
-            duration_ns,
-        });
-        for kv in &link.attributes {
-            out.attrs.push(attr_record(
-                kv,
-                SCOPE_LINK,
-                date,
-                timestamp_ns,
-                trace_id,
-                span_id,
-                duration_ns,
-            ));
-        }
-    }
-
-    // The five arrays are this span's OWN attr rows, projected. Deriving
-    // them rather than rebuilding them is what makes the two stores agree
-    // element by element, and it is what keeps the numeric rule right: a
-    // link's `spanID` of `0000000000000001` parses as 1.0 and is stored
-    // NULL, because the record that built it stores NULL.
-    let span_attrs = &out.attrs[attrs_start..];
-    let attr_key: Vec<String> = span_attrs.iter().map(|a| a.key.clone()).collect();
-    let attr_scope: Vec<String> = span_attrs.iter().map(|a| a.scope.clone()).collect();
-    let attr_val: Vec<String> = span_attrs.iter().map(|a| a.val.clone()).collect();
-    let attr_type: Vec<AttrValueType> = span_attrs.iter().map(|a| a.val_type).collect();
-    let attr_num: Vec<Option<f64>> = span_attrs.iter().map(|a| a.val_num).collect();
-
-    out.spans.push(SpanRecord {
-        trace_id,
-        span_id,
-        parent_id,
-        name: span.name.clone(),
-        service: ctx.service.to_string(),
-        timestamp_ns,
-        duration_ns,
-        status_code,
-        status_message,
-        kind,
-        shared,
-        scope_name,
-        scope_version,
-        payload: build_payload(span, ctx.resource, ctx.resource_spans, ctx.scope_spans),
-        attr_key,
-        attr_scope,
-        attr_val,
-        attr_type,
-        attr_num,
-    });
-    Ok(())
-}
-
-/// `1` iff `span` carries the `zipkin.shared` attribute with the exact
-/// string value `"true"` — the wire contract `zipkin::to_otlp` emits for a
-/// Zipkin shared span (issue #173, `str_kv("zipkin.shared", "true")`),
-/// documented so an OTLP-native sender can set it too. Matched on a literal
-/// `StringValue` (not the rendered form) so only that precise pair flips the
-/// bit; anything else (a bool value, a different string, absence) is `0`.
-/// The attribute itself still flows to `trace_attrs_idx` unchanged.
-fn shared_flag(span: &Span) -> u8 {
-    let is_true = span.attributes.iter().any(|kv| {
-        kv.key == "zipkin.shared"
-            && matches!(
-                kv.value.as_ref().and_then(|v| v.value.as_ref()),
-                Some(Value::StringValue(s)) if s == "true"
-            )
-    });
-    u8::from(is_true)
-}
-
-/// Rejects a single span into partial success.
-fn reject_span(out: &mut ParsedTraces, message: String) {
-    out.rejected += 1;
-    if out.rejected_message.is_none() {
-        out.rejected_message = Some(message);
-    }
-}
-
-/// The self-contained single-`ResourceSpans` `TracesData` payload for one
-/// span (the pinned T2/T3 contract — see the module doc): this span, its
-/// own resource + scope, and both original schema URLs, `prost`-encoded.
-fn build_payload(
-    span: &Span,
-    resource: Option<&Resource>,
-    resource_spans: &ResourceSpans,
-    scope_spans: &ScopeSpans,
-) -> Vec<u8> {
-    TracesData {
-        resource_spans: vec![ResourceSpans {
-            resource: resource.cloned(),
-            scope_spans: vec![ScopeSpans {
-                scope: scope_spans.scope.clone(),
-                spans: vec![span.clone()],
-                schema_url: scope_spans.schema_url.clone(),
-            }],
-            schema_url: resource_spans.schema_url.clone(),
-        }],
-    }
-    .encode_to_vec()
-}
-
-/// One indexed attribute row: key verbatim, value via the shared
-/// `AnyValue` string rendering, `val_num` populated iff the rendered value
-/// parses as a finite float (docs/schemas.md §4.1: "populated when val
-/// parses numeric" — non-finite parses like `"inf"`/`"NaN"` are excluded,
-/// a `Nullable(Float64)` comparison column has no meaningful ordering for
-/// them).
-fn attr_record(
-    kv: &KeyValue,
-    scope: &str,
-    date: u16,
-    timestamp_ns: i64,
-    trace_id: [u8; 16],
-    span_id: [u8; 8],
-    duration_ns: i64,
-) -> AttrRecord {
-    let val = any_value_to_string(kv.value.as_ref());
-    let val_num = numeric_val_num(&val);
-    AttrRecord {
-        date,
-        key: kv.key.clone(),
-        scope: scope.to_string(),
-        val,
-        val_type: any_value_type(kv.value.as_ref()),
-        val_num,
-        timestamp_ns,
-        trace_id,
-        span_id,
-        duration_ns,
-    }
-}
-
-/// The `val_num` for a stored `val` string: its `f64` parse when finite,
-/// else `None` (docs/schemas.md §4.1 — non-finite parses like `inf`/`NaN`
-/// are excluded, a `Nullable(Float64)` comparison column has no meaningful
-/// ordering for them).
-fn numeric_val_num(val: &str) -> Option<f64> {
-    val.parse::<f64>().ok().filter(|n| n.is_finite())
-}
-
-/// A span event's `timeSinceStart` in nanoseconds: `event.time_unix_nano −
-/// span.start_time_unix_nano` (issue #192 PR-B). Both operands are `u64`
-/// wire values; the difference is computed in `i128` and clamped into the
-/// `i64` range, so it preserves sign (a non-conformant sender whose event
-/// predates its span start yields a negative value, never a wrap) and
-/// saturates rather than overflowing. The RAW `start_time_unix_nano` is
-/// used (never the now-fallback resolved `timestamp_ns`), matching the
-/// reference's literal `time − start` definition — a span with an unknown
-/// (`0`) start therefore reports the event's absolute time, the degenerate
-/// case a conformant sender never produces.
-fn resolve_time_since_start_ns(start_time_unix_nano: u64, event_time_unix_nano: u64) -> i64 {
-    let delta = i128::from(event_time_unix_nano) - i128::from(start_time_unix_nano);
-    delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
-}
-
-/// Lowercase-hex rendering of a span link's referenced id bytes (issue #192
-/// PR-C). The bytes are stored verbatim (a link references some OTHER span,
-/// so — unlike this span's own 16/8-byte ids — they are never length-validated
-/// here): whatever the sender put on the wire is rendered as-is, so an
-/// off-length id round-trips honestly rather than being rejected. Matches the
-/// `link:spanID`/`link:traceID` intrinsics' `AttrEq` value classification (the
-/// TraceQL probe supplies lowercase hex).
-fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        // Infallible: writing to a String never errors.
-        let _ = write!(out, "{b:02x}");
-    }
-    out
 }
 
 /// The resource attribute backing the promoted `service` column: the one
@@ -808,96 +163,75 @@ fn find_service_kv(resource: Option<&Resource>) -> Option<&KeyValue> {
         .find(|kv| kv.key == "service.name")
 }
 
-/// The estimated expanded-output byte charge for one span's rows +
-/// payload: the fixed per-span floor, its name/service clone cost, the
-/// per-span payload duplication (`payload_base` = resource + scope +
-/// schema-URL wire lengths, precomputed once per scope), the span's own
-/// wire length, and every resource ⊕ span attribute row (fixed overhead +
-/// [`attr_budget_charge`], which multiplies the kinds whose stored
-/// rendering can outgrow their wire bytes). Allocation-free: `encoded_len`
-/// never allocates. Extracted from [`parse_span`] so the identical measure
-/// is reachable from [`resource_spans_expansion_charge`].
-fn span_expansion_charge(
-    span: &Span,
+/// What every span copies from its block, charged once per span: the
+/// scope's attributes, name, version and schema url, which the span row
+/// carries; and the resource row the span may open on its own UTC day — its
+/// attributes, its schema url and its encoded entity references — an upper
+/// bound, since a block opens at most one resource row per span.
+/// Allocation-free.
+fn per_span_copy_charge(
     resource: Option<&Resource>,
-    scope: Option<&InstrumentationScope>,
-    service_len: usize,
-    payload_base: usize,
+    resource_schema_url: &str,
+    scope_spans: &ScopeSpans,
 ) -> usize {
-    let resource_attrs = resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
-    let scope_attrs = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
-    // The promoted `status_message` (issue #184) is an extra materialized
-    // copy beyond the wire `span.encoded_len()`, like `name`/`service`. The
-    // promoted `scope_name`/`scope_version` (issue #192) are the same shape.
-    let status_message_len = span.status.as_ref().map(|s| s.message.len()).unwrap_or(0);
-    let scope_name_len = scope.map(|s| s.name.len() + s.version.len()).unwrap_or(0);
-    // The five `Vec` headers this span's attribute arrays carry, once per
-    // span (issue #556); the per-element terms are charged in lockstep
-    // with the emission loops below.
-    let mut charge = SPAN_ROW_OVERHEAD
-        + ATTR_ARRAY_HEADER_OVERHEAD
-        + span.name.len()
-        + service_len
-        + payload_base
-        + span.encoded_len()
-        + status_message_len
-        + scope_name_len;
-    // Every resource ⊕ span ⊕ instrumentation-scope attribute becomes one
-    // indexed row per span (issue #192 adds the scope arm) — charged BEFORE
-    // materialization, in lockstep with the emission loop above.
-    // Each also becomes one ARRAY element on the span's own row (issue
-    // #556): the element's slot cost plus a SECOND copy of its rendered
-    // key/value text.
-    for kv in resource_attrs
-        .iter()
-        .chain(&span.attributes)
-        .chain(scope_attrs)
-    {
-        charge += ATTR_ROW_OVERHEAD + ATTR_ARRAY_ELEMENT_OVERHEAD + 2 * attr_budget_charge(kv);
-    }
-    // Every span event (issue #192 PR-B) fans out into indexed rows: two
-    // intrinsic rows (`event:intrinsic` name/timeSinceStart — the name's
-    // `val` is the event name; timeSinceStart is a small numeric string
-    // within the row-overhead floor) plus one row per event attribute —
-    // charged BEFORE materialization, in lockstep with the event emission
-    // loop above. `span.encoded_len()` already covers the events' wire
-    // bytes (they nest inside the span); this is the extra index-row cost.
+    let resource_attrs: usize = resource
+        .map(|r| r.attributes.iter().map(attr_budget_charge).sum())
+        .unwrap_or(0);
+    let entity_refs = resource
+        .map(|r| prost::encoding::message::encoded_len_repeated(3, &r.entity_refs))
+        .unwrap_or(0);
+    let resource_row = std::mem::size_of::<LandingResource>()
+        .saturating_add(resource_attrs)
+        .saturating_add(resource_schema_url.len())
+        .saturating_add(entity_refs);
+    let scope = scope_spans.scope.as_ref();
+    let scope_attrs: usize = scope
+        .map(|s| s.attributes.iter().map(attr_budget_charge).sum())
+        .unwrap_or(0);
+    let scope_text = scope.map(|s| s.name.len() + s.version.len()).unwrap_or(0);
+    resource_row
+        .saturating_add(scope_attrs)
+        .saturating_add(scope_text)
+        .saturating_add(scope_spans.schema_url.len())
+}
+
+/// The bytes one span materializes beyond its own attributes: its row, two
+/// copies of the rendered service (its row's and its resource row's), what
+/// it copies from its block (`copies`, from [`per_span_copy_charge`]), its
+/// own text, and each event and link with theirs. Charged before the span is landed, rejected
+/// or not, so the decode and an adapter charge the same spans.
+fn span_row_charge(span: &Span, service_len: usize, copies: usize) -> usize {
+    let status = span.status.as_ref().map(|s| s.message.len()).unwrap_or(0);
+    // The rendered service twice: the span row's copy and the resource
+    // row's.
+    let mut charge = std::mem::size_of::<LandingSpan>()
+        .saturating_add(service_len.saturating_mul(2))
+        .saturating_add(copies)
+        .saturating_add(span.name.len())
+        .saturating_add(span.trace_state.len())
+        .saturating_add(status);
     for event in &span.events {
-        // Both intrinsics also become array elements on the span's own row
-        // (issue #556), and the event name is then STORED TWICE — once in
-        // the index row's `val`, once in `attr_val[i]`.
-        charge += 2 * ATTR_ROW_OVERHEAD + 2 * ATTR_ARRAY_ELEMENT_OVERHEAD + 2 * event.name.len();
-        for kv in &event.attributes {
-            charge += ATTR_ROW_OVERHEAD + ATTR_ARRAY_ELEMENT_OVERHEAD + 2 * attr_budget_charge(kv);
-        }
+        charge = charge.saturating_add(std::mem::size_of::<LandingEvent>() + event.name.len());
     }
-    // Every span link (issue #192 PR-C) fans out identically: two intrinsic
-    // rows (`link:intrinsic` spanID/traceID, whose `val` is lowercase hex —
-    // 2× the referenced id's byte length) plus one row per link attribute —
-    // charged BEFORE materialization, in lockstep with the link emission loop
-    // above. `span.encoded_len()` already covers the links' wire bytes.
     for link in &span.links {
-        // Each intrinsic also becomes an array element (issue #556). The
-        // hex rendering is twice the referenced id's byte length and it is
-        // now stored twice, hence `4 *` where the index row alone was
-        // `2 *`.
-        charge += ATTR_ROW_OVERHEAD + ATTR_ARRAY_ELEMENT_OVERHEAD + 4 * link.span_id.len();
-        charge += ATTR_ROW_OVERHEAD + ATTR_ARRAY_ELEMENT_OVERHEAD + 4 * link.trace_id.len();
-        for kv in &link.attributes {
-            charge += ATTR_ROW_OVERHEAD + ATTR_ARRAY_ELEMENT_OVERHEAD + 2 * attr_budget_charge(kv);
-        }
+        charge = charge.saturating_add(
+            std::mem::size_of::<LandingLink>()
+                + link.trace_id.len()
+                + link.span_id.len()
+                + link.trace_state.len(),
+        );
     }
     charge
 }
 
-/// The estimated expanded-output byte charge [`parse`] accumulates for one
-/// `ResourceSpans` block: the promoted-`service` rendering charge (once per
-/// block, escape-multiplied like any rendered attribute) plus every span's
-/// [`span_expansion_charge`]. Byte-identical to what `parse` sums over the
-/// same block (it factors through the same two helpers), so an upstream
-/// adapter can charge the SAME budget against an adapted block and reach
-/// the identical accept/reject verdict. Allocation-free except the one
-/// per-block `service` render `parse` itself performs.
+/// The expansion charge [`parse_landing`] accumulates for one
+/// `ResourceSpans` block: [`attr_budget_charge`] over the promoted
+/// `service.name` value, every resource attribute and every scope attribute
+/// once each, and every span, event and link attribute; plus each span's
+/// [`span_row_charge`]. It is the sum `parse_landing` charges over the same
+/// block, so an upstream adapter that charges it block by block reaches the
+/// verdict `parse_landing` gives the adapted request. Allocation-free except
+/// the one per-block `service` render `parse_landing` itself performs.
 fn resource_spans_expansion_charge(rs: &ResourceSpans) -> usize {
     let resource = rs.resource.as_ref();
     let service_kv = find_service_kv(resource);
@@ -905,25 +239,30 @@ fn resource_spans_expansion_charge(rs: &ResourceSpans) -> usize {
     let service_len = service_kv
         .map(|kv| any_value_to_string(kv.value.as_ref()).len())
         .unwrap_or(0);
-    let resource_wire_len = resource.map(Message::encoded_len).unwrap_or(0);
+    let resource_attrs = resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
+    for kv in resource_attrs {
+        charge = charge.saturating_add(attr_budget_charge(kv));
+    }
     for scope_spans in &rs.scope_spans {
-        let payload_base = resource_wire_len
-            + scope_spans
-                .scope
-                .as_ref()
-                .map(Message::encoded_len)
-                .unwrap_or(0)
-            + rs.schema_url.len()
-            + scope_spans.schema_url.len()
-            + PAYLOAD_ENVELOPE_OVERHEAD;
+        let scope_attrs = scope_spans
+            .scope
+            .as_ref()
+            .map(|s| s.attributes.as_slice())
+            .unwrap_or(&[]);
+        for kv in scope_attrs {
+            charge = charge.saturating_add(attr_budget_charge(kv));
+        }
+        let copies = per_span_copy_charge(resource, &rs.schema_url, scope_spans);
         for span in &scope_spans.spans {
-            charge = charge.saturating_add(span_expansion_charge(
-                span,
-                resource,
-                scope_spans.scope.as_ref(),
-                service_len,
-                payload_base,
-            ));
+            charge = charge.saturating_add(span_row_charge(span, service_len, copies));
+            let own = span
+                .attributes
+                .iter()
+                .chain(span.events.iter().flat_map(|e| &e.attributes))
+                .chain(span.links.iter().flat_map(|l| &l.attributes));
+            for kv in own {
+                charge = charge.saturating_add(attr_budget_charge(kv));
+            }
         }
     }
     charge
@@ -936,10 +275,10 @@ fn resource_spans_expansion_charge(rs: &ResourceSpans) -> usize {
 /// self-contained single-`ResourceSpans` blocks: charging each block as it
 /// is adapted — BEFORE the full batch is materialized — makes an
 /// over-budget foreign request abort mid-adaptation rather than exhaust
-/// memory ahead of [`parse`]'s post-materialization check, and (because the
-/// measure is [`resource_spans_expansion_charge`], the exact per-block sum
-/// `parse` uses) rejects it byte-identically to the equivalent native OTLP
-/// request.
+/// memory ahead of [`parse_landing`], and (because the measure is
+/// [`resource_spans_expansion_charge`], the exact per-block sum
+/// `parse_landing` charges) rejects it as the equivalent native OTLP request
+/// is rejected.
 pub(crate) fn charge_resource_spans_expansion(
     expanded_bytes: &mut usize,
     rs: &ResourceSpans,
@@ -949,7 +288,7 @@ pub(crate) fn charge_resource_spans_expansion(
 
 /// Adds `amount` to the running expansion estimate and fails the whole
 /// request the moment it exceeds [`MAX_EXPANDED_BYTES`] — the single
-/// charge/check point every materialization site (per-span rows/payload,
+/// charge/check point every materialization site (each attribute set, the
 /// per-resource `service` rendering) reserves through before allocating.
 fn charge_budget(expanded_bytes: &mut usize, amount: usize) -> Result<(), LogsIngestError> {
     *expanded_bytes = expanded_bytes.saturating_add(amount);
@@ -1030,34 +369,6 @@ fn service_arm(value: Option<&AnyValue>) -> &'static str {
     }
 }
 
-/// The stored type discriminator for an OTLP `AnyValue` (issue #476) —
-/// the companion of [`any_value_to_string`], and deliberately written
-/// beside it so the two cannot classify the same `AnyValue` differently.
-///
-/// Array, kvlist and bytes values RENDER to a string
-/// ([`any_value_to_string`] JSON-encodes the first two and base64s the
-/// third), so they are [`AttrValueType::String`] here: the column states
-/// the type of what we stored, which is what it means. An absent or
-/// entirely unspecified `AnyValue` renders `""` and is likewise a string.
-///
-/// The reference emits no tag-value row at all for a bytes or
-/// heterogeneous-array attribute; that is a difference in row PRESENCE,
-/// not in `type`, and is out of scope here.
-fn any_value_type(value: Option<&AnyValue>) -> AttrValueType {
-    let Some(value) = value.and_then(|v| v.value.as_ref()) else {
-        return AttrValueType::String;
-    };
-    match value {
-        Value::StringValue(_) => AttrValueType::String,
-        Value::BoolValue(_) => AttrValueType::Bool,
-        Value::IntValue(_) => AttrValueType::Int,
-        Value::DoubleValue(_) => AttrValueType::Float,
-        Value::ArrayValue(_) | Value::KvlistValue(_) => AttrValueType::String,
-        Value::BytesValue(_) => AttrValueType::String,
-        Value::StringValueStrindex(_) => AttrValueType::String,
-    }
-}
-
 /// Recursively renders an `AnyValue`'s `value` oneof to a `serde_json`
 /// tree, used for the array/kvlist branch of [`any_value_to_string`] —
 /// mirrors `otlp_logs::any_value_to_json` byte-for-byte (same duplication
@@ -1132,11 +443,11 @@ fn base64_encode(input: &[u8]) -> String {
 mod tests {
     use super::*;
     use opentelemetry_proto::tonic::common::v1::{ArrayValue, InstrumentationScope, KeyValueList};
-    use opentelemetry_proto::tonic::trace::v1::Status;
     use opentelemetry_proto::tonic::trace::v1::span::Event;
     use opentelemetry_proto::tonic::trace::v1::span::Link;
     use opentelemetry_proto::tonic::trace::v1::span::SpanKind;
     use opentelemetry_proto::tonic::trace::v1::status::StatusCode;
+    use opentelemetry_proto::tonic::trace::v1::{ScopeSpans, Status};
 
     fn kv(key: &str, value: Value) -> KeyValue {
         KeyValue {
@@ -1210,17 +521,17 @@ mod tests {
 
     #[test]
     fn parse_of_empty_request_returns_empty_output() {
-        let out = parse(&ExportTraceServiceRequest::default(), 1_000)
+        let out = parse_landing(&ExportTraceServiceRequest::default())
             .expect("within the expansion budget");
-        assert_eq!(out, ParsedTraces::default());
+        assert_eq!(out, ParsedTraceLanding::default());
     }
 
     #[test]
     fn parse_is_a_pure_function_of_its_arguments() {
         let req = request_with(Some(checkout_resource()), None, vec![valid_span()]);
         assert_eq!(
-            parse(&req, 42).expect("within the expansion budget"),
-            parse(&req, 42).expect("within the expansion budget")
+            parse_landing(&req).expect("within the expansion budget"),
+            parse_landing(&req).expect("within the expansion budget")
         );
     }
 
@@ -1228,10 +539,11 @@ mod tests {
 
     #[test]
     fn parse_promotes_resource_service_name_verbatim() {
-        let out = parse(
-            &request_with(Some(checkout_resource()), None, vec![valid_span()]),
-            0,
-        )
+        let out = parse_landing(&request_with(
+            Some(checkout_resource()),
+            None,
+            vec![valid_span()],
+        ))
         .expect("within the expansion budget");
         assert_eq!(out.spans.len(), 1);
         assert_eq!(out.spans[0].service, "checkout");
@@ -1239,7 +551,7 @@ mod tests {
 
     #[test]
     fn parse_service_is_empty_when_resource_or_service_name_is_absent() {
-        let out = parse(&request_with(None, None, vec![valid_span()]), 0)
+        let out = parse_landing(&request_with(None, None, vec![valid_span()]))
             .expect("within the expansion budget");
         assert_eq!(out.spans[0].service, "");
 
@@ -1253,7 +565,7 @@ mod tests {
             dropped_attributes_count: 0,
             entity_refs: vec![],
         };
-        let out = parse(&request_with(Some(resource), None, vec![valid_span()]), 0)
+        let out = parse_landing(&request_with(Some(resource), None, vec![valid_span()]))
             .expect("within the expansion budget");
         assert_eq!(out.spans[0].service, "");
     }
@@ -1267,67 +579,25 @@ mod tests {
             code: StatusCode::Error as i32,
         });
         let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+            parse_landing(&request_with(None, None, vec![s])).expect("within the expansion budget");
         let span = &out.spans[0];
         assert_eq!(span.trace_id, [1; 16]);
         assert_eq!(span.span_id, [2; 8]);
-        assert_eq!(span.parent_id, [3; 8]);
+        assert_eq!(span.parent_span_id, [3; 8]);
         assert_eq!(span.name, "op-a");
-        assert_eq!(span.timestamp_ns, 1_700_000_000_000_000_000);
+        assert_eq!(span.start_ns, 1_700_000_000_000_000_000);
         assert_eq!(span.duration_ns, 1_000_000_000);
-        assert_eq!(span.status_code, StatusCode::Error as i8);
+        assert_eq!(span.status_code, StatusCode::Error as i32);
         assert_eq!(
             span.status_message, "deadline exceeded",
             "issue #184: Status.message is stored verbatim, no longer dropped"
         );
-        assert_eq!(span.kind, SpanKind::Server as i8);
-    }
-
-    /// Issue #173 (M7-E1) AC7(e): an OTLP-native span with no `zipkin.shared`
-    /// attribute stores `shared = 0`; a span carrying `zipkin.shared = "true"`
-    /// (the wire contract `zipkin::to_otlp` emits) stores `shared = 1`. The
-    /// attribute still flows to `trace_attrs_idx` as an ordinary span attr.
-    #[test]
-    fn parse_promotes_the_zipkin_shared_attribute_to_the_shared_column() {
-        // Native span, no marker → shared = 0.
-        let out = parse(&request_with(None, None, vec![valid_span()]), 0)
-            .expect("within the expansion budget");
-        assert_eq!(out.spans[0].shared, 0);
-
-        // A shared-flagged span → shared = 1, and the attr is still indexed.
-        let mut s = valid_span();
-        s.attributes = vec![kv("zipkin.shared", Value::StringValue("true".to_string()))];
-        let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
-        assert_eq!(out.spans[0].shared, 1);
-        assert!(
-            out.attrs
-                .iter()
-                .any(|a| a.key == "zipkin.shared" && a.val == "true"),
-            "the shared attribute still flows to trace_attrs_idx"
-        );
-
-        // Only the exact string "true" flips the bit — a bool value or a
-        // different string does not (the literal wire contract).
-        let mut s = valid_span();
-        s.attributes = vec![kv("zipkin.shared", Value::BoolValue(true))];
-        let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
-        assert_eq!(
-            out.spans[0].shared, 0,
-            "a bool value is not the string contract"
-        );
-
-        let mut s = valid_span();
-        s.attributes = vec![kv("zipkin.shared", Value::StringValue("false".to_string()))];
-        let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
-        assert_eq!(out.spans[0].shared, 0);
+        assert_eq!(span.kind, SpanKind::Server as i32);
     }
 
     #[test]
     fn parse_missing_status_resolves_to_code_zero() {
-        let out = parse(&request_with(None, None, vec![valid_span()]), 0)
+        let out = parse_landing(&request_with(None, None, vec![valid_span()]))
             .expect("within the expansion budget");
         assert_eq!(out.spans[0].status_code, 0);
         assert_eq!(
@@ -1338,21 +608,24 @@ mod tests {
 
     #[test]
     fn parse_empty_parent_span_id_maps_to_the_zero_sentinel() {
-        let out = parse(&request_with(None, None, vec![valid_span()]), 0)
+        let out = parse_landing(&request_with(None, None, vec![valid_span()]))
             .expect("within the expansion budget");
-        assert_eq!(out.spans[0].parent_id, [0u8; 8]);
+        assert_eq!(out.spans[0].parent_span_id, [0u8; 8]);
     }
 
     // -- timestamp / duration rules ---------------------------------------
 
     #[test]
-    fn parse_zero_start_time_falls_back_to_now_ns() {
+    fn a_zero_start_time_is_stored_as_zero() {
         let mut s = valid_span();
         s.start_time_unix_nano = 0;
         s.end_time_unix_nano = 0;
         let out =
-            parse(&request_with(None, None, vec![s]), 999).expect("within the expansion budget");
-        assert_eq!(out.spans[0].timestamp_ns, 999);
+            parse_landing(&request_with(None, None, vec![s])).expect("within the expansion budget");
+        assert_eq!(
+            out.spans[0].start_ns, 0,
+            "no receiver clock (issue #587 row 10)"
+        );
         assert_eq!(out.spans[0].duration_ns, 0);
     }
 
@@ -1362,38 +635,38 @@ mod tests {
         bad.start_time_unix_nano = u64::MAX; // top bit set: does not fit in i64
         bad.attributes = vec![kv("http.method", Value::StringValue("GET".to_string()))];
         let good = valid_span();
-        let out = parse(&request_with(None, None, vec![bad, good]), 0)
+        let out = parse_landing(&request_with(None, None, vec![bad, good]))
             .expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(out.rejected_message.is_some());
         assert_eq!(out.spans.len(), 1);
-        // The rejected span contributes no attr rows either.
-        assert!(out.attrs.is_empty());
+        // The rejected span contributes no catalog rows either.
+        assert!(out.tag_values.is_empty());
     }
 
     #[test]
     fn parse_rejects_a_far_future_span_instead_of_orphaning_it_into_the_max_date_partition() {
         // Representable as i64 ns but ~year 2200 — past the 2149-06-06
-        // ClickHouse `Date` cutoff. Before #8's fix `trace_attrs_idx.date`
-        // saturated to day 65535, silently orphaning the span; now it is a
-        // clean per-span rejection (partial success), with no span/attr rows.
+        // ClickHouse `Date` cutoff: a clean per-span rejection (partial
+        // success), with no span or catalog rows.
         let far_future_ns: u64 = 86_400_000_000_000 * 84_000;
         let mut bad = valid_span();
         bad.start_time_unix_nano = far_future_ns;
         bad.end_time_unix_nano = far_future_ns;
         bad.attributes = vec![kv("http.method", Value::StringValue("GET".to_string()))];
         let good = valid_span();
-        let out = parse(&request_with(None, None, vec![bad, good]), 0)
+        let out = parse_landing(&request_with(None, None, vec![bad, good]))
             .expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(
-            out.rejected_message.as_deref().unwrap().contains(
-                "outside the supported storage time range (1970-01-01 to 2106-02-06 UTC)"
-            )
+            out.rejected_message
+                .as_deref()
+                .unwrap()
+                .contains("outside the admitted UTC day domain")
         );
         assert_eq!(out.spans.len(), 1);
-        // No attr row registered at the max-`Date` boundary.
-        assert!(out.attrs.iter().all(|a| a.date != u16::MAX));
+        // No resource row at the max-`Date` boundary.
+        assert!(out.resources.iter().all(|r| r.day != u16::MAX));
     }
 
     /// Issue #131: a span on day 49_710 (2106-02-07) partitions correctly
@@ -1401,7 +674,7 @@ mod tests {
     /// DateTime domain the trace delete-TTL evaluates in — before the
     /// DateTime-safe gate such a span was accepted and stored with a
     /// wrap-prone TTL input. It is now a clean per-span rejection (partial
-    /// success), with no span/attr rows.
+    /// success), with no span or catalog rows.
     #[test]
     fn parse_rejects_a_span_on_the_first_datetime_unsafe_day_as_partial_success() {
         let first_unsafe_ns: u64 = 86_400_000_000_000 * 49_710;
@@ -1410,22 +683,22 @@ mod tests {
         bad.end_time_unix_nano = first_unsafe_ns;
         bad.attributes = vec![kv("http.method", Value::StringValue("GET".to_string()))];
         let good = valid_span();
-        let out = parse(&request_with(None, None, vec![bad, good]), 0)
+        let out = parse_landing(&request_with(None, None, vec![bad, good]))
             .expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(
             out.rejected_message
                 .as_deref()
                 .unwrap()
-                .contains("outside the supported storage time range")
+                .contains("outside the admitted UTC day domain")
         );
         assert_eq!(out.spans.len(), 1);
-        assert!(out.attrs.is_empty());
+        assert!(out.tag_values.is_empty());
     }
 
     /// Issue #131 boundary acceptance: the last nanosecond of day 49_709
     /// (2106-02-06, the last fully DateTime-safe UTC day) is still admitted,
-    /// and every attr row carries `date == 49_709`.
+    /// and its resource row carries `day == 49_709`.
     #[test]
     fn parse_accepts_a_span_at_the_last_datetime_safe_nanosecond() {
         let last_safe_ns: u64 = 86_400_000_000_000 * 49_710 - 1;
@@ -1434,11 +707,11 @@ mod tests {
         s.end_time_unix_nano = last_safe_ns;
         s.attributes = vec![kv("http.method", Value::StringValue("GET".to_string()))];
         let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+            parse_landing(&request_with(None, None, vec![s])).expect("within the expansion budget");
         assert_eq!(out.rejected, 0);
         assert_eq!(out.spans.len(), 1);
-        assert!(!out.attrs.is_empty());
-        assert!(out.attrs.iter().all(|a| a.date == 49_709));
+        assert!(!out.tag_values.is_empty());
+        assert!(out.resources.iter().all(|r| r.day == 49_709));
     }
 
     #[test]
@@ -1447,7 +720,7 @@ mod tests {
         unset_end.end_time_unix_nano = 0;
         let mut inverted = valid_span();
         inverted.end_time_unix_nano = inverted.start_time_unix_nano - 1;
-        let out = parse(&request_with(None, None, vec![unset_end, inverted]), 0)
+        let out = parse_landing(&request_with(None, None, vec![unset_end, inverted]))
             .expect("within the expansion budget");
         assert_eq!(out.spans[0].duration_ns, 0);
         assert_eq!(out.spans[1].duration_ns, 0);
@@ -1459,7 +732,7 @@ mod tests {
         s.start_time_unix_nano = 1;
         s.end_time_unix_nano = u64::MAX;
         let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+            parse_landing(&request_with(None, None, vec![s])).expect("within the expansion budget");
         assert_eq!(out.spans[0].duration_ns, i64::MAX);
     }
 
@@ -1471,14 +744,15 @@ mod tests {
         let short_span = span(vec![1; 16], vec![2; 7]);
         let mut bad_parent = valid_span();
         bad_parent.parent_span_id = vec![3; 4];
-        let out = parse(
-            &request_with(None, None, vec![short_trace, short_span, bad_parent]),
-            0,
-        )
+        let out = parse_landing(&request_with(
+            None,
+            None,
+            vec![short_trace, short_span, bad_parent],
+        ))
         .expect("within the expansion budget");
         assert_eq!(out.rejected, 3);
         assert!(out.spans.is_empty());
-        assert!(out.attrs.is_empty());
+        assert!(out.tag_values.is_empty());
         assert!(
             out.rejected_message
                 .as_ref()
@@ -1490,86 +764,10 @@ mod tests {
 
     // -- attribute indexing ---------------------------------------------
 
-    #[test]
-    fn parse_indexes_resource_and_span_attrs_with_scopes_and_verbatim_keys() {
-        let resource = Resource {
-            attributes: vec![
-                kv("service.name", Value::StringValue("checkout".to_string())),
-                kv(
-                    "deployment.environment",
-                    Value::StringValue("prod".to_string()),
-                ),
-            ],
-            dropped_attributes_count: 0,
-            entity_refs: vec![],
-        };
-        let mut s = valid_span();
-        s.attributes = vec![
-            kv("http.status_code", Value::IntValue(500)),
-            kv("http.method", Value::StringValue("GET".to_string())),
-        ];
-        let out = parse(&request_with(Some(resource), None, vec![s]), 0)
-            .expect("within the expansion budget");
-
-        let rows: Vec<(&str, &str, &str, Option<f64>)> = out
-            .attrs
-            .iter()
-            .map(|a| (a.scope.as_str(), a.key.as_str(), a.val.as_str(), a.val_num))
-            .collect();
-        assert_eq!(
-            rows,
-            vec![
-                ("resource", "service.name", "checkout", None),
-                ("resource", "deployment.environment", "prod", None),
-                ("span", "http.status_code", "500", Some(500.0)),
-                ("span", "http.method", "GET", None),
-            ],
-            "verbatim keys, resource-then-span order, scope discriminators, numeric val_num"
-        );
-        for attr in &out.attrs {
-            assert_eq!(attr.trace_id, [1; 16]);
-            assert_eq!(attr.span_id, [2; 8]);
-            assert_eq!(attr.timestamp_ns, 1_700_000_000_000_000_000);
-            assert_eq!(attr.duration_ns, 1_000_000_000);
-            // 1_700_000_000s / 86_400s = day 19675 (2023-11-14 UTC).
-            assert_eq!(attr.date, 19_675);
-        }
-    }
-
-    /// Issue #54 plan v2 test-gap fix: the same verbatim key at BOTH scopes
-    /// yields two distinct rows separated only by `scope` — the exact
-    /// collision the scope discriminator exists to prevent.
-    #[test]
-    fn parse_same_key_at_resource_and_span_scope_yields_two_scoped_rows() {
-        let resource = Resource {
-            attributes: vec![kv(
-                "deployment.environment",
-                Value::StringValue("prod".to_string()),
-            )],
-            dropped_attributes_count: 0,
-            entity_refs: vec![],
-        };
-        let mut s = valid_span();
-        s.attributes = vec![kv(
-            "deployment.environment",
-            Value::StringValue("prod".to_string()),
-        )];
-        let out = parse(&request_with(Some(resource), None, vec![s]), 0)
-            .expect("within the expansion budget");
-        let scopes: Vec<&str> = out
-            .attrs
-            .iter()
-            .filter(|a| a.key == "deployment.environment" && a.val == "prod")
-            .map(|a| a.scope.as_str())
-            .collect();
-        assert_eq!(scopes, vec!["resource", "span"]);
-    }
-
-    /// Issue #192 (supersedes the #54 adjudication #2 that dropped them):
-    /// `InstrumentationScope` attributes ARE indexed under
-    /// `scope='instrumentation'` with their key verbatim, in
-    /// resource→span→instrumentation emission order; the scope `name`/
-    /// `version` are promoted onto the `SpanRecord` columns.
+    /// Issue #192: `InstrumentationScope` attributes are stored on the span
+    /// row and catalogued under the `instrumentation` scope with their key
+    /// verbatim; the scope `name`/`version` are carried as the span row's
+    /// own columns.
     #[test]
     fn parse_indexes_instrumentation_scope_attributes_and_promotes_name_version() {
         let resource = Resource {
@@ -1585,25 +783,25 @@ mod tests {
             attributes: vec![kv("scope.attr", Value::StringValue("x".to_string()))],
             dropped_attributes_count: 0,
         };
-        let out = parse(&request_with(Some(resource), Some(scope), vec![s]), 0)
+        let out = parse_landing(&request_with(Some(resource), Some(scope), vec![s]))
             .expect("within the expansion budget");
 
-        // The instrumentation attribute is indexed verbatim, last in the
-        // resource→span→instrumentation emission order.
-        let rows: Vec<(&str, &str, &str)> = out
-            .attrs
-            .iter()
-            .map(|a| (a.scope.as_str(), a.key.as_str(), a.val.as_str()))
-            .collect();
-        assert_eq!(
-            rows,
-            vec![
-                ("resource", "res.attr", "r"),
-                ("span", "span.attr", "s"),
-                ("instrumentation", "scope.attr", "x"),
-            ]
+        // The instrumentation attribute lands in the span's scope
+        // attributes and the catalog under its own scope.
+        assert!(
+            out.spans[0]
+                .scope_attrs
+                .entries()
+                .iter()
+                .any(|e| e.path == "scope%2Eattr"),
+            "{:?}",
+            out.spans[0].scope_attrs
         );
-
+        assert!(
+            out.tag_names
+                .iter()
+                .any(|t| t.scope == TagScope::Instrumentation && t.key == "scope.attr")
+        );
         // The scope name/version are promoted onto the span row.
         assert_eq!(out.spans.len(), 1);
         assert_eq!(out.spans[0].scope_name, "my-scope");
@@ -1611,279 +809,59 @@ mod tests {
     }
 
     /// A span whose `ScopeSpans` carries no `scope` yields no
-    /// instrumentation attr rows and empty `scope_name`/`scope_version`.
+    /// instrumentation catalog rows and empty `scope_name`/`scope_version`.
     #[test]
     fn parse_absent_instrumentation_scope_leaves_scope_columns_empty() {
-        let out = parse(&request_with(None, None, vec![valid_span()]), 0)
+        let mut span = valid_span();
+        span.attributes = vec![kv("span.attr", Value::StringValue("s".to_string()))];
+        let out = parse_landing(&request_with(None, None, vec![span]))
             .expect("within the expansion budget");
-        assert!(out.attrs.iter().all(|a| a.scope != "instrumentation"));
+        assert!(out.spans[0].scope_attrs.is_empty());
         assert_eq!(out.spans.len(), 1);
         assert_eq!(out.spans[0].scope_name, "");
         assert_eq!(out.spans[0].scope_version, "");
-    }
-
-    /// Issue #192 PR-B: a span event fans out into indexed rows — two
-    /// intrinsic rows under the dedicated `event:intrinsic` scope (`name`,
-    /// `timeSinceStart` in ns via `val_num`) followed by one `event`-scoped
-    /// row per event attribute (verbatim key), emitted after the
-    /// resource/span/instrumentation attrs.
-    #[test]
-    fn parse_indexes_span_events_intrinsics_and_attributes() {
-        let mut s = valid_span(); // start = 1_700_000_000_000_000_000
-        s.attributes = vec![kv("span.attr", Value::StringValue("s".to_string()))];
-        s.events = vec![Event {
-            time_unix_nano: s.start_time_unix_nano + 3_000_000, // +3ms
-            name: "exception".to_string(),
-            attributes: vec![kv(
-                "exception.type",
-                Value::StringValue("IOError".to_string()),
-            )],
-            dropped_attributes_count: 0,
-        }];
-        let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
-
-        let rows: Vec<(&str, &str, &str, Option<f64>)> = out
-            .attrs
-            .iter()
-            .map(|a| (a.scope.as_str(), a.key.as_str(), a.val.as_str(), a.val_num))
-            .collect();
-        assert_eq!(
-            rows,
-            vec![
-                ("span", "span.attr", "s", None),
-                // ...then the event: intrinsics first (dedicated scope,
-                // reserved keys), then its verbatim attribute.
-                ("event:intrinsic", "name", "exception", None),
-                (
-                    "event:intrinsic",
-                    "timeSinceStart",
-                    "3000000",
-                    Some(3_000_000.0)
-                ),
-                ("event", "exception.type", "IOError", None),
-            ]
+        // The catalogs are not empty — the span's own attribute is listed —
+        // and neither lists an `instrumentation` row for the missing scope.
+        assert!(out.tag_names.iter().any(|t| t.scope == TagScope::Span));
+        assert!(out.tag_values.iter().any(|t| t.scope == TagScope::Span));
+        assert!(
+            out.tag_names
+                .iter()
+                .all(|t| t.scope != TagScope::Instrumentation)
+        );
+        assert!(
+            out.tag_values
+                .iter()
+                .all(|t| t.scope != TagScope::Instrumentation)
         );
     }
 
-    /// The event intrinsic scope is a HARD partition: an event attribute
-    /// literally keyed `name` lands under `scope='event'`, never colliding
-    /// with the `event:intrinsic`/`name` intrinsic row.
-    #[test]
-    fn span_event_attribute_named_like_an_intrinsic_stays_in_the_event_scope() {
-        let mut s = valid_span();
-        s.events = vec![Event {
-            time_unix_nano: s.start_time_unix_nano,
-            name: "evt".to_string(),
-            attributes: vec![kv("name", Value::StringValue("shadow".to_string()))],
-            dropped_attributes_count: 0,
-        }];
-        let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
-        // The intrinsic `name` row (event:intrinsic) and the sender's `name`
-        // attribute (event) are two distinct rows separated by scope.
-        let name_rows: Vec<(&str, &str)> = out
-            .attrs
-            .iter()
-            .filter(|a| a.key == "name")
-            .map(|a| (a.scope.as_str(), a.val.as_str()))
-            .collect();
-        assert_eq!(
-            name_rows,
-            vec![("event:intrinsic", "evt"), ("event", "shadow")]
-        );
-    }
-
-    /// `timeSinceStart` preserves sign and saturates (issue #192 PR-B): a
-    /// conformant event (after start) is positive; a non-conformant event
-    /// before its span start is negative, never a wrap.
-    #[test]
-    fn span_event_time_since_start_is_signed_and_saturating() {
-        let mut s = valid_span();
-        s.start_time_unix_nano = 1_000;
-        s.events = vec![
-            Event {
-                time_unix_nano: 1_500, // +500ns
-                name: "after".to_string(),
-                attributes: vec![],
-                dropped_attributes_count: 0,
-            },
-            Event {
-                time_unix_nano: 400, // −600ns (before start)
-                name: "before".to_string(),
-                attributes: vec![],
-                dropped_attributes_count: 0,
-            },
-        ];
-        let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
-        let tss: Vec<f64> = out
-            .attrs
-            .iter()
-            .filter(|a| a.scope == "event:intrinsic" && a.key == "timeSinceStart")
-            .map(|a| a.val_num.expect("timeSinceStart carries val_num"))
-            .collect();
-        assert_eq!(tss, vec![500.0, -600.0]);
-    }
-
-    /// A span carrying no events yields no `event`/`event:intrinsic` rows.
+    /// A span carrying no events yields no `event` catalog rows.
     #[test]
     fn parse_absent_events_leave_no_event_rows() {
-        let out = parse(&request_with(None, None, vec![valid_span()]), 0)
+        let out = parse_landing(&request_with(None, None, vec![valid_span()]))
             .expect("within the expansion budget");
-        assert!(
-            out.attrs
-                .iter()
-                .all(|a| a.scope != "event" && a.scope != "event:intrinsic")
-        );
+        assert!(out.spans[0].events.is_empty());
+        assert!(out.tag_names.iter().all(|t| t.scope != TagScope::Event));
     }
 
-    /// Issue #192 PR-C: a span link fans out into indexed rows — two intrinsic
-    /// rows under the dedicated `link:intrinsic` scope (`spanID`/`traceID` as
-    /// lowercase hex in `val`) followed by one `link`-scoped row per link
-    /// attribute (verbatim key), emitted after the events.
-    #[test]
-    fn parse_indexes_span_links_intrinsics_and_attributes() {
-        let mut s = valid_span();
-        s.attributes = vec![kv("span.attr", Value::StringValue("s".to_string()))];
-        s.links = vec![Link {
-            trace_id: vec![
-                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-                0x0e, 0x0f,
-            ],
-            span_id: vec![0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71],
-            trace_state: String::new(),
-            attributes: vec![kv(
-                "link.relation",
-                Value::StringValue("child_of".to_string()),
-            )],
-            dropped_attributes_count: 0,
-            flags: 0,
-        }];
-        let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
-
-        let rows: Vec<(&str, &str, &str, Option<f64>)> = out
-            .attrs
-            .iter()
-            .map(|a| (a.scope.as_str(), a.key.as_str(), a.val.as_str(), a.val_num))
-            .collect();
-        assert_eq!(
-            rows,
-            vec![
-                ("span", "span.attr", "s", None),
-                // ...then the link: intrinsics first (dedicated scope, reserved
-                // keys, lowercase-hex ids in `val`), then its verbatim attribute.
-                ("link:intrinsic", "spanID", "0a1b2c3d4e5f6071", None),
-                (
-                    "link:intrinsic",
-                    "traceID",
-                    "000102030405060708090a0b0c0d0e0f",
-                    None
-                ),
-                ("link", "link.relation", "child_of", None),
-            ]
-        );
-    }
-
-    /// The link intrinsic scope is a HARD partition: a link attribute literally
-    /// keyed `spanID` lands under `scope='link'`, never colliding with the
-    /// `link:intrinsic`/`spanID` intrinsic row.
-    #[test]
-    fn span_link_attribute_named_like_an_intrinsic_stays_in_the_link_scope() {
-        let mut s = valid_span();
-        s.links = vec![Link {
-            trace_id: vec![0xaa; 16],
-            span_id: vec![0xbb; 8],
-            trace_state: String::new(),
-            attributes: vec![kv("spanID", Value::StringValue("shadow".to_string()))],
-            dropped_attributes_count: 0,
-            flags: 0,
-        }];
-        let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
-        // The intrinsic `spanID` row (link:intrinsic) and the sender's `spanID`
-        // attribute (link) are two distinct rows separated by scope.
-        let span_id_rows: Vec<(&str, &str)> = out
-            .attrs
-            .iter()
-            .filter(|a| a.key == "spanID")
-            .map(|a| (a.scope.as_str(), a.val.as_str()))
-            .collect();
-        assert_eq!(
-            span_id_rows,
-            vec![("link:intrinsic", "bbbbbbbbbbbbbbbb"), ("link", "shadow")]
-        );
-    }
-
-    /// A span carrying no links yields no `link`/`link:intrinsic` rows.
+    /// A span carrying no links yields no `link` catalog rows.
     #[test]
     fn parse_absent_links_leave_no_link_rows() {
-        let out = parse(&request_with(None, None, vec![valid_span()]), 0)
+        let out = parse_landing(&request_with(None, None, vec![valid_span()]))
             .expect("within the expansion budget");
-        assert!(
-            out.attrs
-                .iter()
-                .all(|a| a.scope != "link" && a.scope != "link:intrinsic")
-        );
-    }
-
-    #[test]
-    fn parse_val_num_excludes_non_finite_and_non_numeric_parses() {
-        let mut s = valid_span();
-        s.attributes = vec![
-            kv("a", Value::StringValue("inf".to_string())),
-            kv("b", Value::StringValue("NaN".to_string())),
-            kv("c", Value::StringValue("1.5".to_string())),
-            kv("d", Value::DoubleValue(2.5)),
-        ];
-        let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
-        let by_key: Vec<Option<f64>> = out.attrs.iter().map(|a| a.val_num).collect();
-        assert_eq!(by_key, vec![None, None, Some(1.5), Some(2.5)]);
-    }
-
-    // -- payload contract -------------------------------------------------
-
-    #[test]
-    fn payload_is_a_self_contained_single_resource_spans_traces_data() {
-        let scope = InstrumentationScope {
-            name: "my-scope".to_string(),
-            version: "1.0.0".to_string(),
-            attributes: vec![],
-            dropped_attributes_count: 0,
-        };
-        let out = parse(
-            &request_with(
-                Some(checkout_resource()),
-                Some(scope.clone()),
-                vec![valid_span()],
-            ),
-            0,
-        )
-        .expect("within the expansion budget");
-        let payload = TracesData::decode(out.spans[0].payload.as_slice()).expect("payload decodes");
-        assert_eq!(payload.resource_spans.len(), 1);
-        let rs = &payload.resource_spans[0];
-        assert_eq!(rs.resource, Some(checkout_resource()));
-        assert_eq!(rs.schema_url, "https://example.com/resource-schema");
-        assert_eq!(rs.scope_spans.len(), 1);
-        let ss = &rs.scope_spans[0];
-        assert_eq!(ss.scope, Some(scope));
-        assert_eq!(ss.schema_url, "https://example.com/scope-schema");
-        assert_eq!(ss.spans, vec![valid_span()]);
+        assert!(out.spans[0].links.is_empty());
+        assert!(out.tag_names.iter().all(|t| t.scope != TagScope::Link));
     }
 
     // -- expansion budget --------------------------------------------------
 
-    /// Issue #54 code-review [high] fix: a small wire body whose resource ×
-    /// span fan-out describes an over-budget expansion is rejected as a
-    /// whole-request structural failure BEFORE the expansion is
-    /// materialized — no partial output survives, and the error is the
-    /// `OversizeMessage` class the handler maps to 400/code 3. The crafted
-    /// request is ~1 MiB on the wire (one 1 MiB resource attribute) but
-    /// its per-span payload duplication alone estimates past
-    /// [`MAX_EXPANDED_BYTES`] within the first few hundred spans.
+    /// Issue #54 code-review [high] fix, kept by issue #602: a request whose
+    /// resource × span fan-out describes an over-budget expansion is rejected
+    /// as a whole-request structural failure BEFORE it is materialized —
+    /// the `OversizeMessage` class the handler maps to 400/code 3. The
+    /// request is ~1 MiB on the wire (one 1 MiB resource attribute), and
+    /// every span row's copy of that resource is charged.
     #[test]
     fn expansion_budget_rejects_a_pathological_resource_by_span_fan_out() {
         let big_value = "v".repeat(1024 * 1024); // 1 MiB resource attr value
@@ -1892,13 +870,12 @@ mod tests {
             dropped_attributes_count: 0,
             entity_refs: vec![],
         };
-        // Enough spans that spans × ~1 MiB payload duplication exceeds the
-        // budget with certainty, derived from the constant rather than
-        // hard-coded so a budget retune cannot silently weaken this test.
+        // Derived from the constant rather than hard-coded, so a budget
+        // retune cannot silently weaken this test.
         let span_count = MAX_EXPANDED_BYTES / (1024 * 1024) + 2;
         let spans: Vec<Span> = (0..span_count).map(|_| valid_span()).collect();
 
-        let err = parse(&request_with(Some(resource), None, spans), 0)
+        let err = parse_landing(&request_with(Some(resource), None, spans))
             .expect_err("pathological fan-out must trip the expansion budget");
         assert!(
             matches!(
@@ -1910,82 +887,9 @@ mod tests {
         );
     }
 
-    /// Issue #54 code-review round 2 [high] fix: an escape-dense
-    /// array-kind resource attribute (NUL bytes render as 6-byte `\u0000`
-    /// JSON escapes) must be charged at [`MAX_JSON_ESCAPE_FACTOR`] × its
-    /// wire length. This test proves the fix two-sidedly: it recomputes
-    /// the round-1 1×-wire proxy for the exact crafted request and asserts
-    /// that proxy stays UNDER the budget (i.e. round 1 would have admitted
-    /// it, then materialized ~7 MiB/span ≈ 0.6 GiB of rendered vals +
-    /// payloads), while the multiplied charge trips `parse` before any
-    /// materialization. Span count and the under-budget bound both derive
-    /// from the constants, so a budget retune cannot silently break either
-    /// side.
-    #[test]
-    fn expansion_budget_charges_escape_dense_array_attributes_at_worst_case() {
-        const MIB: usize = 1024 * 1024;
-        // One array attribute wrapping a 1 MiB NUL-dense string: ~1 MiB on
-        // the wire, ~6 MiB once JSON-rendered into `val`.
-        let nul_dense = "\0".repeat(MIB);
-        let resource = Resource {
-            attributes: vec![kv(
-                "escape.bomb",
-                Value::ArrayValue(ArrayValue {
-                    values: vec![AnyValue {
-                        value: Some(Value::StringValue(nul_dense)),
-                    }],
-                }),
-            )],
-            dropped_attributes_count: 0,
-            entity_refs: vec![],
-        };
-        // Old per-span charge ~2 MiB (payload_base ~1 MiB + attr 1× ~1 MiB);
-        // new per-span charge ~7 MiB. One third of budget/old-charge keeps
-        // the 1× proxy comfortably under budget while 6× trips.
-        let attr_wire = resource.attributes[0].encoded_len();
-        let span_count = MAX_EXPANDED_BYTES / (3 * attr_wire);
-        let spans: Vec<Span> = (0..span_count).map(|_| valid_span()).collect();
-        let req = request_with(Some(resource.clone()), None, spans);
-
-        // Side 1: the round-1 proxy (1 × encoded_len for every attr kind)
-        // over the exact same request stays under the budget — the old
-        // estimate would have admitted this request.
-        let rs = &req.resource_spans[0];
-        let ss = &rs.scope_spans[0];
-        let payload_base = resource.encoded_len()
-            + rs.schema_url.len()
-            + ss.schema_url.len()
-            + PAYLOAD_ENVELOPE_OVERHEAD;
-        let one_x_per_span = SPAN_ROW_OVERHEAD
-            + valid_span().name.len()
-            + payload_base
-            + valid_span().encoded_len()
-            + ATTR_ROW_OVERHEAD
-            + attr_wire;
-        assert!(
-            one_x_per_span * span_count <= MAX_EXPANDED_BYTES,
-            "precondition: the round-1 1x-wire proxy must admit this request \
-             ({} <= {MAX_EXPANDED_BYTES}) or this test proves nothing",
-            one_x_per_span * span_count
-        );
-
-        // Side 2: the worst-case-multiplied charge trips before any
-        // materialization.
-        let err =
-            parse(&req, 0).expect_err("escape-dense array fan-out must trip the multiplied budget");
-        assert!(
-            matches!(
-                err,
-                LogsIngestError::OversizeMessage { limit, actual, .. }
-                    if limit == MAX_EXPANDED_BYTES && actual > MAX_EXPANDED_BYTES
-            ),
-            "unexpected error: {err}"
-        );
-    }
-
-    /// Issue #192 PR-B: span events are multiplicative in span output
-    /// (0..N per span, each fanning out into intrinsic + attribute index
-    /// rows), so their materialization must be charged BEFORE it happens.
+    /// Issue #192 PR-B: span events are multiplicative in span output (0..N
+    /// per span, each carrying its own attributes), so their materialization
+    /// must be charged BEFORE it happens.
     /// A single span with an over-budget event fan-out (each event carrying
     /// an escape-dense array attribute charged at [`MAX_JSON_ESCAPE_FACTOR`]×)
     /// trips the `OversizeMessage` guard rather than exhausting memory. Event
@@ -2016,7 +920,7 @@ mod tests {
         let mut s = valid_span();
         s.events = (0..event_count).map(|_| event.clone()).collect();
 
-        let err = parse(&request_with(None, None, vec![s]), 0)
+        let err = parse_landing(&request_with(None, None, vec![s]))
             .expect_err("pathological event fan-out must trip the expansion budget");
         assert!(
             matches!(
@@ -2029,8 +933,8 @@ mod tests {
     }
 
     /// Issue #192 PR-C: span links are multiplicative in span output exactly
-    /// like events (0..N per span, each fanning out into intrinsic + attribute
-    /// index rows), so their materialization must be charged BEFORE it happens.
+    /// like events (0..N per span, each carrying its own attributes), so their
+    /// materialization must be charged BEFORE it happens.
     /// A single span with an over-budget link fan-out (each link carrying an
     /// escape-dense array attribute charged at [`MAX_JSON_ESCAPE_FACTOR`]×)
     /// trips the `OversizeMessage` guard rather than exhausting memory. Link
@@ -2063,7 +967,7 @@ mod tests {
         let mut s = valid_span();
         s.links = (0..link_count).map(|_| link.clone()).collect();
 
-        let err = parse(&request_with(None, None, vec![s]), 0)
+        let err = parse_landing(&request_with(None, None, vec![s]))
             .expect_err("pathological link fan-out must trip the expansion budget");
         assert!(
             matches!(
@@ -2127,7 +1031,7 @@ mod tests {
         );
 
         // Side 2: the pre-render charges alone trip the budget.
-        let err = parse(&req, 0)
+        let err = parse_landing(&req)
             .expect_err("escape-dense service.name fan-out must trip before rendering");
         assert!(
             matches!(
@@ -2154,12 +1058,12 @@ mod tests {
         let mut bad = valid_span();
         bad.name = "\u{1}".repeat(32 * 1024 * 1024); // near-body-cap, escape-dense
         bad.trace_id = vec![1; 15]; // invalid: triggers the rejection path
-        let out = parse(&request_with(None, None, vec![bad]), 0)
+        let out = parse_landing(&request_with(None, None, vec![bad]))
             .expect("a rejected span is partial success, not a whole-request error");
 
         assert_eq!(out.rejected, 1);
         assert!(out.spans.is_empty());
-        assert!(out.attrs.is_empty());
+        assert!(out.tag_values.is_empty());
         let msg = out.rejected_message.expect("rejection message present");
         assert!(
             msg.len() <= DIAG_SNIPPET_MAX_BYTES * 10 + 256,
@@ -2245,31 +1149,12 @@ mod tests {
     /// `Ok` — pinned here explicitly against the same code path.
     #[test]
     fn expansion_budget_admits_an_ordinary_request() {
-        let out = parse(
-            &request_with(Some(checkout_resource()), None, vec![valid_span()]),
-            0,
-        );
+        let out = parse_landing(&request_with(
+            Some(checkout_resource()),
+            None,
+            vec![valid_span()],
+        ));
         assert!(out.is_ok());
-    }
-
-    /// Two spans under one scope: each payload carries ONLY its own span
-    /// (independently decodable, concatenable by T3) — never the sibling.
-    #[test]
-    fn each_spans_payload_carries_only_that_span() {
-        let mut second = span(vec![9; 16], vec![8; 8]);
-        second.name = "op-b".to_string();
-        let out = parse(
-            &request_with(None, None, vec![valid_span(), second.clone()]),
-            0,
-        )
-        .expect("within the expansion budget");
-        assert_eq!(out.spans.len(), 2);
-        let payload_b =
-            TracesData::decode(out.spans[1].payload.as_slice()).expect("payload decodes");
-        assert_eq!(
-            payload_b.resource_spans[0].scope_spans[0].spans,
-            vec![second]
-        );
     }
 
     // -- AnyValue recursion-depth guard (finding #54) --------------------
@@ -2309,7 +1194,7 @@ mod tests {
                 crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH,
             )],
         );
-        let out = parse(&req, 0).expect("at-cap span attribute is within the depth guard");
+        let out = parse_landing(&req).expect("at-cap span attribute is within the depth guard");
         assert_eq!(out.spans.len(), 1);
     }
 
@@ -2326,345 +1211,17 @@ mod tests {
                 crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH + 1,
             )],
         );
-        let err = parse(&req, 0).expect_err("over-depth span attribute is rejected whole-request");
+        let err =
+            parse_landing(&req).expect_err("over-depth span attribute is rejected whole-request");
         assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
-    }
-
-    /// Issue #475: every scope constant this module declares is
-    /// REACHABLE from parse output.
-    ///
-    /// What this proves that `trace_scope_vocabulary.rs` cannot: that
-    /// each declared constant is actually emitted, not merely declared.
-    /// What that gate proves that this cannot: that the string VALUES
-    /// match the reader's. Neither substitutes for the other, and this
-    /// one is deliberately written against the constants rather than a
-    /// second literal list, so it is a reachability check and not a
-    /// spelling check.
-    #[test]
-    fn every_declared_scope_constant_is_emitted_by_parse() {
-        let mut span = valid_span();
-        span.attributes = vec![kv("status", Value::StringValue("degraded".to_string()))];
-        span.events = vec![Event {
-            time_unix_nano: 1_700_000_000_005_000_000,
-            name: "exception".to_string(),
-            attributes: vec![kv("kind", Value::StringValue("retry".to_string()))],
-            dropped_attributes_count: 0,
-        }];
-        span.links = vec![Link {
-            trace_id: vec![7; 16],
-            span_id: vec![9; 8],
-            trace_state: String::new(),
-            attributes: vec![kv(
-                "spanID",
-                Value::StringValue("from-attribute".to_string()),
-            )],
-            dropped_attributes_count: 0,
-            flags: 0,
-        }];
-        let scope = InstrumentationScope {
-            name: "checkout-lib".to_string(),
-            version: "1.0.0".to_string(),
-            attributes: vec![kv("sdk", Value::StringValue("rust".to_string()))],
-            dropped_attributes_count: 0,
-        };
-        let req = request_with(Some(checkout_resource()), Some(scope), vec![span]);
-
-        let parsed = parse(&req, 0).expect("the corpus parses");
-        let mut emitted: Vec<&str> = parsed.attrs.iter().map(|a| a.scope.as_str()).collect();
-        emitted.sort_unstable();
-        emitted.dedup();
-
-        let mut declared = [
-            SCOPE_EVENT,
-            SCOPE_EVENT_INTRINSIC,
-            SCOPE_INSTRUMENTATION,
-            SCOPE_LINK,
-            SCOPE_LINK_INTRINSIC,
-            SCOPE_RESOURCE,
-            SCOPE_SPAN,
-        ];
-        declared.sort_unstable();
-        assert_eq!(emitted, declared, "every declared scope must be reachable");
-    }
-
-    // -- issue #476: the stored OTLP type ---------------------------------
-
-    /// AC3 — the ORDERED `(key, val_type)` list for one attribute of every
-    /// OTLP `AnyValue` kind, plus the adversarial string cases the issue
-    /// names: a string whose text is digits, a duration literal, a boolean
-    /// word, a float, and the empty string.
-    ///
-    /// This is a PERMUTATION break, not a rename check. The expected list
-    /// pairs each key with its own spelling, so swapping two arms of
-    /// `AttrValueType::as_str` (`Int` <-> `Float`, say) moves `port` to
-    /// `float` and `cpu` to `int` and fails here. A test that asserted only
-    /// that the SET `{string,int,float,bool}` appears would pass under that
-    /// swap and must not be written.
-    #[test]
-    fn every_otlp_value_kind_stores_its_own_type_spelling() {
-        let mut s = valid_span();
-        s.attributes = vec![
-            // Strings whose TEXT reads as something else — the whole point
-            // of the column. Before it, `build` was reported `int`,
-            // `timeout` `duration`, `enabled` `bool` and `ratio` `float`.
-            kv("build", Value::StringValue("007".to_string())),
-            kv("timeout", Value::StringValue("2s".to_string())),
-            kv("enabled", Value::StringValue("true".to_string())),
-            kv("ratio", Value::StringValue("1.5".to_string())),
-            kv("note", Value::StringValue(String::new())),
-            // Genuine scalars.
-            kv("status_code", Value::IntValue(500)),
-            kv("sampled", Value::BoolValue(true)),
-            kv("cpu", Value::DoubleValue(1.5)),
-            // Composite values RENDER to a string, so `string` is the truth
-            // about what we stored.
-            kv(
-                "tags",
-                Value::ArrayValue(ArrayValue {
-                    values: vec![AnyValue {
-                        value: Some(Value::StringValue("a".to_string())),
-                    }],
-                }),
-            ),
-            kv(
-                "meta",
-                Value::KvlistValue(KeyValueList {
-                    values: vec![kv("k", Value::StringValue("v".to_string()))],
-                }),
-            ),
-            kv("blob", Value::BytesValue(vec![0xDE, 0xAD])),
-        ];
-        // An attribute carrying NO value at all renders `""` and is a
-        // string; it cannot be spelled through `kv`.
-        s.attributes.push(KeyValue {
-            key: "absent".to_string(),
-            value: None,
-            key_strindex: 0,
-        });
-        let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
-        let got: Vec<(&str, &str)> = out
-            .attrs
-            .iter()
-            .map(|a| (a.key.as_str(), a.val_type.as_str()))
-            .collect();
-        assert_eq!(
-            got,
-            vec![
-                ("build", "string"),
-                ("timeout", "string"),
-                ("enabled", "string"),
-                ("ratio", "string"),
-                ("note", "string"),
-                ("status_code", "int"),
-                ("sampled", "bool"),
-                ("cpu", "float"),
-                ("tags", "string"),
-                ("meta", "string"),
-                ("blob", "string"),
-                ("absent", "string"),
-            ]
-        );
-    }
-
-    /// The type is NOT a function of the rendered text: a string `"1.5"`
-    /// and a double `1.5` store identical `val` bytes and different types.
-    /// This is the pair no read-side rule could ever separate, which is
-    /// why the column exists.
-    #[test]
-    fn a_string_and_a_double_with_identical_text_store_different_types() {
-        let mut s = valid_span();
-        s.attributes = vec![
-            kv("as_text", Value::StringValue("1.5".to_string())),
-            kv("as_double", Value::DoubleValue(1.5)),
-        ];
-        let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
-        let rows: Vec<(&str, &str, &str)> = out
-            .attrs
-            .iter()
-            .map(|a| (a.key.as_str(), a.val.as_str(), a.val_type.as_str()))
-            .collect();
-        assert_eq!(
-            rows,
-            vec![("as_text", "1.5", "string"), ("as_double", "1.5", "float")]
-        );
-        // `val_num` is populated for BOTH — it is a parse of the text, so
-        // it cannot tell them apart. Asserted so the next reader does not
-        // reach for it as a type source (issue #493 owns its own limits).
-        assert_eq!(out.attrs[0].val_num, Some(1.5));
-        assert_eq!(out.attrs[1].val_num, Some(1.5));
-    }
-
-    /// The writer-synthesised intrinsic rows carry a type too: an event
-    /// name and the two link hex ids are strings, `timeSinceStart` is the
-    /// integer nanosecond count.
-    #[test]
-    fn writer_synthesised_intrinsic_rows_carry_their_own_types() {
-        let mut s = valid_span();
-        s.events = vec![Event {
-            time_unix_nano: 1_700_000_000_500_000_000,
-            name: "cache.miss".to_string(),
-            attributes: vec![],
-            dropped_attributes_count: 0,
-        }];
-        s.links = vec![Link {
-            trace_id: vec![0x0a; 16],
-            span_id: vec![0x0b; 8],
-            trace_state: String::new(),
-            attributes: vec![],
-            dropped_attributes_count: 0,
-            flags: 0,
-        }];
-        let out =
-            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
-        let rows: Vec<(&str, &str, &str)> = out
-            .attrs
-            .iter()
-            .map(|a| (a.scope.as_str(), a.key.as_str(), a.val_type.as_str()))
-            .collect();
-        assert_eq!(
-            rows,
-            vec![
-                ("event:intrinsic", "name", "string"),
-                ("event:intrinsic", "timeSinceStart", "int"),
-                ("link:intrinsic", "spanID", "string"),
-                ("link:intrinsic", "traceID", "string"),
-            ]
-        );
-    }
-
-    // -- the admission charge counts the span-row arrays (issue #556) ----
-
-    /// The request the byte figures on issue #556 are taken on. Fully
-    /// determined by this text: no helper supplies an attribute.
-    fn metered_request(long_renderings: bool) -> ExportTraceServiceRequest {
-        let mut sp = Span {
-            trace_id: vec![1; 16],
-            span_id: vec![2; 8],
-            name: "op-a".to_string(),
-            kind: SpanKind::Server as i32,
-            start_time_unix_nano: 1_700_000_000_000_000_000,
-            end_time_unix_nano: 1_700_000_001_000_000_000,
-            ..Default::default()
-        };
-        sp.attributes = vec![
-            kv("http.status_code", Value::IntValue(500)),
-            kv("http.method", Value::StringValue("GET".into())),
-        ];
-        if long_renderings {
-            sp.attributes.push(kv("d", Value::DoubleValue(f64::MIN)));
-            sp.attributes.push(kv("i", Value::IntValue(i64::MIN)));
-            sp.attributes.push(kv("b", Value::BoolValue(true)));
-        }
-        sp.events = vec![Event {
-            time_unix_nano: 1_700_000_000_003_000_000,
-            name: "exception".into(),
-            attributes: vec![kv("exception.type", Value::StringValue("IOError".into()))],
-            dropped_attributes_count: 0,
-        }];
-        sp.links = vec![Link {
-            trace_id: vec![9; 16],
-            span_id: vec![8; 8],
-            attributes: vec![kv("rel", Value::StringValue("child_of".into()))],
-            ..Default::default()
-        }];
-        ExportTraceServiceRequest {
-            resource_spans: vec![ResourceSpans {
-                resource: Some(Resource {
-                    attributes: vec![kv("service.name", Value::StringValue("checkout".into()))],
-                    dropped_attributes_count: 0,
-                    ..Default::default()
-                }),
-                scope_spans: vec![ScopeSpans {
-                    scope: None,
-                    spans: vec![sp],
-                    schema_url: String::new(),
-                }],
-                schema_url: String::new(),
-            }],
-        }
-    }
-
-    fn admission_charge(req: &ExportTraceServiceRequest) -> usize {
-        req.resource_spans
-            .iter()
-            .map(resource_spans_expansion_charge)
-            .sum()
-    }
-
-    fn queue_reservation(req: &ExportTraceServiceRequest) -> u64 {
-        let out = parse(req, 0).expect("within the expansion budget");
-        out.spans
-            .iter()
-            .map(crate::writer::rows::TraceSpanRow::est_source_bytes)
-            .sum::<u64>()
-            + out
-                .attrs
-                .iter()
-                .map(crate::writer::rows::TraceAttrRow::est_source_bytes)
-                .sum::<u64>()
-    }
-
-    /// One more attribute costs the admission charge at least one more
-    /// array element (issue #556). The charge is compared with ITSELF over
-    /// two requests, so the figure it must clear is not one this test
-    /// computes.
-    #[test]
-    fn one_more_attribute_charges_at_least_one_more_array_element() {
-        let mut three = metered_request(false);
-        let mut four = metered_request(false);
-        three.resource_spans[0].scope_spans[0].spans[0]
-            .attributes
-            .push(kv("a", Value::StringValue("x".into())));
-        four.resource_spans[0].scope_spans[0].spans[0]
-            .attributes
-            .push(kv("a", Value::StringValue("x".into())));
-        four.resource_spans[0].scope_spans[0].spans[0]
-            .attributes
-            .push(kv("b", Value::StringValue("y".into())));
-        let delta = admission_charge(&four) - admission_charge(&three);
-        assert!(
-            delta >= ATTR_ARRAY_ELEMENT_OVERHEAD,
-            "one more attribute must charge at least one array element \
-             ({ATTR_ARRAY_ELEMENT_OVERHEAD}); it charged {delta}"
-        );
-    }
-
-    /// On an ordinary span the coarse admission charge covers the exact
-    /// queue reservation — two numbers from two functions over two shapes,
-    /// so neither produces the other.
-    ///
-    /// Asserted on `metered_request(false)` only. It does NOT hold in
-    /// general: on values whose rendering is far longer than their wire
-    /// bytes it fails at the BASE, before these arrays exist, because
-    /// `attr_budget_charge` measures the protobuf length while the queue
-    /// reserves the RENDERED string. That gap predates issue #556 and is
-    /// not closed by it, so asserting the relation generally would pin a
-    /// defect that is not this change's.
-    #[test]
-    fn the_admission_charge_covers_the_queue_reservation_on_an_ordinary_span() {
-        let req = metered_request(false);
-        let charge = admission_charge(&req) as u64;
-        let reservation = queue_reservation(&req);
-        assert!(
-            charge >= reservation,
-            "the admission charge ({charge}) must cover the queue reservation ({reservation})"
-        );
     }
 }
 
 // === The landing-shaped decode (issues #584 to #586) ======================
 //
-// [`parse`] above is the OLD two-table path's walk and is untouched. This
-// one produces [`ParsedTraceLanding`], which carries what the landing path
-// stores and the old path keeps inside the span's protobuf `payload` blob
-// instead: the events, the links, the scope's attributes, the resource's
-// attributes, the trace state, the flags and the four dropped counts.
-//
-// The two walks share this module's depth guard, its expansion budget and
-// its value renderer, and nothing else. **Neither path's behaviour depends
-// on the other's**: a change to one walk cannot move the other's rows.
+// [`parse_landing`] produces [`ParsedTraceLanding`]: the events, the links,
+// the scope's attributes, the resource's attributes, the trace state, the
+// flags and the four dropped counts, beside each span's own columns.
 
 /// The reserved key the resource-identity buffer appends the schema url
 /// under.
@@ -3244,8 +1801,7 @@ fn value_is_non_empty_string(value: Option<&AnyValue>) -> bool {
 ///
 /// **No row for a mixed array**: its elements have no one `tag_type`, and
 /// an unnarrowed value lookup on such a key answers an empty list while a
-/// narrowed one reads the store and answers. That is a decision, not parity
-/// with the old `trace_tag_catalog`.
+/// narrowed one reads the store and answers. That is a decision.
 fn record_values(
     scope: TagScope,
     key: &str,
@@ -3348,20 +1904,17 @@ fn check_json_paths(json: &TraceJson) -> Result<(), LogsIngestError> {
 
 /// Decodes `req` into the landing path's four landed event shapes.
 ///
-/// `Err` on the same two whole-request structural failures [`parse`] has —
-/// the `AnyValue` recursion-depth guard and the [`MAX_EXPANDED_BYTES`]
-/// expansion budget — plus one of its own: a value whose stored path count
-/// would exceed `format_binary_max_object_size`. Everything else (bad ids,
+/// `Err` on three whole-request structural failures: the `AnyValue`
+/// recursion-depth guard, the [`MAX_EXPANDED_BYTES`] expansion budget, and
+/// a value whose stored path count would exceed
+/// `format_binary_max_object_size`. Everything else (bad ids,
 /// bad timestamps) stays a per-span partial-success rejection inside the
 /// `Ok`.
+///
+/// It takes no clock: a zero `start_time_unix_nano` is stored as `0` rather
+/// than replaced with the receipt time (issue #587 row 10).
 pub fn parse_landing(
     req: &ExportTraceServiceRequest,
-    // **Not consulted since issue #587 row 10.** A zero
-    // `start_time_unix_nano` is stored as `0` rather than replaced with
-    // the receipt time, so this walk needs no clock at all. The parameter
-    // stays because the handler runs both decodes over the same bytes with
-    // the same arguments, and `parse` does still take one.
-    _now_ns: i64,
 ) -> Result<ParsedTraceLanding, LogsIngestError> {
     crate::protocols::otlp_depth::ensure_trace_anyvalue_depth(req)?;
 
@@ -3444,8 +1997,13 @@ pub fn parse_landing(
                 },
             };
             check_json_paths(&scope_attrs.json)?;
+            let copies = per_span_copy_charge(resource, &resource_spans.schema_url, scope_spans);
 
             for span in &scope_spans.spans {
+                charge_budget(
+                    &mut expanded_bytes,
+                    span_row_charge(span, service.len(), copies),
+                )?;
                 let mut span_stage = TagStage::default();
                 let Some(landed) = land_span(
                     &mut out,
@@ -3579,12 +2137,6 @@ fn land_span(
     // the sender's own time range did not find it. 1970-01-01T00:00:00Z is
     // inside the admitted UTC-day domain, so the span lands where the
     // sender said it belongs.
-    //
-    // **The OLD path's substitution stays**, in `parse`'s span loop, and
-    // `parse_zero_start_time_falls_back_to_now_ns` is what pins it. The two
-    // paths then disagree for a zero start, which is allowed: no
-    // equivalence between the old tables and the new ones is claimed,
-    // required or tested.
     let start_ns = match i64::try_from(span.start_time_unix_nano) {
         Ok(ns) => ns,
         Err(_) => {
@@ -3708,6 +2260,8 @@ fn reject_landing(out: &mut ParsedTraceLanding, message: String) {
 #[cfg(test)]
 mod landing_tests {
     use super::*;
+    use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+    use opentelemetry_proto::tonic::trace::v1::ScopeSpans;
     use opentelemetry_proto::tonic::trace::v1::span;
 
     fn str_value(s: &str) -> AnyValue {
@@ -3821,7 +2375,7 @@ mod landing_tests {
     }
 
     fn landed(req: &ExportTraceServiceRequest) -> ParsedTraceLanding {
-        parse_landing(req, TS as i64).expect("the landing decode")
+        parse_landing(req).expect("the landing decode")
     }
 
     /// The stored paths one span's `attrs` carries, in the encoder's own
@@ -4358,11 +2912,11 @@ mod landing_tests {
         };
 
         let at_limit = request_of("checkout", vec![span_of(attrs(limit))]);
-        let parsed = parse_landing(&at_limit, TS as i64).expect("a span at the limit is admitted");
+        let parsed = parse_landing(&at_limit).expect("a span at the limit is admitted");
         assert_eq!(parsed.spans[0].attrs.len(), limit);
 
         let over = request_of("checkout", vec![span_of(attrs(limit + 1))]);
-        let err = parse_landing(&over, TS as i64).expect_err("one path over is refused");
+        let err = parse_landing(&over).expect_err("one path over is refused");
         match err {
             LogsIngestError::OversizeMessage {
                 field,
@@ -4871,5 +3425,29 @@ mod landing_tests {
             parsed.resources[0].resource_id, parsed.resources[1].resource_id,
             "one resource, two days"
         );
+    }
+
+    /// **The per-block charge an adapter pays is the landing decode's own**
+    /// (issue #602): a block whose landing charge sits below
+    /// [`MAX_EXPANDED_BYTES`] passes both, and one above it fails both. One
+    /// span carrying one array attribute (charged at
+    /// [`MAX_JSON_ESCAPE_FACTOR`]× its wire bytes) at three quarters of the
+    /// budget, then at five quarters of it.
+    #[test]
+    fn the_per_block_charge_gives_the_landing_decodes_verdict() {
+        for (fraction_of_budget, admitted) in [(3usize, true), (5, false)] {
+            let len = MAX_EXPANDED_BYTES / MAX_JSON_ESCAPE_FACTOR * fraction_of_budget / 4 + 1024;
+            let attr = kv("big", array_value(vec![str_value(&"x".repeat(len))]));
+            let req = request_of("checkout", vec![span_of(vec![attr])]);
+            let mut adapter_total = 0usize;
+            let adapter =
+                charge_resource_spans_expansion(&mut adapter_total, &req.resource_spans[0]);
+            let decode = parse_landing(&req);
+            assert_eq!(
+                (adapter.is_ok(), decode.is_ok()),
+                (admitted, admitted),
+                "{fraction_of_budget}/4 of the budget: the adapter charged {adapter_total}"
+            );
+        }
     }
 }

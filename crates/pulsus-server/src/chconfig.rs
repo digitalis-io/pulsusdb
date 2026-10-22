@@ -253,23 +253,10 @@ pub(crate) fn metric_writer_tables_from(config: &Config) -> MetricWriterTables {
     }
 }
 
-/// Maps `Config` to [`pulsus_write::TraceWriterTables`] (issue #54),
-/// deriving `_dist` names the *same way* [`writer_tables_from`]/
-/// [`metric_writer_tables_from`] do — a configured `cluster` writes both
-/// per-shard trace tables through their `_dist` wrappers (`Family::Traces`,
-/// `cityHash64(trace_id)` sharding, docs/schemas.md §7), an unclustered
-/// deployment writes the base tables directly. `trace_tag_catalog` is
-/// deliberately absent: it is MV-populated (issue #53), never
-/// writer-written, so there is no table name for the writer to resolve.
-pub(crate) fn trace_writer_tables_from(config: &Config) -> TraceWriterTables {
-    let dist = if config.cluster.is_some() {
-        config.dist_suffix.as_str()
-    } else {
-        ""
-    };
+/// Maps `Config` to [`pulsus_write::TraceWriterTables`]: the landing table,
+/// the one table a trace push is inserted into.
+pub(crate) fn trace_writer_tables_from(_config: &Config) -> TraceWriterTables {
     TraceWriterTables {
-        spans: Arc::from(format!("trace_spans{dist}")),
-        attrs: Arc::from(format!("trace_attrs_idx{dist}")),
         // Bare in every mode (issue #586), the way `metric_landing` and
         // `log_landing` are: the landing table has no `Distributed` wrapper,
         // because one push sent through one would stop being one block.
@@ -722,23 +709,18 @@ mod tests {
         assert_eq!(&*tables.landing, "metric_landing");
     }
 
+    /// The trace writer's one target is the landing table, written by bare
+    /// name in both deployments, like the metric writer's above.
     #[test]
-    fn trace_writer_tables_from_uses_base_table_names_when_unclustered() {
-        let config = Config::default();
-        let tables = trace_writer_tables_from(&config);
-        assert_eq!(&*tables.spans, "trace_spans");
-        assert_eq!(&*tables.attrs, "trace_attrs_idx");
-    }
-
-    #[test]
-    fn trace_writer_tables_from_uses_dist_table_names_when_clustered() {
-        let config = Config {
-            cluster: Some("prod".to_string()),
-            ..Config::default()
-        };
-        let tables = trace_writer_tables_from(&config);
-        assert_eq!(&*tables.spans, "trace_spans_dist");
-        assert_eq!(&*tables.attrs, "trace_attrs_idx_dist");
+    fn trace_writer_tables_from_ignores_the_cluster_for_the_landing_table() {
+        for cluster in [None, Some("prod".to_string())] {
+            let config = Config {
+                cluster,
+                ..Config::default()
+            };
+            let tables = trace_writer_tables_from(&config);
+            assert_eq!(&*tables.landing, "trace_landing");
+        }
     }
 
     #[test]

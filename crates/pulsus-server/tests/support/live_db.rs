@@ -382,14 +382,11 @@ pub fn register_push_target(port: u16, db: &str) {
 /// every table its landing block feeds holds the push (issue #624, part
 /// 3d).
 ///
-/// **Why.** A trace push is acknowledged once the old path's tables hold
-/// it; the landing block, which feeds `spans`, `traces`, `resources`,
-/// `tag_names`, `tag_values` and the other derived tables through their
-/// views, carries no waiter (`crates/pulsus-write/src/writer/trace.rs`).
-/// A route that reads those tables right after the acknowledgement may
-/// not see the push yet. Writes not being readable the instant they are
-/// acknowledged is a known, deferred property; a test does not assume
-/// otherwise.
+/// **Why.** A sync trace push is acknowledged once its landing insert,
+/// and the view inserts it drives, have committed (issue #602). A route
+/// may still read through a replica the push has not reached yet. Writes
+/// not being readable the instant they are acknowledged is a known,
+/// deferred property; a test does not assume otherwise.
 ///
 /// **What it waits for.** Both, in one poll:
 ///

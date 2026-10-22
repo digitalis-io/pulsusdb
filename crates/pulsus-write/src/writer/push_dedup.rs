@@ -83,8 +83,9 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::ingest::PushHeaders;
 use crate::ingest::metrics::ParsedMetrics;
-use crate::ingest::traces::ParsedTraces;
+use crate::ingest::traces::ParsedTraceLanding;
 use crate::protocols::otlp_logs::ParsedLogs;
+use pulsus_clickhouse::json_column::{TraceJson, TraceJsonScalar, TraceJsonValue};
 
 // ---------------------------------------------------------------------
 // Identity
@@ -189,6 +190,66 @@ impl DigestBuilder {
             self.str(k).str(v);
         }
         self
+    }
+
+    /// One `JSON` column's value, **structurally**: the entry count, then
+    /// each entry's path, a variant tag and the value — every float by its
+    /// bits, so two NaN payloads, and `-0.0` against `0.0`, are two
+    /// contents (issue #602).
+    fn json(&mut self, j: &TraceJson) -> &mut Self {
+        self.u64(j.entries().len() as u64);
+        for e in j.entries() {
+            self.str(&e.path);
+            match &e.value {
+                TraceJsonValue::Scalar(v) => {
+                    self.u8(0).scalar(v);
+                }
+                TraceJsonValue::StrArray(v) => {
+                    self.u8(1).u64(v.len() as u64);
+                    for x in v {
+                        self.str(x);
+                    }
+                }
+                TraceJsonValue::IntArray(v) => {
+                    self.u8(2).u64(v.len() as u64);
+                    for x in v {
+                        self.i64(*x);
+                    }
+                }
+                TraceJsonValue::DoubleArray(v) => {
+                    self.u8(3).u64(v.len() as u64);
+                    for x in v {
+                        self.u64(x.to_bits());
+                    }
+                }
+                TraceJsonValue::BoolArray(v) => {
+                    self.u8(4).u64(v.len() as u64);
+                    for x in v {
+                        self.u8(u8::from(*x));
+                    }
+                }
+                TraceJsonValue::MixedArray(v) => {
+                    self.u8(5).u64(v.len() as u64);
+                    for x in v {
+                        self.scalar(x);
+                    }
+                }
+                TraceJsonValue::EmptyArray => {
+                    self.u8(6);
+                }
+            }
+        }
+        self
+    }
+
+    /// One scalar: a variant tag, then the value, a double by its bits.
+    fn scalar(&mut self, v: &TraceJsonScalar) -> &mut Self {
+        match v {
+            TraceJsonScalar::Str(s) => self.u8(0).str(s),
+            TraceJsonScalar::Bool(b) => self.u8(1).u8(u8::from(*b)),
+            TraceJsonScalar::Int(i) => self.u8(2).i64(*i),
+            TraceJsonScalar::Double(d) => self.u8(3).u64(d.to_bits()),
+        }
     }
 
     fn opt_str(&mut self, s: Option<&str>) -> &mut Self {
@@ -332,89 +393,81 @@ pub fn metric_identity(
     identity_from(metric_content_digest(batch), headers, Some(tenant))
 }
 
-/// The content digest of a parsed trace push (issue #586).
-///
-/// Taken over the OLD path's [`ParsedTraces`] rather than over the landing
-/// decode, because that shape carries every span's own
-/// single-`ResourceSpans` protobuf `payload` — the resource, the scope and
-/// the span, as they arrived — so one walk covers everything the request
-/// sent.
-///
-/// **Three of that shape's values are the receiver's and are left out:**
-/// `SpanRecord::timestamp_ns`, and `AttrRecord::timestamp_ns` and
-/// `AttrRecord::date` on every row a span produces. A span whose
-/// `start_time_unix_nano` is `0` ("unknown or missing" on the wire) takes
-/// the request's own receive clock instead (`otlp_traces::parse`), the
-/// attribute rows carry that instant, and the attribute day is derived from
-/// it — so hashing any of the three would give the same bytes two
-/// identities, and a retry would be stored a second time with no key and
-/// refused as changed content under one. Each span's wire start time is in
-/// the digest where the request put it: inside `payload`, which is that
-/// span re-encoded verbatim.
-///
-/// **The rule, so a field added here is judged by it:** a value the decode
-/// generates is not content, and every field this walk reads is a function
-/// of the request's own bytes.
-fn trace_content_digest(batch: &ParsedTraces) -> PushDigest {
+/// The content digest of a parsed trace push (issues #586 and #602), over
+/// every field of the landing decode in declaration order: each span with
+/// its events and links (each count-prefixed), then each resource row, then
+/// the rejection count and message. The decode takes no receiver value — a
+/// zero start is stored as `0` — so the same request always digests the
+/// same, whichever of its encodings arrived.
+fn trace_content_digest(landing: &ParsedTraceLanding) -> PushDigest {
     let mut d = DigestBuilder::new();
     d.str("traces");
-    d.u64(batch.spans.len() as u64);
-    for span in &batch.spans {
+    d.u64(landing.spans.len() as u64);
+    for span in &landing.spans {
         d.bytes(&span.trace_id)
             .bytes(&span.span_id)
-            .bytes(&span.parent_id)
-            .str(&span.name)
-            .str(&span.service)
+            .bytes(&span.parent_span_id)
+            .i64(span.start_ns)
             .i64(span.duration_ns)
-            .u8(span.status_code as u8)
+            .fingerprint(span.resource_id)
+            .str(&span.name)
+            .i64(i64::from(span.kind))
+            .i64(i64::from(span.status_code))
             .str(&span.status_message)
-            .u8(span.kind as u8)
-            .u8(span.shared)
+            .str(&span.trace_state)
+            .u64(u64::from(span.flags))
             .str(&span.scope_name)
             .str(&span.scope_version)
-            .bytes(&span.payload);
-        d.u64(span.attr_key.len() as u64);
-        for key in &span.attr_key {
-            d.str(key);
+            .json(&span.scope_attrs)
+            .str(&span.scope_schema_url)
+            .u64(u64::from(span.scope_dropped_attrs))
+            .bytes(&span.scope_attrs_other)
+            .u64(span.end_ns);
+        d.u64(span.events.len() as u64);
+        for e in &span.events {
+            d.u64(e.time_ns)
+                .str(&e.name)
+                .json(&e.attrs)
+                .bytes(&e.attrs_other)
+                .u64(u64::from(e.dropped_attrs));
         }
-        for scope in &span.attr_scope {
-            d.str(scope);
+        d.u64(u64::from(span.dropped_events));
+        d.u64(span.links.len() as u64);
+        for l in &span.links {
+            d.bytes(&l.trace_id)
+                .bytes(&l.span_id)
+                .str(&l.trace_state)
+                .u64(u64::from(l.flags))
+                .json(&l.attrs)
+                .bytes(&l.attrs_other)
+                .u64(u64::from(l.dropped_attrs));
         }
-        for val in &span.attr_val {
-            d.str(val);
-        }
-        for ty in &span.attr_type {
-            d.str(ty.as_str());
-        }
-        for num in &span.attr_num {
-            match num {
-                Some(n) => d.u8(1).f64(*n),
-                None => d.u8(0),
-            };
-        }
+        d.u64(u64::from(span.dropped_links))
+            .str(&span.service)
+            .str(span.service_type)
+            .json(&span.attrs)
+            .bytes(&span.attrs_other)
+            .u64(u64::from(span.dropped_attrs));
     }
-    d.u64(batch.attrs.len() as u64);
-    for attr in &batch.attrs {
-        d.str(&attr.key)
-            .str(&attr.scope)
-            .str(&attr.val)
-            .str(attr.val_type.as_str())
-            .bytes(&attr.trace_id)
-            .bytes(&attr.span_id)
-            .i64(attr.duration_ns);
-        match attr.val_num {
-            Some(n) => d.u8(1).f64(n),
-            None => d.u8(0),
-        };
+    d.u64(landing.resources.len() as u64);
+    for r in &landing.resources {
+        d.fingerprint(r.resource_id)
+            .u64(u64::from(r.day))
+            .str(&r.service)
+            .json(&r.attrs)
+            .bytes(&r.attrs_other)
+            .u64(u64::from(r.dropped_attrs))
+            .str(&r.schema_url)
+            .bytes(&r.entity_refs);
     }
-    d.u64(batch.rejected);
-    d.opt_str(batch.rejected_message.as_deref());
+    d.u64(landing.rejected);
+    d.opt_str(landing.rejected_message.as_deref());
     d.finish()
 }
 
 /// Resolves a trace push's identity — see [`log_identity`].
-pub fn trace_identity(batch: &ParsedTraces, headers: &PushHeaders) -> PushIdentity {
-    identity_from(trace_content_digest(batch), headers, None)
+pub fn trace_identity(landing: &ParsedTraceLanding, headers: &PushHeaders) -> PushIdentity {
+    identity_from(trace_content_digest(landing), headers, None)
 }
 
 /// `tenant` is `None` for the traces identity, which is unchanged; a
@@ -878,8 +931,8 @@ pub struct DedupMetricsSnapshot {
 /// `std::sync::Mutex`, never an async one: [`WaitGuard`]'s `Drop` is
 /// synchronous and must take this lock, and blocking an async mutex from a
 /// destructor panics. It is also the shipped convention in this module —
-/// the stream cache (`writer/mod.rs:92,201`) and every table buffer
-/// (`writer/buffer.rs:10`) use `std::sync::Mutex` already.
+/// the stream cache and the landing paths' token generators use
+/// `std::sync::Mutex` already.
 #[derive(Debug)]
 pub(crate) struct Core {
     /// Reserved once at construction; never grows, never rehashes.
@@ -1402,7 +1455,8 @@ impl Core {
         if let Some(waiters) = self.waiters.remove(key) {
             for (_, tx) in waiters {
                 // The receiver observing a dropped sender is how an absent
-                // claim reaches the caller, which then admits.
+                // claim reaches a waiting caller: `Suppressed::into_answer`
+                // reads it as `Failed` (`mod.rs:147`).
                 drop(tx);
             }
         }
@@ -1518,6 +1572,10 @@ impl Drop for ClaimGuard {
 pub(crate) struct ClaimTicket {
     dedup: Option<Arc<PushDedup>>,
     counts_for_ack: bool,
+    /// Every target of this ticket's rows collapses a replay at read, so an
+    /// ending whose fate is unknown releases the claim rather than confirming
+    /// it (issue #602). See [`ClaimTicket::replay_safe`].
+    replay_safe: bool,
     claims: Vec<PushDigest>,
 }
 
@@ -1526,8 +1584,30 @@ impl ClaimTicket {
         ClaimTicket {
             dedup,
             counts_for_ack,
+            replay_safe: false,
             claims: Vec::new(),
         }
+    }
+
+    /// Marks the ticket's rows **replay-safe**: an uncertain ending is
+    /// reported as not committed, so the claim is released and the client's
+    /// retry is stored rather than answered the failure again.
+    ///
+    /// Only for a block every target of which collapses a repeat at read.
+    /// The trace landing block is one: `spans`, `resources`, `tag_names`,
+    /// `tag_values`, `error_spans` and `service_bucket_resources` are
+    /// `ReplacingMergeTree` tables keyed on the row's own identity, and
+    /// `traces` and `tag_bucket_values` aggregate with `min`, `max` and
+    /// `groupUniqArray` (`schema/schema.sql`). An uncertain trace
+    /// insert may have committed some targets and not others (a view that
+    /// throws leaves its own target empty while the source and its siblings
+    /// may have committed — `docs/ingest-one-source-table.md` §9 D1), so
+    /// confirming the claim would suppress the only push that can fill the
+    /// empty target. The log and metric blocks are not replay-safe: a
+    /// repeated sample doubles `count_over_time`.
+    pub(crate) fn replay_safe(mut self) -> Self {
+        self.replay_safe = true;
+        self
     }
 
     /// An inert ticket, for a buffer with no suppression index behind it.
@@ -1550,6 +1630,10 @@ impl ClaimTicket {
         let Some(dedup) = self.dedup.as_ref() else {
             self.claims.clear();
             return;
+        };
+        let outcome = match outcome {
+            TargetOutcome::Uncertain if self.replay_safe => TargetOutcome::NotCommitted,
+            other => other,
         };
         for key in std::mem::take(&mut self.claims) {
             dedup.settle_target(key, outcome, self.counts_for_ack);
@@ -1599,6 +1683,380 @@ impl Drop for WaitGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The trace digest reads every float by its bits** (issue #602): two
+    /// NaN payloads, as a scalar, in a typed array and in a mixed array, and
+    /// `-0.0` against `0.0`, are two contents. A text rendering spells every
+    /// NaN the same, so a changed payload would be suppressed as a repeat.
+    #[test]
+    fn the_trace_digest_reads_every_float_by_its_bits() {
+        use pulsus_clickhouse::json_column::{TraceJsonEntry, TraceJsonScalar, TraceJsonValue};
+        let nan_a = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan_b = f64::from_bits(0x7ff8_0000_0000_0002);
+        assert!(nan_a.is_nan() && nan_b.is_nan());
+        let digest_of = |value: TraceJsonValue| {
+            let mut landing = ParsedTraceLanding::default();
+            landing
+                .resources
+                .push(crate::ingest::traces::LandingResource {
+                    resource_id: Fingerprint::from_raw(1),
+                    day: 1,
+                    service: String::new(),
+                    attrs: TraceJson::from_entries(vec![TraceJsonEntry {
+                        path: "k".to_string(),
+                        value,
+                    }]),
+                    attrs_other: Vec::new(),
+                    dropped_attrs: 0,
+                    schema_url: String::new(),
+                    entity_refs: Vec::new(),
+                });
+            trace_content_digest(&landing)
+        };
+        let d = TraceJsonScalar::Double;
+        for (case, a, b) in [
+            (
+                "scalar NaN",
+                TraceJsonValue::Scalar(d(nan_a)),
+                TraceJsonValue::Scalar(d(nan_b)),
+            ),
+            (
+                "typed-array NaN",
+                TraceJsonValue::DoubleArray(vec![nan_a]),
+                TraceJsonValue::DoubleArray(vec![nan_b]),
+            ),
+            (
+                "mixed-array NaN",
+                TraceJsonValue::MixedArray(vec![d(nan_a)]),
+                TraceJsonValue::MixedArray(vec![d(nan_b)]),
+            ),
+            (
+                "signed zero",
+                TraceJsonValue::Scalar(d(-0.0)),
+                TraceJsonValue::Scalar(d(0.0)),
+            ),
+        ] {
+            assert_ne!(digest_of(a), digest_of(b), "{case}");
+        }
+    }
+
+    /// **Every field of the landing decode moves the trace digest** (issue
+    /// #602). A field the digest leaves out makes two different pushes one
+    /// identity, and the second is suppressed and stored nowhere. Each
+    /// struct is destructured with no `..`, so a field added to it fails to
+    /// compile here until it has an edit of its own.
+    #[test]
+    fn every_landing_field_moves_the_trace_digest() {
+        use crate::ingest::traces::{LandingEvent, LandingLink, LandingResource, LandingSpan};
+        use pulsus_clickhouse::json_column::{
+            TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue,
+        };
+        let json = |v: &str| {
+            TraceJson::from_entries(vec![TraceJsonEntry {
+                path: "k".to_string(),
+                value: TraceJsonValue::Scalar(TraceJsonScalar::Str(v.to_string())),
+            }])
+        };
+        let base = ParsedTraceLanding {
+            spans: vec![LandingSpan {
+                trace_id: [1; 16],
+                span_id: [2; 8],
+                parent_span_id: [3; 8],
+                start_ns: 4,
+                duration_ns: 5,
+                resource_id: Fingerprint::from_raw(6),
+                name: "n".into(),
+                kind: 7,
+                status_code: 8,
+                status_message: "m".into(),
+                trace_state: "t".into(),
+                flags: 9,
+                scope_name: "sn".into(),
+                scope_version: "sv".into(),
+                scope_attrs: json("sa"),
+                scope_schema_url: "su".into(),
+                scope_dropped_attrs: 10,
+                scope_attrs_other: vec![11],
+                end_ns: 12,
+                events: vec![LandingEvent {
+                    time_ns: 13,
+                    name: "e".into(),
+                    attrs: json("ea"),
+                    attrs_other: vec![14],
+                    dropped_attrs: 15,
+                }],
+                dropped_events: 16,
+                links: vec![LandingLink {
+                    trace_id: vec![17],
+                    span_id: vec![18],
+                    trace_state: "lt".into(),
+                    flags: 19,
+                    attrs: json("la"),
+                    attrs_other: vec![20],
+                    dropped_attrs: 21,
+                }],
+                dropped_links: 22,
+                service: "s".into(),
+                service_type: "string",
+                attrs: json("a"),
+                attrs_other: vec![23],
+                dropped_attrs: 24,
+            }],
+            resources: vec![LandingResource {
+                resource_id: Fingerprint::from_raw(6),
+                day: 25,
+                service: "s".into(),
+                attrs: json("ra"),
+                attrs_other: vec![26],
+                dropped_attrs: 27,
+                schema_url: "ru".into(),
+                entity_refs: vec![28],
+            }],
+            tag_names: Vec::new(),
+            tag_values: Vec::new(),
+            rejected: 29,
+            rejected_message: Some("r".into()),
+        };
+        type Edit = Box<dyn Fn(&mut ParsedTraceLanding)>;
+        let edits: Vec<(&str, Edit)> = {
+            let LandingSpan {
+                trace_id: _,
+                span_id: _,
+                parent_span_id: _,
+                start_ns: _,
+                duration_ns: _,
+                resource_id: _,
+                name: _,
+                kind: _,
+                status_code: _,
+                status_message: _,
+                trace_state: _,
+                flags: _,
+                scope_name: _,
+                scope_version: _,
+                scope_attrs: _,
+                scope_schema_url: _,
+                scope_dropped_attrs: _,
+                scope_attrs_other: _,
+                end_ns: _,
+                events: _,
+                dropped_events: _,
+                links: _,
+                dropped_links: _,
+                service: _,
+                service_type: _,
+                attrs: _,
+                attrs_other: _,
+                dropped_attrs: _,
+            } = &base.spans[0];
+            let LandingEvent {
+                time_ns: _,
+                name: _,
+                attrs: _,
+                attrs_other: _,
+                dropped_attrs: _,
+            } = &base.spans[0].events[0];
+            let LandingLink {
+                trace_id: _,
+                span_id: _,
+                trace_state: _,
+                flags: _,
+                attrs: _,
+                attrs_other: _,
+                dropped_attrs: _,
+            } = &base.spans[0].links[0];
+            let LandingResource {
+                resource_id: _,
+                day: _,
+                service: _,
+                attrs: _,
+                attrs_other: _,
+                dropped_attrs: _,
+                schema_url: _,
+                entity_refs: _,
+            } = &base.resources[0];
+            let ParsedTraceLanding {
+                spans: _,
+                resources: _,
+                tag_names: _,
+                tag_values: _,
+                rejected: _,
+                rejected_message: _,
+            } = &base;
+            vec![
+                ("span.trace_id", Box::new(|l| l.spans[0].trace_id[0] ^= 1)),
+                ("span.span_id", Box::new(|l| l.spans[0].span_id[0] ^= 1)),
+                (
+                    "span.parent_span_id",
+                    Box::new(|l| l.spans[0].parent_span_id[0] ^= 1),
+                ),
+                ("span.start_ns", Box::new(|l| l.spans[0].start_ns += 1)),
+                (
+                    "span.duration_ns",
+                    Box::new(|l| l.spans[0].duration_ns += 1),
+                ),
+                (
+                    "span.resource_id",
+                    Box::new(|l| l.spans[0].resource_id = Fingerprint::from_raw(99)),
+                ),
+                ("span.name", Box::new(|l| l.spans[0].name.push('x'))),
+                ("span.kind", Box::new(|l| l.spans[0].kind += 1)),
+                (
+                    "span.status_code",
+                    Box::new(|l| l.spans[0].status_code += 1),
+                ),
+                (
+                    "span.status_message",
+                    Box::new(|l| l.spans[0].status_message.push('x')),
+                ),
+                (
+                    "span.trace_state",
+                    Box::new(|l| l.spans[0].trace_state.push('x')),
+                ),
+                ("span.flags", Box::new(|l| l.spans[0].flags += 1)),
+                (
+                    "span.scope_name",
+                    Box::new(|l| l.spans[0].scope_name.push('x')),
+                ),
+                (
+                    "span.scope_version",
+                    Box::new(|l| l.spans[0].scope_version.push('x')),
+                ),
+                (
+                    "span.scope_attrs",
+                    Box::new(move |l| l.spans[0].scope_attrs = json("other")),
+                ),
+                (
+                    "span.scope_schema_url",
+                    Box::new(|l| l.spans[0].scope_schema_url.push('x')),
+                ),
+                (
+                    "span.scope_dropped_attrs",
+                    Box::new(|l| l.spans[0].scope_dropped_attrs += 1),
+                ),
+                (
+                    "span.scope_attrs_other",
+                    Box::new(|l| l.spans[0].scope_attrs_other.push(0)),
+                ),
+                ("span.end_ns", Box::new(|l| l.spans[0].end_ns += 1)),
+                (
+                    "event.time_ns",
+                    Box::new(|l| l.spans[0].events[0].time_ns += 1),
+                ),
+                (
+                    "event.name",
+                    Box::new(|l| l.spans[0].events[0].name.push('x')),
+                ),
+                (
+                    "event.attrs",
+                    Box::new(move |l| l.spans[0].events[0].attrs = json("other")),
+                ),
+                (
+                    "event.attrs_other",
+                    Box::new(|l| l.spans[0].events[0].attrs_other.push(0)),
+                ),
+                (
+                    "event.dropped_attrs",
+                    Box::new(|l| l.spans[0].events[0].dropped_attrs += 1),
+                ),
+                (
+                    "span.dropped_events",
+                    Box::new(|l| l.spans[0].dropped_events += 1),
+                ),
+                (
+                    "link.trace_id",
+                    Box::new(|l| l.spans[0].links[0].trace_id.push(0)),
+                ),
+                (
+                    "link.span_id",
+                    Box::new(|l| l.spans[0].links[0].span_id.push(0)),
+                ),
+                (
+                    "link.trace_state",
+                    Box::new(|l| l.spans[0].links[0].trace_state.push('x')),
+                ),
+                ("link.flags", Box::new(|l| l.spans[0].links[0].flags += 1)),
+                (
+                    "link.attrs",
+                    Box::new(move |l| l.spans[0].links[0].attrs = json("other")),
+                ),
+                (
+                    "link.attrs_other",
+                    Box::new(|l| l.spans[0].links[0].attrs_other.push(0)),
+                ),
+                (
+                    "link.dropped_attrs",
+                    Box::new(|l| l.spans[0].links[0].dropped_attrs += 1),
+                ),
+                (
+                    "span.dropped_links",
+                    Box::new(|l| l.spans[0].dropped_links += 1),
+                ),
+                ("span.service", Box::new(|l| l.spans[0].service.push('x'))),
+                (
+                    "span.service_type",
+                    Box::new(|l| l.spans[0].service_type = "int"),
+                ),
+                (
+                    "span.attrs",
+                    Box::new(move |l| l.spans[0].attrs = json("other")),
+                ),
+                (
+                    "span.attrs_other",
+                    Box::new(|l| l.spans[0].attrs_other.push(0)),
+                ),
+                (
+                    "span.dropped_attrs",
+                    Box::new(|l| l.spans[0].dropped_attrs += 1),
+                ),
+                (
+                    "resource.resource_id",
+                    Box::new(|l| l.resources[0].resource_id = Fingerprint::from_raw(99)),
+                ),
+                ("resource.day", Box::new(|l| l.resources[0].day += 1)),
+                (
+                    "resource.service",
+                    Box::new(|l| l.resources[0].service.push('x')),
+                ),
+                (
+                    "resource.attrs",
+                    Box::new(move |l| l.resources[0].attrs = json("other")),
+                ),
+                (
+                    "resource.attrs_other",
+                    Box::new(|l| l.resources[0].attrs_other.push(0)),
+                ),
+                (
+                    "resource.dropped_attrs",
+                    Box::new(|l| l.resources[0].dropped_attrs += 1),
+                ),
+                (
+                    "resource.schema_url",
+                    Box::new(|l| l.resources[0].schema_url.push('x')),
+                ),
+                (
+                    "resource.entity_refs",
+                    Box::new(|l| l.resources[0].entity_refs.push(0)),
+                ),
+                ("rejected", Box::new(|l| l.rejected += 1)),
+                ("rejected_message", Box::new(|l| l.rejected_message = None)),
+            ]
+        };
+        let digest = trace_content_digest(&base);
+        let mut unmoved = Vec::new();
+        for (field, edit) in &edits {
+            let mut changed = base.clone();
+            edit(&mut changed);
+            if trace_content_digest(&changed) == digest {
+                unmoved.push(*field);
+            }
+        }
+        assert!(
+            unmoved.is_empty(),
+            "fields the trace digest does not read: {unmoved:?}"
+        );
+        assert_eq!(edits.len(), 48, "one edit per digested field");
+    }
 
     fn index() -> Arc<PushDedup> {
         PushDedup::new(
@@ -1810,6 +2268,77 @@ mod tests {
             matches!(admit(&d, identity(404)), Admission::Admit(_)),
             "and the push that finds nothing is stored"
         );
+    }
+
+    /// **A repeat that arrives while the claim is pending is not admitted,
+    /// and is answered the outcome the claim settles to** (issue #602, the
+    /// retry contract's pending rows). Three originals: one acknowledged
+    /// target settling not-committed (`Released`, `Failed`); the same with a
+    /// replay-safe ticket settling `Uncertain`, the trace writer's case
+    /// (`Released`, `Failed`); and a push with no rows, sealing with zero
+    /// targets (`Released`, `Ok`). In each, a sync repeat waiting on the
+    /// pending claim receives that outcome, an async repeat is answered at
+    /// once, and a repeat after the claim is released is admitted.
+    #[tokio::test]
+    async fn a_repeat_waiting_on_a_pending_claim_is_answered_the_outcome_it_settles_to() {
+        for (case, targets, replay_safe, outcome, told) in [
+            (
+                "not committed",
+                1,
+                false,
+                Some(TargetOutcome::NotCommitted),
+                ClaimOutcome::Failed,
+            ),
+            (
+                "replay-safe uncertain",
+                1,
+                true,
+                Some(TargetOutcome::Uncertain),
+                ClaimOutcome::Failed,
+            ),
+            ("zero targets", 0, false, None, ClaimOutcome::Ok),
+        ] {
+            let d = index();
+            let id = identity(31);
+            let Admission::Admit(mut guard) = admit(&d, id) else {
+                panic!("{case}: the original must admit");
+            };
+            for _ in 0..targets {
+                guard.note_target(true);
+            }
+            let mut ticket = ClaimTicket::new(Some(Arc::clone(&d)), true);
+            if replay_safe {
+                ticket = ticket.replay_safe();
+            }
+            if targets > 0 {
+                ticket.push(id.key);
+            }
+
+            // The repeat arrives while the claim is pending.
+            let Admission::SuppressedPending { guard: wait, rx } = d.admit(id, WaitMode::Register)
+            else {
+                panic!("{case}: a sync repeat on a pending claim must wait");
+            };
+            assert!(
+                matches!(
+                    d.admit(id, WaitMode::None),
+                    Admission::SuppressedSettled(ClaimOutcome::Ok)
+                ),
+                "{case}: an async repeat on a pending claim is answered at once"
+            );
+
+            guard.seal();
+            match outcome {
+                Some(outcome) => ticket.settle(outcome),
+                None => drop(ticket),
+            }
+            assert_eq!(rx.await.unwrap(), told, "{case}: the waiter's answer");
+            drop(wait);
+            assert!(
+                matches!(admit(&d, id), Admission::Admit(_)),
+                "{case}: a repeat after the claim is released is admitted"
+            );
+        }
     }
 
     #[tokio::test]

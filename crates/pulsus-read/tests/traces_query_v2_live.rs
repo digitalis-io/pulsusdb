@@ -525,7 +525,7 @@ fn span_of(
 /// suppressed at the landing table: collapsing it is `final = 1`'s job and
 /// this suite exercises it rather than assuming it.
 async fn land(client: &ChClient, req: &ExportTraceServiceRequest, token: &str) {
-    let parsed = parse_trace_landing(req, now_ns()).expect("the landing decode");
+    let parsed = parse_trace_landing(req).expect("the landing decode");
     let received_ms = now_ns() / 1_000_000;
     let mut rows: Vec<TraceLandingRow> = Vec::with_capacity(parsed.total_rows() as usize);
     rows.extend(
@@ -5896,40 +5896,9 @@ fn client_config(db: &str) -> ChConnConfig {
     }
 }
 
-/// Lands each request in BOTH stores: the old tables through today's trace
-/// writer, and the new ones through `trace_landing`, as [`land`] does —
-/// the same request, so the two engines read the same pushes.
-async fn land_both(client: &ChClient, db: &str, reqs: &[ExportTraceServiceRequest], tag: &str) {
-    use pulsus_write::writer::{ChBlockInserter, TraceWriter, TraceWriterTables};
-    use pulsus_write::{ParsedTraceLanding, PushHeaders, TraceSink};
-    use std::sync::Arc;
-    let writer_client = Arc::new(
-        ChClient::new(client_config(db))
-            .await
-            .expect("connect the writer"),
-    );
-    let mut cfg = pulsus_config::WriterConfig::default();
-    cfg.batch_bytes.0 = 1;
-    let writer = TraceWriter::with_inserters_with_tables(
-        Arc::new(ChBlockInserter::new(writer_client.clone())),
-        Arc::new(ChBlockInserter::new(writer_client.clone())),
-        Arc::new(ChBlockInserter::new(writer_client.clone())),
-        &cfg,
-        TraceWriterTables::traces_default(),
-    );
+/// Lands each request through [`land`], one insert a request.
+async fn land_all(client: &ChClient, reqs: &[ExportTraceServiceRequest], tag: &str) {
     for (i, req) in reqs.iter().enumerate() {
-        let parsed = pulsus_write::parse_traces(req, now_ns()).expect("the old path parses");
-        let wait = writer
-            .admit_flush(
-                parsed,
-                ParsedTraceLanding::default(),
-                PushHeaders::default(),
-            )
-            .expect("the queue has room");
-        tokio::time::timeout(StdDuration::from_secs(30), wait)
-            .await
-            .expect("the old path's flush settles")
-            .expect("the old path commits");
         land(client, req, &format!("{tag}-{i}-{}", now_ns())).await;
     }
 }
@@ -6512,23 +6481,17 @@ const P_QUERIES: [&str; 37] = [
 /// The `(limit, spss)` pairs every comparison runs at.
 const LIMIT_SPSS: [(u32, u32); 3] = [(100, 100), (20, 3), (2, 1)];
 
-/// Seeds `bodies` in both stores of a fresh database, asserting the two
-/// span counts first.
-async fn seed_both(
+/// Seeds `bodies` in a fresh database, asserting the span count first.
+async fn seed(
     db: String,
     bodies: &[ExportTraceServiceRequest],
     spans: u64,
     tag: &str,
 ) -> (String, ChClient) {
     let client = fresh_db(&db).await;
-    land_both(&client, &db, bodies, tag).await;
-    let new = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
-    let old = count(&client, "SELECT count() AS n FROM trace_spans").await;
-    assert_eq!(
-        (new, old),
-        (spans, spans),
-        "{db}: spans in the new and the old store"
-    );
+    land_all(&client, bodies, tag).await;
+    let n = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(n, spans, "{db}: spans stored");
     (db, client)
 }
 
@@ -6635,28 +6598,28 @@ async fn search_statement_answers_as_recorded_on_fixture_c() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let window = (base_ns, base_ns + CATALOGUE_WINDOW_NS);
-    let (db_c, client_c) = seed_both(
+    let (db_c, client_c) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t591_both_c"),
         &fixture_catalogue_bodies(base_ns),
         34,
         "t591-c",
     )
     .await;
-    let (db_z, client_z) = seed_both(
+    let (db_z, client_z) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t591_both_rz"),
         &[fixture_rz_body(base_ns)],
         6,
         "t591-rz",
     )
     .await;
-    let (db_b, client_b) = seed_both(
+    let (db_b, client_b) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t591_both_b"),
         &fixture_b_bodies(base_ns),
         8,
         "t591-b",
     )
     .await;
-    let (db_p, client_p) = seed_both(
+    let (db_p, client_p) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t591_both_p"),
         &[fixture_p_body(base_ns)],
         3,
@@ -7413,7 +7376,7 @@ async fn search_statement_reads_one_root_across_pushes_and_merges() {
         ("svc-d", named(sp(0xdd, 0xd1, 0xd9, midnight - S), "d-one")),
         ("svc-a", named(sp(0xee, 0xe1, 0, midnight + S), "z-name")),
     ]);
-    land_both(&client, &db, &[push1, push2], "t591-r2").await;
+    land_all(&client, &[push1, push2], "t591-r2").await;
     let n = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
     assert_eq!(n, 7, "fixture R2 seeds seven spans");
     let window = (midnight - 60 * S, midnight + 60 * S);
@@ -7538,7 +7501,7 @@ async fn search_routed_answers_as_recorded_on_fixture_c() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let window = (base_ns, base_ns + CATALOGUE_WINDOW_NS);
-    let (db, _client) = seed_both(
+    let (db, _client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t591p3_fork_c"),
         &fixture_catalogue_bodies(base_ns),
         34,
@@ -7589,7 +7552,7 @@ async fn search_routed_answers_as_recorded_on_fixture_c() {
     // every case must equal today's answer and its literal answer.
     let mut fixture_cases = 0usize;
     for (label, bodies, spans, cases) in pipeline_fixtures(base_ns) {
-        let (db, _client) = seed_both(
+        let (db, _client) = seed(
             pulsus_testkit::test_db(&format!("pulsus_read_it_t592p1_{label}")),
             &bodies,
             spans,
@@ -8116,7 +8079,7 @@ async fn search_routed_answers_a_run_time_demand_itself() {
             schema_url: String::new(),
         }],
     };
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t591p3_demand"),
         &[body],
         3,
@@ -8458,7 +8421,7 @@ async fn seed_by_fixture(label: &str, test: &str, base_ns: i64) -> (String, ChCl
         .into_iter()
         .find(|(l, ..)| *l == label)
         .unwrap_or_else(|| panic!("no fixture {label}"));
-    seed_both(
+    seed(
         pulsus_testkit::test_db(&format!("pulsus_read_it_t592p2_{test}")),
         &bodies,
         spans,
@@ -8540,7 +8503,7 @@ async fn the_integer_and_the_double_do_not_merge() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let window = (base_ns, base_ns + CATALOGUE_WINDOW_NS);
-    let (db, _client) = seed_both(
+    let (db, _client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t592p2_intdouble"),
         &fixture_catalogue_bodies(base_ns),
         34,
@@ -8718,7 +8681,7 @@ async fn search_routed_keeps_the_group_cap() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let window = (base_ns, base_ns + CATALOGUE_WINDOW_NS);
-    let (db, _client) = seed_both(
+    let (db, _client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t592p2_cap"),
         &fixture_catalogue_bodies(base_ns),
         34,
@@ -8937,7 +8900,7 @@ async fn seed_agg_fixture(label: &str, test: &str, base_ns: i64) -> (String, ChC
         .into_iter()
         .find(|(l, ..)| *l == label)
         .unwrap_or_else(|| panic!("no fixture {label}"));
-    seed_both(
+    seed(
         pulsus_testkit::test_db(&format!("pulsus_read_it_t592p3_{test}")),
         &bodies,
         spans,
@@ -9326,7 +9289,7 @@ async fn a_value_the_reference_cannot_type_is_missing() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let bodies = off_scope_fixture(base_ns);
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t592p3_offscope"),
         &bodies,
         12,
@@ -9385,7 +9348,7 @@ async fn check_structural(
     base_ns: i64,
     cases: &[StructuralCase],
 ) {
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db(&format!("pulsus_read_it_t593p1_{label}")),
         bodies,
         spans,
@@ -9614,7 +9577,7 @@ async fn a_structural_operator_answers_as_today() {
 async fn a_refused_condition_under_a_relation_answers_as_today() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
-    let (db, _client) = seed_both(
+    let (db, _client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t593p1_demand"),
         &rule_bodies(base_ns),
         22,
@@ -9659,7 +9622,7 @@ async fn check_climbing(
     base_ns: i64,
     cases: &[StructuralCase],
 ) {
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db(&format!("pulsus_read_it_t593p2_{label}")),
         bodies,
         spans,
@@ -10000,7 +9963,7 @@ async fn t_a10_t_a11_a_climb_past_the_bound_answers_422() {
     ];
     let mut wrong = Vec::new();
     for (label, bodies, spans, query, routed_literal) in cases {
-        let (db, _client) = seed_both(
+        let (db, _client) = seed(
             pulsus_testkit::test_db(&format!("pulsus_read_it_t593p2_chain_{label}")),
             &bodies,
             spans,
@@ -10043,7 +10006,7 @@ async fn a_configured_bound_counts_parent_links() {
         ("d1002", 1002, 1001, "d1 1 [ea]".to_string()),
         ("d1003", 1003, 1001, "Err(query too broad: a structural operator (>> or <<) found a chain of parent spans deeper than 1001 links)".to_string()),
     ] {
-        let (db, _client) = seed_both(
+        let (db, _client) = seed(
             pulsus_testkit::test_db(&format!("pulsus_read_it_t593p2_depth_{label}")),
             &long_chain_bodies(base_ns, n),
             u64::from(n),
@@ -10077,7 +10040,7 @@ async fn a_configured_bound_counts_parent_links() {
 async fn a_refused_condition_under_a_climb_answers_as_today() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
-    let (db, _client) = seed_both(
+    let (db, _client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t593p2_demand"),
         &rule_bodies(base_ns),
         22,
@@ -10168,7 +10131,7 @@ async fn a_broad_climb_is_one_statement() {
             Vec::new(),
         ));
     }
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t593p2_broad"),
         &[by_body("svc", spans)],
         140_000,
@@ -10297,7 +10260,7 @@ async fn check_levels_by(
     cases: &[LevelCase],
     render: Render,
 ) -> Vec<String> {
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db(&format!("pulsus_read_it_t594p1_{label}")),
         bodies,
         spans,
@@ -10636,7 +10599,7 @@ async fn a_resource_seen_on_two_days_answers_its_earlier_day() {
 async fn a_fetched_trace_keeps_a_resource_seen_on_two_days() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
-    let (db, _client) = seed_both(
+    let (db, _client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t594p1_rf"),
         &rd_bodies(base_ns),
         2,
@@ -11437,7 +11400,7 @@ async fn the_two_numberings_agree_on_well_formed_traces() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let (bodies, spans) = nw_bodies(base_ns);
-    let (db, _client) = seed_both(
+    let (db, _client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t594p2_nw"),
         &bodies,
         spans,
@@ -11499,7 +11462,7 @@ fn nsf_bodies(e: i64) -> Vec<ExportTraceServiceRequest> {
 async fn a_sliced_search_numbers_whole_traces() {
     skip_unless_live!();
     let e = end595();
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t594p2_nsf"),
         &nsf_bodies(e),
         27,
@@ -11572,7 +11535,7 @@ async fn a_sliced_search_numbers_a_trace_across_midnight() {
         by_body("svc", vec![lsp(e, 0xa4, 1, 0, "root", -1700 * S, S)]),
         by_body("svc", vec![lsp(e, 0xa4, 2, 1, "child", -100 * S, S)]),
     ];
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t594p2_mid"),
         &bodies,
         4,
@@ -11677,7 +11640,7 @@ async fn a_numbered_search_doubles_past_an_empty_slice() {
         by_body("svc", vec![lsp(e, 0xb5, 1, 0, "root", -450 * S, S)]),
         by_body("svc", vec![lsp(e, 0xb6, 1, 0, "root", -400 * S, S)]),
     ];
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t594p2_dbl"),
         &bodies,
         2,
@@ -12002,7 +11965,7 @@ const TV_CASES: &[LevelCase] = &[
 async fn a_trace_without_its_row_has_no_value() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t594p3_tvn"),
         &tl_bodies(base_ns),
         12,
@@ -12150,7 +12113,7 @@ const NK_CASES: &[LevelCase] = &[
 async fn a_sliced_search_reads_whole_trace_values() {
     skip_unless_live!();
     let e = end595();
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t594p3_tvs"),
         &tl_bodies(e - 120_000_000_000),
         12,
@@ -12248,7 +12211,7 @@ async fn a_count_or_number_without_its_row_is_zero() {
             "b2 5 [05, 02, 04, 01, 03] {int:1 2 [05, 04]; int:-1 2 [02, 01]; int:7 1 [03]}; c1 2 [02, 03] {int:1 1 [02]; int:2 1 [03]}; e5 2 [01, 02] {int:0 2 [01, 02]}; e2 5 [04, 01, 05, 02, 03] {int:-1 1 [04]; int:0 3 [01, 02, 03]; int:1 1 [05]}; e1 6 [01, 02, 03, 04, 05, 06] {int:-1 1 [01]; int:1 2 [02, 03]; int:2 1 [04]; int:0 2 [05, 06]}; a1 4 [01, 02, 03, 04] {int:0 4 [01, 02, 03, 04]}",
         ),
     ] {
-        let (db, client) = seed_both(
+        let (db, client) = seed(
             pulsus_testkit::test_db(&format!("pulsus_read_it_t594p3_{label}")),
             &bodies,
             spans,
@@ -12419,7 +12382,7 @@ async fn a_service_key_after_an_operand_or_a_trace_value() {
 async fn a_sliced_search_compares_whole_numbers() {
     skip_unless_live!();
     let e = end595();
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t594p4_nsf"),
         &nsf_bodies(e),
         27,
@@ -15956,7 +15919,7 @@ const KEYS_CASES: [(&str, &str, &str); 27] = [
 async fn every_key_and_aggregate_scope_is_the_statements() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t602p1_keys"),
         &keys_fixture(base_ns),
         6,
@@ -16167,7 +16130,7 @@ const UNTYPED_METRICS_CASES: [(&str, &str, f64); 3] = [
 async fn a_value_is_held_only_as_the_reference_types_it() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t602p1_untyped"),
         &untyped_fixture(base_ns),
         4,
@@ -16260,7 +16223,7 @@ async fn a_service_name_is_held_only_as_a_string_under_not() {
     skip_unless_live!();
     const S: i64 = 1_000_000_000;
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t602p1_svcnot"),
         &service_not_fixture(base_ns),
         4,
@@ -16401,7 +16364,7 @@ fn service_aggregate_fixture(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
 async fn a_service_name_aggregate_reads_only_a_string() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t602p1_svcagg"),
         &service_aggregate_fixture(base_ns),
         2,
@@ -16465,7 +16428,7 @@ async fn a_covered_grouping_is_capped_by_one_statement() {
             )
         })
         .collect();
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t602p1_cap"),
         &bodies,
         3,
@@ -16547,7 +16510,7 @@ async fn a_covered_grouping_is_capped_by_one_statement() {
 async fn an_unscoped_service_name_is_held_only_as_a_string() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
-    let (db, client) = seed_both(
+    let (db, client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t602p1_svcchain"),
         &service_aggregate_fixture(base_ns),
         2,
@@ -16811,7 +16774,7 @@ async fn every_pipeline_shape_is_one_statement_and_answers_as_written() {
     let end_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let window = (end_ns - 4 * 3_600_000_000_000, end_ns);
     let bodies = p2_bodies(end_ns);
-    let (db, _client) = seed_both(
+    let (db, _client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t602p2a_shapes"),
         &bodies,
         31,
@@ -17019,7 +16982,7 @@ async fn a_metrics_negation_is_served_and_a_non_boolean_is_400() {
             span(5, at(base_s + 400), Some(str_value("s"))),
         ],
     );
-    let (db, _client) = seed_both(
+    let (db, _client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t602p2a_metrics_not"),
         &[body],
         5,
@@ -17180,7 +17143,7 @@ async fn a_structural_search_reads_its_candidates_newest_slice_first() {
     skip_unless_live!();
     let end_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let window = (end_ns - 4 * 3_600_000_000_000, end_ns);
-    let (db, _client) = seed_both(
+    let (db, _client) = seed(
         pulsus_testkit::test_db("p2b_s"),
         &s_bodies(end_ns),
         25,
@@ -17328,7 +17291,7 @@ async fn a_demand_in_the_slice_is_the_requests_400() {
         .map(|i| one(0x80 + i, 10 + i64::from(i), bool_value(false)))
         .collect();
     bodies.push(one(0xe2, 100, str_value("s")));
-    let (db, _client) = seed_both(pulsus_testkit::test_db("p2b_demand"), &bodies, 41, "p2bd").await;
+    let (db, _client) = seed(pulsus_testkit::test_db("p2b_demand"), &bodies, 41, "p2bd").await;
     let engine = engine_of(&db).await;
     let mut wrong = Vec::new();
     for (q, limit, want) in [
@@ -17438,7 +17401,7 @@ async fn the_ledger_search_claims_hold_on_the_route() {
             ],
         ),
     ];
-    let (db, _client) = seed_both(
+    let (db, _client) = seed(
         pulsus_testkit::test_db("pulsus_read_it_t602p2c2a_ledger"),
         &bodies,
         9,

@@ -339,39 +339,9 @@ fn request_of(nonce: &[u8; 16], spans: &[SpanDef]) -> ExportTraceServiceRequest 
     }
 }
 
-/// Lands `req` through the product writer: the old tables through today's
-/// trace writer, the new ones through `trace_landing`, one insert.
-async fn pulsus_land(client: &ChClient, db: &str, req: &ExportTraceServiceRequest) {
-    use pulsus_write::writer::{ChBlockInserter, TraceWriter, TraceWriterTables};
-    use pulsus_write::{ParsedTraceLanding, PushHeaders, TraceSink};
-    use std::sync::Arc;
-    let writer_client = Arc::new(
-        ChClient::new(ch_config(db))
-            .await
-            .expect("connect the writer"),
-    );
-    let mut cfg = pulsus_config::WriterConfig::default();
-    cfg.batch_bytes.0 = 1;
-    let writer = TraceWriter::with_inserters_with_tables(
-        Arc::new(ChBlockInserter::new(writer_client.clone())),
-        Arc::new(ChBlockInserter::new(writer_client.clone())),
-        Arc::new(ChBlockInserter::new(writer_client.clone())),
-        &cfg,
-        TraceWriterTables::traces_default(),
-    );
-    let parsed = pulsus_write::parse_traces(req, now_ns()).expect("the old path parses");
-    let wait = writer
-        .admit_flush(
-            parsed,
-            ParsedTraceLanding::default(),
-            PushHeaders::default(),
-        )
-        .expect("the queue has room");
-    tokio::time::timeout(Duration::from_secs(30), wait)
-        .await
-        .expect("the old path's flush settles")
-        .expect("the old path commits");
-    let landing = parse_trace_landing(req, now_ns()).expect("the landing decode");
+/// Lands `req` into `trace_landing`, one insert.
+async fn pulsus_land(client: &ChClient, req: &ExportTraceServiceRequest) {
+    let landing = parse_trace_landing(req).expect("the landing decode");
     let received_ms = now_ns() / 1_000_000;
     let mut rows: Vec<TraceLandingRow> = Vec::new();
     rows.extend(
@@ -789,7 +759,7 @@ async fn compare_arity_differential() {
     init_db(&bootstrap, &db).await;
     let client = ChClient::new(ch_config(&db)).await.expect("connect db");
     for spans in [&spans_e, &spans_b, &spans_p] {
-        pulsus_land(&client, &db, &request_of(&nonce, spans)).await;
+        pulsus_land(&client, &request_of(&nonce, spans)).await;
     }
     let engine = TraceEngine::new(
         ChClient::new(ch_config(&db)).await.expect("connect engine"),
@@ -1078,11 +1048,6 @@ async fn compare_arity_differential() {
             "PulsusDB emitted __meta_error for {q:?}: {leaked:?}"
         );
     }
-
-    // Issue #559 criterion 11: the metrics filter reads the span row, so
-    // a fixture that seeds only `trace_attrs_idx` would compare our empty
-    // answers against the reference's real ones. Before the drop.
-    pulsus_testkit::assert_stores_agree(&db);
 
     exec(&bootstrap, &format!("DROP DATABASE IF EXISTS {db}")).await;
 

@@ -40,9 +40,9 @@ trap 'kill "$pid" 2>/dev/null || true' EXIT
 timeout 60 sh -c "until curl -sf http://localhost:$api/ready > /dev/null; do sleep 1; done"
 python3 "$here/push_otlp.py" "http://localhost:$api" "$work/cat" 1
 
-# A push is acknowledged once the old tables hold it; the landing insert that
-# feeds `spans` and its views is done when every span is there and no insert
-# into `trace_landing` is running. On a cluster the views write through the
+# A push is acknowledged once its insert into `trace_landing` has committed;
+# the run still waits until every span is in `spans` and no insert into
+# `trace_landing` is running. On a cluster the views write through the
 # `_dist` tables, flushed here on the node that took the push.
 landed="SELECT concat(toString((SELECT count() FROM (SELECT DISTINCT trace_id, span_id FROM $db.$spans))), ',',
     toString((SELECT count() FROM $procs WHERE query_kind = 'Insert'

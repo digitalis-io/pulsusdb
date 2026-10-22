@@ -909,8 +909,8 @@ pub(crate) enum TagPathError {
 /// Scope keywords accepted on the three names routes that name no
 /// catalog scope and therefore carry no tags (issue #475): answered
 /// `200` with an EMPTY scope list and NO catalog read. Disjoint from
-/// `pulsus_read::traces::tags_sql::{ATTR_SCOPES, RESERVED_INTRINSIC_SCOPES}`
-/// by construction and by unit test — a keyword here can never reach the
+/// `pulsus_read::traces::spans::tags::ATTR_SCOPES` by construction and by
+/// unit test — a keyword here can never reach the
 /// SQL `IN` list.
 pub(crate) const EMPTY_SCOPES: [&str; 1] = ["trace"];
 
@@ -2224,10 +2224,6 @@ mod tests {
     fn the_empty_scopes_are_disjoint_from_every_catalog_scope() {
         for scope in EMPTY_SCOPES {
             assert!(!ATTR_SCOPES.contains(&scope), "{scope} is a catalog scope");
-            assert!(
-                !pulsus_read::traces::spans::tags::RESERVED_INTRINSIC_SCOPES.contains(&scope),
-                "{scope} is a reserved scope"
-            );
             assert!(
                 !["intrinsic", "none", ""].contains(&scope),
                 "{scope} collides with a reserved keyword"

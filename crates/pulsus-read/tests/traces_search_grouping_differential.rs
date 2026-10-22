@@ -6,14 +6,13 @@
 //! and reads the response back live:
 //!
 //!   * **PulsusDB side** — the corpus bytes go through OUR OWN ingest
-//!     parser (`pulsus_write::protocols::otlp_traces::decode_json` +
-//!     `parse_traces`) into the real trace writer against a throwaway
-//!     ClickHouse database, and the answer comes from the search route's
-//!     own engine ([`TraceEngine::search_routed`]). A differential
-//!     whose two sides are written separately compares two authors, not
-//!     two systems — and here the STORED TYPE is the thing under test, so
-//!     hand-writing `trace_attrs_idx` rows would let the fixture choose
-//!     the answer.
+//!     parser (`pulsus_write::protocols::otlp_traces::decode_json` + the
+//!     landing decode) into `trace_landing` in a throwaway ClickHouse
+//!     database, and the answer comes from the search route's own engine
+//!     ([`TraceEngine::search_routed`]). A differential whose two sides
+//!     are written separately compares two authors, not two systems — and
+//!     here the STORED TYPE is the thing under test, so hand-writing span
+//!     rows would let the fixture choose the answer.
 //!   * **Reference side** — the same bytes are pushed to the pinned
 //!     reference's OTLP receiver and the spanSets are read back from its
 //!     live search route with the identical `q=`.
@@ -123,13 +122,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
-use pulsus_config::WriterConfig;
 use pulsus_read::{GroupValue, TraceEngine, TraceReadConfig, wire_arm};
 use pulsus_read::{SearchParams, StatementTables, plan_search_request};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
-use pulsus_write::writer::{ChBlockInserter, TraceWriter, TraceWriterTables};
-use pulsus_write::{ParsedTraceLanding, PushHeaders, TraceSink};
 
 // ---------------------------------------------------------------------------
 // ClickHouse setup
@@ -1343,15 +1339,6 @@ async fn traces_search_grouping_differential() {
     let db = pulsus_testkit::test_db("pulsus_grpdiff_it");
     init_db(&bootstrap, &db).await;
     let client = Arc::new(ChClient::new(ch_config(&db)).await.expect("connect db"));
-    let mut cfg = WriterConfig::default();
-    cfg.batch_bytes.0 = 1;
-    let writer = TraceWriter::with_inserters_with_tables(
-        Arc::new(ChBlockInserter::new(client.clone())),
-        Arc::new(ChBlockInserter::new(client.clone())),
-        Arc::new(ChBlockInserter::new(client.clone())),
-        &cfg,
-        TraceWriterTables::traces_default(),
-    );
 
     // Every corpus carries its own random trace id and its own
     // `resource.service.name`, so nothing this suite pushes can be picked
@@ -1365,26 +1352,15 @@ async fn traces_search_grouping_differential() {
         otlp_push(&otlp_base, &body, corpus.service);
         let req = pulsus_write::protocols::otlp_traces::decode_json(&body)
             .expect("our own ingest decodes the same body the reference got");
-        let parsed =
-            pulsus_write::parse_traces(&req, base).expect("our own ingest parses the same body");
+        let landing =
+            pulsus_write::parse_trace_landing(&req).expect("our own ingest decodes the same body");
         assert_eq!(
-            parsed.spans.len(),
+            landing.spans.len(),
             corpus.spans.len(),
             "corpus {} lost a span in our own ingest",
             corpus.service
         );
-        let wait = writer
-            .admit_flush(
-                parsed,
-                ParsedTraceLanding::default(),
-                PushHeaders::default(),
-            )
-            .expect("queue has room");
-        tokio::time::timeout(Duration::from_secs(20), wait)
-            .await
-            .expect("flush settles")
-            .expect("the corpus commits");
-        land_new_store(
+        land(
             &client,
             &req,
             base,
@@ -1769,16 +1745,14 @@ fn every_fixture_is_scoped_to_a_corpus_that_exists() {
 }
 
 /// Lands `req` in the span, per-trace and resource tables through
-/// `trace_landing`, as `traces_query_v2_live.rs`'s `land` does: the trace
-/// writer above writes only the previous engine's store, and the search
-/// route reads this one (issue #602 part 2c-1).
-async fn land_new_store(
+/// `trace_landing`, as `traces_query_v2_live.rs`'s `land` does.
+async fn land(
     client: &ChClient,
     req: &opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
     received_ns: i64,
     token: &str,
 ) {
-    let parsed = pulsus_write::parse_trace_landing(req, received_ns).expect("the landing decode");
+    let parsed = pulsus_write::parse_trace_landing(req).expect("the landing decode");
     let received_ms = received_ns / 1_000_000;
     let mut rows: Vec<pulsus_write::TraceLandingRow> =
         Vec::with_capacity(parsed.total_rows() as usize);

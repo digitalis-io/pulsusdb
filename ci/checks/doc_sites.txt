@@ -129,7 +129,10 @@ leave docs/traceql-schema-migration.md:2289-2289
 # Issue #623 part 1 adds #461 and #623: #461 is carried on the rewritten
 # hot-table sentence, and #623 is the change itself, cited where the
 # metrics layout and its sharding key are stated.
-rewrite docs/architecture.md:337-340 refs=#603,#134,#139,#9,#498,#167,#16,#25,#586,#584,#587,#478,#555,#461,#623
+# Issue #602 part 3b-1 drops #134, #139, #9 and #167 from this column: they
+# were on the registration-backfill bullet and its residuals, which are gone
+# with the backfill.
+rewrite docs/architecture.md:337-340 refs=#603,#498,#16,#25,#586,#584,#587,#478,#555,#461,#623
 rewrite docs/architecture.md:342-342
 rewrite docs/architecture.md:196-196
 leave docs/configuration.md:126-126
@@ -148,13 +151,25 @@ leave docs/configuration.md:126-126
 # `#587` here is the other half of the same move, and also new: the comment
 # records where the `JSON` column's codec went. Same decision as
 # `crates/pulsus-clickhouse/src/lib.rs` above.
-rewrite crates/pulsus-write/src/writer/mod.rs:36-40 refs=#603,#139,#9,#587
+# Issue #602 part 3b-1 rewrites this module doc again: the registration
+# backfill paragraph, which carried #139 and #9, is gone with the backfill,
+# and #602 is the change itself, cited where the doc says traces are now one
+# insert of one block too.
+rewrite crates/pulsus-write/src/writer/mod.rs:36-40 refs=#603,#587,#602
 rewrite crates/pulsus-write/src/writer/mod.rs:566-568
-leave crates/pulsus-write/src/writer/backfill.rs:23-28
+# Issue #602 part 3b-1 deletes `crates/pulsus-write/src/writer/backfill.rs`,
+# so its row is gone with the file, for the reason the `catalog.rs` rows
+# above give. It pinned the sentence that the append-only tables are
+# excluded from registration backfill; the backfill itself is gone, and with
+# it the exclusion. The same part rewrites `writer/trace.rs` as a writer
+# that inserts one block into `trace_landing`, so its two sentences on the
+# old span and attribute tables are replaced. `#586` and `#602` are on the
+# rewritten module doc: #586 is carried from the module it replaces, and
+# #602 is the change itself.
 leave crates/pulsus-write/src/protocols/otlp_logs.rs:111-113
 leave crates/pulsus-write/src/ingest/metrics.rs:94-97
-leave crates/pulsus-write/src/writer/trace.rs:5-5
-leave crates/pulsus-write/src/writer/trace.rs:159-159
+rewrite crates/pulsus-write/src/writer/trace.rs:5-5 refs=#586,#602
+rewrite crates/pulsus-write/src/writer/trace.rs:159-159
 leave crates/pulsus-server/tests/logs_api_live.rs:1404-1404
 leave crates/pulsus-server/tests/fingerprint_collision_live.rs:676-682
 leave crates/pulsus-server/tests/fingerprint_collision_live.rs:909-909

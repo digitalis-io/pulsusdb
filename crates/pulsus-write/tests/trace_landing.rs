@@ -1,19 +1,14 @@
-//! `TraceWriter`'s landing half: **one push is one insert of one block into
-//! `trace_landing`** (issue #586), the three per-push ceilings, the joint
-//! admission that decides for both write paths at once, the push-suppression
-//! index over three targets, and the two refusal containers the trace
-//! transports render. All against mock `BlockInserter`s — no real ClickHouse,
+//! `TraceWriter`: **one push is one insert of one block into
+//! `trace_landing`** (issues #586 and #602), the three per-push ceilings, the
+//! admission over the landing queue, the push-suppression index, the sync
+//! acknowledgement, and the two refusal containers the trace transports
+//! render. All against mock `BlockInserter`s — no ClickHouse server,
 //! except the one case whose whole observable is a `system` table and which
 //! gates itself on `PULSUS_TEST_CLICKHOUSE=1`.
 //!
 //! **Nothing here reads a target table.** The five derived trace tables are
 //! maintained by materialized view; what this file pins is the block the
-//! writer hands over, and what the old two-table path does beside it.
-//!
-//! **No case here compares the old store with the new one.** The old path
-//! keeps writing `trace_spans` and `trace_attrs_idx` until task 20, and no
-//! equivalence between the two is claimed, required or tested; where a case
-//! names `trace_spans` it is asserting that table's own expected value.
+//! writer hands over.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -35,17 +30,14 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use pulsus_clickhouse::{ChError, ChRow, MAX_JSON_PATHS_PER_VALUE, QuerySettings};
 use pulsus_config::{ByteSize, WriterConfig};
 use pulsus_write::writer::{
-    BlockInserter, TRACE_LANDING_DAY_LIMIT, TraceAttrRow, TraceLandingRow, TraceSpanRow,
-    TraceWriter, TraceWriterTables, WriterRuntime, landing_block_overhead_bytes,
+    BlockInserter, TRACE_LANDING_DAY_LIMIT, TraceLandingRow, TraceWriter, TraceWriterTables,
+    WriterRuntime, landing_block_overhead_bytes,
 };
 use pulsus_write::{
-    AdmitRefusal, ParsedTraceLanding, ParsedTraces, PushHeaders, TraceSink,
-    push_spans_too_many_days_message,
+    AdmitRefusal, ParsedTraceLanding, PushHeaders, TraceSink, push_spans_too_many_days_message,
 };
 
 const LANDING: &str = "trace_landing";
-const SPANS: &str = "trace_spans";
-const ATTRS: &str = "trace_attrs_idx";
 
 /// One nanosecond-resolution UTC day.
 const NS_PER_DAY: i64 = 86_400_000_000_000;
@@ -60,10 +52,11 @@ enum Act {
     Poison,
     /// Never returns, so the block it was handed stays charged.
     Hang,
+    /// A failure after the block was sent: its fate is unknown.
+    Uncertain,
 }
 
-/// A scriptable mock [`BlockInserter`], generic over the row type so one
-/// struct serves the landing table and both old-path tables. Records every
+/// A scriptable mock [`BlockInserter`] for the landing table. Records every
 /// call's table, **rows** and settings.
 ///
 /// The rows are kept as themselves rather than as `serde_json::Value`:
@@ -170,6 +163,7 @@ impl<R: ChRow + Clone> BlockInserter<R> for MockInserter<R> {
                 Act::Ok => Ok(()),
                 Act::Poison => Err(ChError::Decode("mock poison".to_string())),
                 Act::Hang => std::future::pending::<Result<(), ChError>>().await,
+                Act::Uncertain => Err(ChError::InsertUncertain("mock uncertain".to_string())),
             }
         })
     }
@@ -266,37 +260,17 @@ fn runtime_at(cfg: &WriterConfig, spool: &Path) -> WriterRuntime {
     runtime
 }
 
-/// A writer whose three inserters are the mocks given.
+/// A writer whose landing inserter is the mock given.
 fn writer_with(
     cfg: &WriterConfig,
     spool: &Path,
-    spans: Arc<dyn BlockInserter<TraceSpanRow>>,
-    attrs: Arc<dyn BlockInserter<TraceAttrRow>>,
     landing: Arc<dyn BlockInserter<TraceLandingRow>>,
 ) -> TraceWriter {
     TraceWriter::with_inserters_and_runtime(
-        spans,
-        attrs,
         landing,
         runtime_at(cfg, spool),
         TraceWriterTables::traces_default(),
     )
-}
-
-/// The common shape: a succeeding old path and the landing mock given.
-fn writer_ok_old(
-    cfg: &WriterConfig,
-    spool: &Path,
-    landing: Arc<MockInserter<TraceLandingRow>>,
-) -> (
-    TraceWriter,
-    Arc<MockInserter<TraceSpanRow>>,
-    Arc<MockInserter<TraceAttrRow>>,
-) {
-    let spans: Arc<MockInserter<TraceSpanRow>> = MockInserter::unrecorded(Act::Ok);
-    let attrs: Arc<MockInserter<TraceAttrRow>> = MockInserter::unrecorded(Act::Ok);
-    let writer = writer_with(cfg, spool, spans.clone(), attrs.clone(), landing);
-    (writer, spans, attrs)
 }
 
 /// Yields until `done` holds, so a case can let the insert workers make
@@ -363,22 +337,9 @@ fn request_of(service: &str, spans: Vec<Span>) -> ExportTraceServiceRequest {
     }
 }
 
-/// Both decodes of one request, exactly as a handler runs them: the old
-/// path's and the landing path's, independently, over the same bytes.
-fn decode_both(req: &ExportTraceServiceRequest) -> (ParsedTraces, ParsedTraceLanding) {
-    decode_both_at(req, base_ns())
-}
-
-/// [`decode_both`] at a named receive clock — for a case that decodes one
-/// body twice at two instants, as two requests carrying it would.
-fn decode_both_at(
-    req: &ExportTraceServiceRequest,
-    now_ns: i64,
-) -> (ParsedTraces, ParsedTraceLanding) {
-    (
-        pulsus_write::parse_traces(req, now_ns).expect("the old path's decode"),
-        pulsus_write::parse_trace_landing(req, now_ns).expect("the landing decode"),
-    )
+/// The landing decode of one request, exactly as a handler runs it.
+fn decode(req: &ExportTraceServiceRequest) -> ParsedTraceLanding {
+    pulsus_write::parse_trace_landing(req).expect("the landing decode")
 }
 
 /// **The fixture every row-count assertion below is decidable against.** Six
@@ -404,9 +365,8 @@ fn six_spans() -> ExportTraceServiceRequest {
 }
 
 /// `six_spans` carrying **no `start_time_unix_nano` and no
-/// `end_time_unix_nano`** — the shape the decode has a fallback for: a span
-/// with no start time takes the request's own receive clock, and the
-/// attribute day of every row that span produces is derived from it.
+/// `end_time_unix_nano`**: each span is stored with a start of `0`
+/// (issue #587 row 10), never the receive clock.
 fn six_spans_without_start_times() -> ExportTraceServiceRequest {
     request_of(
         "checkout",
@@ -423,15 +383,6 @@ fn six_spans_without_start_times() -> ExportTraceServiceRequest {
             })
             .collect(),
     )
-}
-
-/// Two receive clocks either side of one UTC midnight, both inside the
-/// admitted day domain: the same bytes decoded at the first and at the
-/// second take a different fallback timestamp **and** a different attribute
-/// day, so a case over the pair reaches every value the fallback feeds.
-fn clocks_across_midnight() -> (i64, i64) {
-    let midnight = (base_ns() / NS_PER_DAY + 1) * NS_PER_DAY;
-    (midnight - 1_000_000_000, midnight + 1_000_000_000)
 }
 
 /// `six_spans` under a different trace id, so two pushes are two distinct
@@ -488,36 +439,26 @@ fn count_of_kind(rows: &[TraceLandingRow], kind: u8) -> usize {
 // -- T1/T2: one push, one insert --------------------------------------
 
 /// One push is one `insert_with` call, into `trace_landing`, carrying every
-/// kind the push produced — and **none** naming any of the five target
-/// tables or the old path's two.
+/// kind the push produced — and **none** naming any of the target tables.
 #[tokio::test]
 async fn one_push_is_one_insert_into_the_landing_table() {
     let root = spool_root("one-insert");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let (writer, spans_mock, _attrs) =
-        writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
 
     let req = six_spans();
-    let (parsed, landed) = decode_both(&req);
+    let landed = decode(&req);
     let expected_rows = landed.total_rows() as usize;
     writer
-        .admit_flush(parsed, landed, PushHeaders::default())
+        .admit_flush(landed, PushHeaders::default())
         .expect("queue has room")
         .await
-        .expect("the old path commits");
+        .expect("the push commits");
     settle_until("the landing insert", || landing.call_count() == 1).await;
 
     assert_eq!(landing.call_count(), 1, "one push is one landing insert");
     assert_eq!(landing.tables(), vec![LANDING.to_string()]);
-    for table in [
-        "spans",
-        "resources",
-        "traces",
-        "tag_names",
-        "tag_values",
-        SPANS,
-        ATTRS,
-    ] {
+    for table in ["spans", "resources", "traces", "tag_names", "tag_values"] {
         assert!(
             !landing.tables().iter().any(|t| t == table),
             "the landing inserter must never name {table}"
@@ -534,9 +475,6 @@ async fn one_push_is_one_insert_into_the_landing_table() {
     );
     assert!(count_of_kind(&rows, 3) >= 2, "and both of their values");
 
-    // The old path keeps writing, which is this change's whole premise.
-    assert_eq!(spans_mock.call_count(), 1);
-
     writer.shutdown(Duration::from_secs(5)).await;
     std::fs::remove_dir_all(&root).ok();
 }
@@ -547,16 +485,16 @@ async fn one_push_is_one_insert_into_the_landing_table() {
 async fn two_pushes_are_two_inserts() {
     let root = spool_root("two-inserts");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let (writer, _spans, _attrs) = writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
 
     for (trace, service) in [(0xa1u8, "checkout"), (0xa2, "cart")] {
         let req = six_spans_of(trace, service);
-        let (parsed, landed) = decode_both(&req);
+        let landed = decode(&req);
         writer
-            .admit_flush(parsed, landed, PushHeaders::default())
+            .admit_flush(landed, PushHeaders::default())
             .expect("queue has room")
             .await
-            .expect("the old path commits");
+            .expect("the push commits");
     }
     settle_until("both landing inserts", || landing.call_count() == 2).await;
 
@@ -576,24 +514,20 @@ async fn two_pushes_are_two_inserts() {
 async fn a_token_is_minted_per_sealed_block_and_repeated_on_resend() {
     let root = spool_root("token");
     let landing = ResendOnceInserter::new();
-    let spans: Arc<MockInserter<TraceSpanRow>> = MockInserter::unrecorded(Act::Ok);
-    let attrs: Arc<MockInserter<TraceAttrRow>> = MockInserter::unrecorded(Act::Ok);
     let cfg = WriterConfig::default();
     let writer = writer_with(
         &cfg,
         &root,
-        spans.clone(),
-        attrs.clone(),
         landing.clone() as Arc<dyn BlockInserter<TraceLandingRow>>,
     );
 
     let req = six_spans();
-    let (parsed, landed) = decode_both(&req);
+    let landed = decode(&req);
     writer
-        .admit_flush(parsed, landed, PushHeaders::default())
+        .admit_flush(landed, PushHeaders::default())
         .expect("queue has room")
         .await
-        .expect("the old path commits");
+        .expect("the resend commits");
     settle_until("the resend", || landing.tokens().len() == 2).await;
     let tokens = landing.tokens();
     assert_eq!(tokens.len(), 2, "one failed attempt and one resend");
@@ -610,14 +544,14 @@ async fn a_token_is_minted_per_sealed_block_and_repeated_on_resend() {
         ..Default::default()
     };
     let landing2: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let (writer2, _s, _a) = writer_ok_old(&cfg, &root, landing2.clone());
+    let writer2 = writer_with(&cfg, &root, landing2.clone());
     for _ in 0..2 {
-        let (parsed, landed) = decode_both(&six_spans());
+        let landed = decode(&six_spans());
         writer2
-            .admit_flush(parsed, landed, PushHeaders::default())
+            .admit_flush(landed, PushHeaders::default())
             .expect("queue has room")
             .await
-            .expect("the old path commits");
+            .expect("the push commits");
     }
     settle_until("two landing inserts", || landing2.call_count() == 2).await;
     assert_ne!(
@@ -642,7 +576,7 @@ async fn a_token_is_minted_per_sealed_block_and_repeated_on_resend() {
 async fn a_push_at_a_ceiling_is_refused_whole() {
     let root = spool_root("ceiling");
     let req = six_spans();
-    let (parsed, landed) = decode_both(&req);
+    let landed = decode(&req);
     let rows = landed.total_rows();
     assert!(
         rows > landed.spans.len() as u64,
@@ -656,10 +590,10 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
         ..Default::default()
     };
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let (writer, spans_mock, attrs_mock) = writer_ok_old(&cfg, &root, landing.clone());
+    let writer = writer_with(&cfg, &root, landing.clone());
     let before = writer.metrics().dedup.rollbacks_total;
     let err = writer
-        .admit_flush(parsed.clone(), landed.clone(), PushHeaders::default())
+        .admit_flush(landed.clone(), PushHeaders::default())
         .expect_err("a push at the row ceiling is refused");
     let AdmitRefusal::PushTooLarge {
         rows: got_rows,
@@ -678,10 +612,8 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
     assert_eq!(byte_limit, 16 * 1024 * 1024);
     assert!(bytes > 0, "the push's own byte estimate is reported");
     assert_eq!(landing.call_count(), 0, "a refusal stores nothing");
-    assert_eq!(spans_mock.call_count(), 0, "on either path");
-    assert_eq!(attrs_mock.call_count(), 0);
     assert_eq!(writer.metrics().queue_bytes, 0, "no bytes stay reserved");
-    assert_eq!(writer.landing_metrics().queue_bytes, 0);
+    assert_eq!(writer.metrics().queue_bytes, 0);
     assert_eq!(
         writer.metrics().dedup.rollbacks_total,
         before + 1,
@@ -697,8 +629,8 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
             ..Default::default()
         };
         let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-        let (writer, _s, _a) = writer_ok_old(&cfg, &root, landing.clone());
-        let result = writer.admit_flush(parsed.clone(), landed.clone(), PushHeaders::default());
+        let writer = writer_with(&cfg, &root, landing.clone());
+        let result = writer.admit_flush(landed.clone(), PushHeaders::default());
         if refused {
             let err = result.expect_err("refused at one byte under its own estimate");
             assert_eq!(
@@ -711,12 +643,12 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
                 }
             );
             assert_eq!(landing.call_count(), 0);
-            assert_eq!(writer.landing_metrics().queue_bytes, 0);
+            assert_eq!(writer.metrics().queue_bytes, 0);
         } else {
             result
                 .expect("byte equality is admitted, not refused")
                 .await
-                .expect("the old path commits");
+                .expect("the push commits");
             settle_until("the landing insert", || landing.call_count() == 1).await;
         }
         writer.shutdown(Duration::from_secs(5)).await;
@@ -772,16 +704,16 @@ async fn the_charge_covers_everything_a_queued_block_holds() {
             LINKS,
         ),
     ] {
-        let (ps, ls) = decode_both(&short);
-        let (pl, ll) = decode_both(&long);
+        let ls = decode(&short);
+        let ll = decode(&long);
         assert_eq!(
             ls.total_rows(),
             ll.total_rows(),
             "{what}: the two sides must carry the same landed rows, or the \
              growth could be a row count rather than the field"
         );
-        let charge_short = refused_charge(&root, ps, ls).await;
-        let charge_long = refused_charge(&root, pl, ll).await;
+        let charge_short = refused_charge(&root, ls).await;
+        let charge_long = refused_charge(&root, ll).await;
         let added = (LONG - SHORT) as u64 * copies;
         assert!(
             charge_long >= charge_short + added,
@@ -792,9 +724,9 @@ async fn the_charge_covers_everything_a_queued_block_holds() {
     }
 
     // And the whole block's rows are charged their slots beside that text.
-    let (parsed, landed) = decode_both(&wide_span_request(SHORT, SHORT, SHORT));
+    let landed = decode(&wide_span_request(SHORT, SHORT, SHORT));
     let rows = landed.total_rows();
-    let charge = refused_charge(&root, parsed, landed).await;
+    let charge = refused_charge(&root, landed).await;
     let slots = rows * std::mem::size_of::<TraceLandingRow>() as u64;
     assert!(
         charge >= slots + landing_block_overhead_bytes::<TraceLandingRow>(),
@@ -833,8 +765,8 @@ async fn the_queue_charge_covers_the_catalog_rows_it_holds() {
                 .collect(),
         )],
     );
-    let (p1, l1) = decode_both(&one);
-    let (p2, l2) = decode_both(&many);
+    let l1 = decode(&one);
+    let l2 = decode(&many);
     assert_eq!(l1.spans.len(), 1);
     assert_eq!(l2.spans.len(), 1, "both pushes carry exactly one span");
     let added_rows = l2.total_rows() - l1.total_rows();
@@ -843,8 +775,8 @@ async fn the_queue_charge_covers_the_catalog_rows_it_holds() {
         "the second push has to carry about a thousand more catalog rows:          {added_rows}"
     );
 
-    let first = refused_charge(&root, p1, l1).await;
-    let second = refused_charge(&root, p2, l2).await;
+    let first = refused_charge(&root, l1).await;
+    let second = refused_charge(&root, l2).await;
     let slot = std::mem::size_of::<TraceLandingRow>() as u64;
     assert!(
         second >= first + added_rows * slot,
@@ -860,16 +792,16 @@ async fn the_queue_charge_covers_the_catalog_rows_it_holds() {
 /// The push's own charge, read off the refusal a one-byte-under ceiling
 /// produces — the one figure the queue reserves, the ceiling refuses against
 /// and the release gives back.
-async fn refused_charge(root: &Path, parsed: ParsedTraces, landed: ParsedTraceLanding) -> u64 {
+async fn refused_charge(root: &Path, landed: ParsedTraceLanding) -> u64 {
     let cfg = WriterConfig {
         batch_bytes: ByteSize(1),
         ingest_queue_bytes: ByteSize(1024 * 1024 * 1024),
         ..Default::default()
     };
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
-    let (writer, _s, _a) = writer_ok_old(&cfg, root, landing);
+    let writer = writer_with(&cfg, root, landing);
     let err = writer
-        .admit_flush(parsed, landed, PushHeaders::default())
+        .admit_flush(landed, PushHeaders::default())
         .expect_err("one byte of ceiling refuses every push");
     writer.shutdown(Duration::from_secs(5)).await;
     match err {
@@ -918,35 +850,32 @@ fn wide_span_request(
 }
 
 /// **A valid push with no span is a success and is charged for nothing**: no
-/// landing block, no landing insert, no old-path insert, and the landing
-/// counter is zero throughout.
+/// landing block, no landing insert, and the landing counter is zero
+/// throughout.
 #[tokio::test]
 async fn an_empty_push_is_a_success_and_is_charged_for_nothing() {
     let root = spool_root("empty");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let (writer, spans_mock, attrs_mock) =
-        writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
 
     let req = request_of("checkout", Vec::new());
-    let (parsed, landed) = decode_both(&req);
+    let landed = decode(&req);
     assert!(landed.is_empty(), "the fixture carries no landed row");
     writer
-        .admit_flush(parsed, landed, PushHeaders::default())
+        .admit_flush(landed, PushHeaders::default())
         .expect("an empty push is admitted")
         .await
         .expect("and answered a success");
 
     assert_eq!(landing.call_count(), 0, "no block, no insert");
-    assert_eq!(spans_mock.call_count(), 0);
-    assert_eq!(attrs_mock.call_count(), 0);
-    assert_eq!(writer.landing_metrics().queue_bytes, 0);
+    assert_eq!(writer.metrics().queue_bytes, 0);
     assert_eq!(writer.metrics().queue_bytes, 0);
 
     writer.shutdown(Duration::from_secs(5)).await;
     std::fs::remove_dir_all(&root).ok();
 }
 
-// -- the two queues, and the coupled admission ------------------------
+// -- the landing queue -----------------------------------------------
 
 /// The landing queue refuses at **its own** configured ceiling: the counter
 /// never exceeds `PULSUS_INGEST_QUEUE_BYTES` and the refusal is
@@ -957,12 +886,12 @@ async fn an_empty_push_is_a_success_and_is_charged_for_nothing() {
 #[tokio::test]
 async fn the_landing_queue_refuses_at_its_own_ceiling() {
     let root = spool_root("landing-ceiling");
-    let (writer, landing, _spans, limit) = saturated_landing(&root).await;
+    let (writer, landing, limit) = saturated_landing(&root).await;
     assert!(
-        writer.landing_metrics().queue_bytes <= limit,
+        writer.metrics().queue_bytes <= limit,
         "the landing counter ({}) must never exceed the configured value \
          ({limit})",
-        writer.landing_metrics().queue_bytes
+        writer.metrics().queue_bytes
     );
     assert!(
         landing.call_count() <= 1,
@@ -972,25 +901,17 @@ async fn the_landing_queue_refuses_at_its_own_ceiling() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// **One-sided landing saturation refuses the push**, and nothing is stored
-/// on either side. The `429` is not the case — a refusal that had already
-/// buffered the old path's rows is the defect.
+/// **Landing saturation refuses the push**, and the refused push queues
+/// no block.
 #[tokio::test]
-async fn one_sided_landing_saturation_refuses_the_push() {
+async fn landing_saturation_refuses_the_push() {
     let root = spool_root("one-sided-landing");
-    let (writer, landing, spans_mock, _limit) = saturated_landing(&root).await;
+    let (writer, landing, _limit) = saturated_landing(&root).await;
     let admitted_landing_calls = landing.call_count();
-    let old_calls_before = spans_mock.call_count();
-    assert_eq!(
-        writer.metrics().queue_bytes,
-        0,
-        "the old path's own counter is free: its blocks committed and \
-         released"
-    );
 
-    let (parsed, landed) = decode_both(&six_spans_of(0xd1, "pay"));
+    let landed = decode(&six_spans_of(0xd1, "pay"));
     let err = writer
-        .admit_flush(parsed, landed, PushHeaders::default())
+        .admit_flush(landed, PushHeaders::default())
         .expect_err("the saturated landing queue refuses the push");
     assert_eq!(err, AdmitRefusal::Backpressure);
     assert_eq!(
@@ -998,203 +919,242 @@ async fn one_sided_landing_saturation_refuses_the_push() {
         admitted_landing_calls,
         "the refused push queued no landing block"
     );
-    assert_eq!(
-        spans_mock.call_count(),
-        old_calls_before,
-        "and stored nothing on the old path either"
-    );
-
-    writer.shutdown(Duration::from_millis(50)).await;
-    std::fs::remove_dir_all(&root).ok();
-}
-
-/// **One-sided old-path saturation refuses the push**, and both stores are
-/// empty afterwards. Without the coupled admission the landing block would
-/// be sent for a push the route refused.
-#[tokio::test]
-async fn one_sided_old_path_saturation_refuses_the_push() {
-    let root = spool_root("one-sided-old");
-    // A hanging OLD span inserter: its generation never settles, so its
-    // bytes stay reserved and the old counter climbs to its ceiling. The
-    // landing inserter succeeds, so the landing counter returns to zero.
-    // `PULSUS_BATCH_BYTES` is the landing path's own per-push ceiling now, so
-    // it is left at its default: lowering it to force the old path's buffers
-    // to flush would refuse every push `413` instead. The old path's
-    // generations settle on `batch_age` instead.
-    let cfg = WriterConfig {
-        ingest_queue_bytes: ByteSize(64 * 1024),
-        ingest_dedup: false,
-        ..Default::default()
-    };
-    let spans: Arc<MockInserter<TraceSpanRow>> = MockInserter::unrecorded(Act::Hang);
-    let attrs: Arc<MockInserter<TraceAttrRow>> = MockInserter::unrecorded(Act::Ok);
-    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
-    let writer = writer_with(
-        &cfg,
-        &root,
-        spans.clone(),
-        attrs.clone(),
-        landing.clone() as Arc<dyn BlockInserter<TraceLandingRow>>,
-    );
-
-    let mut admitted = 0usize;
-    let mut refused = None;
-    for trace in 0..200u8 {
-        let (parsed, landed) = decode_both(&six_spans_of(trace + 1, "checkout"));
-        match writer.admit(parsed, landed, PushHeaders::default()) {
-            Ok(()) => admitted += 1,
-            Err(e) => {
-                refused = Some(e);
-                break;
-            }
-        }
-        settle_until("the landing block to commit and release", || {
-            writer.landing_metrics().queue_bytes == 0
-        })
-        .await;
-    }
-    assert_eq!(
-        refused,
-        Some(AdmitRefusal::Backpressure),
-        "the old path's own saturation refuses the push"
-    );
-    assert!(admitted > 0, "some push had to be admitted first");
-    assert_eq!(
-        writer.landing_metrics().queue_bytes,
-        0,
-        "the landing counter is free when the old path refuses"
-    );
-    assert_eq!(
-        landing.call_count(),
-        admitted,
-        "the refused push queued no landing block: the landing inserter saw \
-         one call per ADMITTED push and no more"
-    );
 
     writer.shutdown(Duration::from_millis(50)).await;
     std::fs::remove_dir_all(&root).ok();
 }
 
 /// Drives the landing counter to its ceiling with a parked landing inserter
-/// and a succeeding old path, and returns the refusal point.
-async fn saturated_landing(
-    root: &Path,
-) -> (
-    TraceWriter,
-    Arc<MockInserter<TraceLandingRow>>,
-    Arc<MockInserter<TraceSpanRow>>,
-    u64,
-) {
+/// and returns the refusal point.
+async fn saturated_landing(root: &Path) -> (TraceWriter, Arc<MockInserter<TraceLandingRow>>, u64) {
     let limit = 256 * 1024;
-    // `PULSUS_BATCH_BYTES` stays at its default: it is the landing path's own
-    // per-push byte ceiling, and lowering it would refuse every push `413`
-    // rather than saturating anything.
+    // `PULSUS_BATCH_BYTES` stays at its default: it is the per-push byte
+    // ceiling, and lowering it would refuse every push `413` rather than
+    // saturating anything.
     let cfg = WriterConfig {
         ingest_queue_bytes: ByteSize(limit),
         ingest_dedup: false,
         ..Default::default()
     };
-    let spans: Arc<MockInserter<TraceSpanRow>> = MockInserter::unrecorded(Act::Ok);
-    let attrs: Arc<MockInserter<TraceAttrRow>> = MockInserter::unrecorded(Act::Ok);
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Hang);
     let mut runtime = runtime_at(&cfg, root);
     runtime.trace_landing_inserters = 1;
     let writer = TraceWriter::with_inserters_and_runtime(
-        spans.clone(),
-        attrs.clone(),
         landing.clone() as Arc<dyn BlockInserter<TraceLandingRow>>,
         runtime,
         TraceWriterTables::traces_default(),
     );
 
     for trace in 0..200u8 {
-        let (parsed, landed) = decode_both(&six_spans_of(trace + 1, "checkout"));
-        if writer
-            .admit(parsed, landed, PushHeaders::default())
-            .is_err()
-        {
+        let landed = decode(&six_spans_of(trace + 1, "checkout"));
+        if writer.admit(landed, PushHeaders::default()).is_err() {
             break;
         }
     }
-    settle_until("the old path's reservations to be released", || {
-        writer.metrics().queue_bytes == 0
-    })
-    .await;
     assert!(
-        writer.landing_metrics().queue_bytes > 0,
+        writer.metrics().queue_bytes > 0,
         "the parked landing inserter has to leave the landing queue charged"
     );
-    (writer, landing, spans, limit)
+    (writer, landing, limit)
 }
 
-// -- the suppression index over three targets --------------------------
+// -- the acknowledgement and the suppression index ----------------------
 
-/// **The case the three-target claim is for.** The landing insert fails
-/// non-retryably while both old-path inserts commit, so the claim's three
-/// targets disagree: the two that count toward the acknowledgement committed
-/// and the landing block did not. The retry is still suppressed, so the old
-/// path does not store the body a second time.
+/// **A sync push is answered by its landing insert** (issue #602): a
+/// landing insert that fails is the push's error.
 #[tokio::test]
-async fn a_retry_is_suppressed_when_only_the_landing_insert_failed() {
-    let root = spool_root("mixed-outcome");
+async fn a_sync_push_is_answered_by_its_landing_insert() {
+    let root = spool_root("answered-by-landing");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Poison);
-    let (writer, spans_mock, _attrs) =
-        writer_ok_old(&WriterConfig::default(), &root, landing.clone());
-
-    let (parsed, landed) = decode_both(&six_spans());
-    writer
-        .admit_flush(parsed.clone(), landed.clone(), PushHeaders::default())
+    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let answer = writer
+        .admit_flush(decode(&six_spans()), PushHeaders::default())
         .expect("queue has room")
-        .await
-        .expect("the old path commits, which is what the route answers");
-    settle_until("the landing block to settle", || {
+        .await;
+    assert!(
+        answer.is_err(),
+        "the failed landing insert is the answer: {answer:?}"
+    );
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **The answer waits for the landing insert**: while it is in flight the
+/// sync push is not answered.
+#[tokio::test]
+async fn a_sync_push_is_not_answered_while_its_landing_insert_is_in_flight() {
+    let root = spool_root("waits-for-landing");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Hang);
+    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let wait = writer
+        .admit_flush(decode(&six_spans()), PushHeaders::default())
+        .expect("queue has room");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), wait)
+            .await
+            .is_err(),
+        "the push was answered before its landing insert ended"
+    );
+    writer.shutdown(Duration::from_millis(50)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **A retry of a push whose landing insert failed is stored**: the claim's
+/// one target is the landing block, so its failure releases the claim.
+#[tokio::test]
+async fn a_retry_of_a_failed_landing_insert_is_stored() {
+    let root = spool_root("retry-after-failure");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Poison);
+    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let landed = decode(&six_spans());
+    let _ = writer
+        .admit_flush(landed.clone(), PushHeaders::default())
+        .expect("queue has room")
+        .await;
+    settle_until("the first landing block to settle", || {
         writer.metrics().spool_poison_total == 1
     })
     .await;
-
-    let again = writer
-        .admit_flush(parsed, landed, PushHeaders::default())
-        .expect("the retry is suppressed, not refused");
-    again
-        .await
-        .expect("and is answered the original push's outcome");
-
+    let _ = writer
+        .admit_flush(landed, PushHeaders::default())
+        .expect("the retry is admitted")
+        .await;
     assert_eq!(
         landing.call_count(),
-        1,
-        "the retry queued no second landing block"
+        2,
+        "the retry queued a second landing block rather than being suppressed"
     );
-    assert_eq!(
-        spans_mock.call_count(),
-        1,
-        "and the old path did not store the body a second time, which is the \
-         defect a claim over the landing block alone would leave"
-    );
-    assert_eq!(
-        writer.metrics().dedup.mixed_outcome_total,
-        1,
-        "one claim whose targets disagreed"
-    );
+    assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 0);
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
 
+/// **A retry after an insert whose fate is unknown is stored** (issue
+/// #602): the trace block is replay-safe, so an uncertain ending releases
+/// the claim and the client's retry queues a block of its own. With no
+/// resends configured each push makes exactly one attempt.
+#[tokio::test]
+async fn a_retry_after_an_uncertain_landing_insert_is_stored() {
+    let root = spool_root("retry-after-uncertain");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Uncertain);
+    let cfg = WriterConfig {
+        trace_landing_retries: 0,
+        ..Default::default()
+    };
+    let writer = writer_with(&cfg, &root, landing.clone());
+    let landed = decode(&six_spans());
+    let first = writer
+        .admit_flush(landed.clone(), PushHeaders::default())
+        .expect("queue has room")
+        .await;
+    assert!(first.is_err(), "the uncertain insert is the push's error");
+    let second = writer
+        .admit_flush(landed, PushHeaders::default())
+        .expect("the retry is admitted")
+        .await;
+    assert!(second.is_err());
+    assert_eq!(
+        landing.call_count(),
+        2,
+        "the retry queued a block of its own rather than being answered the first error"
+    );
+    assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 0);
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// An inserter whose one call is held until the case releases it, and then
+/// fails with a non-retryable error: provably not committed.
+struct GatedPoisonInserter {
+    entered: tokio::sync::Semaphore,
+    gate: tokio::sync::Semaphore,
+    calls: AtomicUsize,
+}
+
+impl BlockInserter<TraceLandingRow> for GatedPoisonInserter {
+    fn insert<'a>(
+        &'a self,
+        _table: &'a str,
+        _rows: &'a [TraceLandingRow],
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.add_permits(1);
+        Box::pin(async move {
+            self.gate
+                .acquire()
+                .await
+                .expect("the gate is never closed")
+                .forget();
+            Err(ChError::Decode("gated poison".to_string()))
+        })
+    }
+}
+
+/// **A sync repeat waiting on a pending trace claim is answered the failure
+/// the claim settles to** (issue #602; the retry contract's row 5, at the
+/// writer). The original's landing insert is held in flight, the identical
+/// push arrives and waits, then the insert fails: both callers are answered
+/// the failure, and the repeat stores nothing.
+#[tokio::test]
+async fn a_sync_repeat_waiting_on_a_pending_trace_claim_is_answered_its_failure() {
+    let root = spool_root("repeat-on-pending-failure");
+    let landing = Arc::new(GatedPoisonInserter {
+        entered: tokio::sync::Semaphore::new(0),
+        gate: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+    });
+    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let landed = decode(&six_spans());
+
+    let original = writer
+        .admit_flush(landed.clone(), PushHeaders::default())
+        .expect("queue has room");
+    // The original's insert is in flight, so its claim is pending.
+    landing
+        .entered
+        .acquire()
+        .await
+        .expect("the entered semaphore is never closed")
+        .forget();
+    let repeat = writer
+        .admit_flush(landed, PushHeaders::default())
+        .expect("the repeat waits on the pending claim");
+    assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 1);
+
+    landing.gate.add_permits(1);
+    let original = original.await;
+    let repeat = tokio::time::timeout(Duration::from_secs(10), repeat)
+        .await
+        .expect("the repeat is answered once the claim settles");
+    assert!(
+        original.is_err(),
+        "the failed insert is the original's answer"
+    );
+    assert!(
+        repeat.is_err(),
+        "the repeat is answered the failure its claim settled to: {repeat:?}"
+    );
+    assert_eq!(
+        landing.calls.load(Ordering::SeqCst),
+        1,
+        "the repeat stored nothing"
+    );
     writer.shutdown(Duration::from_secs(5)).await;
     std::fs::remove_dir_all(&root).ok();
 }
 
 /// **The hermetic half of the push-identity set**: two identical bodies
-/// under two distinct `Idempotency-Key`s are two identities, so both store,
-/// on both paths.
+/// under two distinct `Idempotency-Key`s are two identities, so both store.
 #[tokio::test]
 async fn a_distinct_key_is_a_distinct_identity_in_the_writer() {
     let root = spool_root("distinct-key");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let (writer, spans_mock, _attrs) =
-        writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
 
-    let (parsed, landed) = decode_both(&six_spans());
+    let landed = decode(&six_spans());
     for key in ["k-1", "k-2"] {
         writer
             .admit_flush(
-                parsed.clone(),
                 landed.clone(),
                 PushHeaders {
                     idempotency_key: Some(key.to_string()),
@@ -1214,40 +1174,34 @@ async fn a_distinct_key_is_a_distinct_identity_in_the_writer() {
          headers both pushes carry the content digest and the second is \
          suppressed"
     );
-    assert_eq!(spans_mock.call_count(), 2, "on the old path too");
 
     writer.shutdown(Duration::from_secs(5)).await;
     std::fs::remove_dir_all(&root).ok();
 }
 
 /// **The same bytes sent twice with no key are one push.** Every span in the
-/// body carries no start time, so each decode stamps it with that request's
-/// own receive clock and derives the attribute day of every row from it; the
-/// two decodes here are the same bytes at two instants either side of a UTC
-/// midnight. With no `Idempotency-Key` the identity IS the content digest, so
-/// a receiver-generated value inside that digest makes the retry a second
-/// identity and the body is stored twice — on both write paths.
+/// body carries no start time. With no `Idempotency-Key` the identity IS the
+/// content digest, so a receiver-generated value inside that digest would
+/// make the retry a second identity and the body would be stored twice.
 #[tokio::test]
 async fn a_body_with_no_span_start_times_is_stored_once_without_a_key() {
     let root = spool_root("no-start-times");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let (writer, spans_mock, _attrs) =
-        writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
 
     let body = six_spans_without_start_times();
-    let (first, second) = clocks_across_midnight();
 
-    let (parsed, landed) = decode_both_at(&body, first);
+    let landed = decode(&body);
     writer
-        .admit_flush(parsed, landed, PushHeaders::default())
+        .admit_flush(landed, PushHeaders::default())
         .expect("the first push is admitted")
         .await
         .expect("and commits");
     settle_until("the first landing insert", || landing.call_count() == 1).await;
 
-    let (parsed, landed) = decode_both_at(&body, second);
+    let landed = decode(&body);
     writer
-        .admit_flush(parsed, landed, PushHeaders::default())
+        .admit_flush(landed, PushHeaders::default())
         .expect("the retry is suppressed, not admitted")
         .await
         .expect("and is answered the first push's outcome");
@@ -1257,11 +1211,6 @@ async fn a_body_with_no_span_start_times_is_stored_once_without_a_key() {
         1,
         "the retry queued no second landing block: one body is one identity \
          whatever the receive clock read"
-    );
-    assert_eq!(
-        spans_mock.call_count(),
-        1,
-        "and the old path did not store the body a second time"
     );
     assert_eq!(
         writer.metrics().dedup.duplicate_pushes_total,
@@ -1274,35 +1223,33 @@ async fn a_body_with_no_span_start_times_is_stored_once_without_a_key() {
 }
 
 /// **The same bytes sent twice under one key are one push, not a changed
-/// body.** The fixture and the two clocks are the case above's; what differs
-/// is that both pushes carry the same `Idempotency-Key`, so the digest is the
-/// content the claim entry recorded rather than the identity. A
-/// receiver-generated value inside it makes the retry read as one key
-/// carrying two contents — a `400` over a body the client sent once.
+/// body.** The fixture is the case above's; what differs is that both pushes
+/// carry the same `Idempotency-Key`, so the digest is the content the claim
+/// entry recorded rather than the identity. A receiver-generated value
+/// inside it would make the retry read as one key carrying two contents — a
+/// `400` over a body the client sent once.
 #[tokio::test]
 async fn a_body_with_no_span_start_times_is_suppressed_under_one_key() {
     let root = spool_root("no-start-times-keyed");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let (writer, spans_mock, _attrs) =
-        writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
 
     let body = six_spans_without_start_times();
-    let (first, second) = clocks_across_midnight();
     let keyed = || PushHeaders {
         idempotency_key: Some("k-1".to_string()),
         declared_retry: false,
     };
 
-    let (parsed, landed) = decode_both_at(&body, first);
+    let landed = decode(&body);
     writer
-        .admit_flush(parsed, landed, keyed())
+        .admit_flush(landed, keyed())
         .expect("the first push is admitted")
         .await
         .expect("and commits");
     settle_until("the first landing insert", || landing.call_count() == 1).await;
 
-    let (parsed, landed) = decode_both_at(&body, second);
-    let outcome = writer.admit_flush(parsed, landed, keyed());
+    let landed = decode(&body);
+    let outcome = writer.admit_flush(landed, keyed());
     assert!(
         outcome.is_ok(),
         "the retry under one key is suppressed, not refused as changed \
@@ -1324,33 +1271,23 @@ async fn a_body_with_no_span_start_times_is_suppressed_under_one_key() {
         1,
         "the retry queued no second landing block"
     );
-    assert_eq!(
-        spans_mock.call_count(),
-        1,
-        "and the old path did not store the body a second time"
-    );
 
     writer.shutdown(Duration::from_secs(5)).await;
     std::fs::remove_dir_all(&root).ok();
 }
 
 /// **The other half of the rule: the start time the request DID send is
-/// still content.** Two bodies alike but for one span's own instant, both
-/// decoded at one receive clock, are two identities and both store — the
-/// digest reads that instant out of the span's `payload`, which is the span
-/// re-encoded verbatim.
+/// still content.** Two bodies alike but for one span's own instant are two
+/// identities and both store.
 ///
-/// **Both ends of the span move by the same nanosecond**, which is what
-/// makes the `payload` term the only thing that can discriminate the pair:
-/// shifting the start alone also shifts `duration_ns`, and the case then
-/// passes with `payload` deleted from the digest — measured, that is what it
-/// did.
+/// **Both ends of the span move by the same nanosecond**, so `duration_ns`
+/// is unchanged and only the digest's `start_ns` and `end_ns` terms can
+/// discriminate the pair.
 #[tokio::test]
 async fn two_bodies_differing_only_in_a_span_instant_both_store() {
     let root = spool_root("start-time-differs");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let (writer, spans_mock, _attrs) =
-        writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
 
     let mut later = six_spans();
     let span = &mut later.resource_spans[0].scope_spans[0].spans[0];
@@ -1358,9 +1295,9 @@ async fn two_bodies_differing_only_in_a_span_instant_both_store() {
     span.end_time_unix_nano += 1;
 
     for body in [six_spans(), later] {
-        let (parsed, landed) = decode_both_at(&body, base_ns());
+        let landed = decode(&body);
         writer
-            .admit_flush(parsed, landed, PushHeaders::default())
+            .admit_flush(landed, PushHeaders::default())
             .expect("both bodies are admitted")
             .await
             .expect("and both commit");
@@ -1372,7 +1309,6 @@ async fn two_bodies_differing_only_in_a_span_instant_both_store() {
         2,
         "a span moved by one nanosecond is a changed body"
     );
-    assert_eq!(spans_mock.call_count(), 2, "on the old path too");
 
     writer.shutdown(Duration::from_secs(5)).await;
     std::fs::remove_dir_all(&root).ok();
@@ -1424,9 +1360,8 @@ fn zipkin_body_over_days(days: u64) -> Vec<u8> {
 
 /// **A push whose spans fall on more than a hundred distinct UTC dates is
 /// refused `413`, on each trace transport** — and the gate's place is the
-/// other half of the case: a gate sitting after the landing path's admission
-/// refuses the push and leaves the old store empty, so it would pass the
-/// status and the old-store assertions and fail these two.
+/// other half of the case: the gate is decided before anything is queued, so
+/// the landing inserter is never called.
 #[tokio::test]
 async fn a_push_spanning_more_than_a_hundred_dates_is_refused() {
     let root = spool_root("day-gate");
@@ -1438,7 +1373,7 @@ async fn a_push_spanning_more_than_a_hundred_dates_is_refused() {
     for transport in ["otlp", "zipkin"] {
         // The admitted side: exactly the limit's worth of dates lands.
         let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
-        let (writer, spans_mock, _attrs) = writer_ok_old(&cfg, &root, landing.clone());
+        let writer = writer_with(&cfg, &root, landing.clone());
         let ok = post(transport, &writer, TRACE_LANDING_DAY_LIMIT).await;
         let (status, _h, _b) = parts(ok).await;
         assert!(
@@ -1449,12 +1384,11 @@ async fn a_push_spanning_more_than_a_hundred_dates_is_refused() {
             landing.call_count() == 1
         })
         .await;
-        assert_eq!(spans_mock.call_count(), 1, "{transport}: and stored");
         writer.shutdown(Duration::from_secs(5)).await;
 
         // One date past it is refused whole.
         let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
-        let (writer, spans_mock, attrs_mock) = writer_ok_old(&cfg, &root, landing.clone());
+        let writer = writer_with(&cfg, &root, landing.clone());
         let refused = post(transport, &writer, TRACE_LANDING_DAY_LIMIT + 1).await;
         let (status, headers, body) = parts(refused).await;
         let message =
@@ -1500,17 +1434,11 @@ async fn a_push_spanning_more_than_a_hundred_dates_is_refused() {
              landing table"
         );
         assert_eq!(
-            writer.landing_metrics().queue_bytes,
+            writer.metrics().queue_bytes,
             0,
             "{transport}: and the landing path's own byte counter never rose \
              above 0, so no block was sealed and charged"
         );
-        assert_eq!(
-            spans_mock.call_count(),
-            0,
-            "{transport}: nothing reached the old path either"
-        );
-        assert_eq!(attrs_mock.call_count(), 0);
         writer.shutdown(Duration::from_secs(5)).await;
     }
 
@@ -1578,7 +1506,7 @@ async fn a_span_with_too_many_paths_is_refused_at_decode_over_http() {
     };
     let limit = MAX_JSON_PATHS_PER_VALUE;
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
-    let (writer, spans_mock, _attrs) = writer_ok_old(&cfg, &root, landing.clone());
+    let writer = writer_with(&cfg, &root, landing.clone());
 
     let ok = post_paths(&writer, limit).await;
     let (status, _h, _b) = parts(ok).await;
@@ -1614,7 +1542,6 @@ async fn a_span_with_too_many_paths_is_refused_at_decode_over_http() {
         1,
         "the refused push never reached admission"
     );
-    assert_eq!(spans_mock.call_count(), 1, "on either path");
     writer.shutdown(Duration::from_secs(10)).await;
 
     std::fs::remove_dir_all(&root).ok();
@@ -1656,13 +1583,13 @@ async fn post_paths(writer: &TraceWriter, paths: u64) -> axum::response::Respons
 }
 
 /// **A push above the per-push ceilings is `413` on both trace transports,
-/// in each route's own container** — and `trace_spans` is empty, because the
-/// refusal is at the joint admission and not after the old path stored.
+/// in each route's own container** — and nothing reaches the landing
+/// inserter, because the refusal is at admission.
 #[tokio::test]
 async fn a_push_too_large_is_413_on_the_trace_transports() {
     let root = spool_root("too-large");
     let req = six_spans();
-    let (_parsed, landed) = decode_both(&req);
+    let landed = decode(&req);
     let rows = landed.total_rows();
     let cfg = WriterConfig {
         trace_landing_max_rows: rows,
@@ -1672,7 +1599,7 @@ async fn a_push_too_large_is_413_on_the_trace_transports() {
 
     for transport in ["otlp", "zipkin"] {
         let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
-        let (writer, spans_mock, attrs_mock) = writer_ok_old(&cfg, &root, landing.clone());
+        let writer = writer_with(&cfg, &root, landing.clone());
         let response = match transport {
             "otlp" => {
                 let mut headers = HeaderMap::new();
@@ -1722,13 +1649,6 @@ async fn a_push_too_large_is_413_on_the_trace_transports() {
                 assert_ne!(body.last(), Some(&b'\n'));
             }
         }
-        assert_eq!(
-            spans_mock.call_count(),
-            0,
-            "{transport}: the old path's own table is empty — the refusal is \
-             at the joint admission, not after the old path stored"
-        );
-        assert_eq!(attrs_mock.call_count(), 0);
         assert_eq!(landing.call_count(), 0);
         writer.shutdown(Duration::from_secs(5)).await;
     }
@@ -1749,6 +1669,318 @@ fn zipkin_six_spans() -> Vec<u8> {
         })
         .collect();
     format!("[{}]", spans.join(",")).into_bytes()
+}
+
+// -- issue #602: the protections, on the one decode left --------------
+
+/// Posts `req` as OTLP protobuf through the trace route's own handler.
+async fn post_request(
+    writer: &TraceWriter,
+    req: &ExportTraceServiceRequest,
+) -> axum::response::Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        "application/x-protobuf".parse().unwrap(),
+    );
+    pulsus_write::ingest_traces(writer, headers, Body::from(req.encode_to_vec())).await
+}
+
+/// A writer whose per-push and queue ceilings sit far above the case's own
+/// bound, so only the bound under test can refuse.
+fn roomy_writer(root: &Path, landing: Arc<MockInserter<TraceLandingRow>>) -> TraceWriter {
+    let cfg = WriterConfig {
+        batch_bytes: ByteSize(4 << 30),
+        ingest_queue_bytes: ByteSize(16 << 30),
+        ingest_dedup: false,
+        ..Default::default()
+    };
+    writer_with(&cfg, root, landing)
+}
+
+/// **`T-X1`.** The expansion bound on the trace route flips once, at the span
+/// count derived here from the wire sizes. Each span carries one array
+/// attribute whose single string is 256 KiB; an array is charged at the
+/// JSON-escape worst case, six times its wire bytes, and the resource's
+/// `service.name` twice (its promoted value and the attribute). Each span
+/// row is charged its own size and its copies of the block's text. `N*` is
+/// the smallest span count whose charge exceeds `MAX_EXPANDED_BYTES`.
+#[tokio::test]
+async fn t_x1_the_expansion_bound_flips_once_at_the_derived_span_count() {
+    use opentelemetry_proto::tonic::common::v1::ArrayValue;
+    let attr = KeyValue {
+        key: "a".to_string(),
+        value: Some(AnyValue {
+            value: Some(Value::ArrayValue(ArrayValue {
+                values: vec![AnyValue {
+                    value: Some(Value::StringValue("x".repeat(256 * 1024))),
+                }],
+            })),
+        }),
+        key_strindex: 0,
+    };
+    let service = kv("service.name", "checkout");
+    let fixed = 2 * service.encoded_len();
+    // The array, charged where it is stored, then what the span copies: its
+    // row and name, the rendered service twice, and a resource row with the
+    // resource's attributes.
+    let per_span = 6 * attr.encoded_len()
+        + std::mem::size_of::<pulsus_write::LandingSpan>()
+        + "GET /api".len()
+        + 2 * "checkout".len()
+        + std::mem::size_of::<pulsus_write::LandingResource>()
+        + service.encoded_len();
+    let max = pulsus_write::protocols::otlp_traces::MAX_EXPANDED_BYTES;
+    let n_star = (max - fixed) / per_span + 1;
+    eprintln!("T-X1: N* = {n_star}");
+    let mut seen = Vec::new();
+    for (n, admitted) in [(n_star - 1, true), (n_star, false), (n_star + 1, false)] {
+        let root = spool_root("t-x1");
+        let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
+        let writer = roomy_writer(&root, landing.clone());
+        let spans = (0..n)
+            .map(|_| span_at(0xa1, 0, base_ns(), vec![attr.clone()]))
+            .enumerate()
+            .map(|(i, mut s)| {
+                s.span_id = (i as u64 + 1).to_be_bytes().to_vec();
+                s
+            })
+            .collect();
+        let (status, _h, body) =
+            parts(post_request(&writer, &request_of("checkout", spans)).await).await;
+        seen.push((n, status.as_u16()));
+        if admitted {
+            assert_eq!(status, StatusCode::OK, "N = {n}");
+            settle_until("the admitted push's landing insert", || {
+                landing.call_count() == 1
+            })
+            .await;
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "N = {n}");
+            let (code, message) = decode_status(&body);
+            assert_eq!(code, 3, "N = {n}: google.rpc.Status code");
+            assert!(
+                message.contains("expanded trace row bytes"),
+                "N = {n}: the expansion bound, not another one: {message}"
+            );
+            assert_eq!(landing.call_count(), 0, "N = {n}: nothing stored");
+        }
+        writer.shutdown(Duration::from_secs(5)).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+    eprintln!("T-X1: (N, status) = {seen:?}");
+}
+
+/// **What every span copies is charged once per span** (issue #602). The
+/// landing decode stores a resource's and a scope's attributes once per
+/// block, but every span row carries its own copy of the rendered service
+/// and of the scope, and every span may open a resource row of its own UTC
+/// day — the service, the resource's attributes, its schema url and its
+/// encoded entity references again. Five shapes, each one 1 MiB value and
+/// `N` spans with no attributes of their own: a scope attribute, a resource
+/// attribute, `service.name`, the resource's schema url, and an entity
+/// reference. `N*` is derived from the wire sizes and `size_of`; the bound
+/// flips there.
+#[tokio::test]
+async fn what_every_span_copies_is_charged_once_per_span() {
+    use opentelemetry_proto::tonic::common::v1::{EntityRef, InstrumentationScope};
+    let big = "x".repeat(1024 * 1024);
+    let max = pulsus_write::protocols::otlp_traces::MAX_EXPANDED_BYTES;
+    let span_row = std::mem::size_of::<pulsus_write::LandingSpan>() + "GET /api".len();
+    let resource_row = std::mem::size_of::<pulsus_write::LandingResource>();
+    let mut wrong = Vec::new();
+    for shape in [
+        "scope attribute",
+        "resource attribute",
+        "service.name",
+        "resource schema url",
+        "entity reference",
+    ] {
+        let mut service = "checkout".to_string();
+        let mut resource_extra = None;
+        let mut scope_attr = None;
+        let mut schema_url = String::new();
+        let mut entity_refs = Vec::new();
+        match shape {
+            "scope attribute" => scope_attr = Some(kv("s", &big)),
+            "resource attribute" => resource_extra = Some(kv("r", &big)),
+            "service.name" => service = big.clone(),
+            "resource schema url" => schema_url = big.clone(),
+            _ => entity_refs.push(EntityRef {
+                r#type: big.clone(),
+                ..Default::default()
+            }),
+        }
+        let service_kv = kv("service.name", &service);
+        // A string attribute is charged its wire bytes. Once per block: the
+        // service's promoted value, every resource attribute (`service.name`
+        // among them) and every scope attribute.
+        let resource_attrs =
+            service_kv.encoded_len() + resource_extra.as_ref().map_or(0, |kv| kv.encoded_len());
+        let scope_attrs = scope_attr.as_ref().map_or(0, |kv| kv.encoded_len());
+        let once = service_kv.encoded_len() + resource_attrs + scope_attrs;
+        // The entity references as the resource row stores them: a resource
+        // carrying only that field, encoded.
+        let refs_len = Resource {
+            entity_refs: entity_refs.clone(),
+            ..Default::default()
+        }
+        .encoded_len();
+        // Once per span: its row and name, the service twice (its row's and
+        // its resource row's), the scope's attributes, and a resource row
+        // with the resource's attributes, schema url and entity references.
+        let per_span = span_row
+            + 2 * service.len()
+            + scope_attrs
+            + resource_row
+            + resource_attrs
+            + schema_url.len()
+            + refs_len;
+        let n_star = (max - once) / per_span + 1;
+        eprintln!("{shape}: N* = {n_star}");
+        for (n, admitted) in [(n_star - 1, true), (n_star, false)] {
+            let root = spool_root("copies");
+            let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
+            let writer = roomy_writer(&root, landing.clone());
+            let mut attributes = vec![service_kv.clone()];
+            attributes.extend(resource_extra.clone());
+            let req = ExportTraceServiceRequest {
+                resource_spans: vec![ResourceSpans {
+                    resource: Some(Resource {
+                        attributes,
+                        dropped_attributes_count: 0,
+                        entity_refs: entity_refs.clone(),
+                    }),
+                    scope_spans: vec![ScopeSpans {
+                        scope: Some(InstrumentationScope {
+                            attributes: scope_attr.clone().into_iter().collect(),
+                            ..Default::default()
+                        }),
+                        spans: (0..n)
+                            .map(|i| {
+                                let mut s = span_at(0xa3, 0, base_ns(), Vec::new());
+                                s.span_id = (i as u64 + 1).to_be_bytes().to_vec();
+                                s
+                            })
+                            .collect(),
+                        schema_url: String::new(),
+                    }],
+                    schema_url: schema_url.clone(),
+                }],
+            };
+            let (status, _h, body) = parts(post_request(&writer, &req).await).await;
+            if admitted {
+                if status != StatusCode::OK {
+                    wrong.push(format!("{shape}: N = {n}: {status}, expected 200"));
+                } else {
+                    settle_until("the admitted push's landing insert", || {
+                        landing.call_count() == 1
+                    })
+                    .await;
+                }
+            } else if status != StatusCode::BAD_REQUEST {
+                wrong.push(format!("{shape}: N = {n}: {status}, expected 400"));
+            } else {
+                let (code, message) = decode_status(&body);
+                if code != 3 || !message.contains("expanded trace row bytes") {
+                    wrong.push(format!("{shape}: N = {n}: code {code}, {message}"));
+                }
+                if landing.call_count() != 0 {
+                    wrong.push(format!("{shape}: N = {n}: something was stored"));
+                }
+            }
+            writer.shutdown(Duration::from_secs(5)).await;
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// **`T-X2`.** An attribute nested one level past `MAX_ANYVALUE_DEPTH` is
+/// `400` on the trace route and stores nothing; at the cap it is stored.
+#[tokio::test]
+async fn t_x2_an_attribute_past_the_depth_cap_is_refused_on_the_route() {
+    use opentelemetry_proto::tonic::common::v1::ArrayValue;
+    use pulsus_write::protocols::otlp_depth::MAX_ANYVALUE_DEPTH;
+    let deep = |levels: usize| {
+        let mut value = AnyValue {
+            value: Some(Value::StringValue("leaf".to_string())),
+        };
+        for _ in 1..levels {
+            value = AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue {
+                    values: vec![value],
+                })),
+            };
+        }
+        KeyValue {
+            key: "deep".to_string(),
+            value: Some(value),
+            key_strindex: 0,
+        }
+    };
+    for (levels, admitted) in [(MAX_ANYVALUE_DEPTH, true), (MAX_ANYVALUE_DEPTH + 1, false)] {
+        let root = spool_root("t-x2");
+        let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
+        let writer = roomy_writer(&root, landing.clone());
+        let req = request_of(
+            "checkout",
+            vec![span_at(0xa2, 0x01, base_ns(), vec![deep(levels)])],
+        );
+        let (status, _h, body) = parts(post_request(&writer, &req).await).await;
+        if admitted {
+            assert_eq!(status, StatusCode::OK, "{levels} levels");
+            settle_until("the admitted push's landing insert", || {
+                landing.call_count() == 1
+            })
+            .await;
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{levels} levels");
+            assert_eq!(
+                decode_status(&body).0,
+                3,
+                "{levels} levels: google.rpc.Status code"
+            );
+            assert_eq!(landing.call_count(), 0, "{levels} levels: nothing stored");
+        }
+        writer.shutdown(Duration::from_secs(5)).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// **`T-X5`.** In one push, a span at `2106-02-07T00:00:00Z` is rejected and
+/// one at `2106-02-06T23:59:59Z` is stored: `200` with a partial success of
+/// one rejected span, and one span row in the landing block.
+#[tokio::test]
+async fn t_x5_the_first_day_past_the_domain_is_rejected_and_the_last_second_before_it_stored() {
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceResponse;
+    const FIRST_UNSAFE_DAY_NS: i64 = 49_710 * NS_PER_DAY; // 2106-02-07T00:00:00Z
+    let root = spool_root("t-x5");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
+    let writer = roomy_writer(&root, landing.clone());
+    let req = request_of(
+        "checkout",
+        vec![
+            span_at(0xa5, 0x01, FIRST_UNSAFE_DAY_NS, Vec::new()),
+            span_at(0xa5, 0x02, FIRST_UNSAFE_DAY_NS - 1_000_000_000, Vec::new()),
+        ],
+    );
+    let (status, _h, body) = parts(post_request(&writer, &req).await).await;
+    assert_eq!(status, StatusCode::OK);
+    let response = ExportTraceServiceResponse::decode(body.as_slice()).expect("an OTLP response");
+    let partial = response.partial_success.expect("a partial success");
+    assert_eq!(
+        partial.rejected_spans, 1,
+        "the first unsafe day's span is rejected"
+    );
+    settle_until("the landing insert", || landing.call_count() == 1).await;
+    assert_eq!(
+        count_of_kind(&landing.rows_of(0), 0),
+        1,
+        "one span row is stored"
+    );
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
 }
 
 // -- the one live observable ------------------------------------------
@@ -1844,14 +2076,14 @@ async fn no_landing_insert_reaches_the_asynchronous_queue() {
         &WriterConfig::default(),
         TraceWriterTables::traces_default(),
     );
-    let (parsed, landed) = decode_both(&six_spans());
+    let landed = decode(&six_spans());
     writer
-        .admit_flush(parsed, landed, PushHeaders::default())
+        .admit_flush(landed, PushHeaders::default())
         .expect("queue has room")
         .await
-        .expect("the old path commits");
+        .expect("the push commits");
     settle_until("the landing insert to commit", || {
-        writer.landing_metrics().landing.flushes_total == 1
+        writer.metrics().landing.flushes_total == 1
     })
     .await;
     writer.shutdown(Duration::from_secs(10)).await;
@@ -1902,9 +2134,8 @@ async fn no_landing_insert_reaches_the_asynchronous_queue() {
 // behind `PULSUS_TEST_CLICKHOUSE=1`, like
 // `no_landing_insert_reaches_the_asynchronous_queue` above.
 //
-// **None of these fetches through a route.** Part 1 of issue #587 changes no
-// API response: every route still answers from `trace_spans` and
-// `trace_attrs_idx`. So every assertion is on what the tables hold.
+// **None of these fetches through a route.** Every assertion is on what the
+// tables hold.
 
 use futures::StreamExt as _;
 use opentelemetry_proto::tonic::common::v1::EntityRef;
@@ -1958,11 +2189,10 @@ fn live_config() -> ChConnConfig {
 }
 
 /// A fresh database with the whole schema in it, **with merges stopped on
-/// the six write-path tables**, and a client bound to it.
+/// the four write-path tables**, and a client bound to it.
 ///
 /// **The merges are stopped because every fixture below is at a fixed past
-/// instant, and `spans`, `traces`, `resources` and `trace_spans` all carry
-/// a delete TTL of `retention_days = 7`.** Measured on this engine: a part
+/// instant, and `spans`, `traces` and `resources` all carry a delete TTL of `retention_days = 7`.** Measured on this engine: a part
 /// holding one span at `start_ns = 1` and one at `1700000000000000000` is
 /// reported with `rows = 0` within two seconds of the insert, because
 /// `ttl_only_drop_parts = 1` drops a wholly-expired part as a background
@@ -1993,13 +2223,7 @@ async fn live_db(db: String) -> (ChClient, String) {
         .expect("drop the test database");
     let ctx: SchemaParams = RenderCtx::for_tests(&db);
     run_init(&admin, &ctx).await.expect("run_init");
-    for table in [
-        "spans",
-        "traces",
-        "resources",
-        "trace_landing",
-        "trace_spans",
-    ] {
+    for table in ["spans", "traces", "resources", "trace_landing"] {
         admin
             .execute(
                 &format!("SYSTEM STOP MERGES {db}.{table}"),
@@ -2089,16 +2313,15 @@ fn wall_ms() -> i64 {
     .expect("a representable instant")
 }
 
-/// Decodes `req` with the landing decoder at the receipt clock `now_ns` and
-/// inserts every row it produces into `trace_landing` through the
-/// production client, in **one** block — one push is one insert.
+/// Decodes `req` with the landing decoder and inserts every row it produces
+/// into `trace_landing` through the production client, in **one** block —
+/// one push is one insert.
 async fn land_live(
     client: &ChClient,
     req: &ExportTraceServiceRequest,
-    now_ns: i64,
     settings: &QuerySettings,
 ) -> ParsedTraceLanding {
-    let parsed = pulsus_write::parse_trace_landing(req, now_ns).expect("the landing decode");
+    let parsed = pulsus_write::parse_trace_landing(req).expect("the landing decode");
     client
         .insert_block_with(LANDING, &landing_rows(&parsed, wall_ms()), settings)
         .await
@@ -2217,7 +2440,7 @@ async fn w4_a_service_name_that_is_not_a_non_empty_string_round_trips() {
             ),
         ],
     };
-    land_live(&client, &req, FIXED_NS, &live_landing_settings()).await;
+    land_live(&client, &req, &live_landing_settings()).await;
 
     // Three identities, three rows — §7.0c's derivation, not the fixture's
     // own count.
@@ -2341,11 +2564,8 @@ async fn w4_a_service_name_that_is_not_a_non_empty_string_round_trips() {
 /// — a byte stores it either way — and `-1` and `300` are what
 /// discriminate.
 ///
-/// **The rejection half is asserted on the landing decode's own count, not
-/// on the route's response body.** §3.4 establishes that the route's
-/// `rejected` figure stays `parse`'s own, so a rejection added in
-/// `parse_landing` would not reach the body at all — the body cannot see
-/// the thing this half exists to rule out, and `ParsedTraceLanding` can.
+/// **The rejection half is asserted on the landing decode's own count**,
+/// which is the figure the route's partial-success body reports.
 #[tokio::test]
 async fn w5_a_kind_outside_a_byte_and_an_off_length_link_id_are_stored_as_sent() {
     skip_unless_live!();
@@ -2373,7 +2593,6 @@ async fn w5_a_kind_outside_a_byte_and_an_off_length_link_id_are_stored_as_sent()
     let parsed = land_live(
         &client,
         &request_with_resource_spans(spans),
-        FIXED_NS,
         &live_landing_settings(),
     )
     .await;
@@ -2495,7 +2714,7 @@ async fn w6_the_entity_references_are_stored_in_their_own_carrier_and_in_the_ide
             ),
         ],
     };
-    land_live(&client, &req, FIXED_NS, &live_landing_settings()).await;
+    land_live(&client, &req, &live_landing_settings()).await;
 
     assert_eq!(
         live_count(&client, "SELECT count() AS n FROM resources FINAL").await,
@@ -2597,7 +2816,6 @@ async fn w8_a_spans_own_end_is_verbatim_and_the_per_trace_end_saturates() {
     land_live(
         &client,
         &request_with_resource_spans(spans),
-        FIXED_NS,
         &live_landing_settings(),
     )
     .await;
@@ -2696,7 +2914,7 @@ async fn w10_five_resources_differing_only_in_two_fields_are_five_rows() {
             })
             .collect(),
     };
-    land_live(&client, &req, FIXED_NS, &live_landing_settings()).await;
+    land_live(&client, &req, &live_landing_settings()).await;
 
     assert_eq!(
         live_count(&client, "SELECT count() AS n FROM resources FINAL").await,
@@ -2741,8 +2959,7 @@ async fn w10_five_resources_differing_only_in_two_fields_are_five_rows() {
 
 /// **W-11 (issue #587 row 10, §4.1 and §0.1d).** A span whose
 /// `start_time_unix_nano` is zero is stored **as zero** — the sender's own
-/// instant, in the sender's own partition — while the old path keeps its
-/// receipt-time substitution.
+/// instant, in the sender's own partition.
 ///
 /// **The case runs under two session timezones and asserts the same values
 /// in both**, which is the only way the partition half can hold anything:
@@ -2783,9 +3000,6 @@ async fn w11_a_zero_start_is_stored_as_zero_in_a_utc_dated_partition() {
     ] {
         let (client, db) = live_db(name).await;
 
-        // The receipt clock, set far from zero, so a substitution is
-        // visible as a value and not merely as a different partition.
-        let receipt_ns = FIXED_NS + 86_400_000_000_000;
         let spans = vec![
             Span {
                 start_time_unix_nano: 0,
@@ -2800,16 +3014,7 @@ async fn w11_a_zero_start_is_stored_as_zero_in_a_utc_dated_partition() {
         if let Some(zone) = session {
             settings = settings.set("session_timezone", zone);
         }
-        land_live(&client, &req, receipt_ns, &settings).await;
-
-        // The old path, beside it: its own substitution is KEPT, which is
-        // §3.8's deliberate asymmetry.
-        let old = pulsus_write::parse_traces(&req, receipt_ns).expect("the old path's decode");
-        let old_rows: Vec<TraceSpanRow> = old.spans.iter().map(TraceSpanRow::from).collect();
-        client
-            .insert_block_with(SPANS, &old_rows, &QuerySettings::new())
-            .await
-            .expect("the old path's insert");
+        land_live(&client, &req, &settings).await;
 
         assert_eq!(
             live_scalar(
@@ -2888,21 +3093,6 @@ async fn w11_a_zero_start_is_stored_as_zero_in_a_utc_dated_partition() {
             "{leg}: the ordinary span is untouched"
         );
 
-        // And the OLD path keeps its substitution — §3.8's asymmetry. No
-        // equivalence between the two stores is claimed, required or
-        // tested; this asserts the old table's own expected value.
-        assert_eq!(
-            live_scalar(
-                &client,
-                "SELECT toString(timestamp_ns) AS s FROM trace_spans \
-                 WHERE span_id = unhex('0101010101010101')"
-            )
-            .await,
-            receipt_ns.to_string(),
-            "{leg}: the OLD path still substitutes the receipt time, and this \
-             change deletes only the landing path's substitution"
-        );
-
         drop_live_db(&db).await;
     }
 }
@@ -2939,7 +3129,6 @@ async fn w12_an_event_time_above_the_signed_maximum_is_stored_unsaturated() {
     land_live(
         &client,
         &request_with_resource_spans(vec![span]),
-        FIXED_NS,
         &live_landing_settings(),
     )
     .await;
@@ -2992,7 +3181,6 @@ async fn w13_a_status_code_outside_a_byte_is_stored_as_the_signed_value_sent() {
     land_live(
         &client,
         &request_with_resource_spans(spans),
-        FIXED_NS,
         &live_landing_settings(),
     )
     .await;
@@ -3075,7 +3263,6 @@ async fn w17_the_stored_bucket_set_is_the_traces_own_distinct_span_buckets() {
             },
             span_at(0xcb, 0x02, FIXED_NS, Vec::new()),
         ]),
-        FIXED_NS,
         &live_landing_settings(),
     )
     .await;
@@ -3083,7 +3270,6 @@ async fn w17_the_stored_bucket_set_is_the_traces_own_distinct_span_buckets() {
     land_live(
         &client,
         &request_with_resource_spans(vec![span_at(0xcb, 0x03, FIXED_NS, Vec::new())]),
-        FIXED_NS,
         &live_landing_settings(),
     )
     .await;
@@ -3096,7 +3282,6 @@ async fn w17_the_stored_bucket_set_is_the_traces_own_distinct_span_buckets() {
             FIXED_NS + 300_000_000_000,
             Vec::new(),
         )]),
-        FIXED_NS,
         &live_landing_settings(),
     )
     .await;
@@ -3189,7 +3374,6 @@ async fn w17_the_stored_bucket_set_is_the_traces_own_distinct_span_buckets() {
     land_live(
         &client,
         &request_with_resource_spans(spans),
-        FIXED_NS,
         &live_landing_settings(),
     )
     .await;
@@ -3216,11 +3400,11 @@ async fn w17_the_stored_bucket_set_is_the_traces_own_distinct_span_buckets() {
 async fn a_trace_block_queued_when_the_drain_begins_is_sent_inside_the_grace() {
     let root = spool_root("queued-at-drain");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let (writer, _spans, _attrs) = writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
 
-    let (parsed, landed) = decode_both(&six_spans());
+    let landed = decode(&six_spans());
     writer
-        .admit(parsed, landed, PushHeaders::default())
+        .admit(landed, PushHeaders::default())
         .expect("queue has room");
     writer.shutdown(Duration::from_secs(10)).await;
 
@@ -3230,4 +3414,82 @@ async fn a_trace_block_queued_when_the_drain_begins_is_sent_inside_the_grace() {
         .unwrap_or(0);
     assert_eq!(spooled, 0, "nothing is filed as never sent");
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// **A retry after a server-declared failure is stored once the fault
+/// clears** (issue #602), on one node. A view that throws fails the landing
+/// insert after the block was sent — an uncertain ending — and may leave
+/// some targets committed and others empty. The trace claim is
+/// replay-safe, so the same push sent again in the same process is a new
+/// block, and once the throwing view is gone every target holds the push.
+#[tokio::test]
+async fn a_retry_after_a_throwing_view_is_stored_once_the_fault_clears() {
+    skip_unless_live!();
+    let (client, db) = live_db(pulsus_testkit::test_db(
+        "pulsus_trace_landing_it_retry_throw",
+    ))
+    .await;
+    for sql in [
+        "CREATE TABLE zz_fault (x UInt8) ENGINE = MergeTree ORDER BY x",
+        "CREATE MATERIALIZED VIEW zz_fault_mv TO zz_fault AS \
+         SELECT throwIf(row_kind = 0, 'injected fault') AS x FROM trace_landing",
+    ] {
+        client
+            .execute(sql, &QuerySettings::new(), Idempotency::NonIdempotent)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let writer_client = Arc::new(
+        ChClient::new(ChConnConfig {
+            database: db.clone(),
+            ..live_config()
+        })
+        .await
+        .expect("connect the writer"),
+    );
+    let cfg = WriterConfig {
+        trace_landing_retries: 0,
+        ..Default::default()
+    };
+    let writer =
+        TraceWriter::new_with_tables(writer_client, &cfg, TraceWriterTables::traces_default());
+    let req = six_spans();
+
+    let first = writer
+        .admit_flush(decode(&req), PushHeaders::default())
+        .expect("admitted")
+        .await;
+    assert!(
+        first.is_err(),
+        "the throwing view fails the push: {first:?}"
+    );
+
+    client
+        .execute(
+            "DROP VIEW zz_fault_mv",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("clear the fault");
+    let second = writer
+        .admit_flush(decode(&req), PushHeaders::default())
+        .expect("the retry is admitted, not suppressed")
+        .await;
+    assert!(
+        second.is_ok(),
+        "the retry commits once the fault is gone: {second:?}"
+    );
+
+    assert_eq!(
+        live_count(&client, "SELECT count() AS n FROM spans FINAL").await,
+        6
+    );
+    assert_eq!(
+        live_count(&client, "SELECT count() AS n FROM traces FINAL").await,
+        1
+    );
+    assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 0);
+    writer.shutdown(Duration::from_secs(5)).await;
+    drop_live_db(&db).await;
 }

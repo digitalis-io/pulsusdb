@@ -4,8 +4,8 @@
 //! **One corpus, two ingests, identical bytes.** The OTLP/JSON body is
 //! built ONCE. Those exact bytes are pushed to the reference's OTLP
 //! receiver and decoded by OUR OWN ingest parser
-//! (`pulsus_write::protocols::otlp_traces::decode_json` +
-//! `parse_traces`) into the real trace writer, so neither side gets a
+//! (`pulsus_write::protocols::otlp_traces::decode_json` + the landing
+//! decode) into `trace_landing`, so neither side gets a
 //! payload hand-written for it. A differential whose two sides are
 //! written separately compares two authors, not two systems.
 //!
@@ -108,13 +108,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
-use pulsus_config::WriterConfig;
 use pulsus_read::{SearchParams, StatementTables, plan_search_request};
 use pulsus_read::{TraceEngine, TraceReadConfig};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
-use pulsus_write::writer::{ChBlockInserter, TraceWriter, TraceWriterTables};
-use pulsus_write::{ParsedTraceLanding, PushHeaders, TraceSink};
 
 mod projection_cases;
 
@@ -1065,40 +1062,20 @@ async fn traces_search_projection_differential() {
     // The reference first, so it has the whole poll window to index.
     otlp_push(&otlp_base, &body);
 
-    // Our side: the SAME bytes through our own ingest parser and the real
-    // trace writer.
+    // Our side: the SAME bytes through our own ingest decode into
+    // `trace_landing`.
     let bootstrap = ChClient::new(ch_config("default"))
         .await
         .expect("connect bootstrap");
     let db = &pulsus_testkit::test_db("pulsus_projdiff_it");
     init_db(&bootstrap, db).await;
     let client = Arc::new(ChClient::new(ch_config(db)).await.expect("connect db"));
-    let mut cfg = WriterConfig::default();
-    cfg.batch_bytes.0 = 1;
-    let writer = TraceWriter::with_inserters_with_tables(
-        Arc::new(ChBlockInserter::new(client.clone())),
-        Arc::new(ChBlockInserter::new(client.clone())),
-        Arc::new(ChBlockInserter::new(client.clone())),
-        &cfg,
-        TraceWriterTables::traces_default(),
-    );
     let req = pulsus_write::protocols::otlp_traces::decode_json(&body)
         .expect("our own ingest decodes the same body the reference got");
-    let parsed =
-        pulsus_write::parse_traces(&req, base).expect("our own ingest parses the same body");
-    assert_eq!(parsed.spans.len(), 4, "the corpus is four spans");
-    let wait = writer
-        .admit_flush(
-            parsed,
-            ParsedTraceLanding::default(),
-            PushHeaders::default(),
-        )
-        .expect("queue has room");
-    tokio::time::timeout(Duration::from_secs(20), wait)
-        .await
-        .expect("flush settles")
-        .expect("the corpus commits");
-    land_new_store(&client, &req, base, &format!("projdiff-{}", now_ns())).await;
+    let landing =
+        pulsus_write::parse_trace_landing(&req).expect("our own ingest decodes the same body");
+    assert_eq!(landing.spans.len(), 4, "the corpus is four spans");
+    land(&client, &req, base, &format!("projdiff-{}", now_ns())).await;
 
     let engine = TraceEngine::new(
         ChClient::new(ch_config(db)).await.expect("connect engine"),
@@ -1216,7 +1193,6 @@ async fn traces_search_projection_differential() {
         "{empty_q}: we must return no spans"
     );
 
-    writer.shutdown(Duration::from_secs(5)).await;
     exec(&bootstrap, &format!("DROP DATABASE IF EXISTS {db}")).await;
 
     assert!(
@@ -1226,16 +1202,14 @@ async fn traces_search_projection_differential() {
 }
 
 /// Lands `req` in the span, per-trace and resource tables through
-/// `trace_landing`, as `traces_query_v2_live.rs`'s `land` does: the trace
-/// writer above writes only the previous engine's store, and the search
-/// route reads this one (issue #602 part 2c-1).
-async fn land_new_store(
+/// `trace_landing`, as `traces_query_v2_live.rs`'s `land` does.
+async fn land(
     client: &ChClient,
     req: &opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
     received_ns: i64,
     token: &str,
 ) {
-    let parsed = pulsus_write::parse_trace_landing(req, received_ns).expect("the landing decode");
+    let parsed = pulsus_write::parse_trace_landing(req).expect("the landing decode");
     let received_ms = received_ns / 1_000_000;
     let mut rows: Vec<pulsus_write::TraceLandingRow> =
         Vec::with_capacity(parsed.total_rows() as usize);

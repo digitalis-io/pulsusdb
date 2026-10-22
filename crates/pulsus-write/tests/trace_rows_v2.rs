@@ -358,7 +358,7 @@ async fn try_land(
     client: &ChClient,
     req: &ExportTraceServiceRequest,
 ) -> Result<ParsedTraceLanding, ChError> {
-    let parsed = parse_trace_landing(req, now_ns()).expect("the landing decode");
+    let parsed = parse_trace_landing(req).expect("the landing decode");
     let received_ms = now_ms();
     let mut rows: Vec<TraceLandingRow> = Vec::with_capacity(parsed.total_rows() as usize);
     rows.extend(

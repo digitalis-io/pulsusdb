@@ -167,7 +167,7 @@ fn ensure_kvs_depth(kvs: &[KeyValue]) -> Result<(), LogsIngestError> {
 
 /// Whole-request `AnyValue` depth guard for `ExportTraceServiceRequest`:
 /// resource / scope / span attributes plus every span event and link
-/// attribute set. Invoked at the top of `otlp_traces::parse`.
+/// attribute set. Invoked at the top of `otlp_traces::parse_landing`.
 pub fn ensure_trace_anyvalue_depth(req: &ExportTraceServiceRequest) -> Result<(), LogsIngestError> {
     for resource_spans in &req.resource_spans {
         if let Some(resource) = resource_spans.resource.as_ref() {

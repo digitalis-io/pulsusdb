@@ -2,49 +2,18 @@
 //! ingest seam. This module root holds what they share.
 //!
 //! **One push is one `INSERT` of one block into one landing table** for logs
-//! (`writer::log`, issue #603) and for metrics (`writer::metric`), with
-//! materialized views maintaining the tables queries read. `writer::landing`
-//! is the block, the insert loop, the audit copy and the one release point
-//! both use. Traces (`writer::trace`) still batch per table through
-//! `writer::buffer` and `writer::table`.
-//!
-//! **Registration backfill** (issue #139): a registration flush that fails
-//! *definitely* (`Poisoned` — provably not-committed) enqueues its rows into a
-//! bounded in-memory backlog (`writer::backfill`) that a dedicated task
-//! re-inserts every `WriterRuntime::backfill_retry_interval` (5s) until
-//! confirmed, capped at `backfill_max_bytes` (32 MiB) — so a "spans committed,
-//! registration lost" orphan self-heals while the process lives. **One
-//! backlog is left**, `trace_attrs_idx`'s. Neither landing path has one
-//! (issue #603): a registration row rides the events' own block and the
-//! registration cache is promoted only when that block commits, so a push
-//! whose insert failed emits its registration rows again next time rather than
-//! leaving an orphan to heal. Its residuals, which apply to the one remaining
-//! backlog:
-//! - R1: an uncertain-fate registration whose spans committed is not healed;
-//!   an `uncertain/` audit record exists iff that batch's spool write
-//!   succeeded (audit-only per #9, never replayed).
-//! - R2: a backfill re-insert returning `InsertUncertain` is terminally
-//!   abandoned (counted + warn-logged) — same residual class as R1.
-//! - R3: the backlog is memory-only — an orphan persists across a crash only
-//!   if the attribute also never arrives again in that window.
-//! - R4: byte-cap drops under sustained failure are counted
-//!   (`backfill_dropped_total`); a poison-spool record for the dropped batch
-//!   exists iff that batch's spool write succeeded.
-//! - R5: on spool-write failure there is no durable record — the in-memory
-//!   backlog is the only (best-effort) remedy; surfaced via the error log +
-//!   `spool_write_failures_total`.
-//! - R4∧R5 compound: a byte-cap-dropped entry whose generation's spool write
-//!   also failed is lost entirely (counters + logs are the sole evidence) —
-//!   acknowledged-lost by design, never claimed healed.
+//! (`writer::log`, issue #603), for metrics (`writer::metric`) and for traces
+//! (`writer::trace`, issue #602), with materialized views maintaining the
+//! tables queries read. `writer::landing` is the block, the insert loop, the
+//! audit copy and the one release point all three use. A registration row
+//! rides the events' own block, so a push whose insert failed emits its
+//! registration rows again next time rather than leaving an orphan to heal.
 //!
 //! **Backpressure**: `queued_bytes` is reserved atomically at admission
 //! ([`reserve_queued_bytes`] — `fetch_add` first, roll back on overflow) and
-//! released exactly once. On either landing path that release is
-//! `writer::landing`'s `LandingBlock::release`, which owns the order; on the
-//! traces path it is `writer::table`'s settle path.
+//! released exactly once, by `writer::landing`'s `LandingBlock::release`,
+//! which owns the order.
 
-mod backfill;
-mod buffer;
 mod config;
 mod drain;
 mod error;
@@ -73,9 +42,8 @@ pub use landing::{landing_block_overhead_bytes, landing_charge};
 pub use log::{LogWriter, WriterTables};
 pub use metric::{MetricWriter, MetricWriterTables};
 pub use metrics::{
-    BackfillMetricsSnapshot, MetricWriterMetrics, MetricWriterMetricsSnapshot,
-    TableMetricsSnapshot, TraceLandingSnapshot, TraceWriterMetrics, TraceWriterMetricsSnapshot,
-    WriterMetrics, WriterMetricsSnapshot,
+    MetricWriterMetrics, MetricWriterMetricsSnapshot, TableMetricsSnapshot, TraceWriterMetrics,
+    TraceWriterMetricsSnapshot, WriterMetrics, WriterMetricsSnapshot,
 };
 pub use push_dedup::{
     Admission, Capacities, ClaimGuard, ClaimOutcome, DedupMetrics, DedupMetricsSnapshot, PushDedup,
@@ -86,8 +54,8 @@ pub use registration::{SeriesLru, StreamLru};
 pub use rows::{
     LANDING_ROW_SLOT_BYTES, LOG_LANDING_ROW_SLOT_BYTES, LogLandingRow, LogPatternRow, LogSampleRow,
     LogStreamRow, MetricHistSampleRow, MetricLandingRow, MetricMetadataRow, MetricSampleRow,
-    MetricSeriesRow, TRACE_LANDING_ROW_SLOT_BYTES, TraceAttrRow, TraceEventTuple, TraceLandingRow,
-    TraceLinkTuple, TraceSpanRow,
+    MetricSeriesRow, TRACE_LANDING_ROW_SLOT_BYTES, TraceEventTuple, TraceLandingRow,
+    TraceLinkTuple,
 };
 pub use spool::SPOOL_CHUNK_BYTES;
 pub use table::{BlockInserter, ChBlockInserter};

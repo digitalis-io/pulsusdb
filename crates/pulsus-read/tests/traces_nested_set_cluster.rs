@@ -181,7 +181,7 @@ fn bodies(base: i64) -> Vec<ExportTraceServiceRequest> {
 }
 
 async fn land(client: &ChClient, req: &ExportTraceServiceRequest, token: &str) {
-    let parsed = parse_trace_landing(req, now_ns()).expect("the landing decode");
+    let parsed = parse_trace_landing(req).expect("the landing decode");
     let received_ms = now_ns() / 1_000_000;
     let mut rows: Vec<TraceLandingRow> = Vec::new();
     rows.extend(
@@ -3610,14 +3610,9 @@ async fn node_writer(config: ChConnConfig) -> pulsus_write::writer::TraceWriter 
     use pulsus_write::writer::{ChBlockInserter, TraceWriter, TraceWriterTables};
     use std::sync::Arc;
     let client = Arc::new(ChClient::new(config).await.expect("connect the writer"));
-    // The product's defaults: a push of 1,000 spans is larger than a
-    // one-byte batch, which the writer refuses.
-    let cfg = pulsus_config::WriterConfig::default();
     TraceWriter::with_inserters_with_tables(
-        Arc::new(ChBlockInserter::new(client.clone())),
-        Arc::new(ChBlockInserter::new(client.clone())),
-        Arc::new(ChBlockInserter::new(client.clone())),
-        &cfg,
+        Arc::new(ChBlockInserter::new(client)),
+        &pulsus_config::WriterConfig::default(),
         TraceWriterTables::traces_default(),
     )
 }
@@ -3684,7 +3679,12 @@ async fn the_job_keeps_up_under_steady_ingest() {
     }
     assert!(watched.len() >= 3, "LV1: three intervals: {watched:?}");
 
-    // The load: one writer per node, 10 pushes a second together.
+    // The load: one writer per node, 5 pushes a second together, each of
+    // 1,000 spans. Twice that rate was more than a four-core CI runner's
+    // three-node cluster could replicate: its replication queues passed the
+    // job's 1,000-entry hold and the sync answers queued past 60 s (issue
+    // #602 part 3b-1). At this rate the run still keeps the queues busy
+    // enough to hold the job if its catch-up rule is removed.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let failures = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let first_failure = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
@@ -3698,7 +3698,10 @@ async fn the_job_keeps_up_under_steady_ingest() {
         let failures = failures.clone();
         let first_failure = first_failure.clone();
         tasks.push(tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(300));
+            // Each answered push's admit-to-answer time, in ms; a push not
+            // answered within 60 s is recorded as 60,000.
+            let answer_ms = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+            let mut tick = tokio::time::interval(Duration::from_millis(600));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut seq = k as u64;
             let mut waits = Vec::new();
@@ -3706,21 +3709,25 @@ async fn the_job_keeps_up_under_steady_ingest() {
                 tick.tick().await;
                 let req = load_push(seq, 500);
                 seq += 3;
-                let parsed =
-                    pulsus_write::parse_traces(&req, now_ns()).expect("the old path parses");
-                let landing =
-                    pulsus_write::parse_trace_landing(&req, now_ns()).expect("the landing decode");
-                match writer.admit_flush(parsed, landing, PushHeaders::default()) {
+                let landing = pulsus_write::parse_trace_landing(&req).expect("the landing decode");
+                let admitted_at = std::time::Instant::now();
+                match writer.admit_flush(landing, PushHeaders::default()) {
                     Ok(wait) => {
                         let failures = failures.clone();
                         let first_failure = first_failure.clone();
+                        let answer_ms = answer_ms.clone();
                         waits.push(tokio::spawn(async move {
-                            let failed =
-                                match tokio::time::timeout(Duration::from_secs(60), wait).await {
-                                    Ok(Ok(())) => None,
-                                    Ok(Err(e)) => Some(e.to_string()),
-                                    Err(_) => Some("no answer within 60 s".to_string()),
-                                };
+                            let answered =
+                                tokio::time::timeout(Duration::from_secs(60), wait).await;
+                            answer_ms
+                                .lock()
+                                .expect("the lock")
+                                .push(admitted_at.elapsed().as_millis().min(60_000) as u64);
+                            let failed = match answered {
+                                Ok(Ok(())) => None,
+                                Ok(Err(e)) => Some(e.to_string()),
+                                Err(_) => Some("no answer within 60 s".to_string()),
+                            };
                             if let Some(e) = failed {
                                 failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 first_failure.lock().expect("the lock").get_or_insert(e);
@@ -3740,6 +3747,17 @@ async fn the_job_keeps_up_under_steady_ingest() {
                 w.await.expect("a push's wait");
             }
             writer.shutdown(Duration::from_secs(30)).await;
+            let mut ms = answer_ms.lock().expect("the lock").clone();
+            ms.sort_unstable();
+            let at = |q: f64| ms.get(((ms.len().max(1) - 1) as f64 * q) as usize).copied();
+            let line = format!(
+                "writer {k}: {} answers, p50 {:?} ms, p99 {:?} ms, max {:?} ms",
+                ms.len(),
+                at(0.5),
+                at(0.99),
+                ms.last()
+            );
+            (k, line, at(0.99))
         }));
     }
 
@@ -3805,8 +3823,11 @@ async fn the_job_keeps_up_under_steady_ingest() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut p99s = Vec::new();
     for t in tasks {
-        t.await.expect("a writer task");
+        let (k, latency, p99) = t.await.expect("a writer task");
+        println!("LV1 answer latency, {latency}");
+        p99s.push((k, p99));
     }
     println!("LV1 queue samples (s since start, spans/service_edges per node):");
     for s in &queue_samples {
@@ -3820,6 +3841,14 @@ async fn the_job_keeps_up_under_steady_ingest() {
         "LV1: every push was stored; the first failure: {:?}",
         first_failure.lock().expect("the lock")
     );
+    // The OTLP exporter's own default timeout is 10 s: a sync answer slower
+    // than that is a client retry, whatever the 60 s check above allows.
+    for (k, p99) in &p99s {
+        assert!(
+            p99.is_some_and(|ms| ms <= 10_000),
+            "LV1: writer {k}'s answer p99 is within 10 s: {p99:?} ms"
+        );
+    }
     for ((b, _), shards) in watched.iter().zip(&covered) {
         for (shard, after) in shards.iter().enumerate() {
             assert!(
@@ -5310,4 +5339,92 @@ async fn the_resource_catalogue_answers_over_two_shards() {
     )
     .await;
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// **A retry after a server-declared failure is stored once the fault
+/// clears, on the cluster** (issue #602). The landing insert goes to shard 1
+/// under its bare name; a view there throws, so the insert fails after the
+/// block was sent. The trace claim is replay-safe, so the same push sent
+/// again through the same writer is a new block, and once the view is gone
+/// every span and trace is readable through the distributed tables.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_after_a_throwing_view_is_stored_once_the_fault_clears_on_the_cluster() {
+    use pulsus_write::{PushHeaders, TraceSink};
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_retry_throw_{}", now_ns()));
+    let bootstrap = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect shard1");
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    run_init(&bootstrap, &cluster_ctx(&db))
+        .await
+        .expect("run_init");
+    let s1 = ChClient::new(shard1_config(&db))
+        .await
+        .expect("connect shard1");
+    exec(
+        &s1,
+        "CREATE TABLE zz_fault (x UInt8) ENGINE = MergeTree ORDER BY x",
+    )
+    .await;
+    exec(
+        &s1,
+        "CREATE MATERIALIZED VIEW zz_fault_mv TO zz_fault AS \
+         SELECT throwIf(row_kind = 0, 'injected fault') AS x FROM trace_landing",
+    )
+    .await;
+
+    let writer = node_writer(shard1_config(&db)).await;
+    let req = load_push(0, 3);
+    let landing = || pulsus_write::parse_trace_landing(&req).expect("the landing decode");
+    let first = writer
+        .admit_flush(landing(), PushHeaders::default())
+        .expect("admitted")
+        .await;
+    assert!(
+        first.is_err(),
+        "the throwing view fails the push: {first:?}"
+    );
+
+    exec(&s1, "DROP VIEW zz_fault_mv").await;
+    let second = writer
+        .admit_flush(landing(), PushHeaders::default())
+        .expect("the retry is admitted, not suppressed")
+        .await;
+    assert!(
+        second.is_ok(),
+        "the retry commits once the fault is gone: {second:?}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let spans = count(
+            &s1,
+            "SELECT count() AS n FROM (SELECT DISTINCT trace_id, span_id, kind FROM spans_dist)",
+        )
+        .await;
+        let traces = count(
+            &s1,
+            "SELECT count() AS n FROM (SELECT DISTINCT trace_id FROM traces_dist)",
+        )
+        .await;
+        if (spans, traces) == (6, 3) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the retried push is readable: {spans} spans, {traces} traces"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    writer.shutdown(Duration::from_secs(5)).await;
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
 }

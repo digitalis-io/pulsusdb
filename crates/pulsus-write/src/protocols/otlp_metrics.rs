@@ -97,8 +97,7 @@ pub const MAX_EXPANDED_BYTES: usize = 4 * crate::ingest::decompress::MAX_DECOMPR
 /// Estimated fixed heap cost of one emitted sample beyond its label bytes:
 /// the `MetricPoint` fixed columns (`metric_name` `Arc<str>` + fingerprint +
 /// `unix_milli` + `value`) plus the optional per-distinct-series `SeriesRef`
-/// containers, floored to a round constant (mirrors
-/// `otlp_traces::ATTR_ROW_OVERHEAD`'s per-row floor).
+/// containers, floored to a round constant.
 const SAMPLE_ROW_OVERHEAD: usize = 64;
 
 /// A descriptor as the within-request metadata dedup keys it (issue #500):

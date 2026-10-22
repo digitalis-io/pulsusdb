@@ -352,8 +352,8 @@ fn span(
 
 /// Seeds `spans` through `POST /v1/traces` with the given resource attrs
 /// (always including `service.name=checkout` unless overridden). A `200`
-/// means the old path's tables hold the rows; the helper then waits for
-/// them in the landing-fed tables ([`live_db::settle_pushed_spans`]).
+/// means the landing insert committed; the helper then waits for the rows
+/// in the landing-fed tables ([`live_db::settle_pushed_spans`]).
 fn ingest(port: u16, spans: Vec<Span>, resource_attrs: Vec<KeyValue>, ctx: &str) {
     let req = ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
@@ -3130,8 +3130,6 @@ async fn a_repeated_attribute_key_resolves_to_one_element_value_and_kind() {
         "k-R-and-S",
     );
 
-    pulsus_testkit::assert_stores_agree(db);
-
     // ---- criterion 1 ---------------------------------------------------
     let ctx = "dup-select";
     let res = search(port, r#"{ } | select(span.dup)"#, w0, w1, "", ctx);
@@ -3272,8 +3270,6 @@ async fn an_unscoped_value_read_skips_the_reserved_intrinsic_scopes() {
     }];
     ingest(port, vec![s], checkout_resource(), "only-an-event");
 
-    pulsus_testkit::assert_stores_agree(db);
-
     let ctx = "unscoped-name-value";
     let res = search(port, r#"{ } | select(.name)"#, w0, w1, "", ctx);
     assert_eq!(res.status, 200, "{ctx}");
@@ -3350,8 +3346,6 @@ async fn a_mixed_projection_reads_every_field_from_its_own_element() {
         vec![kv_str("service.name", "checkout"), kv_str("c", "R")],
         "mixed",
     );
-
-    pulsus_testkit::assert_stores_agree(db);
 
     let ctx = "mixed-projection";
     let q = r#"{ } | select(span.a) | select(.c) | avg(span.b) > 1 | avg(span.d) > 1"#;
@@ -4065,236 +4059,6 @@ async fn the_empty_search_and_the_error_field_answer() {
         wrong.len(),
         wrong.join("\n")
     );
-}
-
-/// T17's OTLP body: 20 traces `…a0`–`…b3`, 3 spans each at `base + t s +
-/// j·10 ms`; span `j = 0` of every trace with `t % 5 == 0` is an error.
-/// `base` is bucket-aligned so no trace's 20 ms straddles a recency
-/// bucket edge, which would give that trace a second row.
-fn replay_body(base_s: i64) -> Vec<Span> {
-    let mut spans = Vec::new();
-    for t in 0..20u8 {
-        for j in 0..3u8 {
-            let start = ts_ns(base_s, i64::from(t) * NS + i64::from(j) * 10_000_000);
-            let code = if j == 0 && t % 5 == 0 { 2 } else { 0 };
-            spans.push(status_span(0xa0 + t, j + 1, start, code));
-        }
-    }
-    spans
-}
-
-fn replay_resource() -> Vec<KeyValue> {
-    vec![kv_str("service.name", "svc")]
-}
-
-#[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
-struct NameRow560 {
-    name: String,
-}
-
-#[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
-struct CountRow560 {
-    n: u64,
-}
-
-#[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
-struct SettingRow560 {
-    v: String,
-}
-
-async fn count_of(admin: &pulsus_clickhouse::ChClient, sql: &str) -> u64 {
-    use futures::StreamExt;
-    let mut stream = admin
-        .query_stream::<CountRow560>(sql, &pulsus_clickhouse::QuerySettings::new())
-        .await
-        .unwrap_or_else(|e| panic!("count failed: {e}\nSQL:\n{sql}"));
-    stream.next().await.expect("a row").expect("decode").n
-}
-
-async fn admin_exec(admin: &pulsus_clickhouse::ChClient, sql: &str) {
-    admin
-        .execute(
-            sql,
-            &pulsus_clickhouse::QuerySettings::new(),
-            pulsus_clickhouse::Idempotency::Idempotent,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("execute failed: {e}\nSQL:\n{sql}"));
-}
-
-/// Both derived tables exist in `db`, then merges on both are stopped so
-/// no merge can lower a physical count between readings.
-async fn prepare_derived_tables(admin: &pulsus_clickhouse::ChClient, db: &str) {
-    use futures::StreamExt;
-    let sql = format!("SELECT name FROM system.tables WHERE database = '{db}'");
-    let mut stream = admin
-        .query_stream::<NameRow560>(&sql, &pulsus_clickhouse::QuerySettings::new())
-        .await
-        .expect("query system.tables");
-    let mut names = BTreeSet::new();
-    while let Some(row) = stream.next().await {
-        names.insert(row.expect("decode").name);
-    }
-    drop(stream);
-    let missing: Vec<&str> = ["trace_recent", "trace_error_spans"]
-        .into_iter()
-        .filter(|t| !names.contains(*t))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "{db} lacks the derived trace tables: {missing:?}"
-    );
-    for table in ["trace_recent", "trace_error_spans"] {
-        admin_exec(admin, &format!("SYSTEM STOP MERGES {db}.{table}")).await;
-    }
-}
-
-/// Posts T17's body three times and returns every mismatch against 20
-/// recency rows, 4 error rows and the same 20 `{}` trace ids after each.
-async fn post_three_times(
-    port: u16,
-    admin: &pulsus_clickhouse::ChClient,
-    db: &str,
-    label: &str,
-) -> Vec<String> {
-    let base = recency_base_s();
-    let want: BTreeSet<String> = (0..20u8).map(|t| hex(&tid(0xa0 + t))).collect();
-    let mut wrong = Vec::new();
-    for post in 1..=3 {
-        ingest(port, replay_body(base), replay_resource(), label);
-        let spans = count_of(admin, &format!("SELECT count() AS n FROM {db}.trace_spans")).await;
-        let recent = count_of(
-            admin,
-            &format!("SELECT count() AS n FROM {db}.trace_recent"),
-        )
-        .await;
-        let errors = count_of(
-            admin,
-            &format!("SELECT count() AS n FROM {db}.trace_error_spans"),
-        )
-        .await;
-        eprintln!(
-            "{label} post {post}: trace_spans {spans}, trace_recent {recent}, \
-             trace_error_spans {errors}"
-        );
-        if recent != 20 {
-            wrong.push(format!(
-                "{label} post {post}: trace_recent {recent}, expected 20"
-            ));
-        }
-        if errors != 4 {
-            wrong.push(format!(
-                "{label} post {post}: trace_error_spans {errors}, expected 4"
-            ));
-        }
-        let res = search(port, "{}", base - 1, base + 30, "&limit=50", label);
-        let got = trace_set(&res.json(label));
-        if got != want {
-            wrong.push(format!(
-                "{label} post {post}: {{}} returned {got:?}, expected the 20 traces"
-            ));
-        }
-    }
-    wrong
-}
-
-/// Issue #560 criterion 9, through the product ingest route: the same
-/// OTLP body posted three times leaves the physical `count()` of both
-/// derived tables unchanged — no `FINAL`, no merge. `trace_spans` is a
-/// plain `MergeTree` on a single node and stores every post; its count is
-/// printed, not asserted.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_same_ingest_twice_leaves_the_derived_tables_count_unchanged() {
-    if !should_run() {
-        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
-        return;
-    }
-    let port = 31_251;
-    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_recency_replay");
-    drop_db(db).await;
-    let guard = spawn_ready(port, db, &[]);
-    let admin = pulsus_clickhouse::ChClient::new(live_db::conn_config("default"))
-        .await
-        .expect("connect the admin client");
-    prepare_derived_tables(&admin, db).await;
-    let wrong = post_three_times(port, &admin, db, "replay").await;
-    drop(guard);
-    drop_db(db).await;
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-}
-
-/// Issue #560 criterion 22: criterion 4 holds under a server profile that
-/// disables either deduplication setting, because the span inserts pin
-/// both. The server runs as a user whose profile carries the disabling
-/// setting.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_profile_that_disables_deduplication_does_not_reach_the_derived_tables() {
-    if !should_run() {
-        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
-        return;
-    }
-    let port = 31_252;
-    let admin = pulsus_clickhouse::ChClient::new(live_db::conn_config("default"))
-        .await
-        .expect("connect the admin client");
-    let mut wrong: Vec<String> = Vec::new();
-    for (label, db, setting, name, disabled) in [
-        (
-            "dependent-view rule 0",
-            pulsus_testkit::test_db("pulsus_traces_search_it_dedup_views_off"),
-            "deduplicate_blocks_in_dependent_materialized_views = 0",
-            "deduplicate_blocks_in_dependent_materialized_views",
-            &["0", "false"][..],
-        ),
-        (
-            "deduplicate_insert disabled",
-            pulsus_testkit::test_db("pulsus_traces_search_it_dedup_insert_off"),
-            "deduplicate_insert = 'disable'",
-            "deduplicate_insert",
-            &["disable"][..],
-        ),
-    ] {
-        let db = db.as_str();
-        let user = format!("{db}_dedup_off");
-        drop_db(db).await;
-        admin_exec(&admin, &format!("DROP USER IF EXISTS {user}")).await;
-        admin_exec(
-            &admin,
-            &format!("CREATE USER {user} IDENTIFIED WITH no_password SETTINGS {setting}"),
-        )
-        .await;
-        admin_exec(&admin, &format!("GRANT ALL ON {db}.* TO {user}")).await;
-
-        let auth = format!("{user}:");
-        let guard = spawn_ready(port, db, &[("CLICKHOUSE_AUTH", auth.as_str())]);
-        prepare_derived_tables(&admin, db).await;
-
-        let mut as_user = live_db::conn_config("default");
-        as_user.user = user.clone();
-        let user_client = pulsus_clickhouse::ChClient::new(as_user)
-            .await
-            .expect("connect as the profile's user");
-        let got = {
-            use futures::StreamExt;
-            let sql = format!("SELECT toString(getSetting('{name}')) AS v");
-            let mut stream = user_client
-                .query_stream::<SettingRow560>(&sql, &pulsus_clickhouse::QuerySettings::new())
-                .await
-                .unwrap_or_else(|e| panic!("read the user's setting: {e}"));
-            stream.next().await.expect("a row").expect("decode").v
-        };
-        if !disabled.contains(&got.as_str()) {
-            wrong.push(format!(
-                "{label}: the user's {name} reads {got:?}, expected one of {disabled:?}"
-            ));
-        }
-
-        wrong.extend(post_three_times(port, &admin, db, label).await);
-        drop(guard);
-        drop_db(db).await;
-        admin_exec(&admin, &format!("DROP USER IF EXISTS {user}")).await;
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 // ---------------------------------------------------------------------

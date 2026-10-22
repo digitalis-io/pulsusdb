@@ -492,21 +492,6 @@ async fn a_retryable_pre_send_failure_is_resent_and_settles_not_committed() {
 
 // -- issue #586: the trace landing insert ------------------------------
 
-/// A `BlockInserter` that answers every call `Ok` and records nothing — the
-/// old two-table path's stand-in, so the mock server serves the landing
-/// insert alone.
-struct NoopInserter;
-
-impl<R: pulsus_clickhouse::ChRow> BlockInserter<R> for NoopInserter {
-    fn insert<'a>(
-        &'a self,
-        _table: &'a str,
-        _rows: &'a [R],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ChError>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
 /// **What the production inserter puts on the wire for a trace landing
 /// insert is the client's MERGED set, not the constructor's** — and the
 /// writer is what builds the constructor's half.
@@ -607,25 +592,23 @@ async fn the_production_inserter_sends_the_trace_landing_settings_on_the_wire() 
     // The writer half: what `TraceWriter` hands its own `BlockInserter` for
     // one push is the trace constructor at the CONFIGURED ceiling, under a
     // token it minted. A writer that handed over `landing_insert` instead —
-    // the metrics constructor — would be short the nine trace pins.
+    // the metrics constructor — would be short the ten trace pins.
     let root = spool_root("trace-landing-wire");
     let recorder = Arc::new(SettingsRecorder::default());
     let mut runtime = WriterRuntime::from_config(&cfg);
     runtime.spool_dir = root.clone();
     runtime.trace_landing_inserters = 1;
     let writer = pulsus_write::TraceWriter::with_inserters_and_runtime(
-        Arc::new(NoopInserter),
-        Arc::new(NoopInserter),
         recorder.clone(),
         runtime,
         pulsus_write::TraceWriterTables::traces_default(),
     );
-    let (parsed, landed) = one_span_trace_push();
+    let landed = one_span_trace_push();
     writer
-        .admit_flush(parsed, landed, pulsus_write::PushHeaders::default())
+        .admit_flush(landed, pulsus_write::PushHeaders::default())
         .expect("the queue has room")
         .await
-        .expect("the old path's two no-op inserts commit");
+        .expect("the landing insert commits");
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while recorder.calls() == 0 {
         assert!(
@@ -726,9 +709,8 @@ fn param_keys(target: &str) -> Vec<String> {
         .collect()
 }
 
-/// One trace push of one span, decoded both ways exactly as a handler runs
-/// it.
-fn one_span_trace_push() -> (pulsus_write::ParsedTraces, pulsus_write::ParsedTraceLanding) {
+/// One trace push of one span, decoded exactly as a handler decodes it.
+fn one_span_trace_push() -> pulsus_write::ParsedTraceLanding {
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::common::v1::any_value::Value;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
@@ -764,10 +746,7 @@ fn one_span_trace_push() -> (pulsus_write::ParsedTraces, pulsus_write::ParsedTra
             schema_url: String::new(),
         }],
     };
-    (
-        pulsus_write::parse_traces(&req, TS).expect("the old path's decode"),
-        pulsus_write::parse_trace_landing(&req, TS).expect("the landing decode"),
-    )
+    pulsus_write::parse_trace_landing(&req).expect("the landing decode")
 }
 
 /// The single-tenant deployment's tenant: no `X-Scope-OrgID`.

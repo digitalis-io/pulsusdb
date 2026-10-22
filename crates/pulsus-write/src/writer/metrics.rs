@@ -79,50 +79,6 @@ impl TableMetrics {
     }
 }
 
-/// Per-backlog registration-backfill counters (issues #134/#139): rows
-/// entering the in-memory backlog after a Poisoned registration flush
-/// (`enqueued`), rows rejected by the backlog byte cap (`dropped`),
-/// re-insert attempts kept-for-retry on a pre-send retryable failure
-/// (`retries`), rows confirmed re-inserted (`healed`), rows terminally
-/// abandoned on a deterministic or uncertain re-insert outcome
-/// (`abandoned`), and the `pending` gauge (rows currently in the backlog,
-/// updated under the backlog lock). One instance per backlog:
-/// `log_streams` and `trace_attrs_idx`. The metrics path has no backlog
-/// (issue #603).
-#[derive(Debug, Default)]
-pub struct BackfillMetrics {
-    pub enqueued_total: AtomicU64,
-    pub dropped_total: AtomicU64,
-    pub retries_total: AtomicU64,
-    pub healed_total: AtomicU64,
-    pub abandoned_total: AtomicU64,
-    pub pending: AtomicU64,
-}
-
-/// A point-in-time, plain-value copy of [`BackfillMetrics`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BackfillMetricsSnapshot {
-    pub enqueued_total: u64,
-    pub dropped_total: u64,
-    pub retries_total: u64,
-    pub healed_total: u64,
-    pub abandoned_total: u64,
-    pub pending: u64,
-}
-
-impl BackfillMetrics {
-    pub fn snapshot(&self) -> BackfillMetricsSnapshot {
-        BackfillMetricsSnapshot {
-            enqueued_total: self.enqueued_total.load(Ordering::Relaxed),
-            dropped_total: self.dropped_total.load(Ordering::Relaxed),
-            retries_total: self.retries_total.load(Ordering::Relaxed),
-            healed_total: self.healed_total.load(Ordering::Relaxed),
-            abandoned_total: self.abandoned_total.load(Ordering::Relaxed),
-            pending: self.pending.load(Ordering::Relaxed),
-        }
-    }
-}
-
 /// The whole logs writer's atomics. `landing` is behind its own `Arc` so
 /// every insert worker can hold a cheap clone without needing the rest of this
 /// struct.
@@ -284,74 +240,36 @@ impl MetricWriterMetrics {
     }
 }
 
-/// [`WriterMetrics`]'s two-table counterpart for
-/// [`crate::writer::TraceWriter`] (issue #54): `spans`/`attrs` per-table
-/// counters plus the shared backpressure/spool/rejected atomics. No
-/// registration-cache counters (traces have no LRU/metadata caches —
-/// `trace_tag_catalog` is MV-populated) and no `collisions_total`
-/// (`ParsedTraces` has no label sets, so nothing collides).
+/// [`WriterMetrics`]'s counterpart for [`crate::writer::TraceWriter`]: the
+/// landing table's per-table counters plus the backpressure, spool and
+/// rejected atomics. No registration-cache counters (traces have no LRU) and
+/// no `collisions_total` (spans carry no label sets).
 #[derive(Debug, Default)]
 pub struct TraceWriterMetrics {
-    pub spans: Arc<TableMetrics>,
-    pub attrs: Arc<TableMetrics>,
+    /// `trace_landing`'s per-table counters (issue #586). One insert per
+    /// push, so `flushes_total` counts pushes stored and `rows_total` counts
+    /// landed events of every kind.
+    pub landing: Arc<TableMetrics>,
     pub backpressure_total: AtomicU64,
     pub spool_poison_total: AtomicU64,
     pub spool_uncertain_total: AtomicU64,
     pub rejected_total: AtomicU64,
-    /// `trace_attrs_idx` registration-backfill counters (issue #139) —
-    /// its own `Arc` so the backfill task holds a cheap clone.
-    pub attrs_backfill: Arc<BackfillMetrics>,
-    /// `trace_landing`'s own per-table counters (issue #586). One insert per
-    /// push, so `flushes_total` counts pushes stored and `rows_total` counts
-    /// landed events of every kind. **They reach no exported series while
-    /// both write paths run** — [`TraceLandingSnapshot`] says why.
-    pub landing: Arc<TableMetrics>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TraceWriterMetricsSnapshot {
-    pub spans: TableMetricsSnapshot,
-    pub attrs: TableMetricsSnapshot,
-    /// The live `queued_bytes` gauge — passed in by the caller
-    /// ([`crate::writer::TraceWriter::metrics`]), which owns the
-    /// authoritative `AtomicU64` (not duplicated here).
-    ///
-    /// **The OLD path's counter alone** (issue #586): the landing path keeps
-    /// one of its own, read through [`TraceLandingSnapshot`].
+    /// `trace_landing`'s per-table counters.
+    pub landing: TableMetricsSnapshot,
+    /// The landing queue's live reservation, in bytes, bounded by
+    /// `PULSUS_INGEST_QUEUE_BYTES`.
     pub queue_bytes: u64,
     pub backpressure_total: u64,
     pub spool_poison_total: u64,
     pub spool_uncertain_total: u64,
     pub rejected_total: u64,
-    /// `trace_attrs_idx` registration-backfill counters (issue #139 —
-    /// additive field).
-    pub attrs_backfill: BackfillMetricsSnapshot,
-    /// Issue #494's push-suppression counters, extended to the trace push by
-    /// issue #586. All zero — and the two gauges zero with them — while
-    /// `PULSUS_INGEST_DEDUP` is off, because no index exists to report.
+    /// Issue #494's push-suppression counters. All zero — and the two gauges
+    /// zero with them — while `PULSUS_INGEST_DEDUP` is off.
     pub dedup: DedupMetricsSnapshot,
-}
-
-/// The trace landing path's own figures (issue #586), which **no exported
-/// series carries**.
-///
-/// `pulsus_ingest_queue_bytes{signal="traces"}` is set from
-/// [`TraceWriterMetricsSnapshot::queue_bytes`], and that field holds one
-/// number: a second emission of the same name and the same label pair would
-/// set one gauge twice per scrape with nothing saying which writer each
-/// reading came from, and a sum would stop being comparable with the ceiling
-/// the configuration names. So while both paths run the exposition cannot
-/// see the landing queue at any occupancy, the trace writer's buffered bytes
-/// are understated by whatever it holds, and this is where a caller that
-/// needs the figure reads it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TraceLandingSnapshot {
-    /// `trace_landing`'s per-table counters.
-    pub landing: TableMetricsSnapshot,
-    /// The landing queue's own live reservation, in bytes, bounded by
-    /// `PULSUS_INGEST_QUEUE_BYTES` — a per-writer ceiling, not a
-    /// per-process one.
-    pub queue_bytes: u64,
 }
 
 impl SpoolCounters for TraceWriterMetrics {
@@ -371,24 +289,13 @@ impl TraceWriterMetrics {
         dedup: DedupMetricsSnapshot,
     ) -> TraceWriterMetricsSnapshot {
         TraceWriterMetricsSnapshot {
-            spans: self.spans.snapshot(),
-            attrs: self.attrs.snapshot(),
+            landing: self.landing.snapshot(),
             queue_bytes,
             backpressure_total: self.backpressure_total.load(Ordering::Relaxed),
             spool_poison_total: self.spool_poison_total.load(Ordering::Relaxed),
             spool_uncertain_total: self.spool_uncertain_total.load(Ordering::Relaxed),
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
-            attrs_backfill: self.attrs_backfill.snapshot(),
             dedup,
-        }
-    }
-
-    /// The landing path's own figures, which no exported series carries —
-    /// [`TraceLandingSnapshot`].
-    pub fn landing_snapshot(&self, queue_bytes: u64) -> TraceLandingSnapshot {
-        TraceLandingSnapshot {
-            landing: self.landing.snapshot(),
-            queue_bytes,
         }
     }
 }
@@ -446,43 +353,6 @@ mod tests {
         assert_eq!(snap.queue_bytes, 4096);
         assert_eq!(snap.backpressure_total, 2);
         assert_eq!(snap.rejected_total, 5);
-    }
-
-    #[test]
-    fn backfill_metrics_snapshot_reflects_every_counter_and_the_gauge() {
-        let metrics = BackfillMetrics::default();
-        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
-        metrics.dropped_total.fetch_add(2, Ordering::Relaxed);
-        metrics.retries_total.fetch_add(3, Ordering::Relaxed);
-        metrics.healed_total.fetch_add(4, Ordering::Relaxed);
-        metrics.abandoned_total.fetch_add(5, Ordering::Relaxed);
-        metrics.pending.store(6, Ordering::Relaxed);
-        assert_eq!(
-            metrics.snapshot(),
-            BackfillMetricsSnapshot {
-                enqueued_total: 1,
-                dropped_total: 2,
-                retries_total: 3,
-                healed_total: 4,
-                abandoned_total: 5,
-                pending: 6,
-            }
-        );
-    }
-
-    /// The log half of this case went with the logs registration backfill
-    /// (issue #603): one landing insert per push has one fate, so there is no
-    /// separate registration insert left to heal, and the metrics half went
-    /// the same way before it. `trace_attrs_idx`'s is the one backlog left.
-    #[test]
-    fn the_trace_writer_snapshot_carries_its_backfill_embed() {
-        let trace_metrics = TraceWriterMetrics::default();
-        trace_metrics
-            .attrs_backfill
-            .enqueued_total
-            .fetch_add(3, Ordering::Relaxed);
-        let snap = trace_metrics.snapshot(0, DedupMetricsSnapshot::default());
-        assert_eq!(snap.attrs_backfill.enqueued_total, 3);
     }
 
     #[test]

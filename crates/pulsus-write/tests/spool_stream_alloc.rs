@@ -54,7 +54,7 @@ use pulsus_write::writer::{
 };
 use pulsus_write::{
     HistogramPoint, LogRow, LogSink, MetricMetadata, MetricPoint, MetricSink, ParsedLogs,
-    ParsedMetrics, ParsedTraceLanding, ParsedTraces, PushHeaders, SeriesRef, StreamRow, TraceSink,
+    ParsedMetrics, ParsedTraceLanding, PushHeaders, SeriesRef, StreamRow, TraceSink,
 };
 
 /// Held for the whole of each measuring `#[test]`, so two of them never share
@@ -692,7 +692,7 @@ fn spooling_a_log_block_holds_no_copy_of_the_push() {
 /// One span carrying 200 events, each with one attribute whose value is
 /// `bytes` long — the shape whose spool cost a whole-document encoder pays
 /// twice, in a value tree and again in the serialised body.
-fn wide_event_trace_push(bytes: usize) -> (ParsedTraces, ParsedTraceLanding) {
+fn wide_event_trace_push(bytes: usize) -> ParsedTraceLanding {
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::common::v1::any_value::Value;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
@@ -739,16 +739,11 @@ fn wide_event_trace_push(bytes: usize) -> (ParsedTraces, ParsedTraceLanding) {
             schema_url: String::new(),
         }],
     };
-    (
-        pulsus_write::parse_traces(&req, TS).expect("the old path's decode"),
-        pulsus_write::parse_trace_landing(&req, TS).expect("the landing decode"),
-    )
+    pulsus_write::parse_trace_landing(&req).expect("the landing decode")
 }
 
-/// [`peak_over_push`]'s traces twin: the same window over a `TraceWriter`,
-/// with the OLD path's two inserters committing so only the landing block is
-/// ever spooled.
-async fn peak_over_trace_push(push: (ParsedTraces, ParsedTraceLanding), poison: bool) -> Measured {
+/// [`peak_over_push`]'s traces twin: the same window over a `TraceWriter`.
+async fn peak_over_trace_push(landed: ParsedTraceLanding, poison: bool) -> Measured {
     let root = spool_root(if poison {
         "trace-poison"
     } else {
@@ -765,24 +760,20 @@ async fn peak_over_trace_push(push: (ParsedTraces, ParsedTraceLanding), poison: 
     });
     runtime.spool_dir = root.clone();
     let writer = TraceWriter::with_inserters_and_runtime(
-        Arc::new(FixedInserter { poison: false }),
-        Arc::new(FixedInserter { poison: false }),
         Arc::new(FixedInserter { poison }),
         runtime,
         TraceWriterTables::traces_default(),
     );
-    let (parsed, landed) = push;
     let peak = peak_bytes_of(async {
         let wait = writer
-            .admit_flush(parsed, landed, PushHeaders::default())
+            .admit_flush(landed, PushHeaders::default())
             .expect("the queue has room");
-        // The OLD path answers the caller, so the wait resolves `Ok` whether
-        // or not the landing block was spooled: the landing half carries no
-        // waiter at all.
-        tokio::time::timeout(Duration::from_secs(60), wait)
+        // The landing insert answers the caller: `Ok` when it commits, the
+        // error when it is poisoned and spooled.
+        let answer = tokio::time::timeout(Duration::from_secs(60), wait)
             .await
-            .expect("the old path settles")
-            .expect("the old path commits");
+            .expect("the landing block settles");
+        assert_eq!(answer.is_err(), poison, "{answer:?}");
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while spooled_of(&root, "trace_landing").len() < usize::from(poison) {
             assert!(

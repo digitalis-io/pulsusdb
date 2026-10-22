@@ -15,8 +15,8 @@ use axum::routing::get;
 use pulsus_clickhouse::ChError;
 use pulsus_read::LabelCache;
 use pulsus_write::writer::{
-    BackfillMetricsSnapshot, DedupMetricsSnapshot, MetricWriterMetricsSnapshot,
-    TableMetricsSnapshot, TraceWriterMetricsSnapshot, WriterMetricsSnapshot,
+    DedupMetricsSnapshot, MetricWriterMetricsSnapshot, TableMetricsSnapshot,
+    TraceWriterMetricsSnapshot, WriterMetricsSnapshot,
 };
 
 use crate::app::AppState;
@@ -373,20 +373,14 @@ fn record_metric_ingest_snapshot(s: &MetricWriterMetricsSnapshot) {
     record_dedup_metrics("metrics", &s.dedup);
 }
 
-/// The trace writer's `pulsus_ingest_*` series: per-table (`trace_spans`/
-/// `trace_attrs_idx`), per-signal (`signal="traces"`), backfill
-/// (`backlog="trace_attrs_idx"`) and issue #494's push-suppression set,
-/// which the trace push joined with issue #586. Traces have no
-/// registration-cache or collision counters (no label sets / LRU).
-///
-/// **`trace_landing` has no per-table series and the landing queue has no
-/// gauge**, while both write paths run: `pulsus_ingest_queue_bytes` is set
-/// from the one `queue_bytes` field, which holds the old path's counter, so
-/// a second emission of the same name and label pair would set one gauge
-/// twice per scrape. `TraceLandingSnapshot` is where that figure is read.
+/// The trace writer's `pulsus_ingest_*` series: the landing table's
+/// per-table set (`table="trace_landing"`), the per-signal set
+/// (`signal="traces"`) and issue #494's push-suppression set. Traces have no
+/// registration-cache or collision counters (no label sets / LRU). No
+/// backfill series: with one insert per push there is no registration to
+/// re-insert.
 fn record_trace_ingest_snapshot(s: &TraceWriterMetricsSnapshot) {
-    record_table_metrics("trace_spans", &s.spans);
-    record_table_metrics("trace_attrs_idx", &s.attrs);
+    record_table_metrics("trace_landing", &s.landing);
 
     metrics::gauge!("pulsus_ingest_queue_bytes", "signal" => "traces").set(s.queue_bytes as f64);
     metrics::counter!("pulsus_ingest_backpressure_total", "signal" => "traces")
@@ -398,24 +392,7 @@ fn record_trace_ingest_snapshot(s: &TraceWriterMetricsSnapshot) {
     metrics::counter!("pulsus_ingest_rejected_total", "signal" => "traces")
         .absolute(s.rejected_total);
 
-    record_backfill_metrics("trace_attrs_idx", &s.attrs_backfill);
     record_dedup_metrics("traces", &s.dedup);
-}
-
-/// Emits the `pulsus_ingest_backfill_*` registration-backfill series for one
-/// backlog (label `backlog`). Counters `.absolute()`, `pending` a gauge.
-fn record_backfill_metrics(backlog: &'static str, b: &BackfillMetricsSnapshot) {
-    metrics::counter!("pulsus_ingest_backfill_enqueued_total", "backlog" => backlog)
-        .absolute(b.enqueued_total);
-    metrics::counter!("pulsus_ingest_backfill_dropped_total", "backlog" => backlog)
-        .absolute(b.dropped_total);
-    metrics::counter!("pulsus_ingest_backfill_retries_total", "backlog" => backlog)
-        .absolute(b.retries_total);
-    metrics::counter!("pulsus_ingest_backfill_healed_total", "backlog" => backlog)
-        .absolute(b.healed_total);
-    metrics::counter!("pulsus_ingest_backfill_abandoned_total", "backlog" => backlog)
-        .absolute(b.abandoned_total);
-    metrics::gauge!("pulsus_ingest_backfill_pending", "backlog" => backlog).set(b.pending as f64);
 }
 
 /// `GET /config`: effective configuration, secrets redacted
@@ -757,47 +734,6 @@ mod tests {
         assert_type(r, "pulsus_ingest_spool_write_failures_total", "counter");
     }
 
-    /// A `BackfillMetricsSnapshot` with every field distinct-nonzero from
-    /// `base` (offsets 1..=6).
-    fn backfill_snap(base: u64) -> BackfillMetricsSnapshot {
-        BackfillMetricsSnapshot {
-            enqueued_total: base + 1,
-            dropped_total: base + 2,
-            retries_total: base + 3,
-            healed_total: base + 4,
-            abandoned_total: base + 5,
-            pending: base + 6,
-        }
-    }
-
-    /// Asserts all six `record_backfill_metrics` series for `backlog`.
-    fn assert_backfill_series(r: &str, backlog: &str, base: u64) {
-        for (name, off) in [
-            ("pulsus_ingest_backfill_enqueued_total", 1u64),
-            ("pulsus_ingest_backfill_dropped_total", 2),
-            ("pulsus_ingest_backfill_retries_total", 3),
-            ("pulsus_ingest_backfill_healed_total", 4),
-            ("pulsus_ingest_backfill_abandoned_total", 5),
-            ("pulsus_ingest_backfill_pending", 6),
-        ] {
-            assert_sample(
-                r,
-                &format!(r#"{name}{{backlog="{backlog}"}}"#),
-                (base + off) as f64,
-            );
-        }
-    }
-
-    /// Asserts the `# TYPE` header for every backfill metric name.
-    fn assert_backfill_types(r: &str) {
-        assert_type(r, "pulsus_ingest_backfill_enqueued_total", "counter");
-        assert_type(r, "pulsus_ingest_backfill_dropped_total", "counter");
-        assert_type(r, "pulsus_ingest_backfill_retries_total", "counter");
-        assert_type(r, "pulsus_ingest_backfill_healed_total", "counter");
-        assert_type(r, "pulsus_ingest_backfill_abandoned_total", "counter");
-        assert_type(r, "pulsus_ingest_backfill_pending", "gauge");
-    }
-
     /// Asserts the `# TYPE` header for the five per-`signal` series shared by
     /// all three writers.
     fn assert_signal_types(r: &str) {
@@ -1042,25 +978,23 @@ mod tests {
         assert!(!r.contains("pulsus_ingest_patterns_dropped_total"));
     }
 
-    /// AC-2 (traces): the trace-writer snapshot emits its two tables, the
-    /// `signal="traces"` series, the attrs backfill and issue #494's
-    /// push-suppression set (issue #586) — and NO
-    /// registration-cache/collision/metadata/pattern series (traces track
-    /// none). Exhaustive: EVERY emitted series is asserted for its exact
-    /// seeded value AND its `# TYPE`. Fully-spelled struct literal.
-    /// Distinct-nonzero seeds (per-table bases 200/210, backfill base 220,
-    /// per-signal 71..=74) catch a mis-wired name/label/type.
+    /// AC-2 (traces): the trace-writer snapshot emits ONE
+    /// `table="trace_landing"` series set — the one table the trace writer
+    /// inserts into (issue #602) — plus the `signal="traces"` series and
+    /// issue #494's push-suppression set, and NO registration-cache,
+    /// collision, metadata, pattern or backfill series. Exhaustive: EVERY
+    /// emitted series is asserted for its exact seeded value AND its
+    /// `# TYPE`. Distinct-nonzero seeds (table base 200, per-signal 71..=74,
+    /// dedup base 230) catch a mis-wired name/label/type.
     #[test]
     fn trace_ingest_snapshot_exports_named_series() {
         let snap = TraceWriterMetricsSnapshot {
-            spans: table_snap(200),
-            attrs: table_snap(210),
+            landing: table_snap(200),
             queue_bytes: 500,
             backpressure_total: 71,
             spool_poison_total: 72,
             spool_uncertain_total: 73,
             rejected_total: 74,
-            attrs_backfill: backfill_snap(220),
             // Issue #586: the trace push joins issue #494's suppression
             // index, so this signal renders the dedup set too. 230 is free
             // beside the bases above.
@@ -1071,11 +1005,9 @@ mod tests {
         // # TYPE header for every emitted metric name.
         assert_table_types(&r);
         assert_signal_types(&r);
-        assert_backfill_types(&r);
 
-        // Per-table values (2 tables × 7 series).
-        assert_table_series(&r, "trace_spans", 200);
-        assert_table_series(&r, "trace_attrs_idx", 210);
+        // Per-table values (1 table × 7 series).
+        assert_table_series(&r, "trace_landing", 200);
 
         // Per-signal values.
         assert_sample(&r, r#"pulsus_ingest_queue_bytes{signal="traces"}"#, 500.0);
@@ -1096,9 +1028,6 @@ mod tests {
         );
         assert_sample(&r, r#"pulsus_ingest_rejected_total{signal="traces"}"#, 74.0);
 
-        // Backfill values (6 series).
-        assert_backfill_series(&r, "trace_attrs_idx", 220);
-
         // Issue #586's push-suppression series, on this signal. The label
         // value is `traces`, which is what every other series this writer
         // renders carries.
@@ -1112,6 +1041,9 @@ mod tests {
         assert!(!r.contains("pulsus_ingest_collisions_total"));
         assert!(!r.contains("pulsus_ingest_metadata_upserts_total"));
         assert!(!r.contains("pulsus_ingest_patterns_dropped_total"));
+        assert!(!r.contains("pulsus_ingest_backfill_"));
+        assert!(!r.contains(r#"table="trace_spans""#));
+        assert!(!r.contains(r#"table="trace_attrs_idx""#));
     }
 
     /// AC-3 / reader-only guard: `metrics_handler` with empty writer slots
@@ -1184,7 +1116,7 @@ mod tests {
             ..Default::default()
         };
         let trace = TraceWriterMetricsSnapshot {
-            spans: TableMetricsSnapshot {
+            landing: TableMetricsSnapshot {
                 rows_total: 91,
                 ..Default::default()
             },
@@ -1232,7 +1164,7 @@ mod tests {
         );
         assert_sample(
             &text,
-            r#"pulsus_ingest_rows_total{table="trace_spans"}"#,
+            r#"pulsus_ingest_rows_total{table="trace_landing"}"#,
             91.0,
         );
         assert_sample(

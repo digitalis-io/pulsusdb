@@ -16,10 +16,9 @@
 //! already-computed `TagNames`/`TagValues`; no extra query work.
 //!
 //! **The wire `type` is the STORED type, never a reading of the value's
-//! text** (issue #476). `trace_tag_catalog.val_type` carries the OTLP kind
-//! the sender sent, put there at ingest by
-//! `pulsus_write::ingest::traces::AttrValueType` and projected by
-//! `trace_tag_catalog_mv`. Nothing in this module inspects a character of
+//! text** (issue #476). `tag_values.val_type` carries the OTLP kind the
+//! sender sent, put there at ingest by the landing decode
+//! (`TraceJsonScalar::val_type`). Nothing in this module inspects a character of
 //! `val` to decide a type. The text-classifying helper that used to —
 //! `bool` for `"true"`, `duration` for anything the duration-literal
 //! parser accepted, `int` for digits, `float` for an `f64` parse — is
@@ -723,7 +722,7 @@ mod tests {
 
     /// The stored type is reported verbatim for every spelling the writer
     /// can produce — a permutation break, not a presence check: swapping
-    /// two arms of `AttrValueType::as_str` moves a value here.
+    /// two arms of `TraceJsonScalar::val_type` moves a value here.
     #[test]
     fn a_typed_row_reports_its_stored_type_verbatim() {
         let values = tag_values(

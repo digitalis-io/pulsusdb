@@ -81,7 +81,6 @@ Status legend: ✅ implemented + evidenced · 🚫 explicit non-goal (recorded, 
 | Ingest metrics bridged onto `/metrics` (fan-out entry) | `crates/pulsus-server/src/ops.rs::record_ingest_metrics` · `api.md §7` | ✅ |
 | Per-table ingest counters/gauge (`pulsus_ingest_{rows,bytes,flushes,flush_latency_nanoseconds,retries,spool_write_failures}_total`, `pulsus_ingest_inflight`) | `crates/pulsus-server/src/ops.rs::record_table_metrics` · `architecture.md §8` | ✅ |
 | Per-signal ingest series (`pulsus_ingest_queue_bytes`, `pulsus_ingest_{backpressure,spool_poison,spool_uncertain,rejected}_total`) exercised for logs/metrics/traces | `crates/pulsus-server/src/ops.rs::the_log_ingest_series_carry_the_landing_table_label` · `crates/pulsus-server/src/ops.rs::metric_ingest_snapshot_exports_named_series` · `crates/pulsus-server/src/ops.rs::trace_ingest_snapshot_exports_named_series` | ✅ |
-| Registration-backfill series (`pulsus_ingest_backfill_*`) | `crates/pulsus-server/src/ops.rs::record_backfill_metrics` | ✅ |
 | End-to-end scrape emits ingest series only for populated writer slots | `crates/pulsus-server/src/ops.rs::metrics_handler_exports_ingest_series_for_populated_writer_slots` · `crates/pulsus-server/src/ops.rs::metrics_handler_omits_ingest_series_when_no_writer` | ✅ |
 | Label-cache (`pulsus_label_cache_*`) and query eval-gate (`pulsus_query_eval_*`) families | `crates/pulsus-server/src/ops.rs` · `architecture.md §8` | ✅ |
 | `/config` secret redaction | `crates/pulsus-server/src/ops.rs::config_handler_redacts_the_password` | ✅ |

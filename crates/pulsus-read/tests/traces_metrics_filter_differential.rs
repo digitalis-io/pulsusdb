@@ -209,7 +209,7 @@ async fn pulsus_insert(client: &ChClient, service: &str, nonce: &[u8; 16], spans
             schema_url: String::new(),
         }],
     };
-    let landing = parse_trace_landing(&req, now_ns()).expect("the landing decode");
+    let landing = parse_trace_landing(&req).expect("the landing decode");
     let received_ms = now_ns() / 1_000_000;
     let mut rows: Vec<TraceLandingRow> = Vec::new();
     rows.extend(

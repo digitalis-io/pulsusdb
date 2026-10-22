@@ -54,7 +54,7 @@ pub(crate) const MSG_SHUTDOWN_QUEUED: &str = "the writer shut down before the bl
 /// | what it holds | bytes |
 /// |---|---|
 /// | the block itself, and the queue slot it is moved into | `2 * size_of::<LandingBlock<R>>()` |
-/// | `settings`: fourteen owned key/value pairs | their vector, [`LANDING_SETTINGS_SLOTS`] slots — its first allocation is four, the fifth pair doubles it and the ninth doubles it again — plus [`LANDING_SETTINGS_TEXT_BYTES`] for their text **by capacity**: 18 + 6, 50 + 10, 26 + 36, 21 + 8, 27 + 10, 33 + 10, 26 + 8, 27 + 10, 32 + 10, 30 + 10, 32 + 10, 51 + 10, 49 + 10, 50 + 10, at a 36-byte token and the largest accepted row ceiling. A value rendered from an integer literal is allocated ten bytes whatever its digits; one rendered from the `u64` ceiling is allocated its digits, which is why the largest ceiling is the term (628 at the default, 622 at the floor) |
+/// | `settings`: the signal's owned key/value pairs | [`landing_settings_charge`]: the allocation of the widest set any signal sends — every constructor built at a token as wide as [`mint_landing_token`] writes and at each signal's row floor and ceiling, measured with `QuerySettings::allocated_bytes` (the vector's slots and every string by capacity). Measured rather than counted, so a setting added to any signal's insert raises the charge with it |
 /// | `claim`: the `Vec<PushDigest>` its one key allocates, four slots at its first push | `4 * size_of::<PushDigest>()` |
 /// | `waiter`: one `oneshot` channel in sync mode — a state word, two waker slots and one `Result<(), WriteError>` | 256. Those four come to 8 + 2 × 16 + 32 = 72; the rest is allowance, because the channel's own bookkeeping is private to it |
 ///
@@ -67,16 +67,46 @@ pub(crate) const MSG_SHUTDOWN_QUEUED: &str = "the writer shut down before the bl
 ///
 /// **The figure does not depend on `R`.** `LandingBlock<R>`'s only
 /// `R`-dependent field is a `Vec<R>`, whose header is three words whatever `R`
-/// is, and the settings are the same fourteen names at the same token width
-/// and the same largest accepted row ceiling for both signals — the two ceilings'
-/// accepted ranges are identical, which is what lets one derivation serve
-/// both.
-pub const fn landing_block_overhead_bytes<R>() -> u64 {
+/// is, and the settings term is the widest set any signal sends, so every
+/// signal's block is charged at least what its own settings hold (issue #602
+/// part 3b-1: the trace set is the widest).
+pub fn landing_block_overhead_bytes<R>() -> u64 {
     2 * std::mem::size_of::<LandingBlock<R>>() as u64
-        + LANDING_SETTINGS_SLOTS * std::mem::size_of::<(String, String)>() as u64
-        + LANDING_SETTINGS_TEXT_BYTES
+        + landing_settings_charge()
         + 4 * std::mem::size_of::<push_dedup::PushDigest>() as u64
         + 256
+}
+
+/// A token as wide as [`mint_landing_token`] writes: 36 characters.
+const WIDEST_TOKEN: &str = "00000000-0000-7000-8000-000000000000";
+
+/// The bytes the widest landing settings set allocates, measured on the
+/// sets themselves: [`QuerySettings::landing_insert`] (metrics and logs) and
+/// [`QuerySettings::trace_landing_insert`], each at [`WIDEST_TOKEN`] and at
+/// every signal's row floor and ceiling, the most any of them allocates.
+/// Built once and kept.
+pub fn landing_settings_charge() -> u64 {
+    static CHARGE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CHARGE.get_or_init(|| {
+        let rows = [
+            pulsus_config::METRICS_LANDING_MAX_ROWS_FLOOR,
+            pulsus_config::METRICS_LANDING_MAX_ROWS_CEILING,
+            pulsus_config::LOG_LANDING_MAX_ROWS_FLOOR,
+            pulsus_config::LOG_LANDING_MAX_ROWS_CEILING,
+            pulsus_config::TRACE_LANDING_MAX_ROWS_FLOOR,
+            pulsus_config::TRACE_LANDING_MAX_ROWS_CEILING,
+        ];
+        rows.iter()
+            .flat_map(|&rows| {
+                [
+                    QuerySettings::landing_insert(WIDEST_TOKEN, rows),
+                    QuerySettings::trace_landing_insert(WIDEST_TOKEN, rows),
+                ]
+            })
+            .map(|settings| settings.allocated_bytes())
+            .max()
+            .unwrap_or(0)
+    })
 }
 
 /// What the queue is charged for a push whose landing rows price `row_bytes`.
@@ -84,16 +114,7 @@ pub const fn landing_block_overhead_bytes<R>() -> u64 {
 /// `reserve_queued_bytes` takes it, whichever ending settles releases it and
 /// `record_flush` reports it, so no two halves of the accounting can drift
 /// apart.
-/// The vector slots [`QuerySettings::landing_insert`]'s pairs occupy: its
-/// first allocation is four, the fifth pair doubles it and the ninth doubles
-/// it again, and fourteen pairs fit in sixteen.
-pub const LANDING_SETTINGS_SLOTS: u64 = 16;
-
-/// The text of [`QuerySettings::landing_insert`]'s pairs by capacity, at a
-/// 36-byte token and the largest accepted row ceiling: the table above.
-pub const LANDING_SETTINGS_TEXT_BYTES: u64 = 630;
-
-pub const fn landing_charge<R>(row_bytes: u64) -> u64 {
+pub fn landing_charge<R>(row_bytes: u64) -> u64 {
     row_bytes + landing_block_overhead_bytes::<R>()
 }
 
@@ -713,25 +734,70 @@ mod tests {
         );
     }
 
-    /// **W3 (issue #623): the block charge prices every landing setting.**
-    /// The settings of the widest block — a 36-byte token and the largest
-    /// accepted row ceiling — read from the settings themselves: their count
-    /// is within the charge's slots, and the key
-    /// and value strings' capacity is the charge's text term exactly. A
-    /// setting added to the landing insert without the charge following
-    /// fails here.
+    /// **The block charge covers every signal's settings as they are built**
+    /// (issue #602 part 3b-1). For each signal's own constructor, at a token
+    /// `mint_landing_token` writes and at the floor, the default and the
+    /// largest accepted row ceiling, the settings' measured allocation plus
+    /// the block's fixed terms must fit in the charge. A setting added to any
+    /// signal's insert without the charge following fails here.
     #[test]
-    fn the_block_charge_prices_every_landing_setting() {
-        let token = "0192f5a4-7c3e-7d2a-9b1c-4e5f6a7b8c9d";
+    fn the_block_charge_covers_every_signals_settings_as_built() {
+        use crate::writer::rows::{LogLandingRow, TraceLandingRow};
+        use pulsus_config as cfg;
+        fn fixed<R>() -> u64 {
+            2 * std::mem::size_of::<LandingBlock<R>>() as u64
+                + 4 * std::mem::size_of::<push_dedup::PushDigest>() as u64
+                + 256
+        }
+        let token = mint_landing_token(&mut XorShift64::seeded());
         assert_eq!(token.len(), 36);
-        let s =
-            QuerySettings::landing_insert(token, pulsus_config::METRICS_LANDING_MAX_ROWS_CEILING);
-        assert!(
-            s.len() as u64 <= LANDING_SETTINGS_SLOTS,
-            "{} settings against {LANDING_SETTINGS_SLOTS} slots charged",
-            s.len()
-        );
-        assert_eq!(s.text_capacity(), LANDING_SETTINGS_TEXT_BYTES);
+        let defaults = pulsus_config::WriterConfig::default();
+        let mut short = Vec::new();
+        let mut check = |signal: &str, settings: QuerySettings, fixed: u64, charged: u64| {
+            let needed = settings.allocated_bytes() + fixed;
+            if needed > charged {
+                short.push(format!(
+                    "{signal}: the block holds {needed} bytes and is charged {charged}"
+                ));
+            }
+        };
+        for rows in [
+            cfg::METRICS_LANDING_MAX_ROWS_FLOOR,
+            defaults.metrics_landing_max_rows,
+            cfg::METRICS_LANDING_MAX_ROWS_CEILING,
+        ] {
+            check(
+                "metrics",
+                QuerySettings::landing_insert(&token, rows),
+                fixed::<MetricLandingRow>(),
+                landing_block_overhead_bytes::<MetricLandingRow>(),
+            );
+        }
+        for rows in [
+            cfg::LOG_LANDING_MAX_ROWS_FLOOR,
+            defaults.log_landing_max_rows,
+            cfg::LOG_LANDING_MAX_ROWS_CEILING,
+        ] {
+            check(
+                "logs",
+                QuerySettings::landing_insert(&token, rows),
+                fixed::<LogLandingRow>(),
+                landing_block_overhead_bytes::<LogLandingRow>(),
+            );
+        }
+        for rows in [
+            cfg::TRACE_LANDING_MAX_ROWS_FLOOR,
+            defaults.trace_landing_max_rows,
+            cfg::TRACE_LANDING_MAX_ROWS_CEILING,
+        ] {
+            check(
+                "traces",
+                QuerySettings::trace_landing_insert(&token, rows),
+                fixed::<TraceLandingRow>(),
+                landing_block_overhead_bytes::<TraceLandingRow>(),
+            );
+        }
+        assert!(short.is_empty(), "{}", short.join("\n"));
     }
 
     /// **The queue gauge is subtracted in one place, and in one order.**

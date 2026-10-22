@@ -103,8 +103,8 @@ async fn exec(client: &ChClient, sql: &str) {
 /// multi-key fixture where a scoped read genuinely has something to
 /// prune away (the other scope's half).
 async fn seed_catalog(client: &ChClient, db: &str) {
-    // The two writer-reserved intrinsic scopes carry the same key/value
-    // shape, with values prefixed `a` so they sort BEFORE the attribute
+    // Two scopes outside the attribute set — no writer produces them —
+    // carry the same key/value shape, with values prefixed `a` so they sort BEFORE the attribute
     // scopes' `v` values: a read that failed to exclude them returns
     // their rows first, which the content checks below can see.
     for scope in ["event:intrinsic", "link:intrinsic", "resource", "span"] {
@@ -765,8 +765,8 @@ static QM_DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_trace
 /// `span` (`v`) is what a `span`-scoped read must return, `resource`
 /// (`r`) is a second ATTRIBUTE scope so a bare-key read has a second
 /// primary-key range to touch and the granule comparison below has
-/// something to compare, and `event:intrinsic` (`a`) is a writer-
-/// RESERVED scope whose values sort first, so a read that lost its scope
+/// something to compare, and `event:intrinsic` (`a`) is a scope outside
+/// the attribute set whose values sort first, so a read that lost its scope
 /// predicate returns them at the head of the very list under test.
 const QM_KEY: &str = "a?b";
 const QM_KEYS_PER_SCOPE: u64 = 10;
