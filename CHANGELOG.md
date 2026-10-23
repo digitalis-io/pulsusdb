@@ -32,8 +32,8 @@ is versioned independently — see `deploy/charts/pulsusdb/Chart.yaml` and
   optional bundled single-node or sharded ClickHouse (with a Keeper
   StatefulSet for the sharded case), an OpenTelemetry Collector for OTLP +
   Prometheus remote-write ingestion, and an optional Grafana Loki-compat
-  datasource ConfigMap. Config is a subset of `docs/configuration.md`
-  §9's YAML schema, rendered into a ConfigMap; credentials are Secret-managed and
+  datasource ConfigMap. Config is a subset of `docs/configuration.md` §9's
+  YAML schema, rendered into a ConfigMap; credentials are Secret-managed and
   never appear in the ConfigMap. See `deploy/charts/pulsusdb/README.md`
   for the full values reference and topology/probe-contract documentation.
 - `.github/workflows/helm-chart.yml`: per-PR `chart-lint` (helm lint

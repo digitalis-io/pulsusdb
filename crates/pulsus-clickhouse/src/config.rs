@@ -162,8 +162,8 @@ pub struct ResolvedEndpoint {
 }
 
 /// Connection settings for [`crate::ChClient`]. Each field is set from the
-/// documented variables its comment names (docs/configuration.md §§1, 2 and
-/// 4), and `Default` gives each its documented default: `pulsus-server`'s
+/// documented variables its comment names (docs/configuration.md §§1, 2
+/// and 4), and `Default` gives each its documented default: `pulsus-server`'s
 /// `conn_config_from_the_default_config_is_the_default` holds the two equal.
 #[derive(Clone, Debug)]
 pub struct ChConnConfig {

@@ -522,7 +522,7 @@ async fn tie_group_split_by_the_fetch_limit_is_delivered_exactly_once() {
 
 // ---------------------------------------------------------------------
 // 3) Engine-level keyset cursor semantics (deterministic, page by page)
-//    — uses `live_db::build_schema_blocking` for the schema, no server needed (port n/a)
+//    — uses `live_db::build_schema_blocking`, no server needed (port n/a)
 // ---------------------------------------------------------------------
 
 fn engine_for_db(client: ChClient) -> LogQlEngine {

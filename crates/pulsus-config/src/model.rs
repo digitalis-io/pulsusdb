@@ -447,8 +447,8 @@ pub struct ReaderConfig {
     /// `--enable-feature=promql-experimental-functions`: when `true`, the
     /// experimental slice of the v3.13 function registry (17 functions;
     /// `limitk`/`limit_ratio` aggregators) is permitted. The planner refuses
-    /// an experimental function or modifier unless it is set (`pulsus-promql`'s
-    /// `plan.rs` gate tests, e.g.
+    /// an experimental function or modifier unless it is set
+    /// (`pulsus-promql`'s `plan.rs` gate tests, e.g.
     /// `every_fill_modifier_spelling_is_gated_behind_experimental_functions`),
     /// and `pulsus-server`'s `metrics_config_from` passes it through. The
     /// coverage authority for what "experimental" covers is
