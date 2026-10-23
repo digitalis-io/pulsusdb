@@ -3383,6 +3383,79 @@ mod tests {
         assert_eq!(ids.len(), 3, "three series, three IDs: {:?}", out.series);
     }
 
+    /// docs/configuration.md §6 (issue #506): three rewrites are not gated by
+    /// the translation strategy and happen under every value. `job` comes
+    /// from `service.namespace`/`service.name`, `instance` from
+    /// `service.instance.id`, and the other resource attributes go to a
+    /// `target_info` series rather than onto the metric's own. The histogram
+    /// suffixes `_bucket`, `_sum` and `_count` are constants under every
+    /// value.
+    #[test]
+    fn the_resource_rewrites_happen_under_every_translation_strategy() {
+        const BASE_NS: u64 = 1_700_000_000_000 * 1_000_000;
+        for strategy in [
+            OtlpTranslationStrategy::NoUtf8EscapingWithSuffixes,
+            OtlpTranslationStrategy::UnderscoreEscapingWithSuffixes,
+            OtlpTranslationStrategy::UnderscoreEscapingWithoutSuffixes,
+            OtlpTranslationStrategy::NoTranslation,
+        ] {
+            let mut req = one_metric_request(
+                Some(Resource {
+                    attributes: vec![
+                        kv("service.namespace", Value::StringValue("shop".into())),
+                        kv("service.name", Value::StringValue("cart".into())),
+                        kv("service.instance.id", Value::StringValue("cart-1".into())),
+                        kv("region", Value::StringValue("eu".into())),
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                gauge_metric("up", number_dp(BASE_NS, 1.0, vec![])),
+            );
+            req.resource_metrics[0].scope_metrics[0]
+                .metrics
+                .push(histogram_metric(
+                    "lat",
+                    AggregationTemporality::Cumulative,
+                    histogram_dp(BASE_NS, 1, Some(1.0), vec![1], vec![]),
+                ));
+            let out = super::parse(
+                &req,
+                0,
+                MetricIngestSettings {
+                    translation_strategy: strategy,
+                    ..MetricIngestSettings::default()
+                },
+            )
+            .expect("within the expansion budget");
+            let up = out
+                .series
+                .iter()
+                .find(|s| &*s.metric_name == "up")
+                .unwrap_or_else(|| panic!("{strategy:?}: no `up` series in {:?}", out.series));
+            assert_eq!(up.labels.get("job"), Some("shop/cart"), "{strategy:?}");
+            assert_eq!(up.labels.get("instance"), Some("cart-1"), "{strategy:?}");
+            assert_eq!(
+                up.labels.get("region"),
+                None,
+                "{strategy:?}: a resource attribute on the metric's own series"
+            );
+            let info = out
+                .series
+                .iter()
+                .find(|s| &*s.metric_name == "target_info")
+                .unwrap_or_else(|| panic!("{strategy:?}: no `target_info` series"));
+            assert_eq!(info.labels.get("region"), Some("eu"), "{strategy:?}");
+            for name in ["lat_bucket", "lat_sum", "lat_count"] {
+                assert!(
+                    out.series.iter().any(|s| &*s.metric_name == name),
+                    "{strategy:?}: no `{name}` series in {:?}",
+                    out.series
+                );
+            }
+        }
+    }
+
     /// A resource carrying a non-identifying attribute plus a `job`.
     fn target_info_resource() -> Resource {
         Resource {

@@ -1,5 +1,5 @@
 //! Exhaustive, table-driven proof that every documented environment
-//! variable (docs/configuration.md §§1–8, 87 variables) parses. Each row
+//! variable (docs/configuration.md §§1–8) parses. Each row
 //! clears the environment, sets only its own variable, calls `parse()`
 //! (not `load()` — see issue #2 architect plan amendment 2), and asserts
 //! the target field. `PULSUS_AUTH_USER`/`PULSUS_AUTH_PASSWORD` need no
@@ -8,7 +8,9 @@
 //!
 //! A set-equality assertion against `pulsus_config::ALL_ENV_VARS` makes a
 //! missing or misnamed row (or a variable `apply_env` doesn't wire up) a
-//! red build.
+//! red build; a second one, against the tables in docs/configuration.md
+//! §§1–8 read from the file, makes a missing or extra documented variable
+//! one.
 
 mod support;
 
@@ -523,17 +525,146 @@ fn matrix_rows_exactly_match_all_env_vars() {
         deduped.len(),
         "env_matrix.rs must not repeat a variable"
     );
-    assert_eq!(
-        declared.len(),
-        94,
-        "docs/configuration.md §§1-8 document exactly 94 variables"
-    );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();
     canonical.sort_unstable();
     assert_eq!(
         declared, canonical,
         "env_matrix.rs rows must exactly match ALL_ENV_VARS (set equality)"
+    );
+}
+
+/// One row of a docs/configuration.md §§1–8 table: the variables its first
+/// cell names (`PULSUS_AUTH_USER` / `PULSUS_AUTH_PASSWORD` is one row and
+/// two variables) and its Default cell.
+struct DocRow {
+    vars: Vec<String>,
+    default: String,
+}
+
+/// Every table row of docs/configuration.md before `## 9. YAML file`: each
+/// line starting ``| ` ``.
+fn documented_rows() -> Vec<DocRow> {
+    let doc = support::repo_file("docs/configuration.md");
+    let tables = doc
+        .split_once("\n## 9. YAML file\n")
+        .expect("docs/configuration.md has a `## 9. YAML file` line")
+        .0;
+    tables
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .map(|line| {
+            let cells: Vec<&str> = line.split('|').collect();
+            DocRow {
+                vars: cells[1]
+                    .split('/')
+                    .map(|v| v.trim_matches(|c| c == ' ' || c == '`').to_string())
+                    .collect(),
+                default: cells[2].trim().to_string(),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn the_documented_tables_name_exactly_all_env_vars() {
+    let mut documented: Vec<String> = documented_rows()
+        .into_iter()
+        .flat_map(|row| row.vars)
+        .collect();
+    documented.sort_unstable();
+    let mut canonical: Vec<String> = pulsus_config::ALL_ENV_VARS
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
+    canonical.sort_unstable();
+    assert_eq!(
+        documented, canonical,
+        "docs/configuration.md §§1–8 must document exactly ALL_ENV_VARS, each once"
+    );
+}
+
+/// docs/configuration.md §9: "Everything above maps 1:1 into YAML". Each
+/// variable, set alone, changes exactly one leaf of the configuration, and
+/// no two variables change the same one.
+#[test]
+fn each_variable_sets_exactly_one_yaml_key() {
+    let _guard = support::lock_env();
+    let defaults =
+        support::leaf_values(&serde_norway::to_value(Config::default()).expect("serialise"));
+    let mut setter: std::collections::BTreeMap<String, &str> = Default::default();
+    for row in ROWS {
+        support::clear_all();
+        support::set(row.var, row.value);
+        let cfg = pulsus_config::parse(None, None)
+            .unwrap_or_else(|e| panic!("{}: parse() failed: {e}", row.var));
+        let leaves = support::leaf_values(&serde_norway::to_value(cfg).expect("serialise"));
+        let changed: Vec<&String> = leaves
+            .iter()
+            .filter(|(path, v)| defaults.get(*path) != Some(*v))
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(changed.len(), 1, "{} changes {changed:?}", row.var);
+        if let Some(other) = setter.insert(changed[0].clone(), row.var) {
+            panic!("{} and {other} both set {}", row.var, changed[0]);
+        }
+    }
+    support::clear_all();
+}
+
+/// The rows whose Default cell is a word rather than a value, each with its
+/// cell. Compared by equality, so neither the set nor a cell changes without
+/// this list changing.
+const NO_LITERAL_DEFAULT: &[(&str, &str)] = &[
+    ("CLICKHOUSE_SERVERS", "unset"),
+    ("PULSUS_AUTH_PASSWORD", "unset"),
+    ("PULSUS_AUTH_USER", "unset"),
+    ("PULSUS_AVAILABILITY_ZONE", "unset"),
+    ("PULSUS_CLUSTER", "unset"),
+    ("PULSUS_STORAGE_POLICY", "unset"),
+    ("PULSUS_TLS_CERT", "unset"),
+    ("PULSUS_TLS_KEY", "unset"),
+    ("PULSUS_TRACEQL_INDEXED_ATTRIBUTES", "empty"),
+];
+
+/// Setting every variable of a row to the row's documented Default leaves
+/// the configuration at the built-in default.
+#[test]
+fn each_documented_default_reproduces_the_built_in_default() {
+    let _guard = support::lock_env();
+    let mut no_literal: Vec<(String, String)> = Vec::new();
+    for row in documented_rows() {
+        let Some(literal) = row
+            .default
+            .strip_prefix('`')
+            .and_then(|d| d.strip_suffix('`'))
+            .filter(|d| !d.contains('`'))
+        else {
+            no_literal.extend(row.vars.iter().map(|v| (v.clone(), row.default.clone())));
+            continue;
+        };
+        support::clear_all();
+        for var in &row.vars {
+            support::set(var, literal);
+        }
+        let cfg = pulsus_config::parse(None, None)
+            .unwrap_or_else(|e| panic!("{:?} = {literal:?}: parse() failed: {e}", row.vars));
+        assert_eq!(
+            cfg,
+            Config::default(),
+            "{:?}: the documented default {literal:?} is not the built-in default",
+            row.vars
+        );
+    }
+    support::clear_all();
+    no_literal.sort_unstable();
+    let want: Vec<(String, String)> = NO_LITERAL_DEFAULT
+        .iter()
+        .map(|(var, cell)| (var.to_string(), cell.to_string()))
+        .collect();
+    assert_eq!(
+        no_literal, want,
+        "the rows whose Default is a word, with the word"
     );
 }
 

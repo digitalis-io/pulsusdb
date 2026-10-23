@@ -501,17 +501,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_env_vars_has_no_duplicates_and_the_documented_count() {
+    fn all_env_vars_has_no_duplicates() {
         let mut sorted = ALL_ENV_VARS.to_vec();
         sorted.sort_unstable();
         let mut deduped = sorted.clone();
         deduped.dedup();
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
-        assert_eq!(
-            ALL_ENV_VARS.len(),
-            94,
-            "docs/configuration.md §§1-8 document exactly 94 variables"
-        );
     }
 
     #[test]

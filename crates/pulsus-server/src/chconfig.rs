@@ -435,6 +435,30 @@ pub(crate) fn trace_engine(
 mod tests {
     use super::*;
 
+    /// Issue #506: `ChConnConfig`'s comment says its `Default` gives each
+    /// field its documented default. The documented defaults are
+    /// `Config::default()` (`pulsus-config`'s tests hold docs/configuration.md
+    /// to it), so converting the default configuration must give
+    /// `ChConnConfig::default()`, field for field. `ChConnConfig` has no
+    /// `PartialEq`; its `Debug` output is compared.
+    #[test]
+    fn conn_config_from_the_default_config_is_the_default() {
+        assert_eq!(
+            format!("{:?}", conn_config_from(&Config::default())),
+            format!("{:?}", ChConnConfig::default()),
+        );
+    }
+
+    /// Issue #506: `ReaderConfig::traceql_max_series` says it mirrors the
+    /// service-graph edge bound, a claim about the two defaults.
+    #[test]
+    fn the_trace_series_cap_default_is_the_service_graph_edge_bound() {
+        assert_eq!(
+            Config::default().reader.traceql_max_series,
+            pulsus_read::SERVICE_GRAPH_MAX_EDGES
+        );
+    }
+
     /// S1 (#603 follow-up): `PULSUS_SKIP_UNAVAILABLE_SHARDS` reaches the
     /// logs engine, both ways.
     #[test]
