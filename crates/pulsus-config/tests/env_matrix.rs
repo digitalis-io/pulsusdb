@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use pulsus_config::{
     ByteSize, ChProto, Config, ExpHistogramMode, InsertMode, LogLevel, Mode,
-    OtlpTranslationStrategy, TierPolicy,
+    OtlpTranslationStrategy,
 };
 
 struct Row {
@@ -160,16 +160,6 @@ const ROWS: &[Row] = &[
         check: |c| c.clickhouse.select_sequential_consistency,
     },
     Row {
-        var: "PULSUS_SKIP_DDL",
-        value: "1",
-        check: |c| c.skip_ddl,
-    },
-    Row {
-        var: "PULSUS_RETENTION_DAYS",
-        value: "30",
-        check: |c| c.retention_days == 30,
-    },
-    Row {
         var: "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
         value: "span.app.request.id,event.exception.type",
         check: |c| c.traceql_indexed_attributes == ["span.app.request.id", "event.exception.type"],
@@ -256,11 +246,6 @@ const ROWS: &[Row] = &[
     },
     // Issue #603: the metrics landing table's five dials.
     Row {
-        var: "PULSUS_METRICS_LANDING_RETENTION_HOURS",
-        value: "24",
-        check: |c| c.metrics_landing_retention_hours == 24,
-    },
-    Row {
         var: "PULSUS_METRICS_DEDUP_WINDOW",
         value: "5000",
         check: |c| c.metrics_dedup_window == 5_000,
@@ -283,11 +268,6 @@ const ROWS: &[Row] = &[
     // **T35.** Issue #603: the logs landing table's five dials. A key with a
     // range check and no `env.rs` parse passes the range case and fails here.
     Row {
-        var: "PULSUS_LOG_LANDING_RETENTION_HOURS",
-        value: "24",
-        check: |c| c.log_landing_retention_hours == 24,
-    },
-    Row {
         var: "PULSUS_LOG_DEDUP_WINDOW",
         value: "5000",
         check: |c| c.log_dedup_window == 5_000,
@@ -306,11 +286,6 @@ const ROWS: &[Row] = &[
         var: "PULSUS_LOG_LANDING_MAX_ROWS",
         value: "2000000",
         check: |c| c.writer.log_landing_max_rows == 2_000_000,
-    },
-    Row {
-        var: "PULSUS_TRACE_LANDING_RETENTION_HOURS",
-        value: "12",
-        check: |c| c.trace_landing_retention_hours == 12,
     },
     Row {
         var: "PULSUS_TRACE_DEDUP_WINDOW",
@@ -493,11 +468,6 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.tail_catchup_slice.0 == Duration::from_secs(120),
     },
     Row {
-        var: "PULSUS_TIER_POLICY",
-        value: "fast",
-        check: |c| c.downsampling.tier_policy == TierPolicy::Fast,
-    },
-    Row {
         var: "PULSUS_RULER_ENABLED",
         value: "true",
         check: |c| c.ruler.enabled,
@@ -559,11 +529,10 @@ fn sections() -> (String, String) {
     (format!("{before}\n## 8. {after}"), seven.to_string())
 }
 
-/// Every table row of docs/configuration.md before `## 9. YAML file`: each
-/// line starting ``| ` ``.
+/// Every table row of docs/configuration.md §§1–6 and §8: each line
+/// starting ``| ` ``.
 fn documented_rows() -> Vec<DocRow> {
-    let (rest, seven) = sections();
-    rows_of(&format!("{rest}\n{seven}"))
+    rows_of(&sections().0)
 }
 
 fn rows_of(tables: &str) -> Vec<DocRow> {

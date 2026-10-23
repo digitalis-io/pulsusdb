@@ -75,7 +75,7 @@ jobs:
       # self-contained, no cluster. A failure here aborts the job before
       # anything is packaged or pushed.
       - name: helm lint --strict (pre-publish gate)
-        run: helm lint "$CHART_DIR" --strict
+        run: helm lint "$CHART_DIR" --strict --set initJob.retentionDays=7
 
       - name: Install the helm-unittest plugin
         run: helm plugin install https://github.com/helm-unittest/helm-unittest

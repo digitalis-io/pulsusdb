@@ -430,6 +430,7 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             pool: Arc::new(RwLock::new(None)),
+            retention_days: std::sync::Arc::new(std::sync::OnceLock::from(7)),
             config: Arc::new(Config::default()),
             metrics: metrics_exporter_prometheus::PrometheusBuilder::new()
                 .build_recorder()
@@ -503,6 +504,7 @@ mod tests {
         cfg.clickhouse.auth.password = pulsus_config::Secret::new("s3cret");
         let state = AppState {
             pool: Arc::new(RwLock::new(None)),
+            retention_days: std::sync::Arc::new(std::sync::OnceLock::from(7)),
             config: Arc::new(cfg),
             metrics: metrics_exporter_prometheus::PrometheusBuilder::new()
                 .build_recorder()

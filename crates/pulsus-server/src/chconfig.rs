@@ -2,8 +2,8 @@
 //! place (task-manager resolution on issue #6, carried over from issue #5's
 //! resolution #4): `pulsus-clickhouse` and `pulsus-schema` stay config-free,
 //! and every caller in this binary — the serving startup path (`serve.rs`,
-//! which, unless `PULSUS_SKIP_DDL` is set, checks that the database
-//! `schema/schema.sh` builds exists; the binary creates no schema) — derives
+//! which reads the retention the database `schema/schema.sh` builds states;
+//! the binary creates no schema) — derives
 //! its connection settings from these
 //! functions.
 
@@ -110,6 +110,18 @@ pub(crate) enum NameCheckError {
     /// The configured database does not exist. `schema/schema.sh` builds
     /// it; this process does not.
     SchemaAbsent(String),
+    /// The configured database exists and its comment states no retention
+    /// (issue #497): it was not built by `schema/schema.sh`.
+    RetentionAbsent {
+        db: String,
+        comment: String,
+    },
+    /// The hosts of the configured cluster do not all hold the database with
+    /// the same valid retention (issue #497).
+    RetentionDisagrees {
+        db: String,
+        detail: String,
+    },
 }
 
 /// Reads back every setting and function name this build sends that was not
@@ -146,29 +158,54 @@ pub(crate) async fn check_server_names(
     }
 }
 
-/// Whether the configured database exists.
+/// The retention the configured database states (issue #497).
 ///
-/// **The binary does not create schema.** `schema/schema.sh` does, and a
-/// serving process that found nothing to serve from used to create it
-/// itself; now it refuses and says which command builds it. Without this
-/// the refusal is ClickHouse's `UNKNOWN_DATABASE` from the pool connect,
-/// which names the database but not what to run.
+/// **The binary creates no schema and has no retention setting.**
+/// `schema/schema.sh` renders `PULSUS_RETENTION_DAYS` into every table's TTL
+/// and into the database comment `retention_days=<N>`, and this reads it back,
+/// on **every replica of the configured cluster** when the server defines it
+/// (`pulsus_schema::schema_retention`). An absent database is
+/// [`NameCheckError::SchemaAbsent`]; one comment on every host that states no
+/// retention is [`NameCheckError::RetentionAbsent`]; hosts that differ, or a
+/// host without the database or not answering, is
+/// [`NameCheckError::RetentionDisagrees`]. All three are retried.
 ///
 /// Reads the catalogue over a bootstrap client of its own, for
 /// [`check_server_names`]' reason: the target database may not exist.
-pub(crate) async fn check_schema_present(config: &Config) -> Result<(), NameCheckError> {
+pub(crate) async fn read_schema_retention(config: &Config) -> Result<u32, NameCheckError> {
     let client = ChClient::new(bootstrap_conn_config_from(config))
         .await
         .map_err(NameCheckError::Connect)?;
     let db = &config.clickhouse.database;
-    let present = pulsus_schema::database_exists(&client, db)
+    let state = pulsus_schema::schema_retention(&client, config.cluster.as_deref(), db)
         .await
         .map_err(NameCheckError::Statement)?;
     drop(client);
-    if !present {
-        return Err(NameCheckError::SchemaAbsent(db.clone()));
+    match state {
+        pulsus_schema::SchemaRetention::Agreed(days) => Ok(days),
+        pulsus_schema::SchemaRetention::Absent => Err(NameCheckError::SchemaAbsent(db.clone())),
+        pulsus_schema::SchemaRetention::Refused { hosts, answered } => {
+            if answered.len() == hosts && answered.iter().all(|(_, c)| c == &answered[0].1) {
+                Err(NameCheckError::RetentionAbsent {
+                    db: db.clone(),
+                    comment: answered[0].1.clone(),
+                })
+            } else {
+                let each: Vec<String> = answered
+                    .iter()
+                    .map(|(h, c)| format!("{h}: {c:?}"))
+                    .collect();
+                Err(NameCheckError::RetentionDisagrees {
+                    db: db.clone(),
+                    detail: format!(
+                        "{} of {hosts} hosts hold it, stating {}",
+                        answered.len(),
+                        each.join(", ")
+                    ),
+                })
+            }
+        }
     }
-    Ok(())
 }
 
 /// Maps `Config` to [`pulsus_read::LogQlEngine`]'s table-name/budget

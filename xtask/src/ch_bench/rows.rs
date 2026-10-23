@@ -43,15 +43,6 @@ impl LogRow {
     }
 }
 
-/// A decoded row from the `metric_samples_5m` tier (docs/schemas.md §2.2/§2.3).
-#[derive(Clone, Debug, PartialEq)]
-pub struct AggRow {
-    pub fingerprint: u128,
-    pub val_count: u64,
-    pub first_value: f64,
-    pub last_value: f64,
-}
-
 /// Realistic `LowCardinality` cardinality for metric names, per the architect
 /// amendment (~500 distinct values — "not 1 and not N").
 pub const METRIC_NAME_CARDINALITY: u64 = 500;

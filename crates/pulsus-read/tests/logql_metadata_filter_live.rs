@@ -73,7 +73,7 @@ fn test_config() -> ChConnConfig {
 }
 
 fn schema_params(db: &str) -> SchemaParams {
-    RenderCtx::for_tests(db)
+    RenderCtx::for_tests(db, 7)
 }
 
 fn engine_config(db: &str) -> EngineConfig {

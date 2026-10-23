@@ -84,8 +84,11 @@ pub async fn database_exists(client: &ChClient, db: &str) -> Result<bool, Schema
 /// `N` a whole number from 1 to `u32::MAX` without a leading zero, the
 /// form `schema/schema.sh` accepts (issue #497). Anything else is `None`.
 pub fn retention_days_from_comment(comment: &str) -> Option<u32> {
-    let _ = comment;
-    None // stub: issue #497 implements it
+    let digits = comment.strip_prefix("retention_days=")?;
+    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// One host's answer about `db`: its name and the database's comment.
@@ -116,8 +119,17 @@ pub enum SchemaRetention {
 /// The decision over the hosts' answers, separated so the rule is tested
 /// without a cluster.
 pub fn decide_retention(hosts: usize, mut answered: Vec<(String, String)>) -> SchemaRetention {
-    let _ = (hosts, &mut answered);
-    SchemaRetention::Absent // stub: issue #497 implements it
+    answered.sort();
+    if answered.is_empty() {
+        return SchemaRetention::Absent;
+    }
+    if let Some(days) = retention_days_from_comment(&answered[0].1)
+        && answered.len() == hosts
+        && answered.iter().all(|(_, c)| c == &answered[0].1)
+    {
+        return SchemaRetention::Agreed(days);
+    }
+    SchemaRetention::Refused { hosts, answered }
 }
 
 /// The retention `db` states (issue #497), read from **every replica of
@@ -133,8 +145,46 @@ pub async fn schema_retention(
     cluster: Option<&str>,
     db: &str,
 ) -> Result<SchemaRetention, SchemaError> {
-    let _ = (client, cluster, db);
-    Ok(SchemaRetention::Absent) // stub: issue #497 implements it
+    let db_lit = db.replace('\'', "''");
+    let defined = match cluster {
+        Some(c) => {
+            let c_lit = c.replace('\'', "''");
+            let n = read_names(
+                client,
+                &format!(
+                    "SELECT toString(count()) AS name FROM system.clusters WHERE cluster = '{c_lit}'"
+                ),
+            )
+            .await?;
+            let n: usize = n.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+            (n > 0).then_some((c_lit, n))
+        }
+        None => None,
+    };
+    let (sql, hosts) = match defined {
+        Some((c_lit, n)) => (
+            format!(
+                "SELECT hostName() AS host, comment FROM clusterAllReplicas('{c_lit}', system.databases) \
+                 WHERE name = '{db_lit}' SETTINGS skip_unavailable_shards = 1"
+            ),
+            n,
+        ),
+        None => (
+            format!(
+                "SELECT hostName() AS host, comment FROM system.databases WHERE name = '{db_lit}'"
+            ),
+            1,
+        ),
+    };
+    let mut stream = client
+        .query_stream::<HostComment>(&sql, &QuerySettings::new())
+        .await?;
+    let mut answered = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row?;
+        answered.push((row.host, row.comment));
+    }
+    Ok(decide_retention(hosts, answered))
 }
 
 /// The seconds deduplication window every clustered write-path table is

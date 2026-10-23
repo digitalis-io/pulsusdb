@@ -345,7 +345,7 @@ fn spawn_ready(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
     // does not exist: build it with `schema/schema.sh`" and `/ready` never
     // reaches 200. Idempotent, so repeated spawns cost one no-op render.
     //
-    // **The DEFAULT retention, unlike every other suite here**, because this
+    // **Seven days of retention, unlike every other suite here**, because this
     // one's "empty DB must return an empty traces array" assertions rest on
     // the delete-TTL dropping its own 2023-stamped fixtures.
     // `live_db::build_schema_with_retention` says what that means.

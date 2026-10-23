@@ -23,13 +23,13 @@ use std::time::Duration;
 use pulsus_schema::{RenderCtx, SCHEMA_SQL, rendered, rendered_statements};
 
 fn single() -> RenderCtx {
-    RenderCtx::for_tests("pulsus")
+    RenderCtx::for_tests("pulsus", 7)
 }
 
 fn clustered() -> RenderCtx {
     RenderCtx {
         cluster: Some("prod".to_string()),
-        ..RenderCtx::for_tests("pulsus")
+        ..RenderCtx::for_tests("pulsus", 7)
     }
 }
 
@@ -1368,6 +1368,7 @@ fn the_script_refuses_the_attribute_lists_the_configuration_refuses() {
             .arg("--print")
             .current_dir(&root)
             .env_remove("PULSUS_CLUSTER")
+            .env("PULSUS_RETENTION_DAYS", "7")
             .env("PULSUS_TRACEQL_INDEXED_ATTRIBUTES", list)
             .output()
             .expect("the script runs");
@@ -1387,6 +1388,7 @@ fn the_script_refuses_the_attribute_lists_the_configuration_refuses() {
         .arg("--print")
         .current_dir(&root)
         .env_remove("PULSUS_CLUSTER")
+        .env("PULSUS_RETENTION_DAYS", "7")
         .env("PULSUS_TRACEQL_INDEXED_ATTRIBUTES", &at)
         .output()
         .expect("the script runs");
@@ -1404,6 +1406,7 @@ fn a_refused_list_stops_the_script_before_it_touches_the_server() {
         .arg(root.join("schema/schema.sh"))
         .current_dir(&root)
         .env_remove("PULSUS_CLUSTER")
+        .env("PULSUS_RETENTION_DAYS", "7")
         .env("CLICKHOUSE_SERVER", "127.0.0.1")
         .env("CLICKHOUSE_HTTP_PORT", "1")
         .env("PULSUS_SCHEMA_WAIT_SECONDS", "1")
@@ -1485,7 +1488,7 @@ fn the_log_tables_lead_with_the_tenant_in_both_forms() {
     ];
     let clustered = RenderCtx {
         cluster: Some("c1".to_string()),
-        ..RenderCtx::for_tests("pulsus")
+        ..RenderCtx::for_tests("pulsus", 7)
     };
     for (form, ctx) in [("single-node", single()), ("clustered", clustered)] {
         let stmts = rendered_statements(&ctx);

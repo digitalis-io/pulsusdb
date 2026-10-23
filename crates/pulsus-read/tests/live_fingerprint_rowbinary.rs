@@ -320,7 +320,7 @@ async fn a_narrow_row_field_is_refused_by_the_client() {
         .await
         .expect("connect");
     drop_database(&bootstrap, &db).await;
-    run_init(&bootstrap, &RenderCtx::for_tests(&db))
+    run_init(&bootstrap, &RenderCtx::for_tests(&db, 7))
         .await
         .expect("run_init");
     let client = ChClient::new(test_config(&db))
@@ -366,7 +366,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         .await
         .expect("connect");
     drop_database(&bootstrap, &db).await;
-    run_init(&bootstrap, &RenderCtx::for_tests(&db))
+    run_init(&bootstrap, &RenderCtx::for_tests(&db, 7))
         .await
         .expect("run_init");
     let client = ChClient::new(test_config(&db))

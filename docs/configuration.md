@@ -1,6 +1,6 @@
 # PulsusDB Configuration
 
-PulsusDB is configured by environment variables, optionally layered over a YAML file (`--config <path>`). Precedence: CLI flags (`--config`, `--mode` — the only two flags) > environment variables > YAML > defaults; an environment variable set to the empty string counts as unset. Every option has a sane single-node default: `pulsusdb` with only `CLICKHOUSE_SERVER` set is a working deployment.
+PulsusDB is configured by environment variables, optionally layered over a YAML file (`--config <path>`). Precedence: CLI flags (`--config`, `--mode` — the only two flags) > environment variables > YAML > defaults; an environment variable set to the empty string counts as unset. Every option of the binary has a sane single-node default: `pulsusdb` with only `CLICKHOUSE_SERVER` set is a working deployment, once `schema/schema.sh` has built the database with the retention it requires (§7).
 
 ## 1. Core
 
@@ -46,20 +46,17 @@ Two further constraints are enforced fail-fast at startup so a config never prom
 
 The hard requirements are columnar bulk-insert/fetch performance and reliable DDL + `INSERT ... SELECT` maintenance statements; which transport serves which statement class is an implementation detail settled by the M0 client benchmark (docs/decisions/0001). `CLICKHOUSE_PORT`/`CLICKHOUSE_HTTP_PORT` both remain configurable so either split works.
 
-## 3. Schema & retention
+## 3. Schema
+
+Retention is not set here: `schema/schema.sh` takes it (§7), and the binary reads it back from the database.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PULSUS_SKIP_DDL` | `false` | skip the startup check that the configured database exists (schema managed externally, e.g. reached through a view under another name). The binary issues no DDL either way |
-| `PULSUS_RETENTION_DAYS` | `7` | TTL for raw log/metric/trace/profile tables; a metric descriptor in `metric_metadata` leaves this many days after its latest resend; a trace read that selects spans by a window reads none older than this, whether or not storage has deleted it (`docs/api.md` §4) |
 | `PULSUS_STORAGE_POLICY` | unset | ClickHouse storage policy for all created tables |
 | `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` | empty | comma-separated trace attributes `spans` carries a bloom-filter index for, each `span.<key>` or `event.<key>`, the key dot-separated segments of letters, digits, `_` and `-`; at most 16, none twice, each key at most 128 bytes. `schema/schema.sh` checks the list before it contacts the server and builds one index per item and the reader hints a search whose filter requires `key = "<string>"` on one. Changing it is a schema rebuild; a reader and a schema that disagree answer the same, only slower. Each index adds about 3–5 MB to a `spans` insert or merge at the default `PULSUS_BATCH_BYTES`, and 41–53 B more per span in a push larger than that |
 | `PULSUS_LOG_ROLLUP_RESOLUTION` | `5s` | bucket size of the derived log count/bytes rollup (table named for it, e.g. `log_metrics_5s`); raw log/metric samples always store source timestamps verbatim — no resolution is assumed or imposed anywhere |
-| `PULSUS_METRICS_LANDING_RETENTION_HOURS` | `6` | TTL for `metric_landing`, the one table a metrics push is inserted into (issue #603), in hours. Eight tables are maintained from it by materialized view, and queries read all eight; the sample, exemplar and activity tables keep `PULSUS_RETENTION_DAYS`, and `metric_labels` keeps its label sets with no TTL (issue #623). Nothing reads a landed row after the push's views have written it, so expiring it deletes nothing a query reads; the rows are kept this long only for inspection by hand. Accepted range `1..=168`; values outside this range are rejected at config load |
 | `PULSUS_METRICS_DEDUP_WINDOW` | `10000` | how many recent blocks `metric_landing` and each of the eight tables the views maintain remember for deduplication, so a resend of a block the server already accepted is dropped before it is stored again. A window of `W` blocks covers a steady rate of `W / 120` pushes a second, the landing insert's budget being 120 s: **83** at the default and **8333** at the maximum, rounding down. Above that a block's token can be evicted before its resend arrives. **Which engine setting carries it follows the deployment**: a clustered deployment renders these tables `Replicated*`, where the window in force is the replicated engines' own. On a single node there is no companion **time** window, the engine having `non_replicated_deduplication_window` and no seconds-based counterpart there — a block is remembered until that many newer blocks have arrived and is never forgotten on a timer, which is the safe direction for a resend. On a cluster there is one, and it is pinned at the server's own default of one hour rather than configured: a deployment that lowered it below the landing budget would forget a block's token while the writer is still entitled to resend under it. Accepted range `1..=1000000`; values outside this range are rejected at config load |
-| `PULSUS_LOG_LANDING_RETENTION_HOURS` | `6` | TTL for `log_landing`, the one table a logs push is inserted into (issue #603), in hours. The five tables queries read are maintained from it by materialized view and keep `PULSUS_RETENTION_DAYS`. Nothing reads a landed row after the push's views have written it, so expiring it deletes nothing a query reads; the rows are kept this long only for inspection by hand. Accepted range `1..=168`; values outside this range are rejected at config load |
 | `PULSUS_LOG_DEDUP_WINDOW` | `10000` | how many recent blocks `log_landing` and each of the five tables the views maintain remember for deduplication, so a resend of a block the server already accepted is dropped before it is stored again. A window of `W` blocks covers a steady rate of `W / 120` pushes a second, the landing insert's budget being 120 s: **83** at the default and **8333** at the maximum, rounding down. Above that a block's token can be evicted before its resend arrives. **Which engine setting carries it follows the deployment**: a clustered deployment renders these tables `Replicated*`, where the window in force is the replicated engines' own. On a cluster there is a companion **time** window, and it is pinned at the server's own default of one hour rather than configured — a deployment that lowered it below the landing budget would forget a block's token while the writer is still entitled to resend under it. Accepted range `1..=1000000`; values outside this range are rejected at config load |
-| `PULSUS_TRACE_LANDING_RETENTION_HOURS` | `6` | TTL for `trace_landing`, the one table a trace push is inserted into, in hours. The eight tables queries read are maintained from it by materialized view; six of them keep `PULSUS_RETENTION_DAYS` and the two tag catalogs `tag_names` and `tag_values` carry no TTL at all, because catalog entries outlive span retention (`docs/api.md` §4.3). Nothing reads a landed row after the push's views have written it, so expiring it deletes nothing a query reads; the rows are kept this long only for inspection by hand. Accepted range `1..=168`; values outside this range are rejected at config load |
 | `PULSUS_TRACE_DEDUP_WINDOW` | `10000` | how many recent blocks `trace_landing` and each of the eight tables the views maintain remember for deduplication, so a resend of a block the server already accepted is dropped before it is stored again. The shape is `PULSUS_LOG_DEDUP_WINDOW`'s, whole, including which engine setting carries it and the pinned companion time window on a cluster. Accepted range `1..=1000000`; values outside this range are rejected at config load |
 
 ## 4. Clustering
@@ -167,36 +164,50 @@ A trace request is also bounded **before** any of that, by a fixed ceiling on th
 | `PULSUS_TAIL_MAX_FETCH_LIMIT` | `5000` | hard cap on one tail poll's fetched-row `LIMIT`; a client `limit` above it is silently clamped before the query is built. Accepted range `1..=5000000`: values above the ceiling are rejected at config load, since they would make the pre-query clamp inert. Scale tuning routes to #25 |
 | `PULSUS_TAIL_CATCHUP_SLICE` | `60s` | maximum time window one tail poll may scan/sort; backlog catch-up proceeds one slice per query, re-polling immediately until caught up (must be > 0) |
 
-## 7. Downsampling (M3)
+## 7. Retention (`schema/schema.sh`)
 
-**Not built yet.** These settings are parsed and validated at startup (the rules below), and nothing else reads them: `schema/schema.sql` creates no tier table and no query is answered from one. The rest of this section is the intended design.
-
-Tier layout is YAML-only (the shape doesn't flatten well into env vars):
-
-```yaml
-downsampling:
-  enabled: true
-  raw_retention: 7d           # overrides PULSUS_RETENTION_DAYS for metric_samples
-  tiers:
-    - name: 5m
-      resolution: 5m
-      table: metric_samples_5m
-      retention: 90d
-      min_step: 5m            # tier eligible when query step >= this; must be >= resolution
-    - name: 1h
-      resolution: 1h
-      table: metric_samples_1h
-      retention: 730d
-      min_step: 1h
-```
+These variables are read by `schema/schema.sh` alone. They are not configuration of the binary and have no YAML key: a YAML file naming `retention_days` or a `*_landing_retention_hours` key is refused at load as an unknown key.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PULSUS_TIER_POLICY` | `exact` | `exact`: raw samples serve every range where raw still exists (tiers only beyond raw retention; a step is Prometheus-exact when its full evaluation window is raw-covered — boundary-straddling steps are flagged approximate). `fast`: any tier-eligible range is served from tiers (bucket-aligned approximation, flagged via `X-Pulsus-Explain`) |
+| `PULSUS_RETENTION_DAYS` | none: required | `R` in the table below, in days. Without it the script exits `2` before it contacts the server; it accepts a whole number from `1` to `4294967295` with no leading zero, and refuses anything else the same way. The script writes it into every TTL below and into the database comment `retention_days=<N>` |
+| `PULSUS_METRICS_LANDING_RETENTION_HOURS` | `6` | `H` for `metric_landing`, in hours. A whole number from `1` to `168`; anything else is exit `2` |
+| `PULSUS_LOG_LANDING_RETENTION_HOURS` | `6` | `H` for `log_landing`, with the same rule |
+| `PULSUS_TRACE_LANDING_RETENTION_HOURS` | `6` | `H` for `trace_landing`, with the same rule |
 
-Tier eligibility always requires `tier.resolution <= query step` **and** `tier.resolution <= the range-vector window` — a 5m-window `rate` is never answered from 1h buckets regardless of policy.
+**The binary reads the retention from the database.** At startup it reads the database comment and is not ready until the comment is exactly `retention_days=<N>`; its retry warning names the script. The trace read floor (a read that selects spans by a window reads no span that started `N` days or more before the request, [api.md](api.md) §4), the live-tail lower bound (`N` days and one more before the request) and `/api/v1/status/runtimeinfo`'s `storageRetention` all use that `N`. Changing retention is a rebuild with the script, which drops the database.
 
-Tiers are populated **in real time by insert-triggered materialized views inside ClickHouse** — there is no downsampling process or schedule. Validation enforced at startup: `resolution`, `min_step`, and `retention` strictly increasing across tiers; `min_step >= resolution` per tier.
+**When a row goes.** `R` is `PULSUS_RETENTION_DAYS` and `H` the table's landing hours. A row is due at the time below, computed in whole seconds and capped at `4294967295` (2106-02-07). The server deletes due rows only during a TTL merge, which it runs on a table at most once per `merge_with_ttl_timeout`: `3600` s on the three landing tables, the server's default `14400` s on every other. "Whole part" keeps a part until every row in it is due, and a part never spans two partitions. "Row by row" deletes each due row.
+
+| Table | Due at | Removed | Partition |
+|-------|--------|---------|-----------|
+| `log_landing` | `received_ms` + `H` hours | whole part | hour of `received_ms` |
+| `log_metrics_<res>` | `bucket_ns` + `R` days | whole part | day of `bucket_ns` |
+| `log_patterns` | `bucket_ns` + `R` days | whole part | day of `bucket_ns` |
+| `log_samples` | `timestamp_ns` + `R` days | whole part | day of `timestamp_ns` |
+| `log_streams` | never: no TTL | — | `month` |
+| `log_streams_idx` | never: no TTL | — | `month` |
+| `metric_exemplars` | `unix_milli` + `R` days | whole part | day of `unix_milli` |
+| `metric_hist_samples` | `unix_milli` + `R` days | whole part | day of `unix_milli` |
+| `metric_label_index` | never: no TTL | — | none |
+| `metric_label_values` | never: no TTL | — | none |
+| `metric_labels` | never: no TTL | — | none |
+| `metric_landing` | `received_ms` + `H` hours | whole part | hour of `received_ms` |
+| `metric_metadata` | `updated_ns` + `R` days | row by row | none |
+| `metric_samples` | `unix_milli` + `R` days | whole part | day of `unix_milli` |
+| `metric_series` | the end of the UTC day `day` + `R` days | whole part | `day`, a UTC day |
+| `resources` | the end of the UTC day `day` + `R` days | whole part | `day`, a UTC day |
+| `service_bucket_resources` | the start of the 5-minute `bucket` + `R` days | whole part | UTC day of `bucket` |
+| `service_edges` | `minute` + `R` days; `minute` − 240 s + `R` days on a row whose `conn_type` is empty | whole part | UTC day of `minute` |
+| `spans` | `start_ns` + `R` days | whole part | UTC day of `start_ns` |
+| `error_spans` | `start_ns` + `R` days | whole part | UTC day of `start_ns` |
+| `tag_bucket_values` | the start of the 5-minute `bucket` + `R` days | whole part | UTC day of `bucket` |
+| `tag_names` | never: no TTL | — | none |
+| `tag_values` | never: no TTL | — | none |
+| `trace_landing` | `received_ms` + `H` hours | whole part | hour of `received_ms` |
+| `traces` | `last_start_ns` + `R` days | whole part | `day`, the UTC day of the earliest of the trace's spans in one push |
+
+A day or hour without "UTC" is the server's time zone. The landing tables' rows are read by nothing once their views have run, so their expiry deletes nothing a query reads.
 
 ## 8. Ruler (M7)
 
@@ -208,7 +219,7 @@ Tiers are populated **in real time by insert-triggered materialized views inside
 
 ## 9. YAML file
 
-Everything above maps 1:1 into YAML (env var wins on conflict). This is the **complete** document schema — unknown keys are rejected; every key shown with its default:
+Every variable in §§1–6 and §8 maps 1:1 into YAML (env var wins on conflict); §7's are the script's alone. This is the **complete** document schema — unknown keys are rejected; every key shown with its default:
 
 ```yaml
 # root scalars
@@ -223,16 +234,11 @@ cors_origin: "*"
 query_timeout: 2m
 tls_cert: null                   # PEM cert chain path; with tls_key set, the one listener is TLS-only
 tls_key: null                    # PEM private key path; one-sided => startup error
-skip_ddl: false
-retention_days: 7
 storage_policy: null
 traceql_indexed_attributes: []   # PULSUS_TRACEQL_INDEXED_ATTRIBUTES
 log_rollup_resolution: 5s
-metrics_landing_retention_hours: 6    # how long the metrics landing table keeps a landed row, in hours
 metrics_dedup_window: 10000           # blocks each metrics table remembers for deduplication
-log_landing_retention_hours: 6        # how long the logs landing table keeps a landed row, in hours
 log_dedup_window: 10000               # blocks each logs table remembers for deduplication
-trace_landing_retention_hours: 6      # how long the traces landing table keeps a landed row, in hours
 trace_dedup_window: 10000             # blocks each traces table remembers for deduplication
 cluster: null                    # ClickHouse cluster name; enables distributed DDL
 dist_suffix: _dist
@@ -317,16 +323,6 @@ reader:
   tail_max_fetch_limit: 5000
   tail_catchup_slice: 60s
 
-downsampling:
-  enabled: false
-  raw_retention: null            # overrides retention_days for metric_samples when set
-  tier_policy: exact             # exact | fast
-  tiers: []                      # see §7; name/table unique, resolution/min_step/retention
-                                 # strictly increasing, min_step >= resolution per tier. e.g.:
-                                 #   tiers:
-                                 #     - {name: r5m, resolution: 5m, table: metric_samples_5m, retention: 30d, min_step: 5m}
-                                 #     - {name: r1h, resolution: 1h, table: metric_samples_1h, retention: 365d, min_step: 1h}
-
 ruler:
   enabled: false
   poll_interval: 30s
@@ -363,7 +359,6 @@ services:
     image: ghcr.io/digitalis-io/pulsusdb:latest
     environment:
       CLICKHOUSE_SERVER: clickhouse
-      PULSUS_RETENTION_DAYS: "7"
     ports: [ "3100:3100" ]
     depends_on:
       clickhouse: { condition: service_healthy }

@@ -109,18 +109,12 @@ fn ch_http_port() -> u16 {
 /// ```
 ///
 /// **Its TTL cannot erase it.** The sample tables carry
-/// `timestamp_ns + INTERVAL <retention_days> DAY DELETE`, so at the default
-/// seven days an instant this far in the past is dropped before the first
-/// query runs. The server this suite spawns sets `PULSUS_RETENTION_DAYS`
-/// to a hundred years, which the tables' `CREATE` declares when `run_init`
-/// builds them — so the pinned instant stays readable however long the
-/// constant sits here.
+/// `timestamp_ns + <retention_days> days`, so at a retention of seven
+/// days an instant this far in the past is dropped before the first
+/// query runs. The schema this suite builds keeps a hundred years
+/// (`live_db::SCHEMA_RETENTION_DAYS`) — so the pinned instant stays
+/// readable however long the constant sits here.
 const T0_NS: i64 = 1_768_435_200_000_000_000;
-
-/// The retention this suite's server runs with, in days: a hundred years,
-/// so [`T0_NS`] is never inside the delete window. The schema applies it at
-/// start-up, and the databases are dropped at the end of each test.
-const RETENTION_DAYS: &str = "36500";
 
 struct HttpResponse {
     status: u16,
@@ -280,9 +274,8 @@ fn spawn_ready(port: u16, db: &str) -> ChildGuard {
         // at this measurement returned empty for exactly that reason.
         .env("PULSUS_CACHE_TTL", "1s")
         .env("PULSUS_COMPAT_ENDPOINTS", "true")
-        // The fixture's instant is pinned in the past; the default
-        // seven-day TTL would delete it before the first query.
-        .env("PULSUS_RETENTION_DAYS", RETENTION_DAYS)
+        // The fixture's instant is pinned in the past; a short retention
+        // would delete it before the first query.
         .env("CLICKHOUSE_SERVER", ch_host())
         .env("CLICKHOUSE_HTTP_PORT", ch_http_port().to_string())
         .env("CLICKHOUSE_DB", db);

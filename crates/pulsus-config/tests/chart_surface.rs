@@ -255,7 +255,14 @@ fn every_chart_config_key_is_a_binary_key_at_the_binary_default() {
 
 /// The README values-table cells that are words rather than a value, with
 /// the exact cell. Asserted by equality.
-const README_WORD_DEFAULTS: &[(&str, &str)] = &[("pulsusdb.config.*", "see `values.yaml`")];
+const README_WORD_DEFAULTS: &[(&str, &str)] = &[
+    ("pulsusdb.config.*", "see `values.yaml`"),
+    // Issue #497: retention has no default, so `values.yaml` has no value.
+    (
+        "initJob.retentionDays",
+        "none: required while `initJob.enabled`",
+    ),
+];
 
 /// The chart README's "Values reference" table and `values.yaml`, both ways:
 /// every key the table names exists in `values.yaml`, every `values.yaml`
@@ -528,14 +535,6 @@ fn schema_leaves<'a>(
     }
 }
 
-/// A valid tier, so an element field can be probed inside a valid list.
-fn base_tier() -> serde_norway::Mapping {
-    serde_norway::from_str(
-        "{name: r5m, resolution: 5m, table: metric_samples_5m, retention: 30d, min_step: 5m}",
-    )
-    .unwrap()
-}
-
 /// The values every property is probed with: each JSON type, and the string
 /// forms a duration, a byte size or a name can take.
 fn probes() -> Vec<serde_norway::Value> {
@@ -547,24 +546,13 @@ fn probes() -> Vec<serde_norway::Value> {
     serde_norway::from_str(text).unwrap()
 }
 
-/// `doc` with the value at dotted `path` replaced; `<list>[].<field>` sets
-/// that one field in a one-element list holding `base_tier()`.
+/// `doc` with the value at dotted `path` replaced.
 fn with_value(
     doc: &serde_norway::Value,
     path: &str,
     v: &serde_norway::Value,
 ) -> serde_norway::Value {
-    let (path, v) = match path.split_once("[].") {
-        Some((list, field)) => {
-            let mut tier = base_tier();
-            tier.insert(field.into(), v.clone());
-            (
-                list.to_string(),
-                serde_norway::Value::Sequence(vec![tier.into()]),
-            )
-        }
-        None => (path.to_string(), v.clone()),
-    };
+    let v = v.clone();
     let mut doc = doc.clone();
     let steps: Vec<&str> = path.split('.').collect();
     let mut cur = &mut doc;
@@ -593,16 +581,6 @@ fn server_accepts(path: &str, v: &serde_norway::Value) -> bool {
     server_verdict(path, v).is_ok()
 }
 
-/// The one server rule the schema is not held to: a tier's `min_step` must
-/// be at least its `resolution`. It relates two fields, and so do the rules
-/// across tiers (durations strictly increasing, names and tables unique),
-/// which a one-tier probe never reaches. The schema does not encode them:
-/// the server refuses them at startup with a message naming the fields
-/// (`a_tier_relation_the_schema_does_not_check_is_refused_at_startup`), and
-/// the `downsampling` section is due for removal. A refusal carrying this
-/// text, at a tier field, is not counted by the sweep.
-const TIER_RELATION_REFUSAL: &str = "must be >= resolution";
-
 /// The values the server accepts and the schema refuses by decision, with
 /// the probe that finds each. Asserted by equality.
 /// * `clickhouse.server` with surrounding whitespace: the template renders
@@ -610,9 +588,7 @@ const TIER_RELATION_REFUSAL: &str = "must be >= resolution";
 /// * `clickhouse.database` empty: no database has an empty name.
 /// * `05s` and `016MiB`, leading zeros: stricter by decision. The positive
 ///   duration and byte-size patterns refuse them; `humanDuration` accepts
-///   them, so its keys are not listed. A tier's `min_step` is probed with
-///   `05m` (`TIER_MIN_STEP_LEADING_ZERO`), because `05s` is below the probe
-///   tier's 5m `resolution` and the server refuses it for that.
+///   them, so its keys are not listed.
 const SCHEMA_STRICTER: &[(&str, &str)] = &[
     ("query_timeout", "05s"),
     ("log_rollup_resolution", "05s"),
@@ -622,10 +598,6 @@ const SCHEMA_STRICTER: &[(&str, &str)] = &[
     ("writer.ingest_queue_bytes", "016MiB"),
     ("reader.logql_scan_budget_bytes", "016MiB"),
     ("reader.traceql_tag_lookback", "05s"),
-    ("downsampling.raw_retention", "05s"),
-    ("downsampling.tiers[].resolution", "05s"),
-    ("downsampling.tiers[].retention", "05s"),
-    ("downsampling.tiers[].min_step", "05m"),
     ("ruler.poll_interval", "05s"),
     ("ruler.max_result_bytes", "016MiB"),
 ];
@@ -633,10 +605,6 @@ const SCHEMA_STRICTER: &[(&str, &str)] = &[
 /// A duration and a byte size with a leading zero, probed at every key in
 /// the reverse direction.
 const LEADING_ZERO_PROBES: &[&str] = &["05s", "016MiB"];
-
-/// A leading-zero `min_step` that fits the probe tier: `05m` equals its
-/// `resolution`, so only the leading zero is in question.
-const TIER_MIN_STEP_LEADING_ZERO: (&str, &str) = ("downsampling.tiers[].min_step", "05m");
 
 /// The definitions whose values the server trims before parsing: durations
 /// and byte sizes (`units.rs`). Their patterns accept surrounding ASCII
@@ -782,7 +750,7 @@ fn the_chart_schema_accepts_no_value_the_binary_refuses() {
     let mut enumerated = Vec::new();
     members(&schema, config_schema, &mut enumerated);
     assert!(
-        enumerated.len() >= 10,
+        enumerated.len() >= 9,
         "the member finder found only {enumerated:?}"
     );
     let mut refused = Vec::new();
@@ -839,10 +807,7 @@ fn the_chart_schema_accepts_no_value_the_binary_refuses() {
             .and_then(|r| r.strip_prefix("#/definitions/"))
             .is_some_and(|d| TRIMMED_DEFINITIONS.contains(&d));
         if trimmed {
-            let own = match path.split_once("[].") {
-                Some((_, field)) => base_tier().get(field).cloned(),
-                None => path.split('.').try_fold(&values, |v, s| v.get(s)).cloned(),
-            };
+            let own = path.split('.').try_fold(&values, |v, s| v.get(s)).cloned();
             let strings: Vec<String> = reverse
                 .iter()
                 .chain(own.iter())
@@ -860,20 +825,9 @@ fn the_chart_schema_accepts_no_value_the_binary_refuses() {
         for probe in LEADING_ZERO_PROBES {
             reverse.push(serde_norway::Value::String(probe.to_string()));
         }
-        if path == TIER_MIN_STEP_LEADING_ZERO.0 {
-            reverse.push(serde_norway::Value::String(
-                TIER_MIN_STEP_LEADING_ZERO.1.to_string(),
-            ));
-        }
         for v in candidates {
-            let verdict = server_verdict(path, &v);
-            let relation = path.contains("[].")
-                && verdict
-                    .as_ref()
-                    .is_err_and(|e| e.contains(TIER_RELATION_REFUSAL));
             if schema_accepts(&schema, config_schema, &with_value(&values, path, &v))
-                && verdict.is_err()
-                && !relation
+                && !server_accepts(path, &v)
             {
                 refused.push(format!(
                     "{path} = {}",
@@ -897,7 +851,7 @@ fn the_chart_schema_accepts_no_value_the_binary_refuses() {
         }
     }
     assert!(
-        leaves.len() >= 40,
+        leaves.len() >= 32,
         "the leaf finder found only {}",
         leaves.len()
     );
@@ -906,7 +860,7 @@ fn the_chart_schema_accepts_no_value_the_binary_refuses() {
         "values.yaml's own configuration must pass the schema"
     );
     assert!(
-        padded_keys >= 15,
+        padded_keys >= 11,
         "the padded probes reached only {padded_keys} keys"
     );
     assert!(
@@ -920,100 +874,6 @@ fn the_chart_schema_accepts_no_value_the_binary_refuses() {
     assert_eq!(
         rejected, want,
         "values the server accepts and the schema refuses, beyond the listed ones"
-    );
-}
-
-/// The limit `TIER_RELATION_REFUSAL` states, held true: a tier whose
-/// `min_step` is below its `resolution`, with downsampling enabled, passes
-/// the schema, and the server refuses it at startup with a message naming
-/// both fields.
-#[test]
-fn a_tier_relation_the_schema_does_not_check_is_refused_at_startup() {
-    let schema = parse_doc(
-        &read("deploy/charts/pulsusdb/values.schema.json"),
-        "values.schema.json",
-    );
-    let config_schema = get(&schema, &["definitions", "pulsusdbConfig"]);
-    let tiers: serde_norway::Value = serde_norway::from_str(
-        "[{name: r10m, resolution: 10m, table: metric_samples_10m, retention: 30d, min_step: 5m}]",
-    )
-    .unwrap();
-    let values = with_value(
-        &with_value(&chart_config(), "downsampling.enabled", &true.into()),
-        "downsampling.tiers",
-        &tiers,
-    );
-    assert!(
-        schema_accepts(&schema, config_schema, &values),
-        "the schema refuses the tier, so the limit no longer holds"
-    );
-    let cfg: Config = serde_norway::from_value(values).expect("the tier parses");
-    let err = pulsus_config::validate(&cfg)
-        .expect_err("the server must refuse min_step below resolution")
-        .to_string();
-    assert!(
-        err.contains("min_step")
-            && err.contains("resolution")
-            && err.contains(TIER_RELATION_REFUSAL),
-        "the refusal must name both fields: {err}"
-    );
-}
-
-/// The chart's tier entry names exactly the binary's tier fields, and
-/// requires exactly the ones the binary requires: a field is required when
-/// a tier without it does not parse.
-#[test]
-fn the_chart_tier_entry_matches_the_binary_tier() {
-    let schema = parse_doc(
-        &read("deploy/charts/pulsusdb/values.schema.json"),
-        "values.schema.json",
-    );
-    let items = get(
-        &schema,
-        &[
-            "definitions",
-            "pulsusdbConfig",
-            "properties",
-            "downsampling",
-            "properties",
-            "tiers",
-            "items",
-        ],
-    );
-    let in_schema: BTreeSet<String> = items
-        .get("properties")
-        .and_then(|p| p.as_mapping())
-        .expect("tier properties")
-        .keys()
-        .map(|k| k.as_str().unwrap().to_string())
-        .collect();
-    let required_in_schema: BTreeSet<String> = items
-        .get("required")
-        .and_then(|r| r.as_sequence())
-        .expect("tier required")
-        .iter()
-        .map(|k| k.as_str().unwrap().to_string())
-        .collect();
-    let tier = base_tier();
-    let in_binary: BTreeSet<String> = support::key_paths(
-        &serde_norway::to_value(
-            serde_norway::from_value::<pulsus_config::Tier>(tier.clone().into()).unwrap(),
-        )
-        .unwrap(),
-    );
-    let required_in_binary: BTreeSet<String> = in_binary
-        .iter()
-        .filter(|k| {
-            let mut t = tier.clone();
-            t.remove(k.as_str());
-            serde_norway::from_value::<pulsus_config::Tier>(t.into()).is_err()
-        })
-        .cloned()
-        .collect();
-    assert_eq!(in_schema, in_binary, "the tier entry's fields");
-    assert_eq!(
-        required_in_schema, required_in_binary,
-        "the tier entry's required fields"
     );
 }
 
@@ -1189,6 +1049,19 @@ fn chart_prose() -> Vec<(String, String)> {
 fn every_name_the_chart_prose_uses_resolves() {
     let values = parse_doc(&read("deploy/charts/pulsusdb/values.yaml"), "values.yaml");
     let config = get(&values, &["pulsusdb", "config"]).clone();
+    // Issue #497: a key with no default is in the schema and not in
+    // `values.yaml`; `initJob.retentionDays` is one.
+    let schema = parse_doc(
+        &read("deploy/charts/pulsusdb/values.schema.json"),
+        "values.schema.json",
+    );
+    let declared = |path: &str| {
+        path.split('.')
+            .try_fold(&schema, |node, step| {
+                node.get("properties").and_then(|p| p.get(step))
+            })
+            .is_some()
+    };
     let top: BTreeSet<String> = values
         .as_mapping()
         .unwrap()
@@ -1282,7 +1155,7 @@ fn every_name_the_chart_prose_uses_resolves() {
             let resolves = |root: &serde_norway::Value| {
                 path.split('.').try_fold(root, |v, s| v.get(s)).is_some()
             };
-            if resolves(&values) || resolves(&config) {
+            if resolves(&values) || resolves(&config) || declared(path) {
                 counts[2] += 1;
             } else if defines.contains(path) {
                 counts[3] += 1;
@@ -1473,8 +1346,9 @@ fn every_schema_maximum_is_a_json_safe_integer() {
     assert!(over.is_empty(), "maximums above 2^53 - 1: {over:?}");
 }
 
-/// Every object of the configuration — the root, each section, the tier
-/// entry, and any object reached through a local `$ref` — is closed (`additionalProperties: false`), and one extra member
+/// Every object of the configuration — the root, each section, and any
+/// object reached through a local `$ref` — is closed
+/// (`additionalProperties: false`), and one extra member
 /// in each is refused by the schema and by the server.
 #[test]
 fn every_config_object_in_the_schema_is_closed() {
@@ -1484,7 +1358,7 @@ fn every_config_object_in_the_schema_is_closed() {
     );
     let config_schema = get(&schema, &["definitions", "pulsusdbConfig"]);
     let values = chart_config();
-    // (path to the object, its schema node); a tier entry is `<list>[]`.
+    // (path to the object, its schema node); a list entry is `<list>[]`.
     fn objects<'a>(
         root: &'a serde_norway::Value,
         node: &'a serde_norway::Value,
@@ -1513,15 +1387,7 @@ fn every_config_object_in_the_schema_is_closed() {
     let paths: Vec<&str> = found.iter().map(|(p, _)| p.as_str()).collect();
     assert_eq!(
         paths,
-        [
-            "",
-            "clickhouse",
-            "writer",
-            "reader",
-            "downsampling",
-            "downsampling.tiers[]",
-            "ruler"
-        ],
+        ["", "clickhouse", "writer", "reader", "ruler"],
         "the configuration's objects"
     );
     for (path, node) in &found {

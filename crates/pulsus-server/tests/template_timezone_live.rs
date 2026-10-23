@@ -218,10 +218,7 @@ fn spawn_ready(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
         .env("PULSUS_PORT", port.to_string())
         .env("CLICKHOUSE_SERVER", ch_host())
         .env("CLICKHOUSE_HTTP_PORT", ch_http_port().to_string())
-        .env("CLICKHOUSE_DB", db)
-        // The fixture instant is in 2023; the default 7-day TTL would make
-        // the seeded rows eligible for deletion on any merge.
-        .env("PULSUS_RETENTION_DAYS", "36500");
+        .env("CLICKHOUSE_DB", db);
     for (key, value) in extra_env {
         command.env(key, value);
     }

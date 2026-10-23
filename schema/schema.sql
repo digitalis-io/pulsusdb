@@ -23,7 +23,7 @@
 -- THERE ARE NO MIGRATIONS. A schema change is an edit here and another run
 -- of the script, which drops the database and builds it again.
 
-CREATE DATABASE IF NOT EXISTS {{db}}{{on_cluster}};
+CREATE DATABASE IF NOT EXISTS {{db}}{{on_cluster}} COMMENT 'retention_days={{retention_days}}';
 
 CREATE TABLE IF NOT EXISTS {{db}}.log_landing{{on_cluster}}
 (

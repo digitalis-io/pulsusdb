@@ -35,11 +35,6 @@ pub enum ConfigError {
         msg: String,
         expected: String,
     },
-
-    /// A `downsampling.tiers` invariant (docs/configuration.md §7) was
-    /// violated.
-    #[error("invalid downsampling tiers: {0}")]
-    Tier(String),
 }
 
 #[cfg(test)]
@@ -65,15 +60,6 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "invalid value for port: must not be 0 (expected 1-65535)"
-        );
-    }
-
-    #[test]
-    fn tier_error_message_wraps_the_reason() {
-        let err = ConfigError::Tier("duplicate tier name \"5m\"".to_string());
-        assert_eq!(
-            err.to_string(),
-            "invalid downsampling tiers: duplicate tier name \"5m\""
         );
     }
 }

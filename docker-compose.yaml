@@ -39,7 +39,6 @@ services:
     image: ghcr.io/digitalis-io/pulsusdb:latest
     environment:
       CLICKHOUSE_SERVER: clickhouse
-      PULSUS_RETENTION_DAYS: "7"
     ports: [ "3100:3100" ]
     depends_on:
       clickhouse: { condition: service_healthy }

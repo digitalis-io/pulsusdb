@@ -745,8 +745,11 @@ pub(crate) async fn status_flags() -> Response {
 }
 
 pub(crate) async fn status_runtimeinfo(State(state): State<AppState>) -> Response {
+    let Some(retention_days) = state.retention_days() else {
+        return ApiError::Unavailable.into_response();
+    };
     let start_time = chrono::DateTime::<chrono::Utc>::from(state.started_at).to_rfc3339();
-    encode::status_runtimeinfo_response(start_time, state.config.retention_days)
+    encode::status_runtimeinfo_response(start_time, retention_days)
 }
 
 pub(crate) async fn status_tsdb(
@@ -795,6 +798,7 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             pool: Arc::new(RwLock::new(None)),
+            retention_days: std::sync::Arc::new(std::sync::OnceLock::from(7)),
             config: Arc::new(Config::default()),
             metrics: metrics_exporter_prometheus::PrometheusBuilder::new()
                 .build_recorder()

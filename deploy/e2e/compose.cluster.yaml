@@ -63,7 +63,6 @@ services:
     environment:
       CLICKHOUSE_SERVER: "172.28.0.11" # ch-shard1's static ipv4_address
       PULSUS_CLUSTER: pulsus_test_cluster
-      PULSUS_RETENTION_DAYS: "7"
       # Issue #82 (M6-05b): the info() differential rows plan only under
       # the experimental gate — flag parity with the prometheus oracle's
       # --enable-feature=promql-experimental-functions below.

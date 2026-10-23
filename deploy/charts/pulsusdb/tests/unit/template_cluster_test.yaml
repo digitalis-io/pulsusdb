@@ -5,6 +5,9 @@ release:
 set:
   topology: cluster
   clickhouse.shards: 3
+# Retention has no default (issue #497): every render states it.
+set:
+  initJob.retentionDays: 7
 templates:
   - clickhouse-shard-statefulset.yaml
   - clickhouse-cluster-configmap.yaml

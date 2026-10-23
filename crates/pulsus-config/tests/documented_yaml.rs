@@ -265,11 +265,7 @@ fn element_keys() -> Vec<(&'static str, BTreeSet<String>)> {
         .collect();
     assert_eq!(
         lists,
-        [
-            "clickhouse.servers",
-            "downsampling.tiers",
-            "traceql_indexed_attributes"
-        ],
+        ["clickhouse.servers", "traceql_indexed_attributes"],
         "the model's list fields"
     );
     let server = pulsus_config::ChServerEntry {
@@ -277,24 +273,10 @@ fn element_keys() -> Vec<(&'static str, BTreeSet<String>)> {
         http_port: Some(1),
         zone: Some("z".to_string()),
     };
-    let minute = pulsus_config::HumanDuration(std::time::Duration::from_secs(60));
-    let tier = pulsus_config::Tier {
-        name: "n".to_string(),
-        resolution: minute,
-        table: "t".to_string(),
-        retention: minute,
-        min_step: minute,
-    };
-    vec![
-        (
-            "servers",
-            support::key_paths(&serde_norway::to_value(server).expect("serialise a server")),
-        ),
-        (
-            "tiers",
-            support::key_paths(&serde_norway::to_value(tier).expect("serialise a tier")),
-        ),
-    ]
+    vec![(
+        "servers",
+        support::key_paths(&serde_norway::to_value(server).expect("serialise a server")),
+    )]
 }
 
 /// The comment lines after a comment line whose text is exactly `<field>:`,
@@ -339,9 +321,6 @@ fn the_list_examples_name_every_element_key() {
                         serde_norway::from_value::<pulsus_config::ChServerEntry>(example.clone())
                             .map(drop)
                     }
-                    "tiers" => {
-                        serde_norway::from_value::<pulsus_config::Tier>(example.clone()).map(drop)
-                    }
                     other => unreachable!("no element type for {other}"),
                 };
                 parsed.unwrap_or_else(|e| panic!("{what}: example {field} entry {example:?}: {e}"));
@@ -349,33 +328,6 @@ fn the_list_examples_name_every_element_key() {
             assert_eq!(got, want, "{what}: the example {field} entries' keys");
         }
     }
-}
-
-/// docs/configuration.md §7's first YAML block is a configuration the
-/// server starts with, and its tier entries name every tier key.
-#[test]
-fn section_7_tier_example_is_a_valid_configuration() {
-    let doc = support::repo_file("docs/configuration.md");
-    let section = doc
-        .split_once("\n## 7. ")
-        .expect("docs/configuration.md has a §7 heading")
-        .1;
-    let block = first_yaml_block(section, "§7");
-    let cfg = config(block, "§7's example");
-    pulsus_config::validate(&cfg).unwrap_or_else(|e| panic!("§7's example must validate: {e}"));
-    let tiers = yaml(block, "§7's example")
-        .get("downsampling")
-        .and_then(|d| d.get("tiers"))
-        .and_then(Value::as_sequence)
-        .cloned()
-        .expect("§7's example has downsampling.tiers");
-    let got: BTreeSet<String> = tiers.iter().flat_map(support::key_paths).collect();
-    let want = element_keys()
-        .into_iter()
-        .find(|(field, _)| *field == "tiers")
-        .expect("tiers are a list field")
-        .1;
-    assert_eq!(got, want, "§7's tier entries' keys");
 }
 
 /// `docker-compose.yaml` and `otel-config.yaml` each say they mirror
@@ -404,46 +356,4 @@ fn the_quickstart_files_are_section_10s_yaml() {
             "{file} must be §10's YAML"
         );
     }
-}
-
-/// Issue #506 part 3: docs/configuration.md §7 and docs/architecture.md
-/// §3.1.1 say the `downsampling` settings are parsed and validated and that
-/// nothing else reads them. This holds the second half: no source file
-/// outside this crate names them. When downsampling is built, this fails,
-/// and the two "Not built yet" paragraphs go with it.
-#[test]
-fn nothing_outside_the_config_crate_reads_the_downsampling_settings() {
-    let names = regex::Regex::new(
-        r"\.downsampling\b|DownsamplingConfig|TierPolicy|tier_policy|raw_retention",
-    )
-    .unwrap();
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let listing = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .args(["ls-files", "-z", "--", "crates"])
-        .output()
-        .expect("git ls-files must run");
-    let mut sources = 0usize;
-    let mut readers = Vec::new();
-    for file in String::from_utf8(listing.stdout).unwrap().split('\0') {
-        if !file.contains("/src/")
-            || !file.ends_with(".rs")
-            || file.starts_with("crates/pulsus-config/")
-        {
-            continue;
-        }
-        sources += 1;
-        let text = std::fs::read_to_string(root.join(file)).unwrap_or_default();
-        for (i, line) in text.lines().enumerate() {
-            if names.is_match(line) {
-                readers.push(format!("{file}:{}: {}", i + 1, line.trim()));
-            }
-        }
-    }
-    assert!(sources > 100, "read only {sources} source files");
-    assert!(
-        readers.is_empty(),
-        "the downsampling settings are read: {readers:#?}"
-    );
 }

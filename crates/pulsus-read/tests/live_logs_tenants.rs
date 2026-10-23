@@ -139,7 +139,7 @@ async fn every_log_table_read_answers_its_own_tenant() {
     let db = &pulsus_testkit::test_db("pulsus_read_it_log_tenants");
     let bootstrap = ChClient::new(conn("default")).await.expect("connect");
     execute(&bootstrap, &format!("DROP DATABASE IF EXISTS {db}")).await;
-    run_init(&bootstrap, &RenderCtx::for_tests(db))
+    run_init(&bootstrap, &RenderCtx::for_tests(db, 7))
         .await
         .expect("run_init");
     let client = ChClient::new(conn(db)).await.expect("connect");

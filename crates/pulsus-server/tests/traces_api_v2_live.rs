@@ -17,15 +17,15 @@
 //!
 //! ## The fixture is derived from the clock, not written as literals
 //!
-//! `spans` carries a delete TTL at `retention_days` (default 7,
-//! `crates/pulsus-config/src/model.rs:165`) with `ttl_only_drop_parts =
-//! 1`. Fixed calendar timestamps fall outside that window as soon as this
-//! file is a week old: the rows are dropped, every case returns empty,
+//! `spans` carries a delete TTL at `retention_days`, which has no default
+//! and which a suite states, with `ttl_only_drop_parts =
+//! 1`. Fixed calendar timestamps fall outside a seven-day window as soon as
+//! this file is a week old: the rows are dropped, every case returns empty,
 //! and the two cases whose expected answer is "nothing" would pass over an
 //! empty table — a green run that tested nothing. So the fixture is
 //! anchored on **yesterday's** UTC day start, which keeps every span and
-//! every request window in the past, less than two days old, and six days
-//! inside the default retention; and it makes this morning's midnight an
+//! every request window in the past, less than two days old, and inside
+//! any retention of two days or more; and it makes this morning's midnight an
 //! instant that has already passed, which `T-B3` needs.
 //!
 //! Both cases whose expected answer is empty carry their own non-vacuity
@@ -4602,9 +4602,10 @@ fn sorted_trace_ids(port: u16, q: &str, start_ns: i64, end_ns: i64, ctx: &str) -
 ///
 /// Three one-span traces: `A` and `C` an hour past the 7-day cutoff, `B`
 /// an hour inside it. The schema keeps everything (built at the suite's
-/// own retention), so expiry is played by hand: `C` is deleted from the
-/// tables and `A` is not. Without the clamp the search returns `A`, which
-/// storage still holds.
+/// own retention) and its database then states seven days, which is the
+/// state storage is in before a part drop removes rows past the cutoff.
+/// Expiry is played by hand: `C` is deleted from the tables and `A` is not.
+/// Without the clamp the search returns `A`, which storage still holds.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_search_never_returns_a_span_past_retention() {
     if !should_run() {
@@ -4615,7 +4616,9 @@ async fn a_search_never_returns_a_span_past_retention() {
     const D: i64 = 24 * H;
     let port = 31_595;
     let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_retention")).await;
-    let _server = spawn_ready_with_env(port, &db, &[("PULSUS_RETENTION_DAYS", "7")]);
+    live_db::build_schema(db.name()).await;
+    live_db::state_retention(db.name(), 7).await;
+    let _server = spawn_ready_with_env(port, &db, &[]);
     let now = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let span = |trace: u8, start_ns: i64| {
         f61_span(
@@ -7007,7 +7010,7 @@ async fn a_run_cut_short_counts_once() {
 fn edge_job_statement(db: &str, max_rows: u64) -> String {
     let ctx = pulsus_schema::RenderCtx {
         graph_job_max_rows: max_rows,
-        ..pulsus_schema::RenderCtx::for_tests(db)
+        ..pulsus_schema::RenderCtx::for_tests(db, 7)
     };
     let head = format!("CREATE MATERIALIZED VIEW {db}.service_edges_mv ");
     pulsus_schema::rendered_statements(&ctx)
@@ -7555,7 +7558,7 @@ async fn a_marker_expires_with_its_bucket_start() {
         return;
     }
     let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_t2")).await;
-    // This case needs the default seven-day retention, not the suite's.
+    // This case needs a seven-day retention, not the suite's.
     live_db::drop_db(db.name()).await;
     live_db::build_schema_with_retention(db.name(), 7).await;
     let client = ch_data(&db).await;
@@ -8013,7 +8016,8 @@ impl Drop for SideDb {
 
 /// `pulsusdb` as a reader of another cluster: its own database holds only
 /// the `spans` routing table, named with `suffix`, and its configured
-/// cluster does not exist. No schema is built for it.
+/// cluster does not exist. No schema is built for it; its database states
+/// the suite's retention, which the binary reads at startup (issue #497).
 fn spawn_routed_reader(port: u16, reader: &SideDb, suffix: &str) -> ChildGuard {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     cmd.env("PULSUS_HOST", "127.0.0.1")
@@ -8084,7 +8088,15 @@ async fn the_graph_target_is_read_once_per_process() {
     let admin = ch_admin().await;
     let reader = SideDb(format!("{}_q", db.name()));
     live_db::drop_db(&reader.0).await;
-    ch_exec(&admin, &format!("CREATE DATABASE {}", reader.0)).await;
+    ch_exec(
+        &admin,
+        &format!(
+            "CREATE DATABASE {} COMMENT 'retention_days={}'",
+            reader.0,
+            live_db::SCHEMA_RETENTION_DAYS
+        ),
+    )
+    .await;
     route_spans(&admin, &reader, db.name()).await;
     let _reader = spawn_routed_reader(reader_port, &reader, "_q");
     let mut lookups = Vec::new();
@@ -8118,7 +8130,15 @@ async fn a_failed_target_read_is_retried() {
     let admin = ch_admin().await;
     let reader = SideDb(format!("{}_q", db.name()));
     live_db::drop_db(&reader.0).await;
-    ch_exec(&admin, &format!("CREATE DATABASE {}", reader.0)).await;
+    ch_exec(
+        &admin,
+        &format!(
+            "CREATE DATABASE {} COMMENT 'retention_days={}'",
+            reader.0,
+            live_db::SCHEMA_RETENTION_DAYS
+        ),
+    )
+    .await;
     // A routing table that routes nothing: not a `Distributed` definition.
     ch_exec(
         &admin,

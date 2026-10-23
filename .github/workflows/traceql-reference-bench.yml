@@ -39,7 +39,7 @@ jobs:
           curl -sf http://localhost:19123/ping && curl -sf http://localhost:13300/ready
       - name: Schema and PulsusDB
         run: |
-          CLICKHOUSE_SERVER=127.0.0.1 CLICKHOUSE_HTTP_PORT=19123 sh schema/schema.sh
+          CLICKHOUSE_SERVER=127.0.0.1 CLICKHOUSE_HTTP_PORT=19123 PULSUS_RETENTION_DAYS=7 sh schema/schema.sh
           # (r4) the containers' limits for the third process: four CPUs, 6 GiB of address space
           ( ulimit -v 6291456
             CLICKHOUSE_SERVER=127.0.0.1 CLICKHOUSE_HTTP_PORT=19123 PULSUS_PORT=3100 \

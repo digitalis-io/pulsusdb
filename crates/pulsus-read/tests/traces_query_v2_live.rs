@@ -172,7 +172,7 @@ async fn fresh_db(db: &str) -> ChClient {
         )
         .await
         .expect("drop the test database");
-    let ctx: SchemaParams = RenderCtx::for_tests(db);
+    let ctx: SchemaParams = RenderCtx::for_tests(db, 7);
     run_init(&admin, &ctx).await.expect("run_init");
     ChClient::new(ChConnConfig {
         database: db.to_string(),
@@ -11700,7 +11700,7 @@ async fn fresh_db_with_attrs(db: &str, attrs: &[&str]) -> ChClient {
         .expect("drop the test database");
     let ctx = SchemaParams {
         trace_indexed_attributes: attrs.iter().map(|a| a.to_string()).collect(),
-        ..RenderCtx::for_tests(db)
+        ..RenderCtx::for_tests(db, 7)
     };
     run_init(&admin, &ctx).await.expect("run_init");
     ChClient::new(ChConnConfig {

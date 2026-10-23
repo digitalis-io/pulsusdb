@@ -1119,11 +1119,11 @@ async fn ancient_start_is_clamped_to_the_retention_floor_in_the_first_poll() {
     // (issue #94). A 7-day catch-up slice makes the ~2-day clamped window a
     // single slice, so catch-up is a handful of polls, never thousands (a
     // raw start=0 without the clamp would grind ~decades of empty slices).
+    live_db::build_schema_blocking_with_retention(db, 1);
     let _guard = spawn_ready(
         port,
         db,
         &[
-            ("PULSUS_RETENTION_DAYS", "1"),
             ("PULSUS_TAIL_POLL_INTERVAL", "200ms"),
             ("PULSUS_TAIL_CATCHUP_SLICE", "7d"),
             ("PULSUS_TAIL_MAX_FETCH_LIMIT", "1000000"),
@@ -1467,19 +1467,19 @@ async fn stage1_month_narrowing_keeps_an_older_registered_orphan_resolvable_via_
         "construction sanity: A and B fall in different calendar months"
     );
 
-    // PULSUS_RETENTION_DAYS=90 keeps the clamp floor (issue #94 item 1)
+    // A 90-day retention keeps the clamp floor (issue #94 item 1)
     // below A (~59-62 days back) and log_samples' TTL from expiring
     // either seed. PULSUS_TAIL_CATCHUP_SLICE=10d is strictly shorter than
     // any single calendar month, so the lowest lower bound of any poll
     // window containing B_sample sits at least `10d` before it — still
     // within B's month or the buffer month, never month(A) — guaranteeing
     // every B-containing poll excludes month(A).
+    live_db::build_schema_blocking_with_retention(db, 90);
     let _guard = spawn_ready(
         port,
         db,
         &[
             ("PULSUS_TAIL_POLL_INTERVAL", "50ms"),
-            ("PULSUS_RETENTION_DAYS", "90"),
             ("PULSUS_TAIL_CATCHUP_SLICE", "10d"),
         ],
     );

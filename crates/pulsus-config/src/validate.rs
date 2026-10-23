@@ -1,5 +1,5 @@
-//! Cross-field startup validation (docs/configuration.md §7's tier rules,
-//! plus sensible guards enumerated in the issue #2 architect plan). Kept
+//! Cross-field startup validation (the sensible guards enumerated in the
+//! issue #2 architect plan). Kept
 //! separate from [`crate::parse`] so environment/YAML/CLI parsing can be
 //! tested independently of validation — in particular, the one-sided
 //! basic-auth rule (#12) would otherwise block env-matrix parse coverage
@@ -192,15 +192,6 @@ pub const INGEST_DEDUP_MAX_BYTES_FLOOR: u64 = 1024 * 1024;
 /// See [`INGEST_DEDUP_MAX_BYTES_FLOOR`].
 pub const INGEST_DEDUP_MAX_BYTES_CEILING: u64 = 1024 * 1024 * 1024;
 
-/// `metrics_landing_retention_hours` — how long the metrics landing table
-/// keeps a landed row. The range is one hour to one week, unchanged since
-/// issue #603; nothing in the product reads a landed row after its views
-/// have run, so the rows are kept only so a person can inspect them by
-/// hand.
-pub const METRICS_LANDING_RETENTION_HOURS_FLOOR: u32 = 1;
-/// See [`METRICS_LANDING_RETENTION_HOURS_FLOOR`].
-pub const METRICS_LANDING_RETENTION_HOURS_CEILING: u32 = 168;
-
 /// `metrics_dedup_window` — how many recent blocks each table on the metrics
 /// write path remembers. The floor is one block, the least that recognises
 /// an immediately repeated resend; the ceiling is a million, the largest the
@@ -236,15 +227,6 @@ pub const METRICS_LANDING_INSERTERS_CEILING: u32 = 64;
 pub const METRICS_LANDING_MAX_ROWS_FLOOR: u64 = 1_000;
 /// See [`METRICS_LANDING_MAX_ROWS_FLOOR`].
 pub const METRICS_LANDING_MAX_ROWS_CEILING: u64 = 10_000_000;
-
-/// `log_landing_retention_hours` — how long the logs landing table
-/// keeps a landed row. The range is one hour to one week, unchanged since
-/// issue #603; nothing in the product reads a landed row after its views
-/// have run, so the rows are kept only so a person can inspect them by
-/// hand.
-pub const LOG_LANDING_RETENTION_HOURS_FLOOR: u32 = 1;
-/// See [`LOG_LANDING_RETENTION_HOURS_FLOOR`].
-pub const LOG_LANDING_RETENTION_HOURS_CEILING: u32 = 168;
 
 /// `log_dedup_window` — how many recent blocks each table on the logs write
 /// path remembers. The floor is one block, the least that recognises an
@@ -283,15 +265,6 @@ pub const LOG_LANDING_INSERTERS_CEILING: u32 = 64;
 pub const LOG_LANDING_MAX_ROWS_FLOOR: u64 = 1_000;
 /// See [`LOG_LANDING_MAX_ROWS_FLOOR`].
 pub const LOG_LANDING_MAX_ROWS_CEILING: u64 = 10_000_000;
-
-/// `trace_landing_retention_hours` — how long the traces landing table
-/// keeps a landed row. The range is one hour to one week, unchanged since
-/// issue #603; nothing in the product reads a landed row after its views
-/// have run, so the rows are kept only so a person can inspect them by
-/// hand.
-pub const TRACE_LANDING_RETENTION_HOURS_FLOOR: u32 = 1;
-/// See [`TRACE_LANDING_RETENTION_HOURS_FLOOR`].
-pub const TRACE_LANDING_RETENTION_HOURS_CEILING: u32 = 168;
 
 /// `trace_dedup_window` — how many recent blocks each of the six tables on
 /// the traces write path remembers. The floor is one block, the least that
@@ -545,11 +518,6 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         (None, None) | (Some(_), Some(_)) => {}
     }
 
-    // Rule 13: retention_days.
-    if cfg.retention_days < 1 {
-        return Err(value_err("retention_days", "must be >= 1", ">= 1"));
-    }
-
     // Issue #595 part 2: the indexed trace attributes.
     if cfg.traceql_indexed_attributes.len() > MAX_INDEXED_ATTRIBUTES {
         return Err(value_err(
@@ -578,17 +546,6 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     // Issue #603: the metrics landing table's dials. Both ends matter for
     // each, so these are range checks rather than ceiling checks — see each
     // constant for what its ends protect.
-    if !(METRICS_LANDING_RETENTION_HOURS_FLOOR..=METRICS_LANDING_RETENTION_HOURS_CEILING)
-        .contains(&cfg.metrics_landing_retention_hours)
-    {
-        return Err(range_err(
-            "metrics_landing_retention_hours",
-            u64::from(cfg.metrics_landing_retention_hours),
-            u64::from(METRICS_LANDING_RETENTION_HOURS_FLOOR),
-            u64::from(METRICS_LANDING_RETENTION_HOURS_CEILING),
-            "hours",
-        ));
-    }
     if !(METRICS_DEDUP_WINDOW_FLOOR..=METRICS_DEDUP_WINDOW_CEILING)
         .contains(&cfg.metrics_dedup_window)
     {
@@ -633,17 +590,6 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     }
 
     // Issue #603: the logs landing table's dials, the metrics block's twin.
-    if !(LOG_LANDING_RETENTION_HOURS_FLOOR..=LOG_LANDING_RETENTION_HOURS_CEILING)
-        .contains(&cfg.log_landing_retention_hours)
-    {
-        return Err(range_err(
-            "log_landing_retention_hours",
-            u64::from(cfg.log_landing_retention_hours),
-            u64::from(LOG_LANDING_RETENTION_HOURS_FLOOR),
-            u64::from(LOG_LANDING_RETENTION_HOURS_CEILING),
-            "hours",
-        ));
-    }
     if !(LOG_DEDUP_WINDOW_FLOOR..=LOG_DEDUP_WINDOW_CEILING).contains(&cfg.log_dedup_window) {
         return Err(range_err(
             "log_dedup_window",
@@ -687,17 +633,6 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
 
     // Issues #584 to #586: the traces landing table's dials, the two shipped
     // signals' blocks' twin.
-    if !(TRACE_LANDING_RETENTION_HOURS_FLOOR..=TRACE_LANDING_RETENTION_HOURS_CEILING)
-        .contains(&cfg.trace_landing_retention_hours)
-    {
-        return Err(range_err(
-            "trace_landing_retention_hours",
-            u64::from(cfg.trace_landing_retention_hours),
-            u64::from(TRACE_LANDING_RETENTION_HOURS_FLOOR),
-            u64::from(TRACE_LANDING_RETENTION_HOURS_CEILING),
-            "hours",
-        ));
-    }
     if !(TRACE_DEDUP_WINDOW_FLOOR..=TRACE_DEDUP_WINDOW_CEILING).contains(&cfg.trace_dedup_window) {
         return Err(range_err(
             "trace_dedup_window",
@@ -1127,102 +1062,6 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         ));
     }
 
-    // Rule 8: raw_retention, if set, must be > 0.
-    if let Some(raw_retention) = cfg.downsampling.raw_retention {
-        positive_duration("downsampling.raw_retention", raw_retention)?;
-    }
-
-    validate_tiers(cfg)?;
-
-    Ok(())
-}
-
-/// Rules 1-7 (docs/configuration.md §7): each tier's `min_step >=
-/// resolution`; `resolution`/`min_step`/`retention` strictly increasing
-/// across tiers in listed order; non-empty names/tables, unique across
-/// tiers; `enabled` requires at least one tier.
-fn validate_tiers(cfg: &Config) -> Result<(), ConfigError> {
-    let tiers = &cfg.downsampling.tiers;
-
-    if cfg.downsampling.enabled && tiers.is_empty() {
-        return Err(ConfigError::Tier(
-            "downsampling.enabled is true but no tiers are configured".to_string(),
-        ));
-    }
-
-    let mut names = std::collections::HashSet::new();
-    let mut tables = std::collections::HashSet::new();
-
-    for tier in tiers {
-        if tier.name.is_empty() {
-            return Err(ConfigError::Tier("tier name must not be empty".to_string()));
-        }
-        if tier.table.is_empty() {
-            return Err(ConfigError::Tier(format!(
-                "tier {:?}: table must not be empty",
-                tier.name
-            )));
-        }
-        if tier.resolution.0.is_zero() {
-            return Err(ConfigError::Tier(format!(
-                "tier {:?}: resolution must be > 0",
-                tier.name
-            )));
-        }
-        if tier.retention.0.is_zero() {
-            return Err(ConfigError::Tier(format!(
-                "tier {:?}: retention must be > 0",
-                tier.name
-            )));
-        }
-        if tier.min_step.0.is_zero() {
-            return Err(ConfigError::Tier(format!(
-                "tier {:?}: min_step must be > 0",
-                tier.name
-            )));
-        }
-        if tier.min_step.0 < tier.resolution.0 {
-            return Err(ConfigError::Tier(format!(
-                "tier {:?}: min_step ({:?}) must be >= resolution ({:?})",
-                tier.name, tier.min_step.0, tier.resolution.0
-            )));
-        }
-        if !names.insert(tier.name.clone()) {
-            return Err(ConfigError::Tier(format!(
-                "duplicate tier name {:?}",
-                tier.name
-            )));
-        }
-        if !tables.insert(tier.table.clone()) {
-            return Err(ConfigError::Tier(format!(
-                "duplicate tier table {:?}",
-                tier.table
-            )));
-        }
-    }
-
-    for pair in tiers.windows(2) {
-        let (prev, next) = (&pair[0], &pair[1]);
-        if next.resolution.0 <= prev.resolution.0 {
-            return Err(ConfigError::Tier(format!(
-                "tier {:?} resolution must be strictly greater than tier {:?} resolution",
-                next.name, prev.name
-            )));
-        }
-        if next.min_step.0 <= prev.min_step.0 {
-            return Err(ConfigError::Tier(format!(
-                "tier {:?} min_step must be strictly greater than tier {:?} min_step",
-                next.name, prev.name
-            )));
-        }
-        if next.retention.0 <= prev.retention.0 {
-            return Err(ConfigError::Tier(format!(
-                "tier {:?} retention must be strictly greater than tier {:?} retention",
-                next.name, prev.name
-            )));
-        }
-    }
-
     Ok(())
 }
 
@@ -1360,15 +1199,6 @@ mod tests {
             ..Config::default()
         };
         assert!(validate(&cfg).is_ok());
-    }
-
-    #[test]
-    fn zero_retention_days_is_rejected() {
-        let cfg = Config {
-            retention_days: 0,
-            ..Config::default()
-        };
-        assert!(validate(&cfg).is_err());
     }
 
     #[test]
@@ -1526,7 +1356,6 @@ mod tests {
     #[test]
     fn the_metrics_landing_dials_reject_both_sides_and_accept_both_ends() {
         let d = Config::default();
-        assert_eq!(d.metrics_landing_retention_hours, 6);
         assert_eq!(d.metrics_dedup_window, 10_000);
         assert_eq!(d.writer.metrics_landing_retries, 3);
         assert_eq!(d.writer.metrics_landing_inserters, 4);
@@ -1535,16 +1364,7 @@ mod tests {
 
         // (field, setter, bad values, good values)
         type Set = fn(&mut Config, u64);
-        let cases: [(&str, Set, Vec<u64>, Vec<u64>); 5] = [
-            (
-                "metrics_landing_retention_hours",
-                |c, v| c.metrics_landing_retention_hours = v as u32,
-                vec![0, u64::from(METRICS_LANDING_RETENTION_HOURS_CEILING) + 1],
-                vec![
-                    u64::from(METRICS_LANDING_RETENTION_HOURS_FLOOR),
-                    u64::from(METRICS_LANDING_RETENTION_HOURS_CEILING),
-                ],
-            ),
+        let cases: [(&str, Set, Vec<u64>, Vec<u64>); 4] = [
             (
                 "metrics_dedup_window",
                 |c, v| c.metrics_dedup_window = v,
@@ -1615,7 +1435,6 @@ mod tests {
     #[test]
     fn the_logs_landing_dials_reject_both_sides_and_accept_both_ends() {
         let d = Config::default();
-        assert_eq!(d.log_landing_retention_hours, 6);
         assert_eq!(d.log_dedup_window, 10_000);
         assert_eq!(d.writer.log_landing_retries, 3);
         assert_eq!(d.writer.log_landing_inserters, 4);
@@ -1624,16 +1443,7 @@ mod tests {
 
         // (field, setter, bad values, good values)
         type Set = fn(&mut Config, u64);
-        let cases: [(&str, Set, Vec<u64>, Vec<u64>); 5] = [
-            (
-                "log_landing_retention_hours",
-                |c, v| c.log_landing_retention_hours = v as u32,
-                vec![0, u64::from(LOG_LANDING_RETENTION_HOURS_CEILING) + 1],
-                vec![
-                    u64::from(LOG_LANDING_RETENTION_HOURS_FLOOR),
-                    u64::from(LOG_LANDING_RETENTION_HOURS_CEILING),
-                ],
-            ),
+        let cases: [(&str, Set, Vec<u64>, Vec<u64>); 4] = [
             (
                 "log_dedup_window",
                 |c, v| c.log_dedup_window = v,
@@ -1699,7 +1509,6 @@ mod tests {
     #[test]
     fn the_trace_landing_dials_reject_both_sides_and_accept_both_ends() {
         let d = Config::default();
-        assert_eq!(d.trace_landing_retention_hours, 6);
         assert_eq!(d.trace_dedup_window, 10_000);
         assert_eq!(d.writer.trace_landing_retries, 3);
         assert_eq!(d.writer.trace_landing_inserters, 4);
@@ -1708,16 +1517,7 @@ mod tests {
 
         // (field, setter, bad values, good values)
         type Set = fn(&mut Config, u64);
-        let cases: [(&str, Set, Vec<u64>, Vec<u64>); 5] = [
-            (
-                "trace_landing_retention_hours",
-                |c, v| c.trace_landing_retention_hours = v as u32,
-                vec![0, u64::from(TRACE_LANDING_RETENTION_HOURS_CEILING) + 1],
-                vec![
-                    u64::from(TRACE_LANDING_RETENTION_HOURS_FLOOR),
-                    u64::from(TRACE_LANDING_RETENTION_HOURS_CEILING),
-                ],
-            ),
+        let cases: [(&str, Set, Vec<u64>, Vec<u64>); 4] = [
             (
                 "trace_dedup_window",
                 |c, v| c.trace_dedup_window = v,
@@ -2350,20 +2150,6 @@ mod tests {
         cfg.clickhouse.select_sequential_consistency = false;
         cfg.clickhouse.insert_quorum = 2;
         cfg.clickhouse.insert_quorum_parallel = true;
-        assert!(validate(&cfg).is_ok());
-    }
-
-    #[test]
-    fn zero_raw_retention_is_rejected_when_set() {
-        let mut cfg = Config::default();
-        cfg.downsampling.raw_retention = Some(HumanDuration(std::time::Duration::ZERO));
-        assert!(validate(&cfg).is_err());
-    }
-
-    #[test]
-    fn unset_raw_retention_is_valid() {
-        let cfg = Config::default();
-        assert!(cfg.downsampling.raw_retention.is_none());
         assert!(validate(&cfg).is_ok());
     }
 }

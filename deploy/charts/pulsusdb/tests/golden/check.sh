@@ -59,8 +59,8 @@ expected() {
 SETS="single cluster"
 args_for() {
     case "$1" in
-        single) ;;
-        cluster) echo "--set topology=cluster --set clickhouse.shards=3" ;;
+        single) echo "--set initJob.retentionDays=7" ;;
+        cluster) echo "--set initJob.retentionDays=7 --set topology=cluster --set clickhouse.shards=3" ;;
     esac
 }
 

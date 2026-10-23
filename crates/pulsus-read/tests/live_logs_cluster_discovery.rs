@@ -105,7 +105,7 @@ fn shard2_config(database: &str) -> ChConnConfig {
 fn cluster_ctx(db: &str) -> RenderCtx {
     RenderCtx {
         cluster: Some(CLUSTER_NAME.to_string()),
-        ..RenderCtx::for_tests(db)
+        ..RenderCtx::for_tests(db, 7)
     }
 }
 

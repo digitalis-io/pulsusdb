@@ -75,7 +75,10 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
         exemplars: params.exemplars,
         // docs/api.md §4, "Retention": no statement reads a span older
         // than the retention cutoff, whether or not storage still holds it.
-        floor_ns: params::retention_floor_ns(state.config.retention_days, now_ns),
+        floor_ns: params::retention_floor_ns(
+            state.retention_days().ok_or(ApiError::PoolUnavailable)?,
+            now_ns,
+        ),
     };
     // Issue #596 part 1: the statement on `spans` answers every query
     // (issue #602 part 3a).
@@ -126,6 +129,7 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             pool: Arc::new(RwLock::new(None)),
+            retention_days: std::sync::Arc::new(std::sync::OnceLock::from(7)),
             config: Arc::new(Config::default()),
             metrics: metrics_exporter_prometheus::PrometheusBuilder::new()
                 .build_recorder()

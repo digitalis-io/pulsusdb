@@ -15,7 +15,7 @@ Feature: helm upgrade rolls pods, and the schema is not theirs to build
   Scenario: Upgrading a schema-affecting value changes the checksum/config annotation, rolls pods, and every replacement reaches Ready
     Given a Kind cluster with the locally-built pulsusdb image loaded
     And a running pulsusdb release installed with default values
-    When I helm upgrade the release with "--set pulsusdb.config.retention_days=14"
+    When I helm upgrade the release with "--set pulsusdb.config.log_rollup_resolution=10s"
     Then the upgrade succeeds
     And the pod template's checksum/config annotation changed from before the upgrade
     And every pod in the release reaches Ready within the timeout budget

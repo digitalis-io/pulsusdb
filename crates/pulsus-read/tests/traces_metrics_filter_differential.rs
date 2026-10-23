@@ -112,7 +112,7 @@ async fn exec(client: &ChClient, sql: &str) {
 
 async fn init_db(bootstrap: &ChClient, db: &str) {
     exec(bootstrap, &format!("DROP DATABASE IF EXISTS {db}")).await;
-    run_init(bootstrap, &RenderCtx::for_tests(db))
+    run_init(bootstrap, &RenderCtx::for_tests(db, 7))
         .await
         .expect("run_init");
 }

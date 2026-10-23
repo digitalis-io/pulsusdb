@@ -117,9 +117,9 @@ COPY --from=build /src/target/release/pulsusdb /usr/local/bin/pulsusdb
 
 # The schema, and the script that applies it. The binary creates none, so
 # an install needs both: `schema.sh` reads `schema.sql` from its own
-# directory and the same environment variables the binary reads.
+# directory, and requires PULSUS_RETENTION_DAYS (docs/configuration.md §7).
 #
-#   docker run --rm -e CLICKHOUSE_SERVER=... \
+#   docker run --rm -e CLICKHOUSE_SERVER=... -e PULSUS_RETENTION_DAYS=<days> \
 #     --entrypoint /usr/local/share/pulsusdb/schema/schema.sh <image>
 COPY schema /usr/local/share/pulsusdb/schema
 

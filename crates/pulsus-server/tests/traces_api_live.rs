@@ -120,7 +120,7 @@ const GROUPED_PORT: u16 = 31_602;
 /// FROZEN at 2023-11-14 so its captured bytes can be committed, and the
 /// delete-TTL the schema declares is
 /// `min(s + retention_days * 86400, 4294967295)` (docs/schemas.md §4.1) —
-/// under the default 7 days that expiry is in the past, ClickHouse drops
+/// under a 7-day retention that expiry is in the past, ClickHouse drops
 /// the part, and all four fetches answer `404` for a reason that has
 /// nothing to do with this issue. 3650 days puts it a decade out. Not a
 /// schema-identity input (`crates/pulsus-schema/src/render.rs` substitutes
@@ -2323,11 +2323,8 @@ async fn absent_submessages_are_materialized_present_and_empty_on_the_wire() {
         "pulsus_traces_nullable_wire_it_live",
     ))
     .await;
-    let _guard = spawn_ready_with_env(
-        NULLABLE_WIRE_PORT,
-        &db,
-        &[("PULSUS_RETENTION_DAYS", &FIXTURE_RETENTION_DAYS.to_string())],
-    );
+    live_db::build_schema_blocking_with_retention(&db, FIXTURE_RETENTION_DAYS);
+    let _guard = spawn_ready_with_env(NULLABLE_WIRE_PORT, &db, &[]);
 
     let push_body = wire_capture::from_hex(&capture.push_body_hex);
     let res = request(
@@ -2372,8 +2369,8 @@ async fn absent_submessages_are_materialized_present_and_empty_on_the_wire() {
     assert_eq!(
         stored, 4,
         "the four fixture spans must be inside retention — a count of 0 here is the delete-TTL \
-         dropping the frozen 2023 fixture, not a defect in the fill (spawn sets \
-         PULSUS_RETENTION_DAYS={FIXTURE_RETENTION_DAYS})"
+         dropping the frozen 2023 fixture, not a defect in the fill (the schema keeps \
+         {FIXTURE_RETENTION_DAYS} days)"
     );
 
     // -- Part 1: the four probes over the v1 fetch route -----------------

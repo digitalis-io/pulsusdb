@@ -128,10 +128,6 @@ const T_NS: i64 = 1_768_435_200_000_000_000;
 /// AND the 10-second pattern rows split, so L1b has one possible outcome.
 const T_SPLIT_NS: i64 = T_NS + 9_000_000_000;
 
-/// A hundred years of retention: the pinned instant is in the past and the
-/// default seven-day TTL would delete it before the first query.
-const RETENTION_DAYS: &str = "36500";
-
 fn should_run() -> bool {
     pulsus_testkit::live_clickhouse_enabled()
 }
@@ -304,7 +300,6 @@ fn spawn_ready(port: u16, db: &ScopedDb, extra_env: &[(&str, &str)]) -> ChildGua
         // metric legs inside their own deadline.
         .env("PULSUS_CACHE_TTL", "1s")
         .env("PULSUS_COMPAT_ENDPOINTS", "true")
-        .env("PULSUS_RETENTION_DAYS", RETENTION_DAYS)
         .env("CLICKHOUSE_SERVER", live_db::ch_host())
         .env("CLICKHOUSE_HTTP_PORT", live_db::ch_http_port().to_string())
         .env("CLICKHOUSE_DB", db.name());

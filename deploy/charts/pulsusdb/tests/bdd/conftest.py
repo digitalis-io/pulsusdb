@@ -243,6 +243,8 @@ class HelmRelease:
             "--set", f"image.repository={repo}",
             "--set", f"image.tag={tag}",
             "--set", "image.pullPolicy=Never",
+            # Retention has no default (issue #497).
+            "--set", "initJob.retentionDays=7",
         ]
 
     def install(self, *extra_args: str, timeout: str = "5m", wait: bool = True) -> subprocess.CompletedProcess:

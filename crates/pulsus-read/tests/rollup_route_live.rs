@@ -153,7 +153,7 @@ async fn exec(client: &ChClient, sql: &str) {
 async fn setup(db: &str, base: i64) -> ChClient {
     let admin = ChClient::new(test_config()).await.expect("connect");
     exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
-    run_init(&admin, &RenderCtx::for_tests(db))
+    run_init(&admin, &RenderCtx::for_tests(db, 7))
         .await
         .expect("run_init");
     let client = ChClient::new(ChConnConfig {

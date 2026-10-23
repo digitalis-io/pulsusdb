@@ -39,12 +39,9 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "CLICKHOUSE_INSERT_QUORUM_PARALLEL",
     "CLICKHOUSE_INSERT_QUORUM_TIMEOUT",
     "CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY",
-    "PULSUS_SKIP_DDL",
-    "PULSUS_RETENTION_DAYS",
     "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
     "PULSUS_STORAGE_POLICY",
     "PULSUS_LOG_ROLLUP_RESOLUTION",
-    "PULSUS_METRICS_LANDING_RETENTION_HOURS",
     "PULSUS_METRICS_DEDUP_WINDOW",
     "PULSUS_CLUSTER",
     "PULSUS_DIST_SUFFIX",
@@ -63,12 +60,10 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_METRICS_LANDING_RETRIES",
     "PULSUS_METRICS_LANDING_INSERTERS",
     "PULSUS_METRICS_LANDING_MAX_ROWS",
-    "PULSUS_LOG_LANDING_RETENTION_HOURS",
     "PULSUS_LOG_DEDUP_WINDOW",
     "PULSUS_LOG_LANDING_RETRIES",
     "PULSUS_LOG_LANDING_INSERTERS",
     "PULSUS_LOG_LANDING_MAX_ROWS",
-    "PULSUS_TRACE_LANDING_RETENTION_HOURS",
     "PULSUS_TRACE_DEDUP_WINDOW",
     "PULSUS_TRACE_LANDING_RETRIES",
     "PULSUS_TRACE_LANDING_INSERTERS",
@@ -105,7 +100,6 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_TAIL_SEND_TIMEOUT",
     "PULSUS_TAIL_MAX_FETCH_LIMIT",
     "PULSUS_TAIL_CATCHUP_SLICE",
-    "PULSUS_TIER_POLICY",
     "PULSUS_RULER_ENABLED",
     "PULSUS_RULER_POLL_INTERVAL",
     "PULSUS_RULER_MAX_RESULT_BYTES",
@@ -147,7 +141,7 @@ where
         .map_err(|e| env_err(var, format!("invalid integer {v:?}: {e}")))
 }
 
-/// Parses one of the `Mode`/`LogLevel`/`ChProto`/`InsertMode`/`TierPolicy`
+/// Parses one of the `Mode`/`LogLevel`/`ChProto`/`InsertMode`
 /// enums, whose `FromStr::Err` is just the valid-value list (e.g. `"one
 /// of: all, writer, reader"`) — this builds the single, complete
 /// error sentence.
@@ -271,12 +265,6 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
         cfg.clickhouse.select_sequential_consistency =
             parse_bool("CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY", &v)?;
     }
-    if let Some(v) = read("PULSUS_SKIP_DDL") {
-        cfg.skip_ddl = parse_bool("PULSUS_SKIP_DDL", &v)?;
-    }
-    if let Some(v) = read("PULSUS_RETENTION_DAYS") {
-        cfg.retention_days = parse_int("PULSUS_RETENTION_DAYS", &v)?;
-    }
     if let Some(v) = read("PULSUS_TRACEQL_INDEXED_ATTRIBUTES") {
         cfg.traceql_indexed_attributes = if v.is_empty() {
             Vec::new()
@@ -290,21 +278,11 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_LOG_ROLLUP_RESOLUTION") {
         cfg.log_rollup_resolution = parse_dur("PULSUS_LOG_ROLLUP_RESOLUTION", &v)?;
     }
-    if let Some(v) = read("PULSUS_METRICS_LANDING_RETENTION_HOURS") {
-        cfg.metrics_landing_retention_hours =
-            parse_int("PULSUS_METRICS_LANDING_RETENTION_HOURS", &v)?;
-    }
     if let Some(v) = read("PULSUS_METRICS_DEDUP_WINDOW") {
         cfg.metrics_dedup_window = parse_int("PULSUS_METRICS_DEDUP_WINDOW", &v)?;
     }
-    if let Some(v) = read("PULSUS_LOG_LANDING_RETENTION_HOURS") {
-        cfg.log_landing_retention_hours = parse_int("PULSUS_LOG_LANDING_RETENTION_HOURS", &v)?;
-    }
     if let Some(v) = read("PULSUS_LOG_DEDUP_WINDOW") {
         cfg.log_dedup_window = parse_int("PULSUS_LOG_DEDUP_WINDOW", &v)?;
-    }
-    if let Some(v) = read("PULSUS_TRACE_LANDING_RETENTION_HOURS") {
-        cfg.trace_landing_retention_hours = parse_int("PULSUS_TRACE_LANDING_RETENTION_HOURS", &v)?;
     }
     if let Some(v) = read("PULSUS_TRACE_DEDUP_WINDOW") {
         cfg.trace_dedup_window = parse_int("PULSUS_TRACE_DEDUP_WINDOW", &v)?;
@@ -479,9 +457,6 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("PULSUS_TAIL_CATCHUP_SLICE") {
         cfg.reader.tail_catchup_slice = parse_dur("PULSUS_TAIL_CATCHUP_SLICE", &v)?;
-    }
-    if let Some(v) = read("PULSUS_TIER_POLICY") {
-        cfg.downsampling.tier_policy = parse_enum("PULSUS_TIER_POLICY", &v)?;
     }
     if let Some(v) = read("PULSUS_RULER_ENABLED") {
         cfg.ruler.enabled = parse_bool("PULSUS_RULER_ENABLED", &v)?;

@@ -673,7 +673,7 @@ docs/query-lowering.md	492-fold-breakA.rs:156	not_in_this_repository
 docs/query-lowering.md	492-fold-breakB.rs:316	not_in_this_repository
 docs/query-lowering.md	ast.rs:1046	ambiguous_basename
 docs/query-lowering.md	crates/pulsus-clickhouse/src/lib.rs:3	no_name_the_target_file_holds
-docs/query-lowering.md	crates/pulsus-config/src/model.rs:669	no_name_the_target_file_holds
+docs/query-lowering.md	crates/pulsus-config/src/model.rs:642	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-config/src/model.rs:698	pinned_to_another_version
 docs/query-lowering.md	crates/pulsus-read/src/canonical_labels.rs:131-163	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-read/src/logql/post_agg.rs:3307-3350	no_name_the_target_file_holds
@@ -734,7 +734,7 @@ docs/query-lowering.md	metrics_sql.rs:111	not_in_this_repository
 docs/query-lowering.md	metrics_sql.rs:1512	not_in_this_repository
 docs/query-lowering.md	metrics_sql.rs:546	not_in_this_repository
 docs/query-lowering.md	metrics_sql.rs:562	not_in_this_repository
-docs/query-lowering.md	model.rs:669	no_name_the_target_file_holds
+docs/query-lowering.md	model.rs:642	no_name_the_target_file_holds
 docs/query-lowering.md	model.rs:698	pinned_to_another_version
 docs/query-lowering.md	pkg/traceql/ast_execute.go:243-280	pinned_to_another_version
 docs/query-lowering.md	plan.rs:1285	ambiguous_basename
@@ -812,7 +812,7 @@ docs/query-lowering.md	traces/compile.rs:197	not_in_this_repository
 docs/query-lowering.md	traces_search_plan_parts.rs:55-61	not_in_this_repository
 docs/query-to-sql.md	canonical_labels.rs:131-163	no_name_the_target_file_holds
 docs/query-to-sql.md	client_agg.rs:2207	no_name_the_target_file_holds
-docs/query-to-sql.md	crates/pulsus-config/src/model.rs:669	no_name_the_target_file_holds
+docs/query-to-sql.md	crates/pulsus-config/src/model.rs:642	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:237	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:242	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:248	no_name_the_target_file_holds
@@ -914,11 +914,11 @@ docs/query-to-sql.md	metrics_sql.rs:826	not_in_this_repository
 docs/query-to-sql.md	metrics_sql.rs:874	not_in_this_repository
 docs/query-to-sql.md	metrics_sql.rs:89	not_in_this_repository
 docs/query-to-sql.md	metrics_sql.rs:951	not_in_this_repository
-docs/query-to-sql.md	model.rs:535	no_name_the_target_file_holds
+docs/query-to-sql.md	model.rs:508	no_name_the_target_file_holds
 docs/query-to-sql.md	model.rs:547	pinned_to_another_version
-docs/query-to-sql.md	model.rs:584	no_name_the_target_file_holds
-docs/query-to-sql.md	model.rs:665	no_name_the_target_file_holds
-docs/query-to-sql.md	model.rs:675	no_name_the_target_file_holds
+docs/query-to-sql.md	model.rs:557	no_name_the_target_file_holds
+docs/query-to-sql.md	model.rs:638	no_name_the_target_file_holds
+docs/query-to-sql.md	model.rs:648	no_name_the_target_file_holds
 docs/query-to-sql.md	model.rs:694	pinned_to_another_version
 docs/query-to-sql.md	pipeline.rs:5544	no_name_the_target_file_holds
 docs/query-to-sql.md	pipeline.rs:6771	no_name_the_target_file_holds
@@ -957,8 +957,8 @@ docs/query-to-sql.md	plan.rs:3870	ambiguous_basename
 docs/query-to-sql.md	plan.rs:3899	ambiguous_basename
 docs/query-to-sql.md	plan.rs:4108	ambiguous_basename
 docs/query-to-sql.md	plan.rs:4112	ambiguous_basename
-docs/query-to-sql.md	pulsus-config/src/model.rs:513	no_name_the_target_file_holds
-docs/query-to-sql.md	pulsus-config/src/model.rs:662	no_name_the_target_file_holds
+docs/query-to-sql.md	pulsus-config/src/model.rs:486	no_name_the_target_file_holds
+docs/query-to-sql.md	pulsus-config/src/model.rs:635	no_name_the_target_file_holds
 docs/query-to-sql.md	pulsus-logql/src/limits.rs:96	no_name_the_target_file_holds
 docs/query-to-sql.md	pulsus-read/src/logql/plan.rs:1057	no_name_the_target_file_holds
 docs/query-to-sql.md	pulsus-read/src/querytext.rs:52	no_name_the_target_file_holds
@@ -1089,7 +1089,6 @@ docs/reference-defects-we-do-not-copy.md	vendor/github.com/grafana/jsonparser/pa
 docs/reference-defects-we-do-not-copy.md	vendor/github.com/grafana/jsonparser/parser.go:1155	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	vendor/github.com/json-iterator/go/iter_skip.go:83-87	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	write_otlp_handler.go:132-138	not_in_this_repository
-docs/schemas.md	crates/pulsus-config/src/validate.rs:285-287	no_name_the_target_file_holds
 docs/schemas.md	labels.go:667-668	not_in_this_repository
 docs/schemas.md	pkg/distributor/distributor.go:697-722	pinned_to_another_version
 docs/schemas.md	pkg/loghttp/push/otlp.go:602-614	pinned_to_another_version

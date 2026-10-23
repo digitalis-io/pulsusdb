@@ -2034,7 +2034,7 @@ async fn no_landing_insert_reaches_the_asynchronous_queue() {
         )
         .await
         .expect("drop the test database");
-    let ctx: SchemaParams = RenderCtx::for_tests(&db);
+    let ctx: SchemaParams = RenderCtx::for_tests(&db, 7);
     run_init(&admin, &ctx).await.expect("run_init");
     let client = Arc::new(
         ChClient::new(ChConnConfig {
@@ -2221,7 +2221,7 @@ async fn live_db(db: String) -> (ChClient, String) {
         )
         .await
         .expect("drop the test database");
-    let ctx: SchemaParams = RenderCtx::for_tests(&db);
+    let ctx: SchemaParams = RenderCtx::for_tests(&db, 7);
     run_init(&admin, &ctx).await.expect("run_init");
     for table in ["spans", "traces", "resources", "trace_landing"] {
         admin

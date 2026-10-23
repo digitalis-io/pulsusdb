@@ -125,7 +125,7 @@ async fn seeded(
         .await
         .expect("connect (bootstrap)");
     drop_database(&bootstrap, &db).await;
-    run_init(&bootstrap, &RenderCtx::for_tests(&db))
+    run_init(&bootstrap, &RenderCtx::for_tests(&db, 7))
         .await
         .expect("run_init");
     let client = ChClient::new(test_config(&db)).await.expect("connect");

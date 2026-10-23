@@ -44,14 +44,14 @@ jobs:
           version: ${{ env.HELM_VERSION }}
 
       - name: helm lint --strict
-        run: helm lint deploy/charts/pulsusdb --strict
+        run: helm lint deploy/charts/pulsusdb --strict --set initJob.retentionDays=7
 
       - name: helm template (topology=single, default values)
-        run: helm template pulsusdb deploy/charts/pulsusdb > /tmp/render-single.yaml
+        run: helm template pulsusdb deploy/charts/pulsusdb --set initJob.retentionDays=7 > /tmp/render-single.yaml
 
       - name: helm template (topology=cluster, clickhouse.shards=3)
         run: |
-          helm template pulsusdb deploy/charts/pulsusdb \
+          helm template pulsusdb deploy/charts/pulsusdb --set initJob.retentionDays=7 \
             --set topology=cluster --set clickhouse.shards=3 \
             > /tmp/render-cluster.yaml
 

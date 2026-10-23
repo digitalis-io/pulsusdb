@@ -104,7 +104,7 @@ def _checksum_changed(helm_release: HelmRelease, k8s_core_v1):
     after = _pulsusdb_pod_checksum_config(k8s_core_v1, helm_release.namespace)
     before = helm_release.pre_upgrade_checksum  # type: ignore[attr-defined]
     assert after != before, (
-        "expected checksum/config to change after a retention_days upgrade "
+        "expected checksum/config to change after a log_rollup_resolution upgrade "
         f"(a schema-affecting value) — before={before} after={after}"
     )
 

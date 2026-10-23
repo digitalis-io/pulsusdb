@@ -94,7 +94,7 @@ fn db_config(db: &str) -> ChConnConfig {
 }
 
 fn schema_params(db: &str) -> SchemaParams {
-    RenderCtx::for_tests(db)
+    RenderCtx::for_tests(db, 7)
 }
 
 async fn fresh_db(db: &str) -> ChClient {

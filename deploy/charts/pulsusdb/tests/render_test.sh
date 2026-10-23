@@ -31,7 +31,7 @@ job_doc() {
 check_digest() {
     local what="$1"; shift
     local doc name spec digest
-    doc=$(helm template pulsusdb "$CHART" "$@" | job_doc) || { fail "$what: render failed"; return; }
+    doc=$(helm template pulsusdb "$CHART" --set initJob.retentionDays=7 "$@" | job_doc) || { fail "$what: render failed"; return; }
     [ -n "$doc" ] || { fail "$what: no schema Job"; return; }
     name=$(awk '/^  name: / { print $2; exit }' <<<"$doc")
     spec=$(awk 'found { sub(/^  /, ""); print } /^spec:$/ { found = 1 }' <<<"$doc")
@@ -46,7 +46,7 @@ check_digest() {
 check_digest "default"
 check_digest "split" --set pulsusdb.split.enabled=true
 check_digest "cluster" --set topology=cluster --set clickhouse.shards=3
-check_digest "a schema parameter" --set pulsusdb.config.retention_days=14
+check_digest "the retention" --set initJob.retentionDays=14
 check_digest "the image tag" --set image.tag=other
 check_digest "image pull secrets" --set 'imagePullSecrets[0].name=regcred'
 check_digest "the service account" --set serviceAccount.name=other
@@ -57,11 +57,11 @@ check_digest "the container security context" --set securityContext.readOnlyRoot
 check_digest "an extra variable" --set 'pulsusdb.extraEnv[0].name=X' --set-string 'pulsusdb.extraEnv[0].value=1'
 
 # B. values the Job does not carry.
-base=$(helm template pulsusdb "$CHART" | job_doc)
+base=$(helm template pulsusdb "$CHART" --set initJob.retentionDays=7 | job_doc)
 for args in "--set pulsusdb.config.reader.cache_ttl=30s" \
             "--set pulsusdb.auth.user=admin --set pulsusdb.auth.password=x"; do
     # shellcheck disable=SC2086
-    other=$(helm template pulsusdb "$CHART" $args | job_doc)
+    other=$(helm template pulsusdb "$CHART" --set initJob.retentionDays=7 $args | job_doc)
     if [ "$other" = "$base" ]; then echo "ok:   B $args"; else fail "B $args: the Job changed"; fi
 done
 
@@ -85,7 +85,7 @@ expected_sources() {
     esac
 }
 for split in false true; do
-    out=$(helm template pulsusdb "$CHART" --set pulsusdb.split.enabled=$split \
+    out=$(helm template pulsusdb "$CHART" --set initJob.retentionDays=7 --set pulsusdb.split.enabled=$split \
         --set 'pulsusdb.extraEnv[0].name=ZZ_EXTRA' --set-string 'pulsusdb.extraEnv[0].value=1' | last_env)
     found=""
     while read -r src last; do
@@ -135,7 +135,7 @@ limit_for() {
 check_names() {
     local what="$1"; shift
     local out
-    out=$(helm template "$@" "$CHART" --set ingress.enabled=true --set hpa.enabled=true \
+    out=$(helm template "$@" "$CHART" --set initJob.retentionDays=7 --set ingress.enabled=true --set hpa.enabled=true \
         --set podDisruptionBudget.enabled=true --set grafana.datasourceProvisioning.enabled=true \
         --set pulsusdb.config.compat_endpoints=true --set pulsusdb.spool.persistence.enabled=true \
         --set pulsusdb.auth.user=a --set pulsusdb.auth.password=b | awk '
