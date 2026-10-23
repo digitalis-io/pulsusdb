@@ -509,7 +509,8 @@ pub struct GroupKeySql {
     pub value_type: Option<String>,
     /// What the key reads beside the span row (issue #594 part 3): the
     /// grouped statement's `group_values`.
-    pub values: Option<super::tracelevel::KeyValues>,
+    /// Lookup `n` is named by the key's `KeyNames` (issue #649).
+    pub values: Vec<super::tracelevel::KeyValues>,
 }
 
 /// The `by()` keys the search statement serves: `name`, `status`, `kind`,
@@ -528,8 +529,10 @@ pub struct GroupKeySql {
 pub fn group_key_sql(
     field: &Field,
     ctx: &PredicateCtx<'_>,
+    names: super::tracelevel::KeyNames,
 ) -> Result<Option<GroupKeySql>, PlanError> {
     use super::tracelevel::{KeyValues, TraceValue};
+    let lookup = names.values(0);
     let typed = |x: String| GroupKeySql {
         value: format!(
             "if(NOT (dynamicType({x}) {HELD}), '', if(startsWith(dynamicType({x}), 'Array'), \
@@ -540,24 +543,24 @@ pub fn group_key_sql(
         value_type: Some(format!(
             "if(dynamicType({x}) {HELD}, toString(dynamicType({x})), 'None')"
         )),
-        values: None,
+        values: Vec::new(),
     };
     let column = |sql: &str| GroupKeySql {
         value: sql.to_string(),
         value_type: None,
-        values: None,
+        values: Vec::new(),
     };
     let looked_up = |values: KeyValues, value: String, value_type: String| GroupKeySql {
         value,
         value_type: Some(value_type),
-        values: Some(values),
+        values: vec![values],
     };
     Ok(match field {
         Field::Attribute { scope, key } => Some(typed(scope_value(*scope, key, ctx)?)),
         Field::Intrinsic(Intrinsic::Duration) => Some(GroupKeySql {
             value: "toString(duration_ns)".to_string(),
             value_type: Some("'Duration'".to_string()),
-            values: None,
+            values: Vec::new(),
         }),
         Field::Intrinsic(Intrinsic::StatusMessage) => Some(column("status_message")),
         Field::Intrinsic(Intrinsic::SpanId) => Some(column("lower(hex(span_id))")),
@@ -573,9 +576,11 @@ pub fn group_key_sql(
             | Intrinsic::LinkSpanId
             | Intrinsic::LinkTraceId,
         ) => None,
-        Field::Intrinsic(i @ (Intrinsic::TraceDuration | Intrinsic::RootName | Intrinsic::RootServiceName)) => {
+        Field::Intrinsic(
+            i @ (Intrinsic::TraceDuration | Intrinsic::RootName | Intrinsic::RootServiceName),
+        ) => {
             let v = TraceValue::of(*i).expect("one of the three");
-            let x = v.lookup_sql("group_values");
+            let x = v.lookup_sql(&lookup);
             let (value, kind) = if v == TraceValue::Duration {
                 (format!("ifNull(toString({x}), '')"), "Duration")
             } else {
@@ -589,12 +594,18 @@ pub fn group_key_sql(
         }
         Field::Intrinsic(Intrinsic::ChildCount) => Some(looked_up(
             KeyValues::ChildCount,
-            "toString(transform(concat(trace_id, span_id), group_values.1, group_values.2, toUInt64(0)))".to_string(),
+            format!(
+                "toString(transform(concat(trace_id, span_id), {lookup}.1, {lookup}.2, toUInt64(0)))"
+            ),
             "'Int64'".to_string(),
         )),
-        Field::Intrinsic(i @ (Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight | Intrinsic::NestedSetParent)) => Some(looked_up(
+        Field::Intrinsic(
+            i @ (Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight | Intrinsic::NestedSetParent),
+        ) => Some(looked_up(
             KeyValues::Numbered(*i),
-            "toString(transform(concat(trace_id, span_id), group_values.1, group_values.2, toInt64(0)))".to_string(),
+            format!(
+                "toString(transform(concat(trace_id, span_id), {lookup}.1, {lookup}.2, toInt64(0)))"
+            ),
             "'Int64'".to_string(),
         )),
         Field::Intrinsic(Intrinsic::Name | Intrinsic::Status | Intrinsic::Kind) => {

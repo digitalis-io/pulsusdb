@@ -32,10 +32,17 @@ pub enum Stage {
 #[derive(Debug, Clone)]
 pub struct Key {
     pub display: String,
+    /// The key in the detail, its lookups named `group_values<j>…`.
     pub sql: GroupKeySql,
+    /// The key in the top-K, its lookups named `top_group_values<j>…`
+    /// (issue #649: each compiled with its own names, no text rewritten).
+    pub top_sql: GroupKeySql,
     /// Whether the key's value is one per trace (`traceDuration`,
     /// `rootName`, `rootServiceName`): it never divides a trace.
     pub per_trace: bool,
+    /// Issue #649: a comparison or boolean key's predicate, whose reads
+    /// the statement defines as it does a filter's.
+    pub needs: Option<SpanPredicate>,
 }
 
 /// What an aggregate reads.
@@ -185,7 +192,7 @@ impl Fold {
     /// Whether the top-K reads key `j` through a lookup scalar of its own.
     pub fn top_reads_lookup(&self, j: usize) -> bool {
         let k = &self.keys[j];
-        k.sql.values.is_some() && !k.per_trace && self.key_matters(j)
+        !k.sql.values.is_empty() && !k.per_trace && self.key_matters(j)
     }
 
     /// The span columns the stages read, `(name, expression)`: each later
@@ -205,19 +212,11 @@ impl Fold {
                 out.push((format!("t{j}"), "''".to_string()));
                 continue;
             }
-            let alias = if top {
-                format!("top_group_values{j}")
-            } else {
-                format!("group_values{j}")
-            };
-            out.push((format!("k{j}"), k.sql.value.replace("group_values", &alias)));
+            let sql = if top { &k.top_sql } else { &k.sql };
+            out.push((format!("k{j}"), sql.value.clone()));
             out.push((
                 format!("t{j}"),
-                k.sql
-                    .value_type
-                    .as_deref()
-                    .unwrap_or("''")
-                    .replace("group_values", &alias),
+                sql.value_type.as_deref().unwrap_or("''").to_string(),
             ));
         }
         for (i, a) in self.aggs.iter().enumerate() {

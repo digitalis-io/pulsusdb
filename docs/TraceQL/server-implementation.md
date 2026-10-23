@@ -165,8 +165,8 @@ second-stage operators, 5 aggregate operators — and `docs/api.md` §4.2–§4.
 "Statement" names a file in `measure/sql/` that runs and is timed. Every rule in
 this table is also applied to the whole corpus in
 `docs/TraceQL/query-catalogue.md`: of the 141 queries the parser and the
-validator accept, the API serves **138** and refuses **3** at plan time, and
-each of the 138 has its own two statements — the one the route issues and the
+validator accept, the API serves **139** and refuses **2** at plan time (#649's run), and
+each of the 138 the design renderer's run served has its own two statements — the one the route issues and the
 membership query — both run, both answers checked against an independent
 interpreter. The corpus belongs to the parser and covers the grammar, so **12 rules
 in this table have no corpus query that reaches them**; those 12 queries
@@ -175,8 +175,8 @@ are run and checked the same way. **4 of the 12 are the row below on
 `| by(<field>)`**: no corpus query groups by an attribute, and the statement that
 shape produced did not run at all.
 
-The three refusals are `by_expression_key`, `duration_unitless` and
-`pipeline_spanset_operation`; the rows below that read `400` are why, and
+The two refusals are `duration_unitless` and
+`pipeline_spanset_operation` (`by_expression_key`, the third, is served since #649); the rows below that read `400` are why, and
 `measure/planner_dispositions.tsv` is the shipped planner's own answer for all
 141, captured by the probe `measure/README.md` prints. The **today**
 column says what the shipped API does with the construct, so nothing is enabled
@@ -214,7 +214,7 @@ or lost by accident: `served` must keep working, `400` must keep refusing.
 | `\| select(...)` | served | extra projected slots in the spanset tuple | `s12` |
 | a `{...}` filter as a **later** pipeline element | served | the fold: a condition ANDed into every stage written after it (#602 part 2a) | `c19` |
 | `\| by(<field>)` in a **search** pipeline — an intrinsic or an attribute | served | a key of the fold's fine groups (#602 part 2a), **rendered as text beside its stored type**: an attribute read is a `Dynamic` value, which ClickHouse refuses as a `GROUP BY` key (code 44), and the label alone would merge an integer `1` with a double `1.0`, which `docs/api.md` §4.2 renders in different arms. An intrinsic key and `resource.service.name` carry no type column — the type follows from the query. One spanset per group, in **first-appearance order**, and a span lacking the key in the one `nil` group, as `docs/api.md` §4.2 and today's engine place it (`sql-schema.md` §5.2). Attribute keys included: `search_plan.rs:2014-2024` plans any `Field`, and `plan_group_key` has an `Field::Attribute` arm at `:2360` | `c05`, and `by_span_attribute` / `by_attribute_types` / `by_missing_attribute` / `by_name_order` in `measure/catalogue-extra.tsv` |
-| `\| by(<expression>)` in a search pipeline — `by(.b + .c)` | **`400`** | not compiled. A group key must resolve to one value per span, so it must be an attribute or an intrinsic; the refusal is `crates/pulsus-read/src/traces/search_plan.rs:2015-2021` | the corpus's `by_expression_key` |
+| `\| by(<expression>)` in a search pipeline — `by(.b + .c)` | served | a key of the fold's fine groups, its value the expression over the values a plain key reads: arithmetic its number, `false` when it has none, a comparison or boolean the filter predicate's answer (#649, `docs/api.md` §4.2) | the corpus's `by_expression_key` |
 | `\| coalesce()` | served | the fold: ends a segment and drops its keys; after an aggregate, each span is handed on marked with whether its group survived (#602 part 2a) | the `c05` statement without its group key |
 | `rate`, `count_over_time`, `sum/min/max/avg_over_time`, `quantile_over_time`, `histogram_over_time` | served | one time-bucketed `GROUP BY`, one row per series | `m01`–`m05` |
 | a metrics filter: a field against a field, arithmetic, an absence check (`{ span.http.route = span.url.path } \| rate()`) | served | the span predicate compiler's predicate in the metrics statement's span read, one statement per request (#596 part 1) | `traceql-metrics-filter-residual-refusals`, `metrics_filters_compare_fields_and_compute` |

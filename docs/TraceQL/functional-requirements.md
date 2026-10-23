@@ -8,7 +8,7 @@ It is the first of the 7 documents under `docs/TraceQL/`:
 | `docs/TraceQL/functional-requirements.md` | the requirements, the data, the queries, the benchmark, the test cases |
 | `docs/TraceQL/sql-schema.md` | the tables, the SQL each query compiles to, the measurements |
 | `docs/TraceQL/server-implementation.md` | the write path, the compiler, what is kept, replaced, deleted |
-| `docs/TraceQL/query-catalogue.md` | **every query in the repository's TraceQL corpus**: 138 the API serves, each with the statement the route issues, the membership statement and its literal answer, and 50 it refuses — 47 at parse or validation, 3 at plan time — each with its status and reason |
+| `docs/TraceQL/query-catalogue.md` | **every query in the repository's TraceQL corpus**: 139 the API serves, each with the statement the route issues, the membership statement and its literal answer, and 49 it refuses — 47 at parse or validation, 2 at plan time — each with its status and reason |
 | `docs/TraceQL/query-catalogue-accepted.md` | generated: the served queries, one row each |
 | `docs/TraceQL/query-catalogue-refused.md` | generated: the refusals, one row each |
 | `docs/TraceQL/measure/README.md` | the scripts, the order to run them in, what a second run reproduces, and what is checked about the numbers above |
@@ -389,16 +389,16 @@ repository's own corpus instead**: all 188 queries of
 | | |
 |---|---:|
 | the parser and the validator accept | 141 |
-| of those, the API refuses at plan time (`400`) | **3** |
-| the API serves | **138** |
-| whose route statement's answer equals the independent check | **138** |
-| whose membership answer equals the independent check | **138** |
+| of those, the API refuses at plan time (`400`) | **2** |
+| the API serves | **139** |
+| whose route statement's answer equals the independent check | **139** |
+| whose membership answer equals the independent check | **139** |
 | the parser or the validator refuses (`400`) | 47 |
 
-The three the planner refuses are `{ .a = 1 } \| by(.b + .c)`,
+The two the planner refuses are
 `{ duration > 100 }` and `{ .a = 1 } \| { .b = 2 } && { .c = 3 }`; the storage
-answers all three, and the refusals are the shipped planner's, which this design
-does not change. `docs/TraceQL/query-catalogue.md` names each with its refusal
+answers both, and the refusals are the shipped planner's, which this design
+does not change. The counts are #649's run of `measure/catalogue.sh`, which serves `{ .a = 1 } \| by(.b + .c)`. `docs/TraceQL/query-catalogue.md` names each with its refusal
 site.
 
 **The catalogue fixture is built so that a wrong statement gives a different
@@ -657,8 +657,8 @@ Each names the literal breach and the configured bound it breaches.
 | `T-C6` | one ordinary pair (client `c1` svc-a → server `s1` svc-b, parent `c1`) and one **shared** pair (client `c2` svc-a and a server span with the **same id** `c2`, svc-c, carrying `zipkin.shared`) | the service-graph edges | two rpc edges, `svc-a → svc-b` and `svc-a → svc-c`, one call each | the single-branch join misses the shared pair; measured by `measure/shared_span_edges.sh` |
 | `T-C7` | one rpc pair and one messaging pair between the same two services | the edges | two edges differing only in `connectionType` | today's statement grouped them together |
 | `T-P1` | both stores, same corpus, interleaved | warm medians per shape | below the reference for every shape outside §6.3's exempt class | the `traceql-reference-bench` workflow, dispatched; `measure/bench/verdict.tsv` |
-| `T-C8` | every query in `crates/pulsus-traceql/tests/corpus/accept/` and `grafana/` that the API serves (138 of 141; the other three are `T-C9`'s), **and the 12 of `measure/catalogue-extra.tsv`** — the queries no corpus query's rule reaches, among them the attribute group key whose statement the database rejected | for each: the statement the route issues runs and its rows equal the independent interpreter's, and the membership statement does too | **138 of 138 and 12 of 12** on both comparisons, as `docs/TraceQL/query-catalogue.md` records, which counts the rows of that file rather than repeating a number | the compiler is new; `measure/catalogue.py` is the runner |
-| `T-C9` | every query the API refuses: the 47 of `reject/`, `unsupported/` and `validate_reject/`, and the three of `accept/` the planner refuses — `{ .a = 1 } \| by(.b + .c)`, `{ duration > 100 }` and `{ .a = 1 } \| { .b = 2 } && { .c = 3 }` | the status and body | `400` and `docs/api.md` §4's envelope for all 50, with the message the corpus's golden pins for the 47 | **guard**: passes today — the parser, the validator and the planner do not change, and all 50 refusals must survive. The three plan-time sites are `crates/pulsus-read/src/traces/search_plan.rs:1949-1960` (a stage that is not one filter), `:2015-2021` (a group key that is not a field) and `crates/pulsus-read/src/traces/filter.rs:1705-1710` (`duration` against a bare number); `measure/planner_dispositions.tsv` is the shipped planner's own answer for every one of them |
+| `T-C8` | every query in `crates/pulsus-traceql/tests/corpus/accept/` and `grafana/` that the API serves (139 of 141; the other two are `T-C9`'s), **and the 12 of `measure/catalogue-extra.tsv`** — the queries no corpus query's rule reaches, among them the attribute group key whose statement the database rejected | for each: the statement the route issues runs and its rows equal the independent interpreter's, and the membership statement does too | **139 of 139 and 12 of 12** on both comparisons, as `docs/TraceQL/query-catalogue.md` records, which counts the rows of that file rather than repeating a number | the compiler is new; `measure/catalogue.py` is the runner |
+| `T-C9` | every query the API refuses: the 47 of `reject/`, `unsupported/` and `validate_reject/`, and the two of `accept/` the planner refuses — `{ duration > 100 }` and `{ .a = 1 } \| { .b = 2 } && { .c = 3 }` | the status and body | `400` and `docs/api.md` §4's envelope for all 49, with the message the corpus's golden pins for the 47 | **guard**: passes today — the parser, the validator and the planner do not change, and all 49 refusals must survive (`{ .a = 1 } \| by(.b + .c)`, the third before #649, is served since). The two plan-time sites are `crates/pulsus-read/src/traces/search_plan.rs:1949-1960` (a stage that is not one filter) and `crates/pulsus-read/src/traces/filter.rs:1705-1710` (`duration` against a bare number); `measure/planner_dispositions.tsv` is the shipped planner's own answer for every one of them |
 
 ## 9. What stays exactly as it is
 

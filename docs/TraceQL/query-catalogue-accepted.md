@@ -1,11 +1,11 @@
-# The TraceQL query catalogue: the 150 queries the API serves
+# The TraceQL query catalogue: the 150 queries the design renderer's run served
 
-**This page is the design renderer's run; since #600 the catalogue compares the shipped compiler instead (`query-catalogue.md`), and the answers here predate the interpreter's corrections.** One row per query the API serves: the 138 of
+**This page is the design renderer's run; since #600 the catalogue compares the shipped compiler instead (`query-catalogue.md`), and the answers here predate the interpreter's corrections.** One row per query the design renderer's run served: the 138 of
 `crates/pulsus-traceql/tests/corpus/accept/` and `grafana/`, and the
 12 of `measure/catalogue-extra.tsv`, which are the queries no
 corpus query's rule reaches (`query-catalogue.md` lists them with the rule each
-decides). The 3 the planner refuses are in
-`query-catalogue-refused.md`. **SQL** is the part of the
+decides). The planner's refusals are in
+`query-catalogue-refused.md`; `by_expression_key`, which it refused in this run, is served since #649 and has no row here. **SQL** is the part of the
 membership statement this query contributes — the predicate, or the aggregate
 for a metric — and the whole statement is
 `docs/TraceQL/measure/catalogue-sql/<name>.membership.sql`, while

@@ -71,7 +71,8 @@ use super::predicate::{PredicateCtx, SpanPredicate, compile_span_predicate_in};
 use super::projection::{Projection, array_elements, ceiling_sql, group_key_sql};
 use super::rows::{SearchGroupTuple, SearchGroupedRow, SearchTraceRow};
 use super::tracelevel::{
-    KeyValues, TraceLeaf, TraceValue, group_values_sql, per_trace_sql, trace_leaf, trace_values_sql,
+    KeyNames, KeyValues, TraceLeaf, TraceValue, group_values_sql, per_trace_sql, trace_leaf,
+    trace_values_sql,
 };
 use crate::logql::error::ReadError;
 use crate::traces::PlanError;
@@ -310,6 +311,7 @@ impl SearchFilter {
             SearchFilter::Pipeline { selector, fold } => {
                 let mut out = selector.predicates();
                 out.extend(fold.filters.iter());
+                out.extend(fold.keys.iter().filter_map(|k| k.needs.as_ref()));
                 out
             }
         }
@@ -476,10 +478,12 @@ pub fn search_sql_at(
 /// row per span identity itself, [`super::distinct_spans`].
 pub fn keeps_final(f: &SearchFilter, proj: &Projection) -> bool {
     let keyed = match f {
-        SearchFilter::Pipeline { fold, .. } => fold
-            .keys
-            .iter()
-            .any(|k| matches!(k.sql.values, Some(KeyValues::Numbered(_)))),
+        SearchFilter::Pipeline { fold, .. } => fold.keys.iter().any(|k| {
+            k.sql
+                .values
+                .iter()
+                .any(|v| matches!(v, KeyValues::Numbered(_)))
+        }),
         _ => false,
     };
     f.predicates().iter().any(|p| p.reads_numbering()) || proj.reads_numbers() || keyed
@@ -773,13 +777,19 @@ fn search_sql_kept(
                 )
             };
             for (j, k) in fold.keys.iter().enumerate() {
-                if let Some(v) = k.sql.values
-                    && fold.top_reads_lookup(j)
-                {
-                    let text = group_values_sql(v, w, spans_table, traces_table)
-                        .replace("(SELECT arrayJoin(top.1))", &top_set)
-                        .replace("group_values", &format!("top_group_values{j}"))
-                        .replace("group_keys", &format!("top_group_keys{j}"));
+                if !fold.top_reads_lookup(j) {
+                    continue;
+                }
+                for (n, v) in k.sql.values.iter().enumerate() {
+                    let text = group_values_sql(
+                        *v,
+                        w,
+                        spans_table,
+                        traces_table,
+                        KeyNames { top: true, key: j },
+                        n,
+                    )
+                    .replace("(SELECT arrayJoin(top.1))", &top_set);
                     candidates.push_str(text.trim_start_matches(",\n     "));
                     candidates.push_str(",\n     ");
                 }
@@ -800,12 +810,15 @@ fn search_sql_kept(
             };
             let mut group_values = String::new();
             for (j, k) in fold.keys.iter().enumerate() {
-                if let Some(v) = k.sql.values {
-                    group_values.push_str(
-                        &group_values_sql(v, w, spans_table, traces_table)
-                            .replace("group_values", &format!("group_values{j}"))
-                            .replace("group_keys", &format!("group_keys{j}")),
-                    );
+                for (n, v) in k.sql.values.iter().enumerate() {
+                    group_values.push_str(&group_values_sql(
+                        *v,
+                        w,
+                        spans_table,
+                        traces_table,
+                        KeyNames { top: false, key: j },
+                        n,
+                    ));
                 }
             }
             let detail = fold.render(
@@ -942,8 +955,8 @@ struct Pipeline<'a> {
 
 /// [`Pipeline`] of `query`: every stage at its written position (issue
 /// #602 part 2a). Refused, with the previous planner's texts: a spanset
-/// operation as a stage, a `by()` over an expression, an event or link
-/// intrinsic key, and the aggregates [`agg_of`] refuses.
+/// operation as a stage, an event or link intrinsic key, and the
+/// aggregates [`agg_of`] refuses.
 fn pipeline_of<'a>(query: &'a Query, ctx: &PredicateCtx<'_>) -> Result<Pipeline<'a>, PlanError> {
     let mut out = Pipeline {
         fold: Fold::default(),
@@ -969,26 +982,39 @@ fn pipeline_of<'a>(query: &'a Query, ctx: &PredicateCtx<'_>) -> Result<Pipeline<
             }
             PipelineStage::Select { fields } => out.selected.extend(fields.iter().cloned()),
             PipelineStage::By { key } => {
+                let j = out.fold.keys.len();
+                let (detail, top) = (
+                    KeyNames { top: false, key: j },
+                    KeyNames { top: true, key: j },
+                );
                 let FieldExpr::Field(field) = key else {
-                    return Err(PlanError::TypeMismatch(format!(
-                        "by({key}) is not a group key this engine can execute: a grouping key \
-                         must resolve to a single per-span value, so it must be an attribute or \
-                         an intrinsic"
-                    )));
+                    let k = super::by_key::expression_key(key, ctx, detail)?;
+                    let top_sql = super::by_key::expression_key(key, ctx, top)?.sql;
+                    out.fold.stages.push(Stage::By(j));
+                    out.fold.keys.push(Key { top_sql, ..k });
+                    continue;
                 };
-                let Some(sql) = group_key_sql(field, ctx)? else {
+                let (Some(sql), Some(top_sql)) = (
+                    group_key_sql(field, ctx, detail)?,
+                    group_key_sql(field, ctx, top)?,
+                ) else {
                     return Err(PlanError::UnsupportedField(format!(
                         "by({field}): grouping by a span-event / span-link intrinsic is not \
                          supported (a span carries a collection of events/links, so there is \
                          no single group value)"
                     )));
                 };
-                let per_trace = matches!(sql.values, Some(super::tracelevel::KeyValues::Trace(_)));
+                let per_trace = matches!(
+                    sql.values.first(),
+                    Some(super::tracelevel::KeyValues::Trace(_))
+                );
                 out.fold.stages.push(Stage::By(out.fold.keys.len()));
                 out.fold.keys.push(Key {
                     display: format!("by({field})"),
                     sql,
+                    top_sql,
                     per_trace,
+                    needs: None,
                 });
             }
             PipelineStage::Coalesce => out.fold.stages.push(Stage::Coalesce),

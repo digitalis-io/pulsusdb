@@ -1,6 +1,6 @@
 # The TraceQL query catalogue
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 `measure/catalogue.py` compares the shipped compiler's search answers — whole and typed, from the route's planner and engine, run by `xtask traceql-catalogue` through `measure/catalogue.sh` — with `measure/catalogue_interp.py`, whose rules and parser were corrected to `docs/api.md`; the run on `c7658d4b` agreed on 119 of 119 corpus searches and 43 of 43 added ones, and on 19 of 19 corpus and 23 of 23 added metrics queries, range and instant, `compare()` included, on one node and, through each shard's node, on two shards with a replicated shard. The statements, answers and counts below are the design renderer's earlier run, and so is the perturbation account below, "The rules no query can tell apart" included: the current record is `measure/results/perturbations.tsv`, which `measure/perturb_check.py` writes over a `measure/catalogue.sh` run, one interpreter or parser rule changed at a time.** Every query in the repository's TraceQL corpus, with the SQL it compiles to
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 `measure/catalogue.py` compares the shipped compiler's search answers — whole and typed, from the route's planner and engine, run by `xtask traceql-catalogue` through `measure/catalogue.sh` — with `measure/catalogue_interp.py`, whose rules and parser were corrected to `docs/api.md`; the run on `c7658d4b` agreed on 119 of 119 corpus searches and 43 of 43 added ones, and on 19 of 19 corpus and 23 of 23 added metrics queries, range and instant, `compare()` included, on one node and, through each shard's node, on two shards with a replicated shard. Since #649 `by_expression_key` is served, and that change's run, on one node, agreed on 120 of 120 corpus searches and 61 of 61 added ones, and on 19 of 19 corpus and 24 of 24 added metrics queries; the first six rows of the table below are its counts. The statements, answers and counts below are the design renderer's earlier run, and so is the perturbation account below, "The rules no query can tell apart" included: the current record is `measure/results/perturbations.tsv`, which `measure/perturb_check.py` writes over a `measure/catalogue.sh` run, one interpreter or parser rule changed at a time.** Every query in the repository's TraceQL corpus, with the SQL it compiles to
 against the schema of `docs/TraceQL/sql-schema.md` and the literal answer it
 gives, or — where the query is refused — the status and the reason.
 
@@ -17,23 +17,23 @@ covers shapes nobody writes by hand.
 | | |
 |---|---:|
 | queries the parser and the validator accept | **141** |
-| of those, the API refuses at plan time, `400` | **3** |
-| queries the API serves | **138** |
-| of those, with a statement that runs | **138** |
-| whose **answer** equals the independent check | **138** |
-| whose **membership** equals the independent check | **138** |
+| of those, the API refuses at plan time, `400` | **2** |
+| queries the API serves | **139** |
+| of those, with a statement that runs | **139** |
+| whose **answer** equals the independent check | **139** |
+| whose **membership** equals the independent check | **139** |
 | queries the parser or the validator refuses, `400` | **47** |
 | queries added here, which the corpus does not contain | **12** |
 | of those, served, with a statement that runs | **12**, **12** |
 | whose **answer** and **membership** equal the check | **12**, **12** |
 
 - `docs/TraceQL/query-catalogue-accepted.md` — the 150
-  served queries, each with its membership SQL and its answer: the
-  138 of the corpus and the 12 added here.
+  queries the design renderer's run served, each with its membership SQL and its answer: the
+  138 of the corpus it served and the 12 added here; `by_expression_key`, served since #649, is not among them.
 - `docs/TraceQL/query-catalogue-refused.md` — the
-  50 refusals:
+  49 refusals:
   47 the parser or the validator turns away and
-  3 the planner does, each with the status and the
+  2 the planner does, each with the status and the
   reason.
 - `docs/TraceQL/measure/catalogue-sql/` — two statements per served query, both
   run exactly as the file stands: `<name>.sql` is **the statement the route
@@ -112,18 +112,17 @@ catalogue.py $CH tqd_cat crates/pulsus-traceql/tests/corpus $WORK/cat/spans.json
 ## What the design cannot serve
 
 Of the 141 queries the parser and the validator accept, the API
-refuses **3** at plan time and this design keeps
-every one of those refusals. They are not defects in the schema — the storage
-answers all three — they are behaviour the shipped planner declines, each with
+refuses **2** at plan time and this design keeps
+both refusals. They are not defects in the schema — the storage
+answers both — they are behaviour the shipped planner declines, each with
 its own refusal site:
 
 | query | TraceQL | status | the reason |
 |---|---|---|---|
-| `by_expression_key` | `{ .a = 1 } \| by(.b + .c)` | `400` | a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic |
 | `duration_unitless` | `{ duration > 100 }` | `400` | duration requires a duration literal |
 | `pipeline_spanset_operation` | `{ .a = 1 } \| { .b = 2 } && { .c = 3 }` | `400` | a `\|` stage must be a single { ... } filter, not a cross-spanset or structural operation |
 
-Of the 150 queries it serves, 0
+Of the 150 queries the design renderer's run served, 0
 failed to run and 0 returned an
 answer other than the independent check's. One limit of the design is stated
 rather than counted, because it is a property of the rules rather than of any

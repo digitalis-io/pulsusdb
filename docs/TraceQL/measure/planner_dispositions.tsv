@@ -19,7 +19,7 @@ attr_unscoped_number	search	served
 bare_attribute	search	served
 bare_bool_true	search	served
 bracketed_attribute	search	served
-by_expression_key	search	plan_error	type mismatch: by((.b + .c)) is not a group key this engine can execute: a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic
+by_expression_key	search	served
 duration_frac_half	search	served
 duration_frac_leading_dot	search	served
 duration_frac_ns_boundary	search	served

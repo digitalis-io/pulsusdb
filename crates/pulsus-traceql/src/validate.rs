@@ -87,6 +87,10 @@
 //!     with `(0, 0)` explicitly legal, meaning "no window".
 //! 14. That window's `end` is strictly after its `start`
 //!     ([`ValidateError::CompareEndNotAfterStart`]).
+//! 15. A spanset `by()` key must reference the span
+//!     ([`ValidateError::GroupNotSpanReferencing`], issue #649), checked
+//!     before the key passes the ordinary field-expression rules — the
+//!     reference's order.
 //!
 //! Rules 12-14 arrived with issue #460, which added the reference's
 //! other two `compare()` productions (`expr.y:324-326`). They were
@@ -676,7 +680,17 @@ fn validate_stage(stage: &PipelineStage) -> Result<(), ValidateError> {
         // messages there that `validate_filter` / `validate_field_expr`
         // already produce here.
         PipelineStage::Filter(expr) => validate_spanset(expr),
-        PipelineStage::Select { .. } | PipelineStage::By { .. } | PipelineStage::Coalesce => Ok(()),
+        // Issue #649: the reference's order — the span reference, then
+        // the key as a field expression.
+        PipelineStage::By { key } => {
+            if !references_span(key) {
+                return Err(ValidateError::GroupNotSpanReferencing {
+                    expr: format!("by({key})"),
+                });
+            }
+            validate_field_expr(key)
+        }
+        PipelineStage::Select { .. } | PipelineStage::Coalesce => Ok(()),
         PipelineStage::Metric(metric) => validate_metric_stage(metric),
         PipelineStage::MetricSecondStage(second) => match second {
             // Rule 7 — the exhaustive match doubles as the
