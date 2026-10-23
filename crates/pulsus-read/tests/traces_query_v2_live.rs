@@ -902,9 +902,7 @@ const CASES_61: &[Case] = &[
     Case {
         name: "T-A1",
         query: r#"{ span.http.response.status_code != 200 }"#,
-        expect: &[
-            "0001", "0002", "0003", "0004", "0005", "0006", "0008", "0009",
-        ],
+        expect: &["0001"],
     },
     Case {
         name: "T-A2a (F4)",
@@ -924,9 +922,7 @@ const CASES_61: &[Case] = &[
     Case {
         name: "T-A2d",
         query: r#"{ span.http.response.status_code != 500 }"#,
-        expect: &[
-            "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009",
-        ],
+        expect: &["0007"],
     },
     Case {
         name: "F6",
@@ -1058,9 +1054,7 @@ const CASES_61: &[Case] = &[
     Case {
         name: "LOL2",
         query: r#"{ 200 != span.http.response.status_code }"#,
-        expect: &[
-            "0001", "0002", "0003", "0004", "0005", "0006", "0008", "0009",
-        ],
+        expect: &["0001"],
     },
     Case {
         name: "RE1",
@@ -1075,7 +1069,7 @@ const CASES_61: &[Case] = &[
     Case {
         name: "RE3",
         query: r#"{ span.http.route !~ "ca" }"#,
-        expect: ALL_61,
+        expect: &["0001", "0007"],
     },
     Case {
         name: "RE4 anchored",
@@ -1200,7 +1194,7 @@ const CASES_T: &[Case] = &[
     Case {
         name: "T-A16d",
         query: r#"{ span.app.cache.hit != true }"#,
-        expect: &["a2", "a3", "a4", "a5", "a6", "a7"],
+        expect: &["a2"],
     },
     Case {
         name: "T-A16e",
@@ -1228,7 +1222,7 @@ const CASES_T: &[Case] = &[
     Case {
         name: "SK5 !=",
         query: r#"{ span.app.seq != 9007199254740993 }"#,
-        expect: &["a1", "a2", "a3", "a4", "a5", "a6"],
+        expect: &["a6"],
     },
     Case {
         name: "SK5 <",
@@ -1814,24 +1808,24 @@ const CASES_R: &[CaseIn] = &[
     CaseIn {
         name: "RR4",
         query: r#"{ resource.tier != 3 }"#,
-        want: Want::Ids(&["r2", "r3", "r4"]),
+        want: Want::Ids(&["r2"]),
     },
     CaseIn {
         name: "RR5",
         query: r#"{ resource.service.name = 12345 }"#,
-        want: Want::Ids(&[]),
+        want: Want::Ids(&["r2"]),
     },
-    // Issue #602 part 1 (D2): `service.name` is held only as a string,
-    // so `r2`'s int is missing.
+    // Issue #493: a `service.name` sent as anything but a string is read
+    // from the resource row in its own type.
     CaseIn {
         name: "RR7",
         query: r#"{ resource.service.name != nil }"#,
-        want: Want::Ids(&["r1", "r3"]),
+        want: Want::Ids(&["r1", "r2", "r3"]),
     },
     CaseIn {
         name: "RR8",
         query: r#"{ resource.service.name = nil }"#,
-        want: Want::Ids(&["r2", "r4"]),
+        want: Want::Ids(&["r4"]),
     },
     CaseIn {
         name: "IS1",
@@ -1841,7 +1835,7 @@ const CASES_R: &[CaseIn] = &[
     CaseIn {
         name: "IS2",
         query: r#"{ instrumentation.otel.scope.build != "release" }"#,
-        want: Want::Ids(&["r2", "r3", "r4"]),
+        want: Want::Ids(&["r2"]),
     },
     CaseIn {
         name: "IS3 truthiness",
@@ -1900,7 +1894,7 @@ const CASES_R_MISS: &[CaseIn] = &[
     CaseIn {
         name: "RR-MISS !=",
         query: r#"{ resource.region != "eu" }"#,
-        want: Want::Ids(&["r2", "r3", "r4"]),
+        want: Want::Ids(&[]),
     },
     CaseIn {
         name: "RR-MISS =",
@@ -2001,6 +1995,23 @@ fn fixture_s_forms() -> Vec<(AnyValue, bool)> {
     ]
 }
 
+/// The strings a fixture-S form holds: its own text, or a string array's
+/// elements.
+fn string_elements(form: &AnyValue) -> Vec<String> {
+    match &form.value {
+        Some(any_value::Value::StringValue(s)) => vec![s.clone()],
+        Some(any_value::Value::ArrayValue(a)) => a
+            .values
+            .iter()
+            .filter_map(|v| match &v.value {
+                Some(any_value::Value::StringValue(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Fixture S, section 9.2: ten requests, one span each.
 fn fixture_s_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
     let s_span = |n: u8| {
@@ -2055,7 +2066,7 @@ struct ServiceRow {
 /// literal being the form's own `service` text, with the expected answer
 /// computed by the loop. Then `SX-MISS`, which deletes a row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_service_name_is_compared_only_as_a_string() {
+async fn the_service_name_is_compared_in_its_stored_type() {
     skip_unless_live!();
     let db = pulsus_testkit::test_db("pulsus_read_it_t589_fixtures");
     let client = fresh_db(&db).await;
@@ -2105,7 +2116,7 @@ async fn the_service_name_is_compared_only_as_a_string() {
     ];
     let mut wrong = Vec::new();
     let mut cells = 0usize;
-    for ((_, is_string), (n, row)) in fixture_s_forms().into_iter().zip((1u8..).zip(&texts)) {
+    for (n, row) in (1u8..).zip(&texts).take(fixture_s_forms().len()) {
         let this = ids_n(n);
         assert_eq!(row.id, this);
         for op in ops {
@@ -2115,11 +2126,21 @@ async fn the_service_name_is_compared_only_as_a_string() {
                 _ => row.service.clone(),
             };
             let positive = matches!(op, ComparisonOp::Eq | ComparisonOp::Re);
-            let want: Vec<String> = match (is_string, positive) {
-                (true, true) => vec![this.clone()],
-                (true, false) => all.iter().filter(|i| **i != this).cloned().collect(),
-                (false, true) => Vec::new(),
-                (false, false) => all.clone(),
+            // Issue #493: a string matches its own text and a string array
+            // any element equal to it (`s6`'s `["svc"]` holds `s1`'s
+            // "svc"); the negation holds where a string or a string
+            // element differs; every other form matches neither.
+            let strings = |keep: &dyn Fn(&String) -> bool| -> Vec<String> {
+                all.iter()
+                    .zip(fixture_s_forms())
+                    .filter(|(_, (form, _))| string_elements(form).iter().any(keep))
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            };
+            let want = if positive {
+                strings(&|e| *e == row.service)
+            } else {
+                strings(&|e| *e != row.service)
             };
             let got = match compile_span_leaf_in(&svc, op, &Value::String(lit.clone()), &ctx) {
                 Ok(p) => try_ids_of(&client, &span_membership_sql(SPANS_TABLE, w, &p)).await,
@@ -2136,19 +2157,25 @@ async fn the_service_name_is_compared_only_as_a_string() {
     }
     assert_eq!(cells, 9 * 4, "SX runs every form against every operator");
 
-    // `SX-MISS`: with `s1`'s resource row gone, no form reads it. Presence
-    // holds the two string forms only (issue #602 part 1, D2).
+    // `SX-MISS`: with `s1`'s resource row gone, `s1` is still read from its
+    // span row. Every form the reference types is present; `s6`'s array
+    // holds "svc", and only `s2`'s "" differs from it (issue #493).
     delete_resource_row_of(&client, &ids_n(1)).await;
     let s1 = ids_n(1);
-    let but = |x: &String| -> Vec<String> { all.iter().filter(|i| *i != x).cloned().collect() };
     for (query, want) in [
-        (r#"{ resource.service.name = "svc" }"#, vec![s1.clone()]),
-        (r#"{ resource.service.name != "svc" }"#, but(&s1)),
-        (r#"{ resource.service.name =~ "svc" }"#, vec![s1.clone()]),
-        (r#"{ resource.service.name !~ "svc" }"#, but(&s1)),
+        (
+            r#"{ resource.service.name = "svc" }"#,
+            vec![s1.clone(), ids_n(6)],
+        ),
+        (r#"{ resource.service.name != "svc" }"#, vec![ids_n(2)]),
+        (
+            r#"{ resource.service.name =~ "svc" }"#,
+            vec![s1.clone(), ids_n(6)],
+        ),
+        (r#"{ resource.service.name !~ "svc" }"#, vec![ids_n(2)]),
         (
             r#"{ resource.service.name != nil }"#,
-            vec![s1.clone(), ids_n(2)],
+            (1..=6).map(ids_n).collect(),
         ),
     ] {
         let got = answer_in(&client, w, query).await;
@@ -2753,12 +2780,6 @@ const ALL_C: &[&str] = &[
     "0029", "002a", "002b", "002c", "002d", "002e", "002f", "0030", "0031", "0032",
 ];
 
-const ALL_C_BUT_0001: &[&str] = &[
-    "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0014", "0015", "0016", "0017", "0018",
-    "0019", "001a", "001b", "001e", "001f", "0020", "0021", "0024", "0025", "0026", "0028", "0029",
-    "002a", "002b", "002c", "002d", "002e", "002f", "0030", "0031", "0032",
-];
-
 const ALL_C_BUT_0004: &[&str] = &[
     "0001", "0002", "0003", "0005", "0006", "0007", "0008", "0014", "0015", "0016", "0017", "0018",
     "0019", "001a", "001b", "001e", "001f", "0020", "0021", "0024", "0025", "0026", "0028", "0029",
@@ -2779,7 +2800,7 @@ const CASES_C: &[CaseIn] = &[
     CaseIn {
         name: "CAT11",
         query: r#"{ .env != "prod" }"#,
-        want: Want::Ids(ALL_C_BUT_0001),
+        want: Want::Ids(&["0004"]),
     },
     CaseIn {
         name: "CAT19",
@@ -3116,8 +3137,6 @@ fn fixture_v_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
     ]
 }
 
-const ALL_V: &[&str] = &["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8"];
-const ALL_V_BUT_V5: &[&str] = &["v1", "v2", "v3", "v4", "v6", "v7", "v8"];
 const ALL_V_BUT_V7: &[&str] = &["v1", "v2", "v3", "v4", "v5", "v6", "v8"];
 const V_SVC_STRING: &[&str] = &["v1", "v2", "v4", "v5", "v7"];
 
@@ -3150,7 +3169,7 @@ const CASES_V: &[CaseIn] = &[
     CaseIn {
         name: "CH6",
         query: r#"{ .k != "e" }"#,
-        want: Want::Ids(&["v1", "v2", "v4", "v5", "v6", "v7", "v8"]),
+        want: Want::Ids(&["v1", "v2", "v4", "v5"]),
     },
     CaseIn {
         name: "CH7 != nil",
@@ -3162,37 +3181,40 @@ const CASES_V: &[CaseIn] = &[
         query: r#"{ .k = nil }"#,
         want: Want::Ids(&["v6", "v7", "v8"]),
     },
+    // Issue #493: `v8`'s `["vsvc","x"]` holds an element above "u".
     CaseIn {
         name: "SV1 >",
         query: r#"{ .service.name > "u" }"#,
-        want: Want::Ids(V_SVC_STRING),
+        want: Want::Ids(&["v1", "v2", "v4", "v5", "v7", "v8"]),
     },
     CaseIn {
         name: "SV1 <",
         query: r#"{ .service.name < "u" }"#,
         want: Want::Ids(&[]),
     },
-    // Issue #602 part 1 (D2): a `service.name` sent as anything but a
-    // string is missing, scoped or unscoped.
+    // Issue #493: a `service.name` sent as anything but a string is read
+    // from the resource row in its own type: `v6` is 12345, `v3` 1.4614…,
+    // `v8` a string array. `!=` holds where a value of the literal's type
+    // differs, so a string matches no number, `!=` included (issue #476).
     CaseIn {
         name: "SV2 =",
         query: r#"{ .service.name = 12345 }"#,
-        want: Want::Ids(&[]),
+        want: Want::Ids(&["v6"]),
     },
     CaseIn {
         name: "SV2 !=",
         query: r#"{ .service.name != 12345 }"#,
-        want: Want::Ids(ALL_V),
+        want: Want::Ids(&["v3"]),
     },
     CaseIn {
         name: "SVD =",
         query: r#"{ .service.name = 1.461413291919332 }"#,
-        want: Want::Ids(&[]),
+        want: Want::Ids(&["v3"]),
     },
     CaseIn {
         name: "SVD >",
         query: r#"{ .service.name > 1.4 }"#,
-        want: Want::Ids(&[]),
+        want: Want::Ids(&["v3", "v6"]),
     },
     CaseIn {
         name: "SV3 =",
@@ -3204,17 +3226,17 @@ const CASES_V: &[CaseIn] = &[
         query: r#"{ .service.name =~ "1.*" }"#,
         want: Want::Ids(&[]),
     },
-    // Issue #602 part 1 (D2): a `service.name` sent as anything but a
-    // string is missing, scoped or unscoped.
+    // Issue #493: a `service.name` sent as anything but a string is read
+    // from the resource row in its own type. `v8`'s `["vsvc","x"]` holds "x".
     CaseIn {
         name: "SV4 =",
         query: r#"{ .service.name = "x" }"#,
-        want: Want::Ids(&[]),
+        want: Want::Ids(&["v8"]),
     },
     CaseIn {
         name: "SV4 !=",
         query: r#"{ .service.name != "x" }"#,
-        want: Want::Ids(ALL_V),
+        want: Want::Ids(&["v1", "v2", "v4", "v5", "v7", "v8"]),
     },
     CaseIn {
         name: "EV1",
@@ -3224,7 +3246,7 @@ const CASES_V: &[CaseIn] = &[
     CaseIn {
         name: "EV2",
         query: r#"{ event.code != "c2" }"#,
-        want: Want::Ids(ALL_V_BUT_V7),
+        want: Want::Ids(&["v7"]),
     },
     CaseIn {
         name: "EV3 = 3",
@@ -3239,7 +3261,7 @@ const CASES_V: &[CaseIn] = &[
     CaseIn {
         name: "EV4",
         query: r#"{ event.code !~ "c.*" }"#,
-        want: Want::Ids(ALL_V_BUT_V7),
+        want: Want::Ids(&[]),
     },
     CaseIn {
         name: "EV5 != nil",
@@ -3264,7 +3286,7 @@ const CASES_V: &[CaseIn] = &[
     CaseIn {
         name: "EV6 event.tags !=",
         query: r#"{ event.tags != "b" }"#,
-        want: Want::Ids(ALL_V_BUT_V5),
+        want: Want::Ids(&["v5"]),
     },
     CaseIn {
         name: "LK1",
@@ -3274,7 +3296,7 @@ const CASES_V: &[CaseIn] = &[
     CaseIn {
         name: "LK2",
         query: r#"{ link.lk != "l1" }"#,
-        want: Want::Ids(ALL_V_BUT_V7),
+        want: Want::Ids(&["v7"]),
     },
     CaseIn {
         name: "EN1 =",
@@ -3284,7 +3306,7 @@ const CASES_V: &[CaseIn] = &[
     CaseIn {
         name: "EN1 !=",
         query: r#"{ event:name != "evB" }"#,
-        want: Want::Ids(ALL_V_BUT_V7),
+        want: Want::Ids(&["v1", "v2", "v3", "v5", "v7", "v8"]),
     },
     CaseIn {
         name: "EN2 ev[A-C]",
@@ -3304,7 +3326,7 @@ const CASES_V: &[CaseIn] = &[
     CaseIn {
         name: "TS2",
         query: r#"{ event:timeSinceStart != 2ms }"#,
-        want: Want::Ids(&["v4", "v5", "v6"]),
+        want: Want::Ids(&["v5", "v7"]),
     },
     CaseIn {
         name: "TS3 < 0",
@@ -3324,7 +3346,7 @@ const CASES_V: &[CaseIn] = &[
     CaseIn {
         name: "LI2",
         query: r#"{ link:traceID != "02020202020202020202020202020202" }"#,
-        want: Want::Ids(ALL_V_BUT_V7),
+        want: Want::Ids(&["v1", "v2", "v3", "v4", "v7", "v8"]),
     },
     CaseIn {
         name: "NE1",
@@ -3368,7 +3390,7 @@ const CASES_V_UC_MISS: &[CaseIn] = &[
     CaseIn {
         name: "UC-MISS != r",
         query: r#"{ .k != "r" }"#,
-        want: Want::Ids(ALL_V),
+        want: Want::Ids(&["v1", "v2", "v3", "v4", "v5"]),
     },
 ];
 
@@ -3712,7 +3734,8 @@ const CASES_W: &[CaseIn] = &[
     CaseIn {
         name: "SVC",
         query: r#"{ resource.service.name = span.svc }"#,
-        want: Want::Ids(&["w21"]),
+        // Issue #493: `w23`'s integer service name 8 equals its `svc` 8.
+        want: Want::Ids(&["w21", "w23"]),
     },
     CaseIn {
         name: "IN",
@@ -3942,24 +3965,24 @@ const CASES_X: &[CaseIn] = &[
         query: r#"{ resource.a != resource.c }"#,
         want: Want::Ids(&["x14"]),
     },
-    // Issue #602 part 1 (D2): a `service.name` sent as anything but a
-    // string is missing, scoped or unscoped.
+    // Issue #493: a `service.name` sent as anything but a string is read
+    // from the resource row in its own type. `x16`: 8 = 8.
     CaseIn {
         name: "SN1",
         query: r#"{ resource.service.name = span.b }"#,
-        want: Want::Ids(&[]),
+        want: Want::Ids(&["x16"]),
     },
     CaseIn {
         name: "SN2",
         query: r#"{ resource.service.name = span.bs }"#,
         want: Want::Ids(&["x17", "x19"]),
     },
-    // Issue #602 part 1 (D2): a `service.name` sent as anything but a
-    // string is missing, scoped or unscoped.
+    // Issue #493: a `service.name` sent as anything but a string is read
+    // from the resource row in its own type. `x18`: 9 != 10.
     CaseIn {
         name: "SN3",
         query: r#"{ resource.service.name != span.b }"#,
-        want: Want::Ids(&[]),
+        want: Want::Ids(&["x18"]),
     },
 ];
 
@@ -4137,9 +4160,10 @@ const Y_NUMERIC_A: &[&str] = &[
     "y19",
 ];
 
-/// `{ (span.a > 1) = false }`'s answer, which `BV7` shares.
+/// `{ (span.a > 1) = false }`'s answer, which `BV7` shares. `y12`'s
+/// `a=[1,2]` holds an element above 1, so it is not among them (#493).
 const Y_A_NOT_ABOVE_1: &[&str] = &[
-    "y04", "y06", "y08", "y09", "y12", "y13", "y14", "y15", "y16", "y18",
+    "y04", "y06", "y08", "y09", "y13", "y14", "y15", "y16", "y18",
 ];
 
 /// The part-3c design's section 8.1.
@@ -4337,8 +4361,7 @@ const CASES_Y: &[CaseIn] = &[
         name: "FD1",
         query: r#"{ span.b != 2 - 1 }"#,
         want: Want::Ids(&[
-            "y01", "y02", "y04", "y05", "y06", "y07", "y08", "y10", "y11", "y13", "y14", "y15",
-            "y16", "y17", "y18", "y19",
+            "y01", "y02", "y04", "y05", "y06", "y07", "y10", "y11", "y17", "y18", "y19",
         ]),
     },
     CaseIn {
@@ -4355,8 +4378,8 @@ const CASES_Y: &[CaseIn] = &[
         name: "BV2",
         query: r#"{ (span.a = 1) = (span.b = 1) }"#,
         want: Want::Ids(&[
-            "y01", "y02", "y04", "y05", "y06", "y07", "y10", "y11", "y13", "y14", "y15", "y16",
-            "y17", "y18", "y19",
+            "y01", "y02", "y04", "y05", "y06", "y07", "y10", "y11", "y12", "y13", "y14", "y15",
+            "y16", "y17", "y18", "y19",
         ]),
     },
     CaseIn {
@@ -4377,7 +4400,7 @@ const CASES_Y: &[CaseIn] = &[
     CaseIn {
         name: "BV6",
         query: r#"{ (span.a > 1 || span.b > 1) = false }"#,
-        want: Want::Ids(&["y06", "y08", "y09", "y12", "y13", "y14", "y15", "y16"]),
+        want: Want::Ids(&["y06", "y08", "y09", "y13", "y14", "y15", "y16"]),
     },
     CaseIn {
         name: "BV7",
@@ -4872,8 +4895,9 @@ const CASES_Z: &[CaseIn] = &[
     CaseIn {
         name: "SN-INT",
         query: r#"{ .service.name = span.n }"#,
-        // Issue #602 part 1 (D2): `z28`'s int service name is missing.
-        want: Want::Ids(&[]),
+        // Issue #493: `z28`'s integer service name is read from its resource
+        // row.
+        want: Want::Ids(&["z28"]),
     },
     CaseIn {
         name: "SN-STR",
@@ -6501,7 +6525,10 @@ async fn seed(
 /// part 2c-2b-1 deleted it). Columns: fixture, the query as a Rust
 /// string literal, `limit`, `spss`, and the [`answer_digest`] of the
 /// answer: 693 answers average 1.9 KB as text, so the file holds the
-/// digest, and a mismatch prints the answer read now.
+/// digest, and a mismatch prints the answer read now. Issue #493 replaced
+/// the nine fixture-C rows of `{ span.retried != false }`,
+/// `{ .env != "prod" }` and `{ span.a != 1 }`: that engine matched a span
+/// lacking the key, or holding another type, under `!=`.
 const RECORDED_ANSWERS: &str = "tests/fixtures/search_answers_recorded.tsv";
 
 /// An answer with every span and trace start made relative to `base_ns`,
@@ -16084,25 +16111,25 @@ const UNTYPED_CASES: [(&str, &str, &str, u64); 15] = [
     (
         "U8",
         "{ } | by(resource.service.name)",
-        "e1 4 [01, 02, 03, 04] {svc-u 1 [01]; nil 3 [02, 03, 04]}",
+        "e1 4 [01, 02, 03, 04] {svc-u 1 [01]; int:7 1 [02]; nil 2 [03, 04]}",
         1,
     ),
     (
         "U9",
         "{ } | by(.service.name)",
-        "e1 4 [01, 02, 03, 04] {svc-u 1 [01]; nil 3 [02, 03, 04]}",
+        "e1 4 [01, 02, 03, 04] {svc-u 1 [01]; int:7 1 [02]; nil 2 [03, 04]}",
         1,
     ),
     (
         "U10",
         "{ } | select(resource.service.name)",
-        "e1 [01 service.name=svc-u, 02 , 03 , 04 ]",
+        "e1 [01 service.name=svc-u, 02 service.name=int:7, 03 , 04 ]",
         1,
     ),
     (
         "U11",
         "{ resource.service.name != nil }",
-        "e1 [01 service.name=svc-u]",
+        "e1 [01 service.name=svc-u, 02 service.name=int:7]",
         1,
     ),
     ("U12", "{ !span.mx }", "", 1),
@@ -16111,7 +16138,7 @@ const UNTYPED_CASES: [(&str, &str, &str, u64); 15] = [
     (
         "U15",
         r#"{ resource.service.name != "zz" }"#,
-        "e1 [01 service.name=svc-u, 02 , 03 , 04 ]",
+        "e1 [01 service.name=svc-u]",
         1,
     ),
 ];
@@ -16123,14 +16150,14 @@ const UNTYPED_METRICS_CASES: [(&str, &str, f64); 3] = [
     (
         "M3",
         "{ resource.service.name != nil } | count_over_time()",
-        1.0,
+        2.0,
     ),
 ];
 
-/// Section 4.3 (D2, D5): a value is held only at a type the reference
-/// gives it — an array mixing element types, a key-value list and bytes are
-/// missing to every read, and `service.name` is held only as a string — in
-/// a search and in a metrics filter alike.
+/// Section 4.3 (D5): a value is held only at a type the reference gives it
+/// — an array mixing element types, a key-value list and bytes are missing
+/// to every read, and a `service.name` of another type is read from the
+/// resource row (issue #493) — in a search and in a metrics filter alike.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_value_is_held_only_as_the_reference_types_it() {
     skip_unless_live!();
@@ -16219,12 +16246,12 @@ fn service_not_fixture(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
     ]
 }
 
-/// Section 4.3 (D2): a `service.name` sent as anything but a string is
-/// missing under `!` — nothing matches and nothing fails — and the
-/// per-trace table holds no root service or service for it; a string under
-/// `!` still fails the query.
+/// Issue #493: a `service.name` sent as anything but a string is read
+/// from the resource row under `!` — a boolean matches when `false`, an
+/// integer fails the query as a string does — and the per-trace table holds
+/// no root service or service for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_service_name_is_held_only_as_a_string_under_not() {
+async fn a_service_name_under_not_reads_its_stored_type() {
     skip_unless_live!();
     const S: i64 = 1_000_000_000;
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
@@ -16240,18 +16267,21 @@ async fn a_service_name_is_held_only_as_a_string_under_not() {
     let b = (base_ns + 30 * S, base_ns + 50 * S);
     let c = (base_ns + 50 * S, base_ns + 60 * S);
     let not_a_boolean = "Err(expression (!resource.service.name) expected a boolean)";
+    let not_a_boolean_unscoped = "Err(expression (!.service.name) expected a boolean)";
     let mut wrong = Vec::new();
     for (id, window, query, literal) in [
-        ("W1", a, "{ !resource.service.name }", ""),
-        ("W2", a, "{ !.service.name }", ""),
-        ("W3", a, "{ (!resource.service.name) = true }", ""),
-        ("W4", b, "{ !resource.service.name }", ""),
-        ("W5", b, "{ !.service.name }", ""),
+        // Issue #493: a boolean `service.name` is read from the resource
+        // row, so `!` matches `false` and an integer demands a boolean.
+        ("W1", a, "{ !resource.service.name }", "f1 [01 ]"),
+        ("W2", a, "{ !.service.name }", "f1 [01 ]"),
+        ("W3", a, "{ (!resource.service.name) = true }", "f1 [01 ]"),
+        ("W4", b, "{ !resource.service.name }", not_a_boolean),
+        ("W5", b, "{ !.service.name }", not_a_boolean_unscoped),
         (
             "W6",
             b,
             "{ !resource.service.name = !resource.service.name }",
-            "",
+            not_a_boolean,
         ),
         (
             "W7",
@@ -16265,7 +16295,7 @@ async fn a_service_name_is_held_only_as_a_string_under_not() {
             "W10",
             a,
             "{ !resource.service.name = !resource.service.name }",
-            "",
+            "f1 [01 , 02 ]",
         ),
     ] {
         let plan = plan_of(&engine, &parse_query(query), window, 20, 10);
@@ -16362,11 +16392,11 @@ fn service_aggregate_fixture(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
     vec![one(str_value("42"), 1), one(int_value(42), 2)]
 }
 
-/// Issue #602 part 1 (D2): an aggregate over `resource.service.name` reads
-/// it only as a string — the string `"42"` contributes, the integer `42` is
-/// missing — one statement each.
+/// Issue #493: an aggregate over `resource.service.name` reads the integer
+/// `42` from the resource row; the string `"42"` contributing is part 2's
+/// to remove — one statement each.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_service_name_aggregate_reads_only_a_string() {
+async fn a_service_name_aggregate_reads_its_stored_type() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let (db, client) = seed(
@@ -16382,11 +16412,11 @@ async fn a_service_name_aggregate_reads_only_a_string() {
     for (query, literal) in [
         (
             "{ } | max(resource.service.name) > 0",
-            "a1 1 [01] {double:42 1 [01]}",
+            "a2 1 [02] {int:42 1 [02]}; a1 1 [01] {double:42 1 [01]}",
         ),
         (
             "{ } | sum(resource.service.name) > 0",
-            "a1 1 [01] {double:42 1 [01]}",
+            "a2 1 [02] {int:42 1 [02]}; a1 1 [01] {double:42 1 [01]}",
         ),
     ] {
         let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
@@ -16473,12 +16503,12 @@ async fn a_covered_grouping_is_capped_by_one_statement() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// Issue #602 part 1 (D2): on fixture A, the unscoped `.service.name` and
-/// an arithmetic `resource.service.name` read the service name only as a
-/// string — the integer `42` is missing to every comparison, presence,
-/// projection, aggregate and metrics filter — one statement each.
+/// Issue #493: on fixture A, the unscoped `.service.name` and an arithmetic
+/// `resource.service.name` read the integer `42` from the resource row, in
+/// every comparison, presence, projection, aggregate and metrics filter —
+/// one statement each.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unscoped_service_name_is_held_only_as_a_string() {
+async fn an_unscoped_service_name_reads_its_stored_type() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let (db, client) = seed(
@@ -16492,13 +16522,27 @@ async fn an_unscoped_service_name_is_held_only_as_a_string() {
     let window = (base_ns, base_ns + 60_000_000_000);
     let mut wrong = Vec::new();
     for (id, query, literal) in [
-        ("A1", "{ .service.name = 42 }", ""),
-        ("A2", "{ .service.name > 40 }", ""),
-        ("A3", "{ .service.name != nil }", "a1 [01 service.name=42]"),
+        // Issue #493: `a2`'s integer 42 is read from its resource row. `a1`'s
+        // string "42" counting in `max` is part 2's.
+        (
+            "A1",
+            "{ .service.name = 42 }",
+            "a2 [02 service.name=int:42]",
+        ),
+        (
+            "A2",
+            "{ .service.name > 40 }",
+            "a2 [02 service.name=int:42]",
+        ),
+        (
+            "A3",
+            "{ .service.name != nil }",
+            "a2 [02 service.name=int:42]; a1 [01 service.name=42]",
+        ),
         (
             "A4",
             "{ } | max(.service.name) > 0",
-            "a1 1 [01] {double:42 1 [01]}",
+            "a2 1 [02] {int:42 1 [02]}; a1 1 [01] {double:42 1 [01]}",
         ),
         (
             "A5",
@@ -16508,20 +16552,28 @@ async fn an_unscoped_service_name_is_held_only_as_a_string() {
         (
             "A6",
             "{ } | select(.service.name)",
-            "a2 [02 ]; a1 [01 service.name=42]",
+            "a2 [02 service.name=int:42]; a1 [01 service.name=42]",
         ),
-        ("A7", "{ .service.name + 0 = 42 }", ""),
-        ("A8", "{ resource.service.name + 0 = 42 }", ""),
+        (
+            "A7",
+            "{ .service.name + 0 = 42 }",
+            "a2 [02 service.name=int:42]",
+        ),
+        (
+            "A8",
+            "{ resource.service.name + 0 = 42 }",
+            "a2 [02 service.name=int:42]",
+        ),
         (
             "A9",
             "{ .service.name = .service.name }",
-            "a1 [01 service.name=42]",
+            "a2 [02 service.name=int:42]; a1 [01 service.name=42]",
         ),
-        ("A10", "{ .service.name = nil }", "a2 [02 ]"),
+        ("A10", "{ .service.name = nil }", ""),
         (
             "A11",
             "{ } | by(.service.name)",
-            "a2 1 [02] {nil 1 [02]}; a1 1 [01] {42 1 [01]}",
+            "a2 1 [02] {int:42 1 [02]}; a1 1 [01] {42 1 [01]}",
         ),
     ] {
         let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
@@ -16548,8 +16600,8 @@ async fn an_unscoped_service_name_is_held_only_as_a_string() {
     let metrics = metrics_engine(&db, 1_000).await;
     let s0 = base_ns / 1_000_000_000;
     for (id, query, want) in [
-        ("M1", "{ .service.name = 42 } | count_over_time()", 0.0),
-        ("M2", "{ .service.name != nil } | count_over_time()", 1.0),
+        ("M1", "{ .service.name = 42 } | count_over_time()", 1.0),
+        ("M2", "{ .service.name != nil } | count_over_time()", 2.0),
     ] {
         let got = instant_answer(&metrics, query, s0, s0 + 60).await.map(|r| {
             r.series
@@ -20994,5 +21046,233 @@ async fn a_span_window_with_no_whole_bucket_is_read_whole() {
     assert_eq!(
         pods_4c(&got),
         Ok(strings_4b(&[("/early", "string"), ("/late", "string")]))
+    );
+}
+
+// ---------------------------------------------------------------------
+// issue #493 — fixture AR, an attribute holding an array
+// ---------------------------------------------------------------------
+
+/// `c1` to `cf`: span ids `00000000000000c1` to `…cf`.
+fn idar(short: &str) -> String {
+    format!("00000000000000{short}")
+}
+
+fn array_value(values: Vec<AnyValue>) -> AnyValue {
+    AnyValue {
+        value: Some(any_value::Value::ArrayValue(ArrayValue { values })),
+    }
+}
+
+/// Fixture AR: `span.k` as a scalar, an array of each element type, an
+/// empty array, a one-element array, a mixed array and an integer past
+/// 2^53, all in one request so one insert holds them; arrays on an event,
+/// a link, a resource and a scope.
+fn fixture_ar_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    let ar_span = |n: u8, attributes: Vec<KeyValue>, events, links| {
+        span_of(
+            vec![0xa7; 16],
+            vec![0, 0, 0, 0, 0, 0, 0, n],
+            Vec::new(),
+            "ar",
+            1,
+            base_ns + i64::from(n) * 1_000_000,
+            1_000_000,
+            attributes,
+            0,
+            events,
+            links,
+        )
+    };
+    let k = |v: AnyValue| vec![kv("k", v)];
+    let ints = |xs: &[i64]| array_value(xs.iter().map(|x| int_value(*x)).collect());
+    let one = request(
+        "svc-ar",
+        "ar-a",
+        vec![
+            ar_span(0xc1, k(int_value(1)), vec![], vec![]),
+            ar_span(0xc2, k(ints(&[1, 2])), vec![], vec![]),
+            ar_span(
+                0xc3,
+                k(array_value(vec![double_value(1.5), double_value(2.5)])),
+                vec![],
+                vec![],
+            ),
+            ar_span(0xc4, k(str_array_value(&["a", "b"])), vec![], vec![]),
+            ar_span(
+                0xc5,
+                k(array_value(vec![bool_value(true), bool_value(false)])),
+                vec![],
+                vec![],
+            ),
+            ar_span(
+                0xc6,
+                k(array_value(vec![bool_value(false), bool_value(false)])),
+                vec![],
+                vec![],
+            ),
+            ar_span(0xc7, k(array_value(vec![])), vec![], vec![]),
+            ar_span(0xc8, k(ints(&[2])), vec![], vec![]),
+            ar_span(0xc9, k(str_value("1")), vec![], vec![]),
+            ar_span(
+                0xca,
+                k(array_value(vec![str_value("m"), int_value(1)])),
+                vec![],
+                vec![],
+            ),
+            ar_span(
+                0xcb,
+                vec![],
+                vec![event_of(
+                    base_ns + 0xcb * 1_000_000 + 1,
+                    "ev",
+                    vec![kv("e", ints(&[3, 4]))],
+                )],
+                vec![link_of(
+                    vec![0xab; 16],
+                    vec![0xab; 8],
+                    vec![kv("l", str_array_value(&["x", "y"]))],
+                )],
+            ),
+            ar_span(
+                0xcc,
+                vec![],
+                vec![
+                    event_of(
+                        base_ns + 0xcc * 1_000_000 + 1,
+                        "ev",
+                        vec![kv("e", int_value(5))],
+                    ),
+                    event_of(base_ns + 0xcc * 1_000_000 + 2, "ew", vec![]),
+                ],
+                vec![],
+            ),
+            ar_span(0xcd, k(ints(&[9_007_199_254_740_993])), vec![], vec![]),
+        ],
+    );
+    let scoped = |attributes| InstrumentationScope {
+        name: "io.pulsus.ar".to_string(),
+        version: "1.0".to_string(),
+        attributes,
+        dropped_attributes_count: 0,
+    };
+    vec![
+        one,
+        one_span_request(
+            vec![
+                kv("service.name", str_value("svc-ar")),
+                kv("r", ints(&[7, 8])),
+            ],
+            scoped(vec![kv("sc", str_array_value(&["p", "q"]))]),
+            ar_span(0xce, vec![], vec![], vec![]),
+        ),
+        one_span_request(
+            vec![
+                kv("service.name", str_value("svc-ar")),
+                kv("r", int_value(7)),
+            ],
+            scoped(vec![]),
+            ar_span(0xcf, vec![], vec![], vec![]),
+        ),
+    ]
+}
+
+/// Fixture AR's cases: the query, and the spans it answers (issue #493,
+/// `docs/api.md` §4.2): every operator, `!=` and `!~` included, holds
+/// when the value is held at the literal's type, as a scalar or an array,
+/// and any element satisfies it; a missing value, an empty array, a mixed
+/// array and a value of another type match nothing, so `=` and `!=` are
+/// not complements. The event and link intrinsics take the same rule over
+/// their elements. An integer and a float compare as numbers. A `status`
+/// or `kind` keyword matches nothing.
+fn ar_cases() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        ("{ span.k = 1 }", vec!["c1", "c2"]),
+        ("{ span.k = 2 }", vec!["c2", "c8"]),
+        ("{ span.k != 1 }", vec!["c2", "c3", "c8", "cd"]),
+        ("{ span.k != true }", vec!["c5", "c6"]),
+        ("{ span.k != \"z\" }", vec!["c4", "c9"]),
+        ("{ span.k !~ \"c\" }", vec!["c4", "c9"]),
+        ("{ span.k > 2 }", vec!["c3", "cd"]),
+        ("{ span.k >= 2 }", vec!["c2", "c3", "c8", "cd"]),
+        ("{ span.k < 1.5 }", vec!["c1", "c2"]),
+        ("{ span.k = 2.5 }", vec!["c3"]),
+        ("{ span.k = 1ns }", vec!["c1", "c2"]),
+        ("{ span.k = 9007199254740993 }", vec!["cd"]),
+        ("{ span.k = 9007199254740992 }", vec![]),
+        ("{ span.k = \"a\" }", vec!["c4"]),
+        ("{ span.k != \"a\" }", vec!["c4", "c9"]),
+        ("{ span.k > \"a\" }", vec!["c4"]),
+        ("{ span.k =~ \"b\" }", vec!["c4"]),
+        ("{ span.k !~ \"a|b\" }", vec!["c9"]),
+        ("{ span.k =~ \"1\" }", vec!["c9"]),
+        ("{ span.k = true }", vec!["c5"]),
+        ("{ span.k = false }", vec!["c5", "c6"]),
+        ("{ span.k != false }", vec!["c5"]),
+        ("{ event.e = 4 }", vec!["cb"]),
+        ("{ event.e != 4 }", vec!["cb", "cc"]),
+        ("{ event.e != 6 }", vec!["cb", "cc"]),
+        ("{ event.e >= 4 }", vec!["cb", "cc"]),
+        ("{ link.l =~ \"x\" }", vec!["cb"]),
+        ("{ .e = 3 }", vec!["cb"]),
+        ("{ resource.r = 8 }", vec!["ce"]),
+        ("{ resource.r != 8 }", vec!["ce", "cf"]),
+        ("{ resource.r != 9 }", vec!["ce", "cf"]),
+        ("{ link.l != \"x\" }", vec!["cb"]),
+        ("{ link.l !~ \"x\" }", vec!["cb"]),
+        ("{ span.k = 1 && span.k != 1 }", vec!["c2"]),
+        ("{ instrumentation.sc = \"q\" }", vec!["ce"]),
+        ("{ instrumentation.sc =~ \"q\" }", vec!["ce"]),
+        ("{ .r = 7 }", vec!["ce", "cf"]),
+        ("{ span.k = ok }", vec![]),
+        ("{ span.k != error }", vec![]),
+        ("{ .k != server }", vec![]),
+        ("{ resource.r = unspecified }", vec![]),
+        // An event or link keyword condition reads no element: it renders
+        // as the constant, not a lambda over no arrays.
+        ("{ event.e = ok }", vec![]),
+        ("{ event.e != ok }", vec![]),
+        ("{ link.l = server }", vec![]),
+        ("{ link.l != server }", vec![]),
+        ("{ .k != 1 }", vec!["c2", "c3", "c8", "cd"]),
+        ("{ event:name != \"ev\" }", vec!["cc"]),
+        ("{ event:name !~ \"ev\" }", vec!["cc"]),
+        ("{ event:timeSinceStart != 1ns }", vec!["cc"]),
+        ("{ link:spanID != \"abababababababab\" }", vec![]),
+    ]
+}
+
+/// Issue #493: a condition against a literal reads an array value element
+/// by element, at every scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_condition_reads_an_array_element_by_element() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t493_fixturear");
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    for (i, req) in fixture_ar_bodies(base_ns).into_iter().enumerate() {
+        land(&client, &req, &format!("t493-ar-{i}-{}", now_ns())).await;
+    }
+    let w = WindowSql::start_closed_end_open(base_ns, base_ns + WINDOW_NS);
+    let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(seeded, 15, "fixture AR seeds fifteen spans");
+    let mut wrong = Vec::new();
+    let cases = ar_cases();
+    for (query, ids) in &cases {
+        let want: Vec<String> = ids.iter().map(|s| idar(s)).collect();
+        let got = answer_in(&client, w, query).await;
+        if got.as_ref() != Ok(&want) {
+            wrong.push(format!(
+                "{query}\n   expected {want:?}\n   answered {got:?}"
+            ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} fixture-AR cases answer something else:\n\n{}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n\n")
     );
 }

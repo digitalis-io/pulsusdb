@@ -3022,7 +3022,7 @@ mod tests {
     /// docs/benchmarks/traces-differential-ledger.md (issue #60 plan v2
     /// deltas 2+3). Update deliberately, with the ledger entry, never
     /// as a quick fix for a red run.
-    const INFORMATIONAL_CASE_IDS: &[&str] = &["neg_attr_missing_key"];
+    const INFORMATIONAL_CASE_IDS: &[&str] = &[];
 
     /// Issue #464 wave 2 (AC 7). `tempo_instant_values` reads
     /// `tempopb.QueryInstantResponse` (`pkg/tempopb/tempo.proto:339-355` @

@@ -793,7 +793,8 @@ mod tests {
             "(SELECT min(b) FROM (SELECT intDiv(start_ns, 300000000000) AS b FROM spans WHERE {TIME} AND {BUCKET} AND {DAY} ORDER BY b DESC LIMIT 123456)) AS cut"
         )
     }
-    const PRED: &str = "(service_type = 'string' AND service = 'cart')";
+    // Issue #493: the span row's string, else the resource row's value.
+    const PRED: &str = "((service_type = 'string' AND service = 'cart') OR (NOT service_type = 'string' AND resource_id IN (SELECT resource_id FROM resources WHERE day >= toDate(fromUnixTimestamp64Nano(1700000000000000000), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1700003599999999999), 'UTC') AND ((coalesce(attrs.`service%2Ename`.:String = 'cart', false) OR has(attrs.`service%2Ename`.:`Array(Nullable(String))`, 'cart'))))))";
     const CAP: &str = "if(length(name) <= 8192, name, substringUTF8(name, 1, 2048))";
     const SERVICE: &str = "if(service_type = 'string', [(CAST(service, 'String'), 'string')], CAST([], 'Array(Tuple(String, String))'))";
 
@@ -851,7 +852,15 @@ mod tests {
         );
         assert_eq!(vs(ValueScope::Event, "http.route"), v_s(&event_arr));
         assert_eq!(vs(ValueScope::Link, "http.route"), v_s(&link_arr));
-        assert_eq!(vs(ValueScope::Resource, "service.name"), v_s(SERVICE));
+        // Issue #493: the span rows' strings and the resource rows' values.
+        assert_eq!(
+            vs(ValueScope::Resource, "service.name"),
+            format!(
+                "WITH {}\nSELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM spans\n  ARRAY JOIN {SERVICE} AS e\n  WHERE {TIME} AND {BUCKET} AND {DAY} AND {NEWER} AND ({PRED})\n  UNION ALL\n  SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM resources\n  ARRAY JOIN {} AS e\n  WHERE {RDAY} AND {ids})\nORDER BY val, val_type\nLIMIT 1001",
+                cut(),
+                elems_text("attrs.`service%2Ename`")
+            )
+        );
         // V-R.
         assert_eq!(
             vs(ValueScope::Resource, "http.route"),

@@ -937,14 +937,14 @@ async fn search_semantics_against_real_clickhouse() {
         "case e-both",
     );
 
-    // -- (g) negation: absent + different match, equal does not (narrow
-    // window isolating T1/T2/T3). ----------------------------------------
+    // -- (g) negation: a different value matches, an absent or equal one
+    // does not (issue #493; narrow window isolating T1/T2/T3). ------------
     assert_set(
         port,
         r#"{ .env != "prod" }"#,
         base + 9,
         base + 13,
-        &[2, 3],
+        &[2],
         "case g-neq",
     );
     assert_set(
@@ -952,7 +952,7 @@ async fn search_semantics_against_real_clickhouse() {
         r#"{ .env !~ "pro.*" }"#,
         base + 9,
         base + 13,
-        &[2, 3],
+        &[2],
         "case g-nre",
     );
     // Dual-scope: a resource-scoped env=prod also blocks the unscoped
@@ -1568,9 +1568,10 @@ async fn event_and_link_comparisons_match_any_event_over_real_clickhouse() {
             BTreeSet::from([hex(&tid(1)), hex(&tid(2)), hex(&tid(3))]),
             "any-event-eq-reversed",
         ),
-        // `!=` is ALL-match: only the spans where NO event matches — and
-        // the span with no events at all, which satisfies it vacuously
-        // (the same absent-key rule the literal form follows).
+        // Against a field, `!=` is ALL-match: only the spans where NO
+        // event matches — and the span with no events at all, which
+        // satisfies it vacuously (ledger
+        // `traceql-event-link-operand-any-match`).
         (
             "{ .a != event:name }",
             BTreeSet::from([hex(&tid(4)), hex(&tid(5))]),
@@ -1610,10 +1611,9 @@ async fn event_and_link_comparisons_match_any_event_over_real_clickhouse() {
     // the field-vs-field path can never see a regex operator.
     //
     // `=~` is ANY-match: span 1's events are evX/evY/evZ and the pattern
-    // matches evZ. `!~` is ALL-match: span 1 is EXCLUDED because one of
-    // its events matches, while spans 2-4 (no `ev?` match... spans 2 and
-    // 3 do contain `ev`-prefixed names, so the discriminating pattern is
-    // anchored on evZ alone) are kept.
+    // matches evZ. `!~` against a literal is any-match too (issue #493):
+    // span 1's evX does not match, so span 1 is kept, and span 5, which
+    // has no events, matches neither.
     for (q, expected, ctx) in [
         (
             r#"{ event:name =~ "evZ" }"#,
@@ -1622,8 +1622,8 @@ async fn event_and_link_comparisons_match_any_event_over_real_clickhouse() {
         ),
         (
             r#"{ event:name !~ "evZ" }"#,
-            BTreeSet::from([hex(&tid(2)), hex(&tid(3)), hex(&tid(4)), hex(&tid(5))]),
-            "regex-all-match-excludes-the-span-with-a-matching-event",
+            BTreeSet::from([hex(&tid(1)), hex(&tid(2)), hex(&tid(3)), hex(&tid(4))]),
+            "regex-any-match-keeps-a-span-with-another-event",
         ),
     ] {
         let res = search(port, q, w0, w1, "", ctx);
@@ -2310,7 +2310,8 @@ async fn the_traces_search_route_answers_the_explain_header() {
 ///
 /// **Trace 4 is what separates this change from what shipped.** Its `k`
 /// is `y` — the first element the sender wrote — so it does not match
-/// `= "x"` and does match `!= "x"`. Before this change it did the
+/// `= "x"` and does match `!= "x"`; a span lacking `span.k` matches
+/// neither (issue #493). Before this change it did the
 /// opposite, because the condition asked the attribute index whether SOME
 /// row for that span matched.
 ///
@@ -2356,11 +2357,7 @@ async fn an_attribute_condition_tests_the_element_the_span_resolves_to() {
 
     for (q, expected, ctx) in [
         (r#"{ span.k = "x" }"#, ids(&[2, 3]), "span-k-eq-x"),
-        (
-            r#"{ span.k != "x" }"#,
-            ids(&[1, 4, 5, 6, 7]),
-            "span-k-neq-x",
-        ),
+        (r#"{ span.k != "x" }"#, ids(&[4, 7]), "span-k-neq-x"),
         (r#"{ .k = "x" }"#, ids(&[2, 3, 6]), "unscoped-k-eq-x"),
         (r#"{ span.k = "" }"#, BTreeSet::new(), "span-k-eq-empty"),
         (r#"{ span.k =~ "x.*" }"#, ids(&[2, 3]), "span-k-re-x"),
@@ -2497,9 +2494,8 @@ async fn a_numeric_condition_tests_the_located_element_and_nothing_further() {
 ///
 /// A span's `event.<key>` is one value PER EVENT, not one per span, so a
 /// condition on it cannot locate "the" element. The arity carve-out keeps
-/// those two scopes matching when ANY element matches, and the reader's
-/// single inversion turns that into the all-match rule the tree already
-/// applies to the field-vs-field form (the owner's 2026-08-05 ruling).
+/// those two scopes matching when ANY element matches, `!=` and `!~`
+/// included.
 ///
 /// ```text
 /// 1  three events carrying code = c1 / c2 / c3
@@ -2508,40 +2504,11 @@ async fn a_numeric_condition_tests_the_located_element_and_nothing_further() {
 /// 4  two links carrying lk = l1 / l2
 /// ```
 ///
-/// **The two negated rows are a RULED divergence from the reference**,
-/// and say so in their own assertion message. The owner ruled on
-/// 2026-09-18 that today's answer stands: `!=` and `!~` on an event or
-/// link attribute are all-match, so a span is returned only when none of
-/// its events satisfies the positive condition, and a span carrying no
-/// such key is returned.
-///
-/// ```text
-///   span emits three events
-///     event.level = "info"     connection acquired
-///     event.level = "warn"     slow query
-///     event.level = "error"    query failed
-///
-///   { event.level != "error" }
-///     ours       span not returned   -- it errored
-///     reference  span returned       -- "info" and "warn" are not "error"
-/// ```
-///
-/// Under the reference's reading a span that errored comes back when the
-/// query asked for spans that did not, and any span with two or more
-/// events always carries something that differs — which makes it
-/// impossible to filter out spans holding a particular event. That is why
-/// we are correct here and the reference is not.
-///
-/// **What the ruling changed is the stated BASIS, not the behaviour.**
-/// The 2026-08-05 ruling said all-match was the reference's own designed
-/// multi-value rule. Measurement at the pinned digest shows it is not,
-/// for the attribute-versus-literal form: the reference returns the
-/// c1/c2/c3 span for `{ event.code != "c3" }` and for
-/// `{ event.code != "zz" }`, and it does NOT return spans with no events,
-/// where we do. The ledger entries are
-/// `traceql-event-link-operand-any-match` (the all-match direction) and
-/// `2026-07-16-negation-matches-missing-key` (the absent-key direction),
-/// and both keep their measured rows.
+/// **The negated rows follow the reference** (issue #493, owner decision
+/// 2026-10-23): against a literal, `!=` on an event or link attribute
+/// matches a span with any element that differs, and no span without one —
+/// so the c1/c2/c3 span matches `{ event.code != "c3" }`, and the spans
+/// with no `code` match no `!=`. Ledger `traceql-array-element-rule`.
 #[tokio::test]
 async fn an_event_or_link_condition_matches_any_element_in_both_directions() {
     if !should_run() {
@@ -2639,29 +2606,27 @@ async fn an_event_or_link_condition_matches_any_element_in_both_directions() {
         );
     }
 
-    // The negated direction: a RULED divergence, not a pending one. The
-    // owner ruled on 2026-09-18 that today's answer stands, because the
-    // reference's reading returns a span that errored to a query asking
-    // for spans that did not.
-    const RULED: &str = "a deliberate divergence the owner ruled on 2026-09-18: all-match is \
-                         correct and the reference is wrong here, recorded as \
-                         `traceql-event-link-operand-any-match` and \
-                         `2026-07-16-negation-matches-missing-key`";
-    let ctx = "event-code-neq-c3";
-    let res = search(port, r#"{ event.code != "c3" }"#, w0, w1, "", ctx);
+    // The negated direction, as the reference answers it (issue #493): a
+    // span with any event whose `code` differs, and no span without one.
+    for (q, ctx) in [
+        (r#"{ event.code != "c3" }"#, "event-code-neq-c3"),
+        (r#"{ event.code != "zz" }"#, "event-code-neq-zz"),
+        (r#"{ event.code !~ "c3" }"#, "event-code-nre-c3"),
+    ] {
+        let res = search(port, q, w0, w1, "", ctx);
+        assert_eq!(
+            trace_set(&res.json(ctx)),
+            ids(&[1]),
+            "{ctx}: the c1/c2/c3 span holds a `code` that differs; the spans with no `code` \
+             match no `!=`"
+        );
+    }
+    let ctx = "link-lk-neq-l1";
+    let res = search(port, r#"{ link.lk != "l1" }"#, l0, l1, "", ctx);
     assert_eq!(
         trace_set(&res.json(ctx)),
-        ids(&[2, 3]),
-        "{ctx}: a span one of whose events matches is EXCLUDED, and a span with no `code` \
-         matches — {RULED} (the reference returns the c1/c2/c3 span)"
-    );
-    let ctx = "event-code-neq-zz";
-    let res = search(port, r#"{ event.code != "zz" }"#, w0, w1, "", ctx);
-    assert_eq!(
-        trace_set(&res.json(ctx)),
-        ids(&[1, 2, 3]),
-        "{ctx}: no event carries `zz`, so every span matches, the two with no `code` \
-         included — {RULED} (the reference returns the c1/c2/c3 span only)"
+        ids(&[4]),
+        "{ctx}: the link carrying l2 differs"
     );
 
     drop_db(db).await;
@@ -3472,10 +3437,8 @@ fn metrics_total(port: u16, q: &str, start_s: i64, end_s: i64, ctx: &str) -> f64
 ///
 /// Trace 7 is the row the `ifNull` wrapper exists for. Its `n` resolves to
 /// the FIRST element, `"abc"`, which has no numeric reading at all — so
-/// `{ span.n = 400 }` does not count it, and `{ span.n != 400 }` does.
-/// Without the wrapper `NOT (NULL)` is `NULL`, which is falsy in a `WHERE`
-/// clause, and trace 7 would be DROPPED from the negation instead of
-/// counted.
+/// neither `{ span.n = 400 }` nor `{ span.n != 400 }` counts it: `!=`
+/// holds only on a number that differs (issue #493).
 ///
 /// **Every row is asserted on both routes**, against the same window: the
 /// search route's trace set and the metrics route's count. That is the
@@ -3523,20 +3486,12 @@ async fn a_metrics_attribute_condition_tests_the_element_the_span_resolves_to() 
 
     for (q, expected, ctx) in [
         (r#"{ span.k = "x" }"#, ids(&[2, 3]), "span-k-eq-x"),
-        (
-            r#"{ span.k != "x" }"#,
-            ids(&[1, 4, 5, 6, 7, 8]),
-            "span-k-neq-x",
-        ),
+        (r#"{ span.k != "x" }"#, ids(&[4]), "span-k-neq-x"),
         (r#"{ .k = "x" }"#, ids(&[2, 3, 6]), "unscoped-k-eq-x"),
         (r#"{ span.k = "" }"#, BTreeSet::new(), "span-k-eq-empty"),
         (r#"{ span.n = 400 }"#, ids(&[8]), "span-n-eq-400"),
         (r#"{ span.n >= 400 }"#, ids(&[8]), "span-n-gte-400"),
-        (
-            r#"{ span.n != 400 }"#,
-            ids(&[1, 2, 3, 4, 5, 6, 7]),
-            "span-n-neq-400",
-        ),
+        (r#"{ span.n != 400 }"#, BTreeSet::new(), "span-n-neq-400"),
         (r#"{ span.n = 0 }"#, BTreeSet::new(), "span-n-eq-0"),
     ] {
         let res = search(port, q, w0, w1, "", ctx);
@@ -3567,7 +3522,7 @@ async fn a_metrics_attribute_condition_tests_the_element_the_span_resolves_to() 
 /// lowering keeps that by folding the value test into the locate
 /// (`arrayFirstIndex((k, s, v) -> …)`), which lands on the first MATCHING
 /// element rather than the first element carrying the key; its negation
-/// excludes exactly as the old `NOT IN` did.
+/// matches where any event differs (issue #493).
 ///
 /// The eight-span fixture above seeds no events, so it would answer `0`
 /// to both queries here and say nothing. This one span carries three.
@@ -3604,7 +3559,7 @@ async fn an_event_condition_matches_any_event_on_the_metrics_route_too() {
         ),
         (
             r#"{ event.exception.type != "E2" }"#,
-            BTreeSet::new(),
+            ids(&[1]),
             "event-neq-E2",
         ),
     ] {

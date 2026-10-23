@@ -78,3 +78,22 @@ array_presence	{ span.tags != nil }	presence: every array but the mixed one
 array_compare	{} | compare({ span.tags != nil })	arrays are not counted in `compare()`
 array_metrics_by	{} | rate() by(span.tags)	an array `by()` key on the metrics routes: each array its own `nil` series, the mixed one with the spans that lack the key
 array_metrics_well_known	{} | rate() by(span.http.method)	a mixed array on a well-known key: one `nil` series with the spans that lack the key
+array_int	{ span.vals = 2 }	an integer against an array: any element (#493)
+array_int_negated	{ span.vals != 1 }	`!=` against an array: any number element differing; a span lacking the key never (#493)
+array_ordered	{ span.vals > 2 }	an ordered comparison against an array: any element, which the first element alone would not answer (#493)
+array_double	{ span.vals = 2.5 }	a double against an array of doubles (#493)
+array_string_ordered	{ span.vals > "a" }	an ordered string comparison against an array (#493)
+array_regex	{ span.vals =~ "b" }	a regex against an array: string elements only (#493)
+array_regex_negated	{ span.vals !~ "a|b" }	`!~` against an array: any string element not matching (#493)
+array_bool	{ span.vals = false }	a boolean against an array (#493)
+array_event	{ event.evals = 4 }	an event attribute holding an array (#493)
+array_link	{ link.lvals =~ "y" }	a link attribute holding an array (#493)
+array_resource	{ resource.rvals = 8 }	a resource attribute holding an array (#493)
+array_unscoped	{ .rvals = 7 }	an unscoped key reaching a resource array (#493)
+array_scalar_by	{ resource.service.name = "arrays" } | by(span.vals)	a key holding a scalar and arrays in one part, as a `by()` key (#493)
+array_scalar_select	{ resource.service.name = "arrays" } | select(span.vals, event.evals)	the same key and an event key holding a scalar and an array, projected (#493)
+array_scalar_aggregate	{ resource.service.name = "arrays" && name != "v-string" } | max(span.vals) > 0	an aggregate over the same key: arrays skipped (#493)
+array_metrics_filter	{ span.vals = 1 } | rate()	array membership on the metrics routes (#493)
+array_string_eq	{ span.vals = "a" }	string membership in an array: the stored array is projected, not the literal (#493)
+array_negated_empty	{ span.tags != "x" }	`!=` is any string differing: `["x","y"]` and `["z"]` match; an empty array, an integer array, the mixed array and a span lacking the key do not (#493)
+keyword_against_attribute	{ span.vals != error || .a = server || name = "v-int" }	a `status` or `kind` keyword against an attribute matches no span (#493)

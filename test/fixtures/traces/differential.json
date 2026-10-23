@@ -96,10 +96,9 @@
     },
     {
       "case_id": "neg_attr_missing_key",
-      "construct": "attr != where some spans lack the key entirely (docs/api.md \u00a74.2 matches-missing rule)",
+      "construct": "attr != where some spans lack the key entirely (docs/api.md \u00a74.2: a span lacking the key never matches)",
       "attr_type": "string",
-      "mode": "informational",
-      "ledger": "2026-07-16-negation-matches-missing-key",
+      "mode": "gated",
       "q": "{ resource.run_id = \"{R}\" && resource.env != \"prod\" }"
     },
     {

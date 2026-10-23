@@ -1513,16 +1513,8 @@ mod tests {
     fn a_refusal_is_the_statement_compilers() {
         for (q, want) in [
             (
-                r#"{ resource.service.name > "x" } | avg_over_time(.n) by (name)"#,
-                "resource.service.name supports only = != =~ !~",
-            ),
-            (
                 "{ name != nil } | histogram_over_time(span:childCount)",
                 "existence checks are only supported on attributes",
-            ),
-            (
-                "{ resource.service.name > -1 } | rate()",
-                "resource.service.name supports only = != =~ !~",
             ),
             (
                 "{ !instrumentation:name } | rate()",
