@@ -279,6 +279,12 @@ pub enum ValidateError {
     /// `avg(-(-.a))`, `avg(nestedSetParent + nestedSetLeft)`.
     #[error("aggregate field expressions must reference the span: {expr}")]
     AggregateNotSpanReferencing { expr: String },
+    /// `ast_validate.go` `GroupOperation.validate` via `ast.go`
+    /// `referencesSpan` (issue #649): a spanset `by()` key must read a
+    /// field. Measured, 400 `grouping field expressions must reference the
+    /// span: by(3)` for `by(1 + 2)`.
+    #[error("grouping field expressions must reference the span: {expr}")]
+    GroupNotSpanReferencing { expr: String },
     /// `ast_validate.go:272-287` — `= nil` is illegal on any intrinsic
     /// and on scoped `resource.service.name`.
     #[error("{field} = nil is not valid: intrinsics cannot be nil")]
@@ -347,6 +353,7 @@ impl ValidateError {
             ValidateError::IllegalUnaryOperator { .. } => "illegal-unary-operator",
             ValidateError::AggregateNotNumeric { .. } => "aggregate-not-numeric",
             ValidateError::AggregateNotSpanReferencing { .. } => "aggregate-not-span-referencing",
+            ValidateError::GroupNotSpanReferencing { .. } => "group-not-span-referencing",
             ValidateError::IntrinsicNotNil { .. } => "intrinsic-not-nil",
             ValidateError::QuantileOutOfRange { .. } => "quantile-out-of-range",
             ValidateError::TooManyGroupBys { .. } => "too-many-group-bys",
@@ -397,6 +404,10 @@ pub const VALIDATE_RULES: &[(&str, &str)] = &[
     (
         "aggregate-not-span-referencing",
         "ast_validate.go Aggregate.validate via ast.go referencesSpan (the span-reference half)",
+    ),
+    (
+        "group-not-span-referencing",
+        "ast_validate.go GroupOperation.validate via ast.go referencesSpan",
     ),
     ("intrinsic-not-nil", "ast_validate.go:272-287"),
     ("quantile-out-of-range", "ast_metrics.go:328-332"),
@@ -1445,6 +1456,9 @@ mod tests {
                 expr: String::new(),
             },
             ValidateError::AggregateNotSpanReferencing {
+                expr: String::new(),
+            },
+            ValidateError::GroupNotSpanReferencing {
                 expr: String::new(),
             },
             ValidateError::IntrinsicNotNil {

@@ -173,8 +173,8 @@
       "subject_atoms": [],
       "stage": "D2",
       "closed_by": 335,
-      "wire_status": "open",
-      "wire_note": "PARSE axis closed, wire axis not. Stage D2 rewrote groupOperation in both directions: the comma list is gone (a reference parse error we accepted AND served, withdrawn and ledgered) and the single operand is a full field expression. All six probes agree on parse. On the WIRE (parse -> validate -> plan) four of them are still planner 400s where the reference answers 2xx: by(.b + .c), by(-.b), by(!.b) and by(.b = 1) are COMPOSITE keys, and a grouping key must resolve to one per-span value, so search_plan.rs refuses them with a clean 400 naming the rendered key rather than answering a silent flat 200. by((.b)) reaches 2xx because parentheses group without surviving into the AST, so it IS by(.b). See wire_baseline.json."
+      "wire_status": "closed",
+      "wire_note": "PARSE and WIRE axes both closed. Stage D2 rewrote groupOperation in both directions: the comma list is gone (a reference parse error we accepted AND served, withdrawn and ledgered) and the single operand is a full field expression. Issue #649 serves that expression as a group key, so by(.b + .c), by(-.b), by(!.b) and by(.b = 1) plan and answer 2xx as the reference does. See wire_baseline.json."
     },
     {
       "id": "D17",
@@ -2010,8 +2010,7 @@
       "pulsus": "accept",
       "verdict": "agree",
       "closed_by": 335,
-      "closed_class": "D16",
-      "owning_issue": 335
+      "closed_class": "D16"
     },
     {
       "query": "{ .a = 1 } | by((.b))",
@@ -2027,8 +2026,7 @@
       "pulsus": "accept",
       "verdict": "agree",
       "closed_by": 335,
-      "closed_class": "D16",
-      "owning_issue": 335
+      "closed_class": "D16"
     },
     {
       "query": "{ .a = 1 } | by(.b + .c)",
@@ -2036,8 +2034,7 @@
       "pulsus": "accept",
       "verdict": "agree",
       "closed_by": 335,
-      "closed_class": "D16",
-      "owning_issue": 335
+      "closed_class": "D16"
     },
     {
       "query": "{ .a = 1 } | by(.b = 1)",
@@ -2045,8 +2042,7 @@
       "pulsus": "accept",
       "verdict": "agree",
       "closed_by": 335,
-      "closed_class": "D16",
-      "owning_issue": 335
+      "closed_class": "D16"
     },
     {
       "query": "{ .a = 1 } | by(.b, .c)",

@@ -7622,7 +7622,7 @@ async fn search_routed_answers_as_recorded_on_fixture_c() {
         drop_db(&db).await;
     }
     eprintln!("and {fixture_cases} fixture cases");
-    assert_eq!(names.len(), 119, "the inventory's new rows");
+    assert_eq!(names.len(), 120, "the inventory's new rows");
     assert!(
         wrong.is_empty(),
         "{} of {} differ:\n\n{}",
@@ -21275,4 +21275,420 @@ async fn a_condition_reads_an_array_element_by_element() {
         cases.len(),
         wrong.join("\n\n")
     );
+}
+
+// ---------------------------------------------------------------------
+// Issue #649: a `by()` key that is a field expression
+// ---------------------------------------------------------------------
+
+/// Issue #649's fixture: trace `d0`, one resource `expr`, spans `d1`…`d6`
+/// at 1…6 s, the corpus the reference was measured on. `d2` is `d1`'s
+/// child and `d1` is an error span.
+///
+/// | span | name | duration | attributes |
+/// |---|---|---|---|
+/// | d1 | a | 1.5 s | dms 2500, f 1.5, s "x", b true, k 3, z 0, group_values 7 |
+/// | d2 | a | 2 s | dms 999, f 2.0, b false, k -1 |
+/// | d3 | b | 3 s | s "y", t "group_values" |
+/// | d4 | b | 1 s | dms "500" |
+/// | d5 | c | 1 s | arr [1, 2] |
+/// | d6 | c | 1 s | dms -7, f -0.5 |
+fn by_expr_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const MS: i64 = 1_000_000;
+    let sp = |id: u8, parent: Option<u8>, name: &str, dur_ms: i64, status: i32, attrs| {
+        span_of(
+            vec![0xd0; 16],
+            vec![0, 0, 0, 0, 0, 0, 0, id],
+            parent.map_or_else(Vec::new, |p| vec![0, 0, 0, 0, 0, 0, 0, p]),
+            name,
+            2,
+            base_ns + i64::from(id - 0xd0) * 1_000 * MS,
+            dur_ms * MS,
+            attrs,
+            status,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    vec![by_body(
+        "expr",
+        vec![
+            sp(
+                0xd1,
+                None,
+                "a",
+                1_500,
+                2,
+                vec![
+                    kv("dms", int_value(2500)),
+                    kv("f", double_value(1.5)),
+                    kv("s", str_value("x")),
+                    kv("b", bool_value(true)),
+                    kv("k", int_value(3)),
+                    kv("z", int_value(0)),
+                    kv("group_values", int_value(7)),
+                ],
+            ),
+            sp(
+                0xd2,
+                Some(0xd1),
+                "a",
+                2_000,
+                0,
+                vec![
+                    kv("dms", int_value(999)),
+                    kv("f", double_value(2.0)),
+                    kv("b", bool_value(false)),
+                    kv("k", int_value(-1)),
+                ],
+            ),
+            sp(
+                0xd3,
+                None,
+                "b",
+                3_000,
+                0,
+                vec![kv("s", str_value("y")), kv("t", str_value("group_values"))],
+            ),
+            sp(0xd4, None, "b", 1_000, 0, vec![kv("dms", str_value("500"))]),
+            sp(
+                0xd5,
+                None,
+                "c",
+                1_000,
+                0,
+                vec![kv("arr", int_array_value(&[1, 2]))],
+            ),
+            sp(
+                0xd6,
+                None,
+                "c",
+                1_000,
+                0,
+                vec![kv("dms", int_value(-7)), kv("f", double_value(-0.5))],
+            ),
+        ],
+    )]
+}
+
+/// [`grouped_answer_of`], led by the first group's key: the label the
+/// response carries.
+fn keyed_answer_of(
+    out: &Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>,
+) -> String {
+    let key = out
+        .as_ref()
+        .ok()
+        .and_then(|o| o.traces.first())
+        .and_then(|t| t.groups.as_ref())
+        .and_then(|g| g.first())
+        .and_then(|g| g.attributes.first())
+        .map_or("-", |(k, _)| k.as_str())
+        .to_string();
+    format!("{key} | {}", grouped_answer_of(out))
+}
+
+const ALL6: &str = "d0 6 [d1, d2, d3, d4, d5, d6]";
+
+/// Parity with the reference: each row's groups were read from the pinned
+/// reference over the same spans (group order aside — ours is first
+/// appearance).
+const BY_EXPR_CASES: &[LevelCase] = &[
+    (
+        "{ } | by(span.dms / 1000)",
+        "by(span.dms / 1000) | d0 6 [d1, d2, d3, d4, d5, d6] {int:2 1 [d1]; int:0 2 [d2, d6]; bool:false 3 [d3, d4, d5]}",
+    ),
+    (
+        "{ } | by(.dms / 1000)",
+        "by(.dms / 1000) | d0 6 [d1, d2, d3, d4, d5, d6] {int:2 1 [d1]; int:0 2 [d2, d6]; bool:false 3 [d3, d4, d5]}",
+    ),
+    (
+        "{ } | by(span.f * 2)",
+        "by(span.f * 2) | d0 6 [d1, d2, d3, d4, d5, d6] {double:3 1 [d1]; double:4 1 [d2]; bool:false 3 [d3, d4, d5]; double:-1 1 [d6]}",
+    ),
+    (
+        "{ } | by(span.dms + span.f)",
+        "by(span.dms + span.f) | d0 6 [d1, d2, d3, d4, d5, d6] {double:2501.5 1 [d1]; double:1001 1 [d2]; bool:false 3 [d3, d4, d5]; double:-7.5 1 [d6]}",
+    ),
+    (
+        "{ } | by(span.dms % 7)",
+        "by(span.dms % 7) | d0 6 [d1, d2, d3, d4, d5, d6] {int:1 1 [d1]; int:5 1 [d2]; bool:false 3 [d3, d4, d5]; int:0 1 [d6]}",
+    ),
+    (
+        "{ } | by((span.dms + 2) * 3)",
+        "by((span.dms + 2) * 3) | d0 6 [d1, d2, d3, d4, d5, d6] {int:7506 1 [d1]; int:3003 1 [d2]; bool:false 3 [d3, d4, d5]; int:-15 1 [d6]}",
+    ),
+    (
+        "{ } | by(span.dms + 2 * 3)",
+        "by(span.dms + 6) | d0 6 [d1, d2, d3, d4, d5, d6] {int:2506 1 [d1]; int:1005 1 [d2]; bool:false 3 [d3, d4, d5]; int:-1 1 [d6]}",
+    ),
+    (
+        "{ } | by(span.dms / 1000.0)",
+        "by(span.dms / 1000.0) | d0 6 [d1, d2, d3, d4, d5, d6] {double:2.5 1 [d1]; double:0.999 1 [d2]; bool:false 3 [d3, d4, d5]; double:-0.007 1 [d6]}",
+    ),
+    (
+        "{ } | by(span.dms * 1ms)",
+        "by(span.dms * 1ms) | d0 6 [d1, d2, d3, d4, d5, d6] {double:2500000000 1 [d1]; double:999000000 1 [d2]; bool:false 3 [d3, d4, d5]; double:-7000000 1 [d6]}",
+    ),
+    (
+        "{ } | by(duration / 1000)",
+        "by(duration / 1000) | d0 6 [d1, d2, d3, d4, d5, d6] {double:1500000 1 [d1]; double:2000000 1 [d2]; double:3000000 1 [d3]; double:1000000 3 [d4, d5, d6]}",
+    ),
+    (
+        "{ } | by(-duration)",
+        "by(-duration) | d0 6 [d1, d2, d3, d4, d5, d6] {-1.5s 1 [d1]; -2s 1 [d2]; -3s 1 [d3]; -1s 3 [d4, d5, d6]}",
+    ),
+    (
+        "{ } | by(span.k * span.k)",
+        "by(span.k * span.k) | d0 6 [d1, d2, d3, d4, d5, d6] {int:9 1 [d1]; int:1 1 [d2]; bool:false 4 [d3, d4, d5, d6]}",
+    ),
+    (
+        "{ } | by(span.dms / 0.0)",
+        "by(span.dms / 0.0) | d0 6 [d1, d2, d3, d4, d5, d6] {double:inf 2 [d1, d2]; bool:false 3 [d3, d4, d5]; double:-inf 1 [d6]}",
+    ),
+    (
+        "{ } | by(span.dms = 999)",
+        "by(span.dms = 999) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:false 5 [d1, d3, d4, d5, d6]; bool:true 1 [d2]}",
+    ),
+    (
+        "{ } | by(span.dms > 1000)",
+        "by(span.dms > 1000) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:true 1 [d1]; bool:false 5 [d2, d3, d4, d5, d6]}",
+    ),
+    (
+        "{ } | by(span.b || span.dms > 0)",
+        "by(span.b || (span.dms > 0)) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:true 2 [d1, d2]; bool:false 4 [d3, d4, d5, d6]}",
+    ),
+    (
+        "{ } | by(span.s =~ \"x\")",
+        "by(span.s =~ `x`) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:true 1 [d1]; bool:false 5 [d2, d3, d4, d5, d6]}",
+    ),
+    (
+        "{ } | by(span.dms != nil)",
+        "by(span.dms != nil) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:true 4 [d1, d2, d4, d6]; bool:false 2 [d3, d5]}",
+    ),
+    (
+        "{ } | by(!(span.dms > 1000))",
+        "by(!(span.dms > 1000)) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:false 1 [d1]; bool:true 5 [d2, d3, d4, d5, d6]}",
+    ),
+    (
+        "{ } | by(name = \"a\")",
+        "by(name = `a`) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:true 2 [d1, d2]; bool:false 4 [d3, d4, d5, d6]}",
+    ),
+    (
+        "{ } | by(span.dms != 999)",
+        "by(span.dms != 999) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:true 2 [d1, d6]; bool:false 4 [d2, d3, d4, d5]}",
+    ),
+];
+
+/// Where the answer differs from the reference by decision (ledger rows
+/// `traceql-arithmetic-exact` and `traceql-by-expression-key`): each row
+/// derived by hand from the fixture table.
+const BY_EXPR_DECIDED: &[LevelCase] = &[
+    (
+        "{ } | by(2 ^ span.k)",
+        "by(2 ^ span.k) | d0 6 [d1, d2, d3, d4, d5, d6] {int:8 1 [d1]; double:0.5 1 [d2]; bool:false 4 [d3, d4, d5, d6]}",
+    ),
+    (
+        "{ } | by(span.dms / span.z)",
+        "by(span.dms / span.z) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:false 6 [d1, d2, d3, d4, d5, d6]}",
+    ),
+    (
+        "{ } | by(-span.dms)",
+        "by(-span.dms) | d0 6 [d1, d2, d3, d4, d5, d6] {int:-2500 1 [d1]; int:-999 1 [d2]; bool:false 3 [d3, d4, d5]; int:7 1 [d6]}",
+    ),
+    (
+        "{ } | by(span.arr + 1)",
+        "by(span.arr + 1) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:false 6 [d1, d2, d3, d4, d5, d6]}",
+    ),
+    (
+        "{ } | by(9223372036854775807 + span.dms)",
+        "by(9223372036854775807 + span.dms) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:false 5 [d1, d2, d3, d4, d5]; int:9223372036854775800 1 [d6]}",
+    ),
+    (
+        "{ } | by(span.dms = nil)",
+        "by(span.dms = nil) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:false 4 [d1, d2, d4, d6]; bool:true 2 [d3, d5]}",
+    ),
+    (
+        "{ } | by(span.f > 0)",
+        "by(span.f > 0) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:true 2 [d1, d2]; bool:false 4 [d3, d4, d5, d6]}",
+    ),
+    (
+        "{ } | by(!span.b)",
+        "by(!span.b) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:false 5 [d1, d3, d4, d5, d6]; bool:true 1 [d2]}",
+    ),
+    (
+        "{ status = error } | by(duration / 1000)",
+        "by(duration / 1000) | d0 1 [d1] {double:1500000 1 [d1]}",
+    ),
+    (
+        "{ } | by(span:childCount + 1)",
+        "by(span:childCount + 1) | d0 6 [d1, d2, d3, d4, d5, d6] {int:2 1 [d1]; int:1 5 [d2, d3, d4, d5, d6]}",
+    ),
+    (
+        "{ } | by(span.t = \"group_values\")",
+        "by(span.t = `group_values`) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:false 5 [d1, d2, d4, d5, d6]; bool:true 1 [d3]}",
+    ),
+    (
+        "{ } | by(traceDuration > 5s)",
+        "by(traceDuration > 5s) | d0 6 [d1, d2, d3, d4, d5, d6] {bool:true 6 [d1, d2, d3, d4, d5, d6]}",
+    ),
+    (
+        "{ } | by(span.group_values + traceDuration)",
+        "by(span.group_values + traceDuration) | d0 6 [d1, d2, d3, d4, d5, d6] {double:6000000007 1 [d1]; bool:false 5 [d2, d3, d4, d5, d6]}",
+    ),
+];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_by_expression_groups_as_the_reference_does() {
+    skip_unless_live!();
+    assert!(BY_EXPR_CASES.iter().all(|(_, w)| w.contains(ALL6)));
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels_by(
+        "bx",
+        &by_expr_bodies(base_ns),
+        6,
+        base_ns,
+        BY_EXPR_CASES,
+        keyed_answer_of,
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_by_expression_answers_as_decided() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels_by(
+        "bxd",
+        &by_expr_bodies(base_ns),
+        6,
+        base_ns,
+        BY_EXPR_DECIDED,
+        keyed_answer_of,
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A looked-up intrinsic in arithmetic groups as its plain key does: the
+/// rows are `TK_CASES`', `a_child_count_is_a_by_key`'s and `NK_CASES`'
+/// literals, a duration's value written as its nanoseconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_looked_up_intrinsic_in_a_by_expression_is_its_plain_value() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let mut wrong = check_levels_by(
+        "bxt",
+        &tl_bodies(base_ns),
+        12,
+        base_ns,
+        &[
+            (
+                r#"{ resource.service.name = "loadgen" } | by(trace:duration / 1)"#,
+                "d3 2 [05, 06] {double:2000000000 2 [05, 06]}; d2 1 [02] {double:7200000000000 1 [02]}; d1 2 [01, 02] {double:1000000000 2 [01, 02]}",
+            ),
+            (
+                r#"{ resource.service.name = "loadgen" } | by(-trace:duration)"#,
+                "d3 2 [05, 06] {-2s 2 [05, 06]}; d2 1 [02] {-2h0m0s 1 [02]}; d1 2 [01, 02] {-1s 2 [01, 02]}",
+            ),
+        ],
+        grouped_answer_of,
+    )
+    .await;
+    wrong.extend(
+        check_levels_by(
+            "bxc",
+            &cc_bodies(base_ns),
+            13,
+            base_ns,
+            &[("{ } | by(span:childCount + 0)", "c3 4 [01, 02, 0b, 0c] {int:1 1 [01]; int:2 1 [02]; int:0 2 [0b, 0c]}; cc 7 [01, 02, 03, 07, 08, 09, 0a] {int:4 1 [01]; int:3 1 [02]; int:1 1 [03]; int:0 4 [07, 08, 09, 0a]}")],
+            grouped_answer_of,
+        )
+        .await,
+    );
+    let plain: Vec<(String, &str)> = NK_CASES
+        .iter()
+        .map(|(q, w)| (q.replace(')', " + 0)"), *w))
+        .collect();
+    let cases: Vec<LevelCase> = plain
+        .iter()
+        .map(|(q, w)| (&*Box::leak(q.clone().into_boxed_str()), *w))
+        .collect();
+    let mut cases = cases;
+    // Two lookups in one key: each span's right minus its left, from
+    // `NK_CASES`' two literals.
+    cases.push((
+        "{ } | by(nestedSetRight - nestedSetLeft)",
+        "b2 5 [05, 02, 04, 01, 03] {int:1 3 [05, 04, 03]; int:5 1 [02]; int:3 1 [01]}; c1 2 [02, 03] {int:3 1 [02]; int:1 1 [03]}; e5 2 [01, 02] {int:0 2 [01, 02]}; e2 5 [04, 01, 05, 02, 03] {int:3 1 [04]; int:0 3 [01, 02, 03]; int:1 1 [05]}; e1 6 [01, 02, 03, 04, 05, 06] {int:7 1 [01]; int:3 1 [02]; int:1 2 [03, 04]; int:0 2 [05, 06]}; a1 4 [01, 02, 03, 04] {int:7 1 [01]; int:3 1 [02]; int:1 2 [03, 04]}",
+    ));
+    // …and read by the top-K, an aggregate partitioning by it.
+    cases.push((
+        "{ } | by(nestedSetRight - nestedSetLeft) | count() > 1",
+        "b2 3 [05, 04, 03] {int:1 3 [05, 04, 03]}; e5 2 [01, 02] {int:0 2 [01, 02]}; e2 3 [01, 02, 03] {int:0 3 [01, 02, 03]}; e1 4 [03, 04, 05, 06] {int:1 2 [03, 04]; int:0 2 [05, 06]}; a1 2 [03, 04] {int:1 2 [03, 04]}",
+    ));
+    wrong.extend(
+        check_levels_by(
+            "bxn",
+            &ns_bodies(base_ns),
+            25,
+            base_ns,
+            &cases,
+            grouped_answer_of,
+        )
+        .await,
+    );
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// No key text is rewritten: an attribute named `group_values` is read as
+/// written (issue #649, decision D9).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_named_group_values_reads_its_own_value() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels_by(
+        "bxg",
+        &by_expr_bodies(base_ns),
+        6,
+        base_ns,
+        &[("{ } | by(span.group_values)", "by(span.group_values) | d0 6 [d1, d2, d3, d4, d5, d6] {int:7 1 [d1]; nil 5 [d2, d3, d4, d5, d6]}")],
+        keyed_answer_of,
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A `!` key over a present non-boolean fails the statement with the
+/// filter's own demand, as the reference fails the query (issue #649).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_negated_key_over_a_string_raises_the_filters_demand() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (db, _client) = seed(
+        pulsus_testkit::test_db("pulsus_read_it_t649_demand"),
+        &by_expr_bodies(base_ns),
+        6,
+        "t649-demand",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let query = "{ } | by(!span.s)";
+    let plan = plan_of(
+        &engine,
+        &parse_query(query),
+        (base_ns, base_ns + 60_000_000_000),
+        20,
+        20,
+    );
+    let routed = engine.search_routed(&plan).await;
+    drop_db(&db).await;
+    match routed {
+        Err(e) => assert!(
+            e.to_string()
+                .contains("expression (!span.s) expected a boolean"),
+            "{query}: {e}"
+        ),
+        Ok(out) => panic!("{query}: answered {}", grouped_answer_of(&Ok(out))),
+    }
 }

@@ -30,6 +30,7 @@
 //!   1): tag names from `tag_names`, unnarrowed values from `tag_values`.
 
 pub mod attr_index;
+pub mod by_key;
 pub mod error_spans;
 pub mod fetch;
 pub mod fold;

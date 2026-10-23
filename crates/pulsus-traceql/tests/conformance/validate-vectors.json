@@ -582,6 +582,94 @@
    "error_variant": "aggregate-not-span-referencing"
   },
   {
+   "id": "grpspan-a1",
+   "check": "group-not-span-referencing",
+   "query": "{} | by(.a + 1)",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "grpspan-a2",
+   "check": "group-not-span-referencing",
+   "query": "{} | by(1 + .a)",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "grpspan-r1",
+   "check": "group-not-span-referencing",
+   "query": "{} | by(1)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "group-not-span-referencing"
+  },
+  {
+   "id": "grpspan-r2",
+   "check": "group-not-span-referencing",
+   "query": "{} | by(1 + 2)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "group-not-span-referencing"
+  },
+  {
+   "id": "grpspan-r3",
+   "check": "group-not-span-referencing",
+   "query": "{} | by(-1s)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "group-not-span-referencing"
+  },
+  {
+   "id": "grpspan-r4",
+   "check": "group-not-span-referencing",
+   "query": "{} | by(\"x\")",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "group-not-span-referencing"
+  },
+  {
+   "id": "grpspan-r5",
+   "check": "group-not-span-referencing",
+   "query": "{} | by(true)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "group-not-span-referencing"
+  },
+  {
+   "id": "grpspan-r6",
+   "check": "group-not-span-referencing",
+   "query": "{} | by(1 + \"x\")",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "group-not-span-referencing"
+  },
+  {
+   "id": "grpspan-r7",
+   "check": "type-mismatch",
+   "query": "{} | by(name + 1)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "type-mismatch"
+  },
+  {
    "id": "nil-d1",
    "check": "intrinsic-not-nil",
    "query": "{ !(name != nil) }",

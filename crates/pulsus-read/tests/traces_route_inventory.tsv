@@ -20,7 +20,7 @@ attr_unscoped_number	search	new	9
 bare_attribute	search	new	9
 bare_bool_true	search	new	9
 bracketed_attribute	search	new	9
-by_expression_key	search	refused	refused
+by_expression_key	search	new	9
 duration_frac_half	search	new	9
 duration_frac_leading_dot	search	new	9
 duration_frac_ns_boundary	search	new	9
