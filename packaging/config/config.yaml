@@ -1,8 +1,8 @@
 # PulsusDB configuration — /etc/pulsusdb/config.yaml
 #
 # This is the COMPLETE document schema (docs/configuration.md §9). Every key is
-# shown commented at its default; uncomment and edit only what you need. Unknown
-# keys are rejected at startup.
+# shown at its default, commented out except `clickhouse.server`; uncomment and
+# edit only what you need. Unknown keys are rejected at startup.
 #
 # Precedence: CLI flags (--config, --mode) > environment variables > this YAML >
 # defaults. An environment variable set to the empty string counts as unset.
@@ -13,7 +13,7 @@
 # decimal (KB/MB/GB/TB), or a bare integer of bytes.
 
 # --- root scalars ---
-#mode: all                        # all | writer | reader | init
+#mode: all                        # all | writer | reader
 #host: 0.0.0.0
 #port: 3100
 #log_level: info                  # error | warn | info | debug | trace
@@ -27,13 +27,23 @@
 #skip_ddl: false
 #retention_days: 7
 #storage_policy: null
+#traceql_indexed_attributes: []   # PULSUS_TRACEQL_INDEXED_ATTRIBUTES
 #log_rollup_resolution: 5s
+#metrics_landing_retention_hours: 6    # how long the metrics landing table keeps a landed row, in hours
+#metrics_dedup_window: 10000           # blocks each metrics table remembers for deduplication
+#log_landing_retention_hours: 6        # how long the logs landing table keeps a landed row, in hours
+#log_dedup_window: 10000               # blocks each logs table remembers for deduplication
+#trace_landing_retention_hours: 6      # how long the traces landing table keeps a landed row, in hours
+#trace_dedup_window: 10000             # blocks each traces table remembers for deduplication
 #cluster: null                    # ClickHouse cluster name; enables distributed DDL
 #dist_suffix: _dist
 #skip_unavailable_shards: false
 #availability_zone: null          # this node's AZ; pool prefers clickhouse.servers whose zone matches
 #az_detect: off                   # off | aws | gcp | azure | auto (detect zone from cloud metadata)
 #exp_histogram_mode: classic      # classic | native | dual (OTLP exp-histogram storage; M7-A4)
+#otlp_translation_strategy: UnderscoreEscapingWithSuffixes   # UnderscoreEscapingWithSuffixes | UnderscoreEscapingWithoutSuffixes
+                                  # | NoUTF8EscapingWithSuffixes | NoTranslation
+#otlp_promote_scope_metadata: false
 
 clickhouse:
   server: localhost               # <-- point this at your ClickHouse host
@@ -61,6 +71,19 @@ clickhouse:
   #insert_mode: sync              # sync | async
   #ingest_queue_bytes: 256MiB
   #log_patterns: true             # ingest-time log-pattern extraction kill-switch (M7-C3)
+  #discover_log_levels: true
+  #ingest_dedup: true
+  #ingest_dedup_window: 5m
+  #ingest_dedup_max_bytes: 16MiB
+  #metrics_landing_retries: 3     # resends of a failed metrics landing insert
+  #metrics_landing_inserters: 4   # insert workers on the metrics landing queue
+  #metrics_landing_max_rows: 1048576   # per-push landing row ceiling
+  #log_landing_retries: 3         # resends of a failed logs landing insert
+  #log_landing_inserters: 4       # insert workers on the logs landing queue
+  #log_landing_max_rows: 1048576       # per-push landing row ceiling
+  #trace_landing_retries: 3       # resends of a failed traces landing insert
+  #trace_landing_inserters: 4     # insert workers on the traces landing queue
+  #trace_landing_max_rows: 1048576     # per-push landing row ceiling
 
 #reader:
   #cache_ttl: 60s
@@ -75,9 +98,14 @@ clickhouse:
   #promql_grouped_push: true
   #logql_scan_budget_bytes: 50GiB
   #logql_pipeline_scan_factor: 10
+  #template_timezone: UTC          # IANA zone for LogQL template time functions; never the host's
   #traceql_scan_budget_rows: 50000000
+  #traceql_max_depth: 64
   #traceql_max_series: 1000
   #traceql_tag_lookback: 20m
+  #logql_read_max_memory_bytes: 8589934592
+  #promql_read_max_memory_bytes: 8589934592
+  #traceql_read_max_memory_bytes: 8589934592
   #query_eval_concurrency: 256
   #tail_poll_interval: 1s
   #tail_max_delay: 5s

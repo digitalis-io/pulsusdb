@@ -291,9 +291,9 @@ Sixteen names.
   alone. A timeout, a transport fault or any other server exception is returned, because
   it says nothing about grants and continuing would let startup send a name nothing
   checked. A name a readable catalogue reports absent still refuses.
-- **The check runs before any DDL.** In `--mode init` it runs before `run_init`, so a
-  refusal leaves no database behind, and the process exits non-zero naming the absent
-  names. In a serving process it is the first step of `ensure_schema_then_connect`, and
+- **The check runs before anything is sent.** The binary creates no schema (issue #619),
+  so the check has one caller: in a serving process it is the first step of
+  `ensure_schema_then_connect`, and
   outside the `PULSUS_SKIP_DDL` branch, because such a deployment reaches no DDL and
   still inserts landing blocks. A missing name there is terminal rather than transient:
   the reconnect loop logs every absent name and returns, no pool and no writer publish,

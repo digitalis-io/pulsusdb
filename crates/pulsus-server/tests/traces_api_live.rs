@@ -2532,7 +2532,7 @@ async fn absent_submessages_are_materialized_present_and_empty_on_the_wire() {
 /// exit: the reconnect loop does not branch on error kind, so it retries
 /// the permanently unsatisfiable version refusal on the transient path
 /// forever (0.5, 1, 2, 4, 8, 16, then 30 s indefinitely) and `/ready`
-/// answers `503` for the life of the process. `--mode init` is the surface
+/// answers `503` for the life of the process. `schema/schema.sh` is the surface
 /// that exits nonzero with the refusal text. And a readiness poll started
 /// with the process is connection-refused (`curl` prints `000`, exit 7)
 /// until the listener binds; that is the process still starting, not a

@@ -274,17 +274,24 @@ pub(crate) async fn ingest_metrics(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let settings = pulsus_write::MetricIngestSettings {
-        exp_histogram_mode: state.config.exp_histogram_mode,
-        translation_strategy: state.config.otlp_translation_strategy,
-        promote_scope_metadata: state.config.otlp_promote_scope_metadata,
+    let settings = metric_ingest_settings(&state.config);
+    pulsus_write::ingest_metrics(state.metric_writer.as_ref(), headers, body, settings).await
+}
+
+/// The OTLP metrics settings a configuration gives `POST /v1/metrics`.
+pub(crate) fn metric_ingest_settings(
+    config: &pulsus_config::Config,
+) -> pulsus_write::MetricIngestSettings {
+    pulsus_write::MetricIngestSettings {
+        exp_histogram_mode: config.exp_histogram_mode,
+        translation_strategy: config.otlp_translation_strategy,
+        promote_scope_metadata: config.otlp_promote_scope_metadata,
         // `target_info`'s cadence is the PromQL lookback halved
         // (`helper.go:560-567 @ v3.13.0`), so the write path reads the same
         // knob the read path evaluates against.
-        promql_lookback_ms: i64::try_from(state.config.reader.promql_lookback.0.as_millis())
+        promql_lookback_ms: i64::try_from(config.reader.promql_lookback.0.as_millis())
             .unwrap_or(i64::MAX),
-    };
-    pulsus_write::ingest_metrics(state.metric_writer.as_ref(), headers, body, settings).await
+    }
 }
 
 /// `POST /v1/traces` (docs/api.md §1.1, issue #54): pulls `AppState`'s
@@ -373,6 +380,90 @@ mod tests {
 
     use pulsus_model::UnixNano;
     use pulsus_write::LogRow;
+
+    /// Issue #506, docs/configuration.md §6: `otlp_promote_scope_metadata`
+    /// set to `true` in a YAML file loads through the binary's own loader,
+    /// reaches `POST /v1/metrics`'s settings, and puts the scope's name and
+    /// version on the series as `otel_scope_*` labels. By default it does
+    /// none of that.
+    #[test]
+    fn scope_promotion_parses_and_reaches_the_metric_labels() {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+            number_data_point,
+        };
+
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![ScopeMetrics {
+                    scope: Some(InstrumentationScope {
+                        name: "my-scope".to_string(),
+                        version: "1.0.0".to_string(),
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                    }),
+                    metrics: vec![Metric {
+                        name: "up".to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: vec![],
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                attributes: vec![],
+                                start_time_unix_nano: 0,
+                                time_unix_nano: 1_700_000_000_000_000_000,
+                                exemplars: vec![],
+                                flags: 0,
+                                value: Some(number_data_point::Value::AsDouble(1.0)),
+                            }],
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        for (case, yaml, scope) in [
+            (
+                "enabled",
+                "otlp_promote_scope_metadata: true\n",
+                Some(("my-scope", "1.0.0")),
+            ),
+            ("default", "{}\n", None),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "pulsus-scope-promotion-{case}-{}.yaml",
+                std::process::id()
+            ));
+            std::fs::write(&path, yaml).expect("write the configuration file");
+            let loaded = pulsus_config::load(Some(&path), None);
+            let _ = std::fs::remove_file(&path);
+            let config = loaded.unwrap_or_else(|e| panic!("{case}: the configuration loads: {e}"));
+
+            let settings = metric_ingest_settings(&config);
+            assert_eq!(settings.promote_scope_metadata, scope.is_some(), "{case}");
+            let parsed = pulsus_write::parse_metrics(&request, 0, settings)
+                .unwrap_or_else(|e| panic!("{case}: the request parses: {e:?}"));
+            let up = parsed
+                .series
+                .iter()
+                .find(|s| &*s.metric_name == "up")
+                .unwrap_or_else(|| panic!("{case}: an `up` series"));
+            assert_eq!(
+                up.labels.get("otel_scope_name"),
+                scope.map(|(name, _)| name),
+                "{case}"
+            );
+            assert_eq!(
+                up.labels.get("otel_scope_version"),
+                scope.map(|(_, version)| version),
+                "{case}"
+            );
+        }
+    }
 
     fn batch() -> ParsedLogs {
         ParsedLogs {

@@ -1,10 +1,10 @@
 //! The `Config` → `ChConnConfig` mappings, in exactly one
 //! place (task-manager resolution on issue #6, carried over from issue #5's
 //! resolution #4): `pulsus-clickhouse` and `pulsus-schema` stay config-free,
-//! and every caller in this binary — the `--mode init` schema controller
-//! (`schema_init.rs`) and the serving startup path (`serve.rs`, which runs
-//! the same schema reconcile before flipping readiness — issue #6 review
-//! fix) — derives its connection settings from these
+//! and every caller in this binary — the serving startup path (`serve.rs`,
+//! which checks the schema `schema/schema.sh` built before flipping
+//! readiness; the binary creates no schema since issue #619) — derives
+//! its connection settings from these
 //! functions.
 
 use std::sync::Arc;
@@ -89,8 +89,8 @@ pub(crate) fn consistency_from(config: &Config) -> ConsistencyConfig {
 /// there yet. `pulsus-schema`'s DDL is fully `{{db}}.`-qualified, so this
 /// binding never affects which database the DDL actually targets
 /// (docs/schemas.md's "CREATE DATABASE chicken-and-egg" edge case). Used by
-/// both `--mode init` (`schema_init.rs`) and the serving reconnect loop's
-/// schema-reconcile step (`serve.rs`).
+/// the serving reconnect loop's schema check (`serve.rs`); the binary
+/// creates no schema since issue #619.
 pub(crate) fn bootstrap_conn_config_from(config: &Config) -> ChConnConfig {
     ChConnConfig {
         database: "default".to_string(),
@@ -434,6 +434,30 @@ pub(crate) fn trace_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #506: `ChConnConfig`'s comment says its `Default` gives each
+    /// field its documented default. The documented defaults are
+    /// `Config::default()` (`pulsus-config`'s tests hold docs/configuration.md
+    /// to it), so converting the default configuration must give
+    /// `ChConnConfig::default()`, field for field. `ChConnConfig` has no
+    /// `PartialEq`; its `Debug` output is compared.
+    #[test]
+    fn conn_config_from_the_default_config_is_the_default() {
+        assert_eq!(
+            format!("{:?}", conn_config_from(&Config::default())),
+            format!("{:?}", ChConnConfig::default()),
+        );
+    }
+
+    /// Issue #506: `ReaderConfig::traceql_max_series` says it mirrors the
+    /// service-graph edge bound, a claim about the two defaults.
+    #[test]
+    fn the_trace_series_cap_default_is_the_service_graph_edge_bound() {
+        assert_eq!(
+            Config::default().reader.traceql_max_series,
+            pulsus_read::SERVICE_GRAPH_MAX_EDGES
+        );
+    }
 
     /// S1 (#603 follow-up): `PULSUS_SKIP_UNAVAILABLE_SHARDS` reaches the
     /// logs engine, both ways.
