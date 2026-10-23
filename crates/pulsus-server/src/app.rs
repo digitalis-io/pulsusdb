@@ -588,4 +588,70 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
     }
+
+    /// docs/api.md §8.3 (issue #480): what the trace datasource's
+    /// Save & Test request, `GET /api/echo`, gets through the whole
+    /// `build_router` composition, under each setting §8.3 names.
+    #[tokio::test]
+    async fn the_trace_datasource_save_and_test_request_answers_as_section_8_3_says() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use pulsus_config::{Mode, Secret};
+        use tower::ServiceExt;
+
+        async fn echo(cfg: &Config, auth: Option<&str>) -> (StatusCode, Vec<u8>) {
+            let router = build_router(test_state(), cfg).expect("router builds");
+            let mut builder = Request::builder().uri("/api/echo").method("GET");
+            if let Some(value) = auth {
+                builder = builder.header(axum::http::header::AUTHORIZATION, value);
+            }
+            let res = router
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = res.status();
+            let body = to_bytes(res.into_body(), 1024).await.unwrap().to_vec();
+            (status, body)
+        }
+        let on = |extra: Config| Config {
+            compat_endpoints: true,
+            ..extra
+        };
+
+        // The built-in default: the flag is off, so the request is 404.
+        assert_eq!(
+            echo(&Config::default(), None).await.0,
+            StatusCode::NOT_FOUND
+        );
+        // The flag on, in a process that serves reads: 200 `echo`.
+        for mode in [Mode::All, Mode::Reader] {
+            let cfg = on(Config {
+                mode,
+                ..Config::default()
+            });
+            assert_eq!(
+                echo(&cfg, None).await,
+                (StatusCode::OK, b"echo".to_vec()),
+                "{mode:?}"
+            );
+        }
+        // The flag on, in a writer-only process: 404.
+        let writer = on(Config {
+            mode: Mode::Writer,
+            ..Config::default()
+        });
+        assert_eq!(echo(&writer, None).await.0, StatusCode::NOT_FOUND);
+        // Basic authentication configured: 401 without the pair, 200 with it.
+        let authed = on(Config {
+            auth_user: Some("alice".to_string()),
+            auth_password: Some(Secret::new("hunter2")),
+            ..Config::default()
+        });
+        let valid = format!("Basic {}", middleware::base64_encode(b"alice:hunter2"));
+        assert_eq!(echo(&authed, None).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            echo(&authed, Some(&valid)).await,
+            (StatusCode::OK, b"echo".to_vec())
+        );
+    }
 }
