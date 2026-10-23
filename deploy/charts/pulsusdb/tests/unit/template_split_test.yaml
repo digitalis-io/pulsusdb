@@ -3,10 +3,9 @@ release:
   name: pulsusdb
   namespace: default
 set:
-  pulsusdb.split.enabled: true
-# Retention has no default (issue #497): every render states it.
-set:
+  # Retention has no default (issue #497): every render states it.
   initJob.retentionDays: 7
+  pulsusdb.split.enabled: true
 templates:
   - deployment-all.yaml
   - deployment-writer.yaml
