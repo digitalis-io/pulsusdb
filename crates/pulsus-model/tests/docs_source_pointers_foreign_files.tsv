@@ -176,6 +176,7 @@ syntax/extractor.go
 syntax/parse.go
 tempodb/encoding/versioned.go
 tempodb/encoding/vparquet4/block_traceql.go
+tempodb/encoding/vparquet4/schema.go
 tempodb/encoding/vparquet5/block_traceql.go
 traces/compile.rs
 traces/metrics_sql.rs

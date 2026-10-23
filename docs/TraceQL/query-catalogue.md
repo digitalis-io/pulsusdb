@@ -85,11 +85,11 @@ answer is the fixture data itself, read by the interpreter. Where the two stores
 `docs/TraceQL/functional-requirements.md` §6.1 and §6.2.
 
 The fixture is `docs/TraceQL/measure/fixture/make_catalogue_fixture.py`:
-38 spans in 7 traces carrying every key, scope, intrinsic and value
+45 spans in 8 traces carrying every key, scope, intrinsic and value
 type the corpus mentions, so an answer is a list of spans rather than a uniform
 empty set. Answers name spans by the last four hex digits of their id.
 
-Four of its seven traces exist so that a wrong rule and a right one differ: a
+Five of its eight traces exist so that a wrong rule and a right one differ: a
 chain that alternates the two sides of an operator (`P -> A2 -> B1 -> A1`)
 beside a sibling pair under a parent of neither side; a descendant three links
 below its nearest matching ancestor, so a direct-child rule and a bounded climb

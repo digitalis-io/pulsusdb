@@ -187,7 +187,7 @@ or lost by accident: `served` must keep working, `400` must keep refusing.
 | `span.k = "s"`, `!=`, `=~`, `!~` | served | the key's typed subcolumn, each typed read inside `coalesce(…, false)`; regex anchored `^(?:…)$` | `s07`, fixture F5/F19 |
 | `span.k <op> <number>` | served | the `Int64` **and** `Float64` variants, both coalesced | `s04` |
 | `span.k = true` / `false` | served | the `Bool` variant | fixture F8 |
-| `span.k = "v"` on an array value | served | ``has(attrs.`k`.:`Array(Nullable(String))`, 'v')`` | fixture F7 |
+| `span.k <op> <literal>` on an array value | served | the typed array subcolumns of the literal's type, any element: ``has(attrs.`k`.:`Array(Nullable(String))`, 'v')`` for a string `=`, ``has(…`Array(Nullable(Bool))`…)`` for a boolean, ``has`` over the `Int64` and `Float64` arrays for a number `=`, ``arrayExists(ae -> coalesce(ae <op> N, false), …)`` for the ordered and regex operators and for a number past 64 bits and for `!=`; `!=` and `!~` hold where an element of the literal's type differs, never on a missing value or another type; a `status` or `kind` keyword against an attribute is `false` (issue #493) | fixture F7, `catalogue-extra.tsv` `array_*` |
 | `{ span.k }` — a bare field, **truthiness** | served | ``coalesce(attrs.`k`.:Bool = true, false)`` — the value must *be* true, which is not presence | `c16` |
 | `{ span.k != nil }` — presence | served | ``dynamicType(attrs.`k`) != 'None'`` | `c17` |
 | `{ span.k = nil }` — absence | served | ``dynamicType(attrs.`k`) = 'None'`` | `c18` |
