@@ -40,7 +40,7 @@
 /// span (`v < 2`, including every negative `v`).
 ///
 /// **Domain: `2..=i64::MAX`, range `2..=2^63`.** `duration_ns` is
-/// `Int64` (`crates/pulsus-schema/src/catalog.rs:347`), so that is
+/// `Int64` (`schema/schema.sql`, `spans`), so that is
 /// everything storage can hold; the result needs `u64` because
 /// `v > 2^62` buckets to `2^63`, which is not representable as `i64`.
 /// No claim is made above `i64::MAX` — unreachable from storage. The

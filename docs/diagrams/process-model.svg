@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1120" height="660" viewBox="0 0 1120 660" role="img" aria-labelledby="title desc">
   <title id="title">PulsusDB process model</title>
-  <desc id="desc">Inputs enter the PulsusDB writer and reader subsystems. The writer inserts batches into ClickHouse. The reader queries ClickHouse. The ruler writes results back through the writer path. The schema controller manages ClickHouse DDL and retention.</desc>
+  <desc id="desc">Inputs enter the PulsusDB writer and reader subsystems. The writer inserts batches into ClickHouse. The reader queries ClickHouse. The ruler writes results back through the writer path. At startup each process checks the server version and the server names it needs, then that the configured database exists, a check PULSUS_SKIP_DDL skips; schema/schema.sh, not the binary, creates the schema.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
@@ -62,15 +62,15 @@
   <text class="label" x="348" y="308">reader</text>
   <text class="small" x="348" y="335">parsers, planners, SQL generation</text>
   <text class="small" x="348" y="357">fetch, exact evaluation, wire format</text>
-  <text class="small" x="348" y="379">label cache, tier router, live tail</text>
+  <text class="small" x="348" y="379">label cache, live tail</text>
 
   <rect class="section3" x="325" y="438" width="420" height="70" rx="8"/>
   <text class="label" x="348" y="466">ruler</text>
   <text class="small" x="348" y="490">rule storage, evaluation loop, write-back</text>
 
   <rect class="section4" x="325" y="528" width="420" height="62" rx="8"/>
-  <text class="label" x="348" y="555">schema controller</text>
-  <text class="small" x="348" y="579">DDL, migrations, TTL rotation, tier/MV management</text>
+  <text class="label" x="348" y="555">schema check</text>
+  <text class="small" x="348" y="579">version, names; database unless PULSUS_SKIP_DDL; creates nothing</text>
 
   <rect class="store" x="860" y="238" width="210" height="184" rx="12"/>
   <ellipse cx="965" cy="238" rx="105" ry="26" fill="#cffafe" stroke="#0891b2" stroke-width="2"/>
@@ -100,5 +100,5 @@
   <path class="arrow dashed" d="M 535 438 C 535 410 535 408 535 408"/>
   <text class="tiny" x="775" y="452">write-back through writer path</text>
   <path class="arrow dashed" d="M 745 560 C 825 560 823 425 858 408"/>
-  <text class="tiny" x="778" y="544">DDL and lifecycle management</text>
+  <text class="tiny" x="778" y="544">startup checks (reads only)</text>
 </svg>

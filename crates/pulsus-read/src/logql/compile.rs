@@ -51,7 +51,7 @@ pub const BODY: &str = "body";
 /// One structured-metadata key, and the expression that reads it.
 ///
 /// `log_samples.structured_metadata` is a `String` holding flat JSON
-/// (schema migration id 21, `crates/pulsus-schema/src/catalog.rs`), so a
+/// (`schema/schema.sql`, `log_samples`), so a
 /// key inside it is a name that is not a column and resolves to an
 /// extraction over one — the same shape the shipped metrics read path
 /// already renders for `labels`

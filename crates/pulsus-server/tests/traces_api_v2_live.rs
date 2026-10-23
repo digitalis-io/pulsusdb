@@ -2120,9 +2120,9 @@ fn plain_span(tid: [u8; 16], span_id: [u8; 8], start_ns: i64) -> Span {
 /// ## The fixture, and why the view is DETACHED rather than dropped
 ///
 /// `DETACH` and not `DROP`: the `ATTACH` in step 3 restores it with no
-/// DDL, where the controller's view reconcile would re-create a dropped
-/// one. It is safe to detach around because the reconcile runs once at
-/// startup and the rotation tick touches no view.
+/// DDL, where a dropped view would need the schema rebuilt. It is safe to
+/// detach around because nothing in the running server creates or touches
+/// a view (issue #619 removed the code that did).
 ///
 /// ## Why it needed BOTH provenance markers and had neither
 ///

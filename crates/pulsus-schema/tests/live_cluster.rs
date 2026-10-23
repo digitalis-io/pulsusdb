@@ -641,8 +641,8 @@ async fn require_two_shard_topology(shard1: &ChClient, shard2: &ChClient) {
 /// says.
 ///
 /// Reading the value back off both shards is the only thing that confirms it
-/// took: `apply_ttl` is what applies it, so a schema built by hand that never
-/// runs `apply_ttl` keeps whatever the server's own default is.
+/// took: the `CREATE` in `schema/schema.sql` declares it, so a table built any
+/// other way keeps whatever the server's own default is.
 #[tokio::test]
 async fn the_cluster_windows_are_the_replicated_pair_on_every_write_path_table() {
     skip_unless_live!();

@@ -118,7 +118,7 @@ const GROUPED_PORT: u16 = 31_602;
 
 /// Retention for the issue #474 spawn only. The fixture's timestamps are
 /// FROZEN at 2023-11-14 so its captured bytes can be committed, and the
-/// delete-TTL `apply_ttl` installs is
+/// delete-TTL the schema declares is
 /// `min(s + retention_days * 86400, 4294967295)` (docs/schemas.md §4.1) —
 /// under the default 7 days that expiry is in the past, ClickHouse drops
 /// the part, and all four fetches answer `404` for a reason that has

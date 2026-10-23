@@ -327,7 +327,7 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
     assert!(became_ready, "/ready never reached 200 within 60s");
 
     // Seed directly (mirrors `live_metrics_engine.rs`'s own precedent) —
-    // `pulsusdb` itself already created the schema during startup above.
+    // the schema was built before the spawn above.
     let client = ChClient::new(test_ch_config(&db))
         .await
         .expect("connect to seed data");

@@ -1,6 +1,6 @@
 # Logs differential divergence ledger
 
-The M6-09 LogQL-pipeline differential (`e2e/src/logs.rs`,
+**Parts of this document describe the schema controller, the migration catalogue and the TTL rotation, which no longer exist. The schema is now `schema/schema.sql`, built by `schema/schema.sh`; the binary creates no schema, and retention is the TTL each table is created with.** The M6-09 LogQL-pipeline differential (`e2e/src/logs.rs`,
 `logs_pipeline_differential`, nightly/dispatch `e2e-single` tier) gates
 every committed pipeline case in `test/fixtures/logs/differential.json`
 against both the corpus's by-construction expectation and the pinned

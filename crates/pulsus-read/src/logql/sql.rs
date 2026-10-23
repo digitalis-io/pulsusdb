@@ -858,7 +858,7 @@ pub fn detected_labels(
 /// lower bound (issue #399).
 ///
 /// The rollup MV stores `bucket_ns = intDiv(timestamp_ns, res) * res`
-/// (`crates/pulsus-schema/src/catalog.rs`, `log_metrics_{{…}}_mv`), so a
+/// (`schema/schema.sql`, `log_metrics_{{…}}_mv`), so a
 /// sample inside the request's `(start, end]` window can sit in a bucket
 /// that starts at or before `start`; comparing `bucket_ns` against
 /// `start_ns` itself — the half-open shape [`log_stats_rollup`] uses on
@@ -1503,7 +1503,7 @@ impl ScanProjection {
 /// `grep -n StructuredMetadata pkg/logql/syntax/*.go` at `b318f28` returns
 /// no filter, matcher or pushdown site at all. Pushing it would also be
 /// useless AND wrong: the column is an opaque canonical-JSON `String` with
-/// `DEFAULT ''` and no index (`pulsus-schema/src/catalog.rs`), so a
+/// `DEFAULT ''` and no index (`schema/schema.sql`), so a
 /// JSON-extract predicate could prune no granule, and the merge renames a
 /// colliding key to `<k>_extracted` before any filter sees it.
 #[allow(clippy::too_many_arguments)]

@@ -207,12 +207,12 @@ on 24.8.14.39 (`tag=None`), a real exception after 2 M rows streamed:
   schema` — a `Decode` error, i.e. a wrong diagnosis of a real server
   exception, and non-retryable where the truth may be transient.
 
-A tag-absent server is reachable on `main` despite the 26.3 floor: the floor is
-enforced inside `pulsus_schema::run_init`
-(`crates/pulsus-schema/src/controller.rs:84-100`), which
-`crates/pulsus-server/src/serve.rs:645-685` skips entirely when
-`PULSUS_SKIP_DDL` is set. A header-stripping proxy in front of a 26.3 server
-produces the same `tag=None`. On that arm the parsed code remains forgeable —
+Startup refuses a server below the supported floor
+(`pulsus_schema::check_version`,
+`crates/pulsus-schema/src/checks.rs:19`, called at
+`crates/pulsus-server/src/chconfig.rs:137`) on one query's answer,
+so another configured endpoint, or a header-stripping proxy, can still send
+`tag=None`. On that arm the parsed code remains forgeable —
 that is the documented out-of-support path, and the failure mode is the status
 quo rather than a new one.
 

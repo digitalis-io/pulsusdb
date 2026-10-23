@@ -17,8 +17,8 @@ pub type SchemaParams = RenderCtx;
 
 /// The config-derived context every DDL block renders against. Re-exported
 /// from `pulsus-schema` as `SchemaParams` — the same struct doubles as the
-/// public `run_init`/`reconcile` parameter (derived from `Config` once, in
-/// `pulsus-server`) and the internal rendering context, so there is exactly
+/// parameter of `pulsus-schema-testkit`'s `run_init` and the internal
+/// rendering context, so there is exactly
 /// one config-shaped struct in this crate rather than two kept in sync by
 /// hand.
 #[derive(Debug, Clone, PartialEq, Eq)]

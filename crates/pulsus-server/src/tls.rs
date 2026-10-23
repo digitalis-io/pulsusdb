@@ -148,7 +148,7 @@ fn is_connection_error(e: &std::io::Error) -> bool {
 }
 
 /// The accept loop, factored as a free fn generic over the accept effect
-/// and IO type (the `rotation_tick` testability idiom in `serve.rs`) so
+/// and IO type so
 /// the error-injection test proves recovery without a real socket error.
 /// Production instantiates it with `TcpListener::accept`.
 ///

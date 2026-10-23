@@ -460,10 +460,9 @@ where
             let this = &mut *self;
             // PULSUSDB PATCH (issue #412): the untagged path is upstream's,
             // byte for byte. It is the only signal a pre-25.11 server (or a
-            // header-stripping proxy) gives, and it is reachable on `main` --
-            // `PULSUS_SKIP_DDL` skips the version gate in `run_init`
-            // (`crates/pulsus-server/src/serve.rs:645-685`,
-            // `crates/pulsus-schema/src/controller.rs:84-100`).
+            // header-stripping proxy) gives. Startup's version check
+            // (`crates/pulsus-server/src/chconfig.rs:137`) reads one query's
+            // answer, so another configured endpoint can still give it.
             let (Some(tag), Some(anchor)) = (this.exception_tag.as_deref(), this.anchor.as_deref())
             else {
                 if let Some(err) = extract_exception(&chunk.data, None) {

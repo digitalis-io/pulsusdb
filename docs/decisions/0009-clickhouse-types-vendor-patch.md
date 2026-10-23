@@ -1,6 +1,6 @@
 # ADR 0009: vendor-and-patch `clickhouse-types` for a named tuple column, and the driver's validator for a `JSON` column
 
-Status: **Accepted** (2026-10-01)
+**Parts of this document describe the schema controller, the migration catalogue and the TTL rotation, which no longer exist. The schema is now `schema/schema.sql`, built by `schema/schema.sh`; the binary creates no schema, and retention is the TTL each table is created with.** Status: **Accepted** (2026-10-01)
 Issue: **none.** The owner declined a new issue for this work. It is a prerequisite of [#584](https://github.com/digitalis-io/pulsusdb/issues/584), [#585](https://github.com/digitalis-io/pulsusdb/issues/585) and [#586](https://github.com/digitalis-io/pulsusdb/issues/586), on pull request [#610](https://github.com/digitalis-io/pulsusdb/pull/610); the measurements were taken under #585, which is what both `PATCHES.md` files and the root `Cargo.toml` patch entries point at.
 Covers: `vendor/clickhouse-types/PATCHES.md` §§1-5 (the type parser) and `vendor/clickhouse/PATCHES.md` §3 (a `Vec` against a `JSON` column) and §4 (a Rust tuple against a named tuple column).
 Related: [ADR 0003](0003-promql-parser-vendor-patch.md) and [ADR 0004](0004-opentelemetry-proto-vendor-patch.md) establish the vendor+patch discipline this ADR reuses; [ADR 0007](0007-clickhouse-vendor-patch.md) is the first patch to this driver and owns the two patches beside the two recorded here; [ADR 0001](0001-clickhouse-client.md) selected the client.

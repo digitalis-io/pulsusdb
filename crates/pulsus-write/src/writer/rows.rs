@@ -1842,8 +1842,8 @@ mod tests {
     ];
 
     /// The `log_landing` columns, in the table's own declaration order
-    /// (`crates/pulsus-schema/src/catalog.rs`, migration 65). Written out here
-    /// rather than read from the catalogue: this crate does not depend on
+    /// (`schema/schema.sql`). Written out here rather than read from the
+    /// schema: this crate does not depend on
     /// `pulsus-schema`, and the point of the case below is that the two agree.
     const LOG_LANDING_COLUMNS: &[&str] = &[
         "org_id",

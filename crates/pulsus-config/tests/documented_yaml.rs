@@ -405,3 +405,45 @@ fn the_quickstart_files_are_section_10s_yaml() {
         );
     }
 }
+
+/// Issue #506 part 3: docs/configuration.md §7 and docs/architecture.md
+/// §3.1.1 say the `downsampling` settings are parsed and validated and that
+/// nothing else reads them. This holds the second half: no source file
+/// outside this crate names them. When downsampling is built, this fails,
+/// and the two "Not built yet" paragraphs go with it.
+#[test]
+fn nothing_outside_the_config_crate_reads_the_downsampling_settings() {
+    let names = regex::Regex::new(
+        r"\.downsampling\b|DownsamplingConfig|TierPolicy|tier_policy|raw_retention",
+    )
+    .unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let listing = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["ls-files", "-z", "--", "crates"])
+        .output()
+        .expect("git ls-files must run");
+    let mut sources = 0usize;
+    let mut readers = Vec::new();
+    for file in String::from_utf8(listing.stdout).unwrap().split('\0') {
+        if !file.contains("/src/")
+            || !file.ends_with(".rs")
+            || file.starts_with("crates/pulsus-config/")
+        {
+            continue;
+        }
+        sources += 1;
+        let text = std::fs::read_to_string(root.join(file)).unwrap_or_default();
+        for (i, line) in text.lines().enumerate() {
+            if names.is_match(line) {
+                readers.push(format!("{file}:{}: {}", i + 1, line.trim()));
+            }
+        }
+    }
+    assert!(sources > 100, "read only {sources} source files");
+    assert!(
+        readers.is_empty(),
+        "the downsampling settings are read: {readers:#?}"
+    );
+}
