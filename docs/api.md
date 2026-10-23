@@ -92,7 +92,8 @@ twice by that writer.** The window is `PULSUS_INGEST_DEDUP_WINDOW` (`5m`);
 | trace by id (§4.1) | one span per span id and kind, carrying one of its copies; which one is not defined | the copy stored last |
 | a query answered from the error-span table (§4.2) | as a search filter, over the copies that are errors | the last copy that was an error, so a span stored again without an error is still found, carrying that copy |
 | a trace's duration, root name and root service | combine every copy: the trace ends at the latest end any copy reported | the same |
-| tag names, in every scope (§4.3) | every copy's | every copy's |
+| tag names in an attribute scope, or with no scope (§4.3) | every copy's | every copy's |
+| tag names in the `intrinsic` and `trace` scopes, and the values of an intrinsic other than `name` | a fixed answer that reads no stored span, so copies do not change it | the same |
 | attribute values with no narrowing `q`, unscoped or in any scope | every copy's | every copy's |
 | `span.<key>`, or `resource.<key>` other than `resource.service.name`, whose `q` is exactly one `resource.service.name` condition: the window's whole 5-minute buckets, unless a whole bucket of the `span.` key has overflowed | every copy's | every copy's |
 | `name` values, with or without `q`; every other narrowed attribute lookup — unscoped, `event.`, `link.`, `instrumentation.`, `resource.service.name`, or a `q` other than the row above's; the partial first and last buckets of the row above; and the whole window of a `span.` key a bucket of which has overflowed | the values of every copy that matches `q` | the copy stored last |
