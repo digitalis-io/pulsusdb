@@ -1,7 +1,7 @@
 # e2e cluster overlay (issue #7) on top of issue #5's
 # `ci/clickhouse-cluster/compose.yaml` (2-shard ClickHouse + Keeper,
 # `pulsus_test_cluster`): adds `pulsusdb` (built from source, `PULSUS_CLUSTER`
-# set so its schema controller runs `ON CLUSTER` DDL) and an `otel-collector`,
+# set; the `schema` service's `schema/schema.sh` runs the `ON CLUSTER` DDL) and an `otel-collector`,
 # neither of which the base fixture defines — no ClickHouse/Keeper
 # duplication. Both new services join the base fixture's fixed
 # `pulsus-schema-it` network with their own static `ipv4_address`

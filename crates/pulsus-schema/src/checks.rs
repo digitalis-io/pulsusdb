@@ -150,7 +150,7 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
         NameCatalogue::Setting,
     ),
     ("merge_with_ttl_timeout", NameCatalogue::MergeTreeSetting),
-    // The three block/seconds deduplication-window names `apply_ttl` sends
+    // The three block/seconds deduplication-window names the `CREATE`s carry
     // (issue #603). Which of the first two a statement carries is rendered
     // from the same thing that renders the engine
     // (`render::dedup_window_setting`), and the third is sent on a clustered

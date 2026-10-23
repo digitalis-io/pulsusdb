@@ -278,7 +278,7 @@ const COLLECTOR_READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// enough that none of the fixture's `ts_offset_ns` values (all small,
 /// recent offsets) can fall outside it.
 const ROUNDTRIP_WINDOW_NS: i64 = 3_600_000_000_000; // 1h
-/// The database the schema controller creates by default
+/// The database `schema/schema.sh` creates by default
 /// (`pulsus_config::ClickHouseConfig::database`'s default) — neither
 /// compose overlay overrides `CLICKHOUSE_DB`, so this is exactly what both
 /// variants' `pulsusdb` targets.

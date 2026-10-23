@@ -150,13 +150,13 @@ impl ChClient {
     /// **Scope of the pin, stated so it is not read as wider than it is.**
     /// It covers [`Self::insert_block`], which is the whole production data
     /// path — `git grep -n "INSERT INTO" -- crates/*/src` finds no other
-    /// production insert, only `schema_migrations`/`mv_checksums`
-    /// bookkeeping. Verified on the connected server rather than argued:
+    /// production insert (the migration bookkeeping it once found has since
+    /// been removed). Verified on the connected server rather than argued:
     /// after a `pulsus-write` live run, every `INSERT INTO \`log_samples\``
     /// / \`log_streams\` / \`metric_series\` / … row in
     /// `system.query_log` carries `Settings['async_insert'] = '0'`, while
-    /// the rows that do NOT are test-fixture `execute()` seeding and
-    /// migration bookkeeping, which are not this path.
+    /// the rows that do NOT were test-fixture `execute()` seeding and the
+    /// migration bookkeeping since removed, neither of which is this path.
     #[cfg(test)]
     fn insert_settings_of(c: &ConsistencyConfig, timeout: Duration) -> QuerySettings {
         Self::insert_settings_with(c, timeout, &QuerySettings::new())
@@ -376,11 +376,11 @@ impl ChClient {
     /// **Carries the same `async_insert = 0` pin as the insert path**
     /// ([`Self::insert_settings_of`] explains why we do not want async
     /// inserts at all). It matters here because this method also runs
-    /// `INSERT` statements — `pulsus-schema`'s `schema_migrations` /
-    /// `mv_checksums` bookkeeping writes a row and a later step reads it
-    /// back, which is read-your-write. From ClickHouse 26.2 the server
+    /// `INSERT` statements — test fixtures seed rows through it and read
+    /// them back, which is read-your-write. (The schema bookkeeping it was
+    /// first pinned for has since been removed.) From ClickHouse 26.2 the server
     /// default is `1`, so without this pin those inserts would be buffered
-    /// and a reconcile could read state that has not landed. Measured
+    /// and a read could miss rows that have not landed. Measured
     /// (issue #376): `logs_tail_live`, whose fixtures seed through this
     /// method, failed **3 of 6 runs** against a 26.3 server at the stock
     /// default and passed **6 of 6** against an otherwise identical 26.3

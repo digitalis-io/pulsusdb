@@ -2,8 +2,8 @@
 //! place (task-manager resolution on issue #6, carried over from issue #5's
 //! resolution #4): `pulsus-clickhouse` and `pulsus-schema` stay config-free,
 //! and every caller in this binary — the serving startup path (`serve.rs`,
-//! which checks the schema `schema/schema.sh` built before flipping
-//! readiness; the binary creates no schema since issue #619) — derives
+//! which, unless `PULSUS_SKIP_DDL` is set, checks that the database
+//! `schema/schema.sh` builds exists; the binary creates no schema) — derives
 //! its connection settings from these
 //! functions.
 
@@ -174,8 +174,8 @@ pub(crate) async fn check_schema_present(config: &Config) -> Result<(), NameChec
 /// Maps `Config` to [`pulsus_read::LogQlEngine`]'s table-name/budget
 /// context (issue #13 architect plan: `EngineConfig` construction, deferred
 /// from #12, lands here alongside the other `Config → *` mappings).
-/// Cluster-aware table-name resolution mirrors `pulsus-schema`'s own
-/// `_dist`-suffix rule (`controller.rs`): a configured `cluster` reads
+/// Cluster-aware table-name resolution mirrors the `_dist` wrappers
+/// `schema/schema.sh` creates under `PULSUS_CLUSTER`: a configured `cluster` reads
 /// through the `_dist` wrapper tables, an unclustered deployment reads the
 /// base tables directly.
 pub(crate) fn engine_config_from(config: &Config) -> EngineConfig {

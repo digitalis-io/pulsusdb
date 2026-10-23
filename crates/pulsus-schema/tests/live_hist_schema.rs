@@ -193,7 +193,7 @@ async fn native_histogram_table_is_built_and_the_float_tables_are_untouched() {
     let names = table_names(&client, db).await;
     assert!(
         names.contains(&"metric_hist_samples".to_string()),
-        "metric_hist_samples must exist after reconcile: {names:?}"
+        "metric_hist_samples must exist after run_init: {names:?}"
     );
 
     // metric_samples (id 5) gains no histogram column; metric_series (id 4)

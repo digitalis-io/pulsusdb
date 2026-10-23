@@ -1,6 +1,6 @@
 # ClickHouse 24.8 → 26.3: what moved in the query plans (issue #376)
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2 — and the previous trace metrics and service-graph SQL, which #602 part 3a deleted; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** One row per gated shape. A shape's verdict is one of:
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2 — and the previous trace metrics and service-graph SQL, which #602 part 3a deleted; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Parts of this document describe the schema controller, the migration catalogue and the TTL rotation, which no longer exist. The schema is now `schema/schema.sql`, built by `schema/schema.sh`; the binary creates no schema, and retention is the TTL each table is created with.** One row per gated shape. A shape's verdict is one of:
 
 - **unchanged** — the gate's assertion is byte-identical on both servers and
   the suite passes on 26.3 with no edit.

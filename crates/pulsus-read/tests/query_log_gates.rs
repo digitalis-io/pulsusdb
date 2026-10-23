@@ -7045,7 +7045,7 @@ const PINNED_SELECTION_STATEMENTS: &str =
 /// window bounds and has to be reproducible. It is in the FUTURE, which
 /// `now_ns()`'s doc comment does not cover and the retention TTL forces:
 /// `log_samples` carries `TTL toDateTime(fromUnixTimestamp64Nano(
-/// timestamp_ns)) + INTERVAL 7 DAY DELETE` (`catalog.rs:256`), and a
+/// timestamp_ns)) + INTERVAL 7 DAY DELETE` (as the old catalogue had it), and a
 /// fixed constant in the past is already expired. Measured on 26.3.29.7:
 /// 22 rows inserted at a timestamp 14 days old left
 /// `SELECT count() FROM log_samples` answering 0.
@@ -7529,13 +7529,13 @@ async fn seed_selection_corpus() -> (ChClient, String) {
     run_init(&admin, &test_ctx(&db)).await.expect("run_init");
     // **The retention TTL comes off this table before anything is
     // seeded.** `test_ctx` renders `TTL toDateTime(fromUnixTimestamp64Nano(
-    // timestamp_ns)) + INTERVAL 7 DAY DELETE` (`catalog.rs:256`), and this
+    // timestamp_ns)) + INTERVAL 7 DAY DELETE` (as the old catalogue had it), and this
     // fixture's timestamps are a FIXED constant, so the fixture would
     // start expiring once the wall clock passed it — a check that goes red
     // on a date rather than on a change. Measured on 26.3.29.7 over two
     // tables with this DDL and one row 14 days old: 0 rows with the TTL,
-    // 1 row with it removed. `log_streams` (`catalog.rs:209`) and
-    // `log_streams_idx` (`catalog.rs:227`) carry no TTL, so this one
+    // 1 row with it removed. `log_streams` and `log_streams_idx`
+    // (`schema/schema.sql`) carry no TTL, so this one
     // statement covers the fixture.
     admin
         .execute(

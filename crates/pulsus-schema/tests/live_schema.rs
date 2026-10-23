@@ -323,7 +323,7 @@ async fn structured_metadata_column_is_additive_and_backward_compatible() {
 
     run_init(&client, &ctx).await.expect("run_init (first run)");
 
-    // AC-1: the catalog shows `structured_metadata String` after reconcile.
+    // AC-1: the catalog shows `structured_metadata String` after run_init.
     let mut desc = client
         .query_stream::<DescribeRow>(
             &format!(
@@ -345,7 +345,7 @@ async fn structured_metadata_column_is_additive_and_backward_compatible() {
     assert_eq!(
         sm_type.as_deref(),
         Some("String"),
-        "structured_metadata must be a String column after reconcile"
+        "structured_metadata must be a String column after run_init"
     );
 
     let mut data_cfg = test_config();

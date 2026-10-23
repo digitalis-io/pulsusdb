@@ -112,8 +112,8 @@ fn ch_http_port() -> u16 {
 /// `timestamp_ns + INTERVAL <retention_days> DAY DELETE`, so at the default
 /// seven days an instant this far in the past is dropped before the first
 /// query runs. The server this suite spawns sets `PULSUS_RETENTION_DAYS`
-/// to a hundred years, which `apply_ttl` puts on the tables at every
-/// `run_init` — so the pinned instant stays readable however long the
+/// to a hundred years, which the tables' `CREATE` declares when `run_init`
+/// builds them — so the pinned instant stays readable however long the
 /// constant sits here.
 const T0_NS: i64 = 1_768_435_200_000_000_000;
 
@@ -341,7 +341,7 @@ fn logs_push_body(ts_ns: i64) -> Vec<u8> {
 /// writer consider `B` again. Under a 64-bit fingerprint the two label
 /// sets hashed to one value and `log_streams` is a
 /// `ReplacingMergeTree` ordered on `fingerprint` alone
-/// (`crates/pulsus-schema/src/catalog.rs` migration 6), so the second
+/// (in the schema of that time), so the second
 /// write replaced the first row: the same fingerprint then resolved to
 /// `B`'s labels, and `A`'s selector answered with `B`'s label set.
 fn logs_push_b_again(ts_ns: i64) -> Vec<u8> {

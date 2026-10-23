@@ -5,7 +5,7 @@
 //! `prom_api_live.rs`. The harness is:
 //!
 //! 1. a TCP proxy on a fixed loopback port that forwards to the real
-//!    ClickHouse HTTP port, so the server boots, migrates the schema and
+//!    ClickHouse HTTP port, so the server boots, passes its startup checks and
 //!    warms its label cache normally;
 //! 2. a flag that makes every pump thread stop forwarding — connections
 //!    are accepted and held open, nothing is written to the backend and

@@ -915,7 +915,7 @@ async fn detected_fields_budget_truncation_signals_pulsus_partial() {
 ///
 /// Seeding is ONE bulk statement per fixture over `numbers()`, fanned out
 /// into `log_streams_idx` by the shipped `log_streams_idx_mv`
-/// (`crates/pulsus-schema/src/catalog.rs`). `pod` is a static detected
+/// (`schema/schema.sql`). `pod` is a static detected
 /// label (the reference's `cluster`/`namespace`/`instance`/`pod` set), so
 /// the relevance filter admits it unconditionally; `svc` is admitted
 /// because its values are neither floats nor UUIDs.
