@@ -610,7 +610,9 @@ const TIER_RELATION_REFUSAL: &str = "must be >= resolution";
 /// * `clickhouse.database` empty: no database has an empty name.
 /// * `05s` and `016MiB`, leading zeros: stricter by decision. The positive
 ///   duration and byte-size patterns refuse them; `humanDuration` accepts
-///   them, so its keys are not listed.
+///   them, so its keys are not listed. A tier's `min_step` is probed with
+///   `05m` (`TIER_MIN_STEP_LEADING_ZERO`), because `05s` is below the probe
+///   tier's 5m `resolution` and the server refuses it for that.
 const SCHEMA_STRICTER: &[(&str, &str)] = &[
     ("query_timeout", "05s"),
     ("log_rollup_resolution", "05s"),
@@ -623,6 +625,7 @@ const SCHEMA_STRICTER: &[(&str, &str)] = &[
     ("downsampling.raw_retention", "05s"),
     ("downsampling.tiers[].resolution", "05s"),
     ("downsampling.tiers[].retention", "05s"),
+    ("downsampling.tiers[].min_step", "05m"),
     ("ruler.poll_interval", "05s"),
     ("ruler.max_result_bytes", "016MiB"),
 ];
@@ -630,6 +633,10 @@ const SCHEMA_STRICTER: &[(&str, &str)] = &[
 /// A duration and a byte size with a leading zero, probed at every key in
 /// the reverse direction.
 const LEADING_ZERO_PROBES: &[&str] = &["05s", "016MiB"];
+
+/// A leading-zero `min_step` that fits the probe tier: `05m` equals its
+/// `resolution`, so only the leading zero is in question.
+const TIER_MIN_STEP_LEADING_ZERO: (&str, &str) = ("downsampling.tiers[].min_step", "05m");
 
 /// The definitions whose values the server trims before parsing: durations
 /// and byte sizes (`units.rs`). Their patterns accept surrounding ASCII
@@ -852,6 +859,11 @@ fn the_chart_schema_accepts_no_value_the_binary_refuses() {
         // decision (`SCHEMA_STRICTER`). Not padded.
         for probe in LEADING_ZERO_PROBES {
             reverse.push(serde_norway::Value::String(probe.to_string()));
+        }
+        if path == TIER_MIN_STEP_LEADING_ZERO.0 {
+            reverse.push(serde_norway::Value::String(
+                TIER_MIN_STEP_LEADING_ZERO.1.to_string(),
+            ));
         }
         for v in candidates {
             let verdict = server_verdict(path, &v);
