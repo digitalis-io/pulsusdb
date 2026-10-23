@@ -192,6 +192,29 @@ pub async fn build_schema_with_retention(db: &str, retention_days: u32) {
         .unwrap_or_else(|e| panic!("build the schema in {db}: {e}"));
 }
 
+/// Rewrites `db`'s comment to state `days` of retention, leaving every
+/// table's TTL as it was built (issue #497). The binary reads its read
+/// floors from the comment, so a test can hold rows storage still has past
+/// the floor, the state a database is in until a part drop removes them.
+pub async fn state_retention(db: &str, days: u32) {
+    set_database_comment(db, &format!("retention_days={days}")).await;
+}
+
+/// Sets `db`'s comment to `comment` exactly (issue #497).
+pub async fn set_database_comment(db: &str, comment: &str) {
+    let client = ChClient::new(conn_config("default"))
+        .await
+        .unwrap_or_else(|e| panic!("connect bootstrap client to comment {db}: {e}"));
+    client
+        .execute(
+            &format!("ALTER DATABASE {db} MODIFY COMMENT '{comment}'"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("comment {db}: {e}"));
+}
+
 /// [`drop_db`] then [`build_schema`]: what a suite that spawns the server
 /// needs before it spawns one.
 pub async fn fresh_db(db: &str) {

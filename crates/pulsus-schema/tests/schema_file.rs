@@ -1725,3 +1725,317 @@ fn the_service_edges_statements_are_the_plan_s() {
         "clustered service_edges_mv"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #497: every table's expiry, exactly.
+// ---------------------------------------------------------------------------
+
+/// Each table the file creates, with the exact `TTL` line it renders at
+/// `retention_days = 17` and landing hours 3 (metrics), 4 (logs) and 5
+/// (traces), whether it drops whole parts (`ttl_only_drop_parts = 1`), and its
+/// `merge_with_ttl_timeout` when set. `None` is a table with no TTL. The
+/// literals are written from docs/configuration.md §7, not read back from the
+/// renderer.
+const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
+    (
+        "log_landing",
+        Some("TTL toDateTime(least(intDiv(received_ms, 1000) + (4 * 3600), 4294967295))"),
+        true,
+        Some(3600),
+    ),
+    (
+        "log_metrics_5s",
+        Some("TTL toDateTime(least(intDiv(bucket_ns, 1000000000) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
+    (
+        "log_patterns",
+        Some("TTL toDateTime(least(intDiv(bucket_ns, 1000000000) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
+    (
+        "log_samples",
+        Some("TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
+    ("log_streams", None, false, None),
+    ("log_streams_idx", None, false, None),
+    (
+        "metric_exemplars",
+        Some("TTL toDateTime(least(intDiv(unix_milli, 1000) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
+    (
+        "metric_hist_samples",
+        Some("TTL toDateTime(least(intDiv(unix_milli, 1000) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
+    ("metric_label_index", None, false, None),
+    ("metric_label_values", None, false, None),
+    ("metric_labels", None, false, None),
+    (
+        "metric_landing",
+        Some("TTL toDateTime(least(intDiv(received_ms, 1000) + (3 * 3600), 4294967295))"),
+        true,
+        Some(3600),
+    ),
+    (
+        "metric_metadata",
+        Some("TTL toDateTime(least(intDiv(updated_ns, 1000000000) + (17 * 86400), 4294967295))"),
+        false,
+        None,
+    ),
+    (
+        "metric_samples",
+        Some("TTL toDateTime(least(intDiv(unix_milli, 1000) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
+    (
+        "metric_series",
+        Some("TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + 17) * 86400, 4294967295))"),
+        true,
+        None,
+    ),
+    (
+        "resources",
+        Some("TTL toDateTime(least(((toUInt32(day) + 1) * 86400) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
+    (
+        "service_bucket_resources",
+        Some(
+            "TTL toDateTime(least(intDiv(bucket * 300000000000, 1000000000) + (17 * 86400), 4294967295))",
+        ),
+        true,
+        None,
+    ),
+    (
+        "service_edges",
+        Some(
+            "TTL toDateTime(least(toUInt32(minute) - if(conn_type = '', 240, 0) + (17 * 86400), 4294967295))",
+        ),
+        true,
+        None,
+    ),
+    (
+        "spans",
+        Some("TTL toDateTime(least(intDiv(start_ns, 1000000000) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
+    (
+        "error_spans",
+        Some("TTL toDateTime(least(intDiv(start_ns, 1000000000) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
+    (
+        "tag_bucket_values",
+        Some(
+            "TTL toDateTime(least(intDiv(bucket * 300000000000, 1000000000) + (17 * 86400), 4294967295))",
+        ),
+        true,
+        None,
+    ),
+    ("tag_names", None, false, None),
+    ("tag_values", None, false, None),
+    (
+        "trace_landing",
+        Some("TTL toDateTime(least(intDiv(received_ms, 1000) + (5 * 3600), 4294967295))"),
+        true,
+        Some(3600),
+    ),
+    (
+        "traces",
+        Some("TTL toDateTime(least(intDiv(last_start_ns, 1000000000) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
+];
+
+/// Issue #497: every table's TTL line, part-drop setting and TTL merge
+/// interval are exactly [`EXPIRY`]'s, in both variants, and the database
+/// comment states the same retention. The hours differ per signal and from
+/// the retention, so a swapped token, a changed anchor or a lost setting
+/// fails; so does a table added without a row.
+#[test]
+fn every_table_expires_exactly_as_documented() {
+    for base in [single(), clustered()] {
+        let variant = if base.cluster.is_some() {
+            "clustered"
+        } else {
+            "single"
+        };
+        let ctx = RenderCtx {
+            retention_days: 17,
+            metrics_landing_retention_hours: 3,
+            log_landing_retention_hours: 4,
+            trace_landing_retention_hours: 5,
+            ..base
+        };
+        let mut got = Vec::new();
+        let mut comment = None;
+        for stmt in rendered_statements(&ctx) {
+            if stmt.starts_with("CREATE DATABASE") {
+                comment = stmt
+                    .split_once(" COMMENT ")
+                    .map(|(_, c)| c.trim_end_matches(';').to_string());
+                continue;
+            }
+            let Some(rest) = stmt.strip_prefix("CREATE TABLE IF NOT EXISTS pulsus.") else {
+                continue;
+            };
+            if stmt.contains("ENGINE = Distributed(") {
+                continue;
+            }
+            let name = rest
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .unwrap();
+            let ttl: Vec<&str> = stmt.lines().filter(|l| l.starts_with("TTL ")).collect();
+            assert!(ttl.len() <= 1, "{variant} {name}: {ttl:?}");
+            let settings = stmt
+                .lines()
+                .find(|l| l.starts_with("SETTINGS "))
+                .unwrap_or_else(|| panic!("{variant} {name}: no SETTINGS line"));
+            let timeout = settings
+                .split(", ")
+                .find_map(|s| {
+                    s.trim_start_matches("SETTINGS ")
+                        .strip_prefix("merge_with_ttl_timeout = ")
+                })
+                .map(|v| v.parse::<u32>().unwrap());
+            got.push((
+                name.to_string(),
+                ttl.first().map(|l| l.to_string()),
+                settings.contains("ttl_only_drop_parts = 1"),
+                timeout,
+            ));
+        }
+        got.sort();
+        let mut want: Vec<(String, Option<String>, bool, Option<u32>)> = EXPIRY
+            .iter()
+            .map(|(n, t, p, m)| (n.to_string(), t.map(str::to_string), *p, *m))
+            .collect();
+        want.sort();
+        assert_eq!(got, want, "{variant}: every table's expiry");
+        assert_eq!(
+            comment.as_deref(),
+            Some("'retention_days=17'"),
+            "{variant}: the database comment"
+        );
+    }
+}
+
+/// Issue #497: `schema/schema.sh` refuses to render without a retention, and
+/// refuses one that is not a whole number of days from 1 to 4294967295, or a
+/// landing value that is not a whole number of hours from 1 to 168, before it
+/// contacts a server. Each refusal is exit 2 naming the variable.
+#[test]
+fn the_script_refuses_a_missing_or_malformed_retention() {
+    let root = repo_root();
+    let run = |vars: &[(&str, &str)]| {
+        let mut cmd = Command::new("sh");
+        cmd.arg(root.join("schema/schema.sh"))
+            .args(["--mode", "single", "--print"])
+            .current_dir(&root);
+        for var in [
+            "PULSUS_RETENTION_DAYS",
+            "PULSUS_METRICS_LANDING_RETENTION_HOURS",
+            "PULSUS_LOG_LANDING_RETENTION_HOURS",
+            "PULSUS_TRACE_LANDING_RETENTION_HOURS",
+            "PULSUS_CLUSTER",
+        ] {
+            cmd.env_remove(var);
+        }
+        cmd.env("CLICKHOUSE_SERVER", "127.0.0.1")
+            .env("CLICKHOUSE_HTTP_PORT", "1");
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("run schema.sh");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, err) = run(&[]);
+    assert_eq!(code, Some(2), "unset: {err}");
+    assert!(
+        err.contains("PULSUS_RETENTION_DAYS is not set"),
+        "unset: {err}"
+    );
+    for bad in [
+        "",
+        "0",
+        "07",
+        "7d",
+        "-1",
+        "1.5",
+        "4294967296",
+        "99999999999",
+    ] {
+        let (code, err) = run(&[("PULSUS_RETENTION_DAYS", bad)]);
+        assert_eq!(code, Some(2), "{bad:?}: {err}");
+        assert!(err.contains("PULSUS_RETENTION_DAYS"), "{bad:?}: {err}");
+    }
+    for good in ["1", "4294967295"] {
+        let (code, err) = run(&[("PULSUS_RETENTION_DAYS", good)]);
+        assert_eq!(code, Some(0), "{good:?}: {err}");
+    }
+    for var in [
+        "PULSUS_METRICS_LANDING_RETENTION_HOURS",
+        "PULSUS_LOG_LANDING_RETENTION_HOURS",
+        "PULSUS_TRACE_LANDING_RETENTION_HOURS",
+    ] {
+        for bad in ["0", "06", "169", "1000", "abc"] {
+            let (code, err) = run(&[("PULSUS_RETENTION_DAYS", "7"), (var, bad)]);
+            assert_eq!(code, Some(2), "{var}={bad:?}: {err}");
+            assert!(err.contains(var), "{var}={bad:?}: {err}");
+        }
+        for good in ["1", "168"] {
+            let (code, err) = run(&[("PULSUS_RETENTION_DAYS", "7"), (var, good)]);
+            assert_eq!(code, Some(0), "{var}={good:?}: {err}");
+        }
+    }
+}
+
+/// Issue #497: docs/configuration.md §7's expiry table has one row per
+/// table the file creates, named in its first cell, and no other.
+#[test]
+fn the_documented_expiry_table_names_every_table() {
+    let doc = std::fs::read_to_string(repo_root().join("docs/configuration.md")).unwrap();
+    let section = doc
+        .split_once("\n## 7. ")
+        .expect("a §7 heading")
+        .1
+        .split_once("\n## ")
+        .expect("a heading after §7")
+        .0;
+    let mut documented: Vec<String> = section
+        .lines()
+        .filter(|l| l.starts_with("| `") && !l.starts_with("| `PULSUS_"))
+        .map(|l| {
+            l.split('|')
+                .nth(1)
+                .unwrap()
+                .trim()
+                .trim_matches('`')
+                .to_string()
+        })
+        .collect();
+    documented.sort();
+    let mut want: Vec<String> = EXPIRY
+        .iter()
+        .map(|(n, ..)| n.replace("log_metrics_5s", "log_metrics_<res>"))
+        .collect();
+    want.sort();
+    assert_eq!(documented, want, "docs/configuration.md §7's expiry rows");
+}

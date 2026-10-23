@@ -542,14 +542,31 @@ struct DocRow {
     default: String,
 }
 
-/// Every table row of docs/configuration.md before `## 9. YAML file`: each
-/// line starting ``| ` ``.
-fn documented_rows() -> Vec<DocRow> {
+/// docs/configuration.md before `## 9. YAML file`, split into §7 (the
+/// variables `schema/schema.sh` alone reads, issue #497) and the rest.
+fn sections() -> (String, String) {
     let doc = support::repo_file("docs/configuration.md");
     let tables = doc
         .split_once("\n## 9. YAML file\n")
         .expect("docs/configuration.md has a `## 9. YAML file` line")
         .0;
+    let (before, rest) = tables
+        .split_once("\n## 7. ")
+        .expect("docs/configuration.md has a §7 heading");
+    let (seven, after) = rest
+        .split_once("\n## 8. ")
+        .expect("docs/configuration.md has a §8 heading");
+    (format!("{before}\n## 8. {after}"), seven.to_string())
+}
+
+/// Every table row of docs/configuration.md before `## 9. YAML file`: each
+/// line starting ``| ` ``.
+fn documented_rows() -> Vec<DocRow> {
+    let (rest, seven) = sections();
+    rows_of(&format!("{rest}\n{seven}"))
+}
+
+fn rows_of(tables: &str) -> Vec<DocRow> {
     tables
         .lines()
         .filter(|line| line.starts_with("| `"))
@@ -564,6 +581,34 @@ fn documented_rows() -> Vec<DocRow> {
             }
         })
         .collect()
+}
+
+/// Issue #497: §7 documents exactly the four variables `schema/schema.sh`
+/// alone reads, and the binary reads none of them.
+#[test]
+fn section_7_names_the_script_s_retention_variables_and_the_binary_reads_none() {
+    let mut got: Vec<String> = rows_of(&sections().1)
+        .into_iter()
+        .flat_map(|row| row.vars)
+        .filter(|v| v.starts_with("PULSUS_"))
+        .collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        [
+            "PULSUS_LOG_LANDING_RETENTION_HOURS",
+            "PULSUS_METRICS_LANDING_RETENTION_HOURS",
+            "PULSUS_RETENTION_DAYS",
+            "PULSUS_TRACE_LANDING_RETENTION_HOURS",
+        ],
+        "§7's variables"
+    );
+    for var in &got {
+        assert!(
+            !pulsus_config::ALL_ENV_VARS.contains(&var.as_str()),
+            "{var} is read by the binary"
+        );
+    }
 }
 
 #[test]

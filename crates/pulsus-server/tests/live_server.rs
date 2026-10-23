@@ -257,3 +257,82 @@ fn an_absent_schema_keeps_ready_at_503_and_names_the_script() {
         "the refusal must name the script that builds the schema: {log}"
     );
 }
+
+/// Issue #497: the binary takes its retention from the database. Built with a
+/// comment that states none, the process stays at `503` and its retry
+/// warning says why and names the script; once the comment states three days
+/// it becomes ready without a restart, and `/api/v1/status/runtimeinfo`
+/// reports the three days. The binary has no retention setting of its own.
+#[test]
+fn the_retention_is_read_from_the_database_and_nothing_serves_without_it() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let port: u16 = 31_132;
+    let db = pulsus_testkit::test_db("pulsus_server_live_retention_it");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        live_db::drop_db(&db).await;
+        live_db::build_schema_with_retention(&db, 3).await;
+        live_db::set_database_comment(&db, "").await;
+    });
+
+    let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
+        .env("PULSUS_HOST", "127.0.0.1")
+        .env("PULSUS_PORT", port.to_string())
+        .env("CLICKHOUSE_SERVER", live_db::ch_host())
+        .env("CLICKHOUSE_HTTP_PORT", live_db::ch_http_port().to_string())
+        .env("CLICKHOUSE_DB", &db)
+        // Ignored: the binary reads no retention variable.
+        .env("PULSUS_RETENTION_DAYS", "30")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn pulsusdb");
+    let mut child = ChildGuard(child);
+    let mut out = child.0.stdout.take().expect("piped stdout");
+
+    std::thread::sleep(Duration::from_secs(3));
+    let (status, _) = http_get(port, "/ready").expect("/ready reachable");
+    assert_eq!(
+        status, 503,
+        "/ready must be 503 while the database states no retention"
+    );
+    let (status, _) = http_get(port, "/api/v1/status/runtimeinfo").expect("runtimeinfo reachable");
+    assert_eq!(status, 503, "runtimeinfo has no retention to report yet");
+
+    rt.block_on(live_db::state_retention(&db, 3));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if http_get(port, "/ready").is_some_and(|(s, _)| s == 200) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        ready,
+        "/ready must reach 200 once the database states its retention"
+    );
+    let (status, body) = http_get(port, "/api/v1/status/runtimeinfo").expect("runtimeinfo");
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("runtimeinfo JSON");
+    assert_eq!(json["data"]["storageRetention"], "3d", "{body}");
+
+    drop(child);
+    let mut log = String::new();
+    let _ = out.read_to_string(&mut log);
+    rt.block_on(live_db::drop_db(&db));
+    assert!(
+        log.contains("states no retention"),
+        "the refusal says why: {log}"
+    );
+    assert!(
+        log.contains("schema/schema.sh") && log.contains("PULSUS_RETENTION_DAYS"),
+        "the refusal names the script and its variable: {log}"
+    );
+}

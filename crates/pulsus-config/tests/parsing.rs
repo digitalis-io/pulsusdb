@@ -370,3 +370,36 @@ fn overflow_and_bad_suffix_return_errors_not_panics() {
     assert!("18446744073709551615TiB".parse::<ByteSize>().is_err());
     assert!("5xyz".parse::<ByteSize>().is_err());
 }
+
+/// Issue #497: retention is the schema's, not the binary's. A YAML file that
+/// names one of the removed keys is refused at load, naming the key, rather
+/// than accepted and never applied to a table.
+#[test]
+fn a_removed_retention_key_is_refused_naming_it() {
+    let _guard = support::lock_env();
+    support::clear_all();
+    for (key, yaml) in [
+        ("retention_days", "retention_days: 30\n"),
+        (
+            "metrics_landing_retention_hours",
+            "metrics_landing_retention_hours: 12\n",
+        ),
+        (
+            "log_landing_retention_hours",
+            "log_landing_retention_hours: 12\n",
+        ),
+        (
+            "trace_landing_retention_hours",
+            "trace_landing_retention_hours: 12\n",
+        ),
+        ("skip_ddl", "skip_ddl: true\n"),
+        ("downsampling", "downsampling:\n  raw_retention: 1d\n"),
+    ] {
+        let path = support::write_temp_yaml(&format!("removed-{key}"), yaml);
+        let err = parse(Some(&path), None).expect_err(key).to_string();
+        assert!(
+            err.contains(&format!("unknown field `{key}`")),
+            "{key}: {err}"
+        );
+    }
+}
