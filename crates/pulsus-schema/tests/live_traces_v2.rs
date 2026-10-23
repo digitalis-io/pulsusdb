@@ -998,10 +998,10 @@ async fn dropping_a_day_drops_no_rows_of_another() {
         "both spans landed through the view"
     );
 
-    // `apply_ttl`'s own `MODIFY TTL` leaves one `MATERIALIZE TTL` row behind
-    // at init, so the property is that the DROP adds none rather than that
-    // the table has none. Measured on 26.3.29.7: one row, `(MATERIALIZE
-    // TTL)`, `parts_to_do = 0`, before any insert.
+    // The property is that the DROP adds nothing to the count below, not
+    // that the count is zero: the `MODIFY TTL` pass issue #619 removed left one
+    // `MATERIALIZE TTL` row behind (measured then on 26.3.29.7: `parts_to_do =
+    // 0`, before any insert), and a count taken before the DROP covers either case.
     let mutations_before = count(
         &client,
         &format!(

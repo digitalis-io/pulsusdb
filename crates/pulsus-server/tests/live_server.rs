@@ -112,9 +112,9 @@ fn ready_transitions_from_503_to_200_and_ops_endpoints_respond() {
         .expect("spawn pulsusdb");
     let _guard = ChildGuard(child);
 
-    // A longer deadline than a bare pool connect needs: startup now runs the
-    // full schema reconcile (`CREATE DATABASE` + migrations + MVs) against
-    // `pulsus_server_live_it` before `/ready` can flip to 200.
+    // A longer deadline than a bare pool connect needs: startup checks the
+    // server version, the names it sends and that `pulsus_server_live_it`
+    // exists before `/ready` can flip to 200.
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut saw_503 = false;
     let mut became_ready = false;

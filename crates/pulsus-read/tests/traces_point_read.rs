@@ -94,8 +94,8 @@ async fn exec(client: &ChClient, sql: &str) {
         .unwrap_or_else(|e| panic!("statement failed: {e}\nSQL:\n{sql}"));
 }
 
-/// Creates a nonce'd database with the migrations applied, and returns its
-/// name.
+/// Creates a nonce'd database with the schema `run_init` builds, and returns
+/// its name.
 ///
 /// **Takes the composed name**, not the bare one: the per-checkout prefix
 /// comes from `pulsus_testkit::test_db`, and the source scan that checks

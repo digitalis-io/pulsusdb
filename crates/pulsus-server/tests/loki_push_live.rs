@@ -2355,8 +2355,8 @@ async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
 /// it was discovered from is queryable by LogQL.
 ///
 /// This is the assertion behind the read-path claim. `log_samples` is
-/// `ORDER BY (service, fingerprint, timestamp_ns)`
-/// (`crates/pulsus-schema/src/catalog.rs`), and every logs read renders
+/// `ORDER BY (org_id, service, fingerprint, timestamp_ns)`
+/// (`schema/schema.sql`), and every logs read renders
 /// `PREWHERE service = …` from the values hydrated in stage 2
 /// (`crates/pulsus-read/src/logql/sql.rs`). Before discovery, a push carrying
 /// no explicit `service_name` — and an OTLP resource carrying no

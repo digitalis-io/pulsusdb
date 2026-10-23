@@ -1,7 +1,7 @@
 //! Live inbound-TLS end-to-end suite (issue #174): spawns the real
 //! `pulsusdb` binary with `PULSUS_TLS_CERT`/`PULSUS_TLS_KEY` set and
 //! proves the TLS listener over loopback — `/ready` reaches 200 over TLS
-//! (the full stack, schema reconcile included, served through the
+//! (the full stack, startup schema check included, served through the
 //! `TlsListener`), a *plaintext* GET on the same port gets no valid HTTP
 //! response (rustls rejects the non-ClientHello and the connection is
 //! closed), and `/config` over TLS shows both path fields (redacted dump
@@ -163,7 +163,7 @@ fn tls_listener_serves_ready_and_config_and_rejects_plaintext() {
     let _guard = ChildGuard(child);
 
     // 1. /ready reaches 200 over TLS within the same 60s cold-start
-    //    deadline live_server.rs uses (schema reconcile included) — the
+    //    deadline live_server.rs uses (startup schema check included) — the
     //    whole readiness transition is observed through the TLS listener.
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut became_ready = false;

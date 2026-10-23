@@ -5,7 +5,7 @@ test gap #5 (startup-time reconcile-retry, not just post-startup outage
 recovery): proves the probe-contract claim (issue #38 plan amendment §1)
 against a real kubelet — a pod stays running and simply loses readiness
 during an outage (or never gains it, if ClickHouse was never up in the
-first place), is never restarted, and self-heals (re-reconciles) once
+first place), is never restarted, and self-heals (reconnects) once
 ClickHouse is back, all without any external intervention.
 """
 
@@ -207,7 +207,7 @@ def _pod_ready_again(helm_release: HelmRelease, k8s_core_v1):
     wait_for_condition(
         lambda: _pod_ready(k8s_core_v1, helm_release.namespace),
         timeout=DEFAULT_TIMEOUT,
-        description="pulsusdb pod to self-reconcile and report Ready again",
+        description="pulsusdb pod to reconnect and report Ready again",
     )
 
 

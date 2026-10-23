@@ -4,9 +4,9 @@
 //! [`super::sql::sweep_query`]), building a whole new
 //! [`super::labels::CacheSnapshot`] and atomically swapping it into the
 //! resident [`super::labels::LabelCache`]. [`spawn_refresh_loop`] runs this
-//! on an interval in the self-healing shape of
-//! `pulsus_server::serve::spawn_rotation_task` (not importable here — the
-//! same *shape*, reimplemented against this crate's own types): a failed
+//! on an interval in a self-healing shape (the server's retention rotation
+//! task once had the same shape; issue #619 removed it): a
+//! failed
 //! sweep logs a warning and bumps `refresh_failures_total`, but **never**
 //! clobbers the last good snapshot — a blanked cache would mass-false-empty
 //! every in-window query.
@@ -201,8 +201,8 @@ pub(crate) fn sweep_settings(
 }
 
 /// Spawns the recurring refresh task: ticks every `ttl`, running one
-/// [`run_sweep`] per tick. Mirrors `serve::spawn_rotation_task`'s
-/// self-healing shape: a failed sweep only logs and bumps a failure
+/// [`run_sweep`] per tick, in a self-healing shape: a failed sweep only
+/// logs and bumps a failure
 /// counter (already done inside `run_sweep`), it never aborts the loop or
 /// panics — the next tick simply tries again. `tokio::time::interval`'s
 /// first tick fires immediately, so the cache starts warming as soon as

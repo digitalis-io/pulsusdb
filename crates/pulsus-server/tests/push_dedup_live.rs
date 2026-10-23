@@ -1388,7 +1388,7 @@ async fn the_sample_budget_still_counts_fetched_rows() {
     // ONE sample. The two numbers differ, which is what makes this a test.
     let at_ms = T_NS / 1_000_000;
     {
-        // The server creates the database, so the client is built after it.
+        // `spawn_ready` builds the database, so the client is built after it.
         let _seeder = spawn_ready(BUDGET_PORT, &db, &[("PULSUS_PROMQL_MAX_SAMPLES", "100")]);
         let client = client_for(db.name()).await;
         seed_series(&client, "budget_probe", 0x494_0012, at_ms, "budget").await;

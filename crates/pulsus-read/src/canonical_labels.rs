@@ -12,7 +12,7 @@
 //!
 //! * `log_streams_idx_mv` is built by ClickHouse from the labels column with
 //!   `ARRAY JOIN JSONExtractKeysAndValues(labels, 'String')`
-//!   (`crates/pulsus-schema/src/catalog.rs:942`). LogQL stage 1 selects
+//!   (`schema/schema.sql`, `log_streams_idx_mv`). LogQL stage 1 selects
 //!   streams through that index; LogQL stage 2 renders the same streams'
 //!   labels through this decoder.
 //! * The metric label pushdown renders
@@ -51,7 +51,7 @@
 //!
 //! | input | here | `serde_json::Value` | `SQL` | `INDEX` |
 //! |---|---|---|---|---|
-//! | `""` (the structured-metadata default, `catalog.rs:441`) | zero pairs | `Err: EOF at column 0` | `''` | `[]` |
+//! | `""` (the structured-metadata default, `schema/schema.sql`'s `log_samples`) | zero pairs | `Err: EOF at column 0` | `''` | `[]` |
 //! | `{"k""v"}` — no colon | `[("k","v")]` | `Err: expected ':'` | `''` | `[]` |
 //! | `{"a":1,"b":"z"}` — a non-string value | `[]`, it stops | both pairs | `'z'` for `b` | `[('a','1'),('b','z')]` |
 //! | `{"k":"a\qb"}` — an unknown escape | `[("k","aqb")]` | `Err: invalid escape` | `''` | `[]` |
@@ -521,7 +521,7 @@ mod tests {
     }
 
     /// The structured-metadata column defaults to the empty string
-    /// (`crates/pulsus-schema/src/catalog.rs:441`) and the log-push
+    /// (`schema/schema.sql`, `log_samples`) and the log-push
     /// receiver writes it for every entry that carries no metadata, so
     /// this is the common case, not an edge case. `serde_json` rejects it.
     #[test]

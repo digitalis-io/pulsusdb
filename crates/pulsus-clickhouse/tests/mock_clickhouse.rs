@@ -323,10 +323,11 @@ async fn a_tagged_success_whose_last_row_ends_in_close_parens_yields_its_row() {
 /// *modern* response would be a false gate, because the body still carries the
 /// tagged trailer, so the chunk ends `__exception__\r\n` rather than `))\n`.
 ///
-/// A tag-absent server is reachable on `main` despite the 26.3 floor:
-/// `PULSUS_SKIP_DDL` skips `run_init` entirely
-/// (`crates/pulsus-server/src/serve.rs:645-685`), and the version gate lives
-/// inside it (`crates/pulsus-schema/src/controller.rs:84-100`). Deleting the
+/// Startup refuses a server below the supported floor
+/// (`crates/pulsus-schema/src/checks.rs:19`, called at
+/// `crates/pulsus-server/src/chconfig.rs:137`) on one query's answer, so
+/// another configured endpoint, or a header-stripping proxy, can still send
+/// an untagged response. Deleting the
 /// old extractor turns this into
 /// `Decode("not enough data, probably a row type mismatches a database
 /// schema")` — a wrong diagnosis of a real server exception, and

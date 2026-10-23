@@ -307,7 +307,7 @@ async fn a_configured_template_timezone_reaches_the_rendered_query_response() {
     let default_port: u16 = 31_171;
 
     drop_db(db).await;
-    // Seeded through a server that has already reconciled the schema.
+    // Seeded through a ready server; the schema is built before it starts.
     let configured = spawn_ready(
         configured_port,
         db,

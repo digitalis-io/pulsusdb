@@ -169,6 +169,8 @@ A trace request is also bounded **before** any of that, by a fixed ceiling on th
 
 ## 7. Downsampling (M3)
 
+**Not built yet.** These settings are parsed and validated at startup (the rules below), and nothing else reads them: `schema/schema.sql` creates no tier table and no query is answered from one. The rest of this section is the intended design.
+
 Tier layout is YAML-only (the shape doesn't flatten well into env vars):
 
 ```yaml
@@ -194,7 +196,7 @@ downsampling:
 
 Tier eligibility always requires `tier.resolution <= query step` **and** `tier.resolution <= the range-vector window` — a 5m-window `rate` is never answered from 1h buckets regardless of policy.
 
-Tiers are populated **in real time by insert-triggered materialized views inside ClickHouse** — there is no downsampling process or schedule. Validation enforced at startup: `resolution`, `min_step`, and `retention` strictly increasing across tiers; `min_step >= resolution` per tier. The schema controller owns the DDL only: tier tables, MVs (recreated when the config checksum changes), TTLs, and a one-shot chunked backfill offered when a tier is first enabled over pre-existing data.
+Tiers are populated **in real time by insert-triggered materialized views inside ClickHouse** — there is no downsampling process or schedule. Validation enforced at startup: `resolution`, `min_step`, and `retention` strictly increasing across tiers; `min_step >= resolution` per tier.
 
 ## 8. Ruler (M7)
 

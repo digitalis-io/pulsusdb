@@ -123,7 +123,7 @@ Label keys are part of the user-visible query surface *and* the fingerprint inpu
 
 **The authoritative DDL, per-table rationale, generated-SQL read paths, and latency targets live in [schemas.md](schemas.md).** This section summarizes the decisions; where the two documents differ, schemas.md wins.
 
-All DDL is written once, in `schema/schema.sql`, and applied by `schema/schema.sh`. **The binary creates no schema** — it reads the file for a materialized view's own projection (the rebuild commands) and a table's declared column list (the trace fetch), and refuses to start when the configured database does not exist, naming the script. **There are no migrations**: a schema change is an edit to the file and another run of the script, which drops the database and builds it again (schemas.md §6). When `PULSUS_CLUSTER` is set, `MergeTree` families swap to `ReplicatedMergeTree` equivalents and `*_dist` Distributed tables are created for every table but the two landing tables, which are written under their bare names in both modes (issue #603, §7). Raw sample/span tables partition **daily** (short TTL, whole-part drops); series/index/tier tables partition **monthly**.
+All DDL is written once, in `schema/schema.sql`, and applied by `schema/schema.sh`. **The binary creates no schema** — while the configured database does not exist it does not become ready, and its retry warning names the script; `PULSUS_SKIP_DDL` skips that check. **There are no migrations**: a schema change is an edit to the file and another run of the script, which drops the database and builds it again (schemas.md §6). When `PULSUS_CLUSTER` is set, `MergeTree` families swap to `ReplicatedMergeTree` equivalents and `*_dist` Distributed tables are created for every table but the two landing tables, which are written under their bare names in both modes (issue #603, §7). Raw sample/span tables partition **daily** (short TTL, whole-part drops); series/index/tier tables partition **monthly**.
 
 ### 3.1 Metrics
 
@@ -137,11 +137,12 @@ Decisions and their reasons:
 
 #### 3.1.1 Downsampling tiers
 
+**Not built yet (M3).** `schema/schema.sql` creates no tier table and no query is answered from one: the `downsampling` settings (configuration.md §7) are parsed and validated at startup, and nothing else reads them. The rest of this subsection is the intended design.
+
 Rollups are maintained **entirely inside ClickHouse** by classic insert-triggered materialized views — no external driver or scheduled process. One `AggregatingMergeTree` table per tier (`metric_samples_5m`, `metric_samples_1h` by default; tiers are configurable) storing per-bucket `val_min/val_max/val_sum/val_count` and first/last time+value states (full DDL in [schemas.md §2.2](schemas.md)).
 
 - **Insert-triggered and real-time.** Every stored aggregate is a mergeable state, so per-block partial aggregates converge under merges regardless of insert order; tiers trail raw data by at most one insert batch and can therefore serve a query's entire time range from one table.
 - **Counter resets are handled at query time from bucket boundaries** (`first_value`/`last_value` per bucket), because per-sample deltas can't be computed correctly inside an incremental MV. The engine reconstructs reset-adjusted increases over the bucket sequence in O(buckets). **Any reset inside a bucket is approximate** — information is lost, sometimes undetectably (`100,150,10,140` reconstructs 40 where the truth is 190) — which is why `PULSUS_TIER_POLICY=exact` keeps counters on raw samples wherever raw exists and every tier-served counter segment is flagged approximate ([schemas.md §2.2](schemas.md)).
-- The schema controller only issues DDL: create tier tables + MVs, recreate an MV when its config checksum changes, and a one-shot chunked backfill when a tier is first enabled over pre-existing data.
 
 ### 3.2 Logs
 
@@ -181,7 +182,7 @@ Rule groups (`kind` = `logs` | `metrics`) live in a `rules` `ReplacingMergeTree`
 
 ### 3.6 Retention
 
-Retention is TTL-driven and applied by the schema controller at startup and on a rotation timer: raw tables get `TTL ... + INTERVAL <PULSUS_RETENTION_DAYS> DAY DELETE` (with `ttl_only_drop_parts = 1` so expiry drops whole partitions); each metric tier carries its own longer retention. `PULSUS_STORAGE_POLICY` attaches a ClickHouse storage policy for hot/cold tiering.
+Retention is TTL-driven and declared in each table's `CREATE` in `schema/schema.sql`, which `schema/schema.sh` applies: raw tables get `TTL ... + INTERVAL <PULSUS_RETENTION_DAYS> DAY DELETE` (with `ttl_only_drop_parts = 1` so expiry drops whole partitions); each metric tier carries its own longer retention. `PULSUS_STORAGE_POLICY` attaches a ClickHouse storage policy for hot/cold tiering.
 
 ---
 
