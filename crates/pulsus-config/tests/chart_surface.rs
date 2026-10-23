@@ -458,9 +458,17 @@ fn schema_accepts(
                 .as_str()
                 .is_none_or(|s| s.chars().count() as u64 >= rule.as_u64().unwrap()),
             "pattern" => v.as_str().is_none_or(|s| {
-                regex::Regex::new(rule.as_str().unwrap())
-                    .expect("pattern")
-                    .is_match(s)
+                thread_local! {
+                    static COMPILED: std::cell::RefCell<std::collections::HashMap<String, regex::Regex>> =
+                        Default::default();
+                }
+                let text = rule.as_str().unwrap();
+                COMPILED.with(|c| {
+                    c.borrow_mut()
+                        .entry(text.to_string())
+                        .or_insert_with(|| regex::Regex::new(text).expect("pattern"))
+                        .is_match(s)
+                })
             }),
             "items" => v
                 .as_sequence()
@@ -540,8 +548,7 @@ fn probes() -> Vec<serde_norway::Value> {
 }
 
 /// `doc` with the value at dotted `path` replaced; `<list>[].<field>` sets
-/// that field in a one-element list holding `base_tier()`, with every
-/// duration field of the tier set together so their order rules hold.
+/// that one field in a one-element list holding `base_tier()`.
 fn with_value(
     doc: &serde_norway::Value,
     path: &str,
@@ -550,14 +557,7 @@ fn with_value(
     let (path, v) = match path.split_once("[].") {
         Some((list, field)) => {
             let mut tier = base_tier();
-            let durations = ["resolution", "retention", "min_step"];
-            for f in if durations.contains(&field) {
-                &durations[..]
-            } else {
-                std::slice::from_ref(&field)
-            } {
-                tier.insert((*f).into(), v.clone());
-            }
+            tier.insert(field.into(), v.clone());
             (
                 list.to_string(),
                 serde_norway::Value::Sequence(vec![tier.into()]),
@@ -582,11 +582,52 @@ fn with_value(
 }
 
 /// The server's verdict on one changed key: its defaults with that key set,
-/// parsed and validated.
-fn server_accepts(path: &str, v: &serde_norway::Value) -> bool {
+/// parsed and validated, with the server's message when it refuses.
+fn server_verdict(path: &str, v: &serde_norway::Value) -> Result<(), String> {
     let doc = with_value(&serde_norway::Value::Mapping(Default::default()), path, v);
-    serde_norway::from_value::<Config>(doc).is_ok_and(|cfg| pulsus_config::validate(&cfg).is_ok())
+    let cfg = serde_norway::from_value::<Config>(doc).map_err(|e| e.to_string())?;
+    pulsus_config::validate(&cfg).map_err(|e| e.to_string())
 }
+
+fn server_accepts(path: &str, v: &serde_norway::Value) -> bool {
+    server_verdict(path, v).is_ok()
+}
+
+/// The one server rule the schema is not held to: a tier's `min_step` must
+/// be at least its `resolution`. It relates two fields, and so do the rules
+/// across tiers (durations strictly increasing, names and tables unique),
+/// which a one-tier probe never reaches. The schema does not encode them:
+/// the server refuses them at startup with a message naming the fields
+/// (`a_tier_relation_the_schema_does_not_check_is_refused_at_startup`), and
+/// the `downsampling` section is due for removal. A refusal carrying this
+/// text, at a tier field, is not counted by the sweep.
+const TIER_RELATION_REFUSAL: &str = "must be >= resolution";
+
+/// The values the server accepts and the schema refuses by decision, with
+/// the probe that finds each. Asserted by equality.
+/// * `clickhouse.server` with surrounding whitespace: the template renders
+///   the value as given, so the schema refuses it rather than trim it.
+/// * `clickhouse.database` empty: no database has an empty name.
+const SCHEMA_STRICTER: &[(&str, &str)] =
+    &[("clickhouse.server", " 5s"), ("clickhouse.database", "")];
+
+/// The definitions whose values the server trims before parsing: durations
+/// and byte sizes (`units.rs`). Their patterns accept surrounding ASCII
+/// whitespace, and the sweep probes them padded.
+const TRIMMED_DEFINITIONS: &[&str] = &[
+    "humanDuration",
+    "positiveHumanDuration",
+    "nullablePositiveHumanDuration",
+    "byteSize",
+    "batchBytes",
+    "ingestQueueBytes",
+    "logqlScanBudgetBytes",
+];
+
+/// The surrounding whitespace a duration or byte-size pattern accepts: the
+/// ASCII characters `str::trim` removes. The server also trims the other
+/// Unicode white space; the schema refuses it, which is the stricter side.
+const PAD: &str = r"[\t\n\v\f\r ]*";
 
 fn int(x: i128) -> serde_norway::Value {
     if x < 0 {
@@ -718,6 +759,8 @@ fn the_chart_schema_accepts_no_value_the_binary_refuses() {
         "the member finder found only {enumerated:?}"
     );
     let mut refused = Vec::new();
+    let mut rejected = Vec::new();
+    let mut padded_keys = 0;
     for (path, _) in &leaves {
         let mut candidates = probes();
         candidates.extend(enumerated.iter().cloned());
@@ -749,6 +792,7 @@ fn the_chart_schema_accepts_no_value_the_binary_refuses() {
         }
         // Every unit a duration or a byte size takes: the largest count the
         // server accepts with it, and the one beyond.
+        let unit_probes_from = candidates.len();
         for unit in UNITS {
             if let Some(n) = largest_count(path, unit) {
                 for x in [n, n + 1] {
@@ -756,14 +800,62 @@ fn the_chart_schema_accepts_no_value_the_binary_refuses() {
                 }
             }
         }
+        // The reverse direction: every probe above that is not one of the
+        // per-unit largest counts (durations allow 13 digits and `byteSize`
+        // 2^53 - 1, deliberately stricter than the server), and at a key
+        // whose value the server trims, each string probe and the key's own
+        // value padded with whitespace.
+        let mut reverse = candidates[..unit_probes_from].to_vec();
+        let trimmed = leaf_node(config_schema, path)
+            .get("$ref")
+            .and_then(|r| r.as_str())
+            .and_then(|r| r.strip_prefix("#/definitions/"))
+            .is_some_and(|d| TRIMMED_DEFINITIONS.contains(&d));
+        if trimmed {
+            let own = match path.split_once("[].") {
+                Some((_, field)) => base_tier().get(field).cloned(),
+                None => path.split('.').try_fold(&values, |v, s| v.get(s)).cloned(),
+            };
+            let strings: Vec<String> = reverse
+                .iter()
+                .chain(own.iter())
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            for s in strings {
+                for padded in [format!(" {s}"), format!("{s} "), format!("\t{s}\n")] {
+                    reverse.push(serde_norway::Value::String(padded));
+                }
+            }
+            padded_keys += 1;
+        }
         for v in candidates {
+            let verdict = server_verdict(path, &v);
+            let relation = path.contains("[].")
+                && verdict
+                    .as_ref()
+                    .is_err_and(|e| e.contains(TIER_RELATION_REFUSAL));
             if schema_accepts(&schema, config_schema, &with_value(&values, path, &v))
-                && !server_accepts(path, &v)
+                && verdict.is_err()
+                && !relation
             {
                 refused.push(format!(
                     "{path} = {}",
                     serde_norway::to_string(&v).unwrap().trim()
                 ));
+            }
+        }
+        for v in reverse {
+            // `null` never reaches the schema: the chart tool deletes a key
+            // set to `null` before it validates. A byte size above 2^53 - 1
+            // is refused by decision (`byteSize`).
+            let over_safe = serde_norway::from_value::<pulsus_config::ByteSize>(v.clone())
+                .is_ok_and(|b| b.0 > JSON_SAFE_MAX);
+            if !v.is_null()
+                && !over_safe
+                && server_accepts(path, &v)
+                && !schema_accepts(&schema, config_schema, &with_value(&values, path, &v))
+            {
+                rejected.push((path.clone(), v));
             }
         }
     }
@@ -777,8 +869,56 @@ fn the_chart_schema_accepts_no_value_the_binary_refuses() {
         "values.yaml's own configuration must pass the schema"
     );
     assert!(
+        padded_keys >= 15,
+        "the padded probes reached only {padded_keys} keys"
+    );
+    assert!(
         refused.is_empty(),
         "values the schema accepts and the server refuses: {refused:#?}"
+    );
+    let want: Vec<(String, serde_norway::Value)> = SCHEMA_STRICTER
+        .iter()
+        .map(|(p, v)| (p.to_string(), serde_norway::Value::String(v.to_string())))
+        .collect();
+    assert_eq!(
+        rejected, want,
+        "values the server accepts and the schema refuses, beyond the listed ones"
+    );
+}
+
+/// The limit `TIER_RELATION_REFUSAL` states, held true: a tier whose
+/// `min_step` is below its `resolution`, with downsampling enabled, passes
+/// the schema, and the server refuses it at startup with a message naming
+/// both fields.
+#[test]
+fn a_tier_relation_the_schema_does_not_check_is_refused_at_startup() {
+    let schema = parse_doc(
+        &read("deploy/charts/pulsusdb/values.schema.json"),
+        "values.schema.json",
+    );
+    let config_schema = get(&schema, &["definitions", "pulsusdbConfig"]);
+    let tiers: serde_norway::Value = serde_norway::from_str(
+        "[{name: r10m, resolution: 10m, table: metric_samples_10m, retention: 30d, min_step: 5m}]",
+    )
+    .unwrap();
+    let values = with_value(
+        &with_value(&chart_config(), "downsampling.enabled", &true.into()),
+        "downsampling.tiers",
+        &tiers,
+    );
+    assert!(
+        schema_accepts(&schema, config_schema, &values),
+        "the schema refuses the tier, so the limit no longer holds"
+    );
+    let cfg: Config = serde_norway::from_value(values).expect("the tier parses");
+    let err = pulsus_config::validate(&cfg)
+        .expect_err("the server must refuse min_step below resolution")
+        .to_string();
+    assert!(
+        err.contains("min_step")
+            && err.contains("resolution")
+            && err.contains(TIER_RELATION_REFUSAL),
+        "the refusal must name both fields: {err}"
     );
 }
 
@@ -1200,7 +1340,8 @@ fn count_regex(hi: u64) -> String {
 }
 
 /// The pattern a positive byte size with `ceiling` must carry: exactly the
-/// strings whose value is `1..=ceiling`, in every unit the parser takes.
+/// strings whose value is `1..=ceiling`, in every unit the parser takes,
+/// with the surrounding whitespace the parser trims.
 fn byte_size_pattern(ceiling: u64) -> String {
     let units: [(&str, u64); 10] = [
         ("", 1),
@@ -1219,7 +1360,7 @@ fn byte_size_pattern(ceiling: u64) -> String {
         .filter(|(_, m)| ceiling / m >= 1)
         .map(|(u, m)| format!("{}{u}", count_regex(ceiling / m)))
         .collect();
-    format!("^(?:{})$", alts.join("|"))
+    format!("^{PAD}(?:{}){PAD}$", alts.join("|"))
 }
 
 /// Each byte-size definition is bounded by its key's ceiling in both forms:

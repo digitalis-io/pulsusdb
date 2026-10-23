@@ -30,6 +30,7 @@ Feature: helm upgrade rolls pods, and the schema is not theirs to build
     And a running pulsusdb release installed with default values
     When I helm upgrade the release with "--set pulsusdb.config.reader.cache_ttl=30s"
     Then the upgrade succeeds
+    And the schema Job is the same Job as before the upgrade
     And every pod in the release reaches Ready within the timeout budget
     And the release status is deployed
 
@@ -38,5 +39,6 @@ Feature: helm upgrade rolls pods, and the schema is not theirs to build
     And a running pulsusdb release installed with default values
     When I helm upgrade the release with "--set initJob.resources.limits.memory=2Gi"
     Then the upgrade succeeds
+    And the schema Job was replaced by one whose memory limit is "2Gi"
     And every pod in the release reaches Ready within the timeout budget
     And the release status is deployed
