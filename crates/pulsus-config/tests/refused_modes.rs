@@ -26,9 +26,7 @@
 //! * the first cell of a table row (the mode tables).
 //!
 //! Every tracked file is read except `schema/` (`schema.sh` has its own
-//! `--mode single|cluster` flag), `deploy/charts/` (issue #506 part 2 takes
-//! the chart's mentions and removes this exclusion), this file, and any file
-//! that is not UTF-8.
+//! `--mode single|cluster` flag), this file, and any file that is not UTF-8.
 
 use std::path::{Path, PathBuf};
 
@@ -38,7 +36,7 @@ use regex::Regex;
 const REMOVED_MODES: &[&str] = &["init"];
 
 /// The tracked paths this test does not read, by prefix.
-const SKIPPED: &[&str] = &["schema/", "deploy/charts/"];
+const SKIPPED: &[&str] = &["schema/"];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")

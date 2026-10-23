@@ -1,7 +1,7 @@
 {{/*
 Rendered when `pulsusdb.split.enabled=false` (default): one `--mode all`
-Deployment (schema controller + writer + reader in one process,
-docs/architecture.md §1) — the single-node topology mirroring
+Deployment (writer + reader in one process, docs/architecture.md §1;
+the schema Job builds the schema) — the single-node topology mirroring
 `deploy/e2e/compose.single.yaml`. Never a StatefulSet: PulsusDB processes
 are stateless (all durable state lives in ClickHouse; the only writable
 path is the insert-failure spool, backed by `pulsusdb.volumes`' `spool`

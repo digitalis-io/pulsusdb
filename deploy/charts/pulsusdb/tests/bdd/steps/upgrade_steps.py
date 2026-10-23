@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pytest_bdd import parsers, scenarios, then, when  # noqa: E402
 
-from conftest import HelmRelease, run  # noqa: E402
+from conftest import HelmRelease, run, wait_for_condition  # noqa: E402
 
 # The `Given`/`And` steps this scenario uses (cluster readiness, default
 # install) are shared and live in `conftest.py` — no import needed, see
@@ -52,13 +52,42 @@ def _pulsusdb_pod_checksum_config(k8s_core_v1, namespace: str) -> str:
     return checksum
 
 
+def _live_schema_jobs(k8s_batch_v1, namespace: str) -> list:
+    """The release's schema Jobs that are not being deleted. Helm deletes a
+    replaced Job in the background, so the old one can still be listed,
+    carrying a deletion timestamp, for a moment after the upgrade returns."""
+    jobs = k8s_batch_v1.list_namespaced_job(
+        namespace, label_selector="app.kubernetes.io/component=init"
+    ).items
+    return [j for j in jobs if j.metadata.deletion_timestamp is None]
+
+
+def _schema_job(k8s_batch_v1, namespace: str) -> dict:
+    """The release's one live schema Job: its name, its UID (a Job deleted
+    and created again under the same name has a new one) and its container's
+    resources."""
+    jobs = _live_schema_jobs(k8s_batch_v1, namespace)
+    assert len(jobs) == 1, f"expected one live schema Job in {namespace}, found {[j.metadata.name for j in jobs]}"
+    job = jobs[0]
+    resources = job.spec.template.spec.containers[0].resources
+    return {
+        "name": job.metadata.name,
+        "uid": job.metadata.uid,
+        "limits": dict(resources.limits or {}),
+        "requests": dict(resources.requests or {}),
+    }
+
+
 @when(parsers.parse('I helm upgrade the release with "{extra}"'))
-def _upgrade(helm_release: HelmRelease, extra: str, k8s_core_v1):
-    # Captured *before* the upgrade runs, so the Then step below has a
+def _upgrade(helm_release: HelmRelease, extra: str, k8s_core_v1, k8s_batch_v1):
+    # Captured *before* the upgrade runs, so the Then steps below have a
     # true before/after pair to compare — this is the only point in the
     # scenario where "before" is observable.
     helm_release.pre_upgrade_checksum = _pulsusdb_pod_checksum_config(  # type: ignore[attr-defined]
         k8s_core_v1, helm_release.namespace
+    )
+    helm_release.pre_upgrade_job = _schema_job(  # type: ignore[attr-defined]
+        k8s_batch_v1, helm_release.namespace
     )
     result = helm_release.upgrade(*extra.split())
     helm_release.last_result = result  # type: ignore[attr-defined]
@@ -77,6 +106,34 @@ def _checksum_changed(helm_release: HelmRelease, k8s_core_v1):
     assert after != before, (
         "expected checksum/config to change after a retention_days upgrade "
         f"(a schema-affecting value) — before={before} after={after}"
+    )
+
+
+@then("the schema Job is the same Job as before the upgrade")
+def _job_unchanged(helm_release: HelmRelease, k8s_batch_v1):
+    before = helm_release.pre_upgrade_job  # type: ignore[attr-defined]
+    after = _schema_job(k8s_batch_v1, helm_release.namespace)
+    assert (after["name"], after["uid"]) == (before["name"], before["uid"]), (
+        f"the schema Job changed: before {before}, after {after}"
+    )
+
+
+@then(parsers.parse('the schema Job was replaced by one whose memory limit is "{limit}"'))
+def _job_replaced(helm_release: HelmRelease, k8s_batch_v1, limit: str):
+    before = helm_release.pre_upgrade_job  # type: ignore[attr-defined]
+    assert before["limits"].get("memory") != limit, (
+        f"the Job already had memory limit {limit} before the upgrade: {before}"
+    )
+    wait_for_condition(
+        lambda: len(_live_schema_jobs(k8s_batch_v1, helm_release.namespace)) == 1,
+        timeout=120,
+        description="the replaced schema Job to be gone",
+    )
+    after = _schema_job(k8s_batch_v1, helm_release.namespace)
+    assert after["name"] != before["name"], f"the schema Job kept its name: {after}"
+    assert after["uid"] != before["uid"], f"the schema Job kept its UID: {after}"
+    assert after["limits"].get("memory") == limit, (
+        f"the new schema Job's memory limit is {after['limits'].get('memory')}, not {limit}: {after}"
     )
 
 

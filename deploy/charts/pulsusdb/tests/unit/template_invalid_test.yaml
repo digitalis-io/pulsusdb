@@ -36,6 +36,15 @@ tests:
       - failedTemplate:
           errorPattern: "server"
 
+  - it: given an external server with surrounding whitespace, when rendering, then values.schema.json rejects it (the template renders the value as given)
+    set:
+      clickhouse.enabled: false
+      clickhouse.auth.existingSecret: "ch-credentials"
+      pulsusdb.config.clickhouse.server: " ch.example.com"
+    asserts:
+      - failedTemplate:
+          errorPattern: "server"
+
   - it: given clickhouse.enabled=false with a server set but no clickhouse.auth.existingSecret, when rendering, then the template-time fail guard rejects it (the chart never invents a password for a database it doesn't manage)
     set:
       clickhouse.enabled: false

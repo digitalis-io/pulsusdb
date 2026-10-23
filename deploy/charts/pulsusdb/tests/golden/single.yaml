@@ -466,7 +466,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: pulsusdb-init-7bfbdd69
+  name: pulsusdb-init-9ff052ba
   labels:
     helm.sh/chart: pulsusdb-0.1.0
     app.kubernetes.io/name: pulsusdb
@@ -485,9 +485,6 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/component: init
-      annotations:
-        checksum/config: 764010191648ea7fbdabadfa7543f066b7b494fb0b52b58e4bacfd307c983632
-        checksum/secret: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
     spec:
       restartPolicy: Never
       serviceAccountName: pulsusdb

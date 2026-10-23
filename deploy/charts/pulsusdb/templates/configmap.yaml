@@ -1,7 +1,9 @@
 {{/*
-Renders `pulsusdb.config` as `config.yaml`, matching docs/configuration.md
-§9's schema exactly (non-secret keys only — `auth_password` and the
-ClickHouse password live in `templates/secret.yaml`, never here). Mounted
+Renders `pulsusdb.config` as `config.yaml`: a subset of docs/configuration.md
+§9's keys (non-secret keys only — `auth_password` and the ClickHouse
+password live in `templates/secret.yaml`, never here), with three rewrites
+below: `cluster`, `clickhouse.server`, and `auth_user` when
+`pulsusdb.auth.user` is set. Mounted
 read-only at `/etc/pulsusdb/config.yaml`; every serving Deployment passes
 `--config /etc/pulsusdb/config.yaml --mode <mode>` (`mode` is not a key in
 this document — it is a per-Deployment `--mode` flag, docs/configuration.md
@@ -20,7 +22,7 @@ process by the CLI flag, which wins over the YAML file).
 {{- $clusterName = .Values.pulsusdb.config.cluster }}
 {{- end }}
 {{- $_ := set $cfg "cluster" (ternary $clusterName nil (ne $clusterName "")) }}
-{{- $_ := set $cfg.clickhouse "server" (include "pulsusdb.clickhouseServer" . | trim) }}
+{{- $_ := set $cfg.clickhouse "server" (include "pulsusdb.clickhouseServer" .) }}
 {{- if .Values.pulsusdb.auth.user }}
 {{- $_ := set $cfg "auth_user" .Values.pulsusdb.auth.user }}
 {{- end }}

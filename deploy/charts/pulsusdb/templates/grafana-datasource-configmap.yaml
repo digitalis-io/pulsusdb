@@ -21,7 +21,7 @@ data:
     apiVersion: 1
     datasources:
       - name: PulsusDB (Loki compat)
-        uid: {{ include "pulsusdb.fullname" . }}-loki
+        uid: {{ printf "%s-loki" (regexReplaceAll "-+$" (include "pulsusdb.fullname" . | trunc 35) "") }}
         type: loki
         access: proxy
         url: http://{{ include "pulsusdb.queryServiceName" . }}:{{ .Values.service.port }}
