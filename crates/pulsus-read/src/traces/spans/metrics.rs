@@ -620,8 +620,13 @@ fn key_text(field: &Field, ctx: &PredicateCtx<'_>, joins: &mut Joins) -> Result<
         Field::Attribute { scope, key } => {
             let missing = if well_known(*scope, key) { 'N' } else { 'n' };
             match scope {
+                // The span row's string, else the resource row's label
+                // (issue #493).
                 AttrScope::Resource if key == "service.name" => {
-                    "if(service_type = 'string', (toString(service), 's'), ('', 'N'))".to_string()
+                    let (present, label) = resource_label_in(key, ctx)?;
+                    format!(
+                        "if(service_type = 'string', (toString(service), 's'), if({present}, {label}, ('', 'N')))"
+                    )
                 }
                 AttrScope::Span => dynamic_key(&attr_path("attrs", key), missing),
                 // Issue #601 part 4c (D2): the label the lookup computes
@@ -635,10 +640,12 @@ fn key_text(field: &Field, ctx: &PredicateCtx<'_>, joins: &mut Joins) -> Result<
                 AttrScope::Link => dynamic_key(&first_element("links.attrs", key), missing),
                 AttrScope::Unscoped => {
                     let span = attr_path("attrs", key);
+                    let (present, label) = resource_label_in(key, ctx)?;
                     let resource_arm = if key == "service.name" {
-                        "service_type = 'string', (toString(service), 's')".to_string()
+                        format!(
+                            "service_type = 'string', (toString(service), 's'), {present}, {label}"
+                        )
                     } else {
-                        let (present, label) = resource_label_in(key, ctx)?;
                         format!("{present}, {label}")
                     };
                     format!(

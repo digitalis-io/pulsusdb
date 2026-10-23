@@ -15,7 +15,8 @@ use super::{
 use crate::logql::error::ReadError;
 use crate::traces::rows::CatalogValuesRow;
 use crate::traces::spans::tags::{
-    catalogue_buckets, catalogue_resource_values_sql, catalogue_values_sql, resource_edge_sql,
+    ARRAY_SERVICE_MARK, catalogue_buckets, catalogue_resource_values_sql, catalogue_values_sql,
+    resource_edge_sql,
 };
 
 impl TraceEngine {
@@ -33,10 +34,9 @@ impl TraceEngine {
     ) -> Result<Option<TagValues>, ReadError> {
         match scope {
             Some("span") => self.catalogue_tag_values(service, key, req).await,
-            Some("resource") if key != "service.name" => self
-                .catalogue_resource_values(service, key, req)
-                .await
-                .map(Some),
+            Some("resource") if key != "service.name" => {
+                self.catalogue_resource_values(service, key, req).await
+            }
             _ => Ok(None),
         }
     }
@@ -73,7 +73,16 @@ impl TraceEngine {
                 &edge_n,
             ));
         }
-        let sql = catalogue_values_sql(service, key, lo, hi, &edges, TAG_VALUES_MAX + 1);
+        let sql = catalogue_values_sql(
+            service,
+            key,
+            lo,
+            hi,
+            &edges,
+            TAG_VALUES_MAX + 1,
+            &self.config.resources_table,
+            &req.window().resources_day_clause(),
+        );
         let n = TagNarrowing::default();
         let mut stream = self
             .dispatch
@@ -109,12 +118,16 @@ impl TraceEngine {
     /// used in its whole 5-minute buckets from `service_bucket_resources`,
     /// and in its partial first and last bucket from `spans`, in one
     /// statement with no cut.
+    ///
+    /// `None` where a resource in the window's days holds `service.name` as
+    /// a string array containing `service` (issue #493): the catalogue keys
+    /// a string `service` only, so the caller runs today's statement.
     pub(super) async fn catalogue_resource_values(
         &self,
         service: &str,
         key: &str,
         req: TagValuesRequest<'_>,
-    ) -> Result<TagValues, ReadError> {
+    ) -> Result<Option<TagValues>, ReadError> {
         let (lo, hi, buckets) = catalogue_buckets(req.start_ns, req.end_ns);
         let mut edges = Vec::new();
         for (s, e) in buckets {
@@ -142,11 +155,20 @@ impl TraceEngine {
             &self.config.resources_table,
             &req.window().resources_day_clause(),
         );
-        self.stream_tag_values(
-            &sql,
-            &tag_store_settings(&self.config),
-            &TagNarrowing::default(),
-        )
-        .await
+        let values = self
+            .stream_tag_values(
+                &sql,
+                &tag_store_settings(&self.config),
+                &TagNarrowing::default(),
+            )
+            .await?;
+        if values
+            .values
+            .first()
+            .is_some_and(|v| v.val_type == ARRAY_SERVICE_MARK)
+        {
+            return Ok(None);
+        }
+        Ok(Some(values))
     }
 }
