@@ -253,8 +253,8 @@ trace 1 (…1111)                                   trace 2 (…2222)   trace 3 
 ```
 
 Answers from both stores (`measure/fixture/fixture_answers.py`,
-`results/fixture-answers.tsv`). Nineteen of the twenty query cases are
-byte-identical; the two marked differ, and both are the correct answer:
+`results/fixture-answers.tsv`, measured before issue #493 moved F19 to the
+reference's answer). The one marked differs, and it is the correct answer:
 
 | # | query | the answer (span ids) | the reference |
 |---|---|---|---|
@@ -276,7 +276,7 @@ byte-identical; the two marked differ, and both are the correct answer:
 | F16 | `{ traceDuration > 1s }` | `…0008, …0009` | same |
 | F17 | `{ .app.user.id = "u-1" }` (unscoped) | `…0001` | same |
 | F18 | `{ resource.k8s.pod.name = "payment-a" }` | `…0005, …0006` | same |
-| F19 | `{ span.http.response.status_code != 200 }` | **eight spans**: the seven lacking the key, plus `…0006` | **`…0001` only** |
+| F19 | `{ span.http.response.status_code != 200 }` | `…0001` — the int 500; not the string `"200"` of `…0006`, nor a span lacking the key | same |
 | F20 | `{ kind = consumer }` | `…0008` | same |
 | F21 | `{} \| count_over_time()` over the window | **9** | **11** |
 | B1 | a span whose timestamp is exactly `start` | returned (**1**) | start is inclusive |
@@ -289,12 +289,6 @@ byte-identical; the two marked differ, and both are the correct answer:
   sorting key) and every read carries `final = 1`. At corpus scale: the
   reference counts 113,201 `checkout` spans against the corpus's 112,701, and
   the 40 retried bodies hold exactly 500 `checkout` spans.
-- **F19, `!=` on an attribute.** PulsusDB's rule (`docs/api.md` §4.2) is that
-  `!=` also matches a span lacking the key; the reference requires the key. On
-  g1: 29,253 spans carry the key with a value other than 200 and 1,708,628 lack
-  it; this design answers their sum, 1,737,881, and the reference answers
-  29,531 — 29,253 plus its own retried copies.
-
 ### 6.2 Answers must equal the corpus, not the other store
 
 `measure/agreement.py` counts, for eighteen filters, what each store reports;
@@ -428,7 +422,7 @@ Two things fall out of it, and neither is visible from an agreement count:
   `docs/TraceQL/query-catalogue.md` with the reason, rather than counted as
   passing.
 
-Four of the fixture's seven traces exist for the same purpose: a chain
+Five of the fixture's eight traces exist for the same purpose: a chain
 alternating the two sides of a structural operator, a sibling pair under a
 parent of neither side, a descendant three links below its nearest matching
 ancestor, a span whose parent is not stored, a two-span cycle, a resource
@@ -588,7 +582,7 @@ answer; `measure/sql/<file>.sql` is the statement it must compile to.
 
 | case | query (on the fixture of §6.1) | expected | statement |
 |---|---|---|---|
-| `T-A1` | `{ span.http.response.status_code != 200 }` | 8 spans: the seven lacking the key plus `…0006` | every typed read wrapped in `coalesce(…, false)`; without it the answer is 0 rows |
+| `T-A1` | `{ span.http.response.status_code != 200 }` | `…0001` | every typed read wrapped in `coalesce(…, false)` |
 | `T-A2` | `{ span.http.response.status_code >= 500 }`, `{ … = "200" }`, `{ … = 200 }` | `…0001`; `…0006`; none | `s04` |
 | `T-A3` | a span with `a.b = 1` and another with a nested `a: {b: 1}`; `{ span.a.b = 1 }` | only the dotted one | path escaping |
 | `T-A4` | an attribute literally named `a%2Eb` | stored path `a%252Eb`; the key read back is `a%2Eb` | the `%`-first escape |

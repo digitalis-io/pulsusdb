@@ -306,7 +306,7 @@ fn env_attr(t: usize) -> Option<&'static str> {
     match t % 5 {
         0 | 1 => Some("prod"),
         2 | 3 => Some("staging"),
-        _ => None, // the matches-missing-key negation class
+        _ => None, // no `env`: neither `=` nor `!=` matches (issue #493)
     }
 }
 fn region_attr(t: usize) -> &'static str {
@@ -382,9 +382,9 @@ fn construction_matches(t: usize) -> BTreeSet<&'static str> {
     tag("attr_regex", t % 5 != 4);
     tag("neg_attr_key_on_all", t % 2 == 1); // region != "eu" -> us
     tag("neg_regex_key_on_all", t.is_multiple_of(2)); // region !~ "u.*" -> eu
-    // Our documented negation rule (docs/api.md §4.2): `!=` matches
-    // spans lacking the key entirely as well as differing values.
-    tag("neg_attr_missing_key", t % 5 >= 2);
+    // `docs/api.md` §4.2 (issue #493): `!=` matches a value that differs,
+    // never a span lacking the key (`t % 5 == 4` carries no `env`).
+    tag("neg_attr_missing_key", (2..=3).contains(&(t % 5)));
     tag("name_eq", t % 4 == 1);
     tag("status_error", is_error(t));
     tag("kind_consumer", t % 2 == 1);
@@ -707,14 +707,13 @@ pub fn naive_matches(case_id: &str, t: &GeneratedTrace, run_id: &str) -> bool {
         // `region != "eu"` — every span carries `region`.
         "neg_attr_key_on_all" => spans().any(|s| res_str(s, "region") != Some("eu")),
         // `region !~ "u.*"` (anchored): matches when the value does NOT
-        // match — i.e. region == "eu" (or, per our documented rule, a
-        // span lacking the key — none exist for `region`).
+        // match — i.e. region == "eu"; every span carries `region`.
         "neg_regex_key_on_all" => {
             spans().any(|s| !res_str(s, "region").is_some_and(|v| v.starts_with('u')))
         }
-        // `env != "prod"` under our documented rule: spans lacking the
-        // key entirely match, as do differing values.
-        "neg_attr_missing_key" => spans().any(|s| res_str(s, "env") != Some("prod")),
+        // `env != "prod"` (`docs/api.md` §4.2): a differing value matches,
+        // a span lacking the key does not.
+        "neg_attr_missing_key" => spans().any(|s| res_str(s, "env").is_some_and(|v| v != "prod")),
         "name_eq" => spans().any(|s| s.name == "charge-card"),
         // Issue #193: by()/coalesce() do not change the matched trace set.
         "by_name" | "by_name_coalesce" => spans().any(|s| s.name == "charge-card"),

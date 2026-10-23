@@ -38,9 +38,9 @@ use pulsus_traceql::{
 
 use super::numbering::projected_sql;
 use super::predicate::{
-    CHAIN, HELD, PredicateCtx, SERVICE_IS_STRING, SERVICE_VALUE, attr_path, chain_presence_in,
-    compile_span_predicate_in, element_index_in, element_select_in, last_element_index_in,
-    resource_value_in, scope_value,
+    CHAIN, HELD, PredicateCtx, attr_path, chain_presence_in, compile_span_predicate_in,
+    element_index_in, element_select_in, last_element_index_in, resource_value_in, scope_value,
+    service_value,
 };
 use super::rows::SearchProjected;
 use crate::logql::error::ReadError;
@@ -261,13 +261,24 @@ impl Projection {
     /// the span holds it; nothing for the fields the envelope carries
     /// (`duration`, `span:id`, `trace:id`); any other intrinsic refused.
     fn select(&mut self, field: &Field, ctx: &PredicateCtx<'_>) -> Result<(), PlanError> {
-        if let Place::Column(sql) = place_of(field) {
-            return self.add(
-                field,
-                column(sql),
-                &FieldExpr::Literal(Value::Bool(true)),
-                ctx,
-            );
+        match place_of(field) {
+            Place::Column(sql) => {
+                return self.add(
+                    field,
+                    column(sql),
+                    &FieldExpr::Literal(Value::Bool(true)),
+                    ctx,
+                );
+            }
+            Place::Service => {
+                return self.add(
+                    field,
+                    service_projects(ctx)?,
+                    &FieldExpr::Literal(Value::Bool(true)),
+                    ctx,
+                );
+            }
+            _ => {}
         }
         match field {
             Field::Attribute { .. } => self.walk(
@@ -323,9 +334,17 @@ impl Projection {
             Projects::Value { value, kind } => (value, kind),
         };
         let mut gate = compile_span_predicate_in(gate, ctx)?.sql().to_string();
-        if matches!(field, Field::Attribute { scope: AttrScope::Resource, key } if key == "service.name")
-        {
-            gate = format!("({gate}) AND {SERVICE_IS_STRING}");
+        // `resource.service.name` projects under any condition, as a column
+        // does, but only where the span holds it (issue #493).
+        if matches!(place_of(field), Place::Service) {
+            let held = FieldExpr::Exists {
+                field: field.clone(),
+                negated: false,
+            };
+            gate = format!(
+                "({gate}) AND ({})",
+                compile_span_predicate_in(&held, ctx)?.sql()
+            );
         }
         let source = Source { gate, value, kind };
         if let Some(group) = self.groups.iter_mut().find(|g| g.field == *field) {
@@ -514,8 +533,9 @@ pub fn group_key_sql(
     let typed = |x: String| GroupKeySql {
         value: format!(
             "if(NOT (dynamicType({x}) {HELD}), '', if(startsWith(dynamicType({x}), 'Array'), \
-             toJSONString(arrayMap(x -> (toString(dynamicType(x)), toString(x)), \
-             CAST({x}, 'Array(Dynamic)'))), toString({x})))"
+             toJSONString(arrayMap(x -> (toString(dynamicType(x)), toString(x)), {})), \
+             toString({x})))",
+            typed_array_elements(&x)
         ),
         value_type: Some(format!(
             "if(dynamicType({x}) {HELD}, toString(dynamicType({x})), 'None')"
@@ -533,14 +553,6 @@ pub fn group_key_sql(
         values: Some(values),
     };
     Ok(match field {
-        Field::Attribute {
-            scope: AttrScope::Resource,
-            key,
-        } if key == "service.name" => Some(GroupKeySql {
-            value: "if(service_type = 'string', toString(service), '')".to_string(),
-            value_type: Some("if(service_type = 'string', 'String', 'None')".to_string()),
-            values: None,
-        }),
         Field::Attribute { scope, key } => Some(typed(scope_value(*scope, key, ctx)?)),
         Field::Intrinsic(Intrinsic::Duration) => Some(GroupKeySql {
             value: "toString(duration_ns)".to_string(),
@@ -623,6 +635,10 @@ fn single_field_of_comparison<'a>(lhs: &'a FieldExpr, rhs: &'a FieldExpr) -> Opt
 enum Place {
     /// A span-row column: the value's SQL.
     Column(&'static str),
+    /// `resource.service.name`: projected like a column, under any
+    /// condition, as the span row's string or else the resource row's value
+    /// (issue #493).
+    Service,
     /// A span or instrumentation attribute: its `JSON` root.
     Attribute(&'static str),
     /// The response envelope carries it (`duration`, `span:id`,
@@ -643,7 +659,7 @@ fn place_of(field: &Field) -> Place {
         Field::Attribute { scope, key } => match scope {
             AttrScope::Span => Place::Attribute("attrs"),
             AttrScope::Instrumentation => Place::Attribute("scope_attrs"),
-            AttrScope::Resource if key == "service.name" => Place::Column("toString(service)"),
+            AttrScope::Resource if key == "service.name" => Place::Service,
             AttrScope::Resource => Place::Resource,
             AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => Place::Set,
         },
@@ -706,12 +722,39 @@ fn stored_parts(e: &str) -> (String, String) {
     (
         format!(
             "if(NOT (dynamicType({e}) {HELD}), '', if(startsWith(dynamicType({e}), 'Array'), \
-             toJSONString(arrayMap(x -> (toString(dynamicType(x)), toString(x)), \
-             CAST({e}, 'Array(Dynamic)'))), {}))",
+             toJSONString(arrayMap(x -> (toString(dynamicType(x)), toString(x)), {})), {}))",
+            typed_array_elements(e),
             ceiling_sql(&format!("toString({e})"))
         ),
         format!("if(dynamicType({e}) {HELD}, toString(dynamicType({e})), 'None')"),
     )
+}
+
+/// The elements of `e`, a `Dynamic` value, as an `Array(Dynamic)`, each
+/// keeping its stored type: one typed read per array type, concatenated.
+/// A typed read of a value that is not that array is `[]`. Never
+/// `CAST(e, 'Array(Dynamic)')`, which the engine refuses for the whole
+/// block when the column also holds a scalar (code 53).
+fn typed_array_elements(e: &str) -> String {
+    let reads: Vec<String> = [
+        "Array(Nullable(String))",
+        "Array(Nullable(Int64))",
+        "Array(Nullable(Float64))",
+        "Array(Nullable(Bool))",
+    ]
+    .iter()
+    .map(|t| format!("CAST(dynamicElement({e}, '{t}'), 'Array(Dynamic)')"))
+    .collect();
+    format!("arrayConcat({})", reads.join(", "))
+}
+
+/// `resource.service.name`'s stored value: the span row's string, else the
+/// resource row's value (issue #493).
+fn service_projects(ctx: &PredicateCtx<'_>) -> Result<Projects, PlanError> {
+    Ok(stored(&service_value(&resource_value_in(
+        "service.name",
+        ctx,
+    )?)))
 }
 
 /// An attribute's stored value on the span row.
@@ -753,6 +796,7 @@ fn stored_value(field: &Field, ctx: &PredicateCtx<'_>, pick: Pick) -> Result<Pro
     Ok(match (place_of(field), field) {
         (Place::Attribute(root), Field::Attribute { key, .. }) => stored_attribute(root, key),
         (Place::Column(sql), _) => column(sql),
+        (Place::Service, _) => service_projects(ctx)?,
         (Place::Resource, Field::Attribute { key, .. }) => resource_stored(key, ctx)?,
         (Place::Set, _) => carrying(field, ctx, pick)?,
         (Place::Envelope | Place::Numbered(_), _)
@@ -765,7 +809,7 @@ fn stored_value(field: &Field, ctx: &PredicateCtx<'_>, pick: Pick) -> Result<Pro
 /// predicate refuses it.
 fn truthiness_value(field: &Field) -> Projects {
     match place_of(field) {
-        Place::Attribute(_) | Place::Resource => literal("true", "Bool"),
+        Place::Attribute(_) | Place::Resource | Place::Service => literal("true", "Bool"),
         Place::Set if matches!(field, Field::Attribute { .. }) => literal("true", "Bool"),
         Place::Column(sql) => column(sql),
         Place::Envelope | Place::Set | Place::Numbered(_) => Projects::Nothing,
@@ -835,6 +879,7 @@ fn comparison_value(
     }
     match place {
         Place::Column(sql) => return Ok(column(sql)),
+        Place::Service => return service_projects(ctx),
         Place::Envelope => return Ok(Projects::Nothing),
         // A one-field nested-set condition projects that field's number,
         // whatever else the condition holds (docs/api.md §4.2; measured
@@ -864,7 +909,7 @@ fn comparison_value(
         }
         Place::Attribute(_) | Place::Resource | Place::Set => {}
     }
-    if op == ComparisonOp::Eq {
+    if op == ComparisonOp::Eq && matches!(field, Field::Intrinsic(_)) {
         match literal_side(field, lhs, rhs) {
             Some(Value::String(s)) => {
                 let text = match field {
@@ -1094,13 +1139,7 @@ fn chain_value(
         let projects = match scope {
             AttrScope::Span => stored_attribute("attrs", key),
             AttrScope::Instrumentation => stored_attribute("scope_attrs", key),
-            AttrScope::Resource if key == "service.name" => Projects::Value {
-                value: format!(
-                    "if(service_type = 'string', {}, '')",
-                    ceiling_sql("toString(service)")
-                ),
-                kind: "if(service_type = 'string', 'String', 'None')".to_string(),
-            },
+            AttrScope::Resource if key == "service.name" => service_projects(ctx)?,
             AttrScope::Resource => resource_stored(key, ctx)?,
             AttrScope::Event | AttrScope::Link => element(&Field::Attribute {
                 scope,
@@ -1198,7 +1237,9 @@ pub(crate) fn aggregate_argument_sql(
         Field::Attribute {
             scope: AttrScope::Resource,
             key,
-        } if key == "service.name" => Ok(Some(stored_parts(SERVICE_VALUE))),
+        } if key == "service.name" => Ok(Some(stored_parts(&service_value(&resource_value_in(
+            key, ctx,
+        )?)))),
         Field::Attribute { .. } => match stored_value(field, ctx, Pick::First)? {
             Projects::Value { value, kind } => Ok(Some((value, kind))),
             Projects::Nothing => Ok(None),

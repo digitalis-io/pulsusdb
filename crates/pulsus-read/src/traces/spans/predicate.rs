@@ -29,20 +29,19 @@
 //! with no wildcard, so a new `Intrinsic` or `AttrScope` variant fails to
 //! compile here rather than falling into the wrong one.
 //!
-//! **Four rules worth reading before the code.**
+//! **Five rules worth reading before the code.**
 //!
 //! * A typed `JSON` subcolumn read is `Nullable`: ``attrs.`k`.:Int64`` is
 //!   `Nullable(Int64)` for every row, and the value is `NULL` when the key
 //!   is absent **or** stored at another type. So the typed read is
-//!   coalesced and the negation is applied to the coalesced result —
-//!   `NOT (coalesce(… = v, false) OR …)`. Without the `coalesce`,
-//!   `false OR NULL` is `NULL`, `NOT NULL` is `NULL`, and a `WHERE` drops
-//!   the row: measured on the worked fixture, that rendering answers
-//!   nothing at all. With the negation pushed *inside* the arms it answers
-//!   one row instead of eight. `!=` matching a span lacking the key is
-//!   this product's documented semantics (`docs/api.md` §4.2) and a
-//!   deliberate divergence recorded at
-//!   `docs/TraceQL/functional-requirements.md`.
+//!   coalesced: `coalesce(… != v, false) OR …`. Without the `coalesce`,
+//!   `false OR NULL` is `NULL` and a `WHERE` drops the row.
+//! * **A literal comparison holds on a value of the literal's type**
+//!   (`docs/api.md` §4.2, issue #493): every operator, `!=` and `!~`
+//!   included, holds when the value is held at that type, as a scalar or
+//!   as an array of it, and some element satisfies it. So
+//!   `{ span.k != 1 }` matches `[1, 2]` and not `[1, 1]`, a string, or a
+//!   span lacking `k`.
 //! * **No intrinsic read is coalesced.** Every intrinsic column in
 //!   `schema/schema.sql` is non-nullable, so there is no `NULL` to absorb
 //!   and a `coalesce` there would be noise that reads as a rule.
@@ -52,17 +51,11 @@
 //!   `9223372036854776000`, which ClickHouse types `UInt64`. An integer
 //!   literal is exact from −2^127 to 2^128 − 1 and refused outside it.
 //!   [`render_number`] and [`fold`] are where that is decided.
-//! * **A resource negation is `NOT` outside the subquery, never inside
-//!   it.** `NOT (R(p))` and `R(NOT p)` disagree for a span whose resource
-//!   row is not visible; outside keeps `{ resource.k != v }` the exact
-//!   complement of `{ resource.k = v }`.
-//! * **An event or link negation is `NOT` outside `arrayExists`, never
-//!   inside the lambda.** `{ event.k != v }` matches a span only when no
-//!   element is `v` — a span lacking the key or carrying no elements
-//!   included — which is the 2026-09-18 decision
-//!   (`docs/benchmarks/traces-differential-ledger.md`,
-//!   `traceql-event-link-operand-any-match`). Inside, it would match a span
-//!   with any element that differs.
+//! * **A resource, event or link `!=` is inside the subquery or the
+//!   lambda, never `NOT` outside it.** `{ resource.k != v }` is `R(k != v)`
+//!   and `{ event.k != v }` matches a span with any element that differs;
+//!   a span whose resource row is not visible, or with no element holding
+//!   the key, matches neither `=` nor `!=` (issue #493).
 
 use std::fmt::Write as _;
 
@@ -343,11 +336,12 @@ pub(super) fn scope_value(
     ctx: &PredicateCtx<'_>,
 ) -> Result<String, PlanError> {
     let resource = |key: &str| -> Result<String, PlanError> {
-        if key == SERVICE_NAME {
-            Ok(SERVICE_VALUE.to_string())
+        let value = resource_value_in(key, ctx)?;
+        Ok(if key == SERVICE_NAME {
+            service_value(&value)
         } else {
-            resource_value_in(key, ctx)
-        }
+            value
+        })
     };
     Ok(match scope {
         AttrScope::Span => attr_path(ATTRS, key),
@@ -541,12 +535,33 @@ const SERVICE_NAME: &str = "service.name";
 /// `service.name` is held at (issue #602 part 1, D2).
 pub(crate) const SERVICE_IS_STRING: &str = "service_type = 'string'";
 
-/// `service.name` as a `Dynamic`: the span row's copy, held only when
-/// stored as a string (D2). The inner `CAST` is required: `toString` of a
-/// `LowCardinality` column stays `LowCardinality`, which the outer one
-/// refuses.
-pub(crate) const SERVICE_VALUE: &str =
-    "if(service_type = 'string', CAST(CAST(service, 'String'), 'Dynamic'), CAST(NULL, 'Dynamic'))";
+/// `service.name` as a `Dynamic` (issue #493): the span row's copy when it
+/// was stored as a string, else `resource`, the resource row's value, which
+/// the writer keeps for every other type. The inner `CAST` is required:
+/// `toString` of a `LowCardinality` column stays `LowCardinality`, which
+/// the outer one refuses.
+pub(crate) fn service_value(resource: &str) -> String {
+    format!("if({SERVICE_IS_STRING}, CAST(CAST(service, 'String'), 'Dynamic'), {resource})")
+}
+
+/// `resource.service.name`'s rendering (issue #493): `string` where the
+/// span row holds it as a string, `other` — the resource row's, as for any
+/// resource key — everywhere else. Each half is a disjunct of its own, so
+/// a string equality keeps the bloom filter on `service` and the other half
+/// the one on `resource_id`.
+fn service_split(string: &str, other: &str) -> String {
+    format!("(({SERVICE_IS_STRING} AND {string}) OR (NOT {SERVICE_IS_STRING} AND {other}))")
+}
+
+/// A presence test at `key`, widened at `service.name` to a span row
+/// holding it as a string (issue #493).
+fn service_or(key: &str, presence: String) -> String {
+    if key == SERVICE_NAME {
+        format!("({SERVICE_IS_STRING} OR {presence})")
+    } else {
+        presence
+    }
+}
 
 /// The stored types a value is held at, as the reference types one (issue
 /// #602 part 1, D5): every presence test of the new path is
@@ -849,9 +864,14 @@ impl<'a> Compiler<'a> {
                 e => Ok(format!("NOT ({})", self.render_expr(e)?)),
             },
             // `{ span.k }` is TRUTHINESS, not presence: the reference matches
-            // a span only where the value IS `true`, so this is plain
-            // equality against the boolean literal and inherits the leaf's
-            // rendering.
+            // a span only where the value IS the boolean `true`
+            // (`pkg/traceql/ast.go:465`), so an attribute reads its
+            // scalar `Bool` alone — `!`'s match half with `want = true` and no
+            // demand — and never a boolean array, which `= true` reads
+            // element by element (issue #493).
+            FieldExpr::Field(Field::Attribute { scope, key }) => {
+                Ok(self.not_parts(*scope, key, Some(true), false)?.0)
+            }
             FieldExpr::Field(field) => self.leaf(field, ComparisonOp::Eq, &Value::Bool(true)),
             // `{ true }` is exactly `{ }` and `{ false }` matches nothing. A
             // non-boolean static never reaches here from the wire —
@@ -915,19 +935,20 @@ impl<'a> Compiler<'a> {
             AttrScope::Instrumentation => not_attr(SCOPE_ATTRS, key, want),
             AttrScope::Event => not_element(EVENT_ATTRS, key, want, all),
             AttrScope::Link => not_element(LINK_ATTRS, key, want, all),
-            // Held only as a string (D2), and a string is never a boolean:
-            // nothing matches, and only a string demands.
-            AttrScope::Resource if key == SERVICE_NAME => {
-                self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
-                ("false".to_string(), SERVICE_IS_STRING.to_string())
-            }
             AttrScope::Resource => {
                 let (matches, condition) = not_attr(ATTRS, key, want);
                 let matches = match want {
                     Some(_) => self.resource_subquery(&matches)?,
                     None => matches,
                 };
-                (matches, self.resource_subquery(&condition)?)
+                let condition = self.resource_subquery(&condition)?;
+                // `service.name` as a string is never a boolean: it matches
+                // nothing and demands (issue #493).
+                if key == SERVICE_NAME {
+                    (service_split("false", &matches), service_or(key, condition))
+                } else {
+                    (matches, condition)
+                }
             }
             AttrScope::Unscoped => self.not_chain(key, want, all)?,
         })
@@ -1007,22 +1028,18 @@ impl<'a> Compiler<'a> {
                 negated,
                 self.head.leaf_function(),
             )),
-            // Presence reads the arm, never the text: `service` is `''` for
-            // an empty string and for no key alike. Only a string is held
-            // (D2).
-            AttrScope::Resource if key == SERVICE_NAME => {
-                self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
-                Ok(if negated {
-                    format!("NOT ({SERVICE_IS_STRING})")
-                } else {
-                    SERVICE_IS_STRING.to_string()
-                })
-            }
             // Absence is `NOT` outside the subquery, so a span whose
-            // resource row is not visible counts as lacking the key.
+            // resource row is not visible counts as lacking the key. At
+            // `service.name` a span row holding a string is present too
+            // (issue #493).
             AttrScope::Resource => {
-                let present = self
-                    .resource_subquery(&format!("dynamicType({}) {HELD}", attr_path(ATTRS, key)))?;
+                let present = service_or(
+                    key,
+                    self.resource_subquery(&format!(
+                        "dynamicType({}) {HELD}",
+                        attr_path(ATTRS, key)
+                    ))?,
+                );
                 Ok(if negated {
                     format!("NOT ({present})")
                 } else {
@@ -1122,8 +1139,7 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// `resource.k <op> v`: the span-scope rendering inside `R(…)`, with a
-    /// negated rendering's `NOT` moved outside it.
+    /// `resource.k <op> v`: the span-scope rendering inside `R(…)`.
     fn resource_leaf(
         &mut self,
         key: &str,
@@ -1131,18 +1147,23 @@ impl<'a> Compiler<'a> {
         value: &Value,
     ) -> Result<String, PlanError> {
         self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
-        if key == SERVICE_NAME {
-            return service_name_leaf(op, value);
-        }
-        let (negated, positive) = attr_leaf_parts(ATTRS, key, op, value)?;
-        let r = self.resource_subquery(&positive)?;
-        Ok(if negated { format!("NOT ({r})") } else { r })
+        // `service.name`'s refusals are the span row's, so they come first.
+        let string = if key == SERVICE_NAME {
+            Some(service_name_leaf(op, value)?)
+        } else {
+            None
+        };
+        let other = self.resource_leaf_other(key, op, value)?;
+        Ok(match string {
+            Some(string) => service_split(&string, &other),
+            None => other,
+        })
     }
 
     /// `.k <op> v`: the value is the first scope's in the chain that holds
     /// the key — `multiIf(P_span, X_span, …, P_instrumentation,
-    /// X_instrumentation, D)` — and a span lacking it everywhere matches
-    /// only a negated operator. A refusal is `span.k`'s.
+    /// X_instrumentation, false)` — and a span lacking it everywhere matches
+    /// nothing, `!=` included (issue #493). A refusal is `span.k`'s.
     fn unscoped_leaf(
         &mut self,
         key: &str,
@@ -1150,59 +1171,52 @@ impl<'a> Compiler<'a> {
         value: &Value,
     ) -> Result<String, PlanError> {
         self.ctx.ok_or_else(|| needs_window(AttrScope::Unscoped))?;
-        let (negated, _) = attr_leaf_parts(ATTRS, key, op, value)?;
+        // Refused where `span.k` would be.
+        attr_leaf(ATTRS, key, op, value)?;
         let mut args = Vec::with_capacity(2 * CHAIN.len());
         for scope in CHAIN {
             args.push(self.chain_presence(scope, key)?);
             args.push(if scope == AttrScope::Resource && key == SERVICE_NAME {
-                self.service_name_in_chain(op, value)?
+                let other = self.resource_leaf_other(key, op, value)?;
+                service_split(&self.service_name_in_chain(op, value)?, &other)
             } else {
                 self.scoped_leaf(scope, key, op, value)?
             });
         }
-        let default = if negated { "true" } else { "false" };
-        Ok(format!("multiIf({}, {default})", args.join(", ")))
+        Ok(format!("multiIf({}, false)", args.join(", ")))
     }
 
     /// `P_sc`: whether `scope` holds `key`, as the chain tests it.
-    ///
-    /// At `service.name` the resource scope is present only when the span
-    /// row holds a string (D2): the resource row's non-string copy is never
-    /// read.
     fn chain_presence(&mut self, scope: AttrScope, key: &str) -> Result<String, PlanError> {
-        if scope == AttrScope::Resource && key == SERVICE_NAME {
-            self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
-            return Ok(SERVICE_IS_STRING.to_string());
-        }
         self.scoped_exists(scope, key, false)
     }
 
-    /// `X_resource` at `service.name` in the chain: a string literal is
-    /// compared on the span row, gated on its arm; a non-string literal is
-    /// `false`, or `true` under a negation. The resource row is never read
-    /// (issue #602 part 1). A negation goes outside the gate.
+    /// `resource.k <op> v` read from the resource row alone: at
+    /// `service.name`, the half of [`service_split`] for a value stored as
+    /// anything but a string.
+    fn resource_leaf_other(
+        &mut self,
+        key: &str,
+        op: ComparisonOp,
+        value: &Value,
+    ) -> Result<String, PlanError> {
+        let leaf = attr_leaf(ATTRS, key, op, value)?;
+        self.resource_subquery(&leaf)
+    }
+
+    /// The span row's half of `X_resource` at `service.name` in the chain:
+    /// a string literal is compared on the span row, any other literal is
+    /// `false` (issue #476); [`service_split`] adds the resource row's half
+    /// (issue #493).
     fn service_name_in_chain(
         &mut self,
         op: ComparisonOp,
         value: &Value,
     ) -> Result<String, PlanError> {
-        let (negated, _) = attr_leaf_parts(ATTRS, SERVICE_NAME, op, value)?;
-        // Reached only where the span row holds a string (`chain_presence`):
-        // a string never equals a non-string literal, so `=` is false and
-        // `!=` true, as the chain's other scopes compare across types.
-        let Value::String(s) = value else {
-            return Ok(if negated { "true" } else { "false" }.to_string());
-        };
-        let g = match positive_op(op).1 {
-            ComparisonOp::Re => format!("match(service, {})", anchored_regex_sql(s)?),
-            other => format!(
-                "service {} {}",
-                sql_op(other).expect("the six non-regex operators"),
-                escape::ch_string(s)
-            ),
-        };
-        let x = format!("({SERVICE_IS_STRING} AND {g})");
-        Ok(if negated { format!("NOT {x}") } else { x })
+        // Refused where `span.service.name` would be; the span row's half
+        // is `resource.service.name`'s own.
+        attr_leaf(ATTRS, SERVICE_NAME, op, value)?;
+        service_name_leaf(op, value)
     }
 
     /// `L op R`, in the order of the part-3c design's section 5.1: the
@@ -1659,20 +1673,9 @@ impl<'a> Compiler<'a> {
                     ..Arms::default()
                 }
             }
-            // Held only as a string (D2), which is never a boolean: no
-            // boolean arm, and only a string demands.
-            AttrScope::Resource if key == SERVICE_NAME => {
-                self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
-                self.note_presence(Some(SERVICE_IS_STRING.to_string()));
-                Arms {
-                    b: Some("CAST(NULL, 'Nullable(UInt8)')".to_string()),
-                    nullable: true,
-                    ..Arms::default()
-                }
-            }
             AttrScope::Resource => {
                 let q = self.resource_read(key)?;
-                self.note_presence(Some(format!("dynamicType({var}) {HELD}")));
+                self.note_presence(Some(service_or(key, format!("dynamicType({var}) {HELD}"))));
                 Arms {
                     b: Some(format!("(NOT dynamicElement({var}, 'Bool'))")),
                     nullable: true,
@@ -1812,21 +1815,11 @@ impl<'a> Compiler<'a> {
                         )));
                         Ok(attribute(root, key))
                     }
-                    // `resource.service.name` is held only as a string
-                    // (D2), so it has no numeric arm.
-                    AttrScope::Resource if key == SERVICE_NAME => {
-                        self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
-                        self.note_presence(Some(SERVICE_IS_STRING.to_string()));
-                        Ok(Some(Tuple {
-                            text: format!("tuple({NULL_INT}, {NULL_FLOAT})"),
-                            dur: false,
-                        }))
-                    }
                     AttrScope::Resource => {
                         let q = self.resource_read(key)?;
-                        self.note_presence(Some(format!(
-                            "dynamicType({}) {HELD}",
-                            resource_value(&q)
+                        self.note_presence(Some(service_or(
+                            key,
+                            format!("dynamicType({}) {HELD}", resource_value(&q)),
                         )));
                         Ok(Some(Tuple {
                             text: format!(
@@ -1942,15 +1935,18 @@ impl<'a> Compiler<'a> {
                 return match scope {
                     AttrScope::Span => Ok(Arms::attribute(ATTRS, key)),
                     AttrScope::Instrumentation => Ok(Arms::attribute(SCOPE_ATTRS, key)),
-                    // Held only as a string (D2): the string arm from the
-                    // span row, and no other arm.
+                    // The string arm reads the span row when it holds the
+                    // value as a string; every arm reads the resource row
+                    // otherwise (issue #493).
                     AttrScope::Resource if key == SERVICE_NAME => {
-                        self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
+                        let q = self.resource_read(key)?;
+                        let arms = Arms::resource(&var, &q);
                         Ok(Arms {
-                            s: Some(format!("if({SERVICE_IS_STRING}, service, NULL)")),
+                            s: Some(format!(
+                                "if({SERVICE_IS_STRING}, CAST(service, 'String'), dynamicElement({var}, 'String'))"
+                            )),
                             s_on_span_row: true,
-                            nullable: true,
-                            ..Arms::default()
+                            ..arms
                         })
                     }
                     AttrScope::Resource => {
@@ -2175,24 +2171,20 @@ impl<'a> Compiler<'a> {
     ) -> Result<SetOperand, PlanError> {
         self.ctx.ok_or_else(|| needs_window(AttrScope::Unscoped))?;
         let r = resource_var.to_string();
-        // `service.name` is read from the span row alone (D2): no resource
-        // lookup is built or bound for it.
-        let binds = if key == SERVICE_NAME {
-            Vec::new()
-        } else {
-            vec![(r.clone(), resource_value(&self.resource_read(key)?))]
-        };
+        let binds = vec![(r.clone(), resource_value(&self.resource_read(key)?))];
         let (span, events, links, scope) = (
             attr_path(ATTRS, key),
             attr_path(EVENT_ATTRS, key),
             attr_path(LINK_ATTRS, key),
             attr_path(SCOPE_ATTRS, key),
         );
+        // At `service.name`, the span row's string, else the resource
+        // row's value (issue #493).
         let (resource_present, resource_values, resource_tags) = if key == SERVICE_NAME {
             (
-                SERVICE_IS_STRING.to_string(),
-                "[CAST(CAST(service, 'String'), 'Dynamic')]".to_string(),
-                format!("[if({SERVICE_IS_STRING}, 2, 9)]"),
+                format!("({SERVICE_IS_STRING} OR dynamicType({r}) {HELD})"),
+                format!("[{}]", service_value(&r)),
+                "[2]".to_string(),
             )
         } else {
             (
@@ -2283,32 +2275,24 @@ fn not_element(root: &str, key: &str, want: Option<bool>, all: bool) -> (String,
 /// `resource.service.name`, read from the span row: `service` holds the
 /// value as text and `service_type` the arm it arrived as.
 ///
-/// Every string and regex comparison is gated on the value having been
+/// The caller, [`service_split`], gates it on the value having been
 /// stored as a string, because `service` cannot tell `""` from no key, or
-/// the integer `12345` from the string `"12345"`, and typed comparisons do
-/// not cross types. A negation goes outside the gate. The refusals and the
-/// non-string fold are [`untyped_string_leaf`]'s, unchanged.
+/// the integer `12345` from the string `"12345"`. Under that gate the
+/// value is present, so `!=` and `!~` there are any differing value's, as
+/// at every attribute (issue #493).
 fn service_name_leaf(op: ComparisonOp, value: &Value) -> Result<String, PlanError> {
-    const NAME: &str = "resource.service.name";
-    let (Value::String(_), Some((negated, positive_op))) = (
-        value,
-        match op {
-            ComparisonOp::Eq => Some((false, ComparisonOp::Eq)),
-            ComparisonOp::Neq => Some((true, ComparisonOp::Eq)),
-            ComparisonOp::Re => Some((false, ComparisonOp::Re)),
-            ComparisonOp::Nre => Some((true, ComparisonOp::Re)),
-            ComparisonOp::Gt | ComparisonOp::Gte | ComparisonOp::Lt | ComparisonOp::Lte => None,
-        },
-    ) else {
-        return untyped_string_leaf(NAME, "service", op, value);
-    };
-    let positive = untyped_string_leaf(NAME, "service", positive_op, value)?;
-    let gated = format!("({SERVICE_IS_STRING} AND {positive})");
-    Ok(if negated {
-        format!("NOT {gated}")
-    } else {
-        gated
-    })
+    match value {
+        // Issue #493: every operator, as any attribute's string arm;
+        // [`service_split`] gates it on the span row holding a string.
+        Value::String(s) => string_column_text("service", op, s),
+        // A span-row string against a literal of another type matches no
+        // operator, `!=` included, as issue #476 measured the reference;
+        // the resource row's half answers for a value of that type.
+        _ if sql_op(op).is_some() => Ok("false".to_string()),
+        _ => Err(PlanError::TypeMismatch(
+            "resource.service.name requires a string value".to_string(),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -3001,8 +2985,7 @@ fn scalar_presence(field: &Field, var: &str) -> Option<String> {
                 "dynamicType({}) {HELD}",
                 attr_path(SCOPE_ATTRS, key)
             )),
-            AttrScope::Resource if key == SERVICE_NAME => Some(SERVICE_IS_STRING.to_string()),
-            AttrScope::Resource => Some(format!("dynamicType({var}) {HELD}")),
+            AttrScope::Resource => Some(service_or(key, format!("dynamicType({var}) {HELD}"))),
             AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => None,
         },
         Field::Intrinsic(intrinsic) => {
@@ -3591,9 +3574,9 @@ fn literal_arms(value: &Value) -> Result<Arms, PlanError> {
 /// not an `Array(Nullable(String))` — measured on the worked fixture, each
 /// arm alone answers one of the two rows and neither answers both.
 ///
-/// `=~`, `!~` and the four ordered operators read `:String` only: the
-/// design names `= "v"` and nothing else, and an ordered comparison
-/// against array elements has no stated meaning.
+/// Every other operator and literal type reads its array subcolumns too
+/// (issue #493): any element of the literal's type, the reference's array
+/// rule (`pkg/traceql/ast_execute.go:534-627` at the pinned tag).
 fn string_eq(string: &str, string_array: &str, literal: &str) -> String {
     let lit = escape::ch_string(literal);
     format!("(coalesce({string} = {lit}, false) OR has({string_array}, {lit}))")
@@ -3605,9 +3588,31 @@ fn string_eq(string: &str, string_array: &str, literal: &str) -> String {
 /// on all 48 of its coalesced numeric lines; the measurement script
 /// disagrees with itself about it, so the catalogue is the authority and
 /// the order is fixed once here.
-fn numeric_pair(int: &str, float: &str, op: ComparisonOp, number: &str) -> String {
+fn numeric_pair(read: &mut dyn FnMut(Read) -> String, op: ComparisonOp, number: &str) -> String {
     let sym = sql_op(op).expect("the caller has already excluded the regex operators");
-    format!("(coalesce({int} {sym} {number}, false) OR coalesce({float} {sym} {number}, false))")
+    let (int, float) = (read(Read::Int), read(Read::Float));
+    let (ia, fa) = (read(Read::IntArray), read(Read::FloatArray));
+    // `has` cannot take a 256-bit literal against a `Float64` array (no
+    // common type), so such a literal compares element by element.
+    let arrays = if op == ComparisonOp::Eq && !number.starts_with("toInt256") {
+        format!("has({ia}, {number}) OR has({fa}, {number})")
+    } else {
+        format!(
+            "{} OR {}",
+            array_member(&ia, &format!("ae {sym} {number}")),
+            array_member(&fa, &format!("ae {sym} {number}"))
+        )
+    };
+    format!(
+        "(coalesce({int} {sym} {number}, false) OR coalesce({float} {sym} {number}, false) OR {arrays})"
+    )
+}
+
+/// Whether any element `ae` of `array` satisfies `test`, a `NULL` element
+/// failing it. `ae` is bound nowhere else, so the term nests inside any
+/// other lambda.
+fn array_member(array: &str, test: &str) -> String {
+    format!("arrayExists(ae -> coalesce({test}, false), {array})")
 }
 
 /// `N` — the numeric literal's SQL text. **Integer first**: a `Number` of
@@ -3634,33 +3639,15 @@ fn duration_nanos(d: Duration) -> String {
     d.as_nanos().to_string()
 }
 
-/// One attribute comparison at `root`: `NOT ` + the positive rendering when
-/// `negated`, the positive rendering alone otherwise.
+/// One attribute comparison at `root`, read from the row's typed paths.
 fn attr_leaf(root: &str, key: &str, op: ComparisonOp, value: &Value) -> Result<String, PlanError> {
-    let (negated, positive) = attr_leaf_parts(root, key, op, value)?;
-    Ok(if negated {
-        format!("NOT {positive}")
-    } else {
-        positive
-    })
-}
-
-/// An attribute comparison's polarity and its positive rendering, kept
-/// apart so a resource leaf can put the negation outside its subquery.
-/// Negated: `!=` on a string, number, duration or boolean, and `!~`.
-fn attr_leaf_parts(
-    root: &str,
-    key: &str,
-    op: ComparisonOp,
-    value: &Value,
-) -> Result<(bool, String), PlanError> {
     let path = attr_path(root, key);
     leaf_parts(&mut |r| format!("{path}{}", r.suffix()), key, op, value)
 }
 
-/// `event.k` / `link.k`: any element passes the positive rendering, with
-/// each typed read a lambda variable over that read's array. A negation
-/// is `NOT` outside `arrayExists`.
+/// `event.k` / `link.k`: any element passes the rendering, `!=` and `!~`
+/// included (issue #493), with each typed read a lambda variable over that
+/// read's array.
 fn element_leaf(
     root: &str,
     key: &str,
@@ -3669,7 +3656,7 @@ fn element_leaf(
     head: &str,
 ) -> Result<String, PlanError> {
     let mut used: Vec<Read> = Vec::new();
-    let (negated, body) = {
+    let body = {
         let mut reader = |r: Read| {
             if !used.contains(&r) {
                 used.push(r);
@@ -3689,102 +3676,83 @@ fn element_leaf(
         .iter()
         .map(|r| format!("{path}{}", r.suffix()))
         .collect();
-    let positive = format!("{head}({args} -> {body}, {})", arrays.join(", "));
-    Ok(if negated {
-        format!("NOT {positive}")
+    // A body that reads no element is a constant (a keyword against the
+    // attribute, issue #493): it is the condition itself.
+    Ok(if used.is_empty() {
+        body
     } else {
-        positive
+        format!("{head}({args} -> {body}, {})", arrays.join(", "))
     })
 }
 
 /// The one attribute-comparison rule, over a reader that renders each
-/// typed read: a span-row path for [`attr_leaf_parts`], a lambda variable
+/// typed read: a span-row path for [`attr_leaf`], a lambda variable
 /// for [`element_leaf`]. `key` names the attribute in the refusal.
 fn leaf_parts(
     read: &mut dyn FnMut(Read) -> String,
     key: &str,
     op: ComparisonOp,
     value: &Value,
-) -> Result<(bool, String), PlanError> {
+) -> Result<String, PlanError> {
+    // Issue #493 (owner decision, 2026-10-23): every operator, `!=` and `!~`
+    // included, holds when the value is held at the literal's type — a
+    // scalar, or an array of that type — and some element satisfies it. A
+    // missing value, an empty or mixed array and a value of another type
+    // match nothing, so `!=` is not the complement of `=`.
     let rendered = match (op, value) {
         (ComparisonOp::Eq, Value::String(s)) => {
-            (false, string_eq(&read(Read::Str), &read(Read::StrArray), s))
-        }
-        (ComparisonOp::Neq, Value::String(s)) => {
-            (true, string_eq(&read(Read::Str), &read(Read::StrArray), s))
+            string_eq(&read(Read::Str), &read(Read::StrArray), s)
         }
         (
-            ComparisonOp::Gt | ComparisonOp::Gte | ComparisonOp::Lt | ComparisonOp::Lte,
+            ComparisonOp::Neq
+            | ComparisonOp::Gt
+            | ComparisonOp::Gte
+            | ComparisonOp::Lt
+            | ComparisonOp::Lte,
             Value::String(s),
-        ) => (
-            false,
+        ) => {
+            let sym = sql_op(op).expect("a non-regex operator");
+            let lit = escape::ch_string(s);
             format!(
-                "coalesce({} {} {}, false)",
+                "(coalesce({} {sym} {lit}, false) OR {})",
                 read(Read::Str),
-                sql_op(op).expect("an ordered operator"),
-                escape::ch_string(s)
-            ),
-        ),
-        (ComparisonOp::Re, Value::String(s)) => (
-            false,
+                array_member(&read(Read::StrArray), &format!("ae {sym} {lit}"))
+            )
+        }
+        (ComparisonOp::Re | ComparisonOp::Nre, Value::String(s)) => {
+            let re = anchored_regex_sql(s)?;
+            let not = if op == ComparisonOp::Nre { "NOT " } else { "" };
             format!(
-                "coalesce(match({}, {}), false)",
+                "(coalesce({not}match({}, {re}), false) OR {})",
                 read(Read::Str),
-                anchored_regex_sql(s)?
-            ),
+                array_member(&read(Read::StrArray), &format!("{not}match(ae, {re})"))
+            )
+        }
+        (op, Value::Number(raw)) if sql_op(op).is_some() => {
+            numeric_pair(read, op, &render_number(raw)?)
+        }
+        (op, Value::Duration(d)) if sql_op(op).is_some() => {
+            numeric_pair(read, op, &duration_nanos(*d))
+        }
+        (ComparisonOp::Eq, Value::Bool(b)) => format!(
+            "(coalesce({} = {b}, false) OR has({}, {b}))",
+            read(Read::Bool),
+            read(Read::BoolArray)
         ),
-        (ComparisonOp::Nre, Value::String(s)) => (
-            true,
-            format!(
-                "coalesce(match({}, {}), false)",
-                read(Read::Str),
-                anchored_regex_sql(s)?
-            ),
+        (ComparisonOp::Neq, Value::Bool(b)) => format!(
+            "(coalesce({} != {b}, false) OR {})",
+            read(Read::Bool),
+            array_member(&read(Read::BoolArray), &format!("ae != {b}"))
         ),
-        (ComparisonOp::Neq, Value::Number(raw)) => (
-            true,
-            numeric_pair(
-                &read(Read::Int),
-                &read(Read::Float),
-                ComparisonOp::Eq,
-                &render_number(raw)?,
-            ),
-        ),
-        (op, Value::Number(raw)) if sql_op(op).is_some() => (
-            false,
-            numeric_pair(
-                &read(Read::Int),
-                &read(Read::Float),
-                op,
-                &render_number(raw)?,
-            ),
-        ),
-        (ComparisonOp::Neq, Value::Duration(d)) => (
-            true,
-            numeric_pair(
-                &read(Read::Int),
-                &read(Read::Float),
-                ComparisonOp::Eq,
-                &duration_nanos(*d),
-            ),
-        ),
-        (op, Value::Duration(d)) if sql_op(op).is_some() => (
-            false,
-            numeric_pair(
-                &read(Read::Int),
-                &read(Read::Float),
-                op,
-                &duration_nanos(*d),
-            ),
-        ),
-        (ComparisonOp::Eq, Value::Bool(b)) => (
-            false,
-            format!("coalesce({} = {b}, false)", read(Read::Bool)),
-        ),
-        (ComparisonOp::Neq, Value::Bool(b)) => (
-            true,
-            format!("(coalesce({} = {b}, false))", read(Read::Bool)),
-        ),
+        // A `status` or `kind` keyword against an attribute matches no
+        // span under `=` or `!=`, whatever the span holds or lacks: the
+        // reference's type gate answers `false` for an attribute value of
+        // any type against these statics (`pkg/traceql/ast_execute.go:413-416`,
+        // `enum_statics.go:29-47`), and a missing value is not equal and not
+        // unequal to them (`pkg/traceql/ast.go:826-830`, `:868-871`).
+        (ComparisonOp::Eq | ComparisonOp::Neq, Value::Status(_) | Value::Kind(_)) => {
+            "false".to_string()
+        }
         // The message the previous filter compiler produced for the same
         // pair (it went with the previous metrics SQL, #602 part 3a).
         _ => {
@@ -4086,38 +4054,18 @@ fn id_leaf(
 // the four event and link intrinsics
 // ---------------------------------------------------------------------
 
-/// `!=` to `=` and `!~` to `=~`, with whether it was negated; the other
-/// operators unchanged.
-fn positive_op(op: ComparisonOp) -> (bool, ComparisonOp) {
-    match op {
-        ComparisonOp::Neq => (true, ComparisonOp::Eq),
-        ComparisonOp::Nre => (true, ComparisonOp::Re),
-        ComparisonOp::Eq
-        | ComparisonOp::Gt
-        | ComparisonOp::Gte
-        | ComparisonOp::Lt
-        | ComparisonOp::Lte
-        | ComparisonOp::Re => (false, op),
-    }
-}
-
-/// Any element of `array`, bound to `var`, passes `body`; `NOT` outside
-/// when negated. `head` is the loop's function: `arrayExists`, or
-/// `arrayFirstIndex` for the search projection's first passing element.
-fn any_element(var: &str, array: &str, negated: bool, body: &str, head: &str) -> String {
-    let positive = format!("{head}({var} -> {body}, {array})");
-    if negated {
-        format!("NOT {positive}")
-    } else {
-        positive
-    }
+/// Any element of `array`, bound to `var`, passes `body`, `!=` and `!~`
+/// included: a span with no element matches no operator (issue #493).
+/// `head` is the loop's function: `arrayExists`, or `arrayFirstIndex` for
+/// the search projection's first passing element.
+fn any_element(var: &str, array: &str, body: &str, head: &str) -> String {
+    format!("{head}({var} -> {body}, {array})")
 }
 
 /// `event:name`: `name`'s rule over each event's name.
 fn event_name_leaf(op: ComparisonOp, value: &Value, head: &str) -> Result<String, PlanError> {
-    let (negated, pos) = positive_op(op);
-    let body = string_column_leaf(Intrinsic::EventName, "n", pos, value)?;
-    Ok(any_element("n", "events.name", negated, &body, head))
+    let body = string_column_leaf(Intrinsic::EventName, "n", op, value)?;
+    Ok(any_element("n", "events.name", &body, head))
 }
 
 /// `event:timeSinceStart`: each event's time less the span's start, in
@@ -4135,8 +4083,7 @@ fn time_since_start_leaf(op: ComparisonOp, value: &Value, head: &str) -> Result<
             ));
         }
     };
-    let (negated, pos) = positive_op(op);
-    let Some(sym) = sql_op(pos) else {
+    let Some(sym) = sql_op(op) else {
         return Err(PlanError::TypeMismatch(
             "event:timeSinceStart does not support regex operators".to_string(),
         ));
@@ -4144,7 +4091,6 @@ fn time_since_start_leaf(op: ComparisonOp, value: &Value, head: &str) -> Result<
     Ok(any_element(
         "t",
         "events.time_ns",
-        negated,
         &format!("toInt128(t) - start_ns {sym} {nanos}"),
         head,
     ))
@@ -4166,15 +4112,21 @@ fn link_id_leaf(
             "{intrinsic} requires a string value"
         )));
     };
-    let (negated, pos) = positive_op(op);
-    let body = match pos {
+    let body = match op {
         ComparisonOp::Re => format!("match(lower(hex(h)), {})", anchored_regex_sql(raw)?),
+        ComparisonOp::Nre => format!("NOT match(lower(hex(h)), {})", anchored_regex_sql(raw)?),
         ComparisonOp::Eq => format!("lower(hex(h)) = {}", escape::ch_string(&raw.to_lowercase())),
+        ComparisonOp::Neq => {
+            format!(
+                "lower(hex(h)) != {}",
+                escape::ch_string(&raw.to_lowercase())
+            )
+        }
         other => format!(
             "lower(hex(h)) {} {}",
             sql_op(other).expect("the four ordered operators"),
             escape::ch_string(raw)
         ),
     };
-    Ok(any_element("h", array, negated, &body, head))
+    Ok(any_element("h", array, &body, head))
 }

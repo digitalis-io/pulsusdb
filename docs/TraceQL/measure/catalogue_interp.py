@@ -190,6 +190,15 @@ def go_duration(ns):
     return sign + text
 
 
+def literal_only(e):
+    """whether `e` holds literals and arithmetic only"""
+    if e['k'] == 'lit': return True
+    if e['k'] == 'unary' and e['op'] == '-': return literal_only(e['e'])
+    if e['k'] == 'bin' and e['op'] in ('+', '-', '*', '/', '%', '^'):
+        return literal_only(e['l']) and literal_only(e['r'])
+    return False
+
+
 class Interp:
     def __init__(self, fx): self.fx = fx
     def lit(self, e):
@@ -248,17 +257,24 @@ class Interp:
             'nestedSetParent': n['parent'],
         }.get(name, '__unsupported__')
     def cmp(self, op, lhs, rhs):
-        if lhs is None: return op in ('!=', '!~')       # a missing key matches != and !~
-        if op == '=~': return bool(re.fullmatch(rhs, str(lhs)))
-        if op == '!~': return not re.fullmatch(rhs, str(lhs))
-        if isinstance(lhs, bool) != isinstance(rhs, bool): 
-            if isinstance(lhs, bool) or isinstance(rhs, bool): return op == '!='
-        if isinstance(lhs, str) != isinstance(rhs, str): return op == '!='
+        # `docs/api.md` §4.2 (issue #493): every operator, `!=` and `!~`
+        # included, holds on a value of the literal's type, a scalar or any
+        # element of an array; a missing value or one of another type
+        # matches nothing, so `!=` is not the complement of `=`
+        if lhs is None: return False
+        if isinstance(lhs, list):
+            want = 's' if isinstance(rhs, str) else 'b' if isinstance(rhs, bool) else 'n'
+            same = [v for t, v in lhs if {'s': 's', 'b': 'b', 'i': 'n', 'd': 'n'}[t] == want]
+            return any(self.cmp(op, v, rhs) for v in same)
+        if op in ('=~', '!~'):
+            return isinstance(lhs, str) and bool(re.fullmatch(rhs, lhs)) == (op == '=~')
+        if isinstance(lhs, bool) != isinstance(rhs, bool): return False
+        if isinstance(lhs, str) != isinstance(rhs, str): return False
         try:
             return {'=': lhs == rhs, '!=': lhs != rhs, '<': lhs < rhs, '<=': lhs <= rhs,
                     '>': lhs > rhs, '>=': lhs >= rhs}[op]
         except TypeError:
-            return op == '!='
+            return False
     def value(self, row, e):
         if e['k'] == 'lit': return self.lit(e)
         if e['k'] == 'attr':
@@ -293,16 +309,23 @@ class Interp:
             return got is not None and got[0] == 'b' and got[1] is True
         if k == 'bin':
             l, r, op = e['l'], e['r'], e['op']
+            # `docs/api.md` §4.2: a `status` or `kind` keyword against an
+            # attribute matches no span, under `=` and `!=` alike
+            if any(x['k'] == 'attr' for x in (l, r)) and any(
+                    x['k'] == 'lit' and x['t'] in ('status', 'kind') for x in (l, r)):
+                return False
             # `docs/api.md` §4.2, "Which value a span *has*": an event or link
-            # field is decided per element — a condition matches when any
-            # element holding the field satisfies it, `!=` and `!~` when every
-            # one does
+            # field is decided per element — a condition against a literal
+            # matches when any element holding the field satisfies it, `!=`
+            # and `!~` included (issue #493); against another field, `!=`
+            # and `!~` when every one does
             if self.elements(row, l) is None and self.elements(row, r) is not None:
                 l, r, op = r, l, FLIP.get(op, op)          # the field on the left
             vals = self.elements(row, l)
             if vals is not None and not (r['k'] == 'lit' and r['t'] == 'nil'):
                 rv = self.value(row, r)
-                if op in ('!=', '!~'): return all(self.cmp(op, v, rv) for v in vals)
+                if op in ('!=', '!~') and not literal_only(r):
+                    return all(self.cmp(op, v, rv) for v in vals)
                 return any(self.cmp(op, v, rv) for v in vals)
             if r['k'] == 'lit' and r['t'] == 'nil':
                 present = self.value(row, l) is not None

@@ -494,7 +494,14 @@ pub fn narrowed_values_sql(
         ValueScope::Instrumentation => from_spans(span_arr("scope_attrs")),
         ValueScope::Event => from_spans(set_arr("events.attrs")),
         ValueScope::Link => from_spans(set_arr("links.attrs")),
-        ValueScope::Resource if key == "service.name" => from_spans(SERVICE_ARR.to_string()),
+        // The span rows' strings, and the resource rows' values of every
+        // other type (issue #493).
+        ValueScope::Resource if key == "service.name" => format!(
+            "{prefix}SELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {spans}\n  ARRAY JOIN {SERVICE_ARR} AS e\n  WHERE {time} AND {bucket} AND {day} AND {NEWER}{pred}\n  UNION ALL\n  SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {resources}\n  ARRAY JOIN {rarr} AS e\n  WHERE {rday} AND {resource_ids})\nORDER BY val, val_type\nLIMIT {limit}",
+            pred = pred_inline(n),
+            rarr = elems(&attr_path("attrs", key)),
+            rday = w.resources_day_clause(),
+        ),
         ValueScope::Resource => format!(
             "{prefix}SELECT DISTINCT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\nFROM {resources}\nARRAY JOIN {arr} AS e\nWHERE {rday}\n  AND {resource_ids}\nORDER BY val, val_type\nLIMIT {limit}",
             arr = elems(&attr_path("attrs", key)),
@@ -545,6 +552,7 @@ pub const CATALOGUE_CAP: usize = 101;
 /// whatever its input, so the flag arrives when every branch is empty.
 /// `service` and `key` are raw; both are escaped here, the key into the
 /// JSON path the catalogue stores.
+#[allow(clippy::too_many_arguments)]
 pub fn catalogue_values_sql(
     service: &str,
     key: &str,
@@ -552,6 +560,8 @@ pub fn catalogue_values_sql(
     hi: i64,
     edges: &[String],
     limit: usize,
+    resources: &str,
+    rday: &str,
 ) -> String {
     let svc = crate::logql::escape::ch_string(service);
     let path = crate::logql::escape::ch_string(&escape_json_path(key));
@@ -562,12 +572,13 @@ pub fn catalogue_values_sql(
     let mut sql = format!(
         "WITH (SELECT max(length(v)) > {over} FROM (SELECT groupUniqArrayMerge({CATALOGUE_CAP})(vals) AS v FROM {TAG_BUCKET_VALUES_TABLE}
       WHERE {groups} GROUP BY bucket)) AS over
-SELECT toUInt8(ifNull(over, 0)) AS overflowed,
+SELECT toUInt8(greatest(ifNull(over, 0), ifNull((SELECT count() > 0 FROM ({})), 0))) AS overflowed,
        arraySlice(arraySort(groupUniqArray((val, val_type))), 1, {limit}) AS vals
 FROM (
     SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type
     FROM (SELECT arrayJoin(groupUniqArrayMerge({CATALOGUE_CAP})(vals)) AS e FROM {TAG_BUCKET_VALUES_TABLE}
-          WHERE NOT over AND {groups}\n          GROUP BY bucket)"
+          WHERE NOT over AND {groups}\n          GROUP BY bucket)",
+        array_service_resources(resources, rday, &svc)
     );
     for edge in edges {
         sql.push_str(&format!(
@@ -609,6 +620,19 @@ pub fn catalogue_buckets(start_ns: i64, end_ns: i64) -> (i64, i64, Vec<(i64, i64
 /// each 5-minute bucket, one cluster-wide replica set read locally.
 const SERVICE_BUCKET_RESOURCES_TABLE: &str = "service_bucket_resources";
 
+/// The resource rows in `rday` holding `service.name` as a string array
+/// containing `svc` (issue #493). The bucket catalogues are keyed by a
+/// string `service` only, so where one exists a service equality is not
+/// answered from them: the span key's read reports it as an overflow, the
+/// resource key's read returns a marker row first, and today's statement
+/// answers in both.
+pub fn array_service_resources(resources: &str, rday: &str, svc: &str) -> String {
+    format!(
+        "SELECT resource_id FROM {resources} WHERE {rday} AND \
+         has(attrs.`service%2Ename`.:`Array(Nullable(String))`, {svc})"
+    )
+}
+
 /// One partial edge of a service-narrowed resource values read (issue
 /// #601 part 4c): the `(service, resource_id)` of the spans in `w` that
 /// `pred` keeps, with no cut.
@@ -647,11 +671,20 @@ pub fn catalogue_resource_values_sql(
     for edge in edges {
         set.push_str(&format!("\n      UNION ALL {edge}"));
     }
+    // Issue #493: first, a row marking that a resource of the window's days
+    // holds `service.name` as a string array containing `service`, which
+    // the catalogue cannot see; the caller then runs today's statement.
     format!(
-        "SELECT DISTINCT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\nFROM {resources}\nARRAY JOIN {arr} AS e\nWHERE {rday}\n  AND (service, resource_id) IN (\n      {set})\nORDER BY val, val_type\nLIMIT {limit}",
+        "SELECT val, val_type FROM (\n  SELECT DISTINCT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {resources}\n  ARRAY JOIN {arr} AS e\n  WHERE {rday}\n    AND (service, resource_id) IN (\n      {set})\n  ORDER BY val, val_type\n  LIMIT {limit}\n  UNION ALL\n  SELECT '' AS val, '{ARRAY_SERVICE_MARK}' AS val_type\n  WHERE (SELECT count() > 0 FROM ({})))\nORDER BY val_type = '{ARRAY_SERVICE_MARK}' DESC, val, val_type\nLIMIT {}",
+        array_service_resources(resources, rday, &svc),
+        limit + 1,
         arr = elems(&attr_path("attrs", key)),
     )
 }
+
+/// The `val_type` of [`catalogue_resource_values_sql`]'s marker row: no
+/// stored type is named so.
+pub const ARRAY_SERVICE_MARK: &str = "array-service";
 
 #[cfg(test)]
 mod tests {
@@ -793,7 +826,8 @@ mod tests {
             "(SELECT min(b) FROM (SELECT intDiv(start_ns, 300000000000) AS b FROM spans WHERE {TIME} AND {BUCKET} AND {DAY} ORDER BY b DESC LIMIT 123456)) AS cut"
         )
     }
-    const PRED: &str = "(service_type = 'string' AND service = 'cart')";
+    // Issue #493: the span row's string, else the resource row's value.
+    const PRED: &str = "((service_type = 'string' AND service = 'cart') OR (NOT service_type = 'string' AND resource_id IN (SELECT resource_id FROM resources WHERE day >= toDate(fromUnixTimestamp64Nano(1700000000000000000), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1700003599999999999), 'UTC') AND ((coalesce(attrs.`service%2Ename`.:String = 'cart', false) OR has(attrs.`service%2Ename`.:`Array(Nullable(String))`, 'cart'))))))";
     const CAP: &str = "if(length(name) <= 8192, name, substringUTF8(name, 1, 2048))";
     const SERVICE: &str = "if(service_type = 'string', [(CAST(service, 'String'), 'string')], CAST([], 'Array(Tuple(String, String))'))";
 
@@ -851,7 +885,15 @@ mod tests {
         );
         assert_eq!(vs(ValueScope::Event, "http.route"), v_s(&event_arr));
         assert_eq!(vs(ValueScope::Link, "http.route"), v_s(&link_arr));
-        assert_eq!(vs(ValueScope::Resource, "service.name"), v_s(SERVICE));
+        // Issue #493: the span rows' strings and the resource rows' values.
+        assert_eq!(
+            vs(ValueScope::Resource, "service.name"),
+            format!(
+                "WITH {}\nSELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM spans\n  ARRAY JOIN {SERVICE} AS e\n  WHERE {TIME} AND {BUCKET} AND {DAY} AND {NEWER} AND ({PRED})\n  UNION ALL\n  SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM resources\n  ARRAY JOIN {} AS e\n  WHERE {RDAY} AND {ids})\nORDER BY val, val_type\nLIMIT 1001",
+                cut(),
+                elems_text("attrs.`service%2Ename`")
+            )
+        );
         // V-R.
         assert_eq!(
             vs(ValueScope::Resource, "http.route"),

@@ -4287,9 +4287,7 @@ const F_CASES: [(&str, &str, &[&str]); 20] = [
     (
         "F19",
         "{ span.http.response.status_code != 200 }",
-        &[
-            "0001", "0002", "0003", "0004", "0005", "0006", "0008", "0009",
-        ],
+        &["0001"],
     ),
     ("F20", "{ kind = consumer }", &["0008"]),
 ];
@@ -8398,5 +8396,503 @@ async fn t_q1_every_request_issues_the_statements_its_row_states() {
         distribution,
         (20, 41),
         "the routed rows at one statement and at two"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Issue #493: one key holding a scalar on one span and an array on another
+// ---------------------------------------------------------------------
+
+/// Five one-span traces in one push, so one insert holds a scalar and the
+/// arrays of `span.num`: `h1` the integer 500, `h2` `[500]`, `h3` the
+/// string "500", `h4` `[1, 2]`, `h5` `[]`.
+fn push_array_fixture(port: u16, start_ns: i64) {
+    let int = |i: i64| AnyValue {
+        value: Some(Value::IntValue(i)),
+    };
+    let array = |values: Vec<AnyValue>| Value::ArrayValue(ArrayValue { values });
+    let nums = [
+        ("h1", Value::IntValue(500)),
+        ("h2", array(vec![int(500)])),
+        ("h3", Value::StringValue("500".to_string())),
+        ("h4", array(vec![int(1), int(2)])),
+        ("h5", array(vec![])),
+    ];
+    let spans = nums
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, num))| {
+            let n = u8::try_from(i + 1).expect("five spans");
+            Span {
+                trace_id: [0x49, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n].to_vec(),
+                span_id: sid(n).to_vec(),
+                name: name.to_string(),
+                kind: SpanKind::Server as i32,
+                start_time_unix_nano: u64::try_from(start_ns + i64::from(n)).expect("post-epoch"),
+                end_time_unix_nano: u64::try_from(start_ns + i64::from(n) + 1_000_000)
+                    .expect("post-epoch"),
+                attributes: vec![kv_val("num", num)],
+                ..Default::default()
+            }
+        })
+        .collect();
+    push(
+        port,
+        vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv_str("service.name", "svc493")],
+                ..Default::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                spans,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        "issue #493 fixture",
+    );
+}
+
+/// The status and JSON body of one GET, or the status and the body's text.
+fn get_any(port: u16, path: &str) -> (u16, serde_json::Value) {
+    let res = request(port, "GET", path, None, &[]).expect("the server is reachable");
+    let body = serde_json::from_slice(&res.body).unwrap_or_else(|_| {
+        serde_json::Value::String(String::from_utf8_lossy(&res.body).into_owned())
+    });
+    (res.status, body)
+}
+
+/// Each returned trace's root name with its first spanSet's attributes
+/// less the key `skip`, sorted by name.
+fn search_rows(body: &serde_json::Value, skip: &str) -> Vec<String> {
+    let mut rows: Vec<String> = body["traces"]
+        .as_array()
+        .map(|ts| {
+            ts.iter()
+                .map(|t| {
+                    let set = &t["spanSets"][0];
+                    let attrs = if set["attributes"].is_null() {
+                        &set["spans"][0]["attributes"]
+                    } else {
+                        &set["attributes"]
+                    };
+                    let kept: Vec<&serde_json::Value> = attrs
+                        .as_array()
+                        .map(|a| a.iter().filter(|x| x["key"] != skip).collect())
+                        .unwrap_or_default();
+                    format!(
+                        "{} {}",
+                        t["rootTraceName"].as_str().unwrap_or("?"),
+                        serde_json::json!(kept)
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    rows.sort();
+    rows
+}
+
+/// Issue #493: a `by()` key, a projection and an aggregate over a key that
+/// holds a scalar and arrays in one part answer, and array membership
+/// reaches the search, metrics and tag-value routes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_holding_a_scalar_and_arrays_answers_on_every_route() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_275;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_t493")).await;
+    let _server = spawn_ready(port, &db);
+    let start_ns = (now_ns() / 1_000_000_000 - 60) * 1_000_000_000;
+    push_array_fixture(port, start_ns);
+    let (s, e) = (start_ns / 1_000_000_000, start_ns / 1_000_000_000 + 120);
+    let search = |q: &str| {
+        get_any(
+            port,
+            &format!(
+                "/api/traces/v1/search?q={}&start={s}&end={e}&limit=20",
+                enc(q)
+            ),
+        )
+    };
+    let int = |v: &str| serde_json::json!({"intValue": v});
+    let arr = |vs: Vec<serde_json::Value>| serde_json::json!({"arrayValue": {"values": vs}});
+    let row = |name: &str, key: &str, v: serde_json::Value| {
+        format!("{name} {}", serde_json::json!([{"key": key, "value": v}]))
+    };
+    let mut wrong = Vec::new();
+    let mut check = |what: &str, got: (u16, Vec<String>), want: Vec<String>| {
+        if got != (200, want.clone()) {
+            wrong.push(format!(
+                "{what}\n   expected 200 {want:?}\n   answered {got:?}"
+            ));
+        }
+    };
+
+    let (st, body) = search(r#"{ resource.service.name = "svc493" } | by(span.num)"#);
+    check(
+        "by(span.num)",
+        (st, search_rows(&body, "service.name")),
+        vec![
+            row("h1", "by(span.num)", int("500")),
+            row("h2", "by(span.num)", arr(vec![int("500")])),
+            row(
+                "h3",
+                "by(span.num)",
+                serde_json::json!({"stringValue": "500"}),
+            ),
+            row("h4", "by(span.num)", arr(vec![int("1"), int("2")])),
+            row("h5", "by(span.num)", serde_json::json!({"arrayValue": {}})),
+        ],
+    );
+    let (st, body) = search(r#"{ resource.service.name = "svc493" } | select(span.num)"#);
+    check(
+        "select(span.num)",
+        (st, search_rows(&body, "service.name")),
+        vec![
+            row("h1", "num", int("500")),
+            row("h2", "num", arr(vec![int("500")])),
+            row("h3", "num", serde_json::json!({"stringValue": "500"})),
+            row("h4", "num", arr(vec![int("1"), int("2")])),
+            row("h5", "num", serde_json::json!({"arrayValue": {}})),
+        ],
+    );
+    let (st, body) =
+        search(r#"{ resource.service.name = "svc493" && name != "h3" } | max(span.num) > 400"#);
+    check(
+        "max(span.num) > 400",
+        (st, search_rows(&body, "service.name")),
+        vec![format!(
+            "h1 {}",
+            serde_json::json!([{"key": "max(span.num)", "value": int("500")}])
+        )],
+    );
+    let (st, body) = search("{ span.num = 2 }");
+    check(
+        "{ span.num = 2 }",
+        (st, search_rows(&body, "service.name")),
+        vec![row("h4", "num", arr(vec![int("1"), int("2")]))],
+    );
+    let (st, body) = get_any(
+        port,
+        &format!(
+            "/api/traces/v1/metrics/query_range?q={}&start={s}&end={e}&step=120s",
+            enc("{ span.num = 500 } | count_over_time()")
+        ),
+    );
+    let total: f64 = body["series"]
+        .as_array()
+        .map(|ss| {
+            ss.iter()
+                .flat_map(|x| x["samples"].as_array().cloned().unwrap_or_default())
+                .map(|p| p["value"].as_f64().unwrap_or(0.0))
+                .sum()
+        })
+        .unwrap_or(-1.0);
+    check(
+        "count_over_time of { span.num = 500 }",
+        (st, vec![total.to_string()]),
+        vec!["2".to_string()],
+    );
+    let (st, body) = get_any(
+        port,
+        &format!(
+            "/api/v2/search/tag/span.num/values?q={}&start={s}&end={e}",
+            enc("{ span.num = 2 }")
+        ),
+    );
+    let values: Vec<String> = body["tagValues"]
+        .as_array()
+        .map(|vs| {
+            vs.iter()
+                .map(|v| format!("{} {}", v["type"], v["value"]))
+                .collect()
+        })
+        .unwrap_or_default();
+    check(
+        "tag values of span.num narrowed by { span.num = 2 }",
+        (st, values),
+        vec![r#""int" "1""#.to_string(), r#""int" "2""#.to_string()],
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} answers differ:\n\n{}",
+        wrong.len(),
+        wrong.join("\n\n")
+    );
+}
+
+/// Six one-span traces, one resource each, `resource.service.name` stored
+/// as s1 the string "a", s2 `["a","b"]`, s3 the integer 5, s4 nothing, s5
+/// the boolean `true`, s6 the empty string; each resource carries
+/// `env = "r2"` and each span `k`: s1 1, s2 `[1, 2]`, the rest none. s2
+/// alone has `status = error` and a resource `tier = "t2"`.
+fn push_service_fixture(port: u16, start_ns: i64) {
+    let any = |v: Value| AnyValue { value: Some(v) };
+    let array = |values: Vec<AnyValue>| Value::ArrayValue(ArrayValue { values });
+    let services: [(&str, Option<Value>, Option<Value>); 6] = [
+        (
+            "s1",
+            Some(Value::StringValue("a".to_string())),
+            Some(Value::IntValue(1)),
+        ),
+        (
+            "s2",
+            Some(array(vec![
+                any(Value::StringValue("a".to_string())),
+                any(Value::StringValue("b".to_string())),
+            ])),
+            Some(array(vec![
+                any(Value::IntValue(1)),
+                any(Value::IntValue(2)),
+            ])),
+        ),
+        ("s3", Some(Value::IntValue(5)), None),
+        ("s4", None, None),
+        ("s5", Some(Value::BoolValue(true)), None),
+        ("s6", Some(Value::StringValue(String::new())), None),
+    ];
+    let blocks = services
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, service, k))| {
+            let n = u8::try_from(i + 0x11).expect("six spans");
+            let mut resource = vec![kv_str("env", "r2")];
+            if name == "s2" {
+                resource.push(kv_str("tier", "t2"));
+            }
+            if let Some(v) = service {
+                resource.push(kv_val("service.name", v));
+            }
+            ResourceSpans {
+                resource: Some(Resource {
+                    attributes: resource,
+                    ..Default::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        trace_id: [0x49, 0x31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n].to_vec(),
+                        span_id: sid(n).to_vec(),
+                        name: name.to_string(),
+                        kind: SpanKind::Server as i32,
+                        start_time_unix_nano: u64::try_from(start_ns + i64::from(n))
+                            .expect("post-epoch"),
+                        end_time_unix_nano: u64::try_from(start_ns + i64::from(n) + 1_000_000)
+                            .expect("post-epoch"),
+                        attributes: k.map(|v| vec![kv_val("k", v)]).unwrap_or_default(),
+                        // s2 is an error span, so the error-span table's
+                        // read is exercised too.
+                        status: (name == "s2").then(|| Status {
+                            code: 2,
+                            message: String::new(),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        })
+        .collect();
+    push(port, blocks, "issue #493 service fixture");
+}
+
+/// The root names a search returns, sorted.
+fn root_names(body: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = body["traces"]
+        .as_array()
+        .map(|ts| {
+            ts.iter()
+                .map(|t| t["rootTraceName"].as_str().unwrap_or("?").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Issue #493: `resource.service.name` stored as anything but a string is
+/// read from the resource row — in a condition, a `by()` key, `select()`,
+/// a metrics key and a narrowed value list — and a string still from the
+/// span row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_name_of_any_type_answers_on_every_route() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_276;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_t493_svc")).await;
+    let _server = spawn_ready(port, &db);
+    let start_ns = (now_ns() / 1_000_000_000 - 60) * 1_000_000_000;
+    push_service_fixture(port, start_ns);
+    let (s, e) = (start_ns / 1_000_000_000, start_ns / 1_000_000_000 + 120);
+    let search = |q: &str| {
+        get_any(
+            port,
+            &format!(
+                "/api/traces/v1/search?q={}&start={s}&end={e}&limit=20",
+                enc(q)
+            ),
+        )
+    };
+    let strs = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let mut wrong = Vec::new();
+    let mut check = |what: &str, got: (u16, Vec<String>), want: Vec<String>| {
+        if got != (200, want.clone()) {
+            wrong.push(format!(
+                "{what}\n   expected 200 {want:?}\n   answered {got:?}"
+            ));
+        }
+    };
+    for (q, want) in [
+        (r#"{ resource.service.name = "a" }"#, strs(&["s1", "s2"])),
+        // `!=` holds on a value of the literal's type that differs: s6's
+        // "" and s2's "b" (issue #493).
+        (r#"{ resource.service.name != "a" }"#, strs(&["s2", "s6"])),
+        (r#"{ resource.service.name !~ "a" }"#, strs(&["s2", "s6"])),
+        (r#"{ resource.service.name > "a" }"#, strs(&["s2"])),
+        ("{ resource.service.name > 4 }", strs(&["s3"])),
+        (r#"{ resource.service.name =~ "b" }"#, strs(&["s2"])),
+        ("{ resource.service.name = 5 }", strs(&["s3"])),
+        // A string, an array of strings, a boolean or a missing value
+        // matches no number, `!=` included (issues #476, #493).
+        ("{ resource.service.name != 5 }", strs(&[])),
+        ("{ resource.service.name != 4 }", strs(&["s3"])),
+        ("{ resource.service.name }", strs(&["s5"])),
+        (
+            "{ resource.service.name != nil }",
+            strs(&["s1", "s2", "s3", "s5", "s6"]),
+        ),
+        (r#"{ .service.name = "b" }"#, strs(&["s2"])),
+        // The error-span table holds `service`, `service_type` and
+        // `resource_id`, which both halves read.
+        (
+            r#"{ status = error && resource.service.name = "b" }"#,
+            strs(&["s2"]),
+        ),
+    ] {
+        let (st, body) = search(q);
+        check(q, (st, root_names(&body)), want);
+    }
+    let int = |v: &str| serde_json::json!({"intValue": v});
+    let text = |v: &str| serde_json::json!({"stringValue": v});
+    let arr =
+        serde_json::json!({"arrayValue": {"values": [{"stringValue": "a"}, {"stringValue": "b"}]}});
+    let row = |name: &str, key: &str, v: serde_json::Value| {
+        format!("{name} {}", serde_json::json!([{"key": key, "value": v}]))
+    };
+    let (st, body) = search(r#"{ resource.env = "r2" } | by(resource.service.name)"#);
+    let g = "by(resource.service.name)";
+    check(
+        "by(resource.service.name)",
+        (st, search_rows(&body, "env")),
+        vec![
+            row("s1", g, text("a")),
+            row("s2", g, arr.clone()),
+            row("s3", g, int("5")),
+            row("s4", g, text("nil")),
+            row("s5", g, serde_json::json!({"boolValue": true})),
+            row("s6", g, text("")),
+        ],
+    );
+    let (st, body) = search(r#"{ resource.env = "r2" } | select(resource.service.name)"#);
+    let selected = search_rows(&body, "env");
+    check(
+        "select(resource.service.name)",
+        (st, selected),
+        vec![
+            row("s1", "service.name", text("a")),
+            row("s2", "service.name", arr),
+            row("s3", "service.name", int("5")),
+            "s4 []".to_string(),
+            row("s5", "service.name", serde_json::json!({"boolValue": true})),
+            row("s6", "service.name", text("")),
+        ],
+    );
+    let values = |path: &str, q: &str| {
+        let (st, body) = get_any(port, &format!("{path}?q={}&start={s}&end={e}", enc(q)));
+        let mut vs: Vec<String> = body["tagValues"]
+            .as_array()
+            .map(|vs| {
+                vs.iter()
+                    .map(|v| {
+                        format!(
+                            "{} {}",
+                            v["type"].as_str().unwrap_or(""),
+                            v["value"].as_str().unwrap_or("")
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        vs.sort();
+        (st, vs)
+    };
+    check(
+        "values of resource.service.name narrowed by env",
+        values(
+            "/api/v2/search/tag/resource.service.name/values",
+            r#"{ resource.env = "r2" }"#,
+        ),
+        strs(&["bool true", "int 5", "string ", "string a", "string b"]),
+    );
+    check(
+        "values of span.k narrowed by service.name = \"b\"",
+        values(
+            "/api/v2/search/tag/span.k/values",
+            r#"{ resource.service.name = "b" }"#,
+        ),
+        strs(&["int 1", "int 2"]),
+    );
+    check(
+        "values of resource.tier narrowed by service.name = \"b\"",
+        values(
+            "/api/v2/search/tag/resource.tier/values",
+            r#"{ resource.service.name = "b" }"#,
+        ),
+        strs(&["string t2"]),
+    );
+    let (st, body) = get_any(
+        port,
+        &format!(
+            "/api/traces/v1/metrics/query_range?q={}&start={s}&end={e}&step=120s",
+            enc(r#"{ resource.env = "r2" } | count_over_time() by(resource.service.name)"#)
+        ),
+    );
+    let mut series: Vec<String> = body["series"]
+        .as_array()
+        .map(|ss| {
+            ss.iter()
+                .map(|x| {
+                    let total: f64 = x["samples"]
+                        .as_array()
+                        .map(|ps| ps.iter().map(|p| p["value"].as_f64().unwrap_or(0.0)).sum())
+                        .unwrap_or(0.0);
+                    format!("{} {total}", x["labels"][0]["value"])
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    series.sort();
+    check(
+        "count_over_time() by(resource.service.name)",
+        (st, series),
+        strs(&[
+            r#"{"boolValue":true} 1"#,
+            r#"{"intValue":"5"} 1"#,
+            r#"{"stringValue":""} 1"#,
+            r#"{"stringValue":"a"} 1"#,
+            r#"{"stringValue":"nil"} 1"#,
+            r#"{"stringValue":"nil"} 1"#,
+        ]),
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} answers differ:\n\n{}",
+        wrong.len(),
+        wrong.join("\n\n")
     );
 }

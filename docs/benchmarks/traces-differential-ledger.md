@@ -51,7 +51,11 @@ stays in this file; that one only explains and points back.
   spans. Both stores agree on `!=`/`!~` whenever every span carries the
   key (`neg_attr_key_on_all` / `neg_regex_key_on_all` remain GATED and
   pass three-way).
-- **Disposition:** `neg_attr_missing_key` moves to
+- **Superseded on 2026-10-23 (issue #493).** Owner decision: `!=` and
+  `!~` never match a span lacking the key (`docs/api.md` §4.2), the
+  reference's answer above. `neg_attr_missing_key` is gated again
+  (`test/fixtures/traces/differential.json`).
+- **Disposition (before #493):** `neg_attr_missing_key` moved to
   `mode: "informational"`. PulsusDB stays hard-gated against the
   corpus expectation under our documented rule (a PulsusDB regression
   on this case still fails the scenario); only the Tempo comparison is
@@ -314,6 +318,13 @@ re-decide from the evidence rather than re-derive it.
   | `{ event.code = "c1" }`, `= "c2"`, `= "c3"` | the three-event span each time | the same | agree |
   | `{ event.code != "c3" }` | the evX/evY/evZ span and the no-`code` span | the c1/c2/c3 span | ALL-match against any-differs |
   | `{ event.code != "zz" }` | all three spans | the c1/c2/c3 span | our absent-key rule (`2026-07-16-negation-matches-missing-key`), reaching the event scope |
+
+  **Superseded on 2026-10-23 (issue #493):** the owner decided to follow
+  the reference here — against a literal, `!=` and `!~` on an event or
+  link field match a span with any element that differs, and no span
+  without one (`traceql-array-element-rule`). The 2026-09-18 decision below
+  is the record it replaced; the field-versus-field rows above keep the
+  all-match rule.
 
   **Ruled on 2026-09-18: today's answer stands, and the BASIS is what
   changed.** `!=` and `!~` on an event or link attribute are all-match — a
@@ -1081,7 +1092,9 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `ifNull(attr_num[0], 0)` reads `0`. Frozen live by
   `a_metrics_attribute_condition_tests_the_element_the_span_resolves_to`
   (`crates/pulsus-server/tests/traces_search_live.rs`), which asserts each row
-  on BOTH routes against one window.
+  on BOTH routes against one window. Issue #493 moved the two `!=` rows to
+  `1` and `0`: a span lacking the key, or holding `n` as a string, matches
+  no `!=`.
 
 - **What issue #559 cost, and it is a cost rather than a wash.** The
   `service_time` projection holds 14 named columns and not the attribute
@@ -4067,3 +4080,38 @@ Applies to `GET /api/traces/v1/search` and its alias.
 | `minDuration`/`maxDuration` | cut to whole milliseconds; a negative value wraps | exact nanoseconds; a negative value is `400` | divergence |
 | tag `maxStaleValues` | an early stop after N values already seen | ignored | divergence: the early stop can under-report |
 | a span past retention that storage still holds | shown until its block is deleted | not returned by a windowed read | divergence |
+
+### `traceql-array-element-rule` (issue #493) — **a condition against a literal holds on a value of the literal's type, any element of an array; `!=` and `!~` included**
+
+Applies to every condition against a literal, at every scope and on every route (`crates/pulsus-read/src/traces/spans/predicate.rs`, `leaf_parts`), and to the four event and link intrinsics against a literal. Every operator, `!=` and `!~` included, holds when the value is held at the literal's type, as a scalar or as an array of that type, and some element satisfies it; a missing value, another type, an empty or a mixed array matches nothing. Owner decision, 2026-10-23: "go with that reference's rule". It replaced `2026-07-16-negation-matches-missing-key` and the 2026-09-18 decision in `traceql-event-link-operand-any-match`.
+
+**Measured on 2026-10-23** against the pinned reference image (the digest `deploy/e2e/compose.single.yaml` names), one OTLP push to each side, `GET /api/search?q=<query>&start&end&limit=50`; the answer is the root span names. One span per trace, `span.k` as named; `missing` has no `k`.
+
+| query | the reference | here |
+|---|---|---|
+| `{ span.k = 1 }` | int1 one1 ints11 ints12 | the same |
+| `{ span.k != 1 }`, `{ .k != 1 }` | ints12 ints23 | the same |
+| `{ span.k = "a" }`, `=~ "a"` | strA strsAA strsAB | the same |
+| `{ span.k != "a" }`, `!~ "a"` | str1 strsAB strsBC | the same |
+| `{ event.e != 4 }` (events `[3,4]`; `4` and `5`; `4`; none) | the first two | the same |
+| `{ event:name != "a" }` (events `a b`; `a`; `a a`; none) | the first, and every span with an event not named `a` | the same |
+| `{ span.f > 1 }` (`f` = 1.5, `[1.5, 2.5]`) | none | both |
+| `{ span.k != nil }` | every span holding `k` but empty and mixed | the same and empty |
+| `{ span.kw = error }`, `!= error`, at span, event and link | none | none |
+
+int1 = 1, one1 = `[1]`, ints11 = `[1,1]`, ints12 = `[1,2]`, ints23 = `[2,3]`, str1 = "1", strA = "a", strsAA = `["a","a"]`, strsAB = `["a","b"]`, strsBC = `["b","c"]`, empty = `[]`, mixed = `["a",1]`.
+
+Why the reference answers so, at the pinned tag:
+
+- The literal's type picks one typed value column, `string`, `int`, `float` or `bool` (`tempodb/encoding/vparquet4/block_traceql.go:3039-3067`), and the scan keeps only the value rows that satisfy the operator (`:3071-3101`). A span lacking the key, or holding it in another type, never reaches a predicate, under `!=` too.
+- The kept rows are the value the engine sees (`:3595-3613`), and the engine evaluates the filter again over it (`pkg/traceql/engine.go:100-105`). Its array rule says `!=` and `!~` are "'not in' / 'match none': must check all elements" (`pkg/traceql/ast_execute.go:583-584`, `:621-622`), but only the elements that differ are left to check, so it answers "any element differs".
+- An integer literal reads the `int` column alone, so a double never compares with it; the engine's own rule compares the two as numbers (`ast_execute.go:630-656`).
+
+| difference | here | basis |
+|---|---|---|
+| an integer literal against a double, a double literal or a duration against an integer | compared as numbers, as the scalar arms already were | the reference engine's own numeric rule |
+| a one-element array | compared as an array of one: the same answer under every operator | `docs/reference-defects-we-do-not-copy.md` §37 |
+| `min`/`max`/`sum`/`avg()` over a span holding an array | the array is skipped | an array is not a number; the reference's value depends on order (`pkg/traceql/ast.go:901-927`, `:1084-1098`) |
+| `link:spanID` against a literal; links lk_12 `…01`, `…02`, lk_1 `…01`, lk_x and lk_xy `…0abc` | `= "0000000000000001"` lk_1 lk_12; `= "0000000000000002"`, `=~ "0+2"` lk_12; `!= "0000000000000001"`, `!~ "0+1"` lk_12 lk_x lk_xy | the reference answers both `=` and the `=~` with no span, `!=` with lk_x lk_xy and `!~` with every span, links or none; it matches no link id under `=`, so its answers follow no element rule and the event intrinsics' rule is applied |
+
+`resource.service.name` stored as anything but a string is read from the resource row, in its own type, as any resource attribute. The reference keeps a string `service.name` in a dedicated column (`tempodb/encoding/vparquet4/schema.go:394-433`) where a missing or non-string value reads as `""`; measured on the same day, it answers `{ resource.service.name = "" }` with every span whose service.name is missing, an integer, a boolean or an array, `!= nil` with the missing one too, and `{ resource.service.name = "a" }` without the span holding `["a","b"]`. Here `= ""` matches a stored empty string only, `!= nil` a stored value, and the array is read by element.

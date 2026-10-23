@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The fixture docs/TraceQL/query-catalogue.md answers on: spans in seven traces,
+"""The fixture docs/TraceQL/query-catalogue.md answers on: spans in eight traces,
 carrying every attribute key, scope, intrinsic and value type the TraceQL corpus
 at crates/pulsus-traceql/tests/corpus/ mentions, so that a catalogue entry's
 answer is a list of spans rather than a uniform empty set.
@@ -25,6 +25,10 @@ wrong rule pass:
 4. **An orphan earlier than its trace's root** (trace seven): a root rule that
    admitted a span whose parent id names a span not stored would answer the
    orphan's service and name as the trace's root.
+5. **One key holding a scalar and arrays in one insert** (trace eight): an
+   array read that the engine refuses for the whole block fails every
+   `by()`, `select()` and aggregate over the key, and a condition reading one
+   element answers differently from one reading every element (#493).
 
 Writes OTLP/JSON bodies under <out>/otlp/ and the staging rows at
 <out>/spans.jsonl. Usage: make_catalogue_fixture.py OUT_DIR BASE_UNIX_SECONDS"""
@@ -185,6 +189,29 @@ span(T6, 48, 40, 'xGETy', 1, 50 * NS + 10 * 10**6, 1 * NS, 'regex', RES_REGEX,
 # the parentless span (`docs/api.md` section 4.2, "Nested-set intrinsics")
 span(T7, 60, 998, 'early orphan', 1, 54 * NS, 1 * NS, 'regex', RES_REGEX, [])
 span(T7, 61, None, 'true root', 2, 55 * NS, 1 * NS, 'gw', RES_GW, [])
+
+# trace 8: one key holding a scalar on one span and an array of each element
+# type on the others, all in one body, so one insert puts the scalar and the
+# arrays in one part; and arrays on an event, a link and the resource. Each
+# array's elements answer differently by position, so a rule reading one
+# element and a rule reading any element disagree.
+T8 = '88' * 16
+RES_ARR = [['service.name', 's', 'arrays'], ['deployment.environment', 's', 'prod'],
+           ['k8s.pod.name', 's', 'arrays-a'], ['rvals', 'a', [['i', 7], ['i', 8]]]]
+span(T8, 70, None, 'v-int', 1, 1 * NS, 1 * NS, 'arrays', RES_ARR, [['vals', 'i', 1]])
+span(T8, 71, 70, 'v-ints', 1, 1 * NS + 1 * 10**6, 1 * NS, 'arrays', RES_ARR,
+     [['vals', 'a', [['i', 1], ['i', 2]]]])
+span(T8, 72, 70, 'v-doubles', 1, 1 * NS + 2 * 10**6, 1 * NS, 'arrays', RES_ARR,
+     [['vals', 'a', [['d', 1.5], ['d', 2.5]]]])
+span(T8, 73, 70, 'v-strings', 1, 1 * NS + 3 * 10**6, 1 * NS, 'arrays', RES_ARR,
+     [['vals', 'a', [['s', 'a'], ['s', 'b']]]])
+span(T8, 74, 70, 'v-bools', 1, 1 * NS + 4 * 10**6, 1 * NS, 'arrays', RES_ARR,
+     [['vals', 'a', [['b', True], ['b', False]]]])
+span(T8, 75, 70, 'v-string', 1, 1 * NS + 5 * 10**6, 1 * NS, 'arrays', RES_ARR, [['vals', 's', '1']],
+     events=[(base * NS + 1 * NS + 5 * 10**6 + 1, 'ev', [['evals', 'i', 5]])])
+span(T8, 76, 70, 'v-elements', 1, 1 * NS + 6 * 10**6, 1 * NS, 'arrays', RES_ARR, [],
+     events=[(base * NS + 1 * NS + 6 * 10**6 + 1, 'ev', [['evals', 'a', [['i', 3], ['i', 4]]]])],
+     links=[(LINK_TRACE, LINK_SPAN, [['lvals', 'a', [['s', 'x'], ['s', 'y']]]])])
 
 os.makedirs(f'{out}/otlp', exist_ok=True)
 def av(t, v):

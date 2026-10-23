@@ -131,8 +131,8 @@
       ],
       "stage": "D1",
       "closed_by": 335,
-      "wire_status": "open",
-      "wire_note": "PARSE axis closed, wire axis not. Stage D1 added the sixth SpanKindValue variant, so all five probes parse and validate. On the WIRE (parse -> validate -> plan) one of them is still a planner 400 where the reference answers 2xx: `{ .a = unspecified }` compares an ATTRIBUTE against a kind static, and traces/filter.rs's attribute predicate has arms for string, bool, number, duration and regex values but none for a kind or status keyword. That gap predates D13 (`{ .a = server }` has the same shape) and D13 is what made it reachable through a probe. The four kind-INTRINSIC and hint probes reach 2xx. See wire_baseline.json."
+      "wire_status": "closed",
+      "wire_note": "PARSE and WIRE axes both closed. Stage D1 added the sixth SpanKindValue variant, so all five probes parse and validate; issue #493 gave an attribute compared with a status or kind keyword its reference answer, no match under = and != (pkg/traceql/ast_execute.go:413-416 at the pinned tag), so `{ .a = unspecified }` plans and answers 200 with no span. See wire_baseline.json."
     },
     {
       "id": "D14",
@@ -1738,8 +1738,7 @@
       "pulsus": "accept",
       "verdict": "agree",
       "closed_by": 335,
-      "closed_class": "D13",
-      "owning_issue": 335
+      "closed_class": "D13"
     },
     {
       "query": "{ kind != unspecified }",

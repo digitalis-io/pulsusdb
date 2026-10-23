@@ -530,6 +530,7 @@ docs/benchmarks/metrics-differential-ledger.md	write_otlp_handler.go:177-189	not
 docs/benchmarks/traces-differential-ledger.md	.github/workflows/ci.yml:483	no_name_the_target_file_holds
 docs/benchmarks/traces-differential-ledger.md	ast_execute.go:553-555	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	ast_execute.go:630-650	not_in_this_repository
+docs/benchmarks/traces-differential-ledger.md	ast_execute.go:630-656	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	ast_stringer.go:245-255	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	block_traceql.go:66-105	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	crates/pulsus-logql/tests/case_folding.rs:874	no_name_the_target_file_holds
@@ -560,11 +561,15 @@ docs/benchmarks/traces-differential-ledger.md	pkg/tempopb/tempo.proto:139	pinned
 docs/benchmarks/traces-differential-ledger.md	pkg/tempopb/tempo.proto:159	pinned_to_another_version
 docs/benchmarks/traces-differential-ledger.md	pkg/tempopb/tempo.proto:160	pinned_to_another_version
 docs/benchmarks/traces-differential-ledger.md	pkg/tempopb/tempo.proto:383-386	pinned_to_another_version
+docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast.go:1084-1098	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast.go:198-215	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast.go:840-842	not_in_this_repository
+docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast.go:901-927	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:14-55	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:486	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:535-627	pinned_to_another_version
+docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:583-584	not_in_this_repository
+docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:621-622	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:630-656	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:652	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:741	not_in_this_repository
@@ -576,6 +581,7 @@ docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_stringer.go:245-25
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_stringer.go:83-84	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_validate.go:214	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_validate.go:295	not_in_this_repository
+docs/benchmarks/traces-differential-ledger.md	pkg/traceql/engine.go:100-105	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/engine.go:295	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/engine.go:31-48	pinned_to_another_version
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/engine.go:399-405	not_in_this_repository
@@ -603,10 +609,14 @@ docs/benchmarks/traces-differential-ledger.md	tempodb/encoding/vparquet4/block_t
 docs/benchmarks/traces-differential-ledger.md	tempodb/encoding/vparquet4/block_traceql.go:227-241	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	tempodb/encoding/vparquet4/block_traceql.go:249-280	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	tempodb/encoding/vparquet4/block_traceql.go:2981	not_in_this_repository
+docs/benchmarks/traces-differential-ledger.md	tempodb/encoding/vparquet4/block_traceql.go:3039-3067	not_in_this_repository
+docs/benchmarks/traces-differential-ledger.md	tempodb/encoding/vparquet4/block_traceql.go:3071-3101	not_in_this_repository
+docs/benchmarks/traces-differential-ledger.md	tempodb/encoding/vparquet4/block_traceql.go:3595-3613	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	tempodb/encoding/vparquet4/block_traceql.go:3683-3691	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	tempodb/encoding/vparquet4/block_traceql.go:65-104	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	tempodb/encoding/vparquet4/nested_set_model.go:11-12	pinned_to_another_version
 docs/benchmarks/traces-differential-ledger.md	tempodb/encoding/vparquet4/nested_set_model.go:57	pinned_to_another_version
+docs/benchmarks/traces-differential-ledger.md	tempodb/encoding/vparquet4/schema.go:394-433	not_in_this_repository
 docs/decisions/0007-clickhouse-vendor-patch.md	src/response.rs:158-163	no_name_the_target_file_holds
 docs/decisions/0007-clickhouse-vendor-patch.md	src/response.rs:85	pinned_to_another_version
 docs/decisions/0007-clickhouse-vendor-patch.md	vendor/clickhouse/PATCHES.md:191	no_name_the_target_file_holds
@@ -1075,7 +1085,6 @@ docs/reference-defects-we-do-not-copy.md	pkg/querier/queryrange/shard_resolver.g
 docs/reference-defects-we-do-not-copy.md	pkg/querier/queryrange/shard_resolver.go:275	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/tempopb/tempo.proto:139	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_execute.go:14-55	not_in_this_repository
-docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_execute.go:553-627	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_execute.go:741	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/engine.go:98-129	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	tempodb/encoding/versioned.go:98-100	not_in_this_repository

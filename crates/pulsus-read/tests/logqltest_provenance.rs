@@ -2105,14 +2105,14 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // previous metrics SQL; its regex renderer moved to `traces/sql_text.rs`,
     // which spells no `match(`.
     // Issue #602 part 2c-2b-2 removes `traces/search_plan.rs` and its two.
-    // Issues #588 and #589. The span-scope predicate compiler: four render
-    // sites, each spelled once for `=~` and once for `!~` — an attribute's
-    // `:String` read, the `name`/`statusMessage` columns, the two
-    // instrumentation columns, and the three id columns' hex text — and
-    // two spelled once, the `link:` ids' hex text and `.service.name`'s
-    // `service` column in the unscoped chain. Every one takes its pattern
-    // from `anchored_regex_sql`, the leaf `sql_text.rs` holds. No production
-    // caller yet.
+    // Issues #588, #589 and #493. The span-scope predicate compiler: the
+    // attribute rule, once for its `:String` read and once for its string
+    // array's element, each text carrying `!~`'s `NOT` itself; and four
+    // renderers spelled once for `=~` and once for `!~` — the string
+    // columns (`name`, `statusMessage`, `event:name`, `service`), the two
+    // instrumentation columns, the three id columns' hex text and the
+    // `link:` ids' hex text. Every one takes its pattern from
+    // `anchored_regex_sql`, the leaf `sql_text.rs` holds.
     ("pulsus-read/src/traces/spans/predicate.rs", 10),
     // Issue #592 part 3. The aggregate's number test: an attribute's
     // stored text matched against the writer's number grammar, its pattern
