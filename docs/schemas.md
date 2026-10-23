@@ -1045,7 +1045,7 @@ Reader-issued settings: every logs, metrics and trace read sends the answer pins
 | `PREWHERE` | planner always places the most selective low-cardinality predicate (`metric_name`, `service`, `type_id`) in `PREWHERE`; time predicates in `WHERE` (partitions already prune them) |
 | Partitioning | **daily** for raw sample/span tables (short TTL, whole-part drops); **monthly** for series/index/tier tables (long-lived, low-churn) |
 | TTL | each table's, in [configuration.md §7](configuration.md); `PULSUS_STORAGE_POLICY` for hot/cold volumes |
-| Dedup strategy | metadata: `ReplacingMergeTree` + duplicate-tolerant reads (`LIMIT 1 BY`, `GROUP BY`); samples: append-only `MergeTree`, with a retried push suppressed at ingest by the writer that accepted the original, inside `PULSUS_INGEST_DEDUP_WINDOW` (issue #494), and writer batch atomicity below that |
+| Dedup strategy | metadata: `ReplacingMergeTree` + duplicate-tolerant reads (`LIMIT 1 BY`, `GROUP BY`); samples: append-only `MergeTree`, with a retried push suppressed at ingest by the writer that accepted the original, inside `PULSUS_INGEST_DEDUP_WINDOW` (issue #494), and writer batch atomicity below that; spans and error spans: `ReplacingMergeTree`, whose copies of one span are read as [api.md §1.0](api.md) states |
 | Codecs | timestamps `DoubleDelta`, gauge-like floats `Gorilla`, counters/ids `Delta`/`T64`, payloads/labels `ZSTD(3..5)`, everything wrapped in `ZSTD(1)` minimum |
 | Minimum ClickHouse | 26.8 LTS (the supported LTS line; servers before 26.3 do not tag an HTTP-200 mid-stream exception, so it cannot be told apart from result text — issue #412. All MVs are classic incremental — no refreshable-MV or scheduler dependency) |
 
