@@ -164,7 +164,7 @@ and for the one performance cliff it introduces.
 
 | Feature | Notes | Milestone |
 |---------|-------|-----------|
-| Single-binary modes | `all` / `writer` / `reader` / `init` | M0 |
+| Single-binary modes | `all` / `writer` / `reader` | M0 |
 | Schema | one `schema/schema.sql`, applied by `schema/schema.sh`; two variants, single-node and clustered; drop and recreate, no migrations | M0 |
 | Health & introspection | `/ready`, `/metrics`, `/config`, `/buildinfo` | M0 |
 | Basic auth | `PULSUS_AUTH_USER` / `PULSUS_AUTH_PASSWORD` | M0 |

@@ -12,10 +12,11 @@ PulsusDB compiles to a **single static binary** (`pulsusdb`). The role of a proc
 
 | Mode | Mounted subsystems | Typical use |
 |------|--------------------|-------------|
-| `all` (default) | writer + reader + ruler + schema controller | single-node deployments |
+| `all` (default) | writer + reader (+ ruler when `PULSUS_RULER_ENABLED`) | single-node deployments |
 | `writer` | ingestion APIs only | horizontally scaled ingest tier |
 | `reader` | query APIs only | horizontally scaled query tier |
-| `init` | schema controller only; creates/migrates tables and exits | init containers, CI |
+
+No mode creates the schema: `schema/schema.sh` does (docs/configuration.md §10).
 
 All durable state lives in ClickHouse. PulsusDB processes are stateless (the reader's in-memory caches are rebuildable) and can be scaled, restarted, and load-balanced freely. One HTTP listener per process serves every mounted API.
 

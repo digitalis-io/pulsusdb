@@ -796,7 +796,7 @@ struct ColumnTypeRow {
 /// The `CREATE`s were edited in place rather than followed by `ALTER`s,
 /// which is only sound while the condition the amendment policy names
 /// holds. The two halves of that are checked together: the shape a fresh
-/// `--mode init` produces, and the absence of any mutation — a column
+/// `run_init` produces, and the absence of any mutation — a column
 /// widened by `ALTER ... MODIFY COLUMN` would rewrite every part in the
 /// background and would show up in `system.mutations`, so an empty
 /// mutation list is what says the widening came from the `CREATE`.

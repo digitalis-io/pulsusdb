@@ -446,11 +446,11 @@ pub struct ReaderConfig {
     /// Mirrors upstream Prometheus's
     /// `--enable-feature=promql-experimental-functions`: when `true`, the
     /// experimental slice of the v3.13 function registry (17 functions;
-    /// `limitk`/`limit_ratio` aggregators) is permitted. Issue #64 (M6-01)
-    /// lands the config surface only — no experimental function is
-    /// implemented yet, so the flag is inert until the first M6 issue
-    /// that implements one threads it into planning (the #64 Q2
-    /// adjudication: no unconsumed `plan()` signature change today). The
+    /// `limitk`/`limit_ratio` aggregators) is permitted. The planner refuses
+    /// an experimental function or modifier unless it is set (`pulsus-promql`'s
+    /// `plan.rs` gate tests, e.g.
+    /// `every_fill_modifier_spelling_is_gated_behind_experimental_functions`),
+    /// and `pulsus-server`'s `metrics_config_from` passes it through. The
     /// coverage authority for what "experimental" covers is
     /// `crates/pulsus-promql/tests/promqltest/coverage/function-coverage.json`.
     pub promql_experimental_functions: bool,

@@ -1,8 +1,8 @@
 //! PulsusDB server binary (`pulsusdb`). See docs/architecture.md §1 — process
 //! model, config load, mode dispatch, and router assembly. Wires
-//! --version/--help, config load/validation (issue #2), the `--mode init`
-//! schema-controller hook (issue #5), and full all/writer/reader mode
-//! dispatch + router assembly (issue #6).
+//! --version/--help, config load/validation (issue #2), and full
+//! all/writer/reader mode dispatch + router assembly (issue #6) on the
+//! serving startup path; the binary creates no schema (issue #619).
 
 use std::path::PathBuf;
 use std::process::ExitCode;

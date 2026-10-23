@@ -125,7 +125,7 @@ Deployment topologies:
 
 At the default, `UnderscoreEscapingWithSuffixes`, an OTLP metric name is escaped to `[a-zA-Z0-9:_]` and gains its unit and type suffixes (`app.checkout.request.count` with unit `1`, a monotonic Sum, is stored as `app_checkout_request_count_total`; `http.server.duration` with unit `s` becomes `http_server_duration_seconds`), and an attribute key is escaped to `[a-zA-Z0-9_]` with a `key`/`key_` prefix where it would otherwise start with `_` or a digit. `NoUTF8EscapingWithSuffixes` keeps the OTLP name and adds suffixes; `UnderscoreEscapingWithoutSuffixes` escapes and adds none; `NoTranslation` stores both verbatim — which makes a dotted name unreachable from PromQL except as `{__name__="…"}`, so it is experimental upstream too.
 
-**Three rewrites are not gated by the strategy and happen under every value**, exactly as in the reference: `job` is derived from `service.namespace`/`service.name`, `instance` from `service.instance.id`, and the resource's remaining attributes are published as a `target_info` series rather than copied onto every metric series. The `_bucket`/`_sum`/`_count` suffixes are likewise constants, not part of the naming strategy.
+**Three rewrites are not gated by the strategy and happen under every value**: `job` is derived from `service.namespace`/`service.name`, `instance` from `service.instance.id`, and the resource's remaining attributes are published as a `target_info` series rather than copied onto every metric series. The `_bucket`/`_sum`/`_count` suffixes are likewise constants, not part of the naming strategy.
 
 Every deliberate difference from the reference on this path is recorded in [benchmarks/metrics-differential-ledger.md](benchmarks/metrics-differential-ledger.md).
 
@@ -142,7 +142,7 @@ A trace request is also bounded **before** any of that, by a fixed ceiling on th
 | `PULSUS_CACHE_WINDOW` | `24h` | active-series window loaded into the cache; the cache only answers queries whose data window lies inside it — older ranges always resolve from `metric_series` in ClickHouse. Reader RAM budget ≈ active series × (labels JSON + maps overhead, ~300–600 B/series): plan ~2–3 GiB per reader at 5M active series |
 | `PULSUS_PROMQL_MAX_SAMPLES` | `50000000` | evaluation sample budget per query, enforced on the metrics read path (issue #138): counts **the rows this process materialises**, charged per row inside the drain loop, and aborts on the first over-budget row, returning `422 query_too_broad` naming this knob. Exactly-at-budget succeeds. Series/label hydration, cardinality probes, and discovery endpoints never charge it (they carry their own caps). **What a row IS depends on the route, and issue #549 is where the two stopped coinciding.** On the ordinary route a row is one fetched `metric_samples` or `metric_hist_samples` row (histogram rows count 1 each, pre-dedup and pre-merge); on the grouped instant read (`PULSUS_PROMQL_GROUPED_PUSH`) a row is one **run** row — a stretch of consecutive grid points over which a group's answer does not change — counted per statement, before the cross-chunk fold. Both are the same quantity, which is what the cap exists to bound: the rows this process holds. The number of rows ClickHouse read off storage to produce them is deliberately not counted — a database of this kind is built to read billions of rows and reduce them, so that number says nothing about this process's memory (owner ruling, 2026-09-17). **The set of requests the cap admits therefore moves in both directions on the queries the push takes**: a query whose sample rows exceed the cap but whose runs do not is served where it was refused (400 series over an hour at a 15 s step: 96,400 sample rows, 964 runs), and a short query whose runs exceed its sample rows is refused where it was served (three one-sample series in one group, counted: 3 sample rows, 5 runs). **Semantics diverge from Prometheus's `--query.max-samples`** (per-step in-eval peak accounting): PulsusDB drains a read fully before evaluation, so what it drains IS the memory event being bounded. Accepted range `1..=50000000000`: values above the ceiling are rejected at config load, since they would make the sample budget unreachable. Scale tuning routes to #25 |
 | `PULSUS_PROMQL_LOOKBACK` | `5m` | staleness/lookback delta |
-| `PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS` | `false` | permit the experimental slice of the pinned Prometheus function registry (mirrors upstream `--enable-feature=promql-experimental-functions`); inert until the first experimental function lands (M6) — the machine-checked inventory of what it will gate is `crates/pulsus-promql/tests/promqltest/coverage/function-coverage.json` |
+| `PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS` | `false` | permit the experimental slice of the pinned Prometheus function registry (mirrors upstream `--enable-feature=promql-experimental-functions`); the machine-checked inventory of what it gates is `crates/pulsus-promql/tests/promqltest/coverage/function-coverage.json` |
 | `PULSUS_PROMQL_MAX_METRIC_FANOUT` | `1000` | cap on how many metric names one PromQL selector with a regex/negated `__name__` matcher and no concrete name (e.g. `{__name__=~"http_.*"}`) may fan out to (a selector with no metric name and no `__name__` matcher, e.g. `{job="api"}`, resolves through the label index instead, issue #635); resolved from the warm label cache into a single `metric_name IN (...)` fetch — exceeding the cap returns "query too broad", never an unbounded scan. Accepted range `1..=1000000`: values above the ceiling are rejected at config load, since they would make the fan-out guard unreachable. **Query-text interaction (issue #35):** a fanout configured near the 1,000,000 ceiling can render a `metric_name IN (...)` list past the 8 MiB read-path query-text budget before the fanout guard itself would trip — such a query fails a deterministic `422 query_too_broad` rather than an opaque ClickHouse parse error. No config-load cross-check between the fanout ceiling and the query-text budget is possible: rendered width depends on stored metric-name lengths, unknowable at config load. Scale tuning routes to #25 |
 | `PULSUS_PROMQL_MAX_CACHE_SCAN` | `200000` | independent cap on how many resident label-cache entries (metric names plus candidate fingerprints) one regex/negated-`__name__` selector's resolution may *examine* before it is rejected as too broad — distinct from `PULSUS_PROMQL_MAX_METRIC_FANOUT` (which bounds only the matched result): a selector whose matchers yield few or no matches can still examine the whole resident cache. Above the default, which sits above `PULSUS_CACHE_MAX_SERIES`, no legitimate warm resolution false-rejects. Accepted range `1..=200000000`: values above the ceiling are rejected at config load, since they would make the scan-budget guard unreachable (an O(resident cache) walk per query). Scale tuning routes to #25 |
 | `PULSUS_PROMQL_MAX_INFO_SERIES` | `100000` | pathological-cardinality backstop on a PromQL `info()` node's synthetic `*_info` metadata-family selector — how many series that family may resolve to before the query is rejected `422 query_too_broad`, enforced BEFORE any sample fetch is issued. Distinct from `PULSUS_PROMQL_MAX_METRIC_FANOUT` (bounds distinct metric *names*, not series) and `PULSUS_PROMQL_MAX_CACHE_SCAN` (bounds examined, not matched, cache entries); a backstop above realistic scrape-target-fleet size, not identifying-label narrowing. Accepted range `1..=100000000`: values above the ceiling are rejected at config load, since they would make the cardinality backstop unreachable. Scale tuning routes to #25 |
@@ -228,12 +228,20 @@ traceql_indexed_attributes: []   # PULSUS_TRACEQL_INDEXED_ATTRIBUTES
 log_rollup_resolution: 5s
 metrics_landing_retention_hours: 6    # how long the metrics landing table keeps a landed row, in hours
 metrics_dedup_window: 10000           # blocks each metrics table remembers for deduplication
+log_landing_retention_hours: 6        # how long the logs landing table keeps a landed row, in hours
+log_dedup_window: 10000               # blocks each logs table remembers for deduplication
+trace_landing_retention_hours: 6      # how long the traces landing table keeps a landed row, in hours
+trace_dedup_window: 10000             # blocks each traces table remembers for deduplication
 cluster: null                    # ClickHouse cluster name; enables distributed DDL
 dist_suffix: _dist
 skip_unavailable_shards: false
 availability_zone: null          # this node's AZ; pool prefers clickhouse.servers whose zone matches (§4)
 az_detect: off                   # off | aws | gcp | azure | auto — detect zone from cloud instance
                                  # metadata at startup when availability_zone is unset (fail-soft)
+exp_histogram_mode: classic      # classic | native | dual
+otlp_translation_strategy: UnderscoreEscapingWithSuffixes   # UnderscoreEscapingWithSuffixes | UnderscoreEscapingWithoutSuffixes
+                                 # | NoUTF8EscapingWithSuffixes | NoTranslation
+otlp_promote_scope_metadata: false
 
 clickhouse:
   server: localhost
@@ -261,9 +269,20 @@ writer:
   batch_ms: 200
   insert_mode: sync              # sync | async
   ingest_queue_bytes: 256MiB
+  log_patterns: true
+  discover_log_levels: true
+  ingest_dedup: true
+  ingest_dedup_window: 5m
+  ingest_dedup_max_bytes: 16MiB
   metrics_landing_retries: 3     # resends of a failed metrics landing insert
   metrics_landing_inserters: 4   # insert workers on the metrics landing queue
   metrics_landing_max_rows: 1048576   # per-push landing row ceiling
+  log_landing_retries: 3         # resends of a failed logs landing insert
+  log_landing_inserters: 4       # insert workers on the logs landing queue
+  log_landing_max_rows: 1048576       # per-push landing row ceiling
+  trace_landing_retries: 3       # resends of a failed traces landing insert
+  trace_landing_inserters: 4     # insert workers on the traces landing queue
+  trace_landing_max_rows: 1048576     # per-push landing row ceiling
 
 reader:
   cache_ttl: 60s
@@ -280,8 +299,12 @@ reader:
   logql_pipeline_scan_factor: 10
   template_timezone: UTC          # IANA zone for LogQL template time functions; never the host's
   traceql_scan_budget_rows: 50000000
+  traceql_max_depth: 64
   traceql_max_series: 1000
   traceql_tag_lookback: 20m
+  logql_read_max_memory_bytes: 8589934592
+  promql_read_max_memory_bytes: 8589934592
+  traceql_read_max_memory_bytes: 8589934592
   query_eval_concurrency: 256
   tail_poll_interval: 1s
   tail_max_delay: 5s
@@ -297,7 +320,10 @@ downsampling:
   raw_retention: null            # overrides retention_days for metric_samples when set
   tier_policy: exact             # exact | fast
   tiers: []                      # see §7; name/table unique, resolution/min_step/retention
-                                 # strictly increasing, min_step >= resolution per tier
+                                 # strictly increasing, min_step >= resolution per tier. e.g.:
+                                 #   tiers:
+                                 #     - {name: r5m, resolution: 5m, table: metric_samples_5m, retention: 30d, min_step: 5m}
+                                 #     - {name: r1h, resolution: 1h, table: metric_samples_1h, retention: 365d, min_step: 1h}
 
 ruler:
   enabled: false

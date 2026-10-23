@@ -81,6 +81,9 @@ jobs:
       - name: Golden snapshot drift check
         run: bash deploy/charts/pulsusdb/tests/golden/check.sh
 
+      - name: Golden snapshot check self-test
+        run: bash deploy/charts/pulsusdb/tests/golden/check_self_test.sh
+
   chart-unittest:
     runs-on: ubuntu-latest
     steps:

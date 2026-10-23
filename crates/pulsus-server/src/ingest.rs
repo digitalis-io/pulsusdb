@@ -274,24 +274,24 @@ pub(crate) async fn ingest_metrics(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let settings = pulsus_write::MetricIngestSettings {
-        exp_histogram_mode: state.config.exp_histogram_mode,
-        translation_strategy: state.config.otlp_translation_strategy,
-        promote_scope_metadata: state.config.otlp_promote_scope_metadata,
-        // `target_info`'s cadence is the PromQL lookback halved
-        // (`helper.go:560-567 @ v3.13.0`), so the write path reads the same
-        // knob the read path evaluates against.
-        promql_lookback_ms: i64::try_from(state.config.reader.promql_lookback.0.as_millis())
-            .unwrap_or(i64::MAX),
-    };
+    let settings = metric_ingest_settings(&state.config);
     pulsus_write::ingest_metrics(state.metric_writer.as_ref(), headers, body, settings).await
 }
 
 /// The OTLP metrics settings a configuration gives `POST /v1/metrics`.
 pub(crate) fn metric_ingest_settings(
-    _config: &pulsus_config::Config,
+    config: &pulsus_config::Config,
 ) -> pulsus_write::MetricIngestSettings {
-    pulsus_write::MetricIngestSettings::default()
+    pulsus_write::MetricIngestSettings {
+        exp_histogram_mode: config.exp_histogram_mode,
+        translation_strategy: config.otlp_translation_strategy,
+        promote_scope_metadata: config.otlp_promote_scope_metadata,
+        // `target_info`'s cadence is the PromQL lookback halved
+        // (`helper.go:560-567 @ v3.13.0`), so the write path reads the same
+        // knob the read path evaluates against.
+        promql_lookback_ms: i64::try_from(config.reader.promql_lookback.0.as_millis())
+            .unwrap_or(i64::MAX),
+    }
 }
 
 /// `POST /v1/traces` (docs/api.md §1.1, issue #54): pulls `AppState`'s

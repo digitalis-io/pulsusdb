@@ -1,6 +1,6 @@
-//! `serve::run`: process entry point for every *serving* mode (`all`,
-//! `writer`, `reader` — never `init`, which `main.rs` dispatches to
-//! `schema_init::run` and exits before this module is ever reached).
+//! `serve::run`: process entry point for every mode (`all`, `writer`,
+//! `reader`: every mode serves; the binary creates no schema, issue #619,
+//! so no mode exits before reaching this module).
 //! Initializes tracing, installs the Prometheus recorder, spawns the
 //! background ClickHouse reconnect loop, builds the router, and serves it
 //! with graceful shutdown.
@@ -34,9 +34,9 @@ use crate::chconfig::{
 };
 use crate::ingest::{MetricWriterSink, TraceWriterSink, WriterSink};
 
-/// Startup-time failures specific to the HTTP server layer (config-load and
-/// schema-controller failures are handled separately, in `main.rs` /
-/// `schema_init.rs`, before this module is reached).
+/// Startup-time failures specific to the HTTP server layer (config-load
+/// failures are handled separately, in `main.rs`, before this module is
+/// reached; a missing schema is `StartupError`, retried).
 #[derive(Debug, Error)]
 pub(crate) enum ServeError {
     #[error("PULSUS_CORS_ORIGIN {0:?} is not a valid HTTP header value")]
@@ -467,7 +467,7 @@ fn spawn_reconnect_loop(
                     // with nothing forcing it to also observe
                     // `label_cache_slot` already set; `label_cache_ready`
                     // maps an unset slot to 200 (the correct behavior for
-                    // writer/init modes), so a `None` slot here would let a
+                    // writer mode), so a `None` slot here would let a
                     // concurrent `/ready` probe pass before the cache even
                     // exists. Publishing the slot first closes that window:
                     // `pool_slot = Some` now implies `label_cache_slot =

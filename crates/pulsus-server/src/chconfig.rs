@@ -1,10 +1,10 @@
 //! The `Config` → `ChConnConfig` mappings, in exactly one
 //! place (task-manager resolution on issue #6, carried over from issue #5's
 //! resolution #4): `pulsus-clickhouse` and `pulsus-schema` stay config-free,
-//! and every caller in this binary — the `--mode init` schema controller
-//! (`schema_init.rs`) and the serving startup path (`serve.rs`, which runs
-//! the same schema reconcile before flipping readiness — issue #6 review
-//! fix) — derives its connection settings from these
+//! and every caller in this binary — the serving startup path (`serve.rs`,
+//! which checks the schema `schema/schema.sh` built before flipping
+//! readiness; the binary creates no schema since issue #619) — derives
+//! its connection settings from these
 //! functions.
 
 use std::sync::Arc;
@@ -89,8 +89,8 @@ pub(crate) fn consistency_from(config: &Config) -> ConsistencyConfig {
 /// there yet. `pulsus-schema`'s DDL is fully `{{db}}.`-qualified, so this
 /// binding never affects which database the DDL actually targets
 /// (docs/schemas.md's "CREATE DATABASE chicken-and-egg" edge case). Used by
-/// both `--mode init` (`schema_init.rs`) and the serving reconnect loop's
-/// schema-reconcile step (`serve.rs`).
+/// the serving reconnect loop's schema check (`serve.rs`); the binary
+/// creates no schema since issue #619.
 pub(crate) fn bootstrap_conn_config_from(config: &Config) -> ChConnConfig {
     ChConnConfig {
         database: "default".to_string(),

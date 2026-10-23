@@ -126,8 +126,8 @@ const ROWS: &[Row] = &[
     },
     Row {
         var: "CLICKHOUSE_PROTO",
-        value: "http",
-        check: |c| c.clickhouse.proto == ChProto::Http,
+        value: "https",
+        check: |c| c.clickhouse.proto == ChProto::Https,
     },
     Row {
         var: "CLICKHOUSE_TLS_SKIP_VERIFY",

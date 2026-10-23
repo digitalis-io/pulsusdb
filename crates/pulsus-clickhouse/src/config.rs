@@ -1,7 +1,7 @@
 //! Plain connection-settings struct. Deliberately has no dependency on
 //! `pulsus-config` (issue #2 supplies these values later via a `From`
 //! conversion — that is the single integration point, not a build
-//! dependency). Field names mirror docs/configuration.md §2.
+//! dependency). Each field's comment names the variables it is set from.
 
 use std::borrow::Cow;
 use std::time::Duration;
@@ -161,8 +161,10 @@ pub struct ResolvedEndpoint {
     pub label: String,
 }
 
-/// Connection settings for [`crate::ChClient`]. Every field maps 1:1 to a
-/// docs/configuration.md §2 variable; defaults match that table.
+/// Connection settings for [`crate::ChClient`]. Each field is set from the
+/// documented variables its comment names (docs/configuration.md §§1, 2 and
+/// 4), and `Default` gives each its documented default: `pulsus-server`'s
+/// `conn_config_from_the_default_config_is_the_default` holds the two equal.
 #[derive(Clone, Debug)]
 pub struct ChConnConfig {
     /// `CLICKHOUSE_SERVER` (default `localhost`).
@@ -192,19 +194,22 @@ pub struct ChConnConfig {
     /// #4 — a query-timeout split-brain otherwise leaves the server running
     /// an abandoned query or the client cancelling a valid one).
     pub query_timeout: Duration,
-    /// Multi-endpoint connection list (issue #43). **Empty** (the default)
-    /// means a single endpoint synthesized from `server`/`http_port` —
-    /// byte-for-byte the pre-#43 behavior. When populated, the pool holds
-    /// one `clickhouse::Client` per endpoint and spreads requests across
-    /// them (zone-preferring round-robin).
+    /// `CLICKHOUSE_SERVERS`: the multi-endpoint connection list (issue #43).
+    /// **Empty** (the default) means a single endpoint synthesized from
+    /// `server`/`http_port` — byte-for-byte the pre-#43 behavior. When
+    /// populated, the pool holds one `clickhouse::Client` per endpoint and
+    /// spreads requests across them (zone-preferring round-robin).
     pub endpoints: Vec<ChEndpoint>,
-    /// This PulsusDB node's own availability zone (issue #43). When `Some`,
+    /// `PULSUS_AVAILABILITY_ZONE`, or the zone `PULSUS_AZ_DETECT` finds: this
+    /// PulsusDB node's own availability zone (issue #43). When `Some`,
     /// endpoints whose `zone` matches are preferred; `None` (the default)
     /// spreads evenly across all endpoints. A zone that matches no endpoint
     /// is not an error — the policy degrades to even spreading.
     pub local_zone: Option<String>,
-    /// ClickHouse consistency policy (issue #114): the quorum trio on the
-    /// insert path and `select_sequential_consistency` on the read path.
+    /// ClickHouse consistency policy (issue #114): the quorum trio
+    /// (`CLICKHOUSE_INSERT_QUORUM`, `CLICKHOUSE_INSERT_QUORUM_PARALLEL`,
+    /// `CLICKHOUSE_INSERT_QUORUM_TIMEOUT`) on the insert path and
+    /// `CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY` on the read path.
     /// Default is all-off (strong consistency is opt-in), so this is
     /// byte-for-byte the pre-#114 insert/select behaviour.
     pub consistency: ConsistencyConfig,

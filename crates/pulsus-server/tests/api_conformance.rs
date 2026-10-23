@@ -10,7 +10,7 @@
 //! (architect plan: "no PromQL/LogQL correctness assertions — conformance
 //! asserts status/envelope/headers only"), and every read handler this
 //! matrix drives returns a well-formed `200` with an empty result set
-//! against a freshly-`--mode init`-reconciled, empty database — `/ready`
+//! against a freshly built (`live_db`), empty database — `/ready`
 //! reaching `200` already implies the pool (and, in reader-enabled modes,
 //! the label cache **and** the writer/metric-writer slots — `serve.rs`
 //! constructs the writer(s) *before* publishing the pool slot) are live,

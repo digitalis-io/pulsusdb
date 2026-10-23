@@ -10,8 +10,8 @@ use crate::secret::Secret;
 use crate::timezone::TemplateTimezone;
 use crate::units::{ByteSize, HumanDuration, parse_bytes, parse_duration};
 
-/// Every environment variable documented in docs/configuration.md §§1–8, in
-/// table order. `apply_env` covers this set 1:1 — `tests/env_matrix.rs`
+/// Every environment variable documented in docs/configuration.md §§1–8.
+/// `apply_env` covers this set 1:1 — `tests/env_matrix.rs`
 /// asserts set-equality against it, so an undocumented or unwired variable
 /// is a red build.
 pub const ALL_ENV_VARS: &[&str] = &[
@@ -149,7 +149,7 @@ where
 
 /// Parses one of the `Mode`/`LogLevel`/`ChProto`/`InsertMode`/`TierPolicy`
 /// enums, whose `FromStr::Err` is just the valid-value list (e.g. `"one
-/// of: all, writer, reader, init"`) — this builds the single, complete
+/// of: all, writer, reader"`) — this builds the single, complete
 /// error sentence.
 fn parse_enum<T>(var: &str, v: &str) -> Result<T, ConfigError>
 where

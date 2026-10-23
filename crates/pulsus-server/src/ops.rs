@@ -75,7 +75,7 @@ async fn ready(State(state): State<AppState>) -> Response {
 /// (constructing one always needs a live `ChClient`, unlike `ChPool`'s own
 /// [`ready_from_ping`] decoupling). `None` covers both "not yet constructed
 /// by the reconnect loop" (a reader-enabled process still warming up) and
-/// "this process never mounts the reader subsystem" (writer/init modes) —
+/// "this process never mounts the reader subsystem" (writer mode) —
 /// the latter is permanent, the former resolves once the reconnect loop's
 /// first pass completes; either way, a *present* cache that is not yet warm
 /// is the only branch gated here (issue #30 architect plan).
@@ -458,7 +458,7 @@ mod tests {
 
     /// `label_cache_ready`'s only pure-testable branch (constructing a
     /// `LabelCache` at all needs a live `ChClient`): an unset slot must
-    /// never gate readiness — covers both "writer/init mode, no reader
+    /// never gate readiness — covers both "writer mode, no reader
     /// subsystem" (permanently `None`) and "reader mode, reconnect loop
     /// hasn't constructed the cache yet" (transiently `None`).
     #[test]
