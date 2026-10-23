@@ -608,8 +608,28 @@ const TIER_RELATION_REFUSAL: &str = "must be >= resolution";
 /// * `clickhouse.server` with surrounding whitespace: the template renders
 ///   the value as given, so the schema refuses it rather than trim it.
 /// * `clickhouse.database` empty: no database has an empty name.
-const SCHEMA_STRICTER: &[(&str, &str)] =
-    &[("clickhouse.server", " 5s"), ("clickhouse.database", "")];
+/// * `05s` and `016MiB`, leading zeros: stricter by decision. The positive
+///   duration and byte-size patterns refuse them; `humanDuration` accepts
+///   them, so its keys are not listed.
+const SCHEMA_STRICTER: &[(&str, &str)] = &[
+    ("query_timeout", "05s"),
+    ("log_rollup_resolution", "05s"),
+    ("clickhouse.server", " 5s"),
+    ("clickhouse.database", ""),
+    ("writer.batch_bytes", "016MiB"),
+    ("writer.ingest_queue_bytes", "016MiB"),
+    ("reader.logql_scan_budget_bytes", "016MiB"),
+    ("reader.traceql_tag_lookback", "05s"),
+    ("downsampling.raw_retention", "05s"),
+    ("downsampling.tiers[].resolution", "05s"),
+    ("downsampling.tiers[].retention", "05s"),
+    ("ruler.poll_interval", "05s"),
+    ("ruler.max_result_bytes", "016MiB"),
+];
+
+/// A duration and a byte size with a leading zero, probed at every key in
+/// the reverse direction.
+const LEADING_ZERO_PROBES: &[&str] = &["05s", "016MiB"];
 
 /// The definitions whose values the server trims before parsing: durations
 /// and byte sizes (`units.rs`). Their patterns accept surrounding ASCII
@@ -827,6 +847,11 @@ fn the_chart_schema_accepts_no_value_the_binary_refuses() {
                 }
             }
             padded_keys += 1;
+        }
+        // Leading zeros, which the server accepts and the schema refuses by
+        // decision (`SCHEMA_STRICTER`). Not padded.
+        for probe in LEADING_ZERO_PROBES {
+            reverse.push(serde_norway::Value::String(probe.to_string()));
         }
         for v in candidates {
             let verdict = server_verdict(path, &v);
@@ -1339,9 +1364,11 @@ fn count_regex(hi: u64) -> String {
     format!("(?:{})", parts.join("|"))
 }
 
-/// The pattern a positive byte size with `ceiling` must carry: exactly the
-/// strings whose value is `1..=ceiling`, in every unit the parser takes,
-/// with the surrounding whitespace the parser trims.
+/// The pattern a positive byte size with `ceiling` must carry: the canonical
+/// forms (no leading zero) of the values `1..=ceiling`, in every unit the
+/// parser takes, plus the surrounding whitespace the parser trims. The
+/// parser also accepts leading zeros; the pattern refuses them by decision
+/// (`SCHEMA_STRICTER`).
 fn byte_size_pattern(ceiling: u64) -> String {
     let units: [(&str, u64); 10] = [
         ("", 1),
