@@ -4,7 +4,8 @@ release:
   # accepts for a release name (Helm's own release-name regex caps it at
   # 53) — this is deliberately as long a release name as Helm allows, to
   # exercise the truncation path without needing `fullnameOverride`.
-  name: a-very-long-release-name-that-is-quite-long-abcdef
+  # (Issue #506: it was 50 characters while this comment said 53.)
+  name: a-very-long-release-name-that-is-quite-long-abcdefghi
   namespace: default
 set:
   topology: cluster
@@ -22,6 +23,7 @@ templates:
   - clickhouse-cluster-configmap.yaml
   - clickhouse-keeper-configmap.yaml
   - otel-collector-configmap.yaml
+  - init-job.yaml
 tests:
   - it: given a maximum-length release name, when rendering the writer/reader Services, then both names stay <= 63 chars and remain distinct
     templates:
@@ -39,14 +41,14 @@ tests:
         documentIndex: 1
       - equal:
           path: metadata.name
-          value: a-very-long-release-name-that-is-quite-long-abcdef-pulsu-writer
+          value: a-very-long-release-name-that-is-quite-long-abcdefghi-pu-writer
         documentIndex: 0
       - equal:
           path: metadata.name
-          value: a-very-long-release-name-that-is-quite-long-abcdef-pulsu-reader
+          value: a-very-long-release-name-that-is-quite-long-abcdefghi-pu-reader
         documentIndex: 1
 
-  - it: given a maximum-length release name, when rendering 3 ClickHouse shards, then every shard StatefulSet name stays <= 63 chars and all 3 remain distinct
+  - it: given a maximum-length release name, when rendering 3 ClickHouse shards, then every shard StatefulSet name stays <= 52 chars (its pods carry a `controller-revision-hash` label of `<name>-<hash>`) and all 3 remain distinct
     templates:
       - clickhouse-shard-statefulset.yaml
     asserts:
@@ -54,40 +56,40 @@ tests:
           count: 6 # Service + StatefulSet per shard
       - matchRegex:
           path: metadata.name
-          pattern: "^.{1,63}$"
+          pattern: "^.{1,52}$"
         documentIndex: 1
       - matchRegex:
           path: metadata.name
-          pattern: "^.{1,63}$"
+          pattern: "^.{1,52}$"
         documentIndex: 3
       - matchRegex:
           path: metadata.name
-          pattern: "^.{1,63}$"
+          pattern: "^.{1,52}$"
         documentIndex: 5
       - equal:
           path: metadata.name
-          value: a-very-long-release-name-that-is-quite-long--clickhouse-shard-0
+          value: a-very-long-release-name-that-is-clickhouse-shard-0
         documentIndex: 1
       - equal:
           path: metadata.name
-          value: a-very-long-release-name-that-is-quite-long--clickhouse-shard-1
+          value: a-very-long-release-name-that-is-clickhouse-shard-1
         documentIndex: 3
       - equal:
           path: metadata.name
-          value: a-very-long-release-name-that-is-quite-long--clickhouse-shard-2
+          value: a-very-long-release-name-that-is-clickhouse-shard-2
         documentIndex: 5
 
-  - it: given a maximum-length release name, when rendering the Keeper StatefulSet, then its name stays <= 63 chars
+  - it: given a maximum-length release name, when rendering the Keeper StatefulSet, then its name stays <= 52 chars (its pods carry a `controller-revision-hash` label of `<name>-<hash>`)
     templates:
       - clickhouse-keeper-statefulset.yaml
     documentIndex: 1
     asserts:
       - matchRegex:
           path: metadata.name
-          pattern: "^.{1,63}$"
+          pattern: "^.{1,52}$"
       - equal:
           path: metadata.name
-          value: a-very-long-release-name-that-is-quite-long-a-clickhouse-keeper
+          value: a-very-long-release-name-that-is-q-clickhouse-keeper
 
   - it: given a maximum-length release name, when rendering the otel-collector Deployment, then its name stays <= 63 chars
     templates:
@@ -100,3 +102,28 @@ tests:
       - equal:
           path: metadata.name
           value: a-very-long-release-name-that-is-quite-long-abcd-otel-collector
+
+  - it: given a maximum-length release name, when rendering the schema Job, then its name with the digest suffix stays <= 63 chars (issue #506)
+    templates:
+      - init-job.yaml
+    asserts:
+      - matchRegex:
+          path: metadata.name
+          pattern: "^.{1,63}$"
+      - matchRegex:
+          path: metadata.name
+          pattern: "^a-very-long-release-name-that-is-quite-long-abcde-init-[0-9a-f]{8}$"
+
+  - it: given a release name whose cut lands inside a run of hyphens, when rendering the Keeper StatefulSet, then the whole run is dropped before the suffix (issue #506)
+    release:
+      name: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa---bbbbbbbbbbbbbbbbbb
+    templates:
+      - clickhouse-keeper-statefulset.yaml
+    documentIndex: 1
+    asserts:
+      - equal:
+          path: metadata.name
+          value: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-clickhouse-keeper
+      - notMatchRegex:
+          path: metadata.name
+          pattern: "--"

@@ -17,5 +17,7 @@ serde_norway.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-# `tests/refused_modes.rs` matches its mention patterns with it.
+# `tests/refused_modes.rs` matches its mention patterns with it, and
+# the chart-schema sweep in `tests/chart_surface.rs` evaluates the schema's
+# `pattern` keywords.
 regex.workspace = true

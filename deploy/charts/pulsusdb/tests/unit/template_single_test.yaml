@@ -65,6 +65,37 @@ tests:
           path: data["config.yaml"]
           pattern: "auth_password"
 
+  - it: given pulsusdb.auth.user, when rendering the ConfigMap, then config.yaml carries it as auth_user (the one key the template adds)
+    templates:
+      - configmap.yaml
+    set:
+      pulsusdb.auth.user: "admin"
+      pulsusdb.auth.password: "x"
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: "(?m)^auth_user: admin$"
+
+  - it: given an external ClickHouse, when rendering the ConfigMap, then config.yaml carries clickhouse.server exactly as given (no rewrite)
+    templates:
+      - configmap.yaml
+    set:
+      clickhouse.enabled: false
+      clickhouse.auth.existingSecret: "ch-credentials"
+      pulsusdb.config.clickhouse.server: "ch.example.com"
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: "(?m)^  server: ch.example.com$"
+
+  - it: given no pulsusdb.auth.user, when rendering the ConfigMap, then config.yaml has no auth_user key
+    templates:
+      - configmap.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: "auth_user"
+
   - it: given default values, when rendering the ConfigMap, then clickhouse.server resolves to the bundled single-node entry Service
     templates:
       - configmap.yaml

@@ -21,3 +21,22 @@ Feature: helm upgrade rolls pods, and the schema is not theirs to build
     And every pod in the release reaches Ready within the timeout budget
     And the release status is deployed
     And replacement pods were not Ready until their readiness probe passed
+
+  # Issue #506. The schema Job's name is a digest of its whole `spec`: a value
+  # the Job does not carry leaves it alone, and a value it does carry replaces
+  # it. Before that, both upgrades were refused with `field is immutable`.
+  Scenario: Upgrading a value the schema Job does not carry succeeds
+    Given a Kind cluster with the locally-built pulsusdb image loaded
+    And a running pulsusdb release installed with default values
+    When I helm upgrade the release with "--set pulsusdb.config.reader.cache_ttl=30s"
+    Then the upgrade succeeds
+    And every pod in the release reaches Ready within the timeout budget
+    And the release status is deployed
+
+  Scenario: Upgrading the schema Job's own resources replaces the Job and the release reaches Ready
+    Given a Kind cluster with the locally-built pulsusdb image loaded
+    And a running pulsusdb release installed with default values
+    When I helm upgrade the release with "--set initJob.resources.limits.memory=2Gi"
+    Then the upgrade succeeds
+    And every pod in the release reaches Ready within the timeout budget
+    And the release status is deployed
