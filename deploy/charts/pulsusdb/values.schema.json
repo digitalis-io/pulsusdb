@@ -304,12 +304,39 @@
       "description": "A Kubernetes resource quantity with a REQUIRED binary/decimal unit suffix, used for persistence sizes only (AC #4's literal negative case: \"10\" with no unit is rejected — a bare byte count is essentially always a typo for a volume size, unlike cpu/memory where a bare number is meaningful)."
     },
     "humanDuration": {
+      "type": "string",
+      "pattern": "^[0-9]{1,13}(ms|s|m|h|d|w)$",
+      "description": "pulsus-config's HumanDuration where zero is allowed: digits then ms|s|m|h|d|w, no space (docs/configuration.md §9). Thirteen digits keep every unit inside the parser's 64-bit range."
+    },
+    "positiveHumanDuration": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,12}(ms|s|m|h|d|w)$",
+      "description": "A HumanDuration the binary refuses at zero."
+    },
+    "nullablePositiveHumanDuration": {
       "type": ["string", "null"],
-      "description": "pulsus-config's HumanDuration: ms|s|m|h|d|w suffixed (docs/configuration.md §9). Not pattern-validated here — pulsus-config itself rejects a malformed value at startup with an actionable error; this schema only constrains the type."
+      "pattern": "^[1-9][0-9]{0,12}(ms|s|m|h|d|w)$",
+      "description": "A positive HumanDuration that may be null (unset)."
     },
     "byteSize": {
-      "type": ["string", "integer"],
-      "description": "pulsus-config's ByteSize: binary (KiB/MiB/GiB/TiB), decimal (KB/MB/GB/TB), or a bare integer of bytes (docs/configuration.md §9). Not pattern-validated here — see humanDuration's note."
+      "type": ["string", "integer"], "minimum": 1, "maximum": 9007199254740991,
+      "pattern": "^(?:(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|[1-9][0-9]{8}|[1-9][0-9]{9}|[1-9][0-9]{10}|[1-9][0-9]{11}|[1-9][0-9]{12}|[1-9][0-9]{13}|[1-9][0-9]{14}|[1-8][0-9]{15}|900[0-6][0-9]{12}|90070[0-9]{11}|90071[0-8][0-9]{10}|900719[0-8][0-9]{9}|9007199[0-1][0-9]{8}|90071992[0-4][0-9]{7}|900719925[0-3][0-9]{6}|9007199254[0-6][0-9]{5}|90071992547[0-3][0-9]{4}|9007199254740[0-8][0-9]{2}|90071992547409[0-8][0-9]|900719925474099[0-1])|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|[1-9][0-9]{8}|[1-9][0-9]{9}|[1-9][0-9]{10}|[1-9][0-9]{11}|[1-9][0-9]{12}|[1-9][0-9]{13}|[1-9][0-9]{14}|[1-8][0-9]{15}|900[0-6][0-9]{12}|90070[0-9]{11}|90071[0-8][0-9]{10}|900719[0-8][0-9]{9}|9007199[0-1][0-9]{8}|90071992[0-4][0-9]{7}|900719925[0-3][0-9]{6}|9007199254[0-6][0-9]{5}|90071992547[0-3][0-9]{4}|9007199254740[0-8][0-9]{2}|90071992547409[0-8][0-9]|900719925474099[0-1])B|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|[1-9][0-9]{8}|[1-9][0-9]{9}|[1-9][0-9]{10}|[1-9][0-9]{11}|[1-8][0-9]{12}|900[0-6][0-9]{9}|90070[0-9]{8}|90071[0-8][0-9]{7}|900719[0-8][0-9]{6}|9007199[0-1][0-9]{5}|90071992[0-4][0-9]{4}|900719925[0-3][0-9]{3}|9007199254[0-6][0-9]{2}|90071992547[0-3][0-9]|9007199254740)KB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|[1-9][0-9]{8}|[1-8][0-9]{9}|900[0-6][0-9]{6}|90070[0-9]{5}|90071[0-8][0-9]{4}|900719[0-8][0-9]{3}|9007199[0-1][0-9]{2}|90071992[0-4][0-9]|900719925[0-4])MB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-8][0-9]{6}|900[0-6][0-9]{3}|9007[0-1][0-9]{2})GB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-8][0-9]{3}|900[0-7])TB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|[1-9][0-9]{8}|[1-9][0-9]{9}|[1-9][0-9]{10}|[1-9][0-9]{11}|[1-7][0-9]{12}|8[0-6][0-9]{11}|87[0-8][0-9]{10}|879[0-5][0-9]{9}|87960[0-8][0-9]{7}|879609[0-2][0-9]{6}|87960930[0-1][0-9]{4}|879609302[0-1][0-9]{3}|8796093022[0-1][0-9]{2}|879609302220[0-7])KiB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|[1-9][0-9]{8}|[1-7][0-9]{9}|8[0-4][0-9]{8}|85[0-7][0-9]{7}|858[0-8][0-9]{6}|8589[0-8][0-9]{5}|85899[0-2][0-9]{4}|858993[0-3][0-9]{3}|8589934[0-4][0-9]{2}|85899345[0-8][0-9]|858993459[0-1])MiB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-7][0-9]{6}|8[0-2][0-9]{5}|83[0-7][0-9]{4}|838[0-7][0-9]{3}|8388[0-5][0-9]{2}|838860[0-7])GiB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-7][0-9]{3}|80[0-9]{2}|81[0-8][0-9]|819[0-1])TiB)$",
+      "description": "pulsus-config's ByteSize where the binary has no ceiling: at most 2^53-1 bytes, the maximum safe integer for readers based on binary64 (IEEE 754 double) numbers. The pattern accepts exactly the strings whose value is between 1 and that maximum: a bare integer, or digits with B, KB, MB, GB, TB, KiB, MiB, GiB or TiB, no space."
+    },
+    "batchBytes": {
+      "type": ["string", "integer"], "minimum": 1, "maximum": 17179869184,
+      "pattern": "^(?:(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|[1-9][0-9]{8}|[1-9][0-9]{9}|1[0-6][0-9]{9}|170[0-9]{8}|171[0-6][0-9]{7}|1717[0-8][0-9]{6}|17179[0-7][0-9]{5}|171798[0-5][0-9]{4}|1717986[0-8][0-9]{3}|171798690[0-9]{2}|171798691[0-7][0-9]|1717986918[0-4])|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|[1-9][0-9]{8}|[1-9][0-9]{9}|1[0-6][0-9]{9}|170[0-9]{8}|171[0-6][0-9]{7}|1717[0-8][0-9]{6}|17179[0-7][0-9]{5}|171798[0-5][0-9]{4}|1717986[0-8][0-9]{3}|171798690[0-9]{2}|171798691[0-7][0-9]|1717986918[0-4])B|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|1[0-6][0-9]{6}|170[0-9]{5}|171[0-6][0-9]{4}|1717[0-8][0-9]{3}|17179[0-7][0-9]{2}|171798[0-6][0-9])KB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|1[0-6][0-9]{3}|170[0-9]{2}|171[0-7][0-9])MB|(?:[1-9]|1[0-7])GB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|1[0-5][0-9]{6}|16[0-6][0-9]{5}|167[0-6][0-9]{4}|1677[0-6][0-9]{3}|16777[0-1][0-9]{2}|1677720[0-9]|1677721[0-6])KiB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|1[0-5][0-9]{3}|16[0-2][0-9]{2}|163[0-7][0-9]|1638[0-4])MiB|(?:[1-9]|1[0-6])GiB)$",
+      "description": "pulsus-config's ByteSize under the binary's ceiling. Both forms are bounded by it: the integer by `maximum`, the string by the pattern, which accepts exactly the strings whose value is between 1 and the ceiling."
+    },
+    "ingestQueueBytes": {
+      "type": ["string", "integer"], "minimum": 1, "maximum": 274877906944,
+      "pattern": "^(?:(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|[1-9][0-9]{8}|[1-9][0-9]{9}|[1-9][0-9]{10}|1[0-9]{11}|2[0-6][0-9]{10}|27[0-3][0-9]{9}|274[0-7][0-9]{8}|2748[0-6][0-9]{7}|27487[0-6][0-9]{6}|274877[0-8][0-9]{5}|27487790[0-5][0-9]{3}|274877906[0-8][0-9]{2}|2748779069[0-3][0-9]|27487790694[0-4])|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|[1-9][0-9]{8}|[1-9][0-9]{9}|[1-9][0-9]{10}|1[0-9]{11}|2[0-6][0-9]{10}|27[0-3][0-9]{9}|274[0-7][0-9]{8}|2748[0-6][0-9]{7}|27487[0-6][0-9]{6}|274877[0-8][0-9]{5}|27487790[0-5][0-9]{3}|274877906[0-8][0-9]{2}|2748779069[0-3][0-9]|27487790694[0-4])B|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|1[0-9]{8}|2[0-6][0-9]{7}|27[0-3][0-9]{6}|274[0-7][0-9]{5}|2748[0-6][0-9]{4}|27487[0-6][0-9]{3}|274877[0-8][0-9]{2}|27487790[0-6])KB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|1[0-9]{5}|2[0-6][0-9]{4}|27[0-3][0-9]{3}|274[0-7][0-9]{2}|2748[0-6][0-9]|27487[0-7])MB|(?:[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-6][0-9]|27[0-4])GB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|1[0-9]{8}|2[0-5][0-9]{7}|26[0-7][0-9]{6}|268[0-3][0-9]{5}|2684[0-2][0-9]{4}|26843[0-4][0-9]{3}|268435[0-3][0-9]{2}|2684354[0-4][0-9]|26843545[0-6])KiB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|1[0-9]{5}|2[0-5][0-9]{4}|26[0-1][0-9]{3}|2620[0-9]{2}|2621[0-3][0-9]|26214[0-4])MiB|(?:[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-6])GiB)$",
+      "description": "pulsus-config's ByteSize under the binary's ceiling. Both forms are bounded by it: the integer by `maximum`, the string by the pattern, which accepts exactly the strings whose value is between 1 and the ceiling."
+    },
+    "logqlScanBudgetBytes": {
+      "type": ["string", "integer"], "minimum": 1, "maximum": 54975581388800,
+      "pattern": "^(?:(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|[1-9][0-9]{8}|[1-9][0-9]{9}|[1-9][0-9]{10}|[1-9][0-9]{11}|[1-9][0-9]{12}|[1-4][0-9]{13}|5[0-3][0-9]{12}|54[0-8][0-9]{11}|549[0-6][0-9]{10}|5497[0-4][0-9]{9}|54975[0-4][0-9]{8}|549755[0-7][0-9]{7}|54975580[0-9]{6}|54975581[0-2][0-9]{5}|549755813[0-7][0-9]{4}|5497558138[0-7][0-9]{3}|54975581388[0-7][0-9]{2}|54975581388800)|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|[1-9][0-9]{8}|[1-9][0-9]{9}|[1-9][0-9]{10}|[1-9][0-9]{11}|[1-9][0-9]{12}|[1-4][0-9]{13}|5[0-3][0-9]{12}|54[0-8][0-9]{11}|549[0-6][0-9]{10}|5497[0-4][0-9]{9}|54975[0-4][0-9]{8}|549755[0-7][0-9]{7}|54975580[0-9]{6}|54975581[0-2][0-9]{5}|549755813[0-7][0-9]{4}|5497558138[0-7][0-9]{3}|54975581388[0-7][0-9]{2}|54975581388800)B|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|[1-9][0-9]{8}|[1-9][0-9]{9}|[1-4][0-9]{10}|5[0-3][0-9]{9}|54[0-8][0-9]{8}|549[0-6][0-9]{7}|5497[0-4][0-9]{6}|54975[0-4][0-9]{5}|549755[0-7][0-9]{4}|54975580[0-9]{3}|54975581[0-2][0-9]{2}|549755813[0-7][0-9]|5497558138[0-8])KB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-4][0-9]{7}|5[0-3][0-9]{6}|54[0-8][0-9]{5}|549[0-6][0-9]{4}|5497[0-4][0-9]{3}|54975[0-4][0-9]{2}|549755[0-7][0-9]|5497558[0-1])MB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-4][0-9]{4}|5[0-3][0-9]{3}|54[0-8][0-9]{2}|549[0-6][0-9]|5497[0-5])GB|(?:[1-9]|[1-4][0-9]|5[0-4])TB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-9][0-9]{7}|[1-9][0-9]{8}|[1-9][0-9]{9}|[1-4][0-9]{10}|5[0-2][0-9]{9}|53[0-5][0-9]{8}|536[0-7][0-9]{7}|5368[0-6][0-9]{6}|536870[0-8][0-9]{4}|53687090[0-9]{3}|53687091[0-1][0-9]{2}|53687091200)KiB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-9][0-9]{4}|[1-9][0-9]{5}|[1-9][0-9]{6}|[1-4][0-9]{7}|5[0-1][0-9]{6}|52[0-3][0-9]{5}|524[0-1][0-9]{4}|5242[0-7][0-9]{3}|52428[0-7][0-9]{2}|52428800)MiB|(?:[1-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-4][0-9]{4}|50[0-9]{3}|51[0-1][0-9]{2}|51200)GiB|(?:[1-9]|[1-4][0-9]|50)TiB)$",
+      "description": "pulsus-config's ByteSize under the binary's ceiling. Both forms are bounded by it: the integer by `maximum`, the string by the pattern, which accepts exactly the strings whose value is between 1 and the ceiling."
     },
     "resources": {
       "type": "object",
@@ -360,42 +387,42 @@
     "pulsusdbConfig": {
       "type": "object",
       "additionalProperties": false,
-      "description": "1:1 with docs/configuration.md §9's YAML schema (secrets excluded) — pulsus-config's own `Config` struct is `#[serde(deny_unknown_fields)]`, so additionalProperties:false here matches the product's real behaviour exactly, not just this chart's convention.",
+      "description": "A subset of docs/configuration.md §9's YAML schema (secrets excluded) — pulsus-config's own `Config` struct is `#[serde(deny_unknown_fields)]`, so additionalProperties:false here matches the product's behaviour exactly, not just this chart's convention.",
       "properties": {
         "host": { "type": "string" },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "log_level": { "type": "string", "enum": ["error", "warn", "info", "debug", "trace"] },
         "compat_endpoints": { "type": "boolean" },
         "cors_origin": { "type": "string" },
-        "query_timeout": { "$ref": "#/definitions/humanDuration" },
+        "query_timeout": { "$ref": "#/definitions/positiveHumanDuration" },
         "skip_ddl": { "type": "boolean" },
-        "retention_days": { "type": "integer", "minimum": 1 },
+        "retention_days": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
         "storage_policy": { "type": ["string", "null"] },
-        "log_rollup_resolution": { "$ref": "#/definitions/humanDuration" },
+        "log_rollup_resolution": { "$ref": "#/definitions/positiveHumanDuration" },
         "cluster": { "type": ["string", "null"] },
-        "dist_suffix": { "type": "string" },
+        "dist_suffix": { "type": "string", "minLength": 1 },
         "skip_unavailable_shards": { "type": "boolean" },
         "clickhouse": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "server": { "type": "string" },
+            "server": { "type": "string", "pattern": "^(\\S(.*\\S)?)?$", "$comment": "No leading or trailing whitespace: the template renders the value as given." },
             "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
             "http_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
             "database": { "type": "string", "minLength": 1 },
             "proto": { "type": "string", "enum": ["http", "https"] },
             "tls_skip_verify": { "type": "boolean" },
-            "pool_size": { "type": "integer", "minimum": 1 }
+            "pool_size": { "type": "integer", "minimum": 1, "maximum": 8000 }
           }
         },
         "writer": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "batch_bytes": { "$ref": "#/definitions/byteSize" },
-            "batch_ms": { "type": "integer", "minimum": 1 },
+            "batch_bytes": { "$ref": "#/definitions/batchBytes" },
+            "batch_ms": { "type": "integer", "minimum": 1, "maximum": 200000 },
             "insert_mode": { "type": "string", "enum": ["sync", "async"] },
-            "ingest_queue_bytes": { "$ref": "#/definitions/byteSize" }
+            "ingest_queue_bytes": { "$ref": "#/definitions/ingestQueueBytes" }
           }
         },
         "reader": {
@@ -403,20 +430,23 @@
           "additionalProperties": false,
           "properties": {
             "cache_ttl": { "$ref": "#/definitions/humanDuration" },
-            "cache_max_series": { "type": "integer", "minimum": 1 },
+            "cache_max_series": { "type": "integer", "minimum": 1, "maximum": 50000000 },
             "cache_window": { "$ref": "#/definitions/humanDuration" },
-            "promql_max_samples": { "type": "integer", "minimum": 1 },
+            "promql_max_samples": { "type": "integer", "minimum": 1, "maximum": 50000000000 },
             "promql_lookback": { "$ref": "#/definitions/humanDuration" },
-            "logql_scan_budget_bytes": { "$ref": "#/definitions/byteSize" },
-            "traceql_tag_lookback": { "$ref": "#/definitions/humanDuration" }
+            "logql_scan_budget_bytes": { "$ref": "#/definitions/logqlScanBudgetBytes" },
+            "traceql_tag_lookback": { "$ref": "#/definitions/positiveHumanDuration" }
           }
         },
         "downsampling": {
           "type": "object",
           "additionalProperties": false,
+          "$comment": "The binary refuses enabled: true with no tiers.",
+          "if": { "properties": { "enabled": { "const": true } } },
+          "then": { "properties": { "tiers": { "minItems": 1 } } },
           "properties": {
             "enabled": { "type": "boolean" },
-            "raw_retention": { "$ref": "#/definitions/humanDuration" },
+            "raw_retention": { "$ref": "#/definitions/nullablePositiveHumanDuration" },
             "tier_policy": { "type": "string", "enum": ["exact", "fast"] },
             "tiers": {
               "type": "array",
@@ -426,10 +456,10 @@
                 "required": ["name", "resolution", "table", "retention", "min_step"],
                 "properties": {
                   "name": { "type": "string", "minLength": 1 },
-                  "resolution": { "$ref": "#/definitions/humanDuration" },
+                  "resolution": { "$ref": "#/definitions/positiveHumanDuration" },
                   "table": { "type": "string", "minLength": 1 },
-                  "retention": { "$ref": "#/definitions/humanDuration" },
-                  "min_step": { "$ref": "#/definitions/humanDuration" }
+                  "retention": { "$ref": "#/definitions/positiveHumanDuration" },
+                  "min_step": { "$ref": "#/definitions/positiveHumanDuration" }
                 }
               }
             }
@@ -440,7 +470,7 @@
           "additionalProperties": false,
           "properties": {
             "enabled": { "type": "boolean" },
-            "poll_interval": { "$ref": "#/definitions/humanDuration" },
+            "poll_interval": { "$ref": "#/definitions/positiveHumanDuration" },
             "max_result_bytes": { "$ref": "#/definitions/byteSize" }
           }
         }

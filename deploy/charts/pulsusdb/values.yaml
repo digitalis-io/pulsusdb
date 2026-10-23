@@ -1,10 +1,10 @@
 # Default values for the pulsusdb chart.
 #
-# `pulsusdb.config` maps 1:1 onto docs/configuration.md §9's YAML document
-# schema (issue #38 AC #14 / architect plan) — every key here that lands in
-# the rendered ConfigMap `config.yaml` is a real `pulsus-config` field, no
-# invented keys. Secrets (`auth_password`, the ClickHouse password half of
-# `CLICKHOUSE_AUTH`) are deliberately **not** represented in
+# `pulsusdb.config` carries a subset of docs/configuration.md §9's YAML
+# document schema (issue #38 AC #14 / architect plan) — every key here that
+# lands in the rendered ConfigMap `config.yaml` is a `pulsus-config`
+# field, no invented keys. Secrets (`auth_password`, the ClickHouse password
+# half of `CLICKHOUSE_AUTH`) are deliberately **not** represented in
 # `pulsusdb.config` — they are chart-only values under `pulsusdb.auth` /
 # `clickhouse.auth`, rendered into a Secret and injected as env vars, which
 # win over the YAML file per the documented precedence (docs/
@@ -43,8 +43,8 @@ topology: single
 
 pulsusdb:
   # -- Process-split axis (orthogonal to `topology` above): false (default)
-  # renders one `--mode all` Deployment (schema controller + writer +
-  # reader in one process, docs/architecture.md §1); true renders separate
+  # renders one `--mode all` Deployment (writer + reader in one process,
+  # docs/architecture.md §1); true renders separate
   # `--mode writer` and `--mode reader` Deployments, independently scaled.
   split:
     enabled: false
@@ -69,7 +69,7 @@ pulsusdb:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { cpu: "2", memory: 2Gi }
 
-  # -- 1:1 with docs/configuration.md §9's YAML schema (secrets excluded,
+  # -- A subset of docs/configuration.md §9's YAML schema (secrets excluded,
   # see `pulsusdb.auth` / `clickhouse.auth` below) — deliberately snake_case
   # to match that schema's field names exactly, so `templates/configmap.yaml`
   # can render this whole subtree with a single `toYaml`, no key-renaming
@@ -152,7 +152,8 @@ pulsusdb:
   # -- Escape hatch for any `PULSUS_*`/`CLICKHOUSE_*` env override the
   # structured `config`/`auth` values above don't (yet) expose — a
   # standard `[{name, value}, ...]` or `[{name, valueFrom}, ...]` list,
-  # appended after the chart's own env vars so it can override them.
+  # appended after the chart's own env vars in every pulsusdb container,
+  # the schema Job's included, so it can override them.
   extraEnv: []
 
   # -- The writer's insert-failure spool volume, mounted at
@@ -173,36 +174,37 @@ pulsusdb:
 # unready and logs the command to run.
 #
 # The script **drops the configured database and builds it fresh**, and the
-# Job's name carries a digest of the schema parameters, so:
+# Job's name carries a digest of the Job's whole `spec`, so:
 #
 #   * an install runs it once;
-#   * an upgrade that changes a schema parameter renders a new Job, which
+#   * an upgrade that changes anything the Job carries (a schema parameter,
+#     the image, `initJob.resources`, `initJob.backoffLimit`, the pod
+#     security contexts, `pulsusdb.extraEnv`, ...) renders a new Job, which
 #     runs again and **discards what the database holds**. That is the cost
 #     this design states: there are no migrations, and a schema change costs
 #     a drop and a rebuild;
-#   * an upgrade that changes anything else leaves it alone.
+#   * an upgrade that changes nothing the Job carries leaves it alone.
 #
-# `templates/init-job.yaml` says which parameters have that property and why
-# the name is built this way.
+# `templates/init-job.yaml` says why the name is built this way.
 initJob:
   enabled: true
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }
-  # -- Attempts the schema Job gets. Generous, because its first attempt can
+  # -- The schema Job's retry limit: how many times a failed run is retried
+  # before the Job is marked failed. Generous, because its first run can
   # legitimately find the cluster incomplete: a sharded install creates every
   # shard's StatefulSet alongside this Job, and `ON CLUSTER` DDL needs all of
   # them. The script waits `PULSUS_SCHEMA_WAIT_SECONDS` (300 by default) for
-  # that on its own, and these attempts are what follows if it still was not.
+  # that on its own, and these retries are what follows if it still was not.
   backoffLimit: 10
 
 clickhouse:
   # -- false => external/production ClickHouse: point
   # `pulsusdb.config.clickhouse.server` (+ `port`/`database`/...) at it and
-  # supply credentials via `pulsusdb.auth.clickhousePassword` or
-  # `clickhouse.auth.existingSecret`. The bundled StatefulSet(s) below are a
-  # CI/compose-fixture-parity convenience, not a hardened HA ClickHouse —
-  # see README.md's production guidance.
+  # supply credentials via `clickhouse.auth.existingSecret`. The bundled
+  # StatefulSet(s) below are a CI/compose-fixture-parity convenience, not a
+  # hardened HA ClickHouse — see README.md's production guidance.
   enabled: true
   # -- Pinned to a full patch tag, not a floating `26.8` minor (code
   # review round-1 [low] finding #12) — `26.8` can resolve to a different
@@ -259,10 +261,8 @@ clickhouse:
   # 101). `readOnlyRootFilesystem: true` is safe only because
   # `/var/lib/clickhouse` (PVC/emptyDir), `/var/log/clickhouse-server`,
   # and `/tmp` are all dedicated writable volumes the chart always mounts
-  # (same pairing discipline as pulsusdb's own spool volume). Not
-  # independently verified against a live cluster in this sandbox (no
-  # docker/kind available) — values-overridable if a real cluster run
-  # surfaces a permission issue.
+  # (same pairing discipline as pulsusdb's own spool volume).
+  # Values-overridable.
   podSecurityContext:
     runAsNonRoot: true
     runAsUser: 101
@@ -294,7 +294,7 @@ clickhouse:
 
 persistence:
   # -- ClickHouse data volumes only (pulsusdb itself is stateless except
-  # for its spool, see `securityContext`/`extraVolumes` below).
+  # for its spool, see `pulsusdb.spool` above).
   enabled: true
   size: 20Gi
   storageClass: ""
@@ -331,7 +331,7 @@ otelCollector:
 grafana:
   # -- Parity with `deploy/e2e/grafana/provisioning/datasources/loki.yaml`;
   # off by default because the datasource only works when
-  # `pulsusdb.config.compatEndpoints=true` (docs/configuration.md §1,
+  # `pulsusdb.config.compat_endpoints=true` (docs/configuration.md §1,
   # docs/api.md §8) — NOTES.txt/README call this coupling out.
   datasourceProvisioning:
     enabled: false
@@ -413,8 +413,9 @@ podDisruptionBudget:
   enabled: false
   minAvailable: 1
 
-# -- Additional pod-level annotations/labels for every workload this chart
-# renders (pulsusdb, ClickHouse, otel-collector).
+# -- Additional pod-level annotations/labels for the pulsusdb Deployments
+# (not the ClickHouse, Keeper or collector pods). `nodeSelector`,
+# `tolerations` and `affinity` below apply to the same Deployments only.
 podAnnotations: {}
 podLabels: {}
 

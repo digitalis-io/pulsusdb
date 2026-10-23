@@ -84,6 +84,9 @@ jobs:
       - name: Golden snapshot check self-test
         run: bash deploy/charts/pulsusdb/tests/golden/check_self_test.sh
 
+      - name: Render checks (schema Job name, extraEnv order)
+        run: bash deploy/charts/pulsusdb/tests/render_test.sh
+
   chart-unittest:
     runs-on: ubuntu-latest
     steps:

@@ -34,13 +34,22 @@ colliding. This helper truncates the **base** name to `63 - len(suffix)`
 *before* appending the suffix, so the full result is always <= 63 chars
 and distinct suffixes can never collide with each other regardless of
 release-name length. `(dict "root" $ "suffix" "-clickhouse-shard-0")`.
+
+Issue #506: an optional `reserve` keeps that many more characters free for
+text appended after this helper. The schema Job appends `-<8 hex digest>`
+(reserve 9) and must stay within 63, the length of the `job-name` label
+Kubernetes puts on its pods. A StatefulSet's pods carry a
+`controller-revision-hash` label of `<name>-<hash>` (a hash of up to 10
+characters), so every StatefulSet name reserves 11 and stays within 52.
+`tests/render_test.sh` check D renders every name with a 53-character
+release name and holds each kind to its limit.
 */}}
 {{- define "pulsusdb.componentFullname" -}}
 {{- $suffix := .suffix -}}
 {{- $base := include "pulsusdb.fullname" .root -}}
-{{- $maxBase := sub 63 (len $suffix) | int -}}
+{{- $maxBase := sub (sub 63 (len $suffix)) (default 0 .reserve) | int -}}
 {{- if gt (len $base) $maxBase -}}
-{{- $base = trunc $maxBase $base -}}
+{{- $base = regexReplaceAll "-+$" (trunc $maxBase $base) "" -}}
 {{- end -}}
 {{- printf "%s%s" $base $suffix -}}
 {{- end -}}
@@ -168,23 +177,23 @@ so it is *not* merged into this helper.
 === ClickHouse naming/resolution helpers ===
 AC #3 resolution (round-1 amendment §3): pulsusdb's config carries exactly
 one `clickhouse.server` entry point + `cluster: <name>`; ClickHouse's own
-Distributed engine (`remote_servers.xml`, `clickhouse-configmap.yaml`) is
+Distributed engine (`remote_servers.xml`, `clickhouse-cluster-configmap.yaml`) is
 where all N shard endpoints actually live. pulsusdb does not, and cannot
 today, load-balance across shards itself (documented product gap, linked
 follow-up filed at close).
 */}}
 
 {{- define "pulsusdb.clickhouseFullname" -}}
-{{- include "pulsusdb.componentFullname" (dict "root" . "suffix" "-clickhouse") -}}
+{{- include "pulsusdb.componentFullname" (dict "root" . "suffix" "-clickhouse" "reserve" 11) -}}
 {{- end -}}
 
 {{- define "pulsusdb.clickhouseKeeperFullname" -}}
-{{- include "pulsusdb.componentFullname" (dict "root" . "suffix" "-clickhouse-keeper") -}}
+{{- include "pulsusdb.componentFullname" (dict "root" . "suffix" "-clickhouse-keeper" "reserve" 11) -}}
 {{- end -}}
 
 {{/* `(dict "root" $ "shard" 0)` -> "<fullname>-clickhouse-shard-0" (truncated-safe) */}}
 {{- define "pulsusdb.clickhouseShardFullname" -}}
-{{- include "pulsusdb.componentFullname" (dict "root" .root "suffix" (printf "-clickhouse-shard-%d" (int .shard))) -}}
+{{- include "pulsusdb.componentFullname" (dict "root" .root "suffix" (printf "-clickhouse-shard-%d" (int .shard)) "reserve" 11) -}}
 {{- end -}}
 
 {{/*
@@ -320,16 +329,21 @@ hard startup error in the product (docs/configuration.md §1).
 {{- end -}}
 
 {{/*
-Env vars every pulsusdb-serving container (`all`/`writer`/`reader`/the
-optional init Job) shares: ClickHouse credentials (always — every mode
+Env vars shared by the serving containers (`all`/`writer`/`reader`) and the
+schema Job: ClickHouse credentials (always — every mode
 connects to ClickHouse) via the Kubernetes "dependent environment
 variables" `$(VAR)` substitution (combines the plaintext username with a
 Secret-sourced password into the single `CLICKHOUSE_AUTH=user:password`
 string `pulsus-config` expects — there is no separate password-only env
-var upstream), optional `PULSUS_AUTH_PASSWORD`, then `extraEnv` last so it
-can override any of the above.
+var upstream), optional `PULSUS_AUTH_PASSWORD` (not on the schema Job, which
+serves no HTTP and whose `spec` digest would otherwise make enabling auth
+rebuild the database), the schema parameters on the Job only, then
+`extraEnv` last so it can override any of the above, in every container.
+Call with `(dict "root" $ "mode" <mode>)`.
 */}}
 {{- define "pulsusdb.commonEnv" -}}
+{{- $mode := .mode -}}
+{{- with .root -}}
 - name: CLICKHOUSE_AUTH_PASSWORD_ONLY
   valueFrom:
     secretKeyRef:
@@ -337,16 +351,20 @@ can override any of the above.
       key: {{ include "pulsusdb.clickhouseSecretKey" . }}
 - name: CLICKHOUSE_AUTH
   value: {{ printf "%s:$(CLICKHOUSE_AUTH_PASSWORD_ONLY)" (include "pulsusdb.clickhouseAuthUser" .) | quote }}
-{{- if or .Values.pulsusdb.auth.password .Values.pulsusdb.auth.existingSecret }}
+{{- if and (ne $mode "schema") (or .Values.pulsusdb.auth.password .Values.pulsusdb.auth.existingSecret) }}
 - name: PULSUS_AUTH_PASSWORD
   valueFrom:
     secretKeyRef:
       name: {{ if .Values.pulsusdb.auth.existingSecret }}{{ .Values.pulsusdb.auth.existingSecret }}{{ else }}{{ include "pulsusdb.fullname" . }}-auth{{ end }}
       key: PULSUS_AUTH_PASSWORD
 {{- end }}
+{{- if eq $mode "schema" }}
+{{ include "pulsusdb.schemaEnv" . }}
+{{- end }}
 {{- range .Values.pulsusdb.extraEnv }}
 {{ toYaml (list .) }}
 {{- end }}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -470,7 +488,7 @@ defaults equal to the binary's.
 {{- $clusterName = $cfg.cluster -}}
 {{- end -}}
 - name: CLICKHOUSE_SERVER
-  value: {{ include "pulsusdb.clickhouseServer" . | trim | quote }}
+  value: {{ include "pulsusdb.clickhouseServer" . | quote }}
 - name: CLICKHOUSE_HTTP_PORT
   value: {{ $cfg.clickhouse.http_port | quote }}
 - name: CLICKHOUSE_DB
@@ -504,7 +522,7 @@ defaults equal to the binary's.
 name: pulsusdb
 image: {{ include "pulsusdb.image" $root }}
 imagePullPolicy: {{ $root.Values.image.pullPolicy }}
-{{- if eq .mode "init" }}
+{{- if eq .mode "schema" }}
 command: [ "/usr/local/share/pulsusdb/schema/schema.sh" ]
 {{- else }}
 args:
@@ -513,18 +531,15 @@ args:
   - --config
   - /etc/pulsusdb/config.yaml
 {{- end }}
-{{- if ne .mode "init" }}
+{{- if ne .mode "schema" }}
 ports:
   - name: http
     containerPort: {{ $port }}
     protocol: TCP
 {{- end }}
 env:
-  {{- include "pulsusdb.commonEnv" $root | nindent 2 }}
-{{- if eq .mode "init" }}
-  {{- include "pulsusdb.schemaEnv" $root | nindent 2 }}
-{{- end }}
-{{- if ne .mode "init" }}
+  {{- include "pulsusdb.commonEnv" (dict "root" $root "mode" .mode) | nindent 2 }}
+{{- if ne .mode "schema" }}
 {{- $lp := deepCopy $root.Values.livenessProbe }}
 {{- $_ := set $lp.tcpSocket "port" $port }}
 livenessProbe:
