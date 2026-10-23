@@ -275,8 +275,8 @@ impl Drop for ChildGuard {
 /// `extra_env` set on top of the baseline (issue #14: `spawn_ready_server`
 /// below is just this with no extras; the compat-alias live tests pass
 /// `[("PULSUS_COMPAT_ENDPOINTS", "1")]`) — the schema is built first, below,
-/// and the server checks it at startup (the path `live_server.rs` proves). Blocks
-/// until `/ready` is `200` (60s deadline).
+/// and the server checks at startup that the database exists (the path
+/// `live_server.rs` proves). Blocks until `/ready` is `200` (60s deadline).
 fn spawn_ready_server_env(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
     // The binary creates no schema: without this the process logs "database
     // does not exist: build it with `schema/schema.sh`" and `/ready` never
