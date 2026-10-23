@@ -2,6 +2,9 @@ suite: probe matrix (issue #38 plan amendment §1 — the only restarting probe 
 release:
   name: pulsusdb
   namespace: default
+# Retention has no default (issue #497): every render states it.
+set:
+  initJob.retentionDays: 7
 templates:
   - deployment-all.yaml
   - deployment-writer.yaml

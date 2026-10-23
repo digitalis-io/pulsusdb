@@ -103,7 +103,7 @@ async fn drop_database(client: &ChClient, db: &str) {
 
 async fn init_db(bootstrap: &ChClient, db: &str) -> Arc<ChClient> {
     drop_database(bootstrap, db).await;
-    let params = RenderCtx::for_tests(db);
+    let params = RenderCtx::for_tests(db, 7);
     run_init(bootstrap, &params).await.expect("run_init");
     Arc::new(
         ChClient::new(test_config(db))

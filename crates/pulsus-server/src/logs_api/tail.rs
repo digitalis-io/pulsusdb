@@ -119,7 +119,11 @@ fn retention_floor_ns(retention_days: u32, now_ns: i64) -> i64 {
     now_ns.saturating_sub(win)
 }
 
-fn parse_tail_params(pairs: &[(String, String)], cfg: &Config) -> Result<TailParams, ApiError> {
+fn parse_tail_params(
+    pairs: &[(String, String)],
+    cfg: &Config,
+    retention_days: u32,
+) -> Result<TailParams, ApiError> {
     let query = params::get(pairs, "query").ok_or(ParamError::MissingQuery)?;
     let expr = super::parse_logql(query)?;
     if !matches!(expr, Expr::Log(_)) {
@@ -151,7 +155,7 @@ fn parse_tail_params(pairs: &[(String, String)], cfg: &Config) -> Result<TailPar
     // pre-retention (already-TTL'd) history one empty slice per poll.
     // `max` only ever RAISES the floor — a legitimate recent `start`
     // (default 1h, or an explicit within-retention value) is untouched.
-    let start_ns = start_ns.max(retention_floor_ns(cfg.retention_days, params::now_ns()));
+    let start_ns = start_ns.max(retention_floor_ns(retention_days, params::now_ns()));
     // `delay_for`: default 0, clamped at `reader.tail_max_delay` (the
     // adjudicated public ceiling, docs/api.md §2.4).
     let delay_secs: u64 = match params::get(pairs, "delay_for") {
@@ -236,7 +240,11 @@ pub(crate) async fn tail(
         Err(e) => return e.into_response(),
     };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    let p = match parse_tail_params(&pairs, &state.config) {
+    // Issue #497: the retention the database states; `503` before it is read.
+    let Some(retention_days) = state.retention_days() else {
+        return ApiError::PoolUnavailable.into_response();
+    };
+    let p = match parse_tail_params(&pairs, &state.config, retention_days) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
@@ -1190,7 +1198,7 @@ mod tests {
         let now_real = params::now_ns();
         let oldest_still_present_real = now_real - 7 * DAY_NS - DAY_NS / 2;
         let pairs = params::parse_pairs("query=%7Ba%3D%22x%22%7D&start=0");
-        let p = parse_tail_params(&pairs, &cfg_default()).expect("ok");
+        let p = parse_tail_params(&pairs, &cfg_default(), 7).expect("ok");
         assert!(
             p.start_ns < oldest_still_present_real,
             "clamped start {} must stay below still-present data {oldest_still_present_real}",
@@ -1203,11 +1211,11 @@ mod tests {
     #[test]
     fn retention_clamp_raises_ancient_start_but_never_lowers_a_recent_one() {
         let cfg = cfg_default();
-        // start=0 ⇒ clamped to ~now − 8 days (default 7d retention + slack).
+        // start=0 ⇒ clamped to ~now − 8 days (the 7d retention passed + slack).
         let base = "query=%7Ba%3D%22x%22%7D";
         let before = params::now_ns();
         let ancient = params::parse_pairs(&format!("{base}&start=0"));
-        let p = parse_tail_params(&ancient, &cfg).expect("ok");
+        let p = parse_tail_params(&ancient, &cfg, 7).expect("ok");
         let after = params::now_ns();
         let floor_lo = before - 8 * DAY_NS;
         let floor_hi = after - 8 * DAY_NS;
@@ -1222,13 +1230,13 @@ mod tests {
         // returned verbatim, never lowered.
         let recent = params::now_ns() - 600_000_000_000;
         let recent_pairs = params::parse_pairs(&format!("{base}&start={recent}"));
-        let p = parse_tail_params(&recent_pairs, &cfg).expect("ok");
+        let p = parse_tail_params(&recent_pairs, &cfg, 7).expect("ok");
         assert_eq!(p.start_ns, recent, "a within-retention start is untouched");
 
         // The default start (1h ago) is likewise within retention.
         let default_pairs = params::parse_pairs(base);
         let before = params::now_ns();
-        let p = parse_tail_params(&default_pairs, &cfg).expect("ok");
+        let p = parse_tail_params(&default_pairs, &cfg, 7).expect("ok");
         let after = params::now_ns();
         let hour = 3_600_000_000_000i64;
         assert!(
@@ -2170,7 +2178,7 @@ mod tests {
     #[test]
     fn narrow_grace_ns_defaults_to_the_production_constant() {
         let pairs = params::parse_pairs("query=%7Ba%3D%22x%22%7D");
-        let p = parse_tail_params(&pairs, &cfg_default()).expect("ok");
+        let p = parse_tail_params(&pairs, &cfg_default(), 7).expect("ok");
         let cfg = TailLoopConfig::new(&cfg_default(), &p, Vec::new().into());
         assert_eq!(cfg.narrow_grace_ns, TAIL_REGISTRATION_GRACE_NS);
     }
@@ -2195,6 +2203,7 @@ mod tests {
 
         let state = AppState {
             pool: Arc::new(RwLock::new(None)),
+            retention_days: std::sync::Arc::new(std::sync::OnceLock::from(7)),
             config: Arc::new(Config::default()),
             metrics: metrics_exporter_prometheus::PrometheusBuilder::new()
                 .build_recorder()
@@ -2258,7 +2267,7 @@ mod tests {
     #[test]
     fn tail_params_reject_a_metric_query() {
         let pairs = params::parse_pairs("query=count_over_time(%7Ba%3D%22x%22%7D%5B1m%5D)");
-        let err = parse_tail_params(&pairs, &cfg_default()).expect_err("metric query");
+        let err = parse_tail_params(&pairs, &cfg_default(), 7).expect_err("metric query");
         assert!(matches!(
             err,
             ApiError::Param(ParamError::MetricQueryUnsupported { endpoint: "tail" })
@@ -2280,7 +2289,7 @@ mod tests {
             "query".to_string(),
             format!(r#"{{app="{}"}}"#, "a".repeat(131_072 - 8)),
         )];
-        let err = parse_tail_params(&pairs, &cfg_default()).expect_err("over-cap query");
+        let err = parse_tail_params(&pairs, &cfg_default(), 7).expect_err("over-cap query");
         assert!(matches!(
             err,
             ApiError::LogQl(pulsus_logql::LogQlError::QueryTooLong { .. })
@@ -2292,16 +2301,16 @@ mod tests {
         let base = "query=%7Ba%3D%22x%22%7D";
         let zero = params::parse_pairs(&format!("{base}&limit=0"));
         assert!(matches!(
-            parse_tail_params(&zero, &cfg_default()),
+            parse_tail_params(&zero, &cfg_default(), 7),
             Err(ApiError::Param(ParamError::InvalidTailLimit(_)))
         ));
         let bad = params::parse_pairs(&format!("{base}&limit=abc"));
         assert!(matches!(
-            parse_tail_params(&bad, &cfg_default()),
+            parse_tail_params(&bad, &cfg_default(), 7),
             Err(ApiError::Param(ParamError::InvalidTailLimit(_)))
         ));
         let big = params::parse_pairs(&format!("{base}&limit=999999999"));
-        let p = parse_tail_params(&big, &cfg_default()).expect("clamped, not rejected");
+        let p = parse_tail_params(&big, &cfg_default(), 7).expect("clamped, not rejected");
         assert_eq!(
             p.fetch_limit,
             cfg_default().reader.tail_max_fetch_limit,
@@ -2314,17 +2323,17 @@ mod tests {
         let base = "query=%7Ba%3D%22x%22%7D";
         let none = params::parse_pairs(base);
         assert_eq!(
-            parse_tail_params(&none, &cfg_default())
+            parse_tail_params(&none, &cfg_default(), 7)
                 .expect("ok")
                 .delay_ns,
             0
         );
         let over = params::parse_pairs(&format!("{base}&delay_for=3600"));
-        let p = parse_tail_params(&over, &cfg_default()).expect("clamped");
+        let p = parse_tail_params(&over, &cfg_default(), 7).expect("clamped");
         assert_eq!(p.delay_ns, 5_000_000_000, "clamped at tail_max_delay (5s)");
         let bad = params::parse_pairs(&format!("{base}&delay_for=soon"));
         assert!(matches!(
-            parse_tail_params(&bad, &cfg_default()),
+            parse_tail_params(&bad, &cfg_default(), 7),
             Err(ApiError::Param(ParamError::InvalidDelayFor(_)))
         ));
     }
@@ -2333,7 +2342,7 @@ mod tests {
     fn tail_params_default_start_is_an_hour_ago() {
         let pairs = params::parse_pairs("query=%7Ba%3D%22x%22%7D");
         let before = params::now_ns();
-        let p = parse_tail_params(&pairs, &cfg_default()).expect("ok");
+        let p = parse_tail_params(&pairs, &cfg_default(), 7).expect("ok");
         let after = params::now_ns();
         let hour = 3_600_000_000_000i64;
         assert!(p.start_ns >= before - hour && p.start_ns <= after - hour);
@@ -2365,10 +2374,10 @@ mod tests {
     fn empty_tail_params_default_exactly_as_absent_ones() {
         let cfg = cfg_default();
         let base = "query=%7Ba%3D%22x%22%7D";
-        let absent = parse_tail_params(&params::parse_pairs(base), &cfg).expect("absent params");
+        let absent = parse_tail_params(&params::parse_pairs(base), &cfg, 7).expect("absent params");
         for param in ["limit", "delay_for", "start"] {
             let pairs = params::parse_pairs(&format!("{base}&{param}="));
-            let empty = parse_tail_params(&pairs, &cfg)
+            let empty = parse_tail_params(&pairs, &cfg, 7)
                 .unwrap_or_else(|e| panic!("`{param}=` must parse as absent, got {e:?}"));
             assert_eq!(
                 empty.fetch_limit, absent.fetch_limit,

@@ -477,7 +477,8 @@ the init container includes as well.
 **A key absent from `pulsusdb.config` emits no variable**, so the script
 falls back to its own default rather than this template restating one.
 `the_script_renders_exactly_what_this_crate_renders` holds the script's
-defaults equal to the binary's.
+defaults equal to the binary's. Retention has no default (issue #497):
+`initJob.retentionDays` is required and is not binary configuration.
 */}}
 {{- define "pulsusdb.schemaEnv" -}}
 {{- $cfg := .Values.pulsusdb.config -}}
@@ -500,12 +501,8 @@ defaults equal to the binary's.
   value: {{ $cfg.dist_suffix | quote }}
 {{- end }}
 {{- range $key, $var := dict
-      "retention_days" "PULSUS_RETENTION_DAYS"
       "storage_policy" "PULSUS_STORAGE_POLICY"
       "log_rollup_resolution" "PULSUS_LOG_ROLLUP_RESOLUTION"
-      "metrics_landing_retention_hours" "PULSUS_METRICS_LANDING_RETENTION_HOURS"
-      "log_landing_retention_hours" "PULSUS_LOG_LANDING_RETENTION_HOURS"
-      "trace_landing_retention_hours" "PULSUS_TRACE_LANDING_RETENTION_HOURS"
       "metrics_dedup_window" "PULSUS_METRICS_DEDUP_WINDOW"
       "log_dedup_window" "PULSUS_LOG_DEDUP_WINDOW"
       "trace_dedup_window" "PULSUS_TRACE_DEDUP_WINDOW" }}
@@ -514,6 +511,8 @@ defaults equal to the binary's.
   value: {{ . | quote }}
 {{- end }}
 {{- end }}
+- name: PULSUS_RETENTION_DAYS
+  value: {{ required "initJob.retentionDays is required: retention has no default (docs/configuration.md §7)" .Values.initJob.retentionDays | quote }}
 {{- end -}}
 
 {{- define "pulsusdb.container" -}}

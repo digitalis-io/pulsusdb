@@ -43,7 +43,7 @@ Internally it is organized as:
 * **writer** — protocol parsers (OTLP logs/metrics/traces/profiles, remote write, pprof, plus flag-gated compatibility receivers), stream fingerprinting, size/age-based batch inserts
 * **reader** — LogQL / PromQL / TraceQL front ends, a ClickHouse-native SQL planner, and the HTTP query APIs (including WebSocket live tail)
 * **ruler** — recording-rule evaluation with write-back through the ingestion path
-* **startup checks** — the binary creates no schema: `schema/schema.sh` builds it from `schema/schema.sql`. At startup every process checks the server's version and the names it needs, then that the configured database exists (skipped when `PULSUS_SKIP_DDL` is set), and is not ready until they pass
+* **startup checks** — the binary creates no schema: `schema/schema.sh` builds it from `schema/schema.sql`. At startup every process checks the server's version and the names it needs, then that the configured database exists and states its retention, which it reads from there, and is not ready until they pass. `schema/schema.sh` requires `PULSUS_RETENTION_DAYS`, which has no default
 
 All state lives in ClickHouse; PulsusDB processes are stateless and scale horizontally by mode.
 

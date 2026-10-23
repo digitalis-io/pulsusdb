@@ -4,6 +4,10 @@
 # shown at its default, commented out except `clickhouse.server`; uncomment and
 # edit only what you need. Unknown keys are rejected at startup.
 #
+# Retention is not here: `schema/schema.sh` takes PULSUS_RETENTION_DAYS, which
+# has no default, and the server reads it back from the database
+# (docs/configuration.md §7).
+#
 # Precedence: CLI flags (--config, --mode) > environment variables > this YAML >
 # defaults. An environment variable set to the empty string counts as unset.
 # Secrets (clickhouse.auth password, auth_password) are better placed in the env
@@ -24,16 +28,11 @@
 #query_timeout: 2m
 #tls_cert: null                   # PEM cert chain path; with tls_key set, the one listener is TLS-only
 #tls_key: null                    # PEM private key path; one-sided => startup error
-#skip_ddl: false
-#retention_days: 7
 #storage_policy: null
 #traceql_indexed_attributes: []   # PULSUS_TRACEQL_INDEXED_ATTRIBUTES
 #log_rollup_resolution: 5s
-#metrics_landing_retention_hours: 6    # how long the metrics landing table keeps a landed row, in hours
 #metrics_dedup_window: 10000           # blocks each metrics table remembers for deduplication
-#log_landing_retention_hours: 6        # how long the logs landing table keeps a landed row, in hours
 #log_dedup_window: 10000               # blocks each logs table remembers for deduplication
-#trace_landing_retention_hours: 6      # how long the traces landing table keeps a landed row, in hours
 #trace_dedup_window: 10000             # blocks each traces table remembers for deduplication
 #cluster: null                    # ClickHouse cluster name; enables distributed DDL
 #dist_suffix: _dist
@@ -115,18 +114,6 @@ clickhouse:
   #tail_send_timeout: 30s
   #tail_max_fetch_limit: 5000
   #tail_catchup_slice: 60s
-
-#downsampling:
-  #enabled: false
-  #raw_retention: null            # overrides retention_days for metric_samples when set
-  #tier_policy: exact             # exact | fast
-  #tiers: []                      # per-tier rollup layout (docs §7). Each entry: {name,
-                                  # resolution, table, retention, min_step}. name/table unique;
-                                  # resolution/min_step/retention strictly increasing across tiers;
-                                  # min_step >= resolution per tier. e.g.:
-                                  #   tiers:
-                                  #     - {name: r5m, resolution: 5m, table: metric_samples_5m, retention: 30d, min_step: 5m}
-                                  #     - {name: r1h, resolution: 1h, table: metric_samples_1h, retention: 365d, min_step: 1h}
 
 #ruler:
   #enabled: false

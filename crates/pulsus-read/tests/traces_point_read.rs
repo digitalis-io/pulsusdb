@@ -71,7 +71,7 @@ fn test_config() -> ChConnConfig {
 }
 
 fn test_ctx(db: &str) -> SchemaParams {
-    RenderCtx::for_tests(db)
+    RenderCtx::for_tests(db, 7)
 }
 
 /// A connection on the built-in `default` database, for DDL and for the

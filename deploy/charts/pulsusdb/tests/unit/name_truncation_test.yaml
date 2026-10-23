@@ -8,6 +8,8 @@ release:
   name: a-very-long-release-name-that-is-quite-long-abcdefghi
   namespace: default
 set:
+  # Retention has no default (issue #497): every render states it.
+  initJob.retentionDays: 7
   topology: cluster
   clickhouse.shards: 3
   pulsusdb.split.enabled: true

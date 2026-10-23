@@ -80,6 +80,113 @@ pub async fn database_exists(client: &ChClient, db: &str) -> Result<bool, Schema
     Ok(!read_names(client, &sql).await?.is_empty())
 }
 
+/// The retention a database comment states: exactly `retention_days=<N>`,
+/// `N` a whole number from 1 to `u32::MAX` without a leading zero, the
+/// form `schema/schema.sh` accepts (issue #497). Anything else is `None`.
+pub fn retention_days_from_comment(comment: &str) -> Option<u32> {
+    let digits = comment.strip_prefix("retention_days=")?;
+    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// One host's answer about `db`: its name and the database's comment.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct HostComment {
+    host: String,
+    comment: String,
+}
+
+/// What the configured database states about its retention (issue #497).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaRetention {
+    /// No host holds the database.
+    Absent,
+    /// Every host of the cluster holds it, and every comment is the same
+    /// valid `retention_days=<N>`.
+    Agreed(u32),
+    /// Anything else: `answered` is each answering host and its comment,
+    /// sorted by host; `hosts` is how many hosts the cluster has (1 without
+    /// one). One host missing the database, one comment differing, or one
+    /// comment [`retention_days_from_comment`] refuses is enough.
+    Refused {
+        hosts: usize,
+        answered: Vec<(String, String)>,
+    },
+}
+
+/// The decision over the hosts' answers, separated so the rule is tested
+/// without a cluster.
+pub fn decide_retention(hosts: usize, mut answered: Vec<(String, String)>) -> SchemaRetention {
+    answered.sort();
+    if answered.is_empty() {
+        return SchemaRetention::Absent;
+    }
+    if let Some(days) = retention_days_from_comment(&answered[0].1)
+        && answered.len() == hosts
+        && answered.iter().all(|(_, c)| c == &answered[0].1)
+    {
+        return SchemaRetention::Agreed(days);
+    }
+    SchemaRetention::Refused { hosts, answered }
+}
+
+/// The retention `db` states (issue #497), read from **every replica of
+/// `cluster`** when the server defines that cluster, and from the connected
+/// server alone otherwise (no cluster configured, or a reader configured
+/// with a cluster this server does not define).
+///
+/// A replica that does not answer is skipped (`skip_unavailable_shards`),
+/// so it shows as a host that did not answer, and the answer is
+/// [`SchemaRetention::Refused`] until every host does.
+pub async fn schema_retention(
+    client: &ChClient,
+    cluster: Option<&str>,
+    db: &str,
+) -> Result<SchemaRetention, SchemaError> {
+    let db_lit = db.replace('\'', "''");
+    let defined = match cluster {
+        Some(c) => {
+            let c_lit = c.replace('\'', "''");
+            let n = read_names(
+                client,
+                &format!(
+                    "SELECT toString(count()) AS name FROM system.clusters WHERE cluster = '{c_lit}'"
+                ),
+            )
+            .await?;
+            let n: usize = n.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+            (n > 0).then_some((c_lit, n))
+        }
+        None => None,
+    };
+    let (sql, hosts) = match defined {
+        Some((c_lit, n)) => (
+            format!(
+                "SELECT hostName() AS host, comment FROM clusterAllReplicas('{c_lit}', system.databases) \
+                 WHERE name = '{db_lit}' SETTINGS skip_unavailable_shards = 1"
+            ),
+            n,
+        ),
+        None => (
+            format!(
+                "SELECT hostName() AS host, comment FROM system.databases WHERE name = '{db_lit}'"
+            ),
+            1,
+        ),
+    };
+    let mut stream = client
+        .query_stream::<HostComment>(&sql, &QuerySettings::new())
+        .await?;
+    let mut answered = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row?;
+        answered.push((row.host, row.comment));
+    }
+    Ok(decide_retention(hosts, answered))
+}
+
 /// The seconds deduplication window every clustered write-path table is
 /// pinned to (issue #603), in seconds.
 ///
@@ -347,6 +454,102 @@ async fn read_names(client: &ChClient, sql: &str) -> Result<Vec<String>, SchemaE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #497: one retention, identical and valid on every host, or
+    /// refused. Each refusal below differs from the agreed case by one host.
+    #[test]
+    fn every_host_must_state_the_same_valid_retention() {
+        let h = |n: &str, c: &str| (n.to_string(), c.to_string());
+        let ok = vec![
+            h("b", "retention_days=4"),
+            h("a", "retention_days=4"),
+            h("c", "retention_days=4"),
+        ];
+        assert_eq!(decide_retention(3, ok.clone()), SchemaRetention::Agreed(4));
+        assert_eq!(decide_retention(3, vec![]), SchemaRetention::Absent);
+        let refused = |hosts: usize, rows: Vec<(String, String)>| {
+            matches!(
+                decide_retention(hosts, rows),
+                SchemaRetention::Refused { .. }
+            )
+        };
+        assert!(
+            refused(
+                3,
+                vec![
+                    h("a", "retention_days=4"),
+                    h("b", "retention_days=5"),
+                    h("c", "retention_days=4")
+                ]
+            ),
+            "one host differs"
+        );
+        assert!(
+            refused(
+                3,
+                vec![h("a", "retention_days=4"), h("b", "retention_days=4")]
+            ),
+            "one host missing"
+        );
+        assert!(
+            refused(
+                3,
+                vec![
+                    h("a", "retention_days=4"),
+                    h("b", ""),
+                    h("c", "retention_days=4")
+                ]
+            ),
+            "one host blank"
+        );
+        assert!(
+            refused(3, vec![h("a", ""), h("b", ""), h("c", "")]),
+            "all agree on nothing"
+        );
+        assert!(
+            refused(1, vec![h("a", "retention_days=07")]),
+            "one host, invalid"
+        );
+        assert_eq!(
+            decide_retention(1, vec![h("a", "retention_days=9")]),
+            SchemaRetention::Agreed(9)
+        );
+        match decide_retention(3, vec![h("c", "x"), h("a", "retention_days=4")]) {
+            SchemaRetention::Refused { hosts, answered } => {
+                assert_eq!(hosts, 3);
+                assert_eq!(
+                    answered,
+                    vec![h("a", "retention_days=4"), h("c", "x")],
+                    "sorted by host"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Issue #497: the comment's one accepted form, and its refusals.
+    #[test]
+    fn a_retention_comment_is_exactly_retention_days_and_a_whole_number() {
+        for (comment, want) in [
+            ("retention_days=1", Some(1)),
+            ("retention_days=30", Some(30)),
+            ("retention_days=4294967295", Some(u32::MAX)),
+            ("retention_days=4294967296", None),
+            ("retention_days=0", None),
+            ("retention_days=07", None),
+            ("retention_days=", None),
+            ("retention_days=7d", None),
+            ("retention_days=-7", None),
+            ("retention_days= 7", None),
+            ("retention_days=7 ", None),
+            ("retention_days=+7", None),
+            (" retention_days=7", None),
+            ("retention_hours=7", None),
+            ("", None),
+        ] {
+            assert_eq!(retention_days_from_comment(comment), want, "{comment:?}");
+        }
+    }
 
     /// The decision is pure: over an empty server every required name is
     /// reported, over a complete one none is, and over each subset with one

@@ -145,7 +145,7 @@ async fn init_db(bootstrap: &ChClient, db: &str) {
         )
         .await
         .expect("drop test database");
-    let params = RenderCtx::for_tests(db);
+    let params = RenderCtx::for_tests(db, 7);
     run_init(bootstrap, &params).await.expect("run_init");
 }
 

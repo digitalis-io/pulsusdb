@@ -7,9 +7,7 @@ mod support;
 
 use std::time::Duration;
 
-use pulsus_config::{
-    ByteSize, ChProto, HumanDuration, InsertMode, LogLevel, Mode, TierPolicy, parse,
-};
+use pulsus_config::{ByteSize, ChProto, HumanDuration, InsertMode, LogLevel, Mode, parse};
 
 const FIXTURE: &str = r#"
 mode: writer
@@ -21,8 +19,6 @@ auth_password: s3cret
 compat_endpoints: true
 cors_origin: https://example.com
 query_timeout: 30s
-skip_ddl: true
-retention_days: 14
 storage_policy: hot_cold
 log_rollup_resolution: 10s
 cluster: prod
@@ -56,22 +52,6 @@ reader:
   traceql_max_series: 5000
   traceql_tag_lookback: 3h
 
-downsampling:
-  enabled: true
-  raw_retention: 3d
-  tier_policy: fast
-  tiers:
-    - name: 5m
-      resolution: 5m
-      table: metric_samples_5m
-      retention: 90d
-      min_step: 5m
-    - name: 1h
-      resolution: 1h
-      table: metric_samples_1h
-      retention: 730d
-      min_step: 1h
-
 ruler:
   enabled: true
   poll_interval: 15s
@@ -98,8 +78,6 @@ fn full_fixture_round_trips_into_typed_values() {
     assert!(cfg.compat_endpoints);
     assert_eq!(cfg.cors_origin, "https://example.com");
     assert_eq!(cfg.query_timeout.0, Duration::from_secs(30));
-    assert!(cfg.skip_ddl);
-    assert_eq!(cfg.retention_days, 14);
     assert_eq!(cfg.storage_policy.as_deref(), Some("hot_cold"));
     assert_eq!(cfg.log_rollup_resolution.0, Duration::from_secs(10));
     assert_eq!(cfg.cluster.as_deref(), Some("prod"));
@@ -145,18 +123,6 @@ fn full_fixture_round_trips_into_typed_values() {
         cfg.reader.traceql_tag_lookback.0,
         Duration::from_secs(3 * 3_600)
     );
-
-    assert!(cfg.downsampling.enabled);
-    assert_eq!(
-        cfg.downsampling.raw_retention.map(|d| d.0),
-        Some(Duration::from_secs(3 * 86_400))
-    );
-    assert_eq!(cfg.downsampling.tier_policy, TierPolicy::Fast);
-    assert_eq!(cfg.downsampling.tiers.len(), 2);
-    assert_eq!(cfg.downsampling.tiers[0].name, "5m");
-    assert_eq!(cfg.downsampling.tiers[0].table, "metric_samples_5m");
-    assert_eq!(cfg.downsampling.tiers[1].name, "1h");
-    assert_eq!(cfg.downsampling.tiers[1].table, "metric_samples_1h");
 
     assert!(cfg.ruler.enabled);
     assert_eq!(cfg.ruler.poll_interval.0, Duration::from_secs(15));
@@ -369,4 +335,37 @@ fn overflow_and_bad_suffix_return_errors_not_panics() {
     // u64::MAX TiB overflows u64 bytes.
     assert!("18446744073709551615TiB".parse::<ByteSize>().is_err());
     assert!("5xyz".parse::<ByteSize>().is_err());
+}
+
+/// Issue #497: retention is the schema's, not the binary's. A YAML file that
+/// names one of the removed keys is refused at load, naming the key, rather
+/// than accepted and never applied to a table.
+#[test]
+fn a_removed_retention_key_is_refused_naming_it() {
+    let _guard = support::lock_env();
+    support::clear_all();
+    for (key, yaml) in [
+        ("retention_days", "retention_days: 30\n"),
+        (
+            "metrics_landing_retention_hours",
+            "metrics_landing_retention_hours: 12\n",
+        ),
+        (
+            "log_landing_retention_hours",
+            "log_landing_retention_hours: 12\n",
+        ),
+        (
+            "trace_landing_retention_hours",
+            "trace_landing_retention_hours: 12\n",
+        ),
+        ("skip_ddl", "skip_ddl: true\n"),
+        ("downsampling", "downsampling:\n  raw_retention: 1d\n"),
+    ] {
+        let path = support::write_temp_yaml(&format!("removed-{key}"), yaml);
+        let err = parse(Some(&path), None).expect_err(key).to_string();
+        assert!(
+            err.contains(&format!("unknown field `{key}`")),
+            "{key}: {err}"
+        );
+    }
 }

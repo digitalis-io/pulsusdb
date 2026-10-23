@@ -244,8 +244,7 @@ struct UnreachableStreamsError {
 }
 
 // ---------------------------------------------------------------------
-// Explain (issue #32: adds `exactness`, a constant `"raw-exact"` in M2 —
-// tiers/rollup routing are M3).
+// Explain (issue #32: adds `exactness`, the constant `"raw-exact"`).
 // ---------------------------------------------------------------------
 
 #[derive(Serialize)]

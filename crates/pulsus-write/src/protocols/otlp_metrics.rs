@@ -135,7 +135,7 @@ const HIST_DEDUP_KEY_BYTES: usize = 48;
 /// timestamp span and has no bound at all, so a single `ResourceMetrics`
 /// whose points straddle the admitted `Date` domain (1970-01-01 …
 /// 2106-02-06) would generate ≈28.6 M samples from one small resource.
-/// 4096 × 150 s ≈ 7.1 days — one default `PULSUS_RETENTION_DAYS` window —
+/// 4096 × 150 s ≈ 7.1 days — a week of retention —
 /// so no legitimate batch reaches it. Exceeding it is an
 /// [`LogsIngestError::OversizeMessage`] whole-request 400, never a silent
 /// truncation. Ledgered as `otlp-target-info-sample-cap`.

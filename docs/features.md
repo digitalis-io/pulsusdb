@@ -1,6 +1,6 @@
 # PulsusDB Features & Compatibility Matrix
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** This document enumerates every feature PulsusDB commits to and the milestone in which it lands. It is the source of truth for scoping GitHub issues — every row here should trace to one or more issues.
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Downsampling (M3's tiers, tier router and `PULSUS_TIER_POLICY`) was never built and is removed; its feature rows are gone and the M3 milestone rows naming it are history.** This document enumerates every feature PulsusDB commits to and the milestone in which it lands. It is the source of truth for scoping GitHub issues — every row here should trace to one or more issues.
 
 Two product decisions frame the matrix:
 
@@ -108,7 +108,6 @@ and for the one performance cliff it introduces.
 | Metadata | `GET /api/v1/metadata` | M2 |
 | Exemplars | `GET|POST /api/v1/query_exemplars` (stored exemplars, at most 100,000 an answer; issue #501) | M2 |
 | Status endpoints | `/api/v1/status/buildinfo`, `/config`, `/flags`, `/runtimeinfo`, `/tsdb` | M2 |
-| Downsampling tiers + query routing | automatic; configurable tiers | M3 |
 
 **PromQL — M2 proof subset, evaluated with Prometheus-exact semantics** (counter resets, extrapolation, staleness markers, lookback delta, Kahan summation — validated by differential testing against Prometheus on exactly this subset): selectors with all matcher types; `offset`; `rate`, `irate`, `increase`, `delta`; `avg/min/max/sum/count_over_time`; aggregations `sum`, `avg`, `min`, `max`, `count`, `topk`, `bottomk` with `by`/`without`; vector–scalar and vector–vector arithmetic/comparison with `bool`, `on()`, `ignoring()`; `histogram_quantile`. Enough to power a typical dashboard and prove the hybrid engine.
 
@@ -171,7 +170,6 @@ and for the one performance cliff it introduces.
 | Compatibility endpoint flag | `PULSUS_COMPAT_ENDPOINTS` (default off) | M1 |
 | Inbound TLS | native TLS termination on the listener | M7 |
 | Label cache | bounded active-series window, JOIN fallback | M2 |
-| Downsampling | insert-triggered in-database MVs (real-time tiers), one-shot backfill, checksum-gated MV recreation, `PULSUS_TIER_POLICY` exact/fast routing | M3 |
 | Clustered ClickHouse | Replicated engines; Distributed tables over every per-shard table but the three ingest landing tables — `log_landing`, `metric_landing` and `trace_landing` — which are written under their bare names so one push stays one block, and `metric_label_values`, which every statement names locally, and `service_edges`, which the service graph reads only per shard, and none over the cluster-wide catalogue tables ([schemas.md §7](schemas.md) lists all eleven); shard-local pushdown for traces, and for logs the reads that do not need a fingerprint's rows to be whole on one shard | M3 (metrics), M4 (logs/traces validation) |
 | Cross-cluster reads | distributed-suffix read targeting | M7 |
 | Recording rules (ruler) | LogQL + PromQL kinds, CRUD API, write-back | M7 |

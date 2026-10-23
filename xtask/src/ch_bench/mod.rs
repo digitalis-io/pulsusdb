@@ -1,14 +1,12 @@
 //! Comparative benchmark harness for the ClickHouse client spike (issue #3).
 //!
 //! `CrateUnderTest` is implemented once per candidate crate so every scenario
-//! (insert/fetch/aggstate/ddl/tls/pool) runs identically against both. Timing
+//! (insert/fetch/tls/pool) runs identically against both. Timing
 //! is hand-rolled wall-clock (rows/s, MiB/s, p50/p95 over R reps) rather than
 //! criterion: these are multi-second, high-variance, network-bound bulk
 //! transfers, not nanosecond microbenchmarks.
 
-pub mod aggstate;
 pub mod candidates;
-pub mod ddl;
 pub mod fetch;
 pub mod insert;
 pub mod pool;
@@ -18,7 +16,7 @@ pub mod tls;
 use std::time::Duration;
 
 pub use candidates::{ChCandidate, KlCandidate};
-pub use rows::{AggRow, LogRow, MetricRow};
+pub use rows::{LogRow, MetricRow};
 
 /// Wall-clock timing summary over `reps` repetitions of a scenario.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -67,8 +65,7 @@ pub trait CrateUnderTest {
     fn name(&self) -> &'static str;
 
     /// DDL / maintenance statement over the crate's own transport. No rows
-    /// returned. Used for CREATE TABLE / CREATE MATERIALIZED VIEW / chunked
-    /// INSERT ... SELECT (the `ddl` scenario, decision-critical).
+    /// returned. Used to create and drop the scenarios' tables.
     fn execute_ddl(&self, sql: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
 
     /// One columnar insert of metric-shaped rows (docs/schemas.md §2.1).
@@ -98,12 +95,4 @@ pub trait CrateUnderTest {
 
     /// `system.parts` count for `table` (post-insert part count per scenario).
     fn part_count(&self, table: &str) -> impl Future<Output = anyhow::Result<u64>> + Send;
-
-    /// Runs a SELECT against the aggregate-state tier and decodes the exact
-    /// docs/schemas.md §2.3 shape (`finalizeAggregation(argMinMergeState(...))`,
-    /// `SimpleAggregateFunction(sum, UInt64)`).
-    fn select_agg_rows(
-        &self,
-        sql: &str,
-    ) -> impl Future<Output = anyhow::Result<Vec<AggRow>>> + Send;
 }

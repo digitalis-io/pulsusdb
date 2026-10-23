@@ -79,7 +79,7 @@ async fn drop_database(client: &ChClient, db: &str) {
 }
 
 fn params_for(db: &str) -> RenderCtx {
-    RenderCtx::for_tests(db)
+    RenderCtx::for_tests(db, 7)
 }
 
 /// A bootstrap client, a freshly initialised database, and a writer over it.

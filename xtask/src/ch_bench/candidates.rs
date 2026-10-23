@@ -3,13 +3,13 @@
 //!
 //! Per-crate row types live here (not in `rows.rs`) because the two crates'
 //! `Row` derive macros are distinct traits; the crate-agnostic `MetricRow` /
-//! `LogRow` / `AggRow` in `rows.rs` are converted at the boundary so the
+//! `LogRow` in `rows.rs` are converted at the boundary so the
 //! scenario code (`insert.rs`, `fetch.rs`, ...) never names either crate.
 
 use futures::StreamExt;
 
 use super::CrateUnderTest;
-use super::rows::{AggRow, LogRow, MetricRow};
+use super::rows::{LogRow, MetricRow};
 
 /// Every benchmark client this module builds pins `async_insert = 0`, the
 /// same value `ChClient` pins on the product write path (issue #376).
@@ -75,14 +75,6 @@ struct ChMetricProj {
 #[derive(clickhouse::Row, serde::Deserialize)]
 struct ChPartCount {
     n: u64,
-}
-
-#[derive(clickhouse::Row, serde::Deserialize)]
-struct ChAggRow {
-    fingerprint: u128,
-    val_count: u64,
-    first_value: f64,
-    last_value: f64,
 }
 
 impl CrateUnderTest for ChCandidate {
@@ -161,19 +153,6 @@ impl CrateUnderTest for ChCandidate {
         let row: ChPartCount = self.client.query(&sql).fetch_one().await?;
         Ok(row.n)
     }
-
-    async fn select_agg_rows(&self, sql: &str) -> anyhow::Result<Vec<AggRow>> {
-        let rows: Vec<ChAggRow> = self.client.query(sql).fetch_all().await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| AggRow {
-                fingerprint: r.fingerprint,
-                val_count: r.val_count,
-                first_value: r.first_value,
-                last_value: r.last_value,
-            })
-            .collect())
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -229,14 +208,6 @@ struct KlMetricProj {
 #[derive(klickhouse::Row, serde::Serialize, serde::Deserialize)]
 struct KlPartCount {
     n: u64,
-}
-
-#[derive(klickhouse::Row, serde::Serialize, serde::Deserialize)]
-struct KlAggRow {
-    fingerprint: u128,
-    val_count: u64,
-    first_value: f64,
-    last_value: f64,
 }
 
 impl KlCandidate {
@@ -327,18 +298,5 @@ impl CrateUnderTest for KlCandidate {
             format!("SELECT count() AS n FROM system.parts WHERE table = '{table}' AND active = 1");
         let row: KlPartCount = self.client.query_one(sql).await?;
         Ok(row.n)
-    }
-
-    async fn select_agg_rows(&self, sql: &str) -> anyhow::Result<Vec<AggRow>> {
-        let rows: Vec<KlAggRow> = self.client.query_collect(sql).await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| AggRow {
-                fingerprint: r.fingerprint,
-                val_count: r.val_count,
-                first_value: r.first_value,
-                last_value: r.last_value,
-            })
-            .collect())
     }
 }

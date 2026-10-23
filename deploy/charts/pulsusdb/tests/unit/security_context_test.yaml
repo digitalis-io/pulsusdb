@@ -2,6 +2,9 @@ suite: securityContext + writable-spool-volume pairing (issue #38 review fix)
 release:
   name: pulsusdb
   namespace: default
+# Retention has no default (issue #497): every render states it.
+set:
+  initJob.retentionDays: 7
 templates:
   - deployment-all.yaml
   - configmap.yaml

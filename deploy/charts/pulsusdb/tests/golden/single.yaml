@@ -44,11 +44,6 @@ data:
     compat_endpoints: false
     cors_origin: '*'
     dist_suffix: _dist
-    downsampling:
-      enabled: false
-      raw_retention: null
-      tier_policy: exact
-      tiers: []
     host: 0.0.0.0
     log_level: info
     log_rollup_resolution: 5s
@@ -62,12 +57,10 @@ data:
       promql_lookback: 5m
       promql_max_samples: 50000000
       traceql_tag_lookback: 20m
-    retention_days: 7
     ruler:
       enabled: false
       max_result_bytes: 10MiB
       poll_interval: 30s
-    skip_ddl: false
     skip_unavailable_shards: false
     storage_policy: null
     writer:
@@ -210,7 +203,7 @@ spec:
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/component: all
       annotations:
-        checksum/config: 764010191648ea7fbdabadfa7543f066b7b494fb0b52b58e4bacfd307c983632
+        checksum/config: 543229901a2a5d992428e16c7718e1ed0c7557c9524e206e9d9e5dd9970485ca
         checksum/secret: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
     spec:
       serviceAccountName: pulsusdb

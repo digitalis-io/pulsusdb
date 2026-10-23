@@ -126,15 +126,15 @@ async fn try_drop_db(db: &str) -> Result<(), String> {
 /// The retention the schema these suites build carries, in days: a hundred
 /// years.
 ///
-/// **Their fixtures are fixed instants in the past.** At the default seven
-/// days the delete-TTL drops the part before the first query runs — measured
-/// while writing this: `template_timezone_live`'s 2023-11-14 line landed in
+/// **Their fixtures are fixed instants in the past.** At seven days of
+/// retention the delete-TTL drops the part before the first query runs —
+/// measured while writing this: `template_timezone_live`'s 2023-11-14 line landed in
 /// `log_samples` and was gone one part later. The suites that cared already
 /// passed `PULSUS_RETENTION_DAYS=36500` to the server, which used to create
 /// the schema; the schema is built here now, so the value belongs here.
 ///
-/// The server's own `PULSUS_RETENTION_DAYS` is untouched by this and still
-/// drives the read-side query-window clamp, which is a different thing.
+/// The server reads its read floors from the database this builds (issue
+/// #497), so they are a hundred years too; [`state_retention`] changes them.
 pub const SCHEMA_RETENTION_DAYS: u32 = 36_500;
 
 /// Builds the schema in `db`, as `schema/schema.sh` would.
@@ -153,7 +153,7 @@ pub async fn build_schema(db: &str) {
 
 /// [`build_schema`] at a stated retention.
 ///
-/// **`api_conformance` needs the default seven days**, and the reason is
+/// **`api_conformance` needs seven days**, and the reason is
 /// uncomfortable but it is the behaviour that suite has always had: its route
 /// assertions push fixtures stamped 2023-11-14 through the ingest routes and
 /// then assert that `/api/traces/v1/search` returns an EMPTY array. What makes
@@ -162,9 +162,8 @@ pub async fn build_schema(db: &str) {
 /// suite itself wrote.
 ///
 /// That fragility pre-dates the schema moving out of the binary — the server
-/// used to build the schema from its own `PULSUS_RETENTION_DAYS`, which that
-/// suite leaves at the default — and it is recorded here rather than changed,
-/// because tightening the assertion is a claim about the route and not about
+/// used to build the schema itself, at seven days for that suite — and it
+/// is recorded here rather than changed, because tightening the assertion is a claim about the route and not about
 /// where the DDL lives.
 pub async fn build_schema_with_retention(db: &str, retention_days: u32) {
     let client = ChClient::new(conn_config("default"))
@@ -185,11 +184,34 @@ pub async fn build_schema_with_retention(db: &str, retention_days: u32) {
 
     let params = pulsus_schema::RenderCtx {
         retention_days,
-        ..pulsus_schema::RenderCtx::for_tests(db)
+        ..pulsus_schema::RenderCtx::for_tests(db, 7)
     };
     pulsus_schema_testkit::run_init(&client, &params)
         .await
         .unwrap_or_else(|e| panic!("build the schema in {db}: {e}"));
+}
+
+/// Rewrites `db`'s comment to state `days` of retention, leaving every
+/// table's TTL as it was built (issue #497). The binary reads its read
+/// floors from the comment, so a test can hold rows storage still has past
+/// the floor, the state a database is in until a part drop removes them.
+pub async fn state_retention(db: &str, days: u32) {
+    set_database_comment(db, &format!("retention_days={days}")).await;
+}
+
+/// Sets `db`'s comment to `comment` exactly (issue #497).
+pub async fn set_database_comment(db: &str, comment: &str) {
+    let client = ChClient::new(conn_config("default"))
+        .await
+        .unwrap_or_else(|e| panic!("connect bootstrap client to comment {db}: {e}"));
+    client
+        .execute(
+            &format!("ALTER DATABASE {db} MODIFY COMMENT '{comment}'"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("comment {db}: {e}"));
 }
 
 /// [`drop_db`] then [`build_schema`]: what a suite that spawns the server
@@ -215,7 +237,7 @@ pub fn build_schema_blocking(db: &str) {
 }
 
 /// [`build_schema_blocking`] at a stated retention. See
-/// [`build_schema_with_retention`] for the one suite that needs the default.
+/// [`build_schema_with_retention`] for the one suite that needs seven days.
 pub fn build_schema_blocking_with_retention(db: &str, retention_days: u32) {
     let name = db.to_string();
     std::thread::spawn(move || {

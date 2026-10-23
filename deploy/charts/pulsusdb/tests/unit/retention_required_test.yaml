@@ -1,0 +1,30 @@
+suite: initJob.retentionDays is required while the schema Job is enabled (issue #497)
+release:
+  name: pulsusdb
+  namespace: default
+# No suite-level `set`: these cases need the key absent, and a test-level
+# `set` can only add to a suite-level one.
+templates:
+  - deployment-all.yaml
+  - configmap.yaml
+  - secret.yaml
+tests:
+  - it: given no initJob.retentionDays, when rendering, then values.schema.json refuses it (retention has no default)
+    asserts:
+      - failedTemplate:
+          errorPattern: "missing property .retentionDays.|retentionDays is required"
+
+  - it: given initJob.retentionDays 0, when rendering, then values.schema.json refuses it
+    set:
+      initJob.retentionDays: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "retentionDays.*(minimum|greater than or equal)"
+
+  - it: given the schema Job disabled and no initJob.retentionDays, when rendering, then it renders (the schema is built elsewhere)
+    set:
+      initJob.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 1
+        template: deployment-all.yaml

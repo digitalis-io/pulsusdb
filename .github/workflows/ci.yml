@@ -2366,6 +2366,7 @@ jobs:
           CLICKHOUSE_SERVER: localhost
           CLICKHOUSE_HTTP_PORT: "19123"
           CLICKHOUSE_DB: pulsus
+          PULSUS_RETENTION_DAYS: "7"
         run: |
           catalogue() {
             curl -sS --fail-with-body 'http://localhost:19123/' --data-binary \
@@ -2406,6 +2407,7 @@ jobs:
           CLICKHOUSE_SERVER: localhost
           CLICKHOUSE_HTTP_PORT: "19124"
           CLICKHOUSE_DB: pulsus
+          PULSUS_RETENTION_DAYS: "7"
         run: |
           set +e
           output=$(schema/schema.sh 2>&1)
@@ -2496,6 +2498,7 @@ jobs:
           CLICKHOUSE_SERVER: localhost
           CLICKHOUSE_HTTP_PORT: "18123"
           CLICKHOUSE_DB: pulsus
+          PULSUS_RETENTION_DAYS: "7"
           PULSUS_CLUSTER: pulsus_test_cluster
         run: |
           ask() { curl -sS --fail-with-body "http://localhost:$1/" --data-binary "$2"; }
@@ -2695,6 +2698,7 @@ jobs:
           CLICKHOUSE_SERVER: localhost
           CLICKHOUSE_HTTP_PORT: "18123"
           CLICKHOUSE_DB: pulsus
+          PULSUS_RETENTION_DAYS: "7"
           PULSUS_CLUSTER: pulsus_test_cluster
         run: |
           ask() { curl -sS --fail-with-body "http://localhost:$1/" --data-binary "$2"; }

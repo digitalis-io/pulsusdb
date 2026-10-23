@@ -99,7 +99,7 @@ fn cluster_ctx(db: &str) -> RenderCtx {
         db: db.to_string(),
         cluster: Some(CLUSTER_NAME.to_string()),
         dist_suffix: "_dist".to_string(),
-        ..RenderCtx::for_tests(db)
+        ..RenderCtx::for_tests(db, 7)
     }
 }
 

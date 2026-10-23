@@ -1,9 +1,9 @@
 //! Typed configuration model. Every struct and field here matches
 //! docs/configuration.md §9's complete YAML schema 1:1 — root-level
-//! scalars stay flat (not nested) so that a documented `retention_days: 7`
+//! scalars stay flat (not nested) so that a documented `port: 3100`
 //! at the YAML root deserializes correctly under `deny_unknown_fields`
 //! (see the issue #2 architect amendment). Only the genuinely-grouped
-//! subsystems (`clickhouse`, `writer`, `reader`, `downsampling`, `ruler`)
+//! subsystems (`clickhouse`, `writer`, `reader`, `ruler`)
 //! are nested objects.
 //!
 //! Every struct carries `#[serde(default, deny_unknown_fields)]` plus a
@@ -49,19 +49,11 @@ pub struct Config {
     /// `PULSUS_TLS_KEY` (issue #174): path to the matching PEM private key
     /// (PKCS#8/PKCS#1/SEC1). See [`Config::tls_cert`] for the pairing rule.
     pub tls_key: Option<String>,
-    // §3 Schema & retention
-    pub skip_ddl: bool,
-    pub retention_days: u32,
+    // §3 Schema
     pub storage_policy: Option<String>,
     /// `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` (issue #595 part 2).
     pub traceql_indexed_attributes: Vec<String>,
     pub log_rollup_resolution: HumanDuration,
-    /// `PULSUS_METRICS_LANDING_RETENTION_HOURS` (issue #603): the metrics
-    /// landing table's delete-TTL, in hours. Nothing reads a landed row
-    /// after its views have run; the rows are kept only so a person
-    /// can inspect them by hand.
-    /// Accepted range `1..=168`.
-    pub metrics_landing_retention_hours: u32,
     /// `PULSUS_METRICS_DEDUP_WINDOW` (issue #603): how many recent blocks
     /// the landing table and each of the four derived metric tables
     /// remember for deduplication, so a resend of a block the server
@@ -74,12 +66,6 @@ pub struct Config {
     /// forgotten on a timer, which is the safe direction for a resend.
     /// Accepted range `1..=1000000`.
     pub metrics_dedup_window: u64,
-    /// `PULSUS_LOG_LANDING_RETENTION_HOURS` (issue #603): the logs landing
-    /// table's delete-TTL, in hours. Nothing reads a landed row
-    /// after its views have run; the rows are kept only so a person
-    /// can inspect them by hand.
-    /// Accepted range `1..=168`.
-    pub log_landing_retention_hours: u32,
     /// `PULSUS_LOG_DEDUP_WINDOW` (issue #603): how many recent blocks the
     /// logs landing table and each of the five derived logs tables remember
     /// for deduplication, so a resend of a block the server already accepted
@@ -93,12 +79,6 @@ pub struct Config {
     /// below the landing budget would forget a token while the writer is
     /// still entitled to resend under it. Accepted range `1..=1000000`.
     pub log_dedup_window: u64,
-    /// `PULSUS_TRACE_LANDING_RETENTION_HOURS` (issues #584 to #586): the
-    /// traces landing table's delete-TTL, in hours. Nothing reads a landed row
-    /// after its views have run; the rows are kept only so a person
-    /// can inspect them by hand.
-    /// Accepted range `1..=168`.
-    pub trace_landing_retention_hours: u32,
     /// `PULSUS_TRACE_DEDUP_WINDOW` (issues #584 to #586): how many recent
     /// blocks the traces landing table and each of the five derived trace
     /// tables remember for deduplication, so a resend of a block the server
@@ -144,7 +124,6 @@ pub struct Config {
     pub clickhouse: ClickHouseConfig,
     pub writer: WriterConfig,
     pub reader: ReaderConfig,
-    pub downsampling: DownsamplingConfig,
     pub ruler: RulerConfig,
 }
 
@@ -162,16 +141,11 @@ impl Default for Config {
             query_timeout: HumanDuration(Duration::from_secs(120)),
             tls_cert: None,
             tls_key: None,
-            skip_ddl: false,
-            retention_days: 7,
             storage_policy: None,
             traceql_indexed_attributes: Vec::new(),
             log_rollup_resolution: HumanDuration(Duration::from_secs(5)),
-            metrics_landing_retention_hours: 6,
             metrics_dedup_window: 10_000,
-            log_landing_retention_hours: 6,
             log_dedup_window: 10_000,
-            trace_landing_retention_hours: 6,
             trace_dedup_window: 10_000,
             cluster: None,
             dist_suffix: "_dist".to_string(),
@@ -184,7 +158,6 @@ impl Default for Config {
             clickhouse: ClickHouseConfig::default(),
             writer: WriterConfig::default(),
             reader: ReaderConfig::default(),
-            downsampling: DownsamplingConfig::default(),
             ruler: RulerConfig::default(),
         }
     }
@@ -684,41 +657,6 @@ impl Default for ReaderConfig {
     }
 }
 
-/// Downsampling tier settings (docs/configuration.md §7, M3). Tier layout
-/// is YAML-only — the shape doesn't flatten into env vars.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct DownsamplingConfig {
-    pub enabled: bool,
-    pub raw_retention: Option<HumanDuration>,
-    pub tier_policy: TierPolicy,
-    pub tiers: Vec<Tier>,
-}
-
-impl Default for DownsamplingConfig {
-    fn default() -> Self {
-        DownsamplingConfig {
-            enabled: false,
-            raw_retention: None,
-            tier_policy: TierPolicy::Exact,
-            tiers: Vec::new(),
-        }
-    }
-}
-
-/// A single downsampling tier (docs/configuration.md §7). All fields are
-/// required when a tier object is present — there is no sensible default
-/// for a tier's name, table, or resolution.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Tier {
-    pub name: String,
-    pub resolution: HumanDuration,
-    pub table: String,
-    pub retention: HumanDuration,
-    pub min_step: HumanDuration,
-}
-
 /// Ruler settings (docs/configuration.md §8, M7).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1006,27 +944,6 @@ impl std::fmt::Display for OtlpTranslationStrategy {
     }
 }
 
-/// `PULSUS_TIER_POLICY` (docs/configuration.md §7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum TierPolicy {
-    #[default]
-    Exact,
-    Fast,
-}
-
-impl std::str::FromStr for TierPolicy {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "exact" => Ok(TierPolicy::Exact),
-            "fast" => Ok(TierPolicy::Fast),
-            _ => Err("one of: exact, fast".to_string()),
-        }
-    }
-}
-
 /// `CLICKHOUSE_AUTH` / `clickhouse.auth`: a `user:password` string split on
 /// the **first** colon (passwords may themselves contain `:`, e.g.
 /// `user:pa:ss` — splitting on the last colon would corrupt such a
@@ -1093,7 +1010,6 @@ mod tests {
         assert_eq!(cfg.port, 3100);
         assert_eq!(cfg.log_level, LogLevel::Info);
         assert_eq!(cfg.cors_origin, "*");
-        assert_eq!(cfg.retention_days, 7);
         assert_eq!(cfg.dist_suffix, "_dist");
         assert_eq!(cfg.clickhouse.server, "localhost");
         assert_eq!(cfg.clickhouse.auth.user, "default");

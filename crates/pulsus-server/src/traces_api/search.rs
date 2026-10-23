@@ -92,7 +92,10 @@ async fn search_impl(
     let start_ns = params::floored_start(
         params.start_ns,
         params.end_ns,
-        params::retention_floor_ns(state.config.retention_days, super::tags::now_unix_nanos()),
+        params::retention_floor_ns(
+            state.retention_days().ok_or(ApiError::PoolUnavailable)?,
+            super::tags::now_unix_nanos(),
+        ),
     );
     let search_params = pulsus_read::SearchParams {
         start_ns,
@@ -135,6 +138,7 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             pool: Arc::new(RwLock::new(None)),
+            retention_days: std::sync::Arc::new(std::sync::OnceLock::from(7)),
             config: Arc::new(Config::default()),
             metrics: metrics_exporter_prometheus::PrometheusBuilder::new()
                 .build_recorder()

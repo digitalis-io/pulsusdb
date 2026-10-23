@@ -71,7 +71,7 @@ fn test_config() -> ChConnConfig {
 }
 
 fn test_ctx(db: &str) -> SchemaParams {
-    RenderCtx::for_tests(db)
+    RenderCtx::for_tests(db, 7)
 }
 
 static DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_tags_it");

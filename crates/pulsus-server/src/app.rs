@@ -42,6 +42,10 @@ use crate::{compat, modes};
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) pool: Arc<RwLock<Option<Arc<ChPool>>>>,
+    /// Issue #497: the retention the database states, read at startup and
+    /// set before `pool` publishes. `None` until then; a route that needs it
+    /// answers `503`, as it does without the pool.
+    pub(crate) retention_days: Arc<OnceLock<u32>>,
     pub(crate) config: Arc<Config>,
     pub(crate) metrics: PrometheusHandle,
     pub(crate) build: BuildInfo,
@@ -84,6 +88,14 @@ pub(crate) struct TailRuntime {
     /// which would end every test tail loop instantly. `None` in
     /// production: `serve::run`'s shutdown future owns the real sender.
     _test_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+impl AppState {
+    /// Issue #497: the retention the database states, or `None` before the
+    /// startup check has read it.
+    pub(crate) fn retention_days(&self) -> Option<u32> {
+        self.retention_days.get().copied()
+    }
 }
 
 impl TailRuntime {
@@ -191,6 +203,7 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             pool: Arc::new(RwLock::new(None)),
+            retention_days: std::sync::Arc::new(std::sync::OnceLock::from(7)),
             config: Arc::new(Config::default()),
             metrics: metrics_exporter_prometheus::PrometheusBuilder::new()
                 .build_recorder()

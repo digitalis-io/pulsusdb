@@ -19,8 +19,8 @@ use serde::Serialize;
 
 use bench::BenchArgs;
 use ch_bench::{
-    ChCandidate, KlCandidate, aggstate::AggstateReport, ddl::DdlReport, fetch::FetchReport,
-    insert::InsertReport, pool::PoolReport, tls::TlsReport,
+    ChCandidate, KlCandidate, fetch::FetchReport, insert::InsertReport, pool::PoolReport,
+    tls::TlsReport,
 };
 
 #[derive(Parser)]
@@ -61,7 +61,7 @@ struct ChBenchArgs {
     user: String,
     #[arg(long, default_value = "")]
     password: String,
-    /// `all|insert|fetch|aggstate|ddl|pool`. `tls` is exercised separately
+    /// `all|insert|fetch|pool`. `tls` is exercised separately
     /// (see xtask/docker/gen-certs.sh) and not part of `all`.
     #[arg(long, default_value = "all")]
     scenario: String,
@@ -99,8 +99,6 @@ struct ChBenchArgs {
 struct Results {
     insert: Vec<InsertReport>,
     fetch: Vec<FetchReport>,
-    aggstate: Vec<AggstateReport>,
-    ddl: Vec<DdlReport>,
     pool: Vec<PoolReport>,
     tls: Vec<TlsReport>,
 }
@@ -126,8 +124,6 @@ async fn run_ch_bench(args: ChBenchArgs) -> anyhow::Result<()> {
     let mut results = Results::default();
     let run_insert = matches!(args.scenario.as_str(), "all" | "insert");
     let run_fetch = matches!(args.scenario.as_str(), "all" | "fetch");
-    let run_aggstate = matches!(args.scenario.as_str(), "all" | "aggstate");
-    let run_ddl = matches!(args.scenario.as_str(), "all" | "ddl");
     let run_pool = matches!(args.scenario.as_str(), "all" | "pool");
     let run_tls = args.scenario.as_str() == "tls";
 
@@ -249,68 +245,6 @@ async fn run_ch_bench(args: ChBenchArgs) -> anyhow::Result<()> {
             r.crate_name, r.stats.p50_ms, r.rows_per_sec_p50, r.rows, r.peak_rss_kib
         );
         results.fetch.push(r);
-    }
-
-    if run_ddl {
-        eprintln!("=== ddl scenario ===");
-        let r = ch_bench::ddl::bench_ddl(
-            &ch,
-            "bench_metric_samples_ch",
-            "bench_metric_samples_5m_ch",
-            "bench_metric_samples_5m_mv_ch",
-            4,
-        )
-        .await;
-        eprintln!(
-            "{:>10} ddl: reliable={} {:?}",
-            r.crate_name,
-            r.reliable(),
-            r.error
-        );
-        results.ddl.push(r);
-        let r = ch_bench::ddl::bench_ddl(
-            &kl,
-            "bench_metric_samples_kl",
-            "bench_metric_samples_5m_kl",
-            "bench_metric_samples_5m_mv_kl",
-            4,
-        )
-        .await;
-        eprintln!(
-            "{:>10} ddl: reliable={} {:?}",
-            r.crate_name,
-            r.reliable(),
-            r.error
-        );
-        results.ddl.push(r);
-    }
-
-    if run_aggstate {
-        eprintln!("=== aggstate scenario ===");
-        let r = ch_bench::aggstate::bench_aggstate(
-            &ch,
-            "aggstate_raw_ch",
-            "aggstate_5m_ch",
-            "aggstate_5m_mv_ch",
-        )
-        .await;
-        eprintln!(
-            "{:>10} aggstate: ok={} actual={:?} err={:?}",
-            r.crate_name, r.ok, r.actual, r.error
-        );
-        results.aggstate.push(r);
-        let r = ch_bench::aggstate::bench_aggstate(
-            &kl,
-            "aggstate_raw_kl",
-            "aggstate_5m_kl",
-            "aggstate_5m_mv_kl",
-        )
-        .await;
-        eprintln!(
-            "{:>10} aggstate: ok={} actual={:?} err={:?}",
-            r.crate_name, r.ok, r.actual, r.error
-        );
-        results.aggstate.push(r);
     }
 
     if run_pool {

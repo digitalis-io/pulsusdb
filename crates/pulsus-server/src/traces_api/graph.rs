@@ -36,12 +36,13 @@ pub(crate) async fn service_graph(
 async fn graph_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
     let now_ns = super::tags::now_unix_nanos();
     let params = params::parse_graph_params(raw, now_ns)?;
+    let retention_days = state.retention_days().ok_or(ApiError::PoolUnavailable)?;
     // docs/api.md §4, "Retention": the window starts at the cutoff.
     let window = GraphWindow {
         start_ns: params::floored_start(
             params.start_ns,
             params.end_ns,
-            params::retention_floor_ns(state.config.retention_days, now_ns),
+            params::retention_floor_ns(retention_days, now_ns),
         ),
         end_ns: params.end_ns,
     };
@@ -94,6 +95,7 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             pool: Arc::new(RwLock::new(None)),
+            retention_days: std::sync::Arc::new(std::sync::OnceLock::from(7)),
             config: Arc::new(Config::default()),
             metrics: metrics_exporter_prometheus::PrometheusBuilder::new()
                 .build_recorder()

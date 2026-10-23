@@ -82,8 +82,6 @@ pulsusdb:
     compat_endpoints: false
     cors_origin: "*"
     query_timeout: 2m
-    skip_ddl: false
-    retention_days: 7
     storage_policy: null
     log_rollup_resolution: 5s
     # -- ClickHouse cluster name (enables `ON CLUSTER` DDL, `Replicated*`
@@ -123,12 +121,6 @@ pulsusdb:
       promql_lookback: 5m
       logql_scan_budget_bytes: 50GiB
       traceql_tag_lookback: 20m
-
-    downsampling:
-      enabled: false
-      raw_retention: null
-      tier_policy: exact
-      tiers: []
 
     ruler:
       enabled: false
@@ -188,6 +180,11 @@ pulsusdb:
 # `templates/init-job.yaml` says why the name is built this way.
 initJob:
   enabled: true
+  # `retentionDays` is required and has no value here (issue #497): the days
+  # `schema/schema.sh` keeps data for, as `PULSUS_RETENTION_DAYS`. Every
+  # table's expiry is in docs/configuration.md §7. The serving pods read it
+  # back from the database the Job builds. Set it with
+  # `--set initJob.retentionDays=<days>`.
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }

@@ -211,7 +211,10 @@ pub(super) async fn values_for(
         start_ns: params::floored_start(
             params.start_ns,
             params.end_ns,
-            params::retention_floor_ns(state.config.retention_days, now_ns),
+            params::retention_floor_ns(
+                state.retention_days().ok_or(ApiError::PoolUnavailable)?,
+                now_ns,
+            ),
         ),
         end_ns: params.end_ns,
     };
@@ -278,6 +281,7 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             pool: Arc::new(RwLock::new(None)),
+            retention_days: std::sync::Arc::new(std::sync::OnceLock::from(7)),
             config: Arc::new(Config::default()),
             metrics: metrics_exporter_prometheus::PrometheusBuilder::new()
                 .build_recorder()

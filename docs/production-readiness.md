@@ -51,9 +51,9 @@ Status legend: ✅ implemented + evidenced · 🚫 explicit non-goal (recorded, 
 
 | Item | Evidence (test / CI step / doc § / code ref) | Status |
 | --- | --- | --- |
-| TTL declared from `retention_days` (saturating `DateTime`, incl. `u32::MAX`) | `crates/pulsus-schema/tests/live_schema.rs::the_configured_retention_reaches_every_retained_tables_ttl` | ✅ |
+| TTL declared from `PULSUS_RETENTION_DAYS`, which has no default (saturating `DateTime`, incl. `u32::MAX`) | `crates/pulsus-schema/tests/schema_file.rs::every_table_expires_exactly_as_documented` · `crates/pulsus-schema/tests/live_schema.rs::the_configured_retention_reaches_every_retained_tables_ttl` | ✅ |
 | TTL applied when the schema is built | `schema/schema.sql` · `schema/schema.sh` · `crates/pulsus-schema/tests/schema_file.rs` | ✅ |
-| Retention/storage-policy config surface | `retention_days`/`storage_policy` in `crates/pulsus-config/src/model.rs` · `configuration.md §3` | ✅ |
+| Retention/storage-policy config surface | `PULSUS_RETENTION_DAYS` in `schema/schema.sh`, read back from the database comment (`crates/pulsus-server/src/chconfig.rs::read_schema_retention`) · `storage_policy` in `crates/pulsus-config/src/model.rs` · `configuration.md §3`, `§7` | ✅ |
 | Live schema TTL gates (logs/metrics + traces) | `ci.yml: "Live schema tests (single-node, migrations + MVs + crash/retry)"` · `ci.yml: "Live trace landing schema tests (tables + views + TTLs)"` · `architecture.md §3.6` | ✅ |
 
 ## 4. Backpressure & admission control
@@ -126,7 +126,7 @@ checklist reflects reality, not blockers:
 - **Additional not-yet-exposed `/metrics` dimensions (🚫 non-goal).** Per
   `architecture.md §8`: per-*protocol* ingest error attribution (today errors are
   per signal + error-class), per-API / per-planner-stage query latencies,
-  tier-router segment decisions, and tail-session counters.
+  and tail-session counters.
 - **Multi-cluster federation (#175/#176) (🚫 will-not-implement).** See §7; the
   implemented single-cluster `_dist` reader targeting satisfies the M7
   cross-cluster-reads deliverable.

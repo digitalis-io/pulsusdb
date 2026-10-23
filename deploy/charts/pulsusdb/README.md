@@ -121,6 +121,7 @@ Every name this chart generates stays within its kind's limit up to Helm's own 5
 | `pulsusdb.extraEnv` | list | `[]` | Escape hatch, `[{name, value\|valueFrom}, ...]` |
 | `pulsusdb.spool.persistence.enabled` / `.size` / `.storageClass` | bool / string / string | `false` / `5Gi` / `""` | PVC for the insert-failure spool instead of `emptyDir` |
 | `initJob.enabled` | bool | `true` | The schema Job — see above |
+| `initJob.retentionDays` | int | none: required while `initJob.enabled` | The schema's retention in days, `PULSUS_RETENTION_DAYS` (docs/configuration.md §7). Without it the chart does not render; the serving pods read it back from the database |
 | `initJob.resources` | object | `{requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: "1", memory: 1Gi}}` | The schema Job's resources |
 | `initJob.backoffLimit` | int | `10` | The schema Job's retry limit: how many times a failed run is retried before the Job is marked failed |
 | `clickhouse.enabled` | bool | `true` | `false` => external/production ClickHouse |

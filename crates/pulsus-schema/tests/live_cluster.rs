@@ -51,6 +51,9 @@ static TEST_DB_DEDUP_PROFILE: pulsus_testkit::TestDb =
 // routing wrappers, clustered.
 static TEST_DB_TRACE_LANDING: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_trace_landing");
+// Issue #497: the retention every replica states.
+static TEST_DB_RETENTION: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_retention");
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -1728,4 +1731,85 @@ async fn the_catalog_targets_reach_every_shard() {
         &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
     )
     .await;
+}
+
+/// Issue #497: the binary takes its retention from the database only when
+/// every replica of the cluster holds it with the same valid comment. Built
+/// at seven days, then one replica's comment is changed or its database
+/// dropped, each by a statement sent to that replica alone.
+#[tokio::test]
+async fn every_replica_must_state_the_same_retention() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+    let db = &TEST_DB_RETENTION;
+    fresh_cluster_db(&shard1, db).await;
+    let read = || pulsus_schema::schema_retention(&shard1, Some(CLUSTER_NAME), db);
+    use pulsus_schema::SchemaRetention::{Agreed, Refused};
+
+    assert_eq!(
+        read().await.expect("read"),
+        Agreed(7),
+        "built at seven days"
+    );
+
+    exec_on(
+        &shard2,
+        &format!("ALTER DATABASE {db} MODIFY COMMENT 'retention_days=8'"),
+    )
+    .await;
+    match read().await.expect("read") {
+        Refused { hosts, answered } => {
+            assert_eq!(answered.len(), hosts, "every host answers");
+            let eights = answered
+                .iter()
+                .filter(|(_, c)| c == "retention_days=8")
+                .count();
+            let sevens = answered
+                .iter()
+                .filter(|(_, c)| c == "retention_days=7")
+                .count();
+            assert_eq!((eights, sevens), (1, hosts - 1), "{answered:?}");
+        }
+        other => panic!("one replica at eight days must refuse: {other:?}"),
+    }
+    assert_eq!(
+        pulsus_schema::schema_retention(&shard1, Some("no_such_cluster"), db)
+            .await
+            .expect("read"),
+        Agreed(7),
+        "a cluster the server does not define reads the connected host alone"
+    );
+
+    exec_on(&shard2, &format!("ALTER DATABASE {db} MODIFY COMMENT ''")).await;
+    assert!(
+        matches!(read().await.expect("read"), Refused { .. }),
+        "one replica stating nothing refuses"
+    );
+
+    exec_on(
+        &shard2,
+        &format!("ALTER DATABASE {db} MODIFY COMMENT 'retention_days=7'"),
+    )
+    .await;
+    assert_eq!(read().await.expect("read"), Agreed(7), "agreement restored");
+
+    exec_on(&shard2, &format!("DROP DATABASE {db} SYNC")).await;
+    match read().await.expect("read") {
+        Refused { hosts, answered } => {
+            assert_eq!(
+                answered.len(),
+                hosts - 1,
+                "the replica without it does not answer"
+            )
+        }
+        other => panic!("one replica without the database must refuse: {other:?}"),
+    }
+
+    drop_cluster_db(&shard1, db).await;
 }

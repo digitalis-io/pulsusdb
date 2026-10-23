@@ -202,7 +202,7 @@ async fn fresh(db: String) -> (ChClient, String, ChClient) {
         .await
         .expect("connect (bootstrap)");
     drop_database(&bootstrap, &db).await;
-    run_init(&bootstrap, &RenderCtx::for_tests(&db))
+    run_init(&bootstrap, &RenderCtx::for_tests(&db, 7))
         .await
         .expect("run_init");
     let client = ChClient::new(test_config(&db))
@@ -1591,7 +1591,7 @@ async fn a_failed_label_view_fails_the_push() {
             // re-creates it, and its view still writes into it.
             _ => {
                 let head = format!("CREATE TABLE IF NOT EXISTS {db}.metric_labels\n");
-                let create = pulsus_schema::rendered_statements(&RenderCtx::for_tests(&db))
+                let create = pulsus_schema::rendered_statements(&RenderCtx::for_tests(&db, 7))
                     .into_iter()
                     .find(|s| s.starts_with(&head))
                     .expect("the schema file creates metric_labels");

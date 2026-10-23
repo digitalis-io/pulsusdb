@@ -2,6 +2,9 @@ suite: values.schema.json / template-time fail-guard negative cases (AC #4)
 release:
   name: pulsusdb
   namespace: default
+# Retention has no default (issue #497): every render states it.
+set:
+  initJob.retentionDays: 7
 templates:
   - deployment-all.yaml
   - configmap.yaml

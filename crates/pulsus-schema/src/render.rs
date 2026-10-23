@@ -35,7 +35,9 @@ pub struct RenderCtx {
     /// `PULSUS_STORAGE_POLICY` (docs/configuration.md §3). Injected as a
     /// `storage_policy` table SETTING when set.
     pub storage_policy: Option<String>,
-    /// `PULSUS_RETENTION_DAYS` (docs/configuration.md §3, default 7).
+    /// `PULSUS_RETENTION_DAYS` (docs/configuration.md §7): required, no
+    /// default (issue #497). Renders every target table's TTL and the
+    /// database comment the binary reads it back from.
     pub retention_days: u32,
     /// `PULSUS_LOG_ROLLUP_RESOLUTION` (docs/configuration.md §3, default
     /// 5s). Sets both the `log_metrics_<res>` table-name suffix and the
@@ -76,21 +78,22 @@ pub struct RenderCtx {
 pub const GRAPH_JOB_MAX_ROWS: u64 = 60_000_000;
 
 impl RenderCtx {
-    /// A context for a test: `db` as given, every other field at the value
-    /// `pulsus_config`'s own default carries.
+    /// A context for a test: `db` and `retention_days` as given, every other
+    /// field at the value `schema/schema.sh` defaults it to. Retention has no
+    /// default (issue #497), so every caller states it.
     ///
     /// **Production does not build a `RenderCtx`**: `schema/schema.sh`
     /// renders the schema from the environment, and nothing in the binary
     /// renders it since the rebuild commands were removed. This exists
     /// because every new field otherwise edits one literal per test file —
     /// thirty-odd of them for the two fields above.
-    pub fn for_tests(db: &str) -> Self {
+    pub fn for_tests(db: &str, retention_days: u32) -> Self {
         RenderCtx {
             db: db.to_string(),
             cluster: None,
             dist_suffix: "_dist".to_string(),
             storage_policy: None,
-            retention_days: 7,
+            retention_days,
             log_rollup: Duration::from_secs(5),
             metrics_landing_retention_hours: 6,
             metrics_dedup_window: 10_000,

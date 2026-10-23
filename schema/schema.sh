@@ -11,9 +11,9 @@
 # There are no migrations. A schema change is an edit to `schema.sql` and
 # another run of this script, which drops what is there and recreates it.
 #
-# Configuration comes from the same environment variables the binary reads
-# (docs/configuration.md). `PULSUS_CLUSTER` selects the clustered variant:
-# `Replicated*` engines, `ON CLUSTER`, the `_dist` wrappers.
+# Configuration comes from the environment (docs/configuration.md).
+# `PULSUS_RETENTION_DAYS` is required, and the binary reads it back from the
+# database. `PULSUS_CLUSTER` selects the clustered variant (`Replicated*`, `ON CLUSTER`, `_dist`).
 #
 # ClickHouse's own `{shard}` and `{replica}` macros must reach the server as
 # those exact characters. Every substitution here is a double-brace
@@ -48,7 +48,7 @@ db=${CLICKHOUSE_DB:-pulsus}
 cluster=${PULSUS_CLUSTER:-}
 dist_suffix=${PULSUS_DIST_SUFFIX:-_dist}
 storage_policy=${PULSUS_STORAGE_POLICY:-}
-retention_days=${PULSUS_RETENTION_DAYS:-7}
+retention_days=${PULSUS_RETENTION_DAYS:-}
 rollup=${PULSUS_LOG_ROLLUP_RESOLUTION:-5s}
 metrics_landing_hours=${PULSUS_METRICS_LANDING_RETENTION_HOURS:-6}
 log_landing_hours=${PULSUS_LOG_LANDING_RETENTION_HOURS:-6}
@@ -79,6 +79,40 @@ for pair in "database:$db" "cluster:$cluster" "dist_suffix:$dist_suffix" \
             exit 2
             ;;
     esac
+done
+
+# Retention has no default (issue #497). This is the one place it is set:
+# the tables' TTLs and the database comment the binary reads it back from
+# are both rendered from it (docs/configuration.md §7).
+case "$retention_days" in
+    '')
+        echo "schema.sh: PULSUS_RETENTION_DAYS is not set; retention has no default (docs/configuration.md §7)" >&2
+        exit 2
+        ;;
+    0* | *[!0-9]*)
+        echo "schema.sh: PULSUS_RETENTION_DAYS must be a whole number of days from 1 to 4294967295: $retention_days" >&2
+        exit 2
+        ;;
+esac
+if [ "${#retention_days}" -gt 10 ] || [ "$retention_days" -gt 4294967295 ]; then
+    echo "schema.sh: PULSUS_RETENTION_DAYS must be a whole number of days from 1 to 4294967295: $retention_days" >&2
+    exit 2
+fi
+for pair in "PULSUS_METRICS_LANDING_RETENTION_HOURS:$metrics_landing_hours" \
+            "PULSUS_LOG_LANDING_RETENTION_HOURS:$log_landing_hours" \
+            "PULSUS_TRACE_LANDING_RETENTION_HOURS:$trace_landing_hours"; do
+    what=${pair%%:*}
+    value=${pair#*:}
+    case "$value" in
+        '' | 0* | *[!0-9]* | ????*)
+            echo "schema.sh: $what must be a whole number of hours from 1 to 168: $value" >&2
+            exit 2
+            ;;
+    esac
+    if [ "$value" -gt 168 ]; then
+        echo "schema.sh: $what must be a whole number of hours from 1 to 168: $value" >&2
+        exit 2
+    fi
 done
 
 if [ "$mode" = cluster ] && [ -z "$cluster" ]; then

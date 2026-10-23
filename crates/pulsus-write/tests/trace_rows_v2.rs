@@ -148,7 +148,7 @@ async fn fresh_db(db: String) -> (ChClient, String) {
         )
         .await
         .expect("drop the test database");
-    let ctx: SchemaParams = RenderCtx::for_tests(&db);
+    let ctx: SchemaParams = RenderCtx::for_tests(&db, 7);
     run_init(&admin, &ctx).await.expect("run_init");
 
     let client = ChClient::new(ChConnConfig {

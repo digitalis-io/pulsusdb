@@ -151,6 +151,7 @@ mod tests {
     fn state_with_config(config: Config) -> AppState {
         AppState {
             pool: Arc::new(RwLock::new(None)),
+            retention_days: std::sync::Arc::new(std::sync::OnceLock::from(7)),
             config: Arc::new(config),
             metrics: metrics_exporter_prometheus::PrometheusBuilder::new()
                 .build_recorder()

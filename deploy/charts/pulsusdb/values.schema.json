@@ -88,9 +88,13 @@
       "additionalProperties": false,
       "properties": {
         "enabled": { "type": "boolean" },
+        "retentionDays": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
         "backoffLimit": { "type": "integer", "minimum": 0 },
         "resources": { "$ref": "#/definitions/resources" }
-      }
+      },
+      "$comment": "Retention has no default (issue #497): the schema Job refuses to render without it.",
+      "if": { "properties": { "enabled": { "const": false } } },
+      "else": { "required": ["retentionDays"] }
     },
     "clickhouse": {
       "type": "object",
@@ -395,8 +399,6 @@
         "compat_endpoints": { "type": "boolean" },
         "cors_origin": { "type": "string" },
         "query_timeout": { "$ref": "#/definitions/positiveHumanDuration" },
-        "skip_ddl": { "type": "boolean" },
-        "retention_days": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
         "storage_policy": { "type": ["string", "null"] },
         "log_rollup_resolution": { "$ref": "#/definitions/positiveHumanDuration" },
         "cluster": { "type": ["string", "null"] },
@@ -436,33 +438,6 @@
             "promql_lookback": { "$ref": "#/definitions/humanDuration" },
             "logql_scan_budget_bytes": { "$ref": "#/definitions/logqlScanBudgetBytes" },
             "traceql_tag_lookback": { "$ref": "#/definitions/positiveHumanDuration" }
-          }
-        },
-        "downsampling": {
-          "type": "object",
-          "additionalProperties": false,
-          "$comment": "The binary refuses enabled: true with no tiers, which the if/then below refuses too. The relationships between tier fields are not checked here: a tier's min_step must be at least its resolution, and across tiers resolution, min_step and retention strictly increase and names and tables are unique. The server checks them at startup and its message names the fields. Downsampling is not built yet, and this section is due for removal.",
-          "if": { "properties": { "enabled": { "const": true } } },
-          "then": { "properties": { "tiers": { "minItems": 1 } } },
-          "properties": {
-            "enabled": { "type": "boolean" },
-            "raw_retention": { "$ref": "#/definitions/nullablePositiveHumanDuration" },
-            "tier_policy": { "type": "string", "enum": ["exact", "fast"] },
-            "tiers": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["name", "resolution", "table", "retention", "min_step"],
-                "properties": {
-                  "name": { "type": "string", "minLength": 1 },
-                  "resolution": { "$ref": "#/definitions/positiveHumanDuration" },
-                  "table": { "type": "string", "minLength": 1 },
-                  "retention": { "$ref": "#/definitions/positiveHumanDuration" },
-                  "min_step": { "$ref": "#/definitions/positiveHumanDuration" }
-                }
-              }
-            }
           }
         },
         "ruler": {

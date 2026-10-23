@@ -4388,7 +4388,7 @@ async fn the_instant_window_is_the_requested_window() {
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[]);
 
-    // A whole hour, inside the default retention.
+    // A whole hour, inside the suite's retention.
     let t = (now_s() / 3_600 - 3) * 3_600;
     let at = |s: i64| (s as u64) * 1_000_000_000;
     ingest(
@@ -4446,7 +4446,8 @@ async fn no_windowed_read_returns_a_span_past_retention() {
     let port = 31_772;
     let db = &pulsus_testkit::test_db("pulsus_traces_retention_floor_it");
     drop_db(db).await;
-    let _guard = spawn_ready(port, db, &[("PULSUS_RETENTION_DAYS", "1")]);
+    live_db::build_schema_blocking_with_retention(db, 1);
+    let _guard = spawn_ready(port, db, &[]);
 
     // A and B on one UTC day: wait for the next minute and recompute
     // otherwise, never skip.

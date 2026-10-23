@@ -1,6 +1,6 @@
 # ADR 0001: ClickHouse client crate
 
-Status: **Accepted** (2026-07-11)
+Status: **Accepted** (2026-07-11) **Downsampling was never built and is removed: the `aggstate` and `ddl` scenarios below built its tier tables and are gone from `xtask ch-bench`.**
 Issue: [#3](https://github.com/digitalis-io/pulsusdb/issues/3)
 
 ## Context

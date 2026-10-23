@@ -22,9 +22,9 @@ if [ -n "$cluster" ]; then
 else
     mode=single spans=spans procs=system.processes
 fi
-CLICKHOUSE_SERVER=$ch CLICKHOUSE_HTTP_PORT=$port CLICKHOUSE_DB=$db sh "$root/schema/schema.sh" --mode "$mode"
+CLICKHOUSE_SERVER=$ch CLICKHOUSE_HTTP_PORT=$port CLICKHOUSE_DB=$db PULSUS_RETENTION_DAYS=7 sh "$root/schema/schema.sh" --mode "$mode"
 
-# Two hours ago, on a minute: inside the default seven-day retention, and the
+# Two hours ago, on a minute: inside the seven-day retention it builds, and the
 # step's grid starts at the fixture's first span.
 base=${CATALOGUE_BASE:-$(( ( $(date -u +%s) - 7200 ) / 60 * 60 ))}
 start=${base}000000000 end=$(( base + 120 ))000000000

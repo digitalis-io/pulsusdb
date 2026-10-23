@@ -68,7 +68,7 @@ fn test_config() -> ChConnConfig {
 }
 
 fn schema_params(db: &str) -> SchemaParams {
-    RenderCtx::for_tests(db)
+    RenderCtx::for_tests(db, 7)
 }
 
 async fn drop_database(client: &ChClient, db: &str) {

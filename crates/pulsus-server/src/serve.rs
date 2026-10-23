@@ -29,8 +29,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::{self, AppState, BuildInfo};
 use crate::chconfig::{
-    NameCheckError, build_label_cache, check_schema_present, check_server_names, conn_config_from,
-    consistency_from, metric_writer_tables_from, trace_writer_tables_from, writer_tables_from,
+    NameCheckError, build_label_cache, check_server_names, conn_config_from, consistency_from,
+    metric_writer_tables_from, read_schema_retention, trace_writer_tables_from, writer_tables_from,
 };
 use crate::ingest::{MetricWriterSink, TraceWriterSink, WriterSink};
 
@@ -115,8 +115,12 @@ pub async fn run(config: Config) -> ExitCode {
     // after `pool_slot` is published — every serving mode holds a pool —
     // and abort+joined in shutdown ordering after the refresh handle).
     let (reprobe_tx, reprobe_rx) = oneshot::channel();
+    // Issue #497: the retention the database states, set by the reconnect
+    // loop before `pool_slot` publishes.
+    let retention_slot: Arc<OnceLock<u32>> = Arc::new(OnceLock::new());
     let reconnect_handle = spawn_reconnect_loop(
         Arc::clone(&pool_slot),
+        Arc::clone(&retention_slot),
         WriterSlots {
             log: Arc::clone(&writer_slot),
             metric: Arc::clone(&metric_writer_slot),
@@ -140,6 +144,7 @@ pub async fn run(config: Config) -> ExitCode {
 
     let state = AppState {
         pool: Arc::clone(&pool_slot),
+        retention_days: Arc::clone(&retention_slot),
         config: Arc::clone(&config),
         metrics,
         build: BuildInfo::from_build_env(),
@@ -330,10 +335,26 @@ enum StartupError {
     /// so every attempt says which command to run.
     #[error(
         "clickhouse database {0:?} does not exist: build it with \
-         `schema/schema.sh` (set PULSUS_CLUSTER for the clustered variant), \
-         or set PULSUS_SKIP_DDL=1 if the schema is managed elsewhere"
+         `schema/schema.sh` (set PULSUS_RETENTION_DAYS, and PULSUS_CLUSTER for \
+         the clustered variant)"
     )]
     SchemaAbsent(String),
+    /// Issue #497: the configured database states no retention. Retried, for
+    /// [`StartupError::SchemaAbsent`]'s reason: a run of the script fixes it.
+    #[error(
+        "clickhouse database {db:?} states no retention (its comment is {comment:?}, \
+         not `retention_days=<N>`): rebuild it with `schema/schema.sh` and \
+         PULSUS_RETENTION_DAYS set"
+    )]
+    RetentionAbsent { db: String, comment: String },
+    /// Issue #497: the cluster's hosts do not state one retention. Retried:
+    /// a host coming back, or a rebuild, fixes it.
+    #[error(
+        "clickhouse database {db:?} does not state one retention on every host \
+         of the cluster ({detail}): rebuild it with `schema/schema.sh` and \
+         PULSUS_RETENTION_DAYS set"
+    )]
+    RetentionDisagrees { db: String, detail: String },
 }
 
 /// The transient halves of a name check map onto the failures the reconnect
@@ -345,6 +366,12 @@ impl From<NameCheckError> for StartupError {
             NameCheckError::Statement(e) => StartupError::Schema(e),
             NameCheckError::Missing(names) => StartupError::MissingServerNames(names),
             NameCheckError::SchemaAbsent(db) => StartupError::SchemaAbsent(db),
+            NameCheckError::RetentionAbsent { db, comment } => {
+                StartupError::RetentionAbsent { db, comment }
+            }
+            NameCheckError::RetentionDisagrees { db, detail } => {
+                StartupError::RetentionDisagrees { db, detail }
+            }
         }
     }
 }
@@ -378,6 +405,7 @@ struct BackgroundHandoff {
 /// loop's first successful pass lands.
 fn spawn_reconnect_loop(
     pool_slot: Arc<RwLock<Option<Arc<ChPool>>>>,
+    retention_slot: Arc<OnceLock<u32>>,
     writer_slots: WriterSlots,
     label_cache_slot: Arc<OnceLock<Arc<LabelCache>>>,
     config: Arc<Config>,
@@ -392,8 +420,14 @@ fn spawn_reconnect_loop(
         let mut backoff = INITIAL_BACKOFF;
         loop {
             match ensure_schema_then_connect(&config, required).await {
-                Ok(pool) => {
-                    tracing::info!("clickhouse schema ready; pool established");
+                Ok((pool, retention_days)) => {
+                    tracing::info!(
+                        retention_days,
+                        "clickhouse schema ready; pool established; retention read from the database"
+                    );
+                    // Issue #497: set before any slot below publishes, so a
+                    // handler that sees the pool sees the retention too.
+                    let _ = retention_slot.set(retention_days);
                     let pool = Arc::new(pool);
                     // Construct and store the writer(s) *before* the pool
                     // (issue #15 architect plan): `/ready`=200 (which gates
@@ -577,18 +611,15 @@ fn reader_enabled(cfg: &Config) -> bool {
 async fn ensure_schema_then_connect(
     config: &Config,
     required: &'static [(&'static str, NameCatalogue)],
-) -> Result<ChPool, StartupError> {
+) -> Result<(ChPool, u32), StartupError> {
     // Issue #603: FIRST — no name is sent before it is known to exist.
     check_server_names(config, required).await?;
-    // `PULSUS_SKIP_DDL=1` is the escape hatch for an operator-managed
-    // schema this check cannot see, e.g. one built under a different
-    // database name and reached through a view.
-    if !config.skip_ddl {
-        check_schema_present(config).await?;
-    }
-    ChPool::connect(conn_config_from(config))
+    // Issue #497: the retention comes from the database, never a setting.
+    let retention_days = read_schema_retention(config).await?;
+    let pool = ChPool::connect(conn_config_from(config))
         .await
-        .map_err(StartupError::Pool)
+        .map_err(StartupError::Pool)?;
+    Ok((pool, retention_days))
 }
 
 /// Initializes the global `tracing` subscriber from `cfg.log_level`
@@ -702,12 +733,11 @@ mod tests {
     }
 
     /// Issue #603: a name the server does not have is TERMINAL. The bootstrap
-    /// task returns rather than backing off, no writer or pool slot
-    /// publishes, and `/ready` stays `503`.
-    ///
-    /// `skip_ddl = true` and the built-in `default` database, so the pool can
-    /// connect with no schema run at all: the check is not gated by
-    /// `skip_ddl`, and that is what this shows.
+    /// task returns rather than backing off, and neither the retention, a
+    /// writer nor the pool slot publishes, so `/ready` stays `503`. The name
+    /// check runs before the database is read, so the built-in `default`
+    /// database serves. That a complete server publishes is what every live
+    /// suite that reaches `/ready` shows.
     #[tokio::test]
     async fn a_missing_server_name_publishes_nothing() {
         if !pulsus_testkit::live_clickhouse_enabled() {
@@ -720,7 +750,6 @@ mod tests {
         let base = Config::default();
         let cfg = Arc::new(Config {
             mode: Mode::Writer,
-            skip_ddl: true,
             clickhouse: pulsus_config::ClickHouseConfig {
                 database: "default".to_string(),
                 http_port: std::env::var("PULSUS_TEST_CH_HTTP_PORT")
@@ -734,50 +763,41 @@ mod tests {
             ..base
         });
 
-        for (required, expect_published) in [(MADE_UP, false), (REQUIRED_SERVER_NAMES, true)] {
-            let pool_slot: Arc<RwLock<Option<Arc<ChPool>>>> = Arc::new(RwLock::new(None));
-            let slots = WriterSlots {
-                log: Arc::new(OnceLock::new()),
-                metric: Arc::new(OnceLock::new()),
-                trace: Arc::new(OnceLock::new()),
-            };
-            let (refresh_tx, _refresh_rx) = oneshot::channel();
-            let (reprobe_tx, _reprobe_rx) = oneshot::channel();
-            let handle = spawn_reconnect_loop(
-                Arc::clone(&pool_slot),
-                WriterSlots {
-                    log: Arc::clone(&slots.log),
-                    metric: Arc::clone(&slots.metric),
-                    trace: Arc::clone(&slots.trace),
-                },
-                Arc::new(OnceLock::new()),
-                Arc::clone(&cfg),
-                BackgroundHandoff {
-                    label_cache_refresh: refresh_tx,
-                    reprobe: reprobe_tx,
-                },
-                required,
-            );
-            tokio::time::timeout(Duration::from_secs(30), handle)
-                .await
-                .expect("the bootstrap task must finish, not back off forever")
-                .expect("it does not panic");
+        let pool_slot: Arc<RwLock<Option<Arc<ChPool>>>> = Arc::new(RwLock::new(None));
+        let retention_slot: Arc<OnceLock<u32>> = Arc::new(OnceLock::new());
+        let slots = WriterSlots {
+            log: Arc::new(OnceLock::new()),
+            metric: Arc::new(OnceLock::new()),
+            trace: Arc::new(OnceLock::new()),
+        };
+        let (refresh_tx, _refresh_rx) = oneshot::channel();
+        let (reprobe_tx, _reprobe_rx) = oneshot::channel();
+        let handle = spawn_reconnect_loop(
+            Arc::clone(&pool_slot),
+            Arc::clone(&retention_slot),
+            WriterSlots {
+                log: Arc::clone(&slots.log),
+                metric: Arc::clone(&slots.metric),
+                trace: Arc::clone(&slots.trace),
+            },
+            Arc::new(OnceLock::new()),
+            Arc::clone(&cfg),
+            BackgroundHandoff {
+                label_cache_refresh: refresh_tx,
+                reprobe: reprobe_tx,
+            },
+            MADE_UP,
+        );
+        tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("the bootstrap task must finish, not back off forever")
+            .expect("it does not panic");
 
-            let published = pool_slot.read().await.is_some();
-            assert_eq!(
-                published, expect_published,
-                "the pool slot must publish only when every required name exists"
-            );
-            assert_eq!(
-                slots.metric.get().is_some(),
-                expect_published,
-                "the metric writer slot follows the pool slot"
-            );
-            if !expect_published {
-                assert!(slots.log.get().is_none());
-                assert!(slots.trace.get().is_none());
-            }
-        }
+        assert!(pool_slot.read().await.is_none(), "no pool publishes");
+        assert!(retention_slot.get().is_none(), "no retention publishes");
+        assert!(slots.log.get().is_none());
+        assert!(slots.metric.get().is_none());
+        assert!(slots.trace.get().is_none());
     }
 
     #[tokio::test]
@@ -789,6 +809,7 @@ mod tests {
         let (reprobe_tx, _reprobe_rx) = oneshot::channel();
         let handle = spawn_reconnect_loop(
             Arc::new(RwLock::new(None)),
+            Arc::new(OnceLock::new()),
             WriterSlots {
                 log: Arc::new(OnceLock::new()),
                 metric: Arc::new(OnceLock::new()),
@@ -928,6 +949,7 @@ mod tests {
         let (_tail_tx, tail_rx) = tokio::sync::watch::channel(false);
         let state = AppState {
             pool: Arc::new(RwLock::new(None)),
+            retention_days: std::sync::Arc::new(std::sync::OnceLock::from(7)),
             config: Arc::new(config.clone()),
             // A standalone handle, not the process-global recorder — this
             // test must not fight `install_metrics_recorder`'s singleton.
@@ -1071,9 +1093,8 @@ mod tests {
         .expect("shutdown_background_tasks must not hang when nothing was started");
     }
 
-    /// Load-bearing regression test for the review finding: by default
-    /// (`skip_ddl = false`) startup must attempt the schema-bootstrap
-    /// connection first, not jump straight to the serving pool — otherwise a
+    /// Load-bearing regression test for the review finding: startup must
+    /// attempt the schema-bootstrap connection first, not jump straight to the serving pool — otherwise a
     /// fresh ClickHouse (missing database) never becomes ready.
     #[tokio::test]
     async fn ensure_schema_then_connect_checks_the_server_first_by_default() {
@@ -1086,35 +1107,6 @@ mod tests {
             Ok(_) => panic!("nothing listens on port 1"),
         };
         assert!(matches!(err, StartupError::Bootstrap(_)));
-    }
-
-    /// Issue #603: the startup name check runs **first**, and
-    /// `PULSUS_SKIP_DDL=1` does not skip it — a `skip_ddl` deployment still
-    /// inserts landing blocks and still sends every name. So with nothing
-    /// listening the failure is the bootstrap connect's under both
-    /// settings, never the pool's.
-    #[tokio::test]
-    async fn the_name_check_runs_first_whether_or_not_ddl_is_skipped() {
-        for skip_ddl in [false, true] {
-            let cfg = Config {
-                skip_ddl,
-                clickhouse: pulsus_config::ClickHouseConfig {
-                    http_port: 1, // nothing listens here
-                    ..Config::default().clickhouse
-                },
-                ..Config::default()
-            };
-            // `ChPool` is not `Debug` (pulsus-clickhouse), so match manually
-            // instead of `.expect_err`/`.unwrap_err`.
-            let err = match ensure_schema_then_connect(&cfg, REQUIRED_SERVER_NAMES).await {
-                Err(err) => err,
-                Ok(_) => panic!("nothing listens on port 1"),
-            };
-            assert!(
-                matches!(err, StartupError::Bootstrap(_)),
-                "skip_ddl = {skip_ddl}: the name check's own connection fails first"
-            );
-        }
     }
 
     #[test]
