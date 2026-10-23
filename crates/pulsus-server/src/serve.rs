@@ -894,6 +894,37 @@ mod tests {
             "the default config must select the plaintext branch"
         );
 
+        let (addr, server) = serve_plaintext(config).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(b"GET /buildinfo HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("a response within 5s")
+            .expect("read response");
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "the plaintext listener must serve /buildinfo with 200, got: {text}"
+        );
+        assert!(
+            text.contains("version"),
+            "the /buildinfo body must arrive intact over plaintext, got: {text}"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// `run()`'s plaintext arm in miniature: the same `build_router` and
+    /// `axum::serve(listener, router)`, on a loopback port, with no pool.
+    async fn serve_plaintext(
+        config: Config,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let (_tail_tx, tail_rx) = tokio::sync::watch::channel(false);
         let state = AppState {
             pool: Arc::new(RwLock::new(None)),
@@ -916,7 +947,7 @@ mod tests {
                 config.reader.tail_max_connections,
             )),
         };
-        let router = app::build_router(state, &config).expect("router builds for defaults");
+        let router = app::build_router(state, &config).expect("router builds");
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -925,25 +956,50 @@ mod tests {
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
+        (addr, server)
+    }
+
+    /// docs/api.md §8.3 (issue #480): the server speaks HTTP/1.1 only, so a
+    /// gRPC call — HTTP/2 — has nothing to answer it. Sends the HTTP/2
+    /// connection preface a plaintext gRPC client opens with, on the same
+    /// `build_router` + `axum::serve(listener, router)` shape `run()`'s
+    /// plaintext arm uses, and records what comes back.
+    #[tokio::test]
+    async fn plaintext_listener_does_not_speak_http2() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let config = Config {
+            compat_endpoints: true,
+            ..Config::default()
+        };
+        let (addr, server) = serve_plaintext(config).await;
 
         let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        // The connection preface, then an empty SETTINGS frame.
         stream
-            .write_all(b"GET /buildinfo HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
             .await
-            .expect("write request");
+            .expect("write preface");
+        // Everything the server sends before it closes the connection. A
+        // reset after the bytes is a close too; the bytes are what count.
         let mut response = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
-            .await
-            .expect("a response within 5s")
-            .expect("read response");
-        let text = String::from_utf8_lossy(&response);
+        let mut buf = [0u8; 1024];
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => response.extend_from_slice(&buf[..n]),
+                }
+            }
+        })
+        .await;
         assert!(
-            text.starts_with("HTTP/1.1 200"),
-            "the plaintext listener must serve /buildinfo with 200, got: {text}"
+            closed.is_ok(),
+            "the server must close an HTTP/2 connection within 5s, sent: {response:?}"
         );
         assert!(
-            text.contains("version"),
-            "the /buildinfo body must arrive intact over plaintext, got: {text}"
+            response.is_empty(),
+            "an HTTP/2 connection must be closed with no reply, got: {response:?}"
         );
 
         server.abort();
