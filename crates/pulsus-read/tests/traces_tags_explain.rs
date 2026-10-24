@@ -341,10 +341,16 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
 
     let resource = ch_string("resource");
     let key = ch_string("k3");
-    let scoped_names = tag_names_sql(Some(&resource), i64::MIN, TAG_NAMES_MAX + 1);
-    let unscoped_names = tag_names_sql(None, i64::MIN, TAG_NAMES_MAX + 1);
-    let scoped_values = tag_values_sql(&key, Some(&resource), i64::MIN, TAG_VALUES_MAX + 1);
-    let unscoped_values = tag_values_sql(&key, None, i64::MIN, TAG_VALUES_MAX + 1);
+    let scoped_names = tag_names_sql(empty_term(), Some(&resource), i64::MIN, TAG_NAMES_MAX + 1);
+    let unscoped_names = tag_names_sql(empty_term(), None, i64::MIN, TAG_NAMES_MAX + 1);
+    let scoped_values = tag_values_sql(
+        empty_term(),
+        &key,
+        Some(&resource),
+        i64::MIN,
+        TAG_VALUES_MAX + 1,
+    );
+    let unscoped_values = tag_values_sql(empty_term(), &key, None, i64::MIN, TAG_VALUES_MAX + 1);
 
     // ---- Gate 2 (strict): scoped values prune on the (scope, key)
     // prefix — strictly fewer granules than the scoped-names shape, which
@@ -637,7 +643,11 @@ async fn tag_discovery_bounds_unscoped_scans_at_the_read_budget() {
     seed_budget_catalog(&seed_client, budget_db).await;
     exec(&seed_client, &format!("INSERT INTO {budget_db}.tag_names SELECT 'span', concat('n', toString(number)), toUnixTimestamp64Nano(now64(9)) FROM numbers({BUDGET_TOTAL_ROWS})")).await;
 
-    let engine = TraceEngine::new(budget_data_client(budget_db).await, tight_budget_config());
+    let engine = TraceEngine::new(
+        budget_data_client(budget_db).await,
+        tight_budget_config(),
+        empty_tenant(),
+    );
 
     // ---- Gate 1: both unscoped shapes throw QueryTooBroad --------------
     match engine.list_tag_names(None, i64::MIN).await {
@@ -852,7 +862,13 @@ async fn unnarrowed_values_for_a_question_mark_key_prune_and_answer() {
 
     let scope = ch_string("span");
     let key = ch_string(QM_KEY);
-    let sql = tag_values_sql(&key, Some(&scope), i64::MIN, TAG_VALUES_MAX + 1);
+    let sql = tag_values_sql(
+        empty_term(),
+        &key,
+        Some(&scope),
+        i64::MIN,
+        TAG_VALUES_MAX + 1,
+    );
     assert!(
         sql.contains(QM_KEY),
         "the builder must inline the key as a literal, or this gate tests nothing:\n{sql}"
@@ -881,7 +897,7 @@ async fn unnarrowed_values_for_a_question_mark_key_prune_and_answer() {
     // prune strictly deeper than fixing `key` alone. Delete the scope
     // predicate and the two shapes become the same statement, so the
     // strict inequality is what fails.
-    let unscoped = tag_values_sql(&key, None, i64::MIN, TAG_VALUES_MAX + 1);
+    let unscoped = tag_values_sql(empty_term(), &key, None, i64::MIN, TAG_VALUES_MAX + 1);
     let unscoped_raw = explain_raw(&client, &unscoped.replace('?', "??")).await;
     let (unscoped_selected, unscoped_total) = primary_key_granules(&unscoped_raw);
     assert_eq!(
@@ -906,6 +922,7 @@ async fn unnarrowed_values_for_a_question_mark_key_prune_and_answer() {
             ChClient::new(cfg).await.expect("connect engine client")
         },
         qm_config(),
+        empty_tenant(),
     );
     let values = engine
         .list_tag_values(QM_KEY, Some("span"), unnarrowed_values_request())
@@ -1058,8 +1075,8 @@ async fn a_stopped_read_is_the_newest_one() {
         (10_000u64, vec!["/new"], vec!["op.new"]),
         (1_000_000, vec!["/new", "/old"], vec!["op.new", "op.old"]),
     ] {
-        let engine =
-            TraceEngine::new(store_client(&db).await, store_config()).with_tag_read_rows(rows);
+        let engine = TraceEngine::new(store_client(&db).await, store_config(), empty_tenant())
+            .with_tag_read_rows(rows);
         let values = engine
             .list_tag_values("http.route", Some("span"), req)
             .await
@@ -1120,8 +1137,8 @@ async fn a_stopped_read_is_the_newest_one() {
         "'/new'",
     )
     .await;
-    let engine =
-        TraceEngine::new(store_client(&db).await, store_config()).with_tag_read_rows(10_000);
+    let engine = TraceEngine::new(store_client(&db).await, store_config(), empty_tenant())
+        .with_tag_read_rows(10_000);
     let req = store_request(now - 14 * 60 * MIN, now);
     let values = engine
         .list_tag_values("http.route", Some("span"), req)
@@ -1180,7 +1197,7 @@ async fn the_cut_reads_the_newest_buckets() {
         .await;
     }
     let prefix = pulsus_testkit::test_ident(&format!("t598p2a_cut_{}", now_ns()));
-    let engine = TraceEngine::new(store_client(&db).await, store_config())
+    let engine = TraceEngine::new(store_client(&db).await, store_config(), empty_tenant())
         .with_tag_read_rows(10_000)
         .with_statement_prefix(&prefix);
     let values = engine
@@ -1207,4 +1224,21 @@ async fn the_cut_reads_the_newest_buckets() {
         "the cut read below all three buckets: {read} rows read"
     );
     exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

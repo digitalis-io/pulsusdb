@@ -217,14 +217,14 @@ async fn pulsus_insert(client: &ChClient, service: &str, nonce: &[u8; 16], spans
             .spans
             .iter()
             .cloned()
-            .map(|s| TraceLandingRow::span(received_ms, s)),
+            .map(|s| TraceLandingRow::span(&std::sync::Arc::from(""), received_ms, s)),
     );
     rows.extend(
         landing
             .resources
             .iter()
             .cloned()
-            .map(|r| TraceLandingRow::resource(received_ms, r)),
+            .map(|r| TraceLandingRow::resource(&std::sync::Arc::from(""), received_ms, r)),
     );
     client
         .insert_block_with(
@@ -312,6 +312,7 @@ async fn pulsus_total(engine: &TraceEngine, q: &str, window: (i64, i64)) -> f64 
             resources: "resources",
             traces: "traces",
             indexed: &[],
+            tenant: empty_term(),
         },
     )
     .unwrap_or_else(|e| panic!("{q} plans: {e:?}"));
@@ -468,6 +469,7 @@ async fn nested_set_root_counts_match_the_reference_on_a_shared_corpus() {
     let engine = TraceEngine::new(
         ChClient::new(ch_config(&db)).await.expect("connect engine"),
         engine_config(),
+        empty_tenant(),
     );
 
     let all_q = format!(r#"{{ resource.service.name = "{service}" }} | count_over_time()"#);
@@ -520,4 +522,21 @@ async fn nested_set_root_counts_match_the_reference_on_a_shared_corpus() {
         ours_roots, ref_roots,
         "value parity on {{ nestedSetParent < 0 }} | count_over_time()"
     );
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

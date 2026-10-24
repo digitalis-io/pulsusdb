@@ -2423,6 +2423,8 @@ impl<'de> Deserialize<'de> for TraceLinkTuple {
 /// targets are read through their own column lists.
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct TraceLandingRow {
+    /// Issue #738: the push's tenant, one shared string per push.
+    pub org_id: Arc<str>,
     pub received_ms: i64,
     pub row_kind: u8,
     pub trace_id: [u8; 16],
@@ -2517,8 +2519,9 @@ impl TraceLandingRow {
     }
 
     /// A row of `row_kind` with every kind-specific column at its default.
-    fn of_kind(received_ms: i64, row_kind: u8) -> Self {
+    fn of_kind(org_id: &Arc<str>, received_ms: i64, row_kind: u8) -> Self {
         TraceLandingRow {
+            org_id: Arc::clone(org_id),
             received_ms,
             row_kind,
             trace_id: [0u8; 16],
@@ -2565,7 +2568,7 @@ impl TraceLandingRow {
     /// **Takes its argument by value** and moves the span's text and its
     /// encoded attributes out of it, so the decoded span and the landing row
     /// never hold the same bytes at once.
-    pub fn span(received_ms: i64, span: LandingSpan) -> Self {
+    pub fn span(org_id: &Arc<str>, received_ms: i64, span: LandingSpan) -> Self {
         TraceLandingRow {
             trace_id: span.trace_id,
             span_id: span.span_id,
@@ -2617,12 +2620,12 @@ impl TraceLandingRow {
             attrs: span.attrs,
             attrs_other: span.attrs_other,
             dropped_attrs: span.dropped_attrs,
-            ..Self::of_kind(received_ms, Self::KIND_SPAN)
+            ..Self::of_kind(org_id, received_ms, Self::KIND_SPAN)
         }
     }
 
     /// A kind-1 row: the columns `resources_mv` reads, and no others.
-    pub fn resource(received_ms: i64, resource: LandingResource) -> Self {
+    pub fn resource(org_id: &Arc<str>, received_ms: i64, resource: LandingResource) -> Self {
         TraceLandingRow {
             resource_id: resource.resource_id,
             service: resource.service,
@@ -2632,23 +2635,23 @@ impl TraceLandingRow {
             day: resource.day,
             schema_url: resource.schema_url,
             entity_refs: resource.entity_refs,
-            ..Self::of_kind(received_ms, Self::KIND_RESOURCE)
+            ..Self::of_kind(org_id, received_ms, Self::KIND_RESOURCE)
         }
     }
 
     /// A kind-2 row: the columns `tag_names_mv` reads, and no others.
-    pub fn tag_name(received_ms: i64, tag: LandingTagName) -> Self {
+    pub fn tag_name(org_id: &Arc<str>, received_ms: i64, tag: LandingTagName) -> Self {
         TraceLandingRow {
             tag_scope: tag.scope.as_str().to_string(),
             tag_key: tag.key,
             // `tag_names_mv` reads it as `last_start_ns` (issue #496).
             start_ns: tag.last_start_ns,
-            ..Self::of_kind(received_ms, Self::KIND_TAG_NAME)
+            ..Self::of_kind(org_id, received_ms, Self::KIND_TAG_NAME)
         }
     }
 
     /// A kind-3 row: the columns `tag_values_mv` reads, and no others.
-    pub fn tag_value(received_ms: i64, tag: LandingTagValue) -> Self {
+    pub fn tag_value(org_id: &Arc<str>, received_ms: i64, tag: LandingTagValue) -> Self {
         TraceLandingRow {
             tag_scope: tag.scope.as_str().to_string(),
             tag_key: tag.key,
@@ -2656,7 +2659,7 @@ impl TraceLandingRow {
             tag_type: tag.val_type.to_string(),
             // `tag_values_mv` reads it as `last_start_ns` (issue #496).
             start_ns: tag.last_start_ns,
-            ..Self::of_kind(received_ms, Self::KIND_TAG_VALUE)
+            ..Self::of_kind(org_id, received_ms, Self::KIND_TAG_VALUE)
         }
     }
 
@@ -2987,7 +2990,8 @@ mod trace_landing_tests {
     /// it).
     #[test]
     fn the_trace_landing_spool_record_renders_its_ids_as_hex() {
-        let v = TraceLandingRow::span(7, span_fixture()).to_spool_value();
+        let v =
+            TraceLandingRow::span(&std::sync::Arc::from(""), 7, span_fixture()).to_spool_value();
         assert_eq!(v["row_kind"], 0);
         assert_eq!(v["received_ms"], 7);
         assert_eq!(v["trace_id"], "ab".repeat(16));
@@ -3063,14 +3067,17 @@ mod trace_landing_tests {
         let received_ms = 5i64;
         // A non-empty `service_type`, so a row that drops it is visible.
         let span = TraceLandingRow::span(
+            &std::sync::Arc::from(""),
             received_ms,
             LandingSpan {
                 service_type: "int",
                 ..span_fixture()
             },
         );
-        let resource = TraceLandingRow::resource(received_ms, resource_fixture());
+        let resource =
+            TraceLandingRow::resource(&std::sync::Arc::from(""), received_ms, resource_fixture());
         let tag_name = TraceLandingRow::tag_name(
+            &std::sync::Arc::from(""),
             received_ms,
             LandingTagName {
                 scope: TagScope::Span,
@@ -3079,6 +3086,7 @@ mod trace_landing_tests {
             },
         );
         let tag_value = TraceLandingRow::tag_value(
+            &std::sync::Arc::from(""),
             received_ms,
             LandingTagValue {
                 scope: TagScope::Event,

@@ -4563,6 +4563,7 @@ async fn a_covered_search_explains_its_one_statement() {
         spans_table: "spans",
         resources_table: "resources",
         indexed: &[],
+        tenant: empty_term(),
     };
     let want =
         pulsus_read::traces::spans::search::compile_search(&parsed, &ctx, "spans", "traces", 20, 3)
@@ -8895,4 +8896,21 @@ async fn a_service_name_of_any_type_answers_on_every_route() {
         wrong.len(),
         wrong.join("\n\n")
     );
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

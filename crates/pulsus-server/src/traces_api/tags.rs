@@ -48,7 +48,7 @@ use axum::response::{IntoResponse, Response};
 use crate::app::AppState;
 
 use super::error::ApiError;
-use super::handlers::engine_for;
+use super::handlers::{engine_for, no_tenant};
 use super::params::{TagLookup, TagScope};
 use super::tags_response::{TagNamesAnswer, TagValuesAnswer};
 use super::{intrinsics, params, tags_response};
@@ -83,7 +83,10 @@ async fn tags_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
             )));
         }
         scope => {
-            let (engine, floor) = (engine_for(&state).await?, catalog_floor_ns(&state)?);
+            let (engine, floor) = (
+                engine_for(&state, no_tenant()).await?,
+                catalog_floor_ns(&state)?,
+            );
             engine.list_tag_names(attribute_scope(scope), floor).await?
         }
     };
@@ -222,14 +225,14 @@ pub(super) async fn values_for(
                 intrinsics::intrinsic_tag_values(intrinsic),
             )),
             TagValueSource::Store => {
-                let engine = engine_for(state).await?;
+                let engine = engine_for(state, no_tenant()).await?;
                 Ok(ValuesSource::Values(
                     engine.list_span_name_values(req).await?,
                 ))
             }
         },
         TagLookup::Attribute { scope, key } => {
-            let engine = engine_for(state).await?;
+            let engine = engine_for(state, no_tenant()).await?;
             Ok(ValuesSource::Values(
                 engine.list_tag_values(&key, scope.as_deref(), req).await?,
             ))

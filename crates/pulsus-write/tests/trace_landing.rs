@@ -450,7 +450,7 @@ async fn one_push_is_one_insert_into_the_landing_table() {
     let landed = decode(&req);
     let expected_rows = landed.total_rows() as usize;
     writer
-        .admit_flush(landed, PushHeaders::default())
+        .admit_flush(&no_tenant(), landed, PushHeaders::default())
         .expect("queue has room")
         .await
         .expect("the push commits");
@@ -491,7 +491,7 @@ async fn two_pushes_are_two_inserts() {
         let req = six_spans_of(trace, service);
         let landed = decode(&req);
         writer
-            .admit_flush(landed, PushHeaders::default())
+            .admit_flush(&no_tenant(), landed, PushHeaders::default())
             .expect("queue has room")
             .await
             .expect("the push commits");
@@ -524,7 +524,7 @@ async fn a_token_is_minted_per_sealed_block_and_repeated_on_resend() {
     let req = six_spans();
     let landed = decode(&req);
     writer
-        .admit_flush(landed, PushHeaders::default())
+        .admit_flush(&no_tenant(), landed, PushHeaders::default())
         .expect("queue has room")
         .await
         .expect("the resend commits");
@@ -548,7 +548,7 @@ async fn a_token_is_minted_per_sealed_block_and_repeated_on_resend() {
     for _ in 0..2 {
         let landed = decode(&six_spans());
         writer2
-            .admit_flush(landed, PushHeaders::default())
+            .admit_flush(&no_tenant(), landed, PushHeaders::default())
             .expect("queue has room")
             .await
             .expect("the push commits");
@@ -593,7 +593,7 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
     let writer = writer_with(&cfg, &root, landing.clone());
     let before = writer.metrics().dedup.rollbacks_total;
     let err = writer
-        .admit_flush(landed.clone(), PushHeaders::default())
+        .admit_flush(&no_tenant(), landed.clone(), PushHeaders::default())
         .expect_err("a push at the row ceiling is refused");
     let AdmitRefusal::PushTooLarge {
         rows: got_rows,
@@ -630,7 +630,7 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
         };
         let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
         let writer = writer_with(&cfg, &root, landing.clone());
-        let result = writer.admit_flush(landed.clone(), PushHeaders::default());
+        let result = writer.admit_flush(&no_tenant(), landed.clone(), PushHeaders::default());
         if refused {
             let err = result.expect_err("refused at one byte under its own estimate");
             assert_eq!(
@@ -801,7 +801,7 @@ async fn refused_charge(root: &Path, landed: ParsedTraceLanding) -> u64 {
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
     let writer = writer_with(&cfg, root, landing);
     let err = writer
-        .admit_flush(landed, PushHeaders::default())
+        .admit_flush(&no_tenant(), landed, PushHeaders::default())
         .expect_err("one byte of ceiling refuses every push");
     writer.shutdown(Duration::from_secs(5)).await;
     match err {
@@ -862,7 +862,7 @@ async fn an_empty_push_is_a_success_and_is_charged_for_nothing() {
     let landed = decode(&req);
     assert!(landed.is_empty(), "the fixture carries no landed row");
     writer
-        .admit_flush(landed, PushHeaders::default())
+        .admit_flush(&no_tenant(), landed, PushHeaders::default())
         .expect("an empty push is admitted")
         .await
         .expect("and answered a success");
@@ -911,7 +911,7 @@ async fn landing_saturation_refuses_the_push() {
 
     let landed = decode(&six_spans_of(0xd1, "pay"));
     let err = writer
-        .admit_flush(landed, PushHeaders::default())
+        .admit_flush(&no_tenant(), landed, PushHeaders::default())
         .expect_err("the saturated landing queue refuses the push");
     assert_eq!(err, AdmitRefusal::Backpressure);
     assert_eq!(
@@ -947,7 +947,10 @@ async fn saturated_landing(root: &Path) -> (TraceWriter, Arc<MockInserter<TraceL
 
     for trace in 0..200u8 {
         let landed = decode(&six_spans_of(trace + 1, "checkout"));
-        if writer.admit(landed, PushHeaders::default()).is_err() {
+        if writer
+            .admit(&no_tenant(), landed, PushHeaders::default())
+            .is_err()
+        {
             break;
         }
     }
@@ -968,7 +971,7 @@ async fn a_sync_push_is_answered_by_its_landing_insert() {
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Poison);
     let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
     let answer = writer
-        .admit_flush(decode(&six_spans()), PushHeaders::default())
+        .admit_flush(&no_tenant(), decode(&six_spans()), PushHeaders::default())
         .expect("queue has room")
         .await;
     assert!(
@@ -987,7 +990,7 @@ async fn a_sync_push_is_not_answered_while_its_landing_insert_is_in_flight() {
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Hang);
     let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
     let wait = writer
-        .admit_flush(decode(&six_spans()), PushHeaders::default())
+        .admit_flush(&no_tenant(), decode(&six_spans()), PushHeaders::default())
         .expect("queue has room");
     assert!(
         tokio::time::timeout(Duration::from_millis(300), wait)
@@ -1008,7 +1011,7 @@ async fn a_retry_of_a_failed_landing_insert_is_stored() {
     let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
     let landed = decode(&six_spans());
     let _ = writer
-        .admit_flush(landed.clone(), PushHeaders::default())
+        .admit_flush(&no_tenant(), landed.clone(), PushHeaders::default())
         .expect("queue has room")
         .await;
     settle_until("the first landing block to settle", || {
@@ -1016,7 +1019,7 @@ async fn a_retry_of_a_failed_landing_insert_is_stored() {
     })
     .await;
     let _ = writer
-        .admit_flush(landed, PushHeaders::default())
+        .admit_flush(&no_tenant(), landed, PushHeaders::default())
         .expect("the retry is admitted")
         .await;
     assert_eq!(
@@ -1044,12 +1047,12 @@ async fn a_retry_after_an_uncertain_landing_insert_is_stored() {
     let writer = writer_with(&cfg, &root, landing.clone());
     let landed = decode(&six_spans());
     let first = writer
-        .admit_flush(landed.clone(), PushHeaders::default())
+        .admit_flush(&no_tenant(), landed.clone(), PushHeaders::default())
         .expect("queue has room")
         .await;
     assert!(first.is_err(), "the uncertain insert is the push's error");
     let second = writer
-        .admit_flush(landed, PushHeaders::default())
+        .admit_flush(&no_tenant(), landed, PushHeaders::default())
         .expect("the retry is admitted")
         .await;
     assert!(second.is_err());
@@ -1107,7 +1110,7 @@ async fn a_sync_repeat_waiting_on_a_pending_trace_claim_is_answered_its_failure(
     let landed = decode(&six_spans());
 
     let original = writer
-        .admit_flush(landed.clone(), PushHeaders::default())
+        .admit_flush(&no_tenant(), landed.clone(), PushHeaders::default())
         .expect("queue has room");
     // The original's insert is in flight, so its claim is pending.
     landing
@@ -1117,7 +1120,7 @@ async fn a_sync_repeat_waiting_on_a_pending_trace_claim_is_answered_its_failure(
         .expect("the entered semaphore is never closed")
         .forget();
     let repeat = writer
-        .admit_flush(landed, PushHeaders::default())
+        .admit_flush(&no_tenant(), landed, PushHeaders::default())
         .expect("the repeat waits on the pending claim");
     assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 1);
 
@@ -1155,6 +1158,7 @@ async fn a_distinct_key_is_a_distinct_identity_in_the_writer() {
     for key in ["k-1", "k-2"] {
         writer
             .admit_flush(
+                &no_tenant(),
                 landed.clone(),
                 PushHeaders {
                     idempotency_key: Some(key.to_string()),
@@ -1193,7 +1197,7 @@ async fn a_body_with_no_span_start_times_is_stored_once_without_a_key() {
 
     let landed = decode(&body);
     writer
-        .admit_flush(landed, PushHeaders::default())
+        .admit_flush(&no_tenant(), landed, PushHeaders::default())
         .expect("the first push is admitted")
         .await
         .expect("and commits");
@@ -1201,7 +1205,7 @@ async fn a_body_with_no_span_start_times_is_stored_once_without_a_key() {
 
     let landed = decode(&body);
     writer
-        .admit_flush(landed, PushHeaders::default())
+        .admit_flush(&no_tenant(), landed, PushHeaders::default())
         .expect("the retry is suppressed, not admitted")
         .await
         .expect("and is answered the first push's outcome");
@@ -1242,14 +1246,14 @@ async fn a_body_with_no_span_start_times_is_suppressed_under_one_key() {
 
     let landed = decode(&body);
     writer
-        .admit_flush(landed, keyed())
+        .admit_flush(&no_tenant(), landed, keyed())
         .expect("the first push is admitted")
         .await
         .expect("and commits");
     settle_until("the first landing insert", || landing.call_count() == 1).await;
 
     let landed = decode(&body);
-    let outcome = writer.admit_flush(landed, keyed());
+    let outcome = writer.admit_flush(&no_tenant(), landed, keyed());
     assert!(
         outcome.is_ok(),
         "the retry under one key is suppressed, not refused as changed \
@@ -1297,7 +1301,7 @@ async fn two_bodies_differing_only_in_a_span_instant_both_store() {
     for body in [six_spans(), later] {
         let landed = decode(&body);
         writer
-            .admit_flush(landed, PushHeaders::default())
+            .admit_flush(&no_tenant(), landed, PushHeaders::default())
             .expect("both bodies are admitted")
             .await
             .expect("and both commit");
@@ -2078,7 +2082,7 @@ async fn no_landing_insert_reaches_the_asynchronous_queue() {
     );
     let landed = decode(&six_spans());
     writer
-        .admit_flush(landed, PushHeaders::default())
+        .admit_flush(&no_tenant(), landed, PushHeaders::default())
         .expect("queue has room")
         .await
         .expect("the push commits");
@@ -2281,28 +2285,28 @@ fn landing_rows(parsed: &ParsedTraceLanding, received_ms: i64) -> Vec<TraceLandi
             .spans
             .iter()
             .cloned()
-            .map(|s| TraceLandingRow::span(received_ms, s)),
+            .map(|s| TraceLandingRow::span(&std::sync::Arc::from(""), received_ms, s)),
     );
     rows.extend(
         parsed
             .resources
             .iter()
             .cloned()
-            .map(|r| TraceLandingRow::resource(received_ms, r)),
+            .map(|r| TraceLandingRow::resource(&std::sync::Arc::from(""), received_ms, r)),
     );
     rows.extend(
         parsed
             .tag_names
             .iter()
             .cloned()
-            .map(|t| TraceLandingRow::tag_name(received_ms, t)),
+            .map(|t| TraceLandingRow::tag_name(&std::sync::Arc::from(""), received_ms, t)),
     );
     rows.extend(
         parsed
             .tag_values
             .iter()
             .cloned()
-            .map(|t| TraceLandingRow::tag_value(received_ms, t)),
+            .map(|t| TraceLandingRow::tag_value(&std::sync::Arc::from(""), received_ms, t)),
     );
     rows
 }
@@ -3411,7 +3415,7 @@ async fn a_trace_block_queued_when_the_drain_begins_is_sent_inside_the_grace() {
 
     let landed = decode(&six_spans());
     writer
-        .admit(landed, PushHeaders::default())
+        .admit(&no_tenant(), landed, PushHeaders::default())
         .expect("queue has room");
     writer.shutdown(Duration::from_secs(10)).await;
 
@@ -3463,7 +3467,7 @@ async fn a_retry_after_a_throwing_view_is_stored_once_the_fault_clears() {
     let req = six_spans();
 
     let first = writer
-        .admit_flush(decode(&req), PushHeaders::default())
+        .admit_flush(&no_tenant(), decode(&req), PushHeaders::default())
         .expect("admitted")
         .await;
     assert!(
@@ -3480,7 +3484,7 @@ async fn a_retry_after_a_throwing_view_is_stored_once_the_fault_clears() {
         .await
         .expect("clear the fault");
     let second = writer
-        .admit_flush(decode(&req), PushHeaders::default())
+        .admit_flush(&no_tenant(), decode(&req), PushHeaders::default())
         .expect("the retry is admitted, not suppressed")
         .await;
     assert!(
@@ -3499,4 +3503,9 @@ async fn a_retry_after_a_throwing_view_is_stored_once_the_fault_clears() {
     assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 0);
     writer.shutdown(Duration::from_secs(5)).await;
     drop_live_db(&db).await;
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

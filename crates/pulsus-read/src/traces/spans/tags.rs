@@ -85,7 +85,12 @@ fn catalog_floor(floor_ns: i64) -> i64 {
 /// to [`ATTR_SCOPES`] (an `IN` list on the same leading column), and to
 /// rows whose latest span started at or after `floor_ns`, the retention
 /// floor (issue #496): a name is listed only while a span carrying it is.
-pub fn tag_names_sql(scope_literal: Option<&str>, floor_ns: i64, limit: usize) -> String {
+pub fn tag_names_sql(
+    _tenant: &crate::traces::tenant_scope::TenantTerm,
+    scope_literal: Option<&str>,
+    floor_ns: i64,
+    limit: usize,
+) -> String {
     let mut sql = format!("SELECT DISTINCT scope, key\nFROM {TAG_NAMES_TABLE}\n");
     match scope_literal {
         Some(scope) => sql.push_str(&format!("WHERE scope = {scope}\n")),
@@ -109,6 +114,7 @@ pub fn tag_names_sql(scope_literal: Option<&str>, floor_ns: i64, limit: usize) -
 ///
 /// Confined, as [`tag_names_sql`] is, to rows at or after `floor_ns`.
 pub fn tag_values_sql(
+    _tenant: &crate::traces::tenant_scope::TenantTerm,
     key_literal: &str,
     scope_literal: Option<&str>,
     floor_ns: i64,
@@ -580,6 +586,7 @@ pub const CATALOGUE_CAP: usize = 101;
 /// JSON path the catalogue stores.
 #[allow(clippy::too_many_arguments)]
 pub fn catalogue_values_sql(
+    tenant: &crate::traces::tenant_scope::TenantTerm,
     service: &str,
     key: &str,
     lo: i64,
@@ -604,7 +611,7 @@ FROM (
     SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type
     FROM (SELECT arrayJoin(groupUniqArrayMerge({CATALOGUE_CAP})(vals)) AS e FROM {TAG_BUCKET_VALUES_TABLE}
           WHERE NOT over AND {groups}\n          GROUP BY bucket)",
-        array_service_resources(resources, rday, &svc)
+        array_service_resources(tenant, resources, rday, &svc)
     );
     for edge in edges {
         sql.push_str(&format!(
@@ -652,7 +659,12 @@ const SERVICE_BUCKET_RESOURCES_TABLE: &str = "service_bucket_resources";
 /// answered from them: the span key's read reports it as an overflow, the
 /// resource key's read returns a marker row first, and today's statement
 /// answers in both.
-pub fn array_service_resources(resources: &str, rday: &str, svc: &str) -> String {
+pub fn array_service_resources(
+    _tenant: &crate::traces::tenant_scope::TenantTerm,
+    resources: &str,
+    rday: &str,
+    svc: &str,
+) -> String {
     format!(
         "SELECT resource_id FROM {resources} WHERE {rday} AND \
          has(attrs.`service%2Ename`.:`Array(Nullable(String))`, {svc})"
@@ -662,7 +674,12 @@ pub fn array_service_resources(resources: &str, rday: &str, svc: &str) -> String
 /// One partial edge of a service-narrowed resource values read (issue
 /// #601 part 4c): the `(service, resource_id)` of the spans in `w` that
 /// `pred` keeps, with no cut.
-pub fn resource_edge_sql(spans: &str, w: WindowSql, pred: Option<&SpanPredicate>) -> String {
+pub fn resource_edge_sql(
+    _tenant: &crate::traces::tenant_scope::TenantTerm,
+    spans: &str,
+    w: WindowSql,
+    pred: Option<&SpanPredicate>,
+) -> String {
     format!(
         "SELECT service, resource_id FROM {spans} WHERE {} AND {} AND {}{}",
         w.span_time_clause(),
@@ -681,6 +698,7 @@ pub fn resource_edge_sql(spans: &str, w: WindowSql, pred: Option<&SpanPredicate>
 /// `key` are raw; both are escaped here.
 #[allow(clippy::too_many_arguments)]
 pub fn catalogue_resource_values_sql(
+    tenant: &crate::traces::tenant_scope::TenantTerm,
     service: &str,
     key: &str,
     lo: i64,
@@ -702,7 +720,7 @@ pub fn catalogue_resource_values_sql(
     // the catalogue cannot see; the caller then runs today's statement.
     format!(
         "SELECT val, val_type FROM (\n  SELECT DISTINCT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {resources}\n  ARRAY JOIN {arr} AS e\n  WHERE {rday}\n    AND (service, resource_id) IN (\n      {set})\n  ORDER BY val, val_type\n  LIMIT {limit}\n  UNION ALL\n  SELECT '' AS val, '{ARRAY_SERVICE_MARK}' AS val_type\n  WHERE (SELECT count() > 0 FROM ({})))\nORDER BY val_type = '{ARRAY_SERVICE_MARK}' DESC, val, val_type\nLIMIT {}",
-        array_service_resources(resources, rday, &svc),
+        array_service_resources(tenant, resources, rday, &svc),
         limit + 1,
         arr = elems(&attr_path("attrs", key)),
     )
@@ -725,6 +743,7 @@ mod tests {
     fn scoped_tag_names_sql_is_byte_exact() {
         assert_eq!(
             tag_names_sql(
+                crate::traces::tenant_scope::empty_term(),
                 Some(&ch_string("resource")),
                 1_700_000_000_000_000_000,
                 TAG_NAMES_MAX + 1
@@ -741,7 +760,12 @@ mod tests {
     #[test]
     fn unscoped_tag_names_sql_is_byte_exact() {
         assert_eq!(
-            tag_names_sql(None, 1_700_000_000_000_000_000, TAG_NAMES_MAX + 1),
+            tag_names_sql(
+                crate::traces::tenant_scope::empty_term(),
+                None,
+                1_700_000_000_000_000_000,
+                TAG_NAMES_MAX + 1
+            ),
             "SELECT DISTINCT scope, key\n\
              FROM tag_names\n\
              WHERE scope IN ('event', 'instrumentation', 'link', 'resource', 'span')\n\
@@ -755,6 +779,7 @@ mod tests {
     fn scoped_tag_values_sql_is_byte_exact() {
         assert_eq!(
             tag_values_sql(
+                crate::traces::tenant_scope::empty_term(),
                 &ch_string("service.name"),
                 Some(&ch_string("resource")),
                 1_700_000_000_000_000_000,
@@ -773,6 +798,7 @@ mod tests {
     fn unscoped_tag_values_sql_is_byte_exact() {
         assert_eq!(
             tag_values_sql(
+                crate::traces::tenant_scope::empty_term(),
                 &ch_string("service.name"),
                 None,
                 1_700_000_000_000_000_000,
@@ -792,8 +818,19 @@ mod tests {
     #[test]
     fn the_floor_of_the_largest_retention_renders_as_zero() {
         for sql in [
-            tag_names_sql(None, i64::MIN, TAG_NAMES_MAX + 1),
-            tag_values_sql(&ch_string("k"), None, i64::MIN, TAG_VALUES_MAX + 1),
+            tag_names_sql(
+                crate::traces::tenant_scope::empty_term(),
+                None,
+                i64::MIN,
+                TAG_NAMES_MAX + 1,
+            ),
+            tag_values_sql(
+                crate::traces::tenant_scope::empty_term(),
+                &ch_string("k"),
+                None,
+                i64::MIN,
+                TAG_VALUES_MAX + 1,
+            ),
         ] {
             assert!(sql.contains("last_start_ns >= 0"), "{sql}");
             assert!(!sql.contains("-9223372036854775808"), "{sql}");
@@ -805,6 +842,7 @@ mod tests {
     #[test]
     fn a_pre_escaped_hostile_key_stays_a_string_literal() {
         let sql = tag_values_sql(
+            crate::traces::tenant_scope::empty_term(),
             &ch_string("k'; DROP TABLE x; --"),
             None,
             0,
@@ -835,10 +873,32 @@ mod tests {
         let scope = ch_string("resource");
         let key = ch_string("service.name");
         for sql in [
-            tag_names_sql(Some(&scope), 0, TAG_NAMES_MAX + 1),
-            tag_names_sql(None, 0, TAG_NAMES_MAX + 1),
-            tag_values_sql(&key, Some(&scope), 0, TAG_VALUES_MAX + 1),
-            tag_values_sql(&key, None, 0, TAG_VALUES_MAX + 1),
+            tag_names_sql(
+                crate::traces::tenant_scope::empty_term(),
+                Some(&scope),
+                0,
+                TAG_NAMES_MAX + 1,
+            ),
+            tag_names_sql(
+                crate::traces::tenant_scope::empty_term(),
+                None,
+                0,
+                TAG_NAMES_MAX + 1,
+            ),
+            tag_values_sql(
+                crate::traces::tenant_scope::empty_term(),
+                &key,
+                Some(&scope),
+                0,
+                TAG_VALUES_MAX + 1,
+            ),
+            tag_values_sql(
+                crate::traces::tenant_scope::empty_term(),
+                &key,
+                None,
+                0,
+                TAG_VALUES_MAX + 1,
+            ),
         ] {
             assert!(!sql.is_empty() && !sql.contains("_dist"), "{sql}");
         }
@@ -859,6 +919,7 @@ mod tests {
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         }
     }
 

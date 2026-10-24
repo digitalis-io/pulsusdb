@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use crate::app::AppState;
 
 use super::error::ApiError;
-use super::handlers::engine_for;
+use super::handlers::{engine_for, no_tenant};
 use super::params::{self, MetricsForm};
 
 /// `GET /api/traces/v1/metrics/query_range`.
@@ -85,17 +85,19 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
     let indexed = pulsus_read::traces::spans::attr_index::IndexedAttr::from_config(
         &state.config.traceql_indexed_attributes,
     );
+    let term = pulsus_read::traces::tenant_scope::TenantTerm::of(&no_tenant());
     let tables = pulsus_read::StatementTables {
         spans: &read_config.spans_table,
         error_spans: &read_config.error_spans_table,
         resources: &read_config.resources_table,
         traces: &read_config.traces_table,
         indexed: &indexed,
+        tenant: &term,
     };
     let plan = pulsus_read::plan_trace_metrics_routed(&query, &metrics_params, &ctx, &tables)
         .map_err(ApiError::Plan)?;
 
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, no_tenant()).await?;
     // Issue #464 wave 2: the two routes return DIFFERENT proto messages —
     // `query_range` is `tempopb.QueryRangeResponse`, `query` is
     // `tempopb.QueryInstantResponse` (`pkg/tempopb/tempo.proto:339-355` @

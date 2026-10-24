@@ -46,7 +46,12 @@ fn target_of(case: &Case) -> Option<GraphTarget> {
 }
 
 fn sql_of(case: &Case) -> String {
-    spans_graph_sql(W, target_of(case).as_ref(), SERVICE_GRAPH_MAX_EDGES)
+    spans_graph_sql(
+        empty_term(),
+        W,
+        target_of(case).as_ref(),
+        SERVICE_GRAPH_MAX_EDGES,
+    )
 }
 
 fn composite(case: &Case) -> String {
@@ -151,4 +156,15 @@ fn regenerate_goldens() {
         std::fs::write(&path, composite(case)).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
         eprintln!("wrote {path:?}");
     }
+}
+
+/// The empty tenant's term (issue #738): the golden is rendered for it.
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            )
+        });
+    &TERM
 }

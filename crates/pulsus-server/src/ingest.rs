@@ -220,20 +220,26 @@ impl TraceWriterSink {
 }
 
 impl TraceSink for TraceWriterSink {
-    fn admit(&self, landing: ParsedTraceLanding, push: PushHeaders) -> Result<(), AdmitRefusal> {
+    fn admit(
+        &self,
+        tenant: &Tenant,
+        landing: ParsedTraceLanding,
+        push: PushHeaders,
+    ) -> Result<(), AdmitRefusal> {
         match self.slot.get() {
-            Some(writer) => writer.admit(landing, push),
+            Some(writer) => writer.admit(tenant, landing, push),
             None => Err(AdmitRefusal::Backpressure),
         }
     }
 
     fn admit_flush(
         &self,
+        tenant: &Tenant,
         landing: ParsedTraceLanding,
         push: PushHeaders,
     ) -> Result<FlushWait, AdmitRefusal> {
         match self.slot.get() {
-            Some(writer) => writer.admit_flush(landing, push),
+            Some(writer) => writer.admit_flush(tenant, landing, push),
             None => Err(AdmitRefusal::Backpressure),
         }
     }
@@ -547,7 +553,11 @@ mod tests {
     fn trace_admit_is_backpressure_while_the_slot_is_empty() {
         let sink = TraceWriterSink::new(Arc::new(OnceLock::new()));
         assert_eq!(
-            sink.admit(ParsedTraceLanding::default(), PushHeaders::default()),
+            sink.admit(
+                &Tenant::from_header(None, false).expect("the empty tenant"),
+                ParsedTraceLanding::default(),
+                PushHeaders::default()
+            ),
             Err(AdmitRefusal::Backpressure)
         );
     }
@@ -556,8 +566,12 @@ mod tests {
     fn trace_admit_flush_is_backpressure_while_the_slot_is_empty() {
         let sink = TraceWriterSink::new(Arc::new(OnceLock::new()));
         assert!(
-            sink.admit_flush(ParsedTraceLanding::default(), PushHeaders::default())
-                .is_err()
+            sink.admit_flush(
+                &Tenant::from_header(None, false).expect("the empty tenant"),
+                ParsedTraceLanding::default(),
+                PushHeaders::default()
+            )
+            .is_err()
         );
     }
 }

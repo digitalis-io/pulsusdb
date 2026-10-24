@@ -107,6 +107,7 @@ fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
             resources: "resources",
             traces: "traces",
             indexed: &[],
+            tenant: empty_term(),
         };
         return match plan_trace_metrics_routed(query, &params, &ctx, &tables) {
             Err(_) => "refused",
@@ -125,6 +126,7 @@ fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
         resources: "resources",
         traces: "traces",
         indexed: &[],
+        tenant: empty_term(),
     };
     match plan_search_request(query, &params, &tables, 64) {
         Err(_) => "refused",
@@ -262,4 +264,21 @@ fn no_code_names_an_old_trace_table() {
         hits.len(),
         hits.join("\n")
     );
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

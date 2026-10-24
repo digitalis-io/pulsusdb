@@ -45,6 +45,7 @@ pub mod rows;
 mod read_config;
 pub mod spans;
 mod sql_text;
+pub mod tenant_scope;
 pub mod values;
 pub mod window_sql;
 

@@ -94,6 +94,9 @@ pub struct StatementTables<'a> {
     pub resources: &'a str,
     pub traces: &'a str,
     pub indexed: &'a [IndexedAttr],
+    /// The request's tenant (issue #738), the first conjunct of every read
+    /// of a trace table the statement renders.
+    pub tenant: &'a crate::traces::tenant_scope::TenantTerm,
 }
 
 /// The unit a target's values are in: `duration`'s nanoseconds, read as
@@ -417,6 +420,7 @@ fn demands_of(
         spans_table: tables.spans,
         resources_table: tables.resources,
         indexed: tables.indexed,
+        tenant: tables.tenant,
     };
     body.and_then(|b| compile_span_predicate_in(b, &ctx).ok())
         .map(|p| p.demand_messages().to_vec())
@@ -466,6 +470,7 @@ impl Read {
             spans_table: tables.spans,
             resources_table: tables.resources,
             indexed: tables.indexed,
+            tenant: tables.tenant,
         };
         let (predicate, with, numbered) = predicate(body, &ctx, tables.traces)?;
         let mut joins = Joins::default();
@@ -1293,6 +1298,7 @@ fn compare_sql(
         spans_table: tables.spans,
         resources_table: tables.resources,
         indexed: tables.indexed,
+        tenant: tables.tenant,
     };
     let outer_p = outer
         .map(|b| compile_span_predicate_in(b, &ctx))
@@ -1423,13 +1429,15 @@ mod tests {
         floor_ns: i64::MIN,
     };
 
-    const TABLES: StatementTables<'static> = StatementTables {
-        spans: "spans",
-        error_spans: "error_spans",
-        resources: "resources",
-        traces: "traces",
-        indexed: &[],
-    };
+    static TABLES: std::sync::LazyLock<StatementTables<'static>> =
+        std::sync::LazyLock::new(|| StatementTables {
+            spans: "spans",
+            error_spans: "error_spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
+        });
 
     fn routed(q: &str, params: &MetricsParams) -> Result<RoutedMetricsPlan, PlanError> {
         plan_trace_metrics_routed(
@@ -1662,6 +1670,7 @@ mod tests {
             resources: "rs_t",
             traces: "tr_t",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         };
         let sql = |q: &str| {
             let r = plan_trace_metrics_routed(
@@ -1858,6 +1867,7 @@ ORDER BY s, g, k, v, y";
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         };
         compile_span_predicate_in(body, &ctx)
             .expect("compiles")

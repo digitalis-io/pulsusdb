@@ -1522,6 +1522,7 @@ pub fn plan_search_request(
         },
     };
     plan_statement_sliced(
+        tables.tenant,
         &request,
         tables.spans,
         tables.traces,
@@ -1536,6 +1537,7 @@ pub fn plan_search_request(
 /// The search statement for `request`, its top-K reading the newest
 /// `slice_ns` of the window when given (issue #595).
 pub fn plan_statement_sliced(
+    tenant: &crate::traces::tenant_scope::TenantTerm,
     request: &SearchRequest,
     spans_table: &str,
     traces_table: &str,
@@ -1556,6 +1558,7 @@ pub fn plan_statement_sliced(
         spans_table,
         resources_table,
         indexed,
+        tenant,
     };
     compile_search_sliced(
         &request.query,
@@ -1849,6 +1852,7 @@ mod charge_tests {
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         };
         compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles")
     }
@@ -2028,6 +2032,7 @@ mod charge_tests {
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         };
         let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");
         let grouping = s.grouping().expect("grouped");
@@ -2086,6 +2091,7 @@ mod charge_tests {
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         };
         let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");
         let grouping = s.grouping().expect("an aggregate is one group");
@@ -2149,6 +2155,7 @@ mod charge_tests {
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         };
         let nests = |query: &str| {
             let q = pulsus_traceql::parse(query).expect("parses");

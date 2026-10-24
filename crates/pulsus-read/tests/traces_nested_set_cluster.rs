@@ -189,14 +189,14 @@ async fn land(client: &ChClient, req: &ExportTraceServiceRequest, token: &str) {
             .spans
             .iter()
             .cloned()
-            .map(|s| TraceLandingRow::span(received_ms, s)),
+            .map(|s| TraceLandingRow::span(&std::sync::Arc::from(""), received_ms, s)),
     );
     rows.extend(
         parsed
             .resources
             .iter()
             .cloned()
-            .map(|r| TraceLandingRow::resource(received_ms, r)),
+            .map(|r| TraceLandingRow::resource(&std::sync::Arc::from(""), received_ms, r)),
     );
     client
         .insert_block_with(
@@ -352,6 +352,7 @@ async fn a_numbered_search_answers_over_two_shards() {
             .await
             .expect("connect the engine"),
         config(),
+        empty_tenant(),
     );
     let plan = |query: &str, start: i64, end: i64, limit: u32| {
         plan_search_request(
@@ -368,6 +369,7 @@ async fn a_numbered_search_answers_over_two_shards() {
                 resources: "resources",
                 traces: "traces_dist",
                 indexed: &[],
+                tenant: empty_term(),
             },
             64,
         )
@@ -377,8 +379,17 @@ async fn a_numbered_search_answers_over_two_shards() {
 
     // The negative control: the statement, without the setting, is refused.
     let p = plan("{ nestedSetLeft > 0 }", window.0, window.1, 30);
-    let stmt = plan_statement_sliced(&p, "spans_dist", "traces_dist", "resources", 64, &[], None)
-        .expect("covered");
+    let stmt = plan_statement_sliced(
+        empty_term(),
+        &p,
+        "spans_dist",
+        "traces_dist",
+        "resources",
+        64,
+        &[],
+        None,
+    )
+    .expect("covered");
     let settings = QuerySettings::clustered_reader(false)
         .set("final", 1)
         .set("do_not_merge_across_partitions_select_final", 1);
@@ -517,6 +528,7 @@ async fn a_numbered_search_answers_over_two_shards() {
         resources: "resources",
         traces: "traces_dist",
         indexed: &[],
+        tenant: empty_term(),
     };
     for (query, value) in [
         ("{ nestedSetLeft > 0 } | count_over_time()", 60.0),
@@ -628,6 +640,7 @@ async fn a_resource_value_keeps_its_type_over_two_shards() {
             .await
             .expect("connect the engine"),
         config(),
+        empty_tenant(),
     );
     let plan = |query: &str| {
         plan_search_request(
@@ -644,6 +657,7 @@ async fn a_resource_value_keeps_its_type_over_two_shards() {
                 resources: "resources",
                 traces: "traces_dist",
                 indexed: &[],
+                tenant: empty_term(),
             },
             64,
         )
@@ -794,6 +808,7 @@ async fn a_stopped_tag_read_is_the_newest_on_every_shard() {
             .await
             .expect("connect the engine"),
         config(),
+        empty_tenant(),
     )
     .with_tag_read_rows(10_000)
     .with_statement_prefix(&prefix);
@@ -867,6 +882,7 @@ async fn a_stopped_tag_read_is_the_newest_on_every_shard() {
             .await
             .expect("connect the engine"),
         config(),
+        empty_tenant(),
     );
     let slow = engine
         .list_tag_values(
@@ -947,6 +963,7 @@ async fn one_cut_holds_for_every_shard() {
             .await
             .expect("connect the engine"),
         config(),
+        empty_tenant(),
     )
     .with_tag_read_rows(10_000);
     let values = engine
@@ -1028,6 +1045,7 @@ async fn a_compare_top_n_is_ranked_over_every_shard() {
             .await
             .expect("connect the engine"),
         config(),
+        empty_tenant(),
     );
     let read = config();
     let tables = StatementTables {
@@ -1036,6 +1054,7 @@ async fn a_compare_top_n_is_ranked_over_every_shard() {
         resources: &read.resources_table,
         traces: &read.traces_table,
         indexed: &[],
+        tenant: empty_term(),
     };
     let q = "{} | compare({ status = error }, 1)";
     let routed = pulsus_read::plan_trace_metrics_routed(
@@ -1276,6 +1295,7 @@ async fn the_service_graph_answers_over_two_shards() {
                     .await
                     .expect("connect the engine"),
                 config(),
+                empty_tenant(),
             )
             .with_statement_prefix(&prefix)
         }
@@ -1340,6 +1360,7 @@ async fn the_service_graph_answers_over_two_shards() {
                 error_spans_table: "error_spans_q".to_string(),
                 ..config()
             },
+            empty_tenant(),
         )
         .with_graph_target_cache(cache.clone())
         .with_statement_prefix(&prefix);
@@ -2127,6 +2148,7 @@ impl Replicas {
                 .await
                 .expect("connect the engine"),
             config(),
+            empty_tenant(),
         )
         .with_statement_prefix(prefix)
         .service_graph(self.window())
@@ -2555,6 +2577,7 @@ async fn a_rebuilt_replica_waits_for_the_shard() {
         database: db.clone(),
     };
     let sql = pulsus_read::spans_graph_sql(
+        empty_term(),
         r.window(),
         Some(&target),
         pulsus_read::SERVICE_GRAPH_MAX_EDGES,
@@ -3814,7 +3837,7 @@ async fn the_job_keeps_up_under_steady_ingest() {
                 seq += 3;
                 let landing = pulsus_write::parse_trace_landing(&req).expect("the landing decode");
                 let admitted_at = std::time::Instant::now();
-                match writer.admit_flush(landing, PushHeaders::default()) {
+                match writer.admit_flush(&empty_tenant(), landing, PushHeaders::default()) {
                     Ok(wait) => {
                         let failures = failures.clone();
                         let first_failure = first_failure.clone();
@@ -4562,6 +4585,7 @@ async fn a_retried_push_is_counted_once_over_two_shards() {
             .await
             .expect("connect the engine"),
         config(),
+        empty_tenant(),
     );
     let tables = StatementTables {
         spans: "spans_dist",
@@ -4569,6 +4593,7 @@ async fn a_retried_push_is_counted_once_over_two_shards() {
         resources: "resources",
         traces: "traces_dist",
         indexed: &[],
+        tenant: empty_term(),
     };
     let nodes = [&shard1, &shard1b, &shard2];
     let mut wrong = Vec::new();
@@ -4847,6 +4872,7 @@ async fn engine_4b(db: &str, prefix: Option<String>, errors: &str) -> pulsus_rea
             error_spans_table: errors.to_string(),
             ..config()
         },
+        empty_tenant(),
     );
     match prefix {
         Some(p) => engine.with_statement_prefix(&p),
@@ -5066,6 +5092,7 @@ async fn the_catalogue_and_the_error_table_answer_over_two_shards() {
         resources: "resources",
         traces: "traces_dist",
         indexed: &[],
+        tenant: empty_term(),
     };
     let base_s = base / S;
     for (q, metrics) in [
@@ -5344,6 +5371,7 @@ async fn a_resource_key_labels_alike_over_two_shards() {
             .await
             .expect("connect the engine"),
         config(),
+        empty_tenant(),
     );
     let tables = StatementTables {
         spans: "spans_dist",
@@ -5351,6 +5379,7 @@ async fn a_resource_key_labels_alike_over_two_shards() {
         resources: "resources",
         traces: "traces_dist",
         indexed: &[],
+        tenant: empty_term(),
     };
     let mut answers = Vec::new();
     for key in ["resource.k8s.pod.name", ".k8s.pod.name"] {
@@ -5613,7 +5642,7 @@ async fn a_retry_after_a_throwing_view_is_stored_once_the_fault_clears_on_the_cl
     let req = load_push(0, 3);
     let landing = || pulsus_write::parse_trace_landing(&req).expect("the landing decode");
     let first = writer
-        .admit_flush(landing(), PushHeaders::default())
+        .admit_flush(&empty_tenant(), landing(), PushHeaders::default())
         .expect("admitted")
         .await;
     assert!(
@@ -5623,7 +5652,7 @@ async fn a_retry_after_a_throwing_view_is_stored_once_the_fault_clears_on_the_cl
 
     exec(&s1, "DROP VIEW zz_fault_mv").await;
     let second = writer
-        .admit_flush(landing(), PushHeaders::default())
+        .admit_flush(&empty_tenant(), landing(), PushHeaders::default())
         .expect("the retry is admitted, not suppressed")
         .await;
     assert!(
@@ -5658,4 +5687,21 @@ async fn a_retry_after_a_throwing_view_is_stored_once_the_fault_clears_on_the_cl
         &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
     )
     .await;
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

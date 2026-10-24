@@ -144,7 +144,12 @@ fn cluster_markers(cluster: &str, edges: &str) -> String {
 /// runs on one replica of every shard through `cluster('<c>', view(…))`
 /// with both tables qualified by that database, so each shard computes its
 /// own coverage from its own markers.
-pub fn spans_graph_sql(w: GraphWindow, target: Option<&GraphTarget>, max_edges: u64) -> String {
+pub fn spans_graph_sql(
+    _tenant: &crate::traces::tenant_scope::TenantTerm,
+    w: GraphWindow,
+    target: Option<&GraphTarget>,
+    max_edges: u64,
+) -> String {
     let src = match target {
         None => format!(
             "(\n{}\n)",

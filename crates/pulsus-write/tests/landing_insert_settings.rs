@@ -605,7 +605,7 @@ async fn the_production_inserter_sends_the_trace_landing_settings_on_the_wire() 
     );
     let landed = one_span_trace_push();
     writer
-        .admit_flush(landed, pulsus_write::PushHeaders::default())
+        .admit_flush(&no_tenant(), landed, pulsus_write::PushHeaders::default())
         .expect("the queue has room")
         .await
         .expect("the landing insert commits");

@@ -456,16 +456,19 @@ pub(crate) fn trace_engine(
     pool: Arc<ChPool>,
     config: &Config,
     graph_target: pulsus_read::GraphTargetCache,
+    tenant: pulsus_model::Tenant,
 ) -> Result<TraceEngine, ChError> {
     let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
         .with_consistency(consistency_from(config))?;
-    Ok(TraceEngine::new(client, trace_read_config_from(config))
-        .with_indexed_attrs(
-            pulsus_read::traces::spans::attr_index::IndexedAttr::from_config(
-                &config.traceql_indexed_attributes,
-            ),
-        )
-        .with_graph_target_cache(graph_target))
+    Ok(
+        TraceEngine::new(client, trace_read_config_from(config), tenant)
+            .with_indexed_attrs(
+                pulsus_read::traces::spans::attr_index::IndexedAttr::from_config(
+                    &config.traceql_indexed_attributes,
+                ),
+            )
+            .with_graph_target_cache(graph_target),
+    )
 }
 
 #[cfg(test)]

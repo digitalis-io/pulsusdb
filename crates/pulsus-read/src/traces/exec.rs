@@ -58,10 +58,12 @@ use super::spans::tags::{
     TAG_STORE_READ_ROWS, TagNarrowing, TagShape, ValueScope, cut_rows, name_values_sql,
     narrowed_values_sql, narrowing_from_query, table_reads,
 };
+use super::tenant_scope::TenantTerm;
 use super::values::{GroupCardinalityCounter, SpanSetGroup, SpanSummary};
 use super::window_sql::WindowSql;
 use crate::logql::error::{ReadError, TooBroadReason};
 use crate::logql::explain::PlanExplain;
+use pulsus_model::Tenant;
 
 /// Response cap for the §4.3 tag-names read (`GET /api/traces/v1/tags`,
 /// issue #58) — a documented constant (docs/api.md §4.3; promoted to
@@ -694,12 +696,43 @@ pub struct TraceEngine {
     tag_read_rows: u64,
     /// The clustered service graph's target, shared across engines.
     graph_target: GraphTargetCache,
+    /// Issue #738: the request's tenant, as the term every trace read
+    /// carries.
+    tenant: TenantTerm,
 }
 
 impl TraceEngine {
-    pub fn new(client: ChClient, config: TraceReadConfig) -> Self {
+    /// An engine reading `tenant`'s traces (issue #738).
+    pub fn new(client: ChClient, config: TraceReadConfig, tenant: Tenant) -> Self {
+        let tenant = TenantTerm::of(&tenant);
+        let mut tables: Vec<String> = [
+            "resources",
+            "spans",
+            "tag_names",
+            "tag_values",
+            "trace_landing",
+            "traces",
+            "service_edges",
+            "tag_bucket_values",
+            "error_spans",
+            "service_bucket_resources",
+        ]
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
+        for routed in [
+            &config.spans_table,
+            &config.error_spans_table,
+            &config.traces_table,
+            &config.resources_table,
+        ] {
+            if !tables.contains(routed) {
+                tables.push(routed.clone());
+            }
+        }
         Self {
-            dispatch: super::dispatch::TraceDispatch::new(client),
+            dispatch: super::dispatch::TraceDispatch::new(client, tenant.clone(), tables),
+            tenant,
             config,
             indexed: Vec::new(),
             tag_read_rows: TAG_STORE_READ_ROWS,
@@ -770,7 +803,7 @@ impl TraceEngine {
         } else {
             None
         };
-        let sql = super::spans::graph::spans_graph_sql(window, target, cap);
+        let sql = super::spans::graph::spans_graph_sql(&self.tenant, window, target, cap);
         let mut edges: Vec<GraphEdgeRow> = Vec::new();
         // Scoped stream (module convention): the pooled-connection lease
         // drops at return, after full consumption (≤ cap + 1 rows by the SQL
@@ -858,6 +891,7 @@ impl TraceEngine {
     ) -> Result<FetchedTrace, ReadError> {
         let settings = fetch_settings(&self.config);
         let sql = span_fetch::indexed_fetch_sql(
+            &self.tenant,
             &self.config.traces_table,
             &self.config.spans_table,
             &self.config.resources_table,
@@ -869,6 +903,7 @@ impl TraceEngine {
         // trace.
         let first: IndexedFetchRow = self.one_fetch_row(&sql, &settings).await?;
         let (route, second) = fetch_route_and_second(
+            &self.tenant,
             &self.config,
             hex32,
             first.index_rows,
@@ -956,6 +991,7 @@ impl TraceEngine {
     ) -> Result<TagNames, ReadError> {
         let scope_literal = scope.map(crate::logql::escape::ch_string);
         let sql = super::spans::tags::tag_names_sql(
+            &self.tenant,
             scope_literal.as_deref(),
             floor_ns,
             TAG_NAMES_MAX + 1,
@@ -1018,12 +1054,14 @@ impl TraceEngine {
             spans_table: &self.config.spans_table,
             resources_table: &self.config.resources_table,
             indexed: &[],
+            tenant: &self.tenant,
         };
         let n = req.narrowing(&ctx);
         if !n.has_body() {
             let key_literal = crate::logql::escape::ch_string(key);
             let scope_literal = scope.map(crate::logql::escape::ch_string);
             let sql = super::spans::tags::tag_values_sql(
+                &self.tenant,
                 &key_literal,
                 scope_literal.as_deref(),
                 req.floor_ns,
@@ -1076,6 +1114,7 @@ impl TraceEngine {
             spans_table: &self.config.spans_table,
             resources_table: &self.config.resources_table,
             indexed: &[],
+            tenant: &self.tenant,
         };
         let n = req.narrowing(&ctx);
         let sql = span_names_statement(&self.config, self.tag_read_rows, w, &n);
@@ -1187,6 +1226,7 @@ impl TraceEngine {
             &self.config.spans_table
         };
         super::spans::search::plan_statement_sliced(
+            &self.tenant,
             request,
             spans,
             &self.config.traces_table,
@@ -1526,6 +1566,7 @@ fn with_final(s: QuerySettings) -> QuerySettings {
 /// answers it. A non-empty span array is needed because statement 1
 /// answers one row whatever `index_rows` turns out to be.
 fn fetch_route_and_second(
+    tenant: &TenantTerm,
     config: &TraceReadConfig,
     hex32: &str,
     index_rows: u64,
@@ -1541,6 +1582,7 @@ fn fetch_route_and_second(
         return (
             FetchRoute::TruncatedSet,
             Some(span_fetch::wide_fetch_sql(
+                tenant,
                 &config.traces_table,
                 &config.spans_table,
                 &config.resources_table,
@@ -1556,6 +1598,7 @@ fn fetch_route_and_second(
         Some(window) => (
             FetchRoute::Fallback,
             Some(span_fetch::fallback_fetch_sql(
+                tenant,
                 &config.spans_table,
                 &config.resources_table,
                 hex32,
@@ -2007,6 +2050,8 @@ mod tests {
         assert!(format!("{config:?}").contains("spans_table: \"spans\""));
     }
 
+    use crate::traces::tenant_scope::empty_term;
+
     fn cfg() -> TraceReadConfig {
         TraceReadConfig {
             spans_table: "spans".to_string(),
@@ -2139,7 +2184,7 @@ mod tests {
 
         // (a) an indexed answer: a complete bucket set and a non-empty
         // span array, so one statement answers.
-        let (route, second) = fetch_route_and_second(&config, HEX, 1, 0, true, None);
+        let (route, second) = fetch_route_and_second(empty_term(), &config, HEX, 1, 0, true, None);
         assert_eq!(route, FetchRoute::Indexed);
         assert!(second.is_none(), "the indexed route issues one statement");
 
@@ -2147,7 +2192,8 @@ mod tests {
         // `4096`: the value an uncapped union of a truncated row with one
         // further bucket produces, so this sub-case also pins that the
         // test is `>=` and not `==`.
-        let (route, second) = fetch_route_and_second(&config, HEX, 1, 4097, false, None);
+        let (route, second) =
+            fetch_route_and_second(empty_term(), &config, HEX, 1, 4097, false, None);
         assert_eq!(route, FetchRoute::TruncatedSet);
         let wide = second.expect("the truncated-set route issues a second statement");
         assert!(
@@ -2157,7 +2203,8 @@ mod tests {
 
         // (c) no index row, no spans, and a window: the fallback answers,
         // also at two statements.
-        let (route, second) = fetch_route_and_second(&config, HEX, 0, 0, false, window);
+        let (route, second) =
+            fetch_route_and_second(empty_term(), &config, HEX, 0, 0, false, window);
         assert_eq!(route, FetchRoute::Fallback);
         let fallback = second.expect("the fallback route issues a second statement");
         assert!(
@@ -2169,7 +2216,7 @@ mod tests {
         // (d) no index row, no spans and NO window: one statement, and the
         // answer is empty rather than a trace_id-only predicate over every
         // partition in retention.
-        let (route, second) = fetch_route_and_second(&config, HEX, 0, 0, false, None);
+        let (route, second) = fetch_route_and_second(empty_term(), &config, HEX, 0, 0, false, None);
         assert_eq!(route, FetchRoute::Indexed);
         assert!(
             second.is_none(),
@@ -2180,7 +2227,8 @@ mod tests {
         // state where the per-trace table holds a row and the span table
         // holds nothing. Both halves of the second condition are
         // load-bearing and this is the half that is not `index_rows`.
-        let (route, second) = fetch_route_and_second(&config, HEX, 1, 0, false, window);
+        let (route, second) =
+            fetch_route_and_second(empty_term(), &config, HEX, 1, 0, false, window);
         assert_eq!(route, FetchRoute::Fallback);
         assert!(second.is_some());
 
@@ -2190,7 +2238,7 @@ mod tests {
         // trace by construction. With a window supplied, an empty
         // statement-1 array on the truncated route must NOT fall through
         // to the fallback.
-        let (route, _) = fetch_route_and_second(&config, HEX, 1, 4096, false, window);
+        let (route, _) = fetch_route_and_second(empty_term(), &config, HEX, 1, 4096, false, window);
         assert_eq!(
             route,
             FetchRoute::TruncatedSet,
@@ -2407,6 +2455,7 @@ mod tests {
             resources: "resources",
             traces: "traces",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         };
         for (q, want) in [
             ("{ status = error } | count_over_time()", None),
@@ -2649,6 +2698,7 @@ mod tests {
                 spans_table: "spans",
                 resources_table: "resources",
                 indexed: &[],
+                tenant: crate::traces::tenant_scope::empty_term(),
             },
         )
     }
@@ -2874,6 +2924,7 @@ mod tests {
             (
                 "indexed",
                 crate::traces::spans::fetch::indexed_fetch_sql(
+                    crate::traces::tenant_scope::empty_term(),
                     "traces_dist",
                     "spans_dist",
                     "resources",
@@ -2883,6 +2934,7 @@ mod tests {
             (
                 "wide",
                 crate::traces::spans::fetch::wide_fetch_sql(
+                    crate::traces::tenant_scope::empty_term(),
                     "traces_dist",
                     "spans_dist",
                     "resources",
@@ -2892,6 +2944,7 @@ mod tests {
             (
                 "fallback",
                 crate::traces::spans::fetch::fallback_fetch_sql(
+                    crate::traces::tenant_scope::empty_term(),
                     "spans_dist",
                     "resources",
                     HEX,
@@ -3033,6 +3086,7 @@ mod tests {
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         }
     }
 

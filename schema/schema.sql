@@ -323,6 +323,7 @@ TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + {{retention_days}}) * 86400,
 
 CREATE TABLE IF NOT EXISTS {{db}}.resources{{on_cluster}}
 (
+    org_id LowCardinality(String),
     day Date CODEC(ZSTD(1)),
     resource_id UInt128 CODEC(ZSTD(1)),
     service LowCardinality(String) CODEC(ZSTD(1)),
@@ -342,6 +343,7 @@ TTL toDateTime(least(((toUInt32(day) + 1) * 86400) + ({{retention_days}} * 86400
 
 CREATE TABLE IF NOT EXISTS {{db}}.spans{{on_cluster}}
 (
+    org_id LowCardinality(String),
     trace_id FixedString(16) CODEC(ZSTD(1)),
     span_id FixedString(8) CODEC(ZSTD(1)),
     parent_span_id FixedString(8) CODEC(ZSTD(1)),
@@ -396,6 +398,7 @@ TTL toDateTime(least(intDiv(start_ns, 1000000000) + ({{retention_days}} * 86400)
 
 CREATE TABLE IF NOT EXISTS {{db}}.tag_names{{on_cluster}}
 (
+    org_id LowCardinality(String),
     scope LowCardinality(String) CODEC(ZSTD(1)),
     key String CODEC(ZSTD(1)),
     last_start_ns Int64 CODEC(DoubleDelta, ZSTD(1))
@@ -409,6 +412,7 @@ TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{
 
 CREATE TABLE IF NOT EXISTS {{db}}.tag_values{{on_cluster}}
 (
+    org_id LowCardinality(String),
     scope LowCardinality(String) CODEC(ZSTD(1)),
     key String CODEC(ZSTD(1)),
     value String CODEC(ZSTD(1)),
@@ -424,6 +428,7 @@ TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{
 
 CREATE TABLE IF NOT EXISTS {{db}}.trace_landing{{on_cluster}}
 (
+    org_id LowCardinality(String),
     event_id UUID DEFAULT generateUUIDv7(),
     received_ms Int64 CODEC(DoubleDelta, ZSTD(1)),
     row_kind UInt8 CODEC(ZSTD(1)),
@@ -485,6 +490,7 @@ TTL toDateTime(least(intDiv(received_ms, 1000) + ({{trace_landing_retention_hour
 
 CREATE TABLE IF NOT EXISTS {{db}}.traces{{on_cluster}}
 (
+    org_id LowCardinality(String),
     day Date CODEC(ZSTD(1)),
     trace_id FixedString(16) CODEC(ZSTD(1)),
     start_ns SimpleAggregateFunction(min, Int64) CODEC(ZSTD(1)),
@@ -499,8 +505,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.traces{{on_cluster}}
 PARTITION BY day
 ORDER BY trace_id
 TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
---@cluster SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS allow_dimensions_outside_sorting_key = 1, index_granularity = 1024, ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, index_granularity = 1024, ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.log_metrics_{{log_rollup_suffix}}{{dist_suffix}}{{on_cluster}} AS {{db}}.log_metrics_{{log_rollup_suffix}}
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'log_metrics_{{log_rollup_suffix}}', cityHash64(fingerprint));
@@ -701,6 +707,7 @@ WHERE kind = 2;
 
 CREATE MATERIALIZED VIEW {{db}}.resources_mv{{on_cluster}} TO {{db}}.resources
 AS SELECT
+    org_id AS org_id,
     day AS day,
     resource_id AS resource_id,
     service AS service,
@@ -714,6 +721,7 @@ WHERE row_kind = 1;
 
 CREATE MATERIALIZED VIEW {{db}}.spans_mv{{on_cluster}} TO {{db}}.spans{{route_suffix}}
 AS SELECT
+    org_id AS org_id,
     trace_id AS trace_id,
     span_id AS span_id,
     parent_span_id AS parent_span_id,
@@ -747,6 +755,7 @@ WHERE row_kind = 0;
 
 CREATE MATERIALIZED VIEW {{db}}.tag_names_mv{{on_cluster}} TO {{db}}.tag_names
 AS SELECT
+    org_id AS org_id,
     tag_scope AS scope,
     tag_key AS key,
     start_ns AS last_start_ns
@@ -755,6 +764,7 @@ WHERE row_kind = 2;
 
 CREATE MATERIALIZED VIEW {{db}}.tag_values_mv{{on_cluster}} TO {{db}}.tag_values
 AS SELECT
+    org_id AS org_id,
     tag_scope AS scope,
     tag_key AS key,
     tag_value AS value,
@@ -765,6 +775,7 @@ WHERE row_kind = 3;
 
 CREATE TABLE IF NOT EXISTS {{db}}.service_edges{{on_cluster}}
 (
+    org_id LowCardinality(String),
     minute DateTime('UTC') CODEC(Delta, ZSTD(1)),
     client_minute DateTime('UTC') CODEC(Delta, ZSTD(1)),
     client LowCardinality(String) CODEC(ZSTD(1)),
@@ -834,6 +845,7 @@ SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_rows_to_read = {{gr
 
 CREATE MATERIALIZED VIEW {{db}}.traces_mv{{on_cluster}} TO {{db}}.traces{{route_suffix}}
 AS SELECT
+    org_id,
     toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day,
     trace_id,
     s AS start_ns,
@@ -845,6 +857,7 @@ AS SELECT
 FROM
 (
     SELECT
+        org_id,
         trace_id,
         min(start_ns) AS s,
         max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), 9223372036854775807))) AS e,
@@ -854,11 +867,12 @@ FROM
         groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk
     FROM {{db}}.trace_landing
     WHERE row_kind = 0
-    GROUP BY trace_id
+    GROUP BY org_id, trace_id
 );
 
 CREATE TABLE IF NOT EXISTS {{db}}.tag_bucket_values{{on_cluster}}
 (
+    org_id LowCardinality(String),
     bucket Int64 CODEC(ZSTD(1)),
     service LowCardinality(String) CODEC(ZSTD(1)),
     scope LowCardinality(String) CODEC(ZSTD(1)),
@@ -870,11 +884,12 @@ CREATE TABLE IF NOT EXISTS {{db}}.tag_bucket_values{{on_cluster}}
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')
 ORDER BY (service, scope, key, bucket)
 TTL toDateTime(least(intDiv(bucket * 300000000000, 1000000000) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
---@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.error_spans{{on_cluster}}
 (
+    org_id LowCardinality(String),
     trace_id FixedString(16) CODEC(ZSTD(1)),
     span_id FixedString(8) CODEC(ZSTD(1)),
     start_ns Int64 CODEC(Delta(8), ZSTD(1)),
@@ -901,13 +916,13 @@ TTL toDateTime(least(intDiv(start_ns, 1000000000) + ({{retention_days}} * 86400)
 --@cluster SETTINGS fsync_after_insert = 1, fsync_directories = 1;
 
 CREATE MATERIALIZED VIEW {{db}}.error_spans_mv{{on_cluster}} TO {{db}}.error_spans{{route_suffix}}
-AS SELECT trace_id, span_id, start_ns, duration_ns, end_ns, service, service_type, resource_id, name, kind,
+AS SELECT org_id, trace_id, span_id, start_ns, duration_ns, end_ns, service, service_type, resource_id, name, kind,
           status_code, status_message
 FROM {{db}}.trace_landing
 WHERE row_kind = 0 AND status_code = 2;
 
 CREATE MATERIALIZED VIEW {{db}}.tag_bucket_values_mv{{on_cluster}} TO {{db}}.tag_bucket_values
-AS SELECT intDiv(start_ns, 300000000000) AS bucket, service, 'span' AS scope, pv.1 AS key,
+AS SELECT org_id, intDiv(start_ns, 300000000000) AS bucket, service, 'span' AS scope, pv.1 AS key,
           groupUniqArrayState(101)(e) AS vals
 FROM {{db}}.trace_landing
 ARRAY JOIN arrayZip(mapKeys(JSONAllPathsWithTypes(attrs)), mapValues(JSONAllPathsWithTypes(attrs)),
@@ -923,10 +938,11 @@ ARRAY JOIN multiIf(
     pv.2 = 'Array(Nullable(Bool))',    arrayMap(x -> (toString(assumeNotNull(x)), 'bool'), CAST(pv.3, 'Array(Nullable(Bool))')),
     CAST([], 'Array(Tuple(String, String))')) AS e
 WHERE row_kind = 0 AND service_type = 'string'
-GROUP BY bucket, service, scope, key;
+GROUP BY org_id, bucket, service, scope, key;
 
 CREATE TABLE IF NOT EXISTS {{db}}.service_bucket_resources{{on_cluster}}
 (
+    org_id LowCardinality(String),
     bucket Int64 CODEC(ZSTD(1)),
     service LowCardinality(String) CODEC(ZSTD(1)),
     resource_id UInt128 CODEC(ZSTD(1))
@@ -940,7 +956,7 @@ TTL toDateTime(least(intDiv(bucket * 300000000000, 1000000000) + ({{retention_da
 --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 CREATE MATERIALIZED VIEW {{db}}.service_bucket_resources_mv{{on_cluster}} TO {{db}}.service_bucket_resources
-AS SELECT intDiv(start_ns, 300000000000) AS bucket, service, resource_id
+AS SELECT org_id, intDiv(start_ns, 300000000000) AS bucket, service, resource_id
 FROM {{db}}.trace_landing
 WHERE row_kind = 0 AND service_type = 'string'
-GROUP BY bucket, service, resource_id;
+GROUP BY org_id, bucket, service, resource_id;

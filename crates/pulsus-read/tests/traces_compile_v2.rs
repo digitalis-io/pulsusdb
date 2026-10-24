@@ -48,13 +48,15 @@ const END_NS: i64 = 1_700_010_800_000_000_000;
 /// request's own.
 const STEP_MS: i64 = 400_000;
 
-const TABLES: StatementTables<'static> = StatementTables {
-    spans: "spans",
-    error_spans: "error_spans",
-    resources: "resources",
-    traces: "traces",
-    indexed: &[],
-};
+static TABLES: std::sync::LazyLock<StatementTables<'static>> =
+    std::sync::LazyLock::new(|| StatementTables {
+        spans: "spans",
+        error_spans: "error_spans",
+        resources: "resources",
+        traces: "traces",
+        indexed: &[],
+        tenant: empty_term(),
+    });
 
 /// The search statement the empty selector compiles to over the window.
 fn search_statements() -> Vec<(&'static str, String)> {
@@ -71,8 +73,17 @@ fn search_statements() -> Vec<(&'static str, String)> {
         64,
     )
     .expect("the empty selector plans");
-    let statement = plan_statement_sliced(&request, "spans", "traces", "resources", 64, &[], None)
-        .expect("the empty selector compiles");
+    let statement = plan_statement_sliced(
+        empty_term(),
+        &request,
+        "spans",
+        "traces",
+        "resources",
+        64,
+        &[],
+        None,
+    )
+    .expect("the empty selector compiles");
     vec![("search statement", statement.sql().to_string())]
 }
 
@@ -103,6 +114,7 @@ fn metrics_statement() -> String {
 /// The service-graph statement on a single node.
 fn graph_statement() -> String {
     spans_graph_sql(
+        empty_term(),
         GraphWindow {
             start_ns: START_NS,
             end_ns: END_NS,
@@ -114,6 +126,7 @@ fn graph_statement() -> String {
 
 fn fetch_statement() -> String {
     pulsus_read::traces::spans::fetch::indexed_fetch_sql(
+        empty_term(),
         "traces",
         "spans",
         "resources",
@@ -130,6 +143,7 @@ fn tag_values_statement() -> String {
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: empty_term(),
         },
     );
     name_values_sql(
@@ -914,6 +928,7 @@ fn ctx() -> PredicateCtx<'static> {
         spans_table: "spans",
         resources_table: "resources",
         indexed: &[],
+        tenant: empty_term(),
     }
 }
 
@@ -4821,6 +4836,7 @@ fn search_golden(stem: &str, query: &str, limit: u32, spss: u32) -> String {
         spans_table: "spans",
         resources_table: "resources",
         indexed: &[],
+        tenant: empty_term(),
     };
     let parsed =
         pulsus_traceql::parse(query).unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
@@ -5013,6 +5029,7 @@ fn route_accepts(query: &str) -> bool {
             resources: "resources",
             traces: "traces",
             indexed: &[],
+            tenant: empty_term(),
         },
         64,
     )
@@ -5344,6 +5361,7 @@ fn a_filter_hints_only_what_its_body_requires() {
         spans_table: "spans",
         resources_table: "resources",
         indexed: &indexed,
+        tenant: empty_term(),
     };
     let req = |v: &str| format!("indexHint(has({}, '{v}'))", span_expr("app%2Erequest%2Eid"));
     let mut wrong = Vec::new();
@@ -5912,4 +5930,21 @@ fn a_by_expression_key_compiles_or_is_refused_by_name() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

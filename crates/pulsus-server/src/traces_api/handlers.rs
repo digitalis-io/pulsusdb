@@ -27,6 +27,7 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
+use pulsus_model::Tenant;
 use pulsus_read::{FetchRoute, TraceEngine};
 
 use crate::request_id::{QUERY_ID_HEADER, current_or_new};
@@ -40,12 +41,18 @@ use super::fetch_v2;
 use super::negotiate::{self, Wants};
 use super::params;
 
+/// The empty tenant, every trace read's tenant until each handler reads
+/// its request's header.
+pub(super) fn no_tenant() -> Tenant {
+    Tenant::from_header(None, false).expect("the empty tenant")
+}
+
 /// Acquires the shared `Arc<ChPool>` from `AppState` (the `engine_for`
 /// pattern: clone the `Option` out from behind the lock, drop the guard
 /// before doing anything else) and builds a `TraceEngine` over it —
 /// `503 unavailable` before the pool is established, matching `/ready`.
 /// `pub(super)`: `search.rs` shares the same engine acquisition.
-pub(super) async fn engine_for(state: &AppState) -> Result<TraceEngine, ApiError> {
+pub(super) async fn engine_for(state: &AppState, tenant: Tenant) -> Result<TraceEngine, ApiError> {
     let pool = {
         let guard = state.pool.read().await;
         guard.clone()
@@ -54,7 +61,7 @@ pub(super) async fn engine_for(state: &AppState) -> Result<TraceEngine, ApiError
     // Issue #114: the consistency-config invariant is already enforced at
     // config load, so this is unreachable in the real binary; a failure maps
     // to the existing 503 "not serving" semantics.
-    chconfig::trace_engine(pool, &state.config, state.graph_target.clone())
+    chconfig::trace_engine(pool, &state.config, state.graph_target.clone(), tenant)
         .map(crate::request_id::tag)
         .map_err(|_| ApiError::PoolUnavailable)
 }
@@ -123,7 +130,9 @@ async fn trace_by_id_impl(
 ) -> Result<Response, ApiError> {
     let hex32 = params::parse_trace_id(raw_trace_id)?;
     let window = params::parse_fetch_window(raw_query)?;
-    let engine = engine_for(&state).await?.with_statement_prefix(stmt_prefix);
+    let engine = engine_for(&state, no_tenant())
+        .await?
+        .with_statement_prefix(stmt_prefix);
     let fetched = engine.fetch_by_id(&hex32, window).await?;
     report_fetch_route(fetched.route);
     if fetched.spans.is_empty() {
@@ -262,7 +271,9 @@ async fn trace_by_id_v2_impl(
 ) -> Result<Response, ApiError> {
     let hex32 = params::parse_trace_id(raw_trace_id)?;
     let window = params::parse_fetch_window(raw_query)?;
-    let engine = engine_for(&state).await?.with_statement_prefix(stmt_prefix);
+    let engine = engine_for(&state, no_tenant())
+        .await?
+        .with_statement_prefix(stmt_prefix);
     let fetched = engine.fetch_by_id(&hex32, window).await?;
     report_fetch_route(fetched.route);
     // The empty case is the whole reason this route exists: a present,

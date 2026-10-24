@@ -338,6 +338,7 @@ async fn ours(engine: &TraceEngine, q: &str, window: (i64, i64)) -> BTreeMap<Str
             resources: "resources",
             traces: "traces",
             indexed: &[],
+            tenant: empty_term(),
         },
         64,
     )
@@ -1080,6 +1081,7 @@ async fn traces_search_projection_differential() {
     let engine = TraceEngine::new(
         ChClient::new(ch_config(db)).await.expect("connect engine"),
         engine_config(),
+        empty_tenant(),
     );
 
     // ---- the validity gate, before any comparison ---------------------
@@ -1214,33 +1216,19 @@ async fn land(
     let mut rows: Vec<pulsus_write::TraceLandingRow> =
         Vec::with_capacity(parsed.total_rows() as usize);
     rows.extend(
-        parsed
-            .spans
-            .iter()
-            .cloned()
-            .map(|s| pulsus_write::TraceLandingRow::span(received_ms, s)),
+        parsed.spans.iter().cloned().map(|s| {
+            pulsus_write::TraceLandingRow::span(&std::sync::Arc::from(""), received_ms, s)
+        }),
     );
-    rows.extend(
-        parsed
-            .resources
-            .iter()
-            .cloned()
-            .map(|r| pulsus_write::TraceLandingRow::resource(received_ms, r)),
-    );
-    rows.extend(
-        parsed
-            .tag_names
-            .iter()
-            .cloned()
-            .map(|t| pulsus_write::TraceLandingRow::tag_name(received_ms, t)),
-    );
-    rows.extend(
-        parsed
-            .tag_values
-            .iter()
-            .cloned()
-            .map(|t| pulsus_write::TraceLandingRow::tag_value(received_ms, t)),
-    );
+    rows.extend(parsed.resources.iter().cloned().map(|r| {
+        pulsus_write::TraceLandingRow::resource(&std::sync::Arc::from(""), received_ms, r)
+    }));
+    rows.extend(parsed.tag_names.iter().cloned().map(|t| {
+        pulsus_write::TraceLandingRow::tag_name(&std::sync::Arc::from(""), received_ms, t)
+    }));
+    rows.extend(parsed.tag_values.iter().cloned().map(|t| {
+        pulsus_write::TraceLandingRow::tag_value(&std::sync::Arc::from(""), received_ms, t)
+    }));
     client
         .insert_block_with(
             "trace_landing",
@@ -1351,4 +1339,21 @@ fn every_witness_query_is_exactly_one_case() {
         "(witness, cases carrying it) = {wrong:?}; a count of 0 is a shape no longer tested \
          against the reference. Edit crates/pulsus-read/tests/projection_cases/mod.rs"
     );
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

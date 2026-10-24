@@ -318,15 +318,16 @@ pub async fn ingest_traces(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
     let rejected = landing.rejected;
     let rejected_message = landing.rejected_message.clone();
     let push = push_headers(&headers);
+    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
 
     if is_async(&headers) {
-        return match sink.admit(landing, push) {
+        return match sink.admit(&tenant, landing, push) {
             Ok(()) => export_traces_response(StatusCode::ACCEPTED, rejected, rejected_message),
             Err(refusal) => otlp_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(landing, push) {
+    match sink.admit_flush(&tenant, landing, push) {
         Ok(wait) => match wait.await {
             Ok(()) => export_traces_response(StatusCode::OK, rejected, rejected_message),
             Err(err) => error_response(err),
@@ -691,15 +692,16 @@ pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
         Err(err) => return zipkin_decode_error_response(&err),
     };
     let push = push_headers(&headers);
+    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
 
     if is_async(&headers) {
-        return match sink.admit(landing, push) {
+        return match sink.admit(&tenant, landing, push) {
             Ok(()) => rw_success_response(StatusCode::ACCEPTED),
             Err(refusal) => zipkin_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(landing, push) {
+    match sink.admit_flush(&tenant, landing, push) {
         Ok(wait) => match wait.await {
             // 202 (not 200) on sync success too — the Zipkin oracle answers
             // 202 Accepted regardless of the async header.
@@ -2536,6 +2538,7 @@ mod tests {
     impl TraceSink for MockTraceSink {
         fn admit(
             &self,
+            _tenant: &pulsus_model::Tenant,
             landing: ParsedTraceLanding,
             push: PushHeaders,
         ) -> Result<(), AdmitRefusal> {
@@ -2552,6 +2555,7 @@ mod tests {
 
         fn admit_flush(
             &self,
+            _tenant: &pulsus_model::Tenant,
             landing: ParsedTraceLanding,
             push: PushHeaders,
         ) -> Result<FlushWait, AdmitRefusal> {

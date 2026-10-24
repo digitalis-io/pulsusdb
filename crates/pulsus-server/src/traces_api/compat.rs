@@ -21,7 +21,7 @@ use pulsus_read::{TagNames, TagValues};
 use crate::app::AppState;
 
 use super::error::ApiError;
-use super::handlers::engine_for;
+use super::handlers::{engine_for, no_tenant};
 use super::params::TagScope;
 use super::tags::{self, attribute_scope, ok_json};
 use super::tags_response::TagNamesAnswer;
@@ -42,7 +42,7 @@ async fn tag_names_for(state: AppState, raw: &str) -> Result<NamesSource, ApiErr
     match params.scope {
         scope @ (TagScope::Intrinsic | TagScope::NoTags) => Ok(NamesSource::Static(scope)),
         scope => {
-            let engine = engine_for(&state).await?;
+            let engine = engine_for(&state, no_tenant()).await?;
             let names = engine
                 .list_tag_names(attribute_scope(scope), tags::catalog_floor_ns(&state)?)
                 .await?;
@@ -91,7 +91,7 @@ async fn tag_values_v1_for(
         tags::now_unix_nanos(),
         tags::tag_lookback_ns(&state),
     )?;
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, no_tenant()).await?;
     Ok(engine
         .list_tag_values(
             &key,

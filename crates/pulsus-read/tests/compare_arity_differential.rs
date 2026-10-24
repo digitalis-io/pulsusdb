@@ -349,14 +349,14 @@ async fn pulsus_land(client: &ChClient, req: &ExportTraceServiceRequest) {
             .spans
             .iter()
             .cloned()
-            .map(|s| TraceLandingRow::span(received_ms, s)),
+            .map(|s| TraceLandingRow::span(&std::sync::Arc::from(""), received_ms, s)),
     );
     rows.extend(
         landing
             .resources
             .iter()
             .cloned()
-            .map(|r| TraceLandingRow::resource(received_ms, r)),
+            .map(|r| TraceLandingRow::resource(&std::sync::Arc::from(""), received_ms, r)),
     );
     client
         .insert_block_with(
@@ -396,6 +396,7 @@ async fn pulsus_counts(
             resources: "resources",
             traces: "traces",
             indexed: &[],
+            tenant: empty_term(),
         },
     )
     .unwrap_or_else(|e| panic!("{query}: plan failed: {e}"));
@@ -764,6 +765,7 @@ async fn compare_arity_differential() {
     let engine = TraceEngine::new(
         ChClient::new(ch_config(&db)).await.expect("connect engine"),
         engine_config(),
+        empty_tenant(),
     );
 
     const MSG: &[&str] = &["statusMessage"];
@@ -1057,4 +1059,21 @@ async fn compare_arity_differential() {
         faults.len(),
         faults.join("\n\n")
     );
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

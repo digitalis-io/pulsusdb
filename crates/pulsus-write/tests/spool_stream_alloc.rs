@@ -766,7 +766,7 @@ async fn peak_over_trace_push(landed: ParsedTraceLanding, poison: bool) -> Measu
     );
     let peak = peak_bytes_of(async {
         let wait = writer
-            .admit_flush(landed, PushHeaders::default())
+            .admit_flush(&no_tenant(), landed, PushHeaders::default())
             .expect("the queue has room");
         // The landing insert answers the caller: `Ok` when it commits, the
         // error when it is poisoned and spooled.

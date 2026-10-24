@@ -216,7 +216,7 @@ fn fetch_config() -> TraceReadConfig {
 }
 
 async fn engine_on(db: &str, prefix: &str) -> TraceEngine {
-    TraceEngine::new(data(db).await, fetch_config()).with_statement_prefix(prefix)
+    TraceEngine::new(data(db).await, fetch_config(), empty_tenant()).with_statement_prefix(prefix)
 }
 
 /// `SYSTEM FLUSH LOGS`, then poll until `query_id` appears — the
@@ -453,6 +453,7 @@ async fn each_statements_reported_column_types_are_the_row_types() {
         (
             "indexed",
             pulsus_read::traces::spans::fetch::indexed_fetch_sql(
+                empty_term(),
                 "traces",
                 "spans",
                 "resources",
@@ -462,12 +463,19 @@ async fn each_statements_reported_column_types_are_the_row_types() {
         ),
         (
             "wide",
-            pulsus_read::traces::spans::fetch::wide_fetch_sql("traces", "spans", "resources", HEX),
+            pulsus_read::traces::spans::fetch::wide_fetch_sql(
+                empty_term(),
+                "traces",
+                "spans",
+                "resources",
+                HEX,
+            ),
             2,
         ),
         (
             "fallback",
             pulsus_read::traces::spans::fetch::fallback_fetch_sql(
+                empty_term(),
                 "spans",
                 "resources",
                 HEX,
@@ -1150,6 +1158,7 @@ async fn a_retention_edge_trace_keeps_its_resource_and_per_trace_rows() {
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: empty_term(),
         },
     )
     .unwrap_or_else(|e| panic!("{query} must compile: {e}"));
@@ -1200,4 +1209,21 @@ async fn a_retention_edge_trace_keeps_its_resource_and_per_trace_rows() {
     );
 
     drop_db(&db).await;
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

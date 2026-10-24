@@ -297,6 +297,7 @@ mod tests {
             resources: "resources",
             traces: "traces",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         };
         let bucket = |q: &str, o: u64| {
             let routed =

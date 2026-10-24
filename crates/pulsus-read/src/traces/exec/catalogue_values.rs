@@ -62,6 +62,7 @@ impl TraceEngine {
                 spans_table: &self.config.spans_table,
                 resources_table: &self.config.resources_table,
                 indexed: &[],
+                tenant: &self.tenant,
             };
             let edge_n = req.narrowing(&ctx);
             edges.push(tag_values_statement(
@@ -74,6 +75,7 @@ impl TraceEngine {
             ));
         }
         let sql = catalogue_values_sql(
+            &self.tenant,
             service,
             key,
             lo,
@@ -137,15 +139,18 @@ impl TraceEngine {
                 spans_table: &self.config.spans_table,
                 resources_table: &self.config.resources_table,
                 indexed: &[],
+                tenant: &self.tenant,
             };
             let edge_n = req.narrowing(&ctx);
             edges.push(resource_edge_sql(
+                &self.tenant,
                 &self.config.spans_table,
                 w,
                 edge_n.predicate(),
             ));
         }
         let sql = catalogue_resource_values_sql(
+            &self.tenant,
             service,
             key,
             lo,

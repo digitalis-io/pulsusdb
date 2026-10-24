@@ -200,6 +200,9 @@ pub struct PredicateCtx<'a> {
     /// The operator-named attribute indexes (issue #595 part 2) a search
     /// filter's hints may reach; empty where none are configured.
     pub indexed: &'a [super::attr_index::IndexedAttr],
+    /// The request's tenant (issue #738), the first conjunct of every read
+    /// of a trace table the predicate renders.
+    pub tenant: &'a crate::traces::tenant_scope::TenantTerm,
 }
 
 /// Compiles one spanset filter body with no context. A `resource.` field

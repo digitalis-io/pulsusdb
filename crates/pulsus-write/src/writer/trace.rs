@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use pulsus_clickhouse::ChClient;
 use pulsus_config::WriterConfig;
+use pulsus_model::Tenant;
 use tokio::sync::oneshot;
 
 use crate::error::LogsIngestError;
@@ -162,6 +163,7 @@ impl TraceWriter {
     /// carries the waiter its answer comes from.
     fn admit_batch(
         &self,
+        tenant: &Tenant,
         landing: ParsedTraceLanding,
         mode: AdmitMode,
         push: PushHeaders,
@@ -186,7 +188,7 @@ impl TraceWriter {
         let mut suppressed: Option<Suppressed> = None;
         let mut guard = match &self.shared.dedup {
             Some(dedup) => {
-                let id = push_dedup::trace_identity(&landing, &push);
+                let id = push_dedup::trace_identity(&landing, &push, tenant);
                 let rows = landing.spans.len() as u64;
                 match dedup.admit(id, mode.wait_mode()) {
                     Admission::Admit(guard) => Some(guard),
@@ -266,7 +268,7 @@ impl TraceWriter {
             } else {
                 None
             };
-            let rows = trace_landing::rows_of(received_ms, landing);
+            let rows = trace_landing::rows_of(&Arc::from(""), received_ms, landing);
             debug_assert_eq!(
                 rows.len() as u64,
                 landing_rows,
@@ -327,17 +329,23 @@ impl TraceWriter {
 }
 
 impl TraceSink for TraceWriter {
-    fn admit(&self, landing: ParsedTraceLanding, push: PushHeaders) -> Result<(), AdmitRefusal> {
-        self.admit_batch(landing, AdmitMode::Async, push)
+    fn admit(
+        &self,
+        tenant: &Tenant,
+        landing: ParsedTraceLanding,
+        push: PushHeaders,
+    ) -> Result<(), AdmitRefusal> {
+        self.admit_batch(tenant, landing, AdmitMode::Async, push)
             .map(|_| ())
     }
 
     fn admit_flush(
         &self,
+        tenant: &Tenant,
         landing: ParsedTraceLanding,
         push: PushHeaders,
     ) -> Result<FlushWait, AdmitRefusal> {
-        match self.admit_batch(landing, AdmitMode::Sync, push)? {
+        match self.admit_batch(tenant, landing, AdmitMode::Sync, push)? {
             Admitted::Stored(receivers) => Ok(FlushWait::new(async move {
                 super::join_generations(receivers)
                     .await
@@ -418,7 +426,11 @@ mod tests {
         for span_id in [1, 2] {
             let landed = push(span_id);
             writer
-                .admit(landed, PushHeaders::default())
+                .admit(
+                    &Tenant::from_header(None, false).expect("the empty tenant"),
+                    landed,
+                    PushHeaders::default(),
+                )
                 .expect("the push is admitted");
             if span_id == 1 {
                 // A is in flight before B is queued.
@@ -439,5 +451,88 @@ mod tests {
 
         assert_b_filed_never_sent(&inserter, &root, trace_landing::LANDING_TABLE).await;
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **T-W2 (issue #738): a trace push is charged its tenant's bytes
+    /// once.** The same push, queued by two writers whose insert parks, once
+    /// as the empty tenant and once as a 150-byte tenant: every row shares
+    /// one tenant string, so the two landing reservations differ by the
+    /// tenant's 150 bytes and nothing else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_trace_push_is_charged_its_tenants_bytes_once() {
+        use crate::writer::teardown_probe::{ParkingInserter, spool_root};
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        const TS: u64 = 1_700_000_000_000_000_000;
+        let landing = || {
+            let req = ExportTraceServiceRequest {
+                resource_spans: vec![ResourceSpans {
+                    resource: Some(Resource {
+                        attributes: vec![KeyValue {
+                            key: "service.name".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue("checkout".to_string())),
+                            }),
+                            key_strindex: 0,
+                        }],
+                        ..Default::default()
+                    }),
+                    scope_spans: vec![ScopeSpans {
+                        spans: (1..=2u8)
+                            .map(|id| Span {
+                                trace_id: vec![0xab; 16],
+                                span_id: vec![id; 8],
+                                name: "op".to_string(),
+                                start_time_unix_nano: TS,
+                                end_time_unix_nano: TS + 1_000_000,
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            };
+            crate::parse_trace_landing(&req).expect("the landing decode")
+        };
+        let long = "a".repeat(150);
+        let mut charged = Vec::new();
+        for name in [None, Some(long.as_str())] {
+            let inserter = ParkingInserter::new();
+            let root = spool_root("trace-tenant-charge");
+            let mut runtime = WriterRuntime::from_config(&WriterConfig::default());
+            runtime.spool_dir = root.clone();
+            runtime.trace_landing_inserters = 1;
+            let writer = TraceWriter::with_inserters_and_runtime(
+                inserter.clone(),
+                runtime,
+                TraceWriterTables::traces_default(),
+            );
+            let value = name.map(|n| axum::http::HeaderValue::from_str(n).expect("a header value"));
+            let who = Tenant::from_header(value.as_ref(), false).expect("a valid tenant");
+            writer
+                .admit(&who, landing(), PushHeaders::default())
+                .expect("the push is admitted");
+            charged.push(writer.metrics().queue_bytes);
+            inserter
+                .entered
+                .acquire()
+                .await
+                .expect("the entered semaphore is never closed")
+                .forget();
+            inserter.release.add_permits(1);
+            writer.shutdown(Duration::from_secs(5)).await;
+            std::fs::remove_dir_all(&root).ok();
+        }
+        assert_eq!(
+            charged[1].checked_sub(charged[0]),
+            Some(150),
+            "the 150-byte tenant's push is charged {} where the empty tenant's is {}",
+            charged[1],
+            charged[0]
+        );
     }
 }

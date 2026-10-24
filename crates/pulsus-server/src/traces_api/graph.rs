@@ -19,7 +19,7 @@ use pulsus_read::{GraphWindow, ServiceGraph};
 use crate::app::AppState;
 
 use super::error::ApiError;
-use super::handlers::engine_for;
+use super::handlers::{engine_for, no_tenant};
 use super::params;
 
 /// `GET /api/traces/v1/service_graph`.
@@ -47,7 +47,7 @@ async fn graph_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
         end_ns: params.end_ns,
     };
 
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, no_tenant()).await?;
     let graph = engine.service_graph(window).await?;
     Ok((StatusCode::OK, Json(render(&graph))).into_response())
 }

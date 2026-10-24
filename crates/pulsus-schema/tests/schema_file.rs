@@ -1519,6 +1519,103 @@ fn the_log_tables_lead_with_the_tenant_in_both_forms() {
     }
 }
 
+/// **T-S (issue #738): the trace tables lead with the tenant, in both
+/// forms.** In the single-node and the clustered rendering, each of the ten
+/// trace tables is created once, keyed with `org_id` first, and none carries
+/// the tests-first seam's `allow_dimensions_outside_sorting_key`; the
+/// service-graph job's marker read reads the markers under the empty tenant,
+/// and its pairing groups by tenant. One assertion per rendering, naming
+/// every failure.
+#[test]
+fn the_trace_tables_lead_with_the_tenant_in_both_forms() {
+    let spans_key = "(org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)";
+    let keys = [
+        ("resources", "(org_id, service, resource_id)"),
+        ("spans", spans_key),
+        ("tag_names", "(org_id, scope, key)"),
+        ("tag_values", "(org_id, scope, key, value, val_type)"),
+        (
+            "trace_landing",
+            "(org_id, row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)",
+        ),
+        ("traces", "(org_id, trace_id)"),
+        (
+            "service_edges",
+            "(org_id, conn_type, minute, client_minute, client, server)",
+        ),
+        ("tag_bucket_values", "(org_id, service, scope, key, bucket)"),
+        ("error_spans", spans_key),
+        (
+            "service_bucket_resources",
+            "(org_id, service, bucket, resource_id)",
+        ),
+    ];
+    let clustered = RenderCtx {
+        cluster: Some("c1".to_string()),
+        ..RenderCtx::for_tests("pulsus", 7)
+    };
+    for (form, ctx) in [("single-node", single()), ("clustered", clustered)] {
+        let stmts = rendered_statements(&ctx);
+        let mut failures = Vec::new();
+        for (table, key) in keys {
+            let head = format!("CREATE TABLE IF NOT EXISTS pulsus.{table}");
+            let creates: Vec<&String> = stmts
+                .iter()
+                .filter(|s| {
+                    s.trim_start()
+                        .strip_prefix(&head)
+                        .is_some_and(|rest| rest.starts_with([' ', '\n']))
+                })
+                .collect();
+            if creates.len() != 1 {
+                failures.push(format!("{table}: created {} times", creates.len()));
+                continue;
+            }
+            let order: Vec<&str> = creates[0]
+                .lines()
+                .filter(|l| l.trim_start().starts_with("ORDER BY"))
+                .collect();
+            let want = format!("ORDER BY {key}");
+            if order != [want.as_str()] {
+                failures.push(format!("{table}: {order:?}, expected {want:?}"));
+            }
+            if creates[0].contains("allow_dimensions_outside_sorting_key") {
+                failures.push(format!(
+                    "{table}: carries allow_dimensions_outside_sorting_key"
+                ));
+            }
+        }
+        let jobs: Vec<&String> = stmts
+            .iter()
+            .filter(|s| {
+                s.trim_start()
+                    .starts_with("CREATE MATERIALIZED VIEW pulsus.service_edges_mv")
+            })
+            .collect();
+        if let [job] = jobs.as_slice() {
+            let markers = job
+                .matches("FROM merge('pulsus', '^service_edges$') FINAL WHERE ")
+                .count();
+            let scoped = job
+                .matches(
+                    "FROM merge('pulsus', '^service_edges$') FINAL WHERE org_id = '' AND conn_type = ''",
+                )
+                .count();
+            if markers != 1 || scoped != 1 {
+                failures.push(format!(
+                    "service_edges_mv: {scoped} of {markers} marker reads under org_id = ''"
+                ));
+            }
+            if !job.contains("GROUP BY org_id, trace_id, k\n") {
+                failures.push("service_edges_mv: pairing not GROUP BY org_id, trace_id, k".into());
+            }
+        } else {
+            failures.push(format!("service_edges_mv: created {} times", jobs.len()));
+        }
+        assert!(failures.is_empty(), "{form}: {failures:#?}");
+    }
+}
+
 /// Issue #614, part 2: the rollup keeps a bucket exactly as long as
 /// `log_samples` keeps the lines it counts, so a window past retention
 /// answers alike on the rollup route and the raw route.

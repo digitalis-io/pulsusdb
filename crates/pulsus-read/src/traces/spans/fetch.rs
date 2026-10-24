@@ -204,6 +204,7 @@ const FALLBACK_PREDICATE: &str = r"trace_id = {key}
 /// Statement 1 — the indexed fetch. Issued on every fetch request,
 /// always, first.
 pub fn indexed_fetch_sql(
+    _tenant: &crate::traces::tenant_scope::TenantTerm,
     traces_table: &str,
     spans_table: &str,
     resources_table: &str,
@@ -229,6 +230,7 @@ pub fn indexed_fetch_sql(
 /// that may have truncated. Takes only `hex32`: it reads its own bounds,
 /// so the reader carries nothing between the two statements.
 pub fn wide_fetch_sql(
+    _tenant: &crate::traces::tenant_scope::TenantTerm,
     traces_table: &str,
     spans_table: &str,
     resources_table: &str,
@@ -249,6 +251,7 @@ pub fn wide_fetch_sql(
 /// not indexed. Every bound is rendered from one [`WindowSql`], so the row
 /// bound, the bucket bound and the resource-day bound cannot disagree.
 pub fn fallback_fetch_sql(
+    _tenant: &crate::traces::tenant_scope::TenantTerm,
     spans_table: &str,
     resources_table: &str,
     hex32: &str,
@@ -282,15 +285,33 @@ mod tests {
     };
 
     fn indexed() -> String {
-        indexed_fetch_sql("traces", "spans", "resources", HEX)
+        indexed_fetch_sql(
+            crate::traces::tenant_scope::empty_term(),
+            "traces",
+            "spans",
+            "resources",
+            HEX,
+        )
     }
 
     fn wide() -> String {
-        wide_fetch_sql("traces", "spans", "resources", HEX)
+        wide_fetch_sql(
+            crate::traces::tenant_scope::empty_term(),
+            "traces",
+            "spans",
+            "resources",
+            HEX,
+        )
     }
 
     fn fallback() -> String {
-        fallback_fetch_sql("spans", "resources", HEX, WINDOW)
+        fallback_fetch_sql(
+            crate::traces::tenant_scope::empty_term(),
+            "spans",
+            "resources",
+            HEX,
+            WINDOW,
+        )
     }
 
     /// `F-3`: **all three builders' output, byte for byte.**
@@ -452,8 +473,13 @@ SELECT sp.1 AS spans,
         );
         let mut rendered = Vec::new();
         for (start_ns, end_ns, lo_arg, hi_arg, lo_bucket, hi_bucket) in cases {
-            let sql =
-                fallback_fetch_sql("spans", "resources", HEX, FetchWindow { start_ns, end_ns });
+            let sql = fallback_fetch_sql(
+                crate::traces::tenant_scope::empty_term(),
+                "spans",
+                "resources",
+                HEX,
+                FetchWindow { start_ns, end_ns },
+            );
             let want = format!(
                 "intDiv(start_ns, 300000000000) BETWEEN intDiv({lo_arg}, 300000000000) \
                  AND intDiv({hi_arg}, 300000000000)"

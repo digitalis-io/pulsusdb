@@ -314,6 +314,7 @@ async fn pulsus_counts(engine: &TraceEngine, window: (i64, i64)) -> Counts {
             resources: "resources",
             traces: "traces",
             indexed: &[],
+            tenant: empty_term(),
         },
     )
     .expect("plan compare");
@@ -430,14 +431,14 @@ async fn pulsus_land(client: &ChClient, reqs: &[ExportTraceServiceRequest]) {
                 .spans
                 .iter()
                 .cloned()
-                .map(|s| TraceLandingRow::span(received_ms, s)),
+                .map(|s| TraceLandingRow::span(&std::sync::Arc::from(""), received_ms, s)),
         );
         rows.extend(
             landing
                 .resources
                 .iter()
                 .cloned()
-                .map(|r| TraceLandingRow::resource(received_ms, r)),
+                .map(|r| TraceLandingRow::resource(&std::sync::Arc::from(""), received_ms, r)),
         );
         client
             .insert_block_with(
@@ -744,6 +745,7 @@ async fn compare_value_differential() {
     let engine = TraceEngine::new(
         ChClient::new(ch_config(&db)).await.expect("connect engine"),
         engine_config(),
+        empty_tenant(),
     );
     let pulsus = pulsus_counts(&engine, window).await;
 
@@ -933,4 +935,21 @@ fn the_wait_absorbs_the_partial_view_that_reddened_ci() {
         3,
         "the assertions above are written against three consecutive identical reads"
     );
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

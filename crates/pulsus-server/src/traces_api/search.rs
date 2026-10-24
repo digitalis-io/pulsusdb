@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use crate::app::AppState;
 
 use super::error::ApiError;
-use super::handlers::engine_for;
+use super::handlers::{engine_for, no_tenant};
 use super::{legacy, params, search_response};
 
 /// `X-Pulsus-Explain: 1` (docs/api.md "Request headers"), issue #492.
@@ -80,12 +80,14 @@ async fn search_impl(
     let indexed = pulsus_read::traces::spans::attr_index::IndexedAttr::from_config(
         &state.config.traceql_indexed_attributes,
     );
+    let term = pulsus_read::traces::tenant_scope::TenantTerm::of(&no_tenant());
     let tables = pulsus_read::StatementTables {
         spans: &read_config.spans_table,
         error_spans: &read_config.error_spans_table,
         resources: &read_config.resources_table,
         traces: &read_config.traces_table,
         indexed: &indexed,
+        tenant: &term,
     };
     // docs/api.md §4, "Retention": the window starts no earlier than the
     // retention cutoff, for both engines.
@@ -107,7 +109,7 @@ async fn search_impl(
         pulsus_read::plan_search_request(&query, &search_params, &tables, read_config.max_depth)
             .map_err(ApiError::Plan)?;
 
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, no_tenant()).await?;
     if !wants_explain(headers) {
         let output = engine.search_routed(&request).await?;
         return Ok((StatusCode::OK, Json(search_response::render(&output))).into_response());

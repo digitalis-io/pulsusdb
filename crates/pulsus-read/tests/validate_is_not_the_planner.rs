@@ -117,6 +117,7 @@ fn every_plan_error_variant_is_witnessed_by_an_accepted_vector() {
         resources: "pulsus.resources",
         traces: "pulsus.traces",
         indexed: &[],
+        tenant: empty_term(),
     };
     let mctx = MetricsCtx {
         scan_budget_rows: 1_000_000,
@@ -179,4 +180,21 @@ fn every_plan_error_variant_is_witnessed_by_an_accepted_vector() {
         "no accept vector witnesses PlanError::MetricsPointCap — expected any valid metrics \
          expression against the huge range"
     );
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

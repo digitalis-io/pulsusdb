@@ -1211,10 +1211,22 @@ mod tests {
         };
 
         vec![
-            ("span", TraceLandingRow::span(5, span)),
-            ("resource", TraceLandingRow::resource(5, resource)),
-            ("tag_name", TraceLandingRow::tag_name(5, tag_name)),
-            ("tag_value", TraceLandingRow::tag_value(5, tag_value)),
+            (
+                "span",
+                TraceLandingRow::span(&std::sync::Arc::from(""), 5, span),
+            ),
+            (
+                "resource",
+                TraceLandingRow::resource(&std::sync::Arc::from(""), 5, resource),
+            ),
+            (
+                "tag_name",
+                TraceLandingRow::tag_name(&std::sync::Arc::from(""), 5, tag_name),
+            ),
+            (
+                "tag_value",
+                TraceLandingRow::tag_value(&std::sync::Arc::from(""), 5, tag_value),
+            ),
         ]
     }
 
