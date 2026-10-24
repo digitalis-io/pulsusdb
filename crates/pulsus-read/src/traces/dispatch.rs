@@ -41,6 +41,8 @@ use pulsus_clickhouse::{ChClient, ChError, ChRow, ChRowStream, QuerySettings};
 use crate::logql::error::ReadError;
 use crate::logql::exec::escape_query_placeholders;
 
+use super::tenant_scope::TenantTerm;
+
 /// The traces read path's ClickHouse handle. Construct one per
 /// [`super::exec::TraceEngine`]; the wrapped client is never handed out.
 ///
@@ -61,14 +63,22 @@ pub(super) struct TraceDispatch {
     /// The counter the stamp's suffix comes from. Shared, so two
     /// concurrent reads through one engine cannot be given one id.
     statement_seq: std::sync::atomic::AtomicU32,
+    /// Issue #738: the request's tenant term, which every read of a trace
+    /// table in a statement this dispatcher sends must carry.
+    term: TenantTerm,
+    /// The trace tables [`Self::term`] is checked on: the ten trace tables
+    /// and each configured routed name.
+    tables: Vec<String>,
 }
 
 impl TraceDispatch {
-    pub(super) fn new(client: ChClient) -> Self {
+    pub(super) fn new(client: ChClient, term: TenantTerm, tables: Vec<String>) -> Self {
         Self {
             client,
             statement_prefix: None,
             statement_seq: std::sync::atomic::AtomicU32::new(0),
+            term,
+            tables,
         }
     }
 
@@ -82,7 +92,7 @@ impl TraceDispatch {
     /// Executes one already-rendered SQL statement and returns its row
     /// stream.
     ///
-    /// Three things happen here and nowhere else on this path:
+    /// Four things happen here and nowhere else on this path:
     ///
     /// 1. every literal `?` is doubled, so the driver's placeholder
     ///    scanner puts the byte back verbatim;
@@ -90,7 +100,9 @@ impl TraceDispatch {
     ///    FINAL text — the escaped form is never shorter than the input,
     ///    so the guard can only be tighter here than it was at the old
     ///    per-site positions;
-    /// 3. the caller's own `map_err` classifies the `ChError`, so the
+    /// 3. [`super::tenant_scope::check`] refuses a statement that reads a
+    ///    trace table without the request's tenant term (issue #738);
+    /// 4. the caller's own `map_err` classifies the `ChError`, so the
     ///    generator/metrics/read error taxonomies stay distinct (issue
     ///    #57 re-audit) despite the single choke point.
     ///
@@ -110,6 +122,10 @@ impl TraceDispatch {
     {
         let sql = escape_query_placeholders(sql);
         crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
+        // Issue #738: a statement that reads a trace table without the
+        // request's tenant term is refused here, and never sent.
+        super::tenant_scope::check(&sql, &self.term, &self.tables)
+            .map_err(|m| ReadError::Clickhouse(ChError::Decode(m)))?;
         let settings = self.stamped(settings);
         self.client
             .query_stream::<R>(&sql, &settings)

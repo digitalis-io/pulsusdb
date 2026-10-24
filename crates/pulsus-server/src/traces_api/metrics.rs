@@ -13,7 +13,9 @@
 //! endpoints are Tempo-datasource-only).
 
 use axum::extract::{RawQuery, State};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
+use pulsus_model::{Tenant, tenant_from_headers};
 
 use crate::app::AppState;
 
@@ -24,9 +26,22 @@ use super::params::{self, MetricsForm};
 /// `GET /api/traces/v1/metrics/query_range`.
 pub(crate) async fn metrics_query_range(
     State(state): State<AppState>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    match metrics_impl(state, raw.as_deref().unwrap_or(""), MetricsForm::Range).await {
+    // Issue #738: the tenant first, before any parameter is read.
+    let tenant = match tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return ApiError::Tenant(e).into_response(),
+    };
+    match metrics_impl(
+        state,
+        tenant,
+        raw.as_deref().unwrap_or(""),
+        MetricsForm::Range,
+    )
+    .await
+    {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -35,15 +50,33 @@ pub(crate) async fn metrics_query_range(
 /// `GET /api/traces/v1/metrics/query`.
 pub(crate) async fn metrics_query(
     State(state): State<AppState>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    match metrics_impl(state, raw.as_deref().unwrap_or(""), MetricsForm::Instant).await {
+    // Issue #738: the tenant first, before any parameter is read.
+    let tenant = match tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return ApiError::Tenant(e).into_response(),
+    };
+    match metrics_impl(
+        state,
+        tenant,
+        raw.as_deref().unwrap_or(""),
+        MetricsForm::Instant,
+    )
+    .await
+    {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
 }
 
-async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<Response, ApiError> {
+async fn metrics_impl(
+    state: AppState,
+    tenant: Tenant,
+    raw: &str,
+    form: MetricsForm,
+) -> Result<Response, ApiError> {
     let now_ns = super::tags::now_unix_nanos();
     let params = params::parse_metrics_params(raw, now_ns, form)?;
     // Issue #596 part 1: the reference's step limit, on the range route
@@ -85,17 +118,19 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
     let indexed = pulsus_read::traces::spans::attr_index::IndexedAttr::from_config(
         &state.config.traceql_indexed_attributes,
     );
+    let term = pulsus_read::traces::tenant_scope::TenantTerm::of(&tenant);
     let tables = pulsus_read::StatementTables {
         spans: &read_config.spans_table,
         error_spans: &read_config.error_spans_table,
         resources: &read_config.resources_table,
         traces: &read_config.traces_table,
         indexed: &indexed,
+        tenant: &term,
     };
     let plan = pulsus_read::plan_trace_metrics_routed(&query, &metrics_params, &ctx, &tables)
         .map_err(ApiError::Plan)?;
 
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, tenant).await?;
     // Issue #464 wave 2: the two routes return DIFFERENT proto messages —
     // `query_range` is `tempopb.QueryRangeResponse`, `query` is
     // `tempopb.QueryInstantResponse` (`pkg/tempopb/tempo.proto:339-355` @
@@ -155,12 +190,22 @@ mod tests {
     /// (`text/plain; charset=utf-8`, exactly once, NO `nosniff`) on the
     /// way through — this module is not a hole in that check (#384).
     async fn run_range(query: &str) -> (StatusCode, String) {
-        let res = metrics_query_range(State(test_state()), RawQuery(Some(query.to_string()))).await;
+        let res = metrics_query_range(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some(query.to_string())),
+        )
+        .await;
         error_body(res).await
     }
 
     async fn run_instant(query: &str) -> (StatusCode, String) {
-        let res = metrics_query(State(test_state()), RawQuery(Some(query.to_string()))).await;
+        let res = metrics_query(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some(query.to_string())),
+        )
+        .await;
         error_body(res).await
     }
 
@@ -329,7 +374,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_query_string_entirely_is_400() {
-        let res = metrics_query_range(State(test_state()), RawQuery(None)).await;
+        let res = metrics_query_range(State(test_state()), HeaderMap::new(), RawQuery(None)).await;
         let (status, _) = error_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }

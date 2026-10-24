@@ -366,28 +366,28 @@ async fn try_land(
             .spans
             .iter()
             .cloned()
-            .map(|s| TraceLandingRow::span(received_ms, s)),
+            .map(|s| TraceLandingRow::span(&std::sync::Arc::from(""), received_ms, s)),
     );
     rows.extend(
         parsed
             .resources
             .iter()
             .cloned()
-            .map(|r| TraceLandingRow::resource(received_ms, r)),
+            .map(|r| TraceLandingRow::resource(&std::sync::Arc::from(""), received_ms, r)),
     );
     rows.extend(
         parsed
             .tag_names
             .iter()
             .cloned()
-            .map(|t| TraceLandingRow::tag_name(received_ms, t)),
+            .map(|t| TraceLandingRow::tag_name(&std::sync::Arc::from(""), received_ms, t)),
     );
     rows.extend(
         parsed
             .tag_values
             .iter()
             .cloned()
-            .map(|t| TraceLandingRow::tag_value(received_ms, t)),
+            .map(|t| TraceLandingRow::tag_value(&std::sync::Arc::from(""), received_ms, t)),
     );
     // **Through the landing insert's own pinned settings**, which is what a
     // push carries: `materialized_views_ignore_errors = 0` among them, which
@@ -1492,8 +1492,8 @@ async fn the_insert_omits_event_id_so_the_server_fills_it() {
     let names = <TraceLandingRow as clickhouse::Row>::COLUMN_NAMES;
     assert_eq!(
         names.len(),
-        37,
-        "the table has 38 columns and the row type declares the other 37: {names:?}"
+        38,
+        "the table has 39 columns and the row type declares the other 38: {names:?}"
     );
     assert!(
         !names.contains(&"event_id"),

@@ -147,6 +147,7 @@ use super::params::{
 /// | `Read(…)` | see [`read_error_parts`] — matched exhaustively (issue #266) |
 /// | `Assemble(_)` | 500 |
 /// | `PoolUnavailable` | 503 |
+/// | `Tenant` | 400 |
 #[derive(Debug)]
 pub(crate) enum ApiError {
     Param(TraceIdError),
@@ -189,6 +190,9 @@ pub(crate) enum ApiError {
     /// serving" contract as `logs_api::error::ApiError::PoolUnavailable`
     /// (mirrors `/ready`'s 503).
     PoolUnavailable,
+    /// An invalid `X-Scope-OrgID` (issue #738): `400`, before any
+    /// parameter is read.
+    Tenant(pulsus_model::TenantError),
 }
 
 impl From<TraceIdError> for ApiError {
@@ -314,6 +318,7 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "clickhouse pool not yet established".to_string(),
             ),
+            ApiError::Tenant(e) => (StatusCode::BAD_REQUEST, e.to_string()),
         };
         plain_text_error(status, message)
     }

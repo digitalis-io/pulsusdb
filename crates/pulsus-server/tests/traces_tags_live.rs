@@ -2707,12 +2707,12 @@ async fn the_stored_attribute_type_reaches_the_wire_and_its_query_returns_the_tr
         .expect("decode system.tables row");
     drop(stream);
     assert_eq!(
-        keys.primary_key, "scope, key, value, val_type",
+        keys.primary_key, "org_id, scope, key, value, val_type",
         "the primary key must be UNCHANGED by migration 41 — it is what prunes every \
          tag-values read"
     );
     assert_eq!(
-        keys.sorting_key, "scope, key, value, val_type",
+        keys.sorting_key, "org_id, scope, key, value, val_type",
         "the sorting key must APPEND val_type — without it the ReplacingMergeTree collapses \
          a string and an int sharing the same text"
     );

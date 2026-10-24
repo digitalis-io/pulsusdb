@@ -1,6 +1,7 @@
-//! The tenant a metrics or logs request reads or writes (issues #635, #653):
-//! the validated value of its `X-Scope-OrgID` header, stored as `org_id`, the
-//! first column of every metrics and log table's sorting key.
+//! The tenant a metrics, logs or traces request reads or writes (issues #635,
+//! #653, #738): the validated value of its `X-Scope-OrgID` header, stored as
+//! `org_id`, the first column of every metrics, log and trace table's sorting
+//! key.
 //!
 //! [`Tenant::from_header`] is the only constructor, so every `Tenant` holds
 //! a value that passed its rule.

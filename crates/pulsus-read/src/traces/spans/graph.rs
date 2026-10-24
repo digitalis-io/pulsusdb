@@ -27,6 +27,7 @@
 //! text.
 
 use crate::traces::exec::GraphTarget;
+use crate::traces::tenant_scope::{MARKER_TERM, TenantTerm};
 
 /// Response cap on distinct `(client, server, conn_type)` edges the
 /// service-graph read returns (docs/api.md §4.5; promoted to config only on
@@ -65,7 +66,13 @@ fn bucket(x: i64) -> i64 {
 
 /// The per-shard statement `I`: markers, totals and the raw regions, on
 /// `edges` and `spans` as written.
-fn per_shard(w: GraphWindow, markers: &str, edges: &str, spans: &str) -> String {
+fn per_shard(
+    tenant: &TenantTerm,
+    w: GraphWindow,
+    markers: &str,
+    edges: &str,
+    spans: &str,
+) -> String {
     let (s, e) = (w.start_ns, w.end_ns);
     format!(
         "{markers}\n\
@@ -77,7 +84,7 @@ fn per_shard(w: GraphWindow, markers: &str, edges: &str, spans: &str) -> String 
         \x20    if(A < B, if(B < {e}, B - 60000000000, {e}), {e}) AS t0\n\
         SELECT client, server, conn_type, calls, failed, q\n\
         FROM {edges} FINAL\n\
-        WHERE conn_type IN ('rpc', 'messaging')\n\
+        WHERE {tenant} AND conn_type IN ('rpc', 'messaging')\n\
         \x20 AND minute >= toDateTime(intDiv(A, 1000000000), 'UTC') AND minute < toDateTime(intDiv(B, 1000000000), 'UTC')\n\
         \x20 AND client_minute >= toDateTime(intDiv(A, 1000000000), 'UTC') AND client_minute < toDateTime(intDiv(B, 1000000000), 'UTC')\n\
         UNION ALL\n\
@@ -90,7 +97,7 @@ fn per_shard(w: GraphWindow, markers: &str, edges: &str, spans: &str) -> String 
         \x20            countIf(kind IN (3, 4)) AS nc,\n\
         \x20            groupArrayIf((span_id, service, status_code, duration_ns, kind, start_ns), kind IN (2, 5)) AS ss\n\
         \x20     FROM {spans}\n\
-        \x20     WHERE ((start_ns >= {s} AND start_ns < h1\n\
+        \x20     WHERE {tenant} AND ((start_ns >= {s} AND start_ns < h1\n\
         \x20             AND intDiv(start_ns, 300000000000) >= {bucket_s} AND intDiv(start_ns, 300000000000) <= intDiv(h1 - 1, 300000000000))\n\
         \x20         OR (start_ns >= t0 AND start_ns < {e}\n\
         \x20             AND intDiv(start_ns, 300000000000) >= intDiv(t0, 300000000000) AND intDiv(start_ns, 300000000000) <= {bucket_e}))\n\
@@ -111,7 +118,7 @@ fn per_shard(w: GraphWindow, markers: &str, edges: &str, spans: &str) -> String 
 /// `I`'s marker list on a single node: the current database's own.
 fn local_markers(edges: &str) -> String {
     format!(
-        "WITH (SELECT arraySort(groupArray(minute)) FROM {edges} FINAL WHERE conn_type = '') AS ms,"
+        "WITH (SELECT arraySort(groupArray(minute)) FROM {edges} FINAL WHERE {MARKER_TERM}) AS ms,"
     )
 }
 
@@ -128,7 +135,7 @@ fn cluster_markers(cluster: &str, edges: &str) -> String {
     format!(
         "WITH (SELECT groupArray((s, h, m)) FROM (SELECT s, h, arraySort(groupArray(minute)) AS m\n\
         \x20     FROM cluster('{cluster}', view(SELECT shardNum() AS s, hostName() AS h, minute\n\
-        \x20                              FROM {edges} FINAL WHERE conn_type = ''))\n\
+        \x20                              FROM {edges} FINAL WHERE {MARKER_TERM}))\n\
         \x20     GROUP BY s, h)) AS mall,\n\
         \x20    arrayFirst(x -> x.1 = shardNum() AND x.2 = hostName(), mall).3 AS ms,"
     )
@@ -144,11 +151,22 @@ fn cluster_markers(cluster: &str, edges: &str) -> String {
 /// runs on one replica of every shard through `cluster('<c>', view(…))`
 /// with both tables qualified by that database, so each shard computes its
 /// own coverage from its own markers.
-pub fn spans_graph_sql(w: GraphWindow, target: Option<&GraphTarget>, max_edges: u64) -> String {
+pub fn spans_graph_sql(
+    tenant: &TenantTerm,
+    w: GraphWindow,
+    target: Option<&GraphTarget>,
+    max_edges: u64,
+) -> String {
     let src = match target {
         None => format!(
             "(\n{}\n)",
-            per_shard(w, &local_markers("service_edges"), "service_edges", "spans")
+            per_shard(
+                tenant,
+                w,
+                &local_markers("service_edges"),
+                "service_edges",
+                "spans"
+            )
         ),
         Some(t) => {
             let cluster = escape_quoted(&t.cluster);
@@ -156,6 +174,7 @@ pub fn spans_graph_sql(w: GraphWindow, target: Option<&GraphTarget>, max_edges: 
             format!(
                 "cluster('{cluster}', view(\n{}\n))",
                 per_shard(
+                    tenant,
                     w,
                     &cluster_markers(&cluster, &edges),
                     &edges,

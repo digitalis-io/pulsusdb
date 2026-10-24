@@ -42,8 +42,10 @@
 
 use axum::Json;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+
+use pulsus_model::{Tenant, tenant_from_headers};
 
 use crate::app::AppState;
 
@@ -54,14 +56,23 @@ use super::tags_response::{TagNamesAnswer, TagValuesAnswer};
 use super::{intrinsics, params, tags_response};
 
 /// `GET /api/traces/v1/tags` — scoped tag-name discovery.
-pub(crate) async fn tags(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
-    match tags_impl(state, raw.as_deref().unwrap_or("")).await {
+pub(crate) async fn tags(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    // Issue #738: the tenant first, before any parameter is read.
+    let tenant = match tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return ApiError::Tenant(e).into_response(),
+    };
+    match tags_impl(state, tenant, raw.as_deref().unwrap_or("")).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
 }
 
-async fn tags_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
+async fn tags_impl(state: AppState, tenant: Tenant, raw: &str) -> Result<Response, ApiError> {
     // Parse before the pool: `scope=bogus` resolves 400 without
     // ClickHouse — the search surface's parse-before-engine ordering.
     let params = params::parse_tags_params(raw)?;
@@ -83,7 +94,7 @@ async fn tags_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
             )));
         }
         scope => {
-            let (engine, floor) = (engine_for(&state).await?, catalog_floor_ns(&state)?);
+            let (engine, floor) = (engine_for(&state, tenant).await?, catalog_floor_ns(&state)?);
             engine.list_tag_names(attribute_scope(scope), floor).await?
         }
     };
@@ -199,6 +210,7 @@ impl ValuesSource {
 /// answer).
 pub(super) async fn values_for(
     state: &AppState,
+    tenant: Tenant,
     raw_tag: &str,
     raw_query: &str,
 ) -> Result<ValuesSource, ApiError> {
@@ -222,14 +234,14 @@ pub(super) async fn values_for(
                 intrinsics::intrinsic_tag_values(intrinsic),
             )),
             TagValueSource::Store => {
-                let engine = engine_for(state).await?;
+                let engine = engine_for(state, tenant).await?;
                 Ok(ValuesSource::Values(
                     engine.list_span_name_values(req).await?,
                 ))
             }
         },
         TagLookup::Attribute { scope, key } => {
-            let engine = engine_for(state).await?;
+            let engine = engine_for(state, tenant).await?;
             Ok(ValuesSource::Values(
                 engine.list_tag_values(&key, scope.as_deref(), req).await?,
             ))
@@ -243,9 +255,15 @@ pub(super) async fn values_for(
 pub(crate) async fn tag_values(
     State(state): State<AppState>,
     Path(tag): Path<String>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    match tag_values_impl(state, &tag, raw.as_deref().unwrap_or("")).await {
+    // Issue #738: the tenant first, before any parameter is read.
+    let tenant = match tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return ApiError::Tenant(e).into_response(),
+    };
+    match tag_values_impl(state, tenant, &tag, raw.as_deref().unwrap_or("")).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -253,10 +271,11 @@ pub(crate) async fn tag_values(
 
 async fn tag_values_impl(
     state: AppState,
+    tenant: Tenant,
     raw_tag: &str,
     raw_query: &str,
 ) -> Result<Response, ApiError> {
-    let source = values_for(&state, raw_tag, raw_query).await?;
+    let source = values_for(&state, tenant, raw_tag, raw_query).await?;
     let limit = params::parse_tag_limit(&params::parse_pairs(raw_query));
     Ok(ok_json(tags_response::render_tag_values(
         &source.answer(),
@@ -318,6 +337,7 @@ mod tests {
     async fn a_bogus_scope_is_400_before_the_pool() {
         let res = tags(
             State(test_state()),
+            HeaderMap::new(),
             RawQuery(Some("scope=bogus".to_string())),
         )
         .await;
@@ -330,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_well_formed_tags_request_without_a_pool_is_503() {
-        let res = tags(State(test_state()), RawQuery(None)).await;
+        let res = tags(State(test_state()), HeaderMap::new(), RawQuery(None)).await;
         let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, "clickhouse pool not yet established");
@@ -341,6 +361,7 @@ mod tests {
         let res = tag_values(
             State(test_state()),
             Path("resource.".to_string()),
+            HeaderMap::new(),
             RawQuery(None),
         )
         .await;
@@ -353,6 +374,7 @@ mod tests {
         let res = tag_values(
             State(test_state()),
             Path("service.name".to_string()),
+            HeaderMap::new(),
             RawQuery(None),
         )
         .await;

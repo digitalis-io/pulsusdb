@@ -4375,22 +4375,22 @@ fn long_key_spans_sql(base_ns: i64) -> String {
 
 /// The error-span table, from the spans, by `error_spans_mv`'s own `SELECT`
 /// (issue #601 part 4b).
-const ERROR_SPANS_FROM_SPANS: &str = "INSERT INTO error_spans SELECT trace_id, span_id, start_ns, \
+const ERROR_SPANS_FROM_SPANS: &str = "INSERT INTO error_spans SELECT org_id, trace_id, span_id, start_ns, \
      duration_ns, end_ns, service, service_type, resource_id, name, kind, status_code, \
      status_message FROM spans WHERE status_code = 2";
 
 /// The per-trace table from the spans, by `traces_mv`'s own `SELECT`.
 const TRACES_FROM_SPANS: &str = "INSERT INTO traces SELECT \
-     toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, \
+     org_id, toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, \
      s AS start_ns, e AS end_ns, r AS root, sv AS services, \
      ls AS last_start_ns, bk AS buckets \
-     FROM (SELECT trace_id, min(start_ns) AS s, \
+     FROM (SELECT org_id, trace_id, min(start_ns) AS s, \
      max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), 9223372036854775807))) AS e, \
      min((toUInt8(parent_span_id != toFixedString('', 8)), start_ns, span_id, \
      if(service_type = 'string', toString(service), ''), toString(name))) AS r, \
      groupUniqArrayIf(toString(service), service_type = 'string') AS sv, max(start_ns) AS ls, \
      groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk \
-     FROM spans GROUP BY trace_id)";
+     FROM spans GROUP BY org_id, trace_id)";
 
 /// Runs the seeding statements on `db`, their threads and memory bounded:
 /// the server is shared.
@@ -4563,6 +4563,7 @@ async fn a_covered_search_explains_its_one_statement() {
         spans_table: "spans",
         resources_table: "resources",
         indexed: &[],
+        tenant: empty_term(),
     };
     let want =
         pulsus_read::traces::spans::search::compile_search(&parsed, &ctx, "spans", "traces", 20, 3)
@@ -6455,7 +6456,7 @@ async fn insert_marker(client: &ChClient, minute_ns: i64) {
     ch_exec(
         client,
         &format!(
-            "INSERT INTO service_edges SELECT {t}, {t}, '', '', '', 0, 0, \
+            "INSERT INTO service_edges SELECT '', {t}, {t}, '', '', '', 0, 0, \
              arrayReduce('quantilesTDigestState(0.5, 0.95, 0.99)', [toInt64(0)]), 1",
             t = ch_time(minute_ns)
         ),
@@ -7307,7 +7308,7 @@ async fn the_coverage_read_touches_only_the_markers() {
     ch_exec(
         &client,
         &format!(
-            "INSERT INTO service_edges SELECT {d} + intDiv(number, 20) * 60 AS m, m, 'svc-a', \
+            "INSERT INTO service_edges SELECT '', {d} + intDiv(number, 20) * 60 AS m, m, 'svc-a', \
              concat('svc-', toString(number % 20)), 'rpc', 1, 0, \
              arrayReduce('quantilesTDigestState(0.5, 0.95, 0.99)', [toInt64(1000)]), 1 \
              FROM numbers(28800)",
@@ -7318,7 +7319,7 @@ async fn the_coverage_read_touches_only_the_markers() {
     ch_exec(
         &client,
         &format!(
-            "INSERT INTO service_edges SELECT {d} + 240 + number * 300 AS m, m, '', '', '', 0, 0, \
+            "INSERT INTO service_edges SELECT '', {d} + 240 + number * 300 AS m, m, '', '', '', 0, 0, \
              arrayReduce('quantilesTDigestState(0.5, 0.95, 0.99)', [toInt64(0)]), 1 \
              FROM numbers(288)",
             d = ch_time(day)
@@ -7568,9 +7569,9 @@ async fn a_marker_expires_with_its_bucket_start() {
         &client,
         &format!(
             "INSERT INTO service_edges VALUES \
-             ({m0}, {m0}, '', '', '', 0, 0, {q}, 1), \
-             ({x}, {x}, 'svc-a', 'svc-x', 'rpc', 1, 0, {q}, 1), \
-             ({y}, {y}, 'svc-a', 'svc-y', 'rpc', 1, 0, {q}, 1)",
+             ('', {m0}, {m0}, '', '', '', 0, 0, {q}, 1), \
+             ('', {x}, {x}, 'svc-a', 'svc-x', 'rpc', 1, 0, {q}, 1), \
+             ('', {y}, {y}, 'svc-a', 'svc-y', 'rpc', 1, 0, {q}, 1)",
             m0 = ch_time(m),
             x = ch_time(m - 4 * MINUTE),
             y = ch_time(m - MINUTE),
@@ -8895,4 +8896,21 @@ async fn a_service_name_of_any_type_answers_on_every_route() {
         wrong.len(),
         wrong.join("\n\n")
     );
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

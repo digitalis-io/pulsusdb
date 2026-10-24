@@ -1995,7 +1995,7 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
     // `SELECT 1` connectivity probe, which is not an engine dispatch.
     let engine_client = data_client(&run_db).await;
     let marker = query_log_marker(&admin).await;
-    let engine = pulsus_read::TraceEngine::new(engine_client, config);
+    let engine = pulsus_read::TraceEngine::new(engine_client, config, empty_tenant());
 
     // 1. Search — the route's statement, with the search settings; the
     //    `spans` rows above hold no attribute, so the query names the span.
@@ -2014,6 +2014,7 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
             resources: "resources",
             traces: "traces",
             indexed: &[],
+            tenant: empty_term(),
         },
         64,
     )
@@ -2071,6 +2072,7 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
             resources: "resources",
             traces: "traces",
             indexed: &[],
+            tenant: empty_term(),
         },
     )
     .expect("metric query plans");
@@ -15014,4 +15016,21 @@ fn dated_ctx(db: &str) -> SchemaParams {
         retention_days: 36_500,
         ..test_ctx(db)
     }
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

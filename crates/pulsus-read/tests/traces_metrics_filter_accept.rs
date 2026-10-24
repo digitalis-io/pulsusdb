@@ -125,6 +125,7 @@ fn derive_ours(q: &str) -> Side {
             resources: "resources",
             traces: "traces",
             indexed: &[],
+            tenant: empty_term(),
         },
     ) {
         Ok(_) => Side {
@@ -328,4 +329,21 @@ fn every_committed_reference_verdict_still_holds_against_the_pinned_oracle() {
         f.capture.reference_image,
         drifted.join("\n")
     );
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

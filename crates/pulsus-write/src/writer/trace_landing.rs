@@ -125,7 +125,11 @@ pub(crate) fn charge_of(landing: &ParsedTraceLanding) -> u64 {
 /// orders what is stored, and every consumer matches rows by `row_kind`.
 /// `received_ms` is taken once per push, so a block lies in one landing
 /// partition.
-pub(crate) fn rows_of(received_ms: i64, landing: ParsedTraceLanding) -> Vec<TraceLandingRow> {
+pub(crate) fn rows_of(
+    org_id: &Arc<str>,
+    received_ms: i64,
+    landing: ParsedTraceLanding,
+) -> Vec<TraceLandingRow> {
     let ParsedTraceLanding {
         spans,
         resources,
@@ -138,22 +142,22 @@ pub(crate) fn rows_of(received_ms: i64, landing: ParsedTraceLanding) -> Vec<Trac
     rows.extend(
         spans
             .into_iter()
-            .map(|s| TraceLandingRow::span(received_ms, s)),
+            .map(|s| TraceLandingRow::span(org_id, received_ms, s)),
     );
     rows.extend(
         resources
             .into_iter()
-            .map(|r| TraceLandingRow::resource(received_ms, r)),
+            .map(|r| TraceLandingRow::resource(org_id, received_ms, r)),
     );
     rows.extend(
         tag_names
             .into_iter()
-            .map(|t| TraceLandingRow::tag_name(received_ms, t)),
+            .map(|t| TraceLandingRow::tag_name(org_id, received_ms, t)),
     );
     rows.extend(
         tag_values
             .into_iter()
-            .map(|t| TraceLandingRow::tag_value(received_ms, t)),
+            .map(|t| TraceLandingRow::tag_value(org_id, received_ms, t)),
     );
     rows
 }

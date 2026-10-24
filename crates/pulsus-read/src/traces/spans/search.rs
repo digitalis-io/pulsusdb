@@ -79,6 +79,7 @@ use crate::traces::PlanError;
 use crate::traces::exec::{
     ByteBudget, RootSummary, SearchOutput, TraceSearchResult, output_reserve_bytes,
 };
+use crate::traces::tenant_scope::TenantTerm;
 use crate::traces::values::{
     GroupCardinalityCounter, GroupValue, SpanSetGroup, SpanSummary, group_double_bits,
     group_reserve_bytes, groups_reserve_bytes, match_reserve_bytes, summary_reserve_bytes,
@@ -92,7 +93,7 @@ use pulsus_clickhouse::ChError;
 const TRACE_READ: &str = r"LEFT JOIN (SELECT trace_id, min(start_ns) AS start_ns, max(end_ns) AS end_ns,
                   min(root) AS r, if(r.1 = 0, {root_service}, '') AS root_service, if(r.1 = 0, {root_name}, '') AS root_name
            FROM {traces}
-           WHERE trace_id IN (SELECT arrayJoin(top.1))
+           WHERE {tenant} AND trace_id IN (SELECT arrayJoin(top.1))
            GROUP BY trace_id) AS t USING trace_id
 ORDER BY last DESC, trace_id ASC";
 
@@ -103,7 +104,7 @@ const SEARCH: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupArray(k
       FROM ({scope_top}SELECT trace_id, max(start_ns) AS last,
                    groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
             FROM {spans}
-            WHERE {top_time}
+            WHERE {tenant} AND {top_time}
               AND {top_bucket}
               AND {top_day}
               AND ({predicate})
@@ -124,7 +125,7 @@ FROM ({scope_detail}SELECT trace_id, max(start_ns) AS last, count() AS matched,
 /// prefix, the window's three bounds and the predicate. Read once per span
 /// identity unless the statement keeps `final` (issue #601 part 4a).
 const DETAIL_FROM: &str = r"{spans}
-      WHERE (intDiv(start_ns, 300000000000), trace_id) IN
+      WHERE {tenant} AND (intDiv(start_ns, 300000000000), trace_id) IN
             {keys}
         AND {time}
         AND {bucket}
@@ -147,13 +148,13 @@ const SEARCH_TRACE_LEVEL: &str = r"WITH (SELECT groupArray((trace_id, lst, fst, 
                    max(end_ns) - min(start_ns) AS duration, min(root) AS r,
                    if(r.1 = 0, {root_service}, '') AS root_service, if(r.1 = 0, {root_name}, '') AS root_name
             FROM {traces}
-            WHERE {days}
+            WHERE {tenant} AND {days}
             GROUP BY trace_id
             HAVING lst >= {first} AND fst <= {last} AND ({having}))) AS cand,
      (SELECT (groupArray(trace_id), groupArray(last))
       FROM (SELECT trace_id, max(start_ns) AS last
             FROM {spans}
-            WHERE (intDiv(start_ns, 300000000000), trace_id) IN
+            WHERE {tenant} AND (intDiv(start_ns, 300000000000), trace_id) IN
                   (SELECT arrayJoin(arrayFlatten(arrayMap(x -> arrayMap(k -> (k, x.1), arrayFilter(k -> {within}, x.4)),
                                                           arrayFilter(x -> NOT (x.3 >= {first} AND x.2 <= {last}), cand)))))
               AND {time}
@@ -193,7 +194,7 @@ const WINDOW_KEYS: &str = ",
      (SELECT arrayFlatten(groupArray(arrayMap(k -> (k, trace_id), arrayFilter(k -> {within}, bk))))
       FROM (SELECT trace_id, groupUniqArrayArray(buckets) AS bk
             FROM {traces}
-            WHERE {days} AND trace_id IN (SELECT arrayJoin(top.1))
+            WHERE {tenant} AND {days} AND trace_id IN (SELECT arrayJoin(top.1))
             GROUP BY trace_id)) AS tb";
 
 /// The detail read's key set when the top-K read a slice (issue #595):
@@ -219,7 +220,7 @@ FROM ({detail}) AS m
 const TOP_PLAIN: &str = r"{scope_top}SELECT trace_id, max(start_ns) AS last,
                    groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
             FROM {spans}
-            WHERE {top_time}
+            WHERE {tenant} AND {top_time}
               AND {top_bucket}
               AND {top_day}
               AND ({predicate})
@@ -233,7 +234,7 @@ const TOP_PLAIN: &str = r"{scope_top}SELECT trace_id, max(start_ns) AS last,
 const CANDIDATES: &str = r"(SELECT (groupArray(trace_id), groupArray(keys))
       FROM ({scope_top}SELECT trace_id, groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
             FROM {spans}
-            WHERE {top_time}
+            WHERE {tenant} AND {top_time}
               AND {top_bucket}
               AND {top_day}
               AND ({predicate})
@@ -241,7 +242,7 @@ const CANDIDATES: &str = r"(SELECT (groupArray(trace_id), groupArray(keys))
      (SELECT arrayFlatten(groupArray(arrayMap(k -> (k, trace_id), arrayFilter(k -> {within}, bk))))
       FROM (SELECT trace_id, groupUniqArrayArray(buckets) AS bk
             FROM {traces}
-            WHERE {days} AND trace_id IN (SELECT arrayJoin(cand.1))
+            WHERE {tenant} AND {days} AND trace_id IN (SELECT arrayJoin(cand.1))
             GROUP BY trace_id)) AS cand_keys,
      ";
 
@@ -433,7 +434,9 @@ pub fn compile_search_filter(
 /// [`super::predicate::span_membership_sql`] does: a resource subquery
 /// bounded by one window's days inside a statement bounded by another is a
 /// wrong answer.
+#[allow(clippy::too_many_arguments)]
 pub fn search_sql(
+    tenant: &TenantTerm,
     spans_table: &str,
     traces_table: &str,
     w: WindowSql,
@@ -442,13 +445,24 @@ pub fn search_sql(
     limit: u32,
     spss: u32,
 ) -> String {
-    search_sql_at(spans_table, traces_table, w, None, f, proj, limit, spss)
+    search_sql_at(
+        tenant,
+        spans_table,
+        traces_table,
+        w,
+        None,
+        f,
+        proj,
+        limit,
+        spss,
+    )
 }
 
 /// [`search_sql`], a [`SearchFilter::One`]'s top-K reading `slice`, the
 /// newest part of `w`, when one is given (issue #595).
 #[allow(clippy::too_many_arguments)]
 pub fn search_sql_at(
+    tenant: &TenantTerm,
     spans_table: &str,
     traces_table: &str,
     w: WindowSql,
@@ -460,6 +474,7 @@ pub fn search_sql_at(
 ) -> String {
     let keeps = keeps_final(f, proj);
     search_sql_kept(
+        tenant,
         spans_table,
         traces_table,
         w,
@@ -493,6 +508,7 @@ pub fn keeps_final(f: &SearchFilter, proj: &Projection) -> bool {
 /// `final` or keep one row per span identity.
 #[allow(clippy::too_many_arguments)]
 fn search_sql_kept(
+    tenant: &TenantTerm,
     spans_table: &str,
     traces_table: &str,
     w: WindowSql,
@@ -512,6 +528,7 @@ fn search_sql_kept(
     let trace_read = fill(
         TRACE_READ,
         &[
+            ("tenant", tenant.as_str()),
             ("traces", traces_table),
             ("root_service", &ceiling_sql("r.4")),
             ("root_name", &ceiling_sql("r.5")),
@@ -530,7 +547,7 @@ fn search_sql_kept(
     // Issue #594 part 2: the numbering, scoped per read.
     let numbered = predicates.iter().any(|p| p.reads_numbering());
     let top_w = slice.unwrap_or(w);
-    let mut scalars = per_trace_sql(&trace_leaves, child_counts, w, traces_table);
+    let mut scalars = per_trace_sql(tenant, &trace_leaves, child_counts, w, traces_table);
     // Issue #594 part 3: the per-trace values read as operands, over the
     // traces reaching the part of the window the top-K reads.
     let mut values: Vec<TraceValue> = Vec::new();
@@ -539,18 +556,23 @@ fn search_sql_kept(
             values.push(*v);
         }
     }
-    scalars.push_str(&trace_values_sql(&values, top_w, w, traces_table));
+    scalars.push_str(&trace_values_sql(tenant, &values, top_w, w, traces_table));
     if numbered {
-        scalars.push_str(&keys_sql(top_w, w, traces_table));
+        scalars.push_str(&keys_sql(tenant, top_w, w, traces_table));
     }
     let (scope_top, scope_detail, after_top) = if numbered {
-        (SCOPE_TOP, SCOPE_DETAIL, after_top_sql(spans_table))
+        (SCOPE_TOP, SCOPE_DETAIL, after_top_sql(tenant, spans_table))
     } else if proj.reads_numbers() {
-        ("", "", returned_numbers_sql(spans_table, traces_table, w))
+        (
+            "",
+            "",
+            returned_numbers_sql(tenant, spans_table, traces_table, w),
+        )
     } else {
         ("", "", String::new())
     };
-    let common: [(&str, &str); 12] = [
+    let common: [(&str, &str); 13] = [
+        ("tenant", tenant.as_str()),
         ("scalars", &scalars),
         ("scope_top", scope_top),
         ("scope_detail", scope_detail),
@@ -578,6 +600,7 @@ fn search_sql_kept(
                     fill(
                         WINDOW_KEYS,
                         &[
+                            ("tenant", tenant.as_str()),
                             ("within", &w.bucket_within("k")),
                             ("traces", traces_table),
                             ("days", &w.per_trace_day_clause()),
@@ -589,6 +612,7 @@ fn search_sql_kept(
             let detail = fill(
                 DETAIL_FROM,
                 &[
+                    ("tenant", tenant.as_str()),
                     ("spans", spans_table),
                     ("keys", keys),
                     ("time", &time),
@@ -679,7 +703,7 @@ fn search_sql_kept(
             let base = |is_top: bool, keys_cond: &str| -> Src {
                 let scope = if is_top { scope_top } else { scope_detail };
                 let read = format!(
-                    "{spans_table}\nWHERE {keys_cond}{time}\n  AND {bucket}\n  AND {day}\n  AND ({sel})"
+                    "{spans_table}\nWHERE {tenant} AND {keys_cond}{time}\n  AND {bucket}\n  AND {day}\n  AND ({sel})"
                 );
                 let mut named = fold.columns(is_top);
                 if !is_top {
@@ -730,6 +754,7 @@ fn search_sql_kept(
                 fill(
                     TOP_PLAIN,
                     &[
+                        ("tenant", tenant.as_str()),
                         ("scope_top", scope_top),
                         ("spans", spans_table),
                         ("top_time", &top_time),
@@ -743,6 +768,7 @@ fn search_sql_kept(
                 candidates = fill(
                     CANDIDATES,
                     &[
+                        ("tenant", tenant.as_str()),
                         ("scope_top", scope_top),
                         ("spans", spans_table),
                         ("top_time", &top_time),
@@ -770,7 +796,7 @@ fn search_sql_kept(
                 "(SELECT arrayJoin(cand.1))".to_string()
             } else {
                 format!(
-                    "(SELECT trace_id FROM {traces_table} WHERE {} AND last_start_ns >= {} AND start_ns <= {})",
+                    "(SELECT trace_id FROM {traces_table} WHERE {tenant} AND {} AND last_start_ns >= {} AND start_ns <= {})",
                     w.per_trace_day_clause(),
                     top.first_included_ns(),
                     top.last_included_ns()
@@ -782,6 +808,7 @@ fn search_sql_kept(
                 }
                 for (n, v) in k.sql.values.iter().enumerate() {
                     let text = group_values_sql(
+                        tenant,
                         *v,
                         w,
                         spans_table,
@@ -799,6 +826,7 @@ fn search_sql_kept(
                     fill(
                         WINDOW_KEYS,
                         &[
+                            ("tenant", tenant.as_str()),
                             ("within", &w.bucket_within("k")),
                             ("traces", traces_table),
                             ("days", &w.per_trace_day_clause()),
@@ -812,6 +840,7 @@ fn search_sql_kept(
             for (j, k) in fold.keys.iter().enumerate() {
                 for (n, v) in k.sql.values.iter().enumerate() {
                     group_values.push_str(&group_values_sql(
+                        tenant,
                         *v,
                         w,
                         spans_table,
@@ -1277,6 +1306,7 @@ pub fn compile_search_sliced(
     };
     let sql = match trace_level {
         Some(body) => trace_level_sql(
+            ctx.tenant,
             spans_table,
             traces_table,
             ctx.window,
@@ -1286,6 +1316,7 @@ pub fn compile_search_sliced(
             spss,
         )?,
         None => search_sql_kept(
+            ctx.tenant,
             spans_table,
             traces_table,
             ctx.window,
@@ -1412,6 +1443,7 @@ fn trace_having(expr: &FieldExpr) -> Result<String, PlanError> {
 /// identity.
 #[allow(clippy::too_many_arguments)]
 fn trace_level_sql(
+    tenant: &TenantTerm,
     spans_table: &str,
     traces_table: &str,
     w: WindowSql,
@@ -1429,6 +1461,7 @@ fn trace_level_sql(
     let detail = fill(
         DETAIL_FROM,
         &[
+            ("tenant", tenant.as_str()),
             ("spans", spans_table),
             ("keys", KEYS_WHOLE),
             ("time", &time),
@@ -1440,6 +1473,7 @@ fn trace_level_sql(
     let trace_read = fill(
         TRACE_READ,
         &[
+            ("tenant", tenant.as_str()),
             ("traces", traces_table),
             ("root_service", &ceiling_sql("r.4")),
             ("root_name", &ceiling_sql("r.5")),
@@ -1453,6 +1487,7 @@ fn trace_level_sql(
     Ok(fill(
         SEARCH_TRACE_LEVEL,
         &[
+            ("tenant", tenant.as_str()),
             ("root_service", &ceiling_sql("r.4")),
             ("root_name", &ceiling_sql("r.5")),
             ("traces", traces_table),
@@ -1522,6 +1557,7 @@ pub fn plan_search_request(
         },
     };
     plan_statement_sliced(
+        tables.tenant,
         &request,
         tables.spans,
         tables.traces,
@@ -1535,7 +1571,9 @@ pub fn plan_search_request(
 
 /// The search statement for `request`, its top-K reading the newest
 /// `slice_ns` of the window when given (issue #595).
+#[allow(clippy::too_many_arguments)]
 pub fn plan_statement_sliced(
+    tenant: &TenantTerm,
     request: &SearchRequest,
     spans_table: &str,
     traces_table: &str,
@@ -1556,6 +1594,7 @@ pub fn plan_statement_sliced(
         spans_table,
         resources_table,
         indexed,
+        tenant,
     };
     compile_search_sliced(
         &request.query,
@@ -1849,6 +1888,7 @@ mod charge_tests {
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         };
         compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles")
     }
@@ -2028,6 +2068,7 @@ mod charge_tests {
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         };
         let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");
         let grouping = s.grouping().expect("grouped");
@@ -2086,6 +2127,7 @@ mod charge_tests {
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         };
         let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");
         let grouping = s.grouping().expect("an aggregate is one group");
@@ -2149,6 +2191,7 @@ mod charge_tests {
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         };
         let nests = |query: &str| {
             let q = pulsus_traceql::parse(query).expect("parses");

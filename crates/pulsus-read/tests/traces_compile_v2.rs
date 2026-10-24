@@ -48,13 +48,15 @@ const END_NS: i64 = 1_700_010_800_000_000_000;
 /// request's own.
 const STEP_MS: i64 = 400_000;
 
-const TABLES: StatementTables<'static> = StatementTables {
-    spans: "spans",
-    error_spans: "error_spans",
-    resources: "resources",
-    traces: "traces",
-    indexed: &[],
-};
+static TABLES: std::sync::LazyLock<StatementTables<'static>> =
+    std::sync::LazyLock::new(|| StatementTables {
+        spans: "spans",
+        error_spans: "error_spans",
+        resources: "resources",
+        traces: "traces",
+        indexed: &[],
+        tenant: empty_term(),
+    });
 
 /// The search statement the empty selector compiles to over the window.
 fn search_statements() -> Vec<(&'static str, String)> {
@@ -71,8 +73,17 @@ fn search_statements() -> Vec<(&'static str, String)> {
         64,
     )
     .expect("the empty selector plans");
-    let statement = plan_statement_sliced(&request, "spans", "traces", "resources", 64, &[], None)
-        .expect("the empty selector compiles");
+    let statement = plan_statement_sliced(
+        empty_term(),
+        &request,
+        "spans",
+        "traces",
+        "resources",
+        64,
+        &[],
+        None,
+    )
+    .expect("the empty selector compiles");
     vec![("search statement", statement.sql().to_string())]
 }
 
@@ -103,6 +114,7 @@ fn metrics_statement() -> String {
 /// The service-graph statement on a single node.
 fn graph_statement() -> String {
     spans_graph_sql(
+        empty_term(),
         GraphWindow {
             start_ns: START_NS,
             end_ns: END_NS,
@@ -114,6 +126,7 @@ fn graph_statement() -> String {
 
 fn fetch_statement() -> String {
     pulsus_read::traces::spans::fetch::indexed_fetch_sql(
+        empty_term(),
         "traces",
         "spans",
         "resources",
@@ -130,9 +143,11 @@ fn tag_values_statement() -> String {
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: empty_term(),
         },
     );
     name_values_sql(
+        empty_term(),
         "spans",
         "traces",
         w,
@@ -524,11 +539,11 @@ fn t_c4_the_membership_statement_is_frozen_whole() {
         compile_span_predicate(&filter_body(r#"{ span.http.response.status_code != 200 }"#))
             .expect("T-A1 compiles");
     assert_eq!(
-        span_membership_sql("spans", t_b1_window(), &predicate),
+        span_membership_sql(empty_term(), "spans", t_b1_window(), &predicate),
         format!(
             "SELECT lower(hex(span_id)) AS id\n\
          FROM spans\n\
-         WHERE start_ns >= 1790094846486853636 AND start_ns < 1790094846486853637\n\
+         WHERE org_id = '' AND start_ns >= 1790094846486853636 AND start_ns < 1790094846486853637\n\
          \x20 AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1790094846486853636, 300000000000) \
          AND intDiv(1790094846486853636, 300000000000)\n\
          \x20 AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-09-22') AND \
@@ -914,13 +929,14 @@ fn ctx() -> PredicateCtx<'static> {
         spans_table: "spans",
         resources_table: "resources",
         indexed: &[],
+        tenant: empty_term(),
     }
 }
 
 /// `R(p)` — section 3.1's resource subquery, from `W`'s own day bound.
 fn r_of(p: &str) -> String {
     format!(
-        "resource_id IN (SELECT resource_id FROM resources WHERE {} AND ({p}))",
+        "resource_id IN (SELECT resource_id FROM resources WHERE org_id = '' AND {} AND ({p}))",
         t_b1_window().resources_day_clause()
     )
 }
@@ -1243,7 +1259,7 @@ fn refusal_in(query: &str) -> PlanError {
 fn t_c15_a_resource_leaf_carries_its_window_inline() {
     assert_eq!(
         rendered_in(r#"{ resource.k8s.pod.name = "payment-a" }"#),
-        "resource_id IN (SELECT resource_id FROM resources WHERE \
+        "resource_id IN (SELECT resource_id FROM resources WHERE org_id = '' AND \
          day >= toDate(fromUnixTimestamp64Nano(1790094846486853636), 'UTC') \
          AND day <= toDate(fromUnixTimestamp64Nano(1790094846486853636), 'UTC') AND \
          ((coalesce(attrs.`k8s%2Epod%2Ename`.:String = 'payment-a', false) OR \
@@ -1259,7 +1275,9 @@ fn t_c15_a_resource_leaf_carries_its_window_inline() {
         &ctx(),
     )
     .expect("compiles");
-    assert!(span_membership_sql("spans", t_b1_window(), &p).contains("resource_id IN"));
+    assert!(
+        span_membership_sql(empty_term(), "spans", t_b1_window(), &p).contains("resource_id IN")
+    );
 }
 
 #[test]
@@ -1271,7 +1289,7 @@ fn t_c15_a_resource_predicate_refuses_another_window() {
     )
     .expect("compiles");
     let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
-    let _ = span_membership_sql("spans", other, &p);
+    let _ = span_membership_sql(empty_term(), "spans", other, &p);
 }
 
 // ---------------------------------------------------------------------
@@ -1680,7 +1698,7 @@ fn t_c21_the_unscoped_chain_is_built_from_each_scopes_own_text() {
         rendered_in(r#"{ .k != "v" }"#),
         format!(
             "multiIf((dynamicType(attrs.`k`) {held}), {c_span}, \
-             resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
+             resource_id IN (SELECT resource_id FROM resources WHERE org_id = '' AND {d} AND \
              (dynamicType(attrs.`k`) {held})), {}, \
              arrayExists(d -> dynamicType(d) {held}, events.attrs.`k`), {}, \
              arrayExists(d -> dynamicType(d) {held}, links.attrs.`k`), {}, \
@@ -2060,11 +2078,11 @@ fn t_c23_not_over_an_event_link_or_unscoped_field_demands_a_boolean() {
 fn t_c24_the_chain_needs_the_window_and_the_element_scopes_do_not() {
     let d = t_b1_window().resources_day_clause();
     let r_present = format!(
-        "resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
+        "resource_id IN (SELECT resource_id FROM resources WHERE org_id = '' AND {d} AND \
          (dynamicType(attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')))"
     );
     let r_true = format!(
-        "resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
+        "resource_id IN (SELECT resource_id FROM resources WHERE org_id = '' AND {d} AND \
          (coalesce(attrs.`k`.:Bool = true, false)))"
     );
     assert_eq!(
@@ -2100,7 +2118,7 @@ fn t_c24_the_chain_needs_the_window_and_the_element_scopes_do_not() {
     let p = compile_span_predicate(&filter_body(r#"{ event.k = 1 }"#)).expect("compiles");
     // No resource subquery, so no window is carried: another window composes.
     let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
-    assert!(span_membership_sql("spans", other, &p).contains("arrayExists"));
+    assert!(span_membership_sql(empty_term(), "spans", other, &p).contains("arrayExists"));
 }
 
 // =====================================================================
@@ -2220,7 +2238,7 @@ fn ff_resource_path(key: &str) -> String {
 fn q_of(path: &str) -> String {
     format!(
         "(SELECT (groupArray(resource_id), groupArray((dynamicType({path}), toString({path}))), \
-         groupUniqArray(dynamicType({path}))) FROM resources WHERE {} AND \
+         groupUniqArray(dynamicType({path}))) FROM resources WHERE org_id = '' AND {} AND \
          dynamicType({path}) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))",
         t_b1_window().resources_day_clause()
     )
@@ -2710,7 +2728,7 @@ fn t_c28_a_resource_operand_refuses_another_window() {
     let p = compile_span_predicate_in(&filter_body(r#"{ resource.a = span.b }"#), &ctx())
         .expect("compiles");
     let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
-    let _ = span_membership_sql("spans", other, &p);
+    let _ = span_membership_sql(empty_term(), "spans", other, &p);
 }
 
 // =====================================================================
@@ -3848,7 +3866,7 @@ fn t_c37_a_chain_operand_refuses_another_window() {
     let p =
         compile_span_predicate_in(&filter_body(r#"{ .a = span.b }"#), &ctx()).expect("compiles");
     let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
-    let _ = span_membership_sql("spans", other, &p);
+    let _ = span_membership_sql(empty_term(), "spans", other, &p);
 }
 
 /// `T-C38`'s leaf cells: what `compile_span_leaf_in` answered for each of
@@ -4695,6 +4713,7 @@ fn search_predicate(
 fn t_b4_the_search_statement_carries_the_bucket_bound() {
     let p = search_predicate("{}", &ctx());
     let sql = search_sql(
+        empty_term(),
         "spans",
         "traces",
         t_b1_window(),
@@ -4821,6 +4840,7 @@ fn search_golden(stem: &str, query: &str, limit: u32, spss: u32) -> String {
         spans_table: "spans",
         resources_table: "resources",
         indexed: &[],
+        tenant: empty_term(),
     };
     let parsed =
         pulsus_traceql::parse(query).unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
@@ -4885,6 +4905,7 @@ fn search_sql_rejects_another_windows_predicate() {
     let p = search_predicate(r#"{ resource.k = "x" }"#, &ctx());
     let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
     let _ = search_sql(
+        empty_term(),
         "spans",
         "traces",
         other,
@@ -5013,6 +5034,7 @@ fn route_accepts(query: &str) -> bool {
             resources: "resources",
             traces: "traces",
             indexed: &[],
+            tenant: empty_term(),
         },
         64,
     )
@@ -5344,6 +5366,7 @@ fn a_filter_hints_only_what_its_body_requires() {
         spans_table: "spans",
         resources_table: "resources",
         indexed: &indexed,
+        tenant: empty_term(),
     };
     let req = |v: &str| format!("indexHint(has({}, '{v}'))", span_expr("app%2Erequest%2Eid"));
     let mut wrong = Vec::new();
@@ -5495,7 +5518,10 @@ fn a_trace_value_reads_the_traces_its_top_k_reads() {
                 count(sql, "SETTINGS max_block_size = 256"),
                 count(sql, " AND trace_id IN (SELECT arrayJoin(top.1))"),
             ),
-            (values, keys, numbering, values),
+            // The per-trace read's own trace id condition follows its
+            // tenant term (issue #738), so it is counted once beside the
+            // lookups'.
+            (values, keys, numbering, values + 1),
             "{query}: {sql}"
         );
     }
@@ -5518,9 +5544,9 @@ fn a_count_or_number_operand_joins_the_read_spans() {
     assert!(
         c.starts_with(&format!(
             "(trace_id, span_id) IN (SELECT trace_id, span_id FROM spans LEFT JOIN (SELECT \
-             trace_id, parent_span_id AS span_id, count() AS pv_children FROM spans WHERE {keys} \
+             trace_id, parent_span_id AS span_id, count() AS pv_children FROM spans WHERE org_id = '' AND {keys} \
              AND parent_span_id != toFixedString('', 8) GROUP BY trace_id, parent_span_id) AS \
-             pv_c USING (trace_id, span_id) WHERE {keys} AND ("
+             pv_c USING (trace_id, span_id) WHERE org_id = '' AND {keys} AND ("
         )) && count(&c, "pv_n") == 0,
         "{c}"
     );
@@ -5746,8 +5772,8 @@ fn a_structural_statement_nests_its_reads() {
 /// is keyed on the slice's candidates; whole, each reads the window.
 #[test]
 fn a_sliced_structural_statement_reads_only_its_candidates() {
-    let unscoped = "FROM spans WHERE start_ns >= ";
-    let scoped = "FROM spans WHERE (intDiv(start_ns, 300000000000), trace_id) IN \
+    let unscoped = "FROM spans WHERE org_id = '' AND start_ns >= ";
+    let scoped = "FROM spans WHERE org_id = '' AND (intDiv(start_ns, 300000000000), trace_id) IN \
                   (SELECT arrayJoin(arrayConcat(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), \
                   cand.1, cand.2)), cand_keys)))";
     let slice = WindowSql::start_closed_end_open(T_B1_END - 300_000_000_000, T_B1_END);
@@ -5912,4 +5938,21 @@ fn a_by_expression_key_compiles_or_is_refused_by_name() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

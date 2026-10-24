@@ -721,8 +721,8 @@ docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:596	not_in_th
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:71	not_in_this_repository
 docs/query-lowering.md	crates/pulsus-read/tests/golden_sql_freeze.rs:508	pinned_to_another_version
 docs/query-lowering.md	crates/pulsus-read/tests/logqltest/corpus/b16_label_replace.test:1-12	no_name_the_target_file_holds
-docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:270-304	no_name_the_target_file_holds
-docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:304	no_name_the_target_file_holds
+docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:274-308	no_name_the_target_file_holds
+docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:308	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-write/src/protocols/otlp_traces.rs:760	pinned_to_another_version
 docs/query-lowering.md	docs/decisions/0008-sql-composition-for-lowered-pipelines.md:201	no_name_the_target_file_holds
 docs/query-lowering.md	exec.rs:114	ambiguous_basename
@@ -848,7 +848,7 @@ docs/query-to-sql.md	crates/pulsus-read/src/traces/exec.rs:3267	pinned_to_anothe
 docs/query-to-sql.md	crates/pulsus-read/src/traces/search_plan.rs:1932	not_in_this_repository
 docs/query-to-sql.md	crates/pulsus-read/tests/logqltest/corpus/b2_formatters.test:165	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-schema/src/checks.rs:29	no_name_the_target_file_holds
-docs/query-to-sql.md	crates/pulsus-server/src/traces_api/error.rs:303	no_name_the_target_file_holds
+docs/query-to-sql.md	crates/pulsus-server/src/traces_api/error.rs:307	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-server/tests/traces_search_live.rs:1285	no_name_the_target_file_holds
 docs/query-to-sql.md	decisions/0008-sql-composition-for-lowered-pipelines.md:199-203	no_name_the_target_file_holds
 docs/query-to-sql.md	docs/decisions/0008-sql-composition-for-lowered-pipelines.md:201	no_name_the_target_file_holds
@@ -1039,9 +1039,9 @@ docs/query-to-sql.md	sql.rs:829	ambiguous_basename
 docs/query-to-sql.md	sql.rs:877	ambiguous_basename
 docs/query-to-sql.md	traces/exec.rs:1011	pinned_to_another_version
 docs/query-to-sql.md	traces/exec.rs:126	pinned_to_another_version
-docs/query-to-sql.md	traces/exec.rs:1276	no_name_the_target_file_holds
+docs/query-to-sql.md	traces/exec.rs:1322	no_name_the_target_file_holds
 docs/query-to-sql.md	traces/exec.rs:131	pinned_to_another_version
-docs/query-to-sql.md	traces/exec.rs:1317	no_name_the_target_file_holds
+docs/query-to-sql.md	traces/exec.rs:1363	no_name_the_target_file_holds
 docs/query-to-sql.md	traces/exec.rs:1413	pinned_to_another_version
 docs/query-to-sql.md	traces/exec.rs:148	no_name_the_target_file_holds
 docs/query-to-sql.md	traces/exec.rs:3162	pinned_to_another_version
@@ -1051,7 +1051,7 @@ docs/query-to-sql.md	traces/metrics_sql.rs:89	not_in_this_repository
 docs/query-to-sql.md	traces/search_plan.rs:1121	not_in_this_repository
 docs/query-to-sql.md	traces/search_sql.rs:109-111	not_in_this_repository
 docs/query-to-sql.md	traces/search_sql.rs:170	not_in_this_repository
-docs/query-to-sql.md	traces_api/error.rs:385	no_name_the_target_file_holds
+docs/query-to-sql.md	traces_api/error.rs:390	no_name_the_target_file_holds
 docs/reference-defects-we-do-not-copy.md	block_traceql.go:3681-3692	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	block_traceql.go:66-104	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	docs/sources/query/log_queries/_index.md:232	not_in_this_repository

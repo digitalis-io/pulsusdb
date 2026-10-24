@@ -5,6 +5,8 @@
 //! everything traces do not have: no fingerprints and no label sets (so no
 //! `collisions`).
 
+use pulsus_model::Tenant;
+
 use crate::ingest::{AdmitRefusal, FlushWait, PushHeaders};
 
 /// The boundary the OTLP traces handler hands a decoded push across:
@@ -18,11 +20,17 @@ use crate::ingest::{AdmitRefusal, FlushWait, PushHeaders};
 /// admits — is a decode-class failure that leaves through each route's
 /// whole-request error writer, and an [`AdmitRefusal`] carries no decode
 /// class. `push` carries the request's `Idempotency-Key`/`Retry-Attempt`
-/// headers.
+/// headers. `tenant` is the request's `X-Scope-OrgID` (issue #738),
+/// validated by the handler before anything else it does.
 pub trait TraceSink: Send + Sync {
     /// Admits `landing` for async-mode requests: the caller responds
     /// immediately once this returns `Ok`.
-    fn admit(&self, landing: ParsedTraceLanding, push: PushHeaders) -> Result<(), AdmitRefusal>;
+    fn admit(
+        &self,
+        tenant: &Tenant,
+        landing: ParsedTraceLanding,
+        push: PushHeaders,
+    ) -> Result<(), AdmitRefusal>;
 
     /// Admits `landing` for sync-mode requests: the caller `.await`s the
     /// returned [`FlushWait`], which resolves once the landing insert has
@@ -30,6 +38,7 @@ pub trait TraceSink: Send + Sync {
     /// original push's** outcome.
     fn admit_flush(
         &self,
+        tenant: &Tenant,
         landing: ParsedTraceLanding,
         push: PushHeaders,
     ) -> Result<FlushWait, AdmitRefusal>;

@@ -12,7 +12,7 @@ FROM (SELECT g, o, empty(cells) AS none, c.1 AS p, c.2 AS v, if(isNaN(v), CAST((
 FROM (SELECT g, o, groupArray((p, v, ex)) AS cells, throwIf(count() OVER () > 1000, 'metrics series cap') AS over
 FROM (SELECT arrayMap(x -> if(x.2 IN ('n', 'N'), ('', x.2), x), [(toString(nb.np), 'i')]) AS g, toUInt64(0) AS o, intDiv(start_ns - 1, 60000000000) + 1 - 29856666 AS p, toFloat64(count()) / 60 AS v, argMax((trace_id, start_ns, duration_ns), (duration_ns, span_id)) AS ex
 FROM spans
-LEFT JOIN (WITH (SELECT groupArray((k, trace_id)) FROM (SELECT trace_id, arrayJoin(bk) AS k FROM (SELECT trace_id, groupUniqArrayArray(buckets) AS bk FROM traces WHERE day >= toDate(fromUnixTimestamp64Nano(1791313500000000001), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1791497220000000000), 'UTC') GROUP BY trace_id HAVING max(last_start_ns) >= 1791399900000000001 AND min(start_ns) <= 1791410820000000000))) AS nested_keys SELECT trace_id, sp.1 AS span_id, nl, nr, np FROM (SELECT trace_id, s, n, lft, rgt,
+LEFT JOIN (WITH (SELECT groupArray((k, trace_id)) FROM (SELECT trace_id, arrayJoin(bk) AS k FROM (SELECT trace_id, groupUniqArrayArray(buckets) AS bk FROM traces WHERE org_id = '' AND day >= toDate(fromUnixTimestamp64Nano(1791313500000000001), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1791497220000000000), 'UTC') GROUP BY trace_id HAVING max(last_start_ns) >= 1791399900000000001 AND min(start_ns) <= 1791410820000000000))) AS nested_keys SELECT trace_id, sp.1 AS span_id, nl, nr, np FROM (SELECT trace_id, s, n, lft, rgt,
        arrayMap((l, p) -> if(l = 0, 0, p), lft,
                 arrayMap(x -> x.2, arraySort(x -> x.1, arrayFilter(x -> x.1 > 0,
                   arrayMap((a, b) -> if(a.2 = 1, (a.3, b.4), (0, 0)), pl, arrayFill(z -> z.2 = 0, pl)))))) AS par
@@ -62,10 +62,10 @@ FROM (SELECT trace_id, s, n, pidx, lft, rgt,
                                            arrayMap((v, root) -> if(root, 0, v), pidx0, isroot) AS pidx
                                     FROM (SELECT trace_id, arraySort(x -> (x.3, x.1), groupArray((span_id, parent_span_id, start_ns))) AS s
                                           FROM spans
-                                          WHERE (intDiv(start_ns, 300000000000), trace_id) IN (SELECT arrayJoin(nested_keys))
+                                          WHERE org_id = '' AND (intDiv(start_ns, 300000000000), trace_id) IN (SELECT arrayJoin(nested_keys))
                                           GROUP BY trace_id
                                           SETTINGS max_block_size = 256)))))))) ARRAY JOIN s AS sp, lft AS nl, rgt AS nr, par AS np) AS nb USING (trace_id, span_id)
-WHERE start_ns >= 1791399900000000001 AND start_ns < 1791410820000000001
+WHERE org_id = '' AND start_ns >= 1791399900000000001 AND start_ns < 1791410820000000001
   AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791399900000000001, 300000000000) AND intDiv(1791410820000000000, 300000000000)
   AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-07') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-07')
   AND (true)
@@ -80,7 +80,7 @@ ORDER BY g, o
 SELECT g, o, [(toInt64(1791410820000), v)] AS points, CAST([], 'Array(Tuple(FixedString(16), Int64, Float64))') AS exemplars, 0 AS f
 FROM (SELECT g, o, v FROM (SELECT g, o, v, throwIf(count() OVER () > 1000, 'metrics series cap') AS over FROM (SELECT arrayMap(x -> if(x.2 IN ('n', 'N'), ('', x.2), x), [(toString(nb.np), 'i')]) AS g, toUInt64(0) AS o, toFloat64(count()) / 10800 AS v
 FROM spans
-LEFT JOIN (WITH (SELECT groupArray((k, trace_id)) FROM (SELECT trace_id, arrayJoin(bk) AS k FROM (SELECT trace_id, groupUniqArrayArray(buckets) AS bk FROM traces WHERE day >= toDate(fromUnixTimestamp64Nano(1791313600000000000), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1791497199999999999), 'UTC') GROUP BY trace_id HAVING max(last_start_ns) >= 1791400000000000000 AND min(start_ns) <= 1791410799999999999))) AS nested_keys SELECT trace_id, sp.1 AS span_id, nl, nr, np FROM (SELECT trace_id, s, n, lft, rgt,
+LEFT JOIN (WITH (SELECT groupArray((k, trace_id)) FROM (SELECT trace_id, arrayJoin(bk) AS k FROM (SELECT trace_id, groupUniqArrayArray(buckets) AS bk FROM traces WHERE org_id = '' AND day >= toDate(fromUnixTimestamp64Nano(1791313600000000000), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1791497199999999999), 'UTC') GROUP BY trace_id HAVING max(last_start_ns) >= 1791400000000000000 AND min(start_ns) <= 1791410799999999999))) AS nested_keys SELECT trace_id, sp.1 AS span_id, nl, nr, np FROM (SELECT trace_id, s, n, lft, rgt,
        arrayMap((l, p) -> if(l = 0, 0, p), lft,
                 arrayMap(x -> x.2, arraySort(x -> x.1, arrayFilter(x -> x.1 > 0,
                   arrayMap((a, b) -> if(a.2 = 1, (a.3, b.4), (0, 0)), pl, arrayFill(z -> z.2 = 0, pl)))))) AS par
@@ -130,10 +130,10 @@ FROM (SELECT trace_id, s, n, pidx, lft, rgt,
                                            arrayMap((v, root) -> if(root, 0, v), pidx0, isroot) AS pidx
                                     FROM (SELECT trace_id, arraySort(x -> (x.3, x.1), groupArray((span_id, parent_span_id, start_ns))) AS s
                                           FROM spans
-                                          WHERE (intDiv(start_ns, 300000000000), trace_id) IN (SELECT arrayJoin(nested_keys))
+                                          WHERE org_id = '' AND (intDiv(start_ns, 300000000000), trace_id) IN (SELECT arrayJoin(nested_keys))
                                           GROUP BY trace_id
                                           SETTINGS max_block_size = 256)))))))) ARRAY JOIN s AS sp, lft AS nl, rgt AS nr, par AS np) AS nb USING (trace_id, span_id)
-WHERE start_ns >= 1791400000000000000 AND start_ns < 1791410800000000000
+WHERE org_id = '' AND start_ns >= 1791400000000000000 AND start_ns < 1791410800000000000
   AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791400000000000000, 300000000000) AND intDiv(1791410799999999999, 300000000000)
   AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-07') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-07')
   AND (true)

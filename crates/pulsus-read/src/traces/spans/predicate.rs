@@ -200,6 +200,9 @@ pub struct PredicateCtx<'a> {
     /// The operator-named attribute indexes (issue #595 part 2) a search
     /// filter's hints may reach; empty where none are configured.
     pub indexed: &'a [super::attr_index::IndexedAttr],
+    /// The request's tenant (issue #738), the first conjunct of every read
+    /// of a trace table the predicate renders.
+    pub tenant: &'a crate::traces::tenant_scope::TenantTerm,
 }
 
 /// Compiles one spanset filter body with no context. A `resource.` field
@@ -451,7 +454,12 @@ pub(super) fn any_element_held(root: &str, key: &str) -> String {
 /// `lower(hex(span_id)) < '0a1b2c3d4e5f60a4'` bound answers nothing where
 /// the un-aliased spelling answers one row. Any predicate reading
 /// `span_id` — the whole `span:id` family — is wrong under that alias.
-pub fn span_membership_sql(spans_table: &str, w: WindowSql, p: &SpanPredicate) -> String {
+pub fn span_membership_sql(
+    tenant: &crate::traces::tenant_scope::TenantTerm,
+    spans_table: &str,
+    w: WindowSql,
+    p: &SpanPredicate,
+) -> String {
     assert!(
         p.composes_with(w),
         "span_membership_sql: the predicate was compiled for a different window"
@@ -459,7 +467,7 @@ pub fn span_membership_sql(spans_table: &str, w: WindowSql, p: &SpanPredicate) -
     format!(
         "SELECT lower(hex(span_id)) AS id\n\
          FROM {spans_table}\n\
-         WHERE {time}\n\
+         WHERE {tenant} AND {time}\n\
          \x20 AND {bucket}\n\
          \x20 AND {day}\n\
          \x20 AND ({pred})\n\
@@ -813,8 +821,9 @@ impl<'a> Compiler<'a> {
         let ctx = self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
         self.uses_resources = true;
         Ok(format!(
-            "resource_id IN (SELECT resource_id FROM {} WHERE {} AND ({p}))",
+            "resource_id IN (SELECT resource_id FROM {} WHERE {} AND {} AND ({p}))",
             ctx.resources_table,
+            ctx.tenant,
             ctx.window.resources_day_clause()
         ))
     }
@@ -837,9 +846,10 @@ impl<'a> Compiler<'a> {
         let path = attr_path(ATTRS, key);
         Ok(format!(
             "(SELECT (groupArray(resource_id), groupArray((dynamicType({path}), \
-             toString({path}))), groupUniqArray(dynamicType({path}))) FROM {} WHERE {} AND \
+             toString({path}))), groupUniqArray(dynamicType({path}))) FROM {} WHERE {} AND {} AND \
              dynamicType({path}) {HELD})",
             ctx.resources_table,
+            ctx.tenant,
             ctx.window.resources_day_clause()
         ))
     }
@@ -856,8 +866,9 @@ impl<'a> Compiler<'a> {
             "(SELECT (groupArray(resource_id), groupArray((toString({p}), \
              multiIf(dynamicType({p}) = 'Int64', 'i', dynamicType({p}) = 'Float64', 'd', \
              dynamicType({p}) = 'Bool', 'b', dynamicType({p}) = 'String', 's', 'a')))) \
-             FROM {} WHERE {} AND dynamicType({p}) {HELD})",
+             FROM {} WHERE {} AND {} AND dynamicType({p}) {HELD})",
             ctx.resources_table,
+            ctx.tenant,
             ctx.window.resources_day_clause()
         );
         let h = fnv1a(&l);
@@ -1139,8 +1150,13 @@ impl<'a> Compiler<'a> {
                     Value::Number(raw) if sql_op(op).is_some() => render_number(raw)?,
                     _ => String::new(),
                 };
-                let (sql, numbered) =
-                    nested_leaf(*i, op, value, &rendered, self.ctx.map(|c| c.spans_table))?;
+                let (sql, numbered) = nested_leaf(
+                    *i,
+                    op,
+                    value,
+                    &rendered,
+                    self.ctx.map(|c| (c.tenant, c.spans_table)),
+                )?;
                 self.numbered += usize::from(numbered);
                 Ok(sql)
             }
@@ -1167,7 +1183,14 @@ impl<'a> Compiler<'a> {
                     .to_string(),
             )
         })?;
-        let sql = child_leaf(op, value, &render_number(raw)?, ctx.window, ctx.spans_table)?;
+        let sql = child_leaf(
+            ctx.tenant,
+            op,
+            value,
+            &render_number(raw)?,
+            ctx.window,
+            ctx.spans_table,
+        )?;
         self.uses_resources = true;
         self.child_counts = true;
         Ok(sql)
@@ -1319,12 +1342,12 @@ impl<'a> Compiler<'a> {
         }
         // Issue #594 part 4: a comparison reading a child count or a
         // number is the membership of the read's spans joined to them.
-        let spans = self
+        let (tenant, spans) = self
             .ctx
-            .map(|c| c.spans_table)
+            .map(|c| (c.tenant, c.spans_table))
             .expect("span_value refuses with no context");
         self.numbered += 1;
-        Ok(span_values_membership(&compared, read, spans))
+        Ok(span_values_membership(tenant, &compared, read, spans))
     }
 
     /// [`Compiler::compare`] within the comparison's own frame.

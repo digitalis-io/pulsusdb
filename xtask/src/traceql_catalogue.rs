@@ -259,12 +259,16 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     };
     let rc = TraceReadConfig::from_config(&config);
     let indexed = IndexedAttr::from_config(&config.traceql_indexed_attributes);
+    // The fixture is pushed with no header: the empty tenant's.
+    let tenant = pulsus_model::Tenant::from_header(None, false)?;
+    let term = pulsus_read::traces::tenant_scope::TenantTerm::of(&tenant);
     let tables = StatementTables {
         spans: &rc.spans_table,
         error_spans: &rc.error_spans_table,
         resources: &rc.resources_table,
         traces: &rc.traces_table,
         indexed: &indexed,
+        tenant: &term,
     };
     let ctx = MetricsCtx {
         scan_budget_rows: rc.scan_budget_rows,
@@ -292,6 +296,7 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         let engine = TraceEngine::new(
             ChClient::from_shared_pool(pool.clone(), TIMEOUT),
             rc.clone(),
+            tenant.clone(),
         )
         .with_statement_prefix(&prefix);
         (engine, prefix)

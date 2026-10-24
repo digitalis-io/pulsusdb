@@ -301,6 +301,7 @@ mod tests {
                 query: pulsus_traceql::parse(q).expect("parses"),
             };
             let stmt = crate::traces::spans::search::plan_statement_sliced(
+                crate::traces::tenant_scope::empty_term(),
                 &request,
                 "spans",
                 "traces",

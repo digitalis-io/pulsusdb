@@ -2992,7 +2992,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `modules/frontend/pipeline/async_query_validator_middleware.go:51,54`
   @ v3.0.2)
   and does not prefix a plan refusal (`ApiError::Plan`,
-  `crates/pulsus-server/src/traces_api/error.rs:303`). Both were measured
+  `crates/pulsus-server/src/traces_api/error.rs:307`). Both were measured
   on 2026-09-08 against a server on this branch: the body below came back
   unprefixed from `/api/traces/v1/search`, while
   `{ resource.service.name = "grp492" } | { 1 }` came back from the same

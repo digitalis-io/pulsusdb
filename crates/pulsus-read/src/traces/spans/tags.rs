@@ -43,6 +43,7 @@
 //! the same rule and are rejected in
 //! `traces_api::params::parse_range_params`.
 
+use crate::traces::tenant_scope::TenantTerm;
 use pulsus_clickhouse::json_column::escape_json_path;
 use pulsus_traceql::{
     AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, FieldOp, SpansetExpr, SpansetFilter, Value,
@@ -85,11 +86,16 @@ fn catalog_floor(floor_ns: i64) -> i64 {
 /// to [`ATTR_SCOPES`] (an `IN` list on the same leading column), and to
 /// rows whose latest span started at or after `floor_ns`, the retention
 /// floor (issue #496): a name is listed only while a span carrying it is.
-pub fn tag_names_sql(scope_literal: Option<&str>, floor_ns: i64, limit: usize) -> String {
+pub fn tag_names_sql(
+    tenant: &TenantTerm,
+    scope_literal: Option<&str>,
+    floor_ns: i64,
+    limit: usize,
+) -> String {
     let mut sql = format!("SELECT DISTINCT scope, key\nFROM {TAG_NAMES_TABLE}\n");
     match scope_literal {
-        Some(scope) => sql.push_str(&format!("WHERE scope = {scope}\n")),
-        None => sql.push_str(&format!("WHERE scope IN {ATTR_SCOPES_IN}\n")),
+        Some(scope) => sql.push_str(&format!("WHERE {tenant} AND scope = {scope}\n")),
+        None => sql.push_str(&format!("WHERE {tenant} AND scope IN {ATTR_SCOPES_IN}\n")),
     }
     sql.push_str(&format!(
         "  AND last_start_ns >= {}\n",
@@ -109,13 +115,14 @@ pub fn tag_names_sql(scope_literal: Option<&str>, floor_ns: i64, limit: usize) -
 ///
 /// Confined, as [`tag_names_sql`] is, to rows at or after `floor_ns`.
 pub fn tag_values_sql(
+    tenant: &TenantTerm,
     key_literal: &str,
     scope_literal: Option<&str>,
     floor_ns: i64,
     limit: usize,
 ) -> String {
     let mut sql = format!(
-        "SELECT DISTINCT value AS val, val_type\nFROM {TAG_VALUES_TABLE}\nWHERE key = {key_literal}"
+        "SELECT DISTINCT value AS val, val_type\nFROM {TAG_VALUES_TABLE}\nWHERE {tenant} AND key = {key_literal}"
     );
     match scope_literal {
         Some(scope) => sql.push_str(&format!(" AND scope = {scope}")),
@@ -172,9 +179,9 @@ pub fn table_reads(shape: TagShape, n: &TagNarrowing) -> u64 {
 
 /// The 5-minute bucket that holds the window's `r`-th newest span: an
 /// ordered read of `start_ns` alone.
-fn cut_sql(spans: &str, w: WindowSql, r: u64) -> String {
+fn cut_sql(tenant: &TenantTerm, spans: &str, w: WindowSql, r: u64) -> String {
     format!(
-        "(SELECT min(b) FROM (SELECT intDiv(start_ns, 300000000000) AS b FROM {spans} WHERE {} AND {} AND {} ORDER BY b DESC LIMIT {r})) AS cut",
+        "(SELECT min(b) FROM (SELECT intDiv(start_ns, 300000000000) AS b FROM {spans} WHERE {tenant} AND {} AND {} AND {} ORDER BY b DESC LIMIT {r})) AS cut",
         w.span_time_clause(),
         w.span_bucket_clause(),
         w.span_day_clause()
@@ -399,10 +406,17 @@ fn pred_line(n: &TagNarrowing, indent: &str) -> String {
 }
 
 /// The statement's `WITH`: the cut alone, or with the trace-level prefix.
-fn with_clause(traces: &str, spans: &str, w: WindowSql, n: &TagNarrowing, r: u64) -> String {
-    let tl = trace_prefix(traces, spans, w, n, r);
+fn with_clause(
+    tenant: &TenantTerm,
+    traces: &str,
+    spans: &str,
+    w: WindowSql,
+    n: &TagNarrowing,
+    r: u64,
+) -> String {
+    let tl = trace_prefix(tenant, traces, spans, w, n, r);
     if tl.is_empty() {
-        format!("WITH {}\n", cut_sql(spans, w, r))
+        format!("WITH {}\n", cut_sql(tenant, spans, w, r))
     } else {
         tl
     }
@@ -420,7 +434,14 @@ fn pred_inline(n: &TagNarrowing) -> String {
 /// `traces` over the window's days ±1 and restricted to the trace ids of
 /// the spans the read covers, the span conjuncts applied. Empty when the
 /// predicate reads no trace leaf.
-fn trace_prefix(traces: &str, spans: &str, w: WindowSql, n: &TagNarrowing, r: u64) -> String {
+fn trace_prefix(
+    tenant: &TenantTerm,
+    traces: &str,
+    spans: &str,
+    w: WindowSql,
+    n: &TagNarrowing,
+    r: u64,
+) -> String {
     let Some(p) = n.predicate() else {
         return String::new();
     };
@@ -446,8 +467,8 @@ fn trace_prefix(traces: &str, spans: &str, w: WindowSql, n: &TagNarrowing, r: u6
         .join(",\n     ");
     let spred = n.span_predicate().map_or("1", |p| p.sql());
     format!(
-        "WITH {cut},\n     (SELECT tuple({elements})\n      FROM (SELECT trace_id, max(end_ns) - min(start_ns) AS duration, min(root) AS r,\n                   if(r.1 = 0, {service}, '') AS root_service, if(r.1 = 0, {name}, '') AS root_name\n            FROM {traces}\n            WHERE {tdays}\n              AND trace_id GLOBAL IN (SELECT trace_id FROM {spans} WHERE {time} AND {bucket} AND {day} AND {NEWER} AND ({spred}))\n            GROUP BY trace_id)) AS per_trace,\n     {aliases}\n",
-        cut = cut_sql(spans, w, r),
+        "WITH {cut},\n     (SELECT tuple({elements})\n      FROM (SELECT trace_id, max(end_ns) - min(start_ns) AS duration, min(root) AS r,\n                   if(r.1 = 0, {service}, '') AS root_service, if(r.1 = 0, {name}, '') AS root_name\n            FROM {traces}\n            WHERE {tenant} AND {tdays}\n              AND trace_id GLOBAL IN (SELECT trace_id FROM {spans} WHERE {tenant} AND {time} AND {bucket} AND {day} AND {NEWER} AND ({spred}))\n            GROUP BY trace_id)) AS per_trace,\n     {aliases}\n",
+        cut = cut_sql(tenant, spans, w, r),
         service = ceiling_sql("r.4"),
         name = ceiling_sql("r.5"),
         tdays = w.per_trace_day_clause(),
@@ -460,6 +481,7 @@ fn trace_prefix(traces: &str, spans: &str, w: WindowSql, n: &TagNarrowing, r: u6
 /// The span-name read (N): the capped names of the spans starting in the
 /// window, newest bucket first, narrowed by `n`'s predicate.
 pub fn name_values_sql(
+    tenant: &TenantTerm,
     spans: &str,
     traces: &str,
     w: WindowSql,
@@ -468,8 +490,8 @@ pub fn name_values_sql(
     limit: usize,
 ) -> String {
     format!(
-        "{with}SELECT DISTINCT {cap} AS val\nFROM {spans}\nWHERE {time}\n  AND {bucket}\n  AND {day}\n  AND {NEWER}{pred}\nORDER BY val\nLIMIT {limit}",
-        with = with_clause(traces, spans, w, n, r),
+        "{with}SELECT DISTINCT {cap} AS val\nFROM {spans}\nWHERE {tenant} AND {time}\n  AND {bucket}\n  AND {day}\n  AND {NEWER}{pred}\nORDER BY val\nLIMIT {limit}",
+        with = with_clause(tenant, traces, spans, w, n, r),
         cap = byte_cap_expr("name"),
         time = w.span_time_clause(),
         bucket = w.span_bucket_clause(),
@@ -483,6 +505,7 @@ pub fn name_values_sql(
 /// first. `key` is raw; it is escaped here, into a JSON path identifier.
 #[allow(clippy::too_many_arguments)]
 pub fn narrowed_values_sql(
+    tenant: &TenantTerm,
     spans: &str,
     resources: &str,
     traces: &str,
@@ -493,7 +516,7 @@ pub fn narrowed_values_sql(
     r: u64,
     limit: usize,
 ) -> String {
-    let prefix = with_clause(traces, spans, w, n, r);
+    let prefix = with_clause(tenant, traces, spans, w, n, r);
     let time = w.span_time_clause();
     let bucket = w.span_bucket_clause();
     let day = w.span_day_clause();
@@ -506,12 +529,12 @@ pub fn narrowed_values_sql(
         )
     };
     let resource_ids = format!(
-        "(service, resource_id) IN (SELECT service, resource_id FROM {spans} WHERE {time} AND {bucket} AND {day} AND {NEWER}{})",
+        "(service, resource_id) IN (SELECT service, resource_id FROM {spans} WHERE {tenant} AND {time} AND {bucket} AND {day} AND {NEWER}{})",
         pred_inline(n)
     );
     let from_spans = |arr: String| {
         format!(
-            "{prefix}SELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {spans}\n  ARRAY JOIN {arr} AS e\n  WHERE {time}\n    AND {bucket}\n    AND {day}\n    AND {NEWER}{pred})\nORDER BY val, val_type\nLIMIT {limit}",
+            "{prefix}SELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {spans}\n  ARRAY JOIN {arr} AS e\n  WHERE {tenant} AND {time}\n    AND {bucket}\n    AND {day}\n    AND {NEWER}{pred})\nORDER BY val, val_type\nLIMIT {limit}",
             pred = pred_line(n, "    "),
         )
     };
@@ -523,13 +546,13 @@ pub fn narrowed_values_sql(
         // The span rows' strings, and the resource rows' values of every
         // other type (issue #493).
         ValueScope::Resource if key == "service.name" => format!(
-            "{prefix}SELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {spans}\n  ARRAY JOIN {SERVICE_ARR} AS e\n  WHERE {time} AND {bucket} AND {day} AND {NEWER}{pred}\n  UNION ALL\n  SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {resources}\n  ARRAY JOIN {rarr} AS e\n  WHERE {rday} AND {resource_ids})\nORDER BY val, val_type\nLIMIT {limit}",
+            "{prefix}SELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {spans}\n  ARRAY JOIN {SERVICE_ARR} AS e\n  WHERE {tenant} AND {time} AND {bucket} AND {day} AND {NEWER}{pred}\n  UNION ALL\n  SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {resources}\n  ARRAY JOIN {rarr} AS e\n  WHERE {tenant} AND {rday} AND {resource_ids})\nORDER BY val, val_type\nLIMIT {limit}",
             pred = pred_inline(n),
             rarr = elems(&attr_path("attrs", key)),
             rday = w.resources_day_clause(),
         ),
         ValueScope::Resource => format!(
-            "{prefix}SELECT DISTINCT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\nFROM {resources}\nARRAY JOIN {arr} AS e\nWHERE {rday}\n  AND {resource_ids}\nORDER BY val, val_type\nLIMIT {limit}",
+            "{prefix}SELECT DISTINCT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\nFROM {resources}\nARRAY JOIN {arr} AS e\nWHERE {tenant} AND {rday}\n  AND {resource_ids}\nORDER BY val, val_type\nLIMIT {limit}",
             arr = elems(&attr_path("attrs", key)),
             rday = w.resources_day_clause(),
         ),
@@ -544,7 +567,7 @@ pub fn narrowed_values_sql(
                 parts.push(SERVICE_ARR.to_string());
             }
             format!(
-                "{prefix}SELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {spans}\n  ARRAY JOIN arrayConcat({all}) AS e\n  WHERE {time} AND {bucket} AND {day} AND {NEWER}{pred}\n  UNION ALL\n  SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {resources}\n  ARRAY JOIN {rarr} AS e\n  WHERE {rday} AND {resource_ids})\nORDER BY val, val_type\nLIMIT {limit}",
+                "{prefix}SELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {spans}\n  ARRAY JOIN arrayConcat({all}) AS e\n  WHERE {tenant} AND {time} AND {bucket} AND {day} AND {NEWER}{pred}\n  UNION ALL\n  SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {resources}\n  ARRAY JOIN {rarr} AS e\n  WHERE {tenant} AND {rday} AND {resource_ids})\nORDER BY val, val_type\nLIMIT {limit}",
                 all = parts.join(", "),
                 pred = pred_inline(n),
                 rarr = elems(&attr_path("attrs", key)),
@@ -580,6 +603,7 @@ pub const CATALOGUE_CAP: usize = 101;
 /// JSON path the catalogue stores.
 #[allow(clippy::too_many_arguments)]
 pub fn catalogue_values_sql(
+    tenant: &TenantTerm,
     service: &str,
     key: &str,
     lo: i64,
@@ -597,14 +621,14 @@ pub fn catalogue_values_sql(
     let over = CATALOGUE_CAP - 1;
     let mut sql = format!(
         "WITH (SELECT max(length(v)) > {over} FROM (SELECT groupUniqArrayMerge({CATALOGUE_CAP})(vals) AS v FROM {TAG_BUCKET_VALUES_TABLE}
-      WHERE {groups} GROUP BY bucket)) AS over
+      WHERE {tenant} AND {groups} GROUP BY bucket)) AS over
 SELECT toUInt8(greatest(ifNull(over, 0), ifNull((SELECT count() > 0 FROM ({})), 0))) AS overflowed,
        arraySlice(arraySort(groupUniqArray((val, val_type))), 1, {limit}) AS vals
 FROM (
     SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type
     FROM (SELECT arrayJoin(groupUniqArrayMerge({CATALOGUE_CAP})(vals)) AS e FROM {TAG_BUCKET_VALUES_TABLE}
-          WHERE NOT over AND {groups}\n          GROUP BY bucket)",
-        array_service_resources(resources, rday, &svc)
+          WHERE {tenant} AND NOT over AND {groups}\n          GROUP BY bucket)",
+        array_service_resources(tenant, resources, rday, &svc)
     );
     for edge in edges {
         sql.push_str(&format!(
@@ -652,9 +676,14 @@ const SERVICE_BUCKET_RESOURCES_TABLE: &str = "service_bucket_resources";
 /// answered from them: the span key's read reports it as an overflow, the
 /// resource key's read returns a marker row first, and today's statement
 /// answers in both.
-pub fn array_service_resources(resources: &str, rday: &str, svc: &str) -> String {
+pub fn array_service_resources(
+    tenant: &TenantTerm,
+    resources: &str,
+    rday: &str,
+    svc: &str,
+) -> String {
     format!(
-        "SELECT resource_id FROM {resources} WHERE {rday} AND \
+        "SELECT resource_id FROM {resources} WHERE {tenant} AND {rday} AND \
          has(attrs.`service%2Ename`.:`Array(Nullable(String))`, {svc})"
     )
 }
@@ -662,9 +691,14 @@ pub fn array_service_resources(resources: &str, rday: &str, svc: &str) -> String
 /// One partial edge of a service-narrowed resource values read (issue
 /// #601 part 4c): the `(service, resource_id)` of the spans in `w` that
 /// `pred` keeps, with no cut.
-pub fn resource_edge_sql(spans: &str, w: WindowSql, pred: Option<&SpanPredicate>) -> String {
+pub fn resource_edge_sql(
+    tenant: &TenantTerm,
+    spans: &str,
+    w: WindowSql,
+    pred: Option<&SpanPredicate>,
+) -> String {
     format!(
-        "SELECT service, resource_id FROM {spans} WHERE {} AND {} AND {}{}",
+        "SELECT service, resource_id FROM {spans} WHERE {tenant} AND {} AND {} AND {}{}",
         w.span_time_clause(),
         w.span_bucket_clause(),
         w.span_day_clause(),
@@ -681,6 +715,7 @@ pub fn resource_edge_sql(spans: &str, w: WindowSql, pred: Option<&SpanPredicate>
 /// `key` are raw; both are escaped here.
 #[allow(clippy::too_many_arguments)]
 pub fn catalogue_resource_values_sql(
+    tenant: &TenantTerm,
     service: &str,
     key: &str,
     lo: i64,
@@ -692,7 +727,7 @@ pub fn catalogue_resource_values_sql(
 ) -> String {
     let svc = crate::logql::escape::ch_string(service);
     let mut set = format!(
-        "SELECT service, resource_id FROM {SERVICE_BUCKET_RESOURCES_TABLE}\n      WHERE service = {svc} AND bucket BETWEEN {lo} AND {hi}"
+        "SELECT service, resource_id FROM {SERVICE_BUCKET_RESOURCES_TABLE}\n      WHERE {tenant} AND service = {svc} AND bucket BETWEEN {lo} AND {hi}"
     );
     for edge in edges {
         set.push_str(&format!("\n      UNION ALL {edge}"));
@@ -701,8 +736,8 @@ pub fn catalogue_resource_values_sql(
     // holds `service.name` as a string array containing `service`, which
     // the catalogue cannot see; the caller then runs today's statement.
     format!(
-        "SELECT val, val_type FROM (\n  SELECT DISTINCT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {resources}\n  ARRAY JOIN {arr} AS e\n  WHERE {rday}\n    AND (service, resource_id) IN (\n      {set})\n  ORDER BY val, val_type\n  LIMIT {limit}\n  UNION ALL\n  SELECT '' AS val, '{ARRAY_SERVICE_MARK}' AS val_type\n  WHERE (SELECT count() > 0 FROM ({})))\nORDER BY val_type = '{ARRAY_SERVICE_MARK}' DESC, val, val_type\nLIMIT {}",
-        array_service_resources(resources, rday, &svc),
+        "SELECT val, val_type FROM (\n  SELECT DISTINCT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {resources}\n  ARRAY JOIN {arr} AS e\n  WHERE {tenant} AND {rday}\n    AND (service, resource_id) IN (\n      {set})\n  ORDER BY val, val_type\n  LIMIT {limit}\n  UNION ALL\n  SELECT '' AS val, '{ARRAY_SERVICE_MARK}' AS val_type\n  WHERE (SELECT count() > 0 FROM ({})))\nORDER BY val_type = '{ARRAY_SERVICE_MARK}' DESC, val, val_type\nLIMIT {}",
+        array_service_resources(tenant, resources, rday, &svc),
         limit + 1,
         arr = elems(&attr_path("attrs", key)),
     )
@@ -725,13 +760,14 @@ mod tests {
     fn scoped_tag_names_sql_is_byte_exact() {
         assert_eq!(
             tag_names_sql(
+                crate::traces::tenant_scope::empty_term(),
                 Some(&ch_string("resource")),
                 1_700_000_000_000_000_000,
                 TAG_NAMES_MAX + 1
             ),
             "SELECT DISTINCT scope, key\n\
              FROM tag_names\n\
-             WHERE scope = 'resource'\n\
+             WHERE org_id = '' AND scope = 'resource'\n\
              \x20 AND last_start_ns >= 1700000000000000000\n\
              ORDER BY scope, key\n\
              LIMIT 10001"
@@ -741,10 +777,15 @@ mod tests {
     #[test]
     fn unscoped_tag_names_sql_is_byte_exact() {
         assert_eq!(
-            tag_names_sql(None, 1_700_000_000_000_000_000, TAG_NAMES_MAX + 1),
+            tag_names_sql(
+                crate::traces::tenant_scope::empty_term(),
+                None,
+                1_700_000_000_000_000_000,
+                TAG_NAMES_MAX + 1
+            ),
             "SELECT DISTINCT scope, key\n\
              FROM tag_names\n\
-             WHERE scope IN ('event', 'instrumentation', 'link', 'resource', 'span')\n\
+             WHERE org_id = '' AND scope IN ('event', 'instrumentation', 'link', 'resource', 'span')\n\
              \x20 AND last_start_ns >= 1700000000000000000\n\
              ORDER BY scope, key\n\
              LIMIT 10001"
@@ -755,6 +796,7 @@ mod tests {
     fn scoped_tag_values_sql_is_byte_exact() {
         assert_eq!(
             tag_values_sql(
+                crate::traces::tenant_scope::empty_term(),
                 &ch_string("service.name"),
                 Some(&ch_string("resource")),
                 1_700_000_000_000_000_000,
@@ -762,7 +804,7 @@ mod tests {
             ),
             "SELECT DISTINCT value AS val, val_type\n\
              FROM tag_values\n\
-             WHERE key = 'service.name' AND scope = 'resource' \
+             WHERE org_id = '' AND key = 'service.name' AND scope = 'resource' \
              AND last_start_ns >= 1700000000000000000\n\
              ORDER BY val, val_type\n\
              LIMIT 1001"
@@ -773,6 +815,7 @@ mod tests {
     fn unscoped_tag_values_sql_is_byte_exact() {
         assert_eq!(
             tag_values_sql(
+                crate::traces::tenant_scope::empty_term(),
                 &ch_string("service.name"),
                 None,
                 1_700_000_000_000_000_000,
@@ -780,7 +823,7 @@ mod tests {
             ),
             "SELECT DISTINCT value AS val, val_type\n\
              FROM tag_values\n\
-             WHERE key = 'service.name' AND scope IN ('event', 'instrumentation', 'link', \
+             WHERE org_id = '' AND key = 'service.name' AND scope IN ('event', 'instrumentation', 'link', \
              'resource', 'span') AND last_start_ns >= 1700000000000000000\n\
              ORDER BY val, val_type\n\
              LIMIT 1001"
@@ -792,8 +835,19 @@ mod tests {
     #[test]
     fn the_floor_of_the_largest_retention_renders_as_zero() {
         for sql in [
-            tag_names_sql(None, i64::MIN, TAG_NAMES_MAX + 1),
-            tag_values_sql(&ch_string("k"), None, i64::MIN, TAG_VALUES_MAX + 1),
+            tag_names_sql(
+                crate::traces::tenant_scope::empty_term(),
+                None,
+                i64::MIN,
+                TAG_NAMES_MAX + 1,
+            ),
+            tag_values_sql(
+                crate::traces::tenant_scope::empty_term(),
+                &ch_string("k"),
+                None,
+                i64::MIN,
+                TAG_VALUES_MAX + 1,
+            ),
         ] {
             assert!(sql.contains("last_start_ns >= 0"), "{sql}");
             assert!(!sql.contains("-9223372036854775808"), "{sql}");
@@ -805,13 +859,14 @@ mod tests {
     #[test]
     fn a_pre_escaped_hostile_key_stays_a_string_literal() {
         let sql = tag_values_sql(
+            crate::traces::tenant_scope::empty_term(),
             &ch_string("k'; DROP TABLE x; --"),
             None,
             0,
             TAG_VALUES_MAX + 1,
         );
         assert!(
-            sql.contains("WHERE key = 'k\\'; DROP TABLE x; --'"),
+            sql.contains("WHERE org_id = '' AND key = 'k\\'; DROP TABLE x; --'"),
             "{sql}"
         );
     }
@@ -835,10 +890,32 @@ mod tests {
         let scope = ch_string("resource");
         let key = ch_string("service.name");
         for sql in [
-            tag_names_sql(Some(&scope), 0, TAG_NAMES_MAX + 1),
-            tag_names_sql(None, 0, TAG_NAMES_MAX + 1),
-            tag_values_sql(&key, Some(&scope), 0, TAG_VALUES_MAX + 1),
-            tag_values_sql(&key, None, 0, TAG_VALUES_MAX + 1),
+            tag_names_sql(
+                crate::traces::tenant_scope::empty_term(),
+                Some(&scope),
+                0,
+                TAG_NAMES_MAX + 1,
+            ),
+            tag_names_sql(
+                crate::traces::tenant_scope::empty_term(),
+                None,
+                0,
+                TAG_NAMES_MAX + 1,
+            ),
+            tag_values_sql(
+                crate::traces::tenant_scope::empty_term(),
+                &key,
+                Some(&scope),
+                0,
+                TAG_VALUES_MAX + 1,
+            ),
+            tag_values_sql(
+                crate::traces::tenant_scope::empty_term(),
+                &key,
+                None,
+                0,
+                TAG_VALUES_MAX + 1,
+            ),
         ] {
             assert!(!sql.is_empty() && !sql.contains("_dist"), "{sql}");
         }
@@ -859,6 +936,7 @@ mod tests {
             spans_table: "spans",
             resources_table: "resources",
             indexed: &[],
+            tenant: crate::traces::tenant_scope::empty_term(),
         }
     }
 
@@ -880,17 +958,17 @@ mod tests {
 
     fn cut() -> String {
         format!(
-            "(SELECT min(b) FROM (SELECT intDiv(start_ns, 300000000000) AS b FROM spans WHERE {TIME} AND {BUCKET} AND {DAY} ORDER BY b DESC LIMIT 123456)) AS cut"
+            "(SELECT min(b) FROM (SELECT intDiv(start_ns, 300000000000) AS b FROM spans WHERE org_id = '' AND {TIME} AND {BUCKET} AND {DAY} ORDER BY b DESC LIMIT 123456)) AS cut"
         )
     }
     // Issue #493: the span row's string, else the resource row's value.
-    const PRED: &str = "((service_type = 'string' AND service = 'cart') OR (NOT service_type = 'string' AND resource_id IN (SELECT resource_id FROM resources WHERE day >= toDate(fromUnixTimestamp64Nano(1700000000000000000), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1700003599999999999), 'UTC') AND ((coalesce(attrs.`service%2Ename`.:String = 'cart', false) OR has(attrs.`service%2Ename`.:`Array(Nullable(String))`, 'cart'))))))";
+    const PRED: &str = "((service_type = 'string' AND service = 'cart') OR (NOT service_type = 'string' AND resource_id IN (SELECT resource_id FROM resources WHERE org_id = '' AND day >= toDate(fromUnixTimestamp64Nano(1700000000000000000), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1700003599999999999), 'UTC') AND ((coalesce(attrs.`service%2Ename`.:String = 'cart', false) OR has(attrs.`service%2Ename`.:`Array(Nullable(String))`, 'cart'))))))";
     const CAP: &str = "if(length(name) <= 8192, name, substringUTF8(name, 1, 2048))";
     const SERVICE: &str = "if(service_type = 'string', [(CAST(service, 'String'), 'string')], CAST([], 'Array(Tuple(String, String))'))";
 
     fn v_s(arr: &str) -> String {
         format!(
-            "WITH {}\nSELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM spans\n  ARRAY JOIN {arr} AS e\n  WHERE {TIME}\n    AND {BUCKET}\n    AND {DAY}\n    AND {NEWER}\n    AND ({PRED}))\nORDER BY val, val_type\nLIMIT 1001",
+            "WITH {}\nSELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM spans\n  ARRAY JOIN {arr} AS e\n  WHERE org_id = '' AND {TIME}\n    AND {BUCKET}\n    AND {DAY}\n    AND {NEWER}\n    AND ({PRED}))\nORDER BY val, val_type\nLIMIT 1001",
             cut()
         )
     }
@@ -914,26 +992,53 @@ mod tests {
         );
         let res_arr = elems_text(&format!("attrs.{k}"));
         let ids = format!(
-            "(service, resource_id) IN (SELECT service, resource_id FROM spans WHERE {TIME} AND {BUCKET} AND {DAY} AND {NEWER} AND ({PRED}))"
+            "(service, resource_id) IN (SELECT service, resource_id FROM spans WHERE org_id = '' AND {TIME} AND {BUCKET} AND {DAY} AND {NEWER} AND ({PRED}))"
         );
         // N, unnarrowed and narrowed.
         assert_eq!(
-            name_values_sql("spans", "traces", w, &none, R, 1001),
+            name_values_sql(
+                crate::traces::tenant_scope::empty_term(),
+                "spans",
+                "traces",
+                w,
+                &none,
+                R,
+                1001
+            ),
             format!(
-                "WITH {}\nSELECT DISTINCT {CAP} AS val\nFROM spans\nWHERE {TIME}\n  AND {BUCKET}\n  AND {DAY}\n  AND {NEWER}\nORDER BY val\nLIMIT 1001",
+                "WITH {}\nSELECT DISTINCT {CAP} AS val\nFROM spans\nWHERE org_id = '' AND {TIME}\n  AND {BUCKET}\n  AND {DAY}\n  AND {NEWER}\nORDER BY val\nLIMIT 1001",
                 cut()
             )
         );
         assert_eq!(
-            name_values_sql("spans", "traces", w, &n, R, 1001),
+            name_values_sql(
+                crate::traces::tenant_scope::empty_term(),
+                "spans",
+                "traces",
+                w,
+                &n,
+                R,
+                1001
+            ),
             format!(
-                "WITH {}\nSELECT DISTINCT {CAP} AS val\nFROM spans\nWHERE {TIME}\n  AND {BUCKET}\n  AND {DAY}\n  AND {NEWER}\n  AND ({PRED})\nORDER BY val\nLIMIT 1001",
+                "WITH {}\nSELECT DISTINCT {CAP} AS val\nFROM spans\nWHERE org_id = '' AND {TIME}\n  AND {BUCKET}\n  AND {DAY}\n  AND {NEWER}\n  AND ({PRED})\nORDER BY val\nLIMIT 1001",
                 cut()
             )
         );
         // V-S, for each of the five arrays.
         let vs = |scope: ValueScope, key: &str| {
-            narrowed_values_sql("spans", "resources", "traces", scope, key, w, &n, R, 1001)
+            narrowed_values_sql(
+                crate::traces::tenant_scope::empty_term(),
+                "spans",
+                "resources",
+                "traces",
+                scope,
+                key,
+                w,
+                &n,
+                R,
+                1001,
+            )
         };
         assert_eq!(vs(ValueScope::Span, "http.route"), v_s(&span_arr));
         assert_eq!(
@@ -946,7 +1051,7 @@ mod tests {
         assert_eq!(
             vs(ValueScope::Resource, "service.name"),
             format!(
-                "WITH {}\nSELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM spans\n  ARRAY JOIN {SERVICE} AS e\n  WHERE {TIME} AND {BUCKET} AND {DAY} AND {NEWER} AND ({PRED})\n  UNION ALL\n  SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM resources\n  ARRAY JOIN {} AS e\n  WHERE {RDAY} AND {ids})\nORDER BY val, val_type\nLIMIT 1001",
+                "WITH {}\nSELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM spans\n  ARRAY JOIN {SERVICE} AS e\n  WHERE org_id = '' AND {TIME} AND {BUCKET} AND {DAY} AND {NEWER} AND ({PRED})\n  UNION ALL\n  SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM resources\n  ARRAY JOIN {} AS e\n  WHERE org_id = '' AND {RDAY} AND {ids})\nORDER BY val, val_type\nLIMIT 1001",
                 cut(),
                 elems_text("attrs.`service%2Ename`")
             )
@@ -955,14 +1060,14 @@ mod tests {
         assert_eq!(
             vs(ValueScope::Resource, "http.route"),
             format!(
-                "WITH {}\nSELECT DISTINCT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\nFROM resources\nARRAY JOIN {res_arr} AS e\nWHERE {RDAY}\n  AND {ids}\nORDER BY val, val_type\nLIMIT 1001",
+                "WITH {}\nSELECT DISTINCT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\nFROM resources\nARRAY JOIN {res_arr} AS e\nWHERE org_id = '' AND {RDAY}\n  AND {ids}\nORDER BY val, val_type\nLIMIT 1001",
                 cut()
             )
         );
         // V-U, and V-U for `service.name`.
         let v_u = |all: &str, res: &str| {
             format!(
-                "WITH {}\nSELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM spans\n  ARRAY JOIN arrayConcat({all}) AS e\n  WHERE {TIME} AND {BUCKET} AND {DAY} AND {NEWER} AND ({PRED})\n  UNION ALL\n  SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM resources\n  ARRAY JOIN {res} AS e\n  WHERE {RDAY} AND {ids})\nORDER BY val, val_type\nLIMIT 1001",
+                "WITH {}\nSELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM spans\n  ARRAY JOIN arrayConcat({all}) AS e\n  WHERE org_id = '' AND {TIME} AND {BUCKET} AND {DAY} AND {NEWER} AND ({PRED})\n  UNION ALL\n  SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM resources\n  ARRAY JOIN {res} AS e\n  WHERE org_id = '' AND {RDAY} AND {ids})\nORDER BY val, val_type\nLIMIT 1001",
                 cut()
             )
         };
@@ -1111,7 +1216,15 @@ mod tests {
     #[test]
     fn a_zero_width_window_selects_nothing() {
         let w = WindowSql::start_closed_end_open(S, S);
-        let sql = name_values_sql("spans", "traces", w, &TagNarrowing::default(), R, 1001);
+        let sql = name_values_sql(
+            crate::traces::tenant_scope::empty_term(),
+            "spans",
+            "traces",
+            w,
+            &TagNarrowing::default(),
+            R,
+            1001,
+        );
         assert!(
             sql.contains(&format!("start_ns >= {S} AND start_ns < {S}")),
             "{sql}"
@@ -1127,16 +1240,30 @@ mod tests {
             .clone();
         let cap = |c: &str| format!("if(length({c}) <= 8192, {c}, substringUTF8({c}, 1, 2048))");
         assert_eq!(
-            trace_prefix("traces", "spans", window(), &n, R),
+            trace_prefix(
+                crate::traces::tenant_scope::empty_term(),
+                "traces",
+                "spans",
+                window(),
+                &n,
+                R
+            ),
             format!(
-                "WITH {cut},\n     (SELECT tuple(groupArrayIf(trace_id, duration > 1000000000))\n      FROM (SELECT trace_id, max(end_ns) - min(start_ns) AS duration, min(root) AS r,\n                   if(r.1 = 0, {svc}, '') AS root_service, if(r.1 = 0, {name}, '') AS root_name\n            FROM traces\n            WHERE day >= toDate(fromUnixTimestamp64Nano(1699913600000000000), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1700089999999999999), 'UTC')\n              AND trace_id GLOBAL IN (SELECT trace_id FROM spans WHERE {TIME} AND {BUCKET} AND {DAY} AND {NEWER} AND ({PRED}))\n            GROUP BY trace_id)) AS per_trace,\n     per_trace.1 AS {alias}\n",
+                "WITH {cut},\n     (SELECT tuple(groupArrayIf(trace_id, duration > 1000000000))\n      FROM (SELECT trace_id, max(end_ns) - min(start_ns) AS duration, min(root) AS r,\n                   if(r.1 = 0, {svc}, '') AS root_service, if(r.1 = 0, {name}, '') AS root_name\n            FROM traces\n            WHERE org_id = '' AND day >= toDate(fromUnixTimestamp64Nano(1699913600000000000), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1700089999999999999), 'UTC')\n              AND trace_id GLOBAL IN (SELECT trace_id FROM spans WHERE org_id = '' AND {TIME} AND {BUCKET} AND {DAY} AND {NEWER} AND ({PRED}))\n            GROUP BY trace_id)) AS per_trace,\n     per_trace.1 AS {alias}\n",
                 cut = cut(),
                 svc = cap("r.4"),
                 name = cap("r.5"),
             )
         );
         assert_eq!(
-            trace_prefix("traces", "spans", window(), &narrow(r#"{span.a="x"}"#), R),
+            trace_prefix(
+                crate::traces::tenant_scope::empty_term(),
+                "traces",
+                "spans",
+                window(),
+                &narrow(r#"{span.a="x"}"#),
+                R
+            ),
             ""
         );
     }

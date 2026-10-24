@@ -42,6 +42,8 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "span-name values read (issue #478) - same class again: outside the search budget by design (no ByteBudget on this path), hard-bounded by the SQL LIMIT to TAG_VALUES_MAX + 1 rows, each at most the 8192-byte string-column cap"),
     ("exec.rs", "new", "Vec::new", 1,
      "the engine's indexed attributes (issue #595 part 2): an empty Vec::new() at construction, once per engine and never per query - nothing to charge"),
+    ("exec.rs", "new", ".collect", 1,
+     "issue #738: the ten trace table names and the configured routed names the dispatch check reads, collected once per engine at construction and never per query - at most fourteen short names, nothing to charge"),
     ("exec.rs", "densify", "Vec::with_capacity", 1,
      "issue #477: the densified sample vector, allocated at exactly RangeAxis::points, which the planner capped at MAX_METRICS_POINTS + 1 before any SQL ran - the fill is computed from the window and the step, so it reads no row and adds no scan; outside the search ByteBudget by design, as every metrics framing"),
     ("exec.rs", "densify", ".collect", 1,

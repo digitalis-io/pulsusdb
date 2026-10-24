@@ -22,10 +22,10 @@ Conventions:
 |--------|-----------|--------|
 | `X-Pulsus-Database` | ingest + query | route to an alternate ClickHouse database (retention is per-database configuration; there is no per-write TTL override in v1) |
 | `X-Pulsus-Async` | ingest | `1` = enqueue and return `202`; `0` = confirm flush (default from config) |
-| `X-Scope-OrgID` | log and metric ingest and query | the tenant (issues #635, #653). No header is the empty tenant, the single-tenant deployment; 1 to 150 bytes of `[A-Za-z0-9_.-]` is that tenant; an empty value, a longer one, any other byte, or the header given twice is `400` (`invalid X-Scope-OrgID`), read before any other parameter, and nothing is stored or read. Every write stores the tenant and every read answers that tenant's rows alone. Traces ignore it |
+| `X-Scope-OrgID` | log, metric and trace ingest and query | the tenant (issues #635, #653, #738). No header is the empty tenant, the single-tenant deployment; 1 to 150 bytes of `[A-Za-z0-9_.-]` is that tenant; an empty value, a longer one, any other byte, or the header given twice is `400` (`invalid X-Scope-OrgID`), read before any other parameter, and nothing is stored or read. Every write stores the tenant and every read answers that tenant's rows alone; a trace id stored only under another tenant is absent to this one |
 | `X-Pulsus-Explain` | query | `1` = include generated SQL, plan, and `exactness`, which is always `raw-exact`, in the response envelope |
 | `X-Loki-Response-Encoding-Flags` | log query (`query`, `query_range`, `tail`) | comma-separated encoding flags. `categorize-labels` switches the `streams` result to the three-element `values` shape — see §2.1. Unknown flags are echoed back and change nothing. Absent, the response is exactly what it was before the header existed |
-| `Idempotency-Key` | log, metric and trace ingest | issue #494, extended to the trace push by issue #586. Namespaces a push's identity: two requests with **different** keys are two pushes whatever they carry, and the same key with the same content is one push. The same key carrying **different** content is a client error — `400`, and nothing is stored. Absent, a push is identified by its own content. Two tenants' identical log or metric pushes, with or without one key, are two pushes. Read on every ingest route, `/v1/traces` and the Zipkin receiver included |
+| `Idempotency-Key` | log, metric and trace ingest | issue #494, extended to the trace push by issue #586. Namespaces a push's identity: two requests with **different** keys are two pushes whatever they carry, and the same key with the same content is one push. The same key carrying **different** content is a client error — `400`, and nothing is stored. Absent, a push is identified by its own content. Two tenants' identical log, metric or trace pushes, with or without one key, are two pushes. Read on every ingest route, `/v1/traces` and the Zipkin receiver included |
 | `Retry-Attempt` | log, metric and trace ingest | issue #494, extended to the trace push by issue #586. The attempt number, `1` upward. **Never a suppression key** — there is nothing stored to match a bare marker against, and suppressing on one would drop a push with no record of having accepted it. It sets the `declared` label on `pulsus_ingest_duplicate_pushes_total` and nothing else |
 | `Authorization` | all | Basic auth when `PULSUS_AUTH_USER` is set |
 
@@ -972,7 +972,9 @@ keys, no trailing newline, under `Content-Type: text/plain; charset=utf-8`
 and **no** `X-Content-Type-Options`. Issue #384 replaced PulsusDB's
 earlier `{"status","errorType","error","position"?}` envelope with it; a
 parse error's byte offset now travels inside the message, as the
-reference's `line, col` does.
+reference's `line, col` does. An invalid `X-Scope-OrgID` is `400 invalid
+X-Scope-OrgID` on every §4 route, before any parameter is read (issue
+#738).
 
 That container is the reference's, and *which* reference writer matters.
 Tempo has two and they disagree:
@@ -1029,6 +1031,7 @@ GET /api/traces/v1/trace/{traceId}/json    → force JSON
 
 | Cause | HTTP |
 |-------|------|
+| Invalid `X-Scope-OrgID`, before any parameter | `400` |
 | Malformed `traceId` (empty, longer than 32, or not hex) | `400` |
 | Trace absent | `404` |
 | No acceptable representation under `Accept` | `406` |

@@ -416,6 +416,8 @@ struct MetricMetadataRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct TraceTagRow {
+    /// Issue #738: the tenant, the key's first column.
+    org_id: String,
     scope: String,
     key: String,
     value: String,

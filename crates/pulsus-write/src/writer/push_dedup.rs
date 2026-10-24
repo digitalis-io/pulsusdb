@@ -465,14 +465,20 @@ fn trace_content_digest(landing: &ParsedTraceLanding) -> PushDigest {
     d.finish()
 }
 
-/// Resolves a trace push's identity — see [`log_identity`].
-pub fn trace_identity(landing: &ParsedTraceLanding, headers: &PushHeaders) -> PushIdentity {
-    identity_from(trace_content_digest(landing), headers, None)
+/// Resolves a trace push's identity — see [`log_identity`]. Issue #738:
+/// the push's tenant is in the key, so two tenants' identical pushes, with
+/// or without one `Idempotency-Key`, are two pushes.
+pub fn trace_identity(
+    landing: &ParsedTraceLanding,
+    headers: &PushHeaders,
+    tenant: &Tenant,
+) -> PushIdentity {
+    identity_from(trace_content_digest(landing), headers, Some(tenant))
 }
 
-/// `tenant` is `None` for the traces identity, which is unchanged; a
-/// metric or log push's tenant (issues #635, #653) is hashed into the key on
-/// both branches, the `Idempotency-Key` digest and the content digest.
+/// A metric, log or trace push's tenant (issues #635, #653, #738) is
+/// hashed into the key on both branches, the `Idempotency-Key` digest and
+/// the content digest.
 fn identity_from(
     content: PushDigest,
     headers: &PushHeaders,
@@ -2870,6 +2876,51 @@ mod tests {
                 "{branch}: two tenants' identical pushes are two pushes"
             );
             assert_eq!(q, q_again, "{branch}: one tenant's repeat is the same push");
+        }
+    }
+
+    /// **T-W4 (issue #738): a trace push's identity includes its tenant.**
+    /// One landing, (i) under an `Idempotency-Key` and (ii) without one: two
+    /// tenants' identities differ on both branches, and one tenant's twice
+    /// are equal.
+    #[test]
+    fn trace_identity_includes_the_tenant() {
+        let mut landing = ParsedTraceLanding::default();
+        landing
+            .resources
+            .push(crate::ingest::traces::LandingResource {
+                resource_id: Fingerprint::from_raw(1),
+                day: 1,
+                service: "checkout".to_string(),
+                attrs: TraceJson::empty(),
+                attrs_other: Vec::new(),
+                dropped_attrs: 0,
+                schema_url: String::new(),
+                entity_refs: Vec::new(),
+            });
+        let tenant = |name: &str| {
+            Tenant::from_header(
+                Some(&axum::http::HeaderValue::from_str(name).expect("a header value")),
+                false,
+            )
+            .expect("a valid tenant")
+        };
+        let keyed = PushHeaders {
+            idempotency_key: Some("k".to_string()),
+            declared_retry: false,
+        };
+        for (branch, headers) in [
+            ("(i) a key", keyed),
+            ("(ii) no key", PushHeaders::default()),
+        ] {
+            let a = trace_identity(&landing, &headers, &tenant("a")).key;
+            let b = trace_identity(&landing, &headers, &tenant("b")).key;
+            let a_again = trace_identity(&landing, &headers, &tenant("a")).key;
+            assert_ne!(
+                a, b,
+                "{branch}: two tenants' identical pushes are two pushes"
+            );
+            assert_eq!(a, a_again, "{branch}: one tenant's repeat is the same push");
         }
     }
 

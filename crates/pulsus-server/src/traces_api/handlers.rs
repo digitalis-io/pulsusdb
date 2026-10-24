@@ -27,6 +27,7 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
+use pulsus_model::{Tenant, TenantError, tenant_from_headers};
 use pulsus_read::{FetchRoute, TraceEngine};
 
 use crate::request_id::{QUERY_ID_HEADER, current_or_new};
@@ -45,7 +46,7 @@ use super::params;
 /// before doing anything else) and builds a `TraceEngine` over it —
 /// `503 unavailable` before the pool is established, matching `/ready`.
 /// `pub(super)`: `search.rs` shares the same engine acquisition.
-pub(super) async fn engine_for(state: &AppState) -> Result<TraceEngine, ApiError> {
+pub(super) async fn engine_for(state: &AppState, tenant: Tenant) -> Result<TraceEngine, ApiError> {
     let pool = {
         let guard = state.pool.read().await;
         guard.clone()
@@ -54,7 +55,7 @@ pub(super) async fn engine_for(state: &AppState) -> Result<TraceEngine, ApiError
     // Issue #114: the consistency-config invariant is already enforced at
     // config load, so this is unreachable in the real binary; a failure maps
     // to the existing 503 "not serving" semantics.
-    chconfig::trace_engine(pool, &state.config, state.graph_target.clone())
+    chconfig::trace_engine(pool, &state.config, state.graph_target.clone(), tenant)
         .map(crate::request_id::tag)
         .map_err(|_| ApiError::PoolUnavailable)
 }
@@ -72,9 +73,12 @@ pub(crate) async fn trace_by_id(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
+    // Issue #738: the tenant first, before any parameter is read.
+    let tenant = tenant_from_headers(&headers);
     let stmt_prefix = current_or_new();
     let mut res = match trace_by_id_impl(
         state,
+        tenant,
         &trace_id,
         query.as_deref(),
         Some(&headers),
@@ -97,14 +101,24 @@ pub(crate) async fn trace_by_id_json(
     State(state): State<AppState>,
     Path(trace_id): Path<String>,
     RawQuery(query): RawQuery,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    // Issue #738: the tenant first, before any parameter is read.
+    let tenant = tenant_from_headers(&headers);
     let stmt_prefix = current_or_new();
-    let mut res =
-        match trace_by_id_impl(state, &trace_id, query.as_deref(), None, &stmt_prefix).await {
-            Ok(res) => res,
-            Err(e) => e.into_response(),
-        };
+    let mut res = match trace_by_id_impl(
+        state,
+        tenant,
+        &trace_id,
+        query.as_deref(),
+        None,
+        &stmt_prefix,
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(e) => e.into_response(),
+    };
     attach_query_id(&mut res, &stmt_prefix);
     res
 }
@@ -116,14 +130,18 @@ pub(crate) async fn trace_by_id_json(
 /// attached to the errors this function returns as well as to its `200`.
 async fn trace_by_id_impl(
     state: AppState,
+    tenant: Result<Tenant, TenantError>,
     raw_trace_id: &str,
     raw_query: Option<&str>,
     negotiate_headers: Option<&HeaderMap>,
     stmt_prefix: &str,
 ) -> Result<Response, ApiError> {
+    let tenant = tenant.map_err(ApiError::Tenant)?;
     let hex32 = params::parse_trace_id(raw_trace_id)?;
     let window = params::parse_fetch_window(raw_query)?;
-    let engine = engine_for(&state).await?.with_statement_prefix(stmt_prefix);
+    let engine = engine_for(&state, tenant)
+        .await?
+        .with_statement_prefix(stmt_prefix);
     let fetched = engine.fetch_by_id(&hex32, window).await?;
     report_fetch_route(fetched.route);
     if fetched.spans.is_empty() {
@@ -240,13 +258,22 @@ pub(crate) async fn trace_by_id_v2(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
+    // Issue #738: the tenant first, before any parameter is read.
+    let tenant = tenant_from_headers(&headers);
     let stmt_prefix = current_or_new();
-    let mut res =
-        match trace_by_id_v2_impl(state, &trace_id, query.as_deref(), &headers, &stmt_prefix).await
-        {
-            Ok(res) => res,
-            Err(e) => e.into_response(),
-        };
+    let mut res = match trace_by_id_v2_impl(
+        state,
+        tenant,
+        &trace_id,
+        query.as_deref(),
+        &headers,
+        &stmt_prefix,
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(e) => e.into_response(),
+    };
     attach_query_id(&mut res, &stmt_prefix);
     res.headers_mut()
         .insert(header::VARY, HeaderValue::from_static("accept"));
@@ -255,14 +282,18 @@ pub(crate) async fn trace_by_id_v2(
 
 async fn trace_by_id_v2_impl(
     state: AppState,
+    tenant: Result<Tenant, TenantError>,
     raw_trace_id: &str,
     raw_query: Option<&str>,
     negotiate_headers: &HeaderMap,
     stmt_prefix: &str,
 ) -> Result<Response, ApiError> {
+    let tenant = tenant.map_err(ApiError::Tenant)?;
     let hex32 = params::parse_trace_id(raw_trace_id)?;
     let window = params::parse_fetch_window(raw_query)?;
-    let engine = engine_for(&state).await?.with_statement_prefix(stmt_prefix);
+    let engine = engine_for(&state, tenant)
+        .await?
+        .with_statement_prefix(stmt_prefix);
     let fetched = engine.fetch_by_id(&hex32, window).await?;
     report_fetch_route(fetched.route);
     // The empty case is the whole reason this route exists: a present,

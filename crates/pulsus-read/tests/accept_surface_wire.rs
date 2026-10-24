@@ -143,6 +143,7 @@ fn wire_accepts(q: &str) -> bool {
         resources: "resources",
         traces: "traces",
         indexed: &[],
+        tenant: empty_term(),
     };
     if is_metrics(q) {
         plan_trace_metrics_routed(
@@ -306,4 +307,21 @@ fn the_baselines_note_explains_the_numbers_beside_it() {
         "wire_baseline.json's `note` must say WHY the count rose — the enumeration widening from \
          a subset of the reference grammar's 33 productions to all 33 — not merely that it did"
     );
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

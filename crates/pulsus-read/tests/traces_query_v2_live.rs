@@ -285,7 +285,7 @@ fn body(query: &str) -> FieldExpr {
 async fn answer(client: &ChClient, w: WindowSql, query: &str) -> Vec<String> {
     let predicate = compile_span_predicate(&body(query))
         .unwrap_or_else(|e| panic!("{query} must compile: {e}"));
-    let sql = span_membership_sql(SPANS_TABLE, w, &predicate);
+    let sql = span_membership_sql(empty_term(), SPANS_TABLE, w, &predicate);
     ids_of(client, &sql).await
 }
 
@@ -533,28 +533,28 @@ async fn land(client: &ChClient, req: &ExportTraceServiceRequest, token: &str) {
             .spans
             .iter()
             .cloned()
-            .map(|s| TraceLandingRow::span(received_ms, s)),
+            .map(|s| TraceLandingRow::span(&std::sync::Arc::from(""), received_ms, s)),
     );
     rows.extend(
         parsed
             .resources
             .iter()
             .cloned()
-            .map(|r| TraceLandingRow::resource(received_ms, r)),
+            .map(|r| TraceLandingRow::resource(&std::sync::Arc::from(""), received_ms, r)),
     );
     rows.extend(
         parsed
             .tag_names
             .iter()
             .cloned()
-            .map(|t| TraceLandingRow::tag_name(received_ms, t)),
+            .map(|t| TraceLandingRow::tag_name(&std::sync::Arc::from(""), received_ms, t)),
     );
     rows.extend(
         parsed
             .tag_values
             .iter()
             .cloned()
-            .map(|t| TraceLandingRow::tag_value(received_ms, t)),
+            .map(|t| TraceLandingRow::tag_value(&std::sync::Arc::from(""), received_ms, t)),
     );
     client
         .insert_block_with(
@@ -1459,6 +1459,7 @@ fn ctx_of(w: WindowSql) -> PredicateCtx<'static> {
         spans_table: SPANS_TABLE,
         resources_table: RESOURCES_TABLE,
         indexed: &[],
+        tenant: empty_term(),
     }
 }
 
@@ -1482,7 +1483,11 @@ async fn try_ids_of(client: &ChClient, sql: &str) -> Result<Vec<String>, String>
 async fn answer_in(client: &ChClient, w: WindowSql, query: &str) -> Result<Vec<String>, String> {
     let predicate = compile_span_predicate_in(&body(query), &ctx_of(w))
         .map_err(|e| format!("<refused: {e}>"))?;
-    try_ids_of(client, &span_membership_sql(SPANS_TABLE, w, &predicate)).await
+    try_ids_of(
+        client,
+        &span_membership_sql(empty_term(), SPANS_TABLE, w, &predicate),
+    )
+    .await
 }
 
 /// A statement this suite expects to FAIL: `Ok(text)` is the driver's
@@ -2143,7 +2148,13 @@ async fn the_service_name_is_compared_in_its_stored_type() {
                 strings(&|e| *e != row.service)
             };
             let got = match compile_span_leaf_in(&svc, op, &Value::String(lit.clone()), &ctx) {
-                Ok(p) => try_ids_of(&client, &span_membership_sql(SPANS_TABLE, w, &p)).await,
+                Ok(p) => {
+                    try_ids_of(
+                        &client,
+                        &span_membership_sql(empty_term(), SPANS_TABLE, w, &p),
+                    )
+                    .await
+                }
                 Err(e) => Err(format!("<refused: {e}>")),
             };
             if got.as_ref() != Ok(&want) {
@@ -5534,6 +5545,7 @@ async fn search_rows(
     let p = compile_span_predicate_in(&body, &ctx_of(w))
         .unwrap_or_else(|e| panic!("{query} must compile: {e}"));
     let sql = search_sql(
+        empty_term(),
         SPANS_TABLE,
         "traces",
         w,
@@ -5705,21 +5717,21 @@ const CORPUS_S_NS: i64 = 10_800_000_000_000;
 
 /// The error-span table, from the spans, by `error_spans_mv`'s own `SELECT`
 /// (issue #601 part 4b).
-const ERROR_SPANS_FROM_SPANS: &str = "INSERT INTO error_spans SELECT trace_id, span_id, start_ns, \
+const ERROR_SPANS_FROM_SPANS: &str = "INSERT INTO error_spans SELECT org_id, trace_id, span_id, start_ns, \
      duration_ns, end_ns, service, service_type, resource_id, name, kind, status_code, \
      status_message FROM spans WHERE status_code = 2";
 
 /// The per-trace table, from the spans, by `traces_mv`'s own `SELECT`.
-const TRACES_FROM_SPANS: &str = "INSERT INTO traces SELECT toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, \
+const TRACES_FROM_SPANS: &str = "INSERT INTO traces SELECT org_id, toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, \
      s AS start_ns, e AS end_ns, r AS root, sv AS services, \
      ls AS last_start_ns, bk AS buckets \
-     FROM (SELECT trace_id, min(start_ns) AS s, \
+     FROM (SELECT org_id, trace_id, min(start_ns) AS s, \
      max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), 9223372036854775807))) AS e, \
      min((toUInt8(parent_span_id != toFixedString('', 8)), start_ns, span_id, \
      if(service_type = 'string', toString(service), ''), toString(name))) AS r, \
      groupUniqArrayIf(toString(service), service_type = 'string') AS sv, max(start_ns) AS ls, \
      groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk \
-     FROM spans GROUP BY trace_id)";
+     FROM spans GROUP BY org_id, trace_id)";
 
 /// One corpus-S statement, its threads and memory bounded: the server is
 /// shared.
@@ -7479,6 +7491,7 @@ async fn engine_of(db: &str) -> pulsus_read::TraceEngine {
             .await
             .expect("connect the engine"),
         engine_config(),
+        empty_tenant(),
     )
 }
 
@@ -7505,6 +7518,7 @@ fn plan_of(
             resources: "resources",
             traces: "traces",
             indexed: &[],
+            tenant: empty_term(),
         },
         64,
     )
@@ -8729,6 +8743,7 @@ async fn search_routed_keeps_the_group_cap() {
             max_series: 2,
             ..engine_config()
         },
+        empty_tenant(),
     );
     let cap = "Err(QueryTooBroad(TraceSearchSeriesCap { count: 3, cap: 2 }))";
     let mut wrong = Vec::new();
@@ -10059,7 +10074,7 @@ async fn a_configured_bound_counts_parent_links() {
         if depth > 1_000 {
             conn.query_timeout = StdDuration::from_secs(300);
         }
-        let engine = pulsus_read::TraceEngine::new(ChClient::new(conn).await.expect("connect"), config);
+        let engine = pulsus_read::TraceEngine::new(ChClient::new(conn).await.expect("connect"), config, empty_tenant());
         let plan = plan_of(&engine, &parse_query(DOWN), (base_ns, base_ns + 60_000_000_000), 20, 20);
         let routed = answer_of(&engine.search_routed(&plan).await.map(normalise_today));
         if routed != want {
@@ -11128,6 +11143,7 @@ async fn a_slice_the_budget_refuses_falls_back_to_the_window() {
     );
     let st = |slice| {
         pulsus_read::traces::spans::search::plan_statement_sliced(
+            empty_term(),
             &plan,
             "spans",
             "traces",
@@ -11153,6 +11169,7 @@ async fn a_slice_the_budget_refuses_falls_back_to_the_window() {
     let tight = pulsus_read::TraceEngine::new(
         ChClient::new(client_config(&db)).await.expect("connect"),
         cfg,
+        empty_tenant(),
     );
     let out = tight.search_routed_explained(&plan).await;
     drop_db(&db).await;
@@ -12571,16 +12588,19 @@ async fn metrics_engine(db: &str, max_series: u64) -> pulsus_read::TraceEngine {
             max_series,
             ..engine_config()
         },
+        empty_tenant(),
     )
 }
 
-const METRICS_TABLES: pulsus_read::StatementTables<'static> = pulsus_read::StatementTables {
-    spans: "spans",
-    error_spans: "error_spans",
-    resources: "resources",
-    traces: "traces",
-    indexed: &[],
-};
+static METRICS_TABLES: std::sync::LazyLock<pulsus_read::StatementTables<'static>> =
+    std::sync::LazyLock::new(|| pulsus_read::StatementTables {
+        spans: "spans",
+        error_spans: "error_spans",
+        resources: "resources",
+        traces: "traces",
+        indexed: &[],
+        tenant: empty_term(),
+    });
 
 /// The routed plan for `q` over `[start_s, end_s)` at `step_ms`.
 fn routed_plan(
@@ -16818,6 +16838,7 @@ async fn a_covered_grouping_is_capped_by_one_statement() {
             max_series: 2,
             ..engine_config()
         },
+        empty_tenant(),
     );
     let mut wrong = Vec::new();
     let query = "{ } | by(resource.service.name)";
@@ -19070,6 +19091,7 @@ async fn an_excluded_trace_only_shape_runs_as_today() {
                 resources: "resources",
                 traces: "traces",
                 indexed: &[],
+                tenant: empty_term(),
             },
             64,
         );
@@ -19586,6 +19608,7 @@ async fn forced_engine_4b(db: &str) -> pulsus_read::TraceEngine {
             error_spans_table: "spans".to_string(),
             ..engine_config()
         },
+        empty_tenant(),
     )
 }
 
@@ -19605,6 +19628,7 @@ async fn todays_values_4b(
     let w = WindowSql::start_closed_end_open(s, e);
     let n = narrowing_from_query(q, &ctx_of(w));
     let sql = narrowed_values_sql(
+        empty_term(),
         SPANS_TABLE,
         RESOURCES_TABLE,
         "traces",
@@ -20187,10 +20211,11 @@ fn routed_with_4b(
 }
 
 /// The tables of [`METRICS_TABLES`] with the error table forced to `spans`.
-const FORCED_TABLES_4B: pulsus_read::StatementTables<'static> = pulsus_read::StatementTables {
-    error_spans: "spans",
-    ..METRICS_TABLES
-};
+static FORCED_TABLES_4B: std::sync::LazyLock<pulsus_read::StatementTables<'static>> =
+    std::sync::LazyLock::new(|| pulsus_read::StatementTables {
+        error_spans: "spans",
+        ..*METRICS_TABLES
+    });
 
 /// `q`'s metrics answer over `[base, base + 10 s)`, rendered, through
 /// `engine` with `tables`.
@@ -22034,4 +22059,21 @@ async fn a_negated_key_over_a_string_raises_the_filters_demand() {
         ),
         Ok(out) => panic!("{query}: answered {}", grouped_answer_of(&Ok(out))),
     }
+}
+
+/// The empty tenant (issue #738): every fixture here is pushed with no
+/// `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn empty_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+/// [`empty_tenant`]'s term, for a statement built outside an engine.
+#[allow(dead_code)]
+fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
+    static TERM: std::sync::LazyLock<pulsus_read::traces::tenant_scope::TenantTerm> =
+        std::sync::LazyLock::new(|| {
+            pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
+        });
+    &TERM
 }

@@ -597,13 +597,14 @@ fn each_view_reads_its_landing_table_under_its_discriminator() {
     assert!(pulsus_schema::mv_projection("not_a_view", &ctx).is_none());
 
     let spans = pulsus_schema::table_column_names("spans").expect("spans is in the file");
-    assert_eq!(spans.first(), Some(&"trace_id"));
+    assert_eq!(&spans[..2], &["org_id", "trace_id"]);
     assert_eq!(spans.last(), Some(&"service_type"));
-    assert_eq!(spans.len(), 28);
+    assert_eq!(spans.len(), 29);
     let resources = pulsus_schema::table_column_names("resources").expect("resources");
     assert_eq!(
         resources,
         vec![
+            "org_id",
             "day",
             "resource_id",
             "service",
@@ -615,7 +616,7 @@ fn each_view_reads_its_landing_table_under_its_discriminator() {
         ]
     );
     let traces = pulsus_schema::table_column_names("traces").expect("traces");
-    assert_eq!(traces.first(), Some(&"day"));
+    assert_eq!(&traces[..2], &["org_id", "day"]);
     assert!(traces.contains(&"buckets"));
     assert!(pulsus_schema::table_column_names("not_a_table").is_none());
 
@@ -1097,12 +1098,12 @@ fn metric_landing_carries_no_event_id() {
     assert_eq!(columns.len(), 28, "the 28 columns the writer sends");
     // Issue #635 part 4: the tenant leads, as it leads the key.
     assert_eq!(columns.first(), Some(&"org_id"));
-    // The log and trace landing tables keep theirs: the trace table's
-    // first, the log table's after the tenant (issue #653).
+    // The log and trace landing tables keep theirs, after the tenant
+    // (issues #653, #738).
     let log = pulsus_schema::table_column_names("log_landing").expect("in the file");
     assert_eq!(&log[..2], &["org_id", "event_id"], "log_landing");
     let trace = pulsus_schema::table_column_names("trace_landing").expect("in the file");
-    assert_eq!(trace.first(), Some(&"event_id"), "trace_landing");
+    assert_eq!(&trace[..2], &["org_id", "event_id"], "trace_landing");
 }
 
 /// **F7 (issue #623): `metric_series` is one row per series per UTC day**,
@@ -1519,6 +1520,103 @@ fn the_log_tables_lead_with_the_tenant_in_both_forms() {
     }
 }
 
+/// **T-S (issue #738): the trace tables lead with the tenant, in both
+/// forms.** In the single-node and the clustered rendering, each of the ten
+/// trace tables is created once, keyed with `org_id` first, and none carries
+/// the tests-first seam's `allow_dimensions_outside_sorting_key`; the
+/// service-graph job's marker read reads the markers under the empty tenant,
+/// and its pairing groups by tenant. One assertion per rendering, naming
+/// every failure.
+#[test]
+fn the_trace_tables_lead_with_the_tenant_in_both_forms() {
+    let spans_key = "(org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)";
+    let keys = [
+        ("resources", "(org_id, service, resource_id)"),
+        ("spans", spans_key),
+        ("tag_names", "(org_id, scope, key)"),
+        ("tag_values", "(org_id, scope, key, value, val_type)"),
+        (
+            "trace_landing",
+            "(org_id, row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)",
+        ),
+        ("traces", "(org_id, trace_id)"),
+        (
+            "service_edges",
+            "(org_id, conn_type, minute, client_minute, client, server)",
+        ),
+        ("tag_bucket_values", "(org_id, service, scope, key, bucket)"),
+        ("error_spans", spans_key),
+        (
+            "service_bucket_resources",
+            "(org_id, service, bucket, resource_id)",
+        ),
+    ];
+    let clustered = RenderCtx {
+        cluster: Some("c1".to_string()),
+        ..RenderCtx::for_tests("pulsus", 7)
+    };
+    for (form, ctx) in [("single-node", single()), ("clustered", clustered)] {
+        let stmts = rendered_statements(&ctx);
+        let mut failures = Vec::new();
+        for (table, key) in keys {
+            let head = format!("CREATE TABLE IF NOT EXISTS pulsus.{table}");
+            let creates: Vec<&String> = stmts
+                .iter()
+                .filter(|s| {
+                    s.trim_start()
+                        .strip_prefix(&head)
+                        .is_some_and(|rest| rest.starts_with([' ', '\n']))
+                })
+                .collect();
+            if creates.len() != 1 {
+                failures.push(format!("{table}: created {} times", creates.len()));
+                continue;
+            }
+            let order: Vec<&str> = creates[0]
+                .lines()
+                .filter(|l| l.trim_start().starts_with("ORDER BY"))
+                .collect();
+            let want = format!("ORDER BY {key}");
+            if order != [want.as_str()] {
+                failures.push(format!("{table}: {order:?}, expected {want:?}"));
+            }
+            if creates[0].contains("allow_dimensions_outside_sorting_key") {
+                failures.push(format!(
+                    "{table}: carries allow_dimensions_outside_sorting_key"
+                ));
+            }
+        }
+        let jobs: Vec<&String> = stmts
+            .iter()
+            .filter(|s| {
+                s.trim_start()
+                    .starts_with("CREATE MATERIALIZED VIEW pulsus.service_edges_mv")
+            })
+            .collect();
+        if let [job] = jobs.as_slice() {
+            let markers = job
+                .matches("FROM merge('pulsus', '^service_edges$') FINAL WHERE ")
+                .count();
+            let scoped = job
+                .matches(
+                    "FROM merge('pulsus', '^service_edges$') FINAL WHERE org_id = '' AND conn_type = ''",
+                )
+                .count();
+            if markers != 1 || scoped != 1 {
+                failures.push(format!(
+                    "service_edges_mv: {scoped} of {markers} marker reads under org_id = ''"
+                ));
+            }
+            if !job.contains("GROUP BY org_id, trace_id, k\n") {
+                failures.push("service_edges_mv: pairing not GROUP BY org_id, trace_id, k".into());
+            }
+        } else {
+            failures.push(format!("service_edges_mv: created {} times", jobs.len()));
+        }
+        assert!(failures.is_empty(), "{form}: {failures:#?}");
+    }
+}
+
 /// Issue #614, part 2: the rollup keeps a bucket exactly as long as
 /// `log_samples` keeps the lines it counts, so a window past retention
 /// answers alike on the rollup route and the raw route.
@@ -1557,6 +1655,7 @@ fn the_rollup_is_kept_as_long_as_the_lines_it_counts() {
 /// `db = pulsus`, `retention_days = 7` and no storage policy.
 const SERVICE_EDGES_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS pulsus.service_edges
 (
+    org_id LowCardinality(String),
     minute DateTime('UTC') CODEC(Delta, ZSTD(1)),
     client_minute DateTime('UTC') CODEC(Delta, ZSTD(1)),
     client LowCardinality(String) CODEC(ZSTD(1)),
@@ -1569,7 +1668,7 @@ const SERVICE_EDGES_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS pulsus.service_e
 )
 ENGINE = ReplacingMergeTree(ver)
 PARTITION BY toDate(minute)
-ORDER BY (conn_type, minute, client_minute, client, server)
+ORDER BY (org_id, conn_type, minute, client_minute, client, server)
 TTL toDateTime(least(toUInt32(minute) - if(conn_type = '', 240, 0) + (7 * 86400), 4294967295))
 SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;"#;
 
@@ -1580,7 +1679,7 @@ SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;"#;
 /// read through `merge()`, so each is read when the scalars before it have
 /// run (part C D6).
 const SERVICE_EDGES_VIEW: &str = r#"CREATE MATERIALIZED VIEW pulsus.service_edges_mv REFRESH EVERY 1 MINUTE APPEND TO pulsus.service_edges
-AS WITH (SELECT arraySort(groupArray(minute)) FROM merge('pulsus', '^service_edges$') FINAL WHERE conn_type = '') AS ms,
+AS WITH (SELECT arraySort(groupArray(minute)) FROM merge('pulsus', '^service_edges$') FINAL WHERE org_id = '' AND conn_type = '') AS ms,
      ms[arrayFirstIndex(i -> i = length(ms) OR ms[i + 1] - ms[i] != 300, arrayEnumerate(ms))] AS wm,
      toStartOfInterval(now('UTC') - INTERVAL 3 MINUTE, INTERVAL 5 MINUTE) AS ready,
      (SELECT toDateTime(min(toDate(parseDateTimeBestEffort(partition))), 'UTC') FROM system.parts WHERE database = 'pulsus' AND table = 'spans' AND active) AS oldest,
@@ -1590,11 +1689,11 @@ least(ready, lo + INTERVAL 5 MINUTE) AS hi,
      toInt64(toUnixTimestamp(hi)) * 1000000000 AS shi,
      toUInt64(toUnixTimestamp64Milli(now64())) AS v
 SELECT * FROM (
-SELECT toDateTime(intDiv(s.6, 60000000000) * 60, 'UTC') AS minute, toDateTime(intDiv(c.4, 60000000000) * 60, 'UTC') AS client_minute,
+SELECT org_id, toDateTime(intDiv(s.6, 60000000000) * 60, 'UTC') AS minute, toDateTime(intDiv(c.4, 60000000000) * 60, 'UTC') AS client_minute,
        c.1 AS client, s.2 AS server, if(c.3 = 3, 'rpc', 'messaging') AS conn_type,
        count() AS calls, countIf(s.3 = 2 OR c.2 = 2) AS failed,
        quantilesTDigestState(0.5, 0.95, 0.99)(s.4) AS q, v AS ver
-FROM (SELECT trace_id,
+FROM (SELECT org_id, trace_id,
         if(kind IN (3, 4) OR attrs.`zipkin%2Eshared`.:String = 'true', span_id, parent_span_id) AS k,
         anyIf((service, status_code, kind, start_ns), kind IN (3, 4)) AS c,
         countIf(kind IN (3, 4)) AS nc,
@@ -1603,16 +1702,16 @@ FROM (SELECT trace_id,
  WHERE start_ns >= slo - 60000000000 AND start_ns < shi + 60000000000
    AND intDiv(start_ns, 300000000000) BETWEEN intDiv(slo - 60000000000, 300000000000) AND intDiv(shi + 59999999999, 300000000000)
    AND ((kind IN (2, 5) AND start_ns >= slo AND start_ns < shi) OR kind IN (3, 4))
- GROUP BY trace_id, k
+ GROUP BY org_id, trace_id, k
  HAVING nc > 0)
 ARRAY JOIN arrayDistinct(ss) AS s
 WHERE ((c.3 = 3 AND s.5 = 2) OR (c.3 = 4 AND s.5 = 5)) AND shi > slo
-GROUP BY minute, client_minute, client, server, conn_type
+GROUP BY org_id, minute, client_minute, client, server, conn_type
 UNION ALL
-SELECT hi - INTERVAL 1 MINUTE, hi - INTERVAL 1 MINUTE, '', '', '', 0, 0, quantilesTDigestState(0.5, 0.95, 0.99)(toInt64(0)), v
+SELECT '', hi - INTERVAL 1 MINUTE, hi - INTERVAL 1 MINUTE, '', '', '', 0, 0, quantilesTDigestState(0.5, 0.95, 0.99)(toInt64(0)), v
 FROM system.one
 HAVING hi > lo)
-ORDER BY conn_type = '', minute, client_minute, client, server, conn_type
+ORDER BY conn_type = '', org_id, minute, client_minute, client, server, conn_type
 SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_rows_to_read = 60000000, read_overflow_mode = 'throw', max_execution_time = 50,
          max_insert_threads = 1, max_insert_block_size = 100000000, min_insert_block_size_rows = 100000000, min_insert_block_size_bytes = 10000000000;"#;
 
@@ -1632,7 +1731,7 @@ length(logs) = 2 AND arrayAll(x -> x.2 OR (position(x.1, '.spans/') > 0 AND leng
 (SELECT groupArray((position(path, '.service_edges/') > 0, extract(value, '^format version: \\d+\ncreate_time: [^\n]*\nsource replica: [^\n]*\nblock_id: [^\n]*\n(?:log_entry_id: [^\n]*\n)?([A-Za-z_]+)\n'), parseDateTimeBestEffortOrZero(extract(value, '\ncreate_time: ([^\n]*)\n'), serverTimezone()), extract(value, '\n(?:get|attach)\n([^\n]+)'), extract(value, '\nsource replica: ([^\n]*)\n'))) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.1 || if(listable, '/queue', '/log_pointer'), logs))) SETTINGS max_execution_time = 10) AS entries,
 (SELECT groupArray((partition_id, min_block_number, max_block_number)) FROM system.parts WHERE database = 'pulsus' AND table = 'service_edges' AND active AND has(arrayMap(e -> extract(e.4, '^([^_]+)_[0-9]+_[0-9]+_[0-9]+(?:_[0-9]+)?$'), arrayFilter(e -> e.1, entries)), partition_id)) AS local_edges,
 listable AND arrayCount(e -> e.1, entries) <= 1000 AND arrayCount(e -> NOT e.1, entries) <= 1000 AND arrayAll(e -> NOT e.1 OR e.2 = 'merge' OR (e.2 IN ('get', 'attach') AND e.5 != '' AND arrayExists(p -> p.1 = extract(e.4, '^([^_]+)_[0-9]+_[0-9]+_[0-9]+(?:_[0-9]+)?$') AND p.2 <= toInt64OrZero(extract(e.4, '^[^_]+_([0-9]+)_')) AND toInt64OrZero(extract(e.4, '^[^_]+_[0-9]+_([0-9]+)_')) <= p.3, local_edges)), entries) AS edges_ok,
-(SELECT arraySort(groupArray(minute)) FROM merge('pulsus', '^service_edges$') FINAL WHERE conn_type = '' AND edges_ok) AS ms,
+(SELECT arraySort(groupArray(minute)) FROM merge('pulsus', '^service_edges$') FINAL WHERE org_id = '' AND conn_type = '' AND edges_ok) AS ms,
 "#;
 
 /// The clustered view's replica barrier (part C §3), in place of the
@@ -1695,7 +1794,7 @@ fn the_service_edges_statements_are_the_plan_s() {
     let hi = "\nleast(ready, lo + INTERVAL 5 MINUTE) AS hi,\n";
     assert!(SERVICE_EDGES_VIEW.contains(hi), "the single-node `hi` line");
     let head = "AS WITH (SELECT arraySort(groupArray(minute)) FROM merge('pulsus', \
-                '^service_edges$') FINAL WHERE conn_type = '') AS ms,\n";
+                '^service_edges$') FINAL WHERE org_id = '' AND conn_type = '') AS ms,\n";
     assert!(
         SERVICE_EDGES_VIEW.contains(head),
         "the single-node first line"
