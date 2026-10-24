@@ -62,6 +62,7 @@
 //! explicit `'UTC'`.
 
 use super::rows::FetchWindow;
+use crate::traces::tenant_scope::TenantTerm;
 use crate::traces::window_sql::{WindowSql, resources_day_bound};
 
 /// The stored bucket set's per-row cap, in the per-trace table's column
@@ -88,7 +89,7 @@ const SPAN_SCALAR: &str = r"(SELECT (groupArray((span_id, parent_span_id, start_
                           scope_schema_url, scope_dropped_attrs, scope_attrs_other)),
               groupUniqArray((service, resource_id)))
       FROM {spans}
-      WHERE {predicate}) AS sp";
+      WHERE {tenant} AND {predicate}) AS sp";
 
 /// The grouped resource read, shared by all three statements.
 ///
@@ -105,7 +106,7 @@ const RESOURCE_SUBQUERY: &str = r"       (SELECT groupArray((resource_id, attrs,
                      any(dropped_attrs) AS dropped_attrs, any(schema_url) AS schema_url,
                      any(entity_refs) AS entity_refs
               FROM {resources}
-              WHERE {day}
+              WHERE {tenant} AND {day}
                 AND (service, resource_id) IN (SELECT arrayJoin(sp.2))
               GROUP BY resource_id)) AS resources";
 
@@ -119,15 +120,17 @@ fn trace_key(hex32: &str) -> String {
     format!("toFixedString(unhex('{hex32}'), 16)")
 }
 
-fn span_scalar(spans_table: &str, predicate: &str) -> String {
+fn span_scalar(tenant: &TenantTerm, spans_table: &str, predicate: &str) -> String {
     SPAN_SCALAR
         .replace("{spans}", spans_table)
+        .replace("{tenant}", tenant.as_str())
         .replace("{predicate}", predicate)
 }
 
-fn resource_subquery(resources_table: &str, day: &str) -> String {
+fn resource_subquery(tenant: &TenantTerm, resources_table: &str, day: &str) -> String {
     RESOURCE_SUBQUERY
         .replace("{resources}", resources_table)
+        .replace("{tenant}", tenant.as_str())
         .replace("{day}", day)
 }
 
@@ -138,7 +141,7 @@ fn resource_subquery(resources_table: &str, day: &str) -> String {
 const INDEXED: &str = r"WITH (SELECT (count(), min(start_ns), max(last_start_ns),
               groupUniqArrayArray({cap})(buckets))
       FROM {traces}
-      WHERE trace_id = {key}) AS ext,
+      WHERE {tenant} AND trace_id = {key}) AS ext,
      ifNull(ext.1, 0)  AS idx_rows,
      ifNull(ext.2, 0)  AS ext_lo,
      ifNull(ext.3, 0)  AS ext_hi,
@@ -162,7 +165,7 @@ const INDEXED_PREDICATE: &str = r"(intDiv(start_ns, {bucket_ns}), trace_id) IN
 
 /// Statement 1w's own text.
 const WIDE: &str = r"WITH (SELECT (min(start_ns), max(last_start_ns)) FROM {traces}
-      WHERE trace_id = {key}) AS ext,
+      WHERE {tenant} AND trace_id = {key}) AS ext,
      ifNull(ext.1, 0) AS lo,
      ifNull(ext.2, 0) AS hi,
      {span}
@@ -204,7 +207,7 @@ const FALLBACK_PREDICATE: &str = r"trace_id = {key}
 /// Statement 1 — the indexed fetch. Issued on every fetch request,
 /// always, first.
 pub fn indexed_fetch_sql(
-    _tenant: &crate::traces::tenant_scope::TenantTerm,
+    tenant: &TenantTerm,
     traces_table: &str,
     spans_table: &str,
     resources_table: &str,
@@ -218,11 +221,16 @@ pub fn indexed_fetch_sql(
     INDEXED
         .replace("{cap}", &BUCKET_SET_CAP.to_string())
         .replace("{traces}", traces_table)
+        .replace("{tenant}", tenant.as_str())
         .replace("{key}", &key)
-        .replace("{span}", &span_scalar(spans_table, &predicate))
+        .replace("{span}", &span_scalar(tenant, spans_table, &predicate))
         .replace(
             "{resources}",
-            &resource_subquery(resources_table, &resources_day_bound("ext_lo", "ext_hi")),
+            &resource_subquery(
+                tenant,
+                resources_table,
+                &resources_day_bound("ext_lo", "ext_hi"),
+            ),
         )
 }
 
@@ -230,7 +238,7 @@ pub fn indexed_fetch_sql(
 /// that may have truncated. Takes only `hex32`: it reads its own bounds,
 /// so the reader carries nothing between the two statements.
 pub fn wide_fetch_sql(
-    _tenant: &crate::traces::tenant_scope::TenantTerm,
+    tenant: &TenantTerm,
     traces_table: &str,
     spans_table: &str,
     resources_table: &str,
@@ -239,11 +247,12 @@ pub fn wide_fetch_sql(
     let key = trace_key(hex32);
     let predicate = WIDE_PREDICATE.replace("{key}", &key);
     WIDE.replace("{traces}", traces_table)
+        .replace("{tenant}", tenant.as_str())
         .replace("{key}", &key)
-        .replace("{span}", &span_scalar(spans_table, &predicate))
+        .replace("{span}", &span_scalar(tenant, spans_table, &predicate))
         .replace(
             "{resources}",
-            &resource_subquery(resources_table, &resources_day_bound("lo", "hi")),
+            &resource_subquery(tenant, resources_table, &resources_day_bound("lo", "hi")),
         )
 }
 
@@ -251,7 +260,7 @@ pub fn wide_fetch_sql(
 /// not indexed. Every bound is rendered from one [`WindowSql`], so the row
 /// bound, the bucket bound and the resource-day bound cannot disagree.
 pub fn fallback_fetch_sql(
-    _tenant: &crate::traces::tenant_scope::TenantTerm,
+    tenant: &TenantTerm,
     spans_table: &str,
     resources_table: &str,
     hex32: &str,
@@ -264,10 +273,10 @@ pub fn fallback_fetch_sql(
         .replace("{time}", &w.span_time_clause())
         .replace("{bucket}", &w.span_bucket_clause());
     FALLBACK
-        .replace("{span}", &span_scalar(spans_table, &predicate))
+        .replace("{span}", &span_scalar(tenant, spans_table, &predicate))
         .replace(
             "{resources}",
-            &resource_subquery(resources_table, &w.resources_day_clause()),
+            &resource_subquery(tenant, resources_table, &w.resources_day_clause()),
         )
 }
 
@@ -340,7 +349,7 @@ mod tests {
     const INDEXED_FROZEN: &str = r"WITH (SELECT (count(), min(start_ns), max(last_start_ns),
               groupUniqArrayArray(4096)(buckets))
       FROM traces
-      WHERE trace_id = toFixedString(unhex('50fb0cd99260ac2a15d0a6f208126742'), 16)) AS ext,
+      WHERE org_id = '' AND trace_id = toFixedString(unhex('50fb0cd99260ac2a15d0a6f208126742'), 16)) AS ext,
      ifNull(ext.1, 0)  AS idx_rows,
      ifNull(ext.2, 0)  AS ext_lo,
      ifNull(ext.3, 0)  AS ext_hi,
@@ -353,7 +362,7 @@ mod tests {
                           scope_schema_url, scope_dropped_attrs, scope_attrs_other)),
               groupUniqArray((service, resource_id)))
       FROM spans
-      WHERE (intDiv(start_ns, 300000000000), trace_id) IN
+      WHERE org_id = '' AND (intDiv(start_ns, 300000000000), trace_id) IN
             (SELECT (k, toFixedString(unhex('50fb0cd99260ac2a15d0a6f208126742'), 16))
              FROM (SELECT arrayJoin(bk) AS k))
         AND length(bk) < 4096) AS sp
@@ -367,12 +376,12 @@ SELECT idx_rows               AS index_rows,
                      any(dropped_attrs) AS dropped_attrs, any(schema_url) AS schema_url,
                      any(entity_refs) AS entity_refs
               FROM resources
-              WHERE day >= toDate(fromUnixTimestamp64Nano(ext_lo), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(ext_hi), 'UTC')
+              WHERE org_id = '' AND day >= toDate(fromUnixTimestamp64Nano(ext_lo), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(ext_hi), 'UTC')
                 AND (service, resource_id) IN (SELECT arrayJoin(sp.2))
               GROUP BY resource_id)) AS resources";
 
     const WIDE_FROZEN: &str = r"WITH (SELECT (min(start_ns), max(last_start_ns)) FROM traces
-      WHERE trace_id = toFixedString(unhex('50fb0cd99260ac2a15d0a6f208126742'), 16)) AS ext,
+      WHERE org_id = '' AND trace_id = toFixedString(unhex('50fb0cd99260ac2a15d0a6f208126742'), 16)) AS ext,
      ifNull(ext.1, 0) AS lo,
      ifNull(ext.2, 0) AS hi,
      (SELECT (groupArray((span_id, parent_span_id, start_ns, end_ns, service,
@@ -383,7 +392,7 @@ SELECT idx_rows               AS index_rows,
                           scope_schema_url, scope_dropped_attrs, scope_attrs_other)),
               groupUniqArray((service, resource_id)))
       FROM spans
-      WHERE trace_id = toFixedString(unhex('50fb0cd99260ac2a15d0a6f208126742'), 16)
+      WHERE org_id = '' AND trace_id = toFixedString(unhex('50fb0cd99260ac2a15d0a6f208126742'), 16)
         AND start_ns >= lo AND start_ns <= hi
         AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
             BETWEEN toDate(fromUnixTimestamp64Nano(lo), 'UTC')
@@ -396,7 +405,7 @@ SELECT sp.1 AS spans,
                      any(dropped_attrs) AS dropped_attrs, any(schema_url) AS schema_url,
                      any(entity_refs) AS entity_refs
               FROM resources
-              WHERE day >= toDate(fromUnixTimestamp64Nano(lo), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(hi), 'UTC')
+              WHERE org_id = '' AND day >= toDate(fromUnixTimestamp64Nano(lo), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(hi), 'UTC')
                 AND (service, resource_id) IN (SELECT arrayJoin(sp.2))
               GROUP BY resource_id)) AS resources";
 
@@ -408,7 +417,7 @@ SELECT sp.1 AS spans,
                           scope_schema_url, scope_dropped_attrs, scope_attrs_other)),
               groupUniqArray((service, resource_id)))
       FROM spans
-      WHERE trace_id = toFixedString(unhex('50fb0cd99260ac2a15d0a6f208126742'), 16)
+      WHERE org_id = '' AND trace_id = toFixedString(unhex('50fb0cd99260ac2a15d0a6f208126742'), 16)
         AND start_ns >= 1699999999000000000 AND start_ns < 1700000002000000000
         AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1699999999000000000, 300000000000) AND intDiv(1700000001999999999, 300000000000)) AS sp
 SELECT sp.1 AS spans,
@@ -419,7 +428,7 @@ SELECT sp.1 AS spans,
                      any(dropped_attrs) AS dropped_attrs, any(schema_url) AS schema_url,
                      any(entity_refs) AS entity_refs
               FROM resources
-              WHERE day >= toDate(fromUnixTimestamp64Nano(1699999999000000000), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1700000001999999999), 'UTC')
+              WHERE org_id = '' AND day >= toDate(fromUnixTimestamp64Nano(1699999999000000000), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1700000001999999999), 'UTC')
                 AND (service, resource_id) IN (SELECT arrayJoin(sp.2))
               GROUP BY resource_id)) AS resources";
 
@@ -656,10 +665,13 @@ SELECT sp.1 AS spans,
     fn each_projection_is_its_tables_column_list_minus_its_named_omissions() {
         /// The caller supplies the trace id; `duration_ns` is replaced by
         /// the sender's own end; `service_type` is the predicate's
-        /// (issue #589) and the trace fetch does not return it.
-        const SPAN_PROJECTION_OMITS: [&str; 3] = ["trace_id", "duration_ns", "service_type"];
-        /// `day` is the partition and `service` travels on the span row.
-        const RESOURCE_PROJECTION_OMITS: [&str; 2] = ["day", "service"];
+        /// (issue #589) and the trace fetch does not return it. `org_id` is
+        /// the request's tenant (issue #738).
+        const SPAN_PROJECTION_OMITS: [&str; 4] =
+            ["org_id", "trace_id", "duration_ns", "service_type"];
+        /// `day` is the partition and `service` travels on the span row;
+        /// `org_id` is the request's tenant.
+        const RESOURCE_PROJECTION_OMITS: [&str; 3] = ["org_id", "day", "service"];
         /// `end_ns` is projected at index 3, where `duration_ns` stood,
         /// not appended last where the DDL declares it.
         const SPAN_PROJECTION_MOVES: [(&str, usize); 1] = [("end_ns", 3)];

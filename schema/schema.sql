@@ -336,7 +336,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.resources{{on_cluster}}
 --@single  ENGINE = ReplacingMergeTree
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.resources', '{replica}')
 PARTITION BY day
-ORDER BY (service, resource_id)
+ORDER BY (org_id, service, resource_id)
 TTL toDateTime(least(((toUInt32(day) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
 --@single  SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
@@ -391,7 +391,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.spans{{on_cluster}}
 --@single  ENGINE = ReplacingMergeTree
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.spans', '{replica}')
 PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
-ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
+ORDER BY (org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
 TTL toDateTime(least(intDiv(start_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
 --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
@@ -405,7 +405,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.tag_names{{on_cluster}}
 )
 --@single  ENGINE = ReplacingMergeTree(last_start_ns)
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.tag_names', '{replica}', last_start_ns)
-ORDER BY (scope, key)
+ORDER BY (org_id, scope, key)
 TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
 --@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
@@ -421,7 +421,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.tag_values{{on_cluster}}
 )
 --@single  ENGINE = ReplacingMergeTree(last_start_ns)
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.tag_values', '{replica}', last_start_ns)
-ORDER BY (scope, key, value, val_type)
+ORDER BY (org_id, scope, key, value, val_type)
 TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
 --@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
@@ -483,7 +483,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.trace_landing{{on_cluster}}
 --@single  ENGINE = MergeTree
 --@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.trace_landing', '{replica}')
 PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
-ORDER BY (row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)
+ORDER BY (org_id, row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)
 TTL toDateTime(least(intDiv(received_ms, 1000) + ({{trace_landing_retention_hours}} * 3600), 4294967295))
 --@single  SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, async_insert = 0, index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, async_insert = 0, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
@@ -503,10 +503,10 @@ CREATE TABLE IF NOT EXISTS {{db}}.traces{{on_cluster}}
 --@single  ENGINE = AggregatingMergeTree
 --@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.traces', '{replica}')
 PARTITION BY day
-ORDER BY trace_id
+ORDER BY (org_id, trace_id)
 TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS allow_dimensions_outside_sorting_key = 1, index_granularity = 1024, ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
---@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, index_granularity = 1024, ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.log_metrics_{{log_rollup_suffix}}{{dist_suffix}}{{on_cluster}} AS {{db}}.log_metrics_{{log_rollup_suffix}}
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'log_metrics_{{log_rollup_suffix}}', cityHash64(fingerprint));
@@ -789,12 +789,12 @@ CREATE TABLE IF NOT EXISTS {{db}}.service_edges{{on_cluster}}
 --@single  ENGINE = ReplacingMergeTree(ver)
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.service_edges', '{replica}', ver)
 PARTITION BY toDate(minute)
-ORDER BY (conn_type, minute, client_minute, client, server)
+ORDER BY (org_id, conn_type, minute, client_minute, client, server)
 TTL toDateTime(least(toUInt32(minute) - if(conn_type = '', 240, 0) + ({{retention_days}} * 86400), 4294967295))
 SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1{{storage_policy}};
 
 CREATE MATERIALIZED VIEW {{db}}.service_edges_mv{{on_cluster}} REFRESH EVERY 1 MINUTE APPEND TO {{db}}.service_edges
---@single AS WITH (SELECT arraySort(groupArray(minute)) FROM merge('{{db}}', '^service_edges$') FINAL WHERE conn_type = '') AS ms,
+--@single AS WITH (SELECT arraySort(groupArray(minute)) FROM merge('{{db}}', '^service_edges$') FINAL WHERE org_id = '' AND conn_type = '') AS ms,
 --@cluster AS WITH (SELECT groupArray((replica_path, log_pointer > log_max_index OR (log_pointer = 0 AND log_max_index = 0), zookeeper_path, log_pointer)) FROM system.replicas WHERE database = '{{db}}' AND table IN ('spans', 'service_edges')) AS logs,
 --@cluster (SELECT groupArray((name, numChildren, value)) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.1, logs))) AND name IN ('queue', 'is_lost')) AS nodes,
 --@cluster (SELECT groupArray((path, numChildren)) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.3, arrayFilter(x -> position(x.1, '.spans/') > 0 AND NOT x.2, logs)))) AND name = 'log') AS loglen,
@@ -803,7 +803,7 @@ CREATE MATERIALIZED VIEW {{db}}.service_edges_mv{{on_cluster}} REFRESH EVERY 1 M
 --@cluster (SELECT groupArray((position(path, '.service_edges/') > 0, extract(value, '^format version: \\d+\ncreate_time: [^\n]*\nsource replica: [^\n]*\nblock_id: [^\n]*\n(?:log_entry_id: [^\n]*\n)?([A-Za-z_]+)\n'), parseDateTimeBestEffortOrZero(extract(value, '\ncreate_time: ([^\n]*)\n'), serverTimezone()), extract(value, '\n(?:get|attach)\n([^\n]+)'), extract(value, '\nsource replica: ([^\n]*)\n'))) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.1 || if(listable, '/queue', '/log_pointer'), logs))) SETTINGS max_execution_time = 10) AS entries,
 --@cluster (SELECT groupArray((partition_id, min_block_number, max_block_number)) FROM system.parts WHERE database = '{{db}}' AND table = 'service_edges' AND active AND has(arrayMap(e -> extract(e.4, '^([^_]+)_[0-9]+_[0-9]+_[0-9]+(?:_[0-9]+)?$'), arrayFilter(e -> e.1, entries)), partition_id)) AS local_edges,
 --@cluster listable AND arrayCount(e -> e.1, entries) <= 1000 AND arrayCount(e -> NOT e.1, entries) <= 1000 AND arrayAll(e -> NOT e.1 OR e.2 = 'merge' OR (e.2 IN ('get', 'attach') AND e.5 != '' AND arrayExists(p -> p.1 = extract(e.4, '^([^_]+)_[0-9]+_[0-9]+_[0-9]+(?:_[0-9]+)?$') AND p.2 <= toInt64OrZero(extract(e.4, '^[^_]+_([0-9]+)_')) AND toInt64OrZero(extract(e.4, '^[^_]+_[0-9]+_([0-9]+)_')) <= p.3, local_edges)), entries) AS edges_ok,
---@cluster (SELECT arraySort(groupArray(minute)) FROM merge('{{db}}', '^service_edges$') FINAL WHERE conn_type = '' AND edges_ok) AS ms,
+--@cluster (SELECT arraySort(groupArray(minute)) FROM merge('{{db}}', '^service_edges$') FINAL WHERE org_id = '' AND conn_type = '' AND edges_ok) AS ms,
      ms[arrayFirstIndex(i -> i = length(ms) OR ms[i + 1] - ms[i] != 300, arrayEnumerate(ms))] AS wm,
      toStartOfInterval(now('UTC') - INTERVAL 3 MINUTE, INTERVAL 5 MINUTE) AS ready,
      (SELECT toDateTime(min(toDate(parseDateTimeBestEffort(partition))), 'UTC') FROM system.parts WHERE database = '{{db}}' AND table = 'spans' AND active) AS oldest,
@@ -817,11 +817,11 @@ CREATE MATERIALIZED VIEW {{db}}.service_edges_mv{{on_cluster}} REFRESH EVERY 1 M
      toInt64(toUnixTimestamp(hi)) * 1000000000 AS shi,
      toUInt64(toUnixTimestamp64Milli(now64())) AS v
 SELECT * FROM (
-SELECT toDateTime(intDiv(s.6, 60000000000) * 60, 'UTC') AS minute, toDateTime(intDiv(c.4, 60000000000) * 60, 'UTC') AS client_minute,
+SELECT org_id, toDateTime(intDiv(s.6, 60000000000) * 60, 'UTC') AS minute, toDateTime(intDiv(c.4, 60000000000) * 60, 'UTC') AS client_minute,
        c.1 AS client, s.2 AS server, if(c.3 = 3, 'rpc', 'messaging') AS conn_type,
        count() AS calls, countIf(s.3 = 2 OR c.2 = 2) AS failed,
        quantilesTDigestState(0.5, 0.95, 0.99)(s.4) AS q, v AS ver
-FROM (SELECT trace_id,
+FROM (SELECT org_id, trace_id,
         if(kind IN (3, 4) OR attrs.`zipkin%2Eshared`.:String = 'true', span_id, parent_span_id) AS k,
         anyIf((service, status_code, kind, start_ns), kind IN (3, 4)) AS c,
         countIf(kind IN (3, 4)) AS nc,
@@ -830,16 +830,16 @@ FROM (SELECT trace_id,
  WHERE start_ns >= slo - 60000000000 AND start_ns < shi + 60000000000
    AND intDiv(start_ns, 300000000000) BETWEEN intDiv(slo - 60000000000, 300000000000) AND intDiv(shi + 59999999999, 300000000000)
    AND ((kind IN (2, 5) AND start_ns >= slo AND start_ns < shi) OR kind IN (3, 4))
- GROUP BY trace_id, k
+ GROUP BY org_id, trace_id, k
  HAVING nc > 0)
 ARRAY JOIN arrayDistinct(ss) AS s
 WHERE ((c.3 = 3 AND s.5 = 2) OR (c.3 = 4 AND s.5 = 5)) AND shi > slo
-GROUP BY minute, client_minute, client, server, conn_type
+GROUP BY org_id, minute, client_minute, client, server, conn_type
 UNION ALL
-SELECT hi - INTERVAL 1 MINUTE, hi - INTERVAL 1 MINUTE, '', '', '', 0, 0, quantilesTDigestState(0.5, 0.95, 0.99)(toInt64(0)), v
+SELECT '', hi - INTERVAL 1 MINUTE, hi - INTERVAL 1 MINUTE, '', '', '', 0, 0, quantilesTDigestState(0.5, 0.95, 0.99)(toInt64(0)), v
 FROM system.one
 HAVING hi > lo)
-ORDER BY conn_type = '', minute, client_minute, client, server, conn_type
+ORDER BY conn_type = '', org_id, minute, client_minute, client, server, conn_type
 SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_rows_to_read = {{graph_job_max_rows}}, read_overflow_mode = 'throw', max_execution_time = 50,
          max_insert_threads = 1, max_insert_block_size = 100000000, min_insert_block_size_rows = 100000000, min_insert_block_size_bytes = 10000000000;
 
@@ -882,10 +882,10 @@ CREATE TABLE IF NOT EXISTS {{db}}.tag_bucket_values{{on_cluster}}
 --@single  ENGINE = AggregatingMergeTree
 --@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/all/{{db}}.tag_bucket_values', '{replica}')
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')
-ORDER BY (service, scope, key, bucket)
+ORDER BY (org_id, service, scope, key, bucket)
 TTL toDateTime(least(intDiv(bucket * 300000000000, 1000000000) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
---@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.error_spans{{on_cluster}}
 (
@@ -906,7 +906,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.error_spans{{on_cluster}}
 --@single  ENGINE = ReplacingMergeTree
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.error_spans', '{replica}')
 PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
-ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
+ORDER BY (org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
 TTL toDateTime(least(intDiv(start_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
 --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
@@ -950,7 +950,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.service_bucket_resources{{on_cluster}}
 --@single  ENGINE = ReplacingMergeTree
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.service_bucket_resources', '{replica}')
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')
-ORDER BY (service, bucket, resource_id)
+ORDER BY (org_id, service, bucket, resource_id)
 TTL toDateTime(least(intDiv(bucket * 300000000000, 1000000000) + ({{retention_days}} * 86400), 4294967295))
 --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};

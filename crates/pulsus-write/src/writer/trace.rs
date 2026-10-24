@@ -215,7 +215,9 @@ impl TraceWriter {
         // push with no span makes no block and no insert** and is charged for
         // nothing.
         let landing_rows = landing.total_rows();
-        let landing_bytes = trace_landing::charge_of(&landing);
+        // Issue #738: every row shares the push's one tenant string, whose
+        // bytes are charged once, beside the slot each row's `Arc` occupies.
+        let landing_bytes = trace_landing::charge_of(&landing) + tenant.as_str().len() as u64;
         if landing_rows > 0 {
             // `spans`, `traces` and `resources` are partitioned by UTC day,
             // so one view's insert produces one part per day in the push and
@@ -268,7 +270,7 @@ impl TraceWriter {
             } else {
                 None
             };
-            let rows = trace_landing::rows_of(&Arc::from(""), received_ms, landing);
+            let rows = trace_landing::rows_of(tenant.as_arc(), received_ms, landing);
             debug_assert_eq!(
                 rows.len() as u64,
                 landing_rows,

@@ -59,22 +59,22 @@ docs/query-lowering.md	crates/pulsus-read/src/metrics/labels.rs:625	crates/pulsu
 docs/query-lowering.md	crates/pulsus-read/src/metrics/re2_authority.rs:89	crates/pulsus-read/src/metrics/re2_authority.rs	89		line	re2_pattern_to_rust	let rewritten = re2_pattern_to_rust(&m.value);
 docs/query-lowering.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		prose	MAX_QUERY_TEXT_BYTES	MAX_QUERY_TEXT_BYTES
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:105	crates/pulsus-read/src/traces/exec.rs	105		line	TRACE_SEARCH_MAX_BLOCK_ROWS	pub const TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096;
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:1319	crates/pulsus-read/src/traces/exec.rs	1319		line	TRACE_SEARCH_MAX_BLOCK_ROWS	.set("max_block_size", TRACE_SEARCH_MAX_BLOCK_ROWS)
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2614	crates/pulsus-read/src/traces/exec.rs	2614		line	search_settings_pin_the_layer_1_budget_contract	fn search_settings_pin_the_layer_1_budget_contract() {
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:1365	crates/pulsus-read/src/traces/exec.rs	1365		line	TRACE_SEARCH_MAX_BLOCK_ROWS	.set("max_block_size", TRACE_SEARCH_MAX_BLOCK_ROWS)
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2673	crates/pulsus-read/src/traces/exec.rs	2673		line	search_settings_pin_the_layer_1_budget_contract	fn search_settings_pin_the_layer_1_budget_contract() {
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:276	crates/pulsus-read/src/traces/exec.rs	276		line	RootSummary	pub root: RootSummary,
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:773	crates/pulsus-read/src/traces/exec.rs	773		line	spans_graph_sql	let sql = super::spans::graph::spans_graph_sql(window, target, cap);
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:804	crates/pulsus-read/src/traces/exec.rs	804		line	spans_graph_sql	let sql = super::spans::graph::spans_graph_sql(&self.tenant, window, target, cap);
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:84	crates/pulsus-read/src/traces/exec.rs	84		line	HYDRATION_BYTE_BUDGET	pub const HYDRATION_BYTE_BUDGET: usize = 256 * 1024 * 1024;
-docs/query-lowering.md	crates/pulsus-read/src/traces/spans/graph.rs:147	crates/pulsus-read/src/traces/spans/graph.rs	147		prose	spans_graph_sql	spans_graph_sql
+docs/query-lowering.md	crates/pulsus-read/src/traces/spans/graph.rs:154	crates/pulsus-read/src/traces/spans/graph.rs	154		prose	spans_graph_sql	spans_graph_sql
 docs/query-lowering.md	crates/pulsus-server/src/logs_api/error.rs:147-157	crates/pulsus-server/src/logs_api/error.rs	147	157	line	X_CONTENT_TYPE_OPTIONS	pub(crate) fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [ (header::CONTENT_TYPE, "te
 docs/query-lowering.md	crates/pulsus-server/src/logs_api/error.rs:147-212	crates/pulsus-server/src/logs_api/error.rs	147	212	line	ClientHTTPStatusAndError	pub(crate) fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [ (header::CONTENT_TYPE, "te
 docs/query-lowering.md	crates/pulsus-server/src/logs_api/error.rs:212	crates/pulsus-server/src/logs_api/error.rs	212		line	PipelineInvalid	| ReadError::PipelineInvalid { .. }
-docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:270-277	crates/pulsus-server/src/traces_api/error.rs	270	277	line	plain_text_error	fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [(header::CONTENT_TYPE, "text/plain; ch
-docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:270-304	crates/pulsus-server/src/traces_api/error.rs	270	304	line	the_error_table_holds_for_every_api_error_variant	fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [(header::CONTENT_TYPE, "text/plain; ch
-docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:304	crates/pulsus-server/src/traces_api/error.rs	304		line	StatusCode	ApiError::NotFound => (StatusCode::NOT_FOUND, "trace not found".to_string()),
-docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:366	crates/pulsus-server/src/traces_api/error.rs	366		line	UNPROCESSABLE_ENTITY	ReadError::QueryTooBroad(_) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
+docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:274-281	crates/pulsus-server/src/traces_api/error.rs	274	281	line	plain_text_error	fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [(header::CONTENT_TYPE, "text/plain; ch
+docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:274-308	crates/pulsus-server/src/traces_api/error.rs	274	308	line	the_error_table_holds_for_every_api_error_variant	fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [(header::CONTENT_TYPE, "text/plain; ch
+docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:308	crates/pulsus-server/src/traces_api/error.rs	308		line	StatusCode	ApiError::NotFound => (StatusCode::NOT_FOUND, "trace not found".to_string()),
+docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:371	crates/pulsus-server/src/traces_api/error.rs	371		line	UNPROCESSABLE_ENTITY	ReadError::QueryTooBroad(_) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/search_response.rs:437-439	crates/pulsus-server/src/traces_api/search_response.rs	437	439	line	matched	let mut set = json!({ "matched": group.matched, "spans": spans,
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/search_response.rs:516-521	crates/pulsus-server/src/traces_api/search_response.rs	516	521	line	span_json	"matched": trace.matched, "spans": trace .spans .iter() .map(|span| span_json(span, report)) .collect::<Vec<_>>(),
-docs/query-lowering.md	exec.rs:1314-1316	crates/pulsus-read/src/traces/exec.rs	1314	1316	prose	TRACE_READ_BYTES_BUDGET	read_overflow_mode
+docs/query-lowering.md	exec.rs:1360-1362	crates/pulsus-read/src/traces/exec.rs	1360	1362	prose	TRACE_READ_BYTES_BUDGET	read_overflow_mode
 docs/query-lowering.md	logql/compile.rs:315-318	crates/pulsus-read/src/logql/compile.rs	315	318	line	residual_effect	/// The seed is always applied, so there is no residual case. fn residual_effect(&self, _s: &LqlLink, rel: Relation<Lql>
 docs/query-lowering.md	logql/predicate.rs:87-91	crates/pulsus-read/src/logql/predicate.rs	87	91	line	documentation	//! //! **It does not check its error code** (measured on this toolchain, issue //! #286): rustdoc requires the snippet
 docs/query-lowering.md	logql/predicate.rs:93	crates/pulsus-read/src/logql/predicate.rs	93		line	REMOVAL	//! **So a fence is only worth what its REMOVAL TEST is worth**, and the
@@ -109,7 +109,7 @@ docs/query-lowering.md	post_agg.rs:3307	crates/pulsus-read/src/logql/post_agg.rs
 docs/query-lowering.md	search_response.rs:513	crates/pulsus-server/src/traces_api/search_response.rs	513		line	group_json	// one-entry list and is served by `group_json` above, so the
 docs/query-lowering.md	sql.rs:950	crates/pulsus-read/src/logql/sql.rs	950		prose	streams_table	fingerprint
 docs/query-lowering.md	traces/exec.rs:84	crates/pulsus-read/src/traces/exec.rs	84		prose	HYDRATION_BYTE_BUDGET	HYDRATION_BYTE_BUDGET
-docs/query-lowering.md	traces_api/error.rs:366	crates/pulsus-server/src/traces_api/error.rs	366		prose	UNPROCESSABLE_ENTITY	ReadError::QueryTooBroad(_)
+docs/query-lowering.md	traces_api/error.rs:371	crates/pulsus-server/src/traces_api/error.rs	371		prose	UNPROCESSABLE_ENTITY	ReadError::QueryTooBroad(_)
 docs/query-to-sql.md	ast.rs:151	crates/pulsus-logql/src/ast.rs	151		prose	DropKeepElem	Vec<DropKeepElem>
 docs/query-to-sql.md	ast.rs:154	crates/pulsus-logql/src/ast.rs	154		prose	DropKeepElem	Vec<DropKeepElem>
 docs/query-to-sql.md	ast.rs:2301	crates/pulsus-logql/src/ast.rs	2301		prose	LogRange	LogRange
@@ -147,7 +147,7 @@ docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:950	crates/pulsus-read/
 docs/query-to-sql.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	MAX_QUERY_TEXT_BYTES	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 docs/query-to-sql.md	crates/pulsus-schema/src/checks.rs:29	crates/pulsus-schema/src/checks.rs	29		line	minor	if (major, minor) < (26, 8) {
 docs/query-to-sql.md	crates/pulsus-schema/src/checks.rs:76	crates/pulsus-schema/src/checks.rs	76		line	format	let sql = format!(
-docs/query-to-sql.md	crates/pulsus-server/src/traces_api/error.rs:303	crates/pulsus-server/src/traces_api/error.rs	303		line	BAD_REQUEST	ApiError::Plan(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+docs/query-to-sql.md	crates/pulsus-server/src/traces_api/error.rs:307	crates/pulsus-server/src/traces_api/error.rs	307		line	BAD_REQUEST	ApiError::Plan(e) => (StatusCode::BAD_REQUEST, e.to_string()),
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/search_response.rs:437-439	crates/pulsus-server/src/traces_api/search_response.rs	437	439	line	matched	let mut set = json!({ "matched": group.matched, "spans": spans,
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/search_response.rs:516-521	crates/pulsus-server/src/traces_api/search_response.rs	516	521	line	span_json	"matched": trace.matched, "spans": trace .spans .iter() .map(|span| span_json(span, report)) .collect::<Vec<_>>(),
 docs/query-to-sql.md	crates/pulsus-server/tests/traces_search_live.rs:1285	crates/pulsus-server/tests/traces_search_live.rs	1285		line	attribute	// string-valued attribute (issue #335 Stage B).
@@ -251,10 +251,10 @@ docs/query-to-sql.md	sql.rs:336	crates/pulsus-read/src/logql/sql.rs	336		prose	l
 docs/query-to-sql.md	sql.rs:748	crates/pulsus-read/src/logql/sql.rs	748		prose	probe	probe
 docs/query-to-sql.md	sql.rs:788	crates/pulsus-read/src/logql/sql.rs	788		prose	streams_idx_table	ORDER
 docs/query-to-sql.md	sql.rs:950	crates/pulsus-read/src/logql/sql.rs	950		prose	streams_table	stage2
-docs/query-to-sql.md	traces/exec.rs:1276	crates/pulsus-read/src/traces/exec.rs	1276		line	dispatch	.dispatch
-docs/query-to-sql.md	traces/exec.rs:1317	crates/pulsus-read/src/traces/exec.rs	1317		line	TRACE_MAX_RESULT_BYTES	.set("max_result_bytes", TRACE_MAX_RESULT_BYTES)
+docs/query-to-sql.md	traces/exec.rs:1322	crates/pulsus-read/src/traces/exec.rs	1322		line	dispatch	.dispatch
+docs/query-to-sql.md	traces/exec.rs:1363	crates/pulsus-read/src/traces/exec.rs	1363		line	TRACE_MAX_RESULT_BYTES	.set("max_result_bytes", TRACE_MAX_RESULT_BYTES)
 docs/query-to-sql.md	traces/exec.rs:148	crates/pulsus-read/src/traces/exec.rs	148		line	TRACE_METRICS_MAX_SET_ROWS	pub const TRACE_METRICS_MAX_SET_ROWS: u64 = 1_000_000;
 docs/query-to-sql.md	traces/exec.rs:84	crates/pulsus-read/src/traces/exec.rs	84		line	HYDRATION_BYTE_BUDGET	pub const HYDRATION_BYTE_BUDGET: usize = 256 * 1024 * 1024;
 docs/query-to-sql.md	traces/exec.rs:96	crates/pulsus-read/src/traces/exec.rs	96		line	TRACE_MAX_RESULT_BYTES	pub const TRACE_MAX_RESULT_BYTES: u64 = 64 * 1024 * 1024;
-docs/query-to-sql.md	traces_api/error.rs:270-274	crates/pulsus-server/src/traces_api/error.rs	270	274	line	plain_text_error	fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [(header::CONTENT_TYPE, "text/plain; ch
-docs/query-to-sql.md	traces_api/error.rs:385	crates/pulsus-server/src/traces_api/error.rs	385		line	PipelineInvalid	ReadError::PipelineInvalid { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
+docs/query-to-sql.md	traces_api/error.rs:274-278	crates/pulsus-server/src/traces_api/error.rs	274	278	line	plain_text_error	fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [(header::CONTENT_TYPE, "text/plain; ch
+docs/query-to-sql.md	traces_api/error.rs:390	crates/pulsus-server/src/traces_api/error.rs	390		line	PipelineInvalid	ReadError::PipelineInvalid { .. } => (StatusCode::BAD_REQUEST, e.to_string()),

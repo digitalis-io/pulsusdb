@@ -10,30 +10,37 @@
 
 use axum::Json;
 use axum::extract::{RawQuery, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
+use pulsus_model::{Tenant, tenant_from_headers};
 use pulsus_read::{GraphWindow, ServiceGraph};
 
 use crate::app::AppState;
 
 use super::error::ApiError;
-use super::handlers::{engine_for, no_tenant};
+use super::handlers::engine_for;
 use super::params;
 
 /// `GET /api/traces/v1/service_graph`.
 pub(crate) async fn service_graph(
     State(state): State<AppState>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    match graph_impl(state, raw.as_deref().unwrap_or("")).await {
+    // Issue #738: the tenant first, before any parameter is read.
+    let tenant = match tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return ApiError::Tenant(e).into_response(),
+    };
+    match graph_impl(state, tenant, raw.as_deref().unwrap_or("")).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
 }
 
-async fn graph_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
+async fn graph_impl(state: AppState, tenant: Tenant, raw: &str) -> Result<Response, ApiError> {
     let now_ns = super::tags::now_unix_nanos();
     let params = params::parse_graph_params(raw, now_ns)?;
     let retention_days = state.retention_days().ok_or(ApiError::PoolUnavailable)?;
@@ -47,7 +54,7 @@ async fn graph_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
         end_ns: params.end_ns,
     };
 
-    let engine = engine_for(&state, no_tenant()).await?;
+    let engine = engine_for(&state, tenant).await?;
     let graph = engine.service_graph(window).await?;
     Ok((StatusCode::OK, Json(render(&graph))).into_response())
 }
@@ -120,7 +127,12 @@ mod tests {
     /// `error::testutil::error_body`, which asserts Tempo's container on
     /// the way through (#384).
     async fn run(query: &str) -> (StatusCode, String) {
-        let res = service_graph(State(test_state()), RawQuery(Some(query.to_string()))).await;
+        let res = service_graph(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some(query.to_string())),
+        )
+        .await;
         error_body(res).await
     }
 

@@ -2746,6 +2746,7 @@ impl TraceLandingRow {
 }
 
 impl SpoolEncode for TraceLandingRow {
+    /// `org_id` (issue #738, so a failure record names the tenant),
     /// `row_kind` and `received_ms`, then exactly the columns that kind
     /// sets. One encoder emitting every column of the union would put
     /// another kind's fields in a row that does not carry them.
@@ -2757,6 +2758,7 @@ impl SpoolEncode for TraceLandingRow {
     fn to_spool_value(&self) -> serde_json::Value {
         match self.row_kind {
             Self::KIND_SPAN => serde_json::json!({
+                "org_id": &*self.org_id,
                 "row_kind": self.row_kind,
                 "received_ms": self.received_ms,
                 "trace_id": hex_lower(&self.trace_id),
@@ -2789,6 +2791,7 @@ impl SpoolEncode for TraceLandingRow {
                 "end_ns": self.end_ns,
             }),
             Self::KIND_RESOURCE => serde_json::json!({
+                "org_id": &*self.org_id,
                 "row_kind": self.row_kind,
                 "received_ms": self.received_ms,
                 "resource_id": self.resource_id,
@@ -2801,6 +2804,7 @@ impl SpoolEncode for TraceLandingRow {
                 "entity_refs_bytes": self.entity_refs.len() as u64,
             }),
             Self::KIND_TAG_NAME => serde_json::json!({
+                "org_id": &*self.org_id,
                 "row_kind": self.row_kind,
                 "received_ms": self.received_ms,
                 "tag_scope": self.tag_scope,
@@ -2812,6 +2816,7 @@ impl SpoolEncode for TraceLandingRow {
             // on the one path that reaches this encoder at all, which is a
             // failure path.
             _ => serde_json::json!({
+                "org_id": &*self.org_id,
                 "row_kind": self.row_kind,
                 "received_ms": self.received_ms,
                 "tag_scope": self.tag_scope,
@@ -2853,6 +2858,7 @@ impl SpoolEncode for TraceLandingRow {
                 o.field("kind", &self.kind).await?;
                 o.field("links", &(self.links.len() as u64)).await?;
                 o.str_field("name", &self.name).await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.str_field("parent_span_id", &hex_lower(&self.parent_span_id))
                     .await?;
                 o.field("received_ms", &self.received_ms).await?;
@@ -2888,6 +2894,7 @@ impl SpoolEncode for TraceLandingRow {
                 o.field("dropped_attrs", &self.dropped_attrs).await?;
                 o.field("entity_refs_bytes", &(self.entity_refs.len() as u64))
                     .await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.field("resource_id", &self.resource_id).await?;
                 o.field("row_kind", &self.row_kind).await?;
@@ -2895,6 +2902,7 @@ impl SpoolEncode for TraceLandingRow {
                 o.str_field("service", &self.service).await?;
             }
             Self::KIND_TAG_NAME => {
+                o.str_field("org_id", &self.org_id).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.field("row_kind", &self.row_kind).await?;
                 o.str_field("tag_key", &self.tag_key).await?;
@@ -2903,6 +2911,7 @@ impl SpoolEncode for TraceLandingRow {
             // The tag value's arm, as the fallback, for the reason
             // [`Self::to_spool_value`]'s own fallback gives.
             _ => {
+                o.str_field("org_id", &self.org_id).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.field("row_kind", &self.row_kind).await?;
                 o.str_field("tag_key", &self.tag_key).await?;
@@ -3029,22 +3038,24 @@ mod trace_landing_tests {
         let names = <TraceLandingRow as pulsus_clickhouse::Row>::COLUMN_NAMES;
         assert_eq!(
             names.len(),
-            37,
-            "the table has 38 columns and the row type declares the other 37: {names:?}"
+            38,
+            "the table has 39 columns and the row type declares the other 38: {names:?}"
         );
         assert!(
             !names.contains(&"event_id"),
             "the landed event's own identity is the server's to fill: {names:?}"
         );
-        // The insert's column list is exactly the row's own field order, so
-        // the first column is the one the DDL declares after `event_id`.
-        assert_eq!(names[0], "received_ms");
-        assert_eq!(names[1], "row_kind");
+        // The insert's column list is exactly the row's own field order:
+        // the tenant first, as the DDL declares it (issue #738), then the
+        // column the DDL declares after `event_id`.
+        assert_eq!(names[0], "org_id");
+        assert_eq!(names[1], "received_ms");
+        assert_eq!(names[2], "row_kind");
         // And the five issue #587 appended, then issue #589's one, in the
         // table's own order, which is what makes the positional encoding
         // land them in the right columns.
         assert_eq!(
-            &names[31..],
+            &names[32..],
             &[
                 "scope_schema_url",
                 "scope_dropped_attrs",

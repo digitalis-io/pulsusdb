@@ -123,7 +123,7 @@ fn the_clustered_statement_runs_per_shard_on_the_target_tables() {
     for case in CASES {
         let sql = sql_of(case);
         assert_eq!(
-            sql.matches("WHERE conn_type = ''").count(),
+            sql.matches("WHERE org_id = '' AND conn_type = ''").count(),
             1,
             "{}: the markers are read in one subquery: {sql}",
             case.name

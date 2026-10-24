@@ -58,12 +58,10 @@ use super::spans::tags::{
     TAG_STORE_READ_ROWS, TagNarrowing, TagShape, ValueScope, cut_rows, name_values_sql,
     narrowed_values_sql, narrowing_from_query, table_reads,
 };
-use super::tenant_scope::TenantTerm;
 use super::values::{GroupCardinalityCounter, SpanSetGroup, SpanSummary};
 use super::window_sql::WindowSql;
 use crate::logql::error::{ReadError, TooBroadReason};
 use crate::logql::explain::PlanExplain;
-use pulsus_model::Tenant;
 
 /// Response cap for the §4.3 tag-names read (`GET /api/traces/v1/tags`,
 /// issue #58) — a documented constant (docs/api.md §4.3; promoted to
@@ -698,13 +696,13 @@ pub struct TraceEngine {
     graph_target: GraphTargetCache,
     /// Issue #738: the request's tenant, as the term every trace read
     /// carries.
-    tenant: TenantTerm,
+    tenant: crate::traces::tenant_scope::TenantTerm,
 }
 
 impl TraceEngine {
     /// An engine reading `tenant`'s traces (issue #738).
-    pub fn new(client: ChClient, config: TraceReadConfig, tenant: Tenant) -> Self {
-        let tenant = TenantTerm::of(&tenant);
+    pub fn new(client: ChClient, config: TraceReadConfig, tenant: pulsus_model::Tenant) -> Self {
+        let tenant = crate::traces::tenant_scope::TenantTerm::of(&tenant);
         let mut tables: Vec<String> = [
             "resources",
             "spans",
@@ -1083,7 +1081,15 @@ impl TraceEngine {
         // Issue #509: neither branch escapes a `?` here. The doubling
         // happens once, in `traces::dispatch`, for every read on this
         // path. The key is escaped into a JSON path by the builder.
-        let sql = tag_values_statement(&self.config, self.tag_read_rows, scope, key, w, &n);
+        let sql = tag_values_statement(
+            &self.tenant,
+            &self.config,
+            self.tag_read_rows,
+            scope,
+            key,
+            w,
+            &n,
+        );
         self.stream_tag_values(&sql, &tag_store_settings(&self.config), &n)
             .await
     }
@@ -1117,7 +1123,7 @@ impl TraceEngine {
             tenant: &self.tenant,
         };
         let n = req.narrowing(&ctx);
-        let sql = span_names_statement(&self.config, self.tag_read_rows, w, &n);
+        let sql = span_names_statement(&self.tenant, &self.config, self.tag_read_rows, w, &n);
         let settings = tag_store_settings(&self.config);
         let mut values = Vec::new();
         // Scoped stream: same lease/drain contract as list_tag_names.
@@ -1386,6 +1392,7 @@ fn tag_store_settings(config: &TraceReadConfig) -> QuerySettings {
 /// 2a), its cut sized from `ceiling`, the scan budget and the statement's
 /// table reads.
 fn tag_values_statement(
+    tenant: &crate::traces::tenant_scope::TenantTerm,
     config: &TraceReadConfig,
     ceiling: u64,
     scope: Option<&str>,
@@ -1395,6 +1402,7 @@ fn tag_values_statement(
 ) -> String {
     let vs = ValueScope::from_attr_scope(scope);
     narrowed_values_sql(
+        tenant,
         &config.spans_table,
         &config.resources_table,
         &config.traces_table,
@@ -1414,12 +1422,14 @@ fn tag_values_statement(
 /// The span-name statement (issue #598 part 2a), its cut sized as
 /// [`tag_values_statement`]'s.
 fn span_names_statement(
+    tenant: &crate::traces::tenant_scope::TenantTerm,
     config: &TraceReadConfig,
     ceiling: u64,
     w: WindowSql,
     n: &TagNarrowing,
 ) -> String {
     name_values_sql(
+        tenant,
         &config.spans_table,
         &config.traces_table,
         w,
@@ -1566,7 +1576,7 @@ fn with_final(s: QuerySettings) -> QuerySettings {
 /// answers it. A non-empty span array is needed because statement 1
 /// answers one row whatever `index_rows` turns out to be.
 fn fetch_route_and_second(
-    tenant: &TenantTerm,
+    tenant: &crate::traces::tenant_scope::TenantTerm,
     config: &TraceReadConfig,
     hex32: &str,
     index_rows: u64,
@@ -2769,21 +2779,37 @@ mod tests {
         let mixed = tag_narrowing(r#"{traceDuration > 1s && span.a="x"}"#, w);
         let cases = [
             (
-                span_names_statement(&config, ceiling, w, &span_a),
+                span_names_statement(empty_term(), &config, ceiling, w, &span_a),
                 "LIMIT 300000)) AS cut",
             ),
             (
-                tag_values_statement(&config, ceiling, None, "http.route", w, &span_a),
+                tag_values_statement(
+                    empty_term(),
+                    &config,
+                    ceiling,
+                    None,
+                    "http.route",
+                    w,
+                    &span_a,
+                ),
                 "LIMIT 200000)) AS cut",
             ),
             (
-                tag_values_statement(&config, ceiling, Some("span"), "http.route", w, &mixed),
+                tag_values_statement(
+                    empty_term(),
+                    &config,
+                    ceiling,
+                    Some("span"),
+                    "http.route",
+                    w,
+                    &mixed,
+                ),
                 "LIMIT 150000)) AS cut",
             ),
         ];
         let mut wide = cfg();
         wide.scan_budget_rows = 50_000_000;
-        let last = span_names_statement(&wide, 10_000, w, &span_a);
+        let last = span_names_statement(empty_term(), &wide, 10_000, w, &span_a);
         for (sql, want) in cases.iter().chain([(last, "LIMIT 10000)) AS cut")].iter()) {
             assert!(sql.contains(want), "want {want}: {sql}");
             assert!(!sql.contains("LIMIT 10000000)"), "a fixed R: {sql}");

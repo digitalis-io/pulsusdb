@@ -126,8 +126,9 @@ impl Membership<'_, '_> {
     fn over(&self, cols: &str, m: &str, extra: &str) -> String {
         let w = self.ctx.window;
         format!(
-            "SELECT {cols} FROM {} WHERE {}{} AND {} AND {} AND ({m}){extra}",
+            "SELECT {cols} FROM {} WHERE {} AND {}{} AND {} AND {} AND ({m}){extra}",
             self.spans_table,
+            self.ctx.tenant,
             self.scope,
             w.span_time_clause(),
             w.span_bucket_clause(),
@@ -294,8 +295,9 @@ impl Membership<'_, '_> {
         let found = |t: &str, p: &str| {
             if stop {
                 format!(
-                    "toUInt8(({t}, {p}) IN (SELECT trace_id, span_id FROM {} WHERE {CAND_KEYS} AND {} AND ({other})))",
+                    "toUInt8(({t}, {p}) IN (SELECT trace_id, span_id FROM {} WHERE {} AND {CAND_KEYS} AND {} AND ({other})))",
                     self.spans_table,
+                    self.ctx.tenant,
                     self.window()
                 )
             } else {
@@ -310,17 +312,18 @@ impl Membership<'_, '_> {
             "WITH RECURSIVE (SELECT (groupArrayIf(trace_id, both), groupArrayIf(keys, both)) \
              FROM (SELECT trace_id, groupUniqArray(intDiv(start_ns, 300000000000)) AS keys, \
              countIf({start}) > 0 AND countIf({other}) > 0 AS both \
-             FROM {spans} WHERE {scope}{window} GROUP BY trace_id)) AS climb_cand, \
+             FROM {spans} WHERE {tenant} AND {scope}{window} GROUP BY trace_id)) AS climb_cand, \
              climb AS (\
              SELECT DISTINCT trace_id, span_id AS start, parent_span_id AS cur, toUInt32(1) AS depth, {found_base} AS found, CAST([], 'Array(FixedString(8))') AS path FROM {spans} \
-             WHERE {CAND_KEYS} AND {window} AND ({start}) AND parent_span_id != {ZERO} AND parent_span_id != span_id \
+             WHERE {tenant} AND {CAND_KEYS} AND {window} AND ({start}) AND parent_span_id != {ZERO} AND parent_span_id != span_id \
              UNION ALL \
              SELECT c.trace_id, c.start, x.parent_span_id, c.depth + 1, {found_step}, arrayPushBack(c.path, c.cur) \
-             FROM (SELECT DISTINCT trace_id, span_id, parent_span_id FROM {spans} WHERE {CAND_KEYS} AND {window}) AS x \
+             FROM (SELECT DISTINCT trace_id, span_id, parent_span_id FROM {spans} WHERE {tenant} AND {CAND_KEYS} AND {window}) AS x \
              INNER JOIN climb AS c ON x.trace_id = c.trace_id AND x.span_id = c.cur \
              WHERE c.found = 0 AND c.depth <= {d} AND x.parent_span_id != {ZERO} AND x.parent_span_id != x.span_id \
              AND NOT has(c.path, x.parent_span_id))",
             spans = self.spans_table,
+            tenant = self.ctx.tenant,
             window = self.window(),
             d = self.max_depth,
             scope = self.scope,

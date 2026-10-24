@@ -1152,7 +1152,7 @@ async fn start_edges(client: &ChClient, marker_ns: i64) {
     exec(
         client,
         &format!(
-            "INSERT INTO service_edges SELECT {t}, {t}, '', '', '', 0, 0, \
+            "INSERT INTO service_edges SELECT '', {t}, {t}, '', '', '', 0, 0, \
              arrayReduce('quantilesTDigestState(0.5, 0.95, 0.99)', [toInt64(0)]), 1",
             t = format_args!("toDateTime({}, 'UTC')", marker_ns / S)
         ),
@@ -1641,7 +1641,7 @@ async fn seed_edges(clients: &[&ChClient], client: &ChClient, marker_ns: i64) {
     exec(
         client,
         &format!(
-            "INSERT INTO service_edges SELECT {t}, {t}, '', '', '', 0, 0, \
+            "INSERT INTO service_edges SELECT '', {t}, {t}, '', '', '', 0, 0, \
              arrayReduce('quantilesTDigestState(0.5, 0.95, 0.99)', [toInt64(0)]), 1",
             t = format_args!("toDateTime({}, 'UTC')", marker_ns / S)
         ),
@@ -2246,7 +2246,7 @@ async fn two_replicas_share_one_edge_table() {
     r.s1b
         .execute(
             &format!(
-                "INSERT INTO service_edges SELECT minute, client_minute, client, server, \
+                "INSERT INTO service_edges SELECT org_id, minute, client_minute, client, server, \
                  conn_type, calls, failed, q, ver + 1 \
                  FROM remote('{source}', '{db}', 'service_edges') WHERE ver > 1"
             ),
@@ -3120,7 +3120,7 @@ async fn a_pending_replace_range_holds_the_run() {
         &r.s1,
         "CREATE TABLE spans_g AS spans ENGINE = MergeTree \
          PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') \
-         ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)",
+         ORDER BY (org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)",
     )
     .await;
     push_g_into(&r.s1, "spans_g", l, 0..8).await;
@@ -3365,7 +3365,7 @@ async fn the_replica_s_own_marker_does_not_hold_the_run() {
     exec(
         &r.s2,
         &format!(
-            "INSERT INTO service_edges SELECT {t}, {t}, '', '', '', 0, 0, \
+            "INSERT INTO service_edges SELECT '', {t}, {t}, '', '', '', 0, 0, \
              arrayReduce('quantilesTDigestState(0.5, 0.95, 0.99)', [toInt64(0)]), 2",
             t = format_args!("toDateTime({}, 'UTC')", (l - MINUTE) / S)
         ),

@@ -11,11 +11,12 @@ use axum::Json;
 use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use pulsus_model::{Tenant, tenant_from_headers};
 
 use crate::app::AppState;
 
 use super::error::ApiError;
-use super::handlers::{engine_for, no_tenant};
+use super::handlers::engine_for;
 use super::{legacy, params, search_response};
 
 /// `X-Pulsus-Explain: 1` (docs/api.md "Request headers"), issue #492.
@@ -39,7 +40,12 @@ pub(crate) async fn search(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    match search_impl(state, &headers, raw.as_deref().unwrap_or("")).await {
+    // Issue #738: the tenant first, before any parameter is read.
+    let tenant = match tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return ApiError::Tenant(e).into_response(),
+    };
+    match search_impl(state, tenant, &headers, raw.as_deref().unwrap_or("")).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -47,6 +53,7 @@ pub(crate) async fn search(
 
 async fn search_impl(
     state: AppState,
+    tenant: Tenant,
     headers: &HeaderMap,
     raw: &str,
 ) -> Result<Response, ApiError> {
@@ -80,7 +87,7 @@ async fn search_impl(
     let indexed = pulsus_read::traces::spans::attr_index::IndexedAttr::from_config(
         &state.config.traceql_indexed_attributes,
     );
-    let term = pulsus_read::traces::tenant_scope::TenantTerm::of(&no_tenant());
+    let term = pulsus_read::traces::tenant_scope::TenantTerm::of(&tenant);
     let tables = pulsus_read::StatementTables {
         spans: &read_config.spans_table,
         error_spans: &read_config.error_spans_table,
@@ -109,7 +116,7 @@ async fn search_impl(
         pulsus_read::plan_search_request(&query, &search_params, &tables, read_config.max_depth)
             .map_err(ApiError::Plan)?;
 
-    let engine = engine_for(&state, no_tenant()).await?;
+    let engine = engine_for(&state, tenant).await?;
     if !wants_explain(headers) {
         let output = engine.search_routed(&request).await?;
         return Ok((StatusCode::OK, Json(search_response::render(&output))).into_response());

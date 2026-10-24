@@ -57,7 +57,9 @@ rewrite docs/schemas.md:33-33
 # column: deleting the previous trace store's §4 text removed the
 # file's last mention of each. It prunes #556 from the
 # `docs/schemas.md:691-692` row for the same reason.
-rewrite docs/schemas.md:174-174 refs=#25,#603,#16,#171,#498,#2,#57,#584,#586,#587,#63,#75,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#235,#3,#450,#624,#412,#398,#653,#4,#602,#614,#131,#137,#598,#597,#599,#501,#601
+# Issue #738 adds #738, its own issue, where the trace tables' column and
+# views, and the trace read paths, carry the tenant.
+rewrite docs/schemas.md:174-174 refs=#25,#603,#16,#171,#498,#2,#57,#584,#586,#587,#63,#75,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#235,#3,#450,#624,#412,#398,#653,#4,#602,#614,#131,#137,#598,#597,#599,#501,#601,#738
 # `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
 # writer-contract paragraph gained the reason the read path does not route on
 # `metric_series.value_type`, and that reason is the decision A1's plan v5
@@ -106,7 +108,9 @@ rewrite docs/schemas.md:691-692
 # Issue #614 part 2 adds #614, where the rollup bullet states its route rule.
 # Issue #501 part 1 adds #501, its own issue, where the top banner says the
 # exemplar table and landing kind 4 are defined in `schema/schema.sql`.
-rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624,#596,#507,#594,#602,#592,#653,#614,#597,#599,#501,#601
+# Issue #738 adds #738, its own issue, where the tenancy section says traces
+# are tenant-scoped beside metrics and logs.
+rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624,#596,#507,#594,#602,#592,#653,#614,#597,#599,#501,#601,#738
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
 rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560
@@ -171,9 +175,11 @@ rewrite crates/pulsus-write/src/writer/mod.rs:566-568
 # old span and attribute tables are replaced. `#586` and `#602` are on the
 # rewritten module doc: #586 is carried from the module it replaces, and
 # #602 is the change itself.
+# Issue #738 adds #738, its own issue, where the writer charges a push its
+# tenant's bytes and its test pins that charge.
 leave crates/pulsus-write/src/protocols/otlp_logs.rs:111-113
 leave crates/pulsus-write/src/ingest/metrics.rs:94-97
-rewrite crates/pulsus-write/src/writer/trace.rs:5-5 refs=#586,#602
+rewrite crates/pulsus-write/src/writer/trace.rs:5-5 refs=#586,#602,#738
 rewrite crates/pulsus-write/src/writer/trace.rs:159-159
 leave crates/pulsus-server/tests/logs_api_live.rs:1404-1404
 leave crates/pulsus-server/tests/fingerprint_collision_live.rs:676-682

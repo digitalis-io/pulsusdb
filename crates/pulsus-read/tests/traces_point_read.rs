@@ -1162,7 +1162,7 @@ async fn a_retention_edge_trace_keeps_its_resource_and_per_trace_rows() {
         },
     )
     .unwrap_or_else(|e| panic!("{query} must compile: {e}"));
-    let membership_sql = span_membership_sql("spans", w, &predicate);
+    let membership_sql = span_membership_sql(empty_term(), "spans", w, &predicate);
     let mut stream = client
         .query_stream::<IdRow>(
             &membership_sql.replace('?', "??"),

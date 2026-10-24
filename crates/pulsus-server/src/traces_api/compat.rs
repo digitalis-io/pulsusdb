@@ -13,15 +13,16 @@
 //! `compat_router()`'s job (`mod.rs`), gated by `crate::compat`.
 
 use axum::extract::{Path, RawQuery, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
+use pulsus_model::{Tenant, tenant_from_headers};
 use pulsus_read::{TagNames, TagValues};
 
 use crate::app::AppState;
 
 use super::error::ApiError;
-use super::handlers::{engine_for, no_tenant};
+use super::handlers::engine_for;
 use super::params::TagScope;
 use super::tags::{self, attribute_scope, ok_json};
 use super::tags_response::TagNamesAnswer;
@@ -37,12 +38,16 @@ enum NamesSource {
 /// Shared fetch for both tag-name reshapings — parse-before-pool, then
 /// the exact catalog read `tags::tags` performs, EXCEPT for the two
 /// static scopes, which return without touching the pool (issue #475).
-async fn tag_names_for(state: AppState, raw: &str) -> Result<NamesSource, ApiError> {
+async fn tag_names_for(
+    state: AppState,
+    tenant: Tenant,
+    raw: &str,
+) -> Result<NamesSource, ApiError> {
     let params = params::parse_tags_params(raw)?;
     match params.scope {
         scope @ (TagScope::Intrinsic | TagScope::NoTags) => Ok(NamesSource::Static(scope)),
         scope => {
-            let engine = engine_for(&state, no_tenant()).await?;
+            let engine = engine_for(&state, tenant).await?;
             let names = engine
                 .list_tag_names(attribute_scope(scope), tags::catalog_floor_ns(&state)?)
                 .await?;
@@ -82,6 +87,7 @@ impl NamesSource {
 /// catalog one, bounded by the retention floor alone.
 async fn tag_values_v1_for(
     state: AppState,
+    tenant: Tenant,
     raw_tag: &str,
     raw_query: &str,
 ) -> Result<TagValues, ApiError> {
@@ -91,7 +97,7 @@ async fn tag_values_v1_for(
         tags::now_unix_nanos(),
         tags::tag_lookback_ns(&state),
     )?;
-    let engine = engine_for(&state, no_tenant()).await?;
+    let engine = engine_for(&state, tenant).await?;
     Ok(engine
         .list_tag_values(
             &key,
@@ -109,9 +115,18 @@ async fn tag_values_v1_for(
 }
 
 /// `GET /api/search/tags` — Tempo v1 flat `{"tagNames":[…]}`.
-pub(crate) async fn tags_v1(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+pub(crate) async fn tags_v1(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    // Issue #738: the tenant first, before any parameter is read.
+    let tenant = match tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return ApiError::Tenant(e).into_response(),
+    };
     let raw = raw.as_deref().unwrap_or("");
-    match tag_names_for(state, raw).await {
+    match tag_names_for(state, tenant, raw).await {
         Ok(source) => ok_json(tags_response::render_tag_names_flat(
             &source.answer(false),
             limit_of(raw),
@@ -130,10 +145,16 @@ fn limit_of(raw_query: &str) -> Option<usize> {
 pub(crate) async fn tag_values_v1(
     State(state): State<AppState>,
     Path(tag): Path<String>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    // Issue #738: the tenant first, before any parameter is read.
+    let tenant = match tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return ApiError::Tenant(e).into_response(),
+    };
     let raw = raw.as_deref().unwrap_or("");
-    match tag_values_v1_for(state, &tag, raw).await {
+    match tag_values_v1_for(state, tenant, &tag, raw).await {
         Ok(values) => ok_json(tags_response::render_tag_values_flat(
             &values,
             limit_of(raw),
@@ -144,9 +165,18 @@ pub(crate) async fn tag_values_v1(
 
 /// `GET /api/v2/search/tags` — the native scoped shape minus
 /// `truncated`.
-pub(crate) async fn tags_v2(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+pub(crate) async fn tags_v2(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    // Issue #738: the tenant first, before any parameter is read.
+    let tenant = match tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return ApiError::Tenant(e).into_response(),
+    };
     let raw = raw.as_deref().unwrap_or("");
-    match tag_names_for(state, raw).await {
+    match tag_names_for(state, tenant, raw).await {
         Ok(source) => ok_json(tags_response::render_tag_names_scoped_v2(
             &source.answer(true),
             limit_of(raw),
@@ -161,10 +191,16 @@ pub(crate) async fn tags_v2(State(state): State<AppState>, RawQuery(raw): RawQue
 pub(crate) async fn tag_values_v2(
     State(state): State<AppState>,
     Path(tag): Path<String>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    // Issue #738: the tenant first, before any parameter is read.
+    let tenant = match tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return ApiError::Tenant(e).into_response(),
+    };
     let raw = raw.as_deref().unwrap_or("");
-    match tags::values_for(&state, &tag, raw).await {
+    match tags::values_for(&state, tenant, &tag, raw).await {
         Ok(source) => ok_json(tags_response::render_tag_values_typed_v2(
             &source.answer(),
             limit_of(raw),
@@ -222,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_well_formed_v1_tags_request_without_a_pool_is_503() {
-        let res = tags_v1(State(test_state()), RawQuery(None)).await;
+        let res = tags_v1(State(test_state()), HeaderMap::new(), RawQuery(None)).await;
         // `error_body` asserts Tempo's container on the way through, so
         // the §8.1 aliases are not a hole in the #384 check.
         let (status, body) = error_body(res).await;
@@ -235,6 +271,7 @@ mod tests {
         let res = tag_values_v1(
             State(test_state()),
             Path("service.name".to_string()),
+            HeaderMap::new(),
             RawQuery(None),
         )
         .await;
@@ -245,7 +282,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_well_formed_v2_tags_request_without_a_pool_is_503() {
-        let res = tags_v2(State(test_state()), RawQuery(None)).await;
+        let res = tags_v2(State(test_state()), HeaderMap::new(), RawQuery(None)).await;
         let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, "clickhouse pool not yet established");
@@ -256,6 +293,7 @@ mod tests {
         let res = tag_values_v2(
             State(test_state()),
             Path("service.name".to_string()),
+            HeaderMap::new(),
             RawQuery(None),
         )
         .await;
@@ -268,6 +306,7 @@ mod tests {
     async fn a_bogus_scope_on_the_v1_tags_alias_is_400_before_the_pool() {
         let res = tags_v1(
             State(test_state()),
+            HeaderMap::new(),
             RawQuery(Some("scope=bogus".to_string())),
         )
         .await;
@@ -281,6 +320,7 @@ mod tests {
         let res = tag_values_v2(
             State(test_state()),
             Path("resource.".to_string()),
+            HeaderMap::new(),
             RawQuery(None),
         )
         .await;

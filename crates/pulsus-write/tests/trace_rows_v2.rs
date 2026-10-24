@@ -1492,8 +1492,8 @@ async fn the_insert_omits_event_id_so_the_server_fills_it() {
     let names = <TraceLandingRow as clickhouse::Row>::COLUMN_NAMES;
     assert_eq!(
         names.len(),
-        37,
-        "the table has 38 columns and the row type declares the other 37: {names:?}"
+        38,
+        "the table has 39 columns and the row type declares the other 38: {names:?}"
     );
     assert!(
         !names.contains(&"event_id"),

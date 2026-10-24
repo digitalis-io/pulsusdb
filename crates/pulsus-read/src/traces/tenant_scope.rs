@@ -44,8 +44,182 @@ pub(crate) fn empty_term() -> &'static TenantTerm {
 /// stored under the reserved empty tenant.
 pub const MARKER_TERM: &str = "org_id = '' AND conn_type = ''";
 
-/// Whether `sql` reads every trace table in `tables` under `term`.
-pub fn check(_sql: &str, _term: &TenantTerm, _tables: &[String]) -> Result<(), String> {
+/// One lexical token of a statement, at its parenthesis depth: a bracket
+/// carries the depth outside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tok {
+    Word,
+    Quoted,
+    Open,
+    Close,
+    Dot,
+    Other,
+}
+
+struct Token {
+    kind: Tok,
+    start: usize,
+    end: usize,
+    depth: usize,
+}
+
+/// `sql` as tokens. A quoted text — `'…'`, `"…"` or `` `…` ``, with
+/// backslash escapes — is one token, so nothing inside a literal is read as
+/// a keyword or a bracket.
+fn tokens(sql: &str) -> Vec<Token> {
+    let b = sql.as_bytes();
+    let mut out = Vec::new();
+    let (mut i, mut depth) = (0, 0usize);
+    while i < b.len() {
+        let c = b[i];
+        let start = i;
+        let kind = match c {
+            b'\'' | b'"' | b'`' => {
+                i += 1;
+                while i < b.len() && b[i] != c {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(b.len());
+                Tok::Quoted
+            }
+            b'(' => {
+                i += 1;
+                out.push(Token {
+                    kind: Tok::Open,
+                    start,
+                    end: i,
+                    depth,
+                });
+                depth += 1;
+                continue;
+            }
+            b')' => {
+                i += 1;
+                depth = depth.saturating_sub(1);
+                Tok::Close
+            }
+            b'.' => {
+                i += 1;
+                Tok::Dot
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                Tok::Word
+            }
+            c if c.is_ascii_whitespace() => {
+                i += 1;
+                continue;
+            }
+            _ => {
+                i += 1;
+                Tok::Other
+            }
+        };
+        out.push(Token {
+            kind,
+            start,
+            end: i,
+            depth,
+        });
+    }
+    out
+}
+
+/// Whether `sql` reads every trace table under `term` (issue #738).
+///
+/// For every `FROM` followed by a name whose last dot-separated part is one
+/// of `tables`, the first `WHERE` at that `FROM`'s depth — before the depth
+/// closes or a `UNION`, `GROUP BY`, `ORDER BY`, `LIMIT`, `HAVING` or
+/// `SETTINGS` at that depth — must begin `<term> AND` (or, on
+/// `service_edges`, [`MARKER_TERM`]), and no `OR` may stand at that depth
+/// inside it. The refusal names the `FROM` and its byte offset.
+pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), String> {
+    let toks = tokens(sql);
+    let text = |t: &Token| &sql[t.start..t.end];
+    let word = |t: &Token, w: &str| t.kind == Tok::Word && text(t).eq_ignore_ascii_case(w);
+    // The clause at `depth` ends at `toks[k]`.
+    let ends = |k: usize, depth: usize| -> bool {
+        let t = &toks[k];
+        if t.kind == Tok::Close && t.depth < depth {
+            return true;
+        }
+        if t.depth != depth || t.kind != Tok::Word {
+            return false;
+        }
+        let next_by = toks.get(k + 1).is_some_and(|n| word(n, "BY"));
+        ["UNION", "LIMIT", "HAVING", "SETTINGS"]
+            .iter()
+            .any(|w| word(t, w))
+            || ((word(t, "GROUP") || word(t, "ORDER")) && next_by)
+    };
+    for (i, from) in toks.iter().enumerate() {
+        if !word(from, "FROM") {
+            continue;
+        }
+        // The name: parts joined by dots, each a word or a quoted name.
+        let mut j = i + 1;
+        let mut last = None;
+        while let Some(t) = toks.get(j) {
+            match t.kind {
+                Tok::Word => last = Some(text(t).to_string()),
+                Tok::Quoted if text(t).starts_with('`') => {
+                    last = Some(text(t).trim_matches('`').to_string())
+                }
+                _ => break,
+            }
+            j += 1;
+            if toks.get(j).is_some_and(|d| d.kind == Tok::Dot) {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        let Some(table) = last.filter(|name| tables.iter().any(|t| t == name)) else {
+            continue;
+        };
+        let refused = || {
+            format!(
+                "statement not tenant-scoped: FROM {table} at byte {}",
+                from.start
+            )
+        };
+        let depth = from.depth;
+        let mut k = j;
+        let where_at = loop {
+            if k >= toks.len() || ends(k, depth) {
+                break None;
+            }
+            if toks[k].depth == depth && word(&toks[k], "WHERE") {
+                break Some(k);
+            }
+            k += 1;
+        };
+        let Some(w) = where_at else {
+            return Err(refused());
+        };
+        let body = sql[toks[w].end..].trim_start();
+        let leads = |lead: &str| {
+            body.strip_prefix(lead)
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_whitespace()))
+        };
+        let marker = table == "service_edges"
+            && body
+                .strip_prefix(MARKER_TERM)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\n', ')']));
+        let scoped = leads(&format!("{term} AND")) || marker;
+        if !scoped {
+            return Err(refused());
+        }
+        let mut k = w + 1;
+        while k < toks.len() && !ends(k, depth) {
+            if toks[k].depth == depth && word(&toks[k], "OR") {
+                return Err(refused());
+            }
+            k += 1;
+        }
+    }
     Ok(())
 }
 

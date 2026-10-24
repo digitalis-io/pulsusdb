@@ -16,7 +16,7 @@ FROM (SELECT CAST([], 'Array(Tuple(String, String))') AS g, intDiv(start_ns - 1,
              arrayMap(x -> if(isFinite(x), x / 1000000000, 0), CAST(quantilesTDigest(0.5, 0.9, 0.99)(duration_ns) AS Array(Float64))) AS qq,
              argMax((trace_id, start_ns, duration_ns), (duration_ns, span_id)) AS x0
       FROM (SELECT * FROM spans
-      WHERE start_ns >= 1791399900000000001 AND start_ns < 1791410820000000001
+      WHERE org_id = '' AND start_ns >= 1791399900000000001 AND start_ns < 1791410820000000001
         AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791399900000000001, 300000000000) AND intDiv(1791410820000000000, 300000000000)
         AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-07') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-07')
         AND (true)
@@ -32,7 +32,7 @@ ORDER BY g, o
 SELECT g, o, [(toInt64(1791410820000), v)] AS points, CAST([], 'Array(Tuple(FixedString(16), Int64, Float64))') AS exemplars, 0 AS f
 FROM (SELECT g, toUInt64(qi) AS o, q AS v FROM (SELECT CAST([], 'Array(Tuple(String, String))') AS g, arrayMap(x -> if(isFinite(x), x / 1000000000, 0), CAST(quantilesTDigest(0.5, 0.9, 0.99)(duration_ns) AS Array(Float64))) AS qq
 FROM (SELECT * FROM spans
-WHERE start_ns >= 1791400000000000000 AND start_ns < 1791410800000000000
+WHERE org_id = '' AND start_ns >= 1791400000000000000 AND start_ns < 1791410800000000000
   AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791400000000000000, 300000000000) AND intDiv(1791410799999999999, 300000000000)
   AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-07') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-07')
   AND (true)

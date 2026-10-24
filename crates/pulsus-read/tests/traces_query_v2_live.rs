@@ -285,7 +285,7 @@ fn body(query: &str) -> FieldExpr {
 async fn answer(client: &ChClient, w: WindowSql, query: &str) -> Vec<String> {
     let predicate = compile_span_predicate(&body(query))
         .unwrap_or_else(|e| panic!("{query} must compile: {e}"));
-    let sql = span_membership_sql(SPANS_TABLE, w, &predicate);
+    let sql = span_membership_sql(empty_term(), SPANS_TABLE, w, &predicate);
     ids_of(client, &sql).await
 }
 
@@ -1483,7 +1483,11 @@ async fn try_ids_of(client: &ChClient, sql: &str) -> Result<Vec<String>, String>
 async fn answer_in(client: &ChClient, w: WindowSql, query: &str) -> Result<Vec<String>, String> {
     let predicate = compile_span_predicate_in(&body(query), &ctx_of(w))
         .map_err(|e| format!("<refused: {e}>"))?;
-    try_ids_of(client, &span_membership_sql(SPANS_TABLE, w, &predicate)).await
+    try_ids_of(
+        client,
+        &span_membership_sql(empty_term(), SPANS_TABLE, w, &predicate),
+    )
+    .await
 }
 
 /// A statement this suite expects to FAIL: `Ok(text)` is the driver's
@@ -2144,7 +2148,13 @@ async fn the_service_name_is_compared_in_its_stored_type() {
                 strings(&|e| *e != row.service)
             };
             let got = match compile_span_leaf_in(&svc, op, &Value::String(lit.clone()), &ctx) {
-                Ok(p) => try_ids_of(&client, &span_membership_sql(SPANS_TABLE, w, &p)).await,
+                Ok(p) => {
+                    try_ids_of(
+                        &client,
+                        &span_membership_sql(empty_term(), SPANS_TABLE, w, &p),
+                    )
+                    .await
+                }
                 Err(e) => Err(format!("<refused: {e}>")),
             };
             if got.as_ref() != Ok(&want) {
@@ -5535,6 +5545,7 @@ async fn search_rows(
     let p = compile_span_predicate_in(&body, &ctx_of(w))
         .unwrap_or_else(|e| panic!("{query} must compile: {e}"));
     let sql = search_sql(
+        empty_term(),
         SPANS_TABLE,
         "traces",
         w,
@@ -5706,21 +5717,21 @@ const CORPUS_S_NS: i64 = 10_800_000_000_000;
 
 /// The error-span table, from the spans, by `error_spans_mv`'s own `SELECT`
 /// (issue #601 part 4b).
-const ERROR_SPANS_FROM_SPANS: &str = "INSERT INTO error_spans SELECT trace_id, span_id, start_ns, \
+const ERROR_SPANS_FROM_SPANS: &str = "INSERT INTO error_spans SELECT org_id, trace_id, span_id, start_ns, \
      duration_ns, end_ns, service, service_type, resource_id, name, kind, status_code, \
      status_message FROM spans WHERE status_code = 2";
 
 /// The per-trace table, from the spans, by `traces_mv`'s own `SELECT`.
-const TRACES_FROM_SPANS: &str = "INSERT INTO traces SELECT toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, \
+const TRACES_FROM_SPANS: &str = "INSERT INTO traces SELECT org_id, toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, \
      s AS start_ns, e AS end_ns, r AS root, sv AS services, \
      ls AS last_start_ns, bk AS buckets \
-     FROM (SELECT trace_id, min(start_ns) AS s, \
+     FROM (SELECT org_id, trace_id, min(start_ns) AS s, \
      max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), 9223372036854775807))) AS e, \
      min((toUInt8(parent_span_id != toFixedString('', 8)), start_ns, span_id, \
      if(service_type = 'string', toString(service), ''), toString(name))) AS r, \
      groupUniqArrayIf(toString(service), service_type = 'string') AS sv, max(start_ns) AS ls, \
      groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk \
-     FROM spans GROUP BY trace_id)";
+     FROM spans GROUP BY org_id, trace_id)";
 
 /// One corpus-S statement, its threads and memory bounded: the server is
 /// shared.
@@ -19617,6 +19628,7 @@ async fn todays_values_4b(
     let w = WindowSql::start_closed_end_open(s, e);
     let n = narrowing_from_query(q, &ctx_of(w));
     let sql = narrowed_values_sql(
+        empty_term(),
         SPANS_TABLE,
         RESOURCES_TABLE,
         "traces",

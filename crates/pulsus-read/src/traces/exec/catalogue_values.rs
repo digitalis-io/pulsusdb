@@ -66,6 +66,7 @@ impl TraceEngine {
             };
             let edge_n = req.narrowing(&ctx);
             edges.push(tag_values_statement(
+                &self.tenant,
                 &self.config,
                 self.tag_read_rows,
                 Some("span"),

@@ -15,6 +15,7 @@ use xxhash_rust::xxh3::xxh3_128;
 
 use super::projection::ceiling_sql;
 use crate::traces::sql_text::{PlanError, parse_num, sql_op};
+use crate::traces::tenant_scope::TenantTerm;
 use crate::traces::window_sql::{RECENT_BUCKET_NS, WindowSql};
 
 /// One trace leaf's element of the per-trace scalar: the alias the leaf
@@ -79,6 +80,7 @@ pub fn trace_leaf(
 ///
 /// [`type_refusal`]'s, and `parse_num`'s for a literal it cannot read.
 pub fn child_leaf(
+    tenant: &TenantTerm,
     op: ComparisonOp,
     value: &Value,
     rendered: &str,
@@ -96,7 +98,7 @@ pub fn child_leaf(
     };
     Ok(format!(
         "(trace_id, span_id) {not}IN (SELECT trace_id, parent_span_id FROM {spans_table} \
-         WHERE ({} OR (intDiv(start_ns, {RECENT_BUCKET_NS}), trace_id) IN \
+         WHERE {tenant} AND ({} OR (intDiv(start_ns, {RECENT_BUCKET_NS}), trace_id) IN \
          (SELECT arrayJoin(per_trace.1))) AND parent_span_id != toFixedString('', 8) \
          GROUP BY trace_id, parent_span_id HAVING {cond})",
         w.span_bucket_clause()
@@ -113,6 +115,7 @@ pub(crate) const CHILDREN: &str = "uniqExact(span_id, start_ns, kind)";
 /// `child_counts`, element 1 is every read trace's buckets outside the
 /// window, as `(bucket, trace_id)`.
 pub fn per_trace_sql(
+    tenant: &TenantTerm,
     trace_leaves: &[&TraceLeaf],
     child_counts: bool,
     w: WindowSql,
@@ -149,7 +152,7 @@ pub fn per_trace_sql(
         ""
     };
     format!(
-        "(SELECT tuple({elements})\n FROM (SELECT trace_id, max(end_ns) - min(start_ns) AS duration, min(root) AS r,\n              if(r.1 = 0, {service}, '') AS root_service, if(r.1 = 0, {name}, '') AS root_name{buckets}\n       FROM {traces_table}\n       WHERE {days}\n       GROUP BY trace_id\n       HAVING max(last_start_ns) >= {first} AND min(start_ns) <= {last})) AS per_trace,\n     {aliases}",
+        "(SELECT tuple({elements})\n FROM (SELECT trace_id, max(end_ns) - min(start_ns) AS duration, min(root) AS r,\n              if(r.1 = 0, {service}, '') AS root_service, if(r.1 = 0, {name}, '') AS root_name{buckets}\n       FROM {traces_table}\n       WHERE {tenant} AND {days}\n       GROUP BY trace_id\n       HAVING max(last_start_ns) >= {first} AND min(start_ns) <= {last})) AS per_trace,\n     {aliases}",
         elements = elements.join(", "),
         service = ceiling_sql("r.4"),
         name = ceiling_sql("r.5"),
@@ -252,10 +255,16 @@ impl TraceValue {
 
     /// `(ids, values)` of the traces `filter` keeps, one row per trace
     /// within `w`'s per-trace days.
-    fn pairs_sql(self, traces_table: &str, w: WindowSql, filter: &str) -> String {
+    fn pairs_sql(
+        self,
+        tenant: &TenantTerm,
+        traces_table: &str,
+        w: WindowSql,
+        filter: &str,
+    ) -> String {
         format!(
             "(SELECT (groupArray(trace_id), groupArray(v)) FROM (SELECT trace_id, {cols} \
-             FROM {traces_table} WHERE {days} {filter}))",
+             FROM {traces_table} WHERE {tenant} AND {days} {filter}))",
             cols = self.columns(),
             days = w.per_trace_day_clause(),
         )
@@ -275,6 +284,7 @@ impl TraceValue {
 /// every trace with a `traces` row in `w`'s per-trace days that reaches
 /// `top`, the part of the window the top-K reads.
 pub fn trace_values_sql(
+    tenant: &TenantTerm,
     values: &[TraceValue],
     top: WindowSql,
     w: WindowSql,
@@ -289,7 +299,7 @@ pub fn trace_values_sql(
         );
         out.push_str(&format!(
             "{} AS {},\n     ",
-            v.pairs_sql(traces_table, w, &having),
+            v.pairs_sql(tenant, traces_table, w, &having),
             v.alias()
         ));
     }
@@ -342,6 +352,7 @@ impl KeyNames {
 /// `w`'s per-trace days, when the key reads spans; and `group_values`, the
 /// key's `(ids, values)` over the returned traces.
 pub fn group_values_sql(
+    tenant: &TenantTerm,
     key: KeyValues,
     w: WindowSql,
     spans_table: &str,
@@ -353,18 +364,23 @@ pub fn group_values_sql(
     let returned = "AND trace_id IN (SELECT arrayJoin(top.1))";
     let keys = format!(
         ",\n     (SELECT groupArray((k, trace_id)) FROM (SELECT trace_id, arrayJoin(buckets) AS k \
-         FROM {traces_table} WHERE {} {returned})) AS {group_keys}",
+         FROM {traces_table} WHERE {tenant} AND {} {returned})) AS {group_keys}",
         w.per_trace_day_clause()
     );
     match key {
         KeyValues::Trace(v) => format!(
             ",\n     {} AS {values}",
-            v.pairs_sql(traces_table, w, &format!("{returned} GROUP BY trace_id"))
+            v.pairs_sql(
+                tenant,
+                traces_table,
+                w,
+                &format!("{returned} GROUP BY trace_id")
+            )
         ),
         KeyValues::ChildCount => format!(
             "{keys},\n     (SELECT (groupArray(concat(trace_id, parent_span_id)), groupArray(c)) \
              FROM (SELECT trace_id, parent_span_id, {CHILDREN} AS c FROM {spans_table} \
-             WHERE (intDiv(start_ns, {RECENT_BUCKET_NS}), trace_id) IN (SELECT arrayJoin({group_keys})) \
+             WHERE {tenant} AND (intDiv(start_ns, {RECENT_BUCKET_NS}), trace_id) IN (SELECT arrayJoin({group_keys})) \
              AND parent_span_id != toFixedString('', 8) GROUP BY trace_id, parent_span_id)) AS {values}"
         ),
         KeyValues::Numbered(i) => format!(
@@ -375,7 +391,7 @@ pub fn group_values_sql(
                 Intrinsic::NestedSetRight => "nr",
                 _ => "np",
             },
-            super::numbering::numbering_sql(spans_table, &group_keys)
+            super::numbering::numbering_sql(tenant, spans_table, &group_keys)
         ),
     }
 }

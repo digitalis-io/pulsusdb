@@ -128,7 +128,7 @@ async fn seed_catalog(client: &ChClient, db: &str) {
     }
     exec(
         client,
-        &format!("INSERT INTO {db}.tag_names SELECT scope, key, max(last_start_ns) FROM {db}.tag_values GROUP BY scope, key"),
+        &format!("INSERT INTO {db}.tag_names SELECT org_id, scope, key, max(last_start_ns) FROM {db}.tag_values GROUP BY org_id, scope, key"),
     )
     .await;
 }
@@ -336,8 +336,8 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
         .expect("tag_values must exist")
         .expect("decode system.tables row");
     drop(stream);
-    assert_eq!(keys.primary_key, "scope, key, value, val_type");
-    assert_eq!(keys.sorting_key, "scope, key, value, val_type");
+    assert_eq!(keys.primary_key, "org_id, scope, key, value, val_type");
+    assert_eq!(keys.sorting_key, "org_id, scope, key, value, val_type");
 
     let resource = ch_string("resource");
     let key = ch_string("k3");
@@ -519,7 +519,7 @@ async fn seed_budget_catalog(client: &ChClient, db: &str) {
     }
     exec(
         client,
-        &format!("INSERT INTO {db}.tag_names SELECT scope, key, max(last_start_ns) FROM {db}.tag_values GROUP BY scope, key"),
+        &format!("INSERT INTO {db}.tag_names SELECT org_id, scope, key, max(last_start_ns) FROM {db}.tag_values GROUP BY org_id, scope, key"),
     )
     .await;
 }
@@ -641,7 +641,7 @@ async fn tag_discovery_bounds_unscoped_scans_at_the_read_budget() {
 
     let seed_client = budget_data_client(budget_db).await;
     seed_budget_catalog(&seed_client, budget_db).await;
-    exec(&seed_client, &format!("INSERT INTO {budget_db}.tag_names SELECT 'span', concat('n', toString(number)), toUnixTimestamp64Nano(now64(9)) FROM numbers({BUDGET_TOTAL_ROWS})")).await;
+    exec(&seed_client, &format!("INSERT INTO {budget_db}.tag_names SELECT '', 'span', concat('n', toString(number)), toUnixTimestamp64Nano(now64(9)) FROM numbers({BUDGET_TOTAL_ROWS})")).await;
 
     let engine = TraceEngine::new(
         budget_data_client(budget_db).await,
@@ -819,7 +819,7 @@ async fn seed_qm_catalog(client: &ChClient, db: &str) {
     }
     exec(
         client,
-        &format!("INSERT INTO {db}.tag_names SELECT scope, key, max(last_start_ns) FROM {db}.tag_values GROUP BY scope, key"),
+        &format!("INSERT INTO {db}.tag_names SELECT org_id, scope, key, max(last_start_ns) FROM {db}.tag_values GROUP BY org_id, scope, key"),
     )
     .await;
 }

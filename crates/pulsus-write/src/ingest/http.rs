@@ -297,6 +297,11 @@ where
 /// `pulsus-server` mounts this `&dyn TraceSink` core directly rather than
 /// [`traces`]'s generic-`State` form.
 pub async fn ingest_traces(sink: &dyn TraceSink, headers: HeaderMap, body: Body) -> Response {
+    // Issue #738: the tenant first; an invalid one stores nothing.
+    let tenant = match pulsus_model::tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(err) => return status_response(StatusCode::BAD_REQUEST, 3, err.to_string()),
+    };
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
         Ok(body) => body,
         Err(err) => return error_response(err),
@@ -318,7 +323,6 @@ pub async fn ingest_traces(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
     let rejected = landing.rejected;
     let rejected_message = landing.rejected_message.clone();
     let push = push_headers(&headers);
-    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
 
     if is_async(&headers) {
         return match sink.admit(&tenant, landing, push) {
@@ -679,6 +683,12 @@ fn decode_loki_push(
 ///   whole-request 400 in [`decode_zipkin`], so no partially-accepted batch
 ///   is ever admitted here.
 pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body) -> Response {
+    // Issue #738: the tenant first, refused as a decode failure is: `400`,
+    // plain text.
+    let tenant = match pulsus_model::tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(err) => return go_http_error_response(StatusCode::BAD_REQUEST, format!("{err}\n")),
+    };
     // Pre-admission: the reference `http.Error`s the capped body read and
     // the decode alike, so both take `zipkin_decode_error_response`. Past
     // admission it switches writers — see `zipkin_sink_error_response`.
@@ -692,7 +702,6 @@ pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
         Err(err) => return zipkin_decode_error_response(&err),
     };
     let push = push_headers(&headers);
-    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
 
     if is_async(&headers) {
         return match sink.admit(&tenant, landing, push) {

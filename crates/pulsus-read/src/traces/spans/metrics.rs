@@ -35,6 +35,7 @@ use crate::traces::metrics_plan::{
     AggFn, MetricsCtx, MetricsParams, PlanKind, STRUCTURAL_METRICS, SeriesReduce, TraceMetricsPlan,
     plan_trace_metrics,
 };
+use crate::traces::tenant_scope::TenantTerm;
 use crate::traces::window_sql::WindowSql;
 
 use super::attr_index::{IndexedAttr, index_hints};
@@ -389,10 +390,19 @@ fn predicate(
     let p = compile_span_predicate_in(body, ctx)?;
     let w = ctx.window;
     let leaves: Vec<&TraceLeaf> = p.trace_leaves().iter().collect();
-    let mut bound = per_trace_sql(&leaves, p.reads_child_counts(), w, traces);
-    bound.push_str(&trace_values_sql(p.trace_values(), w, w, traces));
+    let mut bound = per_trace_sql(ctx.tenant, &leaves, p.reads_child_counts(), w, traces);
+    bound.push_str(&trace_values_sql(
+        ctx.tenant,
+        p.trace_values(),
+        w,
+        w,
+        traces,
+    ));
     if p.reads_numbering() {
-        bound.push_str(&format!("{} AS nested_keys", trace_keys(traces, w)));
+        bound.push_str(&format!(
+            "{} AS nested_keys",
+            trace_keys(ctx.tenant, traces, w)
+        ));
     }
     let bound = bound.trim_end().trim_end_matches(',');
     let with = if bound.is_empty() {
@@ -721,11 +731,11 @@ fn key_text(field: &Field, ctx: &PredicateCtx<'_>, joins: &mut Joins) -> Result<
 
 /// The `(bucket, trace_id)` pairs of every trace reaching `window`, from
 /// the per-trace rows of its days ± 1.
-fn trace_keys(traces: &str, window: WindowSql) -> String {
+fn trace_keys(tenant: &TenantTerm, traces: &str, window: WindowSql) -> String {
     format!(
         "(SELECT groupArray((k, trace_id)) FROM (SELECT trace_id, arrayJoin(bk) AS k \
          FROM (SELECT trace_id, groupUniqArrayArray(buckets) AS bk FROM {traces} \
-         WHERE {} GROUP BY trace_id \
+         WHERE {tenant} AND {} GROUP BY trace_id \
          HAVING max(last_start_ns) >= {} AND min(start_ns) <= {})))",
         window.per_trace_day_clause(),
         window.first_included_ns(),
@@ -753,8 +763,9 @@ fn from_clause(
         join.push_str(&format!(
             "\nLEFT JOIN (SELECT trace_id, max(end_ns) - min(start_ns) AS td, min(root) AS r, \
              if(r.1 = 0, r.5, '') AS rn, if(r.1 = 0, r.4, '') AS rs \
-             FROM {} WHERE {} GROUP BY trace_id) AS tv USING trace_id",
+             FROM {} WHERE {} AND {} GROUP BY trace_id) AS tv USING trace_id",
             tables.traces,
+            tables.tenant,
             window.per_trace_day_clause()
         ));
     }
@@ -763,23 +774,25 @@ fn from_clause(
             "\nLEFT JOIN (WITH {} AS nested_keys SELECT trace_id, sp.1 AS span_id, nl, nr, np \
              FROM ({}) ARRAY JOIN s AS sp, lft AS nl, rgt AS nr, par AS np) AS nb \
              USING (trace_id, span_id)",
-            trace_keys(tables.traces, window),
-            numbering_sql(tables.spans, "nested_keys")
+            trace_keys(tables.tenant, tables.traces, window),
+            numbering_sql(tables.tenant, tables.spans, "nested_keys")
         ));
     }
     if joins.children {
         join.push_str(&format!(
             "\nLEFT JOIN (WITH {} AS child_keys SELECT trace_id, parent_span_id AS span_id, \
-             {CHILDREN} AS cc FROM {} WHERE (intDiv(start_ns, 300000000000), trace_id) IN \
+             {CHILDREN} AS cc FROM {} WHERE {} AND (intDiv(start_ns, 300000000000), trace_id) IN \
              (SELECT arrayJoin(child_keys)) AND parent_span_id != toFixedString('', 8) \
              GROUP BY trace_id, parent_span_id) AS ch USING (trace_id, span_id)",
-            trace_keys(tables.traces, window),
-            tables.spans
+            trace_keys(tables.tenant, tables.traces, window),
+            tables.spans,
+            tables.tenant
         ));
     }
     let read = format!(
-        "{}{join}\nWHERE {}\n  AND {}\n  AND {}\n  AND ({predicate}){condition}",
+        "{}{join}\nWHERE {} AND {}\n  AND {}\n  AND {}\n  AND ({predicate}){condition}",
         tables.spans,
+        tables.tenant,
         window.span_time_clause(),
         window.span_bucket_clause(),
         window.span_day_clause()
@@ -1316,11 +1329,20 @@ fn compare_sql(
             values.push(*v);
         }
     }
-    let mut bound = per_trace_sql(&leaves, children, w, tables.traces);
-    bound.push_str(&trace_values_sql(&values, w, w, tables.traces));
+    let mut bound = per_trace_sql(tables.tenant, &leaves, children, w, tables.traces);
+    bound.push_str(&trace_values_sql(
+        tables.tenant,
+        &values,
+        w,
+        w,
+        tables.traces,
+    ));
     let keeps_final = both.iter().any(|p| p.reads_numbering());
     if keeps_final {
-        bound.push_str(&format!("{} AS nested_keys", trace_keys(tables.traces, w)));
+        bound.push_str(&format!(
+            "{} AS nested_keys",
+            trace_keys(tables.tenant, tables.traces, w)
+        ));
     }
     let bound = bound.trim_end().trim_end_matches(',');
     let with = if bound.is_empty() {
@@ -1358,10 +1380,11 @@ fn compare_sql(
     );
     let res = format!(
         "(SELECT concat(hex(resource_id), toString(service)) AS rk, any(kvs) AS rkv FROM \
-         (SELECT service, resource_id, arrayFilter(t -> t.3 != '', {}) AS kvs FROM {} WHERE {}) \
+         (SELECT service, resource_id, arrayFilter(t -> t.3 != '', {}) AS kvs FROM {} WHERE {} AND {}) \
          GROUP BY rk)",
         compare_pairs("resource.", "attrs"),
         tables.resources,
+        tables.tenant,
         w.resources_day_clause()
     );
     let from = from_clause(
@@ -1826,7 +1849,7 @@ ORDER BY s, g, k, v, y";
         let res = format!(
             "(SELECT concat(hex(resource_id), toString(service)) AS rk, any(kvs) AS rkv FROM \
              (SELECT service, resource_id, arrayFilter(t -> t.3 != '', {}) AS kvs FROM resources \
-             WHERE {}) GROUP BY rk)",
+             WHERE org_id = '' AND {}) GROUP BY rk)",
             typed_j("resource.", "attrs"),
             w.resources_day_clause()
         );
@@ -1835,8 +1858,8 @@ ORDER BY s, g, k, v, y";
         let from = format!(
             "FROM (SELECT *, tv.td AS `tv.td`, tv.rn AS `tv.rn`, tv.rs AS `tv.rs` FROM spans\n\
              LEFT JOIN (SELECT trace_id, max(end_ns) - min(start_ns) AS td, min(root) \
-             AS r, if(r.1 = 0, r.5, '') AS rn, if(r.1 = 0, r.4, '') AS rs FROM traces WHERE {} \
-             GROUP BY trace_id) AS tv USING trace_id\nWHERE {}\n  AND {}\n  AND {}\n  AND (true)\n\
+             AS r, if(r.1 = 0, r.5, '') AS rn, if(r.1 = 0, r.4, '') AS rs FROM traces WHERE org_id = '' AND {} \
+             GROUP BY trace_id) AS tv USING trace_id\nWHERE org_id = '' AND {}\n  AND {}\n  AND {}\n  AND (true)\n\
              LIMIT 1 BY trace_id, start_ns, span_id, kind)",
             w.per_trace_day_clause(),
             w.span_time_clause(),

@@ -614,7 +614,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `\| by(name)` | the key becomes the KEY of a map aggregate inside the `HAVING`, not a `GROUP BY` column: `HAVING arrayMax(mapValues(uniqExactMap(map(<capped name>, span_id)))) > 2` when an aggregate lands in the same level, and nothing at all when none does | *emitted today* (issue #492 part 5), superseding `docs/query-lowering.md:609`'s `GROUP BY name`. The statement keeps one aggregation state per (trace × key value) where the ungrouped one keeps one per trace; the map form measured 334 MB against the wrapped `GROUP BY trace_id, name` form's 523 MB on the same corpus, with byte-identical `EXPLAIN indexes = 1` |
 | `\| coalesce()` after a `by()` | none — it FREES the grouping slot when the level carries no `HAVING`, and refuses when it does | *emitted today* (issue #492 part 5), superseding ADR 0008 D1's wrap. No wrap is emitted, and none was ever emitted |
 | `\| coalesce()` with no preceding `by()` | none, and none is needed | *from the design*, `docs/query-lowering.md:611`. It is the identity |
-| `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read*, `docs/query-lowering.md` §3.1's `Filter` row (issue #492 item 9). Pushing it as a `WHERE` conjunct **onto the leading generator** is unsound whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span comes from the RIGHT operand, so the pushed statement returns a wrong answer rather than a wider one. **That is a fact about one statement shape, not about SQL:** both tables store what the stage reads — `trace_spans.name` (`schema/schema.sql:539`) and the attribute index (`schema/schema.sql:419-438`) — and §5.1 names the rule of ours that holds the two-table form back. It clears exactness, and a mid-pipeline spanset OPERATION is a plan-time `400` |
+| `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read*, `docs/query-lowering.md` §3.1's `Filter` row (issue #492 item 9). Pushing it as a `WHERE` conjunct **onto the leading generator** is unsound whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span comes from the RIGHT operand, so the pushed statement returns a wrong answer rather than a wider one. **That is a fact about one statement shape, not about SQL:** both tables store what the stage reads — `trace_spans.name` (`schema/schema.sql:539`) and the attribute index (`schema/schema.sql:423-443`) — and §5.1 names the rule of ours that holds the two-table form back. It clears exactness, and a mid-pipeline spanset OPERATION is a plan-time `400` |
 | `\| select(.foo)` | **emitted today** (issue #558): three projected expressions on the batch hydration statement, all three subscripted at one `arrayFirstIndex((k, s) -> k = 'foo' AND s = 'span', attr_key, attr_scope)` over the span row's own arrays — the byte-capped value, the numeric reading and the stored kind | *emitted today*, `search_sql.rs:448` and `search_plan.rs:1266`. **The join this row used to describe was never needed.** The refusal recorded in [query-lowering.md](query-lowering.md) §9.8 rested on the value living in a second table; since issue #557 the span row carries its own attributes, so putting the value beside the span reads no second table and contains no join. ADR 0008's unnamed-clause question does not arise |
 | `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_sql.rs:111`. Still `400` on the search route (`search_plan.rs:2134`); this work does not change that |
 | `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage | none | *evaluated after the read*, unchanged. It reduces the SERIES the first stage produced, so no clause of ADR 0008 carries it and no row set exists to apply it to: `metrics_plan.rs:538` records it, `traces/exec.rs:3162` @ bf195076 applies it. Still `400` on the search route (`search_plan.rs:2140`) |
@@ -1050,7 +1050,7 @@ nothing and reads fewer rows; it simply keeps paging.
 
 `<d0>`, `<d1>` are the window's first and last dates. Two tables are in play:
 `trace_attrs_idx`, ordered by `(key, val, scope, timestamp_ns, trace_id, span_id)` and partitioned by
-date (`schema/schema.sql:420-422`), and `trace_spans`, ordered by `(trace_id, timestamp_ns)` with a
+date (`schema/schema.sql:424-426`), and `trace_spans`, ordered by `(trace_id, timestamp_ns)` with a
 `service_time` projection ordered by `(service, timestamp_ns)` (`schema/schema.sql:570-597`, migration 45).
 
 | written as | the fragment it contributes | where it lands | what the database does less of |
@@ -1617,7 +1617,7 @@ first refusal would emit no `body` term and read every `ipcase` line.
 
 Same rule as §2.8 for the SQL and a different one for the answers. **Every statement below was
 executed** on server 26.3, server version 26.3.17.110, against
-`trace_spans` and `trace_attrs_idx` built from `schema/schema.sql:419-438` plus the later added columns,
+`trace_spans` and `trace_attrs_idx` built from `schema/schema.sql:423-443` plus the later added columns,
 holding 200,000 spans in 50,000 traces of four spans each and 600,000 attribute rows.
 **No response bodies are stated**, for the reason part 4.8 gives and part 9 repeats: no reference
 instance was run for traces, and a body written from understanding looks exactly like one that was
@@ -2007,7 +2007,7 @@ Under `crates/`: the route is mounted at `pulsus-server/src/logs_api/mod.rs:55-5
 `plan.rs:1693` and `plan.rs:1720`; LogQL's compiler keeps or replaces them itself, and does not move
 them into the core (owner decision, #507). Evaluation after the read is `logql/pipeline.rs:1354`. The
 TraceQL equivalents are `traces/search_plan.rs:1121`, `traces/search_sql.rs:170` and
-`traces/exec.rs:1276`.
+`traces/exec.rs:1322`.
 
 ### 3.3 The decision, per step
 
@@ -4517,7 +4517,7 @@ difference is the whole of what part 2 changes for it.
 
 Each of these is refused by `plan_pipeline` (`crates/pulsus-read/src/traces/search_plan.rs:1932`)
 before any statement is built, and mapped to `400` at
-`crates/pulsus-server/src/traces_api/error.rs:303`. `PlanError` renders with the prefix
+`crates/pulsus-server/src/traces_api/error.rs:307`. `PlanError` renders with the prefix
 `type mismatch: ` or `unsupported field: ` (`filter.rs:76-79`).
 
 **A query the shipped planner refuses must still be refused.** This work must not turn a refused
@@ -4534,14 +4534,14 @@ payload into a stage evaluated after the read and then answer it.
 | `{ .service.namespace = "prod" } \| rate()` | the metrics stages are not search-route stages | `search_plan.rs:2134` |
 
 Every one carries `Content-Type: text/plain; charset=utf-8`. **The traces route does not set
-`X-Content-Type-Options: nosniff` and the logs route does** — `traces_api/error.rs:270-274` against
+`X-Content-Type-Options: nosniff` and the logs route does** — `traces_api/error.rs:274-278` against
 `logs_api/error.rs:148-153`. That difference is deliberate and each side matches its own reference.
 
 One refusal that is **not** a payload rejection, because it happens during evaluation:
 
 | query | status | body | where |
 |---|---|---|---|
-| `{ !.a = 1 }` against a span whose `a` is present and is not a boolean | `400` | `expression (!.a) expected a boolean` | raised at `search_eval.rs:1227`, mapped at `traces_api/error.rs:385`, pinned character for character by `crates/pulsus-server/tests/traces_search_live.rs:1285` |
+| `{ !.a = 1 }` against a span whose `a` is present and is not a boolean | `400` | `expression (!.a) expected a boolean` | raised at `search_eval.rs:1227`, mapped at `traces_api/error.rs:390`, pinned character for character by `crates/pulsus-server/tests/traces_search_live.rs:1285` |
 
 This one matters most for this work: **it is raised by a stage evaluated after the read, and it must
 stay a `400` regardless of how much of the query became SQL.** Compiling a stage changes which
@@ -4626,7 +4626,7 @@ different answer from the reference on some input, and the inputs are named belo
 | 3 | LogQL `\| unwrap duration(x)`, `\| unwrap bytes(x)` | "ClickHouse has no function for either" | false. Measured below: `parseTimeDelta('1h30m')` is `5400` and `parseReadableSize('4KiB')` is `4096` | neither function is the reference's parser, and rule B requires exactness because the value feeds an aggregate. `parseTimeDelta('-5s')` is a `Code: 36` error where the reference answers `-5` |
 | 4 | LogQL `sum by (k) (…)`, `k` from a parser | "no ClickHouse expression reproduces the parser's rendering of a JSON number" | the claim is about every expression; two were measured. `simpleJSONExtractRaw('{"c":31.0}','c')` is `31.0`, which is the reference's own bytes | that function is a text scanner rather than a parser, and a group key has to be right about more than number bytes. Nesting, absent-versus-empty and key spelling all still disagree, below |
 | 5 | LogQL `\|= ip("…")` | "an address-range test over substrings has no `LIKE` or `match` predicate the body indexes could use" | that is a statement about pruning, and the unwired LogQL model in our source already classifies it as one: `BlockReason::NotPushable`, never `NeverReason` (`crates/pulsus-read/src/compile/fold.rs:685`, answered at `crates/pulsus-read/src/logql/compile.rs:338`) | pruning, and it is priced below: a predicate that decides the test can be written, but none that a body index can serve can, so the statement reads what the primary key and the window leave it. Measured uncached (`use_query_condition_cache = 0`) — 3,000,000 rows and 309,060,017 bytes, against 245,760 and 25,313,762 for a literal filter selecting the same 30 lines. Once the condition has been evaluated against those parts the shipped cache closes the gap, which is why the setting is printed beside the figure |
-| 6 | TraceQL `\| { … }` written after another stage | pushing it as a `WHERE` conjunct returns a wrong answer | true of that one statement shape, and that shape is not the only one. Both tables store what the stage reads: `trace_spans.name` (`schema/schema.sql:539`) and the attribute index (`schema/schema.sql:419-438`) | for the attribute-only form, exactness — two shapes disagree, below. For the mixed-source form, **`docs/schemas.md` §4.2** (`docs/schemas.md:1110 @ d60a960d`): every phase-1 generator is its own index-served top-K query, "never a `UNION ALL`". That is a rule of ours and can be amended. **ADR 0008's join clause is not the obstacle**, because a statement reading both tables needs no join. What an amendment turns on is the pruning that rule protects, which is unmeasured; the cost table below names the instrument that would measure it |
+| 6 | TraceQL `\| { … }` written after another stage | pushing it as a `WHERE` conjunct returns a wrong answer | true of that one statement shape, and that shape is not the only one. Both tables store what the stage reads: `trace_spans.name` (`schema/schema.sql:539`) and the attribute index (`schema/schema.sql:423-443`) | for the attribute-only form, exactness — two shapes disagree, below. For the mixed-source form, **`docs/schemas.md` §4.2** (`docs/schemas.md:1110 @ d60a960d`): every phase-1 generator is its own index-served top-K query, "never a `UNION ALL`". That is a rule of ours and can be amended. **ADR 0008's join clause is not the obstacle**, because a statement reading both tables needs no join. What an amendment turns on is the pruning that rule protects, which is unmeasured; the cost table below names the instrument that would measure it |
 
 **Every measurement below was taken on 2026-09-09** against ClickHouse `26.3.29.7`
 (server 26.3) and `grafana/loki:3.7.4`, digest
@@ -5274,7 +5274,7 @@ engine will read, and what it will return:
 | TraceQL batch size | 32 traces | `traces/exec.rs:126` @ 1cdb3e5e |
 | spans per trace | 10,000 | `traces/exec.rs:131` @ 1cdb3e5e; a trace over it is reported incomplete |
 | TraceQL span-read bytes | 256 MiB | `traces/exec.rs:84` |
-| ClickHouse result bytes, traces | 64 MiB, refusing rather than truncating | `traces/exec.rs:96`, applied at `:1317` |
+| ClickHouse result bytes, traces | 64 MiB, refusing rather than truncating | `traces/exec.rs:96`, applied at `:1363` |
 | rendered SQL text | 8 MiB; at or past it is `422 query_too_broad` | `pulsus-read/src/querytext.rs:52` |
 | syntax tree, reduced statement after `\| logfmt` | `max_ast_elements` 1,000,000 and `max_expanded_ast_elements` 10,000,000 on that statement only; at the server's default of 50,000 it fails with `TOO_BIG_AST` | `logql/sql.rs` `metric_range_reduced` |
 | handover size | at most one set of values written into the text of the next statement. 32,768 literal ids is `Code: 168. DB::Exception: AST is too big. Maximum: 50000.` | ADR 0008 D3 |
@@ -5315,7 +5315,7 @@ cheaper than having the next reader find them.
 | the `400` body of LogQL32 | the template at `logql/error.rs:769-772` was rendered with the captured values and compared to the captured body: **462 bytes each, identical** | that the template is reached for this query. That is read from `logql/error.rs:762-768`, not executed |
 | the committed corpus cannot distinguish the two colour-stripping behaviours | all 46 corpus files read as bytes; one line has escape bytes and it has four; 46 of 50 queries using the stage carry a later filter and all 46 load colour-free lines | it is a statement about the **committed** corpus at this commit. A row added tomorrow changes it, and nothing detects that |
 | every `file:line` in this document | each was printed with `sed -n "${n}p"` and read before being written down | that the line still says that after the next commit. There is no mechanism holding these citations true |
-| every SQL text marked *decided here* parses and executes | each was run against server 26.3, server version 26.3.17.110, on 2026-09-01, over part 4.1's corpus in a `log_samples` built from `schema/schema.sql:86-108` plus `structured_metadata`, and over 200,000 synthetic spans in `trace_spans`/`trace_attrs_idx` built from `schema/schema.sql:419-438` | that our code will emit that text. No code emits it. It also cannot see whether a **different** corpus makes the statement and the reference disagree |
+| every SQL text marked *decided here* parses and executes | each was run against server 26.3, server version 26.3.17.110, on 2026-09-01, over part 4.1's corpus in a `log_samples` built from `schema/schema.sql:86-108` plus `structured_metadata`, and over 200,000 synthetic spans in `trace_spans`/`trace_attrs_idx` built from `schema/schema.sql:423-443` | that our code will emit that text. No code emits it. It also cannot see whether a **different** corpus makes the statement and the reference disagree |
 | the §2.8 statements agree with the reference over this corpus | the **nine** log-query statements (LogQL45–51, LogQL53, LogQL58) were run and their returned timestamps compared to the reference's captured entries: all nine contain every answer row, and LogQL45, LogQL48 and LogQL51 return exactly it. The **three** metric statements (LogQL54, LogQL55, LogQL56) were run and compared for equality, not containment, and each reproduced the reference's answer exactly — including LogQL56's tie between `edge` and `ipcase` | that containment holds on **any** corpus. The corpus is fourteen lines. The property is argued below and the argument, not this run, is what carries it. LogQL52 is held back and LogQL57's aggregation does not compile, so neither is in either count |
 | the fourteen answers of §2.8 | captured from `grafana/loki:3.7.4`, digest `sha256:87f0a067…cfcc`, on 2026-09-01, over part 4.1's corpus, with `data.stats` removed and no other edit | the same limit as part 4's answers: only that the reference answers this way over **this** corpus |
 | the ClickHouse behaviours the guards rest on | run and pasted into the cells that use them: `JSONExtractString('{"c":31.0}','c')` is `31`; `JSONExtractString('{"b":500}','b')` is `500`; `JSONExtractFloat('{"i":1e3}','i')` is `1000`; `JSONExtractFloat('{"s":"12abc"}','s')` is `0`; `JSONType('{"a":1}trailing')` is `Null`; `JSONExtractString('{"a":"x","a":"y"}','a')` is `x`; `extractGroups('a\nb','(?P<x>a.b)')` is `['a\nb']` and with `(?-s)` is `[]` | that they hold on another ClickHouse version. They were run on 26.3.17.110 only; the version floor is 26.8 LTS (`crates/pulsus-schema/src/checks.rs:29`) |

@@ -409,11 +409,15 @@ async fn the_sorting_key_is_the_one_this_design_states() {
     for (table, sorting_key, granularity) in [
         (
             "spans",
-            "intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind",
+            "org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind",
             Some("index_granularity = 2048"),
         ),
-        ("traces", "trace_id", Some("index_granularity = 1024")),
-        ("resources", "service, resource_id", None),
+        (
+            "traces",
+            "org_id, trace_id",
+            Some("index_granularity = 1024"),
+        ),
+        ("resources", "org_id, service, resource_id", None),
     ] {
         let got = scalar(
             &client,
@@ -501,6 +505,8 @@ async fn the_per_trace_aggregate_columns_carry_the_functions_this_design_names()
         // the minimum and this is the maximum, and a view that wrote `min`
         // here would narrow that bound silently.
         ("last_start_ns", "SimpleAggregateFunction(max, Int64)"),
+        // Issue #738: the tenant, the key's first column.
+        ("org_id", "LowCardinality(String)"),
         // Issue #591 part 1, decision 4: the root is ONE span, the least
         // `(not a root, start_ns, span_id, service, name)`.
         (
@@ -517,7 +523,7 @@ async fn the_per_trace_aggregate_columns_carry_the_functions_this_design_names()
     .iter()
     .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
     .collect();
-    assert_eq!(got, want, "the per-trace table's nine declarations");
+    assert_eq!(got, want, "the per-trace table's ten declarations");
 
     drop_database(&client, db).await;
 }
@@ -547,22 +553,25 @@ async fn every_target_table_column_carries_a_codec() {
             ),
         )
         .await,
-        72,
-        "the eight target tables' own column count (28 + 8 + 8 + 3 + 5 + 12 \
-         + 5 + 3), so the codec check below has a non-empty domain. Issue #587 \
+        80,
+        "the eight target tables' own column count (29 + 9 + 9 + 4 + 6 + 13 \
+         + 6 + 4), so the codec check below has a non-empty domain. Issue #587 \
          added four columns to `spans`, two to `traces` and one to \
          `resources`; issue #589 added one to `spans`; issue #591 part 1 made \
          `traces`' two root columns one; issue #601 part 4b added \
          `error_spans` and `tag_bucket_values`; part 4c added \
          `service_bucket_resources`; issue #496 added `last_start_ns` to both \
-         catalogs"
+         catalogs; issue #738 added `org_id` to each"
     );
+    // Issue #738: the tenant column carries no codec, as on every metrics
+    // and log table (issues #635, #653). `name` below is the select's
+    // `table.name` alias.
     let bare = names(
         &client,
         &format!(
             "SELECT concat(table, '.', name) AS name FROM system.columns \
              WHERE database = '{db}' AND table IN ({TARGET_TABLE_LIST}) \
-             AND compression_codec = '' \
+             AND compression_codec = '' AND NOT endsWith(name, '.org_id') \
              ORDER BY name"
         ),
     )
@@ -584,7 +593,8 @@ async fn every_target_table_column_carries_a_codec() {
 ///
 /// The column **type** is not pinned here — the per-table `(name, type)`
 /// cases above own that.
-const TARGET_TABLE_CODECS: [(&str, &str, &str); 72] = [
+const TARGET_TABLE_CODECS: [(&str, &str, &str); 80] = [
+    ("error_spans", "org_id", ""),
     ("error_spans", "trace_id", "CODEC(ZSTD(1))"),
     ("error_spans", "span_id", "CODEC(ZSTD(1))"),
     ("error_spans", "start_ns", "CODEC(Delta(8), ZSTD(1))"),
@@ -597,6 +607,7 @@ const TARGET_TABLE_CODECS: [(&str, &str, &str); 72] = [
     ("error_spans", "kind", "CODEC(ZSTD(1))"),
     ("error_spans", "status_code", "CODEC(ZSTD(1))"),
     ("error_spans", "status_message", "CODEC(ZSTD(1))"),
+    ("resources", "org_id", ""),
     ("resources", "day", "CODEC(ZSTD(1))"),
     ("resources", "resource_id", "CODEC(ZSTD(1))"),
     ("resources", "service", "CODEC(ZSTD(1))"),
@@ -605,9 +616,11 @@ const TARGET_TABLE_CODECS: [(&str, &str, &str); 72] = [
     ("resources", "dropped_attrs", "CODEC(ZSTD(1))"),
     ("resources", "schema_url", "CODEC(ZSTD(1))"),
     ("resources", "entity_refs", "CODEC(ZSTD(1))"),
+    ("service_bucket_resources", "org_id", ""),
     ("service_bucket_resources", "bucket", "CODEC(ZSTD(1))"),
     ("service_bucket_resources", "service", "CODEC(ZSTD(1))"),
     ("service_bucket_resources", "resource_id", "CODEC(ZSTD(1))"),
+    ("spans", "org_id", ""),
     ("spans", "trace_id", "CODEC(ZSTD(1))"),
     ("spans", "span_id", "CODEC(ZSTD(1))"),
     ("spans", "parent_span_id", "CODEC(ZSTD(1))"),
@@ -636,19 +649,23 @@ const TARGET_TABLE_CODECS: [(&str, &str, &str); 72] = [
     ("spans", "scope_attrs_other", "CODEC(ZSTD(1))"),
     ("spans", "end_ns", "CODEC(Delta(8), ZSTD(1))"),
     ("spans", "service_type", "CODEC(ZSTD(1))"),
+    ("tag_bucket_values", "org_id", ""),
     ("tag_bucket_values", "bucket", "CODEC(ZSTD(1))"),
     ("tag_bucket_values", "service", "CODEC(ZSTD(1))"),
     ("tag_bucket_values", "scope", "CODEC(ZSTD(1))"),
     ("tag_bucket_values", "key", "CODEC(ZSTD(1))"),
     ("tag_bucket_values", "vals", "CODEC(ZSTD(1))"),
+    ("tag_names", "org_id", ""),
     ("tag_names", "scope", "CODEC(ZSTD(1))"),
     ("tag_names", "key", "CODEC(ZSTD(1))"),
     ("tag_names", "last_start_ns", "CODEC(DoubleDelta, ZSTD(1))"),
+    ("tag_values", "org_id", ""),
     ("tag_values", "scope", "CODEC(ZSTD(1))"),
     ("tag_values", "key", "CODEC(ZSTD(1))"),
     ("tag_values", "value", "CODEC(ZSTD(1))"),
     ("tag_values", "val_type", "CODEC(ZSTD(1))"),
     ("tag_values", "last_start_ns", "CODEC(DoubleDelta, ZSTD(1))"),
+    ("traces", "org_id", ""),
     ("traces", "day", "CODEC(ZSTD(1))"),
     ("traces", "trace_id", "CODEC(ZSTD(1))"),
     ("traces", "start_ns", "CODEC(ZSTD(1))"),
@@ -1183,22 +1200,27 @@ const ATTRIBUTE_COLUMNS: [&str; 17] = [
 /// Every other text-capable column of the ten tables. `entity_refs`
 /// carries attribute **keys** that must exist in the resource's
 /// attributes, not attribute values.
-const OTHER_TEXT_COLUMNS: [&str; 56] = [
+const OTHER_TEXT_COLUMNS: [&str; 66] = [
     "error_spans.name",
+    "error_spans.org_id",
     "error_spans.service",
     "error_spans.service_type",
     "error_spans.span_id",
     "error_spans.status_message",
     "error_spans.trace_id",
     "resources.entity_refs",
+    "resources.org_id",
     "resources.schema_url",
     "resources.service",
+    "service_bucket_resources.org_id",
     "service_bucket_resources.service",
     "service_edges.client",
     "service_edges.conn_type",
+    "service_edges.org_id",
     "service_edges.q",
     "service_edges.server",
     "spans.name",
+    "spans.org_id",
     "spans.parent_span_id",
     "spans.scope_name",
     "spans.scope_schema_url",
@@ -1210,15 +1232,19 @@ const OTHER_TEXT_COLUMNS: [&str; 56] = [
     "spans.trace_id",
     "spans.trace_state",
     "tag_bucket_values.key",
+    "tag_bucket_values.org_id",
     "tag_bucket_values.scope",
     "tag_bucket_values.service",
     "tag_names.key",
+    "tag_names.org_id",
     "tag_names.scope",
     "tag_values.key",
+    "tag_values.org_id",
     "tag_values.scope",
     "tag_values.val_type",
     "trace_landing.entity_refs",
     "trace_landing.name",
+    "trace_landing.org_id",
     "trace_landing.parent_span_id",
     "trace_landing.schema_url",
     "trace_landing.scope_name",
@@ -1236,6 +1262,7 @@ const OTHER_TEXT_COLUMNS: [&str; 56] = [
     "traces.buckets",
     "traces.end_ns",
     "traces.last_start_ns",
+    "traces.org_id",
     "traces.root",
     "traces.services",
     "traces.start_ns",
@@ -1430,7 +1457,7 @@ async fn the_two_4b_tables_have_the_planned_shape() {
 
         let tbv = shape(&client, db, "tag_bucket_values").await;
         assert_eq!(tbv.engine, format!("{replicated}AggregatingMergeTree"));
-        assert_eq!(tbv.sorting_key, "service, scope, key, bucket");
+        assert_eq!(tbv.sorting_key, "org_id, service, scope, key, bucket");
         assert_eq!(
             tbv.partition_key,
             "toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')"
@@ -1451,7 +1478,7 @@ async fn the_two_4b_tables_have_the_planned_shape() {
         assert_eq!(es.engine, format!("{replicated}ReplacingMergeTree"));
         assert_eq!(
             es.sorting_key,
-            "intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind"
+            "org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind"
         );
         assert_eq!(
             es.partition_key,
@@ -1482,7 +1509,7 @@ async fn the_two_4b_tables_have_the_planned_shape() {
         assert!(
             tbv_mv.as_select.ends_with(
                 "WHERE (row_kind = 0) AND (service_type = 'string') \
-                 GROUP BY bucket, service, scope, key"
+                 GROUP BY org_id, bucket, service, scope, key"
             ),
             "tag_bucket_values_mv: {}",
             tbv_mv.as_select
@@ -1580,7 +1607,7 @@ async fn the_4c_table_has_the_planned_shape() {
 
         let sbr = shape(&client, db, "service_bucket_resources").await;
         assert_eq!(sbr.engine, format!("{replicated}ReplacingMergeTree"));
-        assert_eq!(sbr.sorting_key, "service, bucket, resource_id");
+        assert_eq!(sbr.sorting_key, "org_id, service, bucket, resource_id");
         assert_eq!(
             sbr.partition_key,
             "toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')"
@@ -1601,7 +1628,7 @@ async fn the_4c_table_has_the_planned_shape() {
             mv.as_select.contains(&format!("FROM {db}.trace_landing "))
                 && mv.as_select.ends_with(
                     "WHERE (row_kind = 0) AND (service_type = 'string') \
-                     GROUP BY bucket, service, resource_id"
+                     GROUP BY org_id, bucket, service, resource_id"
                 ),
             "service_bucket_resources_mv: {}",
             mv.as_select

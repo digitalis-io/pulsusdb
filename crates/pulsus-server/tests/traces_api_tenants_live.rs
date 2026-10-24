@@ -1225,7 +1225,10 @@ async fn the_header_is_the_metrics_rule_on_every_trace_route() {
             Kind::Search => trace_ids(&json(&r.body)).is_empty(),
             Kind::Tags => !r.body.contains("http.route"),
             Kind::Values => tag_values(&json(&r.body)).is_empty(),
-            Kind::Range | Kind::Instant => series(&json(&r.body)).is_empty(),
+            Kind::Range => series(&json(&r.body)).is_empty(),
+            // An ungrouped count answers its one series, its zero value
+            // omitted (docs/api.md §4.4).
+            Kind::Instant => series(&json(&r.body)).values().all(|v| *v == 0.0),
             Kind::Graph => edges(&json(&r.body)).is_empty(),
         };
         if !empty {
