@@ -1104,7 +1104,10 @@ async fn the_sample_tables_fingerprint_codec_is_zstd() {
 /// **Issue #635: a kind-2 landing row fills the label index and its
 /// values table.** One row per label in `metric_label_index`, one row per
 /// pair in `metric_label_values`, an empty value included; a sample row
-/// writes neither.
+/// writes neither. The rows carry the current time: the two tables expire
+/// a row at the end of its `last_seen` UTC day plus the retention
+/// (issue #496), and a row from 1970 is removed by a TTL merge that can
+/// run before the read.
 #[tokio::test]
 async fn a_kind_2_row_fills_the_label_index_and_its_values() {
     skip_unless_live!();
@@ -1121,14 +1124,18 @@ async fn a_kind_2_row_fills_the_label_index_and_its_values() {
     ] {
         assert!(names.contains(&name.to_string()), "{name}: {names:?}");
     }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after the epoch")
+        .as_millis() as i64;
     client
         .execute(
             &format!(
                 "INSERT INTO {db}.metric_landing \
                  (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
-                 VALUES (1, 2, 'm', 7, 1000, '{{\"env\":\"\",\"job\":\"api\",\"zone\":\"z07\"}}', 0), \
-                        (1, 2, 'm', 8, 1000, '{{\"job\":\"api\"}}', 0), \
-                        (1, 0, 'm', 7, 1000, '', 0)"
+                 VALUES ({now_ms}, 2, 'm', 7, {now_ms}, '{{\"env\":\"\",\"job\":\"api\",\"zone\":\"z07\"}}', 0), \
+                        ({now_ms}, 2, 'm', 8, {now_ms}, '{{\"job\":\"api\"}}', 0), \
+                        ({now_ms}, 0, 'm', 7, {now_ms}, '', 0)"
             ),
             &QuerySettings::new(),
             Idempotency::NonIdempotent,
