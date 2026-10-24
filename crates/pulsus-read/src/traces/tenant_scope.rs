@@ -127,18 +127,89 @@ fn tokens(sql: &str) -> Vec<Token> {
     out
 }
 
+/// How a table source is introduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// After `FROM`: a trace table here is scoped by the `WHERE` that
+    /// follows at the same depth.
+    From,
+    /// After `JOIN` (any form), or after a comma in a `FROM` clause: the
+    /// `WHERE` that follows is the whole statement's, so a trace table
+    /// here must be a subquery with its own.
+    Joined,
+    /// After `IN` (and `GLOBAL IN`, `NOT IN`): a bare name is a table set.
+    InSet,
+}
+
+/// Table functions that read nothing a request stores.
+const HARMLESS_TABLE_FUNCTIONS: [&str; 6] = [
+    "numbers",
+    "numbers_mt",
+    "zeros",
+    "zeros_mt",
+    "generateseries",
+    "generate_series",
+];
+
+/// Table functions whose argument is a query: the read inside is checked
+/// as any other.
+const QUERY_TABLE_FUNCTIONS: [&str; 2] = ["view", "viewifpermitted"];
+
+/// Table functions that run a query, or read a table, on other servers:
+/// accepted only when their argument is a [`QUERY_TABLE_FUNCTIONS`] call.
+const REMOTE_TABLE_FUNCTIONS: [&str; 4] =
+    ["cluster", "clusterallreplicas", "remote", "remotesecure"];
+
+/// Words that end a `FROM` clause's list of sources at their depth.
+const CLAUSE_WORDS: [&str; 18] = [
+    "WHERE",
+    "PREWHERE",
+    "GROUP",
+    "ORDER",
+    "LIMIT",
+    "HAVING",
+    "SETTINGS",
+    "UNION",
+    "ON",
+    "USING",
+    "SELECT",
+    "WINDOW",
+    "QUALIFY",
+    "FORMAT",
+    "INTERSECT",
+    "EXCEPT",
+    "SAMPLE",
+    "WITH",
+];
+
 /// Whether `sql` reads every trace table under `term` (issue #738).
 ///
-/// For every `FROM` followed by a name whose last dot-separated part is one
-/// of `tables`, the first `WHERE` at that `FROM`'s depth — before the depth
-/// closes or a `UNION`, `GROUP BY`, `ORDER BY`, `LIMIT`, `HAVING` or
-/// `SETTINGS` at that depth — must begin `<term> AND` (or, on
-/// `service_edges`, [`MARKER_TERM`]), and no `OR` may stand at that depth
-/// inside it. The refusal names the `FROM` and its byte offset.
+/// Every table source is inspected: what follows `FROM`, every `JOIN`
+/// form, each comma-joined source of a `FROM` clause, and a bare name
+/// after `IN`. A CTE's body and every subquery are read as statements of
+/// their own, so their sources are inspected the same way.
+///
+/// * A trace table after `FROM` — a name whose last dot-separated part is
+///   one of `tables` — must have, at that `FROM`'s depth, a first `WHERE`
+///   (before the depth closes or a `UNION`, `GROUP BY`, `ORDER BY`,
+///   `LIMIT`, `HAVING` or `SETTINGS` at that depth) beginning `<term> AND`
+///   (or, on `service_edges`, [`MARKER_TERM`]), with no `OR` at that depth
+///   inside it.
+/// * A trace table as a join target, a comma-joined source or an `IN` set
+///   is refused: it must be a subquery whose own `WHERE` carries the term.
+/// * A table function is refused unless it reads nothing a request stores
+///   ([`HARMLESS_TABLE_FUNCTIONS`]), takes a query whose reads are checked
+///   ([`QUERY_TABLE_FUNCTIONS`]), or runs such a query remotely
+///   ([`REMOTE_TABLE_FUNCTIONS`] with a `view(…)` argument). One the check
+///   cannot see into is refused.
+///
+/// The refusal names the source and its byte offset.
 pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), String> {
     let toks = tokens(sql);
     let text = |t: &Token| &sql[t.start..t.end];
     let word = |t: &Token, w: &str| t.kind == Tok::Word && text(t).eq_ignore_ascii_case(w);
+    let refuse =
+        |what: &str, at: usize| Err(format!("statement not tenant-scoped: {what} at byte {at}"));
     // The clause at `depth` ends at `toks[k]`.
     let ends = |k: usize, depth: usize| -> bool {
         let t = &toks[k];
@@ -154,12 +225,44 @@ pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), Stri
             .any(|w| word(t, w))
             || ((word(t, "GROUP") || word(t, "ORDER")) && next_by)
     };
-    for (i, from) in toks.iter().enumerate() {
-        if !word(from, "FROM") {
+
+    // Every source: where it starts, how it was introduced, and the byte
+    // of the word or comma that introduced it.
+    let mut sources: Vec<(usize, Source, usize)> = Vec::new();
+    let mut in_from: Vec<bool> = vec![false];
+    for (i, t) in toks.iter().enumerate() {
+        let d = t.depth;
+        if in_from.len() < d + 2 {
+            in_from.resize(d + 2, false);
+        }
+        if t.kind == Tok::Open {
+            in_from[d + 1] = false;
             continue;
         }
+        if word(t, "FROM") {
+            in_from[d] = true;
+            sources.push((i + 1, Source::From, t.start));
+        } else if word(t, "JOIN") {
+            let array = i > 0 && word(&toks[i - 1], "ARRAY");
+            if array {
+                // An array join's list names arrays, not tables.
+                in_from[d] = false;
+            } else {
+                in_from[d] = true;
+                sources.push((i + 1, Source::Joined, t.start));
+            }
+        } else if t.kind == Tok::Other && text(t) == "," && in_from[d] {
+            sources.push((i + 1, Source::Joined, t.start));
+        } else if word(t, "IN") {
+            sources.push((i + 1, Source::InSet, t.start));
+        } else if t.kind == Tok::Word && CLAUSE_WORDS.iter().any(|w| word(t, w)) {
+            in_from[d] = false;
+        }
+    }
+
+    for (start, how, at) in sources {
         // The name: parts joined by dots, each a word or a quoted name.
-        let mut j = i + 1;
+        let mut j = start;
         let mut last = None;
         while let Some(t) = toks.get(j) {
             match t.kind {
@@ -176,16 +279,55 @@ pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), Stri
                 break;
             }
         }
-        let Some(table) = last.filter(|name| tables.iter().any(|t| t == name)) else {
+        // A subquery, a tuple or a literal: its own reads are sources of
+        // their own.
+        let Some(name) = last else {
             continue;
         };
-        let refused = || {
-            format!(
-                "statement not tenant-scoped: FROM {table} at byte {}",
-                from.start
-            )
-        };
-        let depth = from.depth;
+        if toks.get(j).is_some_and(|t| t.kind == Tok::Open) {
+            let f = name.to_ascii_lowercase();
+            let known = HARMLESS_TABLE_FUNCTIONS.contains(&f.as_str())
+                || QUERY_TABLE_FUNCTIONS.contains(&f.as_str())
+                || REMOTE_TABLE_FUNCTIONS.contains(&f.as_str());
+            if how == Source::InSet && !known && !f.starts_with("merge") {
+                // After `IN` the server evaluates a call as a scalar function
+                // (`x IN tuple(…)`, `x IN arrayConcat(…)`): a value, not a
+                // table. The names that read tables are refused below.
+                continue;
+            }
+            if HARMLESS_TABLE_FUNCTIONS.contains(&f.as_str())
+                || QUERY_TABLE_FUNCTIONS.contains(&f.as_str())
+            {
+                continue;
+            }
+            if REMOTE_TABLE_FUNCTIONS.contains(&f.as_str()) {
+                let inner = toks[j].depth + 1;
+                let mut k = j + 1;
+                let mut viewed = false;
+                while k + 1 < toks.len() && !(toks[k].kind == Tok::Close && toks[k].depth < inner) {
+                    if toks[k].depth == inner
+                        && QUERY_TABLE_FUNCTIONS.iter().any(|q| word(&toks[k], q))
+                        && toks[k + 1].kind == Tok::Open
+                    {
+                        viewed = true;
+                    }
+                    k += 1;
+                }
+                if viewed {
+                    continue;
+                }
+            }
+            return refuse(&format!("table function {name}"), at);
+        }
+        let table = name;
+        if !tables.contains(&table) {
+            continue;
+        }
+        if how != Source::From {
+            return refuse(&format!("{table} read as a join target or a set"), at);
+        }
+        let refused = || refuse(&format!("FROM {table}"), at);
+        let depth = toks[start - 1].depth;
         let mut k = j;
         let where_at = loop {
             if k >= toks.len() || ends(k, depth) {
@@ -197,7 +339,7 @@ pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), Stri
             k += 1;
         };
         let Some(w) = where_at else {
-            return Err(refused());
+            return refused();
         };
         let body = sql[toks[w].end..].trim_start();
         let leads = |lead: &str| {
@@ -210,12 +352,12 @@ pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), Stri
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\n', ')']));
         let scoped = leads(&format!("{term} AND")) || marker;
         if !scoped {
-            return Err(refused());
+            return refused();
         }
         let mut k = w + 1;
         while k < toks.len() && !ends(k, depth) {
             if toks[k].depth == depth && word(&toks[k], "OR") {
-                return Err(refused());
+                return refused();
             }
             k += 1;
         }
@@ -291,5 +433,126 @@ mod tests {
                 "accepted, as tenant 'a': {sql}"
             );
         }
+    }
+
+    /// **T-G, every table source (issue #738).** A trace table read as a
+    /// join target, a comma-joined table, an `IN` set, inside a CTE, or
+    /// through a table function is refused unscoped and accepted only
+    /// when the read is a subquery whose own `WHERE` leads with the term.
+    /// A table function the check cannot see into is refused.
+    #[test]
+    fn the_check_refuses_an_unscoped_read_in_every_table_source() {
+        let a = term("a");
+        let tables = tables();
+        let scoped_spans = "(SELECT trace_id FROM spans WHERE org_id = 'a' AND x)";
+        let unscoped_spans = "(SELECT trace_id FROM spans WHERE x)";
+        let joins = [
+            "JOIN",
+            "INNER JOIN",
+            "LEFT JOIN",
+            "LEFT OUTER JOIN",
+            "RIGHT JOIN",
+            "FULL OUTER JOIN",
+            "CROSS JOIN",
+            "ANY LEFT JOIN",
+            "ALL INNER JOIN",
+            "ASOF LEFT JOIN",
+            "LEFT SEMI JOIN",
+            "GLOBAL INNER JOIN",
+            "GLOBAL ANY LEFT JOIN",
+        ];
+        let base = "SELECT 1 FROM system.one AS o";
+        let mut refused: Vec<String> = Vec::new();
+        let mut accepted: Vec<String> = Vec::new();
+        for j in joins {
+            refused.push(format!("{base} {j} spans AS s ON o.dummy = s.kind WHERE x"));
+            refused.push(format!("{base} {j} db.spans_dist AS s USING (trace_id)"));
+            refused.push(format!("{base} {j} {unscoped_spans} AS s USING (trace_id)"));
+            accepted.push(format!("{base} {j} {scoped_spans} AS s USING (trace_id)"));
+        }
+        // Comma joins.
+        refused.push(format!("{base}, spans AS s WHERE org_id = 'a' AND x"));
+        refused.push(format!("{base}, {unscoped_spans} AS s"));
+        accepted.push(format!("{base}, {scoped_spans} AS s"));
+        // `IN` and `GLOBAL IN` sets.
+        for op in ["IN", "NOT IN", "GLOBAL IN", "GLOBAL NOT IN"] {
+            refused.push(format!("{base} WHERE x {op} spans"));
+            refused.push(format!("{base} WHERE x {op} db.traces_dist"));
+            refused.push(format!("{base} WHERE x {op} {unscoped_spans}"));
+            accepted.push(format!("{base} WHERE x {op} {scoped_spans}"));
+        }
+        // CTE bodies and references.
+        refused.push("WITH c AS (SELECT * FROM spans WHERE x) SELECT * FROM c".to_string());
+        refused.push(format!(
+            "WITH c AS {unscoped_spans} SELECT * FROM c JOIN spans USING (trace_id)"
+        ));
+        accepted.push(format!("WITH c AS {scoped_spans} SELECT * FROM c"));
+        // Table functions: refused unless the read is a scoped one inside.
+        for f in [
+            "merge('db', '^spans$')",
+            "merge(db, '^(spans|traces)$')",
+            "remote('h', 'db', 'spans')",
+            "remote('h', 'db.spans')",
+            "remoteSecure('h', 'db', 'traces')",
+            "cluster('c', 'db', 'spans')",
+            "cluster('c', db.spans)",
+            "clusterAllReplicas('c', 'db', 'spans')",
+            "url('http://h/x', 'TSV')",
+            "file('x.tsv')",
+        ] {
+            refused.push(format!("SELECT 1 FROM {f} WHERE org_id = 'a' AND x"));
+            refused.push(format!("{base} JOIN {f} AS s USING (trace_id)"));
+            // After `IN` the server evaluates a call as a scalar function, and
+            // knows none of these names; the check refuses them anyway.
+            if !f.starts_with("url") && !f.starts_with("file") {
+                refused.push(format!("{base} WHERE x IN {f}"));
+            }
+        }
+        // A scalar function after `IN` is a value.
+        accepted.push(format!("{base} WHERE x IN arrayConcat([1], [2])"));
+        accepted.push(format!("{base} WHERE (x, y) IN tuple(1, 2)"));
+        for f in [
+            "view",
+            "cluster('c', view",
+            "clusterAllReplicas('c', view",
+            "remote('h', view",
+        ] {
+            let close = if f == "view" { ")" } else { "))" };
+            refused.push(format!(
+                "SELECT 1 FROM {f}(SELECT 1 FROM db.spans WHERE x){close}"
+            ));
+            accepted.push(format!(
+                "SELECT 1 FROM {f}(SELECT 1 FROM db.spans WHERE org_id = 'a' AND x){close}"
+            ));
+        }
+        accepted.push("SELECT number FROM numbers(10)".to_string());
+        // Not tables: an array join over a column, a column named like a
+        // table, a scalar function.
+        accepted.push(
+            "SELECT 1 FROM spans ARRAY JOIN events AS e, links AS l WHERE org_id = 'a' AND x"
+                .to_string(),
+        );
+        accepted.push(
+            "SELECT m.spans AS spans, arrayJoin(spans) AS s FROM (SELECT 1 AS spans) AS m"
+                .to_string(),
+        );
+        let mut wrong = Vec::new();
+        for sql in &refused {
+            if check(sql, &a, &tables).is_ok() {
+                wrong.push(format!("accepted, want refused: {sql}"));
+            }
+        }
+        for sql in &accepted {
+            if let Err(e) = check(sql, &a, &tables) {
+                wrong.push(format!("refused ({e}), want accepted: {sql}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} cases wrong:\n{}",
+            wrong.len(),
+            refused.len() + accepted.len(),
+            wrong.join("\n")
+        );
     }
 }
