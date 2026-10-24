@@ -116,10 +116,10 @@ async fn seed_catalog(client: &ChClient, db: &str) {
         exec(
             client,
             &format!(
-                "INSERT INTO {db}.tag_values (scope, key, value, val_type) \
+                "INSERT INTO {db}.tag_values (scope, key, value, val_type, last_start_ns) \
                  SELECT '{scope}', \
                         concat('k', toString(number % {KEYS_PER_SCOPE})), \
-                        concat('{prefix}', leftPad(toString(intDiv(number, {KEYS_PER_SCOPE})), 7, '0')), 'string' \
+                        concat('{prefix}', leftPad(toString(intDiv(number, {KEYS_PER_SCOPE})), 7, '0')), 'string', toUnixTimestamp64Nano(now64(9)) \
                  FROM numbers({})",
                 KEYS_PER_SCOPE * VALS_PER_KEY
             ),
@@ -128,7 +128,7 @@ async fn seed_catalog(client: &ChClient, db: &str) {
     }
     exec(
         client,
-        &format!("INSERT INTO {db}.tag_names SELECT DISTINCT scope, key FROM {db}.tag_values"),
+        &format!("INSERT INTO {db}.tag_names SELECT scope, key, max(last_start_ns) FROM {db}.tag_values GROUP BY scope, key"),
     )
     .await;
 }
@@ -341,10 +341,10 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
 
     let resource = ch_string("resource");
     let key = ch_string("k3");
-    let scoped_names = tag_names_sql(Some(&resource), TAG_NAMES_MAX + 1);
-    let unscoped_names = tag_names_sql(None, TAG_NAMES_MAX + 1);
-    let scoped_values = tag_values_sql(&key, Some(&resource), TAG_VALUES_MAX + 1);
-    let unscoped_values = tag_values_sql(&key, None, TAG_VALUES_MAX + 1);
+    let scoped_names = tag_names_sql(Some(&resource), i64::MIN, TAG_NAMES_MAX + 1);
+    let unscoped_names = tag_names_sql(None, i64::MIN, TAG_NAMES_MAX + 1);
+    let scoped_values = tag_values_sql(&key, Some(&resource), i64::MIN, TAG_VALUES_MAX + 1);
+    let unscoped_values = tag_values_sql(&key, None, i64::MIN, TAG_VALUES_MAX + 1);
 
     // ---- Gate 2 (strict): scoped values prune on the (scope, key)
     // prefix — strictly fewer granules than the scoped-names shape, which
@@ -501,10 +501,10 @@ async fn seed_budget_catalog(client: &ChClient, db: &str) {
         exec(
             client,
             &format!(
-                "INSERT INTO {db}.tag_values (scope, key, value, val_type) \
+                "INSERT INTO {db}.tag_values (scope, key, value, val_type, last_start_ns) \
                  SELECT '{scope}', \
                         concat('k', toString(number % {BUDGET_KEYS_PER_SCOPE})), \
-                        concat('v', leftPad(toString(intDiv(number, {BUDGET_KEYS_PER_SCOPE})), 7, '0')), 'string' \
+                        concat('v', leftPad(toString(intDiv(number, {BUDGET_KEYS_PER_SCOPE})), 7, '0')), 'string', toUnixTimestamp64Nano(now64(9)) \
                  FROM numbers({})",
                 BUDGET_KEYS_PER_SCOPE * vals_per_key
             ),
@@ -513,7 +513,7 @@ async fn seed_budget_catalog(client: &ChClient, db: &str) {
     }
     exec(
         client,
-        &format!("INSERT INTO {db}.tag_names SELECT DISTINCT scope, key FROM {db}.tag_values"),
+        &format!("INSERT INTO {db}.tag_names SELECT scope, key, max(last_start_ns) FROM {db}.tag_values GROUP BY scope, key"),
     )
     .await;
 }
@@ -635,12 +635,12 @@ async fn tag_discovery_bounds_unscoped_scans_at_the_read_budget() {
 
     let seed_client = budget_data_client(budget_db).await;
     seed_budget_catalog(&seed_client, budget_db).await;
-    exec(&seed_client, &format!("INSERT INTO {budget_db}.tag_names SELECT 'span', concat('n', toString(number)) FROM numbers({BUDGET_TOTAL_ROWS})")).await;
+    exec(&seed_client, &format!("INSERT INTO {budget_db}.tag_names SELECT 'span', concat('n', toString(number)), toUnixTimestamp64Nano(now64(9)) FROM numbers({BUDGET_TOTAL_ROWS})")).await;
 
     let engine = TraceEngine::new(budget_data_client(budget_db).await, tight_budget_config());
 
     // ---- Gate 1: both unscoped shapes throw QueryTooBroad --------------
-    match engine.list_tag_names(None).await {
+    match engine.list_tag_names(None, i64::MIN).await {
         Err(ReadError::QueryTooBroad(TooBroadReason::TraceScanBudgetRows { budget_rows })) => {
             assert_eq!(budget_rows, TIGHT_BUDGET_ROWS);
         }
@@ -664,7 +664,7 @@ async fn tag_discovery_bounds_unscoped_scans_at_the_read_budget() {
 
     // ---- Gate 2: both scoped shapes stay under budget -> Ok -------------
     let names = engine
-        .list_tag_names(Some("resource"))
+        .list_tag_names(Some("resource"), i64::MIN)
         .await
         .expect("scoped tag-names prune to the 50-row resource partition, well under budget");
     assert_eq!(names.names.len(), BUDGET_KEYS_PER_SCOPE as usize);
@@ -743,6 +743,7 @@ fn unnarrowed_values_request() -> pulsus_read::TagValuesRequest<'static> {
         q: None,
         start_ns: 1_700_000_000_000_000_000,
         end_ns: 1_700_003_600_000_000_000,
+        floor_ns: i64::MIN,
     }
 }
 
@@ -777,10 +778,10 @@ async fn seed_qm_catalog(client: &ChClient, db: &str) {
         exec(
             client,
             &format!(
-                "INSERT INTO {db}.tag_values (scope, key, value, val_type) \
+                "INSERT INTO {db}.tag_values (scope, key, value, val_type, last_start_ns) \
                  SELECT '{scope}', \
                         concat('k', toString(number % {QM_KEYS_PER_SCOPE})), \
-                        concat('v', leftPad(toString(intDiv(number, {QM_KEYS_PER_SCOPE})), 7, '0')), 'string' \
+                        concat('v', leftPad(toString(intDiv(number, {QM_KEYS_PER_SCOPE})), 7, '0')), 'string', toUnixTimestamp64Nano(now64(9)) \
                  FROM numbers({})",
                 QM_KEYS_PER_SCOPE * QM_VALS_PER_KEY
             ),
@@ -797,9 +798,9 @@ async fn seed_qm_catalog(client: &ChClient, db: &str) {
         exec(
             client,
             &format!(
-                "INSERT INTO {db}.tag_values (scope, key, value, val_type) \
+                "INSERT INTO {db}.tag_values (scope, key, value, val_type, last_start_ns) \
                  SELECT '{scope}', '{QM_KEY}', \
-                        concat('{prefix}', leftPad(toString(number), 7, '0')), 'string' \
+                        concat('{prefix}', leftPad(toString(number), 7, '0')), 'string', toUnixTimestamp64Nano(now64(9)) \
                  FROM numbers({QM_VALS_PER_KEY})"
             )
             .replace('?', "??"),
@@ -808,7 +809,7 @@ async fn seed_qm_catalog(client: &ChClient, db: &str) {
     }
     exec(
         client,
-        &format!("INSERT INTO {db}.tag_names SELECT DISTINCT scope, key FROM {db}.tag_values"),
+        &format!("INSERT INTO {db}.tag_names SELECT scope, key, max(last_start_ns) FROM {db}.tag_values GROUP BY scope, key"),
     )
     .await;
 }
@@ -851,7 +852,7 @@ async fn unnarrowed_values_for_a_question_mark_key_prune_and_answer() {
 
     let scope = ch_string("span");
     let key = ch_string(QM_KEY);
-    let sql = tag_values_sql(&key, Some(&scope), TAG_VALUES_MAX + 1);
+    let sql = tag_values_sql(&key, Some(&scope), i64::MIN, TAG_VALUES_MAX + 1);
     assert!(
         sql.contains(QM_KEY),
         "the builder must inline the key as a literal, or this gate tests nothing:\n{sql}"
@@ -880,7 +881,7 @@ async fn unnarrowed_values_for_a_question_mark_key_prune_and_answer() {
     // prune strictly deeper than fixing `key` alone. Delete the scope
     // predicate and the two shapes become the same statement, so the
     // strict inequality is what fails.
-    let unscoped = tag_values_sql(&key, None, TAG_VALUES_MAX + 1);
+    let unscoped = tag_values_sql(&key, None, i64::MIN, TAG_VALUES_MAX + 1);
     let unscoped_raw = explain_raw(&client, &unscoped.replace('?', "??")).await;
     let (unscoped_selected, unscoped_total) = primary_key_granules(&unscoped_raw);
     assert_eq!(
@@ -1014,6 +1015,7 @@ fn store_request(start_ns: i64, end_ns: i64) -> pulsus_read::TagValuesRequest<'s
         q: Some(r#"{resource.service.name="s1" && kind=server}"#),
         start_ns,
         end_ns,
+        floor_ns: i64::MIN,
     }
 }
 

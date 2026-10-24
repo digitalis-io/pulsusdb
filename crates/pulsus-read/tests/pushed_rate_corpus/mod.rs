@@ -550,12 +550,12 @@ pub async fn seed(client: &ChClient, fx: &[SeedSeries], seen_ms: i64) {
     // same kind-2 row — a selector with no metric name and no `__name__`
     // matcher resolves through it.
     for sql in [
-        "INSERT INTO metric_label_index (key, value, fingerprint) \
-         SELECT kv.1, kv.2, fingerprint FROM metric_labels \
+        "INSERT INTO metric_label_index (key, value, fingerprint, last_seen) \
+         SELECT kv.1, kv.2, fingerprint, last_seen FROM metric_labels \
          ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv",
-        "INSERT INTO metric_label_values (key, value) \
-         SELECT DISTINCT kv.1, kv.2 FROM metric_labels \
-         ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv",
+        "INSERT INTO metric_label_values (key, value, last_seen) \
+         SELECT kv.1, kv.2, max(last_seen) FROM metric_labels \
+         ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv GROUP BY kv.1, kv.2",
     ] {
         client
             .execute(sql, &QuerySettings::new(), Idempotency::NonIdempotent)

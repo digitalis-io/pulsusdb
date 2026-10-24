@@ -786,6 +786,7 @@ async fn a_stopped_tag_read_is_the_newest_on_every_shard() {
         q: Some(r#"{resource.service.name="a" || resource.service.name="b"}"#),
         start_ns: now - 180 * MIN,
         end_ns: now,
+        floor_ns: i64::MIN,
     };
     let prefix = pulsus_testkit::test_ident(&format!("t598p2_cluster_{}", now_ns()));
     let engine = pulsus_read::TraceEngine::new(
@@ -875,6 +876,7 @@ async fn a_stopped_tag_read_is_the_newest_on_every_shard() {
                 q: Some("{traceDuration > 1s}"),
                 start_ns: now - 180 * MIN,
                 end_ns: now_ns() + MIN,
+                floor_ns: i64::MIN,
             },
         )
         .await
@@ -955,6 +957,7 @@ async fn one_cut_holds_for_every_shard() {
                 q: Some(r#"{resource.service.name="a" || resource.service.name="b"}"#),
                 start_ns: now - 180 * MIN,
                 end_ns: now,
+                floor_ns: i64::MIN,
             },
         )
         .await
@@ -5025,6 +5028,7 @@ async fn the_catalogue_and_the_error_table_answer_over_two_shards() {
                 q: Some(r#"{ resource.service.name = "checkout" }"#),
                 start_ns: s,
                 end_ns: e_ns,
+                floor_ns: i64::MIN,
             },
         )
         .await
@@ -5506,6 +5510,7 @@ async fn the_resource_catalogue_answers_over_two_shards() {
                 q: Some(r#"{ resource.service.name = "a" }"#),
                 start_ns: s,
                 end_ns: e,
+                floor_ns: i64::MIN,
             },
         )
         .await

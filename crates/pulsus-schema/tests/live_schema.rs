@@ -2003,3 +2003,210 @@ async fn the_log_body_has_one_text_index_of_4_grams() {
     );
     drop_database(&client, db).await;
 }
+
+/// Issue #496: the eight lookup and catalog tables expire. Built at one day of
+/// retention; per table one row three days or three months old and one row
+/// stamped one second into yesterday (UTC), each in its own insert. After
+/// `MATERIALIZE TTL` and a final merge the old row is gone and yesterday's
+/// kept: it is due at the end of its UTC day plus a day, not a day after its
+/// own instant, which has passed. An anchor on the row's own instant deletes
+/// it and fails here.
+///
+/// The views carry the time, and a late row does not move it back: each
+/// table is fed a row of now and then, in a second insert, a row of an hour
+/// ago for the same key. After a final merge one row is left, carrying now,
+/// read without `max()` or `FINAL`.
+#[tokio::test]
+async fn the_lookup_and_catalog_tables_expire_with_the_samples() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_lookup_ttl");
+    drop_database(&client, db).await;
+    run_init(&client, &RenderCtx::for_tests(db, 1))
+        .await
+        .expect("run_init (retention_days=1)");
+    let exec = |sql: String| {
+        let client = &client;
+        async move {
+            client
+                .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\nSQL:\n{sql}"));
+        }
+    };
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let old_s = now_s - 3 * 86_400;
+    let yesterday_s = (now_s / 86_400 - 1) * 86_400 + 1;
+    let (old_ms, new_ms, y_ms) = (old_s * 1000, now_s * 1000, yesterday_s * 1000);
+    let (old_ns, new_ns, y_ns) = (
+        old_s * 1_000_000_000,
+        now_s * 1_000_000_000,
+        yesterday_s * 1_000_000_000,
+    );
+    let (late_ms, late_ns) = (new_ms - 3_600_000, new_ns - 3_600_000_000_000);
+    let old_month = "toStartOfMonth(today() - INTERVAL 3 MONTH)";
+    let new_month = "toStartOfMonth(today())";
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "log_streams",
+            format!(
+                "INSERT INTO {db}.log_streams (org_id, month, fingerprint, service, labels, updated_ns) SELECT '', {old_month}, 1, 's', '{{}}', 1"
+            ),
+            format!(
+                "INSERT INTO {db}.log_streams (org_id, month, fingerprint, service, labels, updated_ns) SELECT '', {new_month}, 2, 's', '{{}}', 1"
+            ),
+        ),
+        (
+            "log_streams_idx",
+            format!(
+                "INSERT INTO {db}.log_streams_idx (org_id, month, key, val, fingerprint) SELECT '', {old_month}, 'k', 'old', 1"
+            ),
+            format!(
+                "INSERT INTO {db}.log_streams_idx (org_id, month, key, val, fingerprint) SELECT '', {new_month}, 'k', 'new', 2"
+            ),
+        ),
+        (
+            "metric_labels",
+            format!(
+                "INSERT INTO {db}.metric_labels (org_id, metric_name, fingerprint, labels, first_seen, last_seen) VALUES ('', 'm', 1, '{{}}', {old_ms}, {old_ms})"
+            ),
+            format!(
+                "INSERT INTO {db}.metric_labels (org_id, metric_name, fingerprint, labels, first_seen, last_seen) VALUES ('', 'm', 2, '{{}}', {y_ms}, {y_ms})"
+            ),
+        ),
+        (
+            "metric_label_index",
+            format!(
+                "INSERT INTO {db}.metric_label_index (org_id, key, value, fingerprint, last_seen) VALUES ('', 'k', 'old', 1, {old_ms})"
+            ),
+            format!(
+                "INSERT INTO {db}.metric_label_index (org_id, key, value, fingerprint, last_seen) VALUES ('', 'k', 'new', 2, {y_ms})"
+            ),
+        ),
+        (
+            "metric_label_values",
+            format!(
+                "INSERT INTO {db}.metric_label_values (org_id, key, value, last_seen) VALUES ('', 'k', 'old', {old_ms})"
+            ),
+            format!(
+                "INSERT INTO {db}.metric_label_values (org_id, key, value, last_seen) VALUES ('', 'k', 'new', {y_ms})"
+            ),
+        ),
+        (
+            "tag_names",
+            format!(
+                "INSERT INTO {db}.tag_names (scope, key, last_start_ns) VALUES ('span', 'old', {old_ns})"
+            ),
+            format!(
+                "INSERT INTO {db}.tag_names (scope, key, last_start_ns) VALUES ('span', 'new', {y_ns})"
+            ),
+        ),
+        (
+            "tag_values",
+            format!(
+                "INSERT INTO {db}.tag_values (scope, key, value, val_type, last_start_ns) VALUES ('span', 'k', 'old', 'string', {old_ns})"
+            ),
+            format!(
+                "INSERT INTO {db}.tag_values (scope, key, value, val_type, last_start_ns) VALUES ('span', 'k', 'new', 'string', {y_ns})"
+            ),
+        ),
+        (
+            "traces",
+            format!(
+                "INSERT INTO {db}.traces (day, trace_id, start_ns, end_ns, last_start_ns) SELECT toDate(fromUnixTimestamp64Nano(toInt64({old_ns})), 'UTC'), toFixedString('old0000000000000', 16), {old_ns}, {old_ns}, {old_ns}"
+            ),
+            format!(
+                "INSERT INTO {db}.traces (day, trace_id, start_ns, end_ns, last_start_ns) SELECT toDate(fromUnixTimestamp64Nano(toInt64({y_ns})), 'UTC'), toFixedString('new0000000000000', 16), {y_ns}, {y_ns}, {y_ns}"
+            ),
+        ),
+    ];
+    for (_, old, new) in &rows {
+        exec(old.clone()).await;
+        exec(new.clone()).await;
+    }
+    let mut left = Vec::new();
+    for (table, ..) in &rows {
+        exec(format!(
+            "ALTER TABLE {db}.{table} MATERIALIZE TTL SETTINGS mutations_sync = 2"
+        ))
+        .await;
+        exec(format!("OPTIMIZE TABLE {db}.{table} FINAL")).await;
+        left.push((
+            *table,
+            count(&client, &format!("SELECT count() AS n FROM {db}.{table}")).await,
+        ));
+    }
+    let want: Vec<(&str, u64)> = rows.iter().map(|(t, ..)| (*t, 1)).collect();
+
+    // The views, newest first: the late row arrives in its own insert.
+    for (ms, ns) in [(new_ms, new_ns), (late_ms, late_ns)] {
+        exec(format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels) VALUES \
+             ('', {new_ms}, 2, 'v', 9, {ms}, '{{\"job\":\"view\"}}')"
+        ))
+        .await;
+        exec(format!(
+            "INSERT INTO {db}.trace_landing (received_ms, row_kind, start_ns, tag_scope, tag_key, tag_value, tag_type) VALUES \
+             ({new_ms}, 2, {ns}, 'span', 'view', '', ''), ({new_ms}, 3, {ns}, 'span', 'view', 'v', 'string')"
+        ))
+        .await;
+    }
+    let mut kept = Vec::new();
+    for (table, column, filter) in [
+        ("metric_labels", "last_seen", "metric_name = 'v'"),
+        (
+            "metric_label_index",
+            "last_seen",
+            "key = 'job' AND value = 'view'",
+        ),
+        (
+            "metric_label_values",
+            "last_seen",
+            "key = 'job' AND value = 'view'",
+        ),
+        ("tag_names", "last_start_ns", "key = 'view'"),
+        ("tag_values", "last_start_ns", "key = 'view'"),
+    ] {
+        exec(format!("OPTIMIZE TABLE {db}.{table} FINAL")).await;
+        let got = int_column(
+            &client,
+            &format!("SELECT toInt64({column}) AS v FROM {db}.{table} WHERE {filter}"),
+        )
+        .await;
+        kept.push((table, got));
+    }
+    drop_database(&client, db).await;
+    assert_eq!(left, want, "each table keeps its one row within retention");
+    assert_eq!(
+        kept,
+        vec![
+            ("metric_labels", vec![new_ms]),
+            ("metric_label_index", vec![new_ms]),
+            ("metric_label_values", vec![new_ms]),
+            ("tag_names", vec![new_ns]),
+            ("tag_values", vec![new_ns]),
+        ],
+        "one row per key after the merge, carrying the newer instant"
+    );
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct IntRow {
+    v: i64,
+}
+
+/// Every value of the single `Int64` column `v` that `sql` returns.
+async fn int_column(client: &ChClient, sql: &str) -> Vec<i64> {
+    let mut stream = client
+        .query_stream::<IntRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\nSQL:\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode IntRow").v);
+    }
+    out
+}

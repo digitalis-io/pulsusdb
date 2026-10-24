@@ -547,14 +547,15 @@ async fn every_target_table_column_carries_a_codec() {
             ),
         )
         .await,
-        70,
-        "the eight target tables' own column count (28 + 8 + 8 + 2 + 4 + 12 \
+        72,
+        "the eight target tables' own column count (28 + 8 + 8 + 3 + 5 + 12 \
          + 5 + 3), so the codec check below has a non-empty domain. Issue #587 \
          added four columns to `spans`, two to `traces` and one to \
          `resources`; issue #589 added one to `spans`; issue #591 part 1 made \
          `traces`' two root columns one; issue #601 part 4b added \
          `error_spans` and `tag_bucket_values`; part 4c added \
-         `service_bucket_resources`"
+         `service_bucket_resources`; issue #496 added `last_start_ns` to both \
+         catalogs"
     );
     let bare = names(
         &client,
@@ -583,7 +584,7 @@ async fn every_target_table_column_carries_a_codec() {
 ///
 /// The column **type** is not pinned here — the per-table `(name, type)`
 /// cases above own that.
-const TARGET_TABLE_CODECS: [(&str, &str, &str); 70] = [
+const TARGET_TABLE_CODECS: [(&str, &str, &str); 72] = [
     ("error_spans", "trace_id", "CODEC(ZSTD(1))"),
     ("error_spans", "span_id", "CODEC(ZSTD(1))"),
     ("error_spans", "start_ns", "CODEC(Delta(8), ZSTD(1))"),
@@ -642,10 +643,12 @@ const TARGET_TABLE_CODECS: [(&str, &str, &str); 70] = [
     ("tag_bucket_values", "vals", "CODEC(ZSTD(1))"),
     ("tag_names", "scope", "CODEC(ZSTD(1))"),
     ("tag_names", "key", "CODEC(ZSTD(1))"),
+    ("tag_names", "last_start_ns", "CODEC(DoubleDelta, ZSTD(1))"),
     ("tag_values", "scope", "CODEC(ZSTD(1))"),
     ("tag_values", "key", "CODEC(ZSTD(1))"),
     ("tag_values", "value", "CODEC(ZSTD(1))"),
     ("tag_values", "val_type", "CODEC(ZSTD(1))"),
+    ("tag_values", "last_start_ns", "CODEC(DoubleDelta, ZSTD(1))"),
     ("traces", "day", "CODEC(ZSTD(1))"),
     ("traces", "trace_id", "CODEC(ZSTD(1))"),
     ("traces", "start_ns", "CODEC(ZSTD(1))"),
@@ -736,26 +739,25 @@ async fn applying_the_schema_to_a_built_database_fails() {
     );
 }
 
-/// The two tag catalogs carry a deduplication window and **no TTL**, because
-/// `docs/api.md` §4.3 requires catalog entries to outlive span retention;
-/// the other four each carry one. It is what catches a TTL statement added
-/// for a catalog.
+/// All six carry a TTL. Issue #496: the two tag catalogs expire with the
+/// spans, at `last_start_ns`, where they used to carry none. Each table's
+/// exact expression is `schema_file.rs`'s `every_table_expires_exactly_as_documented`.
 #[tokio::test]
-async fn the_catalogs_carry_no_ttl_and_the_other_four_do() {
+async fn the_catalogs_and_the_other_four_carry_a_ttl() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_ttlset");
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
 
-    for catalog in ["tag_names", "tag_values"] {
-        let engine = engine_full(&client, db, catalog).await;
-        assert!(
-            !engine.contains("TTL"),
-            "{catalog} must carry no TTL: {engine}"
-        );
-    }
-    for retained in ["spans", "resources", "traces", "trace_landing"] {
+    for retained in [
+        "tag_names",
+        "tag_values",
+        "spans",
+        "resources",
+        "traces",
+        "trace_landing",
+    ] {
         let engine = engine_full(&client, db, retained).await;
         assert!(
             engine.contains("TTL"),
@@ -843,7 +845,10 @@ async fn the_ttl_clamps_at_the_top_of_the_admitted_domain() {
     // The clamp is in the stored text of all three retained tables.
     for (table, column) in [
         ("spans", "intDiv(start_ns, 1000000000)"),
-        ("traces", "intDiv(last_start_ns, 1000000000)"),
+        (
+            "traces",
+            "((intDiv(last_start_ns, 86400000000000) + 1) * 86400)",
+        ),
         ("resources", "((toUInt32(day) + 1) * 86400)"),
     ] {
         let engine = engine_full(&client, db, table).await;
@@ -911,8 +916,12 @@ async fn the_ttl_clamps_at_the_top_of_the_admitted_domain() {
 ///
 /// `min = 1` for resources is the row outliving its day's last span by one
 /// second; one day less gives `-86399`. `max = 86400` is a span at the
-/// start of its day, which the day-grained row must also cover. The gaps do
-/// not depend on the retention.
+/// start of its day, which the day-grained row must also cover. The
+/// per-trace row is due at the end of its latest span's UTC day (issue
+/// #496), so it outlives that span by the rest of the day: `min = 60` is a
+/// latest span in the day's last minute, `max = 86400` one at midnight; an
+/// anchor on the span's own instant gives `(0,0,…)`. The gaps do not depend
+/// on the retention.
 #[tokio::test]
 async fn every_resource_and_trace_row_outlives_the_spans_it_covers() {
     skip_unless_live!();
@@ -958,7 +967,7 @@ async fn every_resource_and_trace_row_outlives_the_spans_it_covers() {
     )
     .await;
     assert_eq!(
-        trace_gap, "(0,0,6220800)",
+        trace_gap, "(60,86400,6220800)",
         "(min, max, count) of a per-trace row's TTL minus its latest span's, in seconds"
     );
 

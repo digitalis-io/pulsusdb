@@ -205,7 +205,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_label_index{{on_cluster}}
     org_id LowCardinality(String),
     key LowCardinality(String),
     value String CODEC(ZSTD(1)),
-    fingerprint UInt128 CODEC(ZSTD(1))
+    fingerprint UInt128 CODEC(ZSTD(1)),
+    last_seen Int64 CODEC(DoubleDelta, ZSTD(1))
 )
 --@single  ENGINE = ReplacingMergeTree
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_label_index', '{replica}')
@@ -217,7 +218,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_label_values{{on_cluster}}
 (
     org_id LowCardinality(String),
     key LowCardinality(String),
-    value String CODEC(ZSTD(1))
+    value String CODEC(ZSTD(1)),
+    last_seen Int64 CODEC(DoubleDelta, ZSTD(1))
 )
 --@single  ENGINE = ReplacingMergeTree
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_label_values', '{replica}')
@@ -390,7 +392,8 @@ TTL toDateTime(least(intDiv(start_ns, 1000000000) + ({{retention_days}} * 86400)
 CREATE TABLE IF NOT EXISTS {{db}}.tag_names{{on_cluster}}
 (
     scope LowCardinality(String) CODEC(ZSTD(1)),
-    key String CODEC(ZSTD(1))
+    key String CODEC(ZSTD(1)),
+    last_start_ns Int64 CODEC(DoubleDelta, ZSTD(1))
 )
 --@single  ENGINE = ReplacingMergeTree
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.tag_names', '{replica}')
@@ -403,7 +406,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.tag_values{{on_cluster}}
     scope LowCardinality(String) CODEC(ZSTD(1)),
     key String CODEC(ZSTD(1)),
     value String CODEC(ZSTD(1)),
-    val_type LowCardinality(String) CODEC(ZSTD(1))
+    val_type LowCardinality(String) CODEC(ZSTD(1)),
+    last_start_ns Int64 CODEC(DoubleDelta, ZSTD(1))
 )
 --@single  ENGINE = ReplacingMergeTree
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.tag_values', '{replica}')

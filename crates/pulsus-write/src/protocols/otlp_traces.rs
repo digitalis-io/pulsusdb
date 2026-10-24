@@ -808,6 +808,77 @@ mod tests {
         assert_eq!(out.spans[0].scope_version, "1.0.0");
     }
 
+    /// Issue #496: each catalog entry carries the latest start of a landed
+    /// span that carries it. Two spans under one resource and one scope,
+    /// starting 100 s and 300 s in: `k` is on both with different values,
+    /// `s=x` on both, the resource's and the scope's attributes on both. A
+    /// third span starting later is refused (no span id), so it raises
+    /// nothing.
+    #[test]
+    fn each_catalog_entry_carries_the_latest_start_of_a_span_that_carries_it() {
+        const T0: u64 = 1_700_000_000_000_000_000;
+        let at = |id: u8, offset_s: u64, value: &str| {
+            let mut s = span(vec![1; 16], vec![id; 8]);
+            s.start_time_unix_nano = T0 + offset_s * 1_000_000_000;
+            s.end_time_unix_nano = s.start_time_unix_nano + 1_000_000;
+            s.attributes = vec![
+                kv("k", Value::StringValue(value.to_string())),
+                kv("s", Value::StringValue("x".to_string())),
+            ];
+            s
+        };
+        let mut refused = at(9, 900, "late");
+        refused.span_id = vec![];
+        let resource = Resource {
+            attributes: vec![
+                kv("service.name", Value::StringValue("checkout".to_string())),
+                kv("r", Value::StringValue("1".to_string())),
+            ],
+            dropped_attributes_count: 0,
+            ..Default::default()
+        };
+        let scope = InstrumentationScope {
+            name: "sc".to_string(),
+            attributes: vec![kv("i", Value::StringValue("y".to_string()))],
+            ..Default::default()
+        };
+        let out = parse_landing(&request_with(
+            Some(resource),
+            Some(scope),
+            vec![at(2, 100, "a"), at(3, 300, "b"), refused],
+        ))
+        .expect("within the expansion budget");
+        assert_eq!(out.spans.len(), 2, "the third span is refused");
+        let ns = |offset_s: i64| T0 as i64 + offset_s * 1_000_000_000;
+        let names: Vec<(TagScope, &str, i64)> = out
+            .tag_names
+            .iter()
+            .map(|t| (t.scope, t.key.as_str(), t.last_start_ns))
+            .collect();
+        for want in [
+            (TagScope::Span, "k", ns(300)),
+            (TagScope::Span, "s", ns(300)),
+            (TagScope::Resource, "r", ns(300)),
+            (TagScope::Instrumentation, "i", ns(300)),
+        ] {
+            assert!(names.contains(&want), "{want:?} in {names:?}");
+        }
+        let values: Vec<(&str, &str, i64)> = out
+            .tag_values
+            .iter()
+            .map(|t| (t.key.as_str(), t.value.as_str(), t.last_start_ns))
+            .collect();
+        for want in [
+            ("k", "a", ns(100)),
+            ("k", "b", ns(300)),
+            ("s", "x", ns(300)),
+            ("r", "1", ns(300)),
+        ] {
+            assert!(values.contains(&want), "{want:?} in {values:?}");
+        }
+        assert!(!values.iter().any(|v| v.1 == "late"), "{values:?}");
+    }
+
     /// A span whose `ScopeSpans` carries no `scope` yields no
     /// instrumentation catalog rows and empty `scope_name`/`scope_version`.
     #[test]
@@ -1752,6 +1823,7 @@ fn land_attrs(
         names.insert(LandingTagName {
             scope,
             key: kv.key.clone(),
+            last_start_ns: 0,
         });
         match landed {
             LandedValue::One(value) => {
@@ -1814,6 +1886,7 @@ fn record_values(
             key: key.to_string(),
             value: scalar.render(),
             val_type: scalar.val_type(),
+            last_start_ns: 0,
         });
     };
     match value {

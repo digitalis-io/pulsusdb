@@ -2038,7 +2038,10 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
 
     // 3 + 4. Catalog discovery — `catalog_settings`, the root that
     //        produced the measured 500.
-    engine.list_tag_names(None).await.expect("tag names");
+    engine
+        .list_tag_names(None, i64::MIN)
+        .await
+        .expect("tag names");
     engine
         .list_tag_values(
             "http.status_code",
@@ -2503,6 +2506,7 @@ fn unnarrowed_values_request() -> pulsus_read::TagValuesRequest<'static> {
         q: None,
         start_ns: 1_700_000_000_000_000_000,
         end_ns: 1_700_003_600_000_000_000,
+        floor_ns: i64::MIN,
     }
 }
 

@@ -447,6 +447,9 @@ pub struct TagValuesRequest<'a> {
     /// type cannot represent an unbounded read.
     pub start_ns: i64,
     pub end_ns: i64,
+    /// The retention floor (issue #496): the catalog read lists only values
+    /// whose latest span started at or after it.
+    pub floor_ns: i64,
 }
 
 impl TagValuesRequest<'_> {
@@ -946,9 +949,17 @@ impl TraceEngine {
     /// bounds *scanned* rows regardless: a breach maps through
     /// [`map_trace_read_error`] to `422 query_too_broad` instead of
     /// running unbounded.
-    pub async fn list_tag_names(&self, scope: Option<&str>) -> Result<TagNames, ReadError> {
+    pub async fn list_tag_names(
+        &self,
+        scope: Option<&str>,
+        floor_ns: i64,
+    ) -> Result<TagNames, ReadError> {
         let scope_literal = scope.map(crate::logql::escape::ch_string);
-        let sql = super::spans::tags::tag_names_sql(scope_literal.as_deref(), TAG_NAMES_MAX + 1);
+        let sql = super::spans::tags::tag_names_sql(
+            scope_literal.as_deref(),
+            floor_ns,
+            TAG_NAMES_MAX + 1,
+        );
         let settings = catalog_settings(&self.config);
         let mut names = Vec::new();
         // Scoped stream (module convention): the pooled-connection lease
@@ -1015,6 +1026,7 @@ impl TraceEngine {
             let sql = super::spans::tags::tag_values_sql(
                 &key_literal,
                 scope_literal.as_deref(),
+                req.floor_ns,
                 TAG_VALUES_MAX + 1,
             );
             return self
@@ -3033,6 +3045,7 @@ mod tests {
             q: None,
             start_ns: 1_700_000_000_000_000_000,
             end_ns: 1_700_010_800_000_000_000,
+            floor_ns: 0,
         };
         assert_eq!(
             req.window().span_time_clause(),
@@ -3053,6 +3066,7 @@ mod tests {
                 q: Some(q),
                 start_ns: 0,
                 end_ns: 0,
+                floor_ns: 0,
             };
             assert!(
                 !req.narrowing(&tag_ctx(req.window())).has_body(),
@@ -3063,6 +3077,7 @@ mod tests {
             q: Some("{resource.service.name=\"cart\"}"),
             start_ns: 0,
             end_ns: 0,
+            floor_ns: 0,
         };
         assert!(
             req.narrowing(&tag_ctx(req.window())).predicate().is_some(),

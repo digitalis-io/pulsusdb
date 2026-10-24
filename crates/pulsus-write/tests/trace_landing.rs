@@ -2192,7 +2192,7 @@ fn live_config() -> ChConnConfig {
 /// the four write-path tables**, and a client bound to it.
 ///
 /// **The merges are stopped because every fixture below is at a fixed past
-/// instant, and `spans`, `traces` and `resources` all carry a delete TTL of `retention_days = 7`.** Measured on this engine: a part
+/// instant, and `spans`, `traces`, `resources` and the two tag catalogs all carry a delete TTL of `retention_days = 7`.** Measured on this engine: a part
 /// holding one span at `start_ns = 1` and one at `1700000000000000000` is
 /// reported with `rows = 0` within two seconds of the insert, because
 /// `ttl_only_drop_parts = 1` drops a wholly-expired part as a background
@@ -2223,7 +2223,14 @@ async fn live_db(db: String) -> (ChClient, String) {
         .expect("drop the test database");
     let ctx: SchemaParams = RenderCtx::for_tests(&db, 7);
     run_init(&admin, &ctx).await.expect("run_init");
-    for table in ["spans", "traces", "resources", "trace_landing"] {
+    for table in [
+        "spans",
+        "traces",
+        "resources",
+        "trace_landing",
+        "tag_names",
+        "tag_values",
+    ] {
         admin
             .execute(
                 &format!("SYSTEM STOP MERGES {db}.{table}"),

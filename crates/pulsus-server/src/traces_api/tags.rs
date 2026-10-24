@@ -84,7 +84,10 @@ async fn tags_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
         }
         scope => {
             let engine = engine_for(&state).await?;
-            engine.list_tag_names(attribute_scope(scope)).await?
+            // Stub (issue #496, tests first): no floor yet.
+            engine
+                .list_tag_names(attribute_scope(scope), i64::MIN)
+                .await?
         }
     };
     Ok(ok_json(tags_response::render_tag_names(
@@ -217,6 +220,8 @@ pub(super) async fn values_for(
             ),
         ),
         end_ns: params.end_ns,
+        // Stub (issue #496, tests first): no floor yet.
+        floor_ns: i64::MIN,
     };
     match lookup {
         TagLookup::Intrinsic(intrinsic) => match tag_value_source(intrinsic) {

@@ -43,7 +43,10 @@ async fn tag_names_for(state: AppState, raw: &str) -> Result<NamesSource, ApiErr
         scope @ (TagScope::Intrinsic | TagScope::NoTags) => Ok(NamesSource::Static(scope)),
         scope => {
             let engine = engine_for(&state).await?;
-            let names = engine.list_tag_names(attribute_scope(scope)).await?;
+            // Stub (issue #496, tests first): no floor yet.
+            let names = engine
+                .list_tag_names(attribute_scope(scope), i64::MIN)
+                .await?;
             Ok(NamesSource::Catalog { names, scope })
         }
     }
@@ -100,6 +103,8 @@ async fn tag_values_v1_for(
                 q: None,
                 start_ns: params.start_ns,
                 end_ns: params.end_ns,
+                // Stub (issue #496, tests first): no floor yet.
+                floor_ns: i64::MIN,
             },
         )
         .await?)

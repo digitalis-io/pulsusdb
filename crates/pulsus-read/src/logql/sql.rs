@@ -3504,7 +3504,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(bucket_ns))) AS chunks, sum(count) AS entries, sum(bytes) AS bytes\n\
+            "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(bucket_ns), 'UTC')) AS chunks, sum(count) AS entries, sum(bytes) AS bytes\n\
              FROM log_metrics_5s\n\
              WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND bucket_ns > 1000 AND bucket_ns <= 2000"
         );
@@ -3573,7 +3573,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(timestamp_ns))) AS chunks, count() AS entries, sum(length(body)) AS bytes\n\
+            "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC')) AS chunks, count() AS entries, sum(length(body)) AS bytes\n\
              FROM log_samples\n\
              PREWHERE service = 'checkout'\n\
              WHERE org_id = '' AND fingerprint IN (toUInt128('18374'))\n\
