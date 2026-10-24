@@ -265,6 +265,45 @@ pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), Stri
             || ((word(t, "GROUP") || word(t, "ORDER")) && next_by)
     };
 
+    // Whether the `FROM` at `i` is a fill bound: it follows the words `WITH
+    // FILL` directly, and they stand in an `ORDER BY` clause at its depth.
+    // A column, an alias or a quoted name `fill` gives no exception, nor
+    // does a clause the scan cannot tell apart: that `FROM` is a source.
+    let fill_bound = |i: usize| -> bool {
+        if i < 2 || !word(&toks[i - 1], "FILL") || !word(&toks[i - 2], "WITH") {
+            return false;
+        }
+        let d = toks[i].depth;
+        if toks[i - 1].depth != d || toks[i - 2].depth != d {
+            return false;
+        }
+        let mut k = i - 2;
+        while k > 0 {
+            k -= 1;
+            let t = &toks[k];
+            if t.depth > d {
+                continue;
+            }
+            if t.depth < d {
+                return false;
+            }
+            if word(t, "ORDER") && toks.get(k + 1).is_some_and(|n| word(n, "BY")) {
+                return true;
+            }
+            if t.kind == Tok::Word
+                && [
+                    "SELECT", "FROM", "WHERE", "PREWHERE", "GROUP", "HAVING", "LIMIT", "SETTINGS",
+                    "UNION", "JOIN", "ON", "USING", "WITH", "FILL", "QUALIFY", "WINDOW",
+                ]
+                .iter()
+                .any(|w| word(t, w))
+            {
+                return false;
+            }
+        }
+        false
+    };
+
     // Every source: where it starts, how it was introduced, and the byte
     // of the word or comma that introduced it.
     let mut sources: Vec<(usize, Source, usize)> = Vec::new();
@@ -278,7 +317,7 @@ pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), Stri
             in_from[d + 1] = false;
             continue;
         }
-        if word(t, "FROM") && i > 0 && word(&toks[i - 1], "FILL") {
+        if word(t, "FROM") && fill_bound(i) {
             // `ORDER BY … WITH FILL FROM <expr>`: a bound, not a source.
             in_from[d] = false;
         } else if word(t, "FROM") {
@@ -648,6 +687,22 @@ mod tests {
         );
         accepted.push("SELECT 1 FROM spans WHERE org_id = 'a' AND x = 'it''s -- c'".to_string());
         accepted.push("SELECT 1 FROM (WITH 1 AS k SELECT k) AS w".to_string());
+        // A column or alias named `fill` gives no exception: the `FROM` after
+        // it is a source.
+        refused.push("SELECT 1 AS fill FROM spans".to_string());
+        refused.push("SELECT fill FROM spans".to_string());
+        refused.push("SELECT `fill` FROM spans".to_string());
+        refused.push("SELECT 1 AS fill FROM spans WHERE x".to_string());
+        refused.push("SELECT x FROM t WITH fill FROM spans".to_string());
+        // A query as a fill bound is checked as any other.
+        refused.push(
+            "SELECT x FROM (SELECT 1 AS x) ORDER BY x WITH FILL FROM (SELECT min(start_ns) FROM spans) TO 5"
+                .to_string(),
+        );
+        accepted.push(
+            "SELECT x FROM (SELECT 1 AS x) ORDER BY x WITH FILL FROM (SELECT min(start_ns) FROM spans WHERE org_id = 'a' AND y) TO 5"
+                .to_string(),
+        );
         // `WITH FILL FROM` is a bound, which the metrics statement uses.
         accepted.push(
             "SELECT g, o, p FROM (SELECT 1 AS g, 2 AS o, 3 AS p) ORDER BY g, o, p WITH FILL FROM 0 TO 5"
