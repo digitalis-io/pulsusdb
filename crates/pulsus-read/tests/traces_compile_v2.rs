@@ -5680,12 +5680,6 @@ fn compile_search_refuses_with_the_previous_planners_texts() {
     let mut wrong = Vec::new();
     for (query, want) in [
         (
-            "{ .a = 1 } | by(.b + .c)",
-            "type mismatch: by((.b + .c)) is not a group key this engine can execute: a grouping \
-             key must resolve to a single per-span value, so it must be an attribute or an \
-             intrinsic",
-        ),
-        (
             "{ .a = 1 } | { .b = 2 } && { .c = 3 }",
             "type mismatch: ({ .b = 2 } && { .c = 3 }) is not executable as a pipeline stage: a \
              `|` stage must be a single { ... } filter, not a cross-spanset or structural \
@@ -5864,6 +5858,57 @@ fn a_multi_field_condition_projects_nothing_on_the_statement() {
         let sql = statement.projection().sql();
         if sql != nothing {
             wrong.push(format!("{query}: projects {sql}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #649: a `by()` key that is a field expression compiles, its
+/// contributor named as the reference names the stage; a key reading an
+/// event or link intrinsic is refused naming the key.
+#[test]
+fn a_by_expression_key_compiles_or_is_refused_by_name() {
+    let mut wrong = Vec::new();
+    for (query, want) in [
+        ("{ .a = 1 } | by(.b + .c)", "by(.b + .c)"),
+        ("{ } | by(-span.a)", "by(-span.a)"),
+        ("{ } | by(!span.a)", "by(!span.a)"),
+        ("{ } | by(span.a = 1)", "by(span.a = 1)"),
+        (
+            "{ } | by(nestedSetLeft * nestedSetLeft)",
+            "by(nestedSetLeft * nestedSetLeft)",
+        ),
+        (
+            "{ } | by(nestedSetRight - nestedSetLeft)",
+            "by(nestedSetRight - nestedSetLeft)",
+        ),
+        (
+            "{ } | by(span:childCount + traceDuration)",
+            "by(span:childCount + traceDuration)",
+        ),
+    ] {
+        match compile_search_of(query) {
+            Ok(s) => {
+                let got: Vec<String> = s
+                    .grouping()
+                    .map(|g| g.contributors.iter().map(|c| c.display.clone()).collect())
+                    .unwrap_or_default();
+                if got != [want.to_string()] {
+                    wrong.push(format!("{query}: contributors {got:?}, want [{want}]"));
+                }
+            }
+            Err(e) => wrong.push(format!("{query}: refused: {e}")),
+        }
+    }
+    for (query, want) in [(
+        "{ } | by(event:timeSinceStart + 1)",
+        "by(event:timeSinceStart + 1): grouping by a span-event / span-link intrinsic \
+             (event:timeSinceStart) is not supported (a span carries a collection of \
+             events/links, so there is no single group value)",
+    )] {
+        match compile_search_of(query) {
+            Err(PlanError::UnsupportedField(m)) if m == want => {}
+            other => wrong.push(format!("{query}: {:?}", other.map(|s| s.sql().len()))),
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

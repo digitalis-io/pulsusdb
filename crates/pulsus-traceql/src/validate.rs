@@ -87,6 +87,10 @@
 //!     with `(0, 0)` explicitly legal, meaning "no window".
 //! 14. That window's `end` is strictly after its `start`
 //!     ([`ValidateError::CompareEndNotAfterStart`]).
+//! 15. A spanset `by()` key must reference the span
+//!     ([`ValidateError::GroupNotSpanReferencing`], issue #649), checked
+//!     before the key passes the ordinary field-expression rules — the
+//!     reference's order.
 //!
 //! Rules 12-14 arrived with issue #460, which added the reference's
 //! other two `compare()` productions (`expr.y:324-326`). They were
@@ -279,6 +283,12 @@ pub enum ValidateError {
     /// `avg(-(-.a))`, `avg(nestedSetParent + nestedSetLeft)`.
     #[error("aggregate field expressions must reference the span: {expr}")]
     AggregateNotSpanReferencing { expr: String },
+    /// `ast_validate.go` `GroupOperation.validate` via `ast.go`
+    /// `referencesSpan` (issue #649): a spanset `by()` key must read a
+    /// field. Measured, 400 `grouping field expressions must reference the
+    /// span: by(3)` for `by(1 + 2)`.
+    #[error("grouping field expressions must reference the span: {expr}")]
+    GroupNotSpanReferencing { expr: String },
     /// `ast_validate.go:272-287` — `= nil` is illegal on any intrinsic
     /// and on scoped `resource.service.name`.
     #[error("{field} = nil is not valid: intrinsics cannot be nil")]
@@ -347,6 +357,7 @@ impl ValidateError {
             ValidateError::IllegalUnaryOperator { .. } => "illegal-unary-operator",
             ValidateError::AggregateNotNumeric { .. } => "aggregate-not-numeric",
             ValidateError::AggregateNotSpanReferencing { .. } => "aggregate-not-span-referencing",
+            ValidateError::GroupNotSpanReferencing { .. } => "group-not-span-referencing",
             ValidateError::IntrinsicNotNil { .. } => "intrinsic-not-nil",
             ValidateError::QuantileOutOfRange { .. } => "quantile-out-of-range",
             ValidateError::TooManyGroupBys { .. } => "too-many-group-bys",
@@ -397,6 +408,10 @@ pub const VALIDATE_RULES: &[(&str, &str)] = &[
     (
         "aggregate-not-span-referencing",
         "ast_validate.go Aggregate.validate via ast.go referencesSpan (the span-reference half)",
+    ),
+    (
+        "group-not-span-referencing",
+        "ast_validate.go GroupOperation.validate via ast.go referencesSpan",
     ),
     ("intrinsic-not-nil", "ast_validate.go:272-287"),
     ("quantile-out-of-range", "ast_metrics.go:328-332"),
@@ -665,7 +680,17 @@ fn validate_stage(stage: &PipelineStage) -> Result<(), ValidateError> {
         // messages there that `validate_filter` / `validate_field_expr`
         // already produce here.
         PipelineStage::Filter(expr) => validate_spanset(expr),
-        PipelineStage::Select { .. } | PipelineStage::By { .. } | PipelineStage::Coalesce => Ok(()),
+        // Issue #649: the reference's order — the span reference, then
+        // the key as a field expression.
+        PipelineStage::By { key } => {
+            if !references_span(key) {
+                return Err(ValidateError::GroupNotSpanReferencing {
+                    expr: format!("by({key})"),
+                });
+            }
+            validate_field_expr(key)
+        }
+        PipelineStage::Select { .. } | PipelineStage::Coalesce => Ok(()),
         PipelineStage::Metric(metric) => validate_metric_stage(metric),
         PipelineStage::MetricSecondStage(second) => match second {
             // Rule 7 — the exhaustive match doubles as the
@@ -1445,6 +1470,9 @@ mod tests {
                 expr: String::new(),
             },
             ValidateError::AggregateNotSpanReferencing {
+                expr: String::new(),
+            },
+            ValidateError::GroupNotSpanReferencing {
                 expr: String::new(),
             },
             ValidateError::IntrinsicNotNil {

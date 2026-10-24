@@ -304,6 +304,39 @@ pub enum KeyValues {
     Numbered(Intrinsic),
 }
 
+/// The names of key `key`'s lookup scalars in the detail (`top: false`)
+/// or the top-K (`top: true`), built from the key's position and the
+/// lookup's, never by rewriting text (issue #649): lookup `n` is
+/// `group_values<key>`, then `group_values<key>_n<n>`, `top_` before
+/// each in the top-K, and `group_keys…` beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyNames {
+    pub top: bool,
+    pub key: usize,
+}
+
+impl KeyNames {
+    fn name(self, what: &str, n: usize) -> String {
+        let top = if self.top { "top_" } else { "" };
+        let key = self.key;
+        if n == 0 {
+            format!("{top}{what}{key}")
+        } else {
+            format!("{top}{what}{key}_n{n}")
+        }
+    }
+
+    /// Lookup `n`'s `(ids, values)` scalar.
+    pub fn values(self, n: usize) -> String {
+        self.name("group_values", n)
+    }
+
+    /// Lookup `n`'s `(bucket, trace_id)` pairs.
+    pub fn keys(self, n: usize) -> String {
+        self.name("group_keys", n)
+    }
+}
+
 /// The grouped statement's scalars after `top` for `key`, starting `,\n`:
 /// `group_keys`, the returned traces' `(bucket, trace_id)` pairs within
 /// `w`'s per-trace days, when the key reads spans; and `group_values`, the
@@ -313,33 +346,36 @@ pub fn group_values_sql(
     w: WindowSql,
     spans_table: &str,
     traces_table: &str,
+    names: KeyNames,
+    n: usize,
 ) -> String {
+    let (values, group_keys) = (names.values(n), names.keys(n));
     let returned = "AND trace_id IN (SELECT arrayJoin(top.1))";
     let keys = format!(
         ",\n     (SELECT groupArray((k, trace_id)) FROM (SELECT trace_id, arrayJoin(buckets) AS k \
-         FROM {traces_table} WHERE {} {returned})) AS group_keys",
+         FROM {traces_table} WHERE {} {returned})) AS {group_keys}",
         w.per_trace_day_clause()
     );
     match key {
         KeyValues::Trace(v) => format!(
-            ",\n     {} AS group_values",
+            ",\n     {} AS {values}",
             v.pairs_sql(traces_table, w, &format!("{returned} GROUP BY trace_id"))
         ),
         KeyValues::ChildCount => format!(
             "{keys},\n     (SELECT (groupArray(concat(trace_id, parent_span_id)), groupArray(c)) \
              FROM (SELECT trace_id, parent_span_id, {CHILDREN} AS c FROM {spans_table} \
-             WHERE (intDiv(start_ns, {RECENT_BUCKET_NS}), trace_id) IN (SELECT arrayJoin(group_keys)) \
-             AND parent_span_id != toFixedString('', 8) GROUP BY trace_id, parent_span_id)) AS group_values"
+             WHERE (intDiv(start_ns, {RECENT_BUCKET_NS}), trace_id) IN (SELECT arrayJoin({group_keys})) \
+             AND parent_span_id != toFixedString('', 8) GROUP BY trace_id, parent_span_id)) AS {values}"
         ),
         KeyValues::Numbered(i) => format!(
             "{keys},\n     (SELECT (groupArray(concat(trace_id, sp.1)), groupArray({})) FROM ({}) \
-             ARRAY JOIN s AS sp, lft AS nl, rgt AS nr, par AS np) AS group_values",
+             ARRAY JOIN s AS sp, lft AS nl, rgt AS nr, par AS np) AS {values}",
             match i {
                 Intrinsic::NestedSetLeft => "nl",
                 Intrinsic::NestedSetRight => "nr",
                 _ => "np",
             },
-            super::numbering::numbering_sql(spans_table, "group_keys")
+            super::numbering::numbering_sql(spans_table, &group_keys)
         ),
     }
 }

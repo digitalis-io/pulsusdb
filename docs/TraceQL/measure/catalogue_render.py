@@ -41,10 +41,6 @@ def refusal(q):
         if st['k'] == 'filter_stage' and st['spanset']['k'] != 'filter':
             return ('a `|` stage must be a single { ... } filter, not a '
                     'cross-spanset or structural operation')
-        # `| by(.b + .c)` — search_plan.rs:2011-2017
-        if st['k'] == 'by' and st['key']['k'] not in ('attr', 'intrinsic'):
-            return ('a grouping key must resolve to a single per-span value, so it '
-                    'must be an attribute or an intrinsic')
     # `{ duration > 100 }` — filter.rs:1710-1715
     bodies = list(_spanset_filters(q['spanset']))
     bodies += [s['spanset']['body'] for s in q['pipeline']

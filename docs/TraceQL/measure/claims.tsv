@@ -22,7 +22,7 @@ planner_refused_index	corpus_planner_refused	functional-requirements.md	at parse
 served_table	corpus_served	functional-requirements.md	\| the API serves \| \*\*(\d+)\*\* \|
 served_si	corpus_served	server-implementation.md	the API serves \*\*(\d+)\*\*
 served_index	corpus_served	functional-requirements.md	TraceQL corpus\*\*: (\d+) the API serves
-served_tc8	corpus_served	functional-requirements.md	\*\*(\d+) of 138 and \d+ of \d+\*\*
+served_tc8	corpus_served	functional-requirements.md	\*\*(\d+) of 139 and \d+ of \d+\*\*
 api_agree_table	corpus_api_agree	functional-requirements.md	\| whose route statement's answer equals the independent check \| \*\*(\d+)\*\* \|
 membership_agree_table	corpus_membership_agree	functional-requirements.md	\| whose membership answer equals the independent check \| \*\*(\d+)\*\* \|
 parser_refused_table	corpus_parser_refused	functional-requirements.md	\| the parser or the validator refuses \(`400`\) \| (\d+) \|
@@ -35,8 +35,8 @@ design_si_first	design_queries	server-implementation.md	so \*\*(\d+) rules in th
 design_si_second	design_queries	server-implementation.md	those (\d+) queries are `measure/catalogue-extra\.tsv`
 design_si_third	design_queries	server-implementation.md	\*\*\d+ of the (\d+) are the row below
 design_tc8_named	design_queries	functional-requirements.md	\*\*and the (\d+) of `measure/catalogue-extra\.tsv`\*\*
-design_tc8_agree	design_queries	functional-requirements.md	\*\*138 of 138 and (\d+) of \d+\*\*
-design_tc8_agree2	design_queries	functional-requirements.md	\*\*138 of 138 and \d+ of (\d+)\*\*
+design_tc8_agree	design_queries	functional-requirements.md	\*\*139 of 139 and (\d+) of \d+\*\*
+design_tc8_agree2	design_queries	functional-requirements.md	\*\*139 of 139 and \d+ of (\d+)\*\*
 cases_total_preamble	cases_total	functional-requirements.md	\*\*(\d+) cases\*\*:
 cases_guard_kinds	cases_guard	functional-requirements.md	\*\*guard\*\* \((\d+) cases\)
 cases_guard_list	cases_guard	functional-requirements.md	The (\d+) guards are

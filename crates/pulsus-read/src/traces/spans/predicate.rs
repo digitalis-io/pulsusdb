@@ -73,7 +73,7 @@ use crate::traces::sql_text::{
 use crate::traces::window_sql::WindowSql;
 
 use super::numbering::{SpanValues, nested_leaf, span_values_membership};
-use super::tracelevel::{TraceLeaf, TraceValue, child_leaf, trace_leaf, type_refusal};
+use super::tracelevel::{KeyValues, TraceLeaf, TraceValue, child_leaf, trace_leaf, type_refusal};
 
 /// A ClickHouse boolean over a `spans` row. Private fields, no public
 /// constructor: the four `compile_*` functions are the only ways to obtain
@@ -223,6 +223,52 @@ pub fn compile_span_predicate_in(
     let mut c = Compiler::new(Some(*ctx));
     let e = c.render_expr(expr)?;
     Ok(c.finish(e))
+}
+
+/// Issue #649: a `by()` key's arithmetic value — its tuple text (`None`
+/// when it has no value on any span), whether a duration is in it, and
+/// the per-span lookups its leaves read, each once.
+pub(super) struct KeyArith {
+    pub tuple: Option<String>,
+    pub dur: bool,
+    pub values: Vec<KeyValues>,
+}
+
+/// [`KeyArith`] of `expr`, an arithmetic node: the predicate compiler's
+/// arithmetic over the leaves a plain `by()` key reads.
+pub(super) fn key_arith_in(
+    expr: &FieldExpr,
+    ctx: &PredicateCtx<'_>,
+    names: super::tracelevel::KeyNames,
+) -> Result<KeyArith, PlanError> {
+    check_literals(expr)?;
+    let mut c = Compiler::new(Some(*ctx));
+    c.key_values = Some(Vec::new());
+    c.key_names = Some(names);
+    let t = c.arith_tuple(expr)?;
+    Ok(KeyArith {
+        dur: t.as_ref().is_some_and(|t| t.dur),
+        tuple: t.map(|t| t.text),
+        values: c.key_values.unwrap_or_default(),
+    })
+}
+
+/// Issue #649: a literal-only arithmetic subtree's static, as the
+/// reference's parser folds it — `None` when it is not one.
+pub(super) enum KeyStatic {
+    Int(String),
+    Dur(i128),
+    Float(f64),
+}
+
+pub(super) fn key_static(expr: &FieldExpr) -> Result<Option<KeyStatic>, PlanError> {
+    Ok(match fold(expr)? {
+        Folded::Int(v) => Some(KeyStatic::Int(v.to_string())),
+        Folded::U128(v) => Some(KeyStatic::Int(v.to_string())),
+        Folded::Dur(v) => Some(KeyStatic::Dur(v)),
+        Folded::Float(x) => Some(KeyStatic::Float(x)),
+        Folded::Undefined | Folded::No => None,
+    })
 }
 
 /// The leaf, for a caller that has already normalised to
@@ -604,6 +650,11 @@ struct Compiler<'a> {
     /// The per-span values the current comparison reads (issue #594 part
     /// 4); saved and reset by each [`Compiler::compare`].
     span_values: SpanValues,
+    /// Issue #649: `Some` while compiling a `by()` key's arithmetic, whose
+    /// leaves read the value a plain `by()` key reads; the lookups read.
+    key_values: Option<Vec<KeyValues>>,
+    /// The names the key's lookups are read by (issue #649).
+    key_names: Option<super::tracelevel::KeyNames>,
 }
 
 /// The head of an element loop: `arrayExists` for the predicate;
@@ -717,6 +768,8 @@ impl<'a> Compiler<'a> {
             numbered: 0,
             trace_values: Vec::new(),
             span_values: SpanValues::default(),
+            key_values: None,
+            key_names: None,
         }
     }
 
@@ -1786,6 +1839,9 @@ impl<'a> Compiler<'a> {
     /// element (the part-3e design's section 5.2); a field leaf's presence
     /// is noted for `!=` (decision 11). **No wildcard arm**.
     fn arith_leaf(&mut self, field: &Field) -> Result<Option<Tuple>, PlanError> {
+        if self.key_values.is_some() {
+            return self.key_leaf(field);
+        }
         if is_set_field(field) {
             return self.set_leaf(field).map(Some);
         }
@@ -1876,6 +1932,101 @@ impl<'a> Compiler<'a> {
                 }))
             }
         }
+    }
+
+    /// Issue #649: a field as a `by()` key's arithmetic leaf — the value a
+    /// plain `by()` key on it reads, as an arithmetic tuple.
+    fn key_leaf(&mut self, field: &Field) -> Result<Option<Tuple>, PlanError> {
+        let ctx = self.ctx.ok_or_else(|| needs_window(AttrScope::Unscoped))?;
+        let looked_up = |text: String, dur: bool| Tuple {
+            text: format!("tuple(toInt256({text}), {NULL_FLOAT})"),
+            dur,
+        };
+        let lookup = match field {
+            Field::Attribute { scope, key } => {
+                let x = match scope {
+                    AttrScope::Span | AttrScope::Instrumentation => {
+                        let root = if *scope == AttrScope::Span {
+                            ATTRS
+                        } else {
+                            SCOPE_ATTRS
+                        };
+                        let path = attr_path(root, key);
+                        return Ok(Some(Tuple {
+                            text: format!(
+                                "tuple(toInt256({path}{}), {path}{})",
+                                Read::Int.suffix(),
+                                Read::Float.suffix()
+                            ),
+                            dur: false,
+                        }));
+                    }
+                    AttrScope::Resource
+                    | AttrScope::Event
+                    | AttrScope::Link
+                    | AttrScope::Unscoped => scope_value(*scope, key, &ctx)?,
+                };
+                return Ok(Some(Tuple {
+                    text: format!(
+                        "tuple(toInt256(dynamicElement({x}, 'Int64')), dynamicElement({x}, \
+                         'Float64'))"
+                    ),
+                    dur: false,
+                }));
+            }
+            Field::Intrinsic(intrinsic) => match intrinsic {
+                Intrinsic::Duration => {
+                    return Ok(Some(looked_up("duration_ns".to_string(), true)));
+                }
+                Intrinsic::TraceDuration => KeyValues::Trace(TraceValue::Duration),
+                Intrinsic::ChildCount => KeyValues::ChildCount,
+                Intrinsic::NestedSetLeft
+                | Intrinsic::NestedSetRight
+                | Intrinsic::NestedSetParent => KeyValues::Numbered(*intrinsic),
+                Intrinsic::EventName
+                | Intrinsic::EventTimeSinceStart
+                | Intrinsic::LinkSpanId
+                | Intrinsic::LinkTraceId => {
+                    return Err(PlanError::UnsupportedField(format!(
+                        "by(): grouping by a span-event / span-link intrinsic ({intrinsic}) is \
+                         not supported (a span carries a collection of events/links, so there \
+                         is no single group value)"
+                    )));
+                }
+                Intrinsic::Name
+                | Intrinsic::StatusMessage
+                | Intrinsic::SpanId
+                | Intrinsic::ParentId
+                | Intrinsic::TraceId
+                | Intrinsic::InstrumentationName
+                | Intrinsic::InstrumentationVersion
+                | Intrinsic::Status
+                | Intrinsic::Kind
+                | Intrinsic::RootName
+                | Intrinsic::RootServiceName => return Ok(None),
+            },
+        };
+        // Lookup `n` is read by the name `KeyNames` gives it.
+        let seen = self.key_values.as_mut().expect("key mode");
+        let n = match seen.iter().position(|v| *v == lookup) {
+            Some(n) => n,
+            None => {
+                seen.push(lookup);
+                seen.len() - 1
+            }
+        };
+        let alias = self.key_names.expect("key mode").values(n);
+        Ok(Some(match lookup {
+            KeyValues::Trace(v) => looked_up(v.lookup_sql(&alias), true),
+            KeyValues::ChildCount => looked_up(
+                format!("transform(concat(trace_id, span_id), {alias}.1, {alias}.2, toUInt64(0))"),
+                false,
+            ),
+            KeyValues::Numbered(_) => looked_up(
+                format!("transform(concat(trace_id, span_id), {alias}.1, {alias}.2, toInt64(0))"),
+                false,
+            ),
+        }))
     }
 
     /// The joined column of a per-span value (issue #594 part 4), noted

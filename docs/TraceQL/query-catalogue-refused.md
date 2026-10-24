@@ -1,8 +1,8 @@
-# The TraceQL query catalogue: the 50 refused queries
+# The TraceQL query catalogue: the 49 refused queries
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 `t_c9_every_corpus_refusal_is_a_400_in_the_reference_container` in `crates/pulsus-server/src/traces_api/search.rs` checks these through the search route: 49 answer `400`, and `reject/empty` is no query there, as on the reference.** The response is `docs/api.md` §4's envelope in every case — **`400`**,
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 `t_c9_every_corpus_refusal_is_a_400_in_the_reference_container` in `crates/pulsus-server/src/traces_api/search.rs` checks these through the search route: 48 answer `400`, and `reject/empty` is no query there, as on the reference.** The response is `docs/api.md` §4's envelope in every case — **`400`**,
 `text/plain`, the message and nothing else — and this design changes neither the
-parser, the validator nor the planner, so it changes no refusal.
+parser, the validator nor the planner, so it changes no refusal; #649 since made the planner serve `by_expression_key`.
 
 ## 47 the parser or the validator refuses
 
@@ -72,7 +72,7 @@ the row stays one row.
 | 46 | `validate_reject` | `chained_comparison` | `{ .a = 1 = 2 }` | `400` | binary operations must operate on the same type: .a = 1 = 2 | - |
 | 47 | `validate_reject` | `nested_set_regex_string` | `{ nestedSetLeft =~ "x" }` | `400` | binary operations must operate on the same type: nestedSetLeft =~ "x" | - |
 
-## 3 the planner refuses
+## 2 the planner refuses
 
 These parse and validate, so they sit under `accept/`, and the route answers
 `400` all the same. The reason column is the rule
@@ -82,6 +82,5 @@ the shipped planner itself returned when the probe of `measure/README.md` ran it
 
 | # | name | TraceQL | status | the rule | the shipped planner's message |
 |---:|---|---|---|---|---|
-| 1 | `by_expression_key` | `{ .a = 1 } \| by(.b + .c)` | `400` | a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic | type mismatch: by((.b + .c)) is not a group key this engine can execute: a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic |
-| 2 | `duration_unitless` | `{ duration > 100 }` | `400` | duration requires a duration literal | type mismatch: duration requires a duration literal |
-| 3 | `pipeline_spanset_operation` | `{ .a = 1 } \| { .b = 2 } && { .c = 3 }` | `400` | a `\|` stage must be a single { ... } filter, not a cross-spanset or structural operation | type mismatch: ({ .b = 2 } && { .c = 3 }) is not executable as a pipeline stage: a `\|` stage must be a single { ... } filter, not a cross-spanset or structural operation |
+| 1 | `duration_unitless` | `{ duration > 100 }` | `400` | duration requires a duration literal | type mismatch: duration requires a duration literal |
+| 2 | `pipeline_spanset_operation` | `{ .a = 1 } \| { .b = 2 } && { .c = 3 }` | `400` | a `\|` stage must be a single { ... } filter, not a cross-spanset or structural operation | type mismatch: ({ .b = 2 } && { .c = 3 }) is not executable as a pipeline stage: a `\|` stage must be a single { ... } filter, not a cross-spanset or structural operation |

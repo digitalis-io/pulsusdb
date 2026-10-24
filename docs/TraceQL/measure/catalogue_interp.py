@@ -190,6 +190,33 @@ def go_duration(ns):
     return sign + text
 
 
+def go_float(x):
+    """Go's `strconv.FormatFloat(x, 'g', -1, 64)`, with `.0` appended when it
+    holds neither `e` nor `.`"""
+    if math.isinf(x) or math.isnan(x): return repr(x)
+    d = decimal.Decimal(repr(x))
+    exp = d.adjusted()
+    if x != 0 and not -4 <= exp < 6:
+        digits = ''.join(map(str, d.as_tuple().digits)).rstrip('0') or '0'
+        mantissa = digits[0] + ('.' + digits[1:] if digits[1:] else '')
+        text = ('-' if x < 0 else '') + mantissa + 'e' + ('-' if exp < 0 else '+') + str(abs(exp)).rjust(2, '0')
+    else:
+        text = format(d.normalize(), 'f') if d != d.to_integral() else str(int(d))
+    return text if ('e' in text or '.' in text) else text + '.0'
+
+
+def duration_typed(e):
+    """a duration literal, or `-` over one"""
+    if e['k'] == 'lit': return e['t'] == 'duration'
+    return e['k'] == 'unary' and e['op'] == '-' and duration_typed(e['e'])
+
+
+def static_text(e, v, fractional):
+    """a folded literal-only subtree as the reference's stage renders it"""
+    if duration_typed(e): return go_duration(v)
+    return go_float(float(v)) if fractional else str(v)
+
+
 def literal_only(e):
     """whether `e` holds literals and arithmetic only"""
     if e['k'] == 'lit': return True
@@ -590,10 +617,78 @@ class Interp:
 
     def group_key(self, r, key):
         """the `by()` key's response attribute: `by(<key>)`, typed (`docs/api.md` §4.2)"""
+        if key['k'] not in ('attr', 'intrinsic'):
+            return ['by(' + self.key_text(key) + ')', self.key_value(r, key)]
         label = 'by(' + (key['name'] if key['k'] == 'intrinsic' else
                          ('.' if key['scope'] == 'unscoped' else key['scope'] + '.') + key['key']) + ')'
         w = self.wire(r, key)
         return [label, ['stringValue', 'nil'] if w is None else w[2]]
+
+    def key_text(self, e):
+        """a `by()` expression as the response names it (`docs/api.md` §4.2):
+        a literal-only arithmetic part folded, an operand that is neither a
+        field nor a literal in parentheses, a string literal in backticks"""
+        def wrap(x):
+            t = self.key_text(x)
+            return t if x['k'] in ('attr', 'intrinsic', 'lit') or literal_only(x) else '(' + t + ')'
+        if e['k'] in ('attr', 'intrinsic'): return self.field_text(e)
+        if literal_only(e) and not (e['k'] == 'lit' and e['t'] != 'number' and e['t'] != 'duration'):
+            folded = self.key_number(None, e)
+            if folded is not None: return static_text(e, *folded)
+        if e['k'] == 'lit':
+            return '`' + e['v'] + '`' if e['t'] == 'string' else str(e['v']).lower() if e['t'] == 'bool' else str(e['v'])
+        if e['k'] == 'unary': return e['op'] + wrap(e['e'])
+        return wrap(e['l']) + ' ' + e['op'] + ' ' + wrap(e['r'])
+
+    def key_value(self, r, e):
+        """a `by()` expression's value (`docs/api.md` §4.2): arithmetic its
+        number, `false` when it has none; anything else `true` where the same
+        expression as a filter matches the span"""
+        if not ((e['k'] == 'bin' and e['op'] in ('+', '-', '*', '/', '%', '^'))
+                or (e['k'] == 'unary' and e['op'] == '-')):
+            return arm('bool', bool(self.pred(r, e)))
+        got = self.key_number(r, e)
+        if got is None: return arm('bool', False)
+        v, fractional = got
+        return arm('double', v) if fractional else arm('int', v)
+
+    def key_number(self, r, e):
+        """`(value, whether a double or a duration is in it)`, or None"""
+        if e['k'] == 'lit':
+            if e['t'] == 'duration': return duration_ns(e), True
+            if e['t'] != 'number': return None
+            v = self.lit(e)
+            return v, isinstance(v, float)
+        if e['k'] == 'attr':
+            got = self.attr(r, e['scope'], e['key'])
+            if got is None or got[0] not in ('i', 'd'): return None
+            return (int(got[1]), False) if got[0] == 'i' else (float(got[1]), True)
+        if e['k'] == 'intrinsic':
+            v = self.intrinsic(r, e['name'])
+            if isinstance(v, bool) or not isinstance(v, int): return None
+            dur = self.field_text(e) in ('duration', 'traceDuration', 'trace:duration')
+            return v, dur
+        if e['k'] == 'unary':
+            got = self.key_number(r, e['e'])
+            return None if got is None else (-got[0], got[1])
+        l, rr = self.key_number(r, e['l']), self.key_number(r, e['r'])
+        if l is None or rr is None: return None
+        (a, fa), (b, fb), op = l, rr, e['op']
+        if not (fa or fb):
+            if op in ('/', '%') and b == 0: return None
+            if op == '^' and b < 0: return float(a) ** b, True
+            v = {'+': a + b, '-': a - b, '*': a * b, '^': a ** b if op == '^' else 0,
+                 '/': abs(a) // abs(b) * (1 if (a < 0) == (b < 0) else -1) if b else 0,
+                 '%': (abs(a) % abs(b)) * (1 if a >= 0 else -1) if b else 0}[op]
+            return (v, False) if -2 ** 63 <= v < 2 ** 63 else None
+        a, b = float(a), float(b)
+        try:
+            v = {'+': lambda: a + b, '-': lambda: a - b, '*': lambda: a * b, '^': lambda: a ** b,
+                 '/': lambda: a / b if b else (float('nan') if a == 0 else math.copysign(float('inf'), a) * math.copysign(1, b)),
+                 '%': lambda: math.fmod(a, b) if b else float('nan')}[op]()
+        except OverflowError:
+            v = float('inf')
+        return v, True
 
     def field_text(self, f):
         """a field as the query renders it: `.k`, `span.k`, an intrinsic's name"""

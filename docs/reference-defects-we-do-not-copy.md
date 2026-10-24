@@ -90,6 +90,7 @@ replaces one.
 | [35](#35-past-the-series-limit-a-drilldown-answer-gains-series-with-no-labels) | log reference | queries | C | A partial answer past the series limit can carry extra series with no labels, holding points of series it was dropping. |
 | [36](#36-one-pattern-series-can-carry-two-samples-at-one-timestamp) | log reference | queries | A | A `/patterns` series can answer `[[t,1],[t,1]]` where it means `[[t,2]]`. |
 | [37](#37-a-one-element-array-is-read-as-its-element-and-an-empty-one-as-no-value) | trace reference | queries | C | A span sent `["z"]` answers `"z"`, and one sent `[]` answers as if it held nothing. |
+| [38](#38-one-span-missing-an-operand-fails-a-whole-grouped-query) | trace reference | queries | A | `by(-span.x)` fails every trace when one span lacks `x`, where `by(span.x / 1000)` groups that span under `false`. |
 
 ---
 
@@ -2199,6 +2200,32 @@ An array stays an array of its elements, one and none included, in the `arrayVal
 
 Ledger row `traceql-search-response-values-against-the-reference`. Pinned by `array_one_element_by` and
 `array_empty_by` in `crates/pulsus-read/tests/traces_search_grouping_differential.rs`.
+
+---
+
+## 38. One span missing an operand fails a whole grouped query
+
+**The trace reference · queries · test A**
+
+### What the reference does
+
+`by(span.x / 1000)` groups a span lacking `x` under `false` (`pkg/traceql/ast_execute.go:414-419`), but
+`by(-span.x)` fails the whole query for the same span (`:858-862`), as does an integer zero divisor
+(`:466-472`) and an array operand (`:537-540`).
+
+### Why that is wrong rather than different
+
+Two of its own paths answer the same question — this span has no value for the key — one with a group and one
+by failing every trace (**A**). Measured against the pinned image.
+
+### What PulsusDB does
+
+The span groups under `false` in every case.
+
+### Evidence
+
+Ledger row `traceql-by-expression-key`. Pinned by `a_by_expression_answers_as_decided` in
+`crates/pulsus-read/tests/traces_query_v2_live.rs`.
 
 ---
 

@@ -205,12 +205,12 @@ for n, src, got, want in metric_notes:
 for n, e in errors: print(f'  statement failed: {n}: {e[:160]}')
 for n in unbounded + unexplained + missing_reason + mismatched + VECTOR_BAD + LEGACY_ANSWERING + pinned_bad + sorted(set(PINNED) - pinned_seen):
     print(f'  see: {n}')
-ok = (c == {'served': 119, 'answer': 119, 'membership': 119}
+ok = (c == {'served': 120, 'answer': 120, 'membership': 120}
       and design_seen == EXTRA_ROWS and d['served'] == EXTRA_ROWS - design_other
       and d == {'served': d['served'], 'answer': d['served'], 'membership': d['served']}
       and cm == {'served': 19, 'range': 19, 'instant': 19}
       and dm == {'served': EXTRA_METRICS, 'range': EXTRA_METRICS, 'instant': EXTRA_METRICS}
-      and sorted(planner) == ['by_expression_key', 'duration_unitless', 'pipeline_spanset_operation']
+      and sorted(planner) == ['duration_unitless', 'pipeline_spanset_operation']
       and pinned_seen == set(PINNED)
       and not (mismatched or errors or unbounded or unexplained or missing_reason or VECTOR_BAD
                or LEGACY_ANSWERING or not TWO_STEPS

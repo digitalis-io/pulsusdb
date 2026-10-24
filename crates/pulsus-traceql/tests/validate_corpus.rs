@@ -488,6 +488,10 @@ fn vector_error_variants_are_real_rule_ids() {
             expr: String::new(),
         }
         .rule_id(),
+        ValidateError::GroupNotSpanReferencing {
+            expr: String::new(),
+        }
+        .rule_id(),
         ValidateError::IntrinsicNotNil {
             field: String::new(),
         }

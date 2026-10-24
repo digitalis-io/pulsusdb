@@ -418,11 +418,7 @@ mod tests {
             assert!(!body.is_empty(), "validate_reject/{name}: a message");
             refused += 1;
         }
-        for name in [
-            "by_expression_key",
-            "duration_unitless",
-            "pipeline_spanset_operation",
-        ] {
+        for name in ["duration_unitless", "pipeline_spanset_operation"] {
             let (src, _) = corpus_case("accept", name);
             let (status, body) = run(&format!("q={}&start=1&end=2", pct(&src))).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "accept/{name}: {body}");
@@ -430,8 +426,8 @@ mod tests {
             refused += 1;
         }
         assert_eq!(
-            refused, 49,
-            "39 of reject/, 3 of unsupported/, 4 of validate_reject/, 3 planned"
+            refused, 48,
+            "39 of reject/, 3 of unsupported/, 4 of validate_reject/, 2 planned"
         );
     }
 }

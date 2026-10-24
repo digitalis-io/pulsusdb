@@ -715,6 +715,8 @@ when we are asking it to slow down, so we keep `429`; recorded as
   those five are still a clean planner `400` here — a grouping key must
   resolve to one per-span value — recorded as class D16's `wire_status:
   "open"` with its note, and each of those probes names issue 335.
+  Since #649 all four are served and D16 is closed on the wire as well
+  (`traceql-by-expression-key`).
 
 - **Nothing served moved.** `crates/pulsus-read/tests/golden_sql_freeze.rs`
   (`PINNED_SQL_CORPUS`, 69 frozen goldens) is unchanged, and
@@ -3096,7 +3098,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `Attribute` (`ast_stringer.go:245-255`); the message is built at
   `pkg/traceql/ast_validate.go:295`. Ours renders the whole
   `FieldExpr::Unary` through its own `Display`
-  (`crates/pulsus-traceql/src/validate.rs:555`), and that `Display` writes
+  (`crates/pulsus-traceql/src/validate.rs:570`), and that `Display` writes
   `!({expr})` for every operand without exception
   (`crates/pulsus-traceql/src/ast.rs:387`).
 
@@ -3179,7 +3181,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   (`:245-255`); the message is built at
   `pkg/traceql/ast_validate.go:214`. Ours builds the text from the two
   operands separately — `format!("{lhs} {op} {rhs}")`,
-  `crates/pulsus-traceql/src/validate.rs:560` — so no wrapping rule is
+  `crates/pulsus-traceql/src/validate.rs:575` — so no wrapping rule is
   applied at all: whatever parentheses appear come from each operand's own
   `Display` (`crates/pulsus-traceql/src/ast.rs:373-415`), which
   parenthesises `&&`/`||` and arithmetic at their own top level and leaves
@@ -3982,7 +3984,7 @@ Read from the reference's source, not measured against it.
 
 ### `traceql-arithmetic-exact` (issue #589) — **arithmetic answers that differ from the reference by decision**
 
-Applies to the span-scope predicate compiler (`crates/pulsus-read/src/traces/spans/predicate.rs`, `arith_tuple`), which no route calls until #590.
+Applies to the span-scope predicate compiler (`crates/pulsus-read/src/traces/spans/predicate.rs`, `arith_tuple`), which no route calls until #590, and, since #649, to a `by()` key's arithmetic.
 
 - **Integer arithmetic is exact within 256-bit integers, and a result outside them has no value.** The
   reference's integer `+ - *` wrap at 2^63; here `9223372036854775807 + 1 > 0` is true, and `2 ^ 255` matches
@@ -4115,3 +4117,18 @@ Why the reference answers so, at the pinned tag:
 | `link:spanID` against a literal; links lk_12 `…01`, `…02`, lk_1 `…01`, lk_x and lk_xy `…0abc` | `= "0000000000000001"` lk_1 lk_12; `= "0000000000000002"`, `=~ "0+2"` lk_12; `!= "0000000000000001"`, `!~ "0+1"` lk_12 lk_x lk_xy | the reference answers both `=` and the `=~` with no span, `!=` with lk_x lk_xy and `!~` with every span, links or none; it matches no link id under `=`, so its answers follow no element rule and the event intrinsics' rule is applied |
 
 `resource.service.name` stored as anything but a string is read from the resource row, in its own type, as any resource attribute. The reference keeps a string `service.name` in a dedicated column (`tempodb/encoding/vparquet4/schema.go:394-433`) where a missing or non-string value reads as `""`; measured on the same day, it answers `{ resource.service.name = "" }` with every span whose service.name is missing, an integer, a boolean or an array, `!= nil` with the missing one too, and `{ resource.service.name = "a" }` without the span holding `["a","b"]`. Here `= ""` matches a stored empty string only, `!= nil` a stored value, and the array is read by element.
+
+### `traceql-by-expression-key` (issue #649) — **a `by()` key over a field expression, where it differs from the reference by decision**
+
+Applies to `GET /api/traces/v1/search` and its alias (`crates/pulsus-read/src/traces/spans/by_key.rs`). Measured 2026-10-23 against the pinned reference image over the fixture of `a_by_expression_groups_as_the_reference_does` (`crates/pulsus-read/tests/traces_query_v2_live.rs`); the parity half is the `by_expr_*` fixtures of `crates/pulsus-read/tests/traces_search_grouping_differential.rs`.
+
+| key | here | the reference |
+|---|---|---|
+| an integer `/` or `%` by zero; `-` over a missing or non-number operand; an array operand in arithmetic | `{"boolValue":false}` for that span | the whole query fails, `500` (entry 38 of `docs/reference-defects-we-do-not-copy.md`) |
+| an integer result outside 64 bits | `{"boolValue":false}` | wraps at 2^63 |
+| integer `^` | exact, written order: `2 ^ 3` is 8; a negative exponent is a double, `2 ^ -1` is 0.5 | operands swapped: 9, and an integer always (entry 16) |
+| `!` over a missing attribute | `{"boolValue":false}` | the whole query fails |
+| `= nil` | `true` for every span lacking the key | `true` for some spans lacking it, not others |
+| an integer literal compared with a double attribute (`by(span.f > 0)`) | compared as numbers | `false` (`traceql-array-element-rule`) |
+| `span:childCount` in a key | its count | no trace (entry 34) |
+| a literal-only subtree that is not arithmetic (`by(span.b && (1 > 2))`), or a float `^` of literals | rendered unfolded in the label | folded |

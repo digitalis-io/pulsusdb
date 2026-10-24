@@ -83,6 +83,9 @@ c	"{ .a = 1 } with(most_recent=true)\n"	2	1	5346981aa7a01eea
 c	"{ .a = 1 } | ({ name = \"b\" })\n"	100	100	c4b53ee1746724bf
 c	"{ .a = 1 } | ({ name = \"b\" })\n"	20	3	1244376ccc6d6150
 c	"{ .a = 1 } | ({ name = \"b\" })\n"	2	1	b5d37d1364cc2e44
+c	"{ .a = 1 } | by(.b + .c)\n"	100	100	616b7e754e5589ab
+c	"{ .a = 1 } | by(.b + .c)\n"	20	3	88357cd2a418052e
+c	"{ .a = 1 } | by(.b + .c)\n"	2	1	baefb60113a27602
 c	"{ .a = 1 } | by(name) | { name = \"b\" }\n"	100	100	efeb382447153106
 c	"{ .a = 1 } | by(name) | { name = \"b\" }\n"	20	3	b2f12820131234fb
 c	"{ .a = 1 } | by(name) | { name = \"b\" }\n"	2	1	8e6111869009cdcd

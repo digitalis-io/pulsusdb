@@ -413,6 +413,36 @@ const S601: &[SpanDef] = &[
     ]),
 ];
 
+/// Issue #649: the corpus the reference was measured on for `by()` over
+/// an expression — the live suite's `by_expr_bodies`.
+const X649: &[SpanDef] = &[
+    span(1, "a").dur(3 * SEC / 2).attrs(&[
+        ("dms", r#"{"intValue":"2500"}"#),
+        ("f", r#"{"doubleValue":1.5}"#),
+        ("s", r#"{"stringValue":"x"}"#),
+        ("b", r#"{"boolValue":true}"#),
+        ("k", r#"{"intValue":"3"}"#),
+    ]),
+    span(2, "a").dur(2 * SEC).attrs(&[
+        ("dms", r#"{"intValue":"999"}"#),
+        ("f", r#"{"doubleValue":2.0}"#),
+        ("b", r#"{"boolValue":false}"#),
+        ("k", r#"{"intValue":"-1"}"#),
+    ]),
+    span(3, "b")
+        .dur(3 * SEC)
+        .attrs(&[("s", r#"{"stringValue":"y"}"#)]),
+    span(4, "b").attrs(&[("dms", r#"{"stringValue":"500"}"#)]),
+    span(5, "c").attrs(&[(
+        "arr",
+        r#"{"arrayValue":{"values":[{"intValue":"1"},{"intValue":"2"}]}}"#,
+    )]),
+    span(6, "c").attrs(&[
+        ("dms", r#"{"intValue":"-7"}"#),
+        ("f", r#"{"doubleValue":-0.5}"#),
+    ]),
+];
+
 fn corpora() -> Vec<Corpus> {
     vec![
         Corpus {
@@ -478,6 +508,10 @@ fn corpora() -> Vec<Corpus> {
         Corpus {
             service: "s601a",
             spans: S601,
+        },
+        Corpus {
+            service: "s649a",
+            spans: X649,
         },
     ]
 }
@@ -604,6 +638,8 @@ const EMPTY_ARRAY: &str = "the reference reads an empty array as no value — le
      docs/reference-defects-we-do-not-copy.md";
 const PRECISION_LIMIT: &str = "an attribute aggregate computes on val_num — ledger row \
      traceql-attribute-aggregate-float64-precision";
+const EXACT_POW: &str = "integer ^ is exact in the written order — ledger row \
+     traceql-arithmetic-exact";
 const MIXED_TYPE: &str = "the reference's mixed-type sum/avg is order-dependent — ledger row \
      traceql-spanset-aggregate-mixed-type-attribute, entry 24 of \
      docs/reference-defects-we-do-not-copy.md";
@@ -872,6 +908,62 @@ fn fixtures() -> Vec<Fixture> {
               "by(span.none)=stringValue=nil | m1 | 02"],
             &["by(span.none)=stringValue=nil | m2 | 01,02"],
             EMPTY_ARRAY),
+
+        // ---- issue #649: a by() key that is a field expression --------
+        parity("by_expr_int_div", "s649a", "| by(span.dms / 1000)", &[
+            "by(span.dms / 1000)=intValue=2 | m1 | 01",
+            "by(span.dms / 1000)=intValue=0 | m2 | 02,06",
+            "by(span.dms / 1000)=boolValue=false | m3 | 03,04,05",
+        ]),
+        parity("by_expr_float", "s649a", "| by(span.f * 2)", &[
+            "by(span.f * 2)=doubleValue=3 | m1 | 01",
+            "by(span.f * 2)=doubleValue=4 | m1 | 02",
+            "by(span.f * 2)=boolValue=false | m3 | 03,04,05",
+            "by(span.f * 2)=doubleValue=-1 | m1 | 06",
+        ]),
+        parity("by_expr_folded_label", "s649a", "| by(span.dms + 2 * 3)", &[
+            "by(span.dms + 6)=intValue=2506 | m1 | 01",
+            "by(span.dms + 6)=intValue=1005 | m1 | 02",
+            "by(span.dms + 6)=boolValue=false | m3 | 03,04,05",
+            "by(span.dms + 6)=intValue=-1 | m1 | 06",
+        ]),
+        parity("by_expr_duration_float", "s649a", "| by(duration / 1000)", &[
+            "by(duration / 1000)=doubleValue=1500000 | m1 | 01",
+            "by(duration / 1000)=doubleValue=2000000 | m1 | 02",
+            "by(duration / 1000)=doubleValue=3000000 | m1 | 03",
+            "by(duration / 1000)=doubleValue=1000000 | m3 | 04,05,06",
+        ]),
+        parity("by_expr_negated_duration", "s649a", "| by(-duration)", &[
+            "by(-duration)=stringValue=-1.5s | m1 | 01",
+            "by(-duration)=stringValue=-2s | m1 | 02",
+            "by(-duration)=stringValue=-3s | m1 | 03",
+            "by(-duration)=stringValue=-1s | m3 | 04,05,06",
+        ]),
+        parity("by_expr_non_finite", "s649a", "| by(span.dms / 0.0)", &[
+            "by(span.dms / 0.0)=doubleValue=Infinity | m2 | 01,02",
+            "by(span.dms / 0.0)=boolValue=false | m3 | 03,04,05",
+            "by(span.dms / 0.0)=doubleValue=-Infinity | m1 | 06",
+        ]),
+        parity("by_expr_comparison", "s649a", "| by(span.dms != 999)", &[
+            "by(span.dms != 999)=boolValue=true | m2 | 01,06",
+            "by(span.dms != 999)=boolValue=false | m4 | 02,03,04,05",
+        ]),
+        parity("by_expr_boolean", "s649a", "| by(span.b || span.dms > 0)", &[
+            "by(span.b || (span.dms > 0))=boolValue=true | m2 | 01,02",
+            "by(span.b || (span.dms > 0))=boolValue=false | m4 | 03,04,05,06",
+        ]),
+        parity("by_expr_regex", "s649a", "| by(span.s =~ \"x\")", &[
+            "by(span.s =~ `x`)=boolValue=true | m1 | 01",
+            "by(span.s =~ `x`)=boolValue=false | m5 | 02,03,04,05,06",
+        ]),
+        diverges("by_expr_pow", "s649a", "| by(2 ^ span.k)",
+            &["by(2 ^ span.k)=intValue=8 | m1 | 01",
+              "by(2 ^ span.k)=doubleValue=0.5 | m1 | 02",
+              "by(2 ^ span.k)=boolValue=false | m4 | 03,04,05,06"],
+            &["by(2 ^ span.k)=intValue=9 | m1 | 01",
+              "by(2 ^ span.k)=intValue=1 | m1 | 02",
+              "by(2 ^ span.k)=boolValue=false | m4 | 03,04,05,06"],
+            EXACT_POW),
     ]
 }
 
