@@ -881,7 +881,7 @@ pub fn activity_lower_bucket_ns(start_ns: i64, rollup_res_ns: u64) -> i64 {
 /// `log_streams_idx` has no time column, so the window has to come from the
 /// one table that records per-stream activity in time: the log rollup
 /// `log_metrics_<res>` (`ORDER BY (fingerprint, bucket_ns)`, `PARTITION BY
-/// toDate(fromUnixTimestamp64Nano(bucket_ns))`), already the source for
+/// toDate(fromUnixTimestamp64Nano(bucket_ns), 'UTC')`), already the source for
 /// `/stats` and `/volume`.
 ///
 /// **Issue #603: this renders a statement of its own on every path.** It is no
@@ -1244,7 +1244,7 @@ pub fn log_stats_rollup(
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     format!(
-        "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(bucket_ns))) AS chunks, sum(count) AS entries, sum(bytes) AS bytes\nFROM {rollup_table}\nWHERE org_id = {t} AND fingerprint IN ({fp_list}) AND bucket_ns > {start_ns} AND bucket_ns <= {end_ns}"
+        "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(bucket_ns), 'UTC')) AS chunks, sum(count) AS entries, sum(bytes) AS bytes\nFROM {rollup_table}\nWHERE org_id = {t} AND fingerprint IN ({fp_list}) AND bucket_ns > {start_ns} AND bucket_ns <= {end_ns}"
     )
 }
 
@@ -1267,7 +1267,7 @@ pub fn log_stats_raw(
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     let mut sql = format!(
-        "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(timestamp_ns))) AS chunks, count() AS entries, sum(length(body)) AS bytes\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE org_id = {t} AND fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC')) AS chunks, count() AS entries, sum(length(body)) AS bytes\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE org_id = {t} AND fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in line_filters {
         sql.push_str("\n  AND ");

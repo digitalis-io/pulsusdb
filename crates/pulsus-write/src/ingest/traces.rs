@@ -227,8 +227,8 @@ pub struct LandingTagValue {
 /// per-process set, no LRU, no cross-push state. A push that fails re-emits
 /// everything next time. The two shipped signals can key a commit-promoted
 /// LRU on a time bucket, so a registration lost to a fan-out failure
-/// reappears at the next bucket; `tag_names` and `tag_values` are time-less
-/// by contract (`docs/api.md` §4.3) and have no heal interval at all.
+/// reappears at the next bucket; a `tag_names` or `tag_values` row lost so
+/// reappears with the next push carrying the tag (issue #496).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ParsedTraceLanding {
     pub spans: Vec<LandingSpan>,

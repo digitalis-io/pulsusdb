@@ -3045,7 +3045,7 @@ mod tests {
             q: None,
             start_ns: 1_700_000_000_000_000_000,
             end_ns: 1_700_010_800_000_000_000,
-            floor_ns: 0,
+            floor_ns: i64::MIN,
         };
         assert_eq!(
             req.window().span_time_clause(),
@@ -3066,7 +3066,7 @@ mod tests {
                 q: Some(q),
                 start_ns: 0,
                 end_ns: 0,
-                floor_ns: 0,
+                floor_ns: i64::MIN,
             };
             assert!(
                 !req.narrowing(&tag_ctx(req.window())).has_body(),
@@ -3077,7 +3077,7 @@ mod tests {
             q: Some("{resource.service.name=\"cart\"}"),
             start_ns: 0,
             end_ns: 0,
-            floor_ns: 0,
+            floor_ns: i64::MIN,
         };
         assert!(
             req.narrowing(&tag_ctx(req.window())).predicate().is_some(),

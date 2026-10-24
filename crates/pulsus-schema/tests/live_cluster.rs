@@ -1680,7 +1680,7 @@ async fn a_hostile_profile_cannot_move_rows_off_their_shard() {
 /// All three, not two: a version of this case that checked `resources` and
 /// `tag_values` only would pass a per-shard `tag_names` and lose **name
 /// discovery** on every other shard — the one catalog read the API
-/// bounds by retention alone.
+/// leaves bounded by the retention floor alone.
 ///
 /// The `SYSTEM SYNC REPLICA` is the assertion's precondition, not a
 /// convenience: the reach is eventual on the shipped consistency defaults,

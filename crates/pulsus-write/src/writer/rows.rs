@@ -2641,6 +2641,8 @@ impl TraceLandingRow {
         TraceLandingRow {
             tag_scope: tag.scope.as_str().to_string(),
             tag_key: tag.key,
+            // `tag_names_mv` reads it as `last_start_ns` (issue #496).
+            start_ns: tag.last_start_ns,
             ..Self::of_kind(received_ms, Self::KIND_TAG_NAME)
         }
     }
@@ -2652,6 +2654,8 @@ impl TraceLandingRow {
             tag_key: tag.key,
             tag_value: tag.value,
             tag_type: tag.val_type.to_string(),
+            // `tag_values_mv` reads it as `last_start_ns` (issue #496).
+            start_ns: tag.last_start_ns,
             ..Self::of_kind(received_ms, Self::KIND_TAG_VALUE)
         }
     }

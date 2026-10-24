@@ -621,8 +621,8 @@ async fn tag_discovery_against_real_clickhouse() {
     );
 
     // -- scope= filters; start/end are accepted and IGNORED (the catalog
-    // read takes the retention floor alone — a window excluding every span
-    // changes nothing). ------------------------------------------------
+    // read is bounded by the retention floor alone — a window excluding
+    // every span changes nothing). -------------------------------------
     let ctx = "tags scope=resource";
     let json = get_json(
         port,

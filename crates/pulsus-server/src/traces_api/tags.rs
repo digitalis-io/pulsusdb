@@ -6,7 +6,7 @@
 //! **Which read answers what** (issue #478 changed this; the module used
 //! to say "catalog ONLY" and that stopped being true):
 //!
-//! * tag NAMES — always `tag_names`, still time-less.
+//! * tag NAMES — always `tag_names`, bounded by retention, not by the window.
 //! * attribute values with no narrowing `q` — `tag_values`.
 //! * attribute values with a narrowing `q` — `spans`, or the bucket
 //!   catalogues for a single service equality.
@@ -19,7 +19,7 @@
 //! Contract corners (docs/api.md §4.3):
 //!
 //! * `start`/`end` are accepted and ignored on the NAMES routes (the
-//!   catalog has no timestamp column) and BOUND the read on the values
+//!   catalog read takes the retention floor alone) and BOUND the read on the values
 //!   route, defaulting to `reader.traceql_tag_lookback`. A range FAULT —
 //!   unparseable, half-supplied, inverted — is a `400` on every route.
 //! * `q=` on the values route NARROWS, and a `q` that is well-formed
@@ -83,11 +83,8 @@ async fn tags_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
             )));
         }
         scope => {
-            let engine = engine_for(&state).await?;
-            // Stub (issue #496, tests first): no floor yet.
-            engine
-                .list_tag_names(attribute_scope(scope), i64::MIN)
-                .await?
+            let (engine, floor) = (engine_for(&state).await?, catalog_floor_ns(&state)?);
+            engine.list_tag_names(attribute_scope(scope), floor).await?
         }
     };
     Ok(ok_json(tags_response::render_tag_names(
@@ -209,19 +206,15 @@ pub(super) async fn values_for(
     let now_ns = now_unix_nanos();
     let params = params::parse_tag_values_params(raw_query, now_ns, tag_lookback_ns(state))?;
     // docs/api.md §4, "Retention": a store read starts at the cutoff.
+    let floor_ns = params::retention_floor_ns(
+        state.retention_days().ok_or(ApiError::PoolUnavailable)?,
+        now_ns,
+    );
     let req = pulsus_read::TagValuesRequest {
         q: params.q.as_deref(),
-        start_ns: params::floored_start(
-            params.start_ns,
-            params.end_ns,
-            params::retention_floor_ns(
-                state.retention_days().ok_or(ApiError::PoolUnavailable)?,
-                now_ns,
-            ),
-        ),
+        start_ns: params::floored_start(params.start_ns, params.end_ns, floor_ns),
         end_ns: params.end_ns,
-        // Stub (issue #496, tests first): no floor yet.
-        floor_ns: i64::MIN,
+        floor_ns,
     };
     match lookup {
         TagLookup::Intrinsic(intrinsic) => match tag_value_source(intrinsic) {
@@ -269,6 +262,16 @@ async fn tag_values_impl(
         &source.answer(),
         limit,
     )))
+}
+
+/// The retention floor every catalog read is confined to (issue #496): a
+/// tag is listed only while a span carrying it is readable. `503` before
+/// the startup check has read the retention.
+pub(super) fn catalog_floor_ns(state: &AppState) -> Result<i64, ApiError> {
+    Ok(params::retention_floor_ns(
+        state.retention_days().ok_or(ApiError::PoolUnavailable)?,
+        now_unix_nanos(),
+    ))
 }
 
 #[cfg(test)]

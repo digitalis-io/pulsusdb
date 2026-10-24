@@ -2168,7 +2168,7 @@ fn base64_encode(input: &[u8]) -> String {
 /// resulting day falls outside the supported storage range (before
 /// 1970-01-01 or after 2106-02-06, day 49_709): `metric_samples` /
 /// `metric_hist_samples` partition on
-/// `toDate(fromUnixTimestamp64Milli(unix_milli))` (issue #126, mirroring
+/// `toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC')` (issue #126, mirroring
 /// #8's log/trace-path fix), so a day past the `Date` range would
 /// silently orphan the sample into the wrong partition — and their
 /// delete-TTL evaluates `intDiv(unix_milli, 1000)` in the 32-bit
