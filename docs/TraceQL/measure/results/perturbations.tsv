@@ -7,7 +7,7 @@ gte_interp	interpreter	red	3	0	0	0	0	noticed	PASS	`>=` evaluates as `>=`
 neq_missing_interp	interpreter	red	5	0	0	0	0	noticed	PASS	`!=` and `!~` never match a span lacking the key
 regex_anchor_interp	interpreter	red	4	0	0	0	0	noticed	PASS	a regex is anchored at both ends
 truthiness_interp	interpreter	red	2	0	0	0	0	noticed	PASS	a bare attribute is truthiness, not presence
-service_column_interp	interpreter	red	9	0	0	0	0	noticed	PASS	`resource.service.name` is answered from the span column
+service_column_interp	interpreter	red	10	0	0	0	0	noticed	PASS	`resource.service.name` is answered from the span column
 child_interp	interpreter	red	5	0	0	0	0	noticed	PASS	`{A} > {B}`: B is a child of an A span
 sibling_interp	interpreter	red	4	0	0	0	0	noticed	PASS	a sibling is not the span itself
 union_interp	interpreter	red	2	0	0	0	0	noticed	PASS	a union form returns both participating sides
@@ -41,7 +41,7 @@ compare_keyword_interp	interpreter	red	0	16	0	0	0	noticed	PASS	`kind` and `statu
 compare_topn_interp	interpreter	red	0	16	0	0	0	noticed	PASS	`topN` is applied per key and per side, not as one cap
 exemplar_off_interp	interpreter	red	0	1	0	0	0	noticed	PASS	`with(exemplars=false)` turns the exemplar column off
 matched_count_interp	interpreter	red	152	0	0	0	0	noticed	PASS	`matched` is how many spans of the trace the query kept
-root_columns_interp	interpreter	red	176	0	0	0	0	noticed	PASS	the trace row carries the root service and the root name, in that order
+root_columns_interp	interpreter	red	177	0	0	0	0	noticed	PASS	the trace row carries the root service and the root name, in that order
 presence_interp	interpreter	red	5	4	0	0	0	noticed	PASS	`!= nil` is presence: the key is stored
 select_projection_interp	interpreter	red	7	0	0	0	0	noticed	PASS	`select()` adds a projected slot to each span tuple
 spanset_and_interp	interpreter	red	3	0	0	0	0	noticed	PASS	`{A} && {B}` keeps only traces carrying both sides
