@@ -182,6 +182,35 @@ const CLAUSE_WORDS: [&str; 18] = [
     "WITH",
 ];
 
+/// The first thing outside a string literal or a backtick-quoted name that
+/// no trace statement builder emits: a comment (`--`, `/*`, `#`) or a
+/// double-quoted name. `'…'` and `` `…` `` are skipped with their
+/// backslash escapes; a doubled quote inside a literal is two literals
+/// side by side, so it is skipped too.
+fn unclassified(sql: &str) -> Option<(&'static str, usize)> {
+    let b = sql.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'`') => {
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+                continue;
+            }
+            b'"' => return Some(("a double-quoted name", i)),
+            b'#' => return Some(("a comment", i)),
+            b'-' if b.get(i + 1) == Some(&b'-') => return Some(("a comment", i)),
+            b'/' if b.get(i + 1) == Some(&b'*') => return Some(("a comment", i)),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Whether `sql` reads every trace table under `term` (issue #738).
 ///
 /// Every table source is inspected: what follows `FROM`, every `JOIN`
@@ -203,8 +232,18 @@ const CLAUSE_WORDS: [&str; 18] = [
 ///   ([`REMOTE_TABLE_FUNCTIONS`] with a `view(…)` argument). One the check
 ///   cannot see into is refused.
 ///
+/// **Fail-closed.** The check accepts only the shapes the trace statement
+/// builders emit, and refuses anything it cannot classify: a statement
+/// holding a comment or a double-quoted name, and a source after `FROM`,
+/// `JOIN` or a comma that is neither a name (`db.`-qualified, backtick-quoted
+/// or both, or a table function call) nor a parenthesised `SELECT` or
+/// `WITH` query.
+///
 /// The refusal names the source and its byte offset.
 pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), String> {
+    if let Some((what, at)) = unclassified(sql) {
+        return Err(format!("statement not tenant-scoped: {what} at byte {at}"));
+    }
     let toks = tokens(sql);
     let text = |t: &Token| &sql[t.start..t.end];
     let word = |t: &Token, w: &str| t.kind == Tok::Word && text(t).eq_ignore_ascii_case(w);
@@ -239,7 +278,10 @@ pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), Stri
             in_from[d + 1] = false;
             continue;
         }
-        if word(t, "FROM") {
+        if word(t, "FROM") && i > 0 && word(&toks[i - 1], "FILL") {
+            // `ORDER BY … WITH FILL FROM <expr>`: a bound, not a source.
+            in_from[d] = false;
+        } else if word(t, "FROM") {
             in_from[d] = true;
             sources.push((i + 1, Source::From, t.start));
         } else if word(t, "JOIN") {
@@ -261,6 +303,45 @@ pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), Stri
     }
 
     for (start, how, at) in sources {
+        // A parenthesised source: a query, which is checked as a statement
+        // of its own, and nothing else after `FROM`, `JOIN` or a comma. After
+        // `IN` it is a query or a tuple of values, but never a bare trace
+        // table.
+        if let Some(open) = toks.get(start).filter(|t| t.kind == Tok::Open) {
+            let query = toks
+                .get(start + 1)
+                .is_some_and(|t| word(t, "SELECT") || word(t, "WITH"));
+            if how != Source::InSet && !query {
+                return refuse("a parenthesised source that is not a query", open.start);
+            }
+            if how == Source::InSet && !query {
+                let mut k = start + 1;
+                let mut last = None;
+                while let Some(t) = toks.get(k) {
+                    match t.kind {
+                        Tok::Word => last = Some(text(t).to_string()),
+                        Tok::Quoted if text(t).starts_with('`') => {
+                            last = Some(text(t).trim_matches('`').to_string())
+                        }
+                        Tok::Dot => {}
+                        _ => break,
+                    }
+                    k += 1;
+                }
+                let closes = toks.get(k).is_some_and(|t| t.kind == Tok::Close);
+                if closes && last.is_some_and(|n| tables.contains(&n)) {
+                    return refuse("a trace table read as a set", open.start);
+                }
+            }
+            continue;
+        }
+        if how != Source::InSet
+            && !toks.get(start).is_some_and(|t| {
+                t.kind == Tok::Word || (t.kind == Tok::Quoted && text(t).starts_with('`'))
+            })
+        {
+            return refuse("a source the check cannot classify", at);
+        }
         // The name: parts joined by dots, each a word or a quoted name.
         let mut j = start;
         let mut last = None;
@@ -534,6 +615,42 @@ mod tests {
         );
         accepted.push(
             "SELECT m.spans AS spans, arrayJoin(spans) AS s FROM (SELECT 1 AS spans) AS m"
+                .to_string(),
+        );
+        // Shapes no builder emits are refused whether or not they carry the
+        // term: a parenthesised source that is not a query, a comment, a
+        // double-quoted name.
+        for w in ["x", "org_id = 'a' AND x"] {
+            refused.push(format!("SELECT * FROM (spans) WHERE {w}"));
+            refused.push(format!("SELECT * FROM /* source */ spans WHERE {w}"));
+            refused.push(format!("SELECT * FROM \"spans\" WHERE {w}"));
+            refused.push(format!("SELECT * FROM (merge('db', '^spans$')) WHERE {w}"));
+            refused.push(format!(
+                "SELECT * FROM merge /* source */ ('db', '^spans$') WHERE {w}"
+            ));
+            refused.push(format!("SELECT * FROM spans -- c\nWHERE {w}"));
+            refused.push(format!("SELECT * FROM spans # c\nWHERE {w}"));
+            refused.push(format!("SELECT * FROM (db.traces) AS t WHERE {w}"));
+            refused.push(format!(
+                "{base} JOIN (spans) AS s USING (trace_id) WHERE {w}"
+            ));
+            refused.push(format!("{base}, (spans) AS s WHERE {w}"));
+            refused.push(format!("{base} WHERE x IN (spans)"));
+            refused.push("SELECT 1 FROM spans WHERE org_id = 'a' AND \"x\" = 1".to_string());
+        }
+        // The same characters inside a string literal are text.
+        accepted.push(
+            "SELECT 1 FROM spans WHERE org_id = 'a' AND x = '/* not -- a # comment */'".to_string(),
+        );
+        accepted.push("SELECT 1 FROM spans WHERE org_id = 'a' AND x = 'say \"hi\"'".to_string());
+        accepted.push(
+            "SELECT 1 FROM spans WHERE org_id = 'a' AND x = 'it\\'s -- \"q\" /* c'".to_string(),
+        );
+        accepted.push("SELECT 1 FROM spans WHERE org_id = 'a' AND x = 'it''s -- c'".to_string());
+        accepted.push("SELECT 1 FROM (WITH 1 AS k SELECT k) AS w".to_string());
+        // `WITH FILL FROM` is a bound, which the metrics statement uses.
+        accepted.push(
+            "SELECT g, o, p FROM (SELECT 1 AS g, 2 AS o, 3 AS p) ORDER BY g, o, p WITH FILL FROM 0 TO 5"
                 .to_string(),
         );
         let mut wrong = Vec::new();
