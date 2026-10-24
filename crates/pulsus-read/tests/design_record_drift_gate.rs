@@ -2009,10 +2009,14 @@ enum ReviewedVerdict {
 // #602 part 3a: coordinates and nothing else. Deleting the previous metrics
 // SQL's engine code moved the block up 923 lines: `:2225-2227` is
 // `:1302-1304`. The verdict is unchanged.
+//
+// #496: coordinates and nothing else. The catalog reads' retention floor
+// moved the block down twelve lines: `:1302-1304` is `:1314-1316`. The
+// verdict is unchanged.
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 2] = [
     (
         "docs/query-lowering.md",
-        "exec.rs:1302-1304",
+        "exec.rs:1314-1316",
         0,
         ReviewedVerdict::FallbackWrong,
         "the search settings block the same section quotes; it is in traces/exec.rs \

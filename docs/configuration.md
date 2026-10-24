@@ -150,7 +150,7 @@ A trace request is also bounded **before** any of that, by a fixed ceiling on th
 | `PULSUS_TRACEQL_SCAN_BUDGET_ROWS` | `50000000` | per-query row scan cap on every trace-search read (`max_rows_to_read`, throw); exceeding returns `422 query_too_broad`. The span-name and `q`-narrowed tag-value reads test the newest whole 5-minute buckets holding `R` spans and answer, `R` = max(1, min(10,000,000, this cap / (2 × the statement's `spans` and `traces` reads))) (`docs/api.md` §4.3), except a service-narrowed span-key or resource-key read, which answers from the bucket catalogue there; they reach this cap when one shard's 5-minute bucket at the cut holds more than about `R` spans, or when the cap is set below what one read of every part in the window costs — non-indexable searches are budget-limited, never silently slow. Must be >= 1 (`0` is ClickHouse's *unlimited* sentinel — it would silently disable the budget). Accepted range `1..=50000000000`: values above the ceiling are rejected at config load. Scale tuning routes to #25 |
 | `PULSUS_TRACEQL_MAX_DEPTH` | `64` | the most parent links one climb of the `>>` and `<<` structural operators follows (issue #593). A climb that still has a parent to follow past it — a chain deeper than the bound, in a trace holding spans of both sides, not decided below it — answers `422 query_too_broad` rather than an answer the climb could not finish; a cycle ends the climb. `1`–`10000`; `0` is rejected at startup. YAML `reader.traceql_max_depth` |
 | `PULSUS_TRACEQL_MAX_SERIES` | `1000` | safety cap on distinct output series a TraceQL metrics `by(...)` query may resolve, any key and up to five of them (issues #182, #596); the metrics statement counts its series inside itself, over the route's own window, and a breach is `422 query_too_broad`, never a silent subset. A `compare()` counts the values it keeps after `topN` on both sides plus four per key (#597). Other ungrouped metrics queries are not capped. Scale tuning routes to #25 |
-| `PULSUS_TRACEQL_TAG_LOOKBACK` | `20m` | the window a `/api/traces/v1/tag/{tag}/values` read (and its two aliases) covers when the client sends no usable `start`/`end` (issue #478). Applies only to the reads that touch the span tables — the span-`name` dropdown and any value dropdown narrowed by `q`; an unnarrowed attribute-value read is still the time-less catalog read and ignores this. The window is `[start, end)` at nanosecond precision, and the reads test at most its newest whole buckets holding `R` spans, `R` = max(1, min(10,000,000, `PULSUS_TRACEQL_SCAN_BUDGET_ROWS` / (2 × the statement's `spans` and `traces` reads))) (`docs/api.md` §4.3), so the knob decides both what a dropdown shows and what it reads. 20 minutes is near what the reference covers for a request without a range: its live store's blocks, kept for 20 minutes after they end. Must be > 0 |
+| `PULSUS_TRACEQL_TAG_LOOKBACK` | `20m` | the window a `/api/traces/v1/tag/{tag}/values` read (and its two aliases) covers when the client sends no usable `start`/`end` (issue #478). Applies only to the reads that touch the span tables — the span-`name` dropdown and any value dropdown narrowed by `q`; an unnarrowed attribute-value read is still the catalog read, bounded by retention alone, and ignores this. The window is `[start, end)` at nanosecond precision, and the reads test at most its newest whole buckets holding `R` spans, `R` = max(1, min(10,000,000, `PULSUS_TRACEQL_SCAN_BUDGET_ROWS` / (2 × the statement's `spans` and `traces` reads))) (`docs/api.md` §4.3), so the knob decides both what a dropdown shows and what it reads. 20 minutes is near what the reference covers for a request without a range: its live store's blocks, kept for 20 minutes after they end. Must be > 0 |
 | `PULSUS_LOGQL_READ_MAX_MEMORY_BYTES` | `8589934592` | per-query ClickHouse memory ceiling on **every** LogQL read (`max_memory_usage` + `max_bytes_before_external_group_by=0`, throw-not-spill); a breach returns `422 query_too_broad` naming this knob, never a `500` carrying the raw server exception (issue #398). **One exception, which never turns an answer into a refusal:** when the read that breaches is a lowered metric statement — the bucketed, sliding or reduced read (docs/query-to-sql.md) — the query is not refused; it is run again on the raw-scan read, which carries this same ceiling and returns the `422` if it breaches too. The failed attempt costs at most this ceiling in memory, released before the second read starts, and the time it ran. A timeout of a lowered statement is returned as a timeout, as for any read. Applied at the single settings origin every LogQL dispatch site goes through, including the stage-1 stream resolution `/query_range`, `/series`, `/detected_labels`, `/detected_fields` and `/stats` all share. **Two behaviour notes.** (1) `max_bytes_before_external_group_by=0` overrides an operator profile that enabled spill-to-disk: a wide aggregation that would previously have finished slowly now returns a loud `422` — deliberate, and consistent with every TraceQL read's `PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES`. (2) `max_memory_usage` is per query **per server**: each shard bounds its own execution and the coordinator bounds its own; it is not a cluster-wide total. Must be >= 1 (`0` is ClickHouse's *unlimited* sentinel — it would silently disable the guard). Accepted range `1..=549755813888` bytes (512 GiB): values above the ceiling are rejected at config load. Scale tuning routes to #25 |
 | `PULSUS_PROMQL_READ_MAX_MEMORY_BYTES` | `8589934592` | the same per-query memory ceiling on every PromQL read (issue #398), including the background label-cache refresh sweep. A breach on a request returns `422` with `errorType: "execution"` — the envelope Prometheus itself returns for a memory refusal — never a `500`. A breach on the **sweep** is unchanged in behaviour: it is logged and the last good snapshot keeps being served, so a degraded cache still answers `200` with results that may no longer reflect the store. Same per-server, throw-not-spill and `>= 1` rules as `PULSUS_LOGQL_READ_MAX_MEMORY_BYTES`; accepted range `1..=549755813888` bytes. Scale tuning routes to #25 |
 | `PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES` | `8589934592` | the same per-query memory ceiling on every TraceQL read (issue #398) — search, tag/tag-value catalog discovery, trace metrics, the service graph, and the trace-by-id point read (which previously carried no settings at all). A breach returns `422 query_too_broad` naming this knob. Same per-server, throw-not-spill and `>= 1` rules; accepted range `1..=549755813888` bytes. Scale tuning routes to #25 |
@@ -182,19 +182,19 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 | Table | Due at | Removed | Partition |
 |-------|--------|---------|-----------|
 | `log_landing` | `received_ms` + `H` hours | whole part | hour of `received_ms` |
-| `log_metrics_<res>` | `bucket_ns` + `R` days | whole part | day of `bucket_ns` |
-| `log_patterns` | `bucket_ns` + `R` days | whole part | day of `bucket_ns` |
-| `log_samples` | `timestamp_ns` + `R` days | whole part | day of `timestamp_ns` |
-| `log_streams` | never: no TTL | — | `month` |
-| `log_streams_idx` | never: no TTL | — | `month` |
-| `metric_exemplars` | `unix_milli` + `R` days | whole part | day of `unix_milli` |
-| `metric_hist_samples` | `unix_milli` + `R` days | whole part | day of `unix_milli` |
-| `metric_label_index` | never: no TTL | — | none |
-| `metric_label_values` | never: no TTL | — | none |
-| `metric_labels` | never: no TTL | — | none |
+| `log_metrics_<res>` | `bucket_ns` + `R` days | whole part | UTC day of `bucket_ns` |
+| `log_patterns` | `bucket_ns` + `R` days | whole part | UTC day of `bucket_ns` |
+| `log_samples` | `timestamp_ns` + `R` days | whole part | UTC day of `timestamp_ns` |
+| `log_streams` | the end of the UTC month `month` + `R` days | whole part | `month`, a UTC month |
+| `log_streams_idx` | the end of the UTC month `month` + `R` days | whole part | `month`, a UTC month |
+| `metric_exemplars` | `unix_milli` + `R` days | whole part | UTC day of `unix_milli` |
+| `metric_hist_samples` | `unix_milli` + `R` days | whole part | UTC day of `unix_milli` |
+| `metric_label_index` | the end of the UTC day of `last_seen` + `R` days | row by row | none |
+| `metric_label_values` | the end of the UTC day of `last_seen` + `R` days | row by row | none |
+| `metric_labels` | the end of the UTC day of `last_seen` + `R` days | row by row | none |
 | `metric_landing` | `received_ms` + `H` hours | whole part | hour of `received_ms` |
 | `metric_metadata` | `updated_ns` + `R` days | row by row | none |
-| `metric_samples` | `unix_milli` + `R` days | whole part | day of `unix_milli` |
+| `metric_samples` | `unix_milli` + `R` days | whole part | UTC day of `unix_milli` |
 | `metric_series` | the end of the UTC day `day` + `R` days | whole part | `day`, a UTC day |
 | `resources` | the end of the UTC day `day` + `R` days | whole part | `day`, a UTC day |
 | `service_bucket_resources` | the start of the 5-minute `bucket` + `R` days | whole part | UTC day of `bucket` |
@@ -202,12 +202,12 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 | `spans` | `start_ns` + `R` days | whole part | UTC day of `start_ns` |
 | `error_spans` | `start_ns` + `R` days | whole part | UTC day of `start_ns` |
 | `tag_bucket_values` | the start of the 5-minute `bucket` + `R` days | whole part | UTC day of `bucket` |
-| `tag_names` | never: no TTL | — | none |
-| `tag_values` | never: no TTL | — | none |
+| `tag_names` | the end of the UTC day of `last_start_ns` + `R` days | row by row | none |
+| `tag_values` | the end of the UTC day of `last_start_ns` + `R` days | row by row | none |
 | `trace_landing` | `received_ms` + `H` hours | whole part | hour of `received_ms` |
-| `traces` | `last_start_ns` + `R` days | whole part | `day`, the UTC day of the earliest of the trace's spans in one push |
+| `traces` | the end of the UTC day of `last_start_ns` + `R` days | whole part | `day`, the UTC day of the earliest of the trace's spans in one push |
 
-A day or hour without "UTC" is the server's time zone. The landing tables' rows are read by nothing once their views have run, so their expiry deletes nothing a query reads.
+An hour is in the server's time zone. `month` is the UTC month of the log lines a stream registration covers; `last_seen` is the latest sample instant a series registration carried; `last_start_ns` is, in `tag_names` and `tag_values`, the latest start of a span carrying the tag and, in `traces`, the latest start of the trace's spans. A row due at the end of a UTC day plus `R` outlives every part of a table partitioned by UTC day that holds the samples or spans it describes, so a series, stream or trace is never found without its labels or its index while its data is stored. The landing tables' rows are read by nothing once their views have run, so their expiry deletes nothing a query reads.
 
 ## 8. Ruler (M7)
 

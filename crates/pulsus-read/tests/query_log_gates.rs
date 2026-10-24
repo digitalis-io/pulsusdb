@@ -1933,8 +1933,9 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
     // than short-circuiting on an empty result.
     for sql in [
         format!(
-            "INSERT INTO {run_db}.tag_values (scope, key, value, val_type) \
-             SELECT 'span', 'http.status_code', concat('v', toString(number)), 'string' \
+            "INSERT INTO {run_db}.tag_values (scope, key, value, val_type, last_start_ns) \
+             SELECT 'span', 'http.status_code', concat('v', toString(number)), 'string', \
+                    toUnixTimestamp64Nano(now64(9)) \
              FROM numbers(64)"
         ),
         // Issue #587: the fetch moved to the span, per-trace and resource
@@ -2038,7 +2039,10 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
 
     // 3 + 4. Catalog discovery — `catalog_settings`, the root that
     //        produced the measured 500.
-    engine.list_tag_names(None).await.expect("tag names");
+    engine
+        .list_tag_names(None, i64::MIN)
+        .await
+        .expect("tag names");
     engine
         .list_tag_values(
             "http.status_code",
@@ -2503,6 +2507,7 @@ fn unnarrowed_values_request() -> pulsus_read::TagValuesRequest<'static> {
         q: None,
         start_ns: 1_700_000_000_000_000_000,
         end_ns: 1_700_003_600_000_000_000,
+        floor_ns: i64::MIN,
     }
 }
 

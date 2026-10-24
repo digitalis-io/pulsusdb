@@ -524,8 +524,8 @@ pub struct ReaderConfig {
     /// client sends no usable `start`/`end`.
     ///
     /// The Span Name dropdown and every `q`-narrowed value dropdown read
-    /// the span tables rather than the time-less catalog, so they need a
-    /// window; the datasource sends `start`/`end` only when its own
+    /// the span tables rather than the catalog, which is bounded by the
+    /// retention floor alone, so they need a window; the datasource sends `start`/`end` only when its own
     /// tag time-range setting is non-default. The bound resolves to whole
     /// UTC days on both tables, so 1 h and 24 h touch the same one or two
     /// daily partitions and read the same bytes — the choice is about what

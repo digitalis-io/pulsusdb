@@ -2641,6 +2641,8 @@ impl TraceLandingRow {
         TraceLandingRow {
             tag_scope: tag.scope.as_str().to_string(),
             tag_key: tag.key,
+            // `tag_names_mv` reads it as `last_start_ns` (issue #496).
+            start_ns: tag.last_start_ns,
             ..Self::of_kind(received_ms, Self::KIND_TAG_NAME)
         }
     }
@@ -2652,6 +2654,8 @@ impl TraceLandingRow {
             tag_key: tag.key,
             tag_value: tag.value,
             tag_type: tag.val_type.to_string(),
+            // `tag_values_mv` reads it as `last_start_ns` (issue #496).
+            start_ns: tag.last_start_ns,
             ..Self::of_kind(received_ms, Self::KIND_TAG_VALUE)
         }
     }
@@ -3071,6 +3075,7 @@ mod trace_landing_tests {
             LandingTagName {
                 scope: TagScope::Span,
                 key: "k".to_string(),
+                last_start_ns: 1_700_000_000_000_000_000,
             },
         );
         let tag_value = TraceLandingRow::tag_value(
@@ -3080,6 +3085,7 @@ mod trace_landing_tests {
                 key: "k".to_string(),
                 value: "v".to_string(),
                 val_type: "string",
+                last_start_ns: 1_700_000_000_000_000_000,
             },
         );
 
@@ -3190,9 +3196,11 @@ mod trace_landing_tests {
         assert_eq!(tag_name.day, 0);
         assert_eq!(tag_name.resource_id, Fingerprint::from_raw(0));
         assert_eq!(tag_name.trace_id, [0u8; 16]);
+        // Issue #496: `tag_names_mv` reads it as `last_start_ns`.
+        assert_eq!(tag_name.start_ns, 1_700_000_000_000_000_000);
         assert_eq!(tag_name.service_type, "");
 
-        // The kind-3 row: four columns, and nothing else.
+        // The kind-3 row: five columns, and nothing else.
         assert_eq!(tag_value.tag_scope, "event");
         assert_eq!(tag_value.tag_key, "k");
         assert_eq!(tag_value.tag_value, "v");
@@ -3201,7 +3209,8 @@ mod trace_landing_tests {
         assert!(tag_value.attrs.is_empty());
         assert_eq!(tag_value.day, 0);
         assert_eq!(tag_value.trace_id, [0u8; 16]);
-        assert_eq!(tag_value.start_ns, 0);
+        // Issue #496: `tag_values_mv` reads it as `last_start_ns`.
+        assert_eq!(tag_value.start_ns, 1_700_000_000_000_000_000);
         assert_eq!(tag_value.service_type, "");
     }
 

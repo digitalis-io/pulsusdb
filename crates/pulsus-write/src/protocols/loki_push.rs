@@ -1280,7 +1280,7 @@ fn append_stream(
     for entry in entries {
         let (timestamp_ns, line, structured_metadata) = entry?;
         // `log_samples` is partitioned by the RAW sample day
-        // (`toDate(fromUnixTimestamp64Nano(timestamp_ns))`) and its
+        // (`toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC')`) and its
         // delete-TTL evaluates `intDiv(timestamp_ns, 1000000000)` in the
         // 32-bit `DateTime` domain (issue #137, mirroring #131's trace fix),
         // so an entry is storage-safe only when its day lies in `0..=49_709`

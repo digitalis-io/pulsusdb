@@ -242,7 +242,7 @@ impl Date {
     /// The UTC start-of-day containing `unix_milli` — the millisecond-scale
     /// sibling of [`Date::start_of_day_utc`] for `metric_samples` /
     /// `metric_hist_samples`, which partition on
-    /// `toDate(fromUnixTimestamp64Milli(unix_milli))` (docs/schemas.md,
+    /// `toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC')` (docs/schemas.md,
     /// issue #126). Deliberately NOT `start_of_day_utc(unix_milli *
     /// 1_000_000)`: that multiply overflows `i64` for `unix_milli` beyond
     /// roughly year 2262, while flooring directly at millisecond scale is

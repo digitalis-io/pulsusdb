@@ -19754,6 +19754,7 @@ async fn values_request_4b(
                 q: Some(q),
                 start_ns: s,
                 end_ns: e,
+                floor_ns: i64::MIN,
             },
         )
         .await
@@ -21043,6 +21044,7 @@ async fn values_request_4c(
                 q: Some(q),
                 start_ns: s,
                 end_ns: e,
+                floor_ns: i64::MIN,
             },
         )
         .await

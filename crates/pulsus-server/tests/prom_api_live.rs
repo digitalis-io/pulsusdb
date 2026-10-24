@@ -209,7 +209,10 @@ impl InsertSeries for ChClient {
         self.insert_block("metric_labels", &labels).await?;
         // Issue #635: the label index and its values, as the two views
         // write them from the same kind-2 row.
-        let (index, values) = index_rows(rows.iter().map(|r| (r.fingerprint, r.labels.as_str())));
+        let (index, values) = index_rows(
+            rows.iter()
+                .map(|r| (r.fingerprint, r.labels.as_str(), r.unix_milli)),
+        );
         self.insert_block("metric_label_index", &index).await?;
         self.insert_block("metric_label_values", &values).await
     }
@@ -221,6 +224,8 @@ struct SeedIndexRow {
     key: String,
     value: String,
     fingerprint: u128,
+    /// Issue #496: the time the view gives a row, its sample's `unix_milli`.
+    last_seen: i64,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -228,34 +233,41 @@ struct SeedValueRow {
     org_id: String,
     key: String,
     value: String,
+    /// Issue #496: the latest `unix_milli` of the pair, as the view takes it.
+    last_seen: i64,
 }
 
 /// One index row per label of each series, and one values row per
 /// distinct key and value.
 fn index_rows<'a>(
-    series: impl Iterator<Item = (u128, &'a str)>,
+    series: impl Iterator<Item = (u128, &'a str, i64)>,
 ) -> (Vec<SeedIndexRow>, Vec<SeedValueRow>) {
     let mut index = Vec::new();
-    let mut pairs = std::collections::BTreeSet::new();
-    for (fingerprint, labels) in series {
+    let mut pairs: std::collections::BTreeMap<(String, String), i64> = Default::default();
+    for (fingerprint, labels, unix_milli) in series {
         let map: std::collections::BTreeMap<String, String> =
             serde_json::from_str(labels).expect("canonical label JSON");
         for (key, value) in map {
-            pairs.insert((key.clone(), value.clone()));
+            let seen = pairs
+                .entry((key.clone(), value.clone()))
+                .or_insert(unix_milli);
+            *seen = (*seen).max(unix_milli);
             index.push(SeedIndexRow {
                 org_id: String::new(),
                 key,
                 value,
                 fingerprint,
+                last_seen: unix_milli,
             });
         }
     }
     let values = pairs
         .into_iter()
-        .map(|(key, value)| SeedValueRow {
+        .map(|((key, value), last_seen)| SeedValueRow {
             org_id: String::new(),
             key,
             value,
+            last_seen,
         })
         .collect();
     (index, values)

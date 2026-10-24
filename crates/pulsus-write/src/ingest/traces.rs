@@ -197,6 +197,11 @@ impl TagScope {
 pub struct LandingTagName {
     pub scope: TagScope,
     pub key: String,
+    /// The latest start of a span in the push that carries this name, in
+    /// Unix nanoseconds (issue #496): `tag_names` keeps the row until it is
+    /// past retention, and a read lists it only while it is within. `0`
+    /// while staged, set when the push's entries are collected.
+    pub last_start_ns: i64,
 }
 
 /// One tag value, as the kind-3 landing row stores it: one per distinct
@@ -209,6 +214,8 @@ pub struct LandingTagValue {
     /// `string`, `int`, `float` or `bool` — the four values
     /// `tag_values`' own comment admits.
     pub val_type: &'static str,
+    /// As [`LandingTagName::last_start_ns`], for this value.
+    pub last_start_ns: i64,
 }
 
 /// The landing-shaped decode of one trace push: the four landed event
@@ -220,8 +227,8 @@ pub struct LandingTagValue {
 /// per-process set, no LRU, no cross-push state. A push that fails re-emits
 /// everything next time. The two shipped signals can key a commit-promoted
 /// LRU on a time bucket, so a registration lost to a fan-out failure
-/// reappears at the next bucket; `tag_names` and `tag_values` are time-less
-/// by contract (`docs/api.md` §4.3) and have no heal interval at all.
+/// reappears at the next bucket; a `tag_names` or `tag_values` row lost so
+/// reappears with the next push carrying the tag (issue #496).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ParsedTraceLanding {
     pub spans: Vec<LandingSpan>,

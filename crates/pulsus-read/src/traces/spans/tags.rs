@@ -71,15 +71,30 @@ pub(crate) const ATTR_SCOPES_IN: &str = "('event', 'instrumentation', 'link', 'r
 const TAG_NAMES_TABLE: &str = "tag_names";
 const TAG_VALUES_TABLE: &str = "tag_values";
 
+/// The floor as the catalog reads write it: never below `0`, which no span
+/// starts before. `i64::MIN`, the floor of the largest retention, renders as
+/// `-9223372036854775808`, which ClickHouse reads as a negated `UInt64` and
+/// cannot analyse; measured, the whole `WHERE` then prunes nothing, the
+/// `scope` prefix included (issue #496).
+fn catalog_floor(floor_ns: i64) -> i64 {
+    floor_ns.max(0)
+}
+
 /// The `GET /api/traces/v1/tags` read: distinct `(scope, key)` pairs from
 /// `tag_names`, confined to one scope (a `(scope)` primary-key prefix) or
-/// to [`ATTR_SCOPES`] (an `IN` list on the same leading column).
-pub fn tag_names_sql(scope_literal: Option<&str>, limit: usize) -> String {
+/// to [`ATTR_SCOPES`] (an `IN` list on the same leading column), and to
+/// rows whose latest span started at or after `floor_ns`, the retention
+/// floor (issue #496): a name is listed only while a span carrying it is.
+pub fn tag_names_sql(scope_literal: Option<&str>, floor_ns: i64, limit: usize) -> String {
     let mut sql = format!("SELECT DISTINCT scope, key\nFROM {TAG_NAMES_TABLE}\n");
     match scope_literal {
         Some(scope) => sql.push_str(&format!("WHERE scope = {scope}\n")),
         None => sql.push_str(&format!("WHERE scope IN {ATTR_SCOPES_IN}\n")),
     }
+    sql.push_str(&format!(
+        "  AND last_start_ns >= {}\n",
+        catalog_floor(floor_ns)
+    ));
     sql.push_str(&format!("ORDER BY scope, key\nLIMIT {limit}"));
     sql
 }
@@ -91,7 +106,14 @@ pub fn tag_names_sql(scope_literal: Option<&str>, limit: usize) -> String {
 /// value alone (issue #476): one key can hold a string `'8080'` and an
 /// int `8080`, which the wire reports as two entries, and the `LIMIT`
 /// probe counts pairs.
-pub fn tag_values_sql(key_literal: &str, scope_literal: Option<&str>, limit: usize) -> String {
+///
+/// Confined, as [`tag_names_sql`] is, to rows at or after `floor_ns`.
+pub fn tag_values_sql(
+    key_literal: &str,
+    scope_literal: Option<&str>,
+    floor_ns: i64,
+    limit: usize,
+) -> String {
     let mut sql = format!(
         "SELECT DISTINCT value AS val, val_type\nFROM {TAG_VALUES_TABLE}\nWHERE key = {key_literal}"
     );
@@ -99,6 +121,10 @@ pub fn tag_values_sql(key_literal: &str, scope_literal: Option<&str>, limit: usi
         Some(scope) => sql.push_str(&format!(" AND scope = {scope}")),
         None => sql.push_str(&format!(" AND scope IN {ATTR_SCOPES_IN}")),
     }
+    sql.push_str(&format!(
+        " AND last_start_ns >= {}",
+        catalog_floor(floor_ns)
+    ));
     sql.push_str(&format!("\nORDER BY val, val_type\nLIMIT {limit}"));
     sql
 }
@@ -698,10 +724,15 @@ mod tests {
     #[test]
     fn scoped_tag_names_sql_is_byte_exact() {
         assert_eq!(
-            tag_names_sql(Some(&ch_string("resource")), TAG_NAMES_MAX + 1),
+            tag_names_sql(
+                Some(&ch_string("resource")),
+                1_700_000_000_000_000_000,
+                TAG_NAMES_MAX + 1
+            ),
             "SELECT DISTINCT scope, key\n\
              FROM tag_names\n\
              WHERE scope = 'resource'\n\
+             \x20 AND last_start_ns >= 1700000000000000000\n\
              ORDER BY scope, key\n\
              LIMIT 10001"
         );
@@ -710,10 +741,11 @@ mod tests {
     #[test]
     fn unscoped_tag_names_sql_is_byte_exact() {
         assert_eq!(
-            tag_names_sql(None, TAG_NAMES_MAX + 1),
+            tag_names_sql(None, 1_700_000_000_000_000_000, TAG_NAMES_MAX + 1),
             "SELECT DISTINCT scope, key\n\
              FROM tag_names\n\
              WHERE scope IN ('event', 'instrumentation', 'link', 'resource', 'span')\n\
+             \x20 AND last_start_ns >= 1700000000000000000\n\
              ORDER BY scope, key\n\
              LIMIT 10001"
         );
@@ -725,11 +757,13 @@ mod tests {
             tag_values_sql(
                 &ch_string("service.name"),
                 Some(&ch_string("resource")),
+                1_700_000_000_000_000_000,
                 TAG_VALUES_MAX + 1
             ),
             "SELECT DISTINCT value AS val, val_type\n\
              FROM tag_values\n\
-             WHERE key = 'service.name' AND scope = 'resource'\n\
+             WHERE key = 'service.name' AND scope = 'resource' \
+             AND last_start_ns >= 1700000000000000000\n\
              ORDER BY val, val_type\n\
              LIMIT 1001"
         );
@@ -738,21 +772,44 @@ mod tests {
     #[test]
     fn unscoped_tag_values_sql_is_byte_exact() {
         assert_eq!(
-            tag_values_sql(&ch_string("service.name"), None, TAG_VALUES_MAX + 1),
+            tag_values_sql(
+                &ch_string("service.name"),
+                None,
+                1_700_000_000_000_000_000,
+                TAG_VALUES_MAX + 1
+            ),
             "SELECT DISTINCT value AS val, val_type\n\
              FROM tag_values\n\
              WHERE key = 'service.name' AND scope IN ('event', 'instrumentation', 'link', \
-             'resource', 'span')\n\
+             'resource', 'span') AND last_start_ns >= 1700000000000000000\n\
              ORDER BY val, val_type\n\
              LIMIT 1001"
         );
+    }
+
+    /// Issue #496: the largest retention's floor, `i64::MIN`, renders as
+    /// `0`, so the `scope` and `key` prefixes still prune.
+    #[test]
+    fn the_floor_of_the_largest_retention_renders_as_zero() {
+        for sql in [
+            tag_names_sql(None, i64::MIN, TAG_NAMES_MAX + 1),
+            tag_values_sql(&ch_string("k"), None, i64::MIN, TAG_VALUES_MAX + 1),
+        ] {
+            assert!(sql.contains("last_start_ns >= 0"), "{sql}");
+            assert!(!sql.contains("-9223372036854775808"), "{sql}");
+        }
     }
 
     /// The injection boundary holds: a hostile key arrives pre-escaped
     /// and stays inside its string literal.
     #[test]
     fn a_pre_escaped_hostile_key_stays_a_string_literal() {
-        let sql = tag_values_sql(&ch_string("k'; DROP TABLE x; --"), None, TAG_VALUES_MAX + 1);
+        let sql = tag_values_sql(
+            &ch_string("k'; DROP TABLE x; --"),
+            None,
+            0,
+            TAG_VALUES_MAX + 1,
+        );
         assert!(
             sql.contains("WHERE key = 'k\\'; DROP TABLE x; --'"),
             "{sql}"
@@ -778,10 +835,10 @@ mod tests {
         let scope = ch_string("resource");
         let key = ch_string("service.name");
         for sql in [
-            tag_names_sql(Some(&scope), TAG_NAMES_MAX + 1),
-            tag_names_sql(None, TAG_NAMES_MAX + 1),
-            tag_values_sql(&key, Some(&scope), TAG_VALUES_MAX + 1),
-            tag_values_sql(&key, None, TAG_VALUES_MAX + 1),
+            tag_names_sql(Some(&scope), 0, TAG_NAMES_MAX + 1),
+            tag_names_sql(None, 0, TAG_NAMES_MAX + 1),
+            tag_values_sql(&key, Some(&scope), 0, TAG_VALUES_MAX + 1),
+            tag_values_sql(&key, None, 0, TAG_VALUES_MAX + 1),
         ] {
             assert!(!sql.is_empty() && !sql.contains("_dist"), "{sql}");
         }

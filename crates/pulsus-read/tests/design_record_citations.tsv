@@ -59,10 +59,10 @@ docs/query-lowering.md	crates/pulsus-read/src/metrics/labels.rs:625	crates/pulsu
 docs/query-lowering.md	crates/pulsus-read/src/metrics/re2_authority.rs:89	crates/pulsus-read/src/metrics/re2_authority.rs	89		line	re2_pattern_to_rust	let rewritten = re2_pattern_to_rust(&m.value);
 docs/query-lowering.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		prose	MAX_QUERY_TEXT_BYTES	MAX_QUERY_TEXT_BYTES
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:105	crates/pulsus-read/src/traces/exec.rs	105		line	TRACE_SEARCH_MAX_BLOCK_ROWS	pub const TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096;
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:1307	crates/pulsus-read/src/traces/exec.rs	1307		line	TRACE_SEARCH_MAX_BLOCK_ROWS	.set("max_block_size", TRACE_SEARCH_MAX_BLOCK_ROWS)
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2602	crates/pulsus-read/src/traces/exec.rs	2602		line	search_settings_pin_the_layer_1_budget_contract	fn search_settings_pin_the_layer_1_budget_contract() {
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:1319	crates/pulsus-read/src/traces/exec.rs	1319		line	TRACE_SEARCH_MAX_BLOCK_ROWS	.set("max_block_size", TRACE_SEARCH_MAX_BLOCK_ROWS)
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2614	crates/pulsus-read/src/traces/exec.rs	2614		line	search_settings_pin_the_layer_1_budget_contract	fn search_settings_pin_the_layer_1_budget_contract() {
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:276	crates/pulsus-read/src/traces/exec.rs	276		line	RootSummary	pub root: RootSummary,
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:770	crates/pulsus-read/src/traces/exec.rs	770		line	spans_graph_sql	let sql = super::spans::graph::spans_graph_sql(window, target, cap);
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:773	crates/pulsus-read/src/traces/exec.rs	773		line	spans_graph_sql	let sql = super::spans::graph::spans_graph_sql(window, target, cap);
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:84	crates/pulsus-read/src/traces/exec.rs	84		line	HYDRATION_BYTE_BUDGET	pub const HYDRATION_BYTE_BUDGET: usize = 256 * 1024 * 1024;
 docs/query-lowering.md	crates/pulsus-read/src/traces/spans/graph.rs:147	crates/pulsus-read/src/traces/spans/graph.rs	147		prose	spans_graph_sql	spans_graph_sql
 docs/query-lowering.md	crates/pulsus-server/src/logs_api/error.rs:147-157	crates/pulsus-server/src/logs_api/error.rs	147	157	line	X_CONTENT_TYPE_OPTIONS	pub(crate) fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [ (header::CONTENT_TYPE, "te
@@ -74,7 +74,7 @@ docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:304	crates/p
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:366	crates/pulsus-server/src/traces_api/error.rs	366		line	UNPROCESSABLE_ENTITY	ReadError::QueryTooBroad(_) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/search_response.rs:437-439	crates/pulsus-server/src/traces_api/search_response.rs	437	439	line	matched	let mut set = json!({ "matched": group.matched, "spans": spans,
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/search_response.rs:516-521	crates/pulsus-server/src/traces_api/search_response.rs	516	521	line	span_json	"matched": trace.matched, "spans": trace .spans .iter() .map(|span| span_json(span, report)) .collect::<Vec<_>>(),
-docs/query-lowering.md	exec.rs:1302-1304	crates/pulsus-read/src/traces/exec.rs	1302	1304	prose	TRACE_READ_BYTES_BUDGET	read_overflow_mode
+docs/query-lowering.md	exec.rs:1314-1316	crates/pulsus-read/src/traces/exec.rs	1314	1316	prose	TRACE_READ_BYTES_BUDGET	read_overflow_mode
 docs/query-lowering.md	logql/compile.rs:315-318	crates/pulsus-read/src/logql/compile.rs	315	318	line	residual_effect	/// The seed is always applied, so there is no residual case. fn residual_effect(&self, _s: &LqlLink, rel: Relation<Lql>
 docs/query-lowering.md	logql/predicate.rs:87-91	crates/pulsus-read/src/logql/predicate.rs	87	91	line	documentation	//! //! **It does not check its error code** (measured on this toolchain, issue //! #286): rustdoc requires the snippet
 docs/query-lowering.md	logql/predicate.rs:93	crates/pulsus-read/src/logql/predicate.rs	93		line	REMOVAL	//! **So a fence is only worth what its REMOVAL TEST is worth**, and the
@@ -251,8 +251,8 @@ docs/query-to-sql.md	sql.rs:336	crates/pulsus-read/src/logql/sql.rs	336		prose	l
 docs/query-to-sql.md	sql.rs:748	crates/pulsus-read/src/logql/sql.rs	748		prose	probe	probe
 docs/query-to-sql.md	sql.rs:788	crates/pulsus-read/src/logql/sql.rs	788		prose	streams_idx_table	ORDER
 docs/query-to-sql.md	sql.rs:950	crates/pulsus-read/src/logql/sql.rs	950		prose	streams_table	stage2
-docs/query-to-sql.md	traces/exec.rs:1264	crates/pulsus-read/src/traces/exec.rs	1264		line	dispatch	.dispatch
-docs/query-to-sql.md	traces/exec.rs:1305	crates/pulsus-read/src/traces/exec.rs	1305		line	TRACE_MAX_RESULT_BYTES	.set("max_result_bytes", TRACE_MAX_RESULT_BYTES)
+docs/query-to-sql.md	traces/exec.rs:1276	crates/pulsus-read/src/traces/exec.rs	1276		line	dispatch	.dispatch
+docs/query-to-sql.md	traces/exec.rs:1317	crates/pulsus-read/src/traces/exec.rs	1317		line	TRACE_MAX_RESULT_BYTES	.set("max_result_bytes", TRACE_MAX_RESULT_BYTES)
 docs/query-to-sql.md	traces/exec.rs:148	crates/pulsus-read/src/traces/exec.rs	148		line	TRACE_METRICS_MAX_SET_ROWS	pub const TRACE_METRICS_MAX_SET_ROWS: u64 = 1_000_000;
 docs/query-to-sql.md	traces/exec.rs:84	crates/pulsus-read/src/traces/exec.rs	84		line	HYDRATION_BYTE_BUDGET	pub const HYDRATION_BYTE_BUDGET: usize = 256 * 1024 * 1024;
 docs/query-to-sql.md	traces/exec.rs:96	crates/pulsus-read/src/traces/exec.rs	96		line	TRACE_MAX_RESULT_BYTES	pub const TRACE_MAX_RESULT_BYTES: u64 = 64 * 1024 * 1024;

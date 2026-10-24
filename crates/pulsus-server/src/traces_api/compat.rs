@@ -43,7 +43,9 @@ async fn tag_names_for(state: AppState, raw: &str) -> Result<NamesSource, ApiErr
         scope @ (TagScope::Intrinsic | TagScope::NoTags) => Ok(NamesSource::Static(scope)),
         scope => {
             let engine = engine_for(&state).await?;
-            let names = engine.list_tag_names(attribute_scope(scope)).await?;
+            let names = engine
+                .list_tag_names(attribute_scope(scope), tags::catalog_floor_ns(&state)?)
+                .await?;
             Ok(NamesSource::Catalog { names, scope })
         }
     }
@@ -77,7 +79,7 @@ impl NamesSource {
 /// contract: a range fault is a `400` on all six §4.3 routes, so the same
 /// malformed input is answered the same way everywhere. A well-formed
 /// range is still ignored here, because this route's read is the
-/// time-less catalog one.
+/// catalog one, bounded by the retention floor alone.
 async fn tag_values_v1_for(
     state: AppState,
     raw_tag: &str,
@@ -100,6 +102,7 @@ async fn tag_values_v1_for(
                 q: None,
                 start_ns: params.start_ns,
                 end_ns: params.end_ns,
+                floor_ns: tags::catalog_floor_ns(&state)?,
             },
         )
         .await?)

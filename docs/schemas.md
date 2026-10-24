@@ -49,7 +49,7 @@ CREATE TABLE metric_samples (
     unix_milli   Int64    CODEC(DoubleDelta, ZSTD(1)),
     value        Float64  CODEC(Gorilla, ZSTD(1))
 ) ENGINE = MergeTree
-PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))
+PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC')
 ORDER BY (org_id, fingerprint, unix_milli)
 TTL toDateTime(least(intDiv(unix_milli, 1000) + ({{retention_days}} * 86400), 4294967295))
 SETTINGS ttl_only_drop_parts = 1,
@@ -75,7 +75,9 @@ CREATE TABLE metric_labels (                       -- the lookup
     first_seen   SimpleAggregateFunction(min, Int64) CODEC(ZSTD(1)),
     last_seen    SimpleAggregateFunction(max, Int64) CODEC(ZSTD(1))
 ) ENGINE = AggregatingMergeTree
-ORDER BY (org_id, metric_name, fingerprint) SETTINGS allow_dimensions_outside_sorting_key = 1, min_columns_to_activate_adaptive_write_buffer = 1;
+ORDER BY (org_id, metric_name, fingerprint)
+TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
+SETTINGS allow_dimensions_outside_sorting_key = 1, min_columns_to_activate_adaptive_write_buffer = 1;
 
 CREATE TABLE metric_series (                       -- the activity
     org_id       LowCardinality(String),
@@ -86,30 +88,34 @@ CREATE TABLE metric_series (                       -- the activity
 ) ENGINE = AggregatingMergeTree
 PARTITION BY day
 ORDER BY (org_id, fingerprint)
-TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + 7) * 86400, 4294967295))
+TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + {{retention_days}}) * 86400, 4294967295))
 SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1;
 
 CREATE TABLE metric_label_index (                  -- the label index (issue #635)
     org_id       LowCardinality(String),
     key          LowCardinality(String),
     value        String   CODEC(ZSTD(1)),
-    fingerprint  UInt128  CODEC(ZSTD(1))
-) ENGINE = ReplacingMergeTree
-ORDER BY (org_id, key, value, fingerprint);
+    fingerprint  UInt128  CODEC(ZSTD(1)),
+    last_seen    Int64    CODEC(DoubleDelta, ZSTD(1))   -- the kind-2 row's unix_milli
+) ENGINE = ReplacingMergeTree(last_seen)
+ORDER BY (org_id, key, value, fingerprint)
+TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295));
 
 CREATE TABLE metric_label_values (                 -- the index's distinct values
     org_id       LowCardinality(String),
     key          LowCardinality(String),
-    value        String   CODEC(ZSTD(1))
-) ENGINE = ReplacingMergeTree
-ORDER BY (org_id, key, value);
+    value        String   CODEC(ZSTD(1)),
+    last_seen    Int64    CODEC(DoubleDelta, ZSTD(1))   -- max(unix_milli) of the block's rows
+) ENGINE = ReplacingMergeTree(last_seen)
+ORDER BY (org_id, key, value)
+TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295));
 ```
 
-- **The label index answers a read with no metric name** (issue #635). The same kind-2 row feeds `metric_label_index_mv`, one row per label of the series, and `metric_label_values_mv`, one row per key and value. A series read with no metric-name scope, no `__name__` matcher and at least one label matcher that does not match the empty string takes its IDs from the index: matchers that do not match `""` intersect their rows, the others remove theirs with `NOT IN`, and a regex runs on `metric_label_values`' distinct values, the index then reading only those values' rows. A stored empty value reads as absent, as `JSONExtractString` reads it, so the two rows that test presence carry `value != ''`. Every other read renders the lookup statement unchanged. `/labels` and `/label/{name}/values` answer a filter with no metric name as `SELECT DISTINCT` over the index. Each kind-2 row writes one index row per label: measured on a 200,000-series block, the views raise the insert's CPU from 902 to 2,571 ms and its rows written from 600,021 to 1,848,989, and the merged index stores 99.8 bytes per series.
+- **The label index answers a read with no metric name** (issue #635). The same kind-2 row feeds `metric_label_index_mv`, one row per label of the series, and `metric_label_values_mv`, one row per key and value; each carries the kind-2 row's `unix_milli` as `last_seen` (the values view the block's `max`), the version a merge keeps and the instant the row's TTL counts from. A series read with no metric-name scope, no `__name__` matcher and at least one label matcher that does not match the empty string takes its IDs from the index: matchers that do not match `""` intersect their rows, the others remove theirs with `NOT IN`, and a regex runs on `metric_label_values`' distinct values, the index then reading only those values' rows. A stored empty value reads as absent, as `JSONExtractString` reads it, so the two rows that test presence carry `value != ''`. Every other read renders the lookup statement unchanged. `/labels` and `/label/{name}/values` answer a filter with no metric name as `SELECT DISTINCT` over the index. Each kind-2 row writes one index row per label: measured on a 200,000-series block, the views raise the insert's CPU from 902 to 2,571 ms and its rows written from 600,021 to 1,848,989, and the merged index stores 99.8 bytes per series.
 
 - **The lookup answers every matcher; the activity answers the window** (issue #623). One kind-2 landing row feeds both views: `metric_labels_mv` writes the series' lookup row and `metric_series_mv` its activity row. `metric_labels` holds **one row per series**, keyed `(metric_name, fingerprint)`: a name equality, or a regex with a literal prefix, is a key range; other name regexes run once per distinct name; label matchers read the rows the name leaves, by `JSONExtractString(labels, '<key>')` (absent is `''`). `metric_series` holds one row per series per UTC day, `hours` a 24-bit mask of the hours the series had samples in, OR'd together on merge. No read joins the two: a read takes the IDs the lookup selects and keeps those the activity table finds in the window. `labels` and `metric_name` are functions of `fingerprint` that sit outside their tables' keys and are not aggregates, which 26.8 refuses unless the table sets `allow_dimensions_outside_sorting_key = 1`; both tables set it, and since one fingerprint has one label set and one name, a merge cannot pick between different values.
 - **First and last seen.** The lookup view sets both `first_seen` and `last_seen` to the kind-2 row's `unix_milli`, the hour the writer registered the series in; merges keep the `min` and the `max`. A read takes `min(first_seen)` and `max(last_seen)` by fingerprint, exact across unmerged parts and shards. No read uses them yet.
-- **Activity expires with the samples; lookup rows are kept.** `metric_series` keeps a day until its last sample has expired (`day + 1 + retention`), capped as the sample tables are. `metric_labels` has no TTL: the label sets are kept on disk permanently, by the owner's decision.
+- **Activity and lookup rows expire with the samples.** `metric_series` keeps a day until its last sample has expired (`day + 1 + retention`), capped as the sample tables are. `metric_labels`, `metric_label_index` and `metric_label_values` keep a row until the UTC day of its `last_seen` is past retention; the label sets are no longer kept permanently.
 - **Exact to the hour, no `FINAL`.** The writer registers a series once per hour it has samples in (`pulsus_model::ACTIVITY_BUCKET_MS`, fixed), skipping known `(metric_name, fingerprint, hour)` triples through an in-process LRU. A read bounds `day` by the window's first and last UTC day and tests each row's `hours` against that day's hours of the window, so an unmerged row is tested on its own and a merge changes no answer. Measured: 300 random windows of up to six days over 1,000 series active in a random tenth of 168 hours answered exactly the hourly form's sets (`activity_is_exact_to_the_hour`). The discovery endpoints built on this table (`/api/v1/series`, `/labels`, `/label/{name}/values`, docs/api.md §3.3) therefore answer the series active in the window's hours: a bounded superset of the reference's exact-sample-window set, never a subset and never a false empty.
 
 #### The four statements
@@ -393,7 +399,7 @@ CREATE TABLE metric_hist_samples (
     neg_bucket_deltas  Array(Int64)   CODEC(ZSTD(1)),
     custom_values      Array(Float64) CODEC(ZSTD(1))
 ) ENGINE = MergeTree
-PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))
+PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC')
 ORDER BY (org_id, fingerprint, unix_milli)
 TTL toDateTime(least(intDiv(unix_milli, 1000) + ({{retention_days}} * 86400), 4294967295))
 SETTINGS ttl_only_drop_parts = 1, min_columns_to_activate_adaptive_write_buffer = 1;
@@ -518,7 +524,9 @@ CREATE TABLE log_streams (
     updated_ns   Int64
 ) ENGINE = ReplacingMergeTree(updated_ns)
 PARTITION BY month
-ORDER BY (org_id, fingerprint);
+ORDER BY (org_id, fingerprint)
+TTL toDateTime(least((toUInt32(addMonths(month, 1)) * 86400) + ({{retention_days}} * 86400), 4294967295))   -- the month's end plus retention
+SETTINGS ttl_only_drop_parts = 1;
 
 CREATE TABLE log_streams_idx (
     org_id       LowCardinality(String),
@@ -528,7 +536,9 @@ CREATE TABLE log_streams_idx (
     fingerprint  UInt128
 ) ENGINE = ReplacingMergeTree
 PARTITION BY month
-ORDER BY (org_id, key, val, fingerprint);
+ORDER BY (org_id, key, val, fingerprint)
+TTL toDateTime(least((toUInt32(addMonths(month, 1)) * 86400) + ({{retention_days}} * 86400), 4294967295))   -- the month's end plus retention
+SETTINGS ttl_only_drop_parts = 1;
 -- populated by log_streams_idx_mv over log_landing's kind-1 rows:
 --   ARRAY JOIN JSONExtractKeysAndValues(labels, 'String')
 ```
@@ -545,7 +555,7 @@ CREATE TABLE log_samples (
     INDEX idx_body_ngrams body TYPE text(tokenizer = ngrams(4)),
     INDEX idx_severity severity TYPE minmax GRANULARITY 4
 ) ENGINE = MergeTree
-PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
+PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC')
 ORDER BY (org_id, service, fingerprint, timestamp_ns)
 TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
 SETTINGS ttl_only_drop_parts = 1, min_columns_to_activate_adaptive_write_buffer = 1;
@@ -560,7 +570,7 @@ CREATE TABLE log_metrics_5s (
     count    SimpleAggregateFunction(sum, UInt64), bytes    SimpleAggregateFunction(sum, UInt64),
     count_at SimpleAggregateFunction(sum, UInt64), bytes_at SimpleAggregateFunction(sum, UInt64),
     PROJECTION by_time (SELECT org_id, bucket_ns, fingerprint ORDER BY (org_id, bucket_ns, fingerprint))
-) ENGINE = AggregatingMergeTree PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))
+) ENGINE = AggregatingMergeTree PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns), 'UTC')
 ORDER BY (org_id, fingerprint, bucket_ns)
 TTL toDateTime(least(intDiv(bucket_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))   -- log_samples' retention
 SETTINGS ttl_only_drop_parts = 1, deduplicate_merge_projection_mode = 'rebuild', lightweight_mutation_projection_mode = 'rebuild';
@@ -584,7 +594,7 @@ CREATE TABLE log_patterns (
     pattern      String  CODEC(ZSTD(1)),
     count        SimpleAggregateFunction(sum, UInt64)
 ) ENGINE = AggregatingMergeTree
-PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))
+PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns), 'UTC')
 ORDER BY (org_id, fingerprint, bucket_ns, pattern)
 TTL toDateTime(least(intDiv(bucket_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
 SETTINGS ttl_only_drop_parts = 1;
@@ -818,41 +828,43 @@ the replica path in the last column.
 
 | table | engine | sorting key | partition | TTL on | replica path | statement |
 |---|---|---|---|---|---|---|
-| `trace_landing` | `MergeTree` | `(row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)` | hour of `received_ms` | `received_ms` + `{{trace_landing_retention_hours}}` h | per shard | `schema/schema.sql:414-473` |
-| `spans` | `ReplacingMergeTree` | `(intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)` | UTC day of `start_ns` | `start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:336-388` |
-| `error_spans` | `ReplacingMergeTree` | `(intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)` | UTC day of `start_ns` | `start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:860-881` |
-| `traces` | `AggregatingMergeTree` | `trace_id` | `day` | `last_start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:475-492` |
-| `resources` | `ReplacingMergeTree` | `(service, resource_id)` | `day` | end of `day` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:317-334` |
-| `tag_names` | `ReplacingMergeTree` | `(scope, key)` | none | none | cluster-wide | `schema/schema.sql:390-399` |
-| `tag_values` | `ReplacingMergeTree` | `(scope, key, value, val_type)` | none | none | cluster-wide | `schema/schema.sql:401-412` |
-| `tag_bucket_values` | `AggregatingMergeTree` | `(service, scope, key, bucket)` | UTC day of `bucket` | `bucket` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:844-858` |
-| `service_bucket_resources` | `ReplacingMergeTree` | `(service, bucket, resource_id)` | UTC day of `bucket` | `bucket` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:912-924` |
-| `service_edges` | `ReplacingMergeTree(ver)` | `(conn_type, minute, client_minute, client, server)` | `toDate(minute)` | `minute` + `{{retention_days}}` d, less 240 s where `conn_type = ''` | per shard | `schema/schema.sql:750-767` |
+| `trace_landing` | `MergeTree` | `(row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)` | hour of `received_ms` | `received_ms` + `{{trace_landing_retention_hours}}` h | per shard | `schema/schema.sql:425-484` |
+| `spans` | `ReplacingMergeTree` | `(intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)` | UTC day of `start_ns` | `start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:343-395` |
+| `error_spans` | `ReplacingMergeTree` | `(intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)` | UTC day of `start_ns` | `start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:876-897` |
+| `traces` | `AggregatingMergeTree` | `trace_id` | `day` | end of the UTC day of `last_start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:486-503` |
+| `resources` | `ReplacingMergeTree` | `(service, resource_id)` | `day` | end of `day` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:324-341` |
+| `tag_names` | `ReplacingMergeTree(last_start_ns)` | `(scope, key)` | none | end of the UTC day of `last_start_ns` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:397-408` |
+| `tag_values` | `ReplacingMergeTree(last_start_ns)` | `(scope, key, value, val_type)` | none | end of the UTC day of `last_start_ns` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:410-423` |
+| `tag_bucket_values` | `AggregatingMergeTree` | `(service, scope, key, bucket)` | UTC day of `bucket` | `bucket` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:860-874` |
+| `service_bucket_resources` | `ReplacingMergeTree` | `(service, bucket, resource_id)` | UTC day of `bucket` | `bucket` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:928-940` |
+| `service_edges` | `ReplacingMergeTree(ver)` | `(conn_type, minute, client_minute, client, server)` | `toDate(minute)` | `minute` + `{{retention_days}}` d, less 240 s where `conn_type = ''` | per shard | `schema/schema.sql:766-783` |
 
-- Every TTL is the saturating form `toDateTime(least(… , 4294967295))`, and every table that has one sets
-  `ttl_only_drop_parts = 1`.
+- Every TTL is the saturating form `toDateTime(least(… , 4294967295))`. Every table but `tag_names` and
+  `tag_values` sets `ttl_only_drop_parts = 1`; those two carry `last_start_ns`, the latest start of a span carrying
+  the row, which their views copy from `start_ns` and a merge keeps as the replacing version, and lose a row as it
+  falls due.
 - Every table but `service_edges` carries a deduplication window of `{{trace_dedup_window}}` blocks
   (`non_replicated_deduplication_window` single-node, `replicated_deduplication_window` clustered).
 - `spans` carries three bloom-filter indexes (`idx_service`, `idx_name`, `idx_resource`) and the
   `{{trace_attr_indexes}}` token, which renders one index per attribute `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` names
-  (`schema/schema.sql:378-380`; `docs/configuration.md` §3).
-- `trace_landing` sets `async_insert = 0` (`schema/schema.sql:472`).
+  (`schema/schema.sql:385-387`; `docs/configuration.md` §3).
+- `trace_landing` sets `async_insert = 0` (`schema/schema.sql:483`).
 - Clustered, `spans`, `traces` and `error_spans` have a `_dist` wrapper sharded on `cityHash64(trace_id)`
-  (`schema/schema.sql:527-529`, `:531-533`, `:883-885`); no other trace table has one (§7).
+  (`schema/schema.sql:538-540`, `:542-544`, `:899-901`); no other trace table has one (§7).
 
 **Views.** Every insert-triggered view reads `trace_landing`; the refreshable one reads `spans` and its own target.
 
 | view | target | reads | filter | statement |
 |---|---|---|---|---|
-| `spans_mv` | `spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0` | `schema/schema.sql:701-732` |
-| `error_spans_mv` | `error_spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0 AND status_code = 2` | `schema/schema.sql:887-891` |
-| `traces_mv` | `traces` (`_dist` clustered) | `trace_landing` | `row_kind = 0`, grouped by `trace_id` | `schema/schema.sql:819-842` |
-| `tag_bucket_values_mv` | `tag_bucket_values` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by bucket, service, scope, key | `schema/schema.sql:893-910` |
-| `service_bucket_resources_mv` | `service_bucket_resources` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by bucket, service, resource | `schema/schema.sql:926-930` |
-| `resources_mv` | `resources` | `trace_landing` | `row_kind = 1` | `schema/schema.sql:688-699` |
-| `tag_names_mv` | `tag_names` | `trace_landing` | `row_kind = 2` | `schema/schema.sql:734-739` |
-| `tag_values_mv` | `tag_values` | `trace_landing` | `row_kind = 3` | `schema/schema.sql:741-748` |
-| `service_edges_mv` | `service_edges`, `REFRESH EVERY 1 MINUTE APPEND` | `spans`, `service_edges` | the hold rule, `docs/api.md` §4.5 | `schema/schema.sql:769-817` |
+| `spans_mv` | `spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0` | `schema/schema.sql:715-746` |
+| `error_spans_mv` | `error_spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0 AND status_code = 2` | `schema/schema.sql:903-907` |
+| `traces_mv` | `traces` (`_dist` clustered) | `trace_landing` | `row_kind = 0`, grouped by `trace_id` | `schema/schema.sql:835-858` |
+| `tag_bucket_values_mv` | `tag_bucket_values` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by bucket, service, scope, key | `schema/schema.sql:909-926` |
+| `service_bucket_resources_mv` | `service_bucket_resources` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by bucket, service, resource | `schema/schema.sql:942-946` |
+| `resources_mv` | `resources` | `trace_landing` | `row_kind = 1` | `schema/schema.sql:702-713` |
+| `tag_names_mv` | `tag_names` | `trace_landing` | `row_kind = 2` | `schema/schema.sql:748-754` |
+| `tag_values_mv` | `tag_values` | `trace_landing` | `row_kind = 3` | `schema/schema.sql:756-764` |
+| `service_edges_mv` | `service_edges`, `REFRESH EVERY 1 MINUTE APPEND` | `spans`, `service_edges` | the hold rule, `docs/api.md` §4.5 | `schema/schema.sql:785-833` |
 
 So `row_kind` 0 is a span, 1 a resource, 2 a tag name and 3 a tag value: the four filters above are the only
 readers of each kind.

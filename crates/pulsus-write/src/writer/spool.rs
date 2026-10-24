@@ -1200,12 +1200,14 @@ mod tests {
         let tag_name = LandingTagName {
             scope: TagScope::Event,
             key: long.clone(),
+            last_start_ns: 1_700_000_000_000_000_000,
         };
         let tag_value = LandingTagValue {
             scope: TagScope::Link,
             key: "k".to_string(),
             value: long,
             val_type: "string",
+            last_start_ns: 1_700_000_000_000_000_000,
         };
 
         vec![

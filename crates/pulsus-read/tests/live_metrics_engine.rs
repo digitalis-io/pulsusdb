@@ -4344,26 +4344,31 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     // Issue #635: the label index and its values, as the two views write
     // them from the same kind-2 row.
     let mut index = Vec::new();
-    let mut pairs = std::collections::BTreeSet::new();
+    let mut pairs: std::collections::BTreeMap<(String, String), i64> = Default::default();
     for r in rows {
         let map: std::collections::BTreeMap<String, String> =
             serde_json::from_str(&r.labels).expect("canonical label JSON");
         for (key, value) in map {
-            pairs.insert((key.clone(), value.clone()));
+            let seen = pairs
+                .entry((key.clone(), value.clone()))
+                .or_insert(r.unix_milli);
+            *seen = (*seen).max(r.unix_milli);
             index.push(SeedIndexRow {
                 org_id: String::new(),
                 key,
                 value,
                 fingerprint: r.fingerprint,
+                last_seen: r.unix_milli,
             });
         }
     }
     let values: Vec<SeedValueRow> = pairs
         .into_iter()
-        .map(|(key, value)| SeedValueRow {
+        .map(|((key, value), last_seen)| SeedValueRow {
             org_id: String::new(),
             key,
             value,
+            last_seen,
         })
         .collect();
     client
@@ -4382,6 +4387,8 @@ struct SeedIndexRow {
     key: String,
     value: String,
     fingerprint: u128,
+    /// Issue #496: the time the view gives a row, its sample's `unix_milli`.
+    last_seen: i64,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -4389,6 +4396,8 @@ struct SeedValueRow {
     org_id: String,
     key: String,
     value: String,
+    /// Issue #496: the latest `unix_milli` of the pair, as the view takes it.
+    last_seen: i64,
 }
 
 /// The single-tenant deployment's tenant: no `X-Scope-OrgID`.

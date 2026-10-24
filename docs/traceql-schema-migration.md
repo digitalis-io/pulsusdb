@@ -449,7 +449,7 @@ that costs 75% of the storage.**
 And the request that reads it already computes a window and throws it away. The
 values route parses `start`/`end`, defaulting to `traceql_tag_lookback` = 24 h
 (`crates/pulsus-config/src/model.rs:553`, `crates/pulsus-server/src/traces_api/tags.rs:165-168`), then calls
-`tag_values_sql` (`crates/pulsus-read/src/traces/spans/tags.rs:94-104`), which emits no time predicate at all —
+`tag_values_sql` (`crates/pulsus-read/src/traces/spans/tags.rs:94-104` @ 9b286980), which emitted no time predicate there at all —
 because the table it reads has no time column.
 
 ### 2.4 The narrowed dropdown is a join over the window
@@ -2319,7 +2319,7 @@ Three aggregate conditions are pushed into the candidate generator today
 Losing a pushdown does not change an answer. The condition is re-evaluated over
 the hydrated spans either way; the pushed form only narrows the candidate list,
 and the plan already keeps a byte-for-byte fallback statement with nothing pushed
-(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:1250-1278`). The effect is more
+(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:1262-1290`). The effect is more
 candidates, not a different result.
 
 `by()` grouping already refuses to push whenever the generator is not
@@ -2494,7 +2494,7 @@ the migration catalogue is append-only and that the window for in-place amendmen
 > — `docs/architecture.md:96`
 
 > the trace-index scope amendment (issue #54) was the last such amendment window
-> — `docs/schemas.md:1034`
+> — `docs/schemas.md:1046`
 
 > issue #54's scope amendment of migrations 17/18 + `trace_tag_catalog_mv` was the last
 > such amendment window (task-manager ruling on #54) — `crates/pulsus-schema/src/catalog.rs:16-23`
@@ -4352,13 +4352,13 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
 
 ### `docs/schemas.md`
 
-**`:748-748`**  — this is one of the two citations round one corrected; the branch base's line holds different text, which is what made the correction necessary
+**`:758-758`**  — this is one of the two citations round one corrected; the branch base's line holds different text, which is what made the correction necessary
 
 ```markdown
   720  | `name`/`status`/`kind` | `trace_spans` time-window scan + predicate | no selective index — window-bounded, budget-limited |
 ```
 
-**`:925-925`**  — this is one of the two citations round one corrected; the branch base's line holds different text, which is what made the correction necessary
+**`:937-937`**  — this is one of the two citations round one corrected; the branch base's line holds different text, which is what made the correction necessary
 
 ```markdown
   897  **Migration amendment policy:** the migration catalog (`pulsus-schema`'s `catalog.rs`, recorded per-id in `schema_migrations`) is append-only from the first tagged release onward. In-place amendment of an already-listed migration was permitted only pre-release (no tagged release, no persistent deployments, CI databases created fresh per run); the trace-index scope amendment (issue #54) was the last such amendment window. A local database created before a pre-release amendment must be dropped and re-reconciled — the per-id checksum drift guard refuses to touch the stale tables.
@@ -4505,7 +4505,7 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
   135  pub const TAG_VALUES_MAX: usize = 1_000;
 ```
 
-**`:877-918` @ d7af710e**  (42 lines in the range; comments and blanks elided, 30 shown)
+**`:880-921` @ d7af710e**  (42 lines in the range; comments and blanks elided, 30 shown)
 
 ```rust
  1825      pub async fn list_tag_values(
@@ -4730,7 +4730,7 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
   321  /// (docs/schemas.md §2.2/§8: replaying a partially-committed block
 ```
 
-**`:395-462`**  (68 lines in the range; comments and blanks elided, 30 shown)
+**`:401-468`**  (68 lines in the range; comments and blanks elided, 30 shown)
 
 ```rust
   367  async fn finish_generation<R>(
@@ -4924,25 +4924,25 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
   380  ///
 ```
 
-**`:425-425`**
+**`:431-431`**
 
 ```rust
   397  pub fn event_set_sql(
 ```
 
-**`:456-456`**
+**`:462-462`**
 
 ```rust
   428  pub fn root_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
 ```
 
-**`:496-496`**
+**`:502-502`**
 
 ```rust
   468  pub fn trace_ctx_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
 ```
 
-**`:520-520`**
+**`:526-526`**
 
 ```rust
   492  pub fn child_count_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {

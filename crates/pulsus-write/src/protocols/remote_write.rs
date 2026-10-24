@@ -1836,7 +1836,7 @@ fn parse_time_series(
 
     for sample in &ts.samples {
         // `metric_samples` partitions on
-        // `toDate(fromUnixTimestamp64Milli(unix_milli))` (issue #126,
+        // `toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC')` (issue #126,
         // mirroring #8's log/trace-path fix) and its delete-TTL evaluates
         // `intDiv(unix_milli, 1000)` in the 32-bit `DateTime` domain
         // (issue #137, mirroring #131's trace fix): a sample whose UTC day

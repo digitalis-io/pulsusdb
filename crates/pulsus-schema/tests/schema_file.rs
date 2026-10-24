@@ -1160,13 +1160,14 @@ fn metric_series_is_one_row_per_series_day() {
     assert!(!view.contains("labels"), "{view}");
 }
 
-/// **K1 (issue #623): `metric_labels` is the lookup, one row per series,
-/// kept for good**, keyed `(metric_name, fingerprint)` so a named matcher is
-/// a key range, with the hours it was first and last registered folded by
-/// `min` and `max`. An aggregating engine, no TTL, filled by a view from the
-/// kind-2 rows, with a routing wrapper and a per-shard replica set.
+/// **K1 (issue #623): `metric_labels` is the lookup, one row per series**,
+/// keyed `(metric_name, fingerprint)` so a named matcher is a key range, with
+/// the hours it was first and last registered folded by `min` and `max`. An
+/// aggregating engine filled by a view from the kind-2 rows, with a routing
+/// wrapper and a per-shard replica set. Its expiry (issue #496) is
+/// `every_table_expires_exactly_as_documented`'s.
 #[test]
-fn metric_labels_holds_one_label_row_per_series_and_never_expires() {
+fn metric_labels_holds_one_label_row_per_series() {
     assert_eq!(
         pulsus_schema::table_column_names("metric_labels").expect("in the file"),
         vec![
@@ -1193,13 +1194,6 @@ fn metric_labels_holds_one_label_row_per_series_and_never_expires() {
         line_of(&single_create, "ORDER BY"),
         "ORDER BY (org_id, metric_name, fingerprint)"
     );
-    for ctx in [single(), clustered()] {
-        let create = create_of(&ctx, "metric_labels");
-        assert!(
-            !create.contains("TTL"),
-            "label sets are never expired: {create}"
-        );
-    }
     let clustered_create = create_of(&clustered(), "metric_labels");
     assert!(
         clustered_create.contains(
@@ -1764,8 +1758,22 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
         true,
         None,
     ),
-    ("log_streams", None, false, None),
-    ("log_streams_idx", None, false, None),
+    (
+        "log_streams",
+        Some(
+            "TTL toDateTime(least((toUInt32(addMonths(month, 1)) * 86400) + (17 * 86400), 4294967295))",
+        ),
+        true,
+        None,
+    ),
+    (
+        "log_streams_idx",
+        Some(
+            "TTL toDateTime(least((toUInt32(addMonths(month, 1)) * 86400) + (17 * 86400), 4294967295))",
+        ),
+        true,
+        None,
+    ),
     (
         "metric_exemplars",
         Some("TTL toDateTime(least(intDiv(unix_milli, 1000) + (17 * 86400), 4294967295))"),
@@ -1778,9 +1786,30 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
         true,
         None,
     ),
-    ("metric_label_index", None, false, None),
-    ("metric_label_values", None, false, None),
-    ("metric_labels", None, false, None),
+    (
+        "metric_label_index",
+        Some(
+            "TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + (17 * 86400), 4294967295))",
+        ),
+        false,
+        None,
+    ),
+    (
+        "metric_label_values",
+        Some(
+            "TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + (17 * 86400), 4294967295))",
+        ),
+        false,
+        None,
+    ),
+    (
+        "metric_labels",
+        Some(
+            "TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + (17 * 86400), 4294967295))",
+        ),
+        false,
+        None,
+    ),
     (
         "metric_landing",
         Some("TTL toDateTime(least(intDiv(received_ms, 1000) + (3 * 3600), 4294967295))"),
@@ -1847,8 +1876,22 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
         true,
         None,
     ),
-    ("tag_names", None, false, None),
-    ("tag_values", None, false, None),
+    (
+        "tag_names",
+        Some(
+            "TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + (17 * 86400), 4294967295))",
+        ),
+        false,
+        None,
+    ),
+    (
+        "tag_values",
+        Some(
+            "TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + (17 * 86400), 4294967295))",
+        ),
+        false,
+        None,
+    ),
     (
         "trace_landing",
         Some("TTL toDateTime(least(intDiv(received_ms, 1000) + (5 * 3600), 4294967295))"),
@@ -1857,11 +1900,48 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
     ),
     (
         "traces",
-        Some("TTL toDateTime(least(intDiv(last_start_ns, 1000000000) + (17 * 86400), 4294967295))"),
+        Some(
+            "TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + (17 * 86400), 4294967295))",
+        ),
         true,
         None,
     ),
 ];
+
+/// Issue #496: every day partition is a UTC day. A lookup row is due at
+/// the end of the UTC day its latest instant falls in, plus the retention,
+/// which outlives a part only when the part's day is a UTC day too. A
+/// `Date` or `DateTime('UTC')` column is one already; a conversion from an
+/// epoch integer names `'UTC'`, or it takes the server's time zone.
+#[test]
+fn every_day_partition_is_a_utc_day() {
+    for base in [single(), clustered()] {
+        let mut by_form: Vec<String> = Vec::new();
+        for stmt in rendered_statements(&base) {
+            for line in stmt.lines().filter(|l| l.starts_with("PARTITION BY ")) {
+                by_form.push(line.to_string());
+            }
+        }
+        by_form.sort();
+        by_form.dedup();
+        assert_eq!(
+            by_form,
+            vec![
+                "PARTITION BY day",
+                "PARTITION BY month",
+                "PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC')",
+                "PARTITION BY toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')",
+                "PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns), 'UTC')",
+                "PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')",
+                "PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC')",
+                "PARTITION BY toDate(minute)",
+                "PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))",
+            ],
+            "{:?}",
+            base.cluster
+        );
+    }
+}
 
 /// Issue #497: every table's TTL line, part-drop setting and TTL merge
 /// interval are exactly [`EXPIRY`]'s, in both variants, and the database

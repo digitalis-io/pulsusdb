@@ -808,6 +808,77 @@ mod tests {
         assert_eq!(out.spans[0].scope_version, "1.0.0");
     }
 
+    /// Issue #496: each catalog entry carries the latest start of a landed
+    /// span that carries it. Two spans under one resource and one scope,
+    /// starting 100 s and 300 s in: `k` is on both with different values,
+    /// `s=x` on both, the resource's and the scope's attributes on both. A
+    /// third span starting later is refused (no span id), so it raises
+    /// nothing.
+    #[test]
+    fn each_catalog_entry_carries_the_latest_start_of_a_span_that_carries_it() {
+        const T0: u64 = 1_700_000_000_000_000_000;
+        let at = |id: u8, offset_s: u64, value: &str| {
+            let mut s = span(vec![1; 16], vec![id; 8]);
+            s.start_time_unix_nano = T0 + offset_s * 1_000_000_000;
+            s.end_time_unix_nano = s.start_time_unix_nano + 1_000_000;
+            s.attributes = vec![
+                kv("k", Value::StringValue(value.to_string())),
+                kv("s", Value::StringValue("x".to_string())),
+            ];
+            s
+        };
+        let mut refused = at(9, 900, "late");
+        refused.span_id = vec![];
+        let resource = Resource {
+            attributes: vec![
+                kv("service.name", Value::StringValue("checkout".to_string())),
+                kv("r", Value::StringValue("1".to_string())),
+            ],
+            dropped_attributes_count: 0,
+            ..Default::default()
+        };
+        let scope = InstrumentationScope {
+            name: "sc".to_string(),
+            attributes: vec![kv("i", Value::StringValue("y".to_string()))],
+            ..Default::default()
+        };
+        let out = parse_landing(&request_with(
+            Some(resource),
+            Some(scope),
+            vec![at(2, 100, "a"), at(3, 300, "b"), refused],
+        ))
+        .expect("within the expansion budget");
+        assert_eq!(out.spans.len(), 2, "the third span is refused");
+        let ns = |offset_s: i64| T0 as i64 + offset_s * 1_000_000_000;
+        let names: Vec<(TagScope, &str, i64)> = out
+            .tag_names
+            .iter()
+            .map(|t| (t.scope, t.key.as_str(), t.last_start_ns))
+            .collect();
+        for want in [
+            (TagScope::Span, "k", ns(300)),
+            (TagScope::Span, "s", ns(300)),
+            (TagScope::Resource, "r", ns(300)),
+            (TagScope::Instrumentation, "i", ns(300)),
+        ] {
+            assert!(names.contains(&want), "{want:?} in {names:?}");
+        }
+        let values: Vec<(&str, &str, i64)> = out
+            .tag_values
+            .iter()
+            .map(|t| (t.key.as_str(), t.value.as_str(), t.last_start_ns))
+            .collect();
+        for want in [
+            ("k", "a", ns(100)),
+            ("k", "b", ns(300)),
+            ("s", "x", ns(300)),
+            ("r", "1", ns(300)),
+        ] {
+            assert!(values.contains(&want), "{want:?} in {values:?}");
+        }
+        assert!(!values.iter().any(|v| v.1 == "late"), "{values:?}");
+    }
+
     /// A span whose `ScopeSpans` carries no `scope` yields no
     /// instrumentation catalog rows and empty `scope_name`/`scope_version`.
     #[test]
@@ -1674,7 +1745,7 @@ struct LandedAttrs {
 ///
 /// **A stage is held back until a span has passed every check.** A
 /// resource's, a scope's and a span's entries each get their own, and
-/// [`TagStage::absorb`] moves them into the push's accepted sets at the one
+/// [`AcceptedTags::absorb`] moves them into the push's accepted sets at the one
 /// point a span is known to land. Writing them straight into the accepted
 /// sets leaves `tag_names` and `tag_values` rows behind for a push that
 /// stores no span — rows for data the store does not hold.
@@ -1684,19 +1755,33 @@ struct TagStage {
     values: BTreeSet<LandingTagValue>,
 }
 
-impl TagStage {
-    /// Takes `staged`'s entries into this stage, which is the push's
-    /// accepted set. Both sides are sets, so a resource's or a scope's
-    /// entries taken once per landed span land once.
+/// The push's accepted catalog entries, each with the latest start of a
+/// landed span that carries it (issue #496): the time the catalog row is
+/// kept from, so a listed tag always has a span within retention.
+#[derive(Default)]
+struct AcceptedTags {
+    names: BTreeMap<LandingTagName, i64>,
+    values: BTreeMap<LandingTagValue, i64>,
+}
+
+impl AcceptedTags {
+    /// Takes `staged`'s entries for a span that landed starting at
+    /// `start_ns`, keeping each entry's latest start. A resource's or a
+    /// scope's entries taken once per landed span keep the latest of them.
     ///
     /// **Not named `merge`.** `pulsus-server`'s route-inventory guard pins
     /// the whole body of every function whose text contains a `.merge(`
-    /// token, and the one call site below is in a decode function that
-    /// composes no routes: pinning it would put that body in the route
-    /// snapshot and make every later edit to it a re-derivation there.
-    fn absorb(&mut self, staged: &TagStage) {
-        self.names.extend(staged.names.iter().cloned());
-        self.values.extend(staged.values.iter().cloned());
+    /// token, and the call sites are in a decode function that composes no
+    /// routes.
+    fn absorb(&mut self, staged: &TagStage, start_ns: i64) {
+        for name in &staged.names {
+            let at = self.names.entry(name.clone()).or_insert(start_ns);
+            *at = (*at).max(start_ns);
+        }
+        for value in &staged.values {
+            let at = self.values.entry(value.clone()).or_insert(start_ns);
+            *at = (*at).max(start_ns);
+        }
     }
 }
 
@@ -1752,6 +1837,7 @@ fn land_attrs(
         names.insert(LandingTagName {
             scope,
             key: kv.key.clone(),
+            last_start_ns: 0,
         });
         match landed {
             LandedValue::One(value) => {
@@ -1814,6 +1900,7 @@ fn record_values(
             key: key.to_string(),
             value: scalar.render(),
             val_type: scalar.val_type(),
+            last_start_ns: 0,
         });
     };
     match value {
@@ -1923,7 +2010,7 @@ pub fn parse_landing(
     // The catalog entries of the spans that landed. Every entry reaches it
     // through a [`TagStage`] merged at the one point below where a span has
     // passed every check, the UTC-day check included.
-    let mut accepted = TagStage::default();
+    let mut accepted = AcceptedTags::default();
     // One row per distinct `(resource_id, day)` in the push. The day comes
     // from the spans that resource carried, so a push whose spans straddle
     // midnight emits two rows for one resource.
@@ -2042,9 +2129,9 @@ pub fn parse_landing(
                 // scope's are merged, and its resource row is emitted. A
                 // span refused above — by its ids, its timestamp or the day
                 // check — reaches neither.
-                accepted.absorb(&resource_stage);
-                accepted.absorb(&scope_stage);
-                accepted.absorb(&span_stage);
+                accepted.absorb(&resource_stage, landed.start_ns);
+                accepted.absorb(&scope_stage, landed.start_ns);
+                accepted.absorb(&span_stage, landed.start_ns);
                 resources
                     .entry((resource_id, day))
                     .or_insert_with(|| LandingResource {
@@ -2065,8 +2152,22 @@ pub fn parse_landing(
     }
 
     out.resources = resources.into_values().collect();
-    out.tag_names = accepted.names.into_iter().collect();
-    out.tag_values = accepted.values.into_iter().collect();
+    out.tag_names = accepted
+        .names
+        .into_iter()
+        .map(|(name, at)| LandingTagName {
+            last_start_ns: at,
+            ..name
+        })
+        .collect();
+    out.tag_values = accepted
+        .values
+        .into_iter()
+        .map(|(value, at)| LandingTagValue {
+            last_start_ns: at,
+            ..value
+        })
+        .collect();
     Ok(out)
 }
 

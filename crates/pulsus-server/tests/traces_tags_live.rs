@@ -621,7 +621,8 @@ async fn tag_discovery_against_real_clickhouse() {
     );
 
     // -- scope= filters; start/end are accepted and IGNORED (the catalog
-    // is time-less — a window excluding every span changes nothing). -----
+    // read is bounded by the retention floor alone — a window excluding
+    // every span changes nothing). -------------------------------------
     let ctx = "tags scope=resource";
     let json = get_json(
         port,
@@ -1965,8 +1966,8 @@ async fn trace_tag_values_memory_breach_is_422() {
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.tag_values (scope, key, value, val_type) \
-                 SELECT 'span', 'bulk.id', concat('v', leftPad(toString(number), 9, '0')), 'string' \
+                "INSERT INTO {db}.tag_values (scope, key, value, val_type, last_start_ns) \
+                 SELECT 'span', 'bulk.id', concat('v', leftPad(toString(number), 9, '0')), 'string', toUnixTimestamp64Nano(now64(9)) \
                  FROM numbers({MEM_CATALOG_ROWS})"
             ),
             &QuerySettings::new(),
@@ -2029,8 +2030,8 @@ async fn the_default_trace_memory_ceiling_does_not_refuse_a_catalog_read() {
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.tag_values (scope, key, value, val_type) \
-                 SELECT 'span', 'bulk.id', concat('v', leftPad(toString(number), 9, '0')), 'string' \
+                "INSERT INTO {db}.tag_values (scope, key, value, val_type, last_start_ns) \
+                 SELECT 'span', 'bulk.id', concat('v', leftPad(toString(number), 9, '0')), 'string', toUnixTimestamp64Nano(now64(9)) \
                  FROM numbers({MEM_CATALOG_ROWS})"
             ),
             &QuerySettings::new(),
@@ -3132,4 +3133,109 @@ fn now_unix_s() -> i64 {
             .as_secs(),
     )
     .expect("fits i64")
+}
+
+/// Issue #496: tag discovery lists only what a span within retention
+/// carries. The schema keeps a hundred years and its database then states
+/// one day, so storage holds both spans and the floor decides. In one push:
+/// a span 30 s past the cutoff carrying `old496` and `k496=out`, and one
+/// 30 s inside it carrying `k496=in`. Each of the six catalog routes lists
+/// `k496` with the value `in` only, and never `old496`.
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_lists_only_tags_a_span_within_retention_carries() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_244;
+    let db = &pulsus_testkit::test_db("pulsus_traces_tags_it_floor");
+    drop_db(db).await;
+    live_db::build_schema(db).await;
+    live_db::state_retention(db, 1).await;
+    let _guard = spawn_ready(port, db);
+
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let out_ns = (now_s - 86_400 - 30) * 1_000_000_000;
+    let in_ns = (now_s - 86_400 + 30) * 1_000_000_000;
+    ingest(
+        port,
+        vec![
+            span(
+                1,
+                1,
+                "op",
+                out_ns,
+                vec![kv_str("old496", "gone"), kv_str("k496", "out")],
+            ),
+            span(2, 1, "op", in_ns, vec![kv_str("k496", "in")]),
+        ],
+        vec![kv_str("service.name", "svc496")],
+        "retention floor seed",
+    );
+
+    // All six mounted catalog routes (`traces_api/mod.rs`): three names
+    // routes and three values routes, each asked for the kept tag and the
+    // expired one.
+    let mut seen = 0usize;
+    let mut names: Vec<(&str, Vec<String>)> = Vec::new();
+    for path in [
+        "/api/traces/v1/tags?scope=span",
+        "/api/v2/search/tags?scope=span",
+    ] {
+        let tags = scopes_of(&get_json(port, path, path, &mut seen), path)
+            .into_iter()
+            .filter(|(s, _)| s == "span")
+            .flat_map(|(_, t)| t)
+            .collect();
+        names.push((path, tags));
+    }
+    let flat = get_json(port, "/api/search/tags", "v1 names", &mut seen);
+    names.push((
+        "/api/search/tags",
+        flat["tagNames"]
+            .as_array()
+            .unwrap_or_else(|| panic!("v1 names: tagNames must be an array, body {flat}"))
+            .iter()
+            .map(|t| t.as_str().expect("tag").to_string())
+            .collect(),
+    ));
+    let mut values: Vec<(String, Vec<String>)> = Vec::new();
+    for tag in ["span.k496", "span.old496"] {
+        for path in [
+            format!("/api/traces/v1/tag/{tag}/values"),
+            format!("/api/v2/search/tag/{tag}/values"),
+        ] {
+            let typed = values_of(&get_json(port, &path, &path, &mut seen), &path);
+            let listed = typed.into_iter().map(|(t, v)| format!("{t}:{v}")).collect();
+            values.push((path, listed));
+        }
+        let path = format!("/api/search/tag/{tag}/values");
+        let json = get_json(port, &path, &path, &mut seen);
+        let listed = json["tagValues"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{path}: tagValues must be an array, body {json}"))
+            .iter()
+            .map(|v| format!("string:{}", v.as_str().expect("bare string")))
+            .collect();
+        values.push((path, listed));
+    }
+    drop_db(db).await;
+
+    assert_eq!(names.len(), 3);
+    for (path, tags) in &names {
+        assert!(tags.iter().any(|t| t == "k496"), "{path}: {tags:?}");
+        assert!(!tags.iter().any(|t| t == "old496"), "{path}: {tags:?}");
+    }
+    assert_eq!(values.len(), 6);
+    for (path, listed) in &values {
+        let want: Vec<String> = if path.contains("span.k496") {
+            vec!["string:in".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(listed, &want, "{path}");
+    }
 }

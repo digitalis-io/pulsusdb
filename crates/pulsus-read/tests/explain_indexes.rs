@@ -1654,7 +1654,7 @@ async fn detected_labels_aggregation_prunes_on_the_month_partition() {
 
 /// Issue #399 AC5 — the activity semi-join's own scan prunes the rollup
 /// on `bucket_ns`, which is the partition key's only input column
-/// (`PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))`), so a
+/// (`PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns), 'UTC')`), so a
 /// window narrower than the corpus reads strictly fewer parts. The
 /// `Parts: m/n` check is the one that carries the claim: `index_usage`
 /// deliberately drops those counts, so a `Condition:` that pruned nothing

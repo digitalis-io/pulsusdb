@@ -54,6 +54,9 @@ static TEST_DB_TRACE_LANDING: pulsus_testkit::TestDb =
 // Issue #497: the retention every replica states.
 static TEST_DB_RETENTION: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_retention");
+// Issue #496: the newest instant survives a late row on every replica.
+static TEST_DB_LATE_ROW: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_late_row");
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -94,6 +97,16 @@ fn shard1_config() -> ChConnConfig {
         "PULSUS_TEST_CH_SHARD1_HOST",
         "172.28.0.11",
         "PULSUS_TEST_CH_SHARD1_HTTP_PORT",
+        8123,
+    )
+}
+
+/// Shard 1's second replica.
+fn shard1b_config() -> ChConnConfig {
+    shard_config(
+        "PULSUS_TEST_CH_SHARD1B_HOST",
+        "172.28.0.13",
+        "PULSUS_TEST_CH_SHARD1B_HTTP_PORT",
         8123,
     )
 }
@@ -407,6 +420,8 @@ struct TraceTagRow {
     key: String,
     value: String,
     val_type: String,
+    /// Issue #496: the latest start of a span carrying the value.
+    last_start_ns: i64,
 }
 
 /// Reads `table` `FINAL` (bookkeeping/catalog tables are `ReplacingMergeTree`
@@ -524,8 +539,9 @@ async fn the_catalog_tables_are_identical_on_every_shard() {
         .execute(
             &format!(
                 "INSERT INTO {TEST_DB_CATALOG}.tag_values \
-                     (scope, key, value, val_type) \
-                 VALUES ('span', 'http.status_code', '500', 'int')"
+                     (scope, key, value, val_type, last_start_ns) \
+                 VALUES ('span', 'http.status_code', '500', 'int', \
+                         toUnixTimestamp64Nano(now64(9)))"
             ),
             &QuerySettings::new(),
             Idempotency::NonIdempotent,
@@ -1132,18 +1148,20 @@ fn trace_landing_insert_sql(
             i + 1,
         ));
     }
-    rows.push(
+    // Issue #496: a catalog row carries the latest span start in its
+    // `start_ns`; at `0` the catalog's TTL drops it at once.
+    rows.push(format!(
         "(1, 2, unhex('00000000000000000000000000000000'), unhex('0000000000000000'), \
-         unhex('0000000000000000'), 0, 0, 0, '', 0, '', '{}', toDate(0), 'span', \
+         unhex('0000000000000000'), {t0}, 0, 0, '', 0, '', '{{}}', toDate(0), 'span', \
          'http.route', '', '', '')"
-            .to_string(),
-    );
-    rows.push(
+    ));
+    // Issue #496: a catalog row carries the latest span start in its
+    // `start_ns`; at `0` the catalog's TTL drops it at once.
+    rows.push(format!(
         "(1, 3, unhex('00000000000000000000000000000000'), unhex('0000000000000000'), \
-         unhex('0000000000000000'), 0, 0, 0, '', 0, '', '{}', toDate(0), 'span', \
+         unhex('0000000000000000'), {t0}, 0, 0, '', 0, '', '{{}}', toDate(0), 'span', \
          'http.route', '/api', 'string', '')"
-            .to_string(),
-    );
+    ));
     format!(
         "INSERT INTO {db}.trace_landing (received_ms, row_kind, trace_id, span_id, \
          parent_span_id, start_ns, duration_ns, resource_id, name, kind, service, attrs, day, \
@@ -1661,8 +1679,8 @@ async fn a_hostile_profile_cannot_move_rows_off_their_shard() {
 ///
 /// All three, not two: a version of this case that checked `resources` and
 /// `tag_values` only would pass a per-shard `tag_names` and lose **name
-/// discovery** on every other shard — the one catalog read the API makes
-/// time-less and unconditional.
+/// discovery** on every other shard — the one catalog read the API
+/// leaves bounded by the retention floor alone.
 ///
 /// The `SYSTEM SYNC REPLICA` is the assertion's precondition, not a
 /// convenience: the reach is eventual on the shipped consistency defaults,
@@ -1812,4 +1830,126 @@ async fn every_replica_must_state_the_same_retention() {
     }
 
     drop_cluster_db(&shard1, db).await;
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct IntRow {
+    v: i64,
+}
+
+async fn ints_on(client: &ChClient, sql: &str) -> Vec<i64> {
+    let mut stream = client
+        .query_stream::<IntRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("read failed: {e}\nSQL:\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode IntRow").v);
+    }
+    out
+}
+
+/// Issue #496: a late row does not move a catalog's instant back, on any
+/// replica. Pushed to shard 1, newest first: a kind-2 `metric_landing` row
+/// and kind-2 and kind-3 `trace_landing` rows of now, then in a second
+/// insert the same keys an hour ago. After a final merge that every replica
+/// waits for, each replica holding the table answers one row per key,
+/// carrying now, read without `max()` or `FINAL`: shard 1's two replicas for
+/// the per-shard metric tables, and those and shard 2 for the cluster-wide
+/// tag tables.
+#[tokio::test]
+async fn a_late_row_keeps_the_newest_instant_on_every_replica() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard1b = ChClient::new(shard1b_config())
+        .await
+        .expect("connect shard1b");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+    let db = &TEST_DB_LATE_ROW;
+    fresh_cluster_db(&shard1, db).await;
+
+    let now_ns = cluster_now_ns();
+    let now_ms = now_ns / 1_000_000;
+    let (late_ms, late_ns) = (now_ms - 3_600_000, now_ns - 3_600_000_000_000);
+    for (ms, ns) in [(now_ms, now_ns), (late_ms, late_ns)] {
+        exec_on(
+            &shard1,
+            &format!(
+                "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels) \
+                 VALUES ('', {now_ms}, 2, 'v', 9, {ms}, '{{\"job\":\"late\"}}')"
+            ),
+        )
+        .await;
+        exec_on(
+            &shard1,
+            &format!(
+                "INSERT INTO {db}.trace_landing (received_ms, row_kind, start_ns, tag_scope, tag_key, tag_value, tag_type) \
+                 VALUES ({now_ms}, 2, {ns}, 'span', 'late', '', ''), ({now_ms}, 3, {ns}, 'span', 'late', 'v', 'string')"
+            ),
+        )
+        .await;
+    }
+
+    let tables: [(&str, &str, &str, bool, i64); 5] = [
+        (
+            "metric_labels",
+            "last_seen",
+            "metric_name = 'v'",
+            false,
+            now_ms,
+        ),
+        (
+            "metric_label_index",
+            "last_seen",
+            "key = 'job' AND value = 'late'",
+            false,
+            now_ms,
+        ),
+        (
+            "metric_label_values",
+            "last_seen",
+            "key = 'job' AND value = 'late'",
+            false,
+            now_ms,
+        ),
+        ("tag_names", "last_start_ns", "key = 'late'", true, now_ns),
+        ("tag_values", "last_start_ns", "key = 'late'", true, now_ns),
+    ];
+    let mut got = Vec::new();
+    let mut want = Vec::new();
+    for (table, column, filter, everywhere, newest) in tables {
+        let replicas: Vec<(&str, &ChClient)> = if everywhere {
+            vec![
+                ("shard1", &shard1),
+                ("shard1b", &shard1b),
+                ("shard2", &shard2),
+            ]
+        } else {
+            vec![("shard1", &shard1), ("shard1b", &shard1b)]
+        };
+        for (_, r) in &replicas {
+            exec_on(r, &format!("SYSTEM SYNC REPLICA {db}.{table}")).await;
+        }
+        exec_on(
+            &shard1,
+            &format!("OPTIMIZE TABLE {db}.{table} FINAL SETTINGS alter_sync = 2"),
+        )
+        .await;
+        for (name, r) in &replicas {
+            exec_on(r, &format!("SYSTEM SYNC REPLICA {db}.{table}")).await;
+            let sql = format!("SELECT toInt64({column}) AS v FROM {db}.{table} WHERE {filter}");
+            got.push((table, *name, ints_on(r, &sql).await));
+            want.push((table, *name, vec![newest]));
+        }
+    }
+    drop_cluster_db(&shard1, db).await;
+    assert_eq!(
+        got, want,
+        "one row per key on every replica, carrying the newest instant"
+    );
 }

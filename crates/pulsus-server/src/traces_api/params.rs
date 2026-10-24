@@ -777,8 +777,9 @@ pub(crate) enum TagsParamError {
     )]
     UnsupportedScope(String),
     /// A range FAULT on a names route (issue #478). A well-formed range
-    /// is still accepted and ignored there — the catalog has no timestamp
-    /// column — so only the fault shapes reach this.
+    /// is still accepted and ignored there — the catalog read is bounded
+    /// by the retention floor alone, not by the request — so only the
+    /// fault shapes reach this.
     #[error(transparent)]
     Range(#[from] RangeParamError),
 }
@@ -930,9 +931,8 @@ pub(crate) enum TagScope {
 
 /// The parsed `/api/traces/v1/tags` request: only `scope` filters.
 /// `start`/`end` are accepted for client compatibility and IGNORED —
-/// `tag_names` has no timestamp column, so tag discovery is
-/// time-less by contract (docs/api.md §4.3, issue #58 frozen-schema
-/// resolution). `limit` is read by [`parse_tag_limit`] and cuts the
+/// the `tag_names` read is bounded by the retention floor alone
+/// (docs/api.md §4.3, issue #496). `limit` is read by [`parse_tag_limit`] and cuts the
 /// rendered lists; any other parameter is ignored.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TagsParams {
@@ -954,9 +954,8 @@ pub(crate) fn parse_tags_params(raw: &str) -> Result<TagsParams, TagsParamError>
     let pairs = parse_pairs(raw);
     // Issue #478: a range FAULT is rejected here too, so the six §4.3
     // routes answer the same malformed input the same way. A WELL-FORMED
-    // range is still accepted and ignored — the catalog has no timestamp
-    // column, which is the documented time-less contract and the coupling
-    // this issue keeps open.
+    // range is still accepted and ignored — the catalog read is bounded by
+    // the retention floor alone (issue #496), not by the request.
     parse_range_params(&pairs)?;
     let scope = match get(&pairs, "scope") {
         None | Some("" | "none") => TagScope::All,
@@ -2233,8 +2232,8 @@ mod tests {
 
     #[test]
     fn tags_start_end_are_accepted_and_ignored_not_errors() {
-        // The catalog is time-less: the bounds parse away without effect
-        // (docs/api.md §4.3).
+        // The bounds parse away without effect: the catalog read is bounded
+        // by the retention floor alone (docs/api.md §4.3).
         let p = parse_tags_params("scope=span&start=100&end=200").unwrap();
         assert_eq!(p.scope, TagScope::Attribute("span"));
     }
