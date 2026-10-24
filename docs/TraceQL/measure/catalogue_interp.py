@@ -708,15 +708,32 @@ class Interp:
             v = {'min': min(vals), 'max': max(vals), 'sum': sum(vals),
                  'avg': sum(vals) // len(vals)}[st['op']]
             return v, arm('string', go_duration(v))
-        got = [self.attr(r, arg['scope'], arg['key']) for r in spans]
-        got = [g for g in got if g is not None and g[0] in ('i', 'd')]
+        held = [g for g in (self.attr(r, arg['scope'], arg['key']) for r in spans) if g is not None]
+        got = [g for g in held if g[0] in ('i', 'd')]
         if not got: return None
+        # issue #493 part 2: a string or a boolean ranks above every number,
+        # so beside one the maximum is not a number; an int is exact, and a
+        # tie between an int and a double is the int
+        if st['op'] == 'max' and any(g[0] in ('s', 'b') for g in held): return None
         if st['op'] in ('min', 'max'):
-            t, v = (min if st['op'] == 'min' else max)(got, key=lambda g: float(g[1]))
+            # a NaN ranks above every number
+            nan = [g for g in got if g[0] == 'd' and math.isnan(float(g[1]))]
+            num = [g for g in got if g not in nan]
+            if st['op'] == 'max' and nan or not num: return float('nan'), arm('double', float('nan'))
+            rank = (lambda g: (g[1], g[0] == 'i')) if st['op'] == 'max' else (lambda g: (g[1], g[0] != 'i'))
+            t, v = (min if st['op'] == 'min' else max)(num, key=rank)
             return v, arm(VALUE_TYPE[t], v)
-        total = sum(float(g[1]) for g in got)
+        ints = sum(int(g[1]) for g in got if g[0] == 'i')
+        if all(g[0] == 'i' for g in got) and st['op'] == 'sum':
+            # an integer sum wraps to 64 bits; the mean reads the unwrapped total
+            wrapped = (ints + 2**63) % 2**64 - 2**63
+            return wrapped, arm('int', wrapped)
+        floats = -0.0
+        for g in got:
+            if g[0] == 'd': floats += float(g[1])
+        total = floats if all(g[0] == 'd' for g in got) else float(ints) + floats
         if st['op'] == 'sum':
-            return total, (arm('int', int(total)) if all(g[0] == 'i' for g in got) else arm('double', total))
+            return total, arm('double', total)
         return total / len(got), arm('double', total / len(got))
 
     def pipeline_fold(self, q, rs):

@@ -50,9 +50,11 @@ pub struct Key {
 pub enum AggArg {
     Count,
     Duration,
-    /// `v` a `Nullable(Float64)` over the span row, `kind` its stored type.
+    /// An attribute: `text` its stored value's text over the span row,
+    /// `kind` its stored type (issue #493 part 2: the number is read in
+    /// that type, never parsed from a string).
     Attr {
-        v: String,
+        text: String,
         kind: String,
     },
 }
@@ -66,6 +68,9 @@ pub struct Agg {
     pub sql_op: &'static str,
     /// `toFloat64('<threshold>')`.
     pub threshold: String,
+    /// The threshold as the predicate renders a number literal, exact to
+    /// its digits: an attribute aggregate compares against it.
+    pub literal: String,
 }
 
 /// A query's `|` stages, compiled.
@@ -220,9 +225,16 @@ impl Fold {
             ));
         }
         for (i, a) in self.aggs.iter().enumerate() {
-            if let AggArg::Attr { v, kind } = &a.arg {
-                out.push((format!("a{i}"), v.clone()));
-                out.push((format!("ak{i}"), kind.clone()));
+            if let AggArg::Attr { text, kind } = &a.arg {
+                out.push((
+                    format!("ai{i}"),
+                    format!("if({kind} = 'Int64', toInt64OrNull({text}), NULL)"),
+                ));
+                out.push((
+                    format!("af{i}"),
+                    format!("if({kind} = 'Float64', toFloat64OrNull({text}), NULL)"),
+                ));
+                out.push((format!("ao{i}"), format!("{kind} IN ('String', 'Bool')")));
             }
         }
         out
@@ -369,14 +381,15 @@ impl Fold {
                             )
                         }
                     };
+                    let ai = src.col(&format!("ai{i}"));
+                    let af = src.col(&format!("af{i}"));
                     let cc = match &a.arg {
                         AggArg::Attr { .. } => {
-                            format!("({cond}) AND isNotNull({})", src.col(&format!("a{i}")))
+                            format!("({cond}) AND (isNotNull({ai}) OR isNotNull({af}))")
                         }
                         _ => cond.clone(),
                     };
-                    let av = src.col(&format!("a{i}"));
-                    let ak = src.col(&format!("ak{i}"));
+                    let lit = &a.literal;
                     partials.push(format!("countIf({cc}) AS n{i}"));
                     merges.push(m("sum({})", &format!("n{i}")));
                     let nm = format!("mn{i}");
@@ -420,41 +433,93 @@ impl Fold {
                             }
                         }
                         (AggArg::Attr { .. }, A::Min | A::Max) => {
-                            // `max` is the `min` of the negated value, so
-                            // one tuple order breaks a tie by the first span.
-                            let sign = if a.op == A::Min { "" } else { "-" };
-                            partials.push(format!(
-                                "minIf(({sign}assumeNotNull({av}), start_ns, span_id, {ak}), {cc}) AS x{i}"
+                            // The integers' and the doubles' extremes, each
+                            // in its own type. A `NaN` ranks above every
+                            // number; the integer wins a tie.
+                            let f = if a.op == A::Min { "min" } else { "max" };
+                            partials.push(format!("{f}If({ai}, {cc}) AS xi{i}"));
+                            partials.push(format!("{f}If({af}, {cc}) AS xf{i}"));
+                            merges.push(m(&format!("{f}({{}})"), &format!("xi{i}")));
+                            merges.push(m(&format!("{f}({{}})"), &format!("xf{i}")));
+                            // The engine's `min` and `max` skip a `NaN` and
+                            // return one only when every double is `NaN`.
+                            let (int, dbl) = if a.op == A::Min {
+                                (
+                                    format!(
+                                        "(isNotNull(mxi{i}) AND (isNull(mxf{i}) OR isNaN(mxf{i}) OR mxi{i} <= mxf{i}))"
+                                    ),
+                                    format!("mxf{i}"),
+                                )
+                            } else {
+                                partials.push(format!("countIf(({cc}) AND isNaN({af})) AS nn{i}"));
+                                merges.push(m("sum({})", &format!("nn{i}")));
+                                (
+                                    format!(
+                                        "(mnn{i} = 0 AND isNotNull(mxi{i}) AND (isNull(mxf{i}) OR mxi{i} >= mxf{i}))"
+                                    ),
+                                    format!("if(mnn{i} > 0, nan, mxf{i})"),
+                                )
+                            };
+                            let mut pass = format!(
+                                "coalesce(if({int}, mxi{i} {op} {lit}, {dbl} {op} {lit}), false)",
+                                op = a.sql_op
+                            );
+                            if a.op == A::Max {
+                                // A string or a boolean ranks above every
+                                // number: the maximum is then not a number.
+                                let ao = src.col(&format!("ao{i}"));
+                                partials.push(format!("countIf(({cond}) AND {ao}) AS ns{i}"));
+                                merges.push(m("sum({})", &format!("ns{i}")));
+                                pass = format!("mns{i} = 0 AND {pass}");
+                            }
+                            passes.push(format!("{nm} > 0 AND {pass}"));
+                            values.push((
+                                *i,
+                                format!(
+                                    "if({int}, toString(assumeNotNull(mxi{i})), toString(assumeNotNull({dbl})))"
+                                ),
+                                format!("if({int}, 'AggInt', 'AggDouble')"),
                             ));
-                            merges.push(m(&format!("minIf({{}}, n{i} > 0)"), &format!("x{i}")));
-                            (
-                                format!("{sign}mx{i}.1"),
-                                format!("toString({sign}mx{i}.1)"),
-                                format!("if(mx{i}.4 = 'Int64', 'AggInt', 'AggDouble')"),
-                            )
+                            continue;
                         }
                         (AggArg::Attr { .. }, A::Sum | A::Avg) => {
+                            // The integers summed in 128 bits, the doubles in
+                            // span order; an integer `sum` wraps to 64 bits
+                            // as the reference's, the mean reads the
+                            // unwrapped total over the count of both.
                             partials.push(format!(
-                                "groupArrayIf((assumeNotNull({av}), start_ns, span_id), {cc}) AS l{i}"
+                                "sumIf(toInt128(assumeNotNull({ai})), ({cc}) AND isNotNull({ai})) AS si{i}"
                             ));
+                            partials.push(format!("countIf(({cc}) AND isNotNull({af})) AS d{i}"));
+                            partials.push(format!(
+                                "groupArrayIf((assumeNotNull({af}), start_ns, span_id), ({cc}) AND isNotNull({af})) AS l{i}"
+                            ));
+                            merges.push(m("sum({})", &format!("si{i}")));
+                            merges.push(m("sum({})", &format!("d{i}")));
                             merges.push(m("groupArrayArray({})", &format!("l{i}")));
-                            let f = fold_sum(&format!("ml{i}"));
-                            if a.op == A::Sum {
-                                partials
-                                    .push(format!("countIf(({cc}) AND {ak} != 'Int64') AS d{i}"));
-                                merges.push(m("sum({})", &format!("d{i}")));
+                            let fs = fold_sum(&format!("ml{i}"));
+                            let total = format!("if(md{i} = {nm}, {fs}, toFloat64(msi{i}) + {fs})");
+                            let op = a.sql_op;
+                            let (pass, text, ty) = if a.op == A::Sum {
                                 (
-                                    f.clone(),
-                                    format!("toString({f})"),
+                                    format!(
+                                        "if(md{i} = 0, toInt64(msi{i}) {op} {lit}, ({total}) {op} {lit})"
+                                    ),
+                                    format!(
+                                        "if(md{i} = 0, toString(toInt64(msi{i})), toString({total}))"
+                                    ),
                                     format!("if(md{i} = 0, 'AggInt', 'AggDouble')"),
                                 )
                             } else {
                                 (
-                                    format!("{f} / {nm}"),
-                                    format!("toString({f} / {nm})"),
+                                    format!("({total}) / {nm} {op} {lit}"),
+                                    format!("toString(({total}) / {nm})"),
                                     "'AggDouble'".to_string(),
                                 )
-                            }
+                            };
+                            passes.push(format!("{nm} > 0 AND {pass}"));
+                            values.push((*i, text, ty));
+                            continue;
                         }
                         (_, A::Count) => unreachable!("count() reads no field"),
                     };

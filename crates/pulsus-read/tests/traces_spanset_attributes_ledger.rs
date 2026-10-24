@@ -61,11 +61,10 @@ use std::path::PathBuf;
 /// and it is pinned separately, by
 /// `traces::metrics_plan::tests::the_metrics_refusal_names_the_mid_pipeline_spanset_filter`,
 /// which asserts its body byte for byte.
-const LEDGER_IDS: [&str; 11] = [
+const LEDGER_IDS: [&str; 10] = [
     "traceql-spanset-aggregate-double-lexical-form",
     "traceql-spanset-aggregate-mixed-type-attribute",
-    "traceql-spanset-aggregate-string-attribute-contributes",
-    "traceql-attribute-aggregate-float64-precision",
+    "traceql-spanset-aggregate-typed-values",
     "traceql-nested-by-composite-series-cap",
     "traceql-select-before-by-nil-group-key",
     "traceql-midpipeline-spanset-operation-unsupported",
@@ -87,7 +86,7 @@ const LEDGER_IDS: [&str; 11] = [
 ///
 /// At least one phrase per row is a NUMBER the measurement moved, so a
 /// withdrawal written from memory rather than from the run fails.
-const WITHDRAWN: [(&str, &[&str]); 3] = [
+const WITHDRAWN: [(&str, &[&str]); 5] = [
     (
         "traceql-spanset-stacked-by-last-key-wins",
         &[
@@ -113,6 +112,19 @@ const WITHDRAWN: [(&str, &[&str]); 3] = [
             "failed at **byte 39**",
             "the grouping-first one at **byte 50**",
             "`matched 2`, spans `02 04`",
+        ],
+    ),
+    // Issue #493 part 2: an aggregate reads the stored type.
+    (
+        "traceql-spanset-aggregate-string-attribute-contributes",
+        &["sum_attr_numeric_string", "`sum(.sn)=doubleValue=8080`"],
+    ),
+    (
+        "traceql-attribute-aggregate-float64-precision",
+        &[
+            "`{\"intValue\":\"9007199254740993\"}`",
+            "`{\"intValue\":\"9007199254740988\"}`",
+            "`4503599627370493.5`",
         ],
     ),
 ];
@@ -379,10 +391,10 @@ fn the_mixed_type_defect_is_indexed_and_explained_in_the_defects_document() {
 }
 
 /// The defects document numbers its entries once each, contiguously from
-/// 1, and holds 38 — the count a merge that renumbered one entry has to
+/// 1, and holds 39 — the count a merge that renumbered one entry has to
 /// produce (issue #507 added entries 25–32, issue #624 part 4 entry 33,
 /// issue #594 part 5 entry 34, issue #605 part 2 entry 35, part 3 entry 36,
-/// issue #601 part 1 entry 37, issue #649 entry 38).
+/// issue #601 part 1 entry 37, issue #649 entry 38, issue #493 part 2 entry 39).
 ///
 /// *RED when:* two entries carry the same number, which is exactly what
 /// both branches of this merge wrote (each added its own entry 23), or an
@@ -390,7 +402,7 @@ fn the_mixed_type_defect_is_indexed_and_explained_in_the_defects_document() {
 /// headings and the index rows are checked SEPARATELY and then against
 /// each other: they are two edits, and a merge can leave one behind.
 #[test]
-fn the_defects_document_numbers_its_entries_once_each_and_holds_thirty_eight() {
+fn the_defects_document_numbers_its_entries_once_each_and_holds_thirty_nine() {
     let doc = read(DEFECTS);
     let numbers = |take: fn(&str) -> Option<&str>| -> Vec<u32> {
         lines_outside_fences(&doc)
@@ -401,16 +413,16 @@ fn the_defects_document_numbers_its_entries_once_each_and_holds_thirty_eight() {
     };
     let headings = numbers(|l| l.strip_prefix("## ")?.split('.').next());
     let index_rows = numbers(|l| l.strip_prefix("| [")?.split(']').next());
-    let want: Vec<u32> = (1..=38).collect();
+    let want: Vec<u32> = (1..=39).collect();
     assert_eq!(
         headings, want,
-        "the defects document's `## <n>.` headings must be 1..=38, once each and in order — \
+        "the defects document's `## <n>.` headings must be 1..=39, once each and in order — \
          a duplicated number is what a merge of two branches that each wrote entry 23 \
          produces"
     );
     assert_eq!(
         index_rows, want,
-        "the index table's rows must be 1..=38, once each and in order — the heading and the \
+        "the index table's rows must be 1..=39, once each and in order — the heading and the \
          index row are two separate edits"
     );
 }
@@ -507,7 +519,7 @@ fn the_api_section_states_the_measured_rules_and_not_the_retired_ones() {
 /// would pass on every row.
 #[test]
 fn every_ledger_row_is_referenced_from_the_artefact_that_owns_it() {
-    const OWNERS: [(&str, &str); 11] = [
+    const OWNERS: [(&str, &str); 10] = [
         (
             "traceql-spanset-aggregate-double-lexical-form",
             "crates/pulsus-read/src/traces/values.rs",
@@ -517,12 +529,8 @@ fn every_ledger_row_is_referenced_from_the_artefact_that_owns_it() {
             "crates/pulsus-read/tests/traces_search_grouping_differential.rs",
         ),
         (
-            "traceql-spanset-aggregate-string-attribute-contributes",
-            "docs/benchmarks/traces-differential-ledger.md",
-        ),
-        (
-            "traceql-attribute-aggregate-float64-precision",
-            "crates/pulsus-read/tests/traces_search_grouping_differential.rs",
+            "traceql-spanset-aggregate-typed-values",
+            "crates/pulsus-read/tests/traces_query_v2_live.rs",
         ),
         (
             "traceql-nested-by-composite-series-cap",

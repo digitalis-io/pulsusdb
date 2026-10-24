@@ -91,6 +91,7 @@ replaces one.
 | [36](#36-one-pattern-series-can-carry-two-samples-at-one-timestamp) | log reference | queries | A | A `/patterns` series can answer `[[t,1],[t,1]]` where it means `[[t,2]]`. |
 | [37](#37-a-one-element-array-is-read-as-its-element-and-an-empty-one-as-no-value) | trace reference | queries | C | A span sent `["z"]` answers `"z"`, and one sent `[]` answers as if it held nothing. |
 | [38](#38-one-span-missing-an-operand-fails-a-whole-grouped-query) | trace reference | queries | A | `by(-span.x)` fails every trace when one span lacks `x`, where `by(span.x / 1000)` groups that span under `false`. |
+| [39](#39-an-attribute-quantile-drops-every-integer-below-2) | trace reference | queries | C, D | `quantile_over_time(span.n, .01)` over `-4`, `1` and `7` answers from `7` alone. |
 
 ---
 
@@ -1686,8 +1687,11 @@ and by then there is nothing to compare it with.
 
 Sums every numeric contributor, whatever type it was stored as, and
 divides by the same count it summed. Both push orders give `5.5` and
-`2.75`. A value that is not numeric contributes nothing, on either
-system.
+`2.75`. A string or a boolean is not a number here, in any order. The
+reference's fold keeps one when it arrives first, so the answer is not a
+number, and counts it in the mean's divisor when it arrives later: an int
+`500` pushed before the string `"x"` averages `250` there and `500` here
+(issue #493 part 2).
 
 The wire ARM still follows the stored types — `sum(.attr)` is an
 `intValue` only when EVERY contributor was stored `int` — so a mixed-type
@@ -2226,6 +2230,40 @@ The span groups under `false` in every case.
 
 Ledger row `traceql-by-expression-key`. Pinned by `a_by_expression_answers_as_decided` in
 `crates/pulsus-read/tests/traces_query_v2_live.rs`.
+
+---
+
+## 39. An attribute quantile drops every integer below 2
+
+**The trace reference · queries · tests C, D**
+
+### What the reference does
+
+`quantile_over_time` over an attribute counts a span in the log2 bucket of its integer value
+(`pkg/traceql/ast_metrics.go:192-202`, `bucketizeAttribute`). A value below 2 has no such bucket, and the
+function returns no bucket for it (`:198-200`); a double gets none either (`:209-212`, "Add support for floats").
+The quantile is then computed over the bucketed spans only.
+
+### Why that is wrong rather than different
+
+The floor is a rule of the bucketing, not a quantile's meaning: the reference rejects every integer below 2
+before bucketing it (`:198-200`), and its bucket function does the same (`engine_metrics.go:2039-2041`). Those
+spans are dropped with no error (**C**). The 1st percentile of `-4`, `1` and `7` is `-4` under PulsusDB's
+estimator and `-3.9` under linear interpolation between order statistics at position (n − 1)p; no reading of a
+low percentile gives `7`, which is what the reference answers from the one span it keeps (**D**). A span set whose integers are all below 2
+answers no series at all. Measured on the pinned reference (§1 corpus of issue #493 part 2,
+`by(resource.case)`): integers `-2`, `-4`, and an int `1` beside `2.5`, give no series there.
+
+### What PulsusDB does
+
+Counts every integer value, below 2 included, as `min_over_time` and `max_over_time` do; a double is not
+counted (`docs/api.md` §4.4). `histogram_over_time` keeps the reference's floor: its buckets are the
+reference's by design (§4.4.1).
+
+### Evidence
+
+Ledger row `traceql-metrics-attribute-quantile-below-2`. Pinned by `an_attribute_quantile_counts_every_integer`
+in `crates/pulsus-read/tests/traces_query_v2_live.rs`, which fails if the floor is restored.
 
 ---
 
