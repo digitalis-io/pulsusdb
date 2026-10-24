@@ -2558,8 +2558,48 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `avg` and the grouped form imply (`attribute_targets`,
   `crates/pulsus-read/tests/traces_query_v2_live.rs`).
 
+- **Cause, and a string or a boolean** (issue #493 part 2, measured
+  2026-10-23 on the pinned reference). Its running sum takes a later
+  non-number as `NaN` and keeps it (`pkg/traceql/engine_metrics_functions.go:5-16`,
+  a value read by `FloatizeAttribute`, `engine_metrics.go:2130-2141`): a
+  span holding `num` as the int `500` pushed before one holding the string
+  `"x"`, grouped `by(resource.case)`, has no series there and `500` here;
+  pushed string first, `500` on both. `min`, `max` and `avg_over_time`
+  agree on both for every stored type.
+
+- **Integer past 2^53 in `histogram_over_time`.** The reference buckets the
+  integer as a double: `9007199254740993` is bucket `9007199254740992`
+  there and `18014398509481984` here, the power of two above the value.
+
 - **Disposition.** Deliberate: the reference's ungrouped sum disagrees with
   its own grouped sum and average over the same spans.
+
+### `traceql-metrics-attribute-quantile-below-2` (issue #493 part 2) — **an attribute quantile counts an integer below 2; the reference drops it**
+
+- **Route.** `GET /api/traces/v1/metrics/query` and `query_range`.
+
+- **Measured** (2026-10-23, the pinned reference, one instance; one trace per
+  case, a root without the key and two children holding `num`;
+  `{ resource.service.name = "ref493p2" } | quantile_over_time(span.num, .5) by(resource.case)`,
+  one 300 s step):
+
+  | children | reference | PulsusDB |
+  |---|---|---|
+  | `-2`, `-4` | no series | `-4` |
+  | int `1`, `2.5` (either order) | no series | `1` |
+  | `3`, `5` | `4` | `3` |
+
+  The third row's values differ by the estimator
+  (`2026-08-05-traceql-quantile-over-time-tdigest`); the first two differ in
+  which spans are counted.
+
+- **Cause.** The reference buckets an integer by its log2 and returns no bucket
+  below 2 (`pkg/traceql/ast_metrics.go:198-200`).
+
+- **Disposition.** Deliberate: entry 39 of
+  `docs/reference-defects-we-do-not-copy.md`. Pinned by
+  `an_attribute_quantile_counts_every_integer` in
+  `crates/pulsus-read/tests/traces_query_v2_live.rs`.
 
 ### `traceql-metrics-intrinsic-target-refused` (issue #596 part 2) — **an intrinsic target other than `duration` and `span:childCount` stays `400`**
 
@@ -3397,6 +3437,15 @@ when we are asking it to slow down, so we keep `429`; recorded as
   (tests **C** and **D**: a contributor is discarded with no error, and
   no reading of "sum" supports omitting an operand).
 
+- **A string or a boolean beside a number** (issue #493 part 2, measured
+  2026-10-23 on one instance, int `500` then the string `"x"`, then the
+  reverse push): the reference's `sum` is `500` and `avg` `250`; pushed
+  string first, both are the string, which meets no numeric threshold.
+  Here `sum` is `500` and `avg` `500` in both orders. An int `5` then the
+  boolean `true`: `avg` `2.5` there and `5` here. A string or a boolean is
+  not a number (`traceql-spanset-aggregate-typed-values`).
+  Pinned by the fixture `avg_attr_string_beside_int`.
+
 - **Disposition.** No arithmetic change. Exercised in BOTH orders by
   `crates/pulsus-read/tests/traces_search_grouping_differential.rs`
   fixtures `mixed_type_int_first_sum`, `mixed_type_float_first_sum`,
@@ -3406,69 +3455,78 @@ when we are asking it to slow down, so we keep `429`; recorded as
   in the same file fails if either order is dropped, because a single
   order cannot show the defect.
 
-### `traceql-spanset-aggregate-string-attribute-contributes` (issue #510) — **a numeric-looking STRING contributes to a numeric aggregate here and not there**
+### `traceql-spanset-aggregate-string-attribute-contributes` — **WITHDRAWN: an aggregate reads the stored type (issue #493 part 2)**
 
-- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias.
+- **What it recorded, withdrawn by issue #493 part 2.** That a string whose text reads as a number
+  (`"8080"`) contributed to `min`/`max`/`sum`/`avg(.attr)` here and not on
+  the reference.
 
-- **What.** An attribute the sender stored as a `string` whose text
-  parses as a number (`"8080"`) is written with a non-null `val_num`, so
-  it contributes to `min`/`max`/`sum`/`avg(.attr)` here. The reference
-  types its comparison and does not aggregate it.
+- **The measurement that retired it.** The fixture `sum_attr_numeric_string`
+  in `crates/pulsus-read/tests/traces_search_grouping_differential.rs`,
+  span `01` holding the string `"8080"`: `| sum(.sn) > 0` returns no span
+  set on both systems, where this side returned
+  `sum(.sn)=doubleValue=8080`. What remains of the string's place in an
+  aggregate is `traceql-spanset-aggregate-typed-values`.
 
-- **Observed.** `{… && .sn = "8080"}` returns the span on both systems and
-  its projected value is `{"stringValue":"8080"}` on both; `by(.sn)`
-  groups it under `{"stringValue":"8080"}` on both. The divergence is in
-  the AGGREGATE arm only, and the same stored row is what causes it: our
-  `val_num` is `8080`, so `sum(.sn)` has a contributor there where the
-  reference has none.
+### `traceql-attribute-aggregate-float64-precision` — **WITHDRAWN: an aggregate reads the stored integer (issue #493 part 2)**
 
-- **Triage.** Out of scope for issue #510, which changes what a response
-  CARRIES and not which spans MATCH. Excluding a numeric-looking string
-  from a numeric aggregate changes which traces come back, which is an
-  accept-surface change and belongs with the cross-type accept work
-  (`traceql-untyped-intrinsic-cross-type-operand` is the same family).
+- **What it recorded, withdrawn by issue #493 part 2.** That an attribute aggregate computed in `Float64`,
+  so an integer past 2^53 was one digit out.
 
-- **Disposition.** Recorded, not fixed. The by-key and projection halves
-  are at parity and are pinned by the
-  `by_attr_numeric_string_and_absent` and `projected_string` fixtures;
-  the aggregate half has no fixture, deliberately, because pinning it
-  would freeze an accept divergence this issue did not decide.
+- **The measurement that retired it.** The fixtures `max_attr_beyond_2_53`,
+  `sum_attr_beyond_2_53` and `avg_attr_beyond_2_53`, spans holding
+  `9007199254740993` and `-5`, answered alike by both systems:
 
-### `traceql-attribute-aggregate-float64-precision` (issue #510) — **an attribute aggregate is one digit out past 2^53, and what that bought**
-
-- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias.
-
-- **What.** `min`/`max`/`sum`/`avg(.attr)` compute on `trace_attrs_idx`'s
-  `val_num`, which is `Nullable(Float64)`, so an integer attribute above
-  2^53 has already lost its last digits before any aggregate runs. The
-  by-key and projection paths do NOT have this defect: both render an
-  `int` from the exact stored `val` text.
-
-- **Observed.** One span carrying `big = 9007199254740993`, stored as
-  `val = '9007199254740993'`, `val_type = 'int'`,
-  `val_num = 9007199254740992`:
-
-  | query | reference | PulsusDB |
+  | query | before, here | after, and the reference |
   |---|---|---|
-  | `\| by(.big)` | `{"intValue":"9007199254740993"}` | `{"intValue":"9007199254740993"}` |
-  | `{… && .big = 9007199254740993}` (projected) | `{"intValue":"9007199254740993"}` | `{"intValue":"9007199254740993"}` |
-  | `\| max(.big) > 0` | `{"intValue":"9007199254740993"}` | `{"intValue":"9007199254740992"}` |
+  | `\| max(.big) > 0` | `{"intValue":"9007199254740992"}` | `{"intValue":"9007199254740993"}` |
+  | `\| sum(.big) > 0` | `9007199254740987` | `{"intValue":"9007199254740988"}` |
+  | `\| avg(.big) > 0` | `4503599627370493.5` | `{"doubleValue":4503599627370494}` |
 
-- **Triage and THE COST THAT WAS DECLINED.** Ratify-documented-difference,
-  adjudicated on issue #510. Making the aggregate exact needs the exact
-  `val` TEXT in the NUMERIC read — an uncapped-per-row `String` column
-  added to the statement that also serves EVERY numeric attribute filter
-  leaf, on the read path, on the hop this project meters bytes over. The
-  alternative that was rejected is therefore not "a bit more work": it is
-  a permanent per-row byte cost on the hot numeric read, paid by every
-  query with a numeric attribute condition, to correct integer attributes
-  above 9 007 199 254 740 992 — a magnitude close to nonexistent in trace
-  data. A future reader revisiting this needs to weigh that column, not
-  just the digit.
+### `traceql-spanset-aggregate-typed-values` (issue #493 part 2) — **an aggregate reads each value in its stored type; seven answers differ**
 
-- **Disposition.** Recorded, not fixed. Pinned in both directions by the
-  `max_attr_beyond_2_53` fixture (which fails if the two ever agree) with
-  the exact by-key half beside it in `by_attr_int_beyond_2_53`.
+- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias.
+
+- **Measured** (2026-10-23, the pinned reference, one instance, OTLP/JSON
+  pushed once; one trace per row, a root without the key and two
+  children holding `num` in push order; `{ resource.service.name = … } |`
+  before each query):
+
+  | children | query | reference | PulsusDB |
+  |---|---|---|---|
+  | `9007199254740993`, `1` | `max(span.num) > 9007199254740992` | no trace | `{"intValue":"9007199254740993"}` |
+  | `9007199254740993`, `1` (A); `9007199254740992`, `1` (B) | `max(span.num)` against `9007199254740993` under `=`; `!=`; `<`; `<=`; `>`; `>=` | A; B; none; A B; none; A B | A; B; B; A B; none; A |
+  | `-2`, `-4` | `avg(span.num) > 0`; `< 0` | `{"doubleValue":9223372036854776000}`; no trace | no trace; `{"doubleValue":-3}` |
+  | `-9223372036854775808`, `-1` | `avg(span.num) != 0` | `{"doubleValue":4611686018427388000}` | `{"doubleValue":-4611686018427388000}` |
+  | `-1.5`, `-2.5`, both push orders | `min(span.num) != 0`; `max` | `-1.5`; `-2.5` | `-2.5`; `-1.5` |
+  | `NaN`, int `5`, both push orders | `min(span.num) != 0`; `max` | `NaN`; `{"intValue":"5"}` | `{"intValue":"5"}`; `NaN` |
+  | int `2`, double `2.0`; double `2.0`, int `2` | `max(span.num) > 0` | `{"intValue":"2"}`; `{"doubleValue":2}` | `{"intValue":"2"}` both |
+
+- **Cause.** The reference compares an aggregate with its threshold as two
+  doubles under `<`, `<=`, `>`, `>=` (`pkg/traceql/ast_execute.go:829-836`)
+  and two integers exactly under `=` (`ast_execute.go:837-838`,
+  `ast.go:833-836`); it divides an integer sum read as unsigned
+  (`ast.go:1100-1103`); its `max` keeps the first of two equal values
+  (`ast_execute.go:294`); it orders two doubles by their bits read as a
+  signed integer (`ast.go:924-925`), so a `NaN` ranks above every double
+  and two negative doubles in reverse, while an integer and a double
+  compare as numbers, a `NaN` below every number (`ast.go:902-903`).
+
+- **Agree** on the same instance: a `NaN` beside a double (`min` the
+  double, `max` `NaN`); `+Inf` beside `-Inf` (`min` `-Inf`, `max` `+Inf`,
+  `sum` and `avg` `NaN`); `+Inf` beside `1.5` (`sum`, `avg` `+Inf`); every
+  double `NaN` (`NaN` under all four); an integer `sum` wrapping at the
+  64-bit boundary (`9223372036854775807` and `1` sum to
+  `-9223372036854775808`, `-9223372036854775808` and `-1` to
+  `9223372036854775807`), and the mean above it (`4611686018427388000`).
+
+- **Disposition.** Deliberate. An integer compares exactly, as a condition
+  compares it; the mean of `-2` and `-4` is `-3`, and a mean reads the
+  total before the wrap; two doubles compare as numbers, and a `NaN` ranks
+  above every number whatever the other values' type; the storage keeps
+  no push order, so a tie reports the integer. Pinned by
+  `a_search_aggregate_reads_each_value_in_its_stored_type` in
+  `crates/pulsus-read/tests/traces_query_v2_live.rs`.
 
 ### `traceql-spanset-stacked-by-last-key-wins` — **WITHDRAWN before it was ever committed (issue #510)**
 

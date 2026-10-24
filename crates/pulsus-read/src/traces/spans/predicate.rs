@@ -3775,7 +3775,7 @@ fn array_member(array: &str, test: &str) -> String {
 /// `minInt`/`maxInt` need no arm of their own: the parser turns each into
 /// `Value::Number(i64::MIN.to_string())` / `i64::MAX.to_string()`, so they
 /// arrive as ordinary decimal literals and take this same path.
-fn render_number(raw: &str) -> Result<String, PlanError> {
+pub(super) fn render_number(raw: &str) -> Result<String, PlanError> {
     Ok(match number_literal(raw)? {
         Folded::Int(v) | Folded::Dur(v) => int_text(v),
         Folded::U128(v) => u128_text(v),

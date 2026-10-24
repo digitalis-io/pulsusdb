@@ -136,11 +136,13 @@ pkg/tempo/search.go
 pkg/tempopb/tempo.proto
 pkg/traceql/ast.go
 pkg/traceql/ast_execute.go
+pkg/traceql/ast_metrics.go
 pkg/traceql/ast_stringer.go
 pkg/traceql/ast_validate.go
 pkg/traceql/engine.go
 pkg/traceql/engine_metrics.go
 pkg/traceql/engine_metrics_compare.go
+pkg/traceql/engine_metrics_functions.go
 pkg/util/errors.go
 pkg/util/httpreq/tags.go
 pkg/util/marshal/marshal.go

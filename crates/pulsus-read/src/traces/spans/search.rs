@@ -1040,10 +1040,6 @@ fn pipeline_of<'a>(query: &'a Query, ctx: &PredicateCtx<'_>) -> Result<Pipeline<
     Ok(out)
 }
 
-/// A number as today's writer reads one from an attribute's stored text:
-/// Rust's `f64` grammar, finite (`numeric_val_num`).
-const NUMBER_TEXT: &str = "[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?";
-
 /// One aggregate stage, checked in the previous planner's order: the
 /// operator, the argument, then the threshold.
 fn agg_of(
@@ -1087,13 +1083,8 @@ fn agg_of(
                     "{op}({f}) is not supported by the search statement"
                 )));
             };
-            let plain = format!("replaceRegexpOne({text_sql}, '^[+]', '')");
-            let number = crate::traces::sql_text::anchored_regex_sql(NUMBER_TEXT)?;
             AggArg::Attr {
-                v: format!(
-                    "if(match({text_sql}, {number}) AND isFinite(toFloat64OrZero({plain})), \
-                     toFloat64OrZero({plain}), NULL)"
-                ),
+                text: text_sql,
                 kind,
             }
         }
@@ -1105,6 +1096,10 @@ fn agg_of(
         }
     };
     let threshold = aggregate_threshold(op, &field.cloned(), value)?;
+    let literal = match value {
+        pulsus_traceql::Value::Number(raw) => super::predicate::render_number(raw)?,
+        _ => format!("toFloat64('{threshold:?}')"),
+    };
     Ok(Agg {
         display: match field {
             Some(FieldExpr::Field(f)) => format!("{op}({f})"),
@@ -1114,6 +1109,7 @@ fn agg_of(
         arg,
         sql_op,
         threshold: format!("toFloat64('{threshold:?}')"),
+        literal,
     })
 }
 
@@ -1128,7 +1124,10 @@ pub(crate) fn aggregate_value(text: &str, value_type: &str) -> Result<GroupValue
     };
     Ok(match value_type {
         "Int64" => GroupValue::Int(text.parse().map_err(|e| format!("count {text:?}: {e}"))?),
-        "AggInt" => GroupValue::Int(f()? as i64),
+        "AggInt" => GroupValue::Int(
+            text.parse()
+                .map_err(|e| format!("aggregate {text:?}: {e}"))?,
+        ),
         "AggDouble" => GroupValue::Double(f()?.to_bits()),
         "DurationI" => GroupValue::Str(crate::traces::values::go_duration_string(
             text.parse()
