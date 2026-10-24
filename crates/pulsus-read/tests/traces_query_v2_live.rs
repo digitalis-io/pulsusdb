@@ -8891,16 +8891,16 @@ fn agg_fixtures(base_ns: i64) -> Vec<(&'static str, Vec<ExportTraceServiceReques
                 930,
                 S / 10,
                 0,
-                n(int_value(-9_007_199_254_740_991)),
+                n(double_value(-9_007_199_254_740_991.0)),
             )],
         ),
         by_body(
             "svc",
-            vec![at(0xb8, 0x55, "fold", 620, S / 10, 0, n(int_value(1)))],
+            vec![at(0xb8, 0x55, "fold", 620, S / 10, 0, n(double_value(1.0)))],
         ),
         by_body(
             "svc",
-            vec![at(0xb8, 0x54, "fold", 310, S / 10, 0, n(int_value(1)))],
+            vec![at(0xb8, 0x54, "fold", 310, S / 10, 0, n(double_value(1.0)))],
         ),
         by_body(
             "svc",
@@ -8911,7 +8911,7 @@ fn agg_fixtures(base_ns: i64) -> Vec<(&'static str, Vec<ExportTraceServiceReques
                 0,
                 S / 10,
                 0,
-                n(int_value(9_007_199_254_740_991)),
+                n(double_value(9_007_199_254_740_991.0)),
             )],
         ),
     ];
@@ -8990,26 +8990,28 @@ async fn t_a19_an_aggregate_then_a_later_filter_is_one_statement() {
     .await;
 }
 
-/// Each aggregate's value and wire type, as `aggregate_value` decides it.
+/// Each aggregate's value and wire type: a string or a boolean is not a
+/// number, and a tie between an int and a double reports the int (issue
+/// #493 part 2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_aggregate_keeps_todays_value_and_type() {
+async fn an_aggregate_reads_each_stored_type() {
     skip_unless_live!();
     check_agg_cases("types", "types", &[
         (r#"{ name = "types" } | sum(span.n) > 0"#,
-         "b7 6 [4d, 4e, 4f] {double:110 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:14 2 [4a, 4b]}; b4 2 [48, 49] {double:14 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:3.5 2 [43, 44]}; b1 2 [41, 42] {int:3 2 [41, 42]}", Some(2)),
+         "b5 2 [4a, 4b] {double:14 2 [4a, 4b]}; b4 2 [48, 49] {double:14 2 [48, 49]}; b2 2 [43, 44] {double:3.5 2 [43, 44]}; b1 2 [41, 42] {int:3 2 [41, 42]}", Some(2)),
         (r#"{ name = "types" } | min(span.n) > 0"#,
-         "b7 6 [4d, 4e, 4f] {double:5 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:7 2 [4a, 4b]}; b4 2 [48, 49] {int:7 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {int:1 2 [43, 44]}; b1 2 [41, 42] {int:1 2 [41, 42]}", Some(2)),
+         "b5 2 [4a, 4b] {int:7 2 [4a, 4b]}; b4 2 [48, 49] {int:7 2 [48, 49]}; b2 2 [43, 44] {int:1 2 [43, 44]}; b1 2 [41, 42] {int:1 2 [41, 42]}", Some(2)),
         (r#"{ name = "types" } | max(span.n) > 0"#,
-         "b7 6 [4d, 4e, 4f] {double:100 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:7 2 [4a, 4b]}; b4 2 [48, 49] {int:7 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:2.5 2 [43, 44]}; b1 2 [41, 42] {int:2 2 [41, 42]}", Some(2)),
+         "b5 2 [4a, 4b] {int:7 2 [4a, 4b]}; b4 2 [48, 49] {int:7 2 [48, 49]}; b2 2 [43, 44] {double:2.5 2 [43, 44]}; b1 2 [41, 42] {int:2 2 [41, 42]}", Some(2)),
         (r#"{ name = "types" } | avg(span.n) > 0"#,
-         "b7 6 [4d, 4e, 4f] {double:36.666666666666664 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:7 2 [4a, 4b]}; b4 2 [48, 49] {double:7 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:1.75 2 [43, 44]}; b1 2 [41, 42] {double:1.5 2 [41, 42]}", Some(2)),
+         "b5 2 [4a, 4b] {double:7 2 [4a, 4b]}; b4 2 [48, 49] {double:7 2 [48, 49]}; b2 2 [43, 44] {double:1.75 2 [43, 44]}; b1 2 [41, 42] {double:1.5 2 [41, 42]}", Some(2)),
         (r#"{ name = "types" } | sum(span.n) < 1"#, "", Some(2)),
         (r#"{ name = "types" } | count() = 2"#,
          "b5 2 [4a, 4b] {int:2 2 [4a, 4b]}; b4 2 [48, 49] {int:2 2 [48, 49]}; b2 2 [43, 44] {int:2 2 [43, 44]}; b1 2 [41, 42] {int:2 2 [41, 42]}", Some(2)),
         (r#"{ name = "types" } | count() != 2"#,
          "b7 6 [4d, 4e, 4f] {int:6 6 [4d, 4e, 4f]}; b6 1 [4c] {int:1 1 [4c]}; b3 3 [45, 46, 47] {int:3 3 [45, 46, 47]}", Some(2)),
         (r#"{ name = "types" } | coalesce() | sum(span.n) > 0"#,
-         "b7 6 [4d, 4e, 4f] {double:110 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:14 2 [4a, 4b]}; b4 2 [48, 49] {double:14 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:3.5 2 [43, 44]}; b1 2 [41, 42] {int:3 2 [41, 42]}", Some(2)),
+         "b5 2 [4a, 4b] {double:14 2 [4a, 4b]}; b4 2 [48, 49] {double:14 2 [48, 49]}; b2 2 [43, 44] {double:3.5 2 [43, 44]}; b1 2 [41, 42] {int:3 2 [41, 42]}", Some(2)),
 
     ]).await;
     check_agg_cases(
@@ -9064,8 +9066,9 @@ async fn a_non_count_aggregate_before_and_after_a_later_filter() {
     ]).await;
 }
 
-/// Float addition in today's order: (2^53 - 1) + 1 + 1 - (2^53 - 1) is 1,
-/// and their mean 0.25, where another order gives 2 and 0.5.
+/// Double addition in span order: (2^53 - 1) + 1 + 1 - (2^53 - 1) is 1,
+/// and their mean 0.25, where another order gives 2 and 0.5. The values
+/// are doubles: integers sum exactly (issue #493 part 2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_float_sum_adds_in_todays_order() {
     skip_unless_live!();
@@ -9075,7 +9078,7 @@ async fn a_float_sum_adds_in_todays_order() {
         &[
             (
                 r#"{ name = "fold" } | sum(span.n) > 0"#,
-                "b8 4 [53, 54, 55] {int:1 4 [53, 54, 55]}",
+                "b8 4 [53, 54, 55] {double:1 4 [53, 54, 55]}",
                 Some(2),
             ),
             (
@@ -15296,6 +15299,38 @@ async fn attrs_other_values_are_missing() {
     );
 }
 
+/// Issue #493 part 2: an attribute's quantile counts every integer, `1` and
+/// `-4` included, so the lowest level is `-4`. The reference's bucketing
+/// drops an integer below 2 (entry 39 of
+/// `docs/reference-defects-we-do-not-copy.md`); restoring that floor here
+/// fails this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attribute_quantile_counts_every_integer() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("quantile_floor", |req, _| {
+        rf_span_mut(req, 1).attributes.push(kv("m", int_value(7)));
+        rf_span_mut(req, 2).attributes.push(kv("m", int_value(1)));
+        rf_span_mut(req, 3).attributes.push(kv("m", int_value(-4)));
+    })
+    .await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let out = rf_range(&engine, "{} | quantile_over_time(span.m, .01, 1)", b).await;
+    drop_db(&db).await;
+    let out = out.expect("the quantile");
+    let at = |p: f64| {
+        out.series
+            .iter()
+            .find(|s| s.labels == vec![pulsus_read::MetricLabel::double("p", p)])
+            .and_then(|s| {
+                s.samples
+                    .iter()
+                    .find(|(t, _)| *t == (b + 60) * 1000)
+                    .map(|(_, v)| *v)
+            })
+    };
+    assert_eq!((at(0.01), at(1.0)), (Some(-4.0), Some(7.0)), "{out:?}");
+}
+
 /// An attribute quantile's exemplar is placed by its own integer value,
 /// unscaled, and valued at it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16092,8 +16127,8 @@ const UNTYPED_CASES: [(&str, &str, &str, u64); 15] = [
     ("U4", "{ span.m != nil }", "e1 [02 m=s]", 1),
     (
         "U5",
-        "{ } | max(.m) > 0",
-        "e1 4 [01, 02, 03, 04] {int:9 4 [01, 02, 03, 04]}",
+        "{ } | sum(.m) > 0",
+        "e1 4 [01, 02, 03, 04] {int:13 4 [01, 02, 03, 04]}",
         1,
     ),
     (
@@ -16365,6 +16400,312 @@ async fn a_service_name_under_not_reads_its_stored_type() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// Issue #493 part 2's fixture TA: one trace per row, trace byte `bN` in
+/// service `agg493` and `dN` in `agg493x`, a root `01` holding no `num` and
+/// children `02`, `03` holding `span.num` in the order given, each request
+/// one trace.
+fn typed_aggregate_fixture(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    const MS: i64 = 1_000_000;
+    let rows: Vec<(u8, [AnyValue; 2])> = vec![
+        (0xd1, [double_value(f64::NAN), double_value(1.5)]),
+        (
+            0xd2,
+            [double_value(f64::INFINITY), double_value(f64::NEG_INFINITY)],
+        ),
+        (0xd3, [double_value(f64::INFINITY), double_value(1.5)]),
+        (0xd4, [double_value(f64::NAN), double_value(f64::NAN)]),
+        (0xd5, [double_value(f64::NAN), int_value(5)]),
+        (0xd6, [double_value(-1.5), double_value(-2.5)]),
+        (0xd7, [int_value(i64::MAX), int_value(1)]),
+        (0xd8, [int_value(i64::MIN), int_value(-1)]),
+        (0xb1, [int_value(3), int_value(5)]),
+        (0xb2, [double_value(1.5), double_value(2.5)]),
+        (0xb3, [str_value("500"), str_value("7")]),
+        (0xb4, [bool_value(true), bool_value(false)]),
+        (0xb5, [int_value(9_007_199_254_740_993), int_value(1)]),
+        (0xb6, [int_value(500), str_value("x")]),
+        (0xb7, [int_value(5), bool_value(true)]),
+        (0xb8, [double_value(2.5), str_value("x")]),
+        (0xb9, [int_value(1), double_value(2.5)]),
+        (0xba, [int_value(-2), int_value(-4)]),
+        (0xbb, [double_value(2.0), int_value(2)]),
+        (0xbc, [int_value(9_007_199_254_740_992), int_value(1)]),
+    ];
+    rows.into_iter()
+        .map(|(t, [a, b])| {
+            let start = base_ns + i64::from(t & 0x1f) * S;
+            let service = if t >= 0xd0 { "agg493x" } else { "agg493" };
+            let at = |n: u8, parent: Vec<u8>, attrs: Vec<KeyValue>| {
+                span_with_message(
+                    vec![t; 16],
+                    vec![0, 0, 0, 0, 0, 0, 0, n],
+                    parent,
+                    "op",
+                    2,
+                    start + i64::from(n) * MS,
+                    MS,
+                    attrs,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
+            let root = vec![0, 0, 0, 0, 0, 0, 0, 1];
+            group_request(
+                vec![kv("service.name", str_value(service))],
+                scope_named("lib-a", "1.0", Vec::new()),
+                vec![
+                    at(1, Vec::new(), Vec::new()),
+                    at(2, root.clone(), vec![kv("num", a)]),
+                    at(3, root, vec![kv("num", b)]),
+                ],
+            )
+        })
+        .collect()
+}
+
+/// Issue #493 part 2: `min`, `max`, `sum` and `avg` read each value in its
+/// stored type. A string or a boolean is not a number; `max` over a
+/// spanset holding one is not a number and meets no numeric threshold,
+/// as the reference's (it ranks a string and a boolean above every
+/// number); an integer is exact to 64 bits, in the value and against the
+/// threshold. Each answer is the reference's, measured on the same
+/// values, except those the ledger row
+/// `traceql-spanset-aggregate-typed-values` and
+/// `traceql-spanset-aggregate-mixed-type-attribute` record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_aggregate_reads_each_value_in_its_stored_type() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (db, _client) = seed(
+        pulsus_testkit::test_db("pulsus_read_it_t493p2_agg"),
+        &typed_aggregate_fixture(base_ns),
+        60,
+        "t493p2-agg",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let window = (base_ns, base_ns + 60_000_000_000);
+    let one = |t: &str, v: &str| format!("{t} 3 [01, 02, 03] {{{v} 3 [01, 02, 03]}}");
+    let answer = |rows: &[(&str, &str)]| {
+        rows.iter()
+            .map(|(t, v)| one(t, v))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let s = r#"{ resource.service.name = "agg493" }"#;
+    let x = r#"{ resource.service.name = "agg493x" }"#;
+    let max_rows = [
+        ("bc", "int:9007199254740992"),
+        ("bb", "int:2"),
+        ("b9", "double:2.5"),
+        ("b5", "int:9007199254740993"),
+        ("b2", "double:2.5"),
+        ("b1", "int:5"),
+    ];
+    let cases: Vec<(String, String)> = vec![
+        (format!("{s} | max(span.num) > 0"), answer(&max_rows)),
+        (format!("{s} | max(.num) > 0"), answer(&max_rows)),
+        // A later `by()` merges the aggregate over its prefix by window.
+        (
+            format!("{s} | max(span.num) > 0 | by(name)"),
+            answer(&max_rows),
+        ),
+        (
+            format!("{s} | min(span.num) > 0"),
+            answer(&[
+                ("bc", "int:1"),
+                ("bb", "int:2"),
+                ("b9", "int:1"),
+                ("b8", "double:2.5"),
+                ("b7", "int:5"),
+                ("b6", "int:500"),
+                ("b5", "int:1"),
+                ("b2", "double:1.5"),
+                ("b1", "int:3"),
+            ]),
+        ),
+        (
+            format!("{s} | sum(span.num) > 0"),
+            answer(&[
+                ("bc", "int:9007199254740993"),
+                ("bb", "double:4"),
+                ("b9", "double:3.5"),
+                ("b8", "double:2.5"),
+                ("b7", "int:5"),
+                ("b6", "int:500"),
+                ("b5", "int:9007199254740994"),
+                ("b2", "double:4"),
+                ("b1", "int:8"),
+            ]),
+        ),
+        (
+            format!("{s} | sum(span.num) > 0 | by(name)"),
+            answer(&[
+                ("bc", "int:9007199254740993"),
+                ("bb", "double:4"),
+                ("b9", "double:3.5"),
+                ("b8", "double:2.5"),
+                ("b7", "int:5"),
+                ("b6", "int:500"),
+                ("b5", "int:9007199254740994"),
+                ("b2", "double:4"),
+                ("b1", "int:8"),
+            ]),
+        ),
+        (
+            format!("{s} | avg(span.num) > 0"),
+            answer(&[
+                ("bc", "double:4503599627370496"),
+                ("bb", "double:2"),
+                ("b9", "double:1.75"),
+                ("b8", "double:2.5"),
+                ("b7", "double:5"),
+                ("b6", "double:500"),
+                ("b5", "double:4503599627370497"),
+                ("b2", "double:2"),
+                ("b1", "double:4"),
+            ]),
+        ),
+        (
+            format!("{s} | max(span.num) = 9007199254740993"),
+            answer(&[("b5", "int:9007199254740993")]),
+        ),
+        (
+            format!("{s} | max(span.num) > 9007199254740992"),
+            answer(&[("b5", "int:9007199254740993")]),
+        ),
+        (
+            format!("{s} | sum(span.num) = 9007199254740994"),
+            answer(&[("b5", "int:9007199254740994")]),
+        ),
+        // Adjacent integers past 2^53 (b5's maximum is 2^53 + 1, bc's
+        // 2^53): rounded to a double the threshold is 2^53, and each
+        // operator's answer moves.
+        (
+            format!("{s} | max(span.num) != 9007199254740993"),
+            answer(&[
+                ("bc", "int:9007199254740992"),
+                ("bb", "int:2"),
+                ("ba", "int:-2"),
+                ("b9", "double:2.5"),
+                ("b2", "double:2.5"),
+                ("b1", "int:5"),
+            ]),
+        ),
+        (
+            format!("{s} | max(span.num) < 9007199254740993"),
+            answer(&[
+                ("bc", "int:9007199254740992"),
+                ("bb", "int:2"),
+                ("ba", "int:-2"),
+                ("b9", "double:2.5"),
+                ("b2", "double:2.5"),
+                ("b1", "int:5"),
+            ]),
+        ),
+        (
+            format!("{s} | max(span.num) <= 9007199254740993"),
+            answer(&[
+                ("bc", "int:9007199254740992"),
+                ("bb", "int:2"),
+                ("ba", "int:-2"),
+                ("b9", "double:2.5"),
+                ("b5", "int:9007199254740993"),
+                ("b2", "double:2.5"),
+                ("b1", "int:5"),
+            ]),
+        ),
+        (
+            format!("{s} | max(span.num) > 9007199254740993"),
+            String::new(),
+        ),
+        (
+            format!("{s} | max(span.num) >= 9007199254740993"),
+            answer(&[("b5", "int:9007199254740993")]),
+        ),
+        // Non-finite doubles, negative doubles and the 64-bit boundary
+        // (service `agg493x`): a `NaN` ranks above every number; an
+        // integer `sum` wraps, the mean reads the unwrapped total.
+        (
+            format!("{x} | min(span.num) != 0"),
+            answer(&[
+                ("d8", "int:-9223372036854775808"),
+                ("d7", "int:1"),
+                ("d6", "double:-2.5"),
+                ("d5", "int:5"),
+                ("d4", "double:NaN"),
+                ("d3", "double:1.5"),
+                ("d2", "double:-inf"),
+                ("d1", "double:1.5"),
+            ]),
+        ),
+        (
+            format!("{x} | max(span.num) != 0"),
+            answer(&[
+                ("d8", "int:-1"),
+                ("d7", "int:9223372036854775807"),
+                ("d6", "double:-1.5"),
+                ("d5", "double:NaN"),
+                ("d4", "double:NaN"),
+                ("d3", "double:inf"),
+                ("d2", "double:inf"),
+                ("d1", "double:NaN"),
+            ]),
+        ),
+        (
+            format!("{x} | sum(span.num) != 0"),
+            answer(&[
+                ("d8", "int:9223372036854775807"),
+                ("d7", "int:-9223372036854775808"),
+                ("d6", "double:-4"),
+                ("d5", "double:NaN"),
+                ("d4", "double:NaN"),
+                ("d3", "double:inf"),
+                ("d2", "double:NaN"),
+                ("d1", "double:NaN"),
+            ]),
+        ),
+        (
+            format!("{x} | avg(span.num) != 0"),
+            answer(&[
+                ("d8", "double:-4611686018427388000"),
+                ("d7", "double:4611686018427388000"),
+                ("d6", "double:-2"),
+                ("d5", "double:NaN"),
+                ("d4", "double:NaN"),
+                ("d3", "double:inf"),
+                ("d2", "double:NaN"),
+                ("d1", "double:NaN"),
+            ]),
+        ),
+        (
+            format!("{s} | min(span.num) < 0"),
+            answer(&[("ba", "int:-4")]),
+        ),
+        (
+            format!("{s} | sum(span.num) < 0"),
+            answer(&[("ba", "int:-6")]),
+        ),
+        (
+            format!("{s} | avg(span.num) < 0"),
+            answer(&[("ba", "double:-3")]),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (query, literal) in &cases {
+        let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
+        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let got = grouped_answer_of(&routed);
+        if &got != literal {
+            wrong.push(format!("{query}\n  literal: {literal}\n  routed:  {got}"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// Issue #602 part 1's fixture A: traces `a1` and `a2`, one span `01` and
 /// `02` each, in resources whose `service.name` is the string `"42"` and
 /// the integer `42`.
@@ -16393,8 +16734,8 @@ fn service_aggregate_fixture(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
 }
 
 /// Issue #493: an aggregate over `resource.service.name` reads the integer
-/// `42` from the resource row; the string `"42"` contributing is part 2's
-/// to remove — one statement each.
+/// `42` from the resource row, and the string `"42"` is not a number
+/// (part 2) — one statement each.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_service_name_aggregate_reads_its_stored_type() {
     skip_unless_live!();
@@ -16412,11 +16753,11 @@ async fn a_service_name_aggregate_reads_its_stored_type() {
     for (query, literal) in [
         (
             "{ } | max(resource.service.name) > 0",
-            "a2 1 [02] {int:42 1 [02]}; a1 1 [01] {double:42 1 [01]}",
+            "a2 1 [02] {int:42 1 [02]}",
         ),
         (
             "{ } | sum(resource.service.name) > 0",
-            "a2 1 [02] {int:42 1 [02]}; a1 1 [01] {double:42 1 [01]}",
+            "a2 1 [02] {int:42 1 [02]}",
         ),
     ] {
         let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
@@ -16542,7 +16883,7 @@ async fn an_unscoped_service_name_reads_its_stored_type() {
         (
             "A4",
             "{ } | max(.service.name) > 0",
-            "a2 1 [02] {int:42 1 [02]}; a1 1 [01] {double:42 1 [01]}",
+            "a2 1 [02] {int:42 1 [02]}",
         ),
         (
             "A5",

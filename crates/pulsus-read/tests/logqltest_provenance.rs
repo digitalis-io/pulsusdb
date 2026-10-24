@@ -2114,15 +2114,13 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // `link:` ids' hex text. Every one takes its pattern from
     // `anchored_regex_sql`, the leaf `sql_text.rs` holds.
     ("pulsus-read/src/traces/spans/predicate.rs", 10),
-    // Issue #592 part 3. The aggregate's number test: an attribute's
-    // stored text matched against the writer's number grammar, its pattern
-    // from `anchored_regex_sql`, the leaf `sql_text.rs` holds.
-    ("pulsus-read/src/traces/spans/search.rs", 1),
+    // Issue #493 part 2 removes `traces/spans/search.rs`'s one, the
+    // aggregate's number test: an aggregate reads the stored type.
 ];
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 105;
+const MATCH_RENDER_TOTAL: usize = 104;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.

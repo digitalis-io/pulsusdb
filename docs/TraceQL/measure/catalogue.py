@@ -38,6 +38,8 @@ EMPTY_REASONS = {
     'metrics_result_comparison': 'no bucket of `{ .a = 1 }` holds more than 9 spans a minute, '
                                  '0.15 per second, so no sample passes `> 5`',
     'metrics_avg_nothing': 'no span holds `.no.such.key`, and an aggregation over no span has no series',
+    'aggregate_string_max': 'span `v-string` holds `vals` as the string "1", which ranks above every '
+                            'number, so the maximum over trace `88…` is not a number (#493 part 2)',
 }
 # The same for an instant answer: one bucket over the whole window.
 EMPTY_INSTANT = {
@@ -50,7 +52,10 @@ CAPS = {'answer': LIMIT, 'cut': CUT, 'full': LIMIT}
 # spans last 7 s and 3 ns in all, so their average is 1.75 s and 0.75 ns:
 # truncated it is `1.75s`, rounded up or to the nearest `1.750000001s`. Checked
 # on the route's answer itself, so the two sides cannot agree on another rule.
-PINNED = {'pipeline_avg_duration': ['avg(duration)', ['stringValue', '1.75s']]}
+PINNED = {'pipeline_avg_duration': ['avg(duration)', ['stringValue', '1.75s']],
+          # #493 part 2: of trace `88…`'s `vals`, only `v-int`'s int 1 is a
+          # number; `v-string`'s "1" is not, and the arrays are skipped.
+          'aggregate_string_sum': ['sum(span.vals)', ['intValue', '1']]}
 
 
 def interp_answer(q, limit, spss):

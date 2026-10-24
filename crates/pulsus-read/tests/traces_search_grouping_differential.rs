@@ -46,15 +46,17 @@
 //! A fixture carrying `theirs` is a pinned divergence: BOTH answers are
 //! literal, and the fixture fails if the two ever AGREE — which is the
 //! signal that the owning work landed and the pin must retire with it.
-//! Two causes, both recorded in
+//! The causes, recorded in
 //! `docs/benchmarks/traces-differential-ledger.md`:
 //!
-//!   * an attribute aggregate computes on `val_num`, so an integer past
-//!     2^53 is one digit out (a by-key renders from the exact stored text
-//!     and is not);
 //!   * the reference's mixed-type `sum`/`avg` is order-dependent and we
 //!     compute the true sum (entry 24 of
-//!     `docs/reference-defects-we-do-not-copy.md`).
+//!     `docs/reference-defects-we-do-not-copy.md`);
+//!   * the reference reads a one-element array as its element and an
+//!     empty one as no value (entry 37).
+//!
+//! The pin of an aggregate one digit out past 2^53 retired with issue
+//! #493 part 2: every aggregate reads the stored integer.
 //!
 //! A third cause retired with this change: our aggregate used to run over
 //! the whole trace BEFORE grouping, so a `by()`-then-aggregate query
@@ -442,9 +444,53 @@ const X649: &[SpanDef] = &[
         ("f", r#"{"doubleValue":-0.5}"#),
     ]),
 ];
+/// Issue #493 part 2: an integer pushed first, then a string (`Q`) or a
+/// boolean (`R`), under one key.
+const Q493: &[SpanDef] = &[
+    span(1, "w").attrs(&[("q", r#"{"intValue":"5"}"#)]),
+    span(2, "w").attrs(&[("q", r#"{"stringValue":"x"}"#)]),
+];
+/// The 64-bit boundary: `O` sums past `i64::MAX`, `P` below `i64::MIN`.
+/// `G` holds two negative doubles.
+const O493: &[SpanDef] = &[
+    span(1, "w").attrs(&[("q", r#"{"intValue":"9223372036854775807"}"#)]),
+    span(2, "w").attrs(&[("q", r#"{"intValue":"1"}"#)]),
+];
+const P493: &[SpanDef] = &[
+    span(1, "w").attrs(&[("q", r#"{"intValue":"-9223372036854775808"}"#)]),
+    span(2, "w").attrs(&[("q", r#"{"intValue":"-1"}"#)]),
+];
+const G493: &[SpanDef] = &[
+    span(1, "w").attrs(&[("q", r#"{"doubleValue":-1.5}"#)]),
+    span(2, "w").attrs(&[("q", r#"{"doubleValue":-2.5}"#)]),
+];
+const R493: &[SpanDef] = &[
+    span(1, "w").attrs(&[("q", r#"{"intValue":"5"}"#)]),
+    span(2, "w").attrs(&[("q", r#"{"boolValue":true}"#)]),
+];
 
 fn corpora() -> Vec<Corpus> {
     vec![
+        Corpus {
+            service: "s493q",
+            spans: Q493,
+        },
+        Corpus {
+            service: "s493r",
+            spans: R493,
+        },
+        Corpus {
+            service: "s493o",
+            spans: O493,
+        },
+        Corpus {
+            service: "s493p",
+            spans: P493,
+        },
+        Corpus {
+            service: "s493g",
+            spans: G493,
+        },
         Corpus {
             service: "s510a",
             spans: A,
@@ -636,8 +682,8 @@ const ONE_ELEMENT_ARRAY: &str = "the reference reads a one-element array as its 
 const EMPTY_ARRAY: &str = "the reference reads an empty array as no value — ledger row \
      traceql-search-response-values-against-the-reference, entry 37 of \
      docs/reference-defects-we-do-not-copy.md";
-const PRECISION_LIMIT: &str = "an attribute aggregate computes on val_num — ledger row \
-     traceql-attribute-aggregate-float64-precision";
+const TYPED_VALUES: &str = "the reference divides an integer sum read as unsigned and orders \
+     two doubles by their bits — ledger row traceql-spanset-aggregate-typed-values";
 const EXACT_POW: &str = "integer ^ is exact in the written order — ledger row \
      traceql-arithmetic-exact";
 const MIXED_TYPE: &str = "the reference's mixed-type sum/avg is order-dependent — ledger row \
@@ -832,11 +878,53 @@ fn fixtures() -> Vec<Fixture> {
             "by(.big)=intValue=9007199254740993 | m1 | 01",
             "by(.big)=intValue=-5 | m1 | 02",
         ]),
-        // …and the AGGREGATE path is one digit out, deliberately.
-        diverges("max_attr_beyond_2_53", "s510l", "| max(.big) > 0",
-            &["max(.big)=intValue=9007199254740992 | m2 | 01,02"],
-            &["max(.big)=intValue=9007199254740993 | m2 | 01,02"],
-            PRECISION_LIMIT),
+        // …and so does every aggregate (issue #493 part 2): exact to 64
+        // bits, the mean the exact sum's quotient.
+        parity("max_attr_beyond_2_53", "s510l", "| max(.big) > 0",
+            &["max(.big)=intValue=9007199254740993 | m2 | 01,02"]),
+        parity("sum_attr_beyond_2_53", "s510l", "| sum(.big) > 0",
+            &["sum(.big)=intValue=9007199254740988 | m2 | 01,02"]),
+        parity("avg_attr_beyond_2_53", "s510l", "| avg(.big) > 0",
+            &["avg(.big)=doubleValue=4503599627370494 | m2 | 01,02"]),
+
+        // ---- a string or a boolean is not a number (issue #493 part 2) --
+        parity("sum_attr_numeric_string", "s510h", "| sum(.sn) > 0", &[]),
+        // `max` ranks a string and a boolean above every number, so the
+        // spanset's maximum is not a number; `min` is the number.
+        parity("max_attr_string_beside_int", "s493q", "| max(.q) > 0", &[]),
+        parity("max_attr_bool_beside_int", "s493r", "| max(.q) > 0", &[]),
+        parity("min_attr_string_beside_int", "s493q", "| min(.q) > 0",
+            &["min(.q)=intValue=5 | m2 | 01,02"]),
+        parity("sum_attr_string_beside_int", "s493q", "| sum(.q) > 0",
+            &["sum(.q)=intValue=5 | m2 | 01,02"]),
+        // Non-finite doubles: a `NaN` ranks above every number.
+        parity("min_attr_non_finite", "s510k", "| min(.f) != 0",
+            &["min(.f)=doubleValue=-Infinity | m3 | 01,02,03"]),
+        parity("max_attr_non_finite", "s510k", "| max(.f) != 0",
+            &["max(.f)=doubleValue=NaN | m3 | 01,02,03"]),
+        parity("sum_attr_non_finite", "s510k", "| sum(.f) != 0",
+            &["sum(.f)=doubleValue=NaN | m3 | 01,02,03"]),
+        parity("avg_attr_non_finite", "s510k", "| avg(.f) != 0",
+            &["avg(.f)=doubleValue=NaN | m3 | 01,02,03"]),
+        // The 64-bit boundary: an integer sum wraps on both.
+        parity("sum_attr_wraps_above", "s493o", "| sum(.q) < 0",
+            &["sum(.q)=intValue=-9223372036854775808 | m2 | 01,02"]),
+        parity("avg_attr_above_the_boundary", "s493o", "| avg(.q) > 0",
+            &["avg(.q)=doubleValue=4611686018427388000 | m2 | 01,02"]),
+        parity("sum_attr_wraps_below", "s493p", "| sum(.q) > 0",
+            &["sum(.q)=intValue=9223372036854775807 | m2 | 01,02"]),
+        diverges("avg_attr_below_the_boundary", "s493p", "| avg(.q) != 0",
+            &["avg(.q)=doubleValue=-4611686018427388000 | m2 | 01,02"],
+            &["avg(.q)=doubleValue=4611686018427388000 | m2 | 01,02"],
+            TYPED_VALUES),
+        diverges("max_attr_negative_doubles", "s493g", "| max(.q) < 0",
+            &["max(.q)=doubleValue=-1.5 | m2 | 01,02"],
+            &["max(.q)=doubleValue=-2.5 | m2 | 01,02"],
+            TYPED_VALUES),
+        diverges("avg_attr_string_beside_int", "s493q", "| avg(.q) > 0",
+            &["avg(.q)=doubleValue=5 | m2 | 01,02"],
+            &["avg(.q)=doubleValue=2.5 | m2 | 01,02"],
+            MIXED_TYPE),
 
         // ---- the reference's order-dependent mixed-type arithmetic ----
         diverges("mixed_type_int_first_sum", "s510n", "| sum(.v) > 0",
