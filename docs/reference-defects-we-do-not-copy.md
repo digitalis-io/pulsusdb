@@ -2205,6 +2205,8 @@ An array stays an array of its elements, one and none included, in the `arrayVal
 Ledger row `traceql-search-response-values-against-the-reference`. Pinned by `array_one_element_by` and
 `array_empty_by` in `crates/pulsus-read/tests/traces_search_grouping_differential.rs`.
 
+---
+
 ## 38. One span missing an operand fails a whole grouped query
 
 **The trace reference · queries · test A**

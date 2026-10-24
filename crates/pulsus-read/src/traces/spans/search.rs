@@ -1115,8 +1115,9 @@ fn agg_of(
 
 /// An aggregate's response value (issue #592 part 3), as today's
 /// `aggregate_value` builds its wire: a count and an `AggInt` as an `Int`
-/// (an `f64` cast as today casts it), an `AggDouble` as its raw bits, a
-/// duration as Go's duration text.
+/// parsed from the text as an `i64`, never through `f64` (issue #493
+/// part 2), an `AggDouble` as its raw bits, a duration as Go's duration
+/// text.
 pub(crate) fn aggregate_value(text: &str, value_type: &str) -> Result<GroupValue, String> {
     let f = || {
         text.parse::<f64>()
