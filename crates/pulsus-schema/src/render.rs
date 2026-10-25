@@ -70,12 +70,20 @@ pub struct RenderCtx {
     /// service-graph job may read. Not a setting: production renders
     /// [`GRAPH_JOB_MAX_ROWS`], and a test lowers it to make a run fail.
     pub graph_job_max_rows: u64,
+    /// `{{rollup_settle_ms}}` (issue #18): the time after a UTC day ends
+    /// before `metric_rollup_mv` derives it. Not a setting: production
+    /// renders [`ROLLUP_SETTLE_MS`], and a test may render another value.
+    pub rollup_settle_ms: u64,
 }
 
 /// The rows one run of the service-graph job may read (issue #599), the
 /// value `schema/schema.sh` renders: three 5-minute buckets of spans at
 /// about 67,000 spans a second on one shard.
 pub const GRAPH_JOB_MAX_ROWS: u64 = 60_000_000;
+
+/// The time after a UTC day ends before `metric_rollup_mv` derives it
+/// (issue #18), the value `schema/schema.sh` renders: two hours.
+pub const ROLLUP_SETTLE_MS: u64 = 7_200_000;
 
 impl RenderCtx {
     /// A context for a test: `db` and `retention_days` as given, every other
@@ -103,6 +111,7 @@ impl RenderCtx {
             trace_dedup_window: 10_000,
             trace_indexed_attributes: Vec::new(),
             graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
+            rollup_settle_ms: ROLLUP_SETTLE_MS,
         }
     }
 }
@@ -265,6 +274,7 @@ mod tests {
             trace_dedup_window: 10_000,
             trace_indexed_attributes: Vec::new(),
             graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
+            rollup_settle_ms: ROLLUP_SETTLE_MS,
         }
     }
 

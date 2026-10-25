@@ -21,5 +21,7 @@ pub use checks::{
     required_names_sql, retention_days_from_comment, schema_retention, server_version,
 };
 pub use error::SchemaError;
-pub use render::{GRAPH_JOB_MAX_ROWS, RenderCtx, SchemaParams, render_name, rollup_suffix};
+pub use render::{
+    GRAPH_JOB_MAX_ROWS, ROLLUP_SETTLE_MS, RenderCtx, SchemaParams, render_name, rollup_suffix,
+};
 pub use sql::{SCHEMA_SQL, mv_projection, rendered, rendered_statements, table_column_names};

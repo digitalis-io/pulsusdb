@@ -22,6 +22,8 @@
 //! runtimes where the host cannot route directly to the compose network
 //! (falls back to the fixture's published host ports in that case).
 
+mod common;
+
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -57,6 +59,9 @@ static TEST_DB_RETENTION: pulsus_testkit::TestDb =
 // Issue #496: the newest instant survives a late row on every replica.
 static TEST_DB_LATE_ROW: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_late_row");
+// Issue #18 part 1: each shard derives its slice of the rollup.
+static TEST_DB_ROLLUP: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_rollup");
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -136,6 +141,7 @@ fn cluster_ctx(db: &str) -> SchemaParams {
         trace_dedup_window: 10_000,
         trace_indexed_attributes: Vec::new(),
         graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
+        rollup_settle_ms: pulsus_schema::ROLLUP_SETTLE_MS,
     }
 }
 
@@ -1954,4 +1960,253 @@ async fn a_late_row_keeps_the_newest_instant_on_every_replica() {
         got, want,
         "one row per key on every replica, carrying the newest instant"
     );
+}
+
+/// One data row of `metric_rollup` as a summary, floats as bits.
+/// Positional: the field order is the `SELECT`'s in
+/// [`a_shard_derives_its_slice_from_every_shard_and_the_slices_cover_the_space`].
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ClusterRollupRow {
+    res: u32,
+    org_id: String,
+    fingerprint: u128,
+    t_end: i64,
+    n: u32,
+    t_first: i64,
+    v_first: u64,
+    t_last: i64,
+    v_last: u64,
+    t_prev: i64,
+    v_prev: u64,
+    v_min: u64,
+    v_max: u64,
+    changes: u32,
+    n_resets: u32,
+    resets: Vec<u64>,
+    t_any: i64,
+    any_stale: u8,
+    has_hist: u8,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ClusterCoverageRow {
+    day: i64,
+    res: u32,
+    lo: u128,
+    hi: u128,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ClusterSampleRow {
+    org_id: String,
+    fingerprint: u128,
+    unix_milli: i64,
+    bits: u64,
+}
+
+async fn rows_on<R: ChRow>(client: &ChClient, sql: &str) -> Vec<R> {
+    let mut stream = client
+        .query_stream::<R>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("read failed: {e}\nSQL:\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.unwrap_or_else(|e| panic!("decode failed: {e}\nSQL:\n{sql}")));
+    }
+    out
+}
+
+/// Whether the chunks of `(day, res)` together cover `[lo, hi]` with no gap.
+fn chunks_cover(cov: &[ClusterCoverageRow], day: i64, res: u32, lo: u128, hi: u128) -> bool {
+    let mut chunks: Vec<(u128, u128)> = cov
+        .iter()
+        .filter(|c| c.day == day && c.res == res)
+        .map(|c| (c.lo, c.hi))
+        .collect();
+    chunks.sort();
+    let mut next = Some(lo);
+    for (a, b) in chunks {
+        if let Some(n) = next
+            && a <= n
+            && b >= n
+        {
+            next = if b >= hi { None } else { Some(b + 1) };
+        }
+    }
+    next.is_none()
+}
+
+/// **1-e (issue #18 part 1).** Each shard's `metric_rollup_mv` derives its
+/// slice of the fingerprint space from every shard's samples, and writes it
+/// to its own shard. One series' samples on `T−3` are split alternately
+/// between shard 1 and shard 2; one series in shard 2's slice sits only on
+/// shard 1, and one (fingerprint `3 × 10^38`) only on shard 2. After four
+/// refreshes of each of the three replicas, the rows read through
+/// `metric_rollup_dist FINAL` equal the summarizer's for all three series;
+/// each shard's coverage covers its slice, and together the whole space,
+/// for `T−4` (the day before the oldest partition), `T−3` and the empty
+/// `T−2`; and both replicas of shard 1 wrote rows.
+#[tokio::test]
+async fn a_shard_derives_its_slice_from_every_shard_and_the_slices_cover_the_space() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard1b = ChClient::new(shard1b_config())
+        .await
+        .expect("connect shard1b");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+    let db = &TEST_DB_ROLLUP;
+    drop_cluster_db(&shard1, db).await;
+    let ctx = RenderCtx {
+        retention_days: 40,
+        ..cluster_ctx(db)
+    };
+    run_init(&shard1, &ctx).await.expect("run_init (clustered)");
+    let replicas = [&shard1, &shard1b, &shard2];
+    // No scheduled refresh may run while the day is only partly written.
+    for r in replicas {
+        exec_on(r, &format!("SYSTEM STOP VIEW {db}.metric_rollup_mv")).await;
+    }
+
+    const DAY: i64 = 86_400_000;
+    let t = ints_on(
+        &shard1,
+        "SELECT intDiv(toInt64(toUnixTimestamp64Milli(now64())), 86400000) AS v",
+    )
+    .await[0];
+    let half: u128 = 1 << 127;
+    let split: u128 = 1;
+    let shard1_only: u128 = half + 7;
+    let shard2_only: u128 = 300_000_000_000_000_000_000_000_000_000_000_000_000;
+    let start = (t - 3) * DAY;
+    let insert = |fp: u128, filter: &str| {
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT '', ts, 0, '', toUInt128('{fp}'), ts, toFloat64(number % 37) FROM ( \
+               SELECT number, toInt64({start} + number * 15000 + 7500) AS ts FROM numbers(5760) WHERE {filter})"
+        )
+    };
+    exec_on(&shard1, &insert(split, "number % 2 = 0")).await;
+    exec_on(&shard2, &insert(split, "number % 2 = 1")).await;
+    exec_on(&shard1, &insert(shard1_only, "1")).await;
+    exec_on(&shard2, &insert(shard2_only, "1")).await;
+    for r in [&shard1, &shard1b] {
+        exec_on(r, &format!("SYSTEM SYNC REPLICA {db}.metric_samples")).await;
+    }
+    for r in replicas {
+        exec_on(r, &format!("SYSTEM START VIEW {db}.metric_rollup_mv")).await;
+    }
+
+    for _ in 0..4 {
+        for r in replicas {
+            exec_on(r, &format!("SYSTEM REFRESH VIEW {db}.metric_rollup_mv")).await;
+            exec_on(r, &format!("SYSTEM WAIT VIEW {db}.metric_rollup_mv")).await;
+        }
+    }
+    for r in [&shard1, &shard1b] {
+        exec_on(r, &format!("SYSTEM SYNC REPLICA {db}.metric_rollup")).await;
+    }
+
+    let floats: Vec<common::rollup_summary::FloatSample> = rows_on::<ClusterSampleRow>(
+        &shard1,
+        &format!(
+            "SELECT toString(org_id), fingerprint, unix_milli, reinterpretAsUInt64(value) \
+             FROM {db}.metric_samples_dist"
+        ),
+    )
+    .await
+    .into_iter()
+    .map(|r| (r.org_id, r.fingerprint, r.unix_milli, r.bits))
+    .collect();
+    assert_eq!(floats.len(), 3 * 5760, "every sample reads back");
+    let want = common::rollup_summary::summarize(&floats, &[]);
+    let got: Vec<common::rollup_summary::Summary> = rows_on::<ClusterRollupRow>(
+        &shard1,
+        &format!(
+            "SELECT res, toString(org_id), fingerprint, t_end, n, t_first, reinterpretAsUInt64(v_first), \
+             t_last, reinterpretAsUInt64(v_last), t_prev, reinterpretAsUInt64(v_prev), \
+             reinterpretAsUInt64(v_min), reinterpretAsUInt64(v_max), changes, n_resets, \
+             arrayMap(x -> reinterpretAsUInt64(x), resets), t_any, any_stale, has_hist \
+             FROM {db}.metric_rollup_dist FINAL WHERE row_kind = 0"
+        ),
+    )
+    .await
+    .into_iter()
+    .map(|r| common::rollup_summary::Summary {
+        res: r.res,
+        org_id: r.org_id,
+        fingerprint: r.fingerprint,
+        t_end: r.t_end,
+        n: r.n,
+        t_first: r.t_first,
+        v_first: r.v_first,
+        t_last: r.t_last,
+        v_last: r.v_last,
+        t_prev: r.t_prev,
+        v_prev: r.v_prev,
+        v_min: r.v_min,
+        v_max: r.v_max,
+        changes: r.changes,
+        n_resets: r.n_resets,
+        resets: r.resets,
+        t_any: r.t_any,
+        any_stale: r.any_stale,
+        has_hist: r.has_hist,
+    })
+    .collect();
+    let mut got_sorted = got.clone();
+    got_sorted.sort();
+    let matching = got_sorted.iter().filter(|r| want.contains(r)).count();
+    assert_eq!(
+        got_sorted,
+        want,
+        "{matching} of {} expected rows match, {} rows read",
+        want.len(),
+        got.len()
+    );
+
+    let cov_sql = |table: &str| {
+        format!(
+            "SELECT intDiv(t_end - 1, {DAY}) AS day, res, fingerprint AS lo, chunk_last AS hi \
+             FROM {db}.{table} WHERE row_kind = 1"
+        )
+    };
+    let on1 = rows_on::<ClusterCoverageRow>(&shard1, &cov_sql("metric_rollup")).await;
+    let on2 = rows_on::<ClusterCoverageRow>(&shard2, &cov_sql("metric_rollup")).await;
+    let all = rows_on::<ClusterCoverageRow>(&shard1, &cov_sql("metric_rollup_dist")).await;
+    for day in [t - 4, t - 3, t - 2] {
+        for res in [300_000u32, 3_600_000] {
+            assert!(
+                chunks_cover(&on1, day, res, 0, half - 1),
+                "shard 1 covers its slice on day {day} at res {res}"
+            );
+            assert!(
+                chunks_cover(&on2, day, res, half, u128::MAX),
+                "shard 2 covers its slice on day {day} at res {res}"
+            );
+            assert!(
+                chunks_cover(&all, day, res, 0, u128::MAX),
+                "the shards together cover the space on day {day} at res {res}"
+            );
+        }
+    }
+
+    // Both replicas of shard 1 refreshed and wrote parts of their own.
+    for (name, r) in [("shard1", &shard1), ("shard1b", &shard1b)] {
+        exec_on(r, "SYSTEM FLUSH LOGS").await;
+        let written = count_on(
+            r,
+            &format!(
+                "SELECT count() AS n FROM system.part_log WHERE database = '{db}' \
+                 AND table = 'metric_rollup' AND event_type = 'NewPart' AND rows > 0"
+            ),
+        )
+        .await;
+        assert!(written > 0, "{name} wrote no rollup part of its own");
+    }
+    drop_cluster_db(&shard1, db).await;
 }
