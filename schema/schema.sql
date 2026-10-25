@@ -1037,16 +1037,35 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level-first     if(q IS NULL OR isNaN(value) OR isNaN(assumeNotNull(q)), 0.,
 --@level-first        if(value >= assumeNotNull(q), value - assumeNotNull(q), value)) AS d
 --@level-first   FROM (
---@level-first     SELECT org_id, fingerprint, unix_milli, bits, reinterpretAsFloat64(bits) AS value,
---@level-first       lagInFrame(toNullable(reinterpretAsFloat64(bits))) OVER (PARTITION BY org_id, fingerprint
---@level-first           ORDER BY unix_milli, bits ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS q
---@level-first     FROM (SELECT DISTINCT org_id, fingerprint, unix_milli, reinterpretAsUInt64(value) AS bits
---@level-first --@single           FROM {{db}}.metric_landing
---@level-first --@cluster           FROM clusterAllReplicas('{{cluster}}', {{db}}.metric_landing)
---@level-first           WHERE work AND kind = 0
---@level-first             AND intDiv(unix_milli, 300000) BETWEEN intDiv(lo - 120000, 300000) AND intDiv(hi, 300000)
---@level-first             AND unix_milli > lo - 120000 AND unix_milli <= hi
---@level-first             AND fingerprint BETWEEN toUInt128(slice_lo) AND toUInt128(slice_hi)))
+--@level-first     SELECT org_id, fingerprint, unix_milli, bits, value,
+--@level-first       if(isNull(q0), if(unix_milli - tp0 <= 86400000, p0, NULL), if(unix_milli - t0 <= 86400000, q0, NULL)) AS q
+--@level-first     FROM (
+--@level-first       SELECT org_id, fingerprint, unix_milli, bits, reinterpretAsFloat64(bits) AS value,
+--@level-first         lagInFrame(toNullable(reinterpretAsFloat64(bits))) OVER (PARTITION BY org_id, fingerprint
+--@level-first             ORDER BY unix_milli, bits ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS q0,
+--@level-first         lagInFrame(toNullable(unix_milli)) OVER (PARTITION BY org_id, fingerprint ORDER BY unix_milli, bits ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS t0
+--@level-first       FROM (SELECT DISTINCT org_id, fingerprint, unix_milli, reinterpretAsUInt64(value) AS bits
+--@level-first --@single             FROM {{db}}.metric_landing
+--@level-first --@cluster             FROM clusterAllReplicas('{{cluster}}', {{db}}.metric_landing)
+--@level-first             WHERE work AND kind = 0
+--@level-first               AND intDiv(unix_milli, 300000) BETWEEN intDiv(lo - 120000, 300000) AND intDiv(hi, 300000)
+--@level-first               AND unix_milli > lo - 120000 AND unix_milli <= hi
+--@level-first               AND fingerprint BETWEEN toUInt128(slice_lo) AND toUInt128(slice_hi))) AS w
+--@level-first     LEFT JOIN (
+--@level-first       SELECT org_id, fingerprint,
+--@level-first              toNullable(argMaxIf(last, t_last, NOT isNaN(last))) AS p0,
+--@level-first              toNullable(maxIf(t_last, NOT isNaN(last))) AS tp0
+--@level-first       FROM {{db}}.metric_samples_{{level}}
+--@level-first       WHERE kind = 0 AND t_end <= lo AND t_end > lo - 86400000
+--@level-first         AND (org_id, fingerprint) IN (SELECT org_id, fingerprint
+--@level-first --@single  FROM {{db}}.metric_landing
+--@level-first --@cluster FROM clusterAllReplicas('{{cluster}}', {{db}}.metric_landing)
+--@level-first                               WHERE work AND kind = 0
+--@level-first                                 AND intDiv(unix_milli, 300000) BETWEEN intDiv(lo - 120000, 300000) AND intDiv(hi, 300000)
+--@level-first                                 AND unix_milli > lo - 120000 AND unix_milli <= hi
+--@level-first                                 AND fingerprint BETWEEN toUInt128(slice_lo) AND toUInt128(slice_hi)
+--@level-first                               GROUP BY org_id, fingerprint HAVING min(unix_milli) > lo)
+--@level-first       GROUP BY org_id, fingerprint) AS z USING (org_id, fingerprint))
 --@level-first   WHERE unix_milli > lo)
 --@level-first GROUP BY org_id, fingerprint, t_end
 --@level-next SELECT toUInt8(0) AS kind, org_id, fingerprint, (intDiv(te - 1, {{level_ms}}) + 1) * {{level_ms}} AS t_end,
