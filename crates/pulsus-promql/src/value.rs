@@ -212,7 +212,8 @@ impl Labels {
 }
 
 /// One resolved series' fetched samples, pre-sorted ascending by `t_ms`
-/// (the fetch `ORDER BY fingerprint, unix_milli` — docs/schemas.md §2.3).
+/// (the fetch `ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)`
+/// — docs/schemas.md §2.3), floats at one millisecond in value-bits order.
 ///
 /// **`metric_name` (issue #85, M6-08c):** each fetched series' own metric
 /// name, carried by the fetch layer alongside the `__name__`-free

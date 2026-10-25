@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 /// One `metric_samples` row from [`super::sample_sql::sample_fetch`] /
 /// [`super::sample_sql::sample_fetch_subquery`] (docs/schemas.md §2.3):
 /// `SELECT fingerprint, unix_milli, value FROM metric_samples WHERE
-/// <window> AND fingerprint IN (...) ORDER BY fingerprint, unix_milli`.
+/// <window> AND fingerprint IN (...) ORDER BY fingerprint, unix_milli,
+/// reinterpretAsUInt64(value)`.
 #[derive(Debug, Clone, Copy, PartialEq, Row, Serialize, Deserialize)]
 pub struct SampleRow {
     pub fingerprint: Fingerprint,

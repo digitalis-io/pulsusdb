@@ -129,7 +129,7 @@ impl CrateUnderTest for ChCandidate {
         let sql = format!(
             "SELECT fingerprint, unix_milli, value FROM {table} \
              WHERE fingerprint BETWEEN toUInt128('{lo}') AND toUInt128('{hi}') \
-             ORDER BY fingerprint, unix_milli"
+             ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
         );
         let mut cursor = self.client.query(&sql).fetch::<ChMetricProj>()?;
         let mut count = 0u64;
@@ -274,7 +274,7 @@ impl CrateUnderTest for KlCandidate {
         let sql = format!(
             "SELECT fingerprint, unix_milli, value FROM {table} \
              WHERE fingerprint BETWEEN toUInt128('{lo}') AND toUInt128('{hi}') \
-             ORDER BY fingerprint, unix_milli"
+             ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
         );
         let mut stream = self.client.query::<KlMetricProj, _>(sql).await?;
         let mut count = 0u64;

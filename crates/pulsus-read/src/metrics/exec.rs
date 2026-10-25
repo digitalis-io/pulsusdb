@@ -3653,12 +3653,14 @@ impl HistPoint for MultiHistSampleRow {
 ///
 /// > **If any histogram is present the answer is a histogram and no float
 /// > survives; otherwise the answer is each distinct float value-bit
-/// > identity, in arrival order.**
+/// > identity, in value-bits order.**
 ///
 /// The comparison is over the whole timestamp RUN, not the previous row.
-/// Rows arrive ordered by `(fingerprint, unix_milli)` (the fetch `ORDER BY`
-/// contract), so a run is contiguous, and in the ordinary case a run is one
-/// row long and the loops below do one comparison each.
+/// Float rows arrive ordered by `(fingerprint, unix_milli, value bits)`
+/// (the fetch `ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)`
+/// contract, issue #18 part 3), so a run is contiguous and its floats are
+/// in value-bits order, and in the ordinary case a run is one row long and
+/// the loops below do one comparison each.
 ///
 /// Two floats and one histogram at one millisecond used to leave a stray
 /// float behind — the tie-break consumed ONE float and one histogram, and
@@ -3687,7 +3689,8 @@ fn emit_timestamp_run<F: FloatPoint, H: HistPoint>(
 }
 
 /// One timestamp run's histograms: each distinct stored value once, in
-/// arrival order.
+/// arrival order. The histogram fetch orders by `fingerprint, unix_milli`
+/// alone; only floats are ordered by value bits.
 ///
 /// Linear while the run is short, which is every run a well-formed store
 /// produces — one histogram per `(series, millisecond)` is the invariant.

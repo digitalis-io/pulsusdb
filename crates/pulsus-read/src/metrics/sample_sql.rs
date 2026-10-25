@@ -96,7 +96,7 @@ pub fn sample_fetch(
     );
     let fps = fingerprints_predicate(fps);
     format!(
-        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
+        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
     )
 }
 
@@ -118,7 +118,7 @@ pub fn sample_fetch_subquery(
     );
     let sub = subquery_predicate(subquery);
     format!(
-        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli"
+        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
     )
 }
 
@@ -142,7 +142,7 @@ pub fn sample_fetch_multi(
     );
     let fps = fingerprints_predicate(fps);
     format!(
-        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
+        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
     )
 }
 

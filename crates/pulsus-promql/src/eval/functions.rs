@@ -9,6 +9,8 @@ use crate::math::{KahanSum, kahan_inc};
 use crate::plan::{OverTimeFn, OverTimeParamFn, RangeFn};
 use crate::value::Sample;
 
+use super::window;
+
 /// `rate`/`increase`/`delta` + `irate`'s shared entry point. `samples` must
 /// already be windowed to the step's range-vector window (left-open
 /// right-closed, with any stale-NaN-marked sample already excluded by the
@@ -119,7 +121,14 @@ pub(super) fn is_start_timestamp_reset(
 /// value comparison alone (the pre-change path — upstream's ST fields are
 /// zero-valued when the engine option is off, and `is_start_timestamp_
 /// reset` with `curr_st == 0` is always false).
+///
+/// Issue #18 part 3: without a start-timestamp channel this is
+/// [`window::summarize_last_two`] then [`window::finish_irate`], the same
+/// operations; the `Some` arm keeps its sample loop.
 fn eval_irate(samples: &[Sample], start_ts: Option<&[i64]>) -> Option<f64> {
+    let Some(st) = start_ts else {
+        return window::summarize_last_two(samples).and_then(|w| window::finish_irate(&w));
+    };
     if samples.len() < 2 {
         return None;
     }
@@ -129,18 +138,13 @@ fn eval_irate(samples: &[Sample], start_ts: Option<&[i64]>) -> Option<f64> {
     if interval_ms == 0 {
         return None;
     }
-    let is_reset = match start_ts {
-        None => last.v < prev.v,
-        Some(st) => {
-            last.v < prev.v
-                || is_start_timestamp_reset(
-                    st[samples.len() - 2],
-                    prev.t_ms,
-                    st[samples.len() - 1],
-                    last.t_ms,
-                )
-        }
-    };
+    let is_reset = last.v < prev.v
+        || is_start_timestamp_reset(
+            st[samples.len() - 2],
+            prev.t_ms,
+            st[samples.len() - 1],
+            last.t_ms,
+        );
     let mut result = if is_reset { last.v } else { last.v - prev.v };
     result /= interval_ms as f64 / 1000.0;
     Some(result)
@@ -157,6 +161,10 @@ fn eval_irate(samples: &[Sample], start_ts: Option<&[i64]>) -> Option<f64> {
 ///
 /// Requires at least 2 samples in the window (the extrapolation heuristic
 /// needs at least one interval to average).
+///
+/// Issue #18 part 3: the window is summarized ([`window::summarize_counter`]
+/// for a counter, its ends alone for `delta`) and finished by
+/// [`window::finish_extrapolated`], which carries the two numbered notes.
 fn eval_extrapolated(
     samples: &[Sample],
     range_ms: i64,
@@ -166,40 +174,27 @@ fn eval_extrapolated(
     is_rate: bool,
     start_ts: Option<&[i64]>,
 ) -> Option<f64> {
-    if samples.len() < 2 {
-        return None;
-    }
-    let first = &samples[0];
-    let last = &samples[samples.len() - 1];
-    // Line 510: `resultFloat = samples.Floats[numSamplesMinusOne].F -
-    // samples.Floats[0].F` (last - first).
-    let mut result_value = last.v - first.v;
-
-    // Lines 519-524: counter-reset correction. Go's loop walks
-    // `samples.Floats[1:]` (never comparing the very first sample against
-    // anything), pairing each element with its immediate predecessor.
-    // Starting `last_value` at `0.0` and looping over every sample
-    // (including the first) is equivalent for a counter — the first
-    // comparison (`first.v < 0.0`) can never fire for a genuine
-    // non-negative counter reading — without needing a second slice index.
-    //
-    // Issue #155: one branch per WINDOW on the ST channel — the `None`
-    // arm is the pre-change loop verbatim; the `Some` arm mirrors the
-    // pin's `:521` condition `currPoint.F < prevPoint.F || (i+1 <
-    // len(startTimestamps) && isStartTimestampReset(startTimestamps[i],
-    // prevPoint.T, startTimestamps[i+1], currPoint.T))`.
-    if is_counter {
-        match start_ts {
-            None => {
-                let mut last_value = 0.0_f64;
-                for s in samples {
-                    if s.v < last_value {
-                        result_value += last_value;
-                    }
-                    last_value = s.v;
-                }
-            }
-            Some(st) => {
+    let summary = match start_ts {
+        // Lines 519-524: counter-reset correction. Go's loop walks
+        // `samples.Floats[1:]` (never comparing the very first sample
+        // against anything), pairing each element with its immediate
+        // predecessor. [`window::summarize_counter`] starts its
+        // `last_value` at `0.0` and loops over every sample (including the
+        // first), which is equivalent for a counter — the first comparison
+        // (`first.v < 0.0`) can never fire for a genuine non-negative
+        // counter reading — and records each addend in order. `delta`
+        // reads no corrections, so none are built for it.
+        None if is_counter => window::summarize_counter(samples),
+        None => window::summarize_ends(samples),
+        // Issue #155: one branch per WINDOW on the ST channel. This arm
+        // mirrors the pin's `:521` condition `currPoint.F < prevPoint.F ||
+        // (i+1 < len(startTimestamps) &&
+        // isStartTimestampReset(startTimestamps[i], prevPoint.T,
+        // startTimestamps[i+1], currPoint.T))`, recording the same addends
+        // in the same order.
+        Some(st) => {
+            let mut w = window::summarize_ends(samples);
+            if let Some(w) = w.as_mut().filter(|_| is_counter) {
                 for i in 1..samples.len() {
                     let prev = &samples[i - 1];
                     let curr = &samples[i];
@@ -207,70 +202,24 @@ fn eval_extrapolated(
                         || (i < st.len()
                             && is_start_timestamp_reset(st[i - 1], prev.t_ms, st[i], curr.t_ms))
                     {
-                        result_value += prev.v;
+                        w.corrections.push(prev.v);
                     }
                 }
             }
+            w
         }
-    }
-
-    // Lines 531-535.
-    let mut duration_to_start = (first.t_ms - range_start_ms) as f64 / 1000.0;
-    let mut duration_to_end = (range_end_ms - last.t_ms) as f64 / 1000.0;
-    let sampled_interval = (last.t_ms - first.t_ms) as f64 / 1000.0;
-    let average_duration_between_samples = sampled_interval / (samples.len() - 1) as f64;
-    let extrapolation_threshold = average_duration_between_samples * 1.1;
-
-    // issue #39 note 1 — ORDER matters here, not just the two formulas in
-    // isolation: upstream clamps `durationToStart` to the threshold FIRST
-    // (lines 550-552), and only *then* (lines 553-574) applies the
-    // counter-cannot-go-negative zero-point override, comparing
-    // `durationToZero` against the *already-clamped* `duration_to_start` —
-    // never the raw value. Computing the zero-point override against the
-    // raw `duration_to_start` (as a prior version of this port did) and
-    // applying the threshold clamp as a separate, later decision is a
-    // different sequence of comparisons, which can select a different
-    // final `duration_to_start` (not merely round differently).
-    if duration_to_start >= extrapolation_threshold {
-        duration_to_start = average_duration_between_samples / 2.0;
-    }
-    if is_counter {
-        // Lines 560-573: `durationToZero := durationToStart` is the
-        // fallback when the zero-crossing isn't computable — mirrored
-        // here by pre-seeding `duration_to_zero` with the (already
-        // threshold-clamped) `duration_to_start` so the final `if
-        // duration_to_zero < duration_to_start` comparison is a genuine
-        // no-op in that case, exactly as upstream's is.
-        let mut duration_to_zero = duration_to_start;
-        if result_value > 0.0 && first.v >= 0.0 {
-            duration_to_zero = sampled_interval * (first.v / result_value);
-        }
-        if duration_to_zero < duration_to_start {
-            duration_to_start = duration_to_zero;
-        }
-    }
-    // Lines 576-578: `duration_to_end`'s own threshold clamp — independent
-    // of the counter zero-point logic above, which only ever touches
-    // `duration_to_start`.
-    if duration_to_end >= extrapolation_threshold {
-        duration_to_end = average_duration_between_samples / 2.0;
-    }
-
-    // issue #39 note 2 — the actual root cause of the observed ULP
-    // divergence: lines 580-585 fully reduce `factor` (including the `/
-    // ms.Range.Seconds()` division when `is_rate`) into ONE value, THEN
-    // multiply `resultFloat` by it exactly once. `(a * b) / c` and `a *
-    // (b / c)` round differently in IEEE 754 even though they're
-    // mathematically equal — a prior version of this port did
-    // `result_value *= (extrapolate_to_interval / sampled_interval)`
-    // followed by a *separate* `result_value /= range_seconds`, which is
-    // the `(a*b)/c` shape upstream never performs.
-    let mut factor = (sampled_interval + duration_to_start + duration_to_end) / sampled_interval;
-    if is_rate {
-        factor /= range_ms as f64 / 1000.0;
-    }
-    result_value *= factor;
-    Some(result_value)
+    }?;
+    // Line 510 onward — `resultFloat = last - first`, each correction
+    // added in order, then the duration and factor arithmetic — is
+    // [`window::finish_extrapolated`], operation for operation.
+    window::finish_extrapolated(
+        &summary,
+        range_ms,
+        range_start_ms,
+        range_end_ms,
+        is_counter,
+        is_rate,
+    )
 }
 
 /// `avg/min/max/sum/count_over_time`. `None` for an empty window (series
@@ -459,28 +408,14 @@ fn eval_deriv(samples: &[Sample]) -> Option<f64> {
 /// round-1 Δ2), otherwise the last two floats' plain difference (no
 /// counter-reset branch and no per-second division in non-rate mode).
 fn eval_idelta(samples: &[Sample]) -> Option<f64> {
-    if samples.len() < 2 {
-        return None;
-    }
-    let last = &samples[samples.len() - 1];
-    let prev = &samples[samples.len() - 2];
-    if last.t_ms - prev.t_ms == 0 {
-        return None;
-    }
-    Some(last.v - prev.v)
+    window::summarize_last_two(samples).and_then(|w| window::finish_idelta(&w))
 }
 
 /// `resets` — `funcResets` (v3.13.0, floats-only path): counts strict
 /// drops (`cur < prev`) between consecutive samples. IEEE `<` makes any
 /// NaN-adjacent pair a non-reset (both `NaN < x` and `x < NaN` are false).
 fn eval_resets(samples: &[Sample]) -> f64 {
-    let mut resets = 0.0_f64;
-    for w in samples.windows(2) {
-        if w[1].v < w[0].v {
-            resets += 1.0;
-        }
-    }
-    resets
+    window::summarize_steps(samples).map_or(0.0, |w| f64::from(w.resets))
 }
 
 /// `changes` — `funcChanges` (v3.13.0, floats-only path): counts
@@ -488,14 +423,7 @@ fn eval_resets(samples: &[Sample]) -> f64 {
 /// (upstream's explicit `!(IsNaN(cur) && IsNaN(prev))`) — a one-sided NaN
 /// transition (`0 → NaN`, `NaN → 0`) still counts.
 fn eval_changes(samples: &[Sample]) -> f64 {
-    let mut changes = 0.0_f64;
-    for w in samples.windows(2) {
-        let (prev, cur) = (w[0].v, w[1].v);
-        if cur != prev && !(cur.is_nan() && prev.is_nan()) {
-            changes += 1.0;
-        }
-    }
-    changes
+    window::summarize_steps(samples).map_or(0.0, |w| f64::from(w.changes))
 }
 
 /// `stdvar_over_time` (`stddev_over_time` = its square root) —
@@ -689,17 +617,10 @@ enum WhichExtremum {
 /// non-empty.
 fn eval_extremum_over_time(samples: &[Sample], which: WhichExtremum) -> f64 {
     debug_assert!(!samples.is_empty(), "caller already checked non-empty");
-    let mut extremum = samples[0].v;
-    for s in samples {
-        let replace = match which {
-            WhichExtremum::Min => s.v < extremum,
-            WhichExtremum::Max => s.v > extremum,
-        } || extremum.is_nan();
-        if replace {
-            extremum = s.v;
-        }
-    }
-    extremum
+    window::summarize_extremum(samples).map_or(f64::NAN, |w| match which {
+        WhichExtremum::Min => w.min,
+        WhichExtremum::Max => w.max,
+    })
 }
 
 /// `avg_over_time` — upstream's `funcAvgOverTime` float path
