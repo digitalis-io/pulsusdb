@@ -796,16 +796,14 @@ async fn a_database_with_no_samples_derives_nothing() {
     drop_db(&client, db).await;
 }
 
-/// A fresh database with both views stopped, and `T`.
-async fn stopped_db(client: &ChClient, name: &str) -> (String, i64) {
-    let db = pulsus_testkit::test_db(name);
-    drop_db(client, &db).await;
-    run_init(client, &RenderCtx::for_tests(&db, RETENTION_DAYS))
+/// `db` built fresh with both views stopped, and `T`.
+async fn stopped_db(client: &ChClient, db: &str) -> i64 {
+    drop_db(client, db).await;
+    run_init(client, &RenderCtx::for_tests(db, RETENTION_DAYS))
         .await
         .expect("run_init");
-    views(client, &db, "STOP").await;
-    let t = now_ms(client).await / DAY;
-    (db, t)
+    views(client, db, "STOP").await;
+    now_ms(client).await / DAY
 }
 
 /// Replaces this replica's plan row with a run of empty days over the
@@ -835,18 +833,17 @@ fn rows_of_day(rows: &[RollupRow], day: i64) -> usize {
 /// **1-j, 1-j2, 1-j3.** A plan made before a backfill names a run of empty
 /// days, and one of them has since gained a sample. A refresh of the
 /// derivation alone, on that plan, covers the days that are still empty and
-/// not the one that gained the sample. `backfill` lands the sample; `run`
+/// not the one that gained the sample. `db` is the database; `backfill` lands the sample; `run`
 /// is the plan's run; `gained` is the day the sample belongs to.
 async fn a_stale_plan_does_not_certify_a_backfilled_day(
-    name: &str,
+    db: &str,
     run: fn(i64) -> Vec<i64>,
     backfill: fn(&str, i64) -> String,
     gained: fn(i64) -> i64,
     then_derive: bool,
 ) {
     let client = ChClient::new(test_config()).await.expect("connect");
-    let (db, t) = stopped_db(&client, name).await;
-    let db = db.as_str();
+    let t = stopped_db(&client, db).await;
     let ordinary: Vec<(u128, i64, Option<f64>)> = [t - 7, t - 2]
         .iter()
         .map(|d| (1, d * DAY + 6 * 3_600_000, Some(1.0)))
@@ -916,7 +913,7 @@ async fn a_stale_plan_does_not_certify_a_backfilled_day(
 async fn a_stale_plan_does_not_certify_a_day_backfilled_with_a_float() {
     skip_unless_live!();
     a_stale_plan_does_not_certify_a_backfilled_day(
-        "pulsus_it_rollup_stale_float",
+        &pulsus_testkit::test_db("pulsus_it_rollup_stale_float"),
         |t| vec![t - 6, t - 5, t - 4],
         |db, t| landing_values(db, &[(2, (t - 5) * DAY + 12 * 3_600_000, Some(3.0))], false),
         |t| t - 5,
@@ -930,7 +927,7 @@ async fn a_stale_plan_does_not_certify_a_day_backfilled_with_a_float() {
 async fn a_stale_plan_does_not_certify_a_day_backfilled_with_a_histogram() {
     skip_unless_live!();
     a_stale_plan_does_not_certify_a_backfilled_day(
-        "pulsus_it_rollup_stale_hist",
+        &pulsus_testkit::test_db("pulsus_it_rollup_stale_hist"),
         |t| vec![t - 6, t - 5, t - 4],
         |db, t| landing_values(db, &[(2, (t - 5) * DAY + 12 * 3_600_000, None)], true),
         |t| t - 5,
@@ -945,7 +942,7 @@ async fn a_stale_plan_does_not_certify_a_day_backfilled_with_a_histogram() {
 async fn a_stale_plan_does_not_certify_a_day_whose_last_bucket_was_backfilled() {
     skip_unless_live!();
     a_stale_plan_does_not_certify_a_backfilled_day(
-        "pulsus_it_rollup_stale_edge",
+        &pulsus_testkit::test_db("pulsus_it_rollup_stale_edge"),
         |t| vec![t - 6, t - 5],
         |db, t| landing_values(db, &[(2, (t - 4) * DAY, Some(3.0))], false),
         |t| t - 5,
@@ -959,8 +956,8 @@ async fn a_stale_plan_does_not_certify_a_day_whose_last_bucket_was_backfilled() 
 async fn an_empty_plan_table_derives_nothing() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let (db, t) = stopped_db(&client, "pulsus_it_rollup_no_plan").await;
-    let db = db.as_str();
+    let db = &pulsus_testkit::test_db("pulsus_it_rollup_no_plan");
+    let t = stopped_db(&client, db).await;
     exec(
         &client,
         &landing_values(db, &[(1, (t - 7) * DAY + 6 * 3_600_000, Some(1.0))], false),
@@ -981,10 +978,9 @@ async fn an_empty_plan_table_derives_nothing() {
 /// **1-l.** Both views start after a backfill landed under a stale plan.
 /// At no moment does the backfilled day have coverage without its data
 /// rows, and it ends with both. `planner_first` is the start order.
-async fn starting_the_views_never_shows_a_backfilled_day_as_empty(name: &str, planner_first: bool) {
+async fn starting_the_views_never_shows_a_backfilled_day_as_empty(db: &str, planner_first: bool) {
     let client = ChClient::new(test_config()).await.expect("connect");
-    let (db, t) = stopped_db(&client, name).await;
-    let db = db.as_str();
+    let t = stopped_db(&client, db).await;
     let ordinary: Vec<(u128, i64, Option<f64>)> = [t - 7, t - 2]
         .iter()
         .map(|d| (1, d * DAY + 6 * 3_600_000, Some(1.0)))
@@ -1038,16 +1034,22 @@ async fn starting_the_views_never_shows_a_backfilled_day_as_empty(name: &str, pl
 #[tokio::test]
 async fn starting_the_planner_first_never_shows_a_backfilled_day_as_empty() {
     skip_unless_live!();
-    starting_the_views_never_shows_a_backfilled_day_as_empty("pulsus_it_rollup_start_a", true)
-        .await;
+    starting_the_views_never_shows_a_backfilled_day_as_empty(
+        &pulsus_testkit::test_db("pulsus_it_rollup_start_a"),
+        true,
+    )
+    .await;
 }
 
 /// **1-l, order B**: the derivation starts first.
 #[tokio::test]
 async fn starting_the_derivation_first_never_shows_a_backfilled_day_as_empty() {
     skip_unless_live!();
-    starting_the_views_never_shows_a_backfilled_day_as_empty("pulsus_it_rollup_start_b", false)
-        .await;
+    starting_the_views_never_shows_a_backfilled_day_as_empty(
+        &pulsus_testkit::test_db("pulsus_it_rollup_start_b"),
+        false,
+    )
+    .await;
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -1061,8 +1063,8 @@ struct DerivedRow {
 async fn a_row_is_stamped_with_the_derivations_clock() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let (db, t) = stopped_db(&client, "pulsus_it_rollup_stamp").await;
-    let db = db.as_str();
+    let db = &pulsus_testkit::test_db("pulsus_it_rollup_stamp");
+    let t = stopped_db(&client, db).await;
     exec(
         &client,
         &landing_values(db, &[(1, (t - 3) * DAY + 6 * 3_600_000, Some(1.0))], false),
