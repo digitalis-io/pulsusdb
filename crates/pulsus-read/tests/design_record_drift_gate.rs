@@ -2023,16 +2023,14 @@ enum ReviewedVerdict {
 // 2428 no longer carries the unrelated `let` the anchor rule matched; the
 // citation is an ambiguous basename again, read by neither rule, and there
 // is no divergence left to hold a judgement about.
-const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 1] = [
-    (
-        "docs/query-lowering.md",
-        "exec.rs:1360-1362",
-        0,
-        ReviewedVerdict::FallbackWrong,
-        "the search settings block the same section quotes; it is in traces/exec.rs \
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 1] = [(
+    "docs/query-lowering.md",
+    "exec.rs:1360-1362",
+    0,
+    ReviewedVerdict::FallbackWrong,
+    "the search settings block the same section quotes; it is in traces/exec.rs \
          (`exec.rs:3227-3233` before #602 part 2c-2b-2 renumbered it)",
-    ),
-];
+)];
 
 /// **Where the language fallback and the anchor rule disagree, and what a
 /// person concluded about each.**
