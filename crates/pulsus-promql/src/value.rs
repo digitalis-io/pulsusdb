@@ -262,8 +262,8 @@ pub struct RawOverlay {
 impl RawOverlay {
     /// Whether the window `(lo, hi]` reaches into a piece: `lo < b` and
     /// `hi > a` for some piece `(a, b]`.
-    pub(crate) fn touches(&self, _lo: i64, _hi: i64) -> bool {
-        false
+    pub(crate) fn touches(&self, lo: i64, hi: i64) -> bool {
+        self.pieces.iter().any(|&(a, b)| lo < b && hi > a)
     }
 }
 

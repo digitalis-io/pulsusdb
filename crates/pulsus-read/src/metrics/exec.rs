@@ -2069,6 +2069,7 @@ impl MetricsEngine {
             labels_by_fp,
             hist_sqls,
             window,
+            params: *p,
         }))
     }
 
@@ -2084,22 +2085,36 @@ impl MetricsEngine {
         let metric_name = concrete_name(sel)?;
         let literals = sql_literals(&plan.fps);
         let chunks = sample_sql::chunk_fingerprints(&literals, sample_sql::CHUNK_THRESHOLD);
+        let mut at = 0usize;
+        let chunk_fps: Vec<&[Fingerprint]> = chunks
+            .iter()
+            .map(|c| {
+                let fps = &plan.fps[at..at + c.len()];
+                at += c.len();
+                fps
+            })
+            .collect();
         let (floats, hist_rows) = join(
             join_all(
                 chunks
                     .iter()
-                    .map(|chunk| self.rollup_chunk(tenant, &plan, chunk, budget)),
+                    .zip(&chunk_fps)
+                    .map(|(chunk, fps)| self.rollup_chunk(tenant, sel, &plan, chunk, fps, budget)),
             ),
             fetch_all_concurrently(plan.hist_sqls.clone(), |sql| {
                 self.fetch_sample_rows::<HistSampleRow>(sql, budget)
             }),
         )
         .await;
+        let hist_rows = hist_rows?;
         let mut rows = Vec::new();
         let mut trace = RollupTrace {
             stages: Vec::new(),
             served_from_level: false,
         };
+        // Plan Q12: each series' uncovered intervals and its raw samples.
+        let mut pieces_of: HashMap<Fingerprint, super::rollup::Intervals> = HashMap::new();
+        let mut overlay_rows: Option<Vec<SampleRow>> = None;
         for (i, chunk) in floats.into_iter().enumerate() {
             let mut chunk = chunk?;
             trace.served_from_level |= chunk.served_from_level;
@@ -2112,8 +2127,51 @@ impl MetricsEngine {
                     .collect();
             }
             rows.append(&mut chunk.rows);
+            if let Some((pieces, mut raw)) = chunk.overlay {
+                for fp in &chunk.fps {
+                    pieces_of.insert(*fp, pieces.clone());
+                }
+                overlay_rows.get_or_insert_with(Vec::new).append(&mut raw);
+            }
         }
-        let series = group_merged_rows(rows, hist_rows?, &plan.labels_by_fp, metric_name)?;
+        let Some(overlay_rows) = overlay_rows else {
+            let series = group_merged_rows(rows, hist_rows, &plan.labels_by_fp, metric_name)?;
+            return Ok((series, Some(trace)));
+        };
+        // The overlay holds the raw route's own samples: the raw floats and
+        // the histogram samples, merged as the raw route merges them.
+        let overlay: HashMap<Fingerprint, Vec<pulsus_promql::Sample>> = group_merged_rows(
+            overlay_rows,
+            hist_rows.clone(),
+            &plan.labels_by_fp,
+            metric_name,
+        )?
+        .into_iter()
+        .map(|s| (s.fingerprint, s.samples))
+        .collect();
+        let mut series = group_merged_rows(rows, hist_rows, &plan.labels_by_fp, metric_name)?;
+        let present: std::collections::HashSet<Fingerprint> =
+            series.iter().map(|s| s.fingerprint).collect();
+        for (fp, _) in overlay.iter().filter(|(fp, _)| !present.contains(*fp)) {
+            if let Some(labels) = plan.labels_by_fp.get(fp) {
+                series.push(FetchedSeries {
+                    fingerprint: *fp,
+                    metric_name: Some(metric_name.to_string()),
+                    labels: to_promql_labels(labels),
+                    samples: Vec::new(),
+                    start_ts: None,
+                    raw_overlay: None,
+                });
+            }
+        }
+        series.sort_by_key(|s| s.fingerprint);
+        let mut overlay = overlay;
+        for s in &mut series {
+            s.raw_overlay = Some(pulsus_promql::RawOverlay {
+                pieces: pieces_of.get(&s.fingerprint).cloned().unwrap_or_default(),
+                samples: overlay.remove(&s.fingerprint).unwrap_or_default(),
+            });
+        }
         Ok((series, Some(trace)))
     }
 
@@ -2125,16 +2183,20 @@ impl MetricsEngine {
     async fn rollup_chunk(
         &self,
         tenant: &Tenant,
+        sel: &SelectorSpec,
         plan: &RollupFetch,
         fps: &[FpLiteral],
+        chunk_fps: &[Fingerprint],
         budget: &SampleBudget,
     ) -> Result<RollupChunk, ReadError> {
         use super::rollup::{
-            Piece, RunRow, column_of, contains, coverage, hull, intersect, level_fetch, subtract,
+            RunRow, Tagged, assemble, column_of, contains, coverage, hull, intersect, level_fetch,
+            level_window_exists, overlaid, subtract, widen,
         };
         let use_ = plan.route.use_;
+        let over = overlaid(use_, plan.route.res_ms);
         let mut todo = vec![plan.window];
-        let mut pieces: std::collections::BTreeMap<Fingerprint, Vec<Piece>> =
+        let mut seqs: std::collections::BTreeMap<Fingerprint, Vec<Tagged>> =
             std::collections::BTreeMap::new();
         let mut stages: Vec<(i64, String, String)> = Vec::new();
         for level in plan.levels.levels[..=plan.route.level].iter().rev() {
@@ -2154,10 +2216,9 @@ impl MetricsEngine {
             let served = intersect(&covered, &todo);
             for row in rows {
                 if row.kind == 0 && contains(&served, row.t_end) {
-                    pieces
-                        .entry(row.fingerprint)
+                    seqs.entry(row.fingerprint)
                         .or_default()
-                        .push(Piece::Level {
+                        .push(Tagged::Level {
                             res_ms: level.res_ms,
                             row,
                         });
@@ -2175,15 +2236,21 @@ impl MetricsEngine {
             }
             todo = subtract(&todo, &covered);
         }
-        if let Some((a, b)) = hull(&todo) {
+        // Plan Q12: under 720 s a counter's raw read is each uncovered
+        // interval widened by the range on both sides, inside the window.
+        let read = if over {
+            widen(&todo, sel.range_ms.unwrap_or(0), plan.window)
+        } else {
+            todo.clone()
+        };
+        if let Some((a, b)) = hull(&read) {
             let sql = sample_sql::sample_fetch(tenant, &self.config.samples_table, fps, a, b);
             let raw: Vec<SampleRow> = self.fetch_sample_rows(sql.clone(), budget).await?;
             for r in raw {
-                if contains(&todo, r.unix_milli) {
-                    pieces.entry(r.fingerprint).or_default().push(Piece::Raw {
-                        t_ms: r.unix_milli,
-                        v: r.value,
-                    });
+                if contains(&read, r.unix_milli) {
+                    seqs.entry(r.fingerprint).or_default().push(Tagged::Raw(
+                        pulsus_promql::Sample::float(r.unix_milli, r.value),
+                    ));
                 }
             }
             for (x, y) in &todo {
@@ -2191,32 +2258,43 @@ impl MetricsEngine {
             }
         }
         let mut rows = Vec::new();
+        let mut raw_rows = Vec::new();
         let mut served_from_level = false;
-        for (fingerprint, mut seq) in pieces {
-            seq.sort_by_key(Piece::at);
-            served_from_level |= seq.iter().any(|p| match p {
-                Piece::Level { row, .. } => {
+        for (fingerprint, mut seq) in seqs {
+            // Stable: raw samples at one millisecond keep their read order.
+            seq.sort_by_key(Tagged::at);
+            served_from_level |= seq.iter().any(|t| match t {
+                Tagged::Level { row, .. } => {
                     matches!(
                         use_,
                         pulsus_promql::RollupUse::Last | pulsus_promql::RollupUse::Counter
                     ) || row.count > 0
                 }
-                Piece::Raw { .. } => false,
+                Tagged::Raw(_) => false,
             });
-            rows.extend(
-                super::rollup::pseudo_samples(use_, &seq)
-                    .into_iter()
-                    .map(|s| SampleRow {
-                        fingerprint,
-                        unix_milli: s.t_ms,
-                        value: s.v,
-                    }),
-            );
+            let (points, overlay) = assemble(use_, plan.route.res_ms, &seq, &todo);
+            rows.extend(points.into_iter().map(|s| SampleRow {
+                fingerprint,
+                unix_milli: s.t_ms,
+                value: s.v,
+            }));
+            if let Some(o) = overlay {
+                raw_rows.extend(o.samples.into_iter().map(|s| SampleRow {
+                    fingerprint,
+                    unix_milli: s.t_ms,
+                    value: s.v,
+                }));
+            }
+        }
+        if over {
+            served_from_level &= level_window_exists(sel, &plan.params, &todo);
         }
         Ok(RollupChunk {
             rows,
             stages,
             served_from_level,
+            overlay: over.then_some((todo, raw_rows)),
+            fps: chunk_fps.to_vec(),
         })
     }
 
@@ -3497,6 +3575,8 @@ struct RollupFetch {
     hist_sqls: Vec<String>,
     /// The selector's fetch window `(lo, hi]`.
     window: (i64, i64),
+    /// The query's parameters, for `level_window_exists` (plan section 7).
+    params: pulsus_promql::PlanParams,
 }
 
 /// Issue #18 part B: what a routed selector's fetch read, for explain.
@@ -3517,6 +3597,12 @@ struct RollupChunk {
     rows: Vec<SampleRow>,
     stages: Vec<(i64, String, String)>,
     served_from_level: bool,
+    /// Plan Q12: the chunk's uncovered intervals and its raw samples as
+    /// read around them, ascending by series and time; `None` on a route
+    /// that folds raw into its points.
+    overlay: Option<(super::rollup::Intervals, Vec<SampleRow>)>,
+    /// The chunk's series IDs, ascending.
+    fps: Vec<Fingerprint>,
 }
 
 /// Issue #316: the 400 `bad_data` an uncompilable `__name__` regex earns,

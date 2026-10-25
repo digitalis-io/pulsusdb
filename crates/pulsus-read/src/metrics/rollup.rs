@@ -82,7 +82,7 @@ pub fn discovery_sql(db: &str) -> String {
 /// The shard count of a cluster.
 pub fn shards_sql(cluster: &str) -> String {
     format!(
-        "SELECT toUInt32(uniqExact(shard_num)) FROM system.clusters WHERE cluster = {}",
+        "SELECT toUInt32(uniqExact(shard_num)) AS shards FROM system.clusters WHERE cluster = {}",
         ch_string(cluster)
     )
 }
@@ -95,7 +95,6 @@ struct LevelNameRow {
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 struct ShardsRow {
-    #[serde(rename = "toUInt32(uniqExact(shard_num))")]
     shards: u32,
 }
 
@@ -416,35 +415,67 @@ pub enum Tagged {
     Raw(Sample),
 }
 
-/// Plan sections 5 and Q12: a series' points from its merged sequence,
-/// and, for a counter routed to a level under 720 s, the raw overlay over
-/// the uncovered intervals `pieces`.
+impl Tagged {
+    /// Where the element sits in time: a level row at its `t_end`.
+    pub fn at(&self) -> i64 {
+        match self {
+            Tagged::Level { row, .. } => row.t_end,
+            Tagged::Raw(s) => s.t_ms,
+        }
+    }
+}
+
+/// The levels from which a counter row also gives a start point (plan
+/// Q9), and under which a counter's raw samples go to the overlay (Q12).
+const START_POINT_FROM_MS: i64 = 720_000;
+
+/// Whether a route of `use_` at `res_ms` reads its raw samples through
+/// the overlay (plan Q12).
+pub fn overlaid(use_: RollupUse, res_ms: i64) -> bool {
+    use_ == RollupUse::Counter && res_ms < START_POINT_FROM_MS
+}
+
+/// Plan sections 5 and Q12: a series' points from its time-ordered merged
+/// sequence, and, for a counter routed to a level under 720 s, the raw
+/// overlay: the uncovered intervals `pieces` and the `Raw` entries as
+/// read (the caller merges the series' histogram samples into it).
 pub fn assemble(
-    _use: RollupUse,
-    _res_ms: i64,
-    _seq: &[Tagged],
-    _pieces: &Intervals,
+    use_: RollupUse,
+    res_ms: i64,
+    seq: &[Tagged],
+    pieces: &Intervals,
 ) -> (Vec<Sample>, Option<RawOverlay>) {
-    (Vec::new(), None)
-}
-
-/// Plan section 7: whether some step's window `(t − offset − range,
-/// t − offset]` touches none of `pieces`.
-pub fn level_window_exists(_sel: &SelectorSpec, _p: &PlanParams, _pieces: &Intervals) -> bool {
-    false
-}
-
-/// Plan section 5: the pseudo-samples of one series' merged sequence.
-pub fn pseudo_samples(use_: RollupUse, seq: &[Piece]) -> Vec<Sample> {
     let mut out = Vec::with_capacity(seq.len() * 2);
+    if overlaid(use_, res_ms) {
+        let levels: Vec<Tagged> = seq
+            .iter()
+            .filter(|t| matches!(t, Tagged::Level { .. }))
+            .cloned()
+            .collect();
+        counter(&levels, &mut out);
+        let samples = seq
+            .iter()
+            .filter_map(|t| match t {
+                Tagged::Raw(s) => Some(s.clone()),
+                Tagged::Level { .. } => None,
+            })
+            .collect();
+        return (
+            out,
+            Some(RawOverlay {
+                pieces: pieces.clone(),
+                samples,
+            }),
+        );
+    }
     if use_ == RollupUse::Counter {
         counter(seq, &mut out);
-        return out;
+        return (out, None);
     }
-    for piece in seq {
-        match *piece {
-            Piece::Raw { t_ms, v } => out.push(Sample::float(t_ms, v)),
-            Piece::Level { row, .. } => match use_ {
+    for t in seq {
+        match t {
+            Tagged::Raw(s) => out.push(s.clone()),
+            Tagged::Level { row, .. } => match use_ {
                 RollupUse::Last => out.push(Sample::float(row.t_last, row.last)),
                 _ if row.count == 0 => {}
                 RollupUse::Max => out.push(Sample::float(row.t_end, row.max)),
@@ -457,26 +488,22 @@ pub fn pseudo_samples(use_: RollupUse, seq: &[Piece]) -> Vec<Sample> {
             },
         }
     }
-    out
+    (out, None)
 }
-
-/// The levels from which a counter row also gives a start point (plan
-/// Q9).
-const START_POINT_FROM_MS: i64 = 720_000;
 
 /// Plan section 5's counter: one value `c` that never resets, folded over
 /// the merged sequence in time order. A level row adds its `inc`, which
 /// counts the step from the last sample before its bucket; a raw sample
 /// adds `v − p`, or `v` on a drop, `p` the previous raw value or the last
-/// level row's `last`. The first piece starts `c` at its own value. A NaN
-/// value (a stale marker among them) passes through as itself and moves
+/// level row's `last`. The first element starts `c` at its own value. A
+/// NaN value, stale marker or not, passes through as itself and moves
 /// neither `c` nor `p`.
-fn counter(seq: &[Piece], out: &mut Vec<Sample>) {
+fn counter(seq: &[Tagged], out: &mut Vec<Sample>) {
     let mut c: Option<f64> = None;
     let mut p: Option<f64> = None;
-    for piece in seq {
-        match *piece {
-            Piece::Level { res_ms, row } => {
+    for t in seq {
+        match t {
+            Tagged::Level { res_ms, row } => {
                 let now = match c {
                     Some(c) => c + row.inc,
                     None if row.last.is_nan() => {
@@ -490,15 +517,16 @@ fn counter(seq: &[Piece], out: &mut Vec<Sample>) {
                     out.push(Sample::float(row.t_last, row.last));
                     continue;
                 }
-                if res_ms >= START_POINT_FROM_MS {
+                if *res_ms >= START_POINT_FROM_MS {
                     out.push(Sample::float(row.t_end - res_ms + 1, now - row.inc));
                 }
                 out.push(Sample::float(row.t_last, now));
                 p = Some(row.last);
             }
-            Piece::Raw { t_ms, v } => {
-                if v.is_nan() {
-                    out.push(Sample::float(t_ms, v));
+            Tagged::Raw(s) => {
+                let v = s.v;
+                if s.h.is_some() || v.is_nan() {
+                    out.push(s.clone());
                     continue;
                 }
                 let now = match (c, p) {
@@ -509,10 +537,44 @@ fn counter(seq: &[Piece], out: &mut Vec<Sample>) {
                 };
                 c = Some(now);
                 p = Some(v);
-                out.push(Sample::float(t_ms, now));
+                out.push(Sample::float(s.t_ms, now));
             }
         }
     }
+}
+
+/// Plan section 7: whether some step's window `(t − offset − range,
+/// t − offset]` touches none of `pieces`.
+pub fn level_window_exists(sel: &SelectorSpec, p: &PlanParams, pieces: &Intervals) -> bool {
+    let range = sel.range_ms.unwrap_or(0);
+    let clear = |t: i64| {
+        let hi = t - sel.offset_ms;
+        let lo = hi - range;
+        !pieces.iter().any(|&(a, b)| lo < b && hi > a)
+    };
+    if let Some(t) = sel.at_ms {
+        return clear(t);
+    }
+    if p.step_ms <= 0 || p.start_ms == p.end_ms {
+        return clear(p.start_ms);
+    }
+    let mut t = p.start_ms;
+    while t <= p.end_ms {
+        if clear(t) {
+            return true;
+        }
+        t += p.step_ms;
+    }
+    false
+}
+
+/// The intervals of `a`, each widened by `by` on both sides and clipped to
+/// `within`, merged.
+pub fn widen(a: &[(i64, i64)], by: i64, within: (i64, i64)) -> Intervals {
+    union(
+        a.iter()
+            .map(|&(x, y)| ((x - by).max(within.0), (y + by).min(within.1))),
+    )
 }
 
 /// `86400000` → `1d`, `7200000` → `2h`, `720000` → `12m`, `60000` → `1m`,
@@ -538,8 +600,8 @@ pub fn column_of(use_: RollupUse) -> &'static str {
         RollupUse::Max => "max",
         RollupUse::Min => "min",
         RollupUse::Sum => "sum",
-        RollupUse::Avg => "sum/count",
-        RollupUse::Counter => "inc",
+        RollupUse::Avg => "sum / count",
+        RollupUse::Counter => "last, inc",
     }
 }
 
