@@ -428,12 +428,14 @@ pub(crate) fn metrics_engine(
     label_cache: Arc<LabelCache>,
     config: &Config,
     eval_gate: Arc<pulsus_read::EvalGate>,
+    rollup_levels: Arc<pulsus_read::metrics::rollup::LevelSlot>,
 ) -> Result<MetricsEngine, ChError> {
     let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
         .with_consistency(consistency_from(config))?;
     Ok(
         MetricsEngine::new(client, label_cache, metrics_config_from(config))
-            .with_eval_gate(eval_gate),
+            .with_eval_gate(eval_gate)
+            .with_rollup_levels(rollup_levels),
     )
 }
 

@@ -57,9 +57,15 @@ async fn engine_for(state: &AppState) -> Result<MetricsEngine, ApiError> {
     // Issue #114: the consistency-config invariant is already enforced at
     // config load, so this is unreachable in the real binary; a failure maps
     // to the existing 503 "not serving" semantics.
-    chconfig::metrics_engine(pool, label_cache, &state.config, state.eval_gate.clone())
-        .map(crate::request_id::tag)
-        .map_err(|_| ApiError::Unavailable)
+    chconfig::metrics_engine(
+        pool,
+        label_cache,
+        &state.config,
+        state.eval_gate.clone(),
+        std::sync::Arc::clone(&state.rollup_levels),
+    )
+    .map(crate::request_id::tag)
+    .map_err(|_| ApiError::Unavailable)
 }
 
 /// Issue #471 M1: a POST's parameters are read from a MERGED view of the
@@ -749,7 +755,17 @@ pub(crate) async fn status_runtimeinfo(State(state): State<AppState>) -> Respons
         return ApiError::Unavailable.into_response();
     };
     let start_time = chrono::DateTime::<chrono::Utc>::from(state.started_at).to_rfc3339();
-    encode::status_runtimeinfo_response(start_time, retention_days)
+    let rollup_levels = state
+        .rollup_levels
+        .get()
+        .map(|l| {
+            l.levels
+                .iter()
+                .map(|level| pulsus_read::metrics::rollup::duration_text(level.res_ms))
+                .collect()
+        })
+        .unwrap_or_default();
+    encode::status_runtimeinfo_response(start_time, retention_days, rollup_levels)
 }
 
 pub(crate) async fn status_tsdb(
