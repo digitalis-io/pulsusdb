@@ -774,8 +774,9 @@ fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
     let no_wrapper = tables_without_a_wrapper();
     assert_eq!(
         no_wrapper.len(),
-        11,
-        "three landing tables, the label values, `service_edges` and six cluster-wide ones: \
+        12,
+        "three landing tables, the label values, `service_edges`, the rollup plan and six \
+         cluster-wide ones: \
          {no_wrapper:?}"
     );
     let all = tables();
@@ -846,12 +847,14 @@ fn the_trace_sharding_key_passage_names_every_routed_trace_table() {
     }
 }
 
-/// **The three landing tables, `metric_label_values` and `service_edges`
-/// are the only per-shard tables with no routing wrapper.** The label
+/// **The three landing tables, `metric_label_values`, `service_edges` and
+/// `metric_rollup_plan` are the only per-shard tables with no routing
+/// wrapper.** The label
 /// values are named locally inside every statement that reads them (issue
 /// #635); `service_edges` is read only per shard, through `cluster(…,
 /// view(…))`, by the one statement that also pairs that shard's spans
-/// (issue #599, part A D9). Four passages across three documents restrict their claim to
+/// (issue #599, part A D9); `metric_rollup_plan` is each replica's own
+/// plan, read only by that replica's derivation (issue #18). Four passages across three documents restrict their claim to
 /// per-shard tables, and this is the fact that restriction rests on: a
 /// per-shard table added without a wrapper makes all four false at once,
 /// and reddens here rather than in a document nobody reads.
@@ -874,12 +877,13 @@ fn only_the_landing_tables_the_label_values_and_the_service_edges_are_per_shard_
             "log_landing",
             "metric_label_values",
             "metric_landing",
+            "metric_rollup_plan",
             "service_edges",
             "trace_landing"
         ],
         "a per-shard table with no routing wrapper that is not a landing \
-         table, the label values or `service_edges` (read only per shard, issue #599 part A \
-         D9) falsifies the clustering claim in docs/architecture.md §7, \
+         table, the label values, `service_edges` (read only per shard, issue #599 part A \
+         D9) or the rollup plan (each replica's own, issue #18) falsifies the clustering claim in docs/architecture.md §7, \
          docs/schemas.md §7, docs/schemas.md's conventions preamble and \
          docs/features.md's clustering row"
     );
@@ -1035,6 +1039,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
             }
         }
         assert_eq!(targets.len(), 24, "{variant:?}: twenty-four views");
+        refreshable.sort();
         let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
             refreshable,

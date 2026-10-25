@@ -577,8 +577,27 @@ async fn the_view_derives_every_day_exactly_and_covers_empty_days() {
         );
     }
 
-    // 1-h: with everything covered, five refreshes write nothing. Their
-    // CPU is printed as evidence and not asserted on.
+    // 1-h: with every candidate day covered, five refreshes write nothing.
+    // Their CPU is printed as evidence and not asserted on. The candidates
+    // run to the last day that ended at least settle ago, which is `T−1`
+    // once settle has passed today.
+    let now = now_ms(&client).await;
+    let last_settled = (now - pulsus_schema::ROLLUP_SETTLE_MS as i64).div_euclid(DAY) - 1;
+    let candidates: Vec<i64> = (t - 7..=last_settled).collect();
+    let mut n = 0;
+    while !all_covered(
+        &coverage_rows(&client, &table).await,
+        &candidates,
+        0,
+        FP_MAX,
+    ) {
+        assert!(
+            n < 10,
+            "the candidate days are not covered after 10 refreshes"
+        );
+        refresh(&client, db).await;
+        n += 1;
+    }
     let t0 = now_ms(&client).await;
     for _ in 0..5 {
         refresh(&client, db).await;

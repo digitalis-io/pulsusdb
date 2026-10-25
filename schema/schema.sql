@@ -321,6 +321,20 @@ TTL toDateTime(least(intDiv(expires_ms, 1000), 4294967295))
 --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
+CREATE TABLE IF NOT EXISTS {{db}}.metric_rollup_plan{{on_cluster}}
+(
+    day Int64,
+    lo UInt256,
+    hi UInt256,
+    day_rows UInt64,
+    empty_run Array(Int64),
+    slice_lo UInt256,
+    slice_hi UInt256
+)
+ENGINE = MergeTree
+ORDER BY tuple()
+SETTINGS index_granularity = 8192{{storage_policy}};
+
 CREATE TABLE IF NOT EXISTS {{db}}.metric_samples{{on_cluster}}
 (
     org_id LowCardinality(String),
@@ -723,7 +737,7 @@ AS SELECT
 FROM {{db}}.metric_landing
 WHERE kind = 3;
 
-CREATE MATERIALIZED VIEW {{db}}.metric_rollup_mv{{on_cluster}} REFRESH EVERY 1 MINUTE APPEND TO {{db}}.metric_rollup
+CREATE MATERIALIZED VIEW {{db}}.metric_rollup_plan_mv{{on_cluster}} REFRESH EVERY 1 MINUTE TO {{db}}.metric_rollup_plan
 --@single  AS WITH toUInt256(1) AS n_shards, toUInt256(0) AS shard_ix,
 --@single  (SELECT groupArray((d, r)) FROM (SELECT toUInt16(toDate(partition)) AS d, sum(rows) AS r FROM system.parts WHERE database = '{{db}}' AND table IN ('metric_samples', 'metric_hist_samples') AND active GROUP BY d)) AS parts,
 --@cluster AS WITH (SELECT toUInt256(uniqExact(shard_num)) FROM system.clusters WHERE cluster = '{{cluster}}') AS n_shards,
@@ -752,10 +766,27 @@ CREATE MATERIALIZED VIEW {{db}}.metric_rollup_mv{{on_cluster}} REFRESH EVERY 1 M
      if(empty(todo), toInt64(-1), todo[1]) AS day,
      if(day < 0, toUInt256(0), if(indexOf(cov_d, day) = 0, slice_lo, greatest(cov[indexOf(cov_d, day)].2, slice_lo))) AS lo,
      arrayFirst(p -> toInt64(p.1) = day, parts).2 + arrayFirst(p -> toInt64(p.1) = day + 1, parts).2 AS day_rows,
-     greatest(toUInt256(1), toUInt256(ceil(day_rows / toFloat64(n_shards) / 20000000))) AS n_chunks,
+     greatest(toUInt256(1), toUInt256(ceil(day_rows / toFloat64(greatest(n_shards, toUInt256(1))) / 20000000))) AS n_chunks,
      least(slice_hi, lo + intDiv(slice_hi - slice_lo + 1, n_chunks) - 1) AS hi,
-     arrayFilter(n -> n >= day AND n < arrayMin(arrayConcat([d_hi + 2], arrayFilter(m -> m > day, arrayMap(p -> toInt64(p.1), parts)))) - 1, todo) AS empty_run,
+     arrayFilter(n -> n >= day AND n < arrayMin(arrayConcat([d_hi + 2], arrayFilter(m -> m > day, arrayMap(p -> toInt64(p.1), parts)))) - 1, todo) AS empty_run
+SELECT day, lo, hi, day_rows, empty_run, slice_lo, slice_hi;
+
+CREATE MATERIALIZED VIEW {{db}}.metric_rollup_mv{{on_cluster}} REFRESH EVERY 1 MINUTE DEPENDS ON {{db}}.metric_rollup_plan_mv APPEND TO {{db}}.metric_rollup
+AS WITH ifNull((SELECT (day, lo, hi, day_rows, empty_run, slice_lo, slice_hi) FROM {{db}}.metric_rollup_plan),
+            (toInt64(-1), toUInt256(0), toUInt256(0), toUInt64(0), CAST([] AS Array(Int64)), toUInt256(0), toUInt256(0))) AS plan,
+     tupleElement(plan, 1) AS day, tupleElement(plan, 2) AS lo, tupleElement(plan, 3) AS hi, tupleElement(plan, 4) AS day_rows,
+     tupleElement(plan, 5) AS empty_run, tupleElement(plan, 6) AS slice_lo, tupleElement(plan, 7) AS slice_hi,
      day * 86400000 AS day_start, day_start + 86400000 AS day_end,
+     if(empty(empty_run), toInt64(0), arrayMin(empty_run) * 86400000) AS e_lo,
+     if(empty(empty_run), toInt64(0), (arrayMax(empty_run) + 1) * 86400000) AS e_hi,
+     (SELECT groupUniqArray(toInt64(intDiv(unix_milli - 1, 86400000))) FROM (
+--@single         SELECT unix_milli FROM {{db}}.metric_samples
+--@cluster         SELECT unix_milli FROM clusterAllReplicas('{{cluster}}', {{db}}.metric_samples)
+        WHERE unix_milli > e_lo AND unix_milli <= e_hi AND fingerprint BETWEEN toUInt128(slice_lo) AND toUInt128(slice_hi)
+        UNION ALL
+--@single         SELECT unix_milli FROM {{db}}.metric_hist_samples
+--@cluster         SELECT unix_milli FROM clusterAllReplicas('{{cluster}}', {{db}}.metric_hist_samples)
+        WHERE unix_milli > e_lo AND unix_milli <= e_hi AND fingerprint BETWEEN toUInt128(slice_lo) AND toUInt128(slice_hi))) AS seen,
      toInt64(toUnixTimestamp64Milli(now64())) AS derived,
      {{retention_days}} * 86400000 AS ret_ms
 SELECT * FROM (
@@ -811,13 +842,15 @@ FROM (
           FROM (
             SELECT org_id, fingerprint, (intDiv(unix_milli - 1, 300000) + 1) * 300000 AS t5,
                    unix_milli AS ts, reinterpretAsUInt64(value) AS bits, false AS is_hist
-            FROM {{db}}.metric_samples{{route_suffix}}
+--@single             FROM {{db}}.metric_samples
+--@cluster             FROM clusterAllReplicas('{{cluster}}', {{db}}.metric_samples)
             WHERE day_rows > 0 AND unix_milli > day_start AND unix_milli <= day_end
               AND fingerprint BETWEEN toUInt128(lo) AND toUInt128(hi)
             UNION ALL
             SELECT org_id, fingerprint, (intDiv(unix_milli - 1, 300000) + 1) * 300000,
                    unix_milli, toUInt64(0), true
-            FROM {{db}}.metric_hist_samples{{route_suffix}}
+--@single             FROM {{db}}.metric_hist_samples
+--@cluster             FROM clusterAllReplicas('{{cluster}}', {{db}}.metric_hist_samples)
             WHERE day_rows > 0 AND unix_milli > day_start AND unix_milli <= day_end
               AND fingerprint BETWEEN toUInt128(lo) AND toUInt128(hi))
           GROUP BY org_id, fingerprint, t5)))
@@ -826,7 +859,7 @@ UNION ALL
 SELECT toUInt8(1), '', r, toUInt128(c.1), toUInt128(c.2), c.3 * 86400000 + 86400000,
        0, 0, 0., 0, 0., 0, 0., 0., 0., 0, 0, [], 0, 0, 0, derived, c.3 * 86400000 + ret_ms
 FROM system.one
-ARRAY JOIN if(day < 0, [], if(day_rows > 0, [(lo, hi, day)], arrayMap(m -> (slice_lo, slice_hi, m), empty_run))) AS c
+ARRAY JOIN if(day < 0, [], if(day_rows > 0, [(lo, hi, day)], arrayMap(m -> (slice_lo, slice_hi, m), arrayFilter(m -> NOT has(seen, m), empty_run)))) AS c
 ARRAY JOIN [toUInt32(300000), toUInt32(3600000)] AS r)
 SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_execution_time = 50,
 --@cluster max_replica_delay_for_distributed_queries = 60, fallback_to_stale_replicas_for_distributed_queries = 0, skip_unavailable_shards = 0,
