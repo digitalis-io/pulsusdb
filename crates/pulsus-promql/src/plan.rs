@@ -1066,8 +1066,10 @@ impl Planner {
             anchored,
             smoothed,
             pos_start,
+            // Issue #18 part B: assigned by the post-plan pass
+            // ([`assign_rollup_use`]) once the whole tree exists.
             rollup_use: None,
-            in_subquery: false,
+            in_subquery: self.subquery_depth > 0,
         });
         id
     }
@@ -1376,7 +1378,135 @@ fn detect_histogram_stats(root: &PlanExpr, selectors: &mut [SelectorSpec]) {
 
 /// Issue #18 part B: the post-plan pass that records, on each selector,
 /// what its consumer reads (`SelectorSpec::rollup_use`).
-fn assign_rollup_use(_root: &PlanExpr, _selectors: &mut [SelectorSpec]) {}
+///
+/// An instant selector reads `last` (`timestamp(x)` reads one too); a
+/// range selector that is the direct source of `rate`/`increase` reads the
+/// counter, of `max_`/`min_`/`sum_`/`avg_over_time` that column, of
+/// `last_`/`present_over_time` or `absent_over_time` `last`; every other
+/// range selector nothing (design r13 section 2's map).
+fn assign_rollup_use(root: &PlanExpr, selectors: &mut [SelectorSpec]) {
+    for spec in selectors.iter_mut() {
+        spec.rollup_use = spec.range_ms.is_none().then_some(RollupUse::Last);
+    }
+    fn walk(expr: &PlanExpr, selectors: &mut [SelectorSpec]) {
+        let direct = match expr {
+            PlanExpr::RangeFn {
+                func: RangeFn::Rate | RangeFn::Increase,
+                source: RangeSource::Selector(id),
+                ..
+            } => Some((*id, RollupUse::Counter)),
+            PlanExpr::OverTime {
+                func,
+                source: RangeSource::Selector(id),
+                ..
+            } => match func {
+                OverTimeFn::Max => Some((*id, RollupUse::Max)),
+                OverTimeFn::Min => Some((*id, RollupUse::Min)),
+                OverTimeFn::Sum => Some((*id, RollupUse::Sum)),
+                OverTimeFn::Avg => Some((*id, RollupUse::Avg)),
+                OverTimeFn::Last | OverTimeFn::Present => Some((*id, RollupUse::Last)),
+                _ => None,
+            },
+            PlanExpr::AbsentOverTime {
+                source: RangeSource::Selector(id),
+            } => Some((*id, RollupUse::Last)),
+            _ => None,
+        };
+        if let Some((id, use_)) = direct
+            && let Some(spec) = selectors.get_mut(id)
+        {
+            spec.rollup_use = Some(use_);
+        }
+        for_each_child(expr, &mut |child| walk(child, selectors));
+    }
+    walk(root, selectors);
+}
+
+/// Every direct child expression of `expr`, a subquery source's inner
+/// expression included.
+fn for_each_child(expr: &PlanExpr, f: &mut dyn FnMut(&PlanExpr)) {
+    let source = |s: &RangeSource, f: &mut dyn FnMut(&PlanExpr)| {
+        if let RangeSource::Subquery(sq) = s {
+            f(&sq.inner);
+        }
+    };
+    match expr {
+        PlanExpr::Selector(_)
+        | PlanExpr::Time
+        | PlanExpr::Scalar(_)
+        | PlanExpr::StringLiteral(_) => {}
+        PlanExpr::RangeVector { source: s }
+        | PlanExpr::RangeFn { source: s, .. }
+        | PlanExpr::OverTime { source: s, .. }
+        | PlanExpr::AbsentOverTime { source: s } => source(s, f),
+        PlanExpr::OverTimeParam {
+            source: s, args, ..
+        } => {
+            source(s, f);
+            for a in args {
+                f(a);
+            }
+        }
+        PlanExpr::HistogramAccessor { arg, .. }
+        | PlanExpr::Absent { arg, .. }
+        | PlanExpr::Sort { arg, .. }
+        | PlanExpr::SortByLabel { arg, .. }
+        | PlanExpr::LabelReplace { arg, .. }
+        | PlanExpr::LabelJoin { arg, .. }
+        | PlanExpr::ScalarOf { arg }
+        | PlanExpr::VectorOf { arg }
+        | PlanExpr::Timestamp { arg, .. } => f(arg),
+        PlanExpr::HistogramQuantile { quantile, expr, .. } => {
+            f(quantile);
+            f(expr);
+        }
+        PlanExpr::HistogramQuantiles {
+            expr, quantiles, ..
+        } => {
+            f(expr);
+            for q in quantiles {
+                f(q);
+            }
+        }
+        PlanExpr::HistogramFraction {
+            lower, upper, expr, ..
+        } => {
+            f(lower);
+            f(upper);
+            f(expr);
+        }
+        PlanExpr::MathFn {
+            arg, scalar_args, ..
+        } => {
+            f(arg);
+            for a in scalar_args {
+                f(a);
+            }
+        }
+        PlanExpr::Aggregate { expr, param, .. } => {
+            f(expr);
+            if let Some(p) = param {
+                f(p);
+            }
+        }
+        PlanExpr::CountValues { expr, .. } => f(expr),
+        PlanExpr::Binary { lhs, rhs, .. } | PlanExpr::SetOp { lhs, rhs, .. } => {
+            f(lhs);
+            f(rhs);
+        }
+        PlanExpr::DateFn { arg, .. } => {
+            if let Some(a) = arg {
+                f(a);
+            }
+        }
+        PlanExpr::Info { base, .. } => f(base),
+        PlanExpr::ScalarFn { args, .. } => {
+            for a in args {
+                f(a);
+            }
+        }
+    }
+}
 
 /// Issue #32 code-review round-1 fix: a `match[]` discovery selector
 /// (`/series`, `/labels`, `/label/{name}/values`) is looser than a
