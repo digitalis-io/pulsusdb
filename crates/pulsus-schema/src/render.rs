@@ -1,5 +1,5 @@
 //! Token substitution for `schema/schema.sql`: explicit `{{token}}` string
-//! replacement, eighteen names and nothing else.
+//! replacement, nineteen names and nothing else.
 //!
 //! **Double braces, always.** ClickHouse's own `{shard}` and `{replica}`
 //! macros are single-brace and must survive verbatim into `Replicated*`
@@ -143,7 +143,7 @@ pub fn rollup_suffix(d: Duration) -> String {
 /// ClickHouse's own single-brace `{shard}`/`{replica}` macros — they are
 /// simply absent from double-brace matching.
 ///
-/// `schema.sh` carries the same list as seventeen `sed` expressions and an
+/// `schema.sh` carries the same list as eighteen `sed` expressions and an
 /// `awk` step;
 /// `the_script_renders_exactly_what_this_crate_renders` holds the two
 /// together.
@@ -196,6 +196,7 @@ pub(crate) fn substitute_tokens(tmpl: &str, ctx: &RenderCtx) -> String {
             "{{graph_job_max_rows}}",
             &ctx.graph_job_max_rows.to_string(),
         )
+        .replace("{{rollup_settle_ms}}", &ctx.rollup_settle_ms.to_string())
         .replace("{{storage_policy}}", &storage_policy)
         .replace("{{trace_attr_indexes}}", &trace_attr_indexes(ctx))
 }

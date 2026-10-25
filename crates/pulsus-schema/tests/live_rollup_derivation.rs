@@ -179,10 +179,10 @@ impl RollupRow {
 /// Every data row (`row_kind = 0`) of `table`, after `FINAL`.
 async fn data_rows(client: &ChClient, table: &str) -> Vec<RollupRow> {
     let sql = format!(
-        "SELECT res, toString(org_id), fingerprint, t_end, n, t_first, reinterpretAsUInt64(v_first), \
-         t_last, reinterpretAsUInt64(v_last), t_prev, reinterpretAsUInt64(v_prev), \
-         reinterpretAsUInt64(v_min), reinterpretAsUInt64(v_max), changes, n_resets, \
-         arrayMap(x -> reinterpretAsUInt64(x), resets), t_any, any_stale, has_hist, expires_ms \
+        "SELECT res, org_id, fingerprint, t_end, n, t_first, reinterpretAsUInt64(v_first) AS v_first, \
+         t_last, reinterpretAsUInt64(v_last) AS v_last, t_prev, reinterpretAsUInt64(v_prev) AS v_prev, \
+         reinterpretAsUInt64(v_min) AS v_min, reinterpretAsUInt64(v_max) AS v_max, changes, n_resets, \
+         arrayMap(x -> reinterpretAsUInt64(x), resets) AS resets, t_any, any_stale, has_hist, expires_ms \
          FROM {table} FINAL WHERE row_kind = 0"
     );
     rows(client, &sql).await
@@ -257,7 +257,7 @@ async fn raw_samples(
     let floats = rows::<FloatRow>(
         client,
         &format!(
-            "SELECT toString(org_id), fingerprint, unix_milli, reinterpretAsUInt64(value) FROM {samples}"
+            "SELECT org_id, fingerprint, unix_milli, reinterpretAsUInt64(value) AS bits FROM {samples}"
         ),
     )
     .await
@@ -266,7 +266,7 @@ async fn raw_samples(
     .collect();
     let hists = rows::<HistRow>(
         client,
-        &format!("SELECT toString(org_id), fingerprint, unix_milli FROM {hists}"),
+        &format!("SELECT org_id, fingerprint, unix_milli FROM {hists}"),
     )
     .await
     .into_iter()

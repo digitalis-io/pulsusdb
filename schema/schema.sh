@@ -65,6 +65,9 @@ dedup_window_seconds=3600
 # job may read (issue #599). Not a knob.
 graph_job_max_rows=60000000
 
+# `pulsus_schema::ROLLUP_SETTLE_MS` (issue #18): the time after a UTC day ends before the rollup derives it. Not a knob.
+rollup_settle_ms=7200000
+
 # Names reach the server inside SQL, so they are identifiers and nothing
 # else. Refusing here is simpler than quoting, and the binary's own
 # configuration check is no wider.
@@ -234,6 +237,7 @@ render() {
             -e "s|{{trace_dedup_window}}|$trace_dedup|g" \
             -e "s|{{dedup_window_seconds}}|$dedup_window_seconds|g" \
             -e "s|{{graph_job_max_rows}}|$graph_job_max_rows|g" \
+            -e "s|{{rollup_settle_ms}}|$rollup_settle_ms|g" \
             -e "s|{{storage_policy}}|$policy_token|g" |
         TRACE_ATTR_INDEXES=$attr_indexes awk '{
             i = index($0, "{{trace_attr_indexes}}")

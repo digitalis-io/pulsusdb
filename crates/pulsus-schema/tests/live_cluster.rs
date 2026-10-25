@@ -2114,7 +2114,7 @@ async fn a_shard_derives_its_slice_from_every_shard_and_the_slices_cover_the_spa
     let floats: Vec<common::rollup_summary::FloatSample> = rows_on::<ClusterSampleRow>(
         &shard1,
         &format!(
-            "SELECT toString(org_id), fingerprint, unix_milli, reinterpretAsUInt64(value) \
+            "SELECT org_id, fingerprint, unix_milli, reinterpretAsUInt64(value) AS bits \
              FROM {db}.metric_samples_dist"
         ),
     )
@@ -2127,10 +2127,10 @@ async fn a_shard_derives_its_slice_from_every_shard_and_the_slices_cover_the_spa
     let got: Vec<common::rollup_summary::Summary> = rows_on::<ClusterRollupRow>(
         &shard1,
         &format!(
-            "SELECT res, toString(org_id), fingerprint, t_end, n, t_first, reinterpretAsUInt64(v_first), \
-             t_last, reinterpretAsUInt64(v_last), t_prev, reinterpretAsUInt64(v_prev), \
-             reinterpretAsUInt64(v_min), reinterpretAsUInt64(v_max), changes, n_resets, \
-             arrayMap(x -> reinterpretAsUInt64(x), resets), t_any, any_stale, has_hist \
+            "SELECT res, org_id, fingerprint, t_end, n, t_first, reinterpretAsUInt64(v_first) AS v_first, \
+             t_last, reinterpretAsUInt64(v_last) AS v_last, t_prev, reinterpretAsUInt64(v_prev) AS v_prev, \
+             reinterpretAsUInt64(v_min) AS v_min, reinterpretAsUInt64(v_max) AS v_max, changes, n_resets, \
+             arrayMap(x -> reinterpretAsUInt64(x), resets) AS resets, t_any, any_stale, has_hist \
              FROM {db}.metric_rollup_dist FINAL WHERE row_kind = 0"
         ),
     )
