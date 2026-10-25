@@ -4978,6 +4978,9 @@ mod tests {
     fn strip_pos(mut selectors: Vec<SelectorSpec>) -> Vec<SelectorSpec> {
         for s in &mut selectors {
             s.pos_start = 0;
+            // Issue #18 part B: the column a rollup level would serve the
+            // consumer from differs by function; the raw fetch does not.
+            s.rollup_use = None;
         }
         selectors
     }
