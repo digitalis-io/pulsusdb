@@ -2377,4 +2377,257 @@ mod tests {
         );
         assert_eq!(none, with_st);
     }
+
+    // --- issue #18 part 3: the refactored functions against their copies ---
+
+    #[allow(dead_code)]
+    mod legacy {
+        use crate::value::Sample;
+        include!("functions_legacy.rs");
+    }
+
+    /// The float sample lists of this module's tests above.
+    fn existing_sample_lists() -> Vec<Vec<Sample>> {
+        let spaced = |step: i64, vals: &[f64]| -> Vec<Sample> {
+            vals.iter()
+                .enumerate()
+                .map(|(i, &v)| s(i as i64 * step, v))
+                .collect()
+        };
+        let nan = f64::NAN;
+        let inf = f64::INFINITY;
+        vec![
+            vec![s(0, 0.0), s(60_000, 60.0)],
+            vec![s(0, 10.0), s(60_000, 4.0)],
+            vec![
+                s(0, 0.0),
+                s(60_000, 100.0),
+                s(120_000, 10.0),
+                s(180_000, 40.0),
+            ],
+            vec![
+                s(30_000, 0.0),
+                s(90_000, 10.0),
+                s(150_000, 20.0),
+                s(210_000, 30.0),
+            ],
+            vec![s(10_000, 5.0), s(50_000, 25.0)],
+            vec![s(0, 1.0)],
+            vec![],
+            vec![
+                s(1_784_061_084_208, 66_846.0),
+                s(1_784_061_099_208, 68_855.0),
+                s(1_784_061_114_208, 70_858.0),
+                s(1_784_061_129_208, 72_866.0),
+                s(1_784_061_144_208, 74_905.0),
+                s(1_784_061_159_208, 76_939.0),
+                s(1_784_061_174_208, 78_951.0),
+                s(1_784_061_189_208, 80_974.0),
+            ],
+            vec![s(0, 0.0), s(60_000, 100.0), s(120_000, 130.0)],
+            vec![s(0, 100.0), s(60_000, 10.0)],
+            vec![s(0, 1e100), s(60_000, 1.0), s(120_000, -1e100)],
+            vec![s(0, 2.0), s(60_000, 4.0)],
+            spaced(
+                60_000,
+                &[
+                    577_446.702_271,
+                    -812_280.826_452,
+                    -943_305.046_956,
+                    671_530.207_84,
+                    -134_465.864_19,
+                    524_560.164_916,
+                    -995_787.893_298,
+                ],
+            ),
+            vec![
+                s(0, f64::MAX),
+                s(60_000, f64::MAX),
+                s(120_000, 1.0),
+                s(180_000, 2.0),
+            ],
+            vec![s(0, 3.0), s(60_000, 1.0), s(120_000, 2.0)],
+            vec![s(0, nan), s(60_000, nan)],
+            vec![s(0, nan), s(60_000, nan), s(120_000, nan)],
+            vec![s(0, 0.0), s(60_000, -0.0)],
+            vec![s(0, -0.0), s(60_000, 0.0)],
+            vec![s(0, 5.0), s(60_000, nan), s(120_000, 3.0)],
+            vec![s(0, nan), s(60_000, 5.0), s(120_000, 3.0)],
+            vec![s(0, 5.0), s(60_000, 5.0), s(120_000, 5.0)],
+            vec![s(0, inf), s(60_000, inf), s(120_000, inf)],
+            vec![s(0, -inf), s(60_000, -inf), s(120_000, -inf)],
+            vec![s(1_000, 1.0), s(2_000, 3.0)],
+            vec![
+                s(0, 0.0),
+                s(300_000, 50.0),
+                s(600_000, 100.0),
+                s(900_000, 50.0),
+            ],
+            vec![s(0, 1.0), s(60_000, 2.0), s(60_000, 5.0)],
+            spaced(300_000, &[1.0, 2.0, 3.0, 0.0, 1.0, 0.0, 0.0, 1.0, 2.0, 0.0]),
+            spaced(300_000, &[1.0, 2.0, 3.0, 4.0, 5.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
+            spaced(300_000, &[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+            vec![s(0, 0.0), s(300_000, nan), s(600_000, 0.0)],
+            vec![s(0, 7.0)],
+            vec![s(0, 9.0)],
+            vec![s(0, 5.0), s(10_000, 7.0), s(20_000, 3.0)],
+            vec![s(10_500, 5.0), s(20_500, 7.0), s(30_500, 3.0)],
+            vec![s(0, 1.0), s(10_000, 3.0), s(20_000, 3.0), s(30_000, 1.0)],
+            vec![s(0, nan), s(10_000, 5.0), s(20_000, 2.0)],
+            vec![s(0, 1.0), s(10_000, 2.0)],
+            vec![s(60_000, 1.0), s(120_000, 2.0)],
+            vec![s(0, 5.0), s(60_000, 7.0)],
+        ]
+    }
+
+    /// splitmix64, the project's fixed-seed generator.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+    }
+
+    /// One generated window: 0 to 40 samples, mostly rising, with drops,
+    /// and values drawn from small integers, ±0.0, NaN, ±∞, 1e300 and
+    /// 1e-300. Times rise by 0 to 30 s, so equal milliseconds occur.
+    fn generated(rng: &mut Rng) -> Vec<Sample> {
+        let len = rng.below(41) as usize;
+        let mut t = rng.below(100_000) as i64;
+        let mut v = 0.0_f64;
+        (0..len)
+            .map(|_| {
+                t += match rng.below(8) {
+                    0 => 0,
+                    1 => rng.below(30_000) as i64,
+                    _ => 15_000,
+                };
+                v = match rng.below(16) {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => f64::NAN,
+                    3 => f64::INFINITY,
+                    4 => f64::NEG_INFINITY,
+                    5 => 1e300,
+                    6 => 1e-300,
+                    7 => rng.below(5) as f64,
+                    8 => -(rng.below(5) as f64),
+                    _ => v + rng.below(4) as f64,
+                };
+                s(t, v)
+            })
+            .collect()
+    }
+
+    /// Three windows around a sample list: tight on its samples, wide,
+    /// and shifted.
+    fn windows_for(samples: &[Sample]) -> [(i64, i64, i64); 3] {
+        let first = samples.first().map_or(0, |x| x.t_ms);
+        let last = samples.last().map_or(0, |x| x.t_ms);
+        [
+            (first - 1, last),
+            (first - 60_000, last + 60_000),
+            (first - 7_000, last + 3_000),
+        ]
+        .map(|(lo, hi)| (hi - lo, lo, hi))
+    }
+
+    /// Every refactored function and its copy, as bits.
+    fn compare_with_legacy(samples: &[Sample], range: i64, lo: i64, hi: i64) -> usize {
+        let b = |v: Option<f64>| v.map(f64::to_bits);
+        let nonempty = |f: fn(&[Sample]) -> f64| (!samples.is_empty()).then(|| f(samples));
+        let pairs: [(&str, Option<f64>, Option<f64>); 9] = [
+            (
+                "rate",
+                eval_range_fn(RangeFn::Rate, samples, range, lo, hi, None),
+                legacy::eval_extrapolated(samples, range, lo, hi, true, true, None),
+            ),
+            (
+                "increase",
+                eval_range_fn(RangeFn::Increase, samples, range, lo, hi, None),
+                legacy::eval_extrapolated(samples, range, lo, hi, true, false, None),
+            ),
+            (
+                "delta",
+                eval_range_fn(RangeFn::Delta, samples, range, lo, hi, None),
+                legacy::eval_extrapolated(samples, range, lo, hi, false, false, None),
+            ),
+            (
+                "irate",
+                eval_range_fn(RangeFn::Irate, samples, range, lo, hi, None),
+                legacy::eval_irate(samples, None),
+            ),
+            (
+                "idelta",
+                eval_over_time(OverTimeFn::Idelta, samples),
+                legacy::eval_idelta(samples),
+            ),
+            (
+                "resets",
+                eval_over_time(OverTimeFn::Resets, samples),
+                nonempty(legacy::eval_resets),
+            ),
+            (
+                "changes",
+                eval_over_time(OverTimeFn::Changes, samples),
+                nonempty(legacy::eval_changes),
+            ),
+            (
+                "min_over_time",
+                eval_over_time(OverTimeFn::Min, samples),
+                (!samples.is_empty())
+                    .then(|| legacy::eval_extremum_over_time(samples, legacy::WhichExtremum::Min)),
+            ),
+            (
+                "max_over_time",
+                eval_over_time(OverTimeFn::Max, samples),
+                (!samples.is_empty())
+                    .then(|| legacy::eval_extremum_over_time(samples, legacy::WhichExtremum::Max)),
+            ),
+        ];
+        for (name, got, want) in pairs {
+            assert_eq!(b(got), b(want), "{name} over ({lo}, {hi}] of {samples:?}");
+        }
+        pairs.len()
+    }
+
+    /// 3-c: the refactored functions return what their copies at the
+    /// merge base return, as bits, over this module's sample lists,
+    /// 10,000 generated lists and the cancellation fixture, three windows
+    /// each.
+    #[test]
+    fn the_window_functions_answer_as_their_copies_at_the_base() {
+        let mut inputs = existing_sample_lists();
+        let mut rng = Rng(0x0018_0003);
+        inputs.extend((0..10_000).map(|_| generated(&mut rng)));
+        let cancellation = vec![
+            s(0, 1e16),
+            s(1_000, 0.0),
+            s(2_000, 1.0),
+            s(3_000, 0.0),
+            s(4_000, 1.0),
+        ];
+        inputs.push(cancellation.clone());
+        let mut compared = 0;
+        for samples in &inputs {
+            for (range, lo, hi) in windows_for(samples) {
+                compared += compare_with_legacy(samples, range, lo, hi);
+            }
+        }
+        assert_eq!(compared, inputs.len() * 3 * 9);
+        assert_eq!(
+            eval_range_fn(RangeFn::Increase, &cancellation, 5_000, -1_000, 4_000, None)
+                .map(f64::to_bits),
+            Some(0x3ff4_0000_0000_0000)
+        );
+    }
 }

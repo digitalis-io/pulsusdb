@@ -155,7 +155,7 @@ const PINNED: &str = include_str!("golden/promql_statements.sha256");
 /// issue #635 part 4, whose statements each carry the tenant.
 const ENTRIES: usize = 30;
 const LINES: usize = 801;
-const BYTES: usize = 43_648;
+const BYTES: usize = 44_444;
 /// The statements the writer's markers declare. Sixty before issue #549;
 /// four entries now send ONE statement where they sent two, and issue #579
 /// made it five.

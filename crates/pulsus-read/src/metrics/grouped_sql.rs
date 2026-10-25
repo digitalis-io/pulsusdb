@@ -734,7 +734,7 @@ mod tests {
              fingerprint,\n\
              \x20           ts, v, is_hist, stale,\n\
              \x20           least(leadInFrame(ts, 1, toInt64(1782910800000) + lookback + 1) OVER (\n\
-             \x20                   PARTITION BY fingerprint ORDER BY ts, is_hist\n\
+             \x20                   PARTITION BY fingerprint ORDER BY ts, is_hist, reinterpretAsUInt64(v)\n\
              \x20                   ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING),\n\
              \x20                 ts + lookback) AS cover_end\n\
              \x20         FROM (\n\
