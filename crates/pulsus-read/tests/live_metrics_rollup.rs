@@ -259,26 +259,28 @@ fn corpus_d_series(db: &str) -> String {
     )
 }
 
-/// Corpus D, day `day` (0 to 7) after `day0`: 15 s scrape, ±100 ms jitter;
-/// 100 counters resetting every 500 to 799 samples, 20 resetting every
-/// second sample, 20 that stop at `day0 + 7 d 12 h 7.5 min`, 20 missing
-/// 30 % of their scrapes, and 100 gauges `sin(i / 50) × 100` (each with
-/// its own phase).
+/// Corpus D, day `day` (0 to 7) after `day0`, by the rule of the port the
+/// bounds of plan section 9 were measured with: 15 s scrape, each series
+/// at its own phase within the scrape interval, ±100 ms jitter; 100
+/// counters `i mod p`, `p` from 500 to 799, so they reset every `p`
+/// samples; 20 that reset every second sample (1, 2, 1, 2, ...); 20 that
+/// count as the first 100 and stop at `day0 + 7 d 18 h 7.5 min`; 20 that
+/// count as the first 100 and miss 30 % of their scrapes; and 100 gauges
+/// `sin(i / 50) × 100`.
 fn corpus_d_day(db: &str, day0: i64, day: i64) -> String {
     let per_day = DAY / SCRAPE;
     let first = day * per_day + 1;
-    let count = if day == 7 { per_day - 1 } else { per_day };
-    let stop = day0 + 7 * DAY + 12 * HOUR + 450_000;
+    let count = if day == 7 { per_day - 2 } else { per_day };
+    let stop = day0 + 7 * DAY + 18 * HOUR + 450_000;
     format!(
         "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
          SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, '{METRIC}', fp, t, v FROM ( \
            SELECT s, kind, fp, toInt64(n.number) AS i, \
-                  toInt64({day0}) + i * {SCRAPE} + (toInt64(cityHash64(s, i) % 201) - 100) AS t, \
-                  toFloat64(cityHash64(s, i, 1) % 10) AS h, \
-                  multiIf(kind = 'normal' OR kind = 'sparse', toFloat64(i % (500 + (s * 37) % 300)) * 10 + h, \
-                          kind = 'fast', toFloat64(i % 2) * 10 + h, \
-                          kind = 'stop', toFloat64(i) * 10 + h, \
-                          sin((i + s * 13) / 50) * 100) AS v \
+                  toInt64({day0}) + i * {SCRAPE} + toInt64(cityHash64(s, 'phase') % {SCRAPE}) \
+                    + (toInt64(cityHash64(s, i) % 201) - 100) AS t, \
+                  multiIf(kind = 'fast', toFloat64(i % 2) + 1, \
+                          kind = 'gauge', sin(i / 50) * 100, \
+                          toFloat64(i % (500 + (s * 37) % 300))) AS v \
            FROM {db}.rd_series, numbers({first}, {count}) AS n) \
          WHERE NOT (kind = 'stop' AND t > {stop}) \
            AND NOT (kind = 'sparse' AND cityHash64(s, i, 2) % 10 < 3)"
@@ -771,24 +773,17 @@ async fn the_raw_piece_continues_the_counter() {
     skip_unless_live!();
     let db = DB_B4.name();
     let w = (now_ms() / MIN) * MIN - 2 * HOUR;
-    let t0 = w - 20 * MIN;
-    // 31 samples 0..=900, then 10 samples 10..=100 ending before `W`,
-    // then 130, 160, ... after it.
+    let t0 = w - 15 * MIN;
+    // Every 15 s, rising by 30: 0, 30, ..., 900; a reset to 10, then 40,
+    // 70, 100, the last 10 s before `W`; then 130, 160, ... from 5 s
+    // after it.
     let mut samples: Vec<(i64, f64)> = Vec::new();
-    let mut t = t0 + 5_000;
-    for k in 0..=30 {
-        samples.push((t, f64::from(k) * 30.0));
-        t += SCRAPE;
+    for k in 0..=34i64 {
+        let v = if k <= 30 { k * 30 } else { 10 + (k - 31) * 30 };
+        samples.push((w - 10_000 - (34 - k) * SCRAPE, v as f64));
     }
-    for k in 1..=10 {
-        samples.push((t, f64::from(k) * 10.0));
-        t += SCRAPE;
-    }
-    assert!(t - SCRAPE <= w, "the reset run ends inside the level");
-    let mut t = w + 5_000;
-    for k in 0..40 {
-        samples.push((t, 130.0 + f64::from(k) * 30.0));
-        t += SCRAPE;
+    for j in 0..40i64 {
+        samples.push((w + 5_000 + j * SCRAPE, (130 + j * 30) as f64));
     }
     let fp = "toUInt128('24000000000000000000000000000000000004')";
     let values: Vec<String> = samples.iter().map(|(t, v)| format!("({t}, {v})")).collect();
@@ -814,10 +809,10 @@ async fn the_raw_piece_continues_the_counter() {
         exec(&admin, sql).await;
     }
     // The 60 s level up to `W` only; the later levels are not built.
-    build_first(&admin, &ctx, t0 - 10 * MIN, w, MIN).await;
+    build_first(&admin, &ctx, t0, w, MIN).await;
     let built = warm(bootstrap, admin, ctx, &[]).await;
 
-    let p = range(w - 10 * MIN, w + 8 * MIN, MIN);
+    let p = range(w - 3 * MIN, w + 8 * MIN, MIN);
     let query = "increase(rollup_b4[5m])";
     let a = ask(&built.engine(true, None).await, &no_tenant(), query, &p).await;
     let b = ask(&built.engine(false, None).await, &no_tenant(), query, &p).await;
@@ -904,7 +899,8 @@ async fn a_hole_reads_raw() {
 
 /// **B5b (issue #18 part B): a hole in the middle keeps the counter.**
 /// Corpus D's last day; the 720 s level's coverage of one hour in the
-/// middle of a 12-hour window removed. `rate` over 1 h at step 12 m reads
+/// middle of a 12-hour window removed, the window ending before the
+/// stopping counters stop. `rate` over 1 h at step 12 m reads
 /// the 720 s level, the 60 s level for the hour, the 720 s level again,
 /// and stays within the 720 s bounds.
 #[tokio::test(flavor = "multi_thread")]
@@ -919,10 +915,10 @@ async fn a_hole_in_the_middle_keeps_the_counter() {
         7..8,
     )
     .await;
-    let hole = end - 6 * HOUR;
+    let hole = end - 14 * HOUR;
     cut_runs(&built.admin, built.db(), 720, hole, hole + HOUR).await;
 
-    let p = range(end - 12 * HOUR, end, 12 * MIN);
+    let p = range(end - 20 * HOUR, end - 8 * HOUR, 12 * MIN);
     let query = format!("rate({METRIC}{{kind!=\"gauge\"}}[1h])");
     let a = ask(&built.engine(true, None).await, &no_tenant(), &query, &p).await;
     let b = ask(&built.engine(false, None).await, &no_tenant(), &query, &p).await;
