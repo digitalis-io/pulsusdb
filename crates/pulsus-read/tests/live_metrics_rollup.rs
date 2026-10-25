@@ -595,6 +595,9 @@ async fn each_served_function_is_within_its_distance() {
     let mut failures = Vec::new();
     let mut report = Vec::new();
     let mut comments = Vec::new();
+    // Each run's statements carry their own comment, so the query log's
+    // rows of an earlier run are not summed into this one's.
+    let run = format!("b2_{}_{}", built.db(), now_ms());
     for (li, secs) in [60i64, 720, 7200, 86400].into_iter().enumerate() {
         let res = secs * 1000;
         let span = match secs {
@@ -633,8 +636,8 @@ async fn each_served_function_is_within_its_distance() {
         queries.push(("bare", METRIC.to_string()));
 
         for (qi, (function, query)) in queries.iter().enumerate() {
-            let on_c = format!("b2_{}_{secs}_{qi}_on", built.db());
-            let off_c = format!("b2_{}_{secs}_{qi}_off", built.db());
+            let on_c = format!("{run}_{secs}_{qi}_on");
+            let off_c = format!("{run}_{secs}_{qi}_off");
             let routed = built.engine(true, Some(&on_c)).await;
             let raw = built.engine(false, Some(&off_c)).await;
             let a = ask(&routed, &no_tenant(), query, &p).await;
@@ -679,7 +682,7 @@ async fn each_served_function_is_within_its_distance() {
             }
         }
     }
-    let rows = read_rows(&built.admin, &format!("b2_{}_", built.db())).await;
+    let rows = read_rows(&built.admin, &format!("{run}_")).await;
     for (query, secs, on_c, off_c) in &comments {
         report.push(format!(
             "read_rows {query:<55} {secs:>6}s routed {:>10} raw {:>10}",
