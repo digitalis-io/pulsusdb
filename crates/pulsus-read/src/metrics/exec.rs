@@ -4227,6 +4227,7 @@ fn group_rows(
                     labels: to_promql_labels(labels),
                     samples: Vec::new(),
                     start_ts: None,
+                    raw_overlay: None,
                 });
                 // Through `RunDedup` like every other row, so the run it
                 // starts is one the next row can be read against.
@@ -4278,6 +4279,7 @@ fn group_multi_rows(
                     labels: to_promql_labels(labels),
                     samples: Vec::new(),
                     start_ts: None,
+                    raw_overlay: None,
                 });
                 let last = out.last_mut().expect("just pushed");
                 run.push_float(&mut last.samples, row.unix_milli, row.value);
@@ -4340,6 +4342,7 @@ fn group_merged_rows(
             labels: to_promql_labels(&labels),
             samples,
             start_ts: None,
+            raw_overlay: None,
         });
     }
     Ok(out)
@@ -4387,6 +4390,7 @@ fn group_merged_multi_rows(
             labels: to_promql_labels(labels),
             samples,
             start_ts: None,
+            raw_overlay: None,
         });
     }
     Ok(out)
@@ -5117,6 +5121,7 @@ mod tests {
                         labels: Labels::new([("g".to_string(), format!("g{g}"))]),
                         samples: samples(1.0),
                         start_ts: None,
+                        raw_overlay: None,
                     });
                 }
             } else {
@@ -5133,6 +5138,7 @@ mod tests {
                             ]),
                             samples: samples(2.0),
                             start_ts: None,
+                            raw_overlay: None,
                         });
                         fp += 1;
                     }

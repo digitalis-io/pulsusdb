@@ -1548,8 +1548,8 @@ jobs:
 
       # Issue #18 part B: each rollup-served function against the raw route
       # within design r13 section 2's distances; the finer levels and raw
-      # after a level; holes; the counter across the raw piece. Reuses this
-      # job's container.
+      # after a level; holes; the counter across the raw piece; a window
+      # touching raw is raw. Reuses this job's container.
       - name: Live metrics rollup tests
         env:
           PULSUS_TEST_CLICKHOUSE: "1"

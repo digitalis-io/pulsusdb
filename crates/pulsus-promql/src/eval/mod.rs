@@ -76,6 +76,7 @@ impl<'a> EvalData<'a> {
                             // sample, so the aligned ST channel (if any)
                             // carries over unchanged.
                             start_ts: fs.start_ts.clone(),
+                            raw_overlay: None,
                         })
                         .collect(),
                 );
@@ -4524,6 +4525,7 @@ mod tests {
             labels: Labels::new(labels.iter().map(|(k, v)| (k.to_string(), v.to_string()))),
             samples,
             start_ts: None,
+            raw_overlay: None,
         }
     }
 

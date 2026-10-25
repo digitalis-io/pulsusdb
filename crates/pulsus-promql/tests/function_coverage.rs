@@ -346,6 +346,7 @@ fn probe_outcome(probe: &str) -> Result<(), String> {
                 ]),
                 samples,
                 start_ts: None,
+                raw_overlay: None,
             }],
         );
     }

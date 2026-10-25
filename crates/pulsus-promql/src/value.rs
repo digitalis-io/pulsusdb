@@ -240,6 +240,31 @@ pub struct FetchedSeries {
     /// Consumed exclusively by `rate`/`irate`/`increase`/`resets`
     /// (`engine.go:2243-2246`'s four-function gate).
     pub start_ts: Option<Vec<i64>>,
+    /// Issue #18 part B (plan Q12): for a `rate`/`increase` source routed
+    /// to a rollup level under 720 s, the intervals no level covers and
+    /// the raw samples read around them. A window reaching into one of
+    /// those intervals is evaluated over these samples instead of
+    /// `samples`. `None` everywhere else.
+    pub raw_overlay: Option<RawOverlay>,
+}
+
+/// Issue #18 part B (plan Q12): the raw read of a routed counter series
+/// around the time no rollup level covers.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RawOverlay {
+    /// The uncovered intervals `(a, b]`, sorted and disjoint.
+    pub pieces: Vec<(i64, i64)>,
+    /// The series' samples as the raw route reads them over each piece
+    /// widened by the range on both sides, histogram samples included.
+    pub samples: Vec<Sample>,
+}
+
+impl RawOverlay {
+    /// Whether the window `(lo, hi]` reaches into a piece: `lo < b` and
+    /// `hi > a` for some piece `(a, b]`.
+    pub(crate) fn touches(&self, _lo: i64, _hi: i64) -> bool {
+        false
+    }
 }
 
 /// Every selector's fetched series, keyed by [`SelectorId`] — populated by
@@ -610,6 +635,7 @@ mod tests {
             labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
             samples: vec![Sample::float(0, 1.0)],
             start_ts: None,
+            raw_overlay: None,
         }];
         data.insert(0, series.clone());
         assert_eq!(data.get(0), series.as_slice());

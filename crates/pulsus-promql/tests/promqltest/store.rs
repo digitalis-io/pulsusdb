@@ -294,6 +294,7 @@ impl TestStorage {
                     // A series never touched by `@st` fetches `None` —
                     // the production shape (AC5).
                     start_ts: stored.has_st.then_some(sts),
+                    raw_overlay: None,
                 });
             }
             data.insert(spec.id, fetched);

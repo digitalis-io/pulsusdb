@@ -119,6 +119,7 @@ fn fixture() -> (QueryPlan, SeriesData) {
                     labels: Labels::new([("g".to_string(), format!("g{g}"))]),
                     samples: samples(1.0),
                     start_ts: None,
+                    raw_overlay: None,
                 });
             }
         } else {
@@ -135,6 +136,7 @@ fn fixture() -> (QueryPlan, SeriesData) {
                         ]),
                         samples: samples(2.0),
                         start_ts: None,
+                        raw_overlay: None,
                     });
                     fp += 1;
                 }

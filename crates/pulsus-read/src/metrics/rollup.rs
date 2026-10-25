@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 
 use pulsus_clickhouse::{ChClient, QuerySettings, Row};
 use pulsus_model::{Fingerprint, FpLiteral, Tenant};
-use pulsus_promql::{PlanParams, RollupUse, Sample, SelectorSpec};
+use pulsus_promql::{PlanParams, RawOverlay, RollupUse, Sample, SelectorSpec};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
@@ -406,6 +406,32 @@ impl Piece {
             Piece::Raw { t_ms, .. } => *t_ms,
         }
     }
+}
+
+/// One element of a series' merged sequence (plan section 4 step 4): a
+/// kept level row, tagged with its level's width, or a kept raw sample.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Tagged {
+    Level { res_ms: i64, row: LevelRow },
+    Raw(Sample),
+}
+
+/// Plan sections 5 and Q12: a series' points from its merged sequence,
+/// and, for a counter routed to a level under 720 s, the raw overlay over
+/// the uncovered intervals `pieces`.
+pub fn assemble(
+    _use: RollupUse,
+    _res_ms: i64,
+    _seq: &[Tagged],
+    _pieces: &Intervals,
+) -> (Vec<Sample>, Option<RawOverlay>) {
+    (Vec::new(), None)
+}
+
+/// Plan section 7: whether some step's window `(t − offset − range,
+/// t − offset]` touches none of `pieces`.
+pub fn level_window_exists(_sel: &SelectorSpec, _p: &PlanParams, _pieces: &Intervals) -> bool {
+    false
 }
 
 /// Plan section 5: the pseudo-samples of one series' merged sequence.
@@ -828,12 +854,14 @@ mod tests {
         s.iter().map(|x| (x.t_ms, x.v)).collect()
     }
 
-    /// **B1c (issue #18 part B): the pseudo-samples of plan section 5.**
-    /// A counter that never resets, crossing the reset and continuing into
-    /// raw; the start point only from 720 s; `count = 0` rows give no
+    /// **B1c (issue #18 part B): `assemble`, plan sections 5 and Q12.** A
+    /// counter that never resets, crossing the reset; at 720 s the start
+    /// points and the raw samples continuing the counter, no overlay; at
+    /// 60 s the level points alone and the raw samples, as read, in the
+    /// overlay with the piece they cover. `count = 0` rows give no
     /// aggregate point.
     #[test]
-    fn b1c_the_pseudo_samples() {
+    fn b1c_assemble() {
         let r = 720_000;
         let (e1, e2) = (BASE + r, BASE + 2 * r);
         let rows = [
@@ -842,26 +870,22 @@ mod tests {
         ];
         let seq = |res: i64| {
             vec![
-                Piece::Level {
+                Tagged::Level {
                     res_ms: res,
                     row: rows[0],
                 },
-                Piece::Level {
+                Tagged::Level {
                     res_ms: res,
                     row: rows[1],
                 },
-                Piece::Raw {
-                    t_ms: e2 + 15_000,
-                    v: 130.0,
-                },
-                Piece::Raw {
-                    t_ms: e2 + 30_000,
-                    v: 20.0,
-                },
+                Tagged::Raw(Sample::float(e2 + 15_000, 130.0)),
+                Tagged::Raw(Sample::float(e2 + 30_000, 20.0)),
             ]
         };
+        let piece: Intervals = vec![(e2, e2 + 60_000)];
+        let (pts, overlay) = assemble(RollupUse::Counter, r, &seq(r), &piece);
         assert_eq!(
-            points(&pseudo_samples(RollupUse::Counter, &seq(r))),
+            points(&pts),
             vec![
                 (e1 - r + 1, 0.0),
                 (e1 - 5_000, 900.0),
@@ -871,15 +895,20 @@ mod tests {
                 (e2 + 30_000, 1150.0),
             ]
         );
+        assert_eq!(overlay, None, "no overlay at 720 s");
+
+        let (pts, overlay) = assemble(RollupUse::Counter, 60_000, &seq(60_000), &piece);
         assert_eq!(
-            points(&pseudo_samples(RollupUse::Counter, &seq(60_000))),
-            vec![
-                (e1 - 5_000, 900.0),
-                (e2 - 5_000, 1100.0),
-                (e2 + 15_000, 1130.0),
-                (e2 + 30_000, 1150.0),
-            ],
-            "no start point below 720 s"
+            points(&pts),
+            vec![(e1 - 5_000, 900.0), (e2 - 5_000, 1100.0)],
+            "the level points alone, no start point, below 720 s"
+        );
+        let overlay = overlay.expect("an overlay below 720 s");
+        assert_eq!(overlay.pieces, piece);
+        assert_eq!(
+            points(&overlay.samples),
+            vec![(e2 + 15_000, 130.0), (e2 + 30_000, 20.0)],
+            "the raw samples as read"
         );
 
         // The aggregate columns at `t_end`, raw as read; `last` at `t_last`.
@@ -888,31 +917,37 @@ mod tests {
             row(e2, e2 - 9_000, 6.0, 0.0, 0),
         ];
         let gseq = vec![
-            Piece::Level {
+            Tagged::Level {
                 res_ms: r,
                 row: gauge[0],
             },
-            Piece::Level {
+            Tagged::Level {
                 res_ms: r,
                 row: gauge[1],
             },
-            Piece::Raw {
-                t_ms: e2 + 1_000,
-                v: 7.5,
-            },
+            Tagged::Raw(Sample::float(e2 + 1_000, 7.5)),
         ];
+        let at = |u: RollupUse, res: i64| {
+            let (pts, overlay) = assemble(u, res, &gseq, &piece);
+            assert_eq!(overlay, None, "{u:?}: no overlay");
+            points(&pts)
+        };
         assert_eq!(
-            points(&pseudo_samples(RollupUse::Max, &gseq)),
+            at(RollupUse::Max, r),
             vec![(e1, 4.0), (e2 + 1_000, 7.5)],
             "a row with count = 0 gives no point"
         );
         assert_eq!(
-            points(&pseudo_samples(RollupUse::Avg, &gseq)),
+            at(RollupUse::Max, 60_000),
+            vec![(e1, 4.0), (e2 + 1_000, 7.5)]
+        );
+        assert_eq!(
+            at(RollupUse::Avg, r),
             vec![(e1, 2.0), (e2 + 1_000, 7.5)],
             "sum / count"
         );
         assert_eq!(
-            points(&pseudo_samples(RollupUse::Last, &gseq)),
+            at(RollupUse::Last, r),
             vec![(e1 - 5_000, 4.0), (e2 - 9_000, 6.0), (e2 + 1_000, 7.5)]
         );
     }

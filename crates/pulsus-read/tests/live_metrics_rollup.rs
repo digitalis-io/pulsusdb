@@ -28,7 +28,7 @@ use pulsus_model::Tenant;
 use pulsus_promql::parser::parse;
 use pulsus_read::logql::PlanExplain;
 use pulsus_read::metrics::rollup::{LevelSlot, refresh_levels};
-use pulsus_read::{LabelCache, MetricQueryParams, MetricsEngine, QueryResult};
+use pulsus_read::{HistOrFloat, LabelCache, MetricQueryParams, MetricsEngine, QueryResult};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
 use pushed_rate_corpus::{
@@ -39,8 +39,6 @@ const MIN: i64 = 60_000;
 const HOUR: i64 = 3_600_000;
 const DAY: i64 = 86_400_000;
 const SCRAPE: i64 = 15_000;
-/// Corpus D's metric.
-const METRIC: &str = "rollup_d";
 
 static DB_B2: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b2");
 static DB_B3: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b3");
@@ -243,47 +241,56 @@ async fn cut_runs(client: &ChClient, db: &str, r: u32, a: i64, b: i64) {
     }
 }
 
-/// Corpus D's series table, in the database: `s`, its kind, its labels
+/// Corpus D's metric of series `s` (plan section 9).
+const CORPUS_D_METRIC: &str =
+    "multiIf(s < 100, 'c_normal', s < 120, 'c_fast', s < 140, 'c_stop', s < 160, 'c_sparse', 'g')";
+
+/// Corpus D's series table, in the database: `s`, its metric, its labels
 /// and its series ID (the scale corpus's ID formula).
 fn corpus_d_series(db: &str) -> String {
     format!(
         "CREATE TABLE {db}.rd_series ENGINE = Memory AS \
-         SELECT toUInt32(number) AS s, \
-                multiIf(s < 100, 'normal', s < 120, 'fast', s < 140, 'stop', s < 160, 'sparse', 'gauge') AS kind, \
-                concat('{{\"kind\":\"', kind, '\",\"s\":\"', toString(s), '\"}}') AS labels, \
-                concat('{METRIC}', unhex('FF'), 'kind', unhex('FF'), kind, unhex('FF'), 's', unhex('FF'), toString(s), unhex('FF')) AS buf, \
-                bitOr(bitShiftLeft(toUInt128(bitShiftRight(cityHash64('{METRIC}'), 32)), 96), \
+         SELECT toUInt32(number) AS s, {CORPUS_D_METRIC} AS metric, \
+                concat('{{\"s\":\"', toString(s), '\"}}') AS labels, \
+                concat(metric, unhex('FF'), 's', unhex('FF'), toString(s), unhex('FF')) AS buf, \
+                bitOr(bitShiftLeft(toUInt128(bitShiftRight(cityHash64(metric), 32)), 96), \
                       bitAnd(bitOr(bitShiftLeft(toUInt128(cityHash64(buf)), 64), toUInt128(xxHash64(buf))), \
                              toUInt128('79228162514264337593543950335'))) AS fp \
          FROM numbers(260)"
     )
 }
 
-/// Corpus D, day `day` (0 to 7) after `day0`, by the rule of the port the
-/// bounds of plan section 9 were measured with: 15 s scrape, each series
-/// at its own phase within the scrape interval, ±100 ms jitter; 100
-/// counters `i mod p`, `p` from 500 to 799, so they reset every `p`
-/// samples; 20 that reset every second sample (1, 2, 1, 2, ...); 20 that
-/// count as the first 100 and stop at `day0 + 7 d 18 h 7.5 min`; 20 that
-/// count as the first 100 and miss 30 % of their scrapes; and 100 gauges
-/// `sin(i / 50) × 100`.
+/// Corpus D's sample time, phase and jitter, as SQL over `s` and `i`
+/// (plan section 9).
+fn corpus_d_time(day0: i64) -> String {
+    format!(
+        "toInt64({day0}) + 15000 * i + (100 + (7919 * s) % 14800) + (toInt64((7 * s + 13 * i) % 201) - 100)"
+    )
+}
+
+/// Corpus D's value of series `s` at sample `i`, as SQL (plan section 9).
+const CORPUS_D_VALUE: &str = "multiIf(metric = 'c_fast', toFloat64(i % 2) + 1, \
+     metric = 'g', sin(i / 50) * 100, \
+     toFloat64(i % (500 + (37 * s) % 300)))";
+
+/// Corpus D, day `day` (0 to 7) after `day0`, exactly as plan section 9
+/// defines it: every sample of the day, the stopping counters cut at
+/// `day0 + 7 d 18 h 7 min 30 s` and the sparse ones keeping
+/// `(3 s + 7 i) mod 10 ≥ 3`. Sample `i` of a day starting at `i = 5760 d`
+/// lands inside that day, its phase and jitter keeping it within its
+/// scrape interval.
 fn corpus_d_day(db: &str, day0: i64, day: i64) -> String {
     let per_day = DAY / SCRAPE;
-    let first = day * per_day + 1;
-    let count = if day == 7 { per_day - 2 } else { per_day };
     let stop = day0 + 7 * DAY + 18 * HOUR + 450_000;
     format!(
         "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
-         SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, '{METRIC}', fp, t, v FROM ( \
-           SELECT s, kind, fp, toInt64(n.number) AS i, \
-                  toInt64({day0}) + i * {SCRAPE} + toInt64(cityHash64(s, 'phase') % {SCRAPE}) \
-                    + (toInt64(cityHash64(s, i) % 201) - 100) AS t, \
-                  multiIf(kind = 'fast', toFloat64(i % 2) + 1, \
-                          kind = 'gauge', sin(i / 50) * 100, \
-                          toFloat64(i % (500 + (s * 37) % 300))) AS v \
-           FROM {db}.rd_series, numbers({first}, {count}) AS n) \
-         WHERE NOT (kind = 'stop' AND t > {stop}) \
-           AND NOT (kind = 'sparse' AND cityHash64(s, i, 2) % 10 < 3)"
+         SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, metric, fp, t, v FROM ( \
+           SELECT s, metric, fp, toInt64(n.number) AS i, {} AS t, {CORPUS_D_VALUE} AS v \
+           FROM {db}.rd_series, numbers({}, {per_day}) AS n) \
+         WHERE NOT (metric = 'c_stop' AND t > {stop}) \
+           AND NOT (metric = 'c_sparse' AND (3 * s + 7 * i) % 10 < 3)",
+        corpus_d_time(day0),
+        day * per_day,
     )
 }
 
@@ -291,11 +298,20 @@ fn corpus_d_day(db: &str, day0: i64, day: i64) -> String {
 fn corpus_d_registrations(db: &str, from: i64, hours: i64) -> String {
     format!(
         "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
-         SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, '{METRIC}', fp, \
+         SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, metric, fp, \
                 toInt64({from}) + toInt64(n.number) * {HOUR} + 1000, labels, 0 \
          FROM {db}.rd_series, numbers({hours}) AS n"
     )
 }
+
+/// Corpus D's five metrics and the kind each one's bounds are read by.
+const CORPUS_D_METRICS: [(&str, &str); 5] = [
+    ("c_normal", "normal"),
+    ("c_fast", "fast"),
+    ("c_stop", "stop"),
+    ("c_sparse", "sparse"),
+    ("g", "gauge"),
+];
 
 /// One built database and its two engines.
 struct Built {
@@ -458,6 +474,39 @@ impl Answer {
         }
         out
     }
+
+    /// Every series' points, floats as their bits and histograms by their
+    /// `Debug` text, by labels then time.
+    fn cells(&self) -> BTreeMap<(String, i64), String> {
+        fn key(l: &[(String, String)]) -> String {
+            let mut l = l.to_vec();
+            l.sort();
+            format!("{l:?}")
+        }
+        let mut out = BTreeMap::new();
+        match &self.result {
+            QueryResult::Matrix(m) => {
+                for s in m {
+                    for (t, v) in &s.points {
+                        out.insert((key(&s.labels), *t), format!("{:016x}", v.to_bits()));
+                    }
+                }
+            }
+            QueryResult::MatrixHist(m) => {
+                for s in m {
+                    for (t, v) in &s.points {
+                        let text = match v {
+                            HistOrFloat::Float(f) => format!("{:016x}", f.to_bits()),
+                            HistOrFloat::Hist(h) => format!("{h:?}"),
+                        };
+                        out.insert((key(&s.labels), *t), text);
+                    }
+                }
+            }
+            other => panic!("unexpected result shape: {other:?}"),
+        }
+        out
+    }
 }
 
 async fn ask(engine: &MetricsEngine, t: &Tenant, query: &str, p: &MetricQueryParams) -> Answer {
@@ -478,34 +527,22 @@ fn range(start: i64, end: i64, step: i64) -> MetricQueryParams {
 }
 
 /// The distance of plan section 9 between a routed answer `a` and the
-/// routing-off answer `b`, per series kind label.
-fn distances(
-    a: &BTreeMap<(String, i64), f64>,
-    b: &BTreeMap<(String, i64), f64>,
-) -> BTreeMap<String, Vec<f64>> {
-    let mut out: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+/// routing-off answer `b`, one per series and step present on either.
+fn distances(a: &BTreeMap<(String, i64), f64>, b: &BTreeMap<(String, i64), f64>) -> Vec<f64> {
     let keys: std::collections::BTreeSet<&(String, i64)> = a.keys().chain(b.keys()).collect();
-    for key in keys {
-        let kind = kind_of(&key.0);
-        let d = match (a.get(key), b.get(key)) {
-            (Some(x), Some(y)) if *y == 0.0 => x.abs(),
-            (Some(x), Some(y)) => (x - y).abs() / y.abs(),
-            (Some(_), None) | (None, Some(_)) => 1.0,
-            (None, None) => continue,
-        };
-        out.entry(kind).or_default().push(d);
-    }
-    out
+    keys.into_iter()
+        .filter_map(|key| d_of(a.get(key), b.get(key)))
+        .collect()
 }
 
-/// The `kind` label of a canonical label list.
-fn kind_of(labels: &str) -> String {
-    labels
-        .split("(\"kind\", \"")
-        .nth(1)
-        .and_then(|rest| rest.split('"').next())
-        .unwrap_or("all")
-        .to_string()
+/// Plan section 9's `d` of one series and step.
+fn d_of(a: Option<&f64>, b: Option<&f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(x), Some(y)) if *y == 0.0 => Some(x.abs()),
+        (Some(x), Some(y)) => Some((x - y).abs() / y.abs()),
+        (Some(_), None) | (None, Some(_)) => Some(1.0),
+        (None, None) => None,
+    }
 }
 
 /// Nearest-rank p99 and the maximum.
@@ -570,13 +607,27 @@ fn bound(function: &str, kind: &str, li: usize) -> Option<f64> {
     Some(row[li])
 }
 
+/// One query sent with routing on and off, concurrently, each with its
+/// own query-log comment.
+async fn both(
+    built: &Built,
+    query: &str,
+    p: &MetricQueryParams,
+    comments: Option<(&str, &str)>,
+) -> (Answer, Answer) {
+    let routed = built.engine(true, comments.map(|c| c.0)).await;
+    let raw = built.engine(false, comments.map(|c| c.1)).await;
+    let t = no_tenant();
+    futures::join!(ask(&routed, &t, query, p), ask(&raw, &t, query, p))
+}
+
 /// **B2 (issue #18 part B): each served function is within its distance
 /// from raw.** Corpus D at every level; per level `res`: `rate` and
-/// `increase` over `5 × res` on the counters, `avg_over_time` on the
-/// gauges, every other served function on every series, at step `res`,
-/// aligned; each sent with routing on and off. The routed explain names
-/// the level and reads `exactness` `"rollup"`; each function is within the
-/// bound of plan section 9 (bit-equal where it says so).
+/// `increase` over `5 × res` on each counter metric, `avg_over_time` on
+/// the gauges, every other served function on every metric, at step
+/// `res`, aligned; each sent with routing on and off. The routed explain
+/// names the level and reads `exactness` `"rollup"`; each function is
+/// within the bound of plan section 9 (bit-equal where it says so).
 #[tokio::test(flavor = "multi_thread")]
 async fn each_served_function_is_within_its_distance() {
     skip_unless_live!();
@@ -607,41 +658,43 @@ async fn each_served_function_is_within_its_distance() {
         };
         let start = (end - span).max(day0 + 5 * res);
         let p = range(start, end, res);
-        let mut queries: Vec<(&str, String)> = Vec::new();
-        for f in ["rate", "increase"] {
-            queries.push((
-                f,
-                format!("{f}({METRIC}{{kind!=\"gauge\"}}[{}s])", 5 * secs),
-            ));
-        }
-        for f in [
-            "max_over_time",
-            "min_over_time",
-            "sum_over_time",
-            "last_over_time",
-            "present_over_time",
-            "absent_over_time",
-        ] {
-            for r in [secs, 5 * secs] {
-                queries.push((f, format!("{f}({METRIC}[{r}s])")));
+        // (function, kind, query)
+        let mut queries: Vec<(&str, &str, String)> = Vec::new();
+        for (metric, kind) in CORPUS_D_METRICS {
+            if kind != "gauge" {
+                for f in ["rate", "increase"] {
+                    queries.push((f, kind, format!("{f}({metric}[{}s])", 5 * secs)));
+                }
             }
+            for f in [
+                "max_over_time",
+                "min_over_time",
+                "sum_over_time",
+                "last_over_time",
+                "present_over_time",
+                "absent_over_time",
+            ] {
+                for r in [secs, 5 * secs] {
+                    queries.push((f, kind, format!("{f}({metric}[{r}s])")));
+                }
+            }
+            if kind == "gauge" {
+                for r in [secs, 5 * secs] {
+                    queries.push((
+                        "avg_over_time",
+                        kind,
+                        format!("avg_over_time({metric}[{r}s])"),
+                    ));
+                }
+            }
+            queries.push(("timestamp", kind, format!("timestamp({metric})")));
+            queries.push(("bare", kind, metric.to_string()));
         }
-        for r in [secs, 5 * secs] {
-            queries.push((
-                "avg_over_time",
-                format!("avg_over_time({METRIC}{{kind=\"gauge\"}}[{r}s])"),
-            ));
-        }
-        queries.push(("timestamp", format!("timestamp({METRIC})")));
-        queries.push(("bare", METRIC.to_string()));
 
-        for (qi, (function, query)) in queries.iter().enumerate() {
+        for (qi, (function, kind, query)) in queries.iter().enumerate() {
             let on_c = format!("{run}_{secs}_{qi}_on");
             let off_c = format!("{run}_{secs}_{qi}_off");
-            let routed = built.engine(true, Some(&on_c)).await;
-            let raw = built.engine(false, Some(&off_c)).await;
-            let a = ask(&routed, &no_tenant(), query, &p).await;
-            let b = ask(&raw, &no_tenant(), query, &p).await;
+            let (a, b) = both(&built, query, &p, Some((&on_c, &off_c))).await;
             comments.push((query.clone(), secs, on_c, off_c));
             let route = a.stages("rollup_route");
             let table = format!("metric_samples_{secs}s,");
@@ -653,39 +706,38 @@ async fn each_served_function_is_within_its_distance() {
                 continue;
             }
             let (pa, pb) = (a.points(), b.points());
-            let by_kind = distances(&pa, &pb);
-            for (kind, d) in &by_kind {
-                let (p99, max) = p99_max(d);
+            let d = distances(&pa, &pb);
+            if d.is_empty() {
                 report.push(format!(
-                    "{function:<18} {query:<55} {secs:>6}s {kind:<7} n {:>7} p99 {p99:.6e} max {max:.6e}",
-                    d.len()
+                    "{function:<18} {query:<40} {secs:>6}s (no points on either route)"
                 ));
-                match bound(function, kind, li) {
-                    Some(limit) if p99 > limit => failures.push(format!(
-                        "{query} at {secs}s, {kind}: p99 {p99:e} above the bound {limit:e}"
-                    )),
-                    Some(_) => {}
-                    None if !matches!(
-                        *function,
-                        "rate" | "increase" | "avg_over_time" | "sum_over_time"
-                    ) && !bit_equal(&pa, &pb) =>
-                    {
-                        failures.push(format!("{query} at {secs}s: not bit-equal ({kind})"))
-                    }
-                    None => {}
-                }
+                continue;
             }
-            if by_kind.is_empty() {
-                report.push(format!(
-                    "{function:<18} {query:<55} {secs:>6}s (no points on either route)"
-                ));
+            let (p99, max) = p99_max(&d);
+            report.push(format!(
+                "{function:<18} {query:<40} {secs:>6}s {kind:<7} n {:>7} p99 {p99:.6e} max {max:.6e}",
+                d.len()
+            ));
+            match bound(function, kind, li) {
+                Some(limit) if p99 > limit => failures.push(format!(
+                    "{query} at {secs}s, {kind}: p99 {p99:e} above the bound {limit:e}"
+                )),
+                Some(_) => {}
+                None if !matches!(
+                    *function,
+                    "rate" | "increase" | "avg_over_time" | "sum_over_time"
+                ) && !bit_equal(&pa, &pb) =>
+                {
+                    failures.push(format!("{query} at {secs}s: not bit-equal"))
+                }
+                None => {}
             }
         }
     }
     let rows = read_rows(&built.admin, &format!("{run}_")).await;
     for (query, secs, on_c, off_c) in &comments {
         report.push(format!(
-            "read_rows {query:<55} {secs:>6}s routed {:>10} raw {:>10}",
+            "read_rows {query:<40} {secs:>6}s routed {:>10} raw {:>10}",
             rows.get(on_c).copied().unwrap_or(0),
             rows.get(off_c).copied().unwrap_or(0)
         ));
@@ -736,9 +788,9 @@ async fn a_window_reads_the_finer_levels_and_raw_after_its_level() {
     cut_runs(&built.admin, built.db(), 60, b + 30 * MIN, end + DAY).await;
 
     let p = range(end - 12 * HOUR, end, 12 * MIN);
-    let query = format!("last_over_time({METRIC}[12m])");
-    let a = ask(&built.engine(true, None).await, &no_tenant(), &query, &p).await;
-    let raw = ask(&built.engine(false, None).await, &no_tenant(), &query, &p).await;
+    let query = "last_over_time(c_normal[12m])";
+    let a = ask(&built.engine(true, None).await, &no_tenant(), query, &p).await;
+    let raw = ask(&built.engine(false, None).await, &no_tenant(), query, &p).await;
     let pieces: Vec<(String, i64)> = a
         .stages("rollup_piece")
         .iter()
@@ -766,59 +818,284 @@ async fn a_window_reads_the_finer_levels_and_raw_after_its_level() {
     built.finish().await;
 }
 
-/// **B4 (issue #18 part B): the raw piece continues the counter.** One
-/// counter rises to 900, resets, rises to 100 inside the 60 s level, whose
-/// watermark is `W`; the first raw sample after `W` is 130. `increase`
-/// over 5 m at step 1 m across `W` equals the raw route's within B2's
-/// 60 s bound, and counts the 30 of the raw step.
+/// Corpus D's sample time of series `s`, sample `i` (plan section 9).
+fn t_of(day0: i64, s: i64, i: i64) -> i64 {
+    day0 + 15_000 * i + 100 + (7919 * s) % 14_800 + (7 * s + 13 * i) % 201 - 100
+}
+
+/// `c_normal`'s value of series `s` at sample `i`.
+fn normal_v(s: i64, i: i64) -> f64 {
+    (i % (500 + (37 * s) % 300)) as f64
+}
+
+/// The sample numbers of series `s` whose times lie in `[a, b]`.
+fn samples_in(day0: i64, s: i64, a: i64, b: i64) -> Vec<i64> {
+    let first = (a - day0) / 15_000 - 2;
+    (first..first + (b - a) / 15_000 + 4)
+        .filter(|&i| (a..=b).contains(&t_of(day0, s, i)))
+        .collect()
+}
+
+/// B4's own series beside corpus D, landed with it before the levels are
+/// built: `c_stale`, `c_mixed`, `h` and `c_iv`. `floats` are
+/// `(metric, t, v)`, `hists` `(metric, t)`.
+fn b4_land(
+    db: &str,
+    day0: i64,
+    w: i64,
+    floats: &[(&str, i64, f64)],
+    hists: &[(&str, i64)],
+) -> Vec<String> {
+    let mut out = vec![format!(
+        "CREATE TABLE {db}.rd_extra ENGINE = Memory AS \
+         SELECT s, metric, concat('{{\"s\":\"', toString(s), '\"}}') AS labels, \
+                concat(metric, unhex('FF'), 's', unhex('FF'), toString(s), unhex('FF')) AS buf, \
+                bitOr(bitShiftLeft(toUInt128(bitShiftRight(cityHash64(metric), 32)), 96), \
+                      bitAnd(bitOr(bitShiftLeft(toUInt128(cityHash64(buf)), 64), toUInt128(xxHash64(buf))), \
+                             toUInt128('79228162514264337593543950335'))) AS fp \
+         FROM values('s UInt32, metric String', (0, 'c_stale'), (1, 'c_mixed'), (0, 'h'), (0, 'c_iv'))"
+    )];
+    out.push(format!(
+        "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+         SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, metric, fp, \
+                toInt64({}) + toInt64(n.number) * {HOUR} + 1000, labels, 0 \
+         FROM {db}.rd_extra, numbers(24) AS n",
+        day0 + 7 * DAY
+    ));
+    for chunk in floats.chunks(2_000) {
+        let values: Vec<String> = chunk
+            .iter()
+            .map(|(m, t, v)| {
+                format!(
+                    "('{m}', {t}, reinterpretAsFloat64(toUInt64({})))",
+                    v.to_bits()
+                )
+            })
+            .collect();
+        out.push(format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, e.metric, e.fp, x.t, x.v \
+             FROM (SELECT * FROM values('m String, t Int64, v Float64', {})) AS x \
+             JOIN {db}.rd_extra AS e ON e.metric = x.m",
+            values.join(", ")
+        ));
+    }
+    let _ = w;
+    for chunk in hists.chunks(2_000) {
+        let values: Vec<String> = chunk.iter().map(|(m, t)| format!("('{m}', {t})")).collect();
+        out.push(format!(
+            "INSERT INTO {db}.metric_hist_samples (org_id, fingerprint, unix_milli, schema, zero_threshold, zero_count, \
+                                                   count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
+                                                   neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values) \
+             SELECT '', e.fp, x.t, 0, 0., 0, toUInt64(4 + intDiv(x.t, 15000) % 1000), \
+                    5. + toFloat64(intDiv(x.t, 15000) % 1000), [0], [3], [1, 1, -1], [], [], [], [] \
+             FROM (SELECT * FROM values('m String, t Int64', {})) AS x \
+             JOIN {db}.rd_extra AS e ON e.metric = x.m",
+            values.join(", ")
+        ));
+    }
+    out
+}
+
+/// One answer's points by series and step.
+type Points<V> = BTreeMap<(String, i64), V>;
+
+/// The points of `x` whose step is after `w`, and those at or before it.
+fn split_at_w<V: Clone>(x: &Points<V>, w: i64) -> (Points<V>, Points<V>) {
+    let after = x
+        .iter()
+        .filter(|((_, t), _)| *t > w)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let before = x
+        .iter()
+        .filter(|((_, t), _)| *t <= w)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    (after, before)
+}
+
+/// **B4 (issue #18 part B): a window touching raw is raw.** Corpus D's
+/// last day at every level, with `c_stale`, `c_mixed`, `h` and `c_iv`
+/// beside it; `W = day0 + 7 d 18 h`. (i) to (ii) and (v) with the 60 s
+/// level's coverage cut after `W`; (iii) and (iv) with the 720 s level's
+/// cut after `W` too, against the same step read before that cut.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_raw_piece_continues_the_counter() {
+async fn a_window_touching_raw_is_raw() {
     skip_unless_live!();
     let db = DB_B4.name();
-    let w = (now_ms() / MIN) * MIN - 2 * HOUR;
-    let t0 = w - 15 * MIN;
-    // Every 15 s, rising by 30: 0, 30, ..., 900; a reset to 10, then 40,
-    // 70, 100, the last 10 s before `W`; then 130, 160, ... from 5 s
-    // after it.
-    let mut samples: Vec<(i64, f64)> = Vec::new();
-    for k in 0..=34i64 {
-        let v = if k <= 30 { k * 30 } else { 10 + (k - 31) * 30 };
-        samples.push((w - 10_000 - (34 - k) * SCRAPE, v as f64));
-    }
-    for j in 0..40i64 {
-        samples.push((w + 5_000 + j * SCRAPE, (130 + j * 30) as f64));
-    }
-    let fp = "toUInt128('24000000000000000000000000000000000004')";
-    let values: Vec<String> = samples.iter().map(|(t, v)| format!("({t}, {v})")).collect();
-    let land = vec![
-        format!(
-            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
-             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, 'rollup_b4', {fp}, {t0}, '{{\"s\":\"0\"}}', 0"
-        ),
-        format!(
-            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
-             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, 'rollup_b4', {fp}, t, v \
-             FROM values('t Int64, v Float64', {})",
-            values.join(", ")
-        ),
-    ];
-    let bootstrap = ChClient::new(test_config("default"))
-        .await
-        .expect("connect");
-    let ctx = RenderCtx::for_tests(db, 30);
-    fresh(&bootstrap, &ctx).await;
-    let admin = ChClient::new(test_config(db)).await.expect("connect");
-    for sql in &land {
-        exec(&admin, sql).await;
-    }
-    // The 60 s level up to `W` only; the later levels are not built.
-    build_first(&admin, &ctx, t0, w, MIN).await;
-    let built = warm(bootstrap, admin, ctx, &[]).await;
+    let day0 = today() - 8 * DAY;
+    let day = day0 + 7 * DAY;
+    let end = day0 + 8 * DAY;
+    let w = day + 18 * HOUR;
 
-    let p = range(w - 3 * MIN, w + 8 * MIN, MIN);
-    let query = "increase(rollup_b4[5m])";
-    let a = ask(&built.engine(true, None).await, &no_tenant(), query, &p).await;
-    let b = ask(&built.engine(false, None).await, &no_tenant(), query, &p).await;
+    let mut floats: Vec<(&str, i64, f64)> = Vec::new();
+    let mut hists: Vec<(&str, i64)> = Vec::new();
+    // `c_stale`: `c_normal`'s series 0 from `W − 1 h` to `W + 4 min`, then
+    // one stale marker 15 s after its last sample.
+    let stale = samples_in(day0, 0, w - HOUR, w + 4 * MIN);
+    for &i in &stale {
+        floats.push(("c_stale", t_of(day0, 0, i), normal_v(0, i)));
+    }
+    let last_stale = t_of(day0, 0, *stale.last().expect("samples"));
+    floats.push((
+        "c_stale",
+        last_stale + SCRAPE,
+        f64::from_bits(9_218_868_437_227_405_314),
+    ));
+    // `c_mixed`: `c_normal`'s series 1 until `W + 2 min`, native
+    // histograms after, to `W + 1 h`.
+    for i in samples_in(day0, 1, day, w + HOUR) {
+        let t = t_of(day0, 1, i);
+        if t <= w + 2 * MIN {
+            floats.push(("c_mixed", t, normal_v(1, i)));
+        } else {
+            hists.push(("c_mixed", t));
+        }
+    }
+    // `h`: native histograms only, from `W − 1 h` to `W + 1 h`.
+    for i in samples_in(day0, 0, w - HOUR, w + HOUR) {
+        hists.push(("h", t_of(day0, 0, i)));
+    }
+    // `c_iv`: rising by 30 a scrape to 900, resetting, again and again,
+    // then a last reset to 10, 40, 70, 100 at `W − 10 s`; after `W`, 130,
+    // 160, ... from `W + 5 s`.
+    for k in 0..=(2 * HOUR / SCRAPE) {
+        let v = if k <= 3 {
+            100 - 30 * k
+        } else {
+            900 - 30 * ((k - 4) % 31)
+        };
+        floats.push(("c_iv", w - 10_000 - k * SCRAPE, v as f64));
+    }
+    for j in 0..(HOUR + 20 * MIN) / SCRAPE {
+        floats.push(("c_iv", w + 5_000 + j * SCRAPE, (130 + 30 * j) as f64));
+    }
+
+    let mut land = vec![
+        corpus_d_series(db),
+        corpus_d_registrations(db, day, 24),
+        corpus_d_day(db, day0, 7),
+    ];
+    land.extend(b4_land(db, day0, w, &floats, &hists));
+    let built = build(
+        db,
+        pulsus_schema::DEFAULT_ROLLUP_LEVELS,
+        &land,
+        day,
+        end,
+        &[],
+    )
+    .await;
+    cut_runs(&built.admin, built.db(), 60, w, end + DAY).await;
+
+    // (i) and (ii).
+    let counters = [
+        ("c_normal", "normal"),
+        ("c_fast", "fast"),
+        ("c_stop", "stop"),
+        ("c_sparse", "sparse"),
+        ("c_stale", "normal"),
+    ];
+    for (metric, kind) in counters {
+        for f in ["rate", "increase"] {
+            let query = format!("{f}({metric}[5m])");
+            let (a, b) = both(&built, &query, &range(w - HOUR, w + HOUR, MIN), None).await;
+            let (after_a, before_a) = split_at_w(&a.cells(), w);
+            let (after_b, _) = split_at_w(&b.cells(), w);
+            assert!(!after_b.is_empty(), "{query}: steps after W");
+            assert_eq!(
+                after_a, after_b,
+                "(i) {query}: every step after W is the raw route's"
+            );
+            let (_, pa) = split_at_w(&a.points(), w);
+            let (_, pb) = split_at_w(&b.points(), w);
+            let d = distances(&pa, &pb);
+            let (p99, max) = p99_max(&d);
+            let limit = bound(f, kind, 0).expect("a counter kind");
+            println!(
+                "B4 (i) {query}: before W n {} p99 {p99:e} max {max:e} bound {limit:e}",
+                d.len()
+            );
+            assert!(!before_a.is_empty());
+            assert!(p99 <= limit, "(i) {query}: p99 {p99:e} above {limit:e}");
+            assert!(
+                a.explain.rollup,
+                "(i) {query}: a level served the steps before W"
+            );
+
+            let (a, b) = both(&built, &query, &range(w + MIN, w + HOUR, MIN), None).await;
+            assert!(!b.cells().is_empty());
+            assert_eq!(a.cells(), b.cells(), "(ii) {query}: bit-equal everywhere");
+            assert!(!a.explain.rollup, "(ii) {query}: raw-exact");
+        }
+    }
+
+    // (v): histograms on either side of the raw overlay.
+    for metric in ["h", "c_mixed"] {
+        let query = format!("rate({metric}[5m])");
+        let (a, b) = both(&built, &query, &range(w - HOUR, w + HOUR, MIN), None).await;
+        let (after_a, _) = split_at_w(&a.cells(), w);
+        let (after_b, _) = split_at_w(&b.cells(), w);
+        assert!(
+            after_b
+                .values()
+                .any(|v| v.contains('{') || v.contains("Histogram")),
+            "(v) {query}: the raw route answers histograms after W"
+        );
+        assert_eq!(
+            after_a, after_b,
+            "(v) {query}: every step after W is the raw route's"
+        );
+    }
+
+    // (iii): the 720 s level's coverage cut after `W` too, each stopping
+    // and stale step against the same step read before the cut.
+    let p720 = range(w - 2 * HOUR, w + 2 * HOUR, 12 * MIN);
+    let mut uncut = BTreeMap::new();
+    for metric in ["c_stop", "c_stale"] {
+        let query = format!("rate({metric}[1h])");
+        let (a, b) = both(&built, &query, &p720, None).await;
+        uncut.insert(metric, (a.points(), b.points()));
+    }
+    cut_runs(&built.admin, built.db(), 720, w, end + DAY).await;
+    for (metric, kind) in [("c_normal", "normal"), ("c_fast", "fast")] {
+        let query = format!("rate({metric}[1h])");
+        let (a, b) = both(&built, &query, &p720, None).await;
+        let d = distances(&a.points(), &b.points());
+        let (p99, max) = p99_max(&d);
+        let limit = bound("rate", kind, 1).expect("a counter kind");
+        println!(
+            "B4 (iii) {query}: n {} p99 {p99:e} max {max:e} bound {limit:e}",
+            d.len()
+        );
+        assert!(p99 <= limit, "(iii) {query}: p99 {p99:e} above {limit:e}");
+    }
+    for metric in ["c_stop", "c_stale"] {
+        let query = format!("rate({metric}[1h])");
+        let (a, b) = both(&built, &query, &p720, None).await;
+        let (pa, pb) = (a.points(), b.points());
+        let (ua, ub) = &uncut[metric];
+        let keys: std::collections::BTreeSet<&(String, i64)> = pa
+            .keys()
+            .chain(pb.keys())
+            .chain(ua.keys())
+            .chain(ub.keys())
+            .collect();
+        assert!(!keys.is_empty());
+        for key in keys {
+            let now = d_of(pa.get(key), pb.get(key)).unwrap_or(0.0);
+            let before = d_of(ua.get(key), ub.get(key)).unwrap_or(0.0);
+            assert!(
+                now <= before + 0.0218,
+                "(iii) {query} {key:?}: d {now} against {before} with the level uncut"
+            );
+        }
+    }
+
+    // (iv): the raw piece continues the level's counter.
+    let query = "increase(c_iv[1h])";
+    let (a, b) = both(&built, query, &range(w - HOUR, w + HOUR, 12 * MIN), None).await;
     assert!(
         a.stages("rollup_piece")
             .iter()
@@ -829,15 +1106,12 @@ async fn the_raw_piece_continues_the_counter() {
     let (pa, pb) = (a.points(), b.points());
     assert!(!pb.is_empty());
     for (key, y) in &pb {
-        let x = pa
-            .get(key)
-            .unwrap_or_else(|| panic!("{key:?} absent when routed"));
-        let d = if *y == 0.0 {
-            x.abs()
-        } else {
-            (x - y).abs() / y.abs()
-        };
-        assert!(d <= 0.0218, "{key:?}: routed {x}, raw {y}");
+        let d = d_of(pa.get(key), Some(y)).expect("present");
+        assert!(
+            d <= 0.00828,
+            "(iv) {key:?}: routed {:?}, raw {y}",
+            pa.get(key)
+        );
     }
     assert_eq!(pa.len(), pb.len());
     built.finish().await;
@@ -875,9 +1149,9 @@ async fn a_hole_reads_raw() {
     let built = warm(bootstrap, admin, ctx, &[]).await;
 
     let p = range(day + 2 * HOUR, end, HOUR);
-    let query = format!("sum_over_time({METRIC}[1h])");
-    let a = ask(&built.engine(true, None).await, &no_tenant(), &query, &p).await;
-    let b = ask(&built.engine(false, None).await, &no_tenant(), &query, &p).await;
+    let query = "sum_over_time(c_normal[1h])";
+    let a = ask(&built.engine(true, None).await, &no_tenant(), query, &p).await;
+    let b = ask(&built.engine(false, None).await, &no_tenant(), query, &p).await;
     let want = format!("raw ({hole}, {}]", hole + HOUR);
     assert!(
         a.stages("rollup_piece").contains(&want),
@@ -922,35 +1196,35 @@ async fn a_hole_in_the_middle_keeps_the_counter() {
     cut_runs(&built.admin, built.db(), 720, hole, hole + HOUR).await;
 
     let p = range(end - 20 * HOUR, end - 8 * HOUR, 12 * MIN);
-    let query = format!("rate({METRIC}{{kind!=\"gauge\"}}[1h])");
-    let a = ask(&built.engine(true, None).await, &no_tenant(), &query, &p).await;
-    let b = ask(&built.engine(false, None).await, &no_tenant(), &query, &p).await;
-    let sources: Vec<String> = a
-        .stages("rollup_piece")
-        .iter()
-        .map(|n| piece_of(n).0)
-        .collect();
-    assert_eq!(
-        sources,
-        vec![
-            "metric_samples_720s",
-            "metric_samples_60s",
-            "metric_samples_720s"
-        ],
-        "{:?}",
-        a.stages("rollup_piece")
-    );
-    assert!(
-        a.stages("rollup_piece").contains(&format!(
-            "metric_samples_60s.inc served ({hole}, {}]",
-            hole + HOUR
-        )),
-        "{:?}",
-        a.stages("rollup_piece")
-    );
-    for (kind, d) in distances(&a.points(), &b.points()) {
+    for (metric, kind) in &CORPUS_D_METRICS[..4] {
+        let query = format!("rate({metric}[1h])");
+        let (a, b) = both(&built, &query, &p, None).await;
+        let sources: Vec<String> = a
+            .stages("rollup_piece")
+            .iter()
+            .map(|n| piece_of(n).0)
+            .collect();
+        assert_eq!(
+            sources,
+            vec![
+                "metric_samples_720s",
+                "metric_samples_60s",
+                "metric_samples_720s"
+            ],
+            "{query}: {:?}",
+            a.stages("rollup_piece")
+        );
+        assert!(
+            a.stages("rollup_piece").contains(&format!(
+                "metric_samples_60s.last, inc served ({hole}, {}]",
+                hole + HOUR
+            )),
+            "{query}: {:?}",
+            a.stages("rollup_piece")
+        );
+        let d = distances(&a.points(), &b.points());
         let (p99, max) = p99_max(&d);
-        let limit = bound("rate", &kind, 1).expect("a counter kind");
+        let limit = bound("rate", kind, 1).expect("a counter kind");
         println!(
             "B5b {kind}: n {} p99 {p99:e} max {max:e} bound {limit:e}",
             d.len()
@@ -1090,7 +1364,7 @@ async fn the_unrouted_classes_read_raw() {
     assert!(
         a.stages("rollup_piece")
             .iter()
-            .any(|n| n.starts_with("metric_samples_720s.inc served")),
+            .any(|n| n.starts_with("metric_samples_720s.last, inc served")),
         "{:?}",
         a.stages("rollup_piece")
     );
@@ -1128,9 +1402,9 @@ async fn a_level_added_later_is_used() {
     let end = day0 + 8 * DAY;
     let built = corpus_d(DB_B7.name(), &[60, 300, 7200, 86400], day0, 7..8).await;
     let p = range(end - 6 * HOUR, end, 5 * MIN);
-    let query = format!("max_over_time({METRIC}[5m])");
-    let a = ask(&built.engine(true, None).await, &no_tenant(), &query, &p).await;
-    let b = ask(&built.engine(false, None).await, &no_tenant(), &query, &p).await;
+    let query = "max_over_time(c_normal[5m])";
+    let a = ask(&built.engine(true, None).await, &no_tenant(), query, &p).await;
+    let b = ask(&built.engine(false, None).await, &no_tenant(), query, &p).await;
     assert!(
         a.stages("rollup_route")
             .iter()
@@ -1217,10 +1491,7 @@ async fn a_sparse_counter_keeps_its_steps() {
         )
         .await;
         assert!(a.explain.rollup, "tenant {org}: served from the level");
-        let d: Vec<f64> = distances(&a.points(), &b.points())
-            .into_values()
-            .flatten()
-            .collect();
+        let d = distances(&a.points(), &b.points());
         assert!(!d.is_empty());
         let (p99, max) = p99_max(&d);
         println!("B10 tenant {org}: n {} p99 {p99:e} max {max:e}", d.len());
