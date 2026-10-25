@@ -2750,7 +2750,7 @@ lines above them, and neither number was wrong about what it measured.
 `min = max` with `uniqExact(read_rows) = 1`, not inferred from a total that happens to divide (the
 trap §9.2 records against itself). That is the whole `key = 'a'` (or `'c'`) partition, once per
 read, and it equals the phase-1 generator's own read. `trace_id` is the fifth column of `ORDER BY
-(key, val, scope, timestamp_ns, trace_id, span_id)` (`schema/schema.sql:442`), so a batch's
+(key, val, scope, timestamp_ns, trace_id, span_id)` (`schema/schema.sql:490`), so a batch's
 `trace_id IN (32 ids)` prunes nothing inside it.
 
 **And §9.2's cheap fix does not apply.** §9.2 records that narrowing the *membership* read's
@@ -3136,7 +3136,7 @@ memory at production volume, and whether 80,658,368 rows per generator statement
 
 **What it is.** An **additional** `trace_attrs_idx`-shaped table ordered `(trace_id, span_id, key)`,
 alongside the existing `ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)`
-(`schema/schema.sql:442`) — **not instead of it**.
+(`schema/schema.sql:490`) — **not instead of it**.
 
 **What it costs to store.** **451,383,963** bytes for the same **71,000,000** rows, on top of the
 existing key-ordered `trace_attrs_idx` — which is **1,128,726,045** bytes on four builds of the

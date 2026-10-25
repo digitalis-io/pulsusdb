@@ -30,7 +30,7 @@ Fixes proposed elsewhere that this design deliberately **rejects**, and why:
 - **`minmax` skip indexes on unclustered string columns** — near-zero granule skipping unless data is physically clustered by that column; where we need that clustering we buy it explicitly (ordering key or projection).
 - **`ReplacingMergeTree` for sample data** — merge-time dedup forces `FINAL` or wrong results. Sample tables are plain `MergeTree`; only metadata tables use `ReplacingMergeTree`, and their read shapes (`LIMIT 1 BY`, `GROUP BY`) are duplicate-tolerant by construction.
 
-Conventions used below: `<db>` defaults to `pulsus`; in clustered mode every table becomes `Replicated*`, and every per-shard table but `log_landing`, `metric_landing`, `trace_landing`, `metric_label_values` and `service_edges` also gets a `_dist` Distributed wrapper — those five and the cluster-wide tables get none (§7 lists all eleven); `TTL` clauses show the `{{retention_days}}` token: `PULSUS_RETENTION_DAYS`, which has no default ([configuration.md §7](configuration.md)). Label keys follow the canonical label model ([architecture.md §2.3](architecture.md)): log label keys are normalized at ingest (`service.name` → `service_name`, before fingerprinting); trace attribute keys are stored verbatim; **OTLP metric names and label keys follow Prometheus v3.13.0's OTLP receiver instead** (issue #461) — the metric name gains its unit and type suffixes, attribute keys are sanitized with the reference's `key`/`key_` prefix rule and collisions merge with `;`, resource attributes become `job`/`instance` plus a `target_info` series rather than per-series labels, and the strategy is selectable with `PULSUS_OTLP_TRANSLATION_STRATEGY` ([configuration.md §5](configuration.md)); remote-write names and labels arrive already translated and are stored verbatim; the promoted physical column is named `service` on the logs, traces, and profiles tables (metrics deliberately have none — reads there are `metric_name` + `fingerprint` driven). **Every DDL block in this document mirrors `schema/schema.sql`, which is applied to a fresh ClickHouse in CI** (`crates/pulsus-schema/tests/live_schema.rs`) — an unapplyable table definition is a build failure, not a docs bug. **The generated-SQL examples below are a different matter and no suite executes one**: several carry `{placeholders}` and could not run as written. Each is instead bound to the code that renders it where one exists — §2.3's grouped instant read is asserted byte for byte against its builder by `the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders`, and §4.2's shapes by the TraceQL SQL suites' doc-consistency tests. Latency figures in §9 are targets to validate, not guarantees.
+Conventions used below: `<db>` defaults to `pulsus`; in clustered mode every table becomes `Replicated*`, and every per-shard table but `log_landing`, `metric_landing`, `trace_landing`, `metric_label_values`, `service_edges` and `metric_rollup_plan` also gets a `_dist` Distributed wrapper — those six and the cluster-wide tables get none (§7 lists all twelve); `TTL` clauses show the `{{retention_days}}` token: `PULSUS_RETENTION_DAYS`, which has no default ([configuration.md §7](configuration.md)). Label keys follow the canonical label model ([architecture.md §2.3](architecture.md)): log label keys are normalized at ingest (`service.name` → `service_name`, before fingerprinting); trace attribute keys are stored verbatim; **OTLP metric names and label keys follow Prometheus v3.13.0's OTLP receiver instead** (issue #461) — the metric name gains its unit and type suffixes, attribute keys are sanitized with the reference's `key`/`key_` prefix rule and collisions merge with `;`, resource attributes become `job`/`instance` plus a `target_info` series rather than per-series labels, and the strategy is selectable with `PULSUS_OTLP_TRANSLATION_STRATEGY` ([configuration.md §5](configuration.md)); remote-write names and labels arrive already translated and are stored verbatim; the promoted physical column is named `service` on the logs, traces, and profiles tables (metrics deliberately have none — reads there are `metric_name` + `fingerprint` driven). **Every DDL block in this document mirrors `schema/schema.sql`, which is applied to a fresh ClickHouse in CI** (`crates/pulsus-schema/tests/live_schema.rs`) — an unapplyable table definition is a build failure, not a docs bug. **The generated-SQL examples below are a different matter and no suite executes one**: several carry `{placeholders}` and could not run as written. Each is instead bound to the code that renders it where one exists — §2.3's grouped instant read is asserted byte for byte against its builder by `the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders`, and §4.2's shapes by the TraceQL SQL suites' doc-consistency tests. Latency figures in §9 are targets to validate, not guarantees.
 
 ---
 
@@ -797,16 +797,16 @@ the replica path in the last column.
 
 | table | engine | sorting key | partition | TTL on | replica path | statement |
 |---|---|---|---|---|---|---|
-| `trace_landing` | `MergeTree` | `(org_id, row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)` | hour of `received_ms` | `received_ms` + `{{trace_landing_retention_hours}}` h | per shard | `schema/schema.sql:429-489` |
-| `spans` | `ReplacingMergeTree` | `(org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)` | UTC day of `start_ns` | `start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:344-397` |
-| `error_spans` | `ReplacingMergeTree` | `(org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)` | UTC day of `start_ns` | `start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:890-912` |
-| `traces` | `AggregatingMergeTree` | `(org_id, trace_id)` | `day` | end of the UTC day of `last_start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:491-509` |
-| `resources` | `ReplacingMergeTree` | `(org_id, service, resource_id)` | `day` | end of `day` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:324-342` |
-| `tag_names` | `ReplacingMergeTree(last_start_ns)` | `(org_id, scope, key)` | none | end of the UTC day of `last_start_ns` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:399-411` |
-| `tag_values` | `ReplacingMergeTree(last_start_ns)` | `(org_id, scope, key, value, val_type)` | none | end of the UTC day of `last_start_ns` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:413-427` |
-| `tag_bucket_values` | `AggregatingMergeTree` | `(org_id, service, scope, key, bucket)` | UTC day of `bucket` | `bucket` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:873-888` |
-| `service_bucket_resources` | `ReplacingMergeTree` | `(org_id, service, bucket, resource_id)` | UTC day of `bucket` | `bucket` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:943-956` |
-| `service_edges` | `ReplacingMergeTree(ver)` | `(org_id, conn_type, minute, client_minute, client, server)` | `toDate(minute)` | `minute` + `{{retention_days}}` d, less 240 s where `conn_type = ''` | per shard | `schema/schema.sql:776-794` |
+| `trace_landing` | `MergeTree` | `(org_id, row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)` | hour of `received_ms` | `received_ms` + `{{trace_landing_retention_hours}}` h | per shard | `schema/schema.sql:477-537` |
+| `spans` | `ReplacingMergeTree` | `(org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)` | UTC day of `start_ns` | `start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:392-445` |
+| `error_spans` | `ReplacingMergeTree` | `(org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)` | UTC day of `start_ns` | `start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:1069-1091` |
+| `traces` | `AggregatingMergeTree` | `(org_id, trace_id)` | `day` | end of the UTC day of `last_start_ns` + `{{retention_days}}` d | per shard | `schema/schema.sql:539-557` |
+| `resources` | `ReplacingMergeTree` | `(org_id, service, resource_id)` | `day` | end of `day` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:372-390` |
+| `tag_names` | `ReplacingMergeTree(last_start_ns)` | `(org_id, scope, key)` | none | end of the UTC day of `last_start_ns` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:447-459` |
+| `tag_values` | `ReplacingMergeTree(last_start_ns)` | `(org_id, scope, key, value, val_type)` | none | end of the UTC day of `last_start_ns` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:461-475` |
+| `tag_bucket_values` | `AggregatingMergeTree` | `(org_id, service, scope, key, bucket)` | UTC day of `bucket` | `bucket` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:1052-1067` |
+| `service_bucket_resources` | `ReplacingMergeTree` | `(org_id, service, bucket, resource_id)` | UTC day of `bucket` | `bucket` + `{{retention_days}}` d | cluster-wide | `schema/schema.sql:1122-1135` |
+| `service_edges` | `ReplacingMergeTree(ver)` | `(org_id, conn_type, minute, client_minute, client, server)` | `toDate(minute)` | `minute` + `{{retention_days}}` d, less 240 s where `conn_type = ''` | per shard | `schema/schema.sql:955-973` |
 
 - Every TTL is the saturating form `toDateTime(least(… , 4294967295))`. Every table but `tag_names` and
   `tag_values` sets `ttl_only_drop_parts = 1`; those two carry `last_start_ns`, the latest start of a span carrying
@@ -816,10 +816,10 @@ the replica path in the last column.
   (`non_replicated_deduplication_window` single-node, `replicated_deduplication_window` clustered).
 - `spans` carries three bloom-filter indexes (`idx_service`, `idx_name`, `idx_resource`) and the
   `{{trace_attr_indexes}}` token, which renders one index per attribute `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` names
-  (`schema/schema.sql:387-389`; `docs/configuration.md` §3).
-- `trace_landing` sets `async_insert = 0` (`schema/schema.sql:488`).
+  (`schema/schema.sql:435-437`; `docs/configuration.md` §3).
+- `trace_landing` sets `async_insert = 0` (`schema/schema.sql:536`).
 - Clustered, `spans`, `traces` and `error_spans` have a `_dist` wrapper sharded on `cityHash64(trace_id)`
-  (`schema/schema.sql:544-546`, `:548-550`, `:914-916`); no other trace table has one (§7).
+  (`schema/schema.sql:595-597`, `:599-601`, `:1093-1095`); no other trace table has one (§7).
 
 - Every table's first column is `org_id`, the tenant (issue #738), and the first column of its sorting key; the
   `_dist` wrappers are `AS` their table and carry it.
@@ -830,15 +830,15 @@ it, and reads and writes its markers under the empty tenant (`org_id = ''`), one
 
 | view | target | reads | filter | statement |
 |---|---|---|---|---|
-| `spans_mv` | `spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0` | `schema/schema.sql:722-754` |
-| `error_spans_mv` | `error_spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0 AND status_code = 2` | `schema/schema.sql:918-922` |
-| `traces_mv` | `traces` (`_dist` clustered) | `trace_landing` | `row_kind = 0`, grouped by `org_id`, `trace_id` | `schema/schema.sql:846-871` |
-| `tag_bucket_values_mv` | `tag_bucket_values` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, scope, key | `schema/schema.sql:924-941` |
-| `service_bucket_resources_mv` | `service_bucket_resources` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, resource | `schema/schema.sql:958-962` |
-| `resources_mv` | `resources` | `trace_landing` | `row_kind = 1` | `schema/schema.sql:708-720` |
-| `tag_names_mv` | `tag_names` | `trace_landing` | `row_kind = 2` | `schema/schema.sql:756-763` |
-| `tag_values_mv` | `tag_values` | `trace_landing` | `row_kind = 3` | `schema/schema.sql:765-774` |
-| `service_edges_mv` | `service_edges`, `REFRESH EVERY 1 MINUTE APPEND` | `spans`, `service_edges` | the hold rule, `docs/api.md` §4.5 | `schema/schema.sql:796-844` |
+| `spans_mv` | `spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0` | `schema/schema.sql:901-933` |
+| `error_spans_mv` | `error_spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0 AND status_code = 2` | `schema/schema.sql:1097-1101` |
+| `traces_mv` | `traces` (`_dist` clustered) | `trace_landing` | `row_kind = 0`, grouped by `org_id`, `trace_id` | `schema/schema.sql:1025-1050` |
+| `tag_bucket_values_mv` | `tag_bucket_values` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, scope, key | `schema/schema.sql:1103-1120` |
+| `service_bucket_resources_mv` | `service_bucket_resources` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, resource | `schema/schema.sql:1137-1141` |
+| `resources_mv` | `resources` | `trace_landing` | `row_kind = 1` | `schema/schema.sql:887-899` |
+| `tag_names_mv` | `tag_names` | `trace_landing` | `row_kind = 2` | `schema/schema.sql:935-942` |
+| `tag_values_mv` | `tag_values` | `trace_landing` | `row_kind = 3` | `schema/schema.sql:944-953` |
+| `service_edges_mv` | `service_edges`, `REFRESH EVERY 1 MINUTE APPEND` | `spans`, `service_edges` | the hold rule, `docs/api.md` §4.5 | `schema/schema.sql:975-1023` |
 
 So `row_kind` 0 is a span, 1 a resource, 2 a tag name and 3 a tag value: the four filters above are the only
 readers of each kind.
@@ -974,7 +974,7 @@ The script reads the same environment variables the binary does ([configuration.
 
 ## 7. Distributed layout
 
-Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family, and every **per-shard** table but the three landing tables, `metric_label_values` and `service_edges` gets a Distributed wrapper. Eleven tables get none. Three are the landing tables — `log_landing`, `metric_landing` and `trace_landing` (issues #603 and #586; the reason, and what it costs, are below, and in [ingest-one-source-table.md](ingest-one-source-table.md)). `metric_label_values` is per-shard and gets none because every statement names it locally, inside a read dispatched with `distributed_product_mode = 'local'`, beside the same shard's label index rows (issue #635). `service_edges` is per-shard and has none because the service graph reads it only through `cluster(…, view(…))`, one per-shard statement that also pairs that shard's spans (issue #599). The other six are the cluster-wide ones, one replica set each spanning every shard (`/clickhouse/tables/all/<db>.<table>`), read from the local replica without fan-out, so a wrapper would put a row on one shard and leave every other shard's read missing it permanently: `metric_metadata`, `resources`, `tag_names`, `tag_values`, `tag_bucket_values` and `service_bucket_resources` — the last row of the table below is theirs. **Sharding keys are chosen so that reads join and aggregate shard-locally** (finding #2):
+Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family, and every **per-shard** table but the three landing tables, `metric_label_values`, `service_edges` and `metric_rollup_plan` gets a Distributed wrapper. Twelve tables get none. Three are the landing tables — `log_landing`, `metric_landing` and `trace_landing` (issues #603 and #586; the reason, and what it costs, are below, and in [ingest-one-source-table.md](ingest-one-source-table.md)). `metric_label_values` is per-shard and gets none because every statement names it locally, inside a read dispatched with `distributed_product_mode = 'local'`, beside the same shard's label index rows (issue #635). `service_edges` is per-shard and has none because the service graph reads it only through `cluster(…, view(…))`, one per-shard statement that also pairs that shard's spans (issue #599). `metric_rollup_plan` is a plain local table on every replica, holding that replica's own rollup plan, which only that replica's derivation reads (issue #18). The other six are the cluster-wide ones, one replica set each spanning every shard (`/clickhouse/tables/all/<db>.<table>`), read from the local replica without fan-out, so a wrapper would put a row on one shard and leave every other shard's read missing it permanently: `metric_metadata`, `resources`, `tag_names`, `tag_values`, `tag_bucket_values` and `service_bucket_resources` — the last row of the table below is theirs. **Sharding keys are chosen so that reads join and aggregate shard-locally** (finding #2):
 
 | Table | Sharding key | Why |
 |-------|--------------|-----|

@@ -1546,10 +1546,11 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test live_metrics_window_algebra
 
-      # Issue #18 part 1: `metric_rollup_mv` derives the 5m and 1h summaries
-      # and the coverage rows, empty days included; a day expires by whole
-      # part; an unsettled day and a database with no samples derive
-      # nothing. Reuses this job's container.
+      # Issue #18 part 1: `metric_rollup_plan_mv` and `metric_rollup_mv`
+      # derive the 5m and 1h summaries and the coverage rows, empty days
+      # included; a stale plan cannot certify a backfilled day; a day
+      # expires by whole part; an unsettled day and a database with no
+      # samples derive nothing. Reuses this job's container.
       - name: Live rollup derivation tests
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -2550,8 +2551,8 @@ jobs:
           catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 64 ]; then
-            echo "::error::expected 64 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 66 ]; then
+            echo "::error::expected 66 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -2758,8 +2759,8 @@ jobs:
           catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 64 ]; then
-            echo "::error::expected 64 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 66 ]; then
+            echo "::error::expected 66 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
