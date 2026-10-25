@@ -1546,6 +1546,16 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test live_metrics_window_algebra
 
+      # Issue #18 part 1: `metric_rollup_mv` derives the 5m and 1h summaries
+      # and the coverage rows, empty days included; a day expires by whole
+      # part; an unsettled day and a database with no samples derive
+      # nothing. Reuses this job's container.
+      - name: Live rollup derivation tests
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-schema --test live_rollup_derivation
+
       # Issue #270: OTLP/JSON metrics ingest must store the CORRECTLY ROUNDED
       # f64 — POST /v1/metrics (application/json) -> decode_json -> parse ->
       # MetricWriter (sync) -> ClickHouse, read back as
@@ -2540,8 +2550,8 @@ jobs:
           catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 61 ]; then
-            echo "::error::expected 61 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 64 ]; then
+            echo "::error::expected 64 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -2568,7 +2578,7 @@ jobs:
                              countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          for pair in "18123 1 19_6_0_19_6" "38123 1 19_6_0_19_6" "28123 2 19_6_19_0_6"; do
+          for pair in "18123 1 20_6_0_20_6" "38123 1 20_6_0_20_6" "28123 2 20_6_20_0_6"; do
             set -- $pair
             want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")
@@ -2748,8 +2758,8 @@ jobs:
           catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 61 ]; then
-            echo "::error::expected 61 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 64 ]; then
+            echo "::error::expected 64 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -2776,7 +2786,7 @@ jobs:
                              countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          for pair in "18123 1 19_6_0_19_6" "38123 1 19_6_0_19_6" "28123 2 19_6_19_0_6"; do
+          for pair in "18123 1 20_6_0_20_6" "38123 1 20_6_0_20_6" "28123 2 20_6_20_0_6"; do
             set -- $pair
             want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")
