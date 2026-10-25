@@ -960,7 +960,7 @@ PULSUS_CLUSTER=prod schema/schema.sh  # clustered
 schema/schema.sh --print              # render the statements, send nothing
 ```
 
-The script reads the same environment variables the binary does ([configuration.md §3](configuration.md)), gates on the server version, **drops the configured database**, creates it, and sends one statement per request — the HTTP interface refuses a multi-statement body. 60 statements single-node, 75 clustered.
+The script reads the same environment variables the binary does ([configuration.md §3](configuration.md)), gates on the server version, **drops the configured database**, creates it, and sends one statement per request — the HTTP interface refuses a multi-statement body. 52 statements single-node, 67 clustered.
 
 **There are no migrations.** No numbered list, no bookkeeping table, no checksum drift guard. A schema change is an edit to `schema.sql` and another run of the script; the cost is the data in the database, and the development workflow is to drop and recreate. Nothing is upgraded in place, including retention: `PULSUS_RETENTION_DAYS` is declared in each table's `CREATE`, so changing it is a rebuild.
 
