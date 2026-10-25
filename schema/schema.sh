@@ -303,7 +303,7 @@ expand_levels() {
             for (j = 1; j <= nb; j++) {
                 if (bk[j] == "first" && i != 1) continue
                 if (bk[j] == "next" && i == 1) continue
-                if (bk[j] == "feeds" && i == n) continue
+                if (bk[j] == "feeds" && (i == n || lv[i + 1] >= 86400)) continue
                 line = rep(bl[j], "{{level}}", lv[i] "s")
                 line = rep(line, "{{level_ms}}", lv[i] "000")
                 line = rep(line, "{{source}}", i > 1 ? "metric_samples_" lv[i - 1] "s" : "")

@@ -174,6 +174,7 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 | `PULSUS_METRICS_LANDING_RETENTION_HOURS` | `6` | `H` for `metric_landing`, in hours. A whole number from `1` to `168`; anything else is exit `2` |
 | `PULSUS_LOG_LANDING_RETENTION_HOURS` | `6` | `H` for `log_landing`, with the same rule |
 | `PULSUS_TRACE_LANDING_RETENTION_HOURS` | `6` | `H` for `trace_landing`, with the same rule |
+| `PULSUS_ROLLUP_LEVELS` | `60,720,7200,86400` | the rollup levels in seconds, smallest first; empty for none. Refused with exit `2` unless: whole numbers, no leading zero, no empty item; each divides 86400; one below 60 divides 60; each greater than and a multiple of the one before; at most 8; and `2 × max(first, 60) + 870 ≤ 3600 × PULSUS_METRICS_LANDING_RETENTION_HOURS`. Choose levels above the scrape interval: a level at or below it stores more than raw and saves nothing (design r13 §3.3) |
 
 **The binary reads the retention from the database.** At startup it reads the database comment and is not ready until the comment is exactly `retention_days=<N>`; its retry warning names the script. The trace read floor (a read that selects spans by a window reads no span that started `N` days or more before the request, [api.md](api.md) §4), the live-tail lower bound (`N` days and one more before the request) and `/api/v1/status/runtimeinfo`'s `storageRetention` all use that `N`. Changing retention is a rebuild with the script, which drops the database.
 
@@ -194,9 +195,8 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 | `metric_labels` | the end of the UTC day of `last_seen` + `R` days | row by row | none |
 | `metric_landing` | `received_ms` + `H` hours | whole part | hour of `received_ms` |
 | `metric_metadata` | `updated_ns` + `R` days | row by row | none |
-| `metric_rollup` | the start of the UTC day of `t_end − 1 ms` + `R` days | whole part | `(res, UTC day of t_end − 1 ms)` |
-| `metric_rollup_plan` | none: one row, replaced by each planning refresh | — | none |
 | `metric_samples` | `unix_milli` + `R` days | whole part | UTC day of `unix_milli` |
+| `metric_samples_<N>s` | the start of the UTC day of `t_end − 1 ms` + `R` days | whole part | UTC day of `t_end − 1 ms` |
 | `metric_series` | the end of the UTC day `day` + `R` days | whole part | `day`, a UTC day |
 | `resources` | the end of the UTC day `day` + `R` days | whole part | `day`, a UTC day |
 | `service_bucket_resources` | the start of the 5-minute `bucket` + `R` days | whole part | UTC day of `bucket` |

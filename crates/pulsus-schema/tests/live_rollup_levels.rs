@@ -45,6 +45,8 @@ static DB_HOLE_SOURCE: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_levels_hole_source");
 static DB_WINDOW: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_levels_window");
+static DB_WINDOW_UP: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_levels_window_up");
 static DB_WAITS: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_levels_waits");
 static DB_MIDNIGHT: pulsus_testkit::TestDb =
@@ -561,10 +563,6 @@ fn day_samples(start: i64, minutes: i64) -> Vec<Sample> {
 /// levels then run until idle, and every row of each equals
 /// [`expected_up`] of the level below in its bucket, with every bucket of
 /// the day built for every series.
-///
-/// **A7 (ii)** runs here, on this database once A4 is done: every coarser
-/// run that wrote data read its source through the source's `by_parent`
-/// projection.
 #[tokio::test]
 async fn a_level_is_its_aggregates() {
     skip_unless_live!();
@@ -657,40 +655,6 @@ async fn a_level_is_its_aggregates() {
         below = got;
     }
 
-    // A7 (ii): every coarser run that wrote data read through the
-    // projection of the level below.
-    exec(&client, "SYSTEM FLUSH LOGS").await;
-    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-    struct RunLog {
-        written_rows: u64,
-        projections: Vec<String>,
-    }
-    for (r, source) in [(720u32, 60u32), (7200, 720), (86400, 7200)] {
-        let logged = rows::<RunLog>(
-            &client,
-            &format!(
-                "SELECT written_rows, projections FROM system.query_log \
-                 WHERE type = 'QueryFinish' AND event_date >= yesterday() \
-                 AND query LIKE 'INSERT INTO {db}.metric_samples_{r}s (%' \
-                 AND query LIKE '%builder%'"
-            ),
-        )
-        .await;
-        let writing: Vec<&RunLog> = logged.iter().filter(|l| l.written_rows > 1).collect();
-        assert!(
-            !writing.is_empty(),
-            "{r}s: no run that wrote data is in the query log: {logged:?}"
-        );
-        let projection = format!("{db}.metric_samples_{source}s.by_parent");
-        for l in writing {
-            assert!(
-                l.projections.contains(&projection),
-                "{r}s: a run that wrote {} rows read without {projection}: {:?}",
-                l.written_rows,
-                l.projections
-            );
-        }
-    }
     drop_db(&client, db).await;
 }
 
@@ -834,13 +798,22 @@ async fn a_hole_is_skipped_at_every_level() {
     drop_db(&client, db).await;
 }
 
-/// **A7 (i) (issue #18 part A): each run reads its window.** In its own
+/// **A7 (issue #18 part A): each run reads its window.** (i) In its own
 /// database, 400 series at 15 s over 40 minutes ending 3 minutes ago land
 /// (64,000 rows), a first-level run row is seeded at the window start, and
 /// the 60 s level runs until idle. Every first-level run reads fewer rows
 /// than `metric_landing` holds: its window and lookback span a few
 /// 5-minute blocks, and the block condition is what lets it read only
-/// those. (ii) is in [`a_level_is_its_aggregates`].
+/// those. (ii) In another database, one UTC day `T−2` of 60 s rows for 400
+/// series and one run row for the day, built by the test; the 720 s, 7200 s
+/// and 86400 s levels run until idle. Every 720 s and 7200 s run that wrote
+/// data read its source through the source's `by_parent` projection, at
+/// least 12 and 2 of them. The 86400 s level's source has no projection (a
+/// day-long run reads its source's day partition), and its data run reads
+/// at most `S + Σ_p min(rows_p, 1024) + O + 1`, taken from `system.parts`
+/// before it: the 7200 s table's rows in the day's partition, one granule
+/// of run rows per source part, its own table's watermark scan, and the
+/// run-row branch.
 #[tokio::test]
 async fn each_run_reads_its_window() {
     skip_unless_live!();
@@ -898,6 +871,104 @@ async fn each_run_reads_its_window() {
         assert!(
             l.read_rows < landing as u64,
             "a first-level run read {} rows of the {landing} landing holds: {logged:?}",
+            l.read_rows
+        );
+    }
+    drop_db(&client, db).await;
+
+    // (ii)
+    let db = DB_WINDOW_UP.name();
+    fresh(&client, &RenderCtx::for_tests(db, 7)).await;
+    let day = (now_ms(&client).await / DAY - 2) * DAY;
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {db}.metric_samples_60s (kind, org_id, fingerprint, t_end, t_last, last, min, max, sum, count, inc, built_at) \
+             SELECT 0, '', toUInt128(number % 400 + 1), {day} + (intDiv(number, 400) + 1) * 60000 AS te, te - 1000, \
+                    toFloat64(number % 89), toFloat64(number % 89), toFloat64(number % 89), toFloat64(number % 89) * 4, 4, 1., 0 \
+             FROM numbers(400 * 1440)"
+        ),
+    )
+    .await;
+    insert_level(&client, db, 60, &[], &[(day, day + DAY)]).await;
+    until_idle(&client, db, 720, 30).await;
+    until_idle(&client, db, 7200, 30).await;
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct PartRow {
+        rows: u64,
+    }
+    let parts = rows::<PartRow>(
+        &client,
+        &format!(
+            "SELECT rows FROM system.parts WHERE database = '{db}' AND table = 'metric_samples_7200s' \
+             AND active AND partition = toString(toDate(fromUnixTimestamp64Milli({day}), 'UTC'))"
+        ),
+    )
+    .await;
+    let own = int(
+        &client,
+        &format!("SELECT toInt64(count()) AS v FROM {db}.metric_samples_86400s"),
+    )
+    .await as u64;
+    let ceiling = parts.iter().map(|p| p.rows).sum::<u64>()
+        + parts.iter().map(|p| p.rows.min(1024)).sum::<u64>()
+        + own
+        + 1;
+    until_idle(&client, db, 86400, 30).await;
+    let built = int(
+        &client,
+        &format!(
+            "SELECT toInt64(count()) AS v FROM {db}.metric_samples_86400s \
+             WHERE kind = 0 AND t_end = {}",
+            day + DAY
+        ),
+    )
+    .await;
+    assert_eq!(
+        built, 400,
+        "the 86400 s level built the day for every series"
+    );
+
+    exec(&client, "SYSTEM FLUSH LOGS").await;
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct RunLog {
+        read_rows: u64,
+        written_rows: u64,
+        projections: Vec<String>,
+    }
+    let runs_of = |r: u32| {
+        format!(
+            "SELECT read_rows, written_rows, projections FROM system.query_log \
+             WHERE type = 'QueryFinish' AND event_date >= yesterday() \
+             AND query LIKE 'INSERT INTO {db}.metric_samples_{r}s (%' \
+             AND query LIKE '%builder%' AND written_rows > 1"
+        )
+    };
+    for (r, source, at_least) in [(720u32, 60u32, 12usize), (7200, 720, 2)] {
+        let logged = rows::<RunLog>(&client, &runs_of(r)).await;
+        assert!(
+            logged.len() >= at_least,
+            "{r}s: {} runs wrote data, want at least {at_least}: {logged:?}",
+            logged.len()
+        );
+        let projection = format!("{db}.metric_samples_{source}s.by_parent");
+        for l in &logged {
+            assert!(
+                l.projections.contains(&projection),
+                "{r}s: a run that wrote {} rows read without {projection}: {logged:?}",
+                l.written_rows
+            );
+        }
+    }
+    let logged = rows::<RunLog>(&client, &runs_of(86400)).await;
+    assert!(
+        !logged.is_empty(),
+        "86400s: the run that wrote the day is in the query log"
+    );
+    for l in &logged {
+        assert!(
+            l.read_rows <= ceiling,
+            "86400s: a run read {} rows, above the day partition's {ceiling}: {logged:?}",
             l.read_rows
         );
     }

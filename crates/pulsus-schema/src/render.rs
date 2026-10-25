@@ -280,7 +280,8 @@ enum LevelLine {
     First,
     /// `--@level-next `: every later level, built from the level below.
     Next,
-    /// `--@level-feeds `: every level but the last.
+    /// `--@level-feeds `: every level whose next level is shorter than a
+    /// day; a day-long run reads its source's day partition.
     Feeds,
 }
 
@@ -379,7 +380,7 @@ fn emit_levels(out: &mut String, block: &[(LevelLine, &str)], levels: &[u32]) {
                 LevelLine::All => true,
                 LevelLine::First => i == 0,
                 LevelLine::Next => i > 0,
-                LevelLine::Feeds => i < last,
+                LevelLine::Feeds => i < last && levels[i + 1] < 86_400,
             };
             if !kept {
                 continue;
@@ -605,7 +606,10 @@ mod tests {
             out.contains("A 86400s 86400000 EVERY 1 DAY OFFSET 780 SECOND\n"),
             "{out}"
         );
-        assert!(out.contains("F 720000\nP 86400000\n"), "{out}");
+        // The next level is a whole day, so the 720 s level feeds no
+        // projection.
+        assert!(out.contains("F 720000\nA 86400s"), "{out}");
+        assert!(!out.contains("\nP "), "{out}");
         assert!(out.contains("N metric_samples_720s\ntail\n"), "{out}");
     }
 

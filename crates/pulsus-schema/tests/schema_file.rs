@@ -2472,7 +2472,7 @@ fn statement_headed(stmts: &[String], head: &str) -> String {
 /// each view's timer is the one plan Q4 derives from the sizes. Each table
 /// names its level in its comment, expires by the UTC day of `t_end − 1 ms`,
 /// is keyed by the series, and carries the projection the next level's run
-/// reads, except the last. The first view reads `metric_landing` with
+/// reads exactly when that next level is shorter than a day. The first view reads `metric_landing` with
 /// exact repeats dropped and the landing block named; every other view
 /// reads the level below with its block named; every view writes its run
 /// row in the same statement and runs on two threads. Nothing names the
@@ -2556,7 +2556,7 @@ fn the_rollup_levels_render_from_one_template() {
                 ] {
                     assert!(lines.contains(&line.as_str()), "{what}: {r}s lacks {line}: {table}");
                 }
-                match levels.get(i + 1) {
+                match levels.get(i + 1).filter(|next| **next < 86_400) {
                     Some(next) => assert!(
                         lines.contains(&format!(
                             "    , PROJECTION by_parent (SELECT * ORDER BY (intDiv(t_end - 1, {next}000), org_id, fingerprint, t_end))"
@@ -2565,7 +2565,7 @@ fn the_rollup_levels_render_from_one_template() {
                     ),
                     None => assert!(
                         !table.contains("PROJECTION"),
-                        "{what}: the last level has no projection: {table}"
+                        "{what}: a level whose next level is a day or none has no projection: {table}"
                     ),
                 }
 

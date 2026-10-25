@@ -967,8 +967,9 @@ GROUP BY org_id, bucket, service, resource_id;
 -- smallest first. A line carrying `--@level ` is emitted for every level,
 -- `--@level-first ` for the first (built from `metric_landing`),
 -- `--@level-next ` for every later one (built from the level below) and
--- `--@level-feeds ` for every level but the last (the projection the next
--- level's run reads); the marker and the one space after it are removed.
+-- `--@level-feeds ` for every level whose next level is shorter than a day
+-- (the projection the next level's run reads; a day-long run reads its
+-- source's day partition); the marker and the one space after it are removed.
 -- Level tokens: `{{level}}` (`60s`), `{{level_ms}}`, `{{source}}`,
 -- `{{parent_ms}}`, `{{timer}}`, `{{period_ms}}`.
 --@level CREATE TABLE IF NOT EXISTS {{db}}.metric_samples_{{level}}{{on_cluster}}
