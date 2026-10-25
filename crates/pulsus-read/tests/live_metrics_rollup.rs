@@ -931,9 +931,10 @@ async fn a_window_touching_raw_is_raw() {
 
     let mut floats: Vec<(&str, i64, f64)> = Vec::new();
     let mut hists: Vec<(&str, i64)> = Vec::new();
-    // `c_stale`: `c_normal`'s series 0 from `W − 1 h` to `W + 4 min`, then
-    // one stale marker 15 s after its last sample.
-    let stale = samples_in(day0, 0, w - HOUR, w + 4 * MIN);
+    // `c_stale`: `c_normal`'s series 0 to `W + 4 min`, then one stale
+    // marker 15 s after its last sample. It starts 10 minutes before the
+    // queries' `W − 1 h`, so no window of theirs holds the series' start.
+    let stale = samples_in(day0, 0, w - HOUR - 10 * MIN, w + 4 * MIN);
     for &i in &stale {
         floats.push(("c_stale", t_of(day0, 0, i), normal_v(0, i)));
     }
@@ -1071,6 +1072,7 @@ async fn a_window_touching_raw_is_raw() {
         );
         assert!(p99 <= limit, "(iii) {query}: p99 {p99:e} above {limit:e}");
     }
+    let mut over = Vec::new();
     for metric in ["c_stop", "c_stale"] {
         let query = format!("rate({metric}[1h])");
         let (a, b) = both(&built, &query, &p720, None).await;
@@ -1086,10 +1088,16 @@ async fn a_window_touching_raw_is_raw() {
         for key in keys {
             let now = d_of(pa.get(key), pb.get(key)).unwrap_or(0.0);
             let before = d_of(ua.get(key), ub.get(key)).unwrap_or(0.0);
-            assert!(
-                now <= before + 0.0218,
-                "(iii) {query} {key:?}: d {now} against {before} with the level uncut"
+            println!(
+                "B4 (iii) {query} step W{:+}s: d {now:e}, with the level uncut {before:e}",
+                (key.1 - w) / 1000
             );
+            if now > before + 0.0218 {
+                over.push(format!(
+                    "(iii) {query} step W{:+}s: d {now} against {before} with the level uncut",
+                    (key.1 - w) / 1000
+                ));
+            }
         }
     }
 
@@ -1115,6 +1123,7 @@ async fn a_window_touching_raw_is_raw() {
     }
     assert_eq!(pa.len(), pb.len());
     built.finish().await;
+    assert!(over.is_empty(), "{}", over.join("\n"));
 }
 
 /// **B5 (issue #18 part B): a hole reads raw.** Corpus D's last day; the
