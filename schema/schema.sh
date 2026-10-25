@@ -56,6 +56,7 @@ trace_landing_hours=${PULSUS_TRACE_LANDING_RETENTION_HOURS:-6}
 metrics_dedup=${PULSUS_METRICS_DEDUP_WINDOW:-10000}
 log_dedup=${PULSUS_LOG_DEDUP_WINDOW:-10000}
 trace_dedup=${PULSUS_TRACE_DEDUP_WINDOW:-10000}
+rollup_levels=${PULSUS_ROLLUP_LEVELS-60,720,7200,86400}
 
 # `pulsus_schema::DEDUP_WINDOW_SECONDS`. Not a knob: the startup check in
 # `pulsus-server` holds it against the landing budget.
@@ -64,9 +65,6 @@ dedup_window_seconds=3600
 # `pulsus_schema::GRAPH_JOB_MAX_ROWS`: the rows one run of the service-graph
 # job may read (issue #599). Not a knob.
 graph_job_max_rows=60000000
-
-# `pulsus_schema::ROLLUP_SETTLE_MS` (issue #18): the time after a UTC day ends before the rollup derives it. Not a knob.
-rollup_settle_ms=7200000
 
 # Names reach the server inside SQL, so they are identifiers and nothing
 # else. Refusing here is simpler than quoting, and the binary's own
@@ -117,6 +115,64 @@ for pair in "PULSUS_METRICS_LANDING_RETENTION_HOURS:$metrics_landing_hours" \
         exit 2
     fi
 done
+
+# Issue #18: `PULSUS_ROLLUP_LEVELS`, the rollup levels in seconds, smallest
+# first; set and empty is no levels. The same rules, in the same order and
+# with the same messages, as `pulsus_schema::parse_rollup_levels`; the first
+# rule that fails is the message.
+bad_levels() {
+    echo "schema.sh: PULSUS_ROLLUP_LEVELS: $1" >&2
+    exit 2
+}
+if [ -n "$rollup_levels" ]; then
+    case "$rollup_levels" in
+        ,* | *, | *,,*) bad_levels "an empty item in '$rollup_levels'" ;;
+    esac
+    old_ifs=$IFS
+    IFS=,
+    set -f
+    # shellcheck disable=SC2086
+    set -- $rollup_levels
+    set +f
+    IFS=$old_ifs
+    for item in "$@"; do
+        case "$item" in
+            0* | *[!0-9]* | ??????*)
+                bad_levels "$item is not a whole number of seconds from 1 to 86400" ;;
+        esac
+        [ "$item" -le 86400 ] ||
+            bad_levels "$item is not a whole number of seconds from 1 to 86400"
+    done
+    for item in "$@"; do
+        [ $((86400 % item)) -eq 0 ] || bad_levels "$item does not divide a day (86400)"
+    done
+    for item in "$@"; do
+        if [ "$item" -lt 60 ] && [ $((60 % item)) -ne 0 ]; then
+            bad_levels "$item is below 60 and does not divide 60"
+        fi
+    done
+    prev=""
+    for item in "$@"; do
+        if [ -n "$prev" ] && [ "$item" -le "$prev" ]; then
+            bad_levels "$prev then $item: the levels must increase"
+        fi
+        prev=$item
+    done
+    prev=""
+    for item in "$@"; do
+        if [ -n "$prev" ] && [ $((item % prev)) -ne 0 ]; then
+            bad_levels "$item is not a multiple of $prev"
+        fi
+        prev=$item
+    done
+    [ "$#" -le 8 ] || bad_levels "more than 8 levels"
+    period=$1
+    [ "$period" -ge 60 ] || period=60
+    if [ $((2 * period + 870)) -gt $((metrics_landing_hours * 3600)) ]; then
+        bad_levels "the first level $1 outlives metric_landing: 2 × $period + 870 > $metrics_landing_hours × 3600"
+    fi
+    set --
+fi
 
 if [ "$mode" = cluster ] && [ -z "$cluster" ]; then
     echo "schema.sh: --mode cluster needs PULSUS_CLUSTER set to the cluster name" >&2
@@ -219,8 +275,62 @@ policy_token=""
 other=single
 [ "$mode" = single ] && other=cluster
 
+# The rollup levels (issue #18): the `--@level*` block of schema.sql, once per
+# level, smallest first. `pulsus_schema::expand_levels` does the same.
+expand_levels() {
+    ROLLUP_LEVELS=$rollup_levels awk '
+    function unit(v) {
+        if (v % 86400 == 0) return (v / 86400) " DAY"
+        if (v % 3600 == 0) return (v / 3600) " HOUR"
+        if (v % 60 == 0) return (v / 60) " MINUTE"
+        return v " SECOND"
+    }
+    function rep(s, k, v,   at) {
+        while ((at = index(s, k)) > 0) s = substr(s, 1, at - 1) v substr(s, at + length(k))
+        return s
+    }
+    function flush(   i, j, p, d, off, timer, line) {
+        if (nb == 0) return
+        p = (lv[1] > 60) ? lv[1] : 60
+        d = int((150 + p - 1) / p) * p
+        for (i = 1; i <= n; i++) {
+            if (i == 1) timer = "EVERY " unit(p)
+            else {
+                d += 60
+                off = d % lv[i]
+                timer = "EVERY " unit(lv[i]) (off ? " OFFSET " off " SECOND" : "")
+            }
+            for (j = 1; j <= nb; j++) {
+                if (bk[j] == "first" && i != 1) continue
+                if (bk[j] == "next" && i == 1) continue
+                if (bk[j] == "feeds" && (i == n || lv[i + 1] >= 86400)) continue
+                line = rep(bl[j], "{{level}}", lv[i] "s")
+                line = rep(line, "{{level_ms}}", lv[i] "000")
+                line = rep(line, "{{source}}", i > 1 ? "metric_samples_" lv[i - 1] "s" : "")
+                line = rep(line, "{{parent_ms}}", i < n ? lv[i + 1] "000" : "")
+                line = rep(line, "{{period_ms}}", p "000")
+                line = rep(line, "{{timer}}", timer)
+                print line
+            }
+        }
+        nb = 0
+    }
+    BEGIN { n = ENVIRON["ROLLUP_LEVELS"] == "" ? 0 : split(ENVIRON["ROLLUP_LEVELS"], lv, ",") }
+    {
+        kind = ""
+        if (index($0, "--@level-first ") == 1) { kind = "first"; rest = substr($0, 16) }
+        else if (index($0, "--@level-next ") == 1) { kind = "next"; rest = substr($0, 15) }
+        else if (index($0, "--@level-feeds ") == 1) { kind = "feeds"; rest = substr($0, 16) }
+        else if (index($0, "--@level ") == 1) { kind = "all"; rest = substr($0, 10) }
+        if (kind != "") { nb++; bk[nb] = kind; bl[nb] = rest; next }
+        flush()
+        print
+    }
+    END { flush() }'
+}
+
 render() {
-    sed -e "/^--@$other /d" -e "s/^--@$mode *//" -e "/^--/d" "$sql" |
+    expand_levels < "$sql" | sed -e "/^--@$other /d" -e "s/^--@$mode *//" -e "/^--/d" |
         sed -e "s|{{db}}|$db|g" \
             -e "s|{{on_cluster}}|$on_cluster|g" \
             -e "s|{{cluster}}|$cluster_token|g" \
@@ -237,7 +347,6 @@ render() {
             -e "s|{{trace_dedup_window}}|$trace_dedup|g" \
             -e "s|{{dedup_window_seconds}}|$dedup_window_seconds|g" \
             -e "s|{{graph_job_max_rows}}|$graph_job_max_rows|g" \
-            -e "s|{{rollup_settle_ms}}|$rollup_settle_ms|g" \
             -e "s|{{storage_policy}}|$policy_token|g" |
         TRACE_ATTR_INDEXES=$attr_indexes awk '{
             i = index($0, "{{trace_attr_indexes}}")

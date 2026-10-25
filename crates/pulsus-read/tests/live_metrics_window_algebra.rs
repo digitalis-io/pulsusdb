@@ -15,9 +15,6 @@
 //!    finisher over `window` of the window's 5-minute `segment_of` pieces
 //!    equals the base revision's function over the window's samples of
 //!    E, as bits.
-//! 3. The same with each piece passed through `cap(…, 4)`, the 5m tier's
-//!    cap: a window holding an overflowed piece answers nothing under
-//!    `rate` and `increase`, and every other answer is unchanged.
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`:
 //!
@@ -45,8 +42,7 @@ use pulsus_clickhouse::{QuerySettings, Row};
 use pulsus_model::{Fingerprint, STALE_NAN_BITS};
 use pulsus_promql::Sample;
 use pulsus_promql::eval::window::{
-    Segment, WindowSummary, cap, finish_extrapolated, finish_idelta, finish_irate, segment_of,
-    window,
+    Segment, WindowSummary, finish_extrapolated, finish_idelta, finish_irate, segment_of, window,
 };
 use pulsus_read::metrics::sample_sql;
 use pulsus_write::{MetricLandingRow, MetricPoint};
@@ -332,11 +328,9 @@ fn from_legacy(samples: &[Sample], range: i64, lo: i64, hi: i64) -> [Option<u64>
 struct Tally {
     windows: usize,
     compared: usize,
-    overflowed: usize,
-    capped_with_corrections: usize,
 }
 
-/// (ii) and (iii) over one series' E.
+/// (ii) over one series' E.
 fn check_windows(w: &Written, e: &[(i64, u64)], day0: i64, tally: &mut Tally) {
     let samples: Vec<Sample> = e
         .iter()
@@ -352,10 +346,6 @@ fn check_windows(w: &Written, e: &[(i64, u64)], day0: i64, tally: &mut Tally) {
         }
     }
     let pieces: Vec<Option<Segment>> = buckets.iter().map(|b| segment_of(b)).collect();
-    let capped: Vec<Option<Segment>> = pieces
-        .iter()
-        .map(|p| p.clone().map(|s| cap(s, 4)))
-        .collect();
 
     // The design's range shapes whose window is 5m-aligned: (step, range).
     let shapes: [(i64, i64); 6] = [
@@ -397,31 +387,8 @@ fn check_windows(w: &Written, e: &[(i64, u64)], day0: i64, tally: &mut Tally) {
                     w.kind, w.fp
                 );
             }
-
-            // (iii) the 5m tier's cap.
-            let summary = window(&segs(&capped));
-            let got = from_summary(summary.as_ref(), range, lo, end);
-            let overflowed = summary.as_ref().is_some_and(|s| s.overflow);
-            for (i, name) in FINISHERS.iter().enumerate() {
-                let expect = if overflowed && (*name == "rate" || *name == "increase") {
-                    None
-                } else {
-                    want[i]
-                };
-                assert_eq!(
-                    got[i], expect,
-                    "kind {} series {:#x}: {name} over ({lo}, {end}], capped pieces",
-                    w.kind, w.fp
-                );
-            }
             tally.windows += 1;
-            tally.compared += 2 * FINISHERS.len();
-            tally.overflowed += usize::from(overflowed);
-            tally.capped_with_corrections += usize::from(
-                summary
-                    .as_ref()
-                    .is_some_and(|s| !s.overflow && s.corrections.iter().any(|c| *c != 0.0)),
-            );
+            tally.compared += FINISHERS.len();
             end += step;
         }
     }
@@ -509,7 +476,7 @@ async fn the_window_algebra_answers_as_the_raw_functions_over_the_fetched_order(
         pairs_read += e.windows(2).filter(|p| p[0].0 == p[1].0).count();
     }
 
-    // (ii) and (iii), over what the test wrote.
+    // (ii), over what the test wrote.
     let mut tally = Tally::default();
     for w in &written {
         check_windows(w, &canonical(w), day0, &mut tally);
@@ -518,14 +485,6 @@ async fn the_window_algebra_answers_as_the_raw_functions_over_the_fetched_order(
     assert_eq!(
         pairs_read, 14,
         "kind 7's equal-millisecond pairs, seven a series"
-    );
-    assert!(
-        tally.overflowed > 0,
-        "some window holds an overflowed 5m piece"
-    );
-    assert!(
-        tally.capped_with_corrections > 0,
-        "some capped window keeps its corrections"
     );
     drop_database(&bootstrap, &db).await;
 }

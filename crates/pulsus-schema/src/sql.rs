@@ -20,19 +20,22 @@ pub const SCHEMA_SQL: &str = include_str!("../../../schema/schema.sql");
 const SINGLE: &str = "--@single";
 const CLUSTER: &str = "--@cluster";
 
-/// The file with the other variant's lines dropped, this variant's markers
+/// The file with its level block expanded for the context's rollup levels
+/// (issue #18), the other variant's lines dropped, this variant's markers
 /// stripped, comments removed and every `{{token}}` resolved.
 ///
-/// `schema.sh` does exactly this with three `sed` expressions and the same
-/// token list; `the_script_renders_exactly_what_this_crate_renders` holds
-/// the two together.
+/// `schema.sh` does exactly this with an `awk` step, three `sed`
+/// expressions and the same token list;
+/// `the_script_renders_exactly_what_this_crate_renders` holds the two
+/// together.
 pub fn rendered(ctx: &RenderCtx) -> String {
     let (mine, theirs) = match ctx.cluster {
         Some(_) => (CLUSTER, SINGLE),
         None => (SINGLE, CLUSTER),
     };
-    let mut out = String::with_capacity(SCHEMA_SQL.len());
-    for line in SCHEMA_SQL.lines() {
+    let expanded = render::expand_levels(SCHEMA_SQL, &ctx.rollup_levels);
+    let mut out = String::with_capacity(expanded.len());
+    for line in expanded.lines() {
         let line = match marked(line, mine) {
             Some(rest) => rest,
             None => {
@@ -46,6 +49,14 @@ pub fn rendered(ctx: &RenderCtx) -> String {
         out.push('\n');
     }
     render::substitute_tokens(&out, ctx)
+}
+
+/// `schema/schema.sql` with its level block expanded for `levels` (issue
+/// #18), before any other step: what a test reads to see the level tables
+/// under their names.
+#[doc(hidden)]
+pub fn expand_levels_for_tests(levels: &[u32]) -> String {
+    render::expand_levels(SCHEMA_SQL, levels)
 }
 
 /// `line` with `marker` and the spaces after it removed, or `None` when the
@@ -173,18 +184,29 @@ mod tests {
         assert_eq!(marked("ENGINE = x", SINGLE), None);
     }
 
-    /// Only the two markers may prefix a line with `--@`: a third would
-    /// reach the server as text.
+    /// Only the two mode markers and the four level markers (issue #18)
+    /// may prefix a line with `--@`: another would reach the server as text.
     #[test]
-    fn the_file_carries_no_marker_but_the_two() {
+    fn the_file_carries_no_marker_but_the_two_modes_and_the_level_markers() {
+        let mut level_lines = 0;
         for line in SCHEMA_SQL.lines() {
             if !line.starts_with("--@") {
                 continue;
             }
+            let level = [
+                "--@level ",
+                "--@level-first ",
+                "--@level-next ",
+                "--@level-feeds ",
+            ]
+            .iter()
+            .any(|m| line.starts_with(m));
+            level_lines += usize::from(level);
             assert!(
-                marked(line, SINGLE).is_some() || marked(line, CLUSTER).is_some(),
-                "unknown mode marker: {line}"
+                level || marked(line, SINGLE).is_some() || marked(line, CLUSTER).is_some(),
+                "unknown marker: {line}"
             );
         }
+        assert!(level_lines > 0, "the file carries the level block");
     }
 }

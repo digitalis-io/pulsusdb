@@ -2494,7 +2494,7 @@ the migration catalogue is append-only and that the window for in-place amendmen
 > — `docs/architecture.md:96`
 
 > the trace-index scope amendment (issue #54) was the last such amendment window
-> — `docs/schemas.md:1046`
+> — `docs/schemas.md:1060`
 
 > issue #54's scope amendment of migrations 17/18 + `trace_tag_catalog_mv` was the last
 > such amendment window (task-manager ruling on #54) — `crates/pulsus-schema/src/catalog.rs:16-23`
@@ -3167,7 +3167,7 @@ from its source; the pointer is not reproduced here.
 | spans per trace cap | `LIMIT 10001 BY trace_id` | `crates/pulsus-read/src/traces/exec.rs:131` @ 1cdb3e5e |
 | tag name / value caps | 10,000 / 1,000 | `crates/pulsus-read/src/traces/exec.rs:131 @ 1cdb3e5e, 135` |
 | storage → reader wire format | RowBinary, LZ4-framed | `crates/pulsus-clickhouse/src/pool.rs:694` → `vendor/clickhouse/Cargo.toml:49` → `vendor/clickhouse/src/query.rs:221-231` |
-| shard key | `cityHash64(trace_id)` | `crates/pulsus-schema/src/render.rs:55-57` |
+| shard key | `cityHash64(trace_id)` | `crates/pulsus-schema/src/render.rs:56-58` |
 | pushed aggregates | `uniqExact(span_id)`, `max(duration_ns)`, `min(duration_ns)` | `crates/pulsus-read/src/traces/compile.rs:478-489` |
 
 ### Assumed compression ratios
@@ -4352,13 +4352,13 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
 
 ### `docs/schemas.md`
 
-**`:758-758`**  — this is one of the two citations round one corrected; the branch base's line holds different text, which is what made the correction necessary
+**`:772-772`**  — this is one of the two citations round one corrected; the branch base's line holds different text, which is what made the correction necessary
 
 ```markdown
   720  | `name`/`status`/`kind` | `trace_spans` time-window scan + predicate | no selective index — window-bounded, budget-limited |
 ```
 
-**`:937-937`**  — this is one of the two citations round one corrected; the branch base's line holds different text, which is what made the correction necessary
+**`:951-951`**  — this is one of the two citations round one corrected; the branch base's line holds different text, which is what made the correction necessary
 
 ```markdown
   897  **Migration amendment policy:** the migration catalog (`pulsus-schema`'s `catalog.rs`, recorded per-id in `schema_migrations`) is append-only from the first tagged release onward. In-place amendment of an already-listed migration was permitted only pre-release (no tagged release, no persistent deployments, CI databases created fresh per run); the trace-index scope amendment (issue #54) was the last such amendment window. A local database created before a pre-release amendment must be dropped and re-reconciled — the per-id checksum drift guard refuses to touch the stale tables.
@@ -4730,7 +4730,7 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
   321  /// (docs/schemas.md §2.2/§8: replaying a partially-committed block
 ```
 
-**`:401-468`**  (68 lines in the range; comments and blanks elided, 30 shown)
+**`:415-482`**  (68 lines in the range; comments and blanks elided, 30 shown)
 
 ```rust
   367  async fn finish_generation<R>(
@@ -4924,25 +4924,25 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
   380  ///
 ```
 
-**`:431-431`**
+**`:445-445`**
 
 ```rust
   397  pub fn event_set_sql(
 ```
 
-**`:462-462`**
+**`:476-476`**
 
 ```rust
   428  pub fn root_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
 ```
 
-**`:502-502`**
+**`:516-516`**
 
 ```rust
   468  pub fn trace_ctx_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
 ```
 
-**`:526-526`**
+**`:540-540`**
 
 ```rust
   492  pub fn child_count_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
@@ -5255,7 +5255,7 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
 
 ### `crates/pulsus-schema/src/render.rs`
 
-**`:55-57`**
+**`:56-58`**
 
 ```rust
    55              Family::Metrics => "cityHash64(metric_name, fingerprint)",

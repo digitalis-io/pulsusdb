@@ -1022,7 +1022,7 @@ async fn metric_landing_and_its_views_exist_after_init() {
     for want in [
         "ENGINE = MergeTree",
         "PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))",
-        "ORDER BY (org_id, kind, metric_name, fingerprint, unix_milli)",
+        "ORDER BY (kind, intDiv(unix_milli, 300000), org_id, metric_name, fingerprint, unix_milli)",
         "ttl_only_drop_parts = 1",
         "merge_with_ttl_timeout = 3600",
     ] {
@@ -1090,8 +1090,11 @@ async fn the_sample_tables_fingerprint_codec_is_zstd() {
         ("metric_label_index", "CODEC(ZSTD(1))"),
         ("metric_labels", "CODEC(Delta(8), ZSTD(1))"),
         ("metric_landing", "CODEC(Delta(8), ZSTD(1))"),
-        ("metric_rollup", "CODEC(ZSTD(1))"),
         ("metric_samples", "CODEC(ZSTD(1))"),
+        ("metric_samples_60s", "CODEC(ZSTD(1))"),
+        ("metric_samples_7200s", "CODEC(ZSTD(1))"),
+        ("metric_samples_720s", "CODEC(ZSTD(1))"),
+        ("metric_samples_86400s", "CODEC(ZSTD(1))"),
         ("metric_series", "CODEC(ZSTD(1))"),
     ]
     .iter()

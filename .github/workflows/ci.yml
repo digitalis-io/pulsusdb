@@ -1538,24 +1538,22 @@ jobs:
 
       # Issue #18 part 3: the raw fetch reads two floats at one millisecond
       # in value-bits order, and the window algebra over 5-minute pieces
-      # answers as the base revision's functions over the same samples,
-      # uncapped and under the 5m tier's cap. Reuses this job's container.
+      # answers as the base revision's functions over the same samples.
+      # Reuses this job's container.
       - name: Live window algebra tests
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test live_metrics_window_algebra
 
-      # Issue #18 part 1: `metric_rollup_plan_mv` and `metric_rollup_mv`
-      # derive the 5m and 1h summaries and the coverage rows, empty days
-      # included; a stale plan cannot certify a backfilled day; a day
-      # expires by whole part; an unsettled day and a database with no
-      # samples derive nothing. Reuses this job's container.
-      - name: Live rollup derivation tests
+      # Issue #18 part A: each rollup level's rows equal their aggregates
+      # from raw or the level below; run rows, holes, the projection read
+      # and expiry. Reuses this job's container.
+      - name: Live rollup level tests
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
-        run: cargo test -p pulsus-schema --test live_rollup_derivation
+        run: cargo test -p pulsus-schema --test live_rollup_levels
 
       # Issue #270: OTLP/JSON metrics ingest must store the CORRECTLY ROUNDED
       # f64 — POST /v1/metrics (application/json) -> decode_json -> parse ->
@@ -2415,8 +2413,8 @@ jobs:
           schema/schema.sh
           catalogue > /tmp/schema-first.tsv
           objects=$(wc -l < /tmp/schema-first.tsv)
-          if [ "$objects" -ne 51 ]; then
-            echo "::error::expected 51 objects in the single-node schema, got $objects"
+          if [ "$objects" -ne 55 ]; then
+            echo "::error::expected 55 objects in the single-node schema, got $objects"
             cut -f1 /tmp/schema-first.tsv
             exit 1
           fi
@@ -2551,8 +2549,8 @@ jobs:
           catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 66 ]; then
-            echo "::error::expected 66 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 73 ]; then
+            echo "::error::expected 73 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -2568,7 +2566,7 @@ jobs:
           # Per-shard replica sets must be per shard: `{shard}` resolved to
           # this node's own macro, so shard 1's paths say /1/ and shard 2's
           # say /2/. Shard 1 has two replicas (issue #599 part B), so its
-          # per-shard tables hold two and shard 2's hold one. The six
+          # 23 per-shard tables hold two and shard 2's hold one. The six
           # cluster-wide tables take /all/ and hold all three nodes. A
           # substituted-away macro collapses the first group onto one path
           # with three replicas, which this catches.
@@ -2579,7 +2577,7 @@ jobs:
                              countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          for pair in "18123 1 20_6_0_20_6" "38123 1 20_6_0_20_6" "28123 2 20_6_20_0_6"; do
+          for pair in "18123 1 23_6_0_23_6" "38123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
             set -- $pair
             want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")
@@ -2759,8 +2757,8 @@ jobs:
           catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 66 ]; then
-            echo "::error::expected 66 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 73 ]; then
+            echo "::error::expected 73 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -2776,7 +2774,7 @@ jobs:
           # Per-shard replica sets must be per shard: `{shard}` resolved to
           # this node's own macro, so shard 1's paths say /1/ and shard 2's
           # say /2/. Shard 1 has two replicas (issue #599 part B), so its
-          # per-shard tables hold two and shard 2's hold one. The six
+          # 23 per-shard tables hold two and shard 2's hold one. The six
           # cluster-wide tables take /all/ and hold all three nodes. A
           # substituted-away macro collapses the first group onto one path
           # with three replicas, which this catches.
@@ -2787,7 +2785,7 @@ jobs:
                              countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          for pair in "18123 1 20_6_0_20_6" "38123 1 20_6_0_20_6" "28123 2 20_6_20_0_6"; do
+          for pair in "18123 1 23_6_0_23_6" "38123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
             set -- $pair
             want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")
