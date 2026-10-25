@@ -62,6 +62,11 @@ static TEST_DB_LATE_ROW: pulsus_testkit::TestDb =
 // Issue #18 part 1: each shard derives its slice of the rollup.
 static TEST_DB_ROLLUP: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_rollup");
+// Issue #18 part 1, 1-e2: a replica behind its peer.
+static TEST_DB_ROLLUP_LAG_EMPTY: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_rollup_lag_empty");
+static TEST_DB_ROLLUP_LAG_CHUNK: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_rollup_lag_chunk");
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -2016,6 +2021,23 @@ async fn rows_on<R: ChRow>(client: &ChClient, sql: &str) -> Vec<R> {
     out
 }
 
+/// Issue #18's planning view, then the derivation that depends on it.
+const ROLLUP_VIEWS: [&str; 2] = ["metric_rollup_plan_mv", "metric_rollup_mv"];
+
+/// `SYSTEM STOP VIEW` or `SYSTEM START VIEW` on both rollup views, on one
+/// replica, planner first.
+async fn rollup_views(client: &ChClient, db: &str, verb: &str) {
+    for view in ROLLUP_VIEWS {
+        exec_on(client, &format!("SYSTEM {verb} VIEW {db}.{view}")).await;
+    }
+}
+
+/// One refresh of `view` on one replica, waited for.
+async fn rollup_refresh(client: &ChClient, db: &str, view: &str) {
+    exec_on(client, &format!("SYSTEM REFRESH VIEW {db}.{view}")).await;
+    exec_on(client, &format!("SYSTEM WAIT VIEW {db}.{view}")).await;
+}
+
 /// Whether the chunks of `(day, res)` together cover `[lo, hi]` with no gap.
 fn chunks_cover(cov: &[ClusterCoverageRow], day: i64, res: u32, lo: u128, hi: u128) -> bool {
     let mut chunks: Vec<(u128, u128)> = cov
@@ -2069,7 +2091,7 @@ async fn a_shard_derives_its_slice_from_every_shard_and_the_slices_cover_the_spa
     let replicas = [&shard1, &shard1b, &shard2];
     // No scheduled refresh may run while the day is only partly written.
     for r in replicas {
-        exec_on(r, &format!("SYSTEM STOP VIEW {db}.metric_rollup_mv")).await;
+        rollup_views(r, db, "STOP").await;
     }
 
     const DAY: i64 = 86_400_000;
@@ -2098,13 +2120,14 @@ async fn a_shard_derives_its_slice_from_every_shard_and_the_slices_cover_the_spa
         exec_on(r, &format!("SYSTEM SYNC REPLICA {db}.metric_samples")).await;
     }
     for r in replicas {
-        exec_on(r, &format!("SYSTEM START VIEW {db}.metric_rollup_mv")).await;
+        rollup_views(r, db, "START").await;
     }
 
     for _ in 0..4 {
         for r in replicas {
-            exec_on(r, &format!("SYSTEM REFRESH VIEW {db}.metric_rollup_mv")).await;
-            exec_on(r, &format!("SYSTEM WAIT VIEW {db}.metric_rollup_mv")).await;
+            for view in ROLLUP_VIEWS {
+                rollup_refresh(r, db, view).await;
+            }
         }
     }
     for r in [&shard1, &shard1b] {
@@ -2209,4 +2232,155 @@ async fn a_shard_derives_its_slice_from_every_shard_and_the_slices_cover_the_spa
         assert!(written > 0, "{name} wrote no rollup part of its own");
     }
     drop_cluster_db(&shard1, db).await;
+}
+
+/// **1-e2 (issue #18 part 1).** The derivation reads every replica's
+/// samples, so a replica behind its peer still sees the peer's backfill.
+/// Shard 1's second replica stops fetching `metric_samples`; a float
+/// sample lands at `T−5` 12:00 on the first replica only; the second
+/// replica's derivation then runs once on `plan`, the plan row it holds.
+/// Returns the second replica's data rows and coverage of `T−5`.
+async fn a_lagging_replica_derives_its_peers_backfill(
+    db: &pulsus_testkit::TestDb,
+    plan: fn(i64, u128) -> String,
+) -> (Vec<ClusterRollupRow>, Vec<ClusterCoverageRow>) {
+    const DAY: i64 = 86_400_000;
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard1b = ChClient::new(shard1b_config())
+        .await
+        .expect("connect shard1b");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+    drop_cluster_db(&shard1, db).await;
+    let ctx = RenderCtx {
+        retention_days: 40,
+        ..cluster_ctx(db)
+    };
+    run_init(&shard1, &ctx).await.expect("run_init (clustered)");
+    for r in [&shard1, &shard1b, &shard2] {
+        rollup_views(r, db, "STOP").await;
+    }
+    let t = ints_on(
+        &shard1,
+        "SELECT intDiv(toInt64(toUnixTimestamp64Milli(now64())), 86400000) AS v",
+    )
+    .await[0];
+    let half: u128 = 1 << 127;
+    let landing = |at: i64| {
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             VALUES ('', {at}, 0, '', 1, {at}, 1.5)"
+        )
+    };
+    for d in [t - 7, t - 2] {
+        exec_on(&shard1, &landing(d * DAY + 6 * 3_600_000)).await;
+    }
+    exec_on(
+        &shard1b,
+        &format!("SYSTEM SYNC REPLICA {db}.metric_samples"),
+    )
+    .await;
+    exec_on(
+        &shard1b,
+        &format!("SYSTEM STOP FETCHES {db}.metric_samples"),
+    )
+    .await;
+    exec_on(&shard1b, &format!("TRUNCATE TABLE {db}.metric_rollup_plan")).await;
+    exec_on(
+        &shard1b,
+        &format!("INSERT INTO {db}.metric_rollup_plan {}", plan(t, half - 1)),
+    )
+    .await;
+    exec_on(&shard1, &landing((t - 5) * DAY + 12 * 3_600_000)).await;
+    exec_on(
+        &shard1b,
+        &format!("SYSTEM START VIEW {db}.metric_rollup_mv"),
+    )
+    .await;
+    rollup_refresh(&shard1b, db, "metric_rollup_mv").await;
+
+    let data = rows_on::<ClusterRollupRow>(
+        &shard1b,
+        &format!(
+            "SELECT res, org_id, fingerprint, t_end, n, t_first, reinterpretAsUInt64(v_first) AS v_first, \
+             t_last, reinterpretAsUInt64(v_last) AS v_last, t_prev, reinterpretAsUInt64(v_prev) AS v_prev, \
+             reinterpretAsUInt64(v_min) AS v_min, reinterpretAsUInt64(v_max) AS v_max, changes, n_resets, \
+             arrayMap(x -> reinterpretAsUInt64(x), resets) AS resets, t_any, any_stale, has_hist \
+             FROM {db}.metric_rollup FINAL WHERE row_kind = 0 AND intDiv(t_end - 1, {DAY}) = {}",
+            t - 5
+        ),
+    )
+    .await;
+    let cov = rows_on::<ClusterCoverageRow>(
+        &shard1b,
+        &format!(
+            "SELECT intDiv(t_end - 1, {DAY}) AS day, res, fingerprint AS lo, chunk_last AS hi \
+             FROM {db}.metric_rollup WHERE row_kind = 1 AND intDiv(t_end - 1, {DAY}) = {}",
+            t - 5
+        ),
+    )
+    .await;
+    exec_on(
+        &shard1b,
+        &format!("SYSTEM START FETCHES {db}.metric_samples"),
+    )
+    .await;
+    drop_cluster_db(&shard1, db).await;
+    (data, cov)
+}
+
+/// **1-e2 (a).** The plan's empty run names `T−5`, which the peer holds a
+/// sample of: the lagging replica does not cover it.
+#[tokio::test]
+async fn a_lagging_replica_does_not_cover_a_day_its_peer_backfilled() {
+    skip_unless_live!();
+    let (data, cov) =
+        a_lagging_replica_derives_its_peers_backfill(&TEST_DB_ROLLUP_LAG_EMPTY, |t, hi| {
+            format!(
+                "SELECT {}, toUInt256(0), toUInt256('{hi}'), 0, CAST([{}, {}, {}] AS Array(Int64)), \
+                 toUInt256(0), toUInt256('{hi}')",
+                t - 6,
+                t - 6,
+                t - 5,
+                t - 4
+            )
+        })
+        .await;
+    assert!(
+        cov.is_empty() && data.is_empty(),
+        "T−5 was certified by a replica that had not fetched its sample: {cov:?} {data:?}"
+    );
+}
+
+/// **1-e2 (b).** The plan is a data chunk for `T−5` over shard 1's slice:
+/// the lagging replica derives the peer's sample with its coverage.
+#[tokio::test]
+async fn a_lagging_replica_derives_a_sample_only_its_peer_holds() {
+    skip_unless_live!();
+    let (data, cov) =
+        a_lagging_replica_derives_its_peers_backfill(&TEST_DB_ROLLUP_LAG_CHUNK, |t, hi| {
+            format!(
+                "SELECT {}, toUInt256(0), toUInt256('{hi}'), 1, CAST([] AS Array(Int64)), \
+                 toUInt256(0), toUInt256('{hi}')",
+                t - 5
+            )
+        })
+        .await;
+    let tiers: Vec<(u32, u32)> = data.iter().map(|r| (r.res, r.n)).collect();
+    assert_eq!(tiers.len(), 2, "the sample's 5m and 1h rows: {tiers:?}");
+    assert!(
+        tiers.iter().all(|(_, n)| *n == 1),
+        "each holds the sample: {tiers:?}"
+    );
+    let mut res: Vec<u32> = cov.iter().map(|c| c.res).collect();
+    res.sort();
+    assert_eq!(
+        res,
+        vec![300_000, 3_600_000],
+        "T−5's coverage at both tiers"
+    );
 }

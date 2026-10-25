@@ -114,14 +114,27 @@ async fn drop_db(client: &ChClient, db: &str) {
     exec(client, &format!("DROP DATABASE IF EXISTS {db} SYNC")).await;
 }
 
-/// One refresh of the view, waited for.
+/// The planning view, then the derivation that depends on it.
+const VIEWS: [&str; 2] = ["metric_rollup_plan_mv", "metric_rollup_mv"];
+
+/// One refresh of `view`, waited for. A stopped view ignores it.
+async fn refresh_one(client: &ChClient, db: &str, view: &str) {
+    exec(client, &format!("SYSTEM REFRESH VIEW {db}.{view}")).await;
+    exec(client, &format!("SYSTEM WAIT VIEW {db}.{view}")).await;
+}
+
+/// One refresh: the planner, then the derivation, each waited for.
 async fn refresh(client: &ChClient, db: &str) {
-    exec(
-        client,
-        &format!("SYSTEM REFRESH VIEW {db}.metric_rollup_mv"),
-    )
-    .await;
-    exec(client, &format!("SYSTEM WAIT VIEW {db}.metric_rollup_mv")).await;
+    for view in VIEWS {
+        refresh_one(client, db, view).await;
+    }
+}
+
+/// `SYSTEM STOP VIEW` or `SYSTEM START VIEW` on both views, planner first.
+async fn views(client: &ChClient, db: &str, verb: &str) {
+    for view in VIEWS {
+        exec(client, &format!("SYSTEM {verb} VIEW {db}.{view}")).await;
+    }
 }
 
 /// One data row of `metric_rollup`, floats as bits. Positional: the field
@@ -231,6 +244,16 @@ fn covers(cov: &[CoverageRow], day: i64, res: u32, lo: u128, hi: u128) -> bool {
 fn all_covered(cov: &[CoverageRow], days: &[i64], lo: u128, hi: u128) -> bool {
     days.iter()
         .all(|&d| [RES_5M, RES_1H].iter().all(|&r| covers(cov, d, r, lo, hi)))
+}
+
+/// One view's refreshes in the query log (1-h).
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct IdleRow {
+    view: String,
+    refreshes: u64,
+    most_written: u64,
+    cpu_us: u64,
+    analysis_us: u64,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -360,7 +383,7 @@ async fn the_view_derives_every_day_exactly_and_covers_empty_days() {
         .expect("run_init");
     // No scheduled refresh may run while the days are only partly
     // written: the refreshes below are the test's own.
-    exec(&client, &format!("SYSTEM STOP VIEW {db}.metric_rollup_mv")).await;
+    views(&client, db, "STOP").await;
 
     let t = now_ms(&client).await / DAY;
 
@@ -430,7 +453,7 @@ async fn the_view_derives_every_day_exactly_and_covers_empty_days() {
         exec(&client, &landing_values(db, &hists, true)).await;
     }
 
-    exec(&client, &format!("SYSTEM START VIEW {db}.metric_rollup_mv")).await;
+    views(&client, db, "START").await;
     let table = format!("{db}.metric_rollup");
     let days: Vec<i64> = (t - 7..=t - 2).collect();
     let mut refreshes = 0;
@@ -554,6 +577,40 @@ async fn the_view_derives_every_day_exactly_and_covers_empty_days() {
         );
     }
 
+    // 1-h: with everything covered, five refreshes write nothing. Their
+    // CPU is printed as evidence and not asserted on.
+    let t0 = now_ms(&client).await;
+    for _ in 0..5 {
+        refresh(&client, db).await;
+    }
+    exec(&client, "SYSTEM FLUSH LOGS").await;
+    let idle = rows::<IdleRow>(
+        &client,
+        &format!(
+            "SELECT if(query LIKE 'INSERT INTO {db}.metric_rollup (%', 'derivation', 'planner') AS view, \
+             toUInt64(count()) AS refreshes, toUInt64(max(written_rows)) AS most_written, \
+             toUInt64(quantile(0.5)(ProfileEvents['OSCPUVirtualTimeMicroseconds'])) AS cpu_us, \
+             toUInt64(quantile(0.5)(ProfileEvents['QueryAnalysisMicroseconds'])) AS analysis_us \
+             FROM system.query_log WHERE has(databases, '{db}') AND query_kind = 'Insert' \
+             AND type = 'QueryFinish' AND event_time_microseconds >= fromUnixTimestamp64Milli({t0}) \
+             GROUP BY view ORDER BY view"
+        ),
+    )
+    .await;
+    eprintln!("1-h idle refreshes: {idle:?}");
+    let derivation = idle
+        .iter()
+        .find(|r| r.view == "derivation")
+        .expect("the derivation's refreshes are in the query log");
+    assert!(
+        derivation.refreshes >= 5,
+        "five refreshes of the derivation: {idle:?}"
+    );
+    assert_eq!(
+        derivation.most_written, 0,
+        "an idle refresh writes nothing: {idle:?}"
+    );
+
     // 1-f: one sample lands at T−15 12:00. Within 3 refreshes T−16 to T−8
     // are covered, and only T−15 has data rows.
     let late = (t - 15) * DAY + 12 * 3_600_000;
@@ -674,13 +731,13 @@ async fn an_unsettled_day_is_not_derived() {
         ..RenderCtx::for_tests(db, RETENTION_DAYS)
     };
     run_init(&client, &ctx).await.expect("run_init");
-    exec(&client, &format!("SYSTEM STOP VIEW {db}.metric_rollup_mv")).await;
+    views(&client, db, "STOP").await;
     let samples: Vec<(u128, i64, Option<f64>)> = [t - 2, t - 1]
         .iter()
         .flat_map(|d| (1..=10).map(move |k| (1, d * DAY + 6 * 3_600_000 + k * 15_000, Some(1.0))))
         .collect();
     exec(&client, &landing_values(db, &samples, false)).await;
-    exec(&client, &format!("SYSTEM START VIEW {db}.metric_rollup_mv")).await;
+    views(&client, db, "START").await;
     for _ in 0..5 {
         refresh(&client, db).await;
     }
@@ -717,5 +774,320 @@ async fn a_database_with_no_samples_derives_nothing() {
     )
     .await;
     assert_eq!(n, 0, "a database with no samples has rollup rows");
+    drop_db(&client, db).await;
+}
+
+/// A fresh database with both views stopped, and `T`.
+async fn stopped_db(client: &ChClient, name: &str) -> (String, i64) {
+    let db = pulsus_testkit::test_db(name);
+    drop_db(client, &db).await;
+    run_init(client, &RenderCtx::for_tests(&db, RETENTION_DAYS))
+        .await
+        .expect("run_init");
+    views(client, &db, "STOP").await;
+    let t = now_ms(client).await / DAY;
+    (db, t)
+}
+
+/// Replaces this replica's plan row with a run of empty days over the
+/// whole fingerprint space: the row the planner wrote before a backfill.
+async fn plan_empty_run(client: &ChClient, db: &str, run: &[i64]) {
+    exec(client, &format!("TRUNCATE TABLE {db}.metric_rollup_plan")).await;
+    let days: Vec<String> = run.iter().map(i64::to_string).collect();
+    exec(
+        client,
+        &format!(
+            "INSERT INTO {db}.metric_rollup_plan SELECT {}, toUInt256(0), toUInt256('{FP_MAX}'), 0, \
+             CAST([{}] AS Array(Int64)), toUInt256(0), toUInt256('{FP_MAX}')",
+            run[0],
+            days.join(", ")
+        ),
+    )
+    .await;
+}
+
+/// The data rows (both tiers) of UTC day `day`, by `t_end − 1`.
+fn rows_of_day(rows: &[RollupRow], day: i64) -> usize {
+    rows.iter()
+        .filter(|r| (r.t_end - 1).div_euclid(DAY) == day)
+        .count()
+}
+
+/// **1-j, 1-j2, 1-j3.** A plan made before a backfill names a run of empty
+/// days, and one of them has since gained a sample. A refresh of the
+/// derivation alone, on that plan, covers the days that are still empty and
+/// not the one that gained the sample. `backfill` lands the sample; `run`
+/// is the plan's run; `gained` is the day the sample belongs to.
+async fn a_stale_plan_does_not_certify_a_backfilled_day(
+    name: &str,
+    run: fn(i64) -> Vec<i64>,
+    backfill: fn(&str, i64) -> String,
+    gained: fn(i64) -> i64,
+    then_derive: bool,
+) {
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let (db, t) = stopped_db(&client, name).await;
+    let db = db.as_str();
+    let ordinary: Vec<(u128, i64, Option<f64>)> = [t - 7, t - 2]
+        .iter()
+        .map(|d| (1, d * DAY + 6 * 3_600_000, Some(1.0)))
+        .collect();
+    exec(&client, &landing_values(db, &ordinary, false)).await;
+    let run = run(t);
+    plan_empty_run(&client, db, &run).await;
+    exec(&client, &backfill(db, t)).await;
+    let gained = gained(t);
+
+    exec(&client, &format!("SYSTEM START VIEW {db}.metric_rollup_mv")).await;
+    refresh_one(&client, db, "metric_rollup_mv").await;
+    let table = format!("{db}.metric_rollup");
+    let cov = coverage_rows(&client, &table).await;
+    for &d in run.iter().filter(|&&d| d != gained) {
+        assert!(
+            all_covered(&cov, &[d], 0, FP_MAX),
+            "day {d} of the stale plan's run is still empty and is covered"
+        );
+    }
+    let wrong: Vec<&CoverageRow> = cov.iter().filter(|c| c.day == gained).collect();
+    assert!(
+        wrong.is_empty(),
+        "the backfilled day {gained} was covered on a plan made before the backfill: {wrong:?}"
+    );
+    assert_eq!(
+        rows_of_day(&data_rows(&client, &table).await, gained),
+        0,
+        "the backfilled day has no data rows yet"
+    );
+
+    if then_derive {
+        // The next plan derives it as a data day.
+        exec(
+            &client,
+            &format!("SYSTEM START VIEW {db}.metric_rollup_plan_mv"),
+        )
+        .await;
+        let mut n = 0;
+        loop {
+            refresh(&client, db).await;
+            n += 1;
+            let cov = coverage_rows(&client, &table).await;
+            if all_covered(&cov, &[gained], 0, FP_MAX) {
+                break;
+            }
+            assert!(
+                n < 20,
+                "the backfilled day is not covered after 20 refreshes"
+            );
+        }
+        let got = data_rows(&client, &table).await;
+        assert_eq!(
+            [RES_5M, RES_1H].map(|r| got
+                .iter()
+                .filter(|x| x.res == r && (x.t_end - 1).div_euclid(DAY) == gained)
+                .count()),
+            [1, 1],
+            "the backfilled sample's 5m and 1h rows"
+        );
+    }
+    drop_db(&client, db).await;
+}
+
+/// **1-j.** The backfill is one float sample at `T−5` 12:00.
+#[tokio::test]
+async fn a_stale_plan_does_not_certify_a_day_backfilled_with_a_float() {
+    skip_unless_live!();
+    a_stale_plan_does_not_certify_a_backfilled_day(
+        "pulsus_it_rollup_stale_float",
+        |t| vec![t - 6, t - 5, t - 4],
+        |db, t| landing_values(db, &[(2, (t - 5) * DAY + 12 * 3_600_000, Some(3.0))], false),
+        |t| t - 5,
+        true,
+    )
+    .await;
+}
+
+/// **1-j2.** The backfill is one native-histogram sample at `T−5` 12:00.
+#[tokio::test]
+async fn a_stale_plan_does_not_certify_a_day_backfilled_with_a_histogram() {
+    skip_unless_live!();
+    a_stale_plan_does_not_certify_a_backfilled_day(
+        "pulsus_it_rollup_stale_hist",
+        |t| vec![t - 6, t - 5, t - 4],
+        |db, t| landing_values(db, &[(2, (t - 5) * DAY + 12 * 3_600_000, None)], true),
+        |t| t - 5,
+        false,
+    )
+    .await;
+}
+
+/// **1-j3.** The backfill is one float sample at exactly `T−4`'s start,
+/// which is in `T−4`'s partition and belongs to `T−5`'s last bucket.
+#[tokio::test]
+async fn a_stale_plan_does_not_certify_a_day_whose_last_bucket_was_backfilled() {
+    skip_unless_live!();
+    a_stale_plan_does_not_certify_a_backfilled_day(
+        "pulsus_it_rollup_stale_edge",
+        |t| vec![t - 6, t - 5],
+        |db, t| landing_values(db, &[(2, (t - 4) * DAY, Some(3.0))], false),
+        |t| t - 5,
+        false,
+    )
+    .await;
+}
+
+/// **1-k.** With no plan row the derivation writes nothing.
+#[tokio::test]
+async fn an_empty_plan_table_derives_nothing() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let (db, t) = stopped_db(&client, "pulsus_it_rollup_no_plan").await;
+    let db = db.as_str();
+    exec(
+        &client,
+        &landing_values(db, &[(1, (t - 7) * DAY + 6 * 3_600_000, Some(1.0))], false),
+    )
+    .await;
+    exec(&client, &format!("TRUNCATE TABLE {db}.metric_rollup_plan")).await;
+    exec(&client, &format!("SYSTEM START VIEW {db}.metric_rollup_mv")).await;
+    refresh_one(&client, db, "metric_rollup_mv").await;
+    let n = int(
+        &client,
+        &format!("SELECT toInt64(count()) AS v FROM {db}.metric_rollup"),
+    )
+    .await;
+    assert_eq!(n, 0, "a derivation with no plan row wrote rows");
+    drop_db(&client, db).await;
+}
+
+/// **1-l.** Both views start after a backfill landed under a stale plan.
+/// At no moment does the backfilled day have coverage without its data
+/// rows, and it ends with both. `planner_first` is the start order.
+async fn starting_the_views_never_shows_a_backfilled_day_as_empty(name: &str, planner_first: bool) {
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let (db, t) = stopped_db(&client, name).await;
+    let db = db.as_str();
+    let ordinary: Vec<(u128, i64, Option<f64>)> = [t - 7, t - 2]
+        .iter()
+        .map(|d| (1, d * DAY + 6 * 3_600_000, Some(1.0)))
+        .collect();
+    exec(&client, &landing_values(db, &ordinary, false)).await;
+    plan_empty_run(&client, db, &[t - 6, t - 5, t - 4]).await;
+    exec(
+        &client,
+        &landing_values(db, &[(2, (t - 5) * DAY + 12 * 3_600_000, Some(3.0))], false),
+    )
+    .await;
+    let order = if planner_first {
+        VIEWS
+    } else {
+        [VIEWS[1], VIEWS[0]]
+    };
+    for view in order {
+        exec(&client, &format!("SYSTEM START VIEW {db}.{view}")).await;
+    }
+    let table = format!("{db}.metric_rollup");
+    let mut wrong = 0;
+    for _ in 0..75 {
+        let cov = coverage_rows(&client, &table).await;
+        let covered = cov.iter().any(|c| c.day == t - 5);
+        if covered && rows_of_day(&data_rows(&client, &table).await, t - 5) == 0 {
+            wrong += 1;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    assert_eq!(
+        wrong, 0,
+        "polls at which T−5 had coverage and no data rows, of 75"
+    );
+    let mut n = 0;
+    loop {
+        refresh(&client, db).await;
+        n += 1;
+        if all_covered(&coverage_rows(&client, &table).await, &[t - 5], 0, FP_MAX) {
+            break;
+        }
+        assert!(n < 20, "T−5 is not covered after 20 refreshes");
+    }
+    assert!(
+        rows_of_day(&data_rows(&client, &table).await, t - 5) > 0,
+        "T−5 ends with its data rows"
+    );
+    drop_db(&client, db).await;
+}
+
+/// **1-l, order A**: the planner starts first.
+#[tokio::test]
+async fn starting_the_planner_first_never_shows_a_backfilled_day_as_empty() {
+    skip_unless_live!();
+    starting_the_views_never_shows_a_backfilled_day_as_empty("pulsus_it_rollup_start_a", true)
+        .await;
+}
+
+/// **1-l, order B**: the derivation starts first.
+#[tokio::test]
+async fn starting_the_derivation_first_never_shows_a_backfilled_day_as_empty() {
+    skip_unless_live!();
+    starting_the_views_never_shows_a_backfilled_day_as_empty("pulsus_it_rollup_start_b", false)
+        .await;
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct DerivedRow {
+    derived_ms: i64,
+}
+
+/// **1-m.** A row's `derived_ms` is the derivation's own clock, never the
+/// plan's: a derivation run 3 s after its plan stamps the time it read.
+#[tokio::test]
+async fn a_row_is_stamped_with_the_derivations_clock() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let (db, t) = stopped_db(&client, "pulsus_it_rollup_stamp").await;
+    let db = db.as_str();
+    exec(
+        &client,
+        &landing_values(db, &[(1, (t - 3) * DAY + 6 * 3_600_000, Some(1.0))], false),
+    )
+    .await;
+    // One planning refresh, which plans a data day, then the planner stops.
+    exec(
+        &client,
+        &format!("SYSTEM START VIEW {db}.metric_rollup_plan_mv"),
+    )
+    .await;
+    refresh_one(&client, db, "metric_rollup_plan_mv").await;
+    exec(
+        &client,
+        &format!("SYSTEM STOP VIEW {db}.metric_rollup_plan_mv"),
+    )
+    .await;
+    let day_rows = int(
+        &client,
+        &format!("SELECT toInt64(any(day_rows)) AS v FROM {db}.metric_rollup_plan"),
+    )
+    .await;
+    assert!(day_rows > 0, "the plan names a data day");
+
+    let t0 = now_ms(&client).await;
+    while now_ms(&client).await < t0 + 3000 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let t1 = now_ms(&client).await;
+    exec(&client, &format!("SYSTEM START VIEW {db}.metric_rollup_mv")).await;
+    refresh_one(&client, db, "metric_rollup_mv").await;
+    let t2 = now_ms(&client).await;
+    let stamps = rows::<DerivedRow>(
+        &client,
+        &format!("SELECT derived_ms FROM {db}.metric_rollup"),
+    )
+    .await;
+    assert!(!stamps.is_empty(), "the derivation wrote rows");
+    for s in &stamps {
+        assert!(
+            t1 <= s.derived_ms && s.derived_ms <= t2,
+            "derived_ms {} is outside the derivation's run [{t1}, {t2}] (plan at {t0})",
+            s.derived_ms
+        );
+    }
     drop_db(&client, db).await;
 }
