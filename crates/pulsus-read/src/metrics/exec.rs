@@ -545,7 +545,18 @@ pub struct MetricsEngine {
     /// lowered by [`MetricsEngine::with_exemplar_answer_bytes`] so a suite
     /// can pass it at a corpus it can afford.
     exemplar_answer_bytes: usize,
+    /// Issue #18 part B: the process-wide rollup level list. `None` reads
+    /// every selector raw.
+    rollup_levels: Option<std::sync::Arc<super::rollup::LevelSlot>>,
+    /// TEST SEAM (issue #18 part B): replaces a level fetch's answer, by
+    /// its statement text. `None` in production.
+    rollup_answer_hook: Option<RollupAnswerHook>,
 }
+
+/// TEST SEAM (issue #18 part B): a level fetch's answer by its statement
+/// text, or `None` to send the statement.
+pub type RollupAnswerHook =
+    std::sync::Arc<dyn Fn(&str) -> Option<Vec<super::rollup::LevelRow>> + Send + Sync>;
 
 impl MetricsEngine {
     pub fn new(
@@ -566,7 +577,24 @@ impl MetricsEngine {
             pushed_series_steps_cap: super::grouped::PUSHED_SERIES_STEPS_PER_STATEMENT,
             lookback_ms: DEFAULT_LOOKBACK_MS,
             exemplar_answer_bytes: super::exemplars::EXEMPLAR_ANSWER_BYTES,
+            rollup_levels: None,
+            rollup_answer_hook: None,
         }
+    }
+
+    /// Issue #18 part B: the process-wide rollup level list the router
+    /// reads.
+    pub fn with_rollup_levels(mut self, slot: std::sync::Arc<super::rollup::LevelSlot>) -> Self {
+        self.rollup_levels = Some(slot);
+        self
+    }
+
+    /// TEST SEAM (issue #18 part B) — see [`RollupAnswerHook`]. Never
+    /// called by `pulsus-server`.
+    #[doc(hidden)]
+    pub fn with_rollup_answer_hook(mut self, hook: RollupAnswerHook) -> Self {
+        self.rollup_answer_hook = Some(hook);
+        self
     }
 
     /// Issue #614: every statement this engine sends carries

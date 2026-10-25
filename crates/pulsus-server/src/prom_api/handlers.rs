@@ -808,6 +808,7 @@ mod tests {
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
+            rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
             graph_target: pulsus_read::GraphTargetCache::default(),
             eval_gate: Arc::new(pulsus_read::EvalGate::new(
                 pulsus_config::Config::default()
@@ -1719,6 +1720,41 @@ mod tests {
         assert_eq!(json["data"]["storageRetention"], "7d");
         let start_time = json["data"]["startTime"].as_str().unwrap();
         assert!(chrono::DateTime::parse_from_rfc3339(start_time).is_ok());
+        assert_eq!(json["data"]["rollupLevels"], serde_json::json!([]));
+    }
+
+    /// **B6 (issue #18 part B): `runtimeinfo` lists the rollup levels the
+    /// slot holds, smallest first, as durations**; an empty slot is `[]`.
+    #[tokio::test]
+    async fn b6_runtimeinfo_lists_the_rollup_levels() {
+        use pulsus_read::metrics::rollup::{Level, Levels};
+        let levels = |secs: &[i64]| Levels {
+            levels: secs
+                .iter()
+                .map(|s| Level {
+                    res_ms: s * 1000,
+                    table: format!("metric_samples_{s}s"),
+                })
+                .collect(),
+            shards: 1,
+        };
+        for (secs, want) in [
+            (
+                &[60, 720, 7200, 86400][..],
+                serde_json::json!(["1m", "12m", "2h", "1d"]),
+            ),
+            (&[720, 86400][..], serde_json::json!(["12m", "1d"])),
+            (&[][..], serde_json::json!([])),
+        ] {
+            let state = test_state();
+            if !secs.is_empty() {
+                state.rollup_levels.set(levels(secs));
+            }
+            let res = status_runtimeinfo(State(state)).await;
+            let (status, json) = status_and_body(res).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(json["data"]["rollupLevels"], want, "{secs:?}");
+        }
     }
 
     #[tokio::test]

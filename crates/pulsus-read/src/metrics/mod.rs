@@ -91,6 +91,7 @@ pub mod labels;
 pub mod matcher;
 mod re2_authority;
 pub mod refresh;
+pub mod rollup;
 pub mod rows;
 pub mod sample_rows;
 pub mod sample_sql;

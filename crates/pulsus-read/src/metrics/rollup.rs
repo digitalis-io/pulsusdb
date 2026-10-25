@@ -1,0 +1,734 @@
+//! Issue #18 part B: reading the rollup levels.
+//!
+//! A selector whose step, start, offset and range fit a rollup level reads
+//! that level's rows as pseudo-samples, then the finer levels and raw for
+//! what the level does not cover, and the engine evaluates them unchanged
+//! (design r13 sections 2 and 5).
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+
+use pulsus_clickhouse::{ChClient, Row};
+use pulsus_model::{Fingerprint, FpLiteral, Tenant};
+use pulsus_promql::{PlanParams, RollupUse, Sample, SelectorSpec};
+use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
+
+use super::labels::LabelledResolution;
+
+/// One rollup level: its bucket width and the table a read names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Level {
+    pub res_ms: i64,
+    pub table: String,
+}
+
+/// The levels the database holds, smallest first, and the shard count a
+/// level's coverage is intersected over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Levels {
+    pub levels: Vec<Level>,
+    pub shards: u32,
+}
+
+/// The process-wide level list, refreshed every 60 s. Empty until the
+/// first successful discovery; nothing routes before it.
+#[derive(Debug, Default)]
+pub struct LevelSlot {
+    current: RwLock<Option<Arc<Levels>>>,
+    failures: AtomicU64,
+}
+
+impl LevelSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self) -> Option<Arc<Levels>> {
+        None
+    }
+
+    pub fn set(&self, _levels: Levels) {}
+
+    /// Discoveries that failed since the process started.
+    pub fn failures(&self) -> u64 {
+        self.failures.load(Ordering::Relaxed)
+    }
+}
+
+/// The level-discovery statement.
+pub fn discovery_sql(_db: &str) -> String {
+    String::new()
+}
+
+/// The shard count of a cluster.
+pub fn shards_sql(_cluster: &str) -> String {
+    String::new()
+}
+
+/// One discovery: reads the levels and, clustered, the shard count, and
+/// sets `slot`. On failure the slot keeps its last good list.
+pub async fn refresh_levels(
+    _slot: &LevelSlot,
+    _client: &ChClient,
+    _db: &str,
+    _dist_suffix: &str,
+    _cluster: Option<&str>,
+) -> Result<(), pulsus_clickhouse::ChError> {
+    Ok(())
+}
+
+/// The discovery loop: every 60 s, the first at once.
+pub fn spawn_level_loop(
+    _slot: Arc<LevelSlot>,
+    _client: ChClient,
+    _db: String,
+    _dist_suffix: String,
+    _cluster: Option<String>,
+) -> JoinHandle<()> {
+    tokio::spawn(async {})
+}
+
+/// The level a routed selector reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Route {
+    /// The chosen level's index in [`Levels::levels`].
+    pub level: usize,
+    pub res_ms: i64,
+    pub table: String,
+    pub use_: RollupUse,
+}
+
+/// Plan section 3: the largest level the selector's time and range fit,
+/// or `None`.
+pub fn route(_sel: &SelectorSpec, _p: &PlanParams, _levels: &Levels) -> Option<Route> {
+    None
+}
+
+/// Plan Q1 and Q5: whether a selector may read a level at all.
+pub fn eligible(_sel: &SelectorSpec, _resolution: &LabelledResolution) -> bool {
+    false
+}
+
+/// Plan section 2: one level fetch over `(lo, hi]` for one fingerprint
+/// chunk, its data rows and the run rows that overlap the interval.
+pub fn level_fetch(
+    _tenant: &Tenant,
+    _table: &str,
+    _fps: &[FpLiteral],
+    _lo: i64,
+    _hi: i64,
+    _clustered: bool,
+) -> String {
+    String::new()
+}
+
+/// One row of a level fetch: a data row (`kind = 0`) or a run row
+/// (`kind = 1`).
+#[derive(Debug, Clone, Copy, PartialEq, Row, Serialize, Deserialize)]
+pub struct LevelRow {
+    pub shard: u32,
+    pub kind: u8,
+    pub fingerprint: Fingerprint,
+    pub t_end: i64,
+    pub t_last: i64,
+    pub last: f64,
+    pub min: f64,
+    pub max: f64,
+    pub sum: f64,
+    pub count: u32,
+    pub inc: f64,
+}
+
+/// One run row: the shard that answered it and its interval
+/// `(t_last, t_end]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunRow {
+    pub shard: u32,
+    pub t_last: i64,
+    pub t_end: i64,
+}
+
+/// Sorted, disjoint, left-open right-closed intervals `(a, b]`.
+pub type Intervals = Vec<(i64, i64)>;
+
+/// Plan Q7: per shard, the union of its run rows' intervals; the
+/// intersection over shards `1..=shards`. A shard with no run row covers
+/// nothing.
+pub fn coverage(_runs: &[RunRow], _shards: u32) -> Intervals {
+    Vec::new()
+}
+
+/// `a` without `b`.
+pub fn subtract(_a: &[(i64, i64)], _b: &[(i64, i64)]) -> Intervals {
+    Vec::new()
+}
+
+/// `a` and `b` both.
+pub fn intersect(_a: &[(i64, i64)], _b: &[(i64, i64)]) -> Intervals {
+    Vec::new()
+}
+
+/// The smallest interval holding every interval of `a`.
+pub fn hull(_a: &[(i64, i64)]) -> Option<(i64, i64)> {
+    None
+}
+
+/// One element of a series' merged sequence (plan section 4 step 4): a
+/// kept level row, tagged with its level's width, or a kept raw sample.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Piece {
+    Level { res_ms: i64, row: LevelRow },
+    Raw { t_ms: i64, v: f64 },
+}
+
+impl Piece {
+    /// Where the piece sits in time: a level row at its `t_end`.
+    pub fn at(&self) -> i64 {
+        match self {
+            Piece::Level { row, .. } => row.t_end,
+            Piece::Raw { t_ms, .. } => *t_ms,
+        }
+    }
+}
+
+/// Plan section 5: the pseudo-samples of one series' merged sequence.
+pub fn pseudo_samples(_use: RollupUse, _seq: &[Piece]) -> Vec<Sample> {
+    Vec::new()
+}
+
+/// `86400000` → `1d`, `7200000` → `2h`, `720000` → `12m`, `60000` → `1m`,
+/// `5000` → `5s`: the largest whole unit.
+pub fn duration_text(_ms: i64) -> String {
+    String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use pulsus_promql::{DEFAULT_LOOKBACK_MS, parse, plan};
+
+    use super::*;
+    use crate::metrics::labels::FallbackReason;
+
+    /// A UTC midnight: on every level's grid.
+    const BASE: i64 = 1_788_825_600_000;
+    const MIN: i64 = 60_000;
+    const HOUR: i64 = 3_600_000;
+
+    fn levels(secs: &[i64]) -> Levels {
+        Levels {
+            levels: secs
+                .iter()
+                .map(|s| Level {
+                    res_ms: s * 1000,
+                    table: format!("metric_samples_{s}s"),
+                })
+                .collect(),
+            shards: 1,
+        }
+    }
+
+    fn all() -> Levels {
+        levels(&[60, 720, 7200, 86400])
+    }
+
+    fn params(start: i64, step: i64, experimental: bool) -> PlanParams {
+        PlanParams {
+            start_ms: start,
+            end_ms: start + 86_400_000,
+            step_ms: step,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
+            experimental_functions: experimental,
+        }
+    }
+
+    fn selectors(query: &str, p: &PlanParams) -> Vec<SelectorSpec> {
+        plan(&parse(query).unwrap(), p.clone()).unwrap().selectors
+    }
+
+    /// The level each selector of `query` reads, in milliseconds.
+    fn chosen(query: &str, p: &PlanParams, lv: &Levels) -> Vec<Option<i64>> {
+        selectors(query, p)
+            .iter()
+            .map(|s| route(s, p, lv).map(|r| r.res_ms))
+            .collect()
+    }
+
+    /// The level the query's one selector reads.
+    fn one(query: &str, start: i64, step: i64, lv: &Levels) -> Option<i64> {
+        let got = chosen(query, &params(start, step, true), lv);
+        assert_eq!(got.len(), 1, "{query}: one selector");
+        got[0]
+    }
+
+    /// **B1 (issue #18 part B): the router chooses the largest level the
+    /// step, start, offset and range fit, as plan section 3 and Q5 give.**
+    #[test]
+    fn b1_the_router_chooses_the_largest_level_that_fits() {
+        let lv = all();
+        let two = levels(&[720, 86400]);
+        let none = levels(&[]);
+
+        // The plan's named examples.
+        assert_eq!(one("rate(m[1h])", BASE, 12 * MIN, &lv), Some(720_000));
+        assert_eq!(one("rate(m[30m])", BASE, 12 * MIN, &lv), Some(60_000));
+        assert_eq!(one("rate(m[30m])", BASE, 12 * MIN, &two), None);
+        assert_eq!(
+            one("max_over_time(m[1d])", BASE, 2 * HOUR, &lv),
+            Some(7_200_000)
+        );
+        assert_eq!(one("max_over_time(m[5m])", BASE, 90_000, &lv), None);
+        assert_eq!(one("irate(m[1h])", BASE, 12 * MIN, &lv), None);
+        assert_eq!(one("rate(m[1h])", BASE, 12 * MIN, &none), None);
+
+        // The counter functions: range on the level and at least five
+        // times it; one millisecond off the range or the step reads raw.
+        for f in ["rate", "increase"] {
+            assert_eq!(
+                one(&format!("{f}(m[1h])"), BASE, 12 * MIN, &lv),
+                Some(720_000)
+            );
+            assert_eq!(
+                one(&format!("{f}(m[48m])"), BASE, 12 * MIN, &lv),
+                Some(60_000),
+                "{f}: 4 x res"
+            );
+            assert_eq!(
+                one(&format!("{f}(m[3600001ms])"), BASE, 12 * MIN, &lv),
+                None,
+                "{f}: range off"
+            );
+            assert_eq!(
+                one(&format!("{f}(m[1h])"), BASE, 12 * MIN + 1, &lv),
+                None,
+                "{f}: step off"
+            );
+            assert_eq!(
+                one(&format!("{f}(m[1h])"), BASE + 1, 12 * MIN, &lv),
+                None,
+                "{f}: start off"
+            );
+            assert_eq!(
+                one(&format!("{f}(m[50h])"), BASE, 2 * HOUR, &lv),
+                Some(7_200_000)
+            );
+            assert_eq!(
+                one(&format!("{f}(m[5d])"), BASE, 24 * HOUR, &lv),
+                Some(86_400_000)
+            );
+        }
+
+        // Every other served function: range on the level and at least
+        // once it.
+        for f in [
+            "max_over_time",
+            "min_over_time",
+            "sum_over_time",
+            "avg_over_time",
+            "last_over_time",
+            "present_over_time",
+            "absent_over_time",
+        ] {
+            assert_eq!(
+                one(&format!("{f}(m[12m])"), BASE, 12 * MIN, &lv),
+                Some(720_000),
+                "{f}"
+            );
+            assert_eq!(
+                one(&format!("{f}(m[719999ms])"), BASE, 12 * MIN, &lv),
+                None,
+                "{f}: res - 1"
+            );
+            assert_eq!(
+                one(&format!("{f}(m[720001ms])"), BASE, 12 * MIN, &lv),
+                None,
+                "{f}: range off"
+            );
+            assert_eq!(
+                one(&format!("{f}(m[12m])"), BASE, 12 * MIN + 1, &lv),
+                None,
+                "{f}: step off"
+            );
+            assert_eq!(
+                one(&format!("{f}(m[1d])"), BASE, 24 * HOUR, &lv),
+                Some(86_400_000),
+                "{f}"
+            );
+        }
+
+        // An instant selector and `timestamp`: the step and start only.
+        for q in ["m", "timestamp(m)"] {
+            assert_eq!(one(q, BASE, 12 * MIN, &lv), Some(720_000), "{q}");
+            assert_eq!(one(q, BASE, 2 * HOUR, &lv), Some(7_200_000), "{q}");
+            assert_eq!(one(q, BASE, MIN, &lv), Some(60_000), "{q}");
+            assert_eq!(one(q, BASE, 12 * MIN + 1, &lv), None, "{q}: step off");
+            assert_eq!(one(q, BASE + 1, 12 * MIN, &lv), None, "{q}: start off");
+        }
+        // An instant query needs only the start.
+        let instant = PlanParams {
+            start_ms: BASE + 12 * MIN,
+            end_ms: BASE + 12 * MIN,
+            step_ms: 0,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
+            experimental_functions: false,
+        };
+        assert_eq!(
+            chosen("max_over_time(m[12m])", &instant, &lv),
+            vec![Some(720_000)]
+        );
+
+        // Every function kept on raw.
+        for q in [
+            "irate(m[1h])",
+            "delta(m[1h])",
+            "idelta(m[1h])",
+            "resets(m[1h])",
+            "changes(m[1h])",
+            "count_over_time(m[1h])",
+            "quantile_over_time(0.5, m[1h])",
+            "stddev_over_time(m[1h])",
+            "stdvar_over_time(m[1h])",
+            "mad_over_time(m[1h])",
+            "first_over_time(m[1h])",
+            "ts_of_min_over_time(m[1h])",
+            "ts_of_max_over_time(m[1h])",
+            "ts_of_first_over_time(m[1h])",
+            "ts_of_last_over_time(m[1h])",
+            "deriv(m[1h])",
+            "predict_linear(m[1h], 60)",
+            "double_exponential_smoothing(m[1h], 0.5, 0.5)",
+        ] {
+            assert_eq!(one(q, BASE, 12 * MIN, &lv), None, "{q}");
+        }
+
+        // `@ t`: only `t - offset` must be on the level's grid, whatever
+        // the request's start and step.
+        let on = (BASE + 12 * MIN) / 1000;
+        let off = format!("{}.001", (BASE + 12 * MIN) / 1000);
+        assert_eq!(
+            one(
+                &format!("max_over_time(m[12m] @ {on})"),
+                BASE + 1,
+                12 * MIN,
+                &lv
+            ),
+            Some(720_000),
+            "@ on the grid, start off it"
+        );
+        assert_eq!(
+            one(&format!("max_over_time(m[12m] @ {on})"), BASE, 90_000, &lv),
+            Some(720_000),
+            "@ on the grid, step off it"
+        );
+        assert_eq!(
+            one(
+                &format!("max_over_time(m[12m] @ {off})"),
+                BASE,
+                12 * MIN,
+                &lv
+            ),
+            None,
+            "@ off the grid, start on it"
+        );
+        assert_eq!(
+            one(
+                &format!("max_over_time(m[12m] @ {on} offset 1m)"),
+                BASE,
+                12 * MIN,
+                &lv
+            ),
+            Some(60_000),
+            "@ minus offset off the 720 s grid"
+        );
+
+        // `offset` moves the start off the grid.
+        assert_eq!(
+            one("max_over_time(m[12m] offset 1m)", BASE, 12 * MIN, &lv),
+            Some(60_000)
+        );
+        assert_eq!(
+            one("max_over_time(m[12m] offset 12m)", BASE, 12 * MIN, &lv),
+            Some(720_000)
+        );
+        assert_eq!(
+            one("max_over_time(m[12m] offset 1ms)", BASE, 12 * MIN, &lv),
+            None
+        );
+
+        // Q5's exclusions.
+        let p = params(BASE, 12 * MIN, true);
+        assert_eq!(
+            chosen("max_over_time(max_over_time(m[12m])[1h:12m])", &p, &lv),
+            vec![None],
+            "a selector in a subquery"
+        );
+        assert_eq!(
+            chosen("rate(m[1h] anchored)", &p, &lv),
+            vec![None],
+            "anchored"
+        );
+        assert_eq!(
+            chosen("rate(m[1h] smoothed)", &p, &lv),
+            vec![None],
+            "smoothed"
+        );
+        let info: Vec<(bool, Option<i64>)> = selectors("info(m)", &p)
+            .iter()
+            .map(|s| (s.info_family, route(s, &p, &lv).map(|r| r.res_ms)))
+            .collect();
+        assert!(
+            info.contains(&(true, None)) && info.contains(&(false, Some(720_000))),
+            "info(): the info-family selector reads raw, its base the level: {info:?}"
+        );
+
+        // The route names the level's table and the consumer's column.
+        let sel = &selectors("rate(m[1h])", &p)[0];
+        assert_eq!(
+            route(sel, &p, &lv),
+            Some(Route {
+                level: 1,
+                res_ms: 720_000,
+                table: "metric_samples_720s".to_string(),
+                use_: RollupUse::Counter,
+            })
+        );
+    }
+
+    fn row(t_end: i64, t_last: i64, last: f64, inc: f64, count: u32) -> LevelRow {
+        LevelRow {
+            shard: 1,
+            kind: 0,
+            fingerprint: Fingerprint::from_raw(7),
+            t_end,
+            t_last,
+            last,
+            min: last,
+            max: last,
+            sum: last,
+            count,
+            inc,
+        }
+    }
+
+    fn points(s: &[Sample]) -> Vec<(i64, f64)> {
+        s.iter().map(|x| (x.t_ms, x.v)).collect()
+    }
+
+    /// **B1c (issue #18 part B): the pseudo-samples of plan section 5.**
+    /// A counter that never resets, crossing the reset and continuing into
+    /// raw; the start point only from 720 s; `count = 0` rows give no
+    /// aggregate point.
+    #[test]
+    fn b1c_the_pseudo_samples() {
+        let r = 720_000;
+        let (e1, e2) = (BASE + r, BASE + 2 * r);
+        let rows = [
+            row(e1, e1 - 5_000, 900.0, 900.0, 48),
+            row(e2, e2 - 5_000, 100.0, 200.0, 48),
+        ];
+        let seq = |res: i64| {
+            vec![
+                Piece::Level {
+                    res_ms: res,
+                    row: rows[0],
+                },
+                Piece::Level {
+                    res_ms: res,
+                    row: rows[1],
+                },
+                Piece::Raw {
+                    t_ms: e2 + 15_000,
+                    v: 130.0,
+                },
+                Piece::Raw {
+                    t_ms: e2 + 30_000,
+                    v: 20.0,
+                },
+            ]
+        };
+        assert_eq!(
+            points(&pseudo_samples(RollupUse::Counter, &seq(r))),
+            vec![
+                (e1 - r + 1, 0.0),
+                (e1 - 5_000, 900.0),
+                (e2 - r + 1, 900.0),
+                (e2 - 5_000, 1100.0),
+                (e2 + 15_000, 1130.0),
+                (e2 + 30_000, 1150.0),
+            ]
+        );
+        assert_eq!(
+            points(&pseudo_samples(RollupUse::Counter, &seq(60_000))),
+            vec![
+                (e1 - 5_000, 900.0),
+                (e2 - 5_000, 1100.0),
+                (e2 + 15_000, 1130.0),
+                (e2 + 30_000, 1150.0),
+            ],
+            "no start point below 720 s"
+        );
+
+        // The aggregate columns at `t_end`, raw as read; `last` at `t_last`.
+        let gauge = [
+            row(e1, e1 - 5_000, 4.0, 0.0, 2),
+            row(e2, e2 - 9_000, 6.0, 0.0, 0),
+        ];
+        let gseq = vec![
+            Piece::Level {
+                res_ms: r,
+                row: gauge[0],
+            },
+            Piece::Level {
+                res_ms: r,
+                row: gauge[1],
+            },
+            Piece::Raw {
+                t_ms: e2 + 1_000,
+                v: 7.5,
+            },
+        ];
+        assert_eq!(
+            points(&pseudo_samples(RollupUse::Max, &gseq)),
+            vec![(e1, 4.0), (e2 + 1_000, 7.5)],
+            "a row with count = 0 gives no point"
+        );
+        assert_eq!(
+            points(&pseudo_samples(RollupUse::Avg, &gseq)),
+            vec![(e1, 2.0), (e2 + 1_000, 7.5)],
+            "sum / count"
+        );
+        assert_eq!(
+            points(&pseudo_samples(RollupUse::Last, &gseq)),
+            vec![(e1 - 5_000, 4.0), (e2 - 9_000, 6.0), (e2 + 1_000, 7.5)]
+        );
+    }
+
+    fn run(shard: u32, t_last: i64, t_end: i64) -> RunRow {
+        RunRow {
+            shard,
+            t_last,
+            t_end,
+        }
+    }
+
+    /// **B1d (issue #18 part B): coverage is each shard's union of run
+    /// intervals, intersected over every shard of the cluster.**
+    #[test]
+    fn b1d_coverage_intersects_every_shard() {
+        let runs = [
+            run(1, 0, 100),
+            run(1, 100, 200),
+            run(2, 0, 50),
+            run(2, 80, 200),
+        ];
+        assert_eq!(
+            coverage(&runs, 2),
+            vec![(0, 50), (80, 200)],
+            "the gap of shard 2"
+        );
+        assert_eq!(
+            coverage(&runs[..2], 1),
+            vec![(0, 200)],
+            "adjacent runs merge"
+        );
+        assert_eq!(
+            coverage(&runs, 3),
+            Vec::<(i64, i64)>::new(),
+            "a shard with no run row covers nothing"
+        );
+        assert_eq!(coverage(&[], 1), Vec::<(i64, i64)>::new());
+        assert_eq!(subtract(&[(0, 200)], &[(0, 50), (80, 200)]), vec![(50, 80)]);
+        assert_eq!(
+            subtract(&[(10, 300)], &[(0, 50), (80, 200)]),
+            vec![(50, 80), (200, 300)]
+        );
+        assert_eq!(
+            intersect(&[(10, 300)], &[(0, 50), (80, 200)]),
+            vec![(10, 50), (80, 200)]
+        );
+        assert_eq!(hull(&[(10, 20), (30, 40)]), Some((10, 40)));
+        assert_eq!(hull(&[]), None);
+    }
+
+    fn no_tenant() -> Tenant {
+        Tenant::from_header(None, false).expect("the empty tenant")
+    }
+
+    /// **B1e (issue #18 part B): the level fetch is plan section 2's
+    /// statement**, `toUInt32(1)` on one node and `_shard_num` clustered.
+    #[test]
+    fn b1e_the_level_fetch_statement() {
+        let fps = [
+            Fingerprint::from_raw(101).sql_literal(),
+            Fingerprint::from_raw(205).sql_literal(),
+        ];
+        let body = "kind, fingerprint, t_end, t_last, last, min, max, sum, count, inc\n";
+        let rest = "WHERE (kind = 0 AND org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205')) AND t_end > 1000 AND t_end <= 9000)\n   OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > 1000 AND t_last < 9000)\nORDER BY kind, fingerprint, t_end";
+        assert_eq!(
+            level_fetch(&no_tenant(), "metric_samples_720s", &fps, 1000, 9000, false),
+            format!("SELECT toUInt32(1) AS shard, {body}FROM metric_samples_720s\n{rest}")
+        );
+        assert_eq!(
+            level_fetch(
+                &no_tenant(),
+                "metric_samples_720s_dist",
+                &fps,
+                1000,
+                9000,
+                true
+            ),
+            format!("SELECT _shard_num AS shard, {body}FROM metric_samples_720s_dist\n{rest}")
+        );
+    }
+
+    /// **B1f, unit half (issue #18 part B): `eligible` refuses every class
+    /// plan Q1 keeps on raw**, each otherwise eligible; the plain selector
+    /// is the control.
+    #[test]
+    fn b1f_eligible_refuses_the_unrouted_classes() {
+        let p = params(BASE, 12 * MIN, false);
+        let series = LabelledResolution::Series(Vec::new());
+        let fallback = LabelledResolution::SqlFallback {
+            sql: "SELECT 1".to_string(),
+            reason: FallbackReason::ColdCache,
+        };
+        let sel = |q: &str| selectors(q, &p).remove(0);
+        assert!(eligible(&sel("rate(m[1h])"), &series), "the control");
+        assert!(
+            !eligible(&sel(r#"rate({job="x"}[1h])"#), &series),
+            "no metric name"
+        );
+        // The parser refuses a bare name beside a `__name__` matcher, so
+        // the name is the first `__name__="m"` and the matcher beside it
+        // is the second.
+        for q in [
+            r#"rate({__name__="m",__name__=~"m.*"}[1h])"#,
+            r#"rate({__name__="m",__name__!~"x"}[1h])"#,
+            r#"rate({__name__="m",__name__!="x"}[1h])"#,
+            r#"rate({__name__="m",__name__="m"}[1h])"#,
+        ] {
+            let s = sel(q);
+            assert_eq!(s.metric_name.as_deref(), Some("m"), "{q}: a concrete name");
+            assert_eq!(s.name_matchers.len(), 1, "{q}: one matcher beside it");
+            assert!(!eligible(&s, &series), "{q}");
+        }
+        assert!(!eligible(&sel("rate(m[1h])"), &fallback), "SqlFallback");
+        let stats = selectors("histogram_count(rate(h[5m]))", &p).remove(0);
+        assert!(
+            stats.histogram_stats,
+            "the case is a histogram-stats selector"
+        );
+        assert!(!eligible(&stats, &series), "histogram_stats");
+    }
+
+    /// The `runtimeinfo` form of a level.
+    #[test]
+    fn duration_text_is_the_largest_whole_unit() {
+        assert_eq!(duration_text(86_400_000), "1d");
+        assert_eq!(duration_text(7_200_000), "2h");
+        assert_eq!(duration_text(720_000), "12m");
+        assert_eq!(duration_text(60_000), "1m");
+        assert_eq!(duration_text(5_000), "5s");
+        assert_eq!(duration_text(300_000), "5m");
+    }
+}

@@ -1709,6 +1709,27 @@ mod tests {
         assert_eq!(json["data"]["explain"]["stages"][0]["name"], "sample_fetch");
     }
 
+    /// **B9 (issue #18 part B): `exactness` follows what served.** A
+    /// trace with `rollup` false is `"raw-exact"`, one with `rollup` true
+    /// `"rollup"`.
+    #[test]
+    fn b9_exactness_is_rollup_when_a_level_served() {
+        let mut explain = PlanExplain::new("matrix");
+        explain.push("sample_fetch", "SELECT 1", None);
+        assert!(!explain.rollup, "a new trace is raw-exact");
+        assert!(
+            explain_json(&explain).contains(r#""exactness":"raw-exact""#),
+            "{}",
+            explain_json(&explain)
+        );
+        explain.rollup = true;
+        assert!(
+            explain_json(&explain).contains(r#""exactness":"rollup""#),
+            "{}",
+            explain_json(&explain)
+        );
+    }
+
     /// Issue #548 criterion 5, half one: **the explain surface gains
     /// `plans` and loses nothing.**
     ///

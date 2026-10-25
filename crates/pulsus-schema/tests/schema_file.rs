@@ -2592,6 +2592,27 @@ fn the_rollup_levels_render_from_one_template() {
                             "{what}: {r}s's view lacks {needle:?}: {view}"
                         );
                     }
+                    // Issue #18 part B: a series with no sample in the
+                    // lookback takes its predecessor from the level's own
+                    // newest row before `lo`, up to a day back, and no
+                    // predecessor more than a day before a sample is used.
+                    let own = format!("FROM pulsus.metric_samples_{r}s\n");
+                    for needle in [
+                        "lagInFrame(toNullable(unix_milli)) OVER (PARTITION BY org_id, fingerprint ORDER BY unix_milli, bits ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS t0",
+                        "if(isNull(q0), if(unix_milli - tp0 <= 86400000, p0, NULL), if(unix_milli - t0 <= 86400000, q0, NULL)) AS q",
+                        "toNullable(argMaxIf(last, t_last, NOT isNaN(last))) AS p0,",
+                        "toNullable(maxIf(t_last, NOT isNaN(last))) AS tp0",
+                        own.as_str(),
+                        "WHERE kind = 0 AND t_end <= lo AND t_end > lo - 86400000",
+                        "AND (org_id, fingerprint) IN (SELECT org_id, fingerprint",
+                        "GROUP BY org_id, fingerprint HAVING min(unix_milli) > lo)",
+                        "USING (org_id, fingerprint)",
+                    ] {
+                        assert!(
+                            view.contains(needle),
+                            "{what}: {r}s's view lacks {needle:?}: {view}"
+                        );
+                    }
                 } else {
                     let source = levels[i - 1];
                     for needle in [

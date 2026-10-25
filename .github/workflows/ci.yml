@@ -1546,6 +1546,16 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test live_metrics_window_algebra
 
+      # Issue #18 part B: each rollup-served function against the raw route
+      # within design r13 section 2's distances; the finer levels and raw
+      # after a level; holes; the counter across the raw piece. Reuses this
+      # job's container.
+      - name: Live metrics rollup tests
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test live_metrics_rollup
+
       # Issue #18 part A: each rollup level's rows equal their aggregates
       # from raw or the level below; run rows, holes, the projection read
       # and expiry. Reuses this job's container.
@@ -2594,6 +2604,14 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-schema --test live_cluster
+
+      # Issue #18 part B: a rollup level's run row is read with its data
+      # from one replica's answer, so a replica that lacks a new part
+      # cannot cover it.
+      - name: Live metrics rollup cluster tests
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test live_metrics_rollup_cluster
 
       # Issue #136: the metrics SqlFallback fetch's double-distributed
       # `fingerprint IN (SELECT … FROM metric_series_dist …)` shape, denied

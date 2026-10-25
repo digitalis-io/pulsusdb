@@ -49,6 +49,9 @@ pub struct PlanExplain {
     /// the header — so every other response is byte-identical to the one
     /// it produced before this field existed.
     pub plans: Vec<PlanShape>,
+    /// Issue #18 part B: a rollup level served part of at least one
+    /// selector — `exactness` is `"rollup"` rather than `"raw-exact"`.
+    pub rollup: bool,
 }
 
 impl PlanExplain {
@@ -59,6 +62,7 @@ impl PlanExplain {
             routing: None,
             plan: None,
             plans: Vec::new(),
+            rollup: false,
         }
     }
 

@@ -1076,3 +1076,256 @@ async fn runs_split_at_midnight_and_expire_by_day() {
     }
     drop_db(&client, db).await;
 }
+
+static DB_SPARSE: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_levels_sparse");
+
+/// The first-level view's statement as an insert over `(lo, hi]`: its
+/// `plan` scalar replaced by the literal interval (issue #18 part B's
+/// method for building a level in a test).
+fn first_level_insert(ctx: &RenderCtx, lo: i64, hi: i64) -> String {
+    let first = ctx.rollup_levels[0];
+    let head = format!(
+        "CREATE MATERIALIZED VIEW {}.metric_samples_{first}s_mv",
+        ctx.db
+    );
+    let view = pulsus_schema::rendered_statements(ctx)
+        .into_iter()
+        .find(|s| s.starts_with(&head))
+        .expect("the first level's view");
+    let body = &view[view.find("AS WITH ").expect("AS WITH") + 3..];
+    let start = body
+        .find("(SELECT (lo, hi, lo < hi) FROM (")
+        .expect("the plan scalar");
+    let end = body[start..].find(") AS plan,").expect("the plan alias") + start;
+    format!(
+        "INSERT INTO {}.metric_samples_{first}s\n{}(toInt64({lo}), toInt64({hi}), true{}",
+        ctx.db,
+        &body[..start],
+        &body[end..]
+    )
+}
+
+/// One stored sample of a tenant: tenant, series, time, value bits.
+type TenantSample = (String, u128, i64, u64);
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct TenantLanded {
+    org_id: String,
+    fingerprint: u128,
+    unix_milli: i64,
+    bits: u64,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct TenantInc {
+    org_id: String,
+    fingerprint: u128,
+    t_end: i64,
+    inc: f64,
+}
+
+/// Per tenant, series and 60 s bucket of `(lo, hi]`, the increase computed
+/// from every landed sample: each step `v − p`, or `v` on a drop, `p` the
+/// series' previous sample when it is no more than 86,400,000 ms before
+/// (no term otherwise).
+fn expected_inc(samples: &[TenantSample], lo: i64, hi: i64) -> BTreeMap<(String, u128, i64), f64> {
+    let distinct: BTreeSet<TenantSample> = samples.iter().cloned().collect();
+    let mut by_series: BTreeMap<(String, u128), Vec<(i64, u64)>> = BTreeMap::new();
+    for (org, fp, t, bits) in distinct {
+        by_series.entry((org, fp)).or_default().push((t, bits));
+    }
+    let mut out = BTreeMap::new();
+    for ((org, fp), series) in by_series {
+        for (i, &(t, bits)) in series.iter().enumerate() {
+            if t <= lo || t > hi {
+                continue;
+            }
+            let v = f64::from_bits(bits);
+            let d = match i.checked_sub(1).map(|p| series[p]) {
+                Some((tp, pb)) if t - tp <= DAY => {
+                    let p = f64::from_bits(pb);
+                    if v >= p { v - p } else { v }
+                }
+                _ => 0.0,
+            };
+            let t_end = ((t - 1).div_euclid(MINUTE) + 1) * MINUTE;
+            *out.entry((org.clone(), fp, t_end)).or_insert(0.0) += d;
+        }
+    }
+    out
+}
+
+/// **B10, schema twin (issue #18 part B): a sparse counter keeps its
+/// steps at the first level.** Tenant `a`: 200 counters at a 60 s scrape,
+/// 30 % of scrapes missing and a 20-minute gap on every tenth series;
+/// tenant `b`: the same 200 series IDs at 15 s with no gap; three hours,
+/// built by 180 separate one-minute runs. Tenant `c`, in one 26-hour run
+/// whose samples start 30 s after its `lo`: two series whose only earlier
+/// row is a hand-made 60 s row exactly 86,400,000 ms and 86,400,001 ms
+/// before that sample, and two series with two samples inside the run,
+/// 25 h and 23 h apart. Every 60 s row's `inc` equals the increase from
+/// every landed sample of its tenant and series; tenant `c`'s four steps
+/// count 30, 0, 0 and 30.
+#[tokio::test]
+async fn a_sparse_counter_keeps_its_steps() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = DB_SPARSE.name();
+    let ctx = RenderCtx::for_tests(db, 7);
+    fresh(&client, &ctx).await;
+    let now = now_ms(&client).await;
+    let t0 = (now / HOUR) * HOUR - 4 * HOUR;
+    let fp = "bitOr(toUInt128('24100000000000000000000000000000000000'), toUInt128(s))";
+    for (org, scrape, keep) in [
+        (
+            "a",
+            60_000i64,
+            "cityHash64(s, i, 3) % 10 >= 3 AND NOT (s % 10 = 0 AND i BETWEEN 60 AND 79)",
+        ),
+        ("b", 15_000, "1"),
+    ] {
+        exec(
+            &client,
+            &format!(
+                "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+                 SELECT '{org}', toInt64(toUnixTimestamp64Milli(now64(3))), 0, 'rollup_b10', {fp}, t, v FROM ( \
+                   SELECT toUInt32(a.number) AS s, toInt64(b.number) AS i, \
+                          toInt64({t0}) + i * {scrape} + toInt64(cityHash64(s, i) % 1000) + 1 AS t, \
+                          toFloat64(i % 37) * 3 + toFloat64(cityHash64(s, i, 1) % 3) AS v \
+                   FROM numbers(200) AS a, numbers({}) AS b) \
+                 WHERE {keep}",
+                3 * HOUR / scrape
+            ),
+        )
+        .await;
+    }
+    // Tenant `c`, a run of 26 hours ending an hour before `t0`.
+    let lo_c = t0 - 27 * HOUR;
+    let first_c = lo_c + 30_000;
+    let mut c_samples = vec![
+        (1u128, first_c, 130.0f64),
+        (2, first_c, 130.0),
+        (3, first_c, 100.0),
+        (3, first_c + 25 * HOUR, 130.0),
+        (4, first_c, 100.0),
+        (4, first_c + 23 * HOUR, 130.0),
+    ];
+    let values: Vec<String> = c_samples
+        .iter()
+        .map(|(fp, t, v)| format!("({fp}, {t}, {v})"))
+        .collect();
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT 'c', toInt64(toUnixTimestamp64Milli(now64(3))), 0, 'rollup_b10', fp, t, v \
+             FROM values('fp UInt128, t Int64, v Float64', {})",
+            values.join(", ")
+        ),
+    )
+    .await;
+    // The hand-made rows: series 1's 86,400,000 ms and series 2's
+    // 86,400,001 ms before the first sample, both in the bucket ending
+    // 86,340,000 ms before `lo_c`, `last` 100.
+    for (fp, before) in [(1u128, DAY), (2, DAY + 1)] {
+        let t_last = first_c - before;
+        let t_end = ((t_last - 1).div_euclid(MINUTE) + 1) * MINUTE;
+        assert!(t_end <= lo_c && t_end > lo_c - DAY);
+        exec(
+            &client,
+            &format!(
+                "INSERT INTO {db}.metric_samples_60s (kind, org_id, fingerprint, t_end, t_last, last, min, max, sum, count, inc, built_at) \
+                 VALUES (0, 'c', {fp}, {t_end}, {t_last}, 100, 100, 100, 100, 1, 0, 0)"
+            ),
+        )
+        .await;
+        c_samples.push((fp, t_last, 100.0));
+    }
+    exec(&client, &first_level_insert(&ctx, lo_c, lo_c + 26 * HOUR)).await;
+    for k in 0..180 {
+        let a = t0 + k * MINUTE;
+        exec(&client, &first_level_insert(&ctx, a, a + MINUTE)).await;
+    }
+
+    let samples: Vec<TenantSample> = rows::<TenantLanded>(
+        &client,
+        &format!(
+            "SELECT org_id, fingerprint, unix_milli, reinterpretAsUInt64(value) AS bits \
+             FROM {db}.metric_landing WHERE kind = 0 AND org_id IN ('a', 'b')"
+        ),
+    )
+    .await
+    .into_iter()
+    .map(|r| (r.org_id, r.fingerprint, r.unix_milli, r.bits))
+    .chain(
+        c_samples
+            .iter()
+            .map(|(fp, t, v)| ("c".to_string(), *fp, *t, v.to_bits())),
+    )
+    .collect();
+    let mut want = expected_inc(&samples, t0, t0 + 3 * HOUR);
+    want.extend(
+        expected_inc(&samples, lo_c, lo_c + 26 * HOUR)
+            .into_iter()
+            .filter(|((org, ..), _)| org == "c"),
+    );
+    let got: BTreeMap<(String, u128, i64), f64> = rows::<TenantInc>(
+        &client,
+        &format!(
+            "SELECT org_id, fingerprint, t_end, inc FROM {db}.metric_samples_60s \
+             WHERE kind = 0 AND (org_id IN ('a', 'b') AND t_end > {t0} OR org_id = 'c' AND t_end > {lo_c})"
+        ),
+    )
+    .await
+    .into_iter()
+    .map(|r| ((r.org_id, r.fingerprint, r.t_end), r.inc))
+    .collect();
+
+    for org in ["a", "b", "c"] {
+        let keys = |m: &BTreeMap<(String, u128, i64), f64>| -> Vec<(u128, i64)> {
+            m.keys()
+                .filter(|(o, ..)| o == org)
+                .map(|(_, fp, t)| (*fp, *t))
+                .collect()
+        };
+        assert_eq!(
+            keys(&got),
+            keys(&want),
+            "tenant {org}: the series and buckets"
+        );
+        let total = keys(&want).len();
+        let equal = want
+            .iter()
+            .filter(|((o, ..), _)| o == org)
+            .filter(|(k, w)| got.get(*k).is_some_and(|g| close(*g, **w)))
+            .count();
+        println!("B10 tenant {org}: {equal} of {total} buckets equal");
+        assert!(total > 0);
+        assert_eq!(
+            equal, total,
+            "tenant {org}: buckets whose inc differs from the samples'"
+        );
+    }
+    let c_inc = |fp: u128, t: i64| {
+        got[&(
+            "c".to_string(),
+            fp,
+            ((t - 1).div_euclid(MINUTE) + 1) * MINUTE,
+        )]
+    };
+    assert_eq!(
+        c_inc(1, first_c),
+        30.0,
+        "a predecessor exactly 86,400,000 ms before"
+    );
+    assert_eq!(c_inc(2, first_c), 0.0, "a predecessor 86,400,001 ms before");
+    assert_eq!(c_inc(3, first_c + 25 * HOUR), 0.0, "two samples 25 h apart");
+    assert_eq!(
+        c_inc(4, first_c + 23 * HOUR),
+        30.0,
+        "two samples 23 h apart"
+    );
+
+    drop_db(&client, db).await;
+}

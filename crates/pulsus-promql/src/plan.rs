@@ -148,6 +148,32 @@ pub struct SelectorSpec {
     /// (`ev.smoothSeries(e.Series, e.Offset, e.PositionRange())`,
     /// engine.go:2540). Eval only.
     pub pos_start: usize,
+    /// Issue #18 part B: what the selector's consumer reads from it, when
+    /// a rollup level can serve that consumer. Assigned by the post-plan
+    /// pass [`assign_rollup_use`]; `None` keeps the selector on raw.
+    pub rollup_use: Option<RollupUse>,
+    /// Issue #18 part B: the selector sits inside a subquery. Fetch only.
+    pub in_subquery: bool,
+}
+
+/// Issue #18 part B: the one column of a rollup level a selector's
+/// consumer reads (design r13 section 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollupUse {
+    /// An instant selector, `last_over_time`, `present_over_time`,
+    /// `absent_over_time`, `timestamp`: `last` at `t_last`.
+    Last,
+    /// `max_over_time`: `max` at `t_end`.
+    Max,
+    /// `min_over_time`: `min` at `t_end`.
+    Min,
+    /// `sum_over_time`: `sum` at `t_end`.
+    Sum,
+    /// `avg_over_time`: `sum / count` at `t_end`.
+    Avg,
+    /// `rate`, `increase`: a counter that never resets, from `last` and
+    /// `inc`.
+    Counter,
 }
 
 /// The fetch-window context accumulated over a selector's enclosing
@@ -1040,6 +1066,8 @@ impl Planner {
             anchored,
             smoothed,
             pos_start,
+            rollup_use: None,
+            in_subquery: false,
         });
         id
     }
@@ -1164,6 +1192,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
             let mut selectors = planner.selectors;
             let root = PlanExpr::RangeVector { source };
             detect_histogram_stats(&root, &mut selectors);
+            assign_rollup_use(&root, &mut selectors);
             return Ok(QueryPlan {
                 root,
                 selectors,
@@ -1184,6 +1213,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
     let root = plan_expr(&mut planner, expr)?;
     let mut selectors = planner.selectors;
     detect_histogram_stats(&root, &mut selectors);
+    assign_rollup_use(&root, &mut selectors);
     Ok(QueryPlan {
         root,
         selectors,
@@ -1343,6 +1373,10 @@ fn detect_histogram_stats(root: &PlanExpr, selectors: &mut [SelectorSpec]) {
 
     walk(root, false, false, selectors);
 }
+
+/// Issue #18 part B: the post-plan pass that records, on each selector,
+/// what its consumer reads (`SelectorSpec::rollup_use`).
+fn assign_rollup_use(_root: &PlanExpr, _selectors: &mut [SelectorSpec]) {}
 
 /// Issue #32 code-review round-1 fix: a `match[]` discovery selector
 /// (`/series`, `/labels`, `/label/{name}/values`) is looser than a
@@ -5411,6 +5445,8 @@ mod tests {
             histogram_stats: false,
             anchored: false,
             smoothed: false,
+            rollup_use: None,
+            in_subquery: false,
         };
         let p = PlanParams {
             start_ms: 10_000_000,
@@ -6741,6 +6777,57 @@ mod tests {
         assert_eq!(
             stats_flags("histogram_count(sum(m)) + on() sum(m2)"),
             vec![true, false]
+        );
+    }
+
+    /// **B1b (issue #18 part B): each selector records what its consumer
+    /// reads.** An instant selector reads `last`; the direct source of
+    /// `rate`/`increase` the counter; of `max_`/`min_`/`sum_`/`avg_over_time`
+    /// that column; of `last_`/`present_`/`absent_over_time` `last`; every
+    /// other range selector nothing. `in_subquery` is set only inside a
+    /// subquery.
+    #[test]
+    fn b1b_each_selector_records_what_its_consumer_reads() {
+        let uses = |query: &str| -> Vec<(Option<RollupUse>, bool)> {
+            let expr = parse(query).unwrap();
+            plan(&expr, params())
+                .unwrap()
+                .selectors
+                .iter()
+                .map(|s| (s.rollup_use, s.in_subquery))
+                .collect()
+        };
+        let cases: [(&str, Option<RollupUse>); 18] = [
+            ("rate(m[5m])", Some(RollupUse::Counter)),
+            ("increase(m[5m])", Some(RollupUse::Counter)),
+            ("max_over_time(m[5m])", Some(RollupUse::Max)),
+            ("min_over_time(m[5m])", Some(RollupUse::Min)),
+            ("sum_over_time(m[5m])", Some(RollupUse::Sum)),
+            ("avg_over_time(m[5m])", Some(RollupUse::Avg)),
+            ("last_over_time(m[5m])", Some(RollupUse::Last)),
+            ("present_over_time(m[5m])", Some(RollupUse::Last)),
+            ("absent_over_time(m[5m])", Some(RollupUse::Last)),
+            ("timestamp(m)", Some(RollupUse::Last)),
+            ("m", Some(RollupUse::Last)),
+            ("quantile_over_time(0.5, m[5m])", None),
+            ("irate(m[5m])", None),
+            ("delta(m[5m])", None),
+            ("changes(m[5m])", None),
+            ("count_over_time(m[5m])", None),
+            ("deriv(m[5m])", None),
+            ("stddev_over_time(m[5m])", None),
+        ];
+        for (query, want) in cases {
+            assert_eq!(uses(query), vec![(want, false)], "{query}");
+        }
+        // The selector inside the subquery reads the counter, and is
+        // marked as inside a subquery; the one outside is not.
+        assert_eq!(
+            uses("max_over_time(rate(m[5m])[1h:5m]) + m"),
+            vec![
+                (Some(RollupUse::Counter), true),
+                (Some(RollupUse::Last), false)
+            ]
         );
     }
 }
