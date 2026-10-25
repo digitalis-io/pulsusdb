@@ -135,6 +135,7 @@ fn cluster_ctx(db: &str) -> RenderCtx {
         trace_indexed_attributes: Vec::new(),
         graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
         rollup_settle_ms: pulsus_schema::ROLLUP_SETTLE_MS,
+        rollup_levels: pulsus_schema::DEFAULT_ROLLUP_LEVELS.to_vec(),
     }
 }
 

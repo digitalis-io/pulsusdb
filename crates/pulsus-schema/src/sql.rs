@@ -48,6 +48,14 @@ pub fn rendered(ctx: &RenderCtx) -> String {
     render::substitute_tokens(&out, ctx)
 }
 
+/// `schema/schema.sql` with its level block expanded for `levels` (issue
+/// #18), before any other step: what a test reads to see the level tables
+/// under their names.
+#[doc(hidden)]
+pub fn expand_levels_for_tests(levels: &[u32]) -> String {
+    render::expand_levels(SCHEMA_SQL, levels)
+}
+
 /// `line` with `marker` and the spaces after it removed, or `None` when the
 /// line does not carry that marker. The space after the marker is part of
 /// the match, so a longer name cannot be mistaken for a marker.

@@ -74,6 +74,9 @@ pub struct RenderCtx {
     /// before `metric_rollup_mv` derives it. Not a setting: production
     /// renders [`ROLLUP_SETTLE_MS`], and a test may render another value.
     pub rollup_settle_ms: u64,
+    /// `PULSUS_ROLLUP_LEVELS` (issue #18): the validated rollup levels in
+    /// seconds, smallest first; empty for none.
+    pub rollup_levels: Vec<u32>,
 }
 
 /// The rows one run of the service-graph job may read (issue #599), the
@@ -84,6 +87,10 @@ pub const GRAPH_JOB_MAX_ROWS: u64 = 60_000_000;
 /// The time after a UTC day ends before `metric_rollup_mv` derives it
 /// (issue #18), the value `schema/schema.sh` renders: two hours.
 pub const ROLLUP_SETTLE_MS: u64 = 7_200_000;
+
+/// The rollup levels `schema/schema.sh` renders when `PULSUS_ROLLUP_LEVELS`
+/// is unset (issue #18).
+pub const DEFAULT_ROLLUP_LEVELS: &[u32] = &[60, 720, 7200, 86400];
 
 impl RenderCtx {
     /// A context for a test: `db` and `retention_days` as given, every other
@@ -112,6 +119,7 @@ impl RenderCtx {
             trace_indexed_attributes: Vec::new(),
             graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
             rollup_settle_ms: ROLLUP_SETTLE_MS,
+            rollup_levels: DEFAULT_ROLLUP_LEVELS.to_vec(),
         }
     }
 }
@@ -220,6 +228,17 @@ fn trace_attr_indexes(ctx: &RenderCtx) -> String {
     out
 }
 
+/// `PULSUS_ROLLUP_LEVELS` (issue #18), validated. Not yet implemented.
+pub fn parse_rollup_levels(_text: &str, _landing_hours: u32) -> Result<Vec<u32>, String> {
+    Ok(Vec::new())
+}
+
+/// The level block of `schema/schema.sql`, once per level. Not yet
+/// implemented.
+pub(crate) fn expand_levels(sql: &str, _levels: &[u32]) -> String {
+    sql.to_string()
+}
+
 /// The suffix a materialized view's `TO` clause carries when its target is
 /// the **routing** table on a cluster and the local table on a single node.
 ///
@@ -276,6 +295,7 @@ mod tests {
             trace_indexed_attributes: Vec::new(),
             graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
             rollup_settle_ms: ROLLUP_SETTLE_MS,
+            rollup_levels: DEFAULT_ROLLUP_LEVELS.to_vec(),
         }
     }
 
@@ -365,6 +385,117 @@ mod tests {
         c.cluster = Some("prod".to_string());
         let out = substitute_tokens("t{{on_cluster}}", &c);
         assert_eq!(out, "t ON CLUSTER 'prod'");
+    }
+
+    /// A level block of every marker, between two ordinary lines. The
+    /// `--@level --@cluster` line keeps its mode marker for the later pass,
+    /// and the three spaces after `--@level` keep two of them.
+    const LEVEL_BLOCK: &str = "head\n\
+        --@level A {{level}} {{level_ms}} {{timer}}\n\
+        --@level --@cluster C {{level}}\n\
+        --@level   indented\n\
+        --@level-first F {{period_ms}}\n\
+        --@level-next N {{source}}\n\
+        --@level-feeds P {{parent_ms}}\n\
+        tail\n";
+
+    /// Issue #18: no levels, no block.
+    #[test]
+    fn no_levels_emit_nothing_for_the_block() {
+        assert_eq!(expand_levels(LEVEL_BLOCK, &[]), "head\ntail\n");
+    }
+
+    /// Issue #18: one level is first and last, so it has no `--@level-next`
+    /// and no `--@level-feeds` line.
+    #[test]
+    fn one_level_is_first_and_feeds_nothing() {
+        assert_eq!(
+            expand_levels(LEVEL_BLOCK, &[60]),
+            "head\n\
+             A 60s 60000 EVERY 1 MINUTE\n\
+             --@cluster C 60s\n  indented\n\
+             F 60000\n\
+             tail\n"
+        );
+    }
+
+    /// Issue #18: the levels are emitted smallest first, each with its own
+    /// tokens. With `[5, 60]` the period is 60 s, `d_1` 180 s and `d_2` 240
+    /// s, and `240 mod 60 = 0`, so the 60 s level has no `OFFSET`.
+    #[test]
+    fn a_level_below_a_minute_runs_every_minute_and_the_next_has_no_offset() {
+        assert_eq!(
+            expand_levels(LEVEL_BLOCK, &[5, 60]),
+            "head\n\
+             A 5s 5000 EVERY 1 MINUTE\n\
+             --@cluster C 5s\n  indented\n\
+             F 60000\n\
+             P 60000\n\
+             A 60s 60000 EVERY 1 MINUTE\n\
+             --@cluster C 60s\n  indented\n\
+             N metric_samples_5s\n\
+             tail\n"
+        );
+    }
+
+    /// Issue #18: `[720, 86400]` has period 720 s, `d_1` 720 s and `d_2`
+    /// 780 s.
+    #[test]
+    fn the_timers_follow_the_level_sizes() {
+        let out = expand_levels(LEVEL_BLOCK, &[720, 86400]);
+        assert!(out.contains("A 720s 720000 EVERY 12 MINUTE\n"), "{out}");
+        assert!(
+            out.contains("A 86400s 86400000 EVERY 1 DAY OFFSET 780 SECOND\n"),
+            "{out}"
+        );
+        assert!(out.contains("F 720000\nP 86400000\n"), "{out}");
+        assert!(out.contains("N metric_samples_720s\ntail\n"), "{out}");
+    }
+
+    /// Issue #18: the lists `parse_rollup_levels` refuses, each with the
+    /// message of the first rule it breaks, and the lists it accepts.
+    #[test]
+    fn parse_rollup_levels_refuses_and_accepts_as_documented() {
+        for (text, hours, message) in [
+            ("60,45", 6, "45 is below 60 and does not divide 60"),
+            ("60,90", 6, "90 is not a multiple of 60"),
+            ("7,60", 6, "7 does not divide a day (86400)"),
+            ("60,60", 6, "60 then 60: the levels must increase"),
+            (
+                "060",
+                6,
+                "060 is not a whole number of seconds from 1 to 86400",
+            ),
+            ("60,,720", 6, "an empty item in '60,,720'"),
+            (",60", 6, "an empty item in ',60'"),
+            ("25,60", 6, "25 is below 60 and does not divide 60"),
+            ("1,2,6,12,60,120,240,720,1440", 6, "more than 8 levels"),
+            ("0", 6, "0 is not a whole number of seconds from 1 to 86400"),
+            (
+                "90000",
+                6,
+                "90000 is not a whole number of seconds from 1 to 86400",
+            ),
+            (
+                "14400,86400",
+                6,
+                "the first level 14400 outlives metric_landing: 2 × 14400 + 870 > 6 × 3600",
+            ),
+        ] {
+            assert_eq!(
+                parse_rollup_levels(text, hours),
+                Err(message.to_string()),
+                "{text:?}"
+            );
+        }
+        for (text, want) in [
+            ("60,720,7200,86400", vec![60, 720, 7200, 86400]),
+            ("5,60", vec![5, 60]),
+            ("720,86400", vec![720, 86400]),
+            ("", vec![]),
+        ] {
+            assert_eq!(parse_rollup_levels(text, 6), Ok(want), "{text:?}");
+        }
     }
 
     #[test]

@@ -67,6 +67,9 @@ static TEST_DB_ROLLUP_LAG_EMPTY: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_rollup_lag_empty");
 static TEST_DB_ROLLUP_LAG_CHUNK: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_rollup_lag_chunk");
+// Issue #18 part A: each shard builds its slice of the first level once.
+static TEST_DB_LEVELS: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_levels");
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -147,6 +150,7 @@ fn cluster_ctx(db: &str) -> SchemaParams {
         trace_indexed_attributes: Vec::new(),
         graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
         rollup_settle_ms: pulsus_schema::ROLLUP_SETTLE_MS,
+        rollup_levels: pulsus_schema::DEFAULT_ROLLUP_LEVELS.to_vec(),
     }
 }
 
@@ -288,6 +292,12 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         ("spans_dist", TRACES_KEY),
         ("traces_dist", TRACES_KEY),
         ("error_spans_dist", TRACES_KEY),
+        // Issue #18 part A: the default rollup levels, keyed like the
+        // samples.
+        ("metric_samples_60s_dist", METRICS_KEY),
+        ("metric_samples_720s_dist", METRICS_KEY),
+        ("metric_samples_7200s_dist", METRICS_KEY),
+        ("metric_samples_86400s_dist", METRICS_KEY),
     ];
     for (table, sharding_expr) in dist_tables {
         assert!(
@@ -2382,5 +2392,200 @@ async fn a_lagging_replica_derives_a_sample_only_its_peer_holds() {
         res,
         vec![300_000, 3_600_000],
         "T−5's coverage at both tiers"
+    );
+}
+
+/// The rollup level views of the default set, finest first (issue #18).
+const LEVEL_VIEWS: [&str; 4] = [
+    "metric_samples_60s_mv",
+    "metric_samples_720s_mv",
+    "metric_samples_7200s_mv",
+    "metric_samples_86400s_mv",
+];
+
+/// **A10 (issue #18 part A).** Each shard builds its slice of the first
+/// level once, on its first replica, from every replica's `metric_landing`.
+/// One series' samples go alternately to shard 1's and shard 2's landing
+/// table; shard 1's first replica, its builder, stops fetching landing, and
+/// one more sample goes to shard 1's second replica, so only that replica
+/// holds it. After one 60 s run on every replica, the level read through its
+/// wrapper has one data row per bucket, counting every sample pushed, that
+/// one included; and each shard holds one run row from that run, so the
+/// second replica wrote none.
+#[tokio::test]
+async fn each_shard_builds_its_slice_once() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard1b = ChClient::new(shard1b_config())
+        .await
+        .expect("connect shard1b");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+    let db = &TEST_DB_LEVELS;
+    drop_cluster_db(&shard1, db).await;
+    run_init(&shard1, &cluster_ctx(db))
+        .await
+        .expect("run_init (clustered)");
+    let replicas = [&shard1, &shard1b, &shard2];
+    // Each view ran once at creation; wait for it, stop every view, and
+    // empty the levels, so the runs below are the test's own.
+    for r in replicas {
+        for view in LEVEL_VIEWS {
+            exec_on(r, &format!("SYSTEM WAIT VIEW {db}.{view}")).await;
+            exec_on(r, &format!("SYSTEM STOP VIEW {db}.{view}")).await;
+        }
+    }
+    for r in [&shard1, &shard2] {
+        for view in LEVEL_VIEWS {
+            let table = view.trim_end_matches("_mv");
+            exec_on(
+                r,
+                &format!("TRUNCATE TABLE {db}.{table} SETTINGS alter_sync = 2"),
+            )
+            .await;
+        }
+    }
+
+    const MINUTE: i64 = 60_000;
+    let now = ints_on(
+        &shard1,
+        "SELECT toInt64(toUnixTimestamp64Milli(now64())) AS v",
+    )
+    .await[0];
+    // Five whole minutes ending at least five minutes ago: inside the
+    // run's window whatever minute it starts in.
+    let seed = now / MINUTE * MINUTE - 10 * MINUTE;
+    let fp: u128 = 1;
+    for r in [&shard1, &shard2] {
+        exec_on(
+            r,
+            &format!(
+                "INSERT INTO {db}.metric_samples_60s (kind, org_id, fingerprint, t_end, t_last, built_at) \
+                 VALUES (1, '', 0, {seed}, {}, 0)",
+                seed - MINUTE
+            ),
+        )
+        .await;
+    }
+    let landing = |t: i64, v: f64| {
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             VALUES ('', {}, 0, '', {fp}, {t}, {v:?})",
+            t + 5_000
+        )
+    };
+    let mut pushed: std::collections::BTreeMap<i64, i64> = Default::default();
+    for k in 1..=20i64 {
+        let t = seed + k * 15_000;
+        let to = if k % 2 == 0 { &shard1 } else { &shard2 };
+        exec_on(to, &landing(t, k as f64)).await;
+        *pushed
+            .entry((t - 1) / MINUTE * MINUTE + MINUTE)
+            .or_default() += 1;
+    }
+    exec_on(
+        &shard1b,
+        &format!("SYSTEM SYNC REPLICA {db}.metric_landing"),
+    )
+    .await;
+    exec_on(&shard1, &format!("SYSTEM STOP FETCHES {db}.metric_landing")).await;
+    let late = seed + 5 * MINUTE - 7_000;
+    exec_on(&shard1b, &landing(late, 99.0)).await;
+    *pushed.entry(seed + 5 * MINUTE).or_default() += 1;
+    let builder_copy = ints_on(
+        &shard1,
+        &format!("SELECT toInt64(count()) AS v FROM {db}.metric_landing WHERE unix_milli = {late}"),
+    )
+    .await[0];
+    assert_eq!(
+        builder_copy, 0,
+        "the builder's own copy lacks the last push"
+    );
+
+    let view = LEVEL_VIEWS[0];
+    for r in replicas {
+        exec_on(r, &format!("SYSTEM START VIEW {db}.{view}")).await;
+        exec_on(r, &format!("SYSTEM REFRESH VIEW {db}.{view}")).await;
+        exec_on(r, &format!("SYSTEM WAIT VIEW {db}.{view}")).await;
+        exec_on(r, &format!("SYSTEM STOP VIEW {db}.{view}")).await;
+    }
+    exec_on(
+        &shard1b,
+        &format!("SYSTEM SYNC REPLICA {db}.metric_samples_60s"),
+    )
+    .await;
+    exec_on(
+        &shard1,
+        &format!("SYSTEM SYNC REPLICA {db}.metric_samples_60s"),
+    )
+    .await;
+
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+    struct BucketRow {
+        t_end: i64,
+        count: u32,
+    }
+    let mut stream = shard1
+        .query_stream::<BucketRow>(
+            &format!(
+                "SELECT t_end, count FROM {db}.metric_samples_60s_dist \
+                 WHERE kind = 0 AND fingerprint = {fp} ORDER BY t_end, count"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read the level through its wrapper");
+    let mut got = Vec::new();
+    while let Some(row) = stream.next().await {
+        got.push(row.expect("decode BucketRow"));
+    }
+    drop(stream);
+    let want: Vec<BucketRow> = pushed
+        .iter()
+        .map(|(t_end, n)| BucketRow {
+            t_end: *t_end,
+            count: u32::try_from(*n).expect("small"),
+        })
+        .collect();
+
+    let mut runs = Vec::new();
+    for (name, r) in [
+        ("shard 1", &shard1),
+        ("shard 1's second replica", &shard1b),
+        ("shard 2", &shard2),
+    ] {
+        let n = ints_on(
+            r,
+            &format!(
+                "SELECT toInt64(count()) AS v FROM {db}.metric_samples_60s \
+                 WHERE kind = 1 AND t_end > {seed}"
+            ),
+        )
+        .await[0];
+        runs.push((name, n));
+    }
+    exec_on(
+        &shard1,
+        &format!("SYSTEM START FETCHES {db}.metric_landing"),
+    )
+    .await;
+    drop_cluster_db(&shard1, db).await;
+
+    assert_eq!(
+        got, want,
+        "one data row per bucket, counting every sample pushed once"
+    );
+    assert_eq!(
+        runs,
+        vec![
+            ("shard 1", 1),
+            ("shard 1's second replica", 1),
+            ("shard 2", 1)
+        ],
+        "one run row per shard, from its first replica: a second replica's run would add one"
     );
 }

@@ -22,6 +22,10 @@ pub use checks::{
 };
 pub use error::SchemaError;
 pub use render::{
-    GRAPH_JOB_MAX_ROWS, ROLLUP_SETTLE_MS, RenderCtx, SchemaParams, render_name, rollup_suffix,
+    DEFAULT_ROLLUP_LEVELS, GRAPH_JOB_MAX_ROWS, ROLLUP_SETTLE_MS, RenderCtx, SchemaParams,
+    parse_rollup_levels, render_name, rollup_suffix,
 };
-pub use sql::{SCHEMA_SQL, mv_projection, rendered, rendered_statements, table_column_names};
+pub use sql::{
+    SCHEMA_SQL, expand_levels_for_tests, mv_projection, rendered, rendered_statements,
+    table_column_names,
+};
