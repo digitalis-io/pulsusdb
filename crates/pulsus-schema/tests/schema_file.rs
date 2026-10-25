@@ -490,7 +490,6 @@ fn the_script_renders_exactly_what_this_crate_renders() {
                 // The script renders the production cap and has no input
                 // for it (issue #599), so this case keeps it.
                 graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
-                rollup_settle_ms: pulsus_schema::ROLLUP_SETTLE_MS,
                 rollup_levels: vec![15, 60, 720],
             },
         ),
@@ -1145,16 +1144,17 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
                     strings(&["metric_landing", "metric_samples_60s"]),
                     Vec::<String>::new(),
                 ),
+                // Sorted as strings: `7200s` before `720s`.
+                (
+                    "metric_samples_7200s_mv".to_string(),
+                    "metric_samples_7200s".to_string(),
+                    strings(&["metric_samples_7200s", "metric_samples_720s"]),
+                    Vec::<String>::new(),
+                ),
                 (
                     "metric_samples_720s_mv".to_string(),
                     "metric_samples_720s".to_string(),
                     strings(&["metric_samples_60s", "metric_samples_720s"]),
-                    Vec::<String>::new(),
-                ),
-                (
-                    "metric_samples_7200s_mv".to_string(),
-                    "metric_samples_7200s".to_string(),
-                    strings(&["metric_samples_720s", "metric_samples_7200s"]),
                     Vec::<String>::new(),
                 ),
                 (

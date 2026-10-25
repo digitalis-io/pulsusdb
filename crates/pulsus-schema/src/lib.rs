@@ -22,8 +22,8 @@ pub use checks::{
 };
 pub use error::SchemaError;
 pub use render::{
-    DEFAULT_ROLLUP_LEVELS, GRAPH_JOB_MAX_ROWS, ROLLUP_SETTLE_MS, RenderCtx, SchemaParams,
-    parse_rollup_levels, render_name, rollup_suffix,
+    DEFAULT_ROLLUP_LEVELS, GRAPH_JOB_MAX_ROWS, RenderCtx, SchemaParams, parse_rollup_levels,
+    render_name, rollup_suffix,
 };
 pub use sql::{
     SCHEMA_SQL, expand_levels_for_tests, mv_projection, rendered, rendered_statements,

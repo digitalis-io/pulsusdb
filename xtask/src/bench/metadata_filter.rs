@@ -185,7 +185,6 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         trace_dedup_window: 10_000,
         trace_indexed_attributes: Vec::new(),
         graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
-        rollup_settle_ms: pulsus_schema::ROLLUP_SETTLE_MS,
         rollup_levels: pulsus_schema::DEFAULT_ROLLUP_LEVELS.to_vec(),
     };
     run_init(&admin, &schema).await?;

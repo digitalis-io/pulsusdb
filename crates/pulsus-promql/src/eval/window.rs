@@ -19,11 +19,8 @@
 //! order is part of its answer: `1 − 1e16` rounds to `−1e16`, so adding
 //! `1e16` then `1` gives `1` while adding `1` first loses it.
 //!
-//! **Tiers cap the stored drop values.** A stored segment keeps its
-//! pre-drop values only up to a tier's cap ([`cap`]); past it the list is
-//! emptied and the count kept. Such a segment is **overflowed**
-//! (`resets.len() < n_resets`), and a counter finisher refuses a window
-//! holding one. Every other field is exact under any cap.
+//! A segment whose `resets` is shorter than `n_resets` is **overflowed**,
+//! and a counter finisher refuses a window holding one.
 
 use crate::value::Sample;
 
@@ -189,17 +186,6 @@ pub fn merge(segments: &[Segment]) -> Option<Segment> {
         m.resets.clear();
     }
     Some(m)
-}
-
-/// A segment as a tier stores it: its pre-drop values are dropped when
-/// there are more than `reset_cap` of them, and every other field is
-/// unchanged. A 5m row is `cap(segment_of(bucket), 4)`; a 1h row is
-/// `cap(merge(the hour's 5m rows), 16)`.
-pub fn cap(mut seg: Segment, reset_cap: u32) -> Segment {
-    if seg.n_resets > reset_cap {
-        seg.resets = Vec::new();
-    }
-    seg
 }
 
 /// The window over `segments`, adjacent and in time order: their
@@ -636,84 +622,6 @@ mod tests {
         assert_eq!(
             finishes(cut.as_ref(), all.len()),
             finishes(whole.as_ref(), all.len())
-        );
-    }
-
-    /// 240 samples 15 s apart, rising by 1 from 100, and `0` at each
-    /// index in `drops`.
-    fn hour_with_drops(drops: &[usize]) -> Vec<Sample> {
-        let mut v = 100.0;
-        (0..240)
-            .map(|i| {
-                v = if drops.contains(&i) { 0.0 } else { v + 1.0 };
-                Sample::float(i as i64 * 15_000, v)
-            })
-            .collect()
-    }
-
-    /// The hour's twelve 5m rows (cap 4) and its 1h row (cap 16).
-    fn tiers(samples: &[Sample]) -> (Vec<Segment>, Segment) {
-        let b: Vec<Segment> = samples
-            .chunks(20)
-            .map(|bucket| cap(segment_of(bucket).expect("a bucket holds samples"), 4))
-            .collect();
-        let h = cap(merge(&b).expect("an hour holds samples"), 16);
-        (b, h)
-    }
-
-    /// 3-h: the tier caps. Sixteen drops in an hour are stored; seventeen
-    /// are not; a 5m row past its cap overflows its hour however few the
-    /// hour's drops are, and the hour is otherwise exact.
-    #[test]
-    fn the_tier_caps_keep_or_drop_the_reset_values() {
-        let inner: Vec<usize> = (0..12).map(|i| i * 20 + 10).collect();
-        let mut h16_drops = inner.clone();
-        h16_drops.extend([20, 40, 60, 80]);
-        let mut h17_drops = h16_drops.clone();
-        h17_drops.push(100);
-
-        let (_, h) = tiers(&hour_with_drops(&h16_drops));
-        assert_eq!(h.n_resets, 16);
-        assert_eq!(h.resets.len(), 16, "the 16-drop hour stores its values");
-
-        let (_, h) = tiers(&hour_with_drops(&h17_drops));
-        assert_eq!(h.n_resets, 17);
-        assert!(h.resets.is_empty(), "the 17-drop hour stores none");
-
-        let h6 = hour_with_drops(&[2, 4, 6, 8, 10, 50]);
-        let (b, h) = tiers(&h6);
-        assert_eq!(b[0].n_resets, 5);
-        assert!(b[0].resets.is_empty(), "the 5-drop 5m row is overflowed");
-        assert_eq!(h.n_resets, 6);
-        assert!(h.resets.is_empty(), "its hour inherits the overflow");
-        let uncapped = merge(&[segment_of(&h6).expect("samples")]).expect("samples");
-        let mut capped_key = seg_key(&h);
-        let mut uncapped_key = seg_key(&uncapped);
-        capped_key.8.clear();
-        uncapped_key.8.clear();
-        assert_eq!(
-            capped_key, uncapped_key,
-            "every other field of the hour is exact"
-        );
-
-        let w = window(&b).expect("samples");
-        assert!(w.overflow);
-        let (range, start, end) = (3_600_000, -1, 3_600_000);
-        assert_eq!(finish_extrapolated(&w, range, start, end, true, true), None);
-        assert_eq!(
-            finish_extrapolated(&w, range, start, end, true, false),
-            None
-        );
-        assert_eq!(
-            bits(finish_extrapolated(&w, range, start, end, false, false)),
-            bits(legacy::eval_extrapolated(
-                &h6, range, start, end, false, false, None
-            )),
-            "delta reads no corrections"
-        );
-        assert!(
-            finish_extrapolated(&w, range, start, end, false, false).is_some(),
-            "the delta compared is a value"
         );
     }
 
