@@ -949,6 +949,70 @@ fn the_citing_clustering_passages_name_the_section_holding_the_list() {
         "docs/features.md's clustering row must cite schemas.md §7 for the \
          {count}: {row}"
     );
+    // The two wrapper passages that state the rule without the list.
+    let schema_dir = doc_line(
+        "architecture.md",
+        "When `PULSUS_CLUSTER` is set, `MergeTree` families",
+    );
+    assert!(
+        schema_dir.contains(&format!("for every table but the {count} §7 lists")),
+        "docs/architecture.md's schema paragraph must cite §7 for the {count} \
+         tables with no wrapper: {schema_dir}"
+    );
+    let shape = doc_line("schemas.md", "gets a Distributed wrapper of this shape");
+    assert!(
+        shape.contains(&format!(
+            "Every table but the {count} listed at the start of this section gets"
+        )),
+        "docs/schemas.md's wrapper-shape sentence must cite the {count} tables \
+         with no wrapper: {shape}"
+    );
+}
+
+/// **Every passage saying the clustered tables are replicated names the
+/// tables that are not.** `metric_rollup_plan` stays a plain local table on
+/// every replica, because its plan depends on that replica's own slice
+/// (issue #18). A passage that says every table becomes `Replicated*`
+/// without naming it is false.
+#[test]
+fn the_replication_passages_name_every_unreplicated_table() {
+    let mut local: Vec<String> = rendered_statements(&clustered())
+        .into_iter()
+        .filter(|s| s.starts_with("CREATE TABLE IF NOT EXISTS pulsus."))
+        .filter(|s| !s.contains("ENGINE = Distributed(") && !s.contains("ENGINE = Replicated"))
+        .map(|s| {
+            s["CREATE TABLE IF NOT EXISTS pulsus.".len()..]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .expect("a table name")
+                .to_string()
+        })
+        .collect();
+    local.sort();
+    assert_eq!(
+        local,
+        vec!["metric_rollup_plan"],
+        "the clustered tables that are not replicated"
+    );
+    for (name, anchor) in [
+        (
+            "architecture.md",
+            "When `PULSUS_CLUSTER` is set, `MergeTree` families",
+        ),
+        ("architecture.md", "**Sharded** (`PULSUS_CLUSTER` set):"),
+        ("schemas.md", "Conventions used below:"),
+        ("schemas.md", "Enabled by `PULSUS_CLUSTER`."),
+    ] {
+        let line = doc_line(name, anchor);
+        for table in &local {
+            assert!(
+                line.contains(&format!("but `{table}`"))
+                    || line.contains(&format!("except `{table}`")),
+                "docs/{name}'s replication claim must except `{table}`, which \
+                 is not replicated: {line}"
+            );
+        }
+    }
 }
 
 /// **No insert-triggered view reads a table another view writes.**
