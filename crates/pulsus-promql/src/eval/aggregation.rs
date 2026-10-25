@@ -6,7 +6,8 @@
 //! summation) and `stddev`/`stdvar` Welford's recurrence, **accumulation
 //! order pinned to the input vector's own order** — which is itself
 //! pinned to ascending-fingerprint order all the way back to the fetch
-//! layer's `ORDER BY fingerprint, unix_milli` (docs/schemas.md §2.3) and
+//! layer's `ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)`
+//! (docs/schemas.md §2.3) and
 //! never reshuffled by a `HashMap` in between (every grouping step here
 //! accumulates into per-group state in the same relative order the input
 //! vector arrives in, regardless of the `HashMap`'s own bucket iteration

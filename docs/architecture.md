@@ -216,9 +216,9 @@ The evaluation flow:
    PREWHERE metric_name = {name}
    WHERE unix_milli > {start} AND unix_milli <= {end}
      AND fingerprint IN ({sorted fps})
-   ORDER BY fingerprint, unix_milli
+   ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
    ```
-   Large fingerprint sets are split into parallel chunk fetches.
+   Large fingerprint sets are split into parallel chunk fetches. At one `(fingerprint, unix_milli)`, distinct floats are read in value-bits order.
 
    **A pushed node has a different step 4, and step 5 reads its answer rather than computing it** (issues #549 and #579). A selector under a pushed node sends that node's statements instead of this fetch and its complementary histogram fetch, and the evaluator takes the node's vector at each step from their rows and evaluates nothing below it. `min`, `max`, `count` and `group` over a plain instant selector send ONE statement per chunk, and that statement returns one row per **run** — a stretch of consecutive grid points over which the group's answer does not change — rather than one row per stored sample. The reader folds the runs across chunks into the node's answer. `sum`, `avg`, `count`, `min` and `max` over `rate`, `irate` or `increase` send one statement per node — split by time when series times steps exceeds 1,048,576 — returning one row per group per step and one row counting the histogram samples in the window; when that count is not zero the rows are discarded and the selector takes this fetch. For the `rate`, `irate` and `increase` nodes the group key is computed in the statement from each series' stored labels, by the same rule as the evaluator's `group_key_of`, and each row carries the group's labels. For the instant `min`/`max`/`count`/`group` statement the group key never enters the SQL: group ids are assigned in this process by the same function the evaluator's own aggregation uses, and reach the statement as a parallel array. Everything else in this list is unchanged, including step 3's one resolve.
 5. **Evaluate** series-first (all steps for one series before the next — samples stay cache-hot, group keys precomputed once) with Prometheus-exact semantics:

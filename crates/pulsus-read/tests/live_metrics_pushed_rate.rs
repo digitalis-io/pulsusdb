@@ -808,6 +808,43 @@ async fn equal_time_samples_are_ordered_by_value_bits() {
         let r = Harness::run(&h.pushed, &q, &p).await;
         assert_by_id_shape(&q, &r);
         assert_eq!(r.answer, want, "{q}: run {run}");
+        // Issue #18 part 3: the route that evaluates in this process
+        // reads the two values in the same order.
+        let u = Harness::run(&h.unpushed, &q, &p).await;
+        assert_eq!(u.answer, want, "{q}: run {run}, unpushed");
+    }
+    h.finish().await;
+}
+
+/// Issue #18 part 3: T11's corpus under `min` and `max` of the plain
+/// instant selector. The pushed route answers them with the grouped
+/// instant read, which picks each series' covering sample by its window
+/// order; the unpushed route picks the last sample it read. Both read
+/// two values at one millisecond in value-bits order, so the answers are
+/// identical in ten runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn equal_time_instant_min_max_agree() {
+    skip_unless_live!();
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_pushed_rate_p3_t11b");
+    let (first, second) = equal_time_corpus(t);
+    let h = harness(&db, t, &first, None).await;
+    seed_samples(&h.admin, &second).await;
+    // A 15 s step lands on every series' equal-millisecond pairs.
+    let p = h.ten_minutes(15_000);
+    for agg in ["min", "max"] {
+        let q = format!("{agg}({EQUAL_TIME_METRIC})");
+        for run in 0..10 {
+            let (a, b) = h.both(&q, &p).await;
+            assert!(!a.answer.is_empty(), "{q}: run {run} answers something");
+            assert!(
+                a.stages.iter().any(|(name, _)| name == "grouped_fetch"),
+                "{q}: the grouped instant read is taken: {:?}",
+                a.stages
+            );
+            assert_eq!(a.answer, b.answer, "{q}: run {run}");
+            assert_eq!(a.annotations, b.annotations, "{q}: run {run}");
+        }
     }
     h.finish().await;
 }

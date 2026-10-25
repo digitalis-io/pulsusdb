@@ -28,6 +28,7 @@ pub(crate) mod info;
 pub mod labels;
 pub mod quote;
 pub mod staleness;
+pub mod window;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

@@ -10,7 +10,8 @@
 //! recovers it).
 //!
 //! **Accumulation order is pinned to ascending-fingerprint input order**
-//! (the fetch `ORDER BY fingerprint, unix_milli` — docs/schemas.md §2.3),
+//! (the fetch `ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)`
+//! — docs/schemas.md §2.3),
 //! per the architect plan's Open Q1: exact last-ULP parity with
 //! Prometheus's own series-storage accumulation order is a #33
 //! differential concern, not assumed here.

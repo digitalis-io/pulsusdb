@@ -96,7 +96,7 @@ pub fn sample_fetch(
     );
     let fps = fingerprints_predicate(fps);
     format!(
-        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
+        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
     )
 }
 
@@ -118,7 +118,7 @@ pub fn sample_fetch_subquery(
     );
     let sub = subquery_predicate(subquery);
     format!(
-        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli"
+        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
     )
 }
 
@@ -142,7 +142,7 @@ pub fn sample_fetch_multi(
     );
     let fps = fingerprints_predicate(fps);
     format!(
-        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
+        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
     )
 }
 
@@ -328,7 +328,7 @@ mod tests {
              FROM metric_samples\n\
              WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
              \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
-             ORDER BY fingerprint, unix_milli"
+             ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
         );
     }
 
@@ -426,7 +426,7 @@ mod tests {
              FROM metric_samples\n\
              WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
              \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
-             ORDER BY fingerprint, unix_milli"
+             ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
         );
     }
 
@@ -532,6 +532,29 @@ mod tests {
         &sql[after_table..]
     }
 
+    /// The float read's tail and the histogram read's tail are the same
+    /// up to the sort key's last column: the float read orders the floats
+    /// of one millisecond by their value bits, and the histogram read
+    /// keeps `fingerprint, unix_milli` (issue #18 part 3).
+    fn assert_same_but_the_float_sort_key(float: &str, hist: &str) {
+        const HIST_ORDER: &str = "ORDER BY fingerprint, unix_milli";
+        const FLOAT_KEY: &str = ", reinterpretAsUInt64(value)";
+        let float_tail = predicate_tail(float);
+        let hist_tail = predicate_tail(hist);
+        let cut = |tail: &str| tail.rfind("ORDER BY").map(|at| tail[..at].to_string());
+        assert_eq!(
+            cut(float_tail),
+            cut(hist_tail),
+            "the predicates up to ORDER BY"
+        );
+        assert!(cut(float_tail).is_some(), "{float}");
+        assert!(hist_tail.ends_with(HIST_ORDER), "{hist}");
+        assert!(
+            float_tail.ends_with(&format!("{HIST_ORDER}{FLOAT_KEY}")),
+            "{float}"
+        );
+    }
+
     /// AC7a (Chunks): the float read and its complementary histogram read
     /// share the identical PREWHERE metric-name, window literal, fingerprint
     /// predicate, and ORDER BY — only the SELECT list and table differ.
@@ -557,7 +580,7 @@ mod tests {
             1_000,
             2_000,
         );
-        assert_eq!(predicate_tail(&float), predicate_tail(&hist));
+        assert_same_but_the_float_sort_key(&float, &hist);
         assert!(predicate_tail(&float).contains("unix_milli > 1000 AND unix_milli <= 2000"));
         assert!(predicate_tail(&float).contains("fingerprint IN (toUInt128('7'), toUInt128('9'))"));
         assert!(!predicate_tail(&float).contains("PREWHERE"));
@@ -571,7 +594,7 @@ mod tests {
         let float = sample_fetch_subquery(&no_tenant(), "metric_samples", subquery, 1_000, 2_000);
         let hist =
             hist_sample_fetch_subquery(&no_tenant(), "metric_hist_samples", subquery, 1_000, 2_000);
-        assert_eq!(predicate_tail(&float), predicate_tail(&hist));
+        assert_same_but_the_float_sort_key(&float, &hist);
     }
 
     /// AC7a (Multi): identical window and `fingerprint IN (…)`.
@@ -597,7 +620,7 @@ mod tests {
             1_000,
             2_000,
         );
-        assert_eq!(predicate_tail(&float), predicate_tail(&hist));
+        assert_same_but_the_float_sort_key(&float, &hist);
     }
 
     /// **F9 (issue #623): no sample statement names a metric.** The sample
@@ -608,16 +631,27 @@ mod tests {
     fn no_sample_statement_names_a_metric() {
         let ids = [fp(101), fp(205)];
         let sub = "SELECT fingerprint FROM metric_series";
+        // Issue #18 part 3: the float reads order one millisecond's floats
+        // by their value bits; the histogram reads keep their order.
         for sql in [
             sample_fetch(&no_tenant(), "metric_samples", &ids, 0, 100),
             sample_fetch_subquery(&no_tenant(), "metric_samples", sub, 0, 100),
             sample_fetch_multi(&no_tenant(), "metric_samples", &ids, 0, 100),
+        ] {
+            assert!(!sql.contains("metric_name"), "{sql}");
+            assert!(
+                sql.ends_with("ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"),
+                "{sql}"
+            );
+        }
+        for sql in [
             hist_sample_fetch(&no_tenant(), "metric_hist_samples", &ids, 0, 100),
             hist_sample_fetch_subquery(&no_tenant(), "metric_hist_samples", sub, 0, 100),
             hist_sample_fetch_multi(&no_tenant(), "metric_hist_samples", &ids, 0, 100),
         ] {
             assert!(!sql.contains("metric_name"), "{sql}");
             assert!(sql.ends_with("ORDER BY fingerprint, unix_milli"), "{sql}");
+            assert!(!sql.contains("reinterpretAsUInt64"), "{sql}");
         }
     }
 }

@@ -63,6 +63,17 @@
 //! states its grouping where it stated the `gids`. The statement count and
 //! every other entry are unchanged.
 //!
+//! # Issue #18 part 3 moved it, and which statements moved
+//!
+//! Two floats at one millisecond are read in value-bits order. The 25
+//! float fetches end `ORDER BY fingerprint, unix_milli,
+//! reinterpretAsUInt64(value)`, and the 4 grouped instant reads order each
+//! series' window `ts, is_hist, reinterpretAsUInt64(v)`, so the covering
+//! sample they pick is the one the unpushed route picks. The histogram
+//! fetches, the shape-A statement and the statement count are unchanged;
+//! every other line that moved is a marker's offset. 43,648 bytes became
+//! 44,444, and the digest moved from `d4a15a8a…` to `538e6d01…`.
+//!
 //! # Every boundary in this golden is writer-emitted
 //!
 //! The writer emits `-- statement[i]` before each statement, and the live
@@ -151,11 +162,12 @@ const PINNED: &str = include_str!("golden/promql_statements.sha256");
 
 /// The three constants published on issue #548 before the code existed;
 /// the line and byte counts re-taken by issue #623, whose sample statements
-/// carry no metric name, again by issue #579 and its parts 2 and 3, and by
-/// issue #635 part 4, whose statements each carry the tenant.
+/// carry no metric name, again by issue #579 and its parts 2 and 3, by
+/// issue #635 part 4, whose statements each carry the tenant, and by issue
+/// #18 part 3, whose float reads carry the value-bits key.
 const ENTRIES: usize = 30;
 const LINES: usize = 801;
-const BYTES: usize = 43_648;
+const BYTES: usize = 44_444;
 /// The statements the writer's markers declare. Sixty before issue #549;
 /// four entries now send ONE statement where they sent two, and issue #579
 /// made it five.

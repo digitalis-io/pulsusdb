@@ -435,7 +435,7 @@ impl Harness {
         let p = self.range();
         format!(
             "SELECT fingerprint, unix_milli, value\nFROM metric_samples\nWHERE org_id = '' AND unix_milli > {} \
-             AND unix_milli <= {}\n  AND fingerprint IN ({fps})\nORDER BY fingerprint, unix_milli",
+             AND unix_milli <= {}\n  AND fingerprint IN ({fps})\nORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)",
             p.start_ms - back,
             p.end_ms
         )
@@ -491,7 +491,7 @@ impl Harness {
              fingerprint,\n\
              \x20           ts, v, is_hist, stale,\n\
              \x20           least(leadInFrame(ts, 1, toInt64({upper}) + lookback + 1) OVER (\n\
-             \x20                   PARTITION BY fingerprint ORDER BY ts, is_hist\n\
+             \x20                   PARTITION BY fingerprint ORDER BY ts, is_hist, reinterpretAsUInt64(v)\n\
              \x20                   ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING),\n\
              \x20                 ts + lookback) AS cover_end\n\
              \x20         FROM (\n\
