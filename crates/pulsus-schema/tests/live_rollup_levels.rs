@@ -818,6 +818,9 @@ async fn a_hole_is_skipped_at_every_level() {
 async fn each_run_reads_its_window() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
+    // The query log is read from this case's start: a database of the same
+    // name from an earlier run left its own runs there.
+    let since = now_ms(&client).await;
     let db = DB_WINDOW.name();
     fresh(&client, &RenderCtx::for_tests(db, 7)).await;
     let now = now_ms(&client).await;
@@ -857,7 +860,7 @@ async fn each_run_reads_its_window() {
         &client,
         &format!(
             "SELECT read_rows, written_rows FROM system.query_log \
-             WHERE type = 'QueryFinish' AND event_date >= yesterday() \
+             WHERE type = 'QueryFinish' AND event_time_microseconds >= fromUnixTimestamp64Milli({since}) \
              AND query LIKE 'INSERT INTO {db}.metric_samples_60s (%' \
              AND query LIKE '%builder%'"
         ),
@@ -939,7 +942,7 @@ async fn each_run_reads_its_window() {
     let runs_of = |r: u32| {
         format!(
             "SELECT read_rows, written_rows, projections FROM system.query_log \
-             WHERE type = 'QueryFinish' AND event_date >= yesterday() \
+             WHERE type = 'QueryFinish' AND event_time_microseconds >= fromUnixTimestamp64Milli({since}) \
              AND query LIKE 'INSERT INTO {db}.metric_samples_{r}s (%' \
              AND query LIKE '%builder%' AND written_rows > 1"
         )
