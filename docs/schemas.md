@@ -1077,6 +1077,6 @@ The schemas are accepted only with benchmark evidence, produced by the M-milesto
 
 **Regression harness.** Every planner/schema PR runs the query set against fixed datasets; `system.query_log` metrics (`read_rows`, `read_bytes`, `SelectedMarks`, memory) are recorded so index-pruning regressions are caught by CI, not by users. `EXPLAIN indexes = 1` output for the canonical queries is snapshot-tested — a query silently losing its primary-index prefix or skip-index usage fails the build. All DDL blocks in this document are rendered and executed against a fresh ClickHouse in CI from M0.
 
-**Rollup accuracy (M3).** Issue #18 part B compares each rollup-served function with the raw route over aligned windows and asserts design r13 §2's measured distances.
+**Rollup accuracy (M3).** Issue #18 part B compares each rollup-served function with the raw route over aligned windows and asserts that each stays within the distance from raw measured for it on issue #18.
 
 **Storage amplification (M5).** Profile rows carry tree/function arrays plus the original payload; the M5 run measures bytes/profile at high frequency with shared symbol tables. If amplification is unacceptable, the fallback design (payload, function dictionary, and compact tree samples in separate tables) replaces it behind the same read path.
