@@ -8160,11 +8160,13 @@ async fn search_routed_answers_a_run_time_demand_itself() {
         statement: u8,
         other: u8,
     }
+    // Reads only: a refreshable view's insert into this database (issue
+    // #18's rollup, `service_edges_mv`) is not another read.
     let sql = format!(
         "SELECT toUnixTimestamp64Micro(event_time_microseconds) AS at, exception_code AS code, \
          toUInt8(startsWith(query, 'WITH (SELECT (groupArray(trace_id)')) AS statement, \
          toUInt8(notEmpty(tables) AND NOT startsWith(query, 'WITH (SELECT (groupArray(trace_id)')) AS other \
-         FROM system.query_log WHERE has(databases, '{db}') \
+         FROM system.query_log WHERE has(databases, '{db}') AND query_kind = 'Select' \
          AND type IN ('ExceptionBeforeStart', 'ExceptionWhileProcessing', 'QueryFinish') \
          AND event_time_microseconds >= toDateTime64({}, 6) ORDER BY at",
         t0 as f64 / 1e9

@@ -194,6 +194,8 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 | `metric_labels` | the end of the UTC day of `last_seen` + `R` days | row by row | none |
 | `metric_landing` | `received_ms` + `H` hours | whole part | hour of `received_ms` |
 | `metric_metadata` | `updated_ns` + `R` days | row by row | none |
+| `metric_rollup` | the start of the UTC day of `t_end − 1 ms` + `R` days | whole part | `(res, UTC day of t_end − 1 ms)` |
+| `metric_rollup_plan` | none: one row, replaced by each planning refresh | — | none |
 | `metric_samples` | `unix_milli` + `R` days | whole part | UTC day of `unix_milli` |
 | `metric_series` | the end of the UTC day `day` + `R` days | whole part | `day`, a UTC day |
 | `resources` | the end of the UTC day `day` + `R` days | whole part | `day`, a UTC day |

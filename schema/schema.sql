@@ -12,7 +12,7 @@
 -- and never add a substitution that matches one.
 --
 -- A REPLICATION PATH NAMES ITS OWN TABLE. The paths are written out rather
--- than derived, so a wrong one is a per-table error. Nineteen tables take
+-- than derived, so a wrong one is a per-table error. Twenty tables take
 -- `/clickhouse/tables/{shard}/` and six take `/clickhouse/tables/all/`
 -- (docs/architecture.md §3). `tests/schema_file.rs` holds the relation.
 --
@@ -287,6 +287,54 @@ TTL toDateTime(least(intDiv(updated_ns, 1000000000) + ({{retention_days}} * 8640
 --@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
+CREATE TABLE IF NOT EXISTS {{db}}.metric_rollup{{on_cluster}}
+(
+    row_kind UInt8,
+    org_id LowCardinality(String),
+    res UInt32,
+    fingerprint UInt128 CODEC(ZSTD(1)),
+    chunk_last UInt128 DEFAULT 0 CODEC(ZSTD(1)),
+    t_end Int64 CODEC(DoubleDelta, ZSTD(1)),
+    n UInt32 CODEC(T64, ZSTD(1)),
+    t_first Int64 CODEC(DoubleDelta, ZSTD(1)),
+    v_first Float64 CODEC(Gorilla(8), ZSTD(1)),
+    t_last Int64 CODEC(DoubleDelta, ZSTD(1)),
+    v_last Float64 CODEC(Gorilla(8), ZSTD(1)),
+    t_prev Int64 CODEC(DoubleDelta, ZSTD(1)),
+    v_prev Float64 CODEC(Gorilla(8), ZSTD(1)),
+    v_min Float64 CODEC(Gorilla(8), ZSTD(1)),
+    v_max Float64 CODEC(Gorilla(8), ZSTD(1)),
+    changes UInt32 CODEC(T64, ZSTD(1)),
+    n_resets UInt32 CODEC(T64, ZSTD(1)),
+    resets Array(Float64) CODEC(ZSTD(1)),
+    t_any Int64 CODEC(DoubleDelta, ZSTD(1)),
+    any_stale UInt8,
+    has_hist UInt8,
+    derived_ms Int64 CODEC(DoubleDelta, ZSTD(1)),
+    expires_ms Int64 CODEC(DoubleDelta, ZSTD(1))
+)
+--@single  ENGINE = ReplacingMergeTree(derived_ms)
+--@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_rollup', '{replica}', derived_ms)
+PARTITION BY (res, toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC'))
+ORDER BY (row_kind, org_id, res, fingerprint, t_end)
+TTL toDateTime(least(intDiv(expires_ms, 1000), 4294967295))
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+
+CREATE TABLE IF NOT EXISTS {{db}}.metric_rollup_plan{{on_cluster}}
+(
+    day Int64,
+    lo UInt256,
+    hi UInt256,
+    day_rows UInt64,
+    empty_run Array(Int64),
+    slice_lo UInt256,
+    slice_hi UInt256
+)
+ENGINE = MergeTree
+ORDER BY tuple()
+SETTINGS index_granularity = 8192{{storage_policy}};
+
 CREATE TABLE IF NOT EXISTS {{db}}.metric_samples{{on_cluster}}
 (
     org_id LowCardinality(String),
@@ -535,6 +583,9 @@ TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_label_index{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_label_index
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_label_index', cityHash64(fingerprint));
 
+--@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_rollup{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_rollup
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_rollup', cityHash64(fingerprint));
+
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_samples{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_samples
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_samples', cityHash64(fingerprint));
 
@@ -685,6 +736,134 @@ AS SELECT
     updated_ns AS updated_ns
 FROM {{db}}.metric_landing
 WHERE kind = 3;
+
+CREATE MATERIALIZED VIEW {{db}}.metric_rollup_plan_mv{{on_cluster}} REFRESH EVERY 1 MINUTE TO {{db}}.metric_rollup_plan
+--@single  AS WITH toUInt256(1) AS n_shards, toUInt256(0) AS shard_ix,
+--@single  (SELECT groupArray((d, r)) FROM (SELECT toUInt16(toDate(partition)) AS d, sum(rows) AS r FROM system.parts WHERE database = '{{db}}' AND table IN ('metric_samples', 'metric_hist_samples') AND active GROUP BY d)) AS parts,
+--@cluster AS WITH (SELECT toUInt256(uniqExact(shard_num)) FROM system.clusters WHERE cluster = '{{cluster}}') AS n_shards,
+--@cluster (SELECT toUInt256(any(shard_num) - 1) FROM system.clusters WHERE cluster = '{{cluster}}' AND is_local) AS shard_ix,
+--@cluster (SELECT groupArray((d, r)) FROM (SELECT toUInt16(toDate(partition)) AS d, sum(rows) AS r FROM clusterAllReplicas('{{cluster}}', system.parts) WHERE database = '{{db}}' AND table IN ('metric_samples', 'metric_hist_samples') AND active GROUP BY d)) AS parts,
+     toUInt256('340282366920938463463374607431768211456') AS space,
+     intDiv(space, greatest(n_shards, toUInt256(1))) AS slice_w,
+     slice_w * shard_ix AS slice_lo,
+     if(shard_ix + 1 = n_shards, space - 1, slice_w * (shard_ix + 1) - 1) AS slice_hi,
+     toInt64(toUnixTimestamp64Milli(now64())) AS now_ms,
+     arrayMap(p -> toInt64(p.1), arrayFilter(p -> p.1 * 86400000 + {{retention_days}} * 86400000 > now_ms + 3600000, parts)) AS kept,
+     intDiv(now_ms - {{rollup_settle_ms}}, 86400000) - 1 AS d_hi,
+     if(empty(kept), d_hi + 1, greatest(arrayMin(kept) - 1, intDiv(now_ms + 3600000 - {{retention_days}} * 86400000, 86400000) + 1)) AS d_lo,
+     (SELECT groupArray((d, rch)) FROM (
+        SELECT d, if(count() < 2, toUInt256(0), min(rch)) AS rch FROM (
+          SELECT intDiv(t_end - 1, 86400000) AS d, res,
+                 arrayFold((e, c) -> if(c.1 <= e AND c.2 >= e, c.2 + 1, e),
+                           arraySort(groupArray((toUInt256(fingerprint), toUInt256(chunk_last)))), slice_lo) AS rch
+          FROM {{db}}.metric_rollup
+          WHERE row_kind = 1 AND toUInt256(fingerprint) >= slice_lo AND toUInt256(chunk_last) <= slice_hi
+          GROUP BY d, res)
+        GROUP BY d)) AS cov,
+     arrayMap(x -> x.1, cov) AS cov_d,
+     arrayFilter(n -> if(indexOf(cov_d, n) = 0, slice_lo, greatest(cov[indexOf(cov_d, n)].2, slice_lo)) <= slice_hi,
+                 arrayMap(i -> toInt64(i), range(toUInt64(greatest(d_lo, 0)), toUInt64(greatest(d_hi + 1, greatest(d_lo, 0)))))) AS todo,
+     if(empty(todo), toInt64(-1), todo[1]) AS day,
+     if(day < 0, toUInt256(0), if(indexOf(cov_d, day) = 0, slice_lo, greatest(cov[indexOf(cov_d, day)].2, slice_lo))) AS lo,
+     arrayFirst(p -> toInt64(p.1) = day, parts).2 + arrayFirst(p -> toInt64(p.1) = day + 1, parts).2 AS day_rows,
+     greatest(toUInt256(1), toUInt256(ceil(day_rows / toFloat64(greatest(n_shards, toUInt256(1))) / 20000000))) AS n_chunks,
+     least(slice_hi, lo + intDiv(slice_hi - slice_lo + 1, n_chunks) - 1) AS hi,
+     arrayFilter(n -> n >= day AND n < arrayMin(arrayConcat([d_hi + 2], arrayFilter(m -> m > day, arrayMap(p -> toInt64(p.1), parts)))) - 1, todo) AS empty_run
+SELECT day, lo, hi, day_rows, empty_run, slice_lo, slice_hi;
+
+CREATE MATERIALIZED VIEW {{db}}.metric_rollup_mv{{on_cluster}} REFRESH EVERY 1 MINUTE DEPENDS ON {{db}}.metric_rollup_plan_mv APPEND TO {{db}}.metric_rollup
+AS WITH ifNull((SELECT (day, lo, hi, day_rows, empty_run, slice_lo, slice_hi) FROM {{db}}.metric_rollup_plan),
+            (toInt64(-1), toUInt256(0), toUInt256(0), toUInt64(0), CAST([] AS Array(Int64)), toUInt256(0), toUInt256(0))) AS plan,
+     tupleElement(plan, 1) AS day, tupleElement(plan, 2) AS lo, tupleElement(plan, 3) AS hi, tupleElement(plan, 4) AS day_rows,
+     tupleElement(plan, 5) AS empty_run, tupleElement(plan, 6) AS slice_lo, tupleElement(plan, 7) AS slice_hi,
+     day * 86400000 AS day_start, day_start + 86400000 AS day_end,
+     if(empty(empty_run), toInt64(0), arrayMin(empty_run) * 86400000) AS e_lo,
+     if(empty(empty_run), toInt64(0), (arrayMax(empty_run) + 1) * 86400000) AS e_hi,
+     (SELECT groupUniqArray(toInt64(intDiv(unix_milli - 1, 86400000))) FROM (
+--@single         SELECT unix_milli FROM {{db}}.metric_samples
+--@cluster         SELECT unix_milli FROM clusterAllReplicas('{{cluster}}', {{db}}.metric_samples)
+        WHERE unix_milli > e_lo AND unix_milli <= e_hi AND fingerprint BETWEEN toUInt128(slice_lo) AND toUInt128(slice_hi)
+        UNION ALL
+--@single         SELECT unix_milli FROM {{db}}.metric_hist_samples
+--@cluster         SELECT unix_milli FROM clusterAllReplicas('{{cluster}}', {{db}}.metric_hist_samples)
+        WHERE unix_milli > e_lo AND unix_milli <= e_hi AND fingerprint BETWEEN toUInt128(slice_lo) AND toUInt128(slice_hi))) AS seen,
+     toInt64(toUnixTimestamp64Milli(now64())) AS derived,
+     {{retention_days}} * 86400000 AS ret_ms
+SELECT * FROM (
+SELECT toUInt8(0) AS row_kind, org_id, x.1 AS res, fingerprint, toUInt128(0) AS chunk_last, x.2 AS t_end,
+       x.3 AS n, x.4 AS t_first, x.5 AS v_first, x.6 AS t_last, x.7 AS v_last, x.8 AS t_prev, x.9 AS v_prev,
+       x.10 AS v_min, x.11 AS v_max, x.12 AS changes, x.13 AS n_resets, x.14 AS resets,
+       x.15 AS t_any, x.16 AS any_stale, x.17 AS has_hist, derived AS derived_ms,
+       intDiv(x.2 - 1, 86400000) * 86400000 + ret_ms AS expires_ms
+FROM (
+  SELECT org_id, fingerprint,
+    arrayJoin(arrayConcat(
+      arrayMap(y -> (toUInt32(300000), y.15, y.1, y.2, y.3, y.4, y.5, y.6, y.7, y.8, y.9, y.10, y.16, y.11, y.12, y.13, y.14), b),
+      [(toUInt32(3600000), hour_end,
+        toUInt32(arraySum(y -> y.1, b)),
+        if(length(e) > 0, e[1].2, 0), if(length(e) > 0, e[1].3, 0.),
+        if(length(e) > 0, e[-1].4, 0), if(length(e) > 0, e[-1].5, 0.),
+        multiIf(length(e) = 0, 0, e[-1].1 > 1, e[-1].6, length(e) > 1, e[-2].4, 0),
+        multiIf(length(e) = 0, 0., e[-1].1 > 1, e[-1].7, length(e) > 1, e[-2].5, 0.),
+        if(length(e) > 0, arrayFold((m, y) -> if(y.8 < m OR isNaN(m), y.8, m), e, e[1].8), 0.),
+        if(length(e) > 0, arrayFold((m, y) -> if(y.9 > m OR isNaN(m), y.9, m), e, e[1].9), 0.),
+        toUInt32(arraySum(y -> y.10, e) + arrayCount((p, c) -> c.3 != p.5 AND NOT (isNaN(c.3) AND isNaN(p.5)), arrayPopBack(e), arrayPopFront(e))),
+        toUInt32(arraySum(y -> y.16, e) + arrayCount((p, c) -> c.3 < p.5, arrayPopBack(e), arrayPopFront(e))) AS nr,
+        if(nr <= 16 AND arrayAll(y -> length(y.11) = y.16, e),
+           arrayFlatten(arrayMap((y, i) -> if(i > 1 AND y.3 < e[i - 1].5, arrayPushFront(y.11, e[i - 1].5), y.11), e, arrayEnumerate(e))), []),
+        if(empty(fa), 0, fa[-1].12), if(empty(fa), toUInt8(0), fa[-1].13), arrayMax(y -> y.14, b))])) AS x
+  FROM (
+    SELECT org_id, fingerprint, (intDiv(t5 - 1, 3600000) + 1) * 3600000 AS hour_end,
+      arraySort(y -> y.15, groupArray((n, t_first, v_first, t_last, v_last, t_prev, v_prev, v_min, v_max,
+                                       changes, resets, t_any, any_stale, has_hist, t5, n_resets))) AS b,
+      arrayFilter(y -> y.1 > 0, b) AS e,
+      arrayFilter(y -> y.12 != 0, b) AS fa
+    FROM (
+      SELECT org_id, fingerprint, t5,
+        toUInt32(length(s)) AS n,
+        if(n > 0, s[1].1, 0) AS t_first, if(n > 0, reinterpretAsFloat64(s[1].2), 0.) AS v_first,
+        if(n > 0, s[-1].1, 0) AS t_last, if(n > 0, reinterpretAsFloat64(s[-1].2), 0.) AS v_last,
+        if(n > 1, s[-2].1, 0) AS t_prev, if(n > 1, reinterpretAsFloat64(s[-2].2), 0.) AS v_prev,
+        if(n > 0, arrayFold((m, v) -> if(v < m OR isNaN(m), v, m), ys, ys[1]), 0.) AS v_min,
+        if(n > 0, arrayFold((m, v) -> if(v > m OR isNaN(m), v, m), ys, ys[1]), 0.) AS v_max,
+        toUInt32(arrayCount((p, v) -> v != p AND NOT (isNaN(v) AND isNaN(p)), arrayPopBack(ys), arrayPopFront(ys))) AS changes,
+        toUInt32(length(rv)) AS n_resets, if(length(rv) <= 4, rv, []) AS resets,
+        if(empty(a), 0, a[-1].1) AS t_any, toUInt8(if(empty(a), 0, a[-1].2 = 9218868437227405314)) AS any_stale,
+        toUInt8(hists > 0) AS has_hist
+      FROM (
+        SELECT org_id, fingerprint, t5, a, hists,
+          arrayFilter(z -> z.2 != 9218868437227405314, a) AS s,
+          arrayMap(z -> reinterpretAsFloat64(z.2), s) AS ys,
+          arrayFilter((p, v) -> v < p, arrayPopBack(ys), arrayPopFront(ys)) AS rv
+        FROM (
+          SELECT org_id, fingerprint, t5, countIf(is_hist) AS hists,
+            arraySort(groupArrayIf((ts, bits), NOT is_hist)) AS raw,
+            arrayFilter((z, i) -> i = 1 OR z != raw[i - 1], raw, arrayEnumerate(raw)) AS a
+          FROM (
+            SELECT org_id, fingerprint, (intDiv(unix_milli - 1, 300000) + 1) * 300000 AS t5,
+                   unix_milli AS ts, reinterpretAsUInt64(value) AS bits, false AS is_hist
+--@single             FROM {{db}}.metric_samples
+--@cluster             FROM clusterAllReplicas('{{cluster}}', {{db}}.metric_samples)
+            WHERE day_rows > 0 AND unix_milli > day_start AND unix_milli <= day_end
+              AND fingerprint BETWEEN toUInt128(lo) AND toUInt128(hi)
+            UNION ALL
+            SELECT org_id, fingerprint, (intDiv(unix_milli - 1, 300000) + 1) * 300000,
+                   unix_milli, toUInt64(0), true
+--@single             FROM {{db}}.metric_hist_samples
+--@cluster             FROM clusterAllReplicas('{{cluster}}', {{db}}.metric_hist_samples)
+            WHERE day_rows > 0 AND unix_milli > day_start AND unix_milli <= day_end
+              AND fingerprint BETWEEN toUInt128(lo) AND toUInt128(hi))
+          GROUP BY org_id, fingerprint, t5)))
+    GROUP BY org_id, fingerprint, hour_end))
+UNION ALL
+SELECT toUInt8(1), '', r, toUInt128(c.1), toUInt128(c.2), c.3 * 86400000 + 86400000,
+       0, 0, 0., 0, 0., 0, 0., 0., 0., 0, 0, [], 0, 0, 0, derived, c.3 * 86400000 + ret_ms
+FROM system.one
+ARRAY JOIN if(day < 0, [], if(day_rows > 0, [(lo, hi, day)], arrayMap(m -> (slice_lo, slice_hi, m), arrayFilter(m -> NOT has(seen, m), empty_run)))) AS c
+ARRAY JOIN [toUInt32(300000), toUInt32(3600000)] AS r)
+SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_execution_time = 50,
+--@cluster max_replica_delay_for_distributed_queries = 60, fallback_to_stale_replicas_for_distributed_queries = 0, skip_unavailable_shards = 0,
+         max_insert_threads = 1, max_insert_block_size = 100000000, min_insert_block_size_rows = 100000000, min_insert_block_size_bytes = 10000000000;
 
 CREATE MATERIALIZED VIEW {{db}}.metric_samples_mv{{on_cluster}} TO {{db}}.metric_samples
 AS SELECT

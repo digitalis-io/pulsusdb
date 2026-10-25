@@ -49,16 +49,16 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 25 tables, 22 views, and
+/// The inventory, single-node: one database, 27 tables, 24 views, and
 /// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
 /// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 48, "statement count");
+    assert_eq!(stmts.len(), 52, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
-    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 25);
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 22);
+    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 27);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 24);
 
     let text = rendered(&single());
     assert!(
@@ -87,18 +87,18 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     assert!(text.contains("non_replicated_deduplication_window = 10000"));
 }
 
-/// The inventory, clustered: the same statements plus 14 `_dist` wrappers,
+/// The inventory, clustered: the same statements plus 15 `_dist` wrappers,
 /// `ON CLUSTER` on every one, and the macros intact.
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 62, "statement count");
+    assert_eq!(stmts.len(), 67, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        39,
-        "25 tables + 14 wrappers"
+        42,
+        "27 tables + 15 wrappers"
     );
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 22);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 24);
 
     let text = rendered(&clustered());
     assert!(
@@ -107,19 +107,20 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        62,
+        67,
         "every statement carries ON CLUSTER"
     );
 
     // `{shard}` and `{replica}` are the server's own macros and must arrive
-    // literally. 19 tables take a per-shard replica set and 6 take the
-    // cluster-wide one, so 25 paths name `{replica}` and 19 name `{shard}`.
+    // literally. 20 tables take a per-shard replica set and 6 take the
+    // cluster-wide one, so 26 paths name `{replica}` and 20 name `{shard}`.
+    // `metric_rollup_plan` is each replica's own and has no path.
     assert_eq!(
         text.matches("{shard}").count(),
-        19,
+        20,
         "per-shard replica sets"
     );
-    assert_eq!(text.matches("{replica}").count(), 25, "replicated tables");
+    assert_eq!(text.matches("{replica}").count(), 26, "replicated tables");
     assert_eq!(
         text.matches("/clickhouse/tables/all/").count(),
         6,
@@ -178,7 +179,7 @@ fn every_replication_path_names_the_table_of_its_own_create() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 25, "every replicated table's path was checked");
+    assert_eq!(checked, 26, "every replicated table's path was checked");
 }
 
 /// The splitter the script relies on: a statement ends at a line whose last
@@ -330,6 +331,7 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         "metric_exemplars",
         "metric_series",
         "metric_labels",
+        "metric_rollup",
     ] {
         assert!(
             text.contains(&format!("'{table}', cityHash64(fingerprint))")),
@@ -358,7 +360,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 25);
+    assert_eq!(on_tables, 27);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -381,10 +383,15 @@ fn the_configured_values_reach_the_statements() {
         trace_dedup_window: 23,
         trace_indexed_attributes: Vec::new(),
         dist_suffix: "_routed".to_string(),
+        rollup_settle_ms: 1234,
         ..clustered()
     };
     let text = rendered(&ctx);
     assert!(text.contains("(31 * 86400)"), "retention days");
+    assert!(
+        text.contains("intDiv(now_ms - 1234, 86400000) - 1 AS d_hi"),
+        "the rollup settle (issue #18)"
+    );
     assert!(
         text.contains("pulsus.log_metrics_2m"),
         "rollup suffix names a table"
@@ -413,9 +420,22 @@ fn the_configured_values_reach_the_statements() {
         text.contains("pulsus.spans_routed"),
         "the configured suffix"
     );
+    // No identifier `pulsus.<name>_dist`: the default suffix is not baked
+    // in. Settings such as `fallback_to_stale_replicas_for_distributed_queries`
+    // contain `_dist` and are not names, so each name is read whole.
+    let baked: Vec<&str> = text
+        .match_indices("pulsus.")
+        .map(|(at, _)| {
+            text[at + "pulsus.".len()..]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .expect("split yields at least one piece")
+        })
+        .filter(|name| name.ends_with("_dist"))
+        .collect();
     assert!(
-        !text.contains("_dist"),
-        "the default suffix is not baked in"
+        baked.is_empty(),
+        "the default suffix is baked into {baked:?}"
     );
 }
 
@@ -453,9 +473,11 @@ fn the_script_renders_exactly_what_this_crate_renders() {
                     "event.exception.type".to_string(),
                     "span.http-x.a_b".to_string(),
                 ],
-                // The script renders the production cap and has no input
-                // for it (issue #599), so this case keeps it.
+                // The script renders the production cap and settle and has
+                // no input for them (issues #599, #18), so this case keeps
+                // them.
                 graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
+                rollup_settle_ms: pulsus_schema::ROLLUP_SETTLE_MS,
             },
         ),
         (
@@ -752,8 +774,9 @@ fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
     let no_wrapper = tables_without_a_wrapper();
     assert_eq!(
         no_wrapper.len(),
-        11,
-        "three landing tables, the label values, `service_edges` and six cluster-wide ones: \
+        12,
+        "three landing tables, the label values, `service_edges`, the rollup plan and six \
+         cluster-wide ones: \
          {no_wrapper:?}"
     );
     let all = tables();
@@ -824,12 +847,14 @@ fn the_trace_sharding_key_passage_names_every_routed_trace_table() {
     }
 }
 
-/// **The three landing tables, `metric_label_values` and `service_edges`
-/// are the only per-shard tables with no routing wrapper.** The label
+/// **The three landing tables, `metric_label_values`, `service_edges` and
+/// `metric_rollup_plan` are the only per-shard tables with no routing
+/// wrapper.** The label
 /// values are named locally inside every statement that reads them (issue
 /// #635); `service_edges` is read only per shard, through `cluster(…,
 /// view(…))`, by the one statement that also pairs that shard's spans
-/// (issue #599, part A D9). Four passages across three documents restrict their claim to
+/// (issue #599, part A D9); `metric_rollup_plan` is each replica's own
+/// plan, read only by that replica's derivation (issue #18). Four passages across three documents restrict their claim to
 /// per-shard tables, and this is the fact that restriction rests on: a
 /// per-shard table added without a wrapper makes all four false at once,
 /// and reddens here rather than in a document nobody reads.
@@ -852,12 +877,13 @@ fn only_the_landing_tables_the_label_values_and_the_service_edges_are_per_shard_
             "log_landing",
             "metric_label_values",
             "metric_landing",
+            "metric_rollup_plan",
             "service_edges",
             "trace_landing"
         ],
         "a per-shard table with no routing wrapper that is not a landing \
-         table, the label values or `service_edges` (read only per shard, issue #599 part A \
-         D9) falsifies the clustering claim in docs/architecture.md §7, \
+         table, the label values, `service_edges` (read only per shard, issue #599 part A \
+         D9) or the rollup plan (each replica's own, issue #18) falsifies the clustering claim in docs/architecture.md §7, \
          docs/schemas.md §7, docs/schemas.md's conventions preamble and \
          docs/features.md's clustering row"
     );
@@ -923,6 +949,70 @@ fn the_citing_clustering_passages_name_the_section_holding_the_list() {
         "docs/features.md's clustering row must cite schemas.md §7 for the \
          {count}: {row}"
     );
+    // The two wrapper passages that state the rule without the list.
+    let schema_dir = doc_line(
+        "architecture.md",
+        "When `PULSUS_CLUSTER` is set, `MergeTree` families",
+    );
+    assert!(
+        schema_dir.contains(&format!("for every table but the {count} §7 lists")),
+        "docs/architecture.md's schema paragraph must cite §7 for the {count} \
+         tables with no wrapper: {schema_dir}"
+    );
+    let shape = doc_line("schemas.md", "gets a Distributed wrapper of this shape");
+    assert!(
+        shape.contains(&format!(
+            "Every table but the {count} listed at the start of this section gets"
+        )),
+        "docs/schemas.md's wrapper-shape sentence must cite the {count} tables \
+         with no wrapper: {shape}"
+    );
+}
+
+/// **Every passage saying the clustered tables are replicated names the
+/// tables that are not.** `metric_rollup_plan` stays a plain local table on
+/// every replica, because its plan depends on that replica's own slice
+/// (issue #18). A passage that says every table becomes `Replicated*`
+/// without naming it is false.
+#[test]
+fn the_replication_passages_name_every_unreplicated_table() {
+    let mut local: Vec<String> = rendered_statements(&clustered())
+        .into_iter()
+        .filter(|s| s.starts_with("CREATE TABLE IF NOT EXISTS pulsus."))
+        .filter(|s| !s.contains("ENGINE = Distributed(") && !s.contains("ENGINE = Replicated"))
+        .map(|s| {
+            s["CREATE TABLE IF NOT EXISTS pulsus.".len()..]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .expect("a table name")
+                .to_string()
+        })
+        .collect();
+    local.sort();
+    assert_eq!(
+        local,
+        vec!["metric_rollup_plan"],
+        "the clustered tables that are not replicated"
+    );
+    for (name, anchor) in [
+        (
+            "architecture.md",
+            "When `PULSUS_CLUSTER` is set, `MergeTree` families",
+        ),
+        ("architecture.md", "**Sharded** (`PULSUS_CLUSTER` set):"),
+        ("schemas.md", "Conventions used below:"),
+        ("schemas.md", "Enabled by `PULSUS_CLUSTER`."),
+    ] {
+        let line = doc_line(name, anchor);
+        for table in &local {
+            assert!(
+                line.contains(&format!("but `{table}`"))
+                    || line.contains(&format!("except `{table}`")),
+                "docs/{name}'s replication claim must except `{table}`, which \
+                 is not replicated: {line}"
+            );
+        }
+    }
 }
 
 /// **No insert-triggered view reads a table another view writes.**
@@ -932,104 +1022,133 @@ fn the_citing_clustering_passages_name_the_section_holding_the_list() {
 /// The sources are pinned as a set too: every insert-triggered view reads a
 /// landing table, which the writers fill directly and no view targets.
 ///
-/// **V1 (issue #599): the one refreshable view is named, not exempted.**
+/// **V1 (issue #599): the refreshable views are named, not exempted.**
 /// `service_edges_mv` runs on a schedule rather than on an insert, and it
 /// reads `spans` (another view's target) and its own target, `service_edges`
-/// (its markers). It is pinned by name, target and exact sources, so a
-/// second refreshable view, or this one reading anything else, fails here
-/// instead of passing under a rule for every refreshable view. Its sources
-/// are read through `merge('pulsus', '^<table>$')` and through nothing else
-/// (part C D6): a direct `FROM pulsus.` read takes its part snapshot before
-/// the barrier runs.
+/// (its markers). Its sources are read through `merge('pulsus', '^<table>$')`
+/// and through nothing else (part C D6): a direct `FROM pulsus.` read takes
+/// its part snapshot before the barrier runs. Issue #18's two views:
+/// `metric_rollup_plan_mv` reads `metric_rollup` (its coverage rows) and
+/// writes one plan row; `metric_rollup_mv` reads that row, `metric_samples`
+/// and `metric_hist_samples` (other views' targets). Each is pinned by name,
+/// target and exact sources, in both variants, so a fourth refreshable view,
+/// or one of these reading anything else, fails here instead of passing
+/// under a rule for every refreshable view.
 #[test]
 fn no_insert_triggered_view_reads_a_table_another_view_writes() {
-    let mut targets = Vec::new();
-    let mut sources = Vec::new();
-    let mut refreshable = Vec::new();
-    for stmt in rendered_statements(&single()) {
-        let Some(head) = stmt.strip_prefix("CREATE MATERIALIZED VIEW pulsus.") else {
-            continue;
-        };
-        let head_line = head.lines().next().expect("a view has a head line");
-        let name = head_line
-            .split_whitespace()
-            .next()
-            .expect("the view's name")
-            .to_string();
-        let target = head_line
-            .split_once(" TO pulsus.")
-            .expect("a view names its target on its head line")
-            .1
-            .trim()
-            .to_string();
-        targets.push(target.clone());
-        // Every `FROM`, not just the first: a view with a subquery has
-        // more than one, and each is a source.
-        let mut own: Vec<String> = Vec::new();
-        for (at, _) in stmt.match_indices("FROM pulsus.") {
-            let table = stmt[at + "FROM pulsus.".len()..]
+    for base in [single(), clustered()] {
+        let variant = base.cluster.clone();
+        let mut targets = Vec::new();
+        let mut sources = Vec::new();
+        let mut refreshable = Vec::new();
+        for stmt in rendered_statements(&base) {
+            let Some(head) = stmt.strip_prefix("CREATE MATERIALIZED VIEW pulsus.") else {
+                continue;
+            };
+            let head_line = head.lines().next().expect("a view has a head line");
+            let name = head_line
                 .split_whitespace()
                 .next()
-                .expect("a table follows FROM")
-                .trim_end_matches(';')
+                .expect("the view's name")
                 .to_string();
-            own.push(table);
-        }
-        // `merge('pulsus', '^<table>$')`: one table, read when the query
-        // reaches it.
-        let mut merged: Vec<String> = Vec::new();
-        for (at, _) in stmt.match_indices("merge('pulsus', '^") {
-            let table = stmt[at + "merge('pulsus', '^".len()..]
-                .split_once("$')")
-                .expect("a merge() source ends with $')")
-                .0
+            let target = head_line
+                .split_once(" TO pulsus.")
+                .expect("a view names its target on its head line")
+                .1
+                .trim()
                 .to_string();
-            merged.push(table);
-        }
-        assert!(
-            !own.is_empty() || !merged.is_empty(),
-            "a view that names no source: {stmt}"
-        );
-        if head_line.contains(" REFRESH EVERY ") {
-            own.sort();
-            own.dedup();
-            merged.sort();
-            merged.dedup();
-            refreshable.push((name, target, own, merged));
-        } else {
+            targets.push(target.clone());
+            // Every `FROM`, not just the first: a view with a subquery has
+            // more than one, and each is a source. A clustered
+            // `clusterAllReplicas('<cluster>', pulsus.<table>)` names
+            // `<table>`.
+            let mut own: Vec<String> = Vec::new();
+            for marker in ["FROM pulsus.", "clusterAllReplicas('prod', pulsus."] {
+                for (at, _) in stmt.match_indices(marker) {
+                    let table = stmt[at + marker.len()..]
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .next()
+                        .expect("a table follows FROM")
+                        .to_string();
+                    own.push(table);
+                }
+            }
+            // `merge('pulsus', '^<table>$')`: one table, read when the query
+            // reaches it.
+            let mut merged: Vec<String> = Vec::new();
+            for (at, _) in stmt.match_indices("merge('pulsus', '^") {
+                let table = stmt[at + "merge('pulsus', '^".len()..]
+                    .split_once("$')")
+                    .expect("a merge() source ends with $')")
+                    .0
+                    .to_string();
+                merged.push(table);
+            }
             assert!(
-                merged.is_empty(),
-                "an insert-triggered view reads through merge(): {stmt}"
+                !own.is_empty() || !merged.is_empty(),
+                "a view that names no source: {stmt}"
             );
-            sources.extend(own);
+            if head_line.contains(" REFRESH EVERY ") {
+                own.sort();
+                own.dedup();
+                merged.sort();
+                merged.dedup();
+                refreshable.push((name, target, own, merged));
+            } else {
+                assert!(
+                    merged.is_empty(),
+                    "an insert-triggered view reads through merge(): {stmt}"
+                );
+                sources.extend(own);
+            }
         }
-    }
-    assert_eq!(targets.len(), 22, "twenty-two views");
-    assert_eq!(
-        refreshable,
-        vec![(
-            "service_edges_mv".to_string(),
-            "service_edges".to_string(),
-            Vec::<String>::new(),
-            vec!["service_edges".to_string(), "spans".to_string()],
-        )],
-        "the one refreshable view, its target, its direct sources (none) and \
-         its sources read through merge()"
-    );
-    let mut distinct: Vec<String> = sources.clone();
-    distinct.sort();
-    distinct.dedup();
-    assert_eq!(
-        distinct,
-        vec!["log_landing", "metric_landing", "trace_landing"],
-        "an insert-triggered view reads a table outside the pinned source set"
-    );
-    for source in &sources {
-        assert!(
-            !targets.contains(source),
-            "a view reads {source}, which another view writes: every row \
-             would be counted twice"
+        assert_eq!(targets.len(), 24, "{variant:?}: twenty-four views");
+        refreshable.sort();
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            refreshable,
+            vec![
+                (
+                    "metric_rollup_mv".to_string(),
+                    "metric_rollup".to_string(),
+                    strings(&[
+                        "metric_hist_samples",
+                        "metric_rollup_plan",
+                        "metric_samples"
+                    ]),
+                    Vec::<String>::new(),
+                ),
+                (
+                    "metric_rollup_plan_mv".to_string(),
+                    "metric_rollup_plan".to_string(),
+                    strings(&["metric_rollup"]),
+                    Vec::<String>::new(),
+                ),
+                (
+                    "service_edges_mv".to_string(),
+                    "service_edges".to_string(),
+                    Vec::<String>::new(),
+                    strings(&["service_edges", "spans"]),
+                ),
+            ],
+            "{variant:?}: the three refreshable views, their targets, their direct \
+             sources and their sources read through merge()"
         );
+        let mut distinct: Vec<String> = sources.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct,
+            vec!["log_landing", "metric_landing", "trace_landing"],
+            "{variant:?}: an insert-triggered view reads a table outside the pinned source set"
+        );
+        for source in &sources {
+            assert!(
+                !targets.contains(source),
+                "a view reads {source}, which another view writes: every row \
+                 would be counted twice"
+            );
+        }
     }
 }
 
@@ -1922,6 +2041,14 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
         None,
     ),
     (
+        "metric_rollup",
+        Some("TTL toDateTime(least(intDiv(expires_ms, 1000), 4294967295))"),
+        true,
+        None,
+    ),
+    // One row per replica, replaced by each planning refresh (issue #18).
+    ("metric_rollup_plan", None, false, None),
+    (
         "metric_samples",
         Some("TTL toDateTime(least(intDiv(unix_milli, 1000) + (17 * 86400), 4294967295))"),
         true,
@@ -2026,6 +2153,7 @@ fn every_day_partition_is_a_utc_day() {
         assert_eq!(
             by_form,
             vec![
+                "PARTITION BY (res, toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC'))",
                 "PARTITION BY day",
                 "PARTITION BY month",
                 "PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC')",
@@ -2220,4 +2348,234 @@ fn the_documented_expiry_table_names_every_table() {
         .collect();
     want.sort();
     assert_eq!(documented, want, "docs/configuration.md §7's expiry rows");
+}
+
+/// The unrendered statement in `schema/schema.sql` that begins on the line
+/// holding `needle`, both variants' lines included. It ends at the first
+/// line ending in `;` that is not a `--@single` line: a statement whose
+/// last line differs by variant carries the single-node line first.
+fn unrendered_statement(needle: &str) -> String {
+    let mut lines = SCHEMA_SQL.lines().skip_while(|l| !l.contains(needle));
+    let mut out = String::new();
+    for line in lines.by_ref() {
+        out.push_str(line);
+        out.push('\n');
+        if line.ends_with(';') && !line.starts_with("--@single") {
+            return out;
+        }
+    }
+    assert!(!out.is_empty(), "no line in the file holds {needle}");
+    panic!("the statement holding {needle} never ends");
+}
+
+/// **Issue #18: a rollup tier is kept no longer than raw.** Its expiry
+/// comes from `{{retention_days}}` alone: the table expires on
+/// `expires_ms`, which the view writes as the day's start plus the
+/// retention; the planner's candidate days come from the same token; and
+/// no other `_days` token or `PULSUS_ROLLUP_*` setting exists. The view also carries the four settings that make each refresh
+/// one block per partition, and, clustered, refuses a stale replica.
+#[test]
+fn the_rollup_expires_with_raw_retention_and_has_no_retention_of_its_own() {
+    for base in [single(), clustered()] {
+        let ctx = RenderCtx {
+            retention_days: 37,
+            ..base.clone()
+        };
+        let head = if ctx.cluster.is_some() {
+            "CREATE TABLE IF NOT EXISTS pulsus.metric_rollup ON CLUSTER 'prod'\n"
+        } else {
+            "CREATE TABLE IF NOT EXISTS pulsus.metric_rollup\n"
+        };
+        let table = statement_starting(&ctx, head);
+        assert!(
+            table
+                .lines()
+                .any(|l| l == "TTL toDateTime(least(intDiv(expires_ms, 1000), 4294967295))"),
+            "{:?}: the rollup's TTL line: {table}",
+            ctx.cluster
+        );
+        let view = statement_starting(&ctx, "CREATE MATERIALIZED VIEW pulsus.metric_rollup_mv");
+        assert!(
+            view.contains("37 * 86400000 AS ret_ms"),
+            "{:?}: the view's expiry takes the configured retention",
+            ctx.cluster
+        );
+        let plan = statement_starting(
+            &ctx,
+            "CREATE MATERIALIZED VIEW pulsus.metric_rollup_plan_mv",
+        );
+        // Every literal count of days in either view is the retention.
+        for (what, text, at_least) in [("planner", &plan, 2), ("derivation", &view, 1)] {
+            let days: Vec<&str> = text
+                .match_indices(" * 86400000")
+                .map(|(at, _)| {
+                    let before = &text[..at];
+                    let start = before
+                        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                        .map_or(0, |i| i + 1);
+                    &before[start..]
+                })
+                .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+                .collect();
+            assert!(
+                days.len() >= at_least && days.iter().all(|d| *d == "37"),
+                "{:?}: the {what}'s day counts are the retention: {days:?}",
+                ctx.cluster
+            );
+        }
+        for pin in [
+            "max_insert_threads = 1",
+            "max_insert_block_size = 100000000",
+            "min_insert_block_size_rows = 100000000",
+            "min_insert_block_size_bytes = 10000000000",
+        ] {
+            assert!(
+                view.contains(pin),
+                "{:?}: the view lacks the block pin {pin}",
+                ctx.cluster
+            );
+        }
+        assert_eq!(
+            view.contains("fallback_to_stale_replicas_for_distributed_queries = 0"),
+            ctx.cluster.is_some(),
+            "a clustered refresh refuses a stale replica"
+        );
+    }
+
+    for needle in [
+        "CREATE TABLE IF NOT EXISTS {{db}}.metric_rollup{{on_cluster}}",
+        "CREATE MATERIALIZED VIEW {{db}}.metric_rollup_plan_mv",
+        "CREATE MATERIALIZED VIEW {{db}}.metric_rollup_mv",
+    ] {
+        let stmt = unrendered_statement(needle);
+        let mut days: Vec<&str> = stmt
+            .match_indices("{{")
+            .filter_map(|(at, _)| {
+                let rest = &stmt[at..];
+                let end = rest.find("}}")? + 2;
+                Some(&rest[..end])
+            })
+            .filter(|t| t.ends_with("_days}}"))
+            .collect();
+        days.sort();
+        days.dedup();
+        let want: Vec<&str> = if needle.contains("_mv") {
+            vec!["{{retention_days}}"]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            days, want,
+            "the only retention a rollup statement names is raw's: {needle}"
+        );
+    }
+
+    let script = std::fs::read_to_string(repo_root().join("schema/schema.sh")).unwrap();
+    assert!(
+        !script.contains("PULSUS_ROLLUP_"),
+        "the rollup has no setting of its own"
+    );
+}
+
+/// **Issue #18: the rollup refreshes once a minute, on small granules.** An
+/// idle refresh reads the coverage rows of every rollup part, so both the
+/// cadence and the granule size set its standing cost.
+#[test]
+fn the_rollup_refreshes_every_minute_with_small_granules() {
+    let plan = statement_starting(
+        &single(),
+        "CREATE MATERIALIZED VIEW pulsus.metric_rollup_plan_mv",
+    );
+    assert_eq!(
+        plan.lines().next().unwrap(),
+        "CREATE MATERIALIZED VIEW pulsus.metric_rollup_plan_mv REFRESH EVERY 1 MINUTE TO pulsus.metric_rollup_plan",
+        "the planner's head line: it replaces its one row"
+    );
+    let view = statement_starting(
+        &single(),
+        "CREATE MATERIALIZED VIEW pulsus.metric_rollup_mv",
+    );
+    assert_eq!(
+        view.lines().next().unwrap(),
+        "CREATE MATERIALIZED VIEW pulsus.metric_rollup_mv REFRESH EVERY 1 MINUTE DEPENDS ON pulsus.metric_rollup_plan_mv APPEND TO pulsus.metric_rollup",
+        "the derivation's head line"
+    );
+    for (ctx, head) in [
+        (
+            single(),
+            "CREATE TABLE IF NOT EXISTS pulsus.metric_rollup\n",
+        ),
+        (
+            clustered(),
+            "CREATE TABLE IF NOT EXISTS pulsus.metric_rollup ON CLUSTER 'prod'\n",
+        ),
+    ] {
+        let table = statement_starting(&ctx, head);
+        let settings = table
+            .lines()
+            .find(|l| l.starts_with("SETTINGS "))
+            .unwrap_or_else(|| panic!("{:?}: the table has a SETTINGS line", ctx.cluster));
+        assert!(
+            settings.contains("index_granularity = 1024,"),
+            "{:?}: {settings}",
+            ctx.cluster
+        );
+    }
+}
+
+/// **Issue #18: the derivation reads its plan once.** The planning runs in
+/// `metric_rollup_plan_mv`; the derivation reads its one row with a single
+/// scalar subquery and plans nothing itself, because each reference to a
+/// planning alias re-analyses its scalar subqueries, and that analysis was
+/// the whole of an idle refresh's cost. Clustered, it reads every replica's
+/// local sample tables, so a sample any replica holds is read. It writes an
+/// empty day's coverage only when its own read finds no sample of that
+/// day. The planner's chunk divisor is guarded against a zero shard count.
+#[test]
+fn the_derivation_reads_its_plan_once() {
+    for base in [single(), clustered()] {
+        let variant = base.cluster.clone();
+        let view = statement_starting(&base, "CREATE MATERIALIZED VIEW pulsus.metric_rollup_mv");
+        assert_eq!(
+            view.matches("FROM pulsus.metric_rollup_plan)").count(),
+            1,
+            "{variant:?}: the plan is read once"
+        );
+        for absent in [
+            "system.parts",
+            "system.clusters",
+            "FROM pulsus.metric_rollup\n",
+        ] {
+            assert!(
+                !view.contains(absent),
+                "{variant:?}: the derivation plans nothing itself: {absent:?}"
+            );
+        }
+        assert!(
+            view.contains("arrayFilter(m -> NOT has(seen, m), empty_run)"),
+            "{variant:?}: an empty day is covered only when the derivation's own read finds it empty"
+        );
+        if variant.is_some() {
+            for table in ["metric_samples", "metric_hist_samples"] {
+                assert_eq!(
+                    view.matches(&format!("clusterAllReplicas('prod', pulsus.{table})"))
+                        .count(),
+                    2,
+                    "clustered: {table} is read from every replica, in the recheck and the chunk"
+                );
+                assert!(
+                    !view.contains(&format!("pulsus.{table}_dist")),
+                    "clustered: {table} is not read through its wrapper"
+                );
+            }
+        }
+        let plan = statement_starting(
+            &base,
+            "CREATE MATERIALIZED VIEW pulsus.metric_rollup_plan_mv",
+        );
+        assert!(
+            plan.contains("day_rows / toFloat64(greatest(n_shards, toUInt256(1))) / 20000000"),
+            "{variant:?}: the chunk divisor is guarded"
+        );
+    }
 }

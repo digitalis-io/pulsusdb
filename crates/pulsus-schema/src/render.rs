@@ -1,5 +1,5 @@
 //! Token substitution for `schema/schema.sql`: explicit `{{token}}` string
-//! replacement, eighteen names and nothing else.
+//! replacement, nineteen names and nothing else.
 //!
 //! **Double braces, always.** ClickHouse's own `{shard}` and `{replica}`
 //! macros are single-brace and must survive verbatim into `Replicated*`
@@ -70,12 +70,20 @@ pub struct RenderCtx {
     /// service-graph job may read. Not a setting: production renders
     /// [`GRAPH_JOB_MAX_ROWS`], and a test lowers it to make a run fail.
     pub graph_job_max_rows: u64,
+    /// `{{rollup_settle_ms}}` (issue #18): the time after a UTC day ends
+    /// before `metric_rollup_mv` derives it. Not a setting: production
+    /// renders [`ROLLUP_SETTLE_MS`], and a test may render another value.
+    pub rollup_settle_ms: u64,
 }
 
 /// The rows one run of the service-graph job may read (issue #599), the
 /// value `schema/schema.sh` renders: three 5-minute buckets of spans at
 /// about 67,000 spans a second on one shard.
 pub const GRAPH_JOB_MAX_ROWS: u64 = 60_000_000;
+
+/// The time after a UTC day ends before `metric_rollup_mv` derives it
+/// (issue #18), the value `schema/schema.sh` renders: two hours.
+pub const ROLLUP_SETTLE_MS: u64 = 7_200_000;
 
 impl RenderCtx {
     /// A context for a test: `db` and `retention_days` as given, every other
@@ -103,6 +111,7 @@ impl RenderCtx {
             trace_dedup_window: 10_000,
             trace_indexed_attributes: Vec::new(),
             graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
+            rollup_settle_ms: ROLLUP_SETTLE_MS,
         }
     }
 }
@@ -134,7 +143,7 @@ pub fn rollup_suffix(d: Duration) -> String {
 /// ClickHouse's own single-brace `{shard}`/`{replica}` macros — they are
 /// simply absent from double-brace matching.
 ///
-/// `schema.sh` carries the same list as seventeen `sed` expressions and an
+/// `schema.sh` carries the same list as eighteen `sed` expressions and an
 /// `awk` step;
 /// `the_script_renders_exactly_what_this_crate_renders` holds the two
 /// together.
@@ -187,6 +196,7 @@ pub(crate) fn substitute_tokens(tmpl: &str, ctx: &RenderCtx) -> String {
             "{{graph_job_max_rows}}",
             &ctx.graph_job_max_rows.to_string(),
         )
+        .replace("{{rollup_settle_ms}}", &ctx.rollup_settle_ms.to_string())
         .replace("{{storage_policy}}", &storage_policy)
         .replace("{{trace_attr_indexes}}", &trace_attr_indexes(ctx))
 }
@@ -265,6 +275,7 @@ mod tests {
             trace_dedup_window: 10_000,
             trace_indexed_attributes: Vec::new(),
             graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
+            rollup_settle_ms: ROLLUP_SETTLE_MS,
         }
     }
 

@@ -1090,6 +1090,7 @@ async fn the_sample_tables_fingerprint_codec_is_zstd() {
         ("metric_label_index", "CODEC(ZSTD(1))"),
         ("metric_labels", "CODEC(Delta(8), ZSTD(1))"),
         ("metric_landing", "CODEC(Delta(8), ZSTD(1))"),
+        ("metric_rollup", "CODEC(ZSTD(1))"),
         ("metric_samples", "CODEC(ZSTD(1))"),
         ("metric_series", "CODEC(ZSTD(1))"),
     ]

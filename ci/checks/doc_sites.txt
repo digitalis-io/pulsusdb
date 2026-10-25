@@ -59,7 +59,10 @@ rewrite docs/schemas.md:33-33
 # `docs/schemas.md:691-692` row for the same reason.
 # Issue #738 adds #738, its own issue, where the trace tables' column and
 # views, and the trace read paths, carry the tenant.
-rewrite docs/schemas.md:174-174 refs=#25,#603,#16,#171,#498,#2,#57,#584,#586,#587,#63,#75,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#235,#3,#450,#624,#412,#398,#653,#4,#602,#614,#131,#137,#598,#597,#599,#501,#601,#738
+# Issue #18 part 1 adds #18, its own issue, where the banner, the
+# downsampling section and the metrics sharding row describe the rollup
+# table and its view.
+rewrite docs/schemas.md:174-174 refs=#25,#603,#16,#171,#498,#2,#57,#584,#586,#587,#63,#75,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#235,#3,#450,#624,#412,#398,#653,#4,#602,#614,#131,#137,#598,#597,#599,#501,#601,#738,#18
 # `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
 # writer-contract paragraph gained the reason the read path does not route on
 # `metric_series.value_type`, and that reason is the decision A1's plan v5
@@ -141,7 +144,9 @@ leave docs/traceql-schema-migration.md:2289-2289
 # Issue #602 part 3b-1 drops #134, #139, #9 and #167 from this column: they
 # were on the registration-backfill bullet and its residuals, which are gone
 # with the backfill.
-rewrite docs/architecture.md:337-340 refs=#603,#498,#16,#25,#586,#584,#587,#478,#555,#461,#623
+# Issue #18 part 1 adds #18, its own issue, where the metrics family's
+# sharding bullet says how the rollup view reads and writes its slice.
+rewrite docs/architecture.md:337-340 refs=#603,#498,#16,#25,#586,#584,#587,#478,#555,#461,#623,#18
 rewrite docs/architecture.md:342-342
 rewrite docs/architecture.md:196-196
 leave docs/configuration.md:126-126
