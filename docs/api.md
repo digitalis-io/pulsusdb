@@ -23,7 +23,7 @@ Conventions:
 | `X-Pulsus-Database` | ingest + query | route to an alternate ClickHouse database (retention is per-database configuration; there is no per-write TTL override in v1) |
 | `X-Pulsus-Async` | ingest | `1` = enqueue and return `202`; `0` = confirm flush (default from config) |
 | `X-Scope-OrgID` | log, metric and trace ingest and query | the tenant (issues #635, #653, #738). No header is the empty tenant, the single-tenant deployment; 1 to 150 bytes of `[A-Za-z0-9_.-]` is that tenant; an empty value, a longer one, any other byte, or the header given twice is `400` (`invalid X-Scope-OrgID`), read before any other parameter, and nothing is stored or read. Every write stores the tenant and every read answers that tenant's rows alone; a trace id stored only under another tenant is absent to this one |
-| `X-Pulsus-Explain` | query | `1` = include generated SQL, plan, and `exactness`, which is always `raw-exact`, in the response envelope |
+| `X-Pulsus-Explain` | query | `1` = include generated SQL, plan, and `exactness` in the response envelope. `exactness` is `"raw-exact"`, or `"rollup"` when a rollup level served part of a selector (§3.6) |
 | `X-Loki-Response-Encoding-Flags` | log query (`query`, `query_range`, `tail`) | comma-separated encoding flags. `categorize-labels` switches the `streams` result to the three-element `values` shape — see §2.1. Unknown flags are echoed back and change nothing. Absent, the response is exactly what it was before the header existed |
 | `Idempotency-Key` | log, metric and trace ingest | issue #494, extended to the trace push by issue #586. Namespaces a push's identity: two requests with **different** keys are two pushes whatever they carry, and the same key with the same content is one push. The same key carrying **different** content is a client error — `400`, and nothing is stored. Absent, a push is identified by its own content. Two tenants' identical log, metric or trace pushes, with or without one key, are two pushes. Read on every ingest route, `/v1/traces` and the Zipkin receiver included |
 | `Retry-Attempt` | log, metric and trace ingest | issue #494, extended to the trace push by issue #586. The attempt number, `1` upward. **Never a suppression key** — there is nothing stored to match a bare marker against, and suppressing on one would drop a push with no record of having accepted it. It sets the `declared` label on `pulsus_ingest_duplicate_pushes_total` and nothing else |
@@ -904,7 +904,7 @@ For a historical window (outside the resident label cache's `PULSUS_CACHE_WINDOW
 GET /api/v1/status/buildinfo     → version, revision, build metadata
 GET /api/v1/status/config        → effective config (redacted), Prometheus envelope
 GET /api/v1/status/flags         → static-equivalent flag map
-GET /api/v1/status/runtimeinfo   → process start time, storage retention (`<N>d`, the retention the database states; `503` until read)
+GET /api/v1/status/runtimeinfo   → process start time, storage retention (`<N>d`, the retention the database states; `503` until read), and `rollupLevels`, the rollup levels the database holds, smallest first, as durations (`["1m","12m","2h","1d"]` by default; `[]` when none or not yet read)
 GET /api/v1/status/tsdb          ?limit=   → numSeries, top metrics by cardinality
 ```
 
@@ -957,6 +957,61 @@ A 2 MiB `DefaultBodyLimit` (axum's default; nothing in this workspace calls `Def
 **Every figure above is this toolchain, target and profile** (release, 2 MiB stack); a compiler change moves all of them.
 
 **So:** this cap closes every *width* vector — the flat chains this issue was filed for, including the 4,881-byte `GET` — because those parse iteratively and the guard runs on the finished tree. It does not close deep grammar nesting, which aborts inside the parser before any after-parse guard exists to run. That residual is pre-existing, is not introduced by this change, and is closed only by converting the parser's grammar recursion.
+
+
+### 3.6 Rollup levels
+
+The database holds the metric samples at full resolution and, beside them, one rollup table per level of `PULSUS_ROLLUP_LEVELS` (`60,720,7200,86400` seconds by default; [docs/configuration.md §7](configuration.md#7-retention-schemaschemash)). Each level keeps one row per series and bucket: the last value and its time, the minimum, maximum, sum and count of the values, and the counter increase within the bucket. The server reads the list of levels from the database every 60 s; `/api/v1/status/runtimeinfo` reports it as `rollupLevels`.
+
+**When a level is used.** A selector reads a level when all of these hold:
+
+- the function reading it is one of: an instant selector, `last_over_time`, `timestamp`, `present_over_time`, `absent_over_time`, `max_over_time`, `min_over_time`, `sum_over_time`, `avg_over_time`, `rate`, `increase`; every other function reads raw samples;
+- for a selector without `@`: the query's step is a multiple of the level, and the query's start minus the selector's `offset` is a multiple of the level (an instant query needs only the second);
+- for a selector with `@ t`, which is evaluated once: `t` minus the selector's `offset` is a multiple of the level, whatever the step;
+- for a range function: the range is a multiple of the level, and at least five times the level for `rate` and `increase`, at least once the level for the others;
+- the selector is not inside a subquery, is not `anchored` or `smoothed`, is not the metadata selector of `info()`, and is not under `histogram_count`, `histogram_sum` or `histogram_avg`;
+- the selector names its metric, and carries no `__name__` matcher beside that name (`=~`, `!~`, `!=`, or a second `=`);
+- the label cache is warm and answers the selector's series.
+
+The largest level that meets all of them is used; if none does, the selector reads raw samples, with the same answer as before rollups. Native-histogram samples are always read raw, beside the level's rows for a metric's float series.
+
+**What the answer is.** The engine evaluates the function unchanged over values built from one column of the level:
+
+| function | value | at |
+|---|---|---|
+| instant selector, `last_over_time`, `timestamp`, `present_over_time`, `absent_over_time` | `last` | the time of that last sample |
+| `max_over_time`, `min_over_time`, `sum_over_time` | `max`, `min`, `sum` | the bucket's end |
+| `avg_over_time` | `sum / count` | the bucket's end |
+| `rate`, `increase` | a counter that never resets: the first row's `last`, then plus each later row's increase; at levels of 12 minutes and more each row also gives a point one millisecond after its bucket's start, valued before that row's increase | the time of the last sample |
+
+The first group, `max_over_time` and `min_over_time` answer exactly as raw. `sum_over_time` differs from raw only in the order of addition. For `avg_over_time`, `rate` and `increase`, measured on a 15 s scrape over 8 days, the 99th percentile of the relative distance from the raw answer is at most:
+
+| function, series | 1 m | 12 m | 2 h | 1 d |
+|---|---|---|---|---|
+| `sum_over_time` | 1e-12 | 1e-12 | 1e-12 | 1e-12 |
+| `avg_over_time`, gauges | 0.0057 | 0.0214 | 0.0214 | 0.0214 |
+| `rate`, `increase`, counters | 0.0218 | 0.00828 | 0.000826 | 0.0000684 |
+| counters that reset every second sample | 0.2 | 0.00826 | 0.000822 | 0.0000686 |
+| counters that stop | 0.0218 | 0.141 | 1.0 | 1.0 |
+| counters missing 30 % of their scrapes | 0.42 | 0.049 | 0.00494 | 0.000368 |
+
+A window that holds the stop of a counter is about half off at the coarse levels; that is what the stopping counters' figures record. `avg_over_time` is further off for series whose samples sit on the edges of the buckets, where jitter moves them between buckets and the number of samples per bucket varies: with every sample on an edge, the 99th percentile measured 0.358 at 1 m, 0.595 at 12 m, 0.0557 at 2 h and 0.0246 at 1 d.
+
+At a level under 12 minutes, a `rate` or `increase` window that reaches into time no level covers is computed from the raw samples, exactly as without rollups, native-histogram samples included.
+
+A counter whose previous sample is more than 24 hours (86,400,000 ms) before its next one starts a new count at that sample: the step between the two is not counted by any level.
+
+**Freshness.** The newest part of every window comes from the finer levels and then from raw samples, so a refreshing panel shows the newest samples. A level's coverage is the time its builds have completed on every shard; anything else, holes included, is read from a finer level or raw.
+
+**How to choose.** Set the panel's minimum interval, or the data source's minimum step, to a level (`1m`, `12m`, `2h`, `1d` by default), and use ranges that are multiples of it. A dashboard that aligns its start to the step meets the start condition whenever the step is a multiple of the level. `rate(x[5m])` at a 12 m step reads the 1 m level, `rate(x[1h])` at a 12 m step the 12 m level. For 7 days of one series at a 15 s scrape, on one node, with the levels up to date:
+
+| dashboard | step sent | level read | rows read |
+|---|---|---|---|
+| 7-day panel, automatic step | 10 min (600 s): a multiple of 60 s, not of 720 s | 1 m | at most 10,080 rows of the 1 m level, then at most 18 raw samples |
+| the same, panel minimum interval set to 12 m | 12 min | 12 m | at most 840 rows of the 12 m level, at most 12 rows of the 1 m level, at most 18 raw samples |
+| 7-day panel, step 90 s | 90 s: not a multiple of any level | raw | 40,320 raw samples |
+
+**Explain.** With `X-Pulsus-Explain: 1`, a routed selector has a stage `rollup_route` naming the level's table, the function's use, the step and the range, and one stage `rollup_piece` per interval served, in time order, each with its statement and a note naming the table and column, or `raw`, and the interval (`metric_samples_720s.max served (lo, hi]`, `raw (lo, hi]`). `exactness` is `"rollup"` when a level served part of a selector; a route that read only raw samples, or only native histograms, is `"raw-exact"`.
 
 ---
 
