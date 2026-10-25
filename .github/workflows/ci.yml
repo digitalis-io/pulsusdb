@@ -2415,8 +2415,8 @@ jobs:
           schema/schema.sh
           catalogue > /tmp/schema-first.tsv
           objects=$(wc -l < /tmp/schema-first.tsv)
-          if [ "$objects" -ne 47 ]; then
-            echo "::error::expected 47 objects in the single-node schema, got $objects"
+          if [ "$objects" -ne 51 ]; then
+            echo "::error::expected 51 objects in the single-node schema, got $objects"
             cut -f1 /tmp/schema-first.tsv
             exit 1
           fi
