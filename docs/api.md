@@ -995,7 +995,7 @@ The first group, `max_over_time` and `min_over_time` answer exactly as raw. `sum
 | counters that stop | 0.0218 | 0.141 | 1.0 | 1.0 |
 | counters missing 30 % of their scrapes | 0.42 | 0.049 | 0.00494 | 0.000368 |
 
-A window that holds the stop of a counter is about half off at the coarse levels; that is what the stopping counters' figures record. `avg_over_time` is further off for series whose samples sit on the edges of the buckets, where jitter moves them between buckets and the number of samples per bucket varies: with every sample on an edge, the 99th percentile measured 0.358 at 1 m, 0.595 at 12 m, 0.0557 at 2 h and 0.0246 at 1 d.
+A window that holds the stop of a counter is about half off at the coarse levels; that is what the stopping counters' figures record. For a counter that stopped or went stale within the newest window, a `rate` or `increase` answered from the 12 m or a coarser level can differ from raw by up to about 3 % (measured 3.08 %) at steps just after the level's newest built bucket; counters that keep counting are unaffected. `avg_over_time` is further off for series whose samples sit on the edges of the buckets, where jitter moves them between buckets and the number of samples per bucket varies: with every sample on an edge, the 99th percentile measured 0.358 at 1 m, 0.595 at 12 m, 0.0557 at 2 h and 0.0246 at 1 d.
 
 At a level under 12 minutes, a `rate` or `increase` window that reaches into time no level covers is computed from the raw samples, exactly as without rollups, native-histogram samples included.
 

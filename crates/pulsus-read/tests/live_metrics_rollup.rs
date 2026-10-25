@@ -818,6 +818,11 @@ async fn a_window_reads_the_finer_levels_and_raw_after_its_level() {
     built.finish().await;
 }
 
+/// B4 (iii): the per-step distance a stopped or stale counter may read
+/// at 720 s and coarser, twice the 0.0308 measured (owner decision,
+/// 2026-10-25).
+const STOPPED_STEP_ALLOWANCE_720S: f64 = 2.0 * 0.0308;
+
 /// Corpus D's sample time of series `s`, sample `i` (plan section 9).
 fn t_of(day0: i64, s: i64, i: i64) -> i64 {
     day0 + 15_000 * i + 100 + (7919 * s) % 14_800 + (7 * s + 13 * i) % 201 - 100
@@ -1092,10 +1097,17 @@ async fn a_window_touching_raw_is_raw() {
                 "B4 (iii) {query} step W{:+}s: d {now:e}, with the level uncut {before:e}",
                 (key.1 - w) / 1000
             );
-            if now > before + 0.0218 {
+            // Owner decision, 2026-10-25 ("Accept, set limit"): rollups are
+            // approximate, so a stopped or stale counter at 720 s and
+            // coarser may read up to twice the measured 0.0308 (step
+            // W+36m, stale counter) on the per-step distance, the plan's
+            // bound rule; the rule above it, the uncut distance plus
+            // 0.0218, still holds wherever it is the larger.
+            if now > (before + 0.0218).max(STOPPED_STEP_ALLOWANCE_720S) {
                 over.push(format!(
-                    "(iii) {query} step W{:+}s: d {now} against {before} with the level uncut",
-                    (key.1 - w) / 1000
+                    "(iii) {query} step W{:+}s: d {now} against {before} with the level uncut, allowance {}",
+                    (key.1 - w) / 1000,
+                    (before + 0.0218).max(STOPPED_STEP_ALLOWANCE_720S)
                 ));
             }
         }
