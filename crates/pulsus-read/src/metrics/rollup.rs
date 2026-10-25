@@ -557,7 +557,7 @@ mod tests {
     }
 
     fn selectors(query: &str, p: &PlanParams) -> Vec<SelectorSpec> {
-        plan(&parse(query).unwrap(), p.clone()).unwrap().selectors
+        plan(&parse(query).unwrap(), *p).unwrap().selectors
     }
 
     /// The level each selector of `query` reads, in milliseconds.

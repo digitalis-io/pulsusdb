@@ -969,6 +969,27 @@ impl MetricsEngine {
                 }
             }
 
+            // Issue #18 part B: a selector a rollup level can serve reads
+            // it, decided before the pushdown, so a routed selector is
+            // never pushed down.
+            if let Some(levels) = self.rollup_levels.as_ref().and_then(|slot| slot.get())
+                && super::rollup::eligible(sel, &resolution)
+                && let Some(route) = super::rollup::route(sel, &plan_params, &levels)
+                && let LabelledResolution::Series(pairs) = resolution
+            {
+                fetch_plans.push(self.rollup_fetch_plan(
+                    tenant,
+                    sel,
+                    route,
+                    levels,
+                    pairs,
+                    (lower_excl, upper_incl),
+                    &plan_params,
+                    explain.as_deref_mut(),
+                ));
+                continue;
+            }
+
             // Issues #549 and #579: the pushed node, decided on the SAME
             // resolution the declining path then consumes — `members_of`
             // borrows it, so there is no clone and no second resolve.
@@ -1094,7 +1115,16 @@ impl MetricsEngine {
 
         let mut data = SeriesData::new();
         for (sel, series) in plan.selectors.iter().zip(fetched) {
-            data.insert(sel.id, series?);
+            let (series, trace) = series?;
+            // Issue #18 part B: a routed selector's pieces, from its first
+            // chunk, and whether a level served any of it.
+            if let (Some(trace), Some(e)) = (trace, explain.as_mut()) {
+                for (sql, note) in trace.stages {
+                    e.push("rollup_piece", sql, Some(note));
+                }
+                e.rollup |= trace.served_from_level;
+            }
+            data.insert(sel.id, series);
         }
 
         // F6: a shape-A statement whose sentinel row counts a histogram
@@ -1155,7 +1185,7 @@ impl MetricsEngine {
                 other => kept.push(other),
             }
         }
-        let refetched: Vec<Result<Vec<FetchedSeries>, ReadError>> =
+        let refetched: Vec<Result<FetchedWithTrace, ReadError>> =
             join_all(fallbacks.iter_mut().map(|(selector, fallback)| {
                 let fetch_plan = std::mem::replace(fallback, SelectorFetchPlan::Empty);
                 self.execute_fetch_plan(
@@ -1167,7 +1197,7 @@ impl MetricsEngine {
             }))
             .await;
         for ((selector, _), series) in fallbacks.into_iter().zip(refetched) {
-            data.insert(selector, series?);
+            data.insert(selector, series?.0);
         }
         if !kept.is_empty() {
             for (self_pos, node) in nodes_offloaded(&self.eval_gate, kept).await? {
@@ -1846,7 +1876,7 @@ impl MetricsEngine {
         sel: &SelectorSpec,
         fetch_plan: SelectorFetchPlan,
         budget: &SampleBudget,
-    ) -> Result<Vec<FetchedSeries>, ReadError> {
+    ) -> Result<FetchedWithTrace, ReadError> {
         // Issue #135 TEST SEAM: when a probe is installed, park here until
         // released — proving (via `FetchProbe::max_in_flight`) that
         // `query_inner`'s `join_all` (:524-529) truly dispatches every
@@ -1856,15 +1886,18 @@ impl MetricsEngine {
             Some(p) => Some(p.enter().await),
             None => None,
         };
-        match fetch_plan {
+        let series = match fetch_plan {
             SelectorFetchPlan::Empty => Ok(Vec::new()),
+            SelectorFetchPlan::Rollup(plan) => {
+                return self.fetch_rollup(tenant, sel, *plan, budget).await;
+            }
             SelectorFetchPlan::Chunks {
                 sqls,
                 hist_sqls,
                 labels_by_fp,
             } => {
                 if sqls.is_empty() && hist_sqls.is_empty() {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), None));
                 }
                 let metric_name = concrete_name(sel)?;
                 // M7-A5a: dispatch the float and complementary histogram
@@ -1923,7 +1956,7 @@ impl MetricsEngine {
                     )
                     .await?;
                 if rows.is_empty() && hist_rows.is_empty() {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), None));
                 }
                 // Hydrate labels over the ID statement both reads used
                 // (issue #579 part 3, D2), so every fingerprint either read
@@ -1983,7 +2016,227 @@ impl MetricsEngine {
                 });
                 Ok(series)
             }
+        };
+        series.map(|s| (s, None))
+    }
+
+    /// Issue #18 part B: a routed selector's fetch plan, and its
+    /// `rollup_route` explain stage.
+    #[allow(clippy::too_many_arguments)]
+    fn rollup_fetch_plan(
+        &self,
+        tenant: &Tenant,
+        sel: &SelectorSpec,
+        route: super::rollup::Route,
+        levels: std::sync::Arc<super::rollup::Levels>,
+        pairs: Vec<(Fingerprint, LabelSet)>,
+        window: (i64, i64),
+        p: &pulsus_promql::PlanParams,
+        explain: Option<&mut PlanExplain>,
+    ) -> SelectorFetchPlan {
+        let labels_by_fp: HashMap<Fingerprint, LabelSet> = pairs.iter().cloned().collect();
+        let mut fps: Vec<Fingerprint> = pairs.into_iter().map(|(fp, _)| fp).collect();
+        fps.sort_unstable();
+        let hist_sqls = build_hist_chunk_sqls(
+            tenant,
+            &self.config.hist_samples_table,
+            fps.clone(),
+            window.0,
+            window.1,
+        );
+        if let Some(e) = explain {
+            let range = sel
+                .range_ms
+                .map_or_else(|| "none".to_string(), super::rollup::duration_text);
+            e.push(
+                "rollup_route",
+                String::new(),
+                Some(format!(
+                    "{}, use {:?}, step {}, range {range}",
+                    route.table,
+                    route.use_,
+                    super::rollup::duration_text(p.step_ms)
+                )),
+            );
+            if let Some(first) = hist_sqls.first() {
+                e.push("hist_sample_fetch", first.clone(), None);
+            }
         }
+        SelectorFetchPlan::Rollup(Box::new(RollupFetch {
+            route,
+            levels,
+            fps,
+            labels_by_fp,
+            hist_sqls,
+            window,
+        }))
+    }
+
+    /// Issue #18 part B: plan section 4 for every fingerprint chunk,
+    /// concurrently, beside the selector's histogram reads.
+    async fn fetch_rollup(
+        &self,
+        tenant: &Tenant,
+        sel: &SelectorSpec,
+        plan: RollupFetch,
+        budget: &SampleBudget,
+    ) -> Result<FetchedWithTrace, ReadError> {
+        let metric_name = concrete_name(sel)?;
+        let literals = sql_literals(&plan.fps);
+        let chunks = sample_sql::chunk_fingerprints(&literals, sample_sql::CHUNK_THRESHOLD);
+        let (floats, hist_rows) = join(
+            join_all(
+                chunks
+                    .iter()
+                    .map(|chunk| self.rollup_chunk(tenant, &plan, chunk, budget)),
+            ),
+            fetch_all_concurrently(plan.hist_sqls.clone(), |sql| {
+                self.fetch_sample_rows::<HistSampleRow>(sql, budget)
+            }),
+        )
+        .await;
+        let mut rows = Vec::new();
+        let mut trace = RollupTrace {
+            stages: Vec::new(),
+            served_from_level: false,
+        };
+        for (i, chunk) in floats.into_iter().enumerate() {
+            let mut chunk = chunk?;
+            trace.served_from_level |= chunk.served_from_level;
+            if i == 0 {
+                chunk.stages.sort_by_key(|(at, ..)| *at);
+                trace.stages = chunk
+                    .stages
+                    .into_iter()
+                    .map(|(_, sql, note)| (sql, note))
+                    .collect();
+            }
+            rows.append(&mut chunk.rows);
+        }
+        let series = group_merged_rows(rows, hist_rows?, &plan.labels_by_fp, metric_name)?;
+        Ok((series, Some(trace)))
+    }
+
+    /// Issue #18 part B: one fingerprint chunk of a routed selector. The
+    /// chosen level, then each finer level from coarsest to finest, then
+    /// raw, each over the hull of what is still not covered; each keeps
+    /// only what falls in its own coverage of that remainder (plan section
+    /// 4).
+    async fn rollup_chunk(
+        &self,
+        tenant: &Tenant,
+        plan: &RollupFetch,
+        fps: &[FpLiteral],
+        budget: &SampleBudget,
+    ) -> Result<RollupChunk, ReadError> {
+        use super::rollup::{
+            Piece, RunRow, column_of, contains, coverage, hull, intersect, level_fetch, subtract,
+        };
+        let use_ = plan.route.use_;
+        let mut todo = vec![plan.window];
+        let mut pieces: std::collections::BTreeMap<Fingerprint, Vec<Piece>> =
+            std::collections::BTreeMap::new();
+        let mut stages: Vec<(i64, String, String)> = Vec::new();
+        for level in plan.levels.levels[..=plan.route.level].iter().rev() {
+            let Some((a, b)) = hull(&todo) else { break };
+            let sql = level_fetch(tenant, &level.table, fps, a, b, self.config.distributed);
+            let rows = self.level_rows(sql.clone(), budget).await?;
+            let runs: Vec<RunRow> = rows
+                .iter()
+                .filter(|r| r.kind == 1)
+                .map(|r| RunRow {
+                    shard: r.shard,
+                    t_last: r.t_last,
+                    t_end: r.t_end,
+                })
+                .collect();
+            let covered = coverage(&runs, plan.levels.shards);
+            let served = intersect(&covered, &todo);
+            for row in rows {
+                if row.kind == 0 && contains(&served, row.t_end) {
+                    pieces
+                        .entry(row.fingerprint)
+                        .or_default()
+                        .push(Piece::Level {
+                            res_ms: level.res_ms,
+                            row,
+                        });
+                }
+            }
+            if served.is_empty() {
+                stages.push((a, sql.clone(), format!("{} served nothing", level.table)));
+            }
+            for (x, y) in &served {
+                stages.push((
+                    *x,
+                    sql.clone(),
+                    format!("{}.{} served ({x}, {y}]", level.table, column_of(use_)),
+                ));
+            }
+            todo = subtract(&todo, &covered);
+        }
+        if let Some((a, b)) = hull(&todo) {
+            let sql = sample_sql::sample_fetch(tenant, &self.config.samples_table, fps, a, b);
+            let raw: Vec<SampleRow> = self.fetch_sample_rows(sql.clone(), budget).await?;
+            for r in raw {
+                if contains(&todo, r.unix_milli) {
+                    pieces.entry(r.fingerprint).or_default().push(Piece::Raw {
+                        t_ms: r.unix_milli,
+                        v: r.value,
+                    });
+                }
+            }
+            for (x, y) in &todo {
+                stages.push((*x, sql.clone(), format!("raw ({x}, {y}]")));
+            }
+        }
+        let mut rows = Vec::new();
+        let mut served_from_level = false;
+        for (fingerprint, mut seq) in pieces {
+            seq.sort_by_key(Piece::at);
+            served_from_level |= seq.iter().any(|p| match p {
+                Piece::Level { row, .. } => {
+                    matches!(
+                        use_,
+                        pulsus_promql::RollupUse::Last | pulsus_promql::RollupUse::Counter
+                    ) || row.count > 0
+                }
+                Piece::Raw { .. } => false,
+            });
+            rows.extend(
+                super::rollup::pseudo_samples(use_, &seq)
+                    .into_iter()
+                    .map(|s| SampleRow {
+                        fingerprint,
+                        unix_milli: s.t_ms,
+                        value: s.v,
+                    }),
+            );
+        }
+        Ok(RollupChunk {
+            rows,
+            stages,
+            served_from_level,
+        })
+    }
+
+    /// Issue #18 part B: one level fetch's rows, charged to the query's
+    /// sample budget as they drain — or the answer hook's, when a test
+    /// installed one.
+    async fn level_rows(
+        &self,
+        sql: String,
+        budget: &SampleBudget,
+    ) -> Result<Vec<super::rollup::LevelRow>, ReadError> {
+        if let Some(hook) = &self.rollup_answer_hook
+            && let Some(rows) = hook(&sql)
+        {
+            for _ in &rows {
+                budget.charge_one().map_err(ReadError::QueryTooBroad)?;
+            }
+            return Ok(rows);
+        }
+        self.fetch_sample_rows(sql, budget).await
     }
 
     /// Issues #549 and #579: runs one pushed node's statements.
@@ -3228,6 +3481,42 @@ enum SelectorFetchPlan {
     /// selector whose `name_matchers` exclude its own name (issue #85),
     /// or a fan-out that matched zero metric names.
     Empty,
+    /// Issue #18 part B: a selector a rollup level serves, its float
+    /// series read from the levels and raw (plan section 4), its
+    /// histogram series by today's histogram statements.
+    Rollup(Box<RollupFetch>),
+}
+
+/// Issue #18 part B: a routed selector's fetch, decided in phase 1.
+struct RollupFetch {
+    route: super::rollup::Route,
+    levels: std::sync::Arc<super::rollup::Levels>,
+    /// Ascending.
+    fps: Vec<Fingerprint>,
+    labels_by_fp: HashMap<Fingerprint, LabelSet>,
+    hist_sqls: Vec<String>,
+    /// The selector's fetch window `(lo, hi]`.
+    window: (i64, i64),
+}
+
+/// Issue #18 part B: what a routed selector's fetch read, for explain.
+pub(super) struct RollupTrace {
+    /// The first chunk's pieces, `(statement, note)`, in time order.
+    stages: Vec<(String, String)>,
+    /// A kept level row produced at least one pseudo-sample, in any
+    /// chunk.
+    served_from_level: bool,
+}
+
+/// A selector's fetched series and, for a routed selector, its trace.
+type FetchedWithTrace = (Vec<FetchedSeries>, Option<RollupTrace>);
+
+/// One chunk of a routed selector: its pseudo-samples as sample rows,
+/// ascending by series and time, and its pieces.
+struct RollupChunk {
+    rows: Vec<SampleRow>,
+    stages: Vec<(i64, String, String)>,
+    served_from_level: bool,
 }
 
 /// Issue #316: the 400 `bad_data` an uncompilable `__name__` regex earns,
