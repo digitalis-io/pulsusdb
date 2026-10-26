@@ -210,13 +210,13 @@ TTL toDateTime(least(intDiv(updated_ns, 1000000000) + (retention_days * 86400), 
 
 ### 2.2 Rollup levels
 
-The rollup levels hold per-series summaries of each bucket of a fixed size, one table and one timed view per level (issue #18 part A). **Nothing reads the levels yet**: no query routes to them until issue #18 part B, so no answer changes. The statements are rendered from one template at the end of `schema/schema.sql`.
+The rollup levels hold per-series summaries of each bucket of a fixed size, one table and one timed view per level (issue #18 part A). A PromQL range query's response grid follows its time range; each eligible selector reads the level that range selects, a finer level, or raw ([api.md](api.md) §3.6). The statements are rendered from one template at the end of `schema/schema.sql`.
 
-**The setting.** `PULSUS_ROLLUP_LEVELS` lists the levels in seconds, smallest first, and defaults to `60,720,7200,86400`; set and empty, it builds no levels ([configuration.md §7](configuration.md)). `schema/schema.sh` refuses a list with exit `2` before it contacts the server, and `pulsus_schema::parse_rollup_levels` refuses the same lists with the same messages, unless: every item is a whole number from 1 to 86400 with no leading zero, and none is empty; each divides 86400; one below 60 divides 60; each is greater than, and a multiple of, the one before; there are at most 8; and `2 × max(first, 60) + 870 ≤ 3600 × PULSUS_METRICS_LANDING_RETENTION_HOURS`. Changing the set is a rebuild.
+**The settings.** `PULSUS_ROLLUP_LEVELS` lists the levels in seconds, smallest first, and defaults to `5,60,720,7200,86400`; set and empty, it builds no levels ([configuration.md §7](configuration.md)). `PULSUS_ROLLUP_RANGES` gives, for each level after the first, the query range in seconds from which it is the resolution (default `3600,86400,604800,7776000`), and `PULSUS_ROLLUP_COUNTER_BUCKETS` the buckets a `rate` or `increase` range covers at least (default `5`); their rules are in configuration.md §7. `schema/schema.sh` refuses a list with exit `2` before it contacts the server, and `pulsus_schema::parse_rollup_levels` refuses the same lists with the same messages, unless: every item is a whole number from 1 to 86400 with no leading zero, and none is empty; each divides 86400; one below 60 divides 60; each is greater than, and a multiple of, the one before; there are at most 8; and `2 × max(first, 60) + 870 ≤ 3600 × PULSUS_METRICS_LANDING_RETENTION_HOURS`. Changing the set is a rebuild.
 
 | | |
 |---|---|
-| table | `metric_samples_<N>s` for a level of `N` seconds: `MergeTree`, `ORDER BY (org_id, fingerprint, t_end)`, `PARTITION BY toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC')`, `index_granularity = 1024`, `COMMENT 'rollup_res_ms=<N>000'`; clustered, a `metric_samples_<N>s_dist` wrapper on `cityHash64(fingerprint)` |
+| table | `metric_samples_<N>s` for a level of `N` seconds: `MergeTree`, `ORDER BY (org_id, fingerprint, t_end)`, `PARTITION BY toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC')`, `index_granularity = 1024`, `COMMENT 'rollup_res_ms=<N>000 rollup_from_ms=<F> counter_buckets=<C>'`, `<F>` `0` for the first level and that level's range followed by `000` for the others, `<C>` the counter bucket count, which the server reads back to choose levels; clustered, a `metric_samples_<N>s_dist` wrapper on `cityHash64(fingerprint)` |
 | bucket | `(t_end − N s, t_end]`, so a bucket never crosses a UTC day |
 | projection | `by_parent`, `SELECT *` ordered by `(intDiv(t_end - 1, <next level's ms>), org_id, fingerprint, t_end)`, on every level whose next level is shorter than a day: the next level's run reads its window through it. A level whose next level is a day has none: that run reads its source's day partition |
 | expiry | the start of the UTC day of `t_end − 1 ms` + `PULSUS_RETENTION_DAYS`, dropped by whole part (`ttl_only_drop_parts = 1`). A level is kept no longer than raw and has no retention of its own |
@@ -241,10 +241,11 @@ A coarser level's row is composed from the rows of the level below in its bucket
 
 | level | timer |
 |---|---|
+| 5 s | `EVERY 1 MINUTE` |
 | 60 s | `EVERY 1 MINUTE` |
-| 720 s | `EVERY 12 MINUTE OFFSET 240 SECOND` |
-| 7200 s | `EVERY 2 HOUR OFFSET 300 SECOND` |
-| 86400 s | `EVERY 1 DAY OFFSET 360 SECOND` |
+| 720 s | `EVERY 12 MINUTE OFFSET 300 SECOND` |
+| 7200 s | `EVERY 2 HOUR OFFSET 360 SECOND` |
+| 86400 s | `EVERY 1 DAY OFFSET 420 SECOND` |
 
 **The first level's read.** It reads `metric_landing` (`kind = 0`) with exact repeats of `(series, time, value bits)` dropped and the samples of one millisecond ordered by value bits. A run's window ends at the last whole period at least 150 s ago, the settle time an insert may still commit in. It starts at the watermark (with no run row yet, one period before that end), covers five periods at most per run, and starts no earlier than `metric_landing` still holds: `now − H hours + 720 s`, rounded up to a period. A sample in the window takes as its previous sample one less than 120 s before the window's start. Landing is keyed by `(kind, intDiv(unix_milli, 300000), org_id, metric_name, fingerprint, unix_milli)`, and the read names the 5-minute blocks it needs, so a run reads only them.
 
@@ -357,7 +358,7 @@ ORDER BY gid, gi_start
 
 **What it costs and what it buys.** The database does more work and this process does much less. On 400 series in 4 groups over an hour at a 15 s step, the statement returns 964 rows where the fetch above returns 96,400, and the bytes the coordinator sent this client went from 691,011 to 9,389 — measured, `ProfileEvents['NetworkSendBytes']` plus the statement text, median of three. **The threshold is a heuristic, and the row count it stands in for is a transition count.** A run ends when the group's answer CHANGES, so what the statement returns depends on how often that happens — not on how many series feed the group. Measured on two corpora with the same 100 series in the same 1 group: 39 rows where the count is flat through the middle, 199 rows where it changes at nearly every grid point. The transition count is not knowable before the statement runs, so the compiler uses what it can compute from the resolver's answer alone and declines below `series >= 2 * groups` — as many groups as series is the shape with no grouping work to do, and that is a proxy for the shape rather than a bound on rows: measured on a declined corpus of three constant series in one group each, the push returns 3 rows against the raw read's 723 under every one of the four operations. Bytes are not bounded in general — the run row is wider than a sample row — and on a 100-series expiry corpus the pushed read moved 5,433 bytes against the raw read's 2,754. Rows ARE bounded: each sample opens its coverage at one grid index and closes it at another, so `pushed_rows <= 2 * raw_rows`.
 
-**Same query over 30 days, step 1h.** Read from raw, like every other query. The rollup levels exist and are built (§2.2) and no read uses them; issue #18 part B defines their read.
+**Same query over 30 days, step 1h.** Reads the 7200 s level: 360 points per series at 2-hour bucket ends, whatever the step ([api.md](api.md) §3.6).
 
 **`count by (job) (up)`** — **the cache-only answer was withdrawn** (issue #33; [architecture.md §5.1](architecture.md)): the label cache records activity at bucket granularity and cannot tell "had a sample inside the 5-minute staleness lookback" from "active somewhere in an up-to-24h-old bucket", and it returned 69 series where the reference correctly returned 57. `count`/`group` read samples like every other aggregation. What issue #549 changed is the SHAPE of that read, not the rule: over a plain instant selector it is one statement per fingerprint chunk that applies the lookback in SQL (§2.3), so the answer is still computed from real samples.
 
