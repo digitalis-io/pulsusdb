@@ -1,9 +1,11 @@
 //! Issue #18 part B: reading the rollup levels.
 //!
-//! A selector whose step, start, offset and range fit a rollup level reads
-//! that level's rows as pseudo-samples, then the finer levels and raw for
-//! what the level does not cover, and the engine evaluates them unchanged
-//! (design r13 sections 2 and 5).
+//! A range query's time range chooses a resolution and the query is
+//! evaluated at that resolution's bucket ends (issue #18 follow-up). A
+//! selector whose range and time fit a level at or below the resolution
+//! reads that level's rows as pseudo-samples, then the finer levels and
+//! raw for what the level does not cover, and the engine evaluates them
+//! unchanged (design r13 sections 2 and 5).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -16,26 +18,25 @@ use tokio::task::JoinHandle;
 
 use super::TenantSql;
 use super::exec::MetricQueryParams;
-use super::labels::LabelledResolution;
 use super::sample_sql::render_fingerprint_list;
 use crate::logql::escape::ch_string;
 
-/// One rollup level: its bucket width and the table a read names.
+/// One rollup level: its bucket width, the table a read names, and the
+/// query range from which it is the resolution (0 for the first level).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Level {
     pub res_ms: i64,
     pub table: String,
-    /// The query range from which this level is the resolution.
     pub from_ms: u64,
 }
 
-/// The levels the database holds, smallest first, and the shard count a
-/// level's coverage is intersected over.
+/// The levels the database holds, smallest first, the shard count a
+/// level's coverage is intersected over, and the buckets of a level a
+/// `rate` or `increase` range covers at least.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Levels {
     pub levels: Vec<Level>,
     pub shards: u32,
-    /// The buckets a counter's range covers at least.
     pub counter_buckets: u32,
 }
 
@@ -73,10 +74,13 @@ impl LevelSlot {
     }
 }
 
-/// The level-discovery statement.
+/// The level-discovery statement: each level's width, switch point and
+/// counter bucket count, from the comment the schema build wrote.
 pub fn discovery_sql(db: &str) -> String {
     format!(
-        "SELECT name, toUInt32(substring(comment, 15)) AS res_ms\n\
+        "SELECT name, toUInt32(extract(comment, 'rollup_res_ms=(\\\\d+)')) AS res_ms,\n       \
+         toUInt64(extract(comment, 'rollup_from_ms=(\\\\d+)')) AS from_ms,\n       \
+         toUInt32(extract(comment, 'counter_buckets=(\\\\d+)')) AS counter_buckets\n\
          FROM system.tables\n\
          WHERE database = {} AND startsWith(comment, 'rollup_res_ms=') AND engine != 'Distributed'\n\
          ORDER BY res_ms",
@@ -96,6 +100,8 @@ pub fn shards_sql(cluster: &str) -> String {
 struct LevelNameRow {
     name: String,
     res_ms: u32,
+    from_ms: u64,
+    counter_buckets: u32,
 }
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
@@ -135,17 +141,18 @@ pub async fn refresh_levels(
             None => 1,
         };
         let suffix = if cluster.is_some() { dist_suffix } else { "" };
+        let counter_buckets = names.first().map_or(0, |r| r.counter_buckets);
         Ok(Levels {
             levels: names
                 .into_iter()
                 .map(|r| Level {
                     res_ms: i64::from(r.res_ms),
                     table: format!("{}{suffix}", r.name),
-                    from_ms: 0,
+                    from_ms: r.from_ms,
                 })
                 .collect(),
             shards,
-            counter_buckets: 5,
+            counter_buckets,
         })
     }
     .await;
@@ -199,19 +206,58 @@ pub struct Route {
     pub use_: RollupUse,
 }
 
-/// Plan section 3: the largest level the selector's time and range fit,
-/// or `None`.
-pub fn route(sel: &SelectorSpec, p: &PlanParams, levels: &Levels, _res: i64) -> Option<Route> {
+/// The most points a snapped grid may hold: the server serves 11,000 step
+/// intervals, 11,001 points (`pulsus-server`'s `POINTS_CAP`).
+pub const MAX_GRID_POINTS: i128 = 11_001;
+
+/// Issue #18 follow-up, R1 and R2: a range query's resolution, the largest
+/// level whose switch point is at most `end − start`, and the grid of
+/// every bucket end in `(start, end]` at that resolution, whatever step
+/// was asked. `None` for an instant query, no levels, a grid with no
+/// point or a time outside `i64`, or more than [`MAX_GRID_POINTS`]: the
+/// query keeps its own grid and nothing routes.
+pub fn grid(p: &MetricQueryParams, levels: &Levels) -> Option<(i64, MetricQueryParams)> {
+    if p.start_ms == p.end_ms {
+        return None;
+    }
+    let span = i128::from(p.end_ms) - i128::from(p.start_ms);
+    let res = levels
+        .levels
+        .iter()
+        .rev()
+        .find(|l| l.res_ms > 0 && i128::from(l.from_ms) <= span)?
+        .res_ms;
+    let r = i128::from(res);
+    let lo = i128::from(p.start_ms).div_euclid(r);
+    let hi = i128::from(p.end_ms).div_euclid(r);
+    let count = hi - lo;
+    if count <= 0 || count > MAX_GRID_POINTS {
+        return None;
+    }
+    let first = i64::try_from((lo + 1) * r).ok()?;
+    let last = i64::try_from(hi * r).ok()?;
+    Some((
+        res,
+        MetricQueryParams {
+            start_ms: first,
+            end_ms: last,
+            step_ms: res,
+        },
+    ))
+}
+
+/// Plan section 3 and issue #18 follow-up R3: the largest level of width
+/// at most `res` that the selector's time and range fit, or `None`.
+pub fn route(sel: &SelectorSpec, p: &PlanParams, levels: &Levels, res: i64) -> Option<Route> {
     let use_ = sel.rollup_use?;
     if excluded(sel) {
         return None;
     }
-    let (index, level) = levels
-        .levels
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, l)| l.res_ms > 0 && fits(sel, p, use_, l.res_ms))?;
+    let buckets = i64::from(levels.counter_buckets);
+    let (index, level) =
+        levels.levels.iter().enumerate().rev().find(|(_, l)| {
+            l.res_ms > 0 && l.res_ms <= res && fits(sel, p, use_, l.res_ms, buckets)
+        })?;
     Some(Route {
         level: index,
         res_ms: level.res_ms,
@@ -220,8 +266,10 @@ pub fn route(sel: &SelectorSpec, p: &PlanParams, levels: &Levels, _res: i64) -> 
     })
 }
 
-/// Plan section 3's two conditions for one level.
-fn fits(sel: &SelectorSpec, p: &PlanParams, use_: RollupUse, res: i64) -> bool {
+/// Plan section 3's two conditions for one level (G2 and G1): the window
+/// ends on the level's bucket ends, and the range is a whole number of
+/// buckets, at least one, or `buckets` for a counter.
+fn fits(sel: &SelectorSpec, p: &PlanParams, use_: RollupUse, res: i64, buckets: i64) -> bool {
     let time = match sel.at_ms {
         Some(t) => (t - sel.offset_ms).rem_euclid(res) == 0,
         None => {
@@ -231,15 +279,10 @@ fn fits(sel: &SelectorSpec, p: &PlanParams, use_: RollupUse, res: i64) -> bool {
     };
     let range = match (sel.range_ms, use_) {
         (None, _) => true,
-        (Some(r), RollupUse::Counter) => r.rem_euclid(res) == 0 && r >= 5 * res,
+        (Some(r), RollupUse::Counter) => r.rem_euclid(res) == 0 && r >= buckets * res,
         (Some(r), _) => r.rem_euclid(res) == 0 && r >= res,
     };
     time && range
-}
-
-/// STUB (tests first): the response grid.
-pub fn grid(_p: &MetricQueryParams, _levels: &Levels) -> Option<(i64, MetricQueryParams)> {
-    None
 }
 
 /// Plan Q5: what keeps a selector on raw whatever its step and range.
@@ -252,12 +295,10 @@ fn excluded(sel: &SelectorSpec) -> bool {
         || sel.smoothed
 }
 
-/// Plan Q1 and Q5: whether a selector may read a level at all.
-pub fn eligible(sel: &SelectorSpec, resolution: &LabelledResolution) -> bool {
-    sel.metric_name.is_some()
-        && sel.name_matchers.is_empty()
-        && matches!(resolution, LabelledResolution::Series(_))
-        && !excluded(sel)
+/// Plan Q1 and Q5: whether a selector may read a level at all, however
+/// its series were found (issue #18 follow-up, R4).
+pub fn eligible(sel: &SelectorSpec) -> bool {
+    sel.metric_name.is_some() && sel.name_matchers.is_empty() && !excluded(sel)
 }
 
 /// Plan section 2: one level fetch over `(lo, hi]` for one fingerprint
@@ -671,7 +712,6 @@ mod tests {
     use pulsus_promql::{DEFAULT_LOOKBACK_MS, parse, plan};
 
     use super::*;
-    use crate::metrics::labels::FallbackReason;
 
     /// A UTC midnight: on every level's grid.
     const BASE: i64 = 1_788_825_600_000;
@@ -1426,17 +1466,9 @@ mod tests {
     #[test]
     fn b1f_eligible_refuses_the_unrouted_classes() {
         let p = params(BASE, 12 * MIN, false);
-        let series = LabelledResolution::Series(Vec::new());
-        let fallback = LabelledResolution::SqlFallback {
-            sql: "SELECT 1".to_string(),
-            reason: FallbackReason::ColdCache,
-        };
         let sel = |q: &str| selectors(q, &p).remove(0);
-        assert!(eligible(&sel("rate(m[1h])"), &series), "the control");
-        assert!(
-            !eligible(&sel(r#"rate({job="x"}[1h])"#), &series),
-            "no metric name"
-        );
+        assert!(eligible(&sel("rate(m[1h])")), "the control");
+        assert!(!eligible(&sel(r#"rate({job="x"}[1h])"#)), "no metric name");
         // The parser refuses a bare name beside a `__name__` matcher, so
         // the name is the first `__name__="m"` and the matcher beside it
         // is the second.
@@ -1449,18 +1481,21 @@ mod tests {
             let s = sel(q);
             assert_eq!(s.metric_name.as_deref(), Some("m"), "{q}: a concrete name");
             assert_eq!(s.name_matchers.len(), 1, "{q}: one matcher beside it");
-            assert!(!eligible(&s, &series), "{q}");
+            assert!(!eligible(&s), "{q}");
         }
+        // T3 (issue #18 follow-up): `eligible` reads the selector alone,
+        // so a selector the label cache cannot answer is eligible as one
+        // it can; the live half is `a_week_reads_two_hour_rows`.
         assert!(
-            eligible(&sel("rate(m[1h])"), &fallback),
-            "T3: a selector the label cache cannot answer is eligible"
+            eligible(&sel("rate(m[1h])")),
+            "T3: eligible whatever resolved its series"
         );
         let stats = selectors("histogram_count(rate(h[5m]))", &p).remove(0);
         assert!(
             stats.histogram_stats,
             "the case is a histogram-stats selector"
         );
-        assert!(!eligible(&stats, &series), "histogram_stats");
+        assert!(!eligible(&stats), "histogram_stats");
     }
 
     /// The `runtimeinfo` form of a level.

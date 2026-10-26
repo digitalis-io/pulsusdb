@@ -49,16 +49,16 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 29 tables, 26 views, and
+/// The inventory, single-node: one database, 30 tables, 27 views, and
 /// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
 /// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 56, "statement count");
+    assert_eq!(stmts.len(), 58, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
-    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 29);
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 26);
+    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 30);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 27);
 
     let text = rendered(&single());
     assert!(
@@ -87,18 +87,18 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     assert!(text.contains("non_replicated_deduplication_window = 10000"));
 }
 
-/// The inventory, clustered: the same statements plus 18 `_dist` wrappers,
+/// The inventory, clustered: the same statements plus 19 `_dist` wrappers,
 /// `ON CLUSTER` on every one, and the macros intact.
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 74, "statement count");
+    assert_eq!(stmts.len(), 77, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        47,
-        "29 tables + 18 wrappers"
+        49,
+        "30 tables + 19 wrappers"
     );
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 26);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 27);
 
     let text = rendered(&clustered());
     assert!(
@@ -107,20 +107,20 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        74,
+        77,
         "every statement carries ON CLUSTER"
     );
 
     // `{shard}` and `{replica}` are the server's own macros and must arrive
-    // literally. 23 tables take a per-shard replica set and 6 take the
-    // cluster-wide one, so 29 paths name `{replica}` and 23 name `{shard}`.
-    // The four rollup levels add four per-shard replica sets.
+    // literally. 24 tables take a per-shard replica set and 6 take the
+    // cluster-wide one, so 30 paths name `{replica}` and 24 name `{shard}`.
+    // The five default rollup levels add five per-shard replica sets.
     assert_eq!(
         text.matches("{shard}").count(),
-        23,
+        24,
         "per-shard replica sets"
     );
-    assert_eq!(text.matches("{replica}").count(), 29, "replicated tables");
+    assert_eq!(text.matches("{replica}").count(), 30, "replicated tables");
     assert_eq!(
         text.matches("/clickhouse/tables/all/").count(),
         6,
@@ -182,7 +182,7 @@ fn every_replication_path_names_the_table_of_its_own_create() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 29, "every replicated table's path was checked");
+    assert_eq!(checked, 30, "every replicated table's path was checked");
 }
 
 /// The splitter the script relies on: a statement ends at a line whose last
@@ -334,6 +334,7 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         "metric_exemplars",
         "metric_series",
         "metric_labels",
+        "metric_samples_5s",
         "metric_samples_60s",
         "metric_samples_720s",
         "metric_samples_7200s",
@@ -366,7 +367,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 29);
+    assert_eq!(on_tables, 30);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -1146,16 +1147,22 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
                 sources.extend(own);
             }
         }
-        assert_eq!(targets.len(), 26, "{variant:?}: twenty-six views");
+        assert_eq!(targets.len(), 27, "{variant:?}: twenty-seven views");
         refreshable.sort();
         let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
             refreshable,
             vec![
                 (
+                    "metric_samples_5s_mv".to_string(),
+                    "metric_samples_5s".to_string(),
+                    strings(&["metric_landing", "metric_samples_5s"]),
+                    Vec::<String>::new(),
+                ),
+                (
                     "metric_samples_60s_mv".to_string(),
                     "metric_samples_60s".to_string(),
-                    strings(&["metric_landing", "metric_samples_60s"]),
+                    strings(&["metric_samples_5s", "metric_samples_60s"]),
                     Vec::<String>::new(),
                 ),
                 // Sorted as strings: `7200s` before `720s`.
@@ -1184,7 +1191,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
                     strings(&["service_edges", "spans"]),
                 ),
             ],
-            "{variant:?}: the five refreshable views, their targets, their direct \
+            "{variant:?}: the six refreshable views, their targets, their direct \
              sources and their sources read through merge()"
         );
         let mut distinct: Vec<String> = sources.clone();
@@ -2102,6 +2109,14 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
     // Issue #18: the rollup levels, one row each, due at the start of the
     // UTC day of `t_end − 1 ms` plus the retention.
     (
+        "metric_samples_5s",
+        Some(
+            "TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + (17 * 86400), 4294967295))",
+        ),
+        true,
+        None,
+    ),
+    (
         "metric_samples_60s",
         Some(
             "TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + (17 * 86400), 4294967295))",
@@ -2746,13 +2761,19 @@ fn the_script_and_the_crate_refuse_the_same_level_lists() {
             "{levels:?}: the crate's message"
         );
     }
-    for (levels, want) in [
-        ("60,720,7200,86400", vec![60, 720, 7200, 86400]),
-        ("5,60", vec![5, 60]),
-        ("720,86400", vec![720, 86400]),
-        ("", vec![]),
+    // Each accepted list with one switch point for each level after the
+    // first (issue #18 follow-up).
+    for (levels, ranges, want) in [
+        (
+            "60,720,7200,86400",
+            "86400,604800,7776000",
+            vec![60, 720, 7200, 86400],
+        ),
+        ("5,60", "3600", vec![5, 60]),
+        ("720,86400", "7776000", vec![720, 86400]),
+        ("", "", vec![]),
     ] {
-        let (code, err) = run(levels);
+        let (code, _, err) = script_levels(Some(levels), Some(ranges), None);
         assert_eq!(code, Some(0), "{levels:?}: the script must accept: {err}");
         assert_eq!(
             pulsus_schema::parse_rollup_levels(levels, 6),

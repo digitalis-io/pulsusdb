@@ -996,7 +996,7 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({{retention_days}} * 86400), 4294967295))
 --@level --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}}
 --@level --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}}
---@level COMMENT 'rollup_res_ms={{level_ms}}';
+--@level COMMENT 'rollup_res_ms={{level_ms}} rollup_from_ms={{from_ms}} counter_buckets={{counter_buckets}}';
 --@level --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_samples_{{level}}{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_samples_{{level}}
 --@level --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_samples_{{level}}', cityHash64(fingerprint));
 --@level CREATE MATERIALIZED VIEW {{db}}.metric_samples_{{level}}_mv{{on_cluster}} REFRESH {{timer}} APPEND TO {{db}}.metric_samples_{{level}}

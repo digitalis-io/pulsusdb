@@ -88,13 +88,16 @@ pub struct RenderCtx {
 pub const GRAPH_JOB_MAX_ROWS: u64 = 60_000_000;
 
 /// The rollup levels `schema/schema.sh` renders when `PULSUS_ROLLUP_LEVELS`
-/// is unset (issue #18).
-pub const DEFAULT_ROLLUP_LEVELS: &[u32] = &[60, 720, 7200, 86400];
+/// is unset (issue #18; the owner's table, 2026-10-26).
+pub const DEFAULT_ROLLUP_LEVELS: &[u32] = &[5, 60, 720, 7200, 86400];
 
-/// STUB (tests first).
-pub const DEFAULT_ROLLUP_RANGES: &[u32] = &[];
+/// The switch points `schema/schema.sh` renders when `PULSUS_ROLLUP_RANGES`
+/// is unset: the query range, in seconds, from which each level after the
+/// first is the resolution (issue #18 follow-up).
+pub const DEFAULT_ROLLUP_RANGES: &[u32] = &[3600, 86400, 604800, 7776000];
 
-/// STUB (tests first).
+/// `PULSUS_ROLLUP_COUNTER_BUCKETS` when unset: the buckets of a level a
+/// `rate` or `increase` range covers at least (issue #18 follow-up).
 pub const DEFAULT_ROLLUP_COUNTER_BUCKETS: u32 = 5;
 
 impl RenderCtx {
@@ -285,14 +288,67 @@ pub fn parse_rollup_levels(text: &str, landing_hours: u32) -> Result<Vec<u32>, S
     Ok(levels)
 }
 
-/// STUB (tests first).
-pub fn parse_rollup_ranges(_text: &str, _levels: &[u32]) -> Result<Vec<u32>, String> {
-    Ok(Vec::new())
+/// `PULSUS_ROLLUP_RANGES` (issue #18 follow-up): `text` validated against
+/// the validated `levels`, the switch points in seconds, one per level
+/// after the first. With no levels the text is not read. An empty `text`
+/// is an empty list. Each rule is checked in turn and the first that fails
+/// is the message, without the `PULSUS_ROLLUP_RANGES: ` prefix
+/// `schema/schema.sh` prints before the same message.
+pub fn parse_rollup_ranges(text: &str, levels: &[u32]) -> Result<Vec<u32>, String> {
+    if levels.is_empty() {
+        return Ok(Vec::new());
+    }
+    let items: Vec<&str> = if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split(',').collect()
+    };
+    if items.iter().any(|item| item.is_empty()) {
+        return Err(format!("an empty item in '{text}'"));
+    }
+    let mut ranges = Vec::with_capacity(items.len());
+    for item in &items {
+        let whole =
+            item.len() <= 9 && !item.starts_with('0') && item.bytes().all(|b| b.is_ascii_digit());
+        match item.parse::<u32>() {
+            Ok(v) if whole => ranges.push(v),
+            _ => {
+                return Err(format!(
+                    "{item} is not a whole number of seconds from 1 to 999999999"
+                ));
+            }
+        }
+    }
+    if ranges.len() + 1 != levels.len() {
+        return Err(format!(
+            "{} ranges for {} levels: give one for each level after the first",
+            ranges.len(),
+            levels.len()
+        ));
+    }
+    if let Some(w) = ranges.windows(2).find(|w| w[1] <= w[0]) {
+        return Err(format!("{} then {}: the ranges must increase", w[0], w[1]));
+    }
+    if let Some((range, level)) = ranges
+        .iter()
+        .zip(&levels[1..])
+        .find(|(range, level)| range < level)
+    {
+        return Err(format!("{range} is shorter than its level {level}"));
+    }
+    Ok(ranges)
 }
 
-/// STUB (tests first).
-pub fn parse_rollup_counter_buckets(_text: &str) -> Result<u32, String> {
-    Ok(0)
+/// `PULSUS_ROLLUP_COUNTER_BUCKETS` (issue #18 follow-up): a whole number
+/// from 2 to 1000, with no leading zero. The message is the one
+/// `schema/schema.sh` prints after `PULSUS_ROLLUP_COUNTER_BUCKETS: `.
+pub fn parse_rollup_counter_buckets(text: &str) -> Result<u32, String> {
+    let whole =
+        text.len() <= 4 && !text.starts_with('0') && text.bytes().all(|b| b.is_ascii_digit());
+    match text.parse::<u32>() {
+        Ok(v) if whole && (2..=1000).contains(&v) => Ok(v),
+        _ => Err(format!("{text} is not a whole number from 2 to 1000")),
+    }
 }
 
 /// Which levels a line of the level block is kept for.
@@ -350,7 +406,7 @@ fn timer_unit(v: u32) -> String {
 /// script's `awk` prints the same digits;
 /// `the_script_renders_exactly_what_this_crate_renders` holds the two
 /// together. Output lines end in `\n`.
-pub(crate) fn expand_levels(sql: &str, levels: &[u32]) -> String {
+pub(crate) fn expand_levels(sql: &str, set: LevelSet<'_>) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut block: Vec<(LevelLine, &str)> = Vec::new();
     for line in sql.lines() {
@@ -358,17 +414,22 @@ pub(crate) fn expand_levels(sql: &str, levels: &[u32]) -> String {
             block.push(marked);
             continue;
         }
-        emit_levels(&mut out, &block, levels);
+        emit_levels(&mut out, &block, set);
         block.clear();
         out.push_str(line);
         out.push('\n');
     }
-    emit_levels(&mut out, &block, levels);
+    emit_levels(&mut out, &block, set);
     out
 }
 
+/// The levels, their switch points and the counter bucket count, as
+/// [`expand_levels`] renders them.
+pub(crate) type LevelSet<'a> = (&'a [u32], &'a [u32], u32);
+
 /// `block`, once per level, into `out`: [`expand_levels`]' rule.
-fn emit_levels(out: &mut String, block: &[(LevelLine, &str)], levels: &[u32]) {
+fn emit_levels(out: &mut String, block: &[(LevelLine, &str)], set: LevelSet<'_>) {
+    let (levels, ranges, counter_buckets) = set;
     let Some(&first) = levels.first() else {
         return;
     };
@@ -399,6 +460,15 @@ fn emit_levels(out: &mut String, block: &[(LevelLine, &str)], levels: &[u32]) {
             .map(|next| format!("{next}000"))
             .unwrap_or_default();
         let period_ms = format!("{p}000");
+        // Written as text, as `{{level_ms}}`: 7,776,000,000 exceeds 32 bits.
+        let from_ms = match i {
+            0 => "0".to_string(),
+            _ => format!(
+                "{}000",
+                ranges.get(i - 1).map(u32::to_string).unwrap_or_default()
+            ),
+        };
+        let counter_buckets = counter_buckets.to_string();
         for (kind, rest) in block {
             let kept = match kind {
                 LevelLine::All => true,
@@ -415,6 +485,8 @@ fn emit_levels(out: &mut String, block: &[(LevelLine, &str)], levels: &[u32]) {
                 .replace("{{source}}", &source)
                 .replace("{{parent_ms}}", &parent_ms)
                 .replace("{{period_ms}}", &period_ms)
+                .replace("{{from_ms}}", &from_ms)
+                .replace("{{counter_buckets}}", &counter_buckets)
                 .replace("{{timer}}", &timer);
             out.push_str(&line);
             out.push('\n');
@@ -586,7 +658,7 @@ mod tests {
     /// Issue #18: no levels, no block.
     #[test]
     fn no_levels_emit_nothing_for_the_block() {
-        assert_eq!(expand_levels(LEVEL_BLOCK, &[]), "head\ntail\n");
+        assert_eq!(expand_levels(LEVEL_BLOCK, (&[], &[], 5)), "head\ntail\n");
     }
 
     /// Issue #18: one level is first and last, so it has no `--@level-next`
@@ -594,7 +666,7 @@ mod tests {
     #[test]
     fn one_level_is_first_and_feeds_nothing() {
         assert_eq!(
-            expand_levels(LEVEL_BLOCK, &[60]),
+            expand_levels(LEVEL_BLOCK, (&[60], &[], 5)),
             "head\n\
              A 60s 60000 EVERY 1 MINUTE\n\
              --@cluster C 60s\n  indented\n\
@@ -609,7 +681,7 @@ mod tests {
     #[test]
     fn a_level_below_a_minute_runs_every_minute_and_the_next_has_no_offset() {
         assert_eq!(
-            expand_levels(LEVEL_BLOCK, &[5, 60]),
+            expand_levels(LEVEL_BLOCK, (&[5, 60], &[3600], 5)),
             "head\n\
              A 5s 5000 EVERY 1 MINUTE\n\
              --@cluster C 5s\n  indented\n\
@@ -626,7 +698,7 @@ mod tests {
     /// 780 s.
     #[test]
     fn the_timers_follow_the_level_sizes() {
-        let out = expand_levels(LEVEL_BLOCK, &[720, 86400]);
+        let out = expand_levels(LEVEL_BLOCK, (&[720, 86400], &[86400], 5));
         assert!(out.contains("A 720s 720000 EVERY 12 MINUTE\n"), "{out}");
         assert!(
             out.contains("A 86400s 86400000 EVERY 1 DAY OFFSET 780 SECOND\n"),

@@ -691,6 +691,42 @@ impl MetricsEngine {
         p: &MetricQueryParams,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<(QueryResult, pulsus_promql::Annotations), ReadError> {
+        // Issue #18 follow-up: with rollup levels, a range query is
+        // evaluated at the bucket ends of the resolution its time range
+        // selects, whatever step it asked (R1, R2); an instant query keeps
+        // its time and routes at the smallest level (R5). No grid, no
+        // routing.
+        let levels = self
+            .rollup_levels
+            .as_ref()
+            .and_then(|slot| slot.get())
+            .filter(|l| !l.levels.is_empty());
+        let mut snapped = *p;
+        let mut routing: Option<(std::sync::Arc<super::rollup::Levels>, i64)> = None;
+        if let Some(levels) = levels {
+            if p.start_ms == p.end_ms {
+                let smallest = levels.levels[0].res_ms;
+                routing = Some((levels, smallest));
+            } else if let Some((res, grid)) = super::rollup::grid(p, &levels) {
+                if let Some(e) = explain.as_mut() {
+                    let points = (grid.end_ms - grid.start_ms) / res + 1;
+                    e.push(
+                        "rollup_grid",
+                        String::new(),
+                        Some(format!(
+                            "resolution {res_text}, step {res_text} (asked {}), {points} points, {} to {}",
+                            super::rollup::duration_text(p.step_ms),
+                            grid.start_ms.div_euclid(1000),
+                            grid.end_ms.div_euclid(1000),
+                            res_text = super::rollup::duration_text(res),
+                        )),
+                    );
+                }
+                snapped = grid;
+                routing = Some((levels, res));
+            }
+        }
+        let p = &snapped;
         let plan_params = p.plan_params(self.config.experimental_functions, self.lookback_ms);
         let plan = pulsus_promql::plan(expr, plan_params)?;
 
@@ -971,18 +1007,22 @@ impl MetricsEngine {
 
             // Issue #18 part B: a selector a rollup level can serve reads
             // it, decided before the pushdown, so a routed selector is
-            // never pushed down.
-            if let Some(levels) = self.rollup_levels.as_ref().and_then(|slot| slot.get())
-                && super::rollup::eligible(sel, &resolution)
-                && let Some(route) = super::rollup::route(sel, &plan_params, &levels, i64::MAX)
-                && let LabelledResolution::Series(pairs) = resolution
+            // never pushed down. However its series were found (issue #18
+            // follow-up, R4).
+            if let Some((levels, res)) = routing.as_ref()
+                && super::rollup::eligible(sel)
+                && let Some(route) = super::rollup::route(sel, &plan_params, levels, *res)
             {
+                let series = match resolution {
+                    LabelledResolution::Series(pairs) => RollupSeries::Known(pairs),
+                    LabelledResolution::SqlFallback { sql, .. } => RollupSeries::Resolve(sql),
+                };
                 fetch_plans.push(self.rollup_fetch_plan(
                     tenant,
                     sel,
                     route,
-                    levels,
-                    pairs,
+                    std::sync::Arc::clone(levels),
+                    series,
                     (lower_excl, upper_incl),
                     &plan_params,
                     explain.as_deref_mut(),
@@ -2021,7 +2061,9 @@ impl MetricsEngine {
     }
 
     /// Issue #18 part B: a routed selector's fetch plan, and its
-    /// `rollup_route` explain stage.
+    /// `rollup_route` explain stage; for a selector the label cache could
+    /// not answer, its `rollup_series` stage before it (issue #18
+    /// follow-up, R4).
     #[allow(clippy::too_many_arguments)]
     fn rollup_fetch_plan(
         &self,
@@ -2029,22 +2071,43 @@ impl MetricsEngine {
         sel: &SelectorSpec,
         route: super::rollup::Route,
         levels: std::sync::Arc<super::rollup::Levels>,
-        pairs: Vec<(Fingerprint, LabelSet)>,
+        series: RollupSeries,
         window: (i64, i64),
         p: &pulsus_promql::PlanParams,
         explain: Option<&mut PlanExplain>,
     ) -> SelectorFetchPlan {
-        let labels_by_fp: HashMap<Fingerprint, LabelSet> = pairs.iter().cloned().collect();
-        let mut fps: Vec<Fingerprint> = pairs.into_iter().map(|(fp, _)| fp).collect();
-        fps.sort_unstable();
-        let hist_sqls = build_hist_chunk_sqls(
-            tenant,
-            &self.config.hist_samples_table,
-            fps.clone(),
-            window.0,
-            window.1,
-        );
+        let (series, hist_sqls) = match series {
+            RollupSeries::Known(mut pairs) => {
+                pairs.sort_unstable_by_key(|(fp, _)| *fp);
+                let fps: Vec<Fingerprint> = pairs.iter().map(|(fp, _)| *fp).collect();
+                let hist_sqls = build_hist_chunk_sqls(
+                    tenant,
+                    &self.config.hist_samples_table,
+                    fps,
+                    window.0,
+                    window.1,
+                );
+                (RollupSeries::Known(pairs), hist_sqls)
+            }
+            RollupSeries::Resolve(ids_sql) => {
+                let hist_sql = sample_sql::hist_sample_fetch_subquery(
+                    tenant,
+                    &self.config.hist_samples_table,
+                    &ids_sql,
+                    window.0,
+                    window.1,
+                );
+                (RollupSeries::Resolve(ids_sql), vec![hist_sql])
+            }
+        };
         if let Some(e) = explain {
+            if let (RollupSeries::Resolve(ids_sql), Some(name)) = (&series, &sel.metric_name) {
+                e.push(
+                    "rollup_series",
+                    self.rollup_series_sql(tenant, name, ids_sql),
+                    Some("the series and their labels, read before the levels".to_string()),
+                );
+            }
             let range = sel
                 .range_ms
                 .map_or_else(|| "none".to_string(), super::rollup::duration_text);
@@ -2065,12 +2128,23 @@ impl MetricsEngine {
         SelectorFetchPlan::Rollup(Box::new(RollupFetch {
             route,
             levels,
-            fps,
-            labels_by_fp,
+            series,
             hist_sqls,
             window,
             params: *p,
         }))
+    }
+
+    /// Issue #18 follow-up, R4: the statement a routed selector the label
+    /// cache could not answer reads its series and labels by, the one the
+    /// raw fallback hydrates its labels by.
+    fn rollup_series_sql(&self, tenant: &Tenant, metric_name: &str, ids_sql: &str) -> String {
+        super::sql::series_labels_by_fingerprint(
+            tenant,
+            &self.config.labels_table,
+            &[metric_name.to_string()],
+            ids_sql,
+        )
     }
 
     /// Issue #18 part B: plan section 4 for every fingerprint chunk,
@@ -2079,21 +2153,53 @@ impl MetricsEngine {
         &self,
         tenant: &Tenant,
         sel: &SelectorSpec,
-        plan: RollupFetch,
+        mut plan: RollupFetch,
         budget: &SampleBudget,
     ) -> Result<FetchedWithTrace, ReadError> {
         let metric_name = concrete_name(sel)?;
-        let literals = sql_literals(&plan.fps);
+        // Issue #18 follow-up, R4: a selector the label cache could not
+        // answer first reads its series and labels, under the settings the
+        // raw fallback reads them by; its histogram read is over the same
+        // series statement, under the same settings.
+        let series = std::mem::replace(&mut plan.series, RollupSeries::Known(Vec::new()));
+        let (pairs, nested) = match series {
+            RollupSeries::Known(pairs) => (pairs, false),
+            RollupSeries::Resolve(ids_sql) => {
+                let rows: Vec<super::rows::SeriesRow> = self
+                    .fetch_series_rows(self.rollup_series_sql(tenant, metric_name, &ids_sql))
+                    .await?;
+                let mut pairs: Vec<(Fingerprint, LabelSet)> = rows
+                    .into_iter()
+                    .map(|r| {
+                        (
+                            r.fingerprint,
+                            crate::canonical_labels::parse_canonical_label_set(&r.labels),
+                        )
+                    })
+                    .collect();
+                pairs.sort_unstable_by_key(|(fp, _)| *fp);
+                pairs.dedup_by_key(|(fp, _)| *fp);
+                (pairs, true)
+            }
+        };
+        let fps: Vec<Fingerprint> = pairs.iter().map(|(fp, _)| *fp).collect();
+        let labels_by_fp: HashMap<Fingerprint, LabelSet> = pairs.into_iter().collect();
+        let literals = sql_literals(&fps);
         let chunks = sample_sql::chunk_fingerprints(&literals, sample_sql::CHUNK_THRESHOLD);
         let mut at = 0usize;
         let chunk_fps: Vec<&[Fingerprint]> = chunks
             .iter()
             .map(|c| {
-                let fps = &plan.fps[at..at + c.len()];
+                let fps = &fps[at..at + c.len()];
                 at += c.len();
                 fps
             })
             .collect();
+        let hist_settings = series_read_settings(
+            self.config.read_max_memory_bytes,
+            self.config.distributed,
+            self.config.skip_unavailable_shards,
+        );
         let (floats, hist_rows) = join(
             join_all(
                 chunks
@@ -2101,8 +2207,13 @@ impl MetricsEngine {
                     .zip(&chunk_fps)
                     .map(|(chunk, fps)| self.rollup_chunk(tenant, sel, &plan, chunk, fps, budget)),
             ),
-            fetch_all_concurrently(plan.hist_sqls.clone(), |sql| {
-                self.fetch_sample_rows::<HistSampleRow>(sql, budget)
+            fetch_all_concurrently(plan.hist_sqls.clone(), |sql| async {
+                if nested {
+                    self.fetch_rows_with::<HistSampleRow>(sql, &hist_settings, Some(budget))
+                        .await
+                } else {
+                    self.fetch_sample_rows::<HistSampleRow>(sql, budget).await
+                }
             }),
         )
         .await;
@@ -2135,25 +2246,21 @@ impl MetricsEngine {
             }
         }
         let Some(overlay_rows) = overlay_rows else {
-            let series = group_merged_rows(rows, hist_rows, &plan.labels_by_fp, metric_name)?;
+            let series = group_merged_rows(rows, hist_rows, &labels_by_fp, metric_name)?;
             return Ok((series, Some(trace)));
         };
         // The overlay holds the raw route's own samples: the raw floats and
         // the histogram samples, merged as the raw route merges them.
-        let overlay: HashMap<Fingerprint, Vec<pulsus_promql::Sample>> = group_merged_rows(
-            overlay_rows,
-            hist_rows.clone(),
-            &plan.labels_by_fp,
-            metric_name,
-        )?
-        .into_iter()
-        .map(|s| (s.fingerprint, s.samples))
-        .collect();
-        let mut series = group_merged_rows(rows, hist_rows, &plan.labels_by_fp, metric_name)?;
+        let overlay: HashMap<Fingerprint, Vec<pulsus_promql::Sample>> =
+            group_merged_rows(overlay_rows, hist_rows.clone(), &labels_by_fp, metric_name)?
+                .into_iter()
+                .map(|s| (s.fingerprint, s.samples))
+                .collect();
+        let mut series = group_merged_rows(rows, hist_rows, &labels_by_fp, metric_name)?;
         let present: std::collections::HashSet<Fingerprint> =
             series.iter().map(|s| s.fingerprint).collect();
         for (fp, _) in overlay.iter().filter(|(fp, _)| !present.contains(*fp)) {
-            if let Some(labels) = plan.labels_by_fp.get(fp) {
+            if let Some(labels) = labels_by_fp.get(fp) {
                 series.push(FetchedSeries {
                     fingerprint: *fp,
                     metric_name: Some(metric_name.to_string()),
@@ -3565,13 +3672,20 @@ enum SelectorFetchPlan {
     Rollup(Box<RollupFetch>),
 }
 
+/// Issue #18 follow-up, R4: how a routed selector's series are known.
+enum RollupSeries {
+    /// From the label cache, ascending by series ID once planned.
+    Known(Vec<(Fingerprint, LabelSet)>),
+    /// The series-ID statement the cache's SQL fallback gave: the series
+    /// and their labels are read by it before the levels.
+    Resolve(String),
+}
+
 /// Issue #18 part B: a routed selector's fetch, decided in phase 1.
 struct RollupFetch {
     route: super::rollup::Route,
     levels: std::sync::Arc<super::rollup::Levels>,
-    /// Ascending.
-    fps: Vec<Fingerprint>,
-    labels_by_fp: HashMap<Fingerprint, LabelSet>,
+    series: RollupSeries,
     hist_sqls: Vec<String>,
     /// The selector's fetch window `(lo, hi]`.
     window: (i64, i64),
