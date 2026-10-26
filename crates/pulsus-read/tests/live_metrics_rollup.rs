@@ -48,6 +48,7 @@ static DB_B5B: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read
 static DB_B1F: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b1f");
 static DB_B7: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b7");
 static DB_B10: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b10");
+static DB_S2: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_s2");
 
 fn should_run() -> bool {
     pulsus_testkit::live_clickhouse_enabled()
@@ -385,7 +386,8 @@ async fn build(
 /// The label cache and the level slot over a database already built.
 async fn warm(bootstrap: ChClient, admin: ChClient, ctx: RenderCtx, tenants: &[Tenant]) -> Built {
     let mut cfg = cache_config(&ctx.db);
-    cfg.window_ms = 10 * DAY;
+    // Wide enough for S2's oldest 86400 s window, 13 days back.
+    cfg.window_ms = 16 * DAY;
     let cache = Arc::new(LabelCache::new(
         ChClient::new(test_config(&ctx.db)).await.expect("connect"),
         cfg,
@@ -535,9 +537,12 @@ fn distances(a: &BTreeMap<(String, i64), f64>, b: &BTreeMap<(String, i64), f64>)
         .collect()
 }
 
-/// Plan section 9's `d` of one series and step.
+/// Plan section 9's `d` of one series and step: 0 when both are NaN, 1
+/// when only one is (plan r9 section 5).
 fn d_of(a: Option<&f64>, b: Option<&f64>) -> Option<f64> {
     match (a, b) {
+        (Some(x), Some(y)) if x.is_nan() && y.is_nan() => Some(0.0),
+        (Some(x), Some(y)) if x.is_nan() || y.is_nan() => Some(1.0),
         (Some(x), Some(y)) if *y == 0.0 => Some(x.abs()),
         (Some(x), Some(y)) => Some((x - y).abs() / y.abs()),
         (Some(_), None) | (None, Some(_)) => Some(1.0),
@@ -1522,4 +1527,279 @@ async fn a_sparse_counter_keeps_its_steps() {
         );
     }
     built.finish().await;
+}
+
+/// The stale marker's bits.
+const STALE_BITS: u64 = 9_218_868_437_227_405_314;
+/// Two ordinary NaNs with different payloads.
+const NAN_A: u64 = 9_221_120_237_041_090_561;
+const NAN_B: u64 = 9_221_120_237_041_090_562;
+
+/// S2's samples for one level `res`: `(metric, t, value bits)`, each
+/// series labelled with the level. Bucket `B = (b − res, b]`, `b = E −
+/// 3 res`, holds S1's shapes, the stale marker in its last 5 minutes;
+/// every series resumes two buckets later. `s2_c` is a counter rising by
+/// 10 a scrape from `b − 11 res`, a stale marker in `B`, resuming 30
+/// higher.
+fn s2_series(e: i64, res: i64) -> Vec<(&'static str, i64, u64)> {
+    let b = e - 3 * res;
+    let st = b - (res / 3).min(150_000);
+    let resume = b + 2 * res - res / 2;
+    let mut out = vec![
+        ("s2_g1", st - 15_000, 5f64.to_bits()),
+        ("s2_g1", st, STALE_BITS),
+        ("s2_g2", st, STALE_BITS),
+        ("s2_g3", st - 15_000, NAN_A),
+        ("s2_g3", st, NAN_B),
+        ("s2_g4", st - 30_000, 3f64.to_bits()),
+        ("s2_g4", st - 15_000, f64::NAN.to_bits()),
+        ("s2_g4", st, 7f64.to_bits()),
+    ];
+    for g in ["s2_g1", "s2_g2", "s2_g3", "s2_g4"] {
+        out.push((g, resume, 9f64.to_bits()));
+    }
+    let mut t = b - 11 * res + 7_000;
+    let mut v = 0.0f64;
+    while t < st {
+        out.push(("s2_c", t, v.to_bits()));
+        v += 10.0;
+        t += SCRAPE;
+    }
+    out.push(("s2_c", st, STALE_BITS));
+    let mut v = v - 10.0 + 30.0;
+    let mut t = resume;
+    while t <= e {
+        out.push(("s2_c", t, v.to_bits()));
+        v += 10.0;
+        t += SCRAPE;
+    }
+    out
+}
+
+/// **S2 (issue #18 part B, plan r9 to r11): stale markers and NaN values
+/// read as raw.** Per level, S1's shapes in one of its buckets: the
+/// functions that are bit-equal stay bit-equal, NaN bits and presence
+/// included; `sum_` and `avg_over_time` are NaN where raw is; a counter
+/// resuming after a stale marker stays within the normal-counter bound;
+/// `c4`'s step of more than a day reads each route's exact value.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_and_nan_read_as_raw() {
+    skip_unless_live!();
+    let db = DB_S2.name();
+    let e = today();
+    let d = e - DAY;
+    let levels = [60i64, 720, 7200, 86400];
+    let mut land = vec![format!(
+        "CREATE TABLE {db}.rd_s2 ENGINE = Memory AS \
+         SELECT metric, lvl, concat('{{\"lvl\":\"', lvl, '\"}}') AS labels, \
+                concat(metric, unhex('FF'), 'lvl', unhex('FF'), lvl, unhex('FF')) AS buf, \
+                bitOr(bitShiftLeft(toUInt128(bitShiftRight(cityHash64(metric), 32)), 96), \
+                      bitAnd(bitOr(bitShiftLeft(toUInt128(cityHash64(buf)), 64), toUInt128(xxHash64(buf))), \
+                             toUInt128('79228162514264337593543950335'))) AS fp \
+         FROM (SELECT arrayJoin(['s2_g1', 's2_g2', 's2_g3', 's2_g4', 's2_c']) AS metric) \
+         ARRAY JOIN ['60', '720', '7200', '86400', 'c4'] AS lvl \
+         WHERE NOT (lvl = 'c4' AND metric != 's2_c')"
+    )];
+    // Registrations: every hour of the 15 days.
+    land.push(format!(
+        "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+         SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, metric, fp, \
+                toInt64({}) + toInt64(n.number) * {HOUR} + 1000, labels, 0 \
+         FROM {db}.rd_s2, numbers({}) AS n",
+        e - 15 * DAY,
+        15 * 24
+    ));
+    let mut samples: Vec<(String, String, i64, u64)> = Vec::new();
+    for res in levels {
+        for (m, t, v) in s2_series(e, res * 1000) {
+            samples.push((m.to_string(), (res).to_string(), t, v));
+        }
+    }
+    // `c4`: 100 at `D − 86,430,000`, a stale marker at `D − 15 s`, 130 at `D`.
+    for (t, v) in [
+        (d - 86_430_000, 100f64.to_bits()),
+        (d - 15_000, STALE_BITS),
+        (d, 130f64.to_bits()),
+    ] {
+        samples.push(("s2_c".to_string(), "c4".to_string(), t, v));
+    }
+    for chunk in samples.chunks(2_000) {
+        let values: Vec<String> = chunk
+            .iter()
+            .map(|(m, l, t, v)| format!("('{m}', '{l}', {t}, {v})"))
+            .collect();
+        land.push(format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, r.metric, r.fp, x.t, reinterpretAsFloat64(x.v) \
+             FROM (SELECT * FROM values('m String, l String, t Int64, v UInt64', {})) AS x \
+             JOIN {db}.rd_s2 AS r ON r.metric = x.m AND r.lvl = x.l",
+            values.join(", ")
+        ));
+    }
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect");
+    let ctx = RenderCtx::for_tests(db, 30);
+    fresh(&bootstrap, &ctx).await;
+    let admin = ChClient::new(test_config(db)).await.expect("connect");
+    for sql in &land {
+        exec(&admin, sql).await;
+    }
+    // The first level by one run over the whole corpus.
+    build_first(&admin, &ctx, e - 15 * DAY, e, 15 * DAY).await;
+    build_later(&admin, &ctx).await;
+    let built = warm(bootstrap, admin, ctx, &[]).await;
+
+    let mut failures = Vec::new();
+    for (li, secs) in levels.into_iter().enumerate() {
+        let res = secs * 1000;
+        let b = e - 3 * res;
+        let p = range(b - 5 * res, b + 3 * res, res);
+        let sel = |m: &str| format!("{m}{{lvl=\"{secs}\"}}");
+        for g in ["s2_g1", "s2_g2", "s2_g3", "s2_g4"] {
+            let mut bit_equal_queries = vec![sel(g), format!("timestamp({})", sel(g))];
+            for f in [
+                "last_over_time",
+                "present_over_time",
+                "absent_over_time",
+                "max_over_time",
+                "min_over_time",
+            ] {
+                for r in [secs, 5 * secs] {
+                    bit_equal_queries.push(format!("{f}({}[{r}s])", sel(g)));
+                }
+            }
+            for q in &bit_equal_queries {
+                let (a, raw) = both(&built, q, &p, None).await;
+                if a.stages("rollup_route").is_empty() {
+                    failures.push(format!("{q} at {secs}s: not routed"));
+                }
+                let (ca, cb) = (vector_or_matrix(&a), vector_or_matrix(&raw));
+                if ca != cb {
+                    failures.push(format!("{q} at {secs}s: routed {ca:?}, raw {cb:?}"));
+                }
+            }
+            for f in ["sum_over_time", "avg_over_time"] {
+                for r in [secs, 5 * secs] {
+                    let q = format!("{f}({}[{r}s])", sel(g));
+                    let (a, raw) = both(&built, &q, &p, None).await;
+                    let (pa, pb) = (a.points(), raw.points());
+                    let limit = if f == "sum_over_time" {
+                        1e-12
+                    } else {
+                        bound("avg_over_time", "gauge", li).expect("avg bound")
+                    };
+                    let keys: std::collections::BTreeSet<_> = pa.keys().chain(pb.keys()).collect();
+                    for k in keys {
+                        let dk = d_of(pa.get(k), pb.get(k)).unwrap_or(0.0);
+                        if dk > limit {
+                            failures.push(format!(
+                                "{q} at {secs}s {k:?}: routed {:?}, raw {:?}",
+                                pa.get(k),
+                                pb.get(k)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let q = format!("increase({}[{}s])", sel("s2_c"), 5 * secs);
+        let (a, raw) = both(&built, &q, &p, None).await;
+        let (pa, pb) = (a.points(), raw.points());
+        let dist = distances(&pa, &pb);
+        assert!(!dist.is_empty(), "{q}: no points on either route");
+        let (p99, max) = p99_max(&dist);
+        let limit = bound("increase", "normal", li).expect("a counter bound");
+        println!(
+            "S2 {q}: n {} p99 {p99:e} max {max:e} bound {limit:e}",
+            dist.len()
+        );
+        if p99 > limit {
+            failures.push(format!("{q}: p99 {p99:e} above {limit:e}"));
+        }
+        if secs == 60 {
+            // The step whose window holds the first sample after the
+            // marker counts the 30 step, as raw does.
+            let resume = b + 2 * res - res / 2;
+            let t = ((resume - 1).div_euclid(res) + 1) * res;
+            let at = pa.iter().find(|((_, s), _)| *s == t).map(|(_, v)| *v);
+            let raw_at = pb.iter().find(|((_, s), _)| *s == t).map(|(_, v)| *v);
+            println!("S2 60 s step holding the resumed sample: routed {at:?}, raw {raw_at:?}");
+            if at.is_none() || at != raw_at || at < Some(30.0) {
+                failures.push(format!(
+                    "{q}: at the resumed step routed {at:?}, raw {raw_at:?}"
+                ));
+            }
+        }
+        // `c4`, an instant query at `D`.
+        let q = format!("increase(s2_c{{lvl=\"c4\"}}[{}s])", 5 * secs);
+        let (a, raw) = both(&built, &q, &range(d, d, 0), None).await;
+        let value = |x: &Answer| x.points().values().next().map(|v| v.to_bits());
+        let want: (Option<u64>, Option<u64>) = match secs {
+            60 => (None, None),
+            720 | 7200 => (Some(0f64.to_bits()), None),
+            _ => (Some(0f64.to_bits()), Some(45f64.to_bits())),
+        };
+        let got = (value(&a), value(&raw));
+        println!(
+            "S2 c4 at {secs}s: routed {:?}, raw {:?}",
+            got.0.map(f64::from_bits),
+            got.1.map(f64::from_bits)
+        );
+        if got != want {
+            failures.push(format!(
+                "{q}: routed {:?}, raw {:?}, want {:?}",
+                got.0.map(f64::from_bits),
+                got.1.map(f64::from_bits),
+                (want.0.map(f64::from_bits), want.1.map(f64::from_bits))
+            ));
+        }
+    }
+    // The size of the flags column, plan r9 section 6.
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct ColRow {
+        table: String,
+        name: String,
+        compressed: u64,
+        uncompressed: u64,
+    }
+    let mut stream = built
+        .admin
+        .query_stream::<ColRow>(
+            &format!(
+                "SELECT table, column AS name, toUInt64(sum(column_data_compressed_bytes)) AS compressed, \
+                        toUInt64(sum(column_data_uncompressed_bytes)) AS uncompressed \
+                 FROM system.parts_columns WHERE database = '{db}' AND active \
+                 AND match(table, '^metric_samples_[0-9]+s$') AND column IN ('flags', 'inc', 'last') \
+                 GROUP BY table, column ORDER BY table, column"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("columns");
+    while let Some(row) = stream.next().await {
+        let row = row.expect("decode");
+        println!(
+            "S2 column {}.{}: {} compressed, {} uncompressed bytes",
+            row.table, row.name, row.compressed, row.uncompressed
+        );
+    }
+    drop(stream);
+    built.finish().await;
+    assert!(failures.is_empty(), "S2 failures:\n{}", failures.join("\n"));
+}
+
+/// An answer's cells, a vector's samples at time 0, floats as their bits.
+fn vector_or_matrix(x: &Answer) -> BTreeMap<(String, i64), String> {
+    match &x.result {
+        QueryResult::Vector(v) => v
+            .iter()
+            .map(|s| {
+                let mut l = s.labels.clone();
+                l.sort();
+                ((format!("{l:?}"), 0), format!("{:016x}", s.value.to_bits()))
+            })
+            .collect(),
+        _ => x.cells(),
+    }
 }

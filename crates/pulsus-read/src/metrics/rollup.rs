@@ -264,7 +264,7 @@ pub fn level_fetch(
         "toUInt32(1)"
     };
     format!(
-        "SELECT {shard} AS shard, kind, fingerprint, t_end, t_last, last, min, max, sum, count, inc\n\
+        "SELECT {shard} AS shard, kind, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags\n\
          FROM {table}\n\
          WHERE (kind = 0 AND org_id = {} AND fingerprint IN ({}) AND t_end > {lo} AND t_end <= {hi})\n   \
          OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > {lo} AND t_last < {hi})\n\
@@ -289,6 +289,9 @@ pub struct LevelRow {
     pub sum: f64,
     pub count: u32,
     pub inc: f64,
+    /// Bit 1: the bucket's last sample is a stale marker; bit 2: the
+    /// bucket holds a NaN that is not a stale marker.
+    pub flags: u8,
 }
 
 /// One run row: the shard that answered it and its interval
@@ -909,6 +912,7 @@ mod tests {
             sum: last,
             count,
             inc,
+            flags: 0,
         }
     }
 
@@ -1014,6 +1018,120 @@ mod tests {
         );
     }
 
+    fn bits(s: &[Sample]) -> Vec<(i64, u64)> {
+        s.iter().map(|x| (x.t_ms, x.v.to_bits())).collect()
+    }
+
+    /// **S3 (issue #18 part B, plan r9 section 3 and r10 section 1): each
+    /// level row's flags and an empty `t_last` read as raw would.** A
+    /// stale ending rebuilds a stale marker at the bucket's end; a bucket
+    /// holding a NaN gives NaN for `sum_` and `avg_`, and an all-NaN bucket
+    /// its last NaN, payload and all, for `max_` and `min_`; a row with no
+    /// sample that is not a stale marker gives no counter point and still
+    /// adds its increase.
+    #[test]
+    fn s3_flags_and_empty_rows() {
+        use pulsus_model::STALE_NAN_BITS;
+        let r = 720_000;
+        let (e1, e2, e3) = (BASE + r, BASE + 2 * r, BASE + 3 * r);
+        let payload = f64::from_bits(9_221_120_237_041_090_562);
+        let flagged = |t_end: i64, t_last: i64, last: f64, count: u32, flags: u8| LevelRow {
+            sum: if count > 0 { 12.0 } else { 0.0 },
+            min: 3.0,
+            max: 7.0,
+            flags,
+            ..row(t_end, t_last, last, 0.0, count)
+        };
+        let one = |use_: RollupUse, row: LevelRow| {
+            let (pts, overlay) =
+                assemble(use_, r, &[Tagged::Level { res_ms: r, row }], &Vec::new());
+            assert_eq!(overlay, None);
+            bits(&pts)
+        };
+        let stale = STALE_NAN_BITS;
+        // `Last`: the last sample that is not a stale marker, then the
+        // marker at the bucket's end.
+        assert_eq!(
+            one(RollupUse::Last, flagged(e1, e1 - 9_000, 5.0, 1, 1)),
+            vec![(e1 - 9_000, 5.0f64.to_bits()), (e1, stale)],
+            "a bucket ending stale"
+        );
+        assert_eq!(
+            one(RollupUse::Last, flagged(e1, 0, 0.0, 0, 1)),
+            vec![(e1, stale)],
+            "a bucket of stale markers only"
+        );
+        assert_eq!(
+            one(RollupUse::Last, flagged(e1, e1 - 9_000, 5.0, 1, 0)),
+            vec![(e1 - 9_000, 5.0f64.to_bits())]
+        );
+        // `Max`, `Min`.
+        for (u, v) in [(RollupUse::Max, 7.0f64), (RollupUse::Min, 3.0)] {
+            assert_eq!(
+                one(u, flagged(e1, e1 - 9_000, 7.0, 2, 2)),
+                vec![(e1, v.to_bits())],
+                "{u:?}: a bucket holding a NaN beside numbers"
+            );
+            assert_eq!(
+                one(u, flagged(e1, e1 - 9_000, payload, 0, 2)),
+                vec![(e1, payload.to_bits())],
+                "{u:?}: an all-NaN bucket gives its last NaN"
+            );
+            assert_eq!(
+                one(u, flagged(e1, 0, 0.0, 0, 1)),
+                vec![],
+                "{u:?}: stale only"
+            );
+        }
+        // `Sum`, `Avg`.
+        for (u, v) in [(RollupUse::Sum, 12.0f64), (RollupUse::Avg, 6.0)] {
+            let nan = one(u, flagged(e1, e1 - 9_000, 7.0, 2, 2));
+            assert_eq!(nan.len(), 1, "{u:?}");
+            assert_eq!(nan[0].0, e1);
+            assert!(
+                f64::from_bits(nan[0].1).is_nan(),
+                "{u:?}: NaN when the bucket holds a NaN"
+            );
+            assert_eq!(
+                one(u, flagged(e1, e1 - 9_000, 7.0, 2, 0)),
+                vec![(e1, v.to_bits())]
+            );
+            assert_eq!(
+                one(u, flagged(e1, 0, 0.0, 0, 1)),
+                vec![],
+                "{u:?}: stale only"
+            );
+        }
+        // `Counter`: the empty row gives no point and adds its increase.
+        let seq = [
+            Tagged::Level {
+                res_ms: r,
+                row: row(e1, e1 - 9_000, 100.0, 0.0, 48),
+            },
+            Tagged::Level {
+                res_ms: r,
+                row: LevelRow {
+                    flags: 1,
+                    ..row(e2, 0, 0.0, 0.0, 0)
+                },
+            },
+            Tagged::Level {
+                res_ms: r,
+                row: row(e3, e3 - 9_000, 130.0, 30.0, 48),
+            },
+        ];
+        let (pts, _) = assemble(RollupUse::Counter, r, &seq, &Vec::new());
+        assert_eq!(
+            points(&pts),
+            vec![
+                (e1 - r + 1, 100.0),
+                (e1 - 9_000, 100.0),
+                (e3 - r + 1, 100.0),
+                (e3 - 9_000, 130.0),
+            ]
+        );
+    }
+
     fn run(shard: u32, t_last: i64, t_end: i64) -> RunRow {
         RunRow {
             shard,
@@ -1073,7 +1191,7 @@ mod tests {
             Fingerprint::from_raw(101).sql_literal(),
             Fingerprint::from_raw(205).sql_literal(),
         ];
-        let body = "kind, fingerprint, t_end, t_last, last, min, max, sum, count, inc\n";
+        let body = "kind, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags\n";
         let rest = "WHERE (kind = 0 AND org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205')) AND t_end > 1000 AND t_end <= 9000)\n   OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > 1000 AND t_last < 9000)\nORDER BY kind, fingerprint, t_end";
         assert_eq!(
             level_fetch(&no_tenant(), "metric_samples_720s", &fps, 1000, 9000, false),

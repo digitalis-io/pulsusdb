@@ -2598,14 +2598,17 @@ fn the_rollup_levels_render_from_one_template() {
                     // predecessor more than a day before a sample is used.
                     let own = format!("FROM pulsus.metric_samples_{r}s\n");
                     for needle in [
-                        "lagInFrame(toNullable(unix_milli)) OVER (PARTITION BY org_id, fingerprint ORDER BY unix_milli, bits ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS t0",
+                        "anyLast(if(bits = 9218868437227405314, NULL, toNullable(reinterpretAsFloat64(bits)))) OVER (PARTITION BY org_id, fingerprint ORDER BY unix_milli, bits ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS q0,",
+                        "anyLast(if(bits = 9218868437227405314, NULL, toNullable(unix_milli))) OVER (PARTITION BY org_id, fingerprint ORDER BY unix_milli, bits ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS t0",
+                        "maxIf(unix_milli, bits != 9218868437227405314) AS t_last, argMaxIf(value, (unix_milli, bits), bits != 9218868437227405314) AS last,",
+                        "sum(d) AS inc, toUInt8(if(argMax(bits, (unix_milli, bits)) = 9218868437227405314, 1, 0) + if(countIf(isNaN(value) AND bits != 9218868437227405314) > 0, 2, 0)) AS flags, any(now_ms) AS built_at",
                         "if(isNull(q0), if(unix_milli - tp0 <= 86400000, p0, NULL), if(unix_milli - t0 <= 86400000, q0, NULL)) AS q",
-                        "toNullable(argMaxIf(last, t_last, NOT isNaN(last))) AS p0,",
-                        "toNullable(maxIf(t_last, NOT isNaN(last))) AS tp0",
+                        "toNullable(argMaxIf(last, t_last, t_last > 0)) AS p0,",
+                        "toNullable(maxIf(t_last, t_last > 0)) AS tp0",
                         own.as_str(),
                         "WHERE kind = 0 AND t_end <= lo AND t_end > lo - 86400000",
                         "AND (org_id, fingerprint) IN (SELECT org_id, fingerprint",
-                        "GROUP BY org_id, fingerprint HAVING min(unix_milli) > lo)",
+                        "GROUP BY org_id, fingerprint HAVING minIf(unix_milli, reinterpretAsUInt64(value) != 9218868437227405314) > lo)",
                         "USING (org_id, fingerprint)",
                     ] {
                         assert!(
@@ -2620,6 +2623,10 @@ fn the_rollup_levels_render_from_one_template() {
                         format!(
                             "AND intDiv(t_end - 1, {r}000) BETWEEN intDiv(lo, {r}000) AND intDiv(hi - 1, {r}000)"
                         ),
+                        // Issue #18 part B: flag 1 from the newest row, flag
+                        // 2 from any.
+                        "sum(ic) AS inc, toUInt8(bitAnd(argMax(fl, te), 1) + bitAnd(groupBitOr(fl), 2)) AS flags, any(now_ms) AS built_at".to_string(),
+                        "sum AS sm, count AS ct, inc AS ic, flags AS fl".to_string(),
                     ] {
                         assert!(
                             view.contains(&needle),

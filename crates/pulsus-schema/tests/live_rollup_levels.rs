@@ -1329,3 +1329,179 @@ async fn a_sparse_counter_keeps_its_steps() {
 
     drop_db(&client, db).await;
 }
+
+static DB_STALE: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_levels_stale");
+
+/// The stale marker's bits.
+const STALE: u64 = 9_218_868_437_227_405_314;
+/// Two ordinary NaNs with different payloads.
+const NAN_A: u64 = 9_221_120_237_041_090_561;
+const NAN_B: u64 = 9_221_120_237_041_090_562;
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct FlagRow {
+    fingerprint: u128,
+    t_end: i64,
+    t_last: i64,
+    last_bits: u64,
+    max_bits: u64,
+    count: u32,
+    inc: f64,
+    flags: u8,
+}
+
+/// **S1 (issue #18 part B, plan r9 to r11): stale markers and NaN values
+/// at the levels.** `g1` 5 then a stale marker in one bucket; `g2` a
+/// bucket of a stale marker only; `g3` two NaNs with different payloads;
+/// `g4` 3, NaN, 7; `c1` 100, stale, 130 in one bucket; `c2` 100 ending a
+/// bucket, a stale marker, 130 first in the next, inside one 720 s
+/// bucket; `c3` 100 150 s before a run's `lo`, a stale marker 30 s before
+/// it, 130 after it, in separate runs; `c4` 100 at `D − 86,430,000` ms, a
+/// stale marker at `D − 15,000` ms, 130 at `D`, one run holding all
+/// three.
+#[tokio::test]
+async fn stale_markers_and_nan_at_the_levels() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = DB_STALE.name();
+    let ctx = RenderCtx::for_tests(db, 7);
+    fresh(&client, &ctx).await;
+    let now = now_ms(&client).await;
+    let d = (now / DAY) * DAY - DAY;
+    let l = d - 36 * HOUR;
+    let hh = d - 12 * HOUR;
+    let s = 1_000;
+    let samples: Vec<Sample> = vec![
+        (1, hh + 20 * MINUTE + 10 * s, 5f64.to_bits()),
+        (1, hh + 20 * MINUTE + 40 * s, STALE),
+        (2, hh + 30 * MINUTE + 30 * s, STALE),
+        (3, hh + 40 * MINUTE + 10 * s, NAN_A),
+        (3, hh + 40 * MINUTE + 40 * s, NAN_B),
+        (4, hh + 50 * MINUTE + 10 * s, 3f64.to_bits()),
+        (4, hh + 50 * MINUTE + 25 * s, f64::NAN.to_bits()),
+        (4, hh + 50 * MINUTE + 40 * s, 7f64.to_bits()),
+        (11, hh + 10 * MINUTE + 5 * s, 100f64.to_bits()),
+        (11, hh + 10 * MINUTE + 20 * s, STALE),
+        (11, hh + 10 * MINUTE + 35 * s, 130f64.to_bits()),
+        (12, hh + 3 * MINUTE + 50 * s, 100f64.to_bits()),
+        (12, hh + 3 * MINUTE + 55 * s, STALE),
+        (12, hh + 4 * MINUTE + 5 * s, 130f64.to_bits()),
+        (13, l - 150 * s, 100f64.to_bits()),
+        (13, l - 30 * s, STALE),
+        (13, l + 15 * s, 130f64.to_bits()),
+        (14, d - 86_430_000, 100f64.to_bits()),
+        (14, d - 15_000, STALE),
+        (14, d, 130f64.to_bits()),
+    ];
+    let tuples: Vec<String> = samples
+        .iter()
+        .map(|(fp, t, bits)| format!("({fp}, {t}, {bits})"))
+        .collect();
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, '', fp, t, reinterpretAsFloat64(b) \
+             FROM values('fp UInt128, t Int64, b UInt64', {})",
+            tuples.join(", ")
+        ),
+    )
+    .await;
+    exec(&client, &first_level_insert(&ctx, d - 2 * DAY, l)).await;
+    exec(&client, &first_level_insert(&ctx, l, d)).await;
+    for r in [720u32, 7200, 86400] {
+        until_idle(&client, db, r, 400).await;
+    }
+
+    let level = |r: u32| {
+        let client = &client;
+        async move {
+            rows::<FlagRow>(
+                client,
+                &format!(
+                    "SELECT fingerprint, t_end, t_last, reinterpretAsUInt64(last) AS last_bits, \
+                     reinterpretAsUInt64(max) AS max_bits, count, inc, flags \
+                     FROM {db}.metric_samples_{r}s WHERE kind = 0 ORDER BY fingerprint, t_end"
+                ),
+            )
+            .await
+        }
+    };
+    let of = |rows: &[FlagRow], fp: u128| -> Vec<FlagRow> {
+        rows.iter()
+            .filter(|x| x.fingerprint == fp)
+            .cloned()
+            .collect()
+    };
+    let bucket = |rows: &[FlagRow], fp: u128, t: i64, res: i64| -> FlagRow {
+        let t_end = ((t - 1).div_euclid(res) + 1) * res;
+        rows.iter()
+            .find(|x| x.fingerprint == fp && x.t_end == t_end)
+            .unwrap_or_else(|| panic!("series {fp}: no row ending {t_end}"))
+            .clone()
+    };
+    let m = level(60).await;
+    let g1 = of(&m, 1);
+    assert_eq!(
+        (g1.len(), g1[0].last_bits, g1[0].flags),
+        (1, 5f64.to_bits(), 1),
+        "g1: {g1:?}"
+    );
+    let g2 = of(&m, 2);
+    assert_eq!((g2[0].t_last, g2[0].flags), (0, 1), "g2: {g2:?}");
+    let g3 = of(&m, 3);
+    assert_eq!(
+        (g3[0].count, g3[0].flags, g3[0].last_bits),
+        (0, 2, NAN_B),
+        "g3: {g3:?}"
+    );
+    let g4 = of(&m, 4);
+    assert_eq!(
+        (g4[0].max_bits, g4[0].count, g4[0].flags),
+        (7f64.to_bits(), 2, 2),
+        "g4: {g4:?}"
+    );
+    for (fp, t) in [
+        (11u128, hh + 10 * MINUTE + 35 * s),
+        (12, hh + 4 * MINUTE + 5 * s),
+        (13, l + 15 * s),
+    ] {
+        let row = bucket(&m, fp, t, MINUTE);
+        assert_eq!(
+            row.inc, 30.0,
+            "series {fp}: the bucket of 130 counts the step past the stale marker: {row:?}"
+        );
+    }
+    let c2: Vec<u8> = of(&m, 12).iter().map(|x| x.flags).collect();
+    assert_eq!(c2, vec![1, 0], "c2's 60 s rows");
+    assert_eq!(
+        bucket(&m, 14, d, MINUTE).inc,
+        0.0,
+        "c4: the step from 100 is over a day"
+    );
+
+    for r in [720u32, 7200, 86400] {
+        let res = i64::from(r) * 1000;
+        let rows = level(r).await;
+        for (fp, from) in [(1u128, &g1[0]), (2, &g2[0]), (3, &g3[0]), (4, &g4[0])] {
+            let got = of(&rows, fp);
+            assert_eq!(got.len(), 1, "{r}s, series {fp}: {got:?}");
+            assert_eq!(
+                (got[0].t_last, got[0].last_bits, got[0].flags),
+                (from.t_last, from.last_bits, from.flags),
+                "{r}s, series {fp}"
+            );
+        }
+        let c2 = of(&rows, 12);
+        assert_eq!(c2.len(), 1, "{r}s: c2 in one bucket: {c2:?}");
+        assert_eq!(c2[0].flags, 0, "{r}s: c2 resumed, so its flag 1 is clear");
+        assert_eq!(
+            bucket(&rows, 14, d, res).inc,
+            0.0,
+            "{r}s: c4's bucket of 130"
+        );
+    }
+
+    drop_db(&client, db).await;
+}

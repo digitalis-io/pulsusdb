@@ -985,6 +985,7 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level     sum Float64 CODEC(Gorilla(8), ZSTD(1)),
 --@level     count UInt32 CODEC(T64, ZSTD(1)),
 --@level     inc Float64 CODEC(Gorilla(8), ZSTD(1)),
+--@level     flags UInt8 CODEC(T64, ZSTD(1)),
 --@level     built_at Int64 CODEC(DoubleDelta, ZSTD(1))
 --@level-feeds     , PROJECTION by_parent (SELECT * ORDER BY (intDiv(t_end - 1, {{parent_ms}}), org_id, fingerprint, t_end))
 --@level )
@@ -1031,7 +1032,7 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level-first   max(unix_milli) AS t_last, argMax(value, (unix_milli, bits)) AS last,
 --@level-first   minIf(value, NOT isNaN(value)) AS min, maxIf(value, NOT isNaN(value)) AS max,
 --@level-first   sumIf(value, NOT isNaN(value)) AS sum, toUInt32(countIf(NOT isNaN(value))) AS count,
---@level-first   sum(d) AS inc, any(now_ms) AS built_at
+--@level-first   sum(d) AS inc, toUInt8(0) AS flags, any(now_ms) AS built_at
 --@level-first FROM (
 --@level-first   SELECT org_id, fingerprint, unix_milli, bits, value,
 --@level-first     if(q IS NULL OR isNaN(value) OR isNaN(assumeNotNull(q)), 0.,
@@ -1071,7 +1072,7 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level-next SELECT toUInt8(0) AS kind, org_id, fingerprint, (intDiv(te - 1, {{level_ms}}) + 1) * {{level_ms}} AS t_end,
 --@level-next   max(tl) AS t_last, argMax(lv, tl) AS last,
 --@level-next   minIf(mn, ct > 0) AS min, maxIf(mx, ct > 0) AS max,
---@level-next   sum(sm) AS sum, toUInt32(sum(ct)) AS count, sum(ic) AS inc, any(now_ms) AS built_at
+--@level-next   sum(sm) AS sum, toUInt32(sum(ct)) AS count, sum(ic) AS inc, toUInt8(0) AS flags, any(now_ms) AS built_at
 --@level-next FROM (SELECT org_id, fingerprint, t_end AS te, t_last AS tl, last AS lv, min AS mn, max AS mx,
 --@level-next              sum AS sm, count AS ct, inc AS ic
 --@level-next       FROM {{db}}.{{source}}
@@ -1080,7 +1081,7 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level-next         AND t_end > lo AND t_end <= hi)
 --@level-next GROUP BY org_id, fingerprint, t_end
 --@level UNION ALL
---@level SELECT toUInt8(1), '', toUInt128(0), r.2, r.1, 0., 0., 0., 0., toUInt32(0), 0., now_ms
+--@level SELECT toUInt8(1), '', toUInt128(0), r.2, r.1, 0., 0., 0., 0., toUInt32(0), 0., toUInt8(0), now_ms
 --@level FROM system.one
 --@level ARRAY JOIN if(work, arrayMap(d -> (greatest(lo, toInt64(d) * 86400000), least(hi, (toInt64(d) + 1) * 86400000)),
 --@level                                range(toUInt64(intDiv(lo, 86400000)), toUInt64(intDiv(hi - 1, 86400000) + 1))),
