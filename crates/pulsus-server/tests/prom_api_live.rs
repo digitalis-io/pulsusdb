@@ -472,6 +472,26 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
     assert_eq!(status, 200);
     assert!(body.contains("\"version\""), "body: {body}");
 
+    // B6 (issue #18 part B): `runtimeinfo` lists the levels the database
+    // holds, the default four here, once the level loop has read them.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut levels = serde_json::Value::Null;
+    while Instant::now() < deadline {
+        if let Some((200, body)) = http_get(port, "/api/v1/status/runtimeinfo") {
+            let json: serde_json::Value = serde_json::from_str(&body).expect("runtimeinfo JSON");
+            levels = json["data"]["rollupLevels"].clone();
+            if levels == serde_json::json!(["1m", "12m", "2h", "1d"]) {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        levels,
+        serde_json::json!(["1m", "12m", "2h", "1d"]),
+        "runtimeinfo lists the default rollup levels"
+    );
+
     // Cheap error-path proof end to end: a malformed query is 400
     // `bad_data`, no `position` field on the wire.
     let (status, body) =

@@ -148,6 +148,32 @@ pub struct SelectorSpec {
     /// (`ev.smoothSeries(e.Series, e.Offset, e.PositionRange())`,
     /// engine.go:2540). Eval only.
     pub pos_start: usize,
+    /// Issue #18 part B: what the selector's consumer reads from it, when
+    /// a rollup level can serve that consumer. Assigned by the post-plan
+    /// pass [`assign_rollup_use`]; `None` keeps the selector on raw.
+    pub rollup_use: Option<RollupUse>,
+    /// Issue #18 part B: the selector sits inside a subquery. Fetch only.
+    pub in_subquery: bool,
+}
+
+/// Issue #18 part B: the one column of a rollup level a selector's
+/// consumer reads (design r13 section 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollupUse {
+    /// An instant selector, `last_over_time`, `present_over_time`,
+    /// `absent_over_time`, `timestamp`: `last` at `t_last`.
+    Last,
+    /// `max_over_time`: `max` at `t_end`.
+    Max,
+    /// `min_over_time`: `min` at `t_end`.
+    Min,
+    /// `sum_over_time`: `sum` at `t_end`.
+    Sum,
+    /// `avg_over_time`: `sum / count` at `t_end`.
+    Avg,
+    /// `rate`, `increase`: a counter that never resets, from `last` and
+    /// `inc`.
+    Counter,
 }
 
 /// The fetch-window context accumulated over a selector's enclosing
@@ -1040,6 +1066,10 @@ impl Planner {
             anchored,
             smoothed,
             pos_start,
+            // Issue #18 part B: assigned by the post-plan pass
+            // ([`assign_rollup_use`]) once the whole tree exists.
+            rollup_use: None,
+            in_subquery: self.subquery_depth > 0,
         });
         id
     }
@@ -1164,6 +1194,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
             let mut selectors = planner.selectors;
             let root = PlanExpr::RangeVector { source };
             detect_histogram_stats(&root, &mut selectors);
+            assign_rollup_use(&root, &mut selectors);
             return Ok(QueryPlan {
                 root,
                 selectors,
@@ -1184,6 +1215,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
     let root = plan_expr(&mut planner, expr)?;
     let mut selectors = planner.selectors;
     detect_histogram_stats(&root, &mut selectors);
+    assign_rollup_use(&root, &mut selectors);
     Ok(QueryPlan {
         root,
         selectors,
@@ -1342,6 +1374,138 @@ fn detect_histogram_stats(root: &PlanExpr, selectors: &mut [SelectorSpec]) {
     }
 
     walk(root, false, false, selectors);
+}
+
+/// Issue #18 part B: the post-plan pass that records, on each selector,
+/// what its consumer reads (`SelectorSpec::rollup_use`).
+///
+/// An instant selector reads `last` (`timestamp(x)` reads one too); a
+/// range selector that is the direct source of `rate`/`increase` reads the
+/// counter, of `max_`/`min_`/`sum_`/`avg_over_time` that column, of
+/// `last_`/`present_over_time` or `absent_over_time` `last`; every other
+/// range selector nothing (design r13 section 2's map).
+fn assign_rollup_use(root: &PlanExpr, selectors: &mut [SelectorSpec]) {
+    for spec in selectors.iter_mut() {
+        spec.rollup_use = spec.range_ms.is_none().then_some(RollupUse::Last);
+    }
+    fn walk(expr: &PlanExpr, selectors: &mut [SelectorSpec]) {
+        let direct = match expr {
+            PlanExpr::RangeFn {
+                func: RangeFn::Rate | RangeFn::Increase,
+                source: RangeSource::Selector(id),
+                ..
+            } => Some((*id, RollupUse::Counter)),
+            PlanExpr::OverTime {
+                func,
+                source: RangeSource::Selector(id),
+                ..
+            } => match func {
+                OverTimeFn::Max => Some((*id, RollupUse::Max)),
+                OverTimeFn::Min => Some((*id, RollupUse::Min)),
+                OverTimeFn::Sum => Some((*id, RollupUse::Sum)),
+                OverTimeFn::Avg => Some((*id, RollupUse::Avg)),
+                OverTimeFn::Last | OverTimeFn::Present => Some((*id, RollupUse::Last)),
+                _ => None,
+            },
+            PlanExpr::AbsentOverTime {
+                source: RangeSource::Selector(id),
+            } => Some((*id, RollupUse::Last)),
+            _ => None,
+        };
+        if let Some((id, use_)) = direct
+            && let Some(spec) = selectors.get_mut(id)
+        {
+            spec.rollup_use = Some(use_);
+        }
+        for_each_child(expr, &mut |child| walk(child, selectors));
+    }
+    walk(root, selectors);
+}
+
+/// Every direct child expression of `expr`, a subquery source's inner
+/// expression included.
+fn for_each_child(expr: &PlanExpr, f: &mut dyn FnMut(&PlanExpr)) {
+    let source = |s: &RangeSource, f: &mut dyn FnMut(&PlanExpr)| {
+        if let RangeSource::Subquery(sq) = s {
+            f(&sq.inner);
+        }
+    };
+    match expr {
+        PlanExpr::Selector(_)
+        | PlanExpr::Time
+        | PlanExpr::Scalar(_)
+        | PlanExpr::StringLiteral(_) => {}
+        PlanExpr::RangeVector { source: s }
+        | PlanExpr::RangeFn { source: s, .. }
+        | PlanExpr::OverTime { source: s, .. }
+        | PlanExpr::AbsentOverTime { source: s } => source(s, f),
+        PlanExpr::OverTimeParam {
+            source: s, args, ..
+        } => {
+            source(s, f);
+            for a in args {
+                f(a);
+            }
+        }
+        PlanExpr::HistogramAccessor { arg, .. }
+        | PlanExpr::Absent { arg, .. }
+        | PlanExpr::Sort { arg, .. }
+        | PlanExpr::SortByLabel { arg, .. }
+        | PlanExpr::LabelReplace { arg, .. }
+        | PlanExpr::LabelJoin { arg, .. }
+        | PlanExpr::ScalarOf { arg }
+        | PlanExpr::VectorOf { arg }
+        | PlanExpr::Timestamp { arg, .. } => f(arg),
+        PlanExpr::HistogramQuantile { quantile, expr, .. } => {
+            f(quantile);
+            f(expr);
+        }
+        PlanExpr::HistogramQuantiles {
+            expr, quantiles, ..
+        } => {
+            f(expr);
+            for q in quantiles {
+                f(q);
+            }
+        }
+        PlanExpr::HistogramFraction {
+            lower, upper, expr, ..
+        } => {
+            f(lower);
+            f(upper);
+            f(expr);
+        }
+        PlanExpr::MathFn {
+            arg, scalar_args, ..
+        } => {
+            f(arg);
+            for a in scalar_args {
+                f(a);
+            }
+        }
+        PlanExpr::Aggregate { expr, param, .. } => {
+            f(expr);
+            if let Some(p) = param {
+                f(p);
+            }
+        }
+        PlanExpr::CountValues { expr, .. } => f(expr),
+        PlanExpr::Binary { lhs, rhs, .. } | PlanExpr::SetOp { lhs, rhs, .. } => {
+            f(lhs);
+            f(rhs);
+        }
+        PlanExpr::DateFn { arg, .. } => {
+            if let Some(a) = arg {
+                f(a);
+            }
+        }
+        PlanExpr::Info { base, .. } => f(base),
+        PlanExpr::ScalarFn { args, .. } => {
+            for a in args {
+                f(a);
+            }
+        }
+    }
 }
 
 /// Issue #32 code-review round-1 fix: a `match[]` discovery selector
@@ -4814,6 +4978,9 @@ mod tests {
     fn strip_pos(mut selectors: Vec<SelectorSpec>) -> Vec<SelectorSpec> {
         for s in &mut selectors {
             s.pos_start = 0;
+            // Issue #18 part B: the column a rollup level would serve the
+            // consumer from differs by function; the raw fetch does not.
+            s.rollup_use = None;
         }
         selectors
     }
@@ -5411,6 +5578,8 @@ mod tests {
             histogram_stats: false,
             anchored: false,
             smoothed: false,
+            rollup_use: None,
+            in_subquery: false,
         };
         let p = PlanParams {
             start_ms: 10_000_000,
@@ -6741,6 +6910,57 @@ mod tests {
         assert_eq!(
             stats_flags("histogram_count(sum(m)) + on() sum(m2)"),
             vec![true, false]
+        );
+    }
+
+    /// **B1b (issue #18 part B): each selector records what its consumer
+    /// reads.** An instant selector reads `last`; the direct source of
+    /// `rate`/`increase` the counter; of `max_`/`min_`/`sum_`/`avg_over_time`
+    /// that column; of `last_`/`present_`/`absent_over_time` `last`; every
+    /// other range selector nothing. `in_subquery` is set only inside a
+    /// subquery.
+    #[test]
+    fn b1b_each_selector_records_what_its_consumer_reads() {
+        let uses = |query: &str| -> Vec<(Option<RollupUse>, bool)> {
+            let expr = parse(query).unwrap();
+            plan(&expr, params())
+                .unwrap()
+                .selectors
+                .iter()
+                .map(|s| (s.rollup_use, s.in_subquery))
+                .collect()
+        };
+        let cases: [(&str, Option<RollupUse>); 18] = [
+            ("rate(m[5m])", Some(RollupUse::Counter)),
+            ("increase(m[5m])", Some(RollupUse::Counter)),
+            ("max_over_time(m[5m])", Some(RollupUse::Max)),
+            ("min_over_time(m[5m])", Some(RollupUse::Min)),
+            ("sum_over_time(m[5m])", Some(RollupUse::Sum)),
+            ("avg_over_time(m[5m])", Some(RollupUse::Avg)),
+            ("last_over_time(m[5m])", Some(RollupUse::Last)),
+            ("present_over_time(m[5m])", Some(RollupUse::Last)),
+            ("absent_over_time(m[5m])", Some(RollupUse::Last)),
+            ("timestamp(m)", Some(RollupUse::Last)),
+            ("m", Some(RollupUse::Last)),
+            ("quantile_over_time(0.5, m[5m])", None),
+            ("irate(m[5m])", None),
+            ("delta(m[5m])", None),
+            ("changes(m[5m])", None),
+            ("count_over_time(m[5m])", None),
+            ("deriv(m[5m])", None),
+            ("stddev_over_time(m[5m])", None),
+        ];
+        for (query, want) in cases {
+            assert_eq!(uses(query), vec![(want, false)], "{query}");
+        }
+        // The selector inside the subquery reads the counter, and is
+        // marked as inside a subquery; the one outside is not.
+        assert_eq!(
+            uses("max_over_time(rate(m[5m])[1h:5m]) + m"),
+            vec![
+                (Some(RollupUse::Counter), true),
+                (Some(RollupUse::Last), false)
+            ]
         );
     }
 }

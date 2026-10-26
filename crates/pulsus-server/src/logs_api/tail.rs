@@ -2217,6 +2217,7 @@ mod tests {
                 OnceLock::new(),
             ))),
             label_cache: Arc::new(OnceLock::new()),
+            rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
             graph_target: pulsus_read::GraphTargetCache::default(),
             eval_gate: Arc::new(pulsus_read::EvalGate::new(
                 pulsus_config::Config::default()

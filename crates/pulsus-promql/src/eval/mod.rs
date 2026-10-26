@@ -76,6 +76,7 @@ impl<'a> EvalData<'a> {
                             // sample, so the aligned ST channel (if any)
                             // carries over unchanged.
                             start_ts: fs.start_ts.clone(),
+                            raw_overlay: None,
                         })
                         .collect(),
                 );
@@ -2242,10 +2243,18 @@ fn windowed_range_source(
                     // ST too); the overwhelmingly common `None` case takes
                     // the untouched pre-change path.
                     let (samples, st) = match &s.start_ts {
-                        None => (
-                            windowed_non_stale(&s.samples, slice_lower, slice_upper),
-                            None,
-                        ),
+                        // Issue #18 part B (plan Q12): a window reaching
+                        // time no rollup level covers reads the raw samples.
+                        None => match &s.raw_overlay {
+                            Some(o) if o.touches(lower_excl, eff_t) => (
+                                windowed_non_stale(&o.samples, slice_lower, slice_upper),
+                                None,
+                            ),
+                            _ => (
+                                windowed_non_stale(&s.samples, slice_lower, slice_upper),
+                                None,
+                            ),
+                        },
                         Some(st) => {
                             let (samples, st) = windowed_non_stale_with_st(
                                 &s.samples,
@@ -4524,6 +4533,7 @@ mod tests {
             labels: Labels::new(labels.iter().map(|(k, v)| (k.to_string(), v.to_string()))),
             samples,
             start_ts: None,
+            raw_overlay: None,
         }
     }
 

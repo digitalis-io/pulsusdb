@@ -32,13 +32,13 @@ pub use math::KahanSum;
 pub use parser::parse;
 pub use plan::{
     AggOp, BinOp, DEFAULT_LOOKBACK_MS, FillValues, Group, Grouping, Matching, MathFn, OverTimeFn,
-    OverTimeParamFn, PlanExpr, PlanParams, QueryPlan, RangeFn, ScalarFn, SelectorId, SelectorSpec,
-    SetOp, exemplar_selectors, plan, series_selector,
+    OverTimeParamFn, PlanExpr, PlanParams, QueryPlan, RangeFn, RollupUse, ScalarFn, SelectorId,
+    SelectorSpec, SetOp, exemplar_selectors, plan, series_selector,
 };
 pub use re2_syntax::re2_pattern_to_rust;
 pub use value::{
-    FetchedSeries, InstantSample, Labels, Point, PushedNode, QueryValue, RangeSeries, Sample,
-    SeriesData,
+    FetchedSeries, InstantSample, Labels, Point, PushedNode, QueryValue, RangeSeries, RawOverlay,
+    Sample, SeriesData,
 };
 
 /// True iff the (paren-stripped) root of `expr` is a call to one of the

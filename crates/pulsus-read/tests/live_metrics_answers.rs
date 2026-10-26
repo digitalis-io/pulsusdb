@@ -904,6 +904,7 @@ fn in_memory_answer(query: &str, fx: &[FixtureSeries], p: &MetricQueryParams) ->
                     all
                 },
                 start_ts: None,
+                raw_overlay: None,
             })
             .collect();
         data.insert(spec.id, series);

@@ -104,6 +104,11 @@ pub async fn run(config: Config) -> ExitCode {
     // reconnect loop only in reader-enabled modes (see `reader_enabled`).
     // `ops::ready` gates on `label_cache.get().is_some_and(|c| c.is_warm())`.
     let label_cache_slot: Arc<OnceLock<Arc<LabelCache>>> = Arc::new(OnceLock::new());
+    // Issue #18 part B: the rollup levels the database holds, refreshed
+    // every 60 s by a loop the reconnect loop starts beside the label
+    // cache's; its handle comes back the same way.
+    let rollup_levels_slot = Arc::new(pulsus_read::metrics::rollup::LevelSlot::new());
+    let (rollup_levels_tx, rollup_levels_rx) = oneshot::channel();
     // The label cache's refresh-loop handle, handed back over a oneshot
     // channel so `run` can abort and join it at shutdown. The reconnect
     // loop is a one-shot bootstrap (see its own doc comment): it runs
@@ -131,6 +136,8 @@ pub async fn run(config: Config) -> ExitCode {
         BackgroundHandoff {
             label_cache_refresh: label_cache_refresh_tx,
             reprobe: reprobe_tx,
+            rollup_levels: rollup_levels_tx,
+            rollup_slot: Arc::clone(&rollup_levels_slot),
         },
         REQUIRED_SERVER_NAMES,
     );
@@ -152,6 +159,7 @@ pub async fn run(config: Config) -> ExitCode {
         metric_writer: Arc::new(MetricWriterSink::new(Arc::clone(&metric_writer_slot))),
         trace_writer: Arc::new(TraceWriterSink::new(Arc::clone(&trace_writer_slot))),
         label_cache: Arc::clone(&label_cache_slot),
+        rollup_levels: Arc::clone(&rollup_levels_slot),
         graph_target: pulsus_read::GraphTargetCache::default(),
         eval_gate: Arc::new(pulsus_read::EvalGate::new(
             config.reader.query_eval_concurrency,
@@ -167,7 +175,13 @@ pub async fn run(config: Config) -> ExitCode {
         Ok(router) => router,
         Err(err) => {
             eprintln!("pulsusdb: {err}");
-            shutdown_background_tasks(reconnect_handle, label_cache_refresh_rx, reprobe_rx).await;
+            shutdown_background_tasks(
+                reconnect_handle,
+                label_cache_refresh_rx,
+                reprobe_rx,
+                rollup_levels_rx,
+            )
+            .await;
             return ExitCode::FAILURE;
         }
     };
@@ -182,8 +196,13 @@ pub async fn run(config: Config) -> ExitCode {
             Ok(tls_config) => Some(tls_config),
             Err(source) => {
                 eprintln!("pulsusdb: {}", ServeError::Tls(source));
-                shutdown_background_tasks(reconnect_handle, label_cache_refresh_rx, reprobe_rx)
-                    .await;
+                shutdown_background_tasks(
+                    reconnect_handle,
+                    label_cache_refresh_rx,
+                    reprobe_rx,
+                    rollup_levels_rx,
+                )
+                .await;
                 return ExitCode::FAILURE;
             }
         },
@@ -195,7 +214,13 @@ pub async fn run(config: Config) -> ExitCode {
         Ok(listener) => listener,
         Err(source) => {
             eprintln!("pulsusdb: {}", ServeError::Bind { addr, source });
-            shutdown_background_tasks(reconnect_handle, label_cache_refresh_rx, reprobe_rx).await;
+            shutdown_background_tasks(
+                reconnect_handle,
+                label_cache_refresh_rx,
+                reprobe_rx,
+                rollup_levels_rx,
+            )
+            .await;
             return ExitCode::FAILURE;
         }
     };
@@ -258,7 +283,13 @@ pub async fn run(config: Config) -> ExitCode {
         trace_writer.shutdown(WRITER_DRAIN_DEADLINE).await;
     }
 
-    shutdown_background_tasks(reconnect_handle, label_cache_refresh_rx, reprobe_rx).await;
+    shutdown_background_tasks(
+        reconnect_handle,
+        label_cache_refresh_rx,
+        reprobe_rx,
+        rollup_levels_rx,
+    )
+    .await;
 
     ExitCode::SUCCESS
 }
@@ -275,6 +306,7 @@ async fn shutdown_background_tasks(
     reconnect_handle: JoinHandle<()>,
     label_cache_refresh_rx: oneshot::Receiver<JoinHandle<()>>,
     reprobe_rx: oneshot::Receiver<JoinHandle<()>>,
+    rollup_levels_rx: oneshot::Receiver<JoinHandle<()>>,
 ) {
     reconnect_handle.abort();
     let _ = reconnect_handle.await;
@@ -297,6 +329,12 @@ async fn shutdown_background_tasks(
     if let Ok(reprobe_handle) = reprobe_rx.await {
         reprobe_handle.abort();
         let _ = reprobe_handle.await;
+    }
+    // Issue #18 part B: the rollup level loop, started beside the label
+    // cache's refresh loop and stopped as it is.
+    if let Ok(levels_handle) = rollup_levels_rx.await {
+        levels_handle.abort();
+        let _ = levels_handle.await;
     }
 }
 
@@ -394,6 +432,10 @@ struct WriterSlots {
 struct BackgroundHandoff {
     label_cache_refresh: oneshot::Sender<JoinHandle<()>>,
     reprobe: oneshot::Sender<JoinHandle<()>>,
+    /// Issue #18 part B: the rollup level loop's handle.
+    rollup_levels: oneshot::Sender<JoinHandle<()>>,
+    /// Issue #18 part B: the slot that loop fills.
+    rollup_slot: Arc<pulsus_read::metrics::rollup::LevelSlot>,
 }
 
 /// Background task: repeatedly checks the server's preconditions and then
@@ -415,6 +457,8 @@ fn spawn_reconnect_loop(
     let BackgroundHandoff {
         label_cache_refresh: label_cache_refresh_tx,
         reprobe: reprobe_tx,
+        rollup_levels: rollup_levels_tx,
+        rollup_slot,
     } = handoff;
     tokio::spawn(async move {
         let mut backoff = INITIAL_BACKOFF;
@@ -527,6 +571,29 @@ fn spawn_reconnect_loop(
                         let refresh_handle =
                             pulsus_read::spawn_refresh_loop(cache, config.reader.cache_ttl.0);
                         let _ = label_cache_refresh_tx.send(refresh_handle);
+                        // Issue #18 part B: the rollup level loop, on a
+                        // client over the same shared pool.
+                        match ChClient::from_shared_pool(Arc::clone(&pool), config.query_timeout.0)
+                            .with_consistency(consistency_from(&config))
+                        {
+                            Ok(client) => {
+                                let levels_handle = pulsus_read::metrics::rollup::spawn_level_loop(
+                                    rollup_slot,
+                                    client,
+                                    config.clickhouse.database.clone(),
+                                    config.dist_suffix.clone(),
+                                    config.cluster.clone(),
+                                );
+                                let _ = rollup_levels_tx.send(levels_handle);
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "invalid clickhouse consistency config"
+                                );
+                                return;
+                            }
+                        }
                     }
                     *pool_slot.write().await = Some(Arc::clone(&pool));
                     // Issue #43 re-probe: spawned unconditionally right
@@ -785,6 +852,8 @@ mod tests {
             BackgroundHandoff {
                 label_cache_refresh: refresh_tx,
                 reprobe: reprobe_tx,
+                rollup_levels: oneshot::channel().0,
+                rollup_slot: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
             },
             MADE_UP,
         );
@@ -820,6 +889,8 @@ mod tests {
             BackgroundHandoff {
                 label_cache_refresh: label_cache_refresh_tx,
                 reprobe: reprobe_tx,
+                rollup_levels: oneshot::channel().0,
+                rollup_slot: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
             },
             REQUIRED_SERVER_NAMES,
         );
@@ -959,6 +1030,7 @@ mod tests {
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(OnceLock::new()))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(OnceLock::new()))),
             label_cache: Arc::new(OnceLock::new()),
+            rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
             graph_target: pulsus_read::GraphTargetCache::default(),
             eval_gate: Arc::new(pulsus_read::EvalGate::new(
                 config.reader.query_eval_concurrency,
@@ -1028,6 +1100,14 @@ mod tests {
         let _ = server.await;
     }
 
+    /// Issue #18 part B: a level loop that was never started — its sender
+    /// already dropped, so the receiver resolves at once.
+    fn no_level_loop() -> oneshot::Receiver<JoinHandle<()>> {
+        let (tx, rx) = oneshot::channel();
+        drop(tx);
+        rx
+    }
+
     /// The label cache refresh task is aborted and joined at shutdown
     /// (issue #30 architect plan).
     #[tokio::test]
@@ -1044,7 +1124,12 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            shutdown_background_tasks(reconnect_handle, label_cache_refresh_rx, reprobe_rx),
+            shutdown_background_tasks(
+                reconnect_handle,
+                label_cache_refresh_rx,
+                reprobe_rx,
+                no_level_loop(),
+            ),
         )
         .await
         .expect("shutdown_background_tasks must not hang on a pending label cache refresh task");
@@ -1067,7 +1152,12 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            shutdown_background_tasks(reconnect_handle, label_cache_refresh_rx, reprobe_rx),
+            shutdown_background_tasks(
+                reconnect_handle,
+                label_cache_refresh_rx,
+                reprobe_rx,
+                no_level_loop(),
+            ),
         )
         .await
         .expect("shutdown_background_tasks must not hang on a pending reprobe task");
@@ -1087,7 +1177,12 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            shutdown_background_tasks(reconnect_handle, label_cache_refresh_rx, reprobe_rx),
+            shutdown_background_tasks(
+                reconnect_handle,
+                label_cache_refresh_rx,
+                reprobe_rx,
+                no_level_loop(),
+            ),
         )
         .await
         .expect("shutdown_background_tasks must not hang when nothing was started");

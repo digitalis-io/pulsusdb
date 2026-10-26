@@ -53,6 +53,9 @@ pub(crate) struct AppState {
     pub(crate) metric_writer: Arc<MetricWriterSink>,
     pub(crate) trace_writer: Arc<TraceWriterSink>,
     pub(crate) label_cache: Arc<OnceLock<Arc<LabelCache>>>,
+    /// Issue #18 part B: the rollup levels the database holds, refreshed
+    /// every 60 s by the level loop; empty until its first discovery.
+    pub(crate) rollup_levels: Arc<pulsus_read::metrics::rollup::LevelSlot>,
     /// Issue #101: the process-wide eval-concurrency permit gating the read
     /// path's one CPU-bound PromQL offload. Lives here (not in
     /// `MetricsEngine`) because the engine is rebuilt per request via
@@ -213,6 +216,7 @@ mod tests {
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
+            rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
             graph_target: pulsus_read::GraphTargetCache::default(),
             eval_gate: Arc::new(pulsus_read::EvalGate::new(
                 pulsus_config::Config::default()

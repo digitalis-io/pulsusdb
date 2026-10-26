@@ -212,7 +212,6 @@ docs/query-to-sql.md	plan.rs:1750	crates/pulsus-read/src/logql/plan.rs	1750		pro
 docs/query-to-sql.md	plan.rs:1821	crates/pulsus-read/src/logql/plan.rs	1821		prose	regexp_count_route	regexp_count_route
 docs/query-to-sql.md	plan.rs:1935	crates/pulsus-read/src/logql/plan.rs	1935		prose	json_count_route	json_count_route
 docs/query-to-sql.md	plan.rs:2041	crates/pulsus-read/src/logql/plan.rs	2041		prose	logfmt_count_route	logfmt_count_route
-docs/query-to-sql.md	plan.rs:2428	crates/pulsus-promql/src/plan.rs	2428		prose	data_matchers	let
 docs/query-to-sql.md	plan.rs:2786	crates/pulsus-read/src/logql/plan.rs	2786		prose	aggregation	invalid
 docs/query-to-sql.md	plan.rs:2791	crates/pulsus-read/src/logql/plan.rs	2791		prose	aggregation	invalid
 docs/query-to-sql.md	plan.rs:2888-2893	crates/pulsus-read/src/logql/plan.rs	2888	2893	prose	has_beyond_line_filter	has_beyond_line_filter

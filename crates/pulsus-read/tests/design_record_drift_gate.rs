@@ -2017,24 +2017,20 @@ enum ReviewedVerdict {
 // #738: coordinates and nothing else. The tenant the engine and the tag
 // statements carry moved the block down forty-six lines: `:1314-1316` is
 // `:1360-1362`. The verdict is unchanged.
-const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 2] = [
-    (
-        "docs/query-lowering.md",
-        "exec.rs:1360-1362",
-        0,
-        ReviewedVerdict::FallbackWrong,
-        "the search settings block the same section quotes; it is in traces/exec.rs \
+//
+// Issue #18 part B: `plan.rs:2428` leaves. The selector's rollup fields and
+// the planner's rollup pass moved the PromQL planner's lines, so its line
+// 2428 no longer carries the unrelated `let` the anchor rule matched; the
+// citation is an ambiguous basename again, read by neither rule, and there
+// is no divergence left to hold a judgement about.
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 1] = [(
+    "docs/query-lowering.md",
+    "exec.rs:1360-1362",
+    0,
+    ReviewedVerdict::FallbackWrong,
+    "the search settings block the same section quotes; it is in traces/exec.rs \
          (`exec.rs:3227-3233` before #602 part 2c-2b-2 renumbered it)",
-    ),
-    (
-        "docs/query-to-sql.md",
-        "plan.rs:2428",
-        0,
-        ReviewedVerdict::FallbackRight,
-        "`let client = if … || is_range`, the LogQL planner's client-aggregation condition; \
-         the PromQL planner's line is an unrelated `let` the anchor rule matched on",
-    ),
-];
+)];
 
 /// **Where the language fallback and the anchor rule disagree, and what a
 /// person concluded about each.**
@@ -2186,7 +2182,10 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
         // they cite code that part deleted, so neither rule reads them.
         // The fourth was renumbered and keeps its verdict; the fallback
         // still answers it wrongly, so §12.3's decision still stands.
-        (1, 1, 0),
+        //
+        // Issue #18 part B removes the `plan.rs:2428` `FallbackRight` row:
+        // the line it judged moved, and neither rule reads the citation.
+        (1, 0, 0),
         "the reviewed verdicts moved; re-read §12.3's decision against them"
     );
 }

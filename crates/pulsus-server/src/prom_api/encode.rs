@@ -244,7 +244,8 @@ struct UnreachableStreamsError {
 }
 
 // ---------------------------------------------------------------------
-// Explain (issue #32: adds `exactness`, the constant `"raw-exact"`).
+// Explain (issue #32: adds `exactness`; issue #18 part B: `"rollup"` when a
+// rollup level served part of a selector, else `"raw-exact"`).
 // ---------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -275,7 +276,7 @@ struct StageWire<'a> {
 fn explain_json(e: &PlanExplain) -> String {
     let wire = ExplainWire {
         result_type: e.result_type,
-        exactness: "raw-exact",
+        exactness: if e.rollup { "rollup" } else { "raw-exact" },
         stages: e
             .stages
             .iter()
@@ -925,15 +926,21 @@ struct RuntimeInfoWire {
     start_time: String,
     #[serde(rename = "storageRetention")]
     storage_retention: String,
+    /// Issue #18 part B: the rollup levels the database holds, smallest
+    /// first, as durations; `[]` when none or not yet read.
+    #[serde(rename = "rollupLevels")]
+    rollup_levels: Vec<String>,
 }
 
 pub(crate) fn status_runtimeinfo_response(
     start_time_rfc3339: String,
     retention_days: u32,
+    rollup_levels: Vec<String>,
 ) -> Response {
     success(RuntimeInfoWire {
         start_time: start_time_rfc3339,
         storage_retention: format!("{retention_days}d"),
+        rollup_levels,
     })
 }
 
@@ -1709,6 +1716,27 @@ mod tests {
         assert_eq!(json["data"]["explain"]["stages"][0]["name"], "sample_fetch");
     }
 
+    /// **B9 (issue #18 part B): `exactness` follows what served.** A
+    /// trace with `rollup` false is `"raw-exact"`, one with `rollup` true
+    /// `"rollup"`.
+    #[test]
+    fn b9_exactness_is_rollup_when_a_level_served() {
+        let mut explain = PlanExplain::new("matrix");
+        explain.push("sample_fetch", "SELECT 1", None);
+        assert!(!explain.rollup, "a new trace is raw-exact");
+        assert!(
+            explain_json(&explain).contains(r#""exactness":"raw-exact""#),
+            "{}",
+            explain_json(&explain)
+        );
+        explain.rollup = true;
+        assert!(
+            explain_json(&explain).contains(r#""exactness":"rollup""#),
+            "{}",
+            explain_json(&explain)
+        );
+    }
+
     /// Issue #548 criterion 5, half one: **the explain surface gains
     /// `plans` and loses nothing.**
     ///
@@ -2127,7 +2155,8 @@ mod tests {
 
     #[tokio::test]
     async fn status_runtimeinfo_maps_start_time_and_retention() {
-        let res = status_runtimeinfo_response("2026-01-01T00:00:00+00:00".to_string(), 7);
+        let res =
+            status_runtimeinfo_response("2026-01-01T00:00:00+00:00".to_string(), 7, Vec::new());
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["data"]["startTime"], "2026-01-01T00:00:00+00:00");
