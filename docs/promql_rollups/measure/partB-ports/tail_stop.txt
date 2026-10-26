@@ -1,0 +1,12 @@
+scrape 15s stop    window ends W+0m as read  n=1387 p99=0.2279 max=0.617
+scrape 15s stop    window ends W+0m thinned  n=1387 p99=0.2279 max=0.617
+scrape 15s stop    window ends W+1m as read  n=1387 p99=0.2279 max=0.617
+scrape 15s stop    window ends W+1m thinned  n=1387 p99=0.2279 max=0.617
+scrape 15s stop    window ends W+2m as read  n=1387 p99=0.2279 max=0.617
+scrape 15s stop    window ends W+2m thinned  n=1387 p99=0.2279 max=0.617
+scrape 15s stop    window ends W+3m as read  n=1387 p99=0.2599 max=0.617
+scrape 15s stop    window ends W+3m thinned  n=1387 p99=0.2279 max=0.617
+scrape 15s stop    window ends W+4m as read  n=1387 p99=0.4322 max=0.617
+scrape 15s stop    window ends W+4m thinned  n=1387 p99=0.2279 max=0.617
+scrape 15s stop    window ends W+5m as read  n=1410 p99=0 max=0.0262
+scrape 15s stop    window ends W+5m thinned  n=1387 p99=0.2279 max=0.617

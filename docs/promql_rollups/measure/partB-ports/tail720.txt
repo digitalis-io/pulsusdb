@@ -1,0 +1,12 @@
+720s route normal  watermark 0 steps before the end n=6630 p99=0.003885 max=0.00391
+720s route normal  watermark 1 steps before the end n=6630 p99=0.003885 max=0.00391
+720s route normal  watermark 2 steps before the end n=6630 p99=0.003885 max=0.00391
+720s route normal  watermark 3 steps before the end n=6630 p99=0.003885 max=0.00391
+720s route normal  watermark 4 steps before the end n=6630 p99=0.003885 max=0.00391
+720s route normal  watermark 5 steps before the end n=6630 p99=0 max=0.00305
+720s route stop    watermark 0 steps before the end n=542 p99=0.5362 max=0.852
+720s route stop    watermark 1 steps before the end n=542 p99=0.5362 max=0.852
+720s route stop    watermark 2 steps before the end n=542 p99=0.5362 max=0.852
+720s route stop    watermark 3 steps before the end n=542 p99=0.5362 max=0.852
+720s route stop    watermark 4 steps before the end n=542 p99=0.5362 max=0.852
+720s route stop    watermark 5 steps before the end n=542 p99=0 max=0.0262

@@ -1,0 +1,1026 @@
+
+running 9 tests
+B5b normal: n 6100 p99 4.1432051978973605e-3 max 4.212416161732129e-3 bound 8.28e-3
+B5b fast: n 1220 p99 4.000388464900041e-3 max 4.01046847522588e-3 bound 8.26e-3
+B5b stop: n 1220 p99 4.080194088528758e-3 max 4.213132511251518e-3 bound 1.41e-1
+B5b sparse: n 1220 p99 1.3755086745309317e-2 max 1.3827612858957197e-2 bound 4.9e-2
+test a_hole_in_the_middle_keeps_the_counter ... ok
+test a_hole_reads_raw ... ok
+test a_level_added_later_is_used ... ok
+B10 tenant a: n 32772 p99 9.609224855862057e-4 max 6.720823556296226e-1
+B10 tenant b: n 34200 p99 6.165026755094309e-2 max 1.0304627206235555e-1
+test a_sparse_counter_keeps_its_steps ... ok
+test a_window_reads_the_finer_levels_and_raw_after_its_level ... ok
+B4 (i) rate(c_normal[5m]): before W n 6100 p99 1.028581110828704e-2 max 5.569513481782735e-2 bound 2.18e-2
+B4 (i) increase(c_normal[5m]): before W n 6100 p99 1.0285811108287218e-2 max 5.569513481782719e-2 bound 2.18e-2
+B4 (i) rate(c_fast[5m]): before W n 1220 p99 5.730096030092146e-4 max 5.730096030092146e-4 bound 2e-1
+B4 (i) increase(c_fast[5m]): before W n 1220 p99 5.730096030093809e-4 max 5.730096030093809e-4 bound 2e-1
+B4 (i) rate(c_stop[5m]): before W n 1220 p99 1.028581110828704e-2 max 5.569513481782711e-2 bound 2.18e-2
+B4 (i) increase(c_stop[5m]): before W n 1220 p99 1.0285811108287218e-2 max 5.5695134817826994e-2 bound 2.18e-2
+B4 (i) rate(c_sparse[5m]): before W n 1220 p99 6.92870276660243e-2 max 6.998738073344517e-2 bound 4.2e-1
+B4 (i) increase(c_sparse[5m]): before W n 1220 p99 6.92870276660243e-2 max 6.998738073344511e-2 bound 4.2e-1
+B4 (i) rate(c_stale[5m]): before W n 61 p99 1.0983707419644493e-2 max 1.0983707419644493e-2 bound 2.18e-2
+B4 (i) increase(c_stale[5m]): before W n 61 p99 1.0983707419644587e-2 max 1.0983707419644587e-2 bound 2.18e-2
+B4 (iii) rate(c_normal[1h]): n 2100 p99 4.134456237970313e-3 max 4.1835402188168105e-3 bound 8.28e-3
+B4 (iii) rate(c_fast[1h]): n 420 p99 3.996188520333876e-3 max 4.007948453668956e-3 bound 8.26e-3
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 3.2787432584737938e-3, with the level uncut 3.2787432584737938e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 3.272871466262228e-3, with the level uncut 3.272871466262228e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 3.266999742780677e-3, with the level uncut 3.266999742780677e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 3.3173795854226137e-3, with the level uncut 3.3173795854226137e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 3.311507670186271e-3, with the level uncut 3.311507670186271e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 3.305635823679841e-3, with the level uncut 3.305635823679841e-3
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 3.317328817682049e-3, with the level uncut 3.317328817682049e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 3.3114570058369974e-3, with the level uncut 3.3114570058369974e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 3.3055350646961764e-3, with the level uncut 3.3055350646961764e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 3.2996630616783256e-3, with the level uncut 3.2996630616783256e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 2.7043926712379067e-6, with the level uncut 2.7043926712379067e-6
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.4804066672517425e-2, with the level uncut 8.633193313607558e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.600437090529258e-2, with the level uncut 7.324403205233507e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.7517117099991403e-2, with the level uncut 1.0256327929570681e-1
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.9941153565600337e-2, with the level uncut 1.7104341828571953e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 5.146466231874223e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 1.0674328216206054e-3, with the level uncut 1.0674328216206054e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 1.0615868846529269e-3, with the level uncut 1.0615868846529269e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 1.1118688602797875e-3, with the level uncut 1.1118688602797875e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 1.1235490980419662e-3, with the level uncut 1.1235490980419662e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 1.117702935791467e-3, with the level uncut 1.117702935791467e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 1.1118568418190082e-3, with the level uncut 1.1118568418190082e-3
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 1.1060108161237531e-3, with the level uncut 1.1060108161237531e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 1.0999914980179986e-3, with the level uncut 1.0999914980179986e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 1.0766194319482148e-3, with the level uncut 1.0766194319482148e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 1.070773387685878e-3, with the level uncut 1.070773387685878e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 1.064927411702471e-3, with the level uncut 1.064927411702471e-3
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.239122144774238e-2, with the level uncut 8.116643856765039e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.2923177371312631e-2, with the level uncut 6.99892502819768e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.3258003472379268e-2, with the level uncut 9.794818042484477e-2
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.3052601199631472e-2, with the level uncut 1.6313434137739713e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 4.881773942280145e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 2.9846789245489233e-3, with the level uncut 2.9846789245489233e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 2.9963697267525393e-3, with the level uncut 2.9963697267525393e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 3.0467376657617277e-3, with the level uncut 3.0467376657617277e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 3.040869020694388e-3, with the level uncut 3.040869020694388e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 3.0350004442993507e-3, with the level uncut 3.0350004442993507e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 3.029131936575152e-3, with the level uncut 3.029131936575152e-3
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 3.005703873853777e-3, with the level uncut 3.005703873853777e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 2.9997692843864126e-3, with the level uncut 2.9997692843864126e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 2.9939007571591946e-3, with the level uncut 2.9939007571591946e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 2.9880322986047454e-3, with the level uncut 2.9880322986047454e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 2.9821639087220255e-3, with the level uncut 2.9821639087220255e-3
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.4483153454847564e-2, with the level uncut 8.564420071333166e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.5594332619076836e-2, with the level uncut 7.281089303515419e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.6949754960453846e-2, with the level uncut 1.0194849589284409e-1
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.902146460801061e-2, with the level uncut 1.6998747934439404e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 5.110793568793969e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 7.92183719706677e-4, with the level uncut 7.92183719706677e-4
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 7.863410993196779e-4, with the level uncut 7.863410993196779e-4
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 8.36610958994996e-4, with the level uncut 8.36610958994996e-4
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 8.307681474631434e-4, with the level uncut 8.307681474631434e-4
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 8.074042661207262e-4, with the level uncut 8.074042661207262e-4
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 8.015616933122869e-4, with the level uncut 8.015616933122869e-4
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 7.957191887197826e-4, with the level uncut 7.957191887197826e-4
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 7.896870860993435e-4, with the level uncut 7.896870860993435e-4
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 7.838443925776463e-4, with the level uncut 7.838443925776463e-4
+B4 (iii) rate(c_stop[1h]) step W-720s: d 7.780017672759694e-4, with the level uncut 7.780017672759694e-4
+B4 (iii) rate(c_stop[1h]) step W+0s: d 7.896797311872993e-4, with the level uncut 7.896797311872993e-4
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.2153785699292515e-2, with the level uncut 8.057109797400347e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.2549453543582586e-2, with the level uncut 6.959447160738678e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.2760196449881536e-2, with the level uncut 9.7408765697591e-2
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.2316027447174627e-2, with the level uncut 1.6228864579372815e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 4.8473357639005193e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 2.70834103299545e-3, with the level uncut 2.70834103299545e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 2.7586961927468924e-3, with the level uncut 2.7586961927468924e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 2.7528309177425564e-3, with the level uncut 2.7528309177425564e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 2.746965711351572e-3, with the level uncut 2.746965711351572e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 2.723545889646124e-3, with the level uncut 2.723545889646124e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 2.7176809231558617e-3, with the level uncut 2.7176809231558617e-3
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 2.7117335973110114e-3, with the level uncut 2.7117335973110114e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 2.7058684401694115e-3, with the level uncut 2.7058684401694115e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 2.7000033516418795e-3, with the level uncut 2.7000033516418795e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 2.6941383317265425e-3, with the level uncut 2.6941383317265425e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 2.688273380422359e-3, with the level uncut 2.688273380422359e-3
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.4223799376575544e-2, with the level uncut 8.502276044071842e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.5184625165235957e-2, with the level uncut 7.237810348877041e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.6383025184545593e-2, with the level uncut 1.0133439770780074e-1
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.8103432737749576e-2, with the level uncut 1.689334429841877e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 5.075288542030761e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 4.8206468342507465e-4, with the level uncut 4.8206468342507465e-4
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 5.323209328609806e-4, with the level uncut 5.323209328609806e-4
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 5.264815713972481e-4, with the level uncut 5.264815713972481e-4
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 5.206422780932438e-4, with the level uncut 5.206422780932438e-4
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 5.14803052947719e-4, with the level uncut 5.14803052947719e-4
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 5.264798091929149e-4, with the level uncut 5.264798091929149e-4
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 5.204349837846753e-4, with the level uncut 5.204349837846753e-4
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 5.145955358940944e-4, with the level uncut 5.145955358940944e-4
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 5.087561561654735e-4, with the level uncut 5.087561561654735e-4
+B4 (iii) rate(c_stop[1h]) step W-720s: d 5.029168445986041e-4, with the level uncut 5.029168445986041e-4
+B4 (iii) rate(c_stop[1h]) step W+0s: d 4.795622026934493e-4, with the level uncut 4.795622026934493e-4
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.1813855209487686e-2, with the level uncut 7.9866745379668e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.2108394114949544e-2, with the level uncut 6.912856377833307e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.2133380582604988e-2, with the level uncut 9.672955930231468e-2
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.1239597945914458e-2, with the level uncut 1.610527455034786e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 4.8130566055389173e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 2.397067101122766e-3, with the level uncut 2.397067101122766e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 2.447408346563396e-3, with the level uncut 2.447408346563396e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 2.441546609896034e-3, with the level uncut 2.441546609896034e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 2.4356849417805967e-3, with the level uncut 2.4356849417805967e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 2.4298233422154186e-3, with the level uncut 2.4298233422154186e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 2.4415112503068095e-3, with the level uncut 2.4415112503068095e-3
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 2.4355508403974243e-3, with the level uncut 2.4355508403974243e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 2.429689016372772e-3, with the level uncut 2.429689016372772e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 2.4238272609030677e-3, with the level uncut 2.4238272609030677e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 2.4179655739866367e-3, with the level uncut 2.4179655739866367e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 2.450757941152433e-3, with the level uncut 2.450757941152433e-3
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.3903272423204441e-2, with the level uncut 8.433629146143662e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.4775248143541456e-2, with the level uncut 7.194566299040765e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.581692671563714e-2, with the level uncut 1.0072098359563228e-1
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.718705348026099e-2, with the level uncut 1.6788130406764804e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 5.039949972696137e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 2.632278447665536e-4, with the level uncut 2.632278447665536e-4
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 2.5739172603501476e-4, with the level uncut 2.5739172603501476e-4
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 2.515556754061258e-4, with the level uncut 2.515556754061258e-4
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 2.2820869482698892e-4, with the level uncut 2.2820869482698892e-4
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 2.223728825663813e-4, with the level uncut 2.223728825663813e-4
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 2.1631556146477416e-4, with the level uncut 2.1631556146477416e-4
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 2.104795607869447e-4, with the level uncut 2.104795607869447e-4
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 2.0464362821194125e-4, with the level uncut 2.0464362821194125e-4
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 1.9880776373872304e-4, with the level uncut 1.9880776373872304e-4
+B4 (iii) rate(c_stop[1h]) step W-720s: d 1.9297196736541662e-4, with the level uncut 1.9297196736541662e-4
+B4 (iii) rate(c_stop[1h]) step W+0s: d 2.432153819119834e-4, with the level uncut 2.432153819119834e-4
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.1494849444739011e-2, with the level uncut 7.918516295382415e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.1701493840558486e-2, with the level uncut 6.869873956217391e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.1572004789204728e-2, with the level uncut 9.612126259612007e-2
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.0335527615944166e-2, with the level uncut 1.600147390546228e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 4.778935368308022e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 2.159705900742771e-3, with the level uncut 2.159705900742771e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 2.171392238435701e-3, with the level uncut 2.171392238435701e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 2.165533831844397e-3, with the level uncut 2.165533831844397e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 2.1596754937458244e-3, with the level uncut 2.1596754937458244e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 2.153817224138729e-3, with the level uncut 2.153817224138729e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 4.14044471294964e-6, with the level uncut 4.14044471294964e-6
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 2.124441453985931e-3, with the level uncut 2.124441453985931e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 2.1185831653027943e-3, with the level uncut 2.1185831653027943e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 2.1127249451129925e-3, with the level uncut 2.1127249451129925e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 2.106866793415069e-3, with the level uncut 2.106866793415069e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 2.157195161274747e-3, with the level uncut 2.157195161274747e-3
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.3582947999235671e-2, with the level uncut 8.365047374613921e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.4366201154411033e-2, with the level uncut 7.151357111797106e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.5251458499451538e-2, with the level uncut 1.0010825241394294e-1
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.627232237708387e-2, with the level uncut 1.6683105747580435e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 5.004776692929691e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 4.0986126646805e-3, with the level uncut 4.0986126646805e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 4.092731704534461e-3, with the level uncut 4.092731704534461e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 4.0868508132766695e-3, with the level uncut 4.0868508132766695e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 4.063391850293275e-3, with the level uncut 4.063391850293275e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 4.057511199761769e-3, with the level uncut 4.057511199761769e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 4.051623191691101e-3, with the level uncut 4.051623191691101e-3
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 4.045742349302448e-3, with the level uncut 4.045742349302448e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 4.039861575803051e-3, with the level uncut 4.039861575803051e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 4.03398087119166e-3, with the level uncut 4.03398087119166e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 4.084394735954495e-3, with the level uncut 4.084394735954495e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 4.078513839399927e-3, with the level uncut 4.078513839399927e-3
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.5679685599532738e-2, with the level uncut 8.814355596063062e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.7044982613370948e-2, with the level uncut 7.434326972755531e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.8957776937728852e-2, with the level uncut 1.0412435236636079e-1
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 2.2279299489273652e-2, with the level uncut 1.7372795560679588e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 5.23762742807545e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 1.8663135374932184e-3, with the level uncut 1.8663135374932184e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 1.8604585946537548e-3, with the level uncut 1.8604585946537548e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 1.8546037202469333e-3, with the level uncut 1.8546037202469333e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 1.8487489142710884e-3, with the level uncut 1.8487489142710884e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 1.8427632145142276e-3, with the level uncut 1.8427632145142276e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 1.854447380225695e-3, with the level uncut 1.854447380225695e-3
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 1.8485923503118796e-3, with the level uncut 1.8485923503118796e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 1.8427373888332333e-3, with the level uncut 1.8427373888332333e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 1.8368824957889197e-3, with the level uncut 1.8368824957889197e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 1.8871989847719431e-3, with the level uncut 1.8871989847719431e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 1.8638042678967516e-3, with the level uncut 1.8638042678967516e-3
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.3262825912772945e-2, with the level uncut 8.296530647126721e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.395748379890481e-2, with the level uncut 7.10818274500465e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.468661948405823e-2, with the level uncut 9.949620302287956e-2
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.5359234985779697e-2, with the level uncut 1.6578269810808133e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 4.969767545770436e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 3.786515962372013e-3, with the level uncut 3.786515962372013e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 3.7806385546260797e-3, with the level uncut 3.7806385546260797e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 3.774761215707066e-3, with the level uncut 3.774761215707066e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 3.7688839456135157e-3, with the level uncut 3.7688839456135157e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 3.780556025449059e-3, with the level uncut 3.780556025449059e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 3.7746784608620465e-3, with the level uncut 3.7746784608620465e-3
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 3.7688009651056973e-3, with the level uncut 3.7688009651056973e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 3.762923538178966e-3, with the level uncut 3.762923538178966e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 3.757046180081018e-3, with the level uncut 3.757046180081018e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 3.7898745119862996e-3, with the level uncut 3.7898745119862996e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 3.7839970649101917e-3, with the level uncut 3.7839970649101917e-3
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.5358237918887341e-2, with the level uncut 8.745412363818474e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.6634104128257922e-2, with the level uncut 7.390924317638191e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.8388807501464502e-2, with the level uncut 1.0350782732576426e-1
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 2.1355390959158116e-2, with the level uncut 1.726671719726943e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 5.20152458237454e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 1.5730929111142052e-3, with the level uncut 1.5730929111142052e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 1.5672413949464846e-3, with the level uncut 1.5672413949464846e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 1.561389947151869e-3, with the level uncut 1.561389947151869e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 1.5555385677286926e-3, with the level uncut 1.5555385677286926e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 1.5495399362087203e-3, with the level uncut 1.5495399362087203e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 1.5612223953340378e-3, with the level uncut 1.5612223953340378e-3
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 1.5553707922350288e-3, with the level uncut 1.5553707922350288e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 1.5495192575116137e-3, with the level uncut 1.5495192575116137e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 1.5998229928751153e-3, with the level uncut 1.5998229928751153e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 1.5939712668185115e-3, with the level uncut 1.5939712668185115e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 1.5705851100986286e-3, with the level uncut 1.5705851100986286e-3
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.2942905972162671e-2, with the level uncut 8.228078881456348e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.3549095678727651e-2, with the level uncut 7.065043156589852e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.4122408619866756e-2, with the level uncut 9.888483428512612e-2
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.4447786879861781e-2, with the level uncut 1.647362208822185e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 4.934921385029925e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 3.509738576010378e-3, with the level uncut 3.509738576010378e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 3.5038645118389412e-3, with the level uncut 3.5038645118389412e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 3.497990516435342e-3, with the level uncut 3.497990516435342e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 3.4920768336102154e-3, with the level uncut 3.4920768336102154e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 3.468634918663566e-3, with the level uncut 3.468634918663566e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 3.462760903526967e-3, with the level uncut 3.462760903526967e-3
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 3.4568869571597227e-3, with the level uncut 3.4568869571597227e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 3.451013079560378e-3, with the level uncut 3.451013079560378e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 3.5014010853810693e-3, with the level uncut 3.5014010853810693e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 3.495527015981513e-3, with the level uncut 3.495527015981513e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 3.4896530153501726e-3, with the level uncut 3.4896530153501726e-3
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.503699364079396e-2, with the level uncut 8.676534633031854e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.6223557492685035e-2, with the level uncut 7.347556717047604e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.7820473117141997e-2, with the level uncut 1.028919904159947e-1
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 2.043315092845642e-2, with the level uncut 1.716083040224698e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 5.165592410828403e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 1.2975732833926444e-3, with the level uncut 1.2975732833926444e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 1.2917250885076754e-3, with the level uncut 1.2917250885076754e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 1.2858769619367024e-3, with the level uncut 1.2858769619367024e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 1.2798655672354514e-3, with the level uncut 1.2798655672354514e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 1.256488251164405e-3, with the level uncut 1.256488251164405e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 1.2506401059397207e-3, with the level uncut 1.2506401059397207e-3
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 1.2447920290295617e-3, with the level uncut 1.2447920290295617e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 1.2389440204343442e-3, with the level uncut 1.2389440204343442e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 1.2892338685285504e-3, with the level uncut 1.2892338685285504e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 1.2833856686757233e-3, with the level uncut 1.2833856686757233e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 1.2775375371370883e-3, with the level uncut 1.2775375371370883e-3
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.2623187985993779e-2, with the level uncut 8.159691995506878e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.3141036396224251e-2, with the level uncut 7.021938304546964e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.355882485961981e-2, with the level uncut 9.827414506589209e-2
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.353797364872344e-2, with the level uncut 1.6369162073418794e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 4.900237075167172e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 3.1979974834973213e-3, with the level uncut 3.1979974834973213e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 3.192126965541031e-3, with the level uncut 3.192126965541031e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 3.1862565162907126e-3, with the level uncut 3.1862565162907126e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 3.1803299150932407e-3, with the level uncut 3.1803299150932407e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 3.1744592747704166e-3, with the level uncut 3.1744592747704166e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 3.1685887031574146e-3, with the level uncut 3.1685887031574146e-3
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 3.1627182002529853e-3, with the level uncut 3.1627182002529853e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 3.230656671030179e-3, with the level uncut 3.230656671030179e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 3.224785873618119e-3, with the level uncut 3.224785873618119e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 3.2189151449157805e-3, with the level uncut 3.2189151449157805e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 3.213044484922746e-3, with the level uncut 3.213044484922746e-3
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.4736728902157966e-2, with the level uncut 8.609946066092385e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.581334230478201e-2, with the level uncut 7.30422412853269e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.7252772722140194e-2, with the level uncut 1.0227684048561392e-1
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.951257488149687e-2, with the level uncut 1.7055134657146478e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 5.12982970601244e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 2.7891317089908498e-6, with the level uncut 2.7891317089908498e-6
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 9.813215943218398e-4, with the level uncut 9.813215943218398e-4
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 9.752976624163504e-4, with the level uncut 9.752976624163504e-4
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 9.694528014799841e-4, with the level uncut 9.694528014799841e-4
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 9.636080088015236e-4, with the level uncut 9.636080088015236e-4
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 9.577632843795114e-4, with the level uncut 9.577632843795114e-4
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 9.519186282133232e-4, with the level uncut 9.519186282133232e-4
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 1.002195735739464e-3, with the level uncut 1.002195735739464e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 9.963508883862233e-4, with the level uncut 9.963508883862233e-4
+B4 (iii) rate(c_stop[1h]) step W-720s: d 9.9050610928847e-4, with the level uncut 9.9050610928847e-4
+B4 (iii) rate(c_stop[1h]) step W+0s: d 9.846613984449554e-4, with the level uncut 9.846613984449554e-4
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.2324398701502247e-2, with the level uncut 8.093583080324131e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.2767144544808616e-2, with the level uncut 6.982442688108154e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.3060703043380214e-2, with the level uncut 9.773438923381955e-2
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.280061238725795e-2, with the level uncut 1.6284502097381645e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 4.883410769130994e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 2.9039969538236956e-3, with the level uncut 2.9039969538236956e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 2.8981298762202224e-3, with the level uncut 2.8981298762202224e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 2.892190528858699e-3, with the level uncut 2.892190528858699e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 2.8863232604420643e-3, with the level uncut 2.8863232604420643e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 2.8804560606753016e-3, with the level uncut 2.8804560606753016e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 2.874588929558827e-3, with the level uncut 2.874588929558827e-3
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 2.8687218670903508e-3, with the level uncut 2.8687218670903508e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 2.919084040021937e-3, with the level uncut 2.919084040021937e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 2.9132167858957588e-3, with the level uncut 2.9132167858957588e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 2.9073496004180972e-3, with the level uncut 2.9073496004180972e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 2.91904028265114e-3, with the level uncut 2.91904028265114e-3
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.4415884281247482e-2, with the level uncut 8.541197681909869e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.54373863729711e-2, with the level uncut 7.26451047544582e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.6750777305955106e-2, with the level uncut 1.0173288729053924e-1
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.8765485859089936e-2, with the level uncut 1.6969357790419382e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 5.094235271864415e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 7.119791073438631e-4, with the level uncut 7.119791073438631e-4
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 7.061377509004635e-4, with the level uncut 7.061377509004635e-4
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 7.001008293104761e-4, with the level uncut 7.001008293104761e-4
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 6.76740433532685e-4, with the level uncut 6.76740433532685e-4
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 6.708990587166296e-4, with the level uncut 6.708990587166296e-4
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 6.650577520972805e-4, with the level uncut 6.650577520972805e-4
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 7.153221253978247e-4, with the level uncut 7.153221253978247e-4
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 7.094806276618186e-4, with the level uncut 7.094806276618186e-4
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 7.211585195374179e-4, with the level uncut 7.211585195374179e-4
+B4 (iii) rate(c_stop[1h]) step W-720s: d 7.153170559297136e-4, with the level uncut 7.153170559297136e-4
+B4 (iii) rate(c_stop[1h]) step W+0s: d 7.094756605178941e-4, with the level uncut 7.094756605178941e-4
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.200507751297271e-2, with the level uncut 8.02532431047603e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.235972813448414e-2, with the level uncut 6.939405745094097e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.2433534473553188e-2, with the level uncut 9.705480065642252e-2
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.1723234247327305e-2, with the level uncut 1.6160803150618153e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 4.8313495184099847e-1
+B4 (iii) rate(c_stop[1h]) step W-7200s: d 2.6277213942346956e-3, with the level uncut 2.6277213942346956e-3
+B4 (iii) rate(c_stop[1h]) step W-6480s: d 2.6217692121215616e-3, with the level uncut 2.6217692121215616e-3
+B4 (iii) rate(c_stop[1h]) step W-5760s: d 2.5983527178774536e-3, with the level uncut 2.5983527178774536e-3
+B4 (iii) rate(c_stop[1h]) step W-5040s: d 2.592488887053508e-3, with the level uncut 2.592488887053508e-3
+B4 (iii) rate(c_stop[1h]) step W-4320s: d 2.5866251248201086e-3, with the level uncut 2.5866251248201086e-3
+B4 (iii) rate(c_stop[1h]) step W-3600s: d 2.580761431175798e-3, with the level uncut 2.580761431175798e-3
+B4 (iii) rate(c_stop[1h]) step W-2880s: d 2.63111082750832e-3, with the level uncut 2.63111082750832e-3
+B4 (iii) rate(c_stop[1h]) step W-2160s: d 2.6252469422771594e-3, with the level uncut 2.6252469422771594e-3
+B4 (iii) rate(c_stop[1h]) step W-1440s: d 2.6369359859841454e-3, with the level uncut 2.6369359859841454e-3
+B4 (iii) rate(c_stop[1h]) step W-720s: d 2.631072135274201e-3, with the level uncut 2.631072135274201e-3
+B4 (iii) rate(c_stop[1h]) step W+0s: d 2.6252083531523134e-3, with the level uncut 2.6252083531523134e-3
+B4 (iii) rate(c_stop[1h]) step W+720s: d 1.4095242488774532e-2, with the level uncut 8.472514552067648e-2
+B4 (iii) rate(c_stop[1h]) step W+1440s: d 1.502781919276805e-2, with the level uncut 7.221246338444343e-2
+B4 (iii) rate(c_stop[1h]) step W+2160s: d 1.6119269661454102e-2, with the level uncut 1.0104859697010089e-1
+B4 (iii) rate(c_stop[1h]) step W+2880s: d 1.7676396757443966e-2, with the level uncut 1.6844314252185547e-1
+B4 (iii) rate(c_stop[1h]) step W+3600s: d 0e0, with the level uncut 5.065650047058967e-1
+B4 (iii) rate(c_stale[1h]) step W-3600s: d 4.6505744647642877e-1, with the level uncut 4.6505744647642877e-1
+B4 (iii) rate(c_stale[1h]) step W-2880s: d 1.5726575216600489e-1, with the level uncut 1.5726575216600489e-1
+B4 (iii) rate(c_stale[1h]) step W-2160s: d 9.483995949351402e-2, with the level uncut 9.483995949351402e-2
+B4 (iii) rate(c_stale[1h]) step W-1440s: d 6.79179394564052e-2, with the level uncut 6.79179394564052e-2
+B4 (iii) rate(c_stale[1h]) step W-720s: d 2.2924381696042178e-3, with the level uncut 2.2924381696042178e-3
+B4 (iii) rate(c_stale[1h]) step W+0s: d 4.165826520554171e-3, with the level uncut 4.165826520554171e-3
+B4 (iii) rate(c_stale[1h]) step W+720s: d 2.4176018568397847e-2, with the level uncut 5.807308651257385e-2
+B4 (iii) rate(c_stale[1h]) step W+1440s: d 2.698659780801473e-2, with the level uncut 7.475339674868578e-2
+B4 (iii) rate(c_stale[1h]) step W+2160s: d 3.0800359955109644e-2, with the level uncut 1.048064963364364e-1
+B4 (iii) rate(c_stale[1h]) step W+2880s: d 3.7505364930132845e-2, with the level uncut 1.758392713887412e-1
+B4 (iii) rate(c_stale[1h]) step W+3600s: d 0e0, with the level uncut 5.48171937664736e-1
+test a_window_touching_raw_is_raw ... ok
+S2 increase(s2_c{lvl="60"}[300s]): n 9 p99 1.587301587301564e-2 max 1.587301587301564e-2 bound 2.18e-2
+S2 60 s step holding the resumed sample: routed Some(222.2222222222222), raw Some(218.75000000000003)
+S2 c4 at 60s: routed None, raw None
+S2 increase(s2_c{lvl="720"}[3600s]): n 9 p99 2.227450508755927e-3 max 2.227450508755927e-3 bound 8.28e-3
+S2 c4 at 720s: routed Some(0.0), raw None
+S2 increase(s2_c{lvl="7200"}[36000s]): n 9 p99 2.2229940604271783e-4 max 2.2229940604271783e-4 bound 8.26e-4
+S2 c4 at 7200s: routed Some(0.0), raw None
+S2 increase(s2_c{lvl="86400"}[432000s]): n 9 p99 1.852117636109243e-5 max 1.852117636109243e-5 bound 6.84e-5
+S2 c4 at 86400s: routed Some(0.0), raw Some(45.0)
+S2 column size_60.flags: 106 compressed, 60 uncompressed bytes
+S2 column size_60.inc: 903 compressed, 176592 uncompressed bytes
+S2 column size_60.last: 93975 compressed, 176592 uncompressed bytes
+S2 column size_720.flags: 87 compressed, 39 uncompressed bytes
+S2 column size_720.inc: 188 compressed, 16368 uncompressed bytes
+S2 column size_720.last: 8259 compressed, 16368 uncompressed bytes
+S2 column size_7200.flags: 85 compressed, 34 uncompressed bytes
+S2 column size_7200.inc: 114 compressed, 1928 uncompressed bytes
+S2 column size_7200.last: 949 compressed, 1928 uncompressed bytes
+S2 column size_86400.flags: 53 compressed, 55 uncompressed bytes
+S2 column size_86400.inc: 99 compressed, 440 uncompressed bytes
+S2 column size_86400.last: 191 compressed, 440 uncompressed bytes
+test stale_and_nan_read_as_raw ... ok
+test the_unrouted_classes_read_raw ... ok
+test each_served_function_is_within_its_distance has been running for over 60 seconds
+rate               rate(c_normal[300s])                         60s normal  n  144100 p99 1.098371e-2 max 5.583495e-2
+increase           increase(c_normal[300s])                     60s normal  n  144100 p99 1.098371e-2 max 5.583495e-2
+max_over_time      max_over_time(c_normal[60s])                 60s normal  n  144100 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_normal[300s])                60s normal  n  144100 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_normal[60s])                 60s normal  n  144100 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_normal[300s])                60s normal  n  144100 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_normal[60s])                 60s normal  n  144100 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_normal[300s])                60s normal  n  144100 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_normal[60s])                60s normal  n  144100 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_normal[300s])               60s normal  n  144100 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_normal[60s])             60s normal  n  144100 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_normal[300s])            60s normal  n  144100 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_normal[60s])              60s (no points on either route)
+absent_over_time   absent_over_time(c_normal[300s])             60s (no points on either route)
+timestamp          timestamp(c_normal)                          60s normal  n  144100 p99 0.000000e0 max 0.000000e0
+bare               c_normal                                     60s normal  n  144100 p99 0.000000e0 max 0.000000e0
+rate               rate(c_fast[300s])                           60s fast    n   28820 p99 5.730096e-4 max 5.730096e-4
+increase           increase(c_fast[300s])                       60s fast    n   28820 p99 5.730096e-4 max 5.730096e-4
+max_over_time      max_over_time(c_fast[60s])                   60s fast    n   28820 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_fast[300s])                  60s fast    n   28820 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_fast[60s])                   60s fast    n   28820 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_fast[300s])                  60s fast    n   28820 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_fast[60s])                   60s fast    n   28820 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_fast[300s])                  60s fast    n   28820 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_fast[60s])                  60s fast    n   28820 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_fast[300s])                 60s fast    n   28820 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_fast[60s])               60s fast    n   28820 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_fast[300s])              60s fast    n   28820 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_fast[60s])                60s (no points on either route)
+absent_over_time   absent_over_time(c_fast[300s])               60s (no points on either route)
+timestamp          timestamp(c_fast)                            60s fast    n   28820 p99 0.000000e0 max 0.000000e0
+bare               c_fast                                       60s fast    n   28820 p99 0.000000e0 max 0.000000e0
+rate               rate(c_stop[300s])                           60s stop    n   21860 p99 1.790485e-2 max 1.000000e0
+increase           increase(c_stop[300s])                       60s stop    n   21860 p99 1.790485e-2 max 1.000000e0
+max_over_time      max_over_time(c_stop[60s])                   60s stop    n   21780 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_stop[300s])                  60s stop    n   21860 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_stop[60s])                   60s stop    n   21780 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_stop[300s])                  60s stop    n   21860 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_stop[60s])                   60s stop    n   21780 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_stop[300s])                  60s stop    n   21860 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_stop[60s])                  60s stop    n   21780 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_stop[300s])                 60s stop    n   21860 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_stop[60s])               60s stop    n   21780 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_stop[300s])              60s stop    n   21860 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_stop[60s])                60s stop    n     352 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_stop[300s])               60s stop    n     348 p99 0.000000e0 max 0.000000e0
+timestamp          timestamp(c_stop)                            60s stop    n   21860 p99 0.000000e0 max 0.000000e0
+bare               c_stop                                       60s stop    n   21860 p99 0.000000e0 max 0.000000e0
+rate               rate(c_sparse[300s])                         60s sparse  n   28820 p99 6.931752e-2 max 1.981132e-1
+increase           increase(c_sparse[300s])                     60s sparse  n   28820 p99 6.931752e-2 max 1.981132e-1
+max_over_time      max_over_time(c_sparse[60s])                 60s sparse  n   28820 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_sparse[300s])                60s sparse  n   28820 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_sparse[60s])                 60s sparse  n   28820 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_sparse[300s])                60s sparse  n   28820 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_sparse[60s])                 60s sparse  n   28820 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_sparse[300s])                60s sparse  n   28820 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_sparse[60s])                60s sparse  n   28820 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_sparse[300s])               60s sparse  n   28820 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_sparse[60s])             60s sparse  n   28820 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_sparse[300s])            60s sparse  n   28820 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_sparse[60s])              60s (no points on either route)
+absent_over_time   absent_over_time(c_sparse[300s])             60s (no points on either route)
+timestamp          timestamp(c_sparse)                          60s sparse  n   28820 p99 0.000000e0 max 0.000000e0
+bare               c_sparse                                     60s sparse  n   28820 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(g[60s])                        60s gauge   n  144100 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(g[300s])                       60s gauge   n  144100 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(g[60s])                        60s gauge   n  144100 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(g[300s])                       60s gauge   n  144100 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(g[60s])                        60s gauge   n  144100 p99 2.058942e-16 max 4.035089e-16
+sum_over_time      sum_over_time(g[300s])                       60s gauge   n  144100 p99 2.188051e-16 max 4.548356e-15
+last_over_time     last_over_time(g[60s])                       60s gauge   n  144100 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(g[300s])                      60s gauge   n  144100 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(g[60s])                    60s gauge   n  144100 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(g[300s])                   60s gauge   n  144100 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(g[60s])                     60s (no points on either route)
+absent_over_time   absent_over_time(g[300s])                    60s (no points on either route)
+avg_over_time      avg_over_time(g[60s])                        60s gauge   n  144100 p99 2.058942e-16 max 4.035089e-16
+avg_over_time      avg_over_time(g[300s])                       60s gauge   n  144100 p99 2.477734e-16 max 4.467136e-15
+timestamp          timestamp(g)                                 60s gauge   n  144100 p99 0.000000e0 max 0.000000e0
+bare               g                                            60s gauge   n  144100 p99 0.000000e0 max 0.000000e0
+rate               rate(c_normal[3600s])                       720s normal  n   36100 p99 4.147129e-3 max 4.201120e-3
+increase           increase(c_normal[3600s])                   720s normal  n   36100 p99 4.147129e-3 max 4.201120e-3
+max_over_time      max_over_time(c_normal[720s])               720s normal  n   36100 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_normal[3600s])              720s normal  n   36100 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_normal[720s])               720s normal  n   36100 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_normal[3600s])              720s normal  n   36100 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_normal[720s])               720s normal  n   36100 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_normal[3600s])              720s normal  n   36100 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_normal[720s])              720s normal  n   36100 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_normal[3600s])             720s normal  n   36100 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_normal[720s])           720s normal  n   36100 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_normal[3600s])          720s normal  n   36100 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_normal[720s])            720s (no points on either route)
+absent_over_time   absent_over_time(c_normal[3600s])           720s (no points on either route)
+timestamp          timestamp(c_normal)                         720s normal  n   36100 p99 0.000000e0 max 0.000000e0
+bare               c_normal                                    720s normal  n   36100 p99 0.000000e0 max 0.000000e0
+rate               rate(c_fast[3600s])                         720s fast    n    7220 p99 3.999548e-3 max 4.010468e-3
+increase           increase(c_fast[3600s])                     720s fast    n    7220 p99 3.999548e-3 max 4.010468e-3
+max_over_time      max_over_time(c_fast[720s])                 720s fast    n    7220 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_fast[3600s])                720s fast    n    7220 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_fast[720s])                 720s fast    n    7220 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_fast[3600s])                720s fast    n    7220 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_fast[720s])                 720s fast    n    7220 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_fast[3600s])                720s fast    n    7220 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_fast[720s])                720s fast    n    7220 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_fast[3600s])               720s fast    n    7220 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_fast[720s])             720s fast    n    7220 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_fast[3600s])            720s fast    n    7220 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_fast[720s])              720s (no points on either route)
+absent_over_time   absent_over_time(c_fast[3600s])             720s (no points on either route)
+timestamp          timestamp(c_fast)                           720s fast    n    7220 p99 0.000000e0 max 0.000000e0
+bare               c_fast                                      720s fast    n    7220 p99 0.000000e0 max 0.000000e0
+rate               rate(c_stop[3600s])                         720s stop    n    6720 p99 8.502276e-2 max 5.237627e-1
+increase           increase(c_stop[3600s])                     720s stop    n    6720 p99 8.502276e-2 max 5.237627e-1
+max_over_time      max_over_time(c_stop[720s])                 720s stop    n    6640 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_stop[3600s])                720s stop    n    6720 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_stop[720s])                 720s stop    n    6640 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_stop[3600s])                720s stop    n    6720 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_stop[720s])                 720s stop    n    6640 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_stop[3600s])                720s stop    n    6720 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_stop[720s])                720s stop    n    6640 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_stop[3600s])               720s stop    n    6720 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_stop[720s])             720s stop    n    6640 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_stop[3600s])            720s stop    n    6720 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_stop[720s])              720s stop    n      29 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_stop[3600s])             720s stop    n      25 p99 0.000000e0 max 0.000000e0
+timestamp          timestamp(c_stop)                           720s stop    n    6640 p99 0.000000e0 max 0.000000e0
+bare               c_stop                                      720s stop    n    6640 p99 0.000000e0 max 0.000000e0
+rate               rate(c_sparse[3600s])                       720s sparse  n    7220 p99 1.375254e-2 max 1.384369e-2
+increase           increase(c_sparse[3600s])                   720s sparse  n    7220 p99 1.375254e-2 max 1.384369e-2
+max_over_time      max_over_time(c_sparse[720s])               720s sparse  n    7220 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_sparse[3600s])              720s sparse  n    7220 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_sparse[720s])               720s sparse  n    7220 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_sparse[3600s])              720s sparse  n    7220 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_sparse[720s])               720s sparse  n    7220 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_sparse[3600s])              720s sparse  n    7220 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_sparse[720s])              720s sparse  n    7220 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_sparse[3600s])             720s sparse  n    7220 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_sparse[720s])           720s sparse  n    7220 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_sparse[3600s])          720s sparse  n    7220 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_sparse[720s])            720s (no points on either route)
+absent_over_time   absent_over_time(c_sparse[3600s])           720s (no points on either route)
+timestamp          timestamp(c_sparse)                         720s sparse  n    7220 p99 0.000000e0 max 0.000000e0
+bare               c_sparse                                    720s sparse  n    7220 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(g[720s])                      720s gauge   n   36100 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(g[3600s])                     720s gauge   n   36100 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(g[720s])                      720s gauge   n   36100 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(g[3600s])                     720s gauge   n   36100 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(g[720s])                      720s gauge   n   36100 p99 3.127532e-15 max 6.739822e-15
+sum_over_time      sum_over_time(g[3600s])                     720s gauge   n   36100 p99 2.505202e-14 max 1.460745e-13
+last_over_time     last_over_time(g[720s])                     720s gauge   n   36100 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(g[3600s])                    720s gauge   n   36100 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(g[720s])                  720s gauge   n   36100 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(g[3600s])                 720s gauge   n   36100 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(g[720s])                   720s (no points on either route)
+absent_over_time   absent_over_time(g[3600s])                  720s (no points on either route)
+avg_over_time      avg_over_time(g[720s])                      720s gauge   n   36100 p99 3.059542e-15 max 6.676239e-15
+avg_over_time      avg_over_time(g[3600s])                     720s gauge   n   36100 p99 2.477708e-14 max 2.388889e-13
+timestamp          timestamp(g)                                720s gauge   n   36100 p99 0.000000e0 max 0.000000e0
+bare               g                                           720s gauge   n   36100 p99 0.000000e0 max 0.000000e0
+rate               rate(c_normal[36000s])                     7200s normal  n    9200 p99 4.130682e-4 max 4.175719e-4
+increase           increase(c_normal[36000s])                 7200s normal  n    9200 p99 4.130682e-4 max 4.175719e-4
+max_over_time      max_over_time(c_normal[7200s])             7200s normal  n    9200 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_normal[36000s])            7200s normal  n    9200 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_normal[7200s])             7200s normal  n    9200 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_normal[36000s])            7200s normal  n    9200 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_normal[7200s])             7200s normal  n    9200 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_normal[36000s])            7200s normal  n    9200 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_normal[7200s])            7200s normal  n    9200 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_normal[36000s])           7200s normal  n    9200 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_normal[7200s])         7200s normal  n    9200 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_normal[36000s])        7200s normal  n    9200 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_normal[7200s])          7200s (no points on either route)
+absent_over_time   absent_over_time(c_normal[36000s])         7200s (no points on either route)
+timestamp          timestamp(c_normal)                        7200s normal  n    9200 p99 0.000000e0 max 0.000000e0
+bare               c_normal                                   7200s normal  n    9200 p99 0.000000e0 max 0.000000e0
+rate               rate(c_fast[36000s])                       7200s fast    n    1840 p99 3.986033e-4 max 4.155580e-4
+increase           increase(c_fast[36000s])                   7200s fast    n    1840 p99 3.986033e-4 max 4.155580e-4
+max_over_time      max_over_time(c_fast[7200s])               7200s fast    n    1840 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_fast[36000s])              7200s fast    n    1840 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_fast[7200s])               7200s fast    n    1840 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_fast[36000s])              7200s fast    n    1840 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_fast[7200s])               7200s fast    n    1840 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_fast[36000s])              7200s fast    n    1840 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_fast[7200s])              7200s fast    n    1840 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_fast[36000s])             7200s fast    n    1840 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_fast[7200s])           7200s fast    n    1840 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_fast[36000s])          7200s fast    n    1840 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_fast[7200s])            7200s (no points on either route)
+absent_over_time   absent_over_time(c_fast[36000s])           7200s (no points on either route)
+timestamp          timestamp(c_fast)                          7200s fast    n    1840 p99 0.000000e0 max 0.000000e0
+bare               c_fast                                     7200s fast    n    1840 p99 0.000000e0 max 0.000000e0
+rate               rate(c_stop[36000s])                       7200s stop    n    1840 p99 9.958314e-2 max 1.005226e-1
+increase           increase(c_stop[36000s])                   7200s stop    n    1840 p99 9.958314e-2 max 1.005226e-1
+max_over_time      max_over_time(c_stop[7200s])               7200s stop    n    1800 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_stop[36000s])              7200s stop    n    1840 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_stop[7200s])               7200s stop    n    1800 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_stop[36000s])              7200s stop    n    1840 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_stop[7200s])               7200s stop    n    1800 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_stop[36000s])              7200s stop    n    1840 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_stop[7200s])              7200s stop    n    1800 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_stop[36000s])             7200s stop    n    1840 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_stop[7200s])           7200s stop    n    1800 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_stop[36000s])          7200s stop    n    1840 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_stop[7200s])            7200s stop    n       2 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_stop[36000s])           7200s (no points on either route)
+timestamp          timestamp(c_stop)                          7200s stop    n    1780 p99 0.000000e0 max 0.000000e0
+bare               c_stop                                     7200s stop    n    1780 p99 0.000000e0 max 0.000000e0
+rate               rate(c_sparse[36000s])                     7200s sparse  n    1840 p99 1.307019e-3 max 1.310087e-3
+increase           increase(c_sparse[36000s])                 7200s sparse  n    1840 p99 1.307019e-3 max 1.310087e-3
+max_over_time      max_over_time(c_sparse[7200s])             7200s sparse  n    1840 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_sparse[36000s])            7200s sparse  n    1840 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_sparse[7200s])             7200s sparse  n    1840 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_sparse[36000s])            7200s sparse  n    1840 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_sparse[7200s])             7200s sparse  n    1840 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_sparse[36000s])            7200s sparse  n    1840 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_sparse[7200s])            7200s sparse  n    1840 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_sparse[36000s])           7200s sparse  n    1840 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_sparse[7200s])         7200s sparse  n    1840 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_sparse[36000s])        7200s sparse  n    1840 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_sparse[7200s])          7200s (no points on either route)
+absent_over_time   absent_over_time(c_sparse[36000s])         7200s (no points on either route)
+timestamp          timestamp(c_sparse)                        7200s sparse  n    1840 p99 0.000000e0 max 0.000000e0
+bare               c_sparse                                   7200s sparse  n    1840 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(g[7200s])                    7200s gauge   n    9200 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(g[36000s])                   7200s gauge   n    9200 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(g[7200s])                    7200s gauge   n    9200 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(g[36000s])                   7200s gauge   n    9200 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(g[7200s])                    7200s gauge   n    9200 p99 5.599521e-15 max 5.599521e-15
+sum_over_time      sum_over_time(g[36000s])                   7200s gauge   n    9200 p99 1.427236e-14 max 1.427236e-14
+last_over_time     last_over_time(g[7200s])                   7200s gauge   n    9200 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(g[36000s])                  7200s gauge   n    9200 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(g[7200s])                7200s gauge   n    9200 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(g[36000s])               7200s gauge   n    9200 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(g[7200s])                 7200s (no points on either route)
+absent_over_time   absent_over_time(g[36000s])                7200s (no points on either route)
+avg_over_time      avg_over_time(g[7200s])                    7200s gauge   n    9200 p99 5.633664e-15 max 5.633664e-15
+avg_over_time      avg_over_time(g[36000s])                   7200s gauge   n    9200 p99 1.426062e-14 max 1.426062e-14
+timestamp          timestamp(g)                               7200s gauge   n    9200 p99 0.000000e0 max 0.000000e0
+bare               g                                          7200s gauge   n    9200 p99 0.000000e0 max 0.000000e0
+rate               rate(c_normal[432000s])                   86400s normal  n     400 p99 3.446193e-5 max 3.475988e-5
+increase           increase(c_normal[432000s])               86400s normal  n     400 p99 3.446193e-5 max 3.475988e-5
+max_over_time      max_over_time(c_normal[86400s])           86400s normal  n     400 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_normal[432000s])          86400s normal  n     400 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_normal[86400s])           86400s normal  n     400 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_normal[432000s])          86400s normal  n     400 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_normal[86400s])           86400s normal  n     400 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_normal[432000s])          86400s normal  n     400 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_normal[86400s])          86400s normal  n     400 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_normal[432000s])         86400s normal  n     400 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_normal[86400s])       86400s normal  n     400 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_normal[432000s])      86400s normal  n     400 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_normal[86400s])        86400s (no points on either route)
+absent_over_time   absent_over_time(c_normal[432000s])       86400s (no points on either route)
+timestamp          timestamp(c_normal)                       86400s normal  n     400 p99 0.000000e0 max 0.000000e0
+bare               c_normal                                  86400s normal  n     400 p99 0.000000e0 max 0.000000e0
+rate               rate(c_fast[432000s])                     86400s fast    n      80 p99 3.462964e-5 max 3.462964e-5
+increase           increase(c_fast[432000s])                 86400s fast    n      80 p99 3.462964e-5 max 3.462964e-5
+max_over_time      max_over_time(c_fast[86400s])             86400s fast    n      80 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_fast[432000s])            86400s fast    n      80 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_fast[86400s])             86400s fast    n      80 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_fast[432000s])            86400s fast    n      80 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_fast[86400s])             86400s fast    n      80 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_fast[432000s])            86400s fast    n      80 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_fast[86400s])            86400s fast    n      80 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_fast[432000s])           86400s fast    n      80 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_fast[86400s])         86400s fast    n      80 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_fast[432000s])        86400s fast    n      80 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_fast[86400s])          86400s (no points on either route)
+absent_over_time   absent_over_time(c_fast[432000s])         86400s (no points on either route)
+timestamp          timestamp(c_fast)                         86400s fast    n      80 p99 0.000000e0 max 0.000000e0
+bare               c_fast                                    86400s fast    n      80 p99 0.000000e0 max 0.000000e0
+rate               rate(c_stop[432000s])                     86400s stop    n      80 p99 5.153416e-2 max 5.153416e-2
+increase           increase(c_stop[432000s])                 86400s stop    n      80 p99 5.153416e-2 max 5.153416e-2
+max_over_time      max_over_time(c_stop[86400s])             86400s stop    n      80 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_stop[432000s])            86400s stop    n      80 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_stop[86400s])             86400s stop    n      80 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_stop[432000s])            86400s stop    n      80 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_stop[86400s])             86400s stop    n      80 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_stop[432000s])            86400s stop    n      80 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_stop[86400s])            86400s stop    n      80 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_stop[432000s])           86400s stop    n      80 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_stop[86400s])         86400s stop    n      80 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_stop[432000s])        86400s stop    n      80 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_stop[86400s])          86400s (no points on either route)
+absent_over_time   absent_over_time(c_stop[432000s])         86400s (no points on either route)
+timestamp          timestamp(c_stop)                         86400s stop    n      60 p99 0.000000e0 max 0.000000e0
+bare               c_stop                                    86400s stop    n      60 p99 0.000000e0 max 0.000000e0
+rate               rate(c_sparse[432000s])                   86400s sparse  n      80 p99 1.087135e-4 max 1.087135e-4
+increase           increase(c_sparse[432000s])               86400s sparse  n      80 p99 1.087135e-4 max 1.087135e-4
+max_over_time      max_over_time(c_sparse[86400s])           86400s sparse  n      80 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(c_sparse[432000s])          86400s sparse  n      80 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_sparse[86400s])           86400s sparse  n      80 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(c_sparse[432000s])          86400s sparse  n      80 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_sparse[86400s])           86400s sparse  n      80 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(c_sparse[432000s])          86400s sparse  n      80 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_sparse[86400s])          86400s sparse  n      80 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(c_sparse[432000s])         86400s sparse  n      80 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_sparse[86400s])       86400s sparse  n      80 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(c_sparse[432000s])      86400s sparse  n      80 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(c_sparse[86400s])        86400s (no points on either route)
+absent_over_time   absent_over_time(c_sparse[432000s])       86400s (no points on either route)
+timestamp          timestamp(c_sparse)                       86400s sparse  n      80 p99 0.000000e0 max 0.000000e0
+bare               c_sparse                                  86400s sparse  n      80 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(g[86400s])                  86400s gauge   n     400 p99 0.000000e0 max 0.000000e0
+max_over_time      max_over_time(g[432000s])                 86400s gauge   n     400 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(g[86400s])                  86400s gauge   n     400 p99 0.000000e0 max 0.000000e0
+min_over_time      min_over_time(g[432000s])                 86400s gauge   n     400 p99 0.000000e0 max 0.000000e0
+sum_over_time      sum_over_time(g[86400s])                  86400s gauge   n     400 p99 2.141860e-14 max 2.141860e-14
+sum_over_time      sum_over_time(g[432000s])                 86400s gauge   n     400 p99 6.471236e-15 max 6.471236e-15
+last_over_time     last_over_time(g[86400s])                 86400s gauge   n     400 p99 0.000000e0 max 0.000000e0
+last_over_time     last_over_time(g[432000s])                86400s gauge   n     400 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(g[86400s])              86400s gauge   n     400 p99 0.000000e0 max 0.000000e0
+present_over_time  present_over_time(g[432000s])             86400s gauge   n     400 p99 0.000000e0 max 0.000000e0
+absent_over_time   absent_over_time(g[86400s])               86400s (no points on either route)
+absent_over_time   absent_over_time(g[432000s])              86400s (no points on either route)
+avg_over_time      avg_over_time(g[86400s])                  86400s gauge   n     400 p99 2.149005e-14 max 2.149005e-14
+avg_over_time      avg_over_time(g[432000s])                 86400s gauge   n     400 p99 6.009550e-15 max 6.009550e-15
+timestamp          timestamp(g)                              86400s gauge   n     400 p99 0.000000e0 max 0.000000e0
+bare               g                                         86400s gauge   n     400 p99 0.000000e0 max 0.000000e0
+read_rows rate(c_normal[300s])                         60s routed     151552 raw    1163264
+read_rows increase(c_normal[300s])                     60s routed     151552 raw    1163264
+read_rows max_over_time(c_normal[60s])                 60s routed     151552 raw    1163264
+read_rows max_over_time(c_normal[300s])                60s routed     151552 raw    1163264
+read_rows min_over_time(c_normal[60s])                 60s routed     151552 raw    1163264
+read_rows min_over_time(c_normal[300s])                60s routed     151552 raw    1163264
+read_rows sum_over_time(c_normal[60s])                 60s routed     151552 raw    1163264
+read_rows sum_over_time(c_normal[300s])                60s routed     151552 raw    1163264
+read_rows last_over_time(c_normal[60s])                60s routed     151552 raw    1163264
+read_rows last_over_time(c_normal[300s])               60s routed     151552 raw    1163264
+read_rows present_over_time(c_normal[60s])             60s routed     151552 raw    1163264
+read_rows present_over_time(c_normal[300s])            60s routed     151552 raw    1163264
+read_rows absent_over_time(c_normal[60s])              60s routed     151552 raw    1163264
+read_rows absent_over_time(c_normal[300s])             60s routed     151552 raw    1163264
+read_rows timestamp(c_normal)                          60s routed     151552 raw    1163264
+read_rows c_normal                                     60s routed     151552 raw    1163264
+read_rows rate(c_fast[300s])                           60s routed      43008 raw     237568
+read_rows increase(c_fast[300s])                       60s routed      43008 raw     237568
+read_rows max_over_time(c_fast[60s])                   60s routed      43008 raw     237568
+read_rows max_over_time(c_fast[300s])                  60s routed      43008 raw     237568
+read_rows min_over_time(c_fast[60s])                   60s routed      43008 raw     237568
+read_rows min_over_time(c_fast[300s])                  60s routed      43008 raw     237568
+read_rows sum_over_time(c_fast[60s])                   60s routed      43008 raw     237568
+read_rows sum_over_time(c_fast[300s])                  60s routed      43008 raw     237568
+read_rows last_over_time(c_fast[60s])                  60s routed      43008 raw     237568
+read_rows last_over_time(c_fast[300s])                 60s routed      43008 raw     237568
+read_rows present_over_time(c_fast[60s])               60s routed      43008 raw     237568
+read_rows present_over_time(c_fast[300s])              60s routed      43008 raw     237568
+read_rows absent_over_time(c_fast[60s])                60s routed      43008 raw     237568
+read_rows absent_over_time(c_fast[300s])               60s routed      43008 raw     237568
+read_rows timestamp(c_fast)                            60s routed      43008 raw     237568
+read_rows c_fast                                       60s routed      43008 raw     237568
+read_rows rate(c_stop[300s])                           60s routed      28551 raw     201176
+read_rows increase(c_stop[300s])                       60s routed      28551 raw     201176
+read_rows max_over_time(c_stop[60s])                   60s routed      28551 raw     201176
+read_rows max_over_time(c_stop[300s])                  60s routed      28551 raw     201176
+read_rows min_over_time(c_stop[60s])                   60s routed      28551 raw     201176
+read_rows min_over_time(c_stop[300s])                  60s routed      28551 raw     201176
+read_rows sum_over_time(c_stop[60s])                   60s routed      28551 raw     201176
+read_rows sum_over_time(c_stop[300s])                  60s routed      28551 raw     201176
+read_rows last_over_time(c_stop[60s])                  60s routed      28551 raw     201176
+read_rows last_over_time(c_stop[300s])                 60s routed      28551 raw     201176
+read_rows present_over_time(c_stop[60s])               60s routed      28551 raw     201176
+read_rows present_over_time(c_stop[300s])              60s routed      28551 raw     201176
+read_rows absent_over_time(c_stop[60s])                60s routed      28551 raw     201176
+read_rows absent_over_time(c_stop[300s])               60s routed      28551 raw     201176
+read_rows timestamp(c_stop)                            60s routed      28551 raw     201176
+read_rows c_stop                                       60s routed      28551 raw     201176
+read_rows rate(c_sparse[300s])                         60s routed      41331 raw     172032
+read_rows increase(c_sparse[300s])                     60s routed      41331 raw     172032
+read_rows max_over_time(c_sparse[60s])                 60s routed      41331 raw     172032
+read_rows max_over_time(c_sparse[300s])                60s routed      41331 raw     172032
+read_rows min_over_time(c_sparse[60s])                 60s routed      41331 raw     172032
+read_rows min_over_time(c_sparse[300s])                60s routed      41331 raw     172032
+read_rows sum_over_time(c_sparse[60s])                 60s routed      41331 raw     172032
+read_rows sum_over_time(c_sparse[300s])                60s routed      41331 raw     172032
+read_rows last_over_time(c_sparse[60s])                60s routed      41331 raw     172032
+read_rows last_over_time(c_sparse[300s])               60s routed      41331 raw     172032
+read_rows present_over_time(c_sparse[60s])             60s routed      41331 raw     172032
+read_rows present_over_time(c_sparse[300s])            60s routed      41331 raw     172032
+read_rows absent_over_time(c_sparse[60s])              60s routed      41331 raw     172032
+read_rows absent_over_time(c_sparse[300s])             60s routed      41331 raw     172032
+read_rows timestamp(c_sparse)                          60s routed      41331 raw     172032
+read_rows c_sparse                                     60s routed      41331 raw     172032
+read_rows max_over_time(g[60s])                        60s routed     157696 raw    1164800
+read_rows max_over_time(g[300s])                       60s routed     157696 raw    1164800
+read_rows min_over_time(g[60s])                        60s routed     157696 raw    1156608
+read_rows min_over_time(g[300s])                       60s routed     157696 raw    1156608
+read_rows sum_over_time(g[60s])                        60s routed     157696 raw    1156608
+read_rows sum_over_time(g[300s])                       60s routed     157696 raw    1156608
+read_rows last_over_time(g[60s])                       60s routed     157696 raw    1156608
+read_rows last_over_time(g[300s])                      60s routed     157696 raw    1156608
+read_rows present_over_time(g[60s])                    60s routed     157696 raw    1156608
+read_rows present_over_time(g[300s])                   60s routed     157696 raw    1156608
+read_rows absent_over_time(g[60s])                     60s routed     157696 raw    1156608
+read_rows absent_over_time(g[300s])                    60s routed     157696 raw    1156608
+read_rows avg_over_time(g[60s])                        60s routed     157696 raw    1156608
+read_rows avg_over_time(g[300s])                       60s routed     157696 raw    1156608
+read_rows timestamp(g)                                 60s routed     157696 raw    1164800
+read_rows g                                            60s routed     157696 raw    1156608
+read_rows rate(c_normal[3600s])                       720s routed      37888 raw    2326528
+read_rows increase(c_normal[3600s])                   720s routed      37888 raw    2326528
+read_rows max_over_time(c_normal[720s])               720s routed      37888 raw    2326528
+read_rows max_over_time(c_normal[3600s])              720s routed      37888 raw    2326528
+read_rows min_over_time(c_normal[720s])               720s routed      37888 raw    2326528
+read_rows min_over_time(c_normal[3600s])              720s routed      37888 raw    2326528
+read_rows sum_over_time(c_normal[720s])               720s routed      37888 raw    2326528
+read_rows sum_over_time(c_normal[3600s])              720s routed      37888 raw    2326528
+read_rows last_over_time(c_normal[720s])              720s routed      37888 raw    2326528
+read_rows last_over_time(c_normal[3600s])             720s routed      37888 raw    2326528
+read_rows present_over_time(c_normal[720s])           720s routed      37888 raw    2326528
+read_rows present_over_time(c_normal[3600s])          720s routed      37888 raw    2326528
+read_rows absent_over_time(c_normal[720s])            720s routed      37888 raw    2326528
+read_rows absent_over_time(c_normal[3600s])           720s routed      37888 raw    2326528
+read_rows timestamp(c_normal)                         720s routed      37888 raw    2326528
+read_rows c_normal                                    720s routed      37888 raw    2326528
+read_rows rate(c_fast[3600s])                         720s routed      20833 raw     491520
+read_rows increase(c_fast[3600s])                     720s routed      20833 raw     491520
+read_rows max_over_time(c_fast[720s])                 720s routed      20833 raw     483328
+read_rows max_over_time(c_fast[3600s])                720s routed      20833 raw     491520
+read_rows min_over_time(c_fast[720s])                 720s routed      20833 raw     483328
+read_rows min_over_time(c_fast[3600s])                720s routed      20833 raw     491520
+read_rows sum_over_time(c_fast[720s])                 720s routed      20833 raw     483328
+read_rows sum_over_time(c_fast[3600s])                720s routed      20833 raw     491520
+read_rows last_over_time(c_fast[720s])                720s routed      20833 raw     483328
+read_rows last_over_time(c_fast[3600s])               720s routed      20833 raw     491520
+read_rows present_over_time(c_fast[720s])             720s routed      20833 raw     483328
+read_rows present_over_time(c_fast[3600s])            720s routed      20833 raw     491520
+read_rows absent_over_time(c_fast[720s])              720s routed      20833 raw     483328
+read_rows absent_over_time(c_fast[3600s])             720s routed      20833 raw     491520
+read_rows timestamp(c_fast)                           720s routed      20833 raw     483328
+read_rows c_fast                                      720s routed      20833 raw     483328
+read_rows rate(c_stop[3600s])                         720s routed      17480 raw     443352
+read_rows increase(c_stop[3600s])                     720s routed      17480 raw     443352
+read_rows max_over_time(c_stop[720s])                 720s routed      17480 raw     443352
+read_rows max_over_time(c_stop[3600s])                720s routed      17480 raw     443352
+read_rows min_over_time(c_stop[720s])                 720s routed      17480 raw     443352
+read_rows min_over_time(c_stop[3600s])                720s routed      17480 raw     443352
+read_rows sum_over_time(c_stop[720s])                 720s routed      17480 raw     443352
+read_rows sum_over_time(c_stop[3600s])                720s routed      17480 raw     443352
+read_rows last_over_time(c_stop[720s])                720s routed      17480 raw     443352
+read_rows last_over_time(c_stop[3600s])               720s routed      17480 raw     443352
+read_rows present_over_time(c_stop[720s])             720s routed      17480 raw     443352
+read_rows present_over_time(c_stop[3600s])            720s routed      17480 raw     443352
+read_rows absent_over_time(c_stop[720s])              720s routed      17480 raw     443352
+read_rows absent_over_time(c_stop[3600s])             720s routed      17480 raw     443352
+read_rows timestamp(c_stop)                           720s routed      17480 raw     443352
+read_rows c_stop                                      720s routed      17480 raw     443352
+read_rows rate(c_sparse[3600s])                       720s routed      19420 raw     352256
+read_rows increase(c_sparse[3600s])                   720s routed      19420 raw     352256
+read_rows max_over_time(c_sparse[720s])               720s routed      19420 raw     352256
+read_rows max_over_time(c_sparse[3600s])              720s routed      19420 raw     352256
+read_rows min_over_time(c_sparse[720s])               720s routed      19420 raw     352256
+read_rows min_over_time(c_sparse[3600s])              720s routed      19420 raw     352256
+read_rows sum_over_time(c_sparse[720s])               720s routed      19420 raw     352256
+read_rows sum_over_time(c_sparse[3600s])              720s routed      19420 raw     352256
+read_rows last_over_time(c_sparse[720s])              720s routed      19420 raw     352256
+read_rows last_over_time(c_sparse[3600s])             720s routed      19420 raw     352256
+read_rows present_over_time(c_sparse[720s])           720s routed      19420 raw     352256
+read_rows present_over_time(c_sparse[3600s])          720s routed      19420 raw     352256
+read_rows absent_over_time(c_sparse[720s])            720s routed      19420 raw     352256
+read_rows absent_over_time(c_sparse[3600s])           720s routed      19420 raw     352256
+read_rows timestamp(c_sparse)                         720s routed      19420 raw     352256
+read_rows c_sparse                                    720s routed      19420 raw     352256
+read_rows max_over_time(g[720s])                      720s routed      50140 raw    2324992
+read_rows max_over_time(g[3600s])                     720s routed      50140 raw    2324992
+read_rows min_over_time(g[720s])                      720s routed      50140 raw    2316800
+read_rows min_over_time(g[3600s])                     720s routed      50140 raw    2316800
+read_rows sum_over_time(g[720s])                      720s routed      50140 raw    2316800
+read_rows sum_over_time(g[3600s])                     720s routed      50140 raw    2316800
+read_rows last_over_time(g[720s])                     720s routed      50140 raw    2316800
+read_rows last_over_time(g[3600s])                    720s routed      50140 raw    2316800
+read_rows present_over_time(g[720s])                  720s routed      50140 raw    2316800
+read_rows present_over_time(g[3600s])                 720s routed      50140 raw    2316800
+read_rows absent_over_time(g[720s])                   720s routed      50140 raw    2316800
+read_rows absent_over_time(g[3600s])                  720s routed      50140 raw    2316800
+read_rows avg_over_time(g[720s])                      720s routed      50140 raw    2316800
+read_rows avg_over_time(g[3600s])                     720s routed      50140 raw    2316800
+read_rows timestamp(g)                                720s routed      50140 raw    2324992
+read_rows g                                           720s routed      50140 raw    2316800
+read_rows rate(c_normal[36000s])                     7200s routed     588863 raw    4653056
+read_rows increase(c_normal[36000s])                 7200s routed      23615 raw    4653056
+read_rows max_over_time(c_normal[7200s])             7200s routed      15423 raw    4653056
+read_rows max_over_time(c_normal[36000s])            7200s routed      23615 raw    4653056
+read_rows min_over_time(c_normal[7200s])             7200s routed      15423 raw    4653056
+read_rows min_over_time(c_normal[36000s])            7200s routed      23615 raw    4653056
+read_rows sum_over_time(c_normal[7200s])             7200s routed      15423 raw    4653056
+read_rows sum_over_time(c_normal[36000s])            7200s routed      23615 raw    4653056
+read_rows last_over_time(c_normal[7200s])            7200s routed      15423 raw    4653056
+read_rows last_over_time(c_normal[36000s])           7200s routed      23615 raw    4653056
+read_rows present_over_time(c_normal[7200s])         7200s routed      15423 raw    4653056
+read_rows present_over_time(c_normal[36000s])        7200s routed      23615 raw    4653056
+read_rows absent_over_time(c_normal[7200s])          7200s routed      15423 raw    4653056
+read_rows absent_over_time(c_normal[36000s])         7200s routed      23615 raw    4653056
+read_rows timestamp(c_normal)                        7200s routed      15423 raw    4653056
+read_rows c_normal                                   7200s routed      15423 raw    4653056
+read_rows rate(c_fast[36000s])                       7200s routed     133183 raw     983040
+read_rows increase(c_fast[36000s])                   7200s routed      18495 raw     983040
+read_rows max_over_time(c_fast[7200s])               7200s routed      18495 raw     983040
+read_rows max_over_time(c_fast[36000s])              7200s routed      18495 raw     983040
+read_rows min_over_time(c_fast[7200s])               7200s routed      18495 raw     983040
+read_rows min_over_time(c_fast[36000s])              7200s routed      18495 raw     983040
+read_rows sum_over_time(c_fast[7200s])               7200s routed      18495 raw     983040
+read_rows sum_over_time(c_fast[36000s])              7200s routed      18495 raw     983040
+read_rows last_over_time(c_fast[7200s])              7200s routed      18495 raw     983040
+read_rows last_over_time(c_fast[36000s])             7200s routed      18495 raw     983040
+read_rows present_over_time(c_fast[7200s])           7200s routed      18495 raw     983040
+read_rows present_over_time(c_fast[36000s])          7200s routed      18495 raw     983040
+read_rows absent_over_time(c_fast[7200s])            7200s routed      18495 raw     983040
+read_rows absent_over_time(c_fast[36000s])           7200s routed      18495 raw     983040
+read_rows timestamp(c_fast)                          7200s routed      18495 raw     983040
+read_rows c_fast                                     7200s routed      18495 raw     983040
+read_rows rate(c_stop[36000s])                       7200s routed     142952 raw     935896
+read_rows increase(c_stop[36000s])                   7200s routed      21864 raw     935896
+read_rows max_over_time(c_stop[7200s])               7200s routed      21864 raw     935896
+read_rows max_over_time(c_stop[36000s])              7200s routed      21864 raw     935896
+read_rows min_over_time(c_stop[7200s])               7200s routed      21864 raw     935896
+read_rows min_over_time(c_stop[36000s])              7200s routed      21864 raw     935896
+read_rows sum_over_time(c_stop[7200s])               7200s routed      21864 raw     935896
+read_rows sum_over_time(c_stop[36000s])              7200s routed      21864 raw     935896
+read_rows last_over_time(c_stop[7200s])              7200s routed      21864 raw     935896
+read_rows last_over_time(c_stop[36000s])             7200s routed      21864 raw     935896
+read_rows present_over_time(c_stop[7200s])           7200s routed      21864 raw     935896
+read_rows present_over_time(c_stop[36000s])          7200s routed      21864 raw     935896
+read_rows absent_over_time(c_stop[7200s])            7200s routed      21864 raw     935896
+read_rows absent_over_time(c_stop[36000s])           7200s routed      21864 raw     935896
+read_rows timestamp(c_stop)                          7200s routed      21864 raw     927704
+read_rows c_stop                                     7200s routed      21864 raw     927704
+read_rows rate(c_sparse[36000s])                     7200s routed     111976 raw     720896
+read_rows increase(c_sparse[36000s])                 7200s routed      21864 raw     720896
+read_rows max_over_time(c_sparse[7200s])             7200s routed      21864 raw     712704
+read_rows max_over_time(c_sparse[36000s])            7200s routed      21864 raw     720896
+read_rows min_over_time(c_sparse[7200s])             7200s routed      21864 raw     712704
+read_rows min_over_time(c_sparse[36000s])            7200s routed      21864 raw     720896
+read_rows sum_over_time(c_sparse[7200s])             7200s routed      21864 raw     712704
+read_rows sum_over_time(c_sparse[36000s])            7200s routed      21864 raw     720896
+read_rows last_over_time(c_sparse[7200s])            7200s routed      21864 raw     712704
+read_rows last_over_time(c_sparse[36000s])           7200s routed      21864 raw     720896
+read_rows present_over_time(c_sparse[7200s])         7200s routed      21864 raw     712704
+read_rows present_over_time(c_sparse[36000s])        7200s routed      21864 raw     720896
+read_rows absent_over_time(c_sparse[7200s])          7200s routed      21864 raw     712704
+read_rows absent_over_time(c_sparse[36000s])         7200s routed      21864 raw     720896
+read_rows timestamp(c_sparse)                        7200s routed      21864 raw     712704
+read_rows c_sparse                                   7200s routed      21864 raw     712704
+read_rows max_over_time(g[7200s])                    7200s routed      24936 raw    4645376
+read_rows max_over_time(g[36000s])                   7200s routed     213352 raw    4645376
+read_rows min_over_time(g[7200s])                    7200s routed      24936 raw    4645376
+read_rows min_over_time(g[36000s])                   7200s routed      24936 raw    4645376
+read_rows sum_over_time(g[7200s])                    7200s routed      24936 raw    4645376
+read_rows sum_over_time(g[36000s])                   7200s routed      24936 raw    4645376
+read_rows last_over_time(g[7200s])                   7200s routed      24936 raw    4645376
+read_rows last_over_time(g[36000s])                  7200s routed      24936 raw    4645376
+read_rows present_over_time(g[7200s])                7200s routed      24936 raw    4645376
+read_rows present_over_time(g[36000s])               7200s routed      24936 raw    4645376
+read_rows absent_over_time(g[7200s])                 7200s routed      24936 raw    4645376
+read_rows absent_over_time(g[36000s])                7200s routed      24936 raw    4645376
+read_rows avg_over_time(g[7200s])                    7200s routed      24936 raw    4645376
+read_rows avg_over_time(g[36000s])                   7200s routed      24936 raw    4645376
+read_rows timestamp(g)                               7200s routed      24936 raw    4645376
+read_rows g                                          7200s routed      24936 raw    4645376
+read_rows rate(c_normal[432000s])                   86400s routed      10280 raw    4653056
+read_rows increase(c_normal[432000s])               86400s routed      10280 raw    4653056
+read_rows max_over_time(c_normal[86400s])           86400s routed       1305 raw    2908160
+read_rows max_over_time(c_normal[432000s])          86400s routed      10280 raw    4653056
+read_rows min_over_time(c_normal[86400s])           86400s routed       1305 raw    2908160
+read_rows min_over_time(c_normal[432000s])          86400s routed      10280 raw    4653056
+read_rows sum_over_time(c_normal[86400s])           86400s routed       1305 raw    2908160
+read_rows sum_over_time(c_normal[432000s])          86400s routed      10280 raw    4653056
+read_rows last_over_time(c_normal[86400s])          86400s routed       1305 raw    2908160
+read_rows last_over_time(c_normal[432000s])         86400s routed      10280 raw    4653056
+read_rows present_over_time(c_normal[86400s])       86400s routed       1305 raw    2908160
+read_rows present_over_time(c_normal[432000s])      86400s routed      10280 raw    4653056
+read_rows absent_over_time(c_normal[86400s])        86400s routed       1305 raw    2908160
+read_rows absent_over_time(c_normal[432000s])       86400s routed      10280 raw    4653056
+read_rows timestamp(c_normal)                       86400s routed       1044 raw    2326528
+read_rows c_normal                                  86400s routed       1044 raw    2326528
+read_rows rate(c_fast[432000s])                     86400s routed       2088 raw     983040
+read_rows increase(c_fast[432000s])                 86400s routed       2088 raw     983040
+read_rows max_over_time(c_fast[86400s])             86400s routed       1305 raw     606208
+read_rows max_over_time(c_fast[432000s])            86400s routed       2088 raw     983040
+read_rows min_over_time(c_fast[86400s])             86400s routed       1305 raw     606208
+read_rows min_over_time(c_fast[432000s])            86400s routed       2088 raw     983040
+read_rows sum_over_time(c_fast[86400s])             86400s routed       1305 raw     606208
+read_rows sum_over_time(c_fast[432000s])            86400s routed       2088 raw     983040
+read_rows last_over_time(c_fast[86400s])            86400s routed       1305 raw     606208
+read_rows last_over_time(c_fast[432000s])           86400s routed       2088 raw     983040
+read_rows present_over_time(c_fast[86400s])         86400s routed       1305 raw     606208
+read_rows present_over_time(c_fast[432000s])        86400s routed       2088 raw     983040
+read_rows absent_over_time(c_fast[86400s])          86400s routed       1305 raw     606208
+read_rows absent_over_time(c_fast[432000s])         86400s routed       2088 raw     983040
+read_rows timestamp(c_fast)                         86400s routed       1044 raw     483328
+read_rows c_fast                                    86400s routed       1044 raw     483328
+read_rows rate(c_stop[432000s])                     86400s routed       2088 raw     935896
+read_rows increase(c_stop[432000s])                 86400s routed       2088 raw     935896
+read_rows max_over_time(c_stop[86400s])             86400s routed       1305 raw     564440
+read_rows max_over_time(c_stop[432000s])            86400s routed       2088 raw     935896
+read_rows min_over_time(c_stop[86400s])             86400s routed       1305 raw     564440
+read_rows min_over_time(c_stop[432000s])            86400s routed       2088 raw     935896
+read_rows sum_over_time(c_stop[86400s])             86400s routed       1305 raw     564440
+read_rows sum_over_time(c_stop[432000s])            86400s routed       2088 raw     935896
+read_rows last_over_time(c_stop[86400s])            86400s routed       1305 raw     564440
+read_rows last_over_time(c_stop[432000s])           86400s routed       2088 raw     935896
+read_rows present_over_time(c_stop[86400s])         86400s routed       1305 raw     564440
+read_rows present_over_time(c_stop[432000s])        86400s routed       2088 raw     935896
+read_rows absent_over_time(c_stop[86400s])          86400s routed       1305 raw     564440
+read_rows absent_over_time(c_stop[432000s])         86400s routed       2088 raw     935896
+read_rows timestamp(c_stop)                         86400s routed       1044 raw     443352
+read_rows c_stop                                    86400s routed       1044 raw     443352
+read_rows rate(c_sparse[432000s])                   86400s routed       2088 raw     720896
+read_rows increase(c_sparse[432000s])               86400s routed       2088 raw     720896
+read_rows max_over_time(c_sparse[86400s])           86400s routed       1305 raw     442368
+read_rows max_over_time(c_sparse[432000s])          86400s routed       2088 raw     720896
+read_rows min_over_time(c_sparse[86400s])           86400s routed       1305 raw     442368
+read_rows min_over_time(c_sparse[432000s])          86400s routed       2088 raw     720896
+read_rows sum_over_time(c_sparse[86400s])           86400s routed       1305 raw     442368
+read_rows sum_over_time(c_sparse[432000s])          86400s routed       2088 raw     720896
+read_rows last_over_time(c_sparse[86400s])          86400s routed       1305 raw     442368
+read_rows last_over_time(c_sparse[432000s])         86400s routed       2088 raw     720896
+read_rows present_over_time(c_sparse[86400s])       86400s routed       1305 raw     442368
+read_rows present_over_time(c_sparse[432000s])      86400s routed       2088 raw     720896
+read_rows absent_over_time(c_sparse[86400s])        86400s routed       1305 raw     442368
+read_rows absent_over_time(c_sparse[432000s])       86400s routed       2088 raw     720896
+read_rows timestamp(c_sparse)                       86400s routed       1044 raw     352256
+read_rows c_sparse                                  86400s routed       1044 raw     352256
+read_rows max_over_time(g[86400s])                  86400s routed       1305 raw    2905088
+read_rows max_over_time(g[432000s])                 86400s routed       2088 raw    4645376
+read_rows min_over_time(g[86400s])                  86400s routed       1305 raw    2896896
+read_rows min_over_time(g[432000s])                 86400s routed       2088 raw    4645376
+read_rows sum_over_time(g[86400s])                  86400s routed       1305 raw    2896896
+read_rows sum_over_time(g[432000s])                 86400s routed       2088 raw    4645376
+read_rows last_over_time(g[86400s])                 86400s routed       1305 raw    2896896
+read_rows last_over_time(g[432000s])                86400s routed       2088 raw    4645376
+read_rows present_over_time(g[86400s])              86400s routed       1305 raw    2896896
+read_rows present_over_time(g[432000s])             86400s routed       2088 raw    4645376
+read_rows absent_over_time(g[86400s])               86400s routed       1305 raw    2896896
+read_rows absent_over_time(g[432000s])              86400s routed       2088 raw    4645376
+read_rows avg_over_time(g[86400s])                  86400s routed       1305 raw    2896896
+read_rows avg_over_time(g[432000s])                 86400s routed       2088 raw    4645376
+read_rows timestamp(g)                              86400s routed       1044 raw    2316800
+read_rows g                                         86400s routed       1044 raw    2316800
+test each_served_function_is_within_its_distance ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 672.33s
+
+exit 0
