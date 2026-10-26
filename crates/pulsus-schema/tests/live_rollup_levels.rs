@@ -801,10 +801,17 @@ async fn a_hole_is_skipped_at_every_level() {
 /// **A7 (issue #18 part A): each run reads its window.** (i) In its own
 /// database, 400 series at 15 s over 40 minutes ending 3 minutes ago land
 /// (64,000 rows), a first-level run row is seeded at the window start, and
-/// the 60 s level runs until idle. Every first-level run reads fewer rows
-/// than `metric_landing` holds: its window and lookback span a few
-/// 5-minute blocks, and the block condition is what lets it read only
-/// those. (ii) In another database, one UTC day `T−2` of 60 s rows for 400
+/// the 60 s level runs until idle. Landing also holds three hours ending
+/// ten minutes before those 40, which no run's window or lookback
+/// reaches, landed in the same part: 352,000 rows. A first-level run reads
+/// landing twice (its window, and the series lacking a lookback sample),
+/// so without the block condition it reads at least 704,000 rows. With
+/// it, each read covers the run's window and lookback: at most 5 minutes
+/// plus 2, so at most 3 of the 5-minute blocks of 8,000 rows, plus the
+/// granules (8,192 rows) at each block's edge — about 40,000 rows per
+/// read, 80,000 for the two. Every run must read at most half of landing,
+/// 176,000 rows: twice that estimate, and a quarter of the unpruned
+/// reading. (ii) In another database, one UTC day `T−2` of 60 s rows for 400
 /// series and one run row for the day, built by the test; the 720 s, 7200 s
 /// and 86400 s levels run until idle. Every 720 s and 7200 s run that wrote
 /// data read its source through the source's `by_parent` projection, at
@@ -826,12 +833,17 @@ async fn each_run_reads_its_window() {
     let now = now_ms(&client).await;
     let end = now / MINUTE * MINUTE - 3 * MINUTE;
     let start = end - 40 * MINUTE;
+    // One insert, so one part: the 40 minutes, and three hours ending ten
+    // minutes before them that no run's window or lookback reaches.
     exec(
         &client,
         &format!(
             "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
-             SELECT '', t + 5000, 0, '', toUInt128(number % 400 + 1), t, toFloat64(number % 97) \
-             FROM (SELECT number, {start} + (intDiv(number, 400) + 1) * 15000 AS t FROM numbers(64000))"
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, '', toUInt128(number % 400 + 1), t, \
+                    toFloat64(number % 97) \
+             FROM (SELECT number, if(number < 64000, {start} + (intDiv(number, 400) + 1) * 15000, \
+                                    {start} - 3 * 3600000 - 600000 + intDiv(number - 64000, 400) * 15000) AS t \
+                   FROM numbers(352000))"
         ),
     )
     .await;
@@ -840,7 +852,7 @@ async fn each_run_reads_its_window() {
         &format!("SELECT toInt64(count()) AS v FROM {db}.metric_landing"),
     )
     .await;
-    assert_eq!(landing, 64_000);
+    assert_eq!(landing, 352_000);
     insert_level(&client, db, 60, &[], &[(start - MINUTE, start)]).await;
     until_idle(&client, db, 60, 20).await;
     let built = int(
@@ -872,11 +884,15 @@ async fn each_run_reads_its_window() {
     );
     for l in &logged {
         assert!(
-            l.read_rows < landing as u64,
-            "a first-level run read {} rows of the {landing} landing holds: {logged:?}",
+            l.read_rows <= landing as u64 / 2,
+            "a first-level run read {} rows, more than half the {landing} landing holds: {logged:?}",
             l.read_rows
         );
     }
+    println!(
+        "A7 (i): first-level reads {:?}",
+        logged.iter().map(|l| l.read_rows).collect::<Vec<_>>()
+    );
     drop_db(&client, db).await;
 
     // (ii)
