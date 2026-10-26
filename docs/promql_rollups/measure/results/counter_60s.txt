@@ -1,0 +1,30 @@
+scrape 60s level 5s range 60s fast   last only n=328 exact=328 median=0 p99=0 max=0
+scrape 60s level 5s range 60s fast   inc       n=328 exact=328 median=0 p99=0 max=0
+scrape 60s level 5s range 60s fast   inc+start n=328 exact=0 median=0.999 p99=1 max=1
+scrape 60s level 5s range 60s normal last only n=1132 exact=1132 median=0 p99=0 max=0
+scrape 60s level 5s range 60s normal inc       n=1132 exact=1132 median=0 p99=0 max=0
+scrape 60s level 5s range 60s normal inc+start n=1132 exact=0 median=0.998 p99=1 max=1
+scrape 60s level 60s range 300s fast   last only n=28720 exact=28720 median=0 p99=0 max=0
+scrape 60s level 60s range 300s fast   inc       n=28720 exact=28720 median=0 p99=0 max=0
+scrape 60s level 60s range 300s fast   inc+start n=28720 exact=0 median=0.1 p99=0.205 max=0.205
+scrape 60s level 60s range 300s normal last only n=143600 exact=143229 median=0 p99=0 max=0.333
+scrape 60s level 60s range 300s normal inc       n=143600 exact=143233 median=0 p99=0 max=0.301
+scrape 60s level 60s range 300s normal inc+start n=143600 exact=0 median=0.1 p99=0.22 max=0.333
+scrape 60s level 720s range 3600s fast   last only n=33520 exact=0 median=1 p99=1 max=1
+scrape 60s level 720s range 3600s fast   inc       n=33520 exact=0 median=0.158 p99=0.166 max=0.166
+scrape 60s level 720s range 3600s fast   inc+start n=33520 exact=0 median=0.00847 p99=0.0169 max=0.0169
+scrape 60s level 720s range 3600s normal last only n=167600 exact=11 median=2.14e-05 p99=0.195 max=0.243
+scrape 60s level 720s range 3600s normal inc       n=167600 exact=11 median=2.14e-05 p99=0.0698 max=0.186
+scrape 60s level 720s range 3600s normal inc+start n=167600 exact=0 median=0.00946 p99=0.0167 max=0.0172
+scrape 60s level 7200s range 36000s fast   last only n=3280 exact=0 median=1 p99=1 max=1
+scrape 60s level 7200s range 36000s fast   inc       n=3280 exact=0 median=0.196 p99=0.197 max=0.197
+scrape 60s level 7200s range 36000s fast   inc+start n=3280 exact=0 median=0.00084 p99=0.00166 max=0.00166
+scrape 60s level 7200s range 36000s normal last only n=16400 exact=0 median=0.126 p99=0.28 max=0.356
+scrape 60s level 7200s range 36000s normal inc       n=16400 exact=0 median=0.000415 p99=0.186 max=0.199
+scrape 60s level 7200s range 36000s normal inc+start n=16400 exact=0 median=0.000924 p99=0.00165 max=0.00167
+scrape 60s level 86400s range 432000s fast   last only n=200 exact=0 median=1 p99=1 max=1
+scrape 60s level 86400s range 432000s fast   inc       n=200 exact=0 median=0.2 p99=0.2 max=0.2
+scrape 60s level 86400s range 432000s fast   inc+start n=200 exact=0 median=6.99e-05 p99=0.000138 max=0.000139
+scrape 60s level 86400s range 432000s normal last only n=1000 exact=0 median=0.847 p99=0.907 max=0.924
+scrape 60s level 86400s range 432000s normal inc       n=1000 exact=0 median=0.16 p99=0.199 max=0.2
+scrape 60s level 86400s range 432000s normal inc+start n=1000 exact=0 median=6.7e-05 p99=0.000137 max=0.000139

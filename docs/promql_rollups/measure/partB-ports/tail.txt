@@ -1,0 +1,72 @@
+scrape 15s fast    window ends W+0m as read  n=81030 p99=0.0007041 max=0.000827
+scrape 15s fast    window ends W+0m thinned  n=81030 p99=0.0007041 max=0.000827
+scrape 15s fast    window ends W+1m as read  n=81030 p99=0.1374 max=0.138
+scrape 15s fast    window ends W+1m thinned  n=81030 p99=0.0007041 max=0.000827
+scrape 15s fast    window ends W+2m as read  n=81030 p99=0.1546 max=0.155
+scrape 15s fast    window ends W+2m thinned  n=81030 p99=0.0007041 max=0.000827
+scrape 15s fast    window ends W+3m as read  n=81030 p99=0.1638 max=0.164
+scrape 15s fast    window ends W+3m thinned  n=81030 p99=0.0007041 max=0.000827
+scrape 15s fast    window ends W+4m as read  n=81030 p99=0.1696 max=0.17
+scrape 15s fast    window ends W+4m thinned  n=81030 p99=0.0007041 max=0.000827
+scrape 15s fast    window ends W+5m as read  n=81030 p99=0 max=0
+scrape 15s fast    window ends W+5m thinned  n=81030 p99=0.0007041 max=0.000827
+scrape 15s normal  window ends W+0m as read  n=81030 p99=0.01087 max=0.0563
+scrape 15s normal  window ends W+0m thinned  n=81030 p99=0.01087 max=0.0563
+scrape 15s normal  window ends W+1m as read  n=81030 p99=0.1375 max=0.147
+scrape 15s normal  window ends W+1m thinned  n=81030 p99=0.01087 max=0.0563
+scrape 15s normal  window ends W+2m as read  n=81030 p99=0.1546 max=0.164
+scrape 15s normal  window ends W+2m thinned  n=81030 p99=0.01087 max=0.0563
+scrape 15s normal  window ends W+3m as read  n=81030 p99=0.1639 max=0.173
+scrape 15s normal  window ends W+3m thinned  n=81030 p99=0.01087 max=0.0563
+scrape 15s normal  window ends W+4m as read  n=81030 p99=0.1696 max=0.178
+scrape 15s normal  window ends W+4m thinned  n=81030 p99=0.01087 max=0.0563
+scrape 15s normal  window ends W+5m as read  n=81030 p99=0 max=0.0469
+scrape 15s normal  window ends W+5m thinned  n=81030 p99=0.01087 max=0.0563
+scrape 15s sparse  window ends W+0m as read  n=81030 p99=0.2025 max=0.529
+scrape 15s sparse  window ends W+0m thinned  n=81030 p99=0.2025 max=0.529
+scrape 15s sparse  window ends W+1m as read  n=81030 p99=0.1692 max=0.529
+scrape 15s sparse  window ends W+1m thinned  n=81030 p99=0.2025 max=0.529
+scrape 15s sparse  window ends W+2m as read  n=81030 p99=0.1499 max=0.384
+scrape 15s sparse  window ends W+2m thinned  n=81030 p99=0.2025 max=0.529
+scrape 15s sparse  window ends W+3m as read  n=81030 p99=0.1597 max=0.306
+scrape 15s sparse  window ends W+3m thinned  n=81030 p99=0.2025 max=0.529
+scrape 15s sparse  window ends W+4m as read  n=81030 p99=0.1689 max=0.234
+scrape 15s sparse  window ends W+4m thinned  n=81030 p99=0.2025 max=0.529
+scrape 15s sparse  window ends W+5m as read  n=81030 p99=0 max=0.101
+scrape 15s sparse  window ends W+5m thinned  n=81030 p99=0.2025 max=0.529
+scrape 60s fast    window ends W+0m as read  n=81030 p99=0 max=0
+scrape 60s fast    window ends W+0m thinned  n=81030 p99=0 max=0
+scrape 60s fast    window ends W+1m as read  n=81030 p99=0 max=0
+scrape 60s fast    window ends W+1m thinned  n=81030 p99=0 max=0
+scrape 60s fast    window ends W+2m as read  n=81030 p99=0 max=0
+scrape 60s fast    window ends W+2m thinned  n=81030 p99=0 max=0
+scrape 60s fast    window ends W+3m as read  n=81030 p99=0 max=0
+scrape 60s fast    window ends W+3m thinned  n=81030 p99=0 max=0
+scrape 60s fast    window ends W+4m as read  n=81030 p99=0 max=0
+scrape 60s fast    window ends W+4m thinned  n=81030 p99=0 max=0
+scrape 60s fast    window ends W+5m as read  n=81030 p99=0 max=0
+scrape 60s fast    window ends W+5m thinned  n=81030 p99=0 max=0
+scrape 60s normal  window ends W+0m as read  n=81030 p99=0 max=0.212
+scrape 60s normal  window ends W+0m thinned  n=81030 p99=0 max=0.212
+scrape 60s normal  window ends W+1m as read  n=81030 p99=0 max=0.212
+scrape 60s normal  window ends W+1m thinned  n=81030 p99=0 max=0.212
+scrape 60s normal  window ends W+2m as read  n=81030 p99=0 max=0.212
+scrape 60s normal  window ends W+2m thinned  n=81030 p99=0 max=0.212
+scrape 60s normal  window ends W+3m as read  n=81030 p99=0 max=0.212
+scrape 60s normal  window ends W+3m thinned  n=81030 p99=0 max=0.212
+scrape 60s normal  window ends W+4m as read  n=81030 p99=0 max=0.212
+scrape 60s normal  window ends W+4m thinned  n=81030 p99=0 max=0.212
+scrape 60s normal  window ends W+5m as read  n=81030 p99=0 max=0.212
+scrape 60s normal  window ends W+5m thinned  n=81030 p99=0 max=0.212
+scrape 60s sparse  window ends W+0m as read  n=78556 p99=0 max=0.47
+scrape 60s sparse  window ends W+0m thinned  n=78556 p99=0 max=0.47
+scrape 60s sparse  window ends W+1m as read  n=78556 p99=0 max=0.47
+scrape 60s sparse  window ends W+1m thinned  n=78556 p99=0 max=0.47
+scrape 60s sparse  window ends W+2m as read  n=78556 p99=0 max=0.47
+scrape 60s sparse  window ends W+2m thinned  n=78556 p99=0 max=0.47
+scrape 60s sparse  window ends W+3m as read  n=78556 p99=0 max=0.47
+scrape 60s sparse  window ends W+3m thinned  n=78556 p99=0 max=0.47
+scrape 60s sparse  window ends W+4m as read  n=78556 p99=0 max=0.47
+scrape 60s sparse  window ends W+4m thinned  n=78556 p99=0 max=0.47
+scrape 60s sparse  window ends W+5m as read  n=78556 p99=0 max=0.47
+scrape 60s sparse  window ends W+5m thinned  n=78556 p99=0 max=0.47

@@ -1,0 +1,8 @@
+scrape 15s sparse   level     60s rate                   n=806240 p99=0.21 max=0.539
+scrape 15s sparse   level    720s rate                   n=67040 p99=0.0245 max=0.0568
+scrape 15s sparse   level   7200s rate                   n=6560 p99=0.00247 max=0.00466
+scrape 15s sparse   level  86400s rate                   n=400 p99=0.000184 max=0.000293
+scrape 60s sparse   level     60s rate                   n=781332 p99=0 max=0.781
+scrape 60s sparse   level    720s rate                   n=67040 p99=0.104 max=0.209
+scrape 60s sparse   level   7200s rate                   n=6560 p99=0.00931 max=0.0192
+scrape 60s sparse   level  86400s rate                   n=400 p99=0.000738 max=0.00104
