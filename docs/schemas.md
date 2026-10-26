@@ -227,12 +227,13 @@ The rollup levels hold per-series summaries of each bucket of a fixed size, one 
 | column | value |
 |---|---|
 | `t_end` | the bucket's end |
-| `t_last`, `last` | the time and value of the bucket's last sample |
+| `t_last`, `last` | the time and value of the bucket's last sample that is not a stale marker; `t_last = 0` when the bucket holds only stale markers |
 | `min`, `max`, `sum`, `count` | over the bucket's non-NaN values |
-| `inc` | the counter increase inside the bucket: over its samples, `v − q` when `v ≥ q`, else `v`, with `q` the series' previous sample |
+| `inc` | the counter increase inside the bucket: over its samples that are not stale markers, `v − q` when `v ≥ q`, else `v`, and `0` when either is NaN; `q` is the series' previous sample that is not a stale marker, from the run's samples or, when the run holds none before it, from the level's own newest row before the run; a `q` more than 24 hours (86,400,000 ms) before `v` is not used and the step counts `0` |
+| `flags` | bit 1 (`1`): the bucket's last sample is a stale marker; bit 2 (`2`): the bucket holds a NaN that is not a stale marker |
 | `built_at` | the run's clock, in milliseconds |
 
-A coarser level's row is composed from the rows of the level below in its bucket: `count`, `sum` and `inc` summed, `min` and `max` over the rows with `count > 0`, `last` and `t_last` from the row with the largest `t_last`.
+A coarser level's row is composed from the rows of the level below in its bucket: `count`, `sum` and `inc` summed, `min` and `max` over the rows with `count > 0`, `last` and `t_last` from the row with the largest `t_last`, flag 1 from the row with the largest `t_end`, flag 2 set when any row has it.
 
 **Run rows.** Every run that has a window, whether or not it found samples, appends a run row: `kind = 1`, `org_id = ''`, `fingerprint = 0`, `t_last` = the window's start, `t_end` = its end, `built_at` = the run's clock, other columns `0`. A window that crosses midnight writes one run row per UTC day. A level's coverage is the union of its run rows' `(t_last, t_end]`, and its watermark the largest `t_end`.
 

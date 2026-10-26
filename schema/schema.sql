@@ -1029,10 +1029,10 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level      tupleElement(plan, 2) AS hi,
 --@level      builder = 1 AND tupleElement(plan, 3) AS work
 --@level-first SELECT toUInt8(0) AS kind, org_id, fingerprint, (intDiv(unix_milli - 1, {{level_ms}}) + 1) * {{level_ms}} AS t_end,
---@level-first   max(unix_milli) AS t_last, argMax(value, (unix_milli, bits)) AS last,
+--@level-first   maxIf(unix_milli, bits != 9218868437227405314) AS t_last, argMaxIf(value, (unix_milli, bits), bits != 9218868437227405314) AS last,
 --@level-first   minIf(value, NOT isNaN(value)) AS min, maxIf(value, NOT isNaN(value)) AS max,
 --@level-first   sumIf(value, NOT isNaN(value)) AS sum, toUInt32(countIf(NOT isNaN(value))) AS count,
---@level-first   sum(d) AS inc, toUInt8(0) AS flags, any(now_ms) AS built_at
+--@level-first   sum(d) AS inc, toUInt8(if(argMax(bits, (unix_milli, bits)) = 9218868437227405314, 1, 0) + if(countIf(isNaN(value) AND bits != 9218868437227405314) > 0, 2, 0)) AS flags, any(now_ms) AS built_at
 --@level-first FROM (
 --@level-first   SELECT org_id, fingerprint, unix_milli, bits, value,
 --@level-first     if(q IS NULL OR isNaN(value) OR isNaN(assumeNotNull(q)), 0.,
@@ -1042,9 +1042,8 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level-first       if(isNull(q0), if(unix_milli - tp0 <= 86400000, p0, NULL), if(unix_milli - t0 <= 86400000, q0, NULL)) AS q
 --@level-first     FROM (
 --@level-first       SELECT org_id, fingerprint, unix_milli, bits, reinterpretAsFloat64(bits) AS value,
---@level-first         lagInFrame(toNullable(reinterpretAsFloat64(bits))) OVER (PARTITION BY org_id, fingerprint
---@level-first             ORDER BY unix_milli, bits ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS q0,
---@level-first         lagInFrame(toNullable(unix_milli)) OVER (PARTITION BY org_id, fingerprint ORDER BY unix_milli, bits ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS t0
+--@level-first         anyLast(if(bits = 9218868437227405314, NULL, toNullable(reinterpretAsFloat64(bits)))) OVER (PARTITION BY org_id, fingerprint ORDER BY unix_milli, bits ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS q0,
+--@level-first         anyLast(if(bits = 9218868437227405314, NULL, toNullable(unix_milli))) OVER (PARTITION BY org_id, fingerprint ORDER BY unix_milli, bits ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS t0
 --@level-first       FROM (SELECT DISTINCT org_id, fingerprint, unix_milli, reinterpretAsUInt64(value) AS bits
 --@level-first --@single             FROM {{db}}.metric_landing
 --@level-first --@cluster             FROM clusterAllReplicas('{{cluster}}', {{db}}.metric_landing)
@@ -1054,8 +1053,8 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level-first               AND fingerprint BETWEEN toUInt128(slice_lo) AND toUInt128(slice_hi))) AS w
 --@level-first     LEFT JOIN (
 --@level-first       SELECT org_id, fingerprint,
---@level-first              toNullable(argMaxIf(last, t_last, NOT isNaN(last))) AS p0,
---@level-first              toNullable(maxIf(t_last, NOT isNaN(last))) AS tp0
+--@level-first              toNullable(argMaxIf(last, t_last, t_last > 0)) AS p0,
+--@level-first              toNullable(maxIf(t_last, t_last > 0)) AS tp0
 --@level-first       FROM {{db}}.metric_samples_{{level}}
 --@level-first       WHERE kind = 0 AND t_end <= lo AND t_end > lo - 86400000
 --@level-first         AND (org_id, fingerprint) IN (SELECT org_id, fingerprint
@@ -1065,16 +1064,16 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level-first                                 AND intDiv(unix_milli, 300000) BETWEEN intDiv(lo - 120000, 300000) AND intDiv(hi, 300000)
 --@level-first                                 AND unix_milli > lo - 120000 AND unix_milli <= hi
 --@level-first                                 AND fingerprint BETWEEN toUInt128(slice_lo) AND toUInt128(slice_hi)
---@level-first                               GROUP BY org_id, fingerprint HAVING min(unix_milli) > lo)
+--@level-first                               GROUP BY org_id, fingerprint HAVING minIf(unix_milli, reinterpretAsUInt64(value) != 9218868437227405314) > lo)
 --@level-first       GROUP BY org_id, fingerprint) AS z USING (org_id, fingerprint))
 --@level-first   WHERE unix_milli > lo)
 --@level-first GROUP BY org_id, fingerprint, t_end
 --@level-next SELECT toUInt8(0) AS kind, org_id, fingerprint, (intDiv(te - 1, {{level_ms}}) + 1) * {{level_ms}} AS t_end,
 --@level-next   max(tl) AS t_last, argMax(lv, tl) AS last,
 --@level-next   minIf(mn, ct > 0) AS min, maxIf(mx, ct > 0) AS max,
---@level-next   sum(sm) AS sum, toUInt32(sum(ct)) AS count, sum(ic) AS inc, toUInt8(0) AS flags, any(now_ms) AS built_at
+--@level-next   sum(sm) AS sum, toUInt32(sum(ct)) AS count, sum(ic) AS inc, toUInt8(bitAnd(argMax(fl, te), 1) + bitAnd(groupBitOr(fl), 2)) AS flags, any(now_ms) AS built_at
 --@level-next FROM (SELECT org_id, fingerprint, t_end AS te, t_last AS tl, last AS lv, min AS mn, max AS mx,
---@level-next              sum AS sm, count AS ct, inc AS ic
+--@level-next              sum AS sm, count AS ct, inc AS ic, flags AS fl
 --@level-next       FROM {{db}}.{{source}}
 --@level-next       WHERE work AND kind = 0
 --@level-next         AND intDiv(t_end - 1, {{level_ms}}) BETWEEN intDiv(lo, {{level_ms}}) AND intDiv(hi - 1, {{level_ms}})

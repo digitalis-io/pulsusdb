@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use pulsus_clickhouse::{ChClient, QuerySettings, Row};
-use pulsus_model::{Fingerprint, FpLiteral, Tenant};
+use pulsus_model::{Fingerprint, FpLiteral, STALE_NAN_BITS, Tenant};
 use pulsus_promql::{PlanParams, RawOverlay, RollupUse, Sample, SelectorSpec};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
@@ -478,20 +478,59 @@ pub fn assemble(
     for t in seq {
         match t {
             Tagged::Raw(s) => out.push(s.clone()),
-            Tagged::Level { row, .. } => match use_ {
-                RollupUse::Last => out.push(Sample::float(row.t_last, row.last)),
-                _ if row.count == 0 => {}
-                RollupUse::Max => out.push(Sample::float(row.t_end, row.max)),
-                RollupUse::Min => out.push(Sample::float(row.t_end, row.min)),
-                RollupUse::Sum => out.push(Sample::float(row.t_end, row.sum)),
-                RollupUse::Avg => {
-                    out.push(Sample::float(row.t_end, row.sum / f64::from(row.count)))
-                }
-                RollupUse::Counter => {}
-            },
+            Tagged::Level { row, .. } => level_points(use_, row, &mut out),
         }
     }
     (out, None)
+}
+
+/// The bucket ended on a stale marker (plan r9 section 2).
+pub const FLAG_STALE_END: u8 = 1;
+/// The bucket holds a NaN that is not a stale marker.
+pub const FLAG_NAN: u8 = 2;
+
+/// Plan r9 section 3 and r10 section 1: the points one level row gives
+/// for a use other than the counter, so a stale marker and a NaN read as
+/// they do raw.
+fn level_points(use_: RollupUse, row: &LevelRow, out: &mut Vec<Sample>) {
+    let nan = row.flags & FLAG_NAN != 0;
+    match use_ {
+        RollupUse::Last => {
+            if row.t_last > 0 {
+                out.push(Sample::float(row.t_last, row.last));
+            }
+            if row.flags & FLAG_STALE_END != 0 {
+                out.push(Sample::float(row.t_end, f64::from_bits(STALE_NAN_BITS)));
+            }
+        }
+        RollupUse::Max | RollupUse::Min => {
+            if row.count > 0 {
+                let v = if use_ == RollupUse::Max {
+                    row.max
+                } else {
+                    row.min
+                };
+                out.push(Sample::float(row.t_end, v));
+            } else if nan {
+                // Every sample that is not a stale marker is NaN: `last` is
+                // the last of them, its payload kept.
+                out.push(Sample::float(row.t_end, row.last));
+            }
+        }
+        RollupUse::Sum | RollupUse::Avg => {
+            if nan {
+                out.push(Sample::float(row.t_end, f64::NAN));
+            } else if row.count > 0 {
+                let v = if use_ == RollupUse::Sum {
+                    row.sum
+                } else {
+                    row.sum / f64::from(row.count)
+                };
+                out.push(Sample::float(row.t_end, v));
+            }
+        }
+        RollupUse::Counter => {}
+    }
 }
 
 /// Plan section 5's counter: one value `c` that never resets, folded over
@@ -506,6 +545,13 @@ fn counter(seq: &[Tagged], out: &mut Vec<Sample>) {
     let mut p: Option<f64> = None;
     for t in seq {
         match t {
+            Tagged::Level { row, .. } if row.t_last == 0 => {
+                // No sample that is not a stale marker: no point; its
+                // increase, 0, still counts (plan r9 section 3).
+                if let Some(x) = c {
+                    c = Some(x + row.inc);
+                }
+            }
             Tagged::Level { res_ms, row } => {
                 let now = match c {
                     Some(c) => c + row.inc,

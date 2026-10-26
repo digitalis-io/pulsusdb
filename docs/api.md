@@ -984,6 +984,8 @@ The largest level that meets all of them is used; if none does, the selector rea
 | `avg_over_time` | `sum / count` | the bucket's end |
 | `rate`, `increase` | a counter that never resets: the first row's `last`, then plus each later row's increase; at levels of 12 minutes and more each row also gives a point one millisecond after its bucket's start, valued before that row's increase | the time of the last sample |
 
+The instant selector, `timestamp`, `last_over_time`, `present_over_time`, `absent_over_time`, `max_over_time` and `min_over_time` read stale markers and NaN values exactly as raw. For `rate` and `increase`, a level does not count the steps to and from a counter value that is NaN (not a stale marker); raw reads NaN when the window's first or last value is NaN and otherwise takes no reset next to it, so the two can differ by those steps, and such windows are outside the distances above.
+
 The first group, `max_over_time` and `min_over_time` answer exactly as raw. `sum_over_time` differs from raw only in the order of addition. For `avg_over_time`, `rate` and `increase`, measured on a 15 s scrape over 8 days, the 99th percentile of the relative distance from the raw answer is at most:
 
 | function, series | 1 m | 12 m | 2 h | 1 d |
@@ -995,11 +997,11 @@ The first group, `max_over_time` and `min_over_time` answer exactly as raw. `sum
 | counters that stop | 0.0218 | 0.141 | 1.0 | 1.0 |
 | counters missing 30 % of their scrapes | 0.42 | 0.049 | 0.00494 | 0.000368 |
 
-A window that holds the stop of a counter is about half off at the coarse levels; that is what the stopping counters' figures record. For a counter that stopped or went stale within the newest window, a `rate` or `increase` answered from the 12 m or a coarser level can differ from raw by up to about 3 % (measured 3.08 %) at steps just after the level's newest built bucket; counters that keep counting are unaffected. `avg_over_time` is further off for series whose samples sit on the edges of the buckets, where jitter moves them between buckets and the number of samples per bucket varies: with every sample on an edge, the 99th percentile measured 0.358 at 1 m, 0.595 at 12 m, 0.0557 at 2 h and 0.0246 at 1 d.
+A window that holds the stop of a counter is about half off at the coarse levels; that is what the stopping counters' figures record. For a counter that stopped or went stale within the newest window, a `rate` or `increase` answered from the 12 m or a coarser level can differ from raw by up to about 4 % (measured 3.75 %) at steps just after the level's newest built bucket; counters that keep counting are unaffected. `avg_over_time` is further off for series whose samples sit on the edges of the buckets, where jitter moves them between buckets and the number of samples per bucket varies: with every sample on an edge, the 99th percentile measured 0.358 at 1 m, 0.595 at 12 m, 0.0557 at 2 h and 0.0246 at 1 d.
 
 At a level under 12 minutes, a `rate` or `increase` window that reaches into time no level covers is computed from the raw samples, exactly as without rollups, native-histogram samples included.
 
-A counter whose previous sample is more than 24 hours (86,400,000 ms) before its next one starts a new count at that sample: the step between the two is not counted by any level.
+From the 12 m level and coarser, a `rate` or `increase` window holding only one sample of a counter has a value where raw has none, when a level row serves that sample and its value is a number: the row also gives a point at its bucket's start, valued before the row's increase, and the two points are extrapolated as any window is. For example, `increase(x[1h])` at a 12 m step, with the window's one sample, 1030, at its end and the sample before the window 1000, reads 45 (`rate` 0.0125); with no rise it reads 0. A single sample read from raw because no level covers its time, or a single NaN, has no value, as raw. A step between two samples more than 24 hours apart is not counted by any level: a counter sampled at 23:59:30 and next at 00:00:00 a day later, with nothing between, reads `increase(x[5d])` 0 from the 1 d level at that midnight, where raw reads 45.
 
 **Freshness.** The newest part of every window comes from the finer levels and then from raw samples, so a refreshing panel shows the newest samples. A level's coverage is the time its builds have completed on every shard; anything else, holes included, is read from a finer level or raw.
 
