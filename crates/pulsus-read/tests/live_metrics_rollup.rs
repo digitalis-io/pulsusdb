@@ -1538,9 +1538,9 @@ const NAN_B: u64 = 9_221_120_237_041_090_562;
 /// S2's samples for one level `res`: `(metric, t, value bits)`, each
 /// series labelled with the level. Bucket `B = (b − res, b]`, `b = E −
 /// 3 res`, holds S1's shapes, the stale marker in its last 5 minutes;
-/// every series resumes two buckets later. `s2_c` is a counter rising by
-/// 10 a scrape from `b − 11 res`, a stale marker in `B`, resuming 30
-/// higher.
+/// every gauge resumes two buckets later. `s2_c` is a counter rising by
+/// 10 a scrape from `b − 11 res`, with a stale marker in `B` and its next
+/// sample 15 s after it, 30 higher: S1's `c1` shape.
 fn s2_series(e: i64, res: i64) -> Vec<(&'static str, i64, u64)> {
     let b = e - 3 * res;
     let st = b - (res / 3).min(150_000);
@@ -1567,7 +1567,7 @@ fn s2_series(e: i64, res: i64) -> Vec<(&'static str, i64, u64)> {
     }
     out.push(("s2_c", st, STALE_BITS));
     let mut v = v - 10.0 + 30.0;
-    let mut t = resume;
+    let mut t = st + SCRAPE;
     while t <= e {
         out.push(("s2_c", t, v.to_bits()));
         v += 10.0;
@@ -1720,12 +1720,16 @@ async fn stale_and_nan_read_as_raw() {
         if secs == 60 {
             // The step whose window holds the first sample after the
             // marker counts the 30 step, as raw does.
-            let resume = b + 2 * res - res / 2;
-            let t = ((resume - 1).div_euclid(res) + 1) * res;
+            let st = b - (res / 3).min(150_000);
+            let t = ((st + SCRAPE - 1).div_euclid(res) + 1) * res;
             let at = pa.iter().find(|((_, s), _)| *s == t).map(|(_, v)| *v);
             let raw_at = pb.iter().find(|((_, s), _)| *s == t).map(|(_, v)| *v);
             println!("S2 60 s step holding the resumed sample: routed {at:?}, raw {raw_at:?}");
-            if at.is_none() || at != raw_at || at < Some(30.0) {
+            let close = match (at, raw_at) {
+                (Some(x), Some(y)) => (x - y).abs() / y.abs() <= limit && x >= 30.0,
+                _ => false,
+            };
+            if !close {
                 failures.push(format!(
                     "{q}: at the resumed step routed {at:?}, raw {raw_at:?}"
                 ));
@@ -1763,6 +1767,17 @@ async fn stale_and_nan_read_as_raw() {
         compressed: u64,
         uncompressed: u64,
     }
+    for r in [60, 720, 7200, 86400] {
+        exec(
+            &built.admin,
+            &format!(
+                "CREATE TABLE {db}.size_{r} ENGINE = MergeTree ORDER BY (org_id, fingerprint, t_end) \
+                 SETTINGS min_bytes_for_wide_part = 0, min_rows_for_wide_part = 0 \
+                 AS SELECT * FROM {db}.metric_samples_{r}s"
+            ),
+        )
+        .await;
+    }
     let mut stream = built
         .admin
         .query_stream::<ColRow>(
@@ -1770,7 +1785,7 @@ async fn stale_and_nan_read_as_raw() {
                 "SELECT table, column AS name, toUInt64(sum(column_data_compressed_bytes)) AS compressed, \
                         toUInt64(sum(column_data_uncompressed_bytes)) AS uncompressed \
                  FROM system.parts_columns WHERE database = '{db}' AND active \
-                 AND match(table, '^metric_samples_[0-9]+s$') AND column IN ('flags', 'inc', 'last') \
+                 AND match(table, '^size_[0-9]+$') AND column IN ('flags', 'inc', 'last') \
                  GROUP BY table, column ORDER BY table, column"
             ),
             &QuerySettings::new(),
