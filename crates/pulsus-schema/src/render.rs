@@ -74,6 +74,12 @@ pub struct RenderCtx {
     /// `PULSUS_ROLLUP_LEVELS` (issue #18): the validated rollup levels in
     /// seconds, smallest first; empty for none.
     pub rollup_levels: Vec<u32>,
+    /// `PULSUS_ROLLUP_RANGES` (issue #18): the validated switch points in
+    /// seconds, one per level after the first.
+    pub rollup_ranges: Vec<u32>,
+    /// `PULSUS_ROLLUP_COUNTER_BUCKETS` (issue #18): the buckets a counter's
+    /// range covers at least.
+    pub rollup_counter_buckets: u32,
 }
 
 /// The rows one run of the service-graph job may read (issue #599), the
@@ -84,6 +90,12 @@ pub const GRAPH_JOB_MAX_ROWS: u64 = 60_000_000;
 /// The rollup levels `schema/schema.sh` renders when `PULSUS_ROLLUP_LEVELS`
 /// is unset (issue #18).
 pub const DEFAULT_ROLLUP_LEVELS: &[u32] = &[60, 720, 7200, 86400];
+
+/// STUB (tests first).
+pub const DEFAULT_ROLLUP_RANGES: &[u32] = &[];
+
+/// STUB (tests first).
+pub const DEFAULT_ROLLUP_COUNTER_BUCKETS: u32 = 5;
 
 impl RenderCtx {
     /// A context for a test: `db` and `retention_days` as given, every other
@@ -112,6 +124,8 @@ impl RenderCtx {
             trace_indexed_attributes: Vec::new(),
             graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
             rollup_levels: DEFAULT_ROLLUP_LEVELS.to_vec(),
+            rollup_ranges: DEFAULT_ROLLUP_RANGES.to_vec(),
+            rollup_counter_buckets: DEFAULT_ROLLUP_COUNTER_BUCKETS,
         }
     }
 }
@@ -269,6 +283,16 @@ pub fn parse_rollup_levels(text: &str, landing_hours: u32) -> Result<Vec<u32>, S
         ));
     }
     Ok(levels)
+}
+
+/// STUB (tests first).
+pub fn parse_rollup_ranges(_text: &str, _levels: &[u32]) -> Result<Vec<u32>, String> {
+    Ok(Vec::new())
+}
+
+/// STUB (tests first).
+pub fn parse_rollup_counter_buckets(_text: &str) -> Result<u32, String> {
+    Ok(0)
 }
 
 /// Which levels a line of the level block is kept for.
@@ -454,6 +478,8 @@ mod tests {
             trace_indexed_attributes: Vec::new(),
             graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
             rollup_levels: DEFAULT_ROLLUP_LEVELS.to_vec(),
+            rollup_ranges: DEFAULT_ROLLUP_RANGES.to_vec(),
+            rollup_counter_buckets: DEFAULT_ROLLUP_COUNTER_BUCKETS,
         }
     }
 

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
 use super::TenantSql;
+use super::exec::MetricQueryParams;
 use super::labels::LabelledResolution;
 use super::sample_sql::render_fingerprint_list;
 use crate::logql::escape::ch_string;
@@ -24,6 +25,8 @@ use crate::logql::escape::ch_string;
 pub struct Level {
     pub res_ms: i64,
     pub table: String,
+    /// The query range from which this level is the resolution.
+    pub from_ms: u64,
 }
 
 /// The levels the database holds, smallest first, and the shard count a
@@ -32,6 +35,8 @@ pub struct Level {
 pub struct Levels {
     pub levels: Vec<Level>,
     pub shards: u32,
+    /// The buckets a counter's range covers at least.
+    pub counter_buckets: u32,
 }
 
 /// The process-wide level list, refreshed every 60 s. Empty until the
@@ -136,9 +141,11 @@ pub async fn refresh_levels(
                 .map(|r| Level {
                     res_ms: i64::from(r.res_ms),
                     table: format!("{}{suffix}", r.name),
+                    from_ms: 0,
                 })
                 .collect(),
             shards,
+            counter_buckets: 5,
         })
     }
     .await;
@@ -194,7 +201,7 @@ pub struct Route {
 
 /// Plan section 3: the largest level the selector's time and range fit,
 /// or `None`.
-pub fn route(sel: &SelectorSpec, p: &PlanParams, levels: &Levels) -> Option<Route> {
+pub fn route(sel: &SelectorSpec, p: &PlanParams, levels: &Levels, _res: i64) -> Option<Route> {
     let use_ = sel.rollup_use?;
     if excluded(sel) {
         return None;
@@ -228,6 +235,11 @@ fn fits(sel: &SelectorSpec, p: &PlanParams, use_: RollupUse, res: i64) -> bool {
         (Some(r), _) => r.rem_euclid(res) == 0 && r >= res,
     };
     time && range
+}
+
+/// STUB (tests first): the response grid.
+pub fn grid(_p: &MetricQueryParams, _levels: &Levels) -> Option<(i64, MetricQueryParams)> {
+    None
 }
 
 /// Plan Q5: what keeps a selector on raw whatever its step and range.
@@ -673,10 +685,162 @@ mod tests {
                 .map(|s| Level {
                     res_ms: s * 1000,
                     table: format!("metric_samples_{s}s"),
+                    from_ms: 0,
                 })
                 .collect(),
             shards: 1,
+            counter_buckets: 5,
         }
+    }
+
+    const DAY: i64 = 86_400_000;
+
+    /// The owner's table (2026-10-26): the default levels and the query
+    /// range from which each is the resolution.
+    fn owners() -> Levels {
+        let rows: [(i64, u64); 5] = [
+            (5, 0),
+            (60, 3_600_000),
+            (720, 86_400_000),
+            (7200, 604_800_000),
+            (86400, 7_776_000_000),
+        ];
+        Levels {
+            levels: rows
+                .iter()
+                .map(|&(s, from_ms)| Level {
+                    res_ms: s * 1000,
+                    table: format!("metric_samples_{s}s"),
+                    from_ms,
+                })
+                .collect(),
+            shards: 1,
+            counter_buckets: 5,
+        }
+    }
+
+    fn query(start: i64, end: i64, step: i64) -> MetricQueryParams {
+        MetricQueryParams {
+            start_ms: start,
+            end_ms: end,
+            step_ms: step,
+        }
+    }
+
+    /// The resolution `grid` chooses, the number of evaluation times of
+    /// the grid it returns, and its first and last time.
+    fn snapped(p: &MetricQueryParams, lv: &Levels) -> Option<(i64, i64, i64, i64)> {
+        let (res, g) = grid(p, lv)?;
+        assert_eq!(g.step_ms, res, "the step is the resolution");
+        assert_eq!(
+            g.start_ms.rem_euclid(res),
+            0,
+            "the first time is a bucket end"
+        );
+        assert_eq!(g.end_ms.rem_euclid(res), 0, "the last time is a bucket end");
+        Some((res, (g.end_ms - g.start_ms) / res + 1, g.start_ms, g.end_ms))
+    }
+
+    /// **T1 (issue #18 follow-up): the owner's table.** Each row's
+    /// range, one millisecond off a midnight, at a 1 s step, gets the
+    /// row's resolution and exactly its points; the aligned, coarser-step
+    /// and one-millisecond-short cases keep the rule.
+    #[test]
+    fn the_owners_table() {
+        let lv = owners();
+        let start = BASE + 1;
+        let rows: [(i64, i64, i64); 15] = [
+            (5 * MIN, 5_000, 60),
+            (15 * MIN, 5_000, 180),
+            (30 * MIN, 5_000, 360),
+            (HOUR, 60_000, 60),
+            (3 * HOUR, 60_000, 180),
+            (6 * HOUR, 60_000, 360),
+            (12 * HOUR, 60_000, 720),
+            (DAY, 720_000, 120),
+            (2 * DAY, 720_000, 240),
+            (7 * DAY, 7_200_000, 84),
+            (30 * DAY, 7_200_000, 360),
+            (90 * DAY, 86_400_000, 90),
+            (182 * DAY, 86_400_000, 182),
+            (365 * DAY, 86_400_000, 365),
+            (HOUR - 1, 5_000, 720),
+        ];
+        for (range, res, points) in rows {
+            let got = snapped(&query(start, start + range, 1_000), &lv).map(|g| (g.0, g.1));
+            assert_eq!(got, Some((res, points)), "range {range} ms");
+        }
+        // Aligned: the start is not a point; the end is.
+        assert_eq!(
+            snapped(&query(BASE, BASE + 7 * DAY, 1_000), &lv),
+            Some((7_200_000, 84, BASE + 2 * HOUR, BASE + 7 * DAY))
+        );
+        // A coarser step asked: every bucket end still.
+        assert_eq!(
+            snapped(&query(BASE, BASE + 7 * DAY, DAY), &lv),
+            Some((7_200_000, 84, BASE + 2 * HOUR, BASE + 7 * DAY))
+        );
+        // One millisecond under 7 days: the 720 s level.
+        assert_eq!(
+            snapped(&query(BASE, BASE + 7 * DAY - 1, 1_000), &lv).map(|g| (g.0, g.1)),
+            Some((720_000, 839))
+        );
+        // One millisecond under an hour: 5 s, the last bucket end at
+        // `start - 1 ms + 1 h`.
+        assert_eq!(
+            snapped(&query(start, start + HOUR - 1, 1_000), &lv),
+            Some((5_000, 720, BASE + 5_000, BASE + HOUR))
+        );
+        // An instant query and no levels keep their own grid.
+        assert_eq!(grid(&query(BASE, BASE, 0), &lv), None);
+        assert_eq!(grid(&query(BASE, BASE + DAY, MIN), &levels(&[])), None);
+    }
+
+    /// **T1b (issue #18 follow-up): the grid does not overflow**, and a
+    /// grid of more than 11,001 points keeps the query's own.
+    #[test]
+    fn the_grid_does_not_overflow() {
+        let lv = owners();
+        assert_eq!(grid(&query(i64::MAX - 1, i64::MAX, 1), &lv), None);
+        assert_eq!(
+            snapped(&query(i64::MIN, i64::MIN + 3_600_000, 1_000), &lv).map(|g| (g.0, g.1)),
+            Some((60_000, 60))
+        );
+        assert_eq!(grid(&query(i64::MIN, i64::MAX, 1_000), &lv), None);
+        assert_eq!(
+            snapped(&query(BASE, BASE + 11_001 * DAY, DAY), &lv).map(|g| (g.0, g.1)),
+            Some((86_400_000, 11_001))
+        );
+        assert_eq!(grid(&query(BASE, BASE + 11_002 * DAY, DAY), &lv), None);
+    }
+
+    /// The level the query's one selector reads on the grid `p` snaps to.
+    fn on_grid(q: &str, p: &MetricQueryParams, lv: &Levels) -> Option<i64> {
+        let got = grid(p, lv);
+        assert!(
+            got.is_some() || p.start_ms == p.end_ms,
+            "{q}: a range query has a grid"
+        );
+        let (res, g) = got.unwrap_or((lv.levels[0].res_ms, *p));
+        let pp = g.plan_params(true, DEFAULT_LOOKBACK_MS);
+        let sels = selectors(q, &pp);
+        assert_eq!(sels.len(), 1, "{q}: one selector");
+        route(&sels[0], &pp, lv, res).map(|r| r.res_ms)
+    }
+
+    /// **T2 (issue #18 follow-up): the guards.** On a 7-day grid a
+    /// selector reads the largest level its range and time allow.
+    #[test]
+    fn the_guards() {
+        let lv = owners();
+        let week = query(BASE, BASE + 7 * DAY, 5 * MIN);
+        assert_eq!(on_grid("rate(x[5m])", &week, &lv), Some(60_000));
+        assert_eq!(on_grid("rate(x[2h])", &week, &lv), Some(720_000));
+        assert_eq!(on_grid("max_over_time(x[2h])", &week, &lv), Some(7_200_000));
+        assert_eq!(on_grid("x offset 90s", &week, &lv), Some(5_000));
+        let at = |t: i64| query(t, t, 0);
+        assert_eq!(on_grid("x", &at(BASE + 3_000), &lv), None);
+        assert_eq!(on_grid("x", &at(BASE + 5_000), &lv), Some(5_000));
     }
 
     fn all() -> Levels {
@@ -701,7 +865,7 @@ mod tests {
     fn chosen(query: &str, p: &PlanParams, lv: &Levels) -> Vec<Option<i64>> {
         selectors(query, p)
             .iter()
-            .map(|s| route(s, p, lv).map(|r| r.res_ms))
+            .map(|s| route(s, p, lv, i64::MAX).map(|r| r.res_ms))
             .collect()
     }
 
@@ -925,7 +1089,7 @@ mod tests {
         );
         let info: Vec<(bool, Option<i64>)> = selectors("info(m)", &p)
             .iter()
-            .map(|s| (s.info_family, route(s, &p, &lv).map(|r| r.res_ms)))
+            .map(|s| (s.info_family, route(s, &p, &lv, i64::MAX).map(|r| r.res_ms)))
             .collect();
         assert!(
             info.contains(&(true, None)) && info.contains(&(false, Some(720_000))),
@@ -935,7 +1099,7 @@ mod tests {
         // The route names the level's table and the consumer's column.
         let sel = &selectors("rate(m[1h])", &p)[0];
         assert_eq!(
-            route(sel, &p, &lv),
+            route(sel, &p, &lv, i64::MAX),
             Some(Route {
                 level: 1,
                 res_ms: 720_000,
@@ -1287,7 +1451,10 @@ mod tests {
             assert_eq!(s.name_matchers.len(), 1, "{q}: one matcher beside it");
             assert!(!eligible(&s, &series), "{q}");
         }
-        assert!(!eligible(&sel("rate(m[1h])"), &fallback), "SqlFallback");
+        assert!(
+            eligible(&sel("rate(m[1h])"), &fallback),
+            "T3: a selector the label cache cannot answer is eligible"
+        );
         let stats = selectors("histogram_count(rate(h[5m]))", &p).remove(0);
         assert!(
             stats.histogram_stats,

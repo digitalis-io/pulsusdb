@@ -1818,6 +1818,7 @@ dependencies = [
  "clickhouse",
  "futures",
  "pulsus-clickhouse",
+ "pulsus-read",
  "pulsus-schema-testkit",
  "pulsus-testkit",
  "serde",

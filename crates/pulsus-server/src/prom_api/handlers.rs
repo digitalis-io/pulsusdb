@@ -1750,9 +1750,11 @@ mod tests {
                 .map(|s| Level {
                     res_ms: s * 1000,
                     table: format!("metric_samples_{s}s"),
+                    from_ms: 0,
                 })
                 .collect(),
             shards: 1,
+            counter_buckets: 5,
         };
         for (secs, want) in [
             (

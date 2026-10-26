@@ -554,7 +554,8 @@ fn rows_of(tables: &str) -> Vec<DocRow> {
 
 /// Issue #497: §7 documents exactly the five variables `schema/schema.sh`
 /// alone reads, and the binary reads none of them. Issue #18 part A added
-/// `PULSUS_ROLLUP_LEVELS`.
+/// `PULSUS_ROLLUP_LEVELS`, and its follow-up `PULSUS_ROLLUP_RANGES` and
+/// `PULSUS_ROLLUP_COUNTER_BUCKETS`.
 #[test]
 fn section_7_names_the_script_s_retention_variables_and_the_binary_reads_none() {
     let mut got: Vec<String> = rows_of(&sections().1)
@@ -569,7 +570,9 @@ fn section_7_names_the_script_s_retention_variables_and_the_binary_reads_none() 
             "PULSUS_LOG_LANDING_RETENTION_HOURS",
             "PULSUS_METRICS_LANDING_RETENTION_HOURS",
             "PULSUS_RETENTION_DAYS",
+            "PULSUS_ROLLUP_COUNTER_BUCKETS",
             "PULSUS_ROLLUP_LEVELS",
+            "PULSUS_ROLLUP_RANGES",
             "PULSUS_TRACE_LANDING_RETENTION_HOURS",
         ],
         "§7's variables"

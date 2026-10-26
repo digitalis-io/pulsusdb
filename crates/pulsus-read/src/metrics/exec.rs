@@ -974,7 +974,7 @@ impl MetricsEngine {
             // never pushed down.
             if let Some(levels) = self.rollup_levels.as_ref().and_then(|slot| slot.get())
                 && super::rollup::eligible(sel, &resolution)
-                && let Some(route) = super::rollup::route(sel, &plan_params, &levels)
+                && let Some(route) = super::rollup::route(sel, &plan_params, &levels, i64::MAX)
                 && let LabelledResolution::Series(pairs) = resolution
             {
                 fetch_plans.push(self.rollup_fetch_plan(
