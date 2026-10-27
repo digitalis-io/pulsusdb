@@ -844,34 +844,30 @@ impl PushedRangeFn {
 /// So the check below is the numerator the statement evaluates, in the
 /// same association order, plus the `leadInFrame` default.
 fn grid_of(params: &PlanParams) -> Option<Grid> {
-    if params.step_ms < 0 || params.end_ms < params.start_ms {
+    // Issue #18 follow-up: the evaluation grid, which a rollup level may
+    // space wider than the request's step; `step_ms == 0` stays the
+    // request's instant test.
+    let (end_ms, eval_step) = (params.eval_end(), params.eval_step());
+    if params.step_ms < 0 || end_ms < params.start_ms {
         return None;
     }
     let (step_ms, points) = if params.step_ms == 0 {
         (1i64, 1u32)
     } else {
-        let intervals = params
-            .end_ms
+        let intervals = end_ms
             .checked_sub(params.start_ms)?
-            .checked_div(params.step_ms)?;
-        (
-            params.step_ms,
-            u32::try_from(intervals.checked_add(1)?).ok()?,
-        )
+            .checked_div(eval_step)?;
+        (eval_step, u32::try_from(intervals.checked_add(1)?).ok()?)
     };
     // `intDiv(cover_end - grid_start + grid_step - 1, grid_step)` at
     // `cover_end`'s maximum, which is `end + lookback`.
-    params
-        .end_ms
+    end_ms
         .checked_add(params.lookback_ms)?
         .checked_sub(params.start_ms)?
         .checked_add(step_ms)?
         .checked_sub(1)?;
     // `leadInFrame(ts, 1, toInt64(<upper>) + lookback + 1)`.
-    params
-        .end_ms
-        .checked_add(params.lookback_ms)?
-        .checked_add(1)?;
+    end_ms.checked_add(params.lookback_ms)?.checked_add(1)?;
     Some(Grid {
         start_ms: params.start_ms,
         step_ms,

@@ -72,14 +72,14 @@ pub struct EvalGrid {
 }
 
 impl PlanParams {
-    /// STUB (tests first): the request's end.
+    /// The last evaluation time: the grid's when set, else the request's.
     pub fn eval_end(&self) -> i64 {
-        self.end_ms
+        self.eval.map_or(self.end_ms, |g| g.end_ms)
     }
 
-    /// STUB (tests first): the request's step.
+    /// The evaluation step: the grid's when set, else the request's.
     pub fn eval_step(&self) -> i64 {
-        self.step_ms
+        self.eval.map_or(self.step_ms, |g| g.step_ms)
     }
 }
 
@@ -252,7 +252,7 @@ impl SelectorSpec {
             ),
             None => (
                 p.start_ms - width - self.fetch.total_offset_ms,
-                p.end_ms - self.fetch.total_offset_ms + upper_extra,
+                p.eval_end() - self.fetch.total_offset_ms + upper_extra,
             ),
         }
     }

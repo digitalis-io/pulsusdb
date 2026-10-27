@@ -973,17 +973,18 @@ The database holds the metric samples at full resolution and, beside them, one r
 | 7 days / 30 days | 7200 s | 84 / 360 |
 | 90 days / 6 months / 1 year | 86400 s | 90 / 182 / 365 |
 
-The query is evaluated at the multiples of the effective step `S = res × ⌈step / res⌉` in `(start, end]`: the resolution, or the step asked rounded up to a multiple of it, so never more points than asked. The times run from `(⌊start / S⌋ + 1) × S` to `⌊end / S⌋ × S`, every `S`: `⌊end / S⌋ − ⌊start / S⌋` points. The whole query is evaluated on these times, whatever its functions. A query no selector of which can read a level on these times (every function raw-only, a guard, no levels) keeps its own start, end and step, `start + k × step`, and reads raw. So does a grid of more than 11,001 points, or with `S` or a time outside the 64-bit millisecond range. An instant query keeps its time, and its selectors read the smallest level or raw.
+The query is evaluated at `start + k × S` up to `end`, with the effective step `S = res × ⌈step / res⌉`: the resolution, or the step asked rounded up to a multiple of it, so never more points than asked. The first point is `start` itself, and there are `⌊(end − start) / S⌋ + 1` points: with a step at most the resolution, one more than the table above when the range is a whole number of steps (7 days: 85); 24 h at `step=15m` gives `S` = 24 min and 61. The whole query is evaluated on these times, whatever its functions; `start()`, `end()`, `range()`, `step()`, `@ start()` and `@ end()` keep the request's values. A query no selector of which can read a level on these times (every function raw-only, a guard, no levels) keeps its own `start + k × step` and reads raw. So does a grid of more than 11,001 points, or with `S` or a time outside the 64-bit millisecond range. An instant query keeps its time, and its selectors read the smallest level or raw.
 
-When a level serves the query, the values are evenly spaced `S` apart, `[t, "v"]`, each `t` a multiple of `S` (seconds since the epoch), from the first after `start` to the last at or before `end`:
+A selector reads a level only where each time, less its `offset`, is one of the level's bucket ends, so a `start` off the level's boundary reads a finer level for the same points. For a panel whose `start` is aligned to its step:
 
-| request | resolution | `S` | points per series |
-|---|---|---|---:|
-| `rate(x[5m])`, 10 min, `step=15s` | 5 s | 15 s | 40 |
-| `rate(x[5m])`, 7 days, `step=5m` | 7200 s | 2 h | 84 |
-| `max_over_time(x[1d])`, 7 days, `step=1d` | 7200 s | 1 d | 7 |
-| `rate(x[1h])`, 24 h, `step=15m` | 720 s | 24 min | 60 |
-| `irate(x[5m])`, 7 days, `step=5m` | — | — | 2,017 (the request's grid) |
+| panel | selector | resolution | `S` | points | level read |
+|---|---|---|---|---:|---|
+| 10 min, `step=15s` | `rate(x[5m])` | 5 s | 15 s | 41 | 5 s (`start` a multiple of 15 s) |
+| 7 days, `step=5m`, `start` on a 2 h boundary | `rate(x[10h])` | 7200 s | 2 h | 85 | 7200 s |
+| 7 days, `step=5m`, `start` on a 5 min boundary only | `rate(x[10h])` | 7200 s | 2 h | 85 | 60 s: the largest width dividing a 5-minute boundary |
+| 7 days, `step=1d` | `max_over_time(x[1d])` | 7200 s | 1 d | 8 | the largest width dividing `start`, at most 7200 s |
+| 24 h, `step=15m` | `rate(x[1h])` | 720 s | 24 min | 61 | 720 s on a 12 min boundary, else 60 s |
+| 7 days, `step=5m` | `irate(x[5m])` | — | — | 2,017 | raw, on the request's grid |
 
 Each selector reads the largest level of width at most the resolution that meets all of these; if none does, it reads raw samples, with the same answer as before rollups:
 

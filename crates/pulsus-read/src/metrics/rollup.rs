@@ -210,15 +210,15 @@ pub struct Route {
 /// intervals, 11,001 points (`pulsus-server`'s `POINTS_CAP`).
 pub const MAX_GRID_POINTS: i128 = 11_001;
 
-/// Issue #18 follow-up, R1 and R2 (r11): a range query's resolution, the
-/// largest level whose switch point is at most `end − start`, and the
-/// grid of the multiples of `S = res × ⌈step / res⌉` in `(start, end]`:
+/// Issue #18 follow-up, R1 and R2 (plan r16): a range query's resolution,
+/// the largest level whose switch point is at most `end − start`, and the
+/// evaluation grid `start + k × S` up to `end`, `S = res × ⌈step / res⌉`:
 /// never more points than asked. `None` for an instant query
-/// (`step == 0`), no levels, an `S` or a time outside `i64`, or a count
-/// outside 1 to [`MAX_GRID_POINTS`]: the query keeps its own grid. The
-/// caller keeps the grid only when [`any_routes`] on it.
+/// (`step == 0`), no levels, an `S` or a time outside `i64`, or more than
+/// [`MAX_GRID_POINTS`] points: the query keeps its own grid. The caller
+/// sets the grid only when [`any_routes`] on it.
 pub fn grid(p: &MetricQueryParams, levels: &Levels) -> Option<(i64, EvalGrid)> {
-    if p.step_ms <= 0 {
+    if p.step_ms <= 0 || p.end_ms < p.start_ms {
         return None;
     }
     let span = i128::from(p.end_ms) - i128::from(p.start_ms);
@@ -232,15 +232,11 @@ pub fn grid(p: &MetricQueryParams, levels: &Levels) -> Option<(i64, EvalGrid)> {
     let step = i128::from(p.step_ms);
     let s = r * ((step + r - 1) / r);
     let s_ms = i64::try_from(s).ok()?;
-    let lo = i128::from(p.start_ms).div_euclid(s);
-    let hi = i128::from(p.end_ms).div_euclid(s);
-    let count = hi - lo;
-    if count <= 0 || count > MAX_GRID_POINTS || count > span.div_euclid(step) + 1 {
+    let intervals = span / s;
+    if intervals + 1 > MAX_GRID_POINTS {
         return None;
     }
-    // STUB (tests first): r11's last time and step.
-    let _first = i64::try_from((lo + 1) * s).ok()?;
-    let last = i64::try_from(hi * s).ok()?;
+    let last = i64::try_from(i128::from(p.start_ms) + intervals * s).ok()?;
     Some((
         res,
         EvalGrid {
@@ -287,7 +283,7 @@ fn fits(sel: &SelectorSpec, p: &PlanParams, use_: RollupUse, res: i64, buckets: 
         Some(t) => (t - sel.offset_ms).rem_euclid(res) == 0,
         None => {
             (p.start_ms - sel.fetch.total_offset_ms).rem_euclid(res) == 0
-                && (p.start_ms == p.end_ms || p.step_ms.rem_euclid(res) == 0)
+                && (p.step_ms == 0 || p.eval_step().rem_euclid(res) == 0)
         }
     };
     let range = match (sel.range_ms, use_) {
@@ -670,15 +666,17 @@ pub fn level_window_exists(sel: &SelectorSpec, p: &PlanParams, pieces: &Interval
     if let Some(t) = sel.at_ms {
         return clear(t);
     }
-    if p.step_ms <= 0 || p.start_ms == p.end_ms {
+    // Issue #18 follow-up: the evaluation grid's times.
+    let (end, step) = (p.eval_end(), p.eval_step());
+    if step <= 0 || p.start_ms == end {
         return clear(p.start_ms);
     }
     let mut t = p.start_ms;
-    while t <= p.end_ms {
+    while t <= end {
         if clear(t) {
             return true;
         }
-        t += p.step_ms;
+        t += step;
     }
     false
 }

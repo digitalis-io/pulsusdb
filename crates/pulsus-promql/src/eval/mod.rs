@@ -346,10 +346,12 @@ fn evaluate_counted_with(
         &plan.root,
         &plan.selectors,
         data,
+        // Issue #18 follow-up: the evaluation grid, which a rollup level
+        // may space wider than the request's step.
         StepGrid::Dense(Horizon {
             start_ms: p.start_ms,
-            end_ms: p.end_ms,
-            step_ms: p.step_ms,
+            end_ms: p.eval_end(),
+            step_ms: p.eval_step(),
         }),
         p.lookback_ms,
         &mut caches,
@@ -434,8 +436,11 @@ fn evaluate_counted_with(
     let mut saw_vector = false;
     let mut saw_scalar = false;
 
+    // Issue #18 follow-up: the evaluation times, `start + k × eval_step()`
+    // up to `eval_end()`; the request's own when no grid is set.
+    let (grid_end, grid_step) = (p.eval_end(), p.eval_step());
     let mut t = p.start_ms;
-    while t <= p.end_ms {
+    while t <= grid_end {
         // Issue #93: one `Relaxed` load per step — O(1), no allocation, no
         // per-sample work inside `eval_step`.
         if caches.cancel.is_cancelled() {
@@ -482,7 +487,7 @@ fn evaluate_counted_with(
                 });
             }
         }
-        t += p.step_ms;
+        t += grid_step;
     }
 
     // Issue #130 Δ2: after the step loop, before EITHER range return's
@@ -9749,11 +9754,13 @@ mod tests {
             .step_by(15)
             .map(|t| s(t * 1_000, t as f64))
             .collect();
+        // `start()`, `end()`, `range()` and `step()` are experimental.
         let p = PlanParams {
             eval: Some(crate::plan::EvalGrid {
                 end_ms: 89_280_000,
                 step_ms: 1_440_000,
             }),
+            experimental_functions: true,
             ..params(0, 90_000_000, 900_000)
         };
         let times: Vec<i64> = (0..63).map(|k| k * 1_440_000).collect();

@@ -704,29 +704,24 @@ impl MetricsEngine {
             .and_then(|slot| slot.get())
             .filter(|l| !l.levels.is_empty());
         let mut routing: Option<(std::sync::Arc<super::rollup::Levels>, i64)> = None;
-        let mut changed: Option<(
-            MetricQueryParams,
-            pulsus_promql::PlanParams,
-            pulsus_promql::QueryPlan,
-        )> = None;
+        let mut changed: Option<(pulsus_promql::PlanParams, pulsus_promql::QueryPlan)> = None;
         if let Some(levels) = levels {
             if p.step_ms == 0 {
                 let smallest = levels.levels[0].res_ms;
                 routing = Some((levels, smallest));
-            } else if let Some((res, g)) = super::rollup::grid(p, &levels) {
-                // STUB (tests first): r11's grid, multiples of `S` after
-                // `start`.
-                let grid = MetricQueryParams {
-                    start_ms: (p.start_ms.div_euclid(g.step_ms) + 1) * g.step_ms,
-                    end_ms: g.end_ms,
-                    step_ms: g.step_ms,
+            } else if let Some((res, grid)) = super::rollup::grid(p, &levels) {
+                // Only the evaluation times move: the request's start, end
+                // and step stay what `start()`, `end()`, `range()`,
+                // `step()` and `@ start()`/`@ end()` read (plan r16).
+                let pp = pulsus_promql::PlanParams {
+                    eval: Some(grid),
+                    ..p.plan_params(self.config.experimental_functions, self.lookback_ms)
                 };
-                let pp = grid.plan_params(self.config.experimental_functions, self.lookback_ms);
                 if let Ok(candidate) = pulsus_promql::plan(expr, pp)
                     && super::rollup::any_routes(&candidate, &pp, &levels, res)
                 {
                     if let Some(e) = explain.as_mut() {
-                        let points = (grid.end_ms - grid.start_ms) / grid.step_ms + 1;
+                        let points = (grid.end_ms - p.start_ms) / grid.step_ms + 1;
                         e.push(
                             "rollup_grid",
                             String::new(),
@@ -735,24 +730,26 @@ impl MetricsEngine {
                                 super::rollup::duration_text(res),
                                 super::rollup::duration_text(grid.step_ms),
                                 super::rollup::duration_text(p.step_ms),
-                                grid.start_ms.div_euclid(1000),
+                                p.start_ms.div_euclid(1000),
                                 grid.end_ms.div_euclid(1000),
                             )),
                         );
                     }
-                    changed = Some((grid, pp, candidate));
-                    routing = Some((levels, res));
+                    changed = Some((pp, candidate));
                 }
+                // When nothing routes on the grid, nothing routes on the
+                // request's either: both start at `start` and `S` is a
+                // multiple of every width that divides the step.
+                routing = Some((levels, res));
             }
         }
-        let (snapped, plan_params, plan) = match changed {
+        let (plan_params, plan) = match changed {
             Some(x) => x,
             None => {
                 let pp = p.plan_params(self.config.experimental_functions, self.lookback_ms);
-                (*p, pp, pulsus_promql::plan(expr, pp)?)
+                (pp, pulsus_promql::plan(expr, pp)?)
             }
         };
-        let p = &snapped;
 
         // Issue #33 architect adjudication (superseding #31's ratified
         // zero-ClickHouse `count`/`group` AC and #40's instant-only gate on
@@ -2147,7 +2144,7 @@ impl MetricsEngine {
                     "{}, use {:?}, step {}, range {range}",
                     route.table,
                     route.use_,
-                    super::rollup::duration_text(p.step_ms)
+                    super::rollup::duration_text(p.eval_step())
                 )),
             );
             if let Some(first) = hist_sqls.first() {
