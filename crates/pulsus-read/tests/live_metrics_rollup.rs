@@ -1187,7 +1187,9 @@ async fn a_window_touching_raw_is_raw() {
                 "(i) {query}: a level served the steps before W"
             );
 
-            let (a, b) = both(&built, &query, &range(w, w + HOUR, MIN), None).await;
+            // From `W + 1 m`: the grid starts at `start`, and the window
+            // at `W` itself lies wholly in the level's coverage.
+            let (a, b) = both(&built, &query, &range(w + MIN, w + HOUR + MIN, MIN), None).await;
             assert!(!b.cells().is_empty());
             assert_eq!(a.cells(), b.cells(), "(ii) {query}: bit-equal everywhere");
             assert!(!a.explain.rollup, "(ii) {query}: raw-exact");
@@ -2332,7 +2334,9 @@ async fn a_grid_from_start_routes_where_the_times_fit() {
 /// `count(g) + scalar(max_over_time(g{s="160"}[1h] @ end()))` over 7 days
 /// less 1 ms at step 5 m: the resolution is 720 s and `S` 720 s; the
 /// `@ end()` selector routes, `count(g)` cannot (`start` is 1 ms off every
-/// boundary) and is pushed. 840 points per series at `start + k × 720 s`,
+/// boundary) and is pushed. `end` is the corpus's end, so the first
+/// point's lookback holds samples. 840 points per series at
+/// `start + k × 720 s`,
 /// explain holding the routed selector's `rollup_route` and the pushed
 /// aggregate's statement, every value bit-equal to the engine without
 /// levels asked at step 720 s from the same `start`.
@@ -2341,7 +2345,7 @@ async fn a_pushed_aggregate_beside_a_routed_selector() {
     skip_unless_live!();
     let day0 = today() - 8 * DAY;
     let built = corpus_d(DB_T14.name(), DEFAULTS, day0, 0..8).await;
-    let end = day0 + 7 * DAY;
+    let end = day0 + 8 * DAY;
     let start = end - 7 * DAY + 1;
     let query = r#"count(g) + scalar(max_over_time(g{s="160"}[1h] @ end()))"#;
     let mut e = MetricsEngine::new(
@@ -2369,11 +2373,17 @@ async fn a_pushed_aggregate_beside_a_routed_selector() {
         "the @ end() selector routes: {:?}",
         a.stages("rollup_route")
     );
+    // The pushed aggregate's statement, on the grid of 720 s.
     let pushed: Vec<&pulsus_read::logql::ExplainStage> = a
         .explain
         .stages
         .iter()
-        .filter(|s| s.name == "pushed_aggregate" && !s.sql.is_empty())
+        .filter(|s| {
+            s.name == "grouped_fetch"
+                && s.sql.contains(&format!(
+                    "{start} AS grid_start, 720000 AS grid_step, 840 AS grid_n"
+                ))
+        })
         .collect();
     assert!(
         !pushed.is_empty(),
