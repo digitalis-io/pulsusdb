@@ -1225,6 +1225,7 @@ mod tests {
 
     fn params(start_ms: i64, end_ms: i64, step_ms: i64) -> PlanParams {
         PlanParams {
+            widen_to: None,
             eval: None,
             start_ms,
             end_ms,

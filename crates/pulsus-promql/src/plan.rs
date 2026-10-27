@@ -60,6 +60,10 @@ pub struct PlanParams {
     /// request's, which `start()`, `end()`, `range()`, `step()` and
     /// `@ start()`/`@ end()` read.
     pub eval: Option<EvalGrid>,
+    /// Issue #18 follow-up (plan r17): `Some(S)` on a stretched grid
+    /// (`S` above the step): every range below `S`, of a matrix selector
+    /// or a subquery at the outer grid and without `@`, is read as `S`.
+    pub widen_to: Option<i64>,
 }
 
 /// Issue #18 follow-up (plan r16, R2): the times a range query is
@@ -69,6 +73,13 @@ pub struct PlanParams {
 pub struct EvalGrid {
     pub end_ms: i64,
     pub step_ms: i64,
+}
+
+impl QueryPlan {
+    /// STUB (tests first).
+    pub fn widened_ranges(&self) -> Vec<(i64, i64)> {
+        Vec::new()
+    }
 }
 
 impl PlanParams {
@@ -181,6 +192,9 @@ pub struct SelectorSpec {
     pub rollup_use: Option<RollupUse>,
     /// Issue #18 part B: the selector sits inside a subquery. Fetch only.
     pub in_subquery: bool,
+    /// Issue #18 follow-up (plan r17): the range as written, before any
+    /// widening; `None` for an instant selector. For explain.
+    pub written_range_ms: Option<i64>,
 }
 
 /// Issue #18 part B: the one column of a rollup level a selector's
@@ -282,6 +296,9 @@ pub enum RangeSource {
 pub struct SubqueryPlan {
     pub inner: Box<PlanExpr>,
     pub range_ms: i64,
+    /// Issue #18 follow-up (plan r17): the range as written, before any
+    /// widening. For explain.
+    pub written_range_ms: i64,
     pub step_ms: i64,
     pub offset_ms: i64,
     pub at_ms: Option<i64>,
@@ -1097,6 +1114,7 @@ impl Planner {
             // ([`assign_rollup_use`]) once the whole tree exists.
             rollup_use: None,
             in_subquery: self.subquery_depth > 0,
+            written_range_ms: range_ms,
         });
         id
     }
@@ -2081,6 +2099,7 @@ fn plan_subquery(planner: &mut Planner, sq: &SubqueryExpr) -> Result<SubqueryPla
     Ok(SubqueryPlan {
         inner: Box::new(inner?),
         range_ms,
+        written_range_ms: range_ms,
         step_ms,
         offset_ms: offset,
         at_ms,
@@ -3542,6 +3561,7 @@ mod tests {
 
     fn params() -> PlanParams {
         PlanParams {
+            widen_to: None,
             eval: None,
             start_ms: 1_000_000,
             end_ms: 1_000_000,
@@ -4035,6 +4055,7 @@ mod tests {
     #[test]
     fn at_start_and_at_end_resolve_against_the_plan_params() {
         let p_range = PlanParams {
+            widen_to: None,
             eval: None,
             start_ms: 5_000,
             end_ms: 65_000,
@@ -4075,6 +4096,7 @@ mod tests {
     fn an_at_fixed_selector_fetch_window_is_invariant_across_eval_spans() {
         let expr = parse("m @ 100").unwrap();
         let span_a = PlanParams {
+            widen_to: None,
             eval: None,
             start_ms: 0,
             end_ms: 60_000,
@@ -4083,6 +4105,7 @@ mod tests {
             experimental_functions: false,
         };
         let span_b = PlanParams {
+            widen_to: None,
             eval: None,
             start_ms: 9_000_000,
             end_ms: 90_000_000,
@@ -4309,6 +4332,7 @@ mod tests {
         for p in [
             params(),
             PlanParams {
+                widen_to: None,
                 eval: None,
                 start_ms: 0,
                 end_ms: 86_400_000,
@@ -4896,6 +4920,7 @@ mod tests {
         // Range query 100s..130s step 10s: start 100, end 130, range 30,
         // step 10 (all in seconds, the oracle's engine.go:4436-4481).
         let p = PlanParams {
+            widen_to: None,
             eval: None,
             start_ms: 100_000,
             end_ms: 130_000,
@@ -4925,6 +4950,7 @@ mod tests {
         // Instant at 100s (upstream preprocesses with (ts, ts, 0),
         // engine.go:558): start 100, end 100, range 0, step 0.
         let p = PlanParams {
+            widen_to: None,
             eval: None,
             start_ms: 100_000,
             end_ms: 100_000,
@@ -4950,6 +4976,7 @@ mod tests {
         // "step_ms == 0" — the promqltest runner's instant convention
         // ((at, at, 0)) masks the difference, so this pins it directly.
         let p = PlanParams {
+            widen_to: None,
             eval: None,
             start_ms: 100_000,
             end_ms: 100_000,
@@ -5171,6 +5198,7 @@ mod tests {
     /// non-zero values here.
     fn range_params() -> PlanParams {
         PlanParams {
+            widen_to: None,
             eval: None,
             start_ms: 1_000_000,
             end_ms: 1_060_000,
@@ -5595,6 +5623,7 @@ mod tests {
     #[test]
     fn fetch_window_subtracts_range_lookback_and_offset() {
         let sel = SelectorSpec {
+            written_range_ms: None,
             id: 0,
             metric_name: Some("up".to_string()),
             name_matchers: Vec::new(),
@@ -5618,6 +5647,7 @@ mod tests {
             in_subquery: false,
         };
         let p = PlanParams {
+            widen_to: None,
             eval: None,
             start_ms: 10_000_000,
             end_ms: 10_000_000,
@@ -6999,5 +7029,110 @@ mod tests {
                 (Some(RollupUse::Last), false)
             ]
         );
+    }
+
+    fn stretched(widen_to: i64) -> PlanParams {
+        PlanParams {
+            start_ms: 0,
+            end_ms: 90_000_000,
+            step_ms: 900_000,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
+            experimental_functions: true,
+            eval: Some(EvalGrid {
+                end_ms: 89_280_000,
+                step_ms: widen_to,
+            }),
+            widen_to: Some(widen_to),
+        }
+    }
+
+    /// The outermost subquery of `expr`, through function calls.
+    fn first_subquery(expr: &PlanExpr) -> Option<SubqueryPlan> {
+        if let PlanExpr::RangeFn {
+            source: RangeSource::Subquery(sq),
+            ..
+        }
+        | PlanExpr::OverTime {
+            source: RangeSource::Subquery(sq),
+            ..
+        } = expr
+        {
+            return Some((**sq).clone());
+        }
+        let mut found = None;
+        for_each_child(expr, &mut |c| {
+            if found.is_none() {
+                found = first_subquery(c);
+            }
+        });
+        found
+    }
+
+    /// **W5 (issue #18 follow-up, plan r17): the written ranges are kept
+    /// for explain**, of selectors and of subqueries, and only the ranges
+    /// that widen are listed.
+    #[test]
+    fn the_written_ranges_are_kept() {
+        let s = 1_440_000;
+        let cases: [(&str, &[(i64, i64)]); 7] = [
+            ("rate(x[5m])", &[(300_000, s)]),
+            ("rate(x[30m])", &[]),
+            ("count_over_time(x[1m] @ end())", &[]),
+            ("count_over_time(x[10m:1m])", &[(600_000, s)]),
+            ("count_over_time(x[10m:1m] @ end())", &[]),
+            (
+                "max_over_time(count_over_time(x[10m:1m])[5m:1m])",
+                &[(300_000, s)],
+            ),
+            ("min_over_time(x[10m:1m] offset 1h)", &[(600_000, s)]),
+        ];
+        for (q, want) in cases {
+            let planned = plan(&parser::parse(q).unwrap(), stretched(s)).unwrap();
+            assert_eq!(planned.widened_ranges(), want.to_vec(), "{q}");
+        }
+        let planned = plan(
+            &parser::parse("min_over_time(x[10m:1m] offset 1h)").unwrap(),
+            stretched(s),
+        )
+        .unwrap();
+        let sq = first_subquery(&planned.root).expect("a subquery");
+        assert_eq!(
+            (sq.written_range_ms, sq.range_ms, sq.offset_ms),
+            (600_000, s, 3_600_000),
+            "the subquery keeps its written range and its offset"
+        );
+        let planned = plan(&parser::parse("rate(x[5m])").unwrap(), stretched(s)).unwrap();
+        let sel = &planned.selectors[0];
+        assert_eq!(
+            (sel.written_range_ms, sel.range_ms),
+            (Some(300_000), Some(s)),
+            "the selector keeps its written range"
+        );
+    }
+
+    /// **W6 (issue #18 follow-up, plan r17): a widening that overflows is
+    /// refused**, so the caller keeps the request's grid: an `S` that fits
+    /// `i64` but not with the lookback added, for a selector and for a
+    /// subquery's window.
+    #[test]
+    fn a_widening_that_overflows_is_refused() {
+        let huge = i64::MAX - 807;
+        for q in ["rate(x[5m])", "count_over_time(x[10m:1m])"] {
+            let mut p = stretched(huge);
+            p.end_ms = 1;
+            p.eval = Some(EvalGrid {
+                end_ms: 0,
+                step_ms: huge,
+            });
+            assert!(
+                plan(&parser::parse(q).unwrap(), p).is_err(),
+                "{q}: the widened range overflows"
+            );
+            p.widen_to = None;
+            assert!(
+                plan(&parser::parse(q).unwrap(), p).is_ok(),
+                "{q}: without widening it plans"
+            );
+        }
     }
 }

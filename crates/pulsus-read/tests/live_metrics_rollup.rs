@@ -54,6 +54,8 @@ static DB_T4: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_
 static DB_T9: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t9");
 static DB_T10: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t10");
 static DB_T14: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t14");
+static DB_W1: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_w1");
+static DB_W2: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_w2");
 
 /// The default levels and their switch points (the owner's table,
 /// 2026-10-26).
@@ -675,6 +677,7 @@ fn snapped(built: &Built, query: &str, p: &MetricQueryParams) -> MetricQueryPara
     // they are `start + k × S` up to the grid's end.
     let pp = pulsus_promql::PlanParams {
         eval: Some(g),
+        widen_to: (g.step_ms > p.step_ms).then_some(g.step_ms),
         ..p.plan_params(false, pulsus_promql::DEFAULT_LOOKBACK_MS)
     };
     let plan = pulsus_promql::plan(&parse(query).expect("parse"), pp).expect("plan");
@@ -2213,6 +2216,8 @@ async fn a_raw_only_query_keeps_its_grid() {
             "{query}: no grid change"
         );
         assert!(a.stages("rollup_route").is_empty(), "{query}: no route");
+        // W3 (plan r17): nothing widens on the request's grid.
+        assert!(widened(&a).is_empty(), "{query}: {:?}", widened(&a));
         let series = per_series(&a);
         assert_eq!(series.len(), 100, "{query}: the series");
         for (l, ts) in &series {
@@ -2381,5 +2386,103 @@ async fn a_pushed_aggregate_beside_a_routed_selector() {
         "the engine without levels routes nothing"
     );
     assert_eq!(a.cells(), b.cells(), "bit-equal to no levels");
+    built.finish().await;
+}
+
+/// Whether any explain note of `x` says a range widened.
+fn widened(x: &Answer) -> Vec<String> {
+    x.explain
+        .stages
+        .iter()
+        .filter_map(|s| s.note.clone())
+        .filter(|n| n.contains("widened"))
+        .collect()
+}
+
+/// **W1 (issue #18 follow-up, plan r17): a short range is widened to the
+/// step.** Corpus D at every level; 7 days on 2 h boundaries at step 5 m,
+/// so `S` is 2 h. `rate(c_normal[5m])` is read as `rate(c_normal[2h])`:
+/// 85 points at `start + k × 2 h`, explain `range 5m widened to 2h`, the
+/// 720 s level, bit-equal to `rate(c_normal[2h])` at step 2 h and within
+/// the 720 s bound of the engine without levels. `max_over_time(g[7s])`
+/// fits no level until widened: read as `max_over_time(g[2h])` from the
+/// 7200 s level, bit-equal to the engine without levels.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_range_is_widened_to_the_step() {
+    skip_unless_live!();
+    let day0 = today() - 8 * DAY;
+    let built = corpus_d(DB_W1.name(), DEFAULTS, day0, 0..8).await;
+    let end = day0 + 8 * DAY - 2 * HOUR;
+    let start = end - 7 * DAY;
+    let asked = range(start, end, 5 * MIN);
+    let two_hours = range(start, end, 2 * HOUR);
+    let times: Vec<i64> = (0..85).map(|k| start + k * 2 * HOUR).collect();
+    let routed = built.engine(true, None).await;
+    let raw = built.engine(false, None).await;
+    for (query, written, wide, table) in [
+        (
+            "rate(c_normal[5m])",
+            "5m",
+            "rate(c_normal[2h])",
+            "metric_samples_720s",
+        ),
+        (
+            "max_over_time(g[7s])",
+            "7s",
+            "max_over_time(g[2h])",
+            "metric_samples_7200s",
+        ),
+    ] {
+        let a = ask(&routed, &no_tenant(), query, &asked).await;
+        let series = per_series(&a);
+        assert!(!series.is_empty(), "{query}: an answer");
+        for (l, ts) in series {
+            assert_eq!(ts, times, "{query} {l}: start + k × 2 h");
+        }
+        let grid = a.stages("rollup_grid");
+        assert!(
+            grid.len() == 1 && grid[0].contains(&format!("; range {written} widened to 2h")),
+            "{query}: {grid:?}"
+        );
+        assert!(
+            a.stages("rollup_route")
+                .iter()
+                .any(|n| n.starts_with(&format!("{table},")) && n.contains("range 2h")),
+            "{query}: {:?}",
+            a.stages("rollup_route")
+        );
+        let same = ask(&routed, &no_tenant(), wide, &two_hours).await;
+        assert_eq!(a.cells(), same.cells(), "{query}: {wide} at step 2 h");
+        let b = ask(&raw, &no_tenant(), wide, &two_hours).await;
+        if query.starts_with("rate") {
+            let d = distances(&a.points(), &b.points());
+            let (p99, max) = p99_max(&d);
+            let limit = bound("rate", "normal", 720).expect("a counter bound");
+            println!("W1 {query}: n {} p99 {p99:e} max {max:e}", d.len());
+            assert!(p99 <= limit, "{query}: p99 {p99:e} above {limit:e}");
+        } else {
+            assert_eq!(a.cells(), b.cells(), "{query}: bit-equal to no levels");
+        }
+    }
+    built.finish().await;
+}
+
+/// **W2 (issue #18 follow-up, plan r17): no widening when the step is
+/// kept.** Corpus D at every level; `max_over_time(g[1m])` over 7 days on
+/// 2 h boundaries at step 2 h: `S` is the step, nothing widens, and every
+/// value is bit-equal to the engine without levels on the same grid.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_widening_when_the_step_is_kept() {
+    skip_unless_live!();
+    let day0 = today() - 8 * DAY;
+    let built = corpus_d(DB_W2.name(), DEFAULTS, day0, 0..8).await;
+    let end = day0 + 8 * DAY - 2 * HOUR;
+    let p = range(end - 7 * DAY, end, 2 * HOUR);
+    let query = "max_over_time(g[1m])";
+    let (a, b) = both(&built, query, &p, None).await;
+    assert!(widened(&a).is_empty(), "{query}: {:?}", widened(&a));
+    assert!(!a.stages("rollup_route").is_empty(), "{query}: routed");
+    assert!(!b.cells().is_empty(), "{query}: an answer");
+    assert_eq!(a.cells(), b.cells(), "{query}: bit-equal to no levels");
     built.finish().await;
 }

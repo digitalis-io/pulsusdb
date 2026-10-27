@@ -994,6 +994,7 @@ mod tests {
 
     fn params(start: i64, step: i64, experimental: bool) -> PlanParams {
         PlanParams {
+            widen_to: None,
             eval: None,
             start_ms: start,
             end_ms: start + 86_400_000,
@@ -1127,6 +1128,7 @@ mod tests {
         }
         // An instant query needs only the start.
         let instant = PlanParams {
+            widen_to: None,
             eval: None,
             start_ms: BASE + 12 * MIN,
             end_ms: BASE + 12 * MIN,

@@ -277,6 +277,7 @@ impl MetricQueryParams {
     /// hermetically).
     pub fn plan_params(&self, experimental_functions: bool, lookback_ms: i64) -> PlanParams {
         PlanParams {
+            widen_to: None,
             eval: None,
             start_ms: self.start_ms,
             end_ms: self.end_ms,
@@ -713,13 +714,8 @@ impl MetricsEngine {
                 // Only the evaluation times move: the request's start, end
                 // and step stay what `start()`, `end()`, `range()`,
                 // `step()` and `@ start()`/`@ end()` read (plan r16).
-                let pp = pulsus_promql::PlanParams {
-                    eval: Some(grid),
-                    ..p.plan_params(self.config.experimental_functions, self.lookback_ms)
-                };
-                if let Ok(candidate) = pulsus_promql::plan(expr, pp)
-                    && super::rollup::any_routes(&candidate, &pp, &levels, res)
-                {
+                let request = p.plan_params(self.config.experimental_functions, self.lookback_ms);
+                if let Some((pp, candidate)) = changed_grid(expr, request, grid, &levels, res) {
                     if let Some(e) = explain.as_mut() {
                         let points = (grid.end_ms - p.start_ms) / grid.step_ms + 1;
                         e.push(
@@ -3698,6 +3694,25 @@ enum SelectorFetchPlan {
     Rollup(Box<RollupFetch>),
 }
 
+/// Issue #18 follow-up (plans r16, r17): the request's plan parameters
+/// with the evaluation grid set, and the query planned on them, when a
+/// selector routes there. `None` keeps the request's grid: nothing
+/// routes, or the plan fails on the grid.
+fn changed_grid(
+    expr: &Expr,
+    request: pulsus_promql::PlanParams,
+    grid: pulsus_promql::EvalGrid,
+    levels: &super::rollup::Levels,
+    res: i64,
+) -> Option<(pulsus_promql::PlanParams, pulsus_promql::QueryPlan)> {
+    let pp = pulsus_promql::PlanParams {
+        eval: Some(grid),
+        ..request
+    };
+    let candidate = pulsus_promql::plan(expr, pp).ok()?;
+    super::rollup::any_routes(&candidate, &pp, levels, res).then_some((pp, candidate))
+}
+
 /// Issue #18 follow-up, R4: where routing is decided. A selector that is
 /// eligible and fits a level of width at most `res` routes, however the
 /// label cache resolved its series: from the cache's list, or by the
@@ -5348,6 +5363,7 @@ mod tests {
         const STEPS: i64 = 200;
         const STEP_MS: i64 = 15_000;
         let params = PlanParams {
+            widen_to: None,
             eval: None,
             start_ms: 0,
             end_ms: (STEPS - 1) * STEP_MS,
@@ -6818,6 +6834,7 @@ mod routed_series_tests {
         // A UTC midnight, on every level's grid.
         let start = 1_788_825_600_000;
         let p = pulsus_promql::PlanParams {
+            widen_to: None,
             eval: None,
             start_ms: start,
             end_ms: start + 86_400_000,
@@ -6849,6 +6866,42 @@ mod routed_series_tests {
                 RollupSeries::Known(Vec::new())
             )),
             "the control: the label cache's selector is routed"
+        );
+    }
+}
+
+/// **W6, caller half (issue #18 follow-up, plan r17): a widening that
+/// overflows keeps the request's grid.** A 1 ms query at a step near
+/// `i64::MAX`: the grid's `S` fits `i64`, the widened range plus the
+/// lookback does not, so no grid is set.
+#[cfg(test)]
+mod changed_grid_tests {
+    use super::*;
+    use crate::metrics::rollup::{Level, Levels};
+
+    #[test]
+    fn a_widening_that_overflows_keeps_the_request_grid() {
+        let levels = Levels {
+            levels: vec![Level {
+                res_ms: 5_000,
+                table: "metric_samples_5s".to_string(),
+                from_ms: 0,
+            }],
+            shards: 1,
+            counter_buckets: 5,
+        };
+        let request = MetricQueryParams {
+            start_ms: 0,
+            end_ms: 1,
+            step_ms: i64::MAX - 5_000,
+        };
+        let (res, grid) = super::super::rollup::grid(&request, &levels).expect("S fits i64");
+        assert!(grid.step_ms > request.step_ms, "a stretched step");
+        let expr = pulsus_promql::parse("rate(m[5m])").unwrap();
+        let pp = request.plan_params(false, pulsus_promql::DEFAULT_LOOKBACK_MS);
+        assert!(
+            changed_grid(&expr, pp, grid, &levels, res).is_none(),
+            "the request's grid is kept"
         );
     }
 }

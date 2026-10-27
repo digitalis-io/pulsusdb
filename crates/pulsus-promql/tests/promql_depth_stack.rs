@@ -157,6 +157,7 @@ fn gl(depth: usize) -> String {
 
 fn instant_params() -> PlanParams {
     PlanParams {
+        widen_to: None,
         eval: None,
         start_ms: 1_700_000_000_000,
         end_ms: 1_700_000_000_000,
