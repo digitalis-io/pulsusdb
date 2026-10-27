@@ -54,6 +54,33 @@ pub struct PlanParams {
     /// [`PromqlError::Unsupported`]; when `true`, implemented
     /// experimental functions plan normally.
     pub experimental_functions: bool,
+    /// Issue #18 follow-up: the evaluation grid when it differs from the
+    /// request's, `start + k × step` up to `end`; `None` evaluates at the
+    /// request's own times. `start_ms`, `end_ms` and `step_ms` stay the
+    /// request's, which `start()`, `end()`, `range()`, `step()` and
+    /// `@ start()`/`@ end()` read.
+    pub eval: Option<EvalGrid>,
+}
+
+/// Issue #18 follow-up (plan r16, R2): the times a range query is
+/// evaluated at when a rollup level serves it, `start + k × step_ms` for
+/// `k ≥ 0` up to `end_ms`, the request's `start` being the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvalGrid {
+    pub end_ms: i64,
+    pub step_ms: i64,
+}
+
+impl PlanParams {
+    /// STUB (tests first): the request's end.
+    pub fn eval_end(&self) -> i64 {
+        self.end_ms
+    }
+
+    /// STUB (tests first): the request's step.
+    pub fn eval_step(&self) -> i64 {
+        self.step_ms
+    }
 }
 
 /// The PromQL default staleness lookback (5 minutes), milliseconds.
@@ -3515,6 +3542,7 @@ mod tests {
 
     fn params() -> PlanParams {
         PlanParams {
+            eval: None,
             start_ms: 1_000_000,
             end_ms: 1_000_000,
             step_ms: 0,
@@ -4007,6 +4035,7 @@ mod tests {
     #[test]
     fn at_start_and_at_end_resolve_against_the_plan_params() {
         let p_range = PlanParams {
+            eval: None,
             start_ms: 5_000,
             end_ms: 65_000,
             step_ms: 10_000,
@@ -4046,6 +4075,7 @@ mod tests {
     fn an_at_fixed_selector_fetch_window_is_invariant_across_eval_spans() {
         let expr = parse("m @ 100").unwrap();
         let span_a = PlanParams {
+            eval: None,
             start_ms: 0,
             end_ms: 60_000,
             step_ms: 10_000,
@@ -4053,6 +4083,7 @@ mod tests {
             experimental_functions: false,
         };
         let span_b = PlanParams {
+            eval: None,
             start_ms: 9_000_000,
             end_ms: 90_000_000,
             step_ms: 60_000,
@@ -4278,6 +4309,7 @@ mod tests {
         for p in [
             params(),
             PlanParams {
+                eval: None,
                 start_ms: 0,
                 end_ms: 86_400_000,
                 step_ms: 60_000,
@@ -4864,6 +4896,7 @@ mod tests {
         // Range query 100s..130s step 10s: start 100, end 130, range 30,
         // step 10 (all in seconds, the oracle's engine.go:4436-4481).
         let p = PlanParams {
+            eval: None,
             start_ms: 100_000,
             end_ms: 130_000,
             step_ms: 10_000,
@@ -4892,6 +4925,7 @@ mod tests {
         // Instant at 100s (upstream preprocesses with (ts, ts, 0),
         // engine.go:558): start 100, end 100, range 0, step 0.
         let p = PlanParams {
+            eval: None,
             start_ms: 100_000,
             end_ms: 100_000,
             step_ms: 0,
@@ -4916,6 +4950,7 @@ mod tests {
         // "step_ms == 0" — the promqltest runner's instant convention
         // ((at, at, 0)) masks the difference, so this pins it directly.
         let p = PlanParams {
+            eval: None,
             start_ms: 100_000,
             end_ms: 100_000,
             step_ms: 10_000,
@@ -5136,6 +5171,7 @@ mod tests {
     /// non-zero values here.
     fn range_params() -> PlanParams {
         PlanParams {
+            eval: None,
             start_ms: 1_000_000,
             end_ms: 1_060_000,
             step_ms: 10_000,
@@ -5582,6 +5618,7 @@ mod tests {
             in_subquery: false,
         };
         let p = PlanParams {
+            eval: None,
             start_ms: 10_000_000,
             end_ms: 10_000_000,
             step_ms: 0,

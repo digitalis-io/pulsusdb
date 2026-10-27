@@ -328,10 +328,15 @@ async fn a_run_row_is_read_with_its_data() {
         .await
         .expect("routed");
     // The engine without levels is asked on the grid the routed answer
-    // came on: the multiples of the effective step in `(start, end]`
-    // (issue #18 follow-up, R2), so neither carries a time the other lacks.
-    let (res, grid) =
+    // came on, `start + k × S` (issue #18 follow-up, plan r16), so neither
+    // carries a time the other lacks.
+    let (res, g) =
         pulsus_read::metrics::rollup::grid(&p, &slot.get().expect("levels")).expect("a grid");
+    let grid = MetricQueryParams {
+        start_ms: p.start_ms,
+        end_ms: g.end_ms,
+        step_ms: g.step_ms,
+    };
     assert_eq!(res, MIN, "the 60 s level is the resolution");
     assert!(
         explain.stages.iter().any(|s| s.name == "rollup_grid"),
@@ -352,9 +357,7 @@ async fn a_run_row_is_read_with_its_data() {
         Some(
             format!(
                 "metric_samples_60s_dist.max served ({}, {hi}]",
-                // The grid's first time is the first minute after the
-                // start (issue #18 follow-up).
-                mid - 29 * MIN - 6 * MIN
+                mid - 30 * MIN - 6 * MIN
             )
             .as_str()
         ),

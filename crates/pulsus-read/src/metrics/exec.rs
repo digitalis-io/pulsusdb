@@ -277,6 +277,7 @@ impl MetricQueryParams {
     /// hermetically).
     pub fn plan_params(&self, experimental_functions: bool, lookback_ms: i64) -> PlanParams {
         PlanParams {
+            eval: None,
             start_ms: self.start_ms,
             end_ms: self.end_ms,
             step_ms: self.step_ms,
@@ -712,7 +713,14 @@ impl MetricsEngine {
             if p.step_ms == 0 {
                 let smallest = levels.levels[0].res_ms;
                 routing = Some((levels, smallest));
-            } else if let Some((res, grid)) = super::rollup::grid(p, &levels) {
+            } else if let Some((res, g)) = super::rollup::grid(p, &levels) {
+                // STUB (tests first): r11's grid, multiples of `S` after
+                // `start`.
+                let grid = MetricQueryParams {
+                    start_ms: (p.start_ms.div_euclid(g.step_ms) + 1) * g.step_ms,
+                    end_ms: g.end_ms,
+                    step_ms: g.step_ms,
+                };
                 let pp = grid.plan_params(self.config.experimental_functions, self.lookback_ms);
                 if let Ok(candidate) = pulsus_promql::plan(expr, pp)
                     && super::rollup::any_routes(&candidate, &pp, &levels, res)
@@ -5343,6 +5351,7 @@ mod tests {
         const STEPS: i64 = 200;
         const STEP_MS: i64 = 15_000;
         let params = PlanParams {
+            eval: None,
             start_ms: 0,
             end_ms: (STEPS - 1) * STEP_MS,
             step_ms: STEP_MS,
@@ -6812,6 +6821,7 @@ mod routed_series_tests {
         // A UTC midnight, on every level's grid.
         let start = 1_788_825_600_000;
         let p = pulsus_promql::PlanParams {
+            eval: None,
             start_ms: start,
             end_ms: start + 86_400_000,
             step_ms: 720_000,

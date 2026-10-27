@@ -94,6 +94,7 @@ const STEP_MS: i64 = 15_000;
 /// 3-label set, over `STEPS` steps.
 fn fixture() -> (QueryPlan, SeriesData) {
     let params = PlanParams {
+        eval: None,
         start_ms: 0,
         end_ms: (STEPS - 1) * STEP_MS,
         step_ms: STEP_MS,

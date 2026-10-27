@@ -2186,6 +2186,7 @@ fn expected_metric_samples_fetch_usage() -> Vec<String> {
 
 fn promql_params(start_ms: i64, end_ms: i64, step_ms: i64) -> pulsus_promql::PlanParams {
     pulsus_promql::PlanParams {
+        eval: None,
         start_ms,
         end_ms,
         step_ms,

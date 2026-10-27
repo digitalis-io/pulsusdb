@@ -480,7 +480,7 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
         if let Some((200, body)) = http_get(port, "/api/v1/status/runtimeinfo") {
             let json: serde_json::Value = serde_json::from_str(&body).expect("runtimeinfo JSON");
             levels = json["data"]["rollupLevels"].clone();
-            if levels == serde_json::json!(["1m", "12m", "2h", "1d"]) {
+            if levels == serde_json::json!(["5s", "1m", "12m", "2h", "1d"]) {
                 break;
             }
         }
@@ -488,7 +488,7 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
     }
     assert_eq!(
         levels,
-        serde_json::json!(["1m", "12m", "2h", "1d"]),
+        serde_json::json!(["5s", "1m", "12m", "2h", "1d"]),
         "runtimeinfo lists the default rollup levels"
     );
 
@@ -2917,6 +2917,11 @@ async fn prom_api_query_parameters_issue_499() {
     }
     let db = pulsus_testkit::test_db("pulsus_prom_499_it");
     let port: u16 = 31_520;
+    // Issue #18 follow-up: no rollup levels, so L2's pushed and fetched
+    // statements are the routes it tests; a level would serve the instant
+    // `count(p499)` and pre-empt the push.
+    drop_db(&db).await;
+    live_db::build_schema_without_levels(&db).await;
     let guard = spawn_prom_server(port, &db, &[]);
     let client = ChClient::new(test_ch_config(&db))
         .await
@@ -3010,6 +3015,15 @@ async fn prom_api_query_parameters_issue_499() {
             "L1: lookback_delta={empty}"
         );
     }
+
+    // The database holds no rollup level, so nothing routes.
+    let (status, info) = q("/api/v1/status/runtimeinfo");
+    assert_eq!(status, 200, "runtimeinfo: {info}");
+    assert_eq!(
+        info["data"]["rollupLevels"],
+        serde_json::json!([]),
+        "no rollup levels"
+    );
 
     // L2: the pushed and the fetched route both read the requested
     // lookback.

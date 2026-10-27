@@ -4347,6 +4347,7 @@ mod tests {
 
     fn params(start_ms: i64, end_ms: i64, step_ms: i64) -> PlanParams {
         PlanParams {
+            eval: None,
             start_ms,
             end_ms,
             step_ms,
@@ -9734,5 +9735,56 @@ mod tests {
             annos.base_messages().1,
             vec!["PromQL info: ignored histogram in max aggregation"]
         );
+    }
+
+    /// **T13 (issue #18 follow-up, plan r16): the grid moves only the
+    /// evaluation times.** `x` is its own time in seconds, every 15 s. The
+    /// request is `start = 0`, `end = 90,000 s`, `step = 900 s`; the grid
+    /// is `720 s × ⌈900 / 720⌉ = 1,440 s` up to 89,280 s. Every query is
+    /// evaluated at the grid's 63 times, and every value the request
+    /// defines keeps the request's.
+    #[test]
+    fn the_grid_moves_only_the_evaluation_times() {
+        let samples: Vec<Sample> = (-172_800i64..=90_000)
+            .step_by(15)
+            .map(|t| s(t * 1_000, t as f64))
+            .collect();
+        let p = PlanParams {
+            eval: Some(crate::plan::EvalGrid {
+                end_ms: 89_280_000,
+                step_ms: 1_440_000,
+            }),
+            ..params(0, 90_000_000, 900_000)
+        };
+        let times: Vec<i64> = (0..63).map(|k| k * 1_440_000).collect();
+        type Want = fn(i64) -> f64;
+        let cases: [(&str, Want); 10] = [
+            ("x @ end()", |_| 90_000.0),
+            ("max_over_time(x[1m] @ end())", |_| 90_000.0),
+            ("x @ start()", |_| 0.0),
+            ("end()", |_| 90_000.0),
+            ("start()", |_| 0.0),
+            ("range()", |_| 90_000.0),
+            ("step()", |_| 900.0),
+            ("count_over_time(x[step() * 2])", |_| 120.0),
+            ("x offset step()", |t| (t / 1_000 - 900) as f64),
+            ("max_over_time(x[10m:1m] @ end())", |_| 90_000.0),
+        ];
+        for (q, want) in cases {
+            let planned = plan(&crate::parser::parse(q).unwrap(), p).unwrap();
+            let mut data = SeriesData::new();
+            for sel in &planned.selectors {
+                data.insert(sel.id, vec![series(1, &[("job", "x")], samples.clone())]);
+            }
+            let points: Vec<(i64, f64)> = match evaluate(&planned, &data).unwrap() {
+                QueryValue::Matrix(m) => {
+                    assert_eq!(m.len(), 1, "{q}: one series");
+                    m[0].points.iter().map(|pt| (pt.t_ms, pt.v)).collect()
+                }
+                other => panic!("{q}: expected a matrix, got {other:?}"),
+            };
+            let expected: Vec<(i64, f64)> = times.iter().map(|&t| (t, want(t))).collect();
+            assert_eq!(points, expected, "{q}");
+        }
     }
 }

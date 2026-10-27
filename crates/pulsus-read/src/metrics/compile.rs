@@ -1322,6 +1322,7 @@ mod tests {
 
     fn plan_params() -> PlanParams {
         PlanParams {
+            eval: None,
             start_ms: params().start_ms,
             end_ms: params().end_ms,
             step_ms: params().step_ms,

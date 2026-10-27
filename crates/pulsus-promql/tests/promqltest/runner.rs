@@ -333,6 +333,7 @@ fn params_for(kind: &EvalKind) -> PlanParams {
     // gate state (issue #65).
     match *kind {
         EvalKind::Instant { at_ms } => PlanParams {
+            eval: None,
             start_ms: at_ms,
             end_ms: at_ms,
             step_ms: 0,
@@ -344,6 +345,7 @@ fn params_for(kind: &EvalKind) -> PlanParams {
             to_ms,
             step_ms,
         } => PlanParams {
+            eval: None,
             start_ms: from_ms,
             end_ms: to_ms,
             step_ms,

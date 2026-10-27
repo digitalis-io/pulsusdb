@@ -315,6 +315,7 @@ fn build_operator_probe(name: &str) -> String {
 fn probe_outcome(probe: &str) -> Result<(), String> {
     let expr = pulsus_promql::parse(probe).map_err(|e| format!("parse: {e}"))?;
     let params = PlanParams {
+        eval: None,
         start_ms: 300_000,
         end_ms: 300_000,
         step_ms: 0,

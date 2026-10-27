@@ -53,6 +53,7 @@ static DB_B2E: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read
 static DB_T4: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t4");
 static DB_T9: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t9");
 static DB_T10: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t10");
+static DB_T14: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t14");
 
 /// The default levels and their switch points (the owner's table,
 /// 2026-10-26).
@@ -670,11 +671,15 @@ fn snapped(built: &Built, query: &str, p: &MetricQueryParams) -> MetricQueryPara
     let Some((res, g)) = pulsus_read::metrics::rollup::grid(p, &levels) else {
         return *p;
     };
-    // The grid changes only when a selector routes on it (r11).
-    let pp = g.plan_params(false, pulsus_promql::DEFAULT_LOOKBACK_MS);
+    // The times move only when a selector routes on them (plan r16): then
+    // they are `start + k × S` up to the grid's end.
+    let pp = pulsus_promql::PlanParams {
+        eval: Some(g),
+        ..p.plan_params(false, pulsus_promql::DEFAULT_LOOKBACK_MS)
+    };
     let plan = pulsus_promql::plan(&parse(query).expect("parse"), pp).expect("plan");
     if pulsus_read::metrics::rollup::any_routes(&plan, &pp, &levels, res) {
-        g
+        range(p.start_ms, g.end_ms, g.step_ms)
     } else {
         *p
     }
@@ -2033,16 +2038,17 @@ fn vector_or_matrix(x: &Answer) -> BTreeMap<(String, i64), String> {
     }
 }
 
-/// **T4 (issue #18 follow-up): a week reads two-hour rows.** Corpus D at
-/// every level; a label cache whose window is 24 hours, so a 7-day
-/// selector resolves by SQL; `end` 90 minutes before the corpus's end and
-/// `start` 7 days before it, asked at step 5 m. `max_over_time(g[2h])` and
-/// `rate(c_normal[10h])`: every series has 84 points, each a multiple of
-/// 7200 s; explain notes the grid first, resolves the series by SQL,
-/// reads their labels by the `rollup_series` statement and routes to
-/// `metric_samples_7200s`; `max_over_time` is bit-equal and `rate` within
-/// the 7200 s bound against the unrouted engine asked at step 2 h from the
-/// same first point.
+/// **T4 (issue #18 follow-up, plan r16): a week reads two-hour rows.**
+/// Corpus D at every level; a label cache whose window is 24 hours, so a
+/// 7-day selector resolves by SQL. `end` 2 hours before the corpus's end
+/// and `start` 7 days before it, both on 2 h boundaries, asked at step
+/// 5 m: `max_over_time(g[2h])` and `rate(c_normal[10h])` have 85 points
+/// per series at `start + k × 2 h`; explain notes the grid first, resolves
+/// the series by SQL, reads their labels by the `rollup_series` statement
+/// and routes to `metric_samples_7200s` at step 2 h. With both ends 5
+/// minutes later, the same 85 points read `metric_samples_60s`.
+/// `max_over_time` is bit-equal and `rate` within its level's bound
+/// against the unrouted engine asked at step 2 h from the same `start`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_week_reads_two_hour_rows() {
     skip_unless_live!();
@@ -2073,96 +2079,101 @@ async fn a_week_reads_two_hour_rows() {
         }
     };
 
-    let end = day0 + 8 * DAY - 90 * MIN;
-    let start = end - 7 * DAY;
     let res = 2 * HOUR;
-    let first = (start.div_euclid(res) + 1) * res;
-    let last = end.div_euclid(res) * res;
-    let p = range(start, end, 5 * MIN);
-    for (qi, (query, kind)) in [
-        ("max_over_time(g[2h])", None),
-        ("rate(c_normal[10h])", Some("normal")),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let a = ask(
-            &engine(true, format!("{run}_{qi}_on")).await,
-            &no_tenant(),
-            query,
-            &p,
-        )
-        .await;
-        let mut per_series: BTreeMap<String, Vec<i64>> = BTreeMap::new();
-        for (l, t) in a.points().keys() {
-            per_series.entry(l.clone()).or_default().push(*t);
-        }
-        assert!(!per_series.is_empty(), "{query}: no series");
-        for (l, ts) in &per_series {
-            assert_eq!(ts.len(), 84, "{query} {l}: the points");
-            assert!(
-                ts.iter().all(|t| t.rem_euclid(res) == 0),
-                "{query} {l}: every time a multiple of 7200 s"
+    // Both ends on 2 h boundaries, then both 5 minutes later: the grid is
+    // `start + k × 2 h` either way; the second reads the 60 s level (G2).
+    for (shift, table, level) in [
+        (0, "metric_samples_7200s", 7200),
+        (5 * MIN, "metric_samples_60s", 60),
+    ] {
+        let end = day0 + 8 * DAY - 2 * HOUR + shift;
+        let start = end - 7 * DAY;
+        let p = range(start, end, 5 * MIN);
+        let times: Vec<i64> = (0..85).map(|k| start + k * res).collect();
+        for (qi, (query, kind)) in [
+            ("max_over_time(g[2h])", None),
+            ("rate(c_normal[10h])", Some("normal")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let a = ask(
+                &engine(true, format!("{run}_{shift}_{qi}_on")).await,
+                &no_tenant(),
+                query,
+                &p,
+            )
+            .await;
+            let series = per_series(&a);
+            assert!(!series.is_empty(), "{query} +{shift}: no series");
+            for (l, ts) in &series {
+                assert_eq!(ts, &times, "{query} +{shift} {l}: start + k × 2 h");
+            }
+            let stages = &a.explain.stages;
+            assert_eq!(stages[0].name, "rollup_grid", "{query}: the first stage");
+            assert_eq!(
+                stages[0].note.as_deref(),
+                Some(
+                    format!(
+                        "resolution 2h, step 2h (asked 5m), 85 points, {} to {}",
+                        start / 1000,
+                        end / 1000
+                    )
+                    .as_str()
+                ),
+                "{query} +{shift}: the grid"
             );
-        }
-        let stages = &a.explain.stages;
-        assert_eq!(stages[0].name, "rollup_grid", "{query}: the first stage");
-        assert_eq!(
-            stages[0].note.as_deref(),
-            Some(
-                format!(
-                    "resolution 2h, step 2h (asked 5m), 84 points, {} to {}",
-                    first / 1000,
-                    last / 1000
-                )
-                .as_str()
-            ),
-            "{query}: the grid"
-        );
-        let resolved = stages
-            .iter()
-            .find(|s| s.name == "series_resolution")
-            .expect("series_resolution");
-        assert!(
-            resolved.sql.starts_with("SELECT"),
-            "{query}: the series resolve by SQL: {resolved:?}"
-        );
-        let metric = if kind.is_some() { "c_normal" } else { "g" };
-        let hydrate = pulsus_read::metrics::sql::series_labels_by_fingerprint(
-            &no_tenant(),
-            &engine_config(&db, false).labels_table,
-            &[metric.to_string()],
-            &resolved.sql,
-        );
-        let series = stages
-            .iter()
-            .find(|s| s.name == "rollup_series")
-            .unwrap_or_else(|| panic!("{query}: no rollup_series stage: {stages:?}"));
-        assert_eq!(series.sql, hydrate, "{query}: the rollup_series statement");
-        assert!(
-            a.stages("rollup_route")
+            let resolved = stages
                 .iter()
-                .any(|n| n.starts_with("metric_samples_7200s,")),
-            "{query}: {:?}",
-            a.stages("rollup_route")
-        );
+                .find(|s| s.name == "series_resolution")
+                .expect("series_resolution");
+            assert!(
+                resolved.sql.starts_with("SELECT"),
+                "{query}: the series resolve by SQL: {resolved:?}"
+            );
+            let metric = if kind.is_some() { "c_normal" } else { "g" };
+            let hydrate = pulsus_read::metrics::sql::series_labels_by_fingerprint(
+                &no_tenant(),
+                &engine_config(&db, false).labels_table,
+                &[metric.to_string()],
+                &resolved.sql,
+            );
+            let hydrated = stages
+                .iter()
+                .find(|s| s.name == "rollup_series")
+                .unwrap_or_else(|| panic!("{query}: no rollup_series stage: {stages:?}"));
+            assert_eq!(
+                hydrated.sql, hydrate,
+                "{query}: the rollup_series statement"
+            );
+            let route = a.stages("rollup_route");
+            assert!(
+                route
+                    .iter()
+                    .any(|n| n.starts_with(&format!("{table},")) && n.contains(", step 2h,")),
+                "{query} +{shift}: {route:?}"
+            );
 
-        let b = ask(
-            &engine(false, format!("{run}_{qi}_off")).await,
-            &no_tenant(),
-            query,
-            &range(first, end, res),
-        )
-        .await;
-        let (pa, pb) = (a.points(), b.points());
-        match kind {
-            None => assert!(bit_equal(&pa, &pb), "{query}: bit-equal"),
-            Some(kind) => {
-                let d = distances(&pa, &pb);
-                let (p99, max) = p99_max(&d);
-                let limit = bound("rate", kind, 7200).expect("a counter kind");
-                println!("T4 {query}: n {} p99 {p99:e} max {max:e}", d.len());
-                assert!(p99 <= limit, "{query}: p99 {p99:e} above {limit:e}");
+            let b = ask(
+                &engine(false, format!("{run}_{shift}_{qi}_off")).await,
+                &no_tenant(),
+                query,
+                &range(start, end, res),
+            )
+            .await;
+            let (pa, pb) = (a.points(), b.points());
+            match kind {
+                None => assert!(bit_equal(&pa, &pb), "{query} +{shift}: bit-equal"),
+                Some(kind) => {
+                    let d = distances(&pa, &pb);
+                    let (p99, max) = p99_max(&d);
+                    let limit = bound("rate", kind, level).expect("a counter kind");
+                    println!("T4 {query} +{shift}: n {} p99 {p99:e} max {max:e}", d.len());
+                    assert!(
+                        p99 <= limit,
+                        "{query} +{shift}: p99 {p99:e} above {limit:e}"
+                    );
+                }
             }
         }
     }
@@ -2213,32 +2224,52 @@ async fn a_raw_only_query_keeps_its_grid() {
     built.finish().await;
 }
 
-/// **T10 (issue #18 follow-up, r11): a query no level serves on the
-/// changed grid reads raw on its own.** Corpus D at every level, against
-/// the engine without levels. `rate(c_normal[5m] offset 1s)` over 1 h at
-/// step 5 m from `day0 + 7 d + 1 s`: no level fits the changed grid, so
-/// 13 points per series at `start + k × 300 s`, bit-equal, with no
-/// `rollup_grid` and no `rollup_route` stage, although the 60 s level
-/// would fit the request's own grid. The instant `rate(c_normal[5m])` at
-/// `day0 + 7 d` reads the 5 s level within 1e-12. The range query with
-/// `start = end` reads raw: one point, bit-equal, no grid, no route.
+/// **T10 (issue #18 follow-up, plan r16): a grid from `start` routes
+/// where its times fit.** Corpus D at every level, against the engine
+/// without levels. `rate(c_normal[5m] offset 1s)` over 1 h at step 5 m
+/// from `day0 + 7 d + 1 s`: `S` = 300 s = the step, so the request's own
+/// 13 times; each time less 1 s is a minute boundary, so it reads
+/// `metric_samples_60s`, within the 60 s bound. The instant
+/// `rate(c_normal[5m])` at `day0 + 7 d` reads the 5 s level. The range
+/// query with `start = end` gets a one-point grid, noted, and reads the
+/// 5 s level at `start`.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_query_no_level_serves_on_the_changed_grid_reads_raw() {
+async fn a_grid_from_start_routes_where_the_times_fit() {
     skip_unless_live!();
     let day0 = today() - 8 * DAY;
     let built = corpus_d(DB_T10.name(), DEFAULTS, day0, 6..8).await;
     let t = day0 + 7 * DAY;
     let routed = built.engine(true, None).await;
     let raw = built.engine(false, None).await;
+    // Every value within `limit` of the engine without levels, by the
+    // 99th percentile, with every value over it printed.
+    let close = |what: &str, a: &Answer, b: &Answer, limit: f64| {
+        let (pa, pb) = (a.points(), b.points());
+        let d = distances(&pa, &pb);
+        let (p99, max) = p99_max(&d);
+        let over: Vec<String> = pa
+            .iter()
+            .filter_map(|(k, x)| {
+                let y = pb.get(k)?;
+                (d_of(Some(x), Some(y))? > limit).then(|| format!("{} {}: {x} vs {y}", k.0, k.1))
+            })
+            .collect();
+        println!(
+            "T10 {what}: n {} p99 {p99:e} max {max:e}; over {limit:e}: {over:?}",
+            d.len()
+        );
+        assert!(p99 <= limit, "{what}: p99 {p99:e} above {limit:e}");
+    };
 
     let query = "rate(c_normal[5m] offset 1s)";
     let p = range(t + 1_000, t + 1_000 + HOUR, 5 * MIN);
     let a = ask(&routed, &no_tenant(), query, &p).await;
     let b = ask(&raw, &no_tenant(), query, &p).await;
-    assert!(a.stages("rollup_grid").is_empty(), "range: no grid change");
     assert!(
-        a.stages("rollup_route").is_empty(),
-        "range: no route {:?}",
+        a.stages("rollup_route")
+            .iter()
+            .any(|n| n.starts_with("metric_samples_60s,")),
+        "range: {:?}",
         a.stages("rollup_route")
     );
     let series = per_series(&a);
@@ -2247,7 +2278,12 @@ async fn a_query_no_level_serves_on_the_changed_grid_reads_raw() {
     for (l, ts) in &series {
         assert_eq!(ts, &want, "range {l}: the request's times");
     }
-    assert_eq!(a.cells(), b.cells(), "range: bit-equal to no levels");
+    close(
+        "range",
+        &a,
+        &b,
+        bound("rate", "normal", 60).expect("a counter bound"),
+    );
 
     let instant = range(t, t, 0);
     let a = ask(&routed, &no_tenant(), "rate(c_normal[5m])", &instant).await;
@@ -2259,30 +2295,22 @@ async fn a_query_no_level_serves_on_the_changed_grid_reads_raw() {
         "instant: {:?}",
         a.stages("rollup_route")
     );
-    let (pa, pb) = (a.points(), b.points());
-    assert_eq!(pa.len(), 100, "instant: the series");
-    let d = distances(&pa, &pb);
-    let (p99, max) = p99_max(&d);
-    let over: Vec<String> = pa
-        .iter()
-        .filter_map(|(k, x)| {
-            let y = pb.get(k)?;
-            (d_of(Some(x), Some(y))? > 1e-12).then(|| format!("{}: routed {x}, raw {y}", k.0))
-        })
-        .collect();
-    println!(
-        "T10 instant: n {} p99 {p99:e} max {max:e}; over 1e-12: {over:?}",
-        d.len()
-    );
-    assert!(p99 <= 1e-12, "instant: p99 {p99:e} from no levels");
+    assert_eq!(a.points().len(), 100, "instant: the series");
+    close("instant", &a, &b, 1e-12);
 
     let equal = range(t + 1_000, t + 1_000, 5 * MIN);
     let a = ask(&routed, &no_tenant(), query, &equal).await;
     let b = ask(&raw, &no_tenant(), query, &equal).await;
-    assert!(a.stages("rollup_grid").is_empty(), "equal bounds: no grid");
+    let grid = a.stages("rollup_grid");
     assert!(
-        a.stages("rollup_route").is_empty(),
-        "equal bounds: no route {:?}",
+        grid.len() == 1 && grid[0].contains(", 1 points, "),
+        "equal bounds: a one-point grid {grid:?}"
+    );
+    assert!(
+        a.stages("rollup_route")
+            .iter()
+            .any(|n| n.starts_with("metric_samples_5s,")),
+        "equal bounds: {:?}",
         a.stages("rollup_route")
     );
     let series = per_series(&a);
@@ -2290,6 +2318,68 @@ async fn a_query_no_level_serves_on_the_changed_grid_reads_raw() {
     for (l, ts) in &series {
         assert_eq!(ts, &vec![t + 1_000], "equal bounds {l}: one point at start");
     }
-    assert_eq!(a.cells(), b.cells(), "equal bounds: bit-equal to no levels");
+    close("equal bounds", &a, &b, 1e-12);
+    built.finish().await;
+}
+
+/// **T14 (issue #18 follow-up, plan r16): a pushed aggregate beside a
+/// routed selector.** Corpus D at every level.
+/// `count(g) + scalar(max_over_time(g{s="160"}[1h] @ end()))` over 7 days
+/// less 1 ms at step 5 m: the resolution is 720 s and `S` 720 s; the
+/// `@ end()` selector routes, `count(g)` cannot (`start` is 1 ms off every
+/// boundary) and is pushed. 840 points per series at `start + k × 720 s`,
+/// explain holding the routed selector's `rollup_route` and the pushed
+/// aggregate's statement, every value bit-equal to the engine without
+/// levels asked at step 720 s from the same `start`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pushed_aggregate_beside_a_routed_selector() {
+    skip_unless_live!();
+    let day0 = today() - 8 * DAY;
+    let built = corpus_d(DB_T14.name(), DEFAULTS, day0, 0..8).await;
+    let end = day0 + 7 * DAY;
+    let start = end - 7 * DAY + 1;
+    let query = r#"count(g) + scalar(max_over_time(g{s="160"}[1h] @ end()))"#;
+    let mut e = MetricsEngine::new(
+        built.client().await,
+        Arc::clone(&built.cache),
+        engine_config(built.db(), true),
+    );
+    e = e.with_rollup_levels(Arc::clone(&built.slot));
+    let raw = MetricsEngine::new(
+        built.client().await,
+        Arc::clone(&built.cache),
+        engine_config(built.db(), true),
+    );
+    let a = ask(&e, &no_tenant(), query, &range(start, end, 5 * MIN)).await;
+    let series = per_series(&a);
+    assert_eq!(series.len(), 1, "one series: {series:?}");
+    let times: Vec<i64> = (0..840).map(|k| start + k * 720_000).collect();
+    for (l, ts) in &series {
+        assert_eq!(ts, &times, "{l}: start + k × 720 s");
+    }
+    assert!(
+        a.stages("rollup_route")
+            .iter()
+            .any(|n| n.starts_with("metric_samples_720s,")),
+        "the @ end() selector routes: {:?}",
+        a.stages("rollup_route")
+    );
+    let pushed: Vec<&pulsus_read::logql::ExplainStage> = a
+        .explain
+        .stages
+        .iter()
+        .filter(|s| s.name == "pushed_aggregate" && !s.sql.is_empty())
+        .collect();
+    assert!(
+        !pushed.is_empty(),
+        "count(g) is pushed: {:?}",
+        a.explain.stages
+    );
+    let b = ask(&raw, &no_tenant(), query, &range(start, end, 720_000)).await;
+    assert!(
+        b.stages("rollup_route").is_empty(),
+        "the engine without levels routes nothing"
+    );
+    assert_eq!(a.cells(), b.cells(), "bit-equal to no levels");
     built.finish().await;
 }

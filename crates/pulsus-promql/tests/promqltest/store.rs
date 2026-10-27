@@ -614,6 +614,7 @@ mod tests {
         pulsus_promql::plan(
             &expr,
             pulsus_promql::PlanParams {
+                eval: None,
                 start_ms: at_ms,
                 end_ms: at_ms,
                 step_ms: 60_000,
