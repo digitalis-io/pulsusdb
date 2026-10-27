@@ -106,7 +106,7 @@ SELECT toUInt32(uniqExact(shard_num)) AS shards FROM system.clusters WHERE clust
 | R1 | **Resolution.** For a range query, `res` is the largest level whose switch point is at most `end − start`; the smallest level's is 0. Defaults: levels 5, 60, 720, 7200 and 86400 s, switch points 1 h, 24 h, 7 d and 90 d (`grid`, `crates/pulsus-read/src/metrics/rollup.rs:220`) |
 | R2 | **Grid** (owner, 2026-10-26: never more than asked). The effective step is `S = res × ⌈step / res⌉`, in `i128`; the evaluation times are the multiples of `S` in `(start, end]`, from `(⌊start / S⌋ + 1) × S` to `⌊end / S⌋ × S`, every `S`; `⌊ ⌋` is `div_euclid`. Their count is `⌊end / S⌋ − ⌊start / S⌋`, never above the request's `⌊(end − start) / step⌋ + 1`. The grid is applied to a range query when levels are discovered, `S`, the first and last time fit `i64`, the count is 1 to 11,001 (`MAX_GRID_POINTS`, `crates/pulsus-read/src/metrics/rollup.rs:211`, the server's 11,000 intervals), and at least one selector routes on it (`any_routes`, `crates/pulsus-read/src/metrics/rollup.rs:256`, decided after planning on the candidate grid, before any fetch). Otherwise the query is planned and answered on its own `start + k × step`, with routing off: no selector reads a level. The whole query is evaluated on the grid it gets, whatever its functions (`query_inner`, `crates/pulsus-read/src/metrics/exec.rs:687`). Every time is a multiple of `S`, so of `res` and of every finer level |
 | R3 | **Per selector**, the level read is the largest of width at most `res` that passes G1 to G3; none means raw (`route`, `crates/pulsus-read/src/metrics/rollup.rs:264`). The widths divide one another (`building.md` §1.2), so every grid time is a bucket end of every level at or below `res` |
-| R4 | **Any resolution.** The route is decided before the pushdown, so a routed selector is never pushed down (`super::rollup::eligible`, `crates/pulsus-read/src/metrics/exec.rs:1029`). How a selector's series were found does not matter (`eligible`, `crates/pulsus-read/src/metrics/rollup.rs:313`): one the label cache could not answer first reads its series and labels by the statement the raw fallback hydrates by, under the same settings, then reads as §3; its native-histogram read is over the same series statement (`fetch_rollup`, `crates/pulsus-read/src/metrics/exec.rs:2168`) |
+| R4 | **Any resolution.** The route is decided before the pushdown, so a routed selector is never pushed down (`routed_series`, `crates/pulsus-read/src/metrics/exec.rs:3701`). How a selector's series were found does not matter (`eligible`, `crates/pulsus-read/src/metrics/rollup.rs:313`): one the label cache could not answer first reads its series and labels by the statement the raw fallback hydrates by, under the same settings, then reads as §3; its native-histogram read is over the same series statement (`fetch_rollup`, `crates/pulsus-read/src/metrics/exec.rs:2173`) |
 | R5 | **Instant query** (`step = 0`): no grid change; `res` is the smallest level, and G2 applies to its time |
 | R6 | **Setup only.** The levels, switch points and counter bucket count are set when the schema is built, validated by `schema/schema.sh` and `pulsus_schema` with the same messages (`building.md` §1.2), and stored in each level table's comment; the binary reads them from there and has no setting for them |
 
@@ -120,13 +120,13 @@ The published distances (§1.1, `docs/api.md` §3.6) were measured at `counter_b
 
 ## 3. Coverage and freshness
 
-Per fingerprint chunk (`rollup_chunk`, `crates/pulsus-read/src/metrics/exec.rs:2306`), with `todo` starting as the selector's fetch window:
+Per fingerprint chunk (`rollup_chunk`, `crates/pulsus-read/src/metrics/exec.rs:2311`), with `todo` starting as the selector's fetch window:
 
 1. For the chosen level, then each finer level from coarsest to finest: one level fetch over the hull of `todo`. Its coverage `C` is computed from its own run rows; the data rows with `t_end` inside `C ∩ todo` are kept; `C` is taken out of `todo`.
-2. One raw read over the hull of what remains, with the raw route's statement (`sample_fetch`, `crates/pulsus-read/src/metrics/sample_sql.rs:85`); samples outside what remains are dropped. For a counter at a level under 720 s, each remaining interval is first widened by the range on both sides, inside the window, so the overlay holds every raw sample a touching window needs (`let read = if over`, `crates/pulsus-read/src/metrics/exec.rs:2364`).
+2. One raw read over the hull of what remains, with the raw route's statement (`sample_fetch`, `crates/pulsus-read/src/metrics/sample_sql.rs:85`); samples outside what remains are dropped. For a counter at a level under 720 s, each remaining interval is first widened by the range on both sides, inside the window, so the overlay holds every raw sample a touching window needs (`let read = if over`, `crates/pulsus-read/src/metrics/exec.rs:2369`).
 3. Per series, every kept level row and raw sample in time order, a level row at its `t_end`, assembled into points (§1, `assemble`, `crates/pulsus-read/src/metrics/rollup.rs:511`).
 
-The selector's native-histogram samples are read raw over the whole window beside the chunks (`build_hist_chunk_sqls`, `crates/pulsus-read/src/metrics/exec.rs:3969`) and merged as the raw route merges them. Every row a level fetch returns, run rows included, is charged to the query's sample budget as it drains.
+The selector's native-histogram samples are read raw over the whole window beside the chunks (`build_hist_chunk_sqls`, `crates/pulsus-read/src/metrics/exec.rs:4000`) and merged as the raw route merges them. Every row a level fetch returns, run rows included, is charged to the query's sample budget as it drains.
 
 The level fetch (`level_fetch`, `crates/pulsus-read/src/metrics/rollup.rs:319`), `{shard}` being `_shard_num` clustered and `toUInt32(1)` on one node, `{table}` the level's table with the distributed suffix when clustered:
 
@@ -201,8 +201,8 @@ With `X-Pulsus-Explain: 1`, a range query whose grid follows its range has, firs
 
 | stage | note |
 |---|---|
-| `rollup_series`, for a selector the label cache could not answer | the statement that reads its series and labels (`rollup_series_sql`, `crates/pulsus-read/src/metrics/exec.rs:2157`) |
-| `rollup_route` | `<table>, use <RollupUse>, step <s>, range <r>` (`rollup_fetch_plan`, `crates/pulsus-read/src/metrics/exec.rs:2084`) |
+| `rollup_series`, for a selector the label cache could not answer | the statement that reads its series and labels (`rollup_series_sql`, `crates/pulsus-read/src/metrics/exec.rs:2162`) |
+| `rollup_route` | `<table>, use <RollupUse>, step <s>, range <r>` (`rollup_fetch_plan`, `crates/pulsus-read/src/metrics/exec.rs:2089`) |
 | `hist_sample_fetch` | the selector's native-histogram read, when it has one |
 | `rollup_piece`, one per interval served, in time order, from the first chunk | `<table>.<column> served (a, b]`, `raw (a, b]`, or `<table> served nothing`, each with its statement |
 

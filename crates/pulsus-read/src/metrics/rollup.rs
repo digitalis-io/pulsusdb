@@ -1558,13 +1558,11 @@ mod tests {
             assert_eq!(s.name_matchers.len(), 1, "{q}: one matcher beside it");
             assert!(!eligible(&s), "{q}");
         }
-        // T3 (issue #18 follow-up): `eligible` reads the selector alone,
-        // so a selector the label cache cannot answer is eligible as one
-        // it can; the live half is `a_week_reads_two_hour_rows`.
-        assert!(
-            eligible(&sel("rate(m[1h])")),
-            "T3: eligible whatever resolved its series"
-        );
+        // T3 (issue #18 follow-up): `eligible` reads the selector alone;
+        // that a selector the label cache cannot answer is routed is held
+        // where routing is decided, `exec::routed_series`
+        // (`a_selector_the_label_cache_cannot_answer_is_routed`), and live
+        // by `a_week_reads_two_hour_rows`.
         let stats = selectors("histogram_count(rate(h[5m]))", &p).remove(0);
         assert!(
             stats.histogram_stats,

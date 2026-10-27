@@ -1,6 +1,6 @@
 # PromQL rollups: design
 
-**Built.** Part A (#742) and part B (#744) are on `main`; every statement about code in these documents is true of `main` at `1cb423d4`. Tiering and a longer retention per level (#743) are not started.
+**Built.** Part A (#742), part B (#744) and the follow-up that chooses the resolution by the query's time range (issue #18) are on `main`; every statement about code in these documents is true of `main` with that follow-up. Tiering and a longer retention per level (#743) are not started.
 
 A rollup level is a table of per-series bucket summaries of one width, built on a timer from the level below it, and read instead of raw samples at the resolution chosen by the query's time range. Its answers approximate the raw answer, by amounts measured per function and level.
 

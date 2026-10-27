@@ -327,7 +327,20 @@ async fn a_run_row_is_read_with_its_data() {
         .query_explained(&tenant, &expr, &p)
         .await
         .expect("routed");
-    let (b, _, _) = raw.query_explained(&tenant, &expr, &p).await.expect("raw");
+    // The engine without levels is asked on the grid the routed answer
+    // came on: the multiples of the effective step in `(start, end]`
+    // (issue #18 follow-up, R2), so neither carries a time the other lacks.
+    let (res, grid) =
+        pulsus_read::metrics::rollup::grid(&p, &slot.get().expect("levels")).expect("a grid");
+    assert_eq!(res, MIN, "the 60 s level is the resolution");
+    assert!(
+        explain.stages.iter().any(|s| s.name == "rollup_grid"),
+        "the routed answer is on the changed grid"
+    );
+    let (b, _, _) = raw
+        .query_explained(&tenant, &expr, &grid)
+        .await
+        .expect("raw");
     let notes: Vec<String> = explain
         .stages
         .iter()

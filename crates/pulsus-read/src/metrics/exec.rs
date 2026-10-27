@@ -1025,26 +1025,31 @@ impl MetricsEngine {
             // it, decided before the pushdown, so a routed selector is
             // never pushed down. However its series were found (issue #18
             // follow-up, R4).
-            if let Some((levels, res)) = routing.as_ref()
-                && super::rollup::eligible(sel)
-                && let Some(route) = super::rollup::route(sel, &plan_params, levels, *res)
-            {
-                let series = match resolution {
-                    LabelledResolution::Series(pairs) => RollupSeries::Known(pairs),
-                    LabelledResolution::SqlFallback { sql, .. } => RollupSeries::Resolve(sql),
-                };
-                fetch_plans.push(self.rollup_fetch_plan(
-                    tenant,
-                    sel,
-                    route,
-                    std::sync::Arc::clone(levels),
-                    series,
-                    (lower_excl, upper_incl),
-                    &plan_params,
-                    explain.as_deref_mut(),
-                ));
-                continue;
-            }
+            let resolution = match routing.as_ref() {
+                Some((levels, res)) => {
+                    match routed_series(sel, &plan_params, levels, *res, resolution) {
+                        Ok(routed) => Ok((levels, routed)),
+                        Err(resolution) => Err(resolution),
+                    }
+                }
+                None => Err(resolution),
+            };
+            let resolution = match resolution {
+                Err(resolution) => resolution,
+                Ok((levels, (route, series))) => {
+                    fetch_plans.push(self.rollup_fetch_plan(
+                        tenant,
+                        sel,
+                        route,
+                        std::sync::Arc::clone(levels),
+                        series,
+                        (lower_excl, upper_incl),
+                        &plan_params,
+                        explain.as_deref_mut(),
+                    ));
+                    continue;
+                }
+            };
 
             // Issues #549 and #579: the pushed node, decided on the SAME
             // resolution the declining path then consumes — `members_of`
@@ -3688,7 +3693,33 @@ enum SelectorFetchPlan {
     Rollup(Box<RollupFetch>),
 }
 
+/// Issue #18 follow-up, R4: where routing is decided. A selector that is
+/// eligible and fits a level of width at most `res` routes, however the
+/// label cache resolved its series: from the cache's list, or by the
+/// fallback's series statement. Otherwise the resolution is handed back
+/// for the raw route.
+fn routed_series(
+    sel: &SelectorSpec,
+    p: &pulsus_promql::PlanParams,
+    levels: &super::rollup::Levels,
+    res: i64,
+    resolution: LabelledResolution,
+) -> Result<(super::rollup::Route, RollupSeries), LabelledResolution> {
+    if !super::rollup::eligible(sel) {
+        return Err(resolution);
+    }
+    let Some(route) = super::rollup::route(sel, p, levels, res) else {
+        return Err(resolution);
+    };
+    let series = match resolution {
+        LabelledResolution::Series(pairs) => RollupSeries::Known(pairs),
+        LabelledResolution::SqlFallback { sql, .. } => RollupSeries::Resolve(sql),
+    };
+    Ok((route, series))
+}
+
 /// Issue #18 follow-up, R4: how a routed selector's series are known.
+#[derive(Debug, PartialEq)]
 enum RollupSeries {
     /// From the label cache, ascending by series ID once planned.
     Known(Vec<(Fingerprint, LabelSet)>),
@@ -6754,5 +6785,63 @@ mod timestamp_run_cost {
                 RUN_SAMPLES_EXAMINED.with(Cell::get)
             );
         }
+    }
+}
+
+/// **T3, routing half (issue #18 follow-up, R4).** At the point where
+/// routing is decided, a selector the label cache could not answer routes
+/// and reads its series by the fallback's statement, as one it answered
+/// routes with its list.
+#[cfg(test)]
+mod routed_series_tests {
+    use super::*;
+    use crate::metrics::labels::FallbackReason;
+    use crate::metrics::rollup::{Level, Levels};
+
+    #[test]
+    fn a_selector_the_label_cache_cannot_answer_is_routed() {
+        let levels = Levels {
+            levels: vec![Level {
+                res_ms: 720_000,
+                table: "metric_samples_720s".to_string(),
+                from_ms: 0,
+            }],
+            shards: 1,
+            counter_buckets: 5,
+        };
+        // A UTC midnight, on every level's grid.
+        let start = 1_788_825_600_000;
+        let p = pulsus_promql::PlanParams {
+            start_ms: start,
+            end_ms: start + 86_400_000,
+            step_ms: 720_000,
+            lookback_ms: pulsus_promql::DEFAULT_LOOKBACK_MS,
+            experimental_functions: false,
+        };
+        let plan = pulsus_promql::plan(&pulsus_promql::parse("rate(m[1h])").unwrap(), p).unwrap();
+        let sel = &plan.selectors[0];
+        let fallback = LabelledResolution::SqlFallback {
+            sql: "SELECT fingerprint FROM metric_series".to_string(),
+            reason: FallbackReason::OutOfWindow,
+        };
+        let got = routed_series(sel, &p, &levels, 720_000, fallback).map(|(r, s)| (r.table, s));
+        assert_eq!(
+            got.ok(),
+            Some((
+                "metric_samples_720s".to_string(),
+                RollupSeries::Resolve("SELECT fingerprint FROM metric_series".to_string())
+            )),
+            "the SQL fallback's selector is routed"
+        );
+        let cache = LabelledResolution::Series(Vec::new());
+        let got = routed_series(sel, &p, &levels, 720_000, cache).map(|(r, s)| (r.table, s));
+        assert_eq!(
+            got.ok(),
+            Some((
+                "metric_samples_720s".to_string(),
+                RollupSeries::Known(Vec::new())
+            )),
+            "the control: the label cache's selector is routed"
+        );
     }
 }
