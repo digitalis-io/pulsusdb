@@ -3113,18 +3113,18 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
         storage_policy: Some("tiered".to_string()),
         ..clustered()
     };
-    let cases: [(&str, Vec<(&str, &str)>, &[&str], RenderCtx, &str); 3] = [
+    let cases = [
         (
             "single-node",
             vec![],
-            &["--mode", "single"],
+            vec!["--mode", "single"],
             single(),
             "8c45842fa4466018fa606e9b01797550efec3df166c6ca7ea23afc9978ab0488",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
-            &[],
+            vec![],
             clustered(),
             "3b2df5f94dc6825bc4914e6fc169fd5dfb7654a878df7a4487b83c99ed1cf4b7",
         ),
@@ -3134,7 +3134,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
                 ("PULSUS_CLUSTER", "prod"),
                 ("PULSUS_STORAGE_POLICY", "tiered"),
             ],
-            &[],
+            vec![],
             tiered_ctx,
             "27c7a0dea6385a67ca9c7f031055e0fd0891271128edc93279267109478216e3",
         ),
@@ -3142,7 +3142,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
     for (what, extra, args, ctx, digest) in cases {
         let mut vars = vec![("CLICKHOUSE_DB", "pulsus"), ("PULSUS_RETENTION_DAYS", "7")];
         vars.extend(extra);
-        let (code, out, err) = script_clean(&vars, args);
+        let (code, out, err) = script_clean(&vars, &args);
         assert_eq!(code, Some(0), "{what}: the script refused: {err}");
         assert_eq!(sha256_hex(&out), digest, "{what}: the script's bytes");
         assert!(

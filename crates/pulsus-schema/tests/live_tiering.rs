@@ -309,6 +309,9 @@ async fn old_days_move_and_every_answer_is_unchanged() {
     }
 }
 
+/// Environment variables for one script run, by name.
+type Vars<'a> = Vec<(&'a str, &'a str)>;
+
 /// `schema/schema.sh --mode single` against the test server, building `db`
 /// with `PULSUS_RETENTION_DAYS=30` and `vars`; every other `PULSUS_*`
 /// variable removed. Its exit code and standard error.
@@ -380,7 +383,7 @@ async fn the_script_refuses_an_absent_policy_before_it_drops() {
              carry it (docs/configuration.md §3)"
         )
     };
-    let cases: Vec<(&str, Vec<(&str, &str)>, String)> = vec![
+    let cases: Vec<(&str, Vars, String)> = vec![
         (
             "(1) an absent policy",
             vec![("PULSUS_STORAGE_POLICY", "pulsus_no_such_policy")],
