@@ -178,7 +178,7 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 | `PULSUS_ROLLUP_RANGES` | `3600,86400,604800,7776000` | the query range in seconds from which each level after the first is the resolution of a PromQL range query ([api.md](api.md) §3.6), one per level after the first, in level order; read only when there are levels, and empty for none. Stored in each level table's comment. Refused with exit `2`, the first failing rule the message: an empty item (`an empty item in '<text>'`); an item that is not a whole number from `1` to `999999999` with no leading zero (`<item> is not a whole number of seconds from 1 to 999999999`); not one for each level after the first (`<n> ranges for <m> levels: give one for each level after the first`); not increasing (`<a> then <b>: the ranges must increase`); shorter than its level (`<range> is shorter than its level <w>`) |
 | `PULSUS_ROLLUP_COUNTER_BUCKETS` | `5` | the buckets of a level a `rate` or `increase` range covers at least for that level to answer it. Stored in each level table's comment. A whole number from `2` to `1000` with no leading zero; anything else is exit `2`, `<v> is not a whole number from 2 to 1000`. One bucket would give a `rate` window one point at the levels under 720 s. The distances in [api.md](api.md) §3.6 hold for `5` |
 | `PULSUS_COLD_VOLUME` | unset: nothing moves | the volume of `PULSUS_STORAGE_POLICY` (§3) that old parts move to; letters, digits and `_`. Requires the policy; the volume must not be the policy's first, and the policy's `move_factor` must be `0` (`schema/schema.sh` checks every server before it drops anything, exit `1`) |
-| `PULSUS_METRICS_HOT_DAYS` | none: required when `PULSUS_COLD_VOLUME` is set, refused when it is not | days a metric sample stays on the local volume, from `1` to `PULSUS_RETENTION_DAYS`; the retention itself means never moves |
+| `PULSUS_METRICS_HOT_DAYS` | none: required when `PULSUS_COLD_VOLUME` is set, refused when it is not | days after which a metric sample's part moves to the cold volume, from `1` to `PULSUS_RETENTION_DAYS`; the retention itself renders no move rule. Either way the tables stay on the policy, so a new part can still be written to the cold volume when the local volume is full (Tiering, below) |
 | `PULSUS_LOGS_HOT_DAYS` | as above | the same for log lines and the log rollups |
 | `PULSUS_TRACES_HOT_DAYS` | as above | the same for spans and the trace tables read by time |
 
@@ -221,17 +221,19 @@ An hour is in the server's time zone. `month` is the UTC month of the log lines 
 
 ### Tiering
 
-With `PULSUS_STORAGE_POLICY` and `PULSUS_COLD_VOLUME` set, `schema/schema.sh` gives each table of a family a second TTL rule that moves its parts to the cold volume. A family whose move age equals `PULSUS_RETENTION_DAYS` never moves.
+With `PULSUS_STORAGE_POLICY` and `PULSUS_COLD_VOLUME` set, `schema/schema.sh` gives each table of a family a second TTL rule that moves its parts to the cold volume. A family whose move age equals `PULSUS_RETENTION_DAYS` gets no move rule.
 
 | Family | Tables | Moves after |
 |--------|--------|-------------|
 | metrics | `metric_samples`, `metric_hist_samples`, `metric_exemplars` | `PULSUS_METRICS_HOT_DAYS` |
 | logs | `log_samples`, `log_metrics_<res>`, `log_patterns` | `PULSUS_LOGS_HOT_DAYS` |
 | traces | `spans`, `error_spans`, `tag_bucket_values`, `service_bucket_resources`, `service_edges` | `PULSUS_TRACES_HOT_DAYS` |
-| levels | `metric_samples_<N>s` | kept on the local volume |
+| levels | `metric_samples_<N>s` | no move rule; on the policy |
 | never moves | `log_landing`, `log_streams`, `log_streams_idx`, `metric_labels`, `metric_label_index`, `metric_label_values`, `metric_landing`, `metric_metadata`, `metric_series`, `resources`, `tag_names`, `tag_values`, `trace_landing`, `traces` | created without `storage_policy`, on the server's `default` policy |
 
 A part moves when its newest row is older than the move age, so a UTC day `D` of raw data with move age `H` is local until `D + 1 + H` days; rows written for a day already moved go straight to the cold volume.
+
+**A table on the policy can reach the cold volume without a move rule.** When the policy's first volume has no space for a new part — an insert, a merge or a replica's fetch — the server writes that part to the next volume that has space, the cold volume here. `move_factor` `0` stops the server moving existing parts to free space; it does not stop this. So a table on the policy — a family's table before its move age, a family whose move age equals `PULSUS_RETENTION_DAYS`, or a rollup level — is local only while the local volume has room. The fourteen tables in the last row are not on the policy and cannot reach the cold volume.
 
 Every server carries the policy, the same on every replica of every shard. For example, with `PULSUS_STORAGE_POLICY=tiered` and `PULSUS_COLD_VOLUME=cold`:
 

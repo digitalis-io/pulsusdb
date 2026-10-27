@@ -75,4 +75,4 @@ The window algebra of issue #18 part 3 (#740) stays as the raw functions' arithm
 
 ## 4. Later
 
-Each level's expiry is its own table's TTL, rendered from `{{retention_days}}`, the raw retention. The levels stay on the local volume; a level's own retention and move age are #743 part B, not started.
+Each level's expiry is its own table's TTL, rendered from `{{retention_days}}`, the raw retention. The levels have no move rule but are on the storage policy, so a new level part reaches the cold volume only when the local volume is full ([configuration.md §7](../configuration.md), Tiering); a level's own retention and move age are #743 part B, not started.
