@@ -973,9 +973,17 @@ The database holds the metric samples at full resolution and, beside them, one r
 | 7 days / 30 days | 7200 s | 84 / 360 |
 | 90 days / 6 months / 1 year | 86400 s | 90 / 182 / 365 |
 
-The evaluation times are every bucket end of the resolution `res` in `(start, end]`, from `(⌊start / res⌋ + 1) × res` to `⌊end / res⌋ × res`, step `res`, whatever step was asked: `⌊end / res⌋ − ⌊start / res⌋` points. The whole query is evaluated on these times, whatever its functions. A grid of more than 11,001 points, or with a time outside the 64-bit millisecond range, keeps the query's own times, and nothing reads a level. An instant query keeps its time, and its selectors read the smallest level or raw.
+The query is evaluated at the multiples of the effective step `S = res × ⌈step / res⌉` in `(start, end]`: the resolution, or the step asked rounded up to a multiple of it, so never more points than asked. The times run from `(⌊start / S⌋ + 1) × S` to `⌊end / S⌋ × S`, every `S`: `⌊end / S⌋ − ⌊start / S⌋` points. The whole query is evaluated on these times, whatever its functions. A query no selector of which can read a level on these times (every function raw-only, a guard, no levels) keeps its own start, end and step, `start + k × step`, and reads raw. So does a grid of more than 11,001 points, or with `S` or a time outside the 64-bit millisecond range. An instant query keeps its time, and its selectors read the smallest level or raw.
 
-So any 7-day `query_range`, at any `step`, returns 84 values per series, `[t, "v"]`, each `t` a multiple of 7200 (seconds since the epoch): the first the first 2-hour boundary after `start`, the last the last one at or before `end`. The newest value is at most 2 hours old: the last bucket end at or before `end` is the last point.
+When a level serves the query, the values are evenly spaced `S` apart, `[t, "v"]`, each `t` a multiple of `S` (seconds since the epoch), from the first after `start` to the last at or before `end`:
+
+| request | resolution | `S` | points per series |
+|---|---|---|---:|
+| `rate(x[5m])`, 10 min, `step=15s` | 5 s | 15 s | 40 |
+| `rate(x[5m])`, 7 days, `step=5m` | 7200 s | 2 h | 84 |
+| `max_over_time(x[1d])`, 7 days, `step=1d` | 7200 s | 1 d | 7 |
+| `rate(x[1h])`, 24 h, `step=15m` | 720 s | 24 min | 60 |
+| `irate(x[5m])`, 7 days, `step=5m` | — | — | 2,017 (the request's grid) |
 
 Each selector reads the largest level of width at most the resolution that meets all of these; if none does, it reads raw samples, with the same answer as before rollups:
 
@@ -1016,7 +1024,7 @@ From the 12 m level and coarser, a `rate` or `increase` window holding only one 
 
 **Freshness.** The newest part of every window comes from the finer levels and then from raw samples, so a refreshing panel shows the newest samples. A level's coverage is the time its builds have completed on every shard; anything else, holes included, is read from a finer level or raw.
 
-**Explain.** With `X-Pulsus-Explain: 1`, a range query whose grid follows its range has a first stage `rollup_grid`, with no statement, noted `resolution 2h, step 2h (asked 5m), 84 points, <first t> to <last t>`; a routed selector whose series the label cache could not answer has a stage `rollup_series` with the statement that reads its series and labels. A routed selector has a stage `rollup_route` naming the level's table, the function's use, the step and the range, and one stage `rollup_piece` per interval served, in time order, each with its statement and a note naming the table and column, or `raw`, and the interval (`metric_samples_720s.max served (lo, hi]`, `raw (lo, hi]`). `exactness` is `"rollup"` when a level served part of a selector; a route that read only raw samples, or only native histograms, is `"raw-exact"`.
+**Explain.** With `X-Pulsus-Explain: 1`, a range query answered on the changed grid has a first stage `rollup_grid`, with no statement, noted `resolution 2h, step 2h (asked 5m), 84 points, <first t> to <last t>`; a query answered on its own grid has none; a routed selector whose series the label cache could not answer has a stage `rollup_series` with the statement that reads its series and labels. A routed selector has a stage `rollup_route` naming the level's table, the function's use, the step and the range, and one stage `rollup_piece` per interval served, in time order, each with its statement and a note naming the table and column, or `raw`, and the interval (`metric_samples_720s.max served (lo, hi]`, `raw (lo, hi]`). `exactness` is `"rollup"` when a level served part of a selector; a route that read only raw samples, or only native histograms, is `"raw-exact"`.
 
 ---
 

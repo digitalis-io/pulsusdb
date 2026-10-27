@@ -49,8 +49,8 @@ services:
       context: ${PULSUS_E2E_ROOT}
     image: pulsusdb:e2e
     entrypoint: [ "/usr/local/share/pulsusdb/schema/schema.sh" ]
-    # Retention has no default (docs/configuration.md §7).
-    environment: { CLICKHOUSE_SERVER: "172.29.0.10", PULSUS_RETENTION_DAYS: "7" }
+    # Retention has no default (docs/configuration.md §7). No rollup levels: the reference comparison is per timestamp.
+    environment: { CLICKHOUSE_SERVER: "172.29.0.10", PULSUS_RETENTION_DAYS: "7", PULSUS_ROLLUP_LEVELS: "" }
     networks:
       pulsus-e2e-single:
         # .10 to .16 are taken by this file's other services; a collision

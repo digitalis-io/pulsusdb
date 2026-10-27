@@ -691,44 +691,60 @@ impl MetricsEngine {
         p: &MetricQueryParams,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<(QueryResult, pulsus_promql::Annotations), ReadError> {
-        // Issue #18 follow-up: with rollup levels, a range query is
-        // evaluated at the bucket ends of the resolution its time range
-        // selects, whatever step it asked (R1, R2); an instant query keeps
-        // its time and routes at the smallest level (R5). No grid, no
-        // routing.
+        // Issue #18 follow-up (r11): with rollup levels, a range query is
+        // evaluated at the multiples of `S`, the resolution its time range
+        // selects rounded up to the step asked, when some selector reads a
+        // level on that grid (R1, R2). Otherwise it is answered on its own
+        // grid with routing off. An instant query (`step == 0`) keeps its
+        // time and routes at the smallest level (R5).
         let levels = self
             .rollup_levels
             .as_ref()
             .and_then(|slot| slot.get())
             .filter(|l| !l.levels.is_empty());
-        let mut snapped = *p;
         let mut routing: Option<(std::sync::Arc<super::rollup::Levels>, i64)> = None;
+        let mut changed: Option<(
+            MetricQueryParams,
+            pulsus_promql::PlanParams,
+            pulsus_promql::QueryPlan,
+        )> = None;
         if let Some(levels) = levels {
-            if p.start_ms == p.end_ms {
+            if p.step_ms == 0 {
                 let smallest = levels.levels[0].res_ms;
                 routing = Some((levels, smallest));
             } else if let Some((res, grid)) = super::rollup::grid(p, &levels) {
-                if let Some(e) = explain.as_mut() {
-                    let points = (grid.end_ms - grid.start_ms) / res + 1;
-                    e.push(
-                        "rollup_grid",
-                        String::new(),
-                        Some(format!(
-                            "resolution {res_text}, step {res_text} (asked {}), {points} points, {} to {}",
-                            super::rollup::duration_text(p.step_ms),
-                            grid.start_ms.div_euclid(1000),
-                            grid.end_ms.div_euclid(1000),
-                            res_text = super::rollup::duration_text(res),
-                        )),
-                    );
+                let pp = grid.plan_params(self.config.experimental_functions, self.lookback_ms);
+                if let Ok(candidate) = pulsus_promql::plan(expr, pp)
+                    && super::rollup::any_routes(&candidate, &pp, &levels, res)
+                {
+                    if let Some(e) = explain.as_mut() {
+                        let points = (grid.end_ms - grid.start_ms) / grid.step_ms + 1;
+                        e.push(
+                            "rollup_grid",
+                            String::new(),
+                            Some(format!(
+                                "resolution {}, step {} (asked {}), {points} points, {} to {}",
+                                super::rollup::duration_text(res),
+                                super::rollup::duration_text(grid.step_ms),
+                                super::rollup::duration_text(p.step_ms),
+                                grid.start_ms.div_euclid(1000),
+                                grid.end_ms.div_euclid(1000),
+                            )),
+                        );
+                    }
+                    changed = Some((grid, pp, candidate));
+                    routing = Some((levels, res));
                 }
-                snapped = grid;
-                routing = Some((levels, res));
             }
         }
+        let (snapped, plan_params, plan) = match changed {
+            Some(x) => x,
+            None => {
+                let pp = p.plan_params(self.config.experimental_functions, self.lookback_ms);
+                (*p, pp, pulsus_promql::plan(expr, pp)?)
+            }
+        };
         let p = &snapped;
-        let plan_params = p.plan_params(self.config.experimental_functions, self.lookback_ms);
-        let plan = pulsus_promql::plan(expr, plan_params)?;
 
         // Issue #33 architect adjudication (superseding #31's ratified
         // zero-ClickHouse `count`/`group` AC and #40's instant-only gate on

@@ -210,14 +210,15 @@ pub struct Route {
 /// intervals, 11,001 points (`pulsus-server`'s `POINTS_CAP`).
 pub const MAX_GRID_POINTS: i128 = 11_001;
 
-/// Issue #18 follow-up, R1 and R2: a range query's resolution, the largest
-/// level whose switch point is at most `end − start`, and the grid of
-/// every bucket end in `(start, end]` at that resolution, whatever step
-/// was asked. `None` for an instant query, no levels, a grid with no
-/// point or a time outside `i64`, or more than [`MAX_GRID_POINTS`]: the
-/// query keeps its own grid and nothing routes.
+/// Issue #18 follow-up, R1 and R2 (r11): a range query's resolution, the
+/// largest level whose switch point is at most `end − start`, and the
+/// grid of the multiples of `S = res × ⌈step / res⌉` in `(start, end]`:
+/// never more points than asked. `None` for an instant query
+/// (`step == 0`), no levels, an `S` or a time outside `i64`, or a count
+/// outside 1 to [`MAX_GRID_POINTS`]: the query keeps its own grid. The
+/// caller keeps the grid only when [`any_routes`] on it.
 pub fn grid(p: &MetricQueryParams, levels: &Levels) -> Option<(i64, MetricQueryParams)> {
-    if p.start_ms == p.end_ms {
+    if p.step_ms <= 0 {
         return None;
     }
     let span = i128::from(p.end_ms) - i128::from(p.start_ms);
@@ -228,27 +229,34 @@ pub fn grid(p: &MetricQueryParams, levels: &Levels) -> Option<(i64, MetricQueryP
         .find(|l| l.res_ms > 0 && i128::from(l.from_ms) <= span)?
         .res_ms;
     let r = i128::from(res);
-    let lo = i128::from(p.start_ms).div_euclid(r);
-    let hi = i128::from(p.end_ms).div_euclid(r);
+    let step = i128::from(p.step_ms);
+    let s = r * ((step + r - 1) / r);
+    let s_ms = i64::try_from(s).ok()?;
+    let lo = i128::from(p.start_ms).div_euclid(s);
+    let hi = i128::from(p.end_ms).div_euclid(s);
     let count = hi - lo;
-    if count <= 0 || count > MAX_GRID_POINTS {
+    if count <= 0 || count > MAX_GRID_POINTS || count > span.div_euclid(step) + 1 {
         return None;
     }
-    let first = i64::try_from((lo + 1) * r).ok()?;
-    let last = i64::try_from(hi * r).ok()?;
+    let first = i64::try_from((lo + 1) * s).ok()?;
+    let last = i64::try_from(hi * s).ok()?;
     Some((
         res,
         MetricQueryParams {
             start_ms: first,
             end_ms: last,
-            step_ms: res,
+            step_ms: s_ms,
         },
     ))
 }
 
-/// STUB (tests first).
-pub fn any_routes(_plan: &QueryPlan, _p: &PlanParams, _levels: &Levels, _res: i64) -> bool {
-    false
+/// Issue #18 follow-up (r11): whether some selector of `plan`, planned on
+/// the grid `p`, reads a level of width at most `res`. Pure; decided
+/// before any fetch.
+pub fn any_routes(plan: &QueryPlan, p: &PlanParams, levels: &Levels, res: i64) -> bool {
+    plan.selectors
+        .iter()
+        .any(|sel| eligible(sel) && route(sel, p, levels, res).is_some())
 }
 
 /// Plan section 3 and issue #18 follow-up R3: the largest level of width

@@ -44,6 +44,10 @@ services:
       CLICKHOUSE_SERVER: "172.28.0.11" # ch-shard1's static ipv4_address
       PULSUS_CLUSTER: pulsus_test_cluster
       PULSUS_RETENTION_DAYS: "7"
+      # No rollup levels: the comparison with the reference is per
+      # timestamp, and a routed query answers at multiples of its effective
+      # step (issue #18 follow-up).
+      PULSUS_ROLLUP_LEVELS: ""
     # Healthy, not merely started: every statement carries `ON CLUSTER`,
     # which needs Keeper serving. Waiting only for the shards to start
     # failed with curl's exit 22; `schema-it-cluster` runs the same script
