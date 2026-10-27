@@ -113,7 +113,7 @@ SELECT toUInt32(uniqExact(shard_num)) AS shards FROM system.clusters WHERE clust
 
 | guard | rule (`fits`, `crates/pulsus-read/src/metrics/rollup.rs:281`; `excluded`, `crates/pulsus-read/src/metrics/rollup.rs:298`) |
 |---|---|
-| G1 range | a range function's range is a whole multiple of the width and at least one width, `counter_buckets` widths for `rate` and `increase`; otherwise a finer level that meets it, else raw. On a 7-day panel at step 5 m with `start` on a 2 h boundary, `rate(x[5m])` is widened to `rate(x[2h])` (R2a) and reads the 720 s level: 2 h is five 720 s buckets but not five 7200 s ones |
+| G1 range | a range function's range is a whole multiple of the width and at least one width, `counter_buckets` widths for `rate` and `increase`; otherwise a finer level that meets it, else raw. On a 7-day panel at step 5 m with `start` on a 2 h boundary, `rate(x[5m])` is widened to `rate(x[2h])` (R2a) and reads the 720 s level: 2 h is ten 720 s buckets, which meets the minimum of five, but only one 7200 s bucket |
 | G2 time | the window's end, the grid time minus `offset` (or the `@` time minus `offset`), is a bucket end of the level; otherwise a finer level whose width divides it, else raw. `x offset 90s` on a 7-day query reads the 5 s level |
 | G3 kind | `rollup_use` is set (§1); not in a subquery, `anchored` or `smoothed`, `info()`'s selector, or under a histogram-statistics function; the selector names its metric and carries no `__name__` matcher beside the name |
 
