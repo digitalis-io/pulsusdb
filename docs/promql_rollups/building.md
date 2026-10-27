@@ -1,6 +1,6 @@
 # PromQL rollups: building the levels
 
-**Built.** Part A (#742), part B (#744) and the follow-up that chooses the resolution by the query's time range (issue #18) are on `main`; every statement about code below is true of `main` with that follow-up. Tiering and a longer retention per level (#743) are not started.
+**Built.** Part A (#742), part B (#744) and the follow-up that chooses the resolution by the query's time range (issue #18) are on `main`; every statement about code below is true of `main` with that follow-up. Tiering of the raw tables (#743 part A) is on main; a level's own retention and move age (#743 part B) are not started.
 
 ## 1. The setting
 

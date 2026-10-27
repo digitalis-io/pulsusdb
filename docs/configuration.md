@@ -52,7 +52,7 @@ Retention is not set here: `schema/schema.sh` takes it (§7), and the binary rea
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PULSUS_STORAGE_POLICY` | unset | ClickHouse storage policy for all created tables |
+| `PULSUS_STORAGE_POLICY` | unset | ClickHouse storage policy for the created tables. With `PULSUS_COLD_VOLUME` set (§7), the tables that never move are created without it. `schema/schema.sh` refuses, before it drops anything, a policy any server of the cluster lacks |
 | `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` | empty | comma-separated trace attributes `spans` carries a bloom-filter index for, each `span.<key>` or `event.<key>`, the key dot-separated segments of letters, digits, `_` and `-`; at most 16, none twice, each key at most 128 bytes. `schema/schema.sh` checks the list before it contacts the server and builds one index per item and the reader hints a search whose filter requires `key = "<string>"` on one. Changing it is a schema rebuild; a reader and a schema that disagree answer the same, only slower. Each index adds about 3–5 MB to a `spans` insert or merge at the default `PULSUS_BATCH_BYTES`, and 41–53 B more per span in a push larger than that |
 | `PULSUS_LOG_ROLLUP_RESOLUTION` | `5s` | bucket size of the derived log count/bytes rollup (table named for it, e.g. `log_metrics_5s`); raw log/metric samples always store source timestamps verbatim — no resolution is assumed or imposed anywhere |
 | `PULSUS_METRICS_DEDUP_WINDOW` | `10000` | how many recent blocks `metric_landing` and each of the eight tables the views maintain remember for deduplication, so a resend of a block the server already accepted is dropped before it is stored again. A window of `W` blocks covers a steady rate of `W / 120` pushes a second, the landing insert's budget being 120 s: **83** at the default and **8333** at the maximum, rounding down. Above that a block's token can be evicted before its resend arrives. **Which engine setting carries it follows the deployment**: a clustered deployment renders these tables `Replicated*`, where the window in force is the replicated engines' own. On a single node there is no companion **time** window, the engine having `non_replicated_deduplication_window` and no seconds-based counterpart there — a block is remembered until that many newer blocks have arrived and is never forgotten on a timer, which is the safe direction for a resend. On a cluster there is one, and it is pinned at the server's own default of one hour rather than configured: a deployment that lowered it below the landing budget would forget a block's token while the writer is still entitled to resend under it. Accepted range `1..=1000000`; values outside this range are rejected at config load |
@@ -177,6 +177,10 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 | `PULSUS_ROLLUP_LEVELS` | `5,60,720,7200,86400` | the rollup levels in seconds, smallest first; empty for none. Refused with exit `2` unless: whole numbers, no leading zero, no empty item; each divides 86400; one below 60 divides 60; each greater than and a multiple of the one before; at most 8; and `2 × max(first, 60) + 870 ≤ 3600 × PULSUS_METRICS_LANDING_RETENTION_HOURS`. Choose levels above the scrape interval: a level at or below it holds about one sample per series and bucket or fewer, so it stores more than raw and saves no rows |
 | `PULSUS_ROLLUP_RANGES` | `3600,86400,604800,7776000` | the query range in seconds from which each level after the first is the resolution of a PromQL range query ([api.md](api.md) §3.6), one per level after the first, in level order; read only when there are levels, and empty for none. Stored in each level table's comment. Refused with exit `2`, the first failing rule the message: an empty item (`an empty item in '<text>'`); an item that is not a whole number from `1` to `999999999` with no leading zero (`<item> is not a whole number of seconds from 1 to 999999999`); not one for each level after the first (`<n> ranges for <m> levels: give one for each level after the first`); not increasing (`<a> then <b>: the ranges must increase`); shorter than its level (`<range> is shorter than its level <w>`) |
 | `PULSUS_ROLLUP_COUNTER_BUCKETS` | `5` | the buckets of a level a `rate` or `increase` range covers at least for that level to answer it. Stored in each level table's comment. A whole number from `2` to `1000` with no leading zero; anything else is exit `2`, `<v> is not a whole number from 2 to 1000`. One bucket would give a `rate` window one point at the levels under 720 s. The distances in [api.md](api.md) §3.6 hold for `5` |
+| `PULSUS_COLD_VOLUME` | unset: nothing moves | the volume of `PULSUS_STORAGE_POLICY` (§3) that old parts move to; letters, digits and `_`. Requires the policy; the volume must not be the policy's first, and the policy's `move_factor` must be `0` (`schema/schema.sh` checks every server before it drops anything, exit `1`) |
+| `PULSUS_METRICS_HOT_DAYS` | none: required when `PULSUS_COLD_VOLUME` is set, refused when it is not | days a metric sample stays on the local volume, from `1` to `PULSUS_RETENTION_DAYS`; the retention itself means never moves |
+| `PULSUS_LOGS_HOT_DAYS` | as above | the same for log lines and the log rollups |
+| `PULSUS_TRACES_HOT_DAYS` | as above | the same for spans and the trace tables read by time |
 
 **The binary reads the retention from the database.** At startup it reads the database comment and is not ready until the comment is exactly `retention_days=<N>`; its retry warning names the script. The trace read floor (a read that selects spans by a window reads no span that started `N` days or more before the request, [api.md](api.md) §4), the live-tail lower bound (`N` days and one more before the request) and `/api/v1/status/runtimeinfo`'s `storageRetention` all use that `N`. Changing retention is a rebuild with the script, which drops the database.
 
@@ -211,7 +215,67 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 | `trace_landing` | `received_ms` + `H` hours | whole part | hour of `received_ms` |
 | `traces` | the end of the UTC day of `last_start_ns` + `R` days | whole part | `day`, the UTC day of the earliest of the trace's spans in one push |
 
+With `PULSUS_COLD_VOLUME` set, a table of a Tiering family (below) also moves to the cold volume at its time column plus its family's `…_HOT_DAYS`; it is still removed at the time above.
+
 An hour is in the server's time zone. `month` is the UTC month of the log lines a stream registration covers; `last_seen` is the latest sample instant a series registration carried; `last_start_ns` is, in `tag_names` and `tag_values`, the latest start of a span carrying the tag and, in `traces`, the latest start of the trace's spans. A row due at the end of a UTC day plus `R` outlives every part of a table partitioned by UTC day that holds the samples or spans it describes, so a series, stream or trace is never found without its labels or its index while its data is stored. The landing tables' rows are read by nothing once their views have run, so their expiry deletes nothing a query reads.
+
+### Tiering
+
+With `PULSUS_STORAGE_POLICY` and `PULSUS_COLD_VOLUME` set, `schema/schema.sh` gives each table of a family a second TTL rule that moves its parts to the cold volume. A family whose move age equals `PULSUS_RETENTION_DAYS` never moves.
+
+| Family | Tables | Moves after |
+|--------|--------|-------------|
+| metrics | `metric_samples`, `metric_hist_samples`, `metric_exemplars` | `PULSUS_METRICS_HOT_DAYS` |
+| logs | `log_samples`, `log_metrics_<res>`, `log_patterns` | `PULSUS_LOGS_HOT_DAYS` |
+| traces | `spans`, `error_spans`, `tag_bucket_values`, `service_bucket_resources`, `service_edges` | `PULSUS_TRACES_HOT_DAYS` |
+| levels | `metric_samples_<N>s` | kept on the local volume |
+| never moves | `log_landing`, `log_streams`, `log_streams_idx`, `metric_labels`, `metric_label_index`, `metric_label_values`, `metric_landing`, `metric_metadata`, `metric_series`, `resources`, `tag_names`, `tag_values`, `trace_landing`, `traces` | created without `storage_policy`, on the server's `default` policy |
+
+A part moves when its newest row is older than the move age, so a UTC day `D` of raw data with move age `H` is local until `D + 1 + H` days; rows written for a day already moved go straight to the cold volume.
+
+Every server carries the policy, the same on every replica of every shard. For example, with `PULSUS_STORAGE_POLICY=tiered` and `PULSUS_COLD_VOLUME=cold`:
+
+```xml
+<clickhouse>
+  <storage_configuration>
+    <disks>
+      <cold_store>
+        <type>s3</type>
+        <endpoint>https://BUCKET-ENDPOINT/BUCKET/pulsus/{shard}/{replica}/</endpoint>
+        <use_environment_credentials>true</use_environment_credentials>
+      </cold_store>
+      <cold_cache>
+        <type>cache</type>
+        <disk>cold_store</disk>
+        <path>CACHE-DIRECTORY</path>
+        <max_size>CACHE-BYTES</max_size>
+      </cold_cache>
+    </disks>
+    <policies>
+      <tiered>
+        <volumes>
+          <hot><disk>default</disk></hot>
+          <cold><disk>cold_cache</disk></cold>
+        </volumes>
+        <move_factor>0</move_factor>
+      </tiered>
+    </policies>
+  </storage_configuration>
+</clickhouse>
+```
+
+The script's refusals, each printed as `schema.sh: <message>`. The first five are checked in this order before the server is contacted; the last, before anything is dropped:
+
+| Rule | Message | Exit |
+|------|---------|------|
+| 1 | `PULSUS_COLD_VOLUME is set and PULSUS_STORAGE_POLICY is not` | `2` |
+| 2 | `cold_volume must be letters, digits and underscores: <v>` | `2` |
+| 3 a | `<VAR> is not set; with PULSUS_COLD_VOLUME set each of PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS is required` | `2` |
+| 3 b | `<VAR> is set and PULSUS_COLD_VOLUME is not` | `2` |
+| 3 c | `<VAR> must be a whole number of days from 1 to <R>: <value>` | `2` |
+| before the drop | `storage policy '<p>' with a volume '<v>' after its first and move_factor 0 is defined on <n> of <m> hosts; every server's configuration must carry it (docs/configuration.md §3)`, without `with a volume … move_factor 0` when no cold volume is set | `1` |
+
+Rule 3 is checked for `PULSUS_METRICS_HOT_DAYS`, then `PULSUS_LOGS_HOT_DAYS`, then `PULSUS_TRACES_HOT_DAYS`, all of a, b and c for one before the next. `<VAR>` is the variable's name and `<R>` is `PULSUS_RETENTION_DAYS`.
 
 ## 8. Ruler (M7)
 
