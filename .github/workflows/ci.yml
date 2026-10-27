@@ -653,7 +653,9 @@ jobs:
       # registry on 2026-10-09 (issue #624, part 3d).
       # The two compose files under `ci/` carry the same digest and the
       # matching clickhouse-keeper one; this comment is the reason for all
-      # nine references.
+      # nine references. The object store's image (issue #743 part A) is
+      # pinned by digest too, in `ci/clickhouse-cluster/compose.yaml` and the
+      # `schema-it-tiering` job.
       #
       # The 24.8 start further down is deliberately left on its tag: it is
       # the negative test that the version floor is enforced, so what it
@@ -1509,7 +1511,9 @@ jobs:
       # registry on 2026-10-09 (issue #624, part 3d).
       # The two compose files under `ci/` carry the same digest and the
       # matching clickhouse-keeper one; this comment is the reason for all
-      # nine references.
+      # nine references. The object store's image (issue #743 part A) is
+      # pinned by digest too, in `ci/clickhouse-cluster/compose.yaml` and the
+      # `schema-it-tiering` job.
       #
       # The 24.8 start further down is deliberately left on its tag: it is
       # the negative test that the version floor is enforced, so what it
@@ -1518,6 +1522,8 @@ jobs:
         run: |
           docker run -d --name pulsus-ch-schema-it -p 19123:8123 -p 19000:9000 \
             -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
+            -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/config.d/storage.xml:/etc/clickhouse-server/config.d/storage.xml:ro \
+            -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/shard1/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro \
             clickhouse/clickhouse-server@sha256:d3fd302416d9523d5d64239d5713d1c16c20ecea2045ac70d7e941b376cb266e
           for _ in $(seq 1 30); do
             curl -sf http://localhost:19123/ping && break
@@ -1835,6 +1841,58 @@ jobs:
           path: target/test-summary/
           if-no-files-found: ignore
 
+  schema-it-tiering:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Issue #743 part A: one ClickHouse with a cold volume on a local
+      # object store, at compose.yaml's addresses so storage.xml serves both.
+      # The second bucket request makes a rerun pass when the bucket exists.
+      - name: Start the object store and ClickHouse 26.8
+        run: |
+          docker network create --subnet 172.28.0.0/24 pulsus-schema-it-cluster
+          docker run -d --name pulsus-store-it --network pulsus-schema-it-cluster --ip 172.28.0.30 \
+            -p 19900:9000 -e RUSTFS_ACCESS_KEY=pulsus-ci -e RUSTFS_SECRET_KEY=pulsus-ci-secret \
+            docker.io/rustfs/rustfs@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2
+          sign='--aws-sigv4 aws:amz:us-east-1:s3 --user pulsus-ci:pulsus-ci-secret'
+          ok=0
+          for _ in $(seq 1 30); do
+            # shellcheck disable=SC2086
+            if curl -sS --fail-with-body $sign -X PUT http://127.0.0.1:19900/pulsus-ci -o /dev/null ||
+               curl -sS --fail-with-body $sign "http://127.0.0.1:19900/pulsus-ci?list-type=2" -o /dev/null; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          [ "$ok" = 1 ]
+          docker run -d --name pulsus-ch-tiering-it --network pulsus-schema-it-cluster --ip 172.28.0.11 \
+            -p 19123:8123 -p 19000:9000 \
+            -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
+            -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/shard1/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro \
+            -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/config.d/storage.xml:/etc/clickhouse-server/config.d/storage.xml:ro \
+            clickhouse/clickhouse-server@sha256:d3fd302416d9523d5d64239d5713d1c16c20ecea2045ac70d7e941b376cb266e
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:19123/ping && break
+            sleep 1
+          done
+
+      - name: Live tiering tests
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-schema --test live_tiering
+
   # Issue #643: see `schema-it-logql`.
   schema-it-traceql:
     runs-on: ubuntu-latest
@@ -1862,7 +1920,9 @@ jobs:
       # registry on 2026-10-09 (issue #624, part 3d).
       # The two compose files under `ci/` carry the same digest and the
       # matching clickhouse-keeper one; this comment is the reason for all
-      # nine references.
+      # nine references. The object store's image (issue #743 part A) is
+      # pinned by digest too, in `ci/clickhouse-cluster/compose.yaml` and the
+      # `schema-it-tiering` job.
       #
       # The 24.8 start further down is deliberately left on its tag: it is
       # the negative test that the version floor is enforced, so what it
@@ -1871,6 +1931,8 @@ jobs:
         run: |
           docker run -d --name pulsus-ch-schema-it -p 19123:8123 -p 19000:9000 \
             -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
+            -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/config.d/storage.xml:/etc/clickhouse-server/config.d/storage.xml:ro \
+            -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/shard1/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro \
             clickhouse/clickhouse-server@sha256:d3fd302416d9523d5d64239d5713d1c16c20ecea2045ac70d7e941b376cb266e
           for _ in $(seq 1 30); do
             curl -sf http://localhost:19123/ping && break
@@ -2531,6 +2593,23 @@ jobs:
           echo "::error::cluster did not become healthy in time"
           docker ps -a
           exit 1
+
+      # Issue #743 part A: the bucket `config.d/storage.xml`'s cold disk
+      # writes to. The second request makes a rerun pass when it exists.
+      - name: Create the object-store bucket
+        run: |
+          sign='--aws-sigv4 aws:amz:us-east-1:s3 --user pulsus-ci:pulsus-ci-secret'
+          ok=0
+          for _ in $(seq 1 30); do
+            # shellcheck disable=SC2086
+            if curl -sS --fail-with-body $sign -X PUT http://127.0.0.1:19900/pulsus-ci -o /dev/null ||
+               curl -sS --fail-with-body $sign "http://127.0.0.1:19900/pulsus-ci?list-type=2" -o /dev/null; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          [ "$ok" = 1 ]
 
       # The clustered half of `schema/schema.sh`, created rather than
       # rendered. **This is the only leg that can tell a correct replication

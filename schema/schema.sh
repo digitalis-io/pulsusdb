@@ -14,6 +14,7 @@
 # Configuration comes from the environment (docs/configuration.md).
 # `PULSUS_RETENTION_DAYS` is required, and the binary reads it back from the
 # database. `PULSUS_CLUSTER` selects the clustered variant (`Replicated*`, `ON CLUSTER`, `_dist`).
+# PULSUS_STORAGE_POLICY and PULSUS_COLD_VOLUME move old parts to a cold volume (docs/configuration.md §3).
 #
 # ClickHouse's own `{shard}` and `{replica}` macros must reach the server as
 # those exact characters. Every substitution here is a double-brace
@@ -59,6 +60,10 @@ trace_dedup=${PULSUS_TRACE_DEDUP_WINDOW:-10000}
 rollup_levels=${PULSUS_ROLLUP_LEVELS-5,60,720,7200,86400}
 rollup_ranges=${PULSUS_ROLLUP_RANGES-3600,86400,604800,7776000}
 counter_buckets=${PULSUS_ROLLUP_COUNTER_BUCKETS-5}
+cold_volume=${PULSUS_COLD_VOLUME:-}
+metrics_hot=${PULSUS_METRICS_HOT_DAYS:-}
+logs_hot=${PULSUS_LOGS_HOT_DAYS:-}
+traces_hot=${PULSUS_TRACES_HOT_DAYS:-}
 
 # `pulsus_schema::DEDUP_WINDOW_SECONDS`. Not a knob: the startup check in
 # `pulsus-server` holds it against the landing budget.
@@ -235,6 +240,48 @@ if [ "$bad_counter_buckets" -eq 1 ] || [ "$counter_buckets" -lt 2 ] ||
     exit 2
 fi
 
+# Issue #743 part A: tiering. The same rules, in the same order and with the
+# same messages, as `pulsus_schema::validate_tiering`.
+bad_tiering() {
+    echo "schema.sh: $1" >&2
+    exit 2
+}
+if [ -n "$cold_volume" ]; then
+    [ -n "$storage_policy" ] ||
+        bad_tiering "PULSUS_COLD_VOLUME is set and PULSUS_STORAGE_POLICY is not"
+    case "$cold_volume" in
+        *[!A-Za-z0-9_]*) bad_tiering "cold_volume must be letters, digits and underscores: $cold_volume" ;;
+    esac
+fi
+for pair in "PULSUS_METRICS_HOT_DAYS:$metrics_hot" "PULSUS_LOGS_HOT_DAYS:$logs_hot" \
+            "PULSUS_TRACES_HOT_DAYS:$traces_hot"; do
+    what=${pair%%:*}
+    value=${pair#*:}
+    if [ -n "$cold_volume" ] && [ -z "$value" ]; then
+        bad_tiering "$what is not set; with PULSUS_COLD_VOLUME set each of PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS is required"
+    fi
+    if [ -z "$cold_volume" ] && [ -n "$value" ]; then
+        bad_tiering "$what is set and PULSUS_COLD_VOLUME is not"
+    fi
+    [ -n "$value" ] || continue
+    case "$value" in
+        0* | *[!0-9]* | ???????????*)
+            bad_tiering "$what must be a whole number of days from 1 to $retention_days: $value" ;;
+    esac
+    [ "$value" -le "$retention_days" ] ||
+        bad_tiering "$what must be a whole number of days from 1 to $retention_days: $value"
+done
+# A family moves when a cold volume is set and its move age is under the
+# retention; its `--@cold-<family>` lines are kept, else dropped.
+cold_metrics='/^--@cold-metrics /d'
+cold_logs='/^--@cold-logs /d'
+cold_traces='/^--@cold-traces /d'
+if [ -n "$cold_volume" ]; then
+    [ "$metrics_hot" -ge "$retention_days" ] || cold_metrics='s/^--@cold-metrics *//'
+    [ "$logs_hot" -ge "$retention_days" ] || cold_logs='s/^--@cold-logs *//'
+    [ "$traces_hot" -ge "$retention_days" ] || cold_traces='s/^--@cold-traces *//'
+fi
+
 if [ "$mode" = cluster ] && [ -z "$cluster" ]; then
     echo "schema.sh: --mode cluster needs PULSUS_CLUSTER set to the cluster name" >&2
     exit 2
@@ -332,6 +379,10 @@ fi
 
 policy_token=""
 [ -z "$storage_policy" ] || policy_token=", storage_policy = '$storage_policy'"
+# The tables that never move (docs/configuration.md §3) are on the server's
+# `default` policy once a cold volume is set, so nothing can move them.
+policy_local_token=$policy_token
+[ -z "$cold_volume" ] || policy_local_token=""
 
 other=single
 [ "$mode" = single ] && other=cluster
@@ -397,7 +448,8 @@ expand_levels() {
 }
 
 render() {
-    expand_levels < "$sql" | sed -e "/^--@$other /d" -e "s/^--@$mode *//" -e "/^--/d" |
+    expand_levels < "$sql" | sed -e "/^--@$other /d" -e "s/^--@$mode *//" \
+        -e "$cold_metrics" -e "$cold_logs" -e "$cold_traces" -e "/^--/d" |
         sed -e "s|{{db}}|$db|g" \
             -e "s|{{on_cluster}}|$on_cluster|g" \
             -e "s|{{cluster}}|$cluster_token|g" \
@@ -414,7 +466,12 @@ render() {
             -e "s|{{trace_dedup_window}}|$trace_dedup|g" \
             -e "s|{{dedup_window_seconds}}|$dedup_window_seconds|g" \
             -e "s|{{graph_job_max_rows}}|$graph_job_max_rows|g" \
-            -e "s|{{storage_policy}}|$policy_token|g" |
+            -e "s|{{storage_policy}}|$policy_token|g" \
+            -e "s|{{storage_policy_local}}|$policy_local_token|g" \
+            -e "s|{{cold_volume}}|$cold_volume|g" \
+            -e "s|{{metrics_hot_days}}|$metrics_hot|g" \
+            -e "s|{{logs_hot_days}}|$logs_hot|g" \
+            -e "s|{{traces_hot_days}}|$traces_hot|g" |
         TRACE_ATTR_INDEXES=$attr_indexes awk '{
             i = index($0, "{{trace_attr_indexes}}")
             if (i) $0 = substr($0, 1, i - 1) ENVIRON["TRACE_ATTR_INDEXES"] substr($0, i + 22)
@@ -557,6 +614,33 @@ within ${wait_seconds}s; ON CLUSTER DDL would fail on the rest" >&2
         exit 1
     fi
     echo "schema.sh: all $want_hosts hosts in cluster '$cluster' answered"
+fi
+
+# Issue #743: the policy, and its cold volume, exist on every host before
+# anything is dropped; a server refuses the first CREATE otherwise, after the
+# drop. The cold volume is not the first, and the policy moves nothing for
+# disk pressure (`move_factor` 0), so only the TTL rules move parts.
+if [ -n "$storage_policy" ]; then
+    if [ -n "$cold_volume" ]; then
+        policy_cond="volume_name = '$cold_volume' AND volume_priority > 1 AND move_factor = 0"
+        policy_what="storage policy '$storage_policy' with a volume '$cold_volume' after its first and move_factor 0"
+    else
+        policy_cond="volume_priority = 1"
+        policy_what="storage policy '$storage_policy'"
+    fi
+    if [ "$mode" = cluster ]; then
+        policy_from="clusterAllReplicas('$cluster', system.storage_policies)"
+        policy_want=$want_hosts
+    else
+        policy_from="system.storage_policies"
+        policy_want=1
+    fi
+    policy_have=$(ask "SELECT count() FROM $policy_from \
+                       WHERE policy_name = '$storage_policy' AND $policy_cond FORMAT TSVRaw")
+    if [ "$policy_have" != "$policy_want" ]; then
+        echo "schema.sh: $policy_what is defined on $policy_have of $policy_want hosts; every server's configuration must carry it (docs/configuration.md §3)" >&2
+        exit 1
+    fi
 fi
 
 tmp=$(mktemp -d)

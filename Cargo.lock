@@ -1822,6 +1822,7 @@ dependencies = [
  "pulsus-schema-testkit",
  "pulsus-testkit",
  "serde",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

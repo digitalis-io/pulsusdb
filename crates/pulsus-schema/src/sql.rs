@@ -20,6 +20,12 @@ pub const SCHEMA_SQL: &str = include_str!("../../../schema/schema.sql");
 const SINGLE: &str = "--@single";
 const CLUSTER: &str = "--@cluster";
 
+/// The move clause of a table of each family (issue #743 part A): kept when
+/// that family moves, dropped otherwise.
+const COLD_METRICS: &str = "--@cold-metrics";
+const COLD_LOGS: &str = "--@cold-logs";
+const COLD_TRACES: &str = "--@cold-traces";
+
 /// The file with its level block expanded for the context's rollup levels
 /// (issue #18), the other variant's lines dropped, this variant's markers
 /// stripped, comments removed and every `{{token}}` resolved.
@@ -42,7 +48,21 @@ pub fn rendered(ctx: &RenderCtx) -> String {
         ),
     );
     let mut out = String::with_capacity(expanded.len());
-    for line in expanded.lines() {
+    'lines: for line in expanded.lines() {
+        // Issue #743 part A: a family's move clause, kept when it moves.
+        for (marker, hot_days) in [
+            (COLD_METRICS, ctx.metrics_hot_days),
+            (COLD_LOGS, ctx.logs_hot_days),
+            (COLD_TRACES, ctx.traces_hot_days),
+        ] {
+            if let Some(rest) = marked(line, marker) {
+                if ctx.moves(hot_days) {
+                    out.push_str(rest);
+                    out.push('\n');
+                }
+                continue 'lines;
+            }
+        }
         let line = match marked(line, mine) {
             Some(rest) => rest,
             None => {
@@ -199,11 +219,13 @@ mod tests {
         assert_eq!(marked("ENGINE = x", SINGLE), None);
     }
 
-    /// Only the two mode markers and the four level markers (issue #18)
-    /// may prefix a line with `--@`: another would reach the server as text.
+    /// Only the two mode markers, the four level markers (issue #18) and the
+    /// three cold markers (issue #743 part A) may prefix a line with `--@`:
+    /// another would reach the server as text.
     #[test]
-    fn the_file_carries_no_marker_but_the_two_modes_and_the_level_markers() {
+    fn the_file_carries_no_marker_but_the_two_modes_and_the_level_and_the_cold_markers() {
         let mut level_lines = 0;
+        let mut cold_lines = [0usize; 3];
         for line in SCHEMA_SQL.lines() {
             if !line.starts_with("--@") {
                 continue;
@@ -217,11 +239,24 @@ mod tests {
             .iter()
             .any(|m| line.starts_with(m));
             level_lines += usize::from(level);
+            let cold = [COLD_METRICS, COLD_LOGS, COLD_TRACES].map(|m| marked(line, m).is_some());
+            for (n, c) in cold_lines.iter_mut().zip(cold) {
+                *n += usize::from(c);
+            }
             assert!(
-                level || marked(line, SINGLE).is_some() || marked(line, CLUSTER).is_some(),
+                level
+                    || cold.contains(&true)
+                    || marked(line, SINGLE).is_some()
+                    || marked(line, CLUSTER).is_some(),
                 "unknown marker: {line}"
             );
         }
         assert!(level_lines > 0, "the file carries the level block");
+        for (marker, n) in [COLD_METRICS, COLD_LOGS, COLD_TRACES]
+            .iter()
+            .zip(cold_lines)
+        {
+            assert!(n > 0, "the file carries a {marker} line");
+        }
     }
 }

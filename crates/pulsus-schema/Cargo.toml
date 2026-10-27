@@ -26,3 +26,5 @@ pulsus-read = { path = "../pulsus-read" }
 # exit 0, so a CI wiring regression was silent.
 pulsus-testkit = { path = "../pulsus-testkit" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Issue #743 part A: the digests that pin the render with no cold volume.
+sha2.workspace = true

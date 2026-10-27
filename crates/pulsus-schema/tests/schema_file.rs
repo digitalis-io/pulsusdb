@@ -494,6 +494,23 @@ fn the_script_renders_exactly_what_this_crate_renders() {
                 rollup_levels: vec![15, 60, 720],
                 rollup_ranges: vec![3600, 86400],
                 rollup_counter_buckets: 7,
+                // Issue #743 part A: the metrics and traces move, the logs
+                // at the retention do not.
+                cold_volume: Some("cold".to_string()),
+                metrics_hot_days: Some(5),
+                logs_hot_days: Some(31),
+                traces_hot_days: Some(6),
+            },
+        ),
+        (
+            "tiering, no family moves",
+            RenderCtx {
+                storage_policy: Some("tiered".to_string()),
+                cold_volume: Some("cold".to_string()),
+                metrics_hot_days: Some(7),
+                logs_hot_days: Some(7),
+                traces_hot_days: Some(7),
+                ..single()
             },
         ),
         (
@@ -582,6 +599,26 @@ fn the_script_renders_exactly_what_this_crate_renders() {
             Some(p) => cmd.env("PULSUS_STORAGE_POLICY", p),
             None => cmd.env_remove("PULSUS_STORAGE_POLICY"),
         };
+        for var in [
+            "PULSUS_COLD_VOLUME",
+            "PULSUS_METRICS_HOT_DAYS",
+            "PULSUS_LOGS_HOT_DAYS",
+            "PULSUS_TRACES_HOT_DAYS",
+        ] {
+            cmd.env_remove(var);
+        }
+        if let Some(v) = &ctx.cold_volume {
+            cmd.env("PULSUS_COLD_VOLUME", v);
+        }
+        for (var, days) in [
+            ("PULSUS_METRICS_HOT_DAYS", ctx.metrics_hot_days),
+            ("PULSUS_LOGS_HOT_DAYS", ctx.logs_hot_days),
+            ("PULSUS_TRACES_HOT_DAYS", ctx.traces_hot_days),
+        ] {
+            if let Some(days) = days {
+                cmd.env(var, days.to_string());
+            }
+        }
 
         let out = cmd.output().expect("the script runs");
         assert!(
@@ -3033,4 +3070,411 @@ fn the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets() {
     assert_eq!(code, Some(0), "no levels: {err}");
     assert!(!out.contains("rollup_res_ms="), "no level objects");
     assert_eq!(pulsus_schema::parse_rollup_ranges("1,2", &[]), Ok(vec![]));
+}
+
+/// `schema.sh --print` with an empty environment but for `PATH`, the given
+/// variables and arguments: its exit code, standard output as the bytes it
+/// wrote, and standard error.
+fn script_clean(vars: &[(&str, &str)], args: &[&str]) -> (Option<i32>, Vec<u8>, String) {
+    let root = repo_root();
+    let mut cmd = Command::new("sh");
+    cmd.arg(root.join("schema/schema.sh"))
+        .args(args)
+        .arg("--print")
+        .current_dir(&root)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").expect("PATH is set"));
+    for (var, value) in vars {
+        cmd.env(var, value);
+    }
+    let out = cmd.output().expect("run schema.sh");
+    (
+        out.status.code(),
+        out.stdout,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// **A0 (issue #743 part A): with no cold volume the schema renders as it
+/// did before tiering.** The script's raw output is pinned by its digest,
+/// and the crate's render is the same bytes. A later schema change
+/// replaces the three digests and says so in its commit.
+#[test]
+fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
+    let tiered_ctx = RenderCtx {
+        storage_policy: Some("tiered".to_string()),
+        ..clustered()
+    };
+    let cases = [
+        (
+            "single-node",
+            vec![],
+            vec!["--mode", "single"],
+            single(),
+            "8c45842fa4466018fa606e9b01797550efec3df166c6ca7ea23afc9978ab0488",
+        ),
+        (
+            "clustered",
+            vec![("PULSUS_CLUSTER", "prod")],
+            vec![],
+            clustered(),
+            "3b2df5f94dc6825bc4914e6fc169fd5dfb7654a878df7a4487b83c99ed1cf4b7",
+        ),
+        (
+            "clustered with a storage policy",
+            vec![
+                ("PULSUS_CLUSTER", "prod"),
+                ("PULSUS_STORAGE_POLICY", "tiered"),
+            ],
+            vec![],
+            tiered_ctx,
+            "27c7a0dea6385a67ca9c7f031055e0fd0891271128edc93279267109478216e3",
+        ),
+    ];
+    for (what, extra, args, ctx, digest) in cases {
+        let mut vars = vec![("CLICKHOUSE_DB", "pulsus"), ("PULSUS_RETENTION_DAYS", "7")];
+        vars.extend(extra);
+        let (code, out, err) = script_clean(&vars, &args);
+        assert_eq!(code, Some(0), "{what}: the script refused: {err}");
+        assert_eq!(sha256_hex(&out), digest, "{what}: the script's bytes");
+        assert!(
+            rendered(&ctx).as_bytes() == out.as_slice(),
+            "{what}: the crate's bytes must equal the script's"
+        );
+    }
+}
+
+/// The variable a `TieringInput` text comes from, in the order the script
+/// and the crate check them.
+const HOT_DAYS_VARS: [&str; 3] = [
+    "PULSUS_METRICS_HOT_DAYS",
+    "PULSUS_LOGS_HOT_DAYS",
+    "PULSUS_TRACES_HOT_DAYS",
+];
+
+/// One set of tiering inputs: the storage policy, the cold volume and the
+/// metrics, logs and traces move ages; `None` leaves a variable unset.
+type TieringCase<'a> = (Option<&'a str>, Option<&'a str>, [Option<&'a str>; 3]);
+
+/// `schema.sh --mode single --print` with `PULSUS_RETENTION_DAYS=30` and
+/// the case's variables, and `validate_tiering` over the same inputs.
+fn both_tiering(
+    case: TieringCase<'_>,
+) -> (
+    (Option<i32>, String),
+    Result<pulsus_schema::Tiering, String>,
+) {
+    let (policy, volume, hot) = case;
+    let mut vars = vec![("PULSUS_RETENTION_DAYS", "30")];
+    if let Some(p) = policy {
+        vars.push(("PULSUS_STORAGE_POLICY", p));
+    }
+    if let Some(v) = volume {
+        vars.push(("PULSUS_COLD_VOLUME", v));
+    }
+    for (var, value) in HOT_DAYS_VARS.iter().zip(hot) {
+        if let Some(value) = value {
+            vars.push((var, value));
+        }
+    }
+    let (code, _, err) = script_clean(&vars, &["--mode", "single"]);
+    let from_crate = pulsus_schema::validate_tiering(&pulsus_schema::TieringInput {
+        storage_policy: policy,
+        cold_volume: volume,
+        retention_days: 30,
+        metrics_hot_days: hot[0],
+        logs_hot_days: hot[1],
+        traces_hot_days: hot[2],
+    });
+    ((code, err), from_crate)
+}
+
+/// **A1 (issue #743 part A): the script and the crate refuse the same
+/// tiering settings, with the same message, and accept the same.** The
+/// overlapping cases pin which rule is reported first.
+#[test]
+fn the_script_and_the_crate_refuse_the_same_tiering_settings() {
+    const MISSING: &str = "is not set; with PULSUS_COLD_VOLUME set each of \
+        PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS is required";
+    let two = Some("2");
+    let mut cases: Vec<(&str, TieringCase<'_>, String)> = vec![
+        (
+            "rule 1",
+            (None, Some("cold"), [two, two, two]),
+            "PULSUS_COLD_VOLUME is set and PULSUS_STORAGE_POLICY is not".to_string(),
+        ),
+        (
+            "rule 2",
+            (Some("p"), Some("co-ld"), [two, two, two]),
+            "cold_volume must be letters, digits and underscores: co-ld".to_string(),
+        ),
+        (
+            "3a",
+            (Some("p"), Some("cold"), [None, two, two]),
+            format!("PULSUS_METRICS_HOT_DAYS {MISSING}"),
+        ),
+        (
+            "4a",
+            (Some("p"), Some("cold"), [two, None, two]),
+            format!("PULSUS_LOGS_HOT_DAYS {MISSING}"),
+        ),
+        (
+            "5a",
+            (Some("p"), Some("cold"), [two, two, None]),
+            format!("PULSUS_TRACES_HOT_DAYS {MISSING}"),
+        ),
+        (
+            "3b",
+            (None, None, [two, None, None]),
+            "PULSUS_METRICS_HOT_DAYS is set and PULSUS_COLD_VOLUME is not".to_string(),
+        ),
+        (
+            "4b",
+            (Some("p"), None, [None, two, None]),
+            "PULSUS_LOGS_HOT_DAYS is set and PULSUS_COLD_VOLUME is not".to_string(),
+        ),
+        (
+            "5b",
+            (None, None, [None, None, two]),
+            "PULSUS_TRACES_HOT_DAYS is set and PULSUS_COLD_VOLUME is not".to_string(),
+        ),
+        (
+            "4c",
+            (Some("p"), Some("cold"), [two, Some("0"), two]),
+            "PULSUS_LOGS_HOT_DAYS must be a whole number of days from 1 to 30: 0".to_string(),
+        ),
+        (
+            "5c",
+            (Some("p"), Some("cold"), [two, two, Some("31")]),
+            "PULSUS_TRACES_HOT_DAYS must be a whole number of days from 1 to 30: 31".to_string(),
+        ),
+        // The overlapping cases: each breaks two rules, and the message is
+        // the first rule's.
+        (
+            "(i) rule 1 before rule 2",
+            (None, Some("co-ld"), [None, None, None]),
+            "PULSUS_COLD_VOLUME is set and PULSUS_STORAGE_POLICY is not".to_string(),
+        ),
+        (
+            "(ii) rule 2 before 3a",
+            (Some("p"), Some("co-ld"), [None, None, None]),
+            "cold_volume must be letters, digits and underscores: co-ld".to_string(),
+        ),
+        (
+            "(iii) 3a before 4c",
+            (Some("p"), Some("cold"), [None, Some("0"), None]),
+            format!("PULSUS_METRICS_HOT_DAYS {MISSING}"),
+        ),
+        (
+            "(iv) 3c before 4a",
+            (Some("p"), Some("cold"), [Some("31"), None, None]),
+            "PULSUS_METRICS_HOT_DAYS must be a whole number of days from 1 to 30: 31".to_string(),
+        ),
+        (
+            "(v) 3b before 3c",
+            (None, None, [Some("0"), Some("0"), None]),
+            "PULSUS_METRICS_HOT_DAYS is set and PULSUS_COLD_VOLUME is not".to_string(),
+        ),
+    ];
+    for bad in ["0", "31", "030", "abc", "12345678901"] {
+        cases.push((
+            "3c",
+            (Some("p"), Some("cold"), [Some(bad), two, two]),
+            format!("PULSUS_METRICS_HOT_DAYS must be a whole number of days from 1 to 30: {bad}"),
+        ));
+    }
+    for (what, case, message) in cases {
+        let ((code, err), from_crate) = both_tiering(case);
+        assert_eq!(
+            (code, err.trim_end()),
+            (Some(2), format!("schema.sh: {message}").as_str()),
+            "{what} {case:?}: the script must refuse with the rule's message"
+        );
+        assert_eq!(
+            from_crate,
+            Err(message.clone()),
+            "{what} {case:?}: the crate must refuse with the same message"
+        );
+    }
+
+    let ((code, err), from_crate) =
+        both_tiering((Some("p"), Some("cold"), [Some("1"), Some("30"), two]));
+    assert_eq!(code, Some(0), "every age from 1 to the retention: {err}");
+    assert_eq!(
+        from_crate,
+        Ok(pulsus_schema::Tiering {
+            cold_volume: Some("cold".to_string()),
+            metrics_hot_days: Some(1),
+            logs_hot_days: Some(30),
+            traces_hot_days: Some(2),
+        })
+    );
+    let ((code, err), from_crate) = both_tiering((None, None, [None, None, None]));
+    assert_eq!(code, Some(0), "no tiering variable: {err}");
+    assert_eq!(
+        from_crate,
+        Ok(pulsus_schema::Tiering {
+            cold_volume: None,
+            metrics_hot_days: None,
+            logs_hot_days: None,
+            traces_hot_days: None,
+        })
+    );
+}
+
+/// The tables of the default render, by name, without the routing
+/// wrappers: each `CREATE TABLE` statement that is not `Distributed`.
+fn local_tables(ctx: &RenderCtx) -> std::collections::BTreeMap<String, String> {
+    let head = format!("CREATE TABLE IF NOT EXISTS {}.", ctx.db);
+    let mut out = std::collections::BTreeMap::new();
+    for stmt in rendered_statements(ctx) {
+        let Some(rest) = stmt.strip_prefix(&head) else {
+            continue;
+        };
+        if stmt.contains("ENGINE = Distributed") {
+            continue;
+        }
+        let name = rest
+            .split(|c: char| c.is_whitespace() || c == '(')
+            .next()
+            .expect("a table name")
+            .to_string();
+        assert!(
+            out.insert(name.clone(), stmt.clone()).is_none(),
+            "{name} is created twice"
+        );
+    }
+    out
+}
+
+const METRICS_FAMILY: [&str; 3] = ["metric_samples", "metric_hist_samples", "metric_exemplars"];
+const LOGS_FAMILY: [&str; 3] = ["log_samples", "log_metrics_5s", "log_patterns"];
+const TRACES_FAMILY: [&str; 5] = [
+    "spans",
+    "error_spans",
+    "tag_bucket_values",
+    "service_bucket_resources",
+    "service_edges",
+];
+/// The fourteen tables that never move (docs/configuration.md §7).
+const NEVER_MOVE: [&str; 14] = [
+    "log_landing",
+    "log_streams",
+    "log_streams_idx",
+    "metric_labels",
+    "metric_label_index",
+    "metric_label_values",
+    "metric_landing",
+    "metric_metadata",
+    "metric_series",
+    "resources",
+    "tag_names",
+    "tag_values",
+    "trace_landing",
+    "traces",
+];
+
+/// The move line issue #743 part A's plan (§3.4) gives `table`, at `days`.
+fn move_line(table: &str, days: u32) -> String {
+    let time = match table {
+        "metric_samples" | "metric_hist_samples" | "metric_exemplars" => "intDiv(unix_milli, 1000)",
+        "log_samples" => "intDiv(timestamp_ns, 1000000000)",
+        "log_metrics_5s" | "log_patterns" => "intDiv(bucket_ns, 1000000000)",
+        "spans" | "error_spans" => "intDiv(start_ns, 1000000000)",
+        "tag_bucket_values" | "service_bucket_resources" => {
+            "intDiv(bucket * 300000000000, 1000000000)"
+        }
+        "service_edges" => "toUInt32(minute) - if(conn_type = '', 240, 0)",
+        other => panic!("{other} has no move line"),
+    };
+    format!(", toDateTime(least({time} + ({days} * 86400), 4294967295)) TO VOLUME 'cold'")
+}
+
+/// Per local table: its ` TO VOLUME 'cold'` count, and whether it carries
+/// `storage_policy = 'tiered'`.
+fn assert_tiering(what: &str, ctx: &RenderCtx, moving: &[(&str, u32)]) {
+    let tables = local_tables(ctx);
+    assert_eq!(tables.len(), 30, "{what}: thirty tables");
+    for name in NEVER_MOVE {
+        assert!(tables.contains_key(name), "{what}: {name} is rendered");
+    }
+    for (name, stmt) in &tables {
+        let moves = stmt.matches(" TO VOLUME 'cold'").count();
+        match moving.iter().find(|(t, _)| t == name) {
+            Some((_, days)) => {
+                assert_eq!(moves, 1, "{what}: {name} carries one move clause");
+                let want = move_line(name, *days);
+                assert!(
+                    stmt.lines().any(|l| l == want),
+                    "{what}: {name} carries `{want}`:\n{stmt}"
+                );
+            }
+            None => assert_eq!(moves, 0, "{what}: {name} carries no move clause"),
+        }
+        let policy = stmt.contains("storage_policy = 'tiered'");
+        let never = NEVER_MOVE.contains(&name.as_str());
+        match (ctx.cold_volume.is_some(), never) {
+            (true, true) => assert!(
+                !stmt.contains("storage_policy"),
+                "{what}: {name} never moves and is on the server's default policy:\n{stmt}"
+            ),
+            _ => assert!(policy, "{what}: {name} is on the policy:\n{stmt}"),
+        }
+    }
+}
+
+/// **A2 (issue #743 part A): the move clauses render only for a family
+/// that moves**, in both modes; the tables that never move lose the
+/// policy, and without a cold volume nothing changes.
+#[test]
+fn the_move_clauses_render_only_for_a_family_that_moves() {
+    for (mode, base) in [("single-node", single()), ("clustered", clustered())] {
+        let tiered = RenderCtx {
+            retention_days: 30,
+            storage_policy: Some("tiered".to_string()),
+            cold_volume: Some("cold".to_string()),
+            metrics_hot_days: Some(2),
+            logs_hot_days: Some(3),
+            traces_hot_days: Some(30),
+            ..base.clone()
+        };
+        let mut moving: Vec<(&str, u32)> = METRICS_FAMILY.iter().map(|t| (*t, 2)).collect();
+        moving.extend(LOGS_FAMILY.iter().map(|t| (*t, 3)));
+        assert_tiering(&format!("{mode}, with the volume"), &tiered, &moving);
+
+        let untiered = RenderCtx {
+            cold_volume: None,
+            metrics_hot_days: None,
+            logs_hot_days: None,
+            traces_hot_days: None,
+            ..tiered
+        };
+        assert_tiering(&format!("{mode}, without the volume"), &untiered, &[]);
+    }
+}
+
+/// **A2b (issue #743 part A): every trace table carries its move clause.**
+#[test]
+fn every_trace_table_carries_its_move_clause() {
+    for (mode, base) in [("single-node", single()), ("clustered", clustered())] {
+        let ctx = RenderCtx {
+            retention_days: 30,
+            storage_policy: Some("tiered".to_string()),
+            cold_volume: Some("cold".to_string()),
+            metrics_hot_days: Some(30),
+            logs_hot_days: Some(30),
+            traces_hot_days: Some(3),
+            ..base
+        };
+        let moving: Vec<(&str, u32)> = TRACES_FAMILY.iter().map(|t| (*t, 3)).collect();
+        assert_tiering(mode, &ctx, &moving);
+    }
 }

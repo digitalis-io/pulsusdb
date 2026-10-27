@@ -11,6 +11,14 @@
 -- server as those exact characters: never write a single-brace token here,
 -- and never add a substitution that matches one.
 --
+-- COLD MARKERS. A line prefixed `--@cold-metrics`, `--@cold-logs` or
+-- `--@cold-traces` is the move clause of a table of that family (issue
+-- #743): kept, marker and spaces removed, when PULSUS_COLD_VOLUME is set and
+-- the family's move age is under the retention; dropped otherwise.
+-- `{{storage_policy_local}}` is `{{storage_policy}}` without a cold volume
+-- and empty with one: the tables that never move are then on the server's
+-- `default` policy.
+--
 -- A REPLICATION PATH NAMES ITS OWN TABLE. The paths are written out rather
 -- than derived, so a wrong one is a per-table error. Nineteen tables, and
 -- one per rollup level, take `/clickhouse/tables/{shard}/` and six take
@@ -49,8 +57,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_landing{{on_cluster}}
 PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
 ORDER BY (org_id, kind, service, fingerprint, timestamp_ns)
 TTL toDateTime(least(intDiv(received_ms, 1000) + ({{log_landing_retention_hours}} * 3600), 4294967295))
---@single  SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
---@cluster SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.log_metrics_{{log_rollup_suffix}}{{on_cluster}}
 (
@@ -68,6 +76,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_metrics_{{log_rollup_suffix}}{{on_cluster}
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns), 'UTC')
 ORDER BY (org_id, fingerprint, bucket_ns)
 TTL toDateTime(least(intDiv(bucket_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@cold-logs , toDateTime(least(intDiv(bucket_ns, 1000000000) + ({{logs_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, deduplicate_merge_projection_mode = 'rebuild', lightweight_mutation_projection_mode = 'rebuild', non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, deduplicate_merge_projection_mode = 'rebuild', lightweight_mutation_projection_mode = 'rebuild', replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
@@ -84,6 +93,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_patterns{{on_cluster}}
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns), 'UTC')
 ORDER BY (org_id, fingerprint, bucket_ns, pattern, level)
 TTL toDateTime(least(intDiv(bucket_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@cold-logs , toDateTime(least(intDiv(bucket_ns, 1000000000) + ({{logs_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
@@ -104,6 +114,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_samples{{on_cluster}}
 PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC')
 ORDER BY (org_id, service, fingerprint, timestamp_ns)
 TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@cold-logs , toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{logs_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
@@ -121,8 +132,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_streams{{on_cluster}}
 PARTITION BY month
 ORDER BY (org_id, fingerprint)
 TTL toDateTime(least((toUInt32(addMonths(month, 1)) * 86400) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
---@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.log_streams_idx{{on_cluster}}
 (
@@ -137,8 +148,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_streams_idx{{on_cluster}}
 PARTITION BY month
 ORDER BY (org_id, key, val, fingerprint)
 TTL toDateTime(least((toUInt32(addMonths(month, 1)) * 86400) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
---@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.metric_exemplars{{on_cluster}}
 (
@@ -155,6 +166,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_exemplars{{on_cluster}}
 PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC')
 ORDER BY (org_id, fingerprint, unix_milli)
 TTL toDateTime(least(intDiv(unix_milli, 1000) + ({{retention_days}} * 86400), 4294967295))
+--@cold-metrics , toDateTime(least(intDiv(unix_milli, 1000) + ({{metrics_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 --@single  SETTINGS ttl_only_drop_parts = 1, primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1, index_granularity = 1024, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1, index_granularity = 1024, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
@@ -182,6 +194,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_hist_samples{{on_cluster}}
 PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC')
 ORDER BY (org_id, fingerprint, unix_milli)
 TTL toDateTime(least(intDiv(unix_milli, 1000) + ({{retention_days}} * 86400), 4294967295))
+--@cold-metrics , toDateTime(least(intDiv(unix_milli, 1000) + ({{metrics_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 --@single  SETTINGS ttl_only_drop_parts = 1, primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
@@ -201,8 +214,8 @@ TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{retention_
 -- `labels` is outside the key and not an aggregate. It is a function of
 -- `fingerprint`, so a merge never chooses between two different values;
 -- 26.8 refuses such a column unless the table allows it.
---@single  SETTINGS allow_dimensions_outside_sorting_key = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
---@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS allow_dimensions_outside_sorting_key = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.metric_label_index{{on_cluster}}
 (
@@ -216,8 +229,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_label_index{{on_cluster}}
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_label_index', '{replica}', last_seen)
 ORDER BY (org_id, key, value, fingerprint)
 TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
---@cluster SETTINGS index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.metric_label_values{{on_cluster}}
 (
@@ -230,8 +243,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_label_values{{on_cluster}}
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_label_values', '{replica}', last_seen)
 ORDER BY (org_id, key, value)
 TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
---@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.metric_landing{{on_cluster}}
 (
@@ -269,8 +282,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_landing{{on_cluster}}
 PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
 ORDER BY (kind, intDiv(unix_milli, 300000), org_id, metric_name, fingerprint, unix_milli)
 TTL toDateTime(least(intDiv(received_ms, 1000) + ({{metrics_landing_retention_hours}} * 3600), 4294967295))
---@single  SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
---@cluster SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.metric_metadata{{on_cluster}}
 (
@@ -285,8 +298,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_metadata{{on_cluster}}
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.metric_metadata', '{replica}', updated_ns)
 ORDER BY (org_id, metric_name, metric_type, help, unit)
 TTL toDateTime(least(intDiv(updated_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
---@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.metric_samples{{on_cluster}}
 (
@@ -300,6 +313,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_samples{{on_cluster}}
 PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC')
 ORDER BY (org_id, fingerprint, unix_milli)
 TTL toDateTime(least(intDiv(unix_milli, 1000) + ({{retention_days}} * 86400), 4294967295))
+--@cold-metrics , toDateTime(least(intDiv(unix_milli, 1000) + ({{metrics_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 --@single  SETTINGS ttl_only_drop_parts = 1, primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
@@ -319,8 +333,8 @@ TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + {{retention_days}}) * 86400,
 -- `metric_name` is outside the key and not an aggregate. It is a function
 -- of `fingerprint`, so a merge never chooses between two different values;
 -- 26.8 refuses such a column unless the table allows it.
---@single  SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
---@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.resources{{on_cluster}}
 (
@@ -339,8 +353,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.resources{{on_cluster}}
 PARTITION BY day
 ORDER BY (org_id, service, resource_id)
 TTL toDateTime(least(((toUInt32(day) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
---@cluster SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.spans{{on_cluster}}
 (
@@ -394,6 +408,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.spans{{on_cluster}}
 PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
 ORDER BY (org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
 TTL toDateTime(least(intDiv(start_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@cold-traces , toDateTime(least(intDiv(start_ns, 1000000000) + ({{traces_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
@@ -408,8 +423,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.tag_names{{on_cluster}}
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.tag_names', '{replica}', last_start_ns)
 ORDER BY (org_id, scope, key)
 TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
---@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.tag_values{{on_cluster}}
 (
@@ -424,8 +439,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.tag_values{{on_cluster}}
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.tag_values', '{replica}', last_start_ns)
 ORDER BY (org_id, scope, key, value, val_type)
 TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
---@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.trace_landing{{on_cluster}}
 (
@@ -486,8 +501,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.trace_landing{{on_cluster}}
 PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
 ORDER BY (org_id, row_kind, trace_id, start_ns, span_id, kind, tag_key, tag_value)
 TTL toDateTime(least(intDiv(received_ms, 1000) + ({{trace_landing_retention_hours}} * 3600), 4294967295))
---@single  SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, async_insert = 0, index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
---@cluster SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, async_insert = 0, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, async_insert = 0, index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, async_insert = 0, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.traces{{on_cluster}}
 (
@@ -506,8 +521,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.traces{{on_cluster}}
 PARTITION BY day
 ORDER BY (org_id, trace_id)
 TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
---@cluster SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.log_metrics_{{log_rollup_suffix}}{{dist_suffix}}{{on_cluster}} AS {{db}}.log_metrics_{{log_rollup_suffix}}
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'log_metrics_{{log_rollup_suffix}}', cityHash64(fingerprint));
@@ -792,6 +807,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.service_edges{{on_cluster}}
 PARTITION BY toDate(minute)
 ORDER BY (org_id, conn_type, minute, client_minute, client, server)
 TTL toDateTime(least(toUInt32(minute) - if(conn_type = '', 240, 0) + ({{retention_days}} * 86400), 4294967295))
+--@cold-traces , toDateTime(least(toUInt32(minute) - if(conn_type = '', 240, 0) + ({{traces_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1{{storage_policy}};
 
 CREATE MATERIALIZED VIEW {{db}}.service_edges_mv{{on_cluster}} REFRESH EVERY 1 MINUTE APPEND TO {{db}}.service_edges
@@ -885,6 +901,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.tag_bucket_values{{on_cluster}}
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')
 ORDER BY (org_id, service, scope, key, bucket)
 TTL toDateTime(least(intDiv(bucket * 300000000000, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@cold-traces , toDateTime(least(intDiv(bucket * 300000000000, 1000000000) + ({{traces_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
@@ -909,6 +926,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.error_spans{{on_cluster}}
 PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
 ORDER BY (org_id, intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
 TTL toDateTime(least(intDiv(start_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@cold-traces , toDateTime(least(intDiv(start_ns, 1000000000) + ({{traces_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
@@ -953,6 +971,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.service_bucket_resources{{on_cluster}}
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')
 ORDER BY (org_id, service, bucket, resource_id)
 TTL toDateTime(least(intDiv(bucket * 300000000000, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@cold-traces , toDateTime(least(intDiv(bucket * 300000000000, 1000000000) + ({{traces_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
