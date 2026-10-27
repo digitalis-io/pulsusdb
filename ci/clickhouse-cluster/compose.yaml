@@ -16,6 +16,10 @@
 #
 # Tear down:
 #   podman-compose -f ci/clickhouse-cluster/compose.yaml down -v
+#
+# Issue #743 part A: the object store serves `config.d/storage.xml`'s cold
+# disk. After `up -d`, create its bucket with the loop in the
+# "Create the object-store bucket" step of `.github/workflows/ci.yml`.
 version: "3.8"
 
 # Fixed, user-defined subnet with a static `ipv4_address` per container
@@ -47,6 +51,18 @@ services:
       timeout: 3s
       retries: 30
 
+  object-store:
+    image: docker.io/rustfs/rustfs@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2
+    container_name: pulsus-store-it
+    networks:
+      pulsus-schema-it:
+        ipv4_address: 172.28.0.20
+    environment:
+      RUSTFS_ACCESS_KEY: pulsus-ci
+      RUSTFS_SECRET_KEY: pulsus-ci-secret
+    ports:
+      - "19900:9000"
+
   ch-shard1:
     image: docker.io/clickhouse/clickhouse-server@sha256:d3fd302416d9523d5d64239d5713d1c16c20ecea2045ac70d7e941b376cb266e
     container_name: pulsus-ch-shard1-it
@@ -61,6 +77,8 @@ services:
       - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
       - ./shard1/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
       - ./config.d/keeper_write.xml:/etc/clickhouse-server/config.d/keeper_write.xml:ro
+      - ./config.d/storage.xml:/etc/clickhouse-server/config.d/storage.xml:ro
+      - ./config.d/storage_partial.xml:/etc/clickhouse-server/config.d/storage_partial.xml:ro
     ports:
       - "18123:8123" # HTTP
       - "19000:9000" # native
@@ -88,6 +106,8 @@ services:
       - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
       - ./shard1b/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
       - ./config.d/keeper_write.xml:/etc/clickhouse-server/config.d/keeper_write.xml:ro
+      - ./config.d/storage.xml:/etc/clickhouse-server/config.d/storage.xml:ro
+      - ./config.d/storage_partial.xml:/etc/clickhouse-server/config.d/storage_partial.xml:ro
     ports:
       - "38123:8123" # HTTP
       - "39000:9000" # native
@@ -115,6 +135,7 @@ services:
       - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
       - ./shard2/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
       - ./config.d/keeper_write.xml:/etc/clickhouse-server/config.d/keeper_write.xml:ro
+      - ./config.d/storage.xml:/etc/clickhouse-server/config.d/storage.xml:ro
     ports:
       - "28123:8123" # HTTP
       - "29000:9000" # native
