@@ -48,7 +48,21 @@ pub fn rendered(ctx: &RenderCtx) -> String {
         ),
     );
     let mut out = String::with_capacity(expanded.len());
-    for line in expanded.lines() {
+    'lines: for line in expanded.lines() {
+        // Issue #743 part A: a family's move clause, kept when it moves.
+        for (marker, hot_days) in [
+            (COLD_METRICS, ctx.metrics_hot_days),
+            (COLD_LOGS, ctx.logs_hot_days),
+            (COLD_TRACES, ctx.traces_hot_days),
+        ] {
+            if let Some(rest) = marked(line, marker) {
+                if ctx.moves(hot_days) {
+                    out.push_str(rest);
+                    out.push('\n');
+                }
+                continue 'lines;
+            }
+        }
         let line = match marked(line, mine) {
             Some(rest) => rest,
             None => {

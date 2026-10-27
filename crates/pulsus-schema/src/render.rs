@@ -1,5 +1,5 @@
 //! Token substitution for `schema/schema.sql`: explicit `{{token}}` string
-//! replacement, eighteen names and nothing else. The level tokens of the
+//! replacement, twenty-three names and nothing else. The level tokens of the
 //! file's level block are resolved earlier, by [`expand_levels`].
 //!
 //! **Double braces, always.** ClickHouse's own `{shard}` and `{replica}`
@@ -115,6 +115,13 @@ pub const DEFAULT_ROLLUP_RANGES: &[u32] = &[3600, 86400, 604800, 7776000];
 pub const DEFAULT_ROLLUP_COUNTER_BUCKETS: u32 = 5;
 
 impl RenderCtx {
+    /// Whether a family with move age `hot_days` moves to the cold volume
+    /// (issue #743 part A): a cold volume is set and the move age is under
+    /// the retention.
+    pub fn moves(&self, hot_days: Option<u32>) -> bool {
+        self.cold_volume.is_some() && hot_days.is_some_and(|h| h < self.retention_days)
+    }
+
     /// A context for a test: `db` and `retention_days` as given, every other
     /// field at the value `schema/schema.sh` defaults it to. Retention has no
     /// default (issue #497), so every caller states it.
@@ -178,7 +185,7 @@ pub fn rollup_suffix(d: Duration) -> String {
 /// ClickHouse's own single-brace `{shard}`/`{replica}` macros — they are
 /// simply absent from double-brace matching.
 ///
-/// `schema.sh` carries the same list as seventeen `sed` expressions and two
+/// `schema.sh` carries the same list as twenty-two `sed` expressions and two
 /// `awk` steps;
 /// `the_script_renders_exactly_what_this_crate_renders` holds the two
 /// together.
@@ -193,6 +200,13 @@ pub(crate) fn substitute_tokens(tmpl: &str, ctx: &RenderCtx) -> String {
         Some(policy) => format!(", storage_policy = '{}'", escape_literal(policy)),
         None => String::new(),
     };
+    // Issue #743 part A: the tables that never move are on the server's
+    // `default` policy once a cold volume is set, so nothing can move them.
+    let storage_policy_local = match &ctx.cold_volume {
+        Some(_) => String::new(),
+        None => storage_policy.clone(),
+    };
+    let days = |d: Option<u32>| d.map(|d| d.to_string()).unwrap_or_default();
 
     tmpl.replace("{{db}}", &ctx.db)
         .replace("{{on_cluster}}", &on_cluster)
@@ -232,6 +246,14 @@ pub(crate) fn substitute_tokens(tmpl: &str, ctx: &RenderCtx) -> String {
             &ctx.graph_job_max_rows.to_string(),
         )
         .replace("{{storage_policy}}", &storage_policy)
+        .replace("{{storage_policy_local}}", &storage_policy_local)
+        .replace(
+            "{{cold_volume}}",
+            &escape_literal(ctx.cold_volume.as_deref().unwrap_or("")),
+        )
+        .replace("{{metrics_hot_days}}", &days(ctx.metrics_hot_days))
+        .replace("{{logs_hot_days}}", &days(ctx.logs_hot_days))
+        .replace("{{traces_hot_days}}", &days(ctx.traces_hot_days))
         .replace("{{trace_attr_indexes}}", &trace_attr_indexes(ctx))
 }
 
@@ -391,13 +413,59 @@ pub struct Tiering {
     pub traces_hot_days: Option<u32>,
 }
 
-/// Stub: accepts everything (issue #743 part A, tests first).
-pub fn validate_tiering(_input: &TieringInput<'_>) -> Result<Tiering, String> {
+/// The tiering settings `schema/schema.sh` validates (issue #743 part A),
+/// checked in the script's order; the first rule that fails is the `Err`,
+/// the text the script prints after `schema.sh: `. With no cold volume
+/// every field of the `Ok` is `None`.
+pub fn validate_tiering(input: &TieringInput<'_>) -> Result<Tiering, String> {
+    if let Some(volume) = input.cold_volume {
+        if input.storage_policy.is_none() {
+            return Err("PULSUS_COLD_VOLUME is set and PULSUS_STORAGE_POLICY is not".to_string());
+        }
+        if !volume
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(format!(
+                "cold_volume must be letters, digits and underscores: {volume}"
+            ));
+        }
+    }
+    let r = input.retention_days;
+    let mut days = [None; 3];
+    for (slot, (name, text)) in days.iter_mut().zip([
+        ("PULSUS_METRICS_HOT_DAYS", input.metrics_hot_days),
+        ("PULSUS_LOGS_HOT_DAYS", input.logs_hot_days),
+        ("PULSUS_TRACES_HOT_DAYS", input.traces_hot_days),
+    ]) {
+        let text = match (input.cold_volume, text) {
+            (Some(_), None) => {
+                return Err(format!(
+                    "{name} is not set; with PULSUS_COLD_VOLUME set each of \
+                     PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS \
+                     is required"
+                ));
+            }
+            (None, Some(_)) => return Err(format!("{name} is set and PULSUS_COLD_VOLUME is not")),
+            (None, None) => continue,
+            (Some(_), Some(text)) => text,
+        };
+        let whole =
+            text.len() <= 10 && !text.starts_with('0') && text.bytes().all(|b| b.is_ascii_digit());
+        match text.parse::<u64>() {
+            Ok(v) if whole && v <= u64::from(r) => *slot = Some(v as u32),
+            _ => {
+                return Err(format!(
+                    "{name} must be a whole number of days from 1 to {r}: {text}"
+                ));
+            }
+        }
+    }
     Ok(Tiering {
-        cold_volume: None,
-        metrics_hot_days: None,
-        logs_hot_days: None,
-        traces_hot_days: None,
+        cold_volume: input.cold_volume.map(str::to_string),
+        metrics_hot_days: days[0],
+        logs_hot_days: days[1],
+        traces_hot_days: days[2],
     })
 }
 
