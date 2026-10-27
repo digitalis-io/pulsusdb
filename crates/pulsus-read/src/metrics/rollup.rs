@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 
 use pulsus_clickhouse::{ChClient, QuerySettings, Row};
 use pulsus_model::{Fingerprint, FpLiteral, STALE_NAN_BITS, Tenant};
-use pulsus_promql::{PlanParams, RawOverlay, RollupUse, Sample, SelectorSpec};
+use pulsus_promql::{PlanParams, QueryPlan, RawOverlay, RollupUse, Sample, SelectorSpec};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
@@ -244,6 +244,11 @@ pub fn grid(p: &MetricQueryParams, levels: &Levels) -> Option<(i64, MetricQueryP
             step_ms: res,
         },
     ))
+}
+
+/// STUB (tests first).
+pub fn any_routes(_plan: &QueryPlan, _p: &PlanParams, _levels: &Levels, _res: i64) -> bool {
+    false
 }
 
 /// Plan section 3 and issue #18 follow-up R3: the largest level of width
@@ -767,24 +772,43 @@ mod tests {
         }
     }
 
-    /// The resolution `grid` chooses, the number of evaluation times of
-    /// the grid it returns, and its first and last time.
-    fn snapped(p: &MetricQueryParams, lv: &Levels) -> Option<(i64, i64, i64, i64)> {
+    /// The resolution `grid` chooses, its effective step `S`, the number
+    /// of evaluation times of the grid it returns, and its first and last
+    /// time; every time a multiple of `S`, and never more points than the
+    /// request asked.
+    fn snapped(p: &MetricQueryParams, lv: &Levels) -> Option<(i64, i64, i64, i64, i64)> {
         let (res, g) = grid(p, lv)?;
-        assert_eq!(g.step_ms, res, "the step is the resolution");
+        let step = g.step_ms;
         assert_eq!(
-            g.start_ms.rem_euclid(res),
+            step.rem_euclid(res),
             0,
-            "the first time is a bucket end"
+            "the step is a multiple of the resolution"
         );
-        assert_eq!(g.end_ms.rem_euclid(res), 0, "the last time is a bucket end");
-        Some((res, (g.end_ms - g.start_ms) / res + 1, g.start_ms, g.end_ms))
+        assert!(step >= p.step_ms, "the step is at least the step asked");
+        assert_eq!(
+            g.start_ms.rem_euclid(step),
+            0,
+            "the first time is a multiple of S"
+        );
+        assert_eq!(
+            g.end_ms.rem_euclid(step),
+            0,
+            "the last time is a multiple of S"
+        );
+        let count = (g.end_ms - g.start_ms) / step + 1;
+        assert!(
+            i128::from(count)
+                <= (i128::from(p.end_ms) - i128::from(p.start_ms)) / i128::from(p.step_ms) + 1,
+            "never more points than asked"
+        );
+        Some((res, step, count, g.start_ms, g.end_ms))
     }
 
-    /// **T1 (issue #18 follow-up): the owner's table.** Each row's
-    /// range, one millisecond off a midnight, at a 1 s step, gets the
-    /// row's resolution and exactly its points; the aligned, coarser-step
-    /// and one-millisecond-short cases keep the rule.
+    /// **T1 (issue #18 follow-up, r11): the owner's table, never more
+    /// than asked.** Each row's range, one millisecond off a midnight, at a
+    /// 1 s step, gets the row's resolution, `S = res` and exactly its
+    /// points; a coarser step asked is rounded up to a multiple of the
+    /// resolution, and the times are its multiples in `(start, end]`.
     #[test]
     fn the_owners_table() {
         let lv = owners();
@@ -806,52 +830,95 @@ mod tests {
             (365 * DAY, 86_400_000, 365),
             (HOUR - 1, 5_000, 720),
         ];
+        let at = |start: i64, end: i64, step: i64| {
+            snapped(&query(start, end, step), &lv).map(|g| (g.0, g.1, g.2))
+        };
         for (range, res, points) in rows {
-            let got = snapped(&query(start, start + range, 1_000), &lv).map(|g| (g.0, g.1));
-            assert_eq!(got, Some((res, points)), "range {range} ms");
+            assert_eq!(
+                at(start, start + range, 1_000),
+                Some((res, res, points)),
+                "range {range} ms at 1 s"
+            );
         }
-        // Aligned: the start is not a point; the end is.
+        // The 5 s rows at a 15 s step: S = 15 s.
+        for (range, points) in [
+            (5 * MIN, 20),
+            (15 * MIN, 60),
+            (30 * MIN, 120),
+            (10 * MIN, 40),
+        ] {
+            assert_eq!(
+                at(start, start + range, 15_000),
+                Some((5_000, 15_000, points)),
+                "range {range} ms at 15 s"
+            );
+        }
+        // 7 days at 5 m, start and end on midnights: S = 2 h, 84 points,
+        // the first `start + 2 h`.
         assert_eq!(
-            snapped(&query(BASE, BASE + 7 * DAY, 1_000), &lv),
-            Some((7_200_000, 84, BASE + 2 * HOUR, BASE + 7 * DAY))
+            snapped(&query(BASE, BASE + 7 * DAY, 5 * MIN), &lv),
+            Some((7_200_000, 7_200_000, 84, BASE + 2 * HOUR, BASE + 7 * DAY))
         );
-        // A coarser step asked: every bucket end still.
+        // 7 days at 1 d, start a midnight + 1 ms: S = 1 d, 7 points.
         assert_eq!(
-            snapped(&query(BASE, BASE + 7 * DAY, DAY), &lv),
-            Some((7_200_000, 84, BASE + 2 * HOUR, BASE + 7 * DAY))
+            snapped(&query(start, start + 7 * DAY, DAY), &lv),
+            Some((7_200_000, DAY, 7, BASE + DAY, BASE + 7 * DAY))
         );
-        // One millisecond under 7 days: the 720 s level.
+        // One millisecond under 7 days at 5 m: the 720 s level, S 720 s.
         assert_eq!(
-            snapped(&query(BASE, BASE + 7 * DAY - 1, 1_000), &lv).map(|g| (g.0, g.1)),
-            Some((720_000, 839))
+            at(BASE, BASE + 7 * DAY - 1, 5 * MIN),
+            Some((720_000, 720_000, 839))
         );
-        // One millisecond under an hour: 5 s, the last bucket end at
+        // One millisecond under an hour at 1 s: 5 s, the last time at
         // `start - 1 ms + 1 h`.
         assert_eq!(
             snapped(&query(start, start + HOUR - 1, 1_000), &lv),
-            Some((5_000, 720, BASE + 5_000, BASE + HOUR))
+            Some((5_000, 5_000, 720, BASE + 5_000, BASE + HOUR))
         );
-        // An instant query and no levels keep their own grid.
+        // 24 hours at 15 m: the 720 s level, S = 1,440 s.
+        assert_eq!(
+            at(start, start + DAY, 15 * MIN),
+            Some((720_000, 1_440_000, 60))
+        );
+        // An instant query (`step == 0`) and no levels keep their own grid.
         assert_eq!(grid(&query(BASE, BASE, 0), &lv), None);
         assert_eq!(grid(&query(BASE, BASE + DAY, MIN), &levels(&[])), None);
     }
 
     /// **T1b (issue #18 follow-up): the grid does not overflow**, and a
-    /// grid of more than 11,001 points keeps the query's own.
+    /// grid of more than 11,001 points, or an `S` above `i64::MAX`, keeps
+    /// the query's own.
     #[test]
     fn the_grid_does_not_overflow() {
         let lv = owners();
         assert_eq!(grid(&query(i64::MAX - 1, i64::MAX, 1), &lv), None);
         assert_eq!(
-            snapped(&query(i64::MIN, i64::MIN + 3_600_000, 1_000), &lv).map(|g| (g.0, g.1)),
+            snapped(&query(i64::MIN, i64::MIN + 3_600_000, 1_000), &lv).map(|g| (g.0, g.2)),
             Some((60_000, 60))
         );
         assert_eq!(grid(&query(i64::MIN, i64::MAX, 1_000), &lv), None);
         assert_eq!(
-            snapped(&query(BASE, BASE + 11_001 * DAY, DAY), &lv).map(|g| (g.0, g.1)),
+            snapped(&query(BASE, BASE + 11_001 * DAY, DAY), &lv).map(|g| (g.0, g.2)),
             Some((86_400_000, 11_001))
         );
         assert_eq!(grid(&query(BASE, BASE + 11_002 * DAY, DAY), &lv), None);
+        // `res` 5 s and `S = 5 s × ⌈i64::MAX / 5 s⌉` above `i64::MAX`.
+        assert_eq!(grid(&query(-1, 1, i64::MAX), &lv), None);
+    }
+
+    /// **T1d (issue #18 follow-up, r11): `any_routes`.** On the 7-day
+    /// grid of 2 h, a query routes when one of its selectors does.
+    #[test]
+    fn any_routes_is_one_routed_selector() {
+        let lv = owners();
+        let (res, g) = grid(&query(BASE, BASE + 7 * DAY, 5 * MIN), &lv).expect("a grid");
+        let pp = g.plan_params(false, DEFAULT_LOOKBACK_MS);
+        let routes =
+            |q: &str, lv: &Levels| any_routes(&plan(&parse(q).unwrap(), pp).unwrap(), &pp, lv, res);
+        assert!(routes("rate(x[5m])", &lv), "rate");
+        assert!(!routes("irate(x[5m])", &lv), "irate");
+        assert!(routes("rate(x[5m]) + irate(x[5m])", &lv), "one of two");
+        assert!(!routes("rate(x[5m])", &levels(&[])), "no levels");
     }
 
     /// The level the query's one selector reads on the grid `p` snaps to.

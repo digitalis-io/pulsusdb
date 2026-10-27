@@ -51,6 +51,8 @@ static DB_B10: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read
 static DB_S2: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_s2");
 static DB_B2E: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b2e");
 static DB_T4: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t4");
+static DB_T9: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t9");
+static DB_T10: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t10");
 
 /// The default levels and their switch points (the owner's table,
 /// 2026-10-26).
@@ -661,12 +663,21 @@ fn bound(function: &str, kind: &str, secs: i64) -> Option<f64> {
 /// The grid the routed engine evaluates `p` on (issue #18 follow-up, R2),
 /// or `p` when it keeps its own: the unrouted engine is asked on it, so the
 /// two answers are compared at the same times.
-fn snapped(built: &Built, p: &MetricQueryParams) -> MetricQueryParams {
-    built
-        .slot
-        .get()
-        .and_then(|levels| pulsus_read::metrics::rollup::grid(p, &levels))
-        .map_or(*p, |(_, g)| g)
+fn snapped(built: &Built, query: &str, p: &MetricQueryParams) -> MetricQueryParams {
+    let Some(levels) = built.slot.get() else {
+        return *p;
+    };
+    let Some((res, g)) = pulsus_read::metrics::rollup::grid(p, &levels) else {
+        return *p;
+    };
+    // The grid changes only when a selector routes on it (r11).
+    let pp = g.plan_params(false, pulsus_promql::DEFAULT_LOOKBACK_MS);
+    let plan = pulsus_promql::plan(&parse(query).expect("parse"), pp).expect("plan");
+    if pulsus_read::metrics::rollup::any_routes(&plan, &pp, &levels, res) {
+        g
+    } else {
+        *p
+    }
 }
 
 /// One query sent with routing on and off, concurrently, each with its
@@ -680,7 +691,7 @@ async fn both(
     let routed = built.engine(true, comments.map(|c| c.0)).await;
     let raw = built.engine(false, comments.map(|c| c.1)).await;
     let t = no_tenant();
-    let grid = snapped(built, p);
+    let grid = snapped(built, query, p);
     futures::join!(ask(&routed, &t, query, p), ask(&raw, &t, query, &grid))
 }
 
@@ -926,7 +937,7 @@ async fn a_window_reads_the_finer_levels_and_raw_after_its_level() {
         &built.engine(false, None).await,
         &no_tenant(),
         query,
-        &snapped(&built, &p),
+        &snapped(&built, query, &p),
     )
     .await;
     // A level whose coverage the cuts removed serves nothing; its stage
@@ -1325,7 +1336,7 @@ async fn a_hole_reads_raw() {
         &built.engine(false, None).await,
         &no_tenant(),
         query,
-        &snapped(&built, &p),
+        &snapped(&built, query, &p),
     )
     .await;
     let want = format!("raw ({hole}, {}]", hole + HOUR);
@@ -1496,7 +1507,7 @@ async fn the_unrouted_classes_read_raw() {
         "histogram_count(rate(rollup_mixed[1h]))",
     ] {
         let a = ask(&routed, &no_tenant(), query, &p).await;
-        let b = ask(&raw, &no_tenant(), query, &snapped(&built, &p)).await;
+        let b = ask(&raw, &no_tenant(), query, &snapped(&built, query, &p)).await;
         assert!(a.stages("rollup_route").is_empty(), "{query}: routed");
         assert_eq!(canonical(&a.result), canonical(&b.result), "{query}");
         assert!(
@@ -1520,7 +1531,7 @@ async fn the_unrouted_classes_read_raw() {
         &cold_raw,
         &no_tenant(),
         "rate(rollup_f[1h])",
-        &snapped(&built, &p),
+        &snapped(&built, "rate(rollup_f[1h])", &p),
     )
     .await;
     assert!(!a.stages("rollup_route").is_empty(), "SqlFallback: routed");
@@ -1538,7 +1549,7 @@ async fn the_unrouted_classes_read_raw() {
         &raw,
         &no_tenant(),
         "rate(rollup_mixed[1h])",
-        &snapped(&built, &p),
+        &snapped(&built, "rate(rollup_mixed[1h])", &p),
     )
     .await;
     assert!(a.explain.rollup, "the float series is served from a level");
@@ -1564,7 +1575,7 @@ async fn the_unrouted_classes_read_raw() {
         &raw,
         &no_tenant(),
         "rate(rollup_hist[1h])",
-        &snapped(&built, &p),
+        &snapped(&built, "rate(rollup_hist[1h])", &p),
     )
     .await;
     assert!(
@@ -1602,7 +1613,7 @@ async fn a_level_added_later_is_used() {
         &built.engine(false, None).await,
         &no_tenant(),
         query,
-        &snapped(&built, &p),
+        &snapped(&built, query, &p),
     )
     .await;
     assert!(
@@ -1691,7 +1702,7 @@ async fn a_sparse_counter_keeps_its_steps() {
             &built.engine(false, None).await,
             &tenant(org),
             "increase(rollup_b10[5m])",
-            &snapped(&built, &p),
+            &snapped(&built, "increase(rollup_b10[5m])", &p),
         )
         .await;
         assert!(a.explain.rollup, "tenant {org}: served from the level");
@@ -2158,5 +2169,116 @@ async fn a_week_reads_two_hour_rows() {
     for (comment, rows) in read_rows(&built.admin, &format!("{run}_")).await {
         println!("T4 read_rows {comment}: {rows}");
     }
+    built.finish().await;
+}
+
+/// The answer's points per series label set.
+fn per_series(x: &Answer) -> BTreeMap<String, Vec<i64>> {
+    let mut out: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    for (l, t) in x.points().keys() {
+        out.entry(l.clone()).or_default().push(*t);
+    }
+    out
+}
+
+/// **T9 (issue #18 follow-up, r11): a raw-only query keeps its grid.**
+/// Corpus D at every level; `irate(c_normal[5m])` and `deriv(g[10m])`
+/// over 7 days at step 5 m from `day0 + 10 min + 7.123 s`, an engine with
+/// the levels against the same engine without them: bit-equal, 2,017
+/// points for each of the 100 series, and no `rollup_grid` stage.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_raw_only_query_keeps_its_grid() {
+    skip_unless_live!();
+    let day0 = today() - 8 * DAY;
+    let built = corpus_d(DB_T9.name(), DEFAULTS, day0, 0..8).await;
+    assert!(built.slot.get().is_some_and(|l| l.levels.len() == 5));
+    let start = day0 + 10 * MIN + 7_123;
+    let p = range(start, start + 7 * DAY, 5 * MIN);
+    for query in ["irate(c_normal[5m])", "deriv(g[10m])"] {
+        let a = ask(&built.engine(true, None).await, &no_tenant(), query, &p).await;
+        let b = ask(&built.engine(false, None).await, &no_tenant(), query, &p).await;
+        assert!(
+            a.stages("rollup_grid").is_empty(),
+            "{query}: no grid change"
+        );
+        assert!(a.stages("rollup_route").is_empty(), "{query}: no route");
+        let series = per_series(&a);
+        assert_eq!(series.len(), 100, "{query}: the series");
+        for (l, ts) in &series {
+            assert_eq!(ts.len(), 2_017, "{query} {l}: the points");
+            assert_eq!(ts[0], start, "{query} {l}: the request's first time");
+        }
+        assert_eq!(a.cells(), b.cells(), "{query}: bit-equal to no levels");
+    }
+    built.finish().await;
+}
+
+/// **T10 (issue #18 follow-up, r11): a query no level serves on the
+/// changed grid reads raw on its own.** Corpus D at every level, against
+/// the engine without levels. `rate(c_normal[5m] offset 1s)` over 1 h at
+/// step 5 m from `day0 + 7 d + 1 s`: no level fits the changed grid, so
+/// 13 points per series at `start + k × 300 s`, bit-equal, with no
+/// `rollup_grid` and no `rollup_route` stage, although the 60 s level
+/// would fit the request's own grid. The instant `rate(c_normal[5m])` at
+/// `day0 + 7 d` reads the 5 s level within 1e-12. The range query with
+/// `start = end` reads raw: one point, bit-equal, no grid, no route.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_no_level_serves_on_the_changed_grid_reads_raw() {
+    skip_unless_live!();
+    let day0 = today() - 8 * DAY;
+    let built = corpus_d(DB_T10.name(), DEFAULTS, day0, 6..8).await;
+    let t = day0 + 7 * DAY;
+    let routed = built.engine(true, None).await;
+    let raw = built.engine(false, None).await;
+
+    let query = "rate(c_normal[5m] offset 1s)";
+    let p = range(t + 1_000, t + 1_000 + HOUR, 5 * MIN);
+    let a = ask(&routed, &no_tenant(), query, &p).await;
+    let b = ask(&raw, &no_tenant(), query, &p).await;
+    assert!(a.stages("rollup_grid").is_empty(), "range: no grid change");
+    assert!(
+        a.stages("rollup_route").is_empty(),
+        "range: no route {:?}",
+        a.stages("rollup_route")
+    );
+    let series = per_series(&a);
+    assert_eq!(series.len(), 100, "range: the series");
+    let want: Vec<i64> = (0..13).map(|k| p.start_ms + k * 300_000).collect();
+    for (l, ts) in &series {
+        assert_eq!(ts, &want, "range {l}: the request's times");
+    }
+    assert_eq!(a.cells(), b.cells(), "range: bit-equal to no levels");
+
+    let instant = range(t, t, 0);
+    let a = ask(&routed, &no_tenant(), "rate(c_normal[5m])", &instant).await;
+    let b = ask(&raw, &no_tenant(), "rate(c_normal[5m])", &instant).await;
+    assert!(
+        a.stages("rollup_route")
+            .iter()
+            .any(|n| n.starts_with("metric_samples_5s,")),
+        "instant: {:?}",
+        a.stages("rollup_route")
+    );
+    let (pa, pb) = (a.points(), b.points());
+    assert_eq!(pa.len(), 100, "instant: the series");
+    for d in distances(&pa, &pb) {
+        assert!(d <= 1e-12, "instant: {d:e} from no levels");
+    }
+
+    let equal = range(t + 1_000, t + 1_000, 5 * MIN);
+    let a = ask(&routed, &no_tenant(), query, &equal).await;
+    let b = ask(&raw, &no_tenant(), query, &equal).await;
+    assert!(a.stages("rollup_grid").is_empty(), "equal bounds: no grid");
+    assert!(
+        a.stages("rollup_route").is_empty(),
+        "equal bounds: no route {:?}",
+        a.stages("rollup_route")
+    );
+    let series = per_series(&a);
+    assert_eq!(series.len(), 100, "equal bounds: the series");
+    for (l, ts) in &series {
+        assert_eq!(ts, &vec![t + 1_000], "equal bounds {l}: one point at start");
+    }
+    assert_eq!(a.cells(), b.cells(), "equal bounds: bit-equal to no levels");
     built.finish().await;
 }
