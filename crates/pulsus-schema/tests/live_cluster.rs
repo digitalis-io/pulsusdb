@@ -2333,7 +2333,7 @@ async fn each_replica_moves_its_own_copy() {
         )
         .await;
         prefixes.push(format!(
-            "SELECT toString(count()) AS s FROM s3('http://172.28.0.20:9000/pulsus-ci/ci/{shard}/{replica}/**', \
+            "SELECT toString(count()) AS s FROM s3('http://172.28.0.30:9000/pulsus-ci/ci/{shard}/{replica}/**', \
              'pulsus-ci', 'pulsus-ci-secret', 'One')"
         ));
     }

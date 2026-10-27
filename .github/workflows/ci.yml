@@ -1861,7 +1861,7 @@ jobs:
       - name: Start the object store and ClickHouse 26.8
         run: |
           docker network create --subnet 172.28.0.0/24 pulsus-schema-it-cluster
-          docker run -d --name pulsus-store-it --network pulsus-schema-it-cluster --ip 172.28.0.20 \
+          docker run -d --name pulsus-store-it --network pulsus-schema-it-cluster --ip 172.28.0.30 \
             -p 19900:9000 -e RUSTFS_ACCESS_KEY=pulsus-ci -e RUSTFS_SECRET_KEY=pulsus-ci-secret \
             docker.io/rustfs/rustfs@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2
           sign='--aws-sigv4 aws:amz:us-east-1:s3 --user pulsus-ci:pulsus-ci-secret'

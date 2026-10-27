@@ -17,8 +17,10 @@
 # Tear down:
 #   podman-compose -f ci/clickhouse-cluster/compose.yaml down -v
 #
-# Issue #743 part A: the object store serves `config.d/storage.xml`'s cold
-# disk. After `up -d`, create its bucket with the loop in the
+# Issue #743 part A: the object store (172.28.0.30) serves
+# `config.d/storage.xml`'s cold disk; `deploy/e2e/compose.cluster.yaml`,
+# which the e2e harness lays over this file, holds .20 to .23. After
+# `up -d`, create its bucket with the loop in the
 # "Create the object-store bucket" step of `.github/workflows/ci.yml`.
 version: "3.8"
 
@@ -56,7 +58,7 @@ services:
     container_name: pulsus-store-it
     networks:
       pulsus-schema-it:
-        ipv4_address: 172.28.0.20
+        ipv4_address: 172.28.0.30
     environment:
       RUSTFS_ACCESS_KEY: pulsus-ci
       RUSTFS_SECRET_KEY: pulsus-ci-secret
