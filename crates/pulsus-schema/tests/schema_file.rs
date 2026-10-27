@@ -49,16 +49,16 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 29 tables, 26 views, and
+/// The inventory, single-node: one database, 30 tables, 27 views, and
 /// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
 /// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 56, "statement count");
+    assert_eq!(stmts.len(), 58, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
-    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 29);
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 26);
+    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 30);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 27);
 
     let text = rendered(&single());
     assert!(
@@ -87,18 +87,18 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     assert!(text.contains("non_replicated_deduplication_window = 10000"));
 }
 
-/// The inventory, clustered: the same statements plus 18 `_dist` wrappers,
+/// The inventory, clustered: the same statements plus 19 `_dist` wrappers,
 /// `ON CLUSTER` on every one, and the macros intact.
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 74, "statement count");
+    assert_eq!(stmts.len(), 77, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        47,
-        "29 tables + 18 wrappers"
+        49,
+        "30 tables + 19 wrappers"
     );
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 26);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 27);
 
     let text = rendered(&clustered());
     assert!(
@@ -107,20 +107,20 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        74,
+        77,
         "every statement carries ON CLUSTER"
     );
 
     // `{shard}` and `{replica}` are the server's own macros and must arrive
-    // literally. 23 tables take a per-shard replica set and 6 take the
-    // cluster-wide one, so 29 paths name `{replica}` and 23 name `{shard}`.
-    // The four rollup levels add four per-shard replica sets.
+    // literally. 24 tables take a per-shard replica set and 6 take the
+    // cluster-wide one, so 30 paths name `{replica}` and 24 name `{shard}`.
+    // The five default rollup levels add five per-shard replica sets.
     assert_eq!(
         text.matches("{shard}").count(),
-        23,
+        24,
         "per-shard replica sets"
     );
-    assert_eq!(text.matches("{replica}").count(), 29, "replicated tables");
+    assert_eq!(text.matches("{replica}").count(), 30, "replicated tables");
     assert_eq!(
         text.matches("/clickhouse/tables/all/").count(),
         6,
@@ -182,7 +182,7 @@ fn every_replication_path_names_the_table_of_its_own_create() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 29, "every replicated table's path was checked");
+    assert_eq!(checked, 30, "every replicated table's path was checked");
 }
 
 /// The splitter the script relies on: a statement ends at a line whose last
@@ -334,6 +334,7 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         "metric_exemplars",
         "metric_series",
         "metric_labels",
+        "metric_samples_5s",
         "metric_samples_60s",
         "metric_samples_720s",
         "metric_samples_7200s",
@@ -366,7 +367,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 29);
+    assert_eq!(on_tables, 30);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -491,6 +492,8 @@ fn the_script_renders_exactly_what_this_crate_renders() {
                 // for it (issue #599), so this case keeps it.
                 graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
                 rollup_levels: vec![15, 60, 720],
+                rollup_ranges: vec![3600, 86400],
+                rollup_counter_buckets: 7,
             },
         ),
         (
@@ -558,6 +561,18 @@ fn the_script_renders_exactly_what_this_crate_renders() {
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
+        );
+        cmd.env(
+            "PULSUS_ROLLUP_RANGES",
+            ctx.rollup_ranges
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        cmd.env(
+            "PULSUS_ROLLUP_COUNTER_BUCKETS",
+            ctx.rollup_counter_buckets.to_string(),
         );
         match &ctx.cluster {
             Some(name) => cmd.env("PULSUS_CLUSTER", name),
@@ -1132,16 +1147,22 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
                 sources.extend(own);
             }
         }
-        assert_eq!(targets.len(), 26, "{variant:?}: twenty-six views");
+        assert_eq!(targets.len(), 27, "{variant:?}: twenty-seven views");
         refreshable.sort();
         let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
             refreshable,
             vec![
                 (
+                    "metric_samples_5s_mv".to_string(),
+                    "metric_samples_5s".to_string(),
+                    strings(&["metric_landing", "metric_samples_5s"]),
+                    Vec::<String>::new(),
+                ),
+                (
                     "metric_samples_60s_mv".to_string(),
                     "metric_samples_60s".to_string(),
-                    strings(&["metric_landing", "metric_samples_60s"]),
+                    strings(&["metric_samples_5s", "metric_samples_60s"]),
                     Vec::<String>::new(),
                 ),
                 // Sorted as strings: `7200s` before `720s`.
@@ -1170,7 +1191,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
                     strings(&["service_edges", "spans"]),
                 ),
             ],
-            "{variant:?}: the five refreshable views, their targets, their direct \
+            "{variant:?}: the six refreshable views, their targets, their direct \
              sources and their sources read through merge()"
         );
         let mut distinct: Vec<String> = sources.clone();
@@ -2088,6 +2109,14 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
     // Issue #18: the rollup levels, one row each, due at the start of the
     // UTC day of `t_end − 1 ms` plus the retention.
     (
+        "metric_samples_5s",
+        Some(
+            "TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + (17 * 86400), 4294967295))",
+        ),
+        true,
+        None,
+    ),
+    (
         "metric_samples_60s",
         Some(
             "TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + (17 * 86400), 4294967295))",
@@ -2479,9 +2508,10 @@ fn statement_headed(stmts: &[String], head: &str) -> String {
 /// removed `metric_rollup`, and `metric_landing` is keyed by the block.
 #[test]
 fn the_rollup_levels_render_from_one_template() {
-    let sets: [(&[u32], &[&str]); 3] = [
+    let sets: [(&[u32], &[u32], &[&str]); 3] = [
         (
-            pulsus_schema::DEFAULT_ROLLUP_LEVELS,
+            &[60, 720, 7200, 86400],
+            &[86400, 604800, 7776000],
             &[
                 "EVERY 1 MINUTE",
                 "EVERY 12 MINUTE OFFSET 240 SECOND",
@@ -2491,6 +2521,7 @@ fn the_rollup_levels_render_from_one_template() {
         ),
         (
             &[5, 60, 720, 7200, 86400],
+            &[3600, 86400, 604800, 7776000],
             &[
                 "EVERY 1 MINUTE",
                 "EVERY 1 MINUTE",
@@ -2501,14 +2532,16 @@ fn the_rollup_levels_render_from_one_template() {
         ),
         (
             &[720, 86400],
+            &[7776000],
             &["EVERY 12 MINUTE", "EVERY 1 DAY OFFSET 780 SECOND"],
         ),
     ];
-    for (levels, timers) in sets {
+    for (levels, ranges, timers) in sets {
         assert_eq!(levels.len(), timers.len());
         for base in [single(), clustered()] {
             let ctx = RenderCtx {
                 rollup_levels: levels.to_vec(),
+                rollup_ranges: ranges.to_vec(),
                 ..base
             };
             let what = format!("{levels:?}, cluster {:?}", ctx.cluster);
@@ -2548,8 +2581,14 @@ fn the_rollup_levels_render_from_one_template() {
                     &format!("CREATE TABLE IF NOT EXISTS pulsus.metric_samples_{r}s{on}"),
                 );
                 let lines: Vec<&str> = table.lines().collect();
+                let from = match i {
+                    0 => "0".to_string(),
+                    _ => format!("{}000", ranges[i - 1]),
+                };
                 for line in [
-                    format!("COMMENT 'rollup_res_ms={r}000';"),
+                    format!(
+                        "COMMENT 'rollup_res_ms={r}000 rollup_from_ms={from} counter_buckets=5';"
+                    ),
                     "TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + (7 * 86400), 4294967295))".to_string(),
                     "ORDER BY (org_id, fingerprint, t_end)".to_string(),
                     "PARTITION BY toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC')".to_string(),
@@ -2722,13 +2761,19 @@ fn the_script_and_the_crate_refuse_the_same_level_lists() {
             "{levels:?}: the crate's message"
         );
     }
-    for (levels, want) in [
-        ("60,720,7200,86400", vec![60, 720, 7200, 86400]),
-        ("5,60", vec![5, 60]),
-        ("720,86400", vec![720, 86400]),
-        ("", vec![]),
+    // Each accepted list with one switch point for each level after the
+    // first (issue #18 follow-up).
+    for (levels, ranges, want) in [
+        (
+            "60,720,7200,86400",
+            "86400,604800,7776000",
+            vec![60, 720, 7200, 86400],
+        ),
+        ("5,60", "3600", vec![5, 60]),
+        ("720,86400", "7776000", vec![720, 86400]),
+        ("", "", vec![]),
     ] {
-        let (code, err) = run(levels);
+        let (code, _, err) = script_levels(Some(levels), Some(ranges), None);
         assert_eq!(code, Some(0), "{levels:?}: the script must accept: {err}");
         assert_eq!(
             pulsus_schema::parse_rollup_levels(levels, 6),
@@ -2736,4 +2781,256 @@ fn the_script_and_the_crate_refuse_the_same_level_lists() {
             "{levels:?}: the crate must accept"
         );
     }
+}
+
+/// **T6 (issue #18 follow-up): the default levels carry their switch
+/// points.** The default render, on one node and clustered, has the five
+/// level tables of the owner's table (2026-10-26), each comment naming its
+/// width, the query range from which it is the resolution, and the counter
+/// bucket count; 7,776,000,000 is written as digits.
+#[test]
+fn the_default_levels_carry_their_switch_points() {
+    let want = [
+        (5, "rollup_res_ms=5000 rollup_from_ms=0 counter_buckets=5"),
+        (
+            60,
+            "rollup_res_ms=60000 rollup_from_ms=3600000 counter_buckets=5",
+        ),
+        (
+            720,
+            "rollup_res_ms=720000 rollup_from_ms=86400000 counter_buckets=5",
+        ),
+        (
+            7200,
+            "rollup_res_ms=7200000 rollup_from_ms=604800000 counter_buckets=5",
+        ),
+        (
+            86400,
+            "rollup_res_ms=86400000 rollup_from_ms=7776000000 counter_buckets=5",
+        ),
+    ];
+    for ctx in [single(), clustered()] {
+        let on = if ctx.cluster.is_some() {
+            " ON CLUSTER 'prod'"
+        } else {
+            ""
+        };
+        let stmts = rendered_statements(&ctx);
+        let tables: Vec<String> = level_heads(&stmts)
+            .into_iter()
+            .filter(|h| h.starts_with("CREATE TABLE") && !h.contains("_dist"))
+            .collect();
+        let want_tables: Vec<String> = want
+            .iter()
+            .map(|(r, _)| format!("CREATE TABLE IF NOT EXISTS pulsus.metric_samples_{r}s{on}"))
+            .collect();
+        assert_eq!(tables, want_tables, "the default level tables");
+        for (r, comment) in want {
+            let table = statement_headed(
+                &stmts,
+                &format!("CREATE TABLE IF NOT EXISTS pulsus.metric_samples_{r}s{on}"),
+            );
+            let line = format!("COMMENT '{comment}';");
+            assert!(
+                table.lines().any(|l| l == line),
+                "{r}s lacks {line}: {table}"
+            );
+        }
+    }
+}
+
+/// `schema.sh --print` with the three level variables; `None` leaves one
+/// unset. Its exit code and standard error.
+fn script_levels(
+    levels: Option<&str>,
+    ranges: Option<&str>,
+    buckets: Option<&str>,
+) -> (Option<i32>, String, String) {
+    let root = repo_root();
+    let mut cmd = Command::new("sh");
+    cmd.arg(root.join("schema/schema.sh"))
+        .args(["--mode", "single", "--print"])
+        .current_dir(&root);
+    for var in [
+        "PULSUS_CLUSTER",
+        "PULSUS_LOG_LANDING_RETENTION_HOURS",
+        "PULSUS_TRACE_LANDING_RETENTION_HOURS",
+        "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
+        "PULSUS_ROLLUP_LEVELS",
+        "PULSUS_ROLLUP_RANGES",
+        "PULSUS_ROLLUP_COUNTER_BUCKETS",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.env("CLICKHOUSE_SERVER", "127.0.0.1")
+        .env("CLICKHOUSE_HTTP_PORT", "1")
+        .env("PULSUS_RETENTION_DAYS", "7")
+        .env("PULSUS_METRICS_LANDING_RETENTION_HOURS", "6");
+    for (var, value) in [
+        ("PULSUS_ROLLUP_LEVELS", levels),
+        ("PULSUS_ROLLUP_RANGES", ranges),
+        ("PULSUS_ROLLUP_COUNTER_BUCKETS", buckets),
+    ] {
+        if let Some(v) = value {
+            cmd.env(var, v);
+        }
+    }
+    let out = cmd.output().expect("run schema.sh");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// **T5 (issue #18 follow-up): the script and the crate refuse the same
+/// switch points and counter bucket counts, with the same message, and
+/// accept the same.** The ranges are checked only when there are levels.
+#[test]
+fn the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets() {
+    let default_levels = "5,60,720,7200,86400";
+    for (levels, ranges, message) in [
+        (
+            default_levels,
+            "3600,,604800,7776000",
+            "an empty item in '3600,,604800,7776000'",
+        ),
+        (
+            "5,60",
+            "1000000000",
+            "1000000000 is not a whole number of seconds from 1 to 999999999",
+        ),
+        (
+            "5,60",
+            "0",
+            "0 is not a whole number of seconds from 1 to 999999999",
+        ),
+        (
+            "5,60",
+            "03600",
+            "03600 is not a whole number of seconds from 1 to 999999999",
+        ),
+        (
+            "5,60",
+            "1h",
+            "1h is not a whole number of seconds from 1 to 999999999",
+        ),
+        (
+            "5,60,720",
+            "3600",
+            "1 ranges for 3 levels: give one for each level after the first",
+        ),
+        (
+            "5,60",
+            "",
+            "0 ranges for 2 levels: give one for each level after the first",
+        ),
+        (
+            "5,60,720",
+            "86400,3600",
+            "86400 then 3600: the ranges must increase",
+        ),
+        (
+            "5,60,720",
+            "3600,3600",
+            "3600 then 3600: the ranges must increase",
+        ),
+        ("5,7200", "3600", "3600 is shorter than its level 7200"),
+    ] {
+        let (code, _, err) = script_levels(Some(levels), Some(ranges), None);
+        assert_eq!(
+            code,
+            Some(2),
+            "{levels:?} {ranges:?}: the script must refuse: {err}"
+        );
+        assert_eq!(
+            err.trim_end(),
+            format!("schema.sh: PULSUS_ROLLUP_RANGES: {message}"),
+            "{levels:?} {ranges:?}: the script's message"
+        );
+        let parsed = pulsus_schema::parse_rollup_levels(levels, 6).expect("valid levels");
+        assert_eq!(
+            pulsus_schema::parse_rollup_ranges(ranges, &parsed),
+            Err(message.to_string()),
+            "{levels:?} {ranges:?}: the crate's message"
+        );
+    }
+    // The levels `60` with the default ranges: four for one level.
+    let (code, _, err) = script_levels(Some("60"), None, None);
+    let message = "4 ranges for 1 levels: give one for each level after the first";
+    assert_eq!(code, Some(2), "60 with the default ranges: {err}");
+    assert_eq!(
+        err.trim_end(),
+        format!("schema.sh: PULSUS_ROLLUP_RANGES: {message}")
+    );
+    assert_eq!(
+        pulsus_schema::parse_rollup_ranges("3600,86400,604800,7776000", &[60]),
+        Err(message.to_string())
+    );
+    assert_eq!(
+        pulsus_schema::DEFAULT_ROLLUP_RANGES,
+        &[3600, 86400, 604800, 7776000],
+        "the default ranges"
+    );
+
+    for (buckets, message) in [
+        ("1", "1 is not a whole number from 2 to 1000"),
+        ("1001", "1001 is not a whole number from 2 to 1000"),
+        ("05", "05 is not a whole number from 2 to 1000"),
+        ("x", "x is not a whole number from 2 to 1000"),
+    ] {
+        let (code, _, err) = script_levels(None, None, Some(buckets));
+        assert_eq!(code, Some(2), "{buckets:?}: the script must refuse: {err}");
+        assert_eq!(
+            err.trim_end(),
+            format!("schema.sh: PULSUS_ROLLUP_COUNTER_BUCKETS: {message}"),
+            "{buckets:?}: the script's message"
+        );
+        assert_eq!(
+            pulsus_schema::parse_rollup_counter_buckets(buckets),
+            Err(message.to_string()),
+            "{buckets:?}: the crate's message"
+        );
+    }
+
+    // Accepted.
+    let (code, out, err) = script_levels(Some("5,60"), Some("999999999"), None);
+    assert_eq!(code, Some(0), "999999999: {err}");
+    assert!(
+        out.contains(
+            "COMMENT 'rollup_res_ms=60000 rollup_from_ms=999999999000 counter_buckets=5';"
+        ),
+        "999999999 is stored"
+    );
+    assert_eq!(
+        pulsus_schema::parse_rollup_ranges("999999999", &[5, 60]),
+        Ok(vec![999_999_999])
+    );
+    for (buckets, want) in [("2", 2u32), ("1000", 1000)] {
+        let (code, out, err) = script_levels(None, None, Some(buckets));
+        assert_eq!(code, Some(0), "{buckets}: {err}");
+        assert!(
+            out.contains(&format!(
+                "COMMENT 'rollup_res_ms=5000 rollup_from_ms=0 counter_buckets={want}';"
+            )),
+            "{buckets} is stored"
+        );
+        assert_eq!(
+            pulsus_schema::parse_rollup_counter_buckets(buckets),
+            Ok(want)
+        );
+    }
+    // One level and an empty range list.
+    let (code, out, err) = script_levels(Some("60"), Some(""), None);
+    assert_eq!(code, Some(0), "one level, no ranges: {err}");
+    assert!(
+        out.contains("COMMENT 'rollup_res_ms=60000 rollup_from_ms=0 counter_buckets=5';"),
+        "one level, no ranges: {out}"
+    );
+    assert_eq!(pulsus_schema::parse_rollup_ranges("", &[60]), Ok(vec![]));
+    // No levels: the ranges are not read.
+    let (code, out, err) = script_levels(Some(""), Some("1,2"), None);
+    assert_eq!(code, Some(0), "no levels: {err}");
+    assert!(!out.contains("rollup_res_ms="), "no level objects");
+    assert_eq!(pulsus_schema::parse_rollup_ranges("1,2", &[]), Ok(vec![]));
 }

@@ -13,7 +13,7 @@ docs/116.md	model.rs:79	no_name_the_target_file_holds
 docs/116.md	schemas.md:173	no_name_the_target_file_holds
 docs/116.md	schemas.md:228	no_name_the_target_file_holds
 docs/116.md	schemas.md:508	no_name_the_target_file_holds
-docs/116.md	schemas.md:535	no_name_the_target_file_holds
+docs/116.md	schemas.md:509	no_name_the_target_file_holds
 docs/116.md	writer/config.rs:21	pinned_to_another_version
 docs/116.md	writer/config.rs:21-26	pinned_to_another_version
 docs/116.md	writer/rows.rs:407	no_name_the_target_file_holds
@@ -766,7 +766,6 @@ docs/query-lowering.md	plan.rs:1708	ambiguous_basename
 docs/query-lowering.md	plan.rs:1730	ambiguous_basename
 docs/query-lowering.md	plan.rs:179	ambiguous_basename
 docs/query-lowering.md	plan.rs:2258	ambiguous_basename
-docs/query-lowering.md	plan.rs:2263	ambiguous_basename
 docs/query-lowering.md	plan.rs:2648	ambiguous_basename
 docs/query-lowering.md	plan.rs:2822	ambiguous_basename
 docs/query-lowering.md	plan.rs:3629	ambiguous_basename
@@ -826,6 +825,7 @@ docs/query-lowering.md	traces/compile.rs:1902	not_in_this_repository
 docs/query-lowering.md	traces/compile.rs:192	not_in_this_repository
 docs/query-lowering.md	traces/compile.rs:197	not_in_this_repository
 docs/query-lowering.md	traces_search_plan_parts.rs:55-61	not_in_this_repository
+docs/query-lowering.md	plan.rs:3672	ambiguous_basename
 docs/query-to-sql.md	canonical_labels.rs:131-163	no_name_the_target_file_holds
 docs/query-to-sql.md	client_agg.rs:2207	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-config/src/model.rs:642	no_name_the_target_file_holds
@@ -1048,6 +1048,7 @@ docs/query-to-sql.md	traces/search_plan.rs:1121	not_in_this_repository
 docs/query-to-sql.md	traces/search_sql.rs:109-111	not_in_this_repository
 docs/query-to-sql.md	traces/search_sql.rs:170	not_in_this_repository
 docs/query-to-sql.md	traces_api/error.rs:390	no_name_the_target_file_holds
+docs/query-to-sql.md	plan.rs:2513	ambiguous_basename
 docs/reference-defects-we-do-not-copy.md	block_traceql.go:3681-3692	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	block_traceql.go:66-104	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	docs/sources/query/log_queries/_index.md:232	not_in_this_repository

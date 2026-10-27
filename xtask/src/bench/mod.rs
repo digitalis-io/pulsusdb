@@ -187,6 +187,8 @@ async fn run_logs_read(args: BenchArgs) -> anyhow::Result<()> {
         trace_indexed_attributes: Vec::new(),
         graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
         rollup_levels: pulsus_schema::DEFAULT_ROLLUP_LEVELS.to_vec(),
+        rollup_ranges: pulsus_schema::DEFAULT_ROLLUP_RANGES.to_vec(),
+        rollup_counter_buckets: pulsus_schema::DEFAULT_ROLLUP_COUNTER_BUCKETS,
     };
     eprintln!(
         "=== initializing schema (db={}, cluster={:?}) ===",

@@ -1,8 +1,8 @@
 # PromQL rollups: design
 
-**Built.** Part A (#742) and part B (#744) are on `main`; every statement about code in these documents is true of `main` at `1cb423d4`. Tiering and a longer retention per level (#743) are not started.
+**Built.** Part A (#742), part B (#744) and the follow-up that chooses the resolution by the query's time range (issue #18) are on `main`; every statement about code in these documents is true of `main` with that follow-up. Tiering and a longer retention per level (#743) are not started.
 
-A rollup level is a table of per-series bucket summaries of one width, built on a timer from the level below it, and read instead of raw samples when a query's step and range allow it. Its answers approximate the raw answer, by amounts measured per function and level.
+A rollup level is a table of per-series bucket summaries of one width, built on a timer from the level below it, and read instead of raw samples at the resolution chosen by the query's time range. Its answers approximate the raw answer, by amounts measured per function and level.
 
 | document | subject |
 |---|---|
@@ -22,11 +22,11 @@ The user's account is `docs/api.md` §3.6 and the setting's is `docs/configurati
 |---|---|---|---|
 | D1 | A rollup-served answer approximates the raw answer. The column a function reads is chosen by what the data is: a counter's increase, a gauge's last value, minimum, maximum or sum. Every other function reads raw, unchanged | owner | `reading.md` §1 |
 | D2 | The levels are chosen per deployment when the schema is built: `PULSUS_ROLLUP_LEVELS`, a list of seconds read by `schema/schema.sh` and the crate's renderer | owner | `building.md` §1 |
-| D3 | The default is `60,720,7200,86400` | — | `building.md` §1.3 |
+| D3 | The default is `5,60,720,7200,86400` | owner (2026-10-26) | `building.md` §1.3 |
 | D4 | One table per level, each with its expiry in its own `CREATE TABLE`, so each level can carry its own retention and storage placement. One data row per series and bucket, `kind = 0, t_end, t_last, last, min, max, sum, count, inc, flags, built_at`, and one run row per run. No metric type is needed to build a row | owner (one table per level) | `building.md` §2 |
 | D5 | The levels form a chain: the first is built from raw, each other from the one below, each by a refreshable view on its own timer, with the timer and offset derived from the level sizes. A level builds only inside its source's run rows | owner (chain, timers) | `building.md` §3 |
 | D6 | A run reads only its own window | — | `building.md` §3.4 |
-| D7 | A selector reads the level chosen by its step and range inside that level's coverage, and the rest of its window from finer levels, then raw, so every chart refresh shows the newest samples | owner (newest samples) | `reading.md` §2, §3 |
+| D7 | A selector reads the level chosen by the query's time range (`reading.md` §2) inside that level's coverage, and the rest of its window from finer levels, then raw, so every chart refresh shows the newest samples | owner (newest samples) | `reading.md` §2, §3 |
 | D8 | Rollup building runs at a lower priority than inserts and queries: every rollup statement carries `max_threads = 2`, in the schema | owner (lower priority) | `building.md` §5 |
 | D9 | Users can see the levels: in the user documentation, in `runtimeinfo` and in explain | owner | `reading.md` §4 |
 | D10 | Native histograms read raw. Classic histogram buckets are counters | — | `reading.md` §1.2 |
@@ -36,6 +36,7 @@ The user's account is `docs/api.md` §3.6 and the setting's is `docs/configurati
 | D14 | The first level's predecessor for `inc` is the previous sample that is not a stale marker, keyed by `(org_id, fingerprint)`, taken from the level's own table when the run holds none, and not used when more than 24 hours old | — | `building.md` §3.1 |
 | D15 | At a level under 720 s, a `rate` or `increase` window that reaches into time no level covers is computed wholly from raw | — | `reading.md` §1 |
 | D16 | A level carries the projection its next level's run reads only when that next level is shorter than a day | — | `building.md` §2.2 |
+| D17 | The query ranges at which the resolution switches to each level, and the counter bucket count, are set when the schema is built and stored in each level table's comment, where the server reads them | owner (2026-10-26) | `building.md` §1, `reading.md` §2 |
 
 **How the engine is meant to be used, and what differs.** The engine's ordinary rollup is an insert-time materialized view into an aggregating table, as `log_metrics_<res>` is built (`schema/schema.sql:553`, `log_metrics_{{log_rollup_suffix}}_mv`). The levels use refreshable views on timers instead, as `service_edges_mv` is built (`schema/schema.sql:797`). That follows the owner's decision on timers. What it costs, and how the cost is kept down, is `building.md` §3.4 and §5.
 
@@ -65,7 +66,6 @@ The window algebra of issue #18 part 3 (#740) stays as the raw functions' arithm
 | a projection on the level below a day level | the day run reads its source's day partition whole either way (`building.md` §3.4) |
 | one start point per window, at its first row | measured the same as one per row on normal and sparse counters, and further from raw on stopping counters (`reading.md` §1.1) |
 | `irate`, `delta`, `resets` from a level | measured: `irate` p99 81 % at the 720 s level, `delta` median 94 %, and `resets` misses resets (`reading.md` §1.2) |
-| a 5 s first level by default | at a 15 s or 60 s scrape it holds one sample per bucket and stores more than raw (`building.md` §1.3) |
 | a parent-block main key on each level | every query would read 4 to 120 times more rows (`building.md` §6.3); the block key is a projection that only the runs read |
 | `DEPENDS ON` between the level views | it orders views on one server only; the run rows order the runs by their data on one server or many |
 | `priority`, or server workloads, for lower priority | `priority` had no measured effect; workloads matched `max_threads = 2` only with a thread limit, and are server objects each server of a cluster must carry (`building.md` §5) |

@@ -33,7 +33,14 @@ pub fn rendered(ctx: &RenderCtx) -> String {
         Some(_) => (CLUSTER, SINGLE),
         None => (SINGLE, CLUSTER),
     };
-    let expanded = render::expand_levels(SCHEMA_SQL, &ctx.rollup_levels);
+    let expanded = render::expand_levels(
+        SCHEMA_SQL,
+        (
+            &ctx.rollup_levels,
+            &ctx.rollup_ranges,
+            ctx.rollup_counter_buckets,
+        ),
+    );
     let mut out = String::with_capacity(expanded.len());
     for line in expanded.lines() {
         let line = match marked(line, mine) {
@@ -53,10 +60,18 @@ pub fn rendered(ctx: &RenderCtx) -> String {
 
 /// `schema/schema.sql` with its level block expanded for `levels` (issue
 /// #18), before any other step: what a test reads to see the level tables
-/// under their names.
+/// under their names. The switch points and the counter bucket count are
+/// the defaults.
 #[doc(hidden)]
 pub fn expand_levels_for_tests(levels: &[u32]) -> String {
-    render::expand_levels(SCHEMA_SQL, levels)
+    render::expand_levels(
+        SCHEMA_SQL,
+        (
+            levels,
+            render::DEFAULT_ROLLUP_RANGES,
+            render::DEFAULT_ROLLUP_COUNTER_BUCKETS,
+        ),
+    )
 }
 
 /// `line` with `marker` and the spaces after it removed, or `None` when the

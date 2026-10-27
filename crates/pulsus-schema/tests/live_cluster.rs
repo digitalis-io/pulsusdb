@@ -142,6 +142,8 @@ fn cluster_ctx(db: &str) -> SchemaParams {
         trace_indexed_attributes: Vec::new(),
         graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
         rollup_levels: pulsus_schema::DEFAULT_ROLLUP_LEVELS.to_vec(),
+        rollup_ranges: pulsus_schema::DEFAULT_ROLLUP_RANGES.to_vec(),
+        rollup_counter_buckets: pulsus_schema::DEFAULT_ROLLUP_COUNTER_BUCKETS,
     }
 }
 
@@ -285,6 +287,7 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         ("error_spans_dist", TRACES_KEY),
         // Issue #18 part A: the default rollup levels, keyed like the
         // samples.
+        ("metric_samples_5s_dist", METRICS_KEY),
         ("metric_samples_60s_dist", METRICS_KEY),
         ("metric_samples_720s_dist", METRICS_KEY),
         ("metric_samples_7200s_dist", METRICS_KEY),
@@ -1968,7 +1971,8 @@ async fn a_late_row_keeps_the_newest_instant_on_every_replica() {
     );
 }
 
-/// The rollup level views of the default set, finest first (issue #18).
+/// The rollup level views of part A's set, 60 s first, finest first
+/// (issue #18); the default set begins at 5 s.
 const LEVEL_VIEWS: [&str; 4] = [
     "metric_samples_60s_mv",
     "metric_samples_720s_mv",
@@ -2000,9 +2004,12 @@ async fn each_shard_builds_its_slice_once() {
     require_two_shard_topology(&shard1, &shard2).await;
     let db = &TEST_DB_LEVELS;
     drop_cluster_db(&shard1, db).await;
-    run_init(&shard1, &cluster_ctx(db))
-        .await
-        .expect("run_init (clustered)");
+    let ctx = RenderCtx {
+        rollup_levels: vec![60, 720, 7200, 86400],
+        rollup_ranges: vec![86400, 604800, 7776000],
+        ..cluster_ctx(db)
+    };
+    run_init(&shard1, &ctx).await.expect("run_init (clustered)");
     let replicas = [&shard1, &shard1b, &shard2];
     // Each view ran once at creation; wait for it, stop every view, and
     // empty the levels, so the runs below are the test's own.

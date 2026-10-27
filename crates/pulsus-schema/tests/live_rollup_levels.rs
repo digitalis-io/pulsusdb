@@ -53,6 +53,18 @@ static DB_MIDNIGHT: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_levels_midnight");
 static DB_EXPIRY: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_levels_expiry");
+static DB_DISCOVERY: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_levels_discovery");
+
+/// Part A's levels, 60 s first, which these cases were written for; the
+/// default levels begin at 5 s.
+fn part_a(db: &str, retention_days: u32) -> RenderCtx {
+    RenderCtx {
+        rollup_levels: vec![60, 720, 7200, 86400],
+        rollup_ranges: vec![86400, 604800, 7776000],
+        ..RenderCtx::for_tests(db, retention_days)
+    }
+}
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -568,7 +580,7 @@ async fn a_level_is_its_aggregates() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = DB_AGGREGATES.name();
-    let ctx = RenderCtx::for_tests(db, 7);
+    let ctx = part_a(db, 7);
     fresh(&client, &ctx).await;
 
     // (i)
@@ -667,7 +679,7 @@ async fn an_empty_window_moves_the_watermark() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = DB_EMPTY.name();
-    fresh(&client, &RenderCtx::for_tests(db, 7)).await;
+    fresh(&client, &part_a(db, 7)).await;
     let ready = |now: i64| (now - 150_000).div_euclid(MINUTE) * MINUTE;
     let before = ready(now_ms(&client).await);
     let seed = before - 3 * MINUTE;
@@ -716,7 +728,7 @@ async fn a_hole_is_skipped_at_every_level() {
     let db = DB_HOLE_LANDING.name();
     let ctx = RenderCtx {
         metrics_landing_retention_hours: 1,
-        ..RenderCtx::for_tests(db, 7)
+        ..part_a(db, 7)
     };
     fresh(&client, &ctx).await;
     let oldest = |now: i64| (now - HOUR + 12 * MINUTE + MINUTE - 1).div_euclid(MINUTE) * MINUTE;
@@ -747,7 +759,7 @@ async fn a_hole_is_skipped_at_every_level() {
     let db = DB_HOLE_SOURCE.name();
     let ctx = RenderCtx {
         rollup_levels: vec![60, 720, 7200],
-        ..RenderCtx::for_tests(db, 7)
+        ..part_a(db, 7)
     };
     fresh(&client, &ctx).await;
     let now = now_ms(&client).await;
@@ -829,7 +841,7 @@ async fn each_run_reads_its_window() {
     // name from an earlier run left its own runs there.
     let since = now_ms(&client).await;
     let db = DB_WINDOW.name();
-    fresh(&client, &RenderCtx::for_tests(db, 7)).await;
+    fresh(&client, &part_a(db, 7)).await;
     let now = now_ms(&client).await;
     let end = now / MINUTE * MINUTE - 3 * MINUTE;
     let start = end - 40 * MINUTE;
@@ -897,7 +909,7 @@ async fn each_run_reads_its_window() {
 
     // (ii)
     let db = DB_WINDOW_UP.name();
-    fresh(&client, &RenderCtx::for_tests(db, 7)).await;
+    fresh(&client, &part_a(db, 7)).await;
     let day = (now_ms(&client).await / DAY - 2) * DAY;
     exec(
         &client,
@@ -1005,7 +1017,7 @@ async fn a_level_waits_for_its_source() {
     let db = DB_WAITS.name();
     let ctx = RenderCtx {
         rollup_levels: vec![60, 720, 7200],
-        ..RenderCtx::for_tests(db, 7)
+        ..part_a(db, 7)
     };
     fresh(&client, &ctx).await;
     let now = now_ms(&client).await;
@@ -1040,7 +1052,7 @@ async fn runs_split_at_midnight_and_expire_by_day() {
     let db = DB_MIDNIGHT.name();
     let ctx = RenderCtx {
         rollup_levels: vec![60, 720],
-        ..RenderCtx::for_tests(db, 7)
+        ..part_a(db, 7)
     };
     fresh(&client, &ctx).await;
     let m = (now_ms(&client).await / DAY - 1) * DAY;
@@ -1063,7 +1075,7 @@ async fn runs_split_at_midnight_and_expire_by_day() {
 
     // (ii)
     let db = DB_EXPIRY.name();
-    let ctx = RenderCtx::for_tests(db, 4);
+    let ctx = part_a(db, 4);
     fresh(&client, &ctx).await;
     let t = now_ms(&client).await / DAY;
     for r in ctx.rollup_levels.clone() {
@@ -1188,7 +1200,7 @@ async fn a_sparse_counter_keeps_its_steps() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = DB_SPARSE.name();
-    let ctx = RenderCtx::for_tests(db, 7);
+    let ctx = part_a(db, 7);
     fresh(&client, &ctx).await;
     let now = now_ms(&client).await;
     let t0 = (now / HOUR) * HOUR - 4 * HOUR;
@@ -1381,7 +1393,7 @@ async fn stale_markers_and_nan_at_the_levels() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = DB_STALE.name();
-    let ctx = RenderCtx::for_tests(db, 7);
+    let ctx = part_a(db, 7);
     fresh(&client, &ctx).await;
     let now = now_ms(&client).await;
     let d = (now / DAY) * DAY - DAY;
@@ -1519,5 +1531,44 @@ async fn stale_markers_and_nan_at_the_levels() {
         );
     }
 
+    drop_db(&client, db).await;
+}
+
+/// **T7 (issue #18 follow-up): the discovery reads the switch points.** A
+/// database built with the default levels: the level discovery returns the
+/// five levels, each with the query range from which it is the
+/// resolution, and the counter bucket count.
+#[tokio::test]
+async fn the_discovery_reads_the_switch_points() {
+    use pulsus_read::metrics::rollup::{LevelSlot, refresh_levels};
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = DB_DISCOVERY.name();
+    drop_db(&client, db).await;
+    run_init(&client, &RenderCtx::for_tests(db, 7))
+        .await
+        .expect("run_init");
+    let slot = LevelSlot::new();
+    refresh_levels(&slot, &client, db, "_dist", None)
+        .await
+        .expect("the level discovery");
+    let levels = slot.get().expect("the levels");
+    let got: Vec<(i64, String, u64)> = levels
+        .levels
+        .iter()
+        .map(|l| (l.res_ms, l.table.clone(), l.from_ms))
+        .collect();
+    let want: Vec<(i64, String, u64)> = [
+        (5_000, 0),
+        (60_000, 3_600_000),
+        (720_000, 86_400_000),
+        (7_200_000, 604_800_000),
+        (86_400_000, 7_776_000_000),
+    ]
+    .into_iter()
+    .map(|(ms, from)| (ms, format!("metric_samples_{}s", ms / 1000), from))
+    .collect();
+    assert_eq!(got, want, "the levels and their switch points");
+    assert_eq!(levels.counter_buckets, 5, "the counter bucket count");
     drop_db(&client, db).await;
 }

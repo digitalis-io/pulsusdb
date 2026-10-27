@@ -87,6 +87,8 @@ const STEP_MS: i64 = 60_000;
 
 fn plan_params() -> PlanParams {
     PlanParams {
+        widen_to: None,
+        eval: None,
         start_ms: START_MS,
         end_ms: END_MS,
         step_ms: STEP_MS,

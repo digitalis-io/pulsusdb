@@ -191,6 +191,30 @@ pub async fn build_schema_with_retention(db: &str, retention_days: u32) {
         .unwrap_or_else(|e| panic!("build the schema in {db}: {e}"));
 }
 
+/// Builds `db` with no rollup levels (issue #18 follow-up), leaving an
+/// existing database alone as [`build_schema_with_retention`] does: a
+/// suite whose statements must take the routes a level would pre-empt.
+/// Call it before the server spawns, so the spawn's own build finds the
+/// database there.
+pub async fn build_schema_without_levels(db: &str) {
+    let client = ChClient::new(conn_config("default"))
+        .await
+        .unwrap_or_else(|e| panic!("connect bootstrap client to build {db}: {e}"));
+    if pulsus_schema::database_exists(&client, db)
+        .await
+        .unwrap_or_else(|e| panic!("read whether {db} exists: {e}"))
+    {
+        return;
+    }
+    let params = pulsus_schema::RenderCtx {
+        rollup_levels: Vec::new(),
+        ..pulsus_schema::RenderCtx::for_tests(db, 7)
+    };
+    pulsus_schema_testkit::run_init(&client, &params)
+        .await
+        .unwrap_or_else(|e| panic!("build the schema in {db}: {e}"));
+}
+
 /// Rewrites `db`'s comment to state `days` of retention, leaving every
 /// table's TTL as it was built (issue #497). The binary reads its read
 /// floors from the comment, so a test can hold rows storage still has past

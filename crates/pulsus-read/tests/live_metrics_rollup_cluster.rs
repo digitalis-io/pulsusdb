@@ -183,10 +183,14 @@ async fn a_run_row_is_read_with_its_data() {
         return;
     }
     let db = pulsus_testkit::test_db("pulsus_read_it_rollup_cluster");
+    // Part B's levels, 60 s first: the 40-minute query below reads the
+    // first level.
     let ctx = RenderCtx {
         db: db.clone(),
         cluster: Some(CLUSTER_NAME.to_string()),
         dist_suffix: "_dist".to_string(),
+        rollup_levels: vec![60, 720, 7200, 86400],
+        rollup_ranges: vec![86400, 604800, 7776000],
         ..RenderCtx::for_tests(&db, 30)
     };
     let bootstrap = ChClient::new(shard1_config("default"))
@@ -323,7 +327,25 @@ async fn a_run_row_is_read_with_its_data() {
         .query_explained(&tenant, &expr, &p)
         .await
         .expect("routed");
-    let (b, _, _) = raw.query_explained(&tenant, &expr, &p).await.expect("raw");
+    // The engine without levels is asked on the grid the routed answer
+    // came on, `start + k × S` (issue #18 follow-up, plan r16), so neither
+    // carries a time the other lacks.
+    let (res, g) =
+        pulsus_read::metrics::rollup::grid(&p, &slot.get().expect("levels")).expect("a grid");
+    let grid = MetricQueryParams {
+        start_ms: p.start_ms,
+        end_ms: g.end_ms,
+        step_ms: g.step_ms,
+    };
+    assert_eq!(res, MIN, "the 60 s level is the resolution");
+    assert!(
+        explain.stages.iter().any(|s| s.name == "rollup_grid"),
+        "the routed answer is on the changed grid"
+    );
+    let (b, _, _) = raw
+        .query_explained(&tenant, &expr, &grid)
+        .await
+        .expect("raw");
     let notes: Vec<String> = explain
         .stages
         .iter()

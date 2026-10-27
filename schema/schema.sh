@@ -56,7 +56,9 @@ trace_landing_hours=${PULSUS_TRACE_LANDING_RETENTION_HOURS:-6}
 metrics_dedup=${PULSUS_METRICS_DEDUP_WINDOW:-10000}
 log_dedup=${PULSUS_LOG_DEDUP_WINDOW:-10000}
 trace_dedup=${PULSUS_TRACE_DEDUP_WINDOW:-10000}
-rollup_levels=${PULSUS_ROLLUP_LEVELS-60,720,7200,86400}
+rollup_levels=${PULSUS_ROLLUP_LEVELS-5,60,720,7200,86400}
+rollup_ranges=${PULSUS_ROLLUP_RANGES-3600,86400,604800,7776000}
+counter_buckets=${PULSUS_ROLLUP_COUNTER_BUCKETS-5}
 
 # `pulsus_schema::DEDUP_WINDOW_SECONDS`. Not a knob: the startup check in
 # `pulsus-server` holds it against the landing budget.
@@ -174,6 +176,65 @@ if [ -n "$rollup_levels" ]; then
     set --
 fi
 
+# Issue #18 follow-up: `PULSUS_ROLLUP_RANGES`, the query range in seconds
+# from which each level after the first is the resolution, read only when
+# there are levels; set and empty is an empty list. The same rules, in the
+# same order and with the same messages, as
+# `pulsus_schema::parse_rollup_ranges`.
+bad_ranges() {
+    echo "schema.sh: PULSUS_ROLLUP_RANGES: $1" >&2
+    exit 2
+}
+if [ -n "$rollup_levels" ]; then
+    case "$rollup_ranges" in
+        ,* | *, | *,,*) bad_ranges "an empty item in '$rollup_ranges'" ;;
+    esac
+    old_ifs=$IFS
+    IFS=,
+    set -f
+    # shellcheck disable=SC2086
+    set -- $rollup_ranges
+    set +f
+    IFS=$old_ifs
+    for item in "$@"; do
+        case "$item" in
+            0* | *[!0-9]* | ??????????*)
+                bad_ranges "$item is not a whole number of seconds from 1 to 999999999" ;;
+        esac
+    done
+    n_ranges=$#
+    n_levels=$(printf '%s\n' "$rollup_levels" | awk -F, '{ print NF }')
+    [ $((n_ranges + 1)) -eq "$n_levels" ] ||
+        bad_ranges "$n_ranges ranges for $n_levels levels: give one for each level after the first"
+    prev=""
+    for item in "$@"; do
+        if [ -n "$prev" ] && [ "$item" -le "$prev" ]; then
+            bad_ranges "$prev then $item: the ranges must increase"
+        fi
+        prev=$item
+    done
+    level_of=$(printf '%s\n' "$rollup_levels" | cut -d, -f2-)
+    for item in "$@"; do
+        level=${level_of%%,*}
+        level_of=${level_of#*,}
+        [ "$item" -ge "$level" ] || bad_ranges "$item is shorter than its level $level"
+    done
+    set --
+fi
+
+# Issue #18 follow-up: `PULSUS_ROLLUP_COUNTER_BUCKETS`, the buckets of a
+# level a `rate` or `increase` range covers at least. The same rule and
+# message as `pulsus_schema::parse_rollup_counter_buckets`.
+case "$counter_buckets" in
+    '' | 0* | *[!0-9]* | ?????*) bad_counter_buckets=1 ;;
+    *) bad_counter_buckets=0 ;;
+esac
+if [ "$bad_counter_buckets" -eq 1 ] || [ "$counter_buckets" -lt 2 ] ||
+    [ "$counter_buckets" -gt 1000 ]; then
+    echo "schema.sh: PULSUS_ROLLUP_COUNTER_BUCKETS: $counter_buckets is not a whole number from 2 to 1000" >&2
+    exit 2
+fi
+
 if [ "$mode" = cluster ] && [ -z "$cluster" ]; then
     echo "schema.sh: --mode cluster needs PULSUS_CLUSTER set to the cluster name" >&2
     exit 2
@@ -278,7 +339,8 @@ other=single
 # The rollup levels (issue #18): the `--@level*` block of schema.sql, once per
 # level, smallest first. `pulsus_schema::expand_levels` does the same.
 expand_levels() {
-    ROLLUP_LEVELS=$rollup_levels awk '
+    ROLLUP_LEVELS=$rollup_levels ROLLUP_RANGES=$rollup_ranges \
+    COUNTER_BUCKETS=$counter_buckets awk '
     function unit(v) {
         if (v % 86400 == 0) return (v / 86400) " DAY"
         if (v % 3600 == 0) return (v / 3600) " HOUR"
@@ -309,13 +371,18 @@ expand_levels() {
                 line = rep(line, "{{source}}", i > 1 ? "metric_samples_" lv[i - 1] "s" : "")
                 line = rep(line, "{{parent_ms}}", i < n ? lv[i + 1] "000" : "")
                 line = rep(line, "{{period_ms}}", p "000")
+                line = rep(line, "{{from_ms}}", i == 1 ? "0" : rg[i - 1] "000")
+                line = rep(line, "{{counter_buckets}}", ENVIRON["COUNTER_BUCKETS"])
                 line = rep(line, "{{timer}}", timer)
                 print line
             }
         }
         nb = 0
     }
-    BEGIN { n = ENVIRON["ROLLUP_LEVELS"] == "" ? 0 : split(ENVIRON["ROLLUP_LEVELS"], lv, ",") }
+    BEGIN {
+        n = ENVIRON["ROLLUP_LEVELS"] == "" ? 0 : split(ENVIRON["ROLLUP_LEVELS"], lv, ",")
+        if (ENVIRON["ROLLUP_RANGES"] != "") split(ENVIRON["ROLLUP_RANGES"], rg, ",")
+    }
     {
         kind = ""
         if (index($0, "--@level-first ") == 1) { kind = "first"; rest = substr($0, 16) }

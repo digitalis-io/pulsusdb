@@ -2023,14 +2023,25 @@ enum ReviewedVerdict {
 // 2428 no longer carries the unrelated `let` the anchor rule matched; the
 // citation is an ambiguous basename again, read by neither rule, and there
 // is no divergence left to hold a judgement about.
-const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 1] = [(
-    "docs/query-lowering.md",
-    "exec.rs:1360-1362",
-    0,
-    ReviewedVerdict::FallbackWrong,
-    "the search settings block the same section quotes; it is in traces/exec.rs \
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 2] = [
+    (
+        "docs/query-lowering.md",
+        "exec.rs:1360-1362",
+        0,
+        ReviewedVerdict::FallbackWrong,
+        "the search settings block the same section quotes; it is in traces/exec.rs \
          (`exec.rs:3227-3233` before #602 part 2c-2b-2 renumbered it)",
-)];
+    ),
+    (
+        "docs/query-lowering.md",
+        "plan.rs:2263",
+        0,
+        ReviewedVerdict::FallbackRight,
+        "the LogQL `RangeAgg` that forbids `unwrap`, in logql/plan.rs; the anchor rule \
+         matches `count_over_time` on the PromQL planner's line 2263 only because issue \
+         #18's follow-up moved that file's lines",
+    ),
+];
 
 /// **Where the language fallback and the anchor rule disagree, and what a
 /// person concluded about each.**
@@ -2185,7 +2196,13 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
         //
         // Issue #18 part B removes the `plan.rs:2428` `FallbackRight` row:
         // the line it judged moved, and neither rule reads the citation.
-        (1, 0, 0),
+        //
+        // Issue #18's follow-up adds one `FallbackRight` row, `plan.rs:2263`:
+        // the PromQL planner's lines moved, and the anchor rule now matches
+        // `count_over_time` there, where the citing prose describes LogQL.
+        // §12.3's decision stands: the fallback still answers one reviewed
+        // citation wrongly, so it is still not applied.
+        (1, 1, 0),
         "the reviewed verdicts moved; re-read §12.3's decision against them"
     );
 }
