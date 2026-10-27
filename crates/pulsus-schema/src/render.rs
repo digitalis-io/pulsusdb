@@ -80,6 +80,20 @@ pub struct RenderCtx {
     /// `PULSUS_ROLLUP_COUNTER_BUCKETS` (issue #18): the buckets a counter's
     /// range covers at least.
     pub rollup_counter_buckets: u32,
+    /// `PULSUS_COLD_VOLUME` (docs/configuration.md §3, issue #743 part A):
+    /// the volume of the storage policy old parts move to; `None` moves
+    /// nothing.
+    pub cold_volume: Option<String>,
+    /// `PULSUS_METRICS_HOT_DAYS` (docs/configuration.md §3, issue #743 part
+    /// A): the days a metric sample stays on the local volume.
+    pub metrics_hot_days: Option<u32>,
+    /// `PULSUS_LOGS_HOT_DAYS` (docs/configuration.md §3, issue #743 part A):
+    /// the days a log line and its rollups stay on the local volume.
+    pub logs_hot_days: Option<u32>,
+    /// `PULSUS_TRACES_HOT_DAYS` (docs/configuration.md §3, issue #743 part
+    /// A): the days a span and the trace tables read by time stay on the
+    /// local volume.
+    pub traces_hot_days: Option<u32>,
 }
 
 /// The rows one run of the service-graph job may read (issue #599), the
@@ -129,6 +143,10 @@ impl RenderCtx {
             rollup_levels: DEFAULT_ROLLUP_LEVELS.to_vec(),
             rollup_ranges: DEFAULT_ROLLUP_RANGES.to_vec(),
             rollup_counter_buckets: DEFAULT_ROLLUP_COUNTER_BUCKETS,
+            cold_volume: None,
+            metrics_hot_days: None,
+            logs_hot_days: None,
+            traces_hot_days: None,
         }
     }
 }
@@ -351,6 +369,38 @@ pub fn parse_rollup_counter_buckets(text: &str) -> Result<u32, String> {
     }
 }
 
+/// Every input `schema/schema.sh`'s tiering block reads (issue #743 part A).
+/// A text is `None` when its variable is unset or empty, as the script
+/// treats `${VAR:-}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TieringInput<'a> {
+    pub storage_policy: Option<&'a str>,
+    pub cold_volume: Option<&'a str>,
+    pub retention_days: u32,
+    pub metrics_hot_days: Option<&'a str>,
+    pub logs_hot_days: Option<&'a str>,
+    pub traces_hot_days: Option<&'a str>,
+}
+
+/// The `RenderCtx` fields the tiering block decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tiering {
+    pub cold_volume: Option<String>,
+    pub metrics_hot_days: Option<u32>,
+    pub logs_hot_days: Option<u32>,
+    pub traces_hot_days: Option<u32>,
+}
+
+/// Stub: accepts everything (issue #743 part A, tests first).
+pub fn validate_tiering(_input: &TieringInput<'_>) -> Result<Tiering, String> {
+    Ok(Tiering {
+        cold_volume: None,
+        metrics_hot_days: None,
+        logs_hot_days: None,
+        traces_hot_days: None,
+    })
+}
+
 /// Which levels a line of the level block is kept for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LevelLine {
@@ -552,6 +602,10 @@ mod tests {
             rollup_levels: DEFAULT_ROLLUP_LEVELS.to_vec(),
             rollup_ranges: DEFAULT_ROLLUP_RANGES.to_vec(),
             rollup_counter_buckets: DEFAULT_ROLLUP_COUNTER_BUCKETS,
+            cold_volume: None,
+            metrics_hot_days: None,
+            logs_hot_days: None,
+            traces_hot_days: None,
         }
     }
 

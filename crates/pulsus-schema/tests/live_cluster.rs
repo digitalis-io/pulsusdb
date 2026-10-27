@@ -144,6 +144,10 @@ fn cluster_ctx(db: &str) -> SchemaParams {
         rollup_levels: pulsus_schema::DEFAULT_ROLLUP_LEVELS.to_vec(),
         rollup_ranges: pulsus_schema::DEFAULT_ROLLUP_RANGES.to_vec(),
         rollup_counter_buckets: pulsus_schema::DEFAULT_ROLLUP_COUNTER_BUCKETS,
+        cold_volume: None,
+        metrics_hot_days: None,
+        logs_hot_days: None,
+        traces_hot_days: None,
     }
 }
 
@@ -2168,4 +2172,251 @@ async fn each_shard_builds_its_slice_once() {
         ],
         "one run row per shard, from its first replica: a second replica's run would add one"
     );
+}
+
+// Issue #743 part A: the pre-check's cluster form, and each replica's own
+// copy on the object store.
+static TEST_DB_TIER_REFUSE: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_tier_refuse");
+static TEST_DB_TIER_MOVE: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_tier_move");
+
+/// One column, every row, as text, on `client`.
+async fn strings_on(client: &ChClient, sql: &str) -> Vec<String> {
+    client
+        .query_strings(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("read failed: {e}\nSQL:\n{sql}"))
+}
+
+/// The one value of a one-row, one-column answer on `client`.
+async fn one_on(client: &ChClient, sql: &str) -> String {
+    let rows = strings_on(client, sql).await;
+    assert_eq!(rows.len(), 1, "one row: {sql}");
+    rows.into_iter().next().expect("one row")
+}
+
+/// **A6b (issue #743 part A): the script refuses a policy one host lacks
+/// before it drops anything, and builds on a policy every host carries.**
+/// `storage_partial.xml` gives `pulsus_test_partial` to shard 1's two
+/// servers only.
+#[tokio::test]
+async fn the_script_refuses_a_policy_missing_on_one_host_before_it_drops() {
+    skip_unless_live!();
+    let servers = [
+        ("shard 1", shard1_config()),
+        ("shard 1b", shard1b_config()),
+        ("shard 2", shard2_config()),
+    ];
+    let mut clients = Vec::new();
+    for (name, cfg) in &servers {
+        clients.push((*name, ChClient::new(cfg.clone()).await.expect("connect")));
+    }
+    let shard1 = &clients[0].1;
+    let d = TEST_DB_TIER_REFUSE.name();
+    drop_cluster_db(shard1, d).await;
+    exec_on(
+        shard1,
+        &format!("CREATE DATABASE {d} ON CLUSTER '{CLUSTER_NAME}'"),
+    )
+    .await;
+    exec_on(
+        shard1,
+        &format!(
+            "CREATE TABLE {d}.keep ON CLUSTER '{CLUSTER_NAME}' (x UInt8) \
+             ENGINE = MergeTree ORDER BY x"
+        ),
+    )
+    .await;
+    let keep = format!(
+        "SELECT toString(count()) AS s FROM system.tables WHERE database = '{d}' AND name = 'keep'"
+    );
+
+    let cfg = &servers[0].1;
+    let script = |policy: &str| {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg(root.join("schema/schema.sh")).current_dir(&root);
+        for (var, _) in std::env::vars() {
+            if var.starts_with("PULSUS_") {
+                cmd.env_remove(var);
+            }
+        }
+        cmd.env("CLICKHOUSE_SERVER", &cfg.server)
+            .env("CLICKHOUSE_HTTP_PORT", cfg.http_port.to_string())
+            .env("PULSUS_SCHEMA_WAIT_SECONDS", "30")
+            .env("PULSUS_CLUSTER", CLUSTER_NAME)
+            .env("CLICKHOUSE_DB", d)
+            .env("PULSUS_RETENTION_DAYS", "7")
+            .env("PULSUS_STORAGE_POLICY", policy)
+            .env("PULSUS_COLD_VOLUME", "cold")
+            .env("PULSUS_METRICS_HOT_DAYS", "2")
+            .env("PULSUS_LOGS_HOT_DAYS", "2")
+            .env("PULSUS_TRACES_HOT_DAYS", "2");
+        let out = cmd.output().expect("run schema.sh");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (code, err) = script("pulsus_test_partial");
+    assert_eq!(code, Some(1), "(1) a policy on 2 of 3 hosts: {err}");
+    assert_eq!(
+        err.trim_end().lines().last(),
+        Some(
+            "schema.sh: storage policy 'pulsus_test_partial' with a volume 'cold' after its \
+             first and move_factor 0 is defined on 2 of 3 hosts; every server's configuration \
+             must carry it (docs/configuration.md §3)"
+        ),
+        "(1) the message"
+    );
+    for (name, client) in &clients {
+        assert_eq!(
+            one_on(client, &keep).await,
+            "1",
+            "(1) {name}: nothing is dropped"
+        );
+    }
+
+    let (code, err) = script("pulsus_test_tiered");
+    assert_eq!(code, Some(0), "(2) a policy on every host: {err}");
+    for (name, client) in &clients {
+        assert_eq!(one_on(client, &keep).await, "0", "(2) {name}: rebuilt");
+        let q = create_table_query(client, d, "metric_samples").await;
+        assert!(q.contains("TO VOLUME 'cold'"), "(2) {name}: {q}");
+    }
+
+    drop_cluster_db(shard1, d).await;
+}
+
+/// **A7 (issue #743 part A): each replica moves its own copy.** A day past
+/// the move age, written through the routing table, is on the object store
+/// on every server, and each server wrote objects under its own
+/// `{shard}/{replica}` prefix; shard 1's two replicas wrote as many.
+#[tokio::test]
+async fn each_replica_moves_its_own_copy() {
+    skip_unless_live!();
+    let servers = [
+        ("shard 1", shard1_config()),
+        ("shard 1b", shard1b_config()),
+        ("shard 2", shard2_config()),
+    ];
+    let mut clients = Vec::new();
+    for (name, cfg) in &servers {
+        clients.push((*name, ChClient::new(cfg.clone()).await.expect("connect")));
+    }
+    let shard1 = &clients[0].1;
+    let db = TEST_DB_TIER_MOVE.name();
+    drop_cluster_db(shard1, db).await;
+    let ctx = RenderCtx {
+        storage_policy: Some("pulsus_test_tiered".to_string()),
+        cold_volume: Some("cold".to_string()),
+        metrics_hot_days: Some(2),
+        logs_hot_days: Some(7),
+        traces_hot_days: Some(7),
+        ..cluster_ctx(db)
+    };
+    run_init(shard1, &ctx).await.expect("run_init (clustered)");
+
+    // The objects under each server's own prefix.
+    let mut prefixes = Vec::new();
+    for (_, client) in &clients {
+        let shard = one_on(
+            client,
+            "SELECT substitution AS s FROM system.macros WHERE macro = 'shard'",
+        )
+        .await;
+        let replica = one_on(
+            client,
+            "SELECT substitution AS s FROM system.macros WHERE macro = 'replica'",
+        )
+        .await;
+        prefixes.push(format!(
+            "SELECT toString(count()) AS s FROM s3('http://172.28.0.20:9000/pulsus-ci/ci/{shard}/{replica}/**', \
+             'pulsus-ci', 'pulsus-ci-secret', 'One')"
+        ));
+    }
+    let mut before = Vec::new();
+    for ((_, client), objects) in clients.iter().zip(&prefixes) {
+        let n: u64 = one_on(client, objects).await.parse().expect("a count");
+        before.push(n);
+    }
+
+    let now_ms: i64 = one_on(
+        shard1,
+        "SELECT toString(toUnixTimestamp64Milli(now64())) AS s",
+    )
+    .await
+    .parse()
+    .expect("milliseconds");
+    let ts = now_ms - 302_400_000; // 3.5 days
+    exec_on(
+        shard1,
+        &format!(
+            "INSERT INTO {db}.metric_samples_dist (org_id, fingerprint, unix_milli, value) \
+             SELECT '', number + 1, toInt64({ts}), 1 FROM numbers(100)"
+        ),
+    )
+    .await;
+    exec_on(
+        shard1,
+        &format!("SYSTEM FLUSH DISTRIBUTED {db}.metric_samples_dist"),
+    )
+    .await;
+    for (_, client) in &clients {
+        exec_on(client, &format!("SYSTEM SYNC REPLICA {db}.metric_samples")).await;
+    }
+
+    let partition = one_on(
+        shard1,
+        &format!("SELECT toString(toDate(fromUnixTimestamp64Milli(toInt64({ts})), 'UTC')) AS s"),
+    )
+    .await;
+    let mut counts = Vec::new();
+    let mut gained = Vec::new();
+    for (((name, client), objects), before) in clients.iter().zip(&prefixes).zip(&before) {
+        let disks = strings_on(
+            client,
+            &format!(
+                "SELECT disk_name AS s FROM system.parts WHERE database = '{db}' \
+                 AND table = 'metric_samples' AND active AND partition = '{partition}'"
+            ),
+        )
+        .await;
+        assert!(!disks.is_empty(), "{name}: the day has a part");
+        assert!(
+            disks.iter().all(|d| d == "cold_store"),
+            "{name}: every part of the day is on the object store: {disks:?}"
+        );
+        let n: u64 = one_on(
+            client,
+            &format!("SELECT toString(count()) AS s FROM {db}.metric_samples"),
+        )
+        .await
+        .parse()
+        .expect("a count");
+        counts.push(n);
+        let after: u64 = one_on(client, objects).await.parse().expect("a count");
+        assert!(
+            after > *before,
+            "{name}: objects written under its own prefix: {before} then {after}"
+        );
+        gained.push(after - before);
+    }
+    assert_eq!(
+        counts[0], counts[1],
+        "shard 1's two replicas hold the same rows"
+    );
+    assert_eq!(
+        counts[0] + counts[2],
+        100,
+        "the two shards hold every row once"
+    );
+    assert_eq!(
+        gained[0], gained[1],
+        "shard 1's two replicas each wrote their own copy"
+    );
+
+    drop_cluster_db(shard1, db).await;
 }

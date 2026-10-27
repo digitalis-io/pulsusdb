@@ -151,6 +151,10 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         rollup_levels: pulsus_schema::DEFAULT_ROLLUP_LEVELS.to_vec(),
         rollup_ranges: pulsus_schema::DEFAULT_ROLLUP_RANGES.to_vec(),
         rollup_counter_buckets: pulsus_schema::DEFAULT_ROLLUP_COUNTER_BUCKETS,
+        cold_volume: None,
+        metrics_hot_days: None,
+        logs_hot_days: None,
+        traces_hot_days: None,
     };
 
     // Frozen once, for the whole run — see `now_unix_ns`'s doc comment.

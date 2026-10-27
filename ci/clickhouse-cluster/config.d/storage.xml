@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<!--
+  Issue #743 part A: a cold volume on the CI object store (compose.yaml,
+  172.28.0.20), each server under its own `{shard}/{replica}` prefix.
+  Test-only credentials, the same as the store's. `pulsus_test_tiered` moves
+  only by TTL (`move_factor` 0); `pulsus_test_pressure` (0.1) is the one
+  `schema/schema.sh` must refuse. `skip_access_check`: a server starts
+  before the workflow creates the bucket.
+-->
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <cold_store>
+                <type>s3</type>
+                <endpoint>http://172.28.0.20:9000/pulsus-ci/ci/{shard}/{replica}/</endpoint>
+                <access_key_id>pulsus-ci</access_key_id>
+                <secret_access_key>pulsus-ci-secret</secret_access_key>
+                <skip_access_check>true</skip_access_check>
+            </cold_store>
+        </disks>
+        <policies>
+            <pulsus_test_tiered>
+                <volumes>
+                    <hot><disk>default</disk></hot>
+                    <cold><disk>cold_store</disk></cold>
+                </volumes>
+                <move_factor>0</move_factor>
+            </pulsus_test_tiered>
+            <pulsus_test_pressure>
+                <volumes>
+                    <hot><disk>default</disk></hot>
+                    <cold><disk>cold_store</disk></cold>
+                </volumes>
+                <move_factor>0.1</move_factor>
+            </pulsus_test_pressure>
+        </policies>
+    </storage_configuration>
+</clickhouse>

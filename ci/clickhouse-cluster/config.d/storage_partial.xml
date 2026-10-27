@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<!--
+  Issue #743 part A: a policy only the shard 1 servers carry, so the
+  pre-check's cluster form must refuse it (2 of 3 hosts). Uses storage.xml's
+  disk.
+-->
+<clickhouse>
+    <storage_configuration>
+        <policies>
+            <pulsus_test_partial>
+                <volumes>
+                    <hot><disk>default</disk></hot>
+                    <cold><disk>cold_store</disk></cold>
+                </volumes>
+                <move_factor>0</move_factor>
+            </pulsus_test_partial>
+        </policies>
+    </storage_configuration>
+</clickhouse>

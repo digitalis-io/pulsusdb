@@ -23,8 +23,9 @@ pub use checks::{
 pub use error::SchemaError;
 pub use render::{
     DEFAULT_ROLLUP_COUNTER_BUCKETS, DEFAULT_ROLLUP_LEVELS, DEFAULT_ROLLUP_RANGES,
-    GRAPH_JOB_MAX_ROWS, RenderCtx, SchemaParams, parse_rollup_counter_buckets, parse_rollup_levels,
-    parse_rollup_ranges, render_name, rollup_suffix,
+    GRAPH_JOB_MAX_ROWS, RenderCtx, SchemaParams, Tiering, TieringInput,
+    parse_rollup_counter_buckets, parse_rollup_levels, parse_rollup_ranges, render_name,
+    rollup_suffix, validate_tiering,
 };
 pub use sql::{
     SCHEMA_SQL, expand_levels_for_tests, mv_projection, rendered, rendered_statements,
