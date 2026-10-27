@@ -76,9 +76,45 @@ pub struct EvalGrid {
 }
 
 impl QueryPlan {
-    /// STUB (tests first).
+    /// Issue #18 follow-up (plan r17): every distinct `(written, read)`
+    /// range pair that widened, of selectors and of subqueries, ascending;
+    /// for explain.
     pub fn widened_ranges(&self) -> Vec<(i64, i64)> {
-        Vec::new()
+        fn walk(expr: &PlanExpr, out: &mut Vec<(i64, i64)>) {
+            if let PlanExpr::RangeFn {
+                source: RangeSource::Subquery(sq),
+                ..
+            }
+            | PlanExpr::OverTime {
+                source: RangeSource::Subquery(sq),
+                ..
+            }
+            | PlanExpr::OverTimeParam {
+                source: RangeSource::Subquery(sq),
+                ..
+            }
+            | PlanExpr::AbsentOverTime {
+                source: RangeSource::Subquery(sq),
+                ..
+            } = expr
+                && sq.written_range_ms != sq.range_ms
+            {
+                out.push((sq.written_range_ms, sq.range_ms));
+            }
+            for_each_child(expr, &mut |c| walk(c, out));
+        }
+        let mut out: Vec<(i64, i64)> = self
+            .selectors
+            .iter()
+            .filter_map(|s| match (s.written_range_ms, s.range_ms) {
+                (Some(w), Some(r)) if w != r => Some((w, r)),
+                _ => None,
+            })
+            .collect();
+        walk(&self.root, &mut out);
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 }
 
@@ -1052,9 +1088,47 @@ struct Planner {
     step_ms: i64,
     ctx: SubqueryCtx,
     subquery_depth: usize,
+    /// Issue #18 follow-up (plan r17): [`PlanParams::widen_to`], the
+    /// lookback and the last evaluation time, to widen a short outer range
+    /// and check its fetch window; `overflow` is set when that window, or
+    /// a widened subquery's, does not fit `i64`.
+    widen_to: Option<i64>,
+    lookback_ms: i64,
+    eval_end_ms: i64,
+    overflow: bool,
 }
 
 impl Planner {
+    /// Issue #18 follow-up (plan r17): `range_ms` as read on a stretched
+    /// grid: `S` when it is shorter, at the outer grid and without `@`.
+    fn widened(&self, range_ms: i64, at_ms: Option<i64>) -> i64 {
+        match self.widen_to {
+            Some(s) if self.subquery_depth == 0 && at_ms.is_none() && range_ms < s => s,
+            _ => range_ms,
+        }
+    }
+
+    /// Issue #18 follow-up (plan r17): on a stretched grid, whether the
+    /// window `(base − range − extra − lookback − offset, end − offset +
+    /// lookback]` fits `i64`; sets `overflow` when it does not.
+    fn check_window(&mut self, range_ms: i64, extra_ms: i64, offset_ms: i64, at_ms: Option<i64>) {
+        if self.widen_to.is_none() {
+            return;
+        }
+        let (lo, hi) = at_ms.map_or((self.start_ms, self.eval_end_ms), |at| (at, at));
+        let fits = range_ms
+            .checked_add(extra_ms)
+            .and_then(|w| w.checked_add(self.lookback_ms))
+            .and_then(|w| lo.checked_sub(w))
+            .and_then(|l| l.checked_sub(offset_ms))
+            .and_then(|_| hi.checked_sub(offset_ms))
+            .and_then(|h| h.checked_add(self.lookback_ms))
+            .is_some();
+        if !fits {
+            self.overflow = true;
+        }
+    }
+
     /// `info_family` (issue #82, retroactive re-review v4 Δ1): `true`
     /// only from `plan_info`'s single call site — marks the synthetic
     /// `*_info` metadata-family selector for the reader's
@@ -1092,6 +1166,12 @@ impl Planner {
                 total_offset_ms: self.ctx.total_offset_ms + offset_ms,
             },
         };
+        self.check_window(
+            range_ms.unwrap_or(0),
+            fetch.extra_range_ms,
+            fetch.total_offset_ms,
+            fetch.at_ms,
+        );
         let id = self.selectors.len();
         self.selectors.push(SelectorSpec {
             id,
@@ -1215,6 +1295,10 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
                 step_ms: params.step_ms,
                 ctx: SubqueryCtx::default(),
                 subquery_depth: 0,
+                widen_to: None,
+                lookback_ms: params.lookback_ms,
+                eval_end_ms: params.eval_end(),
+                overflow: false,
             };
             // Directly through the matrix-selector planner — the
             // identical `SelectorSpec` fetch/pushdown as `rate()`'s
@@ -1256,8 +1340,20 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
         step_ms: params.step_ms,
         ctx: SubqueryCtx::default(),
         subquery_depth: 0,
+        widen_to: params.widen_to,
+        lookback_ms: params.lookback_ms,
+        eval_end_ms: params.eval_end(),
+        overflow: false,
     };
     let root = plan_expr(&mut planner, expr)?;
+    // Issue #18 follow-up (plan r17): a widened range whose window does
+    // not fit `i64` refuses the plan, and the caller keeps the request's
+    // grid with no widening.
+    if planner.overflow {
+        return Err(unsupported(
+            "a range widened to the step overflows its window".to_string(),
+        ));
+    }
     let mut selectors = planner.selectors;
     detect_histogram_stats(&root, &mut selectors);
     assign_rollup_use(&root, &mut selectors);
@@ -1981,9 +2077,11 @@ fn plan_matrix_selector_id(
     gate_extended_modifier(ms.vs.anchored, ms.vs.smoothed, planner.experimental)?;
     let (metric_name, name_matchers, matchers) = extract_name_and_matchers(&ms.vs)?;
     let at_ms = planner.resolve_at(&ms.vs.at);
-    let range_ms = planner.resolve_range_ms(ms.range, &ms.range_expr)?;
+    let written = planner.resolve_range_ms(ms.range, &ms.range_expr)?;
+    // Issue #18 follow-up (plan r17): read as `S` on a stretched grid.
+    let range_ms = planner.widened(written, at_ms);
     let offset = planner.resolve_offset_ms(&ms.vs.offset, &ms.vs.offset_expr)?;
-    Ok(planner.push_selector(
+    let id = planner.push_selector(
         metric_name,
         name_matchers,
         matchers,
@@ -1994,7 +2092,9 @@ fn plan_matrix_selector_id(
         ms.vs.anchored,
         ms.vs.smoothed,
         ms.vs.pos.start().unwrap_or(0),
-    ))
+    );
+    planner.selectors[id].written_range_ms = Some(written);
+    Ok(id)
 }
 
 /// Plans a range-vector function's argument (issue #83): a bare matrix
@@ -2075,8 +2175,16 @@ fn plan_subquery(planner: &mut Planner, sq: &SubqueryExpr) -> Result<SubqueryPla
             "subquery nesting deeper than {MAX_SUBQUERY_DEPTH} levels"
         )));
     }
-    let (range_ms, step_ms, offset) = resolve_subquery_fields(planner, sq)?;
+    let (written_range_ms, step_ms, offset) = resolve_subquery_fields(planner, sq)?;
     let at_ms = planner.resolve_at(&sq.at);
+    // Issue #18 follow-up (plan r17): read as `S` on a stretched grid, its
+    // window checked against `i64`.
+    let range_ms = planner.widened(written_range_ms, at_ms);
+    planner.check_window(range_ms, 0, offset, at_ms);
+    let extra_range_ms = match planner.widen_to {
+        Some(_) => saved_extra(planner, range_ms),
+        None => planner.ctx.extra_range_ms + range_ms,
+    };
 
     let saved = planner.ctx;
     planner.ctx = match at_ms {
@@ -2087,7 +2195,7 @@ fn plan_subquery(planner: &mut Planner, sq: &SubqueryExpr) -> Result<SubqueryPla
         },
         None => SubqueryCtx {
             at_ms: saved.at_ms,
-            extra_range_ms: saved.extra_range_ms + range_ms,
+            extra_range_ms,
             total_offset_ms: saved.total_offset_ms + offset,
         },
     };
@@ -2099,11 +2207,23 @@ fn plan_subquery(planner: &mut Planner, sq: &SubqueryExpr) -> Result<SubqueryPla
     Ok(SubqueryPlan {
         inner: Box::new(inner?),
         range_ms,
-        written_range_ms: range_ms,
+        written_range_ms,
         step_ms,
         offset_ms: offset,
         at_ms,
     })
+}
+
+/// Issue #18 follow-up (plan r17): the enclosing extra range plus
+/// `range_ms` on a stretched grid, checked: an overflow marks the plan.
+fn saved_extra(planner: &mut Planner, range_ms: i64) -> i64 {
+    match planner.ctx.extra_range_ms.checked_add(range_ms) {
+        Some(v) => v,
+        None => {
+            planner.overflow = true;
+            0
+        }
+    }
 }
 
 fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError> {

@@ -718,11 +718,22 @@ impl MetricsEngine {
                 if let Some((pp, candidate)) = changed_grid(expr, request, grid, &levels, res) {
                     if let Some(e) = explain.as_mut() {
                         let points = (grid.end_ms - p.start_ms) / grid.step_ms + 1;
+                        let widened: String = candidate
+                            .widened_ranges()
+                            .into_iter()
+                            .map(|(written, read)| {
+                                format!(
+                                    "; range {} widened to {}",
+                                    super::rollup::duration_text(written),
+                                    super::rollup::duration_text(read)
+                                )
+                            })
+                            .collect();
                         e.push(
                             "rollup_grid",
                             String::new(),
                             Some(format!(
-                                "resolution {}, step {} (asked {}), {points} points, {} to {}",
+                                "resolution {}, step {} (asked {}), {points} points, {} to {}{widened}",
                                 super::rollup::duration_text(res),
                                 super::rollup::duration_text(grid.step_ms),
                                 super::rollup::duration_text(p.step_ms),
@@ -3705,8 +3716,11 @@ fn changed_grid(
     levels: &super::rollup::Levels,
     res: i64,
 ) -> Option<(pulsus_promql::PlanParams, pulsus_promql::QueryPlan)> {
+    // Plan r17: on a stretched grid every range shorter than `S` is read
+    // as `S`.
     let pp = pulsus_promql::PlanParams {
         eval: Some(grid),
+        widen_to: (grid.step_ms > request.step_ms).then_some(grid.step_ms),
         ..request
     };
     let candidate = pulsus_promql::plan(expr, pp).ok()?;

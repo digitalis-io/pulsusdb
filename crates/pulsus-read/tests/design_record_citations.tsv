@@ -88,6 +88,7 @@ docs/query-lowering.md	plan.rs:1517	crates/pulsus-read/src/logql/plan.rs	1517		p
 docs/query-lowering.md	plan.rs:1654	crates/pulsus-read/src/logql/plan.rs	1654		prose	PipelineInvalid	Pipe
 docs/query-lowering.md	plan.rs:1663	crates/pulsus-read/src/logql/plan.rs	1663		prose	has_unpushed_dropping_stage	fetch_until_limit
 docs/query-lowering.md	plan.rs:1727	crates/pulsus-read/src/logql/plan.rs	1727		prose	metric_pipeline_construct	metric_pipeline_construct
+docs/query-lowering.md	plan.rs:2263	crates/pulsus-promql/src/plan.rs	2263		prose	count_over_time	count_over_time
 docs/query-lowering.md	plan.rs:2725	crates/pulsus-read/src/logql/plan.rs	2725		prose	InvalidStep	InvalidStep
 docs/query-lowering.md	plan.rs:2822	crates/pulsus-read/src/logql/plan.rs	2822		prose	QuantileOverTime	RangeAgg
 docs/query-lowering.md	plan.rs:3445	crates/pulsus-read/src/logql/plan.rs	3445		prose	unwrap_vector_aggs_into	unwrap_vector_aggs_into
