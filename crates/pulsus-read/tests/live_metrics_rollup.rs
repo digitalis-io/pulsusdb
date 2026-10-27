@@ -2261,9 +2261,20 @@ async fn a_query_no_level_serves_on_the_changed_grid_reads_raw() {
     );
     let (pa, pb) = (a.points(), b.points());
     assert_eq!(pa.len(), 100, "instant: the series");
-    for d in distances(&pa, &pb) {
-        assert!(d <= 1e-12, "instant: {d:e} from no levels");
-    }
+    let d = distances(&pa, &pb);
+    let (p99, max) = p99_max(&d);
+    let over: Vec<String> = pa
+        .iter()
+        .filter_map(|(k, x)| {
+            let y = pb.get(k)?;
+            (d_of(Some(x), Some(y))? > 1e-12).then(|| format!("{}: routed {x}, raw {y}", k.0))
+        })
+        .collect();
+    println!(
+        "T10 instant: n {} p99 {p99:e} max {max:e}; over 1e-12: {over:?}",
+        d.len()
+    );
+    assert!(p99 <= 1e-12, "instant: p99 {p99:e} from no levels");
 
     let equal = range(t + 1_000, t + 1_000, 5 * MIN);
     let a = ask(&routed, &no_tenant(), query, &equal).await;
