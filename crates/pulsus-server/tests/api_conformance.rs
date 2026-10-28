@@ -2303,7 +2303,7 @@ fn assert_gzip_identity_metrics(port: u16, spawn: &str) {
     assert_eq!(
         identity.content_type(),
         Some("text/plain; version=0.0.4"),
-        "{ctx_id}: Content-Type (`ops.rs:122`)"
+        "{ctx_id}: Content-Type (`ops.rs:129`)"
     );
 
     req.headers.pop();
@@ -2318,7 +2318,7 @@ fn assert_gzip_identity_metrics(port: u16, spawn: &str) {
     assert_eq!(
         gz.content_type(),
         Some("text/plain; version=0.0.4"),
-        "{ctx_gz}: Content-Type under gzip negotiation (`ops.rs:122`)"
+        "{ctx_gz}: Content-Type under gzip negotiation (`ops.rs:129`)"
     );
 
     // ONE body, round-tripped: no second scrape enters this assertion.

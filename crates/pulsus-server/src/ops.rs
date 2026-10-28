@@ -56,31 +56,25 @@ const READY_PING_TIMEOUT: Duration = Duration::from_secs(2);
 /// see its own doc comment), so no lock is ever held across an `.await`
 /// here either.
 async fn ready(State(state): State<AppState>) -> Response {
+    match readiness(&state).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(reason) => unavailable(&reason),
+    }
+}
+
+/// [`ready`]'s three checks, the reason as text when one fails: `/ready`
+/// answers `503` with it, and the admin status page and API show it
+/// (issue #746).
+pub(crate) async fn readiness(state: &AppState) -> Result<(), String> {
     let pool = {
         let guard = state.pool.read().await;
         guard.clone()
     };
     let Some(pool) = pool else {
-        return unavailable("clickhouse pool not yet established");
+        return Err("clickhouse pool not yet established".to_string());
     };
-    let ping = ready_from_ping(async move { pool.ping().await }).await;
-    if ping.status() != StatusCode::OK {
-        return ping;
-    }
+    ready_from_ping(async move { pool.ping().await }).await?;
     label_cache_ready(state.label_cache.get())
-}
-
-/// Step-1 stub: today's `ready`, its 503 body as the reason.
-#[allow(dead_code)]
-pub(crate) async fn readiness(state: &AppState) -> Result<(), String> {
-    let res = ready(State(state.clone())).await;
-    if res.status() == StatusCode::OK {
-        return Ok(());
-    }
-    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-        .await
-        .map_err(|e| e.to_string())?;
-    Err(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// The label-cache half of [`ready`]'s gate, decoupled from `AppState` so
@@ -92,24 +86,24 @@ pub(crate) async fn readiness(state: &AppState) -> Result<(), String> {
 /// the latter is permanent, the former resolves once the reconnect loop's
 /// first pass completes; either way, a *present* cache that is not yet warm
 /// is the only branch gated here (issue #30 architect plan).
-fn label_cache_ready(cache: Option<&std::sync::Arc<LabelCache>>) -> Response {
+fn label_cache_ready(cache: Option<&std::sync::Arc<LabelCache>>) -> Result<(), String> {
     match cache {
-        Some(cache) if !cache.is_warm() => unavailable("label cache warming"),
-        _ => StatusCode::OK.into_response(),
+        Some(cache) if !cache.is_warm() => Err("label cache warming".to_string()),
+        _ => Ok(()),
     }
 }
 
 /// The 503-mapping core of [`ready`], decoupled from `ChPool` so the
 /// "ping exceeds the deadline" branch is unit-testable without a live (or
 /// even fake-hanging) ClickHouse connection.
-async fn ready_from_ping<F>(ping: F) -> Response
+async fn ready_from_ping<F>(ping: F) -> Result<(), String>
 where
     F: Future<Output = Result<(), ChError>>,
 {
     match tokio::time::timeout(READY_PING_TIMEOUT, ping).await {
-        Ok(Ok(())) => StatusCode::OK.into_response(),
-        Ok(Err(err)) => unavailable(&format!("clickhouse ping failed: {err}")),
-        Err(_elapsed) => unavailable("clickhouse ping exceeded 2s"),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(format!("clickhouse ping failed: {err}")),
+        Err(_elapsed) => Err("clickhouse ping exceeded 2s".to_string()),
     }
 }
 
@@ -478,32 +472,29 @@ mod tests {
     /// hasn't constructed the cache yet" (transiently `None`).
     #[test]
     fn label_cache_ready_is_a_pass_through_when_the_slot_is_unset() {
-        assert_eq!(label_cache_ready(None).status(), StatusCode::OK);
+        assert_eq!(label_cache_ready(None), Ok(()));
     }
 
     #[tokio::test]
-    async fn ready_from_ping_is_200_on_a_successful_ping() {
-        let res = ready_from_ping(async { Ok(()) }).await;
-        assert_eq!(res.status(), StatusCode::OK);
+    async fn ready_from_ping_is_ok_on_a_successful_ping() {
+        assert_eq!(ready_from_ping(async { Ok(()) }).await, Ok(()));
     }
 
     #[tokio::test]
-    async fn ready_from_ping_is_503_on_a_failed_ping() {
+    async fn ready_from_ping_reports_a_failed_ping() {
         let res = ready_from_ping(async { Err(ChError::Connect("refused".to_string())) }).await;
-        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let reason = res.expect_err("a failed ping is not ready");
+        assert!(reason.starts_with("clickhouse ping failed: "), "{reason}");
     }
 
     #[tokio::test]
-    async fn ready_from_ping_is_503_not_408_or_504_when_the_ping_hangs() {
+    async fn ready_from_ping_reports_the_deadline_when_the_ping_hangs() {
         // A ping future that never resolves stands in for a hung ClickHouse
         // connection (amendment F2's load-bearing case): the 2s internal
-        // deadline must still map to 503, never a generic-timeout-style
-        // 408/504.
+        // deadline is the reason `/ready` answers `503` with.
         let hang = std::future::pending::<Result<(), ChError>>();
         let res = ready_from_ping(hang).await;
-        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_ne!(res.status(), StatusCode::REQUEST_TIMEOUT);
-        assert_ne!(res.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(res, Err("clickhouse ping exceeded 2s".to_string()));
     }
 
     #[tokio::test]

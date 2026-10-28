@@ -9,7 +9,6 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-#[allow(dead_code)]
 mod admin;
 mod app;
 mod azdetect;

@@ -37,9 +37,7 @@ pub struct Config {
     pub auth_password: Option<Secret>,
     /// `PULSUS_ADMIN_USER` / `PULSUS_ADMIN_PASSWORD` (issue #746): the admin
     /// UI's own Basic pair; both set mounts `/admin/`.
-    #[serde(deserialize_with = "crate::model::ignore_until_part_b")]
     pub admin_user: Option<String>,
-    #[serde(deserialize_with = "crate::model::ignore_until_part_b")]
     pub admin_password: Option<Secret>,
     pub compat_endpoints: bool,
     pub cors_origin: String,
@@ -169,16 +167,6 @@ impl Default for Config {
             ruler: RulerConfig::default(),
         }
     }
-}
-
-/// Step-1 stub (issue #746 part B): accepts the key and leaves the field
-/// `None`.
-pub(crate) fn ignore_until_part_b<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    serde::de::IgnoredAny::deserialize(deserializer)?;
-    Ok(None)
 }
 
 impl Config {

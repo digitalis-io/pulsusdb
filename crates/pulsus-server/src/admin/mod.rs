@@ -1,17 +1,61 @@
 //! The admin UI (issue #746 part B): status, database and configuration
-//! pages under `/admin/`, and their JSON API under `/admin/api/v1/`.
+//! pages under `/admin/`, and their JSON API under `/admin/api/v1/`. Each
+//! page and its endpoint are built from one view value (`views`). Mounted
+//! only with the admin pair; `app::build_router` merges it outside the CORS
+//! layer.
 
 use axum::Router;
+use axum::extract::Request;
+use axum::http::{HeaderValue, header};
+use axum::middleware::Next;
+use axum::response::Response;
+use axum::routing::get;
 use pulsus_config::Config;
 
 use crate::app::AppState;
 
+mod api;
 pub(crate) mod html;
+mod pages;
 pub(crate) mod views;
 
-/// Step-1 stub: never mounted.
-pub(crate) fn router(_config: &Config) -> Option<Router<AppState>> {
-    None
+/// The admin routes, or `None` unless both admin fields are set. The pages
+/// refuse with the plain `401`, the API with the JSON one; every response
+/// carries the two headers `headers` sets.
+pub(crate) fn router(config: &Config) -> Option<Router<AppState>> {
+    let page_auth = crate::middleware::admin_auth_layer(config, false)?;
+    let api_auth = crate::middleware::admin_auth_layer(config, true)?;
+    let pages = Router::new()
+        .route("/admin/", get(pages::status))
+        .route("/admin/database", get(pages::database))
+        .route("/admin/config", get(pages::config))
+        .route("/admin/admin.css", get(pages::css))
+        .layer(page_auth);
+    let api = Router::new()
+        .route("/admin/api/v1/status", get(api::status))
+        .route("/admin/api/v1/database", get(api::database))
+        .route("/admin/api/v1/config", get(api::config))
+        .layer(api_auth);
+    Some(
+        pages
+            .merge(api)
+            .layer(axum::middleware::from_fn(headers))
+            .layer(axum::middleware::from_fn(crate::request_id::stamp))
+            .layer(crate::middleware::trace_layer()),
+    )
+}
+
+/// `Content-Security-Policy: default-src 'self'` and `Cache-Control:
+/// no-store` on every admin response, a `401` included.
+async fn headers(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let headers = res.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'self'"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res
 }
 
 #[cfg(test)]
@@ -264,11 +308,10 @@ mod tests {
     async fn status_reports_a_failed_ping_as_ready_does() {
         let st = state_with_stub_pool(false).await;
         let (ready, page, api) = three_reasons(&router(&st)).await;
-        eprintln!("B5(ii) texts: ready={ready:?} page={page:?} api={api:?}");
-        let prefix = "clickhouse ping failed: ";
-        assert!(ready.starts_with(prefix), "{ready}");
-        assert!(api.starts_with(prefix), "{api}");
-        assert!(page.starts_with(prefix), "{page}");
+        // Each request pings afresh; the three failures give one text.
+        assert!(ready.starts_with("clickhouse ping failed: "), "{ready}");
+        assert_eq!(api, ready);
+        assert_eq!(page, html_text(&ready));
     }
 
     /// B5 (iii): the ping hangs.

@@ -10,7 +10,7 @@
 #
 # Precedence: CLI flags (--config, --mode) > environment variables > this YAML >
 # defaults. An environment variable set to the empty string counts as unset.
-# Secrets (clickhouse.auth password, auth_password) are better placed in the env
+# Secrets (clickhouse.auth password, auth_password, admin_password) are better placed in the env
 # file /etc/pulsusdb/pulsusdb.env so they stay out of this world-readable schema.
 #
 # Durations accept ms|s|m|h|d|w; byte sizes accept binary (KiB/MiB/GiB/TiB),
@@ -23,6 +23,8 @@
 #log_level: info                  # error | warn | info | debug | trace
 #auth_user: null                  # both set => basic auth; one-sided => startup error
 #auth_password: null              # secret: prefer the env file
+#admin_user: null                 # both set => /admin/ mounted; one-sided => startup error
+#admin_password: null             # secret: prefer the env file
 #compat_endpoints: false
 #cors_origin: "*"
 #query_timeout: 2m

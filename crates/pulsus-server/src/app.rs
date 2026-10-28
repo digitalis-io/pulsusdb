@@ -168,6 +168,8 @@ impl BuildInfo {
 ///    outside both auth and the generic timeout entirely.
 /// 4. Global layers on the merged whole, CORS outermost: trace →
 ///    compression → CORS (auth/timeout are never global).
+/// 5. With the admin pair set, `admin::router` merged outside all of
+///    that (issue #746): its own authentication, no CORS layer.
 pub(crate) fn build_router(state: AppState, config: &Config) -> Result<Router, ServeError> {
     let mut authed = ops::ops_authed_router().merge(modes::mount_subsystems(Router::new(), config));
     authed = compat::apply_aliases(authed, config);
@@ -194,6 +196,14 @@ pub(crate) fn build_router(state: AppState, config: &Config) -> Result<Router, S
         .layer(middleware::trace_layer())
         .layer(middleware::compression_layer())
         .layer(middleware::cors_layer(config)?);
+
+    // Issue #746: the admin router, outside the CORS layer. `admin` comes
+    // first so the merge keeps the data-plane router's fallback, behind its
+    // authentication and CORS layers, for every unmatched path.
+    let router = match crate::admin::router(config) {
+        Some(admin) => admin.merge(router),
+        None => router,
+    };
 
     Ok(router.with_state(state))
 }

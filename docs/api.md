@@ -27,7 +27,7 @@ Conventions:
 | `X-Loki-Response-Encoding-Flags` | log query (`query`, `query_range`, `tail`) | comma-separated encoding flags. `categorize-labels` switches the `streams` result to the three-element `values` shape — see §2.1. Unknown flags are echoed back and change nothing. Absent, the response is exactly what it was before the header existed |
 | `Idempotency-Key` | log, metric and trace ingest | issue #494, extended to the trace push by issue #586. Namespaces a push's identity: two requests with **different** keys are two pushes whatever they carry, and the same key with the same content is one push. The same key carrying **different** content is a client error — `400`, and nothing is stored. Absent, a push is identified by its own content. Two tenants' identical log, metric or trace pushes, with or without one key, are two pushes. Read on every ingest route, `/v1/traces` and the Zipkin receiver included |
 | `Retry-Attempt` | log, metric and trace ingest | issue #494, extended to the trace push by issue #586. The attempt number, `1` upward. **Never a suppression key** — there is nothing stored to match a bare marker against, and suppressing on one would drop a push with no record of having accepted it. It sets the `declared` label on `pulsus_ingest_duplicate_pushes_total` and nothing else |
-| `Authorization` | all | Basic auth when `PULSUS_AUTH_USER` is set |
+| `Authorization` | all | Basic auth. On `/admin/…`, the `PULSUS_ADMIN_USER` pair. Elsewhere, when `PULSUS_AUTH_USER` is set, its pair on every request but two kinds: a request to `/ready` or `/metrics` by any method but `OPTIONS` (one other than `GET` or `HEAD` answers `405`), and any `OPTIONS` request to a path that is not an admin route, which the CORS layer answers before routing |
 
 ## Response headers
 
@@ -1507,11 +1507,20 @@ GET /ready        → 200 when ClickHouse reachable (+ label cache warm in reade
 GET /metrics      → Prometheus exposition of PulsusDB internals
 GET /config       → effective configuration, secrets redacted (rendered as YAML text, served as `text/plain; charset=utf-8` — not a YAML media type)
 GET /buildinfo    → {"version","revision","builtAt","rustc"}
+GET /admin/                → status page (HTML)
+GET /admin/database        → database page (HTML)
+GET /admin/config          → configuration page (HTML), secrets redacted
+GET /admin/admin.css       → the pages' stylesheet
+GET /admin/api/v1/status    → {"version","revision","builtAt","rustc","mode","uptimeSeconds","ready","notReadyReason"}
+GET /admin/api/v1/database  → {"database","cluster","retentionDays","levels":[{"table","resMs","fromMs"}],"levelsNote","shards","counterBuckets","discoveryFailures"}
+GET /admin/api/v1/config    → the effective configuration as JSON, secrets "***"
 ```
 
 `/metrics` exposes three implemented families (see `architecture.md §8` for the exact metric set): **ingest** (`pulsus_ingest_*`, `writer`/`all` roles only — absent on a reader-only process), **label cache** (`pulsus_label_cache_*`, reader/all), and **query eval gate** (`pulsus_query_eval_*`, reader/all). Ingest errors are attributed per signal + error-class, not per ingest protocol; on-disk spool size/file-count gauges, per-API/per-planner-stage query latencies and tail-session counters are not yet exposed.
 
 When basic auth is enabled, `/ready` and `/metrics` remain **unauthenticated** (liveness probes and metric scrapers must work without credentials); `/config`, `/buildinfo`, and every data-plane route require auth.
+
+**Admin routes** (`/admin/…`) are mounted only when `PULSUS_ADMIN_USER` and `PULSUS_ADMIN_PASSWORD` are both set, and require that pair; the data-plane pair does not open them, and they open nothing else. They carry no CORS headers, and every response carries `Content-Security-Policy: default-src 'self'` and `Cache-Control: no-store`. A `null` field has no value yet; `levels` is `null` with `levelsNote` `not yet discovered` until the first level discovery, and with `not read in writer mode` in writer mode. With the admin pair set, a request without it gets `401`: on `/admin/api/v1/…` the body `{"errors":[{"field":null,"message":"unauthorized"}]}` as `application/json`, on the HTML routes the plain `unauthorized`. With the admin pair unset nothing under `/admin/` is mounted: `404`, except that where `PULSUS_AUTH_USER` is set a request without that pair gets its `401` first, as for any path.
 
 ---
 

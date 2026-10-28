@@ -167,6 +167,7 @@ and for the one performance cliff it introduces.
 | Schema | one `schema/schema.sql`, applied by `schema/schema.sh`; two variants, single-node and clustered; drop and recreate, no migrations | M0 |
 | Health & introspection | `/ready`, `/metrics`, `/config`, `/buildinfo` | M0 |
 | Basic auth | `PULSUS_AUTH_USER` / `PULSUS_AUTH_PASSWORD` | M0 |
+| Admin UI | `/admin/`: status, database and configuration pages and their JSON API, under its own credential (`PULSUS_ADMIN_USER` / `PULSUS_ADMIN_PASSWORD`) | #746 |
 | Compatibility endpoint flag | `PULSUS_COMPAT_ENDPOINTS` (default off) | M1 |
 | Inbound TLS | native TLS termination on the listener | M7 |
 | Label cache | bounded active-series window, JOIN fallback | M2 |
@@ -176,7 +177,7 @@ and for the one performance cliff it introduces.
 | Alerting rules | stored/validated from M7 API; evaluation + notification delivery | post-1.0 |
 | Query explain | `X-Pulsus-Explain` returns planner SQL | M2 |
 
-**Explicit non-goals for 1.0:** built-in UI, DuckDB or object-store backends other than via ClickHouse storage policies, Prometheus remote *read*.
+**Explicit non-goals for 1.0:** DuckDB or object-store backends other than via ClickHouse storage policies, Prometheus remote *read*.
 
 ## 7. Milestones
 
