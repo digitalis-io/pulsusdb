@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+mod admin;
 mod app;
 mod azdetect;
 mod chconfig;

@@ -3162,7 +3162,7 @@ from its source; the pointer is not reproduced here.
 |---|---|---|
 | phase-2 batch | 32 candidate traces | `crates/pulsus-read/src/traces/exec.rs:126` @ 1cdb3e5e |
 | candidate ceiling | 100,000 | `crates/pulsus-config/src/model.rs:692` @ 1cdb3e5e |
-| scan budget | 50,000,000 rows | `crates/pulsus-config/src/model.rs:636` |
+| scan budget | 50,000,000 rows | `crates/pulsus-config/src/model.rs:642` |
 | tag lookback default | 24 hours | `crates/pulsus-config/src/model.rs:696` @ 1cdb3e5e |
 | spans per trace cap | `LIMIT 10001 BY trace_id` | `crates/pulsus-read/src/traces/exec.rs:131` @ 1cdb3e5e |
 | tag name / value caps | 10,000 / 1,000 | `crates/pulsus-read/src/traces/exec.rs:131 @ 1cdb3e5e, 135` |

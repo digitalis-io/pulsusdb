@@ -187,9 +187,9 @@ docs/query-to-sql.md	logql/window.rs:148	crates/pulsus-read/src/logql/window.rs	
 docs/query-to-sql.md	logs_api/error.rs:148-153	crates/pulsus-server/src/logs_api/error.rs	148	153	line	X_CONTENT_TYPE_OPTIONS	( status, [ (header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff"), ],
 docs/query-to-sql.md	metrics_plan.rs:297	crates/pulsus-read/src/traces/metrics_plan.rs	297		line	plan_trace_metrics	pub fn plan_trace_metrics(
 docs/query-to-sql.md	metrics_plan.rs:538	crates/pulsus-read/src/traces/metrics_plan.rs	538		prose	pipeline	reduce
-docs/query-to-sql.md	model.rs:506	crates/pulsus-config/src/model.rs	506		line	logql_pipeline_scan_factor	pub logql_pipeline_scan_factor: u32,
-docs/query-to-sql.md	model.rs:555	crates/pulsus-config/src/model.rs	555		line	logql_read_max_memory_bytes	pub logql_read_max_memory_bytes: u64,
-docs/query-to-sql.md	model.rs:645	crates/pulsus-config/src/model.rs	645		line	logql_read_max_memory_bytes	logql_read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
+docs/query-to-sql.md	model.rs:512	crates/pulsus-config/src/model.rs	512		line	logql_pipeline_scan_factor	pub logql_pipeline_scan_factor: u32,
+docs/query-to-sql.md	model.rs:561	crates/pulsus-config/src/model.rs	561		line	logql_read_max_memory_bytes	pub logql_read_max_memory_bytes: u64,
+docs/query-to-sql.md	model.rs:651	crates/pulsus-config/src/model.rs	651		line	logql_read_max_memory_bytes	logql_read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
 docs/query-to-sql.md	pipeline.rs:3407	crates/pulsus-read/src/logql/pipeline.rs	3407		line	PipelineError	Err(PipelineError::BadParserExpr(format!(
 docs/query-to-sql.md	pipeline.rs:3421	crates/pulsus-read/src/logql/pipeline.rs	3421		prose	DURATION_UNITS	DURATION_UNITS
 docs/query-to-sql.md	pipeline.rs:3641	crates/pulsus-read/src/logql/pipeline.rs	3641		line	QUERY_BYTES_SUFFIXES	const QUERY_BYTES_SUFFIXES: &[&str] = &[
@@ -230,8 +230,8 @@ docs/query-to-sql.md	post_agg.rs:858	crates/pulsus-read/src/logql/post_agg.rs	85
 docs/query-to-sql.md	post_agg.rs:983	crates/pulsus-read/src/logql/post_agg.rs	983		prose	approx_topk_instant	approx_topk_instant
 docs/query-to-sql.md	predicate.rs:468-482	crates/pulsus-read/src/logql/predicate.rs	468	482	prose	BAD_ARGUMENTS	BAD_ARGUMENTS
 docs/query-to-sql.md	predicate.rs:492	crates/pulsus-read/src/logql/predicate.rs	492		prose	CheckedFragment	line_filter
-docs/query-to-sql.md	pulsus-config/src/model.rs:484	crates/pulsus-config/src/model.rs	484		line	logql_scan_budget_bytes	pub logql_scan_budget_bytes: ByteSize,
-docs/query-to-sql.md	pulsus-config/src/model.rs:633	crates/pulsus-config/src/model.rs	633		line	logql_scan_budget_bytes	logql_scan_budget_bytes: ByteSize(50u64 * 1024 * 1024 * 1024),
+docs/query-to-sql.md	pulsus-config/src/model.rs:490	crates/pulsus-config/src/model.rs	490		line	logql_scan_budget_bytes	pub logql_scan_budget_bytes: ByteSize,
+docs/query-to-sql.md	pulsus-config/src/model.rs:639	crates/pulsus-config/src/model.rs	639		line	logql_scan_budget_bytes	logql_scan_budget_bytes: ByteSize(50u64 * 1024 * 1024 * 1024),
 docs/query-to-sql.md	pulsus-logql/src/limits.rs:96	crates/pulsus-logql/src/limits.rs	96		line	157_680_000_000_000_000	pub const MAX_QUERY_SPAN_NS: i64 = 157_680_000_000_000_000;
 docs/query-to-sql.md	pulsus-read/src/logql/plan.rs:1057	crates/pulsus-read/src/logql/plan.rs	1057		line	QueryParams	pub fn plan(expr: &Expr, p: &QueryParams, ctx: &PlanCtx<'_>) -> Result<Plan, ReadError> {
 docs/query-to-sql.md	pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	MAX_QUERY_TEXT_BYTES	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;

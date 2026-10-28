@@ -24,6 +24,8 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_LOG_LEVEL",
     "PULSUS_AUTH_USER",
     "PULSUS_AUTH_PASSWORD",
+    "PULSUS_ADMIN_USER",
+    "PULSUS_ADMIN_PASSWORD",
     "PULSUS_COMPAT_ENDPOINTS",
     "PULSUS_CORS_ORIGIN",
     "PULSUS_QUERY_TIMEOUT",
@@ -196,6 +198,12 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("PULSUS_AUTH_PASSWORD") {
         cfg.auth_password = Some(Secret::new(v));
+    }
+    if let Some(v) = read("PULSUS_ADMIN_USER") {
+        cfg.admin_user = Some(v);
+    }
+    if let Some(v) = read("PULSUS_ADMIN_PASSWORD") {
+        cfg.admin_password = Some(Secret::new(v));
     }
     if let Some(v) = read("PULSUS_COMPAT_ENDPOINTS") {
         cfg.compat_endpoints = parse_bool("PULSUS_COMPAT_ENDPOINTS", &v)?;

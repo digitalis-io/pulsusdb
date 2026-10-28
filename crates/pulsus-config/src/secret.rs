@@ -1,7 +1,7 @@
 //! Redacted secret newtype.
 //!
-//! docs/configuration.md documents two secret-shaped values: `auth_password`
-//! and the password half of `clickhouse.auth`. Both must never surface in the
+//! docs/configuration.md documents three secret-shaped values: `auth_password`,
+//! `admin_password` and the password half of `clickhouse.auth`. All must never surface in the
 //! redacted config dump served by the `/config` endpoint (issue #6). Rather
 //! than scrubbing secrets out of a dump at runtime, `Secret` makes redaction
 //! a type-level property: `Debug` and `Serialize` always print `"***"`, and

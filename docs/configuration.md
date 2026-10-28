@@ -11,6 +11,7 @@ PulsusDB is configured by environment variables, optionally layered over a YAML 
 | `PULSUS_PORT` | `3100` | HTTP port |
 | `PULSUS_LOG_LEVEL` | `info` | `error` \| `warn` \| `info` \| `debug` \| `trace` |
 | `PULSUS_AUTH_USER` / `PULSUS_AUTH_PASSWORD` | unset | enable HTTP Basic auth when both set |
+| `PULSUS_ADMIN_USER` / `PULSUS_ADMIN_PASSWORD` | unset | the admin UI's own HTTP Basic pair ([api.md](api.md) §7); both set mounts `/admin/`, one alone is a startup error, and neither opens any other route |
 | `PULSUS_COMPAT_ENDPOINTS` | `false` | mount third-party-compatible query aliases and ingest receivers ([api.md §8](api.md)); the PulsusDB API and OTLP ingestion are always on |
 | `PULSUS_CORS_ORIGIN` | `*` | `Access-Control-Allow-Origin` value |
 | `PULSUS_QUERY_TIMEOUT` | `2m` | hard per-query timeout |
@@ -358,6 +359,8 @@ port: 3100
 log_level: info                  # error | warn | info | debug | trace
 auth_user: null                  # both set => basic auth; one-sided => startup error
 auth_password: null              # secret: never appears in redacted output
+admin_user: null                 # both set => /admin/ mounted; one-sided => startup error
+admin_password: null             # secret: never appears in redacted output
 compat_endpoints: false
 cors_origin: "*"
 query_timeout: 2m

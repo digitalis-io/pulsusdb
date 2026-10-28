@@ -221,7 +221,27 @@ pub(crate) fn auth_layer(config: &Config) -> Option<ValidateRequestHeaderLayer<B
     let password = config.auth_password.as_ref()?;
     let credentials = format!("{user}:{}", password.expose());
     let expected = format!("Basic {}", base64_encode(credentials.as_bytes()));
-    Some(ValidateRequestHeaderLayer::custom(BasicAuth { expected }))
+    Some(ValidateRequestHeaderLayer::custom(BasicAuth {
+        expected,
+        json: false,
+    }))
+}
+
+/// HTTP Basic auth for the admin UI (issue #746) — `None` unless both
+/// `PULSUS_ADMIN_USER` and `PULSUS_ADMIN_PASSWORD` are set. `json` selects
+/// the JSON `401` body the admin API answers with.
+pub(crate) fn admin_auth_layer(
+    config: &Config,
+    json: bool,
+) -> Option<ValidateRequestHeaderLayer<BasicAuth>> {
+    let user = config.admin_user.as_deref()?;
+    let password = config.admin_password.as_ref()?;
+    let credentials = format!("{user}:{}", password.expose());
+    let expected = format!("Basic {}", base64_encode(credentials.as_bytes()));
+    Some(ValidateRequestHeaderLayer::custom(BasicAuth {
+        expected,
+        json,
+    }))
 }
 
 /// Validates the `Authorization` header against a precomputed `Basic
@@ -232,6 +252,9 @@ pub(crate) fn auth_layer(config: &Config) -> Option<ValidateRequestHeaderLayer<B
 #[derive(Clone)]
 pub(crate) struct BasicAuth {
     expected: String,
+    /// The refusal's body: `{"errors":[…]}` as `application/json` when
+    /// set (the admin API), the plain `unauthorized` otherwise.
+    json: bool,
 }
 
 impl<B> ValidateRequest<B> for BasicAuth {
@@ -246,7 +269,18 @@ impl<B> ValidateRequest<B> for BasicAuth {
         if matches {
             return Ok(());
         }
-        let mut res = Response::new(Body::from("unauthorized"));
+        let mut res = if self.json {
+            let mut res = Response::new(Body::from(
+                r#"{"errors":[{"field":null,"message":"unauthorized"}]}"#,
+            ));
+            res.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            res
+        } else {
+            Response::new(Body::from("unauthorized"))
+        };
         *res.status_mut() = StatusCode::UNAUTHORIZED;
         res.headers_mut()
             .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic"));

@@ -11,14 +11,24 @@ fn redacted_yaml_and_debug_never_contain_secret_values() {
 
     support::set("PULSUS_AUTH_USER", "alice");
     support::set("PULSUS_AUTH_PASSWORD", "top-secret-auth-password");
+    support::set("PULSUS_ADMIN_USER", "root");
+    support::set("PULSUS_ADMIN_PASSWORD", "top-secret-admin-password");
     support::set("CLICKHOUSE_AUTH", "admin:top-secret-ch-password");
 
     let cfg = parse(None, None).expect("parse with secrets set");
+    assert!(
+        cfg.admin_password.is_some(),
+        "PULSUS_ADMIN_PASSWORD must be read, or its absence below checks nothing"
+    );
 
     let dump = cfg.to_redacted_yaml().expect("redacted yaml dump");
     assert!(
         !dump.contains("top-secret-auth-password"),
         "auth_password leaked into the redacted dump"
+    );
+    assert!(
+        !dump.contains("top-secret-admin-password"),
+        "admin_password leaked into the redacted dump"
     );
     assert!(
         !dump.contains("top-secret-ch-password"),
@@ -33,6 +43,10 @@ fn redacted_yaml_and_debug_never_contain_secret_values() {
     assert!(
         !debug_repr.contains("top-secret-auth-password"),
         "auth_password leaked into Debug output"
+    );
+    assert!(
+        !debug_repr.contains("top-secret-admin-password"),
+        "admin_password leaked into Debug output"
     );
     assert!(
         !debug_repr.contains("top-secret-ch-password"),
