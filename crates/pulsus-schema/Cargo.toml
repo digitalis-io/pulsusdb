@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 clickhouse.workspace = true
 pulsus-clickhouse = { path = "../pulsus-clickhouse" }
+pulsus-config = { path = "../pulsus-config" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "time", "rt"] }
 tracing.workspace = true

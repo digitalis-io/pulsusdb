@@ -14,6 +14,7 @@ mod checks;
 mod error;
 mod render;
 mod sql;
+mod vars;
 
 pub use checks::{
     DEDUP_WINDOW_SECONDS, NameCatalogue, REQUIRED_SERVER_NAMES, SchemaRetention,
@@ -30,4 +31,7 @@ pub use render::{
 pub use sql::{
     SCHEMA_SQL, expand_levels_for_tests, mv_projection, rendered, rendered_statements,
     table_column_names,
+};
+pub use vars::{
+    MAX_LEVELS, REFUSALS, SCHEMA_VARS, SCRIPT_CONNECTION_VARS, SchemaMode, ctx_from_vars,
 };

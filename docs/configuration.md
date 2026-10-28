@@ -289,6 +289,17 @@ The script's refusals, each printed as `schema.sh: <message>`. Rules 1 to 5 are 
 
 Rule 3 is checked for `PULSUS_METRICS_HOT_DAYS`, then `PULSUS_LOGS_HOT_DAYS`, then `PULSUS_TRACES_HOT_DAYS`, all of a, b and c for one before the next. `<VAR>` is the variable's name and `<R>` is `PULSUS_RETENTION_DAYS`. Rule 4 is checked when `PULSUS_ROLLUP_RETENTION_DAYS` is set, rule 5 when `PULSUS_ROLLUP_HOT_DAYS` is, each item in level order and 4 c for every level before 4 d. `<s>` is the level in seconds; `<from>` the switch point of the level after it; `<d>` = ⌈`<from>` ÷ 86400⌉ + 1; `<keep>` the level's `PULSUS_ROLLUP_RETENTION_DAYS` item, else `<R>`; `<k>` the number of items and `<m>` of levels.
 
+### Grammar boundaries
+
+The values at each edge of the two grammars. The dedup-window grammar applies to the three `PULSUS_*_DEDUP_WINDOW` environment variables, as the binary and `schema/schema.sh` read them; a YAML `*_dedup_window` is an integer, held only to `1..=1000000`, and the chart's values schema does not expose these keys. The log-rollup-resolution grammar applies to `PULSUS_LOG_ROLLUP_RESOLUTION` and the YAML `log_rollup_resolution` as the binary reads them, to the variable as `schema/schema.sh` reads it, and to the chart's `log_rollup_resolution`. The tests read this table.
+
+| Result | Grammar | Value |
+|---|---|---|
+| accepted | dedup window | `1`, `1000000` |
+| refused | dedup window | `0`, `01`, `+5`, ` 5`, `1000001`, `10000000`, `1.0` |
+| accepted | log rollup resolution | `1ms`, `5s`, `1h`, `2d`, `1w`, `999999999999ms`, `999999999s`, `99999999m`, `999999h`, `99999d`, `9999w` |
+| refused | log rollup resolution | `1000000000000ms`, `1000000000s`, `100000000m`, `1000000h`, `100000d`, `10000w`, `0s`, `05s`, ` 5s`, `5s `, `5ns`, `1.5s`, `5` |
+
 ## 8. Ruler (M7)
 
 | Variable | Default | Description |

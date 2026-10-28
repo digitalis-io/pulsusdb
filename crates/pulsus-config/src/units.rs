@@ -94,6 +94,21 @@ pub fn parse_duration(s: &str) -> Result<Duration, UnitError> {
     Ok(Duration::from_secs(secs))
 }
 
+/// A dedup window as `schema/schema.sh` and the binary's environment reader
+/// both read it (docs/configuration.md §3): 1 to 7 ASCII digits, the first
+/// not `0`, at most 1000000.
+pub fn parse_dedup_window(_s: &str) -> Option<u64> {
+    None
+}
+
+/// `PULSUS_LOG_ROLLUP_RESOLUTION` as `schema/schema.sh` and the binary both
+/// read it (docs/configuration.md §3): ASCII digits, the first not `0`, then
+/// exactly `ms`, `s`, `m`, `h`, `d` or `w`, of at most 12, 9, 8, 6, 5 or 4
+/// digits respectively.
+pub fn parse_log_rollup_resolution(_s: &str) -> Option<Duration> {
+    None
+}
+
 /// A byte quantity. Parsed from strings like `16MiB` or a bare integer of
 /// bytes (docs/configuration.md §9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]

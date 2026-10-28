@@ -877,6 +877,57 @@ fn the_chart_schema_accepts_no_value_the_binary_refuses() {
     );
 }
 
+/// **A8c (issue #746 part A): the chart's `log_rollup_resolution` takes
+/// the grammar `schema/schema.sh` and the binary take.** Every accepted row
+/// of `docs/configuration.md`'s "Grammar boundaries" table passes the chart
+/// schema and no refused row does, so each unit's digit cap and the cap plus
+/// one are both fixed.
+#[test]
+fn the_chart_holds_the_documented_log_rollup_resolution_boundaries() {
+    let schema = parse_doc(
+        &read("deploy/charts/pulsusdb/values.schema.json"),
+        "values.schema.json",
+    );
+    assert!(
+        schema
+            .get("definitions")
+            .and_then(|d| d.get("logRollupResolution"))
+            .is_some(),
+        "values.schema.json defines no logRollupResolution"
+    );
+    let config_schema = get(&schema, &["definitions", "pulsusdbConfig"]);
+    assert_eq!(
+        get(
+            config_schema,
+            &["properties", "log_rollup_resolution", "$ref"]
+        )
+        .as_str(),
+        Some("#/definitions/logRollupResolution"),
+        "log_rollup_resolution's definition"
+    );
+    let values = chart_config();
+    let mut checked = 0;
+    for (accepted, grammar, rows) in support::grammar_boundaries() {
+        if grammar != "log rollup resolution" {
+            continue;
+        }
+        for v in rows {
+            let doc = with_value(
+                &values,
+                "log_rollup_resolution",
+                &serde_norway::Value::String(v.clone()),
+            );
+            assert_eq!(
+                schema_accepts(&schema, config_schema, &doc),
+                accepted,
+                "the chart schema at {v:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 24, "only {checked} values");
+}
+
 /// The keys the ConfigMap template rewrites on the way from `values.yaml`
 /// to the rendered `config.yaml`, per golden, with the rendered value.
 /// `auth_user`, added from `pulsusdb.auth.user`, is not set in either golden
