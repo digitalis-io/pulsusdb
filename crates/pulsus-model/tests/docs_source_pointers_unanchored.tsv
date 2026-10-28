@@ -8,8 +8,6 @@ docs/116.md	docs/architecture.md:20	no_name_the_target_file_holds
 docs/116.md	docs/schemas.md:1077	no_name_the_target_file_holds
 docs/116.md	docs/schemas.md:228	no_name_the_target_file_holds
 docs/116.md	ingest/http.rs:116-121	no_name_the_target_file_holds
-docs/116.md	model.rs:157	no_name_the_target_file_holds
-docs/116.md	model.rs:80	no_name_the_target_file_holds
 docs/116.md	schemas.md:173	no_name_the_target_file_holds
 docs/116.md	schemas.md:228	no_name_the_target_file_holds
 docs/116.md	schemas.md:508	no_name_the_target_file_holds
@@ -689,8 +687,7 @@ docs/query-lowering.md	492-fold-breakA.rs:156	not_in_this_repository
 docs/query-lowering.md	492-fold-breakB.rs:316	not_in_this_repository
 docs/query-lowering.md	ast.rs:1046	ambiguous_basename
 docs/query-lowering.md	crates/pulsus-clickhouse/src/lib.rs:3	no_name_the_target_file_holds
-docs/query-lowering.md	crates/pulsus-config/src/model.rs:643	no_name_the_target_file_holds
-docs/query-lowering.md	crates/pulsus-config/src/model.rs:699	pinned_to_another_version
+docs/query-lowering.md	crates/pulsus-config/src/model.rs:698	pinned_to_another_version
 docs/query-lowering.md	crates/pulsus-read/src/canonical_labels.rs:131-163	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-read/src/logql/post_agg.rs:3307-3350	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-read/src/logql/predicate.rs:257	no_name_the_target_file_holds
@@ -750,8 +747,7 @@ docs/query-lowering.md	metrics_sql.rs:111	not_in_this_repository
 docs/query-lowering.md	metrics_sql.rs:1512	not_in_this_repository
 docs/query-lowering.md	metrics_sql.rs:546	not_in_this_repository
 docs/query-lowering.md	metrics_sql.rs:562	not_in_this_repository
-docs/query-lowering.md	model.rs:643	no_name_the_target_file_holds
-docs/query-lowering.md	model.rs:699	pinned_to_another_version
+docs/query-lowering.md	model.rs:698	pinned_to_another_version
 docs/query-lowering.md	pkg/traceql/ast_execute.go:243-280	pinned_to_another_version
 docs/query-lowering.md	plan.rs:1285	ambiguous_basename
 docs/query-lowering.md	plan.rs:1294	ambiguous_basename
@@ -828,7 +824,7 @@ docs/query-lowering.md	traces/compile.rs:197	not_in_this_repository
 docs/query-lowering.md	traces_search_plan_parts.rs:55-61	not_in_this_repository
 docs/query-to-sql.md	canonical_labels.rs:131-163	no_name_the_target_file_holds
 docs/query-to-sql.md	client_agg.rs:2207	no_name_the_target_file_holds
-docs/query-to-sql.md	crates/pulsus-config/src/model.rs:643	no_name_the_target_file_holds
+docs/query-to-sql.md	crates/pulsus-config/src/model.rs:698	pinned_to_another_version
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:237	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:242	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:248	no_name_the_target_file_holds
@@ -930,12 +926,9 @@ docs/query-to-sql.md	metrics_sql.rs:826	not_in_this_repository
 docs/query-to-sql.md	metrics_sql.rs:874	not_in_this_repository
 docs/query-to-sql.md	metrics_sql.rs:89	not_in_this_repository
 docs/query-to-sql.md	metrics_sql.rs:951	not_in_this_repository
-docs/query-to-sql.md	model.rs:509	no_name_the_target_file_holds
-docs/query-to-sql.md	model.rs:548	pinned_to_another_version
-docs/query-to-sql.md	model.rs:558	no_name_the_target_file_holds
-docs/query-to-sql.md	model.rs:639	no_name_the_target_file_holds
-docs/query-to-sql.md	model.rs:649	no_name_the_target_file_holds
-docs/query-to-sql.md	model.rs:695	pinned_to_another_version
+docs/query-to-sql.md	model.rs:547	pinned_to_another_version
+docs/query-to-sql.md	model.rs:692	pinned_to_another_version
+docs/query-to-sql.md	model.rs:694	pinned_to_another_version
 docs/query-to-sql.md	pipeline.rs:5544	no_name_the_target_file_holds
 docs/query-to-sql.md	pipeline.rs:6771	no_name_the_target_file_holds
 docs/query-to-sql.md	pipeline.rs:6855-6875	no_name_the_target_file_holds
@@ -973,8 +966,6 @@ docs/query-to-sql.md	plan.rs:3870	ambiguous_basename
 docs/query-to-sql.md	plan.rs:3899	ambiguous_basename
 docs/query-to-sql.md	plan.rs:4108	ambiguous_basename
 docs/query-to-sql.md	plan.rs:4112	ambiguous_basename
-docs/query-to-sql.md	pulsus-config/src/model.rs:487	no_name_the_target_file_holds
-docs/query-to-sql.md	pulsus-config/src/model.rs:636	no_name_the_target_file_holds
 docs/query-to-sql.md	pulsus-logql/src/limits.rs:96	no_name_the_target_file_holds
 docs/query-to-sql.md	pulsus-read/src/logql/plan.rs:1057	no_name_the_target_file_holds
 docs/query-to-sql.md	pulsus-read/src/querytext.rs:52	no_name_the_target_file_holds
@@ -1133,9 +1124,10 @@ docs/traceql-schema-migration.md	crates/pulsus-config/src/model.rs:514	no_name_t
 docs/traceql-schema-migration.md	crates/pulsus-config/src/model.rs:514-516	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-config/src/model.rs:515	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-config/src/model.rs:516	no_name_the_target_file_holds
-docs/traceql-schema-migration.md	crates/pulsus-config/src/model.rs:552	no_name_the_target_file_holds
-docs/traceql-schema-migration.md	crates/pulsus-config/src/model.rs:553	no_name_the_target_file_holds
-docs/traceql-schema-migration.md	crates/pulsus-config/src/model.rs:554	no_name_the_target_file_holds
+docs/traceql-schema-migration.md	crates/pulsus-config/src/model.rs:636	no_name_the_target_file_holds
+docs/traceql-schema-migration.md	crates/pulsus-config/src/model.rs:692	pinned_to_another_version
+docs/traceql-schema-migration.md	crates/pulsus-config/src/model.rs:692-693	pinned_to_another_version
+docs/traceql-schema-migration.md	crates/pulsus-config/src/model.rs:696	pinned_to_another_version
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/compile.rs:431-462	not_in_this_repository
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/compile.rs:439-489	not_in_this_repository
 docs/traceql-schema-migration.md	crates/pulsus-read/src/traces/compile.rs:451-462	not_in_this_repository
