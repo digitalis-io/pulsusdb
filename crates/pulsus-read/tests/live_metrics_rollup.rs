@@ -1610,7 +1610,7 @@ async fn the_unrouted_classes_read_raw() {
 }
 
 /// **B7 (issue #18 part B): a level added later is used.** A database
-/// built with the levels 60, 300, 7200 and 86400 and the ranges 3600,
+/// built with the levels 60, 300, 7200 and 86400 and the ranges 60, 3600,
 /// 86400 and 7776000: `max_over_time` over 5 m on a 6-hour range reads
 /// `metric_samples_300s`.
 #[tokio::test(flavor = "multi_thread")]
@@ -1620,7 +1620,7 @@ async fn a_level_added_later_is_used() {
     let end = day0 + 8 * DAY;
     let built = corpus_d(
         DB_B7.name(),
-        (&[60, 300, 7200, 86400], &[3600, 86400, 7776000]),
+        (&[60, 300, 7200, 86400], &[60, 3600, 86400, 7776000]),
         day0,
         7..8,
     )
