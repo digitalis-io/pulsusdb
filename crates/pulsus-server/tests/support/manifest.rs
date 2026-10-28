@@ -284,7 +284,7 @@ pub enum Surface {
     /// axum's `&'static str` response), no I/O, no pool. The body text
     /// is the mounting oracle; the route has no error cases.
     Echo,
-    /// `/admin/…` (issue #746) — mounted only with the admin pair, HTML
+    /// `/admin/…` (issue #746) — always mounted, behind the admin pair, HTML
     /// or JSON.
     Admin,
 }
@@ -310,8 +310,8 @@ pub enum Gate {
     /// [`Gate::CompatAndReader`]: the flag alone never mounts a
     /// `CompatAndWriter` route without the Writer role.
     CompatAndWriter,
-    /// Mounted only when `PULSUS_ADMIN_USER` and `PULSUS_ADMIN_PASSWORD`
-    /// are set (issue #746).
+    /// Always mounted, behind the admin pair `PULSUS_ADMIN_USER` /
+    /// `PULSUS_ADMIN_PASSWORD`, `admin` / `admin` by default (issue #746).
     AdminPair,
 }
 
@@ -1795,7 +1795,7 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: "",
         cases: &[],
     },
-    // -- Admin (issue #746: mounted only with the admin pair) ----------
+    // -- Admin (issue #746: always mounted, behind the admin pair) -----
     RouteSpec {
         path: "/admin/",
         methods: &[Method::Get],

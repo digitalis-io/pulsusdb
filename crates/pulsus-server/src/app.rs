@@ -766,28 +766,32 @@ mod tests {
         );
     }
 
-    /// B4: the admin routes exist only with the admin pair; the data-plane
-    /// pair answers its own 401 first, then 404.
+    /// B4 (owner, 2026-10-28): the admin routes are always mounted. With
+    /// neither admin variable set the default pair `admin` / `admin` opens
+    /// them and nothing else does, the data-plane pair included.
     #[tokio::test]
-    async fn admin_routes_are_mounted_only_with_the_admin_pair() {
+    async fn admin_routes_are_mounted_with_the_default_admin_pair() {
         let none = admin_router(&pairs(false, false));
         assert_eq!(
             status_of(&none, "/admin/", None).await,
-            StatusCode::NOT_FOUND
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_of(&none, "/admin/", Some(&basic("admin:admin"))).await,
+            StatusCode::OK
         );
 
         let data_only = admin_router(&pairs(true, false));
+        for auth in [None, Some(basic("q:wrong")), Some(basic("q:r"))] {
+            assert_eq!(
+                status_of(&data_only, "/admin/", auth.as_deref()).await,
+                StatusCode::UNAUTHORIZED,
+                "{auth:?}"
+            );
+        }
         assert_eq!(
-            status_of(&data_only, "/admin/", None).await,
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            status_of(&data_only, "/admin/", Some(&basic("q:wrong"))).await,
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            status_of(&data_only, "/admin/", Some(&basic("q:r"))).await,
-            StatusCode::NOT_FOUND
+            status_of(&data_only, "/admin/", Some(&basic("admin:admin"))).await,
+            StatusCode::OK
         );
 
         let admin_only = admin_router(&pairs(false, true));

@@ -293,7 +293,6 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         ("error_spans_dist", TRACES_KEY),
         // Issue #18 part A: the default rollup levels, keyed like the
         // samples.
-        ("metric_samples_5s_dist", METRICS_KEY),
         ("metric_samples_60s_dist", METRICS_KEY),
         ("metric_samples_720s_dist", METRICS_KEY),
         ("metric_samples_7200s_dist", METRICS_KEY),
@@ -2012,7 +2011,7 @@ async fn each_shard_builds_its_slice_once() {
     drop_cluster_db(&shard1, db).await;
     let ctx = RenderCtx {
         rollup_levels: vec![60, 720, 7200, 86400],
-        rollup_ranges: vec![86400, 604800, 7776000],
+        rollup_ranges: vec![60, 86400, 604800, 7776000],
         ..cluster_ctx(db)
     };
     run_init(&shard1, &ctx).await.expect("run_init (clustered)");
@@ -2451,13 +2450,13 @@ async fn one_and_eight_levels_are_discovered_on_the_cluster() {
         .await
         .expect("connect shard1");
     let cases: [LevelCase; 2] = [
-        (&TEST_DB_LEVELS_ONE, "60", "", vec![(60_000, 0)]),
+        (&TEST_DB_LEVELS_ONE, "60", "3600", vec![(60_000, 3_600_000)]),
         (
             &TEST_DB_LEVELS_EIGHT,
             "5,10,20,60,120,240,720,86400",
-            "3600,7200,14400,28800,86400,604800,7776000",
+            "60,3600,7200,14400,28800,86400,604800,7776000",
             vec![
-                (5_000, 0),
+                (5_000, 60_000),
                 (10_000, 3_600_000),
                 (20_000, 7_200_000),
                 (60_000, 14_400_000),

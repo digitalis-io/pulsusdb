@@ -1170,28 +1170,31 @@ mod tests {
         );
     }
 
-    /// Issue #746 B1: one-sided admin pair is a hard error naming the
-    /// missing field.
+    /// Issue #746: the admin pair defaults to `admin` / `admin`, so the
+    /// admin UI is always mounted, and either half set alone keeps the
+    /// other's default.
     #[test]
-    fn one_sided_admin_user_only_is_a_hard_error() {
-        let cfg = Config {
+    fn the_admin_pair_defaults_to_admin_and_either_half_overrides_alone() {
+        let cfg = Config::default();
+        assert_eq!(cfg.admin_user.as_deref(), Some("admin"));
+        assert_eq!(
+            cfg.admin_password.as_ref().map(|s| s.expose()),
+            Some("admin")
+        );
+        assert!(cfg.admin_password_is_default());
+        assert!(validate(&cfg).is_ok());
+        let user_only = Config {
             admin_user: Some("root".to_string()),
             ..Config::default()
         };
-        assert!(
-            matches!(validate(&cfg), Err(ConfigError::Value { field, .. }) if field == "admin_password")
-        );
-    }
-
-    #[test]
-    fn one_sided_admin_password_only_is_a_hard_error() {
-        let cfg = Config {
+        assert!(validate(&user_only).is_ok(), "the user alone");
+        assert!(user_only.admin_password_is_default());
+        let password_only = Config {
             admin_password: Some(crate::secret::Secret::new("toor")),
             ..Config::default()
         };
-        assert!(
-            matches!(validate(&cfg), Err(ConfigError::Value { field, .. }) if field == "admin_user")
-        );
+        assert!(validate(&password_only).is_ok(), "the password alone");
+        assert!(!password_only.admin_password_is_default());
     }
 
     #[test]

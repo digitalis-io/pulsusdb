@@ -942,7 +942,7 @@ mod tests {
     #[test]
     fn one_level_is_first_and_feeds_nothing() {
         assert_eq!(
-            expand_levels(LEVEL_BLOCK, (&[60], &[], 5, &[], &[])),
+            expand_levels(LEVEL_BLOCK, (&[60], &[3600], 5, &[], &[])),
             "head\n\
              A 60s 60000 EVERY 1 MINUTE\n\
              --@cluster C 60s\n  indented\n\
@@ -957,7 +957,7 @@ mod tests {
     #[test]
     fn a_level_below_a_minute_runs_every_minute_and_the_next_has_no_offset() {
         assert_eq!(
-            expand_levels(LEVEL_BLOCK, (&[5, 60], &[3600], 5, &[], &[])),
+            expand_levels(LEVEL_BLOCK, (&[5, 60], &[60, 3600], 5, &[], &[])),
             "head\n\
              A 5s 5000 EVERY 1 MINUTE\n\
              --@cluster C 5s\n  indented\n\
@@ -974,7 +974,7 @@ mod tests {
     /// 780 s.
     #[test]
     fn the_timers_follow_the_level_sizes() {
-        let out = expand_levels(LEVEL_BLOCK, (&[720, 86400], &[86400], 5, &[], &[]));
+        let out = expand_levels(LEVEL_BLOCK, (&[720, 86400], &[86400, 7776000], 5, &[], &[]));
         assert!(out.contains("A 720s 720000 EVERY 12 MINUTE\n"), "{out}");
         assert!(
             out.contains("A 86400s 86400000 EVERY 1 DAY OFFSET 780 SECOND\n"),

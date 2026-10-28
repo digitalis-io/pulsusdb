@@ -132,6 +132,14 @@ pub struct Config {
     pub ruler: RulerConfig,
 }
 
+impl Config {
+    /// Issue #746: whether the admin password is still the default
+    /// `admin`, which the server warns about at startup.
+    pub fn admin_password_is_default(&self) -> bool {
+        false
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {

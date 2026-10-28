@@ -2403,14 +2403,10 @@ async fn all_mode_auth_off_compat_on_full_matrix() {
                 assert_traces_fetch_v2_route(port, spec, "spawn=all,auth=off,compat=on")
             }
             Surface::LogsTail => assert_tail_route(port, spec, "spawn=all,auth=off,compat=on"),
-            // Issue #746: the admin pair is unset in this spawn, so no
-            // admin route is mounted.
+            // Issue #746: the admin variables are unset in this spawn, so
+            // the default pair opens the admin routes.
             Surface::Admin => {
-                let ctx = format!(
-                    "[spawn=all,auth=off,compat=on] GET {} case=admin-pair-unset-404",
-                    spec.path
-                );
-                assert_404_empty(&get(port, spec.path, &ctx), &ctx);
+                assert_default_admin_pair(port, spec, "spawn=all,auth=off,compat=on", &[])
             }
             _ => assert_full_route_matrix(port, spec, "spawn=all,auth=off,compat=on"),
         }
@@ -2486,6 +2482,12 @@ async fn all_mode_auth_on_perimeter() {
         // the pinned auth-failure envelope — the perimeter never leaks
         // path existence.
         let spawn = "spawn=all,auth=on,compat=on";
+        // Issue #746: the admin variables are unset in this spawn, so the
+        // default pair, and not the data-plane pair, opens an admin route.
+        if spec.surface == Surface::Admin {
+            assert_default_admin_pair(port, spec, spawn, &[&valid, &invalid]);
+            continue;
+        }
         let ctx = format!(
             "[{spawn}] {} {} case=auth creds=none",
             req.method, spec.path
@@ -2516,12 +2518,6 @@ async fn all_mode_auth_on_perimeter() {
         req.headers.pop();
         req.headers.push(("authorization", valid.clone()));
         let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
-        // Issue #746: the admin pair is unset in this spawn, so past the
-        // data-plane perimeter an admin route is an unmounted path.
-        if spec.surface == Surface::Admin {
-            assert_404_empty(&res, &ctx);
-            continue;
-        }
         assert_eq!(
             res.status,
             spec.success_status,
@@ -2569,6 +2565,50 @@ fn assert_401_admin_json(res: &RawResponse, ctx: &str) {
         r#"{"errors":[{"field":null,"message":"unauthorized"}]}"#,
         "{ctx}: body"
     );
+}
+
+/// Issue #746 (owner, 2026-10-28): with neither admin variable set an admin
+/// route is mounted behind the default pair `admin` / `admin`. No
+/// credentials, and each of `others`, get the admin `401`; the default pair
+/// reaches the documented success status.
+fn assert_default_admin_pair(port: u16, spec: &RouteSpec, spawn: &str, others: &[&String]) {
+    let is_api = spec.path.starts_with("/admin/api/v1/");
+    let method = spec.methods[0].as_str();
+    let mut refused: Vec<(&str, Option<&String>)> = vec![("none", None)];
+    refused.extend(others.iter().map(|c| ("other", Some(*c))));
+    for (label, creds) in refused {
+        let ctx = format!(
+            "[{spawn}] {method} {} case=admin-default creds={label}",
+            spec.path
+        );
+        let mut req = admin_request(spec);
+        if let Some(value) = creds {
+            req.headers.push(("authorization", value.clone()));
+        }
+        let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        if is_api {
+            assert_401_admin_json(&res, &ctx);
+        } else {
+            assert_401_unauthorized(&res, &ctx);
+        }
+    }
+    let ctx = format!(
+        "[{spawn}] {method} {} case=admin-default creds=admin:admin",
+        spec.path
+    );
+    let mut req = admin_request(spec);
+    req.headers.push((
+        "authorization",
+        format!("Basic {}", base64_encode(b"admin:admin")),
+    ));
+    let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+    assert_eq!(
+        res.status,
+        spec.success_status,
+        "{ctx}: status (body: {:?})",
+        String::from_utf8_lossy(&res.body)
+    );
+    assert_success_envelope(spec, &res, &ctx);
 }
 
 /// The valid request for an admin route: its first method, with
@@ -2749,11 +2789,8 @@ async fn writer_only_mode_reader_routes_404() {
             // assertion that distinguishes `CompatAndWriter` from
             // `CompatAndReader` (which stays 404 here, no Reader role).
             Gate::CompatAndWriter => assert_ingest_route(port, spec, spawn),
-            // Issue #746: the admin pair is unset in this spawn.
-            Gate::AdminPair => {
-                let ctx = format!("[{spawn}] GET {} case=admin-pair-unset-404", spec.path);
-                assert_404_empty(&get(port, spec.path, &ctx), &ctx);
-            }
+            // Issue #746: the admin variables are unset in this spawn.
+            Gate::AdminPair => assert_default_admin_pair(port, spec, spawn, &[]),
         }
     }
 }
@@ -2820,11 +2857,8 @@ async fn reader_only_mode_writer_routes_404() {
             // `reader_only_mode_compat_on_writer_compat_route_404` (flag on,
             // Writer role still absent) and spawn 3 (flag off).
             Gate::CompatAndWriter => {}
-            // Issue #746: the admin pair is unset in this spawn.
-            Gate::AdminPair => {
-                let ctx = format!("[{spawn}] GET {} case=admin-pair-unset-404", spec.path);
-                assert_404_empty(&get(port, spec.path, &ctx), &ctx);
-            }
+            // Issue #746: the admin variables are unset in this spawn.
+            Gate::AdminPair => assert_default_admin_pair(port, spec, spawn, &[]),
             Gate::ReaderMode => {
                 let method = spec.methods[0];
                 let ctx = format!(

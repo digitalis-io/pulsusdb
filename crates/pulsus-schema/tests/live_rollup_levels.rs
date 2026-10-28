@@ -56,12 +56,12 @@ static DB_EXPIRY: pulsus_testkit::TestDb =
 static DB_DISCOVERY: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_levels_discovery");
 
-/// Part A's levels, 60 s first, which these cases were written for; the
-/// default levels begin at 5 s.
+/// Part A's levels, 60 s first, which these cases were written for, the
+/// 60 s level the resolution from a range of 60 s.
 fn part_a(db: &str, retention_days: u32) -> RenderCtx {
     RenderCtx {
         rollup_levels: vec![60, 720, 7200, 86400],
-        rollup_ranges: vec![86400, 604800, 7776000],
+        rollup_ranges: vec![60, 86400, 604800, 7776000],
         ..RenderCtx::for_tests(db, retention_days)
     }
 }
@@ -1536,8 +1536,9 @@ async fn stale_markers_and_nan_at_the_levels() {
 
 /// **T7 (issue #18 follow-up): the discovery reads the switch points.** A
 /// database built with the default levels: the level discovery returns the
-/// five levels, each with the query range from which it is the
-/// resolution, and the counter bucket count.
+/// four levels, 60 s first, each with the query range from which it is the
+/// resolution, the first level's included (issue #746), and the counter
+/// bucket count.
 #[tokio::test]
 async fn the_discovery_reads_the_switch_points() {
     use pulsus_read::metrics::rollup::{LevelSlot, refresh_levels};
@@ -1559,7 +1560,6 @@ async fn the_discovery_reads_the_switch_points() {
         .map(|l| (l.res_ms, l.table.clone(), l.from_ms))
         .collect();
     let want: Vec<(i64, String, u64)> = [
-        (5_000, 0),
         (60_000, 3_600_000),
         (720_000, 86_400_000),
         (7_200_000, 604_800_000),
@@ -1589,7 +1589,7 @@ async fn a_level_and_its_series_outlive_raw() {
     let db = DB_KEPT.name();
     let ctx = RenderCtx {
         rollup_levels: vec![60, 720],
-        rollup_ranges: vec![86400],
+        rollup_ranges: vec![60, 86400],
         rollup_retention_days: vec![2, 10],
         ..RenderCtx::for_tests(db, 2)
     };

@@ -805,9 +805,40 @@ mod tests {
         assert_eq!((v.shards, v.replicas), (2, 3));
         assert_eq!(v.keepers.len(), 3);
         let widths: Vec<&str> = v.levels.iter().map(|l| l.width.as_str()).collect();
-        assert_eq!(widths, ["5", "60", "720", "7200", "86400"]);
+        assert_eq!(widths, ["60", "720", "7200", "86400"]);
         let froms: Vec<&str> = v.levels.iter().filter_map(|l| l.from.as_deref()).collect();
         assert_eq!(froms, ["3600", "86400", "604800", "7776000"]);
+        assert_eq!(
+            v.vars["PULSUS_ROLLUP_RANGES"], "3600,86400,604800,7776000",
+            "level 1 carries its own range"
+        );
+    }
+
+    /// Issue #746: level 1's "Range from" is a field like every other
+    /// row's, starting at the default 3600, and refused like them: below
+    /// its resolution, the message is the schema's, on the level group.
+    #[test]
+    fn level_one_has_its_own_range_from() {
+        let page = page(&Inputs::from_pairs(starting_values()), &[], None);
+        assert!(
+            page.contains(" name=\"l1_from\""),
+            "level 1 has a Range from field: {page}"
+        );
+        assert!(
+            page.contains("aria-label=\"Level 1 range from\""),
+            "the field is labelled: {page}"
+        );
+        assert!(!page.contains("0, every range"), "{page}");
+        let mut pairs = starting_values();
+        pairs.retain(|(n, _)| n != "l1_from");
+        pairs.push(("l1_from".to_string(), "30".to_string()));
+        let errors = pulsus_setup::validate(&Inputs::from_pairs(pairs)).expect_err("refused");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field, "levels");
+        assert_eq!(
+            errors[0].message,
+            "PULSUS_ROLLUP_RANGES: 30 is shorter than its level 60"
+        );
     }
 
     /// Every field the server reads is on the form, under its own name.

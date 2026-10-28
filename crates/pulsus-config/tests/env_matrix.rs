@@ -659,8 +659,6 @@ fn each_variable_sets_exactly_one_yaml_key() {
 const NO_LITERAL_DEFAULT: &[(&str, &str)] = &[
     ("CLICKHOUSE_SERVERS", "unset"),
     ("CLICKHOUSE_TLS_CA_FILE", "unset"),
-    ("PULSUS_ADMIN_PASSWORD", "unset"),
-    ("PULSUS_ADMIN_USER", "unset"),
     ("PULSUS_AUTH_PASSWORD", "unset"),
     ("PULSUS_AUTH_USER", "unset"),
     ("PULSUS_AVAILABILITY_ZONE", "unset"),
@@ -826,5 +824,40 @@ fn exp_histogram_mode_accepts_every_variant_and_rejects_unknown() {
         "the rejection must name the variable and the accepted values: {msg}"
     );
 
+    support::clear_all();
+}
+
+/// Issue #746: with neither admin variable set the admin pair is
+/// `admin` / `admin`; either variable alone loads, overriding its half
+/// only.
+#[test]
+fn the_admin_pair_defaults_to_admin_and_either_variable_loads_alone() {
+    let _guard = support::lock_env();
+    let pair = |c: &Config| {
+        (
+            c.admin_user.clone(),
+            c.admin_password.as_ref().map(|s| s.expose().to_string()),
+        )
+    };
+    let some = |s: &str| Some(s.to_string());
+    for (vars, want) in [
+        (&[][..], (some("admin"), some("admin"))),
+        (
+            &[("PULSUS_ADMIN_USER", "root")][..],
+            (some("root"), some("admin")),
+        ),
+        (
+            &[("PULSUS_ADMIN_PASSWORD", "toor")][..],
+            (some("admin"), some("toor")),
+        ),
+    ] {
+        support::clear_all();
+        for (var, value) in vars {
+            support::set(var, value);
+        }
+        let cfg = pulsus_config::load(None, None)
+            .unwrap_or_else(|e| panic!("{vars:?}: load() failed: {e}"));
+        assert_eq!(pair(&cfg), want, "{vars:?}");
+    }
     support::clear_all();
 }

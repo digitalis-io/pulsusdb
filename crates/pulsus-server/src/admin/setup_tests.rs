@@ -206,16 +206,14 @@ fn one_level() -> Pairs {
 fn eight_levels() -> Pairs {
     let widths = ["5", "10", "20", "60", "120", "240", "720", "86400"];
     let froms = [
-        "3600", "7200", "14400", "28800", "86400", "604800", "7776000",
+        "60", "3600", "7200", "14400", "28800", "86400", "604800", "7776000",
     ];
     let mut overrides: Vec<(String, String)> = Vec::new();
     for (i, width) in widths.iter().enumerate() {
         let k = i + 1;
         overrides.push((format!("l{k}_width"), width.to_string()));
         overrides.push((format!("l{k}_local"), "365".to_string()));
-        if k > 1 {
-            overrides.push((format!("l{k}_from"), froms[i - 1].to_string()));
-        }
+        overrides.push((format!("l{k}_from"), froms[i].to_string()));
     }
     let refs: Vec<(&str, &str)> = overrides
         .iter()
@@ -301,7 +299,7 @@ async fn c10_the_setup_page_shows_files_and_totals() {
         res.body,
         "CLICKHOUSE_DB=pulsus\nPULSUS_CLUSTER=pulsus_cluster\nPULSUS_COLD_VOLUME=cold\n\
          PULSUS_LOGS_HOT_DAYS=7\nPULSUS_METRICS_HOT_DAYS=7\nPULSUS_RETENTION_DAYS=97\n\
-         PULSUS_ROLLUP_LEVELS=60,720,7200,86400\nPULSUS_ROLLUP_RANGES=86400,604800,7776000\n\
+         PULSUS_ROLLUP_LEVELS=60,720,7200,86400\nPULSUS_ROLLUP_RANGES=3600,86400,604800,7776000\n\
          PULSUS_ROLLUP_RETENTION_DAYS=365,365,365,365\nPULSUS_STORAGE_POLICY=pulsus_tiered\n\
          PULSUS_TRACES_HOT_DAYS=7\n"
     );

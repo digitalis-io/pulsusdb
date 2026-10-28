@@ -150,7 +150,7 @@ fn c1_schema_env_of_the_example() {
             "PULSUS_METRICS_HOT_DAYS=7",
             "PULSUS_RETENTION_DAYS=97",
             "PULSUS_ROLLUP_LEVELS=60,720,7200,86400",
-            "PULSUS_ROLLUP_RANGES=86400,604800,7776000",
+            "PULSUS_ROLLUP_RANGES=3600,86400,604800,7776000",
             "PULSUS_ROLLUP_RETENTION_DAYS=365,365,365,365",
             "PULSUS_STORAGE_POLICY=pulsus_tiered",
             "PULSUS_TRACES_HOT_DAYS=7",
@@ -971,4 +971,23 @@ fn c17_the_bundle_runs_its_own_script() {
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(out, file(&files, "schema-rendered.sql"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **Issue #746: the admin pair's default.** Step 5 says the admin pair is
+/// `admin` / `admin` until set and to set the password; V5 reads the admin
+/// API with the pair from the environment, else the default.
+#[test]
+fn the_steps_name_the_default_admin_pair() {
+    let files = files(&example());
+    let md = file(&files, "setup.md");
+    let step = section(md, "5");
+    assert!(
+        step.contains("`admin` / `admin`") && step.contains("set `PULSUS_ADMIN_PASSWORD`"),
+        "{step}"
+    );
+    let v5 = section(md, "V5");
+    assert!(
+        v5.contains(r#"-u "${PULSUS_ADMIN_USER:-admin}:${PULSUS_ADMIN_PASSWORD:-admin}""#),
+        "{v5}"
+    );
 }
