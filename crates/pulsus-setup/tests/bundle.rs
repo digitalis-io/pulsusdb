@@ -1181,3 +1181,17 @@ fn two_bundles_at_once_never_mix() {
         assert!(stray.is_empty(), "round {round}: left beside it: {stray:?}");
     }
 }
+
+/// **Review r3: a destination whose parent directories do not exist yet is
+/// written, its parents created.**
+#[test]
+fn a_nested_new_destination_is_written() {
+    let root = fresh_dir("nested");
+    let dir = root.join("a/b/bundle");
+    let files = bundle(&validated(&example()));
+    write_bundle(&dir, &files).expect("the parents are created");
+    let mut want: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+    want.sort();
+    assert_eq!(files_under(&dir), want);
+    let _ = std::fs::remove_dir_all(&root);
+}
