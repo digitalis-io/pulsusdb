@@ -224,6 +224,15 @@ pub(crate) fn auth_layer(config: &Config) -> Option<ValidateRequestHeaderLayer<B
     Some(ValidateRequestHeaderLayer::custom(BasicAuth { expected }))
 }
 
+/// Step-1 stub: never built.
+#[allow(dead_code)]
+pub(crate) fn admin_auth_layer(
+    _config: &Config,
+    _json: bool,
+) -> Option<ValidateRequestHeaderLayer<BasicAuth>> {
+    None
+}
+
 /// Validates the `Authorization` header against a precomputed `Basic
 /// <base64>` value computed once at layer-build time. A plain string
 /// comparison (not constant-time) is judged acceptable for this

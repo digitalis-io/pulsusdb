@@ -70,6 +70,19 @@ async fn ready(State(state): State<AppState>) -> Response {
     label_cache_ready(state.label_cache.get())
 }
 
+/// Step-1 stub: today's `ready`, its 503 body as the reason.
+#[allow(dead_code)]
+pub(crate) async fn readiness(state: &AppState) -> Result<(), String> {
+    let res = ready(State(state.clone())).await;
+    if res.status() == StatusCode::OK {
+        return Ok(());
+    }
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .map_err(|e| e.to_string())?;
+    Err(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// The label-cache half of [`ready`]'s gate, decoupled from `AppState` so
 /// the "unset slot" branch is unit-testable without a `LabelCache`
 /// (constructing one always needs a live `ChClient`, unlike `ChPool`'s own

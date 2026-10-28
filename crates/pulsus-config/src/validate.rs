@@ -1151,6 +1151,30 @@ mod tests {
         );
     }
 
+    /// Issue #746 B1: one-sided admin pair is a hard error naming the
+    /// missing field.
+    #[test]
+    fn one_sided_admin_user_only_is_a_hard_error() {
+        let cfg = Config {
+            admin_user: Some("root".to_string()),
+            ..Config::default()
+        };
+        assert!(
+            matches!(validate(&cfg), Err(ConfigError::Value { field, .. }) if field == "admin_password")
+        );
+    }
+
+    #[test]
+    fn one_sided_admin_password_only_is_a_hard_error() {
+        let cfg = Config {
+            admin_password: Some(crate::secret::Secret::new("toor")),
+            ..Config::default()
+        };
+        assert!(
+            matches!(validate(&cfg), Err(ConfigError::Value { field, .. }) if field == "admin_user")
+        );
+    }
+
     #[test]
     fn both_auth_fields_set_is_valid() {
         let cfg = Config {

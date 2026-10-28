@@ -35,6 +35,12 @@ pub struct Config {
     pub log_level: LogLevel,
     pub auth_user: Option<String>,
     pub auth_password: Option<Secret>,
+    /// `PULSUS_ADMIN_USER` / `PULSUS_ADMIN_PASSWORD` (issue #746): the admin
+    /// UI's own Basic pair; both set mounts `/admin/`.
+    #[serde(deserialize_with = "crate::model::ignore_until_part_b")]
+    pub admin_user: Option<String>,
+    #[serde(deserialize_with = "crate::model::ignore_until_part_b")]
+    pub admin_password: Option<Secret>,
     pub compat_endpoints: bool,
     pub cors_origin: String,
     pub query_timeout: HumanDuration,
@@ -136,6 +142,8 @@ impl Default for Config {
             log_level: LogLevel::Info,
             auth_user: None,
             auth_password: None,
+            admin_user: None,
+            admin_password: None,
             compat_endpoints: false,
             cors_origin: "*".to_string(),
             query_timeout: HumanDuration(Duration::from_secs(120)),
@@ -161,6 +169,16 @@ impl Default for Config {
             ruler: RulerConfig::default(),
         }
     }
+}
+
+/// Step-1 stub (issue #746 part B): accepts the key and leaves the field
+/// `None`.
+pub(crate) fn ignore_until_part_b<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(None)
 }
 
 impl Config {
