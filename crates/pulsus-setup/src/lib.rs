@@ -76,9 +76,58 @@ pub fn bundle(v: &Validated) -> Vec<File> {
     files
 }
 
-/// Writes `files` under `dir`, creating the directories they need. The
-/// schema script is made executable.
+/// Writes `files` as the new directory `dir`, creating its parents. They
+/// are written into a temporary directory beside it, which is then renamed
+/// to `dir`, so `dir` holds one whole bundle or nothing. A `dir` that already exists is
+/// refused, and an error reading it is returned; two writers to one `dir`
+/// get one bundle and one refusal. The schema script is made executable.
 pub fn write_bundle(dir: &Path, files: &[File]) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let exists = || {
+        Error::new(
+            ErrorKind::AlreadyExists,
+            format!(
+                "{} already exists: write the bundle to a new directory",
+                dir.display()
+            ),
+        )
+    };
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => return Err(exists()),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let name = dir
+        .file_name()
+        .ok_or_else(|| Error::other(format!("{} names no directory", dir.display())))?
+        .to_string_lossy()
+        .to_string();
+    let parent = match dir.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent)?;
+    let mut n = 0u32;
+    let tmp = loop {
+        let candidate = parent.join(format!(".{name}.{}-{n}", std::process::id()));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(e),
+        }
+    };
+    // A rename onto a directory that holds anything fails, so of two
+    // writers only the first lands.
+    let result = write_files(&tmp, files).and_then(|()| {
+        std::fs::rename(&tmp, dir).map_err(|e| if dir.exists() { exists() } else { e })
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    result
+}
+
+fn write_files(dir: &Path, files: &[File]) -> std::io::Result<()> {
     for f in files {
         let path = dir.join(&f.path);
         if let Some(parent) = path.parent() {

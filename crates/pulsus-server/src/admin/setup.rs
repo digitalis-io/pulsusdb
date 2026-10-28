@@ -237,8 +237,8 @@ const REMOTE_URL: Field = Field {
         placeholder: "https://bucket.s3.eu-west-1.amazonaws.com/pulsus/",
     },
     help: "Optional: an S3-compatible bucket that older data moves to, for example \
-           https://bucket.s3.eu-west-1.amazonaws.com/pulsus/. An http or https URL with a host, \
-           ending in /, with no user, query or fragment. Each host writes under \
+           https://bucket.s3.eu-west-1.amazonaws.com/pulsus/. An http or https URL with a host and, \
+           if given, a port from 1 to 65535, ending in /, with no user, query or fragment. Each host writes under \
            URL/shard/replica/. Leave blank for local disk only; then every \
            \"days on object storage\" must be blank or 0.",
 };

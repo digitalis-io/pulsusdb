@@ -2091,10 +2091,14 @@ async fn each_shard_builds_its_slice_once() {
         "the builder's own copy lacks the last push"
     );
 
+    // Exactly one run on each replica: the refresh is asked for while the
+    // view is stopped, then the view is started, which runs it once. Started
+    // first, a view whose minute passed while it was stopped runs at once
+    // for the missed tick, and the refresh then adds a second run.
     let view = LEVEL_VIEWS[0];
     for r in replicas {
-        exec_on(r, &format!("SYSTEM START VIEW {db}.{view}")).await;
         exec_on(r, &format!("SYSTEM REFRESH VIEW {db}.{view}")).await;
+        exec_on(r, &format!("SYSTEM START VIEW {db}.{view}")).await;
         exec_on(r, &format!("SYSTEM WAIT VIEW {db}.{view}")).await;
         exec_on(r, &format!("SYSTEM STOP VIEW {db}.{view}")).await;
     }

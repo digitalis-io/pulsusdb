@@ -935,8 +935,8 @@ fn c16_bounds() {
     }
 }
 
-/// A fresh directory under the build's temporary directory, outside the
-/// source tree.
+/// A path under the build's temporary directory, outside the source tree,
+/// that does not exist yet: a bundle's destination.
 fn fresh_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "pulsus-setup-{name}-{}-{:?}",
@@ -944,7 +944,6 @@ fn fresh_dir(name: &str) -> PathBuf {
         std::thread::current().id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create the directory");
     dir
 }
 
@@ -990,4 +989,228 @@ fn the_steps_name_the_default_admin_pair() {
         v5.contains(r#"-u "${PULSUS_ADMIN_USER:-admin}:${PULSUS_ADMIN_PASSWORD:-admin}""#),
         "{v5}"
     );
+}
+
+/// The `sh` block of `setup.md`'s step 4.
+fn step4_command(md: &str) -> String {
+    let section = section(md, "4");
+    let at = section.find("```sh\n").expect("step 4's command") + "```sh\n".len();
+    section[at..at + section[at..].find("```").expect("the fence closes")].to_string()
+}
+
+/// **Review r1 finding 1: step 4 stops, naming the password variable, when
+/// it is not set in the shell that runs it.**
+#[test]
+fn step4_refuses_to_run_without_the_password() {
+    let files = files(&example());
+    let md = file(&files, "setup.md");
+    assert!(
+        section(md, "4").contains("PULSUS_CLICKHOUSE_PASSWORD"),
+        "step 4 says where the password comes from"
+    );
+    let dir = fresh_dir("step4");
+    let list: Vec<pulsus_setup::File> = files
+        .iter()
+        .map(|(path, content)| pulsus_setup::File {
+            path: path.clone(),
+            content: content.clone(),
+        })
+        .collect();
+    write_bundle(&dir, &list).expect("write the bundle");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(step4_command(md))
+        .current_dir(&dir)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PULSUS_SCHEMA_WAIT_SECONDS", "1")
+        .output()
+        .expect("run sh");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("PULSUS_CLICKHOUSE_PASSWORD"), "{stderr}");
+    assert!(
+        !stderr.contains("did not answer"),
+        "it stops before the server: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **Review r1 finding 2: a bundle is not written over an earlier one,
+/// whose files the new one may not have.**
+#[test]
+fn a_bundle_is_not_written_over_another() {
+    let dir = fresh_dir("over");
+    let tls = bundle(&validated(&example()));
+    write_bundle(&dir, &tls).expect("the first bundle");
+    assert!(dir.join("nodes/1/config.d/pulsus-tls.xml").exists());
+    let plain = bundle(&validated(&no_tls()));
+    let err = write_bundle(&dir, &plain).expect_err("the directory holds a bundle");
+    assert!(err.to_string().contains("already exists"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **Review r1 finding 3: the object-storage URL's whole authority is
+/// checked, its port included.**
+#[test]
+fn the_remote_url_authority_is_checked() {
+    let message =
+        "must be an http(s) URL with a host, ending in /, without a user, query or fragment";
+    for bad in [
+        "https://h:99999/b/",
+        "https://h:0/b/",
+        "https://h:65536/b/",
+        "https://h:/b/",
+        "https://h:x/b/",
+        "https://[::1]:99999/b/",
+    ] {
+        assert_eq!(
+            field_messages(&with(example(), &[("remote_url", bad)]), "remote_url"),
+            [message],
+            "{bad:?}"
+        );
+    }
+    // Review r2 finding 2: any parsed host, bracketed IPv6 included.
+    for good in [
+        "https://h:65535/b/",
+        "http://10.0.0.1:9000/b/",
+        "https://s3.example/b/",
+        "https://[::1]:9000/b/",
+        "http://[2001:db8::1]/b/",
+    ] {
+        assert!(
+            field_messages(&with(example(), &[("remote_url", good)]), "remote_url").is_empty(),
+            "{good:?}"
+        );
+    }
+}
+
+/// **Review r1 finding 5: raw data with no object-storage days, under the
+/// tiered policy, is described as the levels are: no move rule, local
+/// while the disk has room.**
+#[test]
+fn raw_data_with_no_remote_days_has_no_move_rule() {
+    let lines = pulsus_setup::total_lines(&validated(&with(example(), &[("raw_remote_days", "")])));
+    assert_eq!(
+        lines[0],
+        "Raw data: kept at least 7 days; no move rule; on local disk while the local disk has room"
+    );
+    let local_only = pulsus_setup::total_lines(&validated(&no_remote()));
+    assert_eq!(
+        local_only[0],
+        "Raw data: kept at least 7 days; at least 7 on local disk"
+    );
+}
+
+/// **Review r2 finding 1: a destination that already exists is refused,
+/// even empty, and one that cannot be read is refused without a file
+/// written.**
+#[test]
+fn an_existing_destination_is_refused() {
+    let files = bundle(&validated(&example()));
+    let empty = fresh_dir("exists-empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let err = write_bundle(&empty, &files).expect_err("the directory exists");
+    assert!(err.to_string().contains("already exists"), "{err}");
+    assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&empty);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let unreadable = fresh_dir("exists-unreadable");
+        std::fs::create_dir_all(&unreadable).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let result = write_bundle(&unreadable, &files);
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "an unreadable destination is refused");
+        assert_eq!(
+            std::fs::read_dir(&unreadable).unwrap().count(),
+            0,
+            "nothing written"
+        );
+        let _ = std::fs::remove_dir_all(&unreadable);
+    }
+}
+
+/// Every file under `dir`, by its path inside it, sorted.
+fn files_under(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(
+                    path.strip_prefix(dir)
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// **Review r2 finding 1: two bundles written to one destination at once
+/// never mix: one is written whole, the other refused, and nothing is
+/// left beside the destination.**
+#[test]
+fn two_bundles_at_once_never_mix() {
+    let tls = bundle(&validated(&example()));
+    let plain = bundle(&validated(&no_tls()));
+    for round in 0..20 {
+        let dir = fresh_dir(&format!("race-{round}"));
+        let barrier = std::sync::Barrier::new(2);
+        let (a, b) = std::thread::scope(|s| {
+            let one = s.spawn(|| {
+                barrier.wait();
+                write_bundle(&dir, &tls)
+            });
+            let two = s.spawn(|| {
+                barrier.wait();
+                write_bundle(&dir, &plain)
+            });
+            (one.join().unwrap(), two.join().unwrap())
+        });
+        assert!(
+            a.is_ok() != b.is_ok(),
+            "round {round}: exactly one is written: {a:?} {b:?}"
+        );
+        let won = if a.is_ok() { &tls } else { &plain };
+        let mut want: Vec<String> = won.iter().map(|f| f.path.clone()).collect();
+        want.sort();
+        assert_eq!(
+            files_under(&dir),
+            want,
+            "round {round}: the winner's files and no other"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let name = dir.file_name().unwrap().to_string_lossy().to_string();
+        let stray: Vec<String> = std::fs::read_dir(dir.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(&format!(".{name}")))
+            .collect();
+        assert!(stray.is_empty(), "round {round}: left beside it: {stray:?}");
+    }
+}
+
+/// **Review r3: a destination whose parent directories do not exist yet is
+/// written, its parents created.**
+#[test]
+fn a_nested_new_destination_is_written() {
+    let root = fresh_dir("nested");
+    let dir = root.join("a/b/bundle");
+    let files = bundle(&validated(&example()));
+    write_bundle(&dir, &files).expect("the parents are created");
+    let mut want: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+    want.sort();
+    assert_eq!(files_under(&dir), want);
+    let _ = std::fs::remove_dir_all(&root);
 }
