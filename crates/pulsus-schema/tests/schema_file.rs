@@ -3100,12 +3100,23 @@ fn the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets() {
 /// variables and arguments: its exit code, standard output as the bytes it
 /// wrote, and standard error.
 fn script_clean(vars: &[(&str, &str)], args: &[&str]) -> (Option<i32>, Vec<u8>, String) {
+    script_clean_in(vars, args, &repo_root())
+}
+
+/// [`script_clean`], run from the directory `cwd` (issue #746 part A: a
+/// value the script left open to pathname expansion read the directory it
+/// ran in).
+fn script_clean_in(
+    vars: &[(&str, &str)],
+    args: &[&str],
+    cwd: &std::path::Path,
+) -> (Option<i32>, Vec<u8>, String) {
     let root = repo_root();
     let mut cmd = Command::new("sh");
     cmd.arg(root.join("schema/schema.sh"))
         .args(args)
         .arg("--print")
-        .current_dir(&root)
+        .current_dir(cwd)
         .env_clear()
         .env("PATH", std::env::var("PATH").expect("PATH is set"));
     for (var, value) in vars {
@@ -4080,7 +4091,16 @@ fn script_message(err: &str) -> Option<String> {
 /// when the two agree: the same refusal with the same message, or both
 /// accept and render the same bytes. Otherwise what differs.
 fn script_and_crate_differ(vars: &[(&str, &str)], mode: Option<SchemaMode>) -> Option<String> {
-    let (code, out, err) = script_clean(vars, &mode_args(mode));
+    script_and_crate_differ_in(vars, mode, &repo_root())
+}
+
+/// [`script_and_crate_differ`], the script run from `cwd`.
+fn script_and_crate_differ_in(
+    vars: &[(&str, &str)],
+    mode: Option<SchemaMode>,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    let (code, out, err) = script_clean_in(vars, &mode_args(mode), cwd);
     let map: std::collections::BTreeMap<&str, &str> = vars.iter().copied().collect();
     let from_crate = ctx_from_vars(&map, mode);
     match (code, from_crate) {
@@ -5193,22 +5213,29 @@ fn the_refusal_scan_reads_every_form() {
     );
 }
 
-/// **A6b (issue #746 part A): a request the server refuses ends the script
-/// with curl's own exit code.** A stub answers the wait loop's first request
-/// and refuses every later one.
-#[test]
-fn a_refused_request_exits_with_curls_code() {
+/// A stub server on loopback: it answers its first request (the script's
+/// wait loop) `200` and every later one `500` with the body `boom`. Its
+/// address, the requests it has served, and each request's
+/// `Authorization` header, empty when it had none.
+fn refusing_stub() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a stub");
     let addr = listener.local_addr().expect("the stub's address");
     let served = std::sync::Arc::new(AtomicUsize::new(0));
+    let auths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let count = served.clone();
+    let seen = auths.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let mut reader = BufReader::new(stream.try_clone().expect("clone the stream"));
             let mut length = 0usize;
+            let mut auth = String::new();
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -5218,12 +5245,16 @@ fn a_refused_request_exits_with_curls_code() {
                 if let Some(v) = lower.strip_prefix("content-length:") {
                     length = v.trim().parse().unwrap_or(0);
                 }
+                if lower.starts_with("authorization:") {
+                    auth = line["authorization:".len()..].trim().to_string();
+                }
                 if line == "\r\n" {
                     break;
                 }
             }
             let mut body = vec![0; length];
             let _ = reader.read_exact(&mut body);
+            seen.lock().unwrap().push(auth);
             let n = count.fetch_add(1, Ordering::SeqCst);
             let (status, body) = if n == 0 {
                 ("200 OK", "1\n")
@@ -5237,6 +5268,16 @@ fn a_refused_request_exits_with_curls_code() {
             );
         }
     });
+    (addr, served, auths)
+}
+
+/// **A6b (issue #746 part A): a request the server refuses ends the script
+/// with curl's own exit code.** A stub answers the wait loop's first request
+/// and refuses every later one.
+#[test]
+fn a_refused_request_exits_with_curls_code() {
+    use std::sync::atomic::Ordering;
+    let (addr, served, _) = refusing_stub();
     let root = repo_root();
     let out = Command::new("sh")
         .arg(root.join("schema/schema.sh"))
@@ -5260,6 +5301,64 @@ fn a_refused_request_exits_with_curls_code() {
         served.load(Ordering::SeqCst),
         2,
         "the wait, then the version"
+    );
+}
+
+/// Standard base64 of `bytes`, for the expected `Authorization` header.
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ABC[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// **Issue #746 part A: the credential reaches the server as written.**
+/// `CLICKHOUSE_AUTH` holding a pattern character, run from a directory
+/// where the pattern names a file: the request carries the credential, not
+/// the file's name.
+#[test]
+fn the_credential_is_sent_as_written() {
+    assert_eq!(base64(b"user:p*"), "dXNlcjpwKg==");
+    let (addr, _, auths) = refusing_stub();
+    let dir = std::env::temp_dir().join(format!("pulsus-schema-auth-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a directory for the credential case");
+    std::fs::write(dir.join("user:pX"), "").expect("a file the pattern names");
+    let root = repo_root();
+    let out = Command::new("sh")
+        .arg(root.join("schema/schema.sh"))
+        .args(["--mode", "single"])
+        .current_dir(&dir)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").expect("PATH is set"))
+        .env("PULSUS_RETENTION_DAYS", "1")
+        .env("CLICKHOUSE_SERVER", "127.0.0.1")
+        .env("CLICKHOUSE_HTTP_PORT", addr.port().to_string())
+        .env("CLICKHOUSE_AUTH", "user:p*")
+        .env("PULSUS_SCHEMA_WAIT_SECONDS", "2")
+        .output()
+        .expect("run schema.sh");
+    std::fs::remove_dir_all(&dir).expect("remove the credential directory");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(22), "the exit: {err}");
+    let auths = auths.lock().unwrap().clone();
+    assert_eq!(
+        auths.get(1).map(String::as_str),
+        Some(format!("Basic {}", base64(b"user:p*")).as_str()),
+        "the version request's credential, of {auths:?}"
     );
 }
 
@@ -5568,6 +5667,32 @@ fn the_script_and_the_crate_agree_at_every_boundary() {
     assert!(
         accepted.load(std::sync::atomic::Ordering::Relaxed) > 100,
         "too few accepted cases"
+    );
+
+    // An attribute list holding a pattern character, from a directory
+    // where the pattern names files: the script reads the text, as the
+    // crate does, and never the directory.
+    let dir = std::env::temp_dir().join(format!("pulsus-schema-glob-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a directory for the pattern cases");
+    for name in ["span.a", "event.b"] {
+        std::fs::write(dir.join(name), "").expect("a file the pattern names");
+    }
+    let mut differ = Vec::new();
+    for list in ["*", "span.*", "span.a,*", "?pan.a", "event.[b]"] {
+        let vars = [
+            ("PULSUS_RETENTION_DAYS", "30"),
+            ("PULSUS_TRACEQL_INDEXED_ATTRIBUTES", list),
+        ];
+        differ.extend(script_and_crate_differ_in(
+            &vars,
+            Some(SchemaMode::Single),
+            &dir,
+        ));
+    }
+    std::fs::remove_dir_all(&dir).expect("remove the pattern directory");
+    assert!(
+        differ.is_empty(),
+        "from a directory the patterns match: {differ:#?}"
     );
 }
 
