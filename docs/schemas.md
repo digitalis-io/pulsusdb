@@ -832,8 +832,8 @@ the replica path in the last column.
   (`non_replicated_deduplication_window` single-node, `replicated_deduplication_window` clustered).
 - `spans` carries three bloom-filter indexes (`idx_service`, `idx_name`, `idx_resource`) and the
   `{{trace_attr_indexes}}` token, which renders one index per attribute `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` names
-  (`schema/schema.sql:388-390`; `docs/configuration.md` §3).
-- `trace_landing` sets `async_insert = 0` (`schema/schema.sql:504`).
+  (`schema/schema.sql:407-409`; `docs/configuration.md` §3).
+- `trace_landing` sets `async_insert = 0` (`schema/schema.sql:509`).
 - Clustered, `spans`, `traces` and `error_spans` have a `_dist` wrapper sharded on `cityHash64(trace_id)`
   (`schema/schema.sql:560-562`, `:564-566`, `:933-935`); no other trace table has one (§7).
 
@@ -847,9 +847,9 @@ it, and reads and writes its markers under the empty tenant (`org_id = ''`), one
 | view | target | reads | filter | statement |
 |---|---|---|---|---|
 | `spans_mv` | `spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0` | `schema/schema.sql:723-755` |
-| `error_spans_mv` | `error_spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0 AND status_code = 2` | `schema/schema.sql:919-923` |
+| `error_spans_mv` | `error_spans` (`_dist` clustered) | `trace_landing` | `row_kind = 0 AND status_code = 2` | `schema/schema.sql:942-946` |
 | `traces_mv` | `traces` (`_dist` clustered) | `trace_landing` | `row_kind = 0`, grouped by `org_id`, `trace_id` | `schema/schema.sql:847-872` |
-| `tag_bucket_values_mv` | `tag_bucket_values` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, scope, key | `schema/schema.sql:925-942` |
+| `tag_bucket_values_mv` | `tag_bucket_values` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, scope, key | `schema/schema.sql:948-965` |
 | `service_bucket_resources_mv` | `service_bucket_resources` | `trace_landing` | `row_kind = 0 AND service_type = 'string'`, grouped by tenant, bucket, service, resource | `schema/schema.sql:959-963` |
 | `resources_mv` | `resources` | `trace_landing` | `row_kind = 1` | `schema/schema.sql:724-736` |
 | `tag_names_mv` | `tag_names` | `trace_landing` | `row_kind = 2` | `schema/schema.sql:772-779` |
