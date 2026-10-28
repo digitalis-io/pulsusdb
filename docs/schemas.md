@@ -76,7 +76,7 @@ CREATE TABLE metric_labels (                       -- the lookup
     last_seen    SimpleAggregateFunction(max, Int64) CODEC(ZSTD(1))
 ) ENGINE = AggregatingMergeTree
 ORDER BY (org_id, metric_name, fingerprint)
-TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
+TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{metrics_catalogue_retention_days}} * 86400), 4294967295))
 SETTINGS allow_dimensions_outside_sorting_key = 1, min_columns_to_activate_adaptive_write_buffer = 1;
 
 CREATE TABLE metric_series (                       -- the activity
@@ -88,7 +88,7 @@ CREATE TABLE metric_series (                       -- the activity
 ) ENGINE = AggregatingMergeTree
 PARTITION BY day
 ORDER BY (org_id, fingerprint)
-TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + {{retention_days}}) * 86400, 4294967295))
+TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + {{metrics_catalogue_retention_days}}) * 86400, 4294967295))
 SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1;
 
 CREATE TABLE metric_label_index (                  -- the label index (issue #635)
@@ -99,7 +99,7 @@ CREATE TABLE metric_label_index (                  -- the label index (issue #63
     last_seen    Int64    CODEC(DoubleDelta, ZSTD(1))   -- the kind-2 row's unix_milli
 ) ENGINE = ReplacingMergeTree(last_seen)
 ORDER BY (org_id, key, value, fingerprint)
-TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295));
+TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{metrics_catalogue_retention_days}} * 86400), 4294967295));
 
 CREATE TABLE metric_label_values (                 -- the index's distinct values
     org_id       LowCardinality(String),
@@ -108,14 +108,14 @@ CREATE TABLE metric_label_values (                 -- the index's distinct value
     last_seen    Int64    CODEC(DoubleDelta, ZSTD(1))   -- max(unix_milli) of the block's rows
 ) ENGINE = ReplacingMergeTree(last_seen)
 ORDER BY (org_id, key, value)
-TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295));
+TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{metrics_catalogue_retention_days}} * 86400), 4294967295));
 ```
 
 - **The label index answers a read with no metric name** (issue #635). The same kind-2 row feeds `metric_label_index_mv`, one row per label of the series, and `metric_label_values_mv`, one row per key and value; each carries the kind-2 row's `unix_milli` as `last_seen` (the values view the block's `max`), the version a merge keeps and the instant the row's TTL counts from. A series read with no metric-name scope, no `__name__` matcher and at least one label matcher that does not match the empty string takes its IDs from the index: matchers that do not match `""` intersect their rows, the others remove theirs with `NOT IN`, and a regex runs on `metric_label_values`' distinct values, the index then reading only those values' rows. A stored empty value reads as absent, as `JSONExtractString` reads it, so the two rows that test presence carry `value != ''`. Every other read renders the lookup statement unchanged. `/labels` and `/label/{name}/values` answer a filter with no metric name as `SELECT DISTINCT` over the index. Each kind-2 row writes one index row per label: measured on a 200,000-series block, the views raise the insert's CPU from 902 to 2,571 ms and its rows written from 600,021 to 1,848,989, and the merged index stores 99.8 bytes per series.
 
 - **The lookup answers every matcher; the activity answers the window** (issue #623). One kind-2 landing row feeds both views: `metric_labels_mv` writes the series' lookup row and `metric_series_mv` its activity row. `metric_labels` holds **one row per series**, keyed `(metric_name, fingerprint)`: a name equality, or a regex with a literal prefix, is a key range; other name regexes run once per distinct name; label matchers read the rows the name leaves, by `JSONExtractString(labels, '<key>')` (absent is `''`). `metric_series` holds one row per series per UTC day, `hours` a 24-bit mask of the hours the series had samples in, OR'd together on merge. No read joins the two: a read takes the IDs the lookup selects and keeps those the activity table finds in the window. `labels` and `metric_name` are functions of `fingerprint` that sit outside their tables' keys and are not aggregates, which 26.8 refuses unless the table sets `allow_dimensions_outside_sorting_key = 1`; both tables set it, and since one fingerprint has one label set and one name, a merge cannot pick between different values.
 - **First and last seen.** The lookup view sets both `first_seen` and `last_seen` to the kind-2 row's `unix_milli`, the hour the writer registered the series in; merges keep the `min` and the `max`. A read takes `min(first_seen)` and `max(last_seen)` by fingerprint, exact across unmerged parts and shards. No read uses them yet.
-- **Activity and lookup rows expire with the samples.** `metric_series` keeps a day until its last sample has expired (`day + 1 + retention`), capped as the sample tables are. `metric_labels`, `metric_label_index` and `metric_label_values` keep a row until the UTC day of its `last_seen` is past retention; the label sets are no longer kept permanently.
+- **Activity and lookup rows expire with the samples.** `metric_series` keeps a day until its last sample has expired (`day + 1 + C`, `C` the largest of `PULSUS_RETENTION_DAYS` and every rollup level's retention, [configuration.md §7](configuration.md)), capped as the sample tables are. `metric_labels`, `metric_label_index` and `metric_label_values` keep a row until the UTC day of its `last_seen` is past `C`; the label sets are no longer kept permanently.
 - **Exact to the hour, no `FINAL`.** The writer registers a series once per hour it has samples in (`pulsus_model::ACTIVITY_BUCKET_MS`, fixed), skipping known `(metric_name, fingerprint, hour)` triples through an in-process LRU. A read bounds `day` by the window's first and last UTC day and tests each row's `hours` against that day's hours of the window, so an unmerged row is tested on its own and a merge changes no answer. Measured: 300 random windows of up to six days over 1,000 series active in a random tenth of 168 hours answered exactly the hourly form's sets (`activity_is_exact_to_the_hour`). The discovery endpoints built on this table (`/api/v1/series`, `/labels`, `/label/{name}/values`, docs/api.md §3.3) therefore answer the series active in the window's hours: a bounded superset of the reference's exact-sample-window set, never a subset and never a false empty.
 
 #### The four statements
@@ -201,7 +201,7 @@ CREATE TABLE metric_metadata (
     updated_ns   Int64
 ) ENGINE = ReplacingMergeTree(updated_ns)
 ORDER BY (org_id, metric_name, metric_type, help, unit)
-TTL toDateTime(least(intDiv(updated_ns, 1000000000) + (retention_days * 86400), 4294967295));
+TTL toDateTime(least(intDiv(updated_ns, 1000000000) + ({{metrics_catalogue_retention_days}} * 86400), 4294967295));
 ```
 
 `metric_type` also drives the planner: counter functions on rollup tiers are only legal because the type is known. **One row is one distinct descriptor of a name** (issue #500): the key is the whole `(org_id, metric_name, metric_type, help, unit)`, so a name with two descriptors — two writers', say — keeps both, and `/api/v1/metadata` lists each. **`updated_ns` is the `ReplacingMergeTree` version column** (issue #26, mirroring `log_streams`' `ReplacingMergeTree(updated_ns)`): a resend of the same descriptor collapses on merge to its latest, and the `TTL` counts `retention_days` from it, so a descriptor still pushed never expires and one no longer pushed leaves. The writer emits a row (receiver-injected `now_ns`) unless it sent the same descriptor within the hour (a bounded cache of the descriptors it sent, promoted only when the block commits; issue #623) — idempotent on repeats, and the hourly resend keeps a live descriptor inside its retention. On a single-host demo every push re-sending every descriptor came to 345,362 rows an hour, 39% of all landed rows.
@@ -219,7 +219,7 @@ The rollup levels hold per-series summaries of each bucket of a fixed size, one 
 | table | `metric_samples_<N>s` for a level of `N` seconds: `MergeTree`, `ORDER BY (org_id, fingerprint, t_end)`, `PARTITION BY toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC')`, `index_granularity = 1024`, `COMMENT 'rollup_res_ms=<N>000 rollup_from_ms=<F> counter_buckets=<C>'`, `<F>` `0` for the first level and that level's range followed by `000` for the others, `<C>` the counter bucket count, which the server reads back to choose levels; clustered, a `metric_samples_<N>s_dist` wrapper on `cityHash64(fingerprint)` |
 | bucket | `(t_end − N s, t_end]`, so a bucket never crosses a UTC day |
 | projection | `by_parent`, `SELECT *` ordered by `(intDiv(t_end - 1, <next level's ms>), org_id, fingerprint, t_end)`, on every level whose next level is shorter than a day: the next level's run reads its window through it. A level whose next level is a day has none: that run reads its source's day partition |
-| expiry | the start of the UTC day of `t_end − 1 ms` + `PULSUS_RETENTION_DAYS`, dropped by whole part (`ttl_only_drop_parts = 1`). A level is kept no longer than raw and has no retention of its own |
+| expiry | the start of the UTC day of `t_end − 1 ms` + the level's `PULSUS_ROLLUP_RETENTION_DAYS` item, `PULSUS_RETENTION_DAYS` when that is unset, dropped by whole part (`ttl_only_drop_parts = 1`) ([configuration.md §7](configuration.md)) |
 | view | `metric_samples_<N>s_mv`, `REFRESH <timer> APPEND TO metric_samples_<N>s`; each run writes its data rows and its run rows in one statement, one part per partition, with `max_threads = 2` |
 
 **A data row** (`kind = 0`) summarizes one series in one bucket:

@@ -1,5 +1,5 @@
 //! Token substitution for `schema/schema.sql`: explicit `{{token}}` string
-//! replacement, twenty-three names and nothing else. The level tokens of the
+//! replacement, twenty-four names and nothing else. The level tokens of the
 //! file's level block are resolved earlier, by [`expand_levels`].
 //!
 //! **Double braces, always.** ClickHouse's own `{shard}` and `{replica}`
@@ -130,6 +130,36 @@ impl RenderCtx {
         self.cold_volume.is_some() && hot_days.is_some_and(|h| h < self.retention_days)
     }
 
+    /// Each level's move age when it moves (issue #743 part B): `Some(h)`
+    /// for a level whose move age is under its retention, with a cold volume
+    /// set; empty when no level moves.
+    pub fn level_moves(&self) -> Vec<Option<u32>> {
+        if self.cold_volume.is_none() || self.rollup_hot_days.is_empty() {
+            return Vec::new();
+        }
+        self.rollup_hot_days
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| {
+                let keep = self
+                    .rollup_retention_days
+                    .get(i)
+                    .copied()
+                    .unwrap_or(self.retention_days);
+                (h < keep).then_some(h)
+            })
+            .collect()
+    }
+
+    /// The metric catalogue's retention (issue #743 part B): the largest of
+    /// `retention_days` and every level's.
+    pub fn metrics_catalogue_retention_days(&self) -> u32 {
+        self.rollup_retention_days
+            .iter()
+            .copied()
+            .fold(self.retention_days, u32::max)
+    }
+
     /// A context for a test: `db` and `retention_days` as given, every other
     /// field at the value `schema/schema.sh` defaults it to. Retention has no
     /// default (issue #497), so every caller states it.
@@ -195,7 +225,7 @@ pub fn rollup_suffix(d: Duration) -> String {
 /// ClickHouse's own single-brace `{shard}`/`{replica}` macros — they are
 /// simply absent from double-brace matching.
 ///
-/// `schema.sh` carries the same list as twenty-two `sed` expressions and two
+/// `schema.sh` carries the same list as twenty-three `sed` expressions and two
 /// `awk` steps;
 /// `the_script_renders_exactly_what_this_crate_renders` holds the two
 /// together.
@@ -264,6 +294,10 @@ pub(crate) fn substitute_tokens(tmpl: &str, ctx: &RenderCtx) -> String {
         .replace("{{metrics_hot_days}}", &days(ctx.metrics_hot_days))
         .replace("{{logs_hot_days}}", &days(ctx.logs_hot_days))
         .replace("{{traces_hot_days}}", &days(ctx.traces_hot_days))
+        .replace(
+            "{{metrics_catalogue_retention_days}}",
+            &ctx.metrics_catalogue_retention_days().to_string(),
+        )
         .replace("{{trace_attr_indexes}}", &trace_attr_indexes(ctx))
 }
 
@@ -404,6 +438,11 @@ pub fn parse_rollup_counter_buckets(text: &str) -> Result<u32, String> {
 /// Every input `schema/schema.sh`'s tiering block reads (issue #743 part A).
 /// A text is `None` when its variable is unset or empty, as the script
 /// treats `${VAR:-}`.
+///
+/// `levels` and `ranges` are what the two parsers returned; a list text is
+/// `None` only when its variable is unset; set and empty is `Some("")`,
+/// which `level_items` refuses as an empty item. (The three family texts
+/// keep part A's rule, `None` when unset or empty.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TieringInput<'a> {
     pub storage_policy: Option<&'a str>,
@@ -479,14 +518,100 @@ pub fn validate_tiering(input: &TieringInput<'_>) -> Result<Tiering, String> {
             }
         }
     }
+    let keep = match input.rollup_retention_days {
+        None => Vec::new(),
+        Some(text) => level_retention(text, input)?,
+    };
+    let hot = match input.rollup_hot_days {
+        None => Vec::new(),
+        Some(_) if input.cold_volume.is_none() => {
+            return Err("PULSUS_ROLLUP_HOT_DAYS is set and PULSUS_COLD_VOLUME is not".to_string());
+        }
+        Some(text) => level_hot(text, input, &keep)?,
+    };
     Ok(Tiering {
         cold_volume: input.cold_volume.map(str::to_string),
         metrics_hot_days: days[0],
         logs_hot_days: days[1],
         traces_hot_days: days[2],
-        rollup_retention_days: Vec::new(),
-        rollup_hot_days: Vec::new(),
+        rollup_retention_days: keep,
+        rollup_hot_days: hot,
     })
+}
+
+/// A level list's items (issue #743 part B): refused when one is empty or
+/// their count is not the number of levels.
+fn level_items<'t>(name: &str, text: &'t str, levels: &[u32]) -> Result<Vec<&'t str>, String> {
+    let items: Vec<&str> = text.split(',').collect();
+    if items.iter().any(|item| item.is_empty()) {
+        return Err(format!("{name}: an empty item in '{text}'"));
+    }
+    if items.len() != levels.len() {
+        return Err(format!(
+            "{name}: {} items for {} levels",
+            items.len(),
+            levels.len()
+        ));
+    }
+    Ok(items)
+}
+
+/// `text` as a whole number of days from `lo` to `hi`, without a leading
+/// zero; `hi` is at most `u32::MAX`.
+fn days_in(text: &str, lo: u64, hi: u64) -> Option<u32> {
+    let whole =
+        text.len() <= 10 && !text.starts_with('0') && text.bytes().all(|b| b.is_ascii_digit());
+    match text.parse::<u64>() {
+        Ok(v) if whole && (lo..=hi).contains(&v) => u32::try_from(v).ok(),
+        _ => None,
+    }
+}
+
+/// `PULSUS_ROLLUP_RETENTION_DAYS` (issue #743 part B): rules 4 a–4 d.
+fn level_retention(text: &str, input: &TieringInput<'_>) -> Result<Vec<u32>, String> {
+    const NAME: &str = "PULSUS_ROLLUP_RETENTION_DAYS";
+    let items = level_items(NAME, text, input.levels)?;
+    let r = input.retention_days;
+    let mut keep = Vec::with_capacity(items.len());
+    for (item, level) in items.iter().zip(input.levels) {
+        match days_in(item, u64::from(r), 4_294_967_295) {
+            Some(v) => keep.push(v),
+            None => {
+                return Err(format!(
+                    "{NAME}: {item} for the {level}s level is not a whole number of days from {r} to 4294967295"
+                ));
+            }
+        }
+    }
+    for ((days, level), from) in keep.iter().zip(input.levels).zip(input.ranges) {
+        let need = from.div_ceil(86_400) + 1;
+        if *days < need {
+            return Err(format!(
+                "{NAME}: {days} for the {level}s level is too short: the next level's switch point, {from} s, requires {need} retention days"
+            ));
+        }
+    }
+    Ok(keep)
+}
+
+/// `PULSUS_ROLLUP_HOT_DAYS` (issue #743 part B): rules 5 b–5 d; 5 a is the
+/// caller's.
+fn level_hot(text: &str, input: &TieringInput<'_>, keep: &[u32]) -> Result<Vec<u32>, String> {
+    const NAME: &str = "PULSUS_ROLLUP_HOT_DAYS";
+    let items = level_items(NAME, text, input.levels)?;
+    let mut hot = Vec::with_capacity(items.len());
+    for (i, (item, level)) in items.iter().zip(input.levels).enumerate() {
+        let most = keep.get(i).copied().unwrap_or(input.retention_days);
+        match days_in(item, 1, u64::from(most)) {
+            Some(v) => hot.push(v),
+            None => {
+                return Err(format!(
+                    "{NAME}: {item} for the {level}s level is not a whole number of days from 1 to {most}"
+                ));
+            }
+        }
+    }
+    Ok(hot)
 }
 
 /// Which levels a line of the level block is kept for.
@@ -501,12 +626,15 @@ enum LevelLine {
     /// `--@level-feeds `: every level whose next level is shorter than a
     /// day; a day-long run reads its source's day partition.
     Feeds,
+    /// `--@level-cold `: every level that moves to the cold volume (issue #743 part B).
+    Cold,
 }
 
 /// `line`'s level marker and the line after the marker and its one space,
 /// or `None` for a line outside the level block.
 fn level_marked(line: &str) -> Option<(LevelLine, &str)> {
     [
+        ("--@level-cold ", LevelLine::Cold),
         ("--@level-first ", LevelLine::First),
         ("--@level-next ", LevelLine::Next),
         ("--@level-feeds ", LevelLine::Feeds),
@@ -530,14 +658,18 @@ fn timer_unit(v: u32) -> String {
 /// The level block of `sql` (issue #18), emitted once per level of
 /// `levels`, smallest first, in place; every other line passes through.
 ///
-/// Lines marked `--@level `, `--@level-first `, `--@level-next ` or
-/// `--@level-feeds ` are collected; at the first unmarked line after them,
+/// Lines marked `--@level `, `--@level-first `, `--@level-next `,
+/// `--@level-feeds ` or `--@level-cold ` are collected; at the first unmarked line after them,
 /// and at the end, they are emitted for each level that keeps them, with
 /// the marker and its one space removed and the level tokens replaced:
 /// `{{level}}` (`<R>s`), `{{level_ms}}` (`<R>000`), `{{source}}` (the level
 /// below's table), `{{parent_ms}}` (the next level's milliseconds),
 /// `{{period_ms}}` (the first level's period, `max(R_1, 60)`, in
-/// milliseconds) and `{{timer}}`. The first level's timer is `EVERY p`;
+/// milliseconds), `{{timer}}`, `{{level_retention_days}}` (the level's
+/// retention, or `{{retention_days}}` when the list is empty, which
+/// [`substitute_tokens`] then resolves) and `{{level_hot_days}}` (the
+/// level's move age; its `--@level-cold ` line is kept only for a level
+/// that moves). The first level's timer is `EVERY p`;
 /// level `i > 1` runs `EVERY R_i`, offset by `d_i mod R_i` seconds when
 /// that is not 0, where `d_1 = ⌈150 ÷ p⌉ × p` and `d_i = d_{i−1} + 60`.
 /// Every number is written as text, never computed in milliseconds, so the
@@ -561,13 +693,14 @@ pub(crate) fn expand_levels(sql: &str, set: LevelSet<'_>) -> String {
     out
 }
 
-/// The levels, their switch points and the counter bucket count, as
-/// [`expand_levels`] renders them.
-pub(crate) type LevelSet<'a> = (&'a [u32], &'a [u32], u32);
+/// The levels, their switch points, the counter bucket count, the
+/// retention list (empty or one per level) and [`RenderCtx::level_moves`],
+/// as [`expand_levels`] renders them.
+pub(crate) type LevelSet<'a> = (&'a [u32], &'a [u32], u32, &'a [u32], &'a [Option<u32>]);
 
 /// `block`, once per level, into `out`: [`expand_levels`]' rule.
 fn emit_levels(out: &mut String, block: &[(LevelLine, &str)], set: LevelSet<'_>) {
-    let (levels, ranges, counter_buckets) = set;
+    let (levels, ranges, counter_buckets, keep, moves) = set;
     let Some(&first) = levels.first() else {
         return;
     };
@@ -607,12 +740,22 @@ fn emit_levels(out: &mut String, block: &[(LevelLine, &str)], set: LevelSet<'_>)
             ),
         };
         let counter_buckets = counter_buckets.to_string();
+        // Issue #743 part B: the level's own retention, else the raw
+        // retention's token, which `substitute_tokens` resolves; and its
+        // move age when it moves.
+        let level_retention_days = keep
+            .get(i)
+            .map(u32::to_string)
+            .unwrap_or_else(|| "{{retention_days}}".to_string());
+        let level_hot = moves.get(i).copied().flatten();
+        let level_hot_days = level_hot.map(|h| h.to_string()).unwrap_or_default();
         for (kind, rest) in block {
             let kept = match kind {
                 LevelLine::All => true,
                 LevelLine::First => i == 0,
                 LevelLine::Next => i > 0,
                 LevelLine::Feeds => i < last && levels[i + 1] < 86_400,
+                LevelLine::Cold => level_hot.is_some(),
             };
             if !kept {
                 continue;
@@ -625,7 +768,9 @@ fn emit_levels(out: &mut String, block: &[(LevelLine, &str)], set: LevelSet<'_>)
                 .replace("{{period_ms}}", &period_ms)
                 .replace("{{from_ms}}", &from_ms)
                 .replace("{{counter_buckets}}", &counter_buckets)
-                .replace("{{timer}}", &timer);
+                .replace("{{timer}}", &timer)
+                .replace("{{level_retention_days}}", &level_retention_days)
+                .replace("{{level_hot_days}}", &level_hot_days);
             out.push_str(&line);
             out.push('\n');
         }
@@ -802,7 +947,10 @@ mod tests {
     /// Issue #18: no levels, no block.
     #[test]
     fn no_levels_emit_nothing_for_the_block() {
-        assert_eq!(expand_levels(LEVEL_BLOCK, (&[], &[], 5)), "head\ntail\n");
+        assert_eq!(
+            expand_levels(LEVEL_BLOCK, (&[], &[], 5, &[], &[])),
+            "head\ntail\n"
+        );
     }
 
     /// Issue #18: one level is first and last, so it has no `--@level-next`
@@ -810,7 +958,7 @@ mod tests {
     #[test]
     fn one_level_is_first_and_feeds_nothing() {
         assert_eq!(
-            expand_levels(LEVEL_BLOCK, (&[60], &[], 5)),
+            expand_levels(LEVEL_BLOCK, (&[60], &[], 5, &[], &[])),
             "head\n\
              A 60s 60000 EVERY 1 MINUTE\n\
              --@cluster C 60s\n  indented\n\
@@ -825,7 +973,7 @@ mod tests {
     #[test]
     fn a_level_below_a_minute_runs_every_minute_and_the_next_has_no_offset() {
         assert_eq!(
-            expand_levels(LEVEL_BLOCK, (&[5, 60], &[3600], 5)),
+            expand_levels(LEVEL_BLOCK, (&[5, 60], &[3600], 5, &[], &[])),
             "head\n\
              A 5s 5000 EVERY 1 MINUTE\n\
              --@cluster C 5s\n  indented\n\
@@ -842,7 +990,7 @@ mod tests {
     /// 780 s.
     #[test]
     fn the_timers_follow_the_level_sizes() {
-        let out = expand_levels(LEVEL_BLOCK, (&[720, 86400], &[86400], 5));
+        let out = expand_levels(LEVEL_BLOCK, (&[720, 86400], &[86400], 5, &[], &[]));
         assert!(out.contains("A 720s 720000 EVERY 12 MINUTE\n"), "{out}");
         assert!(
             out.contains("A 86400s 86400000 EVERY 1 DAY OFFSET 780 SECOND\n"),

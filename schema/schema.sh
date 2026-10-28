@@ -64,6 +64,10 @@ cold_volume=${PULSUS_COLD_VOLUME:-}
 metrics_hot=${PULSUS_METRICS_HOT_DAYS:-}
 logs_hot=${PULSUS_LOGS_HOT_DAYS:-}
 traces_hot=${PULSUS_TRACES_HOT_DAYS:-}
+rollup_retention=${PULSUS_ROLLUP_RETENTION_DAYS-}
+retention_given=${PULSUS_ROLLUP_RETENTION_DAYS+1}
+rollup_hot=${PULSUS_ROLLUP_HOT_DAYS-}
+hot_given=${PULSUS_ROLLUP_HOT_DAYS+1}
 
 # `pulsus_schema::DEDUP_WINDOW_SECONDS`. Not a knob: the startup check in
 # `pulsus-server` holds it against the landing budget.
@@ -282,6 +286,82 @@ if [ -n "$cold_volume" ]; then
     [ "$traces_hot" -ge "$retention_days" ] || cold_traces='s/^--@cold-traces *//'
 fi
 
+# Issue #743 part B: each rollup level's own retention and move age. The
+# same rules, in the same order and with the same messages, as
+# `pulsus_schema::validate_tiering`. `level_moves` holds one item per level,
+# its move age when it moves and empty when it does not; `catalogue_days` is
+# the metric catalogue's retention, the largest of the retention and every
+# level's.
+level_n=0
+[ -z "$rollup_levels" ] || level_n=$(printf '%s\n' "$rollup_levels" | awk -F, '{ print NF }')
+level_list() {
+    case "$2" in
+        '' | ,* | *, | *,,*) bad_tiering "$1: an empty item in '$2'" ;;
+    esac
+    list_n=$(printf '%s\n' "$2" | awk -F, '{ print NF }')
+    [ "$list_n" -eq "$level_n" ] || bad_tiering "$1: $list_n items for $level_n levels"
+}
+not_days() {
+    case "$1" in
+        0* | *[!0-9]* | ???????????*) return 0 ;;
+    esac
+    return 1
+}
+if [ -n "$retention_given" ]; then
+    level_list PULSUS_ROLLUP_RETENTION_DAYS "$rollup_retention"
+    rest_l=$rollup_levels,
+    rest_r=$rollup_retention,
+    while [ -n "$rest_l" ]; do
+        level=${rest_l%%,*}; rest_l=${rest_l#*,}
+        item=${rest_r%%,*}; rest_r=${rest_r#*,}
+        if not_days "$item" || [ "$item" -lt "$retention_days" ] || [ "$item" -gt 4294967295 ]; then
+            bad_tiering "PULSUS_ROLLUP_RETENTION_DAYS: $item for the ${level}s level is not a whole number of days from $retention_days to 4294967295"
+        fi
+    done
+    rest_l=$rollup_levels,
+    rest_r=$rollup_retention,
+    rest_g=""
+    [ -z "$rollup_ranges" ] || rest_g=$rollup_ranges,
+    while [ -n "$rest_g" ]; do
+        level=${rest_l%%,*}; rest_l=${rest_l#*,}
+        item=${rest_r%%,*}; rest_r=${rest_r#*,}
+        from=${rest_g%%,*}; rest_g=${rest_g#*,}
+        need=$(( (from + 86399) / 86400 + 1 ))
+        [ "$item" -ge "$need" ] ||
+            bad_tiering "PULSUS_ROLLUP_RETENTION_DAYS: $item for the ${level}s level is too short: the next level's switch point, $from s, requires $need retention days"
+    done
+fi
+level_moves=""
+if [ -n "$hot_given" ]; then
+    [ -n "$cold_volume" ] ||
+        bad_tiering "PULSUS_ROLLUP_HOT_DAYS is set and PULSUS_COLD_VOLUME is not"
+    level_list PULSUS_ROLLUP_HOT_DAYS "$rollup_hot"
+    rest_l=$rollup_levels,
+    rest_h=$rollup_hot,
+    rest_r=""
+    [ -z "$rollup_retention" ] || rest_r=$rollup_retention,
+    while [ -n "$rest_l" ]; do
+        level=${rest_l%%,*}; rest_l=${rest_l#*,}
+        item=${rest_h%%,*}; rest_h=${rest_h#*,}
+        keep=$retention_days
+        if [ -n "$rest_r" ]; then
+            keep=${rest_r%%,*}; rest_r=${rest_r#*,}
+        fi
+        if not_days "$item" || [ "$item" -gt "$keep" ]; then
+            bad_tiering "PULSUS_ROLLUP_HOT_DAYS: $item for the ${level}s level is not a whole number of days from 1 to $keep"
+        fi
+        [ "$item" -ge "$keep" ] || level_moves="$level_moves$item"
+        level_moves="$level_moves,"
+    done
+fi
+catalogue_days=$retention_days
+rest_r=""
+[ -z "$rollup_retention" ] || rest_r=$rollup_retention,
+while [ -n "$rest_r" ]; do
+    item=${rest_r%%,*}; rest_r=${rest_r#*,}
+    [ "$item" -le "$catalogue_days" ] || catalogue_days=$item
+done
+
 if [ "$mode" = cluster ] && [ -z "$cluster" ]; then
     echo "schema.sh: --mode cluster needs PULSUS_CLUSTER set to the cluster name" >&2
     exit 2
@@ -391,7 +471,8 @@ other=single
 # level, smallest first. `pulsus_schema::expand_levels` does the same.
 expand_levels() {
     ROLLUP_LEVELS=$rollup_levels ROLLUP_RANGES=$rollup_ranges \
-    COUNTER_BUCKETS=$counter_buckets awk '
+    COUNTER_BUCKETS=$counter_buckets LEVEL_RETENTION=$rollup_retention \
+    LEVEL_MOVES=$level_moves awk '
     function unit(v) {
         if (v % 86400 == 0) return (v / 86400) " DAY"
         if (v % 3600 == 0) return (v / 3600) " HOUR"
@@ -417,6 +498,7 @@ expand_levels() {
                 if (bk[j] == "first" && i != 1) continue
                 if (bk[j] == "next" && i == 1) continue
                 if (bk[j] == "feeds" && (i == n || lv[i + 1] >= 86400)) continue
+                if (bk[j] == "cold" && mv[i] == "") continue
                 line = rep(bl[j], "{{level}}", lv[i] "s")
                 line = rep(line, "{{level_ms}}", lv[i] "000")
                 line = rep(line, "{{source}}", i > 1 ? "metric_samples_" lv[i - 1] "s" : "")
@@ -425,6 +507,8 @@ expand_levels() {
                 line = rep(line, "{{from_ms}}", i == 1 ? "0" : rg[i - 1] "000")
                 line = rep(line, "{{counter_buckets}}", ENVIRON["COUNTER_BUCKETS"])
                 line = rep(line, "{{timer}}", timer)
+                line = rep(line, "{{level_retention_days}}", ENVIRON["LEVEL_RETENTION"] == "" ? "{{retention_days}}" : kr[i])
+                line = rep(line, "{{level_hot_days}}", mv[i])
                 print line
             }
         }
@@ -433,12 +517,15 @@ expand_levels() {
     BEGIN {
         n = ENVIRON["ROLLUP_LEVELS"] == "" ? 0 : split(ENVIRON["ROLLUP_LEVELS"], lv, ",")
         if (ENVIRON["ROLLUP_RANGES"] != "") split(ENVIRON["ROLLUP_RANGES"], rg, ",")
+        if (ENVIRON["LEVEL_RETENTION"] != "") split(ENVIRON["LEVEL_RETENTION"], kr, ",")
+        split(ENVIRON["LEVEL_MOVES"], mv, ",")
     }
     {
         kind = ""
         if (index($0, "--@level-first ") == 1) { kind = "first"; rest = substr($0, 16) }
         else if (index($0, "--@level-next ") == 1) { kind = "next"; rest = substr($0, 15) }
         else if (index($0, "--@level-feeds ") == 1) { kind = "feeds"; rest = substr($0, 16) }
+        else if (index($0, "--@level-cold ") == 1) { kind = "cold"; rest = substr($0, 15) }
         else if (index($0, "--@level ") == 1) { kind = "all"; rest = substr($0, 10) }
         if (kind != "") { nb++; bk[nb] = kind; bl[nb] = rest; next }
         flush()
@@ -471,7 +558,8 @@ render() {
             -e "s|{{cold_volume}}|$cold_volume|g" \
             -e "s|{{metrics_hot_days}}|$metrics_hot|g" \
             -e "s|{{logs_hot_days}}|$logs_hot|g" \
-            -e "s|{{traces_hot_days}}|$traces_hot|g" |
+            -e "s|{{traces_hot_days}}|$traces_hot|g" \
+            -e "s|{{metrics_catalogue_retention_days}}|$catalogue_days|g" |
         TRACE_ATTR_INDEXES=$attr_indexes awk '{
             i = index($0, "{{trace_attr_indexes}}")
             if (i) $0 = substr($0, 1, i - 1) ENVIRON["TRACE_ATTR_INDEXES"] substr($0, i + 22)

@@ -1027,6 +1027,19 @@ From the 12 m level and coarser, a `rate` or `increase` window holding only one 
 
 **Freshness.** The newest part of every window comes from the finer levels and then from raw samples, so a refreshing panel shows the newest samples. A level's coverage is the time its builds have completed on every shard; anything else, holes included, is read from a finer level or raw.
 
+**Data older than the raw retention.** Raw samples are kept `PULSUS_RETENTION_DAYS` (`R`) days; a level can be kept longer (`PULSUS_ROLLUP_RETENTION_DAYS`, [docs/configuration.md §7](configuration.md#7-retention-schemaschemash)). For a range query whose window reaches before `now − R`:
+
+| case | answer before `now − R` |
+|---|---|
+| a selector read at a level that keeps that day | the level's rows, within the distances above |
+| a selector read at a level that does not keep that day | the rows of a finer level that keeps it; else nothing |
+| a selector read raw: a function not listed above, a selector whose conditions hold only at levels that did not keep that day, native-histogram samples | nothing |
+| `/api/v1/series`, `/api/v1/labels`, `/api/v1/label/<name>/values` | the series of the days kept: the series catalogue keeps the largest of `R` and every level's retention |
+| `/api/v1/metadata` | metrics written within that same largest retention |
+| `storageRetention` in `/api/v1/status/runtimeinfo` | `R` |
+
+Each level but the last answers ranges shorter than the next level's switch point, and `schema/schema.sh` refuses a retention shorter than ⌈that switch point ÷ 86400⌉ + 1 days, so a range that ends now and selects a level finds every day it touches. The last level answers every range from its switch point up; kept `L` days, it holds the UTC days that began after `now − L` days, so a longer range returns those days only, reaching back between `L − 1` and `L` days (one day more until a TTL merge removes an expired day). A range that ends in the past reaches further back than its length and reads what the selected level kept.
+
 **Explain.** With `X-Pulsus-Explain: 1`, a range query answered on the changed grid has a first stage `rollup_grid`, with no statement, noted `resolution 2h, step 2h (asked 5m), 85 points, <first t> to <last t>; range 5m widened to 2h` for that panel; a query answered on its own grid has none; a routed selector whose series the label cache could not answer has a stage `rollup_series` with the statement that reads its series and labels. A routed selector has a stage `rollup_route` naming the level's table, the function's use, the step and the range, and one stage `rollup_piece` per interval served, in time order, each with its statement and a note naming the table and column, or `raw`, and the interval (`metric_samples_720s.max served (lo, hi]`, `raw (lo, hi]`). `exactness` is `"rollup"` when a level served part of a selector; a route that read only raw samples, or only native histograms, is `"raw-exact"`.
 
 ---

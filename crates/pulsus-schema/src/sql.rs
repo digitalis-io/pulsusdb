@@ -39,12 +39,15 @@ pub fn rendered(ctx: &RenderCtx) -> String {
         Some(_) => (CLUSTER, SINGLE),
         None => (SINGLE, CLUSTER),
     };
+    let moves = ctx.level_moves();
     let expanded = render::expand_levels(
         SCHEMA_SQL,
         (
             &ctx.rollup_levels,
             &ctx.rollup_ranges,
             ctx.rollup_counter_buckets,
+            &ctx.rollup_retention_days,
+            &moves,
         ),
     );
     let mut out = String::with_capacity(expanded.len());
@@ -90,6 +93,8 @@ pub fn expand_levels_for_tests(levels: &[u32]) -> String {
             levels,
             render::DEFAULT_ROLLUP_RANGES,
             render::DEFAULT_ROLLUP_COUNTER_BUCKETS,
+            &[],
+            &[],
         ),
     )
 }

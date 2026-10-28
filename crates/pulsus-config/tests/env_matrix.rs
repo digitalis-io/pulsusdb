@@ -556,7 +556,7 @@ fn rows_of(tables: &str) -> Vec<DocRow> {
 /// alone reads, and the binary reads none of them. Issue #18 part A added
 /// `PULSUS_ROLLUP_LEVELS`, and its follow-up `PULSUS_ROLLUP_RANGES` and
 /// `PULSUS_ROLLUP_COUNTER_BUCKETS`. Issue #743 part A added the four tiering
-/// variables.
+/// variables. Issue #743 part B added the two level lists.
 #[test]
 fn section_7_names_the_script_s_retention_variables_and_the_binary_reads_none() {
     let mut got: Vec<String> = rows_of(&sections().1)
@@ -575,8 +575,10 @@ fn section_7_names_the_script_s_retention_variables_and_the_binary_reads_none() 
             "PULSUS_METRICS_LANDING_RETENTION_HOURS",
             "PULSUS_RETENTION_DAYS",
             "PULSUS_ROLLUP_COUNTER_BUCKETS",
+            "PULSUS_ROLLUP_HOT_DAYS",
             "PULSUS_ROLLUP_LEVELS",
             "PULSUS_ROLLUP_RANGES",
+            "PULSUS_ROLLUP_RETENTION_DAYS",
             "PULSUS_TRACES_HOT_DAYS",
             "PULSUS_TRACE_LANDING_RETENTION_HOURS",
         ],
