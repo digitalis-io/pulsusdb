@@ -8,7 +8,10 @@ use crate::error::ConfigError;
 use crate::model::{ChAuth, ChServerEntry, Config};
 use crate::secret::Secret;
 use crate::timezone::TemplateTimezone;
-use crate::units::{ByteSize, HumanDuration, parse_bytes, parse_duration};
+use crate::units::{
+    ByteSize, HumanDuration, parse_bytes, parse_dedup_window, parse_duration,
+    parse_log_rollup_resolution,
+};
 
 /// Every environment variable documented in docs/configuration.md §§1–8.
 /// `apply_env` covers this set 1:1 — `tests/env_matrix.rs`
@@ -276,16 +279,39 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
         cfg.storage_policy = Some(v);
     }
     if let Some(v) = read("PULSUS_LOG_ROLLUP_RESOLUTION") {
-        cfg.log_rollup_resolution = parse_dur("PULSUS_LOG_ROLLUP_RESOLUTION", &v)?;
+        cfg.log_rollup_resolution = parse_log_rollup_resolution(&v)
+            .map(HumanDuration)
+            .ok_or_else(|| {
+                env_err(
+                    "PULSUS_LOG_ROLLUP_RESOLUTION",
+                    "must be a whole number with no leading zero, then ms (at most 12 digits), \
+                     s (9), m (8), h (6), d (5) or w (4)",
+                )
+            })?;
     }
     if let Some(v) = read("PULSUS_METRICS_DEDUP_WINDOW") {
-        cfg.metrics_dedup_window = parse_int("PULSUS_METRICS_DEDUP_WINDOW", &v)?;
+        cfg.metrics_dedup_window = parse_dedup_window(&v).ok_or_else(|| {
+            env_err(
+                "PULSUS_METRICS_DEDUP_WINDOW",
+                "must be a whole number of blocks from 1 to 1000000, no sign or leading zero",
+            )
+        })?;
     }
     if let Some(v) = read("PULSUS_LOG_DEDUP_WINDOW") {
-        cfg.log_dedup_window = parse_int("PULSUS_LOG_DEDUP_WINDOW", &v)?;
+        cfg.log_dedup_window = parse_dedup_window(&v).ok_or_else(|| {
+            env_err(
+                "PULSUS_LOG_DEDUP_WINDOW",
+                "must be a whole number of blocks from 1 to 1000000, no sign or leading zero",
+            )
+        })?;
     }
     if let Some(v) = read("PULSUS_TRACE_DEDUP_WINDOW") {
-        cfg.trace_dedup_window = parse_int("PULSUS_TRACE_DEDUP_WINDOW", &v)?;
+        cfg.trace_dedup_window = parse_dedup_window(&v).ok_or_else(|| {
+            env_err(
+                "PULSUS_TRACE_DEDUP_WINDOW",
+                "must be a whole number of blocks from 1 to 1000000, no sign or leading zero",
+            )
+        })?;
     }
     if let Some(v) = read("PULSUS_CLUSTER") {
         cfg.cluster = Some(v);

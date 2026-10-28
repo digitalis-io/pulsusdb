@@ -97,16 +97,58 @@ pub fn parse_duration(s: &str) -> Result<Duration, UnitError> {
 /// A dedup window as `schema/schema.sh` and the binary's environment reader
 /// both read it (docs/configuration.md §3): 1 to 7 ASCII digits, the first
 /// not `0`, at most 1000000.
-pub fn parse_dedup_window(_s: &str) -> Option<u64> {
-    None
+pub fn parse_dedup_window(s: &str) -> Option<u64> {
+    let whole =
+        (1..=7).contains(&s.len()) && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit());
+    if !whole {
+        return None;
+    }
+    let v: u64 = s.parse().ok()?;
+    (v <= 1_000_000).then_some(v)
 }
 
 /// `PULSUS_LOG_ROLLUP_RESOLUTION` as `schema/schema.sh` and the binary both
 /// read it (docs/configuration.md §3): ASCII digits, the first not `0`, then
 /// exactly `ms`, `s`, `m`, `h`, `d` or `w`, of at most 12, 9, 8, 6, 5 or 4
-/// digits respectively.
-pub fn parse_log_rollup_resolution(_s: &str) -> Option<Duration> {
-    None
+/// digits respectively, so the script's nanoseconds stay inside 64-bit shell
+/// arithmetic. Nothing around it.
+pub fn parse_log_rollup_resolution(s: &str) -> Option<Duration> {
+    let digit_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (digits, unit) = s.split_at(digit_end);
+    let (cap, secs_per_unit) = match unit {
+        "ms" => (12, 0),
+        "s" => (9, 1),
+        "m" => (8, 60),
+        "h" => (6, 3_600),
+        "d" => (5, 86_400),
+        "w" => (4, 7 * 86_400),
+        _ => return None,
+    };
+    if digits.is_empty() || digits.len() > cap || digits.starts_with('0') {
+        return None;
+    }
+    let n: u64 = digits.parse().ok()?;
+    Some(if unit == "ms" {
+        Duration::from_millis(n)
+    } else {
+        Duration::from_secs(n * secs_per_unit)
+    })
+}
+
+/// `log_rollup_resolution` from YAML: a string through
+/// [`parse_log_rollup_resolution`].
+pub(crate) fn de_log_rollup_resolution<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<HumanDuration, D::Error> {
+    let s = String::deserialize(d)?;
+    parse_log_rollup_resolution(&s)
+        .map(HumanDuration)
+        .ok_or_else(|| {
+            de::Error::custom(
+                "log_rollup_resolution must be a whole number with no leading zero, then ms (at \
+                 most 12 digits), s (9), m (8), h (6), d (5) or w (4)",
+            )
+        })
 }
 
 /// A byte quantity. Parsed from strings like `16MiB` or a bare integer of

@@ -53,6 +53,7 @@ pub struct Config {
     pub storage_policy: Option<String>,
     /// `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` (issue #595 part 2).
     pub traceql_indexed_attributes: Vec<String>,
+    #[serde(deserialize_with = "crate::units::de_log_rollup_resolution")]
     pub log_rollup_resolution: HumanDuration,
     /// `PULSUS_METRICS_DEDUP_WINDOW` (issue #603): how many recent blocks
     /// the landing table and each of the four derived metric tables
