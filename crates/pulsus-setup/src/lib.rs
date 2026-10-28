@@ -77,8 +77,15 @@ pub fn bundle(v: &Validated) -> Vec<File> {
 }
 
 /// Writes `files` under `dir`, creating the directories they need. The
-/// schema script is made executable.
+/// schema script is made executable. A `dir` that already holds anything
+/// is refused: an earlier bundle's files would stay beside the new ones.
 pub fn write_bundle(dir: &Path, files: &[File]) -> std::io::Result<()> {
+    if std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some()) {
+        return Err(std::io::Error::other(format!(
+            "{} is not empty: write the bundle to a new directory",
+            dir.display()
+        )));
+    }
     for f in files {
         let path = dir.join(&f.path);
         if let Some(parent) = path.parent() {

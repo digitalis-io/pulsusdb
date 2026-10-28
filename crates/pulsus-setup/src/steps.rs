@@ -11,11 +11,19 @@ pub(crate) const CEILING: &str = "no row is due after 2106-02-07 06:28:15 UTC";
 
 /// Raw data's line, each level's, then the ceiling.
 pub(crate) fn total_lines(v: &Validated) -> Vec<String> {
-    let mut lines = vec![format!(
-        "Raw data: kept at least {} days; at least {} on local disk",
-        v.raw_local_days + v.raw_remote_days,
-        v.raw_local_days
-    )];
+    let raw_total = v.raw_local_days + v.raw_remote_days;
+    // On the tiered policy with no move rule, a part can still go to the
+    // cold volume when the local one is full.
+    let mut lines = vec![if v.remote_url.is_some() && v.raw_remote_days == 0 {
+        format!(
+            "Raw data: kept at least {raw_total} days; no move rule; on local disk while the local disk has room"
+        )
+    } else {
+        format!(
+            "Raw data: kept at least {raw_total} days; at least {} on local disk",
+            v.raw_local_days
+        )
+    }];
     for (i, level) in v.levels.iter().enumerate() {
         let head = format!(
             "Level {} ({} s): kept at least {} days;",
@@ -208,7 +216,7 @@ pub(crate) fn setup_md(v: &Validated, statements: usize) -> String {
         .unwrap_or_default();
     let _ = write!(
         out,
-        "\n### 4\n\nIn the bundle's directory, on a machine with `sh`, `awk`, `cat`, `curl`, `cut`, `dirname`, `grep`, `mktemp`, `rm`, `sed`, `seq` and `sleep`{}:\n\n```sh\nset -a; . ./schema.env; set +a\nCLICKHOUSE_SERVER={} CLICKHOUSE_HTTP_PORT={p} CLICKHOUSE_AUTH=\"pulsus:$PULSUS_CLICKHOUSE_PASSWORD\"{tls_env} sh schema/schema.sh\n```\n\nExpected:\n\n```text\nschema.sh: all {h} hosts in cluster '{c}' answered\nschema.sh: {statements} statements applied to {d}\n```\n",
+        "\n### 4\n\nSet `PULSUS_CLICKHOUSE_PASSWORD` in the shell from your secret store, as on the servers in step 2: the command stops without it. In the bundle's directory, on a machine with `sh`, `awk`, `cat`, `curl`, `cut`, `dirname`, `grep`, `mktemp`, `rm`, `sed`, `seq` and `sleep`{}:\n\n```sh\n: \"${{PULSUS_CLICKHOUSE_PASSWORD:?set it in this shell from your secret store: it is the pulsus user password of step 2}}\"\nset -a; . ./schema.env; set +a\nCLICKHOUSE_SERVER={} CLICKHOUSE_HTTP_PORT={p} CLICKHOUSE_AUTH=\"pulsus:$PULSUS_CLICKHOUSE_PASSWORD\"{tls_env} sh schema/schema.sh\n```\n\nExpected:\n\n```text\nschema.sh: all {h} hosts in cluster '{c}' answered\nschema.sh: {statements} statements applied to {d}\n```\n",
         v.tls
             .as_ref()
             .map(|t| format!(", and the CA at `{}`", t.ca))
@@ -246,7 +254,7 @@ pub(crate) fn setup_md(v: &Validated, statements: usize) -> String {
 
     let _ = write!(
         out,
-        "\n### V5\n\nWith `PULSUS_URL` set to PulsusDB's address (for example `http://pulsusdb:3100`) and the admin pair in the environment, run this with `sh`. It waits for PulsusDB to find the {n} levels: discovery runs at start and then every 60 s.\n\n```sh\n# V5 begin\ntries=${{V5_TRIES:-24}}; pause=${{V5_PAUSE:-5}}; i=0\nwhile [ \"$i\" -lt \"$tries\" ]; do\n  got=$(curl -s --fail-with-body -u \"$PULSUS_ADMIN_USER:$PULSUS_ADMIN_PASSWORD\" \"$PULSUS_URL/admin/api/v1/database\" | grep -o '\"table\":' | wc -l)\n  if [ \"$got\" -eq {n} ]; then echo \"V5: {n} levels\"; exit 0; fi\n  i=$((i + 1)); sleep \"$pause\"\ndone\necho \"V5: $got levels, not {n}\" >&2; exit 1\n# V5 end\n```\n\nExpected: exit 0, printing `V5: {n} levels`.\n"
+        "\n### V5\n\nWith `PULSUS_URL` set to PulsusDB's address (for example `http://pulsusdb:3100`) and the admin pair in the environment, run this with `sh`. It waits for PulsusDB to answer with its list of {n} levels: discovery runs at start and then every 60 s, and the list is `null` until the first one.\n\n```sh\n# V5 begin\ntries=${{V5_TRIES:-24}}; pause=${{V5_PAUSE:-5}}; i=0\nwhile [ \"$i\" -lt \"$tries\" ]; do\n  if body=$(curl -s --fail-with-body -u \"$PULSUS_ADMIN_USER:$PULSUS_ADMIN_PASSWORD\" \"$PULSUS_URL/admin/api/v1/database\"); then\n    case \"$body\" in\n      *'\"levels\":['*) got=$(printf '%s' \"$body\" | grep -o '\"table\":' | wc -l | tr -d ' ') ;;\n      *) got=null ;;\n    esac\n  else\n    got=\"an error\"\n  fi\n  if [ \"$got\" = {n} ]; then echo \"V5: {n} levels\"; exit 0; fi\n  i=$((i + 1)); sleep \"$pause\"\ndone\necho \"V5: got $got, want {n} levels\" >&2; exit 1\n# V5 end\n```\n\nExpected: exit 0, printing `V5: {n} levels`.\n"
     );
     out
 }
