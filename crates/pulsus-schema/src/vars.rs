@@ -41,12 +41,13 @@ pub const SCHEMA_VARS: &[&str] = &[
 ];
 
 /// The variables `schema/schema.sh` reads only to reach the server.
-/// Part D adds CLICKHOUSE_PROTO and CLICKHOUSE_TLS_CA_FILE when the script starts reading them.
 pub const SCRIPT_CONNECTION_VARS: &[&str] = &[
     "CLICKHOUSE_SERVER",
     "CLICKHOUSE_HTTP_PORT",
     "CLICKHOUSE_AUTH",
     "PULSUS_SCHEMA_WAIT_SECONDS",
+    "CLICKHOUSE_PROTO",
+    "CLICKHOUSE_TLS_CA_FILE",
 ];
 
 /// The most rollup levels a schema carries.
@@ -206,6 +207,7 @@ pub const REFUSALS: &[(&str, &str)] = &[
         "the lines above carry a token this script does not render",
         "2",
     ),
+    ("CLICKHOUSE_PROTO must be http or https: <proto>", "2"),
     ("the server refused a request; it said:", "curl"),
     ("the server refused this statement:", "1"),
     ("the server said:", "1"),

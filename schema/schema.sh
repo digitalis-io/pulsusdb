@@ -599,6 +599,15 @@ if printf '%s\n' "$rendered" | grep -n '{{'; then
     exit 2
 fi
 
+# `CLICKHOUSE_PROTO` and `CLICKHOUSE_TLS_CA_FILE` are the binary's own
+# variables (docs/configuration.md §2): with https, every request verifies
+# the server's certificate, against the CA file when one is named.
+proto=${CLICKHOUSE_PROTO:-http}
+case "$proto" in
+    http | https) ;;
+    *) echo "schema.sh: CLICKHOUSE_PROTO must be http or https: $proto" >&2; exit 2 ;;
+esac
+
 if [ "$print_only" = 1 ]; then
     printf '%s\n' "$rendered"
     exit 0
@@ -606,15 +615,18 @@ fi
 
 server=${CLICKHOUSE_SERVER:-localhost}
 port=${CLICKHOUSE_HTTP_PORT:-8123}
-url="http://$server:$port/"
+url="$proto://$server:$port/"
+cacert=""
+[ -z "${CLICKHOUSE_TLS_CA_FILE:-}" ] || cacert="--cacert ${CLICKHOUSE_TLS_CA_FILE}"
 
 # `CLICKHOUSE_AUTH` is `user:password`, split on the FIRST colon — the same
 # variable and the same rule the binary reads (docs/configuration.md §2), so
 # a deployment configures the credential once.
 auth=""
 [ -z "${CLICKHOUSE_AUTH:-}" ] || auth="--user ${CLICKHOUSE_AUTH}"
-# `$auth` is split into `--user` and the credential with pathname expansion
-# off (`set -f` in each request's subshell), so a `*` in a password stays one.
+# `$auth` and `$cacert` are split into the option and its value with
+# pathname expansion off (`set -f` in each request's subshell), so a `*` in a
+# password stays one.
 
 # `curl` exits 0 when ClickHouse answers with an error in the body, so every
 # request below carries --fail-with-body.
@@ -623,7 +635,7 @@ auth=""
 # own exit code, so a caller under `set -e` still stops with it.
 # shellcheck disable=SC2086
 ask() {
-    if ask_body=$(set -f; curl -sS --fail-with-body $auth "$url" --data-binary "$1"); then
+    if ask_body=$(set -f; curl -sS --fail-with-body $auth $cacert "$url" --data-binary "$1"); then
         printf '%s\n' "$ask_body"
     else
         ask_rc=$?
@@ -639,7 +651,7 @@ ask() {
 # `curl: (22) The requested URL returned error: 500`.
 # shellcheck disable=SC2086
 send_file() {
-    if ! body=$(set -f; curl -sS --fail-with-body $auth "$url" --data-binary "@$1" 2>&1); then
+    if ! body=$(set -f; curl -sS --fail-with-body $auth $cacert "$url" --data-binary "@$1" 2>&1); then
         echo "schema.sh: the server refused this statement:" >&2
         cat "$1" >&2
         echo "schema.sh: the server said:" >&2
@@ -662,7 +674,8 @@ send_file() {
 wait_seconds=${PULSUS_SCHEMA_WAIT_SECONDS:-300}
 ready=0
 for _ in $(seq 1 "$wait_seconds"); do
-    if curl -sS -o /dev/null "$url" --data-binary 'SELECT 1' 2>/dev/null; then
+    # shellcheck disable=SC2086
+    if (set -f; curl -sS -o /dev/null $cacert "$url" --data-binary 'SELECT 1') 2>/dev/null; then
         ready=1
         break
     fi

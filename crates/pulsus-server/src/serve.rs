@@ -78,6 +78,15 @@ pub async fn run(config: Config) -> ExitCode {
     // every node sharing this configuration renders identically.
     install_template_timezone(&config);
 
+    // Issue #746 part D: the ClickHouse CA file is read before anything
+    // starts, so one that cannot be read stops startup rather than failing
+    // every connection attempt after it.
+    if let Some(path) = &config.clickhouse.tls_ca_file
+        && let Err(err) = pulsus_clickhouse::ca_root_store(path)
+    {
+        eprintln!("pulsusdb: {err}");
+        return ExitCode::FAILURE;
+    }
     let metrics = install_metrics_recorder();
     let config = Arc::new(config);
     let pool_slot: Arc<RwLock<Option<Arc<ChPool>>>> = Arc::new(RwLock::new(None));

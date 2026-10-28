@@ -61,7 +61,8 @@ fn write_temp(name: &str, contents: &str) -> PathBuf {
 }
 
 /// An HTTPS stand-in: connection 0 presents `first`, every later one
-/// `later`; every request is answered `200` with the body `26.8.21.10`.
+/// `later`; every request is answered `200`, the script's with the body
+/// `26.8.21.10`.
 /// `bodies` holds each request body received, by connection.
 struct Stub {
     port: u16,
@@ -70,7 +71,7 @@ struct Stub {
 
 async fn stub(first: Arc<rustls::ServerConfig>, later: Arc<rustls::ServerConfig>) -> Stub {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let assigned = listener.local_addr().unwrap().port();
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let seen = bodies.clone();
     let count = Arc::new(AtomicUsize::new(0));
@@ -124,16 +125,23 @@ async fn stub(first: Arc<rustls::ServerConfig>, later: Arc<rustls::ServerConfig>
                         break;
                     }
                 }
-                let _ = tls
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n26.8.21.10",
-                    )
-                    .await;
+                // The script posts to `/` and reads the version from the
+                // body; the pool's client sends query parameters and reads
+                // a compressed body, which an empty one satisfies.
+                let answer: &[u8] = if String::from_utf8_lossy(&buf).starts_with("POST / ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n26.8.21.10"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                let _ = tls.write_all(answer).await;
                 let _ = tls.shutdown().await;
             });
         }
     });
-    Stub { port, bodies }
+    Stub {
+        port: assigned,
+        bodies,
+    }
 }
 
 fn conn_config(port: u16, ca: Option<&Path>) -> ChConnConfig {
@@ -202,7 +210,7 @@ fn script() -> PathBuf {
 /// Runs `schema.sh --mode single` against the stub on `port`, trusting
 /// `ca`.
 async fn run_script(port: u16, ca: &Path) -> (Option<i32>, String, String) {
-    let port = port.to_string();
+    let listening = port.to_string();
     let ca = ca.to_str().unwrap().to_string();
     tokio::task::spawn_blocking(move || {
         let out = std::process::Command::new("sh")
@@ -212,7 +220,7 @@ async fn run_script(port: u16, ca: &Path) -> (Option<i32>, String, String) {
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("PULSUS_RETENTION_DAYS", "7")
             .env("CLICKHOUSE_SERVER", "127.0.0.1")
-            .env("CLICKHOUSE_HTTP_PORT", port)
+            .env("CLICKHOUSE_HTTP_PORT", listening)
             .env("CLICKHOUSE_PROTO", "https")
             .env("CLICKHOUSE_TLS_CA_FILE", ca)
             .env("PULSUS_SCHEMA_WAIT_SECONDS", "2")
@@ -269,4 +277,21 @@ async fn d5_no_statement_reaches_a_server_signed_by_another_ca() {
     }
 
     let _ = std::fs::remove_file(ca);
+}
+
+/// **D-2: the binary stops at startup on a CA file it cannot read, naming
+/// the variable, before it binds a port or reaches ClickHouse.**
+#[test]
+fn d2_startup_stops_on_an_unreadable_ca_file() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("CLICKHOUSE_PROTO", "https")
+        .env("CLICKHOUSE_TLS_CA_FILE", "/nonexistent/pulsus-d2/ca.crt")
+        .output()
+        .expect("run pulsusdb");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("CLICKHOUSE_TLS_CA_FILE"), "{stderr}");
+    assert!(stderr.contains("/nonexistent/pulsus-d2/ca.crt"), "{stderr}");
 }

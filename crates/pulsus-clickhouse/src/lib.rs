@@ -30,6 +30,7 @@ pub use settings::{
     ANSWER_FAMILIES, ANSWER_PIN_NAMES, AnswerFamily, MAX_JSON_PATHS_PER_VALUE,
     MAX_PARTITIONS_PER_INSERT_BLOCK, QuerySettings,
 };
+pub use tls::ca_root_store;
 
 #[cfg(test)]
 mod tests {

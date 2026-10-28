@@ -683,13 +683,17 @@ pub fn spawn_reprobe_loop(pool: Arc<ChPool>) -> tokio::task::JoinHandle<()> {
 }
 
 /// Builds one `clickhouse::Client` for `url`. Routes through the skip-verify
-/// TLS builder ([`tls::skip_verify_ch_client`]) only for `https` +
-/// `tls_skip_verify` (docs/configuration.md §2); every other combination
-/// (plain `http`, or verified `https` against public CAs) uses the crate's
-/// own default `rustls-tls-webpki-roots` connector.
+/// TLS builder ([`tls::skip_verify_ch_client`]) for `https` +
+/// `tls_skip_verify`, and the CA-file builder ([`tls::ca_file_ch_client`])
+/// for `https` + `tls_ca_file` (docs/configuration.md §2); every other
+/// combination (plain `http`, or verified `https` against public CAs) uses
+/// the crate's own default `rustls-tls-webpki-roots` connector.
 fn build_client(cfg: &ChConnConfig, url: &str) -> Result<clickhouse::Client, ChError> {
-    let mut client = if cfg.proto == ChProto::Https && cfg.tls_skip_verify {
+    let https = cfg.proto == ChProto::Https;
+    let mut client = if https && cfg.tls_skip_verify {
         tls::skip_verify_ch_client()?
+    } else if let Some(ca) = cfg.tls_ca_file.as_deref().filter(|_| https) {
+        tls::ca_file_ch_client(ca)?
     } else {
         clickhouse::Client::default()
     };

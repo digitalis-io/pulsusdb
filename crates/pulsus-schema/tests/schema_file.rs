@@ -4922,7 +4922,7 @@ fn the_variable_lists_are_every_variable_the_script_reads() {
             scanned.insert(name);
         }
     }
-    assert_eq!(scanned.len(), 26, "the scan found {scanned:?}");
+    assert_eq!(scanned.len(), 28, "the scan found {scanned:?}");
     let union: std::collections::BTreeSet<String> = union.into_iter().map(String::from).collect();
     assert_eq!(union, scanned, "the lists against the script");
 }

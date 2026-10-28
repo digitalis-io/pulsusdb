@@ -27,9 +27,10 @@ PulsusDB is configured by environment variables, optionally layered over a YAML 
 | `CLICKHOUSE_HTTP_PORT` | `8123` | HTTP-interface port — the port the chosen transport uses ([ADR 0001](decisions/0001-clickhouse-client.md)); also the per-endpoint port fallback for `CLICKHOUSE_SERVERS` entries that omit one |
 | `CLICKHOUSE_PORT` | `9000` | native-protocol port; reserved for the documented fallback client, unused by the current transport |
 | `CLICKHOUSE_DB` | `pulsus` | database; created by `schema/schema.sh`, never by the binary — startup refuses when it does not exist |
-| `CLICKHOUSE_PROTO` | `http` | `http` \| `https` (TLS to ClickHouse). `native` is reserved for the fallback client and rejected at startup with an error citing ADR 0001 |
+| `CLICKHOUSE_PROTO` | `http` | `http` \| `https` (TLS to ClickHouse). `native` is reserved for the fallback client and rejected at startup with an error citing ADR 0001. `schema/schema.sh` reads it and `CLICKHOUSE_TLS_CA_FILE` too, and takes `http` or `https` |
 | `CLICKHOUSE_AUTH` | `default:` | `user:password` |
 | `CLICKHOUSE_TLS_SKIP_VERIFY` | `false` | accept self-signed certificates |
+| `CLICKHOUSE_TLS_CA_FILE` | unset | a PEM file of the CA certificates an `https` server's certificate must chain to, in place of the public roots; a file that cannot be read stops startup. `CLICKHOUSE_TLS_SKIP_VERIFY` overrides it |
 | `PULSUS_CH_POOL_SIZE` | `8` | connections per process. Accepted range `1..=8000`: values above the ceiling are rejected at config load — an unbounded pool disables the connection cap and can exceed the 32-bit tokio semaphore permit bound at startup. Scale tuning routes to #25 |
 | `CLICKHOUSE_INSERT_QUORUM` | `0` | replicas that must confirm a block before an insert is acknowledged (`0` = off, `1` = rejected at startup — a silent no-op in ClickHouse — `>= 2` = active quorum). Integer-only — `auto`/majority is unsupported. Only meaningful on `Replicated*` engines; see [Consistency](#consistency) |
 | `CLICKHOUSE_INSERT_QUORUM_PARALLEL` | `true` | allow parallel quorum inserts; only applied when `CLICKHOUSE_INSERT_QUORUM > 0` |
@@ -317,16 +318,17 @@ Each is printed as `schema.sh: <message>` on standard error, and the script exit
 | 40 | `PULSUS_TRACEQL_INDEXED_ATTRIBUTES: <item> is listed twice` | 2 |
 | 41 | `PULSUS_TRACEQL_INDEXED_ATTRIBUTES: names more than 16 attributes` | 2 |
 | 42 | `the lines above carry a token this script does not render` | 2 |
-| 43 | `the server refused a request; it said:` | curl |
-| 44 | `the server refused this statement:` | 1 |
-| 45 | `the server said:` | 1 |
-| 46 | `clickhouse at <server>:<port> did not answer within <wait_seconds>s` | 1 |
-| 47 | `could not read a version from '<version>'` | 1 |
-| 48 | `clickhouse <version> is below the minimum supported version 26.8` | 1 |
-| 49 | `cluster '<cluster>' is not defined on <server>:<port>` | 1 |
-| 50 | `only <live> of <want_hosts> hosts in cluster '<cluster>' answered within <wait_seconds>s; ON CLUSTER DDL would fail on the rest` | 1 |
-| 51 | `<policy_what> is defined on <policy_have> of <policy_want> hosts; every server's configuration must carry it (docs/configuration.md §3)` | 1 |
-| 52 | `the file ends in an unterminated statement` | 1 |
+| 43 | `CLICKHOUSE_PROTO must be http or https: <proto>` | 2 |
+| 44 | `the server refused a request; it said:` | curl |
+| 45 | `the server refused this statement:` | 1 |
+| 46 | `the server said:` | 1 |
+| 47 | `clickhouse at <server>:<port> did not answer within <wait_seconds>s` | 1 |
+| 48 | `could not read a version from '<version>'` | 1 |
+| 49 | `clickhouse <version> is below the minimum supported version 26.8` | 1 |
+| 50 | `cluster '<cluster>' is not defined on <server>:<port>` | 1 |
+| 51 | `only <live> of <want_hosts> hosts in cluster '<cluster>' answered within <wait_seconds>s; ON CLUSTER DDL would fail on the rest` | 1 |
+| 52 | `<policy_what> is defined on <policy_have> of <policy_want> hosts; every server's configuration must carry it (docs/configuration.md §3)` | 1 |
+| 53 | `the file ends in an unterminated statement` | 1 |
 
 ### Grammar boundaries
 
@@ -391,6 +393,7 @@ clickhouse:
   auth: "default:"               # user:password, split on first colon; password is secret
   proto: http                    # http | https  (native rejected at startup — ADR 0001)
   tls_skip_verify: false
+  tls_ca_file: null              # PEM CA file for https; null = the public roots
   pool_size: 8
   insert_quorum: 0               # replicas that must confirm a block (0 = off; Replicated* only). §Consistency
   insert_quorum_parallel: true   # only applied when insert_quorum > 0

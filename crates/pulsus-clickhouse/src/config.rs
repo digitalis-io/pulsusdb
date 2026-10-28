@@ -188,7 +188,7 @@ pub struct ChConnConfig {
     /// [`crate::client::ChClient::new`] for the startup warning this must emit.
     pub tls_skip_verify: bool,
     /// `CLICKHOUSE_TLS_CA_FILE` (default unset): a PEM file of the CA
-    /// certificates an `https` server's certificate is verified against, in
+    /// certificates an `https` server's certificate must chain to, in
     /// place of the built-in public roots.
     pub tls_ca_file: Option<String>,
     /// `PULSUS_CH_POOL_SIZE` (default `8`).

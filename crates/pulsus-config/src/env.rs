@@ -39,6 +39,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "CLICKHOUSE_AUTH",
     "CLICKHOUSE_PROTO",
     "CLICKHOUSE_TLS_SKIP_VERIFY",
+    "CLICKHOUSE_TLS_CA_FILE",
     "PULSUS_CH_POOL_SIZE",
     "CLICKHOUSE_INSERT_QUORUM",
     "CLICKHOUSE_INSERT_QUORUM_PARALLEL",
@@ -258,6 +259,9 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("CLICKHOUSE_TLS_SKIP_VERIFY") {
         cfg.clickhouse.tls_skip_verify = parse_bool("CLICKHOUSE_TLS_SKIP_VERIFY", &v)?;
+    }
+    if let Some(v) = read("CLICKHOUSE_TLS_CA_FILE") {
+        cfg.clickhouse.tls_ca_file = Some(v);
     }
     if let Some(v) = read("PULSUS_CH_POOL_SIZE") {
         cfg.clickhouse.pool_size = parse_int("PULSUS_CH_POOL_SIZE", &v)?;

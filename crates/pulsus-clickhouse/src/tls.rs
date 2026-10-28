@@ -1,4 +1,5 @@
-//! Minimal skip-verify TLS client construction for `CLICKHOUSE_TLS_SKIP_VERIFY`.
+//! TLS client construction: skip-verify for `CLICKHOUSE_TLS_SKIP_VERIFY`, and
+//! a private CA for `CLICKHOUSE_TLS_CA_FILE` (issue #746 part D).
 //!
 //! Encryption is preserved end-to-end; only the peer certificate is left
 //! unchecked (edge case #5, see [`crate::ChClient::new`]'s startup warning).
@@ -89,6 +90,43 @@ fn danger_skip_verify_tls_config() -> Result<Arc<rustls::ClientConfig>, ChError>
 /// `.with_url`/`.with_database`/`.with_user`/`.with_password`.
 pub(crate) fn skip_verify_ch_client() -> Result<clickhouse::Client, ChError> {
     let tls_config = (*danger_skip_verify_tls_config()?).clone();
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_only()
+        .enable_http1()
+        .build();
+    let http = HyperClient::builder(TokioExecutor::new()).build(connector);
+    Ok(clickhouse::Client::with_http_client(http))
+}
+
+/// The CA certificates of the PEM file at `path`, as a root store. Every
+/// failure names `CLICKHOUSE_TLS_CA_FILE`: the file cannot be read, a
+/// certificate does not parse, or it holds none.
+pub fn ca_root_store(path: &str) -> Result<rustls::RootCertStore, ChError> {
+    let fail = |msg: String| ChError::Config(format!("CLICKHOUSE_TLS_CA_FILE {path}: {msg}"));
+    let pem = std::fs::read(path).map_err(|e| fail(e.to_string()))?;
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+        let cert = cert.map_err(|e| fail(e.to_string()))?;
+        roots.add(cert).map_err(|e| fail(e.to_string()))?;
+    }
+    if roots.is_empty() {
+        return Err(fail("holds no certificate".to_string()));
+    }
+    Ok(roots)
+}
+
+/// A `clickhouse::Client` whose HTTPS transport verifies the server against
+/// the CA file at `path` only, with the same explicit `ring` provider as
+/// the skip-verify builder above.
+pub(crate) fn ca_file_ch_client(path: &str) -> Result<clickhouse::Client, ChError> {
+    let roots = ca_root_store(path)?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let tls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| ChError::Config(format!("rustls: default protocol versions: {e}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls_config)
         .https_only()

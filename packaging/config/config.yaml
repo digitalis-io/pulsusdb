@@ -54,6 +54,7 @@ clickhouse:
   #auth: "default:"               # user:password (prefer CLICKHOUSE_AUTH in the env file)
   #proto: http                    # http | https  (native rejected at startup — ADR 0001)
   #tls_skip_verify: false
+  #tls_ca_file: null              # PEM CA file for https; null = the public roots
   #pool_size: 8
   #insert_quorum: 0               # replicas that must confirm a block (0 = off; Replicated* only)
   #insert_quorum_parallel: true   # only applied when insert_quorum > 0
