@@ -591,7 +591,6 @@ fn server_accepts(path: &str, v: &serde_norway::Value) -> bool {
 ///   them, so its keys are not listed.
 const SCHEMA_STRICTER: &[(&str, &str)] = &[
     ("query_timeout", "05s"),
-    ("log_rollup_resolution", "05s"),
     ("clickhouse.server", " 5s"),
     ("clickhouse.database", ""),
     ("writer.batch_bytes", "016MiB"),

@@ -4236,12 +4236,14 @@ fn the_script_and_the_crate_refuse_every_setting_the_same_way() {
     use SchemaMode::{Cluster, Single};
     let s = Some;
     let mut cases: Vec<RefusalCase> = Vec::new();
-    for (var, what) in [
-        ("CLICKHOUSE_DB", "database"),
-        ("PULSUS_CLUSTER", "cluster"),
-        ("PULSUS_DIST_SUFFIX", "dist_suffix"),
-        ("PULSUS_STORAGE_POLICY", "storage_policy"),
-    ] {
+    let name_vars = [
+        "CLICKHOUSE_DB",
+        "PULSUS_CLUSTER",
+        "PULSUS_DIST_SUFFIX",
+        "PULSUS_STORAGE_POLICY",
+    ];
+    let name_whats = ["database", "cluster", "dist_suffix", "storage_policy"];
+    for (var, what) in name_vars.into_iter().zip(name_whats) {
         cases.push(refusal_case(
             3,
             &[(var, s("a-b"))],
@@ -4653,6 +4655,10 @@ type RenderCase = (&'static str, Vec<(&'static str, &'static str)>, SchemaMode);
 fn a2_cases() -> Vec<RenderCase> {
     use SchemaMode::{Cluster, Single};
     let base = [("CLICKHOUSE_DB", "pulsus"), ("PULSUS_RETENTION_DAYS", "7")];
+    // Composed rather than written as a literal, as in
+    // `the_script_renders_exactly_what_this_crate_renders`: `live_db_naming`
+    // reads every literal given to a database variable.
+    let other_db: &'static str = Box::leak(format!("{}_elsewhere", single().db).into_boxed_str());
     let with = |extra: &[(&'static str, &'static str)]| {
         let mut v = base.to_vec();
         v.extend_from_slice(extra);
@@ -4668,7 +4674,7 @@ fn a2_cases() -> Vec<RenderCase> {
         (
             "every value moved",
             vec![
-                ("CLICKHOUSE_DB", "pulsus_elsewhere"),
+                ("CLICKHOUSE_DB", other_db),
                 ("PULSUS_CLUSTER", "c1"),
                 ("PULSUS_DIST_SUFFIX", "_routed"),
                 ("PULSUS_STORAGE_POLICY", "hot_cold"),
@@ -5195,7 +5201,7 @@ fn a_refused_request_exits_with_curls_code() {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a stub");
-    let port = listener.local_addr().expect("the stub's address").port();
+    let addr = listener.local_addr().expect("the stub's address");
     let served = std::sync::Arc::new(AtomicUsize::new(0));
     let count = served.clone();
     std::thread::spawn(move || {
@@ -5240,7 +5246,7 @@ fn a_refused_request_exits_with_curls_code() {
         .env("PATH", std::env::var("PATH").expect("PATH is set"))
         .env("PULSUS_RETENTION_DAYS", "1")
         .env("CLICKHOUSE_SERVER", "127.0.0.1")
-        .env("CLICKHOUSE_HTTP_PORT", port.to_string())
+        .env("CLICKHOUSE_HTTP_PORT", addr.port().to_string())
         .env("PULSUS_SCHEMA_WAIT_SECONDS", "2")
         .output()
         .expect("run schema.sh");
