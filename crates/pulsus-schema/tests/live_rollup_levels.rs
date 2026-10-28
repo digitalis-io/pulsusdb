@@ -1,12 +1,11 @@
 //! Issue #18 part A: the rollup levels, built by their timed views, on one
 //! node. Each case builds its own database, then drives the views itself:
 //! after the build every level view's creation run is waited for, the view
-//! stopped and its table emptied, and a run is `SYSTEM START VIEW`,
-//! `SYSTEM REFRESH VIEW`, `SYSTEM WAIT VIEW`, `SYSTEM STOP VIEW` (a stopped
-//! view ignores a manual refresh). Starting a view whose scheduled time has
-//! passed also runs it, so one such run may be two; every assertion below
-//! holds either way, because a second run starts from the first one's
-//! watermark.
+//! stopped and its table emptied, and a run is `SYSTEM REFRESH VIEW`,
+//! `SYSTEM START VIEW`, `SYSTEM WAIT VIEW`, `SYSTEM STOP VIEW`: a refresh
+//! asked for while the view is stopped runs once when it starts, whether or
+//! not its scheduled minute passed meanwhile. Started first, a view whose
+//! minute passed runs at once for it, and the refresh adds a second run.
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`, like `live_schema.rs`:
 //!
@@ -56,12 +55,12 @@ static DB_EXPIRY: pulsus_testkit::TestDb =
 static DB_DISCOVERY: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_levels_discovery");
 
-/// Part A's levels, 60 s first, which these cases were written for; the
-/// default levels begin at 5 s.
+/// Part A's levels, 60 s first, which these cases were written for, the
+/// 60 s level the resolution from a range of 60 s.
 fn part_a(db: &str, retention_days: u32) -> RenderCtx {
     RenderCtx {
         rollup_levels: vec![60, 720, 7200, 86400],
-        rollup_ranges: vec![86400, 604800, 7776000],
+        rollup_ranges: vec![60, 86400, 604800, 7776000],
         ..RenderCtx::for_tests(db, retention_days)
     }
 }
@@ -196,8 +195,8 @@ async fn fresh(client: &ChClient, ctx: &RenderCtx) {
 /// One run of level `r`'s view.
 async fn run(client: &ChClient, db: &str, r: u32) {
     let view = format!("{db}.metric_samples_{r}s_mv");
-    exec(client, &format!("SYSTEM START VIEW {view}")).await;
     exec(client, &format!("SYSTEM REFRESH VIEW {view}")).await;
+    exec(client, &format!("SYSTEM START VIEW {view}")).await;
     exec(client, &format!("SYSTEM WAIT VIEW {view}")).await;
     exec(client, &format!("SYSTEM STOP VIEW {view}")).await;
 }
@@ -1536,8 +1535,9 @@ async fn stale_markers_and_nan_at_the_levels() {
 
 /// **T7 (issue #18 follow-up): the discovery reads the switch points.** A
 /// database built with the default levels: the level discovery returns the
-/// five levels, each with the query range from which it is the
-/// resolution, and the counter bucket count.
+/// four levels, 60 s first, each with the query range from which it is the
+/// resolution, the first level's included (issue #746), and the counter
+/// bucket count.
 #[tokio::test]
 async fn the_discovery_reads_the_switch_points() {
     use pulsus_read::metrics::rollup::{LevelSlot, refresh_levels};
@@ -1559,7 +1559,6 @@ async fn the_discovery_reads_the_switch_points() {
         .map(|l| (l.res_ms, l.table.clone(), l.from_ms))
         .collect();
     let want: Vec<(i64, String, u64)> = [
-        (5_000, 0),
         (60_000, 3_600_000),
         (720_000, 86_400_000),
         (7_200_000, 604_800_000),
@@ -1589,7 +1588,7 @@ async fn a_level_and_its_series_outlive_raw() {
     let db = DB_KEPT.name();
     let ctx = RenderCtx {
         rollup_levels: vec![60, 720],
-        rollup_ranges: vec![86400],
+        rollup_ranges: vec![60, 86400],
         rollup_retention_days: vec![2, 10],
         ..RenderCtx::for_tests(db, 2)
     };

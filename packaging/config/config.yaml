@@ -23,8 +23,8 @@
 #log_level: info                  # error | warn | info | debug | trace
 #auth_user: null                  # both set => basic auth; one-sided => startup error
 #auth_password: null              # secret: prefer the env file
-#admin_user: null                 # both set => /admin/ mounted; one-sided => startup error
-#admin_password: null             # secret: prefer the env file
+#admin_user: admin                # the admin UI's pair; /admin/ is always mounted
+#admin_password: admin            # secret: prefer the env file; change it
 #compat_endpoints: false
 #cors_origin: "*"
 #query_timeout: 2m
@@ -54,6 +54,7 @@ clickhouse:
   #auth: "default:"               # user:password (prefer CLICKHOUSE_AUTH in the env file)
   #proto: http                    # http | https  (native rejected at startup — ADR 0001)
   #tls_skip_verify: false
+  #tls_ca_file: null              # PEM CA file for https; null = the public roots
   #pool_size: 8
   #insert_quorum: 0               # replicas that must confirm a block (0 = off; Replicated* only)
   #insert_quorum_parallel: true   # only applied when insert_quorum > 0

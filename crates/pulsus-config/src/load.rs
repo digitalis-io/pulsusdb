@@ -10,6 +10,7 @@ use std::path::Path;
 use crate::env::apply_env;
 use crate::error::ConfigError;
 use crate::model::Config;
+use crate::secret::Secret;
 use crate::validate::validate;
 
 /// Merges defaults, an optional YAML file, environment variables, and a
@@ -26,6 +27,9 @@ pub fn parse(
     };
 
     apply_env(&mut cfg)?;
+    // Issue #746: a null or empty admin field from the file keeps its default.
+    let (user, password) = cfg.admin_pair();
+    (cfg.admin_user, cfg.admin_password) = (Some(user.to_string()), Some(Secret::new(password)));
 
     if let Some(mode) = mode_override {
         cfg.mode = mode.parse().map_err(|expected| ConfigError::Value {

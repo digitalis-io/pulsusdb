@@ -183,14 +183,14 @@ async fn a_run_row_is_read_with_its_data() {
         return;
     }
     let db = pulsus_testkit::test_db("pulsus_read_it_rollup_cluster");
-    // Part B's levels, 60 s first: the 40-minute query below reads the
-    // first level.
+    // Part B's levels, 60 s first and the resolution from 60 s: the
+    // 40-minute query below reads the first level.
     let ctx = RenderCtx {
         db: db.clone(),
         cluster: Some(CLUSTER_NAME.to_string()),
         dist_suffix: "_dist".to_string(),
         rollup_levels: vec![60, 720, 7200, 86400],
-        rollup_ranges: vec![86400, 604800, 7776000],
+        rollup_ranges: vec![60, 86400, 604800, 7776000],
         ..RenderCtx::for_tests(&db, 30)
     };
     let bootstrap = ChClient::new(shard1_config("default"))

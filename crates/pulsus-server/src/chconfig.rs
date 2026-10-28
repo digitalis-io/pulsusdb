@@ -39,6 +39,7 @@ pub(crate) fn conn_config_from(config: &Config) -> ChConnConfig {
             pulsus_config::ChProto::Https => ChProto::Https,
         },
         tls_skip_verify: config.clickhouse.tls_skip_verify,
+        tls_ca_file: config.clickhouse.tls_ca_file.clone(),
         pool_size: config.clickhouse.pool_size as usize,
         query_timeout: config.query_timeout.0,
         // Issue #43: multi-endpoint connection spreading. An empty

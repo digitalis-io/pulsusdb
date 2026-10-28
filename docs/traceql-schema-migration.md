@@ -2994,7 +2994,7 @@ materialized view in §1 (`crates/pulsus-schema/src/catalog.rs:227-234, 244-256,
 (`crates/pulsus-write/src/writer/trace.rs:9-19 @ d60a960d, 137-185, 172`; `crates/pulsus-write/src/writer/table.rs:375-442` @ d60a960d;
 `crates/pulsus-write/src/writer/backfill.rs:23-28, 189-201, 214-220`); the wire framing
 (`vendor/clickhouse/src/rowbinary/ser.rs:129, 137, 146, 222`) and that the
-storage-to-reader hop is LZ4-framed (`crates/pulsus-clickhouse/src/pool.rs:694` →
+storage-to-reader hop is LZ4-framed (`crates/pulsus-clickhouse/src/pool.rs:698` →
 `vendor/clickhouse/Cargo.toml:49` `default = ["lz4"]` →
 `vendor/clickhouse/src/query.rs:221-231`, which appends `compress=1`).
 
@@ -3166,7 +3166,7 @@ from its source; the pointer is not reproduced here.
 | tag lookback default | 24 hours | `crates/pulsus-config/src/model.rs:696` @ 1cdb3e5e |
 | spans per trace cap | `LIMIT 10001 BY trace_id` | `crates/pulsus-read/src/traces/exec.rs:131` @ 1cdb3e5e |
 | tag name / value caps | 10,000 / 1,000 | `crates/pulsus-read/src/traces/exec.rs:131 @ 1cdb3e5e, 135` |
-| storage → reader wire format | RowBinary, LZ4-framed | `crates/pulsus-clickhouse/src/pool.rs:694` → `vendor/clickhouse/Cargo.toml:49` → `vendor/clickhouse/src/query.rs:221-231` |
+| storage → reader wire format | RowBinary, LZ4-framed | `crates/pulsus-clickhouse/src/pool.rs:698` → `vendor/clickhouse/Cargo.toml:49` → `vendor/clickhouse/src/query.rs:221-231` |
 | shard key | `cityHash64(trace_id)` | `schema/schema.sql:566` |
 | pushed aggregates | `uniqExact(span_id)`, `max(duration_ns)`, `min(duration_ns)` | `crates/pulsus-read/src/traces/compile.rs:478-489` |
 

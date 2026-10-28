@@ -168,8 +168,9 @@ impl BuildInfo {
 ///    outside both auth and the generic timeout entirely.
 /// 4. Global layers on the merged whole, CORS outermost: trace →
 ///    compression → CORS (auth/timeout are never global).
-/// 5. With the admin pair set, `admin::router` merged outside all of
-///    that (issue #746): its own authentication, no CORS layer.
+/// 5. `admin::router` merged outside all of that (issue #746): its own
+///    authentication, the admin pair (`admin` / `admin` unless set), and no
+///    CORS layer.
 pub(crate) fn build_router(state: AppState, config: &Config) -> Result<Router, ServeError> {
     let mut authed = ops::ops_authed_router().merge(modes::mount_subsystems(Router::new(), config));
     authed = compat::apply_aliases(authed, config);
@@ -200,10 +201,7 @@ pub(crate) fn build_router(state: AppState, config: &Config) -> Result<Router, S
     // Issue #746: the admin router, outside the CORS layer. `admin` comes
     // first so the merge keeps the data-plane router's fallback, behind its
     // authentication and CORS layers, for every unmatched path.
-    let router = match crate::admin::router(config) {
-        Some(admin) => admin.merge(router),
-        None => router,
-    };
+    let router = crate::admin::router(config).merge(router);
 
     Ok(router.with_state(state))
 }
@@ -766,29 +764,50 @@ mod tests {
         );
     }
 
-    /// B4: the admin routes exist only with the admin pair; the data-plane
-    /// pair answers its own 401 first, then 404.
+    /// B4 (owner, 2026-10-28): the admin routes are always mounted. With
+    /// neither admin variable set the default pair `admin` / `admin` opens
+    /// them and nothing else does, the data-plane pair included.
     #[tokio::test]
-    async fn admin_routes_are_mounted_only_with_the_admin_pair() {
+    async fn admin_routes_are_mounted_with_the_default_admin_pair() {
         let none = admin_router(&pairs(false, false));
         assert_eq!(
             status_of(&none, "/admin/", None).await,
-            StatusCode::NOT_FOUND
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_of(&none, "/admin/", Some(&basic("admin:admin"))).await,
+            StatusCode::OK
         );
 
         let data_only = admin_router(&pairs(true, false));
+        for auth in [None, Some(basic("q:wrong")), Some(basic("q:r"))] {
+            assert_eq!(
+                status_of(&data_only, "/admin/", auth.as_deref()).await,
+                StatusCode::UNAUTHORIZED,
+                "{auth:?}"
+            );
+        }
         assert_eq!(
-            status_of(&data_only, "/admin/", None).await,
-            StatusCode::UNAUTHORIZED
+            status_of(&data_only, "/admin/", Some(&basic("admin:admin"))).await,
+            StatusCode::OK
         );
-        assert_eq!(
-            status_of(&data_only, "/admin/", Some(&basic("q:wrong"))).await,
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            status_of(&data_only, "/admin/", Some(&basic("q:r"))).await,
-            StatusCode::NOT_FOUND
-        );
+
+        // A configuration built with either admin field absent or empty
+        // still mounts the admin routes behind that half's default.
+        for (user, password) in [(None, None), (Some(""), Some("")), (None, Some("b"))] {
+            let mut cfg = pairs(false, false);
+            cfg.admin_user = user.map(str::to_string);
+            cfg.admin_password = password.map(pulsus_config::Secret::new);
+            let pair = format!(
+                "admin:{}",
+                password.filter(|p| !p.is_empty()).unwrap_or("admin")
+            );
+            assert_eq!(
+                status_of(&admin_router(&cfg), "/admin/", Some(&basic(&pair))).await,
+                StatusCode::OK,
+                "{user:?} {password:?}"
+            );
+        }
 
         let admin_only = admin_router(&pairs(false, true));
         assert_eq!(

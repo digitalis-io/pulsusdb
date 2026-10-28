@@ -29,7 +29,7 @@ pub use render::{
     rollup_suffix, validate_tiering,
 };
 pub use sql::{
-    SCHEMA_SQL, expand_levels_for_tests, mv_projection, rendered, rendered_statements,
+    SCHEMA_SH, SCHEMA_SQL, expand_levels_for_tests, mv_projection, rendered, rendered_statements,
     table_column_names,
 };
 pub use vars::{

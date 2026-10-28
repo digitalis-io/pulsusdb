@@ -11,7 +11,7 @@ PulsusDB is configured by environment variables, optionally layered over a YAML 
 | `PULSUS_PORT` | `3100` | HTTP port |
 | `PULSUS_LOG_LEVEL` | `info` | `error` \| `warn` \| `info` \| `debug` \| `trace` |
 | `PULSUS_AUTH_USER` / `PULSUS_AUTH_PASSWORD` | unset | enable HTTP Basic auth when both set |
-| `PULSUS_ADMIN_USER` / `PULSUS_ADMIN_PASSWORD` | unset | the admin UI's own HTTP Basic pair ([api.md](api.md) §7); both set mounts `/admin/`, one alone is a startup error, and neither opens any other route |
+| `PULSUS_ADMIN_USER` / `PULSUS_ADMIN_PASSWORD` | `admin` | the admin UI's own HTTP Basic pair ([api.md](api.md) §7), which opens `/admin/` and no other route. Each variable set overrides its own half; empty, or null in the file, a half keeps its default. While the password is `admin` the server logs a warning at startup: change it |
 | `PULSUS_COMPAT_ENDPOINTS` | `false` | mount third-party-compatible query aliases and ingest receivers ([api.md §8](api.md)); the PulsusDB API and OTLP ingestion are always on |
 | `PULSUS_CORS_ORIGIN` | `*` | `Access-Control-Allow-Origin` value |
 | `PULSUS_QUERY_TIMEOUT` | `2m` | hard per-query timeout |
@@ -27,9 +27,10 @@ PulsusDB is configured by environment variables, optionally layered over a YAML 
 | `CLICKHOUSE_HTTP_PORT` | `8123` | HTTP-interface port — the port the chosen transport uses ([ADR 0001](decisions/0001-clickhouse-client.md)); also the per-endpoint port fallback for `CLICKHOUSE_SERVERS` entries that omit one |
 | `CLICKHOUSE_PORT` | `9000` | native-protocol port; reserved for the documented fallback client, unused by the current transport |
 | `CLICKHOUSE_DB` | `pulsus` | database; created by `schema/schema.sh`, never by the binary — startup refuses when it does not exist |
-| `CLICKHOUSE_PROTO` | `http` | `http` \| `https` (TLS to ClickHouse). `native` is reserved for the fallback client and rejected at startup with an error citing ADR 0001 |
+| `CLICKHOUSE_PROTO` | `http` | `http` \| `https` (TLS to ClickHouse). `native` is reserved for the fallback client and rejected at startup with an error citing ADR 0001. `schema/schema.sh` reads it and `CLICKHOUSE_TLS_CA_FILE` too, and takes `http` or `https` |
 | `CLICKHOUSE_AUTH` | `default:` | `user:password` |
 | `CLICKHOUSE_TLS_SKIP_VERIFY` | `false` | accept self-signed certificates |
+| `CLICKHOUSE_TLS_CA_FILE` | unset | a PEM file of the CA certificates an `https` server's certificate must chain to, in place of the public roots; a file that cannot be read stops startup. `CLICKHOUSE_TLS_SKIP_VERIFY` overrides it |
 | `PULSUS_CH_POOL_SIZE` | `8` | connections per process. Accepted range `1..=8000`: values above the ceiling are rejected at config load — an unbounded pool disables the connection cap and can exceed the 32-bit tokio semaphore permit bound at startup. Scale tuning routes to #25 |
 | `CLICKHOUSE_INSERT_QUORUM` | `0` | replicas that must confirm a block before an insert is acknowledged (`0` = off, `1` = rejected at startup — a silent no-op in ClickHouse — `>= 2` = active quorum). Integer-only — `auto`/majority is unsupported. Only meaningful on `Replicated*` engines; see [Consistency](#consistency) |
 | `CLICKHOUSE_INSERT_QUORUM_PARALLEL` | `true` | allow parallel quorum inserts; only applied when `CLICKHOUSE_INSERT_QUORUM > 0` |
@@ -175,14 +176,14 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 | `PULSUS_METRICS_LANDING_RETENTION_HOURS` | `6` | `H` for `metric_landing`, in hours. A whole number from `1` to `168` ([errors](#schemaschemash-errors)) |
 | `PULSUS_LOG_LANDING_RETENTION_HOURS` | `6` | `H` for `log_landing`, with the same rule |
 | `PULSUS_TRACE_LANDING_RETENTION_HOURS` | `6` | `H` for `trace_landing`, with the same rule |
-| `PULSUS_ROLLUP_LEVELS` | `5,60,720,7200,86400` | the rollup levels in seconds, smallest first; empty for none. Its rules are [errors](#schemaschemash-errors) 8-15. Choose levels above the scrape interval: a level at or below it holds about one sample per series and bucket or fewer, so it stores more than raw and saves no rows |
-| `PULSUS_ROLLUP_RANGES` | `3600,86400,604800,7776000` | the query range in seconds from which each level after the first is the resolution of a PromQL range query ([api.md](api.md) §3.6), one per level after the first, in level order; read only when there are levels, and empty for none. Stored in each level table's comment. Its rules are [errors](#schemaschemash-errors) 16-20 |
+| `PULSUS_ROLLUP_LEVELS` | `60,720,7200,86400` | the rollup levels in seconds, smallest first; empty for none. Its rules are [errors](#schemaschemash-errors) 8-15. Choose levels above the scrape interval: a level at or below it holds about one sample per series and bucket or fewer, so it stores more than raw and saves no rows |
+| `PULSUS_ROLLUP_RANGES` | `3600,86400,604800,7776000` | the query range in seconds from which each level is the resolution of a PromQL range query ([api.md](api.md) §3.6), one per level, in level order; a range below the first reads raw. Read only when there are levels, and empty for none. Stored in each level table's comment. Its rules are [errors](#schemaschemash-errors) 16-20 |
 | `PULSUS_ROLLUP_COUNTER_BUCKETS` | `5` | the buckets of a level a `rate` or `increase` range covers at least for that level to answer it. Stored in each level table's comment. A whole number from `2` to `1000` with no leading zero ([errors](#schemaschemash-errors)). One bucket would give a `rate` window one point at the levels under 720 s. The distances in [api.md](api.md) §3.6 hold for `5` |
 | `PULSUS_COLD_VOLUME` | unset: nothing moves | the volume of `PULSUS_STORAGE_POLICY` (§3) that old parts move to; letters, digits and `_`. Requires the policy; the volume must not be the policy's first, and the policy's `move_factor` must be `0` (`schema/schema.sh` checks every server before it drops anything, exit `1`) |
 | `PULSUS_METRICS_HOT_DAYS` | none: required when `PULSUS_COLD_VOLUME` is set, refused when it is not | days after which a metric sample's part moves to the cold volume, from `1` to `PULSUS_RETENTION_DAYS`; the retention itself renders no move rule. Either way the tables stay on the policy, so a new part can still be written to the cold volume when the local volume is full (Tiering, below) |
 | `PULSUS_LOGS_HOT_DAYS` | as above | the same for log lines and the log rollups |
 | `PULSUS_TRACES_HOT_DAYS` | as above | the same for spans and the trace tables read by time |
-| `PULSUS_ROLLUP_RETENTION_DAYS` | unset: every level keeps `PULSUS_RETENTION_DAYS` | each level's retention in days, comma-separated, one per level of `PULSUS_ROLLUP_LEVELS` in its order. Each a whole number from `PULSUS_RETENTION_DAYS` to `4294967295` with no leading zero (set and empty is refused as an empty item), and each but the last at least ⌈the next level's switch point (`PULSUS_ROLLUP_RANGES`) ÷ 86400⌉ + 1, so a range that selects a level finds every day it touches: with the default switch points the first four levels need at least `2`, `2`, `8`, `91`. The metric catalogue keeps the largest of `PULSUS_RETENTION_DAYS` and these (`C` below) |
+| `PULSUS_ROLLUP_RETENTION_DAYS` | unset: every level keeps `PULSUS_RETENTION_DAYS` | each level's retention in days, comma-separated, one per level of `PULSUS_ROLLUP_LEVELS` in its order. Each a whole number from `PULSUS_RETENTION_DAYS` to `4294967295` with no leading zero (set and empty is refused as an empty item), and each but the last at least ⌈the next level's switch point (`PULSUS_ROLLUP_RANGES`) ÷ 86400⌉ + 1, so a range that selects a level finds every day it touches: with the default switch points the first three levels need at least `2`, `8`, `91`. The metric catalogue keeps the largest of `PULSUS_RETENTION_DAYS` and these (`C` below) |
 | `PULSUS_ROLLUP_HOT_DAYS` | unset: no level moves | each level's move age in days, one per level; refused when `PULSUS_COLD_VOLUME` is unset. Each a whole number from `1` to that level's retention (set and empty is refused as an empty item); the retention itself renders no move rule |
 
 **The binary reads the retention from the database.** At startup it reads the database comment and is not ready until the comment is exactly `retention_days=<N>`; its retry warning names the script. The trace read floor (a read that selects spans by a window reads no span that started `N` days or more before the request, [api.md](api.md) §4), the live-tail lower bound (`N` days and one more before the request) and `/api/v1/status/runtimeinfo`'s `storageRetention` all use that `N`. Changing retention is a rebuild with the script, which drops the database.
@@ -292,7 +293,7 @@ Each is printed as `schema.sh: <message>` on standard error, and the script exit
 | 15 | `PULSUS_ROLLUP_LEVELS: the first level <1> outlives metric_landing: 2 × <period> + 870 > <metrics_landing_hours> × 3600` | 2 |
 | 16 | `PULSUS_ROLLUP_RANGES: an empty item in '<rollup_ranges>'` | 2 |
 | 17 | `PULSUS_ROLLUP_RANGES: <item> is not a whole number of seconds from 1 to 999999999` | 2 |
-| 18 | `PULSUS_ROLLUP_RANGES: <n_ranges> ranges for <n_levels> levels: give one for each level after the first` | 2 |
+| 18 | `PULSUS_ROLLUP_RANGES: <n_ranges> ranges for <n_levels> levels: give one for each level` | 2 |
 | 19 | `PULSUS_ROLLUP_RANGES: <prev> then <item>: the ranges must increase` | 2 |
 | 20 | `PULSUS_ROLLUP_RANGES: <item> is shorter than its level <level>` | 2 |
 | 21 | `PULSUS_ROLLUP_COUNTER_BUCKETS: <counter_buckets> is not a whole number from 2 to 1000` | 2 |
@@ -317,16 +318,17 @@ Each is printed as `schema.sh: <message>` on standard error, and the script exit
 | 40 | `PULSUS_TRACEQL_INDEXED_ATTRIBUTES: <item> is listed twice` | 2 |
 | 41 | `PULSUS_TRACEQL_INDEXED_ATTRIBUTES: names more than 16 attributes` | 2 |
 | 42 | `the lines above carry a token this script does not render` | 2 |
-| 43 | `the server refused a request; it said:` | curl |
-| 44 | `the server refused this statement:` | 1 |
-| 45 | `the server said:` | 1 |
-| 46 | `clickhouse at <server>:<port> did not answer within <wait_seconds>s` | 1 |
-| 47 | `could not read a version from '<version>'` | 1 |
-| 48 | `clickhouse <version> is below the minimum supported version 26.8` | 1 |
-| 49 | `cluster '<cluster>' is not defined on <server>:<port>` | 1 |
-| 50 | `only <live> of <want_hosts> hosts in cluster '<cluster>' answered within <wait_seconds>s; ON CLUSTER DDL would fail on the rest` | 1 |
-| 51 | `<policy_what> is defined on <policy_have> of <policy_want> hosts; every server's configuration must carry it (docs/configuration.md §3)` | 1 |
-| 52 | `the file ends in an unterminated statement` | 1 |
+| 43 | `CLICKHOUSE_PROTO must be http or https: <proto>` | 2 |
+| 44 | `the server refused a request; it said:` | curl |
+| 45 | `the server refused this statement:` | 1 |
+| 46 | `the server said:` | 1 |
+| 47 | `clickhouse at <server>:<port> did not answer within <wait_seconds>s` | 1 |
+| 48 | `could not read a version from '<version>'` | 1 |
+| 49 | `clickhouse <version> is below the minimum supported version 26.8` | 1 |
+| 50 | `cluster '<cluster>' is not defined on <server>:<port>` | 1 |
+| 51 | `only <live> of <want_hosts> hosts in cluster '<cluster>' answered within <wait_seconds>s; ON CLUSTER DDL would fail on the rest` | 1 |
+| 52 | `<policy_what> is defined on <policy_have> of <policy_want> hosts; every server's configuration must carry it (docs/configuration.md §3)` | 1 |
+| 53 | `the file ends in an unterminated statement` | 1 |
 
 ### Grammar boundaries
 
@@ -359,8 +361,8 @@ port: 3100
 log_level: info                  # error | warn | info | debug | trace
 auth_user: null                  # both set => basic auth; one-sided => startup error
 auth_password: null              # secret: never appears in redacted output
-admin_user: null                 # both set => /admin/ mounted; one-sided => startup error
-admin_password: null             # secret: never appears in redacted output
+admin_user: admin                # the admin UI's pair; /admin/ is always mounted
+admin_password: admin            # secret: never appears in redacted output; change it
 compat_endpoints: false
 cors_origin: "*"
 query_timeout: 2m
@@ -391,6 +393,7 @@ clickhouse:
   auth: "default:"               # user:password, split on first colon; password is secret
   proto: http                    # http | https  (native rejected at startup — ADR 0001)
   tls_skip_verify: false
+  tls_ca_file: null              # PEM CA file for https; null = the public roots
   pool_size: 8
   insert_quorum: 0               # replicas that must confirm a block (0 = off; Replicated* only). §Consistency
   insert_quorum_parallel: true   # only applied when insert_quorum > 0

@@ -522,7 +522,7 @@ async fn a_level_day_counts_from_its_end() {
         logs_hot_days: Some(3),
         traces_hot_days: Some(3),
         rollup_levels: vec![60],
-        rollup_ranges: Vec::new(),
+        rollup_ranges: vec![3600],
         rollup_retention_days: vec![7],
         rollup_hot_days: vec![3],
         ..RenderCtx::for_tests(&DB_DAY_END, 7)

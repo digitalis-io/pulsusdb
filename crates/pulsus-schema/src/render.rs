@@ -75,7 +75,7 @@ pub struct RenderCtx {
     /// seconds, smallest first; empty for none.
     pub rollup_levels: Vec<u32>,
     /// `PULSUS_ROLLUP_RANGES` (issue #18): the validated switch points in
-    /// seconds, one per level after the first.
+    /// seconds, one per level; a shorter range reads raw.
     pub rollup_ranges: Vec<u32>,
     /// `PULSUS_ROLLUP_COUNTER_BUCKETS` (issue #18): the buckets a counter's
     /// range covers at least.
@@ -110,12 +110,13 @@ pub struct RenderCtx {
 pub const GRAPH_JOB_MAX_ROWS: u64 = 60_000_000;
 
 /// The rollup levels `schema/schema.sh` renders when `PULSUS_ROLLUP_LEVELS`
-/// is unset (issue #18; the owner's table, 2026-10-26).
-pub const DEFAULT_ROLLUP_LEVELS: &[u32] = &[5, 60, 720, 7200, 86400];
+/// is unset (issue #18): 60 s first, raw being the 5 s data (owner,
+/// 2026-10-28).
+pub const DEFAULT_ROLLUP_LEVELS: &[u32] = &[60, 720, 7200, 86400];
 
 /// The switch points `schema/schema.sh` renders when `PULSUS_ROLLUP_RANGES`
-/// is unset: the query range, in seconds, from which each level after the
-/// first is the resolution (issue #18 follow-up).
+/// is unset: the query range, in seconds, from which each level is the
+/// resolution (issue #18 follow-up; issue #746).
 pub const DEFAULT_ROLLUP_RANGES: &[u32] = &[3600, 86400, 604800, 7776000];
 
 /// `PULSUS_ROLLUP_COUNTER_BUCKETS` when unset: the buckets of a level a
@@ -357,8 +358,9 @@ pub fn parse_rollup_levels(text: &str, landing_hours: u32) -> Result<Vec<u32>, S
 }
 
 /// `PULSUS_ROLLUP_RANGES` (issue #18 follow-up): `text` validated against
-/// the validated `levels`, the switch points in seconds, one per level
-/// after the first. With no levels the text is not read. An empty `text`
+/// the validated `levels`, the switch points in seconds, one per level; a
+/// range below the first reads raw (issue #746). With no levels the text
+/// is not read. An empty `text`
 /// is an empty list. Each rule is checked in turn and the first that fails
 /// is the message, without the `PULSUS_ROLLUP_RANGES: ` prefix
 /// `schema/schema.sh` prints before the same message.
@@ -387,9 +389,9 @@ pub fn parse_rollup_ranges(text: &str, levels: &[u32]) -> Result<Vec<u32>, Strin
             }
         }
     }
-    if ranges.len() + 1 != levels.len() {
+    if ranges.len() != levels.len() {
         return Err(format!(
-            "{} ranges for {} levels: give one for each level after the first",
+            "{} ranges for {} levels: give one for each level",
             ranges.len(),
             levels.len()
         ));
@@ -399,7 +401,7 @@ pub fn parse_rollup_ranges(text: &str, levels: &[u32]) -> Result<Vec<u32>, Strin
     }
     if let Some((range, level)) = ranges
         .iter()
-        .zip(&levels[1..])
+        .zip(levels)
         .find(|(range, level)| range < level)
     {
         return Err(format!("{range} is shorter than its level {level}"));
@@ -567,7 +569,12 @@ fn level_retention(text: &str, input: &TieringInput<'_>) -> Result<Vec<u32>, Str
             }
         }
     }
-    for ((days, level), from) in keep.iter().zip(input.levels).zip(input.ranges) {
+    // Each level but the last against the next level's switch point.
+    for ((days, level), from) in keep
+        .iter()
+        .zip(input.levels)
+        .zip(input.ranges.iter().skip(1))
+    {
         let need = from.div_ceil(86_400) + 1;
         if *days < need {
             return Err(format!(
@@ -716,13 +723,12 @@ fn emit_levels(out: &mut String, block: &[(LevelLine, &str)], set: LevelSet<'_>)
             .unwrap_or_default();
         let period_ms = format!("{p}000");
         // Written as text, as `{{level_ms}}`: 7,776,000,000 exceeds 32 bits.
-        let from_ms = match i {
-            0 => "0".to_string(),
-            _ => format!(
-                "{}000",
-                ranges.get(i - 1).map(u32::to_string).unwrap_or_default()
-            ),
-        };
+        // Every level carries its own switch point, the first included
+        // (issue #746).
+        let from_ms = format!(
+            "{}000",
+            ranges.get(i).map(u32::to_string).unwrap_or_default()
+        );
         let counter_buckets = counter_buckets.to_string();
         // Issue #743 part B: the level's own retention, else the raw
         // retention's token, which `substitute_tokens` resolves; and its
@@ -942,7 +948,7 @@ mod tests {
     #[test]
     fn one_level_is_first_and_feeds_nothing() {
         assert_eq!(
-            expand_levels(LEVEL_BLOCK, (&[60], &[], 5, &[], &[])),
+            expand_levels(LEVEL_BLOCK, (&[60], &[3600], 5, &[], &[])),
             "head\n\
              A 60s 60000 EVERY 1 MINUTE\n\
              --@cluster C 60s\n  indented\n\
@@ -957,7 +963,7 @@ mod tests {
     #[test]
     fn a_level_below_a_minute_runs_every_minute_and_the_next_has_no_offset() {
         assert_eq!(
-            expand_levels(LEVEL_BLOCK, (&[5, 60], &[3600], 5, &[], &[])),
+            expand_levels(LEVEL_BLOCK, (&[5, 60], &[60, 3600], 5, &[], &[])),
             "head\n\
              A 5s 5000 EVERY 1 MINUTE\n\
              --@cluster C 5s\n  indented\n\
@@ -974,7 +980,7 @@ mod tests {
     /// 780 s.
     #[test]
     fn the_timers_follow_the_level_sizes() {
-        let out = expand_levels(LEVEL_BLOCK, (&[720, 86400], &[86400], 5, &[], &[]));
+        let out = expand_levels(LEVEL_BLOCK, (&[720, 86400], &[86400, 7776000], 5, &[], &[]));
         assert!(out.contains("A 720s 720000 EVERY 12 MINUTE\n"), "{out}");
         assert!(
             out.contains("A 86400s 86400000 EVERY 1 DAY OFFSET 780 SECOND\n"),

@@ -1,15 +1,16 @@
-//! The admin UI (issue #746 part B): status, database and configuration
-//! pages under `/admin/`, and their JSON API under `/admin/api/v1/`. Each
-//! page and its endpoint are built from one view value (`views`). Mounted
-//! only with the admin pair; `app::build_router` merges it outside the CORS
-//! layer.
+//! The admin UI (issue #746 parts B and C): status, database and
+//! configuration pages and the setup form under `/admin/`, and their JSON
+//! API under `/admin/api/v1/`. Each
+//! page and its endpoint are built from one view value (`views`). Always
+//! mounted, behind the admin pair; `app::build_router` merges it outside the
+//! CORS layer.
 
 use axum::Router;
 use axum::extract::Request;
 use axum::http::{HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
 use pulsus_config::Config;
 
 use crate::app::AppState;
@@ -17,32 +18,35 @@ use crate::app::AppState;
 mod api;
 pub(crate) mod html;
 mod pages;
+mod setup;
 pub(crate) mod views;
 
-/// The admin routes, or `None` unless both admin fields are set. The pages
-/// refuse with the plain `401`, the API with the JSON one; every response
-/// carries the two headers `headers` sets.
-pub(crate) fn router(config: &Config) -> Option<Router<AppState>> {
-    let page_auth = crate::middleware::admin_auth_layer(config, false)?;
-    let api_auth = crate::middleware::admin_auth_layer(config, true)?;
+/// The admin routes, behind the admin pair (`Config::admin_pair`). The
+/// pages refuse with the plain `401`, the API with the JSON one; every
+/// response carries the two headers `headers` sets.
+pub(crate) fn router(config: &Config) -> Router<AppState> {
+    let page_auth = crate::middleware::admin_auth_layer(config, false);
+    let api_auth = crate::middleware::admin_auth_layer(config, true);
     let pages = Router::new()
         .route("/admin/", get(pages::status))
         .route("/admin/database", get(pages::database))
         .route("/admin/config", get(pages::config))
+        .route("/admin/setup", get(setup::form).post(setup::submit))
+        .route("/admin/setup/file", post(setup::file))
         .route("/admin/admin.css", get(pages::css))
         .layer(page_auth);
     let api = Router::new()
         .route("/admin/api/v1/status", get(api::status))
         .route("/admin/api/v1/database", get(api::database))
         .route("/admin/api/v1/config", get(api::config))
+        .route("/admin/api/v1/setup/validate", post(api::setup_validate))
+        .route("/admin/api/v1/setup/bundle", post(api::setup_bundle))
         .layer(api_auth);
-    Some(
-        pages
-            .merge(api)
-            .layer(axum::middleware::from_fn(headers))
-            .layer(axum::middleware::from_fn(crate::request_id::stamp))
-            .layer(crate::middleware::trace_layer()),
-    )
+    pages
+        .merge(api)
+        .layer(axum::middleware::from_fn(headers))
+        .layer(axum::middleware::from_fn(crate::request_id::stamp))
+        .layer(crate::middleware::trace_layer())
 }
 
 /// `Content-Security-Policy: default-src 'self'` and `Cache-Control:
@@ -57,6 +61,9 @@ async fn headers(req: Request, next: Next) -> Response {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     res
 }
+
+#[cfg(test)]
+mod setup_tests;
 
 #[cfg(test)]
 mod tests {
@@ -80,7 +87,7 @@ mod tests {
 
     /// `app.rs`'s `test_state()`, with `cfg` as the configuration, the
     /// admin pair `a`/`s3cret` added, and retention unset.
-    fn state(mut cfg: Config) -> AppState {
+    pub(super) fn state(mut cfg: Config) -> AppState {
         cfg.admin_user = Some("a".to_string());
         cfg.admin_password = Some(Secret::new("s3cret"));
         AppState {
@@ -105,11 +112,11 @@ mod tests {
         }
     }
 
-    fn router(state: &AppState) -> axum::Router {
+    pub(super) fn router(state: &AppState) -> axum::Router {
         build_router(state.clone(), &state.config.clone()).expect("router builds")
     }
 
-    fn admin_header() -> String {
+    pub(super) fn admin_header() -> String {
         format!("Basic {}", crate::middleware::base64_encode(b"a:s3cret"))
     }
 
@@ -176,7 +183,7 @@ mod tests {
         }
     }
 
-    fn b6_levels(shards: u32, counter_buckets: u32) -> Levels {
+    pub(super) fn b6_levels(shards: u32, counter_buckets: u32) -> Levels {
         Levels {
             levels: vec![
                 Level {

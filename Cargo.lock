@@ -1683,6 +1683,7 @@ dependencies = [
  "pulsus-config",
  "pulsus-testkit",
  "rustls",
+ "rustls-pemfile",
  "rustls-pki-types",
  "serde",
  "thiserror 2.0.18",
@@ -1862,6 +1863,7 @@ dependencies = [
  "pulsus-read",
  "pulsus-schema",
  "pulsus-schema-testkit",
+ "pulsus-setup",
  "pulsus-testkit",
  "pulsus-traceql",
  "pulsus-write",
@@ -1882,6 +1884,15 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pulsus-setup"
+version = "0.0.0"
+dependencies = [
+ "http",
+ "pulsus-schema",
+ "serde",
 ]
 
 [[package]]
@@ -3344,6 +3355,7 @@ dependencies = [
  "pulsus-read",
  "pulsus-schema",
  "pulsus-schema-testkit",
+ "pulsus-setup",
  "pulsus-traceql",
  "rand 0.8.6",
  "rustls",

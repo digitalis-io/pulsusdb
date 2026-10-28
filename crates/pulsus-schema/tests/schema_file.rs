@@ -51,16 +51,16 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 30 tables, 27 views, and
+/// The inventory, single-node: one database, 29 tables, 26 views, and
 /// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
 /// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 58, "statement count");
+    assert_eq!(stmts.len(), 56, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
-    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 30);
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 27);
+    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 29);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 26);
 
     let text = rendered(&single());
     assert!(
@@ -89,18 +89,18 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     assert!(text.contains("non_replicated_deduplication_window = 10000"));
 }
 
-/// The inventory, clustered: the same statements plus 19 `_dist` wrappers,
+/// The inventory, clustered: the same statements plus 18 `_dist` wrappers,
 /// `ON CLUSTER` on every one, and the macros intact.
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 77, "statement count");
+    assert_eq!(stmts.len(), 74, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        49,
-        "30 tables + 19 wrappers"
+        47,
+        "29 tables + 18 wrappers"
     );
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 27);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 26);
 
     let text = rendered(&clustered());
     assert!(
@@ -109,20 +109,20 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        77,
+        74,
         "every statement carries ON CLUSTER"
     );
 
     // `{shard}` and `{replica}` are the server's own macros and must arrive
-    // literally. 24 tables take a per-shard replica set and 6 take the
-    // cluster-wide one, so 30 paths name `{replica}` and 24 name `{shard}`.
-    // The five default rollup levels add five per-shard replica sets.
+    // literally. 23 tables take a per-shard replica set and 6 take the
+    // cluster-wide one, so 29 paths name `{replica}` and 23 name `{shard}`.
+    // The four default rollup levels are four of the per-shard replica sets.
     assert_eq!(
         text.matches("{shard}").count(),
-        24,
+        23,
         "per-shard replica sets"
     );
-    assert_eq!(text.matches("{replica}").count(), 30, "replicated tables");
+    assert_eq!(text.matches("{replica}").count(), 29, "replicated tables");
     assert_eq!(
         text.matches("/clickhouse/tables/all/").count(),
         6,
@@ -184,7 +184,7 @@ fn every_replication_path_names_the_table_of_its_own_create() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 30, "every replicated table's path was checked");
+    assert_eq!(checked, 29, "every replicated table's path was checked");
 }
 
 /// The splitter the script relies on: a statement ends at a line whose last
@@ -336,7 +336,6 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         "metric_exemplars",
         "metric_series",
         "metric_labels",
-        "metric_samples_5s",
         "metric_samples_60s",
         "metric_samples_720s",
         "metric_samples_7200s",
@@ -369,7 +368,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 30);
+    assert_eq!(on_tables, 29);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -494,7 +493,7 @@ fn the_script_renders_exactly_what_this_crate_renders() {
                 // for it (issue #599), so this case keeps it.
                 graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
                 rollup_levels: vec![15, 60, 720],
-                rollup_ranges: vec![3600, 86400],
+                rollup_ranges: vec![600, 3600, 86400],
                 rollup_counter_buckets: 7,
                 // Issue #743 part A: the metrics and traces move, the logs
                 // at the retention do not.
@@ -521,7 +520,7 @@ fn the_script_renders_exactly_what_this_crate_renders() {
         (
             "level retention only",
             RenderCtx {
-                rollup_retention_days: vec![7, 7, 8, 91, 400],
+                rollup_retention_days: vec![7, 8, 91, 400],
                 ..single()
             },
         ),
@@ -1208,22 +1207,16 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
                 sources.extend(own);
             }
         }
-        assert_eq!(targets.len(), 27, "{variant:?}: twenty-seven views");
+        assert_eq!(targets.len(), 26, "{variant:?}: twenty-six views");
         refreshable.sort();
         let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
             refreshable,
             vec![
                 (
-                    "metric_samples_5s_mv".to_string(),
-                    "metric_samples_5s".to_string(),
-                    strings(&["metric_landing", "metric_samples_5s"]),
-                    Vec::<String>::new(),
-                ),
-                (
                     "metric_samples_60s_mv".to_string(),
                     "metric_samples_60s".to_string(),
-                    strings(&["metric_samples_5s", "metric_samples_60s"]),
+                    strings(&["metric_landing", "metric_samples_60s"]),
                     Vec::<String>::new(),
                 ),
                 // Sorted as strings: `7200s` before `720s`.
@@ -1252,7 +1245,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
                     strings(&["service_edges", "spans"]),
                 ),
             ],
-            "{variant:?}: the six refreshable views, their targets, their direct \
+            "{variant:?}: the five refreshable views, their targets, their direct \
              sources and their sources read through merge()"
         );
         let mut distinct: Vec<String> = sources.clone();
@@ -2170,14 +2163,6 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
     // Issue #18: the rollup levels, one row each, due at the end of the
     // UTC day of `t_end − 1 ms` plus the retention.
     (
-        "metric_samples_5s",
-        Some(
-            "TTL toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + (17 * 86400), 4294967295))",
-        ),
-        true,
-        None,
-    ),
-    (
         "metric_samples_60s",
         Some(
             "TTL toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + (17 * 86400), 4294967295))",
@@ -2572,7 +2557,7 @@ fn the_rollup_levels_render_from_one_template() {
     let sets: [(&[u32], &[u32], &[&str]); 3] = [
         (
             &[60, 720, 7200, 86400],
-            &[86400, 604800, 7776000],
+            &[3600, 86400, 604800, 7776000],
             &[
                 "EVERY 1 MINUTE",
                 "EVERY 12 MINUTE OFFSET 240 SECOND",
@@ -2582,7 +2567,7 @@ fn the_rollup_levels_render_from_one_template() {
         ),
         (
             &[5, 60, 720, 7200, 86400],
-            &[3600, 86400, 604800, 7776000],
+            &[600, 3600, 86400, 604800, 7776000],
             &[
                 "EVERY 1 MINUTE",
                 "EVERY 1 MINUTE",
@@ -2593,7 +2578,7 @@ fn the_rollup_levels_render_from_one_template() {
         ),
         (
             &[720, 86400],
-            &[7776000],
+            &[86400, 7776000],
             &["EVERY 12 MINUTE", "EVERY 1 DAY OFFSET 780 SECOND"],
         ),
     ];
@@ -2642,10 +2627,8 @@ fn the_rollup_levels_render_from_one_template() {
                     &format!("CREATE TABLE IF NOT EXISTS pulsus.metric_samples_{r}s{on}"),
                 );
                 let lines: Vec<&str> = table.lines().collect();
-                let from = match i {
-                    0 => "0".to_string(),
-                    _ => format!("{}000", ranges[i - 1]),
-                };
+                // Issue #746: every level carries its own switch point.
+                let from = format!("{}000", ranges[i]);
                 for line in [
                     format!(
                         "COMMENT 'rollup_res_ms={r}000 rollup_from_ms={from} counter_buckets=5';"
@@ -2822,16 +2805,16 @@ fn the_script_and_the_crate_refuse_the_same_level_lists() {
             "{levels:?}: the crate's message"
         );
     }
-    // Each accepted list with one switch point for each level after the
-    // first (issue #18 follow-up).
+    // Each accepted list with one switch point for each level (issue #18
+    // follow-up; issue #746).
     for (levels, ranges, want) in [
         (
             "60,720,7200,86400",
-            "86400,604800,7776000",
+            "3600,86400,604800,7776000",
             vec![60, 720, 7200, 86400],
         ),
-        ("5,60", "3600", vec![5, 60]),
-        ("720,86400", "7776000", vec![720, 86400]),
+        ("5,60", "5,3600", vec![5, 60]),
+        ("720,86400", "86400,7776000", vec![720, 86400]),
         ("", "", vec![]),
     ] {
         let (code, _, err) = script_levels(Some(levels), Some(ranges), None);
@@ -2844,15 +2827,23 @@ fn the_script_and_the_crate_refuse_the_same_level_lists() {
     }
 }
 
-/// **T6 (issue #18 follow-up): the default levels carry their switch
-/// points.** The default render, on one node and clustered, has the five
-/// level tables of the owner's table (2026-10-26), each comment naming its
-/// width, the query range from which it is the resolution, and the counter
+/// **T6 (issue #18 follow-up; issue #746): the default levels carry their
+/// switch points.** The default render, on one node and clustered, has the
+/// four level tables of the owner's table, 60 s first: raw is the 5 s data
+/// (owner, 2026-10-28). Each comment names its width, the query range from
+/// which it is the resolution, the first level's included, and the counter
 /// bucket count; 7,776,000,000 is written as digits.
 #[test]
 fn the_default_levels_carry_their_switch_points() {
+    assert_eq!(
+        pulsus_schema::DEFAULT_ROLLUP_LEVELS,
+        &[60, 720, 7200, 86400]
+    );
+    assert_eq!(
+        pulsus_schema::DEFAULT_ROLLUP_RANGES,
+        &[3600, 86400, 604800, 7776000]
+    );
     let want = [
-        (5, "rollup_res_ms=5000 rollup_from_ms=0 counter_buckets=5"),
         (
             60,
             "rollup_res_ms=60000 rollup_from_ms=3600000 counter_buckets=5",
@@ -2944,12 +2935,14 @@ fn script_levels(
     )
 }
 
-/// **T5 (issue #18 follow-up): the script and the crate refuse the same
-/// switch points and counter bucket counts, with the same message, and
-/// accept the same.** The ranges are checked only when there are levels.
+/// **T5 (issue #18 follow-up; issue #746): the script and the crate refuse
+/// the same switch points and counter bucket counts, with the same message,
+/// and accept the same.** The ranges are checked only when there are levels,
+/// and there is one for each level, the first included: a query range below
+/// the first level's reads raw.
 #[test]
 fn the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets() {
-    let default_levels = "5,60,720,7200,86400";
+    let default_levels = "60,720,7200,86400";
     for (levels, ranges, message) in [
         (
             default_levels,
@@ -2977,26 +2970,33 @@ fn the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets() {
             "1h is not a whole number of seconds from 1 to 999999999",
         ),
         (
-            "5,60,720",
+            "60,720,7200",
             "3600",
-            "1 ranges for 3 levels: give one for each level after the first",
+            "1 ranges for 3 levels: give one for each level",
         ),
         (
-            "5,60",
-            "",
-            "0 ranges for 2 levels: give one for each level after the first",
+            "60,720,7200",
+            "86400,604800",
+            "2 ranges for 3 levels: give one for each level",
+        ),
+        ("60", "", "0 ranges for 1 levels: give one for each level"),
+        (
+            "60,720",
+            "3600,86400,604800",
+            "3 ranges for 2 levels: give one for each level",
         ),
         (
-            "5,60,720",
-            "86400,3600",
+            "60,720,7200",
+            "86400,3600,604800",
             "86400 then 3600: the ranges must increase",
         ),
         (
-            "5,60,720",
-            "3600,3600",
+            "60,720,7200",
+            "3600,3600,86400",
             "3600 then 3600: the ranges must increase",
         ),
-        ("5,7200", "3600", "3600 is shorter than its level 7200"),
+        ("60,720", "30,3600", "30 is shorter than its level 60"),
+        ("5,7200", "60,3600", "3600 is shorter than its level 7200"),
     ] {
         let (code, _, err) = script_levels(Some(levels), Some(ranges), None);
         assert_eq!(
@@ -3018,7 +3018,7 @@ fn the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets() {
     }
     // The levels `60` with the default ranges: four for one level.
     let (code, _, err) = script_levels(Some("60"), None, None);
-    let message = "4 ranges for 1 levels: give one for each level after the first";
+    let message = "4 ranges for 1 levels: give one for each level";
     assert_eq!(code, Some(2), "60 with the default ranges: {err}");
     assert_eq!(
         err.trim_end(),
@@ -3027,11 +3027,6 @@ fn the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets() {
     assert_eq!(
         pulsus_schema::parse_rollup_ranges("3600,86400,604800,7776000", &[60]),
         Err(message.to_string())
-    );
-    assert_eq!(
-        pulsus_schema::DEFAULT_ROLLUP_RANGES,
-        &[3600, 86400, 604800, 7776000],
-        "the default ranges"
     );
 
     for (buckets, message) in [
@@ -3055,24 +3050,24 @@ fn the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets() {
     }
 
     // Accepted.
-    let (code, out, err) = script_levels(Some("5,60"), Some("999999999"), None);
+    let (code, out, err) = script_levels(Some("5,60"), Some("60,999999999"), None);
     assert_eq!(code, Some(0), "999999999: {err}");
-    assert!(
-        out.contains(
-            "COMMENT 'rollup_res_ms=60000 rollup_from_ms=999999999000 counter_buckets=5';"
-        ),
-        "999999999 is stored"
-    );
+    for comment in [
+        "COMMENT 'rollup_res_ms=5000 rollup_from_ms=60000 counter_buckets=5';",
+        "COMMENT 'rollup_res_ms=60000 rollup_from_ms=999999999000 counter_buckets=5';",
+    ] {
+        assert!(out.contains(comment), "{comment} is stored");
+    }
     assert_eq!(
-        pulsus_schema::parse_rollup_ranges("999999999", &[5, 60]),
-        Ok(vec![999_999_999])
+        pulsus_schema::parse_rollup_ranges("60,999999999", &[5, 60]),
+        Ok(vec![60, 999_999_999])
     );
     for (buckets, want) in [("2", 2u32), ("1000", 1000)] {
         let (code, out, err) = script_levels(None, None, Some(buckets));
         assert_eq!(code, Some(0), "{buckets}: {err}");
         assert!(
             out.contains(&format!(
-                "COMMENT 'rollup_res_ms=5000 rollup_from_ms=0 counter_buckets={want}';"
+                "COMMENT 'rollup_res_ms=60000 rollup_from_ms=3600000 counter_buckets={want}';"
             )),
             "{buckets} is stored"
         );
@@ -3081,14 +3076,17 @@ fn the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets() {
             Ok(want)
         );
     }
-    // One level and an empty range list.
-    let (code, out, err) = script_levels(Some("60"), Some(""), None);
-    assert_eq!(code, Some(0), "one level, no ranges: {err}");
+    // One level and its own range, equal to its width.
+    let (code, out, err) = script_levels(Some("60"), Some("60"), None);
+    assert_eq!(code, Some(0), "one level, one range: {err}");
     assert!(
-        out.contains("COMMENT 'rollup_res_ms=60000 rollup_from_ms=0 counter_buckets=5';"),
-        "one level, no ranges: {out}"
+        out.contains("COMMENT 'rollup_res_ms=60000 rollup_from_ms=60000 counter_buckets=5';"),
+        "one level, one range: {out}"
     );
-    assert_eq!(pulsus_schema::parse_rollup_ranges("", &[60]), Ok(vec![]));
+    assert_eq!(
+        pulsus_schema::parse_rollup_ranges("60", &[60]),
+        Ok(vec![60])
+    );
     // No levels: the ranges are not read.
     let (code, out, err) = script_levels(Some(""), Some("1,2"), None);
     assert_eq!(code, Some(0), "no levels: {err}");
@@ -3154,14 +3152,14 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             vec![],
             vec!["--mode", "single"],
             single(),
-            "5295ea5f4f205e7e42838d845a27741566652cc270e9289d35e3941df9d2b4fc",
+            "77777077dcc457e1014d451f0f18ed80efba6eb485fc0d550e2982351ea6f558",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "1a3e9d34d55cc2af05de1acad35a805cf250ff3dbb9a5030c8f44efbd2280964",
+            "5da1f1529806c2eaea71bcbb2b00ac59f4747617fdd7cc837308067cd6c7a4e9",
         ),
         (
             "clustered with a storage policy",
@@ -3171,7 +3169,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "aa31710015720cb50e242c7d9b11a2916955c11b3ec48589bd918f778b875cc6",
+            "69da18812935012d9c7b69aaf3c9ff7c30b53bd4daab986f8086e6cf33b117fc",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
@@ -3445,7 +3443,7 @@ fn move_line(table: &str, days: u32) -> String {
 /// `storage_policy = 'tiered'`.
 fn assert_tiering(what: &str, ctx: &RenderCtx, moving: &[(&str, u32)]) {
     let tables = local_tables(ctx);
-    assert_eq!(tables.len(), 30, "{what}: thirty tables");
+    assert_eq!(tables.len(), 29, "{what}: twenty-nine tables");
     for name in NEVER_MOVE {
         assert!(tables.contains_key(name), "{what}: {name} is rendered");
     }
@@ -3594,7 +3592,7 @@ fn both_levels(
 
 /// **B1 (issue #743 part B): the script and the crate refuse the same level
 /// day lists, with the same message, and accept the same.** Levels `60,
-/// 720, 7200` with switch points `86400, 604800`, and `R` = 2. A list
+/// 720, 7200` with switch points `3600, 86400, 604800`, and `R` = 2. A list
 /// variable that is set is checked, empty included; rule 4 is checked
 /// before rule 5, 4 c for every level before 4 d, and 5 a before 5 b.
 #[test]
@@ -3616,7 +3614,7 @@ fn the_script_and_the_crate_refuse_the_same_level_day_lists() {
         PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS is required"
         .to_string();
     let levels = "60,720,7200";
-    let ranges = "86400,604800";
+    let ranges = "3600,86400,604800";
     type Case<'a> = (
         &'a str,
         &'a str,
@@ -3926,8 +3924,8 @@ fn line_starting<'a>(stmt: &'a str, head: &str) -> Option<&'a str> {
 
 /// **B2 (issue #743 part B): each level keeps its own retention and moves
 /// at its own age, and the metric catalogue keeps the longest.** `R` = 7,
-/// the default levels kept `30, 30, 90, 365, 730` days and moving at `7, 7,
-/// 30, 30, 730`, in both modes; every table outside the levels and the
+/// the default levels kept `30, 90, 365, 730` days and moving at `7, 30,
+/// 30, 730`, in both modes; every table outside the levels and the
 /// catalogue renders as it does without the two lists.
 #[test]
 fn each_level_keeps_its_own_retention_and_the_catalogue_the_longest() {
@@ -3938,8 +3936,8 @@ fn each_level_keeps_its_own_retention_and_the_catalogue_the_longest() {
             metrics_hot_days: Some(7),
             logs_hot_days: Some(7),
             traces_hot_days: Some(7),
-            rollup_retention_days: vec![30, 30, 90, 365, 730],
-            rollup_hot_days: vec![7, 7, 30, 30, 730],
+            rollup_retention_days: vec![30, 90, 365, 730],
+            rollup_hot_days: vec![7, 30, 30, 730],
             ..base
         };
         let plain = RenderCtx {
@@ -3956,7 +3954,6 @@ fn each_level_keeps_its_own_retention_and_the_catalogue_the_longest() {
         );
 
         let levels = [
-            ("metric_samples_5s", 30, Some(7)),
             ("metric_samples_60s", 30, Some(7)),
             ("metric_samples_720s", 90, Some(30)),
             ("metric_samples_7200s", 365, Some(30)),
@@ -4337,11 +4334,7 @@ fn the_script_and_the_crate_refuse_every_setting_the_same_way() {
             "3600,86400,604800,1000000000",
             "1000000000 is not a whole number of seconds from 1 to 999999999",
         ),
-        (
-            18,
-            "3600",
-            "1 ranges for 5 levels: give one for each level after the first",
-        ),
+        (18, "3600", "1 ranges for 4 levels: give one for each level"),
         (
             19,
             "86400,3600,604800,7776000",
@@ -4430,7 +4423,7 @@ fn the_script_and_the_crate_refuse_every_setting_the_same_way() {
         28,
         &[(keep, s("30"))],
         Single,
-        format!("{keep}: 1 items for 5 levels"),
+        format!("{keep}: 1 items for 4 levels"),
     ));
     let mut hot_empty = with_cold.clone();
     hot_empty.push((hot, s("")));
@@ -4446,36 +4439,36 @@ fn the_script_and_the_crate_refuse_every_setting_the_same_way() {
         28,
         &hot_one,
         Single,
-        format!("{hot}: 1 items for 5 levels"),
+        format!("{hot}: 1 items for 4 levels"),
     ));
     cases.push(refusal_case(
         29,
-        &[(keep, s("29,30,30,30,30"))],
+        &[(keep, s("29,30,30,30"))],
         Single,
-        format!("{keep}: 29 for the 5s level is not a whole number of days from 30 to 4294967295"),
+        format!("{keep}: 29 for the 60s level is not a whole number of days from 30 to 4294967295"),
     ));
     cases.push(refusal_case(
         30,
-        &[("PULSUS_RETENTION_DAYS", s("1")), (keep, s("1,1,1,1,1"))],
+        &[("PULSUS_RETENTION_DAYS", s("1")), (keep, s("1,1,1,1"))],
         Single,
         format!(
-            "{keep}: 1 for the 5s level is too short: the next level's switch point, 3600 s, \
+            "{keep}: 1 for the 60s level is too short: the next level's switch point, 86400 s, \
              requires 2 retention days"
         ),
     ));
     cases.push(refusal_case(
         31,
-        &[(hot, s("1,1,1,1,1"))],
+        &[(hot, s("1,1,1,1"))],
         Single,
         format!("{hot} is set and PULSUS_COLD_VOLUME is not"),
     ));
     let mut hot_over = with_cold.clone();
-    hot_over.push((hot, s("31,1,1,1,1")));
+    hot_over.push((hot, s("31,1,1,1")));
     cases.push(refusal_case(
         32,
         &hot_over,
         Single,
-        format!("{hot}: 31 for the 5s level is not a whole number of days from 1 to 30"),
+        format!("{hot}: 31 for the 60s level is not a whole number of days from 1 to 30"),
     ));
     cases.push(refusal_case(
         33,
@@ -4603,7 +4596,7 @@ fn the_script_and_the_crate_refuse_every_setting_the_same_way() {
                 ("PULSUS_ROLLUP_COUNTER_BUCKETS", s("1")),
             ],
             Single,
-            format!("{ranges}: 1 ranges for 5 levels: give one for each level after the first"),
+            format!("{ranges}: 1 ranges for 4 levels: give one for each level"),
         ),
         refusal_case(
             21,
@@ -4711,7 +4704,7 @@ fn a2_cases() -> Vec<RenderCase> {
                     "span.app.request.id,event.exception.type,span.http-x.a_b",
                 ),
                 ("PULSUS_ROLLUP_LEVELS", "15,60,720"),
-                ("PULSUS_ROLLUP_RANGES", "3600,86400"),
+                ("PULSUS_ROLLUP_RANGES", "600,3600,86400"),
                 ("PULSUS_ROLLUP_COUNTER_BUCKETS", "7"),
                 ("PULSUS_COLD_VOLUME", "cold"),
                 ("PULSUS_METRICS_HOT_DAYS", "5"),
@@ -4735,7 +4728,7 @@ fn a2_cases() -> Vec<RenderCase> {
         ),
         (
             "level retention only",
-            with(&[("PULSUS_ROLLUP_RETENTION_DAYS", "7,7,8,91,400")]),
+            with(&[("PULSUS_ROLLUP_RETENTION_DAYS", "7,8,91,400")]),
             Single,
         ),
         ("no levels", with(&[("PULSUS_ROLLUP_LEVELS", "")]), Single),
@@ -4751,7 +4744,10 @@ fn a2_cases() -> Vec<RenderCase> {
         ),
         (
             "one level",
-            with(&[("PULSUS_ROLLUP_LEVELS", "60"), ("PULSUS_ROLLUP_RANGES", "")]),
+            with(&[
+                ("PULSUS_ROLLUP_LEVELS", "60"),
+                ("PULSUS_ROLLUP_RANGES", "3600"),
+            ]),
             Single,
         ),
         (
@@ -4760,7 +4756,7 @@ fn a2_cases() -> Vec<RenderCase> {
                 ("PULSUS_ROLLUP_LEVELS", "5,10,20,60,120,240,720,86400"),
                 (
                     "PULSUS_ROLLUP_RANGES",
-                    "3600,7200,14400,28800,86400,604800,7776000",
+                    "60,3600,7200,14400,28800,86400,604800,7776000",
                 ),
             ]),
             Single,
@@ -4894,6 +4890,8 @@ fn the_variable_lists_are_every_variable_the_script_reads() {
         "CLICKHOUSE_HTTP_PORT",
         "CLICKHOUSE_AUTH",
         "PULSUS_SCHEMA_WAIT_SECONDS",
+        "CLICKHOUSE_PROTO",
+        "CLICKHOUSE_TLS_CA_FILE",
     ];
     assert_eq!(pulsus_schema::SCHEMA_VARS, schema_vars, "SCHEMA_VARS");
     assert_eq!(
@@ -4920,7 +4918,7 @@ fn the_variable_lists_are_every_variable_the_script_reads() {
             scanned.insert(name);
         }
     }
-    assert_eq!(scanned.len(), 26, "the scan found {scanned:?}");
+    assert_eq!(scanned.len(), 28, "the scan found {scanned:?}");
     let union: std::collections::BTreeSet<String> = union.into_iter().map(String::from).collect();
     assert_eq!(union, scanned, "the lists against the script");
 }
@@ -5577,7 +5575,7 @@ fn a7_cases() -> Vec<Vec<(String, Option<String>)>> {
                     let mut c = set(&[
                         ("PULSUS_RETENTION_DAYS", retention),
                         ("PULSUS_ROLLUP_LEVELS", "60,720"),
-                        ("PULSUS_ROLLUP_RANGES", "86400"),
+                        ("PULSUS_ROLLUP_RANGES", "3600,86400"),
                         (var, list.as_str()),
                     ]);
                     if tiered {

@@ -187,6 +187,10 @@ pub struct ChConnConfig {
     /// verification only — never downgrades to plaintext. See
     /// [`crate::client::ChClient::new`] for the startup warning this must emit.
     pub tls_skip_verify: bool,
+    /// `CLICKHOUSE_TLS_CA_FILE` (default unset): a PEM file of the CA
+    /// certificates an `https` server's certificate must chain to, in
+    /// place of the built-in public roots.
+    pub tls_ca_file: Option<String>,
     /// `PULSUS_CH_POOL_SIZE` (default `8`).
     pub pool_size: usize,
     /// `PULSUS_QUERY_TIMEOUT` (default `2m`). Drives both the client-side
@@ -226,6 +230,7 @@ impl Default for ChConnConfig {
             password: String::new(),
             proto: ChProto::Http,
             tls_skip_verify: false,
+            tls_ca_file: None,
             pool_size: 8,
             query_timeout: Duration::from_secs(120),
             endpoints: Vec::new(),

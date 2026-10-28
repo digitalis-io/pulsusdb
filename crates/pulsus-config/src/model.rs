@@ -36,7 +36,7 @@ pub struct Config {
     pub auth_user: Option<String>,
     pub auth_password: Option<Secret>,
     /// `PULSUS_ADMIN_USER` / `PULSUS_ADMIN_PASSWORD` (issue #746): the admin
-    /// UI's own Basic pair; both set mounts `/admin/`.
+    /// UI's own Basic pair, `admin` / `admin` unless set (the defaults below).
     pub admin_user: Option<String>,
     pub admin_password: Option<Secret>,
     pub compat_endpoints: bool,
@@ -141,8 +141,8 @@ impl Default for Config {
             log_level: LogLevel::Info,
             auth_user: None,
             auth_password: None,
-            admin_user: None,
-            admin_password: None,
+            admin_user: Some(DEFAULT_ADMIN_USER.to_string()),
+            admin_password: Some(Secret::new(DEFAULT_ADMIN_PASSWORD)),
             compat_endpoints: false,
             cors_origin: "*".to_string(),
             query_timeout: HumanDuration(Duration::from_secs(120)),
@@ -194,6 +194,9 @@ pub struct ClickHouseConfig {
     pub auth: ChAuth,
     pub proto: ChProto,
     pub tls_skip_verify: bool,
+    /// `CLICKHOUSE_TLS_CA_FILE`: the CA an `https` server is verified
+    /// against (issue #746 part D).
+    pub tls_ca_file: Option<String>,
     pub pool_size: u32,
     /// Multi-endpoint connection list (issue #43). **Empty** (the default)
     /// keeps the single-endpoint behavior driven by `server`/`http_port`.
@@ -234,6 +237,7 @@ impl Default for ClickHouseConfig {
             auth: ChAuth::default(),
             proto: ChProto::default(),
             tls_skip_verify: false,
+            tls_ca_file: None,
             pool_size: 8,
             servers: Vec::new(),
             insert_quorum: 0,
@@ -1002,6 +1006,36 @@ impl<'de> Deserialize<'de> for ChAuth {
     {
         let s = String::deserialize(deserializer)?;
         s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// The admin user when `PULSUS_ADMIN_USER` is unset (issue #746).
+pub const DEFAULT_ADMIN_USER: &str = "admin";
+
+/// The admin password when `PULSUS_ADMIN_PASSWORD` is unset (issue #746);
+/// the server warns at startup while it is in use.
+pub const DEFAULT_ADMIN_PASSWORD: &str = "admin";
+
+impl Config {
+    /// Issue #746: whether the admin password is still the default
+    /// `admin`, which the server warns about at startup.
+    pub fn admin_password_is_default(&self) -> bool {
+        self.admin_pair().1 == DEFAULT_ADMIN_PASSWORD
+    }
+
+    /// Issue #746: the admin pair in force. A half that is absent or empty
+    /// is its default, so the admin UI is always mounted.
+    pub fn admin_pair(&self) -> (&str, &str) {
+        let user = self.admin_user.as_deref().filter(|u| !u.is_empty());
+        let password = self
+            .admin_password
+            .as_ref()
+            .map(|p| p.expose())
+            .filter(|p| !p.is_empty());
+        (
+            user.unwrap_or(DEFAULT_ADMIN_USER),
+            password.unwrap_or(DEFAULT_ADMIN_PASSWORD),
+        )
     }
 }
 

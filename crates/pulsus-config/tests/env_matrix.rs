@@ -145,6 +145,11 @@ const ROWS: &[Row] = &[
         check: |c| c.clickhouse.tls_skip_verify,
     },
     Row {
+        var: "CLICKHOUSE_TLS_CA_FILE",
+        value: "/etc/ch/ca.crt",
+        check: |c| c.clickhouse.tls_ca_file.as_deref() == Some("/etc/ch/ca.crt"),
+    },
+    Row {
         var: "PULSUS_CH_POOL_SIZE",
         value: "32",
         check: |c| c.clickhouse.pool_size == 32,
@@ -626,15 +631,23 @@ fn the_documented_tables_name_exactly_all_env_vars() {
 #[test]
 fn each_variable_sets_exactly_one_yaml_key() {
     let _guard = support::lock_env();
-    let defaults =
-        support::leaf_values(&serde_norway::to_value(Config::default()).expect("serialise"));
+    // A secret serialises as `***` whatever its value, so the admin
+    // password, which has a default (issue #746), is compared by its value.
+    let leaves_of = |c: &Config| {
+        let mut leaves = support::leaf_values(&serde_norway::to_value(c).expect("serialise"));
+        if let Some(p) = &c.admin_password {
+            leaves.insert("admin_password".to_string(), p.expose().into());
+        }
+        leaves
+    };
+    let defaults = leaves_of(&Config::default());
     let mut setter: std::collections::BTreeMap<String, &str> = Default::default();
     for row in ROWS {
         support::clear_all();
         support::set(row.var, row.value);
         let cfg = pulsus_config::parse(None, None)
             .unwrap_or_else(|e| panic!("{}: parse() failed: {e}", row.var));
-        let leaves = support::leaf_values(&serde_norway::to_value(cfg).expect("serialise"));
+        let leaves = leaves_of(&cfg);
         let changed: Vec<&String> = leaves
             .iter()
             .filter(|(path, v)| defaults.get(*path) != Some(*v))
@@ -653,8 +666,7 @@ fn each_variable_sets_exactly_one_yaml_key() {
 /// this list changing.
 const NO_LITERAL_DEFAULT: &[(&str, &str)] = &[
     ("CLICKHOUSE_SERVERS", "unset"),
-    ("PULSUS_ADMIN_PASSWORD", "unset"),
-    ("PULSUS_ADMIN_USER", "unset"),
+    ("CLICKHOUSE_TLS_CA_FILE", "unset"),
     ("PULSUS_AUTH_PASSWORD", "unset"),
     ("PULSUS_AUTH_USER", "unset"),
     ("PULSUS_AVAILABILITY_ZONE", "unset"),
@@ -821,4 +833,77 @@ fn exp_histogram_mode_accepts_every_variant_and_rejects_unknown() {
     );
 
     support::clear_all();
+}
+
+/// Issue #746: with neither admin variable set the admin pair is
+/// `admin` / `admin`; either variable alone loads, overriding its half
+/// only.
+#[test]
+fn the_admin_pair_defaults_to_admin_and_either_variable_loads_alone() {
+    let _guard = support::lock_env();
+    let pair = |c: &Config| {
+        (
+            c.admin_user.clone(),
+            c.admin_password.as_ref().map(|s| s.expose().to_string()),
+        )
+    };
+    let some = |s: &str| Some(s.to_string());
+    for (vars, want) in [
+        (&[][..], (some("admin"), some("admin"))),
+        (
+            &[("PULSUS_ADMIN_USER", "root")][..],
+            (some("root"), some("admin")),
+        ),
+        (
+            &[("PULSUS_ADMIN_PASSWORD", "toor")][..],
+            (some("admin"), some("toor")),
+        ),
+    ] {
+        support::clear_all();
+        for (var, value) in vars {
+            support::set(var, value);
+        }
+        let cfg = pulsus_config::load(None, None)
+            .unwrap_or_else(|e| panic!("{vars:?}: load() failed: {e}"));
+        assert_eq!(pair(&cfg), want, "{vars:?}");
+    }
+    support::clear_all();
+}
+
+/// Issue #746: a configuration file that sets either admin field to null or
+/// empty keeps that half's default, so the admin UI stays mounted.
+#[test]
+fn a_null_or_empty_admin_field_in_yaml_keeps_its_default() {
+    let _guard = support::lock_env();
+    support::clear_all();
+    for (name, yaml, want) in [
+        (
+            "admin-null",
+            "admin_user: null\nadmin_password: null\n",
+            ("admin", "admin"),
+        ),
+        (
+            "admin-empty",
+            "admin_user: \"\"\nadmin_password: \"\"\n",
+            ("admin", "admin"),
+        ),
+        (
+            "admin-user-null",
+            "admin_user: null\nadmin_password: toor\n",
+            ("admin", "toor"),
+        ),
+    ] {
+        let path = support::write_temp_yaml(name, yaml);
+        let cfg = pulsus_config::load(Some(&path), None)
+            .unwrap_or_else(|e| panic!("{name}: load() failed: {e}"));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            (
+                cfg.admin_user.as_deref(),
+                cfg.admin_password.as_ref().map(|s| s.expose())
+            ),
+            (Some(want.0), Some(want.1)),
+            "{name}"
+        );
+    }
 }

@@ -284,7 +284,7 @@ pub enum Surface {
     /// axum's `&'static str` response), no I/O, no pool. The body text
     /// is the mounting oracle; the route has no error cases.
     Echo,
-    /// `/admin/…` (issue #746) — mounted only with the admin pair, HTML
+    /// `/admin/…` (issue #746) — always mounted, behind the admin pair, HTML
     /// or JSON.
     Admin,
 }
@@ -310,8 +310,8 @@ pub enum Gate {
     /// [`Gate::CompatAndReader`]: the flag alone never mounts a
     /// `CompatAndWriter` route without the Writer role.
     CompatAndWriter,
-    /// Mounted only when `PULSUS_ADMIN_USER` and `PULSUS_ADMIN_PASSWORD`
-    /// are set (issue #746).
+    /// Always mounted, behind the admin pair `PULSUS_ADMIN_USER` /
+    /// `PULSUS_ADMIN_PASSWORD`, `admin` / `admin` by default (issue #746).
     AdminPair,
 }
 
@@ -1734,12 +1734,20 @@ pub struct RouteSpec {
     pub success_status: u16,
     /// A valid GET query string (no leading `?`) — or, for a `POST`-only
     /// documented route, a valid `application/x-www-form-urlencoded` body
-    /// — reaching `success_status` against an empty-but-live database.
+    /// — reaching `success_status` against an empty-but-live database. The
+    /// admin JSON API's `POST` routes take it as their JSON body.
     /// Unused (empty) for `Surface::Ingest`, whose bodies are protobuf/
     /// snappy and built directly in `api_conformance.rs`.
     pub base_query: &'static str,
     pub cases: &'static [CaseClass],
 }
+
+/// The issue #746 example (`pulsus_setup::example_pairs`) as a form body,
+/// with `file=schema.env` for the download route.
+const SETUP_FILE_FORM: &str = "cluster=pulsus_cluster&cores=32&database=pulsus&disk_gib=2048&hosts=ch1%0Ach2%0Ach3%0Ach4%0Ach5%0Ach6&keepers=kp1%0Akp2%0Akp3&l1_from=3600&l1_local=365&l1_width=60&l2_from=86400&l2_local=365&l2_width=720&l3_from=604800&l3_local=365&l3_width=7200&l4_from=7776000&l4_local=365&l4_width=86400&local_path=%2Fvar%2Flib%2Fclickhouse%2F&memory_gib=128&raw_local_days=7&raw_remote_days=90&remote_url=https%3A%2F%2Fbucket.example%2Fpulsus%2F&replicas=3&shards=2&tls_ca=%2Fetc%2Fch%2Fca.crt&tls_cert=%2Fetc%2Fch%2Fserver.crt&tls_key=%2Fetc%2Fch%2Fserver.key&file=schema.env";
+
+/// The same example as the setup API's JSON object.
+const SETUP_JSON: &str = r#"{"cluster":"pulsus_cluster","cores":"32","database":"pulsus","disk_gib":"2048","hosts":"ch1\nch2\nch3\nch4\nch5\nch6","keepers":"kp1\nkp2\nkp3","l1_from":"3600","l1_local":"365","l1_width":"60","l2_from":"86400","l2_local":"365","l2_width":"720","l3_from":"604800","l3_local":"365","l3_width":"7200","l4_from":"7776000","l4_local":"365","l4_width":"86400","local_path":"/var/lib/clickhouse/","memory_gib":"128","raw_local_days":"7","raw_remote_days":"90","remote_url":"https://bucket.example/pulsus/","replicas":"3","shards":"2","tls_ca":"/etc/ch/ca.crt","tls_cert":"/etc/ch/server.crt","tls_key":"/etc/ch/server.key"}"#;
 
 static MANIFEST: &[RouteSpec] = &[
     // -- Ops (always mounted, mode/flag independent) --------------------
@@ -1787,7 +1795,7 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: "",
         cases: &[],
     },
-    // -- Admin (issue #746: mounted only with the admin pair) ----------
+    // -- Admin (issue #746: always mounted, behind the admin pair) -----
     RouteSpec {
         path: "/admin/",
         methods: &[Method::Get],
@@ -1863,6 +1871,50 @@ static MANIFEST: &[RouteSpec] = &[
         doc_ref: DocRef::Verbatim,
         success_status: 200,
         base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/admin/setup",
+        methods: &[Method::Get, Method::Post],
+        surface: Surface::Admin,
+        gate: Gate::AdminPair,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/admin/setup/file",
+        methods: &[Method::Post],
+        surface: Surface::Admin,
+        gate: Gate::AdminPair,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: SETUP_FILE_FORM,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/admin/api/v1/setup/validate",
+        methods: &[Method::Post],
+        surface: Surface::Admin,
+        gate: Gate::AdminPair,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: SETUP_JSON,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/admin/api/v1/setup/bundle",
+        methods: &[Method::Post],
+        surface: Surface::Admin,
+        gate: Gate::AdminPair,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: SETUP_JSON,
         cases: &[],
     },
     // -- Ingest (WriterMode) ---------------------------------------------
@@ -2915,14 +2967,15 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/app.rs",
         function: "build_router",
-        body: "let mut authed = ops::ops_authed_router().merge(modes::mount_subsystems(Router::new(), config)); authed = compat::apply_aliases(authed, config); authed = authed.layer(middleware::timeout_layer(config)); if let Some(auth) = middleware::auth_layer(config) {authed = authed.layer(auth);} authed = authed.layer(axum::middleware::from_fn(crate::request_id::stamp)); let router = ops::ops_public_router().merge(authed); let router = router.layer(middleware::trace_layer()).layer(middleware::compression_layer()).layer(middleware::cors_layer(config)?); let router = match crate::admin::router(config) {Some(admin) => admin.merge(router), None => router,}; Ok(router.with_state(state))",
+        body: "let mut authed = ops::ops_authed_router().merge(modes::mount_subsystems(Router::new(), config)); authed = compat::apply_aliases(authed, config); authed = authed.layer(middleware::timeout_layer(config)); if let Some(auth) = middleware::auth_layer(config) {authed = authed.layer(auth);} authed = authed.layer(axum::middleware::from_fn(crate::request_id::stamp)); let router = ops::ops_public_router().merge(authed); let router = router.layer(middleware::trace_layer()).layer(middleware::compression_layer()).layer(middleware::cors_layer(config)?); let router = crate::admin::router(config).merge(router); Ok(router.with_state(state))",
     },
     // Issue #746 part B: the admin UI's router, merged ahead of the
-    // data-plane router in `build_router`.
+    // data-plane router in `build_router`. Re-pinned when it became always
+    // mounted (both bodies).
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/admin/mod.rs",
         function: "router",
-        body: "let page_auth = crate::middleware::admin_auth_layer(config, false)?; let api_auth = crate::middleware::admin_auth_layer(config, true)?; let pages = Router::new().route(\"/admin/\", get(pages::status)).route(\"/admin/database\", get(pages::database)).route(\"/admin/config\", get(pages::config)).route(\"/admin/admin.css\", get(pages::css)).layer(page_auth); let api = Router::new().route(\"/admin/api/v1/status\", get(api::status)).route(\"/admin/api/v1/database\", get(api::database)).route(\"/admin/api/v1/config\", get(api::config)).layer(api_auth); Some(pages.merge(api).layer(axum::middleware::from_fn(headers)).layer(axum::middleware::from_fn(crate::request_id::stamp)).layer(crate::middleware::trace_layer()))",
+        body: "let page_auth = crate::middleware::admin_auth_layer(config, false); let api_auth = crate::middleware::admin_auth_layer(config, true); let pages = Router::new().route(\"/admin/\", get(pages::status)).route(\"/admin/database\", get(pages::database)).route(\"/admin/config\", get(pages::config)).route(\"/admin/setup\", get(setup::form).post(setup::submit)).route(\"/admin/setup/file\", post(setup::file)).route(\"/admin/admin.css\", get(pages::css)).layer(page_auth); let api = Router::new().route(\"/admin/api/v1/status\", get(api::status)).route(\"/admin/api/v1/database\", get(api::database)).route(\"/admin/api/v1/config\", get(api::config)).route(\"/admin/api/v1/setup/validate\", post(api::setup_validate)).route(\"/admin/api/v1/setup/bundle\", post(api::setup_bundle)).layer(api_auth); pages.merge(api).layer(axum::middleware::from_fn(headers)).layer(axum::middleware::from_fn(crate::request_id::stamp)).layer(crate::middleware::trace_layer())",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/modes.rs",

@@ -17,6 +17,10 @@ use crate::render::{self, RenderCtx};
 /// `--@single` / `--@cluster` line prefixes.
 pub const SCHEMA_SQL: &str = include_str!("../../../schema/schema.sql");
 
+/// `schema/schema.sh`, verbatim: the setup bundle carries it beside
+/// [`SCHEMA_SQL`], which the script reads from its own directory.
+pub const SCHEMA_SH: &str = include_str!("../../../schema/schema.sh");
+
 const SINGLE: &str = "--@single";
 const CLUSTER: &str = "--@cluster";
 

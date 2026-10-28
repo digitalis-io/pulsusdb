@@ -78,6 +78,15 @@ pub async fn run(config: Config) -> ExitCode {
     // every node sharing this configuration renders identically.
     install_template_timezone(&config);
 
+    // Issue #746 part D: the ClickHouse CA file is read before anything
+    // starts, so one that cannot be read stops startup rather than failing
+    // every connection attempt after it.
+    if let Some(path) = &config.clickhouse.tls_ca_file
+        && let Err(err) = pulsus_clickhouse::ca_root_store(path)
+    {
+        eprintln!("pulsusdb: {err}");
+        return ExitCode::FAILURE;
+    }
     let metrics = install_metrics_recorder();
     let config = Arc::new(config);
     let pool_slot: Arc<RwLock<Option<Arc<ChPool>>>> = Arc::new(RwLock::new(None));
@@ -230,7 +239,7 @@ pub async fn run(config: Config) -> ExitCode {
     } else {
         "http"
     };
-    tracing::info!(%addr, mode = ?config.mode, proto, "pulsusdb listening");
+    log_listening(&addr, &config, proto);
 
     // Both arms share the identical graceful-shutdown future and ordering
     // contract; only the listener differs. The `None` arm is today's
@@ -776,6 +785,17 @@ async fn shutdown_signal() {
         _ = terminate => {}
     }
     tracing::info!("shutdown signal received; draining in-flight requests");
+}
+
+/// The startup line, and (issue #746) a warning while the admin password is
+/// the default `admin`.
+fn log_listening(addr: &str, config: &Config, proto: &str) {
+    tracing::info!(%addr, mode = ?config.mode, proto, "pulsusdb listening");
+    if config.admin_password_is_default() {
+        tracing::warn!(
+            "the admin password is the default `admin`: set PULSUS_ADMIN_PASSWORD to change it"
+        );
+    }
 }
 
 #[cfg(test)]

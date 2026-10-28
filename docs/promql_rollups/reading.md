@@ -15,7 +15,7 @@ The read path hands the engine pseudo-samples built from the level's rows, in ti
 | `Counter` | `rate`, `increase` |
 | none | every other function: the selector reads raw |
 
-The points each level row gives (`level_points`, `crates/pulsus-read/src/metrics/rollup.rs:557`; `counter`, `crates/pulsus-read/src/metrics/rollup.rs:605`):
+The points each level row gives (`level_points`, `crates/pulsus-read/src/metrics/rollup.rs:559`; `counter`, `crates/pulsus-read/src/metrics/rollup.rs:607`):
 
 | `RollupUse` | points from one level row |
 |---|---|
@@ -30,7 +30,7 @@ Stale markers and NaN read as raw for the bit-equal functions: a routed `Last` s
 
 ### 1.1 Distance from raw, measured on the engine
 
-`each_served_function_is_within_its_distance` (`crates/pulsus-read/tests/live_metrics_rollup.rs:838`): corpus D, 260 series over 8 days at a 15 s scrape, built at every default level; each function sent with routing on and off; per level `res`, step `res`, over the last day at 60 s, the last 3 days at 720 s and all 8 days at 7200 s and 86400 s; `rate`, `increase` over `5 × res`, the others over `res` and `5 × res`. `d = |a − b| / |b|` (`|a|` when `b = 0`; 1 when only one answer is present); p99 by nearest rank. Output: `measure/results/live-metrics-rollup.txt`. Run before the levels followed the query's time range and before the 5 s default, so each level was reached by its step; the windows a level serves are the same bucket-end windows today.
+`each_served_function_is_within_its_distance` (`crates/pulsus-read/tests/live_metrics_rollup.rs:847`): corpus D, 260 series over 8 days at a 15 s scrape, built at every level of the five-level set `5,60,720,7200,86400`; each function sent with routing on and off; per level `res`, step `res`, over the last day at 60 s, the last 3 days at 720 s and all 8 days at 7200 s and 86400 s; `rate`, `increase` over `5 × res`, the others over `res` and `5 × res`. `d = |a − b| / |b|` (`|a|` when `b = 0`; 1 when only one answer is present); p99 by nearest rank. Output: `measure/results/live-metrics-rollup.txt`. Run before the levels followed the query's time range and before the 5 s default, so each level was reached by its step; the windows a level serves are the same bucket-end windows today.
 
 Bit-equal at every level and on every series kind: `max_over_time`, `min_over_time`, `last_over_time`, `present_over_time`, `absent_over_time`, `timestamp` and the bare selector. `sum_over_time` and `avg_over_time` differed by at most 2.39e-13 (addition order).
 
@@ -45,9 +45,9 @@ Bit-equal at every level and on every series kind: `max_over_time`, `min_over_ti
 
 The bounds are the published figures of `docs/api.md` §3.6: twice the larger of the Python port's p99 (`measure/partB-ports/bounds.py`) and the earlier design measurement, rounded up. The test's bound for `avg_over_time` on gauges (0.0057 at 60 s, 0.0214 above) is wider than what corpus D gives, because each corpus D series has its own phase inside a scrape interval and no sample sits on a bucket edge. With every sample on an edge, jitter moves samples between buckets, and `avg_over_time`'s p99 measured 0.358 at 60 s, 0.595 at 720 s, 0.0557 at 7200 s and 0.0246 at 86400 s; output not kept.
 
-**A counter that stops or goes stale near a level's newest bucket.** `a_window_touching_raw_is_raw` (`crates/pulsus-read/tests/live_metrics_rollup.rs:1091`) cuts the 720 s level's run rows at `W` and compares `rate(m[1h])` at a 12 m step, step by step. For a counter that ends in a stale marker, steps just after `W` differed from raw by up to 3.75 % (at `W + 48 min`; the same step with the level uncut, 17.6 %). Counters that keep counting are unaffected. The owner accepted this figure; `docs/api.md` §3.6 states it. Output: `measure/results/live-metrics-rollup.txt`.
+**A counter that stops or goes stale near a level's newest bucket.** `a_window_touching_raw_is_raw` (`crates/pulsus-read/tests/live_metrics_rollup.rs:1100`) cuts the 720 s level's run rows at `W` and compares `rate(m[1h])` at a 12 m step, step by step. For a counter that ends in a stale marker, steps just after `W` differed from raw by up to 3.75 % (at `W + 48 min`; the same step with the level uncut, 17.6 %). Counters that keep counting are unaffected. The owner accepted this figure; `docs/api.md` §3.6 states it. Output: `measure/results/live-metrics-rollup.txt`.
 
-**Two other differences, both in `docs/api.md` §3.6.** From the 720 s level and coarser, a `rate` or `increase` window holding one sample of a counter has a value where raw has none, when a level row serves that sample: the row's start point and its sample are two points. A step between two samples more than 24 hours apart is counted by no level (the predecessor rule of `building.md` §3.1): a counter sampled at 23:59:30 and next at 00:00:00 a day later reads `increase(x[5d])` 0 from the 86400 s level at that midnight, where raw reads 45. `stale_and_nan_read_as_raw` (`crates/pulsus-read/tests/live_metrics_rollup.rs:1788`) asserts that counter's routed and raw values at every level exactly: absent at 60 s on both routes, 0 routed and absent raw at 720 s and 7200 s, 0 routed and 45 raw at 86400 s.
+**Two other differences, both in `docs/api.md` §3.6.** From the 720 s level and coarser, a `rate` or `increase` window holding one sample of a counter has a value where raw has none, when a level row serves that sample: the row's start point and its sample are two points. A step between two samples more than 24 hours apart is counted by no level (the predecessor rule of `building.md` §3.1): a counter sampled at 23:59:30 and next at 00:00:00 a day later reads `increase(x[5d])` 0 from the 86400 s level at that midnight, where raw reads 45. `stale_and_nan_read_as_raw` (`crates/pulsus-read/tests/live_metrics_rollup.rs:1797`) asserts that counter's routed and raw values at every level exactly: absent at 60 s on both routes, 0 routed and absent raw at 720 s and 7200 s, 0 routed and 45 raw at 86400 s.
 
 **Why the start point is one per row.** One start point per window, at `max(bucket start, lo) + 1`, against one per row: equal p99 and maximum on normal and sparse counters at 720 s and 7200 s; on stopping counters per row is closer, p99 0.0704 against 0.125 at 720 s and a 15 s scrape, 0.0634 against 0.118 at a 60 s scrape, equal at 7200 s (`measure/partB-ports/startpoints.txt`).
 
@@ -87,7 +87,7 @@ The 7200 s and 86400 s levels were not measured for gauges in the port; the 5 s 
 
 ## 2. Choosing the level
 
-The binary reads the levels at start and then every 60 s (`spawn_level_loop`, `LEVEL_REFRESH`, `crates/pulsus-read/src/metrics/rollup.rs:172`), and, clustered, the shard count; a failed read keeps the last good list, and nothing routes before the first success (`refresh_levels`, `crates/pulsus-read/src/metrics/rollup.rs:127`). Each level's width, switch point and the counter bucket count come from the comment the schema build wrote (`building.md` §2.2; `discovery_sql`, `crates/pulsus-read/src/metrics/rollup.rs:79`); the counter bucket count is the first row's:
+The binary reads the levels at start and then every 60 s (`spawn_level_loop`, `LEVEL_REFRESH`, `crates/pulsus-read/src/metrics/rollup.rs:173`), and, clustered, the shard count; a failed read keeps the last good list, and nothing routes before the first success (`refresh_levels`, `crates/pulsus-read/src/metrics/rollup.rs:128`). Each level's width, switch point and the counter bucket count come from the comment the schema build wrote (`building.md` §2.2; `discovery_sql`, `crates/pulsus-read/src/metrics/rollup.rs:80`); the counter bucket count is the first row's:
 
 ```sql
 SELECT name, toUInt32(extract(comment, 'rollup_res_ms=(\\d+)')) AS res_ms,
@@ -103,18 +103,18 @@ SELECT toUInt32(uniqExact(shard_num)) AS shards FROM system.clusters WHERE clust
 
 | # | rule |
 |---|---|
-| R1 | **Resolution.** For a range query, `res` is the largest level whose switch point is at most `end − start`; the smallest level's is 0. Defaults: levels 5, 60, 720, 7200 and 86400 s, switch points 1 h, 24 h, 7 d and 90 d (`grid`, `crates/pulsus-read/src/metrics/rollup.rs:220`) |
-| R2 | **Grid** (owner, 2026-10-26: never more than asked; owner, the simple grid). The effective step is `S = res × ⌈step / res⌉`, in `i128`; the evaluation times are `start + k × S` for `k ≥ 0` while at most `end`, `⌊(end − start) / S⌋ + 1` of them, never above the request's `⌊(end − start) / step⌋ + 1`: with a step at most the resolution, one more than the owner's table when the range is a whole number of steps; 24 h at 15 m gives 61. The grid is applied to a range query when levels are discovered, `S` and the last time fit `i64`, the count is at most 11,001 (`MAX_GRID_POINTS`, `crates/pulsus-read/src/metrics/rollup.rs:211`, the server's 11,000 intervals), and at least one selector routes on it (`any_routes`, `crates/pulsus-read/src/metrics/rollup.rs:252`, decided after planning on the candidate grid, before any fetch). Otherwise the query is planned and answered on its own `start + k × step`. Only the evaluation times move: `PlanParams` keeps the request's `start`, `end` and `step`, which `start()`, `end()`, `range()`, `step()` and `@ start()`/`@ end()` read, and carries the grid as `eval` (`EvalGrid`, `crates/pulsus-promql/src/plan.rs:73`), which the fetch window, the step loop, a pushed aggregate's grid, G2's step test, coverage and the `rollup_route` note read. When nothing routes on the grid, nothing routes on the request's either: both start at `start`, and `S` is a multiple of every width that divides the step. A selector reads a level only where `start` less its `offset` is a multiple of the width, so a `start` off the level's boundary reads a finer level for the same points (`query_inner`, `crates/pulsus-read/src/metrics/exec.rs:689`) |
+| R1 | **Resolution.** For a range query, `res` is the largest level whose switch point is at most `end − start`; below the smallest level's, the query keeps its own grid and reads raw. Defaults: levels 60, 720, 7200 and 86400 s, switch points 1 h, 24 h, 7 d and 90 d (`grid`, `crates/pulsus-read/src/metrics/rollup.rs:222`) |
+| R2 | **Grid** (owner, 2026-10-26: never more than asked; owner, the simple grid). The effective step is `S = res × ⌈step / res⌉`, in `i128`; the evaluation times are `start + k × S` for `k ≥ 0` while at most `end`, `⌊(end − start) / S⌋ + 1` of them, never above the request's `⌊(end − start) / step⌋ + 1`: with a step at most the resolution, one more than the owner's table when the range is a whole number of steps; 24 h at 15 m gives 61. The grid is applied to a range query when levels are discovered, `S` and the last time fit `i64`, the count is at most 11,001 (`MAX_GRID_POINTS`, `crates/pulsus-read/src/metrics/rollup.rs:212`, the server's 11,000 intervals), and at least one selector routes on it (`any_routes`, `crates/pulsus-read/src/metrics/rollup.rs:254`, decided after planning on the candidate grid, before any fetch). Otherwise the query is planned and answered on its own `start + k × step`. Only the evaluation times move: `PlanParams` keeps the request's `start`, `end` and `step`, which `start()`, `end()`, `range()`, `step()` and `@ start()`/`@ end()` read, and carries the grid as `eval` (`EvalGrid`, `crates/pulsus-promql/src/plan.rs:73`), which the fetch window, the step loop, a pushed aggregate's grid, G2's step test, coverage and the `rollup_route` note read. When nothing routes on the grid, nothing routes on the request's either: both start at `start`, and `S` is a multiple of every width that divides the step. A selector reads a level only where `start` less its `offset` is a multiple of the width, so a `start` off the level's boundary reads a finer level for the same points (`query_inner`, `crates/pulsus-read/src/metrics/exec.rs:689`) |
 | R2a | **Widening** (owner, 2026-10-27: prevent aliasing on a stretched grid). When the grid is used and `S` is above the step, every range shorter than `S` of a matrix selector or a subquery at the outer grid and without `@` is read as `S` (`PlanParams::widen_to`), so each point covers the time since the one before: `rate(x[5m])` on a 7-day panel at 5 m becomes `rate(x[2h])` and reads the 720 s level (`5 × 720 s ≤ 2 h`). Offsets still move the window; `@` selectors and `@` subqueries, the ranges inside a subquery, ranges at least `S`, raw-only and instant queries, and `S` equal to the step are unchanged; `range()` and `step()` resolve to the request's values first, and the resolved range then widens like a literal. `route` and `any_routes` see the widened range. The written range is kept on the selector and the subquery (`written_range_ms`), and the `rollup_grid` note adds `; range <written> widened to <S>` for each that widened (`widened_ranges`, `crates/pulsus-promql/src/plan.rs:82`). A widened range whose window, with the lookback and the offset, does not fit `i64` refuses the plan on the grid, and the query keeps the request's grid with no widening (`changed_grid`, `crates/pulsus-read/src/metrics/exec.rs:3712`) |
-| R3 | **Per selector**, the level read is the largest of width at most `res` that passes G1 to G3; none means raw (`route`, `crates/pulsus-read/src/metrics/rollup.rs:260`). The widths divide one another (`building.md` §1.2), so every grid time is a bucket end of every level at or below `res` |
-| R4 | **Any resolution.** The route is decided before the pushdown, so a routed selector is never pushed down (`routed_series`, `crates/pulsus-read/src/metrics/exec.rs:3735`). How a selector's series were found does not matter (`eligible`, `crates/pulsus-read/src/metrics/rollup.rs:309`): one the label cache could not answer first reads its series and labels by the statement the raw fallback hydrates by, under the same settings, then reads as §3; its native-histogram read is over the same series statement (`fetch_rollup`, `crates/pulsus-read/src/metrics/exec.rs:2185`) |
+| R3 | **Per selector**, the level read is the largest of width at most `res` that passes G1 to G3; none means raw (`route`, `crates/pulsus-read/src/metrics/rollup.rs:262`). The widths divide one another (`building.md` §1.2), so every grid time is a bucket end of every level at or below `res` |
+| R4 | **Any resolution.** The route is decided before the pushdown, so a routed selector is never pushed down (`routed_series`, `crates/pulsus-read/src/metrics/exec.rs:3735`). How a selector's series were found does not matter (`eligible`, `crates/pulsus-read/src/metrics/rollup.rs:311`): one the label cache could not answer first reads its series and labels by the statement the raw fallback hydrates by, under the same settings, then reads as §3; its native-histogram read is over the same series statement (`fetch_rollup`, `crates/pulsus-read/src/metrics/exec.rs:2185`) |
 | R5 | **Instant query** (`step = 0`): no grid change; `res` is the smallest level, and G2 applies to its time |
 | R6 | **Setup only.** The levels, switch points and counter bucket count are set when the schema is built, validated by `schema/schema.sh` and `pulsus_schema` with the same messages (`building.md` §1.2), and stored in each level table's comment; the binary reads them from there and has no setting for them |
 
-| guard | rule (`fits`, `crates/pulsus-read/src/metrics/rollup.rs:281`; `excluded`, `crates/pulsus-read/src/metrics/rollup.rs:298`) |
+| guard | rule (`fits`, `crates/pulsus-read/src/metrics/rollup.rs:283`; `excluded`, `crates/pulsus-read/src/metrics/rollup.rs:300`) |
 |---|---|
 | G1 range | a range function's range is a whole multiple of the width and at least one width, `counter_buckets` widths for `rate` and `increase`; otherwise a finer level that meets it, else raw. On a 7-day panel at step 5 m with `start` on a 2 h boundary, `rate(x[5m])` is widened to `rate(x[2h])` (R2a) and reads the 720 s level: 2 h is ten 720 s buckets, which meets the minimum of five, but only one 7200 s bucket |
-| G2 time | the window's end, the grid time minus `offset` (or the `@` time minus `offset`), is a bucket end of the level; otherwise a finer level whose width divides it, else raw. `x offset 90s` on a 7-day query reads the 5 s level |
+| G2 time | the window's end, the grid time minus `offset` (or the `@` time minus `offset`), is a bucket end of the level; otherwise a finer level whose width divides it, else raw. `x offset 90s` on a 7-day query reads raw at the default levels: its window ends fall 30 s past a minute |
 | G3 kind | `rollup_use` is set (§1); not in a subquery, `anchored` or `smoothed`, `info()`'s selector, or under a histogram-statistics function; the selector names its metric and carries no `__name__` matcher beside the name |
 
 The published distances (§1.1, `docs/api.md` §3.6) were measured at `counter_buckets` = 5 and hold for that value.
@@ -125,11 +125,11 @@ Per fingerprint chunk (`rollup_chunk`, `crates/pulsus-read/src/metrics/exec.rs:2
 
 1. For the chosen level, then each finer level from coarsest to finest: one level fetch over the hull of `todo`. Its coverage `C` is computed from its own run rows; the data rows with `t_end` inside `C ∩ todo` are kept; `C` is taken out of `todo`.
 2. One raw read over the hull of what remains, with the raw route's statement (`sample_fetch`, `crates/pulsus-read/src/metrics/sample_sql.rs:85`); samples outside what remains are dropped. For a counter at a level under 720 s, each remaining interval is first widened by the range on both sides, inside the window, so the overlay holds every raw sample a touching window needs (`let read = if over`, `crates/pulsus-read/src/metrics/exec.rs:2381`).
-3. Per series, every kept level row and raw sample in time order, a level row at its `t_end`, assembled into points (§1, `assemble`, `crates/pulsus-read/src/metrics/rollup.rs:507`).
+3. Per series, every kept level row and raw sample in time order, a level row at its `t_end`, assembled into points (§1, `assemble`, `crates/pulsus-read/src/metrics/rollup.rs:509`).
 
 The selector's native-histogram samples are read raw over the whole window beside the chunks (`build_hist_chunk_sqls`, `crates/pulsus-read/src/metrics/exec.rs:4034`) and merged as the raw route merges them. Every row a level fetch returns, run rows included, is charged to the query's sample budget as it drains.
 
-The level fetch (`level_fetch`, `crates/pulsus-read/src/metrics/rollup.rs:315`), `{shard}` being `_shard_num` clustered and `toUInt32(1)` on one node, `{table}` the level's table with the distributed suffix when clustered:
+The level fetch (`level_fetch`, `crates/pulsus-read/src/metrics/rollup.rs:317`), `{shard}` being `_shard_num` clustered and `toUInt32(1)` on one node, `{table}` the level's table with the distributed suffix when clustered:
 
 ```sql
 SELECT {shard} AS shard, kind, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags
@@ -142,21 +142,20 @@ ORDER BY kind, fingerprint, t_end
 | rule | |
 |---|---|
 | why one statement | a distributed read answers each shard from one replica, and a run row is in the same part as its data (`building.md` §2.3). So a run row in the answer proves that replica returned that run's data. Two statements could be answered by two replicas, and coverage from one could admit data the other lacks |
-| coverage `C` | for each shard of the discovered count, the union of its returned run rows' `(t_last, t_end]`, intersected over shards. A shard that returned no run row covers nothing (`coverage`, `crates/pulsus-read/src/metrics/rollup.rs:374`) |
+| coverage `C` | for each shard of the discovered count, the union of its returned run rows' `(t_last, t_end]`, intersected over shards. A shard that returned no run row covers nothing (`coverage`, `crates/pulsus-read/src/metrics/rollup.rs:376`) |
 | with the levels built in order | `(lo, W_L]` from `L`, `(W_L, W_K]` from each finer level `K`, and the newest part from raw, so every refresh ends on the newest raw sample |
 | history before a level's first run, and any hole | read from finer levels or raw |
 
 The property this rests on was measured on the development cluster while an earlier rollup design was prototyped: with fetches stopped on one replica of a shard, a read through the distributed table on that replica returned neither the rows nor the coverage row of a block inserted on its peer. That output was not kept. `a_run_row_is_read_with_its_data` (`crates/pulsus-read/tests/live_metrics_rollup_cluster.rs:177`) checks it for this read in CI's cluster job.
 
-How much of a window its level does not serve, default set, levels up to date (`building.md` §3.3):
+How much of a window its level does not serve, default set, levels up to date (`building.md` §3.3); a range under 1 h reads raw whole:
 
 | query range | level | after its watermark, at most | of which raw, at most | share of the window |
 |---|---|---:|---:|---:|
-| 30 min | 5 s | 270 s | 270 s | 15.0 % |
-| 1 h | 60 s | 300 s | 270 s | 8.3 % |
-| 24 h | 720 s | 1,020 s | 270 s | 1.2 % |
-| 7 d | 7200 s | 7,560 s | 270 s | 1.3 % |
-| 90 d | 86400 s | 86,820 s | 270 s | 1.1 % |
+| 1 h | 60 s | 270 s | 270 s | 7.5 % |
+| 24 h | 720 s | 960 s | 270 s | 1.1 % |
+| 7 d | 7200 s | 7,500 s | 270 s | 1.2 % |
+| 90 d | 86400 s | 86,760 s | 270 s | 1.1 % |
 
 ### 3.1 Rows read
 
@@ -179,7 +178,7 @@ The routed reads include the finer levels and raw after each level's watermark.
 
 | Range (end − start) | Resolution | Points per series |
 |---|---|---:|
-| 5 min / 15 min / 30 min | 5 s | 60 / 180 / 360 |
+| 5 min / 15 min / 30 min | raw | at the step asked |
 | 1 h / 3 h / 6 h / 12 h | 60 s | 60 / 180 / 360 / 720 |
 | 24 h / 2 days | 720 s | 120 / 240 |
 | 7 days / 30 days | 7200 s | 84 / 360 |
@@ -187,7 +186,7 @@ The routed reads include the finer levels and raw after each level's watermark.
 
 ### 4.2 From a running server
 
-`GET /api/v1/status/runtimeinfo` carries `rollupLevels`: the discovered levels in duration form, smallest first (`rollup_levels`, `crates/pulsus-server/src/prom_api/encode.rs:932`; `status_runtimeinfo`, `crates/pulsus-server/src/prom_api/handlers.rs:753`). `["5s","1m","12m","2h","1d"]` for the default; `[]` when none are built and before the first discovery.
+`GET /api/v1/status/runtimeinfo` carries `rollupLevels`: the discovered levels in duration form, smallest first (`rollup_levels`, `crates/pulsus-server/src/prom_api/encode.rs:932`; `status_runtimeinfo`, `crates/pulsus-server/src/prom_api/handlers.rs:753`). `["1m","12m","2h","1d"]` for the default; `[]` when none are built and before the first discovery.
 
 | candidate | verdict |
 |---|---|
@@ -207,7 +206,7 @@ With `X-Pulsus-Explain: 1`, a range query whose grid follows its range has, firs
 | `hist_sample_fetch` | the selector's native-histogram read, when it has one |
 | `rollup_piece`, one per interval served, in time order, from the first chunk | `<table>.<column> served (a, b]`, `raw (a, b]`, or `<table> served nothing`, each with its statement |
 
-`exactness` is `"rollup"` when a kept level row served the selector in some chunk (for `Max`, `Min`, `Sum` and `Avg`, a row with `count > 0`) and, for a counter under 720 s, some step's window touches no interval read from raw (`level_window_exists`, `crates/pulsus-read/src/metrics/rollup.rs:659`); otherwise `"raw-exact"` (`exactness: if e.rollup`, `crates/pulsus-server/src/prom_api/encode.rs:279`).
+`exactness` is `"rollup"` when a kept level row served the selector in some chunk (for `Max`, `Min`, `Sum` and `Avg`, a row with `count > 0`) and, for a counter under 720 s, some step's window touches no interval read from raw (`level_window_exists`, `crates/pulsus-read/src/metrics/rollup.rs:661`); otherwise `"raw-exact"` (`exactness: if e.rollup`, `crates/pulsus-server/src/prom_api/encode.rs:279`).
 
 ## 5. What this evidence cannot see
 

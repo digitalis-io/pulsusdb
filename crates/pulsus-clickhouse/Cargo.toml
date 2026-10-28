@@ -13,6 +13,7 @@ thiserror.workspace = true
 futures.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+rustls-pemfile.workspace = true
 hyper-rustls.workspace = true
 hyper-util.workspace = true
 tracing.workspace = true

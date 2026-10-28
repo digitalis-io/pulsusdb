@@ -22,7 +22,8 @@ use super::sample_sql::render_fingerprint_list;
 use crate::logql::escape::ch_string;
 
 /// One rollup level: its bucket width, the table a read names, and the
-/// query range from which it is the resolution (0 for the first level).
+/// query range from which it is the resolution; a range below the first
+/// level's reads raw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Level {
     pub res_ms: i64,
@@ -214,7 +215,8 @@ pub const MAX_GRID_POINTS: i128 = 11_001;
 /// the largest level whose switch point is at most `end − start`, and the
 /// evaluation grid `start + k × S` up to `end`, `S = res × ⌈step / res⌉`:
 /// never more points than asked. `None` for an instant query
-/// (`step == 0`), no levels, an `S` or a time outside `i64`, or more than
+/// (`step == 0`), no levels, a range below the first level's switch point
+/// (issue #746), an `S` or a time outside `i64`, or more than
 /// [`MAX_GRID_POINTS`] points: the query keeps its own grid. The caller
 /// sets the grid only when [`any_routes`] on it.
 pub fn grid(p: &MetricQueryParams, levels: &Levels) -> Option<(i64, EvalGrid)> {
@@ -746,8 +748,9 @@ mod tests {
 
     const DAY: i64 = 86_400_000;
 
-    /// The owner's table (2026-10-26): the default levels and the query
-    /// range from which each is the resolution.
+    /// The owner's table of 2026-10-26: five levels, 5 s first, and the
+    /// query range from which each is the resolution; the grid cases below
+    /// were written for it.
     fn owners() -> Levels {
         let rows: [(i64, u64); 5] = [
             (5, 0),
@@ -874,6 +877,49 @@ mod tests {
         // An instant query (`step == 0`) and no levels keep their own grid.
         assert_eq!(grid(&query(BASE, BASE, 0), &lv), None);
         assert_eq!(grid(&query(BASE, BASE + DAY, MIN), &levels(&[])), None);
+    }
+
+    /// **R1 (issue #746): a range below the first level's switch point
+    /// keeps its own grid and reads raw.** The default levels, 60 s first,
+    /// each the resolution from its own switch point, the first included
+    /// (owner, 2026-10-28): under 1 h no grid, from 1 h the 60 s level.
+    #[test]
+    fn a_range_below_the_first_switch_point_keeps_its_grid() {
+        let lv = Levels {
+            levels: pulsus_schema::DEFAULT_ROLLUP_LEVELS
+                .iter()
+                .zip(pulsus_schema::DEFAULT_ROLLUP_RANGES)
+                .map(|(&s, &from)| Level {
+                    res_ms: i64::from(s) * 1000,
+                    table: format!("metric_samples_{s}s"),
+                    from_ms: u64::from(from) * 1000,
+                })
+                .collect(),
+            shards: 1,
+            counter_buckets: 5,
+        };
+        assert_eq!(lv.levels.len(), 4, "{lv:?}");
+        let start = BASE + 1;
+        for range in [0, 5 * MIN, 15 * MIN, 30 * MIN, HOUR - 1] {
+            assert_eq!(
+                grid(&query(start, start + range, 1_000), &lv),
+                None,
+                "range {range} ms reads raw"
+            );
+        }
+        for (range, res) in [
+            (HOUR, 60_000),
+            (DAY - 1, 60_000),
+            (DAY, 720_000),
+            (7 * DAY, 7_200_000),
+            (90 * DAY, 86_400_000),
+        ] {
+            assert_eq!(
+                grid(&query(start, start + range, 1_000), &lv).map(|g| g.0),
+                Some(res),
+                "range {range} ms"
+            );
+        }
     }
 
     /// **T1b (issue #18 follow-up, plan r16): the grid does not overflow**,

@@ -56,22 +56,31 @@ static DB_T10: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read
 static DB_T14: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t14");
 static DB_W1: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_w1");
 static DB_W2: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_w2");
+static DB_R1: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_r1");
 
-/// The default levels and their switch points (the owner's table,
-/// 2026-10-26).
+/// The default levels and their switch points: 60 s first, the resolution
+/// from 1 h; a shorter range reads raw (owner, 2026-10-28).
 const DEFAULTS: (&[u32], &[u32]) = (
     pulsus_schema::DEFAULT_ROLLUP_LEVELS,
     pulsus_schema::DEFAULT_ROLLUP_RANGES,
 );
 
-/// Part B's levels, 60 s first, with the switch points that make each the
-/// resolution from 0, 24 h, 7 days and 90 days.
-const PART_B: (&[u32], &[u32]) = (&[60, 720, 7200, 86400], &[86400, 604800, 7776000]);
+/// The five levels most of these cases were written for, 5 s first, with
+/// the switch points that make each the resolution from 5 s, 1 h, 24 h, 7
+/// days and 90 days.
+const FIVE: (&[u32], &[u32]) = (
+    &[5, 60, 720, 7200, 86400],
+    &[5, 3600, 86400, 604800, 7776000],
+);
 
-/// The shortest query range that selects the default level `secs`.
+/// Part B's levels, 60 s first, with the switch points that make each the
+/// resolution from 60 s, 24 h, 7 days and 90 days.
+const PART_B: (&[u32], &[u32]) = (&[60, 720, 7200, 86400], &[60, 86400, 604800, 7776000]);
+
+/// The shortest query range that selects the level `secs` of [`FIVE`].
 fn band(secs: i64) -> i64 {
     match secs {
-        5 => 0,
+        5 => 5_000,
         60 => HOUR,
         720 => DAY,
         7200 => 7 * DAY,
@@ -839,11 +848,11 @@ async fn each_served_function_is_within_its_distance() {
     skip_unless_live!();
     let day0 = today() - 8 * DAY;
     let end = day0 + 8 * DAY;
-    let built = corpus_d(DB_B2.name(), DEFAULTS, day0, 0..8).await;
+    let built = corpus_d(DB_B2.name(), FIVE, day0, 0..8).await;
     let levels = built.slot.get().expect("the levels are read");
     assert_eq!(levels.levels.len(), 5, "{levels:?}");
     let e_land = corpus_e(DB_B2E.name(), end);
-    let built_e = build(DB_B2E.name(), DEFAULTS, &e_land, end - 2 * HOUR, end, &[]).await;
+    let built_e = build(DB_B2E.name(), FIVE, &e_land, end - 2 * HOUR, end, &[]).await;
 
     let mut failures = Vec::new();
     let mut report = Vec::new();
@@ -929,7 +938,7 @@ async fn a_window_reads_the_finer_levels_and_raw_after_its_level() {
     skip_unless_live!();
     let day0 = today() - 8 * DAY;
     let end = day0 + 8 * DAY;
-    let built = corpus_d(DB_B3.name(), DEFAULTS, day0, 6..8).await;
+    let built = corpus_d(DB_B3.name(), FIVE, day0, 6..8).await;
     let b = end - 3 * HOUR;
     for r in [86_400, 7_200, 720] {
         cut_runs(&built.admin, built.db(), r, b, end + DAY).await;
@@ -1147,7 +1156,7 @@ async fn a_window_touching_raw_is_raw() {
         corpus_d_day(db, day0, 7),
     ];
     land.extend(b4_land(db, day0, w, &floats, &hists));
-    let built = build(db, DEFAULTS, &land, day - DAY, end, &[]).await;
+    let built = build(db, FIVE, &land, day - DAY, end, &[]).await;
     for r in [60, 5] {
         cut_runs(&built.admin, built.db(), r, w, end + DAY).await;
     }
@@ -1382,7 +1391,7 @@ async fn a_hole_in_the_middle_keeps_the_counter() {
     skip_unless_live!();
     let day0 = today() - 8 * DAY;
     let end = day0 + 8 * DAY;
-    let built = corpus_d(DB_B5B.name(), DEFAULTS, day0, 6..8).await;
+    let built = corpus_d(DB_B5B.name(), FIVE, day0, 6..8).await;
     let hole = end - 14 * HOUR;
     cut_runs(&built.admin, built.db(), 720, hole, hole + HOUR).await;
 
@@ -1503,7 +1512,7 @@ async fn the_unrouted_classes_read_raw() {
             ));
         }
     }
-    let built = build(db, DEFAULTS, &land, lo, end, &[]).await;
+    let built = build(db, FIVE, &land, lo, end, &[]).await;
     let p = range(end - 6 * HOUR, end, 12 * MIN);
     let routed = built.engine(true, None).await;
     let raw = built.engine(false, None).await;
@@ -1601,7 +1610,7 @@ async fn the_unrouted_classes_read_raw() {
 }
 
 /// **B7 (issue #18 part B): a level added later is used.** A database
-/// built with the levels 60, 300, 7200 and 86400 and the ranges 3600,
+/// built with the levels 60, 300, 7200 and 86400 and the ranges 60, 3600,
 /// 86400 and 7776000: `max_over_time` over 5 m on a 6-hour range reads
 /// `metric_samples_300s`.
 #[tokio::test(flavor = "multi_thread")]
@@ -1611,7 +1620,7 @@ async fn a_level_added_later_is_used() {
     let end = day0 + 8 * DAY;
     let built = corpus_d(
         DB_B7.name(),
-        (&[60, 300, 7200, 86400], &[3600, 86400, 7776000]),
+        (&[60, 300, 7200, 86400], &[60, 3600, 86400, 7776000]),
         day0,
         7..8,
     )
@@ -2058,7 +2067,7 @@ fn vector_or_matrix(x: &Answer) -> BTreeMap<(String, i64), String> {
 async fn a_week_reads_two_hour_rows() {
     skip_unless_live!();
     let day0 = today() - 8 * DAY;
-    let built = corpus_d(DB_T4.name(), DEFAULTS, day0, 0..8).await;
+    let built = corpus_d(DB_T4.name(), FIVE, day0, 0..8).await;
     let db = built.db().to_string();
     let mut cfg = cache_config(&db);
     cfg.window_ms = DAY;
@@ -2206,7 +2215,7 @@ fn per_series(x: &Answer) -> BTreeMap<String, Vec<i64>> {
 async fn a_raw_only_query_keeps_its_grid() {
     skip_unless_live!();
     let day0 = today() - 8 * DAY;
-    let built = corpus_d(DB_T9.name(), DEFAULTS, day0, 0..8).await;
+    let built = corpus_d(DB_T9.name(), FIVE, day0, 0..8).await;
     assert!(built.slot.get().is_some_and(|l| l.levels.len() == 5));
     let start = day0 + 10 * MIN + 7_123;
     let p = range(start, start + 7 * DAY, 5 * MIN);
@@ -2238,13 +2247,13 @@ async fn a_raw_only_query_keeps_its_grid() {
 /// 13 times; each time less 1 s is a minute boundary, so it reads
 /// `metric_samples_60s`, within the 60 s bound. The instant
 /// `rate(c_normal[5m])` at `day0 + 7 d` reads the 5 s level. The range
-/// query with `start = end` gets a one-point grid, noted, and reads the
-/// 5 s level at `start`.
+/// query with `start = end` is shorter than the 5 s level's switch point,
+/// so it keeps its own one-point grid and reads raw (issue #746).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_grid_from_start_routes_where_the_times_fit() {
     skip_unless_live!();
     let day0 = today() - 8 * DAY;
-    let built = corpus_d(DB_T10.name(), DEFAULTS, day0, 6..8).await;
+    let built = corpus_d(DB_T10.name(), FIVE, day0, 6..8).await;
     let t = day0 + 7 * DAY;
     let routed = built.engine(true, None).await;
     let raw = built.engine(false, None).await;
@@ -2308,16 +2317,14 @@ async fn a_grid_from_start_routes_where_the_times_fit() {
     let equal = range(t + 1_000, t + 1_000, 5 * MIN);
     let a = ask(&routed, &no_tenant(), query, &equal).await;
     let b = ask(&raw, &no_tenant(), query, &equal).await;
-    let grid = a.stages("rollup_grid");
     assert!(
-        grid.len() == 1 && grid[0].contains(", 1 points, "),
-        "equal bounds: a one-point grid {grid:?}"
+        a.stages("rollup_grid").is_empty(),
+        "equal bounds: no grid change {:?}",
+        a.stages("rollup_grid")
     );
     assert!(
-        a.stages("rollup_route")
-            .iter()
-            .any(|n| n.starts_with("metric_samples_5s,")),
-        "equal bounds: {:?}",
+        a.stages("rollup_route").is_empty(),
+        "equal bounds: raw {:?}",
         a.stages("rollup_route")
     );
     let series = per_series(&a);
@@ -2325,7 +2332,64 @@ async fn a_grid_from_start_routes_where_the_times_fit() {
     for (l, ts) in &series {
         assert_eq!(ts, &vec![t + 1_000], "equal bounds {l}: one point at start");
     }
-    close("equal bounds", &a, &b, 1e-12);
+    assert_eq!(a.cells(), b.cells(), "equal bounds: bit-equal to no levels");
+    built.finish().await;
+}
+
+/// **R1 (issue #746): a range below the first level's switch point reads
+/// raw.** Corpus D over two days at the default levels, 60 s first from
+/// 1 h. `rate(c_normal[5m])` at step 60 s from a minute boundary: over
+/// 15 minutes, and over 1 h less 1 ms, the query keeps its own grid, no
+/// selector routes, and every value is bit-equal to the engine without
+/// levels; over exactly 1 h the resolution is 60 s and the selector reads
+/// `metric_samples_60s`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_range_below_the_first_level_reads_raw() {
+    skip_unless_live!();
+    let day0 = today() - 8 * DAY;
+    let built = corpus_d(DB_R1.name(), DEFAULTS, day0, 6..8).await;
+    let found = built.slot.get().expect("the levels");
+    let first = &found.levels[0];
+    assert_eq!(
+        (first.res_ms, first.from_ms, found.levels.len()),
+        (60_000, 3_600_000, 4),
+        "the first default level and its switch point: {found:?}"
+    );
+    let t = day0 + 7 * DAY;
+    let routed = built.engine(true, None).await;
+    let raw = built.engine(false, None).await;
+    let query = "rate(c_normal[5m])";
+    for span in [15 * MIN, HOUR - 1] {
+        let p = range(t, t + span, MIN);
+        let a = ask(&routed, &no_tenant(), query, &p).await;
+        let b = ask(&raw, &no_tenant(), query, &p).await;
+        assert!(
+            a.stages("rollup_grid").is_empty(),
+            "{span} ms: no grid change {:?}",
+            a.stages("rollup_grid")
+        );
+        assert!(
+            a.stages("rollup_route").is_empty(),
+            "{span} ms: raw {:?}",
+            a.stages("rollup_route")
+        );
+        assert_eq!(per_series(&a).len(), 100, "{span} ms: the series");
+        assert_eq!(a.cells(), b.cells(), "{span} ms: bit-equal to no levels");
+    }
+    let p = range(t, t + HOUR, MIN);
+    let a = ask(&routed, &no_tenant(), query, &p).await;
+    let grid = a.stages("rollup_grid");
+    assert!(
+        grid.len() == 1 && grid[0].starts_with("resolution 1m, "),
+        "1 h: the 60 s resolution {grid:?}"
+    );
+    assert!(
+        a.stages("rollup_route")
+            .iter()
+            .any(|n| n.starts_with("metric_samples_60s,")),
+        "1 h: reads the first level {:?}",
+        a.stages("rollup_route")
+    );
     built.finish().await;
 }
 
@@ -2344,7 +2408,7 @@ async fn a_grid_from_start_routes_where_the_times_fit() {
 async fn a_pushed_aggregate_beside_a_routed_selector() {
     skip_unless_live!();
     let day0 = today() - 8 * DAY;
-    let built = corpus_d(DB_T14.name(), DEFAULTS, day0, 0..8).await;
+    let built = corpus_d(DB_T14.name(), FIVE, day0, 0..8).await;
     let end = day0 + 8 * DAY;
     let start = end - 7 * DAY + 1;
     let query = r#"count(g) + scalar(max_over_time(g{s="160"}[1h] @ end()))"#;
@@ -2421,7 +2485,7 @@ fn widened(x: &Answer) -> Vec<String> {
 async fn a_short_range_is_widened_to_the_step() {
     skip_unless_live!();
     let day0 = today() - 8 * DAY;
-    let built = corpus_d(DB_W1.name(), DEFAULTS, day0, 0..8).await;
+    let built = corpus_d(DB_W1.name(), FIVE, day0, 0..8).await;
     let end = day0 + 8 * DAY - 2 * HOUR;
     let start = end - 7 * DAY;
     let asked = range(start, end, 5 * MIN);
@@ -2485,7 +2549,7 @@ async fn a_short_range_is_widened_to_the_step() {
 async fn no_widening_when_the_step_is_kept() {
     skip_unless_live!();
     let day0 = today() - 8 * DAY;
-    let built = corpus_d(DB_W2.name(), DEFAULTS, day0, 0..8).await;
+    let built = corpus_d(DB_W2.name(), FIVE, day0, 0..8).await;
     let end = day0 + 8 * DAY - 2 * HOUR;
     let p = range(end - 7 * DAY, end, 2 * HOUR);
     let query = "max_over_time(g[1m])";
@@ -2515,7 +2579,7 @@ async fn a_level_older_than_raw_answers() {
         .expect("connect (bootstrap)");
     let ctx = RenderCtx {
         rollup_levels: vec![60, 720],
-        rollup_ranges: vec![86400],
+        rollup_ranges: vec![60, 86400],
         rollup_retention_days: vec![2, 10],
         ..RenderCtx::for_tests(db, 2)
     };
