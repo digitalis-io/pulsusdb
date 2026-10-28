@@ -170,14 +170,18 @@ fn is_remote_url(url: &str) -> bool {
     let Some(authority) = uri.authority() else {
         return false;
     };
-    // The whole authority is a W1 host and, when given, a port from 1 to
-    // 65535: nothing else (a user is refused above).
-    let port_ok = match authority.as_str().split_once(':') {
-        None => true,
-        Some((_, port)) => whole(port, 5, 1, 65_535).is_some(),
+    // Any parsed host, bracketed IPv6 included; a port, when given, from 1
+    // to 65535 (a user is refused above).
+    let host = authority.host();
+    let port_ok = match authority.as_str().strip_prefix(host) {
+        Some("") => true,
+        Some(rest) => rest
+            .strip_prefix(':')
+            .is_some_and(|port| whole(port, 5, 1, 65_535).is_some()),
+        None => false,
     };
     matches!(uri.scheme_str(), Some("http" | "https"))
-        && is_host(&authority.host().to_ascii_lowercase())
+        && !host.is_empty()
         && port_ok
         && uri.path().ends_with('/')
 }
