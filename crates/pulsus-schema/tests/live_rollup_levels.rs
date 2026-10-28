@@ -1572,3 +1572,120 @@ async fn the_discovery_reads_the_switch_points() {
     assert_eq!(levels.counter_buckets, 5, "the counter bucket count");
     drop_db(&client, db).await;
 }
+
+static DB_KEPT: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_levels_kept");
+
+/// **B3 (issue #743 part B): a level and its series outlive raw.** Levels
+/// `60, 720`, `R` = 2, the levels kept `2` and `10` days. For the UTC days
+/// `T−5` and `T−12`: raw samples, every bucket of both levels with one run
+/// row for the day, and four series in `metric_series` and
+/// `metric_labels`. After `OPTIMIZE … FINAL`, only the 720 s level and the
+/// catalogue keep `T−5`, and nothing keeps `T−12`.
+#[tokio::test]
+async fn a_level_and_its_series_outlive_raw() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = DB_KEPT.name();
+    let ctx = RenderCtx {
+        rollup_levels: vec![60, 720],
+        rollup_ranges: vec![86400],
+        rollup_retention_days: vec![2, 10],
+        ..RenderCtx::for_tests(db, 2)
+    };
+    fresh(&client, &ctx).await;
+    let t = now_ms(&client).await / DAY;
+    let day_of = |d0: i64| format!("toDate(fromUnixTimestamp64Milli(toInt64({d0})), 'UTC')");
+    for day in [t - 5, t - 12] {
+        let d0 = day * DAY;
+        exec(
+            &client,
+            &format!(
+                "INSERT INTO {db}.metric_samples (org_id, fingerprint, unix_milli, value) \
+                 SELECT '', toUInt128(1 + number % 4), {d0} + 1000 + intDiv(number, 4) * 60000, \
+                        toFloat64(number) FROM numbers(240)"
+            ),
+        )
+        .await;
+        for r in [60, 720] {
+            let (data, _) = covered(r, d0, d0 + DAY);
+            insert_level(&client, db, r, &data, &[(d0, d0 + DAY)]).await;
+        }
+        exec(
+            &client,
+            &format!(
+                "INSERT INTO {db}.metric_series (org_id, day, fingerprint, metric_name, hours) \
+                 SELECT '', {}, toUInt128(number + 1), 'm', toUInt32(16777215) FROM numbers(4)",
+                day_of(d0)
+            ),
+        )
+        .await;
+        exec(
+            &client,
+            &format!(
+                "INSERT INTO {db}.metric_labels (org_id, metric_name, fingerprint, labels, first_seen, last_seen) \
+                 SELECT '', 'm', toUInt128(number + 1), concat('{{\"s\":\"', toString(number + 1), '\"}}'), \
+                        toInt64({d0} + 1000), toInt64({d0} + 1000) FROM numbers(4)"
+            ),
+        )
+        .await;
+    }
+    for table in [
+        "metric_samples",
+        "metric_samples_60s",
+        "metric_samples_720s",
+        "metric_series",
+        "metric_labels",
+    ] {
+        exec(&client, &format!("OPTIMIZE TABLE {db}.{table} FINAL")).await;
+    }
+
+    // (table, the predicate of day `day`, the rows kept of T−5 and T−12)
+    type DayCheck = (&'static str, fn(i64) -> String, [i64; 2]);
+    let checks: [DayCheck; 5] = [
+        (
+            "metric_samples",
+            |day| format!("intDiv(unix_milli, {DAY}) = {day}"),
+            [0, 0],
+        ),
+        (
+            "metric_samples_60s",
+            |day| format!("intDiv(t_end - 1, {DAY}) = {day}"),
+            [0, 0],
+        ),
+        (
+            "metric_samples_720s",
+            |day| format!("intDiv(t_end - 1, {DAY}) = {day}"),
+            [4 * 120 + 1, 0],
+        ),
+        (
+            "metric_series",
+            |day| {
+                format!(
+                    "day = toDate(fromUnixTimestamp64Milli(toInt64({})), 'UTC')",
+                    day * DAY
+                )
+            },
+            [4, 0],
+        ),
+        (
+            "metric_labels",
+            |day| format!("intDiv(last_seen, {DAY}) = {day}"),
+            [4, 0],
+        ),
+    ];
+    for (table, predicate, want) in checks {
+        for (day, want) in [t - 5, t - 12].into_iter().zip(want) {
+            let got = int(
+                &client,
+                &format!(
+                    "SELECT toInt64(count()) AS v FROM {db}.{table} WHERE {}",
+                    predicate(day)
+                ),
+            )
+            .await;
+            assert_eq!(got, want, "{table}: the rows of day T−{}", t - day);
+        }
+    }
+    drop_db(&client, db).await;
+}

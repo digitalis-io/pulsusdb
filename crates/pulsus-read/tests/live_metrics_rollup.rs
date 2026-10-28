@@ -2496,3 +2496,114 @@ async fn no_widening_when_the_step_is_kept() {
     assert_eq!(a.cells(), b.cells(), "{query}: bit-equal to no levels");
     built.finish().await;
 }
+
+static DB_KEPT: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_kept");
+
+/// **B4 (issue #743 part B): a level older than raw answers.** Levels `60,
+/// 720`, `R` = 2, the levels kept `2` and `10` days. Corpus D's series
+/// registered for the UTC day `d0`, five days back, and hand-made 720 s
+/// rows for its `g` series over that day with one run row, all after
+/// `OPTIMIZE … FINAL`. `avg_over_time(g[12m])` over the day at step 12 m
+/// reads the 720 s level and answers each row's `sum ÷ count`; the series
+/// resolve by SQL, the label cache's window being one day.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_level_older_than_raw_answers() {
+    skip_unless_live!();
+    let db = DB_KEPT.name();
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let ctx = RenderCtx {
+        rollup_levels: vec![60, 720],
+        rollup_ranges: vec![86400],
+        rollup_retention_days: vec![2, 10],
+        ..RenderCtx::for_tests(db, 2)
+    };
+    fresh(&bootstrap, &ctx).await;
+    let admin = ChClient::new(test_config(db)).await.expect("connect");
+    let d0 = today() - 5 * DAY;
+    exec(&admin, &corpus_d_series(db)).await;
+    exec(&admin, &corpus_d_registrations(db, d0, 24)).await;
+    exec(
+        &admin,
+        &format!(
+            "INSERT INTO {db}.metric_samples_720s (kind, org_id, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags, built_at) \
+             SELECT 0, '', fp, {d0} + toInt64(j.number + 1) * 720000, {d0} + toInt64(j.number + 1) * 720000 - 1000, \
+                    toFloat64(s), toFloat64(s), toFloat64(s), toFloat64(s * 1000 + j.number + 1), \
+                    toUInt32(1 + (s + j.number + 1) % 4), 0, 0, 0 \
+             FROM {db}.rd_series, numbers(120) AS j WHERE metric = 'g'"
+        ),
+    )
+    .await;
+    exec(
+        &admin,
+        &format!(
+            "INSERT INTO {db}.metric_samples_720s (kind, org_id, fingerprint, t_end, t_last, built_at) \
+             VALUES (1, '', 0, {}, {d0}, 0)",
+            d0 + DAY
+        ),
+    )
+    .await;
+    for table in ["metric_samples_720s", "metric_series", "metric_labels"] {
+        exec(&admin, &format!("OPTIMIZE TABLE {db}.{table} FINAL")).await;
+    }
+
+    let mut cfg = cache_config(db);
+    cfg.window_ms = DAY;
+    let cache = Arc::new(LabelCache::new(
+        ChClient::new(test_config(db)).await.expect("connect"),
+        cfg,
+    ));
+    cache.refresh().await.expect("refresh");
+    let slot = Arc::new(LevelSlot::new());
+    refresh_levels(&slot, &admin, db, &ctx.dist_suffix, None)
+        .await
+        .expect("level discovery");
+    let engine = MetricsEngine::new(
+        ChClient::new(test_config(db)).await.expect("connect"),
+        cache,
+        engine_config(db, false),
+    )
+    .with_rollup_levels(slot);
+    let a = ask(
+        &engine,
+        &no_tenant(),
+        "avg_over_time(g[12m])",
+        &range(d0, d0 + DAY, 12 * MIN),
+    )
+    .await;
+
+    let mut want = BTreeMap::new();
+    for s in 160..260i64 {
+        for j in 1..=120i64 {
+            let labels = vec![("s".to_string(), s.to_string())];
+            let v = (s * 1000 + j) as f64 / (1 + (s + j) % 4) as f64;
+            want.insert(
+                (format!("{labels:?}"), d0 + j * 720_000),
+                format!("{:016x}", v.to_bits()),
+            );
+        }
+    }
+    assert_eq!(want.len(), 12_000);
+    assert_eq!(
+        a.cells(),
+        want,
+        "each 720 s row's sum ÷ count, no point at d0"
+    );
+    let routes = a.stages("rollup_route");
+    assert!(
+        routes.iter().any(|n| n.starts_with("metric_samples_720s,")),
+        "the 720 s level answers: {routes:?}"
+    );
+    let resolved = a
+        .explain
+        .stages
+        .iter()
+        .find(|s| s.name == "series_resolution")
+        .expect("series_resolution");
+    assert!(
+        resolved.sql.starts_with("SELECT"),
+        "the series resolve by SQL: {resolved:?}"
+    );
+    drop_database(&bootstrap, db).await;
+}

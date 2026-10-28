@@ -94,6 +94,14 @@ pub struct RenderCtx {
     /// A): the days a span and the trace tables read by time stay on the
     /// local volume.
     pub traces_hot_days: Option<u32>,
+    /// `PULSUS_ROLLUP_RETENTION_DAYS` (docs/configuration.md §7, issue #743
+    /// part B): each level's retention in days, one per level; empty: every
+    /// level keeps `retention_days`.
+    pub rollup_retention_days: Vec<u32>,
+    /// `PULSUS_ROLLUP_HOT_DAYS` (docs/configuration.md §7, issue #743 part
+    /// B): each level's move age in days, one per level; empty: no level
+    /// moves.
+    pub rollup_hot_days: Vec<u32>,
 }
 
 /// The rows one run of the service-graph job may read (issue #599), the
@@ -154,6 +162,8 @@ impl RenderCtx {
             metrics_hot_days: None,
             logs_hot_days: None,
             traces_hot_days: None,
+            rollup_retention_days: Vec::new(),
+            rollup_hot_days: Vec::new(),
         }
     }
 }
@@ -402,6 +412,12 @@ pub struct TieringInput<'a> {
     pub metrics_hot_days: Option<&'a str>,
     pub logs_hot_days: Option<&'a str>,
     pub traces_hot_days: Option<&'a str>,
+    /// What `parse_rollup_levels` returned (issue #743 part B).
+    pub levels: &'a [u32],
+    /// What `parse_rollup_ranges` returned.
+    pub ranges: &'a [u32],
+    pub rollup_retention_days: Option<&'a str>,
+    pub rollup_hot_days: Option<&'a str>,
 }
 
 /// The `RenderCtx` fields the tiering block decides.
@@ -411,6 +427,8 @@ pub struct Tiering {
     pub metrics_hot_days: Option<u32>,
     pub logs_hot_days: Option<u32>,
     pub traces_hot_days: Option<u32>,
+    pub rollup_retention_days: Vec<u32>,
+    pub rollup_hot_days: Vec<u32>,
 }
 
 /// The tiering settings `schema/schema.sh` validates (issue #743 part A),
@@ -466,6 +484,8 @@ pub fn validate_tiering(input: &TieringInput<'_>) -> Result<Tiering, String> {
         metrics_hot_days: days[0],
         logs_hot_days: days[1],
         traces_hot_days: days[2],
+        rollup_retention_days: Vec::new(),
+        rollup_hot_days: Vec::new(),
     })
 }
 
@@ -674,6 +694,8 @@ mod tests {
             metrics_hot_days: None,
             logs_hot_days: None,
             traces_hot_days: None,
+            rollup_retention_days: Vec::new(),
+            rollup_hot_days: Vec::new(),
         }
     }
 

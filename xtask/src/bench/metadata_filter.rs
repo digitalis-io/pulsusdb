@@ -192,6 +192,8 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         metrics_hot_days: None,
         logs_hot_days: None,
         traces_hot_days: None,
+        rollup_retention_days: Vec::new(),
+        rollup_hot_days: Vec::new(),
     };
     run_init(&admin, &schema).await?;
     let mut data_cfg = admin_cfg.clone();
