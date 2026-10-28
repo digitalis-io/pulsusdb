@@ -2551,6 +2551,29 @@ jobs:
           path: target/test-summary/
           if-no-files-found: ignore
 
+  # Issue #746 part E: a cluster built from the setup form's own files —
+  # 4 servers in 2 shards of 2, 3 Keepers, TLS on every hop, the object
+  # store — set up by following the generated setup.md, step by step.
+  setup-cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build PulsusDB and the setup bundle command
+        run: cargo build -p pulsus-server -p xtask
+
+      - name: "Setup form: build the cluster from its files and follow its steps"
+        run: RT=docker sh ci/setup-cluster/run.sh
+
   # Issue #5: the 2-shard + Keeper cluster variant — Replicated engines,
   # `_dist` write/read-back, and the live sharding-identity assertion
   # (docs/schemas.md §7). Fixture at ci/clickhouse-cluster/compose.yaml.
