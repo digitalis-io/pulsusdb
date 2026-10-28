@@ -1514,6 +1514,11 @@ GET /admin/admin.css       → the pages' stylesheet
 GET /admin/api/v1/status    → {"version","revision","builtAt","rustc","mode","uptimeSeconds","ready","notReadyReason"}
 GET /admin/api/v1/database  → {"database","cluster","retentionDays","levels":[{"table","resMs","fromMs"}],"levelsNote","shards","counterBuckets","discoveryFailures"}
 GET /admin/api/v1/config    → the effective configuration as JSON, secrets "***"
+GET  /admin/setup                  → the setup form (HTML)
+POST /admin/setup                  → the form with each refusal beside its field, or what the schema keeps and the generated files
+POST /admin/setup/file             → one generated file as an attachment: the form's fields plus file=<path>
+POST /admin/api/v1/setup/validate  → {"totals":{"raw","levels"}}
+POST /admin/api/v1/setup/bundle    → {"totals":{"raw","levels"},"files":[{"path","content"}]}
 ```
 
 `/metrics` exposes three implemented families (see `architecture.md §8` for the exact metric set): **ingest** (`pulsus_ingest_*`, `writer`/`all` roles only — absent on a reader-only process), **label cache** (`pulsus_label_cache_*`, reader/all), and **query eval gate** (`pulsus_query_eval_*`, reader/all). Ingest errors are attributed per signal + error-class, not per ingest protocol; on-disk spool size/file-count gauges, per-API/per-planner-stage query latencies and tail-session counters are not yet exposed.
@@ -1521,6 +1526,8 @@ GET /admin/api/v1/config    → the effective configuration as JSON, secrets "**
 When basic auth is enabled, `/ready` and `/metrics` remain **unauthenticated** (liveness probes and metric scrapers must work without credentials); `/config`, `/buildinfo`, and every data-plane route require auth.
 
 **Admin routes** (`/admin/…`) are mounted only when `PULSUS_ADMIN_USER` and `PULSUS_ADMIN_PASSWORD` are both set, and require that pair; the data-plane pair does not open them, and they open nothing else. They carry no CORS headers, and every response carries `Content-Security-Policy: default-src 'self'` and `Cache-Control: no-store`. A `null` field has no value yet; `levels` is `null` with `levelsNote` `not yet discovered` until the first level discovery, and with `not read in writer mode` in writer mode. With the admin pair set, a request without it gets `401`: on `/admin/api/v1/…` the body `{"errors":[{"field":null,"message":"unauthorized"}]}` as `application/json`, on the HTML routes the plain `unauthorized`. With the admin pair unset nothing under `/admin/` is mounted: `404`, except that where `PULSUS_AUTH_USER` is set a request without that pair gets its `401` first, as for any path.
+
+**Setup** (`/admin/setup`, `/admin/api/v1/setup/…`) generates a cluster's configuration, schema and setup steps from the form's fields; it reads no file and sends nothing to ClickHouse, and no secret enters it (every password and key is named as an environment variable in the generated files). The two API routes take a JSON object of the form's field names to string values; an absent field is blank. `totals` gives each total kept, in days: `raw` for raw data, `levels` one per rollup level. Refused inputs are `422` with `{"errors":[{"field","message"}]}`, every refusal the form shows, in the same order; `field` is the form field, or `raw`, `levels`, `tls` or `remote_url` for a rule over several. A body that is not a JSON object of strings is `400` with `{"errors":[{"field":null,"message"}]}`. `files` lists the same files, in the same order, as the form's downloads.
 
 ---
 

@@ -1,10 +1,16 @@
 //! The admin JSON API, `/admin/api/v1/…`: the same view values the pages
 //! render.
 
+use std::collections::BTreeMap;
+
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+
+use pulsus_setup::{Inputs, Validated};
+use serde_json::json;
 
 use super::views::{self, DatabaseView, StatusView};
 use crate::app::AppState;
@@ -30,5 +36,45 @@ pub(crate) async fn config(State(state): State<AppState>) -> Response {
             )
                 .into_response()
         }
+    }
+}
+
+/// The setup API's body: a JSON object of form fields to strings, read by
+/// the same `Inputs::from_pairs` and `validate` as the form. A body that is
+/// not such an object is `400`; refused inputs are `422`.
+fn setup_validated(body: &[u8]) -> Result<Validated, Box<Response>> {
+    let pairs: BTreeMap<String, String> = serde_json::from_slice(body).map_err(|e| {
+        Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"errors": [{"field": null, "message": e.to_string()}]})),
+            )
+                .into_response(),
+        )
+    })?;
+    pulsus_setup::validate(&Inputs::from_pairs(pairs)).map_err(|errors| {
+        Box::new(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "errors": errors })),
+            )
+                .into_response(),
+        )
+    })
+}
+
+pub(crate) async fn setup_validate(body: Bytes) -> Response {
+    match setup_validated(&body) {
+        Ok(v) => Json(json!({ "totals": v.totals() })).into_response(),
+        Err(res) => *res,
+    }
+}
+
+pub(crate) async fn setup_bundle(body: Bytes) -> Response {
+    match setup_validated(&body) {
+        Ok(v) => {
+            Json(json!({ "totals": v.totals(), "files": pulsus_setup::bundle(&v) })).into_response()
+        }
+        Err(res) => *res,
     }
 }

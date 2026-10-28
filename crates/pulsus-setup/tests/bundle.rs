@@ -272,12 +272,20 @@ fn c3_rendered_schema_is_what_the_script_prints() {
     }
 }
 
+/// One C4 case: its name, the overrides of `example`, and every
+/// `(field, message)` refused.
+type C4Case = (
+    &'static str,
+    Vec<(&'static str, &'static str)>,
+    Vec<(&'static str, String)>,
+);
+
 /// **C4: each form rule, and one schema refusal, with its field and
 /// message.**
 #[test]
 fn c4_each_rule_refuses_with_its_field_and_message() {
     let ip_or_name = "is not an IPv4 address or a host name";
-    let cases: Vec<(&str, Vec<(&str, &str)>, Vec<(&str, String)>)> = vec![
+    let cases: Vec<C4Case> = vec![
         (
             "W1",
             vec![("hosts", "ch1\nch_2\nch3\nch4\nch5\nch6")],
@@ -434,6 +442,21 @@ fn c5_zero_levels() {
         assert!(!line.starts_with("PULSUS_ROLLUP_RETENTION_DAYS"), "{line}");
         assert!(!line.starts_with("PULSUS_ROLLUP_HOT_DAYS"), "{line}");
     }
+    // The finder sees the example's four level tables.
+    let example_files = self::files(&example());
+    let found: Vec<String> = level_tables(file(&example_files, "schema-rendered.sql"))
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        found,
+        [
+            "metric_samples_60s",
+            "metric_samples_720s",
+            "metric_samples_7200s",
+            "metric_samples_86400s"
+        ]
+    );
     let rendered = file(&files, "schema-rendered.sql");
     assert!(!rendered.is_empty());
     assert!(
@@ -443,23 +466,23 @@ fn c5_zero_levels() {
     );
 }
 
-/// Every `CREATE TABLE` statement of a level table (`metric_samples_` and
-/// a digit), as (name, statement).
+/// Every `CREATE TABLE` statement of a level table (`metric_samples_<n>s`),
+/// as (name, statement).
 fn level_tables(rendered: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for stmt in rendered.split(";\n") {
-        let Some(at) = stmt.find("CREATE TABLE ") else {
+        let Some(at) = stmt.find("CREATE TABLE IF NOT EXISTS ") else {
             continue;
         };
-        let name: String = stmt[at + "CREATE TABLE ".len()..]
+        let name: String = stmt[at + "CREATE TABLE IF NOT EXISTS ".len()..]
             .chars()
             .take_while(|c| !c.is_whitespace() && *c != '(')
             .collect();
         let bare = name.rsplit('.').next().unwrap_or(&name).trim_matches('`');
-        if bare
+        let width = bare
             .strip_prefix("metric_samples_")
-            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
-        {
+            .and_then(|rest| rest.strip_suffix('s'));
+        if width.is_some_and(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit())) {
             out.push((bare.to_string(), stmt.to_string()));
         }
     }

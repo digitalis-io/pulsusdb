@@ -1,5 +1,6 @@
-//! The admin UI (issue #746 part B): status, database and configuration
-//! pages under `/admin/`, and their JSON API under `/admin/api/v1/`. Each
+//! The admin UI (issue #746 parts B and C): status, database and
+//! configuration pages and the setup form under `/admin/`, and their JSON
+//! API under `/admin/api/v1/`. Each
 //! page and its endpoint are built from one view value (`views`). Mounted
 //! only with the admin pair; `app::build_router` merges it outside the CORS
 //! layer.
@@ -9,7 +10,7 @@ use axum::extract::Request;
 use axum::http::{HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
 use pulsus_config::Config;
 
 use crate::app::AppState;
@@ -17,6 +18,7 @@ use crate::app::AppState;
 mod api;
 pub(crate) mod html;
 mod pages;
+mod setup;
 pub(crate) mod views;
 
 /// The admin routes, or `None` unless both admin fields are set. The pages
@@ -29,12 +31,16 @@ pub(crate) fn router(config: &Config) -> Option<Router<AppState>> {
         .route("/admin/", get(pages::status))
         .route("/admin/database", get(pages::database))
         .route("/admin/config", get(pages::config))
+        .route("/admin/setup", get(setup::form).post(setup::submit))
+        .route("/admin/setup/file", post(setup::file))
         .route("/admin/admin.css", get(pages::css))
         .layer(page_auth);
     let api = Router::new()
         .route("/admin/api/v1/status", get(api::status))
         .route("/admin/api/v1/database", get(api::database))
         .route("/admin/api/v1/config", get(api::config))
+        .route("/admin/api/v1/setup/validate", post(api::setup_validate))
+        .route("/admin/api/v1/setup/bundle", post(api::setup_bundle))
         .layer(api_auth);
     Some(
         pages

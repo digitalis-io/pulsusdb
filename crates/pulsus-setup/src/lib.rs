@@ -23,26 +23,144 @@ pub struct File {
     pub content: String,
 }
 
-/// Every file of the bundle, in the order the page lists them.
-pub fn bundle(_v: &Validated) -> Vec<File> {
-    Vec::new()
+/// Every file of the bundle, in the order the page lists them: each
+/// host's, each Keeper host's, then the schema, `pulsusdb.env` and
+/// `setup.md`.
+pub fn bundle(v: &Validated) -> Vec<File> {
+    let mut files = Vec::new();
+    let mut add = |path: String, content: String| files.push(File { path, content });
+    let cluster = server_xml::cluster(v);
+    let storage = server_xml::storage(v);
+    let tls = server_xml::tls(v);
+    for i in 1..=v.hosts.len() {
+        let dir = format!("nodes/{i}");
+        add(
+            format!("{dir}/config.d/pulsus-cluster.xml"),
+            cluster.clone(),
+        );
+        add(
+            format!("{dir}/config.d/pulsus-node.xml"),
+            server_xml::node(v, i),
+        );
+        add(
+            format!("{dir}/config.d/pulsus-storage.xml"),
+            storage.clone(),
+        );
+        if let Some(tls) = &tls {
+            add(format!("{dir}/config.d/pulsus-tls.xml"), tls.clone());
+        }
+        add(format!("{dir}/users.d/pulsus-user.xml"), server_xml::user());
+    }
+    for j in 1..=v.keepers.len() {
+        add(
+            format!("keepers/{j}/keeper_config.xml"),
+            server_xml::keeper(v, j),
+        );
+    }
+    add("schema.env".to_string(), vars::schema_env(v));
+    add(
+        "schema-rendered.sql".to_string(),
+        pulsus_schema::rendered(&v.ctx),
+    );
+    add(
+        "schema/schema.sh".to_string(),
+        pulsus_schema::SCHEMA_SH.to_string(),
+    );
+    add(
+        "schema/schema.sql".to_string(),
+        pulsus_schema::SCHEMA_SQL.to_string(),
+    );
+    add("pulsusdb.env".to_string(), vars::pulsusdb_env(v));
+    let statements = pulsus_schema::rendered_statements(&v.ctx).len();
+    add("setup.md".to_string(), steps::setup_md(v, statements));
+    files
 }
 
-/// Writes `files` under `dir`, creating the directories they need.
-pub fn write_bundle(_dir: &Path, _files: &[File]) -> std::io::Result<()> {
+/// Writes `files` under `dir`, creating the directories they need. The
+/// schema script is made executable.
+pub fn write_bundle(dir: &Path, files: &[File]) -> std::io::Result<()> {
+    for f in files {
+        let path = dir.join(&f.path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &f.content)?;
+        #[cfg(unix)]
+        if f.path.ends_with(".sh") {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
     Ok(())
 }
 
 /// The page's lines for what the schema keeps: raw data, each level, then
 /// the due-time ceiling.
-pub fn total_lines(_v: &Validated) -> Vec<String> {
-    Vec::new()
+pub fn total_lines(v: &Validated) -> Vec<String> {
+    steps::total_lines(v)
 }
 
 /// The figures the server derives from the hardware, shown and not
 /// written: (label, value).
-pub fn sizing(_v: &Validated) -> Vec<(&'static str, String)> {
-    Vec::new()
+pub fn sizing(v: &Validated) -> Vec<(&'static str, String)> {
+    steps::sizing(v)
+}
+
+/// Every form field, in the form's order: the scalar fields, then each
+/// level row's (row 1 has no switch point).
+pub fn field_names() -> Vec<String> {
+    let mut names: Vec<String> = [
+        "hosts",
+        "keepers",
+        "shards",
+        "replicas",
+        "cluster",
+        "database",
+        "tls_cert",
+        "tls_key",
+        "tls_ca",
+        "local_path",
+        "remote_url",
+        "cores",
+        "memory_gib",
+        "disk_gib",
+        "raw_local_days",
+        "raw_remote_days",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for k in 1..=pulsus_schema::MAX_LEVELS {
+        names.push(format!("l{k}_width"));
+        if k > 1 {
+            names.push(format!("l{k}_from"));
+        }
+        names.push(format!("l{k}_local"));
+        names.push(format!("l{k}_remote"));
+    }
+    names
+}
+
+/// The form's starting values: the chart's cluster name, the database
+/// default, the shipped data path, and the default levels with their
+/// default switch points.
+pub fn prefilled() -> Vec<(String, String)> {
+    let mut pairs = vec![
+        ("cluster".to_string(), "pulsus_cluster".to_string()),
+        ("database".to_string(), "pulsus".to_string()),
+        ("local_path".to_string(), "/var/lib/clickhouse/".to_string()),
+    ];
+    for (i, width) in pulsus_schema::DEFAULT_ROLLUP_LEVELS.iter().enumerate() {
+        let k = i + 1;
+        pairs.push((format!("l{k}_width"), width.to_string()));
+        if let Some(from) = i
+            .checked_sub(1)
+            .and_then(|r| pulsus_schema::DEFAULT_ROLLUP_RANGES.get(r))
+        {
+            pairs.push((format!("l{k}_from"), from.to_string()));
+        }
+    }
+    pairs
 }
 
 /// The issue's example as form pairs: six hosts in two shards of three,

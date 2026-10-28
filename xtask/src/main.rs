@@ -11,6 +11,7 @@
 
 mod bench;
 mod ch_bench;
+mod setup_bundle;
 mod template_audit;
 mod traceql_catalogue;
 
@@ -45,6 +46,10 @@ enum Command {
     /// metrics planners and engine against a database holding the
     /// catalogue fixture; one JSON line per query (issue #600).
     TraceqlCatalogue(traceql_catalogue::Args),
+    /// Write the setup form's files for the inputs in a file of
+    /// `field=value` lines (issue #746): the same generator as the admin
+    /// UI's setup page.
+    SetupBundle(setup_bundle::Args),
 }
 
 #[derive(Parser)]
@@ -117,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Bench(args) => bench::run(args).await,
         Command::TemplateAudit(args) => template_audit::run(args).await,
         Command::TraceqlCatalogue(args) => traceql_catalogue::run(args).await,
+        Command::SetupBundle(args) => setup_bundle::run(args),
     }
 }
 

@@ -127,11 +127,24 @@ fn page_errors(page: &str) -> Vec<(String, String)> {
             let rest = &list[at + marker.len()..];
             let close = rest.find("\">").expect("the attribute closes");
             let field = rest[..close].to_string();
-            let text = &rest[close + 2..];
-            let message = text[..text.find("</li>").expect("the item closes")].to_string();
+            let item = &rest[close + 2..];
+            let item = &item[..item.find("</li>").expect("the item closes")];
+            let open = "<span class=\"msg\">";
+            let text = &item[item.find(open).expect("the message opens") + open.len()..];
+            let message = text[..text.find("</span>").expect("the message closes")].to_string();
             (field, message)
         })
         .collect()
+}
+
+/// The page's list of what the schema keeps, still escaped: the files'
+/// contents below it repeat the lines in `setup.md`.
+fn totals(page: &str) -> &str {
+    let start = page
+        .find("<ul class=\"totals\">")
+        .unwrap_or_else(|| panic!("no totals in {page}"));
+    let list = &page[start..];
+    &list[..list.find("</ul>").expect("the list closes")]
 }
 
 /// The API's bundle of `pairs`: `(totals, [(path, content)])`.
@@ -243,15 +256,14 @@ async fn c10_the_setup_page_shows_files_and_totals() {
     let shown = page_files(&page.body);
     let want: Vec<String> = api_files.iter().map(|(p, _)| p.clone()).collect();
     assert_eq!(shown, want);
-    assert!(
+    assert!(totals(&page.body).contains("kept at least 97 days; at least 7 on local disk"));
+    assert_eq!(
+        totals(&page.body).matches(NO_MOVE).count(),
+        4,
+        "{}",
         page.body
-            .contains("kept at least 97 days; at least 7 on local disk")
     );
-    assert_eq!(page.body.matches(NO_MOVE).count(), 4, "{}", page.body);
-    assert!(
-        page.body
-            .contains("no row is due after 2106-02-07 06:28:15 UTC")
-    );
+    assert!(totals(&page.body).contains("no row is due after 2106-02-07 06:28:15 UTC"));
 
     let mixed = post_form(
         &r,
@@ -260,18 +272,18 @@ async fn c10_the_setup_page_shows_files_and_totals() {
     )
     .await;
     assert_eq!(mixed.status, StatusCode::OK, "{}", mixed.body);
-    assert!(
-        mixed
-            .body
-            .contains("kept at least 365 days; at least 30 on local disk")
-    );
-    assert_eq!(mixed.body.matches(NO_MOVE).count(), 3);
+    assert!(totals(&mixed.body).contains("kept at least 365 days; at least 30 on local disk"));
+    assert_eq!(totals(&mixed.body).matches(NO_MOVE).count(), 3);
 
     for (pairs, n) in [(one_level(), 1), (eight_levels(), 8)] {
         let page = post_form(&r, "/admin/setup", &pairs).await;
         assert_eq!(page.status, StatusCode::OK, "{n}: {}", page.body);
-        assert_eq!(page.body.matches(NO_MOVE).count(), n, "{n}");
-        assert_eq!(page.body.matches("kept at least").count(), n + 1, "{n}");
+        assert_eq!(totals(&page.body).matches(NO_MOVE).count(), n, "{n}");
+        assert_eq!(
+            totals(&page.body).matches("kept at least").count(),
+            n + 1,
+            "{n}"
+        );
     }
 
     let mut request = example();

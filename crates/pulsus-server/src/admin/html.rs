@@ -17,16 +17,36 @@ pub(crate) fn html_text(s: &str) -> String {
     out
 }
 
-/// A whole admin page: the stylesheet, links to the three pages, `title`
-/// as the heading, then `body`, which the caller has escaped.
+/// The four admin pages, as (path, name); a page's title is its name.
+const PAGES: [(&str, &str); 4] = [
+    ("/admin/", "Status"),
+    ("/admin/database", "Database"),
+    ("/admin/config", "Configuration"),
+    ("/admin/setup", "Setup"),
+];
+
+/// A whole admin page: the stylesheet, a header bar linking the four pages
+/// with the one titled `title` marked current, `title` as the heading,
+/// then `body`, which the caller has escaped.
 pub(crate) fn layout(title: &str, body: &str) -> String {
+    let mut nav = String::new();
+    for (path, name) in PAGES {
+        let current = if name == title {
+            " aria-current=\"page\""
+        } else {
+            ""
+        };
+        nav.push_str(&format!("<a href=\"{path}\"{current}>{name}</a>"));
+    }
     let title = html_text(title);
     format!(
         "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>PulsusDB admin: {title}</title>\
          <link rel=\"stylesheet\" href=\"/admin/admin.css\"></head><body>\
-         <nav><a href=\"/admin/\">Status</a> <a href=\"/admin/database\">Database</a> \
-         <a href=\"/admin/config\">Configuration</a></nav>\
+         <header class=\"topbar\"><div class=\"topbar-inner\">\
+         <a class=\"brand\" href=\"/admin/\">PulsusDB <span>admin</span></a>\
+         <nav>{nav}</nav></div></header>\
          <main><h1>{title}</h1>{body}</main></body></html>\n"
     )
 }
@@ -42,5 +62,16 @@ mod tests {
             html_text("<a href='x'>&\""),
             "&lt;a href=&#39;x&#39;&gt;&amp;&quot;"
         );
+    }
+
+    /// The header bar marks the page being shown, and only that one.
+    #[test]
+    fn layout_marks_the_current_page() {
+        let page = layout("Database", "");
+        assert!(
+            page.contains("<a href=\"/admin/database\" aria-current=\"page\">Database</a>"),
+            "{page}"
+        );
+        assert_eq!(page.matches("aria-current").count(), 1, "{page}");
     }
 }
