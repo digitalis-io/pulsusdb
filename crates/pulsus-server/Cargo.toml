@@ -50,6 +50,7 @@ pulsus-read = { path = "../pulsus-read" }
 # `pulsus-logql`'s role on the log query surface.
 pulsus-traceql = { path = "../pulsus-traceql" }
 pulsus-schema = { path = "../pulsus-schema" }
+pulsus-setup = { path = "../pulsus-setup" }
 pulsus-write = { path = "../pulsus-write" }
 # Issue #43: one-time cloud instance-metadata probe for availability-zone
 # auto-detection at startup (`azdetect.rs`). This crate itself needs no TLS —

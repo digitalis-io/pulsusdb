@@ -4894,6 +4894,8 @@ fn the_variable_lists_are_every_variable_the_script_reads() {
         "CLICKHOUSE_HTTP_PORT",
         "CLICKHOUSE_AUTH",
         "PULSUS_SCHEMA_WAIT_SECONDS",
+        "CLICKHOUSE_PROTO",
+        "CLICKHOUSE_TLS_CA_FILE",
     ];
     assert_eq!(pulsus_schema::SCHEMA_VARS, schema_vars, "SCHEMA_VARS");
     assert_eq!(

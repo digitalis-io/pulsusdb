@@ -59,6 +59,9 @@ async fn headers(req: Request, next: Next) -> Response {
 }
 
 #[cfg(test)]
+mod setup_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::{Arc, OnceLock};
     use std::time::{Duration, SystemTime};
@@ -80,7 +83,7 @@ mod tests {
 
     /// `app.rs`'s `test_state()`, with `cfg` as the configuration, the
     /// admin pair `a`/`s3cret` added, and retention unset.
-    fn state(mut cfg: Config) -> AppState {
+    pub(super) fn state(mut cfg: Config) -> AppState {
         cfg.admin_user = Some("a".to_string());
         cfg.admin_password = Some(Secret::new("s3cret"));
         AppState {
@@ -105,11 +108,11 @@ mod tests {
         }
     }
 
-    fn router(state: &AppState) -> axum::Router {
+    pub(super) fn router(state: &AppState) -> axum::Router {
         build_router(state.clone(), &state.config.clone()).expect("router builds")
     }
 
-    fn admin_header() -> String {
+    pub(super) fn admin_header() -> String {
         format!("Basic {}", crate::middleware::base64_encode(b"a:s3cret"))
     }
 
@@ -176,7 +179,7 @@ mod tests {
         }
     }
 
-    fn b6_levels(shards: u32, counter_buckets: u32) -> Levels {
+    pub(super) fn b6_levels(shards: u32, counter_buckets: u32) -> Levels {
         Levels {
             levels: vec![
                 Level {

@@ -1,0 +1,951 @@
+//! The setup form's generator (issue #746 part C): tests C1-C9, C11, C12
+//! and C15-C17. The fixture `example` is the issue's example
+//! (`pulsus_setup::example_pairs`).
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use pulsus_setup::{Inputs, bundle, example_pairs, validate, write_bundle};
+
+type Pairs = Vec<(String, String)>;
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// `pairs` with each `(name, value)` set, replacing the field's value.
+fn with(mut pairs: Pairs, overrides: &[(&str, &str)]) -> Pairs {
+    for (name, value) in overrides {
+        pairs.retain(|(n, _)| n != name);
+        pairs.push((name.to_string(), value.to_string()));
+    }
+    pairs
+}
+
+fn example() -> Pairs {
+    example_pairs()
+}
+
+/// C5: `example` with every width blank.
+fn zero_levels() -> Pairs {
+    with(
+        example(),
+        &[
+            ("l1_width", ""),
+            ("l2_width", ""),
+            ("l3_width", ""),
+            ("l4_width", ""),
+        ],
+    )
+}
+
+/// C6: `example` with level 1 at 30 local and 335 object-storage days.
+fn mixed_levels() -> Pairs {
+    with(example(), &[("l1_local", "30"), ("l1_remote", "335")])
+}
+
+/// C7: `example` with no remote storage.
+fn no_remote() -> Pairs {
+    with(example(), &[("remote_url", ""), ("raw_remote_days", "")])
+}
+
+/// C8: `example` with no TLS.
+fn no_tls() -> Pairs {
+    with(
+        example(),
+        &[("tls_cert", ""), ("tls_key", ""), ("tls_ca", "")],
+    )
+}
+
+fn validated(pairs: &Pairs) -> pulsus_setup::Validated {
+    validate(&Inputs::from_pairs(pairs.clone()))
+        .unwrap_or_else(|e| panic!("the inputs are refused: {e:?}"))
+}
+
+/// The bundle of `pairs`, by path.
+fn files(pairs: &Pairs) -> BTreeMap<String, String> {
+    let files = bundle(&validated(pairs));
+    let mut out = BTreeMap::new();
+    for f in files {
+        assert!(
+            out.insert(f.path.clone(), f.content).is_none(),
+            "{} is in the bundle twice",
+            f.path
+        );
+    }
+    out
+}
+
+fn file<'a>(files: &'a BTreeMap<String, String>, path: &str) -> &'a str {
+    files
+        .get(path)
+        .unwrap_or_else(|| panic!("no {path} in {:?}", files.keys().collect::<Vec<_>>()))
+}
+
+/// `None` when `pairs` are accepted, else every `(field, message)`.
+fn refusals(pairs: &Pairs) -> Option<Vec<(String, String)>> {
+    match validate(&Inputs::from_pairs(pairs.clone())) {
+        Ok(_) => None,
+        Err(errors) => Some(errors.into_iter().map(|e| (e.field, e.message)).collect()),
+    }
+}
+
+/// The messages refused against `field`; empty when `field` is accepted.
+fn field_messages(pairs: &Pairs, field: &str) -> Vec<String> {
+    refusals(pairs)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(f, _)| f == field)
+        .map(|(_, m)| m)
+        .collect()
+}
+
+fn lines(text: &str) -> Vec<&str> {
+    text.lines().collect()
+}
+
+/// `env`'s `NAME=value` lines as pairs.
+fn env_pairs(env: &str) -> Vec<(String, String)> {
+    env.lines()
+        .map(|l| {
+            let (k, v) = l
+                .split_once('=')
+                .unwrap_or_else(|| panic!("not NAME=value: {l:?}"));
+            (k.to_string(), v.to_string())
+        })
+        .collect()
+}
+
+/// `sh schema/schema.sh --mode cluster --print` from `dir`, with exactly
+/// the variables of `schema_env` and `PATH`.
+fn script_print(dir: &Path, schema_env: &str) -> (Option<i32>, String, String) {
+    let out = Command::new("sh")
+        .arg("schema/schema.sh")
+        .args(["--mode", "cluster", "--print"])
+        .current_dir(dir)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .envs(env_pairs(schema_env))
+        .output()
+        .expect("run sh");
+    (
+        out.status.code(),
+        String::from_utf8(out.stdout).expect("utf-8"),
+        String::from_utf8(out.stderr).expect("utf-8"),
+    )
+}
+
+/// **C1: `schema.env` is the §5.3 variables, sorted.**
+#[test]
+fn c1_schema_env_of_the_example() {
+    let files = files(&example());
+    assert_eq!(
+        lines(file(&files, "schema.env")),
+        [
+            "CLICKHOUSE_DB=pulsus",
+            "PULSUS_CLUSTER=pulsus_cluster",
+            "PULSUS_COLD_VOLUME=cold",
+            "PULSUS_LOGS_HOT_DAYS=7",
+            "PULSUS_METRICS_HOT_DAYS=7",
+            "PULSUS_RETENTION_DAYS=97",
+            "PULSUS_ROLLUP_LEVELS=60,720,7200,86400",
+            "PULSUS_ROLLUP_RANGES=86400,604800,7776000",
+            "PULSUS_ROLLUP_RETENTION_DAYS=365,365,365,365",
+            "PULSUS_STORAGE_POLICY=pulsus_tiered",
+            "PULSUS_TRACES_HOT_DAYS=7",
+        ]
+    );
+}
+
+const NODE_4: &str = "<clickhouse>
+    <macros>
+        <shard>2</shard>
+        <replica>ch4</replica>
+        <cluster>pulsus_cluster</cluster>
+    </macros>
+    <interserver_http_host>ch4</interserver_http_host>
+</clickhouse>
+";
+
+const CLUSTER_TLS: &str = "<clickhouse>
+    <listen_host>::</listen_host>
+    <listen_host>0.0.0.0</listen_host>
+    <listen_try>1</listen_try>
+    <remote_servers>
+        <pulsus_cluster>
+            <secret from_env=\"CLICKHOUSE_INTERSERVER_SECRET\"/>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>ch1</host>
+                    <port>9440</port>
+                    <secure>1</secure>
+                </replica>
+                <replica>
+                    <host>ch2</host>
+                    <port>9440</port>
+                    <secure>1</secure>
+                </replica>
+                <replica>
+                    <host>ch3</host>
+                    <port>9440</port>
+                    <secure>1</secure>
+                </replica>
+            </shard>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>ch4</host>
+                    <port>9440</port>
+                    <secure>1</secure>
+                </replica>
+                <replica>
+                    <host>ch5</host>
+                    <port>9440</port>
+                    <secure>1</secure>
+                </replica>
+                <replica>
+                    <host>ch6</host>
+                    <port>9440</port>
+                    <secure>1</secure>
+                </replica>
+            </shard>
+        </pulsus_cluster>
+    </remote_servers>
+    <zookeeper>
+        <node>
+            <host>kp1</host>
+            <port>9181</port>
+            <secure>1</secure>
+        </node>
+        <node>
+            <host>kp2</host>
+            <port>9181</port>
+            <secure>1</secure>
+        </node>
+        <node>
+            <host>kp3</host>
+            <port>9181</port>
+            <secure>1</secure>
+        </node>
+    </zookeeper>
+    <interserver_http_credentials>
+        <user>interserver</user>
+        <password from_env=\"CLICKHOUSE_INTERSERVER_SECRET\"/>
+    </interserver_http_credentials>
+</clickhouse>
+";
+
+/// **C2: host 4 is replica `ch4` of shard 2, and the cluster file lists
+/// both shards over TLS.**
+#[test]
+fn c2_node_and_cluster_files_of_host_4() {
+    let files = files(&example());
+    assert_eq!(file(&files, "nodes/4/config.d/pulsus-node.xml"), NODE_4);
+    let cluster = file(&files, "nodes/4/config.d/pulsus-cluster.xml");
+    assert_eq!(cluster, CLUSTER_TLS);
+    assert!(!cluster.contains("keeper_server"));
+    // Identical on every host.
+    for i in 1..=6 {
+        assert_eq!(
+            file(&files, &format!("nodes/{i}/config.d/pulsus-cluster.xml")),
+            CLUSTER_TLS,
+            "host {i}"
+        );
+    }
+}
+
+/// **C3: `schema-rendered.sql` is what the script prints from
+/// `schema.env`.**
+#[test]
+fn c3_rendered_schema_is_what_the_script_prints() {
+    for (name, pairs) in [
+        ("example", example()),
+        ("zero levels", zero_levels()),
+        ("a level that moves", mixed_levels()),
+    ] {
+        let files = files(&pairs);
+        let (code, out, err) = script_print(&repo_root(), file(&files, "schema.env"));
+        assert_eq!(code, Some(0), "{name}: {err}");
+        assert_eq!(out, file(&files, "schema-rendered.sql"), "{name}");
+    }
+}
+
+/// **C4: each form rule, and one schema refusal, with its field and
+/// message.**
+#[test]
+fn c4_each_rule_refuses_with_its_field_and_message() {
+    let ip_or_name = "is not an IPv4 address or a host name";
+    let cases: Vec<(&str, Vec<(&str, &str)>, Vec<(&str, String)>)> = vec![
+        (
+            "W1",
+            vec![("hosts", "ch1\nch_2\nch3\nch4\nch5\nch6")],
+            vec![("hosts", format!("ch_2 {ip_or_name}"))],
+        ),
+        (
+            "W2",
+            vec![("hosts", "ch1\nch1\nch3\nch4\nch5\nch6")],
+            vec![("hosts", "ch1 is listed twice".into())],
+        ),
+        (
+            "W3 shards",
+            vec![("shards", "0")],
+            vec![("shards", "must be a whole number from 1 to 100".into())],
+        ),
+        (
+            "W3 replicas",
+            vec![("replicas", "1.5")],
+            vec![("replicas", "must be a whole number from 1 to 100".into())],
+        ),
+        (
+            "W3 product",
+            vec![("replicas", "51")],
+            vec![("hosts", "102 hosts is more than 100".into())],
+        ),
+        (
+            "W4",
+            vec![("hosts", "ch1\nch2\nch3\nch4\nch5")],
+            vec![("hosts", "5 hosts for 2 shards of 3 replicas: give 6".into())],
+        ),
+        (
+            "W5",
+            vec![("local_path", "var/lib/clickhouse/")],
+            vec![(
+                "local_path",
+                "must be an absolute directory ending in /, of letters, digits, . _ / -".into(),
+            )],
+        ),
+        (
+            "W6",
+            vec![("remote_url", "https://bucket.example/pulsus/?a")],
+            vec![(
+                "remote_url",
+                "must be an http(s) URL with a host, ending in /, without a user, query or fragment"
+                    .into(),
+            )],
+        ),
+        (
+            "W7 all or none",
+            vec![("tls_key", "")],
+            vec![(
+                "tls",
+                "give the certificate, the key and the CA, or none".into(),
+            )],
+        ),
+        (
+            "W7 path",
+            vec![("tls_ca", "etc/ch/ca.crt")],
+            vec![(
+                "tls_ca",
+                "must be an absolute path of letters, digits, . _ / -".into(),
+            )],
+        ),
+        (
+            "W8",
+            vec![("cores", "0")],
+            vec![("cores", "must be a whole number from 1 to 1000000".into())],
+        ),
+        (
+            "W9",
+            vec![("l3_width", "")],
+            vec![("l4_width", "level 4 is set after an empty row".into())],
+        ),
+        (
+            "W10 twice",
+            vec![("keepers", "kp1\nkp1\nkp3")],
+            vec![("keepers", "kp1 is listed twice".into())],
+        ),
+        (
+            "W10 a ClickHouse host",
+            vec![("keepers", "kp1\nkp2\nch1")],
+            vec![(
+                "keepers",
+                "ch1 is also a ClickHouse host: Keeper runs on its own hosts".into(),
+            )],
+        ),
+        (
+            "W10 not a host",
+            vec![("keepers", "kp1\nkp2\nkp_3")],
+            vec![("keepers", format!("kp_3 {ip_or_name}"))],
+        ),
+        (
+            "W11",
+            vec![("keepers", "kp1\nkp2")],
+            vec![("keepers", "give from 3 to 9 Keeper hosts".into())],
+        ),
+        (
+            "W12 local",
+            vec![("raw_local_days", "0")],
+            vec![(
+                "raw_local_days",
+                "must be a whole number from 1 to 4294967295".into(),
+            )],
+        ),
+        (
+            "W12 object storage",
+            vec![("l1_remote", "x")],
+            vec![(
+                "l1_remote",
+                "must be a whole number from 0 to 4294967295".into(),
+            )],
+        ),
+        (
+            "W12 no URL",
+            vec![("remote_url", "")],
+            vec![(
+                "raw_remote_days",
+                "object storage days need a remote storage URL".into(),
+            )],
+        ),
+        (
+            "W13",
+            vec![("cluster", "1c")],
+            vec![("cluster", "must start with a letter or _".into())],
+        ),
+        (
+            "schema",
+            vec![("l1_local", "30")],
+            vec![(
+                "levels",
+                "PULSUS_ROLLUP_RETENTION_DAYS: 30 for the 60s level is not a whole number of \
+                 days from 97 to 4294967295"
+                    .into(),
+            )],
+        ),
+    ];
+    for (name, overrides, want) in cases {
+        let want: Vec<(String, String)> =
+            want.into_iter().map(|(f, m)| (f.to_string(), m)).collect();
+        assert_eq!(refusals(&with(example(), &overrides)), Some(want), "{name}");
+    }
+}
+
+/// **C5: no levels.**
+#[test]
+fn c5_zero_levels() {
+    let files = files(&zero_levels());
+    let env = lines(file(&files, "schema.env"));
+    assert!(env.contains(&"PULSUS_ROLLUP_LEVELS="), "{env:?}");
+    for line in &env {
+        if line.starts_with("PULSUS_ROLLUP_RANGES") {
+            assert_eq!(*line, "PULSUS_ROLLUP_RANGES=");
+        }
+        assert!(!line.starts_with("PULSUS_ROLLUP_RETENTION_DAYS"), "{line}");
+        assert!(!line.starts_with("PULSUS_ROLLUP_HOT_DAYS"), "{line}");
+    }
+    let rendered = file(&files, "schema-rendered.sql");
+    assert!(!rendered.is_empty());
+    assert!(
+        level_tables(rendered).is_empty(),
+        "{:?}",
+        level_tables(rendered)
+    );
+}
+
+/// Every `CREATE TABLE` statement of a level table (`metric_samples_` and
+/// a digit), as (name, statement).
+fn level_tables(rendered: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for stmt in rendered.split(";\n") {
+        let Some(at) = stmt.find("CREATE TABLE ") else {
+            continue;
+        };
+        let name: String = stmt[at + "CREATE TABLE ".len()..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '(')
+            .collect();
+        let bare = name.rsplit('.').next().unwrap_or(&name).trim_matches('`');
+        if bare
+            .strip_prefix("metric_samples_")
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        {
+            out.push((bare.to_string(), stmt.to_string()));
+        }
+    }
+    out
+}
+
+/// **C6: one level moves; the rest stay on local disk.**
+#[test]
+fn c6_one_level_moves() {
+    let files = files(&mixed_levels());
+    let env = lines(file(&files, "schema.env"));
+    assert!(
+        env.contains(&"PULSUS_ROLLUP_RETENTION_DAYS=365,365,365,365"),
+        "{env:?}"
+    );
+    assert!(
+        env.contains(&"PULSUS_ROLLUP_HOT_DAYS=30,365,365,365"),
+        "{env:?}"
+    );
+    let tables = level_tables(file(&files, "schema-rendered.sql"));
+    assert!(tables.len() >= 4, "{tables:?}");
+    let moving: Vec<&str> = tables
+        .iter()
+        .filter(|(_, stmt)| stmt.contains("TO VOLUME 'cold'"))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(moving, ["metric_samples_60s"]);
+}
+
+/// **C7: no remote storage.**
+#[test]
+fn c7_no_remote_storage() {
+    let files = files(&no_remote());
+    for (path, content) in &files {
+        if path.starts_with("schema/") || path == "schema-rendered.sql" {
+            continue;
+        }
+        assert!(!content.contains("storage_configuration"), "{path}");
+    }
+    assert!(files.contains_key("nodes/1/config.d/pulsus-storage.xml"));
+    for env in ["schema.env", "pulsusdb.env"] {
+        assert!(
+            !file(&files, env).contains("PULSUS_STORAGE_POLICY"),
+            "{env}"
+        );
+    }
+}
+
+/// **C8: no TLS.**
+#[test]
+fn c8_no_tls() {
+    let files = files(&no_tls());
+    assert!(
+        !files.keys().any(|p| p.ends_with("pulsus-tls.xml")),
+        "{:?}",
+        files.keys().collect::<Vec<_>>()
+    );
+    let cluster = file(&files, "nodes/1/config.d/pulsus-cluster.xml");
+    assert!(cluster.contains("<port>9000</port>"), "{cluster}");
+    assert!(!cluster.contains("9440"), "{cluster}");
+    assert!(!cluster.contains("<secure>"), "{cluster}");
+    let env = lines(file(&files, "pulsusdb.env"));
+    assert!(env.contains(&"CLICKHOUSE_PROTO=http"), "{env:?}");
+    assert!(env.contains(&"CLICKHOUSE_HTTP_PORT=8123"), "{env:?}");
+    assert!(
+        env.iter()
+            .any(|l| l.starts_with("CLICKHOUSE_SERVERS=ch1:8123,")),
+        "{env:?}"
+    );
+}
+
+/// The text of `setup.md`'s section `### {id}`.
+fn section<'a>(md: &'a str, id: &str) -> &'a str {
+    let head = format!("\n### {id}\n");
+    let start = md.find(&head).unwrap_or_else(|| panic!("no {id} in {md}")) + head.len();
+    let rest = &md[start..];
+    &rest[..rest.find("\n### ").unwrap_or(rest.len())]
+}
+
+/// The first fenced block after `marker` in `text`.
+fn block_after<'a>(text: &'a str, marker: &str) -> &'a str {
+    let at = text
+        .find(marker)
+        .unwrap_or_else(|| panic!("no {marker:?} in {text}"));
+    let rest = &text[at..];
+    let open = rest.find("```").expect("a fence");
+    let body = &rest[open..];
+    let body = &body[body.find('\n').expect("the fence's line") + 1..];
+    &body[..body.find("```").expect("the closing fence")]
+}
+
+/// **C9: the expected values of the verify steps.**
+#[test]
+fn c9_setup_steps_expect_the_example() {
+    let pairs = example();
+    let files = files(&pairs);
+    let md = file(&files, "setup.md");
+    assert_eq!(block_after(section(md, "V1"), "Expected"), "6\n");
+    let v2: Vec<&str> = block_after(section(md, "V2"), "Expected").lines().collect();
+    assert_eq!(v2.len(), 12, "{v2:?}");
+    assert_eq!(v2[0], "replica\tch1");
+    assert_eq!(v2[5], "replica\tch6");
+    assert_eq!(v2[6], "shard\t1");
+    assert_eq!(v2[11], "shard\t2");
+    assert_eq!(block_after(section(md, "V3"), "Expected"), "6\n");
+    assert_eq!(block_after(section(md, "V4"), "Expected"), "24\n");
+    let n = pulsus_schema::rendered_statements(&validated(&pairs).ctx).len();
+    assert!(n > 50, "{n}");
+    assert_eq!(
+        block_after(section(md, "4"), "Expected"),
+        format!(
+            "schema.sh: all 6 hosts in cluster 'pulsus_cluster' answered\nschema.sh: {n} statements applied to pulsus\n"
+        )
+    );
+}
+
+const KEEPER_2: &str = "<clickhouse>
+    <listen_host>::</listen_host>
+    <listen_host>0.0.0.0</listen_host>
+    <listen_try>1</listen_try>
+    <keeper_server>
+        <tcp_port_secure>9181</tcp_port_secure>
+        <server_id>2</server_id>
+        <log_storage_path>/var/lib/clickhouse-keeper/coordination/log</log_storage_path>
+        <snapshot_storage_path>/var/lib/clickhouse-keeper/coordination/snapshots</snapshot_storage_path>
+        <raft_configuration>
+            <secure>true</secure>
+            <server>
+                <id>1</id>
+                <hostname>kp1</hostname>
+                <port>9234</port>
+            </server>
+            <server>
+                <id>2</id>
+                <hostname>kp2</hostname>
+                <port>9234</port>
+            </server>
+            <server>
+                <id>3</id>
+                <hostname>kp3</hostname>
+                <port>9234</port>
+            </server>
+        </raft_configuration>
+    </keeper_server>
+    <openSSL>
+        <server>
+            <certificateFile>/etc/ch/server.crt</certificateFile>
+            <privateKeyFile>/etc/ch/server.key</privateKeyFile>
+            <caConfig>/etc/ch/ca.crt</caConfig>
+            <verificationMode>none</verificationMode>
+        </server>
+        <client>
+            <caConfig>/etc/ch/ca.crt</caConfig>
+            <verificationMode>relaxed</verificationMode>
+        </client>
+    </openSSL>
+</clickhouse>
+";
+
+/// **C11: Keeper host 2's whole configuration.**
+#[test]
+fn c11_keeper_2() {
+    let files = files(&example());
+    assert_eq!(file(&files, "keepers/2/keeper_config.xml"), KEEPER_2);
+}
+
+/// **C12: from 3 to 9 Keeper hosts, none a ClickHouse host.**
+#[test]
+fn c12_keeper_count_and_overlap() {
+    let two = with(example(), &[("keepers", "kp1\nkp2")]);
+    assert_eq!(
+        field_messages(&two, "keepers"),
+        ["give from 3 to 9 Keeper hosts"]
+    );
+    let four = with(example(), &[("keepers", "kp1\nkp2\nkp3\nkp4")]);
+    assert!(refusals(&four).is_none(), "{:?}", refusals(&four));
+    assert_eq!(
+        files(&four)
+            .keys()
+            .filter(|p| p.starts_with("keepers/"))
+            .count(),
+        4
+    );
+    let overlap = with(example(), &[("keepers", "kp1\nkp2\nch1")]);
+    assert_eq!(
+        field_messages(&overlap, "keepers"),
+        ["ch1 is also a ClickHouse host: Keeper runs on its own hosts"]
+    );
+}
+
+/// **C15: no memory, thread or cache setting is written.**
+#[test]
+fn c15_no_memory_or_thread_settings() {
+    let forbidden = [
+        "max_server_memory_usage",
+        "max_memory_usage",
+        "max_threads",
+        "background_",
+        "_cache_size",
+        "max_concurrent_queries",
+        "merges_",
+    ];
+    for (name, pairs) in [
+        ("example", example()),
+        ("zero levels", zero_levels()),
+        ("mixed", mixed_levels()),
+        ("no remote", no_remote()),
+        ("no tls", no_tls()),
+    ] {
+        let files = files(&pairs);
+        assert!(files.len() > 10, "{name}");
+        for (path, content) in &files {
+            if path == "schema-rendered.sql" || path.starts_with("schema/") {
+                continue;
+            }
+            for word in forbidden {
+                assert!(!content.contains(word), "{name}: {path} holds {word}");
+            }
+        }
+    }
+}
+
+fn hosts(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("h{i}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// **C16: each rule's bounds.**
+#[test]
+fn c16_bounds() {
+    let whole_100 = "must be a whole number from 1 to 100";
+    let whole_1m = "must be a whole number from 1 to 1000000";
+    let whole_days = "must be a whole number from 1 to 4294967295";
+    let whole_days_0 = "must be a whole number from 0 to 4294967295";
+    let digits25 = "1234567890123456789012345";
+
+    // W3.
+    let s100 = with(
+        example(),
+        &[("shards", "100"), ("replicas", "1"), ("hosts", &hosts(100))],
+    );
+    assert!(refusals(&s100).is_none(), "{:?}", refusals(&s100));
+    let ten_by_ten = with(
+        example(),
+        &[("shards", "10"), ("replicas", "10"), ("hosts", &hosts(100))],
+    );
+    assert!(
+        refusals(&ten_by_ten).is_none(),
+        "{:?}",
+        refusals(&ten_by_ten)
+    );
+    for field in ["shards", "replicas"] {
+        for bad in ["101", digits25] {
+            assert_eq!(
+                field_messages(&with(example(), &[(field, bad)]), field),
+                [whole_100],
+                "{field} {bad}"
+            );
+        }
+    }
+    assert_eq!(
+        field_messages(&with(example(), &[("replicas", "51")]), "hosts"),
+        ["102 hosts is more than 100"]
+    );
+    assert_eq!(
+        field_messages(
+            &with(
+                example(),
+                &[("shards", "100"), ("replicas", "100"), ("hosts", "a\nb\nc")]
+            ),
+            "hosts"
+        ),
+        ["10000 hosts is more than 100"]
+    );
+
+    // W8.
+    for field in ["cores", "memory_gib", "disk_gib"] {
+        assert!(
+            field_messages(&with(example(), &[(field, "1000000")]), field).is_empty(),
+            "{field}"
+        );
+        for bad in ["1000001", digits25] {
+            assert_eq!(
+                field_messages(&with(example(), &[(field, bad)]), field),
+                [whole_1m],
+                "{field} {bad}"
+            );
+        }
+    }
+
+    // W12: the field's own bound; the total then goes to the schema.
+    let max_raw = with(
+        zero_levels(),
+        &[("raw_local_days", "4294967295"), ("raw_remote_days", "0")],
+    );
+    assert!(refusals(&max_raw).is_none(), "{:?}", refusals(&max_raw));
+    for field in ["raw_local_days", "l1_local"] {
+        assert!(
+            field_messages(&with(example(), &[(field, "4294967295")]), field).is_empty(),
+            "{field}"
+        );
+        for bad in ["4294967296", digits25] {
+            assert_eq!(
+                field_messages(&with(example(), &[(field, bad)]), field),
+                [whole_days],
+                "{field} {bad}"
+            );
+        }
+    }
+    for field in ["raw_remote_days", "l1_remote"] {
+        assert!(
+            field_messages(&with(example(), &[(field, "4294967295")]), field).is_empty(),
+            "{field}"
+        );
+        for bad in ["4294967296", digits25] {
+            assert_eq!(
+                field_messages(&with(example(), &[(field, bad)]), field),
+                [whole_days_0],
+                "{field} {bad}"
+            );
+        }
+    }
+    // A total over the schema's bound is the schema's refusal.
+    assert_eq!(
+        refusals(&with(
+            zero_levels(),
+            &[("raw_local_days", "4294967295"), ("raw_remote_days", "1")]
+        )),
+        Some(vec![(
+            "raw".to_string(),
+            "PULSUS_RETENTION_DAYS must be a whole number of days from 1 to 4294967295: 4294967296"
+                .to_string()
+        )])
+    );
+
+    // W11.
+    let nine = (1..=9)
+        .map(|i| format!("kp{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ten = (1..=10)
+        .map(|i| format!("kp{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(field_messages(&with(example(), &[("keepers", &nine)]), "keepers").is_empty());
+    assert_eq!(
+        field_messages(&with(example(), &[("keepers", &ten)]), "keepers"),
+        ["give from 3 to 9 Keeper hosts"]
+    );
+
+    // W2 and W10 after lowercasing.
+    assert_eq!(
+        field_messages(
+            &with(example(), &[("hosts", "ch1\nCH1\nch3\nch4\nch5\nch6")]),
+            "hosts"
+        ),
+        ["ch1 is listed twice"]
+    );
+    assert_eq!(
+        field_messages(&with(example(), &[("keepers", "kp1\nkp2\nCH1")]), "keepers"),
+        ["ch1 is also a ClickHouse host: Keeper runs on its own hosts"]
+    );
+    // Lowercased in every output.
+    let upper = with(example(), &[("hosts", "CH1\nch2\nch3\nch4\nch5\nch6")]);
+    let upper_files = files(&upper);
+    assert!(
+        file(&upper_files, "nodes/1/config.d/pulsus-node.xml").contains("<replica>ch1</replica>")
+    );
+
+    // W5 and W7.
+    for bad in ["/var/lib/\n", "/var/li b/", "/var/lib$/"] {
+        assert_eq!(
+            field_messages(&with(example(), &[("local_path", bad)]), "local_path"),
+            ["must be an absolute directory ending in /, of letters, digits, . _ / -"],
+            "{bad:?}"
+        );
+    }
+    for bad in ["/etc/ch/a\n", "/etc/ch/a b", "/etc/ch/$a"] {
+        assert_eq!(
+            field_messages(&with(example(), &[("tls_cert", bad)]), "tls_cert"),
+            ["must be an absolute path of letters, digits, . _ / -"],
+            "{bad:?}"
+        );
+    }
+
+    // W6.
+    for bad in [
+        "https://u:p@h/",
+        "https:///",
+        "https://h/?a",
+        "https://h/#a",
+        "https://h",
+        "ftp://h/",
+    ] {
+        assert_eq!(
+            field_messages(&with(example(), &[("remote_url", bad)]), "remote_url"),
+            ["must be an http(s) URL with a host, ending in /, without a user, query or fragment"],
+            "{bad:?}"
+        );
+    }
+    assert!(
+        field_messages(
+            &with(example(), &[("remote_url", "http://10.0.0.1:9000/b/")]),
+            "remote_url"
+        )
+        .is_empty()
+    );
+
+    // W13.
+    assert_eq!(
+        field_messages(&with(example(), &[("cluster", "1c")]), "cluster"),
+        ["must start with a letter or _"]
+    );
+    for good in ["_c", "c1"] {
+        let pairs = with(example(), &[("cluster", good)]);
+        assert!(refusals(&pairs).is_none(), "{good}: {:?}", refusals(&pairs));
+    }
+
+    // W1.
+    let label64 = "a".repeat(64);
+    for bad in [
+        ".",
+        "..",
+        "a..b",
+        "-a",
+        "a-",
+        label64.as_str(),
+        "::1",
+        "a_b",
+    ] {
+        let list = format!("{bad}\nch2\nch3\nch4\nch5\nch6");
+        assert_eq!(
+            field_messages(&with(example(), &[("hosts", &list)]), "hosts"),
+            [format!(
+                "{} is not an IPv4 address or a host name",
+                bad.to_ascii_lowercase()
+            )],
+            "{bad:?}"
+        );
+    }
+    let label63 = "a".repeat(63);
+    for good in ["10.0.0.1", label63.as_str(), "a-b.example"] {
+        let list = format!("{good}\nch2\nch3\nch4\nch5\nch6");
+        assert!(
+            field_messages(&with(example(), &[("hosts", &list)]), "hosts").is_empty(),
+            "{good}"
+        );
+    }
+}
+
+/// A fresh directory under the build's temporary directory, outside the
+/// source tree.
+fn fresh_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "pulsus-setup-{name}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create the directory");
+    dir
+}
+
+/// **C17: the bundle carries the script and the schema, and the script
+/// run from the bundle prints `schema-rendered.sql`.**
+#[test]
+fn c17_the_bundle_runs_its_own_script() {
+    let files = files(&example());
+    let dir = fresh_dir("c17");
+    let list: Vec<pulsus_setup::File> = files
+        .iter()
+        .map(|(path, content)| pulsus_setup::File {
+            path: path.clone(),
+            content: content.clone(),
+        })
+        .collect();
+    write_bundle(&dir, &list).expect("write the bundle");
+    for path in ["schema/schema.sh", "schema/schema.sql"] {
+        let written = std::fs::read(dir.join(path)).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let repo = std::fs::read(repo_root().join(path)).expect("the repository's file");
+        assert!(written == repo, "{path} differs from the repository's");
+    }
+    let (code, out, err) = script_print(&dir, file(&files, "schema.env"));
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(out, file(&files, "schema-rendered.sql"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

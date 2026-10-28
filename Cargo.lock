@@ -1862,6 +1862,7 @@ dependencies = [
  "pulsus-read",
  "pulsus-schema",
  "pulsus-schema-testkit",
+ "pulsus-setup",
  "pulsus-testkit",
  "pulsus-traceql",
  "pulsus-write",
@@ -1882,6 +1883,15 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pulsus-setup"
+version = "0.0.0"
+dependencies = [
+ "http",
+ "pulsus-schema",
+ "serde",
 ]
 
 [[package]]

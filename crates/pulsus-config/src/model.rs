@@ -194,6 +194,9 @@ pub struct ClickHouseConfig {
     pub auth: ChAuth,
     pub proto: ChProto,
     pub tls_skip_verify: bool,
+    /// `CLICKHOUSE_TLS_CA_FILE`: the CA an `https` server is verified
+    /// against (issue #746 part D).
+    pub tls_ca_file: Option<String>,
     pub pool_size: u32,
     /// Multi-endpoint connection list (issue #43). **Empty** (the default)
     /// keeps the single-endpoint behavior driven by `server`/`http_port`.
@@ -234,6 +237,7 @@ impl Default for ClickHouseConfig {
             auth: ChAuth::default(),
             proto: ChProto::default(),
             tls_skip_verify: false,
+            tls_ca_file: None,
             pool_size: 8,
             servers: Vec::new(),
             insert_quorum: 0,

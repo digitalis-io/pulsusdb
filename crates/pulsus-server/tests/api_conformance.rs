@@ -1189,6 +1189,18 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             );
             if path == "/admin/admin.css" {
                 assert_eq!(res.content_type(), Some("text/css"), "{ctx}: content-type");
+            } else if path == "/admin/setup/file" {
+                assert_eq!(
+                    res.content_type(),
+                    Some("text/plain; charset=utf-8"),
+                    "{ctx}: content-type"
+                );
+                assert!(
+                    res.headers
+                        .get("content-disposition")
+                        .is_some_and(|v| v.starts_with("attachment")),
+                    "{ctx}: an attachment"
+                );
             } else if path.starts_with("/admin/api/v1/") {
                 assert_eq!(
                     res.content_type(),
@@ -2559,6 +2571,17 @@ fn assert_401_admin_json(res: &RawResponse, ctx: &str) {
     );
 }
 
+/// The valid request for an admin route: its first method, with
+/// `base_query` as a form body, or as a JSON body on the API.
+fn admin_request(spec: &RouteSpec) -> manifest::Req {
+    let method = spec.methods[0];
+    let mut req = valid_request(spec, method);
+    if method == Method::Post && spec.path.starts_with("/admin/api/v1/") {
+        req.content_type = Some("application/json");
+    }
+    req
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_pair_gates_every_admin_route() {
     if !should_run() {
@@ -2588,9 +2611,10 @@ async fn admin_pair_gates_every_admin_route() {
         }
         admin_routes += 1;
         let is_api = spec.path.starts_with("/admin/api/v1/");
+        let method = spec.methods[0].as_str();
         for (label, creds) in [("none", None), ("data-plane", Some(&data_plane))] {
-            let ctx = format!("[{spawn}] GET {} case=admin creds={label}", spec.path);
-            let mut req = manifest::Req::new("GET", spec.path);
+            let ctx = format!("[{spawn}] {method} {} case=admin creds={label}", spec.path);
+            let mut req = admin_request(spec);
             if let Some(value) = creds {
                 req.headers.push(("authorization", value.clone()));
             }
@@ -2601,8 +2625,8 @@ async fn admin_pair_gates_every_admin_route() {
                 assert_401_unauthorized(&res, &ctx);
             }
         }
-        let ctx = format!("[{spawn}] GET {} case=admin creds=admin", spec.path);
-        let mut req = manifest::Req::new("GET", spec.path);
+        let ctx = format!("[{spawn}] {method} {} case=admin creds=admin", spec.path);
+        let mut req = admin_request(spec);
         req.headers.push(("authorization", admin.clone()));
         let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
         assert_eq!(
@@ -2613,7 +2637,7 @@ async fn admin_pair_gates_every_admin_route() {
         );
         assert_success_envelope(spec, &res, &ctx);
     }
-    assert_eq!(admin_routes, 7, "the manifest's admin routes");
+    assert_eq!(admin_routes, 11, "the manifest's admin routes");
 
     // The admin pair opens nothing else.
     let ctx = format!("[{spawn}] GET /config case=admin creds=admin");

@@ -1206,6 +1206,20 @@ mod tests {
 
     /// Issue #174 Rule 16: cert without key is rejected naming the
     /// *missing* field (fail closed, the Rule-12 shape).
+    /// D-2 (issue #746 part D): a CA file that cannot be read stops startup,
+    /// naming its variable.
+    #[test]
+    fn an_unreadable_ca_file_is_a_startup_error_naming_its_variable() {
+        let mut cfg = Config::default();
+        cfg.clickhouse.tls_ca_file = Some("/nonexistent/pulsus-d2/ca.crt".to_string());
+        let err = validate(&cfg).expect_err("the file does not exist");
+        let text = err.to_string();
+        assert!(text.contains("CLICKHOUSE_TLS_CA_FILE"), "{text}");
+        assert!(text.contains("/nonexistent/pulsus-d2/ca.crt"), "{text}");
+        cfg.clickhouse.tls_ca_file = None;
+        assert!(validate(&cfg).is_ok());
+    }
+
     #[test]
     fn one_sided_tls_cert_only_is_a_hard_error() {
         let cfg = Config {

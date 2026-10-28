@@ -145,6 +145,11 @@ const ROWS: &[Row] = &[
         check: |c| c.clickhouse.tls_skip_verify,
     },
     Row {
+        var: "CLICKHOUSE_TLS_CA_FILE",
+        value: "/etc/ch/ca.crt",
+        check: |c| c.clickhouse.tls_ca_file.as_deref() == Some("/etc/ch/ca.crt"),
+    },
+    Row {
         var: "PULSUS_CH_POOL_SIZE",
         value: "32",
         check: |c| c.clickhouse.pool_size == 32,
@@ -653,6 +658,7 @@ fn each_variable_sets_exactly_one_yaml_key() {
 /// this list changing.
 const NO_LITERAL_DEFAULT: &[(&str, &str)] = &[
     ("CLICKHOUSE_SERVERS", "unset"),
+    ("CLICKHOUSE_TLS_CA_FILE", "unset"),
     ("PULSUS_ADMIN_PASSWORD", "unset"),
     ("PULSUS_ADMIN_USER", "unset"),
     ("PULSUS_AUTH_PASSWORD", "unset"),
