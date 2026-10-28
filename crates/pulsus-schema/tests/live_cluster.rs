@@ -2430,6 +2430,15 @@ static TEST_DB_LEVELS_ONE: pulsus_testkit::TestDb =
 static TEST_DB_LEVELS_EIGHT: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_levels_eight");
 
+/// One A5 case: its database, the levels, the switch points, and each
+/// level's width and switch point in milliseconds.
+type LevelCase = (
+    &'static pulsus_testkit::TestDb,
+    &'static str,
+    &'static str,
+    Vec<(i64, u64)>,
+);
+
 /// **A5 (issue #746 part A): a clustered schema of one level and of eight
 /// levels, its context from `ctx_from_vars`, is discovered whole.** The
 /// level discovery reads two shards, each level's routing table and its
@@ -2441,7 +2450,7 @@ async fn one_and_eight_levels_are_discovered_on_the_cluster() {
     let shard1 = ChClient::new(shard1_config())
         .await
         .expect("connect shard1");
-    let cases: [(&pulsus_testkit::TestDb, &str, &str, Vec<(i64, u64)>); 2] = [
+    let cases: [LevelCase; 2] = [
         (&TEST_DB_LEVELS_ONE, "60", "", vec![(60_000, 0)]),
         (
             &TEST_DB_LEVELS_EIGHT,

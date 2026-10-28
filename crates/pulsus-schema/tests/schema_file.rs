@@ -4645,9 +4645,12 @@ fn the_script_and_the_crate_refuse_every_setting_the_same_way() {
     }
 }
 
+/// One A2 case: what it is, the variables, the mode.
+type RenderCase = (&'static str, Vec<(&'static str, &'static str)>, SchemaMode);
+
 /// The eight cases of `the_script_renders_exactly_what_this_crate_renders`,
 /// as the variables the script reads, and the four A2 adds.
-fn a2_cases() -> Vec<(&'static str, Vec<(&'static str, &'static str)>, SchemaMode)> {
+fn a2_cases() -> Vec<RenderCase> {
     use SchemaMode::{Cluster, Single};
     let base = [("CLICKHOUSE_DB", "pulsus"), ("PULSUS_RETENTION_DAYS", "7")];
     let with = |extra: &[(&'static str, &'static str)]| {
