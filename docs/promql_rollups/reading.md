@@ -30,7 +30,7 @@ Stale markers and NaN read as raw for the bit-equal functions: a routed `Last` s
 
 ### 1.1 Distance from raw, measured on the engine
 
-`each_served_function_is_within_its_distance` (`crates/pulsus-read/tests/live_metrics_rollup.rs:847`): corpus D, 260 series over 8 days at a 15 s scrape, built at every default level; each function sent with routing on and off; per level `res`, step `res`, over the last day at 60 s, the last 3 days at 720 s and all 8 days at 7200 s and 86400 s; `rate`, `increase` over `5 × res`, the others over `res` and `5 × res`. `d = |a − b| / |b|` (`|a|` when `b = 0`; 1 when only one answer is present); p99 by nearest rank. Output: `measure/results/live-metrics-rollup.txt`. Run before the levels followed the query's time range and before the 5 s default, so each level was reached by its step; the windows a level serves are the same bucket-end windows today.
+`each_served_function_is_within_its_distance` (`crates/pulsus-read/tests/live_metrics_rollup.rs:847`): corpus D, 260 series over 8 days at a 15 s scrape, built at every level of the five-level set `5,60,720,7200,86400`; each function sent with routing on and off; per level `res`, step `res`, over the last day at 60 s, the last 3 days at 720 s and all 8 days at 7200 s and 86400 s; `rate`, `increase` over `5 × res`, the others over `res` and `5 × res`. `d = |a − b| / |b|` (`|a|` when `b = 0`; 1 when only one answer is present); p99 by nearest rank. Output: `measure/results/live-metrics-rollup.txt`. Run before the levels followed the query's time range and before the 5 s default, so each level was reached by its step; the windows a level serves are the same bucket-end windows today.
 
 Bit-equal at every level and on every series kind: `max_over_time`, `min_over_time`, `last_over_time`, `present_over_time`, `absent_over_time`, `timestamp` and the bare selector. `sum_over_time` and `avg_over_time` differed by at most 2.39e-13 (addition order).
 
@@ -178,7 +178,7 @@ The routed reads include the finer levels and raw after each level's watermark.
 
 | Range (end − start) | Resolution | Points per series |
 |---|---|---:|
-| 5 min / 15 min / 30 min | 5 s | 60 / 180 / 360 |
+| 5 min / 15 min / 30 min | raw | at the step asked |
 | 1 h / 3 h / 6 h / 12 h | 60 s | 60 / 180 / 360 / 720 |
 | 24 h / 2 days | 720 s | 120 / 240 |
 | 7 days / 30 days | 7200 s | 84 / 360 |

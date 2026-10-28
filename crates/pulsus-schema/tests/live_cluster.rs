@@ -1976,8 +1976,8 @@ async fn a_late_row_keeps_the_newest_instant_on_every_replica() {
     );
 }
 
-/// The rollup level views of part A's set, 60 s first, finest first
-/// (issue #18); the default set begins at 5 s.
+/// The rollup level views of part A's set, the default levels, 60 s
+/// first, finest first (issue #18).
 const LEVEL_VIEWS: [&str; 4] = [
     "metric_samples_60s_mv",
     "metric_samples_720s_mv",

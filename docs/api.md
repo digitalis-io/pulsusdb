@@ -688,7 +688,7 @@ the 131,071-byte text cap is the only bound. The sole exception is
 `/tail`, which is `GET`-only here and effectively `GET`-only there too (a
 POST cannot carry a WebSocket handshake; the reference's `POST`
 registration is nominal and it answers `400` to one — measured
-2026-08-10, `mod.rs:122-127`). Reopen if a client turns up that can only
+2026-08-10, `crates/pulsus-server/src/logs_api/mod.rs:148-153`). Reopen if a client turns up that can only
 `GET` and needs more than ~65.5 KB of request-target.
 
 **Accepted divergence — LogQL nesting depth (issue #256, closed
