@@ -126,6 +126,20 @@ for pair in "PULSUS_METRICS_LANDING_RETENTION_HOURS:$metrics_landing_hours" \
         exit 2
     fi
 done
+for pair in "PULSUS_METRICS_DEDUP_WINDOW:$metrics_dedup" \
+            "PULSUS_LOG_DEDUP_WINDOW:$log_dedup" \
+            "PULSUS_TRACE_DEDUP_WINDOW:$trace_dedup"; do
+    what=${pair%%:*}
+    value=${pair#*:}
+    case "$value" in
+        '' | 0* | *[!0-9]* | ????????*) bad_dedup=1 ;;
+        *) bad_dedup=0; [ "$value" -le 1000000 ] || bad_dedup=1 ;;
+    esac
+    if [ "$bad_dedup" = 1 ]; then
+        echo "schema.sh: $what must be a whole number of blocks from 1 to 1000000: $value" >&2
+        exit 2
+    fi
+done
 
 # Issue #18: `PULSUS_ROLLUP_LEVELS`, the rollup levels in seconds, smallest
 # first; set and empty is no levels. The same rules, in the same order and
@@ -371,19 +385,24 @@ fi
 # `pulsus_schema::rollup_suffix` produces: whole minutes, then whole
 # seconds, then milliseconds, then nanoseconds.
 case "$rollup" in
-    *ms) rollup_ns=$(( ${rollup%ms} * 1000000 )) ;;
-    *ns) rollup_ns=${rollup%ns} ;;
-    *s)  rollup_ns=$(( ${rollup%s} * 1000000000 )) ;;
-    *m)  rollup_ns=$(( ${rollup%m} * 60000000000 )) ;;
-    *)
-        echo "schema.sh: PULSUS_LOG_ROLLUP_RESOLUTION must end in ns, ms, s or m: $rollup" >&2
-        exit 2
-        ;;
+    *ms) rollup_num=${rollup%ms}; rollup_unit=1000000;         rollup_digits=12 ;;
+    *s)  rollup_num=${rollup%s};  rollup_unit=1000000000;      rollup_digits=9 ;;
+    *m)  rollup_num=${rollup%m};  rollup_unit=60000000000;     rollup_digits=8 ;;
+    *h)  rollup_num=${rollup%h};  rollup_unit=3600000000000;   rollup_digits=6 ;;
+    *d)  rollup_num=${rollup%d};  rollup_unit=86400000000000;  rollup_digits=5 ;;
+    *w)  rollup_num=${rollup%w};  rollup_unit=604800000000000; rollup_digits=4 ;;
+    *)   rollup_num=x;            rollup_unit=0;               rollup_digits=0 ;;
 esac
-if [ "$rollup_ns" -le 0 ]; then
-    echo "schema.sh: PULSUS_LOG_ROLLUP_RESOLUTION must be positive: $rollup" >&2
+rollup_ok=1
+case "$rollup_num" in
+    '' | 0* | *[!0-9]*) rollup_ok=0 ;;
+esac
+[ "$rollup_ok" = 0 ] || [ "${#rollup_num}" -le "$rollup_digits" ] || rollup_ok=0
+if [ "$rollup_ok" = 0 ]; then
+    echo "schema.sh: PULSUS_LOG_ROLLUP_RESOLUTION must be a whole number with no leading zero, then ms (at most 12 digits), s (9), m (8), h (6), d (5) or w (4): $rollup" >&2
     exit 2
 fi
+rollup_ns=$((rollup_num * rollup_unit))
 if [ $((rollup_ns % 1000000)) -eq 0 ]; then
     millis=$((rollup_ns / 1000000))
     if [ $((millis % 60000)) -eq 0 ]; then
