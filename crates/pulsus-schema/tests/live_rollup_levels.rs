@@ -1041,8 +1041,8 @@ async fn a_level_waits_for_its_source() {
 /// Levels `60, 720`; the 60 s level covers `(M − 1 h, M + 2 h]`, `M`
 /// yesterday's midnight; one 720 s run writes two run rows, `(M − 1 h, M]`
 /// and `(M, M + 1 h]`, one per day. (ii) Retention rendered 4; rows of every
-/// level for the UTC days `T−4` and `T−2`; after `OPTIMIZE … FINAL`, no row
-/// of `T−4` is left and every row of `T−2` is.
+/// level for the UTC days `T−5` and `T−4`; after `OPTIMIZE … FINAL`, no row
+/// of `T−5` is left and every row of `T−4` is.
 #[tokio::test]
 async fn runs_split_at_midnight_and_expire_by_day() {
     skip_unless_live!();
@@ -1079,7 +1079,7 @@ async fn runs_split_at_midnight_and_expire_by_day() {
     fresh(&client, &ctx).await;
     let t = now_ms(&client).await / DAY;
     for r in ctx.rollup_levels.clone() {
-        for day in [t - 4, t - 2] {
+        for day in [t - 5, t - 4] {
             let (data, _) = covered(r, day * DAY, (day + 1) * DAY);
             insert_level(&client, db, r, &data, &[(day * DAY, (day + 1) * DAY)]).await;
         }
@@ -1095,11 +1095,11 @@ async fn runs_split_at_midnight_and_expire_by_day() {
             )
         };
         let kept = 4 * (86_400 / i64::from(r)) + 1;
-        assert_eq!(int(&client, &per_day(t - 4)).await, 0, "{r}s: T−4 is gone");
+        assert_eq!(int(&client, &per_day(t - 5)).await, 0, "{r}s: T−5 is gone");
         assert_eq!(
-            int(&client, &per_day(t - 2)).await,
+            int(&client, &per_day(t - 4)).await,
             kept,
-            "{r}s: T−2 is kept"
+            "{r}s: T−4 is kept"
         );
     }
     drop_db(&client, db).await;
