@@ -22,7 +22,7 @@ The user's account is `docs/api.md` §3.6 and the setting's is `docs/configurati
 |---|---|---|---|
 | D1 | A rollup-served answer approximates the raw answer. The column a function reads is chosen by what the data is: a counter's increase, a gauge's last value, minimum, maximum or sum. Every other function reads raw, unchanged | owner | `reading.md` §1 |
 | D2 | The levels are chosen per deployment when the schema is built: `PULSUS_ROLLUP_LEVELS`, a list of seconds read by `schema/schema.sh` and the crate's renderer | owner | `building.md` §1 |
-| D3 | The default is `5,60,720,7200,86400` | owner (2026-10-26) | `building.md` §1.3 |
+| D3 | The default is `60,720,7200,86400`, each level the resolution from its own switch point, and a shorter range than the first reads raw | owner (2026-10-28) | `building.md` §1.3 |
 | D4 | One table per level, each with its expiry in its own `CREATE TABLE`, so each level can carry its own retention and storage placement. One data row per series and bucket, `kind = 0, t_end, t_last, last, min, max, sum, count, inc, flags, built_at`, and one run row per run. No metric type is needed to build a row | owner (one table per level) | `building.md` §2 |
 | D5 | The levels form a chain: the first is built from raw, each other from the one below, each by a refreshable view on its own timer, with the timer and offset derived from the level sizes. A level builds only inside its source's run rows | owner (chain, timers) | `building.md` §3 |
 | D6 | A run reads only its own window | — | `building.md` §3.4 |

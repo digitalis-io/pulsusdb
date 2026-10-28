@@ -124,7 +124,6 @@ table.levels thead th { white-space: nowrap; }
 table.levels tbody th { text-align: center; width: 3.5rem; color: var(--text); }
 table.levels td { width: 24%; }
 table.levels input { padding: 0.35rem 0.5rem; text-align: right; }
-table.levels .fixed { color: var(--muted); font-family: inherit; font-size: 0.85rem; padding-left: 0.6rem; }
 table.levels tr.row-errors td { width: auto; font-family: inherit; background: var(--bad-soft); }
 .column-help {
   grid-template-columns: 11rem 1fr; gap: 0.4rem 1rem; margin-top: 1rem;

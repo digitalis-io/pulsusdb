@@ -631,15 +631,23 @@ fn the_documented_tables_name_exactly_all_env_vars() {
 #[test]
 fn each_variable_sets_exactly_one_yaml_key() {
     let _guard = support::lock_env();
-    let defaults =
-        support::leaf_values(&serde_norway::to_value(Config::default()).expect("serialise"));
+    // A secret serialises as `***` whatever its value, so the admin
+    // password, which has a default (issue #746), is compared by its value.
+    let leaves_of = |c: &Config| {
+        let mut leaves = support::leaf_values(&serde_norway::to_value(c).expect("serialise"));
+        if let Some(p) = &c.admin_password {
+            leaves.insert("admin_password".to_string(), p.expose().into());
+        }
+        leaves
+    };
+    let defaults = leaves_of(&Config::default());
     let mut setter: std::collections::BTreeMap<String, &str> = Default::default();
     for row in ROWS {
         support::clear_all();
         support::set(row.var, row.value);
         let cfg = pulsus_config::parse(None, None)
             .unwrap_or_else(|e| panic!("{}: parse() failed: {e}", row.var));
-        let leaves = support::leaf_values(&serde_norway::to_value(cfg).expect("serialise"));
+        let leaves = leaves_of(&cfg);
         let changed: Vec<&String> = leaves
             .iter()
             .filter(|(path, v)| defaults.get(*path) != Some(*v))

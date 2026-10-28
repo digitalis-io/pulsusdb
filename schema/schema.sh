@@ -57,7 +57,7 @@ trace_landing_hours=${PULSUS_TRACE_LANDING_RETENTION_HOURS:-6}
 metrics_dedup=${PULSUS_METRICS_DEDUP_WINDOW:-10000}
 log_dedup=${PULSUS_LOG_DEDUP_WINDOW:-10000}
 trace_dedup=${PULSUS_TRACE_DEDUP_WINDOW:-10000}
-rollup_levels=${PULSUS_ROLLUP_LEVELS-5,60,720,7200,86400}
+rollup_levels=${PULSUS_ROLLUP_LEVELS-60,720,7200,86400}
 rollup_ranges=${PULSUS_ROLLUP_RANGES-3600,86400,604800,7776000}
 counter_buckets=${PULSUS_ROLLUP_COUNTER_BUCKETS-5}
 cold_volume=${PULSUS_COLD_VOLUME:-}
@@ -200,8 +200,9 @@ if [ -n "$rollup_levels" ]; then
 fi
 
 # Issue #18 follow-up: `PULSUS_ROLLUP_RANGES`, the query range in seconds
-# from which each level after the first is the resolution, read only when
-# there are levels; set and empty is an empty list. The same rules, in the
+# from which each level is the resolution, read only when there are levels;
+# set and empty is an empty list. A range below the first reads raw (issue
+# #746). The same rules, in the
 # same order and with the same messages, as
 # `pulsus_schema::parse_rollup_ranges`.
 bad_ranges() {
@@ -227,8 +228,8 @@ if [ -n "$rollup_levels" ]; then
     done
     n_ranges=$#
     n_levels=$(printf '%s\n' "$rollup_levels" | awk -F, '{ print NF }')
-    [ $((n_ranges + 1)) -eq "$n_levels" ] ||
-        bad_ranges "$n_ranges ranges for $n_levels levels: give one for each level after the first"
+    [ "$n_ranges" -eq "$n_levels" ] ||
+        bad_ranges "$n_ranges ranges for $n_levels levels: give one for each level"
     prev=""
     for item in "$@"; do
         if [ -n "$prev" ] && [ "$item" -le "$prev" ]; then
@@ -236,7 +237,7 @@ if [ -n "$rollup_levels" ]; then
         fi
         prev=$item
     done
-    level_of=$(printf '%s\n' "$rollup_levels" | cut -d, -f2-)
+    level_of=$rollup_levels
     for item in "$@"; do
         level=${level_of%%,*}
         level_of=${level_of#*,}
@@ -334,8 +335,10 @@ if [ -n "$retention_given" ]; then
     done
     rest_l=$rollup_levels,
     rest_r=$rollup_retention,
+    # Each level but the last against the next level's switch point.
     rest_g=""
     [ -z "$rollup_ranges" ] || rest_g=$rollup_ranges,
+    rest_g=${rest_g#*,}
     while [ -n "$rest_g" ]; do
         level=${rest_l%%,*}; rest_l=${rest_l#*,}
         item=${rest_r%%,*}; rest_r=${rest_r#*,}
@@ -527,7 +530,7 @@ expand_levels() {
                 line = rep(line, "{{source}}", i > 1 ? "metric_samples_" lv[i - 1] "s" : "")
                 line = rep(line, "{{parent_ms}}", i < n ? lv[i + 1] "000" : "")
                 line = rep(line, "{{period_ms}}", p "000")
-                line = rep(line, "{{from_ms}}", i == 1 ? "0" : rg[i - 1] "000")
+                line = rep(line, "{{from_ms}}", rg[i] "000")
                 line = rep(line, "{{counter_buckets}}", ENVIRON["COUNTER_BUCKETS"])
                 line = rep(line, "{{timer}}", timer)
                 line = rep(line, "{{level_retention_days}}", ENVIRON["LEVEL_RETENTION"] == "" ? "{{retention_days}}" : kr[i])

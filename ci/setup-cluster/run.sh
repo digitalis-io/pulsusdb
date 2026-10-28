@@ -108,6 +108,7 @@ disk_gib=20
 raw_local_days=7
 raw_remote_days=30
 l1_width=60
+l1_from=3600
 l1_local=30
 l1_remote=335
 l2_width=720

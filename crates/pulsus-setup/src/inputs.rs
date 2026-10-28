@@ -61,8 +61,9 @@ pub struct Tls {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LevelRow {
     pub width: String,
-    /// The switch point; `None` for the first level.
-    pub from: Option<String>,
+    /// The switch point: the query range from which a range query reads
+    /// this level; a shorter range than the first level's reads raw.
+    pub from: String,
     pub local_days: u64,
     pub remote_days: u64,
 }
@@ -410,7 +411,7 @@ pub fn validate(inputs: &Inputs) -> Result<Validated, Vec<FieldError>> {
         );
         levels.push(LevelRow {
             width: width.to_string(),
-            from: (k > 1).then(|| inputs.get(&format!("l{k}_from")).to_string()),
+            from: inputs.get(&format!("l{k}_from")).to_string(),
             local_days,
             remote_days,
         });
@@ -491,7 +492,7 @@ fn schema_vars(
     );
     vars.insert(
         "PULSUS_ROLLUP_RANGES",
-        join(levels.iter().filter_map(|l| l.from.clone()).collect()),
+        join(levels.iter().map(|l| l.from.clone()).collect()),
     );
     if !levels.is_empty() {
         vars.insert(

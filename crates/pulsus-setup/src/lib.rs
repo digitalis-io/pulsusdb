@@ -132,9 +132,7 @@ pub fn field_names() -> Vec<String> {
     .collect();
     for k in 1..=pulsus_schema::MAX_LEVELS {
         names.push(format!("l{k}_width"));
-        if k > 1 {
-            names.push(format!("l{k}_from"));
-        }
+        names.push(format!("l{k}_from"));
         names.push(format!("l{k}_local"));
         names.push(format!("l{k}_remote"));
     }
@@ -150,15 +148,14 @@ pub fn prefilled() -> Vec<(String, String)> {
         ("database".to_string(), "pulsus".to_string()),
         ("local_path".to_string(), "/var/lib/clickhouse/".to_string()),
     ];
-    for (i, width) in pulsus_schema::DEFAULT_ROLLUP_LEVELS.iter().enumerate() {
+    for (i, (width, from)) in pulsus_schema::DEFAULT_ROLLUP_LEVELS
+        .iter()
+        .zip(pulsus_schema::DEFAULT_ROLLUP_RANGES)
+        .enumerate()
+    {
         let k = i + 1;
         pairs.push((format!("l{k}_width"), width.to_string()));
-        if let Some(from) = i
-            .checked_sub(1)
-            .and_then(|r| pulsus_schema::DEFAULT_ROLLUP_RANGES.get(r))
-        {
-            pairs.push((format!("l{k}_from"), from.to_string()));
-        }
+        pairs.push((format!("l{k}_from"), from.to_string()));
     }
     pairs
 }
@@ -185,6 +182,7 @@ pub fn example_pairs() -> Vec<(String, String)> {
         ("raw_local_days", "7"),
         ("raw_remote_days", "90"),
         ("l1_width", "60"),
+        ("l1_from", "3600"),
         ("l1_local", "365"),
         ("l2_width", "720"),
         ("l2_from", "86400"),

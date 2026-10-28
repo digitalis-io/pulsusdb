@@ -23,8 +23,8 @@
 #log_level: info                  # error | warn | info | debug | trace
 #auth_user: null                  # both set => basic auth; one-sided => startup error
 #auth_password: null              # secret: prefer the env file
-#admin_user: null                 # both set => /admin/ mounted; one-sided => startup error
-#admin_password: null             # secret: prefer the env file
+#admin_user: admin                # the admin UI's pair; /admin/ is always mounted
+#admin_password: admin            # secret: prefer the env file; change it
 #compat_endpoints: false
 #cors_origin: "*"
 #query_timeout: 2m

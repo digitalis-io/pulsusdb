@@ -237,7 +237,7 @@ pub(crate) fn setup_md(v: &Validated, statements: usize) -> String {
 
     let _ = write!(
         out,
-        "\n### 5\n\nOn the PulsusDB host{}, start PulsusDB with the variables of `pulsusdb.env` and, from your secret store, `CLICKHOUSE_AUTH=pulsus:<password>`, `PULSUS_ADMIN_USER` and `PULSUS_ADMIN_PASSWORD`. Then `GET /ready`.\n\nExpected: `200`.\n",
+        "\n### 5\n\nOn the PulsusDB host{}, start PulsusDB with the variables of `pulsusdb.env` and, from your secret store, `CLICKHOUSE_AUTH=pulsus:<password>` and `PULSUS_ADMIN_PASSWORD`. The admin pair is `admin` / `admin` until you set it: set `PULSUS_ADMIN_PASSWORD`, and `PULSUS_ADMIN_USER` for another user. Then `GET /ready`.\n\nExpected: `200`.\n",
         v.tls
             .as_ref()
             .map(|t| format!(", put the CA at `{}`", t.ca))
@@ -246,7 +246,7 @@ pub(crate) fn setup_md(v: &Validated, statements: usize) -> String {
 
     let _ = write!(
         out,
-        "\n### V5\n\nWith `PULSUS_URL` set to PulsusDB's address (for example `http://pulsusdb:3100`) and the admin pair in the environment, run this with `sh`. It waits for PulsusDB to find the {n} levels: discovery runs at start and then every 60 s.\n\n```sh\n# V5 begin\ntries=${{V5_TRIES:-24}}; pause=${{V5_PAUSE:-5}}; i=0\nwhile [ \"$i\" -lt \"$tries\" ]; do\n  got=$(curl -s --fail-with-body -u \"$PULSUS_ADMIN_USER:$PULSUS_ADMIN_PASSWORD\" \"$PULSUS_URL/admin/api/v1/database\" | grep -o '\"table\":' | wc -l)\n  if [ \"$got\" -eq {n} ]; then echo \"V5: {n} levels\"; exit 0; fi\n  i=$((i + 1)); sleep \"$pause\"\ndone\necho \"V5: $got levels, not {n}\" >&2; exit 1\n# V5 end\n```\n\nExpected: exit 0, printing `V5: {n} levels`.\n"
+        "\n### V5\n\nWith `PULSUS_URL` set to PulsusDB's address (for example `http://pulsusdb:3100`) and the admin pair in the environment (`admin` / `admin` when unset), run this with `sh`. It waits for PulsusDB to find the {n} levels: discovery runs at start and then every 60 s.\n\n```sh\n# V5 begin\ntries=${{V5_TRIES:-24}}; pause=${{V5_PAUSE:-5}}; i=0\nwhile [ \"$i\" -lt \"$tries\" ]; do\n  got=$(curl -s --fail-with-body -u \"${{PULSUS_ADMIN_USER:-admin}}:${{PULSUS_ADMIN_PASSWORD:-admin}}\" \"$PULSUS_URL/admin/api/v1/database\" | grep -o '\"table\":' | wc -l)\n  if [ \"$got\" -eq {n} ]; then echo \"V5: {n} levels\"; exit 0; fi\n  i=$((i + 1)); sleep \"$pause\"\ndone\necho \"V5: $got levels, not {n}\" >&2; exit 1\n# V5 end\n```\n\nExpected: exit 0, printing `V5: {n} levels`.\n"
     );
     out
 }

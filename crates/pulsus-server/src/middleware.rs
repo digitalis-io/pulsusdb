@@ -227,8 +227,9 @@ pub(crate) fn auth_layer(config: &Config) -> Option<ValidateRequestHeaderLayer<B
     }))
 }
 
-/// HTTP Basic auth for the admin UI (issue #746) — `None` unless both
-/// `PULSUS_ADMIN_USER` and `PULSUS_ADMIN_PASSWORD` are set. `json` selects
+/// HTTP Basic auth for the admin UI (issue #746): the pair
+/// `PULSUS_ADMIN_USER` / `PULSUS_ADMIN_PASSWORD`, `admin` / `admin` unless
+/// set; `None` only when a configuration file sets either to null. `json` selects
 /// the JSON `401` body the admin API answers with.
 pub(crate) fn admin_auth_layer(
     config: &Config,

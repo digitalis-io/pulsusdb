@@ -21,7 +21,8 @@ mod pages;
 mod setup;
 pub(crate) mod views;
 
-/// The admin routes, or `None` unless both admin fields are set. The pages
+/// The admin routes, or `None` when a configuration file sets either admin
+/// field to null; unset, the pair is `admin` / `admin`. The pages
 /// refuse with the plain `401`, the API with the JSON one; every response
 /// carries the two headers `headers` sets.
 pub(crate) fn router(config: &Config) -> Option<Router<AppState>> {

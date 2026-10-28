@@ -78,14 +78,13 @@ fn starting_values() -> Vec<(String, String)> {
         ("raw_local_days", "7"),
         ("raw_remote_days", "23"),
         ("l1_local", "30"),
+        ("l1_remote", "60"),
         ("l2_local", "30"),
-        ("l2_remote", "60"),
+        ("l2_remote", "335"),
         ("l3_local", "30"),
-        ("l3_remote", "335"),
+        ("l3_remote", "700"),
         ("l4_local", "30"),
-        ("l4_remote", "700"),
-        ("l5_local", "30"),
-        ("l5_remote", "1795"),
+        ("l4_remote", "1795"),
     ];
     for (name, value) in example {
         pairs.retain(|(n, _)| n != name);
@@ -638,15 +637,11 @@ fn page(inputs: &Inputs, errors: &[FieldError], result: Option<&Validated>) -> S
                 )
             )
         };
-        let from_cell = if k == 1 {
-            "<td class=\"fixed\">0, every range</td>".to_string()
-        } else {
-            cell(1, &from, "range from")
-        };
         let _ = writeln!(
             body,
-            "<tr><th scope=\"row\">{k}</th>{}{from_cell}{}{}</tr>",
+            "<tr><th scope=\"row\">{k}</th>{}{}{}{}</tr>",
             cell(0, &width, "resolution"),
+            cell(1, &from, "range from"),
             cell(2, &local, "days on local disk"),
             cell(3, &remote, "days on object storage")
         );
@@ -680,18 +675,18 @@ fn page(inputs: &Inputs, errors: &[FieldError], result: Option<&Validated>) -> S
         "<dl class=\"column-help\">\
          <dt>Resolution</dt><dd>Seconds per stored point, a whole number from 1 to 86400 that \
          divides a day (86400); below 60 it must divide 60. Each level's is larger than the one \
-         above and a multiple of it. Example: 5, 60, 720, 7200, 86400.</dd>\
+         above and a multiple of it. Example: 60, 720, 7200, 86400.</dd>\
          <dt>Range from</dt><dd>The query range, in seconds, from which a range query reads \
-         this level; level 1 serves every shorter range. A whole number from 1 to 999999999, \
-         each larger than the row above and at least its own resolution. Example: 3600 \
-         (1 hour), 86400 (1 day), 604800 (7 days), 7776000 (90 days).</dd>\
+         this level; a range shorter than level 1's reads the raw samples. A whole number from \
+         1 to 999999999, each larger than the row above and at least its own resolution. \
+         Example: 3600 (1 hour), 86400 (1 day), 604800 (7 days), 7776000 (90 days).</dd>\
          <dt>Days on local disk</dt><dd>A whole number from 1 to 4294967295.</dd>\
          <dt>Then days on object storage</dt><dd>Blank or 0 keeps the level on local disk; \
          above 0 needs an object storage URL. A whole number from 0 to 4294967295.</dd>\
          <dt>Kept in all</dt><dd>Local plus object storage days. Each level is kept at least \
          as long as raw data, and each level but the last at least ⌈the next level's range \
          ÷ 86400⌉ + 1 days, so a query that switches to the next level finds every day it \
-         needs: 2, 2, 8 and 91 days with the example ranges.</dd></dl>\n",
+         needs: 2, 8 and 91 days with the example ranges.</dd></dl>\n",
     );
     body.push_str("</fieldset>\n</section>\n");
     body.push_str(
@@ -806,7 +801,7 @@ mod tests {
         assert_eq!(v.keepers.len(), 3);
         let widths: Vec<&str> = v.levels.iter().map(|l| l.width.as_str()).collect();
         assert_eq!(widths, ["60", "720", "7200", "86400"]);
-        let froms: Vec<&str> = v.levels.iter().filter_map(|l| l.from.as_deref()).collect();
+        let froms: Vec<&str> = v.levels.iter().map(|l| l.from.as_str()).collect();
         assert_eq!(froms, ["3600", "86400", "604800", "7776000"]);
         assert_eq!(
             v.vars["PULSUS_ROLLUP_RANGES"], "3600,86400,604800,7776000",

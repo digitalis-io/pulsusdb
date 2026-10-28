@@ -239,7 +239,7 @@ pub async fn run(config: Config) -> ExitCode {
     } else {
         "http"
     };
-    tracing::info!(%addr, mode = ?config.mode, proto, "pulsusdb listening");
+    log_listening(&addr, &config, proto);
 
     // Both arms share the identical graceful-shutdown future and ordering
     // contract; only the listener differs. The `None` arm is today's
@@ -785,6 +785,17 @@ async fn shutdown_signal() {
         _ = terminate => {}
     }
     tracing::info!("shutdown signal received; draining in-flight requests");
+}
+
+/// The startup line, and (issue #746) a warning while the admin password is
+/// the default `admin`.
+fn log_listening(addr: &str, config: &Config, proto: &str) {
+    tracing::info!(%addr, mode = ?config.mode, proto, "pulsusdb listening");
+    if config.admin_password_is_default() {
+        tracing::warn!(
+            "the admin password is the default `admin`: set PULSUS_ADMIN_PASSWORD to change it"
+        );
+    }
 }
 
 #[cfg(test)]

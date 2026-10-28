@@ -184,7 +184,7 @@ fn every_replication_path_names_the_table_of_its_own_create() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 30, "every replicated table's path was checked");
+    assert_eq!(checked, 29, "every replicated table's path was checked");
 }
 
 /// The splitter the script relies on: a statement ends at a line whose last
@@ -368,7 +368,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 30);
+    assert_eq!(on_tables, 29);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -520,7 +520,7 @@ fn the_script_renders_exactly_what_this_crate_renders() {
         (
             "level retention only",
             RenderCtx {
-                rollup_retention_days: vec![7, 7, 8, 91, 400],
+                rollup_retention_days: vec![7, 8, 91, 400],
                 ..single()
             },
         ),
@@ -3152,14 +3152,14 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             vec![],
             vec!["--mode", "single"],
             single(),
-            "5295ea5f4f205e7e42838d845a27741566652cc270e9289d35e3941df9d2b4fc",
+            "77777077dcc457e1014d451f0f18ed80efba6eb485fc0d550e2982351ea6f558",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "1a3e9d34d55cc2af05de1acad35a805cf250ff3dbb9a5030c8f44efbd2280964",
+            "5da1f1529806c2eaea71bcbb2b00ac59f4747617fdd7cc837308067cd6c7a4e9",
         ),
         (
             "clustered with a storage policy",
@@ -3169,7 +3169,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "aa31710015720cb50e242c7d9b11a2916955c11b3ec48589bd918f778b875cc6",
+            "69da18812935012d9c7b69aaf3c9ff7c30b53bd4daab986f8086e6cf33b117fc",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
@@ -3443,7 +3443,7 @@ fn move_line(table: &str, days: u32) -> String {
 /// `storage_policy = 'tiered'`.
 fn assert_tiering(what: &str, ctx: &RenderCtx, moving: &[(&str, u32)]) {
     let tables = local_tables(ctx);
-    assert_eq!(tables.len(), 30, "{what}: thirty tables");
+    assert_eq!(tables.len(), 29, "{what}: twenty-nine tables");
     for name in NEVER_MOVE {
         assert!(tables.contains_key(name), "{what}: {name} is rendered");
     }

@@ -22,7 +22,8 @@ use super::sample_sql::render_fingerprint_list;
 use crate::logql::escape::ch_string;
 
 /// One rollup level: its bucket width, the table a read names, and the
-/// query range from which it is the resolution (0 for the first level).
+/// query range from which it is the resolution; a range below the first
+/// level's reads raw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Level {
     pub res_ms: i64,
@@ -214,7 +215,8 @@ pub const MAX_GRID_POINTS: i128 = 11_001;
 /// the largest level whose switch point is at most `end − start`, and the
 /// evaluation grid `start + k × S` up to `end`, `S = res × ⌈step / res⌉`:
 /// never more points than asked. `None` for an instant query
-/// (`step == 0`), no levels, an `S` or a time outside `i64`, or more than
+/// (`step == 0`), no levels, a range below the first level's switch point
+/// (issue #746), an `S` or a time outside `i64`, or more than
 /// [`MAX_GRID_POINTS`] points: the query keeps its own grid. The caller
 /// sets the grid only when [`any_routes`] on it.
 pub fn grid(p: &MetricQueryParams, levels: &Levels) -> Option<(i64, EvalGrid)> {

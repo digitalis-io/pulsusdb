@@ -117,7 +117,7 @@ pub const REFUSALS: &[(&str, &str)] = &[
         "2",
     ),
     (
-        "PULSUS_ROLLUP_RANGES: <n_ranges> ranges for <n_levels> levels: give one for each level after the first",
+        "PULSUS_ROLLUP_RANGES: <n_ranges> ranges for <n_levels> levels: give one for each level",
         "2",
     ),
     (
