@@ -480,7 +480,7 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
         if let Some((200, body)) = http_get(port, "/api/v1/status/runtimeinfo") {
             let json: serde_json::Value = serde_json::from_str(&body).expect("runtimeinfo JSON");
             levels = json["data"]["rollupLevels"].clone();
-            if levels == serde_json::json!(["5s", "1m", "12m", "2h", "1d"]) {
+            if levels == serde_json::json!(["1m", "12m", "2h", "1d"]) {
                 break;
             }
         }
@@ -488,7 +488,7 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
     }
     assert_eq!(
         levels,
-        serde_json::json!(["5s", "1m", "12m", "2h", "1d"]),
+        serde_json::json!(["1m", "12m", "2h", "1d"]),
         "runtimeinfo lists the default rollup levels"
     );
 
