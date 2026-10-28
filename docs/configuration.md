@@ -204,7 +204,7 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 | `metric_landing` | `received_ms` + `H` hours | whole part | hour of `received_ms` |
 | `metric_metadata` | `updated_ns` + `C` days | row by row | none |
 | `metric_samples` | `unix_milli` + `R` days | whole part | UTC day of `unix_milli` |
-| `metric_samples_<N>s` | the start of the UTC day of `t_end − 1 ms` + `L` days | whole part | UTC day of `t_end − 1 ms` |
+| `metric_samples_<N>s` | the end of the UTC day of `t_end − 1 ms` + `L` days | whole part | UTC day of `t_end − 1 ms` |
 | `metric_series` | the end of the UTC day `day` + `C` days | whole part | `day`, a UTC day |
 | `resources` | the end of the UTC day `day` + `R` days | whole part | `day`, a UTC day |
 | `service_bucket_resources` | the start of the 5-minute `bucket` + `R` days | whole part | UTC day of `bucket` |
@@ -233,7 +233,7 @@ With `PULSUS_STORAGE_POLICY` and `PULSUS_COLD_VOLUME` set, `schema/schema.sh` gi
 | levels | `metric_samples_<N>s` | its `PULSUS_ROLLUP_HOT_DAYS` item; no move rule when that is unset or equals the level's retention |
 | never moves | `log_landing`, `log_streams`, `log_streams_idx`, `metric_labels`, `metric_label_index`, `metric_label_values`, `metric_landing`, `metric_metadata`, `metric_series`, `resources`, `tag_names`, `tag_values`, `trace_landing`, `traces` | created without `storage_policy`, on the server's `default` policy |
 
-A part moves when its newest row is older than the move age, so a UTC day `D` of raw data with move age `H` is local until `D + 1 + H` days; rows written for a day already moved go straight to the cold volume. A level's UTC day `D` with move age `H` is local until `D + H` days.
+A part moves when its newest row is older than the move age, so a UTC day `D` of raw data with move age `H` is local until `D + 1 + H` days; rows written for a day already moved go straight to the cold volume. A level's UTC day `D` with move age `H` is local until `D + 1 + H` days, as raw data is.
 
 **A table on the policy can reach the cold volume without a move rule.** When the policy's first volume has no space for a new part — an insert, a merge or a replica's fetch — the server writes that part to the next volume that has space, the cold volume here. `move_factor` `0` stops the server moving existing parts to free space; it does not stop this. So a table on the policy — a family's table before its move age, a family whose move age equals `PULSUS_RETENTION_DAYS`, or a rollup level before its move age or without one — is local only while the local volume has room. The fourteen tables in the last row are not on the policy and cannot reach the cold volume.
 

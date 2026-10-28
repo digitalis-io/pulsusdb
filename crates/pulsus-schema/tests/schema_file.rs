@@ -2165,12 +2165,12 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
         true,
         None,
     ),
-    // Issue #18: the rollup levels, one row each, due at the start of the
+    // Issue #18: the rollup levels, one row each, due at the end of the
     // UTC day of `t_end − 1 ms` plus the retention.
     (
         "metric_samples_5s",
         Some(
-            "TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + (17 * 86400), 4294967295))",
+            "TTL toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + (17 * 86400), 4294967295))",
         ),
         true,
         None,
@@ -2178,7 +2178,7 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
     (
         "metric_samples_60s",
         Some(
-            "TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + (17 * 86400), 4294967295))",
+            "TTL toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + (17 * 86400), 4294967295))",
         ),
         true,
         None,
@@ -2186,7 +2186,7 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
     (
         "metric_samples_720s",
         Some(
-            "TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + (17 * 86400), 4294967295))",
+            "TTL toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + (17 * 86400), 4294967295))",
         ),
         true,
         None,
@@ -2194,7 +2194,7 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
     (
         "metric_samples_7200s",
         Some(
-            "TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + (17 * 86400), 4294967295))",
+            "TTL toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + (17 * 86400), 4294967295))",
         ),
         true,
         None,
@@ -2202,7 +2202,7 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
     (
         "metric_samples_86400s",
         Some(
-            "TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + (17 * 86400), 4294967295))",
+            "TTL toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + (17 * 86400), 4294967295))",
         ),
         true,
         None,
@@ -2648,7 +2648,7 @@ fn the_rollup_levels_render_from_one_template() {
                     format!(
                         "COMMENT 'rollup_res_ms={r}000 rollup_from_ms={from} counter_buckets=5';"
                     ),
-                    "TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + (7 * 86400), 4294967295))".to_string(),
+                    "TTL toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + (7 * 86400), 4294967295))".to_string(),
                     "ORDER BY (org_id, fingerprint, t_end)".to_string(),
                     "PARTITION BY toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC')".to_string(),
                 ] {
@@ -3141,14 +3141,14 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             vec![],
             vec!["--mode", "single"],
             single(),
-            "8c45842fa4466018fa606e9b01797550efec3df166c6ca7ea23afc9978ab0488",
+            "5295ea5f4f205e7e42838d845a27741566652cc270e9289d35e3941df9d2b4fc",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "3b2df5f94dc6825bc4914e6fc169fd5dfb7654a878df7a4487b83c99ed1cf4b7",
+            "1a3e9d34d55cc2af05de1acad35a805cf250ff3dbb9a5030c8f44efbd2280964",
         ),
         (
             "clustered with a storage policy",
@@ -3158,7 +3158,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "27c7a0dea6385a67ca9c7f031055e0fd0891271128edc93279267109478216e3",
+            "aa31710015720cb50e242c7d9b11a2916955c11b3ec48589bd918f778b875cc6",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
@@ -3896,13 +3896,13 @@ fn the_script_and_the_crate_refuse_the_same_level_day_lists() {
 /// The level `TTL` line at `days`, and the level move line at `days`.
 fn level_ttl(days: u32) -> String {
     format!(
-        "TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({days} * 86400), 4294967295))"
+        "TTL toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + ({days} * 86400), 4294967295))"
     )
 }
 
 fn level_move(days: u32) -> String {
     format!(
-        ", toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({days} * 86400), 4294967295)) TO VOLUME 'cold'"
+        ", toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + ({days} * 86400), 4294967295)) TO VOLUME 'cold'"
     )
 }
 

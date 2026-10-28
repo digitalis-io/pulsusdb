@@ -29,6 +29,8 @@ static DB_PLAIN: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_tiering_plain");
 static DB_REFUSE: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_tiering_refuse");
+static DB_DAY_END: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_tiering_day_end");
 
 /// The policy `storage.xml` defines: a local `hot` volume and a `cold`
 /// volume on the object store, moving only by TTL.
@@ -222,8 +224,8 @@ async fn old_days_move_and_every_answer_is_unchanged() {
         }
     }
     // Issue #743 part B: one 720 s level row for each of the two youngest
-    // days, in the tiered database only. Age 29.5 is left out: a level row
-    // is due at its day's start + 30 days, which can precede now.
+    // days, in the tiered database only. Age 29.5 is left out, as it was when a level row
+    // was due at its day's start + 30 days (before #746 part S).
     let level_rows: Vec<&(u32, f64, i64)> = rows.iter().filter(|(_, a, _)| *a < 29.0).collect();
     let level_tuples = level_rows
         .iter()
@@ -499,4 +501,119 @@ async fn the_script_refuses_an_absent_policy_before_it_drops() {
     assert!(!q.contains("storage_policy"), "(5) traces: {q}");
 
     exec(&client, &format!("DROP DATABASE IF EXISTS {d} SYNC")).await;
+}
+
+/// **S2, S3 (issue #746 part S): a level's day counts from its end.** One
+/// 60 s level kept 7 days and moving after 3. Rows at the first and last
+/// bucket of the UTC day `D` before today and at the first bucket of
+/// `D + 1 day`; after `OPTIMIZE … FINAL`, every part of day `D` is due for
+/// deletion at `D + 8 days` and for the move at `D + 4 days`, so the last
+/// bucket is kept 7 days after its own end; every part of `D + 1 day` is due
+/// one day later.
+#[tokio::test]
+async fn a_level_day_counts_from_its_end() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    require_policy(&client).await;
+    let ctx = RenderCtx {
+        storage_policy: Some(POLICY.to_string()),
+        cold_volume: Some("cold".to_string()),
+        metrics_hot_days: Some(3),
+        logs_hot_days: Some(3),
+        traces_hot_days: Some(3),
+        rollup_levels: vec![60],
+        rollup_ranges: Vec::new(),
+        rollup_retention_days: vec![7],
+        rollup_hot_days: vec![3],
+        ..RenderCtx::for_tests(&DB_DAY_END, 7)
+    };
+    let db = &ctx.db;
+    exec(&client, &format!("DROP DATABASE IF EXISTS {db} SYNC")).await;
+    run_init(&client, &ctx).await.expect("build the schema");
+
+    const DAY_MS: i64 = 86_400_000;
+    const DAY_S: i64 = 86_400;
+    let now_ms: i64 = one(
+        &client,
+        "SELECT toString(toUnixTimestamp64Milli(now64())) AS s",
+    )
+    .await
+    .parse()
+    .expect("milliseconds");
+    let d = (now_ms / DAY_MS - 1) * DAY_MS;
+    let first = d + 60_000;
+    let last = d + DAY_MS;
+    let next = d + DAY_MS + 60_000;
+    let values = [first, last, next]
+        .iter()
+        .map(|t| format!("(0, '', 1, {t}, {}, 1, 1, 1, 1, 1, 0, 0, 0)", t - 1000))
+        .collect::<Vec<_>>()
+        .join(", ");
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {db}.metric_samples_60s \
+             (kind, org_id, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags, built_at) \
+             VALUES {values}"
+        ),
+    )
+    .await;
+    exec(
+        &client,
+        &format!("OPTIMIZE TABLE {db}.metric_samples_60s FINAL"),
+    )
+    .await;
+
+    // (what, a row's t_end in the partition, expected delete, expected move), in seconds.
+    let cases = [
+        (
+            "S2: day D",
+            first,
+            d / 1000 + 8 * DAY_S,
+            d / 1000 + 4 * DAY_S,
+        ),
+        (
+            "S3: day D + 1",
+            next,
+            d / 1000 + 9 * DAY_S,
+            d / 1000 + 5 * DAY_S,
+        ),
+    ];
+    for (what, t, delete, moved) in cases {
+        let p = one(
+            &client,
+            &format!(
+                "SELECT toString(toDate(fromUnixTimestamp64Milli(toInt64({t}) - 1), 'UTC')) AS s"
+            ),
+        )
+        .await;
+        let got = one(
+            &client,
+            &format!(
+                "SELECT concat(\
+                 toString(min(toUnixTimestamp(delete_ttl_info_min))), ' ', \
+                 toString(max(toUnixTimestamp(delete_ttl_info_max))), ' ', \
+                 toString(min(toUnixTimestamp(move_ttl_info.max[1]))), ' ', \
+                 toString(max(toUnixTimestamp(move_ttl_info.max[1])))) AS s \
+                 FROM system.parts \
+                 WHERE database = '{db}' AND table = 'metric_samples_60s' AND active \
+                 AND partition = '{p}'"
+            ),
+        )
+        .await;
+        assert_eq!(
+            got,
+            format!("{delete} {delete} {moved} {moved}"),
+            "{what} (partition {p}): delete min, delete max, move min, move max"
+        );
+        if t == first {
+            assert_eq!(
+                delete - last / 1000,
+                7 * DAY_S,
+                "{what}: the last bucket is kept 7 days after its end"
+            );
+        }
+    }
+
+    exec(&client, &format!("DROP DATABASE IF EXISTS {db} SYNC")).await;
 }

@@ -1022,8 +1022,8 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level --@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_samples_{{level}}', '{replica}')
 --@level PARTITION BY toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC')
 --@level ORDER BY (org_id, fingerprint, t_end)
---@level TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({{level_retention_days}} * 86400), 4294967295))
---@level-cold , toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({{level_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
+--@level TTL toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + ({{level_retention_days}} * 86400), 4294967295))
+--@level-cold , toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + ({{level_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 --@level --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}}
 --@level --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}}
 --@level COMMENT 'rollup_res_ms={{level_ms}} rollup_from_ms={{from_ms}} counter_buckets={{counter_buckets}}';
