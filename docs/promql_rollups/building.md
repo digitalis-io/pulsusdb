@@ -114,8 +114,8 @@ The table's `CREATE TABLE` and its wrapper, as `schema/schema.sql:1004-1031` car
 --@level --@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_samples_{{level}}', '{replica}')
 --@level PARTITION BY toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC')
 --@level ORDER BY (org_id, fingerprint, t_end)
---@level TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({{level_retention_days}} * 86400), 4294967295))
---@level-cold , toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({{level_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
+--@level TTL toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + ({{level_retention_days}} * 86400), 4294967295))
+--@level-cold , toDateTime(least((intDiv(t_end - 1, 86400000) + 1) * 86400 + ({{level_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 --@level --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}}
 --@level --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}}
 --@level COMMENT 'rollup_res_ms={{level_ms}} rollup_from_ms={{from_ms}} counter_buckets={{counter_buckets}}';
@@ -137,7 +137,7 @@ The table's `CREATE TABLE` and its wrapper, as `schema/schema.sql:1004-1031` car
 |---|---|
 | main key | fingerprint first, for queries. A parent-block main key would make queries read 4 to 120 times more rows (§6.3) |
 | projection `by_parent` | the next level's bucket first; only that level's run reads it (§3.4). A level whose next level is a day has none: the day run reads the source's day partition whole, and with the projection it read the same marks (§3.4) |
-| expiry | in the table's own DDL. Every row of a UTC day expires at the day's start plus the level's retention (`PULSUS_ROLLUP_RETENTION_DAYS`, else `PULSUS_RETENTION_DAYS`); with `PULSUS_ROLLUP_HOT_DAYS` its `--@level-cold ` line moves the part to the cold volume at the day's start plus the move age; and `ttl_only_drop_parts` drops a day's part whole |
+| expiry | in the table's own DDL. Every row of a UTC day expires at the day's end plus the level's retention (`PULSUS_ROLLUP_RETENTION_DAYS`, else `PULSUS_RETENTION_DAYS`); with `PULSUS_ROLLUP_HOT_DAYS` its `--@level-cold ` line moves the part to the cold volume at the day's end plus the move age; and `ttl_only_drop_parts` drops a day's part whole |
 | comment | `rollup_res_ms=<ms> rollup_from_ms=<ms> counter_buckets=<n>`, which the binary reads to discover the levels, the query range from which each is the resolution and the counter bucket count (`reading.md` §2). `{{from_ms}}` is `0` for the first level, else that level's range followed by `000`, written as text as `{{level_ms}}` is: 7,776,000,000 exceeds 32 bits |
 | wrapper | a wrapper created `AS` a table with a projection carries the columns and no projection |
 

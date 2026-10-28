@@ -219,7 +219,7 @@ The rollup levels hold per-series summaries of each bucket of a fixed size, one 
 | table | `metric_samples_<N>s` for a level of `N` seconds: `MergeTree`, `ORDER BY (org_id, fingerprint, t_end)`, `PARTITION BY toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC')`, `index_granularity = 1024`, `COMMENT 'rollup_res_ms=<N>000 rollup_from_ms=<F> counter_buckets=<C>'`, `<F>` `0` for the first level and that level's range followed by `000` for the others, `<C>` the counter bucket count, which the server reads back to choose levels; clustered, a `metric_samples_<N>s_dist` wrapper on `cityHash64(fingerprint)` |
 | bucket | `(t_end − N s, t_end]`, so a bucket never crosses a UTC day |
 | projection | `by_parent`, `SELECT *` ordered by `(intDiv(t_end - 1, <next level's ms>), org_id, fingerprint, t_end)`, on every level whose next level is shorter than a day: the next level's run reads its window through it. A level whose next level is a day has none: that run reads its source's day partition |
-| expiry | the start of the UTC day of `t_end − 1 ms` + the level's `PULSUS_ROLLUP_RETENTION_DAYS` item, `PULSUS_RETENTION_DAYS` when that is unset, dropped by whole part (`ttl_only_drop_parts = 1`) ([configuration.md §7](configuration.md)) |
+| expiry | the end of the UTC day of `t_end − 1 ms` + the level's `PULSUS_ROLLUP_RETENTION_DAYS` item, `PULSUS_RETENTION_DAYS` when that is unset, dropped by whole part (`ttl_only_drop_parts = 1`) ([configuration.md §7](configuration.md)) |
 | view | `metric_samples_<N>s_mv`, `REFRESH <timer> APPEND TO metric_samples_<N>s`; each run writes its data rows and its run rows in one statement, one part per partition, with `max_threads = 2` |
 
 **A data row** (`kind = 0`) summarizes one series in one bucket:
