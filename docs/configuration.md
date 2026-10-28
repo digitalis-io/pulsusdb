@@ -170,7 +170,7 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PULSUS_RETENTION_DAYS` | none: required | `R` in the table below, in days: the raw retention, each rollup level's when `PULSUS_ROLLUP_RETENTION_DAYS` is unset, and the least the metric catalogue keeps (`C`). Without it the script exits `2` before it contacts the server; it accepts a whole number from `1` to `4294967295` with no leading zero, and refuses anything else the same way. The script writes it into every TTL below but a rollup level's (`L`) and the five metric catalogue tables' (`C`), and into the database comment `retention_days=<N>` |
+| `PULSUS_RETENTION_DAYS` | none: required | `R` in the table below, in days. Without it the script exits `2` before it contacts the server; it accepts a whole number from `1` to `4294967295` with no leading zero, and refuses anything else the same way. The script writes it into the TTLs marked `R` below, into each rollup level's (`L`) when `PULSUS_ROLLUP_RETENTION_DAYS` is unset, into the five metric catalogue tables' (`C`) as their least, and into the database comment `retention_days=<N>`; the three landing tables' TTLs (`H`) take their own hours |
 | `PULSUS_METRICS_LANDING_RETENTION_HOURS` | `6` | `H` for `metric_landing`, in hours. A whole number from `1` to `168`; anything else is exit `2` |
 | `PULSUS_LOG_LANDING_RETENTION_HOURS` | `6` | `H` for `log_landing`, with the same rule |
 | `PULSUS_TRACE_LANDING_RETENTION_HOURS` | `6` | `H` for `trace_landing`, with the same rule |
