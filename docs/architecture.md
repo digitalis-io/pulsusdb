@@ -173,7 +173,7 @@ Rule groups (`kind` = `logs` | `metrics`) live in a `rules` `ReplacingMergeTree`
 
 ### 3.6 Retention
 
-Retention is the TTL each table is created with in `schema/schema.sql`. `PULSUS_RETENTION_DAYS`, which `schema/schema.sh` requires and which has no default, sets the TTLs marked `R` in [configuration.md §7](configuration.md); a rollup level's is its `PULSUS_ROLLUP_RETENTION_DAYS` item (`L`), the metric catalogue's the longest of those and `PULSUS_RETENTION_DAYS` (`C`), and each landing table's its own hours (`H`). The binary reads `PULSUS_RETENTION_DAYS` back from the database. Each table's expiry is in that section. `PULSUS_STORAGE_POLICY` attaches a ClickHouse storage policy for hot/cold tiering.
+Retention is the TTL each table is created with in `schema/schema.sql`. `PULSUS_RETENTION_DAYS`, which `schema/schema.sh` requires and which has no default, sets the TTLs marked `R` in [configuration.md §7](configuration.md); a rollup level's is its `PULSUS_ROLLUP_RETENTION_DAYS` item, or `PULSUS_RETENTION_DAYS` when that is unset (`L`), the metric catalogue's the largest of `PULSUS_RETENTION_DAYS` and every level's item (`C`), and each landing table's its own hours (`H`). The binary reads `PULSUS_RETENTION_DAYS` back from the database. Each table's expiry is in that section. `PULSUS_STORAGE_POLICY` attaches a ClickHouse storage policy for hot/cold tiering.
 
 ---
 
