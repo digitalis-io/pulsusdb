@@ -972,3 +972,111 @@ fn c17_the_bundle_runs_its_own_script() {
     assert_eq!(out, file(&files, "schema-rendered.sql"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The `sh` block of `setup.md`'s step 4.
+fn step4_command(md: &str) -> String {
+    let section = section(md, "4");
+    let at = section.find("```sh\n").expect("step 4's command") + "```sh\n".len();
+    section[at..at + section[at..].find("```").expect("the fence closes")].to_string()
+}
+
+/// **Review r1 finding 1: step 4 stops, naming the password variable, when
+/// it is not set in the shell that runs it.**
+#[test]
+fn step4_refuses_to_run_without_the_password() {
+    let files = files(&example());
+    let md = file(&files, "setup.md");
+    assert!(
+        section(md, "4").contains("PULSUS_CLICKHOUSE_PASSWORD"),
+        "step 4 says where the password comes from"
+    );
+    let dir = fresh_dir("step4");
+    let list: Vec<pulsus_setup::File> = files
+        .iter()
+        .map(|(path, content)| pulsus_setup::File {
+            path: path.clone(),
+            content: content.clone(),
+        })
+        .collect();
+    write_bundle(&dir, &list).expect("write the bundle");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(step4_command(md))
+        .current_dir(&dir)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PULSUS_SCHEMA_WAIT_SECONDS", "1")
+        .output()
+        .expect("run sh");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("PULSUS_CLICKHOUSE_PASSWORD"), "{stderr}");
+    assert!(
+        !stderr.contains("did not answer"),
+        "it stops before the server: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **Review r1 finding 2: a bundle is not written over an earlier one,
+/// whose files the new one may not have.**
+#[test]
+fn a_bundle_is_not_written_over_another() {
+    let dir = fresh_dir("over");
+    let tls = bundle(&validated(&example()));
+    write_bundle(&dir, &tls).expect("the first bundle");
+    assert!(dir.join("nodes/1/config.d/pulsus-tls.xml").exists());
+    let plain = bundle(&validated(&no_tls()));
+    let err = write_bundle(&dir, &plain).expect_err("the directory holds a bundle");
+    assert!(err.to_string().contains("not empty"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **Review r1 finding 3: the object-storage URL's whole authority is
+/// checked, its port included.**
+#[test]
+fn the_remote_url_authority_is_checked() {
+    let message =
+        "must be an http(s) URL with a host, ending in /, without a user, query or fragment";
+    for bad in [
+        "https://h:99999/b/",
+        "https://h:0/b/",
+        "https://h:65536/b/",
+        "https://h:/b/",
+        "https://bad_host/b/",
+        "https://-h/b/",
+    ] {
+        assert_eq!(
+            field_messages(&with(example(), &[("remote_url", bad)]), "remote_url"),
+            [message],
+            "{bad:?}"
+        );
+    }
+    for good in [
+        "https://h:65535/b/",
+        "http://10.0.0.1:9000/b/",
+        "https://s3.example/b/",
+    ] {
+        assert!(
+            field_messages(&with(example(), &[("remote_url", good)]), "remote_url").is_empty(),
+            "{good:?}"
+        );
+    }
+}
+
+/// **Review r1 finding 5: raw data with no object-storage days, under the
+/// tiered policy, is described as the levels are: no move rule, local
+/// while the disk has room.**
+#[test]
+fn raw_data_with_no_remote_days_has_no_move_rule() {
+    let lines = pulsus_setup::total_lines(&validated(&with(example(), &[("raw_remote_days", "")])));
+    assert_eq!(
+        lines[0],
+        "Raw data: kept at least 7 days; no move rule; on local disk while the local disk has room"
+    );
+    let local_only = pulsus_setup::total_lines(&validated(&no_remote()));
+    assert_eq!(
+        local_only[0],
+        "Raw data: kept at least 7 days; at least 7 on local disk"
+    );
+}

@@ -575,8 +575,84 @@ async fn b16_v5_polls_until_the_levels_are_discovered() {
                 "no empty poll first"
             );
         } else {
-            assert_eq!(err, "V5: 0 levels, not 2\n");
+            assert_eq!(err, "V5: got null, want 2 levels\n");
         }
+        server.abort();
+    }
+}
+
+/// **Review r1 finding 4: with no levels, V5 passes only on an empty
+/// list: not before discovery (`null`), and not on a refused request.**
+#[tokio::test(flavor = "multi_thread")]
+async fn v5_for_no_levels_needs_an_answered_empty_list() {
+    let none = with(
+        example(),
+        &[
+            ("l1_width", ""),
+            ("l2_width", ""),
+            ("l3_width", ""),
+            ("l4_width", ""),
+        ],
+    );
+    let validated = pulsus_setup::validate(&pulsus_setup::Inputs::from_pairs(none))
+        .expect("no levels are accepted");
+    let files = pulsus_setup::bundle(&validated);
+    let block = v5_block(
+        &files
+            .iter()
+            .find(|f| f.path == "setup.md")
+            .expect("setup.md")
+            .content,
+    );
+    let quick = [("V5_TRIES", "1"), ("V5_PAUSE", "0")];
+    for (case, set, password, code, out_want, err_want) in [
+        (
+            "before discovery",
+            false,
+            "s3cret",
+            Some(1),
+            "",
+            "V5: got null, want 0 levels\n",
+        ),
+        (
+            "refused",
+            true,
+            "wrong",
+            Some(1),
+            "",
+            "V5: got an error, want 0 levels\n",
+        ),
+        (
+            "discovered, none",
+            true,
+            "s3cret",
+            Some(0),
+            "V5: 0 levels\n",
+            "",
+        ),
+    ] {
+        let st = state(Config::default());
+        if set {
+            st.rollup_levels.set(pulsus_read::metrics::rollup::Levels {
+                levels: Vec::new(),
+                shards: 1,
+                counter_buckets: 5,
+            });
+        }
+        let app = router(&st);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut env = quick.to_vec();
+        env.push(("PULSUS_ADMIN_PASSWORD", password));
+        let (got, out, err) = run_v5(block.clone(), url, &env).await;
+        assert_eq!(
+            (got, out.as_str(), err.as_str()),
+            (code, out_want, err_want),
+            "{case}"
+        );
         server.abort();
     }
 }
