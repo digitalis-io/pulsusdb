@@ -201,10 +201,7 @@ pub(crate) fn build_router(state: AppState, config: &Config) -> Result<Router, S
     // Issue #746: the admin router, outside the CORS layer. `admin` comes
     // first so the merge keeps the data-plane router's fallback, behind its
     // authentication and CORS layers, for every unmatched path.
-    let router = match crate::admin::router(config) {
-        Some(admin) => admin.merge(router),
-        None => router,
-    };
+    let router = crate::admin::router(config).merge(router);
 
     Ok(router.with_state(state))
 }

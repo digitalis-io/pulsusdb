@@ -1020,9 +1020,22 @@ impl Config {
     /// Issue #746: whether the admin password is still the default
     /// `admin`, which the server warns about at startup.
     pub fn admin_password_is_default(&self) -> bool {
-        self.admin_password
+        self.admin_pair().1 == DEFAULT_ADMIN_PASSWORD
+    }
+
+    /// Issue #746: the admin pair in force. A half that is absent or empty
+    /// is its default, so the admin UI is always mounted.
+    pub fn admin_pair(&self) -> (&str, &str) {
+        let user = self.admin_user.as_deref().filter(|u| !u.is_empty());
+        let password = self
+            .admin_password
             .as_ref()
-            .is_some_and(|p| p.expose() == DEFAULT_ADMIN_PASSWORD)
+            .map(|p| p.expose())
+            .filter(|p| !p.is_empty());
+        (
+            user.unwrap_or(DEFAULT_ADMIN_USER),
+            password.unwrap_or(DEFAULT_ADMIN_PASSWORD),
+        )
     }
 }
 

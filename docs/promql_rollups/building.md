@@ -299,11 +299,10 @@ The default set:
 
 | level | timer | `d_i` | worst age of its watermark |
 |---|---|---:|---:|
-| 5 s | `EVERY 1 MINUTE` | 180 s | 270 s (`2p + 150 s`) |
-| 60 s | `EVERY 1 MINUTE` | 240 s | 300 s (`R + d`) |
-| 720 s | `EVERY 12 MINUTE OFFSET 300 SECOND` | 300 s | 1,020 s |
-| 7200 s | `EVERY 2 HOUR OFFSET 360 SECOND` | 360 s | 7,560 s |
-| 86400 s | `EVERY 1 DAY OFFSET 420 SECOND` | 420 s | 86,820 s |
+| 60 s | `EVERY 1 MINUTE` | 180 s | 270 s (`2p + 150 s`) |
+| 720 s | `EVERY 12 MINUTE OFFSET 240 SECOND` | 240 s | 960 s (`R + d`) |
+| 7200 s | `EVERY 2 HOUR OFFSET 300 SECOND` | 300 s | 7,500 s |
+| 86400 s | `EVERY 1 DAY OFFSET 360 SECOND` | 360 s | 86,760 s |
 
 The server accepted `EVERY 12 MINUTE OFFSET 240 SECOND`, `EVERY 2 HOUR OFFSET 300 SECOND`, `EVERY 1 DAY OFFSET 360 SECOND`, `EVERY 6 HOUR OFFSET 420 SECOND`, `EVERY 5 MINUTE OFFSET 240 SECOND`, `EVERY 90 SECOND` and `EVERY 1 MINUTE`. For a view created at 14:49:58 the next runs were at 14:52, 16:05, 00:06, 18:07, 14:54, 14:51:00 and 14:50, each a multiple of its period plus its offset. Output not kept.
 
@@ -410,14 +409,14 @@ One UTC day, 4,000 series: half counters resetting every 500–799 samples, 40 r
 | 86400 s level | 88,871 | 0.08 % | 87,945 | 0.49 % |
 | all levels and projections | 851,660,388 | 766 % | 329,906,439 | 1,847 % |
 
-The table predates `flags` and the projection rule of §2.2: the default set no longer stores the 7200 s projection, so its total is 765.7 % at 15 s and 1,843.4 % at 60 s (§1.3).
+The table predates `flags` and the projection rule of §2.2: the five-level set `5,60,720,7200,86400` no longer stores the 7200 s projection, so its total is 765.7 % at 15 s and 1,843.4 % at 60 s; the default set, 60 s first, is 103.8 % and 634.0 % (§1.3).
 
 Landing holds 6 hours by default (`metrics_landing_hours`, `schema/schema.sh:54`), so its daily figure is four times what it stores.
 
 | cost | figures | the alternative |
 |---|---|---|
 | a level at or below the scrape interval stores more than raw and saves nothing | the 60 s level at a 60 s scrape: 336 % of raw, the same rows; a 5 s level at 15 s: 379 % | choose levels above the scrape interval (§1.3) |
-| the projection a level carries for the next level's run is the largest cost after the level itself | default set at 15 s: the 5 s level's projection is 283 % of raw and the 60 s projection 43.1 %, of 765.7 % | build the second level from landing instead of the first level: no projection, each run reads its own window of landing, and the chain is broken at that step. Not measured |
+| the projection a level carries for the next level's run is the largest cost after the level itself | the five-level set at 15 s: the 5 s level's projection is 283 % of raw and the 60 s projection 43.1 %, of 765.7 % | build the second level from landing instead of the first level: no projection, each run reads its own window of landing, and the chain is broken at that step. Not measured |
 | landing grows with its block key | ×1.30 at 15 s, ×2.73 at 60 s, of a 6-hour buffer | keep the earlier key and read 11.6 times the rows per first-level run (§3.4) |
 
 ### 6.2 Cost per run

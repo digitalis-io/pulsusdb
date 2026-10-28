@@ -241,11 +241,10 @@ A coarser level's row is composed from the rows of the level below in its bucket
 
 | level | timer |
 |---|---|
-| 5 s | `EVERY 1 MINUTE` |
 | 60 s | `EVERY 1 MINUTE` |
-| 720 s | `EVERY 12 MINUTE OFFSET 300 SECOND` |
-| 7200 s | `EVERY 2 HOUR OFFSET 360 SECOND` |
-| 86400 s | `EVERY 1 DAY OFFSET 420 SECOND` |
+| 720 s | `EVERY 12 MINUTE OFFSET 240 SECOND` |
+| 7200 s | `EVERY 2 HOUR OFFSET 300 SECOND` |
+| 86400 s | `EVERY 1 DAY OFFSET 360 SECOND` |
 
 **The first level's read.** It reads `metric_landing` (`kind = 0`) with exact repeats of `(series, time, value bits)` dropped and the samples of one millisecond ordered by value bits. A run's window ends at the last whole period at least 150 s ago, the settle time an insert may still commit in. It starts at the watermark (with no run row yet, one period before that end), covers five periods at most per run, and starts no earlier than `metric_landing` still holds: `now − H hours + 720 s`, rounded up to a period. A sample in the window takes as its previous sample one less than 120 s before the window's start. Landing is keyed by `(kind, intDiv(unix_milli, 300000), org_id, metric_name, fingerprint, unix_milli)`, and the read names the 5-minute blocks it needs, so a run reads only them.
 

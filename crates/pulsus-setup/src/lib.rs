@@ -107,7 +107,7 @@ pub fn sizing(v: &Validated) -> Vec<(&'static str, String)> {
 }
 
 /// Every form field, in the form's order: the scalar fields, then each
-/// level row's (row 1 has no switch point).
+/// level row's, each with its switch point.
 pub fn field_names() -> Vec<String> {
     let mut names: Vec<String> = [
         "hosts",

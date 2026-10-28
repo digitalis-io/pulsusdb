@@ -1,9 +1,9 @@
 //! The admin UI (issue #746 parts B and C): status, database and
 //! configuration pages and the setup form under `/admin/`, and their JSON
 //! API under `/admin/api/v1/`. Each
-//! page and its endpoint are built from one view value (`views`). Mounted
-//! only with the admin pair; `app::build_router` merges it outside the CORS
-//! layer.
+//! page and its endpoint are built from one view value (`views`). Always
+//! mounted, behind the admin pair; `app::build_router` merges it outside the
+//! CORS layer.
 
 use axum::Router;
 use axum::extract::Request;
@@ -21,13 +21,12 @@ mod pages;
 mod setup;
 pub(crate) mod views;
 
-/// The admin routes, or `None` when a configuration file sets either admin
-/// field to null; unset, the pair is `admin` / `admin`. The pages
-/// refuse with the plain `401`, the API with the JSON one; every response
-/// carries the two headers `headers` sets.
-pub(crate) fn router(config: &Config) -> Option<Router<AppState>> {
-    let page_auth = crate::middleware::admin_auth_layer(config, false)?;
-    let api_auth = crate::middleware::admin_auth_layer(config, true)?;
+/// The admin routes, behind the admin pair (`Config::admin_pair`). The
+/// pages refuse with the plain `401`, the API with the JSON one; every
+/// response carries the two headers `headers` sets.
+pub(crate) fn router(config: &Config) -> Router<AppState> {
+    let page_auth = crate::middleware::admin_auth_layer(config, false);
+    let api_auth = crate::middleware::admin_auth_layer(config, true);
     let pages = Router::new()
         .route("/admin/", get(pages::status))
         .route("/admin/database", get(pages::database))
@@ -43,13 +42,11 @@ pub(crate) fn router(config: &Config) -> Option<Router<AppState>> {
         .route("/admin/api/v1/setup/validate", post(api::setup_validate))
         .route("/admin/api/v1/setup/bundle", post(api::setup_bundle))
         .layer(api_auth);
-    Some(
-        pages
-            .merge(api)
-            .layer(axum::middleware::from_fn(headers))
-            .layer(axum::middleware::from_fn(crate::request_id::stamp))
-            .layer(crate::middleware::trace_layer()),
-    )
+    pages
+        .merge(api)
+        .layer(axum::middleware::from_fn(headers))
+        .layer(axum::middleware::from_fn(crate::request_id::stamp))
+        .layer(crate::middleware::trace_layer())
 }
 
 /// `Content-Security-Policy: default-src 'self'` and `Cache-Control:

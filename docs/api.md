@@ -904,7 +904,7 @@ For a historical window (outside the resident label cache's `PULSUS_CACHE_WINDOW
 GET /api/v1/status/buildinfo     → version, revision, build metadata
 GET /api/v1/status/config        → effective config (redacted), Prometheus envelope
 GET /api/v1/status/flags         → static-equivalent flag map
-GET /api/v1/status/runtimeinfo   → process start time, storage retention (`<N>d`, the retention the database states; `503` until read), and `rollupLevels`, the rollup levels the database holds, smallest first, as durations (`["5s","1m","12m","2h","1d"]` by default; `[]` when none or not yet read)
+GET /api/v1/status/runtimeinfo   → process start time, storage retention (`<N>d`, the retention the database states; `503` until read), and `rollupLevels`, the rollup levels the database holds, smallest first, as durations (`["1m","12m","2h","1d"]` by default; `[]` when none or not yet read)
 GET /api/v1/status/tsdb          ?limit=   → numSeries, top metrics by cardinality
 ```
 

@@ -228,21 +228,17 @@ pub(crate) fn auth_layer(config: &Config) -> Option<ValidateRequestHeaderLayer<B
 }
 
 /// HTTP Basic auth for the admin UI (issue #746): the pair
-/// `PULSUS_ADMIN_USER` / `PULSUS_ADMIN_PASSWORD`, `admin` / `admin` unless
-/// set; `None` only when a configuration file sets either to null. `json` selects
+/// `PULSUS_ADMIN_USER` / `PULSUS_ADMIN_PASSWORD`, each half `admin` unless
+/// set (`Config::admin_pair`). `json` selects
 /// the JSON `401` body the admin API answers with.
 pub(crate) fn admin_auth_layer(
     config: &Config,
     json: bool,
-) -> Option<ValidateRequestHeaderLayer<BasicAuth>> {
-    let user = config.admin_user.as_deref()?;
-    let password = config.admin_password.as_ref()?;
-    let credentials = format!("{user}:{}", password.expose());
+) -> ValidateRequestHeaderLayer<BasicAuth> {
+    let (user, password) = config.admin_pair();
+    let credentials = format!("{user}:{password}");
     let expected = format!("Basic {}", base64_encode(credentials.as_bytes()));
-    Some(ValidateRequestHeaderLayer::custom(BasicAuth {
-        expected,
-        json,
-    }))
+    ValidateRequestHeaderLayer::custom(BasicAuth { expected, json })
 }
 
 /// Validates the `Authorization` header against a precomputed `Basic

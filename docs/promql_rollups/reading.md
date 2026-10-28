@@ -114,7 +114,7 @@ SELECT toUInt32(uniqExact(shard_num)) AS shards FROM system.clusters WHERE clust
 | guard | rule (`fits`, `crates/pulsus-read/src/metrics/rollup.rs:283`; `excluded`, `crates/pulsus-read/src/metrics/rollup.rs:300`) |
 |---|---|
 | G1 range | a range function's range is a whole multiple of the width and at least one width, `counter_buckets` widths for `rate` and `increase`; otherwise a finer level that meets it, else raw. On a 7-day panel at step 5 m with `start` on a 2 h boundary, `rate(x[5m])` is widened to `rate(x[2h])` (R2a) and reads the 720 s level: 2 h is ten 720 s buckets, which meets the minimum of five, but only one 7200 s bucket |
-| G2 time | the window's end, the grid time minus `offset` (or the `@` time minus `offset`), is a bucket end of the level; otherwise a finer level whose width divides it, else raw. `x offset 90s` on a 7-day query reads the 5 s level |
+| G2 time | the window's end, the grid time minus `offset` (or the `@` time minus `offset`), is a bucket end of the level; otherwise a finer level whose width divides it, else raw. `x offset 90s` on a 7-day query reads raw at the default levels: its window ends fall 30 s past a minute |
 | G3 kind | `rollup_use` is set (§1); not in a subquery, `anchored` or `smoothed`, `info()`'s selector, or under a histogram-statistics function; the selector names its metric and carries no `__name__` matcher beside the name |
 
 The published distances (§1.1, `docs/api.md` §3.6) were measured at `counter_buckets` = 5 and hold for that value.
@@ -148,15 +148,14 @@ ORDER BY kind, fingerprint, t_end
 
 The property this rests on was measured on the development cluster while an earlier rollup design was prototyped: with fetches stopped on one replica of a shard, a read through the distributed table on that replica returned neither the rows nor the coverage row of a block inserted on its peer. That output was not kept. `a_run_row_is_read_with_its_data` (`crates/pulsus-read/tests/live_metrics_rollup_cluster.rs:177`) checks it for this read in CI's cluster job.
 
-How much of a window its level does not serve, default set, levels up to date (`building.md` §3.3):
+How much of a window its level does not serve, default set, levels up to date (`building.md` §3.3); a range under 1 h reads raw whole:
 
 | query range | level | after its watermark, at most | of which raw, at most | share of the window |
 |---|---|---:|---:|---:|
-| 30 min | 5 s | 270 s | 270 s | 15.0 % |
-| 1 h | 60 s | 300 s | 270 s | 8.3 % |
-| 24 h | 720 s | 1,020 s | 270 s | 1.2 % |
-| 7 d | 7200 s | 7,560 s | 270 s | 1.3 % |
-| 90 d | 86400 s | 86,820 s | 270 s | 1.1 % |
+| 1 h | 60 s | 270 s | 270 s | 7.5 % |
+| 24 h | 720 s | 960 s | 270 s | 1.1 % |
+| 7 d | 7200 s | 7,500 s | 270 s | 1.2 % |
+| 90 d | 86400 s | 86,760 s | 270 s | 1.1 % |
 
 ### 3.1 Rows read
 
@@ -187,7 +186,7 @@ The routed reads include the finer levels and raw after each level's watermark.
 
 ### 4.2 From a running server
 
-`GET /api/v1/status/runtimeinfo` carries `rollupLevels`: the discovered levels in duration form, smallest first (`rollup_levels`, `crates/pulsus-server/src/prom_api/encode.rs:932`; `status_runtimeinfo`, `crates/pulsus-server/src/prom_api/handlers.rs:753`). `["5s","1m","12m","2h","1d"]` for the default; `[]` when none are built and before the first discovery.
+`GET /api/v1/status/runtimeinfo` carries `rollupLevels`: the discovered levels in duration form, smallest first (`rollup_levels`, `crates/pulsus-server/src/prom_api/encode.rs:932`; `status_runtimeinfo`, `crates/pulsus-server/src/prom_api/handlers.rs:753`). `["1m","12m","2h","1d"]` for the default; `[]` when none are built and before the first discovery.
 
 | candidate | verdict |
 |---|---|
