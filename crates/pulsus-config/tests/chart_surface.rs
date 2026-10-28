@@ -858,8 +858,10 @@ fn the_chart_schema_accepts_no_value_the_binary_refuses() {
         schema_accepts(&schema, config_schema, &values),
         "values.yaml's own configuration must pass the schema"
     );
+    // Ten: `log_rollup_resolution` takes `logRollupResolution` (issue #746
+    // part A), which the binary does not trim, so it is not a trimmed key.
     assert!(
-        padded_keys >= 11,
+        padded_keys >= 10,
         "the padded probes reached only {padded_keys} keys"
     );
     assert!(
