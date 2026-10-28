@@ -76,9 +76,9 @@ pub fn bundle(v: &Validated) -> Vec<File> {
     files
 }
 
-/// Writes `files` as the new directory `dir`. They are written into a
-/// temporary directory beside it, which is then renamed to `dir`, so `dir`
-/// holds one whole bundle or nothing. A `dir` that already exists is
+/// Writes `files` as the new directory `dir`, creating its parents. They
+/// are written into a temporary directory beside it, which is then renamed
+/// to `dir`, so `dir` holds one whole bundle or nothing. A `dir` that already exists is
 /// refused, and an error reading it is returned; two writers to one `dir`
 /// get one bundle and one refusal. The schema script is made executable.
 pub fn write_bundle(dir: &Path, files: &[File]) -> std::io::Result<()> {
@@ -106,6 +106,7 @@ pub fn write_bundle(dir: &Path, files: &[File]) -> std::io::Result<()> {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
+    std::fs::create_dir_all(parent)?;
     let mut n = 0u32;
     let tmp = loop {
         let candidate = parent.join(format!(".{name}.{}-{n}", std::process::id()));
