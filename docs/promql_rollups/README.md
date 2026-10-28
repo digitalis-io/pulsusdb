@@ -1,6 +1,6 @@
 # PromQL rollups: design
 
-**Built.** Part A (#742), part B (#744) and the follow-up that chooses the resolution by the query's time range (issue #18) are on `main`; every statement about code in these documents is true of `main` with that follow-up. Tiering of the raw tables (#743 part A) is on main; a level's own retention and move age (#743 part B) are not started.
+**Built.** Part A (#742), part B (#744) and the follow-up that chooses the resolution by the query's time range (issue #18) are on `main`; every statement about code in these documents is true of `main` with that follow-up. Tiering (#743 part A) and a level's own retention and move age (#743 part B) are on main.
 
 A rollup level is a table of per-series bucket summaries of one width, built on a timer from the level below it, and read instead of raw samples at the resolution chosen by the query's time range. Its answers approximate the raw answer, by amounts measured per function and level.
 
@@ -38,7 +38,7 @@ The user's account is `docs/api.md` §3.6 and the setting's is `docs/configurati
 | D16 | A level carries the projection its next level's run reads only when that next level is shorter than a day | — | `building.md` §2.2 |
 | D17 | The query ranges at which the resolution switches to each level, and the counter bucket count, are set when the schema is built and stored in each level table's comment, where the server reads them | owner (2026-10-26) | `building.md` §1, `reading.md` §2 |
 
-**How the engine is meant to be used, and what differs.** The engine's ordinary rollup is an insert-time materialized view into an aggregating table, as `log_metrics_<res>` is built (`schema/schema.sql:568`, `log_metrics_{{log_rollup_suffix}}_mv`). The levels use refreshable views on timers instead, as `service_edges_mv` is built (`schema/schema.sql:813`). That follows the owner's decision on timers. What it costs, and how the cost is kept down, is `building.md` §3.4 and §5.
+**How the engine is meant to be used, and what differs.** The engine's ordinary rollup is an insert-time materialized view into an aggregating table, as `log_metrics_<res>` is built (`schema/schema.sql:573`, `log_metrics_{{log_rollup_suffix}}_mv`). The levels use refreshable views on timers instead, as `service_edges_mv` is built (`schema/schema.sql:818`). That follows the owner's decision on timers. What it costs, and how the cost is kept down, is `building.md` §3.4 and §5.
 
 ## 2. Parts
 
@@ -46,7 +46,7 @@ Each part was its own plan, review, branch and pull request inside issue #18.
 
 | part | what it built |
 |---|---|
-| A (#742) | `PULSUS_ROLLUP_LEVELS` and its validation in `schema/schema.sh` and `pulsus_schema::parse_rollup_levels`; the level template (`schema/schema.sql:965-1090`), its prefixes, run rows and derived timers; `metric_landing`'s block key; the removal of the earlier design's `metric_rollup` table, its plan table, their views and wrapper, the settle constant and the window algebra's reset cap |
+| A (#742) | `PULSUS_ROLLUP_LEVELS` and its validation in `schema/schema.sh` and `pulsus_schema::parse_rollup_levels`; the level template (`schema/schema.sql:989-1120`), its prefixes, run rows and derived timers; `metric_landing`'s block key; the removal of the earlier design's `metric_rollup` table, its plan table, their views and wrapper, the settle constant and the window algebra's reset cap |
 | B (#744) | discovery, eligibility and the level choice; the one-statement level fetch and its coverage; the finer levels and raw after a level; the points of `reading.md` §1 and the raw overlay; `rollupLevels` in `runtimeinfo`; the explain stages and `exactness`; `docs/api.md` §3.6. In part A's first-level statement: the predecessor of D14, and `flags` with the last non-stale sample of D13 |
 
 The window algebra of issue #18 part 3 (#740) stays as the raw functions' arithmetic (`summarize_counter`, `crates/pulsus-promql/src/eval/functions.rs:187`), and the raw fetch's value-bits order (`reinterpretAsUInt64`, `crates/pulsus-read/src/metrics/sample_sql.rs:99`), which D12 builds the first level in.
@@ -75,4 +75,4 @@ The window algebra of issue #18 part 3 (#740) stays as the raw functions' arithm
 
 ## 4. Later
 
-Each level's expiry is its own table's TTL, rendered from `{{retention_days}}`, the raw retention. The levels have no move rule but are on the storage policy, so a new level part reaches the cold volume only when the local volume is full ([configuration.md §7](../configuration.md), Tiering); a level's own retention and move age are #743 part B, not started.
+Each level's expiry is its own table's TTL: its `PULSUS_ROLLUP_RETENTION_DAYS` item, else the raw retention (`{{level_retention_days}}`). A level moves to the cold volume at its `PULSUS_ROLLUP_HOT_DAYS` item, and, like every table on the storage policy, a new level part can reach the cold volume when the local volume is full ([configuration.md §7](../configuration.md), Tiering).

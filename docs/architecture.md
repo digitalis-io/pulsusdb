@@ -133,7 +133,7 @@ Decisions and their reasons:
 
 - **JSON labels, not `Map`.** `JSONExtractString(labels, k)` outperforms `Map` access in ClickHouse, and the reader rarely extracts labels in SQL anyway (see label cache, §5.2).
 - **Activity folds on merge, and reads need no `FINAL`.** `metric_series` is an `AggregatingMergeTree` whose `hours` OR together; a read tests each unmerged row's mask against the window's hours, so a series is found whether or not its rows have merged.
-- **Labels stored once per series.** `metric_labels` holds one row per series, keyed `(org_id, metric_name, fingerprint)`, and is kept until the UTC day of its latest registration is past retention; `metric_series` keeps only activity, in daily partitions that expire with the samples. A metric's lookup rows are one key range, so a matcher with the name reads that metric's rows alone. No read joins: a read takes IDs from the lookup and the window from activity, and each answered series carries its own lookup row.
+- **Labels stored once per series.** `metric_labels` holds one row per series, keyed `(org_id, metric_name, fingerprint)`, and is kept until the UTC day of its latest registration is past the metric catalogue retention (`C`, [configuration.md §7](configuration.md)); `metric_series` keeps only activity, in daily partitions that expire after the same `C`. A metric's lookup rows are one key range, so a matcher with the name reads that metric's rows alone. No read joins: a read takes IDs from the lookup and the window from activity, and each answered series carries its own lookup row.
 
 ### 3.2 Logs
 
@@ -173,7 +173,7 @@ Rule groups (`kind` = `logs` | `metrics`) live in a `rules` `ReplacingMergeTree`
 
 ### 3.6 Retention
 
-Retention is the TTL each table is created with in `schema/schema.sql`, from the one value `schema/schema.sh` takes, `PULSUS_RETENTION_DAYS`, which has no default. The binary reads it back from the database. Each table's expiry is in [configuration.md §7](configuration.md). `PULSUS_STORAGE_POLICY` attaches a ClickHouse storage policy for hot/cold tiering.
+Retention is the TTL each table is created with in `schema/schema.sql`. `PULSUS_RETENTION_DAYS`, which `schema/schema.sh` requires and which has no default, sets the TTLs marked `R` in [configuration.md §7](configuration.md); a rollup level's is its `PULSUS_ROLLUP_RETENTION_DAYS` item, or `PULSUS_RETENTION_DAYS` when that is unset (`L`), the metric catalogue's the largest of `PULSUS_RETENTION_DAYS` and every level's item (`C`), and each landing table's its own hours (`H`). The binary reads `PULSUS_RETENTION_DAYS` back from the database. Each table's expiry is in that section. `PULSUS_STORAGE_POLICY` attaches a ClickHouse storage policy for hot/cold tiering.
 
 ---
 

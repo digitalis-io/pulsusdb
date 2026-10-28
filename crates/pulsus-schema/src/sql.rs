@@ -39,12 +39,15 @@ pub fn rendered(ctx: &RenderCtx) -> String {
         Some(_) => (CLUSTER, SINGLE),
         None => (SINGLE, CLUSTER),
     };
+    let moves = ctx.level_moves();
     let expanded = render::expand_levels(
         SCHEMA_SQL,
         (
             &ctx.rollup_levels,
             &ctx.rollup_ranges,
             ctx.rollup_counter_buckets,
+            &ctx.rollup_retention_days,
+            &moves,
         ),
     );
     let mut out = String::with_capacity(expanded.len());
@@ -90,6 +93,8 @@ pub fn expand_levels_for_tests(levels: &[u32]) -> String {
             levels,
             render::DEFAULT_ROLLUP_RANGES,
             render::DEFAULT_ROLLUP_COUNTER_BUCKETS,
+            &[],
+            &[],
         ),
     )
 }
@@ -219,12 +224,14 @@ mod tests {
         assert_eq!(marked("ENGINE = x", SINGLE), None);
     }
 
-    /// Only the two mode markers, the four level markers (issue #18) and the
-    /// three cold markers (issue #743 part A) may prefix a line with `--@`:
-    /// another would reach the server as text.
+    /// Only the two mode markers, the five level markers (issue #18; issue
+    /// #743 part B added `--@level-cold `) and the three cold markers (issue
+    /// #743 part A) may prefix a line with `--@`: another would reach the
+    /// server as text. The level block carries one `--@level-cold ` line.
     #[test]
     fn the_file_carries_no_marker_but_the_two_modes_and_the_level_and_the_cold_markers() {
         let mut level_lines = 0;
+        let mut level_cold_lines = 0;
         let mut cold_lines = [0usize; 3];
         for line in SCHEMA_SQL.lines() {
             if !line.starts_with("--@") {
@@ -235,10 +242,12 @@ mod tests {
                 "--@level-first ",
                 "--@level-next ",
                 "--@level-feeds ",
+                "--@level-cold ",
             ]
             .iter()
             .any(|m| line.starts_with(m));
             level_lines += usize::from(level);
+            level_cold_lines += usize::from(line.starts_with("--@level-cold "));
             let cold = [COLD_METRICS, COLD_LOGS, COLD_TRACES].map(|m| marked(line, m).is_some());
             for (n, c) in cold_lines.iter_mut().zip(cold) {
                 *n += usize::from(c);
@@ -252,6 +261,10 @@ mod tests {
             );
         }
         assert!(level_lines > 0, "the file carries the level block");
+        assert_eq!(
+            level_cold_lines, 1,
+            "the level block carries one --@level-cold line"
+        );
         for (marker, n) in [COLD_METRICS, COLD_LOGS, COLD_TRACES]
             .iter()
             .zip(cold_lines)

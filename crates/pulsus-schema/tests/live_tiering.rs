@@ -150,6 +150,9 @@ async fn old_days_move_and_every_answer_is_unchanged() {
         metrics_hot_days: Some(2),
         logs_hot_days: Some(2),
         traces_hot_days: Some(2),
+        // Issue #743 part B: every level moves after two days and keeps
+        // the retention.
+        rollup_hot_days: vec![2, 2, 2, 2, 2],
         ..RenderCtx::for_tests(&DB_TIERED, 30)
     };
     let plain = RenderCtx::for_tests(&DB_PLAIN, 30);
@@ -218,9 +221,65 @@ async fn old_days_move_and_every_answer_is_unchanged() {
             exec(&client, &format!("OPTIMIZE TABLE {db}.{table} FINAL")).await;
         }
     }
+    // Issue #743 part B: one 720 s level row for each of the two youngest
+    // days, in the tiered database only. Age 29.5 is left out: a level row
+    // is due at its day's start + 30 days, which can precede now.
+    let level_rows: Vec<&(u32, f64, i64)> = rows.iter().filter(|(_, a, _)| *a < 29.0).collect();
+    let level_tuples = level_rows
+        .iter()
+        .map(|(k, a, ts)| format!("({k}, {a}, toInt64({ts}))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {}.metric_samples_720s \
+             (kind, org_id, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags, built_at) \
+             SELECT 0, '', 1, (intDiv(r.3 - 1, 720000) + 1) * 720000, r.3, r.2, r.2, r.2, r.2, 1, 0, 0, 0 \
+             FROM (SELECT arrayJoin([{level_tuples}]) AS r)",
+            DB_TIERED.name()
+        ),
+    )
+    .await;
+    exec(
+        &client,
+        &format!(
+            "OPTIMIZE TABLE {}.metric_samples_720s FINAL",
+            DB_TIERED.name()
+        ),
+    )
+    .await;
 
     // (a) Where each day's parts are.
     let t = DB_TIERED.name();
+    for (_, a, ts) in &level_rows {
+        let t_end = ((ts - 1).div_euclid(720_000) + 1) * 720_000;
+        let partition = one(
+            &client,
+            &format!(
+                "SELECT toString(toDate(fromUnixTimestamp64Milli(toInt64({}) - 1), 'UTC')) AS s",
+                t_end
+            ),
+        )
+        .await;
+        let want = if *a > 2.0 { "cold_store" } else { "default" };
+        let disks = strings(
+            &client,
+            &format!(
+                "SELECT disk_name AS s FROM system.parts WHERE database = '{t}' \
+                 AND table = 'metric_samples_720s' AND active AND partition = '{partition}'"
+            ),
+        )
+        .await;
+        assert!(
+            !disks.is_empty(),
+            "metric_samples_720s: the day of the row {a} days old has a part"
+        );
+        assert!(
+            disks.iter().all(|d| d == want),
+            "metric_samples_720s: the part of a day {a} days old is on {want}: {disks:?}"
+        );
+    }
     for (k, a, ts) in &rows {
         let partition = one(
             &client,
@@ -302,6 +361,11 @@ async fn old_days_move_and_every_answer_is_unchanged() {
     for table in ["traces", "metric_series", "resources"] {
         let q = create_table_query(&client, t, table).await;
         assert!(!q.contains("storage_policy"), "{table}: {q}");
+    }
+    for level in pulsus_schema::DEFAULT_ROLLUP_LEVELS {
+        let table = format!("metric_samples_{level}s");
+        let q = create_table_query(&client, t, &table).await;
+        assert!(q.contains("TO VOLUME 'cold'"), "{table}: {q}");
     }
 
     for db in [DB_TIERED.name(), DB_PLAIN.name()] {

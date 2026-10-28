@@ -1,6 +1,6 @@
 # PromQL rollups: building the levels
 
-**Built.** Part A (#742), part B (#744) and the follow-up that chooses the resolution by the query's time range (issue #18) are on `main`; every statement about code below is true of `main` with that follow-up. Tiering of the raw tables (#743 part A) is on main; a level's own retention and move age (#743 part B) are not started.
+**Built.** Part A (#742), part B (#744) and the follow-up that chooses the resolution by the query's time range (issue #18) are on `main`; every statement about code below is true of `main` with that follow-up. Tiering (#743 part A) and a level's own retention and move age (#743 part B) are on main.
 
 ## 1. The setting
 
@@ -12,13 +12,13 @@
 | `PULSUS_ROLLUP_RANGES` | `3600,86400,604800,7776000` | for each level after the first, the query range in seconds from which it is the resolution (`reading.md` §2); read only when there are levels |
 | `PULSUS_ROLLUP_COUNTER_BUCKETS` | `5` | the buckets of a level a `rate` or `increase` range covers at least |
 
-They are schema-build settings, documented beside the other schema settings (`PULSUS_ROLLUP_LEVELS`, `docs/configuration.md:177`; the two after it on the next rows). `schema/schema.sh` reads them with no colon in the default, so unset gives the default and set-but-empty gives none (`rollup_levels`, `rollup_ranges`, `counter_buckets`, `schema/schema.sh:59-61`); `RenderCtx::for_tests` takes `DEFAULT_ROLLUP_LEVELS`, `DEFAULT_ROLLUP_RANGES` and `DEFAULT_ROLLUP_COUNTER_BUCKETS` (`crates/pulsus-schema/src/render.rs:115`). The binary has no rollup setting: it learns the levels, their switch points and the counter bucket count from the tables' comments (`reading.md` §2).
+They are schema-build settings, documented beside the other schema settings (`PULSUS_ROLLUP_LEVELS`, `docs/configuration.md:177`; the two after it on the next rows). `schema/schema.sh` reads them with no colon in the default, so unset gives the default and set-but-empty gives none (`rollup_levels`, `rollup_ranges`, `counter_buckets`, `schema/schema.sh:60-62`); `RenderCtx::for_tests` takes `DEFAULT_ROLLUP_LEVELS`, `DEFAULT_ROLLUP_RANGES` and `DEFAULT_ROLLUP_COUNTER_BUCKETS` (`crates/pulsus-schema/src/render.rs:123`). The binary has no rollup setting: it learns the levels, their switch points and the counter bucket count from the tables' comments (`reading.md` §2).
 
 Changing the set is a rebuild: drop the database and run `schema/schema.sh` again. A new set builds from what landing still holds.
 
 ### 1.2 Validation
 
-`schema/schema.sh` exits `2` before contacting the server (`bad_levels`, `schema/schema.sh:123-126`), and `pulsus_schema::parse_rollup_levels` returns an error (`parse_rollup_levels`, `crates/pulsus-schema/src/render.rs:285`), at the first rule that fails, in this order and with the same messages:
+`schema/schema.sh` exits `2` before contacting the server (`bad_levels`, `schema/schema.sh:134-137`), and `pulsus_schema::parse_rollup_levels` returns an error (`parse_rollup_levels`, `crates/pulsus-schema/src/render.rs:329`), at the first rule that fails, in this order and with the same messages:
 
 | rule | why |
 |---|---|
@@ -29,9 +29,9 @@ Changing the set is a rebuild: drop the database and run `schema/schema.sh` agai
 | each greater than the one before | each level is built from the one below |
 | each a multiple of the one before | a coarser bucket is a whole number of finer buckets |
 | at most 8 levels | each level is three objects and a timer; eight cover 5 s to 1 day with room |
-| `2 × max(R_1, 60) + 870 ≤ H × 3600`, with `R_1` the first level and `H` = `PULSUS_METRICS_LANDING_RETENTION_HOURS` (default 6, `metrics_landing_hours`, `schema/schema.sh:53`) | a normal first-level run reads back to `now − (2p + 150 s + 120 s)`, and 600 s more is kept spare. `14400` with `H = 6` is refused: `2 × 14,400 + 870 = 29,670 > 21,600` |
+| `2 × max(R_1, 60) + 870 ≤ H × 3600`, with `R_1` the first level and `H` = `PULSUS_METRICS_LANDING_RETENTION_HOURS` (default 6, `metrics_landing_hours`, `schema/schema.sh:54`) | a normal first-level run reads back to `now − (2p + 150 s + 120 s)`, and 600 s more is kept spare. `14400` with `H = 6` is refused: `2 × 14,400 + 870 = 29,670 > 21,600` |
 
-`PULSUS_ROLLUP_RANGES` is checked after the levels, and only when there are levels (`bad_ranges`, `schema/schema.sh:184`; `parse_rollup_ranges`, `crates/pulsus-schema/src/render.rs:337`), the first failing rule the message, `PULSUS_ROLLUP_RANGES: ` before it in the script:
+`PULSUS_ROLLUP_RANGES` is checked after the levels, and only when there are levels (`bad_ranges`, `schema/schema.sh:193`; `parse_rollup_ranges`, `crates/pulsus-schema/src/render.rs:381`), the first failing rule the message, `PULSUS_ROLLUP_RANGES: ` before it in the script:
 
 | rule | message |
 |---|---|
@@ -41,9 +41,9 @@ Changing the set is a rebuild: drop the database and run `schema/schema.sh` agai
 | each greater than the one before | `<a> then <b>: the ranges must increase` |
 | each at least its level | `<range> is shorter than its level <w>` |
 
-`PULSUS_ROLLUP_COUNTER_BUCKETS` is a whole number from 2 to 1000 with no leading zero, else `<v> is not a whole number from 2 to 1000` (`parse_rollup_counter_buckets`, `crates/pulsus-schema/src/render.rs:385`). One bucket would give a `rate` window one point at the levels under 720 s.
+`PULSUS_ROLLUP_COUNTER_BUCKETS` is a whole number from 2 to 1000 with no leading zero, else `<v> is not a whole number from 2 to 1000` (`parse_rollup_counter_buckets`, `crates/pulsus-schema/src/render.rs:429`). One bucket would give a `rate` window one point at the levels under 720 s.
 
-`the_script_renders_exactly_what_this_crate_renders` (`crates/pulsus-schema/tests/schema_file.rs:460`) holds the script's render and the crate's equal, and `the_script_and_the_crate_refuse_the_same_level_lists` (`crates/pulsus-schema/tests/schema_file.rs:2739`) and `the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets` (`crates/pulsus-schema/tests/schema_file.rs:2927`) hold their refusals equal.
+`the_script_renders_exactly_what_this_crate_renders` (`crates/pulsus-schema/tests/schema_file.rs:460`) holds the script's render and the crate's equal, and `the_script_and_the_crate_refuse_the_same_level_lists` (`crates/pulsus-schema/tests/schema_file.rs:2761`) and `the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets` (`crates/pulsus-schema/tests/schema_file.rs:2949`) hold their refusals equal.
 
 ### 1.3 The default, and what each set costs
 
@@ -68,7 +68,7 @@ Only sets drawn from 5, 60, 720, 7200 and 86400 s were measured; the `flags` col
 
 ### 2.1 One template, rendered once per level
 
-`schema/schema.sql` holds one level template, one contiguous block at the end of the file (`schema/schema.sql:965-1090`). Its lines carry a prefix that `expand_levels` (`crates/pulsus-schema/src/render.rs:527`) and the script's `awk` resolve before the `--@single`/`--@cluster` pass; the marker and exactly one space after it are removed, so a line may then carry a mode marker:
+`schema/schema.sql` holds one level template, one contiguous block at the end of the file (`schema/schema.sql:989-1120`). Its lines carry a prefix that `expand_levels` (`crates/pulsus-schema/src/render.rs:679`) and the script's `awk` resolve before the `--@single`/`--@cluster` pass; the marker and exactly one space after it are removed, so a line may then carry a mode marker:
 
 | prefix | rendered for |
 |---|---|
@@ -90,7 +90,7 @@ The block is replaced, in place, by its lines for each level in turn, smallest f
 
 ### 2.2 The level table
 
-The table's `CREATE TABLE` and its wrapper, as `schema/schema.sql:975-1001` carries them:
+The table's `CREATE TABLE` and its wrapper, as `schema/schema.sql:1004-1031` carries them:
 
 ```sql
 --@level CREATE TABLE IF NOT EXISTS {{db}}.metric_samples_{{level}}{{on_cluster}}
@@ -114,7 +114,8 @@ The table's `CREATE TABLE` and its wrapper, as `schema/schema.sql:975-1001` carr
 --@level --@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_samples_{{level}}', '{replica}')
 --@level PARTITION BY toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC')
 --@level ORDER BY (org_id, fingerprint, t_end)
---@level TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({{retention_days}} * 86400), 4294967295))
+--@level TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({{level_retention_days}} * 86400), 4294967295))
+--@level-cold , toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({{level_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 --@level --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}}
 --@level --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}}
 --@level COMMENT 'rollup_res_ms={{level_ms}} rollup_from_ms={{from_ms}} counter_buckets={{counter_buckets}}';
@@ -136,7 +137,7 @@ The table's `CREATE TABLE` and its wrapper, as `schema/schema.sql:975-1001` carr
 |---|---|
 | main key | fingerprint first, for queries. A parent-block main key would make queries read 4 to 120 times more rows (§6.3) |
 | projection `by_parent` | the next level's bucket first; only that level's run reads it (§3.4). A level whose next level is a day has none: the day run reads the source's day partition whole, and with the projection it read the same marks (§3.4) |
-| expiry | in the table's own DDL. Every row of a UTC day expires at the day's start plus the retention, and `ttl_only_drop_parts` drops a day's part whole |
+| expiry | in the table's own DDL. Every row of a UTC day expires at the day's start plus the level's retention (`PULSUS_ROLLUP_RETENTION_DAYS`, else `PULSUS_RETENTION_DAYS`); with `PULSUS_ROLLUP_HOT_DAYS` its `--@level-cold ` line moves the part to the cold volume at the day's start plus the move age; and `ttl_only_drop_parts` drops a day's part whole |
 | comment | `rollup_res_ms=<ms> rollup_from_ms=<ms> counter_buckets=<n>`, which the binary reads to discover the levels, the query range from which each is the resolution and the counter bucket count (`reading.md` §2). `{{from_ms}}` is `0` for the first level, else that level's range followed by `000`, written as text as `{{level_ms}}` is: 7,776,000,000 exceeds 32 bits |
 | wrapper | a wrapper created `AS` a table with a projection carries the columns and no projection |
 
@@ -144,13 +145,13 @@ The table's `CREATE TABLE` and its wrapper, as `schema/schema.sql:975-1001` carr
 
 Every run that has a window, whether or not it found samples, appends a run row with `kind = 1`, `org_id = ''`, `fingerprint = 0`, `t_last = lo`, `t_end = hi`, `built_at` = the run's start and every other column `0`: one row for each UTC day its `(lo, hi]` touches, each cut at midnight, so each lies in its day's partition. A run with no window, and every run on a replica that is not its shard's builder (§4.1), writes nothing.
 
-The run row is a `UNION ALL` branch of the run's own `SELECT`. With the block pins `max_insert_threads = 1` and `min_insert_block_size_rows` (`schema/schema.sql:1090`), a run's data rows and its run row are one part per partition, so a replica holds both or neither. Measured: each one-hour first-level run wrote 240,001 rows, 240,000 data rows and one run row, into one part (`measure/projection-run/10_60s_parts.tsv`).
+The run row is a `UNION ALL` branch of the run's own `SELECT`. With the block pins `max_insert_threads = 1` and `min_insert_block_size_rows` (`schema/schema.sql:1120`), a run's data rows and its run row are one part per partition, so a replica holds both or neither. Measured: each one-hour first-level run wrote 240,001 rows, 240,000 data rows and one run row, into one part (`measure/projection-run/10_60s_parts.tsv`).
 
 A level's coverage on a shard is the union of its run rows' `(t_last, t_end]`. A run row expires with its day's data.
 
 ### 2.4 `metric_landing`'s key
 
-The first level reads `metric_landing` by sample time, so landing is keyed by the 5-minute block of the sample time, `intDiv(unix_milli, 300000)`, after `kind`, whatever the set (`schema/schema.sql:283`):
+The first level reads `metric_landing` by sample time, so landing is keyed by the 5-minute block of the sample time, `intDiv(unix_milli, 300000)`, after `kind`, whatever the set (`schema/schema.sql:288`):
 
 ```sql
 ORDER BY (kind, intDiv(unix_milli, 300000), org_id, metric_name, fingerprint, unix_milli)
@@ -162,7 +163,7 @@ Its partition and expiry are those it had before. The cost is §6.1's: landing i
 
 ### 3.1 The view
 
-Each level's view, as `schema/schema.sql:1002-1090` carries it. `--@level-first` lines build the first level from `metric_landing`; `--@level-next` lines build every later level from `{{source}}`, the level below.
+Each level's view, as `schema/schema.sql:1032-1120` carries it. `--@level-first` lines build the first level from `metric_landing`; `--@level-next` lines build every later level from `{{source}}`, the level below.
 
 ```sql
 --@level CREATE MATERIALIZED VIEW {{db}}.metric_samples_{{level}}_mv{{on_cluster}} REFRESH {{timer}} APPEND TO {{db}}.metric_samples_{{level}}
@@ -285,7 +286,7 @@ Measured effect of dropping repeats: one day, 4,000 series at 15 s, 80 series wi
 
 ### 3.3 Timers, derived from the sizes
 
-Let `p = max(R_1, 60 s)` be the first level's period, and `d_i` the delay after a bucket's end by which level `i` has built it (`timer_unit`, `crates/pulsus-schema/src/render.rs:501`).
+Let `p = max(R_1, 60 s)` be the first level's period, and `d_i` the delay after a bucket's end by which level `i` has built it (`timer_unit`, `crates/pulsus-schema/src/render.rs:649`).
 
 | level | `{{timer}}` | builds up to | `d_i` |
 |---|---|---|---|
@@ -333,7 +334,7 @@ The server accepted `EVERY 12 MINUTE OFFSET 240 SECOND`, `EVERY 2 HOUR OFFSET 30
 
 Without the block condition the engine did not use the projection's expression key: the same statements read 23,039,986 rows. So every build statement names the block. These were measured before the first level's predecessor join (§3.1), which doubles its rows read.
 
-**The day level carries no projection below it.** A day bucket is the 7200 s table's whole day partition, so the plain table reads the same marks: measured with the projection, one 86400 s run read 6,628 rows with `projections = []` (parts of 4,001 and 801 rows: 4,802 rows of data, 1,825 of the run-row scan, the one-row run-row branch). Output not kept. `--@level-feeds` lines are kept only for a level whose next level is shorter than a day (`Feeds`, `crates/pulsus-schema/src/render.rs:483`).
+**The day level carries no projection below it.** A day bucket is the 7200 s table's whole day partition, so the plain table reads the same marks: measured with the projection, one 86400 s run read 6,628 rows with `projections = []` (parts of 4,001 and 801 rows: 4,802 rows of data, 1,825 of the run-row scan, the one-row run-row branch). Output not kept. `--@level-feeds` lines are kept only for a level whose next level is shorter than a day (`Feeds`, `crates/pulsus-schema/src/render.rs:628`).
 
 **The recorded run** (`measure/projection-run/`). One node; 4,000 series at 15 s over three hours, landed through a `metric_landing` with §2.4's key; the 60 s and 720 s tables as they then stood, without `flags`; three one-hour first-level runs, then the 720 s run for one bucket, three times on an emptied table.
 
@@ -411,7 +412,7 @@ One UTC day, 4,000 series: half counters resetting every 500–799 samples, 40 r
 
 The table predates `flags` and the projection rule of §2.2: the default set no longer stores the 7200 s projection, so its total is 765.7 % at 15 s and 1,843.4 % at 60 s (§1.3).
 
-Landing holds 6 hours by default (`metrics_landing_hours`, `schema/schema.sh:53`), so its daily figure is four times what it stores.
+Landing holds 6 hours by default (`metrics_landing_hours`, `schema/schema.sh:54`), so its daily figure is four times what it stores.
 
 | cost | figures | the alternative |
 |---|---|---|

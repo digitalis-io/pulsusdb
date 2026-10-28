@@ -500,6 +500,9 @@ fn the_script_renders_exactly_what_this_crate_renders() {
                 metrics_hot_days: Some(5),
                 logs_hot_days: Some(31),
                 traces_hot_days: Some(6),
+                rollup_retention_days: vec![31, 40, 50],
+                // The `60s` level's move age is its retention: it does not move.
+                rollup_hot_days: vec![3, 40, 9],
             },
         ),
         (
@@ -510,6 +513,13 @@ fn the_script_renders_exactly_what_this_crate_renders() {
                 metrics_hot_days: Some(7),
                 logs_hot_days: Some(7),
                 traces_hot_days: Some(7),
+                ..single()
+            },
+        ),
+        (
+            "level retention only",
+            RenderCtx {
+                rollup_retention_days: vec![7, 7, 8, 91, 400],
                 ..single()
             },
         ),
@@ -604,8 +614,20 @@ fn the_script_renders_exactly_what_this_crate_renders() {
             "PULSUS_METRICS_HOT_DAYS",
             "PULSUS_LOGS_HOT_DAYS",
             "PULSUS_TRACES_HOT_DAYS",
+            "PULSUS_ROLLUP_RETENTION_DAYS",
+            "PULSUS_ROLLUP_HOT_DAYS",
         ] {
             cmd.env_remove(var);
+        }
+        // Issue #743 part B: each level list, when the case has one.
+        for (var, list) in [
+            ("PULSUS_ROLLUP_RETENTION_DAYS", &ctx.rollup_retention_days),
+            ("PULSUS_ROLLUP_HOT_DAYS", &ctx.rollup_hot_days),
+        ] {
+            if !list.is_empty() {
+                let text: Vec<String> = list.iter().map(u32::to_string).collect();
+                cmd.env(var, text.join(","));
+            }
         }
         if let Some(v) = &ctx.cold_volume {
             cmd.env("PULSUS_COLD_VOLUME", v);
@@ -3193,6 +3215,10 @@ fn both_tiering(
         metrics_hot_days: hot[0],
         logs_hot_days: hot[1],
         traces_hot_days: hot[2],
+        levels: pulsus_schema::DEFAULT_ROLLUP_LEVELS,
+        ranges: pulsus_schema::DEFAULT_ROLLUP_RANGES,
+        rollup_retention_days: None,
+        rollup_hot_days: None,
     });
     ((code, err), from_crate)
 }
@@ -3315,6 +3341,8 @@ fn the_script_and_the_crate_refuse_the_same_tiering_settings() {
             metrics_hot_days: Some(1),
             logs_hot_days: Some(30),
             traces_hot_days: Some(2),
+            rollup_retention_days: Vec::new(),
+            rollup_hot_days: Vec::new(),
         })
     );
     let ((code, err), from_crate) = both_tiering((None, None, [None, None, None]));
@@ -3326,6 +3354,8 @@ fn the_script_and_the_crate_refuse_the_same_tiering_settings() {
             metrics_hot_days: None,
             logs_hot_days: None,
             traces_hot_days: None,
+            rollup_retention_days: Vec::new(),
+            rollup_hot_days: Vec::new(),
         })
     );
 }
@@ -3476,5 +3506,547 @@ fn every_trace_table_carries_its_move_clause() {
         };
         let moving: Vec<(&str, u32)> = TRACES_FAMILY.iter().map(|t| (*t, 3)).collect();
         assert_tiering(mode, &ctx, &moving);
+    }
+}
+
+/// The tiering variables of one B1 case (issue #743 part B): none, part
+/// A's set (`PULSUS_STORAGE_POLICY=p`, `PULSUS_COLD_VOLUME=cold`, the three
+/// family move ages `2`), or that set without the metrics move age.
+#[derive(Debug, Clone, Copy)]
+enum LevelTiering {
+    Unset,
+    Set,
+    SetWithoutMetrics,
+}
+
+/// `schema.sh --mode single --print` with `PULSUS_RETENTION_DAYS=2`,
+/// `levels`, `ranges`, the tiering variables and each level list that is
+/// `Some` (an empty text set as the empty string), and `validate_tiering`
+/// over the same inputs, each list text passed unchanged.
+fn both_levels(
+    levels: &str,
+    ranges: &str,
+    tiering: LevelTiering,
+    retention: Option<&str>,
+    hot: Option<&str>,
+) -> (
+    (Option<i32>, String),
+    Result<pulsus_schema::Tiering, String>,
+) {
+    let (policy, volume, ages) = match tiering {
+        LevelTiering::Unset => (None, None, [None; 3]),
+        LevelTiering::Set => (Some("p"), Some("cold"), [Some("2"); 3]),
+        LevelTiering::SetWithoutMetrics => (Some("p"), Some("cold"), [None, Some("2"), Some("2")]),
+    };
+    let mut vars = vec![
+        ("PULSUS_RETENTION_DAYS", "2"),
+        ("PULSUS_ROLLUP_LEVELS", levels),
+        ("PULSUS_ROLLUP_RANGES", ranges),
+    ];
+    if let Some(p) = policy {
+        vars.push(("PULSUS_STORAGE_POLICY", p));
+    }
+    if let Some(v) = volume {
+        vars.push(("PULSUS_COLD_VOLUME", v));
+    }
+    for (var, value) in HOT_DAYS_VARS.iter().zip(ages) {
+        if let Some(value) = value {
+            vars.push((var, value));
+        }
+    }
+    if let Some(text) = retention {
+        vars.push(("PULSUS_ROLLUP_RETENTION_DAYS", text));
+    }
+    if let Some(text) = hot {
+        vars.push(("PULSUS_ROLLUP_HOT_DAYS", text));
+    }
+    let (code, _, err) = script_clean(&vars, &["--mode", "single"]);
+    let level_list = pulsus_schema::parse_rollup_levels(levels, 6).expect("the levels");
+    let range_list =
+        pulsus_schema::parse_rollup_ranges(ranges, &level_list).expect("the switch points");
+    let from_crate = pulsus_schema::validate_tiering(&pulsus_schema::TieringInput {
+        storage_policy: policy,
+        cold_volume: volume,
+        retention_days: 2,
+        metrics_hot_days: ages[0],
+        logs_hot_days: ages[1],
+        traces_hot_days: ages[2],
+        levels: &level_list,
+        ranges: &range_list,
+        rollup_retention_days: retention,
+        rollup_hot_days: hot,
+    });
+    ((code, err), from_crate)
+}
+
+/// **B1 (issue #743 part B): the script and the crate refuse the same level
+/// day lists, with the same message, and accept the same.** Levels `60,
+/// 720, 7200` with switch points `86400, 604800`, and `R` = 2. A list
+/// variable that is set is checked, empty included; rule 4 is checked
+/// before rule 5, 4 c for every level before 4 d, and 5 a before 5 b.
+#[test]
+fn the_script_and_the_crate_refuse_the_same_level_day_lists() {
+    use LevelTiering::{Set, SetWithoutMetrics, Unset};
+    const KEEP: &str = "PULSUS_ROLLUP_RETENTION_DAYS: ";
+    const HOT: &str = "PULSUS_ROLLUP_HOT_DAYS: ";
+    let not_kept = |item: &str, level: u32| {
+        format!(
+            "{KEEP}{item} for the {level}s level is not a whole number of days from 2 to 4294967295"
+        )
+    };
+    let too_short = format!(
+        "{KEEP}7 for the 720s level is too short: the next level's switch point, 604800 s, \
+         requires 8 retention days"
+    );
+    let no_volume = "PULSUS_ROLLUP_HOT_DAYS is set and PULSUS_COLD_VOLUME is not".to_string();
+    let missing = "PULSUS_METRICS_HOT_DAYS is not set; with PULSUS_COLD_VOLUME set each of \
+        PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS is required"
+        .to_string();
+    let levels = "60,720,7200";
+    let ranges = "86400,604800";
+    type Case<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        LevelTiering,
+        Option<&'a str>,
+        Option<&'a str>,
+        String,
+    );
+    let refused: Vec<Case<'_>> = vec![
+        (
+            "r1",
+            levels,
+            ranges,
+            Unset,
+            Some("2,,30"),
+            None,
+            format!("{KEEP}an empty item in '2,,30'"),
+        ),
+        (
+            "r2",
+            levels,
+            ranges,
+            Unset,
+            Some("2,8,"),
+            None,
+            format!("{KEEP}an empty item in '2,8,'"),
+        ),
+        (
+            "r3",
+            levels,
+            ranges,
+            Unset,
+            Some(","),
+            None,
+            format!("{KEEP}an empty item in ','"),
+        ),
+        (
+            "r4",
+            levels,
+            ranges,
+            Unset,
+            Some("2,8"),
+            None,
+            format!("{KEEP}2 items for 3 levels"),
+        ),
+        (
+            "r5",
+            levels,
+            ranges,
+            Unset,
+            Some("2,8,30,40"),
+            None,
+            format!("{KEEP}4 items for 3 levels"),
+        ),
+        (
+            "r6",
+            levels,
+            ranges,
+            Unset,
+            Some("2,1,30"),
+            None,
+            not_kept("1", 720),
+        ),
+        (
+            "r7",
+            levels,
+            ranges,
+            Unset,
+            Some("02,8,30"),
+            None,
+            not_kept("02", 60),
+        ),
+        (
+            "r8",
+            levels,
+            ranges,
+            Unset,
+            Some("2,8,x"),
+            None,
+            not_kept("x", 7200),
+        ),
+        (
+            "r9",
+            levels,
+            ranges,
+            Unset,
+            Some("2,8,4294967296"),
+            None,
+            not_kept("4294967296", 7200),
+        ),
+        (
+            "r10",
+            levels,
+            ranges,
+            Unset,
+            Some("2,8,12345678901"),
+            None,
+            not_kept("12345678901", 7200),
+        ),
+        (
+            "r11",
+            levels,
+            ranges,
+            Unset,
+            Some("2,7,30"),
+            None,
+            too_short.clone(),
+        ),
+        (
+            "r12",
+            levels,
+            ranges,
+            Unset,
+            Some("2,7,1"),
+            None,
+            not_kept("1", 7200),
+        ),
+        (
+            "r13",
+            "",
+            "",
+            Unset,
+            Some("30"),
+            None,
+            format!("{KEEP}1 items for 0 levels"),
+        ),
+        (
+            "r14",
+            levels,
+            ranges,
+            Unset,
+            Some(""),
+            None,
+            format!("{KEEP}an empty item in ''"),
+        ),
+        (
+            "h1",
+            levels,
+            ranges,
+            Unset,
+            None,
+            Some("1,1,1"),
+            no_volume.clone(),
+        ),
+        (
+            "h2",
+            levels,
+            ranges,
+            Unset,
+            None,
+            Some(",1"),
+            no_volume.clone(),
+        ),
+        (
+            "h8",
+            levels,
+            ranges,
+            Unset,
+            None,
+            Some(""),
+            no_volume.clone(),
+        ),
+        (
+            "h9",
+            levels,
+            ranges,
+            Set,
+            None,
+            Some(""),
+            format!("{HOT}an empty item in ''"),
+        ),
+        (
+            "h3",
+            levels,
+            ranges,
+            Set,
+            None,
+            Some("1,,1"),
+            format!("{HOT}an empty item in '1,,1'"),
+        ),
+        (
+            "h4",
+            levels,
+            ranges,
+            Set,
+            None,
+            Some("1,1"),
+            format!("{HOT}2 items for 3 levels"),
+        ),
+        (
+            "h5",
+            levels,
+            ranges,
+            Set,
+            None,
+            Some("0,1,1"),
+            format!("{HOT}0 for the 60s level is not a whole number of days from 1 to 2"),
+        ),
+        (
+            "h6",
+            levels,
+            ranges,
+            Set,
+            None,
+            Some("1,3,1"),
+            format!("{HOT}3 for the 720s level is not a whole number of days from 1 to 2"),
+        ),
+        (
+            "h7",
+            levels,
+            ranges,
+            Set,
+            Some("2,8,30"),
+            Some("2,9,30"),
+            format!("{HOT}9 for the 720s level is not a whole number of days from 1 to 8"),
+        ),
+        (
+            "o1",
+            levels,
+            ranges,
+            Set,
+            Some("2,7,30"),
+            Some("0,1,1"),
+            too_short.clone(),
+        ),
+        (
+            "o2",
+            levels,
+            ranges,
+            SetWithoutMetrics,
+            Some("2,7,30"),
+            None,
+            missing,
+        ),
+    ];
+    for (id, levels, ranges, tiering, retention, hot, message) in refused {
+        let ((code, err), from_crate) = both_levels(levels, ranges, tiering, retention, hot);
+        assert_eq!(
+            (code, err.trim_end()),
+            (Some(2), format!("schema.sh: {message}").as_str()),
+            "{id}: the script must refuse with the rule's message"
+        );
+        assert_eq!(
+            from_crate,
+            Err(message.clone()),
+            "{id}: the crate must refuse with the same message"
+        );
+    }
+
+    let unset = |keep: Vec<u32>| pulsus_schema::Tiering {
+        cold_volume: None,
+        metrics_hot_days: None,
+        logs_hot_days: None,
+        traces_hot_days: None,
+        rollup_retention_days: keep,
+        rollup_hot_days: Vec::new(),
+    };
+    let accepted = [
+        ("a1", Unset, Some("2,8,30"), None, unset(vec![2, 8, 30])),
+        (
+            "a2",
+            Unset,
+            Some("2,8,4294967295"),
+            None,
+            unset(vec![2, 8, 4_294_967_295]),
+        ),
+        (
+            "a3",
+            Set,
+            Some("2,8,30"),
+            Some("1,8,29"),
+            pulsus_schema::Tiering {
+                cold_volume: Some("cold".to_string()),
+                metrics_hot_days: Some(2),
+                logs_hot_days: Some(2),
+                traces_hot_days: Some(2),
+                rollup_retention_days: vec![2, 8, 30],
+                rollup_hot_days: vec![1, 8, 29],
+            },
+        ),
+    ];
+    for (id, tiering, retention, hot, want) in accepted {
+        let ((code, err), from_crate) = both_levels(levels, ranges, tiering, retention, hot);
+        assert_eq!(code, Some(0), "{id}: the script must accept: {err}");
+        assert_eq!(from_crate, Ok(want), "{id}: the crate must accept");
+    }
+}
+
+/// The level `TTL` line at `days`, and the level move line at `days`.
+fn level_ttl(days: u32) -> String {
+    format!(
+        "TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({days} * 86400), 4294967295))"
+    )
+}
+
+fn level_move(days: u32) -> String {
+    format!(
+        ", toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({days} * 86400), 4294967295)) TO VOLUME 'cold'"
+    )
+}
+
+/// The statement's line that starts with `head`.
+fn line_starting<'a>(stmt: &'a str, head: &str) -> Option<&'a str> {
+    stmt.lines().find(|l| l.starts_with(head))
+}
+
+/// **B2 (issue #743 part B): each level keeps its own retention and moves
+/// at its own age, and the metric catalogue keeps the longest.** `R` = 7,
+/// the default levels kept `30, 30, 90, 365, 730` days and moving at `7, 7,
+/// 30, 30, 730`, in both modes; every table outside the levels and the
+/// catalogue renders as it does without the two lists.
+#[test]
+fn each_level_keeps_its_own_retention_and_the_catalogue_the_longest() {
+    for (mode, base) in [("single-node", single()), ("clustered", clustered())] {
+        let ctx = RenderCtx {
+            storage_policy: Some("tiered".to_string()),
+            cold_volume: Some("cold".to_string()),
+            metrics_hot_days: Some(7),
+            logs_hot_days: Some(7),
+            traces_hot_days: Some(7),
+            rollup_retention_days: vec![30, 30, 90, 365, 730],
+            rollup_hot_days: vec![7, 7, 30, 30, 730],
+            ..base
+        };
+        let plain = RenderCtx {
+            rollup_retention_days: Vec::new(),
+            rollup_hot_days: Vec::new(),
+            ..ctx.clone()
+        };
+        let tables = local_tables(&ctx);
+        let plain_tables = local_tables(&plain);
+        assert_eq!(
+            tables.keys().collect::<Vec<_>>(),
+            plain_tables.keys().collect::<Vec<_>>(),
+            "{mode}: the same tables"
+        );
+
+        let levels = [
+            ("metric_samples_5s", 30, Some(7)),
+            ("metric_samples_60s", 30, Some(7)),
+            ("metric_samples_720s", 90, Some(30)),
+            ("metric_samples_7200s", 365, Some(30)),
+            ("metric_samples_86400s", 730, None),
+        ];
+        for (name, keep, moves) in levels {
+            let stmt = &tables[name];
+            let ttl = level_ttl(keep);
+            assert!(
+                stmt.lines().any(|l| l == ttl),
+                "{mode}: {name} carries `{ttl}`:\n{stmt}"
+            );
+            let n = stmt.matches(" TO VOLUME").count();
+            match moves {
+                Some(h) => {
+                    assert_eq!(
+                        stmt.matches(" TO VOLUME 'cold'").count(),
+                        1,
+                        "{mode}: {name} carries one move clause:\n{stmt}"
+                    );
+                    let want = level_move(h);
+                    assert!(
+                        stmt.lines().any(|l| l == want),
+                        "{mode}: {name} carries `{want}`:\n{stmt}"
+                    );
+                }
+                None => assert_eq!(n, 0, "{mode}: {name} carries no move clause:\n{stmt}"),
+            }
+            assert!(
+                stmt.contains("storage_policy = 'tiered'"),
+                "{mode}: {name} is on the policy:\n{stmt}"
+            );
+            assert_eq!(
+                line_starting(stmt, "COMMENT"),
+                line_starting(&plain_tables[name], "COMMENT"),
+                "{mode}: {name}'s comment"
+            );
+        }
+
+        let catalogue = [
+            (
+                "metric_labels",
+                "TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + (730 * 86400), 4294967295))",
+            ),
+            (
+                "metric_label_index",
+                "TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + (730 * 86400), 4294967295))",
+            ),
+            (
+                "metric_label_values",
+                "TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + (730 * 86400), 4294967295))",
+            ),
+            (
+                "metric_metadata",
+                "TTL toDateTime(least(intDiv(updated_ns, 1000000000) + (730 * 86400), 4294967295))",
+            ),
+            (
+                "metric_series",
+                "TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + 730) * 86400, 4294967295))",
+            ),
+        ];
+        for (name, ttl) in catalogue {
+            let stmt = &tables[name];
+            assert!(
+                stmt.lines().any(|l| l == ttl),
+                "{mode}: {name} carries `{ttl}`:\n{stmt}"
+            );
+            assert_eq!(
+                stmt.matches(" TO VOLUME").count(),
+                0,
+                "{mode}: {name} carries no move clause:\n{stmt}"
+            );
+        }
+
+        for (name, stmt) in &tables {
+            if levels.iter().any(|(t, _, _)| t == name) || catalogue.iter().any(|(t, _)| t == name)
+            {
+                continue;
+            }
+            assert_eq!(
+                stmt, &plain_tables[name],
+                "{mode}: {name} renders as without the lists"
+            );
+        }
+        let raw = &tables["metric_samples"];
+        let raw_ttl = "TTL toDateTime(least(intDiv(unix_milli, 1000) + (7 * 86400), 4294967295))";
+        assert!(
+            raw.lines().any(|l| l == raw_ttl),
+            "{mode}: metric_samples carries `{raw_ttl}`:\n{raw}"
+        );
+        assert_eq!(
+            raw.matches(" TO VOLUME").count(),
+            0,
+            "{mode}: metric_samples does not move:\n{raw}"
+        );
+
+        let database = rendered_statements(&ctx)
+            .into_iter()
+            .find(|s| s.starts_with("CREATE DATABASE"))
+            .expect("the database statement");
+        assert!(
+            database.contains("COMMENT 'retention_days=7'"),
+            "{mode}: {database}"
+        );
     }
 }

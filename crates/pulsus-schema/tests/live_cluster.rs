@@ -148,6 +148,8 @@ fn cluster_ctx(db: &str) -> SchemaParams {
         metrics_hot_days: None,
         logs_hot_days: None,
         traces_hot_days: None,
+        rollup_retention_days: Vec::new(),
+        rollup_hot_days: Vec::new(),
     }
 }
 

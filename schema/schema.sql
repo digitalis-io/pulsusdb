@@ -11,10 +11,15 @@
 -- server as those exact characters: never write a single-brace token here,
 -- and never add a substitution that matches one.
 --
+-- `{{metrics_catalogue_retention_days}}`, on the five metric catalogue
+-- tables, is the largest of the retention and every rollup level's
+-- (issue #743), so a level's series outlive its rows.
+--
 -- COLD MARKERS. A line prefixed `--@cold-metrics`, `--@cold-logs` or
 -- `--@cold-traces` is the move clause of a table of that family (issue
 -- #743): kept, marker and spaces removed, when PULSUS_COLD_VOLUME is set and
--- the family's move age is under the retention; dropped otherwise.
+-- the family's move age is under the retention; dropped otherwise. A rollup
+-- level's move clause is the level block's `--@level-cold ` line (below).
 -- `{{storage_policy_local}}` is `{{storage_policy}}` without a cold volume
 -- and empty with one: the tables that never move are then on the server's
 -- `default` policy.
@@ -210,7 +215,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_labels{{on_cluster}}
 --@single  ENGINE = AggregatingMergeTree
 --@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_labels', '{replica}')
 ORDER BY (org_id, metric_name, fingerprint)
-TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
+TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{metrics_catalogue_retention_days}} * 86400), 4294967295))
 -- `labels` is outside the key and not an aggregate. It is a function of
 -- `fingerprint`, so a merge never chooses between two different values;
 -- 26.8 refuses such a column unless the table allows it.
@@ -228,7 +233,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_label_index{{on_cluster}}
 --@single  ENGINE = ReplacingMergeTree(last_seen)
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_label_index', '{replica}', last_seen)
 ORDER BY (org_id, key, value, fingerprint)
-TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
+TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{metrics_catalogue_retention_days}} * 86400), 4294967295))
 --@single  SETTINGS index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy_local}};
 --@cluster SETTINGS index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
@@ -242,7 +247,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_label_values{{on_cluster}}
 --@single  ENGINE = ReplacingMergeTree(last_seen)
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_label_values', '{replica}', last_seen)
 ORDER BY (org_id, key, value)
-TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
+TTL toDateTime(least(((intDiv(last_seen, 86400000) + 1) * 86400) + ({{metrics_catalogue_retention_days}} * 86400), 4294967295))
 --@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy_local}};
 --@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
@@ -297,7 +302,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_metadata{{on_cluster}}
 --@single  ENGINE = ReplacingMergeTree(updated_ns)
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.metric_metadata', '{replica}', updated_ns)
 ORDER BY (org_id, metric_name, metric_type, help, unit)
-TTL toDateTime(least(intDiv(updated_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+TTL toDateTime(least(intDiv(updated_ns, 1000000000) + ({{metrics_catalogue_retention_days}} * 86400), 4294967295))
 --@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy_local}};
 --@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
@@ -329,7 +334,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_series{{on_cluster}}
 --@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_series', '{replica}')
 PARTITION BY day
 ORDER BY (org_id, fingerprint)
-TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + {{retention_days}}) * 86400, 4294967295))
+TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + {{metrics_catalogue_retention_days}}) * 86400, 4294967295))
 -- `metric_name` is outside the key and not an aggregate. It is a function
 -- of `fingerprint`, so a merge never chooses between two different values;
 -- 26.8 refuses such a column unless the table allows it.
@@ -988,9 +993,14 @@ GROUP BY org_id, bucket, service, resource_id;
 -- `--@level-next ` for every later one (built from the level below) and
 -- `--@level-feeds ` for every level whose next level is shorter than a day
 -- (the projection the next level's run reads; a day-long run reads its
--- source's day partition); the marker and the one space after it are removed.
--- Level tokens: `{{level}}` (`60s`), `{{level_ms}}`, `{{source}}`,
--- `{{parent_ms}}`, `{{timer}}`, `{{period_ms}}`.
+-- source's day partition), and `--@level-cold ` for every level that moves
+-- to the cold volume (issue #743: PULSUS_COLD_VOLUME set and the level's
+-- PULSUS_ROLLUP_HOT_DAYS item under its retention); the marker and the one
+-- space after it are removed. Level tokens: `{{level}}` (`60s`),
+-- `{{level_ms}}`, `{{source}}`, `{{parent_ms}}`, `{{timer}}`,
+-- `{{period_ms}}`, `{{level_retention_days}}` (the level's
+-- PULSUS_ROLLUP_RETENTION_DAYS item, else `{{retention_days}}`) and
+-- `{{level_hot_days}}`.
 --@level CREATE TABLE IF NOT EXISTS {{db}}.metric_samples_{{level}}{{on_cluster}}
 --@level (
 --@level     kind UInt8,
@@ -1012,7 +1022,8 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level --@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_samples_{{level}}', '{replica}')
 --@level PARTITION BY toDate(fromUnixTimestamp64Milli(t_end - 1), 'UTC')
 --@level ORDER BY (org_id, fingerprint, t_end)
---@level TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({{retention_days}} * 86400), 4294967295))
+--@level TTL toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({{level_retention_days}} * 86400), 4294967295))
+--@level-cold , toDateTime(least(intDiv(t_end - 1, 86400000) * 86400 + ({{level_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
 --@level --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}}
 --@level --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 1024, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}}
 --@level COMMENT 'rollup_res_ms={{level_ms}} rollup_from_ms={{from_ms}} counter_buckets={{counter_buckets}}';

@@ -51,7 +51,7 @@ Status legend: ✅ implemented + evidenced · 🚫 explicit non-goal (recorded, 
 
 | Item | Evidence (test / CI step / doc § / code ref) | Status |
 | --- | --- | --- |
-| TTL declared from `PULSUS_RETENTION_DAYS`, which has no default (saturating `DateTime`, incl. `u32::MAX`) | `crates/pulsus-schema/tests/schema_file.rs::every_table_expires_exactly_as_documented` · `crates/pulsus-schema/tests/live_schema.rs::the_configured_retention_reaches_every_retained_tables_ttl` | ✅ |
+| TTL declared from `PULSUS_RETENTION_DAYS`, which has no default, on the tables marked `R` in docs/configuration.md §7; on a rollup level, its `PULSUS_ROLLUP_RETENTION_DAYS` item, or `PULSUS_RETENTION_DAYS` when that is unset (`L`); on the metric catalogue, the largest of `PULSUS_RETENTION_DAYS` and every level's item (`C`); from the landing hours on the three landing tables (`H`) (saturating `DateTime`, incl. `u32::MAX`) | `crates/pulsus-schema/tests/schema_file.rs::every_table_expires_exactly_as_documented` · `crates/pulsus-schema/tests/live_schema.rs::the_configured_retention_reaches_every_retained_tables_ttl` | ✅ |
 | TTL applied when the schema is built | `schema/schema.sql` · `schema/schema.sh` · `crates/pulsus-schema/tests/schema_file.rs` | ✅ |
 | Retention/storage-policy config surface | `PULSUS_RETENTION_DAYS` in `schema/schema.sh`, read back from the database comment (`crates/pulsus-server/src/chconfig.rs::read_schema_retention`) · `storage_policy` in `crates/pulsus-config/src/model.rs` · `configuration.md §3`, `§7` | ✅ |
 | Live schema TTL gates (logs/metrics + traces) | `ci.yml: "Live schema tests (single-node, migrations + MVs + crash/retry)"` · `ci.yml: "Live trace landing schema tests (tables + views + TTLs)"` · `architecture.md §3.6` | ✅ |
