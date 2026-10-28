@@ -317,6 +317,7 @@
       "pattern": "^[\\t\\n\\v\\f\\r ]*[1-9][0-9]{0,12}(ms|s|m|h|d|w)[\\t\\n\\v\\f\\r ]*$",
       "description": "A HumanDuration the binary refuses at zero. A leading zero, which the parser accepts, is refused by decision."
     },
+    "logRollupResolution": { "type": "string", "pattern": "^([1-9][0-9]{0,11}ms|[1-9][0-9]{0,8}s|[1-9][0-9]{0,7}m|[1-9][0-9]{0,5}h|[1-9][0-9]{0,4}d|[1-9][0-9]{0,3}w)$", "description": "PULSUS_LOG_ROLLUP_RESOLUTION's grammar, shared with schema/schema.sh." },
     "nullablePositiveHumanDuration": {
       "type": ["string", "null"],
       "pattern": "^[\\t\\n\\v\\f\\r ]*[1-9][0-9]{0,12}(ms|s|m|h|d|w)[\\t\\n\\v\\f\\r ]*$",
@@ -400,7 +401,7 @@
         "cors_origin": { "type": "string" },
         "query_timeout": { "$ref": "#/definitions/positiveHumanDuration" },
         "storage_policy": { "type": ["string", "null"] },
-        "log_rollup_resolution": { "$ref": "#/definitions/positiveHumanDuration" },
+        "log_rollup_resolution": { "$ref": "#/definitions/logRollupResolution" },
         "cluster": { "type": ["string", "null"] },
         "dist_suffix": { "type": "string", "minLength": 1 },
         "skip_unavailable_shards": { "type": "boolean" },

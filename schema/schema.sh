@@ -126,6 +126,20 @@ for pair in "PULSUS_METRICS_LANDING_RETENTION_HOURS:$metrics_landing_hours" \
         exit 2
     fi
 done
+for pair in "PULSUS_METRICS_DEDUP_WINDOW:$metrics_dedup" \
+            "PULSUS_LOG_DEDUP_WINDOW:$log_dedup" \
+            "PULSUS_TRACE_DEDUP_WINDOW:$trace_dedup"; do
+    what=${pair%%:*}
+    value=${pair#*:}
+    case "$value" in
+        '' | 0* | *[!0-9]* | ????????*) bad_dedup=1 ;;
+        *) bad_dedup=0; [ "$value" -le 1000000 ] || bad_dedup=1 ;;
+    esac
+    if [ "$bad_dedup" = 1 ]; then
+        echo "schema.sh: $what must be a whole number of blocks from 1 to 1000000: $value" >&2
+        exit 2
+    fi
+done
 
 # Issue #18: `PULSUS_ROLLUP_LEVELS`, the rollup levels in seconds, smallest
 # first; set and empty is no levels. The same rules, in the same order and
@@ -371,19 +385,24 @@ fi
 # `pulsus_schema::rollup_suffix` produces: whole minutes, then whole
 # seconds, then milliseconds, then nanoseconds.
 case "$rollup" in
-    *ms) rollup_ns=$(( ${rollup%ms} * 1000000 )) ;;
-    *ns) rollup_ns=${rollup%ns} ;;
-    *s)  rollup_ns=$(( ${rollup%s} * 1000000000 )) ;;
-    *m)  rollup_ns=$(( ${rollup%m} * 60000000000 )) ;;
-    *)
-        echo "schema.sh: PULSUS_LOG_ROLLUP_RESOLUTION must end in ns, ms, s or m: $rollup" >&2
-        exit 2
-        ;;
+    *ms) rollup_num=${rollup%ms}; rollup_unit=1000000;         rollup_digits=12 ;;
+    *s)  rollup_num=${rollup%s};  rollup_unit=1000000000;      rollup_digits=9 ;;
+    *m)  rollup_num=${rollup%m};  rollup_unit=60000000000;     rollup_digits=8 ;;
+    *h)  rollup_num=${rollup%h};  rollup_unit=3600000000000;   rollup_digits=6 ;;
+    *d)  rollup_num=${rollup%d};  rollup_unit=86400000000000;  rollup_digits=5 ;;
+    *w)  rollup_num=${rollup%w};  rollup_unit=604800000000000; rollup_digits=4 ;;
+    *)   rollup_num=x;            rollup_unit=0;               rollup_digits=0 ;;
 esac
-if [ "$rollup_ns" -le 0 ]; then
-    echo "schema.sh: PULSUS_LOG_ROLLUP_RESOLUTION must be positive: $rollup" >&2
+rollup_ok=1
+case "$rollup_num" in
+    '' | 0* | *[!0-9]*) rollup_ok=0 ;;
+esac
+[ "$rollup_ok" = 0 ] || [ "${#rollup_num}" -le "$rollup_digits" ] || rollup_ok=0
+if [ "$rollup_ok" = 0 ]; then
+    echo "schema.sh: PULSUS_LOG_ROLLUP_RESOLUTION must be a whole number with no leading zero, then ms (at most 12 digits), s (9), m (8), h (6), d (5) or w (4): $rollup" >&2
     exit 2
 fi
+rollup_ns=$((rollup_num * rollup_unit))
 if [ $((rollup_ns % 1000000)) -eq 0 ]; then
     millis=$((rollup_ns / 1000000))
     if [ $((millis % 60000)) -eq 0 ]; then
@@ -419,6 +438,9 @@ n=0
 seen=","
 old_ifs=$IFS
 IFS=,
+# Pathname expansion is off while the list is split, so an item holding a
+# pattern character is checked as written, as the crate checks it.
+set -f
 for item in $indexed; do
     case "$item" in
         span.*) key=${item#span.}; root=span ;;
@@ -446,6 +468,7 @@ for item in $indexed; do
     attr_indexes="$attr_indexes,
     INDEX idx_attr_$n $expr TYPE bloom_filter(0.01) GRANULARITY 1"
 done
+set +f
 IFS=$old_ifs
 
 on_cluster=""
@@ -590,6 +613,8 @@ url="http://$server:$port/"
 # a deployment configures the credential once.
 auth=""
 [ -z "${CLICKHOUSE_AUTH:-}" ] || auth="--user ${CLICKHOUSE_AUTH}"
+# `$auth` is split into `--user` and the credential with pathname expansion
+# off (`set -f` in each request's subshell), so a `*` in a password stays one.
 
 # `curl` exits 0 when ClickHouse answers with an error in the body, so every
 # request below carries --fail-with-body.
@@ -598,7 +623,7 @@ auth=""
 # own exit code, so a caller under `set -e` still stops with it.
 # shellcheck disable=SC2086
 ask() {
-    if ask_body=$(curl -sS --fail-with-body $auth "$url" --data-binary "$1"); then
+    if ask_body=$(set -f; curl -sS --fail-with-body $auth "$url" --data-binary "$1"); then
         printf '%s\n' "$ask_body"
     else
         ask_rc=$?
@@ -614,7 +639,7 @@ ask() {
 # `curl: (22) The requested URL returned error: 500`.
 # shellcheck disable=SC2086
 send_file() {
-    if ! body=$(curl -sS --fail-with-body $auth "$url" --data-binary "@$1" 2>&1); then
+    if ! body=$(set -f; curl -sS --fail-with-body $auth "$url" --data-binary "@$1" 2>&1); then
         echo "schema.sh: the server refused this statement:" >&2
         cat "$1" >&2
         echo "schema.sh: the server said:" >&2

@@ -20,7 +20,9 @@
 use std::process::Command;
 use std::time::Duration;
 
-use pulsus_schema::{RenderCtx, SCHEMA_SQL, rendered, rendered_statements};
+use pulsus_schema::{
+    RenderCtx, SCHEMA_SQL, SchemaMode, ctx_from_vars, rendered, rendered_statements,
+};
 
 fn single() -> RenderCtx {
     RenderCtx::for_tests("pulsus", 7)
@@ -3098,12 +3100,23 @@ fn the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets() {
 /// variables and arguments: its exit code, standard output as the bytes it
 /// wrote, and standard error.
 fn script_clean(vars: &[(&str, &str)], args: &[&str]) -> (Option<i32>, Vec<u8>, String) {
+    script_clean_in(vars, args, &repo_root())
+}
+
+/// [`script_clean`], run from the directory `cwd` (issue #746 part A: a
+/// value the script left open to pathname expansion read the directory it
+/// ran in).
+fn script_clean_in(
+    vars: &[(&str, &str)],
+    args: &[&str],
+    cwd: &std::path::Path,
+) -> (Option<i32>, Vec<u8>, String) {
     let root = repo_root();
     let mut cmd = Command::new("sh");
     cmd.arg(root.join("schema/schema.sh"))
         .args(args)
         .arg("--print")
-        .current_dir(&root)
+        .current_dir(cwd)
         .env_clear()
         .env("PATH", std::env::var("PATH").expect("PATH is set"));
     for (var, value) in vars {
@@ -4048,5 +4061,1791 @@ fn each_level_keeps_its_own_retention_and_the_catalogue_the_longest() {
             database.contains("COMMENT 'retention_days=7'"),
             "{mode}: {database}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #746 part A: one set of schema rules, `pulsus_schema::ctx_from_vars`,
+// held against the script.
+
+/// The script's arguments for `mode`.
+fn mode_args(mode: Option<SchemaMode>) -> Vec<&'static str> {
+    match mode {
+        Some(SchemaMode::Single) => vec!["--mode", "single"],
+        Some(SchemaMode::Cluster) => vec!["--mode", "cluster"],
+        None => vec![],
+    }
+}
+
+/// What the script printed after `schema.sh: `, when it printed one line
+/// there and nothing else.
+fn script_message(err: &str) -> Option<String> {
+    let line = err.strip_suffix('\n')?;
+    if line.contains('\n') {
+        return None;
+    }
+    line.strip_prefix("schema.sh: ").map(str::to_string)
+}
+
+/// `schema.sh --print` and `ctx_from_vars` over the same variables. `None`
+/// when the two agree: the same refusal with the same message, or both
+/// accept and render the same bytes. Otherwise what differs.
+fn script_and_crate_differ(vars: &[(&str, &str)], mode: Option<SchemaMode>) -> Option<String> {
+    script_and_crate_differ_in(vars, mode, &repo_root())
+}
+
+/// [`script_and_crate_differ`], the script run from `cwd`.
+fn script_and_crate_differ_in(
+    vars: &[(&str, &str)],
+    mode: Option<SchemaMode>,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    let (code, out, err) = script_clean_in(vars, &mode_args(mode), cwd);
+    let map: std::collections::BTreeMap<&str, &str> = vars.iter().copied().collect();
+    let from_crate = ctx_from_vars(&map, mode);
+    match (code, from_crate) {
+        (Some(0), Ok(ctx)) => {
+            let from_crate = rendered(&ctx);
+            (from_crate.as_bytes() != out.as_slice())
+                .then(|| format!("{vars:?} {mode:?}: both accept; the renders differ"))
+        }
+        (Some(2), Err(msg)) => match script_message(&err) {
+            Some(s) if s == msg => None,
+            _ => Some(format!(
+                "{vars:?} {mode:?}: the script printed {err:?}, the crate {msg:?}"
+            )),
+        },
+        (code, from_crate) => Some(format!(
+            "{vars:?} {mode:?}: the script exited {code:?} ({err:?}), the crate returned {:?}",
+            from_crate.map(|_| "a context")
+        )),
+    }
+}
+
+/// The literal pieces of a `REFUSALS` template, split at each `<name>`.
+fn template_pieces(template: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while let Some(open) = template[i..].find('<').map(|j| i + j) {
+        i = open + 1;
+        let Some(close) = template[open + 1..].find('>').map(|j| open + 1 + j) else {
+            break;
+        };
+        let name = &template[open + 1..close];
+        if !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            pieces.push(&template[start..open]);
+            start = close + 1;
+            i = close + 1;
+        }
+    }
+    pieces.push(&template[start..]);
+    pieces
+}
+
+/// `text` is `template` with each `<name>` standing for any text.
+fn matches_template(text: &str, template: &str) -> bool {
+    let pieces = template_pieces(template);
+    if pieces.len() == 1 {
+        return text == template;
+    }
+    let (first, last) = (pieces[0], pieces[pieces.len() - 1]);
+    if text.len() < first.len() + last.len() || !text.starts_with(first) || !text.ends_with(last) {
+        return false;
+    }
+    let mut rest = &text[first.len()..text.len() - last.len()];
+    for mid in &pieces[1..pieces.len() - 1] {
+        match rest.find(mid) {
+            Some(at) => rest = &rest[at + mid.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// `REFUSALS` row `n`, numbered from 1 as the documentation numbers it.
+fn refusal_row(n: usize) -> &'static str {
+    let row = pulsus_schema::REFUSALS.get(n - 1);
+    assert!(
+        row.is_some(),
+        "REFUSALS has no row {n}: {:?}",
+        pulsus_schema::REFUSALS
+    );
+    row.unwrap().0
+}
+
+#[test]
+fn the_template_matcher_reads_each_placeholder_as_any_text() {
+    assert!(matches_template("a 1 b 2 c", "a <x> b <y> c"));
+    assert!(matches_template(
+        "PULSUS_X: an empty item in ''",
+        "<1>: an empty item in '<2>'"
+    ));
+    assert!(!matches_template("a 1 b 2", "a <x> b <y> c"));
+    assert!(!matches_template("x 1 b 2 c", "a <x> b <y> c"));
+    assert!(!matches_template("a 1 c", "a <x> b <y> c"));
+    assert!(matches_template(
+        "2 × 60 + 870 > 6 × 3600",
+        "2 × <p> + 870 > <h> × 3600"
+    ));
+    assert!(!matches_template("abc", "abd"));
+}
+
+const MISSING_HOT: &str = "is not set; with PULSUS_COLD_VOLUME set each of \
+    PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS is required";
+
+const LANDING_VARS: [&str; 3] = [
+    "PULSUS_METRICS_LANDING_RETENTION_HOURS",
+    "PULSUS_LOG_LANDING_RETENTION_HOURS",
+    "PULSUS_TRACE_LANDING_RETENTION_HOURS",
+];
+
+const DEDUP_VARS: [&str; 3] = [
+    "PULSUS_METRICS_DEDUP_WINDOW",
+    "PULSUS_LOG_DEDUP_WINDOW",
+    "PULSUS_TRACE_DEDUP_WINDOW",
+];
+
+const RESOLUTION_REFUSED: &str = "PULSUS_LOG_ROLLUP_RESOLUTION must be a whole number with no \
+    leading zero, then ms (at most 12 digits), s (9), m (8), h (6), d (5) or w (4): ";
+
+/// One A1 case: the `REFUSALS` row it reaches, the variables over
+/// `PULSUS_RETENTION_DAYS=30` (`None` unsets one), the mode, and the message.
+type RefusalCase = (usize, Vec<(String, Option<String>)>, SchemaMode, String);
+
+fn refusal_case(
+    row: usize,
+    vars: &[(&str, Option<&str>)],
+    mode: SchemaMode,
+    message: impl Into<String>,
+) -> RefusalCase {
+    (
+        row,
+        vars.iter()
+            .map(|(k, v)| (k.to_string(), v.map(str::to_string)))
+            .collect(),
+        mode,
+        message.into(),
+    )
+}
+
+/// The variables of a case: `PULSUS_RETENTION_DAYS=30`, then each override.
+fn case_vars(overrides: &[(String, Option<String>)]) -> Vec<(String, String)> {
+    let mut map =
+        std::collections::BTreeMap::from([("PULSUS_RETENTION_DAYS".to_string(), "30".to_string())]);
+    for (k, v) in overrides {
+        match v {
+            Some(v) => map.insert(k.clone(), v.clone()),
+            None => map.remove(k),
+        };
+    }
+    map.into_iter().collect()
+}
+
+/// **A1 (issue #746 part A): the script and `ctx_from_vars` refuse every
+/// setting the same way, with the same message.** One case per message the
+/// settings can reach, and two-failure cases over every adjacent pair of
+/// rule groups and within the landing and dedup groups, which pin the order.
+/// Each message is also held to its `REFUSALS` row.
+#[test]
+fn the_script_and_the_crate_refuse_every_setting_the_same_way() {
+    use SchemaMode::{Cluster, Single};
+    let s = Some;
+    let mut cases: Vec<RefusalCase> = Vec::new();
+    let name_vars = [
+        "CLICKHOUSE_DB",
+        "PULSUS_CLUSTER",
+        "PULSUS_DIST_SUFFIX",
+        "PULSUS_STORAGE_POLICY",
+    ];
+    let name_whats = ["database", "cluster", "dist_suffix", "storage_policy"];
+    for (var, what) in name_vars.into_iter().zip(name_whats) {
+        cases.push(refusal_case(
+            3,
+            &[(var, s("a-b"))],
+            Single,
+            format!("{what} must be letters, digits and underscores: a-b"),
+        ));
+    }
+    cases.push(refusal_case(
+        4,
+        &[("PULSUS_RETENTION_DAYS", None)],
+        Single,
+        "PULSUS_RETENTION_DAYS is not set; retention has no default (docs/configuration.md §7)",
+    ));
+    cases.push(refusal_case(
+        5,
+        &[("PULSUS_RETENTION_DAYS", s("0"))],
+        Single,
+        "PULSUS_RETENTION_DAYS must be a whole number of days from 1 to 4294967295: 0",
+    ));
+    for var in LANDING_VARS {
+        cases.push(refusal_case(
+            6,
+            &[(var, s("0"))],
+            Single,
+            format!("{var} must be a whole number of hours from 1 to 168: 0"),
+        ));
+    }
+    for var in DEDUP_VARS {
+        cases.push(refusal_case(
+            7,
+            &[(var, s("0"))],
+            Single,
+            format!("{var} must be a whole number of blocks from 1 to 1000000: 0"),
+        ));
+    }
+    let levels = "PULSUS_ROLLUP_LEVELS";
+    for (row, text, message) in [
+        (8, "60,,720", "an empty item in '60,,720'"),
+        (
+            9,
+            "86401",
+            "86401 is not a whole number of seconds from 1 to 86400",
+        ),
+        (10, "7", "7 does not divide a day (86400)"),
+        (11, "45", "45 is below 60 and does not divide 60"),
+        (12, "720,60", "720 then 60: the levels must increase"),
+        (13, "60,90", "90 is not a multiple of 60"),
+        (14, "1,2,4,12,60,120,240,720,86400", "more than 8 levels"),
+        (
+            15,
+            "14400",
+            "the first level 14400 outlives metric_landing: 2 × 14400 + 870 > 6 × 3600",
+        ),
+    ] {
+        cases.push(refusal_case(
+            row,
+            &[(levels, s(text))],
+            Single,
+            format!("{levels}: {message}"),
+        ));
+    }
+    let ranges = "PULSUS_ROLLUP_RANGES";
+    for (row, text, message) in [
+        (
+            16,
+            "3600,,604800,7776000",
+            "an empty item in '3600,,604800,7776000'",
+        ),
+        (
+            17,
+            "3600,86400,604800,1000000000",
+            "1000000000 is not a whole number of seconds from 1 to 999999999",
+        ),
+        (
+            18,
+            "3600",
+            "1 ranges for 5 levels: give one for each level after the first",
+        ),
+        (
+            19,
+            "86400,3600,604800,7776000",
+            "86400 then 3600: the ranges must increase",
+        ),
+        (
+            20,
+            "59,86400,604800,7776000",
+            "59 is shorter than its level 60",
+        ),
+    ] {
+        cases.push(refusal_case(
+            row,
+            &[(ranges, s(text))],
+            Single,
+            format!("{ranges}: {message}"),
+        ));
+    }
+    cases.push(refusal_case(
+        21,
+        &[("PULSUS_ROLLUP_COUNTER_BUCKETS", s("1"))],
+        Single,
+        "PULSUS_ROLLUP_COUNTER_BUCKETS: 1 is not a whole number from 2 to 1000",
+    ));
+    cases.push(refusal_case(
+        22,
+        &[("PULSUS_COLD_VOLUME", s("cold"))],
+        Single,
+        "PULSUS_COLD_VOLUME is set and PULSUS_STORAGE_POLICY is not",
+    ));
+    cases.push(refusal_case(
+        23,
+        &[
+            ("PULSUS_STORAGE_POLICY", s("p")),
+            ("PULSUS_COLD_VOLUME", s("co-ld")),
+        ],
+        Single,
+        "cold_volume must be letters, digits and underscores: co-ld",
+    ));
+    let tiered = [
+        ("PULSUS_STORAGE_POLICY", s("p")),
+        ("PULSUS_COLD_VOLUME", s("cold")),
+    ];
+    for var in HOT_DAYS_VARS {
+        let mut missing: Vec<(&str, Option<&str>)> = tiered.to_vec();
+        let mut over: Vec<(&str, Option<&str>)> = tiered.to_vec();
+        for other in HOT_DAYS_VARS {
+            over.push((other, s(if other == var { "31" } else { "2" })));
+            if other != var {
+                missing.push((other, s("2")));
+            }
+        }
+        cases.push(refusal_case(
+            24,
+            &missing,
+            Single,
+            format!("{var} {MISSING_HOT}"),
+        ));
+        cases.push(refusal_case(
+            25,
+            &[(var, s("2"))],
+            Single,
+            format!("{var} is set and PULSUS_COLD_VOLUME is not"),
+        ));
+        cases.push(refusal_case(
+            26,
+            &over,
+            Single,
+            format!("{var} must be a whole number of days from 1 to 30: 31"),
+        ));
+    }
+    let with_cold: Vec<(&str, Option<&str>)> = tiered
+        .iter()
+        .copied()
+        .chain(HOT_DAYS_VARS.iter().map(|v| (*v, s("2"))))
+        .collect();
+    let keep = "PULSUS_ROLLUP_RETENTION_DAYS";
+    let hot = "PULSUS_ROLLUP_HOT_DAYS";
+    cases.push(refusal_case(
+        27,
+        &[(keep, s(""))],
+        Single,
+        format!("{keep}: an empty item in ''"),
+    ));
+    cases.push(refusal_case(
+        28,
+        &[(keep, s("30"))],
+        Single,
+        format!("{keep}: 1 items for 5 levels"),
+    ));
+    let mut hot_empty = with_cold.clone();
+    hot_empty.push((hot, s("")));
+    cases.push(refusal_case(
+        27,
+        &hot_empty,
+        Single,
+        format!("{hot}: an empty item in ''"),
+    ));
+    let mut hot_one = with_cold.clone();
+    hot_one.push((hot, s("1")));
+    cases.push(refusal_case(
+        28,
+        &hot_one,
+        Single,
+        format!("{hot}: 1 items for 5 levels"),
+    ));
+    cases.push(refusal_case(
+        29,
+        &[(keep, s("29,30,30,30,30"))],
+        Single,
+        format!("{keep}: 29 for the 5s level is not a whole number of days from 30 to 4294967295"),
+    ));
+    cases.push(refusal_case(
+        30,
+        &[("PULSUS_RETENTION_DAYS", s("1")), (keep, s("1,1,1,1,1"))],
+        Single,
+        format!(
+            "{keep}: 1 for the 5s level is too short: the next level's switch point, 3600 s, \
+             requires 2 retention days"
+        ),
+    ));
+    cases.push(refusal_case(
+        31,
+        &[(hot, s("1,1,1,1,1"))],
+        Single,
+        format!("{hot} is set and PULSUS_COLD_VOLUME is not"),
+    ));
+    let mut hot_over = with_cold.clone();
+    hot_over.push((hot, s("31,1,1,1,1")));
+    cases.push(refusal_case(
+        32,
+        &hot_over,
+        Single,
+        format!("{hot}: 31 for the 5s level is not a whole number of days from 1 to 30"),
+    ));
+    cases.push(refusal_case(
+        33,
+        &[],
+        Cluster,
+        "--mode cluster needs PULSUS_CLUSTER set to the cluster name",
+    ));
+    cases.push(refusal_case(
+        34,
+        &[("PULSUS_LOG_ROLLUP_RESOLUTION", s("5ns"))],
+        Single,
+        format!("{RESOLUTION_REFUSED}5ns"),
+    ));
+    let attrs = "PULSUS_TRACEQL_INDEXED_ATTRIBUTES";
+    let long_key = format!("span.{}", "a".repeat(129));
+    let seventeen = (1..=17)
+        .map(|i| format!("span.a{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (row, text, message) in [
+        (
+            35,
+            "span.a,,span.b".to_string(),
+            "an empty item in 'span.a,,span.b'".to_string(),
+        ),
+        (
+            36,
+            "resource.c".to_string(),
+            "resource.c: a resource attribute is read through resource_id, which the span \
+             table already indexes"
+                .to_string(),
+        ),
+        (
+            37,
+            "x.y".to_string(),
+            "x.y: the scope must be span. or event.".to_string(),
+        ),
+        (
+            38,
+            "span.a..b".to_string(),
+            "span.a..b: the key must be dot-separated segments of letters, digits, '_' and '-'"
+                .to_string(),
+        ),
+        (
+            39,
+            long_key.clone(),
+            format!("{long_key}: the key is longer than 128 bytes"),
+        ),
+        (
+            40,
+            "span.a,span.a".to_string(),
+            "span.a is listed twice".to_string(),
+        ),
+        (41, seventeen, "names more than 16 attributes".to_string()),
+    ] {
+        cases.push(refusal_case(
+            row,
+            &[(attrs, Some(text.as_str()))],
+            Single,
+            format!("{attrs}: {message}"),
+        ));
+    }
+    // Two failures at once: the earlier rule is the message.
+    let [ml, ll, tl] = LANDING_VARS;
+    let [md, ld, td] = DEDUP_VARS;
+    let two: Vec<RefusalCase> = vec![
+        refusal_case(
+            3,
+            &[("CLICKHOUSE_DB", s("a-b")), ("PULSUS_RETENTION_DAYS", None)],
+            Single,
+            "database must be letters, digits and underscores: a-b",
+        ),
+        refusal_case(
+            5,
+            &[("PULSUS_RETENTION_DAYS", s("0")), (ml, s("0"))],
+            Single,
+            "PULSUS_RETENTION_DAYS must be a whole number of days from 1 to 4294967295: 0",
+        ),
+        refusal_case(
+            6,
+            &[(ml, s("0")), (ll, s("0"))],
+            Single,
+            format!("{ml} must be a whole number of hours from 1 to 168: 0"),
+        ),
+        refusal_case(
+            6,
+            &[(ll, s("0")), (tl, s("0"))],
+            Single,
+            format!("{ll} must be a whole number of hours from 1 to 168: 0"),
+        ),
+        refusal_case(
+            6,
+            &[(tl, s("0")), (md, s("0"))],
+            Single,
+            format!("{tl} must be a whole number of hours from 1 to 168: 0"),
+        ),
+        refusal_case(
+            7,
+            &[(md, s("0")), (ld, s("0"))],
+            Single,
+            format!("{md} must be a whole number of blocks from 1 to 1000000: 0"),
+        ),
+        refusal_case(
+            7,
+            &[(ld, s("0")), (td, s("0"))],
+            Single,
+            format!("{ld} must be a whole number of blocks from 1 to 1000000: 0"),
+        ),
+        refusal_case(
+            7,
+            &[(td, s("0")), (levels, s("7"))],
+            Single,
+            format!("{td} must be a whole number of blocks from 1 to 1000000: 0"),
+        ),
+        refusal_case(
+            10,
+            &[(levels, s("7")), (ranges, s("1000000000"))],
+            Single,
+            format!("{levels}: 7 does not divide a day (86400)"),
+        ),
+        refusal_case(
+            18,
+            &[
+                (ranges, s("3600")),
+                ("PULSUS_ROLLUP_COUNTER_BUCKETS", s("1")),
+            ],
+            Single,
+            format!("{ranges}: 1 ranges for 5 levels: give one for each level after the first"),
+        ),
+        refusal_case(
+            21,
+            &[
+                ("PULSUS_ROLLUP_COUNTER_BUCKETS", s("1")),
+                ("PULSUS_COLD_VOLUME", s("cold")),
+            ],
+            Single,
+            "PULSUS_ROLLUP_COUNTER_BUCKETS: 1 is not a whole number from 2 to 1000",
+        ),
+        refusal_case(
+            22,
+            &[("PULSUS_COLD_VOLUME", s("cold"))],
+            Cluster,
+            "PULSUS_COLD_VOLUME is set and PULSUS_STORAGE_POLICY is not",
+        ),
+        refusal_case(
+            33,
+            &[("PULSUS_LOG_ROLLUP_RESOLUTION", s("5ns"))],
+            Cluster,
+            "--mode cluster needs PULSUS_CLUSTER set to the cluster name",
+        ),
+        refusal_case(
+            34,
+            &[
+                ("PULSUS_LOG_ROLLUP_RESOLUTION", s("5ns")),
+                (attrs, s("x.y")),
+            ],
+            Single,
+            format!("{RESOLUTION_REFUSED}5ns"),
+        ),
+    ];
+    cases.extend(two);
+
+    for (row, overrides, mode, want) in &cases {
+        let vars = case_vars(overrides);
+        let vars: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let args = mode_args(Some(*mode));
+        let (code, _, err) = script_clean(&vars, &args);
+        assert_eq!(
+            code,
+            Some(2),
+            "{vars:?} {mode:?}: the script's exit ({err})"
+        );
+        assert_eq!(
+            script_message(&err).as_deref(),
+            Some(want.as_str()),
+            "{vars:?} {mode:?}: the script's message"
+        );
+        let map: std::collections::BTreeMap<&str, &str> = vars.iter().copied().collect();
+        assert_eq!(
+            ctx_from_vars(&map, Some(*mode)).map(|_| ()),
+            Err(want.clone()),
+            "{vars:?} {mode:?}: ctx_from_vars"
+        );
+        let template = refusal_row(*row);
+        assert!(
+            matches_template(want, template),
+            "{want:?} is not row {row}, {template:?}"
+        );
+    }
+}
+
+/// One A2 case: what it is, the variables, the mode.
+type RenderCase = (&'static str, Vec<(&'static str, &'static str)>, SchemaMode);
+
+/// The eight cases of `the_script_renders_exactly_what_this_crate_renders`,
+/// as the variables the script reads, and the four A2 adds.
+fn a2_cases() -> Vec<RenderCase> {
+    use SchemaMode::{Cluster, Single};
+    let base = [("CLICKHOUSE_DB", "pulsus"), ("PULSUS_RETENTION_DAYS", "7")];
+    // Composed rather than written as a literal, as in
+    // `the_script_renders_exactly_what_this_crate_renders`: `live_db_naming`
+    // reads every literal given to a database variable.
+    let other_db: &'static str = Box::leak(format!("{}_elsewhere", single().db).into_boxed_str());
+    let with = |extra: &[(&'static str, &'static str)]| {
+        let mut v = base.to_vec();
+        v.extend_from_slice(extra);
+        v
+    };
+    vec![
+        ("default single-node", with(&[]), Single),
+        (
+            "default clustered",
+            with(&[("PULSUS_CLUSTER", "prod")]),
+            Cluster,
+        ),
+        (
+            "every value moved",
+            vec![
+                ("CLICKHOUSE_DB", other_db),
+                ("PULSUS_CLUSTER", "c1"),
+                ("PULSUS_DIST_SUFFIX", "_routed"),
+                ("PULSUS_STORAGE_POLICY", "hot_cold"),
+                ("PULSUS_RETENTION_DAYS", "31"),
+                ("PULSUS_LOG_ROLLUP_RESOLUTION", "500ms"),
+                ("PULSUS_METRICS_LANDING_RETENTION_HOURS", "11"),
+                ("PULSUS_LOG_LANDING_RETENTION_HOURS", "12"),
+                ("PULSUS_TRACE_LANDING_RETENTION_HOURS", "13"),
+                ("PULSUS_METRICS_DEDUP_WINDOW", "21"),
+                ("PULSUS_LOG_DEDUP_WINDOW", "22"),
+                ("PULSUS_TRACE_DEDUP_WINDOW", "23"),
+                (
+                    "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
+                    "span.app.request.id,event.exception.type,span.http-x.a_b",
+                ),
+                ("PULSUS_ROLLUP_LEVELS", "15,60,720"),
+                ("PULSUS_ROLLUP_RANGES", "3600,86400"),
+                ("PULSUS_ROLLUP_COUNTER_BUCKETS", "7"),
+                ("PULSUS_COLD_VOLUME", "cold"),
+                ("PULSUS_METRICS_HOT_DAYS", "5"),
+                ("PULSUS_LOGS_HOT_DAYS", "31"),
+                ("PULSUS_TRACES_HOT_DAYS", "6"),
+                ("PULSUS_ROLLUP_RETENTION_DAYS", "31,40,50"),
+                ("PULSUS_ROLLUP_HOT_DAYS", "3,40,9"),
+            ],
+            Cluster,
+        ),
+        (
+            "tiering, no family moves",
+            with(&[
+                ("PULSUS_STORAGE_POLICY", "tiered"),
+                ("PULSUS_COLD_VOLUME", "cold"),
+                ("PULSUS_METRICS_HOT_DAYS", "7"),
+                ("PULSUS_LOGS_HOT_DAYS", "7"),
+                ("PULSUS_TRACES_HOT_DAYS", "7"),
+            ]),
+            Single,
+        ),
+        (
+            "level retention only",
+            with(&[("PULSUS_ROLLUP_RETENTION_DAYS", "7,7,8,91,400")]),
+            Single,
+        ),
+        ("no levels", with(&[("PULSUS_ROLLUP_LEVELS", "")]), Single),
+        (
+            "whole minutes",
+            with(&[("PULSUS_LOG_ROLLUP_RESOLUTION", "120000ms")]),
+            Single,
+        ),
+        (
+            "whole seconds given in milliseconds",
+            with(&[("PULSUS_LOG_ROLLUP_RESOLUTION", "2000ms")]),
+            Single,
+        ),
+        (
+            "one level",
+            with(&[("PULSUS_ROLLUP_LEVELS", "60"), ("PULSUS_ROLLUP_RANGES", "")]),
+            Single,
+        ),
+        (
+            "eight levels",
+            with(&[
+                ("PULSUS_ROLLUP_LEVELS", "5,10,20,60,120,240,720,86400"),
+                (
+                    "PULSUS_ROLLUP_RANGES",
+                    "3600,7200,14400,28800,86400,604800,7776000",
+                ),
+            ]),
+            Single,
+        ),
+        (
+            "no levels, tiering set",
+            with(&[
+                ("PULSUS_ROLLUP_LEVELS", ""),
+                ("PULSUS_STORAGE_POLICY", "p"),
+                ("PULSUS_COLD_VOLUME", "cold"),
+                ("PULSUS_METRICS_HOT_DAYS", "2"),
+                ("PULSUS_LOGS_HOT_DAYS", "2"),
+                ("PULSUS_TRACES_HOT_DAYS", "2"),
+            ]),
+            Single,
+        ),
+        (
+            "an empty resolution",
+            with(&[("PULSUS_LOG_ROLLUP_RESOLUTION", "")]),
+            Single,
+        ),
+    ]
+}
+
+/// **A2 (issue #746 part A): `ctx_from_vars` renders what the script
+/// renders.** The script's `--print` output and `rendered` of the context
+/// built from the same variables are the same bytes; an empty resolution is
+/// the default; with no `--mode` the mode is the script's default, cluster
+/// exactly when `PULSUS_CLUSTER` is non-empty.
+#[test]
+fn ctx_from_vars_renders_what_the_script_renders() {
+    for (what, vars, mode) in a2_cases() {
+        let (code, out, err) = script_clean(&vars, &mode_args(Some(mode)));
+        assert_eq!(code, Some(0), "{what}: the script refused: {err}");
+        let map: std::collections::BTreeMap<&str, &str> = vars.iter().copied().collect();
+        let ctx = ctx_from_vars(&map, Some(mode));
+        assert!(ctx.is_ok(), "{what}: ctx_from_vars refused: {ctx:?}");
+        let from_crate = rendered(&ctx.unwrap());
+        assert!(
+            from_crate.as_bytes() == out.as_slice(),
+            "{what}: the crate's bytes must equal the script's"
+        );
+    }
+
+    // An empty resolution renders as an unset one, in both.
+    let unset = [("CLICKHOUSE_DB", "pulsus"), ("PULSUS_RETENTION_DAYS", "7")];
+    let empty = [
+        ("CLICKHOUSE_DB", "pulsus"),
+        ("PULSUS_RETENTION_DAYS", "7"),
+        ("PULSUS_LOG_ROLLUP_RESOLUTION", ""),
+    ];
+    let single = mode_args(Some(SchemaMode::Single));
+    let (_, from_unset, _) = script_clean(&unset, &single);
+    let (_, from_empty, _) = script_clean(&empty, &single);
+    assert!(from_unset == from_empty, "the script: empty and unset");
+    let crate_of = |vars: &[(&str, &str)], mode| {
+        let map: std::collections::BTreeMap<&str, &str> = vars.iter().copied().collect();
+        ctx_from_vars(&map, mode)
+    };
+    assert_eq!(
+        crate_of(&empty, Some(SchemaMode::Single)),
+        crate_of(&unset, Some(SchemaMode::Single)),
+        "the crate: empty and unset"
+    );
+    assert!(
+        String::from_utf8_lossy(&from_unset).contains("log_metrics_5s"),
+        "the default resolution is 5s"
+    );
+
+    // No `--mode`: the script's default.
+    for (what, vars, same_as) in [
+        (
+            "PULSUS_CLUSTER set",
+            vec![
+                ("CLICKHOUSE_DB", "pulsus"),
+                ("PULSUS_RETENTION_DAYS", "7"),
+                ("PULSUS_CLUSTER", "prod"),
+            ],
+            SchemaMode::Cluster,
+        ),
+        ("PULSUS_CLUSTER unset", unset.to_vec(), SchemaMode::Single),
+    ] {
+        let (code, by_default, err) = script_clean(&vars, &[]);
+        assert_eq!(code, Some(0), "{what}: the script refused: {err}");
+        let (_, by_mode, _) = script_clean(&vars, &mode_args(Some(same_as)));
+        assert!(by_default == by_mode, "{what}: the script's default mode");
+        let ctx = crate_of(&vars, None);
+        assert_eq!(
+            ctx,
+            crate_of(&vars, Some(same_as)),
+            "{what}: the crate's default"
+        );
+        assert!(
+            ctx.as_ref()
+                .is_ok_and(|c| rendered(c).as_bytes() == by_default.as_slice()),
+            "{what}: the crate's default renders the script's"
+        );
+    }
+}
+
+/// **A3 (issue #746 part A): the two variable lists are exactly the
+/// variables the script reads.**
+#[test]
+fn the_variable_lists_are_every_variable_the_script_reads() {
+    let schema_vars = [
+        "CLICKHOUSE_DB",
+        "PULSUS_CLUSTER",
+        "PULSUS_DIST_SUFFIX",
+        "PULSUS_STORAGE_POLICY",
+        "PULSUS_RETENTION_DAYS",
+        "PULSUS_LOG_ROLLUP_RESOLUTION",
+        "PULSUS_METRICS_LANDING_RETENTION_HOURS",
+        "PULSUS_LOG_LANDING_RETENTION_HOURS",
+        "PULSUS_TRACE_LANDING_RETENTION_HOURS",
+        "PULSUS_METRICS_DEDUP_WINDOW",
+        "PULSUS_LOG_DEDUP_WINDOW",
+        "PULSUS_TRACE_DEDUP_WINDOW",
+        "PULSUS_ROLLUP_LEVELS",
+        "PULSUS_ROLLUP_RANGES",
+        "PULSUS_ROLLUP_COUNTER_BUCKETS",
+        "PULSUS_COLD_VOLUME",
+        "PULSUS_METRICS_HOT_DAYS",
+        "PULSUS_LOGS_HOT_DAYS",
+        "PULSUS_TRACES_HOT_DAYS",
+        "PULSUS_ROLLUP_RETENTION_DAYS",
+        "PULSUS_ROLLUP_HOT_DAYS",
+        "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
+    ];
+    let connection_vars = [
+        "CLICKHOUSE_SERVER",
+        "CLICKHOUSE_HTTP_PORT",
+        "CLICKHOUSE_AUTH",
+        "PULSUS_SCHEMA_WAIT_SECONDS",
+    ];
+    assert_eq!(pulsus_schema::SCHEMA_VARS, schema_vars, "SCHEMA_VARS");
+    assert_eq!(
+        pulsus_schema::SCRIPT_CONNECTION_VARS,
+        connection_vars,
+        "SCRIPT_CONNECTION_VARS"
+    );
+    let mut union = std::collections::BTreeSet::new();
+    for name in pulsus_schema::SCHEMA_VARS
+        .iter()
+        .chain(pulsus_schema::SCRIPT_CONNECTION_VARS)
+    {
+        assert!(union.insert(*name), "{name} is listed twice");
+    }
+
+    let script = std::fs::read_to_string(repo_root().join("schema/schema.sh")).expect("schema.sh");
+    let mut scanned = std::collections::BTreeSet::new();
+    for (at, _) in script.match_indices("${") {
+        let name: String = script[at + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+            .collect();
+        if name.starts_with("PULSUS_") || name.starts_with("CLICKHOUSE_") {
+            scanned.insert(name);
+        }
+    }
+    assert_eq!(scanned.len(), 26, "the scan found {scanned:?}");
+    let union: std::collections::BTreeSet<String> = union.into_iter().map(String::from).collect();
+    assert_eq!(union, scanned, "the lists against the script");
+}
+
+/// **A4 (issue #746 part A): at most `MAX_LEVELS` levels, and it is 8.**
+#[test]
+fn a_schema_carries_at_most_eight_levels() {
+    assert_eq!(pulsus_schema::MAX_LEVELS, 8, "MAX_LEVELS");
+    assert_eq!(
+        pulsus_schema::parse_rollup_levels("1,2,4,12,60,120,240,720", 6).map(|l| l.len()),
+        Ok(8)
+    );
+    assert_eq!(
+        pulsus_schema::parse_rollup_levels("1,2,4,12,60,120,240,720,86400", 6),
+        Err("more than 8 levels".to_string())
+    );
+}
+
+/// The text of a double-quoted shell or awk string starting at `s[0] == '"'`.
+fn quoted(s: &str) -> Option<(&str, &str)> {
+    let body = s.strip_prefix('"')?;
+    let mut escaped = false;
+    for (i, c) in body.char_indices() {
+        match c {
+            '\\' if !escaped => escaped = true,
+            '"' if !escaped => return Some((&body[..i], &body[i + 1..])),
+            _ => escaped = false,
+        }
+    }
+    None
+}
+
+/// `$name`, `${name}`, `$1` written `<name>`, `<1>`.
+fn templated(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        let name: String = match chars.peek() {
+            Some('{') => {
+                chars.next();
+                let name: String = chars.by_ref().take_while(|c| *c != '}').collect();
+                name
+            }
+            Some(d) if d.is_ascii_digit() => chars.next().into_iter().collect(),
+            _ => {
+                let mut name = String::new();
+                while let Some(c) = chars.peek() {
+                    if c.is_ascii_alphanumeric() || *c == '_' {
+                        name.push(*c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                name
+            }
+        };
+        if name.is_empty() {
+            out.push('$');
+        } else {
+            out.push_str(&format!("<{name}>"));
+        }
+    }
+    out
+}
+
+/// The exit a line of the script ends in: `exit <n>`, or `return …` with
+/// `return "$ask_rc"` read as `curl`.
+fn exit_on(line: &str) -> Option<String> {
+    for word in ["exit ", "return "] {
+        let mut from = 0;
+        while let Some(at) = line[from..].find(word).map(|i| from + i) {
+            let before = line[..at].chars().last();
+            from = at + word.len();
+            if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            let arg: String = line[from..]
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != ';' && *c != '}')
+                .collect();
+            return Some(match arg.as_str() {
+                "\"$ask_rc\"" => "curl".to_string(),
+                _ => arg,
+            });
+        }
+    }
+    None
+}
+
+/// Every error message `schema/schema.sh` prints, in line order with a
+/// repeat dropped, each with the exit it leads to.
+fn script_refusals() -> Vec<(String, String)> {
+    let script = std::fs::read_to_string(repo_root().join("schema/schema.sh")).expect("schema.sh");
+    let joined = script.replace("\\\n", "");
+    let lines: Vec<&str> = joined.lines().collect();
+    let helpers = [
+        ("bad_levels", "PULSUS_ROLLUP_LEVELS: "),
+        ("bad_ranges", "PULSUS_ROLLUP_RANGES: "),
+        ("bad_tiering", ""),
+        ("bad_attr", "PULSUS_TRACEQL_INDEXED_ATTRIBUTES: "),
+    ];
+    // Each helper's body: its lines, and the exit it ends in.
+    let mut in_body = vec![false; lines.len()];
+    let mut helper_exit = std::collections::BTreeMap::new();
+    for (name, _) in helpers {
+        let head = format!("{name}() {{");
+        let start = lines
+            .iter()
+            .position(|l| l.trim() == head)
+            .unwrap_or_else(|| panic!("{name}'s body"));
+        let end = start
+            + lines[start..]
+                .iter()
+                .position(|l| l.trim() == "}")
+                .expect("the body's end");
+        for flag in &mut in_body[start..=end] {
+            *flag = true;
+        }
+        let exit = lines[start..=end]
+            .iter()
+            .find_map(|l| exit_on(l))
+            .expect("the body's exit");
+        helper_exit.insert(name, exit);
+    }
+    let mut found: Vec<(String, String)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if in_body[i] {
+            continue;
+        }
+        let mut message = None;
+        if let Some(at) = line.find("echo \"schema.sh: ") {
+            let (text, after) = quoted(&line[at + 5..]).expect("a closed string");
+            if after.trim_start().starts_with(">&2") {
+                let exit = lines[i..]
+                    .iter()
+                    .find_map(|l| exit_on(l))
+                    .expect("an exit after the message");
+                message = Some((text["schema.sh: ".len()..].to_string(), exit));
+            }
+        } else if let Some(at) = line.find("print \"schema.sh: ") {
+            let (text, after) = quoted(&line[at + 6..]).expect("a closed string");
+            if after.trim_start().starts_with("> \"/dev/stderr\"") {
+                let exit = lines[i..]
+                    .iter()
+                    .find_map(|l| exit_on(l))
+                    .expect("an exit after the message");
+                message = Some((text["schema.sh: ".len()..].to_string(), exit));
+            }
+        } else {
+            for (name, prefix) in helpers {
+                let call = format!("{name} \"");
+                let Some(at) = line.find(&call) else { continue };
+                if line[..at]
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let (text, _) = quoted(&line[at + name.len() + 1..]).expect("a closed string");
+                message = Some((format!("{prefix}{text}"), helper_exit[name].clone()));
+            }
+        }
+        if let Some((text, exit)) = message {
+            let template = templated(&text);
+            if !found.iter().any(|(t, _)| *t == template) {
+                found.push((template, exit));
+            }
+        }
+    }
+    found
+}
+
+/// The rows of `docs/configuration.md`'s `schema/schema.sh` errors table:
+/// (template, exit), numbered from 1 in order.
+fn documented_refusals() -> Vec<(String, String)> {
+    let text = doc("configuration.md");
+    let start = text
+        .find("### `schema/schema.sh` errors")
+        .map(|at| at + 1)
+        .unwrap_or(text.len());
+    let section = &text[start..];
+    let end = section.find("\n#").unwrap_or(section.len());
+    let mut rows = Vec::new();
+    for line in section[..end].lines() {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        if cells.len() < 5 || cells[1].is_empty() || !cells[1].bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        assert_eq!(
+            cells[1].parse::<usize>().unwrap(),
+            rows.len() + 1,
+            "the rows are numbered in order: {line}"
+        );
+        // The message cell is one code span; its text may hold a `|` only
+        // if the table did, which it does not.
+        let message = cells[2..cells.len() - 2].join("|");
+        let message = message
+            .strip_prefix('`')
+            .and_then(|m| m.strip_suffix('`'))
+            .unwrap_or_else(|| panic!("the message is one code span: {line}"));
+        rows.push((message.to_string(), cells[cells.len() - 2].to_string()));
+    }
+    rows
+}
+
+/// **A6 (issue #746 part A): every error the script prints is documented
+/// and held in `REFUSALS`, in order, with its exit.** The script is
+/// scanned, not trusted: each message is read out of its `echo`, `print` or
+/// helper call, and each exit out of the script.
+#[test]
+fn every_error_the_script_prints_is_documented_and_in_refusals() {
+    let constant: Vec<(String, String)> = pulsus_schema::REFUSALS
+        .iter()
+        .map(|(t, e)| (t.to_string(), e.to_string()))
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for (template, _) in &constant {
+        assert!(seen.insert(template), "{template:?} is in REFUSALS twice");
+    }
+    let scanned = script_refusals();
+    assert!(
+        scanned.len() >= 50,
+        "the scan found only {}: {scanned:#?}",
+        scanned.len()
+    );
+    assert_eq!(constant, scanned, "REFUSALS against the script");
+    assert_eq!(
+        documented_refusals(),
+        constant,
+        "docs/configuration.md's table against REFUSALS"
+    );
+}
+
+/// The scan reads each form the script prints a message in, and the exit
+/// each reaches.
+#[test]
+fn the_refusal_scan_reads_every_form() {
+    let scanned = script_refusals();
+    let find = |template: &str| {
+        scanned
+            .iter()
+            .find(|(t, _)| t == template)
+            .map(|(_, e)| e.as_str())
+    };
+    assert_eq!(find("--mode takes single or cluster"), Some("2"));
+    assert_eq!(find("unknown argument <1>"), Some("2"));
+    assert_eq!(
+        find("PULSUS_ROLLUP_LEVELS: an empty item in '<rollup_levels>'"),
+        Some("2")
+    );
+    assert_eq!(find("<1>: <list_n> items for <level_n> levels"), Some("2"));
+    assert_eq!(
+        find(
+            "PULSUS_ROLLUP_RETENTION_DAYS: <item> for the <level>s level is not a whole number \
+             of days from <retention_days> to 4294967295"
+        ),
+        Some("2")
+    );
+    assert_eq!(find("the server refused a request; it said:"), Some("curl"));
+    assert_eq!(find("the server refused this statement:"), Some("1"));
+    assert_eq!(find("the server said:"), Some("1"));
+    assert_eq!(
+        find(
+            "only <live> of <want_hosts> hosts in cluster '<cluster>' answered within \
+             <wait_seconds>s; ON CLUSTER DDL would fail on the rest"
+        ),
+        Some("1")
+    );
+    assert_eq!(
+        find("the file ends in an unterminated statement"),
+        Some("1")
+    );
+    assert!(
+        !scanned.iter().any(|(t, _)| t.starts_with("all ")),
+        "a message on standard output is not an error"
+    );
+    assert_eq!(
+        scanned
+            .iter()
+            .filter(|(t, _)| t.starts_with("cluster '<cluster>' is not defined"))
+            .count(),
+        1,
+        "a repeat is dropped"
+    );
+}
+
+/// A stub server on loopback: it answers its first request (the script's
+/// wait loop) `200` and every later one `500` with the body `boom`. Its
+/// address, the requests it has served, and each request's
+/// `Authorization` header, empty when it had none.
+fn refusing_stub() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a stub");
+    let addr = listener.local_addr().expect("the stub's address");
+    let served = std::sync::Arc::new(AtomicUsize::new(0));
+    let auths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let count = served.clone();
+    let seen = auths.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().expect("clone the stream"));
+            let mut length = 0usize;
+            let mut auth = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let lower = line.to_ascii_lowercase();
+                if let Some(v) = lower.strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap_or(0);
+                }
+                if lower.starts_with("authorization:") {
+                    auth = line["authorization:".len()..].trim().to_string();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut body = vec![0; length];
+            let _ = reader.read_exact(&mut body);
+            seen.lock().unwrap().push(auth);
+            let n = count.fetch_add(1, Ordering::SeqCst);
+            let (status, body) = if n == 0 {
+                ("200 OK", "1\n")
+            } else {
+                ("500 Internal Server Error", "boom")
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (addr, served, auths)
+}
+
+/// **A6b (issue #746 part A): a request the server refuses ends the script
+/// with curl's own exit code.** A stub answers the wait loop's first request
+/// and refuses every later one.
+#[test]
+fn a_refused_request_exits_with_curls_code() {
+    use std::sync::atomic::Ordering;
+    let (addr, served, _) = refusing_stub();
+    let root = repo_root();
+    let out = Command::new("sh")
+        .arg(root.join("schema/schema.sh"))
+        .args(["--mode", "single"])
+        .current_dir(&root)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").expect("PATH is set"))
+        .env("PULSUS_RETENTION_DAYS", "1")
+        .env("CLICKHOUSE_SERVER", "127.0.0.1")
+        .env("CLICKHOUSE_HTTP_PORT", addr.port().to_string())
+        .env("PULSUS_SCHEMA_WAIT_SECONDS", "2")
+        .output()
+        .expect("run schema.sh");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(22), "the exit: {err}");
+    assert!(
+        err.contains("schema.sh: the server refused a request; it said:\nboom\n"),
+        "the message and the server's answer: {err}"
+    );
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        2,
+        "the wait, then the version"
+    );
+}
+
+/// Standard base64 of `bytes`, for the expected `Authorization` header.
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ABC[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// **Issue #746 part A: the credential reaches the server as written.**
+/// `CLICKHOUSE_AUTH` holding a pattern character, run from a directory
+/// where the pattern names a file: the request carries the credential, not
+/// the file's name.
+#[test]
+fn the_credential_is_sent_as_written() {
+    assert_eq!(base64(b"user:p*"), "dXNlcjpwKg==");
+    let (addr, _, auths) = refusing_stub();
+    let dir = std::env::temp_dir().join(format!("pulsus-schema-auth-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a directory for the credential case");
+    std::fs::write(dir.join("user:pX"), "").expect("a file the pattern names");
+    let root = repo_root();
+    let out = Command::new("sh")
+        .arg(root.join("schema/schema.sh"))
+        .args(["--mode", "single"])
+        .current_dir(&dir)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").expect("PATH is set"))
+        .env("PULSUS_RETENTION_DAYS", "1")
+        .env("CLICKHOUSE_SERVER", "127.0.0.1")
+        .env("CLICKHOUSE_HTTP_PORT", addr.port().to_string())
+        .env("CLICKHOUSE_AUTH", "user:p*")
+        .env("PULSUS_SCHEMA_WAIT_SECONDS", "2")
+        .output()
+        .expect("run schema.sh");
+    std::fs::remove_dir_all(&dir).expect("remove the credential directory");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(22), "the exit: {err}");
+    let auths = auths.lock().unwrap().clone();
+    assert_eq!(
+        auths.get(1).map(String::as_str),
+        Some(format!("Basic {}", base64(b"user:p*")).as_str()),
+        "the version request's credential, of {auths:?}"
+    );
+}
+
+/// The numeric values of an A7 scalar between `lo` and `hi`; `None` unsets.
+fn scalar_values(lo: u64, hi: u64) -> Vec<Option<String>> {
+    let mut v: Vec<Option<String>> = vec![None];
+    for s in [
+        String::new(),
+        "0".into(),
+        "00".into(),
+        "01".into(),
+        (lo - 1).to_string(),
+        lo.to_string(),
+        (lo + 1).to_string(),
+        (hi - 1).to_string(),
+        hi.to_string(),
+        (hi + 1).to_string(),
+        format!("+{lo}"),
+        "-1".into(),
+        format!(" {lo}"),
+        format!("{lo} "),
+        "1.0".into(),
+        "1234567890123456789012345".into(),
+    ] {
+        v.push(Some(s));
+    }
+    v
+}
+
+/// Every list of `0..=n` items from `items`, joined with `,`.
+fn lists(items: &[&str], n: usize) -> Vec<String> {
+    let mut all = vec![Vec::<&str>::new()];
+    let mut last = vec![Vec::<&str>::new()];
+    for _ in 0..n {
+        let mut next = Vec::new();
+        for l in &last {
+            for item in items {
+                let mut l = l.clone();
+                l.push(item);
+                next.push(l);
+            }
+        }
+        all.extend(next.iter().cloned());
+        last = next;
+    }
+    all.into_iter().map(|l| l.join(",")).collect()
+}
+
+/// A7's cases: the variables over `PULSUS_RETENTION_DAYS=30` (`None`
+/// unsets one).
+fn a7_cases() -> Vec<Vec<(String, Option<String>)>> {
+    let mut cases: Vec<Vec<(String, Option<String>)>> = Vec::new();
+    let one = |var: &str, v: Option<String>| vec![(var.to_string(), v)];
+    let set = |pairs: &[(&str, &str)]| -> Vec<(String, Option<String>)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), Some(v.to_string())))
+            .collect()
+    };
+    for v in scalar_values(1, 4_294_967_295) {
+        cases.push(one("PULSUS_RETENTION_DAYS", v));
+    }
+    for var in LANDING_VARS {
+        for v in scalar_values(1, 168) {
+            cases.push(one(var, v));
+        }
+    }
+    for var in DEDUP_VARS {
+        for v in scalar_values(1, 1_000_000) {
+            cases.push(one(var, v));
+        }
+    }
+    for v in scalar_values(2, 1000) {
+        cases.push(one("PULSUS_ROLLUP_COUNTER_BUCKETS", v));
+    }
+    for var in HOT_DAYS_VARS {
+        for v in scalar_values(1, 30) {
+            let mut c = set(&[
+                ("PULSUS_STORAGE_POLICY", "p"),
+                ("PULSUS_COLD_VOLUME", "cold"),
+            ]);
+            for other in HOT_DAYS_VARS {
+                if other != var {
+                    c.push((other.to_string(), Some("2".to_string())));
+                }
+            }
+            c.push((var.to_string(), v));
+            cases.push(c);
+        }
+    }
+    let names = [
+        "a".to_string(),
+        "_".to_string(),
+        "1".to_string(),
+        "a-b".to_string(),
+        "a b".to_string(),
+        "a.b".to_string(),
+        "é".to_string(),
+        "a".repeat(64),
+        String::new(),
+    ];
+    for var in [
+        "CLICKHOUSE_DB",
+        "PULSUS_CLUSTER",
+        "PULSUS_DIST_SUFFIX",
+        "PULSUS_STORAGE_POLICY",
+        "PULSUS_COLD_VOLUME",
+    ] {
+        for v in names.iter().map(|n| Some(n.clone())).chain([None]) {
+            let mut c = if var == "PULSUS_COLD_VOLUME" {
+                set(&[
+                    ("PULSUS_STORAGE_POLICY", "p"),
+                    ("PULSUS_METRICS_HOT_DAYS", "2"),
+                    ("PULSUS_LOGS_HOT_DAYS", "2"),
+                    ("PULSUS_TRACES_HOT_DAYS", "2"),
+                ])
+            } else {
+                Vec::new()
+            };
+            c.push((var.to_string(), v));
+            cases.push(c);
+        }
+    }
+    let mut resolutions: Vec<Option<String>> = vec![None];
+    for r in [
+        "",
+        "1ms",
+        "5s",
+        "500ms",
+        "2m",
+        "1h",
+        "1d",
+        "1w",
+        "999999999999ms",
+        "1000000000000ms",
+        "999999999s",
+        "1000000000s",
+        "99999999m",
+        "100000000m",
+        "999999h",
+        "1000000h",
+        "99999d",
+        "100000d",
+        "9999w",
+        "10000w",
+        "0s",
+        "05s",
+        "5",
+        "5ns",
+        "-5s",
+        "1.5s",
+        "abcs",
+        " 5s",
+        "5s ",
+    ] {
+        resolutions.push(Some(r.to_string()));
+    }
+    for v in resolutions {
+        cases.push(one("PULSUS_LOG_ROLLUP_RESOLUTION", v));
+    }
+    let widths = [
+        "1", "2", "7", "60", "90", "120", "720", "1200", "1440", "86400", "86401", "172800",
+    ];
+    for list in lists(&widths, 3) {
+        for hours in ["1", "6"] {
+            cases.push(set(&[
+                ("PULSUS_ROLLUP_LEVELS", list.as_str()),
+                ("PULSUS_METRICS_LANDING_RETENTION_HOURS", hours),
+            ]));
+        }
+    }
+    for chain in [
+        "1,2,4,12,60,120,240",
+        "1,2,4,12,60,120,240,720",
+        "1,2,4,12,60,120,240,720,86400",
+    ] {
+        cases.push(set(&[("PULSUS_ROLLUP_LEVELS", chain)]));
+    }
+    let switch = [
+        "59",
+        "719",
+        "720",
+        "3600",
+        "86399",
+        "86400",
+        "999999999",
+        "1000000000",
+        "",
+    ];
+    for list in lists(&switch, 3) {
+        cases.push(set(&[
+            ("PULSUS_ROLLUP_LEVELS", "60,720,86400"),
+            ("PULSUS_ROLLUP_RANGES", list.as_str()),
+        ]));
+    }
+    let pairs = |items: &[&str]| -> Vec<String> {
+        let mut out = Vec::new();
+        for a in items {
+            for b in items {
+                out.push(format!("{a},{b}"));
+            }
+        }
+        out
+    };
+    for var in ["PULSUS_ROLLUP_RETENTION_DAYS", "PULSUS_ROLLUP_HOT_DAYS"] {
+        for (retention, items, hot) in [
+            (
+                "30",
+                &["29", "30", "31", "4294967295", "4294967296", "0", "01", ""][..],
+                "2",
+            ),
+            ("1", &["1", "2", "3"][..], "1"),
+        ] {
+            for list in pairs(items) {
+                for tiered in [false, true] {
+                    let mut c = set(&[
+                        ("PULSUS_RETENTION_DAYS", retention),
+                        ("PULSUS_ROLLUP_LEVELS", "60,720"),
+                        ("PULSUS_ROLLUP_RANGES", "86400"),
+                        (var, list.as_str()),
+                    ]);
+                    if tiered {
+                        c.extend(set(&[
+                            ("PULSUS_STORAGE_POLICY", "p"),
+                            ("PULSUS_COLD_VOLUME", "cold"),
+                            ("PULSUS_METRICS_HOT_DAYS", hot),
+                            ("PULSUS_LOGS_HOT_DAYS", hot),
+                            ("PULSUS_TRACES_HOT_DAYS", hot),
+                        ]));
+                    }
+                    cases.push(c);
+                }
+            }
+        }
+    }
+    let keys = [
+        "span.a".to_string(),
+        "event.b".to_string(),
+        "resource.c".to_string(),
+        "x.y".to_string(),
+        "span.".to_string(),
+        "span.a..b".to_string(),
+        "span.-a".to_string(),
+        format!("span.{}", "a".repeat(127)),
+        format!("span.{}", "a".repeat(128)),
+        format!("span.{}", "a".repeat(129)),
+    ];
+    let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let mut attr_lists = lists(&key_refs, 2);
+    for n in [15, 16, 17] {
+        attr_lists.push(
+            (1..=n)
+                .map(|i| format!("span.a{i}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    attr_lists.push("span.a,span.a".to_string());
+    for list in attr_lists {
+        cases.push(set(&[("PULSUS_TRACEQL_INDEXED_ATTRIBUTES", list.as_str())]));
+    }
+    cases
+}
+
+/// **A7 (issue #746 part A): the script and `ctx_from_vars` agree at every
+/// boundary.** About 5,300 cases over every rule's limits, at and on each
+/// side; for each, the same exit and message, and for an accepted case the
+/// same render. Eight threads.
+#[test]
+fn the_script_and_the_crate_agree_at_every_boundary() {
+    let cases = a7_cases();
+    assert!(cases.len() > 5000, "only {} cases", cases.len());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failures = std::sync::Mutex::new(Vec::new());
+    let accepted = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(case) = cases.get(i) else { break };
+                    let vars = case_vars(case);
+                    let vars: Vec<(&str, &str)> =
+                        vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    let map: std::collections::BTreeMap<&str, &str> =
+                        vars.iter().copied().collect();
+                    if ctx_from_vars(&map, Some(SchemaMode::Single)).is_ok() {
+                        accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if let Some(diff) = script_and_crate_differ(&vars, Some(SchemaMode::Single)) {
+                        failures.lock().unwrap().push(diff);
+                    }
+                }
+            });
+        }
+    });
+    let failures = failures.into_inner().unwrap();
+    assert!(
+        failures.is_empty(),
+        "{} of {} cases differ; the first: {:#?}",
+        failures.len(),
+        cases.len(),
+        &failures[..failures.len().min(20)]
+    );
+    // Both sides accepting nothing would agree everywhere.
+    assert!(
+        accepted.load(std::sync::atomic::Ordering::Relaxed) > 100,
+        "too few accepted cases"
+    );
+
+    // An attribute list holding a pattern character, from a directory
+    // where the pattern names files: the script reads the text, as the
+    // crate does, and never the directory.
+    let dir = std::env::temp_dir().join(format!("pulsus-schema-glob-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a directory for the pattern cases");
+    for name in ["span.a", "event.b"] {
+        std::fs::write(dir.join(name), "").expect("a file the pattern names");
+    }
+    let mut differ = Vec::new();
+    for list in ["*", "span.*", "span.a,*", "?pan.a", "event.[b]"] {
+        let vars = [
+            ("PULSUS_RETENTION_DAYS", "30"),
+            ("PULSUS_TRACEQL_INDEXED_ATTRIBUTES", list),
+        ];
+        differ.extend(script_and_crate_differ_in(
+            &vars,
+            Some(SchemaMode::Single),
+            &dir,
+        ));
+    }
+    std::fs::remove_dir_all(&dir).expect("remove the pattern directory");
+    assert!(
+        differ.is_empty(),
+        "from a directory the patterns match: {differ:#?}"
+    );
+}
+
+/// The rows of `docs/configuration.md`'s "Grammar boundaries" table:
+/// (accepted, grammar, values), each value one code span taken exactly.
+fn grammar_boundaries() -> Vec<(bool, String, Vec<String>)> {
+    let text = doc("configuration.md");
+    let start = text
+        .find("### Grammar boundaries")
+        .unwrap_or_else(|| panic!("no Grammar boundaries table"));
+    let section = &text[start + 1..];
+    let section = &section[..section.find("\n#").unwrap_or(section.len())];
+    let mut rows = Vec::new();
+    for line in section.lines() {
+        let Some(rest) = line
+            .strip_prefix("| accepted | ")
+            .map(|r| (true, r))
+            .or_else(|| line.strip_prefix("| refused | ").map(|r| (false, r)))
+        else {
+            continue;
+        };
+        let (accepted, rest) = rest;
+        let (grammar, cell) = rest.split_once(" | ").expect("three cells");
+        let cell = cell.strip_suffix(" |").expect("the row's end");
+        let mut values = Vec::new();
+        let mut cell = cell;
+        loop {
+            let body = cell
+                .strip_prefix('`')
+                .unwrap_or_else(|| panic!("a code span: {line}"));
+            let end = body.find('`').expect("a closed code span");
+            values.push(body[..end].to_string());
+            cell = &body[end + 1..];
+            if cell.is_empty() {
+                break;
+            }
+            cell = cell
+                .strip_prefix(", ")
+                .unwrap_or_else(|| panic!("values are separated by ', ': {line}"));
+        }
+        rows.push((accepted, grammar.to_string(), values));
+    }
+    let kinds: Vec<(bool, &str)> = rows.iter().map(|(a, g, _)| (*a, g.as_str())).collect();
+    assert_eq!(
+        kinds,
+        [
+            (true, "dedup window"),
+            (false, "dedup window"),
+            (true, "log rollup resolution"),
+            (false, "log rollup resolution"),
+        ],
+        "the table's rows"
+    );
+    rows
+}
+
+/// A resolution as a `Duration`, worked out here rather than by the parser.
+fn resolution_of(v: &str) -> Duration {
+    let digits: String = v.chars().take_while(char::is_ascii_digit).collect();
+    let n: u64 = digits.parse().expect("digits");
+    match &v[digits.len()..] {
+        "ms" => Duration::from_millis(n),
+        "s" => Duration::from_secs(n),
+        "m" => Duration::from_secs(n * 60),
+        "h" => Duration::from_secs(n * 3600),
+        "d" => Duration::from_secs(n * 86_400),
+        "w" => Duration::from_secs(n * 604_800),
+        unit => panic!("unit {unit}"),
+    }
+}
+
+/// **A8 (issue #746 part A): the script, `ctx_from_vars` and the binary's
+/// parsers accept and refuse the documented boundary values.** Read from
+/// `docs/configuration.md`'s "Grammar boundaries" table.
+#[test]
+fn the_script_the_crate_and_the_parsers_hold_the_documented_boundaries() {
+    let rows = grammar_boundaries();
+    for (accepted, grammar, values) in rows {
+        for v in values {
+            let checks: Vec<(&str, String)> = if grammar == "dedup window" {
+                let parsed = pulsus_config::parse_dedup_window(&v);
+                if accepted {
+                    assert_eq!(parsed, Some(v.parse::<u64>().unwrap()), "{v:?}: the parser");
+                } else {
+                    assert_eq!(parsed, None, "{v:?}: the parser");
+                }
+                DEDUP_VARS
+                    .iter()
+                    .map(|var| {
+                        (
+                            *var,
+                            format!(
+                                "{var} must be a whole number of blocks from 1 to 1000000: {v}"
+                            ),
+                        )
+                    })
+                    .collect()
+            } else {
+                let parsed = pulsus_config::parse_log_rollup_resolution(&v);
+                if accepted {
+                    assert_eq!(parsed, Some(resolution_of(&v)), "{v:?}: the parser");
+                } else {
+                    assert_eq!(parsed, None, "{v:?}: the parser");
+                }
+                vec![(
+                    "PULSUS_LOG_ROLLUP_RESOLUTION",
+                    format!("{RESOLUTION_REFUSED}{v}"),
+                )]
+            };
+            let row = if grammar == "dedup window" { 7 } else { 34 };
+            for (var, refusal) in checks {
+                let vars = [("PULSUS_RETENTION_DAYS", "30"), (var, v.as_str())];
+                let (code, out, err) = script_clean(&vars, &["--mode", "single"]);
+                let map: std::collections::BTreeMap<&str, &str> = vars.iter().copied().collect();
+                let from_crate = ctx_from_vars(&map, Some(SchemaMode::Single));
+                if accepted {
+                    assert_eq!(code, Some(0), "{var}={v:?}: the script ({err})");
+                    let ctx = from_crate
+                        .unwrap_or_else(|e| panic!("{var}={v:?}: ctx_from_vars refused: {e}"));
+                    assert!(
+                        rendered(&ctx).as_bytes() == out.as_slice(),
+                        "{var}={v:?}: the renders"
+                    );
+                    if grammar == "dedup window" {
+                        let n: u64 = v.parse().unwrap();
+                        let got = [
+                            ctx.metrics_dedup_window,
+                            ctx.log_dedup_window,
+                            ctx.trace_dedup_window,
+                        ];
+                        let at = DEDUP_VARS.iter().position(|d| *d == var).unwrap();
+                        assert_eq!(got[at], n, "{var}={v:?}: the context's window");
+                    } else {
+                        assert_eq!(ctx.log_rollup, resolution_of(&v), "{var}={v:?}");
+                    }
+                } else {
+                    assert_eq!(code, Some(2), "{var}={v:?}: the script's exit ({err})");
+                    assert_eq!(
+                        script_message(&err),
+                        Some(refusal.clone()),
+                        "{var}={v:?}: the script's message"
+                    );
+                    assert_eq!(
+                        from_crate.map(|_| ()),
+                        Err(refusal.clone()),
+                        "{var}={v:?}: ctx_from_vars"
+                    );
+                    assert!(
+                        matches_template(&refusal, refusal_row(row)),
+                        "{refusal:?} is row {row}"
+                    );
+                }
+            }
+        }
     }
 }

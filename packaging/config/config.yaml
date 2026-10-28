@@ -13,7 +13,7 @@
 # Secrets (clickhouse.auth password, auth_password, admin_password) are better placed in the env
 # file /etc/pulsusdb/pulsusdb.env so they stay out of this world-readable schema.
 #
-# Durations accept ms|s|m|h|d|w; byte sizes accept binary (KiB/MiB/GiB/TiB),
+# Durations accept ms|s|m|h|d|w (log_rollup_resolution: no spaces, no leading zero, digit cap per unit); byte sizes accept binary (KiB/MiB/GiB/TiB),
 # decimal (KB/MB/GB/TB), or a bare integer of bytes.
 
 # --- root scalars ---

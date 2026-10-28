@@ -55,10 +55,10 @@ Retention is not set here: `schema/schema.sh` takes it (§7), and the binary rea
 |----------|---------|-------------|
 | `PULSUS_STORAGE_POLICY` | unset | ClickHouse storage policy for the created tables. With `PULSUS_COLD_VOLUME` set (§7), the tables that never move are created without it. `schema/schema.sh` refuses, before it drops anything, a policy any server of the cluster lacks |
 | `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` | empty | comma-separated trace attributes `spans` carries a bloom-filter index for, each `span.<key>` or `event.<key>`, the key dot-separated segments of letters, digits, `_` and `-`; at most 16, none twice, each key at most 128 bytes. `schema/schema.sh` checks the list before it contacts the server and builds one index per item and the reader hints a search whose filter requires `key = "<string>"` on one. Changing it is a schema rebuild; a reader and a schema that disagree answer the same, only slower. Each index adds about 3–5 MB to a `spans` insert or merge at the default `PULSUS_BATCH_BYTES`, and 41–53 B more per span in a push larger than that |
-| `PULSUS_LOG_ROLLUP_RESOLUTION` | `5s` | bucket size of the derived log count/bytes rollup (table named for it, e.g. `log_metrics_5s`); raw log/metric samples always store source timestamps verbatim — no resolution is assumed or imposed anywhere |
-| `PULSUS_METRICS_DEDUP_WINDOW` | `10000` | how many recent blocks `metric_landing` and each of the eight tables the views maintain remember for deduplication, so a resend of a block the server already accepted is dropped before it is stored again. A window of `W` blocks covers a steady rate of `W / 120` pushes a second, the landing insert's budget being 120 s: **83** at the default and **8333** at the maximum, rounding down. Above that a block's token can be evicted before its resend arrives. **Which engine setting carries it follows the deployment**: a clustered deployment renders these tables `Replicated*`, where the window in force is the replicated engines' own. On a single node there is no companion **time** window, the engine having `non_replicated_deduplication_window` and no seconds-based counterpart there — a block is remembered until that many newer blocks have arrived and is never forgotten on a timer, which is the safe direction for a resend. On a cluster there is one, and it is pinned at the server's own default of one hour rather than configured: a deployment that lowered it below the landing budget would forget a block's token while the writer is still entitled to resend under it. Accepted range `1..=1000000`; values outside this range are rejected at config load |
-| `PULSUS_LOG_DEDUP_WINDOW` | `10000` | how many recent blocks `log_landing` and each of the five tables the views maintain remember for deduplication, so a resend of a block the server already accepted is dropped before it is stored again. A window of `W` blocks covers a steady rate of `W / 120` pushes a second, the landing insert's budget being 120 s: **83** at the default and **8333** at the maximum, rounding down. Above that a block's token can be evicted before its resend arrives. **Which engine setting carries it follows the deployment**: a clustered deployment renders these tables `Replicated*`, where the window in force is the replicated engines' own. On a cluster there is a companion **time** window, and it is pinned at the server's own default of one hour rather than configured — a deployment that lowered it below the landing budget would forget a block's token while the writer is still entitled to resend under it. Accepted range `1..=1000000`; values outside this range are rejected at config load |
-| `PULSUS_TRACE_DEDUP_WINDOW` | `10000` | how many recent blocks `trace_landing` and each of the eight tables the views maintain remember for deduplication, so a resend of a block the server already accepted is dropped before it is stored again. The shape is `PULSUS_LOG_DEDUP_WINDOW`'s, whole, including which engine setting carries it and the pinned companion time window on a cluster. Accepted range `1..=1000000`; values outside this range are rejected at config load |
+| `PULSUS_LOG_ROLLUP_RESOLUTION` | `5s` | bucket size of the derived log count/bytes rollup (table named for it, e.g. `log_metrics_5s`); raw log/metric samples always store source timestamps verbatim — no resolution is assumed or imposed anywhere. A whole number with no leading zero and nothing around it, then `ms`, `s`, `m`, `h`, `d` or `w`, of at most 12, 9, 8, 6, 5 or 4 digits respectively, here and in `schema/schema.sh` ([grammar boundaries](#grammar-boundaries)) |
+| `PULSUS_METRICS_DEDUP_WINDOW` | `10000` | how many recent blocks `metric_landing` and each of the eight tables the views maintain remember for deduplication, so a resend of a block the server already accepted is dropped before it is stored again. A window of `W` blocks covers a steady rate of `W / 120` pushes a second, the landing insert's budget being 120 s: **83** at the default and **8333** at the maximum, rounding down. Above that a block's token can be evicted before its resend arrives. **Which engine setting carries it follows the deployment**: a clustered deployment renders these tables `Replicated*`, where the window in force is the replicated engines' own. On a single node there is no companion **time** window, the engine having `non_replicated_deduplication_window` and no seconds-based counterpart there — a block is remembered until that many newer blocks have arrived and is never forgotten on a timer, which is the safe direction for a resend. On a cluster there is one, and it is pinned at the server's own default of one hour rather than configured: a deployment that lowered it below the landing budget would forget a block's token while the writer is still entitled to resend under it. A whole number from `1` to `1000000` with no sign or leading zero; anything else is rejected at config load and by `schema/schema.sh` ([grammar boundaries](#grammar-boundaries)) |
+| `PULSUS_LOG_DEDUP_WINDOW` | `10000` | how many recent blocks `log_landing` and each of the five tables the views maintain remember for deduplication, so a resend of a block the server already accepted is dropped before it is stored again. A window of `W` blocks covers a steady rate of `W / 120` pushes a second, the landing insert's budget being 120 s: **83** at the default and **8333** at the maximum, rounding down. Above that a block's token can be evicted before its resend arrives. **Which engine setting carries it follows the deployment**: a clustered deployment renders these tables `Replicated*`, where the window in force is the replicated engines' own. On a cluster there is a companion **time** window, and it is pinned at the server's own default of one hour rather than configured — a deployment that lowered it below the landing budget would forget a block's token while the writer is still entitled to resend under it. A whole number from `1` to `1000000` with no sign or leading zero; anything else is rejected at config load and by `schema/schema.sh` ([grammar boundaries](#grammar-boundaries)) |
+| `PULSUS_TRACE_DEDUP_WINDOW` | `10000` | how many recent blocks `trace_landing` and each of the eight tables the views maintain remember for deduplication, so a resend of a block the server already accepted is dropped before it is stored again. The shape is `PULSUS_LOG_DEDUP_WINDOW`'s, whole, including which engine setting carries it and the pinned companion time window on a cluster. A whole number from `1` to `1000000` with no sign or leading zero; anything else is rejected at config load and by `schema/schema.sh` ([grammar boundaries](#grammar-boundaries)) |
 
 ## 4. Clustering
 
@@ -171,13 +171,13 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PULSUS_RETENTION_DAYS` | none: required | `R` in the table below, in days. Without it the script exits `2` before it contacts the server; it accepts a whole number from `1` to `4294967295` with no leading zero, and refuses anything else the same way. The script writes it into the TTLs marked `R` below, into each rollup level's (`L`) when `PULSUS_ROLLUP_RETENTION_DAYS` is unset, into the five metric catalogue tables' (`C`) as their least, and into the database comment `retention_days=<N>`; the three landing tables' TTLs (`H`) take their own hours |
-| `PULSUS_METRICS_LANDING_RETENTION_HOURS` | `6` | `H` for `metric_landing`, in hours. A whole number from `1` to `168`; anything else is exit `2` |
+| `PULSUS_RETENTION_DAYS` | none: required | `R` in the table below, in days. A whole number from `1` to `4294967295` with no leading zero; unset or anything else is refused before the server is contacted ([errors](#schemaschemash-errors)). The script writes it into the TTLs marked `R` below, into each rollup level's (`L`) when `PULSUS_ROLLUP_RETENTION_DAYS` is unset, into the five metric catalogue tables' (`C`) as their least, and into the database comment `retention_days=<N>`; the three landing tables' TTLs (`H`) take their own hours |
+| `PULSUS_METRICS_LANDING_RETENTION_HOURS` | `6` | `H` for `metric_landing`, in hours. A whole number from `1` to `168` ([errors](#schemaschemash-errors)) |
 | `PULSUS_LOG_LANDING_RETENTION_HOURS` | `6` | `H` for `log_landing`, with the same rule |
 | `PULSUS_TRACE_LANDING_RETENTION_HOURS` | `6` | `H` for `trace_landing`, with the same rule |
-| `PULSUS_ROLLUP_LEVELS` | `5,60,720,7200,86400` | the rollup levels in seconds, smallest first; empty for none. Refused with exit `2` unless: whole numbers, no leading zero, no empty item; each divides 86400; one below 60 divides 60; each greater than and a multiple of the one before; at most 8; and `2 × max(first, 60) + 870 ≤ 3600 × PULSUS_METRICS_LANDING_RETENTION_HOURS`. Choose levels above the scrape interval: a level at or below it holds about one sample per series and bucket or fewer, so it stores more than raw and saves no rows |
-| `PULSUS_ROLLUP_RANGES` | `3600,86400,604800,7776000` | the query range in seconds from which each level after the first is the resolution of a PromQL range query ([api.md](api.md) §3.6), one per level after the first, in level order; read only when there are levels, and empty for none. Stored in each level table's comment. Refused with exit `2`, the first failing rule the message: an empty item (`an empty item in '<text>'`); an item that is not a whole number from `1` to `999999999` with no leading zero (`<item> is not a whole number of seconds from 1 to 999999999`); not one for each level after the first (`<n> ranges for <m> levels: give one for each level after the first`); not increasing (`<a> then <b>: the ranges must increase`); shorter than its level (`<range> is shorter than its level <w>`) |
-| `PULSUS_ROLLUP_COUNTER_BUCKETS` | `5` | the buckets of a level a `rate` or `increase` range covers at least for that level to answer it. Stored in each level table's comment. A whole number from `2` to `1000` with no leading zero; anything else is exit `2`, `<v> is not a whole number from 2 to 1000`. One bucket would give a `rate` window one point at the levels under 720 s. The distances in [api.md](api.md) §3.6 hold for `5` |
+| `PULSUS_ROLLUP_LEVELS` | `5,60,720,7200,86400` | the rollup levels in seconds, smallest first; empty for none. Its rules are [errors](#schemaschemash-errors) 8-15. Choose levels above the scrape interval: a level at or below it holds about one sample per series and bucket or fewer, so it stores more than raw and saves no rows |
+| `PULSUS_ROLLUP_RANGES` | `3600,86400,604800,7776000` | the query range in seconds from which each level after the first is the resolution of a PromQL range query ([api.md](api.md) §3.6), one per level after the first, in level order; read only when there are levels, and empty for none. Stored in each level table's comment. Its rules are [errors](#schemaschemash-errors) 16-20 |
+| `PULSUS_ROLLUP_COUNTER_BUCKETS` | `5` | the buckets of a level a `rate` or `increase` range covers at least for that level to answer it. Stored in each level table's comment. A whole number from `2` to `1000` with no leading zero ([errors](#schemaschemash-errors)). One bucket would give a `rate` window one point at the levels under 720 s. The distances in [api.md](api.md) §3.6 hold for `5` |
 | `PULSUS_COLD_VOLUME` | unset: nothing moves | the volume of `PULSUS_STORAGE_POLICY` (§3) that old parts move to; letters, digits and `_`. Requires the policy; the volume must not be the policy's first, and the policy's `move_factor` must be `0` (`schema/schema.sh` checks every server before it drops anything, exit `1`) |
 | `PULSUS_METRICS_HOT_DAYS` | none: required when `PULSUS_COLD_VOLUME` is set, refused when it is not | days after which a metric sample's part moves to the cold volume, from `1` to `PULSUS_RETENTION_DAYS`; the retention itself renders no move rule. Either way the tables stay on the policy, so a new part can still be written to the cold volume when the local volume is full (Tiering, below) |
 | `PULSUS_LOGS_HOT_DAYS` | as above | the same for log lines and the log rollups |
@@ -269,26 +269,75 @@ Every server carries the policy, the same on every replica of every shard. For e
 </clickhouse>
 ```
 
-The script's refusals, each printed as `schema.sh: <message>`. Rules 1 to 5 are checked in this order before the server is contacted; the last, before anything is dropped:
+### `schema/schema.sh` errors
 
-| Rule | Message | Exit |
-|------|---------|------|
-| 1 | `PULSUS_COLD_VOLUME is set and PULSUS_STORAGE_POLICY is not` | `2` |
-| 2 | `cold_volume must be letters, digits and underscores: <v>` | `2` |
-| 3 a | `<VAR> is not set; with PULSUS_COLD_VOLUME set each of PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS is required` | `2` |
-| 3 b | `<VAR> is set and PULSUS_COLD_VOLUME is not` | `2` |
-| 3 c | `<VAR> must be a whole number of days from 1 to <R>: <value>` | `2` |
-| 4 a | `PULSUS_ROLLUP_RETENTION_DAYS: an empty item in '<text>'` | `2` |
-| 4 b | `PULSUS_ROLLUP_RETENTION_DAYS: <k> items for <m> levels` | `2` |
-| 4 c | `PULSUS_ROLLUP_RETENTION_DAYS: <item> for the <s>s level is not a whole number of days from <R> to 4294967295` | `2` |
-| 4 d | `PULSUS_ROLLUP_RETENTION_DAYS: <item> for the <s>s level is too short: the next level's switch point, <from> s, requires <d> retention days` | `2` |
-| 5 a | `PULSUS_ROLLUP_HOT_DAYS is set and PULSUS_COLD_VOLUME is not` | `2` |
-| 5 b | `PULSUS_ROLLUP_HOT_DAYS: an empty item in '<text>'` | `2` |
-| 5 c | `PULSUS_ROLLUP_HOT_DAYS: <k> items for <m> levels` | `2` |
-| 5 d | `PULSUS_ROLLUP_HOT_DAYS: <item> for the <s>s level is not a whole number of days from 1 to <keep>` | `2` |
-| before the drop | `storage policy '<p>' with a volume '<v>' after its first and move_factor 0 is defined on <n> of <m> hosts; every server's configuration must carry it (docs/configuration.md §3)`, without `with a volume … move_factor 0` when no cold volume is set | `1` |
+Each is printed as `schema.sh: <message>` on standard error, and the script exits with the code shown. Rows 3 to 41 are the settings, checked in this order before the server is contacted, the first that fails reported. `<what>` is `database`, `cluster`, `dist_suffix` or `storage_policy` in row 3 and the variable's name in rows 6, 7 and 24 to 26; `<1>` is the argument in row 2, the first level in row 15, and `PULSUS_ROLLUP_RETENTION_DAYS` or `PULSUS_ROLLUP_HOT_DAYS` in rows 27 and 28; other `<…>` are values. Rows 43 to 45 print the statement or the server's answer after them.
 
-Rule 3 is checked for `PULSUS_METRICS_HOT_DAYS`, then `PULSUS_LOGS_HOT_DAYS`, then `PULSUS_TRACES_HOT_DAYS`, all of a, b and c for one before the next. `<VAR>` is the variable's name and `<R>` is `PULSUS_RETENTION_DAYS`. Rule 4 is checked when `PULSUS_ROLLUP_RETENTION_DAYS` is set, rule 5 when `PULSUS_ROLLUP_HOT_DAYS` is, each item in level order and 4 c for every level before 4 d. `<s>` is the level in seconds; `<from>` the switch point of the level after it; `<d>` = ⌈`<from>` ÷ 86400⌉ + 1; `<keep>` the level's `PULSUS_ROLLUP_RETENTION_DAYS` item, else `<R>`; `<k>` the number of items and `<m>` of levels.
+| # | Message | Exit |
+|---|---|---|
+| 1 | `--mode takes single or cluster` | 2 |
+| 2 | `unknown argument <1>` | 2 |
+| 3 | `<what> must be letters, digits and underscores: <value>` | 2 |
+| 4 | `PULSUS_RETENTION_DAYS is not set; retention has no default (docs/configuration.md §7)` | 2 |
+| 5 | `PULSUS_RETENTION_DAYS must be a whole number of days from 1 to 4294967295: <retention_days>` | 2 |
+| 6 | `<what> must be a whole number of hours from 1 to 168: <value>` | 2 |
+| 7 | `<what> must be a whole number of blocks from 1 to 1000000: <value>` | 2 |
+| 8 | `PULSUS_ROLLUP_LEVELS: an empty item in '<rollup_levels>'` | 2 |
+| 9 | `PULSUS_ROLLUP_LEVELS: <item> is not a whole number of seconds from 1 to 86400` | 2 |
+| 10 | `PULSUS_ROLLUP_LEVELS: <item> does not divide a day (86400)` | 2 |
+| 11 | `PULSUS_ROLLUP_LEVELS: <item> is below 60 and does not divide 60` | 2 |
+| 12 | `PULSUS_ROLLUP_LEVELS: <prev> then <item>: the levels must increase` | 2 |
+| 13 | `PULSUS_ROLLUP_LEVELS: <item> is not a multiple of <prev>` | 2 |
+| 14 | `PULSUS_ROLLUP_LEVELS: more than 8 levels` | 2 |
+| 15 | `PULSUS_ROLLUP_LEVELS: the first level <1> outlives metric_landing: 2 × <period> + 870 > <metrics_landing_hours> × 3600` | 2 |
+| 16 | `PULSUS_ROLLUP_RANGES: an empty item in '<rollup_ranges>'` | 2 |
+| 17 | `PULSUS_ROLLUP_RANGES: <item> is not a whole number of seconds from 1 to 999999999` | 2 |
+| 18 | `PULSUS_ROLLUP_RANGES: <n_ranges> ranges for <n_levels> levels: give one for each level after the first` | 2 |
+| 19 | `PULSUS_ROLLUP_RANGES: <prev> then <item>: the ranges must increase` | 2 |
+| 20 | `PULSUS_ROLLUP_RANGES: <item> is shorter than its level <level>` | 2 |
+| 21 | `PULSUS_ROLLUP_COUNTER_BUCKETS: <counter_buckets> is not a whole number from 2 to 1000` | 2 |
+| 22 | `PULSUS_COLD_VOLUME is set and PULSUS_STORAGE_POLICY is not` | 2 |
+| 23 | `cold_volume must be letters, digits and underscores: <cold_volume>` | 2 |
+| 24 | `<what> is not set; with PULSUS_COLD_VOLUME set each of PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS is required` | 2 |
+| 25 | `<what> is set and PULSUS_COLD_VOLUME is not` | 2 |
+| 26 | `<what> must be a whole number of days from 1 to <retention_days>: <value>` | 2 |
+| 27 | `<1>: an empty item in '<2>'` | 2 |
+| 28 | `<1>: <list_n> items for <level_n> levels` | 2 |
+| 29 | `PULSUS_ROLLUP_RETENTION_DAYS: <item> for the <level>s level is not a whole number of days from <retention_days> to 4294967295` | 2 |
+| 30 | `PULSUS_ROLLUP_RETENTION_DAYS: <item> for the <level>s level is too short: the next level's switch point, <from> s, requires <need> retention days` | 2 |
+| 31 | `PULSUS_ROLLUP_HOT_DAYS is set and PULSUS_COLD_VOLUME is not` | 2 |
+| 32 | `PULSUS_ROLLUP_HOT_DAYS: <item> for the <level>s level is not a whole number of days from 1 to <keep>` | 2 |
+| 33 | `--mode cluster needs PULSUS_CLUSTER set to the cluster name` | 2 |
+| 34 | `PULSUS_LOG_ROLLUP_RESOLUTION must be a whole number with no leading zero, then ms (at most 12 digits), s (9), m (8), h (6), d (5) or w (4): <rollup>` | 2 |
+| 35 | `PULSUS_TRACEQL_INDEXED_ATTRIBUTES: an empty item in '<indexed>'` | 2 |
+| 36 | `PULSUS_TRACEQL_INDEXED_ATTRIBUTES: <item>: a resource attribute is read through resource_id, which the span table already indexes` | 2 |
+| 37 | `PULSUS_TRACEQL_INDEXED_ATTRIBUTES: <item>: the scope must be span. or event.` | 2 |
+| 38 | `PULSUS_TRACEQL_INDEXED_ATTRIBUTES: <item>: the key must be dot-separated segments of letters, digits, '_' and '-'` | 2 |
+| 39 | `PULSUS_TRACEQL_INDEXED_ATTRIBUTES: <item>: the key is longer than 128 bytes` | 2 |
+| 40 | `PULSUS_TRACEQL_INDEXED_ATTRIBUTES: <item> is listed twice` | 2 |
+| 41 | `PULSUS_TRACEQL_INDEXED_ATTRIBUTES: names more than 16 attributes` | 2 |
+| 42 | `the lines above carry a token this script does not render` | 2 |
+| 43 | `the server refused a request; it said:` | curl |
+| 44 | `the server refused this statement:` | 1 |
+| 45 | `the server said:` | 1 |
+| 46 | `clickhouse at <server>:<port> did not answer within <wait_seconds>s` | 1 |
+| 47 | `could not read a version from '<version>'` | 1 |
+| 48 | `clickhouse <version> is below the minimum supported version 26.8` | 1 |
+| 49 | `cluster '<cluster>' is not defined on <server>:<port>` | 1 |
+| 50 | `only <live> of <want_hosts> hosts in cluster '<cluster>' answered within <wait_seconds>s; ON CLUSTER DDL would fail on the rest` | 1 |
+| 51 | `<policy_what> is defined on <policy_have> of <policy_want> hosts; every server's configuration must carry it (docs/configuration.md §3)` | 1 |
+| 52 | `the file ends in an unterminated statement` | 1 |
+
+### Grammar boundaries
+
+The values at each edge of the two grammars. The dedup-window grammar applies to the three `PULSUS_*_DEDUP_WINDOW` environment variables, as the binary and `schema/schema.sh` read them; a YAML `*_dedup_window` is an integer, held only to `1..=1000000`, and the chart's values schema does not expose these keys. The log-rollup-resolution grammar applies to `PULSUS_LOG_ROLLUP_RESOLUTION` and the YAML `log_rollup_resolution` as the binary reads them, to the variable as `schema/schema.sh` reads it, and to the chart's `log_rollup_resolution`. The tests read this table.
+
+| Result | Grammar | Value |
+|---|---|---|
+| accepted | dedup window | `1`, `1000000` |
+| refused | dedup window | `0`, `01`, `+5`, ` 5`, `1000001`, `10000000`, `1.0` |
+| accepted | log rollup resolution | `1ms`, `5s`, `1h`, `2d`, `1w`, `999999999999ms`, `999999999s`, `99999999m`, `999999h`, `99999d`, `9999w` |
+| refused | log rollup resolution | `1000000000000ms`, `1000000000s`, `100000000m`, `1000000h`, `100000d`, `10000w`, `0s`, `05s`, ` 5s`, `5s `, `5ns`, `1.5s`, `5` |
 
 ## 8. Ruler (M7)
 
@@ -412,7 +461,7 @@ ruler:
   max_result_bytes: 10MiB
 ```
 
-Durations accept `ms|s|m|h|d|w`; byte sizes accept binary units (`KiB/MiB/GiB/TiB`), decimal units (`KB/MB/GB/TB`), or a bare integer of bytes.
+Durations accept `ms|s|m|h|d|w` (`log_rollup_resolution` without spaces or a leading zero and with a digit cap per unit, §3); byte sizes accept binary units (`KiB/MiB/GiB/TiB`), decimal units (`KB/MB/GB/TB`), or a bare integer of bytes.
 
 ## 10. Quickstart (podman compose / docker compose)
 

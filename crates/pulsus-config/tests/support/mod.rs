@@ -148,3 +148,72 @@ pub fn assert_names_every_model_key(what: &str, doc: &serde_norway::Value) {
         extra.len()
     );
 }
+
+/// The rows of `docs/configuration.md`'s "Grammar boundaries" table (issue
+/// #746 part A): (accepted, grammar, values), each value one code span taken
+/// exactly, surrounding spaces included.
+pub fn grammar_boundaries() -> Vec<(bool, String, Vec<String>)> {
+    let text = repo_file("docs/configuration.md");
+    let start = text
+        .find("### Grammar boundaries")
+        .unwrap_or_else(|| panic!("no Grammar boundaries table"));
+    let section = &text[start + 1..];
+    let section = &section[..section.find("\n#").unwrap_or(section.len())];
+    let mut rows = Vec::new();
+    for line in section.lines() {
+        let Some((accepted, rest)) = line
+            .strip_prefix("| accepted | ")
+            .map(|r| (true, r))
+            .or_else(|| line.strip_prefix("| refused | ").map(|r| (false, r)))
+        else {
+            continue;
+        };
+        let (grammar, cell) = rest.split_once(" | ").expect("three cells");
+        let mut cell = cell.strip_suffix(" |").expect("the row's end");
+        let mut values = Vec::new();
+        loop {
+            let body = cell
+                .strip_prefix('`')
+                .unwrap_or_else(|| panic!("a code span: {line}"));
+            let end = body.find('`').expect("a closed code span");
+            values.push(body[..end].to_string());
+            cell = &body[end + 1..];
+            if cell.is_empty() {
+                break;
+            }
+            cell = cell
+                .strip_prefix(", ")
+                .unwrap_or_else(|| panic!("values are separated by ', ': {line}"));
+        }
+        rows.push((accepted, grammar.to_string(), values));
+    }
+    let kinds: Vec<(bool, &str)> = rows.iter().map(|(a, g, _)| (*a, g.as_str())).collect();
+    assert_eq!(
+        kinds,
+        [
+            (true, "dedup window"),
+            (false, "dedup window"),
+            (true, "log rollup resolution"),
+            (false, "log rollup resolution"),
+        ],
+        "the table's rows"
+    );
+    rows
+}
+
+/// A log rollup resolution from the table as a `Duration`, worked out here
+/// rather than by the parser under test.
+pub fn resolution_of(v: &str) -> std::time::Duration {
+    use std::time::Duration;
+    let digits: String = v.chars().take_while(char::is_ascii_digit).collect();
+    let n: u64 = digits.parse().expect("digits");
+    match &v[digits.len()..] {
+        "ms" => Duration::from_millis(n),
+        "s" => Duration::from_secs(n),
+        "m" => Duration::from_secs(n * 60),
+        "h" => Duration::from_secs(n * 3600),
+        "d" => Duration::from_secs(n * 86_400),
+        "w" => Duration::from_secs(n * 604_800),
+        unit => panic!("unit {unit}"),
+    }
+}

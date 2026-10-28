@@ -31,7 +31,9 @@ pub use model::{
 };
 pub use secret::Secret;
 pub use timezone::{TemplateTimezone, UnknownTimezone};
-pub use units::{ByteSize, HumanDuration, UnitError};
+pub use units::{
+    ByteSize, HumanDuration, UnitError, parse_dedup_window, parse_log_rollup_resolution,
+};
 pub use validate::{
     BATCH_BYTES_CEILING, BATCH_MS_CEILING, CACHE_MAX_SERIES_CEILING,
     INGEST_DEDUP_MAX_BYTES_CEILING, INGEST_DEDUP_MAX_BYTES_FLOOR, INGEST_DEDUP_WINDOW_CEILING_MS,

@@ -31,7 +31,8 @@ const COLD_TRACES: &str = "--@cold-traces";
 /// stripped, comments removed and every `{{token}}` resolved.
 ///
 /// `schema.sh` does exactly this with an `awk` step, three `sed`
-/// expressions and the same token list;
+/// expressions and the same token list, and the two outputs are the same
+/// bytes;
 /// `the_script_renders_exactly_what_this_crate_renders` holds the two
 /// together.
 pub fn rendered(ctx: &RenderCtx) -> String {
@@ -78,7 +79,14 @@ pub fn rendered(ctx: &RenderCtx) -> String {
         out.push_str(line);
         out.push('\n');
     }
-    render::substitute_tokens(&out, ctx)
+    // Exactly one trailing newline, as the script's `printf '%s\n'
+    // "$(render)"` leaves it: with no rollup levels the file's last level
+    // block expands to nothing and would leave a blank line (issue #746
+    // part A).
+    let mut text = render::substitute_tokens(&out, ctx);
+    text.truncate(text.trim_end_matches('\n').len());
+    text.push('\n');
+    text
 }
 
 /// `schema/schema.sql` with its level block expanded for `levels` (issue

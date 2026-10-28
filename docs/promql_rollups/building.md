@@ -12,13 +12,13 @@
 | `PULSUS_ROLLUP_RANGES` | `3600,86400,604800,7776000` | for each level after the first, the query range in seconds from which it is the resolution (`reading.md` §2); read only when there are levels |
 | `PULSUS_ROLLUP_COUNTER_BUCKETS` | `5` | the buckets of a level a `rate` or `increase` range covers at least |
 
-They are schema-build settings, documented beside the other schema settings (`PULSUS_ROLLUP_LEVELS`, `docs/configuration.md:178`; the two after it on the next rows). `schema/schema.sh` reads them with no colon in the default, so unset gives the default and set-but-empty gives none (`rollup_levels`, `rollup_ranges`, `counter_buckets`, `schema/schema.sh:60-62`); `RenderCtx::for_tests` takes `DEFAULT_ROLLUP_LEVELS`, `DEFAULT_ROLLUP_RANGES` and `DEFAULT_ROLLUP_COUNTER_BUCKETS` (`crates/pulsus-schema/src/render.rs:123`). The binary has no rollup setting: it learns the levels, their switch points and the counter bucket count from the tables' comments (`reading.md` §2).
+They are schema-build settings, documented beside the other schema settings (`PULSUS_ROLLUP_LEVELS`, `docs/configuration.md:178`; the two after it on the next rows). `schema/schema.sh` reads them with no colon in the default, so unset gives the default and set-but-empty gives none (`rollup_levels`, `rollup_ranges`, `counter_buckets`, `schema/schema.sh:60-62`); `RenderCtx::for_tests` is `ctx_from_vars` of the database and the retention alone, so it takes `DEFAULT_ROLLUP_LEVELS`, `DEFAULT_ROLLUP_RANGES` and `DEFAULT_ROLLUP_COUNTER_BUCKETS` (`crates/pulsus-schema/src/vars.rs:291-293`). The binary has no rollup setting: it learns the levels, their switch points and the counter bucket count from the tables' comments (`reading.md` §2).
 
 Changing the set is a rebuild: drop the database and run `schema/schema.sh` again. A new set builds from what landing still holds.
 
 ### 1.2 Validation
 
-`schema/schema.sh` exits `2` before contacting the server (`bad_levels`, `schema/schema.sh:134-137`), and `pulsus_schema::parse_rollup_levels` returns an error (`parse_rollup_levels`, `crates/pulsus-schema/src/render.rs:329`), at the first rule that fails, in this order and with the same messages:
+`schema/schema.sh` exits `2` before contacting the server (`bad_levels`, `schema/schema.sh:148-151`), and `pulsus_schema::parse_rollup_levels` returns an error (`parse_rollup_levels`, `crates/pulsus-schema/src/render.rs:313`), at the first rule that fails, in this order and with the same messages:
 
 | rule | why |
 |---|---|
@@ -31,7 +31,7 @@ Changing the set is a rebuild: drop the database and run `schema/schema.sh` agai
 | at most 8 levels | each level is three objects and a timer; eight cover 5 s to 1 day with room |
 | `2 × max(R_1, 60) + 870 ≤ H × 3600`, with `R_1` the first level and `H` = `PULSUS_METRICS_LANDING_RETENTION_HOURS` (default 6, `metrics_landing_hours`, `schema/schema.sh:54`) | a normal first-level run reads back to `now − (2p + 150 s + 120 s)`, and 600 s more is kept spare. `14400` with `H = 6` is refused: `2 × 14,400 + 870 = 29,670 > 21,600` |
 
-`PULSUS_ROLLUP_RANGES` is checked after the levels, and only when there are levels (`bad_ranges`, `schema/schema.sh:193`; `parse_rollup_ranges`, `crates/pulsus-schema/src/render.rs:381`), the first failing rule the message, `PULSUS_ROLLUP_RANGES: ` before it in the script:
+`PULSUS_ROLLUP_RANGES` is checked after the levels, and only when there are levels (`bad_ranges`, `schema/schema.sh:207`; `parse_rollup_ranges`, `crates/pulsus-schema/src/render.rs:365`), the first failing rule the message, `PULSUS_ROLLUP_RANGES: ` before it in the script:
 
 | rule | message |
 |---|---|
@@ -41,9 +41,9 @@ Changing the set is a rebuild: drop the database and run `schema/schema.sh` agai
 | each greater than the one before | `<a> then <b>: the ranges must increase` |
 | each at least its level | `<range> is shorter than its level <w>` |
 
-`PULSUS_ROLLUP_COUNTER_BUCKETS` is a whole number from 2 to 1000 with no leading zero, else `<v> is not a whole number from 2 to 1000` (`parse_rollup_counter_buckets`, `crates/pulsus-schema/src/render.rs:429`). One bucket would give a `rate` window one point at the levels under 720 s.
+`PULSUS_ROLLUP_COUNTER_BUCKETS` is a whole number from 2 to 1000 with no leading zero, else `<v> is not a whole number from 2 to 1000` (`parse_rollup_counter_buckets`, `crates/pulsus-schema/src/render.rs:413`). One bucket would give a `rate` window one point at the levels under 720 s.
 
-`the_script_renders_exactly_what_this_crate_renders` (`crates/pulsus-schema/tests/schema_file.rs:460`) holds the script's render and the crate's equal, and `the_script_and_the_crate_refuse_the_same_level_lists` (`crates/pulsus-schema/tests/schema_file.rs:2761`) and `the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets` (`crates/pulsus-schema/tests/schema_file.rs:2949`) hold their refusals equal.
+`the_script_renders_exactly_what_this_crate_renders` (`crates/pulsus-schema/tests/schema_file.rs:462`) holds the script's render and the crate's equal, and `the_script_and_the_crate_refuse_the_same_level_lists` (`crates/pulsus-schema/tests/schema_file.rs:2763`) and `the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets` (`crates/pulsus-schema/tests/schema_file.rs:2951`) hold their refusals equal.
 
 ### 1.3 The default, and what each set costs
 
@@ -68,7 +68,7 @@ Only sets drawn from 5, 60, 720, 7200 and 86400 s were measured; the `flags` col
 
 ### 2.1 One template, rendered once per level
 
-`schema/schema.sql` holds one level template, one contiguous block at the end of the file (`schema/schema.sql:989-1120`). Its lines carry a prefix that `expand_levels` (`crates/pulsus-schema/src/render.rs:679`) and the script's `awk` resolve before the `--@single`/`--@cluster` pass; the marker and exactly one space after it are removed, so a line may then carry a mode marker:
+`schema/schema.sql` holds one level template, one contiguous block at the end of the file (`schema/schema.sql:989-1120`). Its lines carry a prefix that `expand_levels` (`crates/pulsus-schema/src/render.rs:663`) and the script's `awk` resolve before the `--@single`/`--@cluster` pass; the marker and exactly one space after it are removed, so a line may then carry a mode marker:
 
 | prefix | rendered for |
 |---|---|
@@ -286,7 +286,7 @@ Measured effect of dropping repeats: one day, 4,000 series at 15 s, 80 series wi
 
 ### 3.3 Timers, derived from the sizes
 
-Let `p = max(R_1, 60 s)` be the first level's period, and `d_i` the delay after a bucket's end by which level `i` has built it (`timer_unit`, `crates/pulsus-schema/src/render.rs:649`).
+Let `p = max(R_1, 60 s)` be the first level's period, and `d_i` the delay after a bucket's end by which level `i` has built it (`timer_unit`, `crates/pulsus-schema/src/render.rs:633`).
 
 | level | `{{timer}}` | builds up to | `d_i` |
 |---|---|---|---|
@@ -334,7 +334,7 @@ The server accepted `EVERY 12 MINUTE OFFSET 240 SECOND`, `EVERY 2 HOUR OFFSET 30
 
 Without the block condition the engine did not use the projection's expression key: the same statements read 23,039,986 rows. So every build statement names the block. These were measured before the first level's predecessor join (§3.1), which doubles its rows read.
 
-**The day level carries no projection below it.** A day bucket is the 7200 s table's whole day partition, so the plain table reads the same marks: measured with the projection, one 86400 s run read 6,628 rows with `projections = []` (parts of 4,001 and 801 rows: 4,802 rows of data, 1,825 of the run-row scan, the one-row run-row branch). Output not kept. `--@level-feeds` lines are kept only for a level whose next level is shorter than a day (`Feeds`, `crates/pulsus-schema/src/render.rs:628`).
+**The day level carries no projection below it.** A day bucket is the 7200 s table's whole day partition, so the plain table reads the same marks: measured with the projection, one 86400 s run read 6,628 rows with `projections = []` (parts of 4,001 and 801 rows: 4,802 rows of data, 1,825 of the run-row scan, the one-row run-row branch). Output not kept. `--@level-feeds` lines are kept only for a level whose next level is shorter than a day (`Feeds`, `crates/pulsus-schema/src/render.rs:612`).
 
 **The recorded run** (`measure/projection-run/`). One node; 4,000 series at 15 s over three hours, landed through a `metric_landing` with §2.4's key; the 60 s and 720 s tables as they then stood, without `flags`; three one-hour first-level runs, then the 720 s run for one bucket, three times on an emptied table.
 

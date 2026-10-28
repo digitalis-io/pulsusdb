@@ -170,31 +170,15 @@ impl RenderCtx {
     /// because every new field otherwise edits one literal per test file —
     /// thirty-odd of them for the two fields above.
     pub fn for_tests(db: &str, retention_days: u32) -> Self {
-        RenderCtx {
-            db: db.to_string(),
-            cluster: None,
-            dist_suffix: "_dist".to_string(),
-            storage_policy: None,
-            retention_days,
-            log_rollup: Duration::from_secs(5),
-            metrics_landing_retention_hours: 6,
-            metrics_dedup_window: 10_000,
-            log_landing_retention_hours: 6,
-            log_dedup_window: 10_000,
-            trace_landing_retention_hours: 6,
-            trace_dedup_window: 10_000,
-            trace_indexed_attributes: Vec::new(),
-            graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
-            rollup_levels: DEFAULT_ROLLUP_LEVELS.to_vec(),
-            rollup_ranges: DEFAULT_ROLLUP_RANGES.to_vec(),
-            rollup_counter_buckets: DEFAULT_ROLLUP_COUNTER_BUCKETS,
-            cold_volume: None,
-            metrics_hot_days: None,
-            logs_hot_days: None,
-            traces_hot_days: None,
-            rollup_retention_days: Vec::new(),
-            rollup_hot_days: Vec::new(),
-        }
+        let days = retention_days.to_string();
+        crate::ctx_from_vars(
+            &std::collections::BTreeMap::from([
+                ("CLICKHOUSE_DB", db),
+                ("PULSUS_RETENTION_DAYS", days.as_str()),
+            ]),
+            Some(crate::SchemaMode::Single),
+        )
+        .expect("a valid test context")
     }
 }
 
@@ -359,8 +343,8 @@ pub fn parse_rollup_levels(text: &str, landing_hours: u32) -> Result<Vec<u32>, S
     if let Some(w) = levels.windows(2).find(|w| w[1] % w[0] != 0) {
         return Err(format!("{} is not a multiple of {}", w[1], w[0]));
     }
-    if levels.len() > 8 {
-        return Err("more than 8 levels".to_string());
+    if levels.len() > crate::MAX_LEVELS {
+        return Err(format!("more than {} levels", crate::MAX_LEVELS));
     }
     let p = levels[0].max(60);
     if 2 * u64::from(p) + 870 > u64::from(landing_hours) * 3600 {

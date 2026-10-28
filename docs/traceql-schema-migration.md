@@ -448,7 +448,7 @@ that costs 75% of the storage.**
 
 And the request that reads it already computes a window and throws it away. The
 values route parses `start`/`end`, defaulting to `traceql_tag_lookback` = 24 h
-(`crates/pulsus-config/src/model.rs:553`, `crates/pulsus-server/src/traces_api/tags.rs:176-179`), then calls
+(`crates/pulsus-config/src/model.rs:696` @ 1cdb3e5e, `crates/pulsus-server/src/traces_api/tags.rs:176-179`), then calls
 `tag_values_sql` (`crates/pulsus-read/src/traces/spans/tags.rs:94-104` @ 9b286980), which emitted no time predicate there at all —
 because the table it reads has no time column.
 
@@ -2289,7 +2289,7 @@ first-written shape had 1,543 extra.
 
 **Two places where "more candidates" is not free.** Both need a test.
 
-1. `traceql_max_candidates = 100_000` (`crates/pulsus-config/src/model.rs:551`). A query sitting
+1. `traceql_max_candidates = 100_000` (`crates/pulsus-config/src/model.rs:692` @ 1cdb3e5e). A query sitting
    just under the ceiling today can now hit it, and hitting it is reported as a
    partial result. The test uses a corpus of exactly 100,000 candidate traces for
    one value, one query at `W = B` and one at `W = B/2`, and asserts the returned
@@ -2989,7 +2989,7 @@ materialized view in §1 (`crates/pulsus-schema/src/catalog.rs:227-234, 244-256,
 648-936, 934-1000`); every statement and its `SELECT` list (`crates/pulsus-read/src/traces/search_sql.rs:231,
 230, 286, 325, 397, 428, 468, 492`; `crates/pulsus-read/src/traces/tags_sql.rs:90, 118, 253, 282` @ bf2c95bd;
 `crates/pulsus-read/src/traces/sql.rs:16-26`; and the committed goldens); the batch arithmetic (`crates/pulsus-read/src/traces/exec.rs:126` @ 1cdb3e5e,
-`crates/pulsus-config/src/model.rs:551-553`); which aggregates push down and what they read
+`crates/pulsus-config/src/model.rs:692-693` @ 1cdb3e5e); which aggregates push down and what they read
 (`crates/pulsus-read/src/traces/compile.rs:439-489, 560-562`); the write path's failure modes
 (`crates/pulsus-write/src/writer/trace.rs:9-19 @ d60a960d, 137-185, 172`; `crates/pulsus-write/src/writer/table.rs:375-442` @ d60a960d;
 `crates/pulsus-write/src/writer/backfill.rs:23-28, 189-201, 214-220`); the wire framing
@@ -3161,13 +3161,13 @@ from its source; the pointer is not reproduced here.
 | what | value | where |
 |---|---|---|
 | phase-2 batch | 32 candidate traces | `crates/pulsus-read/src/traces/exec.rs:126` @ 1cdb3e5e |
-| candidate ceiling | 100,000 | `crates/pulsus-config/src/model.rs:551` |
-| scan budget | 50,000,000 rows | `crates/pulsus-config/src/model.rs:552` |
-| tag lookback default | 24 hours | `crates/pulsus-config/src/model.rs:553` |
+| candidate ceiling | 100,000 | `crates/pulsus-config/src/model.rs:692` @ 1cdb3e5e |
+| scan budget | 50,000,000 rows | `crates/pulsus-config/src/model.rs:642` |
+| tag lookback default | 24 hours | `crates/pulsus-config/src/model.rs:696` @ 1cdb3e5e |
 | spans per trace cap | `LIMIT 10001 BY trace_id` | `crates/pulsus-read/src/traces/exec.rs:131` @ 1cdb3e5e |
 | tag name / value caps | 10,000 / 1,000 | `crates/pulsus-read/src/traces/exec.rs:131 @ 1cdb3e5e, 135` |
 | storage → reader wire format | RowBinary, LZ4-framed | `crates/pulsus-clickhouse/src/pool.rs:694` → `vendor/clickhouse/Cargo.toml:49` → `vendor/clickhouse/src/query.rs:221-231` |
-| shard key | `cityHash64(trace_id)` | `crates/pulsus-schema/src/render.rs:56-58` |
+| shard key | `cityHash64(trace_id)` | `schema/schema.sql:566` |
 | pushed aggregates | `uniqExact(span_id)`, `max(duration_ns)`, `min(duration_ns)` | `crates/pulsus-read/src/traces/compile.rs:478-489` |
 
 ### Assumed compression ratios

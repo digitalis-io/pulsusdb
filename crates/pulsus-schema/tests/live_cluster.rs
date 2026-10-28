@@ -2422,3 +2422,84 @@ async fn each_replica_moves_its_own_copy() {
 
     drop_cluster_db(shard1, db).await;
 }
+
+// Issue #746 part A: one level and eight, built from the variables the
+// script reads, are discovered on the cluster.
+static TEST_DB_LEVELS_ONE: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_levels_one");
+static TEST_DB_LEVELS_EIGHT: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_levels_eight");
+
+/// One A5 case: its database, the levels, the switch points, and each
+/// level's width and switch point in milliseconds.
+type LevelCase = (
+    &'static pulsus_testkit::TestDb,
+    &'static str,
+    &'static str,
+    Vec<(i64, u64)>,
+);
+
+/// **A5 (issue #746 part A): a clustered schema of one level and of eight
+/// levels, its context from `ctx_from_vars`, is discovered whole.** The
+/// level discovery reads two shards, each level's routing table and its
+/// switch point.
+#[tokio::test]
+async fn one_and_eight_levels_are_discovered_on_the_cluster() {
+    use pulsus_read::metrics::rollup::{LevelSlot, refresh_levels};
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let cases: [LevelCase; 2] = [
+        (&TEST_DB_LEVELS_ONE, "60", "", vec![(60_000, 0)]),
+        (
+            &TEST_DB_LEVELS_EIGHT,
+            "5,10,20,60,120,240,720,86400",
+            "3600,7200,14400,28800,86400,604800,7776000",
+            vec![
+                (5_000, 0),
+                (10_000, 3_600_000),
+                (20_000, 7_200_000),
+                (60_000, 14_400_000),
+                (120_000, 28_800_000),
+                (240_000, 86_400_000),
+                (720_000, 604_800_000),
+                (86_400_000, 7_776_000_000),
+            ],
+        ),
+    ];
+    for (test_db, levels, ranges, want) in cases {
+        let db: &str = test_db;
+        let vars = std::collections::BTreeMap::from([
+            ("CLICKHOUSE_DB", db),
+            ("PULSUS_RETENTION_DAYS", "7"),
+            ("PULSUS_CLUSTER", CLUSTER_NAME),
+            ("PULSUS_ROLLUP_LEVELS", levels),
+            ("PULSUS_ROLLUP_RANGES", ranges),
+        ]);
+        let ctx = pulsus_schema::ctx_from_vars(&vars, Some(pulsus_schema::SchemaMode::Cluster))
+            .expect("the levels are valid");
+        drop_cluster_db(&shard1, db).await;
+        run_init(&shard1, &ctx).await.expect("run_init (clustered)");
+        let slot = LevelSlot::new();
+        refresh_levels(&slot, &shard1, db, "_dist", Some(CLUSTER_NAME))
+            .await
+            .expect("the level discovery");
+        let found = slot.get().expect("the levels");
+        assert_eq!(found.shards, 2, "{levels}: the shards");
+        let got: Vec<(i64, String, u64)> = found
+            .levels
+            .iter()
+            .map(|l| (l.res_ms, l.table.clone(), l.from_ms))
+            .collect();
+        let want: Vec<(i64, String, u64)> = want
+            .into_iter()
+            .map(|(ms, from)| (ms, format!("metric_samples_{}s_dist", ms / 1000), from))
+            .collect();
+        assert_eq!(
+            got, want,
+            "{levels}: the levels, their tables and switch points"
+        );
+        drop_cluster_db(&shard1, db).await;
+    }
+}
