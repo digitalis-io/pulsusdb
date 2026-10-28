@@ -869,3 +869,41 @@ fn the_admin_pair_defaults_to_admin_and_either_variable_loads_alone() {
     }
     support::clear_all();
 }
+
+/// Issue #746: a configuration file that sets either admin field to null or
+/// empty keeps that half's default, so the admin UI stays mounted.
+#[test]
+fn a_null_or_empty_admin_field_in_yaml_keeps_its_default() {
+    let _guard = support::lock_env();
+    support::clear_all();
+    for (name, yaml, want) in [
+        (
+            "admin-null",
+            "admin_user: null\nadmin_password: null\n",
+            ("admin", "admin"),
+        ),
+        (
+            "admin-empty",
+            "admin_user: \"\"\nadmin_password: \"\"\n",
+            ("admin", "admin"),
+        ),
+        (
+            "admin-user-null",
+            "admin_user: null\nadmin_password: toor\n",
+            ("admin", "toor"),
+        ),
+    ] {
+        let path = support::write_temp_yaml(name, yaml);
+        let cfg = pulsus_config::load(Some(&path), None)
+            .unwrap_or_else(|e| panic!("{name}: load() failed: {e}"));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            (
+                cfg.admin_user.as_deref(),
+                cfg.admin_password.as_ref().map(|s| s.expose())
+            ),
+            (Some(want.0), Some(want.1)),
+            "{name}"
+        );
+    }
+}

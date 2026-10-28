@@ -795,6 +795,23 @@ mod tests {
             StatusCode::OK
         );
 
+        // A configuration built with either admin field absent or empty
+        // still mounts the admin routes behind that half's default.
+        for (user, password) in [(None, None), (Some(""), Some("")), (None, Some("b"))] {
+            let mut cfg = pairs(false, false);
+            cfg.admin_user = user.map(str::to_string);
+            cfg.admin_password = password.map(pulsus_config::Secret::new);
+            let pair = format!(
+                "admin:{}",
+                password.filter(|p| !p.is_empty()).unwrap_or("admin")
+            );
+            assert_eq!(
+                status_of(&admin_router(&cfg), "/admin/", Some(&basic(&pair))).await,
+                StatusCode::OK,
+                "{user:?} {password:?}"
+            );
+        }
+
         let admin_only = admin_router(&pairs(false, true));
         assert_eq!(
             status_of(&admin_only, "/admin/", Some(&basic("a:b"))).await,
