@@ -1,12 +1,11 @@
 //! Issue #18 part A: the rollup levels, built by their timed views, on one
 //! node. Each case builds its own database, then drives the views itself:
 //! after the build every level view's creation run is waited for, the view
-//! stopped and its table emptied, and a run is `SYSTEM START VIEW`,
-//! `SYSTEM REFRESH VIEW`, `SYSTEM WAIT VIEW`, `SYSTEM STOP VIEW` (a stopped
-//! view ignores a manual refresh). Starting a view whose scheduled time has
-//! passed also runs it, so one such run may be two; every assertion below
-//! holds either way, because a second run starts from the first one's
-//! watermark.
+//! stopped and its table emptied, and a run is `SYSTEM REFRESH VIEW`,
+//! `SYSTEM START VIEW`, `SYSTEM WAIT VIEW`, `SYSTEM STOP VIEW`: a refresh
+//! asked for while the view is stopped runs once when it starts, whether or
+//! not its scheduled minute passed meanwhile. Started first, a view whose
+//! minute passed runs at once for it, and the refresh adds a second run.
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`, like `live_schema.rs`:
 //!
@@ -196,8 +195,8 @@ async fn fresh(client: &ChClient, ctx: &RenderCtx) {
 /// One run of level `r`'s view.
 async fn run(client: &ChClient, db: &str, r: u32) {
     let view = format!("{db}.metric_samples_{r}s_mv");
-    exec(client, &format!("SYSTEM START VIEW {view}")).await;
     exec(client, &format!("SYSTEM REFRESH VIEW {view}")).await;
+    exec(client, &format!("SYSTEM START VIEW {view}")).await;
     exec(client, &format!("SYSTEM WAIT VIEW {view}")).await;
     exec(client, &format!("SYSTEM STOP VIEW {view}")).await;
 }
