@@ -284,6 +284,9 @@ pub enum Surface {
     /// axum's `&'static str` response), no I/O, no pool. The body text
     /// is the mounting oracle; the route has no error cases.
     Echo,
+    /// `/admin/…` (issue #746) — mounted only with the admin pair, HTML
+    /// or JSON.
+    Admin,
 }
 
 /// Mode/flag gating (issue #36 plan v2 finding 3): mirrors
@@ -307,6 +310,9 @@ pub enum Gate {
     /// [`Gate::CompatAndReader`]: the flag alone never mounts a
     /// `CompatAndWriter` route without the Writer role.
     CompatAndWriter,
+    /// Mounted only when `PULSUS_ADMIN_USER` and `PULSUS_ADMIN_PASSWORD`
+    /// are set (issue #746).
+    AdminPair,
 }
 
 /// Whether a manifest entry is actually mounted today (drift-guarded,
@@ -1781,6 +1787,84 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: "",
         cases: &[],
     },
+    // -- Admin (issue #746: mounted only with the admin pair) ----------
+    RouteSpec {
+        path: "/admin/",
+        methods: &[Method::Get],
+        surface: Surface::Admin,
+        gate: Gate::AdminPair,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/admin/database",
+        methods: &[Method::Get],
+        surface: Surface::Admin,
+        gate: Gate::AdminPair,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/admin/config",
+        methods: &[Method::Get],
+        surface: Surface::Admin,
+        gate: Gate::AdminPair,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/admin/admin.css",
+        methods: &[Method::Get],
+        surface: Surface::Admin,
+        gate: Gate::AdminPair,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/admin/api/v1/status",
+        methods: &[Method::Get],
+        surface: Surface::Admin,
+        gate: Gate::AdminPair,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/admin/api/v1/database",
+        methods: &[Method::Get],
+        surface: Surface::Admin,
+        gate: Gate::AdminPair,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/admin/api/v1/config",
+        methods: &[Method::Get],
+        surface: Surface::Admin,
+        gate: Gate::AdminPair,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
     // -- Ingest (WriterMode) ---------------------------------------------
     RouteSpec {
         path: "/v1/logs",
@@ -2831,7 +2915,14 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/app.rs",
         function: "build_router",
-        body: "let mut authed = ops::ops_authed_router().merge(modes::mount_subsystems(Router::new(), config)); authed = compat::apply_aliases(authed, config); authed = authed.layer(middleware::timeout_layer(config)); if let Some(auth) = middleware::auth_layer(config) {authed = authed.layer(auth);} authed = authed.layer(axum::middleware::from_fn(crate::request_id::stamp)); let router = ops::ops_public_router().merge(authed); let router = router.layer(middleware::trace_layer()).layer(middleware::compression_layer()).layer(middleware::cors_layer(config)?); Ok(router.with_state(state))",
+        body: "let mut authed = ops::ops_authed_router().merge(modes::mount_subsystems(Router::new(), config)); authed = compat::apply_aliases(authed, config); authed = authed.layer(middleware::timeout_layer(config)); if let Some(auth) = middleware::auth_layer(config) {authed = authed.layer(auth);} authed = authed.layer(axum::middleware::from_fn(crate::request_id::stamp)); let router = ops::ops_public_router().merge(authed); let router = router.layer(middleware::trace_layer()).layer(middleware::compression_layer()).layer(middleware::cors_layer(config)?); let router = match crate::admin::router(config) {Some(admin) => admin.merge(router), None => router,}; Ok(router.with_state(state))",
+    },
+    // Issue #746 part B: the admin UI's router, merged ahead of the
+    // data-plane router in `build_router`.
+    PinnedFunctionBody {
+        file: "crates/pulsus-server/src/admin/mod.rs",
+        function: "router",
+        body: "let page_auth = crate::middleware::admin_auth_layer(config, false)?; let api_auth = crate::middleware::admin_auth_layer(config, true)?; let pages = Router::new().route(\"/admin/\", get(pages::status)).route(\"/admin/database\", get(pages::database)).route(\"/admin/config\", get(pages::config)).route(\"/admin/admin.css\", get(pages::css)).layer(page_auth); let api = Router::new().route(\"/admin/api/v1/status\", get(api::status)).route(\"/admin/api/v1/database\", get(api::database)).route(\"/admin/api/v1/config\", get(api::config)).layer(api_auth); Some(pages.merge(api).layer(axum::middleware::from_fn(headers)).layer(axum::middleware::from_fn(crate::request_id::stamp)).layer(crate::middleware::trace_layer()))",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/modes.rs",

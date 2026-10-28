@@ -662,7 +662,7 @@ fn tls_paths(cfg: &Config) -> Option<(&str, &str)> {
 /// the reconnect loop's gate on constructing a [`LabelCache`] at all (issue
 /// #30 architect plan). Pure so the gate is unit-tested without touching
 /// the network, mirroring [`writer_enabled`]'s idiom.
-fn reader_enabled(cfg: &Config) -> bool {
+pub(crate) fn reader_enabled(cfg: &Config) -> bool {
     matches!(cfg.mode, Mode::All | Mode::Reader)
 }
 

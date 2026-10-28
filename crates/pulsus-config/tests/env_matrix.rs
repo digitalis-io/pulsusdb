@@ -59,6 +59,16 @@ const ROWS: &[Row] = &[
         check: |c| c.auth_password.as_ref().map(|s| s.expose()) == Some("row-pass"),
     },
     Row {
+        var: "PULSUS_ADMIN_USER",
+        value: "row-admin",
+        check: |c| c.admin_user.as_deref() == Some("row-admin"),
+    },
+    Row {
+        var: "PULSUS_ADMIN_PASSWORD",
+        value: "row-admin-pass",
+        check: |c| c.admin_password.as_ref().map(|s| s.expose()) == Some("row-admin-pass"),
+    },
+    Row {
         var: "PULSUS_COMPAT_ENDPOINTS",
         value: "true",
         check: |c| c.compat_endpoints,
@@ -643,6 +653,8 @@ fn each_variable_sets_exactly_one_yaml_key() {
 /// this list changing.
 const NO_LITERAL_DEFAULT: &[(&str, &str)] = &[
     ("CLICKHOUSE_SERVERS", "unset"),
+    ("PULSUS_ADMIN_PASSWORD", "unset"),
+    ("PULSUS_ADMIN_USER", "unset"),
     ("PULSUS_AUTH_PASSWORD", "unset"),
     ("PULSUS_AUTH_USER", "unset"),
     ("PULSUS_AVAILABILITY_ZONE", "unset"),

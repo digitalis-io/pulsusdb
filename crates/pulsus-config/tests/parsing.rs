@@ -16,6 +16,8 @@ port: 4100
 log_level: warn
 auth_user: alice
 auth_password: s3cret
+admin_user: root
+admin_password: t00r
 compat_endpoints: true
 cors_origin: https://example.com
 query_timeout: 30s
@@ -74,6 +76,11 @@ fn full_fixture_round_trips_into_typed_values() {
     assert_eq!(
         cfg.auth_password.as_ref().map(|s| s.expose()),
         Some("s3cret")
+    );
+    assert_eq!(cfg.admin_user.as_deref(), Some("root"));
+    assert_eq!(
+        cfg.admin_password.as_ref().map(|s| s.expose()),
+        Some("t00r")
     );
     assert!(cfg.compat_endpoints);
     assert_eq!(cfg.cors_origin, "https://example.com");

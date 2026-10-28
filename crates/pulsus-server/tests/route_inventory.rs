@@ -1101,6 +1101,7 @@ fn every_mounted_route_spec_has_a_surface_consistent_gate() {
             Surface::TracesTagsV1 | Surface::TracesTagsV2 | Surface::Echo => {
                 spec.gate == Gate::CompatAndReader
             }
+            Surface::Admin => spec.gate == Gate::AdminPair,
         };
         assert!(
             ok,

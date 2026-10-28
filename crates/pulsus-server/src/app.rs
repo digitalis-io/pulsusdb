@@ -168,6 +168,8 @@ impl BuildInfo {
 ///    outside both auth and the generic timeout entirely.
 /// 4. Global layers on the merged whole, CORS outermost: trace →
 ///    compression → CORS (auth/timeout are never global).
+/// 5. With the admin pair set, `admin::router` merged outside all of
+///    that (issue #746): its own authentication, no CORS layer.
 pub(crate) fn build_router(state: AppState, config: &Config) -> Result<Router, ServeError> {
     let mut authed = ops::ops_authed_router().merge(modes::mount_subsystems(Router::new(), config));
     authed = compat::apply_aliases(authed, config);
@@ -194,6 +196,14 @@ pub(crate) fn build_router(state: AppState, config: &Config) -> Result<Router, S
         .layer(middleware::trace_layer())
         .layer(middleware::compression_layer())
         .layer(middleware::cors_layer(config)?);
+
+    // Issue #746: the admin router, outside the CORS layer. `admin` comes
+    // first so the merge keeps the data-plane router's fallback, behind its
+    // authentication and CORS layers, for every unmatched path.
+    let router = match crate::admin::router(config) {
+        Some(admin) => admin.merge(router),
+        None => router,
+    };
 
     Ok(router.with_state(state))
 }
@@ -670,5 +680,228 @@ mod tests {
             echo(&authed, Some(&valid)).await,
             (StatusCode::OK, b"echo".to_vec())
         );
+    }
+
+    // ---- issue #746 part B: the admin pair ----
+
+    /// `Basic <base64(user:password)>`.
+    fn basic(pair: &str) -> String {
+        format!("Basic {}", middleware::base64_encode(pair.as_bytes()))
+    }
+
+    /// The configuration carrying the admin pair `a`/`b` and/or the
+    /// data-plane pair `q`/`r`.
+    fn pairs(data_plane: bool, admin: bool) -> Config {
+        use pulsus_config::Secret;
+        let mut cfg = Config::default();
+        if data_plane {
+            cfg.auth_user = Some("q".to_string());
+            cfg.auth_password = Some(Secret::new("r"));
+        }
+        if admin {
+            cfg.admin_user = Some("a".to_string());
+            cfg.admin_password = Some(Secret::new("b"));
+        }
+        cfg
+    }
+
+    fn admin_router(cfg: &Config) -> Router {
+        let mut state = test_state();
+        state.config = Arc::new(cfg.clone());
+        build_router(state, cfg).expect("router builds")
+    }
+
+    async fn send(
+        router: &Router,
+        method: &str,
+        path: &str,
+        auth: Option<&str>,
+        origin: bool,
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let mut builder = Request::builder().uri(path).method(method);
+        if let Some(value) = auth {
+            builder = builder.header(axum::http::header::AUTHORIZATION, value);
+        }
+        if origin {
+            builder = builder.header(axum::http::header::ORIGIN, "https://x.example");
+        }
+        let request = builder.body(Body::empty()).unwrap();
+        router.clone().oneshot(request).await.unwrap()
+    }
+
+    async fn status_of(router: &Router, path: &str, auth: Option<&str>) -> StatusCode {
+        send(router, "GET", path, auth, false).await.status()
+    }
+
+    /// B3: each pair opens its own routes and nothing else.
+    #[tokio::test]
+    async fn admin_pair_and_data_plane_pair_each_open_only_their_own_routes() {
+        let router = admin_router(&pairs(true, true));
+        let admin = basic("a:b");
+        let data = basic("q:r");
+        let cells = [
+            ("/admin/", None, StatusCode::UNAUTHORIZED),
+            ("/admin/", Some(&admin), StatusCode::OK),
+            ("/admin/", Some(&data), StatusCode::UNAUTHORIZED),
+            ("/config", None, StatusCode::UNAUTHORIZED),
+            ("/config", Some(&admin), StatusCode::UNAUTHORIZED),
+            ("/config", Some(&data), StatusCode::OK),
+            ("/api/v1/labels", None, StatusCode::UNAUTHORIZED),
+            ("/api/v1/labels", Some(&admin), StatusCode::UNAUTHORIZED),
+        ];
+        for (path, auth, want) in cells {
+            assert_eq!(
+                status_of(&router, path, auth.map(String::as_str)).await,
+                want,
+                "{path} with {auth:?}"
+            );
+        }
+        assert_ne!(
+            status_of(&router, "/api/v1/labels", Some(&data)).await,
+            StatusCode::UNAUTHORIZED,
+            "/api/v1/labels with the data-plane pair"
+        );
+    }
+
+    /// B4: the admin routes exist only with the admin pair; the data-plane
+    /// pair answers its own 401 first, then 404.
+    #[tokio::test]
+    async fn admin_routes_are_mounted_only_with_the_admin_pair() {
+        let none = admin_router(&pairs(false, false));
+        assert_eq!(
+            status_of(&none, "/admin/", None).await,
+            StatusCode::NOT_FOUND
+        );
+
+        let data_only = admin_router(&pairs(true, false));
+        assert_eq!(
+            status_of(&data_only, "/admin/", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_of(&data_only, "/admin/", Some(&basic("q:wrong"))).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_of(&data_only, "/admin/", Some(&basic("q:r"))).await,
+            StatusCode::NOT_FOUND
+        );
+
+        let admin_only = admin_router(&pairs(false, true));
+        assert_eq!(
+            status_of(&admin_only, "/admin/", Some(&basic("a:b"))).await,
+            StatusCode::OK
+        );
+    }
+
+    /// B8: admin responses carry no CORS header and both admin headers, on
+    /// success and refusal alike; `/ready` keeps its CORS header. The
+    /// page `401` is the data-plane check's plain one, which sets no
+    /// content type.
+    #[tokio::test]
+    async fn admin_responses_carry_their_headers_and_no_cors_header() {
+        let router = admin_router(&pairs(false, true));
+        let admin = basic("a:b");
+        let cells: [(&str, Option<&str>, StatusCode, Option<&str>); 5] = [
+            (
+                "/admin/",
+                Some(&admin),
+                StatusCode::OK,
+                Some("text/html; charset=utf-8"),
+            ),
+            (
+                "/admin/admin.css",
+                Some(&admin),
+                StatusCode::OK,
+                Some("text/css"),
+            ),
+            ("/admin/", None, StatusCode::UNAUTHORIZED, None),
+            (
+                "/admin/api/v1/status",
+                Some(&admin),
+                StatusCode::OK,
+                Some("application/json"),
+            ),
+            (
+                "/admin/api/v1/status",
+                None,
+                StatusCode::UNAUTHORIZED,
+                Some("application/json"),
+            ),
+        ];
+        for (path, auth, status, content_type) in cells {
+            let res = send(&router, "GET", path, auth, true).await;
+            let headers = res.headers();
+            let ctx = format!("{path} with {auth:?}");
+            assert_eq!(res.status(), status, "{ctx}");
+            assert!(
+                headers.get("access-control-allow-origin").is_none(),
+                "{ctx}: no CORS header"
+            );
+            assert_eq!(
+                headers
+                    .get("content-security-policy")
+                    .and_then(|v| v.to_str().ok()),
+                Some("default-src 'self'"),
+                "{ctx}"
+            );
+            assert_eq!(
+                headers.get("cache-control").and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{ctx}"
+            );
+            assert_eq!(
+                headers.get("content-type").and_then(|v| v.to_str().ok()),
+                content_type,
+                "{ctx}"
+            );
+        }
+        let ready = send(&router, "GET", "/ready", None, true).await;
+        assert!(
+            ready.headers().get("access-control-allow-origin").is_some(),
+            "/ready keeps its CORS header"
+        );
+    }
+
+    /// B18: an unmatched path keeps the data-plane router's fallback, behind
+    /// its authentication and CORS layers, whichever pairs are set.
+    #[tokio::test]
+    async fn unmatched_paths_keep_the_data_plane_fallback_under_every_pair_setting() {
+        let admin = basic("a:b");
+        let data = basic("q:r");
+        let u = StatusCode::UNAUTHORIZED;
+        let n = StatusCode::NOT_FOUND;
+        // (data-plane pair, admin pair, [no header, q:r, a:b]).
+        let settings = [
+            (false, false, [n, n, n]),
+            (true, false, [u, n, u]),
+            (false, true, [n, n, n]),
+            (true, true, [u, n, u]),
+        ];
+        for (data_plane, admin_pair, want) in settings {
+            let router = admin_router(&pairs(data_plane, admin_pair));
+            let ctx = format!("data-plane pair {data_plane}, admin pair {admin_pair}");
+            for path in ["/no-such-path", "/admin/no-such-path"] {
+                let got = [
+                    status_of(&router, path, None).await,
+                    status_of(&router, path, Some(&data)).await,
+                    status_of(&router, path, Some(&admin)).await,
+                ];
+                assert_eq!(got, want, "{ctx}: GET {path}");
+            }
+            let res = send(&router, "OPTIONS", "/no-such-path", None, true).await;
+            assert_eq!(res.status(), StatusCode::OK, "{ctx}: OPTIONS");
+            assert!(
+                res.headers().get("access-control-allow-origin").is_some(),
+                "{ctx}: OPTIONS carries the CORS header"
+            );
+            let mounted = status_of(&router, "/admin/", Some(&admin)).await;
+            if admin_pair {
+                assert_eq!(mounted, StatusCode::OK, "{ctx}: GET /admin/ with a:b");
+            }
+        }
     }
 }

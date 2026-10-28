@@ -493,6 +493,25 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         (None, None) | (Some(_), Some(_)) => {}
     }
 
+    // Issue #746: the admin pair follows Rule 12's shape.
+    match (&cfg.admin_user, &cfg.admin_password) {
+        (Some(_), None) => {
+            return Err(value_err(
+                "admin_password",
+                "PULSUS_ADMIN_USER is set but PULSUS_ADMIN_PASSWORD is not",
+                "both PULSUS_ADMIN_USER and PULSUS_ADMIN_PASSWORD set to enable the admin UI",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(value_err(
+                "admin_user",
+                "PULSUS_ADMIN_PASSWORD is set but PULSUS_ADMIN_USER is not",
+                "both PULSUS_ADMIN_USER and PULSUS_ADMIN_PASSWORD set to enable the admin UI",
+            ));
+        }
+        (None, None) | (Some(_), Some(_)) => {}
+    }
+
     // Rule 16 (issue #174): one-sided inbound TLS is a hard startup error
     // (fail closed, the Rule-12 shape — the error names the MISSING
     // field). Pairing only: this function performs no filesystem I/O
@@ -1148,6 +1167,30 @@ mod tests {
         };
         assert!(
             matches!(validate(&cfg), Err(ConfigError::Value { field, .. }) if field == "auth_user")
+        );
+    }
+
+    /// Issue #746 B1: one-sided admin pair is a hard error naming the
+    /// missing field.
+    #[test]
+    fn one_sided_admin_user_only_is_a_hard_error() {
+        let cfg = Config {
+            admin_user: Some("root".to_string()),
+            ..Config::default()
+        };
+        assert!(
+            matches!(validate(&cfg), Err(ConfigError::Value { field, .. }) if field == "admin_password")
+        );
+    }
+
+    #[test]
+    fn one_sided_admin_password_only_is_a_hard_error() {
+        let cfg = Config {
+            admin_password: Some(crate::secret::Secret::new("toor")),
+            ..Config::default()
+        };
+        assert!(
+            matches!(validate(&cfg), Err(ConfigError::Value { field, .. }) if field == "admin_user")
         );
     }
 

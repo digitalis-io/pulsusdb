@@ -35,6 +35,10 @@ pub struct Config {
     pub log_level: LogLevel,
     pub auth_user: Option<String>,
     pub auth_password: Option<Secret>,
+    /// `PULSUS_ADMIN_USER` / `PULSUS_ADMIN_PASSWORD` (issue #746): the admin
+    /// UI's own Basic pair; both set mounts `/admin/`.
+    pub admin_user: Option<String>,
+    pub admin_password: Option<Secret>,
     pub compat_endpoints: bool,
     pub cors_origin: String,
     pub query_timeout: HumanDuration,
@@ -136,6 +140,8 @@ impl Default for Config {
             log_level: LogLevel::Info,
             auth_user: None,
             auth_password: None,
+            admin_user: None,
+            admin_password: None,
             compat_endpoints: false,
             cors_origin: "*".to_string(),
             query_timeout: HumanDuration(Duration::from_secs(120)),

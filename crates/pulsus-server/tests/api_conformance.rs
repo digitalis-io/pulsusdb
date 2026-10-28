@@ -1172,6 +1172,46 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
         (Surface::Ingest, _) => {
             unreachable!("{ctx}: ingest routes assert via assert_ingest_family")
         }
+        (Surface::Admin, path) => {
+            // Issue #746: every admin response carries both headers and no
+            // CORS header; the content type follows the route's kind.
+            assert_eq!(
+                res.headers
+                    .get("content-security-policy")
+                    .map(String::as_str),
+                Some("default-src 'self'"),
+                "{ctx}: admin content-security-policy"
+            );
+            assert_eq!(
+                res.headers.get("cache-control").map(String::as_str),
+                Some("no-store"),
+                "{ctx}: admin cache-control"
+            );
+            if path == "/admin/admin.css" {
+                assert_eq!(res.content_type(), Some("text/css"), "{ctx}: content-type");
+            } else if path.starts_with("/admin/api/v1/") {
+                assert_eq!(
+                    res.content_type(),
+                    Some("application/json"),
+                    "{ctx}: content-type"
+                );
+                let json = res.json(ctx);
+                assert!(
+                    json.is_object(),
+                    "{ctx}: body must be an object, got {json}"
+                );
+            } else {
+                assert_eq!(
+                    res.content_type(),
+                    Some("text/html; charset=utf-8"),
+                    "{ctx}: content-type"
+                );
+                assert!(
+                    String::from_utf8_lossy(&res.body).starts_with("<!DOCTYPE html>"),
+                    "{ctx}: body must be an HTML page"
+                );
+            }
+        }
     }
 }
 
@@ -2263,7 +2303,7 @@ fn assert_gzip_identity_metrics(port: u16, spawn: &str) {
     assert_eq!(
         identity.content_type(),
         Some("text/plain; version=0.0.4"),
-        "{ctx_id}: Content-Type (`ops.rs:122`)"
+        "{ctx_id}: Content-Type (`ops.rs:129`)"
     );
 
     req.headers.pop();
@@ -2278,7 +2318,7 @@ fn assert_gzip_identity_metrics(port: u16, spawn: &str) {
     assert_eq!(
         gz.content_type(),
         Some("text/plain; version=0.0.4"),
-        "{ctx_gz}: Content-Type under gzip negotiation (`ops.rs:122`)"
+        "{ctx_gz}: Content-Type under gzip negotiation (`ops.rs:129`)"
     );
 
     // ONE body, round-tripped: no second scrape enters this assertion.
@@ -2351,6 +2391,15 @@ async fn all_mode_auth_off_compat_on_full_matrix() {
                 assert_traces_fetch_v2_route(port, spec, "spawn=all,auth=off,compat=on")
             }
             Surface::LogsTail => assert_tail_route(port, spec, "spawn=all,auth=off,compat=on"),
+            // Issue #746: the admin pair is unset in this spawn, so no
+            // admin route is mounted.
+            Surface::Admin => {
+                let ctx = format!(
+                    "[spawn=all,auth=off,compat=on] GET {} case=admin-pair-unset-404",
+                    spec.path
+                );
+                assert_404_empty(&get(port, spec.path, &ctx), &ctx);
+            }
             _ => assert_full_route_matrix(port, spec, "spawn=all,auth=off,compat=on"),
         }
     }
@@ -2455,6 +2504,12 @@ async fn all_mode_auth_on_perimeter() {
         req.headers.pop();
         req.headers.push(("authorization", valid.clone()));
         let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        // Issue #746: the admin pair is unset in this spawn, so past the
+        // data-plane perimeter an admin route is an unmounted path.
+        if spec.surface == Surface::Admin {
+            assert_404_empty(&res, &ctx);
+            continue;
+        }
         assert_eq!(
             res.status,
             spec.success_status,
@@ -2476,6 +2531,96 @@ async fn all_mode_auth_on_perimeter() {
                creds=none (perimeter uniformity)";
     let res = get(port, "/totally-bogus-conformance-path", ctx);
     assert_401_unauthorized(&res, ctx);
+}
+
+// ---------------------------------------------------------------------
+// Spawn 2b (issue #746, B14): both pairs set — the admin pair opens every
+// admin route and nothing else; the data-plane pair opens no admin route.
+// ---------------------------------------------------------------------
+
+/// The admin JSON API's `401`: the JSON error body, `application/json`,
+/// `WWW-Authenticate: Basic`.
+fn assert_401_admin_json(res: &RawResponse, ctx: &str) {
+    assert_eq!(res.status, 401, "{ctx}: status");
+    assert_eq!(
+        res.headers.get("www-authenticate").map(String::as_str),
+        Some("Basic"),
+        "{ctx}: WWW-Authenticate header"
+    );
+    assert_eq!(
+        res.content_type(),
+        Some("application/json"),
+        "{ctx}: content-type"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&res.body),
+        r#"{"errors":[{"field":null,"message":"unauthorized"}]}"#,
+        "{ctx}: body"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_pair_gates_every_admin_route() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_137;
+    let db = &pulsus_testkit::test_db("pulsus_api_conformance_it_admin");
+    let _guard = spawn_ready(
+        port,
+        db,
+        &[
+            ("PULSUS_AUTH_USER", "alice"),
+            ("PULSUS_AUTH_PASSWORD", "hunter2"),
+            ("PULSUS_ADMIN_USER", "root"),
+            ("PULSUS_ADMIN_PASSWORD", "toor"),
+        ],
+    );
+    let spawn = "spawn=all,auth=on,admin=on";
+    let data_plane = format!("Basic {}", base64_encode(b"alice:hunter2"));
+    let admin = format!("Basic {}", base64_encode(b"root:toor"));
+
+    let mut admin_routes = 0;
+    for spec in route_manifest() {
+        if spec.status != RouteStatus::Mounted || spec.gate != Gate::AdminPair {
+            continue;
+        }
+        admin_routes += 1;
+        let is_api = spec.path.starts_with("/admin/api/v1/");
+        for (label, creds) in [("none", None), ("data-plane", Some(&data_plane))] {
+            let ctx = format!("[{spawn}] GET {} case=admin creds={label}", spec.path);
+            let mut req = manifest::Req::new("GET", spec.path);
+            if let Some(value) = creds {
+                req.headers.push(("authorization", value.clone()));
+            }
+            let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+            if is_api {
+                assert_401_admin_json(&res, &ctx);
+            } else {
+                assert_401_unauthorized(&res, &ctx);
+            }
+        }
+        let ctx = format!("[{spawn}] GET {} case=admin creds=admin", spec.path);
+        let mut req = manifest::Req::new("GET", spec.path);
+        req.headers.push(("authorization", admin.clone()));
+        let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        assert_eq!(
+            res.status,
+            spec.success_status,
+            "{ctx}: status (body: {:?})",
+            String::from_utf8_lossy(&res.body)
+        );
+        assert_success_envelope(spec, &res, &ctx);
+    }
+    assert_eq!(admin_routes, 7, "the manifest's admin routes");
+
+    // The admin pair opens nothing else.
+    let ctx = format!("[{spawn}] GET /config case=admin creds=admin");
+    let mut req = manifest::Req::new("GET", "/config");
+    req.headers.push(("authorization", admin.clone()));
+    let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+    assert_401_unauthorized(&res, &ctx);
 }
 
 // ---------------------------------------------------------------------
@@ -2580,6 +2725,11 @@ async fn writer_only_mode_reader_routes_404() {
             // assertion that distinguishes `CompatAndWriter` from
             // `CompatAndReader` (which stays 404 here, no Reader role).
             Gate::CompatAndWriter => assert_ingest_route(port, spec, spawn),
+            // Issue #746: the admin pair is unset in this spawn.
+            Gate::AdminPair => {
+                let ctx = format!("[{spawn}] GET {} case=admin-pair-unset-404", spec.path);
+                assert_404_empty(&get(port, spec.path, &ctx), &ctx);
+            }
         }
     }
 }
@@ -2646,6 +2796,11 @@ async fn reader_only_mode_writer_routes_404() {
             // `reader_only_mode_compat_on_writer_compat_route_404` (flag on,
             // Writer role still absent) and spawn 3 (flag off).
             Gate::CompatAndWriter => {}
+            // Issue #746: the admin pair is unset in this spawn.
+            Gate::AdminPair => {
+                let ctx = format!("[{spawn}] GET {} case=admin-pair-unset-404", spec.path);
+                assert_404_empty(&get(port, spec.path, &ctx), &ctx);
+            }
             Gate::ReaderMode => {
                 let method = spec.methods[0];
                 let ctx = format!(
