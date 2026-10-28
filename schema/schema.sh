@@ -438,6 +438,9 @@ n=0
 seen=","
 old_ifs=$IFS
 IFS=,
+# Pathname expansion is off while the list is split, so an item holding a
+# pattern character is checked as written, as the crate checks it.
+set -f
 for item in $indexed; do
     case "$item" in
         span.*) key=${item#span.}; root=span ;;
@@ -465,6 +468,7 @@ for item in $indexed; do
     attr_indexes="$attr_indexes,
     INDEX idx_attr_$n $expr TYPE bloom_filter(0.01) GRANULARITY 1"
 done
+set +f
 IFS=$old_ifs
 
 on_cluster=""
@@ -609,6 +613,8 @@ url="http://$server:$port/"
 # a deployment configures the credential once.
 auth=""
 [ -z "${CLICKHOUSE_AUTH:-}" ] || auth="--user ${CLICKHOUSE_AUTH}"
+# `$auth` is split into `--user` and the credential with pathname expansion
+# off (`set -f` in each request's subshell), so a `*` in a password stays one.
 
 # `curl` exits 0 when ClickHouse answers with an error in the body, so every
 # request below carries --fail-with-body.
@@ -617,7 +623,7 @@ auth=""
 # own exit code, so a caller under `set -e` still stops with it.
 # shellcheck disable=SC2086
 ask() {
-    if ask_body=$(curl -sS --fail-with-body $auth "$url" --data-binary "$1"); then
+    if ask_body=$(set -f; curl -sS --fail-with-body $auth "$url" --data-binary "$1"); then
         printf '%s\n' "$ask_body"
     else
         ask_rc=$?
@@ -633,7 +639,7 @@ ask() {
 # `curl: (22) The requested URL returned error: 500`.
 # shellcheck disable=SC2086
 send_file() {
-    if ! body=$(curl -sS --fail-with-body $auth "$url" --data-binary "@$1" 2>&1); then
+    if ! body=$(set -f; curl -sS --fail-with-body $auth "$url" --data-binary "@$1" 2>&1); then
         echo "schema.sh: the server refused this statement:" >&2
         cat "$1" >&2
         echo "schema.sh: the server said:" >&2
