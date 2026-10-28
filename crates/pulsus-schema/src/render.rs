@@ -470,10 +470,10 @@ pub struct Tiering {
     pub rollup_hot_days: Vec<u32>,
 }
 
-/// The tiering settings `schema/schema.sh` validates (issue #743 part A),
-/// checked in the script's order; the first rule that fails is the `Err`,
-/// the text the script prints after `schema.sh: `. With no cold volume
-/// every field of the `Ok` is `None`.
+/// The tiering settings `schema/schema.sh` validates (issue #743), checked
+/// in the script's order; the first rule that fails is the `Err`, the text
+/// the script prints after `schema.sh: `. With no cold volume the `Ok` has
+/// no volume and no move age; only `rollup_retention_days` can be set.
 pub fn validate_tiering(input: &TieringInput<'_>) -> Result<Tiering, String> {
     if let Some(volume) = input.cold_volume {
         if input.storage_policy.is_none() {
