@@ -1,5 +1,5 @@
 //! The setup form's pages and API (issue #746 part C): tests C10, C13,
-//! C14, C18 and C19, and B16, which runs the V5 check of a generated
+//! C14, C18, C19 and C20, and B16, which runs the V5 check of a generated
 //! `setup.md` against a server.
 
 use std::collections::BTreeMap;
@@ -592,6 +592,96 @@ async fn c19_one_keeper_is_accepted_with_a_warning() {
         assert_eq!(api.status, StatusCode::OK, "{path}: {}", api.body);
         let json: Value = serde_json::from_str(&api.body).unwrap();
         assert_eq!(json["warnings"], json!([]), "{path}: {}", api.body);
+    }
+}
+
+/// Each file card on the page, as (bundle path, destination heading,
+/// the "in the bundle" line), unescaped.
+fn page_cards(page: &str) -> Vec<(String, String, String)> {
+    let unescape = |s: &str| {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+    };
+    let between = |text: &str, open: &str, close: &str| -> String {
+        let at = text
+            .find(open)
+            .unwrap_or_else(|| panic!("no {open} in {text}"))
+            + open.len();
+        text[at..at + text[at..].find(close).expect("it closes")].to_string()
+    };
+    page.split("<article class=\"card file\" id=\"file-")
+        .skip(1)
+        .map(|card| {
+            let card = &card[..card.find("</header>").expect("the header closes")];
+            let path = card[..card.find('"').expect("the id closes")].to_string();
+            (
+                unescape(&path),
+                unescape(&between(card, "<span class=\"dest\">", "</span>")),
+                unescape(&between(card, "<span class=\"in-bundle\">", "</span>")),
+            )
+        })
+        .collect()
+}
+
+/// **C20: each file card is headed by where the file goes, with its
+/// bundle path under it, and the API gives each file the same
+/// destination.**
+#[tokio::test]
+async fn c20_each_file_shows_where_it_goes() {
+    let r = admin_router();
+    let page = post_form(&r, "/admin/setup", &example()).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    let cards = page_cards(&page.body);
+    let card = |path: &str| {
+        cards
+            .iter()
+            .find(|(p, _, _)| p == path)
+            .unwrap_or_else(|| panic!("no card for {path}"))
+            .clone()
+    };
+    assert_eq!(
+        card("nodes/1/config.d/pulsus-cluster.xml"),
+        (
+            "nodes/1/config.d/pulsus-cluster.xml".to_string(),
+            "ch1:/etc/clickhouse-server/config.d/pulsus-cluster.xml".to_string(),
+            "in the bundle: nodes/1/config.d/pulsus-cluster.xml".to_string()
+        )
+    );
+    assert_eq!(
+        card("pulsusdb.env").1,
+        "<pulsusdb host>:/etc/pulsusdb/pulsusdb.env"
+    );
+    assert_eq!(
+        card("schema.env").1,
+        "on the machine you run step 4 from: pulsus-bundle/schema.env"
+    );
+    assert_eq!(
+        card("keepers/3/keeper_config.xml").1,
+        "kp3:/etc/clickhouse-keeper/keeper_config.xml"
+    );
+
+    let res = post_json(&r, "/admin/api/v1/setup/bundle", json_body(&example())).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let json: Value = serde_json::from_str(&res.body).unwrap();
+    let api: Vec<(String, String)> = json["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|f| {
+            (
+                f["path"].as_str().expect("path").to_string(),
+                f["destination"].as_str().expect("destination").to_string(),
+            )
+        })
+        .collect();
+    let shown: Vec<(String, String)> = cards
+        .iter()
+        .map(|(p, d, _)| (p.clone(), d.clone()))
+        .collect();
+    assert_eq!(api, shown);
+    for (path, _, in_bundle) in &cards {
+        assert_eq!(in_bundle, &format!("in the bundle: {path}"));
     }
 }
 

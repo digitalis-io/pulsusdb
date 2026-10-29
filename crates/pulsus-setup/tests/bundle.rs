@@ -1556,3 +1556,51 @@ fn the_steps_give_the_copy_commands() {
         section(md, "K1")
     );
 }
+
+/// **Each file's destination, as the page and the API show it**: `host:/path`
+/// for a file placed on a host, `<pulsusdb host>:` for `pulsusdb.env`,
+/// and where it is used for the rest; each agrees with setup.md's table.
+#[test]
+fn each_file_has_a_destination_label() {
+    let pairs = example();
+    let v = validated(&pairs);
+    let files = files(&pairs);
+    let label = |path: &str| pulsus_setup::destination_label(&v, path);
+    assert_eq!(
+        label("nodes/1/config.d/pulsus-cluster.xml"),
+        "ch1:/etc/clickhouse-server/config.d/pulsus-cluster.xml"
+    );
+    assert_eq!(
+        label("nodes/6/users.d/pulsus-user.xml"),
+        "ch6:/etc/clickhouse-server/users.d/pulsus-user.xml"
+    );
+    assert_eq!(
+        label("keepers/2/keeper_config.xml"),
+        "kp2:/etc/clickhouse-keeper/keeper_config.xml"
+    );
+    assert_eq!(
+        label("pulsusdb.env"),
+        "<pulsusdb host>:/etc/pulsusdb/pulsusdb.env"
+    );
+    assert_eq!(
+        label("schema.env"),
+        "on the machine you run step 4 from: pulsus-bundle/schema.env"
+    );
+    assert_eq!(
+        label("schema/schema.sh"),
+        "on the machine you run step 4 from: pulsus-bundle/schema/schema.sh"
+    );
+    let md = file(&files, "setup.md");
+    for path in files.keys() {
+        let (host, dest) = destination(md, path).unwrap_or_else(|| panic!("{path}"));
+        let got = label(path);
+        let want = if v.hosts.contains(&host) || v.keepers.contains(&host) {
+            format!("{host}:{dest}")
+        } else if path == "pulsusdb.env" {
+            format!("<pulsusdb host>:{dest}")
+        } else {
+            format!("on the machine you run step 4 from: {dest}")
+        };
+        assert_eq!(got, want, "{path}");
+    }
+}

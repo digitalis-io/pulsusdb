@@ -154,6 +154,12 @@ pub fn total_lines(v: &Validated) -> Vec<String> {
     steps::total_lines(v)
 }
 
+/// Where bundle file `path` goes, as the page and the API show it:
+/// `host:/path` for a file placed on a host, else where it is used.
+pub fn destination_label(_v: &Validated, _path: &str) -> String {
+    String::new()
+}
+
 /// "1 Keeper host", or "N Keeper hosts".
 pub fn keeper_hosts(v: &Validated) -> String {
     steps::keeper_hosts(v)
