@@ -1,5 +1,5 @@
-//! The setup form's generator (issue #746 part C): tests C1-C9, C11, C12
-//! and C15-C17. The fixture `example` is the issue's example
+//! The setup form's generator (issue #746 part C): tests C1-C9, C11, C12,
+//! C12b and C15-C17. The fixture `example` is the issue's example
 //! (`pulsus_setup::example_pairs`).
 
 use std::collections::BTreeMap;
@@ -380,7 +380,7 @@ fn c4_each_rule_refuses_with_its_field_and_message() {
         (
             "W11",
             vec![("keepers", "kp1\nkp2")],
-            vec![("keepers", "give from 3 to 9 Keeper hosts".into())],
+            vec![("keepers", KEEPERS_REFUSED.into())],
         ),
         (
             "W12 local",
@@ -649,16 +649,79 @@ fn c11_keeper_2() {
     assert_eq!(file(&files, "keepers/2/keeper_config.xml"), KEEPER_2);
 }
 
-/// **C12: from 3 to 9 Keeper hosts, none a ClickHouse host.**
+const KEEPERS_REFUSED: &str = "give 1 Keeper host, or from 3 to 9";
+const ONE_KEEPER: &str = "One Keeper host: no fault tolerance. If it is down, writes to \
+     replicated tables and schema changes stop until it is back.";
+
+/// `pairs`' warnings as `(field, message)`; panics when they are refused.
+fn warnings(pairs: &Pairs) -> Vec<(String, String)> {
+    validated(pairs)
+        .warnings
+        .into_iter()
+        .map(|w| (w.field, w.message))
+        .collect()
+}
+
+/// The one Keeper host's whole configuration: a Raft group of itself.
+const KEEPER_ONE: &str = "<clickhouse>
+    <listen_host>::</listen_host>
+    <listen_host>0.0.0.0</listen_host>
+    <listen_try>1</listen_try>
+    <keeper_server>
+        <tcp_port_secure>9181</tcp_port_secure>
+        <server_id>1</server_id>
+        <log_storage_path>/var/lib/clickhouse-keeper/coordination/log</log_storage_path>
+        <snapshot_storage_path>/var/lib/clickhouse-keeper/coordination/snapshots</snapshot_storage_path>
+        <raft_configuration>
+            <secure>true</secure>
+            <server>
+                <id>1</id>
+                <hostname>kp1</hostname>
+                <port>9234</port>
+            </server>
+        </raft_configuration>
+    </keeper_server>
+    <openSSL>
+        <server>
+            <certificateFile>/etc/ch/server.crt</certificateFile>
+            <privateKeyFile>/etc/ch/server.key</privateKeyFile>
+            <caConfig>/etc/ch/ca.crt</caConfig>
+            <verificationMode>none</verificationMode>
+        </server>
+        <client>
+            <caConfig>/etc/ch/ca.crt</caConfig>
+            <verificationMode>relaxed</verificationMode>
+        </client>
+    </openSSL>
+</clickhouse>
+";
+
+/// **C12: 1 Keeper host, or from 3 to 9, none a ClickHouse host.** One is
+/// accepted with a warning on `keepers`; 2 and 10 are refused; 3 and 4
+/// are accepted with none.
 #[test]
 fn c12_keeper_count_and_overlap() {
-    let two = with(example(), &[("keepers", "kp1\nkp2")]);
+    let one = with(example(), &[("keepers", "kp1")]);
+    assert!(refusals(&one).is_none(), "{:?}", refusals(&one));
     assert_eq!(
-        field_messages(&two, "keepers"),
-        ["give from 3 to 9 Keeper hosts"]
+        warnings(&one),
+        [("keepers".to_string(), ONE_KEEPER.to_string())]
     );
+    for refused in [
+        "kp1\nkp2",
+        "kp1\nkp2\nkp3\nkp4\nkp5\nkp6\nkp7\nkp8\nkp9\nkp10",
+    ] {
+        assert_eq!(
+            field_messages(&with(example(), &[("keepers", refused)]), "keepers"),
+            [KEEPERS_REFUSED],
+            "{refused:?}"
+        );
+    }
+    let three = example();
+    assert!(warnings(&three).is_empty(), "{:?}", warnings(&three));
     let four = with(example(), &[("keepers", "kp1\nkp2\nkp3\nkp4")]);
     assert!(refusals(&four).is_none(), "{:?}", refusals(&four));
+    assert!(warnings(&four).is_empty(), "{:?}", warnings(&four));
     assert_eq!(
         files(&four)
             .keys()
@@ -671,6 +734,36 @@ fn c12_keeper_count_and_overlap() {
         field_messages(&overlap, "keepers"),
         ["ch1 is also a ClickHouse host: Keeper runs on its own hosts"]
     );
+}
+
+/// **C12b: a bundle for 1 Keeper host.** One Keeper file, holding a Raft
+/// group of exactly one member; each server's config names that one
+/// Keeper; `setup.md` says "1 Keeper host" and carries the warning, which
+/// a 3-Keeper `setup.md` does not.
+#[test]
+fn c12b_one_keeper_bundle() {
+    let one = files(&with(example(), &[("keepers", "kp1")]));
+    let keeper_files: Vec<&String> = one.keys().filter(|p| p.starts_with("keepers/")).collect();
+    assert_eq!(keeper_files, ["keepers/1/keeper_config.xml"]);
+    let keeper = file(&one, "keepers/1/keeper_config.xml");
+    assert_eq!(
+        keeper.matches("<server>\n                <id>").count(),
+        1,
+        "{keeper}"
+    );
+    assert_eq!(keeper, KEEPER_ONE);
+    let cluster = file(&one, "nodes/1/config.d/pulsus-cluster.xml");
+    let zookeeper = &cluster[cluster.find("<zookeeper>").expect("a zookeeper block")
+        ..cluster.find("</zookeeper>").expect("the block closes")];
+    assert_eq!(zookeeper.matches("<node>").count(), 1, "{zookeeper}");
+    assert!(zookeeper.contains("<host>kp1</host>"), "{zookeeper}");
+    let md = file(&one, "setup.md");
+    assert!(md.contains(", 1 Keeper host, "), "{md}");
+    assert!(md.contains(ONE_KEEPER), "{md}");
+    let three = files(&example());
+    let md = file(&three, "setup.md");
+    assert!(md.contains(", 3 Keeper hosts, "), "{md}");
+    assert!(!md.contains("no fault tolerance"), "{md}");
 }
 
 /// **C15: no memory, thread or cache setting is written.**
@@ -832,7 +925,7 @@ fn c16_bounds() {
     assert!(field_messages(&with(example(), &[("keepers", &nine)]), "keepers").is_empty());
     assert_eq!(
         field_messages(&with(example(), &[("keepers", &ten)]), "keepers"),
-        ["give from 3 to 9 Keeper hosts"]
+        [KEEPERS_REFUSED]
     );
 
     // W2 and W10 after lowercasing.

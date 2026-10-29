@@ -14,7 +14,7 @@ mod server_xml;
 mod steps;
 mod vars;
 
-pub use inputs::{FieldError, Inputs, LevelRow, Tls, Totals, Validated, validate};
+pub use inputs::{FieldError, FieldWarning, Inputs, LevelRow, Tls, Totals, Validated, validate};
 
 /// One generated file: its path inside the bundle, and its text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

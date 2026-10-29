@@ -1,5 +1,5 @@
 //! The setup form's pages and API (issue #746 part C): tests C10, C13,
-//! C14 and C18, and B16, which runs the V5 check of a generated
+//! C14, C18 and C19, and B16, which runs the V5 check of a generated
 //! `setup.md` against a server.
 
 use std::collections::BTreeMap;
@@ -496,6 +496,99 @@ async fn c18_a_hundred_hosts() {
     assert_eq!(api.len(), 100 * 5 + 9 + 6);
     let page = page_bundle(&r, &pairs).await;
     assert_eq!(page, api);
+}
+
+const ONE_KEEPER: &str = "One Keeper host: no fault tolerance. If it is down, writes to \
+     replicated tables and schema changes stop until it is back.";
+
+/// The keepers field's block on the page: from its control to the next
+/// field.
+fn keepers_field(page: &str) -> &str {
+    let start = page
+        .find("id=\"f-keepers\"")
+        .unwrap_or_else(|| panic!("no keepers field in {page}"));
+    let rest = &page[start..];
+    &rest[..rest.find("<div class=\"field\">").unwrap_or(rest.len())]
+}
+
+/// **C19: 1 Keeper host is accepted with a warning, on the page and in
+/// the API; 2 and 10 are refused; 3 is accepted with none.**
+#[tokio::test]
+async fn c19_one_keeper_is_accepted_with_a_warning() {
+    let r = admin_router();
+    let one = with(example(), &[("keepers", "kp1")]);
+    let warned = json!([{"field": "keepers", "message": ONE_KEEPER}]);
+
+    let page = post_form(&r, "/admin/setup", &one).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert!(page_errors(&page.body).is_empty(), "{}", page.body);
+    assert!(
+        page_files(&page.body).contains(&"keepers/1/keeper_config.xml".to_string()),
+        "the bundle is generated: {}",
+        page.body
+    );
+    assert!(
+        keepers_field(&page.body).contains(&format!(
+            "<p class=\"field-warning\">{}</p>",
+            html_text(ONE_KEEPER)
+        )),
+        "the warning is under the keepers field: {}",
+        page.body
+    );
+    assert_eq!(page.body.matches("class=\"field-warning\"").count(), 1);
+
+    for path in ["/admin/api/v1/setup/validate", "/admin/api/v1/setup/bundle"] {
+        let api = post_json(&r, path, json_body(&one)).await;
+        assert_eq!(api.status, StatusCode::OK, "{path}: {}", api.body);
+        let json: Value = serde_json::from_str(&api.body).unwrap();
+        assert_eq!(json["warnings"], warned, "{path}: {}", api.body);
+    }
+    let (_, files) = api_bundle(&r, &one).await;
+    assert_eq!(
+        files
+            .iter()
+            .filter(|(p, _)| p.starts_with("keepers/"))
+            .count(),
+        1
+    );
+
+    let ten = (1..=10)
+        .map(|i| format!("kp{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for keepers in ["kp1\nkp2", ten.as_str()] {
+        let pairs = with(example(), &[("keepers", keepers)]);
+        let api = post_json(&r, "/admin/api/v1/setup/validate", json_body(&pairs)).await;
+        assert_eq!(api.status, StatusCode::UNPROCESSABLE_ENTITY, "{keepers:?}");
+        let json: Value = serde_json::from_str(&api.body).unwrap();
+        assert_eq!(
+            json["errors"],
+            json!([{"field": "keepers", "message": "give 1 Keeper host, or from 3 to 9"}]),
+            "{keepers:?}"
+        );
+        let page = post_form(&r, "/admin/setup", &pairs).await;
+        assert_eq!(
+            page_errors(&page.body),
+            [(
+                "keepers".to_string(),
+                "give 1 Keeper host, or from 3 to 9".to_string()
+            )],
+            "{keepers:?}"
+        );
+        assert!(page_files(&page.body).is_empty(), "{keepers:?}");
+    }
+
+    let three = example();
+    let page = post_form(&r, "/admin/setup", &three).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(!page_files(&page.body).is_empty(), "{}", page.body);
+    assert!(!page.body.contains("field-warning"), "{}", page.body);
+    for path in ["/admin/api/v1/setup/validate", "/admin/api/v1/setup/bundle"] {
+        let api = post_json(&r, path, json_body(&three)).await;
+        assert_eq!(api.status, StatusCode::OK, "{path}: {}", api.body);
+        let json: Value = serde_json::from_str(&api.body).unwrap();
+        assert_eq!(json["warnings"], json!([]), "{path}: {}", api.body);
+    }
 }
 
 /// The text between `# V5 begin` and `# V5 end`, both included.

@@ -49,6 +49,14 @@ pub struct FieldError {
     pub message: String,
 }
 
+/// A warning: the form field and the message shown under it. The inputs
+/// are accepted and the bundle is generated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FieldWarning {
+    pub field: String,
+    pub message: String,
+}
+
 /// The certificate, key and CA paths, the same on every host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tls {
@@ -98,6 +106,8 @@ pub struct Validated {
     pub raw_local_days: u64,
     pub raw_remote_days: u64,
     pub levels: Vec<LevelRow>,
+    /// What the form warns about inputs it accepted.
+    pub warnings: Vec<FieldWarning>,
     /// The schema variables, `schema.env`'s lines.
     pub vars: BTreeMap<&'static str, String>,
     pub ctx: RenderCtx,
@@ -467,6 +477,7 @@ pub fn validate(inputs: &Inputs) -> Result<Validated, Vec<FieldError>> {
         raw_local_days,
         raw_remote_days,
         levels,
+        warnings: Vec::new(),
         vars,
         ctx,
     })
