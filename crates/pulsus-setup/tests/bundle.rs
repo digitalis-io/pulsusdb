@@ -1309,13 +1309,14 @@ fn a_nested_new_destination_is_written() {
 }
 
 /// Every variable the bundle tells a host to set from a secret store.
-const SECRET_VARS: [&str; 6] = [
+const SECRET_VARS: [&str; 7] = [
     "CLICKHOUSE_INTERSERVER_SECRET",
     "PULSUS_CLICKHOUSE_PASSWORD",
     "PULSUS_S3_ACCESS_KEY_ID",
     "PULSUS_S3_SECRET_ACCESS_KEY",
     "CLICKHOUSE_AUTH",
     "PULSUS_ADMIN_PASSWORD",
+    "PULSUS_AUTH_PASSWORD",
 ];
 
 /// Each value `text` assigns to `name`, as `name=value` (an env file) or
@@ -1602,5 +1603,90 @@ fn each_file_has_a_destination_label() {
             format!("on the machine you run step 4 from: {dest}")
         };
         assert_eq!(got, want, "{path}");
+    }
+}
+
+/// **W5: the local storage path is not `/` or a top-level system
+/// directory**, since step 1 changes its owner and mode.
+#[test]
+fn the_local_path_is_not_a_system_directory() {
+    let message = "must not be / or a top-level system directory such as /etc/ or /var/";
+    for bad in [
+        "/", "/etc/", "/usr/", "/bin/", "/var/", "/home/", "/root/", "/boot/", "/lib/",
+    ] {
+        assert_eq!(
+            field_messages(&with(example(), &[("local_path", bad)]), "local_path"),
+            [message],
+            "{bad}"
+        );
+    }
+    for good in ["/var/lib/clickhouse/", "/data/", "/srv/clickhouse/"] {
+        assert!(
+            field_messages(&with(example(), &[("local_path", good)]), "local_path").is_empty(),
+            "{good}"
+        );
+    }
+}
+
+/// **The PulsusDB host's step**: with TLS, each container example mounts
+/// the CA read-only, as `pulsusdb.env` names it; the packaged unit is
+/// enabled and started; and the optional data API login is in each
+/// example, with what happens without it.
+#[test]
+fn step5_mounts_the_ca_enables_the_unit_and_offers_the_data_login() {
+    let tls = files(&example());
+    let md = file(&tls, "setup.md");
+    let step5 = section(md, "5");
+    for needle in [
+        "-v /etc/ch/ca.crt:/etc/ch/ca.crt:ro",
+        "      - /etc/ch/ca.crt:/etc/ch/ca.crt:ro",
+        "mountPath: /etc/ch/ca.crt",
+        "readOnly: true",
+        "sudo systemctl enable --now pulsusdb",
+        "without them the query and ingest endpoints have no login",
+    ] {
+        assert!(step5.contains(needle), "{needle:?}: {step5}");
+    }
+    assert!(!step5.contains("systemctl restart pulsusdb"), "{step5}");
+    for var in ["PULSUS_AUTH_USER", "PULSUS_AUTH_PASSWORD"] {
+        assert_eq!(assigned(step5, var).len(), 2, "{var}: {step5}");
+    }
+    let containers = part(md, "In containers");
+    assert!(
+        containers.contains("PulsusDB: the CA at `/etc/ch/ca.crt`, read-only"),
+        "{containers}"
+    );
+
+    let plain = files(&no_tls());
+    let md = file(&plain, "setup.md");
+    let step5 = section(md, "5");
+    for needle in ["ca.crt", "mountPath"] {
+        assert!(!step5.contains(needle), "{needle:?}: {step5}");
+    }
+}
+
+/// **The files that stay in the bundle have exact modes**, in the table
+/// and in the fetch commands.
+#[test]
+fn bundle_files_have_exact_modes() {
+    let files = files(&example());
+    let md = file(&files, "setup.md");
+    let table = part(md, "Where each file goes");
+    for (path, mode) in [
+        ("schema.env", "0644"),
+        ("schema-rendered.sql", "0644"),
+        ("schema/schema.sh", "0755"),
+        ("schema/schema.sql", "0644"),
+        ("setup.md", "0644"),
+    ] {
+        let row = table
+            .lines()
+            .find(|l| l.starts_with(&format!("| `{path}` | ")))
+            .unwrap_or_else(|| panic!("no row for {path}"));
+        assert!(row.ends_with(&format!(" | yours, `{mode}` |")), "{row}");
+    }
+    let bundle = part(md, "The bundle");
+    for needle in ["chmod 644", "chmod 755 schema/schema.sh"] {
+        assert!(bundle.contains(needle), "{needle:?}: {bundle}");
     }
 }
