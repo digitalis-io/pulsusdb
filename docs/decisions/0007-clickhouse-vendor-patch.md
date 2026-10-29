@@ -90,6 +90,9 @@ Consequences:
   `validate_impl`'s `JSON` arm and its named-tuple arm,
   `vendor/clickhouse/PATCHES.md` §§3-4, whose re-vendor rules are paired with
   `vendor/clickhouse-types`'s.
+- A fifth, `vendor/clickhouse/PATCHES.md` §5, names LZ4 on every request that
+  asks for a compressed reply: from ClickHouse 26.10 the server's default
+  codec for that reply is ZSTD, which the client does not decode.
 
 ## What this does not decide
 

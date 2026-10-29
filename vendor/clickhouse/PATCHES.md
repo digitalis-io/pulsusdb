@@ -7,11 +7,13 @@ path is unchanged. See
 [`docs/decisions/0007-clickhouse-vendor-patch.md`](../../docs/decisions/0007-clickhouse-vendor-patch.md)
 for the decision this copy implements, and issue #382 for the measurements.
 
-**Four patches, in four functions across two files**: §1
+**Five patches, in five functions across three files**: §1
 (`collect_bad_response`, issue #382) and §2 (`extract_exception` and
-`DetectDbException`, issue #412), both in `src/response.rs`, and §3 and §4
+`DetectDbException`, issue #412), both in `src/response.rs`, §3 and §4
 (`validate_impl`, issue #585) in `src/rowbinary/validation.rs` — §3 in its
-`SerdeType::Seq(_)` arm and §4 in its `SerdeType::Tuple(len)` arm. One
+`SerdeType::Seq(_)` arm and §4 in its `SerdeType::Tuple(len)` arm — and §5
+(`Query::do_execute`) in `src/query.rs`, with the setting's name beside the
+others in `src/lib.rs`'s `settings` module. One
 test-support export joins them in `src/lib.rs`'s `_priv` module and is
 named in §3; it is not a change to the driver's behaviour. Nothing else is
 modified. The vendored tree
@@ -549,3 +551,47 @@ upstream's `SerdeType::Tuple(len)` arm admits a named tuple. It can only do so
 once `clickhouse-types` has a variant for one, so this entry is paired with
 that crate's re-vendor rule: if upstream takes named tuples there, drop that
 patch and this arm together.
+
+## 5. `Query::do_execute` names LZ4 for a compressed reply
+
+`src/query.rs`, in `do_execute`.
+
+### What upstream does
+
+With LZ4 compression (the default), every query sends `compress=1` and
+decodes the reply with `Lz4Decoder`, which accepts only method byte `0x82`.
+The request does not say which codec to use. From ClickHouse 26.10 a
+`compress=1` reply is compressed with `network_compression_method`, and that
+defaults to ZSTD (method byte `0x90`). Measured with `SELECT 1`: 26.10.3.7
+answers `0x90`; 26.8.21.10 answers `0x82` whatever the setting says.
+
+### Why that is a defect for us
+
+Every reply from a 26.10 server fails with `decompression error: incorrect
+magic number`, starting with the pool's connect probe, so PulsusDB never
+becomes ready.
+
+### The change
+
+When the client decodes LZ4, the query string carries
+`network_compression_method=lz4`, appended after the client's own settings.
+ClickHouse applies the last of two values for one setting in a query string
+(measured on 26.10.3.7: `zstd` then `lz4` answers `0x82`, the reverse `0x90`),
+so no caller's setting can undo it. A client set to ZSTD, or to no
+compression, is unchanged. Inserts are unchanged: an insert sends
+`decompress=1`, asks for no compressed reply, and reads its reply
+uncompressed.
+
+### Gates
+
+- **Hermetic** (`pulsus-clickhouse/tests/reply_compression.rs`):
+  `every_request_asking_for_a_compressed_reply_names_lz4` records every
+  request the pool sends and requires the setting exactly once beside every
+  `compress=1`.
+- **Live** (`pulsus-clickhouse/tests/live_clickhouse.rs`):
+  `a_user_whose_replies_default_to_zstd_still_connects_queries_and_inserts`.
+  It is a gate only against 26.10 or newer; on 26.8 it passes either way.
+
+**Re-vendor rule (§5):** on any `clickhouse` version bump, check whether
+upstream names the codec on a `compress=1` request. If it does, drop this
+patch.
