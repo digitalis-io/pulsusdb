@@ -234,6 +234,18 @@ impl Query {
             pairs.append_pair(name, value);
         }
 
+        // PulsusDB patch §5 (`PATCHES.md`): `compress=1` replies are decoded
+        // as LZ4 only, so name the codec rather than take the server's
+        // default, which is ZSTD from ClickHouse 26.10. Appended after the
+        // client's own settings so nothing can override it.
+        let lz4_reply = self.client.compression.is_enabled();
+        #[cfg(feature = "zstd")]
+        let lz4_reply =
+            lz4_reply && !matches!(self.client.compression, crate::Compression::Zstd(_));
+        if lz4_reply {
+            pairs.append_pair(settings::NETWORK_COMPRESSION_METHOD, "lz4");
+        }
+
         pairs.extend_pairs(self.client.roles.iter().map(|role| (settings::ROLE, role)));
 
         drop(pairs);

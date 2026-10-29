@@ -677,6 +677,7 @@ mod settings {
     pub(crate) const DEFAULT_FORMAT: &str = "default_format";
     pub(crate) const COMPRESS: &str = "compress";
     pub(crate) const DECOMPRESS: &str = "decompress";
+    pub(crate) const NETWORK_COMPRESSION_METHOD: &str = "network_compression_method";
     #[cfg(feature = "zstd")]
     pub(crate) const ENABLE_HTTP_COMPRESSION: &str = "enable_http_compression";
     pub(crate) const ROLE: &str = "role";
