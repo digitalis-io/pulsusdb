@@ -206,6 +206,10 @@ pub(crate) fn user() -> String {
     .to_string()
 }
 
+/// Keeper's log and snapshot directories, under `places::KEEPER_DATA`.
+pub(crate) const KEEPER_LOG: &str = "/var/lib/clickhouse-keeper/coordination/log";
+pub(crate) const KEEPER_SNAPSHOTS: &str = "/var/lib/clickhouse-keeper/coordination/snapshots";
+
 /// `keepers/<j>/keeper_config.xml` for Keeper host `j` (from 1): the whole
 /// file, replacing the package's.
 pub(crate) fn keeper(v: &Validated, j: usize) -> String {
@@ -216,12 +220,12 @@ pub(crate) fn keeper(v: &Validated, j: usize) -> String {
     let port_key = if tls { "tcp_port_secure" } else { "tcp_port" };
     let _ = writeln!(out, "        <{port_key}>{KEEPER_PORT}</{port_key}>");
     let _ = writeln!(out, "        <server_id>{j}</server_id>");
-    out.push_str(
-        "        <log_storage_path>/var/lib/clickhouse-keeper/coordination/log</log_storage_path>
-        <snapshot_storage_path>/var/lib/clickhouse-keeper/coordination/snapshots</snapshot_storage_path>
+    out.push_str(&format!(
+        "        <log_storage_path>{KEEPER_LOG}</log_storage_path>
+        <snapshot_storage_path>{KEEPER_SNAPSHOTS}</snapshot_storage_path>
         <raft_configuration>
-",
-    );
+"
+    ));
     if tls {
         out.push_str("            <secure>true</secure>\n");
     }

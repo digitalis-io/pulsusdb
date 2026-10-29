@@ -1,5 +1,5 @@
 //! The setup form's pages and API (issue #746 part C): tests C10, C13,
-//! C14 and C18, and B16, which runs the V5 check of a generated
+//! C14, C18, C19 and C20, and B16, which runs the V5 check of a generated
 //! `setup.md` against a server.
 
 use std::collections::BTreeMap;
@@ -352,7 +352,11 @@ async fn c13_api_and_page_give_the_same_files() {
             validated.body
         );
         let validated: Value = serde_json::from_str(&validated.body).unwrap();
-        assert_eq!(validated, json!({"totals": totals}), "{name}");
+        assert_eq!(
+            validated,
+            json!({"totals": totals, "warnings": []}),
+            "{name}"
+        );
         if name == "example" {
             assert_eq!(totals, json!({"raw": 97, "levels": [365, 365, 365, 365]}));
         }
@@ -496,6 +500,189 @@ async fn c18_a_hundred_hosts() {
     assert_eq!(api.len(), 100 * 5 + 9 + 6);
     let page = page_bundle(&r, &pairs).await;
     assert_eq!(page, api);
+}
+
+const ONE_KEEPER: &str = "One Keeper host: no fault tolerance. If it is down, writes to \
+     replicated tables and schema changes stop until it is back.";
+
+/// The keepers field's block on the page: from its control to the next
+/// field.
+fn keepers_field(page: &str) -> &str {
+    let start = page
+        .find("id=\"f-keepers\"")
+        .unwrap_or_else(|| panic!("no keepers field in {page}"));
+    let rest = &page[start..];
+    &rest[..rest.find("<div class=\"field\">").unwrap_or(rest.len())]
+}
+
+/// **C19: 1 Keeper host is accepted with a warning, on the page and in
+/// the API; 2 and 10 are refused; 3 is accepted with none.**
+#[tokio::test]
+async fn c19_one_keeper_is_accepted_with_a_warning() {
+    let r = admin_router();
+    let one = with(example(), &[("keepers", "kp1")]);
+    let warned = json!([{"field": "keepers", "message": ONE_KEEPER}]);
+
+    let page = post_form(&r, "/admin/setup", &one).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert!(page_errors(&page.body).is_empty(), "{}", page.body);
+    assert!(
+        page_files(&page.body).contains(&"keepers/1/keeper_config.xml".to_string()),
+        "the bundle is generated: {}",
+        page.body
+    );
+    assert!(
+        keepers_field(&page.body).contains(&format!(
+            "<p class=\"field-warning\">{}</p>",
+            html_text(ONE_KEEPER)
+        )),
+        "the warning is under the keepers field: {}",
+        page.body
+    );
+    assert_eq!(page.body.matches("class=\"field-warning\"").count(), 1);
+
+    for path in ["/admin/api/v1/setup/validate", "/admin/api/v1/setup/bundle"] {
+        let api = post_json(&r, path, json_body(&one)).await;
+        assert_eq!(api.status, StatusCode::OK, "{path}: {}", api.body);
+        let json: Value = serde_json::from_str(&api.body).unwrap();
+        assert_eq!(json["warnings"], warned, "{path}: {}", api.body);
+    }
+    let (_, files) = api_bundle(&r, &one).await;
+    assert_eq!(
+        files
+            .iter()
+            .filter(|(p, _)| p.starts_with("keepers/"))
+            .count(),
+        1
+    );
+
+    let ten = (1..=10)
+        .map(|i| format!("kp{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for keepers in ["kp1\nkp2", ten.as_str()] {
+        let pairs = with(example(), &[("keepers", keepers)]);
+        let api = post_json(&r, "/admin/api/v1/setup/validate", json_body(&pairs)).await;
+        assert_eq!(api.status, StatusCode::UNPROCESSABLE_ENTITY, "{keepers:?}");
+        let json: Value = serde_json::from_str(&api.body).unwrap();
+        assert_eq!(
+            json["errors"],
+            json!([{"field": "keepers", "message": "give 1 Keeper host, or from 3 to 9"}]),
+            "{keepers:?}"
+        );
+        let page = post_form(&r, "/admin/setup", &pairs).await;
+        assert_eq!(
+            page_errors(&page.body),
+            [(
+                "keepers".to_string(),
+                "give 1 Keeper host, or from 3 to 9".to_string()
+            )],
+            "{keepers:?}"
+        );
+        assert!(page_files(&page.body).is_empty(), "{keepers:?}");
+    }
+
+    let three = example();
+    let page = post_form(&r, "/admin/setup", &three).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(!page_files(&page.body).is_empty(), "{}", page.body);
+    assert!(!page.body.contains("field-warning"), "{}", page.body);
+    for path in ["/admin/api/v1/setup/validate", "/admin/api/v1/setup/bundle"] {
+        let api = post_json(&r, path, json_body(&three)).await;
+        assert_eq!(api.status, StatusCode::OK, "{path}: {}", api.body);
+        let json: Value = serde_json::from_str(&api.body).unwrap();
+        assert_eq!(json["warnings"], json!([]), "{path}: {}", api.body);
+    }
+}
+
+/// Each file card on the page, as (bundle path, destination heading,
+/// the "in the bundle" line), unescaped.
+fn page_cards(page: &str) -> Vec<(String, String, String)> {
+    let unescape = |s: &str| {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+    };
+    let between = |text: &str, open: &str, close: &str| -> String {
+        let at = text
+            .find(open)
+            .unwrap_or_else(|| panic!("no {open} in {text}"))
+            + open.len();
+        text[at..at + text[at..].find(close).expect("it closes")].to_string()
+    };
+    page.split("<article class=\"card file\" id=\"file-")
+        .skip(1)
+        .map(|card| {
+            let card = &card[..card.find("</header>").expect("the header closes")];
+            let path = card[..card.find('"').expect("the id closes")].to_string();
+            (
+                unescape(&path),
+                unescape(&between(card, "<span class=\"dest\">", "</span>")),
+                unescape(&between(card, "<span class=\"in-bundle\">", "</span>")),
+            )
+        })
+        .collect()
+}
+
+/// **C20: each file card is headed by where the file goes, with its
+/// bundle path under it, and the API gives each file the same
+/// destination.**
+#[tokio::test]
+async fn c20_each_file_shows_where_it_goes() {
+    let r = admin_router();
+    let page = post_form(&r, "/admin/setup", &example()).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    let cards = page_cards(&page.body);
+    let card = |path: &str| {
+        cards
+            .iter()
+            .find(|(p, _, _)| p == path)
+            .unwrap_or_else(|| panic!("no card for {path}"))
+            .clone()
+    };
+    assert_eq!(
+        card("nodes/1/config.d/pulsus-cluster.xml"),
+        (
+            "nodes/1/config.d/pulsus-cluster.xml".to_string(),
+            "ch1:/etc/clickhouse-server/config.d/pulsus-cluster.xml".to_string(),
+            "in the bundle: nodes/1/config.d/pulsus-cluster.xml".to_string()
+        )
+    );
+    assert_eq!(
+        card("pulsusdb.env").1,
+        "<pulsusdb host>:/etc/pulsusdb/pulsusdb.env"
+    );
+    assert_eq!(
+        card("schema.env").1,
+        "on the machine you run step 4 from: pulsus-bundle/schema.env"
+    );
+    assert_eq!(
+        card("keepers/3/keeper_config.xml").1,
+        "kp3:/etc/clickhouse-keeper/keeper_config.xml"
+    );
+
+    let res = post_json(&r, "/admin/api/v1/setup/bundle", json_body(&example())).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let json: Value = serde_json::from_str(&res.body).unwrap();
+    let api: Vec<(String, String)> = json["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|f| {
+            (
+                f["path"].as_str().expect("path").to_string(),
+                f["destination"].as_str().expect("destination").to_string(),
+            )
+        })
+        .collect();
+    let shown: Vec<(String, String)> = cards
+        .iter()
+        .map(|(p, d, _)| (p.clone(), d.clone()))
+        .collect();
+    assert_eq!(api, shown);
+    for (path, _, in_bundle) in &cards {
+        assert_eq!(in_bundle, &format!("in the bundle: {path}"));
+    }
 }
 
 /// The text between `# V5 begin` and `# V5 end`, both included.

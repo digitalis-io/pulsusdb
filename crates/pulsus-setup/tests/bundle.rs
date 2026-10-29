@@ -1,5 +1,5 @@
-//! The setup form's generator (issue #746 part C): tests C1-C9, C11, C12
-//! and C15-C17. The fixture `example` is the issue's example
+//! The setup form's generator (issue #746 part C): tests C1-C9, C11, C12,
+//! C12b and C15-C17. The fixture `example` is the issue's example
 //! (`pulsus_setup::example_pairs`).
 
 use std::collections::BTreeMap;
@@ -380,7 +380,7 @@ fn c4_each_rule_refuses_with_its_field_and_message() {
         (
             "W11",
             vec![("keepers", "kp1\nkp2")],
-            vec![("keepers", "give from 3 to 9 Keeper hosts".into())],
+            vec![("keepers", KEEPERS_REFUSED.into())],
         ),
         (
             "W12 local",
@@ -649,16 +649,79 @@ fn c11_keeper_2() {
     assert_eq!(file(&files, "keepers/2/keeper_config.xml"), KEEPER_2);
 }
 
-/// **C12: from 3 to 9 Keeper hosts, none a ClickHouse host.**
+const KEEPERS_REFUSED: &str = "give 1 Keeper host, or from 3 to 9";
+const ONE_KEEPER: &str = "One Keeper host: no fault tolerance. If it is down, writes to \
+     replicated tables and schema changes stop until it is back.";
+
+/// `pairs`' warnings as `(field, message)`; panics when they are refused.
+fn warnings(pairs: &Pairs) -> Vec<(String, String)> {
+    validated(pairs)
+        .warnings
+        .into_iter()
+        .map(|w| (w.field, w.message))
+        .collect()
+}
+
+/// The one Keeper host's whole configuration: a Raft group of itself.
+const KEEPER_ONE: &str = "<clickhouse>
+    <listen_host>::</listen_host>
+    <listen_host>0.0.0.0</listen_host>
+    <listen_try>1</listen_try>
+    <keeper_server>
+        <tcp_port_secure>9181</tcp_port_secure>
+        <server_id>1</server_id>
+        <log_storage_path>/var/lib/clickhouse-keeper/coordination/log</log_storage_path>
+        <snapshot_storage_path>/var/lib/clickhouse-keeper/coordination/snapshots</snapshot_storage_path>
+        <raft_configuration>
+            <secure>true</secure>
+            <server>
+                <id>1</id>
+                <hostname>kp1</hostname>
+                <port>9234</port>
+            </server>
+        </raft_configuration>
+    </keeper_server>
+    <openSSL>
+        <server>
+            <certificateFile>/etc/ch/server.crt</certificateFile>
+            <privateKeyFile>/etc/ch/server.key</privateKeyFile>
+            <caConfig>/etc/ch/ca.crt</caConfig>
+            <verificationMode>none</verificationMode>
+        </server>
+        <client>
+            <caConfig>/etc/ch/ca.crt</caConfig>
+            <verificationMode>relaxed</verificationMode>
+        </client>
+    </openSSL>
+</clickhouse>
+";
+
+/// **C12: 1 Keeper host, or from 3 to 9, none a ClickHouse host.** One is
+/// accepted with a warning on `keepers`; 2 and 10 are refused; 3 and 4
+/// are accepted with none.
 #[test]
 fn c12_keeper_count_and_overlap() {
-    let two = with(example(), &[("keepers", "kp1\nkp2")]);
+    let one = with(example(), &[("keepers", "kp1")]);
+    assert!(refusals(&one).is_none(), "{:?}", refusals(&one));
     assert_eq!(
-        field_messages(&two, "keepers"),
-        ["give from 3 to 9 Keeper hosts"]
+        warnings(&one),
+        [("keepers".to_string(), ONE_KEEPER.to_string())]
     );
+    for refused in [
+        "kp1\nkp2",
+        "kp1\nkp2\nkp3\nkp4\nkp5\nkp6\nkp7\nkp8\nkp9\nkp10",
+    ] {
+        assert_eq!(
+            field_messages(&with(example(), &[("keepers", refused)]), "keepers"),
+            [KEEPERS_REFUSED],
+            "{refused:?}"
+        );
+    }
+    let three = example();
+    assert!(warnings(&three).is_empty(), "{:?}", warnings(&three));
     let four = with(example(), &[("keepers", "kp1\nkp2\nkp3\nkp4")]);
     assert!(refusals(&four).is_none(), "{:?}", refusals(&four));
+    assert!(warnings(&four).is_empty(), "{:?}", warnings(&four));
     assert_eq!(
         files(&four)
             .keys()
@@ -671,6 +734,36 @@ fn c12_keeper_count_and_overlap() {
         field_messages(&overlap, "keepers"),
         ["ch1 is also a ClickHouse host: Keeper runs on its own hosts"]
     );
+}
+
+/// **C12b: a bundle for 1 Keeper host.** One Keeper file, holding a Raft
+/// group of exactly one member; each server's config names that one
+/// Keeper; `setup.md` says "1 Keeper host" and carries the warning, which
+/// a 3-Keeper `setup.md` does not.
+#[test]
+fn c12b_one_keeper_bundle() {
+    let one = files(&with(example(), &[("keepers", "kp1")]));
+    let keeper_files: Vec<&String> = one.keys().filter(|p| p.starts_with("keepers/")).collect();
+    assert_eq!(keeper_files, ["keepers/1/keeper_config.xml"]);
+    let keeper = file(&one, "keepers/1/keeper_config.xml");
+    assert_eq!(
+        keeper.matches("<server>\n                <id>").count(),
+        1,
+        "{keeper}"
+    );
+    assert_eq!(keeper, KEEPER_ONE);
+    let cluster = file(&one, "nodes/1/config.d/pulsus-cluster.xml");
+    let zookeeper = &cluster[cluster.find("<zookeeper>").expect("a zookeeper block")
+        ..cluster.find("</zookeeper>").expect("the block closes")];
+    assert_eq!(zookeeper.matches("<node>").count(), 1, "{zookeeper}");
+    assert!(zookeeper.contains("<host>kp1</host>"), "{zookeeper}");
+    let md = file(&one, "setup.md");
+    assert!(md.contains(", 1 Keeper host, "), "{md}");
+    assert!(md.contains(ONE_KEEPER), "{md}");
+    let three = files(&example());
+    let md = file(&three, "setup.md");
+    assert!(md.contains(", 3 Keeper hosts, "), "{md}");
+    assert!(!md.contains("no fault tolerance"), "{md}");
 }
 
 /// **C15: no memory, thread or cache setting is written.**
@@ -832,7 +925,7 @@ fn c16_bounds() {
     assert!(field_messages(&with(example(), &[("keepers", &nine)]), "keepers").is_empty());
     assert_eq!(
         field_messages(&with(example(), &[("keepers", &ten)]), "keepers"),
-        ["give from 3 to 9 Keeper hosts"]
+        [KEEPERS_REFUSED]
     );
 
     // W2 and W10 after lowercasing.
@@ -1213,4 +1306,387 @@ fn a_nested_new_destination_is_written() {
     want.sort();
     assert_eq!(files_under(&dir), want);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Every variable the bundle tells a host to set from a secret store.
+const SECRET_VARS: [&str; 7] = [
+    "CLICKHOUSE_INTERSERVER_SECRET",
+    "PULSUS_CLICKHOUSE_PASSWORD",
+    "PULSUS_S3_ACCESS_KEY_ID",
+    "PULSUS_S3_SECRET_ACCESS_KEY",
+    "CLICKHOUSE_AUTH",
+    "PULSUS_ADMIN_PASSWORD",
+    "PULSUS_AUTH_PASSWORD",
+];
+
+/// Each value `text` assigns to `name`, as `name=value` (an env file) or
+/// `name: value` (a Kubernetes Secret), to the end of its line.
+fn assigned<'a>(text: &'a str, name: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        for sep in ["=", ": "] {
+            if let Some(value) = line.strip_prefix(&format!("{name}{sep}")) {
+                out.push(value);
+            }
+        }
+    }
+    out
+}
+
+/// **Step 2 says how to set each ClickHouse host's variables**, by
+/// systemd, Docker and Kubernetes, naming the object store's two only
+/// when there is a remote URL; step 5 does the same for PulsusDB's.
+#[test]
+fn the_steps_say_how_to_set_the_variables() {
+    let ch_always = [
+        "CLICKHOUSE_INTERSERVER_SECRET",
+        "PULSUS_CLICKHOUSE_PASSWORD",
+    ];
+    let s3 = ["PULSUS_S3_ACCESS_KEY_ID", "PULSUS_S3_SECRET_ACCESS_KEY"];
+    for (name, pairs, with_s3) in [
+        ("remote", example(), true),
+        ("no remote", no_remote(), false),
+    ] {
+        let files = files(&pairs);
+        let md = file(&files, "setup.md");
+        for id in ["2", "5"] {
+            let step = section(md, id);
+            for needle in [
+                "How to set them",
+                "install -m 600",
+                "systemctl edit",
+                "EnvironmentFile=",
+                "sudo systemctl ",
+                "--env-file",
+                "env_file:",
+                "kind: Secret",
+                "envFrom:",
+            ] {
+                assert!(
+                    step.contains(needle),
+                    "{name}: step {id} lacks {needle:?}: {step}"
+                );
+            }
+        }
+        let step2 = section(md, "2");
+        for var in ch_always {
+            assert_eq!(assigned(step2, var).len(), 2, "{name}: {var}: {step2}");
+        }
+        for var in s3 {
+            let want = if with_s3 { 2 } else { 0 };
+            assert_eq!(assigned(step2, var).len(), want, "{name}: {var}: {step2}");
+            if !with_s3 {
+                assert!(!step2.contains(var), "{name}: {var}: {step2}");
+            }
+        }
+        let step5 = section(md, "5");
+        for var in ["CLICKHOUSE_AUTH", "PULSUS_ADMIN_PASSWORD"] {
+            assert_eq!(assigned(step5, var).len(), 2, "{name}: {var}: {step5}");
+        }
+        assert!(!step5.contains("PULSUS_S3_"), "{name}: {step5}");
+    }
+}
+
+/// **No secret value is in any file**: every value the bundle gives a
+/// secret variable is a `<…>` placeholder or a reference to the shell's
+/// own variable, and each is given at least once, so the scan has
+/// something to read.
+#[test]
+fn no_file_holds_a_secret_value() {
+    let placeholder = |v: &str| {
+        let v = v.trim_matches('"');
+        v.starts_with('<') || v.starts_with("pulsus:<") || v == "pulsus:$PULSUS_CLICKHOUSE_PASSWORD"
+    };
+    let files = files(&example());
+    for var in SECRET_VARS {
+        let mut seen = 0;
+        for (path, content) in &files {
+            for value in assigned(content, var) {
+                seen += 1;
+                assert!(placeholder(value), "{path}: {var} is given {value:?}");
+            }
+        }
+        assert!(seen >= 2, "{var} is given {seen} times");
+    }
+}
+
+/// `setup.md`'s part `## {title}`, to the next `## ` heading.
+fn part<'a>(md: &'a str, title: &str) -> &'a str {
+    let head = format!("\n## {title}\n");
+    let start = md
+        .find(&head)
+        .unwrap_or_else(|| panic!("no {title} in {md}"))
+        + head.len();
+    let rest = &md[start..];
+    &rest[..rest.find("\n## ").unwrap_or(rest.len())]
+}
+
+/// The row for `path` in setup.md's "Where each file goes" table, as
+/// (host, destination), the destination without its backquotes.
+fn destination(md: &str, path: &str) -> Option<(String, String)> {
+    let table = part(md, "Where each file goes");
+    let head = format!("| `{path}` | ");
+    let rows: Vec<&str> = table.lines().filter(|l| l.starts_with(&head)).collect();
+    assert!(rows.len() <= 1, "{path} has {} rows", rows.len());
+    let cells: Vec<&str> = rows.first()?.split(" | ").collect();
+    Some((cells[1].to_string(), cells[2].trim_matches('`').to_string()))
+}
+
+/// **Every file in the bundle has its destination in setup.md**: the
+/// host and the exact path, checked against this test's own mapping.
+#[test]
+fn setup_md_says_where_every_file_goes() {
+    let pairs = example();
+    let v = validated(&pairs);
+    let files = files(&pairs);
+    let md = file(&files, "setup.md");
+    let step4 = "the machine that runs step 4";
+    for path in files.keys() {
+        let want = if let Some(rest) = path.strip_prefix("nodes/") {
+            let (i, rest) = rest.split_once('/').unwrap();
+            let host = v.hosts[i.parse::<usize>().unwrap() - 1].clone();
+            (host, format!("/etc/clickhouse-server/{rest}"))
+        } else if let Some(rest) = path.strip_prefix("keepers/") {
+            let (j, _) = rest.split_once('/').unwrap();
+            let host = v.keepers[j.parse::<usize>().unwrap() - 1].clone();
+            (host, "/etc/clickhouse-keeper/keeper_config.xml".to_string())
+        } else if path == "pulsusdb.env" {
+            (
+                "the PulsusDB host".to_string(),
+                "/etc/pulsusdb/pulsusdb.env".to_string(),
+            )
+        } else if [
+            "schema.env",
+            "schema-rendered.sql",
+            "schema/schema.sh",
+            "schema/schema.sql",
+            "setup.md",
+        ]
+        .contains(&path.as_str())
+        {
+            (step4.to_string(), format!("pulsus-bundle/{path}"))
+        } else {
+            panic!("this test has no destination for {path}");
+        };
+        assert_eq!(destination(md, path), Some(want), "{path}");
+    }
+}
+
+/// **Each step gives the copy commands, owners and modes.**
+#[test]
+fn the_steps_give_the_copy_commands() {
+    let pairs = example();
+    let v = validated(&pairs);
+    let bundle_files = files(&pairs);
+    let md = file(&bundle_files, "setup.md");
+    let bundle = part(md, "The bundle");
+    for needle in ["pulsus-bundle/", "/admin/api/v1/setup/bundle", "Download"] {
+        assert!(bundle.contains(needle), "{needle:?}: {bundle}");
+    }
+
+    let k1 = section(md, "K1");
+    for (j, kp) in v.keepers.iter().enumerate() {
+        let scp = format!("scp keepers/{}/keeper_config.xml {kp}:", j + 1);
+        assert!(k1.contains(&scp), "{scp}: {k1}");
+    }
+    for needle in [
+        "-o clickhouse -g clickhouse",
+        "/etc/clickhouse-keeper/keeper_config.xml",
+        "/var/lib/clickhouse-keeper/coordination/log",
+        "/var/lib/clickhouse-keeper/coordination/snapshots",
+        "systemctl enable --now clickhouse-keeper",
+        "/etc/ch/server.crt",
+        "/etc/ch/server.key",
+        "/etc/ch/ca.crt",
+    ] {
+        assert!(k1.contains(needle), "{needle:?}: {k1}");
+    }
+
+    let step1 = section(md, "1");
+    for (i, host) in v.hosts.iter().enumerate() {
+        let scp = format!("scp -r nodes/{} {host}:", i + 1);
+        assert!(step1.contains(&scp), "{scp}: {step1}");
+    }
+    for needle in [
+        "/etc/clickhouse-server/config.d/",
+        "/etc/clickhouse-server/users.d/",
+        "-m 640 -o clickhouse -g clickhouse",
+        "install -d -m 750 -o clickhouse -g clickhouse /var/lib/clickhouse/",
+        "/etc/ch/server.crt",
+        "/etc/ch/server.key",
+        "/etc/ch/ca.crt",
+    ] {
+        assert!(step1.contains(needle), "{needle:?}: {step1}");
+    }
+
+    assert!(
+        section(md, "4").contains("pulsus-bundle"),
+        "{}",
+        section(md, "4")
+    );
+    let step5 = section(md, "5");
+    assert!(
+        step5
+            .contains("install -m 640 -o root -g pulsusdb pulsusdb.env /etc/pulsusdb/pulsusdb.env"),
+        "{step5}"
+    );
+    let containers = part(md, "In containers");
+    for needle in [
+        "/etc/clickhouse-server/config.d/",
+        "/etc/clickhouse-server/users.d/",
+        "/etc/clickhouse-keeper/keeper_config.xml",
+        "/var/lib/clickhouse-keeper",
+        "/var/lib/clickhouse/",
+        "--env-file pulsusdb.env",
+        "Kubernetes",
+    ] {
+        assert!(containers.contains(needle), "{needle:?}: {containers}");
+    }
+
+    let plain = files(&no_tls());
+    let md = file(&plain, "setup.md");
+    assert!(
+        !section(md, "1").contains("/etc/ch/"),
+        "{}",
+        section(md, "1")
+    );
+    assert!(
+        !section(md, "K1").contains("/etc/ch/"),
+        "{}",
+        section(md, "K1")
+    );
+}
+
+/// **Each file's destination, as the page and the API show it**: `host:/path`
+/// for a file placed on a host, `<pulsusdb host>:` for `pulsusdb.env`,
+/// and where it is used for the rest; each agrees with setup.md's table.
+#[test]
+fn each_file_has_a_destination_label() {
+    let pairs = example();
+    let v = validated(&pairs);
+    let files = files(&pairs);
+    let label = |path: &str| pulsus_setup::destination_label(&v, path);
+    assert_eq!(
+        label("nodes/1/config.d/pulsus-cluster.xml"),
+        "ch1:/etc/clickhouse-server/config.d/pulsus-cluster.xml"
+    );
+    assert_eq!(
+        label("nodes/6/users.d/pulsus-user.xml"),
+        "ch6:/etc/clickhouse-server/users.d/pulsus-user.xml"
+    );
+    assert_eq!(
+        label("keepers/2/keeper_config.xml"),
+        "kp2:/etc/clickhouse-keeper/keeper_config.xml"
+    );
+    assert_eq!(
+        label("pulsusdb.env"),
+        "<pulsusdb host>:/etc/pulsusdb/pulsusdb.env"
+    );
+    assert_eq!(
+        label("schema.env"),
+        "on the machine you run step 4 from: pulsus-bundle/schema.env"
+    );
+    assert_eq!(
+        label("schema/schema.sh"),
+        "on the machine you run step 4 from: pulsus-bundle/schema/schema.sh"
+    );
+    let md = file(&files, "setup.md");
+    for path in files.keys() {
+        let (host, dest) = destination(md, path).unwrap_or_else(|| panic!("{path}"));
+        let got = label(path);
+        let want = if v.hosts.contains(&host) || v.keepers.contains(&host) {
+            format!("{host}:{dest}")
+        } else if path == "pulsusdb.env" {
+            format!("<pulsusdb host>:{dest}")
+        } else {
+            format!("on the machine you run step 4 from: {dest}")
+        };
+        assert_eq!(got, want, "{path}");
+    }
+}
+
+/// **W5: the local storage path is not `/` or a top-level system
+/// directory**, since step 1 changes its owner and mode.
+#[test]
+fn the_local_path_is_not_a_system_directory() {
+    let message = "must not be / or a top-level system directory such as /etc/ or /var/";
+    for bad in [
+        "/", "/etc/", "/usr/", "/bin/", "/var/", "/home/", "/root/", "/boot/", "/lib/",
+    ] {
+        assert_eq!(
+            field_messages(&with(example(), &[("local_path", bad)]), "local_path"),
+            [message],
+            "{bad}"
+        );
+    }
+    for good in ["/var/lib/clickhouse/", "/data/", "/srv/clickhouse/"] {
+        assert!(
+            field_messages(&with(example(), &[("local_path", good)]), "local_path").is_empty(),
+            "{good}"
+        );
+    }
+}
+
+/// **The PulsusDB host's step**: with TLS, each container example mounts
+/// the CA read-only, as `pulsusdb.env` names it; the packaged unit is
+/// enabled and started; and the optional data API login is in each
+/// example, with what happens without it.
+#[test]
+fn step5_mounts_the_ca_enables_the_unit_and_offers_the_data_login() {
+    let tls = files(&example());
+    let md = file(&tls, "setup.md");
+    let step5 = section(md, "5");
+    for needle in [
+        "-v /etc/ch/ca.crt:/etc/ch/ca.crt:ro",
+        "      - /etc/ch/ca.crt:/etc/ch/ca.crt:ro",
+        "mountPath: /etc/ch/ca.crt",
+        "readOnly: true",
+        "sudo systemctl enable --now pulsusdb",
+        "without them the query and ingest endpoints have no login",
+    ] {
+        assert!(step5.contains(needle), "{needle:?}: {step5}");
+    }
+    assert!(!step5.contains("systemctl restart pulsusdb"), "{step5}");
+    for var in ["PULSUS_AUTH_USER", "PULSUS_AUTH_PASSWORD"] {
+        assert_eq!(assigned(step5, var).len(), 2, "{var}: {step5}");
+    }
+    let containers = part(md, "In containers");
+    assert!(
+        containers.contains("PulsusDB: the CA at `/etc/ch/ca.crt`, read-only"),
+        "{containers}"
+    );
+
+    let plain = files(&no_tls());
+    let md = file(&plain, "setup.md");
+    let step5 = section(md, "5");
+    for needle in ["ca.crt", "mountPath"] {
+        assert!(!step5.contains(needle), "{needle:?}: {step5}");
+    }
+}
+
+/// **The files that stay in the bundle have exact modes**, in the table
+/// and in the fetch commands.
+#[test]
+fn bundle_files_have_exact_modes() {
+    let files = files(&example());
+    let md = file(&files, "setup.md");
+    let table = part(md, "Where each file goes");
+    for (path, mode) in [
+        ("schema.env", "0644"),
+        ("schema-rendered.sql", "0644"),
+        ("schema/schema.sh", "0755"),
+        ("schema/schema.sql", "0644"),
+        ("setup.md", "0644"),
+    ] {
+        let row = table
+            .lines()
+            .find(|l| l.starts_with(&format!("| `{path}` | ")))
+            .unwrap_or_else(|| panic!("no row for {path}"));
+        assert!(row.ends_with(&format!(" | yours, `{mode}` |")), "{row}");
+    }
+    let bundle = part(md, "The bundle");
+    for needle in ["chmod 644", "chmod 755 schema/schema.sh"] {
+        assert!(bundle.contains(needle), "{needle:?}: {bundle}");
+    }
 }

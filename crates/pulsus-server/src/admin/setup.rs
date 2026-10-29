@@ -9,7 +9,7 @@ use std::fmt::Write;
 use axum::Form;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use pulsus_setup::{FieldError, Inputs, Validated};
+use pulsus_setup::{FieldError, FieldWarning, Inputs, Validated};
 
 use super::html::{html_text, layout};
 
@@ -148,8 +148,9 @@ const KEEPERS: Field = Field {
     required: true,
     kind: Kind::Lines,
     help: "One ClickHouse Keeper host per line, an IPv4 address or a host name, for example \
-           kp1.example.com. From 3 to 9 hosts of their own: none may also be a ClickHouse host. \
-           Keeper commits on a majority, so 3 hosts survive one failure, as do 4; 5 survive two.",
+           kp1.example.com. 1 host, or from 3 to 9, of their own: none may also be a ClickHouse \
+           host. Keeper commits on a majority, so 1 host survives no failure, nor do 2, which are \
+           refused; 3 survive one failure, as do 4; 5 survive two.",
 };
 const CLUSTER: Field = Field {
     name: "cluster",
@@ -240,7 +241,9 @@ const REMOTE_URL: Field = Field {
            https://bucket.s3.eu-west-1.amazonaws.com/pulsus/. An http or https URL with a host and, \
            if given, a port from 1 to 65535, ending in /, with no user, query or fragment. Each host writes under \
            URL/shard/replica/. Leave blank for local disk only; then every \
-           \"days on object storage\" must be blank or 0.",
+           \"days on object storage\" must be blank or 0. The access key and secret are not \
+           entered here: give them to each ClickHouse server as the environment variables \
+           PULSUS_S3_ACCESS_KEY_ID and PULSUS_S3_SECRET_ACCESS_KEY (see step 2 of setup.md).",
 };
 const HARDWARE: [Field; 3] = [
     Field {
@@ -417,8 +420,18 @@ fn control(
     }
 }
 
-/// One field: its label, control, help, and every message refused against it.
-fn field(inputs: &Inputs, errors: &[FieldError], f: &Field) -> String {
+/// The warnings on `field`, each under it.
+fn warning_messages(warnings: &[FieldWarning], field: &str) -> String {
+    warnings
+        .iter()
+        .filter(|w| w.field == field)
+        .map(|w| format!("<p class=\"field-warning\">{}</p>", html_text(&w.message)))
+        .collect()
+}
+
+/// One field: its label, control, help, every message refused against
+/// it, and every warning on it.
+fn field(inputs: &Inputs, errors: &[FieldError], warnings: &[FieldWarning], f: &Field) -> String {
     let help_id = format!("h-{}", f.name);
     let required = if f.required {
         " <span class=\"req\" aria-hidden=\"true\">*</span>"
@@ -427,7 +440,7 @@ fn field(inputs: &Inputs, errors: &[FieldError], f: &Field) -> String {
     };
     format!(
         "<div class=\"field\"><label for=\"f-{name}\">{label}{required}</label>{control}\
-         <p class=\"help\" id=\"{help_id}\">{help}</p>{messages}</div>\n",
+         <p class=\"help\" id=\"{help_id}\">{help}</p>{messages}{warned}</div>\n",
         name = f.name,
         label = html_text(f.label),
         control = control(
@@ -441,6 +454,7 @@ fn field(inputs: &Inputs, errors: &[FieldError], f: &Field) -> String {
         ),
         help = html_text(f.help),
         messages = messages(errors, f.name),
+        warned = warning_messages(warnings, f.name),
     )
 }
 
@@ -475,6 +489,7 @@ const INTRO: &str = "<section class=\"intro\"><p>This form generates everything 
 /// The form with `inputs`' values, `errors` listed and under their
 /// fields, and `result`'s lines and files when every rule accepted.
 fn page(inputs: &Inputs, errors: &[FieldError], result: Option<&Validated>) -> String {
+    let warnings = result.map(|v| v.warnings.as_slice()).unwrap_or_default();
     let mut body = String::from(INTRO);
     if !errors.is_empty() {
         let count = if errors.len() == 1 {
@@ -519,12 +534,12 @@ fn page(inputs: &Inputs, errors: &[FieldError], result: Option<&Validated>) -> S
         "Which machines run ClickHouse and Keeper, and how the data is split and copied across them.",
     ));
     body.push_str("<div class=\"row cols-3\">");
-    body.push_str(&field(inputs, errors, &SHARDS));
-    body.push_str(&field(inputs, errors, &REPLICAS));
-    body.push_str(&field(inputs, errors, &CLUSTER));
+    body.push_str(&field(inputs, errors, warnings, &SHARDS));
+    body.push_str(&field(inputs, errors, warnings, &REPLICAS));
+    body.push_str(&field(inputs, errors, warnings, &CLUSTER));
     body.push_str("</div><div class=\"row cols-2\">");
-    body.push_str(&field(inputs, errors, &HOSTS));
-    body.push_str(&field(inputs, errors, &KEEPERS));
+    body.push_str(&field(inputs, errors, warnings, &HOSTS));
+    body.push_str(&field(inputs, errors, warnings, &KEEPERS));
     body.push_str("</div></fieldset>\n");
 
     body.push_str(&subsection(
@@ -536,7 +551,7 @@ fn page(inputs: &Inputs, errors: &[FieldError], result: Option<&Validated>) -> S
     body.push_str(&group_messages(errors, "tls"));
     body.push_str("<div class=\"row cols-3\">");
     for f in &TLS {
-        body.push_str(&field(inputs, errors, f));
+        body.push_str(&field(inputs, errors, warnings, f));
     }
     body.push_str("</div></fieldset>\n");
 
@@ -546,8 +561,8 @@ fn page(inputs: &Inputs, errors: &[FieldError], result: Option<&Validated>) -> S
         "Where each host keeps its data, and the object storage older data can move to.",
     ));
     body.push_str("<div class=\"row cols-2\">");
-    body.push_str(&field(inputs, errors, &LOCAL_PATH));
-    body.push_str(&field(inputs, errors, &REMOTE_URL));
+    body.push_str(&field(inputs, errors, warnings, &LOCAL_PATH));
+    body.push_str(&field(inputs, errors, warnings, &REMOTE_URL));
     body.push_str("</div></fieldset>\n");
 
     body.push_str(&subsection(
@@ -558,7 +573,7 @@ fn page(inputs: &Inputs, errors: &[FieldError], result: Option<&Validated>) -> S
     ));
     body.push_str("<div class=\"row cols-3\">");
     for f in &HARDWARE {
-        body.push_str(&field(inputs, errors, f));
+        body.push_str(&field(inputs, errors, warnings, f));
     }
     body.push_str("</div></fieldset>\n</section>\n");
 
@@ -570,7 +585,7 @@ fn page(inputs: &Inputs, errors: &[FieldError], result: Option<&Validated>) -> S
     );
     body.push_str(&group_messages(errors, "schema"));
     body.push_str("<div class=\"row cols-3\">");
-    body.push_str(&field(inputs, errors, &DATABASE));
+    body.push_str(&field(inputs, errors, warnings, &DATABASE));
     body.push_str("</div>\n");
     body.push_str(&subsection(
         "g-raw",
@@ -581,7 +596,7 @@ fn page(inputs: &Inputs, errors: &[FieldError], result: Option<&Validated>) -> S
     body.push_str(&group_messages(errors, "raw"));
     body.push_str("<div class=\"row cols-2\">");
     for f in &RAW {
-        body.push_str(&field(inputs, errors, f));
+        body.push_str(&field(inputs, errors, warnings, f));
     }
     body.push_str("</div></fieldset>\n");
 
@@ -729,14 +744,14 @@ fn result_html(inputs: &Inputs, v: &Validated) -> String {
     let files = pulsus_setup::bundle(v);
     let mut out = format!(
         "<section class=\"summary good\" id=\"result\"><h2>Generated {} files</h2>\
-         <p>For {} ClickHouse hosts in {} shards of {} replicas, and {} Keeper hosts. \
+         <p>For {} ClickHouse hosts in {} shards of {} replicas, and {}. \
          Start with <a href=\"#file-setup.md\">setup.md</a>: it walks through every step.</p>\
          <h3>What the schema keeps</h3><ul class=\"totals\">",
         files.len(),
         v.hosts.len(),
         v.shards,
         v.replicas,
-        v.keepers.len()
+        pulsus_setup::keeper_hosts(v)
     );
     for line in pulsus_setup::total_lines(v) {
         let _ = write!(out, "<li>{}</li>", html_text(&line));
@@ -771,9 +786,12 @@ fn result_html(inputs: &Inputs, v: &Validated) -> String {
         let path = html_text(&f.path);
         let open = if f.path == "setup.md" { " open" } else { "" };
         let lines = f.content.lines().count();
+        let dest = html_text(&pulsus_setup::destination_label(v, &f.path));
         let _ = writeln!(
             out,
-            "<article class=\"card file\" id=\"file-{path}\"><header><code>{path}</code>\
+            "<article class=\"card file\" id=\"file-{path}\"><header><div class=\"where\">\
+             <span class=\"dest\">{dest}</span>\
+             <span class=\"in-bundle\">in the bundle: {path}</span></div>\
              <span class=\"size\">{lines} lines</span>\
              <button type=\"submit\" name=\"file\" value=\"{path}\">Download</button></header>\
              <details{open}><summary>Show contents</summary><pre>{}</pre></details></article>",
@@ -834,6 +852,22 @@ mod tests {
             errors[0].message,
             "PULSUS_ROLLUP_RANGES: 30 is shorter than its level 60"
         );
+    }
+
+    /// The object storage URL's help says where the access key and secret
+    /// go: not on the form, but in each server's environment.
+    #[test]
+    fn the_remote_url_help_says_where_the_s3_key_goes() {
+        let page = page(&Inputs::from_pairs(starting_values()), &[], None);
+        let help = html_text(
+            "The access key and secret are not entered here: give them to each ClickHouse \
+             server as the environment variables PULSUS_S3_ACCESS_KEY_ID and \
+             PULSUS_S3_SECRET_ACCESS_KEY (see step 2 of setup.md).",
+        );
+        let at = page.find("id=\"h-remote_url\"").expect("the URL's help");
+        let rest = &page[at..];
+        let text = &rest[..rest.find("</p>").expect("the help closes")];
+        assert!(text.contains(&help), "{text}");
     }
 
     /// Every field the server reads is on the form, under its own name.

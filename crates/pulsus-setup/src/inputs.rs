@@ -49,6 +49,14 @@ pub struct FieldError {
     pub message: String,
 }
 
+/// A warning: the form field and the message shown under it. The inputs
+/// are accepted and the bundle is generated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FieldWarning {
+    pub field: String,
+    pub message: String,
+}
+
 /// The certificate, key and CA paths, the same on every host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tls {
@@ -98,6 +106,8 @@ pub struct Validated {
     pub raw_local_days: u64,
     pub raw_remote_days: u64,
     pub levels: Vec<LevelRow>,
+    /// What the form warns about inputs it accepted.
+    pub warnings: Vec<FieldWarning>,
     /// The schema variables, `schema.env`'s lines.
     pub vars: BTreeMap<&'static str, String>,
     pub ctx: RenderCtx,
@@ -118,6 +128,14 @@ impl Validated {
 }
 
 const NOT_A_HOST: &str = "is not an IPv4 address or a host name";
+/// W11's warning for a single Keeper host.
+const ONE_KEEPER: &str = "One Keeper host: no fault tolerance. If it is down, writes to \
+     replicated tables and schema changes stop until it is back.";
+/// W5: `/` and the top-level system directories, without their final `/`.
+const SYSTEM_DIRS: [&str; 21] = [
+    "", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64", "/media", "/mnt",
+    "/opt", "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/tmp", "/usr", "/var",
+];
 const DAYS_MAX: u64 = 4_294_967_295;
 
 /// `text` as digits only, at most `digits` of them, from `lo` to `hi`.
@@ -318,8 +336,19 @@ pub fn validate(inputs: &Inputs) -> Result<Validated, Vec<FieldError>> {
         }
         seen.push(keeper);
     }
-    if !(3..=9).contains(&keepers.len()) {
-        refuse(e, "keepers", "give from 3 to 9 Keeper hosts".to_string());
+    // 2 hosts survive no failure, the same as 1, so 2 is refused.
+    let mut warnings = Vec::new();
+    match keepers.len() {
+        1 => warnings.push(FieldWarning {
+            field: "keepers".to_string(),
+            message: ONE_KEEPER.to_string(),
+        }),
+        3..=9 => {}
+        _ => refuse(
+            e,
+            "keepers",
+            "give 1 Keeper host, or from 3 to 9".to_string(),
+        ),
     }
 
     // W13.
@@ -368,6 +397,13 @@ pub fn validate(inputs: &Inputs) -> Result<Validated, Vec<FieldError>> {
             e,
             "local_path",
             "must be an absolute directory ending in /, of letters, digits, . _ / -".to_string(),
+        );
+    } else if SYSTEM_DIRS.contains(&local_path.trim_end_matches('/')) {
+        // Step 1 makes it owned by `clickhouse`, mode 750.
+        refuse(
+            e,
+            "local_path",
+            "must not be / or a top-level system directory such as /etc/ or /var/".to_string(),
         );
     }
 
@@ -467,6 +503,7 @@ pub fn validate(inputs: &Inputs) -> Result<Validated, Vec<FieldError>> {
         raw_local_days,
         raw_remote_days,
         levels,
+        warnings,
         vars,
         ctx,
     })
