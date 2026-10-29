@@ -160,7 +160,9 @@ button.primary:hover { background: var(--accent-dark); color: #fff; }
 .file-group { margin: 1.5rem 0 0.5rem; color: var(--muted); font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.04em; }
 .file { margin-bottom: 0.6rem; overflow: hidden; }
 .file > header { display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem 1rem; }
-.file > header code { font-family: var(--mono); font-weight: 600; flex: 1; word-break: break-all; }
+.file .where { flex: 1; display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; }
+.file .dest { font-family: var(--mono); font-weight: 600; word-break: break-all; }
+.file .in-bundle { color: var(--muted); font-family: var(--mono); font-size: 0.8rem; word-break: break-all; }
 .file .size { color: var(--muted); font-size: 0.85rem; }
 .file details { border-top: 1px solid var(--line); }
 .file summary { cursor: pointer; padding: 0.45rem 1rem; color: var(--accent); font-size: 0.9rem; }

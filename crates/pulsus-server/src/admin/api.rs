@@ -74,7 +74,13 @@ pub(crate) async fn setup_validate(body: Bytes) -> Response {
 pub(crate) async fn setup_bundle(body: Bytes) -> Response {
     match setup_validated(&body) {
         Ok(v) => {
-            let files = pulsus_setup::bundle(&v);
+            let files: Vec<serde_json::Value> = pulsus_setup::bundle(&v)
+                .into_iter()
+                .map(|f| {
+                    let destination = pulsus_setup::destination_label(&v, &f.path);
+                    json!({ "path": f.path, "destination": destination, "content": f.content })
+                })
+                .collect();
             Json(json!({ "totals": v.totals(), "warnings": v.warnings, "files": files }))
                 .into_response()
         }

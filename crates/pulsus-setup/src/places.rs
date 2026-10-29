@@ -39,9 +39,20 @@ pub(crate) const PULSUSDB_ENV_OWNER: &str = "root:pulsusdb";
 /// The packaged unit's name (`packaging/nfpm.yaml`).
 pub(crate) const PULSUSDB_UNIT: &str = "pulsusdb";
 
-/// One row of "Where each file goes": the host, the destination and the
-/// owner and mode, for bundle file `path`.
-pub(crate) fn destination(v: &Validated, path: &str) -> (String, String, String) {
+/// Which machine a bundle file goes to.
+pub(crate) enum Host {
+    /// A ClickHouse or Keeper host, by its name on the form.
+    Named(String),
+    /// The host PulsusDB runs on.
+    Pulsusdb,
+    /// The machine `setup.md`'s step 4 runs from: the file stays in the
+    /// bundle.
+    Step4,
+}
+
+/// Where bundle file `path` goes: the host, the destination, and the owner
+/// and mode there. `setup.md`'s table and [`label`] both read this.
+pub(crate) fn destination(v: &Validated, path: &str) -> (Host, String, String) {
     let ch = format!("`{CH_OWNER}:{CH_OWNER}`, `640`");
     let host = |rest: &str, hosts: &[String]| -> Option<(String, String)> {
         let (n, rest) = rest.split_once('/')?;
@@ -56,17 +67,17 @@ pub(crate) fn destination(v: &Validated, path: &str) -> (String, String, String)
         } else {
             format!("/etc/clickhouse-server/{rest}")
         };
-        return (name, dir, ch);
+        return (Host::Named(name), dir, ch);
     }
     if let Some((name, _)) = path
         .strip_prefix("keepers/")
         .and_then(|r| host(r, &v.keepers))
     {
-        return (name, KEEPER_CONFIG.to_string(), ch);
+        return (Host::Named(name), KEEPER_CONFIG.to_string(), ch);
     }
     if path == "pulsusdb.env" {
         return (
-            "the PulsusDB host".to_string(),
+            Host::Pulsusdb,
             PULSUSDB_ENV.to_string(),
             format!("`{PULSUSDB_ENV_OWNER}`, `640`"),
         );
@@ -77,8 +88,28 @@ pub(crate) fn destination(v: &Validated, path: &str) -> (String, String, String)
         "yours"
     };
     (
-        "the machine that runs step 4".to_string(),
+        Host::Step4,
         format!("{BUNDLE_DIR}/{path}"),
         mode.to_string(),
     )
+}
+
+/// The host column of `setup.md`'s table.
+pub(crate) fn host_cell(host: &Host) -> String {
+    match host {
+        Host::Named(name) => name.clone(),
+        Host::Pulsusdb => "the PulsusDB host".to_string(),
+        Host::Step4 => "the machine that runs step 4".to_string(),
+    }
+}
+
+/// Where `path` goes as the page and the API show it: `host:/path`, or
+/// where the file is used.
+pub(crate) fn label(v: &Validated, path: &str) -> String {
+    let (host, dest, _) = destination(v, path);
+    match host {
+        Host::Named(name) => format!("{name}:{dest}"),
+        Host::Pulsusdb => format!("<pulsusdb host>:{dest}"),
+        Host::Step4 => format!("on the machine you run step 4 from: {dest}"),
+    }
 }

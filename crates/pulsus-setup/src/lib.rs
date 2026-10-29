@@ -156,8 +156,8 @@ pub fn total_lines(v: &Validated) -> Vec<String> {
 
 /// Where bundle file `path` goes, as the page and the API show it:
 /// `host:/path` for a file placed on a host, else where it is used.
-pub fn destination_label(_v: &Validated, _path: &str) -> String {
-    String::new()
+pub fn destination_label(v: &Validated, path: &str) -> String {
+    places::label(v, path)
 }
 
 /// "1 Keeper host", or "N Keeper hosts".

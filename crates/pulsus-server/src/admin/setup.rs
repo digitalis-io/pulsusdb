@@ -786,9 +786,12 @@ fn result_html(inputs: &Inputs, v: &Validated) -> String {
         let path = html_text(&f.path);
         let open = if f.path == "setup.md" { " open" } else { "" };
         let lines = f.content.lines().count();
+        let dest = html_text(&pulsus_setup::destination_label(v, &f.path));
         let _ = writeln!(
             out,
-            "<article class=\"card file\" id=\"file-{path}\"><header><code>{path}</code>\
+            "<article class=\"card file\" id=\"file-{path}\"><header><div class=\"where\">\
+             <span class=\"dest\">{dest}</span>\
+             <span class=\"in-bundle\">in the bundle: {path}</span></div>\
              <span class=\"size\">{lines} lines</span>\
              <button type=\"submit\" name=\"file\" value=\"{path}\">Download</button></header>\
              <details{open}><summary>Show contents</summary><pre>{}</pre></details></article>",

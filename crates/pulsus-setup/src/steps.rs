@@ -6,7 +6,7 @@ use std::fmt::Write;
 use crate::Validated;
 use crate::places::{
     BUNDLE_DIR, CH_CONFIG_D, CH_OWNER, CH_USERS_D, KEEPER_CONFIG, KEEPER_DATA, KEEPER_UNIT,
-    PULSUSDB_ENV, PULSUSDB_ENV_OWNER, PULSUSDB_UNIT, SERVER_UNIT, destination,
+    PULSUSDB_ENV, PULSUSDB_ENV_OWNER, PULSUSDB_UNIT, SERVER_UNIT, destination, host_cell,
 };
 use crate::server_xml::{KEEPER_LOG, KEEPER_SNAPSHOTS};
 use crate::vars::http_port;
@@ -111,6 +111,7 @@ fn bundle_part(out: &mut String, v: &Validated, paths: &[String]) {
     );
     for path in paths.iter().map(String::as_str).chain(["setup.md"]) {
         let (host, dest, mode) = destination(v, path);
+        let host = host_cell(&host);
         let _ = writeln!(out, "| `{path}` | {host} | `{dest}` | {mode} |");
     }
     let tls = v
