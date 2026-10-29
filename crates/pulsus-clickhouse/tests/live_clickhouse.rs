@@ -143,6 +143,94 @@ async fn insert_block_then_query_stream_round_trips_rows() {
     assert!(got[1].fingerprint > (1u64 << 63));
 }
 
+/// The client decodes only LZ4 replies, and from ClickHouse 26.10 a
+/// `compress=1` reply uses `network_compression_method`, which defaults to
+/// ZSTD there. Without that the
+/// pool's connect probe fails with `incorrect magic number` and PulsusDB
+/// never becomes ready.
+///
+/// It connects through the pool as a user whose own settings default the
+/// codec to ZSTD, inserts a block and reads it back as a stream. It is a gate
+/// only on 26.10 or newer: 26.8.21.10 answers `compress=1` with LZ4 whatever
+/// `network_compression_method` says, so there it passes either way. The
+/// hermetic half, which bites on every version, is
+/// `tests/reply_compression.rs`.
+#[tokio::test]
+async fn a_user_whose_replies_default_to_zstd_still_connects_queries_and_inserts() {
+    skip_unless_live!();
+    let admin = ChClient::new(test_config())
+        .await
+        .expect("connect as admin");
+    let cfg = test_config();
+    let table = pulsus_testkit::test_ident("pulsus_clickhouse_it_zstd_default");
+    let user = pulsus_testkit::test_ident("pulsus_clickhouse_it_zstd_user");
+    // Dropped before it is created, so a run that stopped early leaves
+    // nothing the next run trips on.
+    for stmt in [
+        format!("DROP USER IF EXISTS {user}"),
+        format!("DROP TABLE IF EXISTS {table}"),
+        format!(
+            "CREATE TABLE {table} (fingerprint UInt64, unix_milli Int64, value Float64) \
+             ENGINE = MergeTree ORDER BY (fingerprint, unix_milli)"
+        ),
+        format!(
+            "CREATE USER {user} IDENTIFIED WITH no_password \
+             SETTINGS network_compression_method = 'ZSTD'"
+        ),
+        format!("GRANT SELECT, INSERT ON {}.{table} TO {user}", cfg.database),
+    ] {
+        admin
+            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e:?}"));
+    }
+
+    let client = ChClient::new(ChConnConfig {
+        user: user.clone(),
+        ..test_config()
+    })
+    .await
+    .expect("the pool connects as a user whose replies default to ZSTD");
+    let rows = vec![
+        TestRow {
+            fingerprint: 7,
+            unix_milli: 1_700_000_000_000,
+            value: 0.5,
+        },
+        TestRow {
+            fingerprint: 8,
+            unix_milli: 1_700_000_000_100,
+            value: 1.5,
+        },
+    ];
+    client
+        .insert_block(&table, &rows)
+        .await
+        .expect("insert as the ZSTD-default user");
+    let sql = format!("SELECT fingerprint, unix_milli, value FROM {table} ORDER BY fingerprint");
+    let mut stream = client
+        .query_stream::<TestRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query_stream as the ZSTD-default user");
+    use futures::StreamExt;
+    let mut got = Vec::new();
+    while let Some(row) = stream.next().await {
+        got.push(row.expect("row decode"));
+    }
+    drop(stream);
+    assert_eq!(got, rows);
+
+    for stmt in [
+        format!("DROP USER IF EXISTS {user}"),
+        format!("DROP TABLE IF EXISTS {table}"),
+    ] {
+        admin
+            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e:?}"));
+    }
+}
+
 /// Issue #382: a server exception raised after the query has already
 /// written output must still classify by its numeric code, so a scan
 /// budget stays a 422 `query_too_broad` and never becomes a 500.
