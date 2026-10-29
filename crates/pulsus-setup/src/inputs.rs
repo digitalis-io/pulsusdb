@@ -131,6 +131,11 @@ const NOT_A_HOST: &str = "is not an IPv4 address or a host name";
 /// W11's warning for a single Keeper host.
 const ONE_KEEPER: &str = "One Keeper host: no fault tolerance. If it is down, writes to \
      replicated tables and schema changes stop until it is back.";
+/// W5: `/` and the top-level system directories, without their final `/`.
+const SYSTEM_DIRS: [&str; 21] = [
+    "", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64", "/media", "/mnt",
+    "/opt", "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/tmp", "/usr", "/var",
+];
 const DAYS_MAX: u64 = 4_294_967_295;
 
 /// `text` as digits only, at most `digits` of them, from `lo` to `hi`.
@@ -392,6 +397,13 @@ pub fn validate(inputs: &Inputs) -> Result<Validated, Vec<FieldError>> {
             e,
             "local_path",
             "must be an absolute directory ending in /, of letters, digits, . _ / -".to_string(),
+        );
+    } else if SYSTEM_DIRS.contains(&local_path.trim_end_matches('/')) {
+        // Step 1 makes it owned by `clickhouse`, mode 750.
+        refuse(
+            e,
+            "local_path",
+            "must not be / or a top-level system directory such as /etc/ or /var/".to_string(),
         );
     }
 

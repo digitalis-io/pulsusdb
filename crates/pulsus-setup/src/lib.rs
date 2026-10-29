@@ -140,9 +140,10 @@ fn write_files(dir: &Path, files: &[File]) -> std::io::Result<()> {
         }
         std::fs::write(&path, &f.content)?;
         #[cfg(unix)]
-        if f.path.ends_with(".sh") {
+        {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            let mode = places::bundle_mode(&f.path);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
         }
     }
     Ok(())

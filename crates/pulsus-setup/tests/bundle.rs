@@ -1357,7 +1357,7 @@ fn the_steps_say_how_to_set_the_variables() {
                 "install -m 600",
                 "systemctl edit",
                 "EnvironmentFile=",
-                "systemctl restart",
+                "sudo systemctl ",
                 "--env-file",
                 "env_file:",
                 "kind: Secret",

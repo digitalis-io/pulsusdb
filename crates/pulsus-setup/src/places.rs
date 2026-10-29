@@ -39,6 +39,12 @@ pub(crate) const PULSUSDB_ENV_OWNER: &str = "root:pulsusdb";
 /// The packaged unit's name (`packaging/nfpm.yaml`).
 pub(crate) const PULSUSDB_UNIT: &str = "pulsusdb";
 
+/// The mode of bundle file `path` where it is fetched to: `0755` for the
+/// schema script, which step 4 runs, `0644` for the rest.
+pub(crate) fn bundle_mode(path: &str) -> u32 {
+    if path.ends_with(".sh") { 0o755 } else { 0o644 }
+}
+
 /// Which machine a bundle file goes to.
 pub(crate) enum Host {
     /// A ClickHouse or Keeper host, by its name on the form.
@@ -82,11 +88,7 @@ pub(crate) fn destination(v: &Validated, path: &str) -> (Host, String, String) {
             format!("`{PULSUSDB_ENV_OWNER}`, `640`"),
         );
     }
-    let mode = if path.ends_with(".sh") {
-        "yours, executable"
-    } else {
-        "yours"
-    };
+    let mode = format!("yours, `{:04o}`", bundle_mode(path));
     (
         Host::Step4,
         format!("{BUNDLE_DIR}/{path}"),
