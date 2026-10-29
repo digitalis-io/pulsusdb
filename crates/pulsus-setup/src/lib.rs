@@ -10,6 +10,7 @@ use std::path::Path;
 use serde::Serialize;
 
 mod inputs;
+mod places;
 mod server_xml;
 mod steps;
 mod vars;
@@ -72,7 +73,11 @@ pub fn bundle(v: &Validated) -> Vec<File> {
     );
     add("pulsusdb.env".to_string(), vars::pulsusdb_env(v));
     let statements = pulsus_schema::rendered_statements(&v.ctx).len();
-    add("setup.md".to_string(), steps::setup_md(v, statements));
+    let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+    files.push(File {
+        path: "setup.md".to_string(),
+        content: steps::setup_md(v, statements, &paths),
+    });
     files
 }
 

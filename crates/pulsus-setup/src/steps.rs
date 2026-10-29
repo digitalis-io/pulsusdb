@@ -4,6 +4,11 @@
 use std::fmt::Write;
 
 use crate::Validated;
+use crate::places::{
+    BUNDLE_DIR, CH_CONFIG_D, CH_OWNER, CH_USERS_D, KEEPER_CONFIG, KEEPER_DATA, KEEPER_UNIT,
+    PULSUSDB_ENV, PULSUSDB_ENV_OWNER, PULSUSDB_UNIT, SERVER_UNIT, destination,
+};
+use crate::server_xml::{KEEPER_LOG, KEEPER_SNAPSHOTS};
 use crate::vars::http_port;
 
 /// The ceiling of every due time (docs/configuration.md §7).
@@ -75,6 +80,56 @@ pub(crate) fn keeper_hosts(v: &Validated) -> String {
     }
 }
 
+/// TLS: the form's three paths on each `kind` host, readable by the
+/// service's user; empty without TLS.
+fn tls_install(v: &Validated, kind: &str) -> String {
+    let Some(t) = &v.tls else {
+        return String::new();
+    };
+    let own = format!("-o {CH_OWNER} -g {CH_OWNER}");
+    format!(
+        " Then put the TLS files at the paths the form names, readable by `{CH_OWNER}`: on each {kind} host, with that host's own certificate and key,\n\n```sh\nsudo install -D -m 644 {own} <this host's certificate> {}\nsudo install -D -m 600 {own} <this host's private key> {}\nsudo install -D -m 644 {own} <the CA certificate> {}\n```",
+        t.cert, t.key, t.ca
+    )
+}
+
+/// The bundle, where each of its files goes, and the mount points in
+/// containers.
+fn bundle_part(out: &mut String, v: &Validated, paths: &[String]) {
+    let _ = write!(
+        out,
+        "\n## The bundle\n\nThe bundle is a directory: this file and every file in the table below, each at its path under `{BUNDLE_DIR}/`. Put it on the machine you run the steps from; it needs `ssh` and `scp` to every host, and step 4 runs there.\n\n\
+         - **From the setup page:** press each file's **Download** and save it at its path under `{BUNDLE_DIR}/` (the download is named with each `/` of the path written `_`).\n\
+         - **From the API:** `POST /admin/api/v1/setup/bundle` with the form's fields as a JSON object (`inputs.json` here) answers with `files`, each a `path` and its `content`. With `curl` and `jq`:\n\n\
+         ```sh\nmkdir {BUNDLE_DIR} && cd {BUNDLE_DIR}\n\
+         curl -s --fail-with-body -u \"admin:<admin password>\" -H 'Content-Type: application/json' --data-binary @../inputs.json \"<PulsusDB URL>/admin/api/v1/setup/bundle\" > ../bundle.json\n\
+         jq -r '.files[].path' ../bundle.json | while read -r p; do mkdir -p \"$(dirname \"$p\")\"; jq -j --arg p \"$p\" '.files[] | select(.path == $p) | .content' ../bundle.json > \"$p\"; done\n\
+         chmod +x schema/schema.sh\n```\n"
+    );
+    out.push_str(
+        "\n## Where each file goes\n\n| File | Host | Destination | Owner and mode |\n|---|---|---|---|\n",
+    );
+    for path in paths.iter().map(String::as_str).chain(["setup.md"]) {
+        let (host, dest, mode) = destination(v, path);
+        let _ = writeln!(out, "| `{path}` | {host} | `{dest}` | {mode} |");
+    }
+    let tls = v
+        .tls
+        .as_ref()
+        .map(|t| {
+            format!(
+                " On both, the certificate at `{}`, the key at `{}` and the CA at `{}`.",
+                t.cert, t.key, t.ca
+            )
+        })
+        .unwrap_or_default();
+    let _ = writeln!(
+        out,
+        "\n## In containers\n\nIn Docker or Kubernetes, mount each file read-only at its destination above instead of copying it. ClickHouse server: each file of `nodes/<position>/config.d/` in `{CH_CONFIG_D}` and of `nodes/<position>/users.d/` in `{CH_USERS_D}`, and a volume at `{}` for its data. Keeper: `keepers/<position>/keeper_config.xml` at `{KEEPER_CONFIG}`, and a volume at `{KEEPER_DATA}` for its log and snapshots.{tls} PulsusDB: no file is mounted; pass `--env-file pulsusdb.env` (compose `env_file:`). On Kubernetes, put each host's files in a ConfigMap and the TLS files in a Secret, mount each file with `subPath` at its path, and read the variables of steps 2 and 5 from their Secrets with `envFrom`.",
+        v.local_path
+    );
+}
+
 /// Where one service's variables go: its systemd unit, the root-only file
 /// that holds them, the bundle's own env file read beside it, if any, and
 /// the Kubernetes Secret's name.
@@ -103,20 +158,13 @@ fn how_to_set(out: &mut String, t: &EnvTarget) {
     let base = t.file.rsplit('/').next().unwrap_or(t.file);
     let (unit, file, secret) = (t.unit, t.file, t.secret);
     let dir = file.rsplit_once('/').map(|(d, _)| d).unwrap_or("/");
-    let copy = t
-        .also
-        .map(|a| format!("sudo install -m 644 {a} {dir}/{a}\n"))
-        .unwrap_or_default();
     let _ = write!(
         out,
         "\nHow to set them, with your own values in place of each `<…>`. Keep the values in your secret store, not in the bundle.\n\n\
          **systemd:** a file only root can read, named in an override of the unit, then a restart:\n\n\
-         ```sh\nsudo install -d {dir}\n{copy}sudo install -m 600 -o root -g root /dev/null {file}\nsudo tee {file} > /dev/null <<'EOF'\n{env_lines}EOF\nsudo systemctl edit {unit}\n```\n\n\
+         ```sh\nsudo install -d {dir}\nsudo install -m 600 -o root -g root /dev/null {file}\nsudo tee {file} > /dev/null <<'EOF'\n{env_lines}EOF\nsudo systemctl edit {unit}\n```\n\n\
          In the editor `systemctl edit` opens, add:\n\n```ini\n[Service]\n"
     );
-    if let Some(also) = t.also {
-        let _ = writeln!(out, "EnvironmentFile={dir}/{also}");
-    }
     let _ = write!(
         out,
         "EnvironmentFile={file}\n```\n\nThen:\n\n```sh\nsudo systemctl restart {unit}\n```\n\n\
@@ -154,8 +202,9 @@ fn sql_block(out: &mut String, id: &str, title: &str, sql: &str, expected: &str)
 }
 
 /// `setup.md`: §5.6 with every value filled in. `statements` is the
-/// number of statements the schema script sends.
-pub(crate) fn setup_md(v: &Validated, statements: usize) -> String {
+/// number of statements the schema script sends; `paths` is every other
+/// file of the bundle, in its order.
+pub(crate) fn setup_md(v: &Validated, statements: usize, paths: &[String]) -> String {
     let c = &v.cluster;
     let d = &v.ctx.db;
     let h = v.hosts.len();
@@ -212,30 +261,46 @@ pub(crate) fn setup_md(v: &Validated, statements: usize) -> String {
         let _ = writeln!(out, "| {label} | {value} |");
     }
 
-    out.push_str("\n## Steps\n");
-    let tls_files = v
-        .tls
-        .as_ref()
-        .map(|t| {
-            format!(
-                "the certificate at `{}`, the key at `{}` and the CA at `{}`",
-                t.cert, t.key, t.ca
-            )
-        })
-        .unwrap_or_default();
+    bundle_part(&mut out, v, paths);
 
+    out.push_str("\n## Steps\n");
+    let own = format!("-o {CH_OWNER} -g {CH_OWNER}");
     let _ = writeln!(
         out,
-        "\n### K1\n\nOn each Keeper host, install ClickHouse Keeper, replace its `keeper_config.xml` with `keepers/<position>/keeper_config.xml`{}, and start it. 4 GB of memory is generally enough for each Keeper server; keep its data directory on a low-latency disk.",
-        if v.tls.is_some() {
-            format!(", put {tls_files}")
-        } else {
-            String::new()
-        }
+        "\n### K1\n\nOn each Keeper host, install the ClickHouse Keeper package. 4 GB of memory is generally enough for each Keeper server; keep its data directory on a low-latency disk.{}",
+        tls_install(v, "Keeper")
     );
-    out.push_str(
-        "\n### 1\n\nOn each ClickHouse host, copy `nodes/<position>/config.d/*` into the server's `config.d/` directory and `nodes/<position>/users.d/*` into its `users.d/` directory.\n",
+    let _ = writeln!(
+        out,
+        "\nFrom `{BUNDLE_DIR}/`, put each host's `keeper_config.xml` at `{KEEPER_CONFIG}`, owned by `{CH_OWNER}`; make the data directories its config names, `{KEEPER_LOG}` and `{KEEPER_SNAPSHOTS}`, owned by `{CH_OWNER}`; then start Keeper and enable it at boot:\n\n```sh"
     );
+    for (j, kp) in v.keepers.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "scp keepers/{}/keeper_config.xml {kp}:keeper_config.xml\nssh {kp} 'sudo install -m 640 {own} keeper_config.xml {KEEPER_CONFIG} && sudo install -d -m 750 {own} {KEEPER_LOG} {KEEPER_SNAPSHOTS} && rm keeper_config.xml && sudo systemctl enable --now {KEEPER_UNIT}'",
+            j + 1
+        );
+    }
+    out.push_str("```\n");
+
+    let local = &v.local_path;
+    let _ = writeln!(
+        out,
+        "\n### 1\n\nOn each ClickHouse host, install the ClickHouse server package.{}",
+        tls_install(v, "ClickHouse")
+    );
+    let _ = writeln!(
+        out,
+        "\nFrom `{BUNDLE_DIR}/`, copy each host's `nodes/<position>/config.d/*` into `{CH_CONFIG_D}` and `nodes/<position>/users.d/*` into `{CH_USERS_D}`, owned by `{CH_OWNER}:{CH_OWNER}`, mode 640; and make the local storage path `{local}`, owned by `{CH_OWNER}`:\n\n```sh"
+    );
+    for (i, host) in v.hosts.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "scp -r nodes/{} {host}:pulsus-node\nssh {host} 'sudo install -d -m 750 {own} {local} && sudo install -m 640 {own} pulsus-node/config.d/* {CH_CONFIG_D} && sudo install -m 640 {own} pulsus-node/users.d/* {CH_USERS_D} && rm -r pulsus-node'",
+            i + 1
+        );
+    }
+    out.push_str("```\n");
     let mut env = vec![
         "`CLICKHOUSE_INTERSERVER_SECRET` (the same value on every host)",
         "`PULSUS_CLICKHOUSE_PASSWORD`",
@@ -252,18 +317,13 @@ pub(crate) fn setup_md(v: &Validated, statements: usize) -> String {
     }
     let _ = writeln!(
         out,
-        "\n### 2\n\nOn every ClickHouse host, set in the server's environment: {}.{}",
+        "\n### 2\n\nOn every ClickHouse host, set in the server's environment: {}.",
         env.join(", "),
-        if v.tls.is_some() {
-            format!(" Put {tls_files}.")
-        } else {
-            String::new()
-        }
     );
     how_to_set(
         &mut out,
         &EnvTarget {
-            unit: "clickhouse-server",
+            unit: SERVER_UNIT,
             file: "/etc/clickhouse-server/pulsus.env",
             also: None,
             secret: "pulsus-clickhouse",
@@ -315,7 +375,7 @@ pub(crate) fn setup_md(v: &Validated, statements: usize) -> String {
         .unwrap_or_default();
     let _ = write!(
         out,
-        "\n### 4\n\nSet `PULSUS_CLICKHOUSE_PASSWORD` in the shell from your secret store, as on the servers in step 2: the command stops without it. In the bundle's directory, on a machine with `sh`, `awk`, `cat`, `curl`, `cut`, `dirname`, `grep`, `mktemp`, `rm`, `sed`, `seq` and `sleep`{}:\n\n```sh\n: \"${{PULSUS_CLICKHOUSE_PASSWORD:?set it in this shell from your secret store: it is the pulsus user password of step 2}}\"\nset -a; . ./schema.env; set +a\nCLICKHOUSE_SERVER={} CLICKHOUSE_HTTP_PORT={p} CLICKHOUSE_AUTH=\"pulsus:$PULSUS_CLICKHOUSE_PASSWORD\"{tls_env} sh schema/schema.sh\n```\n\nExpected:\n\n```text\nschema.sh: all {h} hosts in cluster '{c}' answered\nschema.sh: {statements} statements applied to {d}\n```\n",
+        "\n### 4\n\nSet `PULSUS_CLICKHOUSE_PASSWORD` in the shell from your secret store, as on the servers in step 2: the command stops without it. In the bundle directory, `{BUNDLE_DIR}/` (see *The bundle* above), on a machine with `sh`, `awk`, `cat`, `curl`, `cut`, `dirname`, `grep`, `mktemp`, `rm`, `sed`, `seq` and `sleep`{}:\n\n```sh\n: \"${{PULSUS_CLICKHOUSE_PASSWORD:?set it in this shell from your secret store: it is the pulsus user password of step 2}}\"\nset -a; . ./schema.env; set +a\nCLICKHOUSE_SERVER={} CLICKHOUSE_HTTP_PORT={p} CLICKHOUSE_AUTH=\"pulsus:$PULSUS_CLICKHOUSE_PASSWORD\"{tls_env} sh schema/schema.sh\n```\n\nExpected:\n\n```text\nschema.sh: all {h} hosts in cluster '{c}' answered\nschema.sh: {statements} statements applied to {d}\n```\n",
         v.tls
             .as_ref()
             .map(|t| format!(", and the CA at `{}`", t.ca))
@@ -344,16 +404,27 @@ pub(crate) fn setup_md(v: &Validated, statements: usize) -> String {
 
     let _ = write!(
         out,
-        "\n### 5\n\nOn the PulsusDB host{}, start PulsusDB with the variables of `pulsusdb.env` and, from your secret store, `CLICKHOUSE_AUTH=pulsus:<password>` and `PULSUS_ADMIN_PASSWORD`. The admin pair is `admin` / `admin` until you set it: set `PULSUS_ADMIN_PASSWORD`, and `PULSUS_ADMIN_USER` for another user.\n",
+        "\n### 5\n\nOn the PulsusDB host{}, start PulsusDB with the variables of `pulsusdb.env` and, from your secret store, `CLICKHOUSE_AUTH=pulsus:<password>` and `PULSUS_ADMIN_PASSWORD`. The admin pair is `admin` / `admin` until you set it: set `PULSUS_ADMIN_PASSWORD`, and `PULSUS_ADMIN_USER` for another user.\n\nOn a packaged install the `{PULSUSDB_UNIT}` unit reads `{PULSUSDB_ENV}`: from `{BUNDLE_DIR}/`, put the bundle's `pulsusdb.env` there{}:\n\n```sh\nsudo install -m 640 -o {} -g {} pulsusdb.env {PULSUSDB_ENV}\n{}```\n\nIn a container, pass it with `--env-file pulsusdb.env` (compose `env_file:`, Kubernetes a ConfigMap read with `envFrom`), as below.\n",
         v.tls
             .as_ref()
             .map(|t| format!(", put the CA at `{}`", t.ca))
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        if v.tls.is_some() {
+            ", and the CA where it is named, readable by every user"
+        } else {
+            ""
+        },
+        PULSUSDB_ENV_OWNER.split(':').next().unwrap_or("root"),
+        PULSUSDB_ENV_OWNER.split(':').nth(1).unwrap_or("pulsusdb"),
+        v.tls
+            .as_ref()
+            .map(|t| format!("sudo install -D -m 644 <the CA certificate> {}\n", t.ca))
+            .unwrap_or_default(),
     );
     how_to_set(
         &mut out,
         &EnvTarget {
-            unit: "pulsusdb",
+            unit: PULSUSDB_UNIT,
             file: "/etc/pulsusdb/secrets.env",
             also: Some("pulsusdb.env"),
             secret: "pulsusdb",
