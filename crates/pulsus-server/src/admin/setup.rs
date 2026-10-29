@@ -241,7 +241,9 @@ const REMOTE_URL: Field = Field {
            https://bucket.s3.eu-west-1.amazonaws.com/pulsus/. An http or https URL with a host and, \
            if given, a port from 1 to 65535, ending in /, with no user, query or fragment. Each host writes under \
            URL/shard/replica/. Leave blank for local disk only; then every \
-           \"days on object storage\" must be blank or 0.",
+           \"days on object storage\" must be blank or 0. The access key and secret are not \
+           entered here: give them to each ClickHouse server as the environment variables \
+           PULSUS_S3_ACCESS_KEY_ID and PULSUS_S3_SECRET_ACCESS_KEY (see step 2 of setup.md).",
 };
 const HARDWARE: [Field; 3] = [
     Field {

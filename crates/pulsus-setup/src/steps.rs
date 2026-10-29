@@ -75,6 +75,77 @@ pub(crate) fn keeper_hosts(v: &Validated) -> String {
     }
 }
 
+/// Where one service's variables go: its systemd unit, the root-only file
+/// that holds them, the bundle's own env file read beside it, if any, and
+/// the Kubernetes Secret's name.
+struct EnvTarget<'a> {
+    unit: &'a str,
+    file: &'a str,
+    also: Option<&'a str>,
+    secret: &'a str,
+    /// Each variable and the placeholder for its value.
+    vars: &'a [(&'a str, &'a str)],
+}
+
+/// "How to set them": the same variables by systemd, Docker and
+/// Kubernetes, each value a placeholder.
+fn how_to_set(out: &mut String, t: &EnvTarget) {
+    let env_lines: String = t
+        .vars
+        .iter()
+        .map(|(name, value)| format!("{name}={value}\n"))
+        .collect();
+    let yaml_lines: String = t
+        .vars
+        .iter()
+        .map(|(name, value)| format!("  {name}: \"{value}\"\n"))
+        .collect();
+    let base = t.file.rsplit('/').next().unwrap_or(t.file);
+    let (unit, file, secret) = (t.unit, t.file, t.secret);
+    let dir = file.rsplit_once('/').map(|(d, _)| d).unwrap_or("/");
+    let copy = t
+        .also
+        .map(|a| format!("sudo install -m 644 {a} {dir}/{a}\n"))
+        .unwrap_or_default();
+    let _ = write!(
+        out,
+        "\nHow to set them, with your own values in place of each `<…>`. Keep the values in your secret store, not in the bundle.\n\n\
+         **systemd:** a file only root can read, named in an override of the unit, then a restart:\n\n\
+         ```sh\nsudo install -d {dir}\n{copy}sudo install -m 600 -o root -g root /dev/null {file}\nsudo tee {file} > /dev/null <<'EOF'\n{env_lines}EOF\nsudo systemctl edit {unit}\n```\n\n\
+         In the editor `systemctl edit` opens, add:\n\n```ini\n[Service]\n"
+    );
+    if let Some(also) = t.also {
+        let _ = writeln!(out, "EnvironmentFile={dir}/{also}");
+    }
+    let _ = write!(
+        out,
+        "EnvironmentFile={file}\n```\n\nThen:\n\n```sh\nsudo systemctl restart {unit}\n```\n\n\
+         **Docker:** the same lines in `{base}`, readable only by you (`chmod 600 {base}`), passed with `--env-file`:\n\n```sh\n"
+    );
+    let env_files: String = t.also.iter().map(|a| format!("--env-file {a} ")).collect();
+    let _ = write!(
+        out,
+        "docker run {env_files}--env-file {base} … # your usual options and image\n```\n\nor, with compose:\n\n```yaml\nservices:\n  {unit}:\n    env_file:\n"
+    );
+    if let Some(also) = t.also {
+        let _ = writeln!(out, "      - {also}");
+    }
+    let _ = write!(
+        out,
+        "      - {base}\n```\n\n**Kubernetes:** a Secret, read into the container with `envFrom`:\n\n\
+         ```yaml\napiVersion: v1\nkind: Secret\nmetadata:\n  name: {secret}\ntype: Opaque\nstringData:\n{yaml_lines}```\n\n\
+         and in the container's spec:\n\n```yaml\nenvFrom:\n"
+    );
+    if let Some(also) = t.also {
+        let name = also.trim_end_matches(".env");
+        let _ = write!(
+            out,
+            "  - configMapRef:\n      name: {name} # kubectl create configmap {name} --from-env-file={also}\n"
+        );
+    }
+    let _ = writeln!(out, "  - secretRef:\n      name: {secret}\n```");
+}
+
 fn sql_block(out: &mut String, id: &str, title: &str, sql: &str, expected: &str) {
     let _ = write!(
         out,
@@ -169,9 +240,15 @@ pub(crate) fn setup_md(v: &Validated, statements: usize) -> String {
         "`CLICKHOUSE_INTERSERVER_SECRET` (the same value on every host)",
         "`PULSUS_CLICKHOUSE_PASSWORD`",
     ];
+    let mut vars = vec![
+        ("CLICKHOUSE_INTERSERVER_SECRET", "<inter-server secret>"),
+        ("PULSUS_CLICKHOUSE_PASSWORD", "<pulsus password>"),
+    ];
     if v.remote_url.is_some() {
         env.push("`PULSUS_S3_ACCESS_KEY_ID`");
         env.push("`PULSUS_S3_SECRET_ACCESS_KEY`");
+        vars.push(("PULSUS_S3_ACCESS_KEY_ID", "<S3 access key id>"));
+        vars.push(("PULSUS_S3_SECRET_ACCESS_KEY", "<S3 secret access key>"));
     }
     let _ = writeln!(
         out,
@@ -182,6 +259,16 @@ pub(crate) fn setup_md(v: &Validated, statements: usize) -> String {
         } else {
             String::new()
         }
+    );
+    how_to_set(
+        &mut out,
+        &EnvTarget {
+            unit: "clickhouse-server",
+            file: "/etc/clickhouse-server/pulsus.env",
+            also: None,
+            secret: "pulsus-clickhouse",
+            vars: &vars,
+        },
     );
     out.push_str("\n### 3\n\nRestart the server on every ClickHouse host.\n");
 
@@ -257,12 +344,26 @@ pub(crate) fn setup_md(v: &Validated, statements: usize) -> String {
 
     let _ = write!(
         out,
-        "\n### 5\n\nOn the PulsusDB host{}, start PulsusDB with the variables of `pulsusdb.env` and, from your secret store, `CLICKHOUSE_AUTH=pulsus:<password>` and `PULSUS_ADMIN_PASSWORD`. The admin pair is `admin` / `admin` until you set it: set `PULSUS_ADMIN_PASSWORD`, and `PULSUS_ADMIN_USER` for another user. Then `GET /ready`.\n\nExpected: `200`.\n",
+        "\n### 5\n\nOn the PulsusDB host{}, start PulsusDB with the variables of `pulsusdb.env` and, from your secret store, `CLICKHOUSE_AUTH=pulsus:<password>` and `PULSUS_ADMIN_PASSWORD`. The admin pair is `admin` / `admin` until you set it: set `PULSUS_ADMIN_PASSWORD`, and `PULSUS_ADMIN_USER` for another user.\n",
         v.tls
             .as_ref()
             .map(|t| format!(", put the CA at `{}`", t.ca))
             .unwrap_or_default()
     );
+    how_to_set(
+        &mut out,
+        &EnvTarget {
+            unit: "pulsusdb",
+            file: "/etc/pulsusdb/secrets.env",
+            also: Some("pulsusdb.env"),
+            secret: "pulsusdb",
+            vars: &[
+                ("CLICKHOUSE_AUTH", "pulsus:<pulsus password>"),
+                ("PULSUS_ADMIN_PASSWORD", "<admin password>"),
+            ],
+        },
+    );
+    out.push_str("\nThen `GET /ready`.\n\nExpected: `200`.\n");
 
     let _ = write!(
         out,
