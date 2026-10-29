@@ -352,7 +352,11 @@ async fn c13_api_and_page_give_the_same_files() {
             validated.body
         );
         let validated: Value = serde_json::from_str(&validated.body).unwrap();
-        assert_eq!(validated, json!({"totals": totals}), "{name}");
+        assert_eq!(
+            validated,
+            json!({"totals": totals, "warnings": []}),
+            "{name}"
+        );
         if name == "example" {
             assert_eq!(totals, json!({"raw": 97, "levels": [365, 365, 365, 365]}));
         }

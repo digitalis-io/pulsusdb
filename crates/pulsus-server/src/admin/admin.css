@@ -113,6 +113,7 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); box-sh
 input.invalid, textarea.invalid { border-color: var(--bad); box-shadow: 0 0 0 2px rgba(180, 35, 24, 0.2); background: var(--bad-soft); }
 
 .field-error { color: var(--bad); font-size: 0.85rem; font-weight: 600; margin: 0.3rem 0 0; }
+.field-warning { color: #8a4b00; background: #fff6e5; border: 1px solid #f0d29a; border-radius: 6px; font-size: 0.85rem; font-weight: 600; padding: 0.3rem 0.5rem; margin: 0.3rem 0 0; }
 .group-error { background: var(--bad-soft); border: 1px solid #f1c3be; border-radius: 6px; padding: 0.4rem 0.75rem; margin: 0.5rem 0; }
 .group-error .field-error { margin: 0.2rem 0; }
 

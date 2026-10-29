@@ -128,6 +128,9 @@ impl Validated {
 }
 
 const NOT_A_HOST: &str = "is not an IPv4 address or a host name";
+/// W11's warning for a single Keeper host.
+const ONE_KEEPER: &str = "One Keeper host: no fault tolerance. If it is down, writes to \
+     replicated tables and schema changes stop until it is back.";
 const DAYS_MAX: u64 = 4_294_967_295;
 
 /// `text` as digits only, at most `digits` of them, from `lo` to `hi`.
@@ -328,8 +331,19 @@ pub fn validate(inputs: &Inputs) -> Result<Validated, Vec<FieldError>> {
         }
         seen.push(keeper);
     }
-    if !(3..=9).contains(&keepers.len()) {
-        refuse(e, "keepers", "give from 3 to 9 Keeper hosts".to_string());
+    // 2 hosts survive no failure, the same as 1, so 2 is refused.
+    let mut warnings = Vec::new();
+    match keepers.len() {
+        1 => warnings.push(FieldWarning {
+            field: "keepers".to_string(),
+            message: ONE_KEEPER.to_string(),
+        }),
+        3..=9 => {}
+        _ => refuse(
+            e,
+            "keepers",
+            "give 1 Keeper host, or from 3 to 9".to_string(),
+        ),
     }
 
     // W13.
@@ -477,7 +491,7 @@ pub fn validate(inputs: &Inputs) -> Result<Validated, Vec<FieldError>> {
         raw_local_days,
         raw_remote_days,
         levels,
-        warnings: Vec::new(),
+        warnings,
         vars,
         ctx,
     })

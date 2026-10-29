@@ -67,6 +67,14 @@ pub(crate) fn sizing(v: &Validated) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// "1 Keeper host", or "N Keeper hosts".
+pub(crate) fn keeper_hosts(v: &Validated) -> String {
+    match v.keepers.len() {
+        1 => "1 Keeper host".to_string(),
+        n => format!("{n} Keeper hosts"),
+    }
+}
+
 fn sql_block(out: &mut String, id: &str, title: &str, sql: &str, expected: &str) {
     let _ = write!(
         out,
@@ -86,16 +94,20 @@ pub(crate) fn setup_md(v: &Validated, statements: usize) -> String {
 
     let _ = writeln!(
         out,
-        "# PulsusDB cluster setup\n\nCluster `{c}`, database `{d}`: {h} ClickHouse hosts in {} shards of {} replicas, {} Keeper hosts, TLS {}, object storage {}.",
+        "# PulsusDB cluster setup\n\nCluster `{c}`, database `{d}`: {h} ClickHouse hosts in {} shards of {} replicas, {}, TLS {}, object storage {}.",
         v.shards,
         v.replicas,
-        v.keepers.len(),
+        keeper_hosts(v),
         if v.tls.is_some() { "on" } else { "off" },
         v.remote_url
             .as_deref()
             .map(|u| format!("at `{u}`"))
             .unwrap_or_else(|| "off".to_string()),
     );
+
+    for w in &v.warnings {
+        let _ = writeln!(out, "\n**Warning:** {}", w.message);
+    }
 
     out.push_str("\n## Hosts\n\n| Position | Host | Shard | Files |\n|---|---|---|---|\n");
     for (i, host) in v.hosts.iter().enumerate() {

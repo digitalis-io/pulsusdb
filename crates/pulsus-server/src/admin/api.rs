@@ -41,7 +41,8 @@ pub(crate) async fn config(State(state): State<AppState>) -> Response {
 
 /// The setup API's body: a JSON object of form fields to strings, read by
 /// the same `Inputs::from_pairs` and `validate` as the form. A body that is
-/// not such an object is `400`; refused inputs are `422`.
+/// not such an object is `400`; refused inputs are `422`. Accepted inputs
+/// answer with `warnings`, `[]` when there are none.
 fn setup_validated(body: &[u8]) -> Result<Validated, Box<Response>> {
     let pairs: BTreeMap<String, String> = serde_json::from_slice(body).map_err(|e| {
         Box::new(
@@ -65,7 +66,7 @@ fn setup_validated(body: &[u8]) -> Result<Validated, Box<Response>> {
 
 pub(crate) async fn setup_validate(body: Bytes) -> Response {
     match setup_validated(&body) {
-        Ok(v) => Json(json!({ "totals": v.totals() })).into_response(),
+        Ok(v) => Json(json!({ "totals": v.totals(), "warnings": v.warnings })).into_response(),
         Err(res) => *res,
     }
 }
@@ -73,7 +74,9 @@ pub(crate) async fn setup_validate(body: Bytes) -> Response {
 pub(crate) async fn setup_bundle(body: Bytes) -> Response {
     match setup_validated(&body) {
         Ok(v) => {
-            Json(json!({ "totals": v.totals(), "files": pulsus_setup::bundle(&v) })).into_response()
+            let files = pulsus_setup::bundle(&v);
+            Json(json!({ "totals": v.totals(), "warnings": v.warnings, "files": files }))
+                .into_response()
         }
         Err(res) => *res,
     }

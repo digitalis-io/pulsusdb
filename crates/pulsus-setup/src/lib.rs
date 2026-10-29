@@ -149,6 +149,11 @@ pub fn total_lines(v: &Validated) -> Vec<String> {
     steps::total_lines(v)
 }
 
+/// "1 Keeper host", or "N Keeper hosts".
+pub fn keeper_hosts(v: &Validated) -> String {
+    steps::keeper_hosts(v)
+}
+
 /// The figures the server derives from the hardware, shown and not
 /// written: (label, value).
 pub fn sizing(v: &Validated) -> Vec<(&'static str, String)> {
