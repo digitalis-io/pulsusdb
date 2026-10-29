@@ -849,6 +849,22 @@ mod tests {
         );
     }
 
+    /// The object storage URL's help says where the access key and secret
+    /// go: not on the form, but in each server's environment.
+    #[test]
+    fn the_remote_url_help_says_where_the_s3_key_goes() {
+        let page = page(&Inputs::from_pairs(starting_values()), &[], None);
+        let help = html_text(
+            "The access key and secret are not entered here: give them to each ClickHouse \
+             server as the environment variables PULSUS_S3_ACCESS_KEY_ID and \
+             PULSUS_S3_SECRET_ACCESS_KEY (see step 2 of setup.md).",
+        );
+        let at = page.find("id=\"h-remote_url\"").expect("the URL's help");
+        let rest = &page[at..];
+        let text = &rest[..rest.find("</p>").expect("the help closes")];
+        assert!(text.contains(&help), "{text}");
+    }
+
     /// Every field the server reads is on the form, under its own name.
     #[test]
     fn every_field_is_on_the_form() {

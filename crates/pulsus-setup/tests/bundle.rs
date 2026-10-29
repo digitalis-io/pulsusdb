@@ -1307,3 +1307,105 @@ fn a_nested_new_destination_is_written() {
     assert_eq!(files_under(&dir), want);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Every variable the bundle tells a host to set from a secret store.
+const SECRET_VARS: [&str; 6] = [
+    "CLICKHOUSE_INTERSERVER_SECRET",
+    "PULSUS_CLICKHOUSE_PASSWORD",
+    "PULSUS_S3_ACCESS_KEY_ID",
+    "PULSUS_S3_SECRET_ACCESS_KEY",
+    "CLICKHOUSE_AUTH",
+    "PULSUS_ADMIN_PASSWORD",
+];
+
+/// Each value `text` assigns to `name`, as `name=value` (an env file) or
+/// `name: value` (a Kubernetes Secret), to the end of its line.
+fn assigned<'a>(text: &'a str, name: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        for sep in ["=", ": "] {
+            if let Some(value) = line.strip_prefix(&format!("{name}{sep}")) {
+                out.push(value);
+            }
+        }
+    }
+    out
+}
+
+/// **Step 2 says how to set each ClickHouse host's variables**, by
+/// systemd, Docker and Kubernetes, naming the object store's two only
+/// when there is a remote URL; step 5 does the same for PulsusDB's.
+#[test]
+fn the_steps_say_how_to_set_the_variables() {
+    let ch_always = [
+        "CLICKHOUSE_INTERSERVER_SECRET",
+        "PULSUS_CLICKHOUSE_PASSWORD",
+    ];
+    let s3 = ["PULSUS_S3_ACCESS_KEY_ID", "PULSUS_S3_SECRET_ACCESS_KEY"];
+    for (name, pairs, with_s3) in [
+        ("remote", example(), true),
+        ("no remote", no_remote(), false),
+    ] {
+        let files = files(&pairs);
+        let md = file(&files, "setup.md");
+        for id in ["2", "5"] {
+            let step = section(md, id);
+            for needle in [
+                "How to set them",
+                "install -m 600",
+                "systemctl edit",
+                "EnvironmentFile=",
+                "systemctl restart",
+                "--env-file",
+                "env_file:",
+                "kind: Secret",
+                "envFrom:",
+            ] {
+                assert!(
+                    step.contains(needle),
+                    "{name}: step {id} lacks {needle:?}: {step}"
+                );
+            }
+        }
+        let step2 = section(md, "2");
+        for var in ch_always {
+            assert_eq!(assigned(step2, var).len(), 2, "{name}: {var}: {step2}");
+        }
+        for var in s3 {
+            let want = if with_s3 { 2 } else { 0 };
+            assert_eq!(assigned(step2, var).len(), want, "{name}: {var}: {step2}");
+            if !with_s3 {
+                assert!(!step2.contains(var), "{name}: {var}: {step2}");
+            }
+        }
+        let step5 = section(md, "5");
+        for var in ["CLICKHOUSE_AUTH", "PULSUS_ADMIN_PASSWORD"] {
+            assert_eq!(assigned(step5, var).len(), 2, "{name}: {var}: {step5}");
+        }
+        assert!(!step5.contains("PULSUS_S3_"), "{name}: {step5}");
+    }
+}
+
+/// **No secret value is in any file**: every value the bundle gives a
+/// secret variable is a `<…>` placeholder or a reference to the shell's
+/// own variable, and each is given at least once, so the scan has
+/// something to read.
+#[test]
+fn no_file_holds_a_secret_value() {
+    let placeholder = |v: &str| {
+        let v = v.trim_matches('"');
+        v.starts_with('<') || v.starts_with("pulsus:<") || v == "pulsus:$PULSUS_CLICKHOUSE_PASSWORD"
+    };
+    let files = files(&example());
+    for var in SECRET_VARS {
+        let mut seen = 0;
+        for (path, content) in &files {
+            for value in assigned(content, var) {
+                seen += 1;
+                assert!(placeholder(value), "{path}: {var} is given {value:?}");
+            }
+        }
+        assert!(seen >= 2, "{var} is given {seen} times");
+    }
+}
