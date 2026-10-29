@@ -231,6 +231,108 @@ async fn a_user_whose_replies_default_to_zstd_still_connects_queries_and_inserts
     }
 }
 
+/// The `GRANT` statements of `docs/configuration.md` §2, "The database
+/// user's grants", read from the document itself so the copy a reader
+/// pastes is the copy tested.
+fn documented_grants() -> Vec<String> {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/configuration.md");
+    let doc = std::fs::read_to_string(path).expect("read docs/configuration.md");
+    let section = doc
+        .split("### The database user's grants")
+        .nth(1)
+        .expect("the grants section");
+    let block = section
+        .split("```sql")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .expect("the grants section's sql block");
+    block
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("GRANT "))
+        .map(|line| line.trim_end_matches(';').to_string())
+        .collect()
+}
+
+/// A user holding exactly the documented grants can read the `system`
+/// tables and run a `clusterAllReplicas()` read, and without the grant each
+/// one names, each is refused (code 497). The remote read uses the bare
+/// image's own one-node `default` cluster. The `CLUSTER` grant is applied
+/// but not probed: an `ON CLUSTER` statement needs a cluster with Keeper,
+/// which this suite's server does not have.
+#[tokio::test]
+async fn the_documented_grants_are_enough_and_each_probed_one_is_needed() {
+    skip_unless_live!();
+    let admin = ChClient::new(test_config())
+        .await
+        .expect("connect as admin");
+    let cfg = test_config();
+    let user = pulsus_testkit::test_ident("pulsus_clickhouse_it_grants_user");
+    let grants: Vec<String> = documented_grants()
+        .into_iter()
+        .map(|g| {
+            let (privilege, _) = g.rsplit_once(" TO ").expect("a GRANT ... TO statement");
+            format!(
+                "{} TO {user}",
+                privilege.replace(" ON pulsus.*", &format!(" ON {}.*", cfg.database))
+            )
+        })
+        .collect();
+    assert_eq!(grants.len(), 4, "the documented grants: {grants:?}");
+    let run = |stmt: String| {
+        let admin = &admin;
+        async move {
+            admin
+                .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+                .await
+                .unwrap_or_else(|e| panic!("{stmt}: {e:?}"));
+        }
+    };
+    run(format!("DROP USER IF EXISTS {user}")).await;
+    run(format!("CREATE USER {user} IDENTIFIED WITH no_password")).await;
+    for g in &grants {
+        run(g.clone()).await;
+    }
+    let as_user = ChClient::new(ChConnConfig {
+        user: user.clone(),
+        ..test_config()
+    })
+    .await
+    .expect("the pool connects with only the documented grants");
+
+    for (grant_prefix, probe) in [
+        (
+            "GRANT SELECT ON system.*",
+            "SELECT toString(count()) AS s FROM system.parts",
+        ),
+        (
+            "GRANT REMOTE ON *.*",
+            "SELECT toString(count()) AS s FROM clusterAllReplicas('default', system.one)",
+        ),
+    ] {
+        let grant = grants
+            .iter()
+            .find(|g| g.starts_with(grant_prefix))
+            .unwrap_or_else(|| panic!("the docs grant {grant_prefix:?}: {grants:?}"));
+        as_user
+            .query_strings(probe, &QuerySettings::new())
+            .await
+            .unwrap_or_else(|e| panic!("{probe} with the documented grants: {e:?}"));
+        let (privilege, _) = grant.rsplit_once(" TO ").expect("GRANT ... TO");
+        let revoke = format!(
+            "REVOKE {} FROM {user}",
+            privilege.trim_start_matches("GRANT ")
+        );
+        run(revoke.clone()).await;
+        match as_user.query_strings(probe, &QuerySettings::new()).await {
+            Err(ChError::Server { code: 497, .. }) => {}
+            other => panic!("{probe} after {revoke}: expected code 497, got {other:?}"),
+        }
+        run(grant.clone()).await;
+    }
+    run(format!("DROP USER IF EXISTS {user}")).await;
+}
+
 /// Issue #382: a server exception raised after the query has already
 /// written output must still classify by its numeric code, so a scan
 /// budget stays a 422 `query_too_broad` and never becomes a 500.

@@ -39,14 +39,14 @@ PulsusDB is configured by environment variables, optionally layered over a YAML 
 
 ### The database user's grants
 
-`schema/schema.sh` and the binary connect as the same user, `CLICKHOUSE_AUTH`. It needs every privilege on the database (`CLICKHOUSE_DB`, `pulsus` below), which `schema/schema.sh` drops and creates, and `SELECT` on the `system` database, whose tables both read (`system.parts`, `system.tables` and `system.databases` among them). A clustered deployment (`PULSUS_CLUSTER` set) also needs `CLUSTER`, for its `ON CLUSTER` statements, and `READ ON REMOTE`, for its `cluster()` and `clusterAllReplicas()` reads, on every server:
+`schema/schema.sh` and the binary connect as the same user, `CLICKHOUSE_AUTH`. It needs every privilege on the database (`CLICKHOUSE_DB`, `pulsus` below), which `schema/schema.sh` drops and creates, and `SELECT` on the `system` database, whose tables both read (`system.parts`, `system.tables` and `system.databases` among them). A clustered deployment (`PULSUS_CLUSTER` set) also needs `CLUSTER`, for its `ON CLUSTER` statements, and `REMOTE`, for its `cluster()` and `clusterAllReplicas()` reads, on every server. The server's refusal names that privilege `READ ON REMOTE`; `GRANT READ ON REMOTE` grants the same privilege, and `SHOW GRANTS` prints either as `REMOTE ON *.*`:
 
 ```sql
 GRANT ALL ON pulsus.* TO pulsus;
 GRANT SELECT ON system.* TO pulsus;
 -- clustered deployments only
 GRANT CLUSTER ON *.* TO pulsus;
-GRANT READ ON REMOTE TO pulsus;
+GRANT REMOTE ON *.* TO pulsus;
 ```
 
 The user the setup form generates, `users.d/pulsus-user.xml`, is declared without grants of its own, so the server gives it every privilege except user and role management, these included.
