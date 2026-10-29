@@ -37,6 +37,20 @@ PulsusDB is configured by environment variables, optionally layered over a YAML 
 | `CLICKHOUSE_INSERT_QUORUM_TIMEOUT` | `120s` | quorum wait bound; must be `0 < timeout <=` `PULSUS_QUERY_TIMEOUT` when quorum is enabled (the insert deadline otherwise preempts the wait). Reconciled to the default `PULSUS_QUERY_TIMEOUT`; ClickHouse's own default is 600s |
 | `CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY` | `false` | reads see all prior quorum-committed writes (read-your-writes); off by default |
 
+### The database user's grants
+
+`schema/schema.sh` and the binary connect as the same user, `CLICKHOUSE_AUTH`. It needs every privilege on the database (`CLICKHOUSE_DB`, `pulsus` below), which `schema/schema.sh` drops and creates, and `SELECT` on the `system` database, whose tables both read (`system.parts`, `system.tables` and `system.databases` among them). A clustered deployment (`PULSUS_CLUSTER` set) also needs `CLUSTER`, for its `ON CLUSTER` statements, and `READ ON REMOTE`, for its `cluster()` and `clusterAllReplicas()` reads, on every server:
+
+```sql
+GRANT ALL ON pulsus.* TO pulsus;
+GRANT SELECT ON system.* TO pulsus;
+-- clustered deployments only
+GRANT CLUSTER ON *.* TO pulsus;
+GRANT READ ON REMOTE TO pulsus;
+```
+
+The user the setup form generates, `users.d/pulsus-user.xml`, is declared without grants of its own, so the server gives it every privilege except user and role management, these included.
+
 ### Consistency
 
 Defaults are all-off: writes are not quorum-committed and reads may hit a lagging replica. This preserves the lowest-latency behaviour on single-node and non-replicated deployments (quorum inserts *throw* on a plain `MergeTree`). On a `Replicated*` multi-replica cluster you can opt in to strong consistency — `CLICKHOUSE_INSERT_QUORUM > 0` makes an insert wait for that many replicas to confirm (so an ack survives a replica loss), and `CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY=true` gives read-your-writes. Both cost, and the two costs are different in kind: a quorum write waits for replication, and **a sequential read does not wait — it fails**, because `select_sequential_consistency`'s own catalogue entry says the server "will generate an exception" when the client reaches a partial replica. That is why they are opt-in — enable them only where the durability/read-your-writes guarantee is worth the round-trip cost. The quorum timeout is bounded by `PULSUS_QUERY_TIMEOUT` (the insert deadline that bounds the whole insert), so it is rejected at startup if it exceeds — or is zero while quorum is enabled.
