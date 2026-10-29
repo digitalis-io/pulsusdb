@@ -1409,3 +1409,150 @@ fn no_file_holds_a_secret_value() {
         assert!(seen >= 2, "{var} is given {seen} times");
     }
 }
+
+/// `setup.md`'s part `## {title}`, to the next `## ` heading.
+fn part<'a>(md: &'a str, title: &str) -> &'a str {
+    let head = format!("\n## {title}\n");
+    let start = md
+        .find(&head)
+        .unwrap_or_else(|| panic!("no {title} in {md}"))
+        + head.len();
+    let rest = &md[start..];
+    &rest[..rest.find("\n## ").unwrap_or(rest.len())]
+}
+
+/// The row for `path` in setup.md's "Where each file goes" table, as
+/// (host, destination), the destination without its backquotes.
+fn destination(md: &str, path: &str) -> Option<(String, String)> {
+    let table = part(md, "Where each file goes");
+    let head = format!("| `{path}` | ");
+    let rows: Vec<&str> = table.lines().filter(|l| l.starts_with(&head)).collect();
+    assert!(rows.len() <= 1, "{path} has {} rows", rows.len());
+    let cells: Vec<&str> = rows.first()?.split(" | ").collect();
+    Some((cells[1].to_string(), cells[2].trim_matches('`').to_string()))
+}
+
+/// **Every file in the bundle has its destination in setup.md**: the
+/// host and the exact path, checked against this test's own mapping.
+#[test]
+fn setup_md_says_where_every_file_goes() {
+    let pairs = example();
+    let v = validated(&pairs);
+    let files = files(&pairs);
+    let md = file(&files, "setup.md");
+    let step4 = "the machine that runs step 4";
+    for path in files.keys() {
+        let want = if let Some(rest) = path.strip_prefix("nodes/") {
+            let (i, rest) = rest.split_once('/').unwrap();
+            let host = v.hosts[i.parse::<usize>().unwrap() - 1].clone();
+            (host, format!("/etc/clickhouse-server/{rest}"))
+        } else if let Some(rest) = path.strip_prefix("keepers/") {
+            let (j, _) = rest.split_once('/').unwrap();
+            let host = v.keepers[j.parse::<usize>().unwrap() - 1].clone();
+            (host, "/etc/clickhouse-keeper/keeper_config.xml".to_string())
+        } else if path == "pulsusdb.env" {
+            (
+                "the PulsusDB host".to_string(),
+                "/etc/pulsusdb/pulsusdb.env".to_string(),
+            )
+        } else if [
+            "schema.env",
+            "schema-rendered.sql",
+            "schema/schema.sh",
+            "schema/schema.sql",
+            "setup.md",
+        ]
+        .contains(&path.as_str())
+        {
+            (step4.to_string(), format!("pulsus-bundle/{path}"))
+        } else {
+            panic!("this test has no destination for {path}");
+        };
+        assert_eq!(destination(md, path), Some(want), "{path}");
+    }
+}
+
+/// **Each step gives the copy commands, owners and modes.**
+#[test]
+fn the_steps_give_the_copy_commands() {
+    let pairs = example();
+    let v = validated(&pairs);
+    let bundle_files = files(&pairs);
+    let md = file(&bundle_files, "setup.md");
+    let bundle = part(md, "The bundle");
+    for needle in ["pulsus-bundle/", "/admin/api/v1/setup/bundle", "Download"] {
+        assert!(bundle.contains(needle), "{needle:?}: {bundle}");
+    }
+
+    let k1 = section(md, "K1");
+    for (j, kp) in v.keepers.iter().enumerate() {
+        let scp = format!("scp keepers/{}/keeper_config.xml {kp}:", j + 1);
+        assert!(k1.contains(&scp), "{scp}: {k1}");
+    }
+    for needle in [
+        "-o clickhouse -g clickhouse",
+        "/etc/clickhouse-keeper/keeper_config.xml",
+        "/var/lib/clickhouse-keeper/coordination/log",
+        "/var/lib/clickhouse-keeper/coordination/snapshots",
+        "systemctl enable --now clickhouse-keeper",
+        "/etc/ch/server.crt",
+        "/etc/ch/server.key",
+        "/etc/ch/ca.crt",
+    ] {
+        assert!(k1.contains(needle), "{needle:?}: {k1}");
+    }
+
+    let step1 = section(md, "1");
+    for (i, host) in v.hosts.iter().enumerate() {
+        let scp = format!("scp -r nodes/{} {host}:", i + 1);
+        assert!(step1.contains(&scp), "{scp}: {step1}");
+    }
+    for needle in [
+        "/etc/clickhouse-server/config.d/",
+        "/etc/clickhouse-server/users.d/",
+        "-m 640 -o clickhouse -g clickhouse",
+        "install -d -m 750 -o clickhouse -g clickhouse /var/lib/clickhouse/",
+        "/etc/ch/server.crt",
+        "/etc/ch/server.key",
+        "/etc/ch/ca.crt",
+    ] {
+        assert!(step1.contains(needle), "{needle:?}: {step1}");
+    }
+
+    assert!(
+        section(md, "4").contains("pulsus-bundle"),
+        "{}",
+        section(md, "4")
+    );
+    let step5 = section(md, "5");
+    assert!(
+        step5
+            .contains("install -m 640 -o root -g pulsusdb pulsusdb.env /etc/pulsusdb/pulsusdb.env"),
+        "{step5}"
+    );
+    let containers = part(md, "In containers");
+    for needle in [
+        "/etc/clickhouse-server/config.d/",
+        "/etc/clickhouse-server/users.d/",
+        "/etc/clickhouse-keeper/keeper_config.xml",
+        "/var/lib/clickhouse-keeper",
+        "/var/lib/clickhouse/",
+        "--env-file pulsusdb.env",
+        "Kubernetes",
+    ] {
+        assert!(containers.contains(needle), "{needle:?}: {containers}");
+    }
+
+    let plain = files(&no_tls());
+    let md = file(&plain, "setup.md");
+    assert!(
+        !section(md, "1").contains("/etc/ch/"),
+        "{}",
+        section(md, "1")
+    );
+    assert!(
+        !section(md, "K1").contains("/etc/ch/"),
+        "{}",
+        section(md, "K1")
+    );
+}
