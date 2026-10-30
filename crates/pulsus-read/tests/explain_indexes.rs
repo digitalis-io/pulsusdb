@@ -474,8 +474,8 @@ fn expected_stage3_skip_blocks(condition: Option<&str>) -> std::collections::BTr
 }
 
 /// The word index's condition for `word("connection", "refused")`: both
-/// words, lowered, all required (issue #757).
-const WORDS_CONNECTION_REFUSED: &str = r#"(mode: All; tokens: ["connection", "refused"])"#;
+/// words, case-keyed (so upper case), all required (issue #757).
+const WORDS_CONNECTION_REFUSED: &str = r#"(mode: All; tokens: ["CONNECTION", "REFUSED"])"#;
 
 /// An extract with its `Skip` blocks removed — the `MinMax`/`Partition`/
 /// `PrimaryKey` prefix, whose ORDER is asserted (those three are printed
@@ -1013,7 +1013,7 @@ async fn stage2_hydration_uses_the_fingerprint_primary_key() {
 // produce the same index-usage extract: the `service`/`fingerprint`/
 // `timestamp_ns` primary-key `Condition:` only reflects those three
 // columns (not `body`, which isn't part of the primary key), and the
-// word index on `lowerUTF8(body)` is listed with the words a `word(…)`
+// word index on `upperUTF8(lowerUTF8(body))` is listed with the words a `word(…)`
 // filter gives it to test, or not at all for a substring or regex filter
 // (issue #757).
 //
@@ -1286,10 +1286,10 @@ async fn stage3_line_filter_before_a_parser_keeps_the_exact_skip_index_usage() {
     .await;
 }
 
-/// Issue #757: `word(…)` renders `hasAllTokens(lowerUTF8(body), …)`, the
-/// expression `idx_body_words` indexes; the words are lowered in SQL, so
-/// the condition lists them lowercase and the read is confined to the
-/// granules holding both.
+/// Issue #757: `word(…)` renders `hasAllTokens(upperUTF8(lowerUTF8(body)),
+/// …)`, the expression `idx_body_words` indexes; the words are case-keyed
+/// in SQL, so the condition lists them upper case and the read is confined
+/// to the granules holding both.
 #[tokio::test]
 async fn stage3_word_filter_uses_the_primary_key_and_the_word_index() {
     skip_unless_live!();
@@ -1323,7 +1323,7 @@ async fn stage3_not_word_filter_prunes_nothing() {
         &client,
         r#"{service_name="checkout"} != word("connection", "refused")"#,
         PrunesBy::NotAtAll,
-        Some(r#"(mode: Any; tokens: ["connection", "refused"])"#),
+        Some(r#"(mode: Any; tokens: ["CONNECTION", "REFUSED"])"#),
     )
     .await;
 }
@@ -1343,7 +1343,7 @@ async fn stage3_word_filter_chained_with_a_literal_prunes_on_the_word() {
         &client,
         r#"{service_name="checkout"} |= word("refused") != "zzz""#,
         PrunesBy::Strongly,
-        Some(r#"(mode: All; tokens: ["refused"])"#),
+        Some(r#"(mode: All; tokens: ["REFUSED"])"#),
     )
     .await;
 }
@@ -3048,7 +3048,7 @@ async fn metric_raw_fallback_uses_the_service_fingerprint_timestamp_primary_key(
     assert_eq!(without_skip_blocks(&usage), expected_stage3_prefix());
     assert_eq!(
         skip_blocks(&raw),
-        expected_stage3_skip_blocks(Some(r#"(mode: All; tokens: ["refused"])"#))
+        expected_stage3_skip_blocks(Some(r#"(mode: All; tokens: ["REFUSED"])"#))
     );
     // One body index, so 26.x reports no `<Combined skip indexes>`
     // pseudo-block here (measured).

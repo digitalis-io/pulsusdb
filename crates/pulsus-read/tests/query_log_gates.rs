@@ -9338,7 +9338,7 @@ fn word_lines_757(streams: &[pulsus_read::logql::StreamResult]) -> Vec<usize> {
 /// **Q5 (issue #757): a `word(…)` filter answers on every route** — a
 /// log query, keyset pages, in the process after `line_format`, a tail
 /// page, `stats`, counts and rates on both count routes, and a `variants`
-/// tail. Every expected value is read from `WORD_LINES_757` by hand.
+/// tail, bare and wrapped. Every expected value is read from `WORD_LINES_757` by hand.
 #[tokio::test]
 async fn a_word_filter_answers_on_every_route() {
     skip_unless_live!();
@@ -9492,11 +9492,23 @@ async fn a_word_filter_answers_on_every_route() {
         }
     }
 
-    let query = r#"variants(count_over_time({s="w"} |= word("memcached") [1m])) of ({s="w"} [1m])"#;
-    let got = run_624(&db, hooks_624(false, None, None), None, query, &range)
-        .await
-        .unwrap_or_else(|e| panic!("{query}: {e}"));
-    assert_eq!(total(&got), 6.0, "the variants tail: {query}: {got:?}");
+    // A bare variant's own line filter is dead by design (`b13_variants.test`
+    // W1, W4); wrapped, the tail runs it in the process (W3).
+    for (query, want) in [
+        (
+            r#"variants(count_over_time({s="w"} |= word("memcached") [1m])) of ({s="w"} [1m])"#,
+            14.0,
+        ),
+        (
+            r#"variants(sum(count_over_time({s="w"} |= word("memcached") [1m]))) of ({s="w"} [1m])"#,
+            6.0,
+        ),
+    ] {
+        let got = run_624(&db, hooks_624(false, None, None), None, query, &range)
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        assert_eq!(total(&got), want, "the variants tail: {query}: {got:?}");
+    }
 
     drop_db_624(&admin, &db).await;
 }
@@ -9594,7 +9606,7 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         &admin,
         &format!(
             "CREATE TABLE {table} (body String, \
-             INDEX idx_body_words lowerUTF8(body) TYPE text(tokenizer = splitByNonAlpha)) \
+             INDEX idx_body_words upperUTF8(lowerUTF8(body)) TYPE text(tokenizer = splitByNonAlpha)) \
              ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
         ),
     )
@@ -9712,7 +9724,7 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         &admin,
         &format!(
             "CREATE TABLE {table} (body String, \
-             INDEX idx_body_words lowerUTF8(body) TYPE text(tokenizer = splitByNonAlpha)) \
+             INDEX idx_body_words upperUTF8(lowerUTF8(body)) TYPE text(tokenizer = splitByNonAlpha)) \
              ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
         ),
     )
@@ -10309,7 +10321,7 @@ async fn every_body_predicate_statement_disables_the_text_index_direct_read() {
         "SELECT query, Settings['query_plan_direct_read_from_text_index'] AS direct_read \
          FROM system.query_log WHERE log_comment = '{comment}' AND type = 'QueryFinish' \
          AND query LIKE '%log_samples%' AND query LIKE '%body%' \
-         AND (query LIKE '%body LIKE%' OR query LIKE '%match(body%' OR query LIKE '%hasAllTokens(lowerUTF8(body)%')"
+         AND (query LIKE '%body LIKE%' OR query LIKE '%match(body%' OR query LIKE '%hasAllTokens(upperUTF8(lowerUTF8(body))%')"
     );
     let mut rows: Vec<DirectReadRow624p3b> = Vec::new();
     for _ in 0..30 {

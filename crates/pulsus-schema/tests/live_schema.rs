@@ -1962,7 +1962,7 @@ struct SkipIndexRow {
 /// **S-T2 (issue #624, part 3b; issue #757): the log body carries one index,
 /// a whole-word `text` index.** Every skip index on every table of a fresh
 /// database, read from `system.data_skipping_indices`: on `log_samples`
-/// exactly `idx_body_words` over `lowerUTF8(body)` as
+/// exactly `idx_body_words` over `upperUTF8(lowerUTF8(body))` as
 /// `text(tokenizer = splitByNonAlpha)`, and the `minmax` on `severity`; no
 /// bloom-filter index anywhere.
 #[tokio::test]
@@ -1995,7 +1995,7 @@ async fn the_log_body_has_one_word_index() {
             &(
                 "log_samples".to_string(),
                 "idx_body_words".to_string(),
-                "lowerUTF8(body)".to_string(),
+                "upperUTF8(lowerUTF8(body))".to_string(),
                 "text(tokenizer = splitByNonAlpha)".to_string()
             ),
             &(

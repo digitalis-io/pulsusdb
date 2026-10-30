@@ -491,21 +491,19 @@ const WORD_BODIES: &[&str] = &[
     "\u{212A}elvin scale",
     "a—b em dash",
     "tab\tseparated\u{1}ctl",
+    "ΑΣ.Β dotted",
+    "Α'Σ apostrophe",
+    "Straße closed",
 ];
 
 /// The truth side's own tokenizer, written here and not taken from
-/// `pulsus_logql::word`: lower each character on its own, then split on
-/// every byte that is not an ASCII letter or digit and is below `0x80`.
+/// `pulsus_logql::word`: the whole line lowered then upper-cased, split on
+/// every byte below `0x80` that is not an ASCII letter or digit.
 fn truth_words(line: &str) -> BTreeSet<Vec<u8>> {
-    let mut lowered = String::new();
-    for c in line.chars() {
-        for l in c.to_lowercase() {
-            lowered.push(l);
-        }
-    }
+    let keyed = line.to_lowercase().to_uppercase();
     let mut out = BTreeSet::new();
     let mut cur: Vec<u8> = Vec::new();
-    for &b in lowered.as_bytes() {
+    for &b in keyed.as_bytes() {
         if b.is_ascii_digit() || b.is_ascii_lowercase() || b.is_ascii_uppercase() || b >= 0x80 {
             cur.push(b);
         } else if !cur.is_empty() {
@@ -519,7 +517,7 @@ fn truth_words(line: &str) -> BTreeSet<Vec<u8>> {
 }
 
 /// The tokens of `line` as written, split by the same byte rule but not
-/// lowered.
+/// keyed.
 fn tokens_as_written(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -571,7 +569,7 @@ fn client_side_indices(filter: &LineFilter) -> BTreeSet<usize> {
 
 /// Issue #757 D1t: `|= word(…)` and `!= word(…)` return exactly the rows
 /// the word rule keeps, through the SQL the database runs and through the
-/// in-process matcher alike.
+/// in-process matcher alike, for every case form of every word.
 #[tokio::test]
 async fn a_word_filter_returns_exactly_the_rows_the_word_rule_does() {
     skip_unless_live!();
@@ -592,6 +590,16 @@ async fn a_word_filter_returns_exactly_the_rows_the_word_rule_does() {
         (&["ünïcode"][..], &[7, 8][..]),
         (&["kelvin"][..], &[16][..]),
         (&["istanbul"][..], &[][..]),
+        (&["ΟΔΟΣ"][..], &[14][..]),
+        (&["οδος"][..], &[14][..]),
+        (&["οδοσ"][..], &[14][..]),
+        (&["ΑΣ"][..], &[19][..]),
+        (&["ας"][..], &[19][..]),
+        (&["ασ"][..], &[19][..]),
+        (&["Σ"][..], &[20][..]),
+        (&["ς"][..], &[20][..]),
+        (&["strasse"][..], &[21][..]),
+        (&["STRASSE"][..], &[21][..]),
     ] {
         let words: Vec<String> = words.iter().map(|w| w.to_string()).collect();
         let want: BTreeSet<usize> = want.iter().copied().collect();
@@ -609,11 +617,24 @@ async fn a_word_filter_returns_exactly_the_rows_the_word_rule_does() {
     for body in WORD_BODIES {
         for t in tokens_as_written(body) {
             singles.insert(t.to_ascii_uppercase());
-            singles.insert(t.chars().flat_map(char::to_lowercase).collect());
+            singles.insert(t.to_lowercase());
             singles.insert(t);
         }
     }
-    for extra in ["absentword", "memcache", "οδος", "istanbul"] {
+    for extra in [
+        "absentword",
+        "memcache",
+        "οδος",
+        "οδοσ",
+        "ΑΣ",
+        "ας",
+        "ασ",
+        "Σ",
+        "ς",
+        "strasse",
+        "STRASSE",
+        "istanbul",
+    ] {
         singles.insert(extra.to_string());
     }
     let mut cases: Vec<Vec<String>> = singles.into_iter().map(|w| vec![w]).collect();
@@ -660,50 +681,54 @@ async fn a_word_filter_returns_exactly_the_rows_the_word_rule_does() {
     drop_database(&client, db).await;
 }
 
-#[derive(Debug, Row, serde::Serialize, serde::Deserialize)]
-struct LoweredRow {
-    cp: u64,
-    low: String,
+/// Every scalar value as a one-character string, `s`, beside its code
+/// point, `cp` — the inner select of D2t and D3t.
+const SCALAR_VALUES_SQL: &str = "SELECT number AS cp, CAST(multiIf( \
+      number < 0x80, char(number), \
+      number < 0x800, char(0xC0 + bitShiftRight(number, 6), 0x80 + bitAnd(number, 0x3F)), \
+      number < 0x10000, char(0xE0 + bitShiftRight(number, 12), 0x80 + bitAnd(bitShiftRight(number, 6), 0x3F), 0x80 + bitAnd(number, 0x3F)), \
+      char(0xF0 + bitShiftRight(number, 18), 0x80 + bitAnd(bitShiftRight(number, 12), 0x3F), 0x80 + bitAnd(bitShiftRight(number, 6), 0x3F), 0x80 + bitAnd(number, 0x3F)) \
+    ) AS String) AS s \
+    FROM numbers(0x110000) WHERE NOT (number BETWEEN 0xD800 AND 0xDFFF)";
+
+/// Every scalar value, as a Rust string, by code point.
+fn scalar_values() -> impl Iterator<Item = (u64, String)> {
+    (0..0x11_0000u32).filter_map(|cp| char::from_u32(cp).map(|c| (u64::from(cp), c.to_string())))
 }
 
-/// Issue #757 D2t: `pulsus_logql::word::lower` lowers every scalar value
-/// as the database's `lowerUTF8` does.
+#[derive(Debug, Row, serde::Serialize, serde::Deserialize)]
+struct KeyedRow {
+    cp: u64,
+    k: String,
+}
+
+/// Issue #757 D2t: `pulsus_logql::word::case_key` keys every scalar value
+/// as the database's `upperUTF8(lowerUTF8(·))` does. One value at a time:
+/// it guards the single-character tables, and D4t owns context.
 #[tokio::test]
-async fn lowering_equals_the_databases_for_every_scalar_value() {
+async fn case_key_equals_the_databases_for_every_scalar_value() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let sql = "SELECT cp, lowerUTF8(s) AS low FROM ( \
-        SELECT number AS cp, CAST(multiIf( \
-          number < 0x80, char(number), \
-          number < 0x800, char(0xC0 + bitShiftRight(number, 6), 0x80 + bitAnd(number, 0x3F)), \
-          number < 0x10000, char(0xE0 + bitShiftRight(number, 12), 0x80 + bitAnd(bitShiftRight(number, 6), 0x3F), 0x80 + bitAnd(number, 0x3F)), \
-          char(0xF0 + bitShiftRight(number, 18), 0x80 + bitAnd(bitShiftRight(number, 12), 0x3F), 0x80 + bitAnd(bitShiftRight(number, 6), 0x3F), 0x80 + bitAnd(number, 0x3F)) \
-        ) AS String) AS s \
-        FROM numbers(0x110000) WHERE NOT (number BETWEEN 0xD800 AND 0xDFFF) \
-      ) WHERE low != s";
+    let sql =
+        format!("SELECT cp, upperUTF8(lowerUTF8(s)) AS k FROM ({SCALAR_VALUES_SQL}) WHERE k != s");
     let mut stream = client
-        .query_stream::<LoweredRow>(sql, &QuerySettings::new())
+        .query_stream::<KeyedRow>(&sql, &QuerySettings::new())
         .await
-        .expect("the lowering statement runs");
+        .expect("the key statement runs");
     let mut server: BTreeMap<u64, String> = BTreeMap::new();
     while let Some(row) = stream.next().await {
         let row = row.expect("row decodes");
-        server.insert(row.cp, row.low);
+        server.insert(row.cp, row.k);
     }
-    let mut ours: BTreeMap<u64, String> = BTreeMap::new();
-    for cp in 0..0x11_0000u32 {
-        let Some(c) = char::from_u32(cp) else {
-            continue;
-        };
-        let s = c.to_string();
-        let low = pulsus_logql::word::lower(&s);
-        if low != s {
-            ours.insert(u64::from(cp), low);
-        }
-    }
+    let ours: BTreeMap<u64, String> = scalar_values()
+        .filter_map(|(cp, s)| {
+            let k = pulsus_logql::word::case_key(&s);
+            (k != s).then_some((cp, k))
+        })
+        .collect();
     assert!(
-        ours.len() > 1_000,
-        "lowering changes more than 1,000 values: {}",
+        ours.len() > 1_500,
+        "the key changes more than 1,500 values: {}",
         ours.len()
     );
     let ours_pairs: BTreeSet<(u64, &str)> = ours.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -712,7 +737,109 @@ async fn lowering_equals_the_databases_for_every_scalar_value() {
     let differ: Vec<&(u64, &str)> = ours_pairs.symmetric_difference(&server_pairs).collect();
     assert!(
         differ.is_empty(),
-        "`word::lower` against `lowerUTF8`: {} entries differ, the first: {:?}",
+        "`word::case_key` against `upperUTF8(lowerUTF8(·))`: {} entries differ, the first: {:?}",
+        differ.len(),
+        &differ[..differ.len().min(10)]
+    );
+}
+
+#[derive(Debug, Row, serde::Serialize, serde::Deserialize)]
+struct InvariantRow {
+    total: u64,
+    changed: u64,
+}
+
+/// Issue #757 D3t: no scalar value's key changes when the value is upper-
+/// or lower-cased first, on the server and in `word::case_key`.
+#[tokio::test]
+async fn case_key_ignores_case_for_every_scalar_value() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let sql = format!(
+        "SELECT count() AS total, countIf(NOT (k = upperUTF8(lowerUTF8(upperUTF8(s))) \
+         AND k = upperUTF8(lowerUTF8(lowerUTF8(s))))) AS changed FROM ( \
+         SELECT s, upperUTF8(lowerUTF8(s)) AS k FROM ({SCALAR_VALUES_SQL}))"
+    );
+    let mut stream = client
+        .query_stream::<InvariantRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("the invariance statement runs");
+    let row = stream.next().await.expect("one row").expect("row decodes");
+    assert_eq!((row.total, row.changed), (1_112_064, 0), "the server's key");
+    let changed: Vec<u64> = scalar_values()
+        .filter(|(_, s)| {
+            let k = pulsus_logql::word::case_key(s);
+            k != pulsus_logql::word::case_key(&s.to_uppercase())
+                || k != pulsus_logql::word::case_key(&s.to_lowercase())
+        })
+        .map(|(cp, _)| cp)
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "`word::case_key` changes under case for {} values, the first: {:x?}",
+        changed.len(),
+        &changed[..changed.len().min(10)]
+    );
+}
+
+#[derive(Debug, Row, serde::Serialize, serde::Deserialize)]
+struct ContextRow {
+    s: String,
+    key: String,
+    invariant: u8,
+    commutes: u8,
+}
+
+/// Issue #757 D4t: over every string of one to five symbols from an
+/// alphabet built around the final sigma, `ß`, `İ` and U+212A, the
+/// server's key is case-invariant, the key of a string splits into the key
+/// of each of its words, and `word::case_key` equals the server's key. The
+/// key's SQL is `predicate::case_key_sql`, the function the predicate uses.
+#[tokio::test]
+async fn case_key_equals_the_databases_over_every_short_context_string() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let k = predicate::case_key_sql;
+    let sql = format!(
+        "WITH ['Σ','σ','ς','A','a','Β','.','''',' ','_','1',char(0xCC,0x81),char(0xC2,0xAD),\
+         'İ',char(0xE2,0x84,0xAA),'ß','ẞ'] AS al, length(al) AS n \
+         SELECT s, {key} AS key, \
+           key = {ku} AND key = {kl} AS invariant, \
+           tokens(key, 'splitByNonAlpha') = arrayMap(t -> {kt}, tokens(s, 'splitByNonAlpha')) AS commutes \
+         FROM ( \
+           SELECT arrayStringConcat(arrayMap(i -> al[(intDiv(number, pow(n, i)) % n) + 1], range(len))) AS s \
+           FROM numbers(1419857) ARRAY JOIN [1, 2, 3, 4, 5] AS len WHERE number < pow(n, len))",
+        key = k("s"),
+        ku = k("upperUTF8(s)"),
+        kl = k("lowerUTF8(s)"),
+        kt = k("t"),
+    );
+    let mut stream = client
+        .query_stream::<ContextRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("the context statement runs");
+    let (mut rows, mut not_invariant, mut not_commuting) = (0u64, 0u64, 0u64);
+    let mut differ: Vec<(String, String, String)> = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("row decodes");
+        rows += 1;
+        not_invariant += u64::from(row.invariant != 1);
+        not_commuting += u64::from(row.commutes != 1);
+        let ours = pulsus_logql::word::case_key(&row.s);
+        if ours != row.key {
+            differ.push((row.s, row.key, ours));
+        }
+    }
+    assert_eq!(rows, 1_508_597, "every string of one to five symbols");
+    assert_eq!(
+        (not_invariant, not_commuting),
+        (0, 0),
+        "the server's key: rows not case-invariant, rows whose key does not split into its \
+         words' keys"
+    );
+    assert!(
+        differ.is_empty(),
+        "`word::case_key` against the server: {} strings differ, the first (s, server, ours): {:?}",
         differ.len(),
         &differ[..differ.len().min(10)]
     );

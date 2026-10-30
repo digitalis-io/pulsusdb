@@ -295,8 +295,8 @@ fn line_filter_not_regex_negates_the_whole_compound_predicate() {
 
 #[test]
 fn a_word_line_filter_pushes_down_beside_a_literal_filter() {
-    // Issue #757 H8: `word(…)` renders `hasAllTokens` over the lowered
-    // body, the expression `idx_body_words` indexes.
+    // Issue #757 H8: `word(…)` renders `hasAllTokens` over the body's case
+    // key, the expression `idx_body_words` indexes.
     let sp = streams_plan(
         r#"{service_name="checkout"} |= word("Connection") |= "x""#,
         &range_params(100, Direction::Backward),
@@ -304,7 +304,7 @@ fn a_word_line_filter_pushes_down_beside_a_literal_filter() {
     assert_eq!(
         sqls(&sp.line_filters),
         vec![
-            "hasAllTokens(lowerUTF8(body), [lowerUTF8('Connection')])",
+            "hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('Connection'))])",
             "body LIKE '%x%'"
         ]
     );

@@ -17,6 +17,11 @@ pub fn lower(s: &str) -> String {
     s.chars().flat_map(char::to_lowercase).collect()
 }
 
+/// Stub for plan r4: r1's lowering, until the case key lands.
+pub fn case_key(s: &str) -> String {
+    lower(s)
+}
+
 /// Whether every one of `lowered` (each already [`lower`]ed) is a word of `line`.
 pub fn has_all_words(line: &str, lowered: &[String]) -> bool {
     let line = lower(line);
@@ -45,18 +50,28 @@ mod tests {
             ("«memcached»", &["memcached"], false),
             ("ÜNÏCODE", &["ünïcode"], true),
             ("ΟΔΟΣ", &["ΟΔΟΣ"], true),
-            ("ΟΔΟΣ", &["οδος"], false),
+            ("ΟΔΟΣ", &["οδος"], true),
+            ("ΟΔΟΣ", &["οδοσ"], true),
+            ("ΑΣ.Β", &["ΑΣ"], true),
+            ("ΑΣ.Β", &["ας"], true),
+            ("ΑΣ.Β", &["ασ"], true),
+            ("Α'Σ", &["ς"], true),
+            ("Α'Σ", &["Σ"], true),
+            ("Straße", &["STRASSE"], true),
+            ("STRASSE", &["straße"], true),
+            ("ϐ", &["β"], true),
             ("\u{212A}elvin", &["kelvin"], true),
             ("İstanbul", &["istanbul"], false),
             ("İstanbul", &["İSTANBUL"], true),
             ("refused: Connection", &["connection", "refused"], true),
             ("connection pool", &["connection", "refused"], false),
             ("a\u{0}b", &["a"], true),
+            ("memcached", &[], false),
         ];
         for (line, ws, want) in table {
-            let lowered: Vec<String> = ws.iter().map(|w| lower(w)).collect();
+            let keyed: Vec<String> = ws.iter().map(|w| case_key(w)).collect();
             assert_eq!(
-                has_all_words(line, &lowered),
+                has_all_words(line, &keyed),
                 *want,
                 "line {line:?}, words {ws:?}"
             );

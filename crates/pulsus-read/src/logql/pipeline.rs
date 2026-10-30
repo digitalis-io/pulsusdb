@@ -9033,7 +9033,8 @@ mod tests {
     }
 
     /// Issue #757 H9: a `word(…)` filter run in the process — after
-    /// `line_format`, and on the client-side route — keeps exactly the
+    /// `line_format`, on the client-side route, and in an `or` group
+    /// holding `ip(…)` — keeps exactly the
     /// lines the word rule does. The kept sets are written by hand.
     #[test]
     fn a_word_filter_in_the_process_keeps_the_whole_word_lines() {
@@ -9068,6 +9069,20 @@ mod tests {
             CompiledPipeline::compile_client_side(&stages_of(r#"{a="x"} != word("memcached")"#))
                 .expect("compiles");
         assert_eq!(kept(&client_side), vec![3, 4, 7, 8, 9, 11]);
+        // Not pushed (an `or` group holding `ip(…)`), so it runs here.
+        let with_ip = CompiledPipeline::compile(&stages_of(
+            r#"{a="x"} |= word("memcached") or ip("10.0.0.0/8")"#,
+        ))
+        .expect("compiles");
+        let mut lines: Vec<&str> = MARKERS.to_vec();
+        lines.push("peer 10.1.2.3 up");
+        let got: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, body)| with_ip.run(body, &[], 0).expect("no budget").is_some())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(got, vec![0, 1, 2, 5, 6, 10, 12]);
     }
 
     /// Issue #201 regression: an `ip(…)` line filter renders no `body`

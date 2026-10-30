@@ -1421,6 +1421,11 @@ pub(super) fn non_id_values_expr() -> CheckedFragment {
     }
 }
 
+/// Stub for plan r4: r1's key, until the case key lands.
+pub fn case_key_sql(expr: &str) -> String {
+    format!("lowerUTF8({expr})")
+}
+
 fn contains_predicate(phrase: &str) -> String {
     format!("body LIKE {}", ch_like_contains(phrase))
 }
@@ -2278,8 +2283,8 @@ mod tests {
     }
 
     /// Issue #757 H7: a `word(…)` alternative renders `hasAllTokens` over
-    /// `lowerUTF8(body)`, words lowered in SQL and kept in the order
-    /// written; a `|~` always renders `match(body, …)`.
+    /// the case key `upperUTF8(lowerUTF8(body))`, each word keyed in SQL and
+    /// kept in the order written; a `|~` always renders `match(body, …)`.
     #[test]
     fn a_word_alternative_renders_has_all_tokens_and_a_regex_renders_match_body() {
         fn words(ws: &[&str]) -> LineMatch {
@@ -2292,7 +2297,7 @@ mod tests {
                     head: words(&["Memcached"]),
                     or_matches: Vec::new(),
                 },
-                "hasAllTokens(lowerUTF8(body), [lowerUTF8('Memcached')])",
+                "hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('Memcached'))])",
             ),
             (
                 LineFilter {
@@ -2300,7 +2305,7 @@ mod tests {
                     head: words(&["connection", "refused"]),
                     or_matches: Vec::new(),
                 },
-                "NOT (hasAllTokens(lowerUTF8(body), [lowerUTF8('connection'), lowerUTF8('refused')]))",
+                "NOT (hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('connection')), upperUTF8(lowerUTF8('refused'))]))",
             ),
             (
                 LineFilter {
@@ -2308,7 +2313,7 @@ mod tests {
                     head: words(&["a"]),
                     or_matches: vec![LineMatch::Text("b".to_string())],
                 },
-                "((hasAllTokens(lowerUTF8(body), [lowerUTF8('a')])) OR (body LIKE '%b%'))",
+                "((hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('a'))])) OR (body LIKE '%b%'))",
             ),
             (
                 regex_filter("(?i)(denied|refused)"),
