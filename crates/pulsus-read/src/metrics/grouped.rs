@@ -263,6 +263,15 @@ pub enum PushedRangeFn {
     Increase,
 }
 
+/// Issue #579 part 4: where a selector's rows come from, decided once in
+/// `query_inner` after the range is rounded: `Level` when today's code
+/// reads it from a rollup level by that route, `Raw` otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Arm {
+    Raw,
+    Level(super::rollup::Route),
+}
+
 /// Issue #579: what [`pushed_nodes`] establishes for a shape-A node — an
 /// aggregation over `rate`/`irate`/`increase` of a plain range selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,31 +286,70 @@ pub struct RangeShape {
     pub grid: Grid,
     pub range_ms: i64,
     pub instant: bool,
+    /// Part 4: the selector's arm. Shape A reads a `Level` arm only at the
+    /// finest level (D5).
+    pub arm: Arm,
 }
 
-/// Issue #579: the two kinds of node the database answers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Issue #579 part 4: one side of a shape-C node, `rate`/`increase`/`irate`
+/// of a plain concrete-name selector.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinSide {
+    pub func: PushedRangeFn,
+    pub selector: SelectorId,
+    pub metric_name: String,
+    pub range_ms: i64,
+    /// A rounded `increase`'s `asked / read`, the evaluator's own factor.
+    pub scale: Option<f64>,
+    pub arm: Arm,
+}
+
+/// Issue #579 part 4: shape C, an aggregation over a one-to-one `R1 op R2`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinShape {
+    pub op: RangeAggOp,
+    pub grouping: Option<Grouping>,
+    pub bin: pulsus_promql::BinOp,
+    pub bool_modifier: bool,
+    pub lhs: JoinSide,
+    pub rhs: JoinSide,
+    pub grid: Grid,
+}
+
+/// Issue #579: the kinds of node the database answers.
+#[derive(Debug, Clone, PartialEq)]
 pub enum PushKind {
     /// Shape A: plan section 3.1.
     Range(RangeShape),
     /// Shape B: issue #549's grouped instant read, at any node.
     Instant(GroupedShape),
+    /// Shape C: part 4.
+    Join(JoinShape),
 }
 
 /// Issue #579: one `Aggregate` node the database can answer, keyed by its
 /// `self_pos` — the key the evaluator looks the answer up by.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PushShape {
     pub self_pos: usize,
     pub kind: PushKind,
 }
 
 impl PushShape {
-    /// The one selector under this node.
+    /// The first selector under this node: shape C's left side.
     pub fn selector(&self) -> SelectorId {
         match &self.kind {
             PushKind::Range(r) => r.selector,
             PushKind::Instant(g) => g.selector,
+            PushKind::Join(j) => j.lhs.selector,
+        }
+    }
+
+    /// Every selector under this node, in written order.
+    pub fn selectors(&self) -> Vec<SelectorId> {
+        match &self.kind {
+            PushKind::Join(j) => vec![j.lhs.selector, j.rhs.selector],
+            _ => vec![self.selector()],
         }
     }
 }
@@ -323,6 +371,13 @@ pub enum NodeDecline {
     NameGrouping,
     /// F8: the grid arithmetic would overflow in the database.
     GridOverflow,
+    /// Part 4, D5: a selector reads a level coarser than the finest, or a
+    /// level whose counter is not overlaid.
+    CoarseLevel,
+    /// Part 4, D6: shape C's operator is not `+ - * /` or a comparison.
+    Operator,
+    /// Part 4, D7: shape C names `on`, `ignoring (…)`, `group_*` or `fill`.
+    Matching,
 }
 
 /// Issue #579: a shape-A node the database answers. Part 3: its
@@ -359,6 +414,7 @@ pub fn node_verdicts(
     plan: &QueryPlan,
     params: &PlanParams,
     cfg: &MetricsConfig,
+    arms: &HashMap<SelectorId, Arm>,
 ) -> Vec<(usize, Result<PushShape, NodeDecline>)> {
     // The flag is read HERE and nowhere else in this module or in
     // `grouped_sql`.
@@ -366,7 +422,7 @@ pub fn node_verdicts(
         return Vec::new();
     }
     let mut out = Vec::new();
-    walk(&plan.root, plan, params, &mut out);
+    walk(&plan.root, plan, params, arms, &mut out);
     out
 }
 
@@ -376,6 +432,7 @@ fn walk(
     e: &PlanExpr,
     plan: &QueryPlan,
     params: &PlanParams,
+    arms: &HashMap<SelectorId, Arm>,
     out: &mut Vec<(usize, Result<PushShape, NodeDecline>)>,
 ) {
     if let PlanExpr::Aggregate {
@@ -395,6 +452,7 @@ fn walk(
             *expr_pos,
             plan,
             params,
+            arms,
         )
     {
         let pushed = verdict.is_ok();
@@ -410,7 +468,7 @@ fn walk(
         }
     }
     for child in children(e) {
-        walk(child, plan, params, out);
+        walk(child, plan, params, arms, out);
     }
 }
 
@@ -475,6 +533,7 @@ fn verdict_of(
     expr_pos: usize,
     plan: &QueryPlan,
     params: &PlanParams,
+    _arms: &HashMap<SelectorId, Arm>,
 ) -> Option<Result<PushKind, NodeDecline>> {
     match expr {
         // Shape B: issue #549's checks, at any node.
@@ -532,6 +591,7 @@ fn verdict_of(
                 grid,
                 range_ms,
                 instant: params.step_ms == 0,
+                arm: Arm::Raw,
             })))
         }
         PlanExpr::OverTime { .. } | PlanExpr::OverTimeParam { .. } => {
@@ -613,7 +673,7 @@ pub fn members_of_groups(groups: &[super::labels::MetricSeriesGroup]) -> Vec<Mem
 
 /// Issue #579: every `Aggregate` node the database can answer.
 pub fn pushed_nodes(plan: &QueryPlan, params: &PlanParams, cfg: &MetricsConfig) -> Vec<PushShape> {
-    node_verdicts(plan, params, cfg)
+    node_verdicts(plan, params, cfg, &HashMap::new())
         .into_iter()
         .filter_map(|(_, v)| v.ok())
         .collect()
@@ -676,6 +736,7 @@ pub fn time_chunks(grid: Grid, series: usize, cap: usize) -> Vec<(u32, Grid)> {
 pub fn range_node(
     push: &RangePush,
     chunks: Vec<(u32, Vec<super::grouped_rows::RangeAggRow>)>,
+    _drop_name: bool,
     cancel: &CancelToken,
 ) -> Result<RangeOutcome, PromqlError> {
     let points = push.grid.points as usize;
@@ -755,6 +816,14 @@ pub fn range_node(
         steps,
         annotations: Annotations::new(),
     }))
+}
+
+/// Issue #579 part 4: the grid indices of `grid` whose window
+/// `(t - range, t]` reaches into an interval of `todo` — `t - range < b`
+/// and `t > a` for some `(a, b]`, the test `RawOverlay::touches` makes —
+/// as merged half-open ranges `[g0, g1)`.
+pub fn raw_steps(_grid: Grid, _range_ms: i64, _todo: &[(i64, i64)]) -> Vec<(u32, u32)> {
+    Vec::new()
 }
 
 /// Issue #579: a shape-B node's runs, folded into the node's answer.
@@ -1243,7 +1312,7 @@ mod tests {
             .into_iter()
             .filter_map(|n| match n.kind {
                 PushKind::Instant(g) => Some(g),
-                PushKind::Range(_) => None,
+                PushKind::Range(_) | PushKind::Join(_) => None,
             })
             .collect();
         (instant.len() == 1).then(|| instant.remove(0))
@@ -1963,7 +2032,7 @@ mod tests {
     }
 
     fn verdicts(q: &str, p: PlanParams) -> Vec<(usize, Result<PushShape, NodeDecline>)> {
-        node_verdicts(&plan_of(q, p), &p, &cfg(true))
+        node_verdicts(&plan_of(q, p), &p, &cfg(true), &HashMap::new())
     }
 
     /// T5: the issue's query pushes two nodes — shape A at `sum`, shape B
@@ -2153,7 +2222,7 @@ mod tests {
         let p = range_params();
         let plan = plan_of(ISSUE_QUERY, p);
         assert!(pushed_nodes(&plan, &p, &cfg(false)).is_empty());
-        assert!(node_verdicts(&plan, &p, &cfg(false)).is_empty());
+        assert!(node_verdicts(&plan, &p, &cfg(false), &HashMap::new()).is_empty());
     }
 
     fn range_shape_for(q: &str) -> RangeShape {
@@ -2272,7 +2341,7 @@ mod tests {
             (2, vec![row("idle", 1, 5.0), sentinel(0.0)]),
         ];
         let RangeOutcome::Node(node) =
-            range_node(&push, chunks, &CancelToken::never()).expect("read")
+            range_node(&push, chunks, true, &CancelToken::never()).expect("read")
         else {
             panic!("no histogram sample was counted");
         };
@@ -2316,7 +2385,7 @@ mod tests {
             (0, vec![row("user", 0, 1.0), sentinel(0.0)]),
             (1, vec![sentinel(20.0)]),
         ];
-        match range_node(&push, chunks, &CancelToken::never()).expect("read") {
+        match range_node(&push, chunks, true, &CancelToken::never()).expect("read") {
             RangeOutcome::Histograms(n) => assert_eq!(n, 20),
             RangeOutcome::Node(n) => panic!("histograms were counted, got {n:?}"),
         }
@@ -2457,5 +2526,292 @@ mod tests {
             members_of_groups(&groups),
             vec![member(9, "a", &[("k", "1")]), member(1, "b", &[("k", "2")])]
         );
+    }
+
+    // ------------------------------------------- issue #579 part 4, T8 / T9
+
+    fn level_arm(level: usize, res_ms: i64) -> Arm {
+        Arm::Level(super::super::rollup::Route {
+            level,
+            res_ms,
+            table: format!("metric_samples_{}s", res_ms / 1000),
+            use_: pulsus_promql::RollupUse::Counter,
+        })
+    }
+
+    fn verdicts_at(
+        plan: &QueryPlan,
+        arms: &[(SelectorId, Arm)],
+    ) -> Vec<(usize, Result<PushShape, NodeDecline>)> {
+        let p = range_params();
+        node_verdicts(plan, &p, &cfg(true), &arms.iter().cloned().collect())
+    }
+
+    /// The one verdict of `q`'s plan under `arms`.
+    fn verdict_of_query(q: &str, arms: &[(SelectorId, Arm)]) -> Result<PushShape, NodeDecline> {
+        let v = verdicts_at(&plan_of(q, range_params()), arms);
+        assert_eq!(v.len(), 1, "{q}: {v:?}");
+        v.into_iter().next().expect("one verdict").1
+    }
+
+    fn join_of(q: &str, arms: &[(SelectorId, Arm)]) -> JoinShape {
+        match verdict_of_query(q, arms).map(|n| n.kind) {
+            Ok(PushKind::Join(j)) => j,
+            other => panic!("{q} is not shape C: {other:?}"),
+        }
+    }
+
+    /// T8: an aggregation over a one-to-one match of two range functions is
+    /// shape C, for every operator part 4 pushes, with or without `bool`,
+    /// and `ignoring()` is the default matching.
+    #[test]
+    fn a_vector_match_under_an_aggregate_is_shape_c() {
+        let j = join_of("sum by (instance) (rate(rx[5m]) + rate(tx[5m]))", &[]);
+        assert_eq!(
+            (j.op, j.bin, j.bool_modifier),
+            (RangeAggOp::Sum, pulsus_promql::BinOp::Add, false)
+        );
+        assert_eq!(
+            (j.lhs.selector, j.lhs.metric_name.as_str(), j.lhs.func),
+            (0, "rx", PushedRangeFn::Rate)
+        );
+        assert_eq!(
+            (j.rhs.selector, j.rhs.metric_name.as_str(), j.rhs.range_ms),
+            (1, "tx", 300_000)
+        );
+        assert_eq!((j.lhs.arm.clone(), j.rhs.arm.clone()), (Arm::Raw, Arm::Raw));
+        assert_eq!(j.grid, range_grid());
+        let j = join_of(
+            "max without (device) (irate(rx[5m]) > bool increase(tx[5m]))",
+            &[(1, level_arm(0, 60_000))],
+        );
+        assert!(j.bool_modifier);
+        assert_eq!(
+            (j.lhs.func, j.rhs.func),
+            (PushedRangeFn::Irate, PushedRangeFn::Increase)
+        );
+        assert_eq!(
+            (j.lhs.arm.clone(), j.rhs.arm.clone()),
+            (Arm::Raw, level_arm(0, 60_000))
+        );
+        for op in ["+", "-", "*", "/", "==", "!=", ">", "<", ">=", "<="] {
+            for modifier in ["", " bool", " ignoring()"] {
+                if modifier == " bool" && !matches!(op, "==" | "!=" | ">" | "<" | ">=" | "<=") {
+                    continue;
+                }
+                let q = format!("count(rate(rx[5m]) {op}{modifier} rate(tx[5m]))");
+                join_of(&q, &[]);
+            }
+        }
+        let shape = verdict_of_query("sum(rate(rx[5m]) + rate(tx[5m]))", &[]).expect("pushed");
+        assert_eq!(shape.selectors(), vec![0, 1]);
+        // A child that is not two range functions is not a candidate.
+        assert!(verdicts_at(&plan_of("sum(rate(rx[5m]) + 1)", range_params()), &[]).is_empty());
+    }
+
+    /// T8: a rounded `increase` side carries the evaluator's `asked / read`
+    /// factor, and an unrounded one none.
+    #[test]
+    fn a_rounded_increase_side_carries_its_scale() {
+        let mut plan = plan_of("sum(increase(rx[2m15s]) + rate(tx[2m15s]))", range_params());
+        for sel in &mut plan.selectors {
+            sel.range_ms = Some(300_000);
+        }
+        let v = verdicts_at(&plan, &[]);
+        let Some((
+            _,
+            Ok(PushShape {
+                kind: PushKind::Join(j),
+                ..
+            }),
+        )) = v.first()
+        else {
+            panic!("not shape C: {v:?}");
+        };
+        assert_eq!(j.lhs.scale, Some(135_000f64 / 300_000f64));
+        assert_eq!(j.rhs.scale, None, "rate is never scaled");
+        let j = join_of("sum(increase(rx[5m]) + increase(tx[5m]))", &[]);
+        assert_eq!((j.lhs.scale, j.rhs.scale), (None, None));
+    }
+
+    fn assert_part4_declines(cases: &[&str], arms: &[(SelectorId, Arm)], want: NodeDecline) {
+        for q in cases {
+            assert_eq!(
+                verdict_of_query(q, arms).map(|n| n.kind),
+                Err(want),
+                "{q} under {arms:?}"
+            );
+        }
+    }
+
+    /// T8: every row of part 4's section 4 table, on one query each.
+    #[test]
+    fn each_part4_condition_declines_and_names_it() {
+        // D1.
+        assert_part4_declines(
+            &[
+                "stddev(rate(rx[5m]) + rate(tx[5m]))",
+                "topk(3, rate(rx[5m]) + rate(tx[5m]))",
+            ],
+            &[],
+            NodeDecline::Aggregation,
+        );
+        // D2.
+        assert_part4_declines(
+            &["sum(rate(rx[5m]) + delta(tx[5m]))"],
+            &[],
+            NodeDecline::RangeFunction,
+        );
+        // D3: not plain, or no concrete name.
+        assert_part4_declines(
+            &[
+                "sum(rate(rx[5m] offset 1m) + rate(tx[5m]))",
+                "sum(rate(rx[5m]) + rate({__name__=~\"p_.x_total\"}[5m]))",
+                "sum(rate({job=\"x\"}[5m]) + rate(tx[5m]))",
+            ],
+            &[],
+            NodeDecline::Selector,
+        );
+        // D4.
+        assert_part4_declines(
+            &["sum by (__name__) (rate(rx[5m]) + rate(tx[5m]))"],
+            &[],
+            NodeDecline::NameGrouping,
+        );
+        // D5: a level coarser than the finest, either side, either shape.
+        let coarse = level_arm(1, 720_000);
+        assert_part4_declines(
+            &["sum(rate(rx[1h]))", "sum(rate(rx[1h]) + rate(tx[1h]))"],
+            &[(0, coarse.clone())],
+            NodeDecline::CoarseLevel,
+        );
+        assert_part4_declines(
+            &["sum(rate(rx[1h]) + rate(tx[1h]))"],
+            &[(1, coarse)],
+            NodeDecline::CoarseLevel,
+        );
+        // D6.
+        assert_part4_declines(
+            &[
+                "sum(rate(rx[5m]) % rate(tx[5m]))",
+                "sum(rate(rx[5m]) ^ rate(tx[5m]))",
+                "sum(rate(rx[5m]) atan2 rate(tx[5m]))",
+            ],
+            &[],
+            NodeDecline::Operator,
+        );
+        // D7.
+        assert_part4_declines(
+            &[
+                "sum(rate(rx[5m]) + on (instance) rate(tx[5m]))",
+                "sum(rate(rx[5m]) + on () rate(tx[5m]))",
+                "sum(rate(rx[5m]) + ignoring (device) rate(tx[5m]))",
+                "sum(rate(rx[5m]) * on (instance) group_left rate(tx[5m]))",
+                "sum(rate(rx[5m]) * on (instance) group_right rate(tx[5m]))",
+                "sum(rate(rx[5m]) + fill(0) rate(tx[5m]))",
+            ],
+            &[],
+            NodeDecline::Matching,
+        );
+        // D8: the database's grid arithmetic would wrap on either side.
+        let end_ms = i64::MAX - 5_000_000_000_000;
+        let p = params(end_ms - 10_000_000_000_000, end_ms, 10_000_000_000);
+        let q = "sum(rate(rx[5m]) + rate(tx[200y]))";
+        let v = node_verdicts(&plan_of(q, p), &p, &cfg(true), &HashMap::new());
+        assert!(
+            v.iter().any(|(_, r)| *r == Err(NodeDecline::GridOverflow)),
+            "{q}: {v:?}"
+        );
+    }
+
+    /// T8: a `Level` arm at the finest level is pushed for both shapes, and
+    /// carried on the shape.
+    #[test]
+    fn a_finest_level_arm_is_pushed() {
+        let fine = level_arm(0, 60_000);
+        match verdict_of_query("sum(rate(rx[5m]))", &[(0, fine.clone())]).map(|n| n.kind) {
+            Ok(PushKind::Range(r)) => assert_eq!(r.arm, fine),
+            other => panic!("not shape A: {other:?}"),
+        }
+        let j = join_of(
+            "sum(rate(rx[5m]) + rate(tx[5m]))",
+            &[(0, fine.clone()), (1, fine.clone())],
+        );
+        assert_eq!((j.lhs.arm, j.rhs.arm), (fine.clone(), fine));
+    }
+
+    /// A small seeded generator, so T9's cases are the same every run.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn upto(&mut self, n: u64) -> i64 {
+            (self.next() % n) as i64
+        }
+    }
+
+    /// T9: a grid index is in `raw_steps` exactly when the overlay's own
+    /// test, `level_window_exists` at that one step, finds the window
+    /// touching a piece — over 1,000 seeded grids, ranges and up to five
+    /// pieces.
+    #[test]
+    fn raw_steps_agree_with_the_overlay() {
+        let mut rng = Lcg(579);
+        let base = plan_of("rate(rx[5m])", range_params()).selectors[0].clone();
+        let mut covered = 0usize;
+        for case in 0..1_000 {
+            let step_ms = 1_000 * (1 + rng.upto(300));
+            let points = 1 + rng.upto(200) as u32;
+            let start_ms = 1_782_907_200_000 + rng.upto(3_600_000);
+            let range_ms = 1_000 * (1 + rng.upto(900));
+            let grid = Grid {
+                start_ms,
+                step_ms,
+                points,
+                lookback_ms: DEFAULT_LOOKBACK_MS,
+            };
+            let span = step_ms * i64::from(points) + range_ms;
+            let mut at = start_ms - range_ms - rng.upto(600_000);
+            let mut pieces = Vec::new();
+            for _ in 0..rng.upto(6) {
+                let a = at + rng.upto(span as u64 / 3 + 1);
+                let b = a + 1 + rng.upto(span as u64 / 4 + 1);
+                pieces.push((a, b));
+                at = b + 1 + rng.upto(span as u64 / 5 + 1);
+            }
+            let mut sel = base.clone();
+            sel.range_ms = Some(range_ms);
+            let steps = raw_steps(grid, range_ms, &pieces);
+            for gi in 0..points {
+                let t = start_ms + i64::from(gi) * step_ms;
+                let one = PlanParams {
+                    start_ms: t,
+                    end_ms: t,
+                    step_ms: 0,
+                    ..range_params()
+                };
+                let raw = !super::super::rollup::level_window_exists(&sel, &one, &pieces);
+                let listed = steps.iter().any(|&(g0, g1)| gi >= g0 && gi < g1);
+                assert_eq!(
+                    listed, raw,
+                    "case {case}: gi {gi} t {t} range {range_ms} pieces {pieces:?} steps {steps:?}"
+                );
+                covered += usize::from(raw);
+            }
+            // Merged, ascending, non-empty ranges.
+            assert!(
+                steps.windows(2).all(|w| w[0].1 < w[1].0),
+                "case {case}: {steps:?}"
+            );
+            assert!(steps.iter().all(|&(g0, g1)| g0 < g1 && g1 <= points));
+        }
+        assert!(covered > 0, "no case had a raw step");
     }
 }

@@ -83,7 +83,7 @@
 
 use pulsus_model::{FpLiteral, Tenant};
 
-use pulsus_promql::Grouping;
+use pulsus_promql::{BinOp, Grouping};
 
 use crate::logql::escape::ch_string;
 
@@ -643,6 +643,75 @@ fn avg_fold(values: &str, state: &str) -> String {
     )
 }
 
+/// Issue #579 part 4: a `Level` side's reads for one time chunk, as phase 1
+/// computed them from its coverage statement (S1).
+#[derive(Debug, Clone, Copy)]
+pub struct LevelRead<'a> {
+    pub table: &'a str,
+    pub clustered: bool,
+    pub shards: u32,
+    /// The selector's fetch window `(lo, hi]`: S1's run predicate.
+    pub window: (i64, i64),
+    /// The covered part of the window, cut to `(lo, chunk end]`.
+    pub served: &'a [(i64, i64)],
+    /// The raw read around the uncovered part, cut likewise.
+    pub read: &'a [(i64, i64)],
+    /// The chunk's grid indices whose window reaches the uncovered part,
+    /// chunk-relative, `[g0, g1)`.
+    pub raw_steps: &'a [(u32, u32)],
+}
+
+/// Issue #579 part 4: one side of a pushed node, as its statements read it.
+#[derive(Debug, Clone, Copy)]
+pub struct SideSql<'a> {
+    pub tenant: &'a Tenant,
+    pub samples_table: &'a str,
+    pub labels_table: &'a str,
+    pub ids_sql: &'a str,
+    pub metric_name: &'a str,
+    pub func: PushedRangeFn,
+    pub range_ms: i64,
+    /// A rounded `increase`'s factor, `asked / read`.
+    pub scale: Option<f64>,
+    /// The selector's fetch window `(lo, hi]`, which the histogram count
+    /// reads.
+    pub window: (i64, i64),
+    /// `None` for a `Raw` arm.
+    pub level: Option<LevelRead<'a>>,
+}
+
+/// Issue #579 part 4: a `Level` arm's points, from the level rows the
+/// replica that answered also proved it holds (`LEVEL_GATHER`).
+pub fn level_gather(_tenant: &Tenant, _ids_sql: &str, _level: &LevelRead<'_>) -> String {
+    String::new()
+}
+
+/// Issue #579 part 4: shape A over a `Level` arm, one time chunk (S3a).
+pub fn level_aggregate_fetch(
+    _side: &SideSql<'_>,
+    _hist_samples_table: &str,
+    _grouping: Option<&Grouping>,
+    _grid: Grid,
+    _op: RangeAggOp,
+) -> String {
+    String::new()
+}
+
+/// Issue #579 part 4: shape C, one time chunk (S3b).
+#[allow(clippy::too_many_arguments)]
+pub fn join_aggregate_fetch(
+    _lhs: &SideSql<'_>,
+    _rhs: &SideSql<'_>,
+    _hist_samples_table: &str,
+    _grouping: Option<&Grouping>,
+    _grid: Grid,
+    _op: RangeAggOp,
+    _bin: BinOp,
+    _bool_modifier: bool,
+) -> String {
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1155,5 +1224,166 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ------------------------------------------ issue #579 part 4, T11
+
+    const JOIN_GOLDEN: &str = include_str!("../../tests/golden/join_aggregate_statements.txt");
+
+    /// T11's ID statement of one metric.
+    fn t11_ids(name: &str) -> String {
+        format!(
+            "SELECT fingerprint\n\
+             FROM metric_series\n\
+             WHERE day BETWEEN '2026-10-29' AND '2026-10-30'\n\
+             \x20 AND bitAnd(hours, 16777215) != 0\n\
+             \x20 AND fingerprint IN (\n\
+             \x20   SELECT fingerprint\n\
+             \x20   FROM metric_labels\n\
+             \x20   WHERE metric_name = '{name}'\n\
+             \x20 )"
+        )
+    }
+
+    /// The golden's sections, keyed by their marker.
+    fn join_golden() -> Vec<(String, String)> {
+        JOIN_GOLDEN
+            .split("-- golden[")
+            .skip(1)
+            .map(|part| {
+                let (key, body) = part.split_once("]\n").expect("a marker line");
+                (
+                    key.to_string(),
+                    body.strip_suffix('\n')
+                        .expect("a section ends in a newline")
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    const T11_START: i64 = 1_793_300_400_000;
+    const T11_END: i64 = T11_START + 720 * 120_000;
+    const T11_WINDOW: (i64, i64) = (T11_START - 600_000, T11_END);
+    const T11_SERVED: [(i64, i64); 2] = [
+        (T11_WINDOW.0, T11_END - 21_600_000),
+        (T11_END - 19_800_000, T11_END - 600_000),
+    ];
+    const T11_READ: [(i64, i64); 2] = [
+        (T11_END - 21_900_000, T11_END - 19_500_000),
+        (T11_END - 900_000, T11_END),
+    ];
+    const T11_STEPS: [(u32, u32); 2] = [(541, 559), (715, 721)];
+
+    fn t11_level() -> LevelRead<'static> {
+        LevelRead {
+            table: "metric_samples_60s",
+            clustered: false,
+            shards: 1,
+            window: T11_WINDOW,
+            served: &T11_SERVED,
+            read: &T11_READ,
+            raw_steps: &T11_STEPS,
+        }
+    }
+
+    fn t11_grid() -> Grid {
+        Grid {
+            start_ms: T11_START,
+            step_ms: 120_000,
+            points: 721,
+            lookback_ms: 300_000,
+        }
+    }
+
+    /// The section `key` of the golden, which a script rendered from part
+    /// 4's plan, section 6, before any builder existed.
+    fn join_section(key: &str) -> String {
+        join_golden()
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .unwrap_or_else(|| panic!("no section {key}"))
+            .1
+    }
+
+    /// T11: the level gather renders the plan's text byte for byte.
+    #[test]
+    fn the_level_gather_renders_the_plans_text() {
+        let tenant = no_tenant();
+        assert_eq!(
+            level_gather(&tenant, &t11_ids("p_rx_total"), &t11_level()),
+            join_section("level_gather")
+        );
+    }
+
+    /// T11: shape C under `+`, both sides at the level, and under `> bool`
+    /// with an `irate` side read raw, render the plan's text byte for byte.
+    #[test]
+    fn the_join_statements_render_the_plans_text() {
+        let tenant = no_tenant();
+        let (rx_ids, tx_ids) = (t11_ids("p_rx_total"), t11_ids("p_tx_total"));
+        fn side<'a>(
+            tenant: &'a Tenant,
+            name: &'a str,
+            ids: &'a str,
+            func: PushedRangeFn,
+            level: Option<LevelRead<'a>>,
+        ) -> SideSql<'a> {
+            SideSql {
+                tenant,
+                samples_table: "metric_samples",
+                labels_table: "metric_labels",
+                ids_sql: ids,
+                metric_name: name,
+                func,
+                range_ms: 300_000,
+                scale: None,
+                window: T11_WINDOW,
+                level,
+            }
+        }
+        let rx = side(
+            &tenant,
+            "p_rx_total",
+            &rx_ids,
+            PushedRangeFn::Rate,
+            Some(t11_level()),
+        );
+        let tx = side(
+            &tenant,
+            "p_tx_total",
+            &tx_ids,
+            PushedRangeFn::Rate,
+            Some(t11_level()),
+        );
+        let tx_irate = side(&tenant, "p_tx_total", &tx_ids, PushedRangeFn::Irate, None);
+        let by_instance = grouping_of("by (instance)");
+        let without_device = grouping_of("without (device)");
+        assert_eq!(
+            join_aggregate_fetch(
+                &rx,
+                &tx,
+                "metric_hist_samples",
+                by_instance.as_ref(),
+                t11_grid(),
+                RangeAggOp::Sum,
+                BinOp::Add,
+                false,
+            ),
+            join_section("sum by (instance) (rate + rate)")
+        );
+        assert_eq!(
+            join_aggregate_fetch(
+                &rx,
+                &tx_irate,
+                "metric_hist_samples",
+                without_device.as_ref(),
+                t11_grid(),
+                RangeAggOp::Count,
+                BinOp::Gt,
+                true,
+            ),
+            join_section("count without (device) (rate > bool irate)")
+        );
     }
 }

@@ -551,7 +551,15 @@ pub struct MetricsEngine {
     /// TEST SEAM (issue #18 part B): replaces a level fetch's answer, by
     /// its statement text. `None` in production.
     rollup_answer_hook: Option<RollupAnswerHook>,
+    /// TEST SEAM (issue #579 part 4): edits a pushed node's coverage rows
+    /// (S1), by selector, before they are used. `None` in production.
+    coverage_hook: Option<CoverageHook>,
 }
+
+/// TEST SEAM (issue #579 part 4): one selector's S1 run rows, edited.
+pub type CoverageHook = std::sync::Arc<
+    dyn Fn(SelectorId, Vec<super::rollup::RunRow>) -> Vec<super::rollup::RunRow> + Send + Sync,
+>;
 
 /// TEST SEAM (issue #18 part B): a level fetch's answer by its statement
 /// text, or `None` to send the statement.
@@ -579,6 +587,7 @@ impl MetricsEngine {
             exemplar_answer_bytes: super::exemplars::EXEMPLAR_ANSWER_BYTES,
             rollup_levels: None,
             rollup_answer_hook: None,
+            coverage_hook: None,
         }
     }
 
@@ -594,6 +603,14 @@ impl MetricsEngine {
     #[doc(hidden)]
     pub fn with_rollup_answer_hook(mut self, hook: RollupAnswerHook) -> Self {
         self.rollup_answer_hook = Some(hook);
+        self
+    }
+
+    /// TEST SEAM (issue #579 part 4) — see [`CoverageHook`]. Never called
+    /// by `pulsus-server`.
+    #[doc(hidden)]
+    pub fn with_coverage_hook(mut self, hook: CoverageHook) -> Self {
+        self.coverage_hook = Some(hook);
         self
     }
 
@@ -774,7 +791,9 @@ impl MetricsEngine {
         // the sole reader of `config.grouped_push` and the sole owner of
         // the grid-overflow guard.
         let mut owners: HashMap<SelectorId, super::grouped::PushShape> = HashMap::new();
-        for (_, verdict) in super::grouped::node_verdicts(&plan, &plan_params, &self.config) {
+        for (_, verdict) in
+            super::grouped::node_verdicts(&plan, &plan_params, &self.config, &HashMap::new())
+        {
             match verdict {
                 Ok(node) => {
                     owners.insert(node.selector(), node);
@@ -892,7 +911,7 @@ impl MetricsEngine {
                         fetch_plans.push(SelectorFetchPlan::Empty);
                         continue;
                     }
-                    None => {}
+                    Some((_, super::grouped::PushKind::Join(_))) | None => {}
                 }
                 let (fetch_plan, read) = if by_index {
                     self.nameless_fetch_plan(tenant, sel, groups, window, explain.as_deref_mut())
@@ -1100,7 +1119,7 @@ impl MetricsEngine {
                     fetch_plans.push(SelectorFetchPlan::Empty);
                     continue;
                 }
-                None => {}
+                Some((_, super::grouped::PushKind::Join(_))) | None => {}
             }
 
             let fetch_plan = self.concrete_fetch_plan(
@@ -3899,7 +3918,7 @@ async fn nodes_offloaded(
                     push,
                     chunks,
                     ..
-                } => match super::grouped::range_node(&push, chunks, &token)? {
+                } => match super::grouped::range_node(&push, chunks, true, &token)? {
                     super::grouped::RangeOutcome::Node(node) => out.push((self_pos, node)),
                     // The caller took every result whose sentinel counted
                     // a histogram sample out before this point.
