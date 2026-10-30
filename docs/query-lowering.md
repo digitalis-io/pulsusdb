@@ -52,11 +52,11 @@ Those are three projections of one traversal. `metric_pipeline_construct` is exa
 returning the first refusal and its reason"; `has_unpushed_dropping_stage` is "did the boundary
 fall short"; `compile_line_filters` is "the predicate the fold accumulated".
 
-Underneath them, `is_pushable_line_filter` (`plan.rs:4357`) carries a doc comment that states the
+Underneath them, `is_pushable_line_filter` (`plan.rs:4356`) carries a doc comment that states the
 problem in the codebase's own words — *"the single source of truth for 'does this line filter push
 down to SQL, or must it run in the client pipeline?' … so the two paths never drift"* — and it has
 five call sites across three files: `plan.rs:1708`, `plan.rs:1730`, `plan.rs:4331`,
-`pipeline.rs:1177`, `exec.rs:2810`.
+`pipeline.rs:1180`, `exec.rs:2810`.
 
 TraceQL computes the same thing a fourth time and shares none of it:
 [`filter::collect`](../crates/pulsus-read/src/traces/filter.rs) (line 2732) walks a boolean tree
@@ -1583,7 +1583,7 @@ variants and carries **none** of the window, the range aggregation, the vector a
 ordering, the limit or the response builder — while `Unwrap` **is** one of the ten. `LogRange`'s own
 `unwrap` field is *"retained-but-unused … the parser represents `| unwrap …` as an ordered
 `Stage::Unwrap` inside `selector.pipeline` … and always leaves this field `None`"*
-(`ast.rs:2294-2299`, `parser.rs:1298`, and the defence-in-depth comment at
+(`ast.rs:2300-2305`, `parser.rs:1324`, and the defence-in-depth comment at
 `crates/pulsus-read/src/logql/plan.rs:2760`). So `Unwrap` reaches the chain through `Pipe`, in its
 written position — which is the whole reason the parser puts it there, so post-`unwrap` label
 filters keep theirs — and a separate `Unwrap` link would be a second spelling of one construct.
@@ -1593,7 +1593,7 @@ filters keep theirs — and a separate `Unwrap` link would be a second spelling 
 
 /// LogQL's chain link. `pulsus_logql::Stage` is ONE arm, carrying all ten
 /// of its variants in the pipeline's own order; the window and the two
-/// aggregation levels live in `LogRange` (`ast.rs:2301`) and `MetricExpr`
+/// aggregation levels live in `LogRange` (`ast.rs:2307`) and `MetricExpr`
 /// (`ast.rs:939`) and are synthesised into links by the chain builder.
 pub enum LqlLink {
     Pipe(pulsus_logql::Stage),
@@ -1608,7 +1608,7 @@ pub enum LqlLink {
 ```
 
 `param` is `Option<String>` and not `Option<f64>` because the AST keeps the `quantile_over_time`
-and `topk` parameters as **raw text** so it can derive `Eq`/`Hash` (`ast.rs:943-946`, `:959-962`);
+and `topk` parameters as **raw text** so it can derive `Eq`/`Hash` (`ast.rs:949-952`, `:965-968`);
 parsing to `f64` is the planner's job and doing it in the link would move a parse error out of the
 one place that reports it.
 
@@ -1620,7 +1620,7 @@ Source -> Pipe(Stage) x n -> Window -> RangeAgg -> (VectorAgg | LabelReplace) x 
 
 **`LabelReplace` is one of the *m* post-`RangeAgg` links, interleaved with the `VectorAgg` levels
 rather than fixed before or after them.** `MetricExpr::LabelReplace`
-(`crates/pulsus-logql/src/ast.rs:1002`) carries an `inner: Child<MetricExpr>` and is a `metricExpr`
+(`crates/pulsus-logql/src/ast.rs:1008`) carries an `inner: Child<MetricExpr>` and is a `metricExpr`
 alternative, so it composes in every metric position; an earlier version of this diagram omitted it
 while the table below carried it, and the two disagreed.
 
@@ -1666,7 +1666,7 @@ maps to **`400`** with `Content-Type: text/plain; charset=utf-8` and `X-Content-
 
 **How this table is derived, because the previous one was transcribed and missed two rejections a
 user can reach today.** The enumeration is over a literal scope: **every `ReadError::` construction
-in `crates/pulsus-read/src/logql/plan.rs` above `mod tests` (`plan.rs:4817`)**, which is 25 sites at
+in `crates/pulsus-read/src/logql/plan.rs` above `mod tests` (`plan.rs:4816`)**, which is 25 sites at
 `2f78c53`, listed by `grep -n 'ReadError::[A-Z]' crates/pulsus-read/src/logql/plan.rs`. Every one of
 the 25 is either a row below or is excluded beneath the table with its reason, so completeness is a
 property of that grep and not of anyone's reading. Each row's body **and its reachability** were
@@ -1744,7 +1744,7 @@ says so in its own doc comment; that is why `RangeAgg::param` and `VectorAgg::pa
 
 | link | accepts → produces | precondition to lower | residual state effect | disposition | continuation |
 |---|---|---|---|---|---|
-| `LineFilter(lf)` (`ast.rs:134`) | `Lines` → `Lines` | `body` provenance resolves to a SQL expression — `Stored`, or `Computed(e)` from `decolorize`/`unpack` (§5) — **and** `is_pushable_line_filter(lf)` (`plan.rs:4357`: no `ip()` alternative) | **clears `exact`**: it removes lines in the evaluator, so the SQL result is a superset | conditional | *none* |
+| `LineFilter(lf)` (`ast.rs:134`) | `Lines` → `Lines` | `body` provenance resolves to a SQL expression — `Stored`, or `Computed(e)` from `decolorize`/`unpack` (§5) — **and** `is_pushable_line_filter(lf)` (`plan.rs:4356`: no `ip()` alternative) | **clears `exact`**: it removes lines in the evaluator, so the SQL result is a superset | conditional | *none* |
 | `Parser(Json { extractions })` (`ast.rs:237`) | `Lines` → `Lines`, `cols` widened by an open source over `body` | `body`'s provenance is expressible | `cols` still widened, but with an **evaluator-only** open source whose `resolve` answers `None`, so a following `LabelFilter` goes residual instead of lowering against a name SQL cannot see. Does **not** clear `exact` | conditional. **Issue #624 part 3b: a counting range query over pushable line filters, this stage and only label filters lowers** — bare under a parent `sum` or `sum by`, targeted under any parent when every expression is one plain top-level field — with the key labels read in the statement and the stages after it run once per group over a document of those keys. **Whether that query lowers is the planner's decision (`json_count_route`)**, as for `Regexp` below, so this link stays residual in the model | *none* |
 | `Parser(Logfmt { strict, keep_empty, extractions })` (`ast.rs:242`) | as above | as above | as above | conditional. **Issue #624 part 3d: a counting range query over pushable line filters, this stage with any flags and only label filters, `drop` and `keep` lowers** — bare under a parent `sum` or `sum by`, targeted under any parent — with the line's fields whose sanitised key is a name the answer reads sent in the statement, and the stages after it run once per group over those fields. As for `Json`, **whether that query lowers is the planner's decision (`logfmt_count_route`)**, so this link stays residual in the model | *none* |
 | `Parser(Regexp(re))` (`ast.rs:248`) | as above, names = capture groups | as above, and the pattern expressible | as above | conditional. **Issue #624 part 3a: the statement runs it** — `extractGroups(body, 're')` as an element of the raw reads' `rx` column, and, in a counting range query, as the group key's `matched` and captures, with the stages after it run once per group. **Whether that query lowers is the planner's decision (`regexp_count_route`), as window-grid representability is:** it turns on the reducer and on every stage after the parser, which a per-link capability does not see, so this link stays residual in the model and the model-agreement walks over log-query chains are unchanged | *none* |
@@ -1763,15 +1763,15 @@ says so in its own doc comment; that is why `RangeAgg::param` and `VectorAgg::pa
 | link | source | accepts → produces | precondition to lower | residual state effect | disposition | continuation |
 |---|---|---|---|---|---|---|
 | `Source` | the stream selector (`LogQL`'s `{…}`) | — → `Lines` | none; the seed is lowered by the predicate lattice rather than by the stage fold, so it always emits | **none — the identity.** The seed is always applied, so there is no residual case, and the row asserts the identity rather than leaving the exemption silent (`logql/compile.rs:315-318`) | **always lowers**, `Fidelity::Equivalent` | *none* |
-| `Window` | `LogRange` (`ast.rs:2301`) + the request step | `Lines`\|`Samples` → the same, bucketed | the origin-shifted bucket expression is emittable and the offset is representable | records the bucketing as evaluator-owned, so a following aggregation cannot lower | conditional | *none* |
-| `RangeAgg` | `MetricExpr::Range` (`ast.rs:940`) | `Samples` → `Series{by}` | `exact`, the `Window` lowered, and `__error__` either filtered or carried in the grouping | **shape unchanged** — `Lines` whenever the `Unwrap` above went residual, which is the case its own row describes; clears `exact` | conditional. `AbsentOverTime` lowers with `count()`: the answer is 1 where no counted row covers a grid point, so presence is a count above zero (#624 part 2). `bytes_over_time`/`bytes_rate` do not lower once `body` is no longer the stored column — a stage rewrote the line, and the bytes are the rewritten line's | *none* |
-| `VectorAgg`, one link per level | `MetricExpr::Vector` (`ast.rs:956`) | `Series` → `Series` | the prior level lowered and the grouping is expressible | retains the prior series state; clears `exact` | conditional | *none* |
-| `LabelReplace` | `MetricExpr::LabelReplace` (`ast.rs:1002`) | `Series` → `Series` | none today — see below | retains series state; **clears `exact`**, because at range it can REMOVE series: colliding post-rewrite label sets merge (`post_agg.rs:3307`, `merge_matrix_collisions`) | must go residual today: `No(NotYetLowered)` | *none* |
+| `Window` | `LogRange` (`ast.rs:2307`) + the request step | `Lines`\|`Samples` → the same, bucketed | the origin-shifted bucket expression is emittable and the offset is representable | records the bucketing as evaluator-owned, so a following aggregation cannot lower | conditional | *none* |
+| `RangeAgg` | `MetricExpr::Range` (`ast.rs:946`) | `Samples` → `Series{by}` | `exact`, the `Window` lowered, and `__error__` either filtered or carried in the grouping | **shape unchanged** — `Lines` whenever the `Unwrap` above went residual, which is the case its own row describes; clears `exact` | conditional. `AbsentOverTime` lowers with `count()`: the answer is 1 where no counted row covers a grid point, so presence is a count above zero (#624 part 2). `bytes_over_time`/`bytes_rate` do not lower once `body` is no longer the stored column — a stage rewrote the line, and the bytes are the rewritten line's | *none* |
+| `VectorAgg`, one link per level | `MetricExpr::Vector` (`ast.rs:962`) | `Series` → `Series` | the prior level lowered and the grouping is expressible | retains the prior series state; clears `exact` | conditional | *none* |
+| `LabelReplace` | `MetricExpr::LabelReplace` (`ast.rs:1008`) | `Series` → `Series` | none today — see below | retains series state; **clears `exact`**, because at range it can REMOVE series: colliding post-rewrite label sets merge (`post_agg.rs:3307`, `merge_matrix_collisions`) | must go residual today: `No(NotYetLowered)` | *none* |
 | `Order` | the request direction | `Lines`\|`Series` → same | the ordering columns are in the projection | leaves `ordering` unset | conditional | *none* |
 | `Limit(n)` | the request limit | `Lines`\|`Series` → same | `ordering.is_some()` **and `exact`** — a `LIMIT` over a superset loses rows a residual link would have kept | leaves `limit` unset, which is today's oversample path | conditional | in the model: **the same SQL part, issued once per page** when `!exact` — `Issue::PerSeed(Driver::Keyset)`, which is how the model describes LogQL's `fetch_until_limit` loop — and `Issue::Once` with the `LIMIT` in the statement when every earlier link was `Fidelity::Equivalent`. LogQL's own compiler makes this decision in `plan.rs` (§2.7.5) |
 | `Emit` | the response builder | → answer | none | records the response build as the evaluator's | **must go residual** | *none* on the LogQL routes: the response is built from rows the last SQL part already returned |
-| `MetricExpr::Literal` (`ast.rs:967`), `VectorFn` (`:972`) | — | — | scalar leaves, not chain links | n/a | not in the chain | n/a |
-| `MetricExpr::Binary` (`ast.rs:977`), `Variants` (`:992`) | — | — | **trees, not chains.** A left fold cannot represent two operands | n/a | out of scope, named | n/a |
+| `MetricExpr::Literal` (`ast.rs:973`), `VectorFn` (`:978`) | — | — | scalar leaves, not chain links | n/a | not in the chain | n/a |
+| `MetricExpr::Binary` (`ast.rs:983`), `Variants` (`:998`) | — | — | **trees, not chains.** A left fold cannot represent two operands | n/a | out of scope, named | n/a |
 
 **Why `LabelReplace` clears `exact`, and why a grouped SQL form cannot replace it.** An earlier
 version of this row said it "removes no series". At **range** it does: colliding label sets merge
@@ -4992,9 +4992,9 @@ measured. None of them exists at base.
 These are **lib unit tests**, because `compile_line_filters` is `pub(crate)`
 (`crates/pulsus-read/src/logql/plan.rs:4323`) and `has_unpushed_dropping_stage` (`:1692`) and
 `metric_pipeline_construct` (`:1726`) are private — an integration test cannot call any of them.
-**They go in `plan.rs`'s existing `mod tests` (`plan.rs:4817`), and no production item is widened
+**They go in `plan.rs`'s existing `mod tests` (`plan.rs:4816`), and no production item is widened
 for them.** That module is a child of `logql::plan`, so it already reaches both private functions —
-directly, and again through its `use super::*` (`plan.rs:4992`). An earlier version of this section
+directly, and again through its `use super::*` (`plan.rs:4991`). An earlier version of this section
 offered a second option — **#492 part 1** writes them wherever they go — moving the gates to
 `logql::compile`'s test module with the two functions raised to `pub(super)`. That option is **withdrawn**: the widening was never needed, and a design
 that offers two placements has not decided.
@@ -5015,7 +5015,7 @@ line rewrites, parsers and `label_format` — every stage the 15-atom set does n
 
 **What these three gates will NOT establish once #492 part 1 has written them, because they share a
 helper — today they establish nothing, because they do not exist.** All three walks call
-`is_pushable_line_filter` (`crates/pulsus-read/src/logql/plan.rs:4357`) — `plan.rs:4331`,
+`is_pushable_line_filter` (`crates/pulsus-read/src/logql/plan.rs:4356`) — `plan.rs:4331`,
 `plan.rs:1708`, `plan.rs:1730` — and so does the model's `LineFilter::capability` (§7.1). The
 sharing is deliberate and stays: that function's doc comment calls itself *"the single source of
 truth for 'does this line filter push down to SQL, or must it run in the client pipeline?' … so the
@@ -5547,8 +5547,8 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | occurrences those resolved pairs cover | 349 |
 | `(document, token)` pairs it cannot resolve | 194 |
 | occurrences those frozen pairs cover | 304 |
-| resolved rows anchored on a token the citing prose prints | 141 |
-| resolved rows anchored on a snapshot of the cited line | 114 |
+| resolved rows anchored on a token the citing prose prints | 139 |
+| resolved rows anchored on a snapshot of the cited line | 116 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
@@ -5566,7 +5566,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 653 citation occurrences the five artefacts make, 478 name a bare basename and 65 are written as a continuation of a citation earlier on the same line. The rule resolves 255 `(document, token)` pairs covering 349 occurrences, and cannot resolve 194 covering 304. Of the resolved rows, 141 are anchored on a token the citing prose prints and 114 on a snapshot of the cited line.
+Of the 653 citation occurrences the five artefacts make, 478 name a bare basename and 65 are written as a continuation of a citation earlier on the same line. The rule resolves 255 `(document, token)` pairs covering 349 occurrences, and cannot resolve 194 covering 304. Of the resolved rows, 139 are anchored on a token the citing prose prints and 116 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 2 citations, all of them read one at a time. 1 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

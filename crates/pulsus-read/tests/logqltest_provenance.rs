@@ -2082,7 +2082,8 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-read/src/logql/plan.rs", 1),
     // Issue #624, part 3d-3 adds three: a targeted `| logfmt` filter's
     // control-separator test and its `!=` key-with-no-`=` test, and the
-    // expected text of the test that pins them.
+    // expected text of the test that pins them. Issue #757 adds one: the
+    // expected text of the test that pins `|~` as `match(body, …)`.
     ("pulsus-read/src/logql/predicate.rs", 19),
     // Issue #624, part 3d adds three to `sql.rs`: the `| logfmt` line
     // grammar in its `decided` column, and the out-of-range integer test in
@@ -2120,7 +2121,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 104;
+const MATCH_RENDER_TOTAL: usize = 105;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
@@ -2532,6 +2533,9 @@ const PREDICATE_ITEMS: &[&str] = &[
     "mod tests :: use pulsus_model::Fingerprint",
     "mod tests :: use super::*",
     "mod tests :: fn regex_filter(value: &str) -> LineFilter",
+    "mod tests :: #[test]",
+    "mod tests :: fn a_word_alternative_renders_has_all_tokens_and_a_regex_renders_match_body()",
+    "mod tests :: fn a_word_alternative_renders_has_all_tokens_and_a_regex_renders_match_body() :: fn words(ws: &[&str]) -> LineMatch",
     "mod tests :: #[test]",
     "mod tests :: fn an_uncompilable_pattern_is_refused_at_the_line_filter_mint()",
     "mod tests :: #[test]",

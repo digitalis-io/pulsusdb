@@ -2,7 +2,7 @@ doc	token	reason
 docs/query-lowering.md	492-fold-breakA.rs:156	not_a_tracked_file
 docs/query-lowering.md	492-fold-breakB.rs:316	not_a_tracked_file
 docs/query-lowering.md	ast.rs:1046	ambiguous_basename
-docs/query-lowering.md	ast.rs:2294-2299	ambiguous_basename
+docs/query-lowering.md	ast.rs:2300-2305	ambiguous_basename
 docs/query-lowering.md	ast.rs:237	ambiguous_basename
 docs/query-lowering.md	ast.rs:242	ambiguous_basename
 docs/query-lowering.md	ast.rs:248	ambiguous_basename
@@ -38,7 +38,7 @@ docs/query-lowering.md	metrics_sql.rs:111	not_a_tracked_file
 docs/query-lowering.md	metrics_sql.rs:1512	not_a_tracked_file
 docs/query-lowering.md	metrics_sql.rs:546	not_a_tracked_file
 docs/query-lowering.md	metrics_sql.rs:562	not_a_tracked_file
-docs/query-lowering.md	parser.rs:1298	ambiguous_basename
+docs/query-lowering.md	parser.rs:1324	ambiguous_basename
 docs/query-lowering.md	plan.rs:1258	ambiguous_basename
 docs/query-lowering.md	plan.rs:1285	ambiguous_basename
 docs/query-lowering.md	plan.rs:1294	ambiguous_basename

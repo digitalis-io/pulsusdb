@@ -71,25 +71,19 @@ pub fn ch_string(s: &str) -> String {
 /// needle's own `\`, `%` and `_` escaped so they match literally. LogQL's
 /// `|=`/`!=` are byte-substring tests (Loki `pkg/logql/log/filter.go`'s
 /// `containsFilter` is `bytes.Contains`, `filter.go:435-444` @ `v3.7.4`),
-/// and `body LIKE '%needle%'` is exactly that — unlike
-/// `position(body, 'needle') > 0` it is a form the body's `text` index of
-/// 4-grams can prune with: the index tests every 4-gram of the needle.
+/// and `body LIKE '%needle%'` is exactly that.
 ///
 /// LIKE-escaping runs BEFORE the string-literal escaping, never after:
 /// [`ch_string`] doubles the backslashes this step introduces, which is
 /// what makes `\%` survive the SQL parser as a LIKE escape.
 ///
-/// **Pruning residual (issue #450).** `log_samples`' body index is
-/// `text(tokenizer = ngrams(4))`, so a needle **shorter than 4 bytes**
-/// produces no n-gram the index can test and prunes NOTHING: `|= "err"`
-/// reads every granule in the selector/time window (measured on 26.3.17.110
-/// with the bloom-filter index this replaced: 1223/1223 granules, 10M
-/// rows). That read is still bounded by stage 3's
-/// `service`/`fingerprint`/`timestamp_ns` primary key, never by the table.
-/// No prefilter can fix it — `hasToken` here is what issue #450 removed
-/// for returning wrong rows. Scale behaviour of short needles is issue
-/// #25's (Tier-2, the 1TB reference run); do not re-introduce a token
-/// prefilter to chase it.
+/// **No index serves it (issue #757).** `log_samples` has no index on
+/// `body`: its one text index is on `lowerUTF8(body)` and only `word(…)`
+/// reads it. `|=`, `!=`, `|~` and `!~` read every line the selector and the
+/// time range select, bounded by stage 3's `service`/`fingerprint`/
+/// `timestamp_ns` primary key. No prefilter can narrow a substring search —
+/// `hasToken` is what issue #450 removed for returning wrong rows. Scale
+/// behaviour is issue #25's; a whole-word search is `word(…)`.
 pub fn ch_like_contains(needle: &str) -> String {
     let mut pattern = String::with_capacity(needle.len() + 2);
     pattern.push('%');

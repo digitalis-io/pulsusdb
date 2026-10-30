@@ -4350,8 +4350,7 @@ pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Result<Vec<CheckedFrag
 /// `exec.rs`'s `stats` gate) so the two paths never drift.
 ///
 /// An `ip(…)` alternative is a range test over IP-shaped substrings — it
-/// renders no `body LIKE`/`match(body, …)` predicate the body index
-/// could prune with, so it (and any `or` group containing one) evaluates
+/// renders no SQL predicate, so it (and any `or` group containing one) evaluates
 /// client-side. A pure literal/regex `or` group pushes down as a
 /// disjunction of the same per-alternative predicate.
 pub(crate) fn is_pushable_line_filter(lf: &LineFilter) -> bool {

@@ -3,7 +3,7 @@
 //! `regexp`/`pattern`), label filters, `line_format`, and `label_format`
 //! are opaque to the columnar store (they read the log body), so they
 //! evaluate here, over rows stage 3 already fetched — **after** line
-//! filters pushed down to the body's `text` index of 4-grams / PREWHERE
+//! filters pushed down to SQL (`word(…)` to the body's word index) / PREWHERE
 //! reduced the row set (features.md §2; the pushdown itself is
 //! [`super::plan::compile_line_filters`]'s job and is untouched by this
 //! module).
@@ -430,7 +430,9 @@ pub enum MetricRun<'a> {
 /// compiles to [`LineMatcher::Ip`] (a range test that renders no `body`
 /// predicate, so [`super::plan::is_pushable_line_filter`] keeps it off the SQL push-
 /// down and it is evaluated here); a plain value compiles to `Literal`
-/// (`|=`/`!=`) or `Regex` (`|~`/`!~`).
+/// (`|=`/`!=`) or `Regex` (`|~`/`!~`); a `word("…", …)` alternative
+/// compiles to `Words`, each word already [`pulsus_logql::word::lower`]ed,
+/// matched by [`pulsus_logql::word::has_all_words`] (issue #757).
 #[derive(Debug, Clone)]
 enum LineMatcher {
     Literal(String),

@@ -3,23 +3,29 @@
 //! `idx_body_words` indexes.
 
 /// An ASCII letter or digit, or any byte of a non-ASCII character.
-pub fn is_word_byte(_b: u8) -> bool {
-    false
+pub fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b >= 0x80
 }
 
 /// A `word(…)` argument: one or more word bytes and nothing else.
-pub fn is_one_word(_s: &str) -> bool {
-    false
+pub fn is_one_word(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(is_word_byte)
 }
 
 /// `lowerUTF8`: each character lowered on its own, with no context.
-pub fn lower(_s: &str) -> String {
-    String::new()
+pub fn lower(s: &str) -> String {
+    s.chars().flat_map(char::to_lowercase).collect()
 }
 
 /// Whether every one of `lowered` (each already [`lower`]ed) is a word of `line`.
-pub fn has_all_words(_line: &str, _lowered: &[String]) -> bool {
-    false
+pub fn has_all_words(line: &str, lowered: &[String]) -> bool {
+    let line = lower(line);
+    let words: std::collections::HashSet<&[u8]> = line
+        .as_bytes()
+        .split(|b| !is_word_byte(*b))
+        .filter(|w| !w.is_empty())
+        .collect();
+    lowered.iter().all(|w| words.contains(w.as_bytes()))
 }
 
 #[cfg(test)]

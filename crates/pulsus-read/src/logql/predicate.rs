@@ -476,9 +476,10 @@ pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, Pip
 /// should have excluded, and a needle containing `_` failed the query
 /// outright (`BAD_ARGUMENTS`). There is no safe subset for us to write —
 /// a token prefilter is equivalence-preserving only when the needle is
-/// token-aligned *in the data*, which the query cannot know. The body's
-/// one index, `text(tokenizer = ngrams(4))`, prunes for both forms from
-/// ClickHouse's own `LIKE`/`match` index analysis; there is no token index.
+/// token-aligned *in the data*, which the query cannot know. No index serves
+/// either form: the body's one index, `idx_body_words`, is on
+/// `lowerUTF8(body)`, and only a `word(…)` alternative reads it, as
+/// `hasAllTokens(lowerUTF8(body), [lowerUTF8('<w>'), …])` (issue #757).
 ///
 /// An `or` group (M8-LQ2 `linefilter.or`) is a disjunction of the same
 /// per-alternative predicate: `((a) OR (b) …)` for positive ops,
@@ -497,8 +498,7 @@ pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
             // `is_pushable_line_filter`.
             LineMatch::Text(value) | LineMatch::Ip(value) => match lf.op {
                 LineFilterOp::Contains | LineFilterOp::NotContains => contains_predicate(value),
-                LineFilterOp::Regex => regex_predicate(value, true)?,
-                LineFilterOp::NotRegex => regex_predicate(value, false)?,
+                LineFilterOp::Regex | LineFilterOp::NotRegex => regex_predicate(value)?,
             },
         });
     }
@@ -955,8 +955,8 @@ fn parsed_name_expr(name: &str, parser: &ParserStage) -> Option<String> {
 /// equalled `v` and those bytes are in the body. Rows without `v` anywhere
 /// are dropped, and the evaluator drops them too.
 ///
-/// It reaches the body index, so for a selective value it prunes
-/// better than a key-precise comparison would.
+/// No index serves it (issue #757); it reads what the selector and time
+/// range select, as a key-precise comparison would.
 ///
 /// **Route B is NOT offered for `| json` or `| logfmt`**, and the reason is
 /// measured rather than assumed: those two decode their values, so a body
@@ -1425,33 +1425,25 @@ fn contains_predicate(phrase: &str) -> String {
     format!("body LIKE {}", ch_like_contains(phrase))
 }
 
+/// `hasAllTokens(lowerUTF8(body), [lowerUTF8('<w>'), …])`, the pushed
+/// `word(…)` predicate (issue #757): the expression `idx_body_words`
+/// indexes, the words lowered by the database in the order written.
 fn words_predicate(words: &[String]) -> String {
-    let _ = words;
-    "0".to_string()
+    format!(
+        "hasAllTokens(lowerUTF8(body), [{}])",
+        words
+            .iter()
+            .map(|w| format!("lowerUTF8({})", ch_string(w)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
-/// `match(body, <p>)`, the pushed `|~`/`!~` predicate.
-///
-/// **Issue #624, part 3a (F2): `match(identity(body), <p>)` for a `|~`
-/// whose pattern the `idx_body_ngrams` index would under-count.** For a
-/// case-insensitive alternation inside a group
-/// ([`pulsus_re2::case_folded_alternation_in_group`]), the database's
-/// `text` index of 4-grams drops granules `match()` accepts, as the
-/// bloom-filter index it replaced (part 3b) did: `match(s,
-/// '(?i)(denied|refused)')` over a row `audit DENIED open` counts 0 with the
-/// index and 1 without it. Wrapping the column in `identity()` keeps the
-/// index out of this one predicate — not out of the statement, so a second
-/// pushed filter keeps its pruning. The pattern text is unchanged. A `!~`
-/// keeps `match(body, …)`: over the same sweep its `NOT match` lost no row
-/// (docs/query-to-sql.md, the n-gram index note).
-fn regex_predicate(pattern: &str, positive: bool) -> Result<String, PipelineError> {
-    let column = if positive && pulsus_re2::case_folded_alternation_in_group(pattern) {
-        "identity(body)"
-    } else {
-        "body"
-    };
+/// `match(body, <p>)`, the pushed `|~`/`!~` predicate. No index serves it
+/// (issue #757).
+fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
     Ok(format!(
-        "match({column}, {})",
+        "match(body, {})",
         ch_regex_unanchored_checked(pattern)?
     ))
 }

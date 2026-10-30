@@ -928,10 +928,7 @@ async fn a_shard_error_is_not_skipped_under_an_exception_skipping_profile() {
     // K3: shard 2 fails before it sends data.
     exec_on(
         &f.shard2,
-        &format!(
-            "ALTER TABLE {}.log_samples DROP INDEX idx_body_ngrams",
-            f.db
-        ),
+        &format!("ALTER TABLE {}.log_samples DROP INDEX idx_body_words", f.db),
     )
     .await;
     exec_on(

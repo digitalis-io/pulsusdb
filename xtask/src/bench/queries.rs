@@ -1047,6 +1047,25 @@ pub async fn run_all(
         .await?,
     );
 
+    // 2b. The same search as a whole word, read from the body's word index
+    // (issue #757). `NEEDLE` is a whole word in every body that carries it.
+    out.push(
+        run_shape(
+            client,
+            db,
+            &tables,
+            "word_search_24h",
+            &format!(
+                r#"{{service_name="{}"}} |= word("{}")"#,
+                dataset.canonical_service,
+                super::dataset::NEEDLE
+            ),
+            &window24h,
+            cfg,
+        )
+        .await?,
+    );
+
     // 3. Label/series discovery, 7d (§9-mandated add) — a distinct code
     // path (no stage 2/3, no fingerprint list), captured directly.
     out.push(run_discovery_shape(client, db, &tables, dataset, cfg).await?);
