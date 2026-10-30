@@ -327,55 +327,11 @@ pub fn range_aggregate_fetch(
         ..
     } = grid;
 
-    // `irate` reads the last sample and the one before it, so each sample
-    // carries its predecessor's time and value (`0`, `0.` for the first);
-    // `rate` and `increase` need neither.
-    let irate = matches!(func, PushedRangeFn::Irate);
-    let (pts, none, marker_tail) = if irate {
-        (
-            "arrayMap((t, j, y, tp, yp) -> (t, toUInt32(j), y, tp, yp), ts, arrayEnumerate(ts), ys, \
-             arrayPushFront(arrayPopBack(ts), toInt64(0)), arrayPushFront(arrayPopBack(ys), 0.))",
-            "(toInt64(-9223372036854775808), toUInt32(0), 0., toInt64(0), 0.)",
-            ", toUInt32(0), 0., toInt64(0), 0.)",
-        )
+    let value = value_text(func, "range_ms", None);
+    let keep = if matches!(func, PushedRangeFn::Irate) {
+        "\n    WHERE t_p > grid_start + gi * grid_step - range_ms AND t_l != t_p"
     } else {
-        (
-            "arrayMap((t, j, y) -> (t, toUInt32(j), y), ts, arrayEnumerate(ts), ys)",
-            "(toInt64(-9223372036854775808), toUInt32(0), 0.)",
-            ", toUInt32(0), 0.)",
-        )
-    };
-    let (value, keep) = match func {
-        PushedRangeFn::Rate | PushedRangeFn::Increase => {
-            let factor = if matches!(func, PushedRangeFn::Rate) {
-                "((sampled + d_start + d_end) / sampled) / (toFloat64(range_ms) / 1000.) AS factor"
-            } else {
-                "(sampled + d_start + d_end) / sampled AS factor"
-            };
-            (
-                format!(
-                    "        i_l - i_f + 1 AS n,\n\
-                     \x20       toFloat64(t_f - (grid_start + gi * grid_step - range_ms)) / 1000. AS d_start_raw,\n\
-                     \x20       toFloat64((grid_start + gi * grid_step) - t_l) / 1000. AS d_end_raw,\n\
-                     \x20       toFloat64(t_l - t_f) / 1000. AS sampled,\n\
-                     \x20       sampled / toFloat64(n - 1) AS avg_dur,\n\
-                     \x20       avg_dur * 1.1 AS threshold,\n\
-                     \x20       if(d_start_raw >= threshold, avg_dur / 2., d_start_raw) AS d_start_1,\n\
-                     \x20       if(result > 0. AND y_f >= 0., sampled * (y_f / result), d_start_1) AS d_zero,\n\
-                     \x20       if(d_zero < d_start_1, d_zero, d_start_1) AS d_start,\n\
-                     \x20       if(d_end_raw >= threshold, avg_dur / 2., d_end_raw) AS d_end,\n\
-                     \x20       {factor},\n\
-                     \x20       result * factor AS v"
-                ),
-                String::new(),
-            )
-        }
-        PushedRangeFn::Irate => (
-            "        st.2.4 AS t_p, st.2.5 AS y_p,\n\
-             \x20       if(y_l < y_p, y_l, y_l - y_p) / (toFloat64(t_l - t_p) / 1000.) AS v"
-                .to_string(),
-            "\n    WHERE t_p > grid_start + gi * grid_step - range_ms AND t_l != t_p".to_string(),
-        ),
+        ""
     };
     let agg = range_agg_expression(op);
     let gkey = group_key_expression(grouping);
@@ -392,6 +348,16 @@ pub fn range_aggregate_fetch(
             tenant.sql_literal()
         ),
     };
+    let gather = format!(
+        "                      SELECT fingerprint, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
+                      FROM {samples_table}
+                      WHERE {window} AND fingerprint IN (
+{ids_sql}
+)
+                        AND reinterpretAsUInt64(value) != {STALE_NAN_DECIMAL}
+                      GROUP BY fingerprint"
+    );
+    let windows = series_windows(&gather, "", "range_ms", func);
 
     format!(
         "WITH {start_ms} AS grid_start, {step_ms} AS grid_step, {points} AS grid_n, {range_ms} AS range_ms
@@ -407,55 +373,7 @@ FROM (
     FROM (
       SELECT m.gkey AS gid, m.rank AS rank, arrayJoin(s.sts) AS st
       FROM (
-        SELECT fingerprint,
-          arrayFilter(x -> x.1.2 > 0 AND x.2.2 > x.1.2, arrayZip(firsts, lasts,
-            if(empty(rs),
-               arrayMap((f, l) -> if(f.3 < 0., (l.3 - f.3) + 0., l.3 - f.3), firsts, lasts),
-               arrayMap((f, l) -> arrayCumSum(arrayPushFront(arrayMap(x -> x.2, arrayFilter(x -> x.1 > f.2 AND x.1 <= l.2, rs)),
-                                                            if(f.3 < 0., (l.3 - f.3) + 0., l.3 - f.3)))[-1], firsts, lasts)),
-            range(grid_n))) AS sts
-        FROM (
-          SELECT fingerprint, rs,
-            arrayFilter((x, b) -> b, arrayFill((x, b) -> NOT b, m_l, arrayMap(x -> x.2 = 0, m_l)), arrayMap(x -> x.2 = 0, m_l)) AS lasts,
-            arrayFilter((x, b) -> b, arrayReverseFill((x, b) -> NOT b, m_f, arrayMap(x -> x.2 = 0, m_f)), arrayMap(x -> x.2 = 0, m_f)) AS firsts
-          FROM (
-            SELECT fingerprint, rs,
-              arraySort((x, k) -> k, arrayConcat(pts_l, arrayMap(e -> (e{marker_tail}, ends)),
-                        arrayConcat(arrayMap(x -> x.1 * 2, pts), arrayMap(e -> e * 2 + 1, ends))) AS m_l,
-              arraySort((x, k) -> k, arrayConcat(pts_f, arrayMap(e -> (e - range_ms{marker_tail}, ends)),
-                        arrayConcat(arrayMap(x -> x.1 * 2, pts), arrayMap(e -> (e - range_ms) * 2 + 1, ends))) AS m_f
-            FROM (
-              SELECT fingerprint, pts, rs,
-                arrayMap(g -> grid_start + toInt64(g) * grid_step, range(grid_n)) AS ends,
-                arrayReverseFill((x, b) -> b, pts, arrayMap((x, n) -> x.1 != n.1, pts, arrayPushBack(arrayPopFront(pts), {none}))) AS pts_l,
-                arrayFill((x, b) -> b, pts, arrayMap((x, p) -> x.1 != p.1, pts, arrayPushFront(arrayPopBack(pts), {none}))) AS pts_f
-              FROM (
-                SELECT fingerprint,
-                  {pts} AS pts,
-                  arrayFilter(x -> x.1 > 0, arrayMap((y, yp, j) -> if(j > 1 AND y < yp, (toUInt32(j), yp), (toUInt32(0), 0.)),
-                                                      ys, arrayPushFront(arrayPopBack(ys), 0.), arrayEnumerate(ys))) AS rs
-                FROM (
-                  SELECT fingerprint,
-                    arrayFilter((t, k) -> k, arrayMap(x -> x.1, raw), keep) AS ts,
-                    arrayMap(b -> reinterpretAsFloat64(b), arrayFilter((b, k) -> k, arrayMap(x -> x.2, raw), keep)) AS ys
-                  FROM (
-                    SELECT fingerprint, raw,
-                      arrayMap((x, p) -> x.1 != p.1 OR x.2 != p.2, raw, arrayPushFront(arrayPopBack(raw), (toInt64(-9223372036854775808), toUInt64(0)))) AS keep
-                    FROM (
-                      SELECT fingerprint, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
-                      FROM {samples_table}
-                      WHERE {window} AND fingerprint IN (
-{ids_sql}
-)
-                        AND reinterpretAsUInt64(value) != {STALE_NAN_DECIMAL}
-                      GROUP BY fingerprint
-                    )
-                  )
-                )
-              )
-            )
-          )
-        )
+{windows}
       ) AS s
       INNER JOIN (
         SELECT fingerprint, row_number() OVER (ORDER BY name, fingerprint) AS rank, {gkey} AS gkey
@@ -481,6 +399,117 @@ SELECT {HISTOGRAM_SENTINEL_KEY} AS gid, toUInt32(0) AS gi,
 ))) AS agg
 ORDER BY gid, gi"
     )
+}
+
+/// Issue #579: the stage that turns each series' gathered points into its
+/// steps, `sts`: one `(first, last, result, step)` per grid index with two
+/// or more points in its window. `gather` returns `fingerprint[, arm], raw`;
+/// `carry` is the columns carried beside `fingerprint` (part 4's ` arm,`);
+/// `range` is the window width as SQL. The text is part 3's, so the shape-A
+/// statement over raw renders byte for byte as it did.
+fn series_windows(gather: &str, carry: &str, range: &str, func: PushedRangeFn) -> String {
+    // `irate` reads the last sample and the one before it, so each sample
+    // carries its predecessor's time and value (`0`, `0.` for the first);
+    // `rate` and `increase` need neither.
+    let (pts, none, marker_tail) = if matches!(func, PushedRangeFn::Irate) {
+        (
+            "arrayMap((t, j, y, tp, yp) -> (t, toUInt32(j), y, tp, yp), ts, arrayEnumerate(ts), ys, \
+             arrayPushFront(arrayPopBack(ts), toInt64(0)), arrayPushFront(arrayPopBack(ys), 0.))",
+            "(toInt64(-9223372036854775808), toUInt32(0), 0., toInt64(0), 0.)",
+            ", toUInt32(0), 0., toInt64(0), 0.)",
+        )
+    } else {
+        (
+            "arrayMap((t, j, y) -> (t, toUInt32(j), y), ts, arrayEnumerate(ts), ys)",
+            "(toInt64(-9223372036854775808), toUInt32(0), 0.)",
+            ", toUInt32(0), 0.)",
+        )
+    };
+    format!(
+        "        SELECT fingerprint,{carry}
+          arrayFilter(x -> x.1.2 > 0 AND x.2.2 > x.1.2, arrayZip(firsts, lasts,
+            if(empty(rs),
+               arrayMap((f, l) -> if(f.3 < 0., (l.3 - f.3) + 0., l.3 - f.3), firsts, lasts),
+               arrayMap((f, l) -> arrayCumSum(arrayPushFront(arrayMap(x -> x.2, arrayFilter(x -> x.1 > f.2 AND x.1 <= l.2, rs)),
+                                                            if(f.3 < 0., (l.3 - f.3) + 0., l.3 - f.3)))[-1], firsts, lasts)),
+            range(grid_n))) AS sts
+        FROM (
+          SELECT fingerprint,{carry} rs,
+            arrayFilter((x, b) -> b, arrayFill((x, b) -> NOT b, m_l, arrayMap(x -> x.2 = 0, m_l)), arrayMap(x -> x.2 = 0, m_l)) AS lasts,
+            arrayFilter((x, b) -> b, arrayReverseFill((x, b) -> NOT b, m_f, arrayMap(x -> x.2 = 0, m_f)), arrayMap(x -> x.2 = 0, m_f)) AS firsts
+          FROM (
+            SELECT fingerprint,{carry} rs,
+              arraySort((x, k) -> k, arrayConcat(pts_l, arrayMap(e -> (e{marker_tail}, ends)),
+                        arrayConcat(arrayMap(x -> x.1 * 2, pts), arrayMap(e -> e * 2 + 1, ends))) AS m_l,
+              arraySort((x, k) -> k, arrayConcat(pts_f, arrayMap(e -> (e - {range}{marker_tail}, ends)),
+                        arrayConcat(arrayMap(x -> x.1 * 2, pts), arrayMap(e -> (e - {range}) * 2 + 1, ends))) AS m_f
+            FROM (
+              SELECT fingerprint,{carry} pts, rs,
+                arrayMap(g -> grid_start + toInt64(g) * grid_step, range(grid_n)) AS ends,
+                arrayReverseFill((x, b) -> b, pts, arrayMap((x, n) -> x.1 != n.1, pts, arrayPushBack(arrayPopFront(pts), {none}))) AS pts_l,
+                arrayFill((x, b) -> b, pts, arrayMap((x, p) -> x.1 != p.1, pts, arrayPushFront(arrayPopBack(pts), {none}))) AS pts_f
+              FROM (
+                SELECT fingerprint,{carry}
+                  {pts} AS pts,
+                  arrayFilter(x -> x.1 > 0, arrayMap((y, yp, j) -> if(j > 1 AND y < yp, (toUInt32(j), yp), (toUInt32(0), 0.)),
+                                                      ys, arrayPushFront(arrayPopBack(ys), 0.), arrayEnumerate(ys))) AS rs
+                FROM (
+                  SELECT fingerprint,{carry}
+                    arrayFilter((t, k) -> k, arrayMap(x -> x.1, raw), keep) AS ts,
+                    arrayMap(b -> reinterpretAsFloat64(b), arrayFilter((b, k) -> k, arrayMap(x -> x.2, raw), keep)) AS ys
+                  FROM (
+                    SELECT fingerprint,{carry} raw,
+                      arrayMap((x, p) -> x.1 != p.1 OR x.2 != p.2, raw, arrayPushFront(arrayPopBack(raw), (toInt64(-9223372036854775808), toUInt64(0)))) AS keep
+                    FROM (
+{gather}
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )"
+    )
+}
+
+/// Issue #579: part 1's arithmetic over a step's first and last point and
+/// its result, ending in `v`. `range` is the window width as SQL; `scale`
+/// a rounded `increase`'s factor (part 4).
+fn value_text(func: PushedRangeFn, range: &str, scale: Option<f64>) -> String {
+    match func {
+        PushedRangeFn::Rate | PushedRangeFn::Increase => {
+            let factor = if matches!(func, PushedRangeFn::Rate) {
+                format!(
+                    "((sampled + d_start + d_end) / sampled) / (toFloat64({range}) / 1000.) AS factor"
+                )
+            } else {
+                "(sampled + d_start + d_end) / sampled AS factor".to_string()
+            };
+            // Rust's shortest round-trip text of the factor, which the
+            // statement reads back as the same `Float64`.
+            let v = match scale {
+                Some(f) => format!("result * factor * {f:?} AS v"),
+                None => "result * factor AS v".to_string(),
+            };
+            format!(
+                "        i_l - i_f + 1 AS n,\n\
+                 \x20       toFloat64(t_f - (grid_start + gi * grid_step - {range})) / 1000. AS d_start_raw,\n\
+                 \x20       toFloat64((grid_start + gi * grid_step) - t_l) / 1000. AS d_end_raw,\n\
+                 \x20       toFloat64(t_l - t_f) / 1000. AS sampled,\n\
+                 \x20       sampled / toFloat64(n - 1) AS avg_dur,\n\
+                 \x20       avg_dur * 1.1 AS threshold,\n\
+                 \x20       if(d_start_raw >= threshold, avg_dur / 2., d_start_raw) AS d_start_1,\n\
+                 \x20       if(result > 0. AND y_f >= 0., sampled * (y_f / result), d_start_1) AS d_zero,\n\
+                 \x20       if(d_zero < d_start_1, d_zero, d_start_1) AS d_start,\n\
+                 \x20       if(d_end_raw >= threshold, avg_dur / 2., d_end_raw) AS d_end,\n\
+                 \x20       {factor},\n\
+                 \x20       {v}"
+            )
+        }
+        PushedRangeFn::Irate => "        st.2.4 AS t_p, st.2.5 AS y_p,\n\
+             \x20       if(y_l < y_p, y_l, y_l - y_p) / (toFloat64(t_l - t_p) / 1000.) AS v"
+            .to_string(),
+    }
 }
 
 /// Issue #579 part 3: the number of distinct series `ids_sql` selects —
@@ -680,36 +709,393 @@ pub struct SideSql<'a> {
     pub level: Option<LevelRead<'a>>,
 }
 
-/// Issue #579 part 4: a `Level` arm's points, from the level rows the
-/// replica that answered also proved it holds (`LEVEL_GATHER`).
-pub fn level_gather(_tenant: &Tenant, _ids_sql: &str, _level: &LevelRead<'_>) -> String {
-    String::new()
+/// `CAST([(a, b), …], 'Array(Tuple(Int64, Int64))')`.
+fn intervals_literal(ivs: &[(i64, i64)]) -> String {
+    let items = ivs
+        .iter()
+        .map(|(a, b)| format!("({a}, {b})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("CAST([{items}], 'Array(Tuple(Int64, Int64))')")
 }
 
-/// Issue #579 part 4: shape A over a `Level` arm, one time chunk (S3a).
-pub fn level_aggregate_fetch(
-    _side: &SideSql<'_>,
-    _hist_samples_table: &str,
-    _grouping: Option<&Grouping>,
-    _grid: Grid,
-    _op: RangeAggOp,
+/// The shard a row of a level table was read from: `_shard_num` on the
+/// distributed table, else 1 — `rollup::level_fetch`'s own column.
+fn shard_column(clustered: bool) -> &'static str {
+    if clustered {
+        "_shard_num"
+    } else {
+        "toUInt32(1)"
+    }
+}
+
+/// Issue #579 part 4: `LEVEL_ROWS` — one scan of the level table that
+/// returns the data rows of `served` for the selector's series and the run
+/// rows over its window, one row per series with its rows sorted, a marker
+/// row, and the replica check (plan section 5.4): unless every shard's run
+/// rows in THIS scan cover every interval of `served`, the statement raises
+/// `PULSUS_LEVEL_REPLICA_BEHIND`. The level rows are written by the shard
+/// whose slice holds the series, so the series set is read once at the
+/// initiator, `GLOBAL IN`.
+pub fn level_rows(tenant: &Tenant, ids_sql: &str, level: &LevelRead<'_>) -> String {
+    let LevelRead {
+        table,
+        clustered,
+        shards,
+        window,
+        served,
+        ..
+    } = *level;
+    let shard = shard_column(clustered);
+    let tenant = tenant.sql_literal();
+    let data = sample_sql::intervals_predicate("t_end", "t_end", "<=", served);
+    let runs = sample_sql::intervals_predicate("t_end", "t_last", "<", &[window]);
+    let served = intervals_literal(served);
+    format!(
+        "SELECT fingerprint, rows AS rows0, max(toUInt8(fingerprint = 0 AND arrayAll(sh -> arrayAll(i -> arrayExists(j -> j.1 <= i.1 AND i.2 <= j.2,
+    arrayFold((acc, x) -> if(empty(acc) OR x.1 > acc[-1].2, arrayPushBack(acc, x), arrayPushBack(arrayPopBack(acc), (acc[-1].1, greatest(acc[-1].2, x.2)))),
+              arraySort(arrayMap(x -> (x.2, x.3), arrayFilter(x -> x.1 = sh, runs))), CAST([], 'Array(Tuple(Int64, Int64))'))),
+  {served}), range(1, {shards} + 1)))) OVER () AS ok,
+  throwIf(ok = 0, 'PULSUS_LEVEL_REPLICA_BEHIND') AS chk
+FROM (
+  SELECT fingerprint,
+    arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), arrayFilter(x -> x.5 = 0, groupArray((t_end, t_last, last, inc, kind))))) AS rows,
+    arrayMap(x -> (x.1, x.2, x.3), arrayFilter(x -> x.4 = 1, groupArray((shard, t_last, t_end, kind)))) AS runs
+  FROM (
+    SELECT {shard} AS shard, kind, fingerprint, t_end, t_last, last, inc
+    FROM {table}
+    WHERE (kind = 0 AND org_id = {tenant} AND {data} AND fingerprint GLOBAL IN (
+{ids_sql}
+))
+       OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND {runs})
+  )
+  GROUP BY fingerprint
+  UNION ALL
+  SELECT toUInt128(0), CAST([], 'Array(Tuple(Int64, Int64, Float64, Float64))'), CAST([], 'Array(Tuple(UInt32, Int64, Int64))')
+)"
+    )
+}
+
+/// Issue #579 part 4: a `Level` arm's points (`LEVEL_GATHER`): the counter
+/// today's route folds over the kept level rows (`rollup::counter`, levels
+/// under 720 s) — started at the first row with a sample and a number,
+/// each later row adding its increase — one `(t_last, c)` point a row, a
+/// NaN row's own value, no point for a row with no sample, stale markers
+/// dropped. `chk` reaches `rows` so the check is evaluated; the groups
+/// with no point, the marker's among them, are removed last.
+pub fn level_gather(tenant: &Tenant, ids_sql: &str, level: &LevelRead<'_>) -> String {
+    let rows = level_rows(tenant, ids_sql, level);
+    format!(
+        "SELECT fingerprint, arm, raw FROM (
+SELECT fingerprint, toUInt8(0) AS arm,
+  arrayFilter(p -> p.1 > 0 AND p.2 != {STALE_NAN_DECIMAL}, arrayMap((r, c) -> if(r.2 = 0, (toInt64(0), toUInt64(0)),
+      (r.2, reinterpretAsUInt64(if(isNaN(r.3), r.3, c)))), rows, cs)) AS raw
+FROM (
+  SELECT fingerprint, arrayResize(rows0, length(rows0) + chk) AS rows,
+    arrayFirstIndex(r -> r.2 > 0 AND NOT isNaN(r.3), rows) AS s,
+    arrayConcat(arrayWithConstant(toUInt64(if(s = 0, length(rows), s - 1)), 0.),
+                if(s = 0, CAST([], 'Array(Float64)'),
+                   arrayCumSum(arrayMap((r, i) -> if(i = 1, r.3, r.4), arraySlice(rows, s), arrayEnumerate(arraySlice(rows, s)))))) AS cs
+  FROM (
+{rows}
+  )
+)
+)
+WHERE notEmpty(raw)"
+    )
+}
+
+/// Issue #579 part 4: S4, explain only — whether a `Level` side read any
+/// level row, today's `served_from_level` for a counter; `sum(chk)` makes
+/// the check run on every row.
+pub fn level_served(tenant: &Tenant, ids_sql: &str, level: &LevelRead<'_>) -> String {
+    format!(
+        "SELECT toUInt8(countIf(fingerprint != 0 AND notEmpty(rows0)) > 0) AS served, sum(chk) AS checked
+FROM (
+{}
+)",
+        level_rows(tenant, ids_sql, level)
+    )
+}
+
+/// Issue #579 part 4: a side's raw points over the intervals `within`, its
+/// `arm` 1: part 3's gather over a list of intervals.
+pub fn raw_gather_within(
+    tenant: &Tenant,
+    samples_table: &str,
+    ids_sql: &str,
+    within: &[(i64, i64)],
 ) -> String {
-    String::new()
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        sample_sql::intervals_predicate("unix_milli", "unix_milli", "<=", within)
+    );
+    format!(
+        "                      SELECT fingerprint, toUInt8(1) AS arm, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
+                      FROM {samples_table}
+                      WHERE {window} AND fingerprint IN (
+{ids_sql}
+)
+                        AND reinterpretAsUInt64(value) != {STALE_NAN_DECIMAL}
+                      GROUP BY fingerprint"
+    )
 }
 
-/// Issue #579 part 4: shape C, one time chunk (S3b).
+/// Issue #579 part 4: `SERIES_STEPS` — one row per series and grid index,
+/// `fingerprint, gi, v`, each step taken from the arm today's route reads
+/// it from: raw where its window reaches time no level covers (the raw
+/// steps), the level elsewhere.
+pub fn series_steps(side: &SideSql<'_>, grid: Grid) -> String {
+    let range = side.range_ms.to_string();
+    let (gather, steps) = match &side.level {
+        Some(level) => {
+            let mut gather = level_gather(side.tenant, side.ids_sql, level);
+            if !level.read.is_empty() {
+                gather.push_str("\nUNION ALL\n");
+                gather.push_str(&raw_gather_within(
+                    side.tenant,
+                    side.samples_table,
+                    side.ids_sql,
+                    level.read,
+                ));
+            }
+            (gather, level.raw_steps.to_vec())
+        }
+        None => {
+            let (lo, hi) = range_window(grid, side.range_ms);
+            (
+                raw_gather_within(side.tenant, side.samples_table, side.ids_sql, &[(lo, hi)]),
+                vec![(0, grid.points)],
+            )
+        }
+    };
+    let steps = if steps.is_empty() {
+        "CAST([], 'Array(Tuple(UInt32, UInt32))')".to_string()
+    } else {
+        format!(
+            "[{}]",
+            steps
+                .iter()
+                .map(|(a, b)| format!("({a}, {b})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let keep = if matches!(side.func, PushedRangeFn::Irate) {
+        format!(" AND t_p > grid_start + gi * grid_step - {range} AND t_l != t_p")
+    } else {
+        String::new()
+    };
+    let value = value_text(side.func, &range, side.scale);
+    let windows = series_windows(&gather, " arm,", &range, side.func);
+    format!(
+        "SELECT fingerprint, toUInt32(st.4) AS gi,
+  st.1.2 AS i_f, st.1.1 AS t_f, st.1.3 AS y_f, st.2.2 AS i_l, st.2.1 AS t_l, st.2.3 AS y_l, st.3 AS result,
+{value}
+FROM (
+  SELECT fingerprint, arm, arrayJoin(sts) AS st
+  FROM (
+{windows}
+  )
+)
+WHERE arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, {steps})){keep}"
+    )
+}
+
+/// Issue #579 part 4: `MEMBERS` — each series' rank in `(name, ID)` order,
+/// the order the evaluator folds in, and its stored label pairs.
+pub fn members(side: &SideSql<'_>) -> String {
+    format!(
+        "SELECT fingerprint, row_number() OVER (ORDER BY name, fingerprint) AS rank, JSONExtractKeysAndValues(l, 'String') AS kv
+FROM (
+  SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
+  FROM {}
+  WHERE org_id = {} AND metric_name = {}
+    AND fingerprint IN (
+{}
+    )
+  GROUP BY fingerprint
+)",
+        side.labels_table,
+        side.tenant.sql_literal(),
+        ch_string(side.metric_name),
+        side.ids_sql
+    )
+}
+
+/// Issue #579 part 4: [`group_key_expression`]'s rule over label pairs
+/// `kv` instead of a series' stored JSON.
+pub fn group_key_over(grouping: Option<&Grouping>, kv: &str) -> String {
+    match grouping {
+        None => "CAST([], 'Array(Tuple(String, String))')".to_string(),
+        Some(g) => {
+            let names = g
+                .labels
+                .iter()
+                .map(|l| ch_string(l))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let not = if g.without { "NOT " } else { "" };
+            format!("arrayFilter(kv -> kv.1 {not}IN ({names}), {kv})")
+        }
+    }
+}
+
+/// The groups stage both part-4 statements share: `inner` gives `gid,
+/// rank, gi, v`; the sentinel row carries the histogram count of
+/// `sentinel_where`.
+fn aggregate_over(
+    grid: Grid,
+    op: RangeAggOp,
+    inner: &str,
+    hist_samples_table: &str,
+    sentinel_where: &str,
+) -> String {
+    let Grid {
+        start_ms,
+        step_ms,
+        points,
+        ..
+    } = grid;
+    let agg = range_agg_expression(op);
+    format!(
+        "WITH {start_ms} AS grid_start, {step_ms} AS grid_step, {points} AS grid_n
+SELECT gid, gi, agg FROM (
+SELECT gid, gi,
+{agg}
+FROM (
+  SELECT gid, gi, arraySort((x, r) -> r, groupArray(v), groupArray(rank)) AS vs
+  FROM (
+{inner}
+  )
+  GROUP BY gid, gi
+)
+)
+UNION ALL
+SELECT {HISTOGRAM_SENTINEL_KEY} AS gid, toUInt32(0) AS gi,
+  toFloat64((SELECT count() FROM {hist_samples_table} WHERE {sentinel_where})) AS agg
+ORDER BY gid, gi"
+    )
+}
+
+/// `unix_milli > lo AND unix_milli <= hi AND fingerprint IN (ids)`: one
+/// side's histogram samples in its fetch window.
+fn side_histograms(side: &SideSql<'_>) -> String {
+    let (lo, hi) = side.window;
+    format!(
+        "unix_milli > {lo} AND unix_milli <= {hi} AND fingerprint IN (\n{}\n)",
+        side.ids_sql
+    )
+}
+
+/// Issue #579 part 4: shape A over a `Level` arm, one time chunk (S3a):
+/// one row per group per grid index and the histogram count.
+pub fn level_aggregate_fetch(
+    side: &SideSql<'_>,
+    hist_samples_table: &str,
+    grouping: Option<&Grouping>,
+    grid: Grid,
+    op: RangeAggOp,
+) -> String {
+    let inner = format!(
+        "    SELECT {} AS gid, m.rank AS rank, s.gi AS gi, s.v AS v
+    FROM (
+{}
+    ) AS s
+    INNER JOIN (
+{}
+    ) AS m USING (fingerprint)",
+        group_key_over(grouping, "m.kv"),
+        series_steps(side, grid),
+        members(side)
+    );
+    let (lo, hi) = side.window;
+    let sentinel = format!(
+        "org_id = {} AND unix_milli > {lo} AND unix_milli <= {hi}
+             AND fingerprint IN (
+{}
+)",
+        side.tenant.sql_literal(),
+        side.ids_sql
+    );
+    aggregate_over(grid, op, &inner, hist_samples_table, &sentinel)
+}
+
+/// Issue #579 part 4: shape C, one time chunk (S3b): both sides' steps,
+/// their series paired by label set, the operator, and the aggregate over
+/// the left member's rank. Arithmetic drops `__type__`/`__unit__` from the
+/// output labels; a comparison keeps them, filtering on its result or,
+/// under `bool`, answering it.
 #[allow(clippy::too_many_arguments)]
 pub fn join_aggregate_fetch(
-    _lhs: &SideSql<'_>,
-    _rhs: &SideSql<'_>,
-    _hist_samples_table: &str,
-    _grouping: Option<&Grouping>,
-    _grid: Grid,
-    _op: RangeAggOp,
-    _bin: BinOp,
-    _bool_modifier: bool,
+    lhs: &SideSql<'_>,
+    rhs: &SideSql<'_>,
+    hist_samples_table: &str,
+    grouping: Option<&Grouping>,
+    grid: Grid,
+    op: RangeAggOp,
+    bin: BinOp,
+    bool_modifier: bool,
 ) -> String {
-    String::new()
+    let cmp = match bin {
+        BinOp::Eq => Some("="),
+        BinOp::Ne => Some("!="),
+        BinOp::Gt => Some(">"),
+        BinOp::Lt => Some("<"),
+        BinOp::Ge => Some(">="),
+        BinOp::Le => Some("<="),
+        _ => None,
+    };
+    let arith = match bin {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        _ => "/",
+    };
+    let (val, filter, outkv) = match cmp {
+        None => (
+            format!("l.v {arith} r.v"),
+            String::new(),
+            "arrayFilter(kv -> kv.1 NOT IN ('__type__', '__unit__'), lm.kv)",
+        ),
+        Some(c) if bool_modifier => (format!("toFloat64(l.v {c} r.v)"), String::new(), "lm.kv"),
+        Some(c) => (
+            "l.v".to_string(),
+            format!("\n    WHERE l.v {c} r.v"),
+            "lm.kv",
+        ),
+    };
+    let inner = format!(
+        "    SELECT p.gkey AS gid, p.rank AS rank, l.gi AS gi, {val} AS v
+    FROM (
+{}
+    ) AS l
+    INNER JOIN (
+      SELECT lm.fingerprint AS lfp, rm.fingerprint AS rfp, lm.rank AS rank, {} AS gkey
+      FROM (
+{}
+      ) AS lm
+      INNER JOIN (
+{}
+      ) AS rm ON lm.kv = rm.kv
+    ) AS p ON l.fingerprint = p.lfp
+    INNER JOIN (
+{}
+    ) AS r ON r.fingerprint = p.rfp AND r.gi = l.gi{filter}",
+        series_steps(lhs, grid),
+        group_key_over(grouping, outkv),
+        members(lhs),
+        members(rhs),
+        series_steps(rhs, grid),
+    );
+    let sentinel = format!(
+        "org_id = {} AND (({}) OR ({}))",
+        lhs.tenant.sql_literal(),
+        side_histograms(lhs),
+        side_histograms(rhs)
+    );
+    aggregate_over(grid, op, &inner, hist_samples_table, &sentinel)
 }
 
 #[cfg(test)]

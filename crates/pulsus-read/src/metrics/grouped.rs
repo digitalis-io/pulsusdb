@@ -525,6 +525,7 @@ fn children(e: &PlanExpr) -> Vec<&PlanExpr> {
 /// The verdict on one `Aggregate` node, or `None` when its child is
 /// neither a selector nor a range function — not a candidate for either
 /// shape, so there is nothing to report.
+#[allow(clippy::too_many_arguments)]
 fn verdict_of(
     op: AggOp,
     expr: &PlanExpr,
@@ -533,7 +534,7 @@ fn verdict_of(
     expr_pos: usize,
     plan: &QueryPlan,
     params: &PlanParams,
-    _arms: &HashMap<SelectorId, Arm>,
+    arms: &HashMap<SelectorId, Arm>,
 ) -> Option<Result<PushKind, NodeDecline>> {
     match expr {
         // Shape B: issue #549's checks, at any node.
@@ -576,8 +577,12 @@ fn verdict_of(
             };
             // The output's name channel is the group key's, which the gid
             // does not carry.
-            if grouping.is_some_and(|g| !g.without && g.labels.iter().any(|l| l == "__name__")) {
+            if by_name(grouping) {
                 return Some(Err(NodeDecline::NameGrouping));
+            }
+            let arm = arm_of(arms, *id);
+            if !pushable(&arm) {
+                return Some(Err(NodeDecline::CoarseLevel));
             }
             let Some(grid) = range_grid_of(params, range_ms) else {
                 return Some(Err(NodeDecline::GridOverflow));
@@ -591,7 +596,99 @@ fn verdict_of(
                 grid,
                 range_ms,
                 instant: params.step_ms == 0,
-                arm: Arm::Raw,
+                arm,
+            })))
+        }
+        // Shape C (part 4): conditions D1 to D8 of plan section 4, in
+        // that order. A child other than two range functions is not a
+        // candidate.
+        PlanExpr::Binary {
+            op: bin,
+            lhs,
+            rhs,
+            bool_modifier,
+            matching,
+            group,
+            fill,
+            ..
+        } => {
+            let (
+                PlanExpr::RangeFn {
+                    func: lf,
+                    source: ls,
+                    ..
+                },
+                PlanExpr::RangeFn {
+                    func: rf,
+                    source: rs,
+                    ..
+                },
+            ) = (lhs.as_ref(), rhs.as_ref())
+            else {
+                return None;
+            };
+            let Some(op) = RangeAggOp::of(op).filter(|_| !has_param) else {
+                return Some(Err(NodeDecline::Aggregation));
+            };
+            let (Some(lf), Some(rf)) = (PushedRangeFn::of(*lf), PushedRangeFn::of(*rf)) else {
+                return Some(Err(NodeDecline::RangeFunction));
+            };
+            let mut sides = Vec::with_capacity(2);
+            for (func, source) in [(lf, ls), (rf, rs)] {
+                let pulsus_promql::plan::RangeSource::Selector(id) = source else {
+                    return Some(Err(NodeDecline::Selector));
+                };
+                let sel = plan.selectors.iter().find(|s| s.id == *id)?;
+                let (Some(Some(metric_name)), Some(range_ms)) =
+                    (plain_metric_name(sel), sel.range_ms)
+                else {
+                    return Some(Err(NodeDecline::Selector));
+                };
+                sides.push(JoinSide {
+                    func,
+                    selector: *id,
+                    metric_name,
+                    range_ms,
+                    scale: increase_scale(func, sel),
+                    arm: arm_of(arms, *id),
+                });
+            }
+            if by_name(grouping) {
+                return Some(Err(NodeDecline::NameGrouping));
+            }
+            if !sides.iter().all(|s| pushable(&s.arm)) {
+                return Some(Err(NodeDecline::CoarseLevel));
+            }
+            use pulsus_promql::BinOp;
+            if !(matches!(bin, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+                || bin.is_comparison())
+            {
+                return Some(Err(NodeDecline::Operator));
+            }
+            if matching.on
+                || !matching.labels.is_empty()
+                || *group != pulsus_promql::Group::OneToOne
+                || *fill != pulsus_promql::FillValues::default()
+            {
+                return Some(Err(NodeDecline::Matching));
+            }
+            let mut grid = None;
+            for side in &sides {
+                let Some(g) = range_grid_of(params, side.range_ms) else {
+                    return Some(Err(NodeDecline::GridOverflow));
+                };
+                grid = Some(g);
+            }
+            let rhs = sides.pop()?;
+            let lhs = sides.pop()?;
+            Some(Ok(PushKind::Join(JoinShape {
+                op,
+                grouping: grouping.cloned(),
+                bin: *bin,
+                bool_modifier: *bool_modifier,
+                lhs,
+                rhs,
+                grid: grid?,
             })))
         }
         PlanExpr::OverTime { .. } | PlanExpr::OverTimeParam { .. } => {
@@ -601,6 +698,36 @@ fn verdict_of(
                 NodeDecline::Aggregation
             }))
         }
+        _ => None,
+    }
+}
+
+/// D4: `by (__name__)`, whose output name the statement's group key does
+/// not carry.
+fn by_name(grouping: Option<&Grouping>) -> bool {
+    grouping.is_some_and(|g| !g.without && g.labels.iter().any(|l| l == "__name__"))
+}
+
+/// A selector's arm; one the caller did not decide is `Raw`.
+fn arm_of(arms: &HashMap<SelectorId, Arm>, id: SelectorId) -> Arm {
+    arms.get(&id).cloned().unwrap_or(Arm::Raw)
+}
+
+/// D5: a `Raw` arm, or a `Level` arm at the finest level whose counter the
+/// evaluator overlays with raw samples.
+fn pushable(arm: &Arm) -> bool {
+    match arm {
+        Arm::Raw => true,
+        Arm::Level(route) => route.level == 0 && super::rollup::overlaid(route.use_, route.res_ms),
+    }
+}
+
+/// A rounded `increase`'s factor, `asked / read`: the evaluator's own
+/// (`eval/mod.rs`, the `scale` of `RangeFn`). `None` for every other
+/// function and an unrounded range.
+pub fn increase_scale(func: PushedRangeFn, sel: &pulsus_promql::SelectorSpec) -> Option<f64> {
+    match (func, sel.written_range_ms, sel.range_ms) {
+        (PushedRangeFn::Increase, Some(w), Some(r)) if w != r && r > 0 => Some(w as f64 / r as f64),
         _ => None,
     }
 }
@@ -736,7 +863,7 @@ pub fn time_chunks(grid: Grid, series: usize, cap: usize) -> Vec<(u32, Grid)> {
 pub fn range_node(
     push: &RangePush,
     chunks: Vec<(u32, Vec<super::grouped_rows::RangeAggRow>)>,
-    _drop_name: bool,
+    drop_name: bool,
     cancel: &CancelToken,
 ) -> Result<RangeOutcome, PromqlError> {
     let points = push.grid.points as usize;
@@ -800,9 +927,10 @@ pub fn range_node(
                 .map(|(gid, v)| InstantSample {
                     labels: groups[gid as usize].clone(),
                     metric_name: None,
-                    // A range function drops the name, and the group's
-                    // verdict is the OR of its members'.
-                    drop_name: true,
+                    // The group's verdict is the OR of its members': a
+                    // range function's, `true`; shape C's, its operator's
+                    // (part 4, plan section 5.3).
+                    drop_name,
                     t_ms,
                     v,
                     h: None,
@@ -822,8 +950,28 @@ pub fn range_node(
 /// `(t - range, t]` reaches into an interval of `todo` — `t - range < b`
 /// and `t > a` for some `(a, b]`, the test `RawOverlay::touches` makes —
 /// as merged half-open ranges `[g0, g1)`.
-pub fn raw_steps(_grid: Grid, _range_ms: i64, _todo: &[(i64, i64)]) -> Vec<(u32, u32)> {
-    Vec::new()
+pub fn raw_steps(grid: Grid, range_ms: i64, todo: &[(i64, i64)]) -> Vec<(u32, u32)> {
+    let n = i64::from(grid.points);
+    let step = grid.step_ms.max(1);
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for &(a, b) in todo {
+        // The first index past `a`, and the first at or past `b + range`.
+        let g0 = (a.saturating_sub(grid.start_ms)).div_euclid(step) + 1;
+        let g1 = (b
+            .saturating_add(range_ms)
+            .saturating_sub(grid.start_ms)
+            .saturating_add(step - 1))
+        .div_euclid(step);
+        let (g0, g1) = (g0.clamp(0, n) as u32, g1.clamp(0, n) as u32);
+        if g0 >= g1 {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if g0 <= last.1 => last.1 = last.1.max(g1),
+            _ => out.push((g0, g1)),
+        }
+    }
+    out
 }
 
 /// Issue #579: a shape-B node's runs, folded into the node's answer.

@@ -3123,7 +3123,9 @@ async fn the_panel_sends_groups_not_level_rows() {
     let end = p_end();
     let db = DB_P2.name();
     let built = corpus_p(db, end).await;
-    let comment = format!("{db}_panel");
+    // Unique to this run: the log keeps every earlier run's statements
+    // under the same database name.
+    let comment = format!("{db}_panel_{}", now_ms());
     let e = built.pushed_engine(Some(&comment)).await;
     e.query(
         &no_tenant(),
