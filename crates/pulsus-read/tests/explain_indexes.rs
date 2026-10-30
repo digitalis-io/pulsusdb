@@ -337,13 +337,13 @@ fn last_granules(raw: &str) -> Option<(u64, u64)> {
 /// `|` and digit-normalised.
 ///
 /// `Description:` is captured on purpose. Without it the gate would accept
-/// `idx_body_ngrams` silently becoming a different index type.
+/// `idx_body_words` silently becoming a different index type.
 ///
 /// `Condition:` is captured, and its ABSENCE is recorded explicitly as
 /// `Condition: <none>` rather than skipped. The body's `text` index prints
-/// the 4-grams it tests and whether it needs all or any of them, so a
-/// stage-3 shape pins the grams of its needle; an index still listed but
-/// testing the wrong grams changes the condition text. The pruning
+/// the words it tests and whether it needs all or any of them, so a
+/// stage-3 shape pins the words of its filter; an index still listed but
+/// testing the wrong words changes the condition text. The pruning
 /// identity ([`assert_prunes_at_least`]) still checks that it rules
 /// granules out, against a same-server control — see
 /// [`seed_line_filter_corpus`].
@@ -461,21 +461,21 @@ fn skip_block_conditions_are_captured_and_blocks_do_not_swallow_each_other() {
 ///
 /// This was briefly read out of `system.data_skipping_indices`, and code
 /// review caught why that is wrong: the planner reads the same catalog, so
-/// dropping `idx_body_ngrams` from the DDL moved BOTH sides and the gate
+/// dropping `idx_body_words` from the DDL moved BOTH sides and the gate
 /// passed on a table that had lost an index. An expectation derived from
 /// the thing it checks is not a check, so the name, the type and the
 /// condition are written down here, where only a human edit can move them.
 /// It is a SET so that a second body index appearing is a difference.
 fn expected_stage3_skip_blocks(condition: Option<&str>) -> std::collections::BTreeSet<String> {
     condition
-        .map(|c| format!("Name: idx_body_ngrams|Description: text GRANULARITY #|Condition: {c}"))
+        .map(|c| format!("Name: idx_body_words|Description: text GRANULARITY #|Condition: {c}"))
         .into_iter()
         .collect()
 }
 
-/// The `text(tokenizer = ngrams(4))` index's condition for `connection
-/// refused`: every 4-gram of the needle, all required.
-const CONNECTION_REFUSED_ALL: &str = r#"(mode: All; tokens: [" ref", "conn", "ctio", "ecti", "efus", "fuse", "ion ", "n re", "nect", "nnec", "on r", "onne", "refu", "tion", "used"])"#;
+/// The word index's condition for `word("connection", "refused")`: both
+/// words, case-keyed (so upper case), all required (issue #757).
+const WORDS_CONNECTION_REFUSED: &str = r#"(mode: All; tokens: ["CONNECTION", "REFUSED"])"#;
 
 /// An extract with its `Skip` blocks removed — the `MinMax`/`Partition`/
 /// `PrimaryKey` prefix, whose ORDER is asserted (those three are printed
@@ -1013,8 +1013,9 @@ async fn stage2_hydration_uses_the_fingerprint_primary_key() {
 // produce the same index-usage extract: the `service`/`fingerprint`/
 // `timestamp_ns` primary-key `Condition:` only reflects those three
 // columns (not `body`, which isn't part of the primary key), and the
-// `body` `text` index is listed with the grams the op gives it to test, or
-// not at all when it gives none (`!=`).
+// word index on `upperUTF8(lowerUTF8(body))` is listed with the words a `word(…)`
+// filter gives it to test, or not at all for a substring or regex filter
+// (issue #757).
 //
 // **How the expectation is built (issue #376).** The `PrimaryKey` key
 // list comes from `system.tables.sorting_key` and the `Skip` name set
@@ -1056,16 +1057,16 @@ async fn stage3_sql(db: &str, ts_ns: i64, query: &str) -> String {
 /// and cannot for a negated one. Measured on the fixture this suite seeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrunesBy {
-    /// A positive line filter (`|=`, `|~`): the body index confines the
-    /// read to the granules that can hold the needle. Measured 13/13
+    /// A positive `word(…)` filter: the word index confines the read to
+    /// the granules that can hold the words. Measured 13/13
     /// granules on the control against 1 gated, i.e. 13x; the gate
     /// requires 4x, which is the floor a dead index cannot reach — a
     /// degraded condition makes gated == control and the ratio 1.
     Strongly,
-    /// A negated line filter (`!=`, `!~`): the body index answers "this
-    /// granule MAY contain the grams", which cannot rule a granule out
-    /// for `NOT (...)`. The claim is "never worse than no skip index at
-    /// all".
+    /// A negated `word(…)` filter, or any substring or regex filter: the
+    /// word index either reads nothing for it or answers "this granule
+    /// MAY contain the words", which cannot rule a granule out for
+    /// `NOT (...)`. The claim is "never worse than no skip index at all".
     NotAtAll,
 }
 
@@ -1157,8 +1158,11 @@ fn expected_stage3_prefix() -> Vec<String> {
     ])
 }
 
+/// Issue #757: `|=` renders `body LIKE '%…%'`, and no index is on `body`,
+/// so no `Skip` block is listed and nothing is pruned beyond the primary
+/// key.
 #[tokio::test]
-async fn stage3_contains_line_filter_uses_the_primary_key_and_the_body_index() {
+async fn stage3_contains_line_filter_uses_the_primary_key_and_no_body_index() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_contains");
     let ts_ns = now_ns();
@@ -1169,8 +1173,8 @@ async fn stage3_contains_line_filter_uses_the_primary_key_and_the_body_index() {
         ts_ns,
         &client,
         r#"{service_name="checkout"} |= "connection refused""#,
-        PrunesBy::Strongly,
-        Some(CONNECTION_REFUSED_ALL),
+        PrunesBy::NotAtAll,
+        None,
     )
     .await;
 }
@@ -1183,9 +1187,8 @@ async fn stage3_not_contains_line_filter_uses_the_primary_key_and_no_body_index(
     let client = setup_with_line_filter_corpus(db, ts_ns).await;
 
     // `!=` renders `NOT (body LIKE '%connection refused%')` (issue #450),
-    // which gives the `text` index no grams to test, so no `Skip` block is
-    // listed; a negated line filter prunes nothing, which
-    // `PrunesBy::NotAtAll` pins.
+    // and no index is on `body` (issue #757), so no `Skip` block is listed;
+    // it prunes nothing, which `PrunesBy::NotAtAll` pins.
     assert_stage3_usage(
         db,
         ts_ns,
@@ -1198,15 +1201,10 @@ async fn stage3_not_contains_line_filter_uses_the_primary_key_and_no_body_index(
 }
 
 /// Issue #450: the `or` group renders `((body LIKE '%a%') OR (body LIKE
-/// '%b%'))` ANDed with the PK bounds; the `text` index tests the grams of
-/// both needles and needs any of them (`mode: Any`).
-///
-/// `"nomatchzzzz"` is absent from the corpus, so the disjunction still
-/// selects only the granules carrying `"connection refused"`, which
-/// `PrunesBy::Strongly` pins against the same-run `use_skip_indexes = 0`
-/// control.
+/// '%b%'))` ANDed with the PK bounds. No index is on `body` (issue #757),
+/// so no `Skip` block is listed.
 #[tokio::test]
-async fn stage3_or_group_line_filter_needs_any_needle_grams() {
+async fn stage3_or_group_line_filter_engages_no_body_index() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_or_group");
     let ts_ns = now_ns();
@@ -1217,14 +1215,15 @@ async fn stage3_or_group_line_filter_needs_any_needle_grams() {
         ts_ns,
         &client,
         r#"{service_name="checkout"} |= "connection refused" or "nomatchzzzz""#,
-        PrunesBy::Strongly,
-        Some(r#"(mode: Any; tokens: [" ref", "atch", "chzz", "conn", "ctio", "ecti", "efus", "fuse", "hzzz", "ion ", "matc", "n re", "nect", "nnec", "noma", "omat", "on r", "onne", "refu", "tchz", "tion", "used", "zzzz"])"#),
+        PrunesBy::NotAtAll,
+        None,
     )
     .await;
 }
 
+/// Issue #757: `|~` renders `match(body, …)`, which no index serves.
 #[tokio::test]
-async fn stage3_regex_line_filter_over_a_plain_literal_uses_the_body_index() {
+async fn stage3_regex_line_filter_engages_no_body_index() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_regex");
     let ts_ns = now_ns();
@@ -1235,8 +1234,8 @@ async fn stage3_regex_line_filter_over_a_plain_literal_uses_the_body_index() {
         ts_ns,
         &client,
         r#"{service_name="checkout"} |~ "connection refused""#,
-        PrunesBy::Strongly,
-        Some(CONNECTION_REFUSED_ALL),
+        PrunesBy::NotAtAll,
+        None,
     )
     .await;
 }
@@ -1249,10 +1248,9 @@ async fn stage3_not_regex_line_filter_over_a_metacharacter_pattern_engages_no_bo
     let client = setup_with_line_filter_corpus(db, ts_ns).await;
 
     // `!~` renders `NOT (match(body, ...))` and nothing else — no
-    // prefilter of any kind is minted (issue #450). From 26.8 ClickHouse's
-    // `EXPLAIN indexes = 1` no longer lists the `body` `text` index, which
-    // has no grams to test (26.3 listed it with `tokens: []`); it prunes
-    // nothing, which `PrunesBy::NotAtAll` pins.
+    // prefilter of any kind is minted (issue #450), and no index is on
+    // `body` (issue #757); it prunes nothing, which `PrunesBy::NotAtAll`
+    // pins.
     assert_stage3_usage(
         db,
         ts_ns,
@@ -1268,7 +1266,8 @@ async fn stage3_not_regex_line_filter_over_a_metacharacter_pattern_engages_no_bo
 /// by parser/label-filter stages keeps the stage-3 `EXPLAIN indexes = 1`
 /// extract EXACTLY equal to the plain line-filter expectation — the
 /// `json`/`status` stages are pure post-fetch and add nothing to the SQL,
-/// so the body index stays engaged for `|= "connection refused"`.
+/// so the word index stays engaged for `|= word("connection", "refused")`
+/// (issue #757).
 #[tokio::test]
 async fn stage3_line_filter_before_a_parser_keeps_the_exact_skip_index_usage() {
     skip_unless_live!();
@@ -1280,9 +1279,71 @@ async fn stage3_line_filter_before_a_parser_keeps_the_exact_skip_index_usage() {
         db,
         ts_ns,
         &client,
-        r#"{service_name="checkout"} |= "connection refused" | json | status = "500""#,
+        r#"{service_name="checkout"} |= word("connection", "refused") | json | status = "500""#,
         PrunesBy::Strongly,
-        Some(CONNECTION_REFUSED_ALL),
+        Some(WORDS_CONNECTION_REFUSED),
+    )
+    .await;
+}
+
+/// Issue #757: `word(…)` renders `hasAllTokens(upperUTF8(lowerUTF8(body)),
+/// …)`, the expression `idx_body_words` indexes; the words are case-keyed
+/// in SQL, so the condition lists them upper case and the read is confined
+/// to the granules holding both.
+#[tokio::test]
+async fn stage3_word_filter_uses_the_primary_key_and_the_word_index() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s3_word");
+    let ts_ns = now_ns();
+    let client = setup_with_line_filter_corpus(db, ts_ns).await;
+
+    assert_stage3_usage(
+        db,
+        ts_ns,
+        &client,
+        r#"{service_name="checkout"} |= word("Connection", "REFUSED")"#,
+        PrunesBy::Strongly,
+        Some(WORDS_CONNECTION_REFUSED),
+    )
+    .await;
+}
+
+/// Issue #757: `!= word(…)` lists the word index needing any word, which
+/// cannot rule a granule out for `NOT (…)`.
+#[tokio::test]
+async fn stage3_not_word_filter_prunes_nothing() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s3_not_word");
+    let ts_ns = now_ns();
+    let client = setup_with_line_filter_corpus(db, ts_ns).await;
+
+    assert_stage3_usage(
+        db,
+        ts_ns,
+        &client,
+        r#"{service_name="checkout"} != word("connection", "refused")"#,
+        PrunesBy::NotAtAll,
+        Some(r#"(mode: Any; tokens: ["CONNECTION", "REFUSED"])"#),
+    )
+    .await;
+}
+
+/// Issue #757: a `word(…)` filter chained with a substring filter prunes on
+/// the word; the substring filter adds no `Skip` block.
+#[tokio::test]
+async fn stage3_word_filter_chained_with_a_literal_prunes_on_the_word() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s3_word_chain");
+    let ts_ns = now_ns();
+    let client = setup_with_line_filter_corpus(db, ts_ns).await;
+
+    assert_stage3_usage(
+        db,
+        ts_ns,
+        &client,
+        r#"{service_name="checkout"} |= word("refused") != "zzz""#,
+        PrunesBy::Strongly,
+        Some(r#"(mode: All; tokens: ["REFUSED"])"#),
     )
     .await;
 }
@@ -2960,7 +3021,7 @@ async fn metric_raw_fallback_uses_the_service_fingerprint_timestamp_primary_key(
     // A line filter forces the raw fallback (`plan::metric_plan`: the
     // rollup table has no `body` column to filter on).
     let mp = metric_plan(
-        r#"count_over_time({env="prod"} |= "refused" [5m])"#,
+        r#"count_over_time({env="prod"} |= word("refused") [5m])"#,
         &range_params(ts_ns),
         db,
     );
@@ -2987,9 +3048,7 @@ async fn metric_raw_fallback_uses_the_service_fingerprint_timestamp_primary_key(
     assert_eq!(without_skip_blocks(&usage), expected_stage3_prefix());
     assert_eq!(
         skip_blocks(&raw),
-        expected_stage3_skip_blocks(Some(
-            r#"(mode: All; tokens: ["efus", "fuse", "refu", "used"])"#
-        ))
+        expected_stage3_skip_blocks(Some(r#"(mode: All; tokens: ["REFUSED"])"#))
     );
     // One body index, so 26.x reports no `<Combined skip indexes>`
     // pseudo-block here (measured).

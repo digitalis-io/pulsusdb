@@ -588,7 +588,7 @@ fn parse_log_expr(cursor: &mut Cursor<'_>) -> Result<LogExpr, LogQlError> {
                 ));
             }
             cursor.advance();
-            let (value, value_is_ip) = parse_line_match(cursor, op)?;
+            let head = parse_line_match(cursor, op)?;
             // `or`-chained alternatives (M8-LQ2 `linefilter.or`): greedily
             // consume `or <line-match>` — a line-level `or` only ever
             // follows a line-match value, so it never collides with the
@@ -597,13 +597,11 @@ fn parse_log_expr(cursor: &mut Cursor<'_>) -> Result<LogExpr, LogQlError> {
             let mut or_matches = Vec::new();
             while matches!(&cursor.peek().kind, TokenKind::Ident(n) if is_kw(n, "or")) {
                 cursor.advance();
-                let (v, is_ip) = parse_line_match(cursor, op)?;
-                or_matches.push(ast::LineMatch { value: v, is_ip });
+                or_matches.push(parse_line_match(cursor, op)?);
             }
             pipeline.push(Stage::LineFilter(LineFilter {
                 op,
-                value,
-                value_is_ip,
+                head,
                 or_matches,
             }));
             continue;
@@ -639,32 +637,60 @@ fn post_unwrap_stage_error(found: String, span: crate::token::Span) -> LogQlErro
 }
 
 /// Parses one line-filter alternative: `ip("<spec>")` (M8-LQ2
-/// `linefilter.ip`) when the next tokens are `ip` `(`, else a plain quoted
-/// string. `ip(…)` is accepted only with `|=`/`!=` (matching the reference)
-/// — under `|~`/`!~` it is an `UnexpectedToken`. Returns `(value, is_ip)`.
+/// `linefilter.ip`) when the next tokens are `ip` `(`; `word` `(` STRING
+/// (`,` STRING)* `)` (issue #757) when they are `word` `(`, each argument
+/// one word under [`crate::word::is_one_word`] or `InvalidWord`; else a
+/// plain quoted string. Both keywords are case-insensitive. `ip(…)` and
+/// `word(…)` are accepted only with `|=`/`!=` (matching the reference for
+/// `ip`) — under `|~`/`!~` each is an `UnexpectedToken`.
 fn parse_line_match(
     cursor: &mut Cursor<'_>,
     op: LineFilterOp,
-) -> Result<(String, bool), LogQlError> {
-    if matches!(&cursor.peek().kind, TokenKind::Ident(n) if is_kw(n, "ip"))
-        && matches!(cursor.peek2().kind, TokenKind::LParen)
-    {
-        let ip_tok = cursor.peek().clone();
-        if !matches!(op, LineFilterOp::Contains | LineFilterOp::NotContains) {
-            return Err(LogQlError::UnexpectedToken {
-                found: describe(&ip_tok.kind),
-                expected: "a string (ip() line filters require `|=` or `!=`)".to_string(),
-                span: ip_tok.span,
-            });
+) -> Result<ast::LineMatch, LogQlError> {
+    let tok = cursor.peek().clone();
+    let call = match &tok.kind {
+        TokenKind::Ident(n) if matches!(cursor.peek2().kind, TokenKind::LParen) => {
+            if is_kw(n, "ip") {
+                Some("ip")
+            } else if is_kw(n, "word") {
+                Some("word")
+            } else {
+                None
+            }
         }
-        cursor.advance(); // `ip`
-        cursor.expect(&TokenKind::LParen, "'('")?;
+        _ => None,
+    };
+    let Some(name) = call else {
+        let (value, _) = cursor.expect_string()?;
+        return Ok(ast::LineMatch::Text(value));
+    };
+    if !matches!(op, LineFilterOp::Contains | LineFilterOp::NotContains) {
+        return Err(LogQlError::UnexpectedToken {
+            found: describe(&tok.kind),
+            expected: format!("a string ({name}() line filters require `|=` or `!=`)"),
+            span: tok.span,
+        });
+    }
+    cursor.advance();
+    cursor.expect(&TokenKind::LParen, "'('")?;
+    if name == "ip" {
         let (value, _) = cursor.expect_string()?;
         cursor.expect(&TokenKind::RParen, "')'")?;
-        Ok((value, true))
-    } else {
-        let (value, _) = cursor.expect_string()?;
-        Ok((value, false))
+        return Ok(ast::LineMatch::Ip(value));
+    }
+    let mut words = Vec::new();
+    loop {
+        let (value, span) = cursor.expect_string()?;
+        if !crate::word::is_one_word(&value) {
+            return Err(LogQlError::InvalidWord { value, span });
+        }
+        words.push(value);
+        if matches!(cursor.peek().kind, TokenKind::Comma) {
+            cursor.advance();
+            continue;
+        }
+        cursor.expect(&TokenKind::RParen, "')' or ','")?;
+        return Ok(ast::LineMatch::Words(words));
     }
 }
 

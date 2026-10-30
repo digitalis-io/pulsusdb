@@ -3,7 +3,7 @@
 //! `regexp`/`pattern`), label filters, `line_format`, and `label_format`
 //! are opaque to the columnar store (they read the log body), so they
 //! evaluate here, over rows stage 3 already fetched — **after** line
-//! filters pushed down to the body's `text` index of 4-grams / PREWHERE
+//! filters pushed down to SQL (`word(…)` to the body's word index) / PREWHERE
 //! reduced the row set (features.md §2; the pushdown itself is
 //! [`super::plan::compile_line_filters`]'s job and is untouched by this
 //! module).
@@ -83,8 +83,8 @@ use std::net::IpAddr;
 
 use pulsus_logql::walk;
 use pulsus_logql::{
-    CompareOp, DropKeepElem, LabelFilterExpr, LabelFmt, LabelMatch, LineFilterOp, MatchOp,
-    NumericLiteral, ParserStage, Stage,
+    CompareOp, DropKeepElem, LabelFilterExpr, LabelFmt, LabelMatch, LineFilterOp, LineMatch,
+    MatchOp, NumericLiteral, ParserStage, Stage,
 };
 
 use super::ip::{IpMatcher, line_has_ip_in};
@@ -430,12 +430,15 @@ pub enum MetricRun<'a> {
 /// compiles to [`LineMatcher::Ip`] (a range test that renders no `body`
 /// predicate, so [`super::plan::is_pushable_line_filter`] keeps it off the SQL push-
 /// down and it is evaluated here); a plain value compiles to `Literal`
-/// (`|=`/`!=`) or `Regex` (`|~`/`!~`).
+/// (`|=`/`!=`) or `Regex` (`|~`/`!~`); a `word("…", …)` alternative
+/// compiles to `Words`, each word already [`pulsus_logql::word::case_key`]ed,
+/// matched by [`pulsus_logql::word::has_all_words`] (issue #757).
 #[derive(Debug, Clone)]
 enum LineMatcher {
     Literal(String),
     Regex(regex::Regex),
     Ip(IpMatcher),
+    Words(Vec<String>),
 }
 
 /// One node of a compiled label filter, in **post-order**.
@@ -1179,16 +1182,18 @@ fn compile_stage(
                 return Ok(None);
             }
             let mut matchers = Vec::with_capacity(1 + lf.or_matches.len());
-            for (value, is_ip) in lf.alternatives() {
-                let matcher = if is_ip {
+            for alt in lf.alternatives() {
+                let matcher = match alt {
                     // `ip("…")` compiles to a range matcher regardless
                     // of the outer op (`ip(…)` is only ever `|=`/`!=`).
-                    LineMatcher::Ip(
+                    LineMatch::Ip(value) => LineMatcher::Ip(
                         IpMatcher::parse(value)
                             .map_err(|e| PipelineError::BadIpFilter(e.to_string()))?,
-                    )
-                } else {
-                    match lf.op {
+                    ),
+                    LineMatch::Words(ws) => LineMatcher::Words(
+                        ws.iter().map(|w| pulsus_logql::word::case_key(w)).collect(),
+                    ),
+                    LineMatch::Text(value) => match lf.op {
                         LineFilterOp::Contains | LineFilterOp::NotContains => {
                             LineMatcher::Literal(value.to_string())
                         }
@@ -1199,7 +1204,7 @@ fn compile_stage(
                             // filter answers the same on every route.
                             LineMatcher::Regex(compile_regex_as_database(value)?)
                         }
-                    }
+                    },
                 };
                 matchers.push(matcher);
             }
@@ -2100,6 +2105,7 @@ impl CompiledPipeline {
                         LineMatcher::Literal(lit) => line.contains(lit.as_str()),
                         LineMatcher::Regex(re) => re.is_match(&line),
                         LineMatcher::Ip(matcher) => line_has_ip_in(matcher, &line),
+                        LineMatcher::Words(ws) => pulsus_logql::word::has_all_words(&line, ws),
                     });
                     // `!=`/`!~` keep the line iff NONE of the alternatives match.
                     let keep = if *negated { !hit } else { hit };
@@ -9024,6 +9030,59 @@ mod tests {
             pulsus_logql::Expr::Log(log) => log.pipeline.clone(),
             other => panic!("unexpected expr shape: {other:?}"),
         }
+    }
+
+    /// Issue #757 H9: a `word(…)` filter run in the process — after
+    /// `line_format`, on the client-side route, and in an `or` group
+    /// holding `ip(…)` — keeps exactly the
+    /// lines the word rule does. The kept sets are written by hand.
+    #[test]
+    fn a_word_filter_in_the_process_keeps_the_whole_word_lines() {
+        const MARKERS: [&str; 12] = [
+            "memcached: connection refused",
+            "Memcached: timeout after 3s",
+            "MEMCACHED down",
+            "xmemcached started",
+            "memcached123 started",
+            "foo_memcached ready",
+            "refused: Connection to memcached",
+            "ÜNÏCODE word",
+            "ünïcode word",
+            "mem cached split",
+            "memcached.local resolved",
+            "naïve «memcached» quote",
+        ];
+        fn kept(p: &CompiledPipeline) -> Vec<usize> {
+            MARKERS
+                .iter()
+                .enumerate()
+                .filter(|(_, body)| p.run(body, &[], 0).expect("no budget").is_some())
+                .map(|(i, _)| i)
+                .collect()
+        }
+        let after_line_format = CompiledPipeline::compile(&stages_of(
+            r#"{a="x"} | line_format "{{ __line__ }}" |= word("memcached")"#,
+        ))
+        .expect("compiles");
+        assert_eq!(kept(&after_line_format), vec![0, 1, 2, 5, 6, 10]);
+        let client_side =
+            CompiledPipeline::compile_client_side(&stages_of(r#"{a="x"} != word("memcached")"#))
+                .expect("compiles");
+        assert_eq!(kept(&client_side), vec![3, 4, 7, 8, 9, 11]);
+        // Not pushed (an `or` group holding `ip(…)`), so it runs here.
+        let with_ip = CompiledPipeline::compile(&stages_of(
+            r#"{a="x"} |= word("memcached") or ip("10.0.0.0/8")"#,
+        ))
+        .expect("compiles");
+        let mut lines: Vec<&str> = MARKERS.to_vec();
+        lines.push("peer 10.1.2.3 up");
+        let got: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, body)| with_ip.run(body, &[], 0).expect("no budget").is_some())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(got, vec![0, 1, 2, 5, 6, 10, 12]);
     }
 
     /// Issue #201 regression: an `ip(…)` line filter renders no `body`

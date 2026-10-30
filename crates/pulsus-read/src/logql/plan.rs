@@ -4350,12 +4350,12 @@ pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Result<Vec<CheckedFrag
 /// `exec.rs`'s `stats` gate) so the two paths never drift.
 ///
 /// An `ip(…)` alternative is a range test over IP-shaped substrings — it
-/// renders no `body LIKE`/`match(body, …)` predicate the body index
-/// could prune with, so it (and any `or` group containing one) evaluates
+/// renders no SQL predicate, so it (and any `or` group containing one) evaluates
 /// client-side. A pure literal/regex `or` group pushes down as a
 /// disjunction of the same per-alternative predicate.
 pub(crate) fn is_pushable_line_filter(lf: &LineFilter) -> bool {
-    !lf.value_is_ip && lf.or_matches.iter().all(|m| !m.is_ip)
+    lf.alternatives()
+        .all(|m| !matches!(m, pulsus_logql::LineMatch::Ip(_)))
 }
 
 /// Compiles every `|~`/`!~` alternative of every line filter in `stages`,
@@ -4385,11 +4385,10 @@ fn validate_pushable_line_filter_regexes(stages: &[Stage]) -> Result<(), ReadErr
         ) {
             continue;
         }
-        for (value, is_ip) in lf.alternatives() {
-            if is_ip {
-                continue;
+        for alt in lf.alternatives() {
+            if let pulsus_logql::LineMatch::Text(value) = alt {
+                super::pipeline::validate_unanchored_regex(value)?;
             }
-            super::pipeline::validate_unanchored_regex(value)?;
         }
     }
     Ok(())
@@ -8556,63 +8555,81 @@ mod tests {
     /// side rather than the head.
     #[test]
     fn the_pushability_rule_matches_a_hand_written_table() {
+        #[derive(Debug, PartialEq)]
+        enum Kind {
+            Text,
+            Ip,
+            Words,
+        }
         struct Row {
             query: &'static str,
-            value_is_ip: bool,
-            or_matches: &'static [(&'static str, bool)],
+            kinds: &'static [Kind],
             pushable: bool,
         }
         const TABLE: &[Row] = &[
             Row {
                 query: r#"{service_name="checkout"} |= "x""#,
-                value_is_ip: false,
-                or_matches: &[],
+                kinds: &[Kind::Text],
                 pushable: true,
             },
             Row {
                 // A regex that SPELLS an IP address is not an `ip()`
                 // filter. The backtick form is the spelling that parses.
                 query: r#"{service_name="checkout"} |~ `1\.2\.3\.4`"#,
-                value_is_ip: false,
-                or_matches: &[],
+                kinds: &[Kind::Text],
                 pushable: true,
             },
             Row {
                 // A literal that spells the call is not the call.
                 query: r#"{service_name="checkout"} |= "ip(""#,
-                value_is_ip: false,
-                or_matches: &[],
+                kinds: &[Kind::Text],
                 pushable: true,
             },
             Row {
                 query: r#"{service_name="checkout"} |= ip("10.0.0.1")"#,
-                value_is_ip: true,
-                or_matches: &[],
+                kinds: &[Kind::Ip],
                 pushable: false,
             },
             Row {
                 query: r#"{service_name="checkout"} != ip("10.0.0.1")"#,
-                value_is_ip: true,
-                or_matches: &[],
+                kinds: &[Kind::Ip],
                 pushable: false,
             },
             Row {
                 query: r#"{service_name="checkout"} |= "x" or "y""#,
-                value_is_ip: false,
-                or_matches: &[("y", false)],
+                kinds: &[Kind::Text, Kind::Text],
                 pushable: true,
             },
             Row {
                 // The `ip()` is not the head.
                 query: r#"{service_name="checkout"} |= "x" or ip("10.0.0.1")"#,
-                value_is_ip: false,
-                or_matches: &[("10.0.0.1", true)],
+                kinds: &[Kind::Text, Kind::Ip],
                 pushable: false,
             },
             Row {
                 query: r#"{service_name="checkout"} |= ip("10.0.0.1") or "x""#,
-                value_is_ip: true,
-                or_matches: &[("x", false)],
+                kinds: &[Kind::Ip, Kind::Text],
+                pushable: false,
+            },
+            Row {
+                // Issue #757: a `word(…)` alternative pushes down.
+                query: r#"{service_name="checkout"} |= word("a")"#,
+                kinds: &[Kind::Words],
+                pushable: true,
+            },
+            Row {
+                query: r#"{service_name="checkout"} != word("a", "b")"#,
+                kinds: &[Kind::Words],
+                pushable: true,
+            },
+            Row {
+                query: r#"{service_name="checkout"} |= word("a") or "x""#,
+                kinds: &[Kind::Words, Kind::Text],
+                pushable: true,
+            },
+            Row {
+                query: r#"{service_name="checkout"} |= word("a") or ip("10.0.0.1")"#,
+                kinds: &[Kind::Words, Kind::Ip],
                 pushable: false,
             },
         ];
@@ -8624,13 +8641,15 @@ mod tests {
             let Some(Stage::LineFilter(lf)) = log.pipeline.first() else {
                 panic!("{} has no line filter", row.query)
             };
-            assert_eq!(lf.value_is_ip, row.value_is_ip, "{}", row.query);
-            let got: Vec<(&str, bool)> = lf
-                .or_matches
-                .iter()
-                .map(|m| (m.value.as_str(), m.is_ip))
+            let got: Vec<Kind> = lf
+                .alternatives()
+                .map(|m| match m {
+                    pulsus_logql::LineMatch::Text(_) => Kind::Text,
+                    pulsus_logql::LineMatch::Ip(_) => Kind::Ip,
+                    pulsus_logql::LineMatch::Words(_) => Kind::Words,
+                })
                 .collect();
-            assert_eq!(got, row.or_matches.to_vec(), "{}", row.query);
+            assert_eq!(got.as_slice(), row.kinds, "{}", row.query);
             assert_eq!(
                 is_pushable_line_filter(lf),
                 row.pushable,

@@ -62,7 +62,9 @@ rewrite docs/schemas.md:33-33
 # Issue #18 part 1 adds #18, its own issue, where the banner, the
 # downsampling section and the metrics sharding row describe the rollup
 # table and its view.
-rewrite docs/schemas.md:174-174 refs=#25,#603,#16,#171,#498,#2,#57,#584,#586,#587,#63,#75,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#235,#3,#450,#624,#412,#398,#653,#4,#602,#614,#131,#137,#598,#597,#599,#501,#601,#738,#18
+# Issue #757 adds #757, its own issue, where the banner says the log body's
+# index is a whole-word index.
+rewrite docs/schemas.md:174-174 refs=#25,#603,#16,#171,#498,#2,#57,#584,#586,#587,#63,#75,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#235,#3,#450,#624,#412,#398,#653,#4,#602,#614,#131,#137,#598,#597,#599,#501,#601,#738,#18,#757
 # `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
 # writer-contract paragraph gained the reason the read path does not route on
 # `metric_series.value_type`, and that reason is the decision A1's plan v5
@@ -113,7 +115,9 @@ rewrite docs/schemas.md:691-692
 # exemplar table and landing kind 4 are defined in `schema/schema.sql`.
 # Issue #738 adds #738, its own issue, where the tenancy section says traces
 # are tenant-scoped beside metrics and logs.
-rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624,#596,#507,#594,#602,#592,#653,#614,#597,#599,#501,#601,#738
+# Issue #757 adds #757, its own issue, where the banner says the log body's
+# index is a whole-word index.
+rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624,#596,#507,#594,#602,#592,#653,#614,#597,#599,#501,#601,#738,#757
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
 rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560
@@ -131,7 +135,9 @@ rewrite docs/decisions/0006-log-pattern-extraction.md:52-62 refs=#603
 # statement's route and its tests assert it; and #544, carried: the comments
 # beside the lowered structured-metadata filter that already cited it were
 # rewritten when that filter's range read moved into the database.
-rewrite crates/pulsus-read/src/logql/plan.rs:5573-5581 refs=#507,#544,#624,#12,#614
+# Issue #757 adds #757, its own issue, where the pushability table gains
+# its `word(…)` rows.
+rewrite crates/pulsus-read/src/logql/plan.rs:5573-5581 refs=#507,#544,#624,#12,#614,#757
 leave docs/116.md:76-76
 leave docs/traceql-schema-migration.md:2289-2289
 # #478 and #555 join this column for the same reason as `docs/schemas.md`'s:
@@ -161,7 +167,7 @@ leave docs/configuration.md:126-126
 # (`crates/pulsus-schema/tests/live_schema.rs`). `idx_body_tokens` is gone
 # with #624 part 3b; the token-index gates in
 # `crates/pulsus-read/tests/query_log_gates.rs` are now the `text` index
-# gates, beside `the_log_body_has_one_text_index_of_4_grams`.
+# gates, beside `the_log_body_has_one_word_index`.
 # `#587` here is the other half of the same move, and also new: the comment
 # records where the `JSON` column's codec went. Same decision as
 # `crates/pulsus-clickhouse/src/lib.rs` above.

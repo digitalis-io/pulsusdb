@@ -189,8 +189,7 @@ fn a_regex_matcher_value_with_metacharacters_and_a_quote_is_fully_escaped() {
 fn a_line_filter_payload_stays_inside_one_literal_in_the_exact_predicate() {
     let filters = vec![pulsus_logql::Stage::LineFilter(LineFilter {
         op: LineFilterOp::Contains,
-        value: PAYLOAD_PAREN.to_string(),
-        value_is_ip: false,
+        head: pulsus_logql::LineMatch::Text(PAYLOAD_PAREN.to_string()),
         or_matches: Vec::new(),
     })];
     let clauses = compile_line_filters(&filters);
@@ -245,8 +244,7 @@ fn an_injected_target_label_matcher_with_a_hostile_name_stays_escaped_in_stage1(
 fn stage3_with_an_injection_payload_in_the_line_filter_keeps_the_statement_well_formed() {
     let filters = vec![pulsus_logql::Stage::LineFilter(LineFilter {
         op: LineFilterOp::Contains,
-        value: PAYLOAD_COMMENT.to_string(),
-        value_is_ip: false,
+        head: pulsus_logql::LineMatch::Text(PAYLOAD_COMMENT.to_string()),
         or_matches: Vec::new(),
     })];
     let clauses = compile_line_filters(&filters);

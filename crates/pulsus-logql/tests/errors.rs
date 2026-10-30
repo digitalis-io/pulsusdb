@@ -790,3 +790,104 @@ fn a_range_aggregation_grouping_round_trips_postfix() {
         assert_eq!(parse(&rendered).unwrap(), expr, "{q:?} -> {rendered:?}");
     }
 }
+
+// --- `word(…)` line filters (issue #757): rejected shapes ---
+
+/// One positional parse error, as `(eof, found, expected, byte)`; `found`
+/// is empty for an end-of-query error.
+fn positional(query: &str) -> (bool, String, String, usize) {
+    match parse(query) {
+        Err(LogQlError::UnexpectedToken {
+            found,
+            expected,
+            span,
+        }) => (false, found, expected, span.start),
+        Err(LogQlError::UnexpectedEof { expected, span }) => {
+            (true, String::new(), expected, span.start)
+        }
+        other => panic!("{query}: expected a positional parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_malformed_word_line_filter_is_a_positional_error() {
+    let under_regex = (
+        false,
+        r#"identifier "word""#.to_string(),
+        "a string (word() line filters require `|=` or `!=`)".to_string(),
+        13,
+    );
+    for (tail, want) in [
+        (r#"|~ word("a")"#, under_regex.clone()),
+        (r#"!~ word("a")"#, under_regex),
+        (
+            r#"|= word()"#,
+            (false, "')'".to_string(), "a string".to_string(), 18),
+        ),
+        (
+            r#"|= word("a",)"#,
+            (false, "')'".to_string(), "a string".to_string(), 22),
+        ),
+        (
+            r#"|= word("a" "b")"#,
+            (
+                false,
+                r#"string "b""#.to_string(),
+                "')' or ','".to_string(),
+                22,
+            ),
+        ),
+        (
+            r#"|= word("a""#,
+            (true, String::new(), "')' or ','".to_string(), 21),
+        ),
+        (
+            r#"|= word(a)"#,
+            (
+                false,
+                r#"identifier "a""#.to_string(),
+                "a string".to_string(),
+                18,
+            ),
+        ),
+        // No `(`: not a call, so the old "a string" error at `word`.
+        (
+            r#"|= word"#,
+            (
+                false,
+                r#"identifier "word""#.to_string(),
+                "a string".to_string(),
+                13,
+            ),
+        ),
+    ] {
+        let query = format!(r#"{{job="x"}} {tail}"#);
+        assert_eq!(positional(&query), want, "{query}");
+    }
+}
+
+#[test]
+fn a_word_argument_that_is_not_one_word_is_invalid_word() {
+    for value in ["", "a.b", "a b", "a_b", "x-y", "a:b", "a\tb"] {
+        let escaped = value.replace('\t', "\\t");
+        let query = format!(r#"{{job="x"}} |= word("{escaped}")"#);
+        match parse(&query) {
+            Err(e @ LogQlError::InvalidWord { .. }) => {
+                let LogQlError::InvalidWord { value: got, .. } = &e else {
+                    unreachable!()
+                };
+                assert_eq!(got, value, "{query}");
+                assert!(e.to_string().contains("invalid word"), "{query}: {e}");
+            }
+            other => panic!("{query}: expected InvalidWord, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_word_argument_of_word_bytes_parses() {
+    for value in ["café", "ÜNÏ", "«x»", "a—b", "123", "A9"] {
+        let query = format!(r#"{{job="x"}} |= word("{value}")"#);
+        parse(&query).unwrap_or_else(|e| panic!("{query} should parse, got {e}"));
+    }
+}

@@ -36,7 +36,7 @@ use sha2::{Digest, Sha256};
 use pulsus_logql::MeNode;
 use pulsus_logql::{
     BINARY_OP_KEYWORDS, BinOp, CompareOp, Expr, GroupingKind, LabelFilterExpr, LabelFmt,
-    LineFilterOp, LogExpr, LogQlError, MatchGroup, MatchOp, MetricExpr, NumericLiteral,
+    LineFilterOp, LineMatch, LogExpr, LogQlError, MatchGroup, MatchOp, MetricExpr, NumericLiteral,
     ParserStage, REMAINING_UNSUPPORTED_STAGES, RangeAggOp, Stage, UNWRAP_CONVERSIONS, VectorAggOp,
     parse,
 };
@@ -335,7 +335,7 @@ fn walk_stage(stage: &Stage, out: &mut BTreeSet<String>) {
         Stage::LineFilter(lf) => {
             out.insert(linefilter_id(lf.op).to_string());
             out.insert("statics.string".to_string());
-            if lf.alternatives().any(|(_, is_ip)| is_ip) {
+            if lf.alternatives().any(|m| matches!(m, LineMatch::Ip(_))) {
                 out.insert("linefilter.ip".to_string());
             }
             if !lf.or_matches.is_empty() {

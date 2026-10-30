@@ -2040,8 +2040,12 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // `zz_print_frame_censuses`. W-MEM disposition: **NIL** — the
         // driver descends a sole-child spine in-loop and touches a
         // `ChunkStack` only at `arity >= 2`; the sum it accumulates is
-        // identical to the recursion's.
-        branches: 6,
+        // identical to the recursion's. Issue #757: a line filter's
+        // alternative is a `LineMatch`, so the byte sum matches on it (one
+        // branch more, 7) and a `word(…)` alternative sums its words'
+        // lengths (`.map`, `.sum`). W-MEM disposition: **NIL** — an
+        // iterator over the borrowed words, no container.
+        branches: 7,
         callees: &[
             ".alternatives",
             ".as_deref",
@@ -2049,8 +2053,10 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             ".fold",
             ".iter",
             ".len",
+            ".map",
             ".map_or",
             ".saturating_add",
+            ".sum",
             "for_each_label_filter",
             "label_filter_bytes",
             "matcher_bytes",
@@ -2060,13 +2066,17 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         file: "variants.rs",
         ty: None,
         anchor: "regex_stage_count",
-        branches: 6,
+        branches: 7,
         // Issue #272: `label_filter_regexes` became a driver consumer
         // (`for_each_label_filter`) rather than a recursion over
         // `LabelFilterExpr`'s now-`Child` slots. Branch count unchanged
         // at 6. Regenerated with `zz_print_frame_censuses`. W-MEM
         // disposition: **NIL** — the driver allocates nothing on an
         // `arity <= 1` tree and the count it accumulates is identical.
+        // Issue #757: a regex alternative is counted by
+        // `matches!(m, LineMatch::Text(_))` (one branch more, 7, and the
+        // `Text` pattern). W-MEM disposition: **NIL** — a match on a
+        // borrowed alternative, no allocation.
         callees: &[
             ".alternatives",
             ".as_ref",
@@ -2074,6 +2084,7 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             ".is_some_and",
             ".iter",
             ".saturating_add",
+            "Text",
             "for_each_label_filter",
             "from",
             "label_filter_regexes",

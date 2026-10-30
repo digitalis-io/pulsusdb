@@ -558,7 +558,7 @@ async fn body_search_skip_index_prunes_most_granules() {
         direction: Direction::Backward,
     };
     let sp = streams_plan(
-        &format!(r#"{{service_name="{SERVICE}"}} |= "{NEEDLE}""#),
+        &format!(r#"{{service_name="{SERVICE}"}} |= word("{NEEDLE}")"#),
         &params,
         db,
     );
@@ -9300,6 +9300,219 @@ async fn a_logql_regex_answers_the_same_on_every_route() {
     drop_db_624(&admin, &db).await;
 }
 
+/// The lines Q5 (issue #757) lands, in order: the plan's markers 0-11,
+/// then two lines holding the filler phrases.
+const WORD_LINES_757: [&str; 14] = [
+    "memcached: connection refused",
+    "Memcached: timeout after 3s",
+    "MEMCACHED down",
+    "xmemcached started",
+    "memcached123 started",
+    "foo_memcached ready",
+    "refused: Connection to memcached",
+    "ÜNÏCODE word",
+    "ünïcode word",
+    "mem cached split",
+    "memcached.local resolved",
+    "naïve «memcached» quote",
+    "connection pool ok",
+    "login refused",
+];
+
+/// The `WORD_LINES_757` indices of every entry of a log query's streams.
+fn word_lines_757(streams: &[pulsus_read::logql::StreamResult]) -> Vec<usize> {
+    let mut out: Vec<usize> = streams
+        .iter()
+        .flat_map(|s| s.entries.iter())
+        .map(|(_, line)| {
+            WORD_LINES_757
+                .iter()
+                .position(|l| l == line)
+                .unwrap_or_else(|| panic!("an unlanded line: {line:?}"))
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// **Q5 (issue #757): a `word(…)` filter answers on every route** — a
+/// log query, keyset pages, in the process after `line_format`, a tail
+/// page, `stats`, counts and rates on both count routes, and a `variants`
+/// tail, bare and wrapped. Every expected value is read from `WORD_LINES_757` by hand.
+#[tokio::test]
+async fn a_word_filter_answers_on_every_route() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w757_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 4 * 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        7_570_000,
+        "w757",
+        r#"{"service_name":"w757","s":"w"}"#,
+    )
+    .await;
+    for (i, line) in WORD_LINES_757.iter().enumerate() {
+        let i = i64::try_from(i).expect("fits");
+        land_line_624(&admin, &db, 7_570_000, "w757", t + (i + 1) * sec, line, "").await;
+    }
+    let logs = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t + 60 * sec,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let kept = vec![0usize, 1, 2, 5, 6, 10];
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
+
+    for (query, route) in [
+        (r#"{s="w"} |= word("memcached")"#, "the log query"),
+        (
+            r#"{s="w"} |= word("memcached") | regexp "(?P<x>\\w+)" | x != """#,
+            "keyset pages",
+        ),
+        (
+            r#"{s="w"} | line_format "{{ __line__ }}" |= word("memcached")"#,
+            "in the process, after line_format",
+        ),
+    ] {
+        let (result, _) = engine
+            .query(&parse(query).expect("parse"), &logs)
+            .await
+            .unwrap_or_else(|e| panic!("{route}: {query}: {e}"));
+        let QueryResult::Streams { items, .. } = result else {
+            panic!("{route}: {query}: streams");
+        };
+        assert_eq!(word_lines_757(&items), kept, "{route}: {query}");
+    }
+
+    {
+        let query = r#"{s="w"} |= word("memcached")"#;
+        let mut setup = engine
+            .tail_setup(&parse(query).expect("parse"), &logs)
+            .expect("a tail setup");
+        let page = engine
+            .tail_poll(
+                &mut setup,
+                pulsus_read::logql::exec::TailLower::Start { start_ns: t },
+                t + 60 * sec,
+                100,
+            )
+            .await
+            .expect("a tail page");
+        assert_eq!(
+            word_lines_757(&page.streams),
+            kept,
+            "the tail page: {query}"
+        );
+    }
+
+    {
+        let query = r#"{s="w"} |= word("memcached")"#;
+        let stats = engine
+            .stats(
+                &parse(query).expect("parse"),
+                pulsus_read::logql::TimeBounds {
+                    start_ns: t,
+                    end_ns: t + 60 * sec,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("stats: {query}: {e}"));
+        assert_eq!(stats.entries, 6, "stats: {query}");
+    }
+
+    let total = |got: &[AnswerSeries]| -> f64 {
+        got.iter()
+            .flat_map(|(_, p)| p.iter().map(|(_, v)| f64::from_bits(*v)))
+            .sum()
+    };
+    for (query, want) in [
+        (
+            r#"sum(count_over_time({s="w"} |= word("memcached") [1m]))"#,
+            6.0,
+        ),
+        (
+            r#"sum(rate({s="w"} |= word("memcached") [1m]))"#,
+            6.0 / 60.0,
+        ),
+        (
+            r#"sum(count_over_time({s="w"} != word("memcached") [1m]))"#,
+            8.0,
+        ),
+        (
+            r#"sum(count_over_time({s="w"} |= word("REFUSED", "connection") [1m]))"#,
+            2.0,
+        ),
+        (
+            r#"sum(count_over_time({s="w"} |= word("ÜNÏCODE") [1m]))"#,
+            2.0,
+        ),
+        (
+            r#"sum(count_over_time({s="w"} |= word("memcached") != "Memcached" [1m]))"#,
+            5.0,
+        ),
+        (
+            r#"sum(count_over_time({s="w"} |= word("memcached") or "xmem" [1m]))"#,
+            7.0,
+        ),
+        (r#"sum(count_over_time({s="w"} |= "memcached" [1m]))"#, 7.0),
+    ] {
+        for todays in [false, true] {
+            let got = run_624(&db, hooks_624(todays, None, None), None, query, &range)
+                .await
+                .unwrap_or_else(|e| panic!("{query}, today's route {todays}: {e}"));
+            assert_eq!(
+                total(&got),
+                want,
+                "{query}, today's route {todays}: {got:?}"
+            );
+        }
+    }
+
+    // A bare variant's own line filter is dead by design (`b13_variants.test`
+    // W1, W4); wrapped, the tail runs it in the process (W3).
+    for (query, want) in [
+        (
+            r#"variants(count_over_time({s="w"} |= word("memcached") [1m])) of ({s="w"} [1m])"#,
+            14.0,
+        ),
+        (
+            r#"variants(sum(count_over_time({s="w"} |= word("memcached") [1m]))) of ({s="w"} [1m])"#,
+            6.0,
+        ),
+    ] {
+        let got = run_624(&db, hooks_624(false, None, None), None, query, &range)
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        assert_eq!(total(&got), want, "the variants tail: {query}: {got:?}");
+    }
+
+    drop_db_624(&admin, &db).await;
+}
+
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct CountRow624p3 {
     n: u64,
@@ -9332,12 +9545,12 @@ struct ExplainLine624p3 {
 }
 
 /// **T12 (issue #624, part 3a, F2): a pushed line filter returns the rows
-/// it returns without the skip indexes.** (a) The n-gram index drops a
-/// granule `match()` accepts for `(?i)(denied|refused)`; (b) over §2.3's
-/// sweep — 16 shapes × 11 flag placements, 26 bodies, one granule per row —
-/// every pattern's pushed predicate counts what it counts unindexed; (c) the
-/// fix is per predicate, so a second filter in the same statement keeps its
-/// n-gram pruning.
+/// it returns without the skip indexes.** (a) `match()` keeps the granule
+/// for `(?i)(denied|refused)`; (b) over §2.3's sweep — 16 shapes × 11 flag
+/// placements, 26 bodies, one granule per row, under the body's word index
+/// — every pattern's pushed predicate counts what it counts unindexed; (c)
+/// a `word(…)` filter beside a regex filter in the same statement prunes
+/// on the word index (issue #757).
 #[tokio::test]
 async fn pushed_line_filters_equal_the_unindexed_answer() {
     skip_unless_live!();
@@ -9393,7 +9606,7 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         &admin,
         &format!(
             "CREATE TABLE {table} (body String, \
-             INDEX idx_body_ngrams body TYPE text(tokenizer = ngrams(4))) \
+             INDEX idx_body_words upperUTF8(lowerUTF8(body)) TYPE text(tokenizer = splitByNonAlpha)) \
              ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
         ),
     )
@@ -9482,8 +9695,7 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
     for pattern in &patterns {
         let fragment = pulsus_read::logql::predicate::line_filter(&pulsus_logql::LineFilter {
             op: pulsus_logql::LineFilterOp::Regex,
-            value: pattern.clone(),
-            value_is_ip: false,
+            head: pulsus_logql::LineMatch::Text(pattern.clone()),
             or_matches: Vec::new(),
         })
         .unwrap_or_else(|e| panic!("{pattern}: {e}"));
@@ -9512,7 +9724,7 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         &admin,
         &format!(
             "CREATE TABLE {table} (body String, \
-             INDEX idx_body_ngrams body TYPE text(tokenizer = ngrams(4))) \
+             INDEX idx_body_words upperUTF8(lowerUTF8(body)) TYPE text(tokenizer = splitByNonAlpha)) \
              ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
         ),
     )
@@ -9526,18 +9738,23 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         ),
     )
     .await;
-    let filter = |op, value: &str| {
+    let filter = |op, head| {
         pulsus_read::logql::predicate::line_filter(&pulsus_logql::LineFilter {
             op,
-            value: value.to_string(),
-            value_is_ip: false,
+            head,
             or_matches: Vec::new(),
         })
         .expect("renders")
     };
-    let contains = filter(pulsus_logql::LineFilterOp::Contains, "rare failure");
-    let regex = filter(pulsus_logql::LineFilterOp::Regex, "(?i)(panic|refused)");
-    let predicate = format!("{} AND {}", contains.as_sql(), regex.as_sql());
+    let words = filter(
+        pulsus_logql::LineFilterOp::Contains,
+        pulsus_logql::LineMatch::Words(vec!["rare".to_string(), "failure".to_string()]),
+    );
+    let regex = filter(
+        pulsus_logql::LineFilterOp::Regex,
+        pulsus_logql::LineMatch::Text("(?i)(panic|refused)".to_string()),
+    );
+    let predicate = format!("{} AND {}", words.as_sql(), regex.as_sql());
     assert_eq!(
         count_where_624p3(&admin, &table, &predicate, true).await,
         10,
@@ -9555,8 +9772,8 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
     drop(stream);
     let at = lines
         .iter()
-        .position(|l| l.contains("Name: idx_body_ngrams"))
-        .unwrap_or_else(|| panic!("(c) the n-gram index is used: {lines:#?}"));
+        .position(|l| l.contains("Name: idx_body_words"))
+        .unwrap_or_else(|| panic!("(c) the word index is used: {lines:#?}"));
     let granules = lines[at..]
         .iter()
         .find_map(|l| l.trim().strip_prefix("Granules: "))
@@ -9566,7 +9783,7 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         kept.trim().parse().expect("kept"),
         total.trim().parse().expect("total"),
     );
-    assert!(kept < total, "(c) idx_body_ngrams prunes: {granules}");
+    assert!(kept < total, "(c) idx_body_words prunes: {granules}");
     drop_db_624(&admin, &db).await;
 }
 
@@ -9977,7 +10194,8 @@ async fn seed_condition_cache_corpus_624p3b() -> (ChClient, String, i64) {
 /// holds `body LIKE` over a `text` index records, in the query condition
 /// cache, granules of the `service` condition as matching nothing; a later
 /// statement with the same `PREWHERE` and no body predicate then counts
-/// too few lines. The log query runs first, then the count: 300,000.
+/// too few lines. The log query runs first, then the count: 300,000. It
+/// runs twice: with a substring filter, then with `word(…)` (issue #757).
 #[tokio::test]
 async fn a_line_filter_leaves_the_next_count_intact() {
     skip_unless_live!();
@@ -9997,18 +10215,6 @@ async fn a_line_filter_leaves_the_next_count_intact() {
         limit: 1000,
         direction: Direction::Backward,
     };
-    let (found, _) = engine
-        .query(
-            &parse(r#"{service_name="c3s"} |= "panic: rare""#).expect("parse"),
-            &logs,
-        )
-        .await
-        .expect("the log query answers");
-    let QueryResult::Streams { items: streams, .. } = found else {
-        panic!("a log query answers streams");
-    };
-    let lines: usize = streams.iter().map(|s| s.entries.len()).sum();
-    assert_eq!(lines, 100, "the needle's lines");
     let at = QueryParams {
         spec: QuerySpec::Instant {
             at_ns: t + 600_000_000_000,
@@ -10016,18 +10222,33 @@ async fn a_line_filter_leaves_the_next_count_intact() {
         limit: 100,
         direction: Direction::Backward,
     };
-    let (count, _) = engine
-        .query(
-            &parse(r#"sum(count_over_time({service_name="c3s"} [10m]))"#).expect("parse"),
-            &at,
-        )
-        .await
-        .expect("the count answers");
-    let QueryResult::Vector(samples) = count else {
-        panic!("an instant query answers a vector");
-    };
-    let total: f64 = samples.iter().map(|s| s.value).sum();
-    assert_eq!(total, 300_000.0, "every line, after the line filter ran");
+    for first in [
+        r#"{service_name="c3s"} |= "panic: rare""#,
+        r#"{service_name="c3s"} |= word("panic", "rare")"#,
+    ] {
+        exec_624(&admin, "SYSTEM DROP QUERY CONDITION CACHE").await;
+        let (found, _) = engine
+            .query(&parse(first).expect("parse"), &logs)
+            .await
+            .unwrap_or_else(|e| panic!("{first}: the log query answers: {e}"));
+        let QueryResult::Streams { items: streams, .. } = found else {
+            panic!("a log query answers streams");
+        };
+        let lines: usize = streams.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(lines, 100, "{first}: the needle's lines");
+        let (count, _) = engine
+            .query(
+                &parse(r#"sum(count_over_time({service_name="c3s"} [10m]))"#).expect("parse"),
+                &at,
+            )
+            .await
+            .expect("the count answers");
+        let QueryResult::Vector(samples) = count else {
+            panic!("an instant query answers a vector");
+        };
+        let total: f64 = samples.iter().map(|s| s.value).sum();
+        assert_eq!(total, 300_000.0, "every line, after `{first}` ran");
+    }
     exec_624(&admin, "SYSTEM DROP QUERY CONDITION CACHE").await;
     drop_db_624(&admin, &db).await;
 }
@@ -10089,6 +10310,7 @@ async fn every_body_predicate_statement_disables_the_text_index_direct_read() {
             r#"sum(count_over_time({service_name="c3s"} |~ "(?i)(panic|refused)" [10m]))"#,
             &instant,
         ),
+        (r#"{service_name="c3s"} |= word("panic")"#, &range),
     ] {
         engine
             .query(&parse(query).expect("parse"), params)
@@ -10099,7 +10321,7 @@ async fn every_body_predicate_statement_disables_the_text_index_direct_read() {
         "SELECT query, Settings['query_plan_direct_read_from_text_index'] AS direct_read \
          FROM system.query_log WHERE log_comment = '{comment}' AND type = 'QueryFinish' \
          AND query LIKE '%log_samples%' AND query LIKE '%body%' \
-         AND (query LIKE '%body LIKE%' OR query LIKE '%match(body%' OR query LIKE '%match(identity(body)%')"
+         AND (query LIKE '%body LIKE%' OR query LIKE '%match(body%' OR query LIKE '%hasAllTokens(upperUTF8(lowerUTF8(body))%')"
     );
     let mut rows: Vec<DirectReadRow624p3b> = Vec::new();
     for _ in 0..30 {
@@ -10113,13 +10335,13 @@ async fn every_body_predicate_statement_disables_the_text_index_direct_read() {
             rows.push(row.expect("decode"));
         }
         drop(stream);
-        if rows.len() >= 6 {
+        if rows.len() >= 7 {
             break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     assert!(
-        rows.len() >= 6,
+        rows.len() >= 7,
         "every shape logged a body-predicate statement: {rows:#?}"
     );
     for r in &rows {

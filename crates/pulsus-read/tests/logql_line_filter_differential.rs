@@ -44,10 +44,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use futures::StreamExt;
-use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
-use pulsus_logql::{LineFilter, LineFilterOp};
+use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
+use pulsus_logql::{LineFilter, LineFilterOp, LineMatch};
 use pulsus_model::Fingerprint;
 use pulsus_read::logql::Direction;
+use pulsus_read::logql::pipeline::CompiledPipeline;
 use pulsus_read::logql::predicate::{self, literal};
 use pulsus_read::logql::rows::SampleRow;
 use pulsus_read::logql::sql::{self, TimeWindow};
@@ -133,9 +134,8 @@ const BODIES: &[&str] = &[
 ];
 
 /// Substring lengths, in CHARS, the generator cuts at every char-boundary
-/// offset of every body. Committed: 1–3 exercise the sub-4-byte no-pruning
-/// residual, 4 is exactly the body index's n-gram length, and the rest walk up to
-/// needles spanning several fields.
+/// offset of every body. Committed: 1–3 are the shortest needles, 4 and up
+/// walk to needles spanning several fields.
 const LENGTHS: &[usize] = &[1, 2, 3, 4, 5, 6, 8, 11, 16, 24];
 
 /// Upper bound on the needle count, so the CI step stays a few thousand
@@ -225,9 +225,9 @@ fn now_ns() -> i64 {
     .expect("fits i64")
 }
 
-/// Seeds one row per [`BODIES`] entry, one nanosecond apart, and returns a
+/// Seeds one row per entry of `bodies`, one nanosecond apart, and returns a
 /// client bound to `db`.
-async fn setup(db: &str, ts_ns: i64) -> ChClient {
+async fn setup(db: &str, ts_ns: i64, bodies: &[&str]) -> ChClient {
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
@@ -238,7 +238,7 @@ async fn setup(db: &str, ts_ns: i64) -> ChClient {
         .await
         .expect("connect (data client)");
 
-    let values: Vec<String> = BODIES
+    let values: Vec<String> = bodies
         .iter()
         .enumerate()
         .map(|(i, body)| {
@@ -287,13 +287,25 @@ async fn matched_indices(
     needle: &str,
     body_index: &BTreeMap<&str, usize>,
 ) -> BTreeSet<usize> {
-    let fragment = predicate::line_filter(&LineFilter {
+    let filter = LineFilter {
         op,
-        value: needle.to_string(),
-        value_is_ip: false,
+        head: LineMatch::Text(needle.to_string()),
         or_matches: Vec::new(),
-    })
-    .unwrap_or_else(|e| panic!("{op:?} {needle:?} must mint: {e:?}"));
+    };
+    filter_indices(client, db, ts_ns, &filter, body_index).await
+}
+
+/// [`matched_indices`] for any line filter: mints it, runs it through
+/// `sql::stage3`, and maps the returned bodies back to indices.
+async fn filter_indices(
+    client: &ChClient,
+    db: &str,
+    ts_ns: i64,
+    filter: &LineFilter,
+    body_index: &BTreeMap<&str, usize>,
+) -> BTreeSet<usize> {
+    let fragment =
+        predicate::line_filter(filter).unwrap_or_else(|e| panic!("`{filter}` must mint: {e:?}"));
     let sql = sql::stage3(
         &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &format!("{db}.log_samples"),
@@ -310,10 +322,10 @@ async fn matched_indices(
     let mut stream = client
         .query_stream::<SampleRow>(&sql.replace('?', "??"), &QuerySettings::new())
         .await
-        .unwrap_or_else(|e| panic!("{op:?} {needle:?} failed: {e}\n{sql}"));
+        .unwrap_or_else(|e| panic!("`{filter}` failed: {e}\n{sql}"));
     let mut out = BTreeSet::new();
     while let Some(row) = stream.next().await {
-        let row = row.unwrap_or_else(|e| panic!("{op:?} {needle:?} row decode failed: {e}"));
+        let row = row.unwrap_or_else(|e| panic!("`{filter}` row decode failed: {e}"));
         let idx = *body_index
             .get(row.body.as_str())
             .unwrap_or_else(|| panic!("unseeded body returned: {:?}", row.body));
@@ -334,7 +346,7 @@ async fn a_line_filter_returns_exactly_the_rows_str_contains_does_for_every_gene
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_line_filter_diff");
     let ts_ns = now_ns();
-    let client = setup(db, ts_ns).await;
+    let client = setup(db, ts_ns, BODIES).await;
 
     let needles = generated_needles();
     let all: BTreeSet<usize> = (0..BODIES.len()).collect();
@@ -453,4 +465,382 @@ fn the_generated_needle_set_spans_every_shape_the_old_rendering_got_wrong() {
 
     // Determinism: the set is a function of this file alone.
     assert_eq!(needles, generated_needles());
+}
+
+// --- Issue #757: `word(…)` -------------------------------------------------
+
+/// Bodies for the `word(…)` differential, pairwise distinct: markers 0-11
+/// of the plan's fixture, then lines for the case and separator edges.
+const WORD_BODIES: &[&str] = &[
+    "memcached: connection refused",
+    "Memcached: timeout after 3s",
+    "MEMCACHED down",
+    "xmemcached started",
+    "memcached123 started",
+    "foo_memcached ready",
+    "refused: Connection to memcached",
+    "ÜNÏCODE word",
+    "ünïcode word",
+    "mem cached split",
+    "memcached.local resolved",
+    "naïve «memcached» quote",
+    "connection pool ok",
+    "login refused",
+    "ΟΔΟΣ final sigma",
+    "İstanbul dotted",
+    "\u{212A}elvin scale",
+    "a—b em dash",
+    "tab\tseparated\u{1}ctl",
+    "ΑΣ.Β dotted",
+    "Α'Σ apostrophe",
+    "Straße closed",
+];
+
+/// The truth side's own tokenizer, written here and not taken from
+/// `pulsus_logql::word`: the whole line lowered then upper-cased, split on
+/// every byte below `0x80` that is not an ASCII letter or digit.
+fn truth_words(line: &str) -> BTreeSet<Vec<u8>> {
+    let keyed = line.to_lowercase().to_uppercase();
+    let mut out = BTreeSet::new();
+    let mut cur: Vec<u8> = Vec::new();
+    for &b in keyed.as_bytes() {
+        if b.is_ascii_digit() || b.is_ascii_lowercase() || b.is_ascii_uppercase() || b >= 0x80 {
+            cur.push(b);
+        } else if !cur.is_empty() {
+            out.insert(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.insert(cur);
+    }
+    out
+}
+
+/// The tokens of `line` as written, split by the same byte rule but not
+/// keyed.
+fn tokens_as_written(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in line.chars() {
+        if c.is_ascii_alphanumeric() || !c.is_ascii() {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn word_truth(words: &[String]) -> BTreeSet<usize> {
+    let needles: Vec<BTreeSet<Vec<u8>>> = words.iter().map(|w| truth_words(w)).collect();
+    WORD_BODIES
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| {
+            let have = truth_words(b);
+            needles.iter().all(|n| n.iter().all(|t| have.contains(t)))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn words_filter(op: LineFilterOp, words: &[String]) -> LineFilter {
+    LineFilter {
+        op,
+        head: LineMatch::Words(words.to_vec()),
+        or_matches: Vec::new(),
+    }
+}
+
+fn client_side_indices(filter: &LineFilter) -> BTreeSet<usize> {
+    let p =
+        CompiledPipeline::compile_client_side(&[pulsus_logql::Stage::LineFilter(filter.clone())])
+            .unwrap_or_else(|e| panic!("`{filter}` must compile: {e:?}"));
+    WORD_BODIES
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| p.run(b, &[], 0).expect("no budget").is_some())
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Issue #757 D1t: `|= word(…)` and `!= word(…)` return exactly the rows
+/// the word rule keeps, through the SQL the database runs and through the
+/// in-process matcher alike, for every case form of every word.
+#[tokio::test]
+async fn a_word_filter_returns_exactly_the_rows_the_word_rule_does() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_word_filter_diff");
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns, WORD_BODIES).await;
+    let all: BTreeSet<usize> = (0..WORD_BODIES.len()).collect();
+    let body_index: BTreeMap<&str, usize> = WORD_BODIES
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (*b, i))
+        .collect();
+
+    // Hand-written sets, read from the bodies above.
+    for (words, want) in [
+        (&["memcached"][..], &[0usize, 1, 2, 5, 6, 10][..]),
+        (&["connection", "refused"][..], &[0, 6][..]),
+        (&["ünïcode"][..], &[7, 8][..]),
+        (&["kelvin"][..], &[16][..]),
+        (&["istanbul"][..], &[][..]),
+        (&["ΟΔΟΣ"][..], &[14][..]),
+        (&["οδος"][..], &[14][..]),
+        (&["οδοσ"][..], &[14][..]),
+        (&["ΑΣ"][..], &[19][..]),
+        (&["ας"][..], &[19][..]),
+        (&["ασ"][..], &[19][..]),
+        (&["Σ"][..], &[20][..]),
+        (&["ς"][..], &[20][..]),
+        (&["strasse"][..], &[21][..]),
+        (&["STRASSE"][..], &[21][..]),
+    ] {
+        let words: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+        let want: BTreeSet<usize> = want.iter().copied().collect();
+        let filter = words_filter(LineFilterOp::Contains, &words);
+        let got = filter_indices(&client, db, ts_ns, &filter, &body_index).await;
+        assert_eq!(got, want, "`{filter}` against the hand-written set");
+        assert_eq!(
+            client_side_indices(&filter),
+            want,
+            "`{filter}` in the process against the hand-written set"
+        );
+    }
+
+    let mut singles: BTreeSet<String> = BTreeSet::new();
+    for body in WORD_BODIES {
+        for t in tokens_as_written(body) {
+            singles.insert(t.to_ascii_uppercase());
+            singles.insert(t.to_lowercase());
+            singles.insert(t);
+        }
+    }
+    for extra in [
+        "absentword",
+        "memcache",
+        "οδος",
+        "οδοσ",
+        "ΑΣ",
+        "ας",
+        "ασ",
+        "Σ",
+        "ς",
+        "strasse",
+        "STRASSE",
+        "istanbul",
+    ] {
+        singles.insert(extra.to_string());
+    }
+    let mut cases: Vec<Vec<String>> = singles.into_iter().map(|w| vec![w]).collect();
+    let mut pair_tokens: BTreeSet<String> = BTreeSet::new();
+    for body in [WORD_BODIES[0], WORD_BODIES[6]] {
+        pair_tokens.extend(tokens_as_written(body));
+    }
+    for a in &pair_tokens {
+        for b in &pair_tokens {
+            if a != b {
+                cases.push(vec![a.clone(), b.clone()]);
+            }
+        }
+    }
+    assert!(
+        cases.len() > 100,
+        "the case set is substantial: {}",
+        cases.len()
+    );
+
+    for words in &cases {
+        let truth = word_truth(words);
+        let pos = words_filter(LineFilterOp::Contains, words);
+        assert_eq!(
+            filter_indices(&client, db, ts_ns, &pos, &body_index).await,
+            truth,
+            "`{pos}` must return exactly the bodies the word rule keeps"
+        );
+        assert_eq!(client_side_indices(&pos), truth, "`{pos}` in the process");
+        let neg = words_filter(LineFilterOp::NotContains, words);
+        let complement: BTreeSet<usize> = all.difference(&truth).copied().collect();
+        assert_eq!(
+            filter_indices(&client, db, ts_ns, &neg, &body_index).await,
+            complement,
+            "`{neg}` must return exactly the complement"
+        );
+        assert_eq!(
+            client_side_indices(&neg),
+            complement,
+            "`{neg}` in the process"
+        );
+    }
+
+    drop_database(&client, db).await;
+}
+
+/// Every scalar value as a one-character string, `s`, beside its code
+/// point, `cp` — the inner select of D2t and D3t.
+const SCALAR_VALUES_SQL: &str = "SELECT number AS cp, CAST(multiIf( \
+      number < 0x80, char(number), \
+      number < 0x800, char(0xC0 + bitShiftRight(number, 6), 0x80 + bitAnd(number, 0x3F)), \
+      number < 0x10000, char(0xE0 + bitShiftRight(number, 12), 0x80 + bitAnd(bitShiftRight(number, 6), 0x3F), 0x80 + bitAnd(number, 0x3F)), \
+      char(0xF0 + bitShiftRight(number, 18), 0x80 + bitAnd(bitShiftRight(number, 12), 0x3F), 0x80 + bitAnd(bitShiftRight(number, 6), 0x3F), 0x80 + bitAnd(number, 0x3F)) \
+    ) AS String) AS s \
+    FROM numbers(0x110000) WHERE NOT (number BETWEEN 0xD800 AND 0xDFFF)";
+
+/// Every scalar value, as a Rust string, by code point.
+fn scalar_values() -> impl Iterator<Item = (u64, String)> {
+    (0..0x11_0000u32).filter_map(|cp| char::from_u32(cp).map(|c| (u64::from(cp), c.to_string())))
+}
+
+#[derive(Debug, Row, serde::Serialize, serde::Deserialize)]
+struct KeyedRow {
+    cp: u64,
+    k: String,
+}
+
+/// Issue #757 D2t: `pulsus_logql::word::case_key` keys every scalar value
+/// as the database's `upperUTF8(lowerUTF8(·))` does. One value at a time:
+/// it guards the single-character tables, and D4t owns context.
+#[tokio::test]
+async fn case_key_equals_the_databases_for_every_scalar_value() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let sql =
+        format!("SELECT cp, upperUTF8(lowerUTF8(s)) AS k FROM ({SCALAR_VALUES_SQL}) WHERE k != s");
+    let mut stream = client
+        .query_stream::<KeyedRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("the key statement runs");
+    let mut server: BTreeMap<u64, String> = BTreeMap::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("row decodes");
+        server.insert(row.cp, row.k);
+    }
+    let ours: BTreeMap<u64, String> = scalar_values()
+        .filter_map(|(cp, s)| {
+            let k = pulsus_logql::word::case_key(&s);
+            (k != s).then_some((cp, k))
+        })
+        .collect();
+    assert!(
+        ours.len() > 1_500,
+        "the key changes more than 1,500 values: {}",
+        ours.len()
+    );
+    let ours_pairs: BTreeSet<(u64, &str)> = ours.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let server_pairs: BTreeSet<(u64, &str)> =
+        server.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let differ: Vec<&(u64, &str)> = ours_pairs.symmetric_difference(&server_pairs).collect();
+    assert!(
+        differ.is_empty(),
+        "`word::case_key` against `upperUTF8(lowerUTF8(·))`: {} entries differ, the first: {:?}",
+        differ.len(),
+        &differ[..differ.len().min(10)]
+    );
+}
+
+#[derive(Debug, Row, serde::Serialize, serde::Deserialize)]
+struct InvariantRow {
+    total: u64,
+    changed: u64,
+}
+
+/// Issue #757 D3t: no scalar value's key changes when the value is upper-
+/// or lower-cased first, on the server and in `word::case_key`.
+#[tokio::test]
+async fn case_key_ignores_case_for_every_scalar_value() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let sql = format!(
+        "SELECT count() AS total, countIf(NOT (k = upperUTF8(lowerUTF8(upperUTF8(s))) \
+         AND k = upperUTF8(lowerUTF8(lowerUTF8(s))))) AS changed FROM ( \
+         SELECT s, upperUTF8(lowerUTF8(s)) AS k FROM ({SCALAR_VALUES_SQL}))"
+    );
+    let mut stream = client
+        .query_stream::<InvariantRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("the invariance statement runs");
+    let row = stream.next().await.expect("one row").expect("row decodes");
+    assert_eq!((row.total, row.changed), (1_112_064, 0), "the server's key");
+    let changed: Vec<u64> = scalar_values()
+        .filter(|(_, s)| {
+            let k = pulsus_logql::word::case_key(s);
+            k != pulsus_logql::word::case_key(&s.to_uppercase())
+                || k != pulsus_logql::word::case_key(&s.to_lowercase())
+        })
+        .map(|(cp, _)| cp)
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "`word::case_key` changes under case for {} values, the first: {:x?}",
+        changed.len(),
+        &changed[..changed.len().min(10)]
+    );
+}
+
+#[derive(Debug, Row, serde::Serialize, serde::Deserialize)]
+struct ContextRow {
+    s: String,
+    key: String,
+    invariant: u8,
+    commutes: u8,
+}
+
+/// Issue #757 D4t: over every string of one to five symbols from an
+/// alphabet built around the final sigma, `ß`, `İ` and U+212A, the
+/// server's key is case-invariant, the key of a string splits into the key
+/// of each of its words, and `word::case_key` equals the server's key. The
+/// key's SQL is `predicate::case_key_sql`, the function the predicate uses.
+#[tokio::test]
+async fn case_key_equals_the_databases_over_every_short_context_string() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let k = predicate::case_key_sql;
+    let sql = format!(
+        "WITH ['Σ','σ','ς','A','a','Β','.','''',' ','_','1',char(0xCC,0x81),char(0xC2,0xAD),\
+         'İ',char(0xE2,0x84,0xAA),'ß','ẞ'] AS al, length(al) AS n \
+         SELECT s, {key} AS key, \
+           key = {ku} AND key = {kl} AS invariant, \
+           tokens(key, 'splitByNonAlpha') = arrayMap(t -> {kt}, tokens(s, 'splitByNonAlpha')) AS commutes \
+         FROM ( \
+           SELECT arrayStringConcat(arrayMap(i -> al[(intDiv(number, pow(n, i)) % n) + 1], range(len))) AS s \
+           FROM numbers(1419857) ARRAY JOIN [1, 2, 3, 4, 5] AS len WHERE number < pow(n, len))",
+        key = k("s"),
+        ku = k("upperUTF8(s)"),
+        kl = k("lowerUTF8(s)"),
+        kt = k("t"),
+    );
+    let mut stream = client
+        .query_stream::<ContextRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("the context statement runs");
+    let (mut rows, mut not_invariant, mut not_commuting) = (0u64, 0u64, 0u64);
+    let mut differ: Vec<(String, String, String)> = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("row decodes");
+        rows += 1;
+        not_invariant += u64::from(row.invariant != 1);
+        not_commuting += u64::from(row.commutes != 1);
+        let ours = pulsus_logql::word::case_key(&row.s);
+        if ours != row.key {
+            differ.push((row.s, row.key, ours));
+        }
+    }
+    assert_eq!(rows, 1_508_597, "every string of one to five symbols");
+    assert_eq!(
+        (not_invariant, not_commuting),
+        (0, 0),
+        "the server's key: rows not case-invariant, rows whose key does not split into its \
+         words' keys"
+    );
+    assert!(
+        differ.is_empty(),
+        "`word::case_key` against the server: {} strings differ, the first (s, server, ours): {:?}",
+        differ.len(),
+        &differ[..differ.len().min(10)]
+    );
 }
