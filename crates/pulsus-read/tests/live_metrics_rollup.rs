@@ -242,6 +242,12 @@ async fn build_later(client: &ChClient, ctx: &RenderCtx) {
 /// Removes level `r`'s coverage of `(a, b]`: the run rows overlapping it
 /// are deleted and their parts outside it written back. Data rows stay.
 async fn cut_runs(client: &ChClient, db: &str, r: u32, a: i64, b: i64) {
+    // The builder writes run rows only on bucket ends, so a cut anywhere
+    // else leaves coverage that no level row stands for.
+    assert!(
+        a.rem_euclid(i64::from(r) * 1000) == 0 && b.rem_euclid(i64::from(r) * 1000) == 0,
+        "a cut ends on bucket ends of the {r} s level: ({a}, {b}]"
+    );
     let table = format!("{db}.metric_samples_{r}s");
     let mut stream = client
         .query_stream::<RunPair>(
@@ -915,8 +921,9 @@ async fn a_window_reads_the_finer_levels_and_raw_after_its_level() {
     let end = day0 + 8 * DAY;
     let built = corpus_d(DB_B3.name(), FIVE, day0, 6..8).await;
     let b = end - 3 * HOUR;
-    for r in [86_400, 7_200, 720] {
-        cut_runs(&built.admin, built.db(), r, b, end + DAY).await;
+    // Each level is cut from its last bucket end at or before `b`.
+    for (r, from) in [(86_400, end - DAY), (7_200, end - 4 * HOUR), (720, b)] {
+        cut_runs(&built.admin, built.db(), r, from, end + DAY).await;
     }
     for r in [60, 5] {
         cut_runs(&built.admin, built.db(), r, b + 30 * MIN, end + DAY).await;
@@ -2470,7 +2477,7 @@ async fn a_range_query_answers_every_step_asked() {
             "(iii)",
             "rate(c_normal[2m15s])",
             "metric_samples_60s, use Counter, step 2m, range 5m (asked 2m15s)",
-            0.0705,
+            0.0706,
         ),
         (
             "(iv)",
@@ -2482,7 +2489,7 @@ async fn a_range_query_answers_every_step_asked() {
             "(v)",
             "increase(c_normal[2m15s])",
             "metric_samples_60s, use Counter, step 2m, range 5m (asked 2m15s)",
-            0.0705,
+            0.0706,
         ),
     ] {
         let (a, b) = both(&built, query, &p, None).await;
@@ -2510,12 +2517,13 @@ async fn finer_levels_and_raw_read_only_what_is_not_covered() {
     let run = format!("h1_{db}_{}", now_ms());
     let st = end - DAY;
     let hd = (end - 9 * DAY, st + 2 * HOUR);
-    let tl = (end - 30 * MIN, end + DAY);
+    let tl720 = (end - 36 * MIN, end + DAY);
+    let tl60 = (end - 30 * MIN, end + DAY);
     let raw = built.engine(false, None).await;
 
     // (C) The 720 s level cut at both ends: the 60 s statement names the
     // two intervals.
-    for (a, b) in [hd, tl] {
+    for (a, b) in [hd, tl720] {
         cut_runs(&built.admin, &db, 720, a, b).await;
     }
     let p = range(st, end, 12 * MIN);
@@ -2540,7 +2548,7 @@ async fn finer_levels_and_raw_read_only_what_is_not_covered() {
         "((t_end > {} AND t_end <= {}) OR (t_end > {} AND t_end <= {end}))",
         st - 1_020_000,
         st + 7_200_000,
-        end - 1_800_000
+        end - 2_160_000
     );
     assert!(
         !sixty.is_empty() && sixty.iter().all(|s| s.contains(&want)),
@@ -2580,7 +2588,7 @@ async fn finer_levels_and_raw_read_only_what_is_not_covered() {
     assert_eq!(on.cells(), off.cells(), "(D): bit-equal to no levels");
 
     // (A) and (B): the 60 s level cut at both ends.
-    for (a, b) in [hd, tl] {
+    for (a, b) in [hd, tl60] {
         cut_runs(&built.admin, &db, 60, a, b).await;
     }
     let p = range(st, end, 120_000);
@@ -2671,7 +2679,7 @@ async fn a_rounded_range_is_within_its_distance() {
             60,
             MIN,
             23 * HOUR,
-            [0.0649, 0.00251, 0.247, 0.667],
+            [0.0649, 0.00252, 0.247, 0.667],
         ),
         (
             "2m15s",
@@ -2679,7 +2687,7 @@ async fn a_rounded_range_is_within_its_distance() {
             60,
             2 * MIN,
             23 * HOUR,
-            [0.0705, 0.000837, 0.0723, 0.167],
+            [0.0706, 0.000838, 0.0724, 0.168],
         ),
         (
             "5m15s",
@@ -2687,7 +2695,7 @@ async fn a_rounded_range_is_within_its_distance() {
             60,
             5 * MIN,
             23 * HOUR,
-            [1e-12, 1e-12, 1e-12, 0.0628],
+            [1e-12, 1e-12, 1e-12, 0.0629],
         ),
         (
             "10m15s",
@@ -2695,7 +2703,7 @@ async fn a_rounded_range_is_within_its_distance() {
             60,
             10 * MIN,
             23 * HOUR,
-            [1e-12, 1e-12, 0.0235, 0.0308],
+            [1e-12, 1e-12, 0.0236, 0.0309],
         ),
         (
             "1h0m15s",
@@ -2703,7 +2711,7 @@ async fn a_rounded_range_is_within_its_distance() {
             720,
             HOUR,
             3 * DAY,
-            [0.00411, 0.00334, 1.44, 0.00901],
+            [0.00412, 0.00334, 1.45, 0.00902],
         ),
         (
             "2h0m15s",
@@ -2711,7 +2719,7 @@ async fn a_rounded_range_is_within_its_distance() {
             720,
             2 * HOUR,
             3 * DAY,
-            [0.00207, 0.00181, 1.69, 0.00449],
+            [0.00207, 0.00182, 1.69, 0.00450],
         ),
     ];
     let kinds = ["c_normal", "c_fast", "c_stop", "c_sparse"];
