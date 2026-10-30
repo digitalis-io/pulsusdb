@@ -103,8 +103,9 @@ Log(
             LineFilter(
                 LineFilter {
                     op: Contains,
-                    value: "err",
-                    value_is_ip: false,
+                    head: Text(
+                        "err",
+                    ),
                     or_matches: [],
                 },
             ),
@@ -136,8 +137,9 @@ Log(
             LineFilter(
                 LineFilter {
                     op: NotContains,
-                    value: "err",
-                    value_is_ip: false,
+                    head: Text(
+                        "err",
+                    ),
                     or_matches: [],
                 },
             ),
@@ -168,8 +170,9 @@ Log(
             LineFilter(
                 LineFilter {
                     op: NotRegex,
-                    value: "e.*r",
-                    value_is_ip: false,
+                    head: Text(
+                        "e.*r",
+                    ),
                     or_matches: [],
                 },
             ),
@@ -200,32 +203,36 @@ Log(
             LineFilter(
                 LineFilter {
                     op: Contains,
-                    value: "a",
-                    value_is_ip: false,
+                    head: Text(
+                        "a",
+                    ),
                     or_matches: [],
                 },
             ),
             LineFilter(
                 LineFilter {
                     op: NotContains,
-                    value: "b",
-                    value_is_ip: false,
+                    head: Text(
+                        "b",
+                    ),
                     or_matches: [],
                 },
             ),
             LineFilter(
                 LineFilter {
                     op: Regex,
-                    value: "c",
-                    value_is_ip: false,
+                    head: Text(
+                        "c",
+                    ),
                     or_matches: [],
                 },
             ),
             LineFilter(
                 LineFilter {
                     op: NotRegex,
-                    value: "d",
-                    value_is_ip: false,
+                    head: Text(
+                        "d",
+                    ),
                     or_matches: [],
                 },
             ),
@@ -256,8 +263,9 @@ Log(
             LineFilter(
                 LineFilter {
                     op: Contains,
-                    value: "10.0.0.0/8",
-                    value_is_ip: true,
+                    head: Ip(
+                        "10.0.0.0/8",
+                    ),
                     or_matches: [],
                 },
             ),
@@ -288,8 +296,9 @@ Log(
             LineFilter(
                 LineFilter {
                     op: NotContains,
-                    value: "10.0.0.0/8",
-                    value_is_ip: true,
+                    head: Ip(
+                        "10.0.0.0/8",
+                    ),
                     or_matches: [],
                 },
             ),
@@ -320,13 +329,13 @@ Log(
             LineFilter(
                 LineFilter {
                     op: Contains,
-                    value: "a",
-                    value_is_ip: false,
+                    head: Text(
+                        "a",
+                    ),
                     or_matches: [
-                        LineMatch {
-                            value: "b",
-                            is_ip: false,
-                        },
+                        Text(
+                            "b",
+                        ),
                     ],
                 },
             ),
@@ -357,13 +366,13 @@ Log(
             LineFilter(
                 LineFilter {
                     op: Contains,
-                    value: "a",
-                    value_is_ip: false,
+                    head: Text(
+                        "a",
+                    ),
                     or_matches: [
-                        LineMatch {
-                            value: "10.0.0.0/8",
-                            is_ip: true,
-                        },
+                        Ip(
+                            "10.0.0.0/8",
+                        ),
                     ],
                 },
             ),
@@ -615,16 +624,18 @@ Metric(
                     LineFilter(
                         LineFilter {
                             op: Contains,
-                            value: "a",
-                            value_is_ip: false,
+                            head: Text(
+                                "a",
+                            ),
                             or_matches: [],
                         },
                     ),
                     LineFilter(
                         LineFilter {
                             op: NotContains,
-                            value: "b",
-                            value_is_ip: false,
+                            head: Text(
+                                "b",
+                            ),
                             or_matches: [],
                         },
                     ),
@@ -1793,5 +1804,74 @@ fn repeated_grouping_labels_survive_the_parse_and_round_trip() {
         };
         let got = &grouping.as_ref().expect("grouping").labels;
         assert_eq!(got, &labels, "{query}: the AST must keep the duplicates");
+    }
+}
+
+/// Issue #757: `word(…)` parses as a `Words` alternative, as the head or
+/// any `or` alternative; its keyword is case-insensitive, and `Display`
+/// writes it lowercase and reparses to the same AST.
+#[test]
+fn a_word_line_filter_parses_renders_and_round_trips() {
+    use pulsus_logql::{Expr, LineFilter, LineFilterOp, LineMatch, Stage};
+    fn words(ws: &[&str]) -> LineMatch {
+        LineMatch::Words(ws.iter().map(|w| w.to_string()).collect())
+    }
+    let cases: Vec<(&str, &str, LineFilter)> = vec![
+        (
+            r#"{a="x"} |= word("memcached")"#,
+            r#"{a="x"} |= word("memcached")"#,
+            LineFilter {
+                op: LineFilterOp::Contains,
+                head: words(&["memcached"]),
+                or_matches: vec![],
+            },
+        ),
+        (
+            r#"{a="x"} != word("connection", "refused")"#,
+            r#"{a="x"} != word("connection", "refused")"#,
+            LineFilter {
+                op: LineFilterOp::NotContains,
+                head: words(&["connection", "refused"]),
+                or_matches: vec![],
+            },
+        ),
+        (
+            r#"{a="x"} |= WORD("a")"#,
+            r#"{a="x"} |= word("a")"#,
+            LineFilter {
+                op: LineFilterOp::Contains,
+                head: words(&["a"]),
+                or_matches: vec![],
+            },
+        ),
+        (
+            r#"{a="x"} |= word("a") or "b""#,
+            r#"{a="x"} |= word("a") or "b""#,
+            LineFilter {
+                op: LineFilterOp::Contains,
+                head: words(&["a"]),
+                or_matches: vec![LineMatch::Text("b".to_string())],
+            },
+        ),
+        (
+            r#"{a="x"} |= "b" or word("a") or ip("10.0.0.1")"#,
+            r#"{a="x"} |= "b" or word("a") or ip("10.0.0.1")"#,
+            LineFilter {
+                op: LineFilterOp::Contains,
+                head: LineMatch::Text("b".to_string()),
+                or_matches: vec![words(&["a"]), LineMatch::Ip("10.0.0.1".to_string())],
+            },
+        ),
+    ];
+    for (query, rendered, want) in cases {
+        let expr = parse(query).unwrap_or_else(|e| panic!("expected {query:?} to parse, got {e}"));
+        let Expr::Log(log) = &expr else {
+            panic!("{query}: not a log query: {expr:?}")
+        };
+        assert_eq!(log.pipeline, vec![Stage::LineFilter(want)], "{query}");
+        assert_eq!(expr.to_string(), rendered, "{query}");
+        let reparsed = parse(&expr.to_string())
+            .unwrap_or_else(|e| panic!("{query}: the rendered form must reparse, got {e}"));
+        assert_eq!(reparsed, expr, "{query}");
     }
 }

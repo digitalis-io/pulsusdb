@@ -588,7 +588,7 @@ fn parse_log_expr(cursor: &mut Cursor<'_>) -> Result<LogExpr, LogQlError> {
                 ));
             }
             cursor.advance();
-            let (value, value_is_ip) = parse_line_match(cursor, op)?;
+            let head = parse_line_match(cursor, op)?;
             // `or`-chained alternatives (M8-LQ2 `linefilter.or`): greedily
             // consume `or <line-match>` — a line-level `or` only ever
             // follows a line-match value, so it never collides with the
@@ -597,13 +597,11 @@ fn parse_log_expr(cursor: &mut Cursor<'_>) -> Result<LogExpr, LogQlError> {
             let mut or_matches = Vec::new();
             while matches!(&cursor.peek().kind, TokenKind::Ident(n) if is_kw(n, "or")) {
                 cursor.advance();
-                let (v, is_ip) = parse_line_match(cursor, op)?;
-                or_matches.push(ast::LineMatch { value: v, is_ip });
+                or_matches.push(parse_line_match(cursor, op)?);
             }
             pipeline.push(Stage::LineFilter(LineFilter {
                 op,
-                value,
-                value_is_ip,
+                head,
                 or_matches,
             }));
             continue;
@@ -645,7 +643,7 @@ fn post_unwrap_stage_error(found: String, span: crate::token::Span) -> LogQlErro
 fn parse_line_match(
     cursor: &mut Cursor<'_>,
     op: LineFilterOp,
-) -> Result<(String, bool), LogQlError> {
+) -> Result<ast::LineMatch, LogQlError> {
     if matches!(&cursor.peek().kind, TokenKind::Ident(n) if is_kw(n, "ip"))
         && matches!(cursor.peek2().kind, TokenKind::LParen)
     {
@@ -661,10 +659,10 @@ fn parse_line_match(
         cursor.expect(&TokenKind::LParen, "'('")?;
         let (value, _) = cursor.expect_string()?;
         cursor.expect(&TokenKind::RParen, "')'")?;
-        Ok((value, true))
+        Ok(ast::LineMatch::Ip(value))
     } else {
         let (value, _) = cursor.expect_string()?;
-        Ok((value, false))
+        Ok(ast::LineMatch::Text(value))
     }
 }
 

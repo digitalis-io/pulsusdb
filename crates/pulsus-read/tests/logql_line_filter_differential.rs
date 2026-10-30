@@ -44,10 +44,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use futures::StreamExt;
-use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
-use pulsus_logql::{LineFilter, LineFilterOp};
+use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
+use pulsus_logql::{LineFilter, LineFilterOp, LineMatch};
 use pulsus_model::Fingerprint;
 use pulsus_read::logql::Direction;
+use pulsus_read::logql::pipeline::CompiledPipeline;
 use pulsus_read::logql::predicate::{self, literal};
 use pulsus_read::logql::rows::SampleRow;
 use pulsus_read::logql::sql::{self, TimeWindow};
@@ -133,9 +134,8 @@ const BODIES: &[&str] = &[
 ];
 
 /// Substring lengths, in CHARS, the generator cuts at every char-boundary
-/// offset of every body. Committed: 1–3 exercise the sub-4-byte no-pruning
-/// residual, 4 is exactly the body index's n-gram length, and the rest walk up to
-/// needles spanning several fields.
+/// offset of every body. Committed: 1–3 are the shortest needles, 4 and up
+/// walk to needles spanning several fields.
 const LENGTHS: &[usize] = &[1, 2, 3, 4, 5, 6, 8, 11, 16, 24];
 
 /// Upper bound on the needle count, so the CI step stays a few thousand
@@ -225,9 +225,9 @@ fn now_ns() -> i64 {
     .expect("fits i64")
 }
 
-/// Seeds one row per [`BODIES`] entry, one nanosecond apart, and returns a
+/// Seeds one row per entry of `bodies`, one nanosecond apart, and returns a
 /// client bound to `db`.
-async fn setup(db: &str, ts_ns: i64) -> ChClient {
+async fn setup(db: &str, ts_ns: i64, bodies: &[&str]) -> ChClient {
     let client = ChClient::new(test_config()).await.expect("connect");
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
@@ -238,7 +238,7 @@ async fn setup(db: &str, ts_ns: i64) -> ChClient {
         .await
         .expect("connect (data client)");
 
-    let values: Vec<String> = BODIES
+    let values: Vec<String> = bodies
         .iter()
         .enumerate()
         .map(|(i, body)| {
@@ -287,13 +287,25 @@ async fn matched_indices(
     needle: &str,
     body_index: &BTreeMap<&str, usize>,
 ) -> BTreeSet<usize> {
-    let fragment = predicate::line_filter(&LineFilter {
+    let filter = LineFilter {
         op,
-        value: needle.to_string(),
-        value_is_ip: false,
+        head: LineMatch::Text(needle.to_string()),
         or_matches: Vec::new(),
-    })
-    .unwrap_or_else(|e| panic!("{op:?} {needle:?} must mint: {e:?}"));
+    };
+    filter_indices(client, db, ts_ns, &filter, body_index).await
+}
+
+/// [`matched_indices`] for any line filter: mints it, runs it through
+/// `sql::stage3`, and maps the returned bodies back to indices.
+async fn filter_indices(
+    client: &ChClient,
+    db: &str,
+    ts_ns: i64,
+    filter: &LineFilter,
+    body_index: &BTreeMap<&str, usize>,
+) -> BTreeSet<usize> {
+    let fragment =
+        predicate::line_filter(filter).unwrap_or_else(|e| panic!("`{filter}` must mint: {e:?}"));
     let sql = sql::stage3(
         &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &format!("{db}.log_samples"),
@@ -310,10 +322,10 @@ async fn matched_indices(
     let mut stream = client
         .query_stream::<SampleRow>(&sql.replace('?', "??"), &QuerySettings::new())
         .await
-        .unwrap_or_else(|e| panic!("{op:?} {needle:?} failed: {e}\n{sql}"));
+        .unwrap_or_else(|e| panic!("`{filter}` failed: {e}\n{sql}"));
     let mut out = BTreeSet::new();
     while let Some(row) = stream.next().await {
-        let row = row.unwrap_or_else(|e| panic!("{op:?} {needle:?} row decode failed: {e}"));
+        let row = row.unwrap_or_else(|e| panic!("`{filter}` row decode failed: {e}"));
         let idx = *body_index
             .get(row.body.as_str())
             .unwrap_or_else(|| panic!("unseeded body returned: {:?}", row.body));
@@ -334,7 +346,7 @@ async fn a_line_filter_returns_exactly_the_rows_str_contains_does_for_every_gene
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_line_filter_diff");
     let ts_ns = now_ns();
-    let client = setup(db, ts_ns).await;
+    let client = setup(db, ts_ns, BODIES).await;
 
     let needles = generated_needles();
     let all: BTreeSet<usize> = (0..BODIES.len()).collect();
@@ -453,4 +465,255 @@ fn the_generated_needle_set_spans_every_shape_the_old_rendering_got_wrong() {
 
     // Determinism: the set is a function of this file alone.
     assert_eq!(needles, generated_needles());
+}
+
+// --- Issue #757: `word(…)` -------------------------------------------------
+
+/// Bodies for the `word(…)` differential, pairwise distinct: markers 0-11
+/// of the plan's fixture, then lines for the case and separator edges.
+const WORD_BODIES: &[&str] = &[
+    "memcached: connection refused",
+    "Memcached: timeout after 3s",
+    "MEMCACHED down",
+    "xmemcached started",
+    "memcached123 started",
+    "foo_memcached ready",
+    "refused: Connection to memcached",
+    "ÜNÏCODE word",
+    "ünïcode word",
+    "mem cached split",
+    "memcached.local resolved",
+    "naïve «memcached» quote",
+    "connection pool ok",
+    "login refused",
+    "ΟΔΟΣ final sigma",
+    "İstanbul dotted",
+    "\u{212A}elvin scale",
+    "a—b em dash",
+    "tab\tseparated\u{1}ctl",
+];
+
+/// The truth side's own tokenizer, written here and not taken from
+/// `pulsus_logql::word`: lower each character on its own, then split on
+/// every byte that is not an ASCII letter or digit and is below `0x80`.
+fn truth_words(line: &str) -> BTreeSet<Vec<u8>> {
+    let mut lowered = String::new();
+    for c in line.chars() {
+        for l in c.to_lowercase() {
+            lowered.push(l);
+        }
+    }
+    let mut out = BTreeSet::new();
+    let mut cur: Vec<u8> = Vec::new();
+    for &b in lowered.as_bytes() {
+        if b.is_ascii_digit() || b.is_ascii_lowercase() || b.is_ascii_uppercase() || b >= 0x80 {
+            cur.push(b);
+        } else if !cur.is_empty() {
+            out.insert(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.insert(cur);
+    }
+    out
+}
+
+/// The tokens of `line` as written, split by the same byte rule but not
+/// lowered.
+fn tokens_as_written(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in line.chars() {
+        if c.is_ascii_alphanumeric() || !c.is_ascii() {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn word_truth(words: &[String]) -> BTreeSet<usize> {
+    let needles: Vec<BTreeSet<Vec<u8>>> = words.iter().map(|w| truth_words(w)).collect();
+    WORD_BODIES
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| {
+            let have = truth_words(b);
+            needles.iter().all(|n| n.iter().all(|t| have.contains(t)))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn words_filter(op: LineFilterOp, words: &[String]) -> LineFilter {
+    LineFilter {
+        op,
+        head: LineMatch::Words(words.to_vec()),
+        or_matches: Vec::new(),
+    }
+}
+
+fn client_side_indices(filter: &LineFilter) -> BTreeSet<usize> {
+    let p =
+        CompiledPipeline::compile_client_side(&[pulsus_logql::Stage::LineFilter(filter.clone())])
+            .unwrap_or_else(|e| panic!("`{filter}` must compile: {e:?}"));
+    WORD_BODIES
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| p.run(b, &[], 0).expect("no budget").is_some())
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Issue #757 D1t: `|= word(…)` and `!= word(…)` return exactly the rows
+/// the word rule keeps, through the SQL the database runs and through the
+/// in-process matcher alike.
+#[tokio::test]
+async fn a_word_filter_returns_exactly_the_rows_the_word_rule_does() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_word_filter_diff");
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns, WORD_BODIES).await;
+    let all: BTreeSet<usize> = (0..WORD_BODIES.len()).collect();
+    let body_index: BTreeMap<&str, usize> = WORD_BODIES
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (*b, i))
+        .collect();
+
+    // Hand-written sets, read from the bodies above.
+    for (words, want) in [
+        (&["memcached"][..], &[0usize, 1, 2, 5, 6, 10][..]),
+        (&["connection", "refused"][..], &[0, 6][..]),
+        (&["ünïcode"][..], &[7, 8][..]),
+        (&["kelvin"][..], &[16][..]),
+        (&["istanbul"][..], &[][..]),
+    ] {
+        let words: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+        let want: BTreeSet<usize> = want.iter().copied().collect();
+        let filter = words_filter(LineFilterOp::Contains, &words);
+        let got = filter_indices(&client, db, ts_ns, &filter, &body_index).await;
+        assert_eq!(got, want, "`{filter}` against the hand-written set");
+        assert_eq!(
+            client_side_indices(&filter),
+            want,
+            "`{filter}` in the process against the hand-written set"
+        );
+    }
+
+    let mut singles: BTreeSet<String> = BTreeSet::new();
+    for body in WORD_BODIES {
+        for t in tokens_as_written(body) {
+            singles.insert(t.to_ascii_uppercase());
+            singles.insert(t.chars().flat_map(char::to_lowercase).collect());
+            singles.insert(t);
+        }
+    }
+    for extra in ["absentword", "memcache", "οδος", "istanbul"] {
+        singles.insert(extra.to_string());
+    }
+    let mut cases: Vec<Vec<String>> = singles.into_iter().map(|w| vec![w]).collect();
+    let mut pair_tokens: BTreeSet<String> = BTreeSet::new();
+    for body in [WORD_BODIES[0], WORD_BODIES[6]] {
+        pair_tokens.extend(tokens_as_written(body));
+    }
+    for a in &pair_tokens {
+        for b in &pair_tokens {
+            if a != b {
+                cases.push(vec![a.clone(), b.clone()]);
+            }
+        }
+    }
+    assert!(
+        cases.len() > 100,
+        "the case set is substantial: {}",
+        cases.len()
+    );
+
+    for words in &cases {
+        let truth = word_truth(words);
+        let pos = words_filter(LineFilterOp::Contains, words);
+        assert_eq!(
+            filter_indices(&client, db, ts_ns, &pos, &body_index).await,
+            truth,
+            "`{pos}` must return exactly the bodies the word rule keeps"
+        );
+        assert_eq!(client_side_indices(&pos), truth, "`{pos}` in the process");
+        let neg = words_filter(LineFilterOp::NotContains, words);
+        let complement: BTreeSet<usize> = all.difference(&truth).copied().collect();
+        assert_eq!(
+            filter_indices(&client, db, ts_ns, &neg, &body_index).await,
+            complement,
+            "`{neg}` must return exactly the complement"
+        );
+        assert_eq!(
+            client_side_indices(&neg),
+            complement,
+            "`{neg}` in the process"
+        );
+    }
+
+    drop_database(&client, db).await;
+}
+
+#[derive(Debug, Row, serde::Serialize, serde::Deserialize)]
+struct LoweredRow {
+    cp: u64,
+    low: String,
+}
+
+/// Issue #757 D2t: `pulsus_logql::word::lower` lowers every scalar value
+/// as the database's `lowerUTF8` does.
+#[tokio::test]
+async fn lowering_equals_the_databases_for_every_scalar_value() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let sql = "SELECT cp, lowerUTF8(s) AS low FROM ( \
+        SELECT number AS cp, CAST(multiIf( \
+          number < 0x80, char(number), \
+          number < 0x800, char(0xC0 + bitShiftRight(number, 6), 0x80 + bitAnd(number, 0x3F)), \
+          number < 0x10000, char(0xE0 + bitShiftRight(number, 12), 0x80 + bitAnd(bitShiftRight(number, 6), 0x3F), 0x80 + bitAnd(number, 0x3F)), \
+          char(0xF0 + bitShiftRight(number, 18), 0x80 + bitAnd(bitShiftRight(number, 12), 0x3F), 0x80 + bitAnd(bitShiftRight(number, 6), 0x3F), 0x80 + bitAnd(number, 0x3F)) \
+        ) AS String) AS s \
+        FROM numbers(0x110000) WHERE NOT (number BETWEEN 0xD800 AND 0xDFFF) \
+      ) WHERE low != s";
+    let mut stream = client
+        .query_stream::<LoweredRow>(sql, &QuerySettings::new())
+        .await
+        .expect("the lowering statement runs");
+    let mut server: BTreeMap<u64, String> = BTreeMap::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("row decodes");
+        server.insert(row.cp, row.low);
+    }
+    let mut ours: BTreeMap<u64, String> = BTreeMap::new();
+    for cp in 0..0x11_0000u32 {
+        let Some(c) = char::from_u32(cp) else {
+            continue;
+        };
+        let s = c.to_string();
+        let low = pulsus_logql::word::lower(&s);
+        if low != s {
+            ours.insert(u64::from(cp), low);
+        }
+    }
+    assert!(
+        ours.len() > 1_000,
+        "lowering changes more than 1,000 values: {}",
+        ours.len()
+    );
+    let ours_pairs: BTreeSet<(u64, &str)> = ours.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let server_pairs: BTreeSet<(u64, &str)> =
+        server.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let differ: Vec<&(u64, &str)> = ours_pairs.symmetric_difference(&server_pairs).collect();
+    assert!(
+        differ.is_empty(),
+        "`word::lower` against `lowerUTF8`: {} entries differ, the first: {:?}",
+        differ.len(),
+        &differ[..differ.len().min(10)]
+    );
 }

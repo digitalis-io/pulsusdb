@@ -8524,8 +8524,7 @@ mod tests {
         // (issue #450). N = 65,522 gives exactly 65,536.
         let filter = super::super::predicate::line_filter(&pulsus_logql::LineFilter {
             op: pulsus_logql::LineFilterOp::Contains,
-            value: "-".repeat(65_522),
-            value_is_ip: false,
+            head: pulsus_logql::LineMatch::Text("-".repeat(65_522)),
             or_matches: Vec::new(),
         })
         .expect("a Contains filter compiles no regex");

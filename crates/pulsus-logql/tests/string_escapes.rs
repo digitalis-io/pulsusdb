@@ -48,7 +48,7 @@
 //! ledger row. What THIS file pins is the decode itself, at the selector
 //! and at a line filter alike.
 
-use pulsus_logql::{Expr, LogQlError, Stage, parse};
+use pulsus_logql::{Expr, LineMatch, LogQlError, Stage, parse};
 
 /// The decoded matcher value of `{app=~"<source>"}`, as BYTES. Bytes and
 /// not `&str`, because the composition rule this file exists to pin is a
@@ -71,7 +71,10 @@ fn line_filter_value(source: &str) -> Result<Vec<u8>, LogQlError> {
     let query = format!(r#"{{app="x"}} |~ "{source}""#);
     match parse(&query) {
         Ok(Expr::Log(log)) => match &log.pipeline[0] {
-            Stage::LineFilter(lf) => Ok(lf.value.clone().into_bytes()),
+            Stage::LineFilter(lf) => match &lf.head {
+                LineMatch::Text(v) => Ok(v.clone().into_bytes()),
+                other => panic!("{query}: expected a text alternative, got {other:?}"),
+            },
             other => panic!("{query}: expected a line filter, got {other:?}"),
         },
         Ok(other) => panic!("{query}: expected a log query, got {other:?}"),

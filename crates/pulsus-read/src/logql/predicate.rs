@@ -224,7 +224,7 @@
 //! and a `Checked`-shaped name on an unchecked value is worse than an honest
 //! `&str`, because the next reader would trust it.
 
-use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, MatchOp, ParserStage};
+use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, LineMatch, MatchOp, ParserStage};
 use pulsus_model::FpLiteral;
 
 use super::escape::ch_like_contains;
@@ -271,14 +271,13 @@ const UUID_RE: &str = r"(?i)^(?:(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4
 /// some unrelated reason breaks this one.
 ///
 /// ```
-/// use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, MatchOp, ParserStage};
+/// use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, LineMatch, MatchOp, ParserStage};
 /// use pulsus_read::logql::{escape, predicate};
 ///
 /// let sql = format!("match(body, {})", escape::ch_string("boom"));
 /// let forged = predicate::line_filter(&LineFilter {
 ///     op: LineFilterOp::Regex,
-///     value: "boom".into(),
-///     value_is_ip: false,
+///     head: LineMatch::Text("boom".into()),
 ///     or_matches: Vec::new(),
 /// })
 /// .expect("`boom` compiles");
@@ -491,11 +490,16 @@ pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, Pip
 /// client-side).
 pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
     let mut disjuncts: Vec<String> = Vec::new();
-    for (value, _) in lf.alternatives() {
-        disjuncts.push(match lf.op {
-            LineFilterOp::Contains | LineFilterOp::NotContains => contains_predicate(value),
-            LineFilterOp::Regex => regex_predicate(value, true)?,
-            LineFilterOp::NotRegex => regex_predicate(value, false)?,
+    for alt in lf.alternatives() {
+        disjuncts.push(match alt {
+            LineMatch::Words(ws) => words_predicate(ws),
+            // `Ip` is never reached: callers gate on
+            // `is_pushable_line_filter`.
+            LineMatch::Text(value) | LineMatch::Ip(value) => match lf.op {
+                LineFilterOp::Contains | LineFilterOp::NotContains => contains_predicate(value),
+                LineFilterOp::Regex => regex_predicate(value, true)?,
+                LineFilterOp::NotRegex => regex_predicate(value, false)?,
+            },
         });
     }
     let core = if lf.or_matches.is_empty() {
@@ -1421,6 +1425,11 @@ fn contains_predicate(phrase: &str) -> String {
     format!("body LIKE {}", ch_like_contains(phrase))
 }
 
+fn words_predicate(words: &[String]) -> String {
+    let _ = words;
+    "0".to_string()
+}
+
 /// `match(body, <p>)`, the pushed `|~`/`!~` predicate.
 ///
 /// **Issue #624, part 3a (F2): `match(identity(body), <p>)` for a `|~`
@@ -2271,9 +2280,52 @@ mod tests {
     fn regex_filter(value: &str) -> LineFilter {
         LineFilter {
             op: LineFilterOp::Regex,
-            value: value.to_string(),
-            value_is_ip: false,
+            head: LineMatch::Text(value.to_string()),
             or_matches: Vec::new(),
+        }
+    }
+
+    /// Issue #757 H7: a `word(…)` alternative renders `hasAllTokens` over
+    /// `lowerUTF8(body)`, words lowered in SQL and kept in the order
+    /// written; a `|~` always renders `match(body, …)`.
+    #[test]
+    fn a_word_alternative_renders_has_all_tokens_and_a_regex_renders_match_body() {
+        fn words(ws: &[&str]) -> LineMatch {
+            LineMatch::Words(ws.iter().map(|w| w.to_string()).collect())
+        }
+        let cases = [
+            (
+                LineFilter {
+                    op: LineFilterOp::Contains,
+                    head: words(&["Memcached"]),
+                    or_matches: Vec::new(),
+                },
+                "hasAllTokens(lowerUTF8(body), [lowerUTF8('Memcached')])",
+            ),
+            (
+                LineFilter {
+                    op: LineFilterOp::NotContains,
+                    head: words(&["connection", "refused"]),
+                    or_matches: Vec::new(),
+                },
+                "NOT (hasAllTokens(lowerUTF8(body), [lowerUTF8('connection'), lowerUTF8('refused')]))",
+            ),
+            (
+                LineFilter {
+                    op: LineFilterOp::Contains,
+                    head: words(&["a"]),
+                    or_matches: vec![LineMatch::Text("b".to_string())],
+                },
+                "((hasAllTokens(lowerUTF8(body), [lowerUTF8('a')])) OR (body LIKE '%b%'))",
+            ),
+            (
+                regex_filter("(?i)(denied|refused)"),
+                "match(body, '(?i)(denied|refused)')",
+            ),
+        ];
+        for (lf, want) in cases {
+            let got = line_filter(&lf).expect("every case mints");
+            assert_eq!(got.as_sql(), want, "{lf}");
         }
     }
 
@@ -2404,8 +2456,7 @@ mod tests {
             for needle in SHAPED {
                 let sql = line_filter(&LineFilter {
                     op,
-                    value: (*needle).to_string(),
-                    value_is_ip: false,
+                    head: LineMatch::Text((*needle).to_string()),
                     or_matches: Vec::new(),
                 })
                 .unwrap_or_else(|e| panic!("{op:?} {needle:?} must mint: {e:?}"))
@@ -2434,8 +2485,7 @@ mod tests {
         ] {
             let f = LineFilter {
                 op: LineFilterOp::Contains,
-                value: needle.to_string(),
-                value_is_ip: false,
+                head: LineMatch::Text(needle.to_string()),
                 or_matches: Vec::new(),
             };
             assert_eq!(

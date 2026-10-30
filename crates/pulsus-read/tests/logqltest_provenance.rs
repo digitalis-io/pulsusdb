@@ -680,15 +680,15 @@ fn check_d_escape_rs_surface_is_allowlisted_and_fail_closed() {
     assert!(errors.is_empty(), "{errors}");
 }
 
-/// Issue #450 AC3b — the pruning residual is stated where the renderer is
-/// read, not only in the issue trail.
+/// Issue #450 AC3b, issue #757 — the pruning residual is stated where the
+/// renderer is read, not only in the issue trail.
 ///
-/// `ch_like_contains` recovered granule pruning by rendering a form the
-/// body's `text` index can serve. Its tokenizer is `ngrams(4)`, so a needle
-/// shorter than four bytes produces no n-gram to test and prunes nothing;
-/// the next reader of this function is entitled to learn that from the
-/// function, and to be told the scale question belongs to issue #25 rather
-/// than to a re-introduced token prefilter. Isolating the contiguous `///`
+/// No index serves `ch_like_contains`'s `body LIKE` (issue #757): the
+/// body's one index is the word index on `lowerUTF8(body)`, and only
+/// `word(…)` reads it. The next reader of this function is entitled to
+/// learn that from the function, and where a whole-word search goes
+/// instead. The markers `#757`, `no index` and `word(` each sit on one
+/// line of that paragraph. Isolating the contiguous `///`
 /// block immediately above the signature — rather than searching the whole
 /// file — is what makes the check discriminating: moving the paragraph
 /// somewhere else in `escape.rs` fails it.
@@ -709,7 +709,7 @@ fn check_d8_the_like_renderer_states_its_pruning_residual() {
         "`ch_like_contains` must carry a doc comment stating its pruning residual"
     );
     let doc = doc.join("\n");
-    for marker in ["ngrams(4)", "4", "#25"] {
+    for marker in ["#757", "no index", "word("] {
         assert!(
             doc.contains(marker),
             "the doc block immediately above `ch_like_contains` must state its pruning \
@@ -2083,7 +2083,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // Issue #624, part 3d-3 adds three: a targeted `| logfmt` filter's
     // control-separator test and its `!=` key-with-no-`=` test, and the
     // expected text of the test that pins them.
-    ("pulsus-read/src/logql/predicate.rs", 18),
+    ("pulsus-read/src/logql/predicate.rs", 19),
     // Issue #624, part 3d adds three to `sql.rs`: the `| logfmt` line
     // grammar in its `decided` column, and the out-of-range integer test in
     // each of the two `| json` key readers. Issue #624, part 4 adds twelve:
@@ -2378,7 +2378,7 @@ fn check_g_match_render_inventory() {
 /// mint added to an existing `impl` block, which is exactly where a future
 /// contributor would reach first (issue #286 review round 1).
 const PREDICATE_ITEMS: &[&str] = &[
-    "use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, MatchOp, ParserStage}",
+    "use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, LineMatch, MatchOp, ParserStage}",
     "use pulsus_model::FpLiteral",
     "use super::escape::ch_like_contains",
     "use super::escape::ch_regex_capture_checked",
@@ -2463,7 +2463,8 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn sliding_cover(scan_start_ns: i64, grid_start_ns: i64, end_ns: i64, step_ns: i64, range_ns: i64) -> Result<SlidingCover, BucketGridRefusal>",
     "pub(super) fn non_id_values_expr() -> CheckedFragment",
     "fn contains_predicate(phrase: &str) -> String",
-    "fn regex_predicate(pattern: &str, positive: bool) -> Result<String, PipelineError>",
+    "fn words_predicate(words: &[String]) -> String",
+    "fn regex_predicate(pattern: &str) -> Result<String, PipelineError>",
     "const KEY_TRIM_CLASS: &str = r_",
     "const JSON_WS: &str = r_",
     "const KEY_SEP: &str = r#_\\\\]|\\\\.)+_ const INTEGER_TEXT: &str = _",

@@ -53,6 +53,11 @@ pub enum LogQlError {
         span: Span,
     },
 
+    /// A `word(…)` argument that is not one word (issue #757): empty, or
+    /// holding a byte that separates words.
+    #[error("invalid word {value:?} at byte {}: a word() argument is one or more ASCII letters, ASCII digits or non-ASCII characters", .span.start)]
+    InvalidWord { value: String, span: Span },
+
     /// The query ended where more input was required. `span` is a
     /// zero-width span at end of input (`start == end == input.len()`),
     /// the same position/rendering convention every other variant uses,
@@ -192,6 +197,7 @@ impl LogQlError {
     pub fn span(&self) -> Span {
         match self {
             LogQlError::UnexpectedToken { span, .. }
+            | LogQlError::InvalidWord { span, .. }
             | LogQlError::UnexpectedEof { span, .. }
             | LogQlError::NotYetSupported { span, .. }
             | LogQlError::InvalidDuration { span, .. }

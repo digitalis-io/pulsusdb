@@ -2905,8 +2905,7 @@ mod tests {
     fn err_line_filter() -> CheckedFragment {
         crate::logql::predicate::line_filter(&pulsus_logql::LineFilter {
             op: pulsus_logql::LineFilterOp::Contains,
-            value: "err".to_string(),
-            value_is_ip: false,
+            head: pulsus_logql::LineMatch::Text("err".to_string()),
             or_matches: Vec::new(),
         })
         .expect("a Contains filter compiles no regex")
@@ -4190,8 +4189,7 @@ mod tests {
             let one_predicate = vec![
                 crate::logql::predicate::line_filter(&pulsus_logql::LineFilter {
                     op: pulsus_logql::LineFilterOp::Contains,
-                    value: "CONN_REFUSED".to_string(),
-                    value_is_ip: false,
+                    head: pulsus_logql::LineMatch::Text("CONN_REFUSED".to_string()),
                     or_matches: Vec::new(),
                 })
                 .expect("a Contains filter compiles no regex"),

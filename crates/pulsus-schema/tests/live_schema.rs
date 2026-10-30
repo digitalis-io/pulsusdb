@@ -1959,13 +1959,14 @@ struct SkipIndexRow {
     type_full: String,
 }
 
-/// **S-T2 (issue #624, part 3b): the log body carries one index, a `text` index of
-/// 4-grams.** Every skip index on every table of a fresh database, read
-/// from `system.data_skipping_indices`: on `log_samples` exactly
-/// `idx_body_ngrams` over `body` as `text(tokenizer = ngrams(4))`, and the
-/// `minmax` on `severity`; no bloom-filter index anywhere.
+/// **S-T2 (issue #624, part 3b; issue #757): the log body carries one index,
+/// a whole-word `text` index.** Every skip index on every table of a fresh
+/// database, read from `system.data_skipping_indices`: on `log_samples`
+/// exactly `idx_body_words` over `lowerUTF8(body)` as
+/// `text(tokenizer = splitByNonAlpha)`, and the `minmax` on `severity`; no
+/// bloom-filter index anywhere.
 #[tokio::test]
-async fn the_log_body_has_one_text_index_of_4_grams() {
+async fn the_log_body_has_one_word_index() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_schema_it_body_text");
@@ -1993,9 +1994,9 @@ async fn the_log_body_has_one_text_index_of_4_grams() {
         [
             &(
                 "log_samples".to_string(),
-                "idx_body_ngrams".to_string(),
-                "body".to_string(),
-                "text(tokenizer = ngrams(4))".to_string()
+                "idx_body_words".to_string(),
+                "lowerUTF8(body)".to_string(),
+                "text(tokenizer = splitByNonAlpha)".to_string()
             ),
             &(
                 "log_samples".to_string(),

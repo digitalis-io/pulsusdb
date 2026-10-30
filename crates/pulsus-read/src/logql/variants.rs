@@ -10,7 +10,7 @@ use super::pipeline::CompiledPipeline;
 use super::plan::{self};
 use super::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_logql::{
-    Grouping, LabelFilterExpr, LabelFmt, LineFilterOp, MatchOp, Matcher, MetricExpr,
+    Grouping, LabelFilterExpr, LabelFmt, LineFilterOp, LineMatch, MatchOp, Matcher, MetricExpr,
     NumericLiteral, ParserStage, RangeAggOp, Stage, StreamSelector,
 };
 use std::collections::HashMap;
@@ -140,9 +140,13 @@ pub(crate) fn stage_source_bytes(stages: &[Stage]) -> u64 {
     let mut bytes: u64 = 0;
     for stage in stages {
         let stage_bytes = match stage {
-            Stage::LineFilter(lf) => lf
-                .alternatives()
-                .fold(0u64, |acc, (v, _)| acc.saturating_add(v.len() as u64)),
+            Stage::LineFilter(lf) => lf.alternatives().fold(0u64, |acc, m| {
+                let len = match m {
+                    LineMatch::Text(v) | LineMatch::Ip(v) => v.len(),
+                    LineMatch::Words(ws) => ws.iter().map(String::len).sum(),
+                };
+                acc.saturating_add(len as u64)
+            }),
             Stage::Parser(p) => match p {
                 ParserStage::Json { extractions } => extractions.iter().fold(0u64, |acc, e| {
                     acc.saturating_add(e.label.len() as u64)
@@ -207,8 +211,8 @@ pub(crate) fn regex_stage_count(stages: &[Stage]) -> u64 {
             Stage::LineFilter(lf)
                 if matches!(lf.op, LineFilterOp::Regex | LineFilterOp::NotRegex) =>
             {
-                lf.alternatives().fold(0u64, |acc, (_, is_ip)| {
-                    acc.saturating_add(u64::from(!is_ip))
+                lf.alternatives().fold(0u64, |acc, m| {
+                    acc.saturating_add(u64::from(matches!(m, LineMatch::Text(_))))
                 })
             }
             Stage::LineFilter(_) => 0,
