@@ -1024,12 +1024,12 @@ A rounded range, measured the same way, against raw at the range asked:
 
 | range asked → read, level, step | counters | counters that reset every second sample | counters that stop | counters missing 30 % of their scrapes |
 |---|---|---|---|---|
-| `1m15s` → `5m`, 60 s, `step=1m` | 0.0649 | 0.00251 | 0.247 | 0.667 |
-| `2m15s` → `5m`, 60 s, `step=2m` | 0.0705 | 0.000837 | 0.0723 | 0.167 |
-| `5m15s` → `6m`, 60 s, `step=5m` | 1e-12 | 1e-12 | 1e-12 | 0.0628 |
-| `10m15s` → `11m`, 60 s, `step=10m` | 1e-12 | 1e-12 | 0.0235 | 0.0308 |
-| `1h0m15s` → `1h12m`, 720 s, `step=1h` | 0.00411 | 0.00334 | 1.44 | 0.00901 |
-| `2h0m15s` → `2h12m`, 720 s, `step=2h` | 0.00207 | 0.00181 | 1.69 | 0.00449 |
+| `1m15s` → `5m`, 60 s, `step=1m` | 0.0649 | 0.00252 | 0.247 | 0.667 |
+| `2m15s` → `5m`, 60 s, `step=2m` | 0.0706 | 0.000838 | 0.0724 | 0.168 |
+| `5m15s` → `6m`, 60 s, `step=5m` | 1e-12 | 1e-12 | 1e-12 | 0.0629 |
+| `10m15s` → `11m`, 60 s, `step=10m` | 1e-12 | 1e-12 | 0.0236 | 0.0309 |
+| `1h0m15s` → `1h12m`, 720 s, `step=1h` | 0.00412 | 0.00334 | 1.45 | 0.00902 |
+| `2h0m15s` → `2h12m`, 720 s, `step=2h` | 0.00207 | 0.00182 | 1.69 | 0.00450 |
 
 The longer window is most of the distance under five buckets: a counter whose rate moves within the window reads further off than these figures, which come from counters rising at a steady rate. Measured on host counters scraped every 15 s, with raw read on both sides, `2m15s → 5m` gave a p99 of 1.74 (median 0.014) for CPU seconds, and `1h0m15s → 1h12m` a p99 of 0.394 (median 0.0022).
 
