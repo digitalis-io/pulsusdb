@@ -2341,7 +2341,13 @@ impl MetricsEngine {
         let mut stages: Vec<(i64, String, String)> = Vec::new();
         for level in plan.levels.levels[..=plan.route.level].iter().rev() {
             let Some((a, b)) = hull(&todo) else { break };
-            let sql = level_fetch(tenant, &level.table, fps, a, b, self.config.distributed);
+            let sql = level_fetch(
+                tenant,
+                &level.table,
+                fps,
+                &[(a, b)],
+                self.config.distributed,
+            );
             let rows = self.level_rows(sql.clone(), budget).await?;
             let runs: Vec<RunRow> = rows
                 .iter()

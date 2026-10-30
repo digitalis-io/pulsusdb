@@ -248,6 +248,28 @@ pub fn grid(p: &MetricQueryParams, levels: &Levels) -> Option<(i64, EvalGrid)> {
     ))
 }
 
+/// Issue #18: a range query's resolution, the largest level whose switch
+/// point is at most `end − start`: the widest level any selector may
+/// read. `None` for an instant query, no levels, or a range below the
+/// first switch point.
+pub fn resolution(_p: &MetricQueryParams, _levels: &Levels) -> Option<i64> {
+    None
+}
+
+/// D6: for a range query's selector of use `Counter` that is `eligible`
+/// and has no level under `route`, the range it is read with, `r'`, and
+/// the level it then routes to. `None` when the query is instant, the
+/// selector has a level already, or no level of width at most `res` fits
+/// its time.
+pub fn round_counter_range(
+    _sel: &SelectorSpec,
+    _p: &PlanParams,
+    _levels: &Levels,
+    _res: i64,
+) -> Option<i64> {
+    None
+}
+
 /// Issue #18 follow-up (r11): whether some selector of `plan`, planned on
 /// the grid `p`, reads a level of width at most `res`. Pure; decided
 /// before any fetch.
@@ -318,10 +340,10 @@ pub fn level_fetch(
     tenant: &Tenant,
     table: &str,
     fps: &[FpLiteral],
-    lo: i64,
-    hi: i64,
+    within: &[(i64, i64)],
     clustered: bool,
 ) -> String {
+    let (lo, hi) = hull(within).unwrap_or((0, 0));
     let shard = if clustered {
         "_shard_num"
     } else {
@@ -449,6 +471,9 @@ pub fn hull(a: &[(i64, i64)]) -> Option<(i64, i64)> {
     let hi = a.iter().map(|x| x.1).max()?;
     Some((lo, hi))
 }
+
+/// The most intervals one level or raw statement names.
+pub const MAX_STATEMENT_INTERVALS: usize = 64;
 
 /// Whether `t` lies in one of `a`'s intervals.
 pub fn contains(a: &[(i64, i64)], t: i64) -> bool {
@@ -802,90 +827,10 @@ mod tests {
         Some((res, step, count as i64, g.end_ms))
     }
 
-    /// **T1 (issue #18 follow-up, plan r16): the owner's table on a grid
-    /// from `start`.** Each row's range, `start` one millisecond after a
-    /// midnight, at a 1 s step: the row's resolution, `S` equal to it and
-    /// the table's count plus one, `start` itself being the first time. A
-    /// coarser step is rounded up to a multiple of the resolution.
-    #[test]
-    fn the_owners_table() {
-        let lv = owners();
-        let start = BASE + 1;
-        let rows: [(i64, i64, i64); 15] = [
-            (5 * MIN, 5_000, 61),
-            (15 * MIN, 5_000, 181),
-            (30 * MIN, 5_000, 361),
-            (HOUR, 60_000, 61),
-            (3 * HOUR, 60_000, 181),
-            (6 * HOUR, 60_000, 361),
-            (12 * HOUR, 60_000, 721),
-            (DAY, 720_000, 121),
-            (2 * DAY, 720_000, 241),
-            (7 * DAY, 7_200_000, 85),
-            (30 * DAY, 7_200_000, 361),
-            (90 * DAY, 86_400_000, 91),
-            (182 * DAY, 86_400_000, 183),
-            (365 * DAY, 86_400_000, 366),
-            (HOUR - 1, 5_000, 720),
-        ];
-        let at = |start: i64, end: i64, step: i64| {
-            snapped(&query(start, end, step), &lv).map(|g| (g.0, g.1, g.2))
-        };
-        for (range, res, points) in rows {
-            assert_eq!(
-                at(start, start + range, 1_000),
-                Some((res, res, points)),
-                "range {range} ms at 1 s"
-            );
-        }
-        // The 5 s rows at a 15 s step: S = 15 s.
-        for (range, points) in [
-            (5 * MIN, 21),
-            (15 * MIN, 61),
-            (30 * MIN, 121),
-            (10 * MIN, 41),
-        ] {
-            assert_eq!(
-                at(start, start + range, 15_000),
-                Some((5_000, 15_000, points)),
-                "range {range} ms at 15 s"
-            );
-        }
-        // 7 days at 5 m, both ends on midnights: S = 2 h, 85 points, the
-        // first `start`, the last `end`.
-        assert_eq!(
-            snapped(&query(BASE, BASE + 7 * DAY, 5 * MIN), &lv),
-            Some((7_200_000, 7_200_000, 85, BASE + 7 * DAY))
-        );
-        // 7 days at 1 d: S = 1 d, 8 points.
-        assert_eq!(at(start, start + 7 * DAY, DAY), Some((7_200_000, DAY, 8)));
-        // One millisecond under 7 days at 5 m: the 720 s level, 840.
-        assert_eq!(
-            at(BASE, BASE + 7 * DAY - 1, 5 * MIN),
-            Some((720_000, 720_000, 840))
-        );
-        // One millisecond under an hour at 1 s: 5 s, 720.
-        assert_eq!(
-            at(start, start + HOUR - 1, 1_000),
-            Some((5_000, 5_000, 720))
-        );
-        // 24 hours at 15 m: the 720 s level, S = 1,440 s, 61.
-        assert_eq!(
-            at(start, start + DAY, 15 * MIN),
-            Some((720_000, 1_440_000, 61))
-        );
-        // An instant query (`step == 0`) and no levels keep their own grid.
-        assert_eq!(grid(&query(BASE, BASE, 0), &lv), None);
-        assert_eq!(grid(&query(BASE, BASE + DAY, MIN), &levels(&[])), None);
-    }
-
-    /// **R1 (issue #746): a range below the first level's switch point
-    /// keeps its own grid and reads raw.** The default levels, 60 s first,
-    /// each the resolution from its own switch point, the first included
-    /// (owner, 2026-10-28): under 1 h no grid, from 1 h the 60 s level.
-    #[test]
-    fn a_range_below_the_first_switch_point_keeps_its_grid() {
-        let lv = Levels {
+    /// The default levels, 60 s first, each the resolution from its own
+    /// switch point, and `buckets` the counter bucket count.
+    fn defaults(buckets: u32) -> Levels {
+        Levels {
             levels: pulsus_schema::DEFAULT_ROLLUP_LEVELS
                 .iter()
                 .zip(pulsus_schema::DEFAULT_ROLLUP_RANGES)
@@ -896,32 +841,160 @@ mod tests {
                 })
                 .collect(),
             shards: 1,
-            counter_buckets: 5,
-        };
-        assert_eq!(lv.levels.len(), 4, "{lv:?}");
-        let start = BASE + 1;
-        for range in [0, 5 * MIN, 15 * MIN, 30 * MIN, HOUR - 1] {
-            assert_eq!(
-                grid(&query(start, start + range, 1_000), &lv),
-                None,
-                "range {range} ms reads raw"
-            );
-        }
-        for (range, res) in [
-            (HOUR, 60_000),
-            (DAY - 1, 60_000),
-            (DAY, 720_000),
-            (7 * DAY, 7_200_000),
-            (90 * DAY, 86_400_000),
-        ] {
-            assert_eq!(
-                grid(&query(start, start + range, 1_000), &lv).map(|g| g.0),
-                Some(res),
-                "range {range} ms"
-            );
+            counter_buckets: buckets,
         }
     }
 
+    /// **U4 (issue #18): a range query's resolution by its range.** The
+    /// default levels, `start` one millisecond after a midnight, at 1 s:
+    /// under 1 h none, then each level from its own switch point.
+    #[test]
+    fn resolution_by_range() {
+        let lv = defaults(5);
+        assert_eq!(lv.levels.len(), 4, "{lv:?}");
+        let start = BASE + 1;
+        for (range, res) in [
+            (0, None),
+            (5 * MIN, None),
+            (HOUR - 1, None),
+            (HOUR, Some(60_000)),
+            (DAY - 1, Some(60_000)),
+            (DAY, Some(720_000)),
+            (7 * DAY, Some(7_200_000)),
+            (90 * DAY, Some(86_400_000)),
+        ] {
+            assert_eq!(
+                resolution(&query(start, start + range, 1_000), &lv),
+                res,
+                "range {range} ms"
+            );
+        }
+        assert_eq!(
+            resolution(&query(start, start + DAY, 0), &lv),
+            None,
+            "step 0"
+        );
+        assert_eq!(
+            resolution(&query(start, start + DAY, 1_000), &levels(&[])),
+            None,
+            "no levels"
+        );
+    }
+
+    /// The plan parameters of a range query over `range` from `start` at
+    /// `step`, `end = start + range`.
+    fn over(start: i64, range: i64, step: i64) -> (MetricQueryParams, PlanParams) {
+        let p = query(start, start + range, step);
+        (p, p.plan_params(true, DEFAULT_LOOKBACK_MS))
+    }
+
+    /// The level the query's one selector routes to on the request's own
+    /// grid, at the resolution its range selects.
+    fn routed(q: &str, start: i64, range: i64, step: i64, lv: &Levels) -> Option<i64> {
+        let (p, pp) = over(start, range, step);
+        let res = resolution(&p, lv).expect("a resolution");
+        let sels = selectors(q, &pp);
+        assert_eq!(sels.len(), 1, "{q}: one selector");
+        route(&sels[0], &pp, lv, res).map(|r| r.res_ms)
+    }
+
+    /// **U5 (issue #18): the guards on the request's grid.** Each selector
+    /// reads the largest level, at most the resolution, whose buckets end
+    /// at its window edges.
+    #[test]
+    fn the_guards() {
+        let lv = defaults(5);
+        let day = |q: &str| routed(q, BASE + 6 * MIN, DAY, 2 * MIN, &lv);
+        assert_eq!(day("x"), Some(60_000));
+        assert_eq!(day("max_over_time(x[1h])"), Some(60_000));
+        assert_eq!(day("rate(x[2m15s])"), None);
+        assert_eq!(day("rate(x[5m])"), Some(60_000));
+        assert_eq!(day("x offset 90s"), None);
+        assert_eq!(routed("x", BASE, 7 * DAY, 10 * MIN, &lv), Some(60_000));
+        assert_eq!(
+            routed("max_over_time(x[2h])", BASE, 7 * DAY, 2 * HOUR, &lv),
+            Some(7_200_000)
+        );
+        assert_eq!(routed("x", BASE, 30 * DAY, HOUR, &lv), Some(720_000));
+        assert_eq!(
+            routed("rate(x[1h])", BASE, 30 * DAY, HOUR, &lv),
+            Some(720_000)
+        );
+    }
+
+    /// The range `round_counter_range` reads the query's one selector
+    /// with, on the request's grid at the resolution its range selects.
+    fn rounded(q: &str, start: i64, range: i64, step: i64, lv: &Levels) -> Option<i64> {
+        let (p, pp) = over(start, range, step);
+        let res = resolution(&p, lv).unwrap_or(lv.levels[0].res_ms);
+        let sels = selectors(q, &pp);
+        assert_eq!(sels.len(), 1, "{q}: one selector");
+        round_counter_range(&sels[0], &pp, lv, res)
+    }
+
+    /// **U6 (issue #18): `round_counter_range` pins the range.** D6's three
+    /// cases: the largest fitting level the rounded range covers at least
+    /// `counter_buckets` times; else that many buckets of the finest
+    /// fitting level; else none.
+    #[test]
+    fn round_counter_range_pins_the_range() {
+        let lv = defaults(5);
+        let day = |q: &str| rounded(q, BASE + 6 * MIN, DAY, 2 * MIN, &lv);
+        assert_eq!(day("rate(x[2m15s])"), Some(300_000));
+        assert_eq!(day("increase(x[4m])"), Some(300_000), "case 2");
+        assert_eq!(day("rate(x[4m30s])"), Some(300_000), "case 1: five buckets");
+        assert_eq!(day("rate(x[5m])"), None, "an exact level");
+        assert_eq!(day("rate(x[2m15s] offset 90s)"), None);
+        assert_eq!(day("irate(x[2m15s])"), None);
+        assert_eq!(day("max_over_time(x[2m15s])"), None);
+        assert_eq!(
+            rounded("rate(x[1m15s])", BASE + 6 * MIN, DAY, MIN, &lv),
+            Some(300_000)
+        );
+        assert_eq!(
+            rounded("rate(x[1m])", BASE, HOUR, 15_000, &lv),
+            None,
+            "no level fits the time"
+        );
+        let month = |q: &str| rounded(q, BASE, 30 * DAY, HOUR, &lv);
+        assert_eq!(month("rate(x[1h0m15s])"), Some(4_320_000));
+        assert_eq!(
+            month("rate(x[2880001ms])"),
+            Some(3_600_000),
+            "720 s, five buckets"
+        );
+        assert_eq!(month("rate(x[61m])"), None, "exact at 60 s");
+        assert_eq!(
+            rounded("rate(x[2h0m15s])", BASE, 7 * DAY, 2 * HOUR, &lv),
+            Some(7_920_000),
+            "720 s: one 7200 s bucket is under five"
+        );
+        let instant = query(BASE, BASE, 0).plan_params(true, DEFAULT_LOOKBACK_MS);
+        let sel = &selectors("rate(x[2m15s])", &instant)[0];
+        assert_eq!(
+            round_counter_range(sel, &instant, &lv, lv.levels[0].res_ms),
+            None,
+            "an instant query"
+        );
+        let at = |q: &str| rounded(q, BASE + 6 * MIN + 30_000, DAY, 2 * MIN, &lv);
+        assert_eq!(
+            at("rate(x[2m15s] @ 1788825960)"),
+            Some(300_000),
+            "the @ time is on a minute"
+        );
+        assert_eq!(at("rate(x[2m15s] @ 1788825990)"), None);
+        let three = defaults(3);
+        assert_eq!(
+            rounded("rate(x[2m15s])", BASE + 6 * MIN, DAY, 2 * MIN, &three),
+            Some(180_000),
+            "three buckets, case 1"
+        );
+        assert_eq!(
+            rounded("rate(x[1m15s])", BASE + 6 * MIN, DAY, MIN, &three),
+            Some(180_000),
+            "three buckets, case 2"
+        );
+    }
     /// **T1b (issue #18 follow-up, plan r16): the grid does not overflow**,
     /// and a grid of more than 11,001 points, or an `S` above `i64::MAX`,
     /// keeps the query's own.
@@ -998,40 +1071,6 @@ mod tests {
             !level_window_exists(sel, &p, &at_grid),
             "every grid window touches a piece"
         );
-    }
-
-    /// The level the query's one selector reads on the grid `p` snaps to.
-    fn on_grid(q: &str, p: &MetricQueryParams, lv: &Levels) -> Option<i64> {
-        let got = grid(p, lv);
-        assert!(
-            got.is_some() || p.start_ms == p.end_ms,
-            "{q}: a range query has a grid"
-        );
-        let (res, pp) = match got {
-            Some((res, g)) => (res, on(p, g, true)),
-            None => (
-                lv.levels[0].res_ms,
-                p.plan_params(true, DEFAULT_LOOKBACK_MS),
-            ),
-        };
-        let sels = selectors(q, &pp);
-        assert_eq!(sels.len(), 1, "{q}: one selector");
-        route(&sels[0], &pp, lv, res).map(|r| r.res_ms)
-    }
-
-    /// **T2 (issue #18 follow-up): the guards.** On a 7-day grid a
-    /// selector reads the largest level its range and time allow.
-    #[test]
-    fn the_guards() {
-        let lv = owners();
-        let week = query(BASE, BASE + 7 * DAY, 5 * MIN);
-        assert_eq!(on_grid("rate(x[5m])", &week, &lv), Some(60_000));
-        assert_eq!(on_grid("rate(x[2h])", &week, &lv), Some(720_000));
-        assert_eq!(on_grid("max_over_time(x[2h])", &week, &lv), Some(7_200_000));
-        assert_eq!(on_grid("x offset 90s", &week, &lv), Some(5_000));
-        let at = |t: i64| query(t, t, 0);
-        assert_eq!(on_grid("x", &at(BASE + 3_000), &lv), None);
-        assert_eq!(on_grid("x", &at(BASE + 5_000), &lv), Some(5_000));
     }
 
     fn all() -> Levels {
@@ -1588,8 +1627,9 @@ mod tests {
         Tenant::from_header(None, false).expect("the empty tenant")
     }
 
-    /// **B1e (issue #18 part B): the level fetch is plan section 2's
-    /// statement**, `toUInt32(1)` on one node and `_shard_num` clustered.
+    /// **B1e and U1 (issue #18): the level fetch is plan section 2's
+    /// statement**, `toUInt32(1)` on one node and `_shard_num` clustered;
+    /// one interval keeps its text, two are `OR`ed in both halves.
     #[test]
     fn b1e_the_level_fetch_statement() {
         let fps = [
@@ -1598,20 +1638,24 @@ mod tests {
         ];
         let body = "kind, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags\n";
         let rest = "WHERE (kind = 0 AND org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205')) AND t_end > 1000 AND t_end <= 9000)\n   OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > 1000 AND t_last < 9000)\nORDER BY kind, fingerprint, t_end";
+        let one = [(1000, 9000)];
         assert_eq!(
-            level_fetch(&no_tenant(), "metric_samples_720s", &fps, 1000, 9000, false),
+            level_fetch(&no_tenant(), "metric_samples_720s", &fps, &one, false),
             format!("SELECT toUInt32(1) AS shard, {body}FROM metric_samples_720s\n{rest}")
         );
         assert_eq!(
-            level_fetch(
-                &no_tenant(),
-                "metric_samples_720s_dist",
-                &fps,
-                1000,
-                9000,
-                true
-            ),
+            level_fetch(&no_tenant(), "metric_samples_720s_dist", &fps, &one, true),
             format!("SELECT _shard_num AS shard, {body}FROM metric_samples_720s_dist\n{rest}")
+        );
+        let two = [(1000, 2000), (8000, 9000)];
+        let rest = "WHERE (kind = 0 AND org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205')) AND ((t_end > 1000 AND t_end <= 2000) OR (t_end > 8000 AND t_end <= 9000)))\n   OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND ((t_end > 1000 AND t_last < 2000) OR (t_end > 8000 AND t_last < 9000)))\nORDER BY kind, fingerprint, t_end";
+        assert_eq!(
+            level_fetch(&no_tenant(), "metric_samples_60s", &fps, &two, false),
+            format!("SELECT toUInt32(1) AS shard, {body}FROM metric_samples_60s\n{rest}")
+        );
+        assert_eq!(
+            level_fetch(&no_tenant(), "metric_samples_60s_dist", &fps, &two, true),
+            format!("SELECT _shard_num AS shard, {body}FROM metric_samples_60s_dist\n{rest}")
         );
     }
 

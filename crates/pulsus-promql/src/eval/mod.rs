@@ -9743,6 +9743,63 @@ mod tests {
         );
     }
 
+    /// The one instant value of `q` at 600 s over `samples`, with the
+    /// first selector's range set to `read` when given: the float, or the
+    /// histogram's count and sum.
+    fn at_600(q: &str, read: Option<i64>, samples: &[Sample]) -> (f64, Option<(f64, f64)>) {
+        let mut planned = plan(
+            &crate::parser::parse(q).unwrap(),
+            params(600_000, 600_000, 0),
+        )
+        .expect("plan");
+        if let Some(r) = read {
+            planned.selectors[0].range_ms = Some(r);
+        }
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "x")], samples.to_vec())]);
+        match evaluate(&planned, &data).expect("evaluate") {
+            QueryValue::Vector(v) => {
+                assert_eq!(v.len(), 1, "{q}: one sample");
+                (v[0].v, v[0].h.as_ref().map(|h| (h.count, h.sum)))
+            }
+            other => panic!("{q}: expected a vector, got {other:?}"),
+        }
+    }
+
+    /// **U7 (issue #18): a rounded `increase` is scaled to the range
+    /// asked.** `x` rises by 1 every 15 s from 0. `increase(x[2m15s])`
+    /// read over 5 m is `rate(x[5m]) × 135`, 9; a rounded `rate` is
+    /// `rate(x[5m])`. A native histogram whose count and sum rise the same
+    /// way scales both.
+    #[test]
+    fn a_rounded_increase_is_scaled_to_the_range_asked() {
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1.0);
+        let floats: Vec<Sample> = (0..=40).map(|i| s(i * 15_000, i as f64)).collect();
+        let (five, _) = at_600("rate(x[5m])", None, &floats);
+        let (rate, _) = at_600("rate(x[2m15s])", Some(300_000), &floats);
+        assert_eq!(
+            rate.to_bits(),
+            five.to_bits(),
+            "a rounded rate is rate(x[5m])"
+        );
+        let (inc, _) = at_600("increase(x[2m15s])", Some(300_000), &floats);
+        assert!(
+            close(inc, five * 135.0),
+            "increase {inc} against rate × 135 {}",
+            five * 135.0
+        );
+        assert!(close(inc, 9.0), "increase {inc}");
+        let hists: Vec<Sample> = (0..=40u64)
+            .map(|i| count_hist(i as i64 * 15_000, i))
+            .collect();
+        let (_, h) = at_600("increase(x[2m15s])", Some(300_000), &hists);
+        let (count, sum) = h.expect("a histogram");
+        assert!(
+            close(count, 9.0) && close(sum, 9.0),
+            "count {count}, sum {sum}"
+        );
+    }
+
     /// **T13 (issue #18 follow-up, plan r16): the grid moves only the
     /// evaluation times.** `x` is its own time in seconds, every 15 s. The
     /// request is `start = 0`, `end = 90,000 s`, `step = 900 s`; the grid

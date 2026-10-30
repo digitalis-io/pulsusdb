@@ -100,6 +100,18 @@ pub fn sample_fetch(
     )
 }
 
+/// [`sample_fetch`] over each interval of `within`: with one interval its
+/// text is `sample_fetch`'s exactly.
+pub fn sample_fetch_within(
+    tenant: &Tenant,
+    table: &str,
+    fps: &[FpLiteral],
+    within: &[(i64, i64)],
+) -> String {
+    let (lo, hi) = super::rollup::hull(within).unwrap_or((0, 0));
+    sample_fetch(tenant, table, fps, lo, hi)
+}
+
 /// The over-cap / `SqlFallback` variant: `subquery` (#30's
 /// `historical_series_subquery` output, already injection-safe) inlined
 /// verbatim as `fingerprint IN ( <subquery> )` — never a materialized
@@ -328,6 +340,33 @@ mod tests {
              FROM metric_samples\n\
              WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
              \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
+             ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
+        );
+    }
+
+    /// **U3 (issue #18): the raw read names each interval.** One interval
+    /// is `sample_fetch`'s text; two are `OR`ed.
+    #[test]
+    fn sample_fetch_within_names_each_interval() {
+        let fps = [
+            Fingerprint::from_raw(101).sql_literal(),
+            Fingerprint::from_raw(205).sql_literal(),
+        ];
+        assert_eq!(
+            sample_fetch_within(&no_tenant(), "metric_samples", &fps, &[(1000, 9000)]),
+            sample_fetch(&no_tenant(), "metric_samples", &fps, 1000, 9000)
+        );
+        assert_eq!(
+            sample_fetch_within(
+                &no_tenant(),
+                "metric_samples",
+                &fps,
+                &[(1000, 2000), (8000, 9000)]
+            ),
+            "SELECT fingerprint, unix_milli, value\n\
+             FROM metric_samples\n\
+             WHERE org_id = '' AND ((unix_milli > 1000 AND unix_milli <= 2000) OR (unix_milli > 8000 AND unix_milli <= 9000))\n\
+             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
              ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
         );
     }
