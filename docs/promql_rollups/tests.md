@@ -42,7 +42,7 @@
 | `a_level_added_later_is_used` (`crates/pulsus-read/tests/live_metrics_rollup.rs:1611`) | live | a database built with `60,300,7200,86400` reads `metric_samples_300s` at a 5 m step |
 | `a_sparse_counter_keeps_its_steps` (`crates/pulsus-read/tests/live_metrics_rollup.rs:1679`) | live | the sparse counters' `increase` within the sparse 60 s bound, per tenant |
 | `stale_and_nan_read_as_raw` (`crates/pulsus-read/tests/live_metrics_rollup.rs:1785`) | live | at every level, stale markers and NaN payloads read as raw for the bit-equal functions; a counter resuming after a stale marker counts its step; the single-sample and 24-hour cases of `reading.md` §1.1 exactly |
-| `a_run_row_is_read_with_its_data` (`crates/pulsus-read/tests/live_metrics_rollup_cluster.rs:294`) | cluster | with one replica's fetches stopped, a new run's interval is served from the level only when its data rows come in the same answer as its run row |
+| `a_run_row_is_read_with_its_data` (`crates/pulsus-read/tests/live_metrics_rollup_cluster.rs:293`) | cluster | with one replica's fetches stopped, a new run's interval is served from the level only when its data rows come in the same answer as its run row |
 | `b9_exactness_is_rollup_when_a_level_served` (`crates/pulsus-server/src/prom_api/encode.rs:1723`) | unit | `"raw-exact"` and `"rollup"` |
 | `b6_runtimeinfo_lists_the_rollup_levels` (`crates/pulsus-server/src/prom_api/handlers.rs:1745`) | unit | `rollupLevels` for two level sets, and `[]` before discovery |
 

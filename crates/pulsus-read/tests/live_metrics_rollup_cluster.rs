@@ -195,12 +195,11 @@ fn fp_of(offset: u32) -> String {
     )
 }
 
-/// A fresh database on the 2-shard fixture, every level view stopped and
+/// `db`, fresh on the 2-shard fixture, every level view stopped and
 /// every level emptied, and each metric of `metrics`, `(name, ID offset)`:
 /// forty series, half in each shard's slice of the ID space, scraped every
 /// 15 s for three hours, registered and landed on shard 1.
-async fn fixture(base: &str, metrics: &[(&str, u32)]) -> Fixture {
-    let db = pulsus_testkit::test_db(base);
+async fn fixture(db: String, metrics: &[(&str, u32)]) -> Fixture {
     // Part B's levels, 60 s first and the resolution from 60 s: the
     // 40-minute queries read the first level.
     let ctx = RenderCtx {
@@ -305,7 +304,11 @@ async fn a_run_row_is_read_with_its_data() {
         mid,
         lo,
         hi,
-    } = fixture("pulsus_read_it_rollup_cluster", &[("m", 0)]).await;
+    } = fixture(
+        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster"),
+        &[("m", 0)],
+    )
+    .await;
 
     // The first level to `mid` on both shards, then shard 1's second
     // replica stops fetching it, then one more run to `hi`.
@@ -608,7 +611,11 @@ async fn a_pushed_level_node_answers_on_two_shards() {
     if skipping() {
         return;
     }
-    let f = fixture("pulsus_read_it_rollup_cluster_t7", &[("m", 0)]).await;
+    let f = fixture(
+        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t7"),
+        &[("m", 0)],
+    )
+    .await;
     build_level(&f).await;
     let (cache, slot) = warm(&f).await;
     let on = level_engine(&f, &cache, &slot, true, None).await;
@@ -659,7 +666,7 @@ async fn a_side_behind_its_coverage_falls_back_whole() {
         return;
     }
     let f = fixture(
-        "pulsus_read_it_rollup_cluster_t10",
+        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t10"),
         &[("m", 0), ("n", 5000)],
     )
     .await;

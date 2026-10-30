@@ -148,7 +148,7 @@ Over more intervals, each half's time condition is the `OR` of one condition per
 | with the levels built in order | `(lo, W_L]` from `L`, `(W_L, W_K]` from each finer level `K`, and the newest part from raw, so every refresh ends on the newest raw sample |
 | history before a level's first run, and any hole | read from finer levels or raw |
 
-The property this rests on was measured on the development cluster while an earlier rollup design was prototyped: with fetches stopped on one replica of a shard, a read through the distributed table on that replica returned neither the rows nor the coverage row of a block inserted on its peer. That output was not kept. `a_run_row_is_read_with_its_data` (`crates/pulsus-read/tests/live_metrics_rollup_cluster.rs:294`) checks it for this read in CI's cluster job.
+The property this rests on was measured on the development cluster while an earlier rollup design was prototyped: with fetches stopped on one replica of a shard, a read through the distributed table on that replica returned neither the rows nor the coverage row of a block inserted on its peer. That output was not kept. `a_run_row_is_read_with_its_data` (`crates/pulsus-read/tests/live_metrics_rollup_cluster.rs:293`) checks it for this read in CI's cluster job.
 
 How much of a window its level does not serve, default set, levels up to date (`building.md` §3.3); a range under 1 h reads raw whole:
 
