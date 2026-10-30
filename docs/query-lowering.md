@@ -5543,22 +5543,22 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | of those, citing a bare basename | 478 |
 | of those, written as a continuation of a citation earlier in the paragraph | 65 |
 | of those continuations, on a later line than the citation they continue | 26 |
-| `(document, token)` pairs the rule resolves | 255 |
-| occurrences those resolved pairs cover | 349 |
-| `(document, token)` pairs it cannot resolve | 194 |
-| occurrences those frozen pairs cover | 304 |
-| resolved rows anchored on a token the citing prose prints | 139 |
+| `(document, token)` pairs the rule resolves | 254 |
+| occurrences those resolved pairs cover | 348 |
+| `(document, token)` pairs it cannot resolve | 195 |
+| occurrences those frozen pairs cover | 305 |
+| resolved rows anchored on a token the citing prose prints | 138 |
 | resolved rows anchored on a snapshot of the cited line | 116 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 85 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `ambiguous_basename` | 86 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `not_a_tracked_file` | 109 | the citation names a file the tree does not hold: a throwaway probe that was never committed, which §10 records deliberately, a file of the previous search engine that #602 part 2c-2b deleted, or a file of the previous metrics and graph SQL that #602 part 3a deleted |
 
 | the reviewed verdict on a fallback disagreement | cases |
 |---|---|
 | the fallback answers a file the citing prose does not describe | 1 |
-| the fallback is right and the anchor rule points elsewhere | 1 |
+| the fallback is right and the anchor rule points elsewhere | 0 |
 | the sentence describes both candidates, so neither answer is wrong | 0 |
 
 | anchor kind | what a row of that kind can show |
@@ -5566,9 +5566,9 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 653 citation occurrences the five artefacts make, 478 name a bare basename and 65 are written as a continuation of a citation earlier on the same line. The rule resolves 255 `(document, token)` pairs covering 349 occurrences, and cannot resolve 194 covering 304. Of the resolved rows, 139 are anchored on a token the citing prose prints and 116 on a snapshot of the cited line.
+Of the 653 citation occurrences the five artefacts make, 478 name a bare basename and 65 are written as a continuation of a citation earlier on the same line. The rule resolves 254 `(document, token)` pairs covering 348 occurrences, and cannot resolve 195 covering 305. Of the resolved rows, 138 are anchored on a token the citing prose prints and 116 on a snapshot of the cited line.
 
-The language fallback and the anchor rule disagree on 2 citations, all of them read one at a time. 1 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
+The language fallback and the anchor rule disagree on 1 citations, all of them read one at a time. 1 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
 The citations where the fallback answers a file the citing prose does not describe are `exec.rs:1360-1362` in `docs/query-lowering.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
 

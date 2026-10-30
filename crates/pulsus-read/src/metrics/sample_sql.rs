@@ -65,6 +65,24 @@ pub fn window_predicate(lower_excl_ms: i64, upper_incl_ms: i64) -> String {
     format!("unix_milli > {lower_excl_ms} AND unix_milli <= {upper_incl_ms}")
 }
 
+/// `lo_col > a AND hi_col <op> b` for one interval; for more,
+/// `((lo_col > a1 AND hi_col <op> b1) OR (lo_col > a2 AND hi_col <op> b2))`;
+/// `0` for none (issue #18).
+pub fn intervals_predicate(lo_col: &str, hi_col: &str, op: &str, within: &[(i64, i64)]) -> String {
+    let one = |&(a, b): &(i64, i64)| format!("{lo_col} > {a} AND {hi_col} {op} {b}");
+    match within {
+        [] => "0".to_string(),
+        [x] => one(x),
+        many => format!(
+            "({})",
+            many.iter()
+                .map(|x| format!("({})", one(x)))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        ),
+    }
+}
+
 /// `fingerprint IN (toUInt128('101'), toUInt128('205'))` — the resolved
 /// fingerprint set.
 pub fn fingerprints_predicate(fps: &[FpLiteral]) -> String {
@@ -93,6 +111,25 @@ pub fn sample_fetch(
         "org_id = {} AND {}",
         tenant.sql_literal(),
         window_predicate(lower_excl_ms, upper_incl_ms)
+    );
+    let fps = fingerprints_predicate(fps);
+    format!(
+        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
+    )
+}
+
+/// [`sample_fetch`] over each interval of `within`: with one interval its
+/// text is `sample_fetch`'s exactly.
+pub fn sample_fetch_within(
+    tenant: &Tenant,
+    table: &str,
+    fps: &[FpLiteral],
+    within: &[(i64, i64)],
+) -> String {
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        intervals_predicate("unix_milli", "unix_milli", "<=", within)
     );
     let fps = fingerprints_predicate(fps);
     format!(
@@ -328,6 +365,33 @@ mod tests {
              FROM metric_samples\n\
              WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
              \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
+             ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
+        );
+    }
+
+    /// **U3 (issue #18): the raw read names each interval.** One interval
+    /// is `sample_fetch`'s text; two are `OR`ed.
+    #[test]
+    fn sample_fetch_within_names_each_interval() {
+        let fps = [
+            Fingerprint::from_raw(101).sql_literal(),
+            Fingerprint::from_raw(205).sql_literal(),
+        ];
+        assert_eq!(
+            sample_fetch_within(&no_tenant(), "metric_samples", &fps, &[(1000, 9000)]),
+            sample_fetch(&no_tenant(), "metric_samples", &fps, 1000, 9000)
+        );
+        assert_eq!(
+            sample_fetch_within(
+                &no_tenant(),
+                "metric_samples",
+                &fps,
+                &[(1000, 2000), (8000, 9000)]
+            ),
+            "SELECT fingerprint, unix_milli, value\n\
+             FROM metric_samples\n\
+             WHERE org_id = '' AND ((unix_milli > 1000 AND unix_milli <= 2000) OR (unix_milli > 8000 AND unix_milli <= 9000))\n\
+             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
              ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
         );
     }

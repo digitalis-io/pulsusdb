@@ -31,9 +31,9 @@ pub use limits::MAX_EXPR_DEPTH;
 pub use math::KahanSum;
 pub use parser::parse;
 pub use plan::{
-    AggOp, BinOp, DEFAULT_LOOKBACK_MS, EvalGrid, FillValues, Group, Grouping, Matching, MathFn,
-    OverTimeFn, OverTimeParamFn, PlanExpr, PlanParams, QueryPlan, RangeFn, RollupUse, ScalarFn,
-    SelectorId, SelectorSpec, SetOp, exemplar_selectors, plan, series_selector,
+    AggOp, BinOp, DEFAULT_LOOKBACK_MS, FillValues, Group, Grouping, Matching, MathFn, OverTimeFn,
+    OverTimeParamFn, PlanExpr, PlanParams, QueryPlan, RangeFn, RollupUse, ScalarFn, SelectorId,
+    SelectorSpec, SetOp, exemplar_selectors, plan, series_selector,
 };
 pub use re2_syntax::re2_pattern_to_rust;
 pub use value::{

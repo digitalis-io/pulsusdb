@@ -346,12 +346,10 @@ fn evaluate_counted_with(
         &plan.root,
         &plan.selectors,
         data,
-        // Issue #18 follow-up: the evaluation grid, which a rollup level
-        // may space wider than the request's step.
         StepGrid::Dense(Horizon {
             start_ms: p.start_ms,
-            end_ms: p.eval_end(),
-            step_ms: p.eval_step(),
+            end_ms: p.end_ms,
+            step_ms: p.step_ms,
         }),
         p.lookback_ms,
         &mut caches,
@@ -436,11 +434,8 @@ fn evaluate_counted_with(
     let mut saw_vector = false;
     let mut saw_scalar = false;
 
-    // Issue #18 follow-up: the evaluation times, `start + k × eval_step()`
-    // up to `eval_end()`; the request's own when no grid is set.
-    let (grid_end, grid_step) = (p.eval_end(), p.eval_step());
     let mut t = p.start_ms;
-    while t <= grid_end {
+    while t <= p.end_ms {
         // Issue #93: one `Relaxed` load per step — O(1), no allocation, no
         // per-sample work inside `eval_step`.
         if caches.cancel.is_cancelled() {
@@ -487,7 +482,7 @@ fn evaluate_counted_with(
                 });
             }
         }
-        t += grid_step;
+        t += p.step_ms;
     }
 
     // Issue #130 Δ2: after the step loop, before EITHER range return's
@@ -2887,6 +2882,19 @@ fn eval_step(
                 t_ms,
                 lookback_ms,
             )?;
+            // Issue #18: the reader rounds a `rate` or `increase` range up
+            // to whole level buckets; a rounded `increase` is scaled back to
+            // the range asked, so it stays `rate × range`.
+            let scale = match (func, source) {
+                (crate::plan::RangeFn::Increase, RangeSource::Selector(id)) => {
+                    let sel = &selectors[*id];
+                    match (sel.written_range_ms, sel.range_ms) {
+                        (Some(w), Some(r)) if w != r && r > 0 => Some(w as f64 / r as f64),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
             let mut out = Vec::new();
             for series in src.series {
                 let metric_name = series.metric_name.as_deref().unwrap_or("");
@@ -2934,7 +2942,13 @@ fn eval_step(
                     }
                 };
                 if let Some(value) = result {
-                    let (v, h) = range_value_to_sample_fields(value);
+                    let (mut v, mut h) = range_value_to_sample_fields(value);
+                    if let Some(f) = scale {
+                        v *= f;
+                        if let Some(h) = h.as_mut() {
+                            h.mul(f);
+                        }
+                    }
                     out.push(InstantSample {
                         labels: series.labels,
                         metric_name: series.metric_name,
@@ -4352,8 +4366,6 @@ mod tests {
 
     fn params(start_ms: i64, end_ms: i64, step_ms: i64) -> PlanParams {
         PlanParams {
-            widen_to: None,
-            eval: None,
             start_ms,
             end_ms,
             step_ms,
@@ -9743,117 +9755,60 @@ mod tests {
         );
     }
 
-    /// **T13 (issue #18 follow-up, plan r16): the grid moves only the
-    /// evaluation times.** `x` is its own time in seconds, every 15 s. The
-    /// request is `start = 0`, `end = 90,000 s`, `step = 900 s`; the grid
-    /// is `720 s × ⌈900 / 720⌉ = 1,440 s` up to 89,280 s. Every query is
-    /// evaluated at the grid's 63 times, and every value the request
-    /// defines keeps the request's.
-    #[test]
-    fn the_grid_moves_only_the_evaluation_times() {
-        let samples: Vec<Sample> = (-172_800i64..=90_000)
-            .step_by(15)
-            .map(|t| s(t * 1_000, t as f64))
-            .collect();
-        // `start()`, `end()`, `range()` and `step()` are experimental.
-        let p = PlanParams {
-            eval: Some(crate::plan::EvalGrid {
-                end_ms: 89_280_000,
-                step_ms: 1_440_000,
-            }),
-            experimental_functions: true,
-            ..params(0, 90_000_000, 900_000)
-        };
-        let times: Vec<i64> = (0..63).map(|k| k * 1_440_000).collect();
-        type Want = fn(i64) -> f64;
-        let cases: [(&str, Want); 10] = [
-            ("x @ end()", |_| 90_000.0),
-            ("max_over_time(x[1m] @ end())", |_| 90_000.0),
-            ("x @ start()", |_| 0.0),
-            ("end()", |_| 90_000.0),
-            ("start()", |_| 0.0),
-            ("range()", |_| 90_000.0),
-            ("step()", |_| 900.0),
-            ("count_over_time(x[step() * 2])", |_| 120.0),
-            ("x offset step()", |t| (t / 1_000 - 900) as f64),
-            ("max_over_time(x[10m:1m] @ end())", |_| 90_000.0),
-        ];
-        for (q, want) in cases {
-            let planned = plan(&crate::parser::parse(q).unwrap(), p).unwrap();
-            let mut data = SeriesData::new();
-            for sel in &planned.selectors {
-                data.insert(sel.id, vec![series(1, &[("job", "x")], samples.clone())]);
+    /// The one instant value of `q` at 600 s over `samples`, with the
+    /// first selector's range set to `read` when given: the float, or the
+    /// histogram's count and sum.
+    fn at_600(q: &str, read: Option<i64>, samples: &[Sample]) -> (f64, Option<(f64, f64)>) {
+        let mut planned = plan(
+            &crate::parser::parse(q).unwrap(),
+            params(600_000, 600_000, 0),
+        )
+        .expect("plan");
+        if let Some(r) = read {
+            planned.selectors[0].range_ms = Some(r);
+        }
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "x")], samples.to_vec())]);
+        match evaluate(&planned, &data).expect("evaluate") {
+            QueryValue::Vector(v) => {
+                assert_eq!(v.len(), 1, "{q}: one sample");
+                (v[0].v, v[0].h.as_ref().map(|h| (h.count, h.sum)))
             }
-            let points: Vec<(i64, f64)> = match evaluate(&planned, &data).unwrap() {
-                QueryValue::Matrix(m) => {
-                    assert_eq!(m.len(), 1, "{q}: one series");
-                    m[0].points.iter().map(|pt| (pt.t_ms, pt.v)).collect()
-                }
-                other => panic!("{q}: expected a matrix, got {other:?}"),
-            };
-            let expected: Vec<(i64, f64)> = times.iter().map(|&t| (t, want(t))).collect();
-            assert_eq!(points, expected, "{q}");
+            other => panic!("{q}: expected a vector, got {other:?}"),
         }
     }
 
-    /// **W4 (issue #18 follow-up, plan r17): a range shorter than the
-    /// stretched step is read as the step.** T13's store and grid with
-    /// `widen_to` 1,440 s: an outer selector's or subquery's range below
-    /// 1,440 s is read as 1,440 s; `@` selectors and subqueries, and the
-    /// ranges inside a subquery, are not; an offset still moves the
-    /// widened window.
+    /// **U7 (issue #18): a rounded `increase` is scaled to the range
+    /// asked.** `x` rises by 1 every 15 s from 0. `increase(x[2m15s])`
+    /// read over 5 m is `rate(x[5m]) × 135`, 9; a rounded `rate` is
+    /// `rate(x[5m])`. A native histogram whose count and sum rise the same
+    /// way scales both.
     #[test]
-    fn a_short_range_is_read_as_the_stretched_step() {
-        let samples: Vec<Sample> = (-172_800i64..=90_000)
-            .step_by(15)
-            .map(|t| s(t * 1_000, t as f64))
+    fn a_rounded_increase_is_scaled_to_the_range_asked() {
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1.0);
+        let floats: Vec<Sample> = (0..=40).map(|i| s(i * 15_000, i as f64)).collect();
+        let (five, _) = at_600("rate(x[5m])", None, &floats);
+        let (rate, _) = at_600("rate(x[2m15s])", Some(300_000), &floats);
+        assert_eq!(
+            rate.to_bits(),
+            five.to_bits(),
+            "a rounded rate is rate(x[5m])"
+        );
+        let (inc, _) = at_600("increase(x[2m15s])", Some(300_000), &floats);
+        assert!(
+            close(inc, five * 135.0),
+            "increase {inc} against rate × 135 {}",
+            five * 135.0
+        );
+        assert!(close(inc, 9.0), "increase {inc}");
+        let hists: Vec<Sample> = (0..=40u64)
+            .map(|i| count_hist(i as i64 * 15_000, i))
             .collect();
-        let p = PlanParams {
-            eval: Some(crate::plan::EvalGrid {
-                end_ms: 89_280_000,
-                step_ms: 1_440_000,
-            }),
-            widen_to: Some(1_440_000),
-            experimental_functions: true,
-            ..params(0, 90_000_000, 900_000)
-        };
-        let times: Vec<i64> = (0..63).map(|k| k * 1_440_000).collect();
-        type Want = fn(i64) -> f64;
-        let cases: [(&str, Want); 12] = [
-            ("count_over_time(x[1m])", |_| 96.0),
-            ("count_over_time(x[step()])", |_| 96.0),
-            ("count_over_time(x[step() * 2])", |_| 120.0),
-            // The widened window, moved by the offset: its first sample.
-            ("min_over_time(x[1m] offset 1h)", |t| {
-                (t / 1_000 - 5_025) as f64
-            }),
-            ("count_over_time(x[1m] @ end())", |_| 4.0),
-            ("count_over_time(x[10m:1m])", |_| 24.0),
-            ("count_over_time(x[10m:1m] @ end())", |_| 10.0),
-            // The subquery's widened window, moved by its offset.
-            ("min_over_time(x[10m:1m] offset 1h)", |t| {
-                (t / 1_000 - 4_980) as f64
-            }),
-            ("max_over_time(count_over_time(x[1m])[30m:1m])", |_| 4.0),
-            ("max_over_time(count_over_time(x[10m:1m])[5m:1m])", |_| 10.0),
-            ("range()", |_| 90_000.0),
-            ("step()", |_| 900.0),
-        ];
-        for (q, want) in cases {
-            let planned = plan(&crate::parser::parse(q).unwrap(), p).unwrap();
-            let mut data = SeriesData::new();
-            for sel in &planned.selectors {
-                data.insert(sel.id, vec![series(1, &[("job", "x")], samples.clone())]);
-            }
-            let points: Vec<(i64, f64)> = match evaluate(&planned, &data).unwrap() {
-                QueryValue::Matrix(m) => {
-                    assert_eq!(m.len(), 1, "{q}: one series");
-                    m[0].points.iter().map(|pt| (pt.t_ms, pt.v)).collect()
-                }
-                other => panic!("{q}: expected a matrix, got {other:?}"),
-            };
-            let expected: Vec<(i64, f64)> = times.iter().map(|&t| (t, want(t))).collect();
-            assert_eq!(points, expected, "{q}");
-        }
+        let (_, h) = at_600("increase(x[2m15s])", Some(300_000), &hists);
+        let (count, sum) = h.expect("a histogram");
+        assert!(
+            close(count, 9.0) && close(sum, 9.0),
+            "count {count}, sum {sum}"
+        );
     }
 }

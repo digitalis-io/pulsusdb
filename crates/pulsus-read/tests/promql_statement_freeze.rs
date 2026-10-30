@@ -247,8 +247,6 @@ fn render() -> String {
     };
     for (q, instant) in QUERIES {
         let params = PlanParams {
-            widen_to: None,
-            eval: None,
             start_ms: START_MS,
             end_ms: if *instant { START_MS } else { END_MS },
             step_ms: if *instant { 0 } else { STEP_MS },
