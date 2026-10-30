@@ -431,7 +431,7 @@ pub enum MetricRun<'a> {
 /// predicate, so [`super::plan::is_pushable_line_filter`] keeps it off the SQL push-
 /// down and it is evaluated here); a plain value compiles to `Literal`
 /// (`|=`/`!=`) or `Regex` (`|~`/`!~`); a `word("…", …)` alternative
-/// compiles to `Words`, each word already [`pulsus_logql::word::lower`]ed,
+/// compiles to `Words`, each word already [`pulsus_logql::word::case_key`]ed,
 /// matched by [`pulsus_logql::word::has_all_words`] (issue #757).
 #[derive(Debug, Clone)]
 enum LineMatcher {
@@ -1191,7 +1191,7 @@ fn compile_stage(
                             .map_err(|e| PipelineError::BadIpFilter(e.to_string()))?,
                     ),
                     LineMatch::Words(ws) => LineMatcher::Words(
-                        ws.iter().map(|w| pulsus_logql::word::lower(w)).collect(),
+                        ws.iter().map(|w| pulsus_logql::word::case_key(w)).collect(),
                     ),
                     LineMatch::Text(value) => match lf.op {
                         LineFilterOp::Contains | LineFilterOp::NotContains => {

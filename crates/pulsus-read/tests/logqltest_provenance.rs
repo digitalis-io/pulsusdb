@@ -684,7 +684,7 @@ fn check_d_escape_rs_surface_is_allowlisted_and_fail_closed() {
 /// renderer is read, not only in the issue trail.
 ///
 /// No index serves `ch_like_contains`'s `body LIKE` (issue #757): the
-/// body's one index is the word index on `lowerUTF8(body)`, and only
+/// body's one index is the word index on `upperUTF8(lowerUTF8(body))`, and only
 /// `word(…)` reads it. The next reader of this function is entitled to
 /// learn that from the function, and where a whole-word search goes
 /// instead. The markers `#757`, `no index` and `word(` each sit on one
@@ -2463,6 +2463,7 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub struct SlidingCover :: pub kend: i64,",
     "pub fn sliding_cover(scan_start_ns: i64, grid_start_ns: i64, end_ns: i64, step_ns: i64, range_ns: i64) -> Result<SlidingCover, BucketGridRefusal>",
     "pub(super) fn non_id_values_expr() -> CheckedFragment",
+    "pub fn case_key_sql(expr: &str) -> String",
     "fn contains_predicate(phrase: &str) -> String",
     "fn words_predicate(words: &[String]) -> String",
     "fn regex_predicate(pattern: &str) -> Result<String, PipelineError>",

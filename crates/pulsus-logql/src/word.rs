@@ -1,5 +1,5 @@
 //! The word rule of `word(…)` (issue #757): the rule of the database's
-//! `splitByNonAlpha` tokenizer over `lowerUTF8(body)`, the expression
+//! `splitByNonAlpha` tokenizer over `upperUTF8(lowerUTF8(body))`, the expression
 //! `idx_body_words` indexes.
 
 /// An ASCII letter or digit, or any byte of a non-ASCII character.
@@ -12,25 +12,27 @@ pub fn is_one_word(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(is_word_byte)
 }
 
-/// `lowerUTF8`: each character lowered on its own, with no context.
-pub fn lower(s: &str) -> String {
-    s.chars().flat_map(char::to_lowercase).collect()
-}
-
-/// Stub for plan r4: r1's lowering, until the case key lands.
+/// The case key `upperUTF8(lowerUTF8(s))` of the index and the predicate:
+/// lowered, then upper-cased, so every case form of a word, a final or
+/// medial sigma, and `ß`/`SS` key the same (issue #757). Measured equal to
+/// the server's on every scalar value and 1,508,597 context strings.
 pub fn case_key(s: &str) -> String {
-    lower(s)
+    s.to_lowercase().to_uppercase()
 }
 
-/// Whether every one of `lowered` (each already [`lower`]ed) is a word of `line`.
-pub fn has_all_words(line: &str, lowered: &[String]) -> bool {
-    let line = lower(line);
+/// Whether every one of `keyed` (each already [`case_key`]ed) is a word of
+/// `line`. No words is `false`, as `hasAllTokens(…, [])` is.
+pub fn has_all_words(line: &str, keyed: &[String]) -> bool {
+    if keyed.is_empty() {
+        return false;
+    }
+    let line = case_key(line);
     let words: std::collections::HashSet<&[u8]> = line
         .as_bytes()
         .split(|b| !is_word_byte(*b))
         .filter(|w| !w.is_empty())
         .collect();
-    lowered.iter().all(|w| words.contains(w.as_bytes()))
+    keyed.iter().all(|w| words.contains(w.as_bytes()))
 }
 
 #[cfg(test)]

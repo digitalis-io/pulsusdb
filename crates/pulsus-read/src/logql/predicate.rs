@@ -478,8 +478,9 @@ pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, Pip
 /// a token prefilter is equivalence-preserving only when the needle is
 /// token-aligned *in the data*, which the query cannot know. No index serves
 /// either form: the body's one index, `idx_body_words`, is on
-/// `lowerUTF8(body)`, and only a `word(…)` alternative reads it, as
-/// `hasAllTokens(lowerUTF8(body), [lowerUTF8('<w>'), …])` (issue #757).
+/// `upperUTF8(lowerUTF8(body))`, and only a `word(…)` alternative reads it,
+/// as `hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('<w>')),
+/// …])` (issue #757).
 ///
 /// An `or` group (M8-LQ2 `linefilter.or`) is a disjunction of the same
 /// per-alternative predicate: `((a) OR (b) …)` for positive ops,
@@ -1421,24 +1422,29 @@ pub(super) fn non_id_values_expr() -> CheckedFragment {
     }
 }
 
-/// Stub for plan r4: r1's key, until the case key lands.
+/// `upperUTF8(lowerUTF8(<expr>))`, the case key of a `word(…)` filter
+/// (issue #757): lowered, then upper-cased, so every case form of a word
+/// keys the same, the final sigma included. The one place the key's SQL is
+/// written; `schema/schema.sql`'s index expression is `case_key_sql("body")`.
 pub fn case_key_sql(expr: &str) -> String {
-    format!("lowerUTF8({expr})")
+    format!("upperUTF8(lowerUTF8({expr}))")
 }
 
 fn contains_predicate(phrase: &str) -> String {
     format!("body LIKE {}", ch_like_contains(phrase))
 }
 
-/// `hasAllTokens(lowerUTF8(body), [lowerUTF8('<w>'), …])`, the pushed
-/// `word(…)` predicate (issue #757): the expression `idx_body_words`
-/// indexes, the words lowered by the database in the order written.
+/// `hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('<w>')),
+/// …])`, the pushed `word(…)` predicate (issue #757): the expression
+/// `idx_body_words` indexes, each word keyed by the database in the order
+/// written.
 fn words_predicate(words: &[String]) -> String {
     format!(
-        "hasAllTokens(lowerUTF8(body), [{}])",
+        "hasAllTokens({}, [{}])",
+        case_key_sql("body"),
         words
             .iter()
-            .map(|w| format!("lowerUTF8({})", ch_string(w)))
+            .map(|w| case_key_sql(&ch_string(w)))
             .collect::<Vec<_>>()
             .join(", ")
     )

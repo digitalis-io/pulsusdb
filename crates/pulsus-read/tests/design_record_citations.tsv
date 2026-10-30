@@ -173,15 +173,15 @@ docs/query-to-sql.md	logql/exec.rs:2783	crates/pulsus-read/src/logql/exec.rs	278
 docs/query-to-sql.md	logql/fold.rs:543	crates/pulsus-read/src/logql/fold.rs	543		line	SelectFold	pub(in crate::logql) struct SelectFold {
 docs/query-to-sql.md	logql/params.rs:124	crates/pulsus-read/src/logql/params.rs	124		line	DEFAULT_MAX_STREAMS	pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 docs/query-to-sql.md	logql/pipeline.rs:1359	crates/pulsus-read/src/logql/pipeline.rs	1359		line	PipelineError	pub fn compile(stages: &[Stage]) -> Result<Self, PipelineError> {
-docs/query-to-sql.md	logql/predicate.rs:1417	crates/pulsus-read/src/logql/predicate.rs	1417		line	format	sql: format!(
-docs/query-to-sql.md	logql/predicate.rs:1444	crates/pulsus-read/src/logql/predicate.rs	1444		line	regex_predicate	fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
-docs/query-to-sql.md	logql/predicate.rs:2463-2470	crates/pulsus-read/src/logql/predicate.rs	2463	2470	prose	a_contains_line_filter_renders_an_escaped_like_pattern	LIKE
-docs/query-to-sql.md	logql/predicate.rs:2469	crates/pulsus-read/src/logql/predicate.rs	2469		line	test	#[test]
-docs/query-to-sql.md	logql/predicate.rs:505	crates/pulsus-read/src/logql/predicate.rs	505		line	or_matches	let core = if lf.or_matches.is_empty() {
-docs/query-to-sql.md	logql/predicate.rs:505-524	crates/pulsus-read/src/logql/predicate.rs	505	524	line	CheckedFragment	let core = if lf.or_matches.is_empty() { disjuncts .into_iter() .next() .expect("a line filter always has a head alterna
-docs/query-to-sql.md	logql/predicate.rs:526	crates/pulsus-read/src/logql/predicate.rs	526		prose	LineFilterOp	NOT
-docs/query-to-sql.md	logql/predicate.rs:597	crates/pulsus-read/src/logql/predicate.rs	597		prose	pattern_captures	pattern_captures
-docs/query-to-sql.md	logql/predicate.rs:959	crates/pulsus-read/src/logql/predicate.rs	959		line	comparison	/// range select, as a key-precise comparison would.
+docs/query-to-sql.md	logql/predicate.rs:1418	crates/pulsus-read/src/logql/predicate.rs	1418		line	format	sql: format!(
+docs/query-to-sql.md	logql/predicate.rs:1455	crates/pulsus-read/src/logql/predicate.rs	1455		line	regex_predicate	fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
+docs/query-to-sql.md	logql/predicate.rs:2474-2481	crates/pulsus-read/src/logql/predicate.rs	2474	2481	prose	a_contains_line_filter_renders_an_escaped_like_pattern	LIKE
+docs/query-to-sql.md	logql/predicate.rs:2480	crates/pulsus-read/src/logql/predicate.rs	2480		line	test	#[test]
+docs/query-to-sql.md	logql/predicate.rs:506	crates/pulsus-read/src/logql/predicate.rs	506		line	or_matches	let core = if lf.or_matches.is_empty() {
+docs/query-to-sql.md	logql/predicate.rs:506-525	crates/pulsus-read/src/logql/predicate.rs	506	525	line	CheckedFragment	let core = if lf.or_matches.is_empty() { disjuncts .into_iter() .next() .expect("a line filter always has a head alterna
+docs/query-to-sql.md	logql/predicate.rs:527	crates/pulsus-read/src/logql/predicate.rs	527		prose	LineFilterOp	NOT
+docs/query-to-sql.md	logql/predicate.rs:598	crates/pulsus-read/src/logql/predicate.rs	598		prose	pattern_captures	pattern_captures
+docs/query-to-sql.md	logql/predicate.rs:960	crates/pulsus-read/src/logql/predicate.rs	960		line	comparison	/// range select, as a key-precise comparison would.
 docs/query-to-sql.md	logql/sql.rs:424	crates/pulsus-read/src/logql/sql.rs	424		prose	json_count_columns	json_count_columns
 docs/query-to-sql.md	logql/window.rs:148	crates/pulsus-read/src/logql/window.rs	148		line	MAX_CLIENT_AGG_BUCKETS	pub const MAX_CLIENT_AGG_BUCKETS: u64 = 11_000;
 docs/query-to-sql.md	logs_api/error.rs:148-153	crates/pulsus-server/src/logs_api/error.rs	148	153	line	X_CONTENT_TYPE_OPTIONS	( status, [ (header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff"), ],
@@ -228,8 +228,8 @@ docs/query-to-sql.md	post_agg.rs:1110	crates/pulsus-read/src/logql/post_agg.rs	1
 docs/query-to-sql.md	post_agg.rs:807	crates/pulsus-read/src/logql/post_agg.rs	807		prose	select_k_range	select_k_range
 docs/query-to-sql.md	post_agg.rs:858	crates/pulsus-read/src/logql/post_agg.rs	858		prose	select_k_instant	select_k_instant
 docs/query-to-sql.md	post_agg.rs:983	crates/pulsus-read/src/logql/post_agg.rs	983		prose	approx_topk_instant	approx_topk_instant
-docs/query-to-sql.md	predicate.rs:467-482	crates/pulsus-read/src/logql/predicate.rs	467	482	prose	idx_body_words	BAD_ARGUMENTS
-docs/query-to-sql.md	predicate.rs:492	crates/pulsus-read/src/logql/predicate.rs	492		prose	CheckedFragment	line_filter
+docs/query-to-sql.md	predicate.rs:467-483	crates/pulsus-read/src/logql/predicate.rs	467	483	prose	idx_body_words	BAD_ARGUMENTS
+docs/query-to-sql.md	predicate.rs:493	crates/pulsus-read/src/logql/predicate.rs	493		prose	CheckedFragment	line_filter
 docs/query-to-sql.md	pulsus-config/src/model.rs:494	crates/pulsus-config/src/model.rs	494		line	logql_scan_budget_bytes	pub logql_scan_budget_bytes: ByteSize,
 docs/query-to-sql.md	pulsus-config/src/model.rs:643	crates/pulsus-config/src/model.rs	643		line	logql_scan_budget_bytes	logql_scan_budget_bytes: ByteSize(50u64 * 1024 * 1024 * 1024),
 docs/query-to-sql.md	pulsus-logql/src/limits.rs:96	crates/pulsus-logql/src/limits.rs	96		line	157_680_000_000_000_000	pub const MAX_QUERY_SPAN_NS: i64 = 157_680_000_000_000_000;

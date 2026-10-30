@@ -78,8 +78,8 @@ pub fn ch_string(s: &str) -> String {
 /// what makes `\%` survive the SQL parser as a LIKE escape.
 ///
 /// **No index serves it (issue #757).** `log_samples` has no index on
-/// `body`: its one text index is on `lowerUTF8(body)` and only `word(…)`
-/// reads it. `|=`, `!=`, `|~` and `!~` read every line the selector and the
+/// `body`: its one text index is on `upperUTF8(lowerUTF8(body))` and only
+/// `word(…)` reads it. `|=`, `!=`, `|~` and `!~` read every line the selector and the
 /// time range select, bounded by stage 3's `service`/`fingerprint`/
 /// `timestamp_ns` primary key. No prefilter can narrow a substring search —
 /// `hasToken` is what issue #450 removed for returning wrong rows. Scale
