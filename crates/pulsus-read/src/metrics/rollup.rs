@@ -1,10 +1,10 @@
 //! Issue #18 part B: reading the rollup levels.
 //!
-//! A range query's time range chooses a resolution and the query is
-//! evaluated at that resolution's bucket ends (issue #18 follow-up). A
-//! selector whose range and time fit a level at or below the resolution
+//! A range query is evaluated at the request's own times; its time range
+//! chooses a resolution, the widest level a selector may read (issue #18).
+//! A selector whose range and time fit a level at or below the resolution
 //! reads that level's rows as pseudo-samples, then the finer levels and
-//! raw for what the level does not cover, and the engine evaluates them
+//! raw over what the level does not cover, and the engine evaluates them
 //! unchanged (design r13 sections 2 and 5).
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,13 +12,13 @@ use std::sync::{Arc, RwLock};
 
 use pulsus_clickhouse::{ChClient, QuerySettings, Row};
 use pulsus_model::{Fingerprint, FpLiteral, STALE_NAN_BITS, Tenant};
-use pulsus_promql::{EvalGrid, PlanParams, QueryPlan, RawOverlay, RollupUse, Sample, SelectorSpec};
+use pulsus_promql::{PlanParams, RawOverlay, RollupUse, Sample, SelectorSpec};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
 use super::TenantSql;
 use super::exec::MetricQueryParams;
-use super::sample_sql::render_fingerprint_list;
+use super::sample_sql::{intervals_predicate, render_fingerprint_list};
 use crate::logql::escape::ch_string;
 
 /// One rollup level: its bucket width, the table a read names, and the
@@ -207,53 +207,21 @@ pub struct Route {
     pub use_: RollupUse,
 }
 
-/// The most points a snapped grid may hold: the server serves 11,000 step
-/// intervals, 11,001 points (`pulsus-server`'s `POINTS_CAP`).
-pub const MAX_GRID_POINTS: i128 = 11_001;
-
-/// Issue #18 follow-up, R1 and R2 (plan r16): a range query's resolution,
-/// the largest level whose switch point is at most `end − start`, and the
-/// evaluation grid `start + k × S` up to `end`, `S = res × ⌈step / res⌉`:
-/// never more points than asked. `None` for an instant query
-/// (`step == 0`), no levels, a range below the first level's switch point
-/// (issue #746), an `S` or a time outside `i64`, or more than
-/// [`MAX_GRID_POINTS`] points: the query keeps its own grid. The caller
-/// sets the grid only when [`any_routes`] on it.
-pub fn grid(p: &MetricQueryParams, levels: &Levels) -> Option<(i64, EvalGrid)> {
-    if p.step_ms <= 0 || p.end_ms < p.start_ms {
-        return None;
-    }
-    let span = i128::from(p.end_ms) - i128::from(p.start_ms);
-    let res = levels
-        .levels
-        .iter()
-        .rev()
-        .find(|l| l.res_ms > 0 && i128::from(l.from_ms) <= span)?
-        .res_ms;
-    let r = i128::from(res);
-    let step = i128::from(p.step_ms);
-    let s = r * ((step + r - 1) / r);
-    let s_ms = i64::try_from(s).ok()?;
-    let intervals = span / s;
-    if intervals + 1 > MAX_GRID_POINTS {
-        return None;
-    }
-    let last = i64::try_from(i128::from(p.start_ms) + intervals * s).ok()?;
-    Some((
-        res,
-        EvalGrid {
-            end_ms: last,
-            step_ms: s_ms,
-        },
-    ))
-}
-
 /// Issue #18: a range query's resolution, the largest level whose switch
 /// point is at most `end − start`: the widest level any selector may
 /// read. `None` for an instant query, no levels, or a range below the
 /// first switch point.
-pub fn resolution(_p: &MetricQueryParams, _levels: &Levels) -> Option<i64> {
-    None
+pub fn resolution(p: &MetricQueryParams, levels: &Levels) -> Option<i64> {
+    if p.step_ms <= 0 || p.end_ms < p.start_ms {
+        return None;
+    }
+    let span = i128::from(p.end_ms) - i128::from(p.start_ms);
+    levels
+        .levels
+        .iter()
+        .rev()
+        .find(|l| l.res_ms > 0 && i128::from(l.from_ms) <= span)
+        .map(|l| l.res_ms)
 }
 
 /// D6: for a range query's selector of use `Counter` that is `eligible`
@@ -261,22 +229,39 @@ pub fn resolution(_p: &MetricQueryParams, _levels: &Levels) -> Option<i64> {
 /// the level it then routes to. `None` when the query is instant, the
 /// selector has a level already, or no level of width at most `res` fits
 /// its time.
+///
+/// Of the levels of width at most `res` whose time fits: the largest that
+/// `⌈r / w⌉ × w` covers at least `counter_buckets` times, read over that
+/// range; else `counter_buckets` buckets of the smallest.
 pub fn round_counter_range(
-    _sel: &SelectorSpec,
-    _p: &PlanParams,
-    _levels: &Levels,
-    _res: i64,
+    sel: &SelectorSpec,
+    p: &PlanParams,
+    levels: &Levels,
+    res: i64,
 ) -> Option<i64> {
-    None
-}
-
-/// Issue #18 follow-up (r11): whether some selector of `plan`, planned on
-/// the grid `p`, reads a level of width at most `res`. Pure; decided
-/// before any fetch.
-pub fn any_routes(plan: &QueryPlan, p: &PlanParams, levels: &Levels, res: i64) -> bool {
-    plan.selectors
+    if p.step_ms <= 0
+        || sel.rollup_use != Some(RollupUse::Counter)
+        || !eligible(sel)
+        || route(sel, p, levels, res).is_some()
+    {
+        return None;
+    }
+    let r = i128::from(sel.range_ms?);
+    let buckets = i128::from(levels.counter_buckets);
+    let fit: Vec<i128> = levels
+        .levels
         .iter()
-        .any(|sel| eligible(sel) && route(sel, p, levels, res).is_some())
+        .filter(|l| l.res_ms > 0 && l.res_ms <= res && fits_time(sel, p, l.res_ms))
+        .map(|l| i128::from(l.res_ms))
+        .collect();
+    let rounded = fit
+        .iter()
+        .rev()
+        .map(|&w| (w, (r + w - 1).div_euclid(w)))
+        .find(|&(_, n)| n >= buckets)
+        .map(|(w, n)| n * w)
+        .or_else(|| fit.iter().min().map(|&w| buckets * w))?;
+    i64::try_from(rounded).ok()
 }
 
 /// Plan section 3 and issue #18 follow-up R3: the largest level of width
@@ -303,19 +288,25 @@ pub fn route(sel: &SelectorSpec, p: &PlanParams, levels: &Levels, res: i64) -> O
 /// ends on the level's bucket ends, and the range is a whole number of
 /// buckets, at least one, or `buckets` for a counter.
 fn fits(sel: &SelectorSpec, p: &PlanParams, use_: RollupUse, res: i64, buckets: i64) -> bool {
-    let time = match sel.at_ms {
-        Some(t) => (t - sel.offset_ms).rem_euclid(res) == 0,
-        None => {
-            (p.start_ms - sel.fetch.total_offset_ms).rem_euclid(res) == 0
-                && (p.step_ms == 0 || p.eval_step().rem_euclid(res) == 0)
-        }
-    };
     let range = match (sel.range_ms, use_) {
         (None, _) => true,
         (Some(r), RollupUse::Counter) => r.rem_euclid(res) == 0 && r >= buckets * res,
         (Some(r), _) => r.rem_euclid(res) == 0 && r >= res,
     };
-    time && range
+    fits_time(sel, p, res) && range
+}
+
+/// G2: every window of the selector ends on a bucket end of the level of
+/// width `res`: the `@` time less the offset, or `start` less the offset
+/// and the step, are whole numbers of buckets.
+fn fits_time(sel: &SelectorSpec, p: &PlanParams, res: i64) -> bool {
+    match sel.at_ms {
+        Some(t) => (t - sel.offset_ms).rem_euclid(res) == 0,
+        None => {
+            (p.start_ms - sel.fetch.total_offset_ms).rem_euclid(res) == 0
+                && (p.step_ms == 0 || p.step_ms.rem_euclid(res) == 0)
+        }
+    }
 }
 
 /// Plan Q5: what keeps a selector on raw whatever its step and range.
@@ -334,8 +325,9 @@ pub fn eligible(sel: &SelectorSpec) -> bool {
     sel.metric_name.is_some() && sel.name_matchers.is_empty() && !excluded(sel)
 }
 
-/// Plan section 2: one level fetch over `(lo, hi]` for one fingerprint
-/// chunk, its data rows and the run rows that overlap the interval.
+/// Plan section 2: one level fetch over the intervals `within`, each
+/// `(lo, hi]`, for one fingerprint chunk: its data rows and the run rows
+/// that overlap an interval.
 pub fn level_fetch(
     tenant: &Tenant,
     table: &str,
@@ -343,7 +335,6 @@ pub fn level_fetch(
     within: &[(i64, i64)],
     clustered: bool,
 ) -> String {
-    let (lo, hi) = hull(within).unwrap_or((0, 0));
     let shard = if clustered {
         "_shard_num"
     } else {
@@ -352,11 +343,13 @@ pub fn level_fetch(
     format!(
         "SELECT {shard} AS shard, kind, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags\n\
          FROM {table}\n\
-         WHERE (kind = 0 AND org_id = {} AND fingerprint IN ({}) AND t_end > {lo} AND t_end <= {hi})\n   \
-         OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > {lo} AND t_last < {hi})\n\
+         WHERE (kind = 0 AND org_id = {} AND fingerprint IN ({}) AND {})\n   \
+         OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND {})\n\
          ORDER BY kind, fingerprint, t_end",
         tenant.sql_literal(),
         render_fingerprint_list(fps),
+        intervals_predicate("t_end", "t_end", "<=", within),
+        intervals_predicate("t_end", "t_last", "<", within),
     )
 }
 
@@ -463,13 +456,6 @@ pub fn intersect(a: &[(i64, i64)], b: &[(i64, i64)]) -> Intervals {
         }
     }
     union(out)
-}
-
-/// The smallest interval holding every interval of `a`.
-pub fn hull(a: &[(i64, i64)]) -> Option<(i64, i64)> {
-    let lo = a.iter().map(|x| x.0).min()?;
-    let hi = a.iter().map(|x| x.1).max()?;
-    Some((lo, hi))
 }
 
 /// The most intervals one level or raw statement names.
@@ -693,8 +679,7 @@ pub fn level_window_exists(sel: &SelectorSpec, p: &PlanParams, pieces: &Interval
     if let Some(t) = sel.at_ms {
         return clear(t);
     }
-    // Issue #18 follow-up: the evaluation grid's times.
-    let (end, step) = (p.eval_end(), p.eval_step());
+    let (end, step) = (p.end_ms, p.step_ms);
     if step <= 0 || p.start_ms == end {
         return clear(p.start_ms);
     }
@@ -731,6 +716,32 @@ pub fn duration_text(ms: i64) -> String {
         }
     }
     format!("{ms}ms")
+}
+
+/// A range as PromQL writes it, the largest units first and zero units
+/// left out: `135000` → `2m15s`, `3615000` → `1h15s`, `1500` → `1s500ms`.
+/// For the range asked in explain's `rollup_route` note.
+pub fn promql_duration_text(ms: i64) -> String {
+    if ms <= 0 {
+        return format!("{ms}ms");
+    }
+    let mut left = ms;
+    let mut out = String::new();
+    for (unit, size) in [
+        ("y", 31_536_000_000),
+        ("w", 604_800_000),
+        ("d", 86_400_000),
+        ("h", 3_600_000),
+        ("m", 60_000),
+        ("s", 1_000),
+        ("ms", 1),
+    ] {
+        if left >= size {
+            out.push_str(&format!("{}{unit}", left / size));
+            left %= size;
+        }
+    }
+    out
 }
 
 /// The column a use reads, as explain names it.
@@ -773,58 +784,12 @@ mod tests {
 
     const DAY: i64 = 86_400_000;
 
-    /// The owner's table of 2026-10-26: five levels, 5 s first, and the
-    /// query range from which each is the resolution; the grid cases below
-    /// were written for it.
-    fn owners() -> Levels {
-        let rows: [(i64, u64); 5] = [
-            (5, 0),
-            (60, 3_600_000),
-            (720, 86_400_000),
-            (7200, 604_800_000),
-            (86400, 7_776_000_000),
-        ];
-        Levels {
-            levels: rows
-                .iter()
-                .map(|&(s, from_ms)| Level {
-                    res_ms: s * 1000,
-                    table: format!("metric_samples_{s}s"),
-                    from_ms,
-                })
-                .collect(),
-            shards: 1,
-            counter_buckets: 5,
-        }
-    }
-
     fn query(start: i64, end: i64, step: i64) -> MetricQueryParams {
         MetricQueryParams {
             start_ms: start,
             end_ms: end,
             step_ms: step,
         }
-    }
-
-    /// The resolution `grid` chooses, its effective step `S`, the number
-    /// of evaluation times `start + k × S` up to the grid's end, and the
-    /// last time; never more points than the request asked.
-    fn snapped(p: &MetricQueryParams, lv: &Levels) -> Option<(i64, i64, i64, i64)> {
-        let (res, g) = grid(p, lv)?;
-        let step = g.step_ms;
-        assert_eq!(step.rem_euclid(res), 0, "S is a multiple of the resolution");
-        assert!(step >= p.step_ms, "S is at least the step asked");
-        assert_eq!(
-            (i128::from(g.end_ms) - i128::from(p.start_ms)).rem_euclid(i128::from(step)),
-            0,
-            "the last time is start + k × S"
-        );
-        let count = (i128::from(g.end_ms) - i128::from(p.start_ms)) / i128::from(step) + 1;
-        assert!(
-            count <= (i128::from(p.end_ms) - i128::from(p.start_ms)) / i128::from(p.step_ms) + 1,
-            "never more points than asked"
-        );
-        Some((res, step, count as i64, g.end_ms))
     }
 
     /// The default levels, 60 s first, each the resolution from its own
@@ -995,92 +960,12 @@ mod tests {
             "three buckets, case 2"
         );
     }
-    /// **T1b (issue #18 follow-up, plan r16): the grid does not overflow**,
-    /// and a grid of more than 11,001 points, or an `S` above `i64::MAX`,
-    /// keeps the query's own.
-    #[test]
-    fn the_grid_does_not_overflow() {
-        let lv = owners();
-        assert_eq!(
-            snapped(&query(i64::MAX - 1, i64::MAX, 1), &lv),
-            Some((5_000, 5_000, 1, i64::MAX - 1)),
-            "one time, start"
-        );
-        assert_eq!(
-            snapped(&query(i64::MIN, i64::MIN + 3_600_000, 1_000), &lv).map(|g| (g.0, g.2)),
-            Some((60_000, 61))
-        );
-        assert_eq!(
-            snapped(&query(BASE, BASE + 11_000 * DAY, DAY), &lv).map(|g| (g.0, g.2)),
-            Some((86_400_000, 11_001))
-        );
-        assert_eq!(grid(&query(BASE, BASE + 11_001 * DAY, DAY), &lv), None);
-        assert_eq!(grid(&query(-1, 1, i64::MAX), &lv), None);
-        assert_eq!(grid(&query(i64::MIN, i64::MAX, 1_000), &lv), None);
-    }
-
-    /// The request's plan parameters with the grid `g` set.
-    fn on(p: &MetricQueryParams, g: EvalGrid, experimental: bool) -> PlanParams {
-        PlanParams {
-            eval: Some(g),
-            ..p.plan_params(experimental, DEFAULT_LOOKBACK_MS)
-        }
-    }
-
-    /// **T1d (issue #18 follow-up, r11): `any_routes`.** On the 7-day
-    /// grid of 2 h, a query routes when one of its selectors does.
-    #[test]
-    fn any_routes_is_one_routed_selector() {
-        let lv = owners();
-        let week = query(BASE, BASE + 7 * DAY, 5 * MIN);
-        let (res, g) = grid(&week, &lv).expect("a grid");
-        let pp = on(&week, g, false);
-        let routes =
-            |q: &str, lv: &Levels| any_routes(&plan(&parse(q).unwrap(), pp).unwrap(), &pp, lv, res);
-        assert!(routes("rate(x[5m])", &lv), "rate");
-        assert!(!routes("irate(x[5m])", &lv), "irate");
-        assert!(routes("rate(x[5m]) + irate(x[5m])", &lv), "one of two");
-        assert!(!routes("rate(x[5m])", &levels(&[])), "no levels");
-    }
-
-    /// **T15 (issue #18 follow-up, plan r16): coverage for `exactness`
-    /// reads the evaluation grid.** The request is `start = 0`,
-    /// `end = 3,600 s`, `step = 300 s`; the grid is 720 s up to 2,880 s.
-    #[test]
-    fn coverage_reads_the_evaluation_grid() {
-        let p = PlanParams {
-            eval: Some(EvalGrid {
-                end_ms: 2_880_000,
-                step_ms: 720_000,
-            }),
-            ..query(0, 3_600_000, 300_000).plan_params(false, DEFAULT_LOOKBACK_MS)
-        };
-        let sel = &selectors("max_over_time(x[1m])", &p)[0];
-        // A piece just before every request time: the window (660 s,
-        // 720 s] of the grid holds none.
-        let at_request: Intervals = (0..=12).map(|k| (k * 300_000 - 1, k * 300_000)).collect();
-        assert!(
-            level_window_exists(sel, &p, &at_request),
-            "a grid window touches no piece"
-        );
-        // Every grid window touched; none after the grid's end.
-        let at_grid: Intervals = (0..=4)
-            .map(|k| (k * 720_000 - 60_000, k * 720_000))
-            .collect();
-        assert!(
-            !level_window_exists(sel, &p, &at_grid),
-            "every grid window touches a piece"
-        );
-    }
-
     fn all() -> Levels {
         levels(&[60, 720, 7200, 86400])
     }
 
     fn params(start: i64, step: i64, experimental: bool) -> PlanParams {
         PlanParams {
-            widen_to: None,
-            eval: None,
             start_ms: start,
             end_ms: start + 86_400_000,
             step_ms: step,
@@ -1213,8 +1098,6 @@ mod tests {
         }
         // An instant query needs only the start.
         let instant = PlanParams {
-            widen_to: None,
-            eval: None,
             start_ms: BASE + 12 * MIN,
             end_ms: BASE + 12 * MIN,
             step_ms: 0,
@@ -1619,8 +1502,6 @@ mod tests {
             intersect(&[(10, 300)], &[(0, 50), (80, 200)]),
             vec![(10, 50), (80, 200)]
         );
-        assert_eq!(hull(&[(10, 20), (30, 40)]), Some((10, 40)));
-        assert_eq!(hull(&[]), None);
     }
 
     fn no_tenant() -> Tenant {
@@ -1693,6 +1574,17 @@ mod tests {
             "the case is a histogram-stats selector"
         );
         assert!(!eligible(&stats), "histogram_stats");
+    }
+
+    /// The range asked, as explain's route note names it.
+    #[test]
+    fn promql_duration_text_is_the_written_form() {
+        assert_eq!(promql_duration_text(135_000), "2m15s");
+        assert_eq!(promql_duration_text(75_000), "1m15s");
+        assert_eq!(promql_duration_text(3_615_000), "1h15s");
+        assert_eq!(promql_duration_text(2_880_001), "48m1ms");
+        assert_eq!(promql_duration_text(300_000), "5m");
+        assert_eq!(promql_duration_text(8 * DAY), "1w1d");
     }
 
     /// The `runtimeinfo` form of a level.

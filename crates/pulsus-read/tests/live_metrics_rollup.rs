@@ -2648,6 +2648,10 @@ async fn finer_levels_and_raw_read_only_what_is_not_covered() {
     built.finish().await;
 }
 
+/// One row of the measured table of rounded ranges: the range asked, the
+/// range read, the level, the step, the span, and the p99 per counter kind.
+type RoundedCase = (&'static str, &'static str, i64, i64, i64, [f64; 4]);
+
 /// **RR (issue #18): a rounded range is within its distance.** Corpus D
 /// over eight days at the default levels. Each of the six rounded cases of
 /// the plan's measured table, `rate` and `increase` on each counter kind,
@@ -2660,7 +2664,7 @@ async fn a_rounded_range_is_within_its_distance() {
     let end = day0 + 8 * DAY;
     let built = corpus_d(DB_RR.name(), DEFAULTS, day0, 0..8).await;
     // (asked, read, level, step, span, [normal, fast, stop, sparse]).
-    let rows: [(&str, &str, i64, i64, i64, [f64; 4]); 6] = [
+    let rows: [RoundedCase; 6] = [
         (
             "1m15s",
             "5m",

@@ -49,7 +49,7 @@ Each part was its own plan, review, branch and pull request inside issue #18.
 | A (#742) | `PULSUS_ROLLUP_LEVELS` and its validation in `schema/schema.sh` and `pulsus_schema::parse_rollup_levels`; the level template (`schema/schema.sql:989-1120`), its prefixes, run rows and derived timers; `metric_landing`'s block key; the removal of the earlier design's `metric_rollup` table, its plan table, their views and wrapper, the settle constant and the window algebra's reset cap |
 | B (#744) | discovery, eligibility and the level choice; the one-statement level fetch and its coverage; the finer levels and raw after a level; the points of `reading.md` §1 and the raw overlay; `rollupLevels` in `runtimeinfo`; the explain stages and `exactness`; `docs/api.md` §3.6. In part A's first-level statement: the predecessor of D14, and `flags` with the last non-stale sample of D13 |
 
-The window algebra of issue #18 part 3 (#740) stays as the raw functions' arithmetic (`summarize_counter`, `crates/pulsus-promql/src/eval/functions.rs:187`), and the raw fetch's value-bits order (`reinterpretAsUInt64`, `crates/pulsus-read/src/metrics/sample_sql.rs:99`), which D12 builds the first level in.
+The window algebra of issue #18 part 3 (#740) stays as the raw functions' arithmetic (`summarize_counter`, `crates/pulsus-promql/src/eval/functions.rs:187`), and the raw fetch's value-bits order (`reinterpretAsUInt64`, `crates/pulsus-read/src/metrics/sample_sql.rs:117`), which D12 builds the first level in.
 
 ## 3. Rejected alternatives
 

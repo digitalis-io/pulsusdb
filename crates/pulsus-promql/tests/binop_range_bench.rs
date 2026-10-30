@@ -267,8 +267,6 @@ fn build_count_values() -> (QueryPlan, SeriesData) {
 
 fn range_params() -> PlanParams {
     PlanParams {
-        widen_to: None,
-        eval: None,
         start_ms: 0,
         end_ms: (STEPS - 1) * STEP_MS,
         step_ms: STEP_MS,

@@ -65,6 +65,24 @@ pub fn window_predicate(lower_excl_ms: i64, upper_incl_ms: i64) -> String {
     format!("unix_milli > {lower_excl_ms} AND unix_milli <= {upper_incl_ms}")
 }
 
+/// `lo_col > a AND hi_col <op> b` for one interval; for more,
+/// `((lo_col > a1 AND hi_col <op> b1) OR (lo_col > a2 AND hi_col <op> b2))`;
+/// `0` for none (issue #18).
+pub fn intervals_predicate(lo_col: &str, hi_col: &str, op: &str, within: &[(i64, i64)]) -> String {
+    let one = |&(a, b): &(i64, i64)| format!("{lo_col} > {a} AND {hi_col} {op} {b}");
+    match within {
+        [] => "0".to_string(),
+        [x] => one(x),
+        many => format!(
+            "({})",
+            many.iter()
+                .map(|x| format!("({})", one(x)))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        ),
+    }
+}
+
 /// `fingerprint IN (toUInt128('101'), toUInt128('205'))` — the resolved
 /// fingerprint set.
 pub fn fingerprints_predicate(fps: &[FpLiteral]) -> String {
@@ -108,8 +126,15 @@ pub fn sample_fetch_within(
     fps: &[FpLiteral],
     within: &[(i64, i64)],
 ) -> String {
-    let (lo, hi) = super::rollup::hull(within).unwrap_or((0, 0));
-    sample_fetch(tenant, table, fps, lo, hi)
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        intervals_predicate("unix_milli", "unix_milli", "<=", within)
+    );
+    let fps = fingerprints_predicate(fps);
+    format!(
+        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
+    )
 }
 
 /// The over-cap / `SqlFallback` variant: `subquery` (#30's

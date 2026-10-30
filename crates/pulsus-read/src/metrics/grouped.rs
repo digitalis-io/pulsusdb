@@ -844,10 +844,8 @@ impl PushedRangeFn {
 /// So the check below is the numerator the statement evaluates, in the
 /// same association order, plus the `leadInFrame` default.
 fn grid_of(params: &PlanParams) -> Option<Grid> {
-    // Issue #18 follow-up: the evaluation grid, which a rollup level may
-    // space wider than the request's step; `step_ms == 0` stays the
-    // request's instant test.
-    let (end_ms, eval_step) = (params.eval_end(), params.eval_step());
+    // `step_ms == 0` stays the request's instant test.
+    let (end_ms, eval_step) = (params.end_ms, params.step_ms);
     if params.step_ms < 0 || end_ms < params.start_ms {
         return None;
     }
@@ -1225,8 +1223,6 @@ mod tests {
 
     fn params(start_ms: i64, end_ms: i64, step_ms: i64) -> PlanParams {
         PlanParams {
-            widen_to: None,
-            eval: None,
             start_ms,
             end_ms,
             step_ms,

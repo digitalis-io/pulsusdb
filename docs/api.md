@@ -963,36 +963,35 @@ A 2 MiB `DefaultBodyLimit` (axum's default; nothing in this workspace calls `Def
 
 The database holds the metric samples at full resolution and, beside them, one rollup table per level of `PULSUS_ROLLUP_LEVELS` (`60,720,7200,86400` seconds by default; [docs/configuration.md §7](configuration.md#7-retention-schemaschemash)). Each level keeps one row per series and bucket: the last value and its time, the minimum, maximum, sum and count of the values, and the counter increase within the bucket. The server reads the list of levels from the database every 60 s; `/api/v1/status/runtimeinfo` reports it as `rollupLevels`.
 
-**When a level is used.** A range query is evaluated at the resolution its time range `end − start` selects: the largest level whose switch point is at most that range. A range shorter than the smallest level's switch point reads raw on its own grid. The switch points are set when the schema is built (`PULSUS_ROLLUP_RANGES`, [docs/configuration.md §7](configuration.md#7-retention-schemaschemash)). With the defaults:
+**When a level is used.** A range query is answered at `start + k × step` up to `end`, the times the request asks, whichever level is read. Its time range `end − start` sets the largest level a selector may read: the largest level whose switch point is at most that range; below the smallest level's switch point every selector reads raw. The switch points are set when the schema is built (`PULSUS_ROLLUP_RANGES`, [docs/configuration.md §7](configuration.md#7-retention-schemaschemash)). With the defaults:
 
-| Range (end − start) | Resolution | Points per series |
-|---|---|---:|
-| 5 min / 15 min / 30 min | raw | at the step asked |
-| 1 h / 3 h / 6 h / 12 h | 60 s | 60 / 180 / 360 / 720 |
-| 24 h / 2 days | 720 s | 120 / 240 |
-| 7 days / 30 days | 7200 s | 84 / 360 |
-| 90 days / 6 months / 1 year | 86400 s | 90 / 182 / 365 |
+| Range (end − start) | Largest level read |
+|---|---|
+| under 1 h | raw |
+| 1 h to under 24 h | 60 s |
+| 24 h to under 7 days | 720 s |
+| 7 days to under 90 days | 7200 s |
+| 90 days and over | 86400 s |
 
-The query is evaluated at `start + k × S` up to `end`, with the effective step `S = res × ⌈step / res⌉`: the resolution, or the step asked rounded up to a multiple of it, so never more points than asked. The first point is `start` itself, and there are `⌊(end − start) / S⌋ + 1` points: with a step at most the resolution, one more than the table above when the range is a whole number of steps (7 days: 85); 24 h at `step=15m` gives `S` = 24 min and 61. The whole query is evaluated on these times, whatever its functions; `start()`, `end()`, `range()`, `step()`, `@ start()` and `@ end()` keep the request's values. A query no selector of which can read a level on these times (every function raw-only, a guard, no levels, a range below the first switch point) keeps its own `start + k × step` and reads raw. So does a grid of more than 11,001 points, or with `S` or a time outside the 64-bit millisecond range. An instant query keeps its time, and its selectors read the smallest level or raw.
+Each selector reads the largest level, up to that one, whose buckets end at every edge of its windows; for a panel whose `start` is a whole number of steps:
 
-When the step is stretched to `S`, every range shorter than `S` is read as `S`, so each point covers the time since the one before: `rate(x[5m])` on a 7-day panel becomes `rate(x[2h])` on its 2-hour points, and may read a coarser level because of it. Offsets still move the window; `@` selectors and `@` subqueries, and the ranges inside a subquery, are unchanged; `range()` and `step()` keep the request's values. Explain's `rollup_grid` note adds `; range 5m widened to 2h` for each range that widened.
-
-A selector reads a level only where each time, less its `offset`, is one of the level's bucket ends, so a `start` off the level's boundary reads a finer level for the same points. For a panel whose `start` is aligned to its step:
-
-| panel | selector | resolution | `S` | points | level read |
-|---|---|---|---|---:|---|
-| 10 min, `step=15s` | `rate(x[5m])` | — | — | 41 | raw, on the request's grid: 10 min is below 1 h |
-| 7 days, `step=5m`, `start` on a 2 h boundary | `rate(x[10h])` | 7200 s | 2 h | 85 | 7200 s |
-| 7 days, `step=5m`, `start` on a 5 min boundary only | `rate(x[10h])` | 7200 s | 2 h | 85 | 60 s: the largest width dividing a 5-minute boundary |
-| 7 days, `step=1d` | `max_over_time(x[1d])` | 7200 s | 1 d | 8 | the largest width dividing `start`, at most 7200 s |
-| 24 h, `step=15m` | `rate(x[1h])` | 720 s | 24 min | 61 | 720 s on a 12 min boundary, else 60 s |
-| 7 days, `step=5m` | `irate(x[5m])` | — | — | 2,017 | raw, on the request's grid |
+| panel | selector | level read |
+|---|---|---|
+| 1 h, `step=15s` | `x` | raw: 15 s is not whole minutes |
+| 24 h, `step=2m` | `x`, `max_over_time(x[10m])` | 60 s |
+| 24 h, `step=2m` | `rate(x[2m15s])` | 60 s, read as `rate(x[5m])` |
+| 30 days, `step=1h` | `rate(x[1h0m15s])` | 720 s, read as `rate(x[1h12m])` |
+| 24 h, `step=2m` | `rate(x[5m])` | 60 s |
+| 7 days, `step=10m` | `x` | 60 s: 10 minutes is not whole 12-minute buckets |
+| 7 days, `step=2h`, `start` on 2 h | `max_over_time(x[2h])` | 7200 s |
+| 30 days, `step=1h` | `x`, `rate(x[1h])` | 720 s |
 
 Each selector reads the largest level of width at most the resolution that meets all of these; if none does, it reads raw samples, with the same answer as before rollups:
 
 - the function reading it is one of: an instant selector, `last_over_time`, `timestamp`, `present_over_time`, `absent_over_time`, `max_over_time`, `min_over_time`, `sum_over_time`, `avg_over_time`, `rate`, `increase`; every other function reads raw samples;
-- range: a range function's range is a whole number of the level's buckets, at least `PULSUS_ROLLUP_COUNTER_BUCKETS` of them (5 by default) for `rate` and `increase` and at least one for the others, so on a 7-day panel at `step=5m` with `start` on a 2-hour boundary, `rate(x[5m])` is read as `rate(x[2h])` on its 85 two-hour points and reads the 12 m level: 2 hours is ten 12-minute buckets, which meets the minimum of five, but only one 2-hour bucket;
-- time: each window's end, the evaluation time (or the `@` time) minus the selector's `offset`, is a bucket end of the level, so `x offset 90s` on a 7-day query reads raw: its window ends fall 30 s past a minute;
+- range: a range function's range is a whole number of the level's buckets, at least `PULSUS_ROLLUP_COUNTER_BUCKETS` of them (5 by default) for `rate` and `increase` and at least one for the others, so `rate(x[1h])` at a 1 h step on 30 days reads the 720 s level, five 12-minute buckets, and `rate(x[5m])` reads the 60 s level;
+- rounding: in a range query, a `rate` or `increase` whose range fits no level is read with its range rounded up, on the largest level whose time fits and that the rounded range covers at least five times: `⌈range / width⌉ × width`. If the rounded range is under five buckets of every level whose time fits, it is read as five buckets of the finest of them. So `rate(x[2m15s])` at `step=2m` reads `rate(x[5m])` from the 60 s level, and `rate(x[1h0m15s])` at `step=1h` reads `rate(x[1h12m])` from the 720 s level. `increase` is scaled back to the range asked. A range that already fits a level, an instant query, and a selector whose time fits no level are not rounded. Explain's `rollup_route` note adds `(asked 2m15s)`.
+- time: each window's end, the evaluation time (or the `@` time) minus the selector's `offset`, is a bucket end of the level, so `start − offset` and the step are whole numbers of its buckets; `x offset 90s` reads raw: its window ends fall 30 s past a minute;
 - kind: the selector is not inside a subquery, is not `anchored` or `smoothed`, is not the metadata selector of `info()`, is not under `histogram_count`, `histogram_sum` or `histogram_avg`, names its metric, and carries no `__name__` matcher beside that name (`=~`, `!~`, `!=`, or a second `=`).
 
 How a selector's series were found does not matter: a selector the label cache cannot answer reads its series and their labels by a statement first, then the levels. Native-histogram samples are always read raw, beside the level's rows for a metric's float series.
@@ -1021,7 +1020,20 @@ The first group, `max_over_time` and `min_over_time` answer exactly as raw. `sum
 
 A window that holds the stop of a counter is about half off at the coarse levels; that is what the stopping counters' figures record. For a counter that stopped or went stale within the newest window, a `rate` or `increase` answered from the 12 m or a coarser level can differ from raw by up to about 4 % (measured 3.75 %) at steps just after the level's newest built bucket; counters that keep counting are unaffected. `avg_over_time` is further off for series whose samples sit on the edges of the buckets, where jitter moves them between buckets and the number of samples per bucket varies: with every sample on an edge, the 99th percentile measured 0.358 at 1 m, 0.595 at 12 m, 0.0557 at 2 h and 0.0246 at 1 d.
 
-At a level under 12 minutes, a `rate` or `increase` window that reaches into time no level covers is computed from the raw samples, exactly as without rollups, native-histogram samples included.
+A rounded range, measured the same way, against raw at the range asked:
+
+| range asked → read, level, step | counters | counters that reset every second sample | counters that stop | counters missing 30 % of their scrapes |
+|---|---|---|---|---|
+| `1m15s` → `5m`, 60 s, `step=1m` | 0.0649 | 0.00251 | 0.247 | 0.667 |
+| `2m15s` → `5m`, 60 s, `step=2m` | 0.0705 | 0.000837 | 0.0723 | 0.167 |
+| `5m15s` → `6m`, 60 s, `step=5m` | 1e-12 | 1e-12 | 1e-12 | 0.0628 |
+| `10m15s` → `11m`, 60 s, `step=10m` | 1e-12 | 1e-12 | 0.0235 | 0.0308 |
+| `1h0m15s` → `1h12m`, 720 s, `step=1h` | 0.00411 | 0.00334 | 1.44 | 0.00901 |
+| `2h0m15s` → `2h12m`, 720 s, `step=2h` | 0.00207 | 0.00181 | 1.69 | 0.00449 |
+
+The longer window is most of the distance under five buckets: a counter whose rate moves within the window reads further off than these figures, which come from counters rising at a steady rate. Measured on host counters scraped every 15 s, with raw read on both sides, `2m15s → 5m` gave a p99 of 1.74 (median 0.014) for CPU seconds, and `1h0m15s → 1h12m` a p99 of 0.394 (median 0.0022).
+
+At a level under 12 minutes, a `rate` or `increase` window that reaches into time no level covers is computed from the raw samples, native-histogram samples included, exactly as without rollups for the range it is read with. A rounded range stays rounded there.
 
 From the 12 m level and coarser, a `rate` or `increase` window holding only one sample of a counter has a value where raw has none, when a level row serves that sample and its value is a number: the row also gives a point at its bucket's start, valued before the row's increase, and the two points are extrapolated as any window is. For example, `increase(x[1h])` at a 12 m step, with the window's one sample, 1030, at its end and the sample before the window 1000, reads 45 (`rate` 0.0125); with no rise it reads 0. A single sample read from raw because no level covers its time, or a single NaN, has no value, as raw. A step between two samples more than 24 hours apart is not counted by any level: a counter sampled at 23:59:30 and next at 00:00:00 a day later, with nothing between, reads `increase(x[5d])` 0 from the 1 d level at that midnight, where raw reads 45.
 
@@ -1040,7 +1052,7 @@ From the 12 m level and coarser, a `rate` or `increase` window holding only one 
 
 Each level but the last answers ranges shorter than the next level's switch point, and `schema/schema.sh` refuses a retention shorter than ⌈that switch point ÷ 86400⌉ + 1 days, so a range that ends now and selects a level finds every day it touches. The last level answers every range from its switch point up; kept `L` days, it holds the UTC days that ended after `now − L` days, so a longer range returns those days only, reaching back between `L` and `L + 1` days (one day more until a TTL merge removes an expired day). A range that ends in the past reaches further back than its length and reads what the selected level kept.
 
-**Explain.** With `X-Pulsus-Explain: 1`, a range query answered on the changed grid has a first stage `rollup_grid`, with no statement, noted `resolution 2h, step 2h (asked 5m), 85 points, <first t> to <last t>; range 5m widened to 2h` for that panel; a query answered on its own grid has none; a routed selector whose series the label cache could not answer has a stage `rollup_series` with the statement that reads its series and labels. A routed selector has a stage `rollup_route` naming the level's table, the function's use, the step and the range, and one stage `rollup_piece` per interval served, in time order, each with its statement and a note naming the table and column, or `raw`, and the interval (`metric_samples_720s.max served (lo, hi]`, `raw (lo, hi]`). `exactness` is `"rollup"` when a level served part of a selector; a route that read only raw samples, or only native histograms, is `"raw-exact"`.
+**Explain.** With `X-Pulsus-Explain: 1`, a routed selector whose series the label cache could not answer has a stage `rollup_series` with the statement that reads its series and labels. A routed selector has a stage `rollup_route` naming the level's table, the function's use, the step and the range, and one stage `rollup_piece` per interval served, in time order, each with its statement and a note naming the table and column, or `raw`, and the interval (`metric_samples_720s.max served (lo, hi]`, `raw (lo, hi]`). `exactness` is `"rollup"` when a level served part of a selector, or when a selector's range was rounded (rounding, above); a route that read only raw samples at the range asked, or only native histograms, is `"raw-exact"`.
 
 ---
 

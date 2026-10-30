@@ -277,8 +277,6 @@ impl MetricQueryParams {
     /// hermetically).
     pub fn plan_params(&self, experimental_functions: bool, lookback_ms: i64) -> PlanParams {
         PlanParams {
-            widen_to: None,
-            eval: None,
             start_ms: self.start_ms,
             end_ms: self.end_ms,
             step_ms: self.step_ms,
@@ -693,70 +691,36 @@ impl MetricsEngine {
         p: &MetricQueryParams,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<(QueryResult, pulsus_promql::Annotations), ReadError> {
-        // Issue #18 follow-up (r11): with rollup levels, a range query is
-        // evaluated at the multiples of `S`, the resolution its time range
-        // selects rounded up to the step asked, when some selector reads a
-        // level on that grid (R1, R2). Otherwise it is answered on its own
-        // grid with routing off. An instant query (`step == 0`) keeps its
-        // time and routes at the smallest level (R5).
         let levels = self
             .rollup_levels
             .as_ref()
             .and_then(|slot| slot.get())
             .filter(|l| !l.levels.is_empty());
-        let mut routing: Option<(std::sync::Arc<super::rollup::Levels>, i64)> = None;
-        let mut changed: Option<(pulsus_promql::PlanParams, pulsus_promql::QueryPlan)> = None;
-        if let Some(levels) = levels {
-            if p.step_ms == 0 {
-                let smallest = levels.levels[0].res_ms;
-                routing = Some((levels, smallest));
-            } else if let Some((res, grid)) = super::rollup::grid(p, &levels) {
-                // Only the evaluation times move: the request's start, end
-                // and step stay what `start()`, `end()`, `range()`,
-                // `step()` and `@ start()`/`@ end()` read (plan r16).
-                let request = p.plan_params(self.config.experimental_functions, self.lookback_ms);
-                if let Some((pp, candidate)) = changed_grid(expr, request, grid, &levels, res) {
-                    if let Some(e) = explain.as_mut() {
-                        let points = (grid.end_ms - p.start_ms) / grid.step_ms + 1;
-                        let widened: String = candidate
-                            .widened_ranges()
-                            .into_iter()
-                            .map(|(written, read)| {
-                                format!(
-                                    "; range {} widened to {}",
-                                    super::rollup::duration_text(written),
-                                    super::rollup::duration_text(read)
-                                )
-                            })
-                            .collect();
-                        e.push(
-                            "rollup_grid",
-                            String::new(),
-                            Some(format!(
-                                "resolution {}, step {} (asked {}), {points} points, {} to {}{widened}",
-                                super::rollup::duration_text(res),
-                                super::rollup::duration_text(grid.step_ms),
-                                super::rollup::duration_text(p.step_ms),
-                                p.start_ms.div_euclid(1000),
-                                grid.end_ms.div_euclid(1000),
-                            )),
-                        );
-                    }
-                    changed = Some((pp, candidate));
+        // Issue #18: a range query keeps the request's grid. Its range picks
+        // the widest level a selector may read; each selector reads the
+        // widest level at most that whose buckets end at its window edges
+        // (`rollup::route`). An instant query routes at the smallest level.
+        let routing: Option<(std::sync::Arc<super::rollup::Levels>, i64)> =
+            levels.and_then(|levels| {
+                let res = if p.step_ms == 0 {
+                    Some(levels.levels[0].res_ms)
+                } else {
+                    super::rollup::resolution(p, &levels)
+                };
+                res.map(|res| (levels, res))
+            });
+        let plan_params = p.plan_params(self.config.experimental_functions, self.lookback_ms);
+        let mut plan = pulsus_promql::plan(expr, plan_params)?;
+        // D6: before the pushdown verdicts and the fetch windows, which read
+        // `range_ms`. `written_range_ms` keeps the range asked.
+        if let Some((levels, res)) = routing.as_ref() {
+            for sel in &mut plan.selectors {
+                if let Some(r) = super::rollup::round_counter_range(sel, &plan_params, levels, *res)
+                {
+                    sel.range_ms = Some(r);
                 }
-                // When nothing routes on the grid, nothing routes on the
-                // request's either: both start at `start` and `S` is a
-                // multiple of every width that divides the step.
-                routing = Some((levels, res));
             }
         }
-        let (plan_params, plan) = match changed {
-            Some(x) => x,
-            None => {
-                let pp = p.plan_params(self.config.experimental_functions, self.lookback_ms);
-                (pp, pulsus_promql::plan(expr, pp)?)
-            }
-        };
 
         // Issue #33 architect adjudication (superseding #31's ratified
         // zero-ClickHouse `count`/`group` AC and #40's instant-only gate on
@@ -1195,7 +1159,9 @@ impl MetricsEngine {
                 for (sql, note) in trace.stages {
                     e.push("rollup_piece", sql, Some(note));
                 }
-                e.rollup |= trace.served_from_level;
+                // D8: a rounded range answers a `rate` over the range read,
+                // not the range asked.
+                e.rollup |= trace.served_from_level || sel.written_range_ms != sel.range_ms;
             }
             data.insert(sel.id, series);
         }
@@ -2141,9 +2107,14 @@ impl MetricsEngine {
                     Some("the series and their labels, read before the levels".to_string()),
                 );
             }
-            let range = sel
+            let mut range = sel
                 .range_ms
                 .map_or_else(|| "none".to_string(), super::rollup::duration_text);
+            if let Some(w) = sel.written_range_ms
+                && sel.written_range_ms != sel.range_ms
+            {
+                range = format!("{range} (asked {})", super::rollup::promql_duration_text(w));
+            }
             e.push(
                 "rollup_route",
                 String::new(),
@@ -2151,7 +2122,7 @@ impl MetricsEngine {
                     "{}, use {:?}, step {}, range {range}",
                     route.table,
                     route.use_,
-                    super::rollup::duration_text(p.eval_step())
+                    super::rollup::duration_text(p.step_ms)
                 )),
             );
             if let Some(first) = hist_sqls.first() {
@@ -2317,7 +2288,8 @@ impl MetricsEngine {
 
     /// Issue #18 part B: one fingerprint chunk of a routed selector. The
     /// chosen level, then each finer level from coarsest to finest, then
-    /// raw, each over the hull of what is still not covered; each keeps
+    /// raw, each over the intervals still not covered, at most
+    /// [`super::rollup::MAX_STATEMENT_INTERVALS`] to a statement; each keeps
     /// only what falls in its own coverage of that remainder (plan section
     /// 4).
     async fn rollup_chunk(
@@ -2330,8 +2302,8 @@ impl MetricsEngine {
         budget: &SampleBudget,
     ) -> Result<RollupChunk, ReadError> {
         use super::rollup::{
-            RunRow, Tagged, assemble, column_of, contains, coverage, hull, intersect, level_fetch,
-            level_window_exists, overlaid, subtract, widen,
+            MAX_STATEMENT_INTERVALS, RunRow, Tagged, assemble, column_of, contains, coverage,
+            intersect, level_fetch, level_window_exists, overlaid, subtract, widen,
         };
         let use_ = plan.route.use_;
         let over = overlaid(use_, plan.route.res_ms);
@@ -2340,15 +2312,18 @@ impl MetricsEngine {
             std::collections::BTreeMap::new();
         let mut stages: Vec<(i64, String, String)> = Vec::new();
         for level in plan.levels.levels[..=plan.route.level].iter().rev() {
-            let Some((a, b)) = hull(&todo) else { break };
-            let sql = level_fetch(
-                tenant,
-                &level.table,
-                fps,
-                &[(a, b)],
-                self.config.distributed,
-            );
-            let rows = self.level_rows(sql.clone(), budget).await?;
+            if todo.is_empty() {
+                break;
+            }
+            // Issue #18: each statement names its intervals, never their
+            // hull, so it returns only rows inside what is still needed.
+            let mut rows = Vec::new();
+            let mut sqls = Vec::new();
+            for ask in todo.chunks(MAX_STATEMENT_INTERVALS) {
+                let sql = level_fetch(tenant, &level.table, fps, ask, self.config.distributed);
+                rows.extend(self.level_rows(sql.clone(), budget).await?);
+                sqls.push((ask.to_vec(), sql));
+            }
             let runs: Vec<RunRow> = rows
                 .iter()
                 .filter(|r| r.kind == 1)
@@ -2370,15 +2345,22 @@ impl MetricsEngine {
                         });
                 }
             }
-            if served.is_empty() {
-                stages.push((a, sql.clone(), format!("{} served nothing", level.table)));
-            }
-            for (x, y) in &served {
-                stages.push((
-                    *x,
-                    sql.clone(),
-                    format!("{}.{} served ({x}, {y}]", level.table, column_of(use_)),
-                ));
+            for (ask, sql) in &sqls {
+                let mine = intersect(&served, ask);
+                if mine.is_empty() {
+                    stages.push((
+                        ask[0].0,
+                        sql.clone(),
+                        format!("{} served nothing", level.table),
+                    ));
+                }
+                for (x, y) in &mine {
+                    stages.push((
+                        *x,
+                        sql.clone(),
+                        format!("{}.{} served ({x}, {y}]", level.table, column_of(use_)),
+                    ));
+                }
             }
             todo = subtract(&todo, &covered);
         }
@@ -2389,8 +2371,8 @@ impl MetricsEngine {
         } else {
             todo.clone()
         };
-        if let Some((a, b)) = hull(&read) {
-            let sql = sample_sql::sample_fetch(tenant, &self.config.samples_table, fps, a, b);
+        for ask in read.chunks(MAX_STATEMENT_INTERVALS) {
+            let sql = sample_sql::sample_fetch_within(tenant, &self.config.samples_table, fps, ask);
             let raw: Vec<SampleRow> = self.fetch_sample_rows(sql.clone(), budget).await?;
             for r in raw {
                 if contains(&read, r.unix_milli) {
@@ -2399,8 +2381,12 @@ impl MetricsEngine {
                     ));
                 }
             }
+            // Each uncovered interval's stage carries the statement of the
+            // chunk that holds it.
             for (x, y) in &todo {
-                stages.push((*x, sql.clone(), format!("raw ({x}, {y}]")));
+                if ask.iter().any(|&(a, b)| a <= *x && *y <= b) {
+                    stages.push((*x, sql.clone(), format!("raw ({x}, {y}]")));
+                }
             }
         }
         let mut rows = Vec::new();
@@ -3709,28 +3695,6 @@ enum SelectorFetchPlan {
     /// series read from the levels and raw (plan section 4), its
     /// histogram series by today's histogram statements.
     Rollup(Box<RollupFetch>),
-}
-
-/// Issue #18 follow-up (plans r16, r17): the request's plan parameters
-/// with the evaluation grid set, and the query planned on them, when a
-/// selector routes there. `None` keeps the request's grid: nothing
-/// routes, or the plan fails on the grid.
-fn changed_grid(
-    expr: &Expr,
-    request: pulsus_promql::PlanParams,
-    grid: pulsus_promql::EvalGrid,
-    levels: &super::rollup::Levels,
-    res: i64,
-) -> Option<(pulsus_promql::PlanParams, pulsus_promql::QueryPlan)> {
-    // Plan r17: on a stretched grid every range shorter than `S` is read
-    // as `S`.
-    let pp = pulsus_promql::PlanParams {
-        eval: Some(grid),
-        widen_to: (grid.step_ms > request.step_ms).then_some(grid.step_ms),
-        ..request
-    };
-    let candidate = pulsus_promql::plan(expr, pp).ok()?;
-    super::rollup::any_routes(&candidate, &pp, levels, res).then_some((pp, candidate))
 }
 
 /// Issue #18 follow-up, R4: where routing is decided. A selector that is
@@ -5383,8 +5347,6 @@ mod tests {
         const STEPS: i64 = 200;
         const STEP_MS: i64 = 15_000;
         let params = PlanParams {
-            widen_to: None,
-            eval: None,
             start_ms: 0,
             end_ms: (STEPS - 1) * STEP_MS,
             step_ms: STEP_MS,
@@ -6854,8 +6816,6 @@ mod routed_series_tests {
         // A UTC midnight, on every level's grid.
         let start = 1_788_825_600_000;
         let p = pulsus_promql::PlanParams {
-            widen_to: None,
-            eval: None,
             start_ms: start,
             end_ms: start + 86_400_000,
             step_ms: 720_000,
@@ -6886,42 +6846,6 @@ mod routed_series_tests {
                 RollupSeries::Known(Vec::new())
             )),
             "the control: the label cache's selector is routed"
-        );
-    }
-}
-
-/// **W6, caller half (issue #18 follow-up, plan r17): a widening that
-/// overflows keeps the request's grid.** A 1 ms query at a step near
-/// `i64::MAX`: the grid's `S` fits `i64`, the widened range plus the
-/// lookback does not, so no grid is set.
-#[cfg(test)]
-mod changed_grid_tests {
-    use super::*;
-    use crate::metrics::rollup::{Level, Levels};
-
-    #[test]
-    fn a_widening_that_overflows_keeps_the_request_grid() {
-        let levels = Levels {
-            levels: vec![Level {
-                res_ms: 5_000,
-                table: "metric_samples_5s".to_string(),
-                from_ms: 0,
-            }],
-            shards: 1,
-            counter_buckets: 5,
-        };
-        let request = MetricQueryParams {
-            start_ms: 0,
-            end_ms: 1,
-            step_ms: i64::MAX - 5_000,
-        };
-        let (res, grid) = super::super::rollup::grid(&request, &levels).expect("S fits i64");
-        assert!(grid.step_ms > request.step_ms, "a stretched step");
-        let expr = pulsus_promql::parse("rate(m[5m])").unwrap();
-        let pp = request.plan_params(false, pulsus_promql::DEFAULT_LOOKBACK_MS);
-        assert!(
-            changed_grid(&expr, pp, grid, &levels, res).is_none(),
-            "the request's grid is kept"
         );
     }
 }
