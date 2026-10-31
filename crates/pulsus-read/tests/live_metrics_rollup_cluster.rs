@@ -88,7 +88,7 @@ fn shard1b_config(database: &str) -> ChConnConfig {
     )
 }
 
-fn engine_config(db: &str, grouped_push: bool) -> MetricsConfig {
+fn engine_config(db: &str) -> MetricsConfig {
     MetricsConfig {
         skip_unavailable_shards: false,
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
@@ -108,7 +108,7 @@ fn engine_config(db: &str, grouped_push: bool) -> MetricsConfig {
         max_info_series: 100_000,
         max_samples: 50_000_000,
         distributed: true,
-        grouped_push,
+        grouped_push: false,
     }
 }
 
@@ -291,22 +291,77 @@ fn skipping() -> bool {
 /// **B8 (issue #18 part B): a level's run row is read with its data.**
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_row_is_read_with_its_data() {
-    if skipping() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with the 2-shard cluster fixture up to run \
+             this test (see crates/pulsus-read/tests/live_metrics_rollup_cluster.rs)"
+        );
         return;
     }
-    let Fixture {
-        db,
-        ctx,
-        bootstrap,
-        shard1,
-        shard2,
-        shard1b,
-        mid,
-        lo,
-        hi,
-    } = fixture(
-        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster"),
-        &[("m", 0)],
+    let db = pulsus_testkit::test_db("pulsus_read_it_rollup_cluster");
+    // Part B's levels, 60 s first and the resolution from 60 s: the
+    // 40-minute query below reads the first level.
+    let ctx = RenderCtx {
+        db: db.clone(),
+        cluster: Some(CLUSTER_NAME.to_string()),
+        dist_suffix: "_dist".to_string(),
+        rollup_levels: vec![60, 720, 7200, 86400],
+        rollup_ranges: vec![60, 86400, 604800, 7776000],
+        ..RenderCtx::for_tests(&db, 30)
+    };
+    let bootstrap = ChClient::new(shard1_config("default"))
+        .await
+        .expect("bootstrap");
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    run_init(&bootstrap, &ctx)
+        .await
+        .expect("run_init (clustered)");
+    let shard1 = Arc::new(ChClient::new(shard1_config(&db)).await.expect("shard1"));
+    let shard2 = Arc::new(ChClient::new(shard2_config(&db)).await.expect("shard2"));
+    let shard1b = Arc::new(ChClient::new(shard1b_config(&db)).await.expect("shard1b"));
+    for node in [&shard1, &shard2, &shard1b] {
+        for r in &ctx.rollup_levels {
+            let view = format!("{db}.metric_samples_{r}s_mv");
+            exec(node, &format!("SYSTEM WAIT VIEW {view}")).await;
+            exec(node, &format!("SYSTEM STOP VIEW {view}")).await;
+        }
+    }
+    for node in [&shard1, &shard2] {
+        for r in &ctx.rollup_levels {
+            exec(node, &format!("TRUNCATE TABLE {db}.metric_samples_{r}s")).await;
+        }
+    }
+
+    // Forty series, half in each shard's slice of the ID space, scraped
+    // every 15 s for three hours, landed on shard 1.
+    let mid = (chrono::Utc::now().timestamp_millis() / HOUR) * HOUR - HOUR;
+    let lo = mid - 2 * HOUR;
+    let hi = mid + 10 * MIN;
+    let fp =
+        "bitOr(if(s % 2 = 0, toUInt128(0), bitShiftLeft(toUInt128(1), 127)), toUInt128(1000 + s))";
+    exec(
+        &shard1,
+        &format!(
+            "INSERT INTO metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, 'm', {fp}, toInt64({lo}) + toInt64(h) * {HOUR} + 1000, \
+                    concat('{{\"s\":\"', toString(s), '\"}}'), 0 \
+             FROM (SELECT toUInt32(number) AS s FROM numbers(40)) ARRAY JOIN [0, 1, 2] AS h"
+        ),
+    )
+    .await;
+    exec(
+        &shard1,
+        &format!(
+            "INSERT INTO metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, 'm', {fp}, \
+                    toInt64({lo}) + toInt64(i) * 15000 + 2000, toFloat64(cityHash64(s, i) % 1000) \
+             FROM (SELECT toUInt32(a.number) AS s, b.number AS i FROM numbers(40) AS a, numbers(1, {}) AS b)",
+            (hi - lo) / 15_000 - 1
+        ),
     )
     .await;
 
@@ -367,14 +422,14 @@ async fn a_run_row_is_read_with_its_data() {
     let routed = MetricsEngine::new(
         ChClient::new(shard1_config(&db)).await.expect("connect"),
         Arc::clone(&cache),
-        engine_config(&db, false),
+        engine_config(&db),
     )
     .with_rollup_levels(Arc::clone(&slot))
     .with_rollup_answer_hook(hook);
     let raw = MetricsEngine::new(
         ChClient::new(shard1_config(&db)).await.expect("connect"),
         Arc::clone(&cache),
-        engine_config(&db, false),
+        engine_config(&db),
     );
 
     let tenant = Tenant::from_header(None, false).expect("the empty tenant");
@@ -489,7 +544,10 @@ async fn level_engine(
     let mut e = MetricsEngine::new(
         ChClient::new(shard1_config(&f.db)).await.expect("connect"),
         Arc::clone(cache),
-        engine_config(&f.db, push),
+        MetricsConfig {
+            grouped_push: push,
+            ..engine_config(&f.db)
+        },
     )
     .with_rollup_levels(Arc::clone(slot));
     if let Some(c) = comment {

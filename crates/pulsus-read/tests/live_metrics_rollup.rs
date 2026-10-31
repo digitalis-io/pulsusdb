@@ -2982,7 +2982,7 @@ fn corpus_p_land(db: &str, end: i64) -> Vec<String> {
              AND NOT (key = 'rxi1d4' AND t >= {e8}) \
              AND NOT (key = 'rxi3d4' AND t > {e13} - 240000))",
         e1 = end - 20 * HOUR,
-        e2 = end - DAY - 7 * MIN,
+        e2 = end - DAY - 4 * MIN - 30_000,
         e3 = end - 15 * HOUR,
         i4 = (end - 12 * HOUR - lo) / SCRAPE,
         i4b = (end - DAY - 9 * MIN - lo) / SCRAPE,
@@ -2990,7 +2990,7 @@ fn corpus_p_land(db: &str, end: i64) -> Vec<String> {
         e6b = end - 9 * HOUR + MIN,
         e7 = end - 5 * MIN,
         e8 = end - 3 * HOUR,
-        e12 = end - DAY + 349 * MIN,
+        e12 = end - DAY + 351 * MIN + 30_000,
         e13 = end - DAY - 8 * MIN,
         n = 50 * HOUR / SCRAPE,
     );
@@ -3380,15 +3380,19 @@ async fn a_histogram_side_falls_back() {
 
 /// **T6 (issue #579 part 4): a node split by time reads its whole prefix**
 /// in every chunk: at a cap of 8,192 series-steps the panel is 5
-/// statements and `sum` over one metric 3, and e12's reset 7 minutes
+/// statements and `sum` over one metric 3, and e12's reset 4 minutes 30 seconds
 /// before the panel's second chunk counts in both.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_split_level_node_reads_its_prefix() {
     skip_unless_live!();
     let end = p_end();
-    let built = corpus_p(DB_P6.name(), end).await;
+    let db = DB_P6.name();
+    let built = corpus_p(db, end).await;
+    // Unique to this run: the log keeps every earlier run's statements
+    // under the same database name.
+    let comment = format!("{db}_split_{}", now_ms());
     let on = built
-        .pushed_engine(None)
+        .pushed_engine(Some(&comment))
         .await
         .with_pushed_series_steps_cap(8_192);
     let off = built.engine(true, None).await;
@@ -3414,8 +3418,28 @@ async fn a_split_level_node_reads_its_prefix() {
             failures.push(format!("{q}: notes {notes:?}, want {more}"));
         }
     }
+    // The panel's chunks start where e12 was placed for: 46 series, 8,192 /
+    // 46 = 178 steps a chunk, the second at end − 24 h + 356 min.
+    let mut starts: Vec<i64> = statements(&built.admin, &comment)
+        .await
+        .iter()
+        .filter(|(q, _)| q.starts_with("WITH ") && q.contains("'p_tx_total'"))
+        .filter_map(|(q, _)| {
+            q.strip_prefix("WITH ")?
+                .split_once(" AS grid_start")?
+                .0
+                .parse()
+                .ok()
+        })
+        .collect();
+    starts.sort_unstable();
     built.finish().await;
     assert!(failures.is_empty(), "T6:\n{}", failures.join("\n"));
+    assert_eq!(
+        starts.get(1).copied(),
+        Some(end - DAY + 356 * MIN),
+        "the panel's second chunk starts at end − 24 h + 356 min: {starts:?}"
+    );
 }
 
 /// **T10a (issue #579 part 4): a data read behind its coverage falls
