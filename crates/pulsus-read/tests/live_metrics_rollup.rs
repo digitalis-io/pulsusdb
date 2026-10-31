@@ -1844,7 +1844,12 @@ async fn stale_and_nan_read_as_raw() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect");
-    let ctx = RenderCtx::for_tests(db, 30);
+    // The switch points this case was written for: the 60 s level from
+    // 1 h, so `band(60)` reads it (issue #18 moved the default to 3 h).
+    let ctx = RenderCtx {
+        rollup_ranges: vec![3600, 86400, 604800, 7776000],
+        ..RenderCtx::for_tests(db, 30)
+    };
     fresh(&bootstrap, &ctx).await;
     let admin = ChClient::new(test_config(db)).await.expect("connect");
     for sql in &land {
@@ -2692,7 +2697,8 @@ fn compare(
 /// the 60 s level, cut after `end − 6 min`, then raw. Every series has
 /// every time; each step to `gl` takes the value of the engine without
 /// levels at the bucket end that holds it, over 12 minutes; each later
-/// step the engine without levels at its own time and range.
+/// step the engine without levels at its own time and range, read from the
+/// 60 s level at step 2 m.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_panel_reads_the_level_its_range_selects() {
     skip_unless_live!();
@@ -2843,6 +2849,20 @@ async fn a_panel_reads_the_level_its_range_selects() {
             &own.points(),
             late,
         ));
+        // ... from the second read, at the request's resolution: the 60 s
+        // level at step 2 m (the bucket ends' notes say step 12m).
+        let second = match query {
+            "rate(c_normal[2m15s])" | "increase(c_normal[2m15s])" => {
+                Some("metric_samples_60s, use Counter, step 2m, range 5m (asked 2m15s)")
+            }
+            "max_over_time(g[2m])" => Some("metric_samples_60s, use Max, step 2m, range 2m"),
+            _ => None,
+        };
+        if let Some(head) = second
+            && !route.iter().any(|n| n.starts_with(head))
+        {
+            failures.push(format!("{query} (iv): no route `{head}`: {route:?}"));
+        }
         // (v) the answer is a rollup's.
         if !a.explain.rollup {
             failures.push(format!("{query} (v): exactness is not rollup"));
@@ -3030,7 +3050,9 @@ async fn a_day_level_fills_a_week() {
 /// pushes through the 60 s level; (b) one at 30 s off the minute is filled,
 /// and its node declined `Filled`; (c) a day at step 2 m is filled with no
 /// newest steps: `rollup_lattice` first, the decline second, then the
-/// bucket ends' read, and no other pushed stage.
+/// bucket ends' read, and no other pushed stage; (d) a week at 1 h is the
+/// same, its decline `Filled` from the request's own steps, not the
+/// `CoarseLevel` its range at the bucket ends would get.
 #[tokio::test(flavor = "multi_thread")]
 async fn pushdown_on_the_request_grid_and_not_when_filled() {
     skip_unless_live!();
@@ -3087,6 +3109,25 @@ async fn pushdown_on_the_request_grid_and_not_when_filled() {
         && names.len() > 2;
     if !in_order {
         failures.push(format!("(c): stages {names:?}"));
+    }
+
+    // (d) A week at 1 h, filled at 7200 s: on the request's own steps
+    // `[5m]` reads the 60 s level and the node would push; its range at the
+    // bucket ends, `[2h]`, would be declined `CoarseLevel` there.
+    let q = "sum by (instance) (rate(p_rx_total[5m]))";
+    let a = ask(&on, &t, q, &range(end - 7 * DAY, end, HOUR)).await;
+    let names: Vec<(&str, &str)> = a
+        .explain
+        .stages
+        .iter()
+        .map(|s| (s.name, s.sql.as_str()))
+        .collect();
+    let in_order = names.first().map(|s| s.0) == Some("rollup_lattice")
+        && names.get(1) == Some(&("pushed_aggregate", "declined: Filled"))
+        && names.len() > 2
+        && names[2..].iter().all(|s| s.0 != "pushed_aggregate");
+    if !in_order || !a.pushed().is_empty() || a.declines().contains(&"declined: CoarseLevel") {
+        failures.push(format!("(d): stages {names:?}"));
     }
     built.finish().await;
     assert!(failures.is_empty(), "L5:\n{}", failures.join("\n"));
