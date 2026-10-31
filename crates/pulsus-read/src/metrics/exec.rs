@@ -730,12 +730,13 @@ impl MetricsEngine {
                     .await?
             }
             Some((lv, l)) => {
-                // D10: what the request's own steps would push, counted on
-                // that plan before any range moves.
-                let filled = if l.until_ms.is_some() {
-                    self.request_grid_pushes(&plan, p, &lv)
+                // D10: what the request's own steps would do with each node,
+                // decided on that plan before any range moves. A filled
+                // query pushes none of them.
+                let verdicts = if l.until_ms.is_some() {
+                    self.request_grid_verdicts(&plan, p, &lv)
                 } else {
-                    0
+                    Vec::new()
                 };
                 for sel in &mut plan.selectors {
                     if let Some(r) = super::rollup::lattice_range(sel, &lv, l.width) {
@@ -746,14 +747,26 @@ impl MetricsEngine {
                 // reads' stages.
                 if let Some(e) = explain.as_mut() {
                     e.push("rollup_lattice", String::new(), Some(lattice_note(&l, p)));
-                    for _ in 0..filled {
-                        e.push(
-                            "pushed_aggregate",
-                            "declined: Filled".to_string(),
-                            Some(FILLED_NOTE.to_string()),
-                        );
+                    for verdict in &verdicts {
+                        match verdict {
+                            Ok(()) => e.push(
+                                "pushed_aggregate",
+                                "declined: Filled".to_string(),
+                                Some(FILLED_NOTE.to_string()),
+                            ),
+                            Err(reason) => e.push(
+                                "pushed_aggregate",
+                                format!("declined: {reason:?}"),
+                                Some(
+                                    "issue #579: this node is evaluated over the sample fetch"
+                                        .to_string(),
+                                ),
+                            ),
+                        }
                     }
-                    e.rollup = true;
+                    // A filled step takes its bucket's value; an unfilled
+                    // query keeps today's rule, inside `read_selectors`.
+                    e.rollup |= l.until_ms.is_some();
                 }
                 match l.until_ms {
                     None => {
@@ -909,15 +922,15 @@ impl MetricsEngine {
         Ok(data)
     }
 
-    /// Issue #18, D10: the nodes the request's own steps would push — the
+    /// Issue #18, D10: each node's verdict on the request's own steps — the
     /// plan given the request's routing, rounding and arms, as a query read
-    /// at its own steps is — counted by `node_verdicts`.
-    fn request_grid_pushes(
+    /// at its own steps is — by `node_verdicts`, in its order.
+    fn request_grid_verdicts(
         &self,
         plan: &pulsus_promql::QueryPlan,
         p: &MetricQueryParams,
         levels: &std::sync::Arc<super::rollup::Levels>,
-    ) -> usize {
+    ) -> Vec<Result<(), super::grouped::NodeDecline>> {
         let mut clone = plan.clone();
         let routing = request_grid_routing(p, Some(std::sync::Arc::clone(levels)));
         round_on_request_grid(&mut clone, routing.as_ref());
@@ -927,9 +940,9 @@ impl MetricsEngine {
             .map(|sel| (sel.id, arm_of(sel, &clone.params, routing.as_ref())))
             .collect();
         super::grouped::node_verdicts(&clone, &clone.params, &self.config, &arms)
-            .iter()
-            .filter(|(_, v)| v.is_ok())
-            .count()
+            .into_iter()
+            .map(|(_, v)| v.map(|_| ()))
+            .collect()
     }
 
     /// Every selector's statements, run, and the pushed nodes' answers: the

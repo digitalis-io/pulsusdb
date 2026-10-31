@@ -828,7 +828,7 @@ mod tests {
     }
 
     /// Issue #746: level 1's "Range from" is a field like every other
-    /// row's, starting at the default 3600, and refused like them: below
+    /// row's, starting at the default 10800, and refused like them: below
     /// its resolution, the message is the schema's, on the level group.
     #[test]
     fn level_one_has_its_own_range_from() {

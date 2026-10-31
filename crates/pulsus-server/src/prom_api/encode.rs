@@ -244,8 +244,10 @@ struct UnreachableStreamsError {
 }
 
 // ---------------------------------------------------------------------
-// Explain (issue #32: adds `exactness`; issue #18 part B: `"rollup"` when a
-// rollup level served part of a selector, else `"raw-exact"`).
+// Explain (issue #32: adds `exactness`; issue #18: `"rollup"` when a rollup
+// level served part of a selector, a selector's range was rounded, or the
+// query's steps take the value of the bucket that holds them, else
+// `"raw-exact"`).
 // ---------------------------------------------------------------------
 
 #[derive(Serialize)]

@@ -49,8 +49,10 @@ pub struct PlanExplain {
     /// the header — so every other response is byte-identical to the one
     /// it produced before this field existed.
     pub plans: Vec<PlanShape>,
-    /// Issue #18 part B: a rollup level served part of at least one
-    /// selector — `exactness` is `"rollup"` rather than `"raw-exact"`.
+    /// Issue #18: a rollup level served part of at least one selector, a
+    /// selector's range was rounded, or the query's steps take the value of
+    /// the bucket that holds them — `exactness` is `"rollup"` rather than
+    /// `"raw-exact"`.
     pub rollup: bool,
 }
 
