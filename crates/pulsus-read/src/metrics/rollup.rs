@@ -373,9 +373,26 @@ pub struct LevelRow {
     pub flags: u8,
 }
 
+/// Issue #579 part 4: S1, a pushed node's coverage statement — the run rows
+/// of `table` that overlap `window`, `(lo, hi]`, each with the shard that
+/// answered it: [`level_fetch`]'s run rows without its data rows.
+pub fn level_runs(table: &str, window: (i64, i64), clustered: bool) -> String {
+    let shard = if clustered {
+        "_shard_num"
+    } else {
+        "toUInt32(1)"
+    };
+    format!(
+        "SELECT {shard} AS shard, t_last, t_end\n\
+         FROM {table}\n\
+         WHERE kind = 1 AND org_id = '' AND fingerprint = 0 AND {}",
+        intervals_predicate("t_end", "t_last", "<", &[window]),
+    )
+}
+
 /// One run row: the shard that answered it and its interval
-/// `(t_last, t_end]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `(t_last, t_end]`. Part 4 reads S1 ([`level_runs`]) into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct RunRow {
     pub shard: u32,
     pub t_last: i64,

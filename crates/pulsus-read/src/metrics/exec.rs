@@ -551,7 +551,15 @@ pub struct MetricsEngine {
     /// TEST SEAM (issue #18 part B): replaces a level fetch's answer, by
     /// its statement text. `None` in production.
     rollup_answer_hook: Option<RollupAnswerHook>,
+    /// TEST SEAM (issue #579 part 4): edits a pushed node's coverage rows
+    /// (S1), by selector, before they are used. `None` in production.
+    coverage_hook: Option<CoverageHook>,
 }
+
+/// TEST SEAM (issue #579 part 4): one selector's S1 run rows, edited.
+pub type CoverageHook = std::sync::Arc<
+    dyn Fn(SelectorId, Vec<super::rollup::RunRow>) -> Vec<super::rollup::RunRow> + Send + Sync,
+>;
 
 /// TEST SEAM (issue #18 part B): a level fetch's answer by its statement
 /// text, or `None` to send the statement.
@@ -579,6 +587,7 @@ impl MetricsEngine {
             exemplar_answer_bytes: super::exemplars::EXEMPLAR_ANSWER_BYTES,
             rollup_levels: None,
             rollup_answer_hook: None,
+            coverage_hook: None,
         }
     }
 
@@ -594,6 +603,14 @@ impl MetricsEngine {
     #[doc(hidden)]
     pub fn with_rollup_answer_hook(mut self, hook: RollupAnswerHook) -> Self {
         self.rollup_answer_hook = Some(hook);
+        self
+    }
+
+    /// TEST SEAM (issue #579 part 4) — see [`CoverageHook`]. Never called
+    /// by `pulsus-server`.
+    #[doc(hidden)]
+    pub fn with_coverage_hook(mut self, hook: CoverageHook) -> Self {
+        self.coverage_hook = Some(hook);
         self
     }
 
@@ -721,6 +738,13 @@ impl MetricsEngine {
                 }
             }
         }
+        // Issue #579 part 4: each selector's arm, by `routed_series`' own
+        // test, after the range is rounded and before the verdicts.
+        let arms: HashMap<SelectorId, super::grouped::Arm> = plan
+            .selectors
+            .iter()
+            .map(|sel| (sel.id, arm_of(sel, &plan_params, routing.as_ref())))
+            .collect();
 
         // Issue #33 architect adjudication (superseding #31's ratified
         // zero-ClickHouse `count`/`group` AC and #40's instant-only gate on
@@ -774,10 +798,19 @@ impl MetricsEngine {
         // the sole reader of `config.grouped_push` and the sole owner of
         // the grid-overflow guard.
         let mut owners: HashMap<SelectorId, super::grouped::PushShape> = HashMap::new();
-        for (_, verdict) in super::grouped::node_verdicts(&plan, &plan_params, &self.config) {
+        // Part 4: shape-C nodes in written order, staged after the loop once
+        // both sides are recorded.
+        let mut joins: Vec<super::grouped::PushShape> = Vec::new();
+        for (_, verdict) in super::grouped::node_verdicts(&plan, &plan_params, &self.config, &arms)
+        {
             match verdict {
                 Ok(node) => {
-                    owners.insert(node.selector(), node);
+                    for id in node.selectors() {
+                        owners.insert(id, node.clone());
+                    }
+                    if matches!(node.kind, super::grouped::PushKind::Join(_)) {
+                        joins.push(node);
+                    }
                 }
                 Err(reason) => {
                     if let Some(e) = explain.as_mut() {
@@ -796,6 +829,10 @@ impl MetricsEngine {
         // The pushes a resolution has confirmed: the decision and the
         // statements it renders. A selector is owned by at most one node.
         let mut pending: Vec<PendingPush> = Vec::new();
+        // Part 4: each shape-C node's recorded sides, by `self_pos`, and the
+        // nodes F11 sent back to today's route.
+        let mut sides: HashMap<usize, Vec<PushSide>> = HashMap::new();
+        let mut declined: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for (selector_id, sel) in plan.selectors.iter().enumerate() {
             let (lower_excl, upper_incl) = sel.fetch_window(&plan_params);
             let window = DataWindow {
@@ -892,7 +929,7 @@ impl MetricsEngine {
                         fetch_plans.push(SelectorFetchPlan::Empty);
                         continue;
                     }
-                    None => {}
+                    Some((_, super::grouped::PushKind::Join(_))) | None => {}
                 }
                 let (fetch_plan, read) = if by_index {
                     self.nameless_fetch_plan(tenant, sel, groups, window, explain.as_deref_mut())
@@ -997,10 +1034,118 @@ impl MetricsEngine {
                 }
             }
 
+            // Issue #579 part 4: a selector of a shape-A or shape-C node
+            // whose arm is the 60 s level reads its coverage now (S1); the
+            // node's statements then read the level and the raw tail. Its
+            // fallback is today's route.
+            let level_owned = owners
+                .get(&selector_id)
+                .filter(|n| !declined.contains(&n.self_pos))
+                .filter(|n| !matches!(n.kind, super::grouped::PushKind::Instant(_)))
+                .filter(|_| matches!(arms.get(&selector_id), Some(super::grouped::Arm::Level(_))))
+                .cloned();
+            let resolution = match (level_owned, routing.as_ref()) {
+                (Some(node), Some((levels, res))) => {
+                    match routed_series(sel, &plan_params, levels, *res, resolution) {
+                        Ok((route, series)) => {
+                            let count = match &series {
+                                RollupSeries::Known(pairs) => Some(pairs.len()),
+                                RollupSeries::Resolve(_) => None,
+                            };
+                            let ids_sql = super::sql::historical_series_subquery(
+                                tenant,
+                                &self.config.series_table,
+                                &self.config.labels_table,
+                                metric_name,
+                                window,
+                                &sel.matchers,
+                            );
+                            let fallback = self.rollup_fetch_plan(
+                                tenant,
+                                sel,
+                                route.clone(),
+                                std::sync::Arc::clone(levels),
+                                series,
+                                (lower_excl, upper_incl),
+                                &plan_params,
+                                None,
+                            );
+                            if let Some(e) = explain.as_mut() {
+                                push_rollup_route(e, sel, &route, &plan_params);
+                            }
+                            let level = self
+                                .level_coverage(
+                                    selector_id,
+                                    sel,
+                                    &route,
+                                    levels,
+                                    (lower_excl, upper_incl),
+                                    explain.as_deref_mut(),
+                                )
+                                .await?;
+                            let grid = match &node.kind {
+                                super::grouped::PushKind::Range(r) => r.grid,
+                                super::grouped::PushKind::Join(j) => j.grid,
+                                super::grouped::PushKind::Instant(g) => g.grid,
+                            };
+                            // F11: a statement names at most 64 intervals.
+                            if level.exceeds(grid, sel.range_ms.unwrap_or(0)) {
+                                if let Some(e) = explain.as_mut() {
+                                    e.push(
+                                        "pushed_aggregate",
+                                        "declined: TooManyIntervals".to_string(),
+                                        Some(
+                                            "issue #579: a level side's coverage is in more \
+                                             pieces than one statement names; the node takes \
+                                             today's route"
+                                                .to_string(),
+                                        ),
+                                    );
+                                }
+                                declined.insert(node.self_pos);
+                                fetch_plans.push(fallback);
+                                continue;
+                            }
+                            let side = PushSide {
+                                selector: selector_id,
+                                ids_sql,
+                                series: count,
+                                window: (lower_excl, upper_incl),
+                                fallback,
+                                level: Some(level),
+                            };
+                            match &node.kind {
+                                super::grouped::PushKind::Range(shape) => {
+                                    self.stage_pushed_node(
+                                        tenant,
+                                        node.self_pos,
+                                        NodeShape::Level(
+                                            shape,
+                                            super::grouped::increase_scale(shape.func, sel),
+                                        ),
+                                        vec![side],
+                                        explain.as_deref_mut(),
+                                        &mut reads,
+                                        &mut pending,
+                                    )
+                                    .await?;
+                                }
+                                _ => sides.entry(node.self_pos).or_default().push(side),
+                            }
+                            fetch_plans.push(SelectorFetchPlan::Empty);
+                            continue;
+                        }
+                        // Unreachable: the arm is `routed_series`' own test.
+                        Err(resolution) => resolution,
+                    }
+                }
+                _ => resolution,
+            };
+
             // Issue #18 part B: a selector a rollup level can serve reads
             // it, decided before the pushdown, so a routed selector is
             // never pushed down. However its series were found (issue #18
-            // follow-up, R4).
+            // follow-up, R4). Part 4: except under a node pushed above.
             let resolution = match routing.as_ref() {
                 Some((levels, res)) => {
                     match routed_series(sel, &plan_params, levels, *res, resolution) {
@@ -1030,7 +1175,11 @@ impl MetricsEngine {
             // Issues #549 and #579: the pushed node, decided on the SAME
             // resolution the declining path then consumes — `members_of`
             // borrows it, so there is no clone and no second resolve.
-            match owners.get(&selector_id).map(|n| (n.self_pos, &n.kind)) {
+            match owners
+                .get(&selector_id)
+                .filter(|n| !declined.contains(&n.self_pos))
+                .map(|n| (n.self_pos, &n.kind))
+            {
                 Some((self_pos, super::grouped::PushKind::Instant(shape))) => {
                     match super::grouped::members_of(&resolution, metric_name)
                         .and_then(|members| super::grouped::decide(shape, &members, shape.grid))
@@ -1100,6 +1249,42 @@ impl MetricsEngine {
                     fetch_plans.push(SelectorFetchPlan::Empty);
                     continue;
                 }
+                // Part 4: a shape-C side read raw, recorded with today's
+                // fetch as its fallback.
+                Some((self_pos, super::grouped::PushKind::Join(_))) => {
+                    let series = match &resolution {
+                        LabelledResolution::Series(pairs) => Some(pairs.len()),
+                        LabelledResolution::SqlFallback { .. } => None,
+                    };
+                    let ids_sql = super::sql::historical_series_subquery(
+                        tenant,
+                        &self.config.series_table,
+                        &self.config.labels_table,
+                        metric_name,
+                        window,
+                        &sel.matchers,
+                    );
+                    let fallback = self.concrete_fetch_plan(
+                        tenant,
+                        selector_id,
+                        sel,
+                        resolution,
+                        lower_excl,
+                        upper_incl,
+                        None,
+                        None,
+                    );
+                    sides.entry(self_pos).or_default().push(PushSide {
+                        selector: selector_id,
+                        ids_sql,
+                        series,
+                        window: (lower_excl, upper_incl),
+                        fallback,
+                        level: None,
+                    });
+                    fetch_plans.push(SelectorFetchPlan::Empty);
+                    continue;
+                }
                 None => {}
             }
 
@@ -1114,6 +1299,35 @@ impl MetricsEngine {
                 Some(&mut reads),
             );
             fetch_plans.push(fetch_plan);
+        }
+
+        // Part 4: each shape-C node with both sides recorded is staged; one
+        // with a single side (F11 on the other) gives that side its
+        // fallback.
+        for node in &joins {
+            let super::grouped::PushKind::Join(shape) = &node.kind else {
+                continue;
+            };
+            let Some(mut recorded) = sides.remove(&node.self_pos) else {
+                continue;
+            };
+            if recorded.len() == 2 && !declined.contains(&node.self_pos) {
+                recorded.sort_by_key(|s| s.selector != shape.lhs.selector);
+                self.stage_pushed_node(
+                    tenant,
+                    node.self_pos,
+                    NodeShape::Join(shape),
+                    recorded,
+                    explain.as_deref_mut(),
+                    &mut reads,
+                    &mut pending,
+                )
+                .await?;
+            } else {
+                for side in recorded {
+                    fetch_plans[side.selector] = side.fallback;
+                }
+            }
         }
 
         // Issue #548: the chain model, built once, only under the
@@ -1169,60 +1383,79 @@ impl MetricsEngine {
         // F6: a shape-A statement whose sentinel row counts a histogram
         // sample is discarded, and its selector is fetched as it is without
         // the push. Checked here, on the sentinel rows alone, because the
-        // fallback is another round trip.
+        // fallback is another round trip. Part 4, F10: a node whose data
+        // read raised the replica check is discarded the same way, before
+        // F6. Either moves every selector of the node to its fallback.
         let mut kept = Vec::with_capacity(pushed.len());
-        let mut fallbacks = Vec::new();
+        let mut fallbacks: Vec<(SelectorId, SelectorFetchPlan)> = Vec::new();
         for result in pushed {
-            match result? {
-                PushResult::Range {
-                    selector,
-                    fallback,
-                    chunks,
-                    ..
-                } if chunks.iter().flat_map(|(_, rows)| rows).any(|r| {
-                    super::grouped::is_histogram_sentinel(&r.gid) && r.agg.unwrap_or(0.0) > 0.0
-                }) =>
+            let result = result?;
+            let reason = match &result {
+                PushResult::Range { behind: true, .. } => Some((
+                    "declined: ReplicaBehind",
+                    "issue #579: a level side's data read lacks the run rows its coverage \
+                     claimed; the node's selectors take today's route",
+                )),
+                PushResult::Range { chunks, .. }
+                    if chunks.iter().flat_map(|(_, rows)| rows).any(|r| {
+                        super::grouped::is_histogram_sentinel(&r.gid) && r.agg.unwrap_or(0.0) > 0.0
+                    }) =>
                 {
-                    if let Some(e) = explain.as_mut() {
-                        e.push(
-                            "pushed_aggregate",
-                            "declined: HistogramSamples".to_string(),
-                            Some(
-                                "issue #579: the window holds histogram samples; this selector \
-                                 takes the sample fetch"
-                                    .to_string(),
-                            ),
-                        );
-                        match &fallback {
-                            SelectorFetchPlan::Chunks {
-                                sqls, hist_sqls, ..
-                            } => {
-                                if let Some(first) = sqls.first() {
-                                    e.push("sample_fetch", first.clone(), None);
-                                }
-                                if let Some(first) = hist_sqls.first() {
-                                    e.push("hist_sample_fetch", first.clone(), None);
-                                }
-                            }
-                            // Issue #579 part 2: a multi-name node's
-                            // fallback is the fan-out's one fetch.
-                            SelectorFetchPlan::Multi { sql, hist_sql, .. } => {
-                                e.push("sample_fetch", sql.clone(), None);
-                                e.push("hist_sample_fetch", hist_sql.clone(), None);
-                            }
-                            // Issue #579 part 3: a node pushed over the SQL
-                            // route falls back to that route's fetch.
-                            SelectorFetchPlan::Fallback { sql, hist_sql, .. } => {
-                                e.push("sample_fetch", sql.clone(), None);
-                                e.push("hist_sample_fetch", hist_sql.clone(), None);
-                            }
-                            _ => {}
-                        }
-                    }
-                    fallbacks.push((selector, fallback));
+                    Some((
+                        "declined: HistogramSamples",
+                        "issue #579: the window holds histogram samples; this selector \
+                         takes the sample fetch",
+                    ))
                 }
-                other => kept.push(other),
+                _ => None,
+            };
+            let PushResult::Range {
+                self_pos,
+                push,
+                chunks,
+                fallbacks: node_fallbacks,
+                drop_name,
+                behind,
+                served,
+            } = result
+            else {
+                kept.push(result);
+                continue;
+            };
+            let Some((declined, note)) = reason else {
+                // Part 4: a `Level` side of a kept node sets the explain
+                // flag by today's rule (`rollup_chunk`'s
+                // `served_from_level`), from S4.
+                if let Some(e) = explain.as_mut() {
+                    for (selector, read_level, todo) in &served {
+                        let sel = &plan.selectors[*selector];
+                        e.rollup |= (*read_level
+                            && super::rollup::level_window_exists(sel, &plan_params, todo))
+                            || sel.written_range_ms != sel.range_ms;
+                    }
+                }
+                kept.push(PushResult::Range {
+                    self_pos,
+                    push,
+                    chunks,
+                    fallbacks: Vec::new(),
+                    drop_name,
+                    behind,
+                    served: Vec::new(),
+                });
+                continue;
+            };
+            if let Some(e) = explain.as_mut() {
+                e.push(
+                    "pushed_aggregate",
+                    declined.to_string(),
+                    Some(note.to_string()),
+                );
+                for (_, fallback) in &node_fallbacks {
+                    push_fallback_stages(e, fallback);
+                }
             }
+            fallbacks.extend(node_fallbacks);
         }
         let refetched: Vec<Result<FetchedWithTrace, ReadError>> =
             join_all(fallbacks.iter_mut().map(|(selector, fallback)| {
@@ -1236,7 +1469,17 @@ impl MetricsEngine {
             }))
             .await;
         for ((selector, _), series) in fallbacks.into_iter().zip(refetched) {
-            data.insert(selector, series?.0);
+            let (series, trace) = series?;
+            // Part 4: a `Level` side's fallback is today's level route, whose
+            // pieces and flag reach explain as the routed selectors' do.
+            if let (Some(trace), Some(e)) = (trace, explain.as_mut()) {
+                let sel = &plan.selectors[selector];
+                for (sql, note) in trace.stages {
+                    e.push("rollup_piece", sql, Some(note));
+                }
+                e.rollup |= trace.served_from_level || sel.written_range_ms != sel.range_ms;
+            }
+            data.insert(selector, series);
         }
         if !kept.is_empty() {
             for (self_pos, node) in nodes_offloaded(&self.eval_gate, kept).await? {
@@ -1590,10 +1833,11 @@ impl MetricsEngine {
         }
         pending.push(PendingPush::Range {
             self_pos,
-            selector: selector_id,
             push,
             sqls,
-            fallback,
+            fallbacks: vec![(selector_id, fallback)],
+            drop_name: true,
+            levels: Vec::new(),
         });
         Ok(())
     }
@@ -2059,6 +2303,221 @@ impl MetricsEngine {
         series.map(|s| (s, None))
     }
 
+    /// Issue #579 part 4: S1, a `Level` side's coverage, read before its
+    /// node's statements are rendered, and what today's route derives from
+    /// it: the served, uncovered and raw-read intervals of the fetch window.
+    async fn level_coverage(
+        &self,
+        selector_id: SelectorId,
+        sel: &SelectorSpec,
+        route: &super::rollup::Route,
+        levels: &super::rollup::Levels,
+        window: (i64, i64),
+        explain: Option<&mut PlanExplain>,
+    ) -> Result<LevelSide, ReadError> {
+        use super::rollup::{coverage, intersect, subtract, widen};
+        let sql = super::rollup::level_runs(&route.table, window, self.config.distributed);
+        if let Some(e) = explain {
+            e.push("pushed_coverage", sql.clone(), None);
+        }
+        let mut runs: Vec<super::rollup::RunRow> = self.fetch_series_rows(sql).await?;
+        if let Some(hook) = &self.coverage_hook {
+            runs = hook(selector_id, runs);
+        }
+        let covered = coverage(&runs, levels.shards);
+        let todo = subtract(&[window], &covered);
+        Ok(LevelSide {
+            table: route.table.clone(),
+            shards: levels.shards,
+            window,
+            served: intersect(&covered, &[window]),
+            read: widen(&todo, sel.range_ms.unwrap_or(0), window),
+            todo,
+        })
+    }
+
+    /// Issue #579 part 4: a shape-A node over the 60 s level, or a shape-C
+    /// node, whose sides phase 1 recorded — S2 where a side's series count
+    /// is unknown, its statements split by time, its explain entries, and
+    /// the pending push with every side's fallback.
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_pushed_node(
+        &self,
+        tenant: &Tenant,
+        self_pos: usize,
+        shape: NodeShape<'_>,
+        sides: Vec<PushSide>,
+        explain: Option<&mut PlanExplain>,
+        reads: &mut compile::SelectorReads,
+        pending: &mut Vec<PendingPush>,
+    ) -> Result<(), ReadError> {
+        let mut explain = explain;
+        let mut series = 0usize;
+        for side in &sides {
+            series += match side.series {
+                Some(n) => n,
+                None => {
+                    let count_sql = super::grouped_sql::series_count(&side.ids_sql);
+                    if let Some(e) = explain.as_mut() {
+                        e.push("pushed_series_count", count_sql.clone(), None);
+                    }
+                    let rows: Vec<super::grouped_rows::SeriesCountRow> =
+                        self.fetch_series_rows(count_sql).await?;
+                    rows.first()
+                        .map_or(0, |r| usize::try_from(r.n).unwrap_or(usize::MAX))
+                }
+            };
+        }
+        let specs = shape.sides();
+        let grid = shape.grid();
+        let sqls: Vec<(u32, String)> = if series == 0 {
+            Vec::new()
+        } else {
+            super::grouped::time_chunks(grid, series, self.pushed_series_steps_cap)
+                .into_iter()
+                .map(|(g0, chunk)| (g0, self.render_chunk(tenant, &shape, &specs, &sides, chunk)))
+                .collect()
+        };
+        let mut levels = Vec::new();
+        if let Some(e) = explain {
+            for (side, spec) in sides.iter().zip(&specs) {
+                if side.level.is_some() || sqls.is_empty() {
+                    continue;
+                }
+                let (lo, hi) = super::grouped_sql::range_window(grid, spec.range_ms);
+                reads.push(compile::SelectorRead {
+                    selector: side.selector,
+                    pred: compile::selector_pred(
+                        None,
+                        &sample_sql::window_predicate(lo, hi),
+                        &sample_sql::subquery_predicate(&side.ids_sql),
+                    ),
+                    shape: compile::PqlShape::Samples,
+                });
+            }
+            if let Some((_, first)) = sqls.first() {
+                let note = (sqls.len() > 1).then(|| {
+                    format!(
+                        "(+{} more statements like this one, split by time)",
+                        sqls.len() - 1
+                    )
+                });
+                e.push("pushed_aggregate", first.clone(), note);
+            }
+            // S4, the explain flag's input, one per `Level` side.
+            for side in &sides {
+                let Some(level) = &side.level else {
+                    continue;
+                };
+                let sql = super::grouped_sql::level_served(
+                    tenant,
+                    &side.ids_sql,
+                    &super::grouped_sql::LevelRead {
+                        table: &level.table,
+                        clustered: self.config.distributed,
+                        shards: level.shards,
+                        window: level.window,
+                        served: &level.served,
+                        read: &level.read,
+                        raw_steps: &[],
+                    },
+                );
+                e.push("pushed_level_rows", sql.clone(), None);
+                levels.push((side.selector, sql, level.todo.clone()));
+            }
+        }
+        let (push, drop_name) = shape.push();
+        pending.push(PendingPush::Range {
+            self_pos,
+            push,
+            sqls,
+            fallbacks: sides
+                .into_iter()
+                .map(|s| (s.selector, s.fallback))
+                .collect(),
+            drop_name,
+            levels,
+        });
+        Ok(())
+    }
+
+    /// Issue #579 part 4: one time chunk's statement. Each `Level` side
+    /// reads its served and raw intervals from the window's start to the
+    /// chunk's end — the counter starts at the window's first row in every
+    /// chunk — and the raw steps of the chunk's own grid.
+    fn render_chunk(
+        &self,
+        tenant: &Tenant,
+        shape: &NodeShape<'_>,
+        specs: &[SideSpec<'_>],
+        sides: &[PushSide],
+        grid: super::grouped::Grid,
+    ) -> String {
+        use super::rollup::intersect;
+        let chunk_end = grid.start_ms + (i64::from(grid.points) - 1) * grid.step_ms;
+        let cuts: Vec<Option<ChunkCut>> = sides
+            .iter()
+            .zip(specs)
+            .map(|(side, spec)| {
+                side.level.as_ref().map(|l| {
+                    let cut = [(l.window.0, chunk_end)];
+                    (
+                        intersect(&l.served, &cut),
+                        intersect(&l.read, &cut),
+                        super::grouped::raw_steps(grid, spec.range_ms, &l.todo),
+                    )
+                })
+            })
+            .collect();
+        let sql_sides: Vec<super::grouped_sql::SideSql<'_>> =
+            sides
+                .iter()
+                .zip(specs)
+                .zip(&cuts)
+                .map(|((side, spec), cut)| super::grouped_sql::SideSql {
+                    tenant,
+                    samples_table: &self.config.samples_table,
+                    labels_table: &self.config.labels_table,
+                    ids_sql: &side.ids_sql,
+                    metric_name: spec.metric_name,
+                    func: spec.func,
+                    range_ms: spec.range_ms,
+                    scale: spec.scale,
+                    window: side.window,
+                    level: side.level.as_ref().zip(cut.as_ref()).map(
+                        |(l, (served, read, steps))| super::grouped_sql::LevelRead {
+                            table: &l.table,
+                            clustered: self.config.distributed,
+                            shards: l.shards,
+                            window: l.window,
+                            served,
+                            read,
+                            raw_steps: steps,
+                        },
+                    ),
+                })
+                .collect();
+        match shape {
+            NodeShape::Level(r, _) => super::grouped_sql::level_aggregate_fetch(
+                &sql_sides[0],
+                &self.config.hist_samples_table,
+                r.grouping.as_ref(),
+                grid,
+                r.op,
+            ),
+            NodeShape::Join(j) => super::grouped_sql::join_aggregate_fetch(
+                &sql_sides[0],
+                &sql_sides[1],
+                &self.config.hist_samples_table,
+                j.grouping.as_ref(),
+                grid,
+                j.op,
+                j.bin,
+                j.bool_modifier,
+            ),
+        }
+    }
+
     /// Issue #18 part B: a routed selector's fetch plan, and its
     /// `rollup_route` explain stage; for a selector the label cache could
     /// not answer, its `rollup_series` stage before it (issue #18
@@ -2107,24 +2566,7 @@ impl MetricsEngine {
                     Some("the series and their labels, read before the levels".to_string()),
                 );
             }
-            let mut range = sel
-                .range_ms
-                .map_or_else(|| "none".to_string(), super::rollup::duration_text);
-            if let Some(w) = sel.written_range_ms
-                && sel.written_range_ms != sel.range_ms
-            {
-                range = format!("{range} (asked {})", super::rollup::promql_duration_text(w));
-            }
-            e.push(
-                "rollup_route",
-                String::new(),
-                Some(format!(
-                    "{}, use {:?}, step {}, range {range}",
-                    route.table,
-                    route.use_,
-                    super::rollup::duration_text(p.step_ms)
-                )),
-            );
+            push_rollup_route(e, sel, &route, p);
             if let Some(first) = hist_sqls.first() {
                 e.push("hist_sample_fetch", first.clone(), None);
             }
@@ -2470,10 +2912,11 @@ impl MetricsEngine {
             }
             PendingPush::Range {
                 self_pos,
-                selector,
                 push,
                 sqls,
-                fallback,
+                fallbacks,
+                drop_name,
+                levels,
             } => {
                 // Issue #579 part 3 (D3): one chunk after another, so a
                 // node holds one statement's memory in the database, not
@@ -2485,17 +2928,55 @@ impl MetricsEngine {
                     self.config.skip_unavailable_shards,
                 );
                 let mut chunks = Vec::with_capacity(sqls.len());
+                let mut behind = false;
                 for (g0, sql) in sqls {
-                    let rows: Vec<super::grouped_rows::RangeAggRow> =
-                        self.fetch_rows_with(sql, &settings, Some(budget)).await?;
-                    chunks.push((g0, rows));
+                    match self
+                        .fetch_rows_with::<super::grouped_rows::RangeAggRow>(
+                            sql,
+                            &settings,
+                            Some(budget),
+                        )
+                        .await
+                    {
+                        Ok(rows) => chunks.push((g0, rows)),
+                        Err(e) if replica_behind(&e) => {
+                            behind = true;
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                // Part 4: S4, sent only under explain, raises as S3 does.
+                let mut served = Vec::with_capacity(levels.len());
+                for (selector, sql, todo) in levels {
+                    if behind {
+                        break;
+                    }
+                    match self
+                        .fetch_rows_with::<super::grouped_rows::LevelServedRow>(
+                            sql, &settings, None,
+                        )
+                        .await
+                    {
+                        Ok(rows) => {
+                            served.push((
+                                selector,
+                                rows.first().is_some_and(|r| r.served == 1),
+                                todo,
+                            ));
+                        }
+                        Err(e) if replica_behind(&e) => behind = true,
+                        Err(e) => return Err(e),
+                    }
                 }
                 Ok(PushResult::Range {
                     self_pos,
-                    selector,
                     push,
                     chunks,
-                    fallback,
+                    fallbacks,
+                    drop_name,
+                    behind,
+                    served,
                 })
             }
         }
@@ -3587,6 +4068,197 @@ fn instant_push_declined(explain: Option<&mut PlanExplain>, reason: super::group
     }
 }
 
+/// Issue #579 part 4: a selector's arm — `Level` exactly where
+/// [`routed_series`] routes it, `Raw` everywhere else.
+fn arm_of(
+    sel: &SelectorSpec,
+    p: &pulsus_promql::PlanParams,
+    routing: Option<&(std::sync::Arc<super::rollup::Levels>, i64)>,
+) -> super::grouped::Arm {
+    match routing {
+        Some((levels, res)) if super::rollup::eligible(sel) => {
+            super::rollup::route(sel, p, levels, *res)
+                .map_or(super::grouped::Arm::Raw, super::grouped::Arm::Level)
+        }
+        _ => super::grouped::Arm::Raw,
+    }
+}
+
+/// Issue #18 part B: a routed selector's `rollup_route` explain stage.
+fn push_rollup_route(
+    e: &mut PlanExplain,
+    sel: &SelectorSpec,
+    route: &super::rollup::Route,
+    p: &pulsus_promql::PlanParams,
+) {
+    let mut range = sel
+        .range_ms
+        .map_or_else(|| "none".to_string(), super::rollup::duration_text);
+    if let Some(w) = sel.written_range_ms
+        && sel.written_range_ms != sel.range_ms
+    {
+        range = format!("{range} (asked {})", super::rollup::promql_duration_text(w));
+    }
+    e.push(
+        "rollup_route",
+        String::new(),
+        Some(format!(
+            "{}, use {:?}, step {}, range {range}",
+            route.table,
+            route.use_,
+            super::rollup::duration_text(p.step_ms)
+        )),
+    );
+}
+
+/// Issue #579: the statements a pushed node's fallback sends, for explain.
+fn push_fallback_stages(e: &mut PlanExplain, fallback: &SelectorFetchPlan) {
+    match fallback {
+        SelectorFetchPlan::Chunks {
+            sqls, hist_sqls, ..
+        } => {
+            if let Some(first) = sqls.first() {
+                e.push("sample_fetch", first.clone(), None);
+            }
+            if let Some(first) = hist_sqls.first() {
+                e.push("hist_sample_fetch", first.clone(), None);
+            }
+        }
+        // Issue #579 part 2: a multi-name node's fallback is the fan-out's
+        // one fetch.
+        SelectorFetchPlan::Multi { sql, hist_sql, .. } => {
+            e.push("sample_fetch", sql.clone(), None);
+            e.push("hist_sample_fetch", hist_sql.clone(), None);
+        }
+        // Issue #579 part 3: a node pushed over the SQL route falls back to
+        // that route's fetch.
+        SelectorFetchPlan::Fallback { sql, hist_sql, .. } => {
+            e.push("sample_fetch", sql.clone(), None);
+            e.push("hist_sample_fetch", hist_sql.clone(), None);
+        }
+        // Part 4: a `Level` side's fallback is the level route, whose
+        // pieces reach explain when it runs.
+        _ => {}
+    }
+}
+
+/// Issue #579 part 4, F10: the replica check raised — `throwIf`'s code,
+/// 395, with the check's own message.
+fn replica_behind(e: &ReadError) -> bool {
+    matches!(
+        e,
+        ReadError::Clickhouse(pulsus_clickhouse::ChError::Server { code: 395, message })
+            if message.contains("PULSUS_LEVEL_REPLICA_BEHIND")
+    )
+}
+
+/// Issue #579 part 4: one side of a pushed node as phase 1 recorded it.
+struct PushSide {
+    selector: SelectorId,
+    /// The selector's series ID statement.
+    ids_sql: String,
+    /// The series count, when the resolution carried a list.
+    series: Option<usize>,
+    /// The selector's fetch window `(lo, hi]`.
+    window: (i64, i64),
+    /// Today's fetch for the selector, sent only on F6 or F10.
+    fallback: SelectorFetchPlan,
+    /// `None` for a `Raw` arm.
+    level: Option<LevelSide>,
+}
+
+/// One `Level` side's served and raw-read intervals and raw steps, cut to
+/// one time chunk.
+type ChunkCut = (
+    super::rollup::Intervals,
+    super::rollup::Intervals,
+    Vec<(u32, u32)>,
+);
+
+/// Issue #579 part 4: a `Level` side's coverage, from S1.
+struct LevelSide {
+    table: String,
+    shards: u32,
+    window: (i64, i64),
+    served: super::rollup::Intervals,
+    todo: super::rollup::Intervals,
+    read: super::rollup::Intervals,
+}
+
+impl LevelSide {
+    /// F11: a list longer than one statement names.
+    fn exceeds(&self, grid: super::grouped::Grid, range_ms: i64) -> bool {
+        let max = super::rollup::MAX_STATEMENT_INTERVALS;
+        self.served.len() > max
+            || self.read.len() > max
+            || super::grouped::raw_steps(grid, range_ms, &self.todo).len() > max
+    }
+}
+
+/// Issue #579 part 4: the node a [`PushSide`] list is staged for: shape A
+/// over the 60 s level with its `increase` scale, or shape C.
+enum NodeShape<'a> {
+    Level(&'a super::grouped::RangeShape, Option<f64>),
+    Join(&'a super::grouped::JoinShape),
+}
+
+/// One side of a [`NodeShape`], in side order.
+struct SideSpec<'a> {
+    func: super::grouped::PushedRangeFn,
+    range_ms: i64,
+    scale: Option<f64>,
+    metric_name: &'a str,
+}
+
+impl NodeShape<'_> {
+    fn grid(&self) -> super::grouped::Grid {
+        match self {
+            NodeShape::Level(r, _) => r.grid,
+            NodeShape::Join(j) => j.grid,
+        }
+    }
+
+    fn sides(&self) -> Vec<SideSpec<'_>> {
+        match self {
+            NodeShape::Level(r, scale) => vec![SideSpec {
+                func: r.func,
+                range_ms: r.range_ms,
+                scale: *scale,
+                metric_name: r.metric_name.as_deref().unwrap_or(""),
+            }],
+            NodeShape::Join(j) => [&j.lhs, &j.rhs]
+                .into_iter()
+                .map(|s| SideSpec {
+                    func: s.func,
+                    range_ms: s.range_ms,
+                    scale: s.scale,
+                    metric_name: &s.metric_name,
+                })
+                .collect(),
+        }
+    }
+
+    /// What `range_node` reads the rows by — the grid — and the output's
+    /// delayed name drop.
+    fn push(&self) -> (super::grouped::RangePush, bool) {
+        match self {
+            NodeShape::Level(r, _) => (super::grouped::decide_range(r), true),
+            NodeShape::Join(j) => (
+                super::grouped::RangePush {
+                    op: j.op,
+                    func: j.lhs.func,
+                    selector: j.lhs.selector,
+                    metric_name: Some(j.lhs.metric_name.clone()),
+                    grouping: j.grouping.clone(),
+                    grid: j.grid,
+                    range_ms: j.lhs.range_ms,
+                },
+                j.bool_modifier,
+            ),
+        }
+    }
+}
+
 /// Issue #579: a shape-A node as the phase-1 loop hands it to
 /// `stage_range_push`.
 struct RangeStage {
@@ -3610,14 +4282,20 @@ enum PendingPush {
         push: super::grouped::GroupedPush,
         sqls: Vec<String>,
     },
-    /// Shape A: one statement per time chunk, each with its first grid
-    /// index, and today's fetch for the selector, sent only on F6.
+    /// Shapes A and C: one statement per time chunk, each with its first
+    /// grid index, and today's fetch for each selector of the node, sent
+    /// only on F6 or F10.
     Range {
         self_pos: usize,
-        selector: SelectorId,
         push: super::grouped::RangePush,
         sqls: Vec<(u32, String)>,
-        fallback: SelectorFetchPlan,
+        fallbacks: Vec<(SelectorId, SelectorFetchPlan)>,
+        /// The output's delayed name drop: `true` over a range function,
+        /// shape C's `bool` (part 4, plan section 5.3).
+        drop_name: bool,
+        /// Part 4, explain only: each `Level` side's S4 and its uncovered
+        /// intervals.
+        levels: Vec<(SelectorId, String, super::rollup::Intervals)>,
     },
 }
 
@@ -3630,10 +4308,15 @@ enum PushResult {
     },
     Range {
         self_pos: usize,
-        selector: SelectorId,
         push: super::grouped::RangePush,
         chunks: Vec<(u32, Vec<super::grouped_rows::RangeAggRow>)>,
-        fallback: SelectorFetchPlan,
+        fallbacks: Vec<(SelectorId, SelectorFetchPlan)>,
+        drop_name: bool,
+        /// F10: a statement of the node raised the replica check.
+        behind: bool,
+        /// Part 4, explain only: per `Level` side, whether S4 found a level
+        /// row, and its uncovered intervals.
+        served: Vec<(SelectorId, bool, super::rollup::Intervals)>,
     },
 }
 
@@ -3898,8 +4581,9 @@ async fn nodes_offloaded(
                     self_pos,
                     push,
                     chunks,
+                    drop_name,
                     ..
-                } => match super::grouped::range_node(&push, chunks, &token)? {
+                } => match super::grouped::range_node(&push, chunks, drop_name, &token)? {
                     super::grouped::RangeOutcome::Node(node) => out.push((self_pos, node)),
                     // The caller took every result whose sentinel counted
                     // a histogram sample out before this point.

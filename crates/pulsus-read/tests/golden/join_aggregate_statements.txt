@@ -1,0 +1,650 @@
+-- golden[level_gather]
+SELECT fingerprint, arm, raw FROM (
+SELECT fingerprint, toUInt8(0) AS arm,
+  arrayFilter(p -> p.1 > 0 AND p.2 != 9218868437227405314, arrayMap((r, c) -> if(r.2 = 0, (toInt64(0), toUInt64(0)),
+      (r.2, reinterpretAsUInt64(if(isNaN(r.3), r.3, c)))), rows, cs)) AS raw
+FROM (
+  SELECT fingerprint, arrayResize(rows0, length(rows0) + chk) AS rows,
+    arrayFirstIndex(r -> r.2 > 0 AND NOT isNaN(r.3), rows) AS s,
+    arrayConcat(arrayWithConstant(toUInt64(if(s = 0, length(rows), s - 1)), 0.),
+                if(s = 0, CAST([], 'Array(Float64)'),
+                   arrayCumSum(arrayMap((r, i) -> if(i = 1, r.3, r.4), arraySlice(rows, s), arrayEnumerate(arraySlice(rows, s)))))) AS cs
+  FROM (
+SELECT fingerprint, rows AS rows0, max(toUInt8(fingerprint = 0 AND arrayAll(sh -> arrayAll(i -> arrayExists(j -> j.1 <= i.1 AND i.2 <= j.2,
+    arrayFold((acc, x) -> if(empty(acc) OR x.1 > acc[-1].2, arrayPushBack(acc, x), arrayPushBack(arrayPopBack(acc), (acc[-1].1, greatest(acc[-1].2, x.2)))),
+              arraySort(arrayMap(x -> (x.2, x.3), arrayFilter(x -> x.1 = sh, runs))), CAST([], 'Array(Tuple(Int64, Int64))'))),
+  CAST([(1793299800000, 1793365200000), (1793367000000, 1793386200000)], 'Array(Tuple(Int64, Int64))')), range(1, 1 + 1)))) OVER () AS ok,
+  throwIf(ok = 0, 'PULSUS_LEVEL_REPLICA_BEHIND') AS chk
+FROM (
+  SELECT fingerprint,
+    arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), arrayFilter(x -> x.5 = 0, groupArray((t_end, t_last, last, inc, kind))))) AS rows,
+    arrayMap(x -> (x.1, x.2, x.3), arrayFilter(x -> x.4 = 1, groupArray((shard, t_last, t_end, kind)))) AS runs
+  FROM (
+    SELECT toUInt32(1) AS shard, kind, fingerprint, t_end, t_last, last, inc
+    FROM metric_samples_60s
+    WHERE (kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_rx_total'
+  )
+))
+       OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > 1793299800000 AND t_last < 1793386800000)
+  )
+  GROUP BY fingerprint
+  UNION ALL
+  SELECT toUInt128(0), CAST([], 'Array(Tuple(Int64, Int64, Float64, Float64))'), CAST([], 'Array(Tuple(UInt32, Int64, Int64))')
+)
+  )
+)
+)
+WHERE notEmpty(raw)
+-- golden[sum by (instance) (rate + rate)]
+WITH 1793300400000 AS grid_start, 120000 AS grid_step, 721 AS grid_n
+SELECT gid, gi, agg FROM (
+SELECT gid, gi,
+  arrayCumSum(arrayPushFront(vs, 0.)) AS t,
+  arrayLastIndex(x -> isInfinite(x), t) AS inf_at,
+  arrayMap((p, x, s, j) -> if(j <= inf_at, 0., if(abs(p) >= abs(x), (p - s) + x, (x - s) + p)),
+           arrayPopBack(t), vs, arrayPopFront(t), arrayEnumerate(vs)) AS terms,
+  t[-1] + arrayCumSum(arrayPushFront(terms, 0.))[-1] AS agg
+FROM (
+  SELECT gid, gi, arraySort((x, r) -> r, groupArray(v), groupArray(rank)) AS vs
+  FROM (
+    SELECT p.gkey AS gid, p.rank AS rank, l.gi AS gi, l.v + r.v AS v
+    FROM (
+SELECT fingerprint, toUInt32(st.4) AS gi,
+  st.1.2 AS i_f, st.1.1 AS t_f, st.1.3 AS y_f, st.2.2 AS i_l, st.2.1 AS t_l, st.2.3 AS y_l, st.3 AS result,
+        i_l - i_f + 1 AS n,
+        toFloat64(t_f - (grid_start + gi * grid_step - 300000)) / 1000. AS d_start_raw,
+        toFloat64((grid_start + gi * grid_step) - t_l) / 1000. AS d_end_raw,
+        toFloat64(t_l - t_f) / 1000. AS sampled,
+        sampled / toFloat64(n - 1) AS avg_dur,
+        avg_dur * 1.1 AS threshold,
+        if(d_start_raw >= threshold, avg_dur / 2., d_start_raw) AS d_start_1,
+        if(result > 0. AND y_f >= 0., sampled * (y_f / result), d_start_1) AS d_zero,
+        if(d_zero < d_start_1, d_zero, d_start_1) AS d_start,
+        if(d_end_raw >= threshold, avg_dur / 2., d_end_raw) AS d_end,
+        ((sampled + d_start + d_end) / sampled) / (toFloat64(300000) / 1000.) AS factor,
+        result * factor AS v
+FROM (
+  SELECT fingerprint, arm, arrayJoin(sts) AS st
+  FROM (
+        SELECT fingerprint, arm,
+          arrayFilter(x -> x.1.2 > 0 AND x.2.2 > x.1.2, arrayZip(firsts, lasts,
+            if(empty(rs),
+               arrayMap((f, l) -> if(f.3 < 0., (l.3 - f.3) + 0., l.3 - f.3), firsts, lasts),
+               arrayMap((f, l) -> arrayCumSum(arrayPushFront(arrayMap(x -> x.2, arrayFilter(x -> x.1 > f.2 AND x.1 <= l.2, rs)),
+                                                            if(f.3 < 0., (l.3 - f.3) + 0., l.3 - f.3)))[-1], firsts, lasts)),
+            range(grid_n))) AS sts
+        FROM (
+          SELECT fingerprint, arm, rs,
+            arrayFilter((x, b) -> b, arrayFill((x, b) -> NOT b, m_l, arrayMap(x -> x.2 = 0, m_l)), arrayMap(x -> x.2 = 0, m_l)) AS lasts,
+            arrayFilter((x, b) -> b, arrayReverseFill((x, b) -> NOT b, m_f, arrayMap(x -> x.2 = 0, m_f)), arrayMap(x -> x.2 = 0, m_f)) AS firsts
+          FROM (
+            SELECT fingerprint, arm, rs,
+              arraySort((x, k) -> k, arrayConcat(pts_l, arrayMap(e -> (e, toUInt32(0), 0.), ends)),
+                        arrayConcat(arrayMap(x -> x.1 * 2, pts), arrayMap(e -> e * 2 + 1, ends))) AS m_l,
+              arraySort((x, k) -> k, arrayConcat(pts_f, arrayMap(e -> (e - 300000, toUInt32(0), 0.), ends)),
+                        arrayConcat(arrayMap(x -> x.1 * 2, pts), arrayMap(e -> (e - 300000) * 2 + 1, ends))) AS m_f
+            FROM (
+              SELECT fingerprint, arm, pts, rs,
+                arrayMap(g -> grid_start + toInt64(g) * grid_step, range(grid_n)) AS ends,
+                arrayReverseFill((x, b) -> b, pts, arrayMap((x, n) -> x.1 != n.1, pts, arrayPushBack(arrayPopFront(pts), (toInt64(-9223372036854775808), toUInt32(0), 0.)))) AS pts_l,
+                arrayFill((x, b) -> b, pts, arrayMap((x, p) -> x.1 != p.1, pts, arrayPushFront(arrayPopBack(pts), (toInt64(-9223372036854775808), toUInt32(0), 0.)))) AS pts_f
+              FROM (
+                SELECT fingerprint, arm,
+                  arrayMap((t, j, y) -> (t, toUInt32(j), y), ts, arrayEnumerate(ts), ys) AS pts,
+                  arrayFilter(x -> x.1 > 0, arrayMap((y, yp, j) -> if(j > 1 AND y < yp, (toUInt32(j), yp), (toUInt32(0), 0.)),
+                                                      ys, arrayPushFront(arrayPopBack(ys), 0.), arrayEnumerate(ys))) AS rs
+                FROM (
+                  SELECT fingerprint, arm,
+                    arrayFilter((t, k) -> k, arrayMap(x -> x.1, raw), keep) AS ts,
+                    arrayMap(b -> reinterpretAsFloat64(b), arrayFilter((b, k) -> k, arrayMap(x -> x.2, raw), keep)) AS ys
+                  FROM (
+                    SELECT fingerprint, arm, raw,
+                      arrayMap((x, p) -> x.1 != p.1 OR x.2 != p.2, raw, arrayPushFront(arrayPopBack(raw), (toInt64(-9223372036854775808), toUInt64(0)))) AS keep
+                    FROM (
+SELECT fingerprint, arm, raw FROM (
+SELECT fingerprint, toUInt8(0) AS arm,
+  arrayFilter(p -> p.1 > 0 AND p.2 != 9218868437227405314, arrayMap((r, c) -> if(r.2 = 0, (toInt64(0), toUInt64(0)),
+      (r.2, reinterpretAsUInt64(if(isNaN(r.3), r.3, c)))), rows, cs)) AS raw
+FROM (
+  SELECT fingerprint, arrayResize(rows0, length(rows0) + chk) AS rows,
+    arrayFirstIndex(r -> r.2 > 0 AND NOT isNaN(r.3), rows) AS s,
+    arrayConcat(arrayWithConstant(toUInt64(if(s = 0, length(rows), s - 1)), 0.),
+                if(s = 0, CAST([], 'Array(Float64)'),
+                   arrayCumSum(arrayMap((r, i) -> if(i = 1, r.3, r.4), arraySlice(rows, s), arrayEnumerate(arraySlice(rows, s)))))) AS cs
+  FROM (
+SELECT fingerprint, rows AS rows0, max(toUInt8(fingerprint = 0 AND arrayAll(sh -> arrayAll(i -> arrayExists(j -> j.1 <= i.1 AND i.2 <= j.2,
+    arrayFold((acc, x) -> if(empty(acc) OR x.1 > acc[-1].2, arrayPushBack(acc, x), arrayPushBack(arrayPopBack(acc), (acc[-1].1, greatest(acc[-1].2, x.2)))),
+              arraySort(arrayMap(x -> (x.2, x.3), arrayFilter(x -> x.1 = sh, runs))), CAST([], 'Array(Tuple(Int64, Int64))'))),
+  CAST([(1793299800000, 1793365200000), (1793367000000, 1793386200000)], 'Array(Tuple(Int64, Int64))')), range(1, 1 + 1)))) OVER () AS ok,
+  throwIf(ok = 0, 'PULSUS_LEVEL_REPLICA_BEHIND') AS chk
+FROM (
+  SELECT fingerprint,
+    arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), arrayFilter(x -> x.5 = 0, groupArray((t_end, t_last, last, inc, kind))))) AS rows,
+    arrayMap(x -> (x.1, x.2, x.3), arrayFilter(x -> x.4 = 1, groupArray((shard, t_last, t_end, kind)))) AS runs
+  FROM (
+    SELECT toUInt32(1) AS shard, kind, fingerprint, t_end, t_last, last, inc
+    FROM metric_samples_60s
+    WHERE (kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_rx_total'
+  )
+))
+       OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > 1793299800000 AND t_last < 1793386800000)
+  )
+  GROUP BY fingerprint
+  UNION ALL
+  SELECT toUInt128(0), CAST([], 'Array(Tuple(Int64, Int64, Float64, Float64))'), CAST([], 'Array(Tuple(UInt32, Int64, Int64))')
+)
+  )
+)
+)
+WHERE notEmpty(raw)
+UNION ALL
+                      SELECT fingerprint, toUInt8(1) AS arm, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
+                      FROM metric_samples
+                      WHERE org_id = '' AND ((unix_milli > 1793364900000 AND unix_milli <= 1793367300000) OR (unix_milli > 1793385900000 AND unix_milli <= 1793386800000)) AND fingerprint IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_rx_total'
+  )
+)
+                        AND reinterpretAsUInt64(value) != 9218868437227405314
+                      GROUP BY fingerprint
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+  )
+)
+WHERE arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, [(541, 559), (715, 721)]))
+    ) AS l
+    INNER JOIN (
+      SELECT lm.fingerprint AS lfp, rm.fingerprint AS rfp, lm.rank AS rank, arrayFilter(kv -> kv.1 IN ('instance'), arrayFilter(kv -> kv.1 NOT IN ('__type__', '__unit__'), lm.kv)) AS gkey
+      FROM (
+SELECT fingerprint, row_number() OVER (ORDER BY name, fingerprint) AS rank, JSONExtractKeysAndValues(l, 'String') AS kv
+FROM (
+  SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
+  FROM metric_labels
+  WHERE org_id = '' AND metric_name = 'p_rx_total'
+    AND fingerprint IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_rx_total'
+  )
+    )
+  GROUP BY fingerprint
+)
+      ) AS lm
+      INNER JOIN (
+SELECT fingerprint, row_number() OVER (ORDER BY name, fingerprint) AS rank, JSONExtractKeysAndValues(l, 'String') AS kv
+FROM (
+  SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
+  FROM metric_labels
+  WHERE org_id = '' AND metric_name = 'p_tx_total'
+    AND fingerprint IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_tx_total'
+  )
+    )
+  GROUP BY fingerprint
+)
+      ) AS rm ON lm.kv = rm.kv
+    ) AS p ON l.fingerprint = p.lfp
+    INNER JOIN (
+SELECT fingerprint, toUInt32(st.4) AS gi,
+  st.1.2 AS i_f, st.1.1 AS t_f, st.1.3 AS y_f, st.2.2 AS i_l, st.2.1 AS t_l, st.2.3 AS y_l, st.3 AS result,
+        i_l - i_f + 1 AS n,
+        toFloat64(t_f - (grid_start + gi * grid_step - 300000)) / 1000. AS d_start_raw,
+        toFloat64((grid_start + gi * grid_step) - t_l) / 1000. AS d_end_raw,
+        toFloat64(t_l - t_f) / 1000. AS sampled,
+        sampled / toFloat64(n - 1) AS avg_dur,
+        avg_dur * 1.1 AS threshold,
+        if(d_start_raw >= threshold, avg_dur / 2., d_start_raw) AS d_start_1,
+        if(result > 0. AND y_f >= 0., sampled * (y_f / result), d_start_1) AS d_zero,
+        if(d_zero < d_start_1, d_zero, d_start_1) AS d_start,
+        if(d_end_raw >= threshold, avg_dur / 2., d_end_raw) AS d_end,
+        ((sampled + d_start + d_end) / sampled) / (toFloat64(300000) / 1000.) AS factor,
+        result * factor AS v
+FROM (
+  SELECT fingerprint, arm, arrayJoin(sts) AS st
+  FROM (
+        SELECT fingerprint, arm,
+          arrayFilter(x -> x.1.2 > 0 AND x.2.2 > x.1.2, arrayZip(firsts, lasts,
+            if(empty(rs),
+               arrayMap((f, l) -> if(f.3 < 0., (l.3 - f.3) + 0., l.3 - f.3), firsts, lasts),
+               arrayMap((f, l) -> arrayCumSum(arrayPushFront(arrayMap(x -> x.2, arrayFilter(x -> x.1 > f.2 AND x.1 <= l.2, rs)),
+                                                            if(f.3 < 0., (l.3 - f.3) + 0., l.3 - f.3)))[-1], firsts, lasts)),
+            range(grid_n))) AS sts
+        FROM (
+          SELECT fingerprint, arm, rs,
+            arrayFilter((x, b) -> b, arrayFill((x, b) -> NOT b, m_l, arrayMap(x -> x.2 = 0, m_l)), arrayMap(x -> x.2 = 0, m_l)) AS lasts,
+            arrayFilter((x, b) -> b, arrayReverseFill((x, b) -> NOT b, m_f, arrayMap(x -> x.2 = 0, m_f)), arrayMap(x -> x.2 = 0, m_f)) AS firsts
+          FROM (
+            SELECT fingerprint, arm, rs,
+              arraySort((x, k) -> k, arrayConcat(pts_l, arrayMap(e -> (e, toUInt32(0), 0.), ends)),
+                        arrayConcat(arrayMap(x -> x.1 * 2, pts), arrayMap(e -> e * 2 + 1, ends))) AS m_l,
+              arraySort((x, k) -> k, arrayConcat(pts_f, arrayMap(e -> (e - 300000, toUInt32(0), 0.), ends)),
+                        arrayConcat(arrayMap(x -> x.1 * 2, pts), arrayMap(e -> (e - 300000) * 2 + 1, ends))) AS m_f
+            FROM (
+              SELECT fingerprint, arm, pts, rs,
+                arrayMap(g -> grid_start + toInt64(g) * grid_step, range(grid_n)) AS ends,
+                arrayReverseFill((x, b) -> b, pts, arrayMap((x, n) -> x.1 != n.1, pts, arrayPushBack(arrayPopFront(pts), (toInt64(-9223372036854775808), toUInt32(0), 0.)))) AS pts_l,
+                arrayFill((x, b) -> b, pts, arrayMap((x, p) -> x.1 != p.1, pts, arrayPushFront(arrayPopBack(pts), (toInt64(-9223372036854775808), toUInt32(0), 0.)))) AS pts_f
+              FROM (
+                SELECT fingerprint, arm,
+                  arrayMap((t, j, y) -> (t, toUInt32(j), y), ts, arrayEnumerate(ts), ys) AS pts,
+                  arrayFilter(x -> x.1 > 0, arrayMap((y, yp, j) -> if(j > 1 AND y < yp, (toUInt32(j), yp), (toUInt32(0), 0.)),
+                                                      ys, arrayPushFront(arrayPopBack(ys), 0.), arrayEnumerate(ys))) AS rs
+                FROM (
+                  SELECT fingerprint, arm,
+                    arrayFilter((t, k) -> k, arrayMap(x -> x.1, raw), keep) AS ts,
+                    arrayMap(b -> reinterpretAsFloat64(b), arrayFilter((b, k) -> k, arrayMap(x -> x.2, raw), keep)) AS ys
+                  FROM (
+                    SELECT fingerprint, arm, raw,
+                      arrayMap((x, p) -> x.1 != p.1 OR x.2 != p.2, raw, arrayPushFront(arrayPopBack(raw), (toInt64(-9223372036854775808), toUInt64(0)))) AS keep
+                    FROM (
+SELECT fingerprint, arm, raw FROM (
+SELECT fingerprint, toUInt8(0) AS arm,
+  arrayFilter(p -> p.1 > 0 AND p.2 != 9218868437227405314, arrayMap((r, c) -> if(r.2 = 0, (toInt64(0), toUInt64(0)),
+      (r.2, reinterpretAsUInt64(if(isNaN(r.3), r.3, c)))), rows, cs)) AS raw
+FROM (
+  SELECT fingerprint, arrayResize(rows0, length(rows0) + chk) AS rows,
+    arrayFirstIndex(r -> r.2 > 0 AND NOT isNaN(r.3), rows) AS s,
+    arrayConcat(arrayWithConstant(toUInt64(if(s = 0, length(rows), s - 1)), 0.),
+                if(s = 0, CAST([], 'Array(Float64)'),
+                   arrayCumSum(arrayMap((r, i) -> if(i = 1, r.3, r.4), arraySlice(rows, s), arrayEnumerate(arraySlice(rows, s)))))) AS cs
+  FROM (
+SELECT fingerprint, rows AS rows0, max(toUInt8(fingerprint = 0 AND arrayAll(sh -> arrayAll(i -> arrayExists(j -> j.1 <= i.1 AND i.2 <= j.2,
+    arrayFold((acc, x) -> if(empty(acc) OR x.1 > acc[-1].2, arrayPushBack(acc, x), arrayPushBack(arrayPopBack(acc), (acc[-1].1, greatest(acc[-1].2, x.2)))),
+              arraySort(arrayMap(x -> (x.2, x.3), arrayFilter(x -> x.1 = sh, runs))), CAST([], 'Array(Tuple(Int64, Int64))'))),
+  CAST([(1793299800000, 1793365200000), (1793367000000, 1793386200000)], 'Array(Tuple(Int64, Int64))')), range(1, 1 + 1)))) OVER () AS ok,
+  throwIf(ok = 0, 'PULSUS_LEVEL_REPLICA_BEHIND') AS chk
+FROM (
+  SELECT fingerprint,
+    arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), arrayFilter(x -> x.5 = 0, groupArray((t_end, t_last, last, inc, kind))))) AS rows,
+    arrayMap(x -> (x.1, x.2, x.3), arrayFilter(x -> x.4 = 1, groupArray((shard, t_last, t_end, kind)))) AS runs
+  FROM (
+    SELECT toUInt32(1) AS shard, kind, fingerprint, t_end, t_last, last, inc
+    FROM metric_samples_60s
+    WHERE (kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_tx_total'
+  )
+))
+       OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > 1793299800000 AND t_last < 1793386800000)
+  )
+  GROUP BY fingerprint
+  UNION ALL
+  SELECT toUInt128(0), CAST([], 'Array(Tuple(Int64, Int64, Float64, Float64))'), CAST([], 'Array(Tuple(UInt32, Int64, Int64))')
+)
+  )
+)
+)
+WHERE notEmpty(raw)
+UNION ALL
+                      SELECT fingerprint, toUInt8(1) AS arm, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
+                      FROM metric_samples
+                      WHERE org_id = '' AND ((unix_milli > 1793364900000 AND unix_milli <= 1793367300000) OR (unix_milli > 1793385900000 AND unix_milli <= 1793386800000)) AND fingerprint IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_tx_total'
+  )
+)
+                        AND reinterpretAsUInt64(value) != 9218868437227405314
+                      GROUP BY fingerprint
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+  )
+)
+WHERE arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, [(541, 559), (715, 721)]))
+    ) AS r ON r.fingerprint = p.rfp AND r.gi = l.gi
+  )
+  GROUP BY gid, gi
+)
+)
+UNION ALL
+SELECT CAST([('', '')], 'Array(Tuple(String, String))') AS gid, toUInt32(0) AS gi,
+  toFloat64((SELECT count() FROM metric_hist_samples WHERE org_id = '' AND ((unix_milli > 1793299800000 AND unix_milli <= 1793386800000 AND fingerprint IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_rx_total'
+  )
+)) OR (unix_milli > 1793299800000 AND unix_milli <= 1793386800000 AND fingerprint IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_tx_total'
+  )
+))))) AS agg
+ORDER BY gid, gi
+-- golden[count without (device) (rate > bool irate)]
+WITH 1793300400000 AS grid_start, 120000 AS grid_step, 721 AS grid_n
+SELECT gid, gi, agg FROM (
+SELECT gid, gi,
+  toFloat64(length(vs)) AS agg
+FROM (
+  SELECT gid, gi, arraySort((x, r) -> r, groupArray(v), groupArray(rank)) AS vs
+  FROM (
+    SELECT p.gkey AS gid, p.rank AS rank, l.gi AS gi, toFloat64(l.v > r.v) AS v
+    FROM (
+SELECT fingerprint, toUInt32(st.4) AS gi,
+  st.1.2 AS i_f, st.1.1 AS t_f, st.1.3 AS y_f, st.2.2 AS i_l, st.2.1 AS t_l, st.2.3 AS y_l, st.3 AS result,
+        i_l - i_f + 1 AS n,
+        toFloat64(t_f - (grid_start + gi * grid_step - 300000)) / 1000. AS d_start_raw,
+        toFloat64((grid_start + gi * grid_step) - t_l) / 1000. AS d_end_raw,
+        toFloat64(t_l - t_f) / 1000. AS sampled,
+        sampled / toFloat64(n - 1) AS avg_dur,
+        avg_dur * 1.1 AS threshold,
+        if(d_start_raw >= threshold, avg_dur / 2., d_start_raw) AS d_start_1,
+        if(result > 0. AND y_f >= 0., sampled * (y_f / result), d_start_1) AS d_zero,
+        if(d_zero < d_start_1, d_zero, d_start_1) AS d_start,
+        if(d_end_raw >= threshold, avg_dur / 2., d_end_raw) AS d_end,
+        ((sampled + d_start + d_end) / sampled) / (toFloat64(300000) / 1000.) AS factor,
+        result * factor AS v
+FROM (
+  SELECT fingerprint, arm, arrayJoin(sts) AS st
+  FROM (
+        SELECT fingerprint, arm,
+          arrayFilter(x -> x.1.2 > 0 AND x.2.2 > x.1.2, arrayZip(firsts, lasts,
+            if(empty(rs),
+               arrayMap((f, l) -> if(f.3 < 0., (l.3 - f.3) + 0., l.3 - f.3), firsts, lasts),
+               arrayMap((f, l) -> arrayCumSum(arrayPushFront(arrayMap(x -> x.2, arrayFilter(x -> x.1 > f.2 AND x.1 <= l.2, rs)),
+                                                            if(f.3 < 0., (l.3 - f.3) + 0., l.3 - f.3)))[-1], firsts, lasts)),
+            range(grid_n))) AS sts
+        FROM (
+          SELECT fingerprint, arm, rs,
+            arrayFilter((x, b) -> b, arrayFill((x, b) -> NOT b, m_l, arrayMap(x -> x.2 = 0, m_l)), arrayMap(x -> x.2 = 0, m_l)) AS lasts,
+            arrayFilter((x, b) -> b, arrayReverseFill((x, b) -> NOT b, m_f, arrayMap(x -> x.2 = 0, m_f)), arrayMap(x -> x.2 = 0, m_f)) AS firsts
+          FROM (
+            SELECT fingerprint, arm, rs,
+              arraySort((x, k) -> k, arrayConcat(pts_l, arrayMap(e -> (e, toUInt32(0), 0.), ends)),
+                        arrayConcat(arrayMap(x -> x.1 * 2, pts), arrayMap(e -> e * 2 + 1, ends))) AS m_l,
+              arraySort((x, k) -> k, arrayConcat(pts_f, arrayMap(e -> (e - 300000, toUInt32(0), 0.), ends)),
+                        arrayConcat(arrayMap(x -> x.1 * 2, pts), arrayMap(e -> (e - 300000) * 2 + 1, ends))) AS m_f
+            FROM (
+              SELECT fingerprint, arm, pts, rs,
+                arrayMap(g -> grid_start + toInt64(g) * grid_step, range(grid_n)) AS ends,
+                arrayReverseFill((x, b) -> b, pts, arrayMap((x, n) -> x.1 != n.1, pts, arrayPushBack(arrayPopFront(pts), (toInt64(-9223372036854775808), toUInt32(0), 0.)))) AS pts_l,
+                arrayFill((x, b) -> b, pts, arrayMap((x, p) -> x.1 != p.1, pts, arrayPushFront(arrayPopBack(pts), (toInt64(-9223372036854775808), toUInt32(0), 0.)))) AS pts_f
+              FROM (
+                SELECT fingerprint, arm,
+                  arrayMap((t, j, y) -> (t, toUInt32(j), y), ts, arrayEnumerate(ts), ys) AS pts,
+                  arrayFilter(x -> x.1 > 0, arrayMap((y, yp, j) -> if(j > 1 AND y < yp, (toUInt32(j), yp), (toUInt32(0), 0.)),
+                                                      ys, arrayPushFront(arrayPopBack(ys), 0.), arrayEnumerate(ys))) AS rs
+                FROM (
+                  SELECT fingerprint, arm,
+                    arrayFilter((t, k) -> k, arrayMap(x -> x.1, raw), keep) AS ts,
+                    arrayMap(b -> reinterpretAsFloat64(b), arrayFilter((b, k) -> k, arrayMap(x -> x.2, raw), keep)) AS ys
+                  FROM (
+                    SELECT fingerprint, arm, raw,
+                      arrayMap((x, p) -> x.1 != p.1 OR x.2 != p.2, raw, arrayPushFront(arrayPopBack(raw), (toInt64(-9223372036854775808), toUInt64(0)))) AS keep
+                    FROM (
+SELECT fingerprint, arm, raw FROM (
+SELECT fingerprint, toUInt8(0) AS arm,
+  arrayFilter(p -> p.1 > 0 AND p.2 != 9218868437227405314, arrayMap((r, c) -> if(r.2 = 0, (toInt64(0), toUInt64(0)),
+      (r.2, reinterpretAsUInt64(if(isNaN(r.3), r.3, c)))), rows, cs)) AS raw
+FROM (
+  SELECT fingerprint, arrayResize(rows0, length(rows0) + chk) AS rows,
+    arrayFirstIndex(r -> r.2 > 0 AND NOT isNaN(r.3), rows) AS s,
+    arrayConcat(arrayWithConstant(toUInt64(if(s = 0, length(rows), s - 1)), 0.),
+                if(s = 0, CAST([], 'Array(Float64)'),
+                   arrayCumSum(arrayMap((r, i) -> if(i = 1, r.3, r.4), arraySlice(rows, s), arrayEnumerate(arraySlice(rows, s)))))) AS cs
+  FROM (
+SELECT fingerprint, rows AS rows0, max(toUInt8(fingerprint = 0 AND arrayAll(sh -> arrayAll(i -> arrayExists(j -> j.1 <= i.1 AND i.2 <= j.2,
+    arrayFold((acc, x) -> if(empty(acc) OR x.1 > acc[-1].2, arrayPushBack(acc, x), arrayPushBack(arrayPopBack(acc), (acc[-1].1, greatest(acc[-1].2, x.2)))),
+              arraySort(arrayMap(x -> (x.2, x.3), arrayFilter(x -> x.1 = sh, runs))), CAST([], 'Array(Tuple(Int64, Int64))'))),
+  CAST([(1793299800000, 1793365200000), (1793367000000, 1793386200000)], 'Array(Tuple(Int64, Int64))')), range(1, 1 + 1)))) OVER () AS ok,
+  throwIf(ok = 0, 'PULSUS_LEVEL_REPLICA_BEHIND') AS chk
+FROM (
+  SELECT fingerprint,
+    arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), arrayFilter(x -> x.5 = 0, groupArray((t_end, t_last, last, inc, kind))))) AS rows,
+    arrayMap(x -> (x.1, x.2, x.3), arrayFilter(x -> x.4 = 1, groupArray((shard, t_last, t_end, kind)))) AS runs
+  FROM (
+    SELECT toUInt32(1) AS shard, kind, fingerprint, t_end, t_last, last, inc
+    FROM metric_samples_60s
+    WHERE (kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_rx_total'
+  )
+))
+       OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > 1793299800000 AND t_last < 1793386800000)
+  )
+  GROUP BY fingerprint
+  UNION ALL
+  SELECT toUInt128(0), CAST([], 'Array(Tuple(Int64, Int64, Float64, Float64))'), CAST([], 'Array(Tuple(UInt32, Int64, Int64))')
+)
+  )
+)
+)
+WHERE notEmpty(raw)
+UNION ALL
+                      SELECT fingerprint, toUInt8(1) AS arm, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
+                      FROM metric_samples
+                      WHERE org_id = '' AND ((unix_milli > 1793364900000 AND unix_milli <= 1793367300000) OR (unix_milli > 1793385900000 AND unix_milli <= 1793386800000)) AND fingerprint IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_rx_total'
+  )
+)
+                        AND reinterpretAsUInt64(value) != 9218868437227405314
+                      GROUP BY fingerprint
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+  )
+)
+WHERE arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, [(541, 559), (715, 721)]))
+    ) AS l
+    INNER JOIN (
+      SELECT lm.fingerprint AS lfp, rm.fingerprint AS rfp, lm.rank AS rank, arrayFilter(kv -> kv.1 NOT IN ('device'), lm.kv) AS gkey
+      FROM (
+SELECT fingerprint, row_number() OVER (ORDER BY name, fingerprint) AS rank, JSONExtractKeysAndValues(l, 'String') AS kv
+FROM (
+  SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
+  FROM metric_labels
+  WHERE org_id = '' AND metric_name = 'p_rx_total'
+    AND fingerprint IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_rx_total'
+  )
+    )
+  GROUP BY fingerprint
+)
+      ) AS lm
+      INNER JOIN (
+SELECT fingerprint, row_number() OVER (ORDER BY name, fingerprint) AS rank, JSONExtractKeysAndValues(l, 'String') AS kv
+FROM (
+  SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
+  FROM metric_labels
+  WHERE org_id = '' AND metric_name = 'p_tx_total'
+    AND fingerprint IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_tx_total'
+  )
+    )
+  GROUP BY fingerprint
+)
+      ) AS rm ON lm.kv = rm.kv
+    ) AS p ON l.fingerprint = p.lfp
+    INNER JOIN (
+SELECT fingerprint, toUInt32(st.4) AS gi,
+  st.1.2 AS i_f, st.1.1 AS t_f, st.1.3 AS y_f, st.2.2 AS i_l, st.2.1 AS t_l, st.2.3 AS y_l, st.3 AS result,
+        st.2.4 AS t_p, st.2.5 AS y_p,
+        if(y_l < y_p, y_l, y_l - y_p) / (toFloat64(t_l - t_p) / 1000.) AS v
+FROM (
+  SELECT fingerprint, arm, arrayJoin(sts) AS st
+  FROM (
+        SELECT fingerprint, arm,
+          arrayFilter(x -> x.1.2 > 0 AND x.2.2 > x.1.2, arrayZip(firsts, lasts,
+            if(empty(rs),
+               arrayMap((f, l) -> if(f.3 < 0., (l.3 - f.3) + 0., l.3 - f.3), firsts, lasts),
+               arrayMap((f, l) -> arrayCumSum(arrayPushFront(arrayMap(x -> x.2, arrayFilter(x -> x.1 > f.2 AND x.1 <= l.2, rs)),
+                                                            if(f.3 < 0., (l.3 - f.3) + 0., l.3 - f.3)))[-1], firsts, lasts)),
+            range(grid_n))) AS sts
+        FROM (
+          SELECT fingerprint, arm, rs,
+            arrayFilter((x, b) -> b, arrayFill((x, b) -> NOT b, m_l, arrayMap(x -> x.2 = 0, m_l)), arrayMap(x -> x.2 = 0, m_l)) AS lasts,
+            arrayFilter((x, b) -> b, arrayReverseFill((x, b) -> NOT b, m_f, arrayMap(x -> x.2 = 0, m_f)), arrayMap(x -> x.2 = 0, m_f)) AS firsts
+          FROM (
+            SELECT fingerprint, arm, rs,
+              arraySort((x, k) -> k, arrayConcat(pts_l, arrayMap(e -> (e, toUInt32(0), 0., toInt64(0), 0.), ends)),
+                        arrayConcat(arrayMap(x -> x.1 * 2, pts), arrayMap(e -> e * 2 + 1, ends))) AS m_l,
+              arraySort((x, k) -> k, arrayConcat(pts_f, arrayMap(e -> (e - 300000, toUInt32(0), 0., toInt64(0), 0.), ends)),
+                        arrayConcat(arrayMap(x -> x.1 * 2, pts), arrayMap(e -> (e - 300000) * 2 + 1, ends))) AS m_f
+            FROM (
+              SELECT fingerprint, arm, pts, rs,
+                arrayMap(g -> grid_start + toInt64(g) * grid_step, range(grid_n)) AS ends,
+                arrayReverseFill((x, b) -> b, pts, arrayMap((x, n) -> x.1 != n.1, pts, arrayPushBack(arrayPopFront(pts), (toInt64(-9223372036854775808), toUInt32(0), 0., toInt64(0), 0.)))) AS pts_l,
+                arrayFill((x, b) -> b, pts, arrayMap((x, p) -> x.1 != p.1, pts, arrayPushFront(arrayPopBack(pts), (toInt64(-9223372036854775808), toUInt32(0), 0., toInt64(0), 0.)))) AS pts_f
+              FROM (
+                SELECT fingerprint, arm,
+                  arrayMap((t, j, y, tp, yp) -> (t, toUInt32(j), y, tp, yp), ts, arrayEnumerate(ts), ys, arrayPushFront(arrayPopBack(ts), toInt64(0)), arrayPushFront(arrayPopBack(ys), 0.)) AS pts,
+                  arrayFilter(x -> x.1 > 0, arrayMap((y, yp, j) -> if(j > 1 AND y < yp, (toUInt32(j), yp), (toUInt32(0), 0.)),
+                                                      ys, arrayPushFront(arrayPopBack(ys), 0.), arrayEnumerate(ys))) AS rs
+                FROM (
+                  SELECT fingerprint, arm,
+                    arrayFilter((t, k) -> k, arrayMap(x -> x.1, raw), keep) AS ts,
+                    arrayMap(b -> reinterpretAsFloat64(b), arrayFilter((b, k) -> k, arrayMap(x -> x.2, raw), keep)) AS ys
+                  FROM (
+                    SELECT fingerprint, arm, raw,
+                      arrayMap((x, p) -> x.1 != p.1 OR x.2 != p.2, raw, arrayPushFront(arrayPopBack(raw), (toInt64(-9223372036854775808), toUInt64(0)))) AS keep
+                    FROM (
+                      SELECT fingerprint, toUInt8(1) AS arm, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
+                      FROM metric_samples
+                      WHERE org_id = '' AND unix_milli > 1793300100000 AND unix_milli <= 1793386800000 AND fingerprint IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_tx_total'
+  )
+)
+                        AND reinterpretAsUInt64(value) != 9218868437227405314
+                      GROUP BY fingerprint
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+  )
+)
+WHERE arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, [(0, 721)])) AND t_p > grid_start + gi * grid_step - 300000 AND t_l != t_p
+    ) AS r ON r.fingerprint = p.rfp AND r.gi = l.gi
+  )
+  GROUP BY gid, gi
+)
+)
+UNION ALL
+SELECT CAST([('', '')], 'Array(Tuple(String, String))') AS gid, toUInt32(0) AS gi,
+  toFloat64((SELECT count() FROM metric_hist_samples WHERE org_id = '' AND ((unix_milli > 1793299800000 AND unix_milli <= 1793386800000 AND fingerprint IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_rx_total'
+  )
+)) OR (unix_milli > 1793299800000 AND unix_milli <= 1793386800000 AND fingerprint IN (
+SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
+  AND bitAnd(hours, 16777215) != 0
+  AND fingerprint IN (
+    SELECT fingerprint
+    FROM metric_labels
+    WHERE metric_name = 'p_tx_total'
+  )
+))))) AS agg
+ORDER BY gid, gi
