@@ -58,7 +58,7 @@ metrics_dedup=${PULSUS_METRICS_DEDUP_WINDOW:-10000}
 log_dedup=${PULSUS_LOG_DEDUP_WINDOW:-10000}
 trace_dedup=${PULSUS_TRACE_DEDUP_WINDOW:-10000}
 rollup_levels=${PULSUS_ROLLUP_LEVELS-60,720,7200,86400}
-rollup_ranges=${PULSUS_ROLLUP_RANGES-3600,86400,604800,7776000}
+rollup_ranges=${PULSUS_ROLLUP_RANGES-10800,57600,604800,7776000}
 counter_buckets=${PULSUS_ROLLUP_COUNTER_BUCKETS-5}
 cold_volume=${PULSUS_COLD_VOLUME:-}
 metrics_hot=${PULSUS_METRICS_HOT_DAYS:-}
@@ -247,7 +247,7 @@ if [ -n "$rollup_levels" ]; then
 fi
 
 # Issue #18 follow-up: `PULSUS_ROLLUP_COUNTER_BUCKETS`, the buckets of a
-# level a `rate` or `increase` range covers at least. The same rule and
+# level under 720 s a `rate` or `increase` range covers at least. The same rule and
 # message as `pulsus_schema::parse_rollup_counter_buckets`.
 case "$counter_buckets" in
     '' | 0* | *[!0-9]* | ?????*) bad_counter_buckets=1 ;;

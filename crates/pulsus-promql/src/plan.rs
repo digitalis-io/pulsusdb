@@ -1534,8 +1534,16 @@ fn for_each_child(expr: &PlanExpr, f: &mut dyn FnMut(&PlanExpr)) {
 /// Issue #18: whether the expression reads the evaluation time — `time()`,
 /// a date function without an argument, or `timestamp` — anywhere in its
 /// tree. Such a range query keeps the request's own steps.
-pub fn reads_eval_time(_root: &PlanExpr) -> bool {
-    false
+pub fn reads_eval_time(root: &PlanExpr) -> bool {
+    if matches!(
+        root,
+        PlanExpr::Time | PlanExpr::DateFn { arg: None, .. } | PlanExpr::Timestamp { .. }
+    ) {
+        return true;
+    }
+    let mut found = false;
+    for_each_child(root, &mut |child| found = found || reads_eval_time(child));
+    found
 }
 
 /// Issue #32 code-review round-1 fix: a `match[]` discovery selector

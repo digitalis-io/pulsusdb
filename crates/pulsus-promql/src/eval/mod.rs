@@ -444,6 +444,14 @@ fn evaluate_counted_with(
     let mut saw_vector = false;
     let mut saw_scalar = false;
 
+    // Issue #18: a query read at a level's bucket ends (every selector has
+    // the same `fill`) is evaluated once per bucket end `τ = ⌈t/L⌉·L` for
+    // the steps at or before the last bucket end, each step taking the
+    // value of the bucket that holds it; later steps are evaluated at their
+    // own times. Points stay at the request's times, so the identity map
+    // and the name latch below are those of any range query.
+    let fill = plan.selectors.first().and_then(|s| s.fill);
+    let mut held: Option<(i64, StepValue)> = None;
     let mut t = p.start_ms;
     while t <= p.end_ms {
         // Issue #93: one `Relaxed` load per step — O(1), no allocation, no
@@ -451,7 +459,28 @@ fn evaluate_counted_with(
         if caches.cancel.is_cancelled() {
             return Err(PromqlError::Cancelled);
         }
-        match eval_step(&plan.root, &plan.selectors, data, t, p.lookback_ms, &caches)? {
+        let tau = match fill {
+            Some(f) if t <= f.until_ms => -(-t).div_euclid(f.width_ms) * f.width_ms,
+            _ => t,
+        };
+        let value = match &held {
+            Some((at, v)) if fill.is_some() && *at == tau => v.clone(),
+            _ => {
+                let v = eval_step(
+                    &plan.root,
+                    &plan.selectors,
+                    data,
+                    tau,
+                    p.lookback_ms,
+                    &caches,
+                )?;
+                if fill.is_some() {
+                    held = Some((tau, v.clone()));
+                }
+                v
+            }
+        };
+        match value {
             StepValue::Vector(v) => {
                 saw_vector = true;
                 for s in v {
@@ -2201,13 +2230,28 @@ enum RangeMode {
 /// Issue #18: a selector's window at evaluation time `t_ms`: its end
 /// `eff_t`, the range it is read with, and whether its series come from the
 /// second read. Without `fill`, `(@ or t) − offset` and the selector's own
-/// range, from the first read.
+/// range, from the first read. Filled, a time at or before the last bucket
+/// end is already a bucket end, read from the first read over `range_ms`;
+/// a later one from the second, over `tail_range_ms`.
 fn window_end(sel: &SelectorSpec, t_ms: i64) -> (i64, Option<i64>, bool) {
-    (
-        sel.at_ms.unwrap_or(t_ms) - sel.offset_ms,
-        sel.range_ms,
-        false,
-    )
+    match sel.fill {
+        None => (
+            sel.at_ms.unwrap_or(t_ms) - sel.offset_ms,
+            sel.range_ms,
+            false,
+        ),
+        Some(f) if t_ms <= f.until_ms => (t_ms - sel.offset_ms, sel.range_ms, false),
+        Some(f) => (t_ms - sel.offset_ms, f.tail_range_ms, true),
+    }
+}
+
+/// Issue #18: `written / read` when a selector's range was read wider than
+/// written, `read` being the range of the read in use.
+fn widened_scale(sel: &SelectorSpec, read: i64) -> Option<f64> {
+    match sel.written_range_ms {
+        Some(w) if w != read && read > 0 => Some(w as f64 / read as f64),
+        _ => None,
+    }
 }
 
 /// A range source resolved at one evaluation step: the `(lower_excl,
@@ -2907,14 +2951,11 @@ fn eval_step(
             )?;
             // Issue #18: the reader rounds a `rate` or `increase` range up
             // to whole level buckets; a rounded `increase` is scaled back to
-            // the range asked, so it stays `rate × range`.
+            // the range asked, so it stays `rate × range`. The range read is
+            // the one of the read in use.
             let scale = match (func, source) {
                 (crate::plan::RangeFn::Increase, RangeSource::Selector(id)) => {
-                    let sel = &selectors[*id];
-                    match (sel.written_range_ms, sel.range_ms) {
-                        (Some(w), Some(r)) if w != r && r > 0 => Some(w as f64 / r as f64),
-                        _ => None,
-                    }
+                    widened_scale(&selectors[*id], src.range_ms)
                 }
                 _ => None,
             };
@@ -3012,6 +3053,14 @@ fn eval_step(
                 lookback_ms,
             )?;
             let keeps_name = matches!(func, OverTimeFn::Last | OverTimeFn::First);
+            // Issue #18: a `sum_over_time` read over whole level buckets
+            // wider than written is scaled back to the range asked.
+            let sum_scale = match (func, source) {
+                (OverTimeFn::Sum, RangeSource::Selector(id)) => {
+                    widened_scale(&selectors[*id], src.range_ms)
+                }
+                _ => None,
+            };
             let mut out = Vec::new();
             for series in src.series {
                 // M7-A5b-iii: `sum_over_time`/`avg_over_time`'s histogram
@@ -3053,7 +3102,13 @@ fn eval_step(
                     )
                 };
                 if let Some(value) = result {
-                    let (v, h) = over_time_value_to_sample_fields(value);
+                    let (mut v, mut h) = over_time_value_to_sample_fields(value);
+                    if let Some(f) = sum_scale {
+                        v *= f;
+                        if let Some(h) = h.as_mut() {
+                            h.mul(f);
+                        }
+                    }
                     out.push(InstantSample {
                         labels: series.labels,
                         // Retained name always (issue #86: selector

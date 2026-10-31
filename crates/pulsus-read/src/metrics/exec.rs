@@ -708,36 +708,246 @@ impl MetricsEngine {
         p: &MetricQueryParams,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<(QueryResult, pulsus_promql::Annotations), ReadError> {
+        let budget = SampleBudget::new(self.config.max_samples);
         let levels = self
             .rollup_levels
             .as_ref()
             .and_then(|slot| slot.get())
             .filter(|l| !l.levels.is_empty());
-        // Issue #18: a range query keeps the request's grid. Its range picks
-        // the widest level a selector may read; each selector reads the
-        // widest level at most that whose buckets end at its window edges
-        // (`rollup::route`). An instant query routes at the smallest level.
-        let routing: Option<(std::sync::Arc<super::rollup::Levels>, i64)> =
-            levels.and_then(|levels| {
-                let res = if p.step_ms == 0 {
-                    Some(levels.levels[0].res_ms)
-                } else {
-                    super::rollup::resolution(p, &levels)
-                };
-                res.map(|res| (levels, res))
-            });
         let plan_params = p.plan_params(self.config.experimental_functions, self.lookback_ms);
         let mut plan = pulsus_promql::plan(expr, plan_params)?;
-        // D6: before the pushdown verdicts and the fetch windows, which read
-        // `range_ms`. `written_range_ms` keeps the range asked.
-        if let Some((levels, res)) = routing.as_ref() {
-            for sel in &mut plan.selectors {
-                if let Some(r) = super::rollup::round_counter_range(sel, &plan_params, levels, *res)
-                {
-                    sel.range_ms = Some(r);
+        // Issue #18: a range query whose range selects a level, and whose
+        // selectors that level or a finer one serves at its bucket ends, is
+        // read at them (`rollup::lattice`).
+        let lattice = levels.as_ref().filter(|_| p.step_ms > 0).and_then(|lv| {
+            super::rollup::lattice(&plan, p, lv).map(|l| (std::sync::Arc::clone(lv), l))
+        });
+        let data = match lattice {
+            None => {
+                let routing = request_grid_routing(p, levels);
+                round_on_request_grid(&mut plan, routing.as_ref());
+                self.read_selectors(tenant, &plan, p, routing, true, &budget, explain)
+                    .await?
+            }
+            Some((lv, l)) => {
+                // D10: what the request's own steps would push, counted on
+                // that plan before any range moves.
+                let filled = if l.until_ms.is_some() {
+                    self.request_grid_pushes(&plan, p, &lv)
+                } else {
+                    0
+                };
+                for sel in &mut plan.selectors {
+                    if let Some(r) = super::rollup::lattice_range(sel, &lv, l.width) {
+                        sel.range_ms = Some(r);
+                    }
+                }
+                // D9: `rollup_lattice` first, then the declines, then the
+                // reads' stages.
+                if let Some(e) = explain.as_mut() {
+                    e.push("rollup_lattice", String::new(), Some(lattice_note(&l, p)));
+                    for _ in 0..filled {
+                        e.push(
+                            "pushed_aggregate",
+                            "declined: Filled".to_string(),
+                            Some(FILLED_NOTE.to_string()),
+                        );
+                    }
+                    e.rollup = true;
+                }
+                match l.until_ms {
+                    None => {
+                        self.read_selectors(
+                            tenant,
+                            &plan,
+                            p,
+                            Some((lv, l.width)),
+                            true,
+                            &budget,
+                            explain,
+                        )
+                        .await?
+                    }
+                    Some(gl) => {
+                        self.read_filled(tenant, &mut plan, p, (lv, l, gl), &budget, explain)
+                            .await?
+                    }
                 }
             }
+        };
+
+        // Issue #93 (finding 2): `pulsus_promql::evaluate` is CPU-bound and
+        // multi-hundred-ms at scale — offload it off the reactor onto the
+        // blocking pool so a heavy range eval cannot stall a tokio worker
+        // (the sole latency win here). `plan`/`data` are owned
+        // (`QueryPlan`/`SeriesData` carry no lifetimes) and `Send + 'static`,
+        // and `fetch_rows` fully drained every `ChRowStream` into a `Vec`
+        // before `join_all` completed above, so NO pooled-connection lease
+        // is held across this offload.
+        //
+        // Cancellation/concurrency bound (issue #101, hardening #93's Δ2):
+        // tokio does NOT cancel a `spawn_blocking` task when its awaiter is
+        // dropped. `self.eval_gate` (the shared `AppState`-owned
+        // `EvalGate`) bounds BOTH in-flight and queued evals: the permit is
+        // acquired inside `run_blocking` — AFTER the `join_all` fetch above
+        // fully drained every `ChRowStream`, so no pooled-connection lease
+        // is ever held across the offload — and released only when the
+        // blocking eval finishes. Exhaustion is a bounded wait
+        // (`acquire().await`), bounded by the upstream request deadline
+        // (`middleware::RequestDeadlineLayer`, `query_timeout`), whose
+        // breach on this surface is `503`/`timeout` since issue #471; a
+        // timed-out/disconnected waiter releases its queued reservation
+        // cleanly. No 429 and no new timeout knob.
+        //
+        // Cooperative cancellation (issue #93, follow-up): a disconnected/
+        // timed-out client's eval used to still run to completion once
+        // admitted (the gate only bounds concurrency, not duration).
+        // `evaluate_offloaded` now arms a [`CancelOnDrop`] guard that fires
+        // when this async frame is dropped, so an already-abandoned eval
+        // bails at its next `pulsus_promql` checkpoint instead of burning a
+        // full evaluation.
+        //
+        // The only reachable `JoinError` is a PANIC in `evaluate_cancellable`:
+        // we own the handle and `.await` it directly (never `abort`, never
+        // drop it early), so cancellation is unreachable. Re-raising the
+        // panic preserves today's panic-on-bug behavior exactly (no new
+        // `ReadError` variant — a panic is not a domain error).
+        let (value, annotations) = evaluate_offloaded(
+            &self.eval_gate,
+            plan,
+            data,
+            pulsus_promql::evaluate_cancellable,
+        )
+        .await?;
+        Ok((value_to_query_result(value), annotations))
+    }
+
+    /// Issue #18: the two reads of a range query filled from a level's
+    /// bucket ends — the bucket ends `(g0, gl, L)` and, when a step follows
+    /// `gl`, the steps after it (F2) — concurrently, over one budget. Sets
+    /// each selector's `fill`.
+    async fn read_filled(
+        &self,
+        tenant: &Tenant,
+        plan: &mut pulsus_promql::QueryPlan,
+        p: &MetricQueryParams,
+        (lv, l, gl): (
+            std::sync::Arc<super::rollup::Levels>,
+            super::rollup::Lattice,
+            i64,
+        ),
+        budget: &SampleBudget,
+        explain: Option<&mut PlanExplain>,
+    ) -> Result<SeriesData, ReadError> {
+        let w = l.width;
+        let qa = MetricQueryParams {
+            start_ms: -(-p.start_ms).div_euclid(w) * w,
+            end_ms: gl,
+            step_ms: w,
+        };
+        let mut first = plan.clone();
+        first.params = qa.plan_params(self.config.experimental_functions, self.lookback_ms);
+        let second = l.tail.map(|t| {
+            let mut q = plan.clone();
+            q.params = t.plan_params(self.config.experimental_functions, self.lookback_ms);
+            for (s, orig) in q.selectors.iter_mut().zip(&plan.selectors) {
+                s.range_ms = orig.written_range_ms;
+                if let Some(r) = super::rollup::round_counter_range(s, &q.params, &lv, w) {
+                    s.range_ms = Some(r);
+                }
+            }
+            (q, t)
+        });
+        let (mut e1, mut e2) = (
+            explain.as_ref().map(|_| PlanExplain::new("metrics")),
+            explain.as_ref().map(|_| PlanExplain::new("metrics")),
+        );
+        let a = self.read_selectors(
+            tenant,
+            &first,
+            &qa,
+            Some((std::sync::Arc::clone(&lv), w)),
+            false,
+            budget,
+            e1.as_mut(),
+        );
+        let b = async {
+            match &second {
+                Some((q, t)) => self
+                    .read_selectors(
+                        tenant,
+                        q,
+                        t,
+                        Some((std::sync::Arc::clone(&lv), w)),
+                        false,
+                        budget,
+                        e2.as_mut(),
+                    )
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        };
+        let (a, b) = join(a, b).await;
+        let (mut data, b) = (a?, b?);
+        for (i, s) in plan.selectors.iter_mut().enumerate() {
+            let tail_range_ms = second.as_ref().and_then(|(q, _)| q.selectors[i].range_ms);
+            s.fill = Some(pulsus_promql::SelectorFill {
+                width_ms: w,
+                until_ms: gl,
+                tail_range_ms,
+            });
         }
+        if let Some(b) = b {
+            data.take_as_tail(b);
+        }
+        if let Some(e) = explain {
+            for x in [e1, e2].into_iter().flatten() {
+                e.append(x);
+            }
+        }
+        Ok(data)
+    }
+
+    /// Issue #18, D10: the nodes the request's own steps would push — the
+    /// plan given the request's routing, rounding and arms, as a query read
+    /// at its own steps is — counted by `node_verdicts`.
+    fn request_grid_pushes(
+        &self,
+        plan: &pulsus_promql::QueryPlan,
+        p: &MetricQueryParams,
+        levels: &std::sync::Arc<super::rollup::Levels>,
+    ) -> usize {
+        let mut clone = plan.clone();
+        let routing = request_grid_routing(p, Some(std::sync::Arc::clone(levels)));
+        round_on_request_grid(&mut clone, routing.as_ref());
+        let arms: HashMap<SelectorId, super::grouped::Arm> = clone
+            .selectors
+            .iter()
+            .map(|sel| (sel.id, arm_of(sel, &clone.params, routing.as_ref())))
+            .collect();
+        super::grouped::node_verdicts(&clone, &clone.params, &self.config, &arms)
+            .iter()
+            .filter(|(_, v)| v.is_ok())
+            .count()
+    }
+
+    /// Every selector's statements, run, and the pushed nodes' answers: the
+    /// reads of `plan` on the grid `q` (`plan.params` is `q`'s), each
+    /// selector routed by `routing`. With `push` false no node is pushed and
+    /// no push stage is written (issue #18: a filled query).
+    #[allow(clippy::too_many_arguments)]
+    async fn read_selectors(
+        &self,
+        tenant: &Tenant,
+        plan: &pulsus_promql::QueryPlan,
+        q: &MetricQueryParams,
+        routing: Option<(std::sync::Arc<super::rollup::Levels>, i64)>,
+        push: bool,
+        budget: &SampleBudget,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<SeriesData, ReadError> {
+        let plan_params = plan.params;
         // Issue #579 part 4: each selector's arm, by `routed_series`' own
         // test, after the range is rounded and before the verdicts.
         let arms: HashMap<SelectorId, super::grouped::Arm> = plan
@@ -801,8 +1011,12 @@ impl MetricsEngine {
         // Part 4: shape-C nodes in written order, staged after the loop once
         // both sides are recorded.
         let mut joins: Vec<super::grouped::PushShape> = Vec::new();
-        for (_, verdict) in super::grouped::node_verdicts(&plan, &plan_params, &self.config, &arms)
-        {
+        let verdicts = if push {
+            super::grouped::node_verdicts(plan, &plan_params, &self.config, &arms)
+        } else {
+            Vec::new()
+        };
+        for (_, verdict) in verdicts {
             match verdict {
                 Ok(node) => {
                     for id in node.selectors() {
@@ -1336,7 +1550,7 @@ impl MetricsEngine {
         // nothing: phase 2 below fetches and evaluates exactly as it did
         // before this existed.
         if let Some(e) = explain.as_mut() {
-            for shape in compile::plan_shapes(&plan, &reads, p)? {
+            for shape in compile::plan_shapes(plan, &reads, q)? {
                 e.push_plan(shape);
             }
         }
@@ -1345,23 +1559,19 @@ impl MetricsEngine {
         // ratified binop-concurrency contract): execute every selector's
         // already-built fetch plan at once via `join_all`. ONE sample
         // budget (issue #138) spans the whole set — the per-query bound,
-        // not a per-selector one.
-        let sample_budget = SampleBudget::new(self.config.max_samples);
+        // not a per-selector one — and, issue #18, both reads of a query
+        // read at a level's bucket ends.
 
         // Issues #549 and #579: every pushed node's statements run
         // concurrently with every other selector's fetch. Their rows are
-        // charged to the SAME `sample_budget`, per drained row, inside the
+        // charged to the SAME `budget`, per drained row, inside the
         // same drain loop.
         let fetches = plan
             .selectors
             .iter()
             .zip(fetch_plans)
-            .map(|(sel, fetch_plan)| {
-                self.execute_fetch_plan(tenant, sel, fetch_plan, &sample_budget)
-            });
-        let pushes = pending
-            .into_iter()
-            .map(|p| self.run_push(p, &sample_budget));
+            .map(|(sel, fetch_plan)| self.execute_fetch_plan(tenant, sel, fetch_plan, budget));
+        let pushes = pending.into_iter().map(|p| self.run_push(p, budget));
         let (fetched, pushed) = join(join_all(fetches), join_all(pushes)).await;
 
         let mut data = SeriesData::new();
@@ -1460,12 +1670,7 @@ impl MetricsEngine {
         let refetched: Vec<Result<FetchedWithTrace, ReadError>> =
             join_all(fallbacks.iter_mut().map(|(selector, fallback)| {
                 let fetch_plan = std::mem::replace(fallback, SelectorFetchPlan::Empty);
-                self.execute_fetch_plan(
-                    tenant,
-                    &plan.selectors[*selector],
-                    fetch_plan,
-                    &sample_budget,
-                )
+                self.execute_fetch_plan(tenant, &plan.selectors[*selector], fetch_plan, budget)
             }))
             .await;
         for ((selector, _), series) in fallbacks.into_iter().zip(refetched) {
@@ -1486,51 +1691,7 @@ impl MetricsEngine {
                 data.insert_pushed(self_pos, node);
             }
         }
-
-        // Issue #93 (finding 2): `pulsus_promql::evaluate` is CPU-bound and
-        // multi-hundred-ms at scale — offload it off the reactor onto the
-        // blocking pool so a heavy range eval cannot stall a tokio worker
-        // (the sole latency win here). `plan`/`data` are owned
-        // (`QueryPlan`/`SeriesData` carry no lifetimes) and `Send + 'static`,
-        // and `fetch_rows` fully drained every `ChRowStream` into a `Vec`
-        // before `join_all` completed above, so NO pooled-connection lease
-        // is held across this offload.
-        //
-        // Cancellation/concurrency bound (issue #101, hardening #93's Δ2):
-        // tokio does NOT cancel a `spawn_blocking` task when its awaiter is
-        // dropped. `self.eval_gate` (the shared `AppState`-owned
-        // `EvalGate`) bounds BOTH in-flight and queued evals: the permit is
-        // acquired inside `run_blocking` — AFTER the `join_all` fetch above
-        // fully drained every `ChRowStream`, so no pooled-connection lease
-        // is ever held across the offload — and released only when the
-        // blocking eval finishes. Exhaustion is a bounded wait
-        // (`acquire().await`), bounded by the upstream request deadline
-        // (`middleware::RequestDeadlineLayer`, `query_timeout`), whose
-        // breach on this surface is `503`/`timeout` since issue #471; a
-        // timed-out/disconnected waiter releases its queued reservation
-        // cleanly. No 429 and no new timeout knob.
-        //
-        // Cooperative cancellation (issue #93, follow-up): a disconnected/
-        // timed-out client's eval used to still run to completion once
-        // admitted (the gate only bounds concurrency, not duration).
-        // `evaluate_offloaded` now arms a [`CancelOnDrop`] guard that fires
-        // when this async frame is dropped, so an already-abandoned eval
-        // bails at its next `pulsus_promql` checkpoint instead of burning a
-        // full evaluation.
-        //
-        // The only reachable `JoinError` is a PANIC in `evaluate_cancellable`:
-        // we own the handle and `.await` it directly (never `abort`, never
-        // drop it early), so cancellation is unreachable. Re-raising the
-        // panic preserves today's panic-on-bug behavior exactly (no new
-        // `ReadError` variant — a panic is not a domain error).
-        let (value, annotations) = evaluate_offloaded(
-            &self.eval_gate,
-            plan,
-            data,
-            pulsus_promql::evaluate_cancellable,
-        )
-        .await?;
-        Ok((value_to_query_result(value), annotations))
+        Ok(data)
     }
 
     /// The fetch plan of a concrete-name selector from its resolution —
@@ -4066,6 +4227,63 @@ fn instant_push_declined(explain: Option<&mut PlanExplain>, reason: super::group
             Some("issue #549: this selector takes the sample fetch below".to_string()),
         );
     }
+}
+
+/// Issue #18: a query read at its own steps — the request's grid. Its
+/// range picks the widest level a selector may read; each selector reads
+/// the widest level at most that whose buckets end at its window edges
+/// (`rollup::route`). An instant query routes at the smallest level.
+fn request_grid_routing(
+    p: &MetricQueryParams,
+    levels: Option<std::sync::Arc<super::rollup::Levels>>,
+) -> Option<(std::sync::Arc<super::rollup::Levels>, i64)> {
+    levels.and_then(|levels| {
+        let res = if p.step_ms == 0 {
+            Some(levels.levels[0].res_ms)
+        } else {
+            super::rollup::resolution(p, &levels)
+        };
+        res.map(|res| (levels, res))
+    })
+}
+
+/// D6: before the pushdown verdicts and the fetch windows, which read
+/// `range_ms`. `written_range_ms` keeps the range asked.
+fn round_on_request_grid(
+    plan: &mut pulsus_promql::QueryPlan,
+    routing: Option<&(std::sync::Arc<super::rollup::Levels>, i64)>,
+) {
+    if let Some((levels, res)) = routing {
+        let params = plan.params;
+        for sel in &mut plan.selectors {
+            if let Some(r) = super::rollup::round_counter_range(sel, &params, levels, *res) {
+                sel.range_ms = Some(r);
+            }
+        }
+    }
+}
+
+/// Issue #18, D10: the note of a node a filled query does not push.
+const FILLED_NOTE: &str =
+    "issue #18: the request is filled; the database answers this node on the request's steps only";
+
+/// Issue #18, D9: the `rollup_lattice` stage's note.
+fn lattice_note(l: &super::rollup::Lattice, p: &MetricQueryParams) -> String {
+    let width = super::rollup::duration_text(l.width);
+    let Some(gl) = l.until_ms else {
+        return format!("lattice {width} on the request's steps");
+    };
+    let g0 = -(-p.start_ms).div_euclid(l.width) * l.width;
+    let mut note =
+        format!("lattice {width} from {g0} to {gl}, each step takes the bucket that holds it");
+    if let Some(t) = l.tail {
+        note.push_str(&format!(
+            "; steps from {} at step {}",
+            t.start_ms,
+            super::rollup::duration_text(t.step_ms)
+        ));
+    }
+    note
 }
 
 /// Issue #579 part 4: a selector's arm — `Level` exactly where

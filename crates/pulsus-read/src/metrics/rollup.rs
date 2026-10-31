@@ -32,8 +32,8 @@ pub struct Level {
 }
 
 /// The levels the database holds, smallest first, the shard count a
-/// level's coverage is intersected over, and the buckets of a level a
-/// `rate` or `increase` range covers at least.
+/// level's coverage is intersected over, and the buckets of a level under
+/// 720 s a `rate` or `increase` range covers at least.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Levels {
     pub levels: Vec<Level>,
@@ -231,8 +231,9 @@ pub fn resolution(p: &MetricQueryParams, levels: &Levels) -> Option<i64> {
 /// its time.
 ///
 /// Of the levels of width at most `res` whose time fits: the largest that
-/// `⌈r / w⌉ × w` covers at least `counter_buckets` times, read over that
-/// range; else `counter_buckets` buckets of the smallest.
+/// `⌈r / w⌉ × w` covers at least `min_buckets(w)` times (`counter_buckets`
+/// under 720 s, one from 720 s), read over that range; else `min_buckets`
+/// buckets of the smallest.
 pub fn round_counter_range(
     sel: &SelectorSpec,
     p: &PlanParams,
@@ -247,7 +248,6 @@ pub fn round_counter_range(
         return None;
     }
     let r = i128::from(sel.range_ms?);
-    let buckets = i128::from(levels.counter_buckets);
     let fit: Vec<i128> = levels
         .levels
         .iter()
@@ -258,15 +258,23 @@ pub fn round_counter_range(
         .iter()
         .rev()
         .map(|&w| (w, (r + w - 1).div_euclid(w)))
-        .find(|&(_, n)| n >= buckets)
+        .find(|&(w, n)| n >= i128::from(min_buckets(levels, RollupUse::Counter, w as i64)))
         .map(|(w, n)| n * w)
-        .or_else(|| fit.iter().min().map(|&w| buckets * w))?;
+        .or_else(|| {
+            fit.iter()
+                .min()
+                .map(|&w| i128::from(min_buckets(levels, RollupUse::Counter, w as i64)) * w)
+        })?;
     i64::try_from(rounded).ok()
 }
 
 /// D4: the buckets of a level of width `w` a range of `use_` covers at least.
-pub fn min_buckets(levels: &Levels, _use_: RollupUse, _w: i64) -> i64 {
-    i64::from(levels.counter_buckets)
+pub fn min_buckets(levels: &Levels, use_: RollupUse, w: i64) -> i64 {
+    if use_ == RollupUse::Counter && w < START_POINT_FROM_MS {
+        i64::from(levels.counter_buckets)
+    } else {
+        1
+    }
 }
 
 /// D5 and F2: a lattice-path range query.
@@ -281,13 +289,67 @@ pub struct Lattice {
 }
 
 /// D3: the range a selector is read with at the bucket ends; `None` without a range or a use.
-pub fn lattice_range(_sel: &SelectorSpec, _levels: &Levels, _width: i64) -> Option<i64> {
-    None
+pub fn lattice_range(sel: &SelectorSpec, levels: &Levels, width: i64) -> Option<i64> {
+    let (r, use_) = (i128::from(sel.range_ms?), sel.rollup_use?);
+    let w = i128::from(width);
+    let n = ((r + w - 1) / w).max(i128::from(min_buckets(levels, use_, width)));
+    i64::try_from(n * w).ok()
 }
 
 /// D2 and D5: the lattice of a range query, or `None` for `main`'s path.
-pub fn lattice(_plan: &QueryPlan, _p: &MetricQueryParams, _levels: &Levels) -> Option<Lattice> {
-    None
+pub fn lattice(plan: &QueryPlan, p: &MetricQueryParams, levels: &Levels) -> Option<Lattice> {
+    let width = resolution(p, levels)?;
+    if plan.selectors.is_empty()
+        || plan.selectors.iter().any(|s| s.at_ms.is_some())
+        || pulsus_promql::reads_eval_time(&plan.root)
+    {
+        return None;
+    }
+    let (start, end, step, w) = (
+        i128::from(p.start_ms),
+        i128::from(p.end_ms),
+        i128::from(p.step_ms),
+        i128::from(width),
+    );
+    let t_last = start + (end - start).div_euclid(step) * step;
+    let g0 = -(-start).div_euclid(w) * w;
+    let gl = t_last.div_euclid(w) * w;
+    if g0 > gl {
+        return None;
+    }
+    let on_grid = start.rem_euclid(w) == 0 && step.rem_euclid(w) == 0;
+    let (until_ms, tail) = if on_grid {
+        (None, None)
+    } else {
+        let t1 = start + ((gl - start).div_euclid(step) + 1) * step;
+        let tail = (t1 <= end).then(|| MetricQueryParams {
+            start_ms: i64::try_from(t1).unwrap_or(i64::MAX),
+            end_ms: p.end_ms,
+            step_ms: p.step_ms,
+        });
+        (Some(i64::try_from(gl).ok()?), tail)
+    };
+    let epp = match until_ms {
+        None => plan.params,
+        Some(gl) => PlanParams {
+            start_ms: i64::try_from(g0).ok()?,
+            end_ms: gl,
+            step_ms: width,
+            ..plan.params
+        },
+    };
+    let fits = plan.selectors.iter().all(|sel| {
+        let mut s = sel.clone();
+        if let Some(r) = lattice_range(sel, levels, width) {
+            s.range_ms = Some(r);
+        }
+        eligible(&s) && route(&s, &epp, levels, width).is_some()
+    });
+    fits.then_some(Lattice {
+        width,
+        until_ms,
+        tail,
+    })
 }
 
 /// Plan section 3 and issue #18 follow-up R3: the largest level of width
@@ -297,11 +359,11 @@ pub fn route(sel: &SelectorSpec, p: &PlanParams, levels: &Levels, res: i64) -> O
     if excluded(sel) {
         return None;
     }
-    let buckets = i64::from(levels.counter_buckets);
-    let (index, level) =
-        levels.levels.iter().enumerate().rev().find(|(_, l)| {
-            l.res_ms > 0 && l.res_ms <= res && fits(sel, p, use_, l.res_ms, buckets)
-        })?;
+    let (index, level) = levels.levels.iter().enumerate().rev().find(|(_, l)| {
+        l.res_ms > 0
+            && l.res_ms <= res
+            && fits(sel, p, use_, l.res_ms, min_buckets(levels, use_, l.res_ms))
+    })?;
     Some(Route {
         level: index,
         res_ms: level.res_ms,
@@ -312,7 +374,8 @@ pub fn route(sel: &SelectorSpec, p: &PlanParams, levels: &Levels, res: i64) -> O
 
 /// Plan section 3's two conditions for one level (G2 and G1): the window
 /// ends on the level's bucket ends, and the range is a whole number of
-/// buckets, at least one, or `buckets` for a counter.
+/// buckets, at least one, or `min_buckets` for a counter (`counter_buckets`
+/// under 720 s).
 fn fits(sel: &SelectorSpec, p: &PlanParams, use_: RollupUse, res: i64, buckets: i64) -> bool {
     let range = match (sel.range_ms, use_) {
         (None, _) => true,

@@ -9,8 +9,8 @@
 | variable | default | meaning |
 |---|---|---|
 | `PULSUS_ROLLUP_LEVELS` | `60,720,7200,86400` | the rollup levels, in seconds, smallest first. Set and empty builds no levels, and every query reads raw |
-| `PULSUS_ROLLUP_RANGES` | `3600,86400,604800,7776000` | for each level, the query range in seconds from which it is the resolution (`reading.md` §2); a range below the first reads raw. Read only when there are levels |
-| `PULSUS_ROLLUP_COUNTER_BUCKETS` | `5` | the buckets of a level a `rate` or `increase` range covers at least |
+| `PULSUS_ROLLUP_RANGES` | `10800,57600,604800,7776000` | for each level, the query range in seconds from which it is the resolution (`reading.md` §2); a range below the first reads raw. Read only when there are levels |
+| `PULSUS_ROLLUP_COUNTER_BUCKETS` | `5` | the buckets of a level under 720 s that a `rate` or `increase` range covers at least for that level to answer it; from 720 s one bucket answers. The distances in `docs/api.md` §3.6 hold for `5` |
 
 They are schema-build settings, documented beside the other schema settings (`PULSUS_ROLLUP_LEVELS`, `docs/configuration.md:179-181`). `schema/schema.sh` reads them with no colon in the default, so unset gives the default and set-but-empty gives none (`rollup_levels`, `rollup_ranges`, `counter_buckets`, `schema/schema.sh:60-62`); `RenderCtx::for_tests` is `ctx_from_vars` of the database and the retention alone, so it takes `DEFAULT_ROLLUP_LEVELS`, `DEFAULT_ROLLUP_RANGES` and `DEFAULT_ROLLUP_COUNTER_BUCKETS` (`crates/pulsus-schema/src/vars.rs:293-295`). The binary has no rollup setting: it learns the levels, their switch points and the counter bucket count from the tables' comments (`reading.md` §2).
 
@@ -57,8 +57,8 @@ One day, 4,000 series. The bytes of the levels, plus the projections the next le
 
 | choice | reason |
 |---|---|
-| no 5 s level by default | raw samples are the 5 s data (owner, 2026-10-28): a range below the first level's switch point, 1 h by default, reads raw |
-| 60 s first | the owner's example: a 1-hour window reads the 60 s level. At a 15 s scrape it holds a quarter of raw's rows and 53.4 % of raw's bytes |
+| no 5 s level by default | raw samples are the 5 s data (owner, 2026-10-28): a range below the first level's switch point, 3 h by default, reads raw (owner, 2026-10-31) |
+| 60 s first | a range from 3 h reads the 60 s level (owner, 2026-10-31). At a 15 s scrape it holds a quarter of raw's rows and 53.4 % of raw's bytes |
 | a deployment scraping every 60 s | the 60 s level thins nothing there (336 % of raw, the same rows): set `720,7200,86400`. `docs/configuration.md` says so beside the setting |
 | a deployment scraping every few seconds | add a first level of 5 or 15 s, which divides 60 |
 

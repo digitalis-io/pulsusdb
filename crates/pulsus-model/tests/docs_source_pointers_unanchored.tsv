@@ -425,7 +425,6 @@ docs/benchmarks/logs-differential-ledger.md	pkg/validation/limits.go:434	pinned_
 docs/benchmarks/logs-differential-ledger.md	pkg/validation/limits.go:60-61	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	pkg/validation/validate.go:15	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/validation/validate.go:58-69	pinned_to_another_version
-docs/benchmarks/logs-differential-ledger.md	plan.rs:2684	ambiguous_basename
 docs/benchmarks/logs-differential-ledger.md	post_agg.rs:1122-1135	no_name_the_target_file_holds
 docs/benchmarks/logs-differential-ledger.md	push.go:571-582	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	querier.go:757	not_in_this_repository
@@ -763,7 +762,6 @@ docs/query-lowering.md	plan.rs:1708	ambiguous_basename
 docs/query-lowering.md	plan.rs:1730	ambiguous_basename
 docs/query-lowering.md	plan.rs:179	ambiguous_basename
 docs/query-lowering.md	plan.rs:2258	ambiguous_basename
-docs/query-lowering.md	plan.rs:2263	ambiguous_basename
 docs/query-lowering.md	plan.rs:2648	ambiguous_basename
 docs/query-lowering.md	plan.rs:2822	ambiguous_basename
 docs/query-lowering.md	plan.rs:3629	ambiguous_basename
