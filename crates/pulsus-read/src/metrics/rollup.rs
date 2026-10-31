@@ -1227,7 +1227,8 @@ mod tests {
         assert_eq!(one("rate(m[1h])", BASE, 12 * MIN, &none), None);
 
         // The counter functions: range on the level and at least five
-        // times it; one millisecond off the range or the step reads raw.
+        // times it under 720 s, once from 720 s (issue #18, D4); one
+        // millisecond off the range or the step reads raw.
         for f in ["rate", "increase"] {
             assert_eq!(
                 one(&format!("{f}(m[1h])"), BASE, 12 * MIN, &lv),
@@ -1235,8 +1236,8 @@ mod tests {
             );
             assert_eq!(
                 one(&format!("{f}(m[48m])"), BASE, 12 * MIN, &lv),
-                Some(60_000),
-                "{f}: 4 x res"
+                Some(720_000),
+                "{f}: 4 x res, one bucket being enough from 720 s"
             );
             assert_eq!(
                 one(&format!("{f}(m[3600001ms])"), BASE, 12 * MIN, &lv),

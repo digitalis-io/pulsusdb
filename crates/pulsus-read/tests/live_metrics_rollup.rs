@@ -2540,7 +2540,7 @@ async fn finer_levels_and_raw_read_only_what_is_not_covered() {
     assert_eq!(on.cells(), off.cells(), "(C): bit-equal to no levels");
 
     // (D) 65 one-minute holes in the 60 s level: two raw statements, 64
-    // intervals and one.
+    // intervals and one. Over 3 hours, the 60 s level's switch point.
     let t0 = day0 + 6 * DAY + 6 * HOUR;
     let holes: Vec<(i64, i64)> = (0..=64)
         .map(|k| (t0 + 2 * k * MIN, t0 + (2 * k + 1) * MIN))
@@ -2549,7 +2549,7 @@ async fn finer_levels_and_raw_read_only_what_is_not_covered() {
         cut_runs(&built.admin, &db, 60, a, b).await;
     }
     let comment = format!("{run}_h1_d_on");
-    let p = range(t0, t0 + 130 * MIN, MIN);
+    let p = range(t0, t0 + 3 * HOUR, MIN);
     let query = "max_over_time(g[1m])";
     let on = ask(
         &built.engine(true, Some(&comment)).await,
@@ -3206,7 +3206,7 @@ async fn a_rounded_range_is_within_its_distance() {
             "1m",
             60,
             end,
-            [0.0618, 0.00363, 1.21, 1.00],
+            [0.0618, 0.00363, 1.22, 1.01],
         ),
         (
             "2 d",
