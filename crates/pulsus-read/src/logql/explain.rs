@@ -49,8 +49,10 @@ pub struct PlanExplain {
     /// the header — so every other response is byte-identical to the one
     /// it produced before this field existed.
     pub plans: Vec<PlanShape>,
-    /// Issue #18 part B: a rollup level served part of at least one
-    /// selector — `exactness` is `"rollup"` rather than `"raw-exact"`.
+    /// Issue #18: a rollup level served part of at least one selector, a
+    /// selector's range was rounded, or the query's steps take the value of
+    /// the bucket that holds them — `exactness` is `"rollup"` rather than
+    /// `"raw-exact"`.
     pub rollup: bool,
 }
 
@@ -90,6 +92,14 @@ impl PlanExplain {
     /// #548).
     pub fn push_plan(&mut self, shape: PlanShape) {
         self.plans.push(shape);
+    }
+
+    /// Issue #18: appends `other`'s stages and plan shapes after this
+    /// trace's, and carries its rollup flag.
+    pub fn append(&mut self, other: PlanExplain) {
+        self.stages.extend(other.stages);
+        self.plans.extend(other.plans);
+        self.rollup |= other.rollup;
     }
 }
 

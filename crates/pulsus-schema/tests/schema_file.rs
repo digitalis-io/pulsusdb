@@ -2841,16 +2841,16 @@ fn the_default_levels_carry_their_switch_points() {
     );
     assert_eq!(
         pulsus_schema::DEFAULT_ROLLUP_RANGES,
-        &[3600, 86400, 604800, 7776000]
+        &[10800, 57600, 604800, 7776000]
     );
     let want = [
         (
             60,
-            "rollup_res_ms=60000 rollup_from_ms=3600000 counter_buckets=5",
+            "rollup_res_ms=60000 rollup_from_ms=10800000 counter_buckets=5",
         ),
         (
             720,
-            "rollup_res_ms=720000 rollup_from_ms=86400000 counter_buckets=5",
+            "rollup_res_ms=720000 rollup_from_ms=57600000 counter_buckets=5",
         ),
         (
             7200,
@@ -3067,7 +3067,7 @@ fn the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets() {
         assert_eq!(code, Some(0), "{buckets}: {err}");
         assert!(
             out.contains(&format!(
-                "COMMENT 'rollup_res_ms=60000 rollup_from_ms=3600000 counter_buckets={want}';"
+                "COMMENT 'rollup_res_ms=60000 rollup_from_ms=10800000 counter_buckets={want}';"
             )),
             "{buckets} is stored"
         );
@@ -3152,14 +3152,14 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             vec![],
             vec!["--mode", "single"],
             single(),
-            "c941338fb6fe55ac5b1f0a008657c9be4532206ecbc926783c1cd7366e7448d7",
+            "bad81642c73b58d76af9f20eab09bbec68fd76969d366af8b48ca04cd6a3c21e",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "bd0e0a0e399e4b2ecac7a2ef64facae4f147979620a77461645146d7ff574226",
+            "fd232a7a626e5ab48aa3ea4540e3b9f50ff2611b45edadd0f7d571d07033a052",
         ),
         (
             "clustered with a storage policy",
@@ -3169,7 +3169,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "549525baccb8a9c770043dbb04fd69a1add33d12172e7309e4473b8e8960d385",
+            "24f6f6e319db0c6215e0e3843dedea2d07340d852a751b29264162d75de2d947",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
@@ -4452,7 +4452,7 @@ fn the_script_and_the_crate_refuse_every_setting_the_same_way() {
         &[("PULSUS_RETENTION_DAYS", s("1")), (keep, s("1,1,1,1"))],
         Single,
         format!(
-            "{keep}: 1 for the 60s level is too short: the next level's switch point, 86400 s, \
+            "{keep}: 1 for the 60s level is too short: the next level's switch point, 57600 s, \
              requires 2 retention days"
         ),
     ));

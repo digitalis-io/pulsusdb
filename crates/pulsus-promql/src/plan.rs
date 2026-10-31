@@ -159,6 +159,22 @@ pub struct SelectorSpec {
     /// instant selector. The evaluator scales a rounded `increase` back to
     /// it, and explain names it.
     pub written_range_ms: Option<i64>,
+    /// Issue #18: set by the reader on a range query read at a rollup
+    /// level's bucket ends; `None` evaluates the selector at each step's
+    /// own time.
+    pub fill: Option<SelectorFill>,
+}
+
+/// Issue #18: how a selector of a range query read at a level's bucket ends
+/// is evaluated. A step at or before `until_ms` is evaluated at the bucket
+/// end that holds it, from the first read, with the selector's `range_ms`;
+/// a later step at its own time, from the second read, with
+/// `tail_range_ms` (`None` for an instant selector).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectorFill {
+    pub width_ms: i64,
+    pub until_ms: i64,
+    pub tail_range_ms: Option<i64>,
 }
 
 /// Issue #18 part B: the one column of a rollup level a selector's
@@ -1076,6 +1092,7 @@ impl Planner {
             rollup_use: None,
             in_subquery: self.subquery_depth > 0,
             written_range_ms: range_ms,
+            fill: None,
         });
         id
     }
@@ -1512,6 +1529,21 @@ fn for_each_child(expr: &PlanExpr, f: &mut dyn FnMut(&PlanExpr)) {
             }
         }
     }
+}
+
+/// Issue #18: whether the expression reads the evaluation time — `time()`,
+/// a date function without an argument, or `timestamp` — anywhere in its
+/// tree. Such a range query keeps the request's own steps.
+pub fn reads_eval_time(root: &PlanExpr) -> bool {
+    if matches!(
+        root,
+        PlanExpr::Time | PlanExpr::DateFn { arg: None, .. } | PlanExpr::Timestamp { .. }
+    ) {
+        return true;
+    }
+    let mut found = false;
+    for_each_child(root, &mut |child| found = found || reads_eval_time(child));
+    found
 }
 
 /// Issue #32 code-review round-1 fix: a `match[]` discovery selector
@@ -5564,10 +5596,33 @@ mod tests {
         );
     }
 
+    /// **U14 (issue #18): `reads_eval_time` finds the step time.** `time()`,
+    /// a date function without an argument and `timestamp` anywhere in the
+    /// tree read it; a date function of a vector reads its values.
+    #[test]
+    fn reads_eval_time_finds_the_step_time() {
+        let reads = |q: &str| reads_eval_time(&plan(&parse(q).unwrap(), params()).unwrap().root);
+        for q in [
+            "time()",
+            "x * 0 + time()",
+            "hour()",
+            "day_of_week()",
+            "timestamp(x)",
+            "timestamp(rate(x[5m]))",
+            "sum(x) + minute()",
+        ] {
+            assert!(reads(q), "{q} reads the evaluation time");
+        }
+        for q in ["x", "rate(x[5m])", "hour(x)", "vector(1)"] {
+            assert!(!reads(q), "{q} does not read the evaluation time");
+        }
+    }
+
     #[test]
     fn fetch_window_subtracts_range_lookback_and_offset() {
         let sel = SelectorSpec {
             written_range_ms: None,
+            fill: None,
             id: 0,
             metric_name: Some("up".to_string()),
             name_matchers: Vec::new(),

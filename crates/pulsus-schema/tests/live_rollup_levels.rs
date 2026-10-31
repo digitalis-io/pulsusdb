@@ -1559,8 +1559,8 @@ async fn the_discovery_reads_the_switch_points() {
         .map(|l| (l.res_ms, l.table.clone(), l.from_ms))
         .collect();
     let want: Vec<(i64, String, u64)> = [
-        (60_000, 3_600_000),
-        (720_000, 86_400_000),
+        (60_000, 10_800_000),
+        (720_000, 57_600_000),
         (7_200_000, 604_800_000),
         (86_400_000, 7_776_000_000),
     ]

@@ -77,8 +77,8 @@ pub struct RenderCtx {
     /// `PULSUS_ROLLUP_RANGES` (issue #18): the validated switch points in
     /// seconds, one per level; a shorter range reads raw.
     pub rollup_ranges: Vec<u32>,
-    /// `PULSUS_ROLLUP_COUNTER_BUCKETS` (issue #18): the buckets a counter's
-    /// range covers at least.
+    /// `PULSUS_ROLLUP_COUNTER_BUCKETS` (issue #18): the buckets of a level
+    /// under 720 s a counter's range covers at least.
     pub rollup_counter_buckets: u32,
     /// `PULSUS_COLD_VOLUME` (docs/configuration.md §3, issue #743 part A):
     /// the volume of the storage policy old parts move to; `None` moves
@@ -117,10 +117,10 @@ pub const DEFAULT_ROLLUP_LEVELS: &[u32] = &[60, 720, 7200, 86400];
 /// The switch points `schema/schema.sh` renders when `PULSUS_ROLLUP_RANGES`
 /// is unset: the query range, in seconds, from which each level is the
 /// resolution (issue #18 follow-up; issue #746).
-pub const DEFAULT_ROLLUP_RANGES: &[u32] = &[3600, 86400, 604800, 7776000];
+pub const DEFAULT_ROLLUP_RANGES: &[u32] = &[10800, 57600, 604800, 7776000];
 
-/// `PULSUS_ROLLUP_COUNTER_BUCKETS` when unset: the buckets of a level a
-/// `rate` or `increase` range covers at least (issue #18 follow-up).
+/// `PULSUS_ROLLUP_COUNTER_BUCKETS` when unset: the buckets of a level under
+/// 720 s a `rate` or `increase` range covers at least (issue #18 follow-up).
 pub const DEFAULT_ROLLUP_COUNTER_BUCKETS: u32 = 5;
 
 impl RenderCtx {

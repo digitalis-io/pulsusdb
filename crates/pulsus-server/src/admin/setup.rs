@@ -694,7 +694,7 @@ fn page(inputs: &Inputs, errors: &[FieldError], result: Option<&Validated>) -> S
          <dt>Range from</dt><dd>The query range, in seconds, from which a range query reads \
          this level; a range shorter than level 1's reads the raw samples. A whole number from \
          1 to 999999999, each larger than the row above and at least its own resolution. \
-         Example: 3600 (1 hour), 86400 (1 day), 604800 (7 days), 7776000 (90 days).</dd>\
+         Example: 10800 (3 hours), 57600 (16 hours), 604800 (7 days), 7776000 (90 days).</dd>\
          <dt>Days on local disk</dt><dd>A whole number from 1 to 4294967295.</dd>\
          <dt>Then days on object storage</dt><dd>Blank or 0 keeps the level on local disk; \
          above 0 needs an object storage URL. A whole number from 0 to 4294967295.</dd>\
@@ -820,15 +820,15 @@ mod tests {
         let widths: Vec<&str> = v.levels.iter().map(|l| l.width.as_str()).collect();
         assert_eq!(widths, ["60", "720", "7200", "86400"]);
         let froms: Vec<&str> = v.levels.iter().map(|l| l.from.as_str()).collect();
-        assert_eq!(froms, ["3600", "86400", "604800", "7776000"]);
+        assert_eq!(froms, ["10800", "57600", "604800", "7776000"]);
         assert_eq!(
-            v.vars["PULSUS_ROLLUP_RANGES"], "3600,86400,604800,7776000",
+            v.vars["PULSUS_ROLLUP_RANGES"], "10800,57600,604800,7776000",
             "level 1 carries its own range"
         );
     }
 
     /// Issue #746: level 1's "Range from" is a field like every other
-    /// row's, starting at the default 3600, and refused like them: below
+    /// row's, starting at the default 10800, and refused like them: below
     /// its resolution, the message is the schema's, on the level group.
     #[test]
     fn level_one_has_its_own_range_from() {
