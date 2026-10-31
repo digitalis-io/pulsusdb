@@ -91,6 +91,14 @@ impl PlanExplain {
     pub fn push_plan(&mut self, shape: PlanShape) {
         self.plans.push(shape);
     }
+
+    /// Issue #18: appends `other`'s stages and plan shapes after this
+    /// trace's, and carries its rollup flag.
+    pub fn append(&mut self, other: PlanExplain) {
+        self.stages.extend(other.stages);
+        self.plans.extend(other.plans);
+        self.rollup |= other.rollup;
+    }
 }
 
 #[cfg(test)]

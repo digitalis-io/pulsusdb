@@ -820,9 +820,9 @@ mod tests {
         let widths: Vec<&str> = v.levels.iter().map(|l| l.width.as_str()).collect();
         assert_eq!(widths, ["60", "720", "7200", "86400"]);
         let froms: Vec<&str> = v.levels.iter().map(|l| l.from.as_str()).collect();
-        assert_eq!(froms, ["3600", "86400", "604800", "7776000"]);
+        assert_eq!(froms, ["10800", "57600", "604800", "7776000"]);
         assert_eq!(
-            v.vars["PULSUS_ROLLUP_RANGES"], "3600,86400,604800,7776000",
+            v.vars["PULSUS_ROLLUP_RANGES"], "10800,57600,604800,7776000",
             "level 1 carries its own range"
         );
     }

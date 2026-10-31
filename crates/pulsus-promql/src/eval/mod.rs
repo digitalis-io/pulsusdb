@@ -92,6 +92,16 @@ impl<'a> EvalData<'a> {
         }
     }
 
+    /// Issue #18: the selector's series from the first read, or from the
+    /// second when `tail` (a range query read at a level's bucket ends).
+    fn get_read(&self, id: SelectorId, tail: bool) -> &[FetchedSeries] {
+        if tail {
+            self.base.get_tail(id)
+        } else {
+            self.get(id)
+        }
+    }
+
     /// Issue #579: the database's answer for the `Aggregate` node at
     /// `self_pos`, if the fetch layer pushed it.
     fn pushed(&self, self_pos: usize) -> Option<&PushedNode> {
@@ -2188,6 +2198,18 @@ enum RangeMode {
     Smoothed,
 }
 
+/// Issue #18: a selector's window at evaluation time `t_ms`: its end
+/// `eff_t`, the range it is read with, and whether its series come from the
+/// second read. Without `fill`, `(@ or t) − offset` and the selector's own
+/// range, from the first read.
+fn window_end(sel: &SelectorSpec, t_ms: i64) -> (i64, Option<i64>, bool) {
+    (
+        sel.at_ms.unwrap_or(t_ms) - sel.offset_ms,
+        sel.range_ms,
+        false,
+    )
+}
+
 /// A range source resolved at one evaluation step: the `(lower_excl,
 /// upper_incl]` window (`upper_incl` = the effective evaluation time) and
 /// every series' windowed, non-stale samples — the shared input for all
@@ -2213,10 +2235,9 @@ fn windowed_range_source(
     let source_view = match source {
         RangeSource::Selector(id) => {
             let sel = &selectors[*id];
-            let eff_t = sel.at_ms.unwrap_or(t_ms) - sel.offset_ms;
-            let range_ms = sel
-                .range_ms
-                .expect("plan() only ever builds a range source over a matrix selector");
+            let (eff_t, range_ms, tail) = window_end(sel, t_ms);
+            let range_ms =
+                range_ms.expect("plan() only ever builds a range source over a matrix selector");
             let lower_excl = eff_t - range_ms;
             // Issue #150: the ORIGINAL `(lower_excl, eff_t]` bounds stay
             // fixed; the extended modes only widen the fetched sample slice
@@ -2235,7 +2256,7 @@ fn windowed_range_source(
                 RangeMode::Smoothed => (lower_excl - lookback_ms, eff_t + lookback_ms),
             };
             let series = data
-                .get(*id)
+                .get_read(*id, tail)
                 .iter()
                 .map(|s| {
                     // Issue #155: a series carrying the ST channel windows
@@ -2791,7 +2812,9 @@ fn eval_step(
             let sel = &selectors[*id];
             // Issue #83: an own `@` fixes the evaluation time (offset
             // applies relative to it) — step-invariant by construction.
-            let eff_t = sel.at_ms.unwrap_or(t_ms) - sel.offset_ms;
+            // Issue #18: a filled selector's later steps read the second
+            // read.
+            let (eff_t, _, tail) = window_end(sel, t_ms);
             let mut out = Vec::new();
             // Issue #150: a `smoothed` instant selector interpolates over the
             // `(eff_t−lb, eff_t+lb]` window per step (`smoothSeries`); the
@@ -2799,7 +2822,7 @@ fn eval_step(
             // instant selector is a no-op upstream (engine.go only widens for
             // `Smoothed` in the instant arm), so it falls through unchanged.
             if sel.smoothed {
-                for series in data.get(*id) {
+                for series in data.get_read(*id, tail) {
                     let metric_name = series
                         .metric_name
                         .clone()
@@ -2832,7 +2855,7 @@ fn eval_step(
                 }
                 return Ok(StepValue::Vector(out));
             }
-            for series in data.get(*id) {
+            for series in data.get_read(*id, tail) {
                 if let Some(sample) = staleness::instant_value(&series.samples, eff_t, lookback_ms)
                 {
                     // M7-A5a: a bare selector is the one selection site that
@@ -9809,6 +9832,160 @@ mod tests {
         assert!(
             close(count, 9.0) && close(sum, 9.0),
             "count {count}, sum {sum}"
+        );
+    }
+
+    /// The plan of `q` on the grid `(120 s, 2400 s, 120 s)`, every selector
+    /// filled at 720 s until 2160 s, read at its bucket ends over `range`
+    /// and after them over `tail_range`; `first` is every selector's first
+    /// read and `second` its second.
+    fn filled(
+        q: &str,
+        range: Option<i64>,
+        tail_range: Option<i64>,
+        first: &[Sample],
+        second: &[Sample],
+    ) -> QueryValue {
+        let mut planned = plan(
+            &crate::parser::parse(q).unwrap(),
+            params(120_000, 2_400_000, 120_000),
+        )
+        .expect("plan");
+        let (mut data, mut tail) = (SeriesData::new(), SeriesData::new());
+        for sel in &mut planned.selectors {
+            sel.range_ms = range;
+            sel.fill = Some(crate::plan::SelectorFill {
+                width_ms: 720_000,
+                until_ms: 2_160_000,
+                tail_range_ms: tail_range,
+            });
+            data.insert(sel.id, vec![series(1, &[("job", "x")], first.to_vec())]);
+            tail.insert(sel.id, vec![series(1, &[("job", "x")], second.to_vec())]);
+        }
+        data.take_as_tail(tail);
+        evaluate(&planned, &data).expect("evaluate")
+    }
+
+    /// The 20 times of [`filled`]'s grid.
+    fn filled_times() -> Vec<i64> {
+        (1..=20).map(|k| k * 120_000).collect()
+    }
+
+    /// **U11 (issue #18): a filled selector reads the bucket that holds
+    /// each step.** `max_over_time(x[2m])` read over 720 s at the bucket
+    /// ends: the six steps of each bucket take its maximum; the two steps
+    /// after 2160 s are read at their own times from the second read.
+    #[test]
+    fn a_filled_selector_reads_the_bucket_that_holds_each_step() {
+        let value = filled(
+            "max_over_time(x[2m])",
+            Some(720_000),
+            Some(120_000),
+            &[s(600_000, 1.0), s(1_400_000, 2.0), s(2_100_000, 3.0)],
+            &[s(2_250_000, 9.0), s(2_390_000, 10.0)],
+        );
+        let QueryValue::Matrix(m) = value else {
+            panic!("a range query answers a matrix: {value:?}");
+        };
+        assert_eq!(m.len(), 1, "one series: {m:?}");
+        let got: Vec<(i64, f64)> = m[0].points.iter().map(|p| (p.t_ms, p.v)).collect();
+        let want: Vec<(i64, f64)> = filled_times()
+            .into_iter()
+            .map(|t| {
+                let v = match t {
+                    ..=720_000 => 1.0,
+                    ..=1_440_000 => 2.0,
+                    ..=2_160_000 => 3.0,
+                    2_280_000 => 9.0,
+                    _ => 10.0,
+                };
+                (t, v)
+            })
+            .collect();
+        assert_eq!(got, want, "each step takes the bucket that holds it");
+    }
+
+    /// **U13 (issue #18): the first step latches the name across both
+    /// reads.** `(m > 0) or (m + 1)` filled as U11: the bucket-end steps
+    /// keep `m` by the filter, the later two drop it by the arithmetic; one
+    /// series, the first step's verdict kept.
+    #[test]
+    fn the_first_step_latches_the_name_across_both_reads() {
+        let value = filled(
+            "(m > 0) or (m + 1)",
+            None,
+            None,
+            &[s(600_000, 1.0), s(1_400_000, 1.0), s(2_100_000, 1.0)],
+            &[s(2_250_000, -5.0), s(2_390_000, -5.0)],
+        );
+        let QueryValue::Matrix(m) = value else {
+            panic!("a range query answers a matrix: {value:?}");
+        };
+        assert_eq!(m.len(), 1, "one series: {m:?}");
+        assert_eq!(
+            m[0].metric_name.as_deref(),
+            Some("m"),
+            "the first step's verdict keeps the name: {m:?}"
+        );
+        let got: Vec<(i64, f64)> = m[0].points.iter().map(|p| (p.t_ms, p.v)).collect();
+        let want: Vec<(i64, f64)> = filled_times()
+            .into_iter()
+            .map(|t| (t, if t <= 2_160_000 { 1.0 } else { -4.0 }))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// The one instant value of `q` at 720 s over `samples`, with the
+    /// first selector's range set to `read`: the float, or the histogram's
+    /// count and sum.
+    fn at_720(q: &str, read: Option<i64>, samples: &[Sample]) -> (f64, Option<(f64, f64)>) {
+        let mut planned = plan(
+            &crate::parser::parse(q).unwrap(),
+            params(720_000, 720_000, 0),
+        )
+        .expect("plan");
+        if let Some(r) = read {
+            planned.selectors[0].range_ms = Some(r);
+        }
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "x")], samples.to_vec())]);
+        match evaluate(&planned, &data).expect("evaluate") {
+            QueryValue::Vector(v) => {
+                assert_eq!(v.len(), 1, "{q}: one sample");
+                (v[0].v, v[0].h.as_ref().map(|h| (h.count, h.sum)))
+            }
+            other => panic!("{q}: expected a vector, got {other:?}"),
+        }
+    }
+
+    /// **U12 (issue #18): a widened `sum_over_time` is scaled to the range
+    /// asked.** `x` rises by 1 every 15 s from 0; `sum_over_time(x[2m])`
+    /// read over 720 s is `sum_over_time(x[12m]) × 120 / 720`, a native
+    /// histogram's count and sum the same.
+    #[test]
+    fn a_widened_sum_over_time_is_scaled_to_the_range_asked() {
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1.0);
+        let scale = 120_000.0 / 720_000.0;
+        let floats: Vec<Sample> = (0..=48).map(|i| s(i * 15_000, i as f64)).collect();
+        let (twelve, _) = at_720("sum_over_time(x[12m])", None, &floats);
+        let (sum, _) = at_720("sum_over_time(x[2m])", Some(720_000), &floats);
+        assert!(
+            close(sum, twelve * scale),
+            "sum {sum} against sum_over_time(x[12m]) × 120 / 720 {}",
+            twelve * scale
+        );
+        let hists: Vec<Sample> = (0..=48u64)
+            .map(|i| count_hist(i as i64 * 15_000, i))
+            .collect();
+        let (_, h12) = at_720("sum_over_time(x[12m])", None, &hists);
+        let (c12, s12) = h12.expect("a histogram");
+        let (_, h) = at_720("sum_over_time(x[2m])", Some(720_000), &hists);
+        let (count, sum) = h.expect("a histogram");
+        assert!(
+            close(count, c12 * scale) && close(sum, s12 * scale),
+            "count {count} against {}, sum {sum} against {}",
+            c12 * scale,
+            s12 * scale
         );
     }
 }

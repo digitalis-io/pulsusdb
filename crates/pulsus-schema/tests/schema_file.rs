@@ -2841,16 +2841,16 @@ fn the_default_levels_carry_their_switch_points() {
     );
     assert_eq!(
         pulsus_schema::DEFAULT_ROLLUP_RANGES,
-        &[3600, 86400, 604800, 7776000]
+        &[10800, 57600, 604800, 7776000]
     );
     let want = [
         (
             60,
-            "rollup_res_ms=60000 rollup_from_ms=3600000 counter_buckets=5",
+            "rollup_res_ms=60000 rollup_from_ms=10800000 counter_buckets=5",
         ),
         (
             720,
-            "rollup_res_ms=720000 rollup_from_ms=86400000 counter_buckets=5",
+            "rollup_res_ms=720000 rollup_from_ms=57600000 counter_buckets=5",
         ),
         (
             7200,
@@ -3067,7 +3067,7 @@ fn the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets() {
         assert_eq!(code, Some(0), "{buckets}: {err}");
         assert!(
             out.contains(&format!(
-                "COMMENT 'rollup_res_ms=60000 rollup_from_ms=3600000 counter_buckets={want}';"
+                "COMMENT 'rollup_res_ms=60000 rollup_from_ms=10800000 counter_buckets={want}';"
             )),
             "{buckets} is stored"
         );

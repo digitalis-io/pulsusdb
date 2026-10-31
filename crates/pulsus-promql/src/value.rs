@@ -279,6 +279,10 @@ pub struct SeriesData {
     /// the `Aggregate` node's `self_pos`. The evaluator returns a node's
     /// vector from here and evaluates nothing below it.
     pushed: HashMap<usize, PushedNode>,
+    /// Issue #18: the second read of a range query read at a level's
+    /// bucket ends — each selector's series over the steps after the last
+    /// bucket end, keyed by [`SelectorId`].
+    tail: HashMap<SelectorId, Vec<FetchedSeries>>,
 }
 
 impl SeriesData {
@@ -306,6 +310,17 @@ impl SeriesData {
     /// fingerprints" — never an error).
     pub fn get(&self, id: SelectorId) -> &[FetchedSeries] {
         self.by_selector.get(&id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Issue #18: the selector's series from the second read, or an empty
+    /// slice when it has none.
+    pub fn get_tail(&self, id: SelectorId) -> &[FetchedSeries] {
+        self.tail.get(&id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Issue #18: makes `other`'s selector series this data's second read.
+    pub fn take_as_tail(&mut self, other: SeriesData) {
+        self.tail = other.by_selector;
     }
 }
 

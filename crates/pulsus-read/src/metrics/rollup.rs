@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 
 use pulsus_clickhouse::{ChClient, QuerySettings, Row};
 use pulsus_model::{Fingerprint, FpLiteral, STALE_NAN_BITS, Tenant};
-use pulsus_promql::{PlanParams, RawOverlay, RollupUse, Sample, SelectorSpec};
+use pulsus_promql::{PlanParams, QueryPlan, RawOverlay, RollupUse, Sample, SelectorSpec};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
@@ -262,6 +262,32 @@ pub fn round_counter_range(
         .map(|(w, n)| n * w)
         .or_else(|| fit.iter().min().map(|&w| buckets * w))?;
     i64::try_from(rounded).ok()
+}
+
+/// D4: the buckets of a level of width `w` a range of `use_` covers at least.
+pub fn min_buckets(levels: &Levels, _use_: RollupUse, _w: i64) -> i64 {
+    i64::from(levels.counter_buckets)
+}
+
+/// D5 and F2: a lattice-path range query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lattice {
+    /// `L`, the request's resolution.
+    pub width: i64,
+    /// `gl`; `None` when the request's own times are bucket ends.
+    pub until_ms: Option<i64>,
+    /// F2's grid `(t1, end, step)`; `None` when no step follows `gl`.
+    pub tail: Option<MetricQueryParams>,
+}
+
+/// D3: the range a selector is read with at the bucket ends; `None` without a range or a use.
+pub fn lattice_range(_sel: &SelectorSpec, _levels: &Levels, _width: i64) -> Option<i64> {
+    None
+}
+
+/// D2 and D5: the lattice of a range query, or `None` for `main`'s path.
+pub fn lattice(_plan: &QueryPlan, _p: &MetricQueryParams, _levels: &Levels) -> Option<Lattice> {
+    None
 }
 
 /// Plan section 3 and issue #18 follow-up R3: the largest level of width
@@ -829,7 +855,8 @@ mod tests {
 
     /// **U4 (issue #18): a range query's resolution by its range.** The
     /// default levels, `start` one millisecond after a midnight, at 1 s:
-    /// under 1 h none, then each level from its own switch point.
+    /// under 3 h none, then each level from its own switch point (3 h,
+    /// 16 h, 7 days, 90 days).
     #[test]
     fn resolution_by_range() {
         let lv = defaults(5);
@@ -838,9 +865,11 @@ mod tests {
         for (range, res) in [
             (0, None),
             (5 * MIN, None),
-            (HOUR - 1, None),
-            (HOUR, Some(60_000)),
-            (DAY - 1, Some(60_000)),
+            (HOUR, None),
+            (3 * HOUR - 1, None),
+            (3 * HOUR, Some(60_000)),
+            (16 * HOUR - 1, Some(60_000)),
+            (16 * HOUR, Some(720_000)),
             (DAY, Some(720_000)),
             (7 * DAY, Some(7_200_000)),
             (90 * DAY, Some(86_400_000)),
@@ -902,6 +931,16 @@ mod tests {
             routed("rate(x[1h])", BASE, 30 * DAY, HOUR, &lv),
             Some(720_000)
         );
+        assert_eq!(
+            routed("rate(x[12m])", BASE, DAY, 12 * MIN, &lv),
+            Some(720_000),
+            "one 720 s bucket answers a rate"
+        );
+        assert_eq!(
+            routed("rate(x[4m])", BASE + 6 * MIN, 6 * HOUR, 2 * MIN, &lv),
+            None,
+            "under 720 s a rate needs `counter_buckets` buckets"
+        );
     }
 
     /// The range `round_counter_range` reads the query's one selector
@@ -948,8 +987,8 @@ mod tests {
         assert_eq!(month("rate(x[61m])"), None, "exact at 60 s");
         assert_eq!(
             rounded("rate(x[2h0m15s])", BASE, 7 * DAY, 2 * HOUR, &lv),
-            Some(7_920_000),
-            "720 s: one 7200 s bucket is under five"
+            Some(14_400_000),
+            "7200 s: one bucket is enough from 720 s, so ⌈2h0m15s / 2h⌉ = 2"
         );
         let instant = query(BASE, BASE, 0).plan_params(true, DEFAULT_LOOKBACK_MS);
         let sel = &selectors("rate(x[2m15s])", &instant)[0];
@@ -977,6 +1016,100 @@ mod tests {
             "three buckets, case 2"
         );
     }
+
+    /// **U9 (issue #18): the range at the bucket ends rounds up to whole
+    /// buckets.** At least one, and `counter_buckets` for a `rate` under
+    /// 720 s; an instant selector has none.
+    #[test]
+    fn lattice_range_rounds_up_to_whole_buckets() {
+        let lv = defaults(5);
+        let pp = query(BASE, BASE + DAY, 2 * MIN).plan_params(true, DEFAULT_LOOKBACK_MS);
+        let at = |q: &str, width: i64| {
+            let sels = selectors(q, &pp);
+            assert_eq!(sels.len(), 1, "{q}: one selector");
+            lattice_range(&sels[0], &lv, width)
+        };
+        for (q, width, want) in [
+            ("rate(x[2m15s])", 720_000, Some(720_000)),
+            ("rate(x[1h0m15s])", 720_000, Some(4_320_000)),
+            ("rate(x[18m])", 720_000, Some(1_440_000)),
+            ("max_over_time(x[12m])", 720_000, Some(720_000)),
+            ("max_over_time(x[13m])", 720_000, Some(1_440_000)),
+            ("x", 720_000, None),
+            ("rate(x[1m15s])", 60_000, Some(300_000)),
+            ("rate(x[5m15s])", 60_000, Some(360_000)),
+            ("max_over_time(x[30s])", 60_000, Some(60_000)),
+            ("rate(x[10m15s])", 7_200_000, Some(7_200_000)),
+        ] {
+            assert_eq!(at(q, width), want, "{q} at {width} ms");
+        }
+    }
+
+    /// The lattice of `q` over `(start, start + span)` at `step`.
+    fn lattice_of(q: &str, start: i64, span: i64, step: i64) -> Option<Lattice> {
+        let lv = defaults(5);
+        let p = query(start, start + span, step);
+        let planned = plan(&parse(q).unwrap(), p.plan_params(true, DEFAULT_LOOKBACK_MS)).unwrap();
+        lattice(&planned, &p, &lv)
+    }
+
+    /// **U10 (issue #18): the lattice of a request.** The bucket ends, the
+    /// last of them and the newest steps' grid; `None` where D2 keeps the
+    /// request's own steps.
+    #[test]
+    fn the_lattice_of_a_request() {
+        let s = BASE + 6 * MIN;
+        let two_days = |q: &str| lattice_of(q, s, 2 * DAY, 2 * MIN);
+        assert_eq!(
+            two_days("rate(x[2m15s])"),
+            Some(Lattice {
+                width: 720_000,
+                until_ms: Some(BASE + 2 * DAY),
+                tail: Some(query(
+                    BASE + 2 * DAY + 2 * MIN,
+                    BASE + 2 * DAY + 6 * MIN,
+                    120_000
+                )),
+            }),
+            "(a)"
+        );
+        assert_eq!(
+            lattice_of("rate(x[2m15s])", BASE, 2 * DAY, 2 * MIN),
+            Some(Lattice {
+                width: 720_000,
+                until_ms: Some(BASE + 2 * DAY),
+                tail: None,
+            }),
+            "(b)"
+        );
+        assert_eq!(
+            lattice_of("rate(x[2m15s])", BASE, 7 * DAY, 2 * HOUR),
+            Some(Lattice {
+                width: 7_200_000,
+                until_ms: None,
+                tail: None,
+            }),
+            "(c)"
+        );
+        assert_eq!(lattice_of("rate(x[2m15s])", s, HOUR, 2 * MIN), None, "(d)");
+        assert_eq!(two_days("x offset 90s"), None, "(e)");
+        assert_eq!(two_days("irate(x[5m])"), None, "(f)");
+        assert_eq!(two_days("rate(x[5m] @ 1788825960)"), None, "(g)");
+        assert!(two_days("x offset 1m").is_some(), "(h)");
+        assert_eq!(two_days("vector(1)"), None, "(i)");
+        assert_eq!(
+            lattice_of("rate(x[2m15s])", s, 2 * DAY, 3 * DAY),
+            None,
+            "(j): no bucket end at or before the last step"
+        );
+        assert_eq!(two_days("x * 0 + time()"), None, "(k)");
+        assert_eq!(two_days("timestamp(x)"), None, "(l)");
+        assert_eq!(two_days("hour()"), None, "(m)");
+        assert!(two_days("hour(x)").is_some(), "(n)");
+        assert_eq!(two_days("predict_linear(x[5m], 60)"), None, "(o)");
+        assert_eq!(two_days("max_over_time(rate(x[5m])[1h:5m])"), None, "(p)");
+    }
+
     fn all() -> Levels {
         levels(&[60, 720, 7200, 86400])
     }
