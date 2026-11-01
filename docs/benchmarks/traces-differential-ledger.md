@@ -773,19 +773,9 @@ when we are asking it to slow down, so we keep `429`; recorded as
   not a boolean answers `400` with the demand's text, where the reference
   answers `500`.
 
-- **The residual, each class with its measured reference status.** Every
-  row is `we 400 / the reference 200`:
-
-  | class id | witness query | our exact 400 body |
-  |---|---|---|
-  | `metrics-filter-intrinsic-existence-shared-path` | `{ name != nil } \| rate()` | `type mismatch: existence checks are only supported on attributes` |
-
-- **The row is not what it looks like.**
-  `metrics-filter-intrinsic-existence-shared-path` is not a
-  metrics-block class at all: `/api/search` refuses `{ name != nil }`
-  with the identical body, so the rejection comes from a shared path. It
-  is listed because it IS a divergence on this route; it is owned
-  elsewhere.
+- **Closed by issue #764**: `{ name != nil } | rate()` is served, as is
+  every existence check on an intrinsic (`traceql-intrinsic-presence`).
+  The residual is empty.
 
 - **Where it is enforced.** `crates/pulsus-read/tests/fixtures/metrics_filter_accept.json`
   carries one probe per witness with both sides' verdicts and the exact
@@ -4190,3 +4180,40 @@ Applies to `GET /api/traces/v1/search` and its alias (`crates/pulsus-read/src/tr
 | an integer literal compared with a double attribute (`by(span.f > 0)`) | compared as numbers | `false` (`traceql-array-element-rule`) |
 | `span:childCount` in a key | its count | no trace (entry 34) |
 | a literal-only subtree that is not arithmetic (`by(span.b && (1 > 2))`), or a float `^` of literals | rendered unfolded in the label | folded |
+
+### `traceql-intrinsic-presence` (issue #764) — **an existence check on an intrinsic is true for every span that can hold it**
+
+- **Route.** `GET /api/traces/v1/search` and `/api/search`, the metrics
+  routes, and `q` on the tag-values routes.
+- **What.** `X != nil` holds for every span on every intrinsic but the four
+  event and link ones, and on `event:name` and `event:timeSinceStart` for a
+  span with an event, on `link:spanID` and `link:traceID` for a span with a
+  link. `X = nil` on any intrinsic is `400` on both sides' search and
+  metrics routes.
+- **Measured** on the pinned reference, a four-span corpus holding an empty
+  name, an unset status, an empty scope, a trace with no root and an event
+  with an empty name: the same spans on the search and metrics routes, and
+  the same projection, for all twenty intrinsics other than
+  `span:childCount`.
+- **The one divergence.** `span:childCount != nil` matches every span here
+  and none there (entry 34 of `docs/reference-defects-we-do-not-copy.md`).
+- **Gated by.** `an_intrinsic_presence_answers_on_every_route` in
+  `crates/pulsus-read/tests/traces_query_v2_live.rs`,
+  `intrinsic_presence_counts_match_the_reference` in
+  `crates/pulsus-read/tests/traces_metrics_filter_differential.rs`, and
+  cases 43 to 62 of `crates/pulsus-read/tests/projection_cases/mod.rs`.
+
+### `traceql-negation-of-a-filtered-condition` (issue #764) — **the reference's `!` over a condition its store filters drops every span on search and is ignored on metrics**
+
+- **Route.** `GET /api/traces/v1/search` and `/api/search`, the metrics
+  routes, and `q` on the tag-values routes.
+- **What.** On a four-span corpus, `{ !(status = error) }` matches three
+  spans here; the reference's search route returns none and its metrics
+  count is 1, the span the operand matches. `{ !(event:name != nil) }`:
+  two spans here, none and a count of 2 there. Tag values with
+  `q={ !(link:spanID != nil) }` list the names of the spans without a link
+  here and of the span with one there.
+- **Disposition.** Not copied: entry 40 of
+  `docs/reference-defects-we-do-not-copy.md`.
+- **Gated by.** `an_intrinsic_presence_answers_on_every_route`, parts (b)
+  and (d).

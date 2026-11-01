@@ -100,10 +100,6 @@ fn the_residual_refusal_entry_names_exactly_the_fixtures_divergence_classes() {
         .filter(|p| p.ours.verdict == "reject")
         .filter_map(|p| p.divergence.clone())
         .collect();
-    assert!(
-        !from_fixture.is_empty(),
-        "the fixture must record at least one divergence class"
-    );
 
     // From the ledger: every `metrics-filter-…` class id the entry names.
     // Scanned out of the entry body rather than hand-listed, so the two

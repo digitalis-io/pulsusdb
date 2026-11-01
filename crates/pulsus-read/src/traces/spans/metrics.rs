@@ -1549,17 +1549,39 @@ mod tests {
     /// compiler answers nothing.
     #[test]
     fn a_refusal_is_the_statement_compilers() {
-        for (q, want) in [
-            (
-                "{ name != nil } | histogram_over_time(span:childCount)",
-                "existence checks are only supported on attributes",
-            ),
-            (
-                "{ !instrumentation:name } | rate()",
-                "expression (!instrumentation:name) expected a boolean",
-            ),
+        let q = "{ !instrumentation:name } | rate()";
+        assert_eq!(
+            refusal(q),
+            "expression (!instrumentation:name) expected a boolean",
+            "{q}"
+        );
+    }
+
+    /// Issue #764: a presence on an intrinsic takes the statement, the
+    /// traces drilldown's rate-by-status query included, whose span read is
+    /// the compiled filter in both forms.
+    #[test]
+    fn an_intrinsic_presence_takes_the_statement() {
+        let drilldown = "{nestedSetParent<0 && true && status != nil} | rate() by(status)";
+        for q in [
+            drilldown,
+            "{ event:name != nil } | rate()",
+            "{ span:childCount != nil } | rate()",
         ] {
-            assert_eq!(refusal(q), want, "{q}");
+            let r = routed(q, &PARAMS);
+            assert!(r.is_ok(), "{q}: routed refused: {:?}", r.err());
+        }
+        let r = routed(drilldown, &PARAMS);
+        let Ok(r) = r else {
+            panic!("{drilldown}: routed refused: {:?}", r.err());
+        };
+        let s = r.statement();
+        let filter = "((parent_span_id = toFixedString('', 8)) AND (true)) AND (true)";
+        for (form, sql) in [("range", s.range_sql()), ("instant", s.instant_sql())] {
+            assert!(
+                sql.contains(filter),
+                "{drilldown}: the {form} form lacks {filter}"
+            );
         }
     }
 

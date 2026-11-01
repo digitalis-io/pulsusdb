@@ -41,7 +41,7 @@ const fn keys_only(name: &'static str, q: &'static str) -> ProjectionCase {
 /// The registry — one entry per numbered row of the issue's query table.
 /// The length is asserted at compile time so the count cannot drift from
 /// the table it describes.
-pub const CASES: [ProjectionCase; 42] = [
+pub const CASES: [ProjectionCase; 62] = [
     c("01_name_eq", r#"{ name = "GET /pay" }"#),
     c("02_duration_gt", "{ duration > 1s }"),
     c("03_match_all", "{}"),
@@ -139,6 +139,43 @@ pub const CASES: [ProjectionCase; 42] = [
         "42_select_array",
         r#"{ name = "charge" } | select(span.tags)"#,
     ),
+    // 43-62 (issue #764): `!= nil` on each intrinsic but `span:childCount`,
+    // which the reference answers with no span (defects entry 34).
+    c("43_presence_name", "{ name != nil }"),
+    c("44_presence_status", "{ status != nil }"),
+    c("45_presence_kind", "{ kind != nil }"),
+    c("46_presence_duration", "{ duration != nil }"),
+    c("47_presence_status_message", "{ statusMessage != nil }"),
+    c("48_presence_span_id", "{ span:id != nil }"),
+    c("49_presence_span_parent_id", "{ span:parentID != nil }"),
+    c("50_presence_trace_id", "{ trace:id != nil }"),
+    c("51_presence_trace_duration", "{ traceDuration != nil }"),
+    c("52_presence_root_name", "{ rootName != nil }"),
+    c(
+        "53_presence_root_service_name",
+        "{ rootServiceName != nil }",
+    ),
+    keys_only(
+        "54_presence_nested_set_parent",
+        "{ nestedSetParent != nil }",
+    ),
+    keys_only("55_presence_nested_set_left", "{ nestedSetLeft != nil }"),
+    keys_only("56_presence_nested_set_right", "{ nestedSetRight != nil }"),
+    c(
+        "57_presence_instrumentation_name",
+        "{ instrumentation:name != nil }",
+    ),
+    c(
+        "58_presence_instrumentation_version",
+        "{ instrumentation:version != nil }",
+    ),
+    c("59_presence_event_name", "{ event:name != nil }"),
+    c(
+        "60_presence_event_time_since_start",
+        "{ event:timeSinceStart != nil }",
+    ),
+    c("61_presence_link_span_id", "{ link:spanID != nil }"),
+    c("62_presence_link_trace_id", "{ link:traceID != nil }"),
 ];
 
-const _: () = assert!(CASES.len() == 42);
+const _: () = assert!(CASES.len() == 62);

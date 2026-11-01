@@ -1091,6 +1091,8 @@ docs/reference-defects-we-do-not-copy.md	pkg/querier/intervals.go:32-40	not_in_t
 docs/reference-defects-we-do-not-copy.md	pkg/querier/queryrange/shard_resolver.go:268	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/queryrange/shard_resolver.go:275	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/tempopb/tempo.proto:139	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_conditions.go:127-146	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_conditions.go:128	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_execute.go:14-55	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_execute.go:414-419	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_execute.go:466-472	not_in_this_repository
@@ -1101,6 +1103,7 @@ docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_metrics.go:192-202	not_
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_metrics.go:198-200	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_metrics.go:209-212	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/engine.go:98-129	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/traceql/engine_metrics.go:1140-1204	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	tempodb/encoding/versioned.go:98-100	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	tempodb/encoding/vparquet4/block_traceql.go:1103-1105	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	tempodb/encoding/vparquet4/block_traceql.go:128-152	not_in_this_repository

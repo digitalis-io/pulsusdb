@@ -4015,9 +4015,20 @@ fn t_c38_every_compile_path_for_every_set_operand() {
                             any
                         })
                     }
-                    _ => Err(PlanError::TypeMismatch(
-                        "existence checks are only supported on attributes".to_string(),
-                    )),
+                    // Issue #764: an event or link intrinsic's presence is
+                    // "at least one element"; `= nil` is the validator's
+                    // refusal, in its words.
+                    _ if *negated => Err(PlanError::TypeMismatch(format!(
+                        "{f} = nil is not valid: intrinsics cannot be nil"
+                    ))),
+                    SetKind::EventName => Ok("arrayExists(n -> true, events.name)".to_string()),
+                    SetKind::TimeSinceStart => {
+                        Ok("arrayExists(t -> true, events.time_ns)".to_string())
+                    }
+                    SetKind::LinkSpanId => Ok("arrayExists(h -> true, links.span_id)".to_string()),
+                    SetKind::LinkTraceId => {
+                        Ok("arrayExists(h -> true, links.trace_id)".to_string())
+                    }
                 }),
                 Shape::Pair => {
                     let me = Side::Set(set);
@@ -4684,6 +4695,71 @@ fn t_c42_the_limits_and_the_refusals_that_remain() {
         refusal(r#"{ event.a + resource.r > 1 }"#),
         PlanError::UnsupportedField(RESOURCE_NEEDS_WINDOW.to_string())
     );
+}
+
+/// `T-C43` (issue #764): `!= nil` on an intrinsic is `true` for the 17 every
+/// span holds and "at least one element" for the four event and link ones,
+/// with and without a context; `= nil` is the validator's refusal, in its
+/// words, on every intrinsic.
+#[test]
+fn t_c43_presence_on_every_intrinsic() {
+    for intrinsic in Intrinsic::ALL.iter().copied() {
+        // No wildcard arm: a new intrinsic decides here.
+        let want = match intrinsic {
+            Intrinsic::EventName => "arrayExists(n -> true, events.name)",
+            Intrinsic::EventTimeSinceStart => "arrayExists(t -> true, events.time_ns)",
+            Intrinsic::LinkSpanId => "arrayExists(h -> true, links.span_id)",
+            Intrinsic::LinkTraceId => "arrayExists(h -> true, links.trace_id)",
+            Intrinsic::Name
+            | Intrinsic::Duration
+            | Intrinsic::Status
+            | Intrinsic::Kind
+            | Intrinsic::NestedSetParent
+            | Intrinsic::NestedSetLeft
+            | Intrinsic::NestedSetRight
+            | Intrinsic::StatusMessage
+            | Intrinsic::ChildCount
+            | Intrinsic::SpanId
+            | Intrinsic::ParentId
+            | Intrinsic::TraceId
+            | Intrinsic::TraceDuration
+            | Intrinsic::RootName
+            | Intrinsic::RootServiceName
+            | Intrinsic::InstrumentationName
+            | Intrinsic::InstrumentationVersion => "true",
+        };
+        let present = format!("{{ {intrinsic} != nil }}");
+        let absent = format!("{{ {intrinsic} = nil }}");
+        assert_eq!(outcome_of(&present), Ok(want.to_string()), "{present}");
+        assert_eq!(
+            outcome_in(&present),
+            Ok(want.to_string()),
+            "{present} in a context"
+        );
+        let refused = PlanError::TypeMismatch(format!(
+            "{intrinsic} = nil is not valid: intrinsics cannot be nil"
+        ));
+        assert_eq!(outcome_of(&absent), Err(refused.clone()), "{absent}");
+        assert_eq!(outcome_in(&absent), Err(refused), "{absent} in a context");
+    }
+    assert_eq!(
+        outcome_of("{ !(name != nil) }"),
+        Ok("NOT (true)".to_string())
+    );
+    assert_eq!(
+        outcome_in("{nestedSetParent<0 && true && status != nil}"),
+        Ok("((parent_span_id = toFixedString('', 8)) AND (true)) AND (true)".to_string())
+    );
+}
+
+/// The context-free compile of `query`, as a result.
+fn outcome_of(query: &str) -> Result<String, PlanError> {
+    compile_span_predicate(&filter_body(query)).map(|p| p.sql().to_string())
+}
+
+/// The compile of `query` in [`ctx`], as a result.
+fn outcome_in(query: &str) -> Result<String, PlanError> {
+    compile_span_predicate_in(&filter_body(query), &ctx()).map(|p| p.sql().to_string())
 }
 
 // =====================================================================
