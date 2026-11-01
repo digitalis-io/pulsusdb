@@ -1549,12 +1549,12 @@ mod tests {
     /// compiler answers nothing.
     #[test]
     fn a_refusal_is_the_statement_compilers() {
-        for (q, want) in [(
-            "{ !instrumentation:name } | rate()",
+        let q = "{ !instrumentation:name } | rate()";
+        assert_eq!(
+            refusal(q),
             "expression (!instrumentation:name) expected a boolean",
-        )] {
-            assert_eq!(refusal(q), want, "{q}");
-        }
+            "{q}"
+        );
     }
 
     /// Issue #764: a presence on an intrinsic takes the statement, the

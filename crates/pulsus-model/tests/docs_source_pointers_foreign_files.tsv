@@ -135,6 +135,7 @@ pkg/storage/stores/shipper/indexshipper/tsdb/single_file_index.go
 pkg/tempo/search.go
 pkg/tempopb/tempo.proto
 pkg/traceql/ast.go
+pkg/traceql/ast_conditions.go
 pkg/traceql/ast_execute.go
 pkg/traceql/ast_metrics.go
 pkg/traceql/ast_stringer.go

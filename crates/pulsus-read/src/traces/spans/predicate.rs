@@ -1050,16 +1050,22 @@ impl<'a> Compiler<'a> {
     /// answers only the rows that store a string, so it misses an integer, a
     /// boolean and an array. The two spellings' meanings differ, which is why
     /// the AST carries the negation rather than a canonical form.
+    ///
+    /// An intrinsic is held by every span but the event and link ones
+    /// (issue #764).
     fn exists(&mut self, field: &Field, negated: bool) -> Result<String, PlanError> {
-        let (scope, key) = match field {
-            Field::Attribute { scope, key } => (*scope, key),
-            Field::Intrinsic(_) => {
-                return Err(PlanError::TypeMismatch(
-                    "existence checks are only supported on attributes".to_string(),
-                ));
-            }
-        };
-        self.scoped_exists(scope, key, negated)
+        match field {
+            Field::Attribute { scope, key } => self.scoped_exists(*scope, key, negated),
+            // Issue #764: every intrinsic but the event and link ones is held
+            // by every span; `= nil` is the validator's refusal, in its words.
+            Field::Intrinsic(_) if negated => Err(PlanError::TypeMismatch(
+                pulsus_traceql::ValidateError::IntrinsicNotNil {
+                    field: field.to_string(),
+                }
+                .to_string(),
+            )),
+            Field::Intrinsic(i) => Ok(intrinsic_presence(*i, self.head.leaf_function())),
+        }
     }
 
     fn scoped_exists(
@@ -4234,6 +4240,33 @@ fn id_leaf(
 /// the search projection's first passing element.
 fn any_element(var: &str, array: &str, body: &str, head: &str) -> String {
     format!("{head}({var} -> {body}, {array})")
+}
+
+/// `X != nil` on an intrinsic (issue #764). **No wildcard arm.**
+fn intrinsic_presence(intrinsic: Intrinsic, head: &str) -> String {
+    match intrinsic {
+        Intrinsic::EventName => any_element("n", "events.name", "true", head),
+        Intrinsic::EventTimeSinceStart => any_element("t", "events.time_ns", "true", head),
+        Intrinsic::LinkSpanId => any_element("h", "links.span_id", "true", head),
+        Intrinsic::LinkTraceId => any_element("h", "links.trace_id", "true", head),
+        Intrinsic::Name
+        | Intrinsic::Duration
+        | Intrinsic::Status
+        | Intrinsic::Kind
+        | Intrinsic::NestedSetParent
+        | Intrinsic::NestedSetLeft
+        | Intrinsic::NestedSetRight
+        | Intrinsic::StatusMessage
+        | Intrinsic::ChildCount
+        | Intrinsic::SpanId
+        | Intrinsic::ParentId
+        | Intrinsic::TraceId
+        | Intrinsic::TraceDuration
+        | Intrinsic::RootName
+        | Intrinsic::RootServiceName
+        | Intrinsic::InstrumentationName
+        | Intrinsic::InstrumentationVersion => "true".to_string(),
+    }
 }
 
 /// `event:name`: `name`'s rule over each event's name.
