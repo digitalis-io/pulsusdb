@@ -1043,10 +1043,12 @@ async fn the_shard_follows_the_key_and_not_the_zone() {
     }
     writer.shutdown(Duration::from_secs(10)).await;
 
+    // The landing inserts alone: the refreshable views' runs are initial
+    // inserts in this database too, and name no landing table.
     let initial_inserts = format!(
         "SELECT count() AS n FROM system.query_log \
          WHERE type = 'QueryFinish' AND is_initial_query AND query_kind = 'Insert' \
-         AND (current_database = '{db}' OR has(databases, '{db}'))"
+         AND arrayExists(t -> startsWith(t, '{db}.log_landing'), tables)"
     );
     for (_, client) in nodes.all() {
         exec(client, "SYSTEM FLUSH LOGS").await;
