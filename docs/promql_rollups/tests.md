@@ -19,7 +19,7 @@
 | `runs_split_at_midnight_and_expire_by_day` (`crates/pulsus-schema/tests/live_rollup_levels.rs:1046`) | live | a run crossing midnight leaves one run row per day; with retention 4, every row of day `T−5` is dropped and every row of `T−4` kept |
 | `a_sparse_counter_keeps_its_steps` (`crates/pulsus-schema/tests/live_rollup_levels.rs:1198`) | live | per tenant, every 60 s row's `inc` equals the increase computed from all landed samples, for a sparse tenant and a dense one on the same fingerprints; a predecessor exactly 86,400,000 ms before a sample is used, one 86,400,001 ms before is not, and two samples 25 h apart inside one run count no step |
 | `stale_markers_and_nan_at_the_levels` (`crates/pulsus-schema/tests/live_rollup_levels.rs:1391`) | live | `last`, `t_last` and `flags` for a stale end, a stale-only bucket, NaN payloads, and counters resuming across a stale marker, at every level; `inc` counts the step over a stale marker and none across 24 hours |
-| `each_shard_builds_its_slice_once` (`crates/pulsus-schema/tests/live_cluster.rs:2009`) | cluster | one series pushed to both shards, one sample held only by a replica that is not its shard's builder: the level has one data row per bucket, counting every sample, and each shard one run row from its builder |
+| `each_shard_builds_its_slice_once` (`crates/pulsus-schema/tests/live_cluster.rs:2029`) | cluster | one series pushed to both shards, one sample held only by a replica that is not its shard's builder: the level has one data row per bucket, counting every sample, and each shard one run row from its builder |
 
 ## Part B: reading
 
