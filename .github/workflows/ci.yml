@@ -2661,8 +2661,8 @@ jobs:
           catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 73 ]; then
-            echo "::error::expected 73 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 76 ]; then
+            echo "::error::expected 76 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -2885,8 +2885,8 @@ jobs:
           catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 73 ]; then
-            echo "::error::expected 73 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 76 ]; then
+            echo "::error::expected 76 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi

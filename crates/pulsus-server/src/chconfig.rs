@@ -255,51 +255,50 @@ pub(crate) fn engine_config_from(config: &Config) -> EngineConfig {
     }
 }
 
+/// The suffix the writers append to their landing table: `PULSUS_DIST_SUFFIX`
+/// on a cluster, none single-node.
+fn landing_suffix(config: &Config) -> Option<&str> {
+    config.cluster.as_ref().map(|_| config.dist_suffix.as_str())
+}
+
 /// Maps `Config` to [`pulsus_write::WriterTables`]: the one table the logs
 /// writer inserts into (issue #603).
 ///
-/// **The cluster plays no part.** The name carries no `_dist` suffix in any
-/// mode, because the landing table has no `Distributed` wrapper for the writer
-/// to name: a push carries many fingerprints, so routing its block through one
-/// would split the push per shard and end "one push is one block". The five
-/// target tables keep their wrappers, and [`engine_config_from`] on the read
-/// path derives them exactly as before.
-///
-/// So a fingerprint's rows can sit on several shards, where the Logs family's
-/// `cityHash64(fingerprint)` sharding key used to put them all on one. What
-/// that costs the read path is `docs/schemas.md` §7.
+/// **On a cluster it is the landing table's wrapper,
+/// `log_landing<PULSUS_DIST_SUFFIX>`** (issue #494 part 1). A push is one
+/// block on one shard: every row of it carries one `received_ms`, taken once
+/// per push, so the wrapper's `cityHash64(received_ms)` key sends the whole
+/// block to one shard. And every resend reaches that shard: the writer resends
+/// the identical rows, so the key, and the shard, are the same whichever
+/// server receives the resend. Single-node it is the bare `log_landing`. The
+/// five target tables keep their own wrappers, and [`engine_config_from`] on
+/// the read path derives them exactly as before.
 pub(crate) fn writer_tables_from(config: &Config) -> WriterTables {
-    let _ = config;
-    WriterTables {
-        landing: Arc::from("log_landing"),
-    }
+    WriterTables::landing_for(landing_suffix(config))
 }
 
 /// Maps `Config` to [`pulsus_write::MetricWriterTables`]: the one table the
 /// metrics writer inserts into (issue #603).
 ///
-/// **The cluster plays no part.** The name carries no `_dist` suffix in any
-/// mode, because the landing table has no `Distributed` wrapper for the
-/// writer to name — `metric_metadata` was already rendered bare on this same
-/// path for its own reason (a global catalog table). The four target tables
-/// keep their wrappers, and [`metrics_config_from`] on the read path derives
-/// them exactly as before.
+/// **On a cluster it is the landing table's wrapper,
+/// `metric_landing<PULSUS_DIST_SUFFIX>`**, for the reasons
+/// [`writer_tables_from`] gives: one push is one block on one shard, and every
+/// resend reaches that shard. Single-node it is the bare `metric_landing`. The
+/// four target tables keep their wrappers, and [`metrics_config_from`] on the
+/// read path derives them exactly as before.
 pub(crate) fn metric_writer_tables_from(config: &Config) -> MetricWriterTables {
-    let _ = config;
-    MetricWriterTables {
-        landing: Arc::from("metric_landing"),
-    }
+    MetricWriterTables::landing_for(landing_suffix(config))
 }
 
 /// Maps `Config` to [`pulsus_write::TraceWriterTables`]: the landing table,
 /// the one table a trace push is inserted into.
-pub(crate) fn trace_writer_tables_from(_config: &Config) -> TraceWriterTables {
-    TraceWriterTables {
-        // Bare in every mode (issue #586), the way `metric_landing` and
-        // `log_landing` are: the landing table has no `Distributed` wrapper,
-        // because one push sent through one would stop being one block.
-        landing: Arc::from("trace_landing"),
-    }
+///
+/// **On a cluster it is the landing table's wrapper,
+/// `trace_landing<PULSUS_DIST_SUFFIX>`**, for the reasons
+/// [`writer_tables_from`] gives: one push is one block on one shard, and every
+/// resend reaches that shard. Single-node it is the bare `trace_landing`.
+pub(crate) fn trace_writer_tables_from(config: &Config) -> TraceWriterTables {
+    TraceWriterTables::landing_for(landing_suffix(config))
 }
 
 /// Builds a [`LogQlEngine`] over `pool` — the same `Arc<ChPool>` `AppState`

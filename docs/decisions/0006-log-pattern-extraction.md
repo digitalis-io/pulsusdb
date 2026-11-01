@@ -1,5 +1,15 @@
 # ADR 0006: Log-pattern extraction (deterministic token-class templating)
 
+> **Stale on landing placement.** Since the routed-landing change (insert batching, part 1), on a
+> cluster every landing insert goes through its table's wrapper, `<landing table><PULSUS_DIST_SUFFIX>`
+> (`log_landing_dist` at the default suffix), keyed on `cityHash64(received_ms)`, so a push and its resends reach one
+> shard; landing inserts pin `distributed_foreground_insert`, `insert_shard_id`,
+> `skip_unavailable_shards`, `prefer_localhost_replica` and `timeout_overflow_mode`. Passages
+> below that say the landing tables have no wrapper, or that a push is placed by the connection,
+> are out of date. Current behaviour: `schema/schema.sql`, `QuerySettings::landing_insert`
+> (`crates/pulsus-clickhouse/src/settings.rs`), and `docs/configuration.md`'s connection-spreading
+> section.
+
 Status: **Accepted** (2026-07-22). Since `/patterns` answers by level, a pattern is also keyed by its line's level, which this record predates; `docs/api.md` §2.6.4 is current.
 Issue: [#171](https://github.com/digitalis-io/pulsusdb/issues/171)
 

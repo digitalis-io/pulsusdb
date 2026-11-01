@@ -529,6 +529,9 @@ TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{
 --@single  SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy_local}};
 --@cluster SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
+--@cluster CREATE TABLE IF NOT EXISTS {{db}}.log_landing{{dist_suffix}}{{on_cluster}} AS {{db}}.log_landing
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'log_landing', cityHash64(received_ms));
+
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.log_metrics_{{log_rollup_suffix}}{{dist_suffix}}{{on_cluster}} AS {{db}}.log_metrics_{{log_rollup_suffix}}
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'log_metrics_{{log_rollup_suffix}}', cityHash64(fingerprint));
 
@@ -556,6 +559,9 @@ TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_label_index{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_label_index
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_label_index', cityHash64(fingerprint));
 
+--@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_landing{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_landing
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_landing', cityHash64(received_ms));
+
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_samples{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_samples
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_samples', cityHash64(fingerprint));
 
@@ -565,6 +571,9 @@ TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.spans{{dist_suffix}}{{on_cluster}} AS {{db}}.spans
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'spans', cityHash64(trace_id))
 --@cluster SETTINGS fsync_after_insert = 1, fsync_directories = 1;
+
+--@cluster CREATE TABLE IF NOT EXISTS {{db}}.trace_landing{{dist_suffix}}{{on_cluster}} AS {{db}}.trace_landing
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'trace_landing', cityHash64(received_ms));
 
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.traces{{dist_suffix}}{{on_cluster}} AS {{db}}.traces
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'traces', cityHash64(trace_id))

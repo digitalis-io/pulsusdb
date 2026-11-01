@@ -474,6 +474,22 @@ impl QuerySettings {
     /// | `ignore_materialized_views_with_dropped_target_table` | `0` | the same class. `InsertDependenciesBuilder::observePath`, on a view whose target table cannot be locked: `if (!ignore_materialized_views_with_dropped_target_table) throw Exception(UNKNOWN_TABLE, …)` then `LOG_INFO(…); return false;` — so at `1` the view is **skipped and the insert returns success**, with that target's rows silently absent |
     /// | `min_insert_block_size_rows_for_materialized_views` | `0` | **the block-forming class above, reaching the part of the path its pins do not.** `createSelectInsertContext` *overrides* `min_insert_block_size_rows` with this value for a **view's** insert alone, so the pin on the non-view variant does not govern there; a profile could reshape one view's output into several blocks, each its own commit into the target |
     /// | `min_insert_block_size_bytes_for_materialized_views` | `0` | the same, for bytes |
+    ///
+    /// **On a cluster the block goes through its landing table's wrapper
+    /// (issue #494 part 1).** The writer names `<landing table><PULSUS_DIST_SUFFIX>`,
+    /// a `Distributed` table keyed on `cityHash64(received_ms)`, so a push and
+    /// every resend of it reach one shard whichever server receives them. Five
+    /// pins keep that routed insert from being quietly placed elsewhere,
+    /// skipped, or answered before it is stored; single-node they change
+    /// nothing, as no wrapper is named:
+    ///
+    /// | setting | pinned to | why |
+    /// |---|---|---|
+    /// | `distributed_foreground_insert` | `1` | **what an acknowledgement means.** The server's default is `0`, "data is inserted in background mode": on a cluster the landing insert goes through its wrapper, and the two per-trace views insert into a routing table. At `0` the wrapper queues the block on the receiving server's disk and answers first. At `1` the insert "succeeds only after all the data is saved on all shards (at least one replica for each shard if `internal_replication` is true)". **It is pinned here and not on the table**: a `Distributed` table accepts the clause on a `CREATE` and the server keeps nothing — the setting is absent from `SHOW CREATE TABLE` and from `system.tables.create_table_query`, and `ALTER TABLE … MODIFY SETTING` answers `Code: 48`. The chain that makes the query pin reach the view's insert is `InsertDependenciesBuilder::createSelectInsertContext` copying the parent context and changing four named settings, and `StorageDistributed::write` computing `insert_sync` from the context it is given |
+    /// | `insert_shard_id` | `0` | **where a row is placed.** The shard follows the sharding key and nothing else. `DistributedSink::writeSync`: `if (settings[Setting::insert_shard_id]) { start = insert_shard_id - 1; end = insert_shard_id; }` — the whole block goes to that one shard and the sharding expression is not consulted. A hash-pruned read then looks on the shard `cityHash64(trace_id)` selects while the rows are elsewhere: wrong answers on a cluster from a setting nobody pinned |
+    /// | `skip_unavailable_shards` | `0` | **a shard is never skipped.** The engine has a skip path for an unreachable shard or a missing remote table (`src/Storages/Distributed/DistributedSink.cpp:105-129` at `v26.8.21.10-lts`); at `1` a skipped shard would make the insert succeed with nothing stored. Measured on 26.8, the insert failed with code 279 at both values; the pin holds whatever a profile sets |
+    /// | `prefer_localhost_replica` | `0` | **the coordinator's own replica is not special.** At the default `1` a coordinator that is a replica of the target shard writes only locally and never tries the peer: measured on 26.8 with the local replica's table detached, the insert answered code 60. At `0` it writes one live replica of the shard |
+    /// | `timeout_overflow_mode` | `throw`, its own declared default | **whether running past the deadline is an error or a success that need not be complete.** Pinned on traces first, and on logs and metrics since issue #494 part 1: `PULSUS_QUERY_TIMEOUT` accepts a value as small as one second. Every insert this client makes carries `max_execution_time` (`ChClient::insert_settings_with`). Measured on 26.8.21.10, one source table with two views, one of them slower than a one-second `max_execution_time`: under `break` the insert **succeeded** with the slow view's target empty; under `throw` it failed with `Code: 159`. Pinned so a profile cannot turn a slow view into a silent loss |
     pub fn landing_insert(token: &str, max_rows: u64) -> Self {
         Self::deduplicate_through_views()
             .set("insert_deduplication_token", token)
@@ -488,11 +504,16 @@ impl QuerySettings {
             .set("ignore_materialized_views_with_dropped_target_table", 0)
             .set("min_insert_block_size_rows_for_materialized_views", 0)
             .set("min_insert_block_size_bytes_for_materialized_views", 0)
+            .set("distributed_foreground_insert", 1)
+            .set("insert_shard_id", 0)
+            .set("skip_unavailable_shards", 0)
+            .set("prefer_localhost_replica", 0)
+            .set("timeout_overflow_mode", "throw")
     }
 
     /// The settings every insert of one traces landing block carries (issues
-    /// #584 to #586): [`Self::landing_insert`] whole, plus **ten further
-    /// pins of seven classes the metrics set did not need**.
+    /// #584 to #586): [`Self::landing_insert`] whole, plus **seven further
+    /// pins of four classes the metrics set did not need**.
     ///
     /// The rule behind the set, stated once so it does not grow without
     /// bound: **pin what a profile could use to make an answer wrong or a
@@ -515,12 +536,9 @@ impl QuerySettings {
     /// | `format_binary_max_object_size` | `100000` | the same class: it bounds the paths one JSON value may carry in RowBinary. A profile that lowered it would refuse spans the decode gate admitted, after the block was sent. The decode gate and this pin carry the **same constant**, so neither can admit what the other refuses |
     /// | `max_partitions_per_insert_block` | `100` | **a limit that refuses a block rather than dividing it.** `spans`, `traces` and `resources` are partitioned by UTC day, so a view's insert touches one part per day the push's spans fall in. A profile that lowered this to 1 would fail every push that straddles midnight |
     /// | `throw_on_max_partitions_per_insert_block` | `1` | the same limit's other half. At `0` the server does not store part of the block: the throw in `MergeTreeDataWriter::buildScatterSelector` sits inside the row loop behind `&& throw_on_limit`, so with it false the loop completes the selector over every row and the whole block is accepted, one part per partition, with a warning. **What `0` costs is the ceiling, not the block** — the admission date gate would then be refusing pushes the server would have taken. Pinned so the gate and the engine cannot disagree about the same limit |
-    /// | `distributed_foreground_insert` | `1` | **a third class: what an acknowledgement means.** The server's default is `0`, "data is inserted in background mode", and the two per-trace views insert into a routing table. At `1` the insert "succeeds only after all the data is saved on all shards (at least one replica for each shard if `internal_replication` is true)". **It is pinned here and not on the table**: a `Distributed` table accepts the clause on a `CREATE` and the server keeps nothing — the setting is absent from `SHOW CREATE TABLE` and from `system.tables.create_table_query`, and `ALTER TABLE … MODIFY SETTING` answers `Code: 48`. The chain that makes the query pin reach the view's insert is `InsertDependenciesBuilder::createSelectInsertContext` copying the parent context and changing four named settings, and `StorageDistributed::write` computing `insert_sync` from the context it is given |
-    /// | `parallel_view_processing` | `1` | **a seventh class: how the views run.** The server's default is `0`, which runs the landing table's eight views one after another inside each insert, so a sync push waits for their sum. At `1` they run concurrently. Measured on the local cluster (26.8.21.10) with four insert workers: the landing insert's p50 fell from 212 ms to 85 ms and one writer's sustained rate rose from 12.3 to 19.8 pushes a second. Each view still deduplicates its own block by the insert's token, so a retry stores nothing twice whatever order the views ran in |
-    /// | `insert_shard_id` | `0` | **a fourth class: where a row is placed.** `DistributedSink::writeSync`: `if (settings[Setting::insert_shard_id]) { start = insert_shard_id - 1; end = insert_shard_id; }` — the whole block goes to that one shard and the sharding expression is not consulted. A hash-pruned read then looks on the shard `cityHash64(trace_id)` selects while the rows are elsewhere: wrong answers on a cluster from a setting nobody pinned |
-    /// | `json_type_escape_dots_in_keys` | `0` | **a fifth class: what path a value is stored under.** Its description says it escapes dots "during parsing", and this path sends paths in the binary form rather than parsing text — but nothing read here establishes that the binary form is unaffected, and if it were affected every stored path would differ from what the encoder renders. Pinned because the question is open, not because the effect is known |
+    /// | `parallel_view_processing` | `1` | **how the views run.** The server's default is `0`, which runs the landing table's eight views one after another inside each insert, so a sync push waits for their sum. At `1` they run concurrently. Measured on the local cluster (26.8.21.10) with four insert workers: the landing insert's p50 fell from 212 ms to 85 ms and one writer's sustained rate rose from 12.3 to 19.8 pushes a second. Each view still deduplicates its own block by the insert's token, so a retry stores nothing twice whatever order the views ran in |
+    /// | `json_type_escape_dots_in_keys` | `0` | **what path a value is stored under.** Its description says it escapes dots "during parsing", and this path sends paths in the binary form rather than parsing text — but nothing read here establishes that the binary form is unaffected, and if it were affected every stored path would differ from what the encoder renders. Pinned because the question is open, not because the effect is known |
     /// | `type_json_skip_duplicated_paths` | `0` | the block-forming class again. At `1` a repeated path in one value "will be ignored and only the first one will be inserted instead of an exception" — the same result the writer's own per-scope deduplication produces, which is why it must stay the **only** mechanism: at `1` a writer that emitted a duplicate would be silently absorbed instead of erroring |
-    /// | `timeout_overflow_mode` | `throw`, its own declared default | **a sixth class: whether running past the deadline is an error or a success that need not be complete.** Every insert this client makes carries `max_execution_time` (`ChClient::insert_settings_with`). Measured on 26.8.21.10, one source table with two views, one of them slower than a one-second `max_execution_time`: under `break` the insert **succeeded** with the slow view's target empty; under `throw` it failed with `Code: 159`. Pinned so a profile cannot turn a slow view into a silent loss |
     ///
     /// **`async_insert` is deliberately not in the set, because it is already
     /// pinned one layer down.** [`crate::ChClient::insert_settings_of`]
@@ -539,12 +557,9 @@ impl QuerySettings {
                 MAX_PARTITIONS_PER_INSERT_BLOCK,
             )
             .set("throw_on_max_partitions_per_insert_block", 1)
-            .set("distributed_foreground_insert", 1)
             .set("parallel_view_processing", 1)
-            .set("insert_shard_id", 0)
             .set("json_type_escape_dots_in_keys", 0)
             .set("type_json_skip_duplicated_paths", 0)
-            .set("timeout_overflow_mode", "throw")
     }
 
     /// docs/schemas.md §7 clustered-reader settings block, emitted exactly:
@@ -567,8 +582,8 @@ impl QuerySettings {
     ///
     /// `prune_by_sharding_key` is `optimize_skip_unused_shards`: true only
     /// where rows are placed by the sharding key (sharded trace reads). Logs
-    /// and metrics rows sit on the shard that took the push, so their reads
-    /// pass `false`. `skip_unavailable_shards` is
+    /// and metrics rows sit on the shard their push's receive stamp selects,
+    /// not the one their table's key does, so their reads pass `false`. `skip_unavailable_shards` is
     /// `PULSUS_SKIP_UNAVAILABLE_SHARDS`; its mode is pinned so "unavailable"
     /// means unreachable or missing the table, never a shard's error. Every
     /// overflow mode is `throw`: a read that hits a limit fails rather than

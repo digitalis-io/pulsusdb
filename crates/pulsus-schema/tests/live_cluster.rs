@@ -759,9 +759,10 @@ async fn the_cluster_windows_are_the_replicated_pair_on_every_write_path_table()
 }
 
 /// **The clustered shape of the trace write path.** Two of the five targets
-/// carry a routing wrapper and three do not, and the landing table carries
-/// none at all — a push carries many trace ids, so inserting the push itself
-/// through a `Distributed` wrapper would split one push per shard.
+/// carry a routing wrapper and three do not. The landing table's wrapper is
+/// keyed on the push's receive stamp, not on a trace id (issue #494 part 1):
+/// every row of a push carries one `received_ms`, so the push stays one block
+/// on one shard.
 ///
 /// **The `SETTINGS` clause is asserted, not merely the engine**: a setting
 /// the server accepts on a `CREATE` and then discards leaves no trace in
@@ -798,10 +799,20 @@ async fn the_clustered_form() {
             );
         }
 
-        // The three catalog targets and the landing table exist on every
-        // shard with no routing twin.
+        let got = engine_full_on(shard, db, "trace_landing_dist").await;
+        assert_eq!(
+            got,
+            format!(
+                "Distributed('{CLUSTER_NAME}', '{db}', 'trace_landing', cityHash64(received_ms))"
+            ),
+            "shard{}: trace_landing_dist routes on the receive stamp",
+            i + 1
+        );
+
+        // The three catalog targets exist on every shard with no routing
+        // twin.
         let present = table_names(shard, db).await;
-        for name in ["resources", "tag_names", "tag_values", "trace_landing"] {
+        for name in ["resources", "tag_names", "tag_values"] {
             assert!(
                 present.iter().any(|n| n == name),
                 "shard{}: {name} must exist on every shard: {present:?}",

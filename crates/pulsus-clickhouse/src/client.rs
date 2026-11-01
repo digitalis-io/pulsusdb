@@ -579,7 +579,9 @@ mod tests {
     /// the two block-deduplication pins, the block's own minted token, and
     /// the seven settings that decide how many blocks the server forms out
     /// of the request and whether it deduplicates them, and the four that
-    /// decide what a view does with it — between
+    /// decide what a view does with it, and the five that keep a routed
+    /// landing insert on its shard and stored before it answers (issue #494
+    /// part 1) — between
     /// `async_insert` and the deadline, with nothing else moving. A path that
     /// sent only some of them would leave a resend storing the block twice,
     /// or one push becoming two blocks.
@@ -602,6 +604,9 @@ mod tests {
              ignore_materialized_views_with_dropped_target_table = 0, \
              min_insert_block_size_rows_for_materialized_views = 0, \
              min_insert_block_size_bytes_for_materialized_views = 0, \
+             distributed_foreground_insert = 1, insert_shard_id = 0, \
+             skip_unavailable_shards = 0, prefer_localhost_replica = 0, \
+             timeout_overflow_mode = throw, \
              max_execution_time = 120.000"
         );
     }

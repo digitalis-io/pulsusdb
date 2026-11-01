@@ -35,17 +35,19 @@ use crate::writer::table::BlockInserter;
 use crate::writer::trace_landing::{self, TraceLandingPath};
 use crate::writer::{AdmitMode, Admitted, Suppressed, note_target};
 
-/// The one table a [`TraceWriter`] inserts into. No `_dist` wrapper in any
-/// mode: a push carries many trace ids, so inserting the push itself through
-/// one would split one push per shard. The routing happens one step later,
-/// on the way out of the per-trace views.
+/// The one table a [`TraceWriter`] inserts into. On a cluster it is the
+/// landing table's `Distributed` wrapper, keyed on `cityHash64(received_ms)`
+/// rather than on a trace id: every row of a push carries one receive stamp,
+/// so the whole push and every resend of it reach one shard (issue #494 part
+/// 1, [`Self::landing_for`]). Single-node it is the bare table. The routing
+/// by trace id happens one step later, on the way out of the per-trace views.
 #[derive(Debug, Clone)]
 pub struct TraceWriterTables {
     pub landing: Arc<str>,
 }
 
 impl TraceWriterTables {
-    /// The landing table's name, the same in every mode.
+    /// The bare landing table's name.
     pub fn traces_default() -> Self {
         TraceWriterTables {
             landing: Arc::from(trace_landing::LANDING_TABLE),
@@ -55,8 +57,13 @@ impl TraceWriterTables {
     /// The landing table for a deployment: the bare name for `None`, and
     /// `trace_landing<suffix>` for `Some(suffix)`.
     pub fn landing_for(dist_suffix: Option<&str>) -> Self {
-        let _ = dist_suffix;
-        Self::traces_default()
+        TraceWriterTables {
+            landing: Arc::from(format!(
+                "{}{}",
+                trace_landing::LANDING_TABLE,
+                dist_suffix.unwrap_or("")
+            )),
+        }
     }
 }
 

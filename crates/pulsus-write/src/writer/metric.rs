@@ -98,9 +98,11 @@ const VALUE_TYPE_HISTOGRAM: u8 = 1;
 
 /// The table name a [`MetricWriter`] inserts into. One name: the four target
 /// tables are maintained by materialized view and the writer never names
-/// them (issue #603). The landing table has no `Distributed` wrapper, so
-/// this is the base name in every mode — `Arc<str>` because the server
-/// resolves it once at startup from `Config` rather than at compile time.
+/// them (issue #603). On a cluster it is the landing table's `Distributed`
+/// wrapper, keyed on `cityHash64(received_ms)`, so a push and every resend of
+/// it reach one shard; single-node it is the bare table (issue #494 part 1,
+/// [`Self::landing_for`]). `Arc<str>` because the server resolves it once at
+/// startup from `Config` rather than at compile time.
 #[derive(Debug, Clone)]
 pub struct MetricWriterTables {
     pub landing: Arc<str>,
@@ -117,8 +119,9 @@ impl MetricWriterTables {
     /// The landing table for a deployment: the bare name for `None`, and
     /// `metric_landing<suffix>` for `Some(suffix)`.
     pub fn landing_for(dist_suffix: Option<&str>) -> Self {
-        let _ = dist_suffix;
-        Self::metrics_default()
+        MetricWriterTables {
+            landing: Arc::from(format!("{LANDING_TABLE}{}", dist_suffix.unwrap_or(""))),
+        }
     }
 }
 

@@ -339,13 +339,12 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         );
     }
     assert!(text.contains("cityHash64(trace_id)"));
-    assert_eq!(
-        by_family
-            .get("landing")
-            .map(|e| e.iter().cloned().collect::<Vec<_>>()),
-        Some(vec!["cityHash64(received_ms)".to_string()]),
-        "the landing wrappers route on the push's receive stamp"
-    );
+    for table in ["log_landing", "metric_landing", "trace_landing"] {
+        assert!(
+            text.contains(&format!("'{table}', cityHash64(received_ms));")),
+            "{table} routes on the push's receive stamp, cityHash64(received_ms)"
+        );
+    }
     // F7 (issue #623): the metrics family shards by the series ID alone.
     for table in [
         "metric_samples",
