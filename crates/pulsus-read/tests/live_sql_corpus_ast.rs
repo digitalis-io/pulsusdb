@@ -259,8 +259,12 @@ const CONTROL: &str = "with_binding_control.txt";
 /// **Issue #602 part 3a moves them 98 -> 43 and 216 -> 66: the 55
 /// `traces_metrics`, `traces_metrics_base` and `traces_graph` goldens and
 /// their 150 statements deleted with the previous metrics and graph SQL.**
-const SQL_FILES: usize = 43;
-const SQL_STATEMENTS: usize = 66;
+///
+/// **Issue #764 moves them 43 -> 44 and 66 -> 68: the
+/// `traces_spans_metrics` golden `explore_root_status` added, a range and an
+/// instant statement.**
+const SQL_FILES: usize = 44;
+const SQL_STATEMENTS: usize = 68;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 55;
 const CONTROL_STATEMENTS: usize = 1;
