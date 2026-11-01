@@ -366,7 +366,7 @@ Per day at a 15 s scrape and 4,000 series, a first-level run every minute read 1
 | a builder down | its shard's run rows stop. That shard's coverage ends, so every query reads finer levels or raw after it (`reading.md` §3) |
 | `max_threads` | in the view's statement, so on every replica with no server configuration |
 
-`each_shard_builds_its_slice_once` (`crates/pulsus-schema/tests/live_cluster.rs:2023`) checks one row per bucket per shard and a push counted once with one replica's fetches stopped. It runs in CI's cluster job; no figure here comes from a cluster.
+`each_shard_builds_its_slice_once` (`crates/pulsus-schema/tests/live_cluster.rs:2025`) checks one row per bucket per shard and a push counted once with one replica's fetches stopped. It runs in CI's cluster job; no figure here comes from a cluster.
 
 ## 5. Lower priority than inserts and queries
 

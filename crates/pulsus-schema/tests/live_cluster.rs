@@ -1552,6 +1552,7 @@ async fn a_shard_that_refuses_loses_whole_traces_and_a_retry_restores_them() {
     for table in ["spans_dist", "traces_dist"] {
         wait_distribution_drained(&shard1, db, table).await;
     }
+    sync_shard1_trace_replicas(&shard1, db).await;
     for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
         // **`FINAL`, because the retry carries its own token**: the shard
         // that committed the first push holds those rows and the retry's
@@ -1645,6 +1646,7 @@ async fn a_hostile_profile_cannot_move_rows_off_their_shard() {
     for table in ["spans_dist", "traces_dist"] {
         wait_distribution_drained(&shard1, db, table).await;
     }
+    sync_shard1_trace_replicas(&shard1, db).await;
     for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
         assert_eq!(
             count_on(shard, &format!("SELECT count() AS n FROM {db}.spans")).await,
