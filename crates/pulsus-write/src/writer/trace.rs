@@ -51,6 +51,13 @@ impl TraceWriterTables {
             landing: Arc::from(trace_landing::LANDING_TABLE),
         }
     }
+
+    /// The landing table for a deployment: the bare name for `None`, and
+    /// `trace_landing<suffix>` for `Some(suffix)`.
+    pub fn landing_for(dist_suffix: Option<&str>) -> Self {
+        let _ = dist_suffix;
+        Self::traces_default()
+    }
 }
 
 struct Shared {
@@ -370,6 +377,20 @@ fn now_unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **1-U6 (issue #494 part 1).** The bare name without a suffix, the
+    /// suffixed wrapper with one.
+    #[test]
+    fn landing_for_names_the_wrapper_only_when_given_a_suffix() {
+        assert_eq!(
+            &*TraceWriterTables::landing_for(None).landing,
+            "trace_landing"
+        );
+        assert_eq!(
+            &*TraceWriterTables::landing_for(Some("_d")).landing,
+            "trace_landing_d"
+        );
+    }
 
     /// [`crate::writer::log`]'s case of the same name, for the trace
     /// writer's landing path: B is refused between the landing sender's

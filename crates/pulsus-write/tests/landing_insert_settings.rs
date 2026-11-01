@@ -642,6 +642,100 @@ async fn the_production_inserter_sends_the_trace_landing_settings_on_the_wire() 
     );
 }
 
+/// The five settings the routed landing insert pins on every signal (issue
+/// #494 part 1), at their values.
+const ROUTED_PINS: [(&str, &str); 5] = [
+    ("distributed_foreground_insert", "1"),
+    ("insert_shard_id", "0"),
+    ("skip_unavailable_shards", "0"),
+    ("prefer_localhost_replica", "0"),
+    ("timeout_overflow_mode", "throw"),
+];
+
+/// Waits until `recorder` has seen one call, then checks that call's
+/// settings carry every routed pin.
+async fn assert_routed_pins(recorder: &SettingsRecorder, table: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while recorder.calls() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the writer never handed a landing block over"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let (named, handed) = recorder.first();
+    assert_eq!(named, table);
+    for (key, value) in ROUTED_PINS {
+        let got = handed
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            got,
+            Some(value),
+            "the settings the writer hands its inserter carry {key} = {value}: {handed:?}"
+        );
+    }
+}
+
+/// **1-U4 (issue #494 part 1), logs.** What `LogWriter` hands its own
+/// `BlockInserter` for one push carries `timeout_overflow_mode = throw` and
+/// the other four routed pins, as the trace writer's does.
+#[tokio::test]
+async fn the_log_writer_hands_over_the_routed_landing_pins() {
+    let root = spool_root("log-routed-pins");
+    let recorder = Arc::new(SettingsRecorder::default());
+    let mut runtime = WriterRuntime::from_config(&WriterConfig::default());
+    runtime.spool_dir = root.clone();
+    let writer = pulsus_write::writer::LogWriter::with_landing_inserter_and_runtime(
+        recorder.clone(),
+        runtime,
+        pulsus_write::writer::WriterTables::logs_default(),
+    );
+    let push = pulsus_write::ParsedLogs {
+        rows: vec![pulsus_write::LogRow {
+            service: "checkout".to_string(),
+            fingerprint: Fingerprint::from_raw(7),
+            timestamp_ns: pulsus_model::UnixNano(1_700_000_000_000_000_000),
+            severity: 0,
+            body: "request 1 completed".to_string(),
+            structured_metadata: String::new(),
+        }],
+        ..Default::default()
+    };
+    pulsus_write::LogSink::admit_flush(&writer, &no_tenant(), push, PushHeaders::default())
+        .expect("the queue has room")
+        .await
+        .expect("the landing insert commits");
+    assert_routed_pins(&recorder, "log_landing").await;
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **1-U4 (issue #494 part 1), metrics.** As the logs case, for
+/// `MetricWriter`.
+#[tokio::test]
+async fn the_metric_writer_hands_over_the_routed_landing_pins() {
+    let root = spool_root("metric-routed-pins");
+    let recorder = Arc::new(SettingsRecorder::default());
+    let mut runtime = WriterRuntime::from_config(&WriterConfig::default());
+    runtime.spool_dir = root.clone();
+    let writer = MetricWriter::with_landing_inserter_and_runtime(
+        recorder.clone(),
+        runtime,
+        ACTIVITY_BUCKET_MS,
+        MetricWriterTables::metrics_default(),
+    );
+    writer
+        .admit_flush(&no_tenant(), one_sample_push(), PushHeaders::default())
+        .expect("the queue has room")
+        .await
+        .expect("the landing insert commits");
+    assert_routed_pins(&recorder, "metric_landing").await;
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// One recorded call: the table it named and the settings it carried.
 type RecordedCall = (String, Vec<(String, String)>);
 

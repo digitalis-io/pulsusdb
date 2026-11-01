@@ -694,40 +694,54 @@ mod tests {
         assert_eq!(engine_cfg.patterns_table, "log_patterns_dist");
     }
 
-    /// **T42.** The logs writer names one table, `log_landing`, with no
-    /// `_dist` suffix in either mode (issue #603): the landing table has no
-    /// `Distributed` wrapper, because routing a push's block through one would
-    /// split it per shard and end "one push is one block". The five target
-    /// tables keep their wrappers for reads, which
-    /// `engine_config_from_uses_dist_table_names_when_clustered` above pins.
+    /// **1-U2 (issue #494 part 1), replacing T42's no-`_dist` assertions.**
+    /// On a cluster each writer names its landing table's wrapper,
+    /// `<landing table><PULSUS_DIST_SUFFIX>`, so a push and every resend of
+    /// it reach one shard; without a cluster it names the bare table, whatever
+    /// the suffix says.
     #[test]
-    fn the_logs_writer_names_only_the_landing_table() {
-        for (name, config) in [
-            ("unclustered", Config::default()),
+    fn the_writers_name_the_landing_wrappers_only_on_a_cluster() {
+        let clustered = Config {
+            cluster: Some("c".to_string()),
+            dist_suffix: "_d".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(&*writer_tables_from(&clustered).landing, "log_landing_d");
+        assert_eq!(
+            &*metric_writer_tables_from(&clustered).landing,
+            "metric_landing_d"
+        );
+        assert_eq!(
+            &*trace_writer_tables_from(&clustered).landing,
+            "trace_landing_d"
+        );
+
+        for (name, single) in [
+            ("default", Config::default()),
             (
-                "clustered",
+                "a suffix without a cluster",
                 Config {
-                    cluster: Some("prod".to_string()),
+                    dist_suffix: "_d".to_string(),
                     ..Config::default()
                 },
             ),
         ] {
-            let tables = writer_tables_from(&config);
-            assert_eq!(&*tables.landing, "log_landing", "{name}");
-            assert!(
-                !tables.landing.contains("_dist"),
-                "{name}: the writer must never name a Distributed wrapper"
+            assert_eq!(
+                &*writer_tables_from(&single).landing,
+                "log_landing",
+                "{name}"
+            );
+            assert_eq!(
+                &*metric_writer_tables_from(&single).landing,
+                "metric_landing",
+                "{name}"
+            );
+            assert_eq!(
+                &*trace_writer_tables_from(&single).landing,
+                "trace_landing",
+                "{name}"
             );
         }
-
-        // A non-default suffix cannot reach it either: the cluster plays no
-        // part in this name at all.
-        let odd = Config {
-            cluster: Some("prod".to_string()),
-            dist_suffix: "_shards".to_string(),
-            ..Config::default()
-        };
-        assert_eq!(&*writer_tables_from(&odd).landing, "log_landing");
     }
 
     /// **T26.** The pinned seconds deduplication window covers the landing
@@ -760,34 +774,6 @@ mod tests {
         let config = Config::default();
         let tables = metric_writer_tables_from(&config);
         assert_eq!(&*tables.landing, "metric_landing");
-    }
-
-    /// Issue #603: no `_dist` name is left on the metrics write path at all.
-    /// The landing table has no `Distributed` wrapper for the writer to
-    /// name, so the cluster changes nothing here — unlike the read path,
-    /// whose four target tables keep their wrappers.
-    #[test]
-    fn metric_writer_tables_from_ignores_the_cluster_for_the_landing_table() {
-        let config = Config {
-            cluster: Some("prod".to_string()),
-            ..Config::default()
-        };
-        let tables = metric_writer_tables_from(&config);
-        assert_eq!(&*tables.landing, "metric_landing");
-    }
-
-    /// The trace writer's one target is the landing table, written by bare
-    /// name in both deployments, like the metric writer's above.
-    #[test]
-    fn trace_writer_tables_from_ignores_the_cluster_for_the_landing_table() {
-        for cluster in [None, Some("prod".to_string())] {
-            let config = Config {
-                cluster,
-                ..Config::default()
-            };
-            let tables = trace_writer_tables_from(&config);
-            assert_eq!(&*tables.landing, "trace_landing");
-        }
     }
 
     #[test]

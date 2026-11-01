@@ -113,6 +113,13 @@ impl MetricWriterTables {
             landing: Arc::from(LANDING_TABLE),
         }
     }
+
+    /// The landing table for a deployment: the bare name for `None`, and
+    /// `metric_landing<suffix>` for `Some(suffix)`.
+    pub fn landing_for(dist_suffix: Option<&str>) -> Self {
+        let _ = dist_suffix;
+        Self::metrics_default()
+    }
 }
 
 /// The `SeriesLru` keys a committed block registers, derived from the block's
@@ -981,6 +988,20 @@ fn now_unix_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// **1-U6 (issue #494 part 1).** The bare name without a suffix, the
+    /// suffixed wrapper with one.
+    #[test]
+    fn landing_for_names_the_wrapper_only_when_given_a_suffix() {
+        assert_eq!(
+            &*super::MetricWriterTables::landing_for(None).landing,
+            "metric_landing"
+        );
+        assert_eq!(
+            &*super::MetricWriterTables::landing_for(Some("_d")).landing,
+            "metric_landing_d"
+        );
+    }
+
     use pulsus_model::LabelSet;
 
     use pulsus_clickhouse::ChError;

@@ -861,11 +861,36 @@ mod tests {
         );
         assert_eq!(
             s.entries().count(),
-            14,
+            19,
             "the pinned set is closed: a setting added to it without a row in \
              landing_insert's table, and without its required-name entry, is \
              a name sent on somebody's memory"
         );
+    }
+
+    /// **1-U1 (issue #494 part 1): every landing insert pins the five
+    /// settings the routed landing insert depends on**, for metrics and logs
+    /// through [`QuerySettings::landing_insert`] and for traces through
+    /// [`QuerySettings::trace_landing_insert`], each at the same value. On a
+    /// cluster the landing block goes through a `Distributed` wrapper, so
+    /// what an acknowledgement means, where the block is placed, whether a
+    /// shard may be skipped, whether the coordinator's own replica is
+    /// special and whether a deadline is an error are each pinned.
+    #[test]
+    fn every_landing_insert_pins_the_routed_insert_settings() {
+        const PINS: [(&str, &str); 5] = [
+            ("distributed_foreground_insert", "1"),
+            ("insert_shard_id", "0"),
+            ("skip_unavailable_shards", "0"),
+            ("prefer_localhost_replica", "0"),
+            ("timeout_overflow_mode", "throw"),
+        ];
+        let base = QuerySettings::landing_insert("tok-1", 1_048_576);
+        let traces = QuerySettings::trace_landing_insert("tok-1", 1_048_576);
+        for (key, value) in PINS {
+            assert_eq!(base.get(key), Some(value), "landing_insert: {key}");
+            assert_eq!(traces.get(key), Some(value), "trace_landing_insert: {key}");
+        }
     }
 
     /// **W1 (issue #623): a landing insert fails when a view does not
@@ -904,12 +929,12 @@ mod tests {
     }
 
     /// **The trace landing insert's pin set is exactly the metrics one plus
-    /// the ten the trace path needs**, and the two sets are compared as
-    /// **sets**, with the difference taken against those ten — so
+    /// the seven the trace path needs**, and the two sets are compared as
+    /// **sets**, with the difference taken against those seven — so
     /// neither an added pin nor a removed one passes.
     ///
     /// It is the only place in this change that writes a setting name as a
-    /// literal. The classes behind the ten, and the catalogue
+    /// literal. The classes behind the seven, and the catalogue
     /// quotation behind each value, are
     /// [`QuerySettings::trace_landing_insert`]'s own doc comment.
     ///
@@ -927,12 +952,9 @@ mod tests {
             ("format_binary_max_object_size", "100000"),
             ("max_partitions_per_insert_block", "100"),
             ("throw_on_max_partitions_per_insert_block", "1"),
-            ("distributed_foreground_insert", "1"),
             ("parallel_view_processing", "1"),
-            ("insert_shard_id", "0"),
             ("json_type_escape_dots_in_keys", "0"),
             ("type_json_skip_duplicated_paths", "0"),
-            ("timeout_overflow_mode", "throw"),
         ];
 
         let base = QuerySettings::landing_insert("tok-1", 1_048_576);
@@ -949,7 +971,7 @@ mod tests {
         assert_eq!(
             added, want,
             "the difference against the metrics landing insert is exactly the \
-             ten pins this design names"
+             seven pins this design names"
         );
 
         for (key, value) in &base_entries {

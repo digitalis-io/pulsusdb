@@ -678,10 +678,14 @@ mod tests {
     fn the_settings_read_back_at_startup_are_the_ones_the_landing_insert_sends() {
         use std::collections::BTreeSet;
 
-        /// In `crates/` before this work, so outside the probed class.
+        /// In `crates/` before this work, so outside the probed class. The
+        /// last two were already sent by `QuerySettings::clustered_reader`
+        /// before the landing insert pinned them (issue #494 part 1).
         const ALREADY_SHIPPED: &[&str] = &[
             "deduplicate_insert",
             "deduplicate_blocks_in_dependent_materialized_views",
+            "skip_unavailable_shards",
+            "prefer_localhost_replica",
         ];
 
         let want: BTreeSet<&str> = BTreeSet::from([
@@ -697,11 +701,14 @@ mod tests {
             "ignore_materialized_views_with_dropped_target_table",
             "min_insert_block_size_rows_for_materialized_views",
             "min_insert_block_size_bytes_for_materialized_views",
+            "distributed_foreground_insert",
+            "insert_shard_id",
+            "timeout_overflow_mode",
         ]);
 
-        // The trace landing insert's own ten pins are rows too (issues
+        // The trace landing insert's own seven pins are rows too (issues
         // #584 to #586), and they are **derived from that constructor** here
-        // rather than written out a second time: this case owns the twelve
+        // rather than written out a second time: this case owns the fifteen
         // above as a literal set, and
         // `the_settings_read_back_at_startup_are_the_ones_the_trace_insert_sends`
         // owns the rest, both ways.
@@ -825,10 +832,14 @@ mod tests {
     fn the_settings_read_back_at_startup_are_the_ones_the_trace_insert_sends() {
         use std::collections::BTreeSet;
 
-        /// In `crates/` before this work, so outside the probed class.
+        /// In `crates/` before this work, so outside the probed class. The
+        /// last two were already sent by `QuerySettings::clustered_reader`
+        /// before the landing insert pinned them (issue #494 part 1).
         const ALREADY_SHIPPED: &[&str] = &[
             "deduplicate_insert",
             "deduplicate_blocks_in_dependent_materialized_views",
+            "skip_unavailable_shards",
+            "prefer_localhost_replica",
         ];
 
         let rows: BTreeSet<&str> = REQUIRED_SERVER_NAMES
