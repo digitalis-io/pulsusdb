@@ -1241,6 +1241,17 @@ async fn wait_distribution_drained(client: &ChClient, db: &str, table: &str) {
     }
 }
 
+/// Brings shard 1's first replica level with its second for the two routed
+/// trace tables. A routed insert writes one replica of the target shard, and
+/// since the landing insert pins `prefer_localhost_replica = 0` (issue #494
+/// part 1) that may be the second replica even when shard 1's first is the
+/// coordinator; a read on the first replica then waits for replication.
+async fn sync_shard1_trace_replicas(shard1: &ChClient, db: &str) {
+    for table in ["spans", "traces"] {
+        exec_on(shard1, &format!("SYSTEM SYNC REPLICA {db}.{table}")).await;
+    }
+}
+
 /// **A trace lands whole on one shard.** Without the routing both traces'
 /// spans sit on whichever node took the push, and one shard holds 20 while
 /// the other holds 0.
@@ -1271,6 +1282,7 @@ async fn a_trace_lands_whole_on_one_shard() {
     for table in ["spans_dist", "traces_dist"] {
         wait_distribution_drained(&shard1, db, table).await;
     }
+    sync_shard1_trace_replicas(&shard1, db).await;
 
     for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
         assert_eq!(
@@ -1373,6 +1385,7 @@ async fn distributed_foreground_insert_reaches_the_views_insert() {
     for table in ["spans_dist", "traces_dist"] {
         wait_distribution_drained(&shard1, db, table).await;
     }
+    sync_shard1_trace_replicas(&shard1, db).await;
     for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
         assert_eq!(
             count_on(shard, &format!("SELECT count() AS n FROM {db}.spans FINAL")).await,
