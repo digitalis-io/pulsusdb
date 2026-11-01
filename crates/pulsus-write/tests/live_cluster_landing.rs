@@ -301,7 +301,7 @@ async fn require_two_shards(nodes: &Nodes) {
 async fn assert_stamp_selects(client: &ChClient, ms: i64, index: u64) {
     let got = num(
         client,
-        &format!("SELECT cityHash64(toInt64({ms})) % 2 AS n"),
+        &format!("SELECT toUInt64(cityHash64(toInt64({ms})) % 2) AS n"),
     )
     .await;
     assert_eq!(got, index, "cityHash64({ms}) % 2");
@@ -825,8 +825,8 @@ async fn a_metric_push_that_throws_on_every_attempt_lands_on_one_shard_once() {
     let repeated = texts(
         &nodes.s1a,
         &format!(
-            "SELECT metric_name AS s FROM {db}.metric_samples{SUFFIX} \
-             GROUP BY metric_name, fingerprint, unix_milli HAVING count() > 1"
+            "SELECT toString(fingerprint) AS s FROM {db}.metric_samples{SUFFIX} \
+             GROUP BY fingerprint, unix_milli HAVING count() > 1"
         ),
     )
     .await;
