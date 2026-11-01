@@ -1519,11 +1519,18 @@ async fn a_shard_that_refuses_loses_whole_traces_and_a_retry_restores_them() {
         .await
         .expect_err("the refusing shard fails the routed insert");
     eprintln!("refusal: the push failed with {err}");
-    assert_eq!(
-        count_on(&shard1, &format!("SELECT count() AS n FROM {db}.spans")).await,
-        10,
-        "the surviving shard's own trace is COMPLETE: the routing makes the \
-         missing unit a whole trace rather than an arbitrary subset of one"
+    // The landing insert pins `prefer_localhost_replica = 0` (issue #494
+    // part 1), so the surviving shard's part is a remote insert as well, and
+    // whether it commits before the refusal ends the statement is a race.
+    // What the routing guarantees is the unit: the whole trace or none of it.
+    sync_shard1_trace_replicas(&shard1, db).await;
+    let surviving = count_on(&shard1, &format!("SELECT count() AS n FROM {db}.spans")).await;
+    eprintln!("refusal: the surviving shard holds {surviving} spans (recorded)");
+    assert!(
+        surviving == 0 || surviving == 10,
+        "the surviving shard holds its own trace whole or not at all: the \
+         routing makes the missing unit a whole trace rather than an arbitrary \
+         subset of one; it holds {surviving}"
     );
     assert_eq!(
         count_on(&shard2, &format!("SELECT count() AS n FROM {db}.spans")).await,
