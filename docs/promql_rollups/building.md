@@ -43,7 +43,7 @@ Changing the set is a rebuild: drop the database and run `schema/schema.sh` agai
 
 `PULSUS_ROLLUP_COUNTER_BUCKETS` is a whole number from 2 to 1000 with no leading zero, else `<v> is not a whole number from 2 to 1000` (`parse_rollup_counter_buckets`, `crates/pulsus-schema/src/render.rs:415`). One bucket would give a `rate` window one point at the levels under 720 s.
 
-`the_script_renders_exactly_what_this_crate_renders` (`crates/pulsus-schema/tests/schema_file.rs:461`) holds the script's render and the crate's equal, and `the_script_and_the_crate_refuse_the_same_level_lists` (`crates/pulsus-schema/tests/schema_file.rs:2746`) and `the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets` (`crates/pulsus-schema/tests/schema_file.rs:2944`) hold their refusals equal.
+`the_script_renders_exactly_what_this_crate_renders` (`crates/pulsus-schema/tests/schema_file.rs:477`) holds the script's render and the crate's equal, and `the_script_and_the_crate_refuse_the_same_level_lists` (`crates/pulsus-schema/tests/schema_file.rs:2816`) and `the_script_and_the_crate_refuse_the_same_ranges_and_counter_buckets` (`crates/pulsus-schema/tests/schema_file.rs:3014`) hold their refusals equal.
 
 ### 1.3 The default, and what each set costs
 
@@ -145,7 +145,7 @@ The table's `CREATE TABLE` and its wrapper, as `schema/schema.sql:1004-1031` car
 
 Every run that has a window, whether or not it found samples, appends a run row with `kind = 1`, `org_id = ''`, `fingerprint = 0`, `t_last = lo`, `t_end = hi`, `built_at` = the run's start and every other column `0`: one row for each UTC day its `(lo, hi]` touches, each cut at midnight, so each lies in its day's partition. A run with no window, and every run on a replica that is not its shard's builder (§4.1), writes nothing.
 
-The run row is a `UNION ALL` branch of the run's own `SELECT`. With the block pins `max_insert_threads = 1` and `min_insert_block_size_rows` (`schema/schema.sql:1120`), a run's data rows and its run row are one part per partition, so a replica holds both or neither. Measured: each one-hour first-level run wrote 240,001 rows, 240,000 data rows and one run row, into one part (`measure/projection-run/10_60s_parts.tsv`).
+The run row is a `UNION ALL` branch of the run's own `SELECT`. With the block pins `max_insert_threads = 1` and `min_insert_block_size_rows` (`schema/schema.sql:1129`), a run's data rows and its run row are one part per partition, so a replica holds both or neither. Measured: each one-hour first-level run wrote 240,001 rows, 240,000 data rows and one run row, into one part (`measure/projection-run/10_60s_parts.tsv`).
 
 A level's coverage on a shard is the union of its run rows' `(t_last, t_end]`. A run row expires with its day's data.
 
@@ -314,7 +314,7 @@ The server accepted `EVERY 12 MINUTE OFFSET 240 SECOND`, `EVERY 2 HOUR OFFSET 30
 | a missed or failed run | the next starts from the same watermark. The first level catches up at most 5 periods of samples per run, the others 10 buckets. An empty window still writes its run row, so the watermark moves |
 | never older than landing | a first-level run starts no earlier than `now − H × 3600 s + 720 s`. A stop longer than landing holds leaves a hole in the run rows, which is read from finer levels or raw (`reading.md` §3) |
 | the first run on a database already holding samples | the first level starts one period back and writes a run row from there. Earlier history has no run row and reads raw. A coarser level builds from the level below, back to that level's oldest run row |
-| settle 150 s | `received_ms` is stamped at admission, and the insert may commit up to the landing budget, 120 s, later (`WriterRuntime::landing_budget`, `docs/ingest-one-source-table.md:407-411`). A sample later than that stays in raw only |
+| settle 150 s | `received_ms` is stamped at admission, and the insert may commit up to the landing budget, 120 s, later (`WriterRuntime::landing_budget`, `docs/ingest-one-source-table.md:417-421`). A sample later than that stays in raw only |
 | lookback 120 s | the first level reads two minutes before its window for each series' previous sample; a series with none there takes it from the level's own table, up to a day back (§3.1) |
 
 ### 3.4 A run reads only its window
@@ -366,7 +366,7 @@ Per day at a 15 s scrape and 4,000 series, a first-level run every minute read 1
 | a builder down | its shard's run rows stop. That shard's coverage ends, so every query reads finer levels or raw after it (`reading.md` §3) |
 | `max_threads` | in the view's statement, so on every replica with no server configuration |
 
-`each_shard_builds_its_slice_once` (`crates/pulsus-schema/tests/live_cluster.rs:1992`) checks one row per bucket per shard and a push counted once with one replica's fetches stopped. It runs in CI's cluster job; no figure here comes from a cluster.
+`each_shard_builds_its_slice_once` (`crates/pulsus-schema/tests/live_cluster.rs:2025`) checks one row per bucket per shard and a push counted once with one replica's fetches stopped. It runs in CI's cluster job; no figure here comes from a cluster.
 
 ## 5. Lower priority than inserts and queries
 

@@ -89,16 +89,16 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     assert!(text.contains("non_replicated_deduplication_window = 10000"));
 }
 
-/// The inventory, clustered: the same statements plus 18 `_dist` wrappers,
+/// The inventory, clustered: the same statements plus 21 `_dist` wrappers,
 /// `ON CLUSTER` on every one, and the macros intact.
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 74, "statement count");
+    assert_eq!(stmts.len(), 77, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        47,
-        "29 tables + 18 wrappers"
+        50,
+        "29 tables + 21 wrappers"
     );
     assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 26);
 
@@ -109,7 +109,7 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        74,
+        77,
         "every statement carries ON CLUSTER"
     );
 
@@ -281,6 +281,10 @@ fn the_file_holds_only_create_statements() {
 /// A family's routing wrappers all shard on one expression: a series'
 /// rollups must land on the shard its samples do.
 ///
+/// The three landing wrappers are a family of their own (issue #494 part 1):
+/// each routes on `cityHash64(received_ms)`, the one stamp every row of a
+/// push carries, so a push and every resend of it reach one shard.
+///
 /// `metric_labels` is in the metrics family (issue #623): one label row
 /// per series, keyed like the series, so its wrapper shards on the same
 /// `(metric_name, fingerprint)`. No write goes through it — the view fills
@@ -311,7 +315,13 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
             .strip_prefix("CREATE TABLE IF NOT EXISTS pulsus.")
             .expect("a wrapper names its database")
             .to_string();
-        let family = if name.starts_with("metric") {
+        let wrapper = name
+            .split_whitespace()
+            .next()
+            .expect("a wrapper has a name");
+        let family = if wrapper.ends_with("_landing_dist") {
+            "landing"
+        } else if name.starts_with("metric") {
             "metrics"
         } else if name.starts_with("log") {
             "logs"
@@ -320,7 +330,7 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         };
         by_family.entry(family).or_default().insert(expr);
     }
-    assert_eq!(by_family.len(), 3, "three families have wrappers");
+    assert_eq!(by_family.len(), 4, "four families have wrappers");
     for (family, exprs) in &by_family {
         assert_eq!(
             exprs.len(),
@@ -329,6 +339,12 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         );
     }
     assert!(text.contains("cityHash64(trace_id)"));
+    for table in ["log_landing", "metric_landing", "trace_landing"] {
+        assert!(
+            text.contains(&format!("'{table}', cityHash64(received_ms));")),
+            "{table} routes on the push's receive stamp, cityHash64(received_ms)"
+        );
+    }
     // F7 (issue #623): the metrics family shards by the series ID alone.
     for table in [
         "metric_samples",
@@ -823,8 +839,30 @@ fn tables() -> Vec<Table> {
     out
 }
 
-/// Every base table with no routing wrapper: the landing tables and the
-/// cluster-wide ones. These are the exceptions three documents name.
+/// The banner a design document carries when its passages on landing
+/// placement predate the routed landing insert (issue #494 part 1). Such a
+/// document may still name the landing tables among those without a wrapper
+/// and keep the counts it cited.
+const LANDING_BANNER: &str = "\
+> **Stale on landing placement.** Since the routed-landing change (insert batching, part 1), on a
+> cluster every landing insert goes through its table's wrapper, `<landing table><PULSUS_DIST_SUFFIX>`
+> (`log_landing_dist` at the default suffix), keyed on `cityHash64(received_ms)`, so a push and its resends reach one
+> shard; landing inserts pin `distributed_foreground_insert`, `insert_shard_id`,
+> `skip_unavailable_shards`, `prefer_localhost_replica` and `timeout_overflow_mode`. Passages
+> below that say the landing tables have no wrapper, or that a push is placed by the connection,
+> are out of date. Current behaviour: `schema/schema.sql`, `QuerySettings::landing_insert`
+> (`crates/pulsus-clickhouse/src/settings.rs`), and `docs/configuration.md`'s connection-spreading
+> section.
+";
+
+/// `true` when `docs/<name>` carries [`LANDING_BANNER`].
+fn carries_landing_banner(name: &str) -> bool {
+    doc(name).contains(LANDING_BANNER)
+}
+
+/// Every base table with no routing wrapper: the label values,
+/// `service_edges` and the cluster-wide ones. These are the exceptions three
+/// documents name.
 fn tables_without_a_wrapper() -> Vec<String> {
     let all = tables();
     let wrapped: Vec<&String> = all.iter().filter(|t| t.wrapper).map(|t| &t.name).collect();
@@ -880,9 +918,8 @@ fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
     let no_wrapper = tables_without_a_wrapper();
     assert_eq!(
         no_wrapper.len(),
-        11,
-        "three landing tables, the label values, `service_edges` and six \
-         cluster-wide ones: \
+        8,
+        "the label values, `service_edges` and six cluster-wide ones: \
          {no_wrapper:?}"
     );
     let all = tables();
@@ -892,6 +929,7 @@ fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
         ("schemas.md", "Enabled by `PULSUS_CLUSTER`."),
     ] {
         let line = doc_line(name, anchor);
+        let bannered = carries_landing_banner(name);
         for table in &no_wrapper {
             assert!(
                 line.contains(&format!("`{table}`")),
@@ -901,6 +939,9 @@ fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
         }
         for table in &wrapped {
             if table.contains("{{") {
+                continue;
+            }
+            if bannered && table.ends_with("_landing") {
                 continue;
             }
             assert!(
@@ -920,16 +961,26 @@ fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
 /// [`doc_line_before`] gives.
 #[test]
 fn the_trace_sharding_key_passage_names_every_routed_trace_table() {
-    let routed: Vec<String> = tables()
-        .into_iter()
-        .filter(|t| t.wrapper)
-        .map(|t| t.name)
-        .filter(|n| !n.starts_with("metric") && !n.starts_with("log") || n.starts_with("trace"))
+    // Chosen by the key, not by the name: `trace_landing_dist` routes on
+    // `cityHash64(received_ms)` and is not among the tables that key.
+    let mut routed: Vec<String> = rendered_statements(&clustered())
+        .iter()
+        .filter_map(|s| {
+            let at = s.find("ENGINE = Distributed(")?;
+            let engine = s[at..].lines().next()?;
+            let args = engine
+                .trim_end()
+                .trim_end_matches(';')
+                .strip_suffix(", cityHash64(trace_id))")?;
+            let table = args.rsplit_once(", ")?.1.trim_matches('\'');
+            Some(table.to_string())
+        })
         .collect();
+    routed.sort();
     assert_eq!(
-        routed.len(),
-        3,
-        "every trace base table but the landing one is routed: {routed:?}"
+        routed,
+        vec!["error_spans", "spans", "traces"],
+        "the tables routed on `cityHash64(trace_id)`"
     );
     for (name, anchor) in [
         (
@@ -953,8 +1004,9 @@ fn the_trace_sharding_key_passage_names_every_routed_trace_table() {
     }
 }
 
-/// **The three landing tables, `metric_label_values` and `service_edges`
-/// are the only per-shard tables with no routing wrapper.** The label
+/// **`metric_label_values` and `service_edges` are the only per-shard tables
+/// with no routing wrapper** (the landing tables have one since issue #494
+/// part 1). The label
 /// values are named locally inside every statement that reads them (issue
 /// #635); `service_edges` is read only per shard, through `cluster(…,
 /// view(…))`, by the one statement that also pairs that shard's spans
@@ -963,8 +1015,7 @@ fn the_trace_sharding_key_passage_names_every_routed_trace_table() {
 /// per-shard table added without a wrapper makes all four false at once,
 /// and reddens here rather than in a document nobody reads.
 #[test]
-fn only_the_landing_tables_the_label_values_and_the_service_edges_are_per_shard_without_a_wrapper()
-{
+fn only_the_label_values_and_the_service_edges_are_per_shard_without_a_wrapper() {
     let cluster_wide: Vec<String> = tables()
         .into_iter()
         .filter(|t| t.cluster_wide)
@@ -977,42 +1028,44 @@ fn only_the_landing_tables_the_label_values_and_the_service_edges_are_per_shard_
     without.sort();
     assert_eq!(
         without,
-        vec![
-            "log_landing",
-            "metric_label_values",
-            "metric_landing",
-            "service_edges",
-            "trace_landing"
-        ],
-        "a per-shard table with no routing wrapper that is not a landing \
-         table, the label values or `service_edges` (read only per shard, issue #599 part A \
+        vec!["metric_label_values", "service_edges"],
+        "a per-shard table with no routing wrapper that is not the label \
+         values or `service_edges` (read only per shard, issue #599 part A \
          D9) falsifies the clustering claim in docs/architecture.md §7, \
          docs/schemas.md §7, docs/schemas.md's conventions preamble and \
          docs/features.md's clustering row"
     );
 }
 
-/// **Every passage saying which tables are written under their bare name
-/// names all three landing tables.**
+/// **Every passage on how the landing tables are written names all three**
+/// (issue #494 part 1): `docs/features.md`'s clustering row names them and
+/// the receive stamp they are routed on, and the two design documents whose
+/// passages predate the change carry the banner that names the wrappers.
 #[test]
-fn the_bare_name_passages_name_all_three_landing_tables() {
-    let landing: Vec<String> = tables_without_a_wrapper()
+fn the_landing_routing_passages_name_all_three_landing_tables() {
+    let landing: Vec<String> = tables()
         .into_iter()
-        .filter(|n| n.ends_with("_landing"))
+        .filter(|t| !t.wrapper && t.name.ends_with("_landing"))
+        .map(|t| t.name)
         .collect();
     assert_eq!(landing.len(), 3, "three landing tables: {landing:?}");
-    for (name, anchor) in [
-        ("architecture.md", "The landing tables have no wrapper"),
-        ("schemas.md", "Conventions used below:"),
-        ("features.md", "| Clustered ClickHouse |"),
-    ] {
-        let line = doc_line(name, anchor);
-        for table in &landing {
-            assert!(
-                line.contains(&format!("`{table}`")),
-                "docs/{name}'s bare-name passage must name `{table}`: {line}"
-            );
-        }
+    let row = doc_line("features.md", "| Clustered ClickHouse |");
+    for table in &landing {
+        assert!(
+            row.contains(&format!("`{table}`")),
+            "docs/features.md's clustering row must name `{table}`: {row}"
+        );
+    }
+    assert!(
+        row.contains("receive stamp"),
+        "docs/features.md's clustering row must say what the landing tables \
+         are routed on: {row}"
+    );
+    for name in ["architecture.md", "schemas.md"] {
+        assert!(
+            carries_landing_banner(name),
+            "docs/{name} must carry the landing-placement banner"
+        );
     }
 }
 
@@ -1026,7 +1079,9 @@ fn the_bare_name_passages_name_all_three_landing_tables() {
 fn the_citing_clustering_passages_name_the_section_holding_the_list() {
     // The documents spell the number out, so the count is spelled too —
     // otherwise the citation could be corrected to a digit and still pass
-    // while the number itself went stale.
+    // while the number itself went stale. A passage in a document carrying
+    // the landing-placement banner may keep the count it cited before the
+    // landing tables gained their wrappers; it must still cite the section.
     let count = match tables_without_a_wrapper().len() {
         7 => "seven",
         8 => "eight",
@@ -1036,21 +1091,28 @@ fn the_citing_clustering_passages_name_the_section_holding_the_list() {
         12 => "twelve",
         n => panic!("spell {n} out here before the count can be cited"),
     };
+    let cites = |name: &str, line: &str, before: &str, after: &str| {
+        if carries_landing_banner(name) {
+            line.contains(before) && line.contains(after)
+        } else {
+            line.contains(&format!("{before}{count}{after}"))
+        }
+    };
     assert!(
         doc("schemas.md").contains("\n## 7. Distributed layout"),
         "docs/schemas.md must still hold the section the other two cite"
     );
     let preamble = doc_line("schemas.md", "Conventions used below:");
     assert!(
-        preamble.contains(&format!("§7 lists all {count}")),
+        cites("schemas.md", &preamble, "§7 lists all ", ""),
         "docs/schemas.md's conventions preamble must cite its own §7 for the \
          {count}: {preamble}"
     );
     let row = doc_line("features.md", "| Clustered ClickHouse |");
     assert!(
-        row.contains(&format!("[schemas.md §7](schemas.md) lists all {count}")),
-        "docs/features.md's clustering row must cite schemas.md §7 for the \
-         {count}: {row}"
+        !row.contains("lists all"),
+        "docs/features.md's clustering row names its exceptions and cites no \
+         count: {row}"
     );
     // The two wrapper passages that state the rule without the list.
     let schema_dir = doc_line(
@@ -1058,15 +1120,23 @@ fn the_citing_clustering_passages_name_the_section_holding_the_list() {
         "When `PULSUS_CLUSTER` is set, `MergeTree` families",
     );
     assert!(
-        schema_dir.contains(&format!("for every table but the {count} §7 lists")),
+        cites(
+            "architecture.md",
+            &schema_dir,
+            "for every table but the ",
+            " §7 lists"
+        ),
         "docs/architecture.md's schema paragraph must cite §7 for the {count} \
          tables with no wrapper: {schema_dir}"
     );
     let shape = doc_line("schemas.md", "gets a Distributed wrapper of this shape");
     assert!(
-        shape.contains(&format!(
-            "Every table but the {count} listed at the start of this section gets"
-        )),
+        cites(
+            "schemas.md",
+            &shape,
+            "Every table but the ",
+            " listed at the start of this section gets"
+        ),
         "docs/schemas.md's wrapper-shape sentence must cite the {count} tables \
          with no wrapper: {shape}"
     );
@@ -3152,14 +3222,14 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             vec![],
             vec!["--mode", "single"],
             single(),
-            "bad81642c73b58d76af9f20eab09bbec68fd76969d366af8b48ca04cd6a3c21e",
+            "4ddf6319dc38d3b39fe7a111e08f913da48b048bf564dc1901574bad4ba723e9",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "fd232a7a626e5ab48aa3ea4540e3b9f50ff2611b45edadd0f7d571d07033a052",
+            "1085f3a227c6cfe92a76933af3857805ef4df0f95a2b45c9fd24aa84806da853",
         ),
         (
             "clustered with a storage policy",
@@ -3169,7 +3239,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "24f6f6e319db0c6215e0e3843dedea2d07340d852a751b29264162d75de2d947",
+            "c792028c58d9f7381af8be68c197d51ae9dfe59546e1133994dc138bb4182fb3",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {

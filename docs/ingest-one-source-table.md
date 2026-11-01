@@ -1,5 +1,15 @@
 # One push, one insert into one table
 
+> **Stale on landing placement.** Since the routed-landing change (insert batching, part 1), on a
+> cluster every landing insert goes through its table's wrapper, `<landing table><PULSUS_DIST_SUFFIX>`
+> (`log_landing_dist` at the default suffix), keyed on `cityHash64(received_ms)`, so a push and its resends reach one
+> shard; landing inserts pin `distributed_foreground_insert`, `insert_shard_id`,
+> `skip_unavailable_shards`, `prefer_localhost_replica` and `timeout_overflow_mode`. Passages
+> below that say the landing tables have no wrapper, or that a push is placed by the connection,
+> are out of date. Current behaviour: `schema/schema.sql`, `QuerySettings::landing_insert`
+> (`crates/pulsus-clickhouse/src/settings.rs`), and `docs/configuration.md`'s connection-spreading
+> section.
+
 **Parts of this document describe the schema controller, the migration catalogue and the TTL rotation, which no longer exist. The schema is now `schema/schema.sql`, built by `schema/schema.sh`; the binary creates no schema, and retention is the TTL each table is created with.** **What this is.** The implementation design of the metrics ingest write path as it stands
 on `main` after issue #603: one landing table, one insert per push, and one materialized
 view per target table. It states the decisions, the guarantees, and for each guarantee

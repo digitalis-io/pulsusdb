@@ -98,9 +98,11 @@ const VALUE_TYPE_HISTOGRAM: u8 = 1;
 
 /// The table name a [`MetricWriter`] inserts into. One name: the four target
 /// tables are maintained by materialized view and the writer never names
-/// them (issue #603). The landing table has no `Distributed` wrapper, so
-/// this is the base name in every mode — `Arc<str>` because the server
-/// resolves it once at startup from `Config` rather than at compile time.
+/// them (issue #603). On a cluster it is the landing table's `Distributed`
+/// wrapper, keyed on `cityHash64(received_ms)`, so a push and every resend of
+/// it reach one shard; single-node it is the bare table (issue #494 part 1,
+/// [`Self::landing_for`]). `Arc<str>` because the server resolves it once at
+/// startup from `Config` rather than at compile time.
 #[derive(Debug, Clone)]
 pub struct MetricWriterTables {
     pub landing: Arc<str>,
@@ -111,6 +113,14 @@ impl MetricWriterTables {
     pub fn metrics_default() -> Self {
         MetricWriterTables {
             landing: Arc::from(LANDING_TABLE),
+        }
+    }
+
+    /// The landing table for a deployment: the bare name for `None`, and
+    /// `metric_landing<suffix>` for `Some(suffix)`.
+    pub fn landing_for(dist_suffix: Option<&str>) -> Self {
+        MetricWriterTables {
+            landing: Arc::from(format!("{LANDING_TABLE}{}", dist_suffix.unwrap_or(""))),
         }
     }
 }
@@ -981,6 +991,20 @@ fn now_unix_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// **1-U6 (issue #494 part 1).** The bare name without a suffix, the
+    /// suffixed wrapper with one.
+    #[test]
+    fn landing_for_names_the_wrapper_only_when_given_a_suffix() {
+        assert_eq!(
+            &*super::MetricWriterTables::landing_for(None).landing,
+            "metric_landing"
+        );
+        assert_eq!(
+            &*super::MetricWriterTables::landing_for(Some("_d")).landing,
+            "metric_landing_d"
+        );
+    }
+
     use pulsus_model::LabelSet;
 
     use pulsus_clickhouse::ChError;

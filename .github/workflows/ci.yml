@@ -2661,8 +2661,8 @@ jobs:
           catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 73 ]; then
-            echo "::error::expected 73 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 76 ]; then
+            echo "::error::expected 76 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -2706,6 +2706,14 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-schema --test live_cluster
+
+      # Issue #494 part 1: a landing insert goes through its table's routing
+      # wrapper, keyed on the push's receive stamp, so a push and every
+      # resend of it reach one shard whichever server receives them.
+      - name: Live routed landing insert (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-write --test live_cluster_landing
 
       # Issue #18 part B: a rollup level's run row is read with its data
       # from one replica's answer, so a replica that lacks a new part
@@ -2877,8 +2885,8 @@ jobs:
           catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 73 ]; then
-            echo "::error::expected 73 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 76 ]; then
+            echo "::error::expected 76 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi

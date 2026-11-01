@@ -38,7 +38,7 @@ The user's account is `docs/api.md` §3.6 and the setting's is `docs/configurati
 | D16 | A level carries the projection its next level's run reads only when that next level is shorter than a day | — | `building.md` §2.2 |
 | D17 | The query ranges at which the resolution switches to each level, and the counter bucket count, are set when the schema is built and stored in each level table's comment, where the server reads them | owner (2026-10-26) | `building.md` §1, `reading.md` §2 |
 
-**How the engine is meant to be used, and what differs.** The engine's ordinary rollup is an insert-time materialized view into an aggregating table, as `log_metrics_<res>` is built (`schema/schema.sql:573`, `log_metrics_{{log_rollup_suffix}}_mv`). The levels use refreshable views on timers instead, as `service_edges_mv` is built (`schema/schema.sql:818`). That follows the owner's decision on timers. What it costs, and how the cost is kept down, is `building.md` §3.4 and §5.
+**How the engine is meant to be used, and what differs.** The engine's ordinary rollup is an insert-time materialized view into an aggregating table, as `log_metrics_<res>` is built (`schema/schema.sql:582`, `log_metrics_{{log_rollup_suffix}}_mv`). The levels use refreshable views on timers instead, as `service_edges_mv` is built (`schema/schema.sql:827`). That follows the owner's decision on timers. What it costs, and how the cost is kept down, is `building.md` §3.4 and §5.
 
 ## 2. Parts
 
