@@ -25,6 +25,9 @@
 //! docker compose -f ci/clickhouse-cluster/compose.yaml down -v
 //! ```
 
+#[path = "query_log_wait/mod.rs"]
+mod query_log_wait;
+
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -34,6 +37,7 @@ use pulsus_read::logql::{Direction, QueryParams, QuerySpec, TimeBounds};
 use pulsus_read::{EngineConfig, LogQlEngine, QueryResult};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
+use query_log_wait::settle_query_log;
 
 const CLUSTER_NAME: &str = "pulsus_test_cluster";
 
@@ -413,8 +417,12 @@ async fn the_production_discovery_read_answers_completely_over_split_placement()
     );
 
     // -- 3. the marks, recorded and bounded — not asserted equal.
-    exec_on(&shard1, "SYSTEM FLUSH LOGS").await;
-    exec_on(&shard2, "SYSTEM FLUSH LOGS").await;
+    settle_query_log(
+        &[&shard1, &shard2],
+        &format!("query_id = '{control_id}' OR initial_query_id = '{control_id}'"),
+        1,
+    )
+    .await;
     let control_marks = selected_marks(&shard1, &shard2, &control_id).await;
     eprintln!(
         "T39 marks: nested-subquery-under-local = {control_marks} (per-shard sum). \

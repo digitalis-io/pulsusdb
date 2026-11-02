@@ -17,6 +17,10 @@
 //! docker compose -f ci/clickhouse-cluster/compose.yaml down -v
 //! ```
 
+#[path = "query_log_wait/mod.rs"]
+mod query_log_wait;
+use query_log_wait::settle_query_log;
+
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -853,7 +857,12 @@ async fn a_stopped_tag_read_is_the_newest_on_every_shard() {
         ["op.new-a", "op.new-b"]
     );
     // Shard1's read is proven by the answer: `/new-a` and `op.new-a` are stored only there.
-    exec(&shard2, "SYSTEM FLUSH LOGS").await;
+    settle_query_log(
+        &[&shard2],
+        &format!("is_initial_query = 0 AND startsWith(initial_query_id, '{prefix}-')"),
+        1,
+    )
+    .await;
     let remote = count(
         &shard2,
         &format!(
@@ -1382,7 +1391,12 @@ async fn the_service_graph_answers_over_two_shards() {
         .with_statement_prefix(&prefix);
         let graph = reader.service_graph(window).await.expect("C3 answers");
         assert_eq!(calls_of(&graph), c1_edges(), "C3 request {n}");
-        exec(&shard1, "SYSTEM FLUSH LOGS").await;
+        settle_query_log(
+            &[&shard1],
+            &format!("is_initial_query AND startsWith(query_id, '{prefix}-')"),
+            1,
+        )
+        .await;
         lookups.push(
             count(
                 &shard1,
@@ -1409,7 +1423,12 @@ async fn the_service_graph_answers_over_two_shards() {
         .await
         .expect("C1 from totals");
     assert_eq!(calls_of(&graph), c1_edges(), "C1 from totals");
-    exec(&shard2, "SYSTEM FLUSH LOGS").await;
+    settle_query_log(
+        &[&shard2],
+        &format!("is_initial_query = 0 AND startsWith(initial_query_id, '{prefix}-')"),
+        1,
+    )
+    .await;
     let remote = count(
         &shard2,
         &format!(
@@ -1469,8 +1488,14 @@ async fn the_service_graph_answers_over_two_shards() {
         .expect("C4");
     assert_eq!(calls_of(&graph), c1_edges(), "C4");
     let mut read = 0;
+    // A statement on each node: the wait counts both.
+    settle_query_log(
+        &[&shard1, &shard2],
+        &format!("startsWith(initial_query_id, '{prefix}-')"),
+        2,
+    )
+    .await;
     for c in [&shard1, &shard2] {
-        exec(c, "SYSTEM FLUSH LOGS").await;
         read += count(
             c,
             &format!(
@@ -2347,8 +2372,13 @@ async fn two_replicas_share_one_edge_table() {
             "K10 request {n}: the route's statement ran with load_balancing = 'in_order'"
         );
         let mut hosts = Vec::new();
+        settle_query_log(
+            &[&r.s1, &r.s1b],
+            &format!("startsWith(initial_query_id, '{prefix}-')"),
+            1,
+        )
+        .await;
         for (c, node) in [(&r.s1, "ch-shard1"), (&r.s1b, "ch-shard1b")] {
-            exec(c, "SYSTEM FLUSH LOGS").await;
             let rows = count(
                 c,
                 &format!(
@@ -2621,8 +2651,13 @@ async fn a_rebuilt_replica_waits_for_the_shard() {
         }
     }
     assert_g1(&edges, "K5: read on the rebuilt replica");
+    settle_query_log(
+        &[&r.s1b, &r.s1],
+        &format!("is_initial_query = 0 AND log_comment = '{tag}'"),
+        1,
+    )
+    .await;
     for (c, node, want) in [(&r.s1b, "ch-shard1b", true), (&r.s1, "ch-shard1", false)] {
-        exec(c, "SYSTEM FLUSH LOGS").await;
         let remote = count(
             c,
             &format!(

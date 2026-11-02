@@ -34,6 +34,10 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+#[path = "query_log_wait/mod.rs"]
+mod query_log_wait;
+use query_log_wait::settle_query_log;
+
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -308,14 +312,7 @@ async fn run_and_capture<R: pulsus_clickhouse::ChRow>(
     }
     drop(stream);
 
-    admin
-        .execute(
-            "SYSTEM FLUSH LOGS",
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("flush logs");
+    settle_query_log(&[admin], &format!("query_id = '{query_id}'"), 1).await;
 
     let log_sql = format!(
         "SELECT read_rows, read_bytes, ProfileEvents['SelectedMarks'] AS selected_marks, \
@@ -755,14 +752,13 @@ struct KeysetPageRow {
 /// by its `max_bytes_to_read` cap. The row count doubles as the page
 /// count (the zero-budget guard test asserts it is 0).
 async fn keyset_page_rows(admin: &ChClient, db: &str) -> Vec<KeysetPageRow> {
-    admin
-        .execute(
-            "SYSTEM FLUSH LOGS",
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("flush logs");
+    // At least none: the zero-budget guard expects no page at all.
+    settle_query_log(
+        &[admin],
+        &format!("current_database = '{db}' AND query LIKE '%AS body_hash%'"),
+        0,
+    )
+    .await;
     let sql = format!(
         "SELECT toUInt64OrZero(Settings['max_bytes_to_read']) AS cap, \
          read_bytes AS read, \
@@ -1468,14 +1464,7 @@ async fn run_detected_labels(client: &ChClient, sql: &str, query_id: &str) -> (u
         }
     }
 
-    client
-        .execute(
-            "SYSTEM FLUSH LOGS",
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("flush logs");
+    settle_query_log(&[client], &format!("query_id = '{query_id}'"), 1).await;
     let log_sql = format!(
         "SELECT result_rows, read_rows FROM system.query_log \
          WHERE query_id = '{query_id}' AND type = 'QueryFinish' \
@@ -1559,14 +1548,15 @@ async fn query_log_marker(admin: &ChClient) -> String {
 /// `type != 'QueryStart'` keeps one row per query INCLUDING the terminal
 /// `ExceptionWhileProcessing` row of a query aborted by its own budget.
 async fn mem_ceiling_rows(admin: &ChClient, db: &str, marker: &str) -> Vec<MemCeilingRow> {
-    admin
-        .execute(
-            "SYSTEM FLUSH LOGS",
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("flush logs");
+    settle_query_log(
+        &[admin],
+        &format!(
+            "current_database = '{db}' AND query_kind = 'Select' \
+             AND query_start_time_microseconds >= toDateTime64('{marker}', 6)"
+        ),
+        0,
+    )
+    .await;
     let sql = format!(
         "SELECT toUInt8(mapContains(Settings, 'max_memory_usage')) AS has_ceiling, \
          toUInt64OrZero(Settings['max_memory_usage']) AS ceiling, \
@@ -2165,14 +2155,7 @@ async fn run_name_projection<R: pulsus_clickhouse::ChRow>(
             row.expect("decode row");
         }
     }
-    client
-        .execute(
-            "SYSTEM FLUSH LOGS",
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("flush logs");
+    settle_query_log(&[client], &format!("query_id = '{query_id}'"), 1).await;
     let log_sql = format!(
         "SELECT read_rows, read_bytes, result_rows, result_bytes, \
          Settings['use_query_condition_cache'] AS condition_cache \

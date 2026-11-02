@@ -20,6 +20,10 @@
 //!   cargo test -p pulsus-read --test traces_tenant_rows
 //! ```
 
+#[path = "query_log_wait/mod.rs"]
+mod query_log_wait;
+use query_log_wait::settle_query_log;
+
 use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
@@ -340,7 +344,12 @@ async fn search_and_fetch_read_the_rows_main_reads() {
             assert!(!out.traces.is_empty(), "{tag}: {q} finds traces");
         }
 
-        exec(&client, "SYSTEM FLUSH LOGS").await;
+        settle_query_log(
+            &[&client],
+            &format!("is_initial_query AND log_comment = '{prefix}'"),
+            5,
+        )
+        .await;
         let sent = strings(
             &client,
             &format!(

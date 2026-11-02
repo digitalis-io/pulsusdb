@@ -19,6 +19,9 @@
 //! docker compose -f ci/clickhouse-cluster/compose.yaml down -v
 //! ```
 
+#[path = "query_log_wait/mod.rs"]
+mod query_log_wait;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +35,7 @@ use pulsus_read::{
 };
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
+use query_log_wait::settle_query_log;
 
 const CLUSTER_NAME: &str = "pulsus_test_cluster";
 const MIN: i64 = 60_000;
@@ -640,7 +644,12 @@ async fn statements(node: &ChClient, comment: &str) -> Vec<String> {
     struct Logged {
         query: String,
     }
-    exec(node, "SYSTEM FLUSH LOGS").await;
+    settle_query_log(
+        &[node],
+        &format!("is_initial_query AND log_comment = '{comment}'"),
+        1,
+    )
+    .await;
     let mut stream = node
         .query_stream::<Logged>(
             &format!(

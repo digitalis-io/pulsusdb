@@ -26,6 +26,10 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+#[path = "query_log_wait/mod.rs"]
+mod query_log_wait;
+use query_log_wait::settle_query_log;
+
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -751,6 +755,21 @@ struct CountRow {
     n: u64,
 }
 
+/// Waits until every `SELECT` started at or after `since_us` has finished
+/// in the query log ([`settle_query_log`]). At least none: some reads here
+/// expect no matching statement at all.
+async fn settle_selects_since(admin: &ChClient, since_us: i64) {
+    settle_query_log(
+        &[admin],
+        &format!(
+            "query_kind = 'Select' \
+             AND toInt64(toUnixTimestamp64Micro(query_start_time_microseconds)) >= {since_us}"
+        ),
+        0,
+    )
+    .await;
+}
+
 async fn flush_logs(admin: &ChClient) {
     admin
         .execute(
@@ -979,9 +998,7 @@ async fn the_four_refused_filters_answer_unchanged_on_the_page_loop() {
     let since = now_micros(&admin).await;
     let paged = r#"{service_name="checkout"} | pod=~"checkout-7d9f6c5b4-.*""#;
     assert_eq!(entries(&engine, paged, &params).await, 3);
-    flush_logs(&admin).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    flush_logs(&admin).await;
+    settle_selects_since(&admin, since).await;
     let sample_statements_since = |text: &'static str| {
         let sql = format!(
             "SELECT count() AS n FROM system.query_log \
@@ -1152,9 +1169,7 @@ async fn a_metric_query_over_a_metadata_filter_answers_the_same_from_one_stateme
     );
 
     // …and the fragment really is in the statement the database ran.
-    flush_logs(&admin).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    flush_logs(&admin).await;
+    settle_selects_since(&admin, since).await;
     let sql = format!(
         "SELECT count() AS n FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
@@ -1225,9 +1240,7 @@ async fn every_metric_route_carries_the_fragment_in_its_statement() {
         "every point counts the one matching row: {got:?}"
     );
 
-    flush_logs(&admin).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    flush_logs(&admin).await;
+    settle_selects_since(&admin, since).await;
     let sql = format!(
         "SELECT count() AS n FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
@@ -1362,9 +1375,7 @@ async fn an_oversized_fragment_falls_back_on_every_route_that_can_meet_it() {
             "{query}: the budget fallback must answer exactly what the lowered route answers"
         );
     }
-    flush_logs(&admin).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    flush_logs(&admin).await;
+    settle_selects_since(&admin, since).await;
     let with_fragment = format!(
         "SELECT count() AS n FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
@@ -1391,9 +1402,7 @@ async fn an_oversized_fragment_falls_back_on_every_route_that_can_meet_it() {
     // budget puts the fragment in a statement.
     let since_full = now_micros(&admin).await;
     let _ = entries(&full_engine(&db).await, LOWERED[0].0, &window(ts)).await;
-    flush_logs(&admin).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    flush_logs(&admin).await;
+    settle_selects_since(&admin, since_full).await;
     let control_sql = with_fragment.replace(&since.to_string(), &since_full.to_string());
     let mut stream = admin
         .query_stream::<CountRow>(&control_sql, &QuerySettings::new())

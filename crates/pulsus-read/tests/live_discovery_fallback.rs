@@ -28,6 +28,10 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+#[path = "query_log_wait/mod.rs"]
+mod query_log_wait;
+use query_log_wait::settle_query_log;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -345,14 +349,7 @@ async fn degraded_regex_name_discovery_matches_the_warm_path_byte_for_byte() {
         drop(r.expect("decode probe row"));
     }
     drop(stream);
-    client
-        .execute(
-            "SYSTEM FLUSH LOGS",
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("flush logs");
+    settle_query_log(&[&client], &format!("query_id = '{query_id}'"), 1).await;
     let log_sql = format!(
         "SELECT read_rows FROM system.query_log \
          WHERE query_id = '{query_id}' AND type = 'QueryFinish' \
