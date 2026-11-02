@@ -28,6 +28,10 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+#[path = "query_log_wait/mod.rs"]
+mod query_log_wait;
+use query_log_wait::settle_query_log;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -335,7 +339,11 @@ async fn degraded_regex_name_discovery_matches_the_warm_path_byte_for_byte() {
         1_000,
     )
     .replace('?', "??");
-    let query_id = &pulsus_testkit::test_ident("pulsus_read_it_discovery_fallback_probe");
+    // Unique to this run: the log keeps earlier runs' rows.
+    let query_id = &pulsus_testkit::test_ident(&format!(
+        "pulsus_read_it_discovery_fallback_probe_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     let mut stream = client
         .query_stream::<ProbeNameRow>(&probe_sql, &QuerySettings::new().set("query_id", query_id))
         .await
@@ -345,14 +353,7 @@ async fn degraded_regex_name_discovery_matches_the_warm_path_byte_for_byte() {
         drop(r.expect("decode probe row"));
     }
     drop(stream);
-    client
-        .execute(
-            "SYSTEM FLUSH LOGS",
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("flush logs");
+    settle_query_log(&[&client], &format!("query_id = '{query_id}'"), 1).await;
     let log_sql = format!(
         "SELECT read_rows FROM system.query_log \
          WHERE query_id = '{query_id}' AND type = 'QueryFinish' \

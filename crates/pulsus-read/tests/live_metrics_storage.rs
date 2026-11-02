@@ -11,6 +11,10 @@
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test live_metrics_storage
 //! ```
 
+#[path = "query_log_wait/mod.rs"]
+mod query_log_wait;
+use query_log_wait::settle_query_log;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1614,14 +1618,15 @@ async fn a_failed_label_view_fails_the_push() {
             "{case}: the resend writes one lookup row"
         );
 
-        bootstrap
-            .execute(
-                "SYSTEM FLUSH LOGS",
-                &QuerySettings::new(),
-                Idempotency::Idempotent,
-            )
-            .await
-            .expect("flush logs");
+        settle_query_log(
+            &[&bootstrap],
+            &format!(
+                "query_kind = 'Insert' AND has(databases, '{db}') \
+                 AND Settings['insert_deduplication_token'] = '{token}'"
+            ),
+            2,
+        )
+        .await;
         let log_sql = format!(
             "SELECT toString(type) AS kind, \
              Settings['insert_deduplication_token'] AS token \

@@ -18,6 +18,8 @@
 
 #[path = "pushed_rate_corpus/mod.rs"]
 mod pushed_rate_corpus;
+#[path = "query_log_wait/mod.rs"]
+mod query_log_wait;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,6 +36,7 @@ use pulsus_schema_testkit::run_init;
 use pushed_rate_corpus::{
     cache_config, canonical, drop_database, engine_config, now_ms, test_config,
 };
+use query_log_wait::settle_query_log;
 
 const MIN: i64 = 60_000;
 const HOUR: i64 = 3_600_000;
@@ -674,9 +677,10 @@ struct ReadRowsRow {
     rows: u64,
 }
 
-/// `read_rows` per `log_comment`, for the comments `prefix` starts.
+/// `read_rows` per `log_comment`, for the comments `prefix` starts, once
+/// every statement under them has finished in the log.
 async fn read_rows(admin: &ChClient, prefix: &str) -> BTreeMap<String, u64> {
-    exec(admin, "SYSTEM FLUSH LOGS").await;
+    settle_query_log(&[admin], &format!("startsWith(log_comment, '{prefix}')"), 1).await;
     let mut stream = admin
         .query_stream::<ReadRowsRow>(
             &format!(
@@ -2448,9 +2452,10 @@ struct StatementRow {
     rows: u64,
 }
 
-/// Every finished statement sent under `comment`, with its `result_rows`.
+/// Every finished statement sent under `comment`, with its `result_rows`,
+/// once each has finished in the log ([`settle_query_log`]).
 async fn statements(admin: &ChClient, comment: &str) -> Vec<(String, u64)> {
-    exec(admin, "SYSTEM FLUSH LOGS").await;
+    settle_query_log(&[admin], &format!("log_comment = '{comment}'"), 1).await;
     let mut stream = admin
         .query_stream::<StatementRow>(
             &format!(
