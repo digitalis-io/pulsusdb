@@ -1,19 +1,22 @@
-//! **1-U3 (issue #494 part 1): on a cluster the log and trace landing tables
-//! each have one routing wrapper, keyed on the push's receive stamp, and
-//! `metric_landing` has none.**
-//!
-//! Every row of a push carries the one `received_ms` the writer took for it,
-//! so `cityHash64(received_ms)` sends the whole block, and every resend the
-//! writer makes of it, to one shard. The metrics writer inserts into the bare
-//! `metric_landing`. Single-node renders no wrapper. Read from what
-//! `schema/schema.sh --print` writes, which is what a deployment applies.
+//! **2-U3 (issue #494 part 1b): on a cluster each landing table has one
+//! routing wrapper.** `log_landing` and `trace_landing` are keyed on the
+//! push's receive stamp, so `cityHash64(received_ms)` sends a whole log or
+//! trace block, and every resend the writer makes of it, to one shard.
+//! `metric_landing` is keyed on `cityHash64(fingerprint)`, the key of every
+//! metrics table's wrapper, so all of a series' rows sit on one shard.
+//! Single-node renders no wrapper. Read from what `schema/schema.sh --print`
+//! writes, which is what a deployment applies.
 
 use std::process::Command;
 
 const LANDING: [&str; 3] = ["log_landing", "metric_landing", "trace_landing"];
 
-/// The landing tables written through a wrapper on a cluster.
-const ROUTED: [&str; 2] = ["log_landing", "trace_landing"];
+/// Each landing table and the expression its wrapper is keyed on.
+const KEYED: [(&str, &str); 3] = [
+    ("log_landing", "cityHash64(received_ms)"),
+    ("metric_landing", "cityHash64(fingerprint)"),
+    ("trace_landing", "cityHash64(received_ms)"),
+];
 
 /// `schema.sh --print` with an empty environment but for `PATH` and `vars`:
 /// the exit status and the statements it printed.
@@ -50,20 +53,11 @@ fn wrapper_heads<'a>(text: &'a str, table: &str) -> Vec<(&'a str, &'a str)> {
 }
 
 #[test]
-fn the_log_and_trace_landing_tables_have_one_wrapper_on_the_receive_stamp_on_a_cluster() {
+fn each_landing_table_has_one_wrapper_on_its_key_on_a_cluster() {
     let (code, text, err) =
         print_schema(&[("PULSUS_RETENTION_DAYS", "7"), ("PULSUS_CLUSTER", "c")]);
     assert_eq!(code, Some(0), "the script refused: {err}");
-    let metric_heads = wrapper_heads(&text, "metric_landing");
-    assert!(
-        metric_heads.is_empty(),
-        "metric_landing has no wrapper: {metric_heads:?}"
-    );
-    assert!(
-        !text.contains("metric_landing_dist"),
-        "nothing names a metric_landing wrapper"
-    );
-    for table in ROUTED {
+    for (table, key) in KEYED {
         let heads = wrapper_heads(&text, table);
         assert_eq!(
             heads.len(),
@@ -77,8 +71,8 @@ fn the_log_and_trace_landing_tables_have_one_wrapper_on_the_receive_stamp_on_a_c
         );
         assert!(
             engine.starts_with("ENGINE = Distributed('c', ")
-                && engine.ends_with(&format!("'{table}', cityHash64(received_ms));")),
-            "{table}_dist routes {table} on the receive stamp: {engine}"
+                && engine.ends_with(&format!("'{table}', {key});")),
+            "{table}_dist routes {table} on {key}: {engine}"
         );
     }
 }

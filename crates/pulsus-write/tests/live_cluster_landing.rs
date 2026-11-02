@@ -39,12 +39,16 @@ use pulsus_clickhouse::{
     ChClient, ChConnConfig, ChEndpoint, ChError, ChProto, ChRow, Idempotency, QuerySettings, Row,
 };
 use pulsus_config::WriterConfig;
-use pulsus_model::{Date, Fingerprint, LabelSet, UnixNano};
+use pulsus_model::{ACTIVITY_BUCKET_MS, Date, Fingerprint, LabelSet, UnixNano};
 use pulsus_write::writer::{
-    BlockInserter, ChBlockInserter, LogLandingRow, LogPatternRow, LogWriter, TraceLandingRow,
-    TraceWriter, TraceWriterTables, WriterRuntime, WriterTables,
+    BlockInserter, ChBlockInserter, LogLandingRow, LogPatternRow, LogWriter, MetricLandingRow,
+    MetricWriter, MetricWriterTables, TraceLandingRow, TraceWriter, TraceWriterTables,
+    WriterRuntime, WriterTables,
 };
-use pulsus_write::{LogRow, LogSink, ParsedLogs, PushHeaders, StreamRow, TraceSink};
+use pulsus_write::{
+    ExemplarPoint, HistogramPoint, LogRow, LogSink, MetricPoint, MetricSink, ParsedLogs,
+    ParsedMetrics, PushHeaders, SeriesRef, StreamRow, TraceSink,
+};
 
 const CLUSTER: &str = "pulsus_test_cluster";
 const SUFFIX: &str = "_dist";
@@ -59,6 +63,16 @@ static DB_POISON_LOGS: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_write_it_routed_poison_logs");
 static DB_POISON_TRACES: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_write_it_routed_poison_traces");
+static DB_POISON_METRICS: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_write_it_routed_poison_metrics");
+static DB_SPLIT_RESEND: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_write_it_routed_split_resend");
+static DB_SPLIT_OTHER_WRITER: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_write_it_routed_split_other_writer");
+static DB_CROSS_HOUR: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_write_it_routed_cross_hour");
+static DB_CROSS_HOUR_CONTROL: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_write_it_routed_cross_hour_control");
 static DB_REPLICA_FAILOVER: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_write_it_routed_replica_failover");
 static DB_SHARD_MISSING: pulsus_testkit::TestDb =
@@ -198,7 +212,11 @@ impl Nodes {
 /// 1's first replica, as `crates/pulsus-schema/tests/live_cluster.rs` does.
 /// The script drops the database before it builds it.
 fn build_schema(db: &str) {
-    let at = shard1();
+    build_schema_at(db, &shard1(), true);
+}
+
+/// [`build_schema`] at `at`, clustered or single-node.
+fn build_schema_at(db: &str, at: &Server, clustered: bool) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut cmd = std::process::Command::new("sh");
     cmd.arg(root.join("schema/schema.sh")).current_dir(&root);
@@ -210,9 +228,11 @@ fn build_schema(db: &str) {
     cmd.env("CLICKHOUSE_SERVER", &at.host)
         .env("CLICKHOUSE_HTTP_PORT", at.port.to_string())
         .env("PULSUS_SCHEMA_WAIT_SECONDS", "30")
-        .env("PULSUS_CLUSTER", CLUSTER)
         .env("CLICKHOUSE_DB", db)
         .env("PULSUS_RETENTION_DAYS", "7");
+    if clustered {
+        cmd.env("PULSUS_CLUSTER", CLUSTER);
+    }
     let out = cmd.output().expect("run schema.sh");
     assert_eq!(
         out.status.code(),
@@ -293,6 +313,90 @@ async fn require_two_shards(nodes: &Nodes) {
     assert_ne!(hosts[0], hosts[1], "one server answered for both shards");
 }
 
+/// Asserts that `fingerprint` selects the shard at `index` (0 is shard 1, 1
+/// is shard 2): the key of `metric_landing`'s wrapper.
+async fn assert_fingerprint_selects(client: &ChClient, fingerprint: u128, index: u64) {
+    let got = num(
+        client,
+        &format!("SELECT toUInt64(cityHash64(toUInt128({fingerprint})) % 2) AS n"),
+    )
+    .await;
+    assert_eq!(got, index, "cityHash64(toUInt128({fingerprint})) % 2");
+}
+
+/// The smallest fingerprint that selects the shard at `index`.
+async fn fingerprint_on(client: &ChClient, index: u64) -> u128 {
+    u128::from(
+        num(
+            client,
+            &format!(
+                "SELECT toUInt64(number) AS n FROM numbers(1000) \
+                 WHERE cityHash64(toUInt128(number)) % 2 = {index} ORDER BY n LIMIT 1"
+            ),
+        )
+        .await,
+    )
+}
+
+/// The server's clock now, in microseconds since the epoch: the scale of
+/// `system.query_log.query_start_time_microseconds`.
+async fn server_now_us(client: &ChClient) -> u64 {
+    num(
+        client,
+        "SELECT toUInt64(toUnixTimestamp64Micro(now64(6))) AS n",
+    )
+    .await
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+struct LogCounts {
+    ended: u64,
+    pending: u64,
+}
+
+/// Waits until every statement `filter` selects in `client`'s
+/// `system.query_log` has its ending row, and at least `at_least` have ended.
+///
+/// One `SYSTEM FLUSH LOGS` is not a barrier: a statement's `QueryFinish` row
+/// can be queued after its client has the answer. Its `QueryStart` row is
+/// queued before it runs, so once flushed it names every statement sent; an
+/// execution is a `query_id` with its `query_start_time_microseconds`, which
+/// both rows share. `filter` must not name `type`. Fails after 60 s.
+async fn settle_query_log(client: &ChClient, filter: &str, at_least: u64) {
+    let sql = format!(
+        "SELECT toUInt64(countIf(e)) AS ended, toUInt64(countIf(s AND NOT e)) AS pending \
+         FROM (SELECT query_id, max(type = 'QueryStart') AS s, \
+                 max(type IN ('QueryFinish', 'ExceptionWhileProcessing', \
+                              'ExceptionBeforeStart')) AS e \
+               FROM system.query_log \
+               WHERE ({filter}) AND query NOT LIKE '%system.query_log%' \
+               GROUP BY query_id, query_start_time_microseconds)"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        exec(client, "SYSTEM FLUSH LOGS").await;
+        let mut stream = client
+            .query_stream::<LogCounts>(&sql, &QuerySettings::new())
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{sql}"));
+        let counts = stream
+            .next()
+            .await
+            .expect("one row")
+            .expect("decode LogCounts");
+        drop(stream);
+        if counts.ended >= at_least && counts.pending == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "system.query_log did not settle within 60 s for {filter}: {counts:?}, \
+             at least {at_least} expected"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Asserts that `ms` selects the shard at `index` (0 is shard 1, 1 is shard 2).
 async fn assert_stamp_selects(client: &ChClient, ms: i64, index: u64) {
     let got = num(
@@ -364,8 +468,10 @@ fn runtime(root: &Path, retries: u32) -> WriterRuntime {
     let mut runtime = WriterRuntime::from_config(&WriterConfig::default());
     runtime.spool_dir = root.to_path_buf();
     runtime.log_landing_retries = retries;
+    runtime.metrics_landing_retries = retries;
     runtime.trace_landing_retries = retries;
     runtime.log_landing_inserters = 1;
+    runtime.metrics_landing_inserters = 1;
     runtime.trace_landing_inserters = 1;
     runtime
 }
@@ -382,6 +488,12 @@ trait Stamped: ChRow + Clone + Send + Sync + 'static {
 }
 
 impl Stamped for LogLandingRow {
+    fn stamp(&mut self, ms: i64) {
+        self.received_ms = ms;
+    }
+}
+
+impl Stamped for MetricLandingRow {
     fn stamp(&mut self, ms: i64) {
         self.received_ms = ms;
     }
@@ -751,6 +863,286 @@ async fn a_trace_push_that_throws_on_every_attempt_lands_on_one_shard_once() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+// -- 2-L1, 2-L3, 2-L4: metrics placed by fingerprint (issue #494 part 1b) --
+
+/// One metrics push: one float sample at `ms` per `(fingerprint, value)`, each
+/// its own series named `name`.
+fn metric_push_of(name: &str, series: &[(u128, f64)], ms: i64) -> ParsedMetrics {
+    let mut batch = ParsedMetrics::default();
+    for (i, (fingerprint, value)) in series.iter().enumerate() {
+        let metric_name: Arc<str> = Arc::from(if series.len() > 1 && i > 0 {
+            format!("{name}_{i}")
+        } else {
+            name.to_string()
+        });
+        let fingerprint = Fingerprint::from_raw(*fingerprint);
+        batch.samples.push(MetricPoint {
+            metric_name: metric_name.clone(),
+            fingerprint,
+            unix_milli: ms,
+            value: *value,
+        });
+        batch.series.push(SeriesRef {
+            metric_name,
+            fingerprint,
+            labels: LabelSet::from_normalized([("job".to_string(), "checkout".to_string())]).0,
+        });
+    }
+    batch
+}
+
+/// The metrics landing rows on each shard that are not on the shard their
+/// fingerprint selects, and the rows stored more than once there: both must
+/// be zero.
+async fn assert_metrics_placed_by_fingerprint(nodes: &Nodes, db: &str) {
+    sync_everywhere(nodes, db).await;
+    for (index, (name, client)) in [("shard 1", &nodes.s1a), ("shard 2", &nodes.s2)]
+        .into_iter()
+        .enumerate()
+    {
+        let misplaced = num(
+            client,
+            &format!(
+                "SELECT count() AS n FROM {db}.metric_landing \
+                 WHERE cityHash64(fingerprint) % 2 != {index}"
+            ),
+        )
+        .await;
+        assert_eq!(
+            misplaced, 0,
+            "{name}: rows on a shard their fingerprint does not select"
+        );
+        let repeated = num(
+            client,
+            &format!(
+                "SELECT count() AS n FROM (SELECT fingerprint, kind, unix_milli, count() AS c \
+                 FROM {db}.metric_landing GROUP BY fingerprint, kind, unix_milli HAVING c > 1)"
+            ),
+        )
+        .await;
+        assert_eq!(repeated, 0, "{name}: a landing row stored twice");
+    }
+}
+
+/// **2-L1.** As 1-L1, for a metrics push carrying a series named `poison`:
+/// each of its landing rows at most once, on the shard its fingerprint
+/// selects, and no sample twice.
+#[tokio::test]
+async fn a_metric_push_that_throws_on_every_attempt_is_placed_by_fingerprint() {
+    skip_unless_live!();
+    let _serial = SERIAL.lock().await;
+    let db = DB_POISON_METRICS.name();
+    build_schema(db);
+    let nodes = Nodes::of(db).await;
+    require_two_shards(&nodes).await;
+    throwing_view(&nodes, db, "metric_landing", "metric_name").await;
+
+    let root = spool_root("poison-metrics");
+    let both = Arc::new(client(&[(&shard1(), None), (&shard2(), None)], db).await);
+    let forwarder = RecordingForwarder::<MetricLandingRow>::new(both);
+    let writer = MetricWriter::with_landing_inserter_and_runtime(
+        forwarder.clone(),
+        runtime(&root, 2),
+        ACTIVITY_BUCKET_MS,
+        MetricWriterTables::landing_for(Some(SUFFIX)),
+    );
+    let ms = now_ms() - 60_000;
+    let mut push = metric_push_of("up", &[(100, 1.0), (101, 1.0), (102, 1.0)], ms);
+    push.samples[1].metric_name = Arc::from("poison");
+    push.series[1].metric_name = Arc::from("poison");
+    let answer = writer
+        .admit_flush(&no_tenant(), push, PushHeaders::default())
+        .expect("the queue has room")
+        .await;
+    writer.shutdown(Duration::from_secs(10)).await;
+
+    assert!(answer.is_err(), "every attempt threw: {answer:?}");
+    assert_eq!(forwarder.calls(), 3, "one send and two resends");
+    assert_eq!(
+        forwarder.last().0,
+        format!("metric_landing{SUFFIX}"),
+        "the writer names the wrapper"
+    );
+    // The scratch table is not asserted empty, as 1-L1's is: the push is one
+    // block per shard, and the block on the shard without the poison row
+    // commits, its view writing its rows there.
+    assert_metrics_placed_by_fingerprint(&nodes, db).await;
+    let repeated = texts(
+        &nodes.s1a,
+        &format!(
+            "SELECT toString(fingerprint) AS s FROM {db}.metric_samples{SUFFIX} \
+             GROUP BY fingerprint, unix_milli HAVING count() > 1"
+        ),
+    )
+    .await;
+    assert!(repeated.is_empty(), "samples stored twice: {repeated:?}");
+
+    drop_db(&nodes, db).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A metrics push of two series, one per shard, each sample at the marked
+/// value `13`, and a view on shard 2's server alone that throws on that
+/// value. Returns the push and the two fingerprints, shard 1's first.
+async fn split_push_with_a_refusing_shard(nodes: &Nodes, db: &str) -> (ParsedMetrics, u128, u128) {
+    let on_shard1 = fingerprint_on(&nodes.s1a, 0).await;
+    let on_shard2 = fingerprint_on(&nodes.s1a, 1).await;
+    assert_fingerprint_selects(&nodes.s1a, on_shard1, 0).await;
+    assert_fingerprint_selects(&nodes.s1a, on_shard2, 1).await;
+    exec(
+        &nodes.s2,
+        &format!(
+            "CREATE TABLE {db}.marked_seen (value Float64) ENGINE = MergeTree ORDER BY tuple()"
+        ),
+    )
+    .await;
+    exec(
+        &nodes.s2,
+        &format!(
+            "CREATE MATERIALIZED VIEW {db}.marked_mv TO {db}.marked_seen \
+             AS SELECT value FROM {db}.metric_landing \
+             WHERE throwIf(value = 13, 'a marked value') = 0"
+        ),
+    )
+    .await;
+    let push = metric_push_of(
+        "split_total",
+        &[(on_shard1, 13.0), (on_shard2, 13.0)],
+        now_ms() - 60_000,
+    );
+    (push, on_shard1, on_shard2)
+}
+
+/// Each fingerprint's samples, counted through `metric_samples`' wrapper.
+async fn samples_of(nodes: &Nodes, db: &str, fingerprint: u128) -> u64 {
+    sync_everywhere(nodes, db).await;
+    num(
+        &nodes.s1a,
+        &format!(
+            "SELECT count() AS n FROM {db}.metric_samples{SUFFIX} \
+             WHERE fingerprint = toUInt128({fingerprint})"
+        ),
+    )
+    .await
+}
+
+/// A `MetricWriter` over `servers`, inserting through `metric_landing`'s
+/// wrapper.
+async fn metric_writer_over(
+    servers: &[(&Server, Option<&str>)],
+    db: &str,
+    root: &Path,
+) -> MetricWriter {
+    MetricWriter::with_landing_inserter_and_runtime(
+        Arc::new(ChBlockInserter::new(Arc::new(client(servers, db).await))),
+        runtime(root, 2),
+        ACTIVITY_BUCKET_MS,
+        MetricWriterTables::landing_for(Some(SUFFIX)),
+    )
+}
+
+/// **2-L3.** A push whose series span both shards, shard 2 refusing its
+/// block: answered the failure, shard 1's sample kept once, shard 2's not
+/// stored. With the refusing view dropped, the same push sent again to the
+/// same writer is admitted and answered `Ok`, and each series holds its
+/// sample once.
+#[tokio::test]
+async fn a_split_push_resent_to_its_writer_stores_each_sample_once() {
+    skip_unless_live!();
+    let _serial = SERIAL.lock().await;
+    let db = DB_SPLIT_RESEND.name();
+    build_schema(db);
+    let nodes = Nodes::of(db).await;
+    require_two_shards(&nodes).await;
+    let (push, on_shard1, on_shard2) = split_push_with_a_refusing_shard(&nodes, db).await;
+
+    let root = spool_root("split-resend");
+    let writer = metric_writer_over(&[(&shard1(), None), (&shard2(), None)], db, &root).await;
+    let answer = writer
+        .admit_flush(&no_tenant(), push.clone(), PushHeaders::default())
+        .expect("the queue has room")
+        .await;
+    assert!(answer.is_err(), "shard 2 refused its block: {answer:?}");
+    assert_eq!(
+        samples_of(&nodes, db, on_shard1).await,
+        1,
+        "shard 1 kept its sample"
+    );
+    assert_eq!(
+        samples_of(&nodes, db, on_shard2).await,
+        0,
+        "shard 2 stored none"
+    );
+
+    exec(&nodes.s2, &format!("DROP TABLE {db}.marked_mv SYNC")).await;
+    writer
+        .admit_flush(&no_tenant(), push, PushHeaders::default())
+        .expect("the retry is admitted")
+        .await
+        .expect("the retry is answered Ok");
+    writer.shutdown(Duration::from_secs(10)).await;
+    assert_eq!(
+        samples_of(&nodes, db, on_shard1).await,
+        1,
+        "shard 1's sample once"
+    );
+    assert_eq!(
+        samples_of(&nodes, db, on_shard2).await,
+        1,
+        "shard 2's sample once"
+    );
+
+    drop_db(&nodes, db).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **2-L4.** As 2-L3 to the drop; then the same push to a second writer, over
+/// shard 2's endpoint alone: answered `Ok`, and each series holds its sample
+/// once, since the token comes from the content and not from the writer.
+#[tokio::test]
+async fn a_split_push_resent_to_another_writer_stores_each_sample_once() {
+    skip_unless_live!();
+    let _serial = SERIAL.lock().await;
+    let db = DB_SPLIT_OTHER_WRITER.name();
+    build_schema(db);
+    let nodes = Nodes::of(db).await;
+    require_two_shards(&nodes).await;
+    let (push, on_shard1, on_shard2) = split_push_with_a_refusing_shard(&nodes, db).await;
+
+    let root = spool_root("split-first-writer");
+    let first = metric_writer_over(&[(&shard1(), None), (&shard2(), None)], db, &root).await;
+    let answer = first
+        .admit_flush(&no_tenant(), push.clone(), PushHeaders::default())
+        .expect("the queue has room")
+        .await;
+    first.shutdown(Duration::from_secs(10)).await;
+    assert!(answer.is_err(), "shard 2 refused its block: {answer:?}");
+    exec(&nodes.s2, &format!("DROP TABLE {db}.marked_mv SYNC")).await;
+
+    let other_root = spool_root("split-second-writer");
+    let second = metric_writer_over(&[(&shard2(), None)], db, &other_root).await;
+    second
+        .admit_flush(&no_tenant(), push, PushHeaders::default())
+        .expect("the queue has room")
+        .await
+        .expect("the second writer's push is answered Ok");
+    second.shutdown(Duration::from_secs(10)).await;
+    assert_eq!(
+        samples_of(&nodes, db, on_shard1).await,
+        1,
+        "shard 1's sample once"
+    );
+    assert_eq!(
+        samples_of(&nodes, db, on_shard2).await,
+        1,
+        "shard 2's sample once"
+    );
+
+    drop_db(&nodes, db).await;
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&other_root).ok();
+}
+
 // -- 1-L4 to 1-L6: where the block goes ---------------------------------
 
 /// The `kind = 0` rows `client` holds for `body` in `db.log_landing`.
@@ -928,6 +1320,11 @@ async fn the_shard_follows_the_key_and_not_the_zone() {
     assert_stamp_selects(&nodes.s1a, SHARD1_MS, 0).await;
     assert_stamp_selects(&nodes.s1a, SHARD2_MS, 1).await;
 
+    // This run's own inserts: the query log keeps earlier runs' rows, under
+    // this same database name.
+    let since_s1 = server_now_us(&nodes.s1a).await;
+    let since_s2 = server_now_us(&nodes.s2).await;
+
     let root = spool_root("zone");
     let mut cfg = config(&[(&shard1(), Some("a")), (&shard2(), Some("b"))], db);
     cfg.local_zone = Some("a".to_string());
@@ -959,25 +1356,35 @@ async fn the_shard_follows_the_key_and_not_the_zone() {
     writer.shutdown(Duration::from_secs(10)).await;
 
     // The landing inserts alone: the refreshable views' runs are initial
-    // inserts in this database too, and name no landing table.
-    let initial_inserts = format!(
-        "SELECT count() AS n FROM system.query_log \
-         WHERE type = 'QueryFinish' AND is_initial_query AND query_kind = 'Insert' \
-         AND arrayExists(t -> startsWith(t, '{db}.log_landing'), tables)"
-    );
-    for (_, client) in nodes.all() {
-        exec(client, "SYSTEM FLUSH LOGS").await;
+    // inserts in this database too, and name no landing table. Each node is
+    // read for the inserts that started on it since this run began, once
+    // each of them has its ending row in the log.
+    let landing_inserts = |since: u64| {
+        format!(
+            "is_initial_query AND query_kind = 'Insert' \
+             AND arrayExists(t -> startsWith(t, '{db}.log_landing'), tables) \
+             AND toUInt64(toUnixTimestamp64Micro(query_start_time_microseconds)) >= {since}"
+        )
+    };
+    for (name, client, since, want) in [
+        ("shard 1 coordinated every insert", &nodes.s1a, since_s1, 4),
+        ("shard 2 coordinated none", &nodes.s2, since_s2, 0),
+    ] {
+        let filter = landing_inserts(since);
+        settle_query_log(client, &filter, want).await;
+        assert_eq!(
+            num(
+                client,
+                &format!(
+                    "SELECT count() AS n FROM system.query_log \
+                     WHERE type = 'QueryFinish' AND {filter}"
+                ),
+            )
+            .await,
+            want,
+            "{name}"
+        );
     }
-    assert_eq!(
-        num(&nodes.s1a, &initial_inserts).await,
-        4,
-        "shard 1 coordinated every insert"
-    );
-    assert_eq!(
-        num(&nodes.s2, &initial_inserts).await,
-        0,
-        "shard 2 coordinated none"
-    );
     sync_everywhere(&nodes, db).await;
     for (body, stamp) in pushes {
         let (here, there) = if stamp == SHARD1_MS {
@@ -1002,6 +1409,52 @@ async fn the_shard_follows_the_key_and_not_the_zone() {
 }
 
 // -- 1-L7: one block, one token, three servers --------------------------
+
+/// The series 2-L2 and 2-L7 send: its fingerprint selects shard 2.
+const METRIC_SERIES: u128 = 2004;
+
+/// 2-L2's metrics block: two float samples and the registration of
+/// [`METRIC_SERIES`], every row stamped `received_ms`.
+fn metric_block(received_ms: i64) -> Vec<MetricLandingRow> {
+    let org: Arc<str> = Arc::from("");
+    let now = now_ms() - 60_000;
+    let name: Arc<str> = Arc::from("http_requests_total");
+    let fingerprint = Fingerprint::from_raw(METRIC_SERIES);
+    let series = SeriesRef {
+        metric_name: name.clone(),
+        fingerprint,
+        labels: LabelSet::from_normalized([("job".to_string(), "checkout".to_string())]).0,
+    };
+    vec![
+        MetricLandingRow::float_sample(
+            &org,
+            received_ms,
+            &MetricPoint {
+                metric_name: name.clone(),
+                fingerprint,
+                unix_milli: now,
+                value: 1.0,
+            },
+        ),
+        MetricLandingRow::float_sample(
+            &org,
+            received_ms,
+            &MetricPoint {
+                metric_name: name.clone(),
+                fingerprint,
+                unix_milli: now + 1_000,
+                value: 2.0,
+            },
+        ),
+        MetricLandingRow::series(
+            &org,
+            received_ms,
+            &series,
+            now - now % ACTIVITY_BUCKET_MS,
+            0,
+        ),
+    ]
+}
 
 /// The two blocks 1-L7 sends, every row stamped [`SHARD1_MS`].
 struct Blocks {
@@ -1188,6 +1641,15 @@ async fn one_block_resent_through_every_server_is_stored_once_on_its_shard() {
     assert_stamp_selects(&nodes.s1a, SHARD1_MS, 0).await;
 
     let blocks = blocks();
+    // 2-L2 (issue #494 part 1b): the metrics block's series selects shard 2
+    // by fingerprint while its stamp selects shard 1.
+    assert_fingerprint_selects(&nodes.s1a, METRIC_SERIES, 1).await;
+    let metrics = metric_block(SHARD1_MS);
+    assert_eq!(
+        kinds(&metrics, |r| r.kind),
+        vec![0, 0, 2],
+        "the metrics block"
+    );
     assert_eq!(
         kinds(&blocks.logs, |r| r.kind),
         vec![0, 0, 0, 1, 2],
@@ -1199,7 +1661,7 @@ async fn one_block_resent_through_every_server_is_stored_once_on_its_shard() {
         "the traces block"
     );
     let max_rows = 1_048_576;
-    let log_settings = QuerySettings::routed_landing_insert("routed-l7-logs", max_rows);
+    let log_settings = QuerySettings::landing_insert("routed-l7-logs", max_rows);
     let trace_settings = QuerySettings::trace_landing_insert("routed-l7-traces", max_rows);
     let log_table = WriterTables::landing_for(Some(SUFFIX)).landing;
     let trace_table = TraceWriterTables::landing_for(Some(SUFFIX)).landing;
@@ -1211,6 +1673,9 @@ async fn one_block_resent_through_every_server_is_stored_once_on_its_shard() {
     ];
     send_through(&order, &log_table, &blocks.logs, &log_settings).await;
     send_through(&order, &trace_table, &blocks.traces, &trace_settings).await;
+    let metric_table = MetricWriterTables::landing_for(Some(SUFFIX)).landing;
+    let metric_settings = QuerySettings::landing_insert("routed-l7-metrics", max_rows);
+    send_through(&order, &metric_table, &metrics, &metric_settings).await;
     let once = [("control, shard 1", &controls.s1a)];
     send_through(&once, "log_landing", &blocks.logs, &log_settings).await;
     send_through(&once, "trace_landing", &blocks.traces, &trace_settings).await;
@@ -1236,6 +1701,25 @@ async fn one_block_resent_through_every_server_is_stored_once_on_its_shard() {
         );
     }
 
+    // 2-L2: the metrics rows sit on the shard their fingerprint selects,
+    // once, whichever server received them.
+    let sql = format!("SELECT count() AS n FROM {db}.metric_landing");
+    for (name, client) in [
+        ("shard 1, first replica", &nodes.s1a),
+        ("shard 1, second replica", &nodes.s1b),
+    ] {
+        assert_eq!(
+            num(client, &sql).await,
+            0,
+            "{name} holds none of metric_landing"
+        );
+    }
+    assert_eq!(
+        num(&nodes.s2, &sql).await,
+        metrics.len() as u64,
+        "shard 2 holds the metrics block once"
+    );
+
     let mut want = std::collections::BTreeMap::new();
     for (table, how) in DERIVED {
         let got = derived_count(&nodes, db, table, *how).await;
@@ -1260,4 +1744,209 @@ async fn one_block_resent_through_every_server_is_stored_once_on_its_shard() {
 
     drop_db(&nodes, db).await;
     drop_db(&controls, control).await;
+}
+
+// -- 2-L7: a resend in another landing hour (issue #494 part 1b) ---------
+
+/// The seven tables a metrics content block's views write.
+const CONTENT_TABLES: [&str; 7] = [
+    "metric_samples",
+    "metric_hist_samples",
+    "metric_exemplars",
+    "metric_series",
+    "metric_labels",
+    "metric_label_index",
+    "metric_label_values",
+];
+
+/// 2-L7's block: [`METRIC_SERIES`]'s registration with two labels, two float
+/// samples, one histogram sample and one exemplar, every row stamped
+/// `received_ms`.
+fn cross_hour_block(received_ms: i64, now: i64) -> Vec<MetricLandingRow> {
+    let org: Arc<str> = Arc::from("");
+    let name: Arc<str> = Arc::from("http_requests_total");
+    let fingerprint = Fingerprint::from_raw(METRIC_SERIES);
+    let series = SeriesRef {
+        metric_name: name.clone(),
+        fingerprint,
+        labels: LabelSet::from_normalized([
+            ("job".to_string(), "checkout".to_string()),
+            ("instance".to_string(), "a".to_string()),
+        ])
+        .0,
+    };
+    let sample = |unix_milli: i64, value: f64| {
+        MetricLandingRow::float_sample(
+            &org,
+            received_ms,
+            &MetricPoint {
+                metric_name: name.clone(),
+                fingerprint,
+                unix_milli,
+                value,
+            },
+        )
+    };
+    vec![
+        MetricLandingRow::series(
+            &org,
+            received_ms,
+            &series,
+            now - now % ACTIVITY_BUCKET_MS,
+            0,
+        ),
+        sample(now, 1.0),
+        sample(now + 1_000, 2.0),
+        MetricLandingRow::hist_sample(
+            &org,
+            received_ms,
+            &HistogramPoint {
+                metric_name: name.clone(),
+                fingerprint,
+                unix_milli: now,
+                histogram: pulsus_model::NativeHistogram {
+                    counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
+                    schema: 0,
+                    zero_threshold: 0.0,
+                    zero_count: 0,
+                    count: 3,
+                    sum: 1.5,
+                    positive_spans: vec![pulsus_model::Span {
+                        offset: 1,
+                        length: 3,
+                    }],
+                    negative_spans: vec![],
+                    positive_buckets: vec![1, -1, 2],
+                    negative_buckets: vec![],
+                    custom_values: vec![],
+                },
+            },
+        ),
+        MetricLandingRow::exemplar(
+            &org,
+            received_ms,
+            &ExemplarPoint {
+                metric_name: name,
+                fingerprint,
+                unix_milli: now,
+                value: 0.25,
+                trace_id: std::array::from_fn(|i| i as u8 + 1),
+                span_id: std::array::from_fn(|i| i as u8 + 17),
+                labels: LabelSet::from_normalized([("a".to_string(), "b".to_string())]).0,
+                histogram: false,
+            },
+        ),
+    ]
+}
+
+/// Stops or starts merges of every content table of `db` on `client`.
+async fn content_merges(client: &ChClient, db: &str, verb: &str) {
+    for table in CONTENT_TABLES {
+        exec(client, &format!("SYSTEM {verb} MERGES {db}.{table}")).await;
+    }
+}
+
+/// **2-L7.** One content block under one token, sent through shard 1's first
+/// replica, then two hours later — another landing partition — through
+/// shard 2's server: `metric_landing` on shard 2 holds it twice, every table
+/// the block's views write holds what one insert of it holds, counted raw
+/// with merges stopped, and shard 1 holds nothing of the series.
+#[tokio::test]
+async fn a_resend_in_another_landing_hour_stores_no_derived_row_twice() {
+    skip_unless_live!();
+    let _serial = SERIAL.lock().await;
+    let db = DB_CROSS_HOUR.name();
+    let control = DB_CROSS_HOUR_CONTROL.name();
+    build_schema(db);
+    build_schema_at(control, &shard2(), false);
+    let nodes = Nodes::of(db).await;
+    let control_client = client(&[(&shard2(), None)], control).await;
+    require_two_shards(&nodes).await;
+    assert_fingerprint_selects(&nodes.s1a, METRIC_SERIES, 1).await;
+
+    for (_, node) in nodes.all() {
+        content_merges(node, db, "STOP").await;
+    }
+    content_merges(&control_client, control, "STOP").await;
+
+    let now = now_ms() - 60_000;
+    let first = cross_hour_block(4_102_444_800_000, now);
+    let later = cross_hour_block(4_102_452_000_000, now);
+    let table = MetricWriterTables::landing_for(Some(SUFFIX)).landing;
+    let settings = QuerySettings::landing_insert("cross-hour-1", 1_048_576);
+    send_through(
+        &[("shard 1, first replica", &nodes.s1a)],
+        &table,
+        &first,
+        &settings,
+    )
+    .await;
+    send_through(&[("shard 2", &nodes.s2)], &table, &later, &settings).await;
+    send_through(
+        &[("control", &control_client)],
+        "metric_landing",
+        &first,
+        &settings,
+    )
+    .await;
+    sync_everywhere(&nodes, db).await;
+
+    assert_eq!(
+        num(
+            &nodes.s2,
+            &format!("SELECT count() AS n FROM {db}.metric_landing")
+        )
+        .await,
+        2 * first.len() as u64,
+        "shard 2's metric_landing holds the block twice, one per landing hour"
+    );
+    for table in CONTENT_TABLES {
+        let got = if table == "metric_label_values" {
+            num(&nodes.s2, &format!("SELECT count() AS n FROM {db}.{table}")).await
+        } else {
+            num(
+                &nodes.s1a,
+                &format!("SELECT count() AS n FROM {db}.{table}{SUFFIX}"),
+            )
+            .await
+        };
+        let want = num(
+            &control_client,
+            &format!("SELECT count() AS n FROM {control}.{table}"),
+        )
+        .await;
+        assert!(want > 0, "the control's {table} is compared, not empty");
+        assert_eq!(
+            got, want,
+            "{table}: raw rows against one insert of the block"
+        );
+    }
+    for (name, client) in [
+        ("shard 1, first replica", &nodes.s1a),
+        ("shard 1, second replica", &nodes.s1b),
+    ] {
+        assert_eq!(
+            num(
+                client,
+                &format!(
+                    "SELECT count() AS n FROM {db}.metric_landing \
+                     WHERE fingerprint = toUInt128({METRIC_SERIES})"
+                ),
+            )
+            .await,
+            0,
+            "{name} holds nothing of the series"
+        );
+    }
+
+    for (_, node) in nodes.all() {
+        content_merges(node, db, "START").await;
+    }
+    content_merges(&control_client, control, "START").await;
+    drop_db(&nodes, db).await;
+    exec(
+        &control_client,
+        &format!("DROP DATABASE IF EXISTS {control} SYNC"),
+    )
+    .await;
 }

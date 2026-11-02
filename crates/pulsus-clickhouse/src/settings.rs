@@ -475,16 +475,15 @@ impl QuerySettings {
     /// | `min_insert_block_size_rows_for_materialized_views` | `0` | **the block-forming class above, reaching the part of the path its pins do not.** `createSelectInsertContext` *overrides* `min_insert_block_size_rows` with this value for a **view's** insert alone, so the pin on the non-view variant does not govern there; a profile could reshape one view's output into several blocks, each its own commit into the target |
     /// | `min_insert_block_size_bytes_for_materialized_views` | `0` | the same, for bytes |
     ///
-    /// **On a cluster a log or trace block goes through its landing table's
-    /// wrapper (issue #494 part 1).** The writer names
-    /// `<landing table><PULSUS_DIST_SUFFIX>`, a `Distributed` table keyed on
-    /// `cityHash64(received_ms)`, so a push and every resend the writer makes
-    /// of that block reach one shard whichever server receives them.
-    /// `landing_insert`, which the metrics writer sends into the bare
-    /// `metric_landing`, carries the last three pins below;
-    /// [`Self::routed_landing_insert`], which the log writer sends and
-    /// [`Self::trace_landing_insert`] builds on, adds
-    /// `distributed_foreground_insert` and `insert_shard_id`. Single-node they
+    /// **On a cluster every landing block goes through its landing table's
+    /// wrapper (issue #494 parts 1 and 1b).** The writer names
+    /// `<landing table><PULSUS_DIST_SUFFIX>`: `log_landing` and `trace_landing`
+    /// are keyed on `cityHash64(received_ms)`, so a push and every resend the
+    /// writer makes of that block reach one shard whichever server receives
+    /// them; `metric_landing` is keyed on `cityHash64(fingerprint)`, so every
+    /// row of a series reaches the shard every metrics table's wrapper names.
+    /// Every landing insert carries the five pins below, and
+    /// [`Self::trace_landing_insert`] builds on this one. Single-node they
     /// change nothing, as no wrapper is named:
     ///
     /// | setting | pinned to | why |
@@ -508,25 +507,16 @@ impl QuerySettings {
             .set("ignore_materialized_views_with_dropped_target_table", 0)
             .set("min_insert_block_size_rows_for_materialized_views", 0)
             .set("min_insert_block_size_bytes_for_materialized_views", 0)
+            .set("distributed_foreground_insert", 1)
+            .set("insert_shard_id", 0)
             .set("skip_unavailable_shards", 0)
             .set("prefer_localhost_replica", 0)
             .set("timeout_overflow_mode", "throw")
     }
 
-    /// The settings an insert through a landing table's `Distributed`
-    /// wrapper carries (issue #494 part 1): [`Self::landing_insert`] whole,
-    /// plus `distributed_foreground_insert = 1` and `insert_shard_id = 0`,
-    /// whose rows are in [`Self::landing_insert`]'s table. The log writer
-    /// sends it, and [`Self::trace_landing_insert`] builds on it.
-    pub fn routed_landing_insert(token: &str, max_rows: u64) -> Self {
-        Self::landing_insert(token, max_rows)
-            .set("distributed_foreground_insert", 1)
-            .set("insert_shard_id", 0)
-    }
-
     /// The settings every insert of one traces landing block carries (issues
-    /// #584 to #586): [`Self::routed_landing_insert`] whole, plus **seven
-    /// further pins of four classes the metrics set did not need**.
+    /// #584 to #586): [`Self::landing_insert`] whole, plus **seven further
+    /// pins of four classes the metrics set did not need**.
     ///
     /// The rule behind the set, stated once so it does not grow without
     /// bound: **pin what a profile could use to make an answer wrong or a
@@ -562,7 +552,7 @@ impl QuerySettings {
     /// pin cannot reach is the `MergeTree` setting of the same name, which the
     /// landing table's own `CREATE` handles.
     pub fn trace_landing_insert(token: &str, max_rows: u64) -> Self {
-        Self::routed_landing_insert(token, max_rows)
+        Self::landing_insert(token, max_rows)
             .set("input_format_binary_read_json_as_string", 0)
             .set("format_binary_max_object_size", MAX_JSON_PATHS_PER_VALUE)
             .set(
@@ -889,46 +879,33 @@ mod tests {
         );
         assert_eq!(
             s.entries().count(),
-            17,
+            19,
             "the pinned set is closed: a setting added to it without a row in \
              landing_insert's table, and without its required-name entry, is \
              a name sent on somebody's memory"
         );
     }
 
-    /// **1-U1 (issue #494 part 1): the landing inserts pin what their path
-    /// needs.** Every landing insert pins `skip_unavailable_shards`,
-    /// `prefer_localhost_replica` and `timeout_overflow_mode`; the log and
-    /// trace inserts, which go through a `Distributed` wrapper on a cluster,
-    /// also pin `distributed_foreground_insert` and `insert_shard_id`, and
-    /// the metrics insert, which names the bare `metric_landing`, does not.
+    /// **2-U1 (issue #494 part 1b): every landing insert pins the five
+    /// placement settings**, metrics and logs through
+    /// [`QuerySettings::landing_insert`] and traces through
+    /// [`QuerySettings::trace_landing_insert`], each at the same value. On a
+    /// cluster every landing table is written through its `Distributed`
+    /// wrapper.
     #[test]
-    fn the_landing_inserts_pin_the_settings_their_path_needs() {
-        const EVERY: [(&str, &str); 3] = [
+    fn every_landing_insert_pins_the_five_placement_settings() {
+        const PINS: [(&str, &str); 5] = [
+            ("distributed_foreground_insert", "1"),
+            ("insert_shard_id", "0"),
             ("skip_unavailable_shards", "0"),
             ("prefer_localhost_replica", "0"),
             ("timeout_overflow_mode", "throw"),
         ];
-        const ROUTED: [(&str, &str); 2] = [
-            ("distributed_foreground_insert", "1"),
-            ("insert_shard_id", "0"),
-        ];
-        let metrics = QuerySettings::landing_insert("tok-1", 1_048_576);
-        let logs = QuerySettings::routed_landing_insert("tok-1", 1_048_576);
+        let landing = QuerySettings::landing_insert("tok-1", 1_048_576);
         let traces = QuerySettings::trace_landing_insert("tok-1", 1_048_576);
-        for (key, value) in EVERY {
-            assert_eq!(metrics.get(key), Some(value), "landing_insert: {key}");
-        }
-        for (key, _) in ROUTED {
-            assert_eq!(
-                metrics.get(key),
-                None,
-                "landing_insert names no wrapper and must not carry {key}"
-            );
-        }
-        for (key, value) in EVERY.iter().chain(ROUTED.iter()) {
-            assert_eq!(logs.get(key), Some(*value), "routed_landing_insert: {key}");
-            assert_eq!(traces.get(key), Some(*value), "trace_landing_insert: {key}");
+        for (key, value) in PINS {
+            assert_eq!(landing.get(key), Some(value), "landing_insert: {key}");
+            assert_eq!(traces.get(key), Some(value), "trace_landing_insert: {key}");
         }
     }
 
@@ -967,11 +944,10 @@ mod tests {
         }
     }
 
-    /// **The trace landing insert's pin set is exactly the metrics one plus
-    /// nine**: the two routed pins of [`QuerySettings::routed_landing_insert`]
-    /// and the seven the trace path needs, compared as **sets**, with the
-    /// difference taken against those nine — so neither an added pin nor a
-    /// removed one passes.
+    /// **The trace landing insert's pin set is exactly the landing one plus
+    /// the seven the trace path needs**, and the two sets are compared as
+    /// **sets**, with the difference taken against those seven — so
+    /// neither an added pin nor a removed one passes.
     ///
     /// It is the only place in this change that writes a setting name as a
     /// literal. The classes behind the seven, and the catalogue
@@ -988,8 +964,6 @@ mod tests {
         use std::collections::BTreeMap;
 
         const WANT: &[(&str, &str)] = &[
-            ("distributed_foreground_insert", "1"),
-            ("insert_shard_id", "0"),
             ("input_format_binary_read_json_as_string", "0"),
             ("format_binary_max_object_size", "100000"),
             ("max_partitions_per_insert_block", "100"),
@@ -1013,7 +987,7 @@ mod tests {
         assert_eq!(
             added, want,
             "the difference against the metrics landing insert is exactly the \
-             two routed pins and the seven this design names"
+             seven pins this design names"
         );
 
         for (key, value) in &base_entries {

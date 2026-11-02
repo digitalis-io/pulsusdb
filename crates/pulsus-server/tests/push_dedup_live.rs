@@ -183,7 +183,7 @@ fn http_request_with(
     body: &[u8],
 ) -> Option<HttpResponse> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT)).ok();
 
     let mut head = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
     if let Some(ct) = content_type {
@@ -498,6 +498,18 @@ async fn collect<R: pulsus_clickhouse::ChRow>(client: &ChClient, sql: &str) -> V
         out.push(row.unwrap_or_else(|e| panic!("decode a row of {sql}: {e}")));
     }
     out
+}
+
+/// How long one request to the server under test may wait for its answer.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// This host's clock, in epoch milliseconds: the server under test stamps
+/// `received_ms` from the same clock.
+fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("post-epoch clock")
+        .as_millis() as i64
 }
 
 async fn scalar(client: &ChClient, sql: &str) -> u64 {
@@ -898,8 +910,8 @@ async fn the_rollup_buckets_return_to_their_single_push_values() {
     );
 }
 
-/// **The control.** With `PULSUS_INGEST_DEDUP=false` the same two pushes
-/// store both copies and every reader doubles — which is the defect, and
+/// **The control.** With `PULSUS_INGEST_DEDUP=false` the same two log
+/// pushes store both copies and every log reader doubles — which is the defect, and
 /// is what the tests above would report if they were passing for some
 /// other reason (a body that never arrived, a query that matched nothing).
 ///
@@ -912,15 +924,16 @@ async fn the_rollup_buckets_return_to_their_single_push_values() {
 ///   log_samples rows                           2               4
 ///   log_metrics_5s count/bytes            2 / 46          4 / 92
 ///   log_patterns count                         2               4
-///   metric_samples rows                        3               6
+///   metric_samples rows                        3               3
 ///   count_over_time over those samples         3               3
 /// ```
 ///
-/// **The last row is not a mistake.** Suppression at ingest and the §7
-/// read rule are independent, and the metric read path collapses two rows
-/// identical in `(fingerprint, unix_milli, value bits)` whether or not the
-/// push that stored them was suppressed. So with the mechanism off the
-/// metric side costs storage rather than a wrong answer.
+/// **The metric rows are not a mistake.** Since issue #494 part 1b a
+/// metrics push's landing token is derived from its tenant and content, so
+/// the repeat carries the first push's token and ClickHouse drops it with
+/// the mechanism off as well: the metric side has a guard of its own. The
+/// metric read path also collapses two rows identical in `(fingerprint,
+/// unix_milli, value bits)`, so the answer is three either way.
 ///
 /// The log side has no such second line of defence, which is the whole of
 /// the engine ruling: `log_metrics_5s` is an `AggregatingMergeTree` fed by
@@ -928,7 +941,7 @@ async fn the_rollup_buckets_return_to_their_single_push_values() {
 /// afterwards subtracts from the sum. That is why the suppression has to
 /// happen before the insert rather than at read time or at merge time.
 #[tokio::test]
-async fn with_the_mechanism_off_the_retry_doubles_every_reader() {
+async fn with_the_mechanism_off_the_retry_doubles_every_log_reader() {
     if !should_run() {
         eprintln!("skipping: PULSUS_TEST_CLICKHOUSE is not set");
         return;
@@ -971,15 +984,49 @@ async fn with_the_mechanism_off_the_retry_doubles_every_reader() {
 
     let t1_ms = T_NS / 1_000_000;
     let retried = remote_write_body("dupOffC", t1_ms);
+    // `metric_landing` is partitioned by the hour of `received_ms`, and a
+    // block's token is remembered per partition: a pair of sends straddling
+    // an hour would store the repeat in the next partition. ClickHouse says
+    // how long remains of the partition `received_ms` would land in now, by
+    // the table's own expression, so the guard and the assertion below agree
+    // whatever the server's time zone. The pair is two requests in turn,
+    // each answered within `REQUEST_READ_TIMEOUT`; with less than both of
+    // those and some slack remaining, it waits for the next partition.
+    let margin = 2 * REQUEST_READ_TIMEOUT + Duration::from_secs(10);
+    let now_ms = epoch_ms();
+    let remaining_ms = scalar(
+        &client,
+        &format!(
+            "SELECT toUInt64(toUInt64(toUnixTimestamp(toStartOfHour(fromUnixTimestamp64Milli(\
+             toInt64({now_ms}))) + INTERVAL 1 HOUR)) * 1000 - {now_ms}) AS n"
+        ),
+    )
+    .await;
+    if Duration::from_millis(remaining_ms) < margin {
+        tokio::time::sleep(Duration::from_millis(remaining_ms + 1_000)).await;
+    }
     for _ in 0..2 {
         assert_eq!(push_metrics(MECHANISM_OFF_PORT, &retried, &[]).status, 204);
     }
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT uniqExact(toStartOfHour(fromUnixTimestamp64Milli(received_ms))) AS n \
+             FROM metric_landing WHERE metric_name = 'http_requests_total'",
+        )
+        .await,
+        1,
+        "off: both sends were received in one hour, one landing partition"
+    );
+    // Both pushes are answered after their inserts, so the count below is
+    // final: the repeat's content token is the first push's, and ClickHouse
+    // stored nothing for it (issue #494 part 1b).
     wait_for_scalar(
         &client,
         "SELECT count() AS n FROM metric_landing \
          WHERE kind = 0 AND metric_name = 'http_requests_total'",
-        6,
-        "off: six sample rows for three samples",
+        3,
+        "off: three sample rows for three samples, the repeat dropped by its token",
     )
     .await;
     assert_eq!(
@@ -989,8 +1036,7 @@ async fn with_the_mechanism_off_the_retry_doubles_every_reader() {
             t1_ms + 40_000
         ),
         "3",
-        "off: six rows are stored, and the §7 read rule still answers three — \
-         the two halves of this change are independent"
+        "off: three rows are stored, and the read answers three"
     );
 }
 

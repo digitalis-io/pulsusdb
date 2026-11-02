@@ -170,9 +170,12 @@ impl WriterMetrics {
 /// family.
 #[derive(Debug, Default)]
 pub struct MetricWriterMetrics {
-    /// `metric_landing` per-table counters. One insert per push, so
-    /// `flushes_total` counts pushes stored and `rows_total` counts landed
-    /// events of every kind (issue #603).
+    /// `metric_landing` per-table counters. Zero, one or two inserts per push
+    /// (`docs/api.md` §1.0, "How a metrics push is written"): the content
+    /// block, when the push has samples, histogram samples or exemplars, and
+    /// the descriptor block, when a descriptor is due — so `flushes_total`
+    /// counts blocks stored and `rows_total` counts landed rows of every kind
+    /// (issue #603).
     pub landing: Arc<TableMetrics>,
     pub backpressure_total: AtomicU64,
     pub spool_poison_total: AtomicU64,

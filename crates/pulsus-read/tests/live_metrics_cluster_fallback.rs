@@ -1230,3 +1230,136 @@ async fn a_metrics_read_with_a_shard_down_fails_unless_the_option_allows_a_parti
     drop_user(&shard1_bootstrap, &user).await;
     drop_database(&shard1_bootstrap, db).await;
 }
+
+/// The value of a one-series instant vector, or `None` when it is empty.
+fn single_value(result: &QueryResult) -> Option<f64> {
+    match result {
+        QueryResult::Vector(v) if v.len() == 1 => Some(v[0].value),
+        QueryResult::Vector(v) if v.is_empty() => None,
+        other => panic!("expected a vector of at most one series, got {other:?}"),
+    }
+}
+
+/// **2-L5 (issue #494 part 1b): a series' samples and its registration land
+/// on one shard whichever server received them**, so the `SqlFallback` read,
+/// which pairs them shard by shard, counts every sample. Block 1, the
+/// registration and a sample, goes through shard 1's server; block 2, a later
+/// sample alone, through shard 2's.
+#[tokio::test]
+async fn a_series_landed_through_two_servers_is_read_whole_by_the_fallback() {
+    skip_unless_live!();
+    use pulsus_write::{MetricLandingRow, MetricPoint, MetricWriterTables, SeriesRef};
+
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_cluster_fallback_routed");
+    let shard1_bootstrap = init_clustered_db(db).await;
+    let metric_name = "routed_landing_fallback_metric";
+    let name: Arc<str> = Arc::from(metric_name);
+    let fingerprint = pulsus_model::Fingerprint::from_raw(777);
+    let t = historical_bucket();
+    let org: Arc<str> = Arc::from("");
+    let received_ms = now_ms();
+    let series = SeriesRef {
+        metric_name: name.clone(),
+        fingerprint,
+        labels: pulsus_model::LabelSet::from_normalized([("job".to_string(), "api".to_string())]).0,
+    };
+    let sample = |unix_milli: i64| {
+        MetricLandingRow::float_sample(
+            &org,
+            received_ms,
+            &MetricPoint {
+                metric_name: name.clone(),
+                fingerprint,
+                unix_milli,
+                value: 1.0,
+            },
+        )
+    };
+    let block1 = vec![
+        MetricLandingRow::series(&org, received_ms, &series, t, 0),
+        sample(t),
+    ];
+    let block2 = vec![sample(t + 15_000)];
+    let table = MetricWriterTables::landing_for(Some("_dist")).landing;
+    for (config, block, token) in [
+        (shard1_config(db), &block1, "routed-fallback-1"),
+        (shard2_config(db), &block2, "routed-fallback-2"),
+    ] {
+        ChClient::new(config)
+            .await
+            .expect("connect")
+            .insert_block_with(
+                &table,
+                block,
+                &QuerySettings::landing_insert(token, 1_048_576),
+            )
+            .await
+            .expect("the landing insert commits");
+    }
+    // Each block was written on one live replica of its shard; the reads
+    // below may be served by another, so every replica catches up first.
+    for table in [
+        "metric_samples",
+        "metric_series",
+        "metric_labels",
+        "metric_label_index",
+    ] {
+        shard1_bootstrap
+            .execute(
+                &format!("SYSTEM SYNC REPLICA ON CLUSTER '{CLUSTER_NAME}' {db}.{table}"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("sync {table}: {e}"));
+    }
+
+    let cache = Arc::new(LabelCache::new(
+        ChClient::new(shard1_config(db)).await.expect("connect"),
+        cache_config_dist(db),
+    ));
+    cache.refresh().await.expect("refresh");
+    let engine = MetricsEngine::new(
+        ChClient::new(shard1_config(db)).await.expect("connect"),
+        cache,
+        engine_config_dist(db),
+    );
+    let params = MetricQueryParams {
+        start_ms: t + 60_000,
+        end_ms: t + 60_000,
+        step_ms: 0,
+    };
+    // The named selector resolves through `SqlFallback` (the label cache's
+    // window does not reach two days back) and pairs samples with series
+    // shard by shard; the name-less one resolves through the label index.
+    // Both must count both samples.
+    for (query, fallback) in [
+        (format!("count_over_time({metric_name}[10m])"), true),
+        (r#"count_over_time({job="api"}[10m])"#.to_string(), false),
+    ] {
+        let expr = parse(&query).expect("parse");
+        let (result, _annotations, explain) = engine
+            .query_explained(&no_tenant(), &expr, &params)
+            .await
+            .expect("the query answers");
+        if fallback {
+            let fetch = stage(&explain, "sample_fetch");
+            assert!(
+                fetch.sql.contains("FROM metric_series_dist"),
+                "{query}: the SqlFallback fetch shape: {}",
+                fetch.sql
+            );
+            let resolution = stage(&explain, "series_resolution");
+            assert!(
+                resolution
+                    .note
+                    .as_deref()
+                    .is_some_and(|n| n.contains("OutOfWindow")),
+                "{query}: the OutOfWindow reason: {resolution:#?}"
+            );
+        }
+        assert_eq!(single_value(&result), Some(2.0), "{query}: both samples");
+    }
+
+    drop_database(&shard1_bootstrap, db).await;
+}

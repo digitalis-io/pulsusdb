@@ -727,12 +727,12 @@ async fn the_log_writer_hands_over_the_routed_landing_pins() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// **1-U4 (issue #494 part 1), metrics.** What `MetricWriter` hands its own
-/// `BlockInserter` for one push carries the three pins every landing insert
-/// does, and neither routed pin: it names the bare `metric_landing`, which
-/// has no `Distributed` wrapper.
+/// **2-U4 (issue #494 part 1b), metrics.** What `MetricWriter` hands its own
+/// `BlockInserter` for one push carries all five pins, as the log and trace
+/// writers' do: on a cluster the metrics landing insert goes through
+/// `metric_landing`'s wrapper too.
 #[tokio::test]
-async fn the_metric_writer_hands_over_the_landing_pins_and_not_the_routed_two() {
+async fn the_metric_writer_hands_over_the_five_landing_pins() {
     let root = spool_root("metric-routed-pins");
     let recorder = Arc::new(SettingsRecorder::default());
     let mut runtime = WriterRuntime::from_config(&WriterConfig::default());
@@ -748,24 +748,9 @@ async fn the_metric_writer_hands_over_the_landing_pins_and_not_the_routed_two() 
         .expect("the queue has room")
         .await
         .expect("the landing insert commits");
-    let (named, handed) = first_call(&recorder).await;
+    assert_routed_pins(&recorder, "metric_landing").await;
     writer.shutdown(Duration::from_secs(5)).await;
     std::fs::remove_dir_all(&root).ok();
-    assert_eq!(named, "metric_landing");
-    for (key, value) in LANDING_PINS {
-        assert_eq!(
-            handed_value(&handed, key),
-            Some(value),
-            "the metrics writer hands over {key} = {value}: {handed:?}"
-        );
-    }
-    for (key, _) in ROUTED_ONLY_PINS {
-        assert_eq!(
-            handed_value(&handed, key),
-            None,
-            "the metrics writer names no wrapper and hands over no {key}: {handed:?}"
-        );
-    }
 }
 
 /// One recorded call: the table it named and the settings it carried.

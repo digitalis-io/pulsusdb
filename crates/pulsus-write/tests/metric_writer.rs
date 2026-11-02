@@ -370,17 +370,13 @@ fn one_bucket_hist(sum: f64) -> NativeHistogram {
 /// 33 + 75 + 28 + 28 + 14 = 178 bytes of buffers. The queue also holds each
 /// row itself, which is the union of all four kinds' columns
 /// (`LANDING_ROW_SLOT_BYTES`), and the block those rows are sealed into
-/// (`landing_block_overhead_bytes`), so the charge is those 178 plus five
-/// rows' slots plus one block's — see
+/// (`landing_block_overhead_bytes`). Since issue #494 part 1b the descriptor
+/// is a block of its own, so the push is charged those 178 plus five rows'
+/// slots plus two blocks' ([`mixed_push_block_charges`]) — see
 /// `a_landing_row_is_charged_the_row_the_queue_holds` and
 /// `the_charge_covers_everything_a_queued_block_holds`.
 const MIXED_PUSH_ROWS: u64 = 5;
 const MIXED_PUSH_BUFFER_BYTES: u64 = 178;
-fn mixed_push_bytes() -> u64 {
-    MIXED_PUSH_BUFFER_BYTES
-        + MIXED_PUSH_ROWS * LANDING_ROW_SLOT_BYTES
-        + landing_block_overhead_bytes::<MetricLandingRow>()
-}
 
 fn mixed_push(unix_milli: i64, updated_ns: i64, with_descriptor: bool) -> ParsedMetrics {
     let mut out = ParsedMetrics {
@@ -455,10 +451,10 @@ fn the_activity_bucket_is_one_hour() {
 // -- one push, one block ----------------------------------------------
 
 /// A push of 2 float samples and 1 histogram sample on one unregistered
-/// series in one activity bucket, plus 1 new descriptor, is **exactly one**
-/// insert of 6 rows into `metric_landing`: 2 kind-0, 1 kind-1, 2 kind-2 (the
-/// series registers at both value types) and 1 kind-3, every row carrying one
-/// `received_ms` taken inside the push.
+/// series in one activity bucket is **exactly one** insert of 5 rows into
+/// `metric_landing`: 2 kind-0, 1 kind-1 and 2 kind-2 (the series registers
+/// at both value types), every row carrying one `received_ms` taken inside
+/// the push.
 ///
 /// Then an empty push makes no block and no insert at all and is answered a
 /// success.
@@ -491,13 +487,6 @@ async fn one_push_is_one_insert_into_the_landing_table() {
             histogram: one_bucket_hist(5.0),
         }],
         series: vec![series_ref("m", 1)],
-        metadata: vec![MetricMetadata {
-            metric_name: Arc::from("m"),
-            metric_type: "counter".to_string(),
-            help: "h".to_string(),
-            unit: "s".to_string(),
-            updated_ns: 7,
-        }],
         ..Default::default()
     };
 
@@ -514,8 +503,8 @@ async fn one_push_is_one_insert_into_the_landing_table() {
     assert_eq!(inserter.call_count(), 1, "one push is one insert");
     assert_eq!(inserter.tables(), vec![LANDING.to_string()]);
     let rows = inserter.rows_of(0);
-    assert_eq!(rows.len(), 6, "2 kind-0 + 1 kind-1 + 2 kind-2 + 1 kind-3");
-    assert_eq!(kinds(&rows), vec![0, 0, 1, 2, 2, 3]);
+    assert_eq!(rows.len(), 5, "2 kind-0 + 1 kind-1 + 2 kind-2");
+    assert_eq!(kinds(&rows), vec![0, 0, 1, 2, 2]);
     let stamps: Vec<i64> = rows
         .iter()
         .map(|r| {
@@ -557,8 +546,8 @@ async fn one_push_is_one_insert_into_the_landing_table() {
 }
 
 /// An insert never carries two pushes: two pushes differing in `unix_milli`
-/// give two calls, each carrying its own push's rows and its own minted
-/// token.
+/// give two calls, each carrying its own push's rows and its own token —
+/// the tokens differ because the contents differ (issue #494 part 1b).
 #[tokio::test]
 async fn two_pushes_are_two_inserts() {
     let cfg = WriterConfig {
@@ -1520,6 +1509,12 @@ async fn an_empty_push_is_a_success_at_the_smallest_accepted_byte_limits() {
 async fn a_push_at_a_ceiling_is_refused_whole() {
     let root = spool_root("ceiling");
 
+    // The push makes two blocks, its content and its descriptor (issue #494
+    // part 1b), and the byte ceiling is over both.
+    let two_blocks = {
+        let (content, descriptor) = mixed_push_block_charges(0);
+        content + descriptor
+    };
     // The row ceiling. A row count over kind-0 only would be 1, under any
     // ceiling, and the push would be admitted.
     let cfg = WriterConfig {
@@ -1541,7 +1536,7 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
         AdmitRefusal::PushTooLarge {
             rows: MIXED_PUSH_ROWS,
             row_limit: MIXED_PUSH_ROWS,
-            bytes: mixed_push_bytes(),
+            bytes: two_blocks,
             byte_limit: 16 * 1024 * 1024,
         }
     );
@@ -1584,7 +1579,7 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
     // The byte ceiling, at the push's own estimate and one below it. A byte
     // total omitting any one of the four estimators lands under the limit and is
     // admitted where it must be refused.
-    for (limit, refused) in [(mixed_push_bytes(), false), (mixed_push_bytes() - 1, true)] {
+    for (limit, refused) in [(two_blocks, false), (two_blocks - 1, true)] {
         let cfg = WriterConfig {
             batch_bytes: ByteSize(limit),
             ..Default::default()
@@ -1604,7 +1599,7 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
                 AdmitRefusal::PushTooLarge {
                     rows: MIXED_PUSH_ROWS,
                     row_limit: 1_048_576,
-                    bytes: mixed_push_bytes(),
+                    bytes: two_blocks,
                     byte_limit: limit,
                 }
             );
@@ -1617,7 +1612,8 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
                 .await
                 .expect("settles")
                 .expect("commits");
-            assert_eq!(inserter.call_count(), 1);
+            wait_for(|| inserter.call_count() == 2).await;
+            assert_eq!(inserter.call_count(), 2, "its two blocks");
         }
         writer.shutdown(Duration::from_secs(2)).await;
     }
@@ -1762,9 +1758,15 @@ async fn an_exemplar_registers_its_series_in_its_own_bucket() {
 #[tokio::test]
 async fn the_queue_charge_covers_the_landing_rows_it_holds() {
     let root = spool_root("queue-charge");
+    // The push is two blocks, its content and its descriptor (issue #494 part
+    // 1b): each is charged its own rows and one block's overhead.
+    let two_blocks = {
+        let (content, descriptor) = mixed_push_block_charges(0);
+        content + descriptor
+    };
     // One byte under the push's own charge, so the refusal reports it.
     let cfg = WriterConfig {
-        batch_bytes: ByteSize(mixed_push_bytes() - 1),
+        batch_bytes: ByteSize(two_blocks - 1),
         ..Default::default()
     };
     let inserter = MockInserter::always(Act::Ok);
@@ -1775,7 +1777,9 @@ async fn the_queue_charge_covers_the_landing_rows_it_holds() {
             mixed_push(1_000, 1, true),
             PushHeaders::default(),
         )
-        .expect_err("one byte under its own charge");
+        .err();
+    assert!(err.is_some(), "refused one byte under its own charge");
+    let Some(err) = err else { unreachable!() };
     let AdmitRefusal::PushTooLarge { rows, bytes, .. } = err else {
         panic!("expected PushTooLarge, got {err:?}");
     };
@@ -1788,9 +1792,9 @@ async fn the_queue_charge_covers_the_landing_rows_it_holds() {
     );
     assert_eq!(
         bytes,
-        MIXED_PUSH_BUFFER_BYTES + held + landing_block_overhead_bytes::<MetricLandingRow>(),
-        "the charge is the buffers, the rows that hold them, and the block they are \
-         sealed into"
+        MIXED_PUSH_BUFFER_BYTES + held + 2 * landing_block_overhead_bytes::<MetricLandingRow>(),
+        "the charge is the buffers, the rows that hold them, and the two blocks they \
+         are sealed into"
     );
 
     // The held figure is also what a successful push releases, so the two
@@ -1808,7 +1812,8 @@ async fn the_queue_charge_covers_the_landing_rows_it_holds() {
         .await
         .expect("settles")
         .expect("commits");
-    assert_eq!(writer.metrics().landing.bytes_total, mixed_push_bytes());
+    wait_for(|| writer.metrics().queue_bytes == 0).await;
+    assert_eq!(writer.metrics().landing.bytes_total, two_blocks);
     assert_eq!(writer.metrics().queue_bytes, 0);
     writer.shutdown(Duration::from_secs(2)).await;
 
@@ -1981,7 +1986,7 @@ fn a_failed_blocks_reservation_is_held_until_its_spool_copy_is_written() {
         let wait = writer
             .admit_flush(
                 &no_tenant(),
-                mixed_push(1_000, 1, true),
+                mixed_push(1_000, 1, false),
                 PushHeaders::default(),
             )
             .expect("queue has room");
@@ -1990,7 +1995,7 @@ fn a_failed_blocks_reservation_is_held_until_its_spool_copy_is_written() {
         settle_until(|| false).await;
         assert_eq!(
             writer.metrics().queue_bytes,
-            mixed_push_bytes(),
+            mixed_push_block_charges(0).0,
             "the reservation must still be charged while the spool copy is \
              being built and written"
         );
@@ -2046,14 +2051,19 @@ async fn a_suppressed_copy_of_an_oversized_push_stores_nothing() {
     // One resident registration, so the eviction below is the only thing that
     // changes what the identical copy computes.
     runtime.lru_capacity = 1;
-    // Call 0 registers `m`; call 1 is push A, held; call 2 is the second
-    // series, which commits and evicts.
-    let inserter = MockInserter::new(vec![
-        Step::now(Act::Ok),
-        Step::now(Act::Hang),
-        Step::now(Act::Ok),
-    ]);
-    let writer = writer_at(runtime, inserter.clone());
+    // Answers by the block it is handed (issue #494 part 1b: a push's
+    // descriptors are a block of their own): A's content block hangs, a block
+    // of descriptors alone is refused, so `D` stays due, and any other block
+    // commits.
+    let inserter = Arc::new(ByRows {
+        calls: AtomicUsize::new(0),
+    });
+    let writer = MetricWriter::with_landing_inserter_and_runtime(
+        inserter.clone(),
+        runtime,
+        BUCKET_MS,
+        MetricWriterTables::metrics_default(),
+    );
 
     // Register `m` in the LRU: 1 sample + 1 registration = 2 rows.
     let wait = writer
@@ -2069,8 +2079,9 @@ async fn a_suppressed_copy_of_an_oversized_push_stores_nothing() {
         .expect("commits");
 
     // Push A: the same series in the same bucket, so no registration row —
-    // 1 sample + 1 descriptor = 2 rows, under the ceiling of 4. Its insert
-    // hangs, so its claim stays open.
+    // 1 sample + 1 descriptor = 2 rows, under the ceiling of 3. Its content
+    // block hangs, so its claim stays open; its descriptor block is refused
+    // and filed in `poison/`, which frees the other worker.
     let mut a = batch_for("m", 1, 1_001, true);
     a.metadata.push(MetricMetadata {
         metric_name: Arc::from("m"),
@@ -2082,9 +2093,14 @@ async fn a_suppressed_copy_of_an_oversized_push_stores_nothing() {
     writer
         .admit(&no_tenant(), a.clone(), PushHeaders::default())
         .expect("2 rows fit");
-    settle_until(|| inserter.call_count() == 2).await;
+    wait_for(|| spool_records(&root, "poison").len() == 1).await;
+    assert_eq!(
+        spool_records(&root, "poison").len(),
+        1,
+        "A's descriptor block"
+    );
 
-    // A second series commits on the other worker and evicts `m`'s key.
+    // A second series commits on the freed worker and evicts `m`'s key.
     let wait = writer
         .admit_flush(
             &no_tenant(),
@@ -2096,15 +2112,19 @@ async fn a_suppressed_copy_of_an_oversized_push_stores_nothing() {
         .await
         .expect("settles")
         .expect("commits");
-    assert_eq!(inserter.call_count(), 3, "the register, A, and the evictor");
+    assert_eq!(
+        inserter.calls.load(Ordering::SeqCst),
+        4,
+        "the register, A's two blocks, and the evictor"
+    );
 
     // A's identical copy: the index recognises it as a repeat, and it now
     // needs its registration row again — 1 sample + 1 registration + 1
-    // descriptor = 3 rows, which is AT the ceiling of 3, so it does not fit
-    // one block and must be refused whole rather than landing its descriptor.
+    // descriptor = 3 rows, which is AT the ceiling of 3, so it must be refused
+    // whole rather than landing its descriptor.
     let before_queue = writer.metrics().queue_bytes;
     let result = writer.admit(&no_tenant(), a, PushHeaders::default());
-    let err = result.expect_err("the copy no longer fits one block");
+    let err = result.expect_err("the copy is over the row ceiling");
     match err {
         AdmitRefusal::PushTooLarge {
             rows,
@@ -2119,8 +2139,8 @@ async fn a_suppressed_copy_of_an_oversized_push_stores_nothing() {
         other => panic!("expected PushTooLarge, got {other:?}"),
     }
     assert_eq!(
-        inserter.call_count(),
-        3,
+        inserter.calls.load(Ordering::SeqCst),
+        4,
         "the suppressed copy queued no descriptor block of its own"
     );
     assert_eq!(
@@ -2131,6 +2151,47 @@ async fn a_suppressed_copy_of_an_oversized_push_stores_nothing() {
 
     writer.shutdown(Duration::from_millis(10)).await;
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// A `BlockInserter` that answers by the rows it is handed: a block holding
+/// a kind-0 row at `unix_milli` 1,001 hangs, a block of kind-3 rows alone is
+/// refused as not stored, and any other block commits.
+struct ByRows {
+    calls: AtomicUsize,
+}
+
+impl BlockInserter<MetricLandingRow> for ByRows {
+    fn insert<'a>(
+        &'a self,
+        table: &'a str,
+        rows: &'a [MetricLandingRow],
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+        self.insert_with(table, rows, &QUERY_SETTINGS_NONE)
+    }
+
+    fn insert_with<'a>(
+        &'a self,
+        _table: &'a str,
+        rows: &'a [MetricLandingRow],
+        _extra: &'a QuerySettings,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let hang = rows
+            .iter()
+            .any(|r| r.kind == MetricLandingRow::KIND_FLOAT && r.unix_milli == 1_001);
+        let poison = rows
+            .iter()
+            .all(|r| r.kind == MetricLandingRow::KIND_METADATA);
+        Box::pin(async move {
+            if hang {
+                std::future::pending::<()>().await;
+            }
+            if poison {
+                return Err(ChError::Decode("mock poison".to_string()));
+            }
+            Ok(())
+        })
+    }
 }
 
 /// The refusal's message is rendered from the push's own four numbers.
@@ -2153,6 +2214,9 @@ async fn push_and_commit(writer: &MetricWriter, batch: ParsedMetrics) {
         .await
         .expect("settles")
         .expect("commits");
+    // The answer waits for the content block only; a descriptor block may
+    // still be in flight (issue #494 part 1b).
+    wait_for(|| writer.metrics().queue_bytes == 0).await;
 }
 
 /// The hour a descriptor's resend is keyed on, from the wall clock.
@@ -2195,13 +2259,19 @@ async fn a_descriptor_is_sent_only_when_it_changes() {
             continue;
         }
 
-        let sent: Vec<(usize, String, i64)> = (0..6)
+        // A push with a descriptor due is two inserts, its content block and
+        // its descriptor block; one with none due is one (issue #494 part 1b).
+        assert_eq!(
+            inserter.call_count(),
+            8,
+            "two pushes of two inserts, four of one"
+        );
+        let sent: Vec<(String, i64)> = (0..inserter.call_count())
             .flat_map(|call| {
                 rows_of_kind(&inserter.rows_of(call), 3)
                     .into_iter()
                     .map(|d| {
                         (
-                            call,
                             d["metric_type"].as_str().expect("a type").to_string(),
                             d["updated_ns"].as_i64().expect("a version"),
                         )
@@ -2211,7 +2281,7 @@ async fn a_descriptor_is_sent_only_when_it_changes() {
             .collect();
         assert_eq!(
             sent,
-            vec![(0, "gauge".to_string(), 1), (3, "counter".to_string(), 4)],
+            vec![("gauge".to_string(), 1), ("counter".to_string(), 4)],
             "only a changed descriptor is sent again within the hour"
         );
         assert_eq!(writer.metrics().metadata_upserts_total, 2);
@@ -2222,27 +2292,33 @@ async fn a_descriptor_is_sent_only_when_it_changes() {
 
 /// **A descriptor whose block did not commit is sent again.** The cache is
 /// promoted at the commit, as the series cache is: a refused insert records
-/// nothing, so the next push carrying the same descriptor lands it.
+/// nothing, so the next push carrying the same descriptor lands it. Each push
+/// is two inserts, its content block then its descriptor block (issue #494
+/// part 1b); the first push's descriptor block is refused, and the push is
+/// answered by its content block's success.
 #[tokio::test]
 async fn a_descriptor_whose_block_failed_is_sent_again() {
     for _attempt in 0..2 {
         let hour = descriptor_hour();
-        let cfg = WriterConfig::default();
+        let cfg = WriterConfig {
+            metrics_landing_inserters: 1,
+            ..Default::default()
+        };
         let root = spool_root("descriptors-failed");
-        let inserter = MockInserter::new(vec![Step::now(Act::Poison), Step::now(Act::Ok)]);
+        let inserter = MockInserter::new(vec![
+            Step::now(Act::Ok),
+            Step::now(Act::Poison),
+            Step::now(Act::Ok),
+        ]);
         let writer = writer_with(&cfg, &root, inserter.clone());
 
-        let wait = writer
-            .admit_flush(
-                &no_tenant(),
-                mixed_push(1_000, 1, true),
-                PushHeaders::default(),
-            )
-            .expect("queue has room");
-        let failed = tokio::time::timeout(Duration::from_secs(5), wait)
-            .await
-            .expect("settles");
-        assert!(failed.is_err(), "the first insert is refused");
+        push_and_commit(&writer, mixed_push(1_000, 1, true)).await;
+        assert_eq!(inserter.call_count(), 2, "the push's two blocks");
+        assert_eq!(
+            kinds(&inserter.rows_of(1)),
+            vec![3],
+            "the refused insert is the descriptor block"
+        );
         push_and_commit(&writer, mixed_push(1_001, 2, true)).await;
         writer.shutdown(Duration::from_secs(2)).await;
         std::fs::remove_dir_all(&root).ok();
@@ -2250,8 +2326,9 @@ async fn a_descriptor_whose_block_failed_is_sent_again() {
             continue;
         }
 
-        let second = inserter.rows_of(1);
-        let descriptors = rows_of_kind(&second, 3);
+        assert_eq!(inserter.call_count(), 4, "two pushes of two inserts");
+        let fourth = inserter.rows_of(3);
+        let descriptors = rows_of_kind(&fourth, 3);
         assert_eq!(
             descriptors.len(),
             1,
@@ -2345,8 +2422,13 @@ async fn every_landing_column_is_the_value_its_kind_was_built_from() {
         .await
         .expect("settles")
         .expect("commits");
-    let rows = inserter.rows_of(0);
-    assert_eq!(kinds(&rows), vec![0, 1, 2, 2, 3, 4]);
+    // Two inserts: the content block and the descriptor block (issue #494
+    // part 1b).
+    wait_for(|| inserter.call_count() == 2 && writer.metrics().queue_bytes == 0).await;
+    let rows = inserter.rows_of(calls_holding(&inserter, 0)[0]);
+    assert_eq!(kinds(&rows), vec![0, 1, 2, 2, 4]);
+    let descriptor_rows = inserter.rows_of(calls_holding(&inserter, 3)[0]);
+    assert_eq!(kinds(&descriptor_rows), vec![3]);
 
     let float = rows_of_kind(&rows, 0)[0];
     assert_eq!(float["metric_name"].as_str(), Some("m0"));
@@ -2423,7 +2505,7 @@ async fn every_landing_column_is_the_value_its_kind_was_built_from() {
         assert_eq!(row["value"].as_f64(), Some(0.0));
     }
 
-    let descriptor = rows_of_kind(&rows, 3)[0];
+    let descriptor = rows_of_kind(&descriptor_rows, 3)[0];
     assert_eq!(descriptor["metric_name"].as_str(), Some("m3"));
     assert_eq!(descriptor["metric_type"].as_str(), Some("counter"));
     assert_eq!(descriptor["help"].as_str(), Some("h"), "help is not unit");
@@ -2482,17 +2564,23 @@ async fn the_inserter_count_bounds_concurrent_inserts() {
 /// what was reserved.
 #[tokio::test]
 async fn the_queue_byte_allowance_is_aggregate_across_pushes() {
+    // Each push is two blocks, its content and its descriptor (issue #494
+    // part 1b).
+    let two_blocks = {
+        let (content, descriptor) = mixed_push_block_charges(0);
+        content + descriptor
+    };
     let cfg = WriterConfig {
         metrics_landing_inserters: 1,
         // Exactly three of the mixed push.
-        ingest_queue_bytes: ByteSize(mixed_push_bytes() * 3),
+        ingest_queue_bytes: ByteSize(two_blocks * 3),
         ..Default::default()
     };
     let root = spool_root("aggregate-bytes");
     let inserter = MockInserter::always(Act::Gate);
     let writer = writer_with(&cfg, &root, inserter.clone());
 
-    // Each push costs mixed_push_bytes(): the held insert never promotes the series LRU,
+    // Each push costs two_blocks: the held insert never promotes the series LRU,
     // so all three emit their two kind-2 rows.
     for unix_milli in [1_000, 1_001, 1_002] {
         writer
@@ -2504,7 +2592,7 @@ async fn the_queue_byte_allowance_is_aggregate_across_pushes() {
             .expect("queue has room for three");
     }
     settle_until(|| inserter.call_count() >= 1).await;
-    assert_eq!(writer.metrics().queue_bytes, mixed_push_bytes() * 3);
+    assert_eq!(writer.metrics().queue_bytes, two_blocks * 3);
 
     let before = writer.metrics();
     let err = writer
@@ -2524,12 +2612,12 @@ async fn the_queue_byte_allowance_is_aggregate_across_pushes() {
     );
     assert_eq!(
         after.queue_bytes,
-        mixed_push_bytes() * 3,
+        two_blocks * 3,
         "the refusal reserved nothing: a reading of four pushes' worth would be the \
          roll-back not happening"
     );
 
-    for _ in 0..3 {
+    for _ in 0..6 {
         inserter.release_one();
     }
     settle_until(|| writer.metrics().queue_bytes == 0).await;
@@ -2538,7 +2626,7 @@ async fn the_queue_byte_allowance_is_aggregate_across_pushes() {
         0,
         "exactly what was reserved is released"
     );
-    assert_eq!(inserter.call_count(), 3);
+    assert_eq!(inserter.call_count(), 6, "three pushes of two inserts");
 
     // The fourth body again: admitted, and the fourth insert call.
     writer
@@ -2548,11 +2636,13 @@ async fn the_queue_byte_allowance_is_aggregate_across_pushes() {
             PushHeaders::default(),
         )
         .expect("queue has room now");
+    // Its descriptor was sent by the three pushes before it, so it is its
+    // content block alone (issue #494 part 1b).
     inserter.release_one();
-    settle_until(|| inserter.call_count() >= 4).await;
+    wait_for(|| inserter.call_count() >= 7).await;
     assert_eq!(
         inserter.call_count(),
-        4,
+        7,
         "a refusal that sealed the claim would make this a suppressed duplicate"
     );
     assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 0);
@@ -2670,15 +2760,19 @@ async fn the_landing_loop_counts_what_it_did() {
         .await
         .expect("settles")
         .expect("commits");
+    // The push is its content block and its descriptor block (issue #494
+    // part 1b).
+    wait_for(|| writer.metrics().queue_bytes == 0).await;
 
     let landing = writer.metrics().landing;
     assert_eq!(landing.rows_total, MIXED_PUSH_ROWS);
-    assert_eq!(landing.bytes_total, mixed_push_bytes());
+    let (content, descriptor) = mixed_push_block_charges(0);
+    assert_eq!(landing.bytes_total, content + descriptor);
     assert_eq!(
-        landing.flushes_total, 1,
-        "one insert per push, not one per row"
+        landing.flushes_total, 2,
+        "one insert per block, not one per row"
     );
-    assert_eq!(landing.flush_latency_count, 1);
+    assert_eq!(landing.flush_latency_count, 2);
     assert!(
         landing.flush_latency_sum_ns >= 5_000_000,
         "the latency covers the insert: {}",
@@ -2695,7 +2789,7 @@ async fn the_landing_loop_counts_what_it_did() {
     writer
         .admit(
             &no_tenant(),
-            mixed_push(1_000, 1, true),
+            mixed_push(1_000, 1, false),
             PushHeaders::default(),
         )
         .expect("queue has room");
@@ -2710,7 +2804,7 @@ async fn the_landing_loop_counts_what_it_did() {
     let wait = writer
         .admit_flush(
             &no_tenant(),
-            mixed_push(1_000, 1, true),
+            mixed_push(1_000, 1, false),
             PushHeaders::default(),
         )
         .expect("queue has room");
@@ -2745,7 +2839,7 @@ async fn a_failed_spool_write_is_counted_and_changes_no_outcome() {
     let wait = writer
         .admit_flush(
             &no_tenant(),
-            mixed_push(1_000, 1, true),
+            mixed_push(1_000, 1, false),
             PushHeaders::default(),
         )
         .expect("queue has room");
@@ -3031,5 +3125,927 @@ async fn a_metric_block_queued_when_the_drain_begins_is_sent_inside_the_grace() 
     assert_eq!(spool_records(&root, "poison").len(), 0);
     assert_eq!(spool_records(&root, "uncertain").len(), 0);
     assert_eq!(writer.metrics().queue_bytes, 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// -- issue #494 part 1b: the content token, two blocks, the claim ------
+
+/// A tenant named `name`, as `X-Scope-OrgID: name` gives it.
+fn tenant_named(name: &str) -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(
+        Some(&axum::http::HeaderValue::from_str(name).expect("a header value")),
+        false,
+    )
+    .expect("a valid tenant")
+}
+
+/// `P`: one float sample at `unix_milli` of series `m` (fingerprint 1,
+/// unregistered) and one `gauge` descriptor with help `help`.
+fn p_push(unix_milli: i64, value: f64, help: &str) -> ParsedMetrics {
+    let mut out = batch_for("m", 1, unix_milli, true);
+    out.samples[0].value = value;
+    out.metadata.push(MetricMetadata {
+        metric_name: Arc::from("m"),
+        metric_type: "gauge".to_string(),
+        help: help.to_string(),
+        unit: String::new(),
+        updated_ns: 7,
+    });
+    out
+}
+
+/// Whether a recorded call's rows hold a row of `kind`.
+fn holds_kind(rows: &[serde_json::Value], kind: u64) -> bool {
+    rows.iter().any(|r| r["kind"].as_u64() == Some(kind))
+}
+
+/// The indices of `inserter`'s calls whose rows hold a row of `kind`.
+fn calls_holding(inserter: &MockInserter, kind: u64) -> Vec<usize> {
+    (0..inserter.call_count())
+        .filter(|&c| holds_kind(&inserter.rows_of(c), kind))
+        .collect()
+}
+
+/// The token of `inserter`'s content block: the one call whose rows hold a
+/// kind-0 row.
+fn content_token(inserter: &MockInserter) -> String {
+    let calls = calls_holding(inserter, 0);
+    assert_eq!(calls.len(), 1, "one content block: {calls:?}");
+    token_of(&inserter.settings_of(calls[0]))
+}
+
+/// `m` followed by 32 lowercase hex digits: the content token's form.
+fn is_content_token(token: &str) -> bool {
+    token.len() == 33
+        && token.starts_with('m')
+        && token[1..]
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+/// The minted token's form: 36 characters, `-` at 8, 13, 18 and 23.
+fn is_minted_token(token: &str) -> bool {
+    let b = token.as_bytes();
+    b.len() == 36 && [8, 13, 18, 23].iter().all(|&i| b[i] == b'-')
+}
+
+/// Waits, in wall-clock time, until `done` holds or five seconds pass.
+async fn wait_for(mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !done() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Admits `batch` synchronously and returns its answer.
+async fn answer_of(
+    writer: &MetricWriter,
+    tenant: &pulsus_model::Tenant,
+    batch: ParsedMetrics,
+    headers: PushHeaders,
+) -> Result<(), String> {
+    let wait = writer
+        .admit_flush(tenant, batch, headers)
+        .map_err(|e| format!("refused: {e:?}"))?;
+    tokio::time::timeout(Duration::from_secs(10), wait)
+        .await
+        .expect("the push is answered")
+        .map_err(|e| e.to_string())
+}
+
+/// **2-U6 (issue #494 part 1b): a metrics push's content block carries a
+/// token derived from its tenant and content.** Seven writers, one push
+/// each: the same content gives one token whatever its `Idempotency-Key` or
+/// its descriptor's help; a changed value or another tenant gives another.
+/// No content block holds a descriptor.
+#[tokio::test]
+async fn the_content_token_follows_the_tenant_and_the_content() {
+    let keyed = |k: &str| PushHeaders {
+        idempotency_key: Some(k.to_string()),
+        declared_retry: false,
+    };
+    let cases: Vec<(pulsus_model::Tenant, ParsedMetrics, PushHeaders)> = vec![
+        (no_tenant(), p_push(1_000, 1.0, "h"), PushHeaders::default()),
+        (no_tenant(), p_push(1_000, 1.0, "h"), PushHeaders::default()),
+        (no_tenant(), p_push(1_000, 2.0, "h"), PushHeaders::default()),
+        (
+            tenant_named("t2"),
+            p_push(1_000, 1.0, "h"),
+            PushHeaders::default(),
+        ),
+        (no_tenant(), p_push(1_000, 1.0, "h"), keyed("a")),
+        (no_tenant(), p_push(1_000, 1.0, "h"), keyed("b")),
+        (
+            no_tenant(),
+            p_push(1_000, 1.0, "another help"),
+            PushHeaders::default(),
+        ),
+    ];
+    let mut tokens = Vec::new();
+    for (i, (tenant, batch, headers)) in cases.into_iter().enumerate() {
+        let root = spool_root(&format!("content-token-{i}"));
+        let inserter = MockInserter::always(Act::Ok);
+        let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
+        answer_of(&writer, &tenant, batch, headers)
+            .await
+            .expect("the push commits");
+        writer.shutdown(Duration::from_secs(2)).await;
+        for call in calls_holding(&inserter, 0) {
+            assert!(
+                !holds_kind(&inserter.rows_of(call), 3),
+                "writer {i}: no content block holds a descriptor"
+            );
+        }
+        tokens.push(content_token(&inserter));
+        std::fs::remove_dir_all(&root).ok();
+    }
+    let same = &tokens[0];
+    assert!(is_content_token(same), "the content token's form: {same}");
+    for i in [1usize, 4, 5, 6] {
+        assert_eq!(&tokens[i], same, "writer {i} sent the same content");
+    }
+    assert_ne!(&tokens[2], same, "a changed value is other content");
+    assert_ne!(&tokens[3], same, "another tenant is another push");
+    assert_ne!(tokens[2], tokens[3]);
+}
+
+/// **2-U7 (issue #494 part 1b): an uncertain metrics claim is released, and
+/// the client's retry is sent under the same token.** Every attempt is
+/// uncertain; the repeat of `P` is admitted, not answered the cached
+/// failure, and its content block carries the first push's token.
+#[tokio::test]
+async fn an_uncertain_metrics_push_is_admitted_again_under_its_token() {
+    let cfg = WriterConfig {
+        metrics_landing_retries: 2,
+        metrics_landing_inserters: 1,
+        ..Default::default()
+    };
+    let root = spool_root("uncertain-again");
+    let inserter = MockInserter::always(Act::Uncertain);
+    let writer = writer_with(&cfg, &root, inserter.clone());
+
+    let first = answer_of(
+        &writer,
+        &no_tenant(),
+        p_push(1_000, 1.0, "h"),
+        PushHeaders::default(),
+    )
+    .await;
+    assert!(first.is_err(), "every attempt was uncertain: {first:?}");
+    wait_for(|| writer.metrics().queue_bytes == 0).await;
+    assert_eq!(
+        calls_holding(&inserter, 0).len(),
+        3,
+        "the content block: three attempts"
+    );
+    assert_eq!(
+        calls_holding(&inserter, 3).len(),
+        3,
+        "the descriptor block: three attempts"
+    );
+    let token = token_of(&inserter.settings_of(calls_holding(&inserter, 0)[0]));
+    let duplicates = writer.metrics().dedup.duplicate_pushes_total;
+
+    let second = answer_of(
+        &writer,
+        &no_tenant(),
+        p_push(1_000, 1.0, "h"),
+        PushHeaders::default(),
+    )
+    .await;
+    assert!(
+        second.is_err(),
+        "the retry's attempts were uncertain too: {second:?}"
+    );
+    wait_for(|| writer.metrics().queue_bytes == 0).await;
+    let content = calls_holding(&inserter, 0);
+    assert_eq!(content.len(), 6, "the retry was admitted and sent");
+    assert_eq!(calls_holding(&inserter, 3).len(), 6);
+    for call in &content[3..] {
+        assert_eq!(
+            token_of(&inserter.settings_of(*call)),
+            token,
+            "the retry carries the first push's token"
+        );
+    }
+    assert_eq!(
+        writer.metrics().dedup.duplicate_pushes_total,
+        duplicates,
+        "the retry was not suppressed"
+    );
+    writer.shutdown(Duration::from_secs(2)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// One gauge point at `ts_ns`, as an OTLP export request.
+fn otlp_one_gauge(
+    ts_ns: u64,
+) -> opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
+    use opentelemetry_proto::tonic::metrics::v1::{
+        Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point,
+    };
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(Value::StringValue("api".to_string())),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "temperature".to_string(),
+                    description: "how warm".to_string(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: ts_ns,
+                            value: Some(number_data_point::Value::AsDouble(21.5)),
+                            ..Default::default()
+                        }],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+/// **2-U8 (issue #494 part 1b): one OTLP request carries one token, whichever
+/// encoding arrived.** The protobuf and the JSON form of one request, each
+/// decoded and parsed as the route does and admitted to its own writer.
+#[tokio::test]
+async fn one_request_in_either_encoding_carries_one_token() {
+    use prost::Message;
+    use pulsus_write::protocols::otlp_metrics::{self, MetricIngestSettings};
+    let now_ns = epoch_millis() * 1_000_000;
+    let req = otlp_one_gauge((now_ns - 60_000_000_000) as u64);
+    let via_pb = otlp_metrics::decode(&req.encode_to_vec()).expect("protobuf decodes");
+    let via_json = otlp_metrics::decode_json(&serde_json::to_vec(&req).expect("serialize"))
+        .expect("JSON decodes");
+    let mut tokens = Vec::new();
+    for (i, decoded) in [via_pb, via_json].into_iter().enumerate() {
+        let batch = otlp_metrics::parse(&decoded, now_ns, MetricIngestSettings::default())
+            .expect("within the expansion budget");
+        assert_eq!(batch.samples.len(), 1, "encoding {i}: one sample");
+        let root = spool_root(&format!("encodings-{i}"));
+        // A recorder of the rows' kinds and the token: a parsed request's
+        // fingerprints are full 128-bit values, which `MockInserter`'s JSON
+        // copy of a row cannot hold.
+        let inserter = Arc::new(TokenRecorder::default());
+        let writer = MetricWriter::with_landing_inserter_and_runtime(
+            inserter.clone(),
+            runtime_at(&WriterConfig::default(), &root),
+            BUCKET_MS,
+            MetricWriterTables::metrics_default(),
+        );
+        answer_of(&writer, &no_tenant(), batch, PushHeaders::default())
+            .await
+            .expect("commits");
+        writer.shutdown(Duration::from_secs(2)).await;
+        let content: Vec<String> = inserter
+            .calls
+            .lock()
+            .expect("mutex")
+            .iter()
+            .filter(|(kinds, _)| kinds.contains(&MetricLandingRow::KIND_FLOAT))
+            .map(|(_, token)| token.clone())
+            .collect();
+        assert_eq!(content.len(), 1, "encoding {i}: one content block");
+        tokens.push(content[0].clone());
+        std::fs::remove_dir_all(&root).ok();
+    }
+    assert_eq!(tokens[0], tokens[1], "protobuf and JSON carry one token");
+}
+
+/// A `BlockInserter` that records each call's row kinds and token, then
+/// answers `Ok`.
+#[derive(Default)]
+struct TokenRecorder {
+    calls: Mutex<Vec<(Vec<u8>, String)>>,
+}
+
+impl BlockInserter<MetricLandingRow> for TokenRecorder {
+    fn insert<'a>(
+        &'a self,
+        table: &'a str,
+        rows: &'a [MetricLandingRow],
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+        self.insert_with(table, rows, &QUERY_SETTINGS_NONE)
+    }
+
+    fn insert_with<'a>(
+        &'a self,
+        _table: &'a str,
+        rows: &'a [MetricLandingRow],
+        extra: &'a QuerySettings,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+        let token = extra
+            .get("insert_deduplication_token")
+            .unwrap_or_default()
+            .to_string();
+        self.calls
+            .lock()
+            .expect("mutex")
+            .push((rows.iter().map(|r| r.kind).collect(), token));
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// **2-U9 (issue #494 part 1b): a push's descriptors go in a block of their
+/// own, under a minted token.** `P` is two inserts: its content block, under
+/// the content token and with no descriptor, and its descriptor block, `D`
+/// alone, under a minted token. The suppressed repeat, after the cache is
+/// forgotten, sends `D` alone under another minted token. A push of
+/// descriptors alone is one insert and is answered by it.
+#[tokio::test]
+async fn a_pushs_descriptors_go_in_a_block_of_their_own() {
+    let root = spool_root("descriptor-block");
+    let inserter = MockInserter::always(Act::Ok);
+    let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
+    answer_of(
+        &writer,
+        &no_tenant(),
+        p_push(1_000, 1.0, "h"),
+        PushHeaders::default(),
+    )
+    .await
+    .expect("commits");
+    wait_for(|| inserter.call_count() == 2 && writer.metrics().queue_bytes == 0).await;
+    assert_eq!(inserter.call_count(), 2, "P is two inserts");
+    let content = calls_holding(&inserter, 0);
+    let descriptor = calls_holding(&inserter, 3);
+    assert_eq!(content.len(), 1);
+    assert_eq!(descriptor.len(), 1);
+    assert_ne!(
+        content, descriptor,
+        "the descriptor rides a block of its own"
+    );
+    assert!(is_content_token(&token_of(
+        &inserter.settings_of(content[0])
+    )));
+    assert_eq!(kinds(&inserter.rows_of(descriptor[0])), vec![3], "D alone");
+    let d_token = token_of(&inserter.settings_of(descriptor[0]));
+    assert!(is_minted_token(&d_token), "a minted token: {d_token}");
+
+    writer.forget_sent_descriptors_for_test();
+    answer_of(
+        &writer,
+        &no_tenant(),
+        p_push(1_000, 1.0, "h"),
+        PushHeaders::default(),
+    )
+    .await
+    .expect("the repeat is answered the original's success");
+    wait_for(|| inserter.call_count() == 3 && writer.metrics().queue_bytes == 0).await;
+    assert_eq!(
+        inserter.call_count(),
+        3,
+        "the suppressed repeat sends D alone"
+    );
+    assert_eq!(kinds(&inserter.rows_of(2)), vec![3]);
+    let again = token_of(&inserter.settings_of(2));
+    assert!(
+        is_minted_token(&again) && again != d_token,
+        "another minted token: {again}"
+    );
+    writer.shutdown(Duration::from_secs(2)).await;
+    std::fs::remove_dir_all(&root).ok();
+
+    let root = spool_root("descriptors-alone");
+    let poisoned = MockInserter::always(Act::Poison);
+    let cold = writer_with(&WriterConfig::default(), &root, poisoned.clone());
+    let mut alone = p_push(1_000, 1.0, "h");
+    alone.samples.clear();
+    alone.series.clear();
+    let answer = answer_of(&cold, &no_tenant(), alone, PushHeaders::default()).await;
+    assert_eq!(poisoned.call_count(), 1, "one insert");
+    assert!(
+        answer.is_err(),
+        "answered by its own insert's failure: {answer:?}"
+    );
+    cold.shutdown(Duration::from_secs(2)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **2-U12 (issue #494 part 1b): with the suppression index off, the same
+/// content still carries one token**, so ClickHouse drops the repeat.
+#[tokio::test]
+async fn with_the_index_off_the_same_content_carries_one_token() {
+    let root = spool_root("dedup-off-token");
+    let mut runtime = runtime_at(&WriterConfig::default(), &root);
+    runtime.ingest_dedup = false;
+    let inserter = MockInserter::always(Act::Ok);
+    let writer = writer_at(runtime, inserter.clone());
+    for _ in 0..2 {
+        answer_of(
+            &writer,
+            &no_tenant(),
+            batch_for("m", 1, 1_000, true),
+            PushHeaders::default(),
+        )
+        .await
+        .expect("commits");
+    }
+    assert_eq!(inserter.call_count(), 2, "two inserts");
+    let first = token_of(&inserter.settings_of(0));
+    assert!(
+        is_content_token(&first),
+        "the content token's form: {first}"
+    );
+    assert_eq!(token_of(&inserter.settings_of(1)), first, "one token");
+    writer.shutdown(Duration::from_secs(2)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **2-U14 (iii), the writer's half (issue #494 part 1b): what is not a row
+/// is not the content.** Two writers admitting pushes that differ only in
+/// their rejected points, rejection message and collisions send one token.
+#[tokio::test]
+async fn rejections_and_collisions_are_not_the_content() {
+    let mut tokens = Vec::new();
+    for (i, (rejected, message, collisions)) in [
+        (0u64, None, 0u64),
+        (3, Some("three dropped".to_string()), 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut batch = batch_for("m", 1, 1_000, true);
+        batch.rejected = rejected;
+        batch.rejected_message = message;
+        batch.collisions = collisions;
+        let root = spool_root(&format!("not-content-{i}"));
+        let inserter = MockInserter::always(Act::Ok);
+        let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
+        answer_of(&writer, &no_tenant(), batch, PushHeaders::default())
+            .await
+            .expect("commits");
+        writer.shutdown(Duration::from_secs(2)).await;
+        tokens.push(content_token(&inserter));
+        std::fs::remove_dir_all(&root).ok();
+    }
+    assert_eq!(tokens[0], tokens[1]);
+}
+
+/// A `BlockInserter` that parks each call on the gate its rows choose — the
+/// descriptor gate for a block holding a kind-3 row, the content gate for any
+/// other — then answers the next step of its script (the last repeating).
+struct KindGated {
+    content: tokio::sync::Semaphore,
+    descriptor: tokio::sync::Semaphore,
+    script: Vec<Act>,
+    calls: AtomicUsize,
+    kinds: Mutex<Vec<Vec<u8>>>,
+}
+
+impl KindGated {
+    fn new(script: Vec<Act>) -> Arc<Self> {
+        Arc::new(KindGated {
+            content: tokio::sync::Semaphore::new(0),
+            descriptor: tokio::sync::Semaphore::new(0),
+            script,
+            calls: AtomicUsize::new(0),
+            kinds: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn kinds_of(&self, call: usize) -> Vec<u8> {
+        self.kinds.lock().expect("mutex")[call].clone()
+    }
+}
+
+impl BlockInserter<MetricLandingRow> for KindGated {
+    fn insert<'a>(
+        &'a self,
+        table: &'a str,
+        rows: &'a [MetricLandingRow],
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+        self.insert_with(table, rows, &QUERY_SETTINGS_NONE)
+    }
+
+    fn insert_with<'a>(
+        &'a self,
+        _table: &'a str,
+        rows: &'a [MetricLandingRow],
+        _extra: &'a QuerySettings,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut k: Vec<u8> = rows.iter().map(|r| r.kind).collect();
+        k.sort_unstable();
+        let descriptor = k.contains(&MetricLandingRow::KIND_METADATA);
+        self.kinds.lock().expect("mutex").push(k);
+        let act = *self
+            .script
+            .get(call)
+            .or_else(|| self.script.last())
+            .expect("a script");
+        Box::pin(async move {
+            let gate = if descriptor {
+                &self.descriptor
+            } else {
+                &self.content
+            };
+            gate.acquire().await.expect("never closed").forget();
+            match act {
+                Act::Ok => Ok(()),
+                Act::Uncertain => Err(ChError::InsertUncertain("mock uncertain".to_string())),
+                Act::Poison => Err(ChError::Decode("mock poison".to_string())),
+                other => panic!("KindGated does not script {other:?}"),
+            }
+        })
+    }
+}
+
+static QUERY_SETTINGS_NONE: std::sync::LazyLock<QuerySettings> =
+    std::sync::LazyLock::new(QuerySettings::new);
+
+/// What [`mixed_push`]'s two blocks are charged under a two-byte tenant: its
+/// content block holds four rows (164 bytes of buffers), its descriptor
+/// block one (the descriptor's 14), each with one block's overhead and the
+/// tenant's bytes: the buffers, the rows that hold them, and the block.
+fn mixed_push_block_charges(tenant_bytes: u64) -> (u64, u64) {
+    let overhead = landing_block_overhead_bytes::<MetricLandingRow>();
+    (
+        164 + 4 * LANDING_ROW_SLOT_BYTES + overhead + tenant_bytes,
+        14 + LANDING_ROW_SLOT_BYTES + overhead + tenant_bytes,
+    )
+}
+
+/// **2-U15 (issue #494 part 1b): each block is charged its own rows and the
+/// tenant string, and releases its own charge when it settles**, in either
+/// order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_block_releases_its_own_charge() {
+    let (content, descriptor) = mixed_push_block_charges(2);
+    for content_first in [true, false] {
+        let root = spool_root("own-charge");
+        let mut runtime = runtime_at(&WriterConfig::default(), &root);
+        runtime.metrics_landing_inserters = 2;
+        let inserter = KindGated::new(vec![Act::Ok]);
+        let writer = MetricWriter::with_landing_inserter_and_runtime(
+            inserter.clone(),
+            runtime,
+            BUCKET_MS,
+            MetricWriterTables::metrics_default(),
+        );
+        writer
+            .admit(
+                &tenant_named("t1"),
+                mixed_push(1_000, 7, true),
+                PushHeaders::default(),
+            )
+            .expect("admitted");
+        wait_for(|| inserter.call_count() == 2).await;
+        let (first, left) = if content_first {
+            inserter.content.add_permits(1);
+            (content, descriptor)
+        } else {
+            inserter.descriptor.add_permits(1);
+            (descriptor, content)
+        };
+        let full = writer.metrics().queue_bytes;
+        wait_for(|| writer.metrics().queue_bytes != full).await;
+        assert_eq!(
+            writer.metrics().queue_bytes,
+            left,
+            "content first {content_first}: the parked block's charge alone is held \
+             (the settled one released {first})"
+        );
+        inserter.content.add_permits(1);
+        inserter.descriptor.add_permits(1);
+        wait_for(|| writer.metrics().queue_bytes == 0).await;
+        assert_eq!(writer.metrics().queue_bytes, 0);
+        writer.shutdown(Duration::from_secs(2)).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// **2-U16 (issue #494 part 1b): a push is admitted only if both its blocks
+/// fit, and a refused push reserves nothing.** It cannot tell one reservation
+/// of the sum from two with a rollback; the code review checks the single
+/// reservation.
+#[tokio::test]
+async fn a_push_is_admitted_only_if_both_blocks_fit() {
+    let (content, descriptor) = mixed_push_block_charges(2);
+    for (limit, admitted) in [
+        (content + descriptor - 1, false),
+        (content + descriptor, true),
+    ] {
+        let root = spool_root("both-fit");
+        let mut runtime = runtime_at(&WriterConfig::default(), &root);
+        runtime.queue_bytes_limit = limit;
+        let inserter = MockInserter::always(Act::Ok);
+        let writer = writer_at(runtime, inserter.clone());
+        let result = writer.admit(
+            &tenant_named("t1"),
+            mixed_push(1_000, 7, true),
+            PushHeaders::default(),
+        );
+        if admitted {
+            result.expect("both blocks fit");
+            wait_for(|| inserter.call_count() == 2 && writer.metrics().queue_bytes == 0).await;
+            assert_eq!(inserter.call_count(), 2, "two inserts");
+        } else {
+            assert!(
+                matches!(result, Err(AdmitRefusal::Backpressure)),
+                "refused as backpressure at {limit}: {result:?}"
+            );
+            assert_eq!(inserter.call_count(), 0);
+            assert_eq!(writer.metrics().queue_bytes, 0);
+        }
+        writer.shutdown(Duration::from_secs(2)).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// **2-U17 (issue #494 part 1b): a descriptor whose own block failed is sent
+/// again**, though the push it came with was answered success.
+#[tokio::test]
+async fn a_descriptor_whose_own_block_failed_goes_with_the_next_push() {
+    let cfg = WriterConfig {
+        metrics_landing_inserters: 1,
+        ..Default::default()
+    };
+    let root = spool_root("descriptor-poison");
+    let inserter = MockInserter::new(vec![
+        Step::now(Act::Ok),
+        Step::now(Act::Poison),
+        Step::now(Act::Ok),
+        Step::now(Act::Ok),
+    ]);
+    let writer = writer_with(&cfg, &root, inserter.clone());
+    answer_of(
+        &writer,
+        &no_tenant(),
+        mixed_push(1_000, 7, true),
+        PushHeaders::default(),
+    )
+    .await
+    .expect("P is answered by its samples insert");
+    wait_for(|| spool_records(&root, "poison").len() == 1).await;
+    assert_eq!(
+        spool_records(&root, "poison").len(),
+        1,
+        "the descriptor block was filed"
+    );
+    let before = inserter.call_count();
+    answer_of(
+        &writer,
+        &no_tenant(),
+        mixed_push(1_001, 7, true),
+        PushHeaders::default(),
+    )
+    .await
+    .expect("P2 commits");
+    wait_for(|| writer.metrics().queue_bytes == 0).await;
+    assert!(
+        (before..inserter.call_count()).any(|c| holds_kind(&inserter.rows_of(c), 3)),
+        "P2's inserts include the descriptor again"
+    );
+    writer.shutdown(Duration::from_secs(2)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `Pr`: one OTLP metric, a delta `Sum` of two points, which the parser
+/// rejects whole while keeping its descriptor.
+fn rejected_delta_sum() -> ParsedMetrics {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use opentelemetry_proto::tonic::metrics::v1::{
+        AggregationTemporality, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
+        metric, number_data_point,
+    };
+    use pulsus_write::protocols::otlp_metrics::{self, MetricIngestSettings};
+    let now_ns = epoch_millis() * 1_000_000;
+    let point = |offset: i64, v: f64| NumberDataPoint {
+        time_unix_nano: (now_ns - offset) as u64,
+        value: Some(number_data_point::Value::AsDouble(v)),
+        ..Default::default()
+    };
+    let req = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "requests_total".to_string(),
+                    data: Some(metric::Data::Sum(Sum {
+                        data_points: vec![point(2_000_000_000, 1.0), point(1_000_000_000, 2.0)],
+                        aggregation_temporality: AggregationTemporality::Delta as i32,
+                        is_monotonic: true,
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let parsed = otlp_metrics::parse(&req, now_ns, MetricIngestSettings::default())
+        .expect("within the expansion budget");
+    assert_eq!(parsed.rejected, 2, "both points rejected");
+    assert_eq!(parsed.metadata.len(), 1, "the descriptor kept");
+    assert!(parsed.samples.is_empty());
+    parsed
+}
+
+/// **2-U18 (issue #494 part 1b): a push of descriptors alone is answered by
+/// its own insert, and an uncertain one is admitted again.**
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_descriptors_only_push_waits_for_its_insert_and_is_replay_safe() {
+    for (run, script) in [
+        ("ok", vec![Act::Ok]),
+        ("uncertain", vec![Act::Uncertain, Act::Ok]),
+    ] {
+        let root = spool_root(&format!("descriptors-only-{run}"));
+        let mut runtime = runtime_at(&WriterConfig::default(), &root);
+        runtime.metrics_landing_retries = 0;
+        let inserter = KindGated::new(script);
+        let writer = MetricWriter::with_landing_inserter_and_runtime(
+            inserter.clone(),
+            runtime,
+            BUCKET_MS,
+            MetricWriterTables::metrics_default(),
+        );
+        let mut wait = Box::pin(
+            writer
+                .admit_flush(&no_tenant(), rejected_delta_sum(), PushHeaders::default())
+                .expect("admitted"),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut wait)
+                .await
+                .is_err(),
+            "{run}: the answer waits for the parked insert"
+        );
+        inserter.descriptor.add_permits(1);
+        let answer = tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("answered");
+        assert_eq!(inserter.call_count(), 1);
+        assert_eq!(inserter.kinds_of(0), vec![MetricLandingRow::KIND_METADATA]);
+        if run == "ok" {
+            answer.expect("answered by its insert's success");
+        } else {
+            assert!(answer.is_err(), "answered by its insert's failure");
+            inserter.descriptor.add_permits(1);
+            let retry = answer_of(
+                &writer,
+                &no_tenant(),
+                rejected_delta_sum(),
+                PushHeaders::default(),
+            )
+            .await;
+            assert!(
+                retry.is_ok(),
+                "the retry is admitted and answered by its own insert: {retry:?}"
+            );
+            assert_eq!(inserter.call_count(), 2, "the retry made an insert");
+        }
+        writer.shutdown(Duration::from_secs(2)).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// A `BlockInserter` that parks every call whose rows name `metric`, then
+/// answers `Ok`; any other call answers `Ok` at once.
+struct ParksMetric {
+    metric: &'static str,
+    gate: tokio::sync::Semaphore,
+    calls: AtomicUsize,
+    kinds: Mutex<Vec<Vec<u8>>>,
+}
+
+impl BlockInserter<MetricLandingRow> for ParksMetric {
+    fn insert<'a>(
+        &'a self,
+        table: &'a str,
+        rows: &'a [MetricLandingRow],
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+        self.insert_with(table, rows, &QUERY_SETTINGS_NONE)
+    }
+
+    fn insert_with<'a>(
+        &'a self,
+        _table: &'a str,
+        rows: &'a [MetricLandingRow],
+        _extra: &'a QuerySettings,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut k: Vec<u8> = rows.iter().map(|r| r.kind).collect();
+        k.sort_unstable();
+        self.kinds.lock().expect("mutex").push(k);
+        let park = rows.iter().any(|r| r.metric_name == self.metric);
+        Box::pin(async move {
+            if park {
+                self.gate.acquire().await.expect("never closed").forget();
+            }
+            Ok(())
+        })
+    }
+}
+
+/// [`mixed_push`] for metric `n`, fingerprint 2: the same byte figures.
+fn mixed_push_n() -> ParsedMetrics {
+    let mut out = mixed_push(1_000, 7, true);
+    let name: Arc<str> = Arc::from("n");
+    out.samples[0].metric_name = name.clone();
+    out.samples[0].fingerprint = Fingerprint::from_raw(2);
+    out.hist_samples[0].metric_name = name.clone();
+    out.hist_samples[0].fingerprint = Fingerprint::from_raw(2);
+    out.series = vec![bare_series("n", 2)];
+    out.metadata[0].metric_name = name;
+    out
+}
+
+/// **2-U19 (issue #494 part 1b): a suppressed repeat's descriptor block takes
+/// a reservation of its own** (§3.1 rows 6 and 7): with no room it is refused
+/// `429` and inserts nothing; with room it inserts the descriptor and is
+/// answered the original's success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_suppressed_repeats_descriptors_need_room_of_their_own() {
+    let (content, descriptor) = mixed_push_block_charges(0);
+    let root = spool_root("suppressed-room");
+    let mut runtime = runtime_at(&WriterConfig::default(), &root);
+    runtime.metrics_landing_inserters = 2;
+    runtime.queue_bytes_limit = content + descriptor + descriptor - 1;
+    let inserter = Arc::new(ParksMetric {
+        metric: "n",
+        gate: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+        kinds: Mutex::new(Vec::new()),
+    });
+    let writer = MetricWriter::with_landing_inserter_and_runtime(
+        inserter.clone(),
+        runtime,
+        BUCKET_MS,
+        MetricWriterTables::metrics_default(),
+    );
+    answer_of(
+        &writer,
+        &no_tenant(),
+        mixed_push(1_000, 7, true),
+        PushHeaders::default(),
+    )
+    .await
+    .expect("P commits");
+    wait_for(|| writer.metrics().queue_bytes == 0).await;
+    writer.forget_sent_descriptors_for_test();
+    writer
+        .admit(&no_tenant(), mixed_push_n(), PushHeaders::default())
+        .expect("G is admitted");
+    wait_for(|| inserter.calls.load(Ordering::SeqCst) == 4).await;
+    assert_eq!(
+        writer.metrics().queue_bytes,
+        content + descriptor,
+        "G's two blocks are held"
+    );
+    let calls = inserter.calls.load(Ordering::SeqCst);
+
+    let refused = writer.admit_flush(
+        &no_tenant(),
+        mixed_push(1_000, 7, true),
+        PushHeaders::default(),
+    );
+    assert!(
+        matches!(refused, Err(AdmitRefusal::Backpressure)),
+        "no room for the repeat's descriptor block: {:?}",
+        refused.err()
+    );
+    assert_eq!(inserter.calls.load(Ordering::SeqCst), calls, "no insert");
+
+    inserter.gate.add_permits(2);
+    wait_for(|| writer.metrics().queue_bytes == 0).await;
+    let before = inserter.calls.load(Ordering::SeqCst);
+    answer_of(
+        &writer,
+        &no_tenant(),
+        mixed_push(1_000, 7, true),
+        PushHeaders::default(),
+    )
+    .await
+    .expect("the repeat is answered the original's success");
+    wait_for(|| inserter.calls.load(Ordering::SeqCst) == before + 1).await;
+    assert_eq!(
+        inserter.calls.load(Ordering::SeqCst),
+        before + 1,
+        "one insert"
+    );
+    assert_eq!(
+        inserter.kinds.lock().expect("mutex")[before],
+        vec![MetricLandingRow::KIND_METADATA],
+        "of kind-3 rows"
+    );
+    writer.shutdown(Duration::from_secs(2)).await;
     std::fs::remove_dir_all(&root).ok();
 }

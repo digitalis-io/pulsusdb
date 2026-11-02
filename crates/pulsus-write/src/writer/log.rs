@@ -634,7 +634,7 @@ impl LogWriter {
         let block = LandingBlock::seal(
             rows,
             bytes,
-            QuerySettings::routed_landing_insert(&token, self.shared.ctx.max_rows),
+            QuerySettings::landing_insert(&token, self.shared.ctx.max_rows),
             claim,
             waiter,
             admitted_at,
@@ -1094,7 +1094,7 @@ mod tests {
             let block = LandingBlock::seal(
                 rows,
                 landing_charge::<LogLandingRow>(line_bytes + stream_bytes + pattern_bound),
-                QuerySettings::routed_landing_insert(
+                QuerySettings::landing_insert(
                     &mint_landing_token(&mut XorShift64::seeded()),
                     1_048_576,
                 ),

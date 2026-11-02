@@ -809,6 +809,18 @@ async fn the_clustered_form() {
             i + 1
         );
 
+        // 2-L6 (issue #494 part 1b): the metrics landing table's wrapper
+        // routes on the series' fingerprint, the key of every metrics table's
+        // wrapper.
+        assert_eq!(
+            engine_full_if_any(shard, db, "metric_landing_dist").await,
+            Some(format!(
+                "Distributed('{CLUSTER_NAME}', '{db}', 'metric_landing', cityHash64(fingerprint))"
+            )),
+            "shard{}: metric_landing_dist routes on the fingerprint",
+            i + 1
+        );
+
         // The three catalog targets exist on every shard with no routing
         // twin.
         let present = table_names(shard, db).await;
@@ -851,6 +863,22 @@ async fn engine_full_on(client: &ChClient, db: &str, name: &str) -> String {
         .expect("row present")
         .expect("decode")
         .create_table_query
+}
+
+/// [`engine_full_on`], `None` when `system.tables` has no such object.
+async fn engine_full_if_any(client: &ChClient, db: &str, name: &str) -> Option<String> {
+    let sql = format!(
+        "SELECT engine_full AS create_table_query FROM system.tables \
+         WHERE database = '{db}' AND name = '{name}'"
+    );
+    let mut stream = client
+        .query_stream::<CreateQueryRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.tables engine_full");
+    stream
+        .next()
+        .await
+        .map(|row| row.expect("decode").create_table_query)
 }
 
 async fn exec_on(client: &ChClient, sql: &str) {

@@ -1,8 +1,9 @@
 //! `MetricWriter`: the metrics write path. Implements issue #26's
 //! [`crate::ingest::metrics::MetricSink`] seam.
 //!
-//! **One push is one `INSERT` of one block into `metric_landing`** (issue
-//! #603). Four materialized views maintain `metric_samples`,
+//! **A push is at most two `INSERT`s into `metric_landing`: its content
+//! block, and its descriptor block when the descriptor cache lets any
+//! descriptor through** (issues #603 and #494). Four materialized views maintain `metric_samples`,
 //! `metric_series`, `metric_metadata` and `metric_hist_samples` from that
 //! one source table, and the writer inserts into none of them. It replaces
 //! four independently flushed table buffers, where some of a push's tables
@@ -13,17 +14,21 @@
 //! inserts. What it does not give: nothing makes the fan-out across the four
 //! targets a transaction.
 //!
-//! A push's rows are never spread over two inserts and an insert never
-//! carries two pushes. A push too large for one block is refused whole
-//! ([`AdmitRefusal::PushTooLarge`]), never split — two blocks can commit a
-//! prefix, and a prefix is not all-or-nothing.
+//! A push's samples, histogram samples and exemplars, with their
+//! registrations, are never spread over two inserts, and an insert never
+//! carries two pushes; only its descriptors go in an insert of their own. A
+//! push over its size ceiling is refused whole
+//! ([`AdmitRefusal::PushTooLarge`]), never split — two inserts of its samples
+//! could commit a prefix, and a prefix is not all-or-nothing.
 //!
-//! **Retry safety** is the `insert_deduplication_token` the writer mints per
-//! sealed block and repeats byte-identically on every resend, so a resend of
-//! a block the server already accepted stores nothing twice while the
-//! tables' deduplication windows still hold it. The token is never derived
-//! from the content: two byte-identical metric blocks can be two genuine
-//! pushes.
+//! **Retry safety** is the `insert_deduplication_token`, derived from the
+//! push's tenant and content ([`metric_landing_token`]) and repeated on every
+//! resend, so a resend — the writer's, or a client's of the same content to
+//! any writer — stores no sample, series or exemplar twice while the tables'
+//! deduplication windows hold it; a resend received in another hour is held a
+//! second time only in `metric_landing`, whose rows no user-facing read
+//! returns. The descriptor block carries a minted token, as every insert of
+//! descriptors did on `main`.
 //!
 //! **Registration**: `SeriesLru` promotion stays success-only — the LRU is
 //! promoted when the block commits, never at admission — keyed
@@ -79,7 +84,7 @@ use crate::writer::landing::{
     mint_landing_token, settle_block, spawn_landing_worker,
 };
 use crate::writer::metrics::{MetricWriterMetrics, MetricWriterMetricsSnapshot};
-use crate::writer::push_dedup::{self, Admission, ClaimTicket, PushDedup};
+use crate::writer::push_dedup::{self, Admission, ClaimTicket, PushDedup, metric_landing_token};
 use crate::writer::registration::{DESCRIPTOR_RESEND_MS, DescriptorCache, SeriesKey, SeriesLru};
 use crate::writer::rows::{
     MetricHistSampleRow, MetricLandingRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow,
@@ -96,11 +101,10 @@ const VALUE_TYPE_FLOAT: u8 = 0;
 /// The `metric_series.value_type` discriminant for a native-histogram sample.
 const VALUE_TYPE_HISTOGRAM: u8 = 1;
 
-/// The table name a [`MetricWriter`] inserts into: the bare `metric_landing`
-/// in every mode, written on the server the writer connects to. One name: the
-/// four target tables are maintained by materialized view and the writer
-/// never names them (issue #603). `Arc<str>` because the server resolves it
-/// once at startup from `Config` rather than at compile time.
+/// The table a [`MetricWriter`] inserts into: on a cluster `metric_landing`'s
+/// wrapper, keyed on `cityHash64(fingerprint)`, so every row of a series
+/// reaches the shard every metrics table's wrapper names; single-node the bare
+/// table.
 #[derive(Debug, Clone)]
 pub struct MetricWriterTables {
     pub landing: Arc<str>,
@@ -109,8 +113,14 @@ pub struct MetricWriterTables {
 impl MetricWriterTables {
     /// The default: the bare local table name.
     pub fn metrics_default() -> Self {
+        Self::landing_for(None)
+    }
+
+    /// The landing table for a deployment: the bare name for `None`, and
+    /// `metric_landing<suffix>` for `Some(suffix)`.
+    pub fn landing_for(dist_suffix: Option<&str>) -> Self {
         MetricWriterTables {
-            landing: Arc::from(LANDING_TABLE),
+            landing: Arc::from(format!("{LANDING_TABLE}{}", dist_suffix.unwrap_or(""))),
         }
     }
 }
@@ -512,11 +522,11 @@ impl MetricWriter {
             })
             .sum();
 
-        let total_rows = (batch.samples.len()
+        let content_rows = (batch.samples.len()
             + batch.hist_samples.len()
             + batch.exemplars.len()
-            + new_series.len()
-            + descriptors.len()) as u64;
+            + new_series.len()) as u64;
+        let total_rows = content_rows + descriptors.len() as u64;
 
         // **A valid push with no rows of any kind is answered here**, before
         // the charge, the two ceilings and the reservation (issue #603 code
@@ -538,12 +548,26 @@ impl MetricWriter {
         }
 
         // Issue #635 part 4: every row shares the push's one tenant string,
-        // whose bytes are charged once, beside the slot each row's `Arc`
-        // already occupies.
+        // whose bytes are charged beside the slot each row's `Arc` already
+        // occupies. Issue #494 part 1b: a push is up to two blocks, its
+        // content block and its descriptor block, and each is charged its
+        // own rows, one block's overhead and the tenant string, as though it
+        // held the string alone, so either releases its whole charge when it
+        // settles, in either order.
         let tenant_bytes = tenant.as_str().len() as u64;
-        let total_bytes = landing_charge::<MetricLandingRow>(
-            sample_bytes + series_bytes + metadata_bytes + hist_sample_bytes + exemplar_bytes,
-        ) + tenant_bytes;
+        let content_bytes = if content_rows > 0 {
+            landing_charge::<MetricLandingRow>(
+                sample_bytes + series_bytes + hist_sample_bytes + exemplar_bytes,
+            ) + tenant_bytes
+        } else {
+            0
+        };
+        let descriptor_bytes = if descriptors.is_empty() {
+            0
+        } else {
+            landing_charge::<MetricLandingRow>(metadata_bytes) + tenant_bytes
+        };
+        let total_bytes = content_bytes + descriptor_bytes;
 
         // The two per-push ceilings, counted over every kind, and decided
         // **before** either branch below queues anything (issue #603 code
@@ -584,8 +608,6 @@ impl MetricWriter {
         // emits them again.
         if let Some(suppressed) = suppressed {
             if !descriptors.is_empty() {
-                let descriptor_bytes =
-                    landing_charge::<MetricLandingRow>(metadata_bytes) + tenant_bytes;
                 super::reserve_queued_bytes(
                     &self.shared.queued_bytes,
                     &self.shared.metrics.backpressure_total,
@@ -601,10 +623,12 @@ impl MetricWriter {
                     .metrics
                     .metadata_upserts_total
                     .fetch_add(rows.len() as u64, Ordering::Relaxed);
+                let token = self.mint_token();
                 self.queue_block(
                     &pass,
                     rows,
                     descriptor_bytes,
+                    token,
                     ClaimTicket::inert(),
                     None,
                     admitted_at,
@@ -615,7 +639,8 @@ impl MetricWriter {
 
         self.count_parse_outcomes(&batch);
 
-        // Atomic reservation: reserve first, roll back on overflow.
+        // Atomic reservation of both blocks' charges at once: a queue without
+        // room for both refuses the push with nothing queued.
         super::reserve_queued_bytes(
             &self.shared.queued_bytes,
             &self.shared.metrics.backpressure_total,
@@ -624,8 +649,10 @@ impl MetricWriter {
         )
         .map_err(AdmitRefusal::from)?;
 
-        // Reservation secured: only now materialize the rows.
-        let mut rows: Vec<MetricLandingRow> = Vec::with_capacity(total_rows as usize);
+        // Reservation secured: only now materialize the rows — the content
+        // block's samples, histogram samples, exemplars and registrations,
+        // and the descriptor block's descriptors.
+        let mut rows: Vec<MetricLandingRow> = Vec::with_capacity(content_rows as usize);
         rows.extend(
             batch
                 .samples
@@ -653,11 +680,10 @@ impl MetricWriter {
                 *value_type,
             ));
         }
-        rows.extend(
-            descriptors
-                .iter()
-                .map(|m| MetricLandingRow::metadata(org_id, received_ms, m)),
-        );
+        let descriptor_rows: Vec<MetricLandingRow> = descriptors
+            .iter()
+            .map(|m| MetricLandingRow::metadata(org_id, received_ms, m))
+            .collect();
 
         if !new_series.is_empty() {
             self.shared
@@ -673,13 +699,19 @@ impl MetricWriter {
         }
 
         debug_assert_eq!(
-            rows.len() as u64,
+            (rows.len() + descriptor_rows.len()) as u64,
             total_rows,
             "the rows materialized are the rows the push was charged and \
              measured for"
         );
 
-        let mut claim = ClaimTicket::new(self.shared.dedup.clone(), true);
+        // The push's claim rides the block that answers it: the content
+        // block, or the descriptor block of a push with nothing else. It is
+        // replay-safe: the content block's token is derived from its content,
+        // so a retry after an uncertain ending is dropped by the tables that
+        // kept it, and a descriptors-only retry stores at most one more
+        // descriptor row, which no answer counts.
+        let mut claim = ClaimTicket::new(self.shared.dedup.clone(), true).replay_safe();
         if let Some(g) = guard.as_ref() {
             claim.push(g.key());
         }
@@ -694,7 +726,41 @@ impl MetricWriter {
             None
         };
 
-        self.queue_block(&pass, rows, total_bytes, claim, waiter, admitted_at);
+        if rows.is_empty() {
+            let token = self.mint_token();
+            self.queue_block(
+                &pass,
+                descriptor_rows,
+                descriptor_bytes,
+                token,
+                claim,
+                waiter,
+                admitted_at,
+            );
+        } else {
+            let token = metric_landing_token(tenant, &rows);
+            self.queue_block(
+                &pass,
+                rows,
+                content_bytes,
+                token,
+                claim,
+                waiter,
+                admitted_at,
+            );
+            if !descriptor_rows.is_empty() {
+                let token = self.mint_token();
+                self.queue_block(
+                    &pass,
+                    descriptor_rows,
+                    descriptor_bytes,
+                    token,
+                    ClaimTicket::inert(),
+                    None,
+                    admitted_at,
+                );
+            }
+        }
 
         // Arms the claim: from here a drop no longer removes it, and the
         // target set is closed.
@@ -829,8 +895,19 @@ impl MetricWriter {
         new_series
     }
 
-    /// Seals one block — minting its token, so two byte-identical pushes
-    /// carry different ones — and hands it to the queue.
+    /// A freshly minted landing token, for a descriptor block: two inserts of
+    /// one descriptor are two rows, which `/api/v1/metadata` reports once.
+    fn mint_token(&self) -> String {
+        let mut rng = self
+            .shared
+            .token_rng
+            .lock()
+            .expect("token rng mutex poisoned");
+        mint_landing_token(&mut rng)
+    }
+
+    /// Seals one block under `token` — the content token, or a minted one for
+    /// a descriptor block — and hands it to the queue.
     ///
     /// **A block that reaches here after the queue closed is settled by a task
     /// of this admission's own**, through the same ending a worker gives a
@@ -848,23 +925,17 @@ impl MetricWriter {
     /// past a gate the drain has already closed. The settlement is registered
     /// with the boundary either way, so it is a task the drain awaits rather
     /// than one runtime teardown can cancel mid-spool.
+    #[allow(clippy::too_many_arguments)]
     fn queue_block(
         &self,
         pass: &AdmissionPass<'_>,
         rows: Vec<MetricLandingRow>,
         bytes: u64,
+        token: String,
         claim: ClaimTicket,
         waiter: Option<oneshot::Sender<Result<(), WriteError>>>,
         admitted_at: tokio::time::Instant,
     ) {
-        let token = {
-            let mut rng = self
-                .shared
-                .token_rng
-                .lock()
-                .expect("token rng mutex poisoned");
-            mint_landing_token(&mut rng)
-        };
         let block = LandingBlock::seal(
             rows,
             bytes,
@@ -981,6 +1052,20 @@ fn now_unix_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// **2-U5 (issue #494 part 1b).** The bare name without a suffix, the
+    /// suffixed wrapper with one.
+    #[test]
+    fn landing_for_names_the_wrapper_only_when_given_a_suffix() {
+        assert_eq!(
+            &*super::MetricWriterTables::landing_for(None).landing,
+            "metric_landing"
+        );
+        assert_eq!(
+            &*super::MetricWriterTables::landing_for(Some("_d")).landing,
+            "metric_landing_d"
+        );
+    }
+
     use pulsus_model::LabelSet;
 
     use pulsus_clickhouse::ChError;
@@ -1106,11 +1191,14 @@ mod tests {
         charged
     }
 
-    /// **T9 (issue #635 part 4): a push is charged its tenant's bytes, once.**
-    /// The same push from the empty tenant and from a 150-byte tenant: the
-    /// second is charged exactly 150 bytes more, whatever its row count.
+    /// **T9 (issue #635 part 4): a block is charged its tenant's bytes,
+    /// once.** The same push from the empty tenant and from a 150-byte
+    /// tenant: the second is charged exactly 150 bytes more per block,
+    /// whatever its row count. The push carries a descriptor, so it is two
+    /// blocks, each charged as though it held the string alone (issue #494
+    /// part 1b).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_push_is_charged_its_tenants_bytes_once() {
+    async fn a_push_is_charged_its_tenants_bytes_once_per_block() {
         let none = Tenant::from_header(None, false).expect("the empty tenant");
         let long = "t".repeat(150);
         let header = axum::http::HeaderValue::from_str(&long).expect("a header value");
@@ -1119,8 +1207,8 @@ mod tests {
         let with_tenant = charge_of_one_push(&tenant).await;
         assert_eq!(
             with_tenant,
-            base + 150,
-            "the tenant's 150 bytes, charged once per push"
+            base + 2 * 150,
+            "the tenant's 150 bytes, charged once per block"
         );
     }
 
