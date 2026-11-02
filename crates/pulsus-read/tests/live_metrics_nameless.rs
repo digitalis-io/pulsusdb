@@ -649,7 +649,14 @@ async fn p1_p2_name_less_selectors_answer_through_the_label_index() {
             "{}",
             s.query
         );
-        assert!(!s.query.contains("toUInt128("), "{}", s.query);
+        // No ID literal in any spelling (issue #399).
+        assert!(
+            !s.query.contains("toUInt128(")
+                && !s.query.contains("fingerprint IN ('")
+                && !s.query.contains("'Array(UInt128)')"),
+            "{}",
+            s.query
+        );
     }
     fx.finish().await;
 }

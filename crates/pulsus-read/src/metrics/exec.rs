@@ -6098,11 +6098,7 @@ mod tests {
             100,
         );
         assert_eq!(sqls.len(), 1);
-        assert!(
-            sqls[0].contains("IN (toUInt128('1'), toUInt128('2'), toUInt128('3'))"),
-            "got: {}",
-            sqls[0]
-        );
+        assert!(sqls[0].contains("IN ('1', '2', '3')"), "got: {}", sqls[0]);
     }
 
     #[test]

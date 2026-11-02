@@ -1004,7 +1004,7 @@ pub(crate) fn detected_labels_response(
 ) -> Response {
     let labels = answer.items;
     let prefix = b"{\"detectedLabels\":[".to_vec();
-    let suffix = explain_suffix("]".to_string(), explain.as_ref());
+    let suffix = explain_suffix(discovery_array_end(answer.truncated), explain.as_ref());
     let suffix = format!("{suffix}}}").into_bytes();
     json_response(stream_array(
         prefix,
@@ -1589,6 +1589,20 @@ pub(crate) fn query_response_warned(
     }
 }
 
+/// The end of a discovery answer's array (issue #399): `]`, and when the
+/// answer was cut at its row bound, the truncation warning after it —
+/// before any `explain`.
+fn discovery_array_end(truncated: bool) -> String {
+    if truncated {
+        format!(
+            "],\"warnings\":[{}]",
+            json_string(crate::prom_api::encode::TRUNCATION_WARNING)
+        )
+    } else {
+        "]".to_string()
+    }
+}
+
 /// Encodes a `labels`/`label/{name}/values` result: `{"status":"success",
 /// "data":["name1",...]}`, `explain` as a top-level sibling of `data` when
 /// requested (docs/api.md §2.3).
@@ -1598,7 +1612,7 @@ pub(crate) fn string_array_response(
 ) -> Response {
     let items = answer.items;
     let prefix = b"{\"status\":\"success\",\"data\":[".to_vec();
-    let suffix = explain_suffix("]".to_string(), explain.as_ref());
+    let suffix = explain_suffix(discovery_array_end(answer.truncated), explain.as_ref());
     let suffix = format!("{suffix}}}").into_bytes();
     json_response(stream_array(
         prefix,
@@ -4573,6 +4587,7 @@ mod tests {
                 "DetectedFieldValues",
                 "DetectedFields",
                 "DetectedLabelOut",
+                "DiscoveryAnswer",
                 "EntryCategories",
                 "ExplainStage",
                 "LogStats",

@@ -1732,7 +1732,7 @@ mod tests {
             Fingerprint::from_raw(205).sql_literal(),
         ];
         let body = "kind, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags\n";
-        let rest = "WHERE (kind = 0 AND org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205')) AND t_end > 1000 AND t_end <= 9000)\n   OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > 1000 AND t_last < 9000)\nORDER BY kind, fingerprint, t_end";
+        let rest = "WHERE (kind = 0 AND org_id = '' AND fingerprint IN ('101', '205') AND t_end > 1000 AND t_end <= 9000)\n   OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > 1000 AND t_last < 9000)\nORDER BY kind, fingerprint, t_end";
         let one = [(1000, 9000)];
         assert_eq!(
             level_fetch(&no_tenant(), "metric_samples_720s", &fps, &one, false),
@@ -1743,7 +1743,7 @@ mod tests {
             format!("SELECT _shard_num AS shard, {body}FROM metric_samples_720s_dist\n{rest}")
         );
         let two = [(1000, 2000), (8000, 9000)];
-        let rest = "WHERE (kind = 0 AND org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205')) AND ((t_end > 1000 AND t_end <= 2000) OR (t_end > 8000 AND t_end <= 9000)))\n   OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND ((t_end > 1000 AND t_last < 2000) OR (t_end > 8000 AND t_last < 9000)))\nORDER BY kind, fingerprint, t_end";
+        let rest = "WHERE (kind = 0 AND org_id = '' AND fingerprint IN ('101', '205') AND ((t_end > 1000 AND t_end <= 2000) OR (t_end > 8000 AND t_end <= 9000)))\n   OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND ((t_end > 1000 AND t_last < 2000) OR (t_end > 8000 AND t_last < 9000)))\nORDER BY kind, fingerprint, t_end";
         assert_eq!(
             level_fetch(&no_tenant(), "metric_samples_60s", &fps, &two, false),
             format!("SELECT toUInt32(1) AS shard, {body}FROM metric_samples_60s\n{rest}")

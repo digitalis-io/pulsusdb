@@ -14,7 +14,7 @@
 //! so every read is an exact ID list (or the fallback's ID sub-query) and
 //! a time range. The one string literal here is [`names_predicate`]'s, for
 //! the explained read. Fingerprints enter as [`FpLiteral`]s and render as
-//! `toUInt128('<decimal>')` (no escaping surface — they come from
+//! `'<decimal>'` set elements (issue #399; no escaping surface — they come from
 //! [`super::labels::Resolution::Fingerprints`] or a resolved
 //! `SqlFallback`, never from unescaped user text). No function in this
 //! module takes a `Fingerprint`: the mint is upstream, which is what makes
@@ -83,8 +83,8 @@ pub fn intervals_predicate(lo_col: &str, hi_col: &str, op: &str, within: &[(i64,
     }
 }
 
-/// `fingerprint IN (toUInt128('101'), toUInt128('205'))` — the resolved
-/// fingerprint set.
+/// `fingerprint IN ('101', '205')` — the resolved fingerprint set, in the
+/// set form (issue #399).
 pub fn fingerprints_predicate(fps: &[FpLiteral]) -> String {
     format!("fingerprint IN ({})", render_fingerprint_list(fps))
 }
@@ -264,26 +264,25 @@ pub fn hist_sample_fetch_multi(
     ))
 }
 
-/// The comma-separated `toUInt128('<decimal>')` list an `IN (...)`
-/// carries. `pub` because `super::compile`'s `handoff_cost` bound is
-/// asserted against what this renders (issue #548 criterion 7), and a
-/// bound asserted against a second renderer would bound the wrong text.
+/// The comma-separated `'<decimal>'` set an `IN (...)` carries
+/// ([`pulsus_model::FpSet`]). `pub` because `super::compile`'s
+/// `handoff_cost` bound is asserted against what this renders (issue #548
+/// criterion 7), and a bound asserted against a second renderer would bound
+/// the wrong text.
 ///
-/// The call form is not optional above `2^64`: ClickHouse reads a bare
-/// decimal literal there as `Float64`, exact only to `2^53`, so
-/// `fingerprint IN (<bare list>)` prunes every granule and returns nothing
-/// (issue #498, measured on ClickHouse 26.3.29.7).
+/// A bare decimal is not an option above `2^64`: ClickHouse reads one there
+/// as `Float64`, exact only to `2^53` (issue #498). A quoted decimal is
+/// converted to the `UInt128` column type exactly, and a list of them folds
+/// into one parse-tree node where a list of `toUInt128(…)` calls costs three
+/// per element (issue #399).
 pub fn render_fingerprint_list(fps: &[FpLiteral]) -> String {
-    fps.iter()
-        .map(FpLiteral::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
+    pulsus_model::FpSet(fps).to_string()
 }
 
 /// A typed fingerprint array, `CAST(['<d>', …], 'Array(UInt128)')`, for
 /// the grouped fetch's `fps` (issue #399).
 pub fn render_fingerprint_array(fps: &[FpLiteral]) -> String {
-    format!("[{}]", render_fingerprint_list(fps))
+    pulsus_model::FpArray(fps).to_string()
 }
 
 /// The fingerprint-chunking threshold (architect plan, edge case 7):
@@ -360,15 +359,15 @@ mod tests {
         18_446_744_073_709_551_618,
     ];
 
-    /// The exact call form at the four values where a bare decimal and
-    /// `toUInt128('<decimal>')` first disagree (issue #498).
+    /// The set form at the four values where a bare decimal and an exact
+    /// form first disagree (issue #498; the set form is issue #399's).
     #[test]
-    fn render_fingerprint_list_renders_the_exact_call_form_at_the_2_64_boundary() {
+    fn render_fingerprint_list_renders_the_set_form_at_the_2_64_boundary() {
         let fps: Vec<FpLiteral> = BOUNDARY.iter().copied().map(fp).collect();
         assert_eq!(
             render_fingerprint_list(&fps),
-            "toUInt128('18446744073709551615'), toUInt128('18446744073709551616'), \
-             toUInt128('18446744073709551617'), toUInt128('18446744073709551618')"
+            "'18446744073709551615', '18446744073709551616', \
+             '18446744073709551617', '18446744073709551618'"
         );
     }
 
@@ -390,7 +389,7 @@ mod tests {
             "SELECT fingerprint, unix_milli, value\n\
              FROM metric_samples\n\
              WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
-             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
+             \x20 AND fingerprint IN ('101', '205', '990')\n\
              ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
         );
     }
@@ -417,7 +416,7 @@ mod tests {
             "SELECT fingerprint, unix_milli, value\n\
              FROM metric_samples\n\
              WHERE org_id = '' AND ((unix_milli > 1000 AND unix_milli <= 2000) OR (unix_milli > 8000 AND unix_milli <= 9000))\n\
-             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+             \x20 AND fingerprint IN ('101', '205')\n\
              ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
         );
     }
@@ -516,7 +515,7 @@ mod tests {
             "SELECT fingerprint, unix_milli, value\n\
              FROM metric_samples\n\
              WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
-             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+             \x20 AND fingerprint IN ('101', '205')\n\
              ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
         );
     }
@@ -564,7 +563,7 @@ mod tests {
                 "SELECT fingerprint, unix_milli, {HIST_COLS}\n\
                  FROM metric_hist_samples\n\
                  WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
-                 \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
+                 \x20 AND fingerprint IN ('101', '205', '990')\n\
                  ORDER BY fingerprint, unix_milli"
             )
         );
@@ -610,7 +609,7 @@ mod tests {
                 "SELECT fingerprint, unix_milli, {HIST_COLS}\n\
                  FROM metric_hist_samples\n\
                  WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
-                 \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+                 \x20 AND fingerprint IN ('101', '205')\n\
                  ORDER BY fingerprint, unix_milli"
             )
         );
@@ -675,7 +674,7 @@ mod tests {
         );
         assert_same_but_the_float_sort_key(&float, &hist);
         assert!(predicate_tail(&float).contains("unix_milli > 1000 AND unix_milli <= 2000"));
-        assert!(predicate_tail(&float).contains("fingerprint IN (toUInt128('7'), toUInt128('9'))"));
+        assert!(predicate_tail(&float).contains("fingerprint IN ('7', '9')"));
         assert!(!predicate_tail(&float).contains("PREWHERE"));
     }
 

@@ -1930,7 +1930,7 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
     // Issue #623: the sample tables carry no metric name; the read is the
     // resolved IDs and the window.
     assert!(!fetch_stage.sql.contains("metric_name"));
-    assert!(fetch_stage.sql.contains("AND fingerprint IN (toUInt128("));
+    assert!(fetch_stage.sql.contains("AND fingerprint IN ('"));
     let resolution_stage = stage(&explain, "series_resolution");
     assert!(resolution_stage.sql.contains("matching series"));
 
@@ -3302,7 +3302,7 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
     assert_eq!(fetches.len(), 1, "one flat fetch: {:#?}", explain.stages);
     let sql = &fetches[0].sql;
     assert!(
-        sql.contains("fingerprint IN (toUInt128('1'), toUInt128('3'))"),
+        sql.contains("fingerprint IN ('1', '3')"),
         "the fetch reads exactly the regex-matched metrics' IDs: {sql}"
     );
     assert!(!sql.contains("other_metric"), "{sql}");

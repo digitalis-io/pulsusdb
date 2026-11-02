@@ -277,22 +277,21 @@ impl Lang for Pql {
     // read, so no cut is possible and `handoff_bound` returning `None` is
     // not reached.
 
-    /// A fingerprint renders as `toUInt128('<decimal>')` — 13 characters
-    /// of call form plus up to 39 decimal digits (`u128::MAX`) — plus the
-    /// two-byte `", "` separator inside an `IN (…)` list, and
-    /// `fingerprint IN ()` is the 17-byte frame. `ast_elements` counts the
-    /// identifier, the `IN` function, the list and one literal per value;
-    /// the call wrapper is one node per value either way, so the element
-    /// count did not move when the identity widened (issue #498).
+    /// A fingerprint renders as a set element `'<up to 39 digits>'`
+    /// (`u128::MAX` has 39) plus the two-byte `", "` separator inside an
+    /// `IN (…)` list, at most 43 bytes, and `fingerprint IN ()` is the
+    /// 17-byte frame. `ast_elements` is four whatever the length (issue
+    /// #399): `Function in`, `ExpressionList`, `Identifier` and one
+    /// `Literal Tuple_` — the parser folds a list of literals into one node.
     ///
-    /// **`text_bytes` over-counts by exactly 2** — the last value carries
-    /// no separator — and that is the safe direction: the core compares
-    /// it against a ceiling, so over-counting can only make it cut
-    /// earlier.
+    /// **`text_bytes` over-counts by exactly 2 for `n ≥ 1`** — the last
+    /// value carries no separator — and that is the safe direction: the
+    /// core compares it against a ceiling, so over-counting can only make
+    /// it cut earlier.
     fn handoff_cost(n: u64) -> HandoffCost {
         HandoffCost {
-            text_bytes: 17 + n * 54,
-            ast_elements: 3 + n,
+            text_bytes: 17 + n * 43,
+            ast_elements: 4,
         }
     }
 
@@ -1338,7 +1337,7 @@ mod tests {
         selector_pred(
             Some(&format!("metric_name = '{tag}'")),
             "unix_milli > 1 AND unix_milli <= 2",
-            "fingerprint IN (toUInt128('7'))",
+            "fingerprint IN ('7')",
         )
     }
 
@@ -1461,7 +1460,7 @@ mod tests {
                 pred: if pushed {
                     grouped_selector_pred(
                         "unix_milli > 1 AND unix_milli <= 2",
-                        "fingerprint IN (toUInt128('7'))",
+                        "fingerprint IN ('7')",
                     )
                 } else {
                     pred("http_requests_total")
@@ -1621,7 +1620,7 @@ mod tests {
                 "n={n}: over-count {} exceeds the one missing separator",
                 cost.text_bytes - actual
             );
-            assert_eq!(cost.ast_elements, 3 + n as u64, "n={n}: ast elements");
+            assert_eq!(cost.ast_elements, 4, "n={n}: ast elements");
         }
     }
 

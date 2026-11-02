@@ -62,14 +62,14 @@ fn names_scope(metric_names: &[String]) -> String {
     format!("metric_name IN ({name_list})")
 }
 
-/// `fingerprint IN (<ids>)`: a set of series IDs already resolved.
+/// `fingerprint IN ('<id>', …)`: a set of series IDs already resolved, in
+/// the set form ([`pulsus_model::FpSet`], issue #399).
+///
+/// The server converts each element to the `UInt128` column exactly, and
+/// the list folds into one parse-tree node, so its length is bounded by the
+/// text limit alone, which [`discovery_fetch_multi`] checks first.
 fn ids_scope(fps: &[FpLiteral]) -> String {
-    let fp_list = fps
-        .iter()
-        .map(FpLiteral::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("fingerprint IN ({fp_list})")
+    format!("fingerprint IN ({})", pulsus_model::FpSet(fps))
 }
 
 /// One series read (issue #623): the window on the activity table and every
@@ -397,13 +397,12 @@ pub fn discovery_distinct_names_query(
 }
 
 /// Issue #89's discovery analog of [`super::sample_sql::sample_fetch_multi`],
-/// statement 2 (issue #623): ONE query for a regex/negated-`__name__`
-/// `match[]` selector's whole resolved candidate set, scoped on the lookup
-/// to `metric_name IN (<resolved names>) AND fingerprint IN (<resolved
-/// IDs>)`. The IDs come from the label cache, which holds every series
-/// active in its whole window, so the request window is applied here by
-/// the activity read — the cache's wider resident superset never leaks into
-/// a narrower discovery response (the `discovery_series` invariant).
+/// statement 2 (issue #623): ONE query for a regex/negated-`__name__` selector's
+/// whole resolved candidate set, scoped on the lookup to `metric_name IN
+/// (<resolved names>) AND fingerprint IN (<resolved IDs>)`. The IDs come from
+/// the label cache, which holds every series active in its whole window, so the
+/// request window is applied here by the activity read — the cache's wider
+/// superset never leaks into a narrower response (`discovery_series`).
 pub fn discovery_fetch_multi(
     tenant: &Tenant,
     series_table: &str,
@@ -1987,7 +1986,7 @@ mod tests {
                  \x20 FROM metric_labels\n\
                  \x20 WHERE org_id = ''\n\
                  \x20   AND metric_name IN ('up', 'down')\n\
-                 \x20   AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+                 \x20   AND fingerprint IN ('101', '205')\n\
                  \x20   AND fingerprint IN (\n\
                  \x20     SELECT fingerprint\n\
                  \x20     FROM metric_series\n\
@@ -1999,7 +1998,7 @@ mod tests {
                  \x20         FROM metric_labels\n\
                  \x20         WHERE org_id = ''\n\
                  \x20           AND metric_name IN ('up', 'down')\n\
-                 \x20           AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+                 \x20           AND fingerprint IN ('101', '205')\n\
                  \x20       )\n\
                  \x20   )\n\
                  )\n\

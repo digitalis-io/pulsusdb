@@ -6974,7 +6974,7 @@ const SELECTION_GOLDEN: &str = "crates/pulsus-read/tests/golden/logql_selection_
 /// alone leaves this constant standing and B2 fails, so the author has to
 /// move a source line in the same change and the diff carries both.
 const PINNED_SELECTION_STATEMENTS: &str =
-    "6b4ec3bca0f3784f83aebc61448f0f394e3d2568fbdafc94e9371d5fd4380715";
+    "035c8db511ba9378f461d69bb14db0b3e892373e80a1b438a85927217bbe12aa";
 
 /// One grid point, on a step boundary: 2030-01-01T00:00:00Z.
 ///
@@ -7191,11 +7191,10 @@ fn sort_fingerprint_lists(sql: &str) -> String {
     while let Some(at) = rest.find(needle) {
         let (head, tail) = rest.split_at(at + needle.len());
         out.push_str(head);
-        // Each element is `toUInt128('<decimal>')` since issue #498, so the
-        // list's own closing parenthesis is the LAST one before the next
-        // clause, not the first — the first now closes the first element's
-        // call. Scanning to a balanced close is what keeps this a list
-        // sorter rather than a text cutter.
+        // Each element is `'<decimal>'` since issue #399 (it was
+        // `toUInt128('<decimal>')` from issue #498). Scanning to a balanced
+        // close keeps this a list sorter rather than a text cutter on a
+        // sub-query form.
         let mut depth = 1usize;
         let mut close = None;
         for (i, c) in tail.char_indices() {
@@ -7221,11 +7220,11 @@ fn sort_fingerprint_lists(sql: &str) -> String {
                     .split(',')
                     .filter_map(|t| {
                         let t = t.trim();
-                        // `toUInt128('123')` or, on a sub-query form, text
-                        // that is not an element at all.
+                        // `'123'` or, on a sub-query form, text that is
+                        // not an element at all.
                         let inner = t
-                            .strip_prefix("toUInt128('")
-                            .and_then(|r| r.strip_suffix("')"))
+                            .strip_prefix('\'')
+                            .and_then(|r| r.strip_suffix('\''))
                             .unwrap_or(t);
                         inner.parse().ok()
                     })
@@ -7233,7 +7232,7 @@ fn sort_fingerprint_lists(sql: &str) -> String {
                 ids.sort_unstable();
                 out.push_str(
                     &ids.iter()
-                        .map(|v| format!("toUInt128('{v}')"))
+                        .map(|v| format!("'{v}'"))
                         .collect::<Vec<_>>()
                         .join(", "),
                 );
@@ -8490,7 +8489,9 @@ async fn shape_a_sends_no_id_list() {
         );
         for s in &shape_a {
             assert!(
-                !s.query.contains("toUInt128("),
+                !s.query.contains("toUInt128(")
+                    && !s.query.contains("fingerprint IN ('")
+                    && !s.query.contains("'Array(UInt128)')"),
                 "{q}: an ID literal in a shape-A statement: {summary:?}"
             );
             assert!(
@@ -12413,7 +12414,7 @@ async fn a_filter_after_a_targeted_parser_returns_what_the_evaluator_returns() {
     let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
     let sec = 1_000_000_000i64;
     const BASE: &str = r#","status":"base""#;
-    const GUARD: &str = "(fingerprint IN (toUInt128('";
+    const GUARD: &str = "(fingerprint IN ('";
     // (line, extra stream labels, pushed pipeline, the not-pushed control,
     //  expected lines, what the pushed statements must carry)
     let cases: &[(&str, &str, &str, &str, usize, &str)] = &[
@@ -12592,7 +12593,7 @@ async fn a_filter_after_a_targeted_parser_returns_what_the_evaluator_returns() {
     for (comment, i) in &comments {
         let (_, _, pushed, _, _, carries) = cases[*i];
         let carries = if carries == GUARD {
-            format!("{GUARD}{}'))", 9600 + *i as u64)
+            format!("{GUARD}{}')", 9600 + *i as u64)
         } else {
             carries.to_string()
         };

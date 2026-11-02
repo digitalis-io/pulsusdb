@@ -1,6 +1,6 @@
 # Logs differential divergence ledger
 
-**Parts of this document describe the schema controller, the migration catalogue and the TTL rotation, which no longer exist. The schema is now `schema/schema.sql`, built by `schema/schema.sh`; the binary creates no schema, and retention is the TTL each table is created with.** The M6-09 LogQL-pipeline differential (`e2e/src/logs.rs`,
+**Issue #399 (remaining part) changed two things this document describes:** label discovery is one statement with `GLOBAL IN` subqueries, not an activity scan plus a literal list, and a fingerprint list renders `'<decimal>'` elements (`CAST([…], 'Array(UInt128)')` for arrays). The current behaviour is in `docs/api.md` §2.3 and in this issue's plan. **Parts of this document describe the schema controller, the migration catalogue and the TTL rotation, which no longer exist. The schema is now `schema/schema.sql`, built by `schema/schema.sh`; the binary creates no schema, and retention is the TTL each table is created with.** The M6-09 LogQL-pipeline differential (`e2e/src/logs.rs`,
 `logs_pipeline_differential`, nightly/dispatch `e2e-single` tier) gates
 every committed pipeline case in `test/fixtures/logs/differential.json`
 against both the corpus's by-construction expectation and the pinned

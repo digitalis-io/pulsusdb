@@ -383,7 +383,7 @@ fn stage3_renders_the_canonical_shape_with_a_single_service() {
         "SELECT fingerprint, timestamp_ns, body, structured_metadata\n\
          FROM log_samples\n\
          PREWHERE service = 'checkout'\n\
-         WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))\n\
+         WHERE org_id = '' AND fingerprint IN ('18374', '99120')\n\
          \x20 AND timestamp_ns > 1782907200000000000 AND timestamp_ns <= 1782928800000000000\n\
          \x20 AND body LIKE '%connection refused%'\n\
          ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC\n\
@@ -670,7 +670,7 @@ fn stage2_is_byte_exact_to_schemas_md_3_2() {
             "log_streams",
             &[18374, 99120].map(|v| Fingerprint::from_raw(v).sql_literal())
         ),
-        "SELECT fingerprint, service, labels FROM log_streams WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))"
+        "SELECT fingerprint, service, labels FROM log_streams WHERE org_id = '' AND fingerprint IN ('18374', '99120')"
     );
 }
 
@@ -1034,7 +1034,7 @@ fn metric_range_sql_uses_intdiv_bucketing() {
         sql,
         "SELECT fingerprint, intDiv(bucket_ns, 60000000000) * 60000000000 AS step, sum(count) AS n\n\
          FROM log_metrics_5s\n\
-         WHERE org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
+         WHERE org_id = '' AND fingerprint IN ('101', '205', '990') AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
          GROUP BY fingerprint, step"
     );
 }
@@ -1067,7 +1067,7 @@ fn metric_instant_sql_has_no_intdiv_bucket_expression() {
         sql,
         "SELECT fingerprint, sum(count) AS n\n\
          FROM log_metrics_5s\n\
-         WHERE org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
+         WHERE org_id = '' AND fingerprint IN ('101', '205') AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
          GROUP BY fingerprint"
     );
     assert!(!sql.contains("intDiv"));
@@ -1100,7 +1100,7 @@ fn log_volume_rollup_is_byte_exact() {
         sql,
         "SELECT fingerprint, sum(bytes) AS bytes\n\
          FROM log_metrics_5s\n\
-         WHERE org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
+         WHERE org_id = '' AND fingerprint IN ('101', '205') AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
          GROUP BY fingerprint"
     );
     assert!(!sql.contains("body"), "zero body reads by construction");
@@ -1141,10 +1141,10 @@ const ACTIVE_UNSCOPED: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
 /// The activity read with `/series`' resolved list pushed inside it, so it
 /// reads primary-key point ranges rather than the whole bucket range.
 const ACTIVE_SCOPED_1: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
-     WHERE org_id = '' AND fingerprint IN (toUInt128('7')) AND bucket_ns >= 1751328000000000000 \
+     WHERE org_id = '' AND fingerprint IN ('7') AND bucket_ns >= 1751328000000000000 \
      AND bucket_ns <= 1751331600000000000";
 const ACTIVE_SCOPED_3: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
-     WHERE org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('4294967296')) AND bucket_ns >= 1751328000000000000 \
+     WHERE org_id = '' AND fingerprint IN ('101', '205', '4294967296') AND bucket_ns >= 1751328000000000000 \
      AND bucket_ns <= 1751331600000000000";
 
 /// A stage-1 statement, opaque to the discovery builders: they nest it
@@ -1506,7 +1506,7 @@ fn an_unwrapped_sum_over_time_renders_a_sliding_raw_scan_with_no_aggregate_and_n
         "SELECT fingerprint, timestamp_ns, body, structured_metadata\n\
          FROM log_samples\n\
          PREWHERE service = 'checkout'\n\
-         WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))\n\
+         WHERE org_id = '' AND fingerprint IN ('18374', '99120')\n\
          \x20 AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000\n\
          ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC"
     );

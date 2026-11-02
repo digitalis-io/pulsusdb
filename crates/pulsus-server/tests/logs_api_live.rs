@@ -4341,10 +4341,10 @@ async fn query_narrows_labels_and_label_values() {
     assert_eq!(
         stages.len(),
         1,
-        "a no-match scoped request runs stage one only: {}",
+        "a no-match scoped request is one statement (issue #399): {}",
         res.body
     );
-    assert_eq!(stages[0]["name"], "stage1_stream_resolution");
+    assert_eq!(stages[0]["name"], "label_values");
 
     // L8 — a key on the OTHER stream only.
     let (status, body) = get(

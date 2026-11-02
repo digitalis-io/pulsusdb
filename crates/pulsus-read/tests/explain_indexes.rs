@@ -1910,7 +1910,8 @@ async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primar
 ///
 /// Issue #482 AC 3 extends it with the SCOPED forms. Since issue #399 the
 /// selector's stage-1 statement is nested inside the activity subquery,
-/// and the outer scan's extract carries the fingerprint set twice.
+/// and the outer scan's extract is IDENTICAL to the unscoped form's,
+/// asserted as an equality against the unscoped extract.
 #[tokio::test]
 async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_bucket_range() {
     skip_unless_live!();
@@ -1967,8 +1968,9 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
     assert_eq!(names_usage, v(&expected));
 
     // The SCOPED form (issue #399): `query=`'s stage-1 statement is nested
-    // inside the activity read, so the outer scan's condition carries the
-    // set twice — measured on the plan's fixture.
+    // inside the activity subquery, so the OUTER scan analyses exactly as
+    // the unscoped form does — one fingerprint set, measured on 26.8.21.10 —
+    // asserted as an equality against the unscoped extract.
     let s1 = streams_plan(r#"{service_name="checkout"}"#, &params, db);
     let s1 = qualify(&s1.stage1_sql, "log_streams_idx", db);
     let scoped = discovery_scope(&rollup, window.start_ns, window.end_ns, Some(&s1));
@@ -1979,18 +1981,10 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         &scoped,
         100_001,
     );
-    let mut expected: Vec<&str> = month_blocks.to_vec();
-    expected.extend([
-        "PrimaryKey",
-        "Keys:",
-        "org_id",
-        "fingerprint",
-        "Condition: and((fingerprint in #-element set), and((fingerprint in #-element set), (org_id in ['', ''])))",
-    ]);
     assert_eq!(
         explain(&client, &scoped_names_sql).await,
-        v(&expected),
-        "the scoped /labels outer scan"
+        names_usage,
+        "the scoped /labels outer scan must analyse exactly as the unscoped one"
     );
 
     let values_sql = sql::label_values(
@@ -2027,19 +2021,10 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         &scoped,
         100_001,
     );
-    let mut expected: Vec<&str> = month_blocks.to_vec();
-    expected.extend([
-        "PrimaryKey",
-        "Keys:",
-        "org_id",
-        "key",
-        "fingerprint",
-        "Condition: and((fingerprint in #-element set), and((fingerprint in #-element set), and((key in ['env', 'env']), (org_id in ['', '']))))",
-    ]);
     assert_eq!(
         explain(&client, &scoped_values_sql).await,
-        v(&expected),
-        "the scoped /label/{{name}}/values outer scan"
+        values_usage,
+        "the scoped /label/{{name}}/values outer scan must analyse exactly as the unscoped one"
     );
 
     // What the activity subquery must NOT cost: the outer scan's month partition
