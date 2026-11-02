@@ -376,3 +376,60 @@ fn a_removed_retention_key_is_refused_naming_it() {
         );
     }
 }
+
+/// **2-U18 (issue #494 part 2).** `PULSUS_LANDING_BATCH_MS` defaults to
+/// 1000, accepts 0 and 10000, and refuses 10001, -1 and `abc`; the YAML key
+/// `writer.landing_batch_ms` reads 250 and refuses 20000. The two values
+/// that do not parse are refused naming the variable; the two out of range
+/// naming the setting, as every range-checked writer key is.
+#[test]
+fn the_landing_batch_window_is_read_and_bounded_from_env_and_yaml() {
+    let _guard = support::lock_env();
+    support::clear_all();
+
+    let cfg = pulsus_config::load(None, None).expect("the defaults load");
+    assert_eq!(cfg.writer.landing_batch_ms, 1_000, "unset is 1000");
+
+    for (value, want) in [("0", 0u64), ("10000", 10_000)] {
+        support::set("PULSUS_LANDING_BATCH_MS", value);
+        let cfg = pulsus_config::load(None, None)
+            .unwrap_or_else(|e| panic!("PULSUS_LANDING_BATCH_MS={value} is accepted: {e}"));
+        assert_eq!(cfg.writer.landing_batch_ms, want);
+    }
+
+    support::set("PULSUS_LANDING_BATCH_MS", "10001");
+    match pulsus_config::load(None, None) {
+        Err(pulsus_config::ConfigError::Value { field, .. }) => {
+            assert_eq!(field, "writer.landing_batch_ms");
+        }
+        other => panic!("PULSUS_LANDING_BATCH_MS=10001 is refused, got {other:?}"),
+    }
+    for value in ["-1", "abc"] {
+        support::set("PULSUS_LANDING_BATCH_MS", value);
+        match pulsus_config::load(None, None) {
+            Err(pulsus_config::ConfigError::Env { var, .. }) => {
+                assert_eq!(var, "PULSUS_LANDING_BATCH_MS");
+            }
+            other => panic!("PULSUS_LANDING_BATCH_MS={value} is refused, got {other:?}"),
+        }
+    }
+    support::clear_all();
+
+    let path = support::write_temp_yaml("landing-batch-250", "writer:\n  landing_batch_ms: 250\n");
+    let cfg = pulsus_config::load(Some(&path), None).expect("a YAML window of 250 loads");
+    assert_eq!(cfg.writer.landing_batch_ms, 250);
+    let _ = std::fs::remove_file(&path);
+
+    let path = support::write_temp_yaml(
+        "landing-batch-20000",
+        "writer:\n  landing_batch_ms: 20000\n",
+    );
+    match pulsus_config::load(Some(&path), None) {
+        Err(pulsus_config::ConfigError::Value { field, .. }) => {
+            assert_eq!(field, "writer.landing_batch_ms");
+        }
+        other => panic!("a YAML window of 20000 is refused, got {other:?}"),
+    }
+    let _ = std::fs::remove_file(&path);
+    support::clear_all();
+}

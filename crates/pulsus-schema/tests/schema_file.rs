@@ -6153,3 +6153,190 @@ fn the_script_the_crate_and_the_parsers_hold_the_documented_boundaries() {
         }
     }
 }
+
+// -- issue #494 part 2: the batching documents ------------------------------
+
+/// Plan B §7's new `docs/api.md` §1.0 paragraph, generated from the plan.
+const B_API_PARAGRAPH: &str = r##"**How a log or trace push is written.** A log or trace push's rows go in one insert into `log_landing` or `trace_landing`, which it shares with the other pushes of its signal that its writer gathers into the same **batch**: a batch takes queued pushes for up to `PULSUS_LANDING_BATCH_MS` after a worker takes its first push, which may itself have waited in the queue, and closes sooner when the next push would bring its rows to `PULSUS_LOG_LANDING_MAX_ROWS` or `PULSUS_TRACE_LANDING_MAX_ROWS`, its estimate above `PULSUS_BATCH_BYTES` or its inclusive UTC-date span above `100` days, at once when one of its pushes would otherwise reach its 120 s landing budget, and at shutdown ([configuration.md](configuration.md)). A push is first checked: a writer shutting down, or a suppression index or its waiters at their bound, answers `429`; a reused `Idempotency-Key` answers `400`, except for a log push some of whose streams fail their label checks, which the suppression index does not see; a push over its size ceiling or over `100` UTC dates answers `413`; each makes no insert. Otherwise:
+
+| the push | inserts | answered by |
+|---|---|---|
+| with rows | its batch's one insert | that insert's outcome, shared by every push in the batch: if one push's rows make it fail, every push in the batch fails |
+| nothing to insert, and not a recognised repeat | none | success |
+| a log push some of whose streams fail their label checks, the rest carrying rows — unchanged by this batching | its batch's one insert, holding the passing streams' rows | synchronous: `400` naming the failed streams once that insert has committed, or the insert's error if it failed; with `X-Pulsus-Async: 1`: `400` naming them at admission, and its passing streams' rows are still stored when the batch commits. The suppression index does not see such a push, so sending it again can store the passing streams' rows again |
+| a log push every stream of which fails — unchanged by this batching | none | `400` naming the failed streams |
+| a repeat the writer's suppression index recognises (above) | none | the original push's answer, once the original's batch has settled |
+| a push whose rows cannot be reserved in the queue | none | `429` |
+
+A synchronous push is answered once its batch's insert has settled, up to one window later than it would be alone; one sent with `X-Pulsus-Async: 1` is answered `202` once admitted, but for the partly failing log push above. Every row of a batch carries its first push's receive time, so on a cluster the batch is one block on one shard, and the writer's resend of it, under the batch's token, reaches the same shard. A batch takes its oldest push's 120 s landing deadline, so a push in a batch can end, sent or not, at an older push's deadline. With `PULSUS_LANDING_BATCH_MS=0` every push is its own batch. Metrics pushes are not batched."##;
+
+/// Plan B §7's new `docs/configuration.md` row.
+const B_CONF_ROW: &str = r##"| `PULSUS_LANDING_BATCH_MS` | `1000` | how long a landing worker keeps adding queued log or trace pushes to the insert it is forming. A batch closes at the first of: this long after its first push was taken; the next push would bring its rows to the signal's `PULSUS_*_LANDING_MAX_ROWS`, its estimate above `PULSUS_BATCH_BYTES`, or its inclusive UTC-date span above `100` days; at once when one of its pushes would otherwise reach its 120 s landing budget; shutdown. Every push of a batch shares its outcome ([api.md §1.0](api.md)). Metrics pushes are not batched. `0` sends every push as its own insert. Accepted range `0..=10000` ms |"##;
+
+/// Plan B §7's new line in `docs/configuration.md`'s YAML schema.
+const B_YAML_LINE: &str =
+    r##"  landing_batch_ms: 1000         # log and trace batch window; 0 sends every push alone"##;
+
+/// Plan B §7's banner on the design documents.
+const B_BANNER: &str = r##"> **Stale on landing inserts.** Since the batching change (#494, part 2), a landing worker gathers
+> queued log or trace pushes into one insert under one token for up to `PULSUS_LANDING_BATCH_MS`,
+> within the row, byte and 100-date caps and the oldest push's budget, and every push of a batch
+> shares its outcome; metrics pushes are not batched. Passages below that say one push is one insert,
+> that nothing waits for a flush trigger, or that a deduplication window counts pushes, are out of
+> date. Current behaviour: `docs/api.md` §1.0 and `crates/pulsus-write/src/writer/landing.rs`."##;
+
+/// Plan B §7's line edits: the document, the text replaced (empty for an
+/// insertion) and the text that replaces it.
+const B_EDITS: &[(&str, &str, &str)] = &[
+    (
+        "api.md",
+        r##"`1` = enqueue and return `202`; `0` = confirm flush (default from config)"##,
+        r##"`1` = answer `202` once admitted: accepted, not stored — except a log push some of whose streams fail their label checks, which is answered `400` (§1.0). A log or trace push is then held in memory until its batch's insert settles — its wait in the queue, up to `PULSUS_LANDING_BATCH_MS` while its batch forms, then the insert and its resends, within 120 s of the admission of its batch's oldest push — and a process that ends without its drain loses it until that insert's first attempt is sent; a failure is reported to nobody. `0` = answer once the insert that answers the push has settled (§1.0) (default from config)"##,
+    ),
+    (
+        "api.md",
+        r##"a push over its size ceiling answers `413`"##,
+        r##"a push over its size ceiling or over `100` UTC dates answers `413`"##,
+    ),
+    (
+        "api.md",
+        r##"A log or trace push is stored as one `INSERT` of one block into one table;"##,
+        r##"A log or trace push is stored in one `INSERT` of one block into one table, which may carry other pushes of its signal (§1.0);"##,
+    ),
+    (
+        "api.md",
+        r##"**`POST /v1/traces` has a third ceiling, and it refuses on the shape of a push's timestamps rather than on its size** (issue #586). `spans`, `traces` and `resources` are partitioned by UTC day, so one view's insert produces one part per day the push's spans fall in, and the server refuses a block above `100` partitions — its own `max_partitions_per_insert_block` default, which this build pins. A push whose spans fall on more than `100` distinct UTC dates is therefore refused `413` at admission"##,
+        r##"**`POST /v1/metrics`, `POST /v1/logs` and `POST /v1/traces` have a third ceiling, and it refuses on the shape of a push's timestamps rather than on its size** (issues #586 and #494). A log line's timestamp, a metric sample's, histogram sample's or exemplar's, and a span's start each feed at least one table partitioned by UTC day, so one view's insert there produces one part per date the push's rows fall on, and the server refuses a block above `100` partitions — its own `max_partitions_per_insert_block` default, which this build pins on every landing insert. A push whose rows fall on more than `100` distinct UTC dates of those timestamps is therefore refused `413` at admission"##,
+    ),
+    (
+        "api.md",
+        r##"The reference accepts a push covering any span of dates"##,
+        r##"The reference accepts a trace push covering any span of dates"##,
+    ),
+    (
+        "api.md",
+        r##"A sender replaying more than a hundred days of history in one request has to split it;"##,
+        r##"A sender whose one request carries more than a hundred distinct UTC dates has to split it;"##,
+    ),
+    (
+        "api.md",
+        r##"and on `/v1/traces` also for a push covering more than `100` UTC dates"##,
+        r##"and on all three also for a push covering more than `100` UTC dates"##,
+    ),
+    (
+        "api.md",
+        r##"**A push over its size ceiling is `413` here too** (§1.1, same two limits and the same message)"##,
+        r##"**A push over its size ceiling, or over `100` UTC dates, is `413` here too** (§1.1, the same limits and the same messages)"##,
+    ),
+    (
+        "api.md",
+        r##"**A push that does not fit one block is 413** plain-text (§1.1, the same two limits and the same message, through this endpoint's own error writer with its terminating newline): a logs push is one `INSERT` of one block and is never split, nothing is stored"##,
+        r##"**A push over its size ceiling, or over `100` UTC dates, is 413** plain-text (§1.1, the same limits and the same messages, through this endpoint's own error writer with its terminating newline): a logs push is never divided among inserts (§1.0), nothing is stored"##,
+    ),
+    (
+        "configuration.md",
+        r##"A window of `W` blocks covers a steady rate of `W / 120` pushes a second, the landing insert's budget being 120 s: **83** at the default and **8333** at the maximum, rounding down. Above that a block's token can be evicted before its resend arrives."##,
+        r##"It sets ClickHouse's deduplication window for these tables — `replicated_deduplication_window` on a cluster, `non_replicated_deduplication_window` on a single node — which counts blocks as ClickHouse defines them (ClickHouse's documentation of those two MergeTree settings); [api.md §1.0](api.md) says how many pushes a log or trace insert carries."##,
+    ),
+    (
+        "configuration.md",
+        r##""##,
+        r##"says how a metrics push is written). A batch of log or trace pushes closes before its summed estimate would exceed it ([api.md §1.0](api.md))."##,
+    ),
+    (
+        "configuration.md",
+        r##"every push is sealed and queued at admission, so nothing waits for an age trigger."##,
+        r##"a log or trace push waits in the queue until a worker takes it, and then while its batch forms, which `PULSUS_LANDING_BATCH_MS` bounds from the moment a worker takes the batch's first push."##,
+    ),
+    (
+        "configuration.md",
+        r##"and holds each insert's charge until that insert has committed or has been spooled"##,
+        r##"and holds each insert's charge until the insert carrying it has committed or has been spooled"##,
+    ),
+    (
+        "configuration.md",
+        r##"Every resend carries the same minted `insert_deduplication_token` and the identical block,"##,
+        r##"Every resend carries the same minted `insert_deduplication_token` and the identical batch of pushes ([api.md §1.0](api.md)),"##,
+    ),
+    (
+        "configuration.md",
+        r##"Every resend carries the same minted `insert_deduplication_token` and the identical block,"##,
+        r##"Every resend carries the same minted `insert_deduplication_token` and the identical batch of pushes ([api.md §1.0](api.md)),"##,
+    ),
+];
+
+/// **2-U19 (issue #494 part 2).** `docs/api.md` §1.0 holds plan B's log and
+/// trace paragraph after the paragraph at its old `:106`; the configuration
+/// row for `PULSUS_LANDING_BATCH_MS` and its YAML line are plan B's; every
+/// other line edit's new text is there and its old text is gone; and the
+/// four design documents start with plan B's banner (the drawing in its
+/// `<desc>` and its first `<text>`).
+#[test]
+fn the_documents_say_how_a_log_or_trace_push_is_batched() {
+    let api = doc("api.md");
+    let before = doc_line(
+        "api.md",
+        "**A synchronous log push can be answered `500` after part of it is stored.**",
+    );
+    assert!(
+        api.contains(&format!("{before}\n\n{B_API_PARAGRAPH}\n")),
+        "docs/api.md §1.0 holds the log and trace paragraph after the paragraph it follows"
+    );
+
+    let conf = doc("configuration.md");
+    let rows: Vec<&str> = conf
+        .lines()
+        .filter(|l| l.starts_with("| `PULSUS_LANDING_BATCH_MS` |"))
+        .collect();
+    assert_eq!(rows, vec![B_CONF_ROW], "the PULSUS_LANDING_BATCH_MS row");
+    assert!(
+        conf.contains(&format!("\n  batch_ms: 200\n{B_YAML_LINE}\n")),
+        "the YAML schema line after `batch_ms`"
+    );
+
+    for (name, old, new) in B_EDITS {
+        let text = doc(name);
+        assert!(
+            text.lines().any(|l| l.contains(new)),
+            "docs/{name} carries {new:?}"
+        );
+        if !old.is_empty() {
+            assert!(!text.contains(old), "docs/{name} no longer carries {old:?}");
+        }
+    }
+
+    for name in [
+        "architecture.md",
+        "schemas.md",
+        "ingest-one-source-table.md",
+    ] {
+        assert!(
+            doc(name).starts_with(&format!("{B_BANNER}\n")),
+            "docs/{name} starts with the batching banner"
+        );
+    }
+    let flat: String = B_BANNER
+        .lines()
+        .map(|l| l.strip_prefix("> ").unwrap_or(l.trim_start_matches('>')))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let svg = doc("diagrams/ingestion-pipeline.svg");
+    let desc = svg
+        .split_once("<desc id=\"desc\">")
+        .map(|(_, rest)| rest)
+        .expect("the drawing has a description");
+    assert!(
+        desc.starts_with(&flat),
+        "the drawing's description starts with the banner"
+    );
+    let first_text = svg
+        .split_once("<text")
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .and_then(|(_, rest)| rest.split_once("</text>"))
+        .map(|(text, _)| text)
+        .expect("the drawing has a text line");
+    assert_eq!(
+        first_text, flat,
+        "the drawing's first text line is the banner"
+    );
+}

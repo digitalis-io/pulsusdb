@@ -296,18 +296,21 @@ impl MetricWriter {
         let lru_for_hook = series_lru.clone();
         let descriptors_for_hook = descriptors.clone();
         let on_commit: crate::writer::landing::CommitHook<MetricLandingRow> =
-            Arc::new(move |rows: &[MetricLandingRow]| {
+            Arc::new(move |parts: &[&[MetricLandingRow]]| {
                 {
                     let mut lru = lru_for_hook.lock().expect("series lru mutex poisoned");
-                    for key in promotion_keys(rows) {
-                        lru.insert(key);
+                    for rows in parts {
+                        for key in promotion_keys(rows) {
+                            lru.insert(key);
+                        }
                     }
                 }
                 let mut sent = descriptors_for_hook
                     .lock()
                     .expect("descriptor cache mutex poisoned");
-                for row in rows
+                for row in parts
                     .iter()
+                    .flat_map(|rows| rows.iter())
                     .filter(|row| row.kind == MetricLandingRow::KIND_METADATA)
                 {
                     sent.promote(
@@ -332,6 +335,8 @@ impl MetricWriter {
             on_commit: Some(on_commit),
             retries: runtime.metrics_landing_retries,
             max_rows: runtime.metrics_landing_max_rows,
+            batch_settings: None,
+            token_rng: Mutex::new(XorShift64::seeded()),
         });
 
         let (landing_tx, landing_rx) = mpsc::unbounded_channel::<LandingBlock<MetricLandingRow>>();
@@ -340,7 +345,9 @@ impl MetricWriter {
         // waiting for a later push. A worker holds the lock only while
         // taking a block, so up to `metrics_landing_inserters` inserts
         // overlap.
-        let landing_rx = Arc::new(tokio::sync::Mutex::new(landing_rx));
+        let landing_rx = Arc::new(tokio::sync::Mutex::new(
+            crate::writer::landing::LandingQueue::new(landing_rx),
+        ));
         // Every task goes into the boundary, which is what joins them: a task
         // this writer spawned and nothing awaits can be cancelled by runtime
         // teardown mid-settlement.
@@ -943,6 +950,7 @@ impl MetricWriter {
             claim,
             waiter,
             admitted_at,
+            None,
         );
         if let Err(closed) = self.shared.landing_tx.send(block) {
             let ctx = self.shared.ctx.clone();
@@ -1525,6 +1533,7 @@ mod tests {
                 ClaimTicket::inert(),
                 Some(tx),
                 tokio::time::Instant::now(),
+                None,
             );
 
             let held = held_bytes(&block);

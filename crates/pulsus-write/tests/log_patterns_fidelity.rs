@@ -42,7 +42,6 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_config::WriterConfig;
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
 use pulsus_write::{LogWriter, ParsedLogs, WriterTables};
@@ -202,7 +201,7 @@ fn loki_push_json(ts_ns: i64) -> Vec<u8> {
 async fn admit_and_drain(db: &str, batch: ParsedLogs) {
     let writer = LogWriter::new_with_tables(
         db_client(db).await,
-        &WriterConfig::default(),
+        &unbatched_config(),
         WriterTables::logs_default(),
     );
     pulsus_write::LogSink::admit_flush(
@@ -384,4 +383,14 @@ async fn re_admitting_an_identical_batch_sums_counts_at_log_metrics_parity() {
     );
 
     drop_database(&client, &db).await;
+}
+
+/// `WriterConfig::default()` with log and trace batching off (issue #494
+/// part 2), so each case here keeps meaning one push per insert.
+#[allow(dead_code)]
+fn unbatched_config() -> pulsus_config::WriterConfig {
+    pulsus_config::WriterConfig {
+        landing_batch_ms: 0,
+        ..pulsus_config::WriterConfig::default()
+    }
 }

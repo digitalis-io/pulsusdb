@@ -47,6 +47,23 @@ where
         let _ = extra;
         self.insert(table, rows)
     }
+
+    /// Stub (issue #494 part 2): [`Self::insert_with`] over `parts`
+    /// concatenated by copy.
+    fn insert_parts_with<'a>(
+        &'a self,
+        table: &'a str,
+        parts: &'a [&'a [R]],
+        extra: &'a QuerySettings,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>>
+    where
+        R: Clone + Send + Sync + 'a,
+    {
+        Box::pin(async move {
+            let all: Vec<R> = parts.iter().flat_map(|p| p.iter().cloned()).collect();
+            self.insert_with(table, &all, extra).await
+        })
+    }
 }
 
 /// Production [`BlockInserter`]: a thin adapter over

@@ -139,6 +139,19 @@ pub struct WriterRuntime {
     /// admitted push is strictly under the count the server would end a
     /// block at.
     pub trace_landing_max_rows: u64,
+    /// `PULSUS_LANDING_BATCH_MS` (issue #494 part 2): how long a landing
+    /// worker keeps adding queued log or trace blocks to the batch it is
+    /// forming, counted from its take of the batch's first block. Zero sends
+    /// every block alone; metrics blocks are never batched.
+    pub landing_batch: Duration,
+    /// Test seam: a lapse before each attempt is authorized, bounded by the
+    /// batch's deadline. Zero in production.
+    #[cfg(test)]
+    pub(crate) test_lapse: Duration,
+    /// Test seam: a fixed backoff between attempts, in place of the jittered
+    /// one, bounded by the batch's deadline.
+    #[cfg(test)]
+    pub(crate) test_backoff: Option<Duration>,
 }
 
 impl WriterRuntime {
@@ -167,6 +180,11 @@ impl WriterRuntime {
             trace_landing_retries: cfg.trace_landing_retries,
             trace_landing_inserters: cfg.trace_landing_inserters,
             trace_landing_max_rows: cfg.trace_landing_max_rows,
+            landing_batch: Duration::from_millis(cfg.landing_batch_ms),
+            #[cfg(test)]
+            test_lapse: Duration::ZERO,
+            #[cfg(test)]
+            test_backoff: None,
         }
     }
 }

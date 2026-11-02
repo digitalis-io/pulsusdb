@@ -262,6 +262,68 @@ pub struct SpoolWriter {
     metrics: Arc<dyn SpoolCounters>,
     uncertain_readme_written: AtomicBool,
     next_seq: AtomicU64,
+    /// A case's stand-in for the disk: see [`SpoolGate`]. Test-only.
+    #[cfg(test)]
+    gate: Option<Arc<SpoolGate>>,
+}
+
+/// A test-only stand-in for the disk under [`SpoolWriter::write`]: it records
+/// each write instead of making a file, and in park mode holds every write
+/// open until the case releases it, counting how many are open at once. A
+/// case on a paused clock needs it because file I/O lets the clock run on.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SpoolGate {
+    /// Writes may finish only with a permit; `None` lets every write through.
+    pub(crate) park: Option<tokio::sync::Semaphore>,
+    pub(crate) open: std::sync::atomic::AtomicUsize,
+    pub(crate) max_open: std::sync::atomic::AtomicUsize,
+    pub(crate) records: std::sync::Mutex<Vec<GateRecord>>,
+}
+
+/// One write the gate took.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GateRecord {
+    pub(crate) kind: SpoolKind,
+    pub(crate) table: String,
+    pub(crate) rows: usize,
+    pub(crate) error: String,
+    pub(crate) ended: tokio::time::Instant,
+}
+
+#[cfg(test)]
+impl SpoolGate {
+    /// A gate that holds every write until [`Self::release`].
+    pub(crate) fn parked() -> Self {
+        SpoolGate {
+            park: Some(tokio::sync::Semaphore::new(0)),
+            ..SpoolGate::default()
+        }
+    }
+
+    /// Lets `n` more writes finish.
+    pub(crate) fn release(&self, n: usize) {
+        if let Some(park) = &self.park {
+            park.add_permits(n);
+        }
+    }
+
+    async fn write(&self, kind: SpoolKind, table: &str, rows: usize, error: &str) {
+        let open = self.open.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_open.fetch_max(open, Ordering::SeqCst);
+        if let Some(park) = &self.park {
+            park.acquire().await.expect("the gate is open").forget();
+        }
+        self.records.lock().expect("records").push(GateRecord {
+            kind,
+            table: table.to_string(),
+            rows,
+            error: error.to_string(),
+            ended: tokio::time::Instant::now(),
+        });
+        self.open.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl SpoolWriter {
@@ -271,7 +333,16 @@ impl SpoolWriter {
             metrics,
             uncertain_readme_written: AtomicBool::new(false),
             next_seq: AtomicU64::new(0),
+            #[cfg(test)]
+            gate: None,
         }
+    }
+
+    /// This writer with `gate` in place of the disk. Test-only.
+    #[cfg(test)]
+    pub(crate) fn with_gate(mut self, gate: Arc<SpoolGate>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Writes `rows` (with `error`'s message) to `kind`'s subdirectory for
@@ -287,6 +358,11 @@ impl SpoolWriter {
         rows: &[R],
         error: &str,
     ) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(gate) = &self.gate {
+            gate.write(kind, table, rows.len(), error).await;
+            return Ok(());
+        }
         let dir = self.root.join(kind.dir_name()).join(table);
         fs::create_dir_all(&dir).await?;
 

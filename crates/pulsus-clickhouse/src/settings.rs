@@ -909,6 +909,18 @@ mod tests {
         }
     }
 
+    /// **2-U17 (issue #494 part 2): every landing insert pins the partition
+    /// limit**, not the trace insert alone: log and metrics pushes gained the
+    /// 100-date admission ceiling, and the server refuses a block above
+    /// `max_partitions_per_insert_block` partitions only while
+    /// `throw_on_max_partitions_per_insert_block` is on.
+    #[test]
+    fn every_landing_insert_pins_the_partition_limit() {
+        let s = QuerySettings::landing_insert("t", 1_048_576);
+        assert_eq!(s.get("max_partitions_per_insert_block"), Some("100"));
+        assert_eq!(s.get("throw_on_max_partitions_per_insert_block"), Some("1"));
+    }
+
     /// **W1 (issue #623): a landing insert fails when a view does not
     /// write.** The four view settings are pinned to the server's own
     /// defaults, so a profile cannot turn a failed view into a stored push

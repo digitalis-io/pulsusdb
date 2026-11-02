@@ -240,6 +240,18 @@ impl ChClient {
 
     /// [`Self::insert_block`] with `extra` settings on this one insert
     /// (issue #560).
+    /// Stub (issue #494 part 2): [`Self::insert_block_with`] over `parts`
+    /// concatenated by copy.
+    pub async fn insert_parts_with<R: ChRow + Clone>(
+        &self,
+        table: &str,
+        parts: &[&[R]],
+        extra: &QuerySettings,
+    ) -> Result<(), ChError> {
+        let all: Vec<R> = parts.iter().flat_map(|p| p.iter().cloned()).collect();
+        self.insert_block_with(table, &all, extra).await
+    }
+
     pub async fn insert_block_with<R: ChRow>(
         &self,
         table: &str,

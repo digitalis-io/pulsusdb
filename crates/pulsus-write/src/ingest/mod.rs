@@ -101,7 +101,7 @@ pub enum AdmitRefusal {
     /// `max_partitions_per_insert_block`. Refused whole (`413`) rather than
     /// admitted, answered `200` by the route and left absent from the new
     /// tables with nobody told.
-    PushSpansTooManyDays { days: u64, day_limit: u64 },
+    PushTooManyDays { days: u64, day_limit: u64 },
 }
 
 impl From<Backpressure> for AdmitRefusal {
@@ -126,10 +126,10 @@ pub fn push_too_large_message(rows: u64, row_limit: u64, bytes: u64, byte_limit:
     )
 }
 
-/// The message [`AdmitRefusal::PushSpansTooManyDays`] is answered with, on
+/// The message [`AdmitRefusal::PushTooManyDays`] is answered with, on
 /// every transport that can reach it (issue #586). It names the push's own
 /// date count and the limit, the shape [`push_too_large_message`] has.
-pub fn push_spans_too_many_days_message(days: u64, day_limit: u64) -> String {
+pub fn push_too_many_days_message(days: u64, day_limit: u64) -> String {
     format!("push covers too many UTC dates for one block: {days} dates (limit {day_limit})")
 }
 

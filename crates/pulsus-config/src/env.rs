@@ -74,6 +74,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_TRACE_LANDING_RETRIES",
     "PULSUS_TRACE_LANDING_INSERTERS",
     "PULSUS_TRACE_LANDING_MAX_ROWS",
+    "PULSUS_LANDING_BATCH_MS",
     "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
     "PULSUS_OTLP_TRANSLATION_STRATEGY",
     "PULSUS_OTLP_PROMOTE_SCOPE_METADATA",
@@ -393,6 +394,9 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("PULSUS_TRACE_LANDING_MAX_ROWS") {
         cfg.writer.trace_landing_max_rows = parse_int("PULSUS_TRACE_LANDING_MAX_ROWS", &v)?;
+    }
+    if let Some(v) = read("PULSUS_LANDING_BATCH_MS") {
+        cfg.writer.landing_batch_ms = parse_int("PULSUS_LANDING_BATCH_MS", &v)?;
     }
     if let Some(v) = read("PULSUS_METRICS_EXP_HISTOGRAM_MODE") {
         cfg.exp_histogram_mode = parse_enum("PULSUS_METRICS_EXP_HISTOGRAM_MODE", &v)?;

@@ -207,6 +207,8 @@ impl TraceLandingPath {
             on_commit: None,
             retries: runtime.trace_landing_retries,
             max_rows: runtime.trace_landing_max_rows,
+            batch_settings: None,
+            token_rng: Mutex::new(XorShift64::seeded()),
         });
 
         let (tx, rx) = mpsc::unbounded_channel::<LandingBlock<TraceLandingRow>>();
@@ -215,7 +217,9 @@ impl TraceLandingPath {
         // waiting for a later push. A worker holds the lock only while
         // taking a block, so up to `trace_landing_inserters` inserts
         // overlap.
-        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let rx = Arc::new(tokio::sync::Mutex::new(
+            crate::writer::landing::LandingQueue::new(rx),
+        ));
         boundary.track_background(
             (0..runtime.trace_landing_inserters.max(1))
                 .map(|_| spawn_landing_worker(ctx.clone(), rx.clone(), boundary.watch()))
@@ -293,6 +297,7 @@ impl TraceLandingPath {
             claim,
             waiter,
             admitted_at,
+            None,
         );
         if let Err(closed) = self.tx.send(block) {
             let ctx = self.ctx.clone();

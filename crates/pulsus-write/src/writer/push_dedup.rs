@@ -1936,7 +1936,17 @@ pub(crate) struct ClaimTicket {
     /// it (issue #602). See [`ClaimTicket::replay_safe`].
     replay_safe: bool,
     claims: Vec<PushDigest>,
+    /// A case's record of what this ticket reported. Test-only.
+    #[cfg(test)]
+    recorder: Option<(u64, ClaimRecorder)>,
 }
+
+/// Every outcome a recorded ticket reported, as the index would see it (an
+/// uncertain ending of a replay-safe ticket is reported not committed): the
+/// ticket's id, the outcome and the instant. Test-only.
+#[cfg(test)]
+pub(crate) type ClaimRecorder =
+    Arc<std::sync::Mutex<Vec<(u64, TargetOutcome, tokio::time::Instant)>>>;
 
 impl ClaimTicket {
     pub(crate) fn new(dedup: Option<Arc<PushDedup>>, counts_for_ack: bool) -> Self {
@@ -1945,7 +1955,16 @@ impl ClaimTicket {
             counts_for_ack,
             replay_safe: false,
             claims: Vec::new(),
+            #[cfg(test)]
+            recorder: None,
         }
+    }
+
+    /// This ticket, recording what it reports under `id`. Test-only.
+    #[cfg(test)]
+    pub(crate) fn recorded(mut self, id: u64, recorder: ClaimRecorder) -> Self {
+        self.recorder = Some((id, recorder));
+        self
     }
 
     /// Marks the ticket's rows **replay-safe**: an uncertain ending is
@@ -1988,13 +2007,21 @@ impl ClaimTicket {
     }
 
     fn report(&mut self, outcome: TargetOutcome) {
-        let Some(dedup) = self.dedup.as_ref() else {
-            self.claims.clear();
-            return;
-        };
         let outcome = match outcome {
             TargetOutcome::Uncertain if self.replay_safe => TargetOutcome::NotCommitted,
             other => other,
+        };
+        #[cfg(test)]
+        if let Some((id, recorder)) = self.recorder.take() {
+            recorder.lock().expect("claim recorder").push((
+                id,
+                outcome,
+                tokio::time::Instant::now(),
+            ));
+        }
+        let Some(dedup) = self.dedup.as_ref() else {
+            self.claims.clear();
+            return;
         };
         for key in std::mem::take(&mut self.claims) {
             dedup.settle_target(key, outcome, self.counts_for_ack);

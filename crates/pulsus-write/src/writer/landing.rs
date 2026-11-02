@@ -153,6 +153,7 @@ pub(crate) struct LandingBlock<R> {
 impl<R> LandingBlock<R> {
     /// The one place a `LandingBlock` is built, so the case that prices what
     /// one holds prices the same value the queue does.
+    #[allow(clippy::too_many_arguments)] // stub: the span is ignored
     pub(crate) fn seal(
         rows: Vec<R>,
         bytes: u64,
@@ -160,7 +161,9 @@ impl<R> LandingBlock<R> {
         claim: ClaimTicket,
         waiter: Option<oneshot::Sender<Result<(), WriteError>>>,
         admitted_at: tokio::time::Instant,
+        span: Option<(i64, i64)>,
     ) -> Self {
+        let _ = span;
         LandingBlock {
             rows,
             bytes,
@@ -216,7 +219,56 @@ impl<R> LandingBlock<R> {
 ///
 /// A named alias rather than an inline `Option<Arc<dyn Fn(..)>>`, for Clippy's
 /// `type_complexity`.
-pub(crate) type CommitHook<R> = Arc<dyn Fn(&[R]) + Send + Sync>;
+pub(crate) type CommitHook<R> = Arc<dyn Fn(&[&[R]]) + Send + Sync>;
+
+/// A landing row whose receive stamp a batch can read and set (issue #494
+/// part 2).
+pub(crate) trait LandingRow {
+    fn received_ms(&self) -> i64;
+    fn set_received_ms(&mut self, received_ms: i64);
+}
+
+impl LandingRow for crate::writer::rows::LogLandingRow {
+    fn received_ms(&self) -> i64 {
+        self.received_ms
+    }
+    fn set_received_ms(&mut self, received_ms: i64) {
+        crate::writer::rows::LogLandingRow::set_received_ms(self, received_ms);
+    }
+}
+
+impl LandingRow for crate::writer::rows::TraceLandingRow {
+    fn received_ms(&self) -> i64 {
+        self.received_ms
+    }
+    fn set_received_ms(&mut self, received_ms: i64) {
+        crate::writer::rows::TraceLandingRow::set_received_ms(self, received_ms);
+    }
+}
+
+impl LandingRow for crate::writer::rows::MetricLandingRow {
+    fn received_ms(&self) -> i64 {
+        self.received_ms
+    }
+    fn set_received_ms(&mut self, received_ms: i64) {
+        let _ = received_ms;
+    }
+}
+
+/// A landing queue: its receiver, and a carried block. Stub: nothing is
+/// carried yet.
+pub(crate) struct LandingQueue<R> {
+    rx: mpsc::UnboundedReceiver<LandingBlock<R>>,
+}
+
+impl<R> LandingQueue<R> {
+    pub(crate) fn new(rx: mpsc::UnboundedReceiver<LandingBlock<R>>) -> Self {
+        LandingQueue { rx }
+    }
+}
+
+/// The receiver shared by one signal's workers.
+pub(crate) type SharedQueue<R> = Arc<tokio::sync::Mutex<LandingQueue<R>>>;
 
 /// What a landing worker needs to run a block to an ending.
 pub(crate) struct LandingContext<R> {
@@ -240,6 +292,10 @@ pub(crate) struct LandingContext<R> {
     /// row limits carry on every insert sent against this table, read from
     /// here when the block is sealed so no config key is named twice.
     pub(crate) max_rows: u64,
+    /// Stub (issue #494 part 2): unread yet.
+    pub(crate) batch_settings: Option<fn(&str, u64) -> QuerySettings>,
+    /// Stub (issue #494 part 2): unread yet.
+    pub(crate) token_rng: std::sync::Mutex<XorShift64>,
 }
 
 /// What the loop knows about a block short of a commit — **a value the loop
@@ -330,7 +386,7 @@ pub(crate) fn mint_landing_token(rng: &mut XorShift64) -> String {
 /// has passed, abandoned if in flight when it passes.
 pub(crate) fn spawn_landing_worker<R>(
     ctx: Arc<LandingContext<R>>,
-    rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<LandingBlock<R>>>>,
+    rx: SharedQueue<R>,
     mut watch: DrainWatch,
 ) -> tokio::task::JoinHandle<()>
 where
@@ -346,6 +402,7 @@ where
         loop {
             let block = {
                 let mut queue = rx.lock().await;
+                let queue = &mut queue.rx;
                 if watch.is_announced() {
                     queue.close();
                     queue.recv().await
@@ -517,7 +574,7 @@ where
     ctx.table_metrics
         .record_flush(block.rows.len() as u64, block.bytes, latency);
     if let Some(hook) = &ctx.on_commit {
-        hook(&block.rows);
+        hook(&[&block.rows]);
     }
     if let Some(waiter) = block.release(ctx, TargetOutcome::Committed) {
         let _ = waiter.send(Ok(()));
@@ -568,9 +625,25 @@ pub(crate) async fn settle_block<R>(
 }
 
 #[cfg(test)]
+#[path = "landing_batch_tests.rs"]
+mod batch_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::writer::rows::MetricLandingRow;
+
+    /// One log line with `body`, for the batch cases beside this module.
+    pub(super) fn log_row(body: String) -> crate::protocols::otlp_logs::LogRow {
+        crate::protocols::otlp_logs::LogRow {
+            service: "checkout".to_string(),
+            fingerprint: pulsus_model::Fingerprint::from_raw(7),
+            timestamp_ns: pulsus_model::UnixNano(1_700_000_000_000_000_000),
+            severity: 0,
+            body,
+            structured_metadata: String::new(),
+        }
+    }
 
     /// Counts insert calls and answers each at once.
     struct CountingInserter(std::sync::atomic::AtomicUsize);
@@ -616,6 +689,8 @@ mod tests {
             on_commit: None,
             retries: 0,
             max_rows: 1_000,
+            batch_settings: None,
+            token_rng: std::sync::Mutex::new(XorShift64::seeded()),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let boundary = crate::writer::drain::DrainBoundary::new();
@@ -636,9 +711,14 @@ mod tests {
             ClaimTicket::inert(),
             None,
             tokio::time::Instant::now(),
+            None,
         ))
         .unwrap_or_else(|_| panic!("the queue is open"));
-        let worker = spawn_landing_worker(ctx, Arc::new(tokio::sync::Mutex::new(rx)), watch);
+        let worker = spawn_landing_worker(
+            ctx,
+            Arc::new(tokio::sync::Mutex::new(LandingQueue::new(rx))),
+            watch,
+        );
         tokio::time::timeout(Duration::from_secs(10), worker)
             .await
             .expect("the worker ends once the cancelled queue is empty")

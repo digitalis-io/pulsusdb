@@ -238,7 +238,7 @@ impl TraceWriter {
             // the server throws above `max_partitions_per_insert_block`.
             let days = trace_landing::distinct_span_days(&landing);
             if days > trace_landing::TRACE_LANDING_DAY_LIMIT {
-                return Err(AdmitRefusal::PushSpansTooManyDays {
+                return Err(AdmitRefusal::PushTooManyDays {
                     days,
                     day_limit: trace_landing::TRACE_LANDING_DAY_LIMIT,
                 });

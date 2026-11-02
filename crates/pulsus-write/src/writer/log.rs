@@ -242,10 +242,12 @@ impl LogWriter {
         // which is what removed the need for a registration backfill.
         let lru_for_hook = lru.clone();
         let on_commit: crate::writer::landing::CommitHook<LogLandingRow> =
-            Arc::new(move |rows: &[LogLandingRow]| {
+            Arc::new(move |parts: &[&[LogLandingRow]]| {
                 let mut guard = lru_for_hook.lock().expect("stream lru mutex poisoned");
-                for key in promotion_keys(rows) {
-                    guard.insert(key);
+                for rows in parts {
+                    for key in promotion_keys(rows) {
+                        guard.insert(key);
+                    }
                 }
             });
 
@@ -259,6 +261,8 @@ impl LogWriter {
             on_commit: Some(on_commit),
             retries: runtime.log_landing_retries,
             max_rows: runtime.log_landing_max_rows,
+            batch_settings: None,
+            token_rng: Mutex::new(XorShift64::seeded()),
         });
 
         let (landing_tx, landing_rx) = mpsc::unbounded_channel::<LandingBlock<LogLandingRow>>();
@@ -266,7 +270,9 @@ impl LogWriter {
         // which stores one permit and would leave a second queued block
         // waiting for a later push. A worker holds the lock only while
         // taking a block, so up to `log_landing_inserters` inserts overlap.
-        let landing_rx = Arc::new(tokio::sync::Mutex::new(landing_rx));
+        let landing_rx = Arc::new(tokio::sync::Mutex::new(
+            crate::writer::landing::LandingQueue::new(landing_rx),
+        ));
         // Every task goes into the boundary, which is what joins them: a task
         // this writer spawned and nothing awaits can be cancelled by runtime
         // teardown mid-settlement.
@@ -638,6 +644,7 @@ impl LogWriter {
             claim,
             waiter,
             admitted_at,
+            None,
         );
         if let Err(closed) = self.shared.landing_tx.send(block) {
             let ctx = self.shared.ctx.clone();
@@ -1101,6 +1108,7 @@ mod tests {
                 ClaimTicket::inert(),
                 Some(tx),
                 tokio::time::Instant::now(),
+                None,
             );
 
             let held = held_bytes(&block);

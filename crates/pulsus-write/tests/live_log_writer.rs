@@ -118,7 +118,7 @@ async fn live_writer(db: String) -> (ChClient, String, Arc<ChClient>, LogWriter)
     );
     let writer = LogWriter::new_with_tables(
         client.clone(),
-        &WriterConfig::default(),
+        &unbatched_config(),
         WriterTables::logs_default(),
     );
     (bootstrap, db, client, writer)
@@ -390,4 +390,169 @@ async fn the_log_landing_insert_omits_event_id_so_the_server_fills_it() {
 
     writer.shutdown(Duration::from_secs(5)).await;
     drop_database(&bootstrap, &db).await;
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+struct LogCounts {
+    ended: u64,
+    pending: u64,
+}
+
+/// Waits until every statement `filter` selects in `client`'s
+/// `system.query_log` has its ending row, and at least `at_least` have ended.
+///
+/// One `SYSTEM FLUSH LOGS` is not a barrier: a statement's `QueryFinish` row
+/// can be queued after its client has the answer. Its `QueryStart` row is
+/// queued before it runs, so once flushed it names every statement sent; an
+/// execution is a `query_id` with its `query_start_time_microseconds`, which
+/// both rows share. `filter` must not name `type`. Fails after 60 s.
+async fn settle_query_log(client: &ChClient, filter: &str, at_least: u64) {
+    let sql = format!(
+        "SELECT toUInt64(countIf(e)) AS ended, toUInt64(countIf(s AND NOT e)) AS pending \
+         FROM (SELECT query_id, max(type = 'QueryStart') AS s, \
+                 max(type IN ('QueryFinish', 'ExceptionWhileProcessing', \
+                              'ExceptionBeforeStart')) AS e \
+               FROM system.query_log \
+               WHERE ({filter}) AND query NOT LIKE '%system.query_log%' \
+               GROUP BY query_id, query_start_time_microseconds)"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        client
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("SYSTEM FLUSH LOGS");
+        let mut stream = client
+            .query_stream::<LogCounts>(&sql, &QuerySettings::new())
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{sql}"));
+        let counts = stream
+            .next()
+            .await
+            .expect("one row")
+            .expect("decode LogCounts");
+        drop(stream);
+        if counts.ended >= at_least && counts.pending == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "system.query_log did not settle within 60 s for {filter}: {counts:?}, \
+             at least {at_least} expected"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// **2-L1 (issue #494 part 2).** Eight sync pushes of 50 distinct lines,
+/// admitted together through a writer with the 1000 ms window, are one
+/// landing insert on the server, and every line is stored once.
+#[tokio::test]
+async fn eight_log_pushes_admitted_together_are_one_landing_insert() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_write_it_log_batch");
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    drop_database(&bootstrap, &db).await;
+    run_init(&bootstrap, &RenderCtx::for_tests(&db, 7))
+        .await
+        .expect("run_init");
+    let client = Arc::new(
+        ChClient::new(test_config(&db))
+            .await
+            .expect("connect (target db)"),
+    );
+    let cfg = WriterConfig {
+        landing_batch_ms: 1_000,
+        ..WriterConfig::default()
+    };
+    let writer = LogWriter::new_with_tables(client.clone(), &cfg, WriterTables::logs_default());
+    // This run's statements: the database is recreated each run, but the
+    // log keeps earlier runs' rows under the same name.
+    let start = count(
+        &client,
+        "SELECT toUInt64(toUnixTimestamp64Micro(now64(6))) AS n",
+    )
+    .await;
+
+    let ts = now_ns();
+    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
+    let waits: Vec<_> = (0..8u128)
+        .map(|push| {
+            let (labels, _) = LabelSet::from_normalized([
+                ("service_name".to_string(), SERVICE.to_string()),
+                ("push".to_string(), push.to_string()),
+            ]);
+            let batch = ParsedLogs {
+                rows: (0..50)
+                    .map(|line| LogRow {
+                        service: SERVICE.to_string(),
+                        fingerprint: Fingerprint::from_raw(100 + push),
+                        timestamp_ns: UnixNano(ts + line),
+                        severity: 0,
+                        body: format!("push {push} line {line}"),
+                        structured_metadata: String::new(),
+                    })
+                    .collect(),
+                streams: vec![StreamRow {
+                    month: Date::start_of_month_utc(ts).expect("a representable month"),
+                    fingerprint: Fingerprint::from_raw(100 + push),
+                    service: SERVICE.to_string(),
+                    labels,
+                    updated_ns: ts,
+                }],
+                ..Default::default()
+            };
+            writer
+                .admit_flush(&tenant, batch, PushHeaders::default())
+                .expect("admitted")
+        })
+        .collect();
+    for wait in waits {
+        wait.await.expect("every push is answered Ok");
+    }
+
+    let filter = format!(
+        "current_database = '{db}' AND query_kind = 'Insert' \
+         AND startsWith(query, 'INSERT INTO `log_landing`') \
+         AND query_start_time_microseconds >= fromUnixTimestamp64Micro(toInt64({start}))"
+    );
+    settle_query_log(&client, &filter, 1).await;
+    assert_eq!(
+        count(
+            &client,
+            &format!(
+                "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' AND {filter}"
+            )
+        )
+        .await,
+        1,
+        "one landing insert"
+    );
+    assert_eq!(
+        count(&client, "SELECT count() AS n FROM log_samples").await,
+        400
+    );
+    assert_eq!(
+        count(&client, "SELECT uniqExact(body) AS n FROM log_samples").await,
+        400
+    );
+
+    writer.shutdown(Duration::from_secs(5)).await;
+    drop_database(&bootstrap, &db).await;
+}
+
+/// `WriterConfig::default()` with log and trace batching off (issue #494
+/// part 2), so each case here keeps meaning one push per insert.
+#[allow(dead_code)]
+fn unbatched_config() -> pulsus_config::WriterConfig {
+    pulsus_config::WriterConfig {
+        landing_batch_ms: 0,
+        ..pulsus_config::WriterConfig::default()
+    }
 }

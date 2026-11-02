@@ -391,6 +391,12 @@ pub struct WriterConfig {
     /// fits one block; the same figure is pinned as the insert's own
     /// `max_insert_block_size`. Accepted range `1000..=10000000`.
     pub trace_landing_max_rows: u64,
+    /// `PULSUS_LANDING_BATCH_MS` (issue #494 part 2): how long a landing
+    /// worker keeps adding queued log or trace blocks to the insert it is
+    /// forming, from the moment it takes the batch's first block. `0` sends
+    /// every block as its own insert. Metrics blocks are never batched.
+    /// Accepted range `0..=10000`.
+    pub landing_batch_ms: u64,
 }
 
 impl Default for WriterConfig {
@@ -414,6 +420,7 @@ impl Default for WriterConfig {
             trace_landing_retries: 3,
             trace_landing_inserters: 4,
             trace_landing_max_rows: 1_048_576,
+            landing_batch_ms: 1_000,
         }
     }
 }

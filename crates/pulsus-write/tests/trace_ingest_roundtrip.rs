@@ -29,7 +29,6 @@ use prost::Message;
 use tower::ServiceExt;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_config::WriterConfig;
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
 use pulsus_write::ingest::http::traces;
@@ -170,7 +169,7 @@ async fn sync_post_round_trips_exact_counts_on_the_span_tables() {
 
     let writer = Arc::new(TraceWriter::new_with_tables(
         Arc::new(ChClient::new(db_config(db)).await.expect("connect writer")),
-        &WriterConfig::default(),
+        &unbatched_config(),
         TraceWriterTables::traces_default(),
     ));
     let router: Router = Router::new()
@@ -270,7 +269,7 @@ async fn status_message_round_trips_through_the_product_ingest_path() {
 
     let writer = Arc::new(TraceWriter::new_with_tables(
         Arc::new(ChClient::new(db_config(db)).await.expect("connect writer")),
-        &WriterConfig::default(),
+        &unbatched_config(),
         TraceWriterTables::traces_default(),
     ));
     let router: Router = Router::new()
@@ -302,4 +301,14 @@ async fn status_message_round_trips_through_the_product_ingest_path() {
     )
     .await;
     assert_eq!(empty, 1, "a span without a Status stores the '' default");
+}
+
+/// `WriterConfig::default()` with log and trace batching off (issue #494
+/// part 2), so each case here keeps meaning one push per insert.
+#[allow(dead_code)]
+fn unbatched_config() -> pulsus_config::WriterConfig {
+    pulsus_config::WriterConfig {
+        landing_batch_ms: 0,
+        ..pulsus_config::WriterConfig::default()
+    }
 }

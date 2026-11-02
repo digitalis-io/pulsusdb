@@ -21,7 +21,7 @@ pub use ingest::traces::{
 };
 pub use ingest::{
     AdmitRefusal, Backpressure, FlushWait, KEY_REUSED_MESSAGE, LogSink, PushHeaders,
-    push_spans_too_many_days_message, push_too_large_message,
+    push_too_large_message, push_too_many_days_message,
 };
 pub use protocols::log_level::LevelDiscovery;
 pub use protocols::loki_push::{
