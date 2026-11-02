@@ -48,8 +48,12 @@ where
         self.insert(table, rows)
     }
 
-    /// Stub (issue #494 part 2): [`Self::insert_with`] over `parts`
-    /// concatenated by copy.
+    /// [`Self::insert_with`] over `parts`, written in order as one block
+    /// (issue #494 part 2: a landing batch is its members' rows). The landing
+    /// loop calls only this. The default calls [`Self::insert_with`] with the
+    /// one part, or with the parts concatenated, so an implementation that
+    /// sends a slice needs no change; the production inserter overrides it
+    /// and copies no row.
     fn insert_parts_with<'a>(
         &'a self,
         table: &'a str,
@@ -59,10 +63,13 @@ where
     where
         R: Clone + Send + Sync + 'a,
     {
-        Box::pin(async move {
-            let all: Vec<R> = parts.iter().flat_map(|p| p.iter().cloned()).collect();
-            self.insert_with(table, &all, extra).await
-        })
+        match parts {
+            [one] => self.insert_with(table, one, extra),
+            _ => Box::pin(async move {
+                let all: Vec<R> = parts.iter().flat_map(|p| p.iter().cloned()).collect();
+                self.insert_with(table, &all, extra).await
+            }),
+        }
     }
 }
 
@@ -123,6 +130,24 @@ impl<R: ChRow> BlockInserter<R> for ChBlockInserter {
         Box::pin(async move {
             let merged = self.merged_settings(extra);
             self.client.insert_block_with(table, rows, &merged).await
+        })
+    }
+
+    /// **Overridden, not inherited** (issue #494 part 2): the members' row
+    /// slices go to [`ChClient::insert_parts_with`] as they are, so no row is
+    /// copied to join a batch.
+    fn insert_parts_with<'a>(
+        &'a self,
+        table: &'a str,
+        parts: &'a [&'a [R]],
+        extra: &'a QuerySettings,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>>
+    where
+        R: Clone + Send + Sync + 'a,
+    {
+        Box::pin(async move {
+            let merged = self.merged_settings(extra);
+            self.client.insert_parts_with(table, parts, &merged).await
         })
     }
 }

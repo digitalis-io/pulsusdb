@@ -70,8 +70,8 @@ use crate::writer::config::WriterRuntime;
 use crate::writer::drain::{AdmissionPass, DrainBoundary};
 use crate::writer::error::WriteError;
 use crate::writer::landing::{
-    LandingBlock, LandingContext, LandingFate, MSG_SHUTDOWN_QUEUED, TerminalCause, landing_charge,
-    mint_landing_token, settle_block, spawn_landing_worker,
+    LandingBlock, LandingContext, LandingFate, LandingQueue, MSG_SHUTDOWN_QUEUED, TerminalCause,
+    day_span, landing_charge, settle_block, spawn_landing_worker,
 };
 use crate::writer::metrics::{WriterMetrics, WriterMetricsSnapshot};
 use crate::writer::push_dedup::{self, Admission, ClaimTicket, PushDedup};
@@ -80,6 +80,16 @@ use crate::writer::rows::{LogLandingRow, LogSampleRow, LogStreamRow};
 use crate::writer::spool::SpoolWriter;
 use crate::writer::table::{BlockInserter, ChBlockInserter, XorShift64, spawn_dedup_ticker};
 use crate::writer::{AdmitMode, Admitted, Suppressed, note_target};
+
+/// How many distinct UTC dates one log push's lines may fall on (issue #494
+/// part 2): the server's `max_partitions_per_insert_block`, which every
+/// landing insert pins. 100 dates is admitted, 101 is refused `413`.
+pub const LOG_LANDING_DAY_LIMIT: u64 = pulsus_clickhouse::MAX_PARTITIONS_PER_INSERT_BLOCK;
+
+/// The UTC day, as days since the epoch, of a nanosecond timestamp.
+pub(crate) fn utc_day(timestamp_ns: i64) -> i64 {
+    timestamp_ns.div_euclid(86_400_000_000_000)
+}
 
 /// The one table the logs writer inserts into (issue #603).
 const LANDING_TABLE: &str = "log_landing";
@@ -144,10 +154,6 @@ struct Shared {
     runtime: Arc<WriterRuntime>,
     metrics: Arc<WriterMetrics>,
     lru: Arc<Mutex<StreamLru>>,
-    /// The token generator. One lock per admitted push: a token minted from
-    /// the clock alone would repeat for two pushes inside one millisecond,
-    /// and the second would be dropped as a resend of the first.
-    token_rng: Mutex<XorShift64>,
     /// The shutdown boundary: the admission gate, the announced deadline and
     /// every task this writer spawned (`writer::drain`).
     boundary: DrainBoundary,
@@ -261,7 +267,9 @@ impl LogWriter {
             on_commit: Some(on_commit),
             retries: runtime.log_landing_retries,
             max_rows: runtime.log_landing_max_rows,
-            batch_settings: None,
+            // Issue #494 part 2: log blocks are batched, and each batch's
+            // insert is built when it closes, under a token minted for it.
+            batch_settings: Some(QuerySettings::landing_insert),
             token_rng: Mutex::new(XorShift64::seeded()),
         });
 
@@ -269,10 +277,8 @@ impl LogWriter {
         // A mutex over the receiver rather than a `Notify` beside a deque,
         // which stores one permit and would leave a second queued block
         // waiting for a later push. A worker holds the lock only while
-        // taking a block, so up to `log_landing_inserters` inserts overlap.
-        let landing_rx = Arc::new(tokio::sync::Mutex::new(
-            crate::writer::landing::LandingQueue::new(landing_rx),
-        ));
+        // forming a batch, so up to `log_landing_inserters` inserts overlap.
+        let landing_rx = Arc::new(tokio::sync::Mutex::new(LandingQueue::new(landing_rx)));
         // Every task goes into the boundary, which is what joins them: a task
         // this writer spawned and nothing awaits can be cancelled by runtime
         // teardown mid-settlement.
@@ -301,7 +307,6 @@ impl LogWriter {
             runtime,
             metrics,
             lru,
-            token_rng: Mutex::new(XorShift64::seeded()),
             boundary,
         });
 
@@ -454,6 +459,26 @@ impl LogWriter {
         // limits.
         let total_rows_bound = batch.rows.len() as u64 + new_streams.len() as u64 + distinct_cap;
 
+        // Issue #494 part 2: the 100-date ceiling, decided before the zero-row
+        // and suppressed branches, so a refused push queues nothing — no
+        // passing stream of a partly valid push either. A line's date feeds
+        // `log_samples` and the rollup, both partitioned by UTC day, and the
+        // server refuses an insert above `max_partitions_per_insert_block`
+        // partitions. Returning here drops the un-sealed guard, which removes
+        // the claim.
+        let days: std::collections::BTreeSet<i64> = batch
+            .rows
+            .iter()
+            .map(|r| utc_day(r.timestamp_ns.0))
+            .collect();
+        if days.len() as u64 > LOG_LANDING_DAY_LIMIT {
+            return Err(AdmitRefusal::PushTooManyDays {
+                days: days.len() as u64,
+                day_limit: LOG_LANDING_DAY_LIMIT,
+            });
+        }
+        let span = day_span(days.iter().copied());
+
         // **A valid push with no rows of any kind is answered here**, before
         // the charge, the two ceilings and the reservation. It makes no block
         // and no insert, so it is charged for none: one block's fixed overhead
@@ -585,7 +610,7 @@ impl LogWriter {
             None
         };
 
-        self.queue_block(&pass, rows, total_bytes, claim, waiter, admitted_at);
+        self.queue_block(&pass, rows, total_bytes, claim, waiter, admitted_at, span);
 
         // Arms the claim: from here a drop no longer removes it, and the
         // target set is closed.
@@ -609,8 +634,9 @@ impl LogWriter {
             .fetch_add(batch.rejected, Ordering::Relaxed);
     }
 
-    /// Seals one block — minting its token, so two byte-identical pushes carry
-    /// different ones — and hands it to the queue.
+    /// Seals one block and hands it to the queue. Its insert's settings and
+    /// token are the batch's, built when the batch closes (issue #494 part
+    /// 2).
     ///
     /// **A block that reaches here after the queue closed is settled by a task
     /// of this admission's own**, through the same ending a worker gives a
@@ -620,6 +646,7 @@ impl LogWriter {
     /// **Nothing reaches that branch from outside**: the pass this takes is
     /// held for the whole admission, and the drain waits for every pass before
     /// the deadline that closes the queue is announced.
+    #[allow(clippy::too_many_arguments)] // one admission's pass, claim and waiter travel together
     fn queue_block(
         &self,
         pass: &AdmissionPass<'_>,
@@ -628,23 +655,16 @@ impl LogWriter {
         claim: ClaimTicket,
         waiter: Option<oneshot::Sender<Result<(), WriteError>>>,
         admitted_at: tokio::time::Instant,
+        span: Option<(i64, i64)>,
     ) {
-        let token = {
-            let mut rng = self
-                .shared
-                .token_rng
-                .lock()
-                .expect("token rng mutex poisoned");
-            mint_landing_token(&mut rng)
-        };
         let block = LandingBlock::seal(
             rows,
             bytes,
-            QuerySettings::landing_insert(&token, self.shared.ctx.max_rows),
+            QuerySettings::new(),
             claim,
             waiter,
             admitted_at,
-            None,
+            span,
         );
         if let Err(closed) = self.shared.landing_tx.send(block) {
             let ctx = self.shared.ctx.clone();
@@ -1101,10 +1121,7 @@ mod tests {
             let block = LandingBlock::seal(
                 rows,
                 landing_charge::<LogLandingRow>(line_bytes + stream_bytes + pattern_bound),
-                QuerySettings::landing_insert(
-                    &mint_landing_token(&mut XorShift64::seeded()),
-                    1_048_576,
-                ),
+                QuerySettings::new(),
                 ClaimTicket::inert(),
                 Some(tx),
                 tokio::time::Instant::now(),

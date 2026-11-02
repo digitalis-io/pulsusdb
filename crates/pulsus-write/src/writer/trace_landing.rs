@@ -41,8 +41,8 @@ use crate::writer::config::WriterRuntime;
 use crate::writer::drain::{AdmissionPass, DrainBoundary};
 use crate::writer::error::WriteError;
 use crate::writer::landing::{
-    LandingBlock, LandingContext, LandingFate, MSG_SHUTDOWN_QUEUED, TerminalCause, landing_charge,
-    mint_landing_token, settle_block, spawn_landing_worker,
+    LandingBlock, LandingContext, LandingFate, LandingQueue, MSG_SHUTDOWN_QUEUED, TerminalCause,
+    day_span, landing_charge, settle_block, spawn_landing_worker,
 };
 use crate::writer::metrics::{TraceWriterMetrics, TraceWriterMetricsSnapshot};
 use crate::writer::push_dedup::ClaimTicket;
@@ -69,6 +69,12 @@ pub(crate) const LANDING_TABLE: &str = "trace_landing";
 /// many dates is refused by the server after the block was sent. 100 dates
 /// is admitted, 101 is refused.
 pub const TRACE_LANDING_DAY_LIMIT: u64 = MAX_PARTITIONS_PER_INSERT_BLOCK;
+
+/// The first and last UTC day, as days since the epoch, of the push's spans
+/// (issue #494 part 2): what a batch's 100-day span cap reads.
+pub(crate) fn span_day_span(landing: &ParsedTraceLanding) -> Option<(i64, i64)> {
+    day_span(landing.resources.iter().map(|r| i64::from(r.day)))
+}
 
 /// The distinct UTC dates the push's spans fall on.
 ///
@@ -174,10 +180,6 @@ pub(crate) struct TraceLandingPath {
     /// The reservation counter `PULSUS_INGEST_QUEUE_BYTES` bounds.
     queued_bytes: Arc<AtomicU64>,
     metrics: Arc<TraceWriterMetrics>,
-    /// The token generator. One lock per admitted push: a token minted from
-    /// the clock alone would repeat for two pushes inside one millisecond,
-    /// and the second would be dropped as a resend of the first.
-    token_rng: Mutex<XorShift64>,
 }
 
 impl TraceLandingPath {
@@ -207,7 +209,9 @@ impl TraceLandingPath {
             on_commit: None,
             retries: runtime.trace_landing_retries,
             max_rows: runtime.trace_landing_max_rows,
-            batch_settings: None,
+            // Issue #494 part 2: trace blocks are batched, and each batch's
+            // insert is built when it closes, under a token minted for it.
+            batch_settings: Some(QuerySettings::trace_landing_insert),
             token_rng: Mutex::new(XorShift64::seeded()),
         });
 
@@ -215,11 +219,9 @@ impl TraceLandingPath {
         // A mutex over the receiver rather than a `Notify` beside a deque,
         // which stores one permit and would leave a second queued block
         // waiting for a later push. A worker holds the lock only while
-        // taking a block, so up to `trace_landing_inserters` inserts
+        // forming a batch, so up to `trace_landing_inserters` inserts
         // overlap.
-        let rx = Arc::new(tokio::sync::Mutex::new(
-            crate::writer::landing::LandingQueue::new(rx),
-        ));
+        let rx = Arc::new(tokio::sync::Mutex::new(LandingQueue::new(rx)));
         boundary.track_background(
             (0..runtime.trace_landing_inserters.max(1))
                 .map(|_| spawn_landing_worker(ctx.clone(), rx.clone(), boundary.watch()))
@@ -236,7 +238,6 @@ impl TraceLandingPath {
             ctx,
             queued_bytes,
             metrics,
-            token_rng: Mutex::new(XorShift64::seeded()),
         }
     }
 
@@ -263,8 +264,9 @@ impl TraceLandingPath {
         )
     }
 
-    /// Seals one block — minting its token, so two byte-identical pushes
-    /// carry different ones — and hands it to the queue.
+    /// Seals one block and hands it to the queue. Its insert's settings and
+    /// token are the batch's, built when the batch closes (issue #494 part
+    /// 2).
     ///
     /// `waiter` is the sync push's answer: the landing insert's own outcome
     /// resolves it, so a failed insert is the route's error (issue #602).
@@ -282,22 +284,16 @@ impl TraceLandingPath {
         claim: ClaimTicket,
         waiter: Option<oneshot::Sender<Result<(), WriteError>>>,
         admitted_at: tokio::time::Instant,
+        span: Option<(i64, i64)>,
     ) {
-        let token = {
-            let mut rng = self
-                .token_rng
-                .lock()
-                .expect("trace landing token rng mutex poisoned");
-            mint_landing_token(&mut rng)
-        };
         let block = LandingBlock::seal(
             rows,
             bytes,
-            QuerySettings::trace_landing_insert(&token, self.ctx.max_rows),
+            QuerySettings::new(),
             claim,
             waiter,
             admitted_at,
-            None,
+            span,
         );
         if let Err(closed) = self.tx.send(block) {
             let ctx = self.ctx.clone();

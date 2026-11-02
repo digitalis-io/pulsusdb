@@ -93,6 +93,12 @@ use crate::writer::spool::SpoolWriter;
 use crate::writer::table::{BlockInserter, ChBlockInserter, XorShift64, spawn_dedup_ticker};
 use crate::writer::{AdmitMode, Admitted, Suppressed, note_target};
 
+/// How many distinct UTC dates one metrics push's samples, histogram samples
+/// and exemplars may fall on (issue #494 part 2): the server's
+/// `max_partitions_per_insert_block`, which every landing insert pins. 100
+/// dates is admitted, 101 is refused `413`.
+pub const METRICS_LANDING_DAY_LIMIT: u64 = pulsus_clickhouse::MAX_PARTITIONS_PER_INSERT_BLOCK;
+
 /// The one table the metrics writer inserts into (issue #603).
 const LANDING_TABLE: &str = "metric_landing";
 
@@ -335,6 +341,9 @@ impl MetricWriter {
             on_commit: Some(on_commit),
             retries: runtime.metrics_landing_retries,
             max_rows: runtime.metrics_landing_max_rows,
+            // Metrics blocks are never batched (issue #494 part 2): a samples
+            // block's token comes from its content, and a batch under one
+            // token would store a client's resent push again.
             batch_settings: None,
             token_rng: Mutex::new(XorShift64::seeded()),
         });
@@ -543,6 +552,29 @@ impl MetricWriter {
         // a block that is never created refused it `413` or `429`.
         //
         // Its claim seals with no targets, so it completes at admission.
+        // Issue #494 part 2: the 100-date ceiling, decided before the zero-row,
+        // suppressed and descriptor branches, so a refused push queues nothing
+        // — no descriptor either. A sample's, histogram sample's or
+        // exemplar's date feeds a table partitioned by UTC day, and the server
+        // refuses an insert above `max_partitions_per_insert_block`
+        // partitions. A registration's activity day comes from a sample's, so
+        // it adds none. Returning here drops the un-sealed guard, which
+        // removes the claim.
+        let days: HashSet<i64> = batch
+            .samples
+            .iter()
+            .map(|p| p.unix_milli)
+            .chain(batch.hist_samples.iter().map(|h| h.unix_milli))
+            .chain(batch.exemplars.iter().map(|e| e.unix_milli))
+            .map(|ms| ms.div_euclid(86_400_000))
+            .collect();
+        if days.len() as u64 > METRICS_LANDING_DAY_LIMIT {
+            return Err(AdmitRefusal::PushTooManyDays {
+                days: days.len() as u64,
+                day_limit: METRICS_LANDING_DAY_LIMIT,
+            });
+        }
+
         if total_rows == 0 {
             if let Some(suppressed) = suppressed {
                 return Ok(Admitted::Suppressed(suppressed));

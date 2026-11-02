@@ -84,9 +84,10 @@ impl TableMetrics {
 /// struct.
 #[derive(Debug, Default)]
 pub struct WriterMetrics {
-    /// `log_landing` per-table counters. One insert per push, so
-    /// `flushes_total` counts pushes stored and `rows_total` counts landed
-    /// events of every kind (issue #603). The three per-target counter sets
+    /// `log_landing` per-table counters. One insert per batch for logs and
+    /// traces, per block for metrics (issue #494 part 2), so `flushes_total`
+    /// counts inserts stored and `rows_total` counts landed events of every
+    /// kind (issue #603). The three per-target counter sets
     /// this replaced went with the three flush tasks: the five logs tables are
     /// maintained by materialized view and the writer names none of them.
     pub landing: Arc<TableMetrics>,

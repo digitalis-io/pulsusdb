@@ -284,6 +284,7 @@ impl TraceWriter {
             } else {
                 None
             };
+            let span = trace_landing::span_day_span(&landing);
             let rows = trace_landing::rows_of(tenant.as_arc(), received_ms, landing);
             debug_assert_eq!(
                 rows.len() as u64,
@@ -299,6 +300,7 @@ impl TraceWriter {
                 claim,
                 waiter,
                 admitted_at,
+                span,
             );
         }
 

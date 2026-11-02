@@ -1030,9 +1030,6 @@ fn remote_write_refusal_response(refusal: AdmitRefusal) -> Response {
                 push_too_large_message(rows, row_limit, bytes, byte_limit)
             ),
         ),
-        // Issue #586: no metric sink builds this variant, and nothing here
-        // asserts that it cannot be reached — rendering the status is the
-        // cheap answer, and a panic inside a response mapper is not one.
         AdmitRefusal::PushTooManyDays { days, day_limit } => go_http_error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("{}\n", push_too_many_days_message(days, day_limit)),
@@ -1065,8 +1062,6 @@ fn loki_refusal_response(refusal: AdmitRefusal) -> Response {
                 push_too_large_message(rows, row_limit, bytes, byte_limit)
             ),
         ),
-        // Issue #586: as on remote write — no log sink builds this variant,
-        // and the status is rendered rather than asserted unreachable.
         AdmitRefusal::PushTooManyDays { days, day_limit } => loki_plain_text_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("{}\n", push_too_many_days_message(days, day_limit)),
