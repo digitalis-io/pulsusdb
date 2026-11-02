@@ -2288,11 +2288,14 @@ mod tests {
         }
     }
 
-    /// Issue #757 H7: a `word(…)` alternative renders `hasAllTokens` over
-    /// the case key `upperUTF8(lowerUTF8(body))`, each word keyed in SQL and
-    /// kept in the order written; a `|~` always renders `match(body, …)`.
+    /// Issue #757: a `word(…)` alternative renders one `hasToken` per word
+    /// over the case key `upperUTF8(lowerUTF8(body))`, each word keyed in SQL,
+    /// kept in the order written and ANDed, which `idx_body_words` serves; a
+    /// `|~` that turns case-insensitivity on renders `match(identity(body), …)`,
+    /// which keeps `idx_body_ngrams` out, and any other `|~` renders
+    /// `match(body, …)`.
     #[test]
-    fn a_word_alternative_renders_has_all_tokens_and_a_regex_renders_match_body() {
+    fn a_word_alternative_renders_has_token_and_a_case_insensitive_regex_keeps_the_index_out() {
         fn words(ws: &[&str]) -> LineMatch {
             LineMatch::Words(ws.iter().map(|w| w.to_string()).collect())
         }
@@ -2303,7 +2306,7 @@ mod tests {
                     head: words(&["Memcached"]),
                     or_matches: Vec::new(),
                 },
-                "hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('Memcached'))])",
+                "hasToken(upperUTF8(lowerUTF8(body)), upperUTF8(lowerUTF8('Memcached')))",
             ),
             (
                 LineFilter {
@@ -2311,7 +2314,7 @@ mod tests {
                     head: words(&["connection", "refused"]),
                     or_matches: Vec::new(),
                 },
-                "NOT (hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('connection')), upperUTF8(lowerUTF8('refused'))]))",
+                "NOT ((hasToken(upperUTF8(lowerUTF8(body)), upperUTF8(lowerUTF8('connection'))) AND hasToken(upperUTF8(lowerUTF8(body)), upperUTF8(lowerUTF8('refused')))))",
             ),
             (
                 LineFilter {
@@ -2319,11 +2322,23 @@ mod tests {
                     head: words(&["a"]),
                     or_matches: vec![LineMatch::Text("b".to_string())],
                 },
-                "((hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('a'))])) OR (body LIKE '%b%'))",
+                "((hasToken(upperUTF8(lowerUTF8(body)), upperUTF8(lowerUTF8('a')))) OR (body LIKE '%b%'))",
             ),
             (
                 regex_filter("(?i)(denied|refused)"),
-                "match(body, '(?i)(denied|refused)')",
+                "match(identity(body), '(?i)(denied|refused)')",
+            ),
+            (
+                LineFilter {
+                    op: LineFilterOp::NotRegex,
+                    head: LineMatch::Text("(?i)(denied|refused)".to_string()),
+                    or_matches: Vec::new(),
+                },
+                "NOT (match(identity(body), '(?i)(denied|refused)'))",
+            ),
+            (
+                regex_filter("connection refused"),
+                "match(body, 'connection refused')",
             ),
         ];
         for (lf, want) in cases {

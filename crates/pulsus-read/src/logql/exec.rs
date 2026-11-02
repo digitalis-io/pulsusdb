@@ -8263,8 +8263,9 @@ mod tests {
             s.get("max_query_size"),
             Some(crate::querytext::MAX_QUERY_TEXT_BYTES.to_string().as_str())
         );
-        // S-T5 (issue #624, part 3b): the `text` body index's direct read is off.
-        assert_eq!(s.get("query_plan_direct_read_from_text_index"), Some("0"));
+        // Issue #757: the body's `text` index is gone, and with it the
+        // setting that turned its direct read off.
+        assert_eq!(s.get("query_plan_direct_read_from_text_index"), None);
     }
 
     /// **T37.** The three discovery dispatches carry `budget_settings`' set

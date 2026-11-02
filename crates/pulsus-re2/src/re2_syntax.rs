@@ -465,6 +465,13 @@ pub fn clickhouse_match_head_rewrite(pattern: &str) -> Option<String> {
     Some(build_head_rewrite(&cs, &leaking))
 }
 
+/// Whether `pattern` turns case-insensitivity on anywhere (issue #757).
+/// A stub that answers `false`, so the table test fails on its assertion;
+/// the next commit replaces it with the parser walk.
+pub fn sets_case_insensitive(_pattern: &str) -> bool {
+    false
+}
+
 /// One scan: every valid flag head, split into the affected (no-`i`)
 /// list and an any-`i`-head flag. Shared by the strategy and the
 /// measurement seam so the two can never disagree about what a head is.
@@ -771,6 +778,32 @@ fn class_span_end(cs: &[char], open: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #757 D5: a pattern turns case-insensitivity on when a flag
+    /// item or a `(?flags:…)` group sets `i`, wherever it sits; text that
+    /// only looks like a flag group does not, and a pattern that does not
+    /// parse answers `true`.
+    #[test]
+    fn sets_case_insensitive_matches_a_hand_written_table() {
+        for (pattern, want) in [
+            ("x", false),
+            ("(?s)x", false),
+            ("(?i)x", true),
+            ("(?-i)x", false),
+            ("a(?i)b", true),
+            ("(?i)(?-i)x", true),
+            ("(?i:x)", true),
+            ("[iI]", false),
+            ("(?si)x", true),
+            ("[(?i)]", false),
+            ("(?i-s)x", true),
+            (r"\(\?i\)", false),
+            ("(a|(?i:b))", true),
+            ("(", true),
+        ] {
+            assert_eq!(sets_case_insensitive(pattern), want, "{pattern:?}");
+        }
+    }
 
     /// The rewrite must be a no-op for ordinary matchers — both for
     /// correctness and because a `Cow::Borrowed` is the whole cost story.

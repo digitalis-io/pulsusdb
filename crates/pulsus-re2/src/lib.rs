@@ -114,6 +114,7 @@ pub use re2_syntax::re2_pattern_to_rust;
 // extraction and living here with the walker helpers it shares.
 pub use re2_syntax::{
     ClickhouseMatchStrategy, clickhouse_match_head_rewrite, clickhouse_match_strategy,
+    sets_case_insensitive,
 };
 
 /// RE2's repetition ceiling — `kMaxRepeat` in `re2/parse.cc`, `maxRepeat`
