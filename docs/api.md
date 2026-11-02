@@ -1661,12 +1661,13 @@ Set `PULSUS_COMPAT_ENDPOINTS=true` before adding the trace datasource. The datas
 | Datasource URL | the PulsusDB base URL: scheme, host and port, with no path. |
 | Datasource basic authentication | on, with the `PULSUS_AUTH_USER` and `PULSUS_AUTH_PASSWORD` pair, when PulsusDB has both set. Without it every datasource request answers `401` (§8.1). |
 
-Two datasource surfaces are not served at all:
+One datasource surface is not served at all:
 
 | Surface | What PulsusDB does | What to do |
 |---------|--------------------|------------|
 | Streaming search and streaming metrics | PulsusDB speaks HTTP/1.1 only and has no gRPC endpoint. Over TLS it offers only `http/1.1`; on a plaintext port a connection that opens with HTTP/2, as a gRPC call does, is closed with no reply. With streaming on, the datasource sends its health check and its queries as gRPC calls, so Save & Test and search fail. | Leave both streaming options off. |
-| The Service Graph tab, and the service graph check in the datasource settings | PulsusDB does not produce the span-metrics series these read. They query a separately configured metrics datasource, not the trace datasource. `GET /api/traces/v1/service_graph` (§4.5) is PulsusDB's own shape, and the datasource does not call it. | Nothing in PulsusDB. The tab shows a graph only when the metrics datasource it is configured with holds those series from another producer. |
+
+**The Service Graph tab, and the service graph check in the datasource settings, are served from series a collector derives.** They read the `traces_service_graph_*` and `traces_spanmetrics_*` series from the metrics datasource set as the trace datasource's service graph source, not from the trace datasource. PulsusDB does not derive these series from stored spans. A collector's `servicegraph` and `spanmetrics` connectors derive them from the spans it receives and send them to PulsusDB by remote write (§1.2) or OTLP (§1.1). With that metrics datasource pointed at PulsusDB, the tab's graph and table are served from those series. The table's duration column reads `traces_spanmetrics_latency_bucket`, so a collector that names the histogram differently needs it renamed to that. The trace datasource does not call `GET /api/traces/v1/service_graph` (§4.5).
 
 ---
 
