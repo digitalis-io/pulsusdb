@@ -500,6 +500,15 @@ async fn collect<R: pulsus_clickhouse::ChRow>(client: &ChClient, sql: &str) -> V
     out
 }
 
+/// This host's clock, in epoch milliseconds: the server under test stamps
+/// `received_ms` from the same clock.
+fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("post-epoch clock")
+        .as_millis() as i64
+}
+
 async fn scalar(client: &ChClient, sql: &str) -> u64 {
     collect::<CountRow>(client, sql)
         .await
@@ -929,7 +938,7 @@ async fn the_rollup_buckets_return_to_their_single_push_values() {
 /// afterwards subtracts from the sum. That is why the suppression has to
 /// happen before the insert rather than at read time or at merge time.
 #[tokio::test]
-async fn with_the_mechanism_off_the_retry_doubles_every_reader() {
+async fn with_the_mechanism_off_the_retry_doubles_every_log_reader() {
     if !should_run() {
         eprintln!("skipping: PULSUS_TEST_CLICKHOUSE is not set");
         return;
@@ -972,9 +981,29 @@ async fn with_the_mechanism_off_the_retry_doubles_every_reader() {
 
     let t1_ms = T_NS / 1_000_000;
     let retried = remote_write_body("dupOffC", t1_ms);
+    // `metric_landing` is partitioned by the hour of `received_ms`, and a
+    // block's token is remembered per partition: a pair of sends straddling
+    // an hour would store the repeat in the next partition. Within a minute
+    // of the hour's end, the pair waits for the next hour to begin; the
+    // partition the two sends landed in is asserted below.
+    let hour_ms: i64 = 3_600_000;
+    let into_hour = epoch_ms() % hour_ms;
+    if into_hour > hour_ms - 60_000 {
+        tokio::time::sleep(Duration::from_millis((hour_ms - into_hour + 1_000) as u64)).await;
+    }
     for _ in 0..2 {
         assert_eq!(push_metrics(MECHANISM_OFF_PORT, &retried, &[]).status, 204);
     }
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT uniqExact(toStartOfHour(fromUnixTimestamp64Milli(received_ms))) AS n \
+             FROM metric_landing WHERE metric_name = 'http_requests_total'",
+        )
+        .await,
+        1,
+        "off: both sends were received in one hour, one landing partition"
+    );
     // Both pushes are answered after their inserts, so the count below is
     // final: the repeat's content token is the first push's, and ClickHouse
     // stored nothing for it (issue #494 part 1b).

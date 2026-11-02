@@ -288,9 +288,10 @@ pub(crate) fn writer_tables_from(config: &Config) -> WriterTables {
 /// `cityHash64(fingerprint)` selects, the shard every metrics table's wrapper
 /// names, so every resend of a push reaches the same shards and a read that
 /// pairs a series' samples with its series rows shard by shard finds all of
-/// them on one shard. Single-node it is the bare `metric_landing`. The four
-/// target tables keep their wrappers, and [`metrics_config_from`] on the read
-/// path derives them exactly as before.
+/// them on one shard. Single-node it is the bare `metric_landing`. The
+/// metrics tables the landing table's views write keep their own wrappers,
+/// and [`metrics_config_from`] on the read path derives them exactly as
+/// before.
 pub(crate) fn metric_writer_tables_from(config: &Config) -> MetricWriterTables {
     MetricWriterTables::landing_for(landing_suffix(config))
 }

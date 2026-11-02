@@ -14,10 +14,12 @@
 //! inserts. What it does not give: nothing makes the fan-out across the four
 //! targets a transaction.
 //!
-//! A push's rows are never spread over two inserts and an insert never
-//! carries two pushes. A push too large for one block is refused whole
-//! ([`AdmitRefusal::PushTooLarge`]), never split — two blocks can commit a
-//! prefix, and a prefix is not all-or-nothing.
+//! A push's samples, histogram samples and exemplars, with their
+//! registrations, are never spread over two inserts, and an insert never
+//! carries two pushes; only its descriptors go in an insert of their own. A
+//! push over its size ceiling is refused whole
+//! ([`AdmitRefusal::PushTooLarge`]), never split — two inserts of its samples
+//! could commit a prefix, and a prefix is not all-or-nothing.
 //!
 //! **Retry safety** is the `insert_deduplication_token`, derived from the
 //! push's tenant and content ([`metric_landing_token`]) and repeated on every
