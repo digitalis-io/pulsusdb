@@ -383,7 +383,7 @@ fn stage3_renders_the_canonical_shape_with_a_single_service() {
         "SELECT fingerprint, timestamp_ns, body, structured_metadata\n\
          FROM log_samples\n\
          PREWHERE service = 'checkout'\n\
-         WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))\n\
+         WHERE org_id = '' AND fingerprint IN ('18374', '99120')\n\
          \x20 AND timestamp_ns > 1782907200000000000 AND timestamp_ns <= 1782928800000000000\n\
          \x20 AND body LIKE '%connection refused%'\n\
          ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC\n\
@@ -670,7 +670,7 @@ fn stage2_is_byte_exact_to_schemas_md_3_2() {
             "log_streams",
             &[18374, 99120].map(|v| Fingerprint::from_raw(v).sql_literal())
         ),
-        "SELECT fingerprint, service, labels FROM log_streams WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))"
+        "SELECT fingerprint, service, labels FROM log_streams WHERE org_id = '' AND fingerprint IN ('18374', '99120')"
     );
 }
 
@@ -1034,7 +1034,7 @@ fn metric_range_sql_uses_intdiv_bucketing() {
         sql,
         "SELECT fingerprint, intDiv(bucket_ns, 60000000000) * 60000000000 AS step, sum(count) AS n\n\
          FROM log_metrics_5s\n\
-         WHERE org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
+         WHERE org_id = '' AND fingerprint IN ('101', '205', '990') AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
          GROUP BY fingerprint, step"
     );
 }
@@ -1067,7 +1067,7 @@ fn metric_instant_sql_has_no_intdiv_bucket_expression() {
         sql,
         "SELECT fingerprint, sum(count) AS n\n\
          FROM log_metrics_5s\n\
-         WHERE org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
+         WHERE org_id = '' AND fingerprint IN ('101', '205') AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
          GROUP BY fingerprint"
     );
     assert!(!sql.contains("intDiv"));
@@ -1100,7 +1100,7 @@ fn log_volume_rollup_is_byte_exact() {
         sql,
         "SELECT fingerprint, sum(bytes) AS bytes\n\
          FROM log_metrics_5s\n\
-         WHERE org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
+         WHERE org_id = '' AND fingerprint IN ('101', '205') AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
          GROUP BY fingerprint"
     );
     assert!(!sql.contains("body"), "zero body reads by construction");
@@ -1127,43 +1127,52 @@ const DISCOVERY_WINDOW: TimeWindow = TimeWindow {
 };
 const DISCOVERY_RES_NS: u64 = 5_000_000_000;
 
-/// The two statements a discovery endpoint issues since issue #603, written
-/// out by hand. **Nothing on the expected side of the assertions below is
+/// The statement a discovery endpoint issues since issue #399, written out
+/// by hand. **Nothing on the expected side of the assertions below is
 /// produced by `sql::`**: a defect inside a shared builder must move only the
 /// left side, so an expected side that called the builder would move with it
 /// and stay green.
 ///
-/// The activity scan, unscoped — the statement the engine runs FIRST, on its
-/// own, and whose result it renders into the second.
+/// The activity read, unscoped — the `GLOBAL IN` subquery of every
+/// unscoped discovery statement, and `/series`' own unmatched statement.
 const ACTIVE_UNSCOPED: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
      WHERE org_id = '' AND bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000";
 
-/// The activity scan with the caller's stage-1 fingerprints pushed inside it,
-/// so it reads primary-key point ranges rather than the whole bucket range.
+/// The activity read with `/series`' resolved list pushed inside it, so it
+/// reads primary-key point ranges rather than the whole bucket range.
 const ACTIVE_SCOPED_1: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
-     WHERE org_id = '' AND fingerprint IN (toUInt128('7')) AND bucket_ns >= 1751328000000000000 \
+     WHERE org_id = '' AND fingerprint IN ('7') AND bucket_ns >= 1751328000000000000 \
      AND bucket_ns <= 1751331600000000000";
 const ACTIVE_SCOPED_3: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
-     WHERE org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('4294967296')) AND bucket_ns >= 1751328000000000000 \
+     WHERE org_id = '' AND fingerprint IN ('101', '205', '4294967296') AND bucket_ns >= 1751328000000000000 \
      AND bucket_ns <= 1751331600000000000";
 
-/// The active-fingerprint list the three index scans below render — the
-/// activity scan's RESULT, not a subquery over it.
-const ACTIVE_LIST: &str = "toUInt128('101'), toUInt128('205'), toUInt128('4294967296')";
+/// A stage-1 statement, opaque to the discovery builders: they nest it
+/// verbatim.
+const STAGE1: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND key = 'app'";
+
+/// The activity read with that stage-1 statement nested inside it — scoped
+/// discovery's subquery.
+const ACTIVE_NESTED: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
+     WHERE org_id = '' AND fingerprint GLOBAL IN (\nSELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND key = 'app'\n) \
+     AND bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000";
 
 /// The three whole-statement templates, one per discovery builder.
 /// `{MONTH}`, `{ACTIVE}` and `{UUID_LITERAL}` are substituted with
 /// [`str::replace`] rather than interpolated, so the text stays byte-identical
 /// and no `sql::` call can reach the expected side.
-const STMT_LABEL_NAMES: &str = "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE org_id = '' AND {MONTH}\n  AND fingerprint IN ({ACTIVE})\nORDER BY name";
-const STMT_LABEL_VALUES: &str = "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE org_id = '' AND {MONTH} AND key = 'env'\n  AND fingerprint IN ({ACTIVE})\nORDER BY value";
-const STMT_DETECTED_LABELS: &str = "SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, {UUID_LITERAL})) AS non_id_values\nFROM log_streams_idx\nWHERE org_id = '' AND {MONTH}\n  AND fingerprint IN ({ACTIVE})\nGROUP BY key\nORDER BY key";
+const STMT_LABEL_NAMES: &str = "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE org_id = '' AND {MONTH}\n  AND fingerprint GLOBAL IN ({ACTIVE})\nORDER BY name\nLIMIT 100001";
+const STMT_LABEL_VALUES: &str = "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE org_id = '' AND {MONTH} AND key = 'env'\n  AND fingerprint GLOBAL IN ({ACTIVE})\nORDER BY value\nLIMIT 100001";
+const STMT_DETECTED_LABELS: &str = "SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, {UUID_LITERAL})) AS non_id_values\nFROM log_streams_idx\nWHERE org_id = '' AND {MONTH}\n  AND fingerprint GLOBAL IN ({ACTIVE})\nGROUP BY key\nORDER BY key\nLIMIT 100001";
+
+/// The row bound plus one, as the engine passes it.
+const LIMIT: u64 = 100_001;
 
 fn expected_stmt(template: &str, month: &str, active: &str) -> String {
     template
         .replace("{MONTH}", month)
-        .replace("{ACTIVE}", active)
         .replace("{UUID_LITERAL}", UUID_LITERAL)
+        .replace("{ACTIVE}", active)
 }
 
 fn active_list() -> Vec<FpLiteral> {
@@ -1174,88 +1183,46 @@ fn active_list() -> Vec<FpLiteral> {
     ]
 }
 
-/// **T38.** The rendered `log_streams_idx` scan for each of the three
-/// discovery endpoints carries a LITERAL fingerprint list and **no nested
-/// `SELECT`**, and the activity scan renders as a statement of its own.
-///
-/// **The observation is the rendered text**, because that is what decides
-/// which route the server takes. A case that read the settings object back
-/// instead would go green over a setting that governs nothing, which is the
-/// defect that produced this shape: the earlier design pinned
-/// `max_rows_to_transfer` and `transfer_overflow_mode` on a `GLOBAL IN`, and
-/// measured against the version the clustered fixture pins, that pair does not
-/// bind the statement this path generates at all.
-///
-/// It fails against the nested form, where the one statement's `IN` opens a
-/// second `SELECT`.
+fn scope(stage1_sql: Option<&str>) -> sql::DiscoveryScope<'_> {
+    sql::DiscoveryScope {
+        rollup_table: "log_metrics_5s",
+        window: DISCOVERY_WINDOW,
+        rollup_res_ns: DISCOVERY_RES_NS,
+        stage1_sql,
+    }
+}
+
+/// **T38.** Each of the three discovery endpoints is ONE statement: the
+/// `log_streams_idx` scan carries the activity read as a `GLOBAL IN`
+/// subquery, and a scoped request nests its stage-1 statement inside that
+/// (issue #399), byte for byte.
 #[test]
-fn the_discovery_statement_carries_a_literal_fingerprint_list() {
+fn the_discovery_statement_nests_the_activity_read() {
     let months = [month_literal(2026, 7)];
-    let fps = active_list();
-    let statements = [
-        (
-            "label_names",
-            sql::label_names(
-                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-                "log_streams_idx",
-                &months,
-                &fps,
-            ),
-        ),
-        (
-            "label_values",
-            sql::label_values(
-                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-                "log_streams_idx",
-                &months,
-                &literal("env"),
-                &fps,
-            ),
-        ),
-        (
-            "detected_labels",
-            sql::detected_labels(
-                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-                "log_streams_idx",
-                &months,
-                &fps,
-            ),
-        ),
-    ];
-    for (name, sql) in &statements {
-        let (_, after_in) = sql
-            .split_once("fingerprint IN (")
-            .unwrap_or_else(|| panic!("{name} must render a fingerprint IN list: {sql}"));
-        // The list ends at the closing bracket that ends the LINE: a
-        // fingerprint literal is itself `toUInt128('…')`, so the first `)`
-        // is inside the first element.
-        let inside = after_in
-            .split_once(")\n")
-            .unwrap_or_else(|| panic!("{name}'s IN list is unterminated: {sql}"))
-            .0;
+    let t = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
+    for (stage1, active) in [(None, ACTIVE_UNSCOPED), (Some(STAGE1), ACTIVE_NESTED)] {
+        let sc = scope(stage1);
         assert_eq!(
-            inside, ACTIVE_LIST,
-            "{name} must render the active-fingerprint set as literals"
+            sql::label_names(&t, "log_streams_idx", &months, &sc, LIMIT),
+            expected_stmt(STMT_LABEL_NAMES, "month = '2026-07-01'", active)
         );
         assert_eq!(
-            sql.matches("SELECT").count(),
-            1,
-            "{name} must nest no second SELECT — the activity scan is its own \
-             statement: {sql}"
+            sql::label_values(&t, "log_streams_idx", &months, &literal("env"), &sc, LIMIT),
+            expected_stmt(STMT_LABEL_VALUES, "month = '2026-07-01'", active)
         );
-        assert!(
-            !sql.contains("log_metrics_5s"),
-            "{name} must name only the index table: {sql}"
+        assert_eq!(
+            sql::detected_labels(&t, "log_streams_idx", &months, &sc, LIMIT),
+            expected_stmt(STMT_DETECTED_LABELS, "month = '2026-07-01'", active)
         );
     }
 
-    // And the activity scan is a statement in its own right, rendered by the
-    // builder the engine dispatches separately.
+    // `/series`' activity read stays a statement of its own.
+    let fps = active_list();
     assert_eq!(
         sql::active_fingerprints(
-            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            &t,
             "log_metrics_5s",
-            None,
+            sql::ActivityScope::All,
             DISCOVERY_WINDOW,
             DISCOVERY_RES_NS
         ),
@@ -1263,9 +1230,9 @@ fn the_discovery_statement_carries_a_literal_fingerprint_list() {
     );
     assert_eq!(
         sql::active_fingerprints(
-            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            &t,
             "log_metrics_5s",
-            Some(&fps),
+            sql::ActivityScope::Listed(&fps),
             DISCOVERY_WINDOW,
             DISCOVERY_RES_NS
         ),
@@ -1273,9 +1240,9 @@ fn the_discovery_statement_carries_a_literal_fingerprint_list() {
     );
     assert_eq!(
         sql::active_fingerprints(
-            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            &t,
             "log_metrics_5s",
-            Some(&[Fingerprint::from_raw(7).sql_literal()]),
+            sql::ActivityScope::Listed(&[Fingerprint::from_raw(7).sql_literal()]),
             DISCOVERY_WINDOW,
             DISCOVERY_RES_NS
         ),
@@ -1286,9 +1253,9 @@ fn the_discovery_statement_carries_a_literal_fingerprint_list() {
     // form.
     assert_eq!(
         sql::active_fingerprints(
-            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            &t,
             "log_metrics_5s",
-            Some(&[Fingerprint::from_raw(7).sql_literal()]),
+            sql::ActivityScope::Listed(&[Fingerprint::from_raw(7).sql_literal()]),
             TimeWindow {
                 start_ns: 1_751_328_003_000_000_000,
                 end_ns: 1_751_331_600_000_000_000,
@@ -1303,19 +1270,23 @@ fn the_discovery_statement_carries_a_literal_fingerprint_list() {
 /// `log_streams_idx` — month-partition-pruned, one output row per key,
 /// `uniqExact` cardinality plus the server-side `containsAllIDTypes`
 /// predicate — narrowed to the streams active in the requested window by the
-/// literal list the activity scan resolved, and with no
-/// `log_samples`/body reference anywhere.
+/// activity subquery, and with no `log_samples`/body reference anywhere.
 #[test]
 fn detected_labels_is_byte_exact() {
     let sql = sql::detected_labels(
         &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         "log_streams_idx",
         &[month_literal(2026, 7)],
-        &active_list(),
+        &scope(None),
+        LIMIT,
     );
     assert_eq!(
         sql,
-        expected_stmt(STMT_DETECTED_LABELS, "month = '2026-07-01'", ACTIVE_LIST)
+        expected_stmt(
+            STMT_DETECTED_LABELS,
+            "month = '2026-07-01'",
+            ACTIVE_UNSCOPED
+        )
     );
     assert!(!sql.contains("log_samples"), "never touches log_samples");
     assert!(!sql.contains("body"), "zero body reads by construction");
@@ -1326,18 +1297,19 @@ fn detected_labels_is_byte_exact() {
             &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_streams_idx",
             &[month_literal(2026, 7), month_literal(2026, 8)],
-            &active_list(),
+            &scope(None),
+            LIMIT,
         ),
         expected_stmt(
             STMT_DETECTED_LABELS,
             "month IN ('2026-07-01', '2026-08-01')",
-            ACTIVE_LIST
+            ACTIVE_UNSCOPED
         )
     );
 }
 
 /// Byte-exact `label_names` snapshot: the `/labels` scan is the same single
-/// `DISTINCT key` pass it always was, narrowed by the active-fingerprint list.
+/// `DISTINCT key` pass it always was, narrowed by the activity subquery.
 #[test]
 fn label_names_is_byte_exact() {
     assert_eq!(
@@ -1345,13 +1317,14 @@ fn label_names_is_byte_exact() {
             &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_streams_idx",
             &[month_literal(2026, 7)],
-            &active_list()
+            &scope(None),
+            LIMIT,
         ),
-        expected_stmt(STMT_LABEL_NAMES, "month = '2026-07-01'", ACTIVE_LIST)
+        expected_stmt(STMT_LABEL_NAMES, "month = '2026-07-01'", ACTIVE_UNSCOPED)
     );
 }
 
-/// Byte-exact `label_values` snapshot: the list sits beside the existing
+/// Byte-exact `label_values` snapshot: the subquery sits beside the existing
 /// `AND key = ...`, on its own line, so the key predicate keeps its place in
 /// the primary-key prefix.
 #[test]
@@ -1362,9 +1335,10 @@ fn label_values_is_byte_exact() {
             "log_streams_idx",
             &[month_literal(2026, 7)],
             &literal("env"),
-            &active_list(),
+            &scope(None),
+            LIMIT,
         ),
-        expected_stmt(STMT_LABEL_VALUES, "month = '2026-07-01'", ACTIVE_LIST)
+        expected_stmt(STMT_LABEL_VALUES, "month = '2026-07-01'", ACTIVE_UNSCOPED)
     );
 }
 
@@ -1532,7 +1506,7 @@ fn an_unwrapped_sum_over_time_renders_a_sliding_raw_scan_with_no_aggregate_and_n
         "SELECT fingerprint, timestamp_ns, body, structured_metadata\n\
          FROM log_samples\n\
          PREWHERE service = 'checkout'\n\
-         WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))\n\
+         WHERE org_id = '' AND fingerprint IN ('18374', '99120')\n\
          \x20 AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000\n\
          ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC"
     );

@@ -1997,17 +1997,17 @@ async fn the_grouped_fps_array_types_as_uint128_and_maps_each_boundary_value() {
 
     // **The array text comes from the production renderer, not from this
     // file.** `grouped_sql::grouped_fetch` builds its `fps` array by
-    // calling `sample_sql::render_fingerprint_list`, so that is what is
-    // executed here. A test that writes out the SQL it expects cannot
+    // calling `sample_sql::render_fingerprint_array` (issue #399), so that
+    // is what is executed here. A test that writes out the SQL it expects cannot
     // notice the renderer changing — with the elements hard-coded, making
     // `FpLiteral` emit a bare decimal left this test green.
-    let rendered = sample_sql::render_fingerprint_list(&[
+    let rendered = sample_sql::render_fingerprint_array(&[
         Fingerprint::from_raw(A).sql_literal(),
         Fingerprint::from_raw(B).sql_literal(),
     ]);
 
-    // It types as `Array(UInt128)` with no `CAST` of its own.
-    let sql = format!("WITH [{rendered}] AS fps SELECT toTypeName(fps) AS t");
+    // It types as `Array(UInt128)`: the renderer's own `CAST`.
+    let sql = format!("WITH {rendered} AS fps SELECT toTypeName(fps) AS t");
     let mut stream = client
         .query_stream::<TypeRow>(&sql, &QuerySettings::new())
         .await
@@ -2022,7 +2022,7 @@ async fn the_grouped_fps_array_types_as_uint128_and_maps_each_boundary_value() {
     // And `transform` maps each of the two to its own group id, over the
     // same rendered array.
     let sql = format!(
-        "WITH [{rendered}] AS fps, \
+        "WITH {rendered} AS fps, \
          CAST([101, 102], 'Array(UInt32)') AS gids \
          SELECT fingerprint, transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid \
          FROM fp128_transform WHERE fingerprint IN fps ORDER BY fingerprint"
@@ -2068,7 +2068,7 @@ async fn the_grouped_fps_array_types_as_uint128_and_maps_each_boundary_value() {
         GroupedOp::Max,
     );
     assert!(
-        statement.contains(&format!("[{rendered}] AS fps")),
+        statement.contains(&format!("{rendered} AS fps")),
         "the grouped statement does not carry the rendered array:\n{statement}"
     );
 

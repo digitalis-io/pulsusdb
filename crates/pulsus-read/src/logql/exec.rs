@@ -330,11 +330,6 @@ enum DiscoveryQuery<'a> {
     DetectedLabels,
 }
 
-/// The explain stage name of the activity scan the three discovery endpoints
-/// now run as a statement of their own (issue #603). One name for all three,
-/// because `run_discovery` owns the dispatch for all three.
-const ACTIVITY_STAGE: &str = "stream_activity";
-
 impl DiscoveryQuery<'_> {
     /// The stage-2 explain stage name — the three literals those three
     /// paths pushed before issue #482 folded them into one helper.
@@ -364,6 +359,19 @@ pub struct LogQlEngine {
     /// made it: the server sets the request's id (issue #614), a test its
     /// own tag (issue #544). `None` sends nothing.
     query_log_comment: Option<String>,
+    /// The discovery answer's row bound (issue #399):
+    /// [`super::params::DISCOVERY_MAX_ROWS`] unless the test seam
+    /// [`LogQlEngine::with_discovery_max_rows`] set it.
+    discovery_max_rows: u64,
+}
+
+/// A discovery answer (issue #399): the items, and whether the answer was
+/// cut at its row bound. The return of `label_names`, `label_values` and
+/// `detected_labels`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryAnswer<T> {
+    pub items: Vec<T>,
+    pub truncated: bool,
 }
 
 /// Test-only settings for the lowered reads (issues #507 and #624). The
@@ -404,6 +412,7 @@ impl LogQlEngine {
             key_route_test: KeyRouteTestHooks::default(),
             metadata_fragment_budget: None,
             query_log_comment: None,
+            discovery_max_rows: super::params::DISCOVERY_MAX_ROWS,
         }
     }
 
@@ -428,6 +437,14 @@ impl LogQlEngine {
     #[doc(hidden)]
     pub fn with_metadata_fragment_budget(mut self, bytes: usize) -> Self {
         self.metadata_fragment_budget = Some(bytes);
+        self
+    }
+
+    /// Lowers the discovery answer's row bound (issue #399). Test-only: it
+    /// makes the bound reachable on a three-stream corpus.
+    #[doc(hidden)]
+    pub fn with_discovery_max_rows(mut self, n: u64) -> Self {
+        self.discovery_max_rows = n;
         self
     }
 
@@ -583,7 +600,7 @@ impl LogQlEngine {
         &self,
         selector: Option<&Expr>,
         b: TimeBounds,
-    ) -> Result<Vec<String>, ReadError> {
+    ) -> Result<DiscoveryAnswer<String>, ReadError> {
         self.label_names_inner(selector, b, None).await
     }
 
@@ -593,7 +610,7 @@ impl LogQlEngine {
         &self,
         selector: Option<&Expr>,
         b: TimeBounds,
-    ) -> Result<(Vec<String>, PlanExplain), ReadError> {
+    ) -> Result<(DiscoveryAnswer<String>, PlanExplain), ReadError> {
         let mut explain = PlanExplain::new("labels");
         let names = self
             .label_names_inner(selector, b, Some(&mut explain))
@@ -606,7 +623,7 @@ impl LogQlEngine {
         selector: Option<&Expr>,
         b: TimeBounds,
         explain: Option<&mut PlanExplain>,
-    ) -> Result<Vec<String>, ReadError> {
+    ) -> Result<DiscoveryAnswer<String>, ReadError> {
         self.run_discovery::<LabelNameRow, String>(
             DiscoveryQuery::LabelNames,
             selector,
@@ -630,7 +647,7 @@ impl LogQlEngine {
         name: &str,
         selector: Option<&Expr>,
         b: TimeBounds,
-    ) -> Result<Vec<String>, ReadError> {
+    ) -> Result<DiscoveryAnswer<String>, ReadError> {
         self.label_values_inner(name, selector, b, None).await
     }
 
@@ -641,7 +658,7 @@ impl LogQlEngine {
         name: &str,
         selector: Option<&Expr>,
         b: TimeBounds,
-    ) -> Result<(Vec<String>, PlanExplain), ReadError> {
+    ) -> Result<(DiscoveryAnswer<String>, PlanExplain), ReadError> {
         let mut explain = PlanExplain::new("label_values");
         let values = self
             .label_values_inner(name, selector, b, Some(&mut explain))
@@ -655,7 +672,7 @@ impl LogQlEngine {
         selector: Option<&Expr>,
         b: TimeBounds,
         explain: Option<&mut PlanExplain>,
-    ) -> Result<Vec<String>, ReadError> {
+    ) -> Result<DiscoveryAnswer<String>, ReadError> {
         self.run_discovery::<LabelValueRow, String>(
             DiscoveryQuery::LabelValues { name },
             selector,
@@ -668,28 +685,24 @@ impl LogQlEngine {
     }
 
     /// Runs a matchers-only discovery request end to end — the ONE
-    /// stage-1 block for `/labels`, `/label/{name}/values` and
-    /// `/detected_labels` (issue #482).
+    /// dispatch for `/labels`, `/label/{name}/values` and
+    /// `/detected_labels` (issues #482 and #399).
     ///
-    /// **The no-stream case is owned here.** When `selector` is `Some`
-    /// and stage 1 resolves to nothing, this returns `Ok(Vec::new())`
-    /// from inside the helper, before any stage-2 statement is built or
-    /// issued. The fingerprint list is a local of this function and is
-    /// passed only to the [`super::sql`] builder selected by `query`.
+    /// One statement; no stream cap; an empty answer is zero rows. The
+    /// selector's stage-1 statement, when there is one, is nested inside the
+    /// activity read, which is nested inside the index scan (issue #399,
+    /// D1–D3). The answer is bounded at [`Self::discovery_max_rows`] rows:
+    /// the statement carries `LIMIT bound + 1`, and a row past the bound
+    /// marks the answer truncated (D4).
     ///
-    /// **No caller receives a fingerprint list in any form** — not as a
-    /// parameter, not as a closure argument, not as a return value — so a
-    /// caller has no expression in which to ignore, replace or fabricate
-    /// one. Because the empty check precedes the build, the
-    /// `Option<&[u64]>` reaching [`super::sql::active_fingerprints`] from
-    /// these three paths is `None` or a NON-EMPTY slice, never
-    /// `Some(&[])`.
+    /// Memory: at most `bound + 1` rows are decoded and `bound` retained.
+    /// The writer caps a label value at 2,048 bytes and a name at 1,024, so a
+    /// full answer stays under the 1 GiB the streams answer already allows
+    /// (`super::charge::MAX_STREAMS_RESULT_BYTES`).
     ///
-    /// Two things it does not prevent, stated rather than implied:
-    /// `R` is not bound to the [`DiscoveryQuery`] variant (a mismatch is
-    /// a row-decode error, not a wrong answer — the projections have
-    /// disjoint column names), and a future fourth discovery path could
-    /// bypass the helper and render a builder itself.
+    /// `R` is not bound to the [`DiscoveryQuery`] variant: a mismatch is a
+    /// row-decode error, not a wrong answer — the projections have disjoint
+    /// column names.
     ///
     /// `metric_rejection` is the endpoint's own `PipelineInvalid` reason:
     /// unreachable through the API layer (all three parse `query` with
@@ -702,11 +715,11 @@ impl LogQlEngine {
         mut explain: Option<&mut PlanExplain>,
         metric_rejection: &str,
         mut keep_row: impl FnMut(R) -> Option<T>,
-    ) -> Result<Vec<T>, ReadError> {
+    ) -> Result<DiscoveryAnswer<T>, ReadError> {
         // Always >= 1 literal (`months_overlapping` never returns empty),
-        // so the stage-2 month IN-list has no empty-IN hazard.
+        // so the month IN-list has no empty-IN hazard.
         let months = plan::months_overlapping(b.start_ns, b.end_ns);
-        let fingerprints: Option<Vec<Fingerprint>> = match selector {
+        let stage1_sql: Option<String> = match selector {
             None => None,
             Some(expr) => {
                 let ctx = self.config.plan_ctx(&self.tenant);
@@ -722,8 +735,8 @@ impl LogQlEngine {
                     limit: 1,
                     direction: Direction::Forward,
                 };
-                let sp = match plan::plan(expr, &qp, &ctx)? {
-                    Plan::Streams(sp) => sp,
+                match plan::plan(expr, &qp, &ctx)? {
+                    Plan::Streams(sp) => Some(sp.stage1_sql),
                     // Unreachable via the API layer (it parses `query`
                     // with `parse_selector`) — kept as a structured
                     // rejection, never a panic.
@@ -732,70 +745,47 @@ impl LogQlEngine {
                             reason: metric_rejection.to_string(),
                         });
                     }
-                };
-                if let Some(e) = explain.as_mut() {
-                    e.push("stage1_stream_resolution", sp.stage1_sql.clone(), None);
                 }
-                let fps = self.resolve_fingerprints(&sp.stage1_sql).await?;
-                if fps.is_empty() {
-                    // No matching streams — return before stage 2 is
-                    // built, so no statement is issued and no empty
-                    // fingerprint IN-list can render.
-                    return Ok(Vec::new());
-                }
-                Some(fps)
             }
         };
-        // **The activity scan is a statement of its own** (issue #603). It was
-        // a subquery nested inside the index scan below, which on a clustered
-        // deployment made a double-distributed `IN`; running it here and
-        // rendering its result as a literal list is what `/series` already
-        // did, and the predicate — so the answer — is the one the subquery
-        // expressed. Both bounds on what that costs are already in the tree:
-        // `check_stream_cap` inside the scan's own loop, and the rendered-SQL
-        // ceiling on the statement the list goes into.
-        let window = self.activity_window(b);
-        let stage1_minted = fingerprints.as_deref().map(sql_literals);
-        let activity_sql = super::sql::active_fingerprints(
-            &self.tenant,
-            &self.config.rollup_table,
-            stage1_minted.as_deref(),
-            window,
-            self.config.rollup_res_ns,
-        );
-        if let Some(e) = explain.as_mut() {
-            e.push(ACTIVITY_STAGE, activity_sql.clone(), None);
-        }
-        let active = self.run_activity_scan(&activity_sql).await?;
-        if active.is_empty() {
-            // **A saved dispatch, not a correctness fix.** An empty literal
-            // list is valid SQL that selects nothing, and this helper turns no
-            // rows into the same empty vector the endpoints document, so the
-            // answer is right either way. What the early return buys is one
-            // avoided round trip on a window with no activity — the common
-            // case for a dashboard opening on a quiet range.
-            return Ok(Vec::new());
-        }
-        let fps = sql_literals(&active);
+        let scope = super::sql::DiscoveryScope {
+            rollup_table: &self.config.rollup_table,
+            window: self.activity_window(b),
+            rollup_res_ns: self.config.rollup_res_ns,
+            stage1_sql: stage1_sql.as_deref(),
+        };
+        let cap = self.discovery_max_rows;
+        let limit = cap.saturating_add(1);
         let sql = match query {
-            DiscoveryQuery::LabelNames => {
-                super::sql::label_names(&self.tenant, &self.config.streams_idx, &months, &fps)
-            }
+            DiscoveryQuery::LabelNames => super::sql::label_names(
+                &self.tenant,
+                &self.config.streams_idx,
+                &months,
+                &scope,
+                limit,
+            ),
             DiscoveryQuery::LabelValues { name } => super::sql::label_values(
                 &self.tenant,
                 &self.config.streams_idx,
                 &months,
                 &super::predicate::literal(name),
-                &fps,
+                &scope,
+                limit,
             ),
-            DiscoveryQuery::DetectedLabels => {
-                super::sql::detected_labels(&self.tenant, &self.config.streams_idx, &months, &fps)
-            }
+            DiscoveryQuery::DetectedLabels => super::sql::detected_labels(
+                &self.tenant,
+                &self.config.streams_idx,
+                &months,
+                &scope,
+                limit,
+            ),
         };
         if let Some(e) = explain.as_mut() {
             e.push(query.stage_name(), sql.clone(), None);
         }
         let mut out = Vec::new();
+        let mut rows_read: u64 = 0;
+        let mut truncated = false;
         let mut stream = self
             .query_stream::<R>(&sql, &self.budget_settings())
             .await?;
@@ -807,11 +797,21 @@ impl LogQlEngine {
                     self.config.read_max_memory_bytes,
                 )
             })?;
+            rows_read += 1;
+            if rows_read > cap {
+                // The row past the bound: the answer is cut here, and
+                // this row is dropped.
+                truncated = true;
+                break;
+            }
             if let Some(kept) = keep_row(row) {
                 out.push(kept);
             }
         }
-        Ok(out)
+        Ok(DiscoveryAnswer {
+            items: out,
+            truncated,
+        })
     }
 
     /// Series discovery (#13 `GET|POST /api/logs/v1/series`): the union of
@@ -893,7 +893,7 @@ impl LogQlEngine {
                     super::sql::active_fingerprints(
                         &self.tenant,
                         &self.config.rollup_table,
-                        None,
+                        super::sql::ActivityScope::All,
                         window,
                         self.config.rollup_res_ns,
                     ),
@@ -949,7 +949,7 @@ impl LogQlEngine {
                     super::sql::active_fingerprints(
                         &self.tenant,
                         &self.config.rollup_table,
-                        Some(&sql_literals(&fingerprints)),
+                        super::sql::ActivityScope::Listed(&sql_literals(&fingerprints)),
                         window,
                         self.config.rollup_res_ns,
                     ),
@@ -1094,7 +1094,7 @@ impl LogQlEngine {
         let sql = super::sql::active_fingerprints(
             &self.tenant,
             &self.config.rollup_table,
-            None,
+            super::sql::ActivityScope::All,
             window,
             self.config.rollup_res_ns,
         );
@@ -1108,9 +1108,9 @@ impl LogQlEngine {
     /// is refused after `max_streams + 1` rows rather than after all of them —
     /// and the caller must not re-check it on the result. That refusal is the
     /// shipped `422 query_too_broad` carrying `TooBroadReason::StreamCap`, the
-    /// same one stage-1 resolution has always raised; issue #603 brought label
-    /// discovery under it by making this set the engine's own rather than a
-    /// subquery the server evaluated.
+    /// same one stage-1 resolution has always raised. Since issue #399 only
+    /// `/series` reads its activity set this way; label discovery nests the
+    /// read inside its one statement.
     ///
     /// Sorted before returning so the rendered `fingerprint IN (...)` text —
     /// and therefore the explain trace — is deterministic. `DISTINCT
@@ -1215,9 +1215,9 @@ impl LogQlEngine {
     /// activity predicate would be redundant — those paths bound the window on
     /// their own sample/rollup/patterns read.
     ///
-    /// **Since issue #603 every discovery endpoint dispatches the activity
-    /// scan this way**, as its own statement: this is no longer the one
-    /// exception to a nested form, and there is no nested form left.
+    /// `/series` dispatches the activity scan as its own statement, as it
+    /// always has; the three label-discovery endpoints nest it inside their
+    /// one statement instead (issue #399).
     ///
     /// Runs AFTER `check_stream_cap` so the cap keeps its current meaning
     /// — the deduped pre-window union — and the cap test keeps failing for
@@ -1237,7 +1237,7 @@ impl LogQlEngine {
         let sql = super::sql::active_fingerprints(
             &self.tenant,
             &self.config.rollup_table,
-            Some(&sql_literals(fingerprints)),
+            super::sql::ActivityScope::Listed(&sql_literals(fingerprints)),
             window,
             self.config.rollup_res_ns,
         );
@@ -3758,7 +3758,7 @@ impl LogQlEngine {
         &self,
         selector: Option<&Expr>,
         b: TimeBounds,
-    ) -> Result<Vec<DetectedLabelOut>, ReadError> {
+    ) -> Result<DiscoveryAnswer<DetectedLabelOut>, ReadError> {
         self.detected_labels_inner(selector, b, None).await
     }
 
@@ -3769,7 +3769,7 @@ impl LogQlEngine {
         &self,
         selector: Option<&Expr>,
         b: TimeBounds,
-    ) -> Result<(Vec<DetectedLabelOut>, PlanExplain), ReadError> {
+    ) -> Result<(DiscoveryAnswer<DetectedLabelOut>, PlanExplain), ReadError> {
         let mut explain = PlanExplain::new("detected_labels");
         let labels = self
             .detected_labels_inner(selector, b, Some(&mut explain))
@@ -3782,7 +3782,7 @@ impl LogQlEngine {
         selector: Option<&Expr>,
         b: TimeBounds,
         explain: Option<&mut PlanExplain>,
-    ) -> Result<Vec<DetectedLabelOut>, ReadError> {
+    ) -> Result<DiscoveryAnswer<DetectedLabelOut>, ReadError> {
         self.run_discovery::<DetectedLabelRow, DetectedLabelOut>(
             DiscoveryQuery::DetectedLabels,
             selector,

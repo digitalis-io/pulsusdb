@@ -142,7 +142,7 @@ pub fn grouped_fetch(
         tenant.sql_literal(),
         sample_sql::window_predicate(lower_excl_ms, upper_incl_ms)
     );
-    let fp_list = sample_sql::render_fingerprint_list(fps);
+    let fp_array = sample_sql::render_fingerprint_array(fps);
     let gid_list = gids
         .iter()
         .map(u32::to_string)
@@ -204,7 +204,7 @@ pub fn grouped_fetch(
     format!(
         "WITH {start_ms} AS grid_start, {step_ms} AS grid_step, {points} AS grid_n, \
          {lookback_ms} AS lookback,\n\
-         \x20    [{fp_list}] AS fps,\n\
+         \x20    {fp_array} AS fps,\n\
          \x20    CAST([{gid_list}], 'Array(UInt32)') AS gids\n\
          SELECT gid, min(gi) AS gi_start, max(gi) AS gi_end, any(agg) AS agg{outer_tail}\n\
          FROM (\n\
@@ -1153,7 +1153,7 @@ mod tests {
             sql(GroupedOp::Max),
             "WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, \
              300000 AS lookback,\n\
-             \x20    [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,\n\
+             \x20    CAST(['101', '205', '990'], 'Array(UInt128)') AS fps,\n\
              \x20    CAST([0, 1, 0], 'Array(UInt32)') AS gids\n\
              SELECT gid, min(gi) AS gi_start, max(gi) AS gi_end, any(agg) AS agg, \
              any(flags) AS flags\n\
@@ -1575,7 +1575,13 @@ mod tests {
                     let s = by_ids_sql(op, func, g.as_ref());
                     let what = format!("{op:?} {func:?} {grouping}");
                     assert_eq!(s.matches(PLAN_IDS).count(), 3, "{what}");
-                    assert!(!s.contains("toUInt128("), "{what}");
+                    // No ID literal in any spelling (issue #399).
+                    assert!(
+                        !s.contains("toUInt128(")
+                            && !s.contains("fingerprint IN ('")
+                            && !s.contains("'Array(UInt128)')"),
+                        "{what}"
+                    );
                     assert!(!s.contains("WINDOW "), "{what}");
                     assert!(s.contains(&group_key_expression(g.as_ref())), "{what}");
                     let tail = format!(

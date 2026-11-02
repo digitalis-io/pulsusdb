@@ -64,7 +64,9 @@ rewrite docs/schemas.md:33-33
 # table and its view.
 # Issue #757 adds #757, its own issue, where the banner says the log body's
 # index is a whole-word index.
-rewrite docs/schemas.md:174-174 refs=#25,#603,#16,#171,#498,#2,#57,#584,#586,#587,#63,#75,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#235,#3,#450,#624,#412,#398,#653,#4,#602,#614,#131,#137,#598,#597,#599,#501,#601,#738,#18,#757
+# Issue #399 adds #399, its own issue, where the banner says label discovery
+# is one statement and a fingerprint list renders literal elements.
+rewrite docs/schemas.md:174-174 refs=#25,#603,#16,#171,#498,#2,#57,#584,#586,#587,#63,#75,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#235,#3,#450,#624,#412,#398,#653,#4,#602,#614,#131,#137,#598,#597,#599,#501,#601,#738,#18,#757,#399
 # `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
 # writer-contract paragraph gained the reason the read path does not route on
 # `metric_series.value_type`, and that reason is the decision A1's plan v5
@@ -117,7 +119,9 @@ rewrite docs/schemas.md:691-692
 # are tenant-scoped beside metrics and logs.
 # Issue #757 adds #757, its own issue, where the banner says the log body's
 # index is a whole-word index.
-rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624,#596,#507,#594,#602,#592,#653,#614,#597,#599,#501,#601,#738,#757
+# Issue #399 adds #399, its own issue, where the banner says label discovery
+# is one statement and a fingerprint list renders literal elements.
+rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624,#596,#507,#594,#602,#592,#653,#614,#597,#599,#501,#601,#738,#757,#399
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
 rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560

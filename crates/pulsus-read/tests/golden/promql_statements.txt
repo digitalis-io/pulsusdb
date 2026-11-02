@@ -2,34 +2,34 @@
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[000] offset=00000251 len=000275
+-- statement[000] offset=00000251 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[001] offset=00000572 len=000438
+-- statement[001] offset=00000539 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == abs(http_requests_total{status="500"}) ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[002] offset=00001268 len=000275
+-- statement[002] offset=00001202 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[003] offset=00001589 len=000438
+-- statement[003] offset=00001490 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == max by (status) (http_requests_total{status="500"}) ==
@@ -37,9 +37,9 @@ params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
 -- grouped op=Max gids=[0, 1, 0]
--- statement[004] offset=00002331 len=002738
+-- statement[004] offset=00002199 len=002729
 WITH 1782907200000 AS grid_start, 60000 AS grid_step, 361 AS grid_n, 300000 AS lookback,
-     [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
+     CAST(['101', '205', '990'], 'Array(UInt128)') AS fps,
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
 SELECT gid, min(gi) AS gi_start, max(gi) AS gi_end, any(agg) AS agg, any(flags) AS flags
 FROM (
@@ -97,9 +97,9 @@ params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
 -- grouped op=Min gids=[0, 1, 0]
--- statement[005] offset=00005380 len=002738
+-- statement[005] offset=00005239 len=002729
 WITH 1782907200000 AS grid_start, 60000 AS grid_step, 361 AS grid_n, 300000 AS lookback,
-     [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
+     CAST(['101', '205', '990'], 'Array(UInt128)') AS fps,
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
 SELECT gid, min(gi) AS gi_start, max(gi) AS gi_end, any(agg) AS agg, any(flags) AS flags
 FROM (
@@ -157,9 +157,9 @@ params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
 -- grouped op=Count gids=[0, 1, 0]
--- statement[006] offset=00008413 len=002347
+-- statement[006] offset=00008263 len=002338
 WITH 1782907200000 AS grid_start, 60000 AS grid_step, 361 AS grid_n, 300000 AS lookback,
-     [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
+     CAST(['101', '205', '990'], 'Array(UInt128)') AS fps,
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
 SELECT gid, min(gi) AS gi_start, max(gi) AS gi_end, any(agg) AS agg
 FROM (
@@ -214,9 +214,9 @@ params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
 -- grouped op=Group gids=[0, 1, 0]
--- statement[007] offset=00011055 len=002341
+-- statement[007] offset=00010896 len=002332
 WITH 1782907200000 AS grid_start, 60000 AS grid_step, 361 AS grid_n, 300000 AS lookback,
-     [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
+     CAST(['101', '205', '990'], 'Array(UInt128)') AS fps,
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
 SELECT gid, min(gi) AS gi_start, max(gi) AS gi_end, any(agg) AS agg
 FROM (
@@ -270,153 +270,153 @@ ORDER BY gid, gi_start
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[008] offset=00013658 len=000275
+-- statement[008] offset=00013490 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[009] offset=00013979 len=000438
+-- statement[009] offset=00013778 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == count_values("v", http_requests_total{status="500"}) ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[010] offset=00014689 len=000275
+-- statement[010] offset=00014455 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[011] offset=00015010 len=000438
+-- statement[011] offset=00014743 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == stddev by (status) (http_requests_total{status="500"}) ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[012] offset=00015722 len=000275
+-- statement[012] offset=00015422 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[013] offset=00016043 len=000438
+-- statement[013] offset=00015710 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == histogram_quantile(0.5, http_requests_total{status="500"}) ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[014] offset=00016759 len=000275
+-- statement[014] offset=00016393 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[015] offset=00017080 len=000438
+-- statement[015] offset=00016681 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == label_replace(http_requests_total{status="500"}, "l", "$1", "status", "(.*)") ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[016] offset=00017815 len=000275
+-- statement[016] offset=00017383 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[017] offset=00018136 len=000438
+-- statement[017] offset=00017671 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == timestamp(http_requests_total{status="500"}) ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[018] offset=00018838 len=000275
+-- statement[018] offset=00018340 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[019] offset=00019159 len=000438
+-- statement[019] offset=00018628 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == absent(http_requests_total{status="500"}) ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[020] offset=00019858 len=000275
+-- statement[020] offset=00019294 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[021] offset=00020179 len=000438
+-- statement[021] offset=00019582 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == sort_desc(http_requests_total{status="500"}) ==
 params start_ms=1782907200000 end_ms=1782907200000 step_ms=0
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782907200000]
--- statement[022] offset=00020877 len=000275
+-- statement[022] offset=00020247 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782907200000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[023] offset=00021198 len=000438
+-- statement[023] offset=00020535 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782907200000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == rate(http_requests_total{status="500"}[5m]) ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=300000 window=(1782906600000, 1782928800000]
--- statement[024] offset=00021904 len=000275
+-- statement[024] offset=00021208 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906600000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[025] offset=00022225 len=000438
+-- statement[025] offset=00021496 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906600000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == sum by (status) (rate(http_requests_total{status="500"}[5m])) ==
@@ -424,7 +424,7 @@ params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=300000 window=(1782906600000, 1782928800000]
 -- pushed op=Sum func=Rate grouping=Some(Grouping { without: false, labels: ["status"] })
--- statement[026] offset=00023039 len=007062
+-- statement[026] offset=00022277 len=007062
 WITH 1782907200000 AS grid_start, 60000 AS grid_step, 361 AS grid_n, 300000 AS range_ms
 SELECT gid, gi, agg FROM (
 SELECT gid, gi,
@@ -565,102 +565,102 @@ ORDER BY gid, gi
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=60000 window=(1782906840000, 1782928800000]
--- statement[027] offset=00030377 len=000275
+-- statement[027] offset=00029615 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906840000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[028] offset=00030698 len=000438
+-- statement[028] offset=00029903 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906840000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == quantile_over_time(0.5, http_requests_total{status="500"}[10m]) ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=600000 window=(1782906300000, 1782928800000]
--- statement[029] offset=00031424 len=000275
+-- statement[029] offset=00030596 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906300000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[030] offset=00031745 len=000438
+-- statement[030] offset=00030884 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906300000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == avg_over_time(http_requests_total{status="500"}[5m] offset 1h) ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=300000 window=(1782903000000, 1782925200000]
--- statement[031] offset=00032470 len=000275
+-- statement[031] offset=00031576 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782903000000 AND unix_milli <= 1782925200000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[032] offset=00032791 len=000438
+-- statement[032] offset=00031864 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782903000000 AND unix_milli <= 1782925200000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == sum_over_time(http_requests_total{status="500"}[5m] @ 1782900000) ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=300000 window=(1782899400000, 1782900000000]
--- statement[033] offset=00033519 len=000275
+-- statement[033] offset=00032559 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782899400000 AND unix_milli <= 1782900000000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[034] offset=00033840 len=000438
+-- statement[034] offset=00032847 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782899400000 AND unix_milli <= 1782900000000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == rate(http_requests_total{status="500"}[5m:1m]) ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906600000, 1782928800000]
--- statement[035] offset=00034544 len=000275
+-- statement[035] offset=00033518 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906600000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[036] offset=00034865 len=000438
+-- statement[036] offset=00033806 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906600000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == http_requests_total{status="500"}[5m] ==
 params start_ms=1782907200000 end_ms=1782907200000 step_ms=0
 selectors 1
 -- selector[0] name=http_requests_total range_ms=300000 window=(1782906600000, 1782907200000]
--- statement[037] offset=00035561 len=000275
+-- statement[037] offset=00034469 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906600000 AND unix_milli <= 1782907200000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[038] offset=00035882 len=000438
+-- statement[038] offset=00034757 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906600000 AND unix_milli <= 1782907200000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == time() ==
@@ -679,123 +679,123 @@ selectors 0
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 2
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[039] offset=00036853 len=000275
+-- statement[039] offset=00035695 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[040] offset=00037174 len=000438
+-- statement[040] offset=00035983 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 -- selector[1] name=target_info range_ms=- window=(1782906900000, 1782928800000]
--- statement[041] offset=00037739 len=000275
+-- statement[041] offset=00036515 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[042] offset=00038060 len=000438
+-- statement[042] offset=00036803 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == rate(http_requests_total{status="500"}[5m]) / on (instance) rate(http_errors_total{status="500"}[5m]) ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 2
 -- selector[0] name=http_requests_total range_ms=300000 window=(1782906600000, 1782928800000]
--- statement[043] offset=00038824 len=000275
+-- statement[043] offset=00037534 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906600000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[044] offset=00039145 len=000438
+-- statement[044] offset=00037822 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906600000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 -- selector[1] name=http_errors_total range_ms=300000 window=(1782906600000, 1782928800000]
--- statement[045] offset=00039721 len=000275
+-- statement[045] offset=00038365 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906600000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[046] offset=00040042 len=000438
+-- statement[046] offset=00038653 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906600000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == http_requests_total{status="500"} and http_requests_total{status="200"} ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 2
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[047] offset=00040771 len=000275
+-- statement[047] offset=00039349 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[048] offset=00041092 len=000438
+-- statement[048] offset=00039637 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 -- selector[1] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[049] offset=00041665 len=000275
+-- statement[049] offset=00040177 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[050] offset=00041986 len=000438
+-- statement[050] offset=00040465 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == http_requests_total{status="500"} * 100 ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=http_requests_total range_ms=- window=(1782906900000, 1782928800000]
--- statement[051] offset=00042683 len=000275
+-- statement[051] offset=00041129 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[052] offset=00043004 len=000438
+-- statement[052] offset=00041417 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 
 == {__name__=~"http_.*",status="500"} ==
 params start_ms=1782907200000 end_ms=1782928800000 step_ms=60000
 selectors 1
 -- selector[0] name=<none> range_ms=- window=(1782906900000, 1782928800000]
--- statement[053] offset=00043683 len=000275
+-- statement[053] offset=00042063 len=000242
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)
--- statement[054] offset=00044004 len=000438
+-- statement[054] offset=00042351 len=000405
 SELECT fingerprint, unix_milli, schema, zero_threshold, zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint
 FROM metric_hist_samples
 WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782928800000
-  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))
+  AND fingerprint IN ('101', '205', '990')
 ORDER BY fingerprint, unix_milli
 

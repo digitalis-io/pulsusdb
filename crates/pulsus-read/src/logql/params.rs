@@ -123,6 +123,12 @@ pub struct TimeBounds {
 /// `PULSUS_LOGQL_MAX_STREAMS` config field only when a deployment needs it.
 pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 
+/// The row bound on a discovery answer — `/labels`, `/label/{name}/values`
+/// and `/detected_labels` (issue #399). Past it the first this-many rows in
+/// the statement's `ORDER BY` are returned and the answer is marked
+/// truncated. Not configurable.
+pub const DISCOVERY_MAX_ROWS: u64 = 100_000;
+
 /// **The client-controlled duration domain** (issue #227 review round 2;
 /// widened to the reference's full domain in round 10).
 ///

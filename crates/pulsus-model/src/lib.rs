@@ -33,7 +33,8 @@ pub use matcher::{LabelMatcher, MatchOp};
 pub use sample::{LogSample, MetricSample, STALE_NAN_BITS, Series};
 pub use tenant::{MAX_TENANT_BYTES, TENANT_HEADER, Tenant, TenantError, tenant_from_headers};
 pub use time::{
-    ACTIVITY_BUCKET_MS, Date, Fingerprint, FpLiteral, UnixMilli, UnixNano, floor_to_activity_bucket,
+    ACTIVITY_BUCKET_MS, Date, Fingerprint, FpArray, FpLiteral, FpSet, UnixMilli, UnixNano,
+    floor_to_activity_bucket,
 };
 
 #[cfg(test)]

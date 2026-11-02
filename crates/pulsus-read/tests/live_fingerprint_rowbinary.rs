@@ -727,3 +727,178 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
 
     drop_database(&bootstrap, &db).await;
 }
+
+/// The read settings every engine statement carries: among them the raised
+/// `max_query_size`, without which a statement of a few hundred kilobytes
+/// is refused for its text before its parse tree is built.
+fn read_settings() -> QuerySettings {
+    pulsus_read::logql::read_query_settings(50 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024, false)
+}
+
+/// Drains `sql` through `R`, returning the dispatch or decode error rather
+/// than panicking, so a refused statement is an assertion failure.
+async fn try_read_all<R: ChRow>(
+    client: &ChClient,
+    sql: &str,
+    settings: &QuerySettings,
+) -> Result<Vec<R>, String> {
+    let mut stream = client
+        .query_stream::<R>(sql, settings)
+        .await
+        .map_err(|e| format!("dispatch: {e}"))?;
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.map_err(|e| format!("decode: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// `n` literals `(1 << 100) + i`, disjoint from the four stored boundary
+/// values.
+fn far_literals(n: u128) -> Vec<pulsus_model::FpLiteral> {
+    (0..n)
+        .map(|i| Fingerprint::from_raw((1u128 << 100) + i).sql_literal())
+        .collect()
+}
+
+#[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
+struct IndexRow {
+    i: u8,
+}
+
+/// **T5 (issue #399).** The set form and the array form select exactly the
+/// fingerprint they name at the `2^64` boundary, alone and with 20,000
+/// further elements — past the size a list of calls can parse at.
+#[tokio::test]
+async fn the_set_and_array_forms_select_exactly_the_named_fingerprint() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_fp_set_forms");
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect");
+    drop_database(&bootstrap, &db).await;
+    run_init(&bootstrap, &RenderCtx::for_tests(&db, 7))
+        .await
+        .expect("run_init");
+    let client = ChClient::new(test_config(&db))
+        .await
+        .expect("connect to db");
+    seed(&client, &db).await;
+    let settings = read_settings();
+    let four: Vec<pulsus_model::FpLiteral> = fingerprints()
+        .into_iter()
+        .map(Fingerprint::sql_literal)
+        .collect();
+
+    for extra in [0u128, 20_000] {
+        let far = far_literals(extra);
+        // (a) each boundary value, alone in the set or with `far` after it.
+        for (k, v) in four.iter().enumerate() {
+            let mut set = vec![*v];
+            set.extend(far.iter().copied());
+            let sql = format!(
+                "SELECT DISTINCT fingerprint FROM log_streams WHERE org_id = '' \
+                 AND fingerprint IN ({}) ORDER BY fingerprint",
+                pulsus_model::FpSet(&set)
+            );
+            let r = try_read_all::<logql_rows::StreamRow>(&client, &sql, &settings).await;
+            assert!(r.is_ok(), "set, {extra} further: {r:?}");
+            assert_eq!(
+                r.unwrap()
+                    .into_iter()
+                    .map(|r| r.fingerprint)
+                    .collect::<Vec<_>>(),
+                vec![Fingerprint::from_raw(BOUNDARY[k])],
+                "set, {extra} further: exactly the named value"
+            );
+        }
+        // (b) a `transform` over the array maps each stored value to its
+        // position, in boundary order.
+        let mut array = four.clone();
+        array.extend(far.iter().copied());
+        let to: Vec<String> = (0..array.len())
+            .map(|i| {
+                if i < 4 {
+                    i.to_string()
+                } else {
+                    "9".to_string()
+                }
+            })
+            .collect();
+        let sql = format!(
+            "SELECT transform(fingerprint, {}, [{}], 9) AS i \
+             FROM (SELECT DISTINCT fingerprint FROM log_streams WHERE org_id = '') \
+             ORDER BY fingerprint",
+            pulsus_model::FpArray(&array),
+            to.join(", ")
+        );
+        let r = try_read_all::<IndexRow>(&client, &sql, &settings).await;
+        assert!(r.is_ok(), "array, {extra} further: {r:?}");
+        assert_eq!(
+            r.unwrap().into_iter().map(|r| r.i).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "array, {extra} further"
+        );
+    }
+
+    drop_database(&bootstrap, &db).await;
+}
+
+/// **T6 (issue #399).** A list at the stream cap is admitted: stage 2, the
+/// flat PromQL fetch and the PromQL discovery read each carry 100,000
+/// fingerprints and answer. The literals are disjoint from the stored
+/// values, so each answers zero rows.
+#[tokio::test]
+async fn a_list_at_the_stream_cap_is_admitted() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_fp_at_cap");
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect");
+    drop_database(&bootstrap, &db).await;
+    run_init(&bootstrap, &RenderCtx::for_tests(&db, 7))
+        .await
+        .expect("run_init");
+    let client = ChClient::new(test_config(&db))
+        .await
+        .expect("connect to db");
+    seed(&client, &db).await;
+    let settings = read_settings();
+    let lits = far_literals(100_000);
+    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
+
+    let sql = pulsus_read::logql::sql::stage2(&tenant, "log_streams", &lits);
+    let r = try_read_all::<logql_rows::StreamMetaRow>(&client, &sql, &settings).await;
+    assert!(r.is_ok(), "stage2: {r:?}");
+    assert!(r.unwrap().is_empty(), "stage2: zero rows");
+
+    let sql = pulsus_read::metrics::sample_sql::sample_fetch_multi(
+        &tenant,
+        "metric_samples",
+        &lits,
+        0,
+        100,
+    );
+    assert!(sql.is_ok(), "sample_fetch_multi builds: {sql:?}");
+    let r = try_read_all::<sample_rows::MultiSampleRow>(&client, &sql.unwrap(), &settings).await;
+    assert!(r.is_ok(), "sample_fetch_multi: {r:?}");
+    assert!(r.unwrap().is_empty(), "sample_fetch_multi: zero rows");
+
+    let sql = pulsus_read::metrics::sql::discovery_fetch_multi(
+        &tenant,
+        "metric_series",
+        "metric_labels",
+        &["up".to_string()],
+        &lits,
+        pulsus_read::metrics::matcher::DataWindow {
+            start_ms: 0,
+            end_ms: 100,
+        },
+    );
+    assert!(sql.is_ok(), "discovery_fetch_multi builds: {sql:?}");
+    let r = try_read_all::<metrics_rows::SeriesRow>(&client, &sql.unwrap(), &settings).await;
+    assert!(r.is_ok(), "discovery_fetch_multi: {r:?}");
+    assert!(r.unwrap().is_empty(), "discovery_fetch_multi: zero rows");
+
+    drop_database(&bootstrap, &db).await;
+}

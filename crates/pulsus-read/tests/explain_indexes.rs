@@ -262,36 +262,20 @@ async fn explain(client: &ChClient, sql: &str) -> Vec<String> {
     index_usage(&explain_raw(client, sql).await)
 }
 
-/// The active-fingerprint set a discovery read resolves from its own
-/// statement (issue #603) before it renders the index scan. The engine runs
-/// exactly this statement; the cases below then analyse the index scan that
-/// carries its result as a literal list.
-async fn active_set(client: &ChClient, rollup: &str, start_ns: i64, end_ns: i64) -> Vec<FpLiteral> {
-    #[derive(Debug, pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
-    struct Fp {
-        fingerprint: Fingerprint,
+/// The scope a discovery read renders over `rollup` (issue #399): the
+/// activity read nested with `GLOBAL IN`, scoped by `stage1_sql` when given.
+fn discovery_scope<'a>(
+    rollup: &'a str,
+    start_ns: i64,
+    end_ns: i64,
+    stage1_sql: Option<&'a str>,
+) -> sql::DiscoveryScope<'a> {
+    sql::DiscoveryScope {
+        rollup_table: rollup,
+        window: TimeWindow { start_ns, end_ns },
+        rollup_res_ns: ROLLUP_RES_NS,
+        stage1_sql,
     }
-    let sql = sql::active_fingerprints(
-        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-        rollup,
-        None,
-        TimeWindow { start_ns, end_ns },
-        ROLLUP_RES_NS,
-    );
-    let mut stream = client
-        .query_stream::<Fp>(&sql, &pulsus_clickhouse::QuerySettings::new())
-        .await
-        .expect("the activity statement runs");
-    let mut out = Vec::new();
-    while let Some(row) = stream.next().await {
-        out.push(row.expect("a fingerprint row").fingerprint.sql_literal());
-    }
-    assert!(
-        !out.is_empty(),
-        "the fixture must have at least one active stream, or the index scan \
-         below would never be issued"
-    );
-    out
 }
 
 /// The FIRST `Parts: m/n` count in raw `EXPLAIN indexes = 1` text —
@@ -1669,14 +1653,15 @@ async fn detected_labels_aggregation_prunes_on_the_month_partition() {
     };
     let months = pulsus_read::logql::plan::months_overlapping(start_ns, end_ns);
     let table = format!("{db}.log_streams_idx");
-    // Issue #603: the activity set reaches the index scan as a literal list
-    // the engine resolved from its own statement, never as a subquery.
-    let active = active_set(&client, &format!("{db}.log_metrics_5s"), start_ns, end_ns).await;
+    // Issue #399: the activity read is a `GLOBAL IN` subquery of the index
+    // scan, one statement.
+    let rollup = format!("{db}.log_metrics_5s");
     let sql = sql::detected_labels(
         &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &table,
         &months,
-        &active,
+        &discovery_scope(&rollup, start_ns, end_ns, None),
+        100_001,
     );
     assert!(!sql.contains("log_samples"), "never touches log_samples");
 
@@ -1755,7 +1740,7 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
     let unscoped = sql::active_fingerprints(
         &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &table,
-        None,
+        sql::ActivityScope::All,
         window,
         ROLLUP_RES_NS,
     );
@@ -1791,7 +1776,7 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
     let scoped = sql::active_fingerprints(
         &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &table,
-        Some(&[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()]),
+        sql::ActivityScope::Listed(&[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()]),
         window,
         ROLLUP_RES_NS,
     );
@@ -1816,7 +1801,7 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
 
 /// Issue #406 Part A — the two statements `/series` with no `match[]`
 /// renders. The branch introduces NO new SQL shape: statement one is
-/// `sql::active_fingerprints(rollup, None, …)`, already production SQL for
+/// `sql::active_fingerprints(rollup, ActivityScope::All, …)`, the activity read of
 /// `/labels`, `/label/{name}/values` and `/detected_labels`, and statement
 /// two is the byte-pinned `sql::stage2`. What this case adds over the
 /// pieces' existing coverage is the PAIRING — the unmatched path engages
@@ -1862,7 +1847,7 @@ async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primar
     let activity = sql::active_fingerprints(
         &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &rollup,
-        None,
+        sql::ActivityScope::All,
         window,
         ROLLUP_RES_NS,
     );
@@ -1923,11 +1908,10 @@ async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primar
 /// Issue #399 AC15 — `/labels` and `/label/{name}/values` keep their
 /// month partition pruning and gain the same activity semi-join.
 ///
-/// Issue #482 AC 3 extends it with the SCOPED forms: `query=`'s
-/// fingerprints are pushed inside the activity subquery, so the outer
-/// scan's `index_usage` extract must be IDENTICAL to the unscoped
-/// form's, asserted as an equality against the unscoped extract rather
-/// than against a second copy of the expected list.
+/// Issue #482 AC 3 extends it with the SCOPED forms. Since issue #399 the
+/// selector's stage-1 statement is nested inside the activity subquery,
+/// and the outer scan's extract is IDENTICAL to the unscoped form's,
+/// asserted as an equality against the unscoped extract.
 #[tokio::test]
 async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_bucket_range() {
     skip_unless_live!();
@@ -1964,12 +1948,13 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         "Condition: (month in [#, #])",
     ];
 
-    let active = active_set(&client, &rollup, window.start_ns, window.end_ns).await;
+    let unscoped = discovery_scope(&rollup, window.start_ns, window.end_ns, None);
     let names_sql = sql::label_names(
         &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &idx,
         &months,
-        &active,
+        &unscoped,
+        100_001,
     );
     let mut expected: Vec<&str> = month_blocks.to_vec();
     expected.extend([
@@ -1982,18 +1967,19 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
     let names_usage = explain(&client, &names_sql).await;
     assert_eq!(names_usage, v(&expected));
 
-    // The SCOPED form. `query=`'s stage-1 fingerprints narrow the ACTIVITY
-    // statement, so the OUTER scan's index usage must be identical to the
-    // unscoped form's: same month MinMax and Partition blocks, same
-    // primary-key condition, over a list of its own.
+    // The SCOPED form (issue #399): `query=`'s stage-1 statement is nested
+    // inside the activity subquery, so the OUTER scan analyses exactly as
+    // the unscoped form does — one fingerprint set, measured on 26.8.21.10 —
+    // asserted as an equality against the unscoped extract.
+    let s1 = streams_plan(r#"{service_name="checkout"}"#, &params, db);
+    let s1 = qualify(&s1.stage1_sql, "log_streams_idx", db);
+    let scoped = discovery_scope(&rollup, window.start_ns, window.end_ns, Some(&s1));
     let scoped_names_sql = sql::label_names(
         &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &idx,
         &months,
-        &[
-            Fingerprint::from_raw(7).sql_literal(),
-            Fingerprint::from_raw(11).sql_literal(),
-        ],
+        &scoped,
+        100_001,
     );
     assert_eq!(
         explain(&client, &scoped_names_sql).await,
@@ -2006,7 +1992,8 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         &idx,
         &months,
         &literal("env"),
-        &active,
+        &unscoped,
+        100_001,
     );
     let mut expected: Vec<&str> = month_blocks.to_vec();
     expected.extend([
@@ -2031,10 +2018,8 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         &idx,
         &months,
         &literal("env"),
-        &[
-            Fingerprint::from_raw(7).sql_literal(),
-            Fingerprint::from_raw(11).sql_literal(),
-        ],
+        &scoped,
+        100_001,
     );
     assert_eq!(
         explain(&client, &scoped_values_sql).await,
@@ -2042,7 +2027,7 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         "the scoped /label/{{name}}/values outer scan must analyse exactly as the unscoped one"
     );
 
-    // What the literal list must NOT cost: the outer scan's month partition
+    // What the activity subquery must NOT cost: the outer scan's month partition
     // pruning. `index_usage` drops `Parts:` counts, so assert
     // it on the raw text.
     let raw = explain_raw(&client, &names_sql).await;
@@ -2355,7 +2340,8 @@ async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_k
         ],
         lower_excl,
         upper_incl,
-    );
+    )
+    .expect("fits");
 
     let usage = explain(&client, &sql).await;
     assert_eq!(
@@ -2591,7 +2577,8 @@ async fn discovery_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprin
             Fingerprint::from_raw(u128::from(SFP2)).sql_literal(),
         ],
         window,
-    );
+    )
+    .expect("fits");
 
     let usage = explain(&client, &sql).await;
     assert_eq!(
@@ -3701,7 +3688,7 @@ async fn an_unscoped_discovery_read_selects_only_its_windows_granules() {
     let statement = sql::active_fingerprints(
         &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &format!("{db}.log_metrics_5s"),
-        None,
+        sql::ActivityScope::All,
         TimeWindow { start_ns, end_ns },
         ROLLUP_RES_NS,
     );

@@ -1089,39 +1089,25 @@ async fn run_discovery_shape(
 
     // Issue #399: `/labels` is window-scoped by the streams active in the
     // request's range, so the bench must issue what production issues — the
-    // corpus window is the discovery window here, as it always was.
-    //
-    // **Issue #603: that is now two statements, not one.** The activity scan
-    // runs first and its result is rendered into the index scan as a literal
-    // list, so neither statement nests a distributed subquery and the index
-    // scan is captured `Flat`. The bench issues the UNSCOPED form — no
-    // `query=` — which is the shape this evidence has always measured.
-    let activity_sql = sql::active_fingerprints(
-        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-        &tables.rollup,
-        None,
-        TimeWindow {
-            start_ns: dataset.start_ns,
-            end_ns: dataset.end_ns,
-        },
-        5_000_000_000,
-    );
-    let active = resolve_fingerprints(
-        client,
-        &activity_sql,
-        &format!("{base_id}-activity"),
-        cfg.dist,
-    )
-    .await?;
-    let fps: Vec<pulsus_model::FpLiteral> = active
-        .into_iter()
-        .map(|fp| pulsus_model::Fingerprint::from_raw(fp).sql_literal())
-        .collect();
+    // corpus window is the discovery window here, as it always was. That is
+    // one statement, the activity read nested as a `GLOBAL IN` subquery; an
+    // explicit `GLOBAL` consults no product mode, so it is captured `Flat`.
+    // The bench issues the UNSCOPED form — no `query=` — which is the shape
+    // this evidence has always measured.
     let sql = sql::label_names(
         &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &tables.streams_idx,
         &months,
-        &fps,
+        &sql::DiscoveryScope {
+            rollup_table: &tables.rollup,
+            window: TimeWindow {
+                start_ns: dataset.start_ns,
+                end_ns: dataset.end_ns,
+            },
+            rollup_res_ns: 5_000_000_000,
+            stage1_sql: None,
+        },
+        pulsus_read::logql::params::DISCOVERY_MAX_ROWS + 1,
     );
 
     execute_discard::<LabelNameRow>(

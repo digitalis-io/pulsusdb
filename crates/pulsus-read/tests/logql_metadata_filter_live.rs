@@ -31,9 +31,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_logql::parse;
-use pulsus_read::logql::TooBroadReason;
 use pulsus_read::logql::{Direction, QueryParams, QuerySpec, TimeBounds};
-use pulsus_read::{EngineConfig, LogQlEngine, QueryResult, ReadError};
+use pulsus_read::{EngineConfig, LogQlEngine, QueryResult};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
 
@@ -1448,12 +1447,12 @@ async fn an_oversized_fragment_falls_back_on_every_route_that_can_meet_it() {
 }
 
 // ---------------------------------------------------------------------
-// Issue #603: label discovery runs the activity scan as its own statement
+// Issue #399: label discovery is one statement, with no stream cap
 // ---------------------------------------------------------------------
 
-/// The stream fixture the two discovery cases below seed: three streams, each
-/// with its own `env` value, so a label-values read over `env` has three
-/// distinct answers and the cap can be set either side of three.
+/// The stream fixture the small discovery cases below seed: three streams,
+/// each with its own `env` value, so a label-values read over `env` has
+/// three distinct answers and a bound can be set either side of three.
 const DISCOVERY_STREAMS: [Stream; 3] = [
     Stream {
         fingerprint: 9_001,
@@ -1497,72 +1496,60 @@ fn bounds(ts_ns: i64) -> TimeBounds {
     }
 }
 
-/// **T52.** An activity set larger than `max_streams` is **refused rather than
-/// truncated**, with the shipped `422` reason.
-///
-/// Issue #603 made label discovery run the activity scan as a statement of its
-/// own and render its result as a literal list, which brings the set under
-/// `check_stream_cap` — the same Rust-side count stage-1 resolution has always
-/// applied. Before that the set was a subquery the server evaluated, so it
-/// never reached the cap at all and an arbitrarily large one was shipped into
-/// each shard's copy of the statement.
-///
-/// **It needs no cluster**: the cap is a count in this process. The
-/// `max_streams: 3` control is what stops a defect in the seeding passing as a
-/// breach — without it, a fixture that seeded nothing would "refuse" for the
-/// wrong reason, or rather would not refuse at all.
-#[tokio::test]
-async fn an_over_cap_activity_set_is_refused_rather_than_truncated() {
-    skip_unless_live!();
-    let db = pulsus_testkit::test_db("pulsus_read_it_logql_activity_cap");
-    let client = create_schema(&db).await;
-    let ts = now_ns();
-    seed(&client, &db, ts, &DISCOVERY_STREAMS, &DISCOVERY_SEEDS).await;
+/// The streams T1 and T4 seed: more active streams than one statement's
+/// parse tree could carry as a `toUInt128` list (the limit is near 16,650).
+const SCALE_STREAMS: u128 = 20_000;
 
-    // At a cap of three the read answers with all three values.
-    let engine = LogQlEngine::new(
-        data_client(&db).await,
-        EngineConfig {
-            max_streams: 3,
-            ..engine_config(&db)
-        },
-        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-    );
-    let values = engine
-        .label_values("env", None, bounds(ts))
-        .await
-        .expect("a set at the cap is answered");
-    assert_eq!(
-        values,
-        vec![
-            "alpha".to_string(),
-            "bravo".to_string(),
-            "charlie".to_string()
-        ],
-        "the control must answer completely, or the breach below proves nothing"
-    );
+/// The first scale stream's fingerprint: `(1 << 100) + i` for stream `i`,
+/// above `2^64` and disjoint from every other fixture value.
+const SCALE_BASE: u128 = 1 << 100;
 
-    // At a cap of two the same read is refused, naming the count and the cap.
-    let engine = LogQlEngine::new(
-        data_client(&db).await,
-        EngineConfig {
-            max_streams: 2,
-            ..engine_config(&db)
-        },
-        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-    );
-    match engine.label_values("env", None, bounds(ts)).await {
-        Err(ReadError::QueryTooBroad(TooBroadReason::StreamCap { count, cap })) => {
-            assert_eq!(cap, 2, "the cap the engine was built with");
-            assert_eq!(
-                count, 3,
-                "the cap is applied INSIDE the streaming loop, so the count is \
-                 the cap plus one rather than the whole store"
-            );
-        }
-        other => panic!("expected a StreamCap refusal, got {other:?}"),
+/// Lands `SCALE_STREAMS` active streams through `log_landing` — one kind-1
+/// row and one kind-0 row at `ts_ns` each, labels
+/// `{"job":"scale","service_name":"scale","unit":"u%05d"}` — plus one idle
+/// stream whose only line is two hours before `ts_ns`, outside `bounds`.
+async fn seed_scale(client: &ChClient, ts_ns: i64) {
+    let month = month_of(ts_ns);
+    let mut block: Vec<SeedLandingRow> = Vec::with_capacity(2 * SCALE_STREAMS as usize + 2);
+    for i in 0..SCALE_STREAMS {
+        let labels = format!(r#"{{"job":"scale","service_name":"scale","unit":"u{i:05}"}}"#);
+        block.push(SeedLandingRow {
+            service: "scale".to_string(),
+            fingerprint: SCALE_BASE + i,
+            month,
+            labels,
+            ..SeedLandingRow::of_kind(1)
+        });
+        block.push(SeedLandingRow {
+            service: "scale".to_string(),
+            fingerprint: SCALE_BASE + i,
+            timestamp_ns: ts_ns,
+            body: "scale line".to_string(),
+            ..SeedLandingRow::of_kind(0)
+        });
     }
+    let idle = SCALE_BASE + SCALE_STREAMS;
+    block.push(SeedLandingRow {
+        service: "scale".to_string(),
+        fingerprint: idle,
+        month,
+        labels: r#"{"idle":"yes","job":"scale","service_name":"scale","unit":"idle"}"#.to_string(),
+        ..SeedLandingRow::of_kind(1)
+    });
+    block.push(SeedLandingRow {
+        service: "scale".to_string(),
+        fingerprint: idle,
+        timestamp_ns: ts_ns - 7_200_000_000_000,
+        body: "idle line".to_string(),
+        ..SeedLandingRow::of_kind(0)
+    });
+    client
+        .insert_block("log_landing", &block)
+        .await
+        .expect("seed log_landing at scale");
+}
 
+async fn drop_named_db(db: &str) {
     admin_client()
         .await
         .execute(
@@ -1574,44 +1561,151 @@ async fn an_over_cap_activity_set_is_refused_rather_than_truncated() {
         .expect("drop the test database");
 }
 
-/// **T54.** A window with no activity dispatches no index scan.
+/// **T1 (issue #399).** Label discovery answers a window with more active
+/// streams than one statement could list.
 ///
-/// **The observation is that the second statement was never issued** — the
-/// explain trace carries the activity stage and NOT the index-scan stage — and
-/// the returned value is the documented empty one.
-///
-/// Observing only the returned value cannot fail: an empty literal list is
-/// valid SQL that selects nothing, measured (`SELECT 1 AS x WHERE
-/// toUInt128(1) IN ()` completes with no row), and `run_discovery` turns no
-/// rows into the same empty vector either way. So the answer is right with or
-/// without the early return; what the return buys is one avoided round trip on
-/// a quiet range, which is the common case for a dashboard opening on one.
-///
-/// One endpoint, because `run_discovery` owns the branch for all three.
+/// 20,000 streams are active in `bounds(ts)`, one more is idle there. Each
+/// of the three discovery reads answers completely, unscoped and scoped,
+/// and the idle stream contributes nothing — so the answer is the window's,
+/// not the month's.
 #[tokio::test]
-async fn a_no_activity_window_dispatches_no_index_scan() {
+async fn label_discovery_answers_a_window_with_more_active_streams_than_one_statement_could_list() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_logql_discovery_scale");
+    let client = create_schema(&db).await;
+    let ts = now_ns();
+    seed_scale(&client, ts).await;
+    let engine = full_engine(&db).await;
+
+    let r = engine.label_names(None, bounds(ts)).await;
+    assert!(r.is_ok(), "{r:?}");
+    let names = r.unwrap();
+    assert_eq!(
+        names.items,
+        vec!["job", "service_name", "unit"],
+        "the idle stream's `idle` key is outside the window"
+    );
+    assert!(!names.truncated);
+
+    let scoped = parse(r#"{job=~"sc.+"}"#).expect("parse");
+    for (what, selector) in [("unscoped", None), ("scoped", Some(&scoped))] {
+        let r = engine.label_values("unit", selector, bounds(ts)).await;
+        assert!(r.is_ok(), "{what}: {r:?}");
+        let values = r.unwrap();
+        assert_eq!(values.items.len(), SCALE_STREAMS as usize, "{what}");
+        assert_eq!(
+            values.items.first().map(String::as_str),
+            Some("u00000"),
+            "{what}"
+        );
+        assert_eq!(
+            values.items.last().map(String::as_str),
+            Some("u19999"),
+            "{what}"
+        );
+        assert!(
+            !values.items.iter().any(|v| v == "idle"),
+            "{what}: the idle stream is outside the window"
+        );
+        assert!(!values.truncated, "{what}");
+    }
+
+    let r = engine.detected_labels(None, bounds(ts)).await;
+    assert!(r.is_ok(), "{r:?}");
+    let detected = r.unwrap();
+    let unit = detected
+        .items
+        .iter()
+        .find(|l| l.label == "unit")
+        .unwrap_or_else(|| panic!("no `unit` in {:?}", detected.items));
+    assert_eq!(unit.cardinality, SCALE_STREAMS as u64);
+
+    drop_named_db(&db).await;
+}
+
+/// **T4 (issue #399).** `/series` answers a selector matching more streams
+/// than one statement could list: its activity filter and its hydration
+/// carry the set as one literal.
+#[tokio::test]
+async fn a_selector_matching_more_streams_than_one_statement_could_list_is_answered() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_logql_series_scale");
+    let client = create_schema(&db).await;
+    let ts = now_ns();
+    seed_scale(&client, ts).await;
+    let engine = full_engine(&db).await;
+
+    let r = engine
+        .series(&[parse(r#"{job="scale"}"#).expect("parse")], bounds(ts))
+        .await;
+    assert!(r.is_ok(), "{r:?}");
+    let series = r.unwrap();
+    assert_eq!(series.len(), SCALE_STREAMS as usize);
+    assert!(
+        !series.iter().any(|l| l.contains("\"idle\"")),
+        "the idle stream is outside the window"
+    );
+
+    drop_named_db(&db).await;
+}
+
+/// **T2 (issue #399).** Discovery has no stream cap: a store with more
+/// active streams than `max_streams` is answered whole. The answer is
+/// label values, not streams.
+#[tokio::test]
+async fn discovery_is_not_capped_by_the_stream_count() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_logql_activity_cap");
+    let client = create_schema(&db).await;
+    let ts = now_ns();
+    seed(&client, &db, ts, &DISCOVERY_STREAMS, &DISCOVERY_SEEDS).await;
+
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        EngineConfig {
+            max_streams: 2,
+            ..engine_config(&db)
+        },
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
+    let r = engine.label_values("env", None, bounds(ts)).await;
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(
+        r.unwrap().items,
+        vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string()
+        ],
+    );
+
+    drop_named_db(&db).await;
+}
+
+/// **T3 (issue #399).** Each discovery request is one statement, active
+/// window or quiet: the explain trace has one stage, the index scan, and
+/// its SQL carries the activity read as a `GLOBAL IN` subquery.
+#[tokio::test]
+async fn a_discovery_request_is_one_statement_in_an_active_or_a_quiet_window() {
     skip_unless_live!();
     let db = pulsus_testkit::test_db("pulsus_read_it_logql_no_activity");
     let client = create_schema(&db).await;
     let ts = now_ns();
     seed(&client, &db, ts, &DISCOVERY_STREAMS, &DISCOVERY_SEEDS).await;
-    let engine = LogQlEngine::new(
-        data_client(&db).await,
-        engine_config(&db),
-        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-    );
+    let engine = full_engine(&db).await;
 
-    // A window the seeded lines are inside: both stages run.
-    let (values, explain) = engine
-        .label_values_explained("env", None, bounds(ts))
-        .await
-        .expect("the active window is answered");
-    assert_eq!(values.len(), 3, "the control window has activity");
+    let r = engine.label_values_explained("env", None, bounds(ts)).await;
+    assert!(r.is_ok(), "{r:?}");
+    let (values, explain) = r.unwrap();
+    assert_eq!(values.items.len(), 3, "the control window has activity");
     let stages: Vec<&str> = explain.stages.iter().map(|s| s.name).collect();
-    assert_eq!(
-        stages,
-        vec!["stream_activity", "label_values"],
-        "an active window issues the activity scan and then the index scan"
+    assert_eq!(stages, vec!["label_values"]);
+    assert!(
+        explain.stages[0]
+            .sql
+            .contains("GLOBAL IN (SELECT DISTINCT fingerprint FROM log_metrics_5s"),
+        "{}",
+        explain.stages[0].sql
     );
 
     // A window an hour earlier, where the same streams have no rollup rows.
@@ -1619,28 +1713,61 @@ async fn a_no_activity_window_dispatches_no_index_scan() {
         start_ns: ts - 7_200_000_000_000,
         end_ns: ts - 3_600_000_000_000,
     };
-    let (values, explain) = engine
-        .label_values_explained("env", None, quiet)
-        .await
-        .expect("a quiet window is answered");
-    assert!(
-        values.is_empty(),
-        "the documented empty answer, not an error: {values:?}"
-    );
+    let r = engine.label_values_explained("env", None, quiet).await;
+    assert!(r.is_ok(), "{r:?}");
+    let (values, explain) = r.unwrap();
+    assert!(values.items.is_empty(), "{values:?}");
     let stages: Vec<&str> = explain.stages.iter().map(|s| s.name).collect();
-    assert_eq!(
-        stages,
-        vec!["stream_activity"],
-        "a window with no activity must issue NO second statement: {stages:?}"
-    );
+    assert_eq!(stages, vec!["label_values"]);
 
-    admin_client()
-        .await
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop the test database");
+    drop_named_db(&db).await;
+}
+
+/// **T9 (issue #399).** A discovery answer past its row bound is cut at
+/// the bound, in the statement's order, and marked truncated; at the bound
+/// it is whole and unmarked.
+#[tokio::test]
+async fn a_discovery_answer_past_its_bound_is_cut_and_marked() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_logql_discovery_bound");
+    let client = create_schema(&db).await;
+    let ts = now_ns();
+    seed(&client, &db, ts, &DISCOVERY_STREAMS, &DISCOVERY_SEEDS).await;
+
+    let engine = |n: u64| {
+        let db = db.clone();
+        async move {
+            LogQlEngine::new(
+                data_client(&db).await,
+                engine_config(&db),
+                pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            )
+            .with_discovery_max_rows(n)
+        }
+    };
+
+    let r = engine(2).await.label_values("env", None, bounds(ts)).await;
+    assert!(r.is_ok(), "{r:?}");
+    let cut = r.unwrap();
+    assert_eq!(cut.items, vec!["alpha".to_string(), "bravo".to_string()]);
+    assert!(cut.truncated, "a row past the bound arrived");
+
+    let r = engine(3).await.label_values("env", None, bounds(ts)).await;
+    assert!(r.is_ok(), "{r:?}");
+    let whole = r.unwrap();
+    assert_eq!(
+        whole.items,
+        vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string()
+        ]
+    );
+    assert!(!whole.truncated, "exactly at the bound is whole");
+
+    let r = engine(1).await.detected_labels(None, bounds(ts)).await;
+    assert!(r.is_ok(), "{r:?}");
+    assert!(r.unwrap().truncated, "two keys against a bound of one");
+
+    drop_named_db(&db).await;
 }

@@ -258,14 +258,14 @@ impl Lang for Lql {
         rel.source_ref()
     }
 
-    /// A fingerprint renders inside an `IN (…)` list as
-    /// `toUInt128('<up to 39 digits>')` plus `", "`, at most 54 bytes, and
-    /// one AST element per literal. The 32-byte constant is the
-    /// `fingerprint IN ()` frame.
+    /// A fingerprint renders inside an `IN (…)` list as `'<up to 39
+    /// digits>'` plus `", "`, at most 43 bytes, and the list is four AST
+    /// elements whatever its length: a list of literals folds into one node
+    /// (issue #399). The 32-byte constant is the `fingerprint IN ()` frame.
     fn handoff_cost(n: u64) -> HandoffCost {
         HandoffCost {
-            text_bytes: 32 + n * 54,
-            ast_elements: 4 + n,
+            text_bytes: 32 + n * 43,
+            ast_elements: 4,
         }
     }
 }
@@ -2438,8 +2438,8 @@ mod tests {
     }
 
     /// **T3 (issue #624, part 3d-3): the handoff cost bounds the text it
-    /// stands for.** A fingerprint renders as `toUInt128('<up to 39
-    /// digits>')` and `", "`.
+    /// stands for.** A fingerprint renders as `'<up to 39 digits>'` and
+    /// `", "` (issue #399).
     #[test]
     fn handoff_cost_bounds_the_rendered_fingerprint_list() {
         use crate::compile::fold::Lang;

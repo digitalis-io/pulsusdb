@@ -404,7 +404,7 @@ async fn the_production_discovery_read_answers_completely_over_split_placement()
         .await
         .expect("the discovery read answers");
     assert_eq!(
-        values,
+        values.items,
         vec!["alpha".to_string()],
         "the production path must answer COMPLETELY over split placement: the \
          activity scan is a statement of its own and its result is rendered \
@@ -430,6 +430,105 @@ async fn the_production_discovery_read_answers_completely_over_split_placement()
         control_marks <= total_marks,
         "the control read {control_marks} marks of a {total_marks}-mark table"
     );
+
+    exec_on(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+}
+
+/// **T7 (issue #399).** Discovery answers past one statement's list, over
+/// split placement.
+///
+/// 20,000 streams, each with its index rows on shard 1's LOCAL
+/// `log_streams_idx` and its one rollup bucket on shard 2's LOCAL
+/// `log_metrics_5s`. A list of 20,000 `toUInt128` calls is past the parse
+/// tree limit; a subquery without `GLOBAL` is refused on a distributed
+/// table, and one evaluated shard-locally finds neither side whole.
+#[tokio::test]
+async fn discovery_answers_past_one_statements_list_over_split_placement() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_logs_cluster_disc_scale");
+
+    let bootstrap = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect shard1 (bootstrap)");
+    exec_on(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    run_init(&bootstrap, &cluster_ctx(&db))
+        .await
+        .expect("run_init (clustered)");
+    let shard1 = ChClient::new(shard1_config(&db))
+        .await
+        .expect("connect shard1 (data)");
+    let shard2 = ChClient::new(shard2_config(&db))
+        .await
+        .expect("connect shard2 (data)");
+    require_two_shard_topology(&shard1, &shard2).await;
+
+    let ts = now_ns();
+    let month = month_of(ts);
+    let base = 1u128 << 100;
+    let bucket = (ts / 5_000_000_000) * 5_000_000_000;
+    exec_on(
+        &shard1,
+        &format!(
+            "INSERT INTO log_streams_idx (org_id, month, key, val, fingerprint) \
+             SELECT '', toDate({month}), 'unit', concat('u', leftPad(toString(number), 5, '0')), \
+             toUInt128('{base}') + number FROM numbers(20000)"
+        ),
+    )
+    .await;
+    exec_on(
+        &shard1,
+        &format!(
+            "INSERT INTO log_streams_idx (org_id, month, key, val, fingerprint) \
+             SELECT '', toDate({month}), 'env', 'alpha', toUInt128('{base}') + number \
+             FROM numbers(20000)"
+        ),
+    )
+    .await;
+    exec_on(
+        &shard2,
+        &format!(
+            "INSERT INTO log_metrics_5s (org_id, fingerprint, bucket_ns, count, bytes, count_at, bytes_at) \
+             SELECT '', toUInt128('{base}') + number, {bucket}, 1, 10, 0, 0 FROM numbers(20000)"
+        ),
+    )
+    .await;
+
+    let bounds = TimeBounds {
+        start_ns: ts - 60_000_000_000,
+        end_ns: ts + 60_000_000_000,
+    };
+    let engine = LogQlEngine::new(
+        ChClient::new(shard1_config(&db))
+            .await
+            .expect("connect the engine's client"),
+        engine_config(&db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
+    let scoped = parse(r#"{env="alpha"}"#).expect("parse");
+    for (what, selector) in [("unscoped", None), ("scoped", Some(&scoped))] {
+        let r = engine.label_values("unit", selector, bounds).await;
+        assert!(r.is_ok(), "{what}: {r:?}");
+        let values = r.unwrap();
+        assert_eq!(values.items.len(), 20_000, "{what}");
+        assert_eq!(
+            values.items.first().map(String::as_str),
+            Some("u00000"),
+            "{what}"
+        );
+        assert_eq!(
+            values.items.last().map(String::as_str),
+            Some("u19999"),
+            "{what}"
+        );
+    }
 
     exec_on(
         &bootstrap,

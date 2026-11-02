@@ -1343,49 +1343,23 @@ async fn detected_labels_fan_in_is_one_row_per_key_at_any_cardinality() {
     }
     const DISTINCT_KEYS: u64 = 3;
 
-    /// The active-fingerprint set a discovery read resolves from its own
-    /// statement (issue #603) before it renders the index scan.
-    async fn active_set(
-        client: &ChClient,
-        rollup: &str,
-        start_ns: i64,
-        end_ns: i64,
-    ) -> Vec<pulsus_model::FpLiteral> {
-        #[derive(Debug, pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
-        struct Fp {
-            fingerprint: pulsus_model::Fingerprint,
-        }
-        let sql = sql::active_fingerprints(
-            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-            rollup,
-            None,
-            sql::TimeWindow { start_ns, end_ns },
-            5_000_000_000,
-        );
-        let mut stream = client
-            .query_stream::<Fp>(&sql, &QuerySettings::new())
-            .await
-            .expect("the activity statement runs");
-        let mut out = Vec::new();
-        while let Some(row) = stream.next().await {
-            out.push(row.expect("a fingerprint row").fingerprint.sql_literal());
-        }
-        assert!(!out.is_empty(), "the fixture must have an active stream");
-        out
-    }
-
     let mut fan_in = Vec::new();
     for (i, (month, n)) in cases.iter().enumerate() {
         let (start_ns, end_ns) = month_window(month);
-        // Issue #603: the activity set is resolved by a statement of its own
-        // and rendered into this one as a literal list, which is what
-        // production issues.
-        let active = active_set(&client, &format!("{db}.log_metrics_5s"), start_ns, end_ns).await;
+        // Issue #399: the activity read is a `GLOBAL IN` subquery of this
+        // one statement, which is what production issues.
+        let rollup = format!("{db}.log_metrics_5s");
         let sql = sql::detected_labels(
             &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             &format!("{db}.log_streams_idx"),
             &[month_literal(month_year(month), month_month(month))],
-            &active,
+            &sql::DiscoveryScope {
+                rollup_table: &rollup,
+                window: sql::TimeWindow { start_ns, end_ns },
+                rollup_res_ns: 5_000_000_000,
+                stage1_sql: None,
+            },
+            100_001,
         );
         let query_id = format!("qlg-detected-labels-fanin-{i}");
         // The UUID predicate carries literal `?`s, which the clickhouse
@@ -1768,28 +1742,23 @@ async fn every_logql_engine_query_carries_the_memory_ceiling() {
         .expect("drop run db");
 }
 
-/// **Issue #482 AC 0a — a scoped discovery request that matches no
-/// stream issues stage one and NOTHING ELSE.**
+/// **Issue #399 — a scoped discovery request is one statement**, whether
+/// or not its selector matches a stream: the selector's stage-1 resolution
+/// is nested inside the activity read, which is nested inside the index
+/// scan.
 ///
 /// The property is a COUNT of statements the server logged, not a
 /// presence test: `mem_ceiling_rows` returns every finalized `Select`
 /// against the run database since the marker, with no filter on the
-/// statement text (`:1458-1486`), so an extra dispatch pushes the count
-/// up and fails.
+/// statement text, so an extra dispatch pushes the count up and fails.
 ///
-/// Phase 2 is the positive control. Without it, phase 1's `rows.len() ==
-/// 1` would be equally consistent with a sweep that cannot see stage-2
-/// statements at all.
+/// Phase 2 is the positive control: the same one statement answers a
+/// selector that matches.
 ///
-/// Both selectors are pure equality, so no selectivity probe is issued
-/// (`sql.rs`: probes are computed only for a selector carrying a regex
-/// matcher) and the counts are exactly two statements' worth.
-///
-/// What this cannot see: a stage-2 statement built and then discarded
-/// before dispatch — which is not a user-visible defect — and any
-/// statement issued against a database other than the run database.
+/// What this cannot see: any statement issued against a database other
+/// than the run database.
 #[tokio::test]
-async fn a_no_match_scoped_discovery_request_issues_stage_one_and_no_stage_two() {
+async fn a_scoped_discovery_request_is_one_statement() {
     skip_unless_live!();
     let (admin, run_db, ts_ns) = fresh_run_db().await;
     let config = engine_config(&run_db, 50 * 1024 * 1024 * 1024);
@@ -1804,83 +1773,44 @@ async fn a_no_match_scoped_discovery_request_issues_stage_one_and_no_stage_two()
         end_ns: ts_ns + 3_600_000_000_000,
     };
 
-    // Phase 1 — the no-match request.
-    let m1 = query_log_marker(&admin).await;
-    let out = engine
-        .label_values(
-            "service_name",
-            Some(&parse(r#"{service_name="no-such-service-482"}"#).expect("parse")),
-            bounds,
-        )
-        .await
-        .expect("no-match label_values");
-    assert_eq!(out, Vec::<String>::new());
-    let rows = mem_ceiling_rows_expecting(&admin, &run_db, &m1, 1).await;
-    assert_eq!(
-        rows.len(),
-        1,
-        "exactly one statement: stage one and nothing else\n{}",
-        rows.iter()
-            .map(|r| r.q.clone())
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    assert!(
-        rows[0]
-            .q
-            .starts_with("SELECT fingerprint\nFROM log_streams_idx"),
-        "the one statement must be stage one, got {:?}",
-        rows[0].q
-    );
-    assert!(
-        !rows
-            .iter()
-            .any(|r| r.q.starts_with("SELECT DISTINCT val AS value")),
-        "no stage-2 label_values statement may be issued"
-    );
-
-    // Phase 2 — the positive control.
-    let m2 = query_log_marker(&admin).await;
-    let out = engine
-        .label_values(
-            "service_name",
-            Some(&parse(&format!(r#"{{service_name="{SERVICE}"}}"#)).expect("parse")),
-            bounds,
-        )
-        .await
-        .expect("matching label_values");
-    assert_eq!(out, vec![SERVICE.to_string()]);
-    let rows = mem_ceiling_rows_expecting(&admin, &run_db, &m2, 3).await;
-    // Issue #603: the activity scan sits between them as a statement of its
-    // own. It used to be a subquery nested inside stage two, so this run saw
-    // two statements; the predicate is unchanged, but its result now arrives
-    // as its own dispatch and is rendered into stage two as a literal list.
-    assert_eq!(
-        rows.len(),
-        3,
-        "stage one, the activity scan, then stage two\n{}",
-        rows.iter()
-            .map(|r| r.q.clone())
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    assert!(
-        rows[0]
-            .q
-            .starts_with("SELECT fingerprint\nFROM log_streams_idx"),
-        "rows[0] must be stage one, got {:?}",
-        rows[0].q
-    );
-    assert!(
-        rows[1].q.starts_with("SELECT DISTINCT fingerprint"),
-        "rows[1] must be the activity scan, got {:?}",
-        rows[1].q
-    );
-    assert!(
-        rows[2].q.starts_with("SELECT DISTINCT val AS value"),
-        "rows[2] must be stage two, got {:?}",
-        rows[2].q
-    );
+    for (phase, selector, want) in [
+        (
+            "no match",
+            r#"{service_name="no-such-service-482"}"#.to_string(),
+            Vec::<String>::new(),
+        ),
+        (
+            "match",
+            format!(r#"{{service_name="{SERVICE}"}}"#),
+            vec![SERVICE.to_string()],
+        ),
+    ] {
+        let marker = query_log_marker(&admin).await;
+        let out = engine
+            .label_values(
+                "service_name",
+                Some(&parse(&selector).expect("parse")),
+                bounds,
+            )
+            .await
+            .expect("scoped label_values");
+        assert_eq!(out.items, want, "{phase}");
+        let rows = mem_ceiling_rows_expecting(&admin, &run_db, &marker, 1).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "{phase}: exactly one statement\n{}",
+            rows.iter()
+                .map(|r| r.q.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(
+            rows[0].q.starts_with("SELECT DISTINCT val AS value"),
+            "{phase}: the one statement must be the label_values scan, got {:?}",
+            rows[0].q
+        );
+    }
 
     admin
         .execute(
@@ -7044,7 +6974,7 @@ const SELECTION_GOLDEN: &str = "crates/pulsus-read/tests/golden/logql_selection_
 /// alone leaves this constant standing and B2 fails, so the author has to
 /// move a source line in the same change and the diff carries both.
 const PINNED_SELECTION_STATEMENTS: &str =
-    "6b4ec3bca0f3784f83aebc61448f0f394e3d2568fbdafc94e9371d5fd4380715";
+    "035c8db511ba9378f461d69bb14db0b3e892373e80a1b438a85927217bbe12aa";
 
 /// One grid point, on a step boundary: 2030-01-01T00:00:00Z.
 ///
@@ -7261,11 +7191,10 @@ fn sort_fingerprint_lists(sql: &str) -> String {
     while let Some(at) = rest.find(needle) {
         let (head, tail) = rest.split_at(at + needle.len());
         out.push_str(head);
-        // Each element is `toUInt128('<decimal>')` since issue #498, so the
-        // list's own closing parenthesis is the LAST one before the next
-        // clause, not the first — the first now closes the first element's
-        // call. Scanning to a balanced close is what keeps this a list
-        // sorter rather than a text cutter.
+        // Each element is `'<decimal>'` since issue #399 (it was
+        // `toUInt128('<decimal>')` from issue #498). Scanning to a balanced
+        // close keeps this a list sorter rather than a text cutter on a
+        // sub-query form.
         let mut depth = 1usize;
         let mut close = None;
         for (i, c) in tail.char_indices() {
@@ -7291,11 +7220,11 @@ fn sort_fingerprint_lists(sql: &str) -> String {
                     .split(',')
                     .filter_map(|t| {
                         let t = t.trim();
-                        // `toUInt128('123')` or, on a sub-query form, text
-                        // that is not an element at all.
+                        // `'123'` or, on a sub-query form, text that is
+                        // not an element at all.
                         let inner = t
-                            .strip_prefix("toUInt128('")
-                            .and_then(|r| r.strip_suffix("')"))
+                            .strip_prefix('\'')
+                            .and_then(|r| r.strip_suffix('\''))
                             .unwrap_or(t);
                         inner.parse().ok()
                     })
@@ -7303,7 +7232,7 @@ fn sort_fingerprint_lists(sql: &str) -> String {
                 ids.sort_unstable();
                 out.push_str(
                     &ids.iter()
-                        .map(|v| format!("toUInt128('{v}')"))
+                        .map(|v| format!("'{v}'"))
                         .collect::<Vec<_>>()
                         .join(", "),
                 );
@@ -8560,7 +8489,9 @@ async fn shape_a_sends_no_id_list() {
         );
         for s in &shape_a {
             assert!(
-                !s.query.contains("toUInt128("),
+                !s.query.contains("toUInt128(")
+                    && !s.query.contains("fingerprint IN ('")
+                    && !s.query.contains("'Array(UInt128)')"),
                 "{q}: an ID literal in a shape-A statement: {summary:?}"
             );
             assert!(
@@ -12483,7 +12414,7 @@ async fn a_filter_after_a_targeted_parser_returns_what_the_evaluator_returns() {
     let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
     let sec = 1_000_000_000i64;
     const BASE: &str = r#","status":"base""#;
-    const GUARD: &str = "(fingerprint IN (toUInt128('";
+    const GUARD: &str = "(fingerprint IN ('";
     // (line, extra stream labels, pushed pipeline, the not-pushed control,
     //  expected lines, what the pushed statements must carry)
     let cases: &[(&str, &str, &str, &str, usize, &str)] = &[
@@ -12662,7 +12593,7 @@ async fn a_filter_after_a_targeted_parser_returns_what_the_evaluator_returns() {
     for (comment, i) in &comments {
         let (_, _, pushed, _, _, carries) = cases[*i];
         let carries = if carries == GUARD {
-            format!("{GUARD}{}'))", 9600 + *i as u64)
+            format!("{GUARD}{}')", 9600 + *i as u64)
         } else {
             carries.to_string()
         };

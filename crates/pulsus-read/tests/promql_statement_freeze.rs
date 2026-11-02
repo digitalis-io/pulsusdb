@@ -74,6 +74,16 @@
 //! every other line that moved is a marker's offset. 43,648 bytes became
 //! 44,444, and the digest moved from `d4a15a8a…` to `538e6d01…`.
 //!
+//! # Issue #399 moved it, and which statements moved
+//!
+//! A fingerprint list renders `'<decimal>'` elements in place of
+//! `toUInt128('<decimal>')`, and the grouped reads' `fps` array is
+//! `CAST([…], 'Array(UInt128)')`: 50 `fingerprint IN (…)` lists and 4
+//! arrays. Applying exactly those two substitutions to the earlier golden
+//! gives this one's statements; every other line that moved is a marker's
+//! offset or length. 44,444 bytes became 42,758, and the digest moved from
+//! `538e6d01…` to `0c7040d9…`.
+//!
 //! # Every boundary in this golden is writer-emitted
 //!
 //! The writer emits `-- statement[i]` before each statement, and the live
@@ -164,10 +174,11 @@ const PINNED: &str = include_str!("golden/promql_statements.sha256");
 /// the line and byte counts re-taken by issue #623, whose sample statements
 /// carry no metric name, again by issue #579 and its parts 2 and 3, by
 /// issue #635 part 4, whose statements each carry the tenant, and by issue
-/// #18 part 3, whose float reads carry the value-bits key.
+/// #18 part 3, whose float reads carry the value-bits key, and by issue
+/// #399, whose fingerprint lists render as literals.
 const ENTRIES: usize = 30;
 const LINES: usize = 801;
-const BYTES: usize = 44_444;
+const BYTES: usize = 42_758;
 /// The statements the writer's markers declare. Sixty before issue #549;
 /// four entries now send ONE statement where they sent two, and issue #579
 /// made it five.
@@ -345,11 +356,13 @@ fn render() -> String {
                 (_, None) => {
                     emit(
                         &mut out,
-                        &sample_sql::sample_fetch_multi(&no_tenant(), SAMPLES, &fps(), lo, hi),
+                        &sample_sql::sample_fetch_multi(&no_tenant(), SAMPLES, &fps(), lo, hi)
+                            .expect("fits"),
                     );
                     emit(
                         &mut out,
-                        &sample_sql::hist_sample_fetch_multi(&no_tenant(), HIST, &fps(), lo, hi),
+                        &sample_sql::hist_sample_fetch_multi(&no_tenant(), HIST, &fps(), lo, hi)
+                            .expect("fits"),
                     );
                 }
             }
