@@ -515,17 +515,40 @@ async fn assert_prunes_at_least(
     k: u64,
     what: &str,
 ) {
+    let (gated, control) = gated_and_control_granules(client, sql, control_sql, what).await;
+    assert!(
+        gated.saturating_mul(k) <= control,
+        "{what}: gated selected {gated} granules against the control's {control}; required \
+         gated x {k} <= control"
+    );
+}
+
+/// The skip indexes select exactly the granules the `use_skip_indexes = 0`
+/// control does: for a predicate no index may rule a granule out for, a
+/// granule dropped is a line lost (issue #757).
+async fn assert_prunes_nothing(client: &ChClient, sql: &str, control_sql: &str, what: &str) {
+    let (gated, control) = gated_and_control_granules(client, sql, control_sql, what).await;
+    assert_eq!(
+        gated, control,
+        "{what}: gated selected {gated} granules against the control's {control}; a predicate \
+         no index can rule a granule out for must select every granule the control does"
+    );
+}
+
+/// The net granule selection of `sql` and of `control_sql`, from one run.
+async fn gated_and_control_granules(
+    client: &ChClient,
+    sql: &str,
+    control_sql: &str,
+    what: &str,
+) -> (u64, u64) {
     let gated_raw = explain_raw(client, sql).await;
     let control_raw = explain_raw(client, control_sql).await;
     let (gated, _) = last_granules(&gated_raw)
         .unwrap_or_else(|| panic!("{what}: no Granules: line in the gated EXPLAIN"));
     let (control, _) = last_granules(&control_raw)
         .unwrap_or_else(|| panic!("{what}: no Granules: line in the control EXPLAIN"));
-    assert!(
-        gated.saturating_mul(k) <= control,
-        "{what}: gated selected {gated} granules against the control's {control}; required \
-         gated x {k} <= control"
-    );
+    (gated, control)
 }
 
 /// The rollup resolution `test_ctx` renders (`log_rollup: 5s`).
@@ -1064,17 +1087,9 @@ enum PrunesBy {
     /// with the never-matching arm: a bloom filter answers "this granule
     /// MAY contain it", which cannot rule a granule out for `NOT (...)`,
     /// and the other two give the index nothing to read. The claim is
-    /// "never worse than no skip index at all".
+    /// that the read selects exactly the control's granules: one granule
+    /// fewer would drop lines the filter keeps.
     NotAtAll,
-}
-
-impl PrunesBy {
-    fn factor(self) -> u64 {
-        match self {
-            PrunesBy::Strongly => 4,
-            PrunesBy::NotAtAll => 1,
-        }
-    }
 }
 
 /// Runs a stage-3 shape's `EXPLAIN indexes = 1` and makes the whole
@@ -1121,7 +1136,10 @@ async fn assert_stage3_usage(
     // ([`seed_line_filter_corpus`]): on a single granule every index
     // trivially selects 1/1 and a dead one is indistinguishable.
     let control_sql = format!("{sql} SETTINGS use_skip_indexes = 0");
-    assert_prunes_at_least(client, &sql, &control_sql, prunes.factor(), query).await;
+    match prunes {
+        PrunesBy::Strongly => assert_prunes_at_least(client, &sql, &control_sql, 4, query).await,
+        PrunesBy::NotAtAll => assert_prunes_nothing(client, &sql, &control_sql, query).await,
+    }
 }
 
 /// The `MinMax`/`Partition`/`PrimaryKey` prefix every stage-3 line-filter
