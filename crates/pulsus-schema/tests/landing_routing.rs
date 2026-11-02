@@ -1,14 +1,19 @@
-//! **1-U3 (issue #494 part 1): on a cluster each landing table has one
-//! routing wrapper, keyed on the push's receive stamp.**
+//! **1-U3 (issue #494 part 1): on a cluster the log and trace landing tables
+//! each have one routing wrapper, keyed on the push's receive stamp, and
+//! `metric_landing` has none.**
 //!
 //! Every row of a push carries the one `received_ms` the writer took for it,
-//! so `cityHash64(received_ms)` sends the whole block, and every resend of
-//! it, to one shard. Single-node renders no wrapper. Read from what
+//! so `cityHash64(received_ms)` sends the whole block, and every resend the
+//! writer makes of it, to one shard. The metrics writer inserts into the bare
+//! `metric_landing`. Single-node renders no wrapper. Read from what
 //! `schema/schema.sh --print` writes, which is what a deployment applies.
 
 use std::process::Command;
 
 const LANDING: [&str; 3] = ["log_landing", "metric_landing", "trace_landing"];
+
+/// The landing tables written through a wrapper on a cluster.
+const ROUTED: [&str; 2] = ["log_landing", "trace_landing"];
 
 /// `schema.sh --print` with an empty environment but for `PATH` and `vars`:
 /// the exit status and the statements it printed.
@@ -45,11 +50,20 @@ fn wrapper_heads<'a>(text: &'a str, table: &str) -> Vec<(&'a str, &'a str)> {
 }
 
 #[test]
-fn each_landing_table_has_one_wrapper_on_the_receive_stamp_on_a_cluster() {
+fn the_log_and_trace_landing_tables_have_one_wrapper_on_the_receive_stamp_on_a_cluster() {
     let (code, text, err) =
         print_schema(&[("PULSUS_RETENTION_DAYS", "7"), ("PULSUS_CLUSTER", "c")]);
     assert_eq!(code, Some(0), "the script refused: {err}");
-    for table in LANDING {
+    let metric_heads = wrapper_heads(&text, "metric_landing");
+    assert!(
+        metric_heads.is_empty(),
+        "metric_landing has no wrapper: {metric_heads:?}"
+    );
+    assert!(
+        !text.contains("metric_landing_dist"),
+        "nothing names a metric_landing wrapper"
+    );
+    for table in ROUTED {
         let heads = wrapper_heads(&text, table);
         assert_eq!(
             heads.len(),

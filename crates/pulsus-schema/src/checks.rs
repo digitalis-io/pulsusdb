@@ -670,9 +670,10 @@ mod tests {
     /// separate check.
     ///
     /// **The logs landing path widens neither side** (issue #603): its insert
-    /// pins the same ten settings the metrics one does, and its read path
-    /// sends no query setting at all — the discovery reads dispatch with the
-    /// budget settings and nothing more. `the_discovery_reads_send_no_distributed_product_mode`
+    /// pins the metrics set plus the two routed pins
+    /// (`QuerySettings::routed_landing_insert`), both rows already, and its
+    /// read path sends no query setting at all — the discovery reads dispatch
+    /// with the budget settings and nothing more. `the_discovery_reads_send_no_distributed_product_mode`
     /// (`crates/pulsus-read/src/logql/exec.rs`) asserts the other side of
     /// that.
     #[test]
@@ -702,14 +703,12 @@ mod tests {
             "ignore_materialized_views_with_dropped_target_table",
             "min_insert_block_size_rows_for_materialized_views",
             "min_insert_block_size_bytes_for_materialized_views",
-            "distributed_foreground_insert",
-            "insert_shard_id",
             "timeout_overflow_mode",
         ]);
 
         // The trace landing insert's own seven pins are rows too (issues
-        // #584 to #586), and they are **derived from that constructor** here
-        // rather than written out a second time: this case owns the fifteen
+        // #584 to #586), as are the two routed pins it carries, and they are **derived from that constructor** here
+        // rather than written out a second time: this case owns the thirteen
         // above as a literal set, and
         // `the_settings_read_back_at_startup_are_the_ones_the_trace_insert_sends`
         // owns the rest, both ways.

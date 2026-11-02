@@ -780,7 +780,7 @@ mod tests {
         ] {
             check(
                 "logs",
-                QuerySettings::landing_insert(&token, rows),
+                QuerySettings::routed_landing_insert(&token, rows),
                 fixed::<LogLandingRow>(),
                 landing_block_overhead_bytes::<LogLandingRow>(),
             );

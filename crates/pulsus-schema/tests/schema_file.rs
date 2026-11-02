@@ -89,16 +89,16 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     assert!(text.contains("non_replicated_deduplication_window = 10000"));
 }
 
-/// The inventory, clustered: the same statements plus 21 `_dist` wrappers,
+/// The inventory, clustered: the same statements plus 20 `_dist` wrappers,
 /// `ON CLUSTER` on every one, and the macros intact.
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 77, "statement count");
+    assert_eq!(stmts.len(), 76, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        50,
-        "29 tables + 21 wrappers"
+        49,
+        "29 tables + 20 wrappers"
     );
     assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 26);
 
@@ -109,7 +109,7 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        77,
+        76,
         "every statement carries ON CLUSTER"
     );
 
@@ -281,9 +281,10 @@ fn the_file_holds_only_create_statements() {
 /// A family's routing wrappers all shard on one expression: a series'
 /// rollups must land on the shard its samples do.
 ///
-/// The three landing wrappers are a family of their own (issue #494 part 1):
-/// each routes on `cityHash64(received_ms)`, the one stamp every row of a
-/// push carries, so a push and every resend of it reach one shard.
+/// The log and trace landing wrappers are a family of their own (issue #494
+/// part 1): each routes on `cityHash64(received_ms)`, the one stamp every row
+/// of a push carries, so a push and every resend the writer makes of that
+/// block reach one shard. `metric_landing` has no wrapper.
 ///
 /// `metric_labels` is in the metrics family (issue #623): one label row
 /// per series, keyed like the series, so its wrapper shards on the same
@@ -339,7 +340,7 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         );
     }
     assert!(text.contains("cityHash64(trace_id)"));
-    for table in ["log_landing", "metric_landing", "trace_landing"] {
+    for table in ["log_landing", "trace_landing"] {
         assert!(
             text.contains(&format!("'{table}', cityHash64(received_ms));")),
             "{table} routes on the push's receive stamp, cityHash64(received_ms)"
@@ -844,15 +845,18 @@ fn tables() -> Vec<Table> {
 /// document may still name the landing tables among those without a wrapper
 /// and keep the counts it cited.
 const LANDING_BANNER: &str = "\
-> **Stale on landing placement.** Since the routed-landing change (insert batching, part 1), on a
-> cluster every landing insert goes through its table's wrapper, `<landing table><PULSUS_DIST_SUFFIX>`
-> (`log_landing_dist` at the default suffix), keyed on `cityHash64(received_ms)`, so a push and its resends reach one
-> shard; landing inserts pin `distributed_foreground_insert`, `insert_shard_id`,
-> `skip_unavailable_shards`, `prefer_localhost_replica` and `timeout_overflow_mode`. Passages
-> below that say the landing tables have no wrapper, or that a push is placed by the connection,
-> are out of date. Current behaviour: `schema/schema.sql`, `QuerySettings::landing_insert`
-> (`crates/pulsus-clickhouse/src/settings.rs`), and `docs/configuration.md`'s connection-spreading
-> section.
+> **Stale on landing placement.** On a cluster `log_landing` and `trace_landing` are written
+> through their wrappers, `<landing table><PULSUS_DIST_SUFFIX>` (`log_landing_dist` at the default
+> suffix), keyed on `cityHash64(received_ms)`, so a log or trace push and the writer's resends of it reach one
+> shard; `metric_landing` is still written on the server the writer connects to, so on a cluster
+> whose servers span more than one shard a metrics read can leave out a sample stored on a different
+> shard from its series' registration (`docs/configuration.md`'s topology requirement). Landing inserts pin
+> `skip_unavailable_shards`, `prefer_localhost_replica` and `timeout_overflow_mode`, and the log and
+> trace ones also `distributed_foreground_insert` and `insert_shard_id`. Passages below that say no
+> landing table has a wrapper, or that a log or trace push is placed by the connection, are out of
+> date. Current behaviour: `schema/schema.sql`, `QuerySettings::landing_insert` and
+> `routed_landing_insert` (`crates/pulsus-clickhouse/src/settings.rs`), and `docs/configuration.md`'s
+> connection-spreading section.
 ";
 
 /// `true` when `docs/<name>` carries [`LANDING_BANNER`].
@@ -860,8 +864,8 @@ fn carries_landing_banner(name: &str) -> bool {
     doc(name).contains(LANDING_BANNER)
 }
 
-/// Every base table with no routing wrapper: the label values,
-/// `service_edges` and the cluster-wide ones. These are the exceptions three
+/// Every base table with no routing wrapper: `metric_landing`, the label
+/// values, `service_edges` and the cluster-wide ones. These are the exceptions three
 /// documents name.
 fn tables_without_a_wrapper() -> Vec<String> {
     let all = tables();
@@ -918,9 +922,9 @@ fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
     let no_wrapper = tables_without_a_wrapper();
     assert_eq!(
         no_wrapper.len(),
-        8,
-        "the label values, `service_edges` and six cluster-wide ones: \
-         {no_wrapper:?}"
+        9,
+        "`metric_landing`, the label values, `service_edges` and six \
+         cluster-wide ones: {no_wrapper:?}"
     );
     let all = tables();
     let wrapped: Vec<&String> = all.iter().filter(|t| t.wrapper).map(|t| &t.name).collect();
@@ -1004,9 +1008,10 @@ fn the_trace_sharding_key_passage_names_every_routed_trace_table() {
     }
 }
 
-/// **`metric_label_values` and `service_edges` are the only per-shard tables
-/// with no routing wrapper** (the landing tables have one since issue #494
-/// part 1). The label
+/// **`metric_landing`, `metric_label_values` and `service_edges` are the
+/// only per-shard tables with no routing wrapper** (the log and trace landing
+/// tables have one since issue #494 part 1). The metrics writer inserts into
+/// `metric_landing` on the server it connects to. The label
 /// values are named locally inside every statement that reads them (issue
 /// #635); `service_edges` is read only per shard, through `cluster(…,
 /// view(…))`, by the one statement that also pairs that shard's spans
@@ -1015,7 +1020,8 @@ fn the_trace_sharding_key_passage_names_every_routed_trace_table() {
 /// per-shard table added without a wrapper makes all four false at once,
 /// and reddens here rather than in a document nobody reads.
 #[test]
-fn only_the_label_values_and_the_service_edges_are_per_shard_without_a_wrapper() {
+fn only_the_metrics_landing_the_label_values_and_the_service_edges_are_per_shard_without_a_wrapper()
+{
     let cluster_wide: Vec<String> = tables()
         .into_iter()
         .filter(|t| t.cluster_wide)
@@ -1028,45 +1034,124 @@ fn only_the_label_values_and_the_service_edges_are_per_shard_without_a_wrapper()
     without.sort();
     assert_eq!(
         without,
-        vec!["metric_label_values", "service_edges"],
-        "a per-shard table with no routing wrapper that is not the label \
-         values or `service_edges` (read only per shard, issue #599 part A \
-         D9) falsifies the clustering claim in docs/architecture.md §7, \
+        vec!["metric_label_values", "metric_landing", "service_edges"],
+        "a per-shard table with no routing wrapper that is not \
+         `metric_landing`, the label values or `service_edges` (read only per \
+         shard, issue #599 part A D9) falsifies the clustering claim in docs/architecture.md §7, \
          docs/schemas.md §7, docs/schemas.md's conventions preamble and \
          docs/features.md's clustering row"
     );
 }
 
-/// **Every passage on how the landing tables are written names all three**
-/// (issue #494 part 1): `docs/features.md`'s clustering row names them and
-/// the receive stamp they are routed on, and the two design documents whose
-/// passages predate the change carry the banner that names the wrappers.
+/// **Every passage on how the landing tables are written names each one
+/// with its placement** (issue #494 part 1): `docs/features.md`'s clustering
+/// row names `metric_landing` as written on the server the writer connects
+/// to, and `log_landing` and `trace_landing` as keyed on the receive stamp;
+/// the six design documents whose passages predate the change carry the
+/// banner.
 #[test]
-fn the_landing_routing_passages_name_all_three_landing_tables() {
-    let landing: Vec<String> = tables()
-        .into_iter()
+fn the_landing_placement_passages_name_every_landing_table() {
+    let all = tables();
+    let landing: Vec<&Table> = all
+        .iter()
         .filter(|t| !t.wrapper && t.name.ends_with("_landing"))
-        .map(|t| t.name)
         .collect();
-    assert_eq!(landing.len(), 3, "three landing tables: {landing:?}");
-    let row = doc_line("features.md", "| Clustered ClickHouse |");
-    for table in &landing {
-        assert!(
-            row.contains(&format!("`{table}`")),
-            "docs/features.md's clustering row must name `{table}`: {row}"
-        );
-    }
-    assert!(
-        row.contains("receive stamp"),
-        "docs/features.md's clustering row must say what the landing tables \
-         are routed on: {row}"
+    assert_eq!(landing.len(), 3, "three landing tables");
+    let wrapped: Vec<&String> = all.iter().filter(|t| t.wrapper).map(|t| &t.name).collect();
+    let (routed, bare): (Vec<&Table>, Vec<&Table>) =
+        landing.iter().partition(|t| wrapped.contains(&&t.name));
+    let routed: Vec<&str> = routed.iter().map(|t| t.name.as_str()).collect();
+    let bare: Vec<&str> = bare.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(
+        routed,
+        vec!["log_landing", "trace_landing"],
+        "the landing tables with a wrapper"
     );
-    for name in ["architecture.md", "schemas.md"] {
+    assert_eq!(
+        bare,
+        vec!["metric_landing"],
+        "the landing table without one"
+    );
+    let row = doc_line("features.md", "| Clustered ClickHouse |");
+    assert!(
+        row.contains(
+            "every per-shard table but `metric_landing`, which the writer inserts \
+             into on the server it connects to,"
+        ),
+        "docs/features.md's clustering row must name `metric_landing` as \
+         written on the server the writer connects to: {row}"
+    );
+    assert!(
+        row.contains(
+            "the `log_landing` and `trace_landing` wrappers are keyed on the \
+             push's receive stamp"
+        ),
+        "docs/features.md's clustering row must say the log and trace landing \
+         wrappers are keyed on the receive stamp: {row}"
+    );
+    for name in [
+        "architecture.md",
+        "schemas.md",
+        "ingest-one-source-table.md",
+        "connection-spreading.md",
+        "decisions/0006-log-pattern-extraction.md",
+        "benchmarks/m1-logs-read-path.md",
+    ] {
         assert!(
             carries_landing_banner(name),
             "docs/{name} must carry the landing-placement banner"
         );
     }
+}
+
+/// `docs/configuration.md`'s `PULSUS_DIST_SUFFIX` row, whole (issue #494
+/// part 1).
+const DIST_SUFFIX_ROW: &str = "| `PULSUS_DIST_SUFFIX` | `_dist` | suffix of the Distributed tables PulsusDB names: readers query through them, and on a cluster the writer inserts every log and trace push into `log_landing` or `trace_landing` with it appended (set differently for cross-cluster read topologies, where the writing processes keep the suffix their own cluster's wrappers carry); the service graph reads the cluster and database that `spans` plus this suffix names |";
+
+/// `docs/configuration.md`'s topology requirement, whole (issue #494 part 1).
+const TOPOLOGY_REQUIREMENT: &str = "**Topology requirement:** on a cluster, every server PulsusDB inserts through — the one `CLICKHOUSE_SERVER` names, or each one `CLICKHOUSE_SERVERS` lists, and every server behind a front end at those addresses — must be a cluster member that hosts the `PULSUS_DIST_SUFFIX` wrapper tables, `log_landing` and `trace_landing`'s among them (`log_landing_dist` at the default suffix). A log or trace insert through a server without them fails. Each of those servers must hold the same definition of `PULSUS_CLUSTER` — the same shards, in the same order, with the same weights and the same replicas — and give every shard `internal_replication = true`, as the setup generator and the chart write it. Given that, a log or trace push goes through its table's wrapper, keyed on its receive stamp, so the push and every resend the writer makes of it reach one shard, and the wrapper writes one live replica of it for replication to copy to the rest. A push the client sends again that is stored as a new push (`docs/api.md` §1.0) carries a new receive stamp and may reach another shard. A server whose definition orders the shards differently may send a resend to another shard, where it is stored again; one without `internal_replication = true` writes every replica itself. PulsusDB detects neither. **A metrics push is written to `metric_landing` on the server that receives it.** When the servers PulsusDB inserts through belong to more than one shard — `CLICKHOUSE_SERVERS` lists several shards' servers, or one address is a front end that balances across shards — a writer's resend after an uncertain attempt can reach another shard and be stored there again, and a metrics read can leave out a sample stored on a different shard from its series' registration. Which queries are affected depends on how the reader executes them; exemplar queries (`/api/v1/query_exemplars`) are not affected. Neither problem occurs when every server behind every configured address belongs to one shard. For log and trace reads, spreading only changes which node coordinates the identical query.";
+
+/// `docs/api.md` §1.0's paragraph on a log push answered `500` after part of
+/// it was stored (issue #494 part 1).
+const PARTIAL_LOG_PUSH: &str = "**A synchronous log push can be answered `500` after part of it is stored.** On `POST /v1/logs` and the log push of §8.2, a failure inside ClickHouse after the push's landing rows are written can leave some of its entries, and some of what is derived from them, stored while the push is answered `500`. A resend the client makes that is stored as a new push (see the tables above) carries a new token and can store that part again.";
+
+/// **The user documents say what the routed log and trace landing insert
+/// changes, in the words decided for them** (issue #494 part 1): the
+/// `PULSUS_DIST_SUFFIX` row and the topology requirement in
+/// `docs/configuration.md` are each exactly that text, and `docs/api.md`
+/// §1.0 carries the partial log push paragraph after its cost paragraph.
+#[test]
+fn the_user_documents_state_what_a1_changes() {
+    let config = doc("configuration.md");
+    let rows: Vec<&str> = config
+        .lines()
+        .filter(|l| l.starts_with("| `PULSUS_DIST_SUFFIX` |"))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![DIST_SUFFIX_ROW],
+        "docs/configuration.md's `PULSUS_DIST_SUFFIX` row"
+    );
+    assert_eq!(
+        doc_line("configuration.md", "**Topology requirement:**"),
+        TOPOLOGY_REQUIREMENT,
+        "docs/configuration.md's topology requirement"
+    );
+    let api = doc("api.md");
+    let start = api.find("\n### 1.0 ").expect("docs/api.md has §1.0");
+    let end = start
+        + api[start..]
+            .find("\n### 1.1 ")
+            .expect("docs/api.md has §1.1 after §1.0");
+    let section = &api[start..end];
+    let cost = section
+        .find("**What it costs.**")
+        .expect("docs/api.md §1.0 says what it costs");
+    assert!(
+        section[cost..].contains(PARTIAL_LOG_PUSH),
+        "docs/api.md §1.0 must carry the partial log push paragraph after \
+         \"**What it costs.**\""
+    );
 }
 
 /// **The two passages that carry the claim without the list say where the
@@ -3222,14 +3307,14 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             vec![],
             vec!["--mode", "single"],
             single(),
-            "4ddf6319dc38d3b39fe7a111e08f913da48b048bf564dc1901574bad4ba723e9",
+            "3f9ac2b1a9f9206e9e3018d22b6ceac62edfd6ddc0c7ab77b23aadc7aed1c97f",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "1085f3a227c6cfe92a76933af3857805ef4df0f95a2b45c9fd24aa84806da853",
+            "c973f150b37592c821dc3a3f86391f96b97ad764b5a38899d3603eec1f72da57",
         ),
         (
             "clustered with a storage policy",
@@ -3239,7 +3324,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "c792028c58d9f7381af8be68c197d51ae9dfe59546e1133994dc138bb4182fb3",
+            "60f604f78480722fbc5ca80fd37b63b70c2990ccd1b02a8347edd429dab8d1b4",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {

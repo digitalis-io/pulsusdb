@@ -1,6 +1,8 @@
-//! Issue #494 part 1: on a cluster a landing insert goes through its table's
-//! `Distributed` wrapper, keyed on `cityHash64(received_ms)`, so a push and
-//! every resend of it reach one shard whichever server receives them.
+//! Issue #494 part 1: on a cluster a log or trace landing insert goes through
+//! its table's `Distributed` wrapper, keyed on `cityHash64(received_ms)`, so a
+//! push and every resend the writer makes of that block reach one shard
+//! whichever server receives them. The metrics landing insert names the bare
+//! `metric_landing` and is not exercised here.
 //!
 //! Against the 2-shard fixture at `ci/clickhouse-cluster/compose.yaml`: shard
 //! 1 has two replicas, shard 2 one. Each server is dialled directly, through
@@ -37,16 +39,12 @@ use pulsus_clickhouse::{
     ChClient, ChConnConfig, ChEndpoint, ChError, ChProto, ChRow, Idempotency, QuerySettings, Row,
 };
 use pulsus_config::WriterConfig;
-use pulsus_model::{ACTIVITY_BUCKET_MS, Date, Fingerprint, LabelSet, UnixNano};
+use pulsus_model::{Date, Fingerprint, LabelSet, UnixNano};
 use pulsus_write::writer::{
-    BlockInserter, ChBlockInserter, LogLandingRow, LogPatternRow, LogWriter, MetricLandingRow,
-    MetricWriter, MetricWriterTables, TraceLandingRow, TraceWriter, TraceWriterTables,
-    WriterRuntime, WriterTables,
+    BlockInserter, ChBlockInserter, LogLandingRow, LogPatternRow, LogWriter, TraceLandingRow,
+    TraceWriter, TraceWriterTables, WriterRuntime, WriterTables,
 };
-use pulsus_write::{
-    ExemplarPoint, HistogramPoint, LogRow, LogSink, MetricMetadata, MetricPoint, MetricSink,
-    ParsedLogs, ParsedMetrics, PushHeaders, SeriesRef, StreamRow, TraceSink,
-};
+use pulsus_write::{LogRow, LogSink, ParsedLogs, PushHeaders, StreamRow, TraceSink};
 
 const CLUSTER: &str = "pulsus_test_cluster";
 const SUFFIX: &str = "_dist";
@@ -61,8 +59,6 @@ static DB_POISON_LOGS: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_write_it_routed_poison_logs");
 static DB_POISON_TRACES: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_write_it_routed_poison_traces");
-static DB_POISON_METRICS: pulsus_testkit::TestDb =
-    pulsus_testkit::TestDb::new("pulsus_write_it_routed_poison_metrics");
 static DB_REPLICA_FAILOVER: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_write_it_routed_replica_failover");
 static DB_SHARD_MISSING: pulsus_testkit::TestDb =
@@ -368,10 +364,8 @@ fn runtime(root: &Path, retries: u32) -> WriterRuntime {
     let mut runtime = WriterRuntime::from_config(&WriterConfig::default());
     runtime.spool_dir = root.to_path_buf();
     runtime.log_landing_retries = retries;
-    runtime.metrics_landing_retries = retries;
     runtime.trace_landing_retries = retries;
     runtime.log_landing_inserters = 1;
-    runtime.metrics_landing_inserters = 1;
     runtime.trace_landing_inserters = 1;
     runtime
 }
@@ -388,12 +382,6 @@ trait Stamped: ChRow + Clone + Send + Sync + 'static {
 }
 
 impl Stamped for LogLandingRow {
-    fn stamp(&mut self, ms: i64) {
-        self.received_ms = ms;
-    }
-}
-
-impl Stamped for MetricLandingRow {
     fn stamp(&mut self, ms: i64) {
         self.received_ms = ms;
     }
@@ -602,29 +590,7 @@ fn trace_push(
     pulsus_write::parse_trace_landing(&req).expect("the landing decode")
 }
 
-/// One metrics push: one float sample per name, each its own series.
-fn metric_push(names: &[&str]) -> ParsedMetrics {
-    let ms = now_ms() - 60_000;
-    let mut batch = ParsedMetrics::default();
-    for (i, name) in names.iter().enumerate() {
-        let metric_name: Arc<str> = Arc::from(*name);
-        let fingerprint = Fingerprint::from_raw(100 + i as u128);
-        batch.samples.push(MetricPoint {
-            metric_name: metric_name.clone(),
-            fingerprint,
-            unix_milli: ms,
-            value: 1.0,
-        });
-        batch.series.push(SeriesRef {
-            metric_name,
-            fingerprint,
-            labels: LabelSet::from_normalized([("job".to_string(), "checkout".to_string())]).0,
-        });
-    }
-    batch
-}
-
-// -- 1-L1 to 1-L3: every attempt throws after the send ------------------
+// -- 1-L1 and 1-L2: every attempt throws after the send -----------------
 
 /// The scratch target a throwing view would write, and the view itself, on
 /// every server: it throws on a marked row, so every insert carrying one
@@ -780,57 +746,6 @@ async fn a_trace_push_that_throws_on_every_attempt_lands_on_one_shard_once() {
     )
     .await;
     assert!(spans <= 4, "the push has four spans and {spans} are stored");
-
-    drop_db(&nodes, db).await;
-    std::fs::remove_dir_all(&root).ok();
-}
-
-/// **1-L3.** As 1-L1, for a metrics push carrying a sample named `poison`.
-#[tokio::test]
-async fn a_metric_push_that_throws_on_every_attempt_lands_on_one_shard_once() {
-    skip_unless_live!();
-    let _serial = SERIAL.lock().await;
-    let db = DB_POISON_METRICS.name();
-    build_schema(db);
-    let nodes = Nodes::of(db).await;
-    require_two_shards(&nodes).await;
-    throwing_view(&nodes, db, "metric_landing", "metric_name").await;
-
-    let root = spool_root("poison-metrics");
-    let both = Arc::new(client(&[(&shard1(), None), (&shard2(), None)], db).await);
-    let forwarder = RecordingForwarder::<MetricLandingRow>::new(both);
-    let writer = MetricWriter::with_landing_inserter_and_runtime(
-        forwarder.clone(),
-        runtime(&root, 2),
-        ACTIVITY_BUCKET_MS,
-        MetricWriterTables::landing_for(Some(SUFFIX)),
-    );
-    let answer = writer
-        .admit_flush(
-            &no_tenant(),
-            metric_push(&["up", "poison", "requests_total"]),
-            PushHeaders::default(),
-        )
-        .expect("the queue has room")
-        .await;
-    writer.shutdown(Duration::from_secs(10)).await;
-
-    assert!(answer.is_err(), "every attempt threw: {answer:?}");
-    assert_eq!(forwarder.calls(), 3, "one send and two resends");
-    assert_eq!(spooled(&root, "uncertain"), 1, "the push settled uncertain");
-    let rows = forwarder.last().1.len() as u64;
-    let per_shard = landing_per_shard(&nodes, db, "metric_landing").await;
-    assert_once_on_one_shard("metric_landing", per_shard, rows);
-    assert_scratch_empty(&nodes, db).await;
-    let repeated = texts(
-        &nodes.s1a,
-        &format!(
-            "SELECT toString(fingerprint) AS s FROM {db}.metric_samples{SUFFIX} \
-             GROUP BY fingerprint, unix_milli HAVING count() > 1"
-        ),
-    )
-    .await;
-    assert!(repeated.is_empty(), "samples stored twice: {repeated:?}");
 
     drop_db(&nodes, db).await;
     std::fs::remove_dir_all(&root).ok();
@@ -1088,10 +1003,9 @@ async fn the_shard_follows_the_key_and_not_the_zone() {
 
 // -- 1-L7: one block, one token, three servers --------------------------
 
-/// The three blocks 1-L7 sends, every row stamped [`SHARD1_MS`].
+/// The two blocks 1-L7 sends, every row stamped [`SHARD1_MS`].
 struct Blocks {
     logs: Vec<LogLandingRow>,
-    metrics: Vec<MetricLandingRow>,
     traces: Vec<TraceLandingRow>,
 }
 
@@ -1128,93 +1042,6 @@ fn blocks() -> Blocks {
         },
     ));
 
-    // Metrics: two float samples of one series, one native-histogram
-    // sample, the series registration, one descriptor and one exemplar.
-    let name: Arc<str> = Arc::from("http_requests_total");
-    let series_fp = Fingerprint::from_raw(42);
-    let series = SeriesRef {
-        metric_name: name.clone(),
-        fingerprint: series_fp,
-        labels: LabelSet::from_normalized([
-            ("job".to_string(), "checkout".to_string()),
-            ("instance".to_string(), "a".to_string()),
-        ])
-        .0,
-    };
-    let metrics = vec![
-        MetricLandingRow::float_sample(
-            &org,
-            ms,
-            &MetricPoint {
-                metric_name: name.clone(),
-                fingerprint: series_fp,
-                unix_milli: now,
-                value: 1.0,
-            },
-        ),
-        MetricLandingRow::float_sample(
-            &org,
-            ms,
-            &MetricPoint {
-                metric_name: name.clone(),
-                fingerprint: series_fp,
-                unix_milli: now + 1_000,
-                value: 2.0,
-            },
-        ),
-        MetricLandingRow::hist_sample(
-            &org,
-            ms,
-            &HistogramPoint {
-                metric_name: Arc::from("http_request_duration_seconds"),
-                fingerprint: Fingerprint::from_raw(43),
-                unix_milli: now,
-                histogram: pulsus_model::NativeHistogram {
-                    counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
-                    schema: 0,
-                    zero_threshold: 0.0,
-                    zero_count: 0,
-                    count: 3,
-                    sum: 1.5,
-                    positive_spans: vec![pulsus_model::Span {
-                        offset: 1,
-                        length: 3,
-                    }],
-                    negative_spans: vec![],
-                    positive_buckets: vec![1, -1, 2],
-                    negative_buckets: vec![],
-                    custom_values: vec![],
-                },
-            },
-        ),
-        MetricLandingRow::series(&org, ms, &series, now - now % ACTIVITY_BUCKET_MS, 0),
-        MetricLandingRow::metadata(
-            &org,
-            ms,
-            &MetricMetadata {
-                metric_name: name.clone(),
-                metric_type: "counter".to_string(),
-                help: "requests".to_string(),
-                unit: String::new(),
-                updated_ns: ts_ns,
-            },
-        ),
-        MetricLandingRow::exemplar(
-            &org,
-            ms,
-            &ExemplarPoint {
-                metric_name: name,
-                fingerprint: series_fp,
-                unix_milli: now,
-                value: 0.25,
-                trace_id: std::array::from_fn(|i| i as u8 + 1),
-                span_id: std::array::from_fn(|i| i as u8 + 17),
-                labels: LabelSet::from_normalized([("a".to_string(), "b".to_string())]).0,
-                histogram: false,
-            },
-        ),
-    ];
-
     // Traces: two spans of one trace, one with status error, under one
     // resource whose service name is a string, each span carrying one string
     // attribute, so `service_bucket_resources` and `tag_bucket_values` are
@@ -1250,19 +1077,14 @@ fn blocks() -> Blocks {
             .into_iter()
             .map(|t| TraceLandingRow::tag_value(&org, ms, t)),
     );
-    Blocks {
-        logs,
-        metrics,
-        traces,
-    }
+    Blocks { logs, traces }
 }
 
-/// How 1-L7 reads a derived table: through its wrapper, bare on each shard
-/// and summed, or bare on one server once every replica is synced.
+/// How 1-L7 reads a derived table: through its wrapper, or bare on one
+/// server once every replica is synced.
 #[derive(Clone, Copy, Debug)]
 enum Read {
     Wrapper,
-    EachShard,
     ClusterWide,
 }
 
@@ -1273,14 +1095,6 @@ const DERIVED: &[(&str, Read)] = &[
     ("log_samples", Read::Wrapper),
     ("log_streams", Read::Wrapper),
     ("log_streams_idx", Read::Wrapper),
-    ("metric_samples", Read::Wrapper),
-    ("metric_hist_samples", Read::Wrapper),
-    ("metric_exemplars", Read::Wrapper),
-    ("metric_series", Read::Wrapper),
-    ("metric_labels", Read::Wrapper),
-    ("metric_label_index", Read::Wrapper),
-    ("metric_label_values", Read::EachShard),
-    ("metric_metadata", Read::ClusterWide),
     ("spans", Read::Wrapper),
     ("traces", Read::Wrapper),
     ("error_spans", Read::Wrapper),
@@ -1324,10 +1138,6 @@ async fn derived_count(nodes: &Nodes, db: &str, table: &str, how: Read) -> u64 {
                 &format!("SELECT {measure} AS n FROM {db}.{table}{SUFFIX}{final_}"),
             )
             .await
-        }
-        Read::EachShard => {
-            let sql = format!("SELECT {measure} AS n FROM {db}.{table}{final_}");
-            num(&nodes.s1a, &sql).await + num(&nodes.s2, &sql).await
         }
         Read::ClusterWide => {
             num(
@@ -1384,21 +1194,14 @@ async fn one_block_resent_through_every_server_is_stored_once_on_its_shard() {
         "the logs block"
     );
     assert_eq!(
-        kinds(&blocks.metrics, |r| r.kind),
-        vec![0, 0, 1, 2, 3, 4],
-        "the metrics block"
-    );
-    assert_eq!(
         kinds(&blocks.traces, |r| r.row_kind),
         vec![0, 0, 1, 2, 2, 3, 3],
         "the traces block"
     );
     let max_rows = 1_048_576;
-    let log_settings = QuerySettings::landing_insert("routed-l7-logs", max_rows);
-    let metric_settings = QuerySettings::landing_insert("routed-l7-metrics", max_rows);
+    let log_settings = QuerySettings::routed_landing_insert("routed-l7-logs", max_rows);
     let trace_settings = QuerySettings::trace_landing_insert("routed-l7-traces", max_rows);
     let log_table = WriterTables::landing_for(Some(SUFFIX)).landing;
-    let metric_table = MetricWriterTables::landing_for(Some(SUFFIX)).landing;
     let trace_table = TraceWriterTables::landing_for(Some(SUFFIX)).landing;
 
     let order = [
@@ -1407,11 +1210,9 @@ async fn one_block_resent_through_every_server_is_stored_once_on_its_shard() {
         ("shard 2", &nodes.s2),
     ];
     send_through(&order, &log_table, &blocks.logs, &log_settings).await;
-    send_through(&order, &metric_table, &blocks.metrics, &metric_settings).await;
     send_through(&order, &trace_table, &blocks.traces, &trace_settings).await;
     let once = [("control, shard 1", &controls.s1a)];
     send_through(&once, "log_landing", &blocks.logs, &log_settings).await;
-    send_through(&once, "metric_landing", &blocks.metrics, &metric_settings).await;
     send_through(&once, "trace_landing", &blocks.traces, &trace_settings).await;
 
     sync_everywhere(&nodes, db).await;
@@ -1419,7 +1220,6 @@ async fn one_block_resent_through_every_server_is_stored_once_on_its_shard() {
 
     for (landing, rows) in [
         ("log_landing", blocks.logs.len() as u64),
-        ("metric_landing", blocks.metrics.len() as u64),
         ("trace_landing", blocks.traces.len() as u64),
     ] {
         let sql = format!("SELECT count() AS n FROM {db}.{landing}");
@@ -1445,9 +1245,6 @@ async fn one_block_resent_through_every_server_is_stored_once_on_its_shard() {
     }
     for (table, n) in [
         ("log_samples", 3),
-        ("metric_samples", 2),
-        ("metric_hist_samples", 1),
-        ("metric_exemplars", 1),
         ("spans", 2),
         ("error_spans", 1),
         ("resources", 1),

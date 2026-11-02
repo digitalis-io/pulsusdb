@@ -642,19 +642,24 @@ async fn the_production_inserter_sends_the_trace_landing_settings_on_the_wire() 
     );
 }
 
-/// The five settings the routed landing insert pins on every signal (issue
-/// #494 part 1), at their values.
-const ROUTED_PINS: [(&str, &str); 5] = [
-    ("distributed_foreground_insert", "1"),
-    ("insert_shard_id", "0"),
+/// The three settings every landing insert pins (issue #494 part 1), at
+/// their values.
+const LANDING_PINS: [(&str, &str); 3] = [
     ("skip_unavailable_shards", "0"),
     ("prefer_localhost_replica", "0"),
     ("timeout_overflow_mode", "throw"),
 ];
 
-/// Waits until `recorder` has seen one call, then checks that call's
-/// settings carry every routed pin.
-async fn assert_routed_pins(recorder: &SettingsRecorder, table: &str) {
+/// The two settings only an insert through a `Distributed` wrapper pins:
+/// the log and trace landing inserts (issue #494 part 1).
+const ROUTED_ONLY_PINS: [(&str, &str); 2] = [
+    ("distributed_foreground_insert", "1"),
+    ("insert_shard_id", "0"),
+];
+
+/// Waits until `recorder` has seen one call, then returns the table it
+/// named and the settings it carried.
+async fn first_call(recorder: &SettingsRecorder) -> RecordedCall {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while recorder.calls() == 0 {
         assert!(
@@ -663,16 +668,26 @@ async fn assert_routed_pins(recorder: &SettingsRecorder, table: &str) {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let (named, handed) = recorder.first();
+    recorder.first()
+}
+
+/// The value `key` carries in `handed`, if any.
+fn handed_value<'a>(handed: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    handed
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Waits until `recorder` has seen one call, then checks that call's
+/// settings carry every landing pin and both routed ones.
+async fn assert_routed_pins(recorder: &SettingsRecorder, table: &str) {
+    let (named, handed) = first_call(recorder).await;
     assert_eq!(named, table);
-    for (key, value) in ROUTED_PINS {
-        let got = handed
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str());
+    for (key, value) in LANDING_PINS.iter().chain(ROUTED_ONLY_PINS.iter()) {
         assert_eq!(
-            got,
-            Some(value),
+            handed_value(&handed, key),
+            Some(*value),
             "the settings the writer hands its inserter carry {key} = {value}: {handed:?}"
         );
     }
@@ -712,10 +727,12 @@ async fn the_log_writer_hands_over_the_routed_landing_pins() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// **1-U4 (issue #494 part 1), metrics.** As the logs case, for
-/// `MetricWriter`.
+/// **1-U4 (issue #494 part 1), metrics.** What `MetricWriter` hands its own
+/// `BlockInserter` for one push carries the three pins every landing insert
+/// does, and neither routed pin: it names the bare `metric_landing`, which
+/// has no `Distributed` wrapper.
 #[tokio::test]
-async fn the_metric_writer_hands_over_the_routed_landing_pins() {
+async fn the_metric_writer_hands_over_the_landing_pins_and_not_the_routed_two() {
     let root = spool_root("metric-routed-pins");
     let recorder = Arc::new(SettingsRecorder::default());
     let mut runtime = WriterRuntime::from_config(&WriterConfig::default());
@@ -731,9 +748,24 @@ async fn the_metric_writer_hands_over_the_routed_landing_pins() {
         .expect("the queue has room")
         .await
         .expect("the landing insert commits");
-    assert_routed_pins(&recorder, "metric_landing").await;
+    let (named, handed) = first_call(&recorder).await;
     writer.shutdown(Duration::from_secs(5)).await;
     std::fs::remove_dir_all(&root).ok();
+    assert_eq!(named, "metric_landing");
+    for (key, value) in LANDING_PINS {
+        assert_eq!(
+            handed_value(&handed, key),
+            Some(value),
+            "the metrics writer hands over {key} = {value}: {handed:?}"
+        );
+    }
+    for (key, _) in ROUTED_ONLY_PINS {
+        assert_eq!(
+            handed_value(&handed, key),
+            None,
+            "the metrics writer names no wrapper and hands over no {key}: {handed:?}"
+        );
+    }
 }
 
 /// One recorded call: the table it named and the settings it carried.

@@ -694,12 +694,13 @@ mod tests {
     }
 
     /// **1-U2 (issue #494 part 1), replacing T42's no-`_dist` assertions.**
-    /// On a cluster each writer names its landing table's wrapper,
-    /// `<landing table><PULSUS_DIST_SUFFIX>`, so a push and every resend of
-    /// it reach one shard; without a cluster it names the bare table, whatever
-    /// the suffix says.
+    /// On a cluster the log and trace writers name their landing table's
+    /// wrapper, `<landing table><PULSUS_DIST_SUFFIX>`, so a push and every
+    /// resend the writer makes of that block reach one shard; the metrics
+    /// writer names the bare `metric_landing`. Without a cluster every writer
+    /// names the bare table, whatever the suffix says.
     #[test]
-    fn the_writers_name_the_landing_wrappers_only_on_a_cluster() {
+    fn the_log_and_trace_writers_name_the_landing_wrappers_only_on_a_cluster() {
         let clustered = Config {
             cluster: Some("c".to_string()),
             dist_suffix: "_d".to_string(),
@@ -708,7 +709,8 @@ mod tests {
         assert_eq!(&*writer_tables_from(&clustered).landing, "log_landing_d");
         assert_eq!(
             &*metric_writer_tables_from(&clustered).landing,
-            "metric_landing_d"
+            "metric_landing",
+            "the metrics writer inserts into the bare table on a cluster too"
         );
         assert_eq!(
             &*trace_writer_tables_from(&clustered).landing,
