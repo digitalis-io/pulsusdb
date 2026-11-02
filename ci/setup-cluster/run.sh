@@ -366,7 +366,26 @@ read_back() {
 }
 # Raw samples reach the table a query reads through a view refreshed every
 # minute, so the read waits for it.
+# On failure, what every host holds first: the metrics tables' row counts and
+# the replication and distribution queues.
+e3_dump() {
+    for ip in $hosts; do
+        for q in \
+            "SELECT 'metric_landing', count() FROM pulsus.metric_landing" \
+            "SELECT 'metric_samples', count() FROM pulsus.metric_samples" \
+            "SELECT 'metric_series', count() FROM pulsus.metric_series" \
+            "SELECT 'metric_labels', count() FROM pulsus.metric_labels" \
+            "SELECT 'metric_label_index', count() FROM pulsus.metric_label_index" \
+            "SELECT 'replication_queue', database, table, type, num_tries, last_exception FROM system.replication_queue" \
+            "SELECT 'distribution_queue', database, table, data_files, error_count, last_exception FROM system.distribution_queue"; do
+            printf 'setup-cluster: E3 %s: ' "$ip" >&2
+            curl -sS --cacert "$ca" -u "pulsus:$PULSUS_CLICKHOUSE_PASSWORD" \
+                "https://$ip:8443/" --data-binary "$q" >&2 || echo >&2
+        done
+    done
+}
 retry 240 read_back || {
+    e3_dump
     curl -sS "$url/api/v1/query" --data-urlencode 'query=setup_e3_up' >&2 || true
     tail -20 "$work/pulsusdb.log" >&2
     fail "E3: the sample did not read back"

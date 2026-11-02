@@ -215,6 +215,13 @@ async fn land(client: &ChClient, req: &ExportTraceServiceRequest, token: &str) {
         )
         .await
         .expect("the landing insert");
+    // The landing insert pins `prefer_localhost_replica = 0` (issue #494 part
+    // 1), so a routed view insert may write this shard's block to its other
+    // replica. This replica then holds it once it has fetched it, which is
+    // what every local read after a `land` relies on.
+    for table in ["spans", "traces", "error_spans"] {
+        exec(client, &format!("SYSTEM SYNC REPLICA {table} LIGHTWEIGHT")).await;
+    }
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]

@@ -52,12 +52,12 @@ use crate::writer::rows::TraceLandingRow;
 use crate::writer::spool::SpoolWriter;
 use crate::writer::table::{BlockInserter, ChBlockInserter, XorShift64, spawn_dedup_ticker};
 
-/// The one table this path inserts into. The landing table has no
-/// `Distributed` wrapper — a push carries many trace ids, so inserting the
-/// push itself through one would split one push per shard and one push would
-/// stop being one block — so this is the base name in every mode. The
-/// routing happens one step later, on the way out of the two per-trace
-/// views.
+/// The bare landing table's name. On a cluster the writer names its
+/// `Distributed` wrapper instead, `trace_landing<PULSUS_DIST_SUFFIX>`, keyed
+/// on `cityHash64(received_ms)`: every row of a push carries one receive
+/// stamp, so the push stays one block on one shard, and every resend of it
+/// reaches that shard (issue #494 part 1). The routing by trace id happens
+/// one step later, on the way out of the two per-trace views.
 pub(crate) const LANDING_TABLE: &str = "trace_landing";
 
 /// How many distinct UTC dates one push's spans may fall on.

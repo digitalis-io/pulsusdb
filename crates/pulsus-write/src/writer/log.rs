@@ -86,9 +86,12 @@ const LANDING_TABLE: &str = "log_landing";
 
 /// The table name a [`LogWriter`] inserts into. One name: the five target
 /// tables are maintained by materialized view and the writer never names
-/// them (issue #603). The landing table has no `Distributed` wrapper, so
-/// this is the base name in every mode — `Arc<str>` because the server
-/// resolves it once at startup from `Config` rather than at compile time.
+/// them (issue #603). On a cluster it is the landing table's `Distributed`
+/// wrapper, keyed on `cityHash64(received_ms)`, so a push and every resend
+/// the writer makes of that block reach one shard; single-node it is the bare
+/// table (issue #494 part 1,
+/// [`Self::landing_for`]). `Arc<str>` because the server resolves it once at
+/// startup from `Config` rather than at compile time.
 #[derive(Debug, Clone)]
 pub struct WriterTables {
     pub landing: Arc<str>,
@@ -99,6 +102,14 @@ impl WriterTables {
     pub fn logs_default() -> Self {
         WriterTables {
             landing: Arc::from(LANDING_TABLE),
+        }
+    }
+
+    /// The landing table for a deployment: the bare name for `None`, and
+    /// `log_landing<suffix>` for `Some(suffix)`.
+    pub fn landing_for(dist_suffix: Option<&str>) -> Self {
+        WriterTables {
+            landing: Arc::from(format!("{LANDING_TABLE}{}", dist_suffix.unwrap_or(""))),
         }
     }
 }
@@ -623,7 +634,7 @@ impl LogWriter {
         let block = LandingBlock::seal(
             rows,
             bytes,
-            QuerySettings::landing_insert(&token, self.shared.ctx.max_rows),
+            QuerySettings::routed_landing_insert(&token, self.shared.ctx.max_rows),
             claim,
             waiter,
             admitted_at,
@@ -727,6 +738,19 @@ fn now_unix_millis() -> i64 {
 /// The rest of the logs write path is `crates/pulsus-write/tests/log_landing.rs`.
 #[cfg(test)]
 mod tests {
+    /// **1-U6 (issue #494 part 1).** The bare name without a suffix, the
+    /// suffixed wrapper with one.
+    #[test]
+    fn landing_for_names_the_wrapper_only_when_given_a_suffix() {
+        assert_eq!(
+            &*super::WriterTables::landing_for(None).landing,
+            "log_landing"
+        );
+        assert_eq!(
+            &*super::WriterTables::landing_for(Some("_d")).landing,
+            "log_landing_d"
+        );
+    }
 
     use std::sync::atomic::AtomicUsize;
 
@@ -1070,7 +1094,7 @@ mod tests {
             let block = LandingBlock::seal(
                 rows,
                 landing_charge::<LogLandingRow>(line_bytes + stream_bytes + pattern_bound),
-                QuerySettings::landing_insert(
+                QuerySettings::routed_landing_insert(
                     &mint_landing_token(&mut XorShift64::seeded()),
                     1_048_576,
                 ),

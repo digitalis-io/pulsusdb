@@ -179,12 +179,14 @@ struct SeedSampleRow {
 /// through, and the rollup the activity scan and the rate scenarios read —
 /// empty. `event_id` is omitted so the server fills it.
 ///
-/// **`log_landing` has no `_dist` wrapper, in either mode** (docs/schemas.md
-/// §7), so `--dist` seeds the bare name and the rows land on whichever shard
-/// this client is bound to. The `--dist` settle polls below therefore wait on
-/// the DERIVED tables' `_dist` names: what has to become visible is the views'
-/// output as the reader sees it, which is the same thing they waited on before
-/// and is now also what carries the rows across the wrapper.
+/// **The loader does not write through `log_landing_dist`.** In production
+/// the log writer inserts through that wrapper, which places a push by
+/// `cityHash64(received_ms)` (issue #494 part 1). The loader instead seeds the
+/// bare `log_landing` single-node, and under `--dist` sends each block through
+/// the bench-only [`LANDING_ROUTE_TABLE`] with an explicit `insert_shard_id`,
+/// so it chooses which shard each batch lands on. The `--dist` settle polls
+/// below therefore wait on the DERIVED tables' `_dist` names: what has to
+/// become visible is the views' output as the reader sees it.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLandingRow {
     /// The tenant (issue #653): the empty tenant's rows.
@@ -205,8 +207,9 @@ struct SeedLandingRow {
     pattern_level: String,
 }
 
-/// The landing table every logs corpus is seeded through. Not a `--dist`
-/// variant: there is no `log_landing_dist`.
+/// The landing table a single-node logs corpus is seeded through. `--dist`
+/// uses [`LANDING_ROUTE_TABLE`] instead of the production wrapper
+/// `log_landing_dist`, to pick each batch's shard explicitly.
 const LANDING_TABLE: &str = "log_landing";
 
 /// Lands a chunk of sample rows as kind-0 landing rows: into the bare
