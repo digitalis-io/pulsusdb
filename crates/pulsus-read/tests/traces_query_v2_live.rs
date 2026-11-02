@@ -120,6 +120,8 @@ use pulsus_traceql::{
 };
 use pulsus_write::{TraceLandingRow, parse_trace_landing};
 
+mod presence_corpus;
+
 // ---------------------------------------------------------------------
 // the live gate
 // ---------------------------------------------------------------------
@@ -19052,8 +19054,8 @@ async fn a_trace_with_no_index_row_is_answered_as_today() {
 /// window and with the same answer: a refused child under `&&` and `||`, a
 /// negated presence check, a comparison of a comparison, a field against a
 /// field, a negated or multiplied field, a literal predicate and presence.
-/// The planner refuses a presence check on a trace-level intrinsic, so the
-/// three shapes holding one are pinned as refused (`None`).
+/// `rootName = nil`, which the compiler refuses as the validator does, is
+/// pinned as refused (`None`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_excluded_trace_only_shape_runs_as_today() {
     skip_unless_live!();
@@ -19063,12 +19065,12 @@ async fn an_excluded_trace_only_shape_runs_as_today() {
     let long = "a1 2 [11, 12]; a2 1 [21]";
     let mut wrong = Vec::new();
     for (q, want) in [
-        ("{ traceDuration > 1s && rootName != nil }", None),
+        ("{ traceDuration > 1s && rootName != nil }", Some(long)),
         (
             "{ traceDuration > 1s || traceDuration = traceDuration }",
             Some(all),
         ),
-        ("{ !(rootName != nil) }", None),
+        ("{ !(rootName != nil) }", Some("")),
         ("{ (traceDuration > 1s) = true }", Some(long)),
         ("{ traceDuration = traceDuration }", Some(all)),
         ("{ rootName = rootServiceName }", Some("")),
@@ -19076,7 +19078,7 @@ async fn an_excluded_trace_only_shape_runs_as_today() {
         ("{ traceDuration * 2 > 1s }", Some(long)),
         ("{ true }", Some(all)),
         ("{ 1 = 1 }", Some(all)),
-        ("{ rootName != nil }", None),
+        ("{ rootName != nil }", Some(all)),
         ("{ rootName = nil }", None),
     ] {
         let planned = pulsus_read::plan_search_request(
@@ -19117,6 +19119,378 @@ async fn an_excluded_trace_only_shape_runs_as_today() {
     }
     drop_db(&db).await;
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// =====================================================================
+// Issue #764 — `!= nil` and `= nil` on an intrinsic
+// =====================================================================
+
+/// Corpus N's trace A, and its trace B, which has no root.
+const NIL_TRACE_A: &str = "a7640000000000000000000000000001";
+const NIL_TRACE_B: &str = "a7640000000000000000000000000002";
+
+/// One matched span as the search route writes it: its `name` (an empty
+/// one is omitted, as the response encoder omits it,
+/// `crates/pulsus-server/src/traces_api/search_response.rs`) and its
+/// projected `(key, untyped value)` multiset, sorted.
+type Matched = BTreeMap<String, (Option<String>, Vec<(String, String)>)>;
+
+/// The projected value as text, its type dropped.
+fn untyped(v: &pulsus_read::GroupValue) -> String {
+    match v {
+        pulsus_read::GroupValue::Str(s) => s.clone(),
+        pulsus_read::GroupValue::Int(i) => i.to_string(),
+        pulsus_read::GroupValue::Double(bits) => f64::from_bits(*bits).to_string(),
+        pulsus_read::GroupValue::Bool(b) => b.to_string(),
+        pulsus_read::GroupValue::Nil => String::new(),
+        pulsus_read::GroupValue::Array(_) => pulsus_read::wire_arm(v).1,
+    }
+}
+
+/// The search route's answer to `q` over `w`, limit 20, spss 50, keyed by
+/// the span id's last byte (`a0`, `a1`, `a2`, `b1`); a refusal or a read
+/// error is the error's text.
+async fn presence_search(
+    engine: &pulsus_read::TraceEngine,
+    q: &str,
+    w: (i64, i64),
+) -> Result<Matched, String> {
+    let plan = pulsus_read::plan_search_request(
+        &parse_query(q),
+        &pulsus_read::SearchParams {
+            start_ns: w.0,
+            end_ns: w.1,
+            limit: 20,
+            spss: 50,
+        },
+        &METRICS_TABLES,
+        64,
+    )
+    .map_err(|e| format!("refused: {e}"))?;
+    let out = engine
+        .search_routed(&plan)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    let mut matched = Matched::new();
+    for t in &out.traces {
+        for s in &t.spans {
+            let mut attrs: Vec<(String, String)> = s
+                .attributes
+                .iter()
+                .map(|a| (a.key().to_string(), untyped(a.value())))
+                .collect();
+            attrs.sort();
+            let name = s.name().filter(|n| !n.is_empty()).map(str::to_string);
+            matched.insert(format!("{:02x}", s.span_id[7]), (name, attrs));
+        }
+    }
+    Ok(matched)
+}
+
+/// The metrics route's range answer to `q` over `[start_s, end_s)`, step
+/// 60 s, as each series' name and the sum of its samples; a refusal or a
+/// read error is the error's text.
+async fn presence_series(
+    engine: &pulsus_read::TraceEngine,
+    q: &str,
+    start_s: i64,
+    end_s: i64,
+) -> Result<BTreeMap<String, f64>, String> {
+    let routed = pulsus_read::plan_trace_metrics_routed(
+        &parse_query(q),
+        &pulsus_read::MetricsParams {
+            start_ns: start_s * S_NS,
+            end_ns: end_s * S_NS,
+            step_ms: 60_000,
+            exemplars: None,
+            floor_ns: i64::MIN,
+        },
+        &engine.metrics_ctx(),
+        &METRICS_TABLES,
+    )
+    .map_err(|e| format!("refused: {e}"))?;
+    let out = engine
+        .metrics_range_routed(&routed)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    Ok(out
+        .series
+        .iter()
+        .map(|s| {
+            (
+                series_name(s),
+                s.samples
+                    .iter()
+                    .map(|(_, v)| *v)
+                    .filter(|v| !v.is_nan())
+                    .sum(),
+            )
+        })
+        .collect())
+}
+
+/// T9 (issue #764): **an existence check on an intrinsic is answered on
+/// every route**, as the reference answers it on corpus N (plan §1), and
+/// `!` over it as the expression's value (§3), never the reference's.
+///
+/// (a) every spelling of every intrinsic, `{ X != nil }`, on the search
+/// route: the spans matched, each one's projected values and `name`;
+/// (b) compositions, and `!` over a condition; (c) the metrics route's
+/// counts, and the traces drilldown's rate-by-status query exactly as the
+/// panel sends it; (d) span-name values narrowed by `q`. Every wrong cell
+/// is reported before the test fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_intrinsic_presence_answers_on_every_route() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_764_presence");
+    let client = fresh_db(&db).await;
+    let base_s = now_ns() / S_NS - 600;
+    let body = presence_corpus::body(base_s * S_NS, NIL_TRACE_A, NIL_TRACE_B, "nil764");
+    let req = pulsus_write::protocols::otlp_traces::decode_json(&body)
+        .expect("our own ingest decodes corpus N");
+    land(&client, &req, "t764").await;
+    let engine = engine_of(&db).await;
+    let (start_s, end_s) = (base_s - 60, base_s + 60);
+    let w = (start_s * S_NS, end_s * S_NS);
+    let mut wrong: Vec<String> = Vec::new();
+
+    // The control: the corpus is visible, all four spans.
+    let all: Vec<&str> = vec!["a0", "a1", "a2", "b1"];
+    match presence_search(&engine, "{}", w).await {
+        Ok(m) if m.keys().map(String::as_str).eq(all.iter().copied()) => {}
+        other => {
+            drop_db(&db).await;
+            panic!("the control `{{}}` must match a0 a1 a2 b1, got {other:?}");
+        }
+    }
+
+    // (a) `(spellings, count, the expected match)`: §1's first table.
+    let span_ids = ["a0", "a1", "a2", "b1"];
+    let every = |key: Option<&str>, values: [&str; 4]| -> Matched {
+        span_ids
+            .iter()
+            .zip(values)
+            .map(|(id, v)| {
+                let attrs = key
+                    .map(|k| vec![(k.to_string(), v.to_string())])
+                    .unwrap_or_default();
+                (id.to_string(), (None, attrs))
+            })
+            .collect()
+    };
+    let nothing = every(None, [""; 4]);
+    let some = |key: &str, rows: &[(&str, &str)]| -> Matched {
+        rows.iter()
+            .map(|(id, v)| {
+                (
+                    id.to_string(),
+                    (None, vec![(key.to_string(), v.to_string())]),
+                )
+            })
+            .collect()
+    };
+    let mut named = nothing.clone();
+    for (id, name) in [("a1", "op"), ("a2", "op2"), ("b1", "orphan")] {
+        named.get_mut(id).expect("a corpus span").0 = Some(name.to_string());
+    }
+    let rows: Vec<(&[&str], f64, Matched)> = vec![
+        (&["name", "span:name"], 4.0, named),
+        (
+            &["status", "span:status"],
+            4.0,
+            every(Some("status"), ["unset", "error", "ok", "unset"]),
+        ),
+        (
+            &["kind", "span:kind"],
+            4.0,
+            every(
+                Some("kind"),
+                ["unspecified", "server", "client", "unspecified"],
+            ),
+        ),
+        (&["duration", "span:duration"], 4.0, nothing.clone()),
+        (
+            &["statusMessage", "span:statusMessage"],
+            4.0,
+            every(Some("statusMessage"), ["", "boom", "", ""]),
+        ),
+        (&["span:id"], 4.0, nothing.clone()),
+        (
+            &["span:parentID"],
+            4.0,
+            every(
+                Some("span:parentID"),
+                [
+                    "0000000000000000",
+                    "00000000000000a0",
+                    "00000000000000a0",
+                    "00000000000000ff",
+                ],
+            ),
+        ),
+        (&["trace:id"], 4.0, nothing.clone()),
+        (&["traceDuration", "trace:duration"], 4.0, nothing.clone()),
+        (&["rootName", "trace:rootName"], 4.0, nothing.clone()),
+        (
+            &["rootServiceName", "trace:rootService"],
+            4.0,
+            nothing.clone(),
+        ),
+        (
+            &["nestedSetParent"],
+            4.0,
+            every(Some("nestedSetParent"), ["-1", "1", "1", "0"]),
+        ),
+        (
+            &["nestedSetLeft"],
+            4.0,
+            every(Some("nestedSetLeft"), ["1", "2", "4", "0"]),
+        ),
+        (
+            &["nestedSetRight"],
+            4.0,
+            every(Some("nestedSetRight"), ["6", "3", "5", "0"]),
+        ),
+        (
+            &["instrumentation:name"],
+            4.0,
+            every(Some("instrumentation:name"), ["", "s", "s", "s"]),
+        ),
+        (
+            &["instrumentation:version"],
+            4.0,
+            every(Some("instrumentation:version"), ["", "1", "1", ""]),
+        ),
+        (
+            &["event:name"],
+            2.0,
+            some("event:name", &[("a1", "ev"), ("a2", "")]),
+        ),
+        (
+            &["event:timeSinceStart"],
+            2.0,
+            some("event:timeSinceStart", &[("a1", "10ns"), ("a2", "10ns")]),
+        ),
+        (
+            &["link:spanID"],
+            1.0,
+            some("link:spanID", &[("a1", "00000000000000b1")]),
+        ),
+        (
+            &["link:traceID"],
+            1.0,
+            some("link:traceID", &[("a1", NIL_TRACE_B)]),
+        ),
+        // D4: every span holds a child count; the reference answers no
+        // span (defects entry 34), which is not copied.
+        (&["span:childCount"], 4.0, nothing.clone()),
+    ];
+    for (spellings, count, want) in &rows {
+        for spelling in *spellings {
+            let q = format!("{{ {spelling} != nil }}");
+            match presence_search(&engine, &q, w).await {
+                Ok(got) if &got == want => {}
+                other => wrong.push(format!("(a) {q}: {other:?}, expected {want:?}")),
+            }
+            // (c) the metrics route's count of the same filter.
+            let mq = format!("{q} | count_over_time()");
+            match presence_series(&engine, &mq, start_s, end_s).await {
+                Ok(s) if s.values().sum::<f64>() == *count => {}
+                other => wrong.push(format!("(c) {mq}: {other:?}, expected a total of {count}")),
+            }
+        }
+    }
+
+    // (b) §1's compositions and §3's `!` rows: the spans matched, which
+    // are the expression's value on corpus N.
+    for (q, want) in [
+        (r#"{ name != nil && status = error }"#, vec!["a1"]),
+        (r#"{ status != nil || name = "zz" }"#, all.clone()),
+        ("{ event:name != nil && link:spanID != nil }", vec!["a1"]),
+        (
+            "{ event:name != nil || link:spanID != nil }",
+            vec!["a1", "a2"],
+        ),
+        (
+            "{ link:traceID != nil || event:timeSinceStart != nil }",
+            vec!["a1", "a2"],
+        ),
+        ("{ !(name != nil) }", vec![]),
+        ("{ !(event:name != nil) }", vec!["a0", "b1"]),
+        ("{ !(status = error) }", vec!["a0", "a2", "b1"]),
+        ("{ !(nestedSetParent < 0) }", vec!["a1", "a2", "b1"]),
+    ] {
+        match presence_search(&engine, q, w).await {
+            Ok(got) if got.keys().map(String::as_str).eq(want.iter().copied()) => {}
+            other => wrong.push(format!(
+                "(b) {q}: {:?}, expected {want:?}",
+                other.map(|m| m.into_keys().collect::<Vec<_>>())
+            )),
+        }
+    }
+
+    // (c) the drilldown's rate-by-status panel, exactly as it is sent: one
+    // series, `status` = `unset`, one root span over a 60 s step.
+    let drilldown = "{nestedSetParent<0 && true && status != nil} | rate() by(status)";
+    match presence_series(&engine, drilldown, start_s, end_s).await {
+        Ok(s)
+            if s.len() == 1
+                && s.get("status=unset")
+                    .is_some_and(|v| (v - 1.0 / 60.0).abs() < 1e-12) => {}
+        other => wrong.push(format!(
+            "(c) {drilldown}: {other:?}, expected one series status=unset summing to 1/60"
+        )),
+    }
+    let by_status = "{ status != nil } | count_over_time() by(status)";
+    let want: BTreeMap<String, f64> = [
+        ("status=error", 1.0),
+        ("status=ok", 1.0),
+        ("status=unset", 2.0),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    match presence_series(&engine, by_status, start_s, end_s).await {
+        Ok(s) if s == want => {}
+        other => wrong.push(format!("(c) {by_status}: {other:?}, expected {want:?}")),
+    }
+
+    // (d) span-name values narrowed by `q`, sorted.
+    for (q, want) in [
+        ("{ event:name != nil }", vec!["op", "op2"]),
+        ("{ link:spanID != nil }", vec!["op"]),
+        ("{ status != nil }", vec!["", "op", "op2", "orphan"]),
+        ("{ event:name != nil || status = error }", vec!["op", "op2"]),
+        // A `q` the validator refuses narrows nothing.
+        ("{ name = nil }", vec!["", "op", "op2", "orphan"]),
+        ("{ !(link:spanID != nil) }", vec!["", "op2", "orphan"]),
+    ] {
+        let got = engine
+            .list_span_name_values(pulsus_read::TagValuesRequest {
+                q: Some(q),
+                start_ns: w.0,
+                end_ns: w.1,
+                floor_ns: i64::MIN,
+            })
+            .await
+            .map(|v| {
+                let mut names: Vec<String> = v.values.into_iter().map(|v| v.val).collect();
+                names.sort();
+                names
+            });
+        match got {
+            Ok(names) if names.iter().map(String::as_str).eq(want.iter().copied()) => {}
+            other => wrong.push(format!("(d) q={q}: {other:?}, expected {want:?}")),
+        }
+    }
+
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} wrong cell(s):\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
 }
 
 /// T10d (issue #601 part 4a): **a comparison written literal first takes

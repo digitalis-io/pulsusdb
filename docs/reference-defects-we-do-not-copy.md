@@ -92,6 +92,7 @@ replaces one.
 | [37](#37-a-one-element-array-is-read-as-its-element-and-an-empty-one-as-no-value) | trace reference | queries | C | A span sent `["z"]` answers `"z"`, and one sent `[]` answers as if it held nothing. |
 | [38](#38-one-span-missing-an-operand-fails-a-whole-grouped-query) | trace reference | queries | A | `by(-span.x)` fails every trace when one span lacks `x`, where `by(span.x / 1000)` groups that span under `false`. |
 | [39](#39-an-attribute-quantile-drops-every-integer-below-2) | trace reference | queries | C, D | `quantile_over_time(span.n, .01)` over `-4`, `1` and `7` answers from `7` alone. |
+| [40](#40--over-a-condition-the-store-can-filter-answers-nothing-on-search-and-is-ignored-on-metrics) | trace reference | queries | A, D | `{ !(status = error) }` answers no span on search and the error spans' count on metrics. |
 
 ---
 
@@ -2264,6 +2265,36 @@ reference's by design (§4.4.1).
 
 Ledger row `traceql-metrics-attribute-quantile-below-2`. Pinned by `an_attribute_quantile_counts_every_integer`
 in `crates/pulsus-read/tests/traces_query_v2_live.rs`, which fails if the floor is restored.
+
+---
+
+## 40. `!` over a condition the store can filter answers nothing on search and is ignored on metrics
+
+**The trace reference · queries · tests A, D**
+
+### What the reference does
+
+`UnaryOperation.extractConditions` hands the store the operand's conditions with their own operators
+(`pkg/traceql/ast_conditions.go:127-146`), under a `TODO when Op is Not` saying it should not
+(`:128`). The store returns only the spans where the operand holds. Search then applies the `!` to
+those and keeps none. On the metrics routes `optimize` drops the pass that applies the `!` when the
+filter has one condition or only intrinsic ones (`pkg/traceql/engine_metrics.go:1140-1204`), so the count is the
+operand's. Measured: over three spans that are not errors and one that is, `{ !(status = error) }`
+returns no span on search and counts 1 on metrics.
+
+### Why that is wrong rather than different
+
+Its search and metrics routes answer the same filter differently (**A**). Neither answer is the
+negation of the operand (**D**).
+
+### What PulsusDB does
+
+The expression's value on every route: `{ !(status = error) }` matches the three.
+
+### Evidence
+
+Ledger row `traceql-negation-of-a-filtered-condition`. Pinned by
+`an_intrinsic_presence_answers_on_every_route` in `crates/pulsus-read/tests/traces_query_v2_live.rs`.
 
 ---
 

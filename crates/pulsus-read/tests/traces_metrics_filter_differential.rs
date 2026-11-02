@@ -44,6 +44,7 @@
 //! fixture is our own authorship and the reference's answers are read
 //! back as black-box runtime output.
 
+use std::collections::BTreeMap;
 use std::process::Command;
 use std::time::Duration;
 
@@ -57,6 +58,8 @@ use pulsus_read::{StatementTables, TraceEngine, TraceReadConfig, plan_trace_metr
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
 use pulsus_write::{TraceLandingRow, parse_trace_landing};
+
+mod presence_corpus;
 
 /// Traces in the corpus — one parentless span each.
 const TRACES: u8 = 6;
@@ -209,7 +212,12 @@ async fn pulsus_insert(client: &ChClient, service: &str, nonce: &[u8; 16], spans
             schema_url: String::new(),
         }],
     };
-    let landing = parse_trace_landing(&req).expect("the landing decode");
+    land_request(client, &req).await;
+}
+
+/// Lands one decoded request in one insert into `trace_landing`.
+async fn land_request(client: &ChClient, req: &ExportTraceServiceRequest) {
+    let landing = parse_trace_landing(req).expect("the landing decode");
     let received_ms = now_ns() / 1_000_000;
     let mut rows: Vec<TraceLandingRow> = Vec::new();
     rows.extend(
@@ -263,6 +271,11 @@ fn otlp_push(otlp_base: &str, service: &str, nonce: &[u8; 16], spans: &[SpanDef]
         })
         .collect();
     let body = serde_json::json!({ "resourceSpans": resource_spans });
+    otlp_post(otlp_base, body.to_string().as_bytes());
+}
+
+/// Posts one OTLP/JSON body to the reference's receiver.
+fn otlp_post(otlp_base: &str, body: &[u8]) {
     let url = format!("{}/v1/traces", otlp_base.trim_end_matches('/'));
     let out = Command::new("curl")
         .args([
@@ -277,11 +290,18 @@ fn otlp_push(otlp_base: &str, service: &str, nonce: &[u8; 16], spans: &[SpanDef]
             "POST",
             "-H",
             "Content-Type: application/json",
-            "-d",
-            &body.to_string(),
+            "--data-binary",
+            "@-",
         ])
         .arg(&url)
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            child.stdin.as_mut().expect("stdin piped").write_all(body)?;
+            child.wait_with_output()
+        })
         .expect("curl on PATH");
     let code = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
@@ -524,6 +544,271 @@ async fn nested_set_root_counts_match_the_reference_on_a_shared_corpus() {
     );
 }
 
+/// Each series' label text (`key=value`, joined by `,`) and the sum of its
+/// non-null samples, from our engine; a refusal or a read error is the
+/// error's text.
+async fn pulsus_series(
+    engine: &TraceEngine,
+    q: &str,
+    window: (i64, i64),
+) -> Result<BTreeMap<String, f64>, String> {
+    let query = pulsus_traceql::parse(q).map_err(|e| format!("does not parse: {e:?}"))?;
+    let plan = plan_trace_metrics_routed(
+        &query,
+        &MetricsParams {
+            start_ns: window.0,
+            end_ns: window.1,
+            step_ms: STEP_MS,
+            exemplars: None,
+            floor_ns: i64::MIN,
+        },
+        &engine.metrics_ctx(),
+        &StatementTables {
+            spans: "spans",
+            error_spans: "error_spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
+            tenant: empty_term(),
+        },
+    )
+    .map_err(|e| format!("refused: {e}"))?;
+    let out = engine
+        .metrics_range_routed(&plan)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    Ok(out
+        .series
+        .iter()
+        .map(|s| {
+            let labels = s
+                .labels
+                .iter()
+                .map(|l| match &l.value {
+                    pulsus_read::MetricLabelValue::Str(v) => format!("{}={v}", l.key),
+                    pulsus_read::MetricLabelValue::Double(v) => format!("{}={v}", l.key),
+                    pulsus_read::MetricLabelValue::Int(v) => format!("{}={v}", l.key),
+                    pulsus_read::MetricLabelValue::Bool(v) => format!("{}={v}", l.key),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let sum = s
+                .samples
+                .iter()
+                .map(|(_, v)| *v)
+                .filter(|v| !v.is_nan())
+                .sum();
+            (labels, sum)
+        })
+        .collect())
+}
+
+/// The same per-series sums from the reference, read once; `None` when
+/// the response carries no `series` array.
+fn reference_series_once(
+    api_base: &str,
+    q: &str,
+    window: (i64, i64),
+) -> Option<BTreeMap<String, f64>> {
+    let url = format!("{}/api/metrics/query_range", api_base.trim_end_matches('/'));
+    let out = Command::new("curl")
+        .args(["-s", "-G", "--max-time", "20"])
+        .args(["--data-urlencode", &format!("q={q}")])
+        .args([
+            "--data-urlencode",
+            &format!("start={}", window.0 / NS_PER_S),
+        ])
+        .args(["--data-urlencode", &format!("end={}", window.1 / NS_PER_S)])
+        .args(["--data-urlencode", &format!("step={}s", STEP_MS / 1_000)])
+        .arg(&url)
+        .output()
+        .expect("curl on PATH");
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let series = body.get("series")?.as_array()?;
+    Some(
+        series
+            .iter()
+            .map(|s| {
+                let labels = s
+                    .get("labels")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .map(|l| {
+                        let key = l.get("key").and_then(|v| v.as_str()).unwrap_or_default();
+                        let value = l
+                            .get("value")
+                            .and_then(|v| v.as_object())
+                            .and_then(|o| o.values().next())
+                            .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
+                            .unwrap_or_default();
+                        format!("{key}={value}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sum = s
+                    .get("samples")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|sm| sm.get("value").and_then(serde_json::Value::as_f64))
+                    .sum();
+                (labels, sum)
+            })
+            .collect(),
+    )
+}
+
+/// Two per-series answers agree: the same series, sums within `1e-12`.
+fn same_series(a: &BTreeMap<String, f64>, b: &BTreeMap<String, f64>) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|((ka, va), (kb, vb))| ka == kb && (va - vb).abs() < 1e-12)
+}
+
+/// T10 (issue #764): **`!= nil` on each intrinsic counts what the reference
+/// counts**, on corpus N pushed to both sides as the same bytes; the
+/// traces drilldown's rate-by-status query sums as the reference's does.
+/// `span:childCount` is not compared: the reference answers no span
+/// (defects entry 34), ours every span.
+#[tokio::test(flavor = "multi_thread")]
+async fn intrinsic_presence_counts_match_the_reference() {
+    // Fail-closed, as the root-count leg above is.
+    let (Some(api_base), Some(otlp_base), true) = (
+        pulsus_testkit::live_endpoint("PULSUSDB_METRICS_FILTER_DIFF_URL"),
+        pulsus_testkit::live_endpoint("PULSUSDB_METRICS_FILTER_OTLP_URL"),
+        pulsus_testkit::live_clickhouse_enabled(),
+    ) else {
+        eprintln!(
+            "skipping the intrinsic-presence differential — set PULSUS_TEST_CLICKHOUSE=1, \
+             PULSUSDB_METRICS_FILTER_DIFF_URL and PULSUSDB_METRICS_FILTER_OTLP_URL"
+        );
+        return;
+    };
+    let base = now_ns() - 90 * NS_PER_S;
+    let window = (base - 60 * NS_PER_S, base + 60 * NS_PER_S);
+    let nonce = *uuid::Uuid::new_v4().as_bytes();
+    let service = format!("nil-diff-{}", hex(&nonce[..4]));
+    let body = presence_corpus::body(base, &hex(&tid(&nonce, 0)), &hex(&tid(&nonce, 1)), &service);
+    otlp_post(&otlp_base, &body);
+
+    let bootstrap = ChClient::new(ch_config("default"))
+        .await
+        .expect("connect bootstrap");
+    let db = pulsus_testkit::test_db(&format!("pulsus_nildiff_it_{}", hex(&nonce)));
+    init_db(&bootstrap, &db).await;
+    let client = ChClient::new(ch_config(&db)).await.expect("connect db");
+    let req = pulsus_write::protocols::otlp_traces::decode_json(&body)
+        .expect("our own ingest decodes the bytes the reference got");
+    land_request(&client, &req).await;
+    let engine = TraceEngine::new(
+        ChClient::new(ch_config(&db)).await.expect("connect engine"),
+        engine_config(),
+        empty_tenant(),
+    );
+    let scoped = |f: &str, tail: &str| {
+        format!(r#"{{ resource.service.name = "{service}" && ({f}) }} | {tail}"#)
+    };
+
+    // The control: four spans on both sides, the reference polled until
+    // its answer is stable.
+    let all_q = format!(r#"{{ resource.service.name = "{service}" }} | count_over_time()"#);
+    let ours_all = pulsus_total(&engine, &all_q, window).await;
+    let ref_all = reference_total(&api_base, &all_q, window);
+    let mut wrong: Vec<String> = Vec::new();
+    if ours_all != 4.0 || ref_all != 4.0 {
+        exec(&bootstrap, &format!("DROP DATABASE IF EXISTS {db}")).await;
+        panic!("the control must count 4 on both sides: ours {ours_all}, the reference {ref_all}");
+    }
+
+    // Each intrinsic's presence, §1's count; the reference read once.
+    for intrinsic in pulsus_traceql::Intrinsic::ALL.iter().copied() {
+        use pulsus_traceql::Intrinsic as I;
+        // No wildcard arm: a new intrinsic decides here.
+        let count = match intrinsic {
+            I::EventName | I::EventTimeSinceStart => 2.0,
+            I::LinkSpanId | I::LinkTraceId => 1.0,
+            I::Name
+            | I::Duration
+            | I::Status
+            | I::Kind
+            | I::NestedSetParent
+            | I::NestedSetLeft
+            | I::NestedSetRight
+            | I::StatusMessage
+            | I::ChildCount
+            | I::SpanId
+            | I::ParentId
+            | I::TraceId
+            | I::TraceDuration
+            | I::RootName
+            | I::RootServiceName
+            | I::InstrumentationName
+            | I::InstrumentationVersion => 4.0,
+        };
+        let q = scoped(&format!("{intrinsic} != nil"), "count_over_time()");
+        let ours = pulsus_series(&engine, &q, window)
+            .await
+            .map(|s| s.values().sum::<f64>());
+        if ours != Ok(count) {
+            wrong.push(format!("{q}: ours {ours:?}, expected {count}"));
+        }
+        if intrinsic == I::ChildCount {
+            continue;
+        }
+        let theirs = reference_series_once(&api_base, &q, window).map(|s| s.values().sum::<f64>());
+        if theirs != Some(count) {
+            wrong.push(format!("{q}: the reference {theirs:?}, expected {count}"));
+        }
+    }
+
+    // The drilldown's rate-by-status query: ours exactly as the panel
+    // sends it and scoped, the reference scoped.
+    let filter = "nestedSetParent<0 && true && status != nil";
+    let unscoped = format!("{{{filter}}} | rate() by(status)");
+    let drill = scoped(filter, "rate() by(status)");
+    let want: BTreeMap<String, f64> = [("status=unset".to_string(), 1.0 / 60.0)].into();
+    let theirs = |q: &str| {
+        reference_series_once(&api_base, q, window).ok_or_else(|| "no series array".to_string())
+    };
+    for (side, q, got) in [
+        (
+            "ours",
+            &unscoped,
+            pulsus_series(&engine, &unscoped, window).await,
+        ),
+        ("ours", &drill, pulsus_series(&engine, &drill, window).await),
+        ("the reference", &drill, theirs(&drill)),
+    ] {
+        if !got.as_ref().is_ok_and(|g| same_series(g, &want)) {
+            wrong.push(format!("{q} ({side}): {got:?}, expected {want:?}"));
+        }
+    }
+    let by_status = scoped("status != nil", "count_over_time() by(status)");
+    let want: BTreeMap<String, f64> = [
+        ("status=error".to_string(), 1.0),
+        ("status=ok".to_string(), 1.0),
+        ("status=unset".to_string(), 2.0),
+    ]
+    .into();
+    for (side, got) in [
+        ("ours", pulsus_series(&engine, &by_status, window).await),
+        ("the reference", theirs(&by_status)),
+    ] {
+        if !got.as_ref().is_ok_and(|g| same_series(g, &want)) {
+            wrong.push(format!("{by_status} ({side}): {got:?}, expected {want:?}"));
+        }
+    }
+
+    exec(&bootstrap, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    assert!(
+        wrong.is_empty(),
+        "{} wrong cell(s):\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
 /// The empty tenant (issue #738): every fixture here is pushed with no
 /// `X-Scope-OrgID`.
 #[allow(dead_code)]

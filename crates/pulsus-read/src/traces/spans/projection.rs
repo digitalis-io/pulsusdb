@@ -801,8 +801,8 @@ fn resource_stored(key: &str, ctx: &PredicateCtx<'_>) -> Result<Projects, PlanEr
 }
 
 /// A field's stored value, as presence projects it: an attribute's own, a
-/// column's, the resource row's, or a set's element carrying it, the one
-/// `pick` names.
+/// column's, the resource row's, a nested-set intrinsic's number, or a
+/// set's element carrying it, the one `pick` names.
 fn stored_value(field: &Field, ctx: &PredicateCtx<'_>, pick: Pick) -> Result<Projects, PlanError> {
     Ok(match (place_of(field), field) {
         (Place::Attribute(root), Field::Attribute { key, .. }) => stored_attribute(root, key),
@@ -810,8 +810,13 @@ fn stored_value(field: &Field, ctx: &PredicateCtx<'_>, pick: Pick) -> Result<Pro
         (Place::Service, _) => service_projects(ctx)?,
         (Place::Resource, Field::Attribute { key, .. }) => resource_stored(key, ctx)?,
         (Place::Set, _) => carrying(field, ctx, pick)?,
-        (Place::Envelope | Place::Numbered(_), _)
-        | (Place::Attribute(_) | Place::Resource, Field::Intrinsic(_)) => Projects::Nothing,
+        (Place::Numbered(i), _) => Projects::Value {
+            value: super::numbering::selected_sql(i),
+            kind: "'Int64'".to_string(),
+        },
+        (Place::Envelope, _) | (Place::Attribute(_) | Place::Resource, Field::Intrinsic(_)) => {
+            Projects::Nothing
+        }
     })
 }
 

@@ -11,14 +11,15 @@
 //!
 //! **What is compared, per case, per span:** the MULTISET of projected
 //! attribute keys, and the `name`-present flag. Values are compared for
-//! the cases whose reference value is a `stringValue`; the FOUR cases
-//! whose reference value is typed (`http.status_code`, `nestedSetLeft`
-//! twice — the range form and the same-field form — and `duration_ms`,
-//! all `intValue`) are KEY-compared only, because value typing is a
+//! the cases whose reference value is a `stringValue`; the SEVEN cases
+//! whose reference value is typed (`http.status_code`, `duration_ms`,
+//! `nestedSetLeft` three times — the range, same-field and presence forms
+//! — and the `nestedSetParent` and `nestedSetRight` presence forms, all
+//! `intValue`) are KEY-compared only, because value typing is a
 //! separate issue and a wrong number rendering would pass this leg. That
 //! limit is stated rather than implied:
 //! `the_live_differential_registry_is_well_formed`, at the end of this
-//! file, holds the same four names as data and fails if the registry's
+//! file, holds the same seven names as data and fails if the registry's
 //! keys-only set stops being them.
 //!
 //! **The validity gate is direction-neutral and runs BEFORE the
@@ -323,7 +324,19 @@ impl Projected {
 /// Our side: the search route's engine, read back as span-id hex ->
 /// projected shape.
 async fn ours(engine: &TraceEngine, q: &str, window: (i64, i64)) -> BTreeMap<String, Projected> {
-    let query = pulsus_traceql::parse(q).unwrap_or_else(|e| panic!("parse {q:?}: {e}"));
+    ours_or_refusal(engine, q, window)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`ours`], a refusal or a read error returned as its text, so a case
+/// the planner refuses is a divergence of its own case.
+async fn ours_or_refusal(
+    engine: &TraceEngine,
+    q: &str,
+    window: (i64, i64),
+) -> Result<BTreeMap<String, Projected>, String> {
+    let query = pulsus_traceql::parse(q).map_err(|e| format!("parse {q:?}: {e}"))?;
     let request = plan_search_request(
         &query,
         &SearchParams {
@@ -342,11 +355,11 @@ async fn ours(engine: &TraceEngine, q: &str, window: (i64, i64)) -> BTreeMap<Str
         },
         64,
     )
-    .unwrap_or_else(|e| panic!("plan {q:?}: {e}"));
+    .map_err(|e| format!("plan {q:?}: {e}"))?;
     let out = engine
         .search_routed(&request)
         .await
-        .unwrap_or_else(|e| panic!("search {q:?}: {e}"));
+        .map_err(|e| format!("search {q:?}: {e}"))?;
     let mut map = BTreeMap::new();
     for t in &out.traces {
         for s in &t.spans {
@@ -365,7 +378,7 @@ async fn ours(engine: &TraceEngine, q: &str, window: (i64, i64)) -> BTreeMap<Str
             );
         }
     }
-    map
+    Ok(map)
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,7 +1131,13 @@ async fn traces_search_projection_differential() {
     for case in &CASES {
         let theirs = reference(&api_base, case.q)
             .unwrap_or_else(|| panic!("[{}] the reference returned no traces array", case.name));
-        let mine = ours(&engine, case.q, window).await;
+        let mine = match ours_or_refusal(&engine, case.q, window).await {
+            Ok(mine) => mine,
+            Err(e) => {
+                diverged.push(format!("[{}] {}: {e}", case.name, case.q));
+                continue;
+            }
+        };
 
         // Per-case validity: BOTH sides must have returned at least one
         // span, else the case failed rather than agreed.
@@ -1241,21 +1260,24 @@ async fn land(
 
 /// The registry is WELL FORMED: every case is uniquely named, its name
 /// carries its own 1-based position, the cases compared by KEY only are
-/// exactly the four this file's module doc names, and the one `nil` case
+/// exactly the seven this file's module doc names, and every `nil` case
 /// is a presence test. Moved here unchanged from the previous search
 /// engine's unit tests when #602 part 2c-2b-2 deleted that engine; it
 /// needs no planner.
 ///
 /// *RED when:* two cases share a name, a case's ordinal prefix stops
 /// matching its index, the keys-only set changes without this list, or a
-/// `nil` case other than the presence test is added.
+/// `nil` case that is not a presence test is added.
 #[test]
 fn the_live_differential_registry_is_well_formed() {
-    const KEYS_ONLY_CASES: [&str; 4] = [
+    const KEYS_ONLY_CASES: [&str; 7] = [
         "10_status_code_num",
         "25_nested_set_left",
         "27_single_field_arithmetic",
         "33_same_field_nested_set",
+        "54_presence_nested_set_parent",
+        "55_presence_nested_set_left",
+        "56_presence_nested_set_right",
     ];
     let names: std::collections::BTreeSet<&str> = CASES.iter().map(|c| c.name).collect();
     assert_eq!(
@@ -1292,11 +1314,12 @@ fn the_live_differential_registry_is_well_formed() {
         .filter(|c| c.q.contains("nil"))
         .map(|c| c.q)
         .collect();
-    assert_eq!(
-        nil_cases,
-        vec![r#"{ span.http.method != nil }"#],
-        "an ABSENCE case is answered from the reference's key catalog, not from this corpus"
+    assert!(
+        nil_cases.iter().all(|q| q.ends_with(" != nil }")),
+        "an ABSENCE case is answered from the reference's key catalog, not from this corpus: \
+         {nil_cases:?}"
     );
+    assert_eq!(nil_cases.len(), 21, "the presence cases: {nil_cases:?}");
 }
 
 /// The registry holds exactly one case for each witness query the

@@ -1,5 +1,5 @@
 {
-  "DIVERGENCE_COUNT": 1,
+  "DIVERGENCE_COUNT": 0,
   "capture": {
     "reference_image": "grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7",
     "reference_config": "ci/tempo/tempo-compare.yaml (unmodified)",
@@ -326,15 +326,67 @@
     {
       "query": "{ name != nil } | rate()",
       "ours": {
-        "verdict": "reject",
-        "body": "type mismatch: existence checks are only supported on attributes"
+        "verdict": "accept",
+        "body": null
       },
       "reference": {
         "verdict": "accept",
         "body": null
       },
-      "divergence": "metrics-filter-intrinsic-existence-shared-path",
-      "why": "NOT a metrics-block defect: /api/search refuses it identically, so the rejection comes from a shared path. Recorded here because it is a divergence on this route; owned elsewhere"
+      "divergence": null,
+      "why": "an existence check on an intrinsic: true for every span (issue #764)"
+    },
+    {
+      "query": "{nestedSetParent<0 && true && status != nil} | rate() by(status)",
+      "ours": {
+        "verdict": "accept",
+        "body": null
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": null,
+      "why": "the traces drilldown's rate-by-status panel (issue #764)"
+    },
+    {
+      "query": "{ event:name != nil } | rate()",
+      "ours": {
+        "verdict": "accept",
+        "body": null
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": null,
+      "why": "an event intrinsic's presence: a span with an event (issue #764)"
+    },
+    {
+      "query": "{ span:childCount != nil } | rate()",
+      "ours": {
+        "verdict": "accept",
+        "body": null
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": null,
+      "why": "accepted on both sides; the reference counts no span (entry 34)"
+    },
+    {
+      "query": "{ name = nil } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "name = nil is not valid: intrinsics cannot be nil"
+      },
+      "reference": {
+        "verdict": "reject",
+        "body": "compiling query: name=nil is not valid because intrinsics cannot be nil"
+      },
+      "divergence": null,
+      "why": "an intrinsic cannot be nil: refused on both sides"
     },
     {
       "query": "{ childCount > 2 } | rate()",

@@ -1117,6 +1117,10 @@ mod tests {
             (r#"{nestedSetLeft > 2}"#, 0),
             (r#"{nestedSetParent < 0}"#, 1),
             (r#"{span.a="x"} | select(span.b)"#, 1),
+            // Issue #764: a presence on an intrinsic is kept.
+            (r#"{status != nil}"#, 1),
+            (r#"{event:name != nil && span.a="y"}"#, 2),
+            (r#"{!(link:spanID != nil)}"#, 1),
         ] {
             let n = narrow(q);
             assert!(n.has_body(), "{q}: a body");
@@ -1129,6 +1133,13 @@ mod tests {
                 .sql()
                 .starts_with("(throwIf("),
             "a `!` over a value is a demand"
+        );
+        assert_eq!(
+            narrow(r#"{status != nil}"#)
+                .predicate()
+                .map(|p| p.sql().to_string()),
+            Some("true".to_string()),
+            "an always-held intrinsic's presence keeps the whole set"
         );
         let td = narrow(r#"{trace:duration > 1s}"#);
         assert_eq!(td.predicate().expect("a predicate").trace_leaves().len(), 1);
@@ -1189,6 +1200,8 @@ mod tests {
             "{}",
             "{ }",
             "{resource.service.name=\"cart\"} >> {span.http.method=\"GET\"}",
+            // Issue #764: a `q` the validator refuses narrows nothing.
+            "{name = nil}",
         ] {
             assert_eq!(narrow(q).terms(), 0, "{q:?} must contribute no terms");
         }
