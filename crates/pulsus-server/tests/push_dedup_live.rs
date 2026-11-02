@@ -183,7 +183,7 @@ fn http_request_with(
     body: &[u8],
 ) -> Option<HttpResponse> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT)).ok();
 
     let mut head = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
     if let Some(ct) = content_type {
@@ -499,6 +499,9 @@ async fn collect<R: pulsus_clickhouse::ChRow>(client: &ChClient, sql: &str) -> V
     }
     out
 }
+
+/// How long one request to the server under test may wait for its answer.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// This host's clock, in epoch milliseconds: the server under test stamps
 /// `received_ms` from the same clock.
@@ -983,13 +986,24 @@ async fn with_the_mechanism_off_the_retry_doubles_every_log_reader() {
     let retried = remote_write_body("dupOffC", t1_ms);
     // `metric_landing` is partitioned by the hour of `received_ms`, and a
     // block's token is remembered per partition: a pair of sends straddling
-    // an hour would store the repeat in the next partition. Within a minute
-    // of the hour's end, the pair waits for the next hour to begin; the
-    // partition the two sends landed in is asserted below.
-    let hour_ms: i64 = 3_600_000;
-    let into_hour = epoch_ms() % hour_ms;
-    if into_hour > hour_ms - 60_000 {
-        tokio::time::sleep(Duration::from_millis((hour_ms - into_hour + 1_000) as u64)).await;
+    // an hour would store the repeat in the next partition. ClickHouse says
+    // how long remains of the partition `received_ms` would land in now, by
+    // the table's own expression, so the guard and the assertion below agree
+    // whatever the server's time zone. The pair is two requests in turn,
+    // each answered within `REQUEST_READ_TIMEOUT`; with less than both of
+    // those and some slack remaining, it waits for the next partition.
+    let margin = 2 * REQUEST_READ_TIMEOUT + Duration::from_secs(10);
+    let now_ms = epoch_ms();
+    let remaining_ms = scalar(
+        &client,
+        &format!(
+            "SELECT toUInt64(toUInt64(toUnixTimestamp(toStartOfHour(fromUnixTimestamp64Milli(\
+             toInt64({now_ms}))) + INTERVAL 1 HOUR)) * 1000 - {now_ms}) AS n"
+        ),
+    )
+    .await;
+    if Duration::from_millis(remaining_ms) < margin {
+        tokio::time::sleep(Duration::from_millis(remaining_ms + 1_000)).await;
     }
     for _ in 0..2 {
         assert_eq!(push_metrics(MECHANISM_OFF_PORT, &retried, &[]).status, 204);
