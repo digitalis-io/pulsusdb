@@ -904,8 +904,10 @@ async fn a_metric_push_that_throws_on_every_attempt_is_placed_by_fingerprint() {
         format!("metric_landing{SUFFIX}"),
         "the writer names the wrapper"
     );
+    // The scratch table is not asserted empty, as 1-L1's is: the push is one
+    // block per shard, and the block on the shard without the poison row
+    // commits, its view writing its rows there.
     assert_metrics_placed_by_fingerprint(&nodes, db).await;
-    assert_scratch_empty(&nodes, db).await;
     let repeated = texts(
         &nodes.s1a,
         &format!(

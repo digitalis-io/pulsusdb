@@ -1296,6 +1296,23 @@ async fn a_series_landed_through_two_servers_is_read_whole_by_the_fallback() {
             .await
             .expect("the landing insert commits");
     }
+    // Each block was written on one live replica of its shard; the reads
+    // below may be served by another, so every replica catches up first.
+    for table in [
+        "metric_samples",
+        "metric_series",
+        "metric_labels",
+        "metric_label_index",
+    ] {
+        shard1_bootstrap
+            .execute(
+                &format!("SYSTEM SYNC REPLICA ON CLUSTER '{CLUSTER_NAME}' {db}.{table}"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("sync {table}: {e}"));
+    }
 
     let cache = Arc::new(LabelCache::new(
         ChClient::new(shard1_config(db)).await.expect("connect"),
@@ -1312,29 +1329,35 @@ async fn a_series_landed_through_two_servers_is_read_whole_by_the_fallback() {
         end_ms: t + 60_000,
         step_ms: 0,
     };
-    for query in [
-        format!("count_over_time({metric_name}[10m])"),
-        r#"count_over_time({job="api"}[10m])"#.to_string(),
+    // The named selector resolves through `SqlFallback` (the label cache's
+    // window does not reach two days back) and pairs samples with series
+    // shard by shard; the name-less one resolves through the label index.
+    // Both must count both samples.
+    for (query, fallback) in [
+        (format!("count_over_time({metric_name}[10m])"), true),
+        (r#"count_over_time({job="api"}[10m])"#.to_string(), false),
     ] {
         let expr = parse(&query).expect("parse");
         let (result, _annotations, explain) = engine
             .query_explained(&no_tenant(), &expr, &params)
             .await
             .expect("the query answers");
-        let fetch = stage(&explain, "sample_fetch");
-        assert!(
-            fetch.sql.contains("FROM metric_series_dist"),
-            "{query}: the SqlFallback fetch shape: {}",
-            fetch.sql
-        );
-        let resolution = stage(&explain, "series_resolution");
-        assert!(
-            resolution
-                .note
-                .as_deref()
-                .is_some_and(|n| n.contains("OutOfWindow")),
-            "{query}: the OutOfWindow reason: {resolution:#?}"
-        );
+        if fallback {
+            let fetch = stage(&explain, "sample_fetch");
+            assert!(
+                fetch.sql.contains("FROM metric_series_dist"),
+                "{query}: the SqlFallback fetch shape: {}",
+                fetch.sql
+            );
+            let resolution = stage(&explain, "series_resolution");
+            assert!(
+                resolution
+                    .note
+                    .as_deref()
+                    .is_some_and(|n| n.contains("OutOfWindow")),
+                "{query}: the OutOfWindow reason: {resolution:#?}"
+            );
+        }
         assert_eq!(single_value(&result), Some(2.0), "{query}: both samples");
     }
 

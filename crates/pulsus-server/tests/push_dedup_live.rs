@@ -898,8 +898,8 @@ async fn the_rollup_buckets_return_to_their_single_push_values() {
     );
 }
 
-/// **The control.** With `PULSUS_INGEST_DEDUP=false` the same two pushes
-/// store both copies and every reader doubles — which is the defect, and
+/// **The control.** With `PULSUS_INGEST_DEDUP=false` the same two log
+/// pushes store both copies and every log reader doubles — which is the defect, and
 /// is what the tests above would report if they were passing for some
 /// other reason (a body that never arrived, a query that matched nothing).
 ///
@@ -912,15 +912,16 @@ async fn the_rollup_buckets_return_to_their_single_push_values() {
 ///   log_samples rows                           2               4
 ///   log_metrics_5s count/bytes            2 / 46          4 / 92
 ///   log_patterns count                         2               4
-///   metric_samples rows                        3               6
+///   metric_samples rows                        3               3
 ///   count_over_time over those samples         3               3
 /// ```
 ///
-/// **The last row is not a mistake.** Suppression at ingest and the §7
-/// read rule are independent, and the metric read path collapses two rows
-/// identical in `(fingerprint, unix_milli, value bits)` whether or not the
-/// push that stored them was suppressed. So with the mechanism off the
-/// metric side costs storage rather than a wrong answer.
+/// **The metric rows are not a mistake.** Since issue #494 part 1b a
+/// metrics push's landing token is derived from its tenant and content, so
+/// the repeat carries the first push's token and ClickHouse drops it with
+/// the mechanism off as well: the metric side has a guard of its own. The
+/// metric read path also collapses two rows identical in `(fingerprint,
+/// unix_milli, value bits)`, so the answer is three either way.
 ///
 /// The log side has no such second line of defence, which is the whole of
 /// the engine ruling: `log_metrics_5s` is an `AggregatingMergeTree` fed by
@@ -974,12 +975,15 @@ async fn with_the_mechanism_off_the_retry_doubles_every_reader() {
     for _ in 0..2 {
         assert_eq!(push_metrics(MECHANISM_OFF_PORT, &retried, &[]).status, 204);
     }
+    // Both pushes are answered after their inserts, so the count below is
+    // final: the repeat's content token is the first push's, and ClickHouse
+    // stored nothing for it (issue #494 part 1b).
     wait_for_scalar(
         &client,
         "SELECT count() AS n FROM metric_landing \
          WHERE kind = 0 AND metric_name = 'http_requests_total'",
-        6,
-        "off: six sample rows for three samples",
+        3,
+        "off: three sample rows for three samples, the repeat dropped by its token",
     )
     .await;
     assert_eq!(
@@ -989,8 +993,7 @@ async fn with_the_mechanism_off_the_retry_doubles_every_reader() {
             t1_ms + 40_000
         ),
         "3",
-        "off: six rows are stored, and the §7 read rule still answers three — \
-         the two halves of this change are independent"
+        "off: three rows are stored, and the read answers three"
     );
 }
 
