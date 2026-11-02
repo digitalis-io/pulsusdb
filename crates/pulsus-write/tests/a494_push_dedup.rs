@@ -157,6 +157,15 @@ fn metric_writer_with(cfg: WriterConfig, landing: Arc<MockInserter>) -> MetricWr
     MetricWriter::with_landing_inserter(landing, &cfg, pulsus_model::ACTIVITY_BUCKET_MS)
 }
 
+/// Waits until `writer` holds no queued bytes: every block it admitted has
+/// settled.
+async fn queue_drained(writer: &MetricWriter) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while writer.metrics().queue_bytes != 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 fn metadata_batch(name: &str, metric_type: &str, updated_ns: i64) -> ParsedMetrics {
     ParsedMetrics {
         metadata: vec![MetricMetadata {
@@ -1046,6 +1055,9 @@ async fn a_retried_push_carrying_the_same_descriptor_is_still_suppressed() {
             .admit_flush(&no_tenant(), body(), PushHeaders::default())
             .expect("queue has room");
         wait.await.expect("the flush settles");
+        // The answer waits for the samples block; the descriptor block is
+        // its own insert (issue #494 part 1b).
+        queue_drained(&writer).await;
     }
     writer.shutdown(Duration::from_secs(2)).await;
 
@@ -1095,7 +1107,12 @@ async fn a_suppressed_push_still_lands_its_descriptor_alone() {
         .admit_flush(&no_tenant(), body(), PushHeaders::default())
         .expect("queue has room");
     wait.await.expect("the first push settles");
-    assert_eq!(landing.call_count(), 1);
+    queue_drained(&writer).await;
+    assert_eq!(
+        landing.call_count(),
+        2,
+        "its samples block and its descriptor block (issue #494 part 1b)"
+    );
     writer.forget_sent_descriptors_for_test();
 
     let wait = writer
@@ -1107,8 +1124,8 @@ async fn a_suppressed_push_still_lands_its_descriptor_alone() {
 
     assert_eq!(
         landing.call_count(),
-        2,
-        "the descriptor block is its own insert"
+        3,
+        "the suppressed push's descriptor block is its own insert"
     );
     assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 1);
     assert_eq!(landing.rows_of_kind(0), 1, "no second sample row");

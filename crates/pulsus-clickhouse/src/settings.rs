@@ -889,46 +889,33 @@ mod tests {
         );
         assert_eq!(
             s.entries().count(),
-            17,
+            19,
             "the pinned set is closed: a setting added to it without a row in \
              landing_insert's table, and without its required-name entry, is \
              a name sent on somebody's memory"
         );
     }
 
-    /// **1-U1 (issue #494 part 1): the landing inserts pin what their path
-    /// needs.** Every landing insert pins `skip_unavailable_shards`,
-    /// `prefer_localhost_replica` and `timeout_overflow_mode`; the log and
-    /// trace inserts, which go through a `Distributed` wrapper on a cluster,
-    /// also pin `distributed_foreground_insert` and `insert_shard_id`, and
-    /// the metrics insert, which names the bare `metric_landing`, does not.
+    /// **2-U1 (issue #494 part 1b): every landing insert pins the five
+    /// placement settings**, metrics and logs through
+    /// [`QuerySettings::landing_insert`] and traces through
+    /// [`QuerySettings::trace_landing_insert`], each at the same value. On a
+    /// cluster every landing table is written through its `Distributed`
+    /// wrapper.
     #[test]
-    fn the_landing_inserts_pin_the_settings_their_path_needs() {
-        const EVERY: [(&str, &str); 3] = [
+    fn every_landing_insert_pins_the_five_placement_settings() {
+        const PINS: [(&str, &str); 5] = [
+            ("distributed_foreground_insert", "1"),
+            ("insert_shard_id", "0"),
             ("skip_unavailable_shards", "0"),
             ("prefer_localhost_replica", "0"),
             ("timeout_overflow_mode", "throw"),
         ];
-        const ROUTED: [(&str, &str); 2] = [
-            ("distributed_foreground_insert", "1"),
-            ("insert_shard_id", "0"),
-        ];
-        let metrics = QuerySettings::landing_insert("tok-1", 1_048_576);
-        let logs = QuerySettings::routed_landing_insert("tok-1", 1_048_576);
+        let landing = QuerySettings::landing_insert("tok-1", 1_048_576);
         let traces = QuerySettings::trace_landing_insert("tok-1", 1_048_576);
-        for (key, value) in EVERY {
-            assert_eq!(metrics.get(key), Some(value), "landing_insert: {key}");
-        }
-        for (key, _) in ROUTED {
-            assert_eq!(
-                metrics.get(key),
-                None,
-                "landing_insert names no wrapper and must not carry {key}"
-            );
-        }
-        for (key, value) in EVERY.iter().chain(ROUTED.iter()) {
-            assert_eq!(logs.get(key), Some(*value), "routed_landing_insert: {key}");
-            assert_eq!(traces.get(key), Some(*value), "trace_landing_insert: {key}");
+        for (key, value) in PINS {
+            assert_eq!(landing.get(key), Some(value), "landing_insert: {key}");
+            assert_eq!(traces.get(key), Some(value), "trace_landing_insert: {key}");
         }
     }
 
@@ -967,11 +954,10 @@ mod tests {
         }
     }
 
-    /// **The trace landing insert's pin set is exactly the metrics one plus
-    /// nine**: the two routed pins of [`QuerySettings::routed_landing_insert`]
-    /// and the seven the trace path needs, compared as **sets**, with the
-    /// difference taken against those nine — so neither an added pin nor a
-    /// removed one passes.
+    /// **The trace landing insert's pin set is exactly the landing one plus
+    /// the seven the trace path needs**, and the two sets are compared as
+    /// **sets**, with the difference taken against those seven — so
+    /// neither an added pin nor a removed one passes.
     ///
     /// It is the only place in this change that writes a setting name as a
     /// literal. The classes behind the seven, and the catalogue
@@ -988,8 +974,6 @@ mod tests {
         use std::collections::BTreeMap;
 
         const WANT: &[(&str, &str)] = &[
-            ("distributed_foreground_insert", "1"),
-            ("insert_shard_id", "0"),
             ("input_format_binary_read_json_as_string", "0"),
             ("format_binary_max_object_size", "100000"),
             ("max_partitions_per_insert_block", "100"),
@@ -1013,7 +997,7 @@ mod tests {
         assert_eq!(
             added, want,
             "the difference against the metrics landing insert is exactly the \
-             two routed pins and the seven this design names"
+             seven pins this design names"
         );
 
         for (key, value) in &base_entries {

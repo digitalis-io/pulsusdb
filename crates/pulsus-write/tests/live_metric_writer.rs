@@ -129,10 +129,12 @@ async fn count(client: &ChClient, sql: &str) -> u64 {
         .n
 }
 
-/// One push of every kind is one block in the landing table, with the rows
-/// the writer built and one `received_ms` shared by all of them.
+/// One push of every kind lands its content block and its descriptor block
+/// in the landing table (issue #494 part 1b): two inserts, so two level-0
+/// parts, with the rows the writer built and one `received_ms` shared by all
+/// of them.
 #[tokio::test]
-async fn a_push_lands_one_block_carrying_every_kind() {
+async fn a_push_lands_its_content_block_and_its_descriptor_block() {
     skip_unless_live!();
     let (bootstrap, db, client, writer) =
         live_writer(pulsus_testkit::test_db("pulsus_write_it_landing_block")).await;
@@ -188,6 +190,18 @@ async fn a_push_lands_one_block_carrying_every_kind() {
         .expect("flush settles within the test timeout")
         .expect("the landing block commits");
     writer.shutdown(Duration::from_secs(5)).await;
+
+    // One part per insert, active or merged away: the content block and the
+    // descriptor block.
+    let inserts = count(
+        &client,
+        &format!(
+            "SELECT countIf(level = 0) AS n FROM system.parts \
+             WHERE database = '{db}' AND table = 'metric_landing'"
+        ),
+    )
+    .await;
+    assert_eq!(inserts, 2, "the push made two inserts into metric_landing");
 
     // Two registrations: the sample's bucket and the exemplar's.
     for (kind, want) in [(0u8, 1u64), (1, 0), (2, 2), (3, 1), (4, 1)] {

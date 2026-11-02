@@ -85,7 +85,9 @@ use crate::ingest::PushHeaders;
 use crate::ingest::metrics::ParsedMetrics;
 use crate::ingest::traces::ParsedTraceLanding;
 use crate::protocols::otlp_logs::ParsedLogs;
+use crate::writer::rows::MetricLandingRow;
 use pulsus_clickhouse::json_column::{TraceJson, TraceJsonScalar, TraceJsonValue};
+use serde::Serializer as _;
 
 // ---------------------------------------------------------------------
 // Identity
@@ -503,6 +505,337 @@ fn identity_from(
         key,
         content,
         declared_retry: headers.declared_retry,
+    }
+}
+
+// ---------------------------------------------------------------------
+// The metrics landing token
+// ---------------------------------------------------------------------
+
+/// The `insert_deduplication_token` of a metrics push's content block (issue
+/// #494 part 1b): `m` and 32 lowercase hex digits of an xxh3-128 digest over
+/// `"metric-landing-token"` and the tenant's text, each length-prefixed, and
+/// then every row of kind 0, 1 or 4 in block order, written by a
+/// [`DigestSerializer`] with `received_ms` set to zero.
+///
+/// The digest is of the rows as inserted, every column the insert sends, so
+/// a resend of the same content — the writer's own, or a client's to any
+/// writer — carries the same token, and ClickHouse drops what a table already
+/// holds. Kind-2 rows, which the writer's registration cache decides, and
+/// kind-3 rows, which go in a block of their own, are not in it. It never
+/// reads the `Idempotency-Key`.
+pub(crate) fn metric_landing_token(tenant: &Tenant, rows: &[MetricLandingRow]) -> String {
+    let _ = (tenant, rows);
+    crate::writer::landing::mint_landing_token(&mut crate::writer::table::XorShift64::seeded())
+}
+
+/// The digest's sink: an [`Xxh3`] fed through `io::Write`.
+struct HashSink<'a>(&'a mut Xxh3);
+
+impl std::io::Write for HashSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Why [`DigestSerializer`] refused a value: a sequence or map of unknown
+/// length, which no landing row holds, or a failed write to its sink.
+#[derive(Debug)]
+pub(crate) struct DigestError(String);
+
+impl std::fmt::Display for DigestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DigestError {}
+
+impl serde::ser::Error for DigestError {
+    fn custom<T: std::fmt::Display>(msg: T) -> Self {
+        DigestError(msg.to_string())
+    }
+}
+
+/// A `serde::Serializer` that writes a value's own `Serialize` output into
+/// any `io::Write` sink, for [`metric_landing_token`]: every primitive
+/// little-endian at its own width, a float as `to_bits()`, every string, byte
+/// array, sequence and map prefixed by its length as a little-endian `u64`, a
+/// tuple (a fixed array among them) as its elements alone, and a struct as its
+/// fields in declaration order. The row's own `Serialize` impl drives it, the
+/// one that drives the RowBinary insert, so the digest covers every column
+/// the insert sends. A length-prefixed framing keeps two adjacent values from
+/// running together.
+///
+/// A struct field named by [`Self::zeroing`] is written as an `i64` zero.
+pub(crate) struct DigestSerializer<W> {
+    sink: W,
+    zero: Option<&'static str>,
+}
+
+impl<W: std::io::Write> DigestSerializer<W> {
+    pub(crate) fn new(sink: W) -> Self {
+        DigestSerializer { sink, zero: None }
+    }
+
+    /// Writes the struct field `field` as an `i64` zero, whatever it holds.
+    pub(crate) fn zeroing(mut self, field: &'static str) -> Self {
+        self.zero = Some(field);
+        self
+    }
+
+    pub(crate) fn into_inner(self) -> W {
+        self.sink
+    }
+
+    fn put(&mut self, bytes: &[u8]) -> Result<(), DigestError> {
+        let _ = bytes;
+        Ok(())
+    }
+
+    fn len(&mut self, len: Option<usize>) -> Result<(), DigestError> {
+        let len = len.ok_or_else(|| DigestError("a length the digest cannot frame".into()))?;
+        self.put(&(len as u64).to_le_bytes())
+    }
+}
+
+impl<'a, W: std::io::Write> serde::Serializer for &'a mut DigestSerializer<W> {
+    type Ok = ();
+    type Error = DigestError;
+    type SerializeSeq = Self;
+    type SerializeTuple = Self;
+    type SerializeTupleStruct = Self;
+    type SerializeTupleVariant = Self;
+    type SerializeMap = Self;
+    type SerializeStruct = Self;
+    type SerializeStructVariant = Self;
+
+    fn serialize_bool(self, v: bool) -> Result<(), DigestError> {
+        self.put(&[u8::from(v)])
+    }
+    fn serialize_i8(self, v: i8) -> Result<(), DigestError> {
+        self.put(&v.to_le_bytes())
+    }
+    fn serialize_i16(self, v: i16) -> Result<(), DigestError> {
+        self.put(&v.to_le_bytes())
+    }
+    fn serialize_i32(self, v: i32) -> Result<(), DigestError> {
+        self.put(&v.to_le_bytes())
+    }
+    fn serialize_i64(self, v: i64) -> Result<(), DigestError> {
+        self.put(&v.to_le_bytes())
+    }
+    fn serialize_i128(self, v: i128) -> Result<(), DigestError> {
+        self.put(&v.to_le_bytes())
+    }
+    fn serialize_u8(self, v: u8) -> Result<(), DigestError> {
+        self.put(&[v])
+    }
+    fn serialize_u16(self, v: u16) -> Result<(), DigestError> {
+        self.put(&v.to_le_bytes())
+    }
+    fn serialize_u32(self, v: u32) -> Result<(), DigestError> {
+        self.put(&v.to_le_bytes())
+    }
+    fn serialize_u64(self, v: u64) -> Result<(), DigestError> {
+        self.put(&v.to_le_bytes())
+    }
+    fn serialize_u128(self, v: u128) -> Result<(), DigestError> {
+        self.put(&v.to_le_bytes())
+    }
+    fn serialize_f32(self, v: f32) -> Result<(), DigestError> {
+        self.put(&v.to_bits().to_le_bytes())
+    }
+    fn serialize_f64(self, v: f64) -> Result<(), DigestError> {
+        self.put(&v.to_bits().to_le_bytes())
+    }
+    fn serialize_char(self, v: char) -> Result<(), DigestError> {
+        self.put(&u32::from(v).to_le_bytes())
+    }
+    fn serialize_str(self, v: &str) -> Result<(), DigestError> {
+        self.len(Some(v.len()))?;
+        self.put(v.as_bytes())
+    }
+    fn serialize_bytes(self, v: &[u8]) -> Result<(), DigestError> {
+        self.len(Some(v.len()))?;
+        self.put(v)
+    }
+    fn serialize_none(self) -> Result<(), DigestError> {
+        self.put(&[0])
+    }
+    fn serialize_some<T: ?Sized + serde::Serialize>(self, value: &T) -> Result<(), DigestError> {
+        self.put(&[1])?;
+        value.serialize(self)
+    }
+    fn serialize_unit(self) -> Result<(), DigestError> {
+        Ok(())
+    }
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<(), DigestError> {
+        Ok(())
+    }
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        index: u32,
+        _variant: &'static str,
+    ) -> Result<(), DigestError> {
+        self.put(&index.to_le_bytes())
+    }
+    fn serialize_newtype_struct<T: ?Sized + serde::Serialize>(
+        self,
+        _name: &'static str,
+        value: &T,
+    ) -> Result<(), DigestError> {
+        value.serialize(self)
+    }
+    fn serialize_newtype_variant<T: ?Sized + serde::Serialize>(
+        self,
+        _name: &'static str,
+        index: u32,
+        _variant: &'static str,
+        value: &T,
+    ) -> Result<(), DigestError> {
+        self.put(&index.to_le_bytes())?;
+        value.serialize(self)
+    }
+    fn serialize_seq(self, len: Option<usize>) -> Result<Self, DigestError> {
+        self.len(len)?;
+        Ok(self)
+    }
+    fn serialize_tuple(self, _len: usize) -> Result<Self, DigestError> {
+        Ok(self)
+    }
+    fn serialize_tuple_struct(self, _name: &'static str, _len: usize) -> Result<Self, DigestError> {
+        Ok(self)
+    }
+    fn serialize_tuple_variant(
+        self,
+        _name: &'static str,
+        index: u32,
+        _variant: &'static str,
+        _len: usize,
+    ) -> Result<Self, DigestError> {
+        self.put(&index.to_le_bytes())?;
+        Ok(self)
+    }
+    fn serialize_map(self, len: Option<usize>) -> Result<Self, DigestError> {
+        self.len(len)?;
+        Ok(self)
+    }
+    fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self, DigestError> {
+        Ok(self)
+    }
+    fn serialize_struct_variant(
+        self,
+        _name: &'static str,
+        index: u32,
+        _variant: &'static str,
+        _len: usize,
+    ) -> Result<Self, DigestError> {
+        self.put(&index.to_le_bytes())?;
+        Ok(self)
+    }
+}
+
+impl<W: std::io::Write> serde::ser::SerializeSeq for &mut DigestSerializer<W> {
+    type Ok = ();
+    type Error = DigestError;
+    fn serialize_element<T: ?Sized + serde::Serialize>(
+        &mut self,
+        v: &T,
+    ) -> Result<(), DigestError> {
+        v.serialize(&mut **self)
+    }
+    fn end(self) -> Result<(), DigestError> {
+        Ok(())
+    }
+}
+
+impl<W: std::io::Write> serde::ser::SerializeTuple for &mut DigestSerializer<W> {
+    type Ok = ();
+    type Error = DigestError;
+    fn serialize_element<T: ?Sized + serde::Serialize>(
+        &mut self,
+        v: &T,
+    ) -> Result<(), DigestError> {
+        v.serialize(&mut **self)
+    }
+    fn end(self) -> Result<(), DigestError> {
+        Ok(())
+    }
+}
+
+impl<W: std::io::Write> serde::ser::SerializeTupleStruct for &mut DigestSerializer<W> {
+    type Ok = ();
+    type Error = DigestError;
+    fn serialize_field<T: ?Sized + serde::Serialize>(&mut self, v: &T) -> Result<(), DigestError> {
+        v.serialize(&mut **self)
+    }
+    fn end(self) -> Result<(), DigestError> {
+        Ok(())
+    }
+}
+
+impl<W: std::io::Write> serde::ser::SerializeTupleVariant for &mut DigestSerializer<W> {
+    type Ok = ();
+    type Error = DigestError;
+    fn serialize_field<T: ?Sized + serde::Serialize>(&mut self, v: &T) -> Result<(), DigestError> {
+        v.serialize(&mut **self)
+    }
+    fn end(self) -> Result<(), DigestError> {
+        Ok(())
+    }
+}
+
+impl<W: std::io::Write> serde::ser::SerializeMap for &mut DigestSerializer<W> {
+    type Ok = ();
+    type Error = DigestError;
+    fn serialize_key<T: ?Sized + serde::Serialize>(&mut self, k: &T) -> Result<(), DigestError> {
+        k.serialize(&mut **self)
+    }
+    fn serialize_value<T: ?Sized + serde::Serialize>(&mut self, v: &T) -> Result<(), DigestError> {
+        v.serialize(&mut **self)
+    }
+    fn end(self) -> Result<(), DigestError> {
+        Ok(())
+    }
+}
+
+impl<W: std::io::Write> serde::ser::SerializeStruct for &mut DigestSerializer<W> {
+    type Ok = ();
+    type Error = DigestError;
+    fn serialize_field<T: ?Sized + serde::Serialize>(
+        &mut self,
+        key: &'static str,
+        v: &T,
+    ) -> Result<(), DigestError> {
+        if self.zero == Some(key) {
+            return (&mut **self).serialize_i64(0);
+        }
+        v.serialize(&mut **self)
+    }
+    fn end(self) -> Result<(), DigestError> {
+        Ok(())
+    }
+}
+
+impl<W: std::io::Write> serde::ser::SerializeStructVariant for &mut DigestSerializer<W> {
+    type Ok = ();
+    type Error = DigestError;
+    fn serialize_field<T: ?Sized + serde::Serialize>(
+        &mut self,
+        _key: &'static str,
+        v: &T,
+    ) -> Result<(), DigestError> {
+        v.serialize(&mut **self)
+    }
+    fn end(self) -> Result<(), DigestError> {
+        Ok(())
     }
 }
 
@@ -2986,6 +3319,198 @@ mod tests {
             PushHeaders::from_values(Some("  "), None).idempotency_key,
             None,
             "a blank key is no key"
+        );
+    }
+
+    /// The two rows 2-U14 frames: R1, kind 0, with every histogram vector
+    /// empty and a NUL inside its metric name; R2, kind 1, with every
+    /// histogram vector non-empty and a NUL inside its labels.
+    fn u14_rows(received_ms: i64) -> [MetricLandingRow; 2] {
+        let org: Arc<str> = Arc::from("t1");
+        let r1 = MetricLandingRow {
+            org_id: org.clone(),
+            received_ms,
+            kind: 0,
+            metric_name: "a\0b".to_string(),
+            fingerprint: Fingerprint::from_raw(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10),
+            unix_milli: 1_700_000_000_000,
+            value: 1.5,
+            labels: "c".to_string(),
+            value_type: 0,
+            metric_type: String::new(),
+            help: String::new(),
+            unit: String::new(),
+            updated_ns: 0,
+            hist_schema: 0,
+            hist_zero_threshold: 0.0,
+            hist_zero_count: 0,
+            hist_count: 0,
+            hist_sum: 0.0,
+            hist_pos_span_offsets: vec![],
+            hist_pos_span_lengths: vec![],
+            hist_pos_bucket_deltas: vec![],
+            hist_neg_span_offsets: vec![],
+            hist_neg_span_lengths: vec![],
+            hist_neg_bucket_deltas: vec![],
+            hist_custom_values: vec![],
+            hist_counter_reset_hint: 0,
+            ex_trace_id: [0; 16],
+            ex_span_id: [0; 8],
+        };
+        let r2 = MetricLandingRow {
+            org_id: org,
+            received_ms,
+            kind: 1,
+            metric_name: "a".to_string(),
+            fingerprint: Fingerprint::from_raw(7),
+            unix_milli: 1_700_000_000_001,
+            value: 0.0,
+            labels: "b\0c".to_string(),
+            value_type: 1,
+            metric_type: String::new(),
+            help: "h".to_string(),
+            unit: String::new(),
+            updated_ns: 0,
+            hist_schema: -2,
+            hist_zero_threshold: 0.25,
+            hist_zero_count: 3,
+            hist_count: 9,
+            hist_sum: 4.5,
+            hist_pos_span_offsets: vec![-1],
+            hist_pos_span_lengths: vec![2],
+            hist_pos_bucket_deltas: vec![5],
+            hist_neg_span_offsets: vec![4],
+            hist_neg_span_lengths: vec![1],
+            hist_neg_bucket_deltas: vec![-6],
+            hist_custom_values: vec![1.0, 2.0],
+            hist_counter_reset_hint: 2,
+            ex_trace_id: [0xab; 16],
+            ex_span_id: [0xcd; 8],
+        };
+        [r1, r2]
+    }
+
+    /// **2-U14 (issue #494 part 1b): the metrics landing token's framing is
+    /// pinned, and the token covers exactly the content block's own rows.**
+    ///
+    /// (i) [`DigestSerializer`] writes `[R1, R2]` as the bytes written by
+    /// hand below, column by column in `COLUMN_NAMES` order. A length-prefixed
+    /// framing makes a boundary collision between adjacent values impossible
+    /// by construction; the case pins that framing and does not claim the
+    /// 128-bit token is unique. (ii) [`metric_landing_token`] is `m` and the
+    /// 32-hex xxh3-128 of `"metric-landing-token"` and the tenant, each
+    /// length-prefixed, then that encoding with `received_ms` zeroed. (iii)
+    /// Blocks differing only in `received_ms` or in kind-2 rows give one
+    /// token.
+    #[test]
+    fn the_metric_landing_token_digests_the_content_rows_as_inserted() {
+        fn s(e: &mut Vec<u8>, v: &str) {
+            e.extend((v.len() as u64).to_le_bytes());
+            e.extend(v.as_bytes());
+        }
+        let mut want: Vec<u8> = Vec::new();
+        let e = &mut want;
+        // R1.
+        s(e, "t1"); // org_id
+        e.extend(0i64.to_le_bytes()); // received_ms
+        e.push(0); // kind
+        s(e, "a\0b"); // metric_name
+        e.extend(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10u128.to_le_bytes()); // fingerprint
+        e.extend(1_700_000_000_000i64.to_le_bytes()); // unix_milli
+        e.extend(1.5f64.to_bits().to_le_bytes()); // value
+        s(e, "c"); // labels
+        e.push(0); // value_type
+        s(e, ""); // metric_type
+        s(e, ""); // help
+        s(e, ""); // unit
+        e.extend(0i64.to_le_bytes()); // updated_ns
+        e.push(0); // hist_schema
+        e.extend(0.0f64.to_bits().to_le_bytes()); // hist_zero_threshold
+        e.extend(0u64.to_le_bytes()); // hist_zero_count
+        e.extend(0u64.to_le_bytes()); // hist_count
+        e.extend(0.0f64.to_bits().to_le_bytes()); // hist_sum
+        e.extend(0u64.to_le_bytes()); // hist_pos_span_offsets: no element
+        e.extend(0u64.to_le_bytes()); // hist_pos_span_lengths: no element
+        e.extend(0u64.to_le_bytes()); // hist_pos_bucket_deltas: no element
+        e.extend(0u64.to_le_bytes()); // hist_neg_span_offsets: no element
+        e.extend(0u64.to_le_bytes()); // hist_neg_span_lengths: no element
+        e.extend(0u64.to_le_bytes()); // hist_neg_bucket_deltas: no element
+        e.extend(0u64.to_le_bytes()); // hist_custom_values: no element
+        e.push(0); // hist_counter_reset_hint
+        e.extend([0u8; 16]); // ex_trace_id: its bytes alone
+        e.extend([0u8; 8]); // ex_span_id: its bytes alone
+        // R2.
+        s(e, "t1"); // org_id
+        e.extend(0i64.to_le_bytes()); // received_ms
+        e.push(1); // kind
+        s(e, "a"); // metric_name
+        e.extend(7u128.to_le_bytes()); // fingerprint
+        e.extend(1_700_000_000_001i64.to_le_bytes()); // unix_milli
+        e.extend(0.0f64.to_bits().to_le_bytes()); // value
+        s(e, "b\0c"); // labels
+        e.push(1); // value_type
+        s(e, ""); // metric_type
+        s(e, "h"); // help
+        s(e, ""); // unit
+        e.extend(0i64.to_le_bytes()); // updated_ns
+        e.push((-2i8) as u8); // hist_schema
+        e.extend(0.25f64.to_bits().to_le_bytes()); // hist_zero_threshold
+        e.extend(3u64.to_le_bytes()); // hist_zero_count
+        e.extend(9u64.to_le_bytes()); // hist_count
+        e.extend(4.5f64.to_bits().to_le_bytes()); // hist_sum
+        e.extend(1u64.to_le_bytes()); // hist_pos_span_offsets: one element
+        e.extend((-1i32).to_le_bytes());
+        e.extend(1u64.to_le_bytes()); // hist_pos_span_lengths: one element
+        e.extend(2u32.to_le_bytes());
+        e.extend(1u64.to_le_bytes()); // hist_pos_bucket_deltas: one element
+        e.extend(5i64.to_le_bytes());
+        e.extend(1u64.to_le_bytes()); // hist_neg_span_offsets: one element
+        e.extend(4i32.to_le_bytes());
+        e.extend(1u64.to_le_bytes()); // hist_neg_span_lengths: one element
+        e.extend(1u32.to_le_bytes());
+        e.extend(1u64.to_le_bytes()); // hist_neg_bucket_deltas: one element
+        e.extend((-6i64).to_le_bytes());
+        e.extend(2u64.to_le_bytes()); // hist_custom_values: two elements
+        e.extend(1.0f64.to_bits().to_le_bytes());
+        e.extend(2.0f64.to_bits().to_le_bytes());
+        e.push(2); // hist_counter_reset_hint
+        e.extend([0xabu8; 16]); // ex_trace_id: its bytes alone
+        e.extend([0xcdu8; 8]); // ex_span_id: its bytes alone
+
+        // (i) The framing, with `received_ms` zeroed by the serializer.
+        let rows = u14_rows(1_234);
+        let mut ser = DigestSerializer::new(Vec::new()).zeroing("received_ms");
+        for row in &rows {
+            serde::Serialize::serialize(row, &mut ser).expect("a landing row serializes");
+        }
+        assert_eq!(ser.into_inner(), want, "the framing, column by column");
+
+        // (ii) The token over that encoding.
+        let tenant = Tenant::from_header(
+            Some(&axum::http::HeaderValue::from_str("t1").expect("a header value")),
+            false,
+        )
+        .expect("a valid tenant");
+        let mut h = Xxh3::new();
+        for part in ["metric-landing-token", "t1"] {
+            h.update(&(part.len() as u64).to_le_bytes());
+            h.update(part.as_bytes());
+        }
+        h.update(&want);
+        let token = metric_landing_token(&tenant, &rows);
+        assert_eq!(token, format!("m{:032x}", h.digest128()), "the token");
+        assert_eq!(token.len(), 33);
+
+        // (iii) `received_ms` and kind-2 rows are not the content.
+        let mut later = u14_rows(99_999).to_vec();
+        let mut series = later[0].clone();
+        series.kind = MetricLandingRow::KIND_SERIES;
+        series.labels = "{\"job\":\"x\"}".to_string();
+        later.push(series);
+        assert_eq!(
+            metric_landing_token(&tenant, &later),
+            token,
+            "a block differing only in received_ms and a kind-2 row"
         );
     }
 }

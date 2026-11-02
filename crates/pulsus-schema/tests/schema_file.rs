@@ -89,16 +89,16 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     assert!(text.contains("non_replicated_deduplication_window = 10000"));
 }
 
-/// The inventory, clustered: the same statements plus 20 `_dist` wrappers,
+/// The inventory, clustered: the same statements plus 21 `_dist` wrappers,
 /// `ON CLUSTER` on every one, and the macros intact.
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 76, "statement count");
+    assert_eq!(stmts.len(), 77, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        49,
-        "29 tables + 20 wrappers"
+        50,
+        "29 tables + 21 wrappers"
     );
     assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 26);
 
@@ -109,7 +109,7 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        76,
+        77,
         "every statement carries ON CLUSTER"
     );
 
@@ -284,7 +284,9 @@ fn the_file_holds_only_create_statements() {
 /// The log and trace landing wrappers are a family of their own (issue #494
 /// part 1): each routes on `cityHash64(received_ms)`, the one stamp every row
 /// of a push carries, so a push and every resend the writer makes of that
-/// block reach one shard. `metric_landing` has no wrapper.
+/// block reach one shard. `metric_landing`'s wrapper is in the metrics family
+/// (issue #494 part 1b): it routes on `cityHash64(fingerprint)`, so every row
+/// of a series reaches the shard every metrics table's wrapper names.
 ///
 /// `metric_labels` is in the metrics family (issue #623): one label row
 /// per series, keyed like the series, so its wrapper shards on the same
@@ -320,7 +322,7 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
             .split_whitespace()
             .next()
             .expect("a wrapper has a name");
-        let family = if wrapper.ends_with("_landing_dist") {
+        let family = if wrapper == "log_landing_dist" || wrapper == "trace_landing_dist" {
             "landing"
         } else if name.starts_with("metric") {
             "metrics"
@@ -348,6 +350,7 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
     }
     // F7 (issue #623): the metrics family shards by the series ID alone.
     for table in [
+        "metric_landing",
         "metric_samples",
         "metric_hist_samples",
         "metric_exemplars",
@@ -845,17 +848,21 @@ fn tables() -> Vec<Table> {
 /// document may still name the landing tables among those without a wrapper
 /// and keep the counts it cited.
 const LANDING_BANNER: &str = "\
-> **Stale on landing placement.** On a cluster `log_landing` and `trace_landing` are written
-> through their wrappers, `<landing table><PULSUS_DIST_SUFFIX>` (`log_landing_dist` at the default
-> suffix), keyed on `cityHash64(received_ms)`, so a log or trace push and the writer's resends of it reach one
-> shard; `metric_landing` is still written on the server the writer connects to, so on a cluster
-> whose servers span more than one shard a metrics read can leave out a sample stored on a different
-> shard from its series' registration (`docs/configuration.md`'s topology requirement). Landing inserts pin
-> `skip_unavailable_shards`, `prefer_localhost_replica` and `timeout_overflow_mode`, and the log and
-> trace ones also `distributed_foreground_insert` and `insert_shard_id`. Passages below that say no
-> landing table has a wrapper, or that a log or trace push is placed by the connection, are out of
-> date. Current behaviour: `schema/schema.sql`, `QuerySettings::landing_insert` and
-> `routed_landing_insert` (`crates/pulsus-clickhouse/src/settings.rs`), and `docs/configuration.md`'s
+> **Stale on landing placement and on the metrics token.** On a cluster every landing table is
+> written through its wrapper, `<landing table><PULSUS_DIST_SUFFIX>` (`log_landing_dist` at the
+> default suffix): `log_landing` and `trace_landing` keyed on `cityHash64(received_ms)`, so a log or
+> trace push and the writer's resends of it reach one shard; `metric_landing` keyed on
+> `cityHash64(fingerprint)`, so a metrics push's content insert is one block per shard its series
+> select, its descriptor insert one more block on fingerprint `0`'s shard, and all of a series' rows sit
+> on the shard every metrics table's wrapper names. A metrics push's samples, series and exemplars
+> carry an `insert_deduplication_token` derived from its tenant and content; its descriptors go in
+> an insert of their own under a minted token. Every landing insert pins
+> `distributed_foreground_insert`, `insert_shard_id`, `skip_unavailable_shards`,
+> `prefer_localhost_replica` and `timeout_overflow_mode`. Passages below that say a landing table has
+> no wrapper, that a push is placed by the connection, or that a landing token is minted for a
+> metrics block, are out of date. Current behaviour: `schema/schema.sql`,
+> `QuerySettings::landing_insert` (`crates/pulsus-clickhouse/src/settings.rs`), `metric_landing_token`
+> (`crates/pulsus-write/src/writer/push_dedup.rs`), and `docs/configuration.md`'s
 > connection-spreading section.
 ";
 
@@ -864,8 +871,8 @@ fn carries_landing_banner(name: &str) -> bool {
     doc(name).contains(LANDING_BANNER)
 }
 
-/// Every base table with no routing wrapper: `metric_landing`, the label
-/// values, `service_edges` and the cluster-wide ones. These are the exceptions three
+/// Every base table with no routing wrapper: the label values,
+/// `service_edges` and the cluster-wide ones. These are the exceptions three
 /// documents name.
 fn tables_without_a_wrapper() -> Vec<String> {
     let all = tables();
@@ -922,9 +929,9 @@ fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
     let no_wrapper = tables_without_a_wrapper();
     assert_eq!(
         no_wrapper.len(),
-        9,
-        "`metric_landing`, the label values, `service_edges` and six \
-         cluster-wide ones: {no_wrapper:?}"
+        8,
+        "the label values, `service_edges` and six cluster-wide ones: \
+         {no_wrapper:?}"
     );
     let all = tables();
     let wrapped: Vec<&String> = all.iter().filter(|t| t.wrapper).map(|t| &t.name).collect();
@@ -1008,10 +1015,9 @@ fn the_trace_sharding_key_passage_names_every_routed_trace_table() {
     }
 }
 
-/// **`metric_landing`, `metric_label_values` and `service_edges` are the
-/// only per-shard tables with no routing wrapper** (the log and trace landing
-/// tables have one since issue #494 part 1). The metrics writer inserts into
-/// `metric_landing` on the server it connects to. The label
+/// **`metric_label_values` and `service_edges` are the only per-shard tables
+/// with no routing wrapper** (the landing tables have one since issue #494
+/// parts 1 and 1b). The label
 /// values are named locally inside every statement that reads them (issue
 /// #635); `service_edges` is read only per shard, through `cluster(…,
 /// view(…))`, by the one statement that also pairs that shard's spans
@@ -1020,8 +1026,7 @@ fn the_trace_sharding_key_passage_names_every_routed_trace_table() {
 /// per-shard table added without a wrapper makes all four false at once,
 /// and reddens here rather than in a document nobody reads.
 #[test]
-fn only_the_metrics_landing_the_label_values_and_the_service_edges_are_per_shard_without_a_wrapper()
-{
+fn only_the_label_values_and_the_service_edges_are_per_shard_without_a_wrapper() {
     let cluster_wide: Vec<String> = tables()
         .into_iter()
         .filter(|t| t.cluster_wide)
@@ -1034,21 +1039,21 @@ fn only_the_metrics_landing_the_label_values_and_the_service_edges_are_per_shard
     without.sort();
     assert_eq!(
         without,
-        vec!["metric_label_values", "metric_landing", "service_edges"],
-        "a per-shard table with no routing wrapper that is not \
-         `metric_landing`, the label values or `service_edges` (read only per \
-         shard, issue #599 part A D9) falsifies the clustering claim in docs/architecture.md §7, \
+        vec!["metric_label_values", "service_edges"],
+        "a per-shard table with no routing wrapper that is not the label \
+         values or `service_edges` (read only per shard, issue #599 part A \
+         D9) falsifies the clustering claim in docs/architecture.md §7, \
          docs/schemas.md §7, docs/schemas.md's conventions preamble and \
          docs/features.md's clustering row"
     );
 }
 
 /// **Every passage on how the landing tables are written names each one
-/// with its placement** (issue #494 part 1): `docs/features.md`'s clustering
-/// row names `metric_landing` as written on the server the writer connects
-/// to, and `log_landing` and `trace_landing` as keyed on the receive stamp;
-/// the six design documents whose passages predate the change carry the
-/// banner.
+/// with its placement** (issue #494 parts 1 and 1b): every landing table has
+/// a wrapper; `docs/features.md`'s clustering row is [`CLUSTERING_CELL`],
+/// checked whole by [`the_user_documents_state_the_landing_rules`] and here
+/// for what it says of the three; the six design documents whose passages
+/// predate the change carry the banner.
 #[test]
 fn the_landing_placement_passages_name_every_landing_table() {
     let all = tables();
@@ -1058,36 +1063,20 @@ fn the_landing_placement_passages_name_every_landing_table() {
         .collect();
     assert_eq!(landing.len(), 3, "three landing tables");
     let wrapped: Vec<&String> = all.iter().filter(|t| t.wrapper).map(|t| &t.name).collect();
-    let (routed, bare): (Vec<&Table>, Vec<&Table>) =
-        landing.iter().partition(|t| wrapped.contains(&&t.name));
-    let routed: Vec<&str> = routed.iter().map(|t| t.name.as_str()).collect();
-    let bare: Vec<&str> = bare.iter().map(|t| t.name.as_str()).collect();
+    let routed: Vec<&str> = landing
+        .iter()
+        .filter(|t| wrapped.contains(&&t.name))
+        .map(|t| t.name.as_str())
+        .collect();
     assert_eq!(
         routed,
-        vec!["log_landing", "trace_landing"],
-        "the landing tables with a wrapper"
-    );
-    assert_eq!(
-        bare,
-        vec!["metric_landing"],
-        "the landing table without one"
+        vec!["log_landing", "metric_landing", "trace_landing"],
+        "every landing table has a wrapper"
     );
     let row = doc_line("features.md", "| Clustered ClickHouse |");
     assert!(
-        row.contains(
-            "every per-shard table but `metric_landing`, which the writer inserts \
-             into on the server it connects to,"
-        ),
-        "docs/features.md's clustering row must name `metric_landing` as \
-         written on the server the writer connects to: {row}"
-    );
-    assert!(
-        row.contains(
-            "the `log_landing` and `trace_landing` wrappers are keyed on the \
-             push's receive stamp"
-        ),
-        "docs/features.md's clustering row must say the log and trace landing \
-         wrappers are keyed on the receive stamp: {row}"
+        row.contains(CLUSTERING_CELL),
+        "docs/features.md's clustering row must carry the decided cell: {row}"
     );
     for name in [
         "architecture.md",
@@ -1106,22 +1095,154 @@ fn the_landing_placement_passages_name_every_landing_table() {
 
 /// `docs/configuration.md`'s `PULSUS_DIST_SUFFIX` row, whole (issue #494
 /// part 1).
-const DIST_SUFFIX_ROW: &str = "| `PULSUS_DIST_SUFFIX` | `_dist` | suffix of the Distributed tables PulsusDB names: readers query through them, and on a cluster the writer inserts every log and trace push into `log_landing` or `trace_landing` with it appended (set differently for cross-cluster read topologies, where the writing processes keep the suffix their own cluster's wrappers carry); the service graph reads the cluster and database that `spans` plus this suffix names |";
+const DIST_SUFFIX_ROW: &str = r##"| `PULSUS_DIST_SUFFIX` | `_dist` | suffix of the Distributed tables PulsusDB names: readers query through them, and on a cluster the writer inserts every log, metric and trace push into `log_landing`, `metric_landing` or `trace_landing` with it appended (set differently for cross-cluster read topologies, where the writing processes keep the suffix their own cluster's wrappers carry); the service graph reads the cluster and database that `spans` plus this suffix names |"##;
 
 /// `docs/configuration.md`'s topology requirement, whole (issue #494 part 1).
-const TOPOLOGY_REQUIREMENT: &str = "**Topology requirement:** on a cluster, every server PulsusDB inserts through — the one `CLICKHOUSE_SERVER` names, or each one `CLICKHOUSE_SERVERS` lists, and every server behind a front end at those addresses — must be a cluster member that hosts the `PULSUS_DIST_SUFFIX` wrapper tables, `log_landing` and `trace_landing`'s among them (`log_landing_dist` at the default suffix). A log or trace insert through a server without them fails. Each of those servers must hold the same definition of `PULSUS_CLUSTER` — the same shards, in the same order, with the same weights and the same replicas — and give every shard `internal_replication = true`, as the setup generator and the chart write it. Given that, a log or trace push goes through its table's wrapper, keyed on its receive stamp, so the push and every resend the writer makes of it reach one shard, and the wrapper writes one live replica of it for replication to copy to the rest. A push the client sends again that is stored as a new push (`docs/api.md` §1.0) carries a new receive stamp and may reach another shard. A server whose definition orders the shards differently may send a resend to another shard, where it is stored again; one without `internal_replication = true` writes every replica itself. PulsusDB detects neither. **A metrics push is written to `metric_landing` on the server that receives it.** When the servers PulsusDB inserts through belong to more than one shard — `CLICKHOUSE_SERVERS` lists several shards' servers, or one address is a front end that balances across shards — a writer's resend after an uncertain attempt can reach another shard and be stored there again, and a metrics read can leave out a sample stored on a different shard from its series' registration. Which queries are affected depends on how the reader executes them; exemplar queries (`/api/v1/query_exemplars`) are not affected. Neither problem occurs when every server behind every configured address belongs to one shard. For log and trace reads, spreading only changes which node coordinates the identical query.";
+const TOPOLOGY_REQUIREMENT: &str = r##"**Topology requirement:** on a cluster, every server PulsusDB inserts through — the one `CLICKHOUSE_SERVER` names, or each one `CLICKHOUSE_SERVERS` lists, and every server behind a front end at those addresses — must be a cluster member that hosts the `PULSUS_DIST_SUFFIX` wrapper tables, the three landing wrappers among them (`log_landing_dist`, `metric_landing_dist` and `trace_landing_dist` at the default suffix). An insert through a server without them fails. Each of those servers must hold the same definition of `PULSUS_CLUSTER` — the same shards, in the same order, with the same weights and the same replicas — and give every shard `internal_replication = true`, as the setup generator and the chart write it. Given that, a log or trace push goes through its table's wrapper, keyed on its receive stamp, so the push and every resend the writer makes of it reach one shard; a push the client sends again that is stored as a new push (`docs/api.md` §1.0) carries a new receive stamp and may reach another shard. A metrics push goes through `metric_landing`'s wrapper, keyed on each series' fingerprint — the key of every metrics table's wrapper — so all of a series' rows sit on one shard, and every resend of the push reaches the same shards whichever writer sends it. Each wrapper writes one live replica of a block for replication to copy to the rest. A server whose definition orders the shards differently may send a resend to another shard, where it is stored again; one without `internal_replication = true` writes every replica itself. PulsusDB detects neither. For reads, spreading only changes which node coordinates the identical query."##;
 
 /// `docs/api.md` §1.0's paragraph on a log push answered `500` after part of
 /// it was stored (issue #494 part 1).
 const PARTIAL_LOG_PUSH: &str = "**A synchronous log push can be answered `500` after part of it is stored.** On `POST /v1/logs` and the log push of §8.2, a failure inside ClickHouse after the push's landing rows are written can leave some of its entries, and some of what is derived from them, stored while the push is answered `500`. A resend the client makes that is stored as a new push (see the tables above) carries a new token and can store that part again.";
 
-/// **The user documents say what the routed log and trace landing insert
-/// changes, in the words decided for them** (issue #494 part 1): the
-/// `PULSUS_DIST_SUFFIX` row and the topology requirement in
-/// `docs/configuration.md` are each exactly that text, and `docs/api.md`
-/// §1.0 carries the partial log push paragraph after its cost paragraph.
+/// `docs/api.md` §1.0's two metrics paragraphs, after the partial log push
+/// paragraph (issue #494 part 1b).
+const METRICS_PUSH_PARAGRAPHS: &str = r##"**How a metrics push is written.** A metrics push makes zero, one or two inserts into `metric_landing`. Its samples, histogram samples and exemplars, with their series' registrations, are its **samples insert**; descriptors in the request that its writer has not sent in the hour are **due**, and go in its **descriptors insert**, whether or not the request's points were accepted. A push is first checked against the writer's state and its size: a writer shutting down, or a suppression index or its waiters at their bound, answers `429`; a reused `Idempotency-Key` answers `400`; a push over its size ceiling answers `413`; each makes no insert. Otherwise:
+
+| the push | inserts | answered by |
+|---|---|---|
+| samples, nothing due | the samples insert | its outcome |
+| samples and due descriptors | both; the descriptors insert after the samples insert | the samples insert's outcome; a failure of the descriptors insert does not fail the push, and the writer sends those descriptors again with its next push that carries them |
+| due descriptors only, every point rejected or none sent | the descriptors insert | its outcome |
+| nothing to insert | none | success |
+| a repeat the writer's suppression index recognises (above), nothing due | none | the original push's answer, once the original has settled |
+| a repeat, with due descriptors, and room in the queue for their insert | the descriptors insert, which the answer does not wait for | the original push's answer, once the original has settled |
+| a repeat, with due descriptors, and no room for their insert | none | `429` |
+| any other push whose inserts cannot be reserved in the queue | none | `429` |
+
+A synchronous push is answered as the last column says; one sent with `X-Pulsus-Async: 1` is answered `202` once admitted. On a cluster ClickHouse divides the samples insert into one block per shard its series select, and the descriptors insert is one block on one shard.
+
+**A metrics push has a second guard, in ClickHouse.** Its samples insert's `insert_deduplication_token` is derived from its tenant and the sample, histogram sample and exemplar rows it inserts, every column of them with the receive time set to zero, and never from `Idempotency-Key`. So the same content sent again, to any writer process, after `PULSUS_INGEST_DEDUP_WINDOW` or with `PULSUS_INGEST_DEDUP=false`, stores no sample, histogram sample, exemplar or series a second time while ClickHouse still remembers the token ([configuration.md](configuration.md), `PULSUS_METRICS_DEDUP_WINDOW`), and two pushes of identical parsed content store their samples, histogram samples, exemplars and series once; their descriptors may be stored twice, and `/api/v1/metadata` shows one. The staging table `metric_landing`, whose rows no query returns (its one reader, the first rollup level's build, removes the copies), may hold a resend received in a later hour a second time until `PULSUS_METRICS_LANDING_RETENTION_HOURS` drops it. If a shard refuses its block of the samples insert, a synchronous push is answered `500` and one sent with `X-Pulsus-Async: 1` has already been answered `202` at admission, and either way the other shards may keep theirs; sending the same push again stores the refused part without storing the kept part twice, within the same limit. The descriptors insert carries a token minted for it. The writer sends a descriptor about once an hour, and again after an insert of it failed or ended unconfirmed, or after the writer restarts, so the stored table may hold a descriptor more than once until ClickHouse merges the copies; `/api/v1/metadata` reports each descriptor once, and a descriptor a client keeps sending never expires."##;
+
+/// `docs/api.md`'s `Idempotency-Key` row, its third cell (issue #494 part 1b).
+const IDEMPOTENCY_KEY_CELL: &str = r##"issue #494, extended to the trace push by issue #586. Namespaces a push's identity in the writer process's suppression index (§1.0), while that index is on and still holds the key — until `PULSUS_INGEST_DEDUP_WINDOW` has passed: two requests with **different** keys are then two pushes whatever they carry, and the same key with the same content is one push. The same key carrying **different** content is then a client error — `400`, and nothing is stored. At another writer process, after the window, or with `PULSUS_INGEST_DEDUP=false`, the key decides nothing. Absent, a push is identified by its own content. Two tenants' identical log, metric or trace pushes, with or without one key, are two pushes. A metrics push's deduplication token in ClickHouse never reads the key, so a metrics push of the same parsed content stores its samples, series and exemplars once whatever its key (§1.0). Read on every ingest route, `/v1/traces` and the Zipkin receiver included"##;
+
+/// `docs/features.md`'s clustering row, its second cell (issue #494 part 1b).
+const CLUSTERING_CELL: &str = r##"Replicated engines; Distributed tables over every per-shard table but `metric_label_values`, which every statement names locally, and `service_edges`, which the service graph reads only per shard, and none over the cluster-wide catalogue tables; the `log_landing` and `trace_landing` wrappers are keyed on the push's receive stamp, so a log or trace push and every resend the writer makes of it reach one shard, and the `metric_landing` wrapper on each series' fingerprint, so all of a series' rows sit on one shard; shard-local pushdown for traces, and for logs the reads that do not need a fingerprint's rows to be whole on one shard"##;
+
+/// Every other edit of the user documents (issue #494 part 1b): the document,
+/// the text it replaced (`None` for an insertion), and the new text.
+const USER_DOC_EDITS: &[(&str, Option<&str>, &str)] = &[
+    (
+        "configuration.md",
+        Some(
+            r##"A window of `W` blocks covers a steady rate of `W / 120` pushes a second, the landing insert's budget being 120 s: **83** at the default and **8333** at the maximum, rounding down. Above that a block's token can be evicted before its resend arrives."##,
+        ),
+        r##"It sets ClickHouse's deduplication window for these tables — `replicated_deduplication_window` on a cluster, `non_replicated_deduplication_window` on a single node — which counts blocks as ClickHouse defines them (ClickHouse's documentation of those two MergeTree settings); [api.md §1.0](api.md) says how many inserts a metrics push makes."##,
+    ),
+    (
+        "configuration.md",
+        Some(
+            r##"no seconds-based counterpart there — a block is remembered until that many newer blocks have arrived and is never forgotten on a timer, which is the safe direction for a resend."##,
+        ),
+        r##"no seconds-based counterpart there."##,
+    ),
+    (
+        "configuration.md",
+        None,
+        r##" A metrics push's token is derived from its tenant and parsed content, so the window also covers a client's resend of the same push, to any PulsusDB process: no sample, series or exemplar is stored twice, and only `metric_landing` itself, whose rows no query returns (its one reader, the first rollup level's build, removes the copies), may hold a resend received in a later hour until `PULSUS_METRICS_LANDING_RETENTION_HOURS` drops it. A push's descriptors carry a token of their own, so `metric_metadata` may hold a descriptor more than once; `/api/v1/metadata` reports it once ([api.md §1.0](api.md))."##,
+    ),
+    (
+        "configuration.md",
+        Some(r##"because a push is one insert of one block and is never split"##),
+        r##"because no push's samples, lines or spans are divided among inserts ([api.md §1.0](api.md) says how a metrics push is written)"##,
+    ),
+    (
+        "configuration.md",
+        Some(r##"; `false` restores the doubling"##),
+        r##"; `false` restores the doubling for logs and traces, while a metrics push keeps the guard in ClickHouse that [api.md §1.0](api.md) describes"##,
+    ),
+    (
+        "configuration.md",
+        Some(
+            r##"A byte-identical push arriving after this has elapsed is a new push and is stored."##,
+        ),
+        r##"A content-identical push arriving after this has elapsed is a new push and is stored, a metrics push only if ClickHouse no longer remembers its token ([api.md §1.0](api.md))."##,
+    ),
+    (
+        "configuration.md",
+        Some(r##"the same minted `insert_deduplication_token`"##),
+        r##"the same `insert_deduplication_token` — for a content block derived from the push's tenant and the sample, histogram sample and exemplar rows it inserts, for a descriptor block minted for it —"##,
+    ),
+    (
+        "configuration.md",
+        Some(
+            r##"— one whole landing block, its rows, its settings and its claim — and holds it until its block has committed or has been spooled"##,
+        ),
+        r##"— each landing insert it makes ([api.md §1.0](api.md)), its rows, its settings and its claim; a metrics push that makes two is admitted only if both fit — and holds each insert's charge until that insert has committed or has been spooled"##,
+    ),
+    (
+        "configuration.md",
+        Some(
+            r##"never split — two blocks can commit a prefix, and a prefix is not all-or-nothing."##,
+        ),
+        r##"never divided among inserts — two inserts of one push's samples could commit a prefix, and a prefix is not all-or-nothing ([api.md §1.0](api.md) says how a metrics push is written)."##,
+    ),
+    (
+        "api.md",
+        Some(r##"`PULSUS_INGEST_DEDUP=false` restores the old behaviour."##),
+        r##"`PULSUS_INGEST_DEDUP=false` turns this index off, which restores the old behaviour for logs and traces; a metrics push keeps the guard in ClickHouse described below."##,
+    ),
+    (
+        "api.md",
+        Some(r##"stored — it is a new push"##),
+        r##"stored — it is a new push; a metrics push only if ClickHouse no longer remembers its token (below)"##,
+    ),
+    (
+        "api.md",
+        Some(r##"stored. The index is per process"##),
+        r##"stored, except a metrics push ClickHouse still remembers (below). The index is per process"##,
+    ),
+    (
+        "api.md",
+        Some(
+            r##"— for logs and metrics, also if an insert's fate is unknown — or **released** if none did; for traces, any failed insert releases it, and a push with no rows is released at once."##,
+        ),
+        r##"— for logs, also if an insert's fate is unknown — or **released** if none did. For metrics, a failed or uncertain insert of the one insert that answers the push (§1.0, how a metrics push is written) releases it; the push's other insert carries no claim. For traces, any failed insert releases it, and a trace push with no rows is released at once."##,
+    ),
+    (
+        "api.md",
+        Some(
+            r##"refuse a push that does not fit one block, whole (issues #603 and #586).** Each is stored as one `INSERT` of one block into one table, and it is never split: two blocks can commit a prefix, and a prefix is not all-or-nothing."##,
+        ),
+        r##"refuse a push over its size ceiling, whole (issues #603 and #586).** A log or trace push is stored as one `INSERT` of one block into one table; how a metrics push is written is §1.0's. No push's samples, lines or spans are divided among inserts: two inserts of them could commit a prefix, and a prefix is not all-or-nothing."##,
+    ),
+    (
+        "api.md",
+        Some(r##"`413` for a push that does not fit one block (above)"##),
+        r##"`413` for a push over its size ceiling (above)"##,
+    ),
+    (
+        "api.md",
+        Some(r##"**A push that does not fit one block is `413` here too**"##),
+        r##"**A push over its size ceiling is `413` here too**"##,
+    ),
+    (
+        "api.md",
+        Some(r##"is written in the same insert into `metric_landing` as the rest of its push"##),
+        r##"is written in the push's samples insert (§1.0, how a metrics push is written)"##,
+    ),
+];
+
+/// **The user documents state the landing rules in the words decided for
+/// them** (issues #494 parts 1 and 1b): the `PULSUS_DIST_SUFFIX` row and the
+/// topology requirement in `docs/configuration.md` are each exactly that
+/// text; `docs/api.md` §1.0 carries, after its cost paragraph, the partial
+/// log push paragraph and then the two metrics paragraphs; the
+/// `Idempotency-Key` row's third cell and `docs/features.md`'s clustering
+/// cell are that text; and every other edit's line holds its new text and not
+/// its old one outside the new.
 #[test]
-fn the_user_documents_state_what_a1_changes() {
+fn the_user_documents_state_the_landing_rules() {
     let config = doc("configuration.md");
     let rows: Vec<&str> = config
         .lines()
@@ -1147,11 +1268,41 @@ fn the_user_documents_state_what_a1_changes() {
     let cost = section
         .find("**What it costs.**")
         .expect("docs/api.md §1.0 says what it costs");
+    let log = cost
+        + section[cost..]
+            .find(PARTIAL_LOG_PUSH)
+            .expect("docs/api.md §1.0 carries the partial log push paragraph after its cost one");
     assert!(
-        section[cost..].contains(PARTIAL_LOG_PUSH),
-        "docs/api.md §1.0 must carry the partial log push paragraph after \
-         \"**What it costs.**\""
+        section[log..].contains(METRICS_PUSH_PARAGRAPHS),
+        "docs/api.md §1.0 must carry the two metrics paragraphs after the log one"
     );
+    let key_row = doc_line("api.md", "| `Idempotency-Key` |");
+    let cells: Vec<&str> = key_row.split(" | ").collect();
+    assert_eq!(cells.len(), 3, "the `Idempotency-Key` row: {key_row}");
+    assert_eq!(
+        cells[2].strip_suffix(" |"),
+        Some(IDEMPOTENCY_KEY_CELL),
+        "docs/api.md's `Idempotency-Key` row, its third cell"
+    );
+    let features = doc_line("features.md", "| Clustered ClickHouse |");
+    let cells: Vec<&str> = features.split(" | ").collect();
+    assert_eq!(cells.len(), 3, "the clustering row: {features}");
+    assert_eq!(
+        cells[1], CLUSTERING_CELL,
+        "docs/features.md's clustering cell"
+    );
+    for (name, old, new) in USER_DOC_EDITS {
+        // The one line holding the new text; the replaced text must be gone
+        // from that line, though a sibling row may still say it of another
+        // signal.
+        let line = doc_line(name, new);
+        if let Some(old) = old {
+            assert!(
+                !line.replace(new, "").contains(old),
+                "docs/{name} still carries the replaced text on its line: {old}"
+            );
+        }
+    }
 }
 
 /// **The two passages that carry the claim without the list say where the
@@ -3307,14 +3458,14 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             vec![],
             vec!["--mode", "single"],
             single(),
-            "3f9ac2b1a9f9206e9e3018d22b6ceac62edfd6ddc0c7ab77b23aadc7aed1c97f",
+            "4ddf6319dc38d3b39fe7a111e08f913da48b048bf564dc1901574bad4ba723e9",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "c973f150b37592c821dc3a3f86391f96b97ad764b5a38899d3603eec1f72da57",
+            "2bf3a3ce69e9f905d14f0d267da81922322130fb4d578711da2db6c4c1a2b893",
         ),
         (
             "clustered with a storage policy",
@@ -3324,7 +3475,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "60f604f78480722fbc5ca80fd37b63b70c2990ccd1b02a8347edd429dab8d1b4",
+            "7605b1f2a96d9232badc51de4abaa7ebbf748059ff9eb670fbfdc94229965cb3",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
