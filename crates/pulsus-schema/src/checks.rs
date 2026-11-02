@@ -282,12 +282,10 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
     // how the block's bytes are read, a limit that refuses a block rather
     // than dividing it, what path a value is stored under, and how the views
     // run; `QuerySettings::trace_landing_insert` names them and quotes what
-    // each one's own catalogue entry says. Two — what an acknowledgement
-    // means and where a row is placed — the log and trace landing inserts
-    // pin since issue #494 part 1, and `QuerySettings::routed_landing_insert`
-    // names them. The third — whether exceeding the deadline is an error —
-    // every landing insert pins, metrics included, and
-    // `QuerySettings::landing_insert` names it. A pin added to either
+    // each one's own catalogue entry says. Three — what an acknowledgement
+    // means, where a row is placed, and whether exceeding the deadline is an
+    // error — every landing insert pins since issue #494 part 1b, metrics
+    // included, and `QuerySettings::landing_insert` names them. A pin added to either
     // without a row here is caught by the two
     // `the_settings_read_back_at_startup_are_the_ones_*` cases, which derive
     // their directions rather than carrying a list.
@@ -671,10 +669,10 @@ mod tests {
     /// A server too old to carry them is refused by its version, which is a
     /// separate check.
     ///
-    /// **The logs landing path widens neither side** (issue #603): its insert
-    /// pins the same set the metrics one does (`QuerySettings::landing_insert`),
-    /// and its read path sends no query setting at all — the discovery reads dispatch
-    /// with the budget settings and nothing more. `the_discovery_reads_send_no_distributed_product_mode`
+    /// **The logs landing path widens neither side** (issue #603): every
+    /// landing insert pins the same set (`QuerySettings::landing_insert`), and
+    /// its read path sends no query setting at all — the discovery reads
+    /// dispatch with the budget settings and nothing more. `the_discovery_reads_send_no_distributed_product_mode`
     /// (`crates/pulsus-read/src/logql/exec.rs`) asserts the other side of
     /// that.
     #[test]

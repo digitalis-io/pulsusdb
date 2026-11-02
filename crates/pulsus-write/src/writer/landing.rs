@@ -81,8 +81,7 @@ pub fn landing_block_overhead_bytes<R>() -> u64 {
 const WIDEST_TOKEN: &str = "00000000-0000-7000-8000-000000000000";
 
 /// The bytes the widest landing settings set allocates, measured on the
-/// sets themselves: [`QuerySettings::landing_insert`] (metrics),
-/// [`QuerySettings::routed_landing_insert`] (logs) and
+/// sets themselves: [`QuerySettings::landing_insert`] (metrics and logs) and
 /// [`QuerySettings::trace_landing_insert`], each at [`WIDEST_TOKEN`] and at
 /// every signal's row floor and ceiling, the most any of them allocates.
 /// Built once and kept.
@@ -101,7 +100,6 @@ pub fn landing_settings_charge() -> u64 {
             .flat_map(|&rows| {
                 [
                     QuerySettings::landing_insert(WIDEST_TOKEN, rows),
-                    QuerySettings::routed_landing_insert(WIDEST_TOKEN, rows),
                     QuerySettings::trace_landing_insert(WIDEST_TOKEN, rows),
                 ]
             })
@@ -111,11 +109,11 @@ pub fn landing_settings_charge() -> u64 {
     })
 }
 
-/// What the queue is charged for a push whose landing rows price `row_bytes`.
-/// **One figure prices a push**: the per-push byte ceiling refuses against it,
-/// `reserve_queued_bytes` takes it, whichever ending settles releases it and
-/// `record_flush` reports it, so no two halves of the accounting can drift
-/// apart.
+/// What the queue is charged for one landing block whose rows price
+/// `row_bytes`. **One figure prices a block**: the per-push byte ceiling
+/// refuses against the sum over a push's blocks, `reserve_queued_bytes` takes
+/// that sum, whichever ending settles a block releases its own, and
+/// `record_flush` reports it.
 pub fn landing_charge<R>(row_bytes: u64) -> u64 {
     row_bytes + landing_block_overhead_bytes::<R>()
 }

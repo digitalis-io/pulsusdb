@@ -634,7 +634,7 @@ impl LogWriter {
         let block = LandingBlock::seal(
             rows,
             bytes,
-            QuerySettings::routed_landing_insert(&token, self.shared.ctx.max_rows),
+            QuerySettings::landing_insert(&token, self.shared.ctx.max_rows),
             claim,
             waiter,
             admitted_at,

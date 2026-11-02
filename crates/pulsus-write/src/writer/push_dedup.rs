@@ -525,8 +525,26 @@ fn identity_from(
 /// kind-3 rows, which go in a block of their own, are not in it. It never
 /// reads the `Idempotency-Key`.
 pub(crate) fn metric_landing_token(tenant: &Tenant, rows: &[MetricLandingRow]) -> String {
-    let _ = (tenant, rows);
-    crate::writer::landing::mint_landing_token(&mut crate::writer::table::XorShift64::seeded())
+    let mut hasher = Xxh3::new();
+    for part in ["metric-landing-token", tenant.as_str()] {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    {
+        let mut ser = DigestSerializer::new(HashSink(&mut hasher)).zeroing("received_ms");
+        for row in rows.iter().filter(|r| {
+            matches!(
+                r.kind,
+                MetricLandingRow::KIND_FLOAT
+                    | MetricLandingRow::KIND_HIST
+                    | MetricLandingRow::KIND_EXEMPLAR
+            )
+        }) {
+            serde::Serialize::serialize(row, &mut ser)
+                .expect("a landing row serializes into the digest");
+        }
+    }
+    format!("m{:032x}", hasher.digest128())
 }
 
 /// The digest's sink: an [`Xxh3`] fed through `io::Write`.
@@ -589,13 +607,15 @@ impl<W: std::io::Write> DigestSerializer<W> {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn into_inner(self) -> W {
         self.sink
     }
 
     fn put(&mut self, bytes: &[u8]) -> Result<(), DigestError> {
-        let _ = bytes;
-        Ok(())
+        self.sink
+            .write_all(bytes)
+            .map_err(|e| DigestError(e.to_string()))
     }
 
     fn len(&mut self, len: Option<usize>) -> Result<(), DigestError> {
@@ -604,7 +624,7 @@ impl<W: std::io::Write> DigestSerializer<W> {
     }
 }
 
-impl<'a, W: std::io::Write> serde::Serializer for &'a mut DigestSerializer<W> {
+impl<W: std::io::Write> serde::Serializer for &mut DigestSerializer<W> {
     type Ok = ();
     type Error = DigestError;
     type SerializeSeq = Self;
@@ -1942,8 +1962,10 @@ impl ClaimTicket {
     /// throws leaves its own target empty while the source and its siblings
     /// may have committed — `docs/ingest-one-source-table.md` §9 D1), so
     /// confirming the claim would suppress the only push that can fill the
-    /// empty target. The log and metric blocks are not replay-safe: a
-    /// repeated sample doubles `count_over_time`.
+    /// empty target. The metric block is one too, for another reason: its
+    /// token is derived from its content, so a retry is dropped by the tables
+    /// that kept it. The log block is not replay-safe: a repeated sample
+    /// doubles `count_over_time`.
     pub(crate) fn replay_safe(mut self) -> Self {
         self.replay_safe = true;
         self

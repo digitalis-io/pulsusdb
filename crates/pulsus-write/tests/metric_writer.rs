@@ -2636,12 +2636,13 @@ async fn the_queue_byte_allowance_is_aggregate_across_pushes() {
             PushHeaders::default(),
         )
         .expect("queue has room now");
+    // Its descriptor was sent by the three pushes before it, so it is its
+    // content block alone (issue #494 part 1b).
     inserter.release_one();
-    inserter.release_one();
-    settle_until(|| inserter.call_count() >= 8).await;
+    wait_for(|| inserter.call_count() >= 7).await;
     assert_eq!(
         inserter.call_count(),
-        8,
+        7,
         "a refusal that sealed the claim would make this a suppressed duplicate"
     );
     assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 0);
@@ -3396,16 +3397,67 @@ async fn one_request_in_either_encoding_carries_one_token() {
             .expect("within the expansion budget");
         assert_eq!(batch.samples.len(), 1, "encoding {i}: one sample");
         let root = spool_root(&format!("encodings-{i}"));
-        let inserter = MockInserter::always(Act::Ok);
-        let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
+        // A recorder of the rows' kinds and the token: a parsed request's
+        // fingerprints are full 128-bit values, which `MockInserter`'s JSON
+        // copy of a row cannot hold.
+        let inserter = Arc::new(TokenRecorder::default());
+        let writer = MetricWriter::with_landing_inserter_and_runtime(
+            inserter.clone(),
+            runtime_at(&WriterConfig::default(), &root),
+            BUCKET_MS,
+            MetricWriterTables::metrics_default(),
+        );
         answer_of(&writer, &no_tenant(), batch, PushHeaders::default())
             .await
             .expect("commits");
         writer.shutdown(Duration::from_secs(2)).await;
-        tokens.push(content_token(&inserter));
+        let content: Vec<String> = inserter
+            .calls
+            .lock()
+            .expect("mutex")
+            .iter()
+            .filter(|(kinds, _)| kinds.contains(&MetricLandingRow::KIND_FLOAT))
+            .map(|(_, token)| token.clone())
+            .collect();
+        assert_eq!(content.len(), 1, "encoding {i}: one content block");
+        tokens.push(content[0].clone());
         std::fs::remove_dir_all(&root).ok();
     }
     assert_eq!(tokens[0], tokens[1], "protobuf and JSON carry one token");
+}
+
+/// A `BlockInserter` that records each call's row kinds and token, then
+/// answers `Ok`.
+#[derive(Default)]
+struct TokenRecorder {
+    calls: Mutex<Vec<(Vec<u8>, String)>>,
+}
+
+impl BlockInserter<MetricLandingRow> for TokenRecorder {
+    fn insert<'a>(
+        &'a self,
+        table: &'a str,
+        rows: &'a [MetricLandingRow],
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+        self.insert_with(table, rows, &QUERY_SETTINGS_NONE)
+    }
+
+    fn insert_with<'a>(
+        &'a self,
+        _table: &'a str,
+        rows: &'a [MetricLandingRow],
+        extra: &'a QuerySettings,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+        let token = extra
+            .get("insert_deduplication_token")
+            .unwrap_or_default()
+            .to_string();
+        self.calls
+            .lock()
+            .expect("mutex")
+            .push((rows.iter().map(|r| r.kind).collect(), token));
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// **2-U9 (issue #494 part 1b): a push's descriptors go in a block of their
@@ -3952,7 +4004,12 @@ async fn a_suppressed_repeats_descriptors_need_room_of_their_own() {
     writer
         .admit(&no_tenant(), mixed_push_n(), PushHeaders::default())
         .expect("G is admitted");
-    wait_for(|| writer.metrics().queue_bytes == content + descriptor).await;
+    wait_for(|| inserter.calls.load(Ordering::SeqCst) == 4).await;
+    assert_eq!(
+        writer.metrics().queue_bytes,
+        content + descriptor,
+        "G's two blocks are held"
+    );
     let calls = inserter.calls.load(Ordering::SeqCst);
 
     let refused = writer.admit_flush(

@@ -4050,10 +4050,11 @@ const CH_DEFAULT_MAX_BLOCK_SIZE: u64 = 65_409;
 /// ClickHouse's default `distributed_product_mode='deny'` (Code 288,
 /// `DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
 ///
-/// `local` is exact here (not merely permissive): one kind-2 landing row
-/// writes a series' activity row and its label row on the node that received
-/// the push, and that node's samples beside them, so the rows one shard-local
-/// read pairs are the rows that belong together — the same precedent already
+/// `local` is exact here (not merely permissive): every landing row of a
+/// series — its registration, samples, histogram samples and exemplars — is
+/// stored on the shard `cityHash64(fingerprint)` selects (`metric_landing`'s
+/// wrapper), so the rows one shard-local read pairs are all of that series'
+/// rows — the same precedent already
 /// applied to the traces metrics semi-join (`crate::traces::exec::
 /// metrics_settings`, issue #59). Not applied to the `Chunks`/`Multi` sample
 /// fetches, which nest nothing — a blanket client-wide default would let a
