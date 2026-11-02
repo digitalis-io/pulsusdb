@@ -305,6 +305,11 @@ pub const TRACE_LANDING_MAX_ROWS_FLOOR: u64 = 1_000;
 /// See [`TRACE_LANDING_MAX_ROWS_FLOOR`].
 pub const TRACE_LANDING_MAX_ROWS_CEILING: u64 = 10_000_000;
 
+/// `writer.landing_batch_ms` — how long a landing worker forms a log or
+/// trace batch (issue #494 part 2). Ten seconds at most: a sync push waits up
+/// to this long before its insert begins, inside its 120 s landing budget.
+pub const LANDING_BATCH_MS_CEILING: u64 = 10_000;
+
 /// `reader.cache_max_series` — the matched-set / IN-list cardinality
 /// guards (`metrics/labels.rs`'s `matched.len() as u64 > cap` sites).
 /// 1000x the default of 50_000; kept below
@@ -671,6 +676,15 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             TRACE_LANDING_MAX_ROWS_FLOOR,
             TRACE_LANDING_MAX_ROWS_CEILING,
             "rows",
+        ));
+    }
+    if cfg.writer.landing_batch_ms > LANDING_BATCH_MS_CEILING {
+        return Err(range_err(
+            "writer.landing_batch_ms",
+            cfg.writer.landing_batch_ms,
+            0,
+            LANDING_BATCH_MS_CEILING,
+            "ms",
         ));
     }
 

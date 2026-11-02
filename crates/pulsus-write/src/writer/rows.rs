@@ -280,6 +280,12 @@ pub struct LogLandingRow {
 pub const LOG_LANDING_ROW_SLOT_BYTES: u64 = std::mem::size_of::<LogLandingRow>() as u64;
 
 impl LogLandingRow {
+    /// Sets the receive stamp: a landing batch's rows all take its first
+    /// member's (issue #494 part 2).
+    pub fn set_received_ms(&mut self, received_ms: i64) {
+        self.received_ms = received_ms;
+    }
+
     /// What the ingest queue is charged for one landing row whose kind's
     /// target estimator priced its owned text at `target_bytes`.
     ///
@@ -2498,6 +2504,12 @@ pub struct TraceLandingRow {
 pub const TRACE_LANDING_ROW_SLOT_BYTES: u64 = std::mem::size_of::<TraceLandingRow>() as u64;
 
 impl TraceLandingRow {
+    /// Sets the receive stamp: a landing batch's rows all take its first
+    /// member's (issue #494 part 2).
+    pub fn set_received_ms(&mut self, received_ms: i64) {
+        self.received_ms = received_ms;
+    }
+
     /// A span, whose targets are `spans` and `traces`.
     pub const KIND_SPAN: u8 = 0;
     /// A resource, whose target is `resources`.

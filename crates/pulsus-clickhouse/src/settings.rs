@@ -493,6 +493,16 @@ impl QuerySettings {
     /// | `skip_unavailable_shards` | `0` | **a shard is never skipped.** The engine has a skip path for an unreachable shard or a missing remote table (`src/Storages/Distributed/DistributedSink.cpp:105-129` at `v26.8.21.10-lts`); at `1` a skipped shard would make the insert succeed with nothing stored. Measured on 26.8, the insert failed with code 279 at both values; the pin holds whatever a profile sets |
     /// | `prefer_localhost_replica` | `0` | **the coordinator's own replica is not special.** At the default `1` a coordinator that is a replica of the target shard writes only locally and never tries the peer: measured on 26.8 with the local replica's table detached, the insert answered code 60. At `0` it writes one live replica of the shard |
     /// | `timeout_overflow_mode` | `throw`, its own declared default | **whether running past the deadline is an error or a success that need not be complete.** Pinned on traces first, and on logs and metrics since issue #494 part 1: `PULSUS_QUERY_TIMEOUT` accepts a value as small as one second. Every insert this client makes carries `max_execution_time` (`ChClient::insert_settings_with`). Measured on 26.8.21.10, one source table with two views, one of them slower than a one-second `max_execution_time`: under `break` the insert **succeeded** with the slow view's target empty; under `throw` it failed with `Code: 159`. Pinned so a profile cannot turn a slow view into a silent loss |
+    ///
+    /// Two more, on every landing insert since issue #494 part 2, when log
+    /// and metrics pushes gained the 100-date admission ceiling traces had:
+    /// a log line's, a metric sample's and a span's dates each feed a table
+    /// partitioned by UTC day.
+    ///
+    /// | setting | pinned to | why |
+    /// |---|---|---|
+    /// | `max_partitions_per_insert_block` | `100` | **a limit that refuses a block rather than dividing it.** `spans`, `traces` and `resources` are partitioned by UTC day, so a view's insert touches one part per day the push's spans fall in. A profile that lowered this to 1 would fail every push that straddles midnight |
+    /// | `throw_on_max_partitions_per_insert_block` | `1` | the same limit's other half. At `0` the server does not store part of the block: the throw in `MergeTreeDataWriter::buildScatterSelector` sits inside the row loop behind `&& throw_on_limit`, so with it false the loop completes the selector over every row and the whole block is accepted, one part per partition, with a warning. **What `0` costs is the ceiling, not the block** — the admission date gate would then be refusing pushes the server would have taken. Pinned so the gate and the engine cannot disagree about the same limit |
     pub fn landing_insert(token: &str, max_rows: u64) -> Self {
         Self::deduplicate_through_views()
             .set("insert_deduplication_token", token)
@@ -512,11 +522,16 @@ impl QuerySettings {
             .set("skip_unavailable_shards", 0)
             .set("prefer_localhost_replica", 0)
             .set("timeout_overflow_mode", "throw")
+            .set(
+                "max_partitions_per_insert_block",
+                MAX_PARTITIONS_PER_INSERT_BLOCK,
+            )
+            .set("throw_on_max_partitions_per_insert_block", 1)
     }
 
     /// The settings every insert of one traces landing block carries (issues
-    /// #584 to #586): [`Self::landing_insert`] whole, plus **seven further
-    /// pins of four classes the metrics set did not need**.
+    /// #584 to #586): [`Self::landing_insert`] whole, plus **five further
+    /// pins of three classes the metrics set did not need**.
     ///
     /// The rule behind the set, stated once so it does not grow without
     /// bound: **pin what a profile could use to make an answer wrong or a
@@ -537,8 +552,6 @@ impl QuerySettings {
     /// |---|---|---|
     /// | `input_format_binary_read_json_as_string` | `0` | **how the block's bytes are read.** At `1` the server reads a `JSON` column from RowBinary as a JSON *string*, and the writer sends the native binary form. A profile that set it would make every trace push fail, or store the encoder's bytes as text |
     /// | `format_binary_max_object_size` | `100000` | the same class: it bounds the paths one JSON value may carry in RowBinary. A profile that lowered it would refuse spans the decode gate admitted, after the block was sent. The decode gate and this pin carry the **same constant**, so neither can admit what the other refuses |
-    /// | `max_partitions_per_insert_block` | `100` | **a limit that refuses a block rather than dividing it.** `spans`, `traces` and `resources` are partitioned by UTC day, so a view's insert touches one part per day the push's spans fall in. A profile that lowered this to 1 would fail every push that straddles midnight |
-    /// | `throw_on_max_partitions_per_insert_block` | `1` | the same limit's other half. At `0` the server does not store part of the block: the throw in `MergeTreeDataWriter::buildScatterSelector` sits inside the row loop behind `&& throw_on_limit`, so with it false the loop completes the selector over every row and the whole block is accepted, one part per partition, with a warning. **What `0` costs is the ceiling, not the block** — the admission date gate would then be refusing pushes the server would have taken. Pinned so the gate and the engine cannot disagree about the same limit |
     /// | `parallel_view_processing` | `1` | **how the views run.** The server's default is `0`, which runs the landing table's eight views one after another inside each insert, so a sync push waits for their sum. At `1` they run concurrently. Measured on the local cluster (26.8.21.10) with four insert workers: the landing insert's p50 fell from 212 ms to 85 ms and one writer's sustained rate rose from 12.3 to 19.8 pushes a second. Each view still deduplicates its own block by the insert's token, so a retry stores nothing twice whatever order the views ran in |
     /// | `json_type_escape_dots_in_keys` | `0` | **what path a value is stored under.** Its description says it escapes dots "during parsing", and this path sends paths in the binary form rather than parsing text — but nothing read here establishes that the binary form is unaffected, and if it were affected every stored path would differ from what the encoder renders. Pinned because the question is open, not because the effect is known |
     /// | `type_json_skip_duplicated_paths` | `0` | the block-forming class again. At `1` a repeated path in one value "will be ignored and only the first one will be inserted instead of an exception" — the same result the writer's own per-scope deduplication produces, which is why it must stay the **only** mechanism: at `1` a writer that emitted a duplicate would be silently absorbed instead of erroring |
@@ -555,11 +568,6 @@ impl QuerySettings {
         Self::landing_insert(token, max_rows)
             .set("input_format_binary_read_json_as_string", 0)
             .set("format_binary_max_object_size", MAX_JSON_PATHS_PER_VALUE)
-            .set(
-                "max_partitions_per_insert_block",
-                MAX_PARTITIONS_PER_INSERT_BLOCK,
-            )
-            .set("throw_on_max_partitions_per_insert_block", 1)
             .set("parallel_view_processing", 1)
             .set("json_type_escape_dots_in_keys", 0)
             .set("type_json_skip_duplicated_paths", 0)
@@ -879,7 +887,7 @@ mod tests {
         );
         assert_eq!(
             s.entries().count(),
-            19,
+            21,
             "the pinned set is closed: a setting added to it without a row in \
              landing_insert's table, and without its required-name entry, is \
              a name sent on somebody's memory"
@@ -907,6 +915,18 @@ mod tests {
             assert_eq!(landing.get(key), Some(value), "landing_insert: {key}");
             assert_eq!(traces.get(key), Some(value), "trace_landing_insert: {key}");
         }
+    }
+
+    /// **2-U17 (issue #494 part 2): every landing insert pins the partition
+    /// limit**, not the trace insert alone: log and metrics pushes gained the
+    /// 100-date admission ceiling, and the server refuses a block above
+    /// `max_partitions_per_insert_block` partitions only while
+    /// `throw_on_max_partitions_per_insert_block` is on.
+    #[test]
+    fn every_landing_insert_pins_the_partition_limit() {
+        let s = QuerySettings::landing_insert("t", 1_048_576);
+        assert_eq!(s.get("max_partitions_per_insert_block"), Some("100"));
+        assert_eq!(s.get("throw_on_max_partitions_per_insert_block"), Some("1"));
     }
 
     /// **W1 (issue #623): a landing insert fails when a view does not
@@ -945,12 +965,12 @@ mod tests {
     }
 
     /// **The trace landing insert's pin set is exactly the landing one plus
-    /// the seven the trace path needs**, and the two sets are compared as
-    /// **sets**, with the difference taken against those seven — so
+    /// the five the trace path needs**, and the two sets are compared as
+    /// **sets**, with the difference taken against those five — so
     /// neither an added pin nor a removed one passes.
     ///
     /// It is the only place in this change that writes a setting name as a
-    /// literal. The classes behind the seven, and the catalogue
+    /// literal. The classes behind the five, and the catalogue
     /// quotation behind each value, are
     /// [`QuerySettings::trace_landing_insert`]'s own doc comment.
     ///
@@ -966,8 +986,6 @@ mod tests {
         const WANT: &[(&str, &str)] = &[
             ("input_format_binary_read_json_as_string", "0"),
             ("format_binary_max_object_size", "100000"),
-            ("max_partitions_per_insert_block", "100"),
-            ("throw_on_max_partitions_per_insert_block", "1"),
             ("parallel_view_processing", "1"),
             ("json_type_escape_dots_in_keys", "0"),
             ("type_json_skip_duplicated_paths", "0"),
@@ -987,7 +1005,7 @@ mod tests {
         assert_eq!(
             added, want,
             "the difference against the metrics landing insert is exactly the \
-             seven pins this design names"
+             five pins this design names"
         );
 
         for (key, value) in &base_entries {

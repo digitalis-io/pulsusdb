@@ -330,7 +330,7 @@ fn rows_of_kind(rows: &[serde_json::Value], kind: u64) -> Vec<&serde_json::Value
 async fn one_logs_push_is_one_insert_into_the_landing_table() {
     let root = spool_root("one-insert");
     let inserter = MockInserter::always(Act::Ok);
-    let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
+    let writer = writer_with(&unbatched_config(), &root, inserter.clone());
 
     let wait = writer
         .admit_flush(
@@ -371,7 +371,7 @@ async fn two_logs_pushes_are_two_inserts() {
     // this case is about the block count rather than the index.
     let cfg = WriterConfig {
         ingest_dedup: false,
-        ..Default::default()
+        ..unbatched_config()
     };
     let writer = writer_with(&cfg, &root, inserter.clone());
 
@@ -564,7 +564,7 @@ async fn a_logs_push_at_a_ceiling_is_refused_whole() {
         // Large enough that the byte ceiling never decides these two.
         batch_bytes: ByteSize(1 << 30),
         ingest_queue_bytes: ByteSize(1 << 30),
-        ..Default::default()
+        ..unbatched_config()
     };
 
     for (name, lines, admitted) in [
@@ -639,7 +639,7 @@ async fn a_logs_push_at_a_ceiling_is_refused_whole() {
             ingest_dedup: false,
             batch_bytes: ByteSize(limit),
             ingest_queue_bytes: ByteSize(1 << 30),
-            ..Default::default()
+            ..unbatched_config()
         };
         let root = spool_root(&format!("bytes-{limit}"));
         let inserter = MockInserter::always(Act::Ok);
@@ -682,7 +682,7 @@ async fn a_logs_push_at_a_ceiling_is_refused_whole() {
                 log_patterns: false,
                 batch_bytes: ByteSize(1 << 30),
                 ingest_queue_bytes: ByteSize(1 << 30),
-                ..Default::default()
+                ..unbatched_config()
             };
             let root2 = spool_root("bytes-retry");
             let inserter2 = MockInserter::always(Act::Ok);
@@ -730,7 +730,7 @@ async fn the_queue_byte_allowance_is_aggregate_across_log_pushes() {
         batch_bytes: ByteSize(1 << 30),
         // Room for one push and not two.
         ingest_queue_bytes: ByteSize(charge + charge / 2),
-        ..Default::default()
+        ..unbatched_config()
     };
     let root = spool_root("aggregate-allowance");
     // Hanging, so the first push's charge stays live while the second is
@@ -778,7 +778,7 @@ async fn the_push_too_large_message_names_the_size_and_both_limits() {
         log_landing_max_rows: 1_000,
         log_patterns: false,
         batch_bytes: ByteSize(1 << 30),
-        ..Default::default()
+        ..unbatched_config()
     };
     let root = spool_root("message");
     let inserter = MockInserter::always_unrecorded(Act::Ok);
@@ -837,14 +837,14 @@ async fn an_empty_logs_push_is_a_success_and_is_charged_for_nothing() {
             "one-byte per-push ceiling",
             WriterConfig {
                 batch_bytes: ByteSize(1),
-                ..Default::default()
+                ..unbatched_config()
             },
         ),
         (
             "one-byte queue allowance",
             WriterConfig {
                 ingest_queue_bytes: ByteSize(1),
-                ..Default::default()
+                ..unbatched_config()
             },
         ),
     ] {
@@ -884,7 +884,7 @@ async fn an_empty_logs_push_is_a_success_and_is_charged_for_nothing() {
 async fn a_suppressed_logs_push_stores_nothing_and_makes_no_block() {
     let root = spool_root("suppressed");
     let inserter = MockInserter::always(Act::Ok);
-    let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
+    let writer = writer_with(&unbatched_config(), &root, inserter.clone());
 
     writer
         .admit_flush(
@@ -927,7 +927,7 @@ async fn the_stream_lru_is_promoted_only_when_the_block_commits() {
         log_landing_inserters: 1,
         log_patterns: false,
         ingest_dedup: false,
-        ..Default::default()
+        ..unbatched_config()
     };
     let root = spool_root("lru-commit");
     // One hanging call, then always Ok.
@@ -1005,7 +1005,7 @@ async fn a_failed_log_block_leaves_the_stream_lru_empty_so_the_next_push_re_regi
         log_landing_retries: 0,
         log_patterns: false,
         ingest_dedup: false,
-        ..Default::default()
+        ..unbatched_config()
     };
     let root = spool_root("failed-lru");
     let inserter = MockInserter::always(Act::Poison);
@@ -1079,7 +1079,7 @@ async fn a_token_is_minted_per_sealed_log_block_and_repeated_on_resend() {
     let cfg = WriterConfig {
         ingest_dedup: false,
         log_patterns: false,
-        ..Default::default()
+        ..unbatched_config()
     };
     let root = spool_root("token-distinct");
     let inserter = MockInserter::always(Act::Ok);
@@ -1112,7 +1112,7 @@ async fn a_token_is_minted_per_sealed_log_block_and_repeated_on_resend() {
     let retrying = WriterConfig {
         log_landing_retries: 2,
         log_patterns: false,
-        ..Default::default()
+        ..unbatched_config()
     };
     let root = spool_root("token-resend");
     let inserter = MockInserter::new(vec![Step::now(Act::Retryable), Step::now(Act::Ok)]);
@@ -1226,7 +1226,7 @@ async fn a_logs_block_settles_at_each_ending_the_loop_names() {
             log_landing_retries: run.retries,
             log_patterns: false,
             ingest_dedup: false,
-            ..Default::default()
+            ..unbatched_config()
         };
         let root = spool_root(run.name);
         let inserter = MockInserter::new(run.script.clone());
@@ -1312,7 +1312,7 @@ async fn a_logs_blocks_fate_never_walks_back_from_uncertain() {
         log_landing_retries: 2,
         log_patterns: false,
         ingest_dedup: false,
-        ..Default::default()
+        ..unbatched_config()
     };
     let root = spool_root("fate-uncertain");
     let inserter = MockInserter::new(vec![Step::now(Act::Uncertain), Step::now(Act::Retryable)]);
@@ -1376,7 +1376,7 @@ async fn two_blocks_one_inflight_one_queued(
         log_landing_inserters: 1,
         log_patterns: false,
         ingest_dedup: false,
-        ..Default::default()
+        ..unbatched_config()
     };
     let inserter = MockInserter::always(Act::Hang);
     let writer = Arc::new(writer_with(&cfg, root, inserter.clone()));
@@ -1491,7 +1491,7 @@ async fn shutdown_files_an_inflight_log_block_and_a_queued_block_differently() {
 async fn a_log_block_queued_when_the_drain_begins_is_sent_inside_the_grace() {
     let root = spool_root("queued-at-drain");
     let inserter = MockInserter::always(Act::Ok);
-    let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
+    let writer = writer_with(&unbatched_config(), &root, inserter.clone());
     let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
 
     writer
@@ -1518,7 +1518,7 @@ async fn a_backlog_behind_a_busy_worker_is_sent_inside_the_grace() {
     let root = spool_root("backlog-at-drain");
     let cfg = WriterConfig {
         log_landing_inserters: 1,
-        ..Default::default()
+        ..unbatched_config()
     };
     let inserter = MockInserter::new(vec![
         Step {
@@ -1559,7 +1559,7 @@ async fn a_backlog_behind_a_busy_worker_is_sent_inside_the_grace() {
 async fn a_writer_dropped_without_a_drain_starts_no_queued_insert() {
     let root = spool_root("dropped-writer");
     let inserter = MockInserter::always(Act::Ok);
-    let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
+    let writer = writer_with(&unbatched_config(), &root, inserter.clone());
     let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
 
     writer
@@ -1583,4 +1583,272 @@ async fn a_writer_dropped_without_a_drain_starts_no_queued_insert() {
         Some("the writer shut down before the block was sent")
     );
     std::fs::remove_dir_all(&root).ok();
+}
+
+// -- issue #494 part 2: batches -----------------------------------------
+
+/// One UTC day in nanoseconds.
+const NS_PER_DAY: i64 = 86_400_000_000_000;
+
+/// The first instant of UTC day `TS`'s day + `day`, plus an hour.
+fn on_day(day: i64) -> i64 {
+    (TS / NS_PER_DAY + day) * NS_PER_DAY + 3_600_000_000_000
+}
+
+/// Push `name`: one line on each of `days`, every body starting `name`, on
+/// a stream of its own.
+fn lines_on(name: &str, fingerprint: u128, days: &[i64]) -> ParsedLogs {
+    ParsedLogs {
+        rows: days
+            .iter()
+            .map(|&d| LogRow {
+                timestamp_ns: UnixNano(on_day(d)),
+                ..log_row(fingerprint, &format!("{name} line on day {d}"))
+            })
+            .collect(),
+        streams: vec![stream_row(fingerprint)],
+        ..Default::default()
+    }
+}
+
+/// The pushes each insert call carried, by the first word of its lines'
+/// bodies, in the call's row order.
+fn pushes_per_call(inserter: &MockInserter) -> Vec<Vec<String>> {
+    (0..inserter.call_count())
+        .map(|call| {
+            let mut names: Vec<String> = Vec::new();
+            for row in rows_of_kind(&inserter.rows_of(call), 0) {
+                let name = row["body"]
+                    .as_str()
+                    .and_then(|b| b.split(' ').next())
+                    .expect("a tagged line")
+                    .to_string();
+                if names.last() != Some(&name) {
+                    names.push(name);
+                }
+            }
+            names
+        })
+        .collect()
+}
+
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant")
+}
+
+fn batched_config() -> WriterConfig {
+    WriterConfig {
+        landing_batch_ms: 1_000,
+        ..WriterConfig::default()
+    }
+}
+
+/// **2-U3b.** Through the writer, a block's date span is its lines' UTC
+/// dates: `A` on dates 1-60, `B` on 61-120, `C` on 61, admitted together,
+/// are `[A]` and `[B, C]`; `D` on dates 1 and 201 beside `E` on 1 are `[D]`
+/// and `[E]`.
+#[tokio::test(start_paused = true)]
+async fn a_log_batch_spans_at_most_one_hundred_days_of_its_lines() {
+    let root = spool_root("batch-span");
+    let inserter = MockInserter::always(Act::Ok);
+    let writer = writer_with(&batched_config(), &root, inserter.clone());
+    let pushes = [
+        lines_on("A", 1, &[1, 30, 60]),
+        lines_on("B", 2, &[61, 90, 120]),
+        lines_on("C", 3, &[61]),
+        lines_on("D", 4, &[1, 201]),
+        lines_on("E", 5, &[1]),
+    ];
+    let waits: Vec<_> = pushes
+        .into_iter()
+        .map(|p| {
+            writer
+                .admit_flush(&no_tenant(), p, PushHeaders::default())
+                .expect("queue has room")
+        })
+        .collect();
+    for wait in waits {
+        wait.await.expect("the batch commits");
+    }
+    assert_eq!(
+        pushes_per_call(&inserter),
+        vec![vec!["A"], vec!["B", "C"], vec!["D"], vec!["E"]],
+        "inserts by push"
+    );
+    writer.shutdown(Duration::from_secs(2)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **2-U8.** Three pushes admitted 10 ms apart carry three receive stamps;
+/// their batch is one insert whose every row carries the smallest.
+#[tokio::test]
+async fn every_row_of_a_log_batch_carries_its_first_members_receive_stamp() {
+    let root = spool_root("batch-stamp");
+    let inserter = MockInserter::always(Act::Ok);
+    let writer = writer_with(&batched_config(), &root, inserter.clone());
+    let mut waits = Vec::new();
+    let mut admitted_ms = Vec::new();
+    for (i, name) in ["A", "B", "C"].into_iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_millis() as i64;
+        admitted_ms.push(before);
+        waits.push(
+            writer
+                .admit_flush(
+                    &no_tenant(),
+                    lines_on(name, i as u128 + 1, &[0]),
+                    PushHeaders::default(),
+                )
+                .expect("queue has room"),
+        );
+    }
+    for wait in waits {
+        wait.await.expect("the batch commits");
+    }
+    assert_eq!(inserter.call_count(), 1, "one insert");
+    let rows = inserter.rows_of(0);
+    let mut stamps: Vec<i64> = rows
+        .iter()
+        .map(|r| r["received_ms"].as_i64().expect("a receive stamp"))
+        .collect();
+    stamps.dedup();
+    assert_eq!(
+        stamps.len(),
+        1,
+        "every row carries one receive stamp: {stamps:?}"
+    );
+    assert!(
+        stamps[0] >= admitted_ms[0] && stamps[0] < admitted_ms[1],
+        "the first member's: {} not in [{}, {})",
+        stamps[0],
+        admitted_ms[0],
+        admitted_ms[1]
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["kind"].as_u64() == Some(0))
+            .count(),
+        3,
+        "all three pushes' lines"
+    );
+    writer.shutdown(Duration::from_secs(2)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **2-U14.** A push `P` at 0 ms and `P` again at 100 ms: one insert, at
+/// 1000 ms; neither is answered before it; both are answered `Ok`.
+#[tokio::test(start_paused = true)]
+async fn a_repeat_of_a_push_in_a_forming_batch_waits_for_the_batch() {
+    let root = spool_root("batch-repeat");
+    let inserter = MockInserter::always(Act::Ok);
+    let writer = writer_with(&batched_config(), &root, inserter.clone());
+    let t0 = tokio::time::Instant::now();
+    let answered = |wait: pulsus_write::FlushWait| {
+        tokio::spawn(async move {
+            let r = wait.await;
+            (tokio::time::Instant::now(), r)
+        })
+    };
+    let first = answered(
+        writer
+            .admit_flush(&no_tenant(), lines_on("P", 1, &[0]), PushHeaders::default())
+            .expect("queue has room"),
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let repeat = answered(
+        writer
+            .admit_flush(&no_tenant(), lines_on("P", 1, &[0]), PushHeaders::default())
+            .expect("a repeat is answered, not refused"),
+    );
+    tokio::time::sleep_until(t0 + Duration::from_millis(999)).await;
+    assert_eq!(
+        inserter.call_count(),
+        0,
+        "no insert before the window closes"
+    );
+    assert!(
+        !first.is_finished() && !repeat.is_finished(),
+        "neither is answered before the insert"
+    );
+    let (first_at, first_r) = first.await.expect("the first push's task");
+    let (repeat_at, repeat_r) = repeat.await.expect("the repeat's task");
+    assert_eq!(inserter.call_count(), 1, "the repeat is not inserted");
+    assert!(
+        first_r.is_ok() && repeat_r.is_ok(),
+        "both are answered Ok: {first_r:?} {repeat_r:?}"
+    );
+    assert!(
+        first_at >= t0 + Duration::from_millis(1_000)
+            && repeat_at >= t0 + Duration::from_millis(1_000),
+        "both are answered at the insert"
+    );
+    writer.shutdown(Duration::from_secs(2)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **2-U15 (logs).** A log push whose lines fall on 100 UTC dates is
+/// admitted; on 101 it is refused whole, with no claim left behind and
+/// nothing reserved or queued.
+#[tokio::test]
+async fn a_log_push_over_one_hundred_dates_is_refused_whole() {
+    for (days, admitted) in [(100i64, true), (101, false)] {
+        let root = spool_root(&format!("dates-{days}"));
+        let inserter = MockInserter::always(Act::Ok);
+        let writer = writer_with(&unbatched_config(), &root, inserter.clone());
+        let all: Vec<i64> = (0..days).collect();
+        let outcome =
+            writer.admit_flush(&no_tenant(), lines_on("P", 1, &all), PushHeaders::default());
+        if admitted {
+            outcome
+                .expect("100 dates are admitted")
+                .await
+                .expect("and stored");
+            assert_eq!(inserter.call_count(), 1);
+        } else {
+            let err = outcome.expect_err("101 dates are refused");
+            assert!(
+                matches!(
+                    err,
+                    AdmitRefusal::PushTooManyDays {
+                        days: 101,
+                        day_limit: 100
+                    }
+                ),
+                "refused PushTooManyDays {{ days: 101, day_limit: 100 }}: {err:?}"
+            );
+            assert_eq!(writer.metrics().queue_bytes, 0, "nothing is reserved");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(inserter.call_count(), 0, "nothing is queued");
+            let dedup = writer.dedup().expect("suppression is on");
+            let identity = pulsus_write::log_identity(
+                &lines_on("P", 1, &all),
+                &PushHeaders::default(),
+                &no_tenant(),
+            );
+            assert!(
+                matches!(
+                    dedup.admit(identity, pulsus_write::WaitMode::None),
+                    pulsus_write::Admission::Admit(_)
+                ),
+                "no claim is left"
+            );
+        }
+        writer.shutdown(Duration::from_secs(2)).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// `WriterConfig::default()` with log and trace batching off (issue #494
+/// part 2), so each case here keeps meaning one push per insert.
+#[allow(dead_code)]
+fn unbatched_config() -> pulsus_config::WriterConfig {
+    pulsus_config::WriterConfig {
+        landing_batch_ms: 0,
+        ..pulsus_config::WriterConfig::default()
+    }
 }

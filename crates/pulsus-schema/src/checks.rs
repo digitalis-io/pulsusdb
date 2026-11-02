@@ -277,15 +277,16 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
         "replicated_deduplication_window_seconds",
         NameCatalogue::MergeTreeSetting,
     ),
-    // Ten further settings, first pinned on the TRACE landing insert. Seven
-    // are pinned there alone, of four classes the metrics set does not need:
-    // how the block's bytes are read, a limit that refuses a block rather
-    // than dividing it, what path a value is stored under, and how the views
-    // run; `QuerySettings::trace_landing_insert` names them and quotes what
-    // each one's own catalogue entry says. Three — what an acknowledgement
-    // means, where a row is placed, and whether exceeding the deadline is an
-    // error — every landing insert pins since issue #494 part 1b, metrics
-    // included, and `QuerySettings::landing_insert` names them. A pin added to either
+    // Ten further settings, first pinned on the TRACE landing insert. Five
+    // are pinned there alone, of three classes the metrics set does not need:
+    // how the block's bytes are read, what path a value is stored under, and
+    // how the views run; `QuerySettings::trace_landing_insert` names them and
+    // quotes what each one's own catalogue entry says. Five — what an
+    // acknowledgement means, where a row is placed, whether exceeding the
+    // deadline is an error (issue #494 part 1b), and the limit that refuses a
+    // block rather than dividing it, with its throw (issue #494 part 2) —
+    // every landing insert pins, and `QuerySettings::landing_insert` names
+    // them. A pin added to either
     // without a row here is caught by the two
     // `the_settings_read_back_at_startup_are_the_ones_*` cases, which derive
     // their directions rather than carrying a list.
@@ -705,11 +706,13 @@ mod tests {
             "distributed_foreground_insert",
             "insert_shard_id",
             "timeout_overflow_mode",
+            "max_partitions_per_insert_block",
+            "throw_on_max_partitions_per_insert_block",
         ]);
 
-        // The trace landing insert's own seven pins are rows too (issues
+        // The trace landing insert's own five pins are rows too (issues
         // #584 to #586), and they are **derived from that constructor** here
-        // rather than written out a second time: this case owns the fifteen
+        // rather than written out a second time: this case owns the seventeen
         // above as a literal set, and
         // `the_settings_read_back_at_startup_are_the_ones_the_trace_insert_sends`
         // owns the rest, both ways.

@@ -93,6 +93,12 @@ use crate::writer::spool::SpoolWriter;
 use crate::writer::table::{BlockInserter, ChBlockInserter, XorShift64, spawn_dedup_ticker};
 use crate::writer::{AdmitMode, Admitted, Suppressed, note_target};
 
+/// How many distinct UTC dates one metrics push's samples, histogram samples
+/// and exemplars may fall on (issue #494 part 2): the server's
+/// `max_partitions_per_insert_block`, which every landing insert pins. 100
+/// dates is admitted, 101 is refused `413`.
+pub const METRICS_LANDING_DAY_LIMIT: u64 = pulsus_clickhouse::MAX_PARTITIONS_PER_INSERT_BLOCK;
+
 /// The one table the metrics writer inserts into (issue #603).
 const LANDING_TABLE: &str = "metric_landing";
 
@@ -296,18 +302,21 @@ impl MetricWriter {
         let lru_for_hook = series_lru.clone();
         let descriptors_for_hook = descriptors.clone();
         let on_commit: crate::writer::landing::CommitHook<MetricLandingRow> =
-            Arc::new(move |rows: &[MetricLandingRow]| {
+            Arc::new(move |parts: &[&[MetricLandingRow]]| {
                 {
                     let mut lru = lru_for_hook.lock().expect("series lru mutex poisoned");
-                    for key in promotion_keys(rows) {
-                        lru.insert(key);
+                    for rows in parts {
+                        for key in promotion_keys(rows) {
+                            lru.insert(key);
+                        }
                     }
                 }
                 let mut sent = descriptors_for_hook
                     .lock()
                     .expect("descriptor cache mutex poisoned");
-                for row in rows
+                for row in parts
                     .iter()
+                    .flat_map(|rows| rows.iter())
                     .filter(|row| row.kind == MetricLandingRow::KIND_METADATA)
                 {
                     sent.promote(
@@ -332,6 +341,11 @@ impl MetricWriter {
             on_commit: Some(on_commit),
             retries: runtime.metrics_landing_retries,
             max_rows: runtime.metrics_landing_max_rows,
+            // Metrics blocks are never batched (issue #494 part 2): a samples
+            // block's token comes from its content, and a batch under one
+            // token would store a client's resent push again.
+            batch_settings: None,
+            token_rng: Mutex::new(XorShift64::seeded()),
         });
 
         let (landing_tx, landing_rx) = mpsc::unbounded_channel::<LandingBlock<MetricLandingRow>>();
@@ -340,7 +354,9 @@ impl MetricWriter {
         // waiting for a later push. A worker holds the lock only while
         // taking a block, so up to `metrics_landing_inserters` inserts
         // overlap.
-        let landing_rx = Arc::new(tokio::sync::Mutex::new(landing_rx));
+        let landing_rx = Arc::new(tokio::sync::Mutex::new(
+            crate::writer::landing::LandingQueue::new(landing_rx),
+        ));
         // Every task goes into the boundary, which is what joins them: a task
         // this writer spawned and nothing awaits can be cancelled by runtime
         // teardown mid-settlement.
@@ -536,6 +552,29 @@ impl MetricWriter {
         // a block that is never created refused it `413` or `429`.
         //
         // Its claim seals with no targets, so it completes at admission.
+        // Issue #494 part 2: the 100-date ceiling, decided before the zero-row,
+        // suppressed and descriptor branches, so a refused push queues nothing
+        // — no descriptor either. A sample's, histogram sample's or
+        // exemplar's date feeds a table partitioned by UTC day, and the server
+        // refuses an insert above `max_partitions_per_insert_block`
+        // partitions. A registration's activity day comes from a sample's, so
+        // it adds none. Returning here drops the un-sealed guard, which
+        // removes the claim.
+        let days: HashSet<i64> = batch
+            .samples
+            .iter()
+            .map(|p| p.unix_milli)
+            .chain(batch.hist_samples.iter().map(|h| h.unix_milli))
+            .chain(batch.exemplars.iter().map(|e| e.unix_milli))
+            .map(|ms| ms.div_euclid(86_400_000))
+            .collect();
+        if days.len() as u64 > METRICS_LANDING_DAY_LIMIT {
+            return Err(AdmitRefusal::PushTooManyDays {
+                days: days.len() as u64,
+                day_limit: METRICS_LANDING_DAY_LIMIT,
+            });
+        }
+
         if total_rows == 0 {
             if let Some(suppressed) = suppressed {
                 return Ok(Admitted::Suppressed(suppressed));
@@ -943,6 +982,7 @@ impl MetricWriter {
             claim,
             waiter,
             admitted_at,
+            None,
         );
         if let Err(closed) = self.shared.landing_tx.send(block) {
             let ctx = self.shared.ctx.clone();
@@ -1525,6 +1565,7 @@ mod tests {
                 ClaimTicket::inert(),
                 Some(tx),
                 tokio::time::Instant::now(),
+                None,
             );
 
             let held = held_bytes(&block);

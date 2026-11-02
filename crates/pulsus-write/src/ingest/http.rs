@@ -59,8 +59,8 @@ use crate::ingest::metrics::MetricSink;
 use crate::ingest::traces::ParsedTraceLanding;
 use crate::ingest::traces::TraceSink;
 use crate::ingest::{
-    AdmitRefusal, KEY_REUSED_MESSAGE, LogSink, PushHeaders, push_spans_too_many_days_message,
-    push_too_large_message,
+    AdmitRefusal, KEY_REUSED_MESSAGE, LogSink, PushHeaders, push_too_large_message,
+    push_too_many_days_message,
 };
 use crate::protocols::otlp_logs::LogIngestSettings;
 use crate::protocols::otlp_metrics::MetricIngestSettings;
@@ -965,10 +965,10 @@ fn otlp_refusal_response(refusal: AdmitRefusal) -> Response {
             8,
             push_too_large_message(rows, row_limit, bytes, byte_limit),
         ),
-        AdmitRefusal::PushSpansTooManyDays { days, day_limit } => status_response(
+        AdmitRefusal::PushTooManyDays { days, day_limit } => status_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             8,
-            push_spans_too_many_days_message(days, day_limit),
+            push_too_many_days_message(days, day_limit),
         ),
     }
 }
@@ -1001,9 +1001,9 @@ fn zipkin_refusal_response(refusal: AdmitRefusal) -> Response {
             StatusCode::PAYLOAD_TOO_LARGE,
             push_too_large_message(rows, row_limit, bytes, byte_limit),
         ),
-        AdmitRefusal::PushSpansTooManyDays { days, day_limit } => plain_text_response(
+        AdmitRefusal::PushTooManyDays { days, day_limit } => plain_text_response(
             StatusCode::PAYLOAD_TOO_LARGE,
-            push_spans_too_many_days_message(days, day_limit),
+            push_too_many_days_message(days, day_limit),
         ),
     }
 }
@@ -1030,12 +1030,9 @@ fn remote_write_refusal_response(refusal: AdmitRefusal) -> Response {
                 push_too_large_message(rows, row_limit, bytes, byte_limit)
             ),
         ),
-        // Issue #586: no metric sink builds this variant, and nothing here
-        // asserts that it cannot be reached — rendering the status is the
-        // cheap answer, and a panic inside a response mapper is not one.
-        AdmitRefusal::PushSpansTooManyDays { days, day_limit } => go_http_error_response(
+        AdmitRefusal::PushTooManyDays { days, day_limit } => go_http_error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
-            format!("{}\n", push_spans_too_many_days_message(days, day_limit)),
+            format!("{}\n", push_too_many_days_message(days, day_limit)),
         ),
     }
 }
@@ -1065,11 +1062,9 @@ fn loki_refusal_response(refusal: AdmitRefusal) -> Response {
                 push_too_large_message(rows, row_limit, bytes, byte_limit)
             ),
         ),
-        // Issue #586: as on remote write — no log sink builds this variant,
-        // and the status is rendered rather than asserted unreachable.
-        AdmitRefusal::PushSpansTooManyDays { days, day_limit } => loki_plain_text_response(
+        AdmitRefusal::PushTooManyDays { days, day_limit } => loki_plain_text_response(
             StatusCode::PAYLOAD_TOO_LARGE,
-            format!("{}\n", push_spans_too_many_days_message(days, day_limit)),
+            format!("{}\n", push_too_many_days_message(days, day_limit)),
         ),
     }
 }
@@ -4560,7 +4555,7 @@ mod tests {
                 bytes: 178,
                 byte_limit: 16_777_216,
             },
-            AdmitRefusal::PushSpansTooManyDays {
+            AdmitRefusal::PushTooManyDays {
                 days: 101,
                 day_limit: 100,
             },
@@ -4587,10 +4582,10 @@ mod tests {
                 8,
                 push_too_large_message(rows, row_limit, bytes, byte_limit),
             ),
-            AdmitRefusal::PushSpansTooManyDays { days, day_limit } => (
+            AdmitRefusal::PushTooManyDays { days, day_limit } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 8,
-                push_spans_too_many_days_message(days, day_limit),
+                push_too_many_days_message(days, day_limit),
             ),
         }
     }

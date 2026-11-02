@@ -38,7 +38,6 @@ use futures::StreamExt;
 use pulsus_clickhouse::{
     ChClient, ChConnConfig, ChEndpoint, ChError, ChProto, ChRow, Idempotency, QuerySettings, Row,
 };
-use pulsus_config::WriterConfig;
 use pulsus_model::{ACTIVITY_BUCKET_MS, Date, Fingerprint, LabelSet, UnixNano};
 use pulsus_write::writer::{
     BlockInserter, ChBlockInserter, LogLandingRow, LogPatternRow, LogWriter, MetricLandingRow,
@@ -82,6 +81,8 @@ static DB_RESEND: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_write_it_routed_resend");
 static DB_RESEND_CONTROL: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_write_it_routed_resend_control");
+static DB_BATCH_POISON: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_write_it_routed_batch_poison");
 
 /// One case at a time: each builds a clustered database through the
 /// cluster's DDL queue, and 1-L6 reads the servers' query logs.
@@ -465,7 +466,7 @@ fn spooled(root: &Path, kind: &str) -> usize {
 }
 
 fn runtime(root: &Path, retries: u32) -> WriterRuntime {
-    let mut runtime = WriterRuntime::from_config(&WriterConfig::default());
+    let mut runtime = WriterRuntime::from_config(&unbatched_config());
     runtime.spool_dir = root.to_path_buf();
     runtime.log_landing_retries = retries;
     runtime.metrics_landing_retries = retries;
@@ -1949,4 +1950,149 @@ async fn a_resend_in_another_landing_hour_stores_no_derived_row_twice() {
         &format!("DROP DATABASE IF EXISTS {control} SYNC"),
     )
     .await;
+}
+
+/// Spins until the clock reaches `ms`, so the next admission is stamped with
+/// it. Fails if the clock has already passed it.
+fn wait_for_ms(ms: i64) {
+    assert!(
+        now_ms() <= ms,
+        "the clock passed {ms} before it was awaited"
+    );
+    while now_ms() < ms {
+        std::hint::spin_loop();
+    }
+}
+
+/// **2-L2 (issue #494 part 2).** Pushes `A` and `B`, admitted inside one
+/// window with receive stamps that select different shards, are one batch:
+/// `B`'s poison line makes the batch throw on every attempt, so both are
+/// answered the failure and filed `uncertain/`, and the batch is on one
+/// shard, once — the first member's — with no line stored twice.
+#[tokio::test]
+async fn a_batch_whose_member_throws_fails_every_member_on_one_shard() {
+    skip_unless_live!();
+    let _serial = SERIAL.lock().await;
+    let db = DB_BATCH_POISON.name();
+    build_schema(db);
+    let nodes = Nodes::of(db).await;
+    require_two_shards(&nodes).await;
+    throwing_view(&nodes, db, "log_landing", "body").await;
+
+    let root = spool_root("batch-poison");
+    let both = Arc::new(client(&[(&shard1(), None), (&shard2(), None)], db).await);
+    let forwarder = RecordingForwarder::<LogLandingRow>::new(both);
+    let mut rt = runtime(&root, 2);
+    rt.landing_batch = Duration::from_millis(1_000);
+    let writer = LogWriter::with_landing_inserter_and_runtime(
+        forwarder.clone(),
+        rt,
+        WriterTables::landing_for(Some(SUFFIX)),
+    );
+
+    // `A` is admitted at the start of a millisecond, so its stamp is that
+    // millisecond; `B` at the first later millisecond that selects the
+    // other shard, inside the window.
+    let a_ms = now_ms() + 1_000;
+    let shard_of = |ms: i64| {
+        let nodes = &nodes;
+        async move {
+            num(
+                &nodes.s1a,
+                &format!("SELECT toUInt64(cityHash64(toInt64({ms})) % 2) AS n"),
+            )
+            .await
+        }
+    };
+    let a_shard = shard_of(a_ms).await;
+    let mut b_ms = a_ms + 1;
+    while shard_of(b_ms).await == a_shard {
+        b_ms += 1;
+    }
+    assert!(
+        b_ms < a_ms + 500,
+        "a millisecond on the other shard inside the window"
+    );
+    wait_for_ms(a_ms);
+    let a = writer
+        .admit_flush(
+            &no_tenant(),
+            log_push(21, &["batch A line 1", "batch A line 2"]),
+            PushHeaders::default(),
+        )
+        .expect("the queue has room");
+    assert_eq!(now_ms(), a_ms, "A is stamped {a_ms}");
+    wait_for_ms(b_ms);
+    let b = writer
+        .admit_flush(
+            &no_tenant(),
+            log_push(22, &["batch B line 1", "poison"]),
+            PushHeaders::default(),
+        )
+        .expect("the queue has room");
+    assert_eq!(now_ms(), b_ms, "B is stamped {b_ms}");
+    let (a, b) = (a.await, b.await);
+    writer.shutdown(Duration::from_secs(10)).await;
+
+    assert!(
+        a.is_err() && b.is_err(),
+        "both are answered the failure: {a:?} {b:?}"
+    );
+    assert_eq!(
+        forwarder.calls(),
+        3,
+        "one send and two resends of the batch"
+    );
+    assert_eq!(
+        spooled(&root, "uncertain"),
+        2,
+        "one uncertain/ file per member"
+    );
+    let (_, rows, _) = forwarder.last();
+    let bodies: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.kind == LogLandingRow::KIND_LINE)
+        .map(|r| r.body.as_str())
+        .collect();
+    assert_eq!(
+        bodies,
+        vec![
+            "batch A line 1",
+            "batch A line 2",
+            "batch B line 1",
+            "poison"
+        ],
+        "every attempt carries both members"
+    );
+    assert!(
+        rows.iter().all(|r| r.received_ms == a_ms),
+        "every row carries A's stamp"
+    );
+    let per_shard = landing_per_shard(&nodes, db, "log_landing").await;
+    let want = rows.len() as u64;
+    let on_a = if a_shard == 0 { (want, 0) } else { (0, want) };
+    assert_eq!(
+        per_shard, on_a,
+        "log_landing holds A and B once each, all on A's shard"
+    );
+    assert_scratch_empty(&nodes, db).await;
+    let repeated = texts(
+        &nodes.s1a,
+        &format!("SELECT body AS s FROM {db}.log_samples{SUFFIX} GROUP BY body HAVING count() > 1"),
+    )
+    .await;
+    assert!(repeated.is_empty(), "lines stored twice: {repeated:?}");
+
+    drop_db(&nodes, db).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `WriterConfig::default()` with log and trace batching off (issue #494
+/// part 2), so each case here keeps meaning one push per insert.
+#[allow(dead_code)]
+fn unbatched_config() -> pulsus_config::WriterConfig {
+    pulsus_config::WriterConfig {
+        landing_batch_ms: 0,
+        ..pulsus_config::WriterConfig::default()
+    }
 }

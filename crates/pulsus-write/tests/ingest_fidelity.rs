@@ -105,7 +105,6 @@ use prost::Message;
 use tower::ServiceExt;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_config::WriterConfig;
 use pulsus_model::{Date, LabelSet, log_label_name};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
@@ -340,7 +339,7 @@ async fn run_path_a(db: &str, f: &Fixture) {
     let client = fresh_db(db).await;
     let writer = Arc::new(LogWriter::new_with_tables(
         Arc::new(client),
-        &WriterConfig::default(),
+        &unbatched_config(),
         WriterTables::logs_default(),
     ));
     // Issue #483: level discovery OFF on this mount. `pulsus_write::logs`
@@ -827,4 +826,14 @@ async fn nonascii_body_encoding() {
 #[tokio::test]
 async fn mv_created_idx_rows() {
     assert_fidelity("case6_mv_created_idx_rows").await;
+}
+
+/// `WriterConfig::default()` with log and trace batching off (issue #494
+/// part 2), so each case here keeps meaning one push per insert.
+#[allow(dead_code)]
+fn unbatched_config() -> pulsus_config::WriterConfig {
+    pulsus_config::WriterConfig {
+        landing_batch_ms: 0,
+        ..pulsus_config::WriterConfig::default()
+    }
 }

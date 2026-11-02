@@ -4049,3 +4049,186 @@ async fn a_suppressed_repeats_descriptors_need_room_of_their_own() {
     writer.shutdown(Duration::from_secs(2)).await;
     std::fs::remove_dir_all(&root).ok();
 }
+
+// -- issue #494 part 2: the 100-date ceiling --------------------------
+
+/// One UTC day in milliseconds.
+const MS_PER_DAY: i64 = 86_400_000;
+
+/// An hour into UTC day `day` after a fixed one.
+fn ms_on_day(day: i64) -> i64 {
+    (1_700_000_000_000 / MS_PER_DAY + day) * MS_PER_DAY + 3_600_000
+}
+
+/// A metrics push of one shape on `days` UTC dates: float samples alone,
+/// histogram samples alone, or float samples on the first 100 dates and
+/// exemplars on the rest.
+fn push_on_dates(shape: &str, days: i64, descriptor: Option<i64>) -> ParsedMetrics {
+    let mut out = ParsedMetrics {
+        series: vec![bare_series("m", 1)],
+        ..Default::default()
+    };
+    for day in 0..days {
+        let unix_milli = ms_on_day(day);
+        match shape {
+            "float" => out.samples.push(MetricPoint {
+                metric_name: Arc::from("m"),
+                fingerprint: Fingerprint::from_raw(1),
+                unix_milli,
+                value: 1.0,
+            }),
+            "histogram" => out.hist_samples.push(HistogramPoint {
+                metric_name: Arc::from("m"),
+                fingerprint: Fingerprint::from_raw(1),
+                unix_milli,
+                histogram: one_bucket_hist(5.0),
+            }),
+            "exemplar" => {
+                // The float samples stop at 100 dates; one exemplar sits on
+                // the first date and one on each date past the samples.
+                if day < 100 {
+                    out.samples.push(MetricPoint {
+                        metric_name: Arc::from("m"),
+                        fingerprint: Fingerprint::from_raw(1),
+                        unix_milli,
+                        value: 1.0,
+                    });
+                }
+                if day == 0 || day >= 100 {
+                    out.exemplars.push(ExemplarPoint {
+                        metric_name: Arc::from("m"),
+                        fingerprint: Fingerprint::from_raw(1),
+                        unix_milli,
+                        value: 1.0,
+                        trace_id: [7; 16],
+                        span_id: [7; 8],
+                        labels: LabelSet::from_normalized(Vec::<(String, String)>::new()).0,
+                        histogram: false,
+                    });
+                }
+            }
+            other => panic!("no shape {other}"),
+        }
+    }
+    if let Some(updated_ns) = descriptor {
+        out.metadata.push(MetricMetadata {
+            metric_name: Arc::from("m"),
+            metric_type: "gauge".to_string(),
+            help: "help".to_string(),
+            unit: String::new(),
+            updated_ns,
+        });
+    }
+    out
+}
+
+/// **2-U15 (metrics).** A metrics push whose samples, histogram samples or
+/// exemplars fall on 100 UTC dates is admitted; on 101 it is refused whole,
+/// with no claim left behind and nothing reserved or queued.
+#[tokio::test]
+async fn a_metrics_push_over_one_hundred_dates_is_refused_whole() {
+    for shape in ["float", "histogram", "exemplar"] {
+        for (days, admitted) in [(100i64, true), (101, false)] {
+            let name = format!("{shape} on {days} dates");
+            let root = spool_root(&format!("dates-{shape}-{days}"));
+            let inserter = MockInserter::always(Act::Ok);
+            let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
+            let outcome = writer.admit_flush(
+                &no_tenant(),
+                push_on_dates(shape, days, None),
+                PushHeaders::default(),
+            );
+            if admitted {
+                outcome
+                    .unwrap_or_else(|e| panic!("{name}: admitted: {e:?}"))
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: stored: {e:?}"));
+                assert!(inserter.call_count() >= 1, "{name}");
+            } else {
+                let err = outcome.expect_err("101 dates are refused");
+                assert!(
+                    matches!(
+                        err,
+                        AdmitRefusal::PushTooManyDays {
+                            days: 101,
+                            day_limit: 100
+                        }
+                    ),
+                    "{name}: refused PushTooManyDays {{ days: 101, day_limit: 100 }}: {err:?}"
+                );
+                assert_eq!(
+                    writer.metrics().queue_bytes,
+                    0,
+                    "{name}: nothing is reserved"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(inserter.call_count(), 0, "{name}: nothing is queued");
+                let identity = pulsus_write::metric_identity(
+                    &push_on_dates(shape, days, None),
+                    &PushHeaders::default(),
+                    &no_tenant(),
+                );
+                assert!(
+                    matches!(
+                        writer
+                            .dedup()
+                            .expect("suppression is on")
+                            .admit(identity, pulsus_write::WaitMode::None),
+                        pulsus_write::Admission::Admit(_)
+                    ),
+                    "{name}: no claim is left"
+                );
+            }
+            writer.shutdown(Duration::from_secs(2)).await;
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+}
+
+/// **2-U15 (descriptors).** A metrics push on 101 dates carrying a due
+/// descriptor is refused, and the descriptor stays due: the next push
+/// carrying it sends it.
+#[tokio::test]
+async fn a_refused_push_leaves_its_descriptor_due() {
+    let root = spool_root("dates-descriptor");
+    let inserter = MockInserter::always(Act::Ok);
+    let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
+    let err = writer
+        .admit_flush(
+            &no_tenant(),
+            push_on_dates("float", 101, Some(1)),
+            PushHeaders::default(),
+        )
+        .expect_err("101 dates are refused");
+    assert!(
+        matches!(
+            err,
+            AdmitRefusal::PushTooManyDays {
+                days: 101,
+                day_limit: 100
+            }
+        ),
+        "{err:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        inserter.call_count(),
+        0,
+        "the descriptor is not queued either"
+    );
+    writer
+        .admit_flush(
+            &no_tenant(),
+            push_on_dates("float", 1, Some(1)),
+            PushHeaders::default(),
+        )
+        .expect("one date is admitted")
+        .await
+        .expect("and stored");
+    let descriptors: usize = (0..inserter.call_count())
+        .map(|call| rows_of_kind(&inserter.rows_of(call), 3).len())
+        .sum();
+    assert_eq!(descriptors, 1, "the next push still sends the descriptor");
+    writer.shutdown(Duration::from_secs(2)).await;
+    std::fs::remove_dir_all(&root).ok();
+}

@@ -1,3 +1,10 @@
+> **Stale on landing inserts.** Since the batching change (#494, part 2), a landing worker gathers
+> queued log or trace pushes into one insert under one token for up to `PULSUS_LANDING_BATCH_MS`,
+> within the row, byte and 100-date caps and the oldest push's budget, and every push of a batch
+> shares its outcome; metrics pushes are not batched. Passages below that say one push is one insert,
+> that nothing waits for a flush trigger, or that a deduplication window counts pushes, are out of
+> date. Current behaviour: `docs/api.md` §1.0 and `crates/pulsus-write/src/writer/landing.rs`.
+
 # PulsusDB ClickHouse Schemas
 
 > **Stale on landing placement and on the metrics token.** On a cluster every landing table is

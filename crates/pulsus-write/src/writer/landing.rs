@@ -148,11 +148,81 @@ pub(crate) struct LandingBlock<R> {
     /// retry sleeps use, so a test that drives the loop on a paused clock
     /// measures one clock rather than two.
     admitted_at: tokio::time::Instant,
+    /// The first and last UTC day, as days since the epoch, of the block's
+    /// rows in day-partitioned targets (issue #494 part 2), or `None` for a
+    /// block with none. A batch's span is its members' union, and a batch
+    /// closes before it would pass [`BATCH_DAY_LIMIT`] days.
+    span: Option<(i64, i64)>,
+}
+
+/// The widest inclusive UTC-date span one landing batch may cover: the
+/// server's `max_partitions_per_insert_block`, which every landing insert
+/// pins, so one insert makes at most this many parts in any day-partitioned
+/// target (issue #494 part 2).
+pub(crate) const BATCH_DAY_LIMIT: u64 = pulsus_clickhouse::MAX_PARTITIONS_PER_INSERT_BLOCK;
+
+/// How many members of a failed batch write their spool copies at once.
+/// Each holds its charge, rows and waiter until its own write is done.
+pub(crate) const SPOOL_WRITE_CONCURRENCY: usize = 4;
+
+/// A landing row whose receive stamp a batch can read and set: every row of
+/// a batch takes its first member's (issue #494 part 2).
+pub(crate) trait LandingRow {
+    fn received_ms(&self) -> i64;
+    fn set_received_ms(&mut self, received_ms: i64);
+}
+
+impl LandingRow for crate::writer::rows::LogLandingRow {
+    fn received_ms(&self) -> i64 {
+        self.received_ms
+    }
+    fn set_received_ms(&mut self, received_ms: i64) {
+        crate::writer::rows::LogLandingRow::set_received_ms(self, received_ms);
+    }
+}
+
+impl LandingRow for crate::writer::rows::TraceLandingRow {
+    fn received_ms(&self) -> i64 {
+        self.received_ms
+    }
+    fn set_received_ms(&mut self, received_ms: i64) {
+        crate::writer::rows::TraceLandingRow::set_received_ms(self, received_ms);
+    }
+}
+
+impl LandingRow for crate::writer::rows::MetricLandingRow {
+    fn received_ms(&self) -> i64 {
+        self.received_ms
+    }
+    fn set_received_ms(&mut self, received_ms: i64) {
+        self.received_ms = received_ms;
+    }
+}
+
+/// The inclusive UTC-day span of `days`, as days since the epoch.
+pub(crate) fn day_span(days: impl IntoIterator<Item = i64>) -> Option<(i64, i64)> {
+    days.into_iter().fold(None, |acc, d| match acc {
+        None => Some((d, d)),
+        Some((lo, hi)) => Some((lo.min(d), hi.max(d))),
+    })
+}
+
+/// The union of two spans, and how many days it covers.
+fn union_span(a: Option<(i64, i64)>, b: Option<(i64, i64)>) -> Option<(i64, i64)> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some((a0, a1)), Some((b0, b1))) => Some((a0.min(b0), a1.max(b1))),
+    }
+}
+
+fn span_days(span: Option<(i64, i64)>) -> u64 {
+    span.map_or(0, |(lo, hi)| (hi - lo + 1) as u64)
 }
 
 impl<R> LandingBlock<R> {
     /// The one place a `LandingBlock` is built, so the case that prices what
     /// one holds prices the same value the queue does.
+    #[allow(clippy::too_many_arguments)] // one admission's rows, charge, claim and waiter
     pub(crate) fn seal(
         rows: Vec<R>,
         bytes: u64,
@@ -160,6 +230,7 @@ impl<R> LandingBlock<R> {
         claim: ClaimTicket,
         waiter: Option<oneshot::Sender<Result<(), WriteError>>>,
         admitted_at: tokio::time::Instant,
+        span: Option<(i64, i64)>,
     ) -> Self {
         LandingBlock {
             rows,
@@ -168,7 +239,15 @@ impl<R> LandingBlock<R> {
             claim,
             waiter,
             admitted_at,
+            span,
         }
+    }
+
+    /// Reports the claim's outcome now, leaving an inert ticket behind, so a
+    /// failed batch's claims are all reported before any member's spool copy
+    /// is written (issue #494 part 2).
+    fn report_claim(&mut self, outcome: TargetOutcome) {
+        std::mem::replace(&mut self.claim, ClaimTicket::inert()).settle(outcome);
     }
 
     /// **The one place a landing block's reservation is released, and the order
@@ -201,6 +280,7 @@ impl<R> LandingBlock<R> {
             claim,
             waiter,
             admitted_at: _,
+            span: _,
         } = self;
         drop(rows);
         drop(settings);
@@ -210,39 +290,78 @@ impl<R> LandingBlock<R> {
     }
 }
 
-/// A commit-time callback over the committed block's own rows: the
-/// registration cache promotion, which is the one thing a signal does at its
-/// commit that this module cannot.
+/// A commit-time callback over the committed batch's rows, one slice per
+/// member: the registration cache promotion, which is the one thing a signal
+/// does at its commit that this module cannot. Called once per committed
+/// insert.
 ///
 /// A named alias rather than an inline `Option<Arc<dyn Fn(..)>>`, for Clippy's
 /// `type_complexity`.
-pub(crate) type CommitHook<R> = Arc<dyn Fn(&[R]) + Send + Sync>;
+pub(crate) type CommitHook<R> = Arc<dyn Fn(&[&[R]]) + Send + Sync>;
 
-/// What a landing worker needs to run a block to an ending.
+/// What a landing worker needs to run a batch to an ending.
 pub(crate) struct LandingContext<R> {
     pub(crate) table: Arc<str>,
     pub(crate) inserter: Arc<dyn BlockInserter<R>>,
     pub(crate) runtime: Arc<WriterRuntime>,
-    /// The landing table's own per-table counters. One insert per push, so
-    /// `flushes_total` counts pushes stored and `rows_total` counts landed
-    /// events of every kind.
+    /// The landing table's own per-table counters. One insert per batch for
+    /// logs and traces, per block for metrics, so `flushes_total` counts
+    /// inserts stored and `rows_total` counts landed events of every kind.
     pub(crate) table_metrics: Arc<TableMetrics>,
     pub(crate) queued_bytes: Arc<AtomicU64>,
     pub(crate) spool: Arc<SpoolWriter>,
-    /// Called by [`commit_block`] with the committed block's rows, **while the
-    /// block is still charged**. A fixed-size field on the context rather than
-    /// on the block, so what a queued block holds does not grow with the push.
+    /// Called by [`commit_batch`] with the committed batch's rows, **while
+    /// every member is still charged**. A fixed-size field on the context
+    /// rather than on the block, so what a queued block holds does not grow
+    /// with the push.
     pub(crate) on_commit: Option<CommitHook<R>>,
     /// `PULSUS_<SIGNAL>_LANDING_RETRIES`, resolved by the signal's writer so
     /// this loop names no signal's config key.
     pub(crate) retries: u32,
     /// `PULSUS_<SIGNAL>_LANDING_MAX_ROWS`, likewise — the value both pinned
-    /// row limits carry on every insert sent against this table, read from
-    /// here when the block is sealed so no config key is named twice.
+    /// row limits carry on every insert sent against this table, and the row
+    /// count a batch stays strictly under.
     pub(crate) max_rows: u64,
+    /// The settings constructor of a batched signal (logs, traces), called
+    /// with a token minted when a batch closes; `None` for metrics, whose
+    /// blocks are never batched and carry their own settings (issue #494
+    /// part 2).
+    pub(crate) batch_settings: Option<fn(&str, u64) -> QuerySettings>,
+    /// The batch tokens' generator, shared by this queue's workers so no two
+    /// batches share a token.
+    pub(crate) token_rng: std::sync::Mutex<XorShift64>,
 }
 
-/// What the loop knows about a block short of a commit — **a value the loop
+impl<R> LandingContext<R> {
+    /// How long a worker forms a batch: `PULSUS_LANDING_BATCH_MS` for a
+    /// batched signal, zero for metrics.
+    fn window(&self) -> Duration {
+        if self.batch_settings.is_some() {
+            self.runtime.landing_batch
+        } else {
+            Duration::ZERO
+        }
+    }
+}
+
+/// A landing queue: its receiver, and the block a former kept back because
+/// it would have broken a bound of the batch it was forming (issue #494
+/// part 2). The next former takes the carried block first.
+pub(crate) struct LandingQueue<R> {
+    rx: mpsc::UnboundedReceiver<LandingBlock<R>>,
+    carry: Option<LandingBlock<R>>,
+}
+
+impl<R> LandingQueue<R> {
+    pub(crate) fn new(rx: mpsc::UnboundedReceiver<LandingBlock<R>>) -> Self {
+        LandingQueue { rx, carry: None }
+    }
+}
+
+/// The receiver shared by one signal's workers.
+pub(crate) type SharedQueue<R> = Arc<tokio::sync::Mutex<LandingQueue<R>>>;
+
+/// What the loop knows about a batch short of a commit — **a value the loop
 /// carries, not a decision each ending makes**. Two methods write it and
 /// there is no third, and `Uncertain` is terminal short of a commit: an
 /// ending whose own knowledge is "this did not send" can never walk the fate
@@ -253,9 +372,9 @@ pub(crate) enum LandingFate {
     Uncertain(String),
 }
 
-/// Why a block reached [`settle_block`]. It decides the waiter's error and
+/// Why a batch reached [`settle_batch`]. It decides the waiter's error and
 /// nothing else: the spool directory and the claim's outcome come from the
-/// fate. A shutdown is not a fate — a block abandoned at the shutdown
+/// fate. A shutdown is not a fate — a batch abandoned at the shutdown
 /// deadline may have committed, exactly as one abandoned at the budget may —
 /// so it travels beside one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,10 +415,10 @@ impl LandingFate {
 /// randomness.
 ///
 /// Written here rather than taken from a dependency: this crate needs one
-/// string per admitted push and nothing else a UUID library offers, and the
-/// layout is 128 bits of two fields it already has to hand.
+/// string per insert and nothing else a UUID library offers, and the layout
+/// is 128 bits of two fields it already has to hand.
 ///
-/// It is the batch's identity for retry purposes only — it is not a landed
+/// It is the insert's identity for retry purposes only — it is not a landed
 /// event's identity, and it is never derived from the block's content.
 pub(crate) fn mint_landing_token(rng: &mut XorShift64) -> String {
     let unix_ms = std::time::SystemTime::now()
@@ -319,22 +438,144 @@ pub(crate) fn mint_landing_token(rng: &mut XorShift64) -> String {
     )
 }
 
+/// What one turn of a former produced: a batch to send, a block whose
+/// deadline had passed when it was taken (settled alone), and whether the
+/// queue is closed and empty.
+struct Formed<R> {
+    batch: Vec<LandingBlock<R>>,
+    expired: Option<LandingBlock<R>>,
+    done: bool,
+}
+
+/// A block's deadline: its admission plus the landing budget.
+fn deadline_of<R>(ctx: &LandingContext<R>, block: &LandingBlock<R>) -> tokio::time::Instant {
+    block.admitted_at + ctx.runtime.landing_budget
+}
+
+/// Takes the next block: the carried one, else the queue's next. Once the
+/// drain is announced the queue is closed and drained.
+async fn take_first<R>(
+    queue: &mut LandingQueue<R>,
+    watch: &mut DrainWatch,
+) -> Option<LandingBlock<R>> {
+    if let Some(block) = queue.carry.take() {
+        return Some(block);
+    }
+    if watch.is_announced() {
+        queue.rx.close();
+        return queue.rx.recv().await;
+    }
+    tokio::select! {
+        block = queue.rx.recv() => block,
+        () = watch.until_announced() => {
+            queue.rx.close();
+            queue.rx.recv().await
+        }
+    }
+}
+
+/// Forms one batch under the queue's mutex, by issue #494 part 2's rules: it
+/// opens at the first block taken and closes `window` later; sooner when the
+/// next block would bring its rows to `max_rows`, its charge above
+/// `PULSUS_BATCH_BYTES` or its day span above [`BATCH_DAY_LIMIT`] (that block
+/// is carried to the next batch); at once when its earliest member deadline
+/// is at or before its close; and at once when the drain is announced. A
+/// block whose deadline has passed when it is taken joins nothing.
+async fn form<R>(
+    ctx: &LandingContext<R>,
+    queue: &mut LandingQueue<R>,
+    watch: &mut DrainWatch,
+) -> Formed<R> {
+    let Some(first) = take_first(queue, watch).await else {
+        return Formed {
+            batch: Vec::new(),
+            expired: None,
+            done: true,
+        };
+    };
+    let first_take = tokio::time::Instant::now();
+    if deadline_of(ctx, &first) <= first_take {
+        return Formed {
+            batch: Vec::new(),
+            expired: Some(first),
+            done: false,
+        };
+    }
+    let window = ctx.window();
+    let close_at = first_take + window;
+    let mut rows = first.rows.len() as u64;
+    let mut bytes = first.bytes;
+    let mut span = first.span;
+    let mut deadline = deadline_of(ctx, &first);
+    let mut batch = vec![first];
+    let formed = |batch, expired| Formed {
+        batch,
+        expired,
+        done: false,
+    };
+    if window.is_zero() || deadline <= close_at {
+        return formed(batch, None);
+    }
+    loop {
+        let next = if watch.is_announced() {
+            // The drain is announced: what is already queued may join, and
+            // nothing is waited for.
+            queue.rx.close();
+            match queue.rx.try_recv() {
+                Ok(block) => block,
+                Err(_) => return formed(batch, None),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(close_at) => return formed(batch, None),
+                () = watch.until_announced() => return formed(batch, None),
+                block = queue.rx.recv() => match block {
+                    Some(block) => block,
+                    None => return formed(batch, None),
+                },
+            }
+        };
+        let take = tokio::time::Instant::now();
+        if deadline_of(ctx, &next) <= take {
+            return formed(batch, Some(next));
+        }
+        let joined_span = union_span(span, next.span);
+        if rows + next.rows.len() as u64 >= ctx.max_rows
+            || bytes + next.bytes > ctx.runtime.batch_bytes
+            || span_days(joined_span) > BATCH_DAY_LIMIT
+        {
+            queue.carry = Some(next);
+            return formed(batch, None);
+        }
+        rows += next.rows.len() as u64;
+        bytes += next.bytes;
+        span = joined_span;
+        deadline = deadline.min(deadline_of(ctx, &next));
+        batch.push(next);
+        if deadline <= close_at {
+            return formed(batch, None);
+        }
+    }
+}
+
 /// Spawns one insert worker on the landing queue. Every worker runs the same
-/// loop: take the next block, run it to an ending through [`run_block`],
-/// repeat. Once the drain is announced — by `DrainBoundary::shutdown`, or by
-/// `DrainBoundary::cancel` when the writer is dropped — the worker closes the
-/// queue and keeps taking blocks until it is empty, so a block still queued at
-/// the announcement has the endings of any other block: committed; filed when
-/// the landing budget is spent, or when an insert error cannot be resent or
-/// the resends are used up; or filed at the deadline — not started once it
-/// has passed, abandoned if in flight when it passes.
+/// loop: form the next batch under the queue's mutex, release it, run the
+/// batch to an ending through [`run_batch`], repeat. Once the drain is
+/// announced — by `DrainBoundary::shutdown`, or by `DrainBoundary::cancel`
+/// when the writer is dropped — the worker closes the queue and keeps taking
+/// blocks until it is empty, so a block still queued at the announcement has
+/// the endings of any other block: committed; filed when the landing budget
+/// is spent, or when an insert error cannot be resent or the resends are
+/// used up; or filed at the deadline — not started once it has passed,
+/// abandoned if in flight when it passes.
 pub(crate) fn spawn_landing_worker<R>(
     ctx: Arc<LandingContext<R>>,
-    rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<LandingBlock<R>>>>,
+    queue: SharedQueue<R>,
     mut watch: DrainWatch,
 ) -> tokio::task::JoinHandle<()>
 where
-    R: ChRow + SpoolEncode + Send + Sync + 'static,
+    R: ChRow + SpoolEncode + LandingRow + Clone + Send + Sync + 'static,
 {
     tokio::spawn(async move {
         // Seeded from the clock, unless a case fixed the seed so its retry
@@ -344,122 +585,177 @@ where
             None => XorShift64::seeded(),
         };
         loop {
-            let block = {
-                let mut queue = rx.lock().await;
-                if watch.is_announced() {
-                    queue.close();
-                    queue.recv().await
-                } else {
-                    tokio::select! {
-                        block = queue.recv() => block,
-                        () = watch.until_announced() => {
-                            queue.close();
-                            queue.recv().await
-                        }
-                    }
+            let Formed {
+                batch,
+                expired,
+                done,
+            } = {
+                let mut queue = queue.lock().await;
+                form(&ctx, &mut queue, &mut watch).await
+            };
+            // A block taken past its deadline settles alone at once, while
+            // the batch it closed is sent.
+            let expired = async {
+                if let Some(block) = expired {
+                    let mut fate = LandingFate::NeverSent(String::new());
+                    fate.saw_pre_send(MSG_BUDGET_QUEUED.to_string());
+                    settle_batch(&ctx, vec![block], fate, TerminalCause::Normal).await;
                 }
             };
-            match block {
-                Some(block) => run_block(&ctx, block, &mut watch, &mut rng).await,
-                // The queue is closed and empty, or every sender is gone.
-                None => return,
+            let sent = async {
+                if !batch.is_empty() {
+                    run_batch(&ctx, batch, &mut watch, &mut rng).await;
+                }
+            };
+            tokio::join!(expired, sent);
+            if done {
+                return;
             }
         }
     })
 }
 
-/// Runs one block to an ending. Returns only once that block has settled.
+/// Runs one batch to an ending. Returns only once every member has settled.
 ///
-/// **Two bounds, and the loop owns one of them.** The budget —
-/// `WriterRuntime::landing_budget`, measured from the push's admission —
-/// bounds the queue wait, every attempt and every sleep. It is **recomputed
-/// after every attempt**, so a sleep can never carry the block past it, and
-/// the check at the top of the loop is what ends a block whose sleep spent
-/// what was left.
+/// **One deadline, the earliest member's.** Every attempt, every lapse
+/// before one and every sleep between them runs inside the batch's deadline,
+/// the earliest member admission plus `WriterRuntime::landing_budget`, and
+/// at it every member settles with the same ending. Every attempt sends the
+/// same members' rows, in the same order, under the one token minted for the
+/// batch when it closed.
 ///
 /// The announced shutdown deadline is `writer::drain`'s, and this loop neither
 /// reads nor reasons about it: it asks [`DrainWatch::attempt`] for an attempt
 /// and gets one of two shutdown endings instead when the deadline has passed
 /// or passes in flight, and every wait between attempts is
 /// [`DrainWatch::sleep`].
-async fn run_block<R>(
+async fn run_batch<R>(
     ctx: &Arc<LandingContext<R>>,
-    block: LandingBlock<R>,
+    mut members: Vec<LandingBlock<R>>,
     watch: &mut DrainWatch,
     rng: &mut XorShift64,
 ) where
-    R: ChRow + SpoolEncode + Send + Sync,
+    R: ChRow + SpoolEncode + LandingRow + Clone + Send + Sync,
 {
+    let first_admitted = members
+        .iter()
+        .map(|m| m.admitted_at)
+        .min()
+        .expect("a batch has a member");
+    let deadline = first_admitted + ctx.runtime.landing_budget;
+    // A batched signal's insert: every row takes the first member's receive
+    // stamp, so the batch is one block on one shard and in one landing
+    // partition, and the token is minted for the batch.
+    let settings = match ctx.batch_settings {
+        Some(build) => {
+            if let Some(stamp) = members
+                .first()
+                .and_then(|m| m.rows.first())
+                .map(LandingRow::received_ms)
+            {
+                for member in &mut members {
+                    for row in &mut member.rows {
+                        row.set_received_ms(stamp);
+                    }
+                }
+            }
+            let token = {
+                let mut rng = ctx.token_rng.lock().expect("landing token rng poisoned");
+                mint_landing_token(&mut rng)
+            };
+            build(&token, ctx.max_rows)
+        }
+        None => std::mem::take(&mut members[0].settings),
+    };
+
     let mut fate = LandingFate::NeverSent(String::new());
     let mut resends = 0u32;
     loop {
-        let remaining = ctx
-            .runtime
-            .landing_budget
-            .saturating_sub(block.admitted_at.elapsed());
-        if remaining.is_zero() {
+        let budget_spent = |fate: &mut LandingFate| {
             let msg = if resends == 0 {
                 MSG_BUDGET_QUEUED
             } else {
                 MSG_BUDGET_BETWEEN
             };
             fate.saw_pre_send(msg.to_string());
-            settle_block(ctx, block, fate, TerminalCause::Normal).await;
+        };
+        if tokio::time::Instant::now() >= deadline {
+            budget_spent(&mut fate);
+            settle_batch(ctx, members, fate, TerminalCause::Normal).await;
             return;
         }
+        #[cfg(test)]
+        if !ctx.runtime.test_lapse.is_zero() {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            watch.sleep(ctx.runtime.test_lapse.min(left)).await;
+            if tokio::time::Instant::now() >= deadline {
+                budget_spent(&mut fate);
+                settle_batch(ctx, members, fate, TerminalCause::Normal).await;
+                return;
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
 
         ctx.table_metrics.inflight.fetch_add(1, Ordering::Relaxed);
         // The budget encloses the two phases the client's own deadline does
         // not: the connection checkout and the health ping it may issue.
-        let end = watch
-            .attempt(remaining, || {
-                ctx.inserter
-                    .insert_with(&ctx.table, &block.rows, &block.settings)
-            })
-            .await;
+        let end = {
+            let parts: Vec<&[R]> = members.iter().map(|m| m.rows.as_slice()).collect();
+            watch
+                .attempt(remaining, || {
+                    ctx.inserter
+                        .insert_parts_with(&ctx.table, &parts, &settings)
+                })
+                .await
+        };
         ctx.table_metrics.inflight.fetch_sub(1, Ordering::Relaxed);
 
         let sent = match end {
             // The shutdown deadline had passed, so no attempt was created and
-            // nothing was sent. The block keeps whatever fate its earlier
+            // nothing was sent. The batch keeps whatever fate its earlier
             // attempts left, and the queued-shutdown message is read only when
             // that fate is `NeverSent` — where it is exactly what happened,
             // since every pre-send ending means nothing was sent.
             AttemptEnd::NotStarted => {
                 fate.saw_pre_send(MSG_SHUTDOWN_QUEUED.to_string());
-                settle_block(ctx, block, fate, TerminalCause::ShuttingDown).await;
+                settle_batch(ctx, members, fate, TerminalCause::ShuttingDown).await;
                 return;
             }
             // The shutdown deadline with an attempt in flight. The attempt
             // is abandoned, and it may have committed.
             AttemptEnd::Abandoned => {
                 fate.saw_uncertain(MSG_SHUTDOWN_INFLIGHT.to_string());
-                settle_block(ctx, block, fate, TerminalCause::ShuttingDown).await;
+                settle_batch(ctx, members, fate, TerminalCause::ShuttingDown).await;
                 return;
             }
             // The budget elapsing mid-attempt. It encloses the checkout and
             // the health ping as well as the send and cannot tell which of
             // the three it interrupted, so it reports the fate as unknown
-            // for a block that may never have left the process. That
+            // for a batch that may never have left the process. That
             // over-reports and never under-reports, which is the direction
-            // a claim has to err in.
+            // a claim has to err in. An answer arriving at the deadline
+            // itself is the same ending: the deadline is inclusive.
             AttemptEnd::BudgetElapsed => {
                 fate.saw_uncertain(MSG_BUDGET_IN_ATTEMPT.to_string());
-                settle_block(ctx, block, fate, TerminalCause::Normal).await;
+                settle_batch(ctx, members, fate, TerminalCause::Normal).await;
+                return;
+            }
+            AttemptEnd::Done(_) if tokio::time::Instant::now() >= deadline => {
+                fate.saw_uncertain(MSG_BUDGET_IN_ATTEMPT.to_string());
+                settle_batch(ctx, members, fate, TerminalCause::Normal).await;
                 return;
             }
             AttemptEnd::Done(result) => result,
         };
 
         // Every `ChError` here other than `InsertUncertain` is pre-send:
-        // `insert_block_with` downgrades every failure from the send onward to
-        // `InsertUncertain` whatever its class, and the only errors before it
-        // are the connection checkout's and the target's column-metadata
+        // `insert_parts_with` downgrades every failure from the send onward
+        // to `InsertUncertain` whatever its class, and the only errors before
+        // it are the connection checkout's and the target's column-metadata
         // read's.
         let resendable = match sent {
             Ok(()) => {
-                let latency = block.admitted_at.elapsed();
-                commit_block(ctx, block, latency).await;
+                commit_batch(ctx, members, first_admitted.elapsed()).await;
                 return;
             }
             Err(ChError::InsertUncertain(msg)) => {
@@ -477,7 +773,7 @@ async fn run_block<R>(
         };
 
         if !resendable || resends >= ctx.retries {
-            settle_block(ctx, block, fate, TerminalCause::Normal).await;
+            settle_batch(ctx, members, fate, TerminalCause::Normal).await;
             return;
         }
 
@@ -486,50 +782,51 @@ async fn run_block<R>(
             .fetch_add(1, Ordering::Relaxed);
         // The remainder AFTER the attempt, not the one captured before it: a
         // failure arriving near expiry would otherwise sleep past the
-        // budget.
-        let left = ctx
-            .runtime
-            .landing_budget
-            .saturating_sub(block.admitted_at.elapsed());
-        let delay = crate::writer::table::backoff_delay(
+        // deadline.
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let jittered = crate::writer::table::backoff_delay(
             ctx.runtime.retry_base_delay,
             ctx.runtime.retry_max_delay,
             resends + 1,
             rng,
-        )
-        .min(left);
-        watch.sleep(delay).await;
+        );
+        #[cfg(test)]
+        let jittered = ctx.runtime.test_backoff.unwrap_or(jittered);
+        watch.sleep(jittered.min(left)).await;
         resends += 1;
     }
 }
 
-/// The commit exit: the landing block holds the push's rows, and the target
-/// tables are written by that insert's own processing.
+/// The commit exit: the batch's insert holds its members' rows, and the
+/// target tables are written by that insert's own processing.
 ///
-/// **The commit hook runs while the block is still charged.** It takes a mutex
-/// admission and every other worker's commit take too, so a worker can wait
-/// there holding a whole block; [`LandingBlock::release`] owns the rule and
-/// says what waiting there would otherwise cost.
-async fn commit_block<R>(ctx: &Arc<LandingContext<R>>, block: LandingBlock<R>, latency: Duration)
-where
+/// **The commit hook runs once, while every member is still charged.** It
+/// takes a mutex admission and every other worker's commit take too, so a
+/// worker can wait there holding a whole batch; [`LandingBlock::release`]
+/// owns the rule and says what waiting there would otherwise cost.
+async fn commit_batch<R>(
+    ctx: &Arc<LandingContext<R>>,
+    members: Vec<LandingBlock<R>>,
+    latency: Duration,
+) where
     R: ChRow + SpoolEncode + Send + Sync,
 {
-    ctx.table_metrics
-        .record_flush(block.rows.len() as u64, block.bytes, latency);
+    let rows: u64 = members.iter().map(|m| m.rows.len() as u64).sum();
+    let bytes: u64 = members.iter().map(|m| m.bytes).sum();
+    ctx.table_metrics.record_flush(rows, bytes, latency);
     if let Some(hook) = &ctx.on_commit {
-        hook(&block.rows);
+        let parts: Vec<&[R]> = members.iter().map(|m| m.rows.as_slice()).collect();
+        hook(&parts);
     }
-    if let Some(waiter) = block.release(ctx, TargetOutcome::Committed) {
-        let _ = waiter.send(Ok(()));
+    for member in members {
+        if let Some(waiter) = member.release(ctx, TargetOutcome::Committed) {
+            let _ = waiter.send(Ok(()));
+        }
     }
 }
 
-/// Every other exit. The fate decides the spool directory and the claim's
-/// outcome; `cause` decides only the waiter's error.
-///
-/// The block is spooled even at the shutdown deadline, because the block is
-/// the push's only copy. A spool write that itself fails is logged and counted
-/// and never changes the outcome.
+/// [`settle_batch`] for one block, as the queue-closed path at admission
+/// settles it.
 pub(crate) async fn settle_block<R>(
     ctx: &Arc<LandingContext<R>>,
     block: LandingBlock<R>,
@@ -538,39 +835,88 @@ pub(crate) async fn settle_block<R>(
 ) where
     R: ChRow + SpoolEncode + Send + Sync,
 {
-    let (kind, outcome, msg) = fate.settle();
-    // The spool write runs while the block is still charged, on its error path
-    // too. The block's rows are what the write reads, one at a time, so they
-    // are live until it returns. What the write itself holds on top of them is
-    // one chunk and one row — `writer::spool`'s `write_record` owns that bound
-    // — and the release order that makes this the right place for it is
-    // [`LandingBlock::release`]'s.
-    if let Err(spool_err) = ctx.spool.write(kind, &ctx.table, &block.rows, &msg).await {
-        ctx.table_metrics
-            .spool_write_failures_total
-            .fetch_add(1, Ordering::Relaxed);
-        error!(
-            table = %ctx.table,
-            error = %spool_err,
-            "failed to spool a landing block to disk"
-        );
-    }
-    if let Some(waiter) = block.release(ctx, outcome) {
-        let err = match cause {
-            TerminalCause::ShuttingDown => WriteError::ShuttingDown,
-            TerminalCause::Normal => match kind {
-                SpoolKind::Uncertain => WriteError::Uncertain(msg),
-                SpoolKind::Poison => WriteError::Poisoned(msg),
-            },
-        };
-        let _ = waiter.send(Err(err));
-    }
+    settle_batch(ctx, vec![block], fate, cause).await;
 }
+
+/// Every other exit, for every member of a batch with the batch's one fate.
+/// The fate decides the spool directory and the claim's outcome; `cause`
+/// decides only the waiter's error.
+///
+/// **Every member's claim is reported first**, so no claim waits behind a
+/// spool write; then the members' spool copies are written at most
+/// [`SPOOL_WRITE_CONCURRENCY`] at a time, each member keeping its charge,
+/// rows and waiter until its own write is done. A member is spooled even at
+/// the shutdown deadline, because its block is the push's only copy. A spool
+/// write that itself fails is logged and counted and never changes the
+/// outcome.
+pub(crate) async fn settle_batch<R>(
+    ctx: &Arc<LandingContext<R>>,
+    mut members: Vec<LandingBlock<R>>,
+    fate: LandingFate,
+    cause: TerminalCause,
+) where
+    R: ChRow + SpoolEncode + Send + Sync,
+{
+    use futures::StreamExt;
+
+    let (kind, outcome, msg) = fate.settle();
+    for member in &mut members {
+        member.report_claim(outcome);
+    }
+    let msg = &msg;
+    futures::stream::iter(members)
+        .for_each_concurrent(SPOOL_WRITE_CONCURRENCY, |member| async move {
+            // The spool write runs while the member is still charged, on its
+            // error path too. The member's rows are what the write reads, one
+            // at a time, so they are live until it returns. What the write
+            // itself holds on top of them is one chunk and one row —
+            // `writer::spool`'s `write_record` owns that bound — and the
+            // release order that makes this the right place for it is
+            // [`LandingBlock::release`]'s.
+            if let Err(spool_err) = ctx.spool.write(kind, &ctx.table, &member.rows, msg).await {
+                ctx.table_metrics
+                    .spool_write_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                error!(
+                    table = %ctx.table,
+                    error = %spool_err,
+                    "failed to spool a landing block to disk"
+                );
+            }
+            if let Some(waiter) = member.release(ctx, outcome) {
+                let err = match cause {
+                    TerminalCause::ShuttingDown => WriteError::ShuttingDown,
+                    TerminalCause::Normal => match kind {
+                        SpoolKind::Uncertain => WriteError::Uncertain(msg.clone()),
+                        SpoolKind::Poison => WriteError::Poisoned(msg.clone()),
+                    },
+                };
+                let _ = waiter.send(Err(err));
+            }
+        })
+        .await;
+}
+
+#[cfg(test)]
+#[path = "landing_batch_tests.rs"]
+mod batch_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::writer::rows::MetricLandingRow;
+
+    /// One log line with `body`, for the batch cases beside this module.
+    pub(super) fn log_row(body: String) -> crate::protocols::otlp_logs::LogRow {
+        crate::protocols::otlp_logs::LogRow {
+            service: "checkout".to_string(),
+            fingerprint: pulsus_model::Fingerprint::from_raw(7),
+            timestamp_ns: pulsus_model::UnixNano(1_700_000_000_000_000_000),
+            severity: 0,
+            body,
+            structured_metadata: String::new(),
+        }
+    }
 
     /// Counts insert calls and answers each at once.
     struct CountingInserter(std::sync::atomic::AtomicUsize);
@@ -616,6 +962,8 @@ mod tests {
             on_commit: None,
             retries: 0,
             max_rows: 1_000,
+            batch_settings: None,
+            token_rng: std::sync::Mutex::new(XorShift64::seeded()),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let boundary = crate::writer::drain::DrainBoundary::new();
@@ -636,9 +984,14 @@ mod tests {
             ClaimTicket::inert(),
             None,
             tokio::time::Instant::now(),
+            None,
         ))
         .unwrap_or_else(|_| panic!("the queue is open"));
-        let worker = spawn_landing_worker(ctx, Arc::new(tokio::sync::Mutex::new(rx)), watch);
+        let worker = spawn_landing_worker(
+            ctx,
+            Arc::new(tokio::sync::Mutex::new(LandingQueue::new(rx))),
+            watch,
+        );
         tokio::time::timeout(Duration::from_secs(10), worker)
             .await
             .expect("the worker ends once the cancelled queue is empty")

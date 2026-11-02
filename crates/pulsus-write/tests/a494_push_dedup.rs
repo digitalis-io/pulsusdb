@@ -190,7 +190,7 @@ fn metadata_batch(name: &str, metric_type: &str, updated_ns: i64) -> ParsedMetri
 /// flush on the very next append; that value now refuses every push in this
 /// suite.
 fn eager() -> WriterConfig {
-    WriterConfig::default()
+    unbatched_config()
 }
 
 /// Nothing ages: the suppression index's ticker never fires, so a claim this
@@ -202,7 +202,7 @@ fn eager() -> WriterConfig {
 fn never_flushes() -> WriterConfig {
     WriterConfig {
         batch_ms: pulsus_config::BATCH_MS_CEILING,
-        ..Default::default()
+        ..unbatched_config()
     }
 }
 
@@ -421,7 +421,7 @@ async fn a_push_refused_by_backpressure_leaves_no_claim() {
     let cfg = WriterConfig {
         batch_bytes: pulsus_config::ByteSize(u64::MAX),
         ingest_queue_bytes: pulsus_config::ByteSize(reserved + reserved / 2),
-        ..Default::default()
+        ..unbatched_config()
     };
     let samples = MockInserter::new(Behavior::Ok);
     let writer = writer_with(cfg, samples.clone(), MockInserter::new(Behavior::Ok));
@@ -783,7 +783,7 @@ use pulsus_write::Admission;
 #[tokio::test(start_paused = true)]
 async fn the_ticker_task_drives_the_index_tick() {
     let writer = writer_with(
-        WriterConfig::default(),
+        unbatched_config(),
         MockInserter::new(Behavior::Ok),
         MockInserter::new(Behavior::Ok),
     );
@@ -922,7 +922,7 @@ async fn a_push_after_the_window_elapses_is_stored_again() {
 #[tokio::test]
 async fn a_descriptor_that_comes_back_within_the_hour_is_already_stored() {
     let landing = MockInserter::new(Behavior::Ok);
-    let writer = metric_writer_with(WriterConfig::default(), landing.clone());
+    let writer = metric_writer_with(unbatched_config(), landing.clone());
 
     for (metric_type, updated_ns) in [("counter", 1), ("gauge", 2), ("counter", 3)] {
         let wait = writer
@@ -966,7 +966,7 @@ async fn a_descriptor_that_comes_back_within_the_hour_is_already_stored() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_identical_descriptor_bearing_pushes_store_one_copy() {
     let landing = MockInserter::new(Behavior::Ok);
-    let writer = Arc::new(metric_writer_with(WriterConfig::default(), landing.clone()));
+    let writer = Arc::new(metric_writer_with(unbatched_config(), landing.clone()));
     let gate = Arc::new(tokio::sync::Barrier::new(4));
 
     let body = || {
@@ -1032,7 +1032,7 @@ async fn concurrent_identical_descriptor_bearing_pushes_store_one_copy() {
 #[tokio::test]
 async fn a_retried_push_carrying_the_same_descriptor_is_still_suppressed() {
     let landing = MockInserter::new(Behavior::Ok);
-    let writer = metric_writer_with(WriterConfig::default(), landing.clone());
+    let writer = metric_writer_with(unbatched_config(), landing.clone());
 
     let body = || {
         let mut batch = metadata_batch("http_requests_total", "counter", 1);
@@ -1085,7 +1085,7 @@ async fn a_retried_push_carrying_the_same_descriptor_is_still_suppressed() {
 #[tokio::test]
 async fn a_suppressed_push_still_lands_its_descriptor_alone() {
     let landing = MockInserter::new(Behavior::Ok);
-    let writer = metric_writer_with(WriterConfig::default(), landing.clone());
+    let writer = metric_writer_with(unbatched_config(), landing.clone());
 
     let body = || {
         let mut batch = metadata_batch("http_requests_total", "counter", 1);
@@ -1238,4 +1238,14 @@ async fn a_settle_wakes_its_own_keys_waiters_and_no_others() {
 #[allow(dead_code)]
 fn no_tenant() -> pulsus_model::Tenant {
     pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
+}
+
+/// `WriterConfig::default()` with log and trace batching off (issue #494
+/// part 2), so each case here keeps meaning one push per insert.
+#[allow(dead_code)]
+fn unbatched_config() -> pulsus_config::WriterConfig {
+    pulsus_config::WriterConfig {
+        landing_batch_ms: 0,
+        ..pulsus_config::WriterConfig::default()
+    }
 }

@@ -45,7 +45,6 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_config::WriterConfig;
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
 use pulsus_write::{TraceWriter, TraceWriterTables};
@@ -116,7 +115,7 @@ async fn fresh_db(db: &str) -> ChClient {
 async fn trace_writer(db: &str) -> Arc<TraceWriter> {
     Arc::new(TraceWriter::new_with_tables(
         Arc::new(ChClient::new(db_config(db)).await.expect("connect writer")),
-        &WriterConfig::default(),
+        &unbatched_config(),
         TraceWriterTables::traces_default(),
     ))
 }
@@ -310,4 +309,14 @@ async fn a_zipkin_shared_span_stores_both_the_server_and_client_sides() {
         ],
         "the two sides are SERVER and CLIENT, each with its own service"
     );
+}
+
+/// `WriterConfig::default()` with log and trace batching off (issue #494
+/// part 2), so each case here keeps meaning one push per insert.
+#[allow(dead_code)]
+fn unbatched_config() -> pulsus_config::WriterConfig {
+    pulsus_config::WriterConfig {
+        landing_batch_ms: 0,
+        ..pulsus_config::WriterConfig::default()
+    }
 }

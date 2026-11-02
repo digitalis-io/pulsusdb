@@ -434,7 +434,7 @@ async fn a_retryable_pre_send_failure_is_resent_and_settles_not_committed() {
     let mut runtime = WriterRuntime::from_config(&WriterConfig {
         metrics_landing_retries: 1,
         metrics_landing_inserters: 1,
-        ..Default::default()
+        ..unbatched_config()
     });
     runtime.spool_dir = root.clone();
     let writer = MetricWriter::with_landing_inserter_and_runtime(
@@ -514,7 +514,7 @@ async fn a_retryable_pre_send_failure_is_resent_and_settles_not_committed() {
 /// `BlockInserter`, which is the other end of the same seam.
 #[tokio::test]
 async fn the_production_inserter_sends_the_trace_landing_settings_on_the_wire() {
-    let cfg = WriterConfig::default();
+    let cfg = unbatched_config();
     let mock = MockChInsert::start(DescribeAnswer::Ok, InsertAnswer::Ok);
     let client = Arc::new(
         ChClient::new(mock.conn_config())
@@ -700,7 +700,7 @@ async fn assert_routed_pins(recorder: &SettingsRecorder, table: &str) {
 async fn the_log_writer_hands_over_the_routed_landing_pins() {
     let root = spool_root("log-routed-pins");
     let recorder = Arc::new(SettingsRecorder::default());
-    let mut runtime = WriterRuntime::from_config(&WriterConfig::default());
+    let mut runtime = WriterRuntime::from_config(&unbatched_config());
     runtime.spool_dir = root.clone();
     let writer = pulsus_write::writer::LogWriter::with_landing_inserter_and_runtime(
         recorder.clone(),
@@ -735,7 +735,7 @@ async fn the_log_writer_hands_over_the_routed_landing_pins() {
 async fn the_metric_writer_hands_over_the_five_landing_pins() {
     let root = spool_root("metric-routed-pins");
     let recorder = Arc::new(SettingsRecorder::default());
-    let mut runtime = WriterRuntime::from_config(&WriterConfig::default());
+    let mut runtime = WriterRuntime::from_config(&unbatched_config());
     runtime.spool_dir = root.clone();
     let writer = MetricWriter::with_landing_inserter_and_runtime(
         recorder.clone(),
@@ -864,4 +864,14 @@ fn one_span_trace_push() -> pulsus_write::ParsedTraceLanding {
 #[allow(dead_code)]
 fn no_tenant() -> pulsus_model::Tenant {
     pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
+}
+
+/// `WriterConfig::default()` with log and trace batching off (issue #494
+/// part 2), so each case here keeps meaning one push per insert.
+#[allow(dead_code)]
+fn unbatched_config() -> pulsus_config::WriterConfig {
+    pulsus_config::WriterConfig {
+        landing_batch_ms: 0,
+        ..pulsus_config::WriterConfig::default()
+    }
 }

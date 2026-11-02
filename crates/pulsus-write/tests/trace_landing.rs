@@ -34,7 +34,7 @@ use pulsus_write::writer::{
     WriterRuntime, landing_block_overhead_bytes,
 };
 use pulsus_write::{
-    AdmitRefusal, ParsedTraceLanding, PushHeaders, TraceSink, push_spans_too_many_days_message,
+    AdmitRefusal, ParsedTraceLanding, PushHeaders, TraceSink, push_too_many_days_message,
 };
 
 const LANDING: &str = "trace_landing";
@@ -444,7 +444,7 @@ fn count_of_kind(rows: &[TraceLandingRow], kind: u8) -> usize {
 async fn one_push_is_one_insert_into_the_landing_table() {
     let root = spool_root("one-insert");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&unbatched_config(), &root, landing.clone());
 
     let req = six_spans();
     let landed = decode(&req);
@@ -485,7 +485,7 @@ async fn one_push_is_one_insert_into_the_landing_table() {
 async fn two_pushes_are_two_inserts() {
     let root = spool_root("two-inserts");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&unbatched_config(), &root, landing.clone());
 
     for (trace, service) in [(0xa1u8, "checkout"), (0xa2, "cart")] {
         let req = six_spans_of(trace, service);
@@ -514,7 +514,7 @@ async fn two_pushes_are_two_inserts() {
 async fn a_token_is_minted_per_sealed_block_and_repeated_on_resend() {
     let root = spool_root("token");
     let landing = ResendOnceInserter::new();
-    let cfg = WriterConfig::default();
+    let cfg = unbatched_config();
     let writer = writer_with(
         &cfg,
         &root,
@@ -541,7 +541,7 @@ async fn a_token_is_minted_per_sealed_block_and_repeated_on_resend() {
     // different token: the token cannot be a content digest.
     let cfg = WriterConfig {
         ingest_dedup: false,
-        ..Default::default()
+        ..unbatched_config()
     };
     let landing2: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
     let writer2 = writer_with(&cfg, &root, landing2.clone());
@@ -587,7 +587,7 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
 
     let cfg = WriterConfig {
         trace_landing_max_rows: rows,
-        ..Default::default()
+        ..unbatched_config()
     };
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
     let writer = writer_with(&cfg, &root, landing.clone());
@@ -626,7 +626,7 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
     for (limit, refused) in [(charge, false), (charge - 1, true)] {
         let cfg = WriterConfig {
             batch_bytes: ByteSize(limit),
-            ..Default::default()
+            ..unbatched_config()
         };
         let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
         let writer = writer_with(&cfg, &root, landing.clone());
@@ -796,7 +796,7 @@ async fn refused_charge(root: &Path, landed: ParsedTraceLanding) -> u64 {
     let cfg = WriterConfig {
         batch_bytes: ByteSize(1),
         ingest_queue_bytes: ByteSize(1024 * 1024 * 1024),
-        ..Default::default()
+        ..unbatched_config()
     };
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
     let writer = writer_with(&cfg, root, landing);
@@ -856,7 +856,7 @@ fn wide_span_request(
 async fn an_empty_push_is_a_success_and_is_charged_for_nothing() {
     let root = spool_root("empty");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&unbatched_config(), &root, landing.clone());
 
     let req = request_of("checkout", Vec::new());
     let landed = decode(&req);
@@ -934,7 +934,7 @@ async fn saturated_landing(root: &Path) -> (TraceWriter, Arc<MockInserter<TraceL
     let cfg = WriterConfig {
         ingest_queue_bytes: ByteSize(limit),
         ingest_dedup: false,
-        ..Default::default()
+        ..unbatched_config()
     };
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Hang);
     let mut runtime = runtime_at(&cfg, root);
@@ -969,7 +969,7 @@ async fn saturated_landing(root: &Path) -> (TraceWriter, Arc<MockInserter<TraceL
 async fn a_sync_push_is_answered_by_its_landing_insert() {
     let root = spool_root("answered-by-landing");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Poison);
-    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&unbatched_config(), &root, landing.clone());
     let answer = writer
         .admit_flush(&no_tenant(), decode(&six_spans()), PushHeaders::default())
         .expect("queue has room")
@@ -988,7 +988,7 @@ async fn a_sync_push_is_answered_by_its_landing_insert() {
 async fn a_sync_push_is_not_answered_while_its_landing_insert_is_in_flight() {
     let root = spool_root("waits-for-landing");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Hang);
-    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&unbatched_config(), &root, landing.clone());
     let wait = writer
         .admit_flush(&no_tenant(), decode(&six_spans()), PushHeaders::default())
         .expect("queue has room");
@@ -1008,7 +1008,7 @@ async fn a_sync_push_is_not_answered_while_its_landing_insert_is_in_flight() {
 async fn a_retry_of_a_failed_landing_insert_is_stored() {
     let root = spool_root("retry-after-failure");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Poison);
-    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&unbatched_config(), &root, landing.clone());
     let landed = decode(&six_spans());
     let _ = writer
         .admit_flush(&no_tenant(), landed.clone(), PushHeaders::default())
@@ -1042,7 +1042,7 @@ async fn a_retry_after_an_uncertain_landing_insert_is_stored() {
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Uncertain);
     let cfg = WriterConfig {
         trace_landing_retries: 0,
-        ..Default::default()
+        ..unbatched_config()
     };
     let writer = writer_with(&cfg, &root, landing.clone());
     let landed = decode(&six_spans());
@@ -1106,7 +1106,7 @@ async fn a_sync_repeat_waiting_on_a_pending_trace_claim_is_answered_its_failure(
         gate: tokio::sync::Semaphore::new(0),
         calls: AtomicUsize::new(0),
     });
-    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&unbatched_config(), &root, landing.clone());
     let landed = decode(&six_spans());
 
     let original = writer
@@ -1152,7 +1152,7 @@ async fn a_sync_repeat_waiting_on_a_pending_trace_claim_is_answered_its_failure(
 async fn a_distinct_key_is_a_distinct_identity_in_the_writer() {
     let root = spool_root("distinct-key");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&unbatched_config(), &root, landing.clone());
 
     let landed = decode(&six_spans());
     for key in ["k-1", "k-2"] {
@@ -1191,7 +1191,7 @@ async fn a_distinct_key_is_a_distinct_identity_in_the_writer() {
 async fn a_body_with_no_span_start_times_is_stored_once_without_a_key() {
     let root = spool_root("no-start-times");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&unbatched_config(), &root, landing.clone());
 
     let body = six_spans_without_start_times();
 
@@ -1236,7 +1236,7 @@ async fn a_body_with_no_span_start_times_is_stored_once_without_a_key() {
 async fn a_body_with_no_span_start_times_is_suppressed_under_one_key() {
     let root = spool_root("no-start-times-keyed");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&unbatched_config(), &root, landing.clone());
 
     let body = six_spans_without_start_times();
     let keyed = || PushHeaders {
@@ -1291,7 +1291,7 @@ async fn a_body_with_no_span_start_times_is_suppressed_under_one_key() {
 async fn two_bodies_differing_only_in_a_span_instant_both_store() {
     let root = spool_root("start-time-differs");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&unbatched_config(), &root, landing.clone());
 
     let mut later = six_spans();
     let span = &mut later.resource_spans[0].scope_spans[0].spans[0];
@@ -1371,7 +1371,7 @@ async fn a_push_spanning_more_than_a_hundred_dates_is_refused() {
     let root = spool_root("day-gate");
     let cfg = WriterConfig {
         ingest_dedup: false,
-        ..Default::default()
+        ..unbatched_config()
     };
 
     for transport in ["otlp", "zipkin"] {
@@ -1396,7 +1396,7 @@ async fn a_push_spanning_more_than_a_hundred_dates_is_refused() {
         let refused = post(transport, &writer, TRACE_LANDING_DAY_LIMIT + 1).await;
         let (status, headers, body) = parts(refused).await;
         let message =
-            push_spans_too_many_days_message(TRACE_LANDING_DAY_LIMIT + 1, TRACE_LANDING_DAY_LIMIT);
+            push_too_many_days_message(TRACE_LANDING_DAY_LIMIT + 1, TRACE_LANDING_DAY_LIMIT);
         assert_eq!(
             status,
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1506,7 +1506,7 @@ async fn a_span_with_too_many_paths_is_refused_at_decode_over_http() {
         batch_bytes: ByteSize(1024 * 1024 * 1024),
         ingest_queue_bytes: ByteSize(1024 * 1024 * 1024),
         ingest_dedup: false,
-        ..Default::default()
+        ..unbatched_config()
     };
     let limit = MAX_JSON_PATHS_PER_VALUE;
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::unrecorded(Act::Ok);
@@ -1598,7 +1598,7 @@ async fn a_push_too_large_is_413_on_the_trace_transports() {
     let cfg = WriterConfig {
         trace_landing_max_rows: rows,
         ingest_dedup: false,
-        ..Default::default()
+        ..unbatched_config()
     };
 
     for transport in ["otlp", "zipkin"] {
@@ -1697,7 +1697,7 @@ fn roomy_writer(root: &Path, landing: Arc<MockInserter<TraceLandingRow>>) -> Tra
         batch_bytes: ByteSize(4 << 30),
         ingest_queue_bytes: ByteSize(16 << 30),
         ingest_dedup: false,
-        ..Default::default()
+        ..unbatched_config()
     };
     writer_with(&cfg, root, landing)
 }
@@ -2073,11 +2073,11 @@ async fn no_landing_insert_reaches_the_asynchronous_queue() {
     };
 
     let root = spool_root("async-queue");
-    let mut runtime = runtime_at(&WriterConfig::default(), &root);
+    let mut runtime = runtime_at(&unbatched_config(), &root);
     runtime.trace_landing_inserters = 1;
     let writer = TraceWriter::new_with_tables(
         client.clone(),
-        &WriterConfig::default(),
+        &unbatched_config(),
         TraceWriterTables::traces_default(),
     );
     let landed = decode(&six_spans());
@@ -3411,7 +3411,7 @@ async fn w17_the_stored_bucket_set_is_the_traces_own_distinct_span_buckets() {
 async fn a_trace_block_queued_when_the_drain_begins_is_sent_inside_the_grace() {
     let root = spool_root("queued-at-drain");
     let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
-    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let writer = writer_with(&unbatched_config(), &root, landing.clone());
 
     let landed = decode(&six_spans());
     writer
@@ -3460,7 +3460,7 @@ async fn a_retry_after_a_throwing_view_is_stored_once_the_fault_clears() {
     );
     let cfg = WriterConfig {
         trace_landing_retries: 0,
-        ..Default::default()
+        ..unbatched_config()
     };
     let writer =
         TraceWriter::new_with_tables(writer_client, &cfg, TraceWriterTables::traces_default());
@@ -3505,7 +3505,286 @@ async fn a_retry_after_a_throwing_view_is_stored_once_the_fault_clears() {
     drop_live_db(&db).await;
 }
 
+// -- issue #494 part 2: batches -----------------------------------------
+
+/// Push `trace`: one span starting on each of `days` (days after
+/// [`base_ns`]'s), every span under trace id `[trace; 16]`.
+fn spans_on(trace: u8, days: &[i64]) -> ExportTraceServiceRequest {
+    let base = (base_ns() / NS_PER_DAY) * NS_PER_DAY + 3_600_000_000_000;
+    request_of(
+        "checkout",
+        days.iter()
+            .enumerate()
+            .map(|(i, &d)| {
+                span_at(
+                    trace,
+                    i as u8 + 1,
+                    base + d * NS_PER_DAY,
+                    vec![kv("http.route", "/api")],
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The pushes each insert call carried, by their spans' trace id byte, in the
+/// call's row order.
+fn traces_per_call(landing: &MockInserter<TraceLandingRow>) -> Vec<Vec<u8>> {
+    (0..landing.call_count())
+        .map(|call| {
+            let mut traces: Vec<u8> = Vec::new();
+            for row in landing.rows_of(call).iter().filter(|r| r.row_kind == 0) {
+                if traces.last() != Some(&row.trace_id[0]) {
+                    traces.push(row.trace_id[0]);
+                }
+            }
+            traces
+        })
+        .collect()
+}
+
+fn batched_config() -> WriterConfig {
+    WriterConfig {
+        landing_batch_ms: 1_000,
+        ..WriterConfig::default()
+    }
+}
+
+/// **2-U3b.** Through the writer, a block's date span is its spans' start
+/// dates: `A` on dates 1-60, `B` on 61-120, `C` on 61, admitted together,
+/// are `[A]` and `[B, C]`; `D` on dates 1 and 201 beside `E` on 1 are `[D]`
+/// and `[E]`.
+#[tokio::test(start_paused = true)]
+async fn a_trace_batch_spans_at_most_one_hundred_days_of_its_spans() {
+    let root = spool_root("batch-span");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
+    let writer = writer_with(&batched_config(), &root, landing.clone());
+    let pushes = [
+        spans_on(0xa, &[1, 30, 60]),
+        spans_on(0xb, &[61, 90, 120]),
+        spans_on(0xc, &[61]),
+        spans_on(0xd, &[1, 201]),
+        spans_on(0xe, &[1]),
+    ];
+    let waits: Vec<_> = pushes
+        .iter()
+        .map(|req| {
+            writer
+                .admit_flush(&no_tenant(), decode(req), PushHeaders::default())
+                .expect("queue has room")
+        })
+        .collect();
+    for wait in waits {
+        wait.await.expect("the batch commits");
+    }
+    assert_eq!(
+        traces_per_call(&landing),
+        vec![vec![0xa], vec![0xb, 0xc], vec![0xd], vec![0xe]],
+        "inserts by push"
+    );
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **2-U8.** Three pushes admitted 10 ms apart carry three receive stamps;
+/// their batch is one insert whose every row carries the smallest.
+#[tokio::test]
+async fn every_row_of_a_trace_batch_carries_its_first_members_receive_stamp() {
+    let root = spool_root("batch-stamp");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
+    let writer = writer_with(&batched_config(), &root, landing.clone());
+    let mut waits = Vec::new();
+    let mut admitted_ms = Vec::new();
+    for trace in [0xau8, 0xb, 0xc] {
+        if trace != 0xa {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        admitted_ms.push(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_millis() as i64,
+        );
+        waits.push(
+            writer
+                .admit_flush(
+                    &no_tenant(),
+                    decode(&spans_on(trace, &[0])),
+                    PushHeaders::default(),
+                )
+                .expect("queue has room"),
+        );
+    }
+    for wait in waits {
+        wait.await.expect("the batch commits");
+    }
+    assert_eq!(landing.call_count(), 1, "one insert");
+    let rows = landing.rows_of(0);
+    let mut stamps: Vec<i64> = rows.iter().map(|r| r.received_ms).collect();
+    stamps.dedup();
+    assert_eq!(
+        stamps.len(),
+        1,
+        "every row carries one receive stamp: {stamps:?}"
+    );
+    assert!(
+        stamps[0] >= admitted_ms[0] && stamps[0] < admitted_ms[1],
+        "the first member's: {} not in [{}, {})",
+        stamps[0],
+        admitted_ms[0],
+        admitted_ms[1]
+    );
+    assert_eq!(count_of_kind(&rows, 0), 3, "all three pushes' spans");
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+struct LogCounts {
+    ended: u64,
+    pending: u64,
+}
+
+/// Waits until every statement `filter` selects in `client`'s
+/// `system.query_log` has its ending row, and at least `at_least` have ended.
+///
+/// One `SYSTEM FLUSH LOGS` is not a barrier: a statement's `QueryFinish` row
+/// can be queued after its client has the answer. Its `QueryStart` row is
+/// queued before it runs, so once flushed it names every statement sent; an
+/// execution is a `query_id` with its `query_start_time_microseconds`, which
+/// both rows share. `filter` must not name `type`. Fails after 60 s.
+async fn settle_query_log(client: &ChClient, filter: &str, at_least: u64) {
+    let sql = format!(
+        "SELECT toUInt64(countIf(e)) AS ended, toUInt64(countIf(s AND NOT e)) AS pending \
+         FROM (SELECT query_id, max(type = 'QueryStart') AS s, \
+                 max(type IN ('QueryFinish', 'ExceptionWhileProcessing', \
+                              'ExceptionBeforeStart')) AS e \
+               FROM system.query_log \
+               WHERE ({filter}) AND query NOT LIKE '%system.query_log%' \
+               GROUP BY query_id, query_start_time_microseconds)"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        client
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("SYSTEM FLUSH LOGS");
+        let mut stream = client
+            .query_stream::<LogCounts>(&sql, &QuerySettings::new())
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{sql}"));
+        let counts = stream
+            .next()
+            .await
+            .expect("one row")
+            .expect("decode LogCounts");
+        drop(stream);
+        if counts.ended >= at_least && counts.pending == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "system.query_log did not settle within 60 s for {filter}: {counts:?}, \
+             at least {at_least} expected"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// **2-L3.** Four pushes of 4 spans, admitted together through a writer with
+/// the 1000 ms window, are one landing insert on the server, and `spans`
+/// holds all 16.
+#[tokio::test]
+async fn four_trace_pushes_admitted_together_are_one_landing_insert() {
+    skip_unless_live!();
+    let (client, db) = live_db(pulsus_testkit::test_db("pulsus_trace_landing_it_batch")).await;
+    let writer_client = Arc::new(
+        ChClient::new(ChConnConfig {
+            database: db.clone(),
+            ..live_config()
+        })
+        .await
+        .expect("connect the writer"),
+    );
+    let writer = TraceWriter::new_with_tables(
+        writer_client,
+        &batched_config(),
+        TraceWriterTables::traces_default(),
+    );
+    // This run's statements: the database is recreated each run, but the
+    // log keeps earlier runs' rows under the same name.
+    let start = live_count(
+        &client,
+        "SELECT toUInt64(toUnixTimestamp64Micro(now64(6))) AS n",
+    )
+    .await;
+    let base = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_nanos() as i64;
+    let waits: Vec<_> = (1..=4u8)
+        .map(|trace| {
+            let req = request_of(
+                "checkout",
+                (0..4u8)
+                    .map(|i| {
+                        span_at(
+                            trace,
+                            i + 1,
+                            base + i64::from(i) * 1_000_000,
+                            vec![kv("http.route", "/api")],
+                        )
+                    })
+                    .collect(),
+            );
+            writer
+                .admit_flush(&no_tenant(), decode(&req), PushHeaders::default())
+                .expect("admitted")
+        })
+        .collect();
+    for wait in waits {
+        wait.await.expect("every push is answered Ok");
+    }
+    let filter = format!(
+        "current_database = '{db}' AND query_kind = 'Insert' \
+         AND startsWith(query, 'INSERT INTO `trace_landing`') \
+         AND query_start_time_microseconds >= fromUnixTimestamp64Micro(toInt64({start}))"
+    );
+    settle_query_log(&client, &filter, 1).await;
+    assert_eq!(
+        live_count(
+            &client,
+            &format!(
+                "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' AND {filter}"
+            )
+        )
+        .await,
+        1,
+        "one landing insert"
+    );
+    assert_eq!(
+        live_count(&client, "SELECT count() AS n FROM spans FINAL").await,
+        16
+    );
+    writer.shutdown(Duration::from_secs(5)).await;
+    drop_live_db(&db).await;
+}
+
 /// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
 fn no_tenant() -> pulsus_model::Tenant {
     pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
+}
+
+/// `WriterConfig::default()` with log and trace batching off (issue #494
+/// part 2), so each case here keeps meaning one push per insert.
+#[allow(dead_code)]
+fn unbatched_config() -> pulsus_config::WriterConfig {
+    pulsus_config::WriterConfig {
+        landing_batch_ms: 0,
+        ..pulsus_config::WriterConfig::default()
+    }
 }

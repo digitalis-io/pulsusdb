@@ -246,6 +246,18 @@ impl ChClient {
         rows: &[R],
         extra: &QuerySettings,
     ) -> Result<(), ChError> {
+        self.insert_parts_with(table, &[rows], extra).await
+    }
+
+    /// [`Self::insert_block_with`] over `parts`, written in order into one
+    /// request as one block (issue #494 part 2: a landing batch is its
+    /// members' rows, and no row is copied to join them).
+    pub async fn insert_parts_with<R: ChRow>(
+        &self,
+        table: &str,
+        parts: &[&[R]],
+        extra: &QuerySettings,
+    ) -> Result<(), ChError> {
         let conn = self.pool.get().await?;
         // Issue #114: the whole attached set — the server deadline plus,
         // when quorum is enabled, the quorum trio — is the single testable
@@ -289,7 +301,7 @@ impl ChClient {
             Err(pair) => Err(pair),
             Ok(mut insert) => {
                 let send = async {
-                    for row in rows {
+                    for row in parts.iter().flat_map(|part| part.iter()) {
                         insert.write(row).await?;
                     }
                     insert.end().await
@@ -607,6 +619,8 @@ mod tests {
              distributed_foreground_insert = 1, insert_shard_id = 0, \
              skip_unavailable_shards = 0, prefer_localhost_replica = 0, \
              timeout_overflow_mode = throw, \
+             max_partitions_per_insert_block = 100, \
+             throw_on_max_partitions_per_insert_block = 1, \
              max_execution_time = 120.000"
         );
     }

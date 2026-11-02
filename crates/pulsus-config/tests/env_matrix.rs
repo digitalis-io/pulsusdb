@@ -323,6 +323,11 @@ const ROWS: &[Row] = &[
         check: |c| c.writer.trace_landing_max_rows == 2_000_000,
     },
     Row {
+        var: "PULSUS_LANDING_BATCH_MS",
+        value: "250",
+        check: |c| c.writer.landing_batch_ms == 250,
+    },
+    Row {
         var: "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
         value: "native",
         check: |c| c.exp_histogram_mode == ExpHistogramMode::Native,
