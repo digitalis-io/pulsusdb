@@ -767,7 +767,12 @@ async fn a_side_behind_its_coverage_falls_back_whole() {
         )
         .await;
         let (cache, slot) = warm(&f).await;
-        let comment = format!("{}_t10b_{side}_{shard}", f.db);
+        // Unique to this run: the log keeps earlier runs' rows.
+        let comment = format!(
+            "{}_t10b_{side}_{shard}_{}",
+            f.db,
+            uuid::Uuid::new_v4().simple()
+        );
         let hook: pulsus_read::metrics::exec::CoverageHook =
             Arc::new(move |selector, mut runs: Vec<RunRow>| {
                 if selector == side {

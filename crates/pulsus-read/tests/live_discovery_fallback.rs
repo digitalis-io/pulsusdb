@@ -339,7 +339,11 @@ async fn degraded_regex_name_discovery_matches_the_warm_path_byte_for_byte() {
         1_000,
     )
     .replace('?', "??");
-    let query_id = &pulsus_testkit::test_ident("pulsus_read_it_discovery_fallback_probe");
+    // Unique to this run: the log keeps earlier runs' rows.
+    let query_id = &pulsus_testkit::test_ident(&format!(
+        "pulsus_read_it_discovery_fallback_probe_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     let mut stream = client
         .query_stream::<ProbeNameRow>(&probe_sql, &QuerySettings::new().set("query_id", query_id))
         .await

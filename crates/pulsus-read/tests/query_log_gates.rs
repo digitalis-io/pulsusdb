@@ -298,6 +298,9 @@ async fn run_and_capture<R: pulsus_clickhouse::ChRow>(
     sql: &str,
     query_id: &str,
 ) -> (u64, QueryLogRow) {
+    // Unique to this execution: the log keeps earlier runs' rows, and a
+    // caller's id may repeat across runs.
+    let query_id = &format!("{query_id}-{}", uuid::Uuid::new_v4().simple());
     let settings = QuerySettings::new()
         .set("query_id", query_id)
         .set("use_query_condition_cache", 0);
@@ -1451,6 +1454,9 @@ struct FanInRow {
 /// scoped to this function so its pooled connection lease is released
 /// before the `system.query_log` read.
 async fn run_detected_labels(client: &ChClient, sql: &str, query_id: &str) -> (u64, FanInRow) {
+    // Unique to this execution: the log keeps earlier runs' rows, and a
+    // caller's id may repeat across runs.
+    let query_id = &format!("{query_id}-{}", uuid::Uuid::new_v4().simple());
     let settings = QuerySettings::new().set("query_id", query_id);
     let mut returned = 0u64;
     {
@@ -2143,6 +2149,9 @@ async fn run_name_projection<R: pulsus_clickhouse::ChRow>(
     sql: &str,
     query_id: &str,
 ) -> NameProjectionRow {
+    // Unique to this execution: the log keeps earlier runs' rows, and a
+    // caller's id may repeat across runs.
+    let query_id = &format!("{query_id}-{}", uuid::Uuid::new_v4().simple());
     let settings = QuerySettings::new()
         .set("query_id", query_id)
         .set("use_query_condition_cache", 0);

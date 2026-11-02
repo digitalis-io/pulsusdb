@@ -368,7 +368,8 @@ async fn the_production_discovery_read_answers_completely_over_split_placement()
     // Written out here rather than built by `sql::`: the point is what the
     // read path used to issue, and a control produced by the builder under
     // test would move with it.
-    let control_id = format!("logs-disc-control-{}", std::process::id());
+    // Unique to this run: the log keeps earlier runs' rows.
+    let control_id = format!("logs-disc-control-{}", uuid::Uuid::new_v4().simple());
     let control_sql = format!(
         "SELECT DISTINCT val AS value\nFROM {db}.log_streams_idx_dist\n\
          WHERE month = toDate({month}) AND key = 'env'\n  \

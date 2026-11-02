@@ -5,6 +5,13 @@
 //! can miss it. Its `QueryStart` row is queued before the statement runs, so
 //! once flushed it names every statement sent. [`settle_query_log`] flushes
 //! and reads until each of those statements has its ending row too.
+//!
+//! One execution is a `query_id` with its `query_start_time_microseconds`,
+//! which its start and ending rows share. The log keeps earlier runs' rows
+//! and an id can repeat, so an old run's ending row must not stand in for
+//! this run's. A caller's filter must still select this run's statements
+//! alone (a per-run comment, id or time marker), or an earlier run's
+//! unfinished statement would hold the wait.
 
 use std::time::{Duration, Instant};
 
@@ -36,7 +43,7 @@ pub async fn settle_query_log(nodes: &[&ChClient], filter: &str, at_least: u64) 
                               'ExceptionBeforeStart')) AS e \
                FROM system.query_log \
                WHERE ({filter}) AND query NOT LIKE '%system.query_log%' \
-               GROUP BY query_id)"
+               GROUP BY query_id, query_start_time_microseconds)"
     );
     let deadline = Instant::now() + QUERY_LOG_WAIT;
     loop {
