@@ -476,11 +476,11 @@ pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, Pip
 /// should have excluded, and a needle containing `_` failed the query
 /// outright (`BAD_ARGUMENTS`). There is no safe subset for us to write —
 /// a token prefilter is equivalence-preserving only when the needle is
-/// token-aligned *in the data*, which the query cannot know. No index serves
-/// either form: the body's one index, `idx_body_words`, is on
-/// `upperUTF8(lowerUTF8(body))`, and only a `word(…)` alternative reads it,
-/// as `hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('<w>')),
-/// …])` (issue #757).
+/// token-aligned *in the data*, which the query cannot know. The body's two
+/// indexes read the predicates as written: `idx_body_ngrams`, `ngrambf_v1`
+/// on `body`, serves `body LIKE` and `match(body, …)`; `idx_body_words`,
+/// `tokenbf_v1` on `upperUTF8(lowerUTF8(body))`, serves a `word(…)`
+/// alternative's `hasToken` conjunction.
 ///
 /// An `or` group (M8-LQ2 `linefilter.or`) is a disjunction of the same
 /// per-alternative predicate: `((a) OR (b) …)` for positive ops,
@@ -1434,27 +1434,42 @@ fn contains_predicate(phrase: &str) -> String {
     format!("body LIKE {}", ch_like_contains(phrase))
 }
 
-/// `hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('<w>')),
-/// …])`, the pushed `word(…)` predicate (issue #757): the expression
-/// `idx_body_words` indexes, each word keyed by the database in the order
-/// written.
+/// The pushed `word(…)` predicate (issue #757): one
+/// `hasToken(upperUTF8(lowerUTF8(body)), upperUTF8(lowerUTF8('<w>')))` per
+/// word, in the order written, ANDed and parenthesised at two or more.
+/// `idx_body_words` serves `hasToken`; it does not serve `hasAllTokens`.
+/// No words renders `0`; the parser admits none.
 fn words_predicate(words: &[String]) -> String {
-    format!(
-        "hasAllTokens({}, [{}])",
-        case_key_sql("body"),
-        words
-            .iter()
-            .map(|w| case_key_sql(&ch_string(w)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+    let parts: Vec<String> = words
+        .iter()
+        .map(|w| {
+            format!(
+                "hasToken({}, {})",
+                case_key_sql("body"),
+                case_key_sql(&ch_string(w))
+            )
+        })
+        .collect();
+    match parts.as_slice() {
+        [] => "0".to_string(),
+        [one] => one.clone(),
+        _ => format!("({})", parts.join(" AND ")),
+    }
 }
 
-/// `match(body, <p>)`, the pushed `|~`/`!~` predicate. No index serves it
-/// (issue #757).
+/// `match(body, <p>)`, the pushed `|~`/`!~` predicate, read by
+/// `idx_body_ngrams`. A pattern that turns case-insensitivity on renders
+/// `match(identity(body), <p>)`, which no index reads: over a row
+/// `audit DENIED open`, `match(s, '(?i)(denied|refused)')` counts 0 with the
+/// n-gram index and 1 without it.
 fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
+    let column = if pulsus_re2::sets_case_insensitive(pattern) {
+        "identity(body)"
+    } else {
+        "body"
+    };
     Ok(format!(
-        "match(body, {})",
+        "match({column}, {})",
         ch_regex_unanchored_checked(pattern)?
     ))
 }
@@ -2288,11 +2303,14 @@ mod tests {
         }
     }
 
-    /// Issue #757 H7: a `word(…)` alternative renders `hasAllTokens` over
-    /// the case key `upperUTF8(lowerUTF8(body))`, each word keyed in SQL and
-    /// kept in the order written; a `|~` always renders `match(body, …)`.
+    /// Issue #757: a `word(…)` alternative renders one `hasToken` per word
+    /// over the case key `upperUTF8(lowerUTF8(body))`, each word keyed in SQL,
+    /// kept in the order written and ANDed, which `idx_body_words` serves; a
+    /// `|~` that turns case-insensitivity on renders `match(identity(body), …)`,
+    /// which keeps `idx_body_ngrams` out, and any other `|~` renders
+    /// `match(body, …)`.
     #[test]
-    fn a_word_alternative_renders_has_all_tokens_and_a_regex_renders_match_body() {
+    fn a_word_alternative_renders_has_token_and_a_case_insensitive_regex_keeps_the_index_out() {
         fn words(ws: &[&str]) -> LineMatch {
             LineMatch::Words(ws.iter().map(|w| w.to_string()).collect())
         }
@@ -2303,7 +2321,7 @@ mod tests {
                     head: words(&["Memcached"]),
                     or_matches: Vec::new(),
                 },
-                "hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('Memcached'))])",
+                "hasToken(upperUTF8(lowerUTF8(body)), upperUTF8(lowerUTF8('Memcached')))",
             ),
             (
                 LineFilter {
@@ -2311,7 +2329,7 @@ mod tests {
                     head: words(&["connection", "refused"]),
                     or_matches: Vec::new(),
                 },
-                "NOT (hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('connection')), upperUTF8(lowerUTF8('refused'))]))",
+                "NOT ((hasToken(upperUTF8(lowerUTF8(body)), upperUTF8(lowerUTF8('connection'))) AND hasToken(upperUTF8(lowerUTF8(body)), upperUTF8(lowerUTF8('refused')))))",
             ),
             (
                 LineFilter {
@@ -2319,11 +2337,23 @@ mod tests {
                     head: words(&["a"]),
                     or_matches: vec![LineMatch::Text("b".to_string())],
                 },
-                "((hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('a'))])) OR (body LIKE '%b%'))",
+                "((hasToken(upperUTF8(lowerUTF8(body)), upperUTF8(lowerUTF8('a')))) OR (body LIKE '%b%'))",
             ),
             (
                 regex_filter("(?i)(denied|refused)"),
-                "match(body, '(?i)(denied|refused)')",
+                "match(identity(body), '(?i)(denied|refused)')",
+            ),
+            (
+                LineFilter {
+                    op: LineFilterOp::NotRegex,
+                    head: LineMatch::Text("(?i)(denied|refused)".to_string()),
+                    or_matches: Vec::new(),
+                },
+                "NOT (match(identity(body), '(?i)(denied|refused)'))",
+            ),
+            (
+                regex_filter("connection refused"),
+                "match(body, 'connection refused')",
             ),
         ];
         for (lf, want) in cases {

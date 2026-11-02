@@ -465,6 +465,36 @@ pub fn clickhouse_match_head_rewrite(pattern: &str) -> Option<String> {
     Some(build_head_rewrite(&cs, &leaking))
 }
 
+/// Whether `pattern` turns case-insensitivity on anywhere: a flag item or
+/// a `(?flags:…)` group whose flags set `i`. A pattern that does not parse
+/// answers `true`.
+pub fn sets_case_insensitive(pattern: &str) -> bool {
+    use regex_syntax::ast::{Ast, Flag, GroupKind};
+    fn walk(ast: &Ast) -> bool {
+        match ast {
+            Ast::Flags(set) => set.flags.flag_state(Flag::CaseInsensitive) == Some(true),
+            Ast::Group(group) => {
+                matches!(&group.kind, GroupKind::NonCapturing(flags)
+                    if flags.flag_state(Flag::CaseInsensitive) == Some(true))
+                    || walk(&group.ast)
+            }
+            Ast::Alternation(alt) => alt.asts.iter().any(walk),
+            Ast::Concat(concat) => concat.asts.iter().any(walk),
+            Ast::Repetition(rep) => walk(&rep.ast),
+            Ast::Empty(_)
+            | Ast::Literal(_)
+            | Ast::Dot(_)
+            | Ast::Assertion(_)
+            | Ast::ClassUnicode(_)
+            | Ast::ClassPerl(_)
+            | Ast::ClassBracketed(_) => false,
+        }
+    }
+    regex_syntax::ast::parse::Parser::new()
+        .parse(pattern)
+        .map_or(true, |ast| walk(&ast))
+}
+
 /// One scan: every valid flag head, split into the affected (no-`i`)
 /// list and an any-`i`-head flag. Shared by the strategy and the
 /// measurement seam so the two can never disagree about what a head is.
@@ -771,6 +801,32 @@ fn class_span_end(cs: &[char], open: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #757 D5: a pattern turns case-insensitivity on when a flag
+    /// item or a `(?flags:…)` group sets `i`, wherever it sits; text that
+    /// only looks like a flag group does not, and a pattern that does not
+    /// parse answers `true`.
+    #[test]
+    fn sets_case_insensitive_matches_a_hand_written_table() {
+        for (pattern, want) in [
+            ("x", false),
+            ("(?s)x", false),
+            ("(?i)x", true),
+            ("(?-i)x", false),
+            ("a(?i)b", true),
+            ("(?i)(?-i)x", true),
+            ("(?i:x)", true),
+            ("[iI]", false),
+            ("(?si)x", true),
+            ("[(?i)]", false),
+            ("(?i-s)x", true),
+            (r"\(\?i\)", false),
+            ("(a|(?i:b))", true),
+            ("(", true),
+        ] {
+            assert_eq!(sets_case_insensitive(pattern), want, "{pattern:?}");
+        }
+    }
 
     /// The rewrite must be a no-op for ordinary matchers — both for
     /// correctness and because a `Cow::Borrowed` is the whole cost story.

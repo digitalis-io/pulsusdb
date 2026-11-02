@@ -2491,10 +2491,10 @@ the migration catalogue is append-only and that the window for in-place amendmen
 > Migrations are idempotent, and append-only from the first tagged release onward —
 > in-place amendment of an already-listed migration was permitted only pre-release (the
 > trace-index scope amendment, issue #54, was the last such window; see docs/schemas.md §6)
-> — `docs/architecture.md:103`
+> — `docs/architecture.md:105`
 
 > the trace-index scope amendment (issue #54) was the last such amendment window
-> — `docs/schemas.md:1067`
+> — `docs/schemas.md:1069`
 
 > issue #54's scope amendment of migrations 17/18 + `trace_tag_catalog_mv` was the last
 > such amendment window (task-manager ruling on #54) — `crates/pulsus-schema/src/catalog.rs:16-23`
@@ -3167,7 +3167,7 @@ from its source; the pointer is not reproduced here.
 | spans per trace cap | `LIMIT 10001 BY trace_id` | `crates/pulsus-read/src/traces/exec.rs:131` @ 1cdb3e5e |
 | tag name / value caps | 10,000 / 1,000 | `crates/pulsus-read/src/traces/exec.rs:131 @ 1cdb3e5e, 135` |
 | storage → reader wire format | RowBinary, LZ4-framed | `crates/pulsus-clickhouse/src/pool.rs:698` → `vendor/clickhouse/Cargo.toml:49` → `vendor/clickhouse/src/query.rs:221-231` |
-| shard key | `cityHash64(trace_id)` | `schema/schema.sql:566` |
+| shard key | `cityHash64(trace_id)` | `schema/schema.sql:567` |
 | pushed aggregates | `uniqExact(span_id)`, `max(duration_ns)`, `min(duration_ns)` | `crates/pulsus-read/src/traces/compile.rs:478-489` |
 
 ### Assumed compression ratios

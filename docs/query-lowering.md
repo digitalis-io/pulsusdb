@@ -1,5 +1,7 @@
 # Query lowering: compiling pipeline stages to SQL
 
+**Stale on the log body index.** `log_samples` carries two bloom-filter indexes on the body and no `text` index: `idx_body_words`, `tokenbf_v1(32768, 3, 0)` over `upperUTF8(lowerUTF8(body))`, which a `word(…)` filter reads through `hasToken`; and `idx_body_ngrams`, `ngrambf_v1(4, 32768, 3, 0)` over `body`, which `body LIKE` and `match(body, …)` read. A `|~` that turns case-insensitivity on renders `match(identity(body), …)` and reads neither. Passages below that describe a `text` index, `hasAllTokens`, a body with no substring index, or line filters that prune nothing are out of date. Current behaviour: `schema/schema.sql` and `crates/pulsus-read/src/logql/predicate.rs`.
+
 **Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2 — and the previous trace metrics and service-graph SQL, which #602 part 3a deleted; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Parts of this document describe the schema controller, the migration catalogue and the TTL rotation, which no longer exist. The schema is now `schema/schema.sql`, built by `schema/schema.sh`; the binary creates no schema, and retention is the TTL each table is created with.** A LogQL or TraceQL query is a **selector** followed by a **pipeline of stages**. Every stage can
 be evaluated in `pulsus-server` over rows ClickHouse has already sent, and some can instead be
 compiled into the SQL we send, so ClickHouse does the work next to the data and returns less.
@@ -1321,7 +1323,7 @@ above. The two are separate constructs and the record had them crossed.
 ### 3.4 Group 3 — lowered already, prunes nothing
 
 `trace_attrs_idx` is `ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)`
-([`schema.sql`](../schema/schema.sql), line 337). `val` is the second key column,
+([`schema.sql`](../schema/schema.sql), line 338). `val` is the second key column,
 so a predicate on it prunes only if it is a **range**. `val = 'x'` is a point range;
 `match(val, …)` and `val_num <op> n` are neither, so pruning stops at `key` and every row carrying
 that key inside the window is read. `GenClass::AttrKeyScan` (`filter.rs:95`) already names this
@@ -2750,7 +2752,7 @@ lines above them, and neither number was wrong about what it measured.
 `min = max` with `uniqExact(read_rows) = 1`, not inferred from a total that happens to divide (the
 trap §9.2 records against itself). That is the whole `key = 'a'` (or `'c'`) partition, once per
 read, and it equals the phase-1 generator's own read. `trace_id` is the fifth column of `ORDER BY
-(key, val, scope, timestamp_ns, trace_id, span_id)` (`schema/schema.sql:443`), so a batch's
+(key, val, scope, timestamp_ns, trace_id, span_id)` (`schema/schema.sql:444`), so a batch's
 `trace_id IN (32 ids)` prunes nothing inside it.
 
 **And §9.2's cheap fix does not apply.** §9.2 records that narrowing the *membership* read's
@@ -3136,7 +3138,7 @@ memory at production volume, and whether 80,658,368 rows per generator statement
 
 **What it is.** An **additional** `trace_attrs_idx`-shaped table ordered `(trace_id, span_id, key)`,
 alongside the existing `ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)`
-(`schema/schema.sql:443`) — **not instead of it**.
+(`schema/schema.sql:444`) — **not instead of it**.
 
 **What it costs to store.** **451,383,963** bytes for the same **71,000,000** rows, on top of the
 existing key-ordered `trace_attrs_idx` — which is **1,128,726,045** bytes on four builds of the
@@ -5547,8 +5549,8 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | occurrences those resolved pairs cover | 348 |
 | `(document, token)` pairs it cannot resolve | 195 |
 | occurrences those frozen pairs cover | 305 |
-| resolved rows anchored on a token the citing prose prints | 138 |
-| resolved rows anchored on a snapshot of the cited line | 116 |
+| resolved rows anchored on a token the citing prose prints | 139 |
+| resolved rows anchored on a snapshot of the cited line | 115 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
@@ -5566,7 +5568,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 653 citation occurrences the five artefacts make, 478 name a bare basename and 65 are written as a continuation of a citation earlier on the same line. The rule resolves 254 `(document, token)` pairs covering 348 occurrences, and cannot resolve 195 covering 305. Of the resolved rows, 138 are anchored on a token the citing prose prints and 116 on a snapshot of the cited line.
+Of the 653 citation occurrences the five artefacts make, 478 name a bare basename and 65 are written as a continuation of a citation earlier on the same line. The rule resolves 254 `(document, token)` pairs covering 348 occurrences, and cannot resolve 195 covering 305. Of the resolved rows, 139 are anchored on a token the citing prose prints and 115 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 1 citations, all of them read one at a time. 1 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

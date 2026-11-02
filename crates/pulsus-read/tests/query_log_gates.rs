@@ -9470,10 +9470,13 @@ struct ExplainLine624p3 {
 /// **T12 (issue #624, part 3a, F2): a pushed line filter returns the rows
 /// it returns without the skip indexes.** (a) `match()` keeps the granule
 /// for `(?i)(denied|refused)`; (b) over §2.3's sweep — 16 shapes × 11 flag
-/// placements, 26 bodies, one granule per row, under the body's word index
-/// — every pattern's pushed predicate counts what it counts unindexed; (c)
-/// a `word(…)` filter beside a regex filter in the same statement prunes
-/// on the word index (issue #757).
+/// placements, 26 bodies, one granule per row, under the body's n-gram
+/// index — every pattern's pushed predicate counts what it counts
+/// unindexed; (c) a `word(…)` filter beside a regex filter in the same
+/// statement prunes on the word index (issue #757); (d) every substring
+/// needle drawn from 21 bodies counts, under the n-gram index, what it
+/// counts unindexed and what `str::contains` counts, and `Straße` keeps one
+/// granule of 21 (issue #757).
 #[tokio::test]
 async fn pushed_line_filters_equal_the_unindexed_answer() {
     skip_unless_live!();
@@ -9529,7 +9532,7 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         &admin,
         &format!(
             "CREATE TABLE {table} (body String, \
-             INDEX idx_body_words upperUTF8(lowerUTF8(body)) TYPE text(tokenizer = splitByNonAlpha)) \
+             INDEX idx_body_ngrams body TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) \
              ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
         ),
     )
@@ -9647,7 +9650,7 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         &admin,
         &format!(
             "CREATE TABLE {table} (body String, \
-             INDEX idx_body_words upperUTF8(lowerUTF8(body)) TYPE text(tokenizer = splitByNonAlpha)) \
+             INDEX idx_body_words upperUTF8(lowerUTF8(body)) TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1) \
              ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
         ),
     )
@@ -9707,6 +9710,133 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         total.trim().parse().expect("total"),
     );
     assert!(kept < total, "(c) idx_body_words prunes: {granules}");
+
+    // (d)
+    let table = format!("{db}.f2_like");
+    exec_624(
+        &admin,
+        &format!(
+            "CREATE TABLE {table} (body String, \
+             INDEX idx_body_ngrams body TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) \
+             ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
+        ),
+    )
+    .await;
+    let long = "x".repeat(300);
+    let bodies: [&str; 21] = [
+        "connection refused",
+        "Connection Refused",
+        "100% done",
+        "a_b_c_d",
+        "path\\to\\file",
+        "tab\there",
+        "line1\nline2",
+        "nul\0byte",
+        "ΟΔΟΣ οδος",
+        "Straße",
+        "日本語のログ",
+        "emoji 😀 here",
+        "abc",
+        "ab",
+        "",
+        &long,
+        "CONN_REFUSED_7734",
+        "%%%%",
+        "____",
+        "\\\\\\\\",
+        "mixed 100%_\\ end",
+    ];
+    let values = bodies
+        .iter()
+        .map(|b| format!("({})", literal(b).as_sql()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    exec_624(
+        &admin,
+        &format!("INSERT INTO {table} (body) VALUES {values}"),
+    )
+    .await;
+    let mut needles: Vec<String> = Vec::new();
+    for body in bodies {
+        let cs: Vec<char> = body.chars().collect();
+        let range = |from: usize, to: usize| -> String {
+            let to = to.min(cs.len());
+            let from = from.min(to);
+            cs[from..to].iter().collect()
+        };
+        for needle in [
+            body.to_string(),
+            range(0, 4),
+            range(1, 5),
+            range(cs.len().saturating_sub(4), cs.len()),
+            range(0, 3),
+            range(2, 9),
+        ] {
+            if !needle.is_empty() && !needles.contains(&needle) {
+                needles.push(needle);
+            }
+        }
+    }
+    for needle in [
+        "zzzz", "efus", "ΟΔΟ", "ログ", "😀 h", "0% d", "_b_c", "\\to\\",
+    ] {
+        if !needles.iter().any(|n| n == needle) {
+            needles.push(needle.to_string());
+        }
+    }
+    let mut wrong: Vec<String> = Vec::new();
+    for needle in &needles {
+        let fragment = pulsus_read::logql::predicate::line_filter(&pulsus_logql::LineFilter {
+            op: pulsus_logql::LineFilterOp::Contains,
+            head: pulsus_logql::LineMatch::Text(needle.clone()),
+            or_matches: Vec::new(),
+        })
+        .unwrap_or_else(|e| panic!("{needle:?}: {e}"));
+        let indexed = count_where_624p3(&admin, &table, fragment.as_sql(), true).await;
+        let unindexed = count_where_624p3(&admin, &table, fragment.as_sql(), false).await;
+        let want = bodies
+            .iter()
+            .filter(|b| b.contains(needle.as_str()))
+            .count() as u64;
+        if indexed != want || unindexed != want {
+            wrong.push(format!(
+                "{needle:?}: {indexed} indexed, {unindexed} unindexed, {want} by str::contains"
+            ));
+        }
+    }
+    println!("(d) {} needles, {} wrong", needles.len(), wrong.len());
+    assert!(
+        wrong.is_empty(),
+        "(d) {} needles count wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+    let strasse = filter(
+        pulsus_logql::LineFilterOp::Contains,
+        pulsus_logql::LineMatch::Text("Straße".to_string()),
+    );
+    let sql = format!(
+        "EXPLAIN indexes = 1 SELECT count() FROM {table} WHERE {}",
+        strasse.as_sql()
+    );
+    let mut stream = admin
+        .query_stream::<ExplainLine624p3>(&sql.replace('?', "??"), &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let mut lines = Vec::new();
+    while let Some(row) = stream.next().await {
+        lines.push(row.expect("an explain line").explain);
+    }
+    drop(stream);
+    let at = lines
+        .iter()
+        .position(|l| l.contains("Name: idx_body_ngrams"))
+        .unwrap_or_else(|| panic!("(d) the n-gram index is used for Straße: {lines:#?}"));
+    let granules = lines[at..]
+        .iter()
+        .find_map(|l| l.trim().strip_prefix("Granules: "))
+        .unwrap_or_else(|| panic!("(d) its granules: {lines:#?}"));
+    assert_eq!(granules.trim(), "1/21", "(d) Straße keeps one granule");
     drop_db_624(&admin, &db).await;
 }
 
@@ -10112,13 +10242,16 @@ async fn seed_condition_cache_corpus_624p3b() -> (ChClient, String, i64) {
     (admin, db, t)
 }
 
-/// **S-T3 (issue #624, part 3b): a line filter leaves the next query's count
-/// intact.** On 26.3.29.7 a `PREWHERE service = …` statement whose `WHERE`
-/// holds `body LIKE` over a `text` index records, in the query condition
-/// cache, granules of the `service` condition as matching nothing; a later
-/// statement with the same `PREWHERE` and no body predicate then counts
-/// too few lines. The log query runs first, then the count: 300,000. It
-/// runs twice: with a substring filter, then with `word(…)` (issue #757).
+/// **S-T3 (issue #624, part 3b; issue #757): a line filter leaves the next
+/// query's count intact.** On 26.3.29.7 a `PREWHERE service = …` statement
+/// whose `WHERE` held `body LIKE` over a `text` index recorded, in the
+/// query condition cache, granules of the `service` condition as matching
+/// nothing, and a later statement with the same `PREWHERE` and no body
+/// predicate counted too few lines. The setting that turned the `text`
+/// index's direct read off went with that index (issue #757); this test
+/// shows the bloom-filter indexes leave the count intact with the setting
+/// at its default. The log query runs first, then the count: 300,000. It
+/// runs twice: with a substring filter, then with `word(…)`.
 #[tokio::test]
 async fn a_line_filter_leaves_the_next_count_intact() {
     skip_unless_live!();
@@ -10173,103 +10306,6 @@ async fn a_line_filter_leaves_the_next_count_intact() {
         assert_eq!(total, 300_000.0, "every line, after `{first}` ran");
     }
     exec_624(&admin, "SYSTEM DROP QUERY CONDITION CACHE").await;
-    drop_db_624(&admin, &db).await;
-}
-
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct DirectReadRow624p3b {
-    query: String,
-    direct_read: String,
-}
-
-/// **S-T4 (issue #624, part 3b): every statement over `log_samples` that
-/// carries a body predicate is sent with
-/// `query_plan_direct_read_from_text_index = 0`** — a log query, a page
-/// loop, a lowered count, today's route for a staged count, an instant
-/// query — and at least one statement of each shape is logged.
-#[tokio::test]
-async fn every_body_predicate_statement_disables_the_text_index_direct_read() {
-    skip_unless_live!();
-    let (admin, db, t) = seed_condition_cache_corpus_624p3b().await;
-    let comment = format!("c624p3bs4-{}", uuid::Uuid::new_v4().simple());
-    let engine = LogQlEngine::new(
-        data_client(&db).await,
-        engine_config(&db, 64 * 1024 * 1024 * 1024),
-        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-    )
-    .with_query_log_comment(comment.clone());
-    let range = QueryParams {
-        spec: QuerySpec::Range {
-            start_ns: t,
-            end_ns: t + 600_000_000_000,
-            step_ns: 60_000_000_000,
-        },
-        limit: 50,
-        direction: Direction::Backward,
-    };
-    let instant = QueryParams {
-        spec: QuerySpec::Instant {
-            at_ns: t + 600_000_000_000,
-        },
-        limit: 50,
-        direction: Direction::Backward,
-    };
-    for (query, params) in [
-        (r#"{service_name="c3s"} |= "panic: rare""#, &range),
-        (
-            r#"{service_name="c3s"} |~ "panic: r.re" | json | x="1""#,
-            &range,
-        ),
-        (r#"{service_name="c3s"} != "hay""#, &range),
-        (
-            r#"sum(count_over_time({service_name="c3s"} |= "panic" [1m]))"#,
-            &range,
-        ),
-        (
-            r#"sum(count_over_time({service_name="c3s"} |= "panic" | drop x [2m]))"#,
-            &range,
-        ),
-        (
-            r#"sum(count_over_time({service_name="c3s"} |~ "(?i)(panic|refused)" [10m]))"#,
-            &instant,
-        ),
-        (r#"{service_name="c3s"} |= word("panic")"#, &range),
-    ] {
-        engine
-            .query(&parse(query).expect("parse"), params)
-            .await
-            .unwrap_or_else(|e| panic!("{query}: {e}"));
-    }
-    let sql = format!(
-        "SELECT query, Settings['query_plan_direct_read_from_text_index'] AS direct_read \
-         FROM system.query_log WHERE log_comment = '{comment}' AND type = 'QueryFinish' \
-         AND query LIKE '%log_samples%' AND query LIKE '%body%' \
-         AND (query LIKE '%body LIKE%' OR query LIKE '%match(body%' OR query LIKE '%hasAllTokens(upperUTF8(lowerUTF8(body))%')"
-    );
-    let mut rows: Vec<DirectReadRow624p3b> = Vec::new();
-    for _ in 0..30 {
-        exec_624(&admin, "SYSTEM FLUSH LOGS").await;
-        let mut stream = admin
-            .query_stream::<DirectReadRow624p3b>(&sql, &QuerySettings::new())
-            .await
-            .expect("read system.query_log");
-        rows.clear();
-        while let Some(row) = stream.next().await {
-            rows.push(row.expect("decode"));
-        }
-        drop(stream);
-        if rows.len() >= 7 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    assert!(
-        rows.len() >= 7,
-        "every shape logged a body-predicate statement: {rows:#?}"
-    );
-    for r in &rows {
-        assert_eq!(r.direct_read, "0", "{}", r.query);
-    }
     drop_db_624(&admin, &db).await;
 }
 

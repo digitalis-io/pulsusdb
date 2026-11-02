@@ -683,12 +683,12 @@ fn check_d_escape_rs_surface_is_allowlisted_and_fail_closed() {
 /// Issue #450 AC3b, issue #757 — the pruning residual is stated where the
 /// renderer is read, not only in the issue trail.
 ///
-/// No index serves `ch_like_contains`'s `body LIKE` (issue #757): the
-/// body's one index is the word index on `upperUTF8(lowerUTF8(body))`, and only
-/// `word(…)` reads it. The next reader of this function is entitled to
+/// `idx_body_ngrams`, the `ngrambf_v1` index on `body`, serves
+/// `ch_like_contains`'s `body LIKE` through the needle's four-character
+/// sequences (issue #757). The next reader of this function is entitled to
 /// learn that from the function, and where a whole-word search goes
-/// instead. The markers `#757`, `no index` and `word(` each sit on one
-/// line of that paragraph. Isolating the contiguous `///`
+/// instead. The markers `idx_body_ngrams`, `four-character` and `word(`
+/// each sit on one line of that paragraph. Isolating the contiguous `///`
 /// block immediately above the signature — rather than searching the whole
 /// file — is what makes the check discriminating: moving the paragraph
 /// somewhere else in `escape.rs` fails it.
@@ -709,7 +709,7 @@ fn check_d8_the_like_renderer_states_its_pruning_residual() {
         "`ch_like_contains` must carry a doc comment stating its pruning residual"
     );
     let doc = doc.join("\n");
-    for marker in ["#757", "no index", "word("] {
+    for marker in ["idx_body_ngrams", "four-character", "word("] {
         assert!(
             doc.contains(marker),
             "the doc block immediately above `ch_like_contains` must state its pruning \
@@ -2083,8 +2083,11 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // Issue #624, part 3d-3 adds three: a targeted `| logfmt` filter's
     // control-separator test and its `!=` key-with-no-`=` test, and the
     // expected text of the test that pins them. Issue #757 adds one: the
-    // expected text of the test that pins `|~` as `match(body, …)`.
-    ("pulsus-read/src/logql/predicate.rs", 19),
+    // expected text of the test that pins `|~` as `match(body, …)`; the
+    // move to bloom-filter indexes adds two more to that test, a negated
+    // case-insensitive `match(identity(body), …)` and a plain
+    // `match(body, …)`.
+    ("pulsus-read/src/logql/predicate.rs", 21),
     // Issue #624, part 3d adds three to `sql.rs`: the `| logfmt` line
     // grammar in its `decided` column, and the out-of-range integer test in
     // each of the two `| json` key readers. Issue #624, part 4 adds twelve:
@@ -2121,7 +2124,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 105;
+const MATCH_RENDER_TOTAL: usize = 107;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
@@ -2535,8 +2538,8 @@ const PREDICATE_ITEMS: &[&str] = &[
     "mod tests :: use super::*",
     "mod tests :: fn regex_filter(value: &str) -> LineFilter",
     "mod tests :: #[test]",
-    "mod tests :: fn a_word_alternative_renders_has_all_tokens_and_a_regex_renders_match_body()",
-    "mod tests :: fn a_word_alternative_renders_has_all_tokens_and_a_regex_renders_match_body() :: fn words(ws: &[&str]) -> LineMatch",
+    "mod tests :: fn a_word_alternative_renders_has_token_and_a_case_insensitive_regex_keeps_the_index_out()",
+    "mod tests :: fn a_word_alternative_renders_has_token_and_a_case_insensitive_regex_keeps_the_index_out() :: fn words(ws: &[&str]) -> LineMatch",
     "mod tests :: #[test]",
     "mod tests :: fn an_uncompilable_pattern_is_refused_at_the_line_filter_mint()",
     "mod tests :: #[test]",

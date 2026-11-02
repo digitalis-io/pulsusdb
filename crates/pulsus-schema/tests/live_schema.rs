@@ -1957,16 +1957,18 @@ struct SkipIndexRow {
     name: String,
     expr: String,
     type_full: String,
+    granularity: u64,
 }
 
-/// **S-T2 (issue #624, part 3b; issue #757): the log body carries one index,
-/// a whole-word `text` index.** Every skip index on every table of a fresh
+/// **S-T2 (issue #757): the log body carries a word index and an n-gram
+/// index, both bloom filters.** Every skip index on every table of a fresh
 /// database, read from `system.data_skipping_indices`: on `log_samples`
-/// exactly `idx_body_words` over `upperUTF8(lowerUTF8(body))` as
-/// `text(tokenizer = splitByNonAlpha)`, and the `minmax` on `severity`; no
-/// bloom-filter index anywhere.
+/// exactly `idx_body_ngrams` over `body` as `ngrambf_v1(4, 32768, 3, 0)`,
+/// `idx_body_words` over `upperUTF8(lowerUTF8(body))` as
+/// `tokenbf_v1(32768, 3, 0)`, both at granularity 1, and the `minmax` on
+/// `severity` at 4; no `text` index anywhere.
 #[tokio::test]
-async fn the_log_body_has_one_word_index() {
+async fn the_log_body_has_a_word_and_an_ngram_index() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_schema_it_body_text");
@@ -1974,44 +1976,57 @@ async fn the_log_body_has_one_word_index() {
     run_init(&client, &test_ctx(db)).await.expect("run_init");
 
     let sql = format!(
-        "SELECT table, name, expr, type_full FROM system.data_skipping_indices \
+        "SELECT table, name, expr, type_full, granularity FROM system.data_skipping_indices \
          WHERE database = '{db}' ORDER BY table, name"
     );
     let mut stream = client
         .query_stream::<SkipIndexRow>(&sql, &QuerySettings::new())
         .await
         .expect("query system.data_skipping_indices");
-    let mut seen: Vec<(String, String, String, String)> = Vec::new();
+    let mut seen: Vec<(String, String, String, String, u64)> = Vec::new();
     while let Some(row) = stream.next().await {
         let row = row.expect("decode SkipIndexRow");
-        seen.push((row.table, row.name, row.expr, row.type_full));
+        seen.push((
+            row.table,
+            row.name,
+            row.expr,
+            row.type_full,
+            row.granularity,
+        ));
     }
     drop(stream);
-    let on_samples: Vec<&(String, String, String, String)> =
+    let on_samples: Vec<&(String, String, String, String, u64)> =
         seen.iter().filter(|r| r.0 == "log_samples").collect();
     assert_eq!(
         on_samples,
         [
             &(
                 "log_samples".to_string(),
+                "idx_body_ngrams".to_string(),
+                "body".to_string(),
+                "ngrambf_v1(4, 32768, 3, 0)".to_string(),
+                1
+            ),
+            &(
+                "log_samples".to_string(),
                 "idx_body_words".to_string(),
                 "upperUTF8(lowerUTF8(body))".to_string(),
-                "text(tokenizer = splitByNonAlpha)".to_string()
+                "tokenbf_v1(32768, 3, 0)".to_string(),
+                1
             ),
             &(
                 "log_samples".to_string(),
                 "idx_severity".to_string(),
                 "severity".to_string(),
-                "minmax".to_string()
+                "minmax".to_string(),
+                4
             ),
         ],
         "log_samples' skip indexes"
     );
     assert!(
-        !seen
-            .iter()
-            .any(|r| r.3.starts_with("tokenbf_v1") || r.3.starts_with("ngrambf_v1")),
-        "no bloom-filter body index anywhere: {seen:#?}"
+        !seen.iter().any(|r| r.3.starts_with("text")),
+        "no `text` index anywhere: {seen:#?}"
     );
     drop_database(&client, db).await;
 }

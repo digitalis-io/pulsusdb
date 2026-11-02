@@ -3458,14 +3458,14 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             vec![],
             vec!["--mode", "single"],
             single(),
-            "4ddf6319dc38d3b39fe7a111e08f913da48b048bf564dc1901574bad4ba723e9",
+            "792b8bf20e338145e8cdf741c4d6e2688efe492b2333e0214c95d5dcce5b0d94",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "2bf3a3ce69e9f905d14f0d267da81922322130fb4d578711da2db6c4c1a2b893",
+            "353f0982d8100bca22375357c2e564d7898819b4af4adcde52580e4275ff1cd9",
         ),
         (
             "clustered with a storage policy",
@@ -3475,7 +3475,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "7605b1f2a96d9232badc51de4abaa7ebbf748059ff9eb670fbfdc94229965cb3",
+            "c87335332c29e27d00784aff7d2c66fe36366a37811fcc0dfb170c7b1a8f09e8",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
