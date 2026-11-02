@@ -103,6 +103,8 @@ twice by that writer.** The window is `PULSUS_INGEST_DEDUP_WINDOW` (`5m`);
 bounds the whole index. It is a hard bound rather than a target: the index
 reserves its collections once at construction and never grows them.
 
+**A synchronous log push can be answered `500` after part of it is stored.** On `POST /v1/logs` and the log push of §8.2, a failure inside ClickHouse after the push's landing rows are written can leave some of its entries, and some of what is derived from them, stored while the push is answered `500`. A resend the client makes that is stored as a new push (see the tables above) carries a new token and can store that part again.
+
 ### 1.1 OTLP (primary)
 
 Standard OTLP/HTTP paths, always enabled:
