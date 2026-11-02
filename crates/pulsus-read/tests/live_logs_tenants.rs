@@ -236,24 +236,30 @@ async fn every_log_table_read_answers_its_own_tenant() {
 
     // B3: label names.
     assert_eq!(
-        q.label_names(None, b).await.expect("B3 tenant-q"),
+        q.label_names(None, b).await.expect("B3 tenant-q").items,
         s(&["app", "service_name"]),
         "B3 tenant-q"
     );
     assert_eq!(
-        o.label_names(None, b).await.expect("B3 tenant-o"),
+        o.label_names(None, b).await.expect("B3 tenant-o").items,
         s(&["app", "service_name", "zone"]),
         "B3 tenant-o"
     );
 
     // B4: label values of `zone`.
     assert_eq!(
-        q.label_values("zone", None, b).await.expect("B4 tenant-q"),
+        q.label_values("zone", None, b)
+            .await
+            .expect("B4 tenant-q")
+            .items,
         Vec::<String>::new(),
         "B4 tenant-q"
     );
     assert_eq!(
-        o.label_values("zone", None, b).await.expect("B4 tenant-o"),
+        o.label_values("zone", None, b)
+            .await
+            .expect("B4 tenant-o")
+            .items,
         s(&["o"]),
         "B4 tenant-o"
     );
@@ -262,9 +268,9 @@ async fn every_log_table_read_answers_its_own_tenant() {
     let detected = |v: Vec<pulsus_read::logql::DetectedLabelOut>| {
         v.into_iter().map(|d| d.label).collect::<Vec<_>>()
     };
-    let q5 = detected(q.detected_labels(None, b).await.expect("B5 tenant-q"));
+    let q5 = detected(q.detected_labels(None, b).await.expect("B5 tenant-q").items);
     assert!(!q5.contains(&"zone".to_string()), "B5 tenant-q: {q5:?}");
-    let o5 = detected(o.detected_labels(None, b).await.expect("B5 tenant-o"));
+    let o5 = detected(o.detected_labels(None, b).await.expect("B5 tenant-o").items);
     assert!(o5.contains(&"zone".to_string()), "B5 tenant-o: {o5:?}");
 
     // B6: series.
@@ -285,12 +291,18 @@ async fn every_log_table_read_answers_its_own_tenant() {
 
     // B7: label values of `app`, over each tenant's own activity.
     assert_eq!(
-        q.label_values("app", None, b).await.expect("B7 tenant-q"),
+        q.label_values("app", None, b)
+            .await
+            .expect("B7 tenant-q")
+            .items,
         s(&["web"]),
         "B7 tenant-q"
     );
     assert_eq!(
-        o.label_values("app", None, b).await.expect("B7 tenant-o"),
+        o.label_values("app", None, b)
+            .await
+            .expect("B7 tenant-o")
+            .items,
         s(&["api", "old"]),
         "B7 tenant-o"
     );

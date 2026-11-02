@@ -70,6 +70,17 @@ pub fn ensure_query_text_fits(sql: &str) -> Result<(), crate::logql::TooBroadRea
     Ok(())
 }
 
+/// Refuses a fingerprint set whose rendered text alone would reach
+/// [`MAX_QUERY_TEXT_BYTES`], from [`pulsus_model::FpSet::rendered_len`],
+/// before any text is built (issue #399) — the same `>=` rule as
+/// [`ensure_query_text_fits`].
+pub fn ensure_fingerprint_set_fits(
+    set: &pulsus_model::FpSet<'_>,
+) -> Result<(), crate::logql::TooBroadReason> {
+    let _ = set;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

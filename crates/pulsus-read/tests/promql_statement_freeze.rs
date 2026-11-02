@@ -345,11 +345,13 @@ fn render() -> String {
                 (_, None) => {
                     emit(
                         &mut out,
-                        &sample_sql::sample_fetch_multi(&no_tenant(), SAMPLES, &fps(), lo, hi),
+                        &sample_sql::sample_fetch_multi(&no_tenant(), SAMPLES, &fps(), lo, hi)
+                            .expect("fits"),
                     );
                     emit(
                         &mut out,
-                        &sample_sql::hist_sample_fetch_multi(&no_tenant(), HIST, &fps(), lo, hi),
+                        &sample_sql::hist_sample_fetch_multi(&no_tenant(), HIST, &fps(), lo, hi)
+                            .expect("fits"),
                     );
                 }
             }

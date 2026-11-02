@@ -78,6 +78,27 @@ const RENDERERS: &[(&str, &str)] = &[
         "render_fingerprint_list",
     ),
     ("crates/pulsus-read/src/metrics/sql.rs", "ids_scope"),
+    ("crates/pulsus-read/src/logql/sql.rs", "fp_array"),
+    (
+        "crates/pulsus-read/src/metrics/sample_sql.rs",
+        "render_fingerprint_array",
+    ),
+    // Issue #399: the three multi builders measure their list with an
+    // `FpSet` before they render it (the 8 MiB preflight), so they carry a
+    // conversion spelling; their text is read by `fingerprint_rendering.rs`
+    // sites 4 and 5.
+    (
+        "crates/pulsus-read/src/metrics/sample_sql.rs",
+        "sample_fetch_multi",
+    ),
+    (
+        "crates/pulsus-read/src/metrics/sample_sql.rs",
+        "hist_sample_fetch_multi",
+    ),
+    (
+        "crates/pulsus-read/src/metrics/sql.rs",
+        "discovery_fetch_multi",
+    ),
 ];
 
 /// Every way the shipped code turns an `FpLiteral` into text. A site
@@ -88,7 +109,37 @@ const CONVERSIONS: &[&str] = &[
     "fp.to_string()",
     "{fp}",
     ".sql_literal().to_string()",
+    "FpSet(",
+    "FpArray(",
 ];
+
+/// Bench modules that render fingerprints (issue #399). Scanned by the
+/// rendering-sites check only: `sql_literals` there keeps a `Fingerprint`
+/// parameter because it is the bench's own mint.
+const BENCH_MODULES: &[&str] = &["xtask/src/bench/logs_hydration/paths.rs"];
+
+/// The rendering sites in [`BENCH_MODULES`], by enclosing function.
+const BENCH_RENDERERS: &[(&str, &str)] = &[
+    (
+        "xtask/src/bench/logs_hydration/paths.rs",
+        "service_set_from_idx",
+    ),
+    (
+        "xtask/src/bench/logs_hydration/paths.rs",
+        "service_set_from_streams",
+    ),
+];
+
+/// The shipped part of a module: everything before its first
+/// `#[cfg(test)]` line (issue #399). Each scanned module keeps its test
+/// code at its end, and a unit test that measures an `FpSet` is not a
+/// rendering site.
+fn shipped(src: &str) -> &str {
+    match src.find("\n#[cfg(test)]\n") {
+        Some(at) => &src[..at],
+        None => src,
+    }
+}
 
 /// Cuts line comments out so a `Fingerprint` in prose is not a parameter.
 fn without_line_comments(src: &str) -> String {
@@ -225,8 +276,8 @@ fn the_exemption_list_is_empty() {
 #[test]
 fn the_rendering_sites_are_the_five_the_inventory_names() {
     let mut found: BTreeSet<(String, String)> = BTreeSet::new();
-    for module in SQL_MODULES {
-        let src = without_line_comments(&read(module));
+    for module in SQL_MODULES.iter().chain(BENCH_MODULES) {
+        let src = without_line_comments(shipped(&read(module)));
         for (name, _, body) in functions(&src) {
             if CONVERSIONS.iter().any(|c| body.contains(c)) {
                 found.insert((module.to_string(), name));
@@ -235,6 +286,7 @@ fn the_rendering_sites_are_the_five_the_inventory_names() {
     }
     let expected: BTreeSet<(String, String)> = RENDERERS
         .iter()
+        .chain(BENCH_RENDERERS)
         .map(|(m, f)| (m.to_string(), f.to_string()))
         .collect();
     assert_eq!(

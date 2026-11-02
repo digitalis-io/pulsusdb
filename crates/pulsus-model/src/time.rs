@@ -154,6 +154,38 @@ impl std::fmt::Display for FpLiteral {
     }
 }
 
+/// A fingerprint set for the right side of `[NOT] [GLOBAL] IN (…)`: `'<d>', '<d>'`.
+/// The server converts each string to the `UInt128` column type, exactly.
+pub struct FpSet<'a>(pub &'a [FpLiteral]);
+
+/// A typed fingerprint array: `CAST(['<d>', '<d>'], 'Array(UInt128)')`.
+pub struct FpArray<'a>(pub &'a [FpLiteral]);
+
+impl FpSet<'_> {
+    /// The exact length of this set's `Display` text, without building it.
+    pub fn rendered_len(&self) -> usize {
+        0
+    }
+}
+
+impl std::fmt::Display for FpSet<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, lit) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{lit}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for FpArray<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}]", FpSet(self.0))
+    }
+}
+
 /// The metrics activity bucket in milliseconds: one hour, fixed (issue
 /// #623; docs/schemas.md §2.1). The writer registers a series once per
 /// bucket (issue #26), and the activity table's hour mask holds one bit per

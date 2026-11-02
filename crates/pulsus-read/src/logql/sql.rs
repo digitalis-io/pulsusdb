@@ -778,7 +778,8 @@ pub fn probe(
 /// caller returns its empty result before building any statement
 /// (`super::exec::LogQlEngine::run_discovery`), and its length is bounded by
 /// `EngineConfig::max_streams` before it is rendered.
-pub fn label_names(
+#[doc(hidden)]
+pub fn label_names_listed(
     tenant: &Tenant,
     streams_idx_table: &str,
     months: &[MonthLiteral],
@@ -802,7 +803,8 @@ pub fn label_names(
 /// request's own window. **Issue #603:** that set is a literal list with
 /// exactly the precondition [`label_names`] documents. The key predicate keeps
 /// its place in the primary-key prefix.
-pub fn label_values(
+#[doc(hidden)]
+pub fn label_values_listed(
     tenant: &Tenant,
     streams_idx_table: &str,
     months: &[MonthLiteral],
@@ -838,7 +840,8 @@ pub fn label_values(
 ///
 /// **Issue #399:** before this, the only time bound was `month`, so a
 /// ten-minute request was answered from the whole calendar month.
-pub fn detected_labels(
+#[doc(hidden)]
+pub fn detected_labels_listed(
     tenant: &Tenant,
     streams_idx_table: &str,
     months: &[MonthLiteral],
@@ -852,6 +855,63 @@ pub fn detected_labels(
         "SELECT key, uniqExact(val) AS cardinality, {non_id_values} AS non_id_values\nFROM {streams_idx_table}\nWHERE org_id = {} AND {month_clause}\n  AND fingerprint IN ({active})\nGROUP BY key\nORDER BY key",
         tenant.sql_literal()
     )
+}
+
+/// Which streams an activity read is asked about (issue #399).
+pub enum ActivityScope<'a> {
+    /// Every stream: `/series` with no `match[]`, and unscoped discovery.
+    All,
+    /// A resolved list: `/series`' matched path. Renders `fingerprint IN (<FpSet>) AND `.
+    Listed(&'a [FpLiteral]),
+    /// A stage-1 statement, nested: scoped discovery.
+    /// Renders `fingerprint GLOBAL IN (\n<stage1>\n) AND `.
+    Resolved(&'a str),
+}
+
+/// The streams one discovery read covers.
+pub struct DiscoveryScope<'a> {
+    pub rollup_table: &'a str,
+    pub window: TimeWindow,
+    pub rollup_res_ns: u64,
+    /// `Some` when the request carries `query=`: that selector's `sp.stage1_sql`.
+    pub stage1_sql: Option<&'a str>,
+}
+
+/// Labels discovery (#13 `GET|POST /api/logs/v1/labels`).
+pub fn label_names(
+    tenant: &Tenant,
+    streams_idx_table: &str,
+    months: &[MonthLiteral],
+    scope: &DiscoveryScope<'_>,
+    limit: u64,
+) -> String {
+    let _ = (tenant, streams_idx_table, months, scope, limit);
+    String::new()
+}
+
+/// Label-values discovery (#13 `GET /api/logs/v1/label/{{name}}/values`).
+pub fn label_values(
+    tenant: &Tenant,
+    streams_idx_table: &str,
+    months: &[MonthLiteral],
+    key_literal: &CheckedLiteral,
+    scope: &DiscoveryScope<'_>,
+    limit: u64,
+) -> String {
+    let _ = (tenant, streams_idx_table, months, key_literal, scope, limit);
+    String::new()
+}
+
+/// Detected-labels aggregation over the stream index (issue #170).
+pub fn detected_labels(
+    tenant: &Tenant,
+    streams_idx_table: &str,
+    months: &[MonthLiteral],
+    scope: &DiscoveryScope<'_>,
+    limit: u64,
+) -> String {
+    let _ = (tenant, streams_idx_table, months, scope, limit);
+    String::new()
 }
 
 /// The rollup bucket CONTAINING `start_ns` — the activity semi-join's
@@ -899,7 +959,7 @@ pub fn activity_lower_bucket_ns(start_ns: i64, rollup_res_ns: u64) -> i64 {
 pub fn active_fingerprints(
     tenant: &Tenant,
     rollup_table: &str,
-    fingerprints: Option<&[FpLiteral]>,
+    scope: ActivityScope<'_>,
     window: TimeWindow,
     rollup_res_ns: u64,
 ) -> String {
@@ -909,8 +969,14 @@ pub fn active_fingerprints(
         "SELECT DISTINCT fingerprint FROM {rollup_table} WHERE org_id = {} AND ",
         tenant.sql_literal()
     );
-    if let Some(fps) = fingerprints {
-        sql.push_str(&format!("fingerprint IN ({}) AND ", fp_list(fps)));
+    match scope {
+        ActivityScope::All => {}
+        ActivityScope::Listed(fps) => {
+            sql.push_str(&format!("fingerprint IN ({}) AND ", fp_list(fps)));
+        }
+        ActivityScope::Resolved(stage1) => {
+            sql.push_str(&format!("fingerprint GLOBAL IN (\n{stage1}\n) AND "));
+        }
     }
     sql.push_str(&format!("bucket_ns >= {lower} AND bucket_ns <= {end_ns}"));
     sql
@@ -2756,6 +2822,12 @@ pub(in crate::logql) fn fp_list(fingerprints: &[FpLiteral]) -> String {
         .join(", ")
 }
 
+/// A typed fingerprint array, `CAST(['<decimal>', …], 'Array(UInt128)')`,
+/// for the `transform` from-arrays in this file (issue #399).
+pub(in crate::logql) fn fp_array(fingerprints: &[FpLiteral]) -> String {
+    format!("[{}]", fp_list(fingerprints))
+}
+
 /// The singleton-equality/`IN` split shared by every stage 3 style
 /// predicate over a resolved value set (architect plan amendment §2).
 fn service_predicate(services: &[CheckedLiteral]) -> String {
@@ -3022,15 +3094,17 @@ mod tests {
     const RES_5S: u64 = 5_000_000_000;
     const ACTIVE_ALL: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE org_id = '' AND bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000";
 
-    /// The active-fingerprint set the caller resolved and renders into a
-    /// discovery scan (issue #603): a literal list, never a subquery.
-    fn active_two() -> Vec<FpLiteral> {
-        vec![
-            Fingerprint::from_raw(7).sql_literal(),
-            Fingerprint::from_raw(9).sql_literal(),
-        ]
+    /// The discovery scope every builder test below renders (issue #399):
+    /// the test constants above, unscoped unless `stage1_sql` is set.
+    fn discovery_scope(stage1_sql: Option<&str>) -> DiscoveryScope<'_> {
+        DiscoveryScope {
+            rollup_table: "log_metrics_5s",
+            window: DISCOVERY_WINDOW,
+            rollup_res_ns: RES_5S,
+            stage1_sql,
+        }
     }
-    const ACTIVE_TWO_LIST: &str = "toUInt128('7'), toUInt128('9')";
+    const LIMIT: u64 = 100_001;
 
     #[test]
     fn label_names_renders_a_distinct_key_scan_for_one_month() {
@@ -3039,11 +3113,10 @@ mod tests {
                 &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 "log_streams_idx",
                 &[month_literal(2026, 7)],
-                &active_two()
+                &discovery_scope(None),
+                LIMIT
             ),
-            format!(
-                "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND fingerprint IN ({ACTIVE_TWO_LIST})\nORDER BY name"
-            )
+            "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND fingerprint GLOBAL IN (SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE org_id = '' AND bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000)\nORDER BY name\nLIMIT 100001"
         );
     }
 
@@ -3053,9 +3126,13 @@ mod tests {
             &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_streams_idx",
             &[month_literal(2026, 7), month_literal(2026, 8)],
-            &active_two(),
+            &discovery_scope(None),
+            LIMIT,
         );
-        assert!(sql.contains("WHERE org_id = '' AND month IN ('2026-07-01', '2026-08-01')"));
+        assert!(
+            sql.contains("WHERE org_id = '' AND month IN ('2026-07-01', '2026-08-01')"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -3066,10 +3143,11 @@ mod tests {
                 "log_streams_idx",
                 &[month_literal(2026, 7)],
                 &literal("env"),
-                &active_two()
+                &discovery_scope(None),
+                LIMIT
             ),
             format!(
-                "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01' AND key = 'env'\n  AND fingerprint IN ({ACTIVE_TWO_LIST})\nORDER BY value"
+                "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01' AND key = 'env'\n  AND fingerprint GLOBAL IN ({ACTIVE_ALL})\nORDER BY value\nLIMIT 100001"
             )
         );
     }
@@ -3080,60 +3158,85 @@ mod tests {
             &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_streams_idx",
             &[month_literal(2026, 7)],
-            &active_two(),
+            &discovery_scope(None),
+            LIMIT,
         );
-        assert!(sql.starts_with("SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, "));
-        assert!(sql.contains("WHERE org_id = '' AND month = '2026-07-01'"));
-        assert!(sql.contains(&format!("\n  AND fingerprint IN ({ACTIVE_TWO_LIST})\n")));
-        assert!(sql.ends_with("GROUP BY key\nORDER BY key"));
+        assert!(sql.starts_with("SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, "), "{sql}");
+        assert!(
+            sql.contains("WHERE org_id = '' AND month = '2026-07-01'"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(&format!("\n  AND fingerprint GLOBAL IN ({ACTIVE_ALL})\n")),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with("GROUP BY key\nORDER BY key\nLIMIT 100001"),
+            "{sql}"
+        );
     }
 
-    /// **Issue #603: no discovery builder nests a subquery.** The activity
-    /// scan is a statement of its own, so each of the three renders exactly
-    /// one `SELECT` and names only the index table — which is what decides
-    /// which route the server takes on a clustered deployment.
+    /// **T8 (issue #399): every discovery builder is one statement whose
+    /// stream set is the activity read, nested with `GLOBAL IN`.** Each of
+    /// the three carries exactly one activity subquery, unscoped and
+    /// scoped; scoped, the stage-1 statement sits inside the activity read
+    /// rather than beside it.
     #[test]
-    fn no_discovery_builder_nests_a_subquery() {
+    fn every_discovery_builder_nests_the_activity_read() {
+        let t = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
         let months = [month_literal(2026, 7)];
-        for (name, sql) in [
-            (
-                "label_names",
-                label_names(
-                    &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-                    "log_streams_idx",
-                    &months,
-                    &active_two(),
+        let pos = [
+            crate::logql::predicate::index_positive_branch("app", Some("api"), &[])
+                .expect("renders"),
+        ];
+        let s1 = stage1(&t, "log_streams_idx", &months, &pos, &[]);
+        const ACTIVITY: &str =
+            "fingerprint GLOBAL IN (SELECT DISTINCT fingerprint FROM log_metrics_5s";
+        for stage1_sql in [None, Some(s1.as_str())] {
+            let scope = discovery_scope(stage1_sql);
+            for (name, sql) in [
+                (
+                    "label_names",
+                    label_names(&t, "log_streams_idx", &months, &scope, LIMIT),
                 ),
-            ),
-            (
-                "label_values",
-                label_values(
-                    &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-                    "log_streams_idx",
-                    &months,
-                    &literal("env"),
-                    &active_two(),
+                (
+                    "label_values",
+                    label_values(
+                        &t,
+                        "log_streams_idx",
+                        &months,
+                        &literal("env"),
+                        &scope,
+                        LIMIT,
+                    ),
                 ),
-            ),
-            (
-                "detected_labels",
-                detected_labels(
-                    &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-                    "log_streams_idx",
-                    &months,
-                    &active_two(),
+                (
+                    "detected_labels",
+                    detected_labels(&t, "log_streams_idx", &months, &scope, LIMIT),
                 ),
-            ),
-        ] {
-            assert_eq!(
-                sql.matches("SELECT").count(),
-                1,
-                "{name} must nest no second SELECT: {sql}"
-            );
-            assert!(
-                !sql.contains("log_metrics_5s"),
-                "{name} must name only the index table: {sql}"
-            );
+            ] {
+                assert_eq!(
+                    sql.matches(ACTIVITY).count(),
+                    1,
+                    "{name} must carry exactly one activity subquery: {sql}"
+                );
+                assert!(sql.ends_with("\nLIMIT 100001"), "{name}: {sql}");
+                if let Some(s1) = stage1_sql {
+                    let open = "fingerprint GLOBAL IN (\n";
+                    let at = sql
+                        .find(open)
+                        .unwrap_or_else(|| panic!("{name}: no nested stage 1 in {sql}"));
+                    let rest = &sql[at + open.len()..];
+                    let end = rest
+                        .find("\n) AND bucket_ns >=")
+                        .unwrap_or_else(|| panic!("{name}: the nest is not closed in {sql}"));
+                    assert_eq!(
+                        &rest[..end],
+                        s1,
+                        "{name}: the nested text is the stage-1 statement"
+                    );
+                }
+            }
         }
     }
 
@@ -3165,7 +3268,7 @@ mod tests {
             active_fingerprints(
                 &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 "log_metrics_5s",
-                None,
+                ActivityScope::All,
                 DISCOVERY_WINDOW,
                 RES_5S
             ),
@@ -3175,7 +3278,7 @@ mod tests {
             active_fingerprints(
                 &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 "log_metrics_5s",
-                Some(&[
+                ActivityScope::Listed(&[
                     Fingerprint::from_raw(101).sql_literal(),
                     Fingerprint::from_raw(205).sql_literal()
                 ]),
@@ -3196,7 +3299,7 @@ mod tests {
         let sql = active_fingerprints(
             &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_metrics_5s",
-            None,
+            ActivityScope::All,
             TimeWindow {
                 start_ns: b + 1_000_000_000,
                 end_ns: b + 4_000_000_000,
@@ -3253,6 +3356,26 @@ mod tests {
             "toUInt128('18446744073709551615'), toUInt128('18446744073709551616'), \
              toUInt128('18446744073709551617'), toUInt128('18446744073709551618')"
         );
+    }
+
+    /// Site 7 of `tests/fingerprint_rendering.rs` (issue #399): `fp_array`
+    /// renders the typed array form at the `2^64` boundary, and an empty
+    /// array is still typed.
+    #[test]
+    fn fp_array_renders_the_typed_array_form_at_the_2_64_boundary() {
+        let fps = [
+            18_446_744_073_709_551_615u128,
+            18_446_744_073_709_551_616,
+            18_446_744_073_709_551_617,
+            18_446_744_073_709_551_618,
+        ]
+        .map(|v| Fingerprint::from_raw(v).sql_literal());
+        assert_eq!(
+            fp_array(&fps),
+            "CAST(['18446744073709551615', '18446744073709551616', \
+             '18446744073709551617', '18446744073709551618'], 'Array(UInt128)')"
+        );
+        assert_eq!(fp_array(&[]), "CAST([], 'Array(UInt128)')");
     }
 
     #[test]
@@ -5329,11 +5452,20 @@ mod tests {
                 .expect("renders"),
         ];
         let neg = [crate::logql::predicate::index_neq_branch("zone", "o")];
-        let fps = active_two();
+        let fps = vec![
+            Fingerprint::from_raw(7).sql_literal(),
+            Fingerprint::from_raw(9).sql_literal(),
+        ];
         let services = [literal("web")];
         let window = TimeWindow {
             start_ns: 1_000,
             end_ns: 2_000,
+        };
+        let tenant_scope = DiscoveryScope {
+            rollup_table: "log_metrics_5s",
+            window,
+            rollup_res_ns: RES_5S,
+            stage1_sql: None,
         };
         let filters = [err_line_filter()];
         let raw = MetricSource::new("log_samples", MetricShape::RawCount);
@@ -5390,27 +5522,40 @@ mod tests {
             (
                 "label_names",
                 "log_streams_idx",
-                label_names(&t, "log_streams_idx", &months, &fps),
+                label_names(&t, "log_streams_idx", &months, &tenant_scope, 100_001),
             ),
             (
                 "label_values",
                 "log_streams_idx",
-                label_values(&t, "log_streams_idx", &months, &literal("app"), &fps),
+                label_values(
+                    &t,
+                    "log_streams_idx",
+                    &months,
+                    &literal("app"),
+                    &tenant_scope,
+                    100_001,
+                ),
             ),
             (
                 "detected_labels",
                 "log_streams_idx",
-                detected_labels(&t, "log_streams_idx", &months, &fps),
+                detected_labels(&t, "log_streams_idx", &months, &tenant_scope, 100_001),
             ),
             (
                 "active_fingerprints, unscoped",
                 "log_metrics_5s",
-                active_fingerprints(&t, "log_metrics_5s", None, window, RES_5S),
+                active_fingerprints(&t, "log_metrics_5s", ActivityScope::All, window, RES_5S),
             ),
             (
                 "active_fingerprints, scoped",
                 "log_metrics_5s",
-                active_fingerprints(&t, "log_metrics_5s", Some(&fps), window, RES_5S),
+                active_fingerprints(
+                    &t,
+                    "log_metrics_5s",
+                    ActivityScope::Listed(&fps),
+                    window,
+                    RES_5S,
+                ),
             ),
             ("stage2", "log_streams", stage2(&t, "log_streams", &fps)),
             (

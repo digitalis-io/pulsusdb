@@ -24,7 +24,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use pulsus_model::Fingerprint;
 use pulsus_read::logql::predicate::month_literal;
 use pulsus_read::logql::sql;
 
@@ -765,13 +764,22 @@ fn the_provenance_transcript_and_the_artifact_agree() {
 /// the number on the HTTP response body.
 #[test]
 fn the_detected_labels_aggregate_is_still_an_exact_count() {
-    let some_fps = [7, 9].map(|v| Fingerprint::from_raw(v).sql_literal());
-    for fingerprints in [&some_fps[..1], &some_fps[..]] {
+    for stage1_sql in [None, Some("SELECT fingerprint FROM log_streams_idx")] {
+        let scope = sql::DiscoveryScope {
+            rollup_table: "log_metrics_5s",
+            window: sql::TimeWindow {
+                start_ns: 1_754_000_000_000_000_000,
+                end_ns: 1_754_003_600_000_000_000,
+            },
+            rollup_res_ns: 5_000_000_000,
+            stage1_sql,
+        };
         let rendered = sql::detected_labels(
             &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_streams_idx",
             &[month_literal(2026, 8)],
-            fingerprints,
+            &scope,
+            100_001,
         );
         assert!(
             rendered.contains("uniqExact(val) AS cardinality"),

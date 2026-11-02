@@ -1099,7 +1099,7 @@ async fn run_discovery_shape(
     let activity_sql = sql::active_fingerprints(
         &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &tables.rollup,
-        None,
+        sql::ActivityScope::All,
         TimeWindow {
             start_ns: dataset.start_ns,
             end_ns: dataset.end_ns,
@@ -1117,7 +1117,7 @@ async fn run_discovery_shape(
         .into_iter()
         .map(|fp| pulsus_model::Fingerprint::from_raw(fp).sql_literal())
         .collect();
-    let sql = sql::label_names(
+    let sql = sql::label_names_listed(
         &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &tables.streams_idx,
         &months,
