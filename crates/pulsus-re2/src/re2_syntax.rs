@@ -465,11 +465,34 @@ pub fn clickhouse_match_head_rewrite(pattern: &str) -> Option<String> {
     Some(build_head_rewrite(&cs, &leaking))
 }
 
-/// Whether `pattern` turns case-insensitivity on anywhere (issue #757).
-/// A stub that answers `false`, so the table test fails on its assertion;
-/// the next commit replaces it with the parser walk.
-pub fn sets_case_insensitive(_pattern: &str) -> bool {
-    false
+/// Whether `pattern` turns case-insensitivity on anywhere: a flag item or
+/// a `(?flags:…)` group whose flags set `i`. A pattern that does not parse
+/// answers `true`.
+pub fn sets_case_insensitive(pattern: &str) -> bool {
+    use regex_syntax::ast::{Ast, Flag, GroupKind};
+    fn walk(ast: &Ast) -> bool {
+        match ast {
+            Ast::Flags(set) => set.flags.flag_state(Flag::CaseInsensitive) == Some(true),
+            Ast::Group(group) => {
+                matches!(&group.kind, GroupKind::NonCapturing(flags)
+                    if flags.flag_state(Flag::CaseInsensitive) == Some(true))
+                    || walk(&group.ast)
+            }
+            Ast::Alternation(alt) => alt.asts.iter().any(walk),
+            Ast::Concat(concat) => concat.asts.iter().any(walk),
+            Ast::Repetition(rep) => walk(&rep.ast),
+            Ast::Empty(_)
+            | Ast::Literal(_)
+            | Ast::Dot(_)
+            | Ast::Assertion(_)
+            | Ast::ClassUnicode(_)
+            | Ast::ClassPerl(_)
+            | Ast::ClassBracketed(_) => false,
+        }
+    }
+    regex_syntax::ast::parse::Parser::new()
+        .parse(pattern)
+        .map_or(true, |ast| walk(&ast))
 }
 
 /// One scan: every valid flag head, split into the affected (no-`i`)

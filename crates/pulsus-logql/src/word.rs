@@ -1,6 +1,6 @@
 //! The word rule of `word(…)` (issue #757): the rule of the database's
-//! `splitByNonAlpha` tokenizer over `upperUTF8(lowerUTF8(body))`, the expression
-//! `idx_body_words` indexes.
+//! `hasToken` and `tokenbf_v1` tokenizer over `upperUTF8(lowerUTF8(body))`,
+//! the expression `idx_body_words` indexes.
 
 /// An ASCII letter or digit, or any byte of a non-ASCII character.
 pub fn is_word_byte(b: u8) -> bool {
@@ -21,7 +21,7 @@ pub fn case_key(s: &str) -> String {
 }
 
 /// Whether every one of `keyed` (each already [`case_key`]ed) is a word of
-/// `line`. No words is `false`, as `hasAllTokens(…, [])` is.
+/// `line`. No words is `false`, as the pushed predicate's `0` is.
 pub fn has_all_words(line: &str, keyed: &[String]) -> bool {
     if keyed.is_empty() {
         return false;

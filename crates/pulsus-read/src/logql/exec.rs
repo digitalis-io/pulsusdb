@@ -6830,13 +6830,6 @@ fn metric_plan_window(mp: &MetricPlan) -> ClientWindow {
 /// server code 241 → [`TooBroadReason::LogqlReadMemory`] → `422`, never
 /// the raw-exception `500` it was before.
 ///
-/// Issue #624, part 3b adds `query_plan_direct_read_from_text_index = 0`.
-/// With the body's `text` index, a statement whose `WHERE` holds a line
-/// filter leaves a query-condition-cache entry under its `PREWHERE service =
-/// …` condition that makes the next statement with that condition count too
-/// few lines (measured on 26.3.29.7). Turning the direct read off corrects
-/// it and leaves the condition cache and the index analysis on.
-///
 /// #603: logs rows sit on the shard that took the push, so these reads send
 /// the answer pins with pruning off.
 pub fn read_query_settings(
@@ -6851,7 +6844,6 @@ pub fn read_query_settings(
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
         .set("max_memory_usage", read_max_memory_bytes)
         .set("max_bytes_before_external_group_by", 0u64)
-        .set("query_plan_direct_read_from_text_index", 0u64)
 }
 
 /// Pure paging-termination decision (issue #133, the #96

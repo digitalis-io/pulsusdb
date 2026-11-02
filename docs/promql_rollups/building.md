@@ -68,7 +68,7 @@ Only sets drawn from 5, 60, 720, 7200 and 86400 s were measured; the `flags` col
 
 ### 2.1 One template, rendered once per level
 
-`schema/schema.sql` holds one level template, one contiguous block at the end of the file (`schema/schema.sql:989-1120`). Its lines carry a prefix that `expand_levels` (`crates/pulsus-schema/src/render.rs:670`) and the script's `awk` resolve before the `--@single`/`--@cluster` pass; the marker and exactly one space after it are removed, so a line may then carry a mode marker:
+`schema/schema.sql` holds one level template, one contiguous block at the end of the file (`schema/schema.sql:990-1121`). Its lines carry a prefix that `expand_levels` (`crates/pulsus-schema/src/render.rs:670`) and the script's `awk` resolve before the `--@single`/`--@cluster` pass; the marker and exactly one space after it are removed, so a line may then carry a mode marker:
 
 | prefix | rendered for |
 |---|---|
@@ -90,7 +90,7 @@ The block is replaced, in place, by its lines for each level in turn, smallest f
 
 ### 2.2 The level table
 
-The table's `CREATE TABLE` and its wrapper, as `schema/schema.sql:1004-1031` carries them:
+The table's `CREATE TABLE` and its wrapper, as `schema/schema.sql:1005-1032` carries them:
 
 ```sql
 --@level CREATE TABLE IF NOT EXISTS {{db}}.metric_samples_{{level}}{{on_cluster}}
@@ -145,13 +145,13 @@ The table's `CREATE TABLE` and its wrapper, as `schema/schema.sql:1004-1031` car
 
 Every run that has a window, whether or not it found samples, appends a run row with `kind = 1`, `org_id = ''`, `fingerprint = 0`, `t_last = lo`, `t_end = hi`, `built_at` = the run's start and every other column `0`: one row for each UTC day its `(lo, hi]` touches, each cut at midnight, so each lies in its day's partition. A run with no window, and every run on a replica that is not its shard's builder (§4.1), writes nothing.
 
-The run row is a `UNION ALL` branch of the run's own `SELECT`. With the block pins `max_insert_threads = 1` and `min_insert_block_size_rows` (`schema/schema.sql:1129`), a run's data rows and its run row are one part per partition, so a replica holds both or neither. Measured: each one-hour first-level run wrote 240,001 rows, 240,000 data rows and one run row, into one part (`measure/projection-run/10_60s_parts.tsv`).
+The run row is a `UNION ALL` branch of the run's own `SELECT`. With the block pins `max_insert_threads = 1` and `min_insert_block_size_rows` (`schema/schema.sql:1130`), a run's data rows and its run row are one part per partition, so a replica holds both or neither. Measured: each one-hour first-level run wrote 240,001 rows, 240,000 data rows and one run row, into one part (`measure/projection-run/10_60s_parts.tsv`).
 
 A level's coverage on a shard is the union of its run rows' `(t_last, t_end]`. A run row expires with its day's data.
 
 ### 2.4 `metric_landing`'s key
 
-The first level reads `metric_landing` by sample time, so landing is keyed by the 5-minute block of the sample time, `intDiv(unix_milli, 300000)`, after `kind`, whatever the set (`schema/schema.sql:288`):
+The first level reads `metric_landing` by sample time, so landing is keyed by the 5-minute block of the sample time, `intDiv(unix_milli, 300000)`, after `kind`, whatever the set (`schema/schema.sql:289`):
 
 ```sql
 ORDER BY (kind, intDiv(unix_milli, 300000), org_id, metric_name, fingerprint, unix_milli)
@@ -163,7 +163,7 @@ Its partition and expiry are those it had before. The cost is §6.1's: landing i
 
 ### 3.1 The view
 
-Each level's view, as `schema/schema.sql:1032-1120` carries it. `--@level-first` lines build the first level from `metric_landing`; `--@level-next` lines build every later level from `{{source}}`, the level below.
+Each level's view, as `schema/schema.sql:1033-1121` carries it. `--@level-first` lines build the first level from `metric_landing`; `--@level-next` lines build every later level from `{{source}}`, the level below.
 
 ```sql
 --@level CREATE MATERIALIZED VIEW {{db}}.metric_samples_{{level}}_mv{{on_cluster}} REFRESH {{timer}} APPEND TO {{db}}.metric_samples_{{level}}

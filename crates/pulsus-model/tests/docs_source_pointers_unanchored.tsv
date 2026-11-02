@@ -770,7 +770,7 @@ docs/query-lowering.md	plan.rs:3672	ambiguous_basename
 docs/query-lowering.md	plan.rs:4084	ambiguous_basename
 docs/query-lowering.md	schema/schema.sql:419	pinned_to_another_version
 docs/query-lowering.md	schema/schema.sql:431	pinned_to_another_version
-docs/query-lowering.md	schema/schema.sql:443	no_name_the_target_file_holds
+docs/query-lowering.md	schema/schema.sql:444	no_name_the_target_file_holds
 docs/query-lowering.md	schema/schema.sql:631	pinned_to_another_version
 docs/query-lowering.md	search_eval.rs:2226	not_in_this_repository
 docs/query-lowering.md	search_eval.rs:2443	not_in_this_repository
@@ -884,7 +884,6 @@ docs/query-to-sql.md	escape.rs:148-158	no_name_the_target_file_holds
 docs/query-to-sql.md	escape.rs:160-165	no_name_the_target_file_holds
 docs/query-to-sql.md	escape.rs:165-172	no_name_the_target_file_holds
 docs/query-to-sql.md	escape.rs:51-67	no_name_the_target_file_holds
-docs/query-to-sql.md	escape.rs:80	no_name_the_target_file_holds
 docs/query-to-sql.md	escape.rs:87	no_name_the_target_file_holds
 docs/query-to-sql.md	escape.rs:87-98	no_name_the_target_file_holds
 docs/query-to-sql.md	escape.rs:92	no_name_the_target_file_holds
@@ -911,8 +910,8 @@ docs/query-to-sql.md	logql/fold.rs:543	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/params.rs:124	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/pipeline.rs:1359	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:1418	no_name_the_target_file_holds
-docs/query-to-sql.md	logql/predicate.rs:1455	no_name_the_target_file_holds
-docs/query-to-sql.md	logql/predicate.rs:2480	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/predicate.rs:1465	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/predicate.rs:2510	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:506	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:506-525	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:527	no_name_the_target_file_holds
@@ -980,13 +979,13 @@ docs/query-to-sql.md	schema/schema.sql:421	pinned_to_another_version
 docs/query-to-sql.md	schema/schema.sql:424	pinned_to_another_version
 docs/query-to-sql.md	schema/schema.sql:429-430	pinned_to_another_version
 docs/query-to-sql.md	schema/schema.sql:431	pinned_to_another_version
-docs/query-to-sql.md	schema/schema.sql:436	no_name_the_target_file_holds
-docs/query-to-sql.md	schema/schema.sql:443	no_name_the_target_file_holds
+docs/query-to-sql.md	schema/schema.sql:437	no_name_the_target_file_holds
+docs/query-to-sql.md	schema/schema.sql:444	no_name_the_target_file_holds
 docs/query-to-sql.md	schema/schema.sql:550-632	pinned_to_another_version
 docs/query-to-sql.md	schema/schema.sql:555	pinned_to_another_version
 docs/query-to-sql.md	schema/schema.sql:572	pinned_to_another_version
-docs/query-to-sql.md	schema/schema.sql:584	no_name_the_target_file_holds
 docs/query-to-sql.md	schema/schema.sql:584-604	pinned_to_another_version
+docs/query-to-sql.md	schema/schema.sql:585	no_name_the_target_file_holds
 docs/query-to-sql.md	search_eval.rs:1227	not_in_this_repository
 docs/query-to-sql.md	search_eval.rs:2443	not_in_this_repository
 docs/query-to-sql.md	search_eval.rs:3143	not_in_this_repository

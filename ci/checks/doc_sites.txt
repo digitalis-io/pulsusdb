@@ -170,8 +170,8 @@ leave docs/configuration.md:126-126
 # by `a_fresh_database_creates_every_fingerprint_column_as_uint128`
 # (`crates/pulsus-schema/tests/live_schema.rs`). `idx_body_tokens` is gone
 # with #624 part 3b; the token-index gates in
-# `crates/pulsus-read/tests/query_log_gates.rs` are now the `text` index
-# gates, beside `the_log_body_has_one_word_index`.
+# `crates/pulsus-read/tests/query_log_gates.rs` are now the body index
+# gates, beside `the_log_body_has_a_word_and_an_ngram_index`.
 # `#587` here is the other half of the same move, and also new: the comment
 # records where the `JSON` column's codec went. Same decision as
 # `crates/pulsus-clickhouse/src/lib.rs` above.

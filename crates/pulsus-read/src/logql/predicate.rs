@@ -476,11 +476,11 @@ pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, Pip
 /// should have excluded, and a needle containing `_` failed the query
 /// outright (`BAD_ARGUMENTS`). There is no safe subset for us to write —
 /// a token prefilter is equivalence-preserving only when the needle is
-/// token-aligned *in the data*, which the query cannot know. No index serves
-/// either form: the body's one index, `idx_body_words`, is on
-/// `upperUTF8(lowerUTF8(body))`, and only a `word(…)` alternative reads it,
-/// as `hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('<w>')),
-/// …])` (issue #757).
+/// token-aligned *in the data*, which the query cannot know. The body's two
+/// indexes read the predicates as written: `idx_body_ngrams`, `ngrambf_v1`
+/// on `body`, serves `body LIKE` and `match(body, …)`; `idx_body_words`,
+/// `tokenbf_v1` on `upperUTF8(lowerUTF8(body))`, serves a `word(…)`
+/// alternative's `hasToken` conjunction.
 ///
 /// An `or` group (M8-LQ2 `linefilter.or`) is a disjunction of the same
 /// per-alternative predicate: `((a) OR (b) …)` for positive ops,
@@ -1434,27 +1434,42 @@ fn contains_predicate(phrase: &str) -> String {
     format!("body LIKE {}", ch_like_contains(phrase))
 }
 
-/// `hasAllTokens(upperUTF8(lowerUTF8(body)), [upperUTF8(lowerUTF8('<w>')),
-/// …])`, the pushed `word(…)` predicate (issue #757): the expression
-/// `idx_body_words` indexes, each word keyed by the database in the order
-/// written.
+/// The pushed `word(…)` predicate (issue #757): one
+/// `hasToken(upperUTF8(lowerUTF8(body)), upperUTF8(lowerUTF8('<w>')))` per
+/// word, in the order written, ANDed and parenthesised at two or more.
+/// `idx_body_words` serves `hasToken`; it does not serve `hasAllTokens`.
+/// No words renders `0`; the parser admits none.
 fn words_predicate(words: &[String]) -> String {
-    format!(
-        "hasAllTokens({}, [{}])",
-        case_key_sql("body"),
-        words
-            .iter()
-            .map(|w| case_key_sql(&ch_string(w)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+    let parts: Vec<String> = words
+        .iter()
+        .map(|w| {
+            format!(
+                "hasToken({}, {})",
+                case_key_sql("body"),
+                case_key_sql(&ch_string(w))
+            )
+        })
+        .collect();
+    match parts.as_slice() {
+        [] => "0".to_string(),
+        [one] => one.clone(),
+        _ => format!("({})", parts.join(" AND ")),
+    }
 }
 
-/// `match(body, <p>)`, the pushed `|~`/`!~` predicate. No index serves it
-/// (issue #757).
+/// `match(body, <p>)`, the pushed `|~`/`!~` predicate, read by
+/// `idx_body_ngrams`. A pattern that turns case-insensitivity on renders
+/// `match(identity(body), <p>)`, which no index reads: over a row
+/// `audit DENIED open`, `match(s, '(?i)(denied|refused)')` counts 0 with the
+/// n-gram index and 1 without it.
 fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
+    let column = if pulsus_re2::sets_case_insensitive(pattern) {
+        "identity(body)"
+    } else {
+        "body"
+    };
     Ok(format!(
-        "match(body, {})",
+        "match({column}, {})",
         ch_regex_unanchored_checked(pattern)?
     ))
 }
