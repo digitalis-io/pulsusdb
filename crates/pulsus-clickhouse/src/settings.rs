@@ -475,13 +475,17 @@ impl QuerySettings {
     /// | `min_insert_block_size_rows_for_materialized_views` | `0` | **the block-forming class above, reaching the part of the path its pins do not.** `createSelectInsertContext` *overrides* `min_insert_block_size_rows` with this value for a **view's** insert alone, so the pin on the non-view variant does not govern there; a profile could reshape one view's output into several blocks, each its own commit into the target |
     /// | `min_insert_block_size_bytes_for_materialized_views` | `0` | the same, for bytes |
     ///
-    /// **On a cluster the block goes through its landing table's wrapper
-    /// (issue #494 part 1).** The writer names `<landing table><PULSUS_DIST_SUFFIX>`,
-    /// a `Distributed` table keyed on `cityHash64(received_ms)`, so a push and
-    /// every resend of it reach one shard whichever server receives them. Five
-    /// pins keep that routed insert from being quietly placed elsewhere,
-    /// skipped, or answered before it is stored; single-node they change
-    /// nothing, as no wrapper is named:
+    /// **On a cluster a log or trace block goes through its landing table's
+    /// wrapper (issue #494 part 1).** The writer names
+    /// `<landing table><PULSUS_DIST_SUFFIX>`, a `Distributed` table keyed on
+    /// `cityHash64(received_ms)`, so a push and every resend the writer makes
+    /// of that block reach one shard whichever server receives them.
+    /// `landing_insert`, which the metrics writer sends into the bare
+    /// `metric_landing`, carries the last three pins below;
+    /// [`Self::routed_landing_insert`], which the log writer sends and
+    /// [`Self::trace_landing_insert`] builds on, adds
+    /// `distributed_foreground_insert` and `insert_shard_id`. Single-node they
+    /// change nothing, as no wrapper is named:
     ///
     /// | setting | pinned to | why |
     /// |---|---|---|
@@ -504,21 +508,25 @@ impl QuerySettings {
             .set("ignore_materialized_views_with_dropped_target_table", 0)
             .set("min_insert_block_size_rows_for_materialized_views", 0)
             .set("min_insert_block_size_bytes_for_materialized_views", 0)
-            .set("distributed_foreground_insert", 1)
-            .set("insert_shard_id", 0)
             .set("skip_unavailable_shards", 0)
             .set("prefer_localhost_replica", 0)
             .set("timeout_overflow_mode", "throw")
     }
 
-    /// The settings every log landing insert carries (issue #494 part 1).
+    /// The settings an insert through a landing table's `Distributed`
+    /// wrapper carries (issue #494 part 1): [`Self::landing_insert`] whole,
+    /// plus `distributed_foreground_insert = 1` and `insert_shard_id = 0`,
+    /// whose rows are in [`Self::landing_insert`]'s table. The log writer
+    /// sends it, and [`Self::trace_landing_insert`] builds on it.
     pub fn routed_landing_insert(token: &str, max_rows: u64) -> Self {
         Self::landing_insert(token, max_rows)
+            .set("distributed_foreground_insert", 1)
+            .set("insert_shard_id", 0)
     }
 
     /// The settings every insert of one traces landing block carries (issues
-    /// #584 to #586): [`Self::landing_insert`] whole, plus **seven further
-    /// pins of four classes the metrics set did not need**.
+    /// #584 to #586): [`Self::routed_landing_insert`] whole, plus **seven
+    /// further pins of four classes the metrics set did not need**.
     ///
     /// The rule behind the set, stated once so it does not grow without
     /// bound: **pin what a profile could use to make an answer wrong or a
@@ -554,7 +562,7 @@ impl QuerySettings {
     /// pin cannot reach is the `MergeTree` setting of the same name, which the
     /// landing table's own `CREATE` handles.
     pub fn trace_landing_insert(token: &str, max_rows: u64) -> Self {
-        Self::landing_insert(token, max_rows)
+        Self::routed_landing_insert(token, max_rows)
             .set("input_format_binary_read_json_as_string", 0)
             .set("format_binary_max_object_size", MAX_JSON_PATHS_PER_VALUE)
             .set(

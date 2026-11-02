@@ -87,8 +87,9 @@ const LANDING_TABLE: &str = "log_landing";
 /// The table name a [`LogWriter`] inserts into. One name: the five target
 /// tables are maintained by materialized view and the writer never names
 /// them (issue #603). On a cluster it is the landing table's `Distributed`
-/// wrapper, keyed on `cityHash64(received_ms)`, so a push and every resend of
-/// it reach one shard; single-node it is the bare table (issue #494 part 1,
+/// wrapper, keyed on `cityHash64(received_ms)`, so a push and every resend
+/// the writer makes of that block reach one shard; single-node it is the bare
+/// table (issue #494 part 1,
 /// [`Self::landing_for`]). `Arc<str>` because the server resolves it once at
 /// startup from `Config` rather than at compile time.
 #[derive(Debug, Clone)]
@@ -633,7 +634,7 @@ impl LogWriter {
         let block = LandingBlock::seal(
             rows,
             bytes,
-            QuerySettings::landing_insert(&token, self.shared.ctx.max_rows),
+            QuerySettings::routed_landing_insert(&token, self.shared.ctx.max_rows),
             claim,
             waiter,
             admitted_at,
@@ -1093,7 +1094,7 @@ mod tests {
             let block = LandingBlock::seal(
                 rows,
                 landing_charge::<LogLandingRow>(line_bytes + stream_bytes + pattern_bound),
-                QuerySettings::landing_insert(
+                QuerySettings::routed_landing_insert(
                     &mint_landing_token(&mut XorShift64::seeded()),
                     1_048_576,
                 ),

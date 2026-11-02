@@ -559,9 +559,6 @@ TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_label_index{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_label_index
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_label_index', cityHash64(fingerprint));
 
---@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_landing{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_landing
---@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_landing', cityHash64(received_ms));
-
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_samples{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_samples
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_samples', cityHash64(fingerprint));
 

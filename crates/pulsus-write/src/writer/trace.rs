@@ -38,8 +38,8 @@ use crate::writer::{AdmitMode, Admitted, Suppressed, note_target};
 /// The one table a [`TraceWriter`] inserts into. On a cluster it is the
 /// landing table's `Distributed` wrapper, keyed on `cityHash64(received_ms)`
 /// rather than on a trace id: every row of a push carries one receive stamp,
-/// so the whole push and every resend of it reach one shard (issue #494 part
-/// 1, [`Self::landing_for`]). Single-node it is the bare table. The routing
+/// so the whole push and every resend the writer makes of that block reach
+/// one shard (issue #494 part 1, [`Self::landing_for`]). Single-node it is the bare table. The routing
 /// by trace id happens one step later, on the way out of the per-trace views.
 #[derive(Debug, Clone)]
 pub struct TraceWriterTables {

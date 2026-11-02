@@ -280,14 +280,19 @@ pub(crate) fn writer_tables_from(config: &Config) -> WriterTables {
 /// Maps `Config` to [`pulsus_write::MetricWriterTables`]: the one table the
 /// metrics writer inserts into (issue #603).
 ///
-/// **On a cluster it is the landing table's wrapper,
-/// `metric_landing<PULSUS_DIST_SUFFIX>`**, for the reasons
-/// [`writer_tables_from`] gives: one push is one block on one shard, and every
-/// resend reaches that shard. Single-node it is the bare `metric_landing`. The
-/// four target tables keep their wrappers, and [`metrics_config_from`] on the
-/// read path derives them exactly as before.
+/// **The bare `metric_landing` in every mode**, written on the server the
+/// writer connects to (issue #494 part 1). Routing metrics by the receive
+/// stamp would split a series' samples from its registration and break the
+/// shard-local metrics reads, so metrics keep this placement until they get a
+/// routing key of their own. On a cluster whose servers behind the configured
+/// addresses span more than one shard, a metrics read can therefore leave out
+/// a sample stored on a different shard from its series' registration
+/// (`docs/configuration.md`'s topology requirement). The four target tables
+/// keep their wrappers, and [`metrics_config_from`] on the read path derives
+/// them exactly as before.
 pub(crate) fn metric_writer_tables_from(config: &Config) -> MetricWriterTables {
-    MetricWriterTables::landing_for(landing_suffix(config))
+    let _ = config;
+    MetricWriterTables::metrics_default()
 }
 
 /// Maps `Config` to [`pulsus_write::TraceWriterTables`]: the landing table,
@@ -316,9 +321,10 @@ pub(crate) fn logql_engine(
 }
 
 /// Maps `Config` to [`pulsus_read::LabelCacheConfig`] (issue #30 architect
-/// plan): `metric_series` is `_dist`-aware exactly as
-/// [`metric_writer_tables_from`] derives it — cache reads and writer
-/// registrations must agree on which physical table they mean.
+/// plan): on a cluster the cache reads `metric_series` and `metric_labels`
+/// through their `PULSUS_DIST_SUFFIX` wrappers, so it sees every shard's
+/// registrations wherever the metrics writer inserted them (into the bare
+/// `metric_landing`, [`metric_writer_tables_from`]).
 /// `staleness_multiplier` is the documented constant
 /// ([`pulsus_read::DEFAULT_STALENESS_MULTIPLIER`], task-manager resolution
 /// #2 on issue #30), not yet promoted to a config field.
