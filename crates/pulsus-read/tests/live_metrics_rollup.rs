@@ -674,9 +674,53 @@ struct ReadRowsRow {
     rows: u64,
 }
 
-/// `read_rows` per `log_comment`, for the comments `prefix` starts.
+/// How long [`settle_query_log`] waits for the statements it is reading.
+const QUERY_LOG_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Waits until every statement `filter` selects in `system.query_log` has
+/// its ending row, and at least one is there.
+///
+/// One `SYSTEM FLUSH LOGS` is not a barrier: a statement's `QueryFinish`
+/// row can be queued after its client has the answer, so a single flush and
+/// read can miss it. Its `QueryStart` row is queued before the statement
+/// runs, so once flushed it names every statement sent under `filter`; the
+/// wait ends when each of those `query_id`s has a `QueryFinish` or
+/// `ExceptionWhileProcessing` row too, flushing again on every try. It fails
+/// after [`QUERY_LOG_WAIT`] with what is still missing.
+async fn settle_query_log(admin: &ChClient, filter: &str) {
+    let sql = format!(
+        "SELECT toInt64(count()) AS v FROM system.query_log \
+         WHERE type = 'QueryStart' AND ({filter}) \
+         UNION ALL \
+         SELECT toInt64(countIf(started AND NOT ended)) AS v FROM ( \
+           SELECT query_id, max(type = 'QueryStart') AS started, \
+             max(type IN ('QueryFinish', 'ExceptionWhileProcessing')) AS ended \
+           FROM system.query_log WHERE ({filter}) GROUP BY query_id)"
+    );
+    let deadline = std::time::Instant::now() + QUERY_LOG_WAIT;
+    loop {
+        exec(admin, "SYSTEM FLUSH LOGS").await;
+        let mut got = ints(admin, &sql).await;
+        got.sort_unstable();
+        // The two counts arrive in either order; the unfinished one is never
+        // larger than the started one.
+        let (pending, started) = (got[0], got[1]);
+        if started > 0 && pending == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "system.query_log did not settle within {QUERY_LOG_WAIT:?} for {filter}: \
+             {started} statements started, {pending} without an ending row"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// `read_rows` per `log_comment`, for the comments `prefix` starts, once
+/// every statement under them has finished in the log.
 async fn read_rows(admin: &ChClient, prefix: &str) -> BTreeMap<String, u64> {
-    exec(admin, "SYSTEM FLUSH LOGS").await;
+    settle_query_log(admin, &format!("startsWith(log_comment, '{prefix}')")).await;
     let mut stream = admin
         .query_stream::<ReadRowsRow>(
             &format!(
@@ -2448,9 +2492,10 @@ struct StatementRow {
     rows: u64,
 }
 
-/// Every finished statement sent under `comment`, with its `result_rows`.
+/// Every finished statement sent under `comment`, with its `result_rows`,
+/// once each has finished in the log ([`settle_query_log`]).
 async fn statements(admin: &ChClient, comment: &str) -> Vec<(String, u64)> {
-    exec(admin, "SYSTEM FLUSH LOGS").await;
+    settle_query_log(admin, &format!("log_comment = '{comment}'")).await;
     let mut stream = admin
         .query_stream::<StatementRow>(
             &format!(
