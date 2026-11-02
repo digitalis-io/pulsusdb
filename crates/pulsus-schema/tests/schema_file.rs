@@ -1106,7 +1106,7 @@ const PARTIAL_LOG_PUSH: &str = "**A synchronous log push can be answered `500` a
 
 /// `docs/api.md` §1.0's two metrics paragraphs, after the partial log push
 /// paragraph (issue #494 part 1b).
-const METRICS_PUSH_PARAGRAPHS: &str = r##"**How a metrics push is written.** A metrics push makes zero, one or two inserts into `metric_landing`. Its samples, histogram samples and exemplars, with their series' registrations, are its **samples insert**; descriptors in the request that its writer has not sent in the hour are **due**, and go in its **descriptors insert**, whether or not the request's points were accepted. A push is first checked against the writer's state and its size: a writer shutting down, or a suppression index or its waiters at their bound, answers `429`; a reused `Idempotency-Key` answers `400`; a push over its size ceiling answers `413`; each makes no insert. Otherwise:
+const METRICS_PUSH_PARAGRAPHS: &str = r##"**How a metrics push is written.** A metrics push makes zero, one or two inserts into `metric_landing`. Its samples, histogram samples and exemplars, with their series' registrations, are its **samples insert**; descriptors in the request that its writer has not sent in the hour are **due**, and go in its **descriptors insert**, whether or not the request's points were accepted. A push is first checked against the writer's state and its size: a writer shutting down, or a suppression index or its waiters at their bound, answers `429`; a reused `Idempotency-Key` answers `400`; a push over its size ceiling or over `100` UTC dates answers `413`; each makes no insert. Otherwise:
 
 | the push | inserts | answered by |
 |---|---|---|
@@ -1178,7 +1178,7 @@ const USER_DOC_EDITS: &[(&str, Option<&str>, &str)] = &[
         Some(
             r##"— one whole landing block, its rows, its settings and its claim — and holds it until its block has committed or has been spooled"##,
         ),
-        r##"— each landing insert it makes ([api.md §1.0](api.md)), its rows, its settings and its claim; a metrics push that makes two is admitted only if both fit — and holds each insert's charge until that insert has committed or has been spooled"##,
+        r##"— each landing insert it makes ([api.md §1.0](api.md)), its rows, its settings and its claim; a metrics push that makes two is admitted only if both fit — and holds each insert's charge until the insert carrying it has committed or has been spooled"##,
     ),
     (
         "configuration.md",
@@ -1214,7 +1214,7 @@ const USER_DOC_EDITS: &[(&str, Option<&str>, &str)] = &[
         Some(
             r##"refuse a push that does not fit one block, whole (issues #603 and #586).** Each is stored as one `INSERT` of one block into one table, and it is never split: two blocks can commit a prefix, and a prefix is not all-or-nothing."##,
         ),
-        r##"refuse a push over its size ceiling, whole (issues #603 and #586).** A log or trace push is stored as one `INSERT` of one block into one table; how a metrics push is written is §1.0's. No push's samples, lines or spans are divided among inserts: two inserts of them could commit a prefix, and a prefix is not all-or-nothing."##,
+        r##"refuse a push over its size ceiling, whole (issues #603 and #586).** A log or trace push is stored in one `INSERT` of one block into one table, which may carry other pushes of its signal (§1.0); how a metrics push is written is §1.0's. No push's samples, lines or spans are divided among inserts: two inserts of them could commit a prefix, and a prefix is not all-or-nothing."##,
     ),
     (
         "api.md",
@@ -1224,7 +1224,7 @@ const USER_DOC_EDITS: &[(&str, Option<&str>, &str)] = &[
     (
         "api.md",
         Some(r##"**A push that does not fit one block is `413` here too**"##),
-        r##"**A push over its size ceiling is `413` here too**"##,
+        r##"**A push over its size ceiling, or over `100` UTC dates, is `413` here too**"##,
     ),
     (
         "api.md",

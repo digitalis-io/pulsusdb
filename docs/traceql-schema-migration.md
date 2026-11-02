@@ -2433,7 +2433,7 @@ What remains unmeasured:
 | `d`, the trace-grain collapse factor, on real traces | it scales the whole index saving. §11 P5 |
 | the byte cost of the `event_set_sql` read after it moves to an `ARRAY JOIN` over `trace_spans` | it is the one phase-2 read that stays a separate statement. §4 Q1 |
 | the scalar value read (`arrayFirstIndex` + element extraction) against today's `attr_values_sql` | the shape is bounded by construction; the byte cost is not measured |
-| whether `Array(LowCardinality(String))` and `Array(Nullable(Float64))` insert through our own writer | `metric_hist_samples` proves `Array(Int32)`/`Array(Float64)` from a `Vec` field (`crates/pulsus-schema/src/catalog.rs:492-498`, `crates/pulsus-write/src/writer/rows.rs:416, 443`); the low-cardinality and nullable element types have no precedent in this repository |
+| whether `Array(LowCardinality(String))` and `Array(Nullable(Float64))` insert through our own writer | `metric_hist_samples` proves `Array(Int32)`/`Array(Float64)` from a `Vec` field (`crates/pulsus-schema/src/catalog.rs:492-498`, `crates/pulsus-write/src/writer/rows.rs:422, 449`); the low-cardinality and nullable element types have no precedent in this repository |
 | the cost of the drop/add/materialise interval on `service_time` (§8 ids 44–46) on a populated table | during it, a `resource.service.name` search falls back to a base-table scan. Empty on a fresh database |
 | the clustered path beyond column presence | §8's twins were measured on a single-node `Distributed('default', …)`: the column appears and the insert lands. Multi-shard routing, `cityHash64(trace_id)` co-sharding of the four new wrappers, and a clustered read were not measured |
 | storage at Appendix A's `Z_p` = 4 | §5's measured storage row was taken at `Z_p` = 15.91 and carries its payload component so the figure can be re-derived at another `Z_p`; it was not re-run at 4 |
@@ -2491,10 +2491,10 @@ the migration catalogue is append-only and that the window for in-place amendmen
 > Migrations are idempotent, and append-only from the first tagged release onward —
 > in-place amendment of an already-listed migration was permitted only pre-release (the
 > trace-index scope amendment, issue #54, was the last such window; see docs/schemas.md §6)
-> — `docs/architecture.md:96`
+> — `docs/architecture.md:103`
 
 > the trace-index scope amendment (issue #54) was the last such amendment window
-> — `docs/schemas.md:1060`
+> — `docs/schemas.md:1067`
 
 > issue #54's scope amendment of migrations 17/18 + `trace_tag_catalog_mv` was the last
 > such amendment window (task-manager ruling on #54) — `crates/pulsus-schema/src/catalog.rs:16-23`
@@ -3162,7 +3162,7 @@ from its source; the pointer is not reproduced here.
 |---|---|---|
 | phase-2 batch | 32 candidate traces | `crates/pulsus-read/src/traces/exec.rs:126` @ 1cdb3e5e |
 | candidate ceiling | 100,000 | `crates/pulsus-config/src/model.rs:692` @ 1cdb3e5e |
-| scan budget | 50,000,000 rows | `crates/pulsus-config/src/model.rs:642` |
+| scan budget | 50,000,000 rows | `crates/pulsus-config/src/model.rs:649` |
 | tag lookback default | 24 hours | `crates/pulsus-config/src/model.rs:696` @ 1cdb3e5e |
 | spans per trace cap | `LIMIT 10001 BY trace_id` | `crates/pulsus-read/src/traces/exec.rs:131` @ 1cdb3e5e |
 | tag name / value caps | 10,000 / 1,000 | `crates/pulsus-read/src/traces/exec.rs:131 @ 1cdb3e5e, 135` |

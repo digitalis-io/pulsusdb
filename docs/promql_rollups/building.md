@@ -12,7 +12,7 @@
 | `PULSUS_ROLLUP_RANGES` | `10800,57600,604800,7776000` | for each level, the query range in seconds from which it is the resolution (`reading.md` §2); a range below the first reads raw. Read only when there are levels |
 | `PULSUS_ROLLUP_COUNTER_BUCKETS` | `5` | the buckets of a level under 720 s that a `rate` or `increase` range covers at least for that level to answer it; from 720 s one bucket answers. The distances in `docs/api.md` §3.6 hold for `5` |
 
-They are schema-build settings, documented beside the other schema settings (`PULSUS_ROLLUP_LEVELS`, `docs/configuration.md:179-181`). `schema/schema.sh` reads them with no colon in the default, so unset gives the default and set-but-empty gives none (`rollup_levels`, `rollup_ranges`, `counter_buckets`, `schema/schema.sh:60-62`); `RenderCtx::for_tests` is `ctx_from_vars` of the database and the retention alone, so it takes `DEFAULT_ROLLUP_LEVELS`, `DEFAULT_ROLLUP_RANGES` and `DEFAULT_ROLLUP_COUNTER_BUCKETS` (`crates/pulsus-schema/src/vars.rs:293-295`). The binary has no rollup setting: it learns the levels, their switch points and the counter bucket count from the tables' comments (`reading.md` §2).
+They are schema-build settings, documented beside the other schema settings (`PULSUS_ROLLUP_LEVELS`, `docs/configuration.md:180-182`). `schema/schema.sh` reads them with no colon in the default, so unset gives the default and set-but-empty gives none (`rollup_levels`, `rollup_ranges`, `counter_buckets`, `schema/schema.sh:60-62`); `RenderCtx::for_tests` is `ctx_from_vars` of the database and the retention alone, so it takes `DEFAULT_ROLLUP_LEVELS`, `DEFAULT_ROLLUP_RANGES` and `DEFAULT_ROLLUP_COUNTER_BUCKETS` (`crates/pulsus-schema/src/vars.rs:293-295`). The binary has no rollup setting: it learns the levels, their switch points and the counter bucket count from the tables' comments (`reading.md` §2).
 
 Changing the set is a rebuild: drop the database and run `schema/schema.sh` again. A new set builds from what landing still holds.
 
@@ -314,7 +314,7 @@ The server accepted `EVERY 12 MINUTE OFFSET 240 SECOND`, `EVERY 2 HOUR OFFSET 30
 | a missed or failed run | the next starts from the same watermark. The first level catches up at most 5 periods of samples per run, the others 10 buckets. An empty window still writes its run row, so the watermark moves |
 | never older than landing | a first-level run starts no earlier than `now − H × 3600 s + 720 s`. A stop longer than landing holds leaves a hole in the run rows, which is read from finer levels or raw (`reading.md` §3) |
 | the first run on a database already holding samples | the first level starts one period back and writes a run row from there. Earlier history has no run row and reads raw. A coarser level builds from the level below, back to that level's oldest run row |
-| settle 150 s | `received_ms` is stamped at admission, and the insert may commit up to the landing budget, 120 s, later (`WriterRuntime::landing_budget`, `docs/ingest-one-source-table.md:421-425`). A sample later than that stays in raw only |
+| settle 150 s | `received_ms` is stamped at admission, and the insert may commit up to the landing budget, 120 s, later (`WriterRuntime::landing_budget`, `docs/ingest-one-source-table.md:428-432`). A sample later than that stays in raw only |
 | lookback 120 s | the first level reads two minutes before its window for each series' previous sample; a series with none there takes it from the level's own table, up to a day back (§3.1) |
 
 ### 3.4 A run reads only its window
