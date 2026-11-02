@@ -2491,10 +2491,10 @@ the migration catalogue is append-only and that the window for in-place amendmen
 > Migrations are idempotent, and append-only from the first tagged release onward —
 > in-place amendment of an already-listed migration was permitted only pre-release (the
 > trace-index scope amendment, issue #54, was the last such window; see docs/schemas.md §6)
-> — `docs/architecture.md:103`
+> — `docs/architecture.md:105`
 
 > the trace-index scope amendment (issue #54) was the last such amendment window
-> — `docs/schemas.md:1067`
+> — `docs/schemas.md:1069`
 
 > issue #54's scope amendment of migrations 17/18 + `trace_tag_catalog_mv` was the last
 > such amendment window (task-manager ruling on #54) — `crates/pulsus-schema/src/catalog.rs:16-23`

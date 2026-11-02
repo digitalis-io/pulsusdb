@@ -1,20 +1,20 @@
 id	path	prefix	suffix	rendering	line
-traceql_pipeline_stage_variants	docs/query-to-sql.md	### 1.5 TraceQL — the	stage kinds, and the selector	word	359
-traceql_pipeline_stage_variants	docs/query-to-sql.md	`PipelineStage` has exactly	variants	word	361
-traceql_pipeline_stage_variants	docs/query-to-sql.md	### 2.4 TraceQL — the	stage kinds, and the selector	word	600
-traceql_pipeline_stage_variants	docs/query-lowering.md	([`crates/pulsus-traceql/src/ast.rs`](../crates/pulsus-traceql/src/ast.rs), line 981) has exactly **	** variants	word	1167
-traceql_pipeline_stage_variants	docs/query-lowering.md	** variants; all	are below	word	1167
-logql_stage_variants	docs/query-to-sql.md	### 1.2 LogQL — the	stage kinds	word	264
-logql_stage_variants	docs/query-to-sql.md	`Stage` has exactly	variants	word	266
-logql_stage_variants	docs/query-lowering.md	no validation. #### The	`Stage` variants, each as a `Pipe` link	word	1743
-never_reason_variants	docs/query-lowering.md	`NeverReason` has exactly **	** variants	word	5461
-lql_link_variants	docs/query-lowering.md	`LqlLink` has exactly **	** variants	digits	5291
-cut_variants	docs/query-lowering.md	every continuation naming a cut names one of the	|	word	5297
-logql_stage_variants	docs/query-lowering.md	reason — a `find_map` over the	stage variants	word	49
-cut_variants	docs/query-lowering.md	§2.7 is the plan object and the	**cuts** that are the only ways	word	19
-section_3_1_effect_rows	docs/query-lowering.md	| §3.1 carries exactly **	** rows with a residual state effect	digits	5292
-section_3_1_effect_rows	docs/query-lowering.md	tables: **	** in §3.1 (`Structural`	digits	5089
-section_3_1_rows_without_effect	docs/query-lowering.md	** rows with a residual state effect and **	** without; §7.1 carries exactly	digits	5292
-section_7_1_effect_rows	docs/query-lowering.md	** without; §7.1 carries exactly **	** and **	digits	5292
-section_7_1_rows_without_effect	docs/query-lowering.md	§7.1 carries exactly **20** and **	** —	digits	5292
-residual_effects_total	docs/query-lowering.md	`LabelReplace`, `Order`, `Limit`, `Emit`) — **	** effects in all	digits	5093
+traceql_pipeline_stage_variants	docs/query-to-sql.md	### 1.5 TraceQL — the	stage kinds, and the selector	word	361
+traceql_pipeline_stage_variants	docs/query-to-sql.md	`PipelineStage` has exactly	variants	word	363
+traceql_pipeline_stage_variants	docs/query-to-sql.md	### 2.4 TraceQL — the	stage kinds, and the selector	word	602
+traceql_pipeline_stage_variants	docs/query-lowering.md	([`crates/pulsus-traceql/src/ast.rs`](../crates/pulsus-traceql/src/ast.rs), line 981) has exactly **	** variants	word	1169
+traceql_pipeline_stage_variants	docs/query-lowering.md	** variants; all	are below	word	1169
+logql_stage_variants	docs/query-to-sql.md	### 1.2 LogQL — the	stage kinds	word	266
+logql_stage_variants	docs/query-to-sql.md	`Stage` has exactly	variants	word	268
+logql_stage_variants	docs/query-lowering.md	no validation. #### The	`Stage` variants, each as a `Pipe` link	word	1745
+never_reason_variants	docs/query-lowering.md	`NeverReason` has exactly **	** variants	word	5463
+lql_link_variants	docs/query-lowering.md	`LqlLink` has exactly **	** variants	digits	5293
+cut_variants	docs/query-lowering.md	every continuation naming a cut names one of the	|	word	5299
+logql_stage_variants	docs/query-lowering.md	reason — a `find_map` over the	stage variants	word	51
+cut_variants	docs/query-lowering.md	§2.7 is the plan object and the	**cuts** that are the only ways	word	21
+section_3_1_effect_rows	docs/query-lowering.md	| §3.1 carries exactly **	** rows with a residual state effect	digits	5294
+section_3_1_effect_rows	docs/query-lowering.md	tables: **	** in §3.1 (`Structural`	digits	5091
+section_3_1_rows_without_effect	docs/query-lowering.md	** rows with a residual state effect and **	** without; §7.1 carries exactly	digits	5294
+section_7_1_effect_rows	docs/query-lowering.md	** without; §7.1 carries exactly **	** and **	digits	5294
+section_7_1_rows_without_effect	docs/query-lowering.md	§7.1 carries exactly **20** and **	** —	digits	5294
+residual_effects_total	docs/query-lowering.md	`LabelReplace`, `Order`, `Limit`, `Emit`) — **	** effects in all	digits	5095

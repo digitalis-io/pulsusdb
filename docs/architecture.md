@@ -7,6 +7,8 @@
 
 # PulsusDB Architecture
 
+**Stale on the log body index.** `log_samples` carries two bloom-filter indexes on the body and no `text` index: `idx_body_words`, `tokenbf_v1(32768, 3, 0)` over `upperUTF8(lowerUTF8(body))`, which a `word(…)` filter reads through `hasToken`; and `idx_body_ngrams`, `ngrambf_v1(4, 32768, 3, 0)` over `body`, which `body LIKE` and `match(body, …)` read. A `|~` that turns case-insensitivity on renders `match(identity(body), …)` and reads neither. Passages below that describe a `text` index, `hasAllTokens`, a body with no substring index, or line filters that prune nothing are out of date. Current behaviour: `schema/schema.sql` and `crates/pulsus-read/src/logql/predicate.rs`.
+
 > **Stale on landing placement and on the metrics token.** On a cluster every landing table is
 > written through its wrapper, `<landing table><PULSUS_DIST_SUFFIX>` (`log_landing_dist` at the
 > default suffix): `log_landing` and `trace_landing` keyed on `cityHash64(received_ms)`, so a log or
