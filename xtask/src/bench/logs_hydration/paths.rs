@@ -47,7 +47,7 @@ use super::report::{Dist, PathEvidence, StageDist, Variant};
 use crate::bench::dataset::BroadDatasetSummary;
 use crate::bench::queries::month_literals;
 use crate::bench::query_log::{flush_logs, tagged_settings};
-use pulsus_model::{Fingerprint, FpLiteral};
+use pulsus_model::{Fingerprint, FpLiteral, FpSet};
 
 /// Table names this scenario reads/writes — always bare (single-node only;
 /// `--dist` per-shard roster capture is explicitly out of scope for this
@@ -118,7 +118,7 @@ fn service_set_from_idx(
     format!(
         "SELECT DISTINCT val AS service\nFROM {streams_idx_table}\nWHERE {} AND key = 'service_name' AND fingerprint IN ({})",
         month_clause(months),
-        fp_list(fps)
+        FpSet(fps)
     )
 }
 
@@ -127,7 +127,7 @@ fn service_set_from_idx(
 fn service_set_from_streams(streams_table: &str, fps: &[FpLiteral]) -> String {
     format!(
         "SELECT DISTINCT service\nFROM {streams_table}\nWHERE fingerprint IN ({})",
-        fp_list(fps)
+        FpSet(fps)
     )
 }
 
@@ -144,16 +144,6 @@ fn month_clause(months: &[MonthLiteral]) -> String {
                 .join(", ")
         )
     }
-}
-
-/// The same `toUInt128('<decimal>')` list the product's own builders
-/// render (issue #498): the column is `UInt128`, and a bare decimal above
-/// `2^64` is read by ClickHouse as `Float64`.
-fn fp_list(fps: &[FpLiteral]) -> String {
-    fps.iter()
-        .map(FpLiteral::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Mints a resolved fingerprint set for the builders, which take literals.

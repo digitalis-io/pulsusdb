@@ -1988,26 +1988,26 @@ fn class_expression(
     }
 }
 
-/// `fingerprint IN (toUInt128('a'), …)` / `fingerprint NOT IN (…)`.
+/// `fingerprint IN ('a', …)` / `fingerprint NOT IN (…)`.
 ///
-/// The call form is not optional above `2^64`, where ClickHouse reads a
-/// bare decimal literal as `Float64` (issue #498); the parameter is a
-/// minted literal, so the form is the type's rather than this function's.
+/// The set form ([`pulsus_model::FpSet`], issue #399): the server converts
+/// each element to the `UInt128` column exactly, and the list folds into one
+/// parse-tree node, so a class of any size costs the statement four nodes.
+///
+/// A bare decimal is not an option above `2^64`, where ClickHouse reads it
+/// as `Float64` (issue #498); the parameter is a minted literal, so the form
+/// is the type's rather than this function's.
+///
+/// The capacity is the set's rendered length plus room for the frame.
 fn fingerprint_test(fps: &[FpLiteral], negated: bool) -> String {
-    // `toUInt128('')` is 14 characters plus up to 39 decimal digits and
-    // the `, ` separator.
-    let mut out = String::with_capacity(fps.len() * 55 + 24);
+    let set = pulsus_model::FpSet(fps);
+    let mut out = String::with_capacity(set.rendered_len() + 24);
     out.push_str(if negated {
         "fingerprint NOT IN ("
     } else {
         "fingerprint IN ("
     });
-    for (i, fp) in fps.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(&fp.to_string());
-    }
+    out.push_str(&set.to_string());
     out.push(')');
     out
 }
@@ -3153,9 +3153,9 @@ mod tests {
         )
         .expect("renders");
         assert_eq!(complement, Some(ComplementClass::Direct));
-        let sql = fragment.as_sql();
+        let (sql, excluded) = (fragment.as_sql(), pulsus_model::FpSet(&sel[0..1]));
         assert!(
-            sql.contains(&format!("fingerprint NOT IN ({})", sel[0])),
+            sql.contains(&format!("fingerprint NOT IN ({excluded})")),
             "the complement must exclude the stream-label class in full: {sql}"
         );
         assert!(

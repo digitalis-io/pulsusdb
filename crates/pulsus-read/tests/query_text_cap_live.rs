@@ -220,7 +220,8 @@ async fn metrics_multi_oversized_sql_fails_under_ch_defaults_and_succeeds_under_
         &fps,
         0,
         i64::MAX,
-    );
+    )
+    .expect("fits");
     assert!(
         sql.len() > 262_144,
         "fixture SQL is {} bytes, expected > 262,144 to exercise the ClickHouse default",

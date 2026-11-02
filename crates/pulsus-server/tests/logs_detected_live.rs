@@ -520,23 +520,19 @@ async fn detected_labels_and_fields_end_to_end() {
         agg_sql.contains("log_streams_idx"),
         "the aggregation reads the stream index"
     );
-    // Issue #603: the activity scan is a STATEMENT OF ITS OWN, so the
-    // aggregation carries the request's window as a literal fingerprint list
-    // and names only the index table. What names the configured rollup is the
-    // `stream_activity` stage that ran before it.
+    // Issue #399: the request is ONE statement. The aggregation carries the
+    // request's window as the activity read over the configured rollup,
+    // nested with `GLOBAL IN`; no `stream_activity` stage runs before it.
+    let nested = agg_sql
+        .split_once("fingerprint GLOBAL IN (SELECT DISTINCT fingerprint FROM ")
+        .map(|(_, rest)| rest.split_whitespace().next().unwrap_or_default());
     assert!(
-        !agg_sql.contains("log_metrics_5s") && !agg_sql.contains("SELECT DISTINCT fingerprint"),
-        "the aggregation must nest no activity subquery: {agg_sql}"
+        nested.is_some_and(|table| table.ends_with("log_metrics_5s")),
+        "the aggregation must nest the activity read over the rollup: {agg_sql}"
     );
-    let activity = stages
-        .iter()
-        .find(|s| s["name"] == "stream_activity")
-        .expect("a stream_activity stage");
-    let activity_sql = activity["sql"].as_str().expect("sql");
     assert!(
-        activity_sql.contains("log_metrics_5s"),
-        "the activity statement must read the configured rollup table, which \
-         is where the request's window applies: {activity_sql}"
+        !stages.iter().any(|s| s["name"] == "stream_activity"),
+        "no activity statement of its own: {stages:?}"
     );
     for stage in stages {
         let sql = stage["sql"].as_str().unwrap_or_default();

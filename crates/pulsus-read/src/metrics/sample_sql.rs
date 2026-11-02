@@ -14,7 +14,7 @@
 //! so every read is an exact ID list (or the fallback's ID sub-query) and
 //! a time range. The one string literal here is [`names_predicate`]'s, for
 //! the explained read. Fingerprints enter as [`FpLiteral`]s and render as
-//! `toUInt128('<decimal>')` (no escaping surface — they come from
+//! `'<decimal>'` set elements (issue #399; no escaping surface — they come from
 //! [`super::labels::Resolution::Fingerprints`] or a resolved
 //! `SqlFallback`, never from unescaped user text). No function in this
 //! module takes a `Fingerprint`: the mint is upstream, which is what makes
@@ -83,8 +83,8 @@ pub fn intervals_predicate(lo_col: &str, hi_col: &str, op: &str, within: &[(i64,
     }
 }
 
-/// `fingerprint IN (toUInt128('101'), toUInt128('205'))` — the resolved
-/// fingerprint set.
+/// `fingerprint IN ('101', '205')` — the resolved fingerprint set, in the
+/// set form (issue #399).
 pub fn fingerprints_predicate(fps: &[FpLiteral]) -> String {
     format!("fingerprint IN ({})", render_fingerprint_list(fps))
 }
@@ -171,16 +171,17 @@ pub fn sample_fetch_multi(
     fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
-) -> String {
+) -> Result<String, crate::logql::TooBroadReason> {
+    crate::querytext::ensure_fingerprint_set_fits(&pulsus_model::FpSet(fps))?;
     let window = format!(
         "org_id = {} AND {}",
         tenant.sql_literal(),
         window_predicate(lower_excl_ms, upper_incl_ms)
     );
     let fps = fingerprints_predicate(fps);
-    format!(
+    Ok(format!(
         "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
-    )
+    ))
 }
 
 /// The 13 `metric_hist_samples` value columns, order-locked to the catalog
@@ -250,32 +251,38 @@ pub fn hist_sample_fetch_multi(
     fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
-) -> String {
+) -> Result<String, crate::logql::TooBroadReason> {
+    crate::querytext::ensure_fingerprint_set_fits(&pulsus_model::FpSet(fps))?;
     let window = format!(
         "org_id = {} AND {}",
         tenant.sql_literal(),
         window_predicate(lower_excl_ms, upper_incl_ms)
     );
     let fps = fingerprints_predicate(fps);
-    format!(
+    Ok(format!(
         "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
-    )
+    ))
 }
 
-/// The comma-separated `toUInt128('<decimal>')` list an `IN (...)`
-/// carries. `pub` because `super::compile`'s `handoff_cost` bound is
-/// asserted against what this renders (issue #548 criterion 7), and a
-/// bound asserted against a second renderer would bound the wrong text.
+/// The comma-separated `'<decimal>'` set an `IN (...)` carries
+/// ([`pulsus_model::FpSet`]). `pub` because `super::compile`'s
+/// `handoff_cost` bound is asserted against what this renders (issue #548
+/// criterion 7), and a bound asserted against a second renderer would bound
+/// the wrong text.
 ///
-/// The call form is not optional above `2^64`: ClickHouse reads a bare
-/// decimal literal there as `Float64`, exact only to `2^53`, so
-/// `fingerprint IN (<bare list>)` prunes every granule and returns nothing
-/// (issue #498, measured on ClickHouse 26.3.29.7).
+/// A bare decimal is not an option above `2^64`: ClickHouse reads one there
+/// as `Float64`, exact only to `2^53` (issue #498). A quoted decimal is
+/// converted to the `UInt128` column type exactly, and a list of them folds
+/// into one parse-tree node where a list of `toUInt128(…)` calls costs three
+/// per element (issue #399).
 pub fn render_fingerprint_list(fps: &[FpLiteral]) -> String {
-    fps.iter()
-        .map(FpLiteral::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
+    pulsus_model::FpSet(fps).to_string()
+}
+
+/// A typed fingerprint array, `CAST(['<d>', …], 'Array(UInt128)')`, for
+/// the grouped fetch's `fps` (issue #399).
+pub fn render_fingerprint_array(fps: &[FpLiteral]) -> String {
+    pulsus_model::FpArray(fps).to_string()
 }
 
 /// The fingerprint-chunking threshold (architect plan, edge case 7):
@@ -306,6 +313,24 @@ pub fn chunk_fingerprints(fps: &[FpLiteral], chunk_size: usize) -> Vec<&[FpLiter
     fps.chunks(chunk_size).collect()
 }
 
+/// The four fingerprint sets the preflight tests (issue #399, T11 and T12)
+/// drive, by rendered length: A 8,388,610 bytes, B exactly 8,388,608,
+/// C 8,388,607, D 8,384,998.
+#[cfg(test)]
+pub(crate) fn preflight_sets() -> [Vec<FpLiteral>; 4] {
+    use pulsus_model::Fingerprint;
+    let max = Fingerprint::from_raw(u128::MAX).sql_literal();
+    let d38 = Fingerprint::from_raw(10u128.pow(37)).sql_literal();
+    let d37 = Fingerprint::from_raw(10u128.pow(36)).sql_literal();
+    let a = vec![max; 195_084];
+    let mut b = vec![max; 195_082];
+    b.extend([d38, d38]);
+    let mut c = vec![max; 195_082];
+    c.extend([d38, d37]);
+    let d = vec![max; 195_000];
+    [a, b, c, d]
+}
+
 #[cfg(test)]
 mod tests {
     use pulsus_model::Fingerprint;
@@ -334,15 +359,15 @@ mod tests {
         18_446_744_073_709_551_618,
     ];
 
-    /// The exact call form at the four values where a bare decimal and
-    /// `toUInt128('<decimal>')` first disagree (issue #498).
+    /// The set form at the four values where a bare decimal and an exact
+    /// form first disagree (issue #498; the set form is issue #399's).
     #[test]
-    fn render_fingerprint_list_renders_the_exact_call_form_at_the_2_64_boundary() {
+    fn render_fingerprint_list_renders_the_set_form_at_the_2_64_boundary() {
         let fps: Vec<FpLiteral> = BOUNDARY.iter().copied().map(fp).collect();
         assert_eq!(
             render_fingerprint_list(&fps),
-            "toUInt128('18446744073709551615'), toUInt128('18446744073709551616'), \
-             toUInt128('18446744073709551617'), toUInt128('18446744073709551618')"
+            "'18446744073709551615', '18446744073709551616', \
+             '18446744073709551617', '18446744073709551618'"
         );
     }
 
@@ -364,7 +389,7 @@ mod tests {
             "SELECT fingerprint, unix_milli, value\n\
              FROM metric_samples\n\
              WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
-             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
+             \x20 AND fingerprint IN ('101', '205', '990')\n\
              ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
         );
     }
@@ -391,7 +416,7 @@ mod tests {
             "SELECT fingerprint, unix_milli, value\n\
              FROM metric_samples\n\
              WHERE org_id = '' AND ((unix_milli > 1000 AND unix_milli <= 2000) OR (unix_milli > 8000 AND unix_milli <= 9000))\n\
-             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+             \x20 AND fingerprint IN ('101', '205')\n\
              ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
         );
     }
@@ -483,13 +508,14 @@ mod tests {
             ],
             1_000,
             2_000,
-        );
+        )
+        .expect("fits");
         assert_eq!(
             sql,
             "SELECT fingerprint, unix_milli, value\n\
              FROM metric_samples\n\
              WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
-             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+             \x20 AND fingerprint IN ('101', '205')\n\
              ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)"
         );
     }
@@ -502,7 +528,8 @@ mod tests {
             &[Fingerprint::from_raw(1).sql_literal()],
             0,
             100,
-        );
+        )
+        .expect("fits");
         assert!(sql.contains("unix_milli > 0 AND unix_milli <= 100"));
         assert!(!sql.contains("unix_milli >= 0"));
     }
@@ -536,7 +563,7 @@ mod tests {
                 "SELECT fingerprint, unix_milli, {HIST_COLS}\n\
                  FROM metric_hist_samples\n\
                  WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
-                 \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
+                 \x20 AND fingerprint IN ('101', '205', '990')\n\
                  ORDER BY fingerprint, unix_milli"
             )
         );
@@ -574,14 +601,15 @@ mod tests {
             ],
             1_000,
             2_000,
-        );
+        )
+        .expect("fits");
         assert_eq!(
             sql,
             format!(
                 "SELECT fingerprint, unix_milli, {HIST_COLS}\n\
                  FROM metric_hist_samples\n\
                  WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
-                 \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+                 \x20 AND fingerprint IN ('101', '205')\n\
                  ORDER BY fingerprint, unix_milli"
             )
         );
@@ -646,7 +674,7 @@ mod tests {
         );
         assert_same_but_the_float_sort_key(&float, &hist);
         assert!(predicate_tail(&float).contains("unix_milli > 1000 AND unix_milli <= 2000"));
-        assert!(predicate_tail(&float).contains("fingerprint IN (toUInt128('7'), toUInt128('9'))"));
+        assert!(predicate_tail(&float).contains("fingerprint IN ('7', '9')"));
         assert!(!predicate_tail(&float).contains("PREWHERE"));
     }
 
@@ -673,7 +701,8 @@ mod tests {
             ],
             1_000,
             2_000,
-        );
+        )
+        .expect("fits");
         let hist = hist_sample_fetch_multi(
             &no_tenant(),
             "metric_hist_samples",
@@ -683,7 +712,8 @@ mod tests {
             ],
             1_000,
             2_000,
-        );
+        )
+        .expect("fits");
         assert_same_but_the_float_sort_key(&float, &hist);
     }
 
@@ -700,7 +730,7 @@ mod tests {
         for sql in [
             sample_fetch(&no_tenant(), "metric_samples", &ids, 0, 100),
             sample_fetch_subquery(&no_tenant(), "metric_samples", sub, 0, 100),
-            sample_fetch_multi(&no_tenant(), "metric_samples", &ids, 0, 100),
+            sample_fetch_multi(&no_tenant(), "metric_samples", &ids, 0, 100).expect("fits"),
         ] {
             assert!(!sql.contains("metric_name"), "{sql}");
             assert!(
@@ -711,11 +741,49 @@ mod tests {
         for sql in [
             hist_sample_fetch(&no_tenant(), "metric_hist_samples", &ids, 0, 100),
             hist_sample_fetch_subquery(&no_tenant(), "metric_hist_samples", sub, 0, 100),
-            hist_sample_fetch_multi(&no_tenant(), "metric_hist_samples", &ids, 0, 100),
+            hist_sample_fetch_multi(&no_tenant(), "metric_hist_samples", &ids, 0, 100)
+                .expect("fits"),
         ] {
             assert!(!sql.contains("metric_name"), "{sql}");
             assert!(sql.ends_with("ORDER BY fingerprint, unix_milli"), "{sql}");
             assert!(!sql.contains("reinterpretAsUInt64"), "{sql}");
         }
+    }
+
+    /// **T11 (issue #399): a multi fetch whose list would reach the 8 MiB
+    /// text limit is refused from the list's exact rendered length.** B
+    /// renders exactly 8,388,608 bytes and is refused; C, one byte under,
+    /// is built — the `>=` rule of `ensure_query_text_fits`.
+    #[test]
+    fn a_multi_fetch_list_at_the_text_limit_is_refused_before_it_is_built() {
+        use crate::logql::TooBroadReason;
+        let [a, b, c, d] = preflight_sets();
+        let cap = crate::querytext::MAX_QUERY_TEXT_BYTES;
+        assert_eq!(
+            sample_fetch_multi(&no_tenant(), "metric_samples", &a, 0, 100).err(),
+            Some(TooBroadReason::QueryTextBytes {
+                rendered_bytes: 8_388_610,
+                cap
+            })
+        );
+        assert_eq!(
+            sample_fetch_multi(&no_tenant(), "metric_samples", &b, 0, 100).err(),
+            Some(TooBroadReason::QueryTextBytes {
+                rendered_bytes: 8_388_608,
+                cap
+            })
+        );
+        assert!(sample_fetch_multi(&no_tenant(), "metric_samples", &c, 0, 100).is_ok());
+        assert!(sample_fetch_multi(&no_tenant(), "metric_samples", &d, 0, 100).is_ok());
+        for (set, want) in [(&b, 8_388_608usize), (&c, 8_388_607)] {
+            let s = pulsus_model::FpSet(set);
+            assert_eq!(s.rendered_len(), want);
+            assert_eq!(s.rendered_len(), s.to_string().len());
+        }
+        let two = [
+            pulsus_model::Fingerprint::from_raw(u128::MAX).sql_literal(),
+            pulsus_model::Fingerprint::from_raw(7).sql_literal(),
+        ];
+        assert_eq!(pulsus_model::FpSet(&two).rendered_len(), 46);
     }
 }

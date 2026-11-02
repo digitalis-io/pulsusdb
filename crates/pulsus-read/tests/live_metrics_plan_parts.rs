@@ -90,11 +90,12 @@ macro_rules! skip_unless_live {
 const METRIC: &str = "http_requests_total";
 const ERRORS: &str = "http_errors_total";
 const FPS: [u64; 4] = [1, 2, 3, 4];
-/// The same four, spelled the one exact way a statement may carry them
-/// (issue #498): above 2^64 a bare decimal is read as `Float64`, so every
-/// builder renders `toUInt128('<decimal>')` and this expectation does too.
-const FPS_SQL: &str = "toUInt128('1'), toUInt128('2'), toUInt128('3'), toUInt128('4')";
-const ERROR_FPS_SQL: &str = "toUInt128('5'), toUInt128('6')";
+/// The same four, spelled the exact way a statement's set carries them
+/// (issue #399): above 2^64 a bare decimal is read as `Float64` (issue
+/// #498), so every builder renders `'<decimal>'` set elements and this
+/// expectation does too.
+const FPS_SQL: &str = "'1', '2', '3', '4'";
+const ERROR_FPS_SQL: &str = "'5', '6'";
 const ERROR_FPS: [u64; 2] = [5, 6];
 /// One lookback, written out rather than computed.
 const LOOKBACK_MS: i64 = 300_000;
@@ -455,7 +456,7 @@ impl Harness {
         let points = (p.end_ms - p.start_ms) / p.step_ms + 1;
         format!(
             "WITH {} AS grid_start, {} AS grid_step, {points} AS grid_n, {back} AS lookback,\n\
-             \x20    [{fps}] AS fps,\n\
+             \x20    CAST([{fps}], 'Array(UInt128)') AS fps,\n\
              \x20    CAST([{gids}], 'Array(UInt32)') AS gids\n\
              SELECT gid, min(gi) AS gi_start, max(gi) AS gi_end, any(agg) AS agg, \
              any(flags) AS flags\n\

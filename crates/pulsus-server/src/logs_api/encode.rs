@@ -39,9 +39,9 @@ use futures::StreamExt;
 use serde::Serialize;
 
 use pulsus_read::{
-    DetectedFieldOut, DetectedFieldValues, DetectedFields, DetectedLabelOut, EntryCategories,
-    ExplainStage, LogStats, MatrixSeries, PatternSeries, PlanExplain, QueryResult, RouteChoice,
-    StreamResult, VectorSample, VolumeEntry, Warnings, WireArity,
+    DetectedFieldOut, DetectedFieldValues, DetectedFields, DetectedLabelOut, DiscoveryAnswer,
+    EntryCategories, ExplainStage, LogStats, MatrixSeries, PatternSeries, PlanExplain, QueryResult,
+    RouteChoice, StreamResult, VectorSample, VolumeEntry, Warnings, WireArity,
 };
 
 /// Builds a streaming JSON body: `prefix`, then `render(item)` for each
@@ -999,11 +999,12 @@ pub(crate) fn volume_response(
 /// divergence from the reference's `omitempty`); no `sketch` (we have no
 /// HLL sketch — valid under the reference's own `omitempty` tag).
 pub(crate) fn detected_labels_response(
-    labels: Vec<DetectedLabelOut>,
+    answer: DiscoveryAnswer<DetectedLabelOut>,
     explain: Option<PlanExplain>,
 ) -> Response {
+    let labels = answer.items;
     let prefix = b"{\"detectedLabels\":[".to_vec();
-    let suffix = explain_suffix("]".to_string(), explain.as_ref());
+    let suffix = explain_suffix(discovery_array_end(answer.truncated), explain.as_ref());
     let suffix = format!("{suffix}}}").into_bytes();
     json_response(stream_array(
         prefix,
@@ -1588,12 +1589,30 @@ pub(crate) fn query_response_warned(
     }
 }
 
+/// The end of a discovery answer's array (issue #399): `]`, and when the
+/// answer was cut at its row bound, the truncation warning after it —
+/// before any `explain`.
+fn discovery_array_end(truncated: bool) -> String {
+    if truncated {
+        format!(
+            "],\"warnings\":[{}]",
+            json_string(crate::prom_api::encode::TRUNCATION_WARNING)
+        )
+    } else {
+        "]".to_string()
+    }
+}
+
 /// Encodes a `labels`/`label/{name}/values` result: `{"status":"success",
 /// "data":["name1",...]}`, `explain` as a top-level sibling of `data` when
 /// requested (docs/api.md §2.3).
-pub(crate) fn string_array_response(items: Vec<String>, explain: Option<PlanExplain>) -> Response {
+pub(crate) fn string_array_response(
+    answer: DiscoveryAnswer<String>,
+    explain: Option<PlanExplain>,
+) -> Response {
+    let items = answer.items;
     let prefix = b"{\"status\":\"success\",\"data\":[".to_vec();
-    let suffix = explain_suffix("]".to_string(), explain.as_ref());
+    let suffix = explain_suffix(discovery_array_end(answer.truncated), explain.as_ref());
     let suffix = format!("{suffix}}}").into_bytes();
     json_response(stream_array(
         prefix,
@@ -2378,7 +2397,13 @@ mod tests {
                 cardinality: 1,
             },
         ];
-        let res = detected_labels_response(labels, None);
+        let res = detected_labels_response(
+            DiscoveryAnswer {
+                items: labels,
+                truncated: false,
+            },
+            None,
+        );
         let body = body_string(res).await;
         assert_eq!(
             body,
@@ -2388,7 +2413,13 @@ mod tests {
 
     #[tokio::test]
     async fn detected_labels_empty_result_keeps_the_top_level_key() {
-        let res = detected_labels_response(Vec::new(), None);
+        let res = detected_labels_response(
+            DiscoveryAnswer {
+                items: Vec::new(),
+                truncated: false,
+            },
+            None,
+        );
         let body = body_string(res).await;
         assert_eq!(body, r#"{"detectedLabels":[]}"#);
     }
@@ -2397,7 +2428,13 @@ mod tests {
     async fn detected_labels_envelope_carries_explain_as_a_sibling_key() {
         let mut explain = PlanExplain::new("detected_labels");
         explain.push("detected_labels", "SELECT 1", None);
-        let res = detected_labels_response(Vec::new(), Some(explain));
+        let res = detected_labels_response(
+            DiscoveryAnswer {
+                items: Vec::new(),
+                truncated: false,
+            },
+            Some(explain),
+        );
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["detectedLabels"], serde_json::json!([]));
@@ -2583,10 +2620,13 @@ mod tests {
     async fn gzip_detected_labels_response_matches_identity_byte_for_byte() {
         fn build() -> Response {
             detected_labels_response(
-                vec![DetectedLabelOut {
-                    label: "env".to_string(),
-                    cardinality: 3,
-                }],
+                DiscoveryAnswer {
+                    items: vec![DetectedLabelOut {
+                        label: "env".to_string(),
+                        cardinality: 3,
+                    }],
+                    truncated: false,
+                },
                 None,
             )
         }
@@ -2652,7 +2692,10 @@ mod tests {
         let mut explain = PlanExplain::new("labels");
         explain.push("label_names", "SELECT DISTINCT key", None);
         let res = string_array_response(
-            vec!["env".to_string(), "with \"quote\"".to_string()],
+            DiscoveryAnswer {
+                items: vec!["env".to_string(), "with \"quote\"".to_string()],
+                truncated: false,
+            },
             Some(explain),
         );
         let body = body_string(res).await;
@@ -2695,9 +2738,154 @@ mod tests {
         );
     }
 
+    /// The byte offset of each top-level `"<key>":` in `body`, in the
+    /// order given — asserted ascending by the caller.
+    fn key_offsets(body: &str, keys: &[&str]) -> Vec<usize> {
+        keys.iter()
+            .map(|k| {
+                body.find(&format!("\"{k}\":"))
+                    .unwrap_or_else(|| panic!("no `{k}` key in {body}"))
+            })
+            .collect()
+    }
+
+    /// **T10 (issue #399): a cut discovery answer carries the truncation
+    /// warning after the array, before any `explain`**, on both encoders;
+    /// an uncut one carries no `warnings` key.
+    #[tokio::test]
+    async fn a_truncated_discovery_answer_carries_the_warning_after_the_array() {
+        let one = || {
+            vec![DetectedLabelOut {
+                label: "env".to_string(),
+                cardinality: 1,
+            }]
+        };
+        let body = body_string(string_array_response(
+            DiscoveryAnswer {
+                items: vec!["a".to_string()],
+                truncated: true,
+            },
+            None,
+        ))
+        .await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":["a"],"warnings":["results truncated due to limit"]}"#
+        );
+        let body = body_string(detected_labels_response(
+            DiscoveryAnswer {
+                items: one(),
+                truncated: true,
+            },
+            None,
+        ))
+        .await;
+        assert_eq!(
+            body,
+            r#"{"detectedLabels":[{"label":"env","cardinality":1}],"warnings":["results truncated due to limit"]}"#
+        );
+        let body = body_string(string_array_response(
+            DiscoveryAnswer {
+                items: vec!["a".to_string()],
+                truncated: false,
+            },
+            None,
+        ))
+        .await;
+        assert_eq!(body, r#"{"status":"success","data":["a"]}"#);
+        let body = body_string(detected_labels_response(
+            DiscoveryAnswer {
+                items: one(),
+                truncated: false,
+            },
+            None,
+        ))
+        .await;
+        assert_eq!(
+            body,
+            r#"{"detectedLabels":[{"label":"env","cardinality":1}]}"#
+        );
+
+        // Combined with an explain trace.
+        let explain = || {
+            let mut e = PlanExplain::new("labels");
+            e.push("label_names", "SELECT 1", None);
+            e
+        };
+        let cut = body_string(string_array_response(
+            DiscoveryAnswer {
+                items: vec!["a".to_string()],
+                truncated: true,
+            },
+            Some(explain()),
+        ))
+        .await;
+        let whole = body_string(string_array_response(
+            DiscoveryAnswer {
+                items: vec!["a".to_string()],
+                truncated: false,
+            },
+            Some(explain()),
+        ))
+        .await;
+        let cut_json: serde_json::Value = serde_json::from_str(&cut).expect("valid JSON");
+        let whole_json: serde_json::Value = serde_json::from_str(&whole).expect("valid JSON");
+        let at = key_offsets(&cut, &["status", "data", "warnings", "explain"]);
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "key order in {cut}");
+        assert_eq!(
+            cut_json.as_object().map(|o| o.len()),
+            Some(4),
+            "exactly four keys in {cut}"
+        );
+        assert_eq!(
+            cut_json["warnings"],
+            serde_json::json!(["results truncated due to limit"])
+        );
+        assert_eq!(cut_json["explain"], whole_json["explain"]);
+        assert!(whole_json.get("warnings").is_none(), "{whole}");
+
+        let cut = body_string(detected_labels_response(
+            DiscoveryAnswer {
+                items: one(),
+                truncated: true,
+            },
+            Some(explain()),
+        ))
+        .await;
+        let whole = body_string(detected_labels_response(
+            DiscoveryAnswer {
+                items: one(),
+                truncated: false,
+            },
+            Some(explain()),
+        ))
+        .await;
+        let cut_json: serde_json::Value = serde_json::from_str(&cut).expect("valid JSON");
+        let whole_json: serde_json::Value = serde_json::from_str(&whole).expect("valid JSON");
+        let at = key_offsets(&cut, &["detectedLabels", "warnings", "explain"]);
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "key order in {cut}");
+        assert_eq!(
+            cut_json.as_object().map(|o| o.len()),
+            Some(3),
+            "exactly three keys in {cut}"
+        );
+        assert_eq!(
+            cut_json["warnings"],
+            serde_json::json!(["results truncated due to limit"])
+        );
+        assert_eq!(cut_json["explain"], whole_json["explain"]);
+        assert!(whole_json.get("warnings").is_none(), "{whole}");
+    }
+
     #[tokio::test]
     async fn empty_array_response_renders_an_empty_data_array() {
-        let res = string_array_response(vec![], None);
+        let res = string_array_response(
+            DiscoveryAnswer {
+                items: vec![],
+                truncated: false,
+            },
+            None,
+        );
         let body = body_string(res).await;
         assert_eq!(body, r#"{"status":"success","data":[]}"#);
     }
@@ -2933,7 +3121,13 @@ mod tests {
     #[tokio::test]
     async fn gzip_string_array_response_matches_identity_byte_for_byte() {
         fn build() -> Response {
-            string_array_response(vec!["env".to_string(), "service_name".to_string()], None)
+            string_array_response(
+                DiscoveryAnswer {
+                    items: vec!["env".to_string(), "service_name".to_string()],
+                    truncated: false,
+                },
+                None,
+            )
         }
         assert_gzip_response_is_byte_identical_to_identity(build).await;
     }
@@ -4393,6 +4587,7 @@ mod tests {
                 "DetectedFieldValues",
                 "DetectedFields",
                 "DetectedLabelOut",
+                "DiscoveryAnswer",
                 "EntryCategories",
                 "ExplainStage",
                 "LogStats",

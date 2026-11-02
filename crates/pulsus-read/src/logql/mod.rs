@@ -164,11 +164,12 @@ pub use detected::{
 pub use detected_probe::{DetectedFieldsProbe, MAX_FEEDER_SCRATCH_BYTES};
 pub use error::{ReadError, TooBroadReason};
 pub use exec::{
-    EngineConfig, EntryCategories, HistMatrixSeries, HistOrFloat, HistVectorSample, LogQlEngine,
-    LogStats, MatrixSeries, PatternSeries, QueryResult, STREAM_FEED_CHUNK_BYTES, StreamAccumulator,
-    StreamResult, StreamsFastPathProbe, StreamsPagedProbe, TAIL_REGISTRATION_GRACE_NS, TailCursor,
-    TailLower, TailPage, TailSetup, VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery,
-    WireArity, bucketed_fallback_client_agg, final_series_gate_applies, read_query_settings,
+    DiscoveryAnswer, EngineConfig, EntryCategories, HistMatrixSeries, HistOrFloat,
+    HistVectorSample, LogQlEngine, LogStats, MatrixSeries, PatternSeries, QueryResult,
+    STREAM_FEED_CHUNK_BYTES, StreamAccumulator, StreamResult, StreamsFastPathProbe,
+    StreamsPagedProbe, TAIL_REGISTRATION_GRACE_NS, TailCursor, TailLower, TailPage, TailSetup,
+    VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery, WireArity,
+    bucketed_fallback_client_agg, final_series_gate_applies, read_query_settings,
     run_pipeline_rows,
 };
 pub use explain::{ExplainStage, PlanExplain};

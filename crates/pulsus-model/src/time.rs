@@ -142,8 +142,9 @@ pub struct FpLiteral(
 );
 
 impl std::fmt::Display for FpLiteral {
-    /// The one implementation in the tree that converts a typed fingerprint
-    /// value into text. Searched with
+    /// The single-value form, and with [`FpSet`]'s and [`FpArray`]'s
+    /// `Display` the only code that reads the sealed value (issue #399).
+    /// Searched with
     /// `git grep -nE 'impl([^\n]*)?(std::fmt::)?Display for' -- '*.rs'` over
     /// every tracked Rust file: two others emit fingerprint SQL —
     /// `SqlExpr` (`crates/pulsus-read/src/compile/fold.rs:83`) and `Pred`
@@ -151,6 +152,50 @@ impl std::fmt::Display for FpLiteral {
     /// carry text rather than converting a value.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "toUInt128('{}')", self.0.0)
+    }
+}
+
+/// A fingerprint set for the right side of `[NOT] [GLOBAL] IN (…)`: `'<d>', '<d>'`.
+/// The server converts each string to the `UInt128` column type, exactly.
+pub struct FpSet<'a>(pub &'a [FpLiteral]);
+
+/// A typed fingerprint array: `CAST(['<d>', '<d>'], 'Array(UInt128)')`.
+pub struct FpArray<'a>(pub &'a [FpLiteral]);
+
+impl FpSet<'_> {
+    /// The exact length of this set's `Display` text, without building it:
+    /// per element its decimal digit count plus the two quotes, plus two
+    /// bytes per `", "` separator.
+    pub fn rendered_len(&self) -> usize {
+        let digits: usize = self
+            .0
+            .iter()
+            .map(|lit| lit.0.0.checked_ilog10().map_or(1, |d| d as usize + 1) + 2)
+            .sum();
+        digits + 2 * self.0.len().saturating_sub(1)
+    }
+}
+
+impl std::fmt::Display for FpSet<'_> {
+    /// `'<decimal>'` per element, joined with `", "`; empty input renders
+    /// nothing. The parser folds a list of literals into one node, which a
+    /// list of `toUInt128(…)` calls is not (issue #399).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, lit) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "'{}'", lit.0.0)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for FpArray<'_> {
+    /// `CAST([<FpSet>], 'Array(UInt128)')`; empty input renders
+    /// `CAST([], 'Array(UInt128)')`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CAST([{}], 'Array(UInt128)')", FpSet(self.0))
     }
 }
 

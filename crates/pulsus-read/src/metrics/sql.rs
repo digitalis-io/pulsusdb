@@ -62,14 +62,14 @@ fn names_scope(metric_names: &[String]) -> String {
     format!("metric_name IN ({name_list})")
 }
 
-/// `fingerprint IN (<ids>)`: a set of series IDs already resolved.
+/// `fingerprint IN ('<id>', …)`: a set of series IDs already resolved, in
+/// the set form ([`pulsus_model::FpSet`], issue #399).
+///
+/// The server converts each element to the `UInt128` column exactly, and
+/// the list folds into one parse-tree node, so its length is bounded by the
+/// text limit alone, which [`discovery_fetch_multi`] checks first.
 fn ids_scope(fps: &[FpLiteral]) -> String {
-    let fp_list = fps
-        .iter()
-        .map(FpLiteral::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("fingerprint IN ({fp_list})")
+    format!("fingerprint IN ({})", pulsus_model::FpSet(fps))
 }
 
 /// One series read (issue #623): the window on the activity table and every
@@ -397,13 +397,12 @@ pub fn discovery_distinct_names_query(
 }
 
 /// Issue #89's discovery analog of [`super::sample_sql::sample_fetch_multi`],
-/// statement 2 (issue #623): ONE query for a regex/negated-`__name__`
-/// `match[]` selector's whole resolved candidate set, scoped on the lookup
-/// to `metric_name IN (<resolved names>) AND fingerprint IN (<resolved
-/// IDs>)`. The IDs come from the label cache, which holds every series
-/// active in its whole window, so the request window is applied here by
-/// the activity read — the cache's wider resident superset never leaks into
-/// a narrower discovery response (the `discovery_series` invariant).
+/// statement 2 (issue #623): ONE query for a regex/negated-`__name__` selector's
+/// whole resolved candidate set, scoped on the lookup to `metric_name IN
+/// (<resolved names>) AND fingerprint IN (<resolved IDs>)`. The IDs come from
+/// the label cache, which holds every series active in its whole window, so the
+/// request window is applied here by the activity read — the cache's wider
+/// superset never leaks into a narrower response (`discovery_series`).
 pub fn discovery_fetch_multi(
     tenant: &Tenant,
     series_table: &str,
@@ -411,10 +410,11 @@ pub fn discovery_fetch_multi(
     metric_names: &[String],
     fps: &[FpLiteral],
     window: DataWindow,
-) -> String {
+) -> Result<String, crate::logql::TooBroadReason> {
+    crate::querytext::ensure_fingerprint_set_fits(&pulsus_model::FpSet(fps))?;
     let scope = [names_scope(metric_names), ids_scope(fps)];
-    series_read(tenant, window, &scope, &[], &[])
-        .with_labels(lookup_tables(series_table, labels_table))
+    Ok(series_read(tenant, window, &scope, &[], &[])
+        .with_labels(lookup_tables(series_table, labels_table)))
 }
 
 /// Issue #96's degraded-cache discovery **probe**, statement 3 with the
@@ -1368,6 +1368,45 @@ mod tests {
 
     // --- discovery_fetch_multi (issue #89) ---
 
+    /// **T12 (issue #399): the discovery multi read refuses a list at the
+    /// 8 MiB text limit**, with T11's sets and figures.
+    #[test]
+    fn discovery_fetch_multi_refuses_a_list_at_the_text_limit() {
+        use crate::logql::TooBroadReason;
+        let [a, b, c, d] = crate::metrics::sample_sql::preflight_sets();
+        let cap = crate::querytext::MAX_QUERY_TEXT_BYTES;
+        let window = DataWindow {
+            start_ms: 3_600_001,
+            end_ms: 7_300_000,
+        };
+        let run = |set: &[pulsus_model::FpLiteral]| {
+            discovery_fetch_multi(
+                &no_tenant(),
+                "metric_series",
+                "metric_labels",
+                &["up".to_string()],
+                set,
+                window,
+            )
+        };
+        assert_eq!(
+            run(&a).err(),
+            Some(TooBroadReason::QueryTextBytes {
+                rendered_bytes: 8_388_610,
+                cap
+            })
+        );
+        assert_eq!(
+            run(&b).err(),
+            Some(TooBroadReason::QueryTextBytes {
+                rendered_bytes: 8_388_608,
+                cap
+            })
+        );
+        assert!(run(&c).is_ok());
+        assert!(run(&d).is_ok());
+    }
+
     #[test]
     fn discovery_fetch_multi_masks_the_windows_hours() {
         let sql = discovery_fetch_multi(
@@ -1380,7 +1419,8 @@ mod tests {
                 start_ms: 3_600_001,
                 end_ms: 7_300_000,
             },
-        );
+        )
+        .expect("fits");
         assert!(sql.contains(
             "AND bitAnd(hours, multiIf(day = '1970-01-01' AND day = '1970-01-01', 6, \
              day = '1970-01-01', 16777214, day = '1970-01-01', 7, 16777215)) != 0\n"
@@ -1399,7 +1439,8 @@ mod tests {
             &["up".to_string()],
             &[Fingerprint::from_raw(1).sql_literal()],
             window(),
-        );
+        )
+        .expect("fits");
         assert!(sql.contains("AND day BETWEEN "));
         assert!(sql.contains("AND bitAnd(hours, "));
     }
@@ -1414,7 +1455,8 @@ mod tests {
             &[payload.to_string()],
             &[Fingerprint::from_raw(1).sql_literal()],
             window(),
-        );
+        )
+        .expect("fits");
         assert!(sql.contains(&format!("metric_name IN ({})", ch_string(payload))));
         assert_no_unescaped_quote(&ch_string(payload));
     }
@@ -1707,7 +1749,8 @@ mod tests {
                 &["up".to_string()],
                 &fps,
                 window(),
-            ),
+            )
+            .expect("fits"),
             discovery_fetch_by_names(
                 &no_tenant(),
                 "metric_series",
@@ -1934,7 +1977,8 @@ mod tests {
                 &two_names,
                 &ids(),
                 evening()
-            ),
+            )
+            .expect("fits"),
             format!(
                 "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
                  FROM (\n\
@@ -1942,7 +1986,7 @@ mod tests {
                  \x20 FROM metric_labels\n\
                  \x20 WHERE org_id = ''\n\
                  \x20   AND metric_name IN ('up', 'down')\n\
-                 \x20   AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+                 \x20   AND fingerprint IN ('101', '205')\n\
                  \x20   AND fingerprint IN (\n\
                  \x20     SELECT fingerprint\n\
                  \x20     FROM metric_series\n\
@@ -1954,7 +1998,7 @@ mod tests {
                  \x20         FROM metric_labels\n\
                  \x20         WHERE org_id = ''\n\
                  \x20           AND metric_name IN ('up', 'down')\n\
-                 \x20           AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+                 \x20           AND fingerprint IN ('101', '205')\n\
                  \x20       )\n\
                  \x20   )\n\
                  )\n\

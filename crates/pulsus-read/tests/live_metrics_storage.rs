@@ -1129,7 +1129,8 @@ async fn matchers_answer_from_the_lookup() {
                     &two,
                     &ids,
                     window
-                ),
+                )
+                .expect("fits"),
                 wname,
             )
             .await,

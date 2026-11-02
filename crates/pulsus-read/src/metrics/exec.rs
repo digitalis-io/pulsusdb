@@ -1136,7 +1136,7 @@ impl MetricsEngine {
                         let (fallback, _) = if by_index {
                             self.nameless_fetch_plan(tenant, sel, groups, window, None)
                         } else {
-                            self.multi_fetch_plan(tenant, groups, lower_excl, upper_incl, None)
+                            self.multi_fetch_plan(tenant, groups, lower_excl, upper_incl, None)?
                         };
                         self.stage_range_push(
                             tenant,
@@ -1167,7 +1167,7 @@ impl MetricsEngine {
                         lower_excl,
                         upper_incl,
                         explain.as_deref_mut(),
-                    )
+                    )?
                 };
                 if let Some(pred) = read {
                     reads.push(compile::SelectorRead {
@@ -2257,7 +2257,7 @@ impl MetricsEngine {
         lower_excl: i64,
         upper_incl: i64,
         mut explain: Option<&mut PlanExplain>,
-    ) -> (SelectorFetchPlan, Option<Pred>) {
+    ) -> Result<(SelectorFetchPlan, Option<Pred>), ReadError> {
         // Group order is sorted-by-name (the resolver's contract) and
         // fingerprints are sorted within each group, so the rendered IN
         // lists — and therefore the explain trace — are deterministic.
@@ -2283,14 +2283,16 @@ impl MetricsEngine {
             &sql_literals(&fps),
             lower_excl,
             upper_incl,
-        );
+        )
+        .map_err(ReadError::QueryTooBroad)?;
         let hist_sql = sample_sql::hist_sample_fetch_multi(
             tenant,
             &self.config.hist_samples_table,
             &sql_literals(&fps),
             lower_excl,
             upper_incl,
-        );
+        )
+        .map_err(ReadError::QueryTooBroad)?;
         if let Some(e) = explain.as_mut() {
             e.push("sample_fetch", sql.clone(), None);
             e.push("hist_sample_fetch", hist_sql.clone(), None);
@@ -2304,7 +2306,7 @@ impl MetricsEngine {
                 &sample_sql::fingerprints_predicate(&sql_literals(&fps)),
             )
         });
-        (
+        Ok((
             SelectorFetchPlan::Multi {
                 sql,
                 hist_sql,
@@ -2312,7 +2314,7 @@ impl MetricsEngine {
                 nested: false,
             },
             read,
-        )
+        ))
     }
 
     /// Executes one selector's already-built [`SelectorFetchPlan`]: the
@@ -3612,7 +3614,8 @@ impl MetricsEngine {
                 &names,
                 &sql_literals(&fps),
                 window,
-            ),
+            )
+            .map_err(ReadError::QueryTooBroad)?,
         )))
     }
 
@@ -5908,7 +5911,8 @@ mod tests {
     fn metrics_default_envelope_fits_the_query_text_cap_and_exceeds_the_ch_default() {
         let fps: Vec<FpLiteral> =
             std::iter::repeat_n(Fingerprint::from_raw(u128::MAX).sql_literal(), 50_000).collect();
-        let sql = sample_sql::sample_fetch_multi(&no_tenant(), "metric_samples", &fps, 0, i64::MAX);
+        let sql = sample_sql::sample_fetch_multi(&no_tenant(), "metric_samples", &fps, 0, i64::MAX)
+            .expect("fits");
         let bytes = sql.len() as u64;
         assert!(
             bytes > 262_144,
@@ -5922,18 +5926,21 @@ mod tests {
     }
 
     /// A ceiling-scale fan-out (near `PROMQL_MAX_METRIC_FANOUT_CEILING`)
-    /// renders SQL past [`crate::querytext::MAX_QUERY_TEXT_BYTES`] — the
-    /// pre-dispatch guard rejects it as `QueryTextBytes` instead of
-    /// ClickHouse hitting an opaque parse error.
+    /// would render a list past [`crate::querytext::MAX_QUERY_TEXT_BYTES`] —
+    /// the builder's own preflight refuses it as `QueryTextBytes` before
+    /// any text is built (issue #399), instead of ClickHouse hitting an
+    /// opaque parse error.
     #[test]
     fn metrics_ceiling_scale_envelope_is_rejected_by_the_guard() {
         let fps: Vec<FpLiteral> =
             std::iter::repeat_n(Fingerprint::from_raw(u128::MAX).sql_literal(), 1_000_000)
                 .collect();
-        let sql = sample_sql::sample_fetch_multi(&no_tenant(), "metric_samples", &fps, 0, i64::MAX);
-        match crate::querytext::ensure_query_text_fits(&sql) {
+        match sample_sql::sample_fetch_multi(&no_tenant(), "metric_samples", &fps, 0, i64::MAX) {
             Err(TooBroadReason::QueryTextBytes { .. }) => {}
-            other => panic!("expected QueryTextBytes rejection, got {other:?}"),
+            other => panic!(
+                "expected QueryTextBytes rejection, got {:?}",
+                other.map(|sql| format!("a {}-byte statement", sql.len()))
+            ),
         }
     }
 
@@ -6091,11 +6098,7 @@ mod tests {
             100,
         );
         assert_eq!(sqls.len(), 1);
-        assert!(
-            sqls[0].contains("IN (toUInt128('1'), toUInt128('2'), toUInt128('3'))"),
-            "got: {}",
-            sqls[0]
-        );
+        assert!(sqls[0].contains("IN ('1', '2', '3')"), "got: {}", sqls[0]);
     }
 
     #[test]

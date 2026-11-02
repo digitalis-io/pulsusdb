@@ -17,6 +17,8 @@
 > claims.** The §9 latency targets remain **unvalidated** pending the Tier-2
 > 1 TB/7d reference run ([#25](https://github.com/digitalis-io/pulsusdb/issues/25)).
 
+> **Issue #399 (remaining part) changed two things this document describes:** label discovery is one statement with `GLOBAL IN` subqueries, not an activity scan plus a literal list, and a fingerprint list renders `'<decimal>'` elements (`CAST([…], 'Array(UInt128)')` for arrays). The current behaviour is in `docs/api.md` §2.3 and in this issue's plan.
+
 > **Method changed under #603.** The harness now lands the corpus through every shard in turn and reads with the product's settings, shard pruning off. Every stage is expected to reach every shard, and a shard counts as reached when it logged the stage's row. The expected-roster model, `expected-pruned` rows and per-shard figures below describe the earlier method.
 
 Issue: [#16](https://github.com/digitalis-io/pulsusdb/issues/16). Evidence

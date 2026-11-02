@@ -27,14 +27,14 @@
 //!
 //! **Sizing argument for [`MAX_QUERY_TEXT_BYTES`] (8 MiB).** The
 //! guaranteed-admitted envelope this cap must cover: `DEFAULT_MAX_STREAMS`
-//! (100,000) worst-case `u64::MAX` fingerprint literals (20 digits + `", "`
-//! separator = 22 B/entry ⇒ 2,199,998 B), plus 10,000 distinct 64-byte
-//! escaped service literals (~660 KB), plus 1 MiB of pre-rendered
-//! line-filter predicate text (16 × 64 KiB filters — a generous multiple of
-//! realistic pipelines), plus template/window/keyset-tuple overhead
-//! (< 400 B) — roughly 3.91 MB ≈ 3.73 MiB, comfortably under 8 MiB (≈2.15×
-//! headroom) and well above ClickHouse's 262,144-byte default (which admits
-//! only ≈11,915 `u64` literals — below the product's own 100k stream cap).
+//! (100,000) worst-case fingerprint set elements (`'` + 39 digits + `'` +
+//! the `", "` separator = 43 B/entry ⇒ 4,299,998 B; issue #399), plus 10,000
+//! distinct 64-byte escaped service literals (~660 KB), plus 1 MiB of
+//! pre-rendered line-filter predicate text (16 × 64 KiB filters — a generous
+//! multiple of realistic pipelines), plus template/window/keyset-tuple
+//! overhead (< 400 B) — 6,008,974 B, 1.40× under 8 MiB and well above
+//! ClickHouse's 262,144-byte default (which admits only ≈6,096 such
+//! elements — below the product's own 100k stream cap).
 //! Requests whose rendered text exceeds this envelope (unbounded
 //! service/filter width, or a large metrics fan-out) are rejected by
 //! [`ensure_query_text_fits`] before dispatch, never sent to ClickHouse to
@@ -61,6 +61,23 @@ pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 /// ClickHouse parse error).
 pub fn ensure_query_text_fits(sql: &str) -> Result<(), crate::logql::TooBroadReason> {
     let rendered_bytes = sql.len() as u64;
+    if rendered_bytes >= MAX_QUERY_TEXT_BYTES {
+        return Err(crate::logql::TooBroadReason::QueryTextBytes {
+            rendered_bytes,
+            cap: MAX_QUERY_TEXT_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Refuses a fingerprint set whose rendered text alone would reach
+/// [`MAX_QUERY_TEXT_BYTES`], from [`pulsus_model::FpSet::rendered_len`],
+/// before any text is built (issue #399) — the same `>=` rule as
+/// [`ensure_query_text_fits`].
+pub fn ensure_fingerprint_set_fits(
+    set: &pulsus_model::FpSet<'_>,
+) -> Result<(), crate::logql::TooBroadReason> {
+    let rendered_bytes = set.rendered_len() as u64;
     if rendered_bytes >= MAX_QUERY_TEXT_BYTES {
         return Err(crate::logql::TooBroadReason::QueryTextBytes {
             rendered_bytes,
