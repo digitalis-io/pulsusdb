@@ -338,6 +338,65 @@ async fn fingerprint_on(client: &ChClient, index: u64) -> u128 {
     )
 }
 
+/// The server's clock now, in microseconds since the epoch: the scale of
+/// `system.query_log.query_start_time_microseconds`.
+async fn server_now_us(client: &ChClient) -> u64 {
+    num(
+        client,
+        "SELECT toUInt64(toUnixTimestamp64Micro(now64(6))) AS n",
+    )
+    .await
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+struct LogCounts {
+    ended: u64,
+    pending: u64,
+}
+
+/// Waits until every statement `filter` selects in `client`'s
+/// `system.query_log` has its ending row, and at least `at_least` have ended.
+///
+/// One `SYSTEM FLUSH LOGS` is not a barrier: a statement's `QueryFinish` row
+/// can be queued after its client has the answer. Its `QueryStart` row is
+/// queued before it runs, so once flushed it names every statement sent; an
+/// execution is a `query_id` with its `query_start_time_microseconds`, which
+/// both rows share. `filter` must not name `type`. Fails after 60 s.
+async fn settle_query_log(client: &ChClient, filter: &str, at_least: u64) {
+    let sql = format!(
+        "SELECT toUInt64(countIf(e)) AS ended, toUInt64(countIf(s AND NOT e)) AS pending \
+         FROM (SELECT query_id, max(type = 'QueryStart') AS s, \
+                 max(type IN ('QueryFinish', 'ExceptionWhileProcessing', \
+                              'ExceptionBeforeStart')) AS e \
+               FROM system.query_log \
+               WHERE ({filter}) AND query NOT LIKE '%system.query_log%' \
+               GROUP BY query_id, query_start_time_microseconds)"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        exec(client, "SYSTEM FLUSH LOGS").await;
+        let mut stream = client
+            .query_stream::<LogCounts>(&sql, &QuerySettings::new())
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{sql}"));
+        let counts = stream
+            .next()
+            .await
+            .expect("one row")
+            .expect("decode LogCounts");
+        drop(stream);
+        if counts.ended >= at_least && counts.pending == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "system.query_log did not settle within 60 s for {filter}: {counts:?}, \
+             at least {at_least} expected"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Asserts that `ms` selects the shard at `index` (0 is shard 1, 1 is shard 2).
 async fn assert_stamp_selects(client: &ChClient, ms: i64, index: u64) {
     let got = num(
@@ -1261,6 +1320,11 @@ async fn the_shard_follows_the_key_and_not_the_zone() {
     assert_stamp_selects(&nodes.s1a, SHARD1_MS, 0).await;
     assert_stamp_selects(&nodes.s1a, SHARD2_MS, 1).await;
 
+    // This run's own inserts: the query log keeps earlier runs' rows, under
+    // this same database name.
+    let since_s1 = server_now_us(&nodes.s1a).await;
+    let since_s2 = server_now_us(&nodes.s2).await;
+
     let root = spool_root("zone");
     let mut cfg = config(&[(&shard1(), Some("a")), (&shard2(), Some("b"))], db);
     cfg.local_zone = Some("a".to_string());
@@ -1292,25 +1356,35 @@ async fn the_shard_follows_the_key_and_not_the_zone() {
     writer.shutdown(Duration::from_secs(10)).await;
 
     // The landing inserts alone: the refreshable views' runs are initial
-    // inserts in this database too, and name no landing table.
-    let initial_inserts = format!(
-        "SELECT count() AS n FROM system.query_log \
-         WHERE type = 'QueryFinish' AND is_initial_query AND query_kind = 'Insert' \
-         AND arrayExists(t -> startsWith(t, '{db}.log_landing'), tables)"
-    );
-    for (_, client) in nodes.all() {
-        exec(client, "SYSTEM FLUSH LOGS").await;
+    // inserts in this database too, and name no landing table. Each node is
+    // read for the inserts that started on it since this run began, once
+    // each of them has its ending row in the log.
+    let landing_inserts = |since: u64| {
+        format!(
+            "is_initial_query AND query_kind = 'Insert' \
+             AND arrayExists(t -> startsWith(t, '{db}.log_landing'), tables) \
+             AND toUInt64(toUnixTimestamp64Micro(query_start_time_microseconds)) >= {since}"
+        )
+    };
+    for (name, client, since, want) in [
+        ("shard 1 coordinated every insert", &nodes.s1a, since_s1, 4),
+        ("shard 2 coordinated none", &nodes.s2, since_s2, 0),
+    ] {
+        let filter = landing_inserts(since);
+        settle_query_log(client, &filter, want).await;
+        assert_eq!(
+            num(
+                client,
+                &format!(
+                    "SELECT count() AS n FROM system.query_log \
+                     WHERE type = 'QueryFinish' AND {filter}"
+                ),
+            )
+            .await,
+            want,
+            "{name}"
+        );
     }
-    assert_eq!(
-        num(&nodes.s1a, &initial_inserts).await,
-        4,
-        "shard 1 coordinated every insert"
-    );
-    assert_eq!(
-        num(&nodes.s2, &initial_inserts).await,
-        0,
-        "shard 2 coordinated none"
-    );
     sync_everywhere(&nodes, db).await;
     for (body, stamp) in pushes {
         let (here, there) = if stamp == SHARD1_MS {
