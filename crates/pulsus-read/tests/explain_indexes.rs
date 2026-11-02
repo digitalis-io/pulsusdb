@@ -504,10 +504,10 @@ fn without_skip_blocks(usage: &[String]) -> Vec<String> {
 /// insufficient rather than merely discouraged. `control_sql` is normally
 /// `sql` with `SETTINGS use_skip_indexes = 0`.
 ///
-/// `k = 1` is sometimes the only claim that holds: for a negated line
-/// filter (`!=`, `!~`) the body index cannot rule a granule out at all, so
-/// the correct assertion is "never worse than no skip index", not a ratio.
-/// Callers say which they mean.
+/// A shape no body index can rule a granule out for (a negated line
+/// filter, a case-insensitive regex, a regex with the never-matching arm)
+/// is checked by [`assert_prunes_nothing`] instead, which requires the two
+/// selections to be equal.
 async fn assert_prunes_at_least(
     client: &ChClient,
     sql: &str,
