@@ -4,12 +4,13 @@
 //! Before this change the writer inserted through the Logs family's `_dist`
 //! wrappers, so `cityHash64(fingerprint)` put one stream's index rows and its
 //! rollup rows on one shard, and the discovery read could evaluate its
-//! semi-join shard-locally. The landing table has no wrapper: a push carries
-//! many fingerprints, so routing its block through one would split the push
-//! per shard and end "one push is one block". A fingerprint's rows can
-//! therefore sit on several shards, and shard-local evaluation can only answer
-//! *was this fingerprint active on **this** shard* where the question is *was
-//! it active **anywhere***.
+//! semi-join shard-locally. A push now lands as one block on one shard: the
+//! writer inserts it through `log_landing`'s wrapper, keyed on the push's
+//! receive stamp (issue #494 part 1), not on a fingerprint. A fingerprint's
+//! rows can therefore sit on several shards, and shard-local evaluation can
+//! only answer *was this fingerprint active on **this** shard* where the
+//! question is *was it active **anywhere***. This suite writes the bare
+//! `log_landing` on chosen shards on purpose, to build that placement.
 //!
 //! **A clustered deployment is the production shape**, so this is the case for
 //! the read path's primary deployment rather than a variant of it.

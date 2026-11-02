@@ -759,9 +759,10 @@ async fn the_cluster_windows_are_the_replicated_pair_on_every_write_path_table()
 }
 
 /// **The clustered shape of the trace write path.** Two of the five targets
-/// carry a routing wrapper and three do not, and the landing table carries
-/// none at all — a push carries many trace ids, so inserting the push itself
-/// through a `Distributed` wrapper would split one push per shard.
+/// carry a routing wrapper and three do not. The landing table's wrapper is
+/// keyed on the push's receive stamp, not on a trace id (issue #494 part 1):
+/// every row of a push carries one `received_ms`, so the push stays one block
+/// on one shard.
 ///
 /// **The `SETTINGS` clause is asserted, not merely the engine**: a setting
 /// the server accepts on a `CREATE` and then discards leaves no trace in
@@ -798,10 +799,20 @@ async fn the_clustered_form() {
             );
         }
 
-        // The three catalog targets and the landing table exist on every
-        // shard with no routing twin.
+        let got = engine_full_on(shard, db, "trace_landing_dist").await;
+        assert_eq!(
+            got,
+            format!(
+                "Distributed('{CLUSTER_NAME}', '{db}', 'trace_landing', cityHash64(received_ms))"
+            ),
+            "shard{}: trace_landing_dist routes on the receive stamp",
+            i + 1
+        );
+
+        // The three catalog targets exist on every shard with no routing
+        // twin.
         let present = table_names(shard, db).await;
-        for name in ["resources", "tag_names", "tag_values", "trace_landing"] {
+        for name in ["resources", "tag_names", "tag_values"] {
             assert!(
                 present.iter().any(|n| n == name),
                 "shard{}: {name} must exist on every shard: {present:?}",
@@ -1230,6 +1241,17 @@ async fn wait_distribution_drained(client: &ChClient, db: &str, table: &str) {
     }
 }
 
+/// Brings shard 1's first replica level with its second for the two routed
+/// trace tables. A routed insert writes one replica of the target shard, and
+/// since the landing insert pins `prefer_localhost_replica = 0` (issue #494
+/// part 1) that may be the second replica even when shard 1's first is the
+/// coordinator; a read on the first replica then waits for replication.
+async fn sync_shard1_trace_replicas(shard1: &ChClient, db: &str) {
+    for table in ["spans", "traces"] {
+        exec_on(shard1, &format!("SYSTEM SYNC REPLICA {db}.{table}")).await;
+    }
+}
+
 /// **A trace lands whole on one shard.** Without the routing both traces'
 /// spans sit on whichever node took the push, and one shard holds 20 while
 /// the other holds 0.
@@ -1260,6 +1282,7 @@ async fn a_trace_lands_whole_on_one_shard() {
     for table in ["spans_dist", "traces_dist"] {
         wait_distribution_drained(&shard1, db, table).await;
     }
+    sync_shard1_trace_replicas(&shard1, db).await;
 
     for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
         assert_eq!(
@@ -1362,6 +1385,7 @@ async fn distributed_foreground_insert_reaches_the_views_insert() {
     for table in ["spans_dist", "traces_dist"] {
         wait_distribution_drained(&shard1, db, table).await;
     }
+    sync_shard1_trace_replicas(&shard1, db).await;
     for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
         assert_eq!(
             count_on(shard, &format!("SELECT count() AS n FROM {db}.spans FINAL")).await,
@@ -1495,11 +1519,18 @@ async fn a_shard_that_refuses_loses_whole_traces_and_a_retry_restores_them() {
         .await
         .expect_err("the refusing shard fails the routed insert");
     eprintln!("refusal: the push failed with {err}");
-    assert_eq!(
-        count_on(&shard1, &format!("SELECT count() AS n FROM {db}.spans")).await,
-        10,
-        "the surviving shard's own trace is COMPLETE: the routing makes the \
-         missing unit a whole trace rather than an arbitrary subset of one"
+    // The landing insert pins `prefer_localhost_replica = 0` (issue #494
+    // part 1), so the surviving shard's part is a remote insert as well, and
+    // whether it commits before the refusal ends the statement is a race.
+    // What the routing guarantees is the unit: the whole trace or none of it.
+    sync_shard1_trace_replicas(&shard1, db).await;
+    let surviving = count_on(&shard1, &format!("SELECT count() AS n FROM {db}.spans")).await;
+    eprintln!("refusal: the surviving shard holds {surviving} spans (recorded)");
+    assert!(
+        surviving == 0 || surviving == 10,
+        "the surviving shard holds its own trace whole or not at all: the \
+         routing makes the missing unit a whole trace rather than an arbitrary \
+         subset of one; it holds {surviving}"
     );
     assert_eq!(
         count_on(&shard2, &format!("SELECT count() AS n FROM {db}.spans")).await,
@@ -1521,6 +1552,7 @@ async fn a_shard_that_refuses_loses_whole_traces_and_a_retry_restores_them() {
     for table in ["spans_dist", "traces_dist"] {
         wait_distribution_drained(&shard1, db, table).await;
     }
+    sync_shard1_trace_replicas(&shard1, db).await;
     for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
         // **`FINAL`, because the retry carries its own token**: the shard
         // that committed the first push holds those rows and the retry's
@@ -1614,6 +1646,7 @@ async fn a_hostile_profile_cannot_move_rows_off_their_shard() {
     for table in ["spans_dist", "traces_dist"] {
         wait_distribution_drained(&shard1, db, table).await;
     }
+    sync_shard1_trace_replicas(&shard1, db).await;
     for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
         assert_eq!(
             count_on(shard, &format!("SELECT count() AS n FROM {db}.spans")).await,

@@ -277,17 +277,20 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
         "replicated_deduplication_window_seconds",
         NameCatalogue::MergeTreeSetting,
     ),
-    // The ten further settings one TRACE landing insert pins, of seven
-    // classes the metrics set does not need: how the block's bytes are read,
-    // a limit that refuses a block rather than dividing it, what an
-    // acknowledgement means, where a row is placed, what path a value is
-    // stored under, whether exceeding the deadline is an error or a success
-    // that need not be complete, and how the views run.
-    // `QuerySettings::trace_landing_insert` names them together and quotes
-    // what each one's own catalogue entry says. A pin added there without a
-    // row here is caught by
-    // `the_settings_read_back_at_startup_are_the_ones_the_trace_insert_sends`,
-    // which derives both directions rather than carrying a list.
+    // Ten further settings, first pinned on the TRACE landing insert. Seven
+    // are pinned there alone, of four classes the metrics set does not need:
+    // how the block's bytes are read, a limit that refuses a block rather
+    // than dividing it, what path a value is stored under, and how the views
+    // run; `QuerySettings::trace_landing_insert` names them and quotes what
+    // each one's own catalogue entry says. Two — what an acknowledgement
+    // means and where a row is placed — the log and trace landing inserts
+    // pin since issue #494 part 1, and `QuerySettings::routed_landing_insert`
+    // names them. The third — whether exceeding the deadline is an error —
+    // every landing insert pins, metrics included, and
+    // `QuerySettings::landing_insert` names it. A pin added to either
+    // without a row here is caught by the two
+    // `the_settings_read_back_at_startup_are_the_ones_*` cases, which derive
+    // their directions rather than carrying a list.
     (
         "input_format_binary_read_json_as_string",
         NameCatalogue::Setting,
@@ -303,8 +306,8 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
     ("insert_shard_id", NameCatalogue::Setting),
     ("json_type_escape_dots_in_keys", NameCatalogue::Setting),
     ("type_json_skip_duplicated_paths", NameCatalogue::Setting),
-    // The deadline's overflow mode; `QuerySettings::trace_landing_insert`'s
-    // own doc comment says why it is pinned.
+    // The deadline's overflow mode; `QuerySettings::landing_insert`'s own
+    // doc comment says why it is pinned.
     ("timeout_overflow_mode", NameCatalogue::Setting),
     ("generateUUIDv7", NameCatalogue::Function),
     ("toStartOfHour", NameCatalogue::Function),
@@ -669,19 +672,24 @@ mod tests {
     /// separate check.
     ///
     /// **The logs landing path widens neither side** (issue #603): its insert
-    /// pins the same ten settings the metrics one does, and its read path
-    /// sends no query setting at all — the discovery reads dispatch with the
-    /// budget settings and nothing more. `the_discovery_reads_send_no_distributed_product_mode`
+    /// pins the metrics set plus the two routed pins
+    /// (`QuerySettings::routed_landing_insert`), both rows already, and its
+    /// read path sends no query setting at all — the discovery reads dispatch
+    /// with the budget settings and nothing more. `the_discovery_reads_send_no_distributed_product_mode`
     /// (`crates/pulsus-read/src/logql/exec.rs`) asserts the other side of
     /// that.
     #[test]
     fn the_settings_read_back_at_startup_are_the_ones_the_landing_insert_sends() {
         use std::collections::BTreeSet;
 
-        /// In `crates/` before this work, so outside the probed class.
+        /// In `crates/` before this work, so outside the probed class. The
+        /// last two were already sent by `QuerySettings::clustered_reader`
+        /// before the landing insert pinned them (issue #494 part 1).
         const ALREADY_SHIPPED: &[&str] = &[
             "deduplicate_insert",
             "deduplicate_blocks_in_dependent_materialized_views",
+            "skip_unavailable_shards",
+            "prefer_localhost_replica",
         ];
 
         let want: BTreeSet<&str> = BTreeSet::from([
@@ -697,11 +705,12 @@ mod tests {
             "ignore_materialized_views_with_dropped_target_table",
             "min_insert_block_size_rows_for_materialized_views",
             "min_insert_block_size_bytes_for_materialized_views",
+            "timeout_overflow_mode",
         ]);
 
-        // The trace landing insert's own ten pins are rows too (issues
-        // #584 to #586), and they are **derived from that constructor** here
-        // rather than written out a second time: this case owns the twelve
+        // The trace landing insert's own seven pins are rows too (issues
+        // #584 to #586), as are the two routed pins it carries, and they are **derived from that constructor** here
+        // rather than written out a second time: this case owns the thirteen
         // above as a literal set, and
         // `the_settings_read_back_at_startup_are_the_ones_the_trace_insert_sends`
         // owns the rest, both ways.
@@ -825,10 +834,14 @@ mod tests {
     fn the_settings_read_back_at_startup_are_the_ones_the_trace_insert_sends() {
         use std::collections::BTreeSet;
 
-        /// In `crates/` before this work, so outside the probed class.
+        /// In `crates/` before this work, so outside the probed class. The
+        /// last two were already sent by `QuerySettings::clustered_reader`
+        /// before the landing insert pinned them (issue #494 part 1).
         const ALREADY_SHIPPED: &[&str] = &[
             "deduplicate_insert",
             "deduplicate_blocks_in_dependent_materialized_views",
+            "skip_unavailable_shards",
+            "prefer_localhost_replica",
         ];
 
         let rows: BTreeSet<&str> = REQUIRED_SERVER_NAMES

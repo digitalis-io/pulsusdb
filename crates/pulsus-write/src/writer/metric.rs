@@ -96,11 +96,11 @@ const VALUE_TYPE_FLOAT: u8 = 0;
 /// The `metric_series.value_type` discriminant for a native-histogram sample.
 const VALUE_TYPE_HISTOGRAM: u8 = 1;
 
-/// The table name a [`MetricWriter`] inserts into. One name: the four target
-/// tables are maintained by materialized view and the writer never names
-/// them (issue #603). The landing table has no `Distributed` wrapper, so
-/// this is the base name in every mode — `Arc<str>` because the server
-/// resolves it once at startup from `Config` rather than at compile time.
+/// The table name a [`MetricWriter`] inserts into: the bare `metric_landing`
+/// in every mode, written on the server the writer connects to. One name: the
+/// four target tables are maintained by materialized view and the writer
+/// never names them (issue #603). `Arc<str>` because the server resolves it
+/// once at startup from `Config` rather than at compile time.
 #[derive(Debug, Clone)]
 pub struct MetricWriterTables {
     pub landing: Arc<str>,
