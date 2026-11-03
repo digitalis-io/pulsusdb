@@ -78,6 +78,9 @@ static DB_P20: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read
 static DB_P21: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p21");
 static DB_P22: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p22");
 static DB_P23: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p23");
+static DB_P30: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p30");
+static DB_P31: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p31");
+static DB_P33: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p33");
 
 /// The default levels and their switch points: 60 s first, the resolution
 /// from 3 h; a shorter range reads raw (owner, 2026-10-31).
@@ -3053,16 +3056,16 @@ async fn a_day_level_fills_a_week() {
     assert!(failures.is_empty(), "L7:\n{}", failures.join("\n"));
 }
 
-/// **L5 (issue #18): pushdown on the request's steps, and not when
-/// filled.** Corpus P with the pushed engine against the engine with the
-/// levels and no pushdown. (a) A 6-hour request on its own minute steps
-/// pushes through the 60 s level; (b) one at 30 s off the minute is filled,
-/// and its node declined `Filled`; (c) a day at step 2 m is filled with no
-/// newest steps: `rollup_lattice` first, the decline second, then the
-/// bucket ends' read, and no other pushed stage; (d) a week at 1 h is the
-/// same, its decline `Filled` from the request's own steps.
+/// **L5 (issue #18): pushdown on the request's steps, and when filled.**
+/// Corpus P with the pushed engine against the engine with the levels and
+/// no pushdown. (a) A 6-hour request on its own minute steps pushes
+/// through the 60 s level; (b) one at 30 s off the minute is filled, and
+/// its bucket ends' read pushes on the minute (issue #18 part 2b); (c) a
+/// day at step 2 m is filled with no newest steps: `rollup_lattice` first,
+/// then the bucket ends' read with its pushed statement; (d) a week at 1 h
+/// is the same, pushed at 7200 s.
 #[tokio::test(flavor = "multi_thread")]
-async fn pushdown_on_the_request_grid_and_not_when_filled() {
+async fn pushdown_on_the_request_grid_and_when_filled() {
     skip_unless_live!();
     let end = p_end();
     let built = corpus_p(DB_L5.name(), end).await;
@@ -3087,7 +3090,7 @@ async fn pushdown_on_the_request_grid_and_not_when_filled() {
     // (b)
     let p = range(end - 6 * HOUR + 30_000, end - 30_000, 30_000);
     let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
-    if a.declines() != ["declined: Filled"] || !a.pushed().is_empty() {
+    if !a.declines().is_empty() || !a.pushed().iter().any(|s| s.contains("60000 AS grid_step")) {
         failures.push(format!(
             "(b): declines {:?}, pushed {:?}",
             a.declines(),
@@ -3112,15 +3115,14 @@ async fn pushdown_on_the_request_grid_and_not_when_filled() {
         .map(|s| (s.name, s.sql.as_str()))
         .collect();
     let in_order = names.first().map(|s| s.0) == Some("rollup_lattice")
-        && names.get(1) == Some(&("pushed_aggregate", "declined: Filled"))
-        && names[2..].iter().all(|s| s.0 != "pushed_aggregate")
-        && names.len() > 2;
+        && a.declines().is_empty()
+        && a.pushed().iter().any(|s| s.contains("720000 AS grid_step"));
     if !in_order {
         failures.push(format!("(c): stages {names:?}"));
     }
 
-    // (d) A week at 1 h, filled at 7200 s: on the request's own steps
-    // `[5m]` reads the 60 s level and the node would push.
+    // (d) A week at 1 h, filled at 7200 s: the bucket ends' read pushes at
+    // 7200 s.
     let q = "sum by (instance) (rate(p_rx_total[5m]))";
     let a = ask(&on, &t, q, &range(end - 7 * DAY, end, HOUR)).await;
     let names: Vec<(&str, &str)> = a
@@ -3130,10 +3132,11 @@ async fn pushdown_on_the_request_grid_and_not_when_filled() {
         .map(|s| (s.name, s.sql.as_str()))
         .collect();
     let in_order = names.first().map(|s| s.0) == Some("rollup_lattice")
-        && names.get(1) == Some(&("pushed_aggregate", "declined: Filled"))
-        && names.len() > 2
-        && names[2..].iter().all(|s| s.0 != "pushed_aggregate");
-    if !in_order || !a.pushed().is_empty() {
+        && a.declines().is_empty()
+        && a.pushed()
+            .iter()
+            .any(|s| s.contains("7200000 AS grid_step"));
+    if !in_order {
         failures.push(format!("(d): stages {names:?}"));
     }
     built.finish().await;
@@ -3800,8 +3803,8 @@ async fn a_vector_match_under_an_aggregate_answers_as_in_process() {
 
 /// **T4 (issue #579 part 4): the shapes part 4 does not push take today's
 /// route**, name their reason where section 4 names one, and answer as in
-/// process. Issue #18 part 2a: the week's three are filled at 7200 s, so
-/// they decline `Filled`.
+/// process. Issue #18 part 2b: the week's three, filled at 7200 s, are
+/// pushed now (T30 (c)), so they are not here.
 #[tokio::test(flavor = "multi_thread")]
 async fn unpushed_shapes_take_todays_route() {
     skip_unless_live!();
@@ -3823,8 +3826,7 @@ async fn unpushed_shapes_take_todays_route() {
     )
     .with_rollup_levels(Arc::clone(&built.slot));
     let day = range(end - 15 * HOUR, end, 2 * MIN);
-    let week = range(end - 7 * DAY, end, HOUR);
-    let cases: [(&str, &MetricQueryParams, Option<&str>); 14] = [
+    let cases: [(&str, &MetricQueryParams, Option<&str>); 11] = [
         (
             "sum(rate(p_rx_total[5m]) + on (instance, device) rate(p_tx_total[5m]))",
             &day,
@@ -3876,13 +3878,6 @@ async fn unpushed_shapes_take_todays_route() {
             &day,
             Some("Selector"),
         ),
-        (
-            "sum by (instance) (rate(p_rx_total[1h]) + rate(p_tx_total[1h]))",
-            &week,
-            Some("Filled"),
-        ),
-        ("sum(rate(p_rx_total[1h]))", &week, Some("Filled")),
-        ("sum(rate(p_tx_total[1h]))", &week, Some("Filled")),
     ];
     let mut failures = Vec::new();
     let t = no_tenant();
@@ -4376,4 +4371,215 @@ async fn a_finer_level_behind_its_coverage_falls_back() {
     }
     built.finish().await;
     assert!(failures.is_empty(), "T23:\n{}", failures.join("\n"));
+}
+
+// ------------------------------------------ issue #18 part 2b, filled
+
+/// Every pushed statement of `a` on the grid `start AS grid_start, step AS
+/// grid_step`.
+fn on_grid(a: &Answer, start: Option<i64>, step: i64) -> Vec<&str> {
+    let grid = match start {
+        Some(s) => format!("{s} AS grid_start, {step} AS grid_step"),
+        None => format!(" AS grid_start, {step} AS grid_step"),
+    };
+    a.pushed()
+        .into_iter()
+        .filter(|s| s.contains(&grid))
+        .collect()
+}
+
+/// A native-histogram sample on rx `{i0,d0}` at `t`.
+async fn one_histogram(built: &Built, t: i64) {
+    let db = built.db();
+    exec(
+        &built.admin,
+        &format!(
+            "INSERT INTO {db}.metric_hist_samples (org_id, fingerprint, unix_milli, schema, zero_threshold, zero_count, \
+                                                   count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
+                                                   neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values) \
+             SELECT '', fp, {t}, 0, 0., 0, 4, 5., [0], [3], [1, 1, -1], [], [], [], [] \
+             FROM {db}.rp_series WHERE key = 'rxi0d0'"
+        ),
+    )
+    .await;
+}
+
+/// **T30 (issue #18 part 2b): a filled request pushes both reads.** (a)
+/// 6 h at 30 s off the minute: the bucket ends' read at 60 s and the
+/// newest step's read at 30 s, both pushed; (b) a day at 2 m, filled from
+/// 720 s, no newest step; (c) a week at 1 h from 7200 s; (d) shape C over a
+/// day.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filled_request_pushes_both_reads() {
+    skip_unless_live!();
+    let end = p_end();
+    let built = corpus_p(DB_P30.name(), end).await;
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(true, None).await;
+    let t = no_tenant();
+    let mut failures = Vec::new();
+    let cases: [(&str, &str, MetricQueryParams); 4] = [
+        (
+            "(a)",
+            "sum by (instance) (rate(p_rx_total[1m]))",
+            range(end - 6 * HOUR + 30_000, end - 30_000, 30_000),
+        ),
+        (
+            "(b)",
+            "sum by (instance) (rate(p_rx_total[2m15s]))",
+            range(end - DAY, end, 2 * MIN),
+        ),
+        (
+            "(c)",
+            "sum by (instance) (rate(p_rx_total[5m]))",
+            range(end - 7 * DAY, end, HOUR),
+        ),
+        (
+            "(d)",
+            "sum by (instance) (rate(p_rx_total[2m15s]) + rate(p_tx_total[2m15s]))",
+            range(end - DAY, end, 2 * MIN),
+        ),
+    ];
+    for (case, q, p) in &cases {
+        let (a, b) = futures::join!(ask(&on, &t, q, p), ask(&off, &t, q, p));
+        if !a.declines().is_empty() {
+            failures.push(format!("{case} {q}: declines {:?}", a.declines()));
+        }
+        if vector_or_matrix(&b).is_empty() {
+            failures.push(format!("{case} {q}: in process, empty"));
+        }
+        if vector_or_matrix(&a) != vector_or_matrix(&b) {
+            failures.push(format!("{case} {q}: cells differ from push off"));
+        }
+        let pushed = a.pushed();
+        match *case {
+            "(a)" => {
+                let first = -(-p.start_ms).div_euclid(MIN) * MIN;
+                if pushed.len() != 2
+                    || on_grid(&a, Some(first), 60_000).len() != 1
+                    || on_grid(&a, Some(end - 30_000), 30_000).len() != 1
+                {
+                    failures.push(format!(
+                        "(a): pushed statements {}, want one on ({first}, 60000) and one on ({}, 30000)",
+                        pushed.len(),
+                        end - 30_000
+                    ));
+                }
+                let times = times_of(p);
+                for (l, ts) in &per_series(&a) {
+                    if ts != &times {
+                        failures.push(format!("(a) {l}: {} of {} times", ts.len(), times.len()));
+                    }
+                }
+            }
+            "(b)" => {
+                if pushed.len() != 1
+                    || !pushed[0].contains("FROM metric_samples_720s\n")
+                    || on_grid(&a, None, 720_000).len() != 1
+                {
+                    failures.push(format!(
+                        "(b): {} pushed statements, want one at 720 s",
+                        pushed.len()
+                    ));
+                }
+            }
+            "(c)" => {
+                // The bucket ends' read at 7200 s and, when `end` is not on
+                // a 2-hour bucket end, the newest step's read at 1 h.
+                let level = on_grid(&a, None, 7_200_000);
+                let newest = usize::from(end.rem_euclid(2 * HOUR) != 0);
+                if level.len() != 1
+                    || !level[0].contains("FROM metric_samples_7200s\n")
+                    || on_grid(&a, Some(end), HOUR).len() != newest
+                    || pushed.len() != 1 + newest
+                {
+                    failures.push(format!(
+                        "(c): {} pushed statements, want one at 7200 s and {newest} at 1 h",
+                        pushed.len()
+                    ));
+                }
+            }
+            _ => {
+                if pushed.is_empty() {
+                    failures.push("(d): not pushed".to_string());
+                }
+            }
+        }
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T30:\n{}", failures.join("\n"));
+}
+
+/// **T31 (issue #18 part 2b): a filled request mixes a pushed read and an
+/// evaluated one.** A histogram sample inside the newest step's read only:
+/// the bucket ends' read pushes, the newest step's read declines.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filled_request_mixes_a_pushed_and_an_evaluated_read() {
+    skip_unless_live!();
+    let end = p_end();
+    let built = corpus_p(DB_P31.name(), end).await;
+    one_histogram(&built, end - 40_000).await;
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(true, None).await;
+    let t = no_tenant();
+    let q = "sum by (instance) (rate(p_rx_total[1m]))";
+    let p = range(end - 6 * HOUR + 30_000, end - 30_000, 30_000);
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    let mut failures = Vec::new();
+    let first = -(-p.start_ms).div_euclid(MIN) * MIN;
+    if on_grid(&a, Some(first), 60_000).len() != 1 {
+        failures.push(format!(
+            "the bucket ends' read is not pushed: {:?}",
+            a.pushed().len()
+        ));
+    }
+    if a.declines() != ["declined: HistogramSamples"] {
+        failures.push(format!("declines {:?}", a.declines()));
+    }
+    if vector_or_matrix(&b).is_empty() {
+        failures.push("in process, empty".to_string());
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) {
+        failures.push("cells differ from push off".to_string());
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T31:\n{}", failures.join("\n"));
+}
+
+/// **T33 (issue #18 part 2b): a filled request pushes only its second
+/// read.** A histogram sample inside the bucket ends' read only: that read
+/// declines and fetches its levels, the newest step's read pushes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filled_request_pushes_only_its_second_read() {
+    skip_unless_live!();
+    let end = p_end();
+    let built = corpus_p(DB_P33.name(), end).await;
+    one_histogram(&built, end - 21 * MIN).await;
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(true, None).await;
+    let t = no_tenant();
+    let q = "sum by (instance) (rate(p_rx_total[1m]))";
+    let p = range(end - 6 * HOUR + 30_000, end - 30_000, 30_000);
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    let mut failures = Vec::new();
+    if a.declines() != ["declined: HistogramSamples"] {
+        failures.push(format!("declines {:?}", a.declines()));
+    }
+    if a.stages("rollup_piece").is_empty() {
+        failures.push("the bucket ends' read fetched no level".to_string());
+    }
+    if on_grid(&a, Some(end - 30_000), 30_000).len() != 1 {
+        failures.push(format!(
+            "the second read is not pushed: {} pushed",
+            a.pushed().len()
+        ));
+    }
+    if vector_or_matrix(&b).is_empty() {
+        failures.push("in process, empty".to_string());
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) {
+        failures.push("cells differ from push off".to_string());
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T33:\n{}", failures.join("\n"));
 }

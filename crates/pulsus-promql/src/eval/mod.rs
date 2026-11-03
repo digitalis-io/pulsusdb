@@ -103,9 +103,10 @@ impl<'a> EvalData<'a> {
     }
 
     /// Issue #579: the database's answer for the `Aggregate` node at
-    /// `self_pos`, if the fetch layer pushed it.
-    fn pushed(&self, self_pos: usize) -> Option<&PushedNode> {
-        self.base.pushed(self_pos)
+    /// `self_pos`, if the fetch layer pushed it; issue #18 part 2b: that of
+    /// the read the step at `t_ms` belongs to.
+    fn pushed(&self, self_pos: usize, t_ms: i64) -> Option<&PushedNode> {
+        self.base.pushed(self_pos, t_ms)
     }
 }
 
@@ -3790,7 +3791,7 @@ fn eval_step(
             // Issue #579: the database already answered this node. Its
             // vector at this step is the answer, and nothing below it is
             // evaluated — the fetch layer read no sample for its selector.
-            if let Some(node) = data.pushed(*self_pos) {
+            if let Some(node) = data.pushed(*self_pos, t_ms) {
                 let Some(v) = node.at(t_ms) else {
                     return Err(PromqlError::Unsupported {
                         construct: format!(
@@ -9774,6 +9775,144 @@ mod tests {
         );
     }
 
+    /// The plan of `sum(rate(x[12m]))` from 240 s to 2400 s at 240 s,
+    /// filled at 720 s until 2160 s, as U1 reads it.
+    fn u1_plan() -> crate::plan::QueryPlan {
+        let mut planned = plan(
+            &crate::parser::parse("sum(rate(x[12m]))").expect("parse"),
+            params(240_000, 2_400_000, 240_000),
+        )
+        .expect("plan");
+        for sel in &mut planned.selectors {
+            sel.fill = Some(crate::plan::SelectorFill {
+                width_ms: 720_000,
+                until_ms: 2_160_000,
+                tail_range_ms: Some(720_000),
+            });
+        }
+        planned
+    }
+
+    /// A pushed node on the grid `start_ms + k × step_ms`, one value a step,
+    /// labelled as `sum` without grouping answers.
+    fn u1_node(start_ms: i64, step_ms: i64, values: &[f64]) -> PushedNode {
+        PushedNode {
+            start_ms,
+            step_ms,
+            steps: values
+                .iter()
+                .enumerate()
+                .map(|(k, v)| {
+                    vec![InstantSample {
+                        labels: Labels::new(Vec::<(String, String)>::new()),
+                        metric_name: None,
+                        drop_name: true,
+                        t_ms: start_ms + k as i64 * step_ms,
+                        v: *v,
+                        h: None,
+                    }]
+                })
+                .collect(),
+            annotations: Annotations::new(),
+        }
+    }
+
+    /// The one series of a matrix answer, as `(t, value)`.
+    fn u1_points(value: &QueryValue) -> Vec<(i64, f64)> {
+        let QueryValue::Matrix(m) = value else {
+            panic!("a range query answers a matrix: {value:?}");
+        };
+        assert_eq!(m.len(), 1, "one series: {m:?}");
+        m[0].points.iter().map(|p| (p.t_ms, p.v)).collect()
+    }
+
+    /// A counter rising by 1 every 15 s from 0 ms to 2400 s.
+    fn u1_samples() -> Vec<Sample> {
+        (0..=160)
+            .map(|i| Sample::float(i * 15_000, i as f64))
+            .collect()
+    }
+
+    /// **U1 (issue #18 part 2b): a filled query reads each read's pushed
+    /// node.** The steps up to the last bucket end take the bucket-ends
+    /// read's node at their bucket; a later step takes the second read's
+    /// node. A read without a node is evaluated from that read's series.
+    #[test]
+    fn a_filled_query_reads_each_reads_pushed_node() {
+        let planned = u1_plan();
+        let pos = first_aggregate_pos(&planned.root);
+        // Case 1: both reads pushed.
+        let mut data = SeriesData::new();
+        data.insert_pushed(pos, u1_node(720_000, 720_000, &[1.0, 2.0, 3.0]));
+        let mut tail = SeriesData::new();
+        tail.insert_pushed(pos, u1_node(2_400_000, 240_000, &[9.0]));
+        data.take_as_tail(tail, 2_400_000);
+        let got = evaluate(&planned, &data);
+        assert!(got.is_ok(), "case 1: {got:?}");
+        let want: Vec<(i64, f64)> = [1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 9.0]
+            .iter()
+            .enumerate()
+            .map(|(k, v)| (240_000 * (k as i64 + 1), *v))
+            .collect();
+        assert_eq!(u1_points(&got.expect("case 1")), want, "case 1");
+
+        // Case 2: the second read has no node, only its series.
+        let mut data = SeriesData::new();
+        data.insert_pushed(pos, u1_node(720_000, 720_000, &[1.0, 2.0, 3.0]));
+        let mut tail = SeriesData::new();
+        tail.insert(0, vec![series(1, &[("job", "x")], u1_samples())]);
+        data.take_as_tail(tail, 2_400_000);
+        let got = evaluate(&planned, &data);
+        assert!(got.is_ok(), "case 2: {got:?}");
+        let points = u1_points(&got.expect("case 2"));
+        let instant = plan(
+            &crate::parser::parse("sum(rate(x[12m]))").expect("parse"),
+            params(2_400_000, 2_400_000, 0),
+        )
+        .expect("plan");
+        let mut alone = SeriesData::new();
+        alone.insert(0, vec![series(1, &[("job", "x")], u1_samples())]);
+        let QueryValue::Vector(v) = evaluate(&instant, &alone).expect("instant") else {
+            panic!("an instant query answers a vector");
+        };
+        assert_eq!(
+            points.last().map(|p| (p.0, p.1.to_bits())),
+            Some((2_400_000, v[0].v.to_bits())),
+            "case 2: the last step from the second read's series"
+        );
+        assert_eq!(
+            points[..9].iter().map(|p| p.1).collect::<Vec<_>>(),
+            want[..9].iter().map(|p| p.1).collect::<Vec<_>>(),
+            "case 2: the bucket ends"
+        );
+
+        // Case 3: the first read has no node, only its series; the second
+        // read's node answers the last step.
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "x")], u1_samples())]);
+        let mut tail = SeriesData::new();
+        tail.insert_pushed(pos, u1_node(2_400_000, 240_000, &[9.0]));
+        data.take_as_tail(tail, 2_400_000);
+        let got = evaluate(&planned, &data);
+        assert!(got.is_ok(), "case 3: {got:?}");
+        let points = u1_points(&got.expect("case 3"));
+        let mut plain = SeriesData::new();
+        plain.insert(0, vec![series(1, &[("job", "x")], u1_samples())]);
+        plain.take_as_tail(SeriesData::new(), 2_400_000);
+        let without = u1_points(&evaluate(&planned, &plain).expect("no node"));
+        let bits = |p: &[(i64, f64)]| p.iter().map(|(t, v)| (*t, v.to_bits())).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&points[..points.len() - 1]),
+            bits(&without),
+            "case 3: the bucket ends as with no node at all"
+        );
+        assert_eq!(
+            points.last(),
+            Some(&(2_400_000, 9.0)),
+            "case 3: the last step"
+        );
+    }
+
     /// A pushed node is never read at a time off its own grid: that would
     /// answer from a different step. It is an error, not an empty vector.
     #[test]
@@ -9917,7 +10056,7 @@ mod tests {
             data.insert(sel.id, vec![series(1, &[("job", "x")], first.to_vec())]);
             tail.insert(sel.id, vec![series(1, &[("job", "x")], second.to_vec())]);
         }
-        data.take_as_tail(tail);
+        data.take_as_tail(tail, 2_280_000);
         evaluate(&planned, &data).expect("evaluate")
     }
 
