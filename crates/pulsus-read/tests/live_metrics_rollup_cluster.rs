@@ -202,8 +202,10 @@ fn fp_of(offset: u32) -> String {
 /// `db`, fresh on the 2-shard fixture, every level view stopped and
 /// every level emptied, and each metric of `metrics`, `(name, ID offset)`:
 /// forty series, half in each shard's slice of the ID space, scraped every
-/// 15 s for three hours, registered and landed on shard 1.
-async fn fixture(db: String, metrics: &[(&str, u32)]) -> Fixture {
+/// 15 s for three hours, registered and landed on shard 1 — or, with
+/// `sharded` (issue #18 part 2a), landed through `metric_landing_dist`,
+/// each series on the shard its ID hashes to.
+async fn fixture(db: String, metrics: &[(&str, u32)], sharded: bool) -> Fixture {
     // Part B's levels, 60 s first and the resolution from 60 s: the
     // 40-minute queries read the first level.
     let ctx = RenderCtx {
@@ -244,13 +246,21 @@ async fn fixture(db: String, metrics: &[(&str, u32)]) -> Fixture {
     let mid = (chrono::Utc::now().timestamp_millis() / HOUR) * HOUR - HOUR;
     let lo = mid - 2 * HOUR;
     let hi = mid + 10 * MIN;
+    let (landing, settings) = if sharded {
+        (
+            "metric_landing_dist",
+            "SETTINGS insert_distributed_sync = 1 ",
+        )
+    } else {
+        ("metric_landing", "")
+    };
     for (metric, offset) in metrics {
         let fp = fp_of(*offset);
         exec(
             &shard1,
             &format!(
-                "INSERT INTO metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
-                 SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, '{metric}', {fp}, toInt64({lo}) + toInt64(h) * {HOUR} + 1000, \
+                "INSERT INTO {landing} (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+                 {settings}SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, '{metric}', {fp}, toInt64({lo}) + toInt64(h) * {HOUR} + 1000, \
                         concat('{{\"s\":\"', toString(s), '\"}}'), 0 \
                  FROM (SELECT toUInt32(number) AS s FROM numbers(40)) ARRAY JOIN [0, 1, 2] AS h"
             ),
@@ -259,8 +269,8 @@ async fn fixture(db: String, metrics: &[(&str, u32)]) -> Fixture {
         exec(
             &shard1,
             &format!(
-                "INSERT INTO metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
-                 SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, '{metric}', {fp}, \
+                "INSERT INTO {landing} (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+                 {settings}SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, '{metric}', {fp}, \
                         toInt64({lo}) + toInt64(i) * 15000 + 2000, toFloat64(cityHash64(s, i) % 1000) \
                  FROM (SELECT toUInt32(a.number) AS s, b.number AS i FROM numbers(40) AS a, numbers(1, {}) AS b)",
                 (hi - lo) / 15_000 - 1
@@ -507,9 +517,14 @@ async fn a_run_row_is_read_with_its_data() {
 /// then shard 1's second replica caught up, so either replica answers the
 /// same rows.
 async fn build_level(f: &Fixture) {
+    build_level_to(f, f.hi).await;
+}
+
+/// [`build_level`] over `(lo, until]`.
+async fn build_level_to(f: &Fixture, until: i64) {
     let mut a = f.lo;
-    while a < f.hi {
-        let b = (a + HOUR).min(f.hi);
+    while a < until {
+        let b = (a + HOUR).min(until);
         for node in [&f.shard1, &f.shard2] {
             exec(node, &first_level_insert(&f.ctx, a, b)).await;
         }
@@ -681,6 +696,7 @@ async fn a_pushed_level_node_answers_on_two_shards() {
     let f = fixture(
         pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t7"),
         &[("m", 0)],
+        false,
     )
     .await;
     build_level(&f).await;
@@ -735,6 +751,7 @@ async fn a_side_behind_its_coverage_falls_back_whole() {
     let f = fixture(
         pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t10"),
         &[("m", 0), ("n", 5000)],
+        false,
     )
     .await;
     let tenant = Tenant::from_header(None, false).expect("the empty tenant");
@@ -774,8 +791,8 @@ async fn a_side_behind_its_coverage_falls_back_whole() {
             uuid::Uuid::new_v4().simple()
         );
         let hook: pulsus_read::metrics::exec::CoverageHook =
-            Arc::new(move |selector, mut runs: Vec<RunRow>| {
-                if selector == side {
+            Arc::new(move |selector, level, mut runs: Vec<RunRow>| {
+                if selector == side && level == 0 {
                     runs.extend(deleted.iter().map(|&(t_last, t_end)| RunRow {
                         shard,
                         t_last,
@@ -853,4 +870,151 @@ async fn a_side_behind_its_coverage_falls_back_whole() {
         ),
     )
     .await;
+}
+
+// ------------------------------------------------ issue #18 part 2a, T24
+
+/// A count `node` answers.
+async fn count_on(node: &ChClient, sql: &str) -> u64 {
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
+    struct N {
+        n: u64,
+    }
+    let mut stream = node
+        .query_stream::<N>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let mut n = 0;
+    while let Some(row) = stream.next().await {
+        n = row.expect("decode").n;
+    }
+    n
+}
+
+/// Runs level `r`'s view on `node` until a run writes no run row there:
+/// the single-node suite's `until_idle`, on one node.
+async fn until_idle_on(node: &ChClient, db: &str, r: u32) {
+    let view = format!("{db}.metric_samples_{r}s_mv");
+    let runs =
+        format!("SELECT toUInt64(count()) AS n FROM {db}.metric_samples_{r}s WHERE kind = 1");
+    let mut before = count_on(node, &runs).await;
+    for _ in 0..4000 {
+        for verb in ["START", "REFRESH", "WAIT", "STOP"] {
+            exec(node, &format!("SYSTEM {verb} VIEW {view}")).await;
+        }
+        let now = count_on(node, &runs).await;
+        if now == before {
+            return;
+        }
+        before = now;
+    }
+    panic!("level {r}s still writes run rows after 4000 runs");
+}
+
+/// **T24 (issue #18 part 2a): a coarse node answers on two shards.** The
+/// series land on the shard their ID hashes to; the 60 s level is built to
+/// `hi − 20 min` and the 720 s level from it on both shards, so a day's
+/// window reads the 720 s level, the 60 s level and raw samples of both
+/// shards in one counter.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coarse_node_answers_on_two_shards() {
+    if skipping() {
+        return;
+    }
+    let f = fixture(
+        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t24"),
+        &[("m", 0), ("n", 5000)],
+        true,
+    )
+    .await;
+    build_level_to(&f, f.hi - 20 * MIN).await;
+    for node in [&f.shard1, &f.shard2] {
+        until_idle_on(node, &f.db, 720).await;
+    }
+    for r in [60, 720] {
+        exec(
+            &f.shard1b,
+            &format!("SYSTEM SYNC REPLICA {}.metric_samples_{r}s", f.db),
+        )
+        .await;
+    }
+    let (cache, slot) = warm(&f).await;
+    let on = level_engine(&f, &cache, &slot, true, None).await;
+    let off = level_engine(&f, &cache, &slot, false, None).await;
+    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
+    let end = f.hi.div_euclid(12 * MIN) * 12 * MIN;
+    let p = MetricQueryParams {
+        start_ms: end - 24 * HOUR,
+        end_ms: end,
+        step_ms: 12 * MIN,
+    };
+    // Every failure, in order — cells against push off, the series count,
+    // then the statements — asserted empty at the end, so a wrong answer is
+    // reported whatever the statement text says.
+    let mut failures: Vec<String> = Vec::new();
+    for q in [
+        "sum by (s) (rate(m[12m]))",
+        "sum by (s) (rate(m[12m]) + rate(n[12m]))",
+    ] {
+        let expr = parse(q).expect("parse");
+        let (a, _, explain) = on.query_explained(&tenant, &expr, &p).await.expect("on");
+        let (b, _, off_explain) = off.query_explained(&tenant, &expr, &p).await.expect("off");
+        let (ca, cb) = (cells(&a), cells(&b));
+        if ca != cb {
+            let first = cb
+                .iter()
+                .find(|(k, v)| ca.get(*k) != Some(*v))
+                .map(|(k, _)| k.clone());
+            failures.push(format!(
+                "{q}: cells differ from push off: {} series pushed, {} in process; first {first:?}",
+                ca.len(),
+                cb.len()
+            ));
+        }
+        if cb.len() != 40 {
+            failures.push(format!("{q}: {} series in process, want 40", cb.len()));
+        }
+        let st = stages(&explain);
+        if !st.iter().any(|(n, sql)| {
+            n == "pushed_aggregate"
+                && [
+                    "FROM metric_samples_720s_dist\n",
+                    "FROM metric_samples_60s_dist\n",
+                    "FROM metric_samples_dist\n",
+                ]
+                .iter()
+                .all(|t| sql.contains(t))
+        }) {
+            failures.push(format!(
+                "{q}: no pushed statement reading the 720 s, 60 s and raw tables"
+            ));
+        }
+        if st.iter().any(|(_, sql)| sql.starts_with("declined:")) {
+            failures.push(format!("{q}: declined: {st:?}"));
+        }
+        if !off_explain.stages.iter().any(|s| {
+            s.name == "rollup_piece" && s.note.as_deref().is_some_and(|n| n.starts_with("raw ("))
+        }) {
+            failures.push(format!("{q}: in process, no raw piece"));
+        }
+    }
+    for (name, node) in [("shard1", &f.shard1), ("shard2", &f.shard2)] {
+        let n = count_on(
+            node,
+            "SELECT toUInt64(count(DISTINCT fingerprint)) AS n FROM metric_samples",
+        )
+        .await;
+        if n == 0 {
+            failures.push(format!("{name} holds no raw series"));
+        }
+    }
+    exec(
+        &f.bootstrap,
+        &format!(
+            "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
+            f.db
+        ),
+    )
+    .await;
+    assert!(failures.is_empty(), "T24:\n{}", failures.join("\n"));
 }

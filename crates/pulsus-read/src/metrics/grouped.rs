@@ -286,8 +286,7 @@ pub struct RangeShape {
     pub grid: Grid,
     pub range_ms: i64,
     pub instant: bool,
-    /// Part 4: the selector's arm. Shape A reads a `Level` arm only at the
-    /// finest level (D5).
+    /// Part 4: the selector's arm. Issue #18 part 2a: any level (D5).
     pub arm: Arm,
 }
 
@@ -371,9 +370,6 @@ pub enum NodeDecline {
     NameGrouping,
     /// F8: the grid arithmetic would overflow in the database.
     GridOverflow,
-    /// Part 4, D5: a selector reads a level coarser than the finest, or a
-    /// level whose counter is not overlaid.
-    CoarseLevel,
     /// Part 4, D6: shape C's operator is not `+ - * /` or a comparison.
     Operator,
     /// Part 4, D7: shape C names `on`, `ignoring (…)`, `group_*` or `fill`.
@@ -581,9 +577,6 @@ fn verdict_of(
                 return Some(Err(NodeDecline::NameGrouping));
             }
             let arm = arm_of(arms, *id);
-            if !pushable(&arm) {
-                return Some(Err(NodeDecline::CoarseLevel));
-            }
             let Some(grid) = range_grid_of(params, range_ms) else {
                 return Some(Err(NodeDecline::GridOverflow));
             };
@@ -656,9 +649,6 @@ fn verdict_of(
             if by_name(grouping) {
                 return Some(Err(NodeDecline::NameGrouping));
             }
-            if !sides.iter().all(|s| pushable(&s.arm)) {
-                return Some(Err(NodeDecline::CoarseLevel));
-            }
             use pulsus_promql::BinOp;
             if !(matches!(bin, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
                 || bin.is_comparison())
@@ -711,15 +701,6 @@ fn by_name(grouping: Option<&Grouping>) -> bool {
 /// A selector's arm; one the caller did not decide is `Raw`.
 fn arm_of(arms: &HashMap<SelectorId, Arm>, id: SelectorId) -> Arm {
     arms.get(&id).cloned().unwrap_or(Arm::Raw)
-}
-
-/// D5: a `Raw` arm, or a `Level` arm at the finest level whose counter the
-/// evaluator overlays with raw samples.
-fn pushable(arm: &Arm) -> bool {
-    match arm {
-        Arm::Raw => true,
-        Arm::Level(route) => route.level == 0 && super::rollup::overlaid(route.use_, route.res_ms),
-    }
 }
 
 /// A rounded `increase`'s factor, `asked / read`: the evaluator's own
@@ -2826,18 +2807,6 @@ mod tests {
             &[],
             NodeDecline::NameGrouping,
         );
-        // D5: a level coarser than the finest, either side, either shape.
-        let coarse = level_arm(1, 720_000);
-        assert_part4_declines(
-            &["sum(rate(rx[1h]))", "sum(rate(rx[1h]) + rate(tx[1h]))"],
-            &[(0, coarse.clone())],
-            NodeDecline::CoarseLevel,
-        );
-        assert_part4_declines(
-            &["sum(rate(rx[1h]) + rate(tx[1h]))"],
-            &[(1, coarse)],
-            NodeDecline::CoarseLevel,
-        );
         // D6.
         assert_part4_declines(
             &[
@@ -2886,6 +2855,29 @@ mod tests {
             &[(0, fine.clone()), (1, fine.clone())],
         );
         assert_eq!((j.lhs.arm, j.rhs.arm), (fine.clone(), fine));
+    }
+
+    /// **U1 (issue #18 part 2a): every arm is pushable** — a 720 s level
+    /// on either side of either shape, and a 60 s level that is not the
+    /// finest, are pushed and carried on the shape.
+    #[test]
+    fn every_arm_is_pushable() {
+        for arm in [level_arm(1, 720_000), level_arm(1, 60_000)] {
+            match verdict_of_query("sum(rate(rx[1h]))", &[(0, arm.clone())]).map(|n| n.kind) {
+                Ok(PushKind::Range(r)) => assert_eq!(r.arm, arm, "shape A"),
+                other => panic!("sum(rate(rx[1h])) under {arm:?}: {other:?}"),
+            }
+            for side in [0, 1] {
+                let q = "sum(rate(rx[1h]) + rate(tx[1h]))";
+                match verdict_of_query(q, &[(side, arm.clone())]).map(|n| n.kind) {
+                    Ok(PushKind::Join(j)) => {
+                        let carried = if side == 0 { j.lhs.arm } else { j.rhs.arm };
+                        assert_eq!(carried, arm, "{q}, side {side}");
+                    }
+                    other => panic!("{q} under {arm:?} on side {side}: {other:?}"),
+                }
+            }
+        }
     }
 
     /// A small seeded generator, so T9's cases are the same every run.

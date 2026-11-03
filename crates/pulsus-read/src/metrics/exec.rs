@@ -557,8 +557,12 @@ pub struct MetricsEngine {
 }
 
 /// TEST SEAM (issue #579 part 4): one selector's S1 run rows, edited.
+/// Issue #18 part 2a: the second argument is the level's index; a side
+/// reads one S1 per level from its route's down to the finest.
 pub type CoverageHook = std::sync::Arc<
-    dyn Fn(SelectorId, Vec<super::rollup::RunRow>) -> Vec<super::rollup::RunRow> + Send + Sync,
+    dyn Fn(SelectorId, usize, Vec<super::rollup::RunRow>) -> Vec<super::rollup::RunRow>
+        + Send
+        + Sync,
 >;
 
 /// TEST SEAM (issue #18 part B): a level fetch's answer by its statement
@@ -1262,8 +1266,9 @@ impl MetricsEngine {
             }
 
             // Issue #579 part 4: a selector of a shape-A or shape-C node
-            // whose arm is the 60 s level reads its coverage now (S1); the
-            // node's statements then read the level and the raw tail. Its
+            // whose arm is a level reads its coverage now (S1, one a level
+            // from the route's down, issue #18 part 2a); the node's
+            // statements then read the levels and the raw samples. Its
             // fallback is today's route.
             let level_owned = owners
                 .get(&selector_id)
@@ -1650,10 +1655,15 @@ impl MetricsEngine {
                 // flag by today's rule (`rollup_chunk`'s
                 // `served_from_level`), from S4.
                 if let Some(e) = explain.as_mut() {
+                    // Issue #18 part 2a: from 720 s (no overlay) a level row
+                    // read sets the flag whatever the windows touch, as
+                    // `rollup_chunk`'s flag is set there.
                     for (selector, read_level, todo) in &served {
                         let sel = &plan.selectors[*selector];
                         e.rollup |= (*read_level
-                            && super::rollup::level_window_exists(sel, &plan_params, todo))
+                            && todo.as_ref().is_none_or(|todo| {
+                                super::rollup::level_window_exists(sel, &plan_params, todo)
+                            }))
                             || sel.written_range_ms != sel.range_ms;
                     }
                 }
@@ -2482,6 +2492,8 @@ impl MetricsEngine {
     /// Issue #579 part 4: S1, a `Level` side's coverage, read before its
     /// node's statements are rendered, and what today's route derives from
     /// it: the served, uncovered and raw-read intervals of the fetch window.
+    /// Issue #18 part 2a: one S1 per level from the route's down to the
+    /// finest, sent together, each level serving what the coarser ones left.
     async fn level_coverage(
         &self,
         selector_id: SelectorId,
@@ -2491,28 +2503,64 @@ impl MetricsEngine {
         window: (i64, i64),
         explain: Option<&mut PlanExplain>,
     ) -> Result<LevelSide, ReadError> {
-        use super::rollup::{coverage, intersect, subtract, widen};
-        let sql = super::rollup::level_runs(&route.table, window, self.config.distributed);
+        let sqls: Vec<(usize, String)> = (0..=route.level)
+            .rev()
+            .map(|k| {
+                let sql = super::rollup::level_runs(
+                    &levels.levels[k].table,
+                    window,
+                    self.config.distributed,
+                );
+                (k, sql)
+            })
+            .collect();
         if let Some(e) = explain {
-            e.push("pushed_coverage", sql.clone(), None);
+            for (_, sql) in &sqls {
+                e.push("pushed_coverage", sql.clone(), None);
+            }
         }
-        let mut runs: Vec<super::rollup::RunRow> = self.fetch_series_rows(sql).await?;
-        if let Some(hook) = &self.coverage_hook {
-            runs = hook(selector_id, runs);
+        let fetched: Vec<Result<Vec<super::rollup::RunRow>, ReadError>> = join_all(
+            sqls.iter()
+                .map(|(_, sql)| self.fetch_series_rows::<super::rollup::RunRow>(sql.clone())),
+        )
+        .await;
+        let mut runs = Vec::with_capacity(sqls.len());
+        for ((k, _), rows) in sqls.iter().zip(fetched) {
+            let mut rows = rows?;
+            if let Some(hook) = &self.coverage_hook {
+                rows = hook(selector_id, *k, rows);
+            }
+            runs.push((*k, rows));
         }
-        let covered = coverage(&runs, levels.shards);
-        let todo = subtract(&[window], &covered);
+        let overlaid = super::rollup::overlaid(route.use_, route.res_ms);
+        let pieces = super::rollup::level_pieces(
+            &runs,
+            levels.shards,
+            window,
+            sel.range_ms.unwrap_or(0),
+            overlaid,
+        );
         Ok(LevelSide {
-            table: route.table.clone(),
             shards: levels.shards,
             window,
-            served: intersect(&covered, &[window]),
-            read: widen(&todo, sel.range_ms.unwrap_or(0), window),
-            todo,
+            levels: pieces
+                .served
+                .into_iter()
+                .map(|(k, served)| {
+                    (
+                        levels.levels[k].table.clone(),
+                        levels.levels[k].res_ms,
+                        served,
+                    )
+                })
+                .collect(),
+            todo: pieces.todo,
+            read: pieces.read,
+            overlaid,
         })
     }
 
-    /// Issue #579 part 4: a shape-A node over the 60 s level, or a shape-C
+    /// Issue #579 part 4: a shape-A node over a rollup level, or a shape-C
     /// node, whose sides phase 1 recorded — S2 where a side's series count
     /// is unknown, its statements split by time, its explain entries, and
     /// the pending push with every side's fallback.
@@ -2580,26 +2628,38 @@ impl MetricsEngine {
                 });
                 e.push("pushed_aggregate", first.clone(), note);
             }
-            // S4, the explain flag's input, one per `Level` side.
+            // S4, the explain flag's input, one per `Level` side, over every
+            // level it reads; a side no level serves has none.
             for side in &sides {
                 let Some(level) = &side.level else {
                     continue;
                 };
-                let sql = super::grouped_sql::level_served(
-                    tenant,
-                    &side.ids_sql,
-                    &super::grouped_sql::LevelRead {
-                        table: &level.table,
-                        clustered: self.config.distributed,
-                        shards: level.shards,
-                        window: level.window,
-                        served: &level.served,
-                        read: &level.read,
-                        raw_steps: &[],
-                    },
-                );
-                e.push("pushed_level_rows", sql.clone(), None);
-                levels.push((side.selector, sql, level.todo.clone()));
+                let served: Vec<super::grouped_sql::LevelServed<'_>> = level
+                    .levels
+                    .iter()
+                    .map(|(table, res_ms, served)| (table.as_str(), *res_ms, served.as_slice()))
+                    .collect();
+                let sql = (!served.is_empty()).then(|| {
+                    super::grouped_sql::level_served(
+                        tenant,
+                        &side.ids_sql,
+                        &super::grouped_sql::LevelRead {
+                            clustered: self.config.distributed,
+                            shards: level.shards,
+                            window: level.window,
+                            levels: &served,
+                            todo: &level.todo,
+                            read: &level.read,
+                            raw_steps: &[],
+                            overlaid: level.overlaid,
+                        },
+                    )
+                });
+                if let Some(sql) = &sql {
+                    e.push("pushed_level_rows", sql.clone(), None);
+                }
+                let todo = level.overlaid.then(|| level.todo.clone());
+                levels.push((side.selector, sql, todo));
             }
         }
         let (push, drop_name) = shape.push();
@@ -2637,20 +2697,43 @@ impl MetricsEngine {
             .map(|(side, spec)| {
                 side.level.as_ref().map(|l| {
                     let cut = [(l.window.0, chunk_end)];
-                    (
-                        intersect(&l.served, &cut),
-                        intersect(&l.read, &cut),
-                        super::grouped::raw_steps(grid, spec.range_ms, &l.todo),
-                    )
+                    ChunkCut {
+                        levels: l
+                            .levels
+                            .iter()
+                            .map(|(table, res_ms, served)| {
+                                (table.clone(), *res_ms, intersect(served, &cut))
+                            })
+                            .filter(|(_, _, served)| !served.is_empty())
+                            .collect(),
+                        todo: intersect(&l.todo, &cut),
+                        read: intersect(&l.read, &cut),
+                        raw_steps: if l.overlaid {
+                            super::grouped::raw_steps(grid, spec.range_ms, &l.todo)
+                        } else {
+                            Vec::new()
+                        },
+                    }
                 })
             })
             .collect();
-        let sql_sides: Vec<super::grouped_sql::SideSql<'_>> =
-            sides
-                .iter()
-                .zip(specs)
-                .zip(&cuts)
-                .map(|((side, spec), cut)| super::grouped_sql::SideSql {
+        let served: Vec<Option<Vec<super::grouped_sql::LevelServed<'_>>>> = cuts
+            .iter()
+            .map(|cut| {
+                cut.as_ref().map(|c| {
+                    c.levels
+                        .iter()
+                        .map(|(table, res_ms, served)| (table.as_str(), *res_ms, served.as_slice()))
+                        .collect()
+                })
+            })
+            .collect();
+        let sql_sides: Vec<super::grouped_sql::SideSql<'_>> = sides
+            .iter()
+            .zip(specs)
+            .zip(cuts.iter().zip(&served))
+            .map(
+                |((side, spec), (cut, served))| super::grouped_sql::SideSql {
                     tenant,
                     samples_table: &self.config.samples_table,
                     labels_table: &self.config.labels_table,
@@ -2660,19 +2743,23 @@ impl MetricsEngine {
                     range_ms: spec.range_ms,
                     scale: spec.scale,
                     window: side.window,
-                    level: side.level.as_ref().zip(cut.as_ref()).map(
-                        |(l, (served, read, steps))| super::grouped_sql::LevelRead {
-                            table: &l.table,
+                    level: side
+                        .level
+                        .as_ref()
+                        .zip(cut.as_ref().zip(served.as_ref()))
+                        .map(|(l, (cut, served))| super::grouped_sql::LevelRead {
                             clustered: self.config.distributed,
                             shards: l.shards,
                             window: l.window,
-                            served,
-                            read,
-                            raw_steps: steps,
-                        },
-                    ),
-                })
-                .collect();
+                            levels: served,
+                            todo: &cut.todo,
+                            read: &cut.read,
+                            raw_steps: &cut.raw_steps,
+                            overlaid: l.overlaid,
+                        }),
+                },
+            )
+            .collect();
         match shape {
             NodeShape::Level(r, _) => super::grouped_sql::level_aggregate_fetch(
                 &sql_sides[0],
@@ -3128,6 +3215,10 @@ impl MetricsEngine {
                     if behind {
                         break;
                     }
+                    let Some(sql) = sql else {
+                        served.push((selector, false, todo));
+                        continue;
+                    };
                     match self
                         .fetch_rows_with::<super::grouped_rows::LevelServedRow>(
                             sql, &settings, None,
@@ -4402,36 +4493,43 @@ struct PushSide {
     level: Option<LevelSide>,
 }
 
-/// One `Level` side's served and raw-read intervals and raw steps, cut to
-/// one time chunk.
-type ChunkCut = (
-    super::rollup::Intervals,
-    super::rollup::Intervals,
-    Vec<(u32, u32)>,
-);
-
-/// Issue #579 part 4: a `Level` side's coverage, from S1.
-struct LevelSide {
-    table: String,
-    shards: u32,
-    window: (i64, i64),
-    served: super::rollup::Intervals,
+/// One `Level` side's levels, uncovered and raw-read intervals and raw
+/// steps, cut to one time chunk.
+struct ChunkCut {
+    levels: Vec<(String, i64, super::rollup::Intervals)>,
     todo: super::rollup::Intervals,
     read: super::rollup::Intervals,
+    raw_steps: Vec<(u32, u32)>,
+}
+
+/// Issue #579 part 4: a `Level` side's coverage, from S1. Issue #18 part
+/// 2a: every level it reads.
+struct LevelSide {
+    shards: u32,
+    window: (i64, i64),
+    /// `(table, width ms, served)` of each level that serves part of the
+    /// window, from the route's level down.
+    levels: Vec<(String, i64, super::rollup::Intervals)>,
+    todo: super::rollup::Intervals,
+    read: super::rollup::Intervals,
+    /// The route is under 720 s: its raw samples are read through the
+    /// overlay, not folded into the counter.
+    overlaid: bool,
 }
 
 impl LevelSide {
     /// F11: a list longer than one statement names.
     fn exceeds(&self, grid: super::grouped::Grid, range_ms: i64) -> bool {
         let max = super::rollup::MAX_STATEMENT_INTERVALS;
-        self.served.len() > max
+        self.levels.iter().any(|(_, _, served)| served.len() > max)
+            || self.todo.len() > max
             || self.read.len() > max
             || super::grouped::raw_steps(grid, range_ms, &self.todo).len() > max
     }
 }
 
 /// Issue #579 part 4: the node a [`PushSide`] list is staged for: shape A
-/// over the 60 s level with its `increase` scale, or shape C.
+/// over a rollup level with its `increase` scale, or shape C.
 enum NodeShape<'a> {
     Level(&'a super::grouped::RangeShape, Option<f64>),
     Join(&'a super::grouped::JoinShape),
@@ -4530,7 +4628,7 @@ enum PendingPush {
         drop_name: bool,
         /// Part 4, explain only: each `Level` side's S4 and its uncovered
         /// intervals.
-        levels: Vec<(SelectorId, String, super::rollup::Intervals)>,
+        levels: Vec<(SelectorId, Option<String>, Option<super::rollup::Intervals>)>,
     },
 }
 
@@ -4551,7 +4649,7 @@ enum PushResult {
         behind: bool,
         /// Part 4, explain only: per `Level` side, whether S4 found a level
         /// row, and its uncovered intervals.
-        served: Vec<(SelectorId, bool, super::rollup::Intervals)>,
+        served: Vec<(SelectorId, bool, Option<super::rollup::Intervals>)>,
     },
 }
 

@@ -564,6 +564,52 @@ pub fn intersect(a: &[(i64, i64)], b: &[(i64, i64)]) -> Intervals {
     union(out)
 }
 
+/// Issue #18 part 2a: a pushed `Level` side's pieces of its fetch window,
+/// from each level's coverage statement (S1): what each level serves, the
+/// time no level covers, and the raw read around it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pieces {
+    /// `(level index, intervals)`, from the route's level down; a level
+    /// that serves nothing is left out.
+    pub served: Vec<(usize, Intervals)>,
+    /// The window less every level's coverage.
+    pub todo: Intervals,
+    /// `todo` widened by the range on both sides inside the window when the
+    /// counter is overlaid; `todo` itself otherwise.
+    pub read: Intervals,
+}
+
+/// Issue #18 part 2a: today's level loop (`rollup_chunk`) over the S1 rows
+/// of each level `(index, runs)`: from the route's level down, each level
+/// serves what it covers of what the coarser ones left; the rest is raw,
+/// read widened by the range under 720 s (plan Q12), as it is from 720 s.
+pub fn level_pieces(
+    runs: &[(usize, Vec<RunRow>)],
+    shards: u32,
+    window: (i64, i64),
+    range_ms: i64,
+    overlaid: bool,
+) -> Pieces {
+    let mut levels: Vec<&(usize, Vec<RunRow>)> = runs.iter().collect();
+    levels.sort_by_key(|(k, _)| std::cmp::Reverse(*k));
+    let mut todo = vec![window];
+    let mut served = Vec::new();
+    for (k, rows) in levels {
+        let covered = coverage(rows, shards);
+        let mine = intersect(&covered, &todo);
+        todo = subtract(&todo, &covered);
+        if !mine.is_empty() {
+            served.push((*k, mine));
+        }
+    }
+    let read = if overlaid {
+        widen(&todo, range_ms, window)
+    } else {
+        todo.clone()
+    };
+    Pieces { served, todo, read }
+}
+
 /// The most intervals one level or raw statement names.
 pub const MAX_STATEMENT_INTERVALS: usize = 64;
 
@@ -1679,6 +1725,68 @@ mod tests {
             t_last,
             t_end,
         }
+    }
+
+    /// **U2 (issue #18 part 2a): `level_pieces` splits the window as the
+    /// route's level loop does**: each level serves what it covers of what
+    /// the coarser ones left, and the raw read is the rest, widened only
+    /// when the counter is overlaid.
+    #[test]
+    fn level_pieces_split_the_window_as_the_route_does() {
+        let w = (0, 100);
+        let one = |runs: Vec<(usize, Vec<RunRow>)>, overlaid: bool| {
+            level_pieces(&runs, 1, w, 10, overlaid)
+        };
+        // (a) the route's level covers the whole window.
+        let a = one(vec![(1, vec![run(1, 0, 100)]), (0, vec![])], false);
+        assert_eq!(a.served, vec![(1, vec![(0, 100)])], "(a)");
+        assert_eq!(a.todo, Vec::<(i64, i64)>::new(), "(a)");
+        // (b) the finer level serves only the coarser one's gap.
+        let b = one(
+            vec![
+                (1, vec![run(1, 0, 40), run(1, 60, 100)]),
+                (0, vec![run(1, 0, 100)]),
+            ],
+            false,
+        );
+        assert_eq!(
+            b.served,
+            vec![(1, vec![(0, 40), (60, 100)]), (0, vec![(40, 60)])],
+            "(b)"
+        );
+        assert_eq!(b.todo, Vec::<(i64, i64)>::new(), "(b)");
+        // (c) the rest is raw, read as it is.
+        let c = one(
+            vec![(1, vec![run(1, 0, 40)]), (0, vec![run(1, 0, 50)])],
+            false,
+        );
+        assert_eq!(
+            c.served,
+            vec![(1, vec![(0, 40)]), (0, vec![(40, 50)])],
+            "(c)"
+        );
+        assert_eq!(c.todo, vec![(50, 100)], "(c)");
+        assert_eq!(c.read, c.todo, "(c) not overlaid");
+        // (d) overlaid: the raw read widened by the range.
+        let d = one(
+            vec![(1, vec![run(1, 0, 40)]), (0, vec![run(1, 0, 50)])],
+            true,
+        );
+        assert_eq!(d.todo, vec![(50, 100)], "(d)");
+        assert_eq!(d.read, vec![(40, 100)], "(d) overlaid, range 10");
+        // (e) a level on one shard of two covers nothing.
+        let e = level_pieces(
+            &[
+                (1, vec![run(1, 0, 100)]),
+                (0, vec![run(1, 0, 100), run(2, 0, 100)]),
+            ],
+            2,
+            w,
+            10,
+            false,
+        );
+        assert_eq!(e.served, vec![(0, vec![(0, 100)])], "(e)");
+        assert_eq!(e.todo, Vec::<(i64, i64)>::new(), "(e)");
     }
 
     /// **B1d (issue #18 part B): coverage is each shard's union of run
