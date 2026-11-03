@@ -5,6 +5,8 @@
 > that nothing waits for a flush trigger, or that a deduplication window counts pushes, are out of
 > date. Current behaviour: `docs/api.md` §1.0 and `crates/pulsus-write/src/writer/landing.rs`.
 
+> **Stale on the PromQL push.** Since issue #579 part 5, an aggregate over a vector match with `on`, `ignoring`, `group_left` or `group_right` also runs in ClickHouse. Passages below that say only one-to-one matches, or only the shapes they list, are pushed are out of date. Current behaviour: `docs/configuration.md`, `PULSUS_PROMQL_GROUPED_PUSH`.
+
 # PulsusDB ClickHouse Schemas
 
 **Stale on the log body index.** `log_samples` carries two bloom-filter indexes on the body and no `text` index: `idx_body_words`, `tokenbf_v1(32768, 3, 0)` over `upperUTF8(lowerUTF8(body))`, which a `word(…)` filter reads through `hasToken`; and `idx_body_ngrams`, `ngrambf_v1(4, 32768, 3, 0)` over `body`, which `body LIKE` and `match(body, …)` read. A `|~` that turns case-insensitivity on renders `match(identity(body), …)` and reads neither. Passages below that describe a `text` index, `hasAllTokens`, a body with no substring index, or line filters that prune nothing are out of date. Current behaviour: `schema/schema.sql` and `crates/pulsus-read/src/logql/predicate.rs`.
