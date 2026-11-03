@@ -960,6 +960,37 @@ async fn hosts_reading(f: &Fixture, comment: &str, table: &str) -> Vec<String> {
     out
 }
 
+/// Issue #18 part 2c r20: the hosts that ran any statement under
+/// `comment` whose `tables` hold `table`, initial or not. A host reading
+/// its own shard's copy inside the initial query lists the local table
+/// there; a remote shard part lists it in its non-initial row.
+async fn hosts_reading_local(f: &Fixture, comment: &str, table: &str) -> Vec<String> {
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
+    struct H {
+        host: String,
+    }
+    settle_query_log(
+        &[&f.shard1, &f.shard2, &f.shard1b],
+        &format!("log_comment = '{comment}'"),
+        1,
+    )
+    .await;
+    let sql = format!(
+        "SELECT hostname AS host FROM clusterAllReplicas('{CLUSTER_NAME}', system.query_log) \
+         WHERE type = 'QueryFinish' AND log_comment = '{comment}' AND has(tables, '{table}')"
+    );
+    let mut stream = f
+        .shard1
+        .query_stream::<H>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode").host);
+    }
+    out
+}
+
 /// **T63 (issue #18 part 2c): a lagging replica is skipped and shown.**
 /// Shard 1's second replica stops fetching the 60 s level while shard 1
 /// builds once more, until its copy lags 5 s or more. An engine on that
@@ -1062,6 +1093,125 @@ async fn a_lagging_replica_is_skipped_and_shown() {
         "the replica slot does not show {h1b}'s lag: {shown:?}"
     );
     exec(&f.shard1b, &format!("SYSTEM START FETCHES {table}")).await;
+    exec(
+        &f.bootstrap,
+        &format!(
+            "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
+            f.db
+        ),
+    )
+    .await;
+}
+
+/// **T67 (issue #18 part 2c r20): a two-table statement keeps the local
+/// replica.** Shard 1's first replica stops fetching `metric_samples`
+/// while ten more minutes of one of shard 1's series land through its
+/// second replica, until the first replica's copy lags 5 s or more. An
+/// engine on the first replica, push off and the label cache never
+/// refreshed, reads with a label matcher: its sample fetch filters through
+/// the series statement in an `IN` subquery, so it is sent without the lag
+/// guard and reads shard 1's part of `metric_samples` locally, as before
+/// this part.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_two_table_statement_keeps_the_local_replica() {
+    if skipping() {
+        return;
+    }
+    let f = fixture(
+        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t67"),
+        &[("m", 0), ("n", 5000)],
+        true,
+    )
+    .await;
+    // Series `s = 10` of `m`: an even series, in shard 1's slice.
+    let fp = "toUInt128(1010)";
+    let shard = text_on(
+        &f.shard1,
+        &format!(
+            "SELECT toString(any(shardNum())) AS t FROM {}.metric_samples_dist \
+             WHERE fingerprint = {fp}",
+            f.db
+        ),
+    )
+    .await;
+    assert_eq!(shard, "1", "series 10 of m is on shard {shard}");
+    let table = format!("{}.metric_samples", f.db);
+    exec(&f.shard1, &format!("SYSTEM STOP FETCHES {table}")).await;
+    exec(
+        &f.shard1b,
+        &format!(
+            "INSERT INTO {}.metric_landing_dist (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SETTINGS insert_distributed_sync = 1 \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, 'm', {fp}, \
+                    toInt64({}) + toInt64(i) * 15000 + 2000, toFloat64(i) \
+             FROM (SELECT number AS i FROM numbers(40))",
+            f.db, f.hi
+        ),
+    )
+    .await;
+    let delay_sql = format!(
+        "SELECT toString(absolute_delay) AS t FROM system.replicas \
+         WHERE database = '{}' AND table = 'metric_samples'",
+        f.db
+    );
+    let mut lag = 0u64;
+    for _ in 0..60 {
+        lag = text_on(&f.shard1, &delay_sql).await.parse().unwrap_or(0);
+        if lag >= 5 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        lag >= 5,
+        "shard1's metric_samples lags {lag} s after a minute"
+    );
+    let (h1, h1b) = (
+        text_on(&f.shard1, "SELECT hostName() AS t").await,
+        text_on(&f.shard1b, "SELECT hostName() AS t").await,
+    );
+    let comment = format!("{}_t67_{}", f.db, uuid::Uuid::new_v4().simple());
+    let engine = MetricsEngine::new(
+        ChClient::new(shard1_config(&f.db)).await.expect("connect"),
+        cold_cache(&f).await,
+        MetricsConfig {
+            grouped_push: false,
+            max_replica_delay_secs: 5,
+            ..engine_config(&f.db)
+        },
+    )
+    .with_query_log_comment(&comment);
+    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
+    let expr = parse(r#"sum(rate(m{s=~"1.*"}[5m]))"#).expect("parse");
+    let p = MetricQueryParams {
+        start_ms: f.hi - 40 * MIN,
+        end_ms: f.hi,
+        step_ms: MIN,
+    };
+    let (_, _, explain) = engine
+        .query_explained(&tenant, &expr, &p)
+        .await
+        .expect("query");
+    let resolution: Vec<String> = explain
+        .stages
+        .iter()
+        .filter(|s| s.name == "series_resolution")
+        .map(|s| s.sql.clone())
+        .collect();
+    assert!(
+        !resolution.is_empty() && resolution.iter().all(|s| !s.starts_with("label cache:")),
+        "the series resolve by SQL: {resolution:?}"
+    );
+    let hosts = hosts_reading_local(&f, &comment, &table).await;
+    exec(&f.shard1, &format!("SYSTEM START FETCHES {table}")).await;
+    assert!(
+        hosts.contains(&h1),
+        "the local replica {h1} read no {table}: {hosts:?}"
+    );
+    assert!(
+        !hosts.contains(&h1b),
+        "the second replica {h1b} read {table}: {hosts:?}"
+    );
     exec(
         &f.bootstrap,
         &format!(

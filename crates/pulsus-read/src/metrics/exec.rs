@@ -6218,9 +6218,11 @@ mod tests {
         assert_eq!(got[2], vec![run(40, 70)], "the third side reads its own");
     }
 
-    /// **U2 (issue #18 part 2c): every PromQL read carries the lag guard**,
-    /// clustered or not: the configured delay, stale replicas as the last
-    /// resort, and the local copy preferred.
+    /// **U2 (issue #18 part 2c): every PromQL settings builder carries the
+    /// lag guard**, clustered or not: the configured delay, stale replicas
+    /// as the last resort, and the local copy preferred. The dispatcher
+    /// takes it off a statement that is not one-table (U8). The label
+    /// cache's sweep carries none of it (r20).
     #[test]
     fn every_promql_read_carries_the_lag_guard() {
         use ExemplarStatement::{Count, Rows, Series, Thinned};
@@ -6233,10 +6235,6 @@ mod tests {
                 (
                     "series_read_settings".to_string(),
                     series_read_settings(TEST_READ_MEM, distributed, false, 7),
-                ),
-                (
-                    "sweep_settings".to_string(),
-                    crate::metrics::refresh::sweep_settings(TEST_READ_MEM, false, 7),
                 ),
             ];
             for st in [Count, Rows, Thinned, Series] {
@@ -6258,6 +6256,16 @@ mod tests {
                     );
                 }
             }
+        }
+        // Issue #18 part 2c r20: the sweep nests one table inside another,
+        // so it is sent with none of the three, as before this part.
+        let sweep = crate::metrics::refresh::sweep_settings(TEST_READ_MEM, false, 7);
+        for name in [
+            "max_replica_delay_for_distributed_queries",
+            "fallback_to_stale_replicas_for_distributed_queries",
+            "prefer_localhost_replica",
+        ] {
+            assert_eq!(sweep.get(name), None, "sweep_settings: {name}");
         }
     }
 

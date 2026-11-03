@@ -218,6 +218,13 @@ impl QuerySettings {
         self
     }
 
+    /// Issue #18 part 2c: the set without `key`, whether it was set or
+    /// not.
+    pub fn without(mut self, key: &str) -> Self {
+        self.0.retain(|(k, _)| k != key);
+        self
+    }
+
     /// The value of one setting, if present. Introspection only (tests /
     /// gate assertions); the client applies settings via
     /// [`Self::apply_to_query`], not through this accessor.
