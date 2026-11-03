@@ -2826,18 +2826,6 @@ mod tests {
             &[],
             NodeDecline::NameGrouping,
         );
-        // D5: a level coarser than the finest, either side, either shape.
-        let coarse = level_arm(1, 720_000);
-        assert_part4_declines(
-            &["sum(rate(rx[1h]))", "sum(rate(rx[1h]) + rate(tx[1h]))"],
-            &[(0, coarse.clone())],
-            NodeDecline::CoarseLevel,
-        );
-        assert_part4_declines(
-            &["sum(rate(rx[1h]) + rate(tx[1h]))"],
-            &[(1, coarse)],
-            NodeDecline::CoarseLevel,
-        );
         // D6.
         assert_part4_declines(
             &[
@@ -2886,6 +2874,29 @@ mod tests {
             &[(0, fine.clone()), (1, fine.clone())],
         );
         assert_eq!((j.lhs.arm, j.rhs.arm), (fine.clone(), fine));
+    }
+
+    /// **U1 (issue #18 part 2a): every arm is pushable** — a 720 s level
+    /// on either side of either shape, and a 60 s level that is not the
+    /// finest, are pushed and carried on the shape.
+    #[test]
+    fn every_arm_is_pushable() {
+        for arm in [level_arm(1, 720_000), level_arm(1, 60_000)] {
+            match verdict_of_query("sum(rate(rx[1h]))", &[(0, arm.clone())]).map(|n| n.kind) {
+                Ok(PushKind::Range(r)) => assert_eq!(r.arm, arm, "shape A"),
+                other => panic!("sum(rate(rx[1h])) under {arm:?}: {other:?}"),
+            }
+            for side in [0, 1] {
+                let q = "sum(rate(rx[1h]) + rate(tx[1h]))";
+                match verdict_of_query(q, &[(side, arm.clone())]).map(|n| n.kind) {
+                    Ok(PushKind::Join(j)) => {
+                        let carried = if side == 0 { j.lhs.arm } else { j.rhs.arm };
+                        assert_eq!(carried, arm, "{q}, side {side}");
+                    }
+                    other => panic!("{q} under {arm:?} on side {side}: {other:?}"),
+                }
+            }
+        }
     }
 
     /// A small seeded generator, so T9's cases are the same every run.

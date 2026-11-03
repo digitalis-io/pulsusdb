@@ -557,8 +557,12 @@ pub struct MetricsEngine {
 }
 
 /// TEST SEAM (issue #579 part 4): one selector's S1 run rows, edited.
+/// Issue #18 part 2a: the second argument is the level's index; a side
+/// reads one S1 per level from its route's down to the finest.
 pub type CoverageHook = std::sync::Arc<
-    dyn Fn(SelectorId, Vec<super::rollup::RunRow>) -> Vec<super::rollup::RunRow> + Send + Sync,
+    dyn Fn(SelectorId, usize, Vec<super::rollup::RunRow>) -> Vec<super::rollup::RunRow>
+        + Send
+        + Sync,
 >;
 
 /// TEST SEAM (issue #18 part B): a level fetch's answer by its statement
@@ -2498,7 +2502,7 @@ impl MetricsEngine {
         }
         let mut runs: Vec<super::rollup::RunRow> = self.fetch_series_rows(sql).await?;
         if let Some(hook) = &self.coverage_hook {
-            runs = hook(selector_id, runs);
+            runs = hook(selector_id, route.level, runs);
         }
         let covered = coverage(&runs, levels.shards);
         let todo = subtract(&[window], &covered);
@@ -2596,6 +2600,9 @@ impl MetricsEngine {
                         served: &level.served,
                         read: &level.read,
                         raw_steps: &[],
+                        levels: &[],
+                        todo: &[],
+                        overlaid: true,
                     },
                 );
                 e.push("pushed_level_rows", sql.clone(), None);
@@ -2669,6 +2676,9 @@ impl MetricsEngine {
                             served,
                             read,
                             raw_steps: steps,
+                            levels: &[],
+                            todo: &[],
+                            overlaid: true,
                         },
                     ),
                 })
