@@ -3229,4 +3229,34 @@ mod tests {
             Labels::new([("i".to_string(), "x".to_string())])
         );
     }
+
+    /// **U4b (issue #579 part 5, review r1): the evaluator keys an output
+    /// identity by the reference's key** — the key `emit_pair` stores for
+    /// a `group_left` pair is U4's for the same labels and name.
+    #[test]
+    fn the_evaluator_stores_the_references_identity_key() {
+        let matching = on(&["instance"]);
+        let include: Vec<String> = Vec::new();
+        let ctx = PairCtx {
+            op: BinOp::Gt,
+            bool_modifier: false,
+            matching: &matching,
+            include: Some(&include),
+            swapped: false,
+        };
+        let mut state = MatchState {
+            one_to_one_matched: HashSet::new(),
+            many_matched: HashMap::new(),
+            out: Vec::new(),
+        };
+        let ls = named_sample("q_one_total", &[("device", "d0"), ("instance", "i0")], 2.0);
+        let rs = named_sample("q_peer_total", &[("instance", "i0")], 1.0);
+        let key = matching_key(&ls.labels, &ls.metric_name, &matching);
+        emit_pair(&ctx, &mut state, &ls, &rs, &key, 0, &mut Annotations::new()).expect("one pair");
+        assert_eq!(
+            state.many_matched.get(&key),
+            Some(&HashSet::from([10_862_058_126_096_718_055u64])),
+            "the stored key is the reference's for {{device=\"d0\", instance=\"i0\"}} named q_one_total"
+        );
+    }
 }

@@ -1472,3 +1472,67 @@ ORDER BY gid, gi
       )
     )
     ARRAY JOIN if(bad, [(CAST([('', 'match')], 'Array(Tuple(String, String))'), toUInt64(0), nan)], if(length(one) = 1, arrayMap(x -> (CAST([], 'Array(Tuple(String, String))'), x.1, toFloat64(x.2 >= one[1].2)), arrayFilter(x -> 1, many)), CAST([], 'Array(Tuple(Array(Tuple(String, String)), UInt64, Float64))'))) AS o
+-- golden[S3c (f) sum (rate * on (instance) group_left (__name__) rate)]
+    SELECT o.1 AS gid, o.2 AS rank, gi, o.3 AS v
+    FROM (
+      SELECT gi, sig, many, one, any_many, (length(one) >= 2 AND any_many = 1) OR (length(one) = 1 AND length(arrayDistinct(arrayMap(x -> xxHash64(arrayStringConcat(arrayMap(k -> concat(if(length(k.1) < 255, concat(char(length(k.1)), k.1), concat(char(255), char(length(k.1) % 256), char(intDiv(length(k.1), 256) % 256), char(intDiv(length(k.1), 65536) % 256), k.1)), if(length(k.2) < 255, concat(char(length(k.2)), k.2), concat(char(255), char(length(k.2) % 256), char(intDiv(length(k.2), 256) % 256), char(intDiv(length(k.2), 65536) % 256), k.2))), arraySort(arrayConcat(arrayFilter(k -> k.2 != '', arrayFilter(k -> k.1 NOT IN ('__type__', '__unit__'), x.3)), [('__name__', 'p_tx_total')]))))), many))) < length(many)) AS bad
+      FROM (
+        SELECT sig, gi, many, one, max(notEmpty(many)) OVER (PARTITION BY gi) AS any_many
+        FROM (
+          SELECT sig, gi,
+            groupArrayIf((rank, v, kv), side = 0) AS many,
+            groupArrayIf((rank, v, kv), side = 1) AS one
+          FROM (
+            SELECT toUInt8(0) AS side, s.gi AS gi, m.rank AS rank, s.v AS v, m.kv AS kv, arrayFilter(k -> k.1 IN ('instance'), m.kv) AS sig
+            FROM (
+{SERIES_STEPS(M)}
+            ) AS s
+            INNER JOIN (
+{MEMBERS(M)}
+            ) AS m USING (fingerprint)
+            UNION ALL
+            SELECT toUInt8(1) AS side, s.gi AS gi, m.rank AS rank, s.v AS v, m.kv AS kv, arrayFilter(k -> k.1 IN ('instance'), m.kv) AS sig
+            FROM (
+{SERIES_STEPS(O)}
+            ) AS s
+            INNER JOIN (
+{MEMBERS(O)}
+            ) AS m USING (fingerprint)
+          )
+          GROUP BY sig, gi
+        )
+      )
+    )
+    ARRAY JOIN if(bad, [(CAST([('', 'match')], 'Array(Tuple(String, String))'), toUInt64(0), nan)], if(length(one) = 1, arrayMap(x -> (CAST([], 'Array(Tuple(String, String))'), x.1, x.2 * one[1].2), arrayFilter(x -> 1, many)), CAST([], 'Array(Tuple(Array(Tuple(String, String)), UInt64, Float64))'))) AS o
+-- golden[S3c (g) sum (rate * on (instance) group_right (__name__) rate)]
+    SELECT o.1 AS gid, o.2 AS rank, gi, o.3 AS v
+    FROM (
+      SELECT gi, sig, many, one, any_many, (length(one) >= 2 AND any_many = 1) OR (length(one) = 1 AND length(arrayDistinct(arrayMap(x -> xxHash64(arrayStringConcat(arrayMap(k -> concat(if(length(k.1) < 255, concat(char(length(k.1)), k.1), concat(char(255), char(length(k.1) % 256), char(intDiv(length(k.1), 256) % 256), char(intDiv(length(k.1), 65536) % 256), k.1)), if(length(k.2) < 255, concat(char(length(k.2)), k.2), concat(char(255), char(length(k.2) % 256), char(intDiv(length(k.2), 256) % 256), char(intDiv(length(k.2), 65536) % 256), k.2))), arraySort(arrayConcat(arrayFilter(k -> k.2 != '', arrayFilter(k -> k.1 NOT IN ('__type__', '__unit__'), x.3)), [('__name__', 'p_rx_total')]))))), many))) < length(many)) AS bad
+      FROM (
+        SELECT sig, gi, many, one, max(notEmpty(many)) OVER (PARTITION BY gi) AS any_many
+        FROM (
+          SELECT sig, gi,
+            groupArrayIf((rank, v, kv), side = 0) AS many,
+            groupArrayIf((rank, v, kv), side = 1) AS one
+          FROM (
+            SELECT toUInt8(0) AS side, s.gi AS gi, m.rank AS rank, s.v AS v, m.kv AS kv, arrayFilter(k -> k.1 IN ('instance'), m.kv) AS sig
+            FROM (
+{SERIES_STEPS(M)}
+            ) AS s
+            INNER JOIN (
+{MEMBERS(M)}
+            ) AS m USING (fingerprint)
+            UNION ALL
+            SELECT toUInt8(1) AS side, s.gi AS gi, m.rank AS rank, s.v AS v, m.kv AS kv, arrayFilter(k -> k.1 IN ('instance'), m.kv) AS sig
+            FROM (
+{SERIES_STEPS(O)}
+            ) AS s
+            INNER JOIN (
+{MEMBERS(O)}
+            ) AS m USING (fingerprint)
+          )
+          GROUP BY sig, gi
+        )
+      )
+    )
+    ARRAY JOIN if(bad, [(CAST([('', 'match')], 'Array(Tuple(String, String))'), toUInt64(0), nan)], if(length(one) = 1, arrayMap(x -> (CAST([], 'Array(Tuple(String, String))'), x.1, one[1].2 * x.2), arrayFilter(x -> 1, many)), CAST([], 'Array(Tuple(Array(Tuple(String, String)), UInt64, Float64))'))) AS o

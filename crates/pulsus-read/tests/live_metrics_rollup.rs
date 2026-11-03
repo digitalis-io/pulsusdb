@@ -86,6 +86,7 @@ static DB_Q13: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read
 static DB_Q14: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_q14");
 static DB_Q15: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_q15");
 static DB_Q16: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_q16");
+static DB_Q18: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_q18");
 
 /// The default levels and their switch points: 60 s first, the resolution
 /// from 3 h; a shorter range reads raw (owner, 2026-10-31).
@@ -5294,4 +5295,31 @@ async fn a_match_side_behind_its_coverage_falls_back_unexplained() {
     }
     built.finish().await;
     assert!(failures.is_empty(), "T16:\n{}", failures.join("\n"));
+}
+
+/// **T18 (issue #579 part 5, review r1): a match whose only include label
+/// is `__name__` answers as in process**, under `group_left` and
+/// `group_right`, arithmetic and comparison.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_name_only_include_answers_as_in_process() {
+    skip_unless_live!();
+    let end = p_end();
+    let built = corpus_pq(DB_Q18.name(), end).await;
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(true, None).await;
+    let v = range(end - 6 * HOUR, end, MIN);
+    let mut failures = Vec::new();
+    for b in [
+        "rate(q_many_total[5m]) * on (instance) group_left (__name__) rate(q_one_total[5m])",
+        "rate(q_one_total[5m]) * on (instance) group_right (__name__) rate(q_many_total[5m])",
+        "rate(q_many_total[5m]) < on (instance) group_left (__name__) rate(q_one_total[5m])",
+        "rate(q_one_total[5m]) > on (instance) group_right (__name__) rate(q_many_total[5m])",
+    ] {
+        for g in ["", "by (instance) ", "without (device) "] {
+            let q = format!("sum {g}({b})");
+            failures.extend(pushed_against_in_process(&on, &off, &q, &v).await.2);
+        }
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T18:\n{}", failures.join("\n"));
 }

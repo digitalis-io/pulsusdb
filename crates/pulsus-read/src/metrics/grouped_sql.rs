@@ -2243,6 +2243,25 @@ mod tests {
                     Group::Left(strs(&["__name__", "role"])),
                 ),
             ),
+            // Review r1, finding 1: `__name__` the only include label.
+            (
+                "S3c (f) sum (rate * on (instance) group_left (__name__) rate)",
+                (&rx, &tx, &rx, &tx),
+                None,
+                RangeAggOp::Sum,
+                BinOp::Mul,
+                false,
+                on(&["instance"], Group::Left(strs(&["__name__"]))),
+            ),
+            (
+                "S3c (g) sum (rate * on (instance) group_right (__name__) rate)",
+                (&tx, &rx, &rx, &tx),
+                None,
+                RangeAggOp::Sum,
+                BinOp::Mul,
+                false,
+                on(&["instance"], Group::Right(strs(&["__name__"]))),
+            ),
         ];
         for (key, (many, one, lhs, rhs), grouping, op, bin, bool_modifier, spec) in &cases {
             let matched = join_section(key)
