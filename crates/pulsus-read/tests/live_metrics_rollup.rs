@@ -4484,9 +4484,17 @@ async fn a_filled_request_pushes_both_reads() {
                 }
             }
             "(c)" => {
-                if pushed.len() != 1 || !pushed[0].contains("FROM metric_samples_7200s\n") {
+                // The bucket ends' read at 7200 s and, when `end` is not on
+                // a 2-hour bucket end, the newest step's read at 1 h.
+                let level = on_grid(&a, None, 7_200_000);
+                let newest = usize::from(end.rem_euclid(2 * HOUR) != 0);
+                if level.len() != 1
+                    || !level[0].contains("FROM metric_samples_7200s\n")
+                    || on_grid(&a, Some(end), HOUR).len() != newest
+                    || pushed.len() != 1 + newest
+                {
                     failures.push(format!(
-                        "(c): {} pushed statements, want one at 7200 s",
+                        "(c): {} pushed statements, want one at 7200 s and {newest} at 1 h",
                         pushed.len()
                     ));
                 }
