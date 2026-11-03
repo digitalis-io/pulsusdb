@@ -438,7 +438,6 @@ pub struct ReaderConfig {
     /// from 1 s to 3600 s: on a cluster a PromQL read skips a replica whose
     /// copy of a Distributed table lags by this or more
     /// (`max_replica_delay_for_distributed_queries`). Default 5 s.
-    #[serde(skip)]
     pub promql_max_replica_delay: HumanDuration,
     /// Mirrors upstream Prometheus's
     /// `--enable-feature=promql-experimental-functions`: when `true`, the

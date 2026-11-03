@@ -25,7 +25,11 @@ FROM (
         FROM (
 SELECT fingerprint, arrayMap(r -> (r.1, toInt64(720000), r.2, r.3, r.4), rows0) AS es
 FROM (
-SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0 FROM (SELECT fingerprint, t_end, t_last, last, inc FROM metric_samples_720s WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793314800000) OR (t_end > 1793318400000 AND t_end <= 1793386080000)) AND fingerprint GLOBAL IN (
+SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
+FROM (
+  SELECT fingerprint, t_end, t_last, last, inc
+  FROM metric_samples_720s
+  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793314800000) OR (t_end > 1793318400000 AND t_end <= 1793386080000)) AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -35,12 +39,18 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_rx_total'
   )
-)) GROUP BY fingerprint
+)
+)
+GROUP BY fingerprint
 )
 UNION ALL
 SELECT fingerprint, arrayMap(r -> (r.1, toInt64(60000), r.2, r.3, r.4), rows0) AS es
 FROM (
-SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0 FROM (SELECT fingerprint, t_end, t_last, last, inc FROM metric_samples_60s WHERE kind = 0 AND org_id = '' AND ((t_end > 1793314800000 AND t_end <= 1793318400000) OR (t_end > 1793386080000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
+SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
+FROM (
+  SELECT fingerprint, t_end, t_last, last, inc
+  FROM metric_samples_60s
+  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793314800000 AND t_end <= 1793318400000) OR (t_end > 1793386080000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -50,7 +60,9 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_rx_total'
   )
-)) GROUP BY fingerprint
+)
+)
+GROUP BY fingerprint
 )
 UNION ALL
 SELECT fingerprint, groupArray((unix_milli, toInt64(0), unix_milli, value, 0.)) AS es
@@ -155,7 +167,11 @@ FROM (
         FROM (
 SELECT fingerprint, arrayMap(r -> (r.1, toInt64(60000), r.2, r.3, r.4), rows0) AS es
 FROM (
-SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0 FROM (SELECT fingerprint, t_end, t_last, last, inc FROM metric_samples_60s WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793372400000)) AND fingerprint GLOBAL IN (
+SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
+FROM (
+  SELECT fingerprint, t_end, t_last, last, inc
+  FROM metric_samples_60s
+  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793372400000)) AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -165,12 +181,18 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_rx_total'
   )
-)) GROUP BY fingerprint
+)
+)
+GROUP BY fingerprint
 )
 UNION ALL
 SELECT fingerprint, arrayMap(r -> (r.1, toInt64(5000), r.2, r.3, r.4), rows0) AS es
 FROM (
-SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0 FROM (SELECT fingerprint, t_end, t_last, last, inc FROM metric_samples_5s WHERE kind = 0 AND org_id = '' AND t_end > 1793372400000 AND t_end <= 1793386200000 AND fingerprint GLOBAL IN (
+SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
+FROM (
+  SELECT fingerprint, t_end, t_last, last, inc
+  FROM metric_samples_5s
+  WHERE kind = 0 AND org_id = '' AND t_end > 1793372400000 AND t_end <= 1793386200000 AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -180,7 +202,9 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_rx_total'
   )
-)) GROUP BY fingerprint
+)
+)
+GROUP BY fingerprint
 )
         )
         GROUP BY fingerprint
@@ -243,7 +267,11 @@ FROM (
         FROM (
 SELECT fingerprint, arrayMap(r -> (r.1, toInt64(60000), r.2, r.3, r.4), rows0) AS es
 FROM (
-SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0 FROM (SELECT fingerprint, t_end, t_last, last, inc FROM metric_samples_60s WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
+SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
+FROM (
+  SELECT fingerprint, t_end, t_last, last, inc
+  FROM metric_samples_60s
+  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -253,7 +281,9 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_rx_total'
   )
-)) GROUP BY fingerprint
+)
+)
+GROUP BY fingerprint
 )
         )
         GROUP BY fingerprint
@@ -355,7 +385,11 @@ FROM (
         FROM (
 SELECT fingerprint, arrayMap(r -> (r.1, toInt64(60000), r.2, r.3, r.4), rows0) AS es
 FROM (
-SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0 FROM (SELECT fingerprint, t_end, t_last, last, inc FROM metric_samples_60s WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
+SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
+FROM (
+  SELECT fingerprint, t_end, t_last, last, inc
+  FROM metric_samples_60s
+  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -365,7 +399,9 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_rx_total'
   )
-)) GROUP BY fingerprint
+)
+)
+GROUP BY fingerprint
 )
         )
         GROUP BY fingerprint
@@ -524,7 +560,11 @@ FROM (
         FROM (
 SELECT fingerprint, arrayMap(r -> (r.1, toInt64(60000), r.2, r.3, r.4), rows0) AS es
 FROM (
-SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0 FROM (SELECT fingerprint, t_end, t_last, last, inc FROM metric_samples_60s WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
+SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
+FROM (
+  SELECT fingerprint, t_end, t_last, last, inc
+  FROM metric_samples_60s
+  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -534,7 +574,9 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_tx_total'
   )
-)) GROUP BY fingerprint
+)
+)
+GROUP BY fingerprint
 )
         )
         GROUP BY fingerprint
@@ -687,7 +729,11 @@ FROM (
         FROM (
 SELECT fingerprint, arrayMap(r -> (r.1, toInt64(60000), r.2, r.3, r.4), rows0) AS es
 FROM (
-SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0 FROM (SELECT fingerprint, t_end, t_last, last, inc FROM metric_samples_60s WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
+SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
+FROM (
+  SELECT fingerprint, t_end, t_last, last, inc
+  FROM metric_samples_60s
+  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -697,7 +743,9 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_rx_total'
   )
-)) GROUP BY fingerprint
+)
+)
+GROUP BY fingerprint
 )
         )
         GROUP BY fingerprint
@@ -956,12 +1004,24 @@ FROM (
         FROM (
 SELECT fingerprint, arrayMap(r -> (r.1, toInt64(720000), r.2, r.3, r.4), rows0) AS es
 FROM (
-SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0 FROM (SELECT fingerprint, t_end, t_last, last, inc FROM metric_samples_720s WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793314800000) OR (t_end > 1793318400000 AND t_end <= 1793386080000)) AND fingerprint IN ('101', '205')) GROUP BY fingerprint
+SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
+FROM (
+  SELECT fingerprint, t_end, t_last, last, inc
+  FROM metric_samples_720s
+  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793314800000) OR (t_end > 1793318400000 AND t_end <= 1793386080000)) AND fingerprint IN ('101', '205')
+)
+GROUP BY fingerprint
 )
 UNION ALL
 SELECT fingerprint, arrayMap(r -> (r.1, toInt64(60000), r.2, r.3, r.4), rows0) AS es
 FROM (
-SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0 FROM (SELECT fingerprint, t_end, t_last, last, inc FROM metric_samples_60s WHERE kind = 0 AND org_id = '' AND ((t_end > 1793314800000 AND t_end <= 1793318400000) OR (t_end > 1793386080000 AND t_end <= 1793386200000)) AND fingerprint IN ('101', '205')) GROUP BY fingerprint
+SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
+FROM (
+  SELECT fingerprint, t_end, t_last, last, inc
+  FROM metric_samples_60s
+  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793314800000 AND t_end <= 1793318400000) OR (t_end > 1793386080000 AND t_end <= 1793386200000)) AND fingerprint IN ('101', '205')
+)
+GROUP BY fingerprint
 )
 UNION ALL
 SELECT fingerprint, groupArray((unix_milli, toInt64(0), unix_milli, value, 0.)) AS es

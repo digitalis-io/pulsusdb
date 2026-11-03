@@ -97,6 +97,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_TRACEQL_TAG_LOOKBACK",
     "PULSUS_LOGQL_READ_MAX_MEMORY_BYTES",
     "PULSUS_PROMQL_READ_MAX_MEMORY_BYTES",
+    "PULSUS_PROMQL_MAX_REPLICA_DELAY",
     "PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES",
     "PULSUS_QUERY_EVAL_CONCURRENCY",
     "PULSUS_TAIL_POLL_INTERVAL",
@@ -421,6 +422,11 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("PULSUS_PROMQL_LOOKBACK") {
         cfg.reader.promql_lookback = parse_dur("PULSUS_PROMQL_LOOKBACK", &v)?;
+    }
+    // Issue #18 part 2c: whole seconds from 1 s to 3600 s, `validate`'s
+    // rule, so the YAML key and the variable get the same one.
+    if let Some(v) = read("PULSUS_PROMQL_MAX_REPLICA_DELAY") {
+        cfg.reader.promql_max_replica_delay = parse_dur("PULSUS_PROMQL_MAX_REPLICA_DELAY", &v)?;
     }
     if let Some(v) = read("PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS") {
         cfg.reader.promql_experimental_functions =

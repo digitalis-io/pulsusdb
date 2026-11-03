@@ -137,7 +137,18 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// table}` and `pulsus_clickhouse_replica_seen{host, table}`, `seen` 0 for
 /// a pair seen before and missing from the latest read, its delay left at
 /// its last value.
-pub(crate) fn record_replica_metrics(_slot: &pulsus_read::metrics::rollup::LevelSlot) {}
+pub(crate) fn record_replica_metrics(slot: &pulsus_read::metrics::rollup::LevelSlot) {
+    for (host, table, delay, seen) in slot.replica_gauges() {
+        metrics::gauge!(
+            "pulsus_clickhouse_replica_delay_seconds",
+            "host" => host.clone(),
+            "table" => table.clone()
+        )
+        .set(delay as f64);
+        metrics::gauge!("pulsus_clickhouse_replica_seen", "host" => host, "table" => table)
+            .set(if seen { 1.0 } else { 0.0 });
+    }
+}
 
 /// The trace fetch's missing-resource counter (issue #587).
 ///

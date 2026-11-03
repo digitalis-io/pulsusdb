@@ -192,14 +192,19 @@ async fn fetch_rows(cache: &LabelCache, sql: &str) -> Result<Vec<SeriesRow>, ChE
 pub(crate) fn sweep_settings(
     read_max_memory_bytes: u64,
     skip_unavailable_shards: bool,
-    _max_replica_delay_secs: u64,
+    max_replica_delay_secs: u64,
 ) -> QuerySettings {
-    QuerySettings::new()
-        .answer_pins(false, skip_unavailable_shards)
-        .set("max_memory_usage", read_max_memory_bytes)
-        .set("max_bytes_before_external_group_by", 0u64)
-        .set("distributed_product_mode", "local")
-        .set("join_algorithm", "hash")
+    // Issue #18 part 2c: the lag guard every PromQL read carries; the
+    // charts read their series and labels from this sweep.
+    super::exec::lag_guard(
+        QuerySettings::new()
+            .answer_pins(false, skip_unavailable_shards)
+            .set("max_memory_usage", read_max_memory_bytes)
+            .set("max_bytes_before_external_group_by", 0u64)
+            .set("distributed_product_mode", "local")
+            .set("join_algorithm", "hash"),
+        max_replica_delay_secs,
+    )
 }
 
 /// Spawns the recurring refresh task: ticks every `ttl`, running one
