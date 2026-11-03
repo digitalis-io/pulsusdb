@@ -580,15 +580,34 @@ pub struct Pieces {
 }
 
 /// Issue #18 part 2a: today's level loop (`rollup_chunk`) over the S1 rows
-/// of each level `(index, runs)`.
+/// of each level `(index, runs)`: from the route's level down, each level
+/// serves what it covers of what the coarser ones left; the rest is raw,
+/// read widened by the range under 720 s (plan Q12), as it is from 720 s.
 pub fn level_pieces(
-    _runs: &[(usize, Vec<RunRow>)],
-    _shards: u32,
-    _window: (i64, i64),
-    _range_ms: i64,
-    _overlaid: bool,
+    runs: &[(usize, Vec<RunRow>)],
+    shards: u32,
+    window: (i64, i64),
+    range_ms: i64,
+    overlaid: bool,
 ) -> Pieces {
-    Pieces::default()
+    let mut levels: Vec<&(usize, Vec<RunRow>)> = runs.iter().collect();
+    levels.sort_by_key(|(k, _)| std::cmp::Reverse(*k));
+    let mut todo = vec![window];
+    let mut served = Vec::new();
+    for (k, rows) in levels {
+        let covered = coverage(rows, shards);
+        let mine = intersect(&covered, &todo);
+        todo = subtract(&todo, &covered);
+        if !mine.is_empty() {
+            served.push((*k, mine));
+        }
+    }
+    let read = if overlaid {
+        widen(&todo, range_ms, window)
+    } else {
+        todo.clone()
+    };
+    Pieces { served, todo, read }
 }
 
 /// The most intervals one level or raw statement names.

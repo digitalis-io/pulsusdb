@@ -680,23 +680,21 @@ pub type LevelServed<'a> = (&'a str, i64, &'a [(i64, i64)]);
 /// computed them from its coverage statement (S1).
 #[derive(Debug, Clone, Copy)]
 pub struct LevelRead<'a> {
-    pub table: &'a str,
     pub clustered: bool,
     pub shards: u32,
     /// The selector's fetch window `(lo, hi]`: S1's run predicate.
     pub window: (i64, i64),
-    /// The covered part of the window, cut to `(lo, chunk end]`.
-    pub served: &'a [(i64, i64)],
-    /// The raw read around the uncovered part, cut likewise.
-    pub read: &'a [(i64, i64)],
-    /// The chunk's grid indices whose window reaches the uncovered part,
-    /// chunk-relative, `[g0, g1)`.
-    pub raw_steps: &'a [(u32, u32)],
     /// Issue #18 part 2a: each level the side reads, `(table, width ms,
-    /// served)`, from the route's level down.
+    /// served)`, from the route's level down, its served part cut to `(lo,
+    /// chunk end]`; a level that serves nothing is not listed.
     pub levels: &'a [LevelServed<'a>],
     /// Issue #18 part 2a: the window no level covers, cut likewise.
     pub todo: &'a [(i64, i64)],
+    /// The raw read around the uncovered part, cut likewise.
+    pub read: &'a [(i64, i64)],
+    /// The chunk's grid indices whose window reaches the uncovered part,
+    /// chunk-relative, `[g0, g1)`; empty unless `overlaid`.
+    pub raw_steps: &'a [(u32, u32)],
     /// Issue #18 part 2a: the raw samples are read through the overlay
     /// (a route under 720 s), not folded into the counter.
     pub overlaid: bool,
@@ -749,13 +747,17 @@ fn shard_column(clustered: bool) -> &'static str {
 /// `PULSUS_LEVEL_REPLICA_BEHIND`. The level rows are written by the shard
 /// whose slice holds the series, so the series set is read once at the
 /// initiator, `GLOBAL IN`.
-pub fn level_rows(tenant: &Tenant, ids_sql: &str, level: &LevelRead<'_>) -> String {
+pub fn level_rows(
+    tenant: &Tenant,
+    ids_sql: &str,
+    level: &LevelRead<'_>,
+    table: &str,
+    served: &[(i64, i64)],
+) -> String {
     let LevelRead {
-        table,
         clustered,
         shards,
         window,
-        served,
         ..
     } = *level;
     let shard = shard_column(clustered);
@@ -788,28 +790,91 @@ FROM (
     )
 }
 
-/// Issue #579 part 4: a `Level` arm's points (`LEVEL_GATHER`): the counter
-/// today's route folds over the kept level rows (`rollup::counter`, levels
-/// under 720 s) — started at the first row with a sample and a number,
-/// each later row adding its increase — one `(t_last, c)` point a row, a
-/// NaN row's own value, no point for a row with no sample, stale markers
-/// dropped. `chk` reaches `rows` so the check is evaluated; the groups
-/// with no point, the marker's among them, are removed last.
-pub fn level_gather(tenant: &Tenant, ids_sql: &str, level: &LevelRead<'_>) -> String {
-    let rows = level_rows(tenant, ids_sql, level);
+/// Issue #18 part 2a: `COUNTER_GATHER`'s elements — one block per level,
+/// its `LEVEL_ROWS` rows as `(t_end, width, t_last, last, inc)`, and, from
+/// 720 s, the raw samples no level covers as `(t, 0, t, v, 0.)`. `chk`
+/// reaches each level's elements, so its check is evaluated.
+fn counter_elements(
+    tenant: &Tenant,
+    samples_table: &str,
+    ids_sql: &str,
+    level: &LevelRead<'_>,
+) -> Vec<String> {
+    let mut out: Vec<String> = level
+        .levels
+        .iter()
+        .map(|&(table, res_ms, served)| {
+            format!(
+                "SELECT fingerprint, arrayMap(r -> (r.1, toInt64({res_ms}), r.2, r.3, r.4), arrayResize(rows0, length(rows0) + chk)) AS es
+FROM (
+{}
+)",
+                level_rows(tenant, ids_sql, level, table, served)
+            )
+        })
+        .collect();
+    if !level.overlaid && !level.todo.is_empty() {
+        out.push(format!(
+            "SELECT fingerprint, groupArray((unix_milli, toInt64(0), unix_milli, value, 0.)) AS es
+FROM {samples_table}
+WHERE org_id = {} AND {} AND fingerprint IN (
+{ids_sql}
+)
+  AND reinterpretAsUInt64(value) != {STALE_NAN_DECIMAL}
+GROUP BY fingerprint",
+            tenant.sql_literal(),
+            sample_sql::intervals_predicate("unix_milli", "unix_milli", "<=", level.todo),
+        ));
+    }
+    out
+}
+
+/// Issue #18 part 2a: `COUNTER_GATHER` — a `Level` arm's points: one
+/// counter (`rollup::counter`) folded over the rows of every level the side
+/// reads and, from 720 s, the raw samples no level covers, each series'
+/// elements in time order. A level row adds its increase; a raw sample its
+/// step from the last value, or itself on a drop; the first row or sample
+/// with a number starts the counter. From 720 s a level row also gives a
+/// start point. Each point carries its element's position and a sub-order
+/// (the start point first), so points at one time keep the fold's order.
+/// Stale markers are dropped and the groups with no point removed last.
+pub fn counter_gather(
+    tenant: &Tenant,
+    samples_table: &str,
+    ids_sql: &str,
+    level: &LevelRead<'_>,
+) -> String {
+    let elements = counter_elements(tenant, samples_table, ids_sql, level).join("\nUNION ALL\n");
     format!(
         "SELECT fingerprint, arm, raw FROM (
 SELECT fingerprint, toUInt8(0) AS arm,
-  arrayFilter(p -> p.1 > 0 AND p.2 != {STALE_NAN_DECIMAL}, arrayMap((r, c) -> if(r.2 = 0, (toInt64(0), toUInt64(0)),
-      (r.2, reinterpretAsUInt64(if(isNaN(r.3), r.3, c)))), rows, cs)) AS raw
+  arrayMap(q -> (q.1, q.4), arraySort(arrayFilter(q -> q.4 != {STALE_NAN_DECIMAL}, arrayFlatten(arrayMap((x, i, c) ->
+    if(s = 0 OR i < s,
+       if(isNaN(x.4) AND (x.2 = 0 OR x.3 > 0), [(x.3, i, 1, reinterpretAsUInt64(x.4))], []),
+       multiIf(x.2 > 0 AND x.3 = 0, CAST([], 'Array(Tuple(Int64, UInt64, UInt8, UInt64))'),
+               isNaN(x.4), [(x.3, i, 1, reinterpretAsUInt64(x.4))],
+               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(c - x.5)), (x.3, i, 1, reinterpretAsUInt64(c))],
+               [(x.3, i, 1, reinterpretAsUInt64(c))])),
+    e, arrayEnumerate(e), cs))))) AS raw
 FROM (
-  SELECT fingerprint, arrayResize(rows0, length(rows0) + chk) AS rows,
-    arrayFirstIndex(r -> r.2 > 0 AND NOT isNaN(r.3), rows) AS s,
-    arrayConcat(arrayWithConstant(toUInt64(if(s = 0, length(rows), s - 1)), 0.),
+  SELECT fingerprint, e, s,
+    arrayConcat(arrayWithConstant(toUInt64(if(s = 0, length(e), s - 1)), 0.),
                 if(s = 0, CAST([], 'Array(Float64)'),
-                   arrayCumSum(arrayMap((r, i) -> if(i = 1, r.3, r.4), arraySlice(rows, s), arrayEnumerate(arraySlice(rows, s)))))) AS cs
+                   arrayCumSum(arrayMap((x, d, i) -> if(i = 1, x.4, d), arraySlice(e, s), arraySlice(ds, s), arrayEnumerate(arraySlice(e, s)))))) AS cs
   FROM (
-{rows}
+    SELECT fingerprint, e, s,
+      arrayMap((x, pb) -> if(x.2 > 0, x.5, if(isNaN(x.4), 0., if(x.4 >= pb, x.4 - pb, x.4))), e,
+               arrayPushFront(arrayPopBack(arrayFill((v, ok) -> ok, arrayMap(x -> x.4, e), sp)), nan)) AS ds
+    FROM (
+      SELECT fingerprint, e, arrayMap(x -> (x.2 = 0 OR x.3 > 0) AND NOT isNaN(x.4), e) AS sp, arrayFirstIndex(b -> b, sp) AS s
+      FROM (
+        SELECT fingerprint, arraySort(x -> (x.1, x.2, reinterpretAsUInt64(x.4), x.3, x.5), arrayFlatten(groupArray(es))) AS e
+        FROM (
+{elements}
+        )
+        GROUP BY fingerprint
+      )
+    )
   )
 )
 )
@@ -817,28 +882,22 @@ WHERE notEmpty(raw)"
     )
 }
 
-/// Issue #18 part 2a: `COUNTER_GATHER` — a `Level` arm's points: one
-/// counter folded over the rows of every level the side reads and, from
-/// 720 s, the raw samples no level covers.
-pub fn counter_gather(
-    _tenant: &Tenant,
-    _samples_table: &str,
-    _ids_sql: &str,
-    _level: &LevelRead<'_>,
-) -> String {
-    String::new()
-}
-
 /// Issue #579 part 4: S4, explain only — whether a `Level` side read any
 /// level row, today's `served_from_level` for a counter; `sum(chk)` makes
-/// the check run on every row.
+/// the check run on every row. Issue #18 part 2a: over the `LEVEL_ROWS` of
+/// every level the side reads.
 pub fn level_served(tenant: &Tenant, ids_sql: &str, level: &LevelRead<'_>) -> String {
+    let rows = level
+        .levels
+        .iter()
+        .map(|&(table, _, served)| level_rows(tenant, ids_sql, level, table, served))
+        .collect::<Vec<_>>()
+        .join("\nUNION ALL\n");
     format!(
         "SELECT toUInt8(countIf(fingerprint != 0 AND notEmpty(rows0)) > 0) AS served, sum(chk) AS checked
 FROM (
-{}
-)",
-        level_rows(tenant, ids_sql, level)
+{rows}
+)"
     )
 }
 
@@ -874,17 +933,33 @@ pub fn series_steps(side: &SideSql<'_>, grid: Grid) -> String {
     let range = side.range_ms.to_string();
     let (gather, steps) = match &side.level {
         Some(level) => {
-            let mut gather = level_gather(side.tenant, side.ids_sql, level);
-            if !level.read.is_empty() {
-                gather.push_str("\nUNION ALL\n");
-                gather.push_str(&raw_gather_within(
+            // Issue #18 part 2a: under 720 s the raw samples stay in part 4's
+            // raw arm. A chunk in which no level serves and the counter
+            // takes no raw sample reads the raw arm alone.
+            let counter = !level.levels.is_empty() || (!level.overlaid && !level.todo.is_empty());
+            let mut parts = Vec::new();
+            if counter {
+                parts.push(counter_gather(
+                    side.tenant,
+                    side.samples_table,
+                    side.ids_sql,
+                    level,
+                ));
+            }
+            if !counter || (level.overlaid && !level.read.is_empty()) {
+                parts.push(raw_gather_within(
                     side.tenant,
                     side.samples_table,
                     side.ids_sql,
                     level.read,
                 ));
             }
-            (gather, level.raw_steps.to_vec())
+            let steps = if level.overlaid {
+                level.raw_steps.to_vec()
+            } else {
+                Vec::new()
+            };
+            (parts.join("\nUNION ALL\n"), steps)
         }
         None => {
             let (lo, hi) = range_window(grid, side.range_ms);
@@ -1699,11 +1774,9 @@ mod tests {
     fn t11_level() -> LevelRead<'static> {
         const LEVELS: [LevelServed<'static>; 1] = [("metric_samples_60s", 60_000, &T11_SERVED)];
         LevelRead {
-            table: "metric_samples_60s",
             clustered: false,
             shards: 1,
             window: T11_WINDOW,
-            served: &T11_SERVED,
             read: &T11_READ,
             raw_steps: &T11_STEPS,
             levels: &LEVELS,
@@ -1755,8 +1828,6 @@ mod tests {
             ("metric_samples_60s", 60_000, s60a.as_slice()),
         ];
         let a = LevelRead {
-            table: "",
-            served: &[],
             clustered: false,
             shards: 1,
             window: T11_WINDOW,
