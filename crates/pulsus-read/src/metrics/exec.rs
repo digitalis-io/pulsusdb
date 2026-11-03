@@ -1588,6 +1588,20 @@ impl MetricsEngine {
                          takes the sample fetch",
                     ))
                 }
+                // Part 5, F12: a step of the vector match raises today's
+                // matching error.
+                PushResult::Range { chunks, .. }
+                    if chunks
+                        .iter()
+                        .flat_map(|(_, rows)| rows)
+                        .any(|r| super::grouped::is_match_sentinel(&r.gid)) =>
+                {
+                    Some((
+                        "declined: MatchCardinality",
+                        "issue #579 part 5: a step of the vector match raises today's matching \
+                         error; the node's selectors take today's route",
+                    ))
+                }
                 _ => None,
             };
             let PushResult::Range {
@@ -2721,16 +2735,37 @@ impl MetricsEngine {
                 grid,
                 r.op,
             ),
-            NodeShape::Join(j) => super::grouped_sql::join_aggregate_fetch(
-                &sql_sides[0],
-                &sql_sides[1],
-                &self.config.hist_samples_table,
-                j.grouping.as_ref(),
-                grid,
-                j.op,
-                j.bin,
-                j.bool_modifier,
-            ),
+            NodeShape::Join(j) => match &j.matching {
+                None => super::grouped_sql::join_aggregate_fetch(
+                    &sql_sides[0],
+                    &sql_sides[1],
+                    &self.config.hist_samples_table,
+                    j.grouping.as_ref(),
+                    grid,
+                    j.op,
+                    j.bin,
+                    j.bool_modifier,
+                ),
+                // Part 5: S3c, its sides in (many, one) order.
+                Some(spec) => {
+                    let (many, one) = if matches!(spec.group, pulsus_promql::Group::Right(_)) {
+                        (&sql_sides[1], &sql_sides[0])
+                    } else {
+                        (&sql_sides[0], &sql_sides[1])
+                    };
+                    super::grouped_sql::match_aggregate_fetch(
+                        many,
+                        one,
+                        &self.config.hist_samples_table,
+                        j.grouping.as_ref(),
+                        grid,
+                        j.op,
+                        j.bin,
+                        j.bool_modifier,
+                        spec,
+                    )
+                }
+            },
         }
     }
 

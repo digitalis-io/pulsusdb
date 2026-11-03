@@ -667,13 +667,20 @@ fn verdict_of(
             {
                 return Some(Err(NodeDecline::Operator));
             }
-            if matching.on
-                || !matching.labels.is_empty()
-                || *group != pulsus_promql::Group::OneToOne
-                || *fill != pulsus_promql::FillValues::default()
-            {
+            // Part 5, D7a: `fill` stays in the process.
+            if *fill != pulsus_promql::FillValues::default() {
                 return Some(Err(NodeDecline::Matching));
             }
+            // D7b: the default matching is part 4's S3b; D7c: any other
+            // `on`, `ignoring` or `group_*` is S3c.
+            let match_spec = (matching.on
+                || !matching.labels.is_empty()
+                || *group != pulsus_promql::Group::OneToOne)
+                .then(|| MatchSpec {
+                    on: matching.on,
+                    labels: matching.labels.clone(),
+                    group: group.clone(),
+                });
             let mut grid = None;
             for side in &sides {
                 let Some(g) = range_grid_of(params, side.range_ms) else {
@@ -691,7 +698,7 @@ fn verdict_of(
                 lhs,
                 rhs,
                 grid: grid?,
-                matching: None,
+                matching: match_spec,
             })))
         }
         PlanExpr::OverTime { .. } | PlanExpr::OverTimeParam { .. } => {
@@ -825,8 +832,8 @@ pub fn is_histogram_sentinel(gid: &[(String, String)]) -> bool {
 
 /// Issue #579 part 5: whether a row is S3c's matching sentinel,
 /// [`super::grouped_sql::MATCH_SENTINEL_KEY`].
-pub fn is_match_sentinel(_gid: &[(String, String)]) -> bool {
-    false
+pub fn is_match_sentinel(gid: &[(String, String)]) -> bool {
+    matches!(gid, [(k, v)] if k.is_empty() && v == "match")
 }
 
 /// Issue #579: splits a shape-A node's grid by time so no statement

@@ -1127,27 +1127,194 @@ pub fn level_aggregate_fetch(
 pub const MATCH_SENTINEL_KEY: &str = "CAST([('', 'match')], 'Array(Tuple(String, String))')";
 
 /// Issue #579 part 5: shape C with `on`, `ignoring` or `group_*`, one time
-/// chunk (S3c), its sides in `(many, one)` order.
+/// chunk (S3c), its sides in `(many, one)` order: `(lhs, rhs)`, or `(rhs,
+/// lhs)` under `group_right`. Both sides' step rows are grouped by
+/// `(signature, step)`; a step at which today's evaluator raises a matching
+/// error gives the matching sentinel row instead of its outputs (plan
+/// section 5, E1-E3), and every output drops its empty-valued labels.
 #[allow(clippy::too_many_arguments)]
 pub fn match_aggregate_fetch(
-    _many: &SideSql<'_>,
-    _one: &SideSql<'_>,
-    _hist_samples_table: &str,
-    _grouping: Option<&Grouping>,
-    _grid: Grid,
-    _op: RangeAggOp,
-    _bin: BinOp,
-    _bool_modifier: bool,
-    _spec: &super::grouped::MatchSpec,
+    many: &SideSql<'_>,
+    one: &SideSql<'_>,
+    hist_samples_table: &str,
+    grouping: Option<&Grouping>,
+    grid: Grid,
+    op: RangeAggOp,
+    bin: BinOp,
+    bool_modifier: bool,
+    spec: &super::grouped::MatchSpec,
 ) -> String {
-    String::new()
+    use pulsus_promql::Group;
+    let list = |labels: &[String]| {
+        labels
+            .iter()
+            .map(|l| ch_string(l))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let labels = list(&spec.labels);
+    let sig = |name: &str| {
+        if spec.on && spec.labels.iter().any(|l| l == "__name__") {
+            format!(
+                "arrayConcat(arrayFilter(k -> k.1 IN ({labels}), m.kv), [('__name__', {})])",
+                ch_string(name)
+            )
+        } else if spec.on {
+            format!("arrayFilter(k -> k.1 IN ({labels}), m.kv)")
+        } else {
+            format!("arrayFilter(k -> k.1 NOT IN ({labels}), m.kv)")
+        }
+    };
+    let (right, include) = match &spec.group {
+        Group::OneToOne => (false, None),
+        Group::Left(i) => (false, Some(i)),
+        Group::Right(i) => (true, Some(i)),
+    };
+    let (l, r) = if right {
+        ("one[1].2", "x.2")
+    } else {
+        ("x.2", "one[1].2")
+    };
+    let cmp = match bin {
+        BinOp::Eq => Some("="),
+        BinOp::Ne => Some("!="),
+        BinOp::Gt => Some(">"),
+        BinOp::Lt => Some("<"),
+        BinOp::Ge => Some(">="),
+        BinOp::Le => Some("<="),
+        _ => None,
+    };
+    let (val, keep) = match cmp {
+        None => {
+            let arith = match bin {
+                BinOp::Add => "+",
+                BinOp::Sub => "-",
+                BinOp::Mul => "*",
+                _ => "/",
+            };
+            (format!("{l} {arith} {r}"), "1".to_string())
+        }
+        Some(c) if bool_modifier => (format!("toFloat64({l} {c} {r})"), "1".to_string()),
+        Some(c) => (l.to_string(), format!("{l} {c} {r}")),
+    };
+    let arith = cmp.is_none();
+    let outkv = match include {
+        None if arith => {
+            "arrayFilter(k -> k.1 NOT IN ('__name__', '__type__', '__unit__'), sig)".to_string()
+        }
+        None => "arrayFilter(k -> k.1 != '__name__', sig)".to_string(),
+        Some(i) if i.is_empty() && arith => {
+            "arrayFilter(k -> k.1 NOT IN ('__type__', '__unit__'), x.3)".to_string()
+        }
+        Some(i) if i.is_empty() => "x.3".to_string(),
+        Some(i) => {
+            let inc = i
+                .iter()
+                .filter(|l| *l != "__name__")
+                .map(|l| ch_string(l))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let meta = if arith {
+                ", '__type__', '__unit__'"
+            } else {
+                ""
+            };
+            format!(
+                "arraySort(arrayConcat(arrayFilter(k -> k.1 NOT IN ({inc}{meta}), x.3), \
+                 arrayFilter(k -> k.1 IN ({inc}) AND k.2 != '', one[1].3)))"
+            )
+        }
+    };
+    let outkv = format!("arrayFilter(k -> k.2 != '', {outkv})");
+    let e1 = "(length(one) >= 2 AND any_many = 1)";
+    let bad = match include {
+        None => format!("{e1} OR (length(many) >= 2 AND notEmpty(one))"),
+        Some(i) => {
+            let idname = if i.iter().any(|l| l == "__name__") {
+                format!("[('__name__', {})]", ch_string(one.metric_name))
+            } else if !arith {
+                format!("[('__name__', {})]", ch_string(many.metric_name))
+            } else {
+                "CAST([], 'Array(Tuple(String, String))')".to_string()
+            };
+            let enc = |e: &str| {
+                format!(
+                    "if(length({e}) < 255, concat(char(length({e})), {e}), concat(char(255), \
+                     char(length({e}) % 256), char(intDiv(length({e}), 256) % 256), \
+                     char(intDiv(length({e}), 65536) % 256), {e}))"
+                )
+            };
+            let idkey = format!(
+                "xxHash64(arrayStringConcat(arrayMap(k -> concat({}, {}), arraySort(arrayConcat({outkv}, {idname})))))",
+                enc("k.1"),
+                enc("k.2")
+            );
+            format!(
+                "{e1} OR (length(one) = 1 AND length(arrayDistinct(arrayMap(x -> {idkey}, many))) < length(many))"
+            )
+        }
+    };
+    let gkey = group_key_over(grouping, &outkv);
+    let out = format!(
+        "if(length(one) = 1, arrayMap(x -> ({gkey}, x.1, {val}), arrayFilter(x -> {keep}, many)), \
+         CAST([], 'Array(Tuple(Array(Tuple(String, String)), UInt64, Float64))'))"
+    );
+    let inner = format!(
+        "    SELECT o.1 AS gid, o.2 AS rank, gi, o.3 AS v
+    FROM (
+      SELECT gi, sig, many, one, any_many, {bad} AS bad
+      FROM (
+        SELECT sig, gi, many, one, max(notEmpty(many)) OVER (PARTITION BY gi) AS any_many
+        FROM (
+          SELECT sig, gi,
+            groupArrayIf((rank, v, kv), side = 0) AS many,
+            groupArrayIf((rank, v, kv), side = 1) AS one
+          FROM (
+            SELECT toUInt8(0) AS side, s.gi AS gi, m.rank AS rank, s.v AS v, m.kv AS kv, {} AS sig
+            FROM (
+{}
+            ) AS s
+            INNER JOIN (
+{}
+            ) AS m USING (fingerprint)
+            UNION ALL
+            SELECT toUInt8(1) AS side, s.gi AS gi, m.rank AS rank, s.v AS v, m.kv AS kv, {} AS sig
+            FROM (
+{}
+            ) AS s
+            INNER JOIN (
+{}
+            ) AS m USING (fingerprint)
+          )
+          GROUP BY sig, gi
+        )
+      )
+    )
+    ARRAY JOIN if(bad, [({MATCH_SENTINEL_KEY}, toUInt64(0), nan)], {out}) AS o",
+        sig(many.metric_name),
+        series_steps(many, grid),
+        members(many),
+        sig(one.metric_name),
+        series_steps(one, grid),
+        members(one),
+    );
+    // S3b's histogram condition, its sides in written order.
+    let (lhs, rhs) = if right { (one, many) } else { (many, one) };
+    let sentinel = format!(
+        "org_id = {} AND (({}) OR ({}))",
+        lhs.tenant.sql_literal(),
+        side_histograms(lhs),
+        side_histograms(rhs)
+    );
+    aggregate_over(grid, op, &inner, hist_samples_table, &sentinel)
 }
 
 /// Issue #579 part 4: shape C, one time chunk (S3b): both sides' steps,
 /// their series paired by label set, the operator, and the aggregate over
 /// the left member's rank. Arithmetic drops `__type__`/`__unit__` from the
 /// output labels; a comparison keeps them, filtering on its result or,
-/// under `bool`, answering it.
+/// under `bool`, answering it. Issue #579 part 5: every output drops its
+/// empty-valued labels, as the reference's result builder does.
 #[allow(clippy::too_many_arguments)]
 pub fn join_aggregate_fetch(
     lhs: &SideSql<'_>,
@@ -1178,13 +1345,17 @@ pub fn join_aggregate_fetch(
         None => (
             format!("l.v {arith} r.v"),
             String::new(),
-            "arrayFilter(kv -> kv.1 NOT IN ('__type__', '__unit__'), lm.kv)",
+            "arrayFilter(k -> k.2 != '', arrayFilter(kv -> kv.1 NOT IN ('__type__', '__unit__'), lm.kv))",
         ),
-        Some(c) if bool_modifier => (format!("toFloat64(l.v {c} r.v)"), String::new(), "lm.kv"),
+        Some(c) if bool_modifier => (
+            format!("toFloat64(l.v {c} r.v)"),
+            String::new(),
+            "arrayFilter(k -> k.2 != '', lm.kv)",
+        ),
         Some(c) => (
             "l.v".to_string(),
             format!("\n    WHERE l.v {c} r.v"),
-            "lm.kv",
+            "arrayFilter(k -> k.2 != '', lm.kv)",
         ),
     };
     let inner = format!(

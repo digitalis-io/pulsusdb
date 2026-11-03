@@ -562,30 +562,39 @@ struct PairCtx<'a> {
     swapped: bool,
 }
 
-/// Hashes a value with a fixed-seed deterministic hasher (issue #93,
-/// finding 1). Used ONLY to key the many-to-one **output-identity** dedup
-/// set on a 64-bit hash rather than a per-pair full-`Labels` clone — the
-/// exact analogue of upstream's `insertSig := metric.Hash()` (engine.go @
-/// 40af9c2 L3258), where a 64-bit collision is likewise accepted. The
-/// SIGNATURE-level dedup does NOT use this: it keys on the full
-/// [`MatchKey`] (collision-free), mirroring upstream's collision-free
-/// `sigOrdinal` — see [`MatchState`]. `DefaultHasher::new` is fixed-seed
-/// (not the randomized `RandomState`), so the same identity always hashes
-/// the same within a run; determinism across runs is irrelevant here (each
-/// set lives one `vector_vector` call).
-fn identity_hash<T: std::hash::Hash>(v: &T) -> u64 {
-    use std::hash::Hasher;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    v.hash(&mut h);
-    h.finish()
-}
-
 /// Issue #579 part 5: the reference's 64-bit key of an output identity —
 /// `xxHash64` over each label with a value, `__name__` included when the
 /// name is set, sorted by name, each written as its length and its bytes
 /// (a length under 255 one byte, else `0xFF` and three bytes little-endian).
 pub(crate) fn reference_identity_key(labels: &Labels, metric_name: Option<&str>) -> u64 {
-    identity_hash(&(labels, metric_name))
+    let mut pairs: Vec<(&str, &str)> = labels
+        .0
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    if let Some(name) = metric_name.filter(|n| !n.is_empty()) {
+        pairs.push(("__name__", name));
+    }
+    pairs.sort_unstable();
+    let mut bytes = Vec::new();
+    for (k, v) in pairs {
+        for part in [k, v] {
+            let n = part.len();
+            if n < 255 {
+                bytes.push(n as u8);
+            } else {
+                bytes.extend_from_slice(&[
+                    255,
+                    (n & 255) as u8,
+                    ((n >> 8) & 255) as u8,
+                    ((n >> 16) & 255) as u8,
+                ]);
+            }
+            bytes.extend_from_slice(part.as_bytes());
+        }
+    }
+    xxhash_rust::xxh64::xxh64(&bytes, 0)
 }
 
 /// Match-signature bookkeeping + output accumulator for one
@@ -608,7 +617,7 @@ pub(crate) fn reference_identity_key(labels: &Labels, metric_name: Option<&str>)
 /// So the SIGNATURE dedup keys on the full [`MatchKey`] here (collision-free
 /// equality — our per-call analogue of upstream's per-series `sigOrdinal`),
 /// and ONLY the inner output-identity set uses the 64-bit
-/// [`identity_hash`] (upstream `metric.Hash()`).
+/// [`reference_identity_key`] (upstream `metric.Hash()`).
 ///
 /// **Issue #93 (finding 1 — range-binop allocation reclaim), round-2
 /// correction:** the profiled hotspot was the per-(step × many-side series)
@@ -748,6 +757,10 @@ fn emit_pair(
         }
     }
 
+    // Issue #579 part 5 (B4a): the reference removes an empty-valued
+    // label from every result before its identity and the aggregate.
+    labels.0.retain(|(_, v)| !v.is_empty());
+
     // Duplicate detection — BEFORE the keep filter (upstream registers the
     // signature/identity even for a filtered-out comparison). Issue #93
     // (finding 1) + round-2 review: the SIGNATURE key is the full
@@ -755,7 +768,7 @@ fn emit_pair(
     // the FIRST sight of each distinct signature — never per matched pair,
     // so the per-cell full-`Labels` clone the profile pinned stays gone.
     // The INNER many-to-one output-identity set keeps the 64-bit
-    // [`identity_hash`] (upstream `metric.Hash()`, collision-accepted).
+    // [`reference_identity_key`] (upstream `metric.Hash()`, collision-accepted).
     if one_to_one {
         if state.one_to_one_matched.contains(key) {
             return Err(PromqlError::BadMatching {
