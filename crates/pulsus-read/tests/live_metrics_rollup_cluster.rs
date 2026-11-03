@@ -803,7 +803,7 @@ async fn a_side_behind_its_coverage_falls_back_whole() {
             });
         let hooked = level_engine(&f, &cache, &slot, true, Some(&comment))
             .await
-            .with_coverage_hook(hook);
+            .with_coverage_hook(Arc::clone(&hook));
         let plain = level_engine(&f, &cache, &slot, true, None).await;
         let off = level_engine(&f, &cache, &slot, false, None).await;
         let (x, _, explain) = hooked
@@ -861,6 +861,46 @@ async fn a_side_behind_its_coverage_falls_back_whole() {
             "{what}: without the hook, not pushed: {plain_stages:#?}"
         );
         assert_eq!(cells(&y), cells(&z), "{what}: without the hook");
+
+        // Issue #579 part 5: without explain no S4 is sent, so only the data
+        // statement's own check can raise: the same node, then a C-match.
+        for (q, data_marker) in [
+            ("sum by (s) (rate(m[5m]) + rate(n[5m]))", "WITH "),
+            (
+                "sum by (s) (rate(m[5m]) * on (s) group_left rate(n[5m]))",
+                "CAST([('', 'match')]",
+            ),
+        ] {
+            let comment = format!(
+                "{}_t10b_quiet_{side}_{shard}_{}",
+                f.db,
+                uuid::Uuid::new_v4().simple()
+            );
+            let quiet = level_engine(&f, &cache, &slot, true, Some(&comment))
+                .await
+                .with_coverage_hook(Arc::clone(&hook));
+            let expr = parse(q).expect("parse");
+            let (x, _) = quiet.query(&tenant, &expr, &p).await.expect("quiet");
+            let (z, _, _) = off.query_explained(&tenant, &expr, &p).await.expect("off");
+            let sent = statements(&f.shard1, &comment).await;
+            let data = sent
+                .iter()
+                .position(|q| q.contains(data_marker) && q.contains("PULSUS_LEVEL_REPLICA_BEHIND"))
+                .unwrap_or_else(|| panic!("{what}, {q}, no explain: no data statement: {sent:#?}"));
+            let fetches = sent[data + 1..]
+                .iter()
+                .filter(|q| q.starts_with("SELECT _shard_num AS shard, kind, fingerprint, t_end"))
+                .count();
+            assert!(
+                fetches >= 2,
+                "{what}, {q}, no explain: {fetches} level fetches after the data statement: {sent:#?}"
+            );
+            assert_eq!(
+                cells(&x),
+                cells(&z),
+                "{what}, {q}, no explain: against push off"
+            );
+        }
     }
     exec(
         &f.bootstrap,
@@ -1096,4 +1136,89 @@ async fn a_filled_node_answers_on_two_shards() {
     )
     .await;
     assert!(failures.is_empty(), "T32:\n{}", failures.join("\n"));
+}
+
+// ------------------------------------------------ issue #579 part 5, T17
+
+/// **T17 (issue #579 part 5): a match node answers on two shards.** T7's
+/// fixture with `m` and `n`: a `group_left` match pushed over both sides'
+/// level reads; a match today's evaluator refuses takes today's route.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_match_node_answers_on_two_shards() {
+    if skipping() {
+        return;
+    }
+    let f = fixture(
+        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t17"),
+        &[("m", 0), ("n", 5000)],
+        false,
+    )
+    .await;
+    build_level(&f).await;
+    let (cache, slot) = warm(&f).await;
+    let on = level_engine(&f, &cache, &slot, true, None).await;
+    let off = level_engine(&f, &cache, &slot, false, None).await;
+    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
+    let p = MetricQueryParams {
+        start_ms: f.mid - 30 * MIN,
+        end_ms: f.hi,
+        step_ms: MIN,
+    };
+    // (i)
+    let expr = parse("sum by (s) (rate(m[5m]) * on (s) group_left rate(n[5m]))").expect("parse");
+    let (a, _, explain) = on.query_explained(&tenant, &expr, &p).await.expect("on");
+    let (b, _, _) = off.query_explained(&tenant, &expr, &p).await.expect("off");
+    let st = stages(&explain);
+    assert!(
+        st.iter().any(|(n, sql)| n == "pushed_aggregate"
+            && sql.matches("FROM metric_samples_60s_dist\n").count() == 2),
+        "(i): no pushed statement reading the level twice: {st:#?}"
+    );
+    assert!(
+        !st.iter().any(|(_, sql)| sql.starts_with("declined:")),
+        "(i): {st:#?}"
+    );
+    assert_eq!(cells(&b).len(), 40, "(i): in process");
+    assert_eq!(cells(&a), cells(&b), "(i): pushed against in process");
+    // (ii)
+    let comment = format!("{}_t17_{}", f.db, uuid::Uuid::new_v4().simple());
+    let logged = level_engine(&f, &cache, &slot, true, Some(&comment)).await;
+    let expr = parse("sum(rate(m[5m]) + ignoring (s) rate(n[5m]))").expect("parse");
+    let x = logged
+        .query(&tenant, &expr, &p)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    let y = off
+        .query(&tenant, &expr, &p)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    assert_eq!(x, y, "(ii): both engines");
+    assert!(
+        y.as_ref()
+            .is_err_and(|e| e.contains("found duplicate series for the match group {}")),
+        "(ii): {y:?}"
+    );
+    let sent = statements(&f.shard1, &comment).await;
+    let at = sent
+        .iter()
+        .position(|q| q.contains("CAST([('', 'match')]"))
+        .unwrap_or_else(|| panic!("(ii): no S3c: {sent:#?}"));
+    let fetches = sent[at + 1..]
+        .iter()
+        .filter(|q| q.starts_with("SELECT _shard_num AS shard, kind, fingerprint, t_end"))
+        .count();
+    assert!(
+        fetches >= 2,
+        "(ii): {fetches} level fetches after S3c: {sent:#?}"
+    );
+    exec(
+        &f.bootstrap,
+        &format!(
+            "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
+            f.db
+        ),
+    )
+    .await;
 }

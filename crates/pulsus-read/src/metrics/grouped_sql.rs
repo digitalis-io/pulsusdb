@@ -1121,6 +1121,28 @@ pub fn level_aggregate_fetch(
     aggregate_over(grid, op, &inner, hist_samples_table, &sentinel)
 }
 
+/// Issue #579 part 5: the key of S3c's matching sentinel row — a step at
+/// which today's evaluator raises a matching error. No series' labels make
+/// it, as [`HISTOGRAM_SENTINEL_KEY`].
+pub const MATCH_SENTINEL_KEY: &str = "CAST([('', 'match')], 'Array(Tuple(String, String))')";
+
+/// Issue #579 part 5: shape C with `on`, `ignoring` or `group_*`, one time
+/// chunk (S3c), its sides in `(many, one)` order.
+#[allow(clippy::too_many_arguments)]
+pub fn match_aggregate_fetch(
+    _many: &SideSql<'_>,
+    _one: &SideSql<'_>,
+    _hist_samples_table: &str,
+    _grouping: Option<&Grouping>,
+    _grid: Grid,
+    _op: RangeAggOp,
+    _bin: BinOp,
+    _bool_modifier: bool,
+    _spec: &super::grouped::MatchSpec,
+) -> String {
+    String::new()
+}
+
 /// Issue #579 part 4: shape C, one time chunk (S3b): both sides' steps,
 /// their series paired by label set, the operator, and the aggregate over
 /// the left member's rank. Arithmetic drops `__type__`/`__unit__` from the
@@ -1948,5 +1970,137 @@ mod tests {
             ),
             join_section("count without (device) (rate > bool irate)")
         );
+        // Issue #579 part 5, U6: the filtering comparison's arm.
+        assert_eq!(
+            join_aggregate_fetch(
+                &rx,
+                &tx_irate,
+                "metric_hist_samples",
+                without_device.as_ref(),
+                t11_grid(),
+                RangeAggOp::Count,
+                BinOp::Gt,
+                false,
+            ),
+            join_section("count without (device) (rate > irate)")
+        );
+    }
+
+    /// **U2 (issue #579 part 5): the match statement renders the plan's
+    /// text**: section 6's `MATCHED` with each placeholder substituted, its
+    /// sides' `SERIES_STEPS` and `MEMBERS` part 4's builders, inside part
+    /// 4's aggregate with S3b's histogram condition.
+    #[test]
+    fn the_match_statement_renders_the_plans_text() {
+        use super::super::grouped::MatchSpec;
+        use pulsus_promql::Group;
+        let tenant = no_tenant();
+        let (rx_ids, tx_ids) = (t11_ids("p_rx_total"), t11_ids("p_tx_total"));
+        let side =
+            |name: &'static str, ids: &'static str, level: Option<LevelRead<'static>>| SideSql {
+                tenant: Box::leak(Box::new(no_tenant())),
+                samples_table: "metric_samples",
+                labels_table: "metric_labels",
+                ids_sql: ids,
+                metric_name: name,
+                func: PushedRangeFn::Rate,
+                range_ms: 300_000,
+                scale: None,
+                window: T11_WINDOW,
+                level,
+            };
+        let rx_ids: &'static str = Box::leak(rx_ids.into_boxed_str());
+        let tx_ids: &'static str = Box::leak(tx_ids.into_boxed_str());
+        let rx = side("p_rx_total", rx_ids, Some(t11_level()));
+        let tx = side("p_tx_total", tx_ids, Some(t11_level()));
+        let (rx_raw, tx_raw) = (
+            side("p_rx_total", rx_ids, None),
+            side("p_tx_total", tx_ids, None),
+        );
+        let strs = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let on = |labels: &[&str], group: Group| MatchSpec {
+            on: true,
+            labels: strs(labels),
+            group,
+        };
+        let cases = [
+            (
+                "S3c (a) sum by (instance) (rate + on (instance) rate)",
+                (&rx, &tx, &rx, &tx),
+                grouping_of("by (instance)"),
+                RangeAggOp::Sum,
+                BinOp::Add,
+                false,
+                on(&["instance"], Group::OneToOne),
+            ),
+            (
+                "S3c (b) max without (device) (rate > on (instance) group_left (role) rate)",
+                (&rx, &tx, &rx, &tx),
+                grouping_of("without (device)"),
+                RangeAggOp::Max,
+                BinOp::Gt,
+                false,
+                on(&["instance"], Group::Left(strs(&["role"]))),
+            ),
+            (
+                "S3c (c) sum (rate / on (instance) group_right rate), raw",
+                (&tx_raw, &rx_raw, &rx_raw, &tx_raw),
+                None,
+                RangeAggOp::Sum,
+                BinOp::Div,
+                false,
+                on(&["instance"], Group::Right(Vec::new())),
+            ),
+            (
+                "S3c (d) sum by (instance) (rate != on (instance) rate)",
+                (&rx, &tx, &rx, &tx),
+                grouping_of("by (instance)"),
+                RangeAggOp::Sum,
+                BinOp::Ne,
+                false,
+                on(&["instance"], Group::OneToOne),
+            ),
+            (
+                "S3c (e) count (rate >= bool on (__name__, instance) group_left (__name__, role) rate)",
+                (&rx, &tx, &rx, &tx),
+                None,
+                RangeAggOp::Count,
+                BinOp::Ge,
+                true,
+                on(
+                    &["__name__", "instance"],
+                    Group::Left(strs(&["__name__", "role"])),
+                ),
+            ),
+        ];
+        for (key, (many, one, lhs, rhs), grouping, op, bin, bool_modifier, spec) in &cases {
+            let matched = join_section(key)
+                .replace("{SERIES_STEPS(M)}", &series_steps(many, t11_grid()))
+                .replace("{MEMBERS(M)}", &members(many))
+                .replace("{SERIES_STEPS(O)}", &series_steps(one, t11_grid()))
+                .replace("{MEMBERS(O)}", &members(one));
+            let sentinel = format!(
+                "org_id = {} AND (({}) OR ({}))",
+                tenant.sql_literal(),
+                side_histograms(lhs),
+                side_histograms(rhs)
+            );
+            let want = aggregate_over(t11_grid(), *op, &matched, "metric_hist_samples", &sentinel);
+            assert_eq!(
+                match_aggregate_fetch(
+                    many,
+                    one,
+                    "metric_hist_samples",
+                    grouping.as_ref(),
+                    t11_grid(),
+                    *op,
+                    *bin,
+                    *bool_modifier,
+                    spec,
+                ),
+                want,
+                "{key}"
+            );
+        }
     }
 }

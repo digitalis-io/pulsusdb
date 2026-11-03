@@ -313,6 +313,18 @@ pub struct JoinShape {
     pub lhs: JoinSide,
     pub rhs: JoinSide,
     pub grid: Grid,
+    /// Part 5: `None` for the default matching (S3b); the node's `on`,
+    /// `ignoring` and `group_*` otherwise (S3c).
+    pub matching: Option<MatchSpec>,
+}
+
+/// Issue #579 part 5: a C-match node's matching — `on` or `ignoring`, its
+/// labels, and its grouping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchSpec {
+    pub on: bool,
+    pub labels: Vec<String>,
+    pub group: pulsus_promql::Group,
 }
 
 /// Issue #579: the kinds of node the database answers.
@@ -679,6 +691,7 @@ fn verdict_of(
                 lhs,
                 rhs,
                 grid: grid?,
+                matching: None,
             })))
         }
         PlanExpr::OverTime { .. } | PlanExpr::OverTimeParam { .. } => {
@@ -808,6 +821,12 @@ pub fn decide_range(shape: &RangeShape) -> RangePush {
 /// [`super::grouped_sql::HISTOGRAM_SENTINEL_KEY`].
 pub fn is_histogram_sentinel(gid: &[(String, String)]) -> bool {
     matches!(gid, [(k, v)] if k.is_empty() && v.is_empty())
+}
+
+/// Issue #579 part 5: whether a row is S3c's matching sentinel,
+/// [`super::grouped_sql::MATCH_SENTINEL_KEY`].
+pub fn is_match_sentinel(_gid: &[(String, String)]) -> bool {
+    false
 }
 
 /// Issue #579: splits a shape-A node's grid by time so no statement
@@ -2817,16 +2836,9 @@ mod tests {
             &[],
             NodeDecline::Operator,
         );
-        // D7.
+        // D7a (part 5: on, ignoring and group_* are pushed, U1).
         assert_part4_declines(
-            &[
-                "sum(rate(rx[5m]) + on (instance) rate(tx[5m]))",
-                "sum(rate(rx[5m]) + on () rate(tx[5m]))",
-                "sum(rate(rx[5m]) + ignoring (device) rate(tx[5m]))",
-                "sum(rate(rx[5m]) * on (instance) group_left rate(tx[5m]))",
-                "sum(rate(rx[5m]) * on (instance) group_right rate(tx[5m]))",
-                "sum(rate(rx[5m]) + fill(0) rate(tx[5m]))",
-            ],
+            &["sum(rate(rx[5m]) + fill(0) rate(tx[5m]))"],
             &[],
             NodeDecline::Matching,
         );
@@ -2878,6 +2890,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **U1 (issue #579 part 5): a C-match node is shape C with its
+    /// matching**, the default matching keeps `None`, and `fill` and `%`
+    /// still decline.
+    #[test]
+    fn each_part5_matching_is_shape_c_or_declined() {
+        use pulsus_promql::Group;
+        let strs = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let spec = |on: bool, labels: &[&str], group: Group| MatchSpec {
+            on,
+            labels: strs(labels),
+            group,
+        };
+        let cases: [(&str, MatchSpec); 8] = [
+            (
+                "sum(rate(a[5m]) + on (__name__, i) rate(b[5m]))",
+                spec(true, &["__name__", "i"], Group::OneToOne),
+            ),
+            (
+                "sum(rate(a[5m]) * on (i) group_left (__name__) rate(b[5m]))",
+                spec(true, &["i"], Group::Left(strs(&["__name__"]))),
+            ),
+            (
+                "sum(rate(a[5m]) + on (i) rate(b[5m]))",
+                spec(true, &["i"], Group::OneToOne),
+            ),
+            (
+                "sum(rate(a[5m]) + ignoring (i) rate(b[5m]))",
+                spec(false, &["i"], Group::OneToOne),
+            ),
+            (
+                "sum(rate(a[5m]) * on (i) group_left (r) rate(b[5m]))",
+                spec(true, &["i"], Group::Left(strs(&["r"]))),
+            ),
+            (
+                "sum(rate(a[5m]) * on (i) group_right rate(b[5m]))",
+                spec(true, &["i"], Group::Right(Vec::new())),
+            ),
+            (
+                "sum(rate(a[5m]) * on () group_left rate(b[5m]))",
+                spec(true, &[], Group::Left(Vec::new())),
+            ),
+            (
+                "sum(rate(a[5m]) + ignoring (__name__, i) rate(b[5m]))",
+                spec(false, &["__name__", "i"], Group::OneToOne),
+            ),
+        ];
+        for (q, want) in cases {
+            match verdict_of_query(q, &[]).map(|n| n.kind) {
+                Ok(PushKind::Join(j)) => assert_eq!(j.matching, Some(want), "{q}"),
+                other => panic!("{q}: {other:?}"),
+            }
+        }
+        for q in [
+            "sum(rate(a[5m]) + rate(b[5m]))",
+            "sum(rate(a[5m]) + ignoring () rate(b[5m]))",
+        ] {
+            assert_eq!(join_of(q, &[]).matching, None, "{q}");
+        }
+        assert_eq!(
+            verdict_of_query("sum(rate(a[5m]) + fill(0) rate(b[5m]))", &[]).map(|n| n.kind),
+            Err(NodeDecline::Matching),
+            "fill"
+        );
+        assert_eq!(
+            verdict_of_query("sum(rate(a[5m]) % on (i) rate(b[5m]))", &[]).map(|n| n.kind),
+            Err(NodeDecline::Operator)
+        );
+    }
+
+    /// **U3 (issue #579 part 5): the match sentinel is its own key.**
+    #[test]
+    fn the_match_sentinel_is_its_own_key() {
+        let kv = |k: &str, v: &str| vec![(k.to_string(), v.to_string())];
+        assert!(is_match_sentinel(&kv("", "match")));
+        assert!(!is_match_sentinel(&kv("", "")));
+        assert!(!is_match_sentinel(&kv("role", "match")));
     }
 
     /// A small seeded generator, so T9's cases are the same every run.

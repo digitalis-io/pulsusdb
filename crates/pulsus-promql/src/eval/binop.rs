@@ -580,6 +580,14 @@ fn identity_hash<T: std::hash::Hash>(v: &T) -> u64 {
     h.finish()
 }
 
+/// Issue #579 part 5: the reference's 64-bit key of an output identity —
+/// `xxHash64` over each label with a value, `__name__` included when the
+/// name is set, sorted by name, each written as its length and its bytes
+/// (a length under 255 one byte, else `0xFF` and three bytes little-endian).
+pub(crate) fn reference_identity_key(labels: &Labels, metric_name: Option<&str>) -> u64 {
+    identity_hash(&(labels, metric_name))
+}
+
 /// Match-signature bookkeeping + output accumulator for one
 /// [`vector_vector`] call. Mirrors upstream `VectorBinop`'s
 /// `matchedSigsPresent` (one-to-one) / `matchedSigs` (many-to-one, a set
@@ -758,7 +766,7 @@ fn emit_pair(
         }
         state.one_to_one_matched.insert(key.clone());
     } else {
-        let out_hash = identity_hash(&(&labels, &metric_name));
+        let out_hash = reference_identity_key(&labels, metric_name.as_deref());
         let inserted = match state.many_matched.get_mut(key) {
             Some(set) => set.insert(out_hash),
             None => {
@@ -3104,5 +3112,108 @@ mod tests {
         assert_eq!(out[0].metric_name.as_deref(), Some("test_metric"));
         assert!(!out[0].drop_name);
         assert!(annos.is_empty());
+    }
+
+    // -- issue #579 part 5: the reference's identity key, empty labels
+
+    /// **U4 (issue #579 part 5): the identity key is the reference's**:
+    /// `xxHash64` of the reference's default label encoding.
+    #[test]
+    fn the_identity_key_is_the_references() {
+        let l = |pairs: &[(&str, &str)]| {
+            Labels::new(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+        };
+        let x254 = "x".repeat(254);
+        let x255 = "x".repeat(255);
+        let x300 = "x".repeat(300);
+        let cases: [(Labels, Option<&str>, u64); 9] = [
+            (
+                l(&[("device", "d0"), ("instance", "i0")]),
+                Some("q_one_total"),
+                10_862_058_126_096_718_055,
+            ),
+            (
+                l(&[("device", "d1"), ("instance", "i2"), ("role", "m")]),
+                None,
+                11_498_421_115_328_139_097,
+            ),
+            (
+                l(&[("__unit__", "bytes"), ("instance", "i3")]),
+                None,
+                303_765_800_756_503_461,
+            ),
+            (l(&[]), None, 17_241_709_254_077_376_921),
+            (l(&[("a", ""), ("b", "y")]), None, 8_496_399_924_857_557_067),
+            (l(&[("é", "v")]), None, 16_833_172_124_303_451_532),
+            (l(&[("a", &x254)]), None, 15_390_423_940_348_798_586),
+            (l(&[("a", &x255)]), None, 7_843_869_350_762_009_678),
+            (
+                l(&[("a", &x300), ("b", "é")]),
+                None,
+                2_939_218_523_603_856_172,
+            ),
+        ];
+        for (labels, name, want) in &cases {
+            assert_eq!(
+                reference_identity_key(labels, *name),
+                *want,
+                "{labels:?} {name:?}"
+            );
+        }
+        assert_eq!(
+            reference_identity_key(&l(&[("a", ""), ("b", "y")]), None),
+            reference_identity_key(&l(&[("b", "y")]), None),
+            "an empty value is removed before the key"
+        );
+    }
+
+    /// **U5 (issue #579 part 5): a binary result drops its empty-valued
+    /// labels**, before its identity is checked.
+    #[test]
+    fn a_binary_result_drops_its_empty_labels() {
+        let m = sample(&[("i", "x"), ("a", "")], 1.0);
+        let o = sample(&[("i", "x")], 1.0);
+        let out = vv_group(
+            BinOp::Mul,
+            false,
+            &on(&["i"]),
+            &group_left(&[]),
+            std::slice::from_ref(&m),
+            std::slice::from_ref(&o),
+        )
+        .expect("one match");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            out[0].labels,
+            Labels::new([("i".to_string(), "x".to_string())])
+        );
+        assert_eq!(out[0].v, 1.0);
+        let err = vv_group(
+            BinOp::Mul,
+            false,
+            &on(&["i"]),
+            &group_left(&[]),
+            &[m.clone(), sample(&[("i", "x")], 2.0)],
+            std::slice::from_ref(&o),
+        );
+        assert!(
+            err.as_ref().is_err_and(|e| e
+                .to_string()
+                .contains("grouping labels must ensure unique matches")),
+            "{err:?}"
+        );
+        let out = vv(
+            BinOp::Add,
+            false,
+            &on(&["i", "a"]),
+            std::slice::from_ref(&m),
+            &[sample(&[("i", "x"), ("a", "")], 1.0)],
+        )
+        .expect("one-to-one");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            out[0].labels,
+            Labels::new([("i".to_string(), "x".to_string())])
+        );
     }
 }
