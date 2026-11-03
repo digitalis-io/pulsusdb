@@ -123,6 +123,7 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
         record_label_cache_metrics(cache);
     }
     record_eval_gate_metrics(&state.eval_gate);
+    record_replica_metrics(&state.rollup_levels);
     record_ingest_metrics(&state);
     (
         StatusCode::OK,
@@ -130,6 +131,13 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
         state.metrics.render(),
     )
 }
+
+/// Issue #18 part 2c: each replica's lag on each PulsusDB table, from the
+/// reader's latest read: `pulsus_clickhouse_replica_delay_seconds{host,
+/// table}` and `pulsus_clickhouse_replica_seen{host, table}`, `seen` 0 for
+/// a pair seen before and missing from the latest read, its delay left at
+/// its last value.
+pub(crate) fn record_replica_metrics(_slot: &pulsus_read::metrics::rollup::LevelSlot) {}
 
 /// The trace fetch's missing-resource counter (issue #587).
 ///

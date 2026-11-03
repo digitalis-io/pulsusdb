@@ -434,6 +434,12 @@ pub struct ReaderConfig {
     pub cache_window: HumanDuration,
     pub promql_max_samples: u64,
     pub promql_lookback: HumanDuration,
+    /// Issue #18 part 2c: `PULSUS_PROMQL_MAX_REPLICA_DELAY`, whole seconds
+    /// from 1 s to 3600 s: on a cluster a PromQL read skips a replica whose
+    /// copy of a Distributed table lags by this or more
+    /// (`max_replica_delay_for_distributed_queries`). Default 5 s.
+    #[serde(skip)]
+    pub promql_max_replica_delay: HumanDuration,
     /// Mirrors upstream Prometheus's
     /// `--enable-feature=promql-experimental-functions`: when `true`, the
     /// experimental slice of the v3.13 function registry (17 functions;
@@ -642,6 +648,7 @@ impl Default for ReaderConfig {
             cache_window: HumanDuration(Duration::from_secs(24 * 3_600)),
             promql_max_samples: 50_000_000,
             promql_lookback: HumanDuration(Duration::from_secs(300)),
+            promql_max_replica_delay: HumanDuration(Duration::from_secs(5)),
             promql_experimental_functions: false,
             promql_max_metric_fanout: 1_000,
             promql_max_cache_scan: 200_000,

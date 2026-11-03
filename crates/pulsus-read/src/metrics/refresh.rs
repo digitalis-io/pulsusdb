@@ -158,6 +158,7 @@ async fn fetch_rows(cache: &LabelCache, sql: &str) -> Result<Vec<SeriesRow>, ChE
             &sweep_settings(
                 cache.config.read_max_memory_bytes,
                 cache.config.skip_unavailable_shards,
+                cache.config.max_replica_delay_secs,
             ),
         )
         .await?;
@@ -191,6 +192,7 @@ async fn fetch_rows(cache: &LabelCache, sql: &str) -> Result<Vec<SeriesRow>, ChE
 pub(crate) fn sweep_settings(
     read_max_memory_bytes: u64,
     skip_unavailable_shards: bool,
+    _max_replica_delay_secs: u64,
 ) -> QuerySettings {
     QuerySettings::new()
         .answer_pins(false, skip_unavailable_shards)

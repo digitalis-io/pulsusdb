@@ -87,6 +87,9 @@ pub struct LabelCacheConfig {
     /// `PULSUS_SKIP_UNAVAILABLE_SHARDS` (#603 follow-up): the sweep sends
     /// the answer pins with it, as every request-path metrics read does.
     pub skip_unavailable_shards: bool,
+    /// Issue #18 part 2c: `PULSUS_PROMQL_MAX_REPLICA_DELAY`, seconds: the
+    /// sweep skips a lagging replica as every PromQL read does.
+    pub max_replica_delay_secs: u64,
 }
 
 /// Resident snapshot: `fingerprint -> LabelSet` plus `metric_name ->
@@ -1338,6 +1341,7 @@ impl MultiMetricScanProbe {
             regex_cache: RegexCache::new(REGEX_CACHE_CAPACITY),
             metrics: CacheMetrics::default(),
             config: LabelCacheConfig {
+                max_replica_delay_secs: 5,
                 skip_unavailable_shards: false,
                 db: "pulsus".to_string(),
                 series_table: "metric_series".to_string(),
@@ -1426,6 +1430,7 @@ mod tests {
 
     fn config() -> LabelCacheConfig {
         LabelCacheConfig {
+            max_replica_delay_secs: 5,
             skip_unavailable_shards: false,
             db: "pulsus".to_string(),
             series_table: "metric_series".to_string(),

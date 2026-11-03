@@ -132,6 +132,7 @@ async fn execute_fingerprint_sql(client: &ChClient, sql: &str) -> Vec<Fingerprin
 
 fn cache_config(db: &str, series_table: &str, window_ms: i64, ttl: Duration) -> LabelCacheConfig {
     LabelCacheConfig {
+        max_replica_delay_secs: 5,
         skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.

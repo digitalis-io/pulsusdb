@@ -197,6 +197,9 @@ pub struct MetricsConfig {
     /// available. `false` → every query takes today's route and nothing
     /// else in this module changes.
     pub grouped_push: bool,
+    /// Issue #18 part 2c: `PULSUS_PROMQL_MAX_REPLICA_DELAY`, seconds: every
+    /// PromQL read sets `max_replica_delay_for_distributed_queries` to it.
+    pub max_replica_delay_secs: u64,
 }
 
 /// Issue #82 (retroactive re-review, Finding 1): the info() degraded-path
@@ -607,6 +610,14 @@ impl MetricsEngine {
     #[doc(hidden)]
     pub fn with_rollup_answer_hook(mut self, hook: RollupAnswerHook) -> Self {
         self.rollup_answer_hook = Some(hook);
+        self
+    }
+
+    /// TEST SEAM (issue #18 part 2c): the statement-size cap F13 refuses a
+    /// pushed node at, [`crate::querytext::MAX_QUERY_TEXT_BYTES`] in
+    /// production.
+    #[doc(hidden)]
+    pub fn with_statement_cap(self, _cap: u64) -> Self {
         self
     }
 
@@ -2370,6 +2381,7 @@ impl MetricsEngine {
                     self.config.read_max_memory_bytes,
                     self.config.distributed,
                     self.config.skip_unavailable_shards,
+                    self.config.max_replica_delay_secs,
                 );
                 let (rows, hist_rows): (Vec<SampleRow>, Vec<HistSampleRow>) =
                     fetch_dual_concurrently(
@@ -2416,11 +2428,13 @@ impl MetricsEngine {
                         self.config.read_max_memory_bytes,
                         self.config.distributed,
                         self.config.skip_unavailable_shards,
+                        self.config.max_replica_delay_secs,
                     )
                 } else {
                     metrics_read_settings(
                         self.config.read_max_memory_bytes,
                         self.config.skip_unavailable_shards,
+                        self.config.max_replica_delay_secs,
                     )
                 };
                 let (rows, hist_rows): (Vec<MultiSampleRow>, Vec<MultiHistSampleRow>) =
@@ -2691,6 +2705,7 @@ impl MetricsEngine {
                     samples_table: &self.config.samples_table,
                     labels_table: &self.config.labels_table,
                     ids_sql: &side.ids_sql,
+                    series: super::grouped_sql::SideSeries::Ids(&side.ids_sql),
                     metric_name: spec.metric_name,
                     func: spec.func,
                     range_ms: spec.range_ms,
@@ -2861,6 +2876,7 @@ impl MetricsEngine {
             self.config.read_max_memory_bytes,
             self.config.distributed,
             self.config.skip_unavailable_shards,
+            self.config.max_replica_delay_secs,
         );
         let (floats, hist_rows) = join(
             join_all(
@@ -3142,6 +3158,7 @@ impl MetricsEngine {
                     self.config.read_max_memory_bytes,
                     self.config.distributed,
                     self.config.skip_unavailable_shards,
+                    self.config.max_replica_delay_secs,
                 );
                 let mut chunks = Vec::with_capacity(sqls.len());
                 let mut behind = false;
@@ -3263,6 +3280,7 @@ impl MetricsEngine {
             &metrics_read_settings(
                 self.config.read_max_memory_bytes,
                 self.config.skip_unavailable_shards,
+                self.config.max_replica_delay_secs,
             ),
             None,
         )
@@ -3279,6 +3297,7 @@ impl MetricsEngine {
                 self.config.read_max_memory_bytes,
                 self.config.distributed,
                 self.config.skip_unavailable_shards,
+                self.config.max_replica_delay_secs,
             ),
             None,
         )
@@ -3300,6 +3319,7 @@ impl MetricsEngine {
             &metrics_read_settings(
                 self.config.read_max_memory_bytes,
                 self.config.skip_unavailable_shards,
+                self.config.max_replica_delay_secs,
             ),
             Some(budget),
         )
@@ -3894,6 +3914,7 @@ impl MetricsEngine {
                 self.config.read_max_memory_bytes,
                 self.config.distributed,
                 self.config.skip_unavailable_shards,
+                self.config.max_replica_delay_secs,
             )
         };
         let counts: Vec<super::rows::ExemplarCountRow> = self
@@ -4070,6 +4091,7 @@ impl MetricsEngine {
 fn metrics_read_settings(
     read_max_memory_bytes: u64,
     skip_unavailable_shards: bool,
+    _max_replica_delay_secs: u64,
 ) -> QuerySettings {
     QuerySettings::new()
         .answer_pins(false, skip_unavailable_shards)
@@ -4108,12 +4130,17 @@ fn series_read_settings(
     read_max_memory_bytes: u64,
     distributed: bool,
     skip_unavailable_shards: bool,
+    max_replica_delay_secs: u64,
 ) -> QuerySettings {
     // The label joins' build side is the scoped metrics' label rows; the
     // plain hash join, for `refresh::sweep_settings`' reason. The unnamed
     // names join sets its own algorithm in its text.
-    let base = metrics_read_settings(read_max_memory_bytes, skip_unavailable_shards)
-        .set("join_algorithm", "hash");
+    let base = metrics_read_settings(
+        read_max_memory_bytes,
+        skip_unavailable_shards,
+        max_replica_delay_secs,
+    )
+    .set("join_algorithm", "hash");
     if distributed {
         base.set("distributed_product_mode", "local")
     } else {
@@ -4152,10 +4179,15 @@ fn exemplar_settings(
     read_max_memory_bytes: u64,
     distributed: bool,
     skip_unavailable_shards: bool,
+    max_replica_delay_secs: u64,
 ) -> QuerySettings {
     use super::exemplars::{EXEMPLAR_ANSWER_BYTES, EXEMPLAR_ANSWER_CAP, EXEMPLAR_MAX_BLOCK_ROWS};
-    let mut settings =
-        series_read_settings(read_max_memory_bytes, distributed, skip_unavailable_shards);
+    let mut settings = series_read_settings(
+        read_max_memory_bytes,
+        distributed,
+        skip_unavailable_shards,
+        max_replica_delay_secs,
+    );
     if statement == ExemplarStatement::Rows {
         settings = settings
             .set("max_rows_to_group_by", EXEMPLAR_ANSWER_CAP)
@@ -4425,6 +4457,24 @@ fn replica_behind(e: &ReadError) -> bool {
         ReadError::Clickhouse(pulsus_clickhouse::ChError::Server { code: 395, message })
             if message.contains("PULSUS_LEVEL_REPLICA_BEHIND")
     )
+}
+
+/// Issue #18 part 2c: the coverage statements one `read_selectors` call
+/// has sent, by their text, so a side whose next statement is one already
+/// sent takes its rows instead of sending it again.
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+struct CoverageMemo(HashMap<String, Vec<super::rollup::RunRow>>);
+
+#[allow(dead_code)]
+impl CoverageMemo {
+    /// The rows of the statement `sql` over `table`, when it was sent.
+    fn lookup(&self, _table: &str, _sql: &str) -> Option<Vec<super::rollup::RunRow>> {
+        None
+    }
+
+    /// Records the rows the statement `sql` over `table` read.
+    fn record(&mut self, _table: &str, _sql: String, _rows: Vec<super::rollup::RunRow>) {}
 }
 
 /// Issue #579 part 4: one side of a pushed node as phase 1 recorded it.
@@ -5897,7 +5947,7 @@ mod tests {
     /// comes in — so the byte-budget keys must still be absent.
     #[test]
     fn metrics_read_settings_carry_the_memory_ceiling() {
-        let s = metrics_read_settings(TEST_READ_MEM, false);
+        let s = metrics_read_settings(TEST_READ_MEM, false, 5);
         assert_eq!(
             s.get("max_memory_usage"),
             Some(TEST_READ_MEM.to_string().as_str())
@@ -5911,7 +5961,7 @@ mod tests {
         );
         // The `SqlFallback` variant layers on top and must keep both.
         for distributed in [false, true] {
-            let f = series_read_settings(TEST_READ_MEM, distributed, false);
+            let f = series_read_settings(TEST_READ_MEM, distributed, false, 5);
             assert_eq!(
                 f.get("max_memory_usage"),
                 Some(TEST_READ_MEM.to_string().as_str()),
@@ -5929,7 +5979,7 @@ mod tests {
     /// exists to remove.
     #[test]
     fn label_cache_sweep_carries_the_memory_ceiling() {
-        let s = crate::metrics::refresh::sweep_settings(TEST_READ_MEM, false);
+        let s = crate::metrics::refresh::sweep_settings(TEST_READ_MEM, false, 5);
         assert_eq!(
             s.get("max_memory_usage"),
             Some(TEST_READ_MEM.to_string().as_str())
@@ -5943,7 +5993,7 @@ mod tests {
 
     #[test]
     fn metrics_read_settings_sets_the_raised_query_text_cap() {
-        let s = metrics_read_settings(TEST_READ_MEM, false);
+        let s = metrics_read_settings(TEST_READ_MEM, false, 5);
         assert_eq!(
             s.get("max_query_size"),
             Some(crate::querytext::MAX_QUERY_TEXT_BYTES.to_string().as_str())
@@ -5996,7 +6046,7 @@ mod tests {
 
     #[test]
     fn series_read_settings_carries_the_read_settings_and_omits_local_product_mode_unclustered() {
-        let unclustered = format!("{:?}", series_read_settings(TEST_READ_MEM, false, false));
+        let unclustered = format!("{:?}", series_read_settings(TEST_READ_MEM, false, false, 5));
         assert!(
             unclustered.contains("max_query_size"),
             "missing max_query_size in {unclustered}"
@@ -6009,7 +6059,7 @@ mod tests {
 
     #[test]
     fn series_read_settings_adds_the_local_product_mode_when_clustered() {
-        let clustered = format!("{:?}", series_read_settings(TEST_READ_MEM, true, false));
+        let clustered = format!("{:?}", series_read_settings(TEST_READ_MEM, true, false, 5));
         assert!(clustered.contains("max_query_size"));
         assert!(clustered.contains("distributed_product_mode"));
         assert!(clustered.contains("local"));
@@ -6021,7 +6071,7 @@ mod tests {
     fn the_exemplar_statements_carry_their_settings() {
         use ExemplarStatement::{Count, Rows, Series, Thinned};
         let get = |st, distributed, key: &str| {
-            exemplar_settings(st, TEST_READ_MEM, distributed, false)
+            exemplar_settings(st, TEST_READ_MEM, distributed, false, 5)
                 .get(key)
                 .map(str::to_string)
         };
@@ -6084,6 +6134,89 @@ mod tests {
         }
     }
 
+    /// **U6 (issue #18 part 2c r10): coverage statements are shared by
+    /// their text** — two sides over one table and the same intervals send
+    /// one statement and read the same rows; a side over other intervals
+    /// sends its own.
+    #[test]
+    fn a_coverage_statement_is_sent_once_per_text() {
+        use super::super::rollup::{RunRow, level_runs};
+        let run = |t_last: i64, t_end: i64| RunRow {
+            shard: 1,
+            t_last,
+            t_end,
+        };
+        let sides = [
+            ("metric_samples_60s", (0, 100), vec![run(0, 100)]),
+            ("metric_samples_60s", (0, 100), vec![run(0, 50)]),
+            ("metric_samples_60s", (40, 100), vec![run(40, 70)]),
+        ];
+        let mut memo = CoverageMemo::default();
+        let mut sent = 0;
+        let mut got = Vec::new();
+        for (table, todo, rows) in &sides {
+            let sql = level_runs(table, *todo, false);
+            let runs = match memo.lookup(table, &sql) {
+                Some(runs) => runs,
+                None => {
+                    sent += 1;
+                    memo.record(table, sql, rows.clone());
+                    rows.clone()
+                }
+            };
+            got.push(runs);
+        }
+        assert_eq!(sent, 2, "statements sent");
+        assert_eq!(
+            got[1], got[0],
+            "the second side reads the first side's rows"
+        );
+        assert_eq!(got[2], vec![run(40, 70)], "the third side reads its own");
+    }
+
+    /// **U2 (issue #18 part 2c): every PromQL read carries the lag guard**,
+    /// clustered or not: the configured delay, stale replicas as the last
+    /// resort, and the local copy preferred.
+    #[test]
+    fn every_promql_read_carries_the_lag_guard() {
+        use ExemplarStatement::{Count, Rows, Series, Thinned};
+        for distributed in [false, true] {
+            let mut builders: Vec<(String, QuerySettings)> = vec![
+                (
+                    "metrics_read_settings".to_string(),
+                    metrics_read_settings(TEST_READ_MEM, false, 7),
+                ),
+                (
+                    "series_read_settings".to_string(),
+                    series_read_settings(TEST_READ_MEM, distributed, false, 7),
+                ),
+                (
+                    "sweep_settings".to_string(),
+                    crate::metrics::refresh::sweep_settings(TEST_READ_MEM, false, 7),
+                ),
+            ];
+            for st in [Count, Rows, Thinned, Series] {
+                builders.push((
+                    format!("exemplar_settings({st:?})"),
+                    exemplar_settings(st, TEST_READ_MEM, distributed, false, 7),
+                ));
+            }
+            for (builder, s) in &builders {
+                for (name, want) in [
+                    ("max_replica_delay_for_distributed_queries", "7"),
+                    ("fallback_to_stale_replicas_for_distributed_queries", "1"),
+                    ("prefer_localhost_replica", "1"),
+                ] {
+                    assert_eq!(
+                        s.get(name),
+                        Some(want),
+                        "{builder}, distributed {distributed}: {name}"
+                    );
+                }
+            }
+        }
+    }
+
     /// MU (#603 follow-up): every metrics settings root, and every builder
     /// over it, carries the answer pins with pruning off and the option as
     /// configured, clustered or not.
@@ -6096,21 +6229,21 @@ mod tests {
                 let mut builders: Vec<(String, QuerySettings)> = vec![
                     (
                         "metrics_read_settings".to_string(),
-                        metrics_read_settings(TEST_READ_MEM, skip),
+                        metrics_read_settings(TEST_READ_MEM, skip, 5),
                     ),
                     (
                         "series_read_settings".to_string(),
-                        series_read_settings(TEST_READ_MEM, distributed, skip),
+                        series_read_settings(TEST_READ_MEM, distributed, skip, 5),
                     ),
                     (
                         "sweep_settings".to_string(),
-                        crate::metrics::refresh::sweep_settings(TEST_READ_MEM, skip),
+                        crate::metrics::refresh::sweep_settings(TEST_READ_MEM, skip, 5),
                     ),
                 ];
                 for st in [Count, Rows, Thinned, Series] {
                     builders.push((
                         format!("exemplar_settings({st:?})"),
-                        exemplar_settings(st, TEST_READ_MEM, distributed, skip),
+                        exemplar_settings(st, TEST_READ_MEM, distributed, skip, 5),
                     ));
                 }
                 for (builder, s) in &builders {

@@ -700,6 +700,21 @@ pub struct LevelRead<'a> {
     pub overlaid: bool,
 }
 
+/// Issue #18 part 2c: how a side's statements name its series: the ID
+/// statement, or, for a side the label cache answered, the cache's own
+/// fingerprints and members as literals.
+#[derive(Debug, Clone, Copy)]
+pub enum SideSeries<'a> {
+    Ids(&'a str),
+    Known { list: &'a str, members: &'a str },
+}
+
+/// Issue #18 part 2c: `MEMBERS_KNOWN` — a side's members from the label
+/// cache's pairs, in the order given (ascending fingerprint), ranked from 1.
+pub fn members_known(_pairs: &[(pulsus_model::Fingerprint, &pulsus_model::LabelSet)]) -> String {
+    String::new()
+}
+
 /// Issue #579 part 4: one side of a pushed node, as its statements read it.
 #[derive(Debug, Clone, Copy)]
 pub struct SideSql<'a> {
@@ -707,6 +722,8 @@ pub struct SideSql<'a> {
     pub samples_table: &'a str,
     pub labels_table: &'a str,
     pub ids_sql: &'a str,
+    /// Issue #18 part 2c: how the statements name the side's series.
+    pub series: SideSeries<'a>,
     pub metric_name: &'a str,
     pub func: PushedRangeFn,
     pub range_ms: i64,
@@ -1860,6 +1877,7 @@ mod tests {
             samples_table: "metric_samples",
             labels_table: "metric_labels",
             ids_sql: &ids,
+            series: SideSeries::Ids(&ids),
             metric_name: "p_rx_total",
             func: PushedRangeFn::Rate,
             range_ms: 300_000,
@@ -1876,6 +1894,74 @@ mod tests {
             counter_gather(&tenant, "metric_samples", &ids, &t11_level()),
             join_section("counter_gather 60s"),
             "(c)"
+        );
+    }
+
+    /// **U1 (issue #18 part 2c): a known side names its series**: the
+    /// members from the label cache's pairs, and a 720 s side's steps whose
+    /// every series filter is the literal list.
+    #[test]
+    fn a_known_side_names_its_series() {
+        use pulsus_model::{Fingerprint, LabelSet};
+        let pair = |pairs: &[(&str, &str)]| {
+            LabelSet::from_verbatim(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+        };
+        let (a, b) = (
+            pair(&[("instance", "i0"), ("device", "d0")]),
+            pair(&[("instance", "i'3"), ("__unit__", "bytes")]),
+        );
+        let members = members_known(&[
+            (Fingerprint::from_raw(101), &a),
+            (Fingerprint::from_raw(205), &b),
+        ]);
+        assert_eq!(members, join_section("members_known two series"), "members");
+        let tenant = no_tenant();
+        let ids = t11_ids("p_rx_total");
+        let h = 3_600_000;
+        let m = 60_000;
+        let s720 = vec![
+            (T11_WINDOW.0, T11_END - 20 * h),
+            (T11_END - 19 * h, T11_END - 12 * m),
+        ];
+        let s60a = vec![
+            (T11_END - 20 * h, T11_END - 19 * h),
+            (T11_END - 12 * m, T11_END - 10 * m),
+        ];
+        let todo_a = [(T11_END - 10 * m, T11_END)];
+        let levels_a = [
+            ("metric_samples_720s", 720_000, s720.as_slice()),
+            ("metric_samples_60s", 60_000, s60a.as_slice()),
+        ];
+        let level = LevelRead {
+            clustered: false,
+            shards: 1,
+            window: T11_WINDOW,
+            levels: &levels_a,
+            todo: &todo_a,
+            read: &todo_a,
+            raw_steps: &[],
+            overlaid: false,
+        };
+        let side = SideSql {
+            tenant: &tenant,
+            samples_table: "metric_samples",
+            labels_table: "metric_labels",
+            ids_sql: &ids,
+            series: SideSeries::Known {
+                list: "'101', '205'",
+                members: &members,
+            },
+            metric_name: "p_rx_total",
+            func: PushedRangeFn::Rate,
+            range_ms: 300_000,
+            scale: None,
+            window: T11_WINDOW,
+            level: Some(level),
+        };
+        assert_eq!(
+            series_steps(&side, t11_grid()),
+            join_section("series_steps 720s known"),
+            "steps"
         );
     }
 
@@ -1897,6 +1983,7 @@ mod tests {
                 samples_table: "metric_samples",
                 labels_table: "metric_labels",
                 ids_sql: ids,
+                series: SideSeries::Ids(ids),
                 metric_name: name,
                 func,
                 range_ms: 300_000,

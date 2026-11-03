@@ -49,6 +49,21 @@ pub struct LevelSlot {
     failures: AtomicU64,
 }
 
+/// Issue #18 part 2c: one replica's lag for one PulsusDB table, from
+/// `system.replicas` on every replica of the cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct ReplicaDelay {
+    pub host: String,
+    pub table: String,
+    pub absolute_delay: u64,
+}
+
+/// Issue #18 part 2c: the replica-lag statement, every replica of
+/// `cluster`, a replica it cannot reach left out.
+pub fn replica_delay_sql(_cluster: &str, _db: &str) -> String {
+    String::new()
+}
+
 impl LevelSlot {
     pub fn new() -> Self {
         Self::default()
@@ -72,6 +87,21 @@ impl LevelSlot {
     /// Discoveries that failed since the process started.
     pub fn failures(&self) -> u64 {
         self.failures.load(Ordering::Relaxed)
+    }
+
+    /// Issue #18 part 2c: records the latest replica-lag read.
+    pub fn set_replicas(&self, _rows: Vec<ReplicaDelay>) {}
+
+    /// Issue #18 part 2c: the latest replica-lag read, `None` before the
+    /// first.
+    pub fn replicas(&self) -> Option<Vec<ReplicaDelay>> {
+        None
+    }
+
+    /// Issue #18 part 2c: every `(host, table)` any read has returned, with
+    /// its last delay and whether the latest read returned it.
+    pub fn replica_gauges(&self) -> Vec<(String, String, u64, bool)> {
+        Vec::new()
     }
 }
 
@@ -1787,6 +1817,16 @@ mod tests {
         );
         assert_eq!(e.served, vec![(0, vec![(0, 100)])], "(e)");
         assert_eq!(e.todo, Vec::<(i64, i64)>::new(), "(e)");
+    }
+
+    /// **U5 (issue #18 part 2c): the replica-delay statement skips an
+    /// unreachable replica.**
+    #[test]
+    fn the_replica_delay_statement_skips_an_unreachable_replica() {
+        assert_eq!(
+            replica_delay_sql("pulsus_test_cluster", "pulsus"),
+            "SELECT hostName() AS host, table, absolute_delay FROM clusterAllReplicas('pulsus_test_cluster', system.replicas) WHERE database = 'pulsus' ORDER BY host, table SETTINGS skip_unavailable_shards = 1"
+        );
     }
 
     /// **B1d (issue #18 part B): coverage is each shard's union of run
