@@ -5,7 +5,7 @@
 > that nothing waits for a flush trigger, or that a deduplication window counts pushes, are out of
 > date. Current behaviour: `docs/api.md` §1.0 and `crates/pulsus-write/src/writer/landing.rs`.
 
-> **Stale on the PromQL push over levels.** Since issue #18 part 2a, a pushed aggregate reads any rollup level on the request's own steps, with the finer levels and raw samples where a level does not cover. Passages below that say the push reads only the 60 s level, or that a coarser route declines its node, are out of date. Current behaviour: `docs/configuration.md`, `PULSUS_PROMQL_GROUPED_PUSH`.
+> **Stale on the PromQL push over levels.** Since issue #18 parts 2a and 2b, a pushed aggregate reads any rollup level, with the finer levels and raw samples where a level does not cover, and a request filled from a level decides its nodes in each of its reads as an unfilled request does. Passages below that say the push reads only the 60 s level, that a coarser route declines its node, or that a filled request pushes no node, are out of date. Current behaviour: `docs/configuration.md`, `PULSUS_PROMQL_GROUPED_PUSH`, and `docs/api.md` §3.6.
 
 # PulsusDB Architecture
 
