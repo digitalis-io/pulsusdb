@@ -1198,30 +1198,34 @@ pub fn match_aggregate_fetch(
         Some(c) => (l.to_string(), format!("{l} {c} {r}")),
     };
     let arith = cmp.is_none();
-    let outkv = match include {
+    // Each label list is built as a vector and joined, so a list never
+    // renders empty or with a leading comma. An include list holding only
+    // `__name__` takes the empty list's form: the name is `{IDNAME}`'s.
+    let kept = include.map(|i| {
+        i.iter()
+            .filter(|l| *l != "__name__")
+            .map(|l| ch_string(l))
+            .collect::<Vec<_>>()
+    });
+    let outkv = match &kept {
         None if arith => {
             "arrayFilter(k -> k.1 NOT IN ('__name__', '__type__', '__unit__'), sig)".to_string()
         }
         None => "arrayFilter(k -> k.1 != '__name__', sig)".to_string(),
-        Some(i) if i.is_empty() && arith => {
+        Some(inc) if inc.is_empty() && arith => {
             "arrayFilter(k -> k.1 NOT IN ('__type__', '__unit__'), x.3)".to_string()
         }
-        Some(i) if i.is_empty() => "x.3".to_string(),
-        Some(i) => {
-            let inc = i
-                .iter()
-                .filter(|l| *l != "__name__")
-                .map(|l| ch_string(l))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let meta = if arith {
-                ", '__type__', '__unit__'"
-            } else {
-                ""
-            };
+        Some(inc) if inc.is_empty() => "x.3".to_string(),
+        Some(inc) => {
+            let mut removed = inc.clone();
+            if arith {
+                removed.extend(["'__type__'".to_string(), "'__unit__'".to_string()]);
+            }
             format!(
-                "arraySort(arrayConcat(arrayFilter(k -> k.1 NOT IN ({inc}{meta}), x.3), \
-                 arrayFilter(k -> k.1 IN ({inc}) AND k.2 != '', one[1].3)))"
+                "arraySort(arrayConcat(arrayFilter(k -> k.1 NOT IN ({}), x.3), \
+                 arrayFilter(k -> k.1 IN ({}) AND k.2 != '', one[1].3)))",
+                removed.join(", "),
+                inc.join(", ")
             )
         }
     };
