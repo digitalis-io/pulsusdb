@@ -766,6 +766,52 @@ async fn b16_v5_polls_until_the_levels_are_discovered() {
     }
 }
 
+/// **B16b (issue #18 part 2c r15): V5 counts the levels, not the replica
+/// rows beside them.** Two levels and three replica rows on a clustered
+/// reader: V5 finds two.
+#[tokio::test(flavor = "multi_thread")]
+async fn v5_counts_the_levels_beside_replica_rows() {
+    use pulsus_read::metrics::rollup::ReplicaDelay;
+    let two = with(example(), &[("l3_width", ""), ("l4_width", "")]);
+    let validated = pulsus_setup::validate(&pulsus_setup::Inputs::from_pairs(two))
+        .expect("two levels are accepted");
+    let files = pulsus_setup::bundle(&validated);
+    let block = v5_block(
+        &files
+            .iter()
+            .find(|f| f.path == "setup.md")
+            .expect("setup.md")
+            .content,
+    );
+    let st = state(Config {
+        cluster: Some("pulsus_test_cluster".to_string()),
+        ..Config::default()
+    });
+    st.rollup_levels.set(b6_levels(1, 5));
+    st.rollup_levels.set_replicas(
+        ["h1", "h2", "h3"]
+            .into_iter()
+            .map(|host| ReplicaDelay {
+                host: host.to_string(),
+                table: "metric_samples_60s".to_string(),
+                absolute_delay: 0,
+            })
+            .collect(),
+    );
+    let app = router(&st);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (got, out, err) = run_v5(block, url, &[("V5_TRIES", "1"), ("V5_PAUSE", "0")]).await;
+    assert_eq!(
+        (got, out.as_str(), err.as_str()),
+        (Some(0), "V5: 2 levels\n", "")
+    );
+    server.abort();
+}
+
 /// **Review r1 finding 4: with no levels, V5 passes only on an empty
 /// list: not before discovery (`null`), and not on a refused request.**
 #[tokio::test(flavor = "multi_thread")]
