@@ -103,9 +103,10 @@ impl<'a> EvalData<'a> {
     }
 
     /// Issue #579: the database's answer for the `Aggregate` node at
-    /// `self_pos`, if the fetch layer pushed it.
-    fn pushed(&self, self_pos: usize) -> Option<&PushedNode> {
-        self.base.pushed(self_pos)
+    /// `self_pos`, if the fetch layer pushed it; issue #18 part 2b: that of
+    /// the read the step at `t_ms` belongs to.
+    fn pushed(&self, self_pos: usize, t_ms: i64) -> Option<&PushedNode> {
+        self.base.pushed(self_pos, t_ms)
     }
 }
 
@@ -3790,7 +3791,7 @@ fn eval_step(
             // Issue #579: the database already answered this node. Its
             // vector at this step is the answer, and nothing below it is
             // evaluated — the fetch layer read no sample for its selector.
-            if let Some(node) = data.pushed(*self_pos) {
+            if let Some(node) = data.pushed(*self_pos, t_ms) {
                 let Some(v) = node.at(t_ms) else {
                     return Err(PromqlError::Unsupported {
                         construct: format!(

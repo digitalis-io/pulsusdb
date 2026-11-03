@@ -734,40 +734,15 @@ impl MetricsEngine {
                     .await?
             }
             Some((lv, l)) => {
-                // D10: what the request's own steps would do with each node,
-                // decided on that plan before any range moves. A filled
-                // query pushes none of them.
-                let verdicts = if l.until_ms.is_some() {
-                    self.request_grid_verdicts(&plan, p, &lv)
-                } else {
-                    Vec::new()
-                };
                 for sel in &mut plan.selectors {
                     if let Some(r) = super::rollup::lattice_range(sel, &lv, l.width) {
                         sel.range_ms = Some(r);
                     }
                 }
-                // D9: `rollup_lattice` first, then the declines, then the
-                // reads' stages.
+                // D9: `rollup_lattice` first, then the reads' stages. Issue
+                // #18 part 2b: each read decides its own nodes.
                 if let Some(e) = explain.as_mut() {
                     e.push("rollup_lattice", String::new(), Some(lattice_note(&l, p)));
-                    for verdict in &verdicts {
-                        match verdict {
-                            Ok(()) => e.push(
-                                "pushed_aggregate",
-                                "declined: Filled".to_string(),
-                                Some(FILLED_NOTE.to_string()),
-                            ),
-                            Err(reason) => e.push(
-                                "pushed_aggregate",
-                                format!("declined: {reason:?}"),
-                                Some(
-                                    "issue #579: this node is evaluated over the sample fetch"
-                                        .to_string(),
-                                ),
-                            ),
-                        }
-                    }
                     // A filled step takes its bucket's value; an unfilled
                     // query keeps today's rule, inside `read_selectors`.
                     e.rollup |= l.until_ms.is_some();
@@ -842,7 +817,8 @@ impl MetricsEngine {
     /// Issue #18: the two reads of a range query filled from a level's
     /// bucket ends — the bucket ends `(g0, gl, L)` and, when a step follows
     /// `gl`, the steps after it (F2) — concurrently, over one budget. Sets
-    /// each selector's `fill`.
+    /// each selector's `fill`. Issue #18 part 2b: each read decides and
+    /// pushes its own nodes, as an unfilled request does.
     async fn read_filled(
         &self,
         tenant: &Tenant,
@@ -884,7 +860,7 @@ impl MetricsEngine {
             &first,
             &qa,
             Some((std::sync::Arc::clone(&lv), w)),
-            false,
+            true,
             budget,
             e1.as_mut(),
         );
@@ -896,7 +872,7 @@ impl MetricsEngine {
                         q,
                         t,
                         Some((std::sync::Arc::clone(&lv), w)),
-                        false,
+                        true,
                         budget,
                         e2.as_mut(),
                     )
@@ -926,33 +902,10 @@ impl MetricsEngine {
         Ok(data)
     }
 
-    /// Issue #18, D10: each node's verdict on the request's own steps — the
-    /// plan given the request's routing, rounding and arms, as a query read
-    /// at its own steps is — by `node_verdicts`, in its order.
-    fn request_grid_verdicts(
-        &self,
-        plan: &pulsus_promql::QueryPlan,
-        p: &MetricQueryParams,
-        levels: &std::sync::Arc<super::rollup::Levels>,
-    ) -> Vec<Result<(), super::grouped::NodeDecline>> {
-        let mut clone = plan.clone();
-        let routing = request_grid_routing(p, Some(std::sync::Arc::clone(levels)));
-        round_on_request_grid(&mut clone, routing.as_ref());
-        let arms: HashMap<SelectorId, super::grouped::Arm> = clone
-            .selectors
-            .iter()
-            .map(|sel| (sel.id, arm_of(sel, &clone.params, routing.as_ref())))
-            .collect();
-        super::grouped::node_verdicts(&clone, &clone.params, &self.config, &arms)
-            .into_iter()
-            .map(|(_, v)| v.map(|_| ()))
-            .collect()
-    }
-
     /// Every selector's statements, run, and the pushed nodes' answers: the
     /// reads of `plan` on the grid `q` (`plan.params` is `q`'s), each
     /// selector routed by `routing`. With `push` false no node is pushed and
-    /// no push stage is written (issue #18: a filled query).
+    /// no push stage is written.
     #[allow(clippy::too_many_arguments)]
     async fn read_selectors(
         &self,
@@ -4370,10 +4323,6 @@ fn round_on_request_grid(
         }
     }
 }
-
-/// Issue #18, D10: the note of a node a filled query does not push.
-const FILLED_NOTE: &str =
-    "issue #18: the request is filled; the database answers this node on the request's steps only";
 
 /// Issue #18, D9: the `rollup_lattice` stage's note.
 fn lattice_note(l: &super::rollup::Lattice, p: &MetricQueryParams) -> String {

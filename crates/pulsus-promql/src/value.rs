@@ -283,6 +283,10 @@ pub struct SeriesData {
     /// bucket ends — each selector's series over the steps after the last
     /// bucket end, keyed by [`SelectorId`].
     tail: HashMap<SelectorId, Vec<FetchedSeries>>,
+    /// Issue #18 part 2b: the second read's pushed nodes, by `self_pos`.
+    tail_pushed: HashMap<usize, PushedNode>,
+    /// Issue #18 part 2b: the time the second read's steps start.
+    tail_from_ms: Option<i64>,
 }
 
 impl SeriesData {
@@ -300,9 +304,14 @@ impl SeriesData {
         self.pushed.insert(self_pos, node);
     }
 
-    /// The pushed answer of the `Aggregate` node at `self_pos`, if any.
-    pub fn pushed(&self, self_pos: usize) -> Option<&PushedNode> {
-        self.pushed.get(&self_pos)
+    /// The pushed answer of the `Aggregate` node at `self_pos` for the step
+    /// at `t_ms`, if any: the second read's from the time its steps start
+    /// (issue #18 part 2b), the first read's before it.
+    pub fn pushed(&self, self_pos: usize, t_ms: i64) -> Option<&PushedNode> {
+        match self.tail_from_ms {
+            Some(from) if t_ms >= from => self.tail_pushed.get(&self_pos),
+            _ => self.pushed.get(&self_pos),
+        }
     }
 
     /// The selector's fetched series, or an empty slice if the selector
@@ -320,8 +329,10 @@ impl SeriesData {
 
     /// Issue #18: makes `other`'s selector series this data's second read,
     /// whose steps start at `from_ms` (issue #18 part 2b).
-    pub fn take_as_tail(&mut self, other: SeriesData, _from_ms: i64) {
+    pub fn take_as_tail(&mut self, other: SeriesData, from_ms: i64) {
         self.tail = other.by_selector;
+        self.tail_pushed = other.pushed;
+        self.tail_from_ms = Some(from_ms);
     }
 }
 
