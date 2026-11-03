@@ -1061,7 +1061,7 @@ rather than suspected.
 
 Our other two languages rewrite a user pattern into the Rust `regex` crate's dialect before
 compiling it, so that the crate reads it the way RE2 does — `pulsus_re2::re2_pattern_to_rust`,
-applied at `crates/pulsus-read/src/metrics/labels.rs:281` and `:628`,
+applied at `crates/pulsus-read/src/metrics/labels.rs:278` and `:625`,
 `crates/pulsus-read/src/metrics/re2_authority.rs:89` and `crates/pulsus-read/src/logql/plan.rs:174`.
 **The TraceQL path applies it nowhere.** `git grep -n re2_pattern_to_rust -- crates/pulsus-read/src/traces/ crates/pulsus-traceql/src/`
 returns no line; `search_plan.rs:958` compiles the **raw** pattern with
