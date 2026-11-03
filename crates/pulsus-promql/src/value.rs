@@ -318,8 +318,9 @@ impl SeriesData {
         self.tail.get(&id).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// Issue #18: makes `other`'s selector series this data's second read.
-    pub fn take_as_tail(&mut self, other: SeriesData) {
+    /// Issue #18: makes `other`'s selector series this data's second read,
+    /// whose steps start at `from_ms` (issue #18 part 2b).
+    pub fn take_as_tail(&mut self, other: SeriesData, _from_ms: i64) {
         self.tail = other.by_selector;
     }
 }

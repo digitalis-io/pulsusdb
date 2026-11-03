@@ -1018,3 +1018,82 @@ async fn a_coarse_node_answers_on_two_shards() {
     .await;
     assert!(failures.is_empty(), "T24:\n{}", failures.join("\n"));
 }
+
+// ------------------------------------------------ issue #18 part 2b, T32
+
+/// **T32 (issue #18 part 2b): a filled node answers on two shards.** T24's
+/// fixture, its series on the shards their IDs hash to, the first level
+/// built; a request at 30 s off the minute is filled at 60 s: the bucket
+/// ends' read pushes over the level, the newest step's read over raw.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filled_node_answers_on_two_shards() {
+    if skipping() {
+        return;
+    }
+    let f = fixture(
+        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t32"),
+        &[("m", 0)],
+        true,
+    )
+    .await;
+    build_level(&f).await;
+    let (cache, slot) = warm(&f).await;
+    let on = level_engine(&f, &cache, &slot, true, None).await;
+    let off = level_engine(&f, &cache, &slot, false, None).await;
+    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
+    let p = MetricQueryParams {
+        start_ms: f.mid - 30 * MIN + 30_000,
+        end_ms: f.hi - 30_000,
+        step_ms: 30_000,
+    };
+    let q = "sum by (s) (rate(m[5m]))";
+    let expr = parse(q).expect("parse");
+    let (a, _, explain) = on.query_explained(&tenant, &expr, &p).await.expect("on");
+    let (b, _, _) = off.query_explained(&tenant, &expr, &p).await.expect("off");
+    let mut failures: Vec<String> = Vec::new();
+    let (ca, cb) = (cells(&a), cells(&b));
+    if ca != cb {
+        failures.push(format!(
+            "cells differ from push off: {} series pushed, {} in process",
+            ca.len(),
+            cb.len()
+        ));
+    }
+    if cb.len() != 40 {
+        failures.push(format!("{} series in process, want 40", cb.len()));
+    }
+    let st = stages(&explain);
+    let pushed: Vec<&String> = st
+        .iter()
+        .filter(|(n, sql)| n == "pushed_aggregate" && !sql.starts_with("declined:"))
+        .map(|(_, sql)| sql)
+        .collect();
+    let level = pushed
+        .iter()
+        .filter(|sql| {
+            sql.contains("60000 AS grid_step") && sql.contains("FROM metric_samples_60s_dist\n")
+        })
+        .count();
+    let newest = pushed
+        .iter()
+        .filter(|sql| sql.contains("30000 AS grid_step"))
+        .count();
+    if pushed.len() != 2 || level != 1 || newest != 1 {
+        failures.push(format!(
+            "{} pushed statements, {level} on the level at 60 s, {newest} at 30 s",
+            pushed.len()
+        ));
+    }
+    if st.iter().any(|(_, sql)| sql.starts_with("declined:")) {
+        failures.push(format!("declined: {st:?}"));
+    }
+    exec(
+        &f.bootstrap,
+        &format!(
+            "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
+            f.db
+        ),
+    )
+    .await;
+    assert!(failures.is_empty(), "T32:\n{}", failures.join("\n"));
+}

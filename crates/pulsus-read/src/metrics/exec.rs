@@ -915,8 +915,8 @@ impl MetricsEngine {
                 tail_range_ms,
             });
         }
-        if let Some(b) = b {
-            data.take_as_tail(b);
+        if let (Some(b), Some((_, t))) = (b, &second) {
+            data.take_as_tail(b, t.start_ms);
         }
         if let Some(e) = explain {
             for x in [e1, e2].into_iter().flatten() {
