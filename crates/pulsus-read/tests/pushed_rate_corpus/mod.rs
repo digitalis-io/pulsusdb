@@ -628,7 +628,6 @@ pub fn test_config(database: &str) -> ChConnConfig {
 
 pub fn cache_config(db: &str) -> LabelCacheConfig {
     LabelCacheConfig {
-        max_replica_delay_secs: 5,
         skip_unavailable_shards: false,
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),

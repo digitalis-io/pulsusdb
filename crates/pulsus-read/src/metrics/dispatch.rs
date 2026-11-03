@@ -194,23 +194,98 @@ impl std::fmt::Debug for MetricsDispatch {
 
 /// Issue #18 part 2c r20: whether every `IN (` and `NOT IN (` of `sql`,
 /// `GLOBAL` or not, opens a list of literals or a subquery naming no
-/// table, so each table access in it is checked for replica lag on its
-/// own. `false` for anything else, and for text it cannot read.
-#[allow(dead_code)] // the tests commit's stub; the code commit uses it
+/// table (no `FROM` inside it), so each table access in it is checked for
+/// replica lag on its own. The server checks a replica's lag for the
+/// outer table of a Distributed read only, so a subquery over another
+/// table would follow the outer table's choice of host.
+///
+/// It fails closed: `false` also for an `IN` not followed by `(`, an
+/// unbalanced parenthesis or a quote left open. Text inside quotes is not
+/// read as keywords.
 pub(crate) fn one_table_per_access(sql: &str) -> bool {
-    let _ = sql;
-    true
+    let b = sql.as_bytes();
+    // One entry per open parenthesis: whether it was opened by an `IN`.
+    let mut open: Vec<bool> = Vec::new();
+    let mut after_in = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' || c == b'"' || c == b'`' {
+            // A quoted literal or identifier: `\x` and a doubled quote
+            // stay inside it.
+            i += 1;
+            loop {
+                match b.get(i) {
+                    None => return false,
+                    Some(b'\\') => i += 2,
+                    Some(&q) if q == c && b.get(i + 1) == Some(&c) => i += 2,
+                    Some(&q) if q == c => break,
+                    Some(_) => i += 1,
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if after_in && c != b'(' {
+            return false;
+        }
+        if c == b'(' {
+            open.push(after_in);
+            after_in = false;
+        } else if c == b')' {
+            if open.pop().is_none() {
+                return false;
+            }
+        } else if c.is_ascii_alphanumeric() || c == b'_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let word = &sql[start..i];
+            if word.eq_ignore_ascii_case("IN") {
+                after_in = true;
+            } else if word.eq_ignore_ascii_case("FROM") && open.iter().any(|&by_in| by_in) {
+                return false;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    !after_in && open.is_empty()
 }
 
-/// The settings `fetch_rows_with` sends `sql` with: `settings`, tagged
-/// with the request's `log_comment`.
+/// Issue #18 part 2c r20: the three settings of
+/// [`crate::metrics::exec::lag_guard`], which only a statement
+/// [`one_table_per_access`] recognises keeps.
+const LAG_GUARD_KEYS: [&str; 3] = [
+    "max_replica_delay_for_distributed_queries",
+    "fallback_to_stale_replicas_for_distributed_queries",
+    "prefer_localhost_replica",
+];
+
+/// `settings` for `sql`: unchanged when `sql` is one-table, and otherwise
+/// without the lag guard's three settings, as before issue #18 part 2c.
+fn scoped(sql: &str, settings: &QuerySettings) -> QuerySettings {
+    if one_table_per_access(sql) {
+        return settings.clone();
+    }
+    LAG_GUARD_KEYS
+        .iter()
+        .fold(settings.clone(), |s, key| s.without(key))
+}
+
+/// The settings `fetch_rows_with` sends `sql` with: `settings` scoped by
+/// [`one_table_per_access`] and tagged with the request's `log_comment`.
 pub(crate) fn rows_with_settings(
     sql: &str,
     settings: &QuerySettings,
     log_comment: Option<&str>,
 ) -> QuerySettings {
-    let _ = sql;
-    tag(settings.clone(), log_comment)
+    tag(scoped(sql, settings), log_comment)
 }
 
 /// The settings `fetch_rows_charged_bytes` sends `sql` with, as
@@ -220,8 +295,7 @@ pub(crate) fn charged_bytes_settings(
     settings: &QuerySettings,
     log_comment: Option<&str>,
 ) -> QuerySettings {
-    let _ = sql;
-    tag(settings.clone(), log_comment)
+    tag(scoped(sql, settings), log_comment)
 }
 
 /// `settings` with `log_comment = comment`, when there is one.

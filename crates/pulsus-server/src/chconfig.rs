@@ -336,7 +336,6 @@ pub(crate) fn label_cache_config_from(config: &Config) -> LabelCacheConfig {
         ""
     };
     LabelCacheConfig {
-        max_replica_delay_secs: config.reader.promql_max_replica_delay.0.as_secs(),
         db: config.clickhouse.database.clone(),
         series_table: format!("metric_series{dist}"),
         labels_table: format!("metric_labels{dist}"),

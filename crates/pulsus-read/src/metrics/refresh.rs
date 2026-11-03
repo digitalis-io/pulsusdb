@@ -158,7 +158,6 @@ async fn fetch_rows(cache: &LabelCache, sql: &str) -> Result<Vec<SeriesRow>, ChE
             &sweep_settings(
                 cache.config.read_max_memory_bytes,
                 cache.config.skip_unavailable_shards,
-                cache.config.max_replica_delay_secs,
             ),
         )
         .await?;
@@ -192,19 +191,16 @@ async fn fetch_rows(cache: &LabelCache, sql: &str) -> Result<Vec<SeriesRow>, ChE
 pub(crate) fn sweep_settings(
     read_max_memory_bytes: u64,
     skip_unavailable_shards: bool,
-    max_replica_delay_secs: u64,
 ) -> QuerySettings {
-    // Issue #18 part 2c: the lag guard every PromQL read carries; the
-    // charts read their series and labels from this sweep.
-    super::exec::lag_guard(
-        QuerySettings::new()
-            .answer_pins(false, skip_unavailable_shards)
-            .set("max_memory_usage", read_max_memory_bytes)
-            .set("max_bytes_before_external_group_by", 0u64)
-            .set("distributed_product_mode", "local")
-            .set("join_algorithm", "hash"),
-        max_replica_delay_secs,
-    )
+    // Issue #18 part 2c r20: no lag guard. The sweep nests `metric_series`
+    // inside `metric_labels`, and the server checks a replica's lag for
+    // the outer table only, so it keeps the server's replica choice.
+    QuerySettings::new()
+        .answer_pins(false, skip_unavailable_shards)
+        .set("max_memory_usage", read_max_memory_bytes)
+        .set("max_bytes_before_external_group_by", 0u64)
+        .set("distributed_product_mode", "local")
+        .set("join_algorithm", "hash")
 }
 
 /// Spawns the recurring refresh task: ticks every `ttl`, running one

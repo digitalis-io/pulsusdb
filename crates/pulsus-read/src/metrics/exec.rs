@@ -6023,7 +6023,7 @@ mod tests {
     /// exists to remove.
     #[test]
     fn label_cache_sweep_carries_the_memory_ceiling() {
-        let s = crate::metrics::refresh::sweep_settings(TEST_READ_MEM, false, 5);
+        let s = crate::metrics::refresh::sweep_settings(TEST_READ_MEM, false);
         assert_eq!(
             s.get("max_memory_usage"),
             Some(TEST_READ_MEM.to_string().as_str())
@@ -6259,7 +6259,7 @@ mod tests {
         }
         // Issue #18 part 2c r20: the sweep nests one table inside another,
         // so it is sent with none of the three, as before this part.
-        let sweep = crate::metrics::refresh::sweep_settings(TEST_READ_MEM, false, 7);
+        let sweep = crate::metrics::refresh::sweep_settings(TEST_READ_MEM, false);
         for name in [
             "max_replica_delay_for_distributed_queries",
             "fallback_to_stale_replicas_for_distributed_queries",
@@ -6289,7 +6289,7 @@ mod tests {
                     ),
                     (
                         "sweep_settings".to_string(),
-                        crate::metrics::refresh::sweep_settings(TEST_READ_MEM, skip, 5),
+                        crate::metrics::refresh::sweep_settings(TEST_READ_MEM, skip),
                     ),
                 ];
                 for st in [Count, Rows, Thinned, Series] {

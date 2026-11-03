@@ -91,7 +91,6 @@ fn engine_config(db: &str, grouped_push: bool) -> MetricsConfig {
 /// series active only the day before are not resident.
 fn cache_config(db: &str) -> LabelCacheConfig {
     LabelCacheConfig {
-        max_replica_delay_secs: 5,
         skip_unavailable_shards: false,
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),

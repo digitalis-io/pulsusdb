@@ -332,7 +332,6 @@ async fn wait_for_cross_shard_split(
 
 fn cache_config_dist(db: &str) -> LabelCacheConfig {
     LabelCacheConfig {
-        max_replica_delay_secs: 5,
         skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
