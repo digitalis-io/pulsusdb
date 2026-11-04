@@ -2252,7 +2252,7 @@ mod tests {
                 tenant: Box::leak(Box::new(no_tenant())),
                 samples_table: "metric_samples",
                 labels_table: "metric_labels",
-                ids_sql: ids,
+                series: SideSeries::Ids(ids),
                 metric_name: name,
                 func: PushedRangeFn::Rate,
                 range_ms: 300_000,

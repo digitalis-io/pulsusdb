@@ -88,7 +88,6 @@ static DB_Q12: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read
 static DB_Q13: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_q13");
 static DB_Q14: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_q14");
 static DB_Q15: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_q15");
-static DB_Q16: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_q16");
 static DB_Q18: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_q18");
 
 /// The default levels and their switch points: 60 s first, the resolution
@@ -5625,7 +5624,7 @@ async fn a_matching_error_takes_todays_route() {
     assert!(failures.is_empty(), "T13:\n{}", failures.join("\n"));
 }
 
-/// The query of T14, T15 and T16: `i0`'s two one-side series overlap where
+/// The query of T14 and T15: `i0`'s two one-side series overlap where
 /// the many side has no sample.
 const T14_QUERY: &str = "sum by (instance) (rate(q_many_total[5m]) * on (instance) group_left (role) rate(q_one_total[5m]))";
 
