@@ -1,0 +1,35 @@
+{{- if and (index .Values "grafana-operator" "enabled") .Values.grafana.instance.enabled }}
+apiVersion: grafana.integreatly.org/v1beta1
+kind: Grafana
+metadata:
+  name: {{ include "pulsusdb.fullname" . }}
+  labels:
+    {{- include "pulsusdb.labels" . | nindent 4 }}
+    dashboards: {{ include "pulsusdb.fullname" . }}
+spec:
+  config:
+    log:
+      mode: console
+    security:
+      admin_user: {{ .Values.grafana.instance.adminUser }}
+      admin_password: {{ .Values.grafana.instance.adminPassword }}
+    {{- if .Values.grafana.instance.config }}
+    {{- toYaml .Values.grafana.instance.config | nindent 4 }}
+    {{- end }}
+  {{- if .Values.grafana.instance.ingress.enabled }}
+  ingress:
+    spec:
+      ingressClassName: {{ .Values.grafana.instance.ingress.className }}
+      rules:
+        - host: {{ .Values.grafana.instance.ingress.host }}
+          http:
+            paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: {{ include "pulsusdb.fullname" . }}-service
+                    port:
+                      number: 3000
+  {{- end }}
+{{- end }}

@@ -178,6 +178,25 @@
           "type": "object",
           "additionalProperties": false,
           "properties": { "enabled": { "type": "boolean" } }
+        },
+        "instance": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "adminUser": { "type": "string" },
+            "adminPassword": { "type": "string" },
+            "config": { "type": "object", "additionalProperties": true },
+            "ingress": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "className": { "type": "string" },
+                "host": { "type": "string" }
+              }
+            }
+          }
         }
       }
     },

@@ -349,6 +349,17 @@ grafana:
   # enabled by default alongside `pulsusdb.config.compat_endpoints=true`.
   datasourceProvisioning:
     enabled: true
+  # -- Deploy a Grafana CR via grafana-operator (requires grafana-operator.enabled=true).
+  instance:
+    enabled: false
+    adminUser: admin
+    adminPassword: admin
+    # -- Extra grafana.ini sections merged into spec.config (map of section → map of key → value).
+    config: {}
+    ingress:
+      enabled: false
+      className: ""
+      host: ""
 
 serviceAccount:
   create: true
