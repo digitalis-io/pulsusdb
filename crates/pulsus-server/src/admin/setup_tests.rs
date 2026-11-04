@@ -225,6 +225,31 @@ fn eight_levels() -> Pairs {
 const NO_MOVE: &str =
     "kept at least 365 days; no move rule; on local disk while the local disk has room";
 
+/// **S3 (issue #18 part 2c r21): the certificate field's help says each
+/// host's certificate must be valid for that host as entered.**
+#[tokio::test]
+async fn the_certificate_help_names_the_host() {
+    let r = admin_router();
+    let req = Request::builder()
+        .uri("/admin/setup")
+        .header(header::AUTHORIZATION, admin_header())
+        .body(Body::empty())
+        .unwrap();
+    let res = r.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let page = String::from_utf8(bytes.to_vec()).unwrap();
+    let marker = "<p class=\"help\" id=\"h-tls_cert\">";
+    let at = page.find(marker).expect("the certificate field's help") + marker.len();
+    let help = &page[at..at + page[at..].find("</p>").expect("the help closes")];
+    assert!(
+        help.contains("valid for that host exactly as entered above"),
+        "{help}"
+    );
+}
+
 /// **C10: the page answers each fixture with its files and its lines, and
 /// a file downloads as an attachment.**
 #[tokio::test]
