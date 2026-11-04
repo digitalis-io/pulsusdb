@@ -1,12 +1,14 @@
 //! Issue #18 part B: reading the rollup levels, against a live ClickHouse.
 //!
-//! Each case builds its own database with `run_init`, stops every level
-//! view right after (part A's driving runs), lands its samples through
-//! `metric_landing`, builds the first level by the first-level view's own
-//! statement with its `plan` scalar replaced by a literal interval, one
-//! statement per interval, and every later level by its view, run until
-//! idle. Two engines read it over one label cache: one with the rollup
-//! levels (routing on) and one without (routing off).
+//! Each case builds or leases a database with `run_init`, every level view
+//! stopped right after (part A's driving runs). Samples land through
+//! `metric_landing`; the first level is built by the first-level view's own
+//! statement with its `plan` scalar replaced by a literal interval, an hour
+//! a statement; every later level by its own view's statement run as an
+//! insert, a day at most a statement, until one writes no run row. Cases
+//! that only read a corpus share one database per corpus. Two engines read
+//! it over one label cache: one with the rollup levels (routing on) and one
+//! without (routing off).
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`:
 //!
@@ -43,7 +45,6 @@ const HOUR: i64 = 3_600_000;
 const DAY: i64 = 86_400_000;
 const SCRAPE: i64 = 15_000;
 
-static DB_B2: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b2");
 static DB_B3: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b3");
 static DB_B4: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b4");
 static DB_B5: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b5");
@@ -53,35 +54,13 @@ static DB_B7: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_
 static DB_B10: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b10");
 static DB_S2: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_s2");
 static DB_B2E: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b2e");
-static DB_T4: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t4");
-static DB_T9: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t9");
 static DB_T10: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t10");
-static DB_T14: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t14");
-static DB_R1: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_r1");
 static DB_H1: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_h1");
-static DB_RR: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_rr");
 static DB_L1: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_l1");
-static DB_L2: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_l2");
-static DB_L3: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_l3");
-static DB_L4: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_l4");
-static DB_L5: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_l5");
 static DB_L7: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_l7");
-static DB_L8: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_l8");
-static DB_P1: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p1");
-static DB_P2: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p2");
-static DB_P3: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p3");
-static DB_P4: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p4");
 static DB_P5: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p5");
-static DB_P6: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p6");
-static DB_P20: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p20");
-static DB_P21: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p21");
 static DB_P22: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p22");
-static DB_P60: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p60");
-static DB_P61: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p61");
-static DB_P62: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p62");
 static DB_P64: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p64");
-static DB_P65: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p65");
-static DB_P30: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p30");
 static DB_P31: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p31");
 static DB_P33: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p33");
 
@@ -265,8 +244,50 @@ async fn build_later_by_view(client: &ChClient, ctx: &RenderCtx) {
     }
 }
 
+/// Level `r`'s view statement (a level after the first) as an insert: the
+/// view's own plan, watermark and hole rule, a run capped at the end of the
+/// UTC day its first bucket ends in instead of 10 buckets on.
+fn later_level_insert(ctx: &RenderCtx, r: u32) -> String {
+    let head = format!("CREATE MATERIALIZED VIEW {}.metric_samples_{r}s_mv", ctx.db);
+    let view = pulsus_schema::rendered_statements(ctx)
+        .into_iter()
+        .find(|s| s.starts_with(&head))
+        .expect("the level's view");
+    let body = &view[view.find("AS WITH ").expect("AS WITH") + 3..];
+    let cap = format!(", b + 9 * {r}000)");
+    assert_eq!(
+        body.matches(&cap).count(),
+        1,
+        "the 10-bucket cap, once:\n{body}"
+    );
+    format!(
+        "INSERT INTO {}.metric_samples_{r}s\n{}",
+        ctx.db,
+        body.replacen(&cap, ", (intDiv(b - 1, 86400000) + 1) * 86400000)", 1)
+    )
+}
+
 /// Every level after the first, in order: its statement until one writes no run row.
-async fn build_later_by_statement(_client: &ChClient, _ctx: &RenderCtx) {}
+async fn build_later_by_statement(client: &ChClient, ctx: &RenderCtx) {
+    for &r in &ctx.rollup_levels[1..] {
+        let sql = later_level_insert(ctx, r);
+        let mut before = run_count(client, &ctx.db, r).await;
+        let mut idle = false;
+        for _ in 0..1000 {
+            exec(client, &sql).await;
+            let now = run_count(client, &ctx.db, r).await;
+            if now == before {
+                idle = true;
+                break;
+            }
+            before = now;
+        }
+        assert!(
+            idle,
+            "level {r}s still writes run rows after 1000 statements"
+        );
+    }
+}
 
 /// Removes level `r`'s coverage of `(a, b]`: the run rows overlapping it
 /// are deleted and their parts outside it written back. Data rows stay.
@@ -502,7 +523,7 @@ async fn build(
     tenants: &[Tenant],
 ) -> Built {
     let (bootstrap, admin, ctx) = first_only(db, levels, land, lo, hi).await;
-    build_later_by_view(&admin, &ctx).await;
+    build_later_by_statement(&admin, &ctx).await;
     warm(bootstrap, admin, ctx, tenants).await
 }
 
@@ -636,7 +657,6 @@ impl Shared {
     /// The corpus for member `test`, built by the first member to ask, and
     /// its anchor. Under the process-per-test harness each member builds a
     /// private database instead.
-    #[allow(dead_code)] // the members lease from the next commit on
     async fn lease(&'static self, test: &str) -> (Built, i64) {
         let k = self
             .members
@@ -1138,9 +1158,10 @@ fn corpus_e(db: &str, end: i64) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn each_served_function_is_within_its_distance() {
     skip_unless_live!();
-    let day0 = today() - 8 * DAY;
+    let (built, day0) = D5_8
+        .lease("each_served_function_is_within_its_distance")
+        .await;
     let end = day0 + 8 * DAY;
-    let built = corpus_d(DB_B2.name(), FIVE, day0, 0..8).await;
     let levels = built.slot.get().expect("the levels are read");
     assert_eq!(levels.levels.len(), 5, "{levels:?}");
     let e_land = corpus_e(DB_B2E.name(), end);
@@ -1632,7 +1653,7 @@ async fn a_hole_reads_raw() {
     build_first(&admin, &ctx, day, end, HOUR).await;
     let hole = day + 10 * HOUR;
     cut_runs(&admin, db, ctx.rollup_levels[0], hole, hole + HOUR).await;
-    build_later_by_view(&admin, &ctx).await;
+    build_later_by_statement(&admin, &ctx).await;
     let built = warm(bootstrap, admin, ctx, &[]).await;
 
     let p = range(day + 2 * HOUR, end, HOUR);
@@ -2120,7 +2141,7 @@ async fn stale_and_nan_read_as_raw() {
     }
     // The first level by one run over the whole corpus.
     build_first(&admin, &ctx, e - 15 * DAY, e, 15 * DAY).await;
-    build_later_by_view(&admin, &ctx).await;
+    build_later_by_statement(&admin, &ctx).await;
     let built = warm(bootstrap, admin, ctx, &[]).await;
 
     let mut failures = Vec::new();
@@ -2330,8 +2351,7 @@ fn vector_or_matrix(x: &Answer) -> BTreeMap<(String, i64), String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_week_reads_two_hour_rows() {
     skip_unless_live!();
-    let day0 = today() - 8 * DAY;
-    let built = corpus_d(DB_T4.name(), FIVE, day0, 0..8).await;
+    let (built, day0) = D5_8.lease("a_week_reads_two_hour_rows").await;
     let db = built.db().to_string();
     let mut cfg = cache_config(&db);
     cfg.window_ms = DAY;
@@ -2479,8 +2499,7 @@ fn per_series(x: &Answer) -> BTreeMap<String, Vec<i64>> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_raw_only_query_keeps_its_grid() {
     skip_unless_live!();
-    let day0 = today() - 8 * DAY;
-    let built = corpus_d(DB_T9.name(), FIVE, day0, 0..8).await;
+    let (built, day0) = D5_8.lease("a_raw_only_query_keeps_its_grid").await;
     assert!(built.slot.get().is_some_and(|l| l.levels.len() == 5));
     let start = day0 + 10 * MIN + 7_123;
     let p = range(start, start + 7 * DAY, 5 * MIN);
@@ -2600,8 +2619,7 @@ async fn a_grid_from_start_routes_where_the_times_fit() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_range_below_the_first_level_reads_raw() {
     skip_unless_live!();
-    let day0 = today() - 8 * DAY;
-    let built = corpus_d(DB_R1.name(), DEFAULTS, day0, 6..8).await;
+    let (built, day0) = D60_2.lease("a_range_below_the_first_level_reads_raw").await;
     let found = built.slot.get().expect("the levels");
     let first = &found.levels[0];
     assert_eq!(
@@ -2650,8 +2668,9 @@ async fn a_range_below_the_first_level_reads_raw() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pushed_aggregate_beside_a_routed_selector() {
     skip_unless_live!();
-    let day0 = today() - 8 * DAY;
-    let built = corpus_d(DB_T14.name(), FIVE, day0, 0..8).await;
+    let (built, day0) = D5_8
+        .lease("a_pushed_aggregate_beside_a_routed_selector")
+        .await;
     let end = day0 + 8 * DAY;
     let start = end - 7 * DAY + 1;
     let query = r#"count(g) + scalar(max_over_time(g{s="160"}[1h] @ end()))"#;
@@ -3144,9 +3163,10 @@ async fn a_panel_reads_the_level_its_range_selects() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lattice_reads_no_finer_level_where_its_own_covers() {
     skip_unless_live!();
-    let day0 = today() - 8 * DAY;
+    let (built, day0) = D60_2
+        .lease("the_lattice_reads_no_finer_level_where_its_own_covers")
+        .await;
     let end = day0 + 8 * DAY;
-    let built = corpus_d(DB_L2.name(), DEFAULTS, day0, 6..8).await;
     let comment = format!("{}_l2_on_{}", built.db(), now_ms());
     let p = range(end - 2 * DAY + 6 * MIN, end - 6 * MIN, 2 * MIN);
     let a = ask(
@@ -3189,9 +3209,10 @@ async fn the_lattice_reads_no_finer_level_where_its_own_covers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_week_and_three_hours_fill_from_their_levels() {
     skip_unless_live!();
-    let day0 = today() - 8 * DAY;
+    let (built, day0) = D60_8
+        .lease("a_week_and_three_hours_fill_from_their_levels")
+        .await;
     let end = day0 + 8 * DAY;
-    let built = corpus_d(DB_L3.name(), DEFAULTS, day0, 0..8).await;
     let routed = built.engine(true, None).await;
     let raw = built.engine(false, None).await;
     let t = no_tenant();
@@ -3319,8 +3340,9 @@ async fn a_day_level_fills_a_week() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pushdown_on_the_request_grid_and_when_filled() {
     skip_unless_live!();
-    let end = p_end();
-    let built = corpus_p(DB_L5.name(), end).await;
+    let (built, end) = P
+        .lease("pushdown_on_the_request_grid_and_when_filled")
+        .await;
     let on = built.pushed_engine(None).await;
     let off = built.engine(true, None).await;
     let t = no_tenant();
@@ -3403,9 +3425,10 @@ async fn pushdown_on_the_request_grid_and_when_filled() {
 #[tokio::test(flavor = "multi_thread")]
 async fn queries_off_the_lattice_keep_the_request_grid() {
     skip_unless_live!();
-    let day0 = today() - 8 * DAY;
+    let (built, day0) = D60_2
+        .lease("queries_off_the_lattice_keep_the_request_grid")
+        .await;
     let end = day0 + 8 * DAY;
-    let built = corpus_d(DB_L4.name(), DEFAULTS, day0, 6..8).await;
     let p = range(end - 2 * DAY + 6 * MIN, end, 2 * MIN);
     let times = times_of(&p);
     let routed = built.engine(true, None).await;
@@ -3453,9 +3476,10 @@ async fn queries_off_the_lattice_keep_the_request_grid() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_query_that_reads_the_step_time_keeps_its_steps() {
     skip_unless_live!();
-    let day0 = today() - 8 * DAY;
+    let (built, day0) = D60_2
+        .lease("a_query_that_reads_the_step_time_keeps_its_steps")
+        .await;
     let end = day0 + 8 * DAY;
-    let built = corpus_d(DB_L8.name(), DEFAULTS, day0, 6..8).await;
     let p = range(end - 2 * DAY + 6 * MIN, end, 2 * MIN);
     let routed = built.engine(true, None).await;
     let lattice = |a: &Answer| a.explain.stages.iter().any(|s| s.name == "rollup_lattice");
@@ -3499,9 +3523,8 @@ type RoundedCase = (
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rounded_range_is_within_its_distance() {
     skip_unless_live!();
-    let day0 = today() - 8 * DAY;
+    let (built, day0) = D60_8.lease("a_rounded_range_is_within_its_distance").await;
     let end = day0 + 8 * DAY;
-    let built = corpus_d(DB_RR.name(), DEFAULTS, day0, 0..8).await;
     let rows: [RoundedCase; 3] = [
         (
             "6 h",
@@ -3904,8 +3927,9 @@ fn served_tables(x: &Answer) -> std::collections::BTreeSet<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_level_rate_aggregate_answers_as_in_process() {
     skip_unless_live!();
-    let end = p_end();
-    let built = corpus_p(DB_P1.name(), end).await;
+    let (built, end) = P
+        .lease("a_level_rate_aggregate_answers_as_in_process")
+        .await;
     let on = built.pushed_engine(None).await;
     let off = built.engine(true, None).await;
     let windows = [
@@ -3937,9 +3961,8 @@ async fn a_level_rate_aggregate_answers_as_in_process() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_panel_sends_groups_not_level_rows() {
     skip_unless_live!();
-    let end = p_end();
-    let db = DB_P2.name();
-    let built = corpus_p(db, end).await;
+    let (built, end) = P.lease("the_panel_sends_groups_not_level_rows").await;
+    let db = &built.db().to_string();
     // Unique to this run: the log keeps every earlier run's statements
     // under the same database name.
     let comment = format!("{db}_panel_{}", now_ms());
@@ -3988,8 +4011,9 @@ async fn the_panel_sends_groups_not_level_rows() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_vector_match_under_an_aggregate_answers_as_in_process() {
     skip_unless_live!();
-    let end = p_end();
-    let built = corpus_p(DB_P3.name(), end).await;
+    let (built, end) = P
+        .lease("a_vector_match_under_an_aggregate_answers_as_in_process")
+        .await;
     let on = built.pushed_engine(None).await;
     let off = built.engine(true, None).await;
     let p = range(end - 15 * HOUR, end, 2 * MIN);
@@ -4060,9 +4084,8 @@ async fn a_vector_match_under_an_aggregate_answers_as_in_process() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unpushed_shapes_take_todays_route() {
     skip_unless_live!();
-    let end = p_end();
-    let db = DB_P4.name();
-    let built = corpus_p(db, end).await;
+    let (built, end) = P.lease("unpushed_shapes_take_todays_route").await;
+    let db = &built.db().to_string();
     // `fill` is an experimental modifier.
     let engine = |push: bool| {
         let mut cfg = engine_config(db, push);
@@ -4195,9 +4218,8 @@ async fn a_histogram_side_falls_back() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_split_level_node_reads_its_prefix() {
     skip_unless_live!();
-    let end = p_end();
-    let db = DB_P6.name();
-    let built = corpus_p(db, end).await;
+    let (built, end) = P.lease("a_split_level_node_reads_its_prefix").await;
+    let db = &built.db().to_string();
     // Unique to this run: the log keeps every earlier run's statements
     // under the same database name.
     let comment = format!("{db}_split_{}", now_ms());
@@ -4287,8 +4309,9 @@ async fn corpus_p2_with(db: &str, end: i64, more: Vec<String>) -> Built {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_coarse_level_aggregate_answers_as_in_process() {
     skip_unless_live!();
-    let end = p_end();
-    let built = corpus_p2(DB_P20.name(), end).await;
+    let (built, end) = P2
+        .lease("a_coarse_level_aggregate_answers_as_in_process")
+        .await;
     let on = built.pushed_engine(None).await;
     let off = built.engine(true, None).await;
     let w24 = range(end - DAY, end, 12 * MIN);
@@ -4341,8 +4364,7 @@ async fn a_coarse_level_aggregate_answers_as_in_process() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_week_reads_the_two_hour_level_pushed() {
     skip_unless_live!();
-    let end = p_end();
-    let built = corpus_p2(DB_P21.name(), end).await;
+    let (built, end) = P2.lease("a_week_reads_the_two_hour_level_pushed").await;
     let on = built.pushed_engine(None).await;
     let off = built.engine(true, None).await;
     let e2h = end.div_euclid(2 * HOUR) * 2 * HOUR;
@@ -4467,8 +4489,7 @@ async fn one_histogram(built: &Built, t: i64) {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_filled_request_pushes_both_reads() {
     skip_unless_live!();
-    let end = p_end();
-    let built = corpus_p(DB_P30.name(), end).await;
+    let (built, end) = P.lease("a_filled_request_pushes_both_reads").await;
     let on = built.pushed_engine(None).await;
     let off = built.engine(true, None).await;
     let t = no_tenant();
@@ -4812,9 +4833,10 @@ async fn t60_uncovered(admin: &ChClient, db: &str, window: (i64, i64)) -> Vec<(i
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pushed_node_reads_no_more_than_in_process() {
     skip_unless_live!();
-    let end = p_end();
-    let db = DB_P60.name();
-    let built = corpus_p2(db, end).await;
+    let (built, end) = P2
+        .lease("a_pushed_node_reads_no_more_than_in_process")
+        .await;
+    let db = &built.db().to_string();
     let probe = ask(
         &built.engine(true, None).await,
         &no_tenant(),
@@ -5000,9 +5022,10 @@ async fn a_pushed_node_reads_no_more_than_in_process() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_side_the_cache_cannot_answer_keeps_its_series_statement() {
     skip_unless_live!();
-    let end = p_end();
-    let db = DB_P61.name();
-    let built = corpus_p2(db, end).await;
+    let (built, end) = P2
+        .lease("a_side_the_cache_cannot_answer_keeps_its_series_statement")
+        .await;
+    let db = &built.db().to_string();
     // A label cache that was never refreshed: every resolution falls back
     // to SQL.
     let cold = Arc::new(LabelCache::new(
@@ -5050,9 +5073,8 @@ async fn a_side_the_cache_cannot_answer_keeps_its_series_statement() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lag_guard_reaches_every_statement() {
     skip_unless_live!();
-    let end = p_end();
-    let db = DB_P62.name();
-    let built = corpus_p2(db, end).await;
+    let (built, end) = P2.lease("the_lag_guard_reaches_every_statement").await;
+    let db = &built.db().to_string();
     let probe = ask(
         &built.engine(true, None).await,
         &no_tenant(),
@@ -5207,9 +5229,9 @@ async fn a_series_registered_after_the_sweep_is_left_out_by_both_routes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_statement_at_the_cap_declines_and_one_below_pushes() {
     skip_unless_live!();
-    let end = p_end();
-    let db = DB_P65.name();
-    let built = corpus_p2(db, end).await;
+    let (built, end) = P2
+        .lease("a_statement_at_the_cap_declines_and_one_below_pushes")
+        .await;
     let off = built.engine(true, None).await;
     let t = no_tenant();
     let q = "sum by (instance) (rate(p_rx_total[12m]))";
@@ -5571,6 +5593,8 @@ fn every_shared_member_leases_its_corpus() {
                 .unwrap_or_else(|| panic!("{name}: no test `{member}` in the file"));
             let body = &text[at..];
             let body = &body[..body.find("\n}\n").expect("the end of the test")];
+            // The call as written, whatever lines the formatter breaks it over.
+            let body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
             let call = format!("{name}.lease(\"{member}\")");
             assert!(
                 body.contains(&call),
