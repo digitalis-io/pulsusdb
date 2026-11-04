@@ -47,9 +47,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends clang \
     && rm -rf /var/lib/apt/lists/*
 ENV CC=clang
-# aws-lc-sys x86 assembly segfaults / exits 254 under QEMU (Apple Silicon).
-# The C fallbacks are correct and sufficient for this workload.
-ARG AWS_LC_SYS_NO_ASM=1
+# aws-lc-sys 0.42.0 forbids AWS_LC_SYS_NO_ASM=1 in release builds.
+# Default to 0 (assembly enabled). Pass --build-arg AWS_LC_SYS_NO_ASM=1
+# only for debug builds when targeting QEMU-emulated arm64.
+ARG AWS_LC_SYS_NO_ASM=0
 ENV AWS_LC_SYS_NO_ASM=${AWS_LC_SYS_NO_ASM}
 WORKDIR /src
 # Copies the whole build context — including vendor/promql-parser, not
@@ -64,7 +65,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends clang cmake \
     && rm -rf /var/lib/apt/lists/*
 ENV CC=clang
-ARG AWS_LC_SYS_NO_ASM=1
+ARG AWS_LC_SYS_NO_ASM=0
 ENV AWS_LC_SYS_NO_ASM=${AWS_LC_SYS_NO_ASM}
 WORKDIR /src
 COPY --from=planner /src/recipe.json recipe.json
