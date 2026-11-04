@@ -36,6 +36,7 @@ maintainers:
     url: https://digitalis.io
 dependencies:
   - name: grafana-operator
+    alias: grafanaOperator
     version: ">=5.0.0-0"
     repository: https://grafana.github.io/helm-charts
     condition: grafanaOperator.enabled
