@@ -6218,13 +6218,15 @@ mod tests {
         assert_eq!(got[2], vec![run(40, 70)], "the third side reads its own");
     }
 
-    /// **U2 (issue #18 part 2c): every PromQL settings builder carries the
-    /// lag guard**, clustered or not: the configured delay, stale replicas
-    /// as the last resort, and the local copy preferred. The dispatcher
-    /// takes it off a statement that is not one-table (U8). The label
-    /// cache's sweep carries none of it (r20).
+    /// **U2 (issue #18 part 2c): the request-path settings builders carry
+    /// the lag guard, and the label cache's sweep carries none of it.**
+    /// `metrics_read_settings`, `series_read_settings` and each
+    /// `exemplar_settings`, clustered or not, set the configured delay,
+    /// stale replicas as the last resort, and the local copy preferred.
+    /// `sweep_settings` sets none of the three (r20). Which statements keep
+    /// the guard when sent is the dispatcher's choice (U8).
     #[test]
-    fn every_promql_read_carries_the_lag_guard() {
+    fn the_read_builders_carry_the_lag_guard_and_the_sweep_does_not() {
         use ExemplarStatement::{Count, Rows, Series, Thinned};
         for distributed in [false, true] {
             let mut builders: Vec<(String, QuerySettings)> = vec![
