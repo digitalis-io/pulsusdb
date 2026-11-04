@@ -5,6 +5,8 @@
 > that nothing waits for a flush trigger, or that a deduplication window counts pushes, are out of
 > date. Current behaviour: `docs/api.md` §1.0 and `crates/pulsus-write/src/writer/landing.rs`.
 
+> **Stale on structured metadata in the counting statements.** Since issue #624 part 8, a raw counting statement reads `'' AS structured_metadata` and groups by fingerprint alone, as the rollup statement does, when its plan is clean — `count_over_time`, `bytes_over_time`, `rate` or `bytes_rate` with no stage but line filters, no `ip(…)` alternative and no lowered metadata filter — and the innermost aggregation is a bare `sum`, or a `sum by (L)` where no name in `L` starts with `__` or ends with `_extracted` and every selected stream carries every name in `L` as a stream label. Under those shapes the rollup's documented limit (a non-empty `__error__` in a line's metadata is counted, not refused) applies on the raw route too. Passages below that show such a statement grouped by `structured_metadata`, or that say only the rollup route has that limit, are out of date. Current behaviour: `docs/api.md` §2 and `counting_projection` in `crates/pulsus-read/src/logql/rollup.rs`.
+
 > **Stale on the PromQL push.** Since issue #579 part 5, an aggregate over a vector match with `on`, `ignoring`, `group_left` or `group_right` also runs in ClickHouse. Passages below that say only one-to-one matches, or only the shapes they list, are pushed are out of date. Current behaviour: `docs/configuration.md`, `PULSUS_PROMQL_GROUPED_PUSH`.
 
 # PulsusDB ClickHouse Schemas
