@@ -148,6 +148,7 @@ fn cache_config(db: &str) -> LabelCacheConfig {
 
 fn engine_config(db: &str, max_metric_fanout: u64) -> MetricsConfig {
     MetricsConfig {
+        max_replica_delay_secs: 5,
         skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.

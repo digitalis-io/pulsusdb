@@ -47,6 +47,31 @@ pub struct Levels {
 pub struct LevelSlot {
     current: RwLock<Option<Arc<Levels>>>,
     failures: AtomicU64,
+    /// Issue #18 part 2c: the latest replica-lag read, `None` before the
+    /// first.
+    replicas: RwLock<Option<Vec<ReplicaDelay>>>,
+    /// Issue #18 part 2c: every `(host, table)` any read has returned, its
+    /// last delay, and whether the latest read returned it.
+    replica_history: RwLock<std::collections::BTreeMap<(String, String), (u64, bool)>>,
+}
+
+/// Issue #18 part 2c: one replica's lag for one PulsusDB table, from
+/// `system.replicas` on every replica of the cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct ReplicaDelay {
+    pub host: String,
+    pub table: String,
+    pub absolute_delay: u64,
+}
+
+/// Issue #18 part 2c: the replica-lag statement, every replica of
+/// `cluster`, a replica it cannot reach left out.
+pub fn replica_delay_sql(cluster: &str, db: &str) -> String {
+    format!(
+        "SELECT hostName() AS host, table, absolute_delay FROM clusterAllReplicas({}, system.replicas) WHERE database = {} ORDER BY host, table SETTINGS skip_unavailable_shards = 1",
+        ch_string(cluster),
+        ch_string(db)
+    )
 }
 
 impl LevelSlot {
@@ -72,6 +97,48 @@ impl LevelSlot {
     /// Discoveries that failed since the process started.
     pub fn failures(&self) -> u64 {
         self.failures.load(Ordering::Relaxed)
+    }
+
+    /// Issue #18 part 2c: records the latest replica-lag read.
+    pub fn set_replicas(&self, rows: Vec<ReplicaDelay>) {
+        {
+            let mut history = match self.replica_history.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for seen in history.values_mut() {
+                seen.1 = false;
+            }
+            for r in &rows {
+                history.insert((r.host.clone(), r.table.clone()), (r.absolute_delay, true));
+            }
+        }
+        match self.replicas.write() {
+            Ok(mut g) => *g = Some(rows),
+            Err(poisoned) => *poisoned.into_inner() = Some(rows),
+        }
+    }
+
+    /// Issue #18 part 2c: the latest replica-lag read, `None` before the
+    /// first.
+    pub fn replicas(&self) -> Option<Vec<ReplicaDelay>> {
+        match self.replicas.read() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Issue #18 part 2c: every `(host, table)` any read has returned, with
+    /// its last delay and whether the latest read returned it.
+    pub fn replica_gauges(&self) -> Vec<(String, String, u64, bool)> {
+        let history = match self.replica_history.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        history
+            .iter()
+            .map(|((host, table), (delay, seen))| (host.clone(), table.clone(), *delay, *seen))
+            .collect()
     }
 }
 
@@ -157,6 +224,16 @@ pub async fn refresh_levels(
         })
     }
     .await;
+    // Issue #18 part 2c: clustered, each replica's lag, read with the
+    // levels. A failed read keeps the last one.
+    if let Some(c) = cluster {
+        match fetch::<ReplicaDelay>(client, &replica_delay_sql(c, db)).await {
+            Ok(rows) => slot.set_replicas(rows),
+            Err(err) => {
+                tracing::warn!(error = %err, "replica delay read failed; keeping the last read")
+            }
+        }
+    }
     match result {
         Ok(levels) => {
             slot.set(levels);
@@ -466,6 +543,12 @@ pub struct LevelRow {
 /// of `table` that overlap `window`, `(lo, hi]`, each with the shard that
 /// answered it: [`level_fetch`]'s run rows without its data rows.
 pub fn level_runs(table: &str, window: (i64, i64), clustered: bool) -> String {
+    level_runs_within(table, &[window], clustered)
+}
+
+/// Issue #18 part 2c: [`level_runs`] over the intervals `within`, each
+/// `(lo, hi]`: a finer level's coverage over what the coarser ones left.
+pub fn level_runs_within(table: &str, within: &[(i64, i64)], clustered: bool) -> String {
     let shard = if clustered {
         "_shard_num"
     } else {
@@ -475,7 +558,7 @@ pub fn level_runs(table: &str, window: (i64, i64), clustered: bool) -> String {
         "SELECT {shard} AS shard, t_last, t_end\n\
          FROM {table}\n\
          WHERE kind = 1 AND org_id = '' AND fingerprint = 0 AND {}",
-        intervals_predicate("t_end", "t_last", "<", &[window]),
+        intervals_predicate("t_end", "t_last", "<", within),
     )
 }
 
@@ -1787,6 +1870,16 @@ mod tests {
         );
         assert_eq!(e.served, vec![(0, vec![(0, 100)])], "(e)");
         assert_eq!(e.todo, Vec::<(i64, i64)>::new(), "(e)");
+    }
+
+    /// **U5 (issue #18 part 2c): the replica-delay statement skips an
+    /// unreachable replica.**
+    #[test]
+    fn the_replica_delay_statement_skips_an_unreachable_replica() {
+        assert_eq!(
+            replica_delay_sql("pulsus_test_cluster", "pulsus"),
+            "SELECT hostName() AS host, table, absolute_delay FROM clusterAllReplicas('pulsus_test_cluster', system.replicas) WHERE database = 'pulsus' ORDER BY host, table SETTINGS skip_unavailable_shards = 1"
+        );
     }
 
     /// **B1d (issue #18 part B): coverage is each shard's union of run

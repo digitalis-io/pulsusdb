@@ -88,7 +88,7 @@ fn tls_install(v: &Validated, kind: &str) -> String {
     };
     let own = format!("-o {CH_OWNER} -g {CH_OWNER}");
     format!(
-        " Then put the TLS files at the paths the form names, readable by `{CH_OWNER}`: on each {kind} host, with that host's own certificate and key,\n\n```sh\nsudo install -D -m 644 {own} <this host's certificate> {}\nsudo install -D -m 600 {own} <this host's private key> {}\nsudo install -D -m 644 {own} <the CA certificate> {}\n```",
+        " Then put the TLS files at the paths the form names, readable by `{CH_OWNER}`: on each {kind} host, with that host's own certificate and key; the certificate must be valid for that host exactly as the form names it, the same DNS name or address, because the other hosts check it when they connect,\n\n```sh\nsudo install -D -m 644 {own} <this host's certificate> {}\nsudo install -D -m 600 {own} <this host's private key> {}\nsudo install -D -m 644 {own} <the CA certificate> {}\n```",
         t.cert, t.key, t.ca
     )
 }
@@ -479,7 +479,7 @@ pub(crate) fn setup_md(v: &Validated, statements: usize, paths: &[String]) -> St
 
     let _ = write!(
         out,
-        "\n### V5\n\nWith `PULSUS_URL` set to PulsusDB's address (for example `http://pulsusdb:3100`) and the admin pair in the environment (`admin` / `admin` when unset), run this with `sh`. It waits for PulsusDB to answer with its list of {n} levels: discovery runs at start and then every 60 s, and the list is `null` until the first one.\n\n```sh\n# V5 begin\ntries=${{V5_TRIES:-24}}; pause=${{V5_PAUSE:-5}}; i=0\nwhile [ \"$i\" -lt \"$tries\" ]; do\n  if body=$(curl -s --fail-with-body -u \"${{PULSUS_ADMIN_USER:-admin}}:${{PULSUS_ADMIN_PASSWORD:-admin}}\" \"$PULSUS_URL/admin/api/v1/database\"); then\n    case \"$body\" in\n      *'\"levels\":['*) got=$(printf '%s' \"$body\" | grep -o '\"table\":' | wc -l | tr -d ' ') ;;\n      *) got=null ;;\n    esac\n  else\n    got=\"an error\"\n  fi\n  if [ \"$got\" = {n} ]; then echo \"V5: {n} levels\"; exit 0; fi\n  i=$((i + 1)); sleep \"$pause\"\ndone\necho \"V5: got $got, want {n} levels\" >&2; exit 1\n# V5 end\n```\n\nExpected: exit 0, printing `V5: {n} levels`.\n"
+        "\n### V5\n\nWith `PULSUS_URL` set to PulsusDB's address (for example `http://pulsusdb:3100`) and the admin pair in the environment (`admin` / `admin` when unset), run this with `sh`. It waits for PulsusDB to answer with its list of {n} levels: discovery runs at start and then every 60 s, and the list is `null` until the first one.\n\n```sh\n# V5 begin\ntries=${{V5_TRIES:-24}}; pause=${{V5_PAUSE:-5}}; i=0\nwhile [ \"$i\" -lt \"$tries\" ]; do\n  if body=$(curl -s --fail-with-body -u \"${{PULSUS_ADMIN_USER:-admin}}:${{PULSUS_ADMIN_PASSWORD:-admin}}\" \"$PULSUS_URL/admin/api/v1/database\"); then\n    case \"$body\" in\n      *'\"levels\":['*) got=$(printf '%s' \"$body\" | sed -n 's/.*\"levels\":\\[\\([^]]*\\)\\].*/\\1/p' | grep -o '\"table\":' | wc -l | tr -d ' ') ;;\n      *) got=null ;;\n    esac\n  else\n    got=\"an error\"\n  fi\n  if [ \"$got\" = {n} ]; then echo \"V5: {n} levels\"; exit 0; fi\n  i=$((i + 1)); sleep \"$pause\"\ndone\necho \"V5: got $got, want {n} levels\" >&2; exit 1\n# V5 end\n```\n\nExpected: exit 0, printing `V5: {n} levels`.\n"
     );
     out
 }

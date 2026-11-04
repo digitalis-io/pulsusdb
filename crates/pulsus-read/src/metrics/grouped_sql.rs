@@ -700,13 +700,66 @@ pub struct LevelRead<'a> {
     pub overlaid: bool,
 }
 
+/// Issue #18 part 2c: how a side's statements name its series: the ID
+/// statement, or, for a side the label cache answered, the cache's own
+/// fingerprints and members as literals.
+#[derive(Debug, Clone, Copy)]
+pub enum SideSeries<'a> {
+    Ids(&'a str),
+    Known { list: &'a str, members: &'a str },
+}
+
+/// Issue #18 part 2c: `MEMBERS_KNOWN` — a side's members from the label
+/// cache's pairs, in the order given (ascending fingerprint), ranked from 1.
+pub fn members_known(pairs: &[(FpLiteral, &pulsus_model::LabelSet)]) -> String {
+    let members = pairs
+        .iter()
+        .enumerate()
+        .map(|(i, (fp, labels))| {
+            let mut kv: Vec<(&str, &str)> =
+                labels.iter().filter(|(k, _)| *k != "__name__").collect();
+            kv.sort_unstable();
+            let kv = kv
+                .iter()
+                .map(|(k, v)| format!("({}, {})", ch_string(k), ch_string(v)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "({}, {}, [{kv}])",
+                sample_sql::render_fingerprint_list(std::slice::from_ref(fp)),
+                i + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT m.1 AS fingerprint, m.2 AS rank, m.3 AS kv
+FROM (SELECT arrayJoin(CAST([{members}], 'Array(Tuple(UInt128, UInt64, Array(Tuple(String, String))))')) AS m)"
+    )
+}
+
+impl SideSeries<'_> {
+    /// The statements' series filter: the literal list for a known side,
+    /// else `fingerprint [GLOBAL ]IN (ids)`.
+    pub fn filter(&self, global: bool) -> String {
+        match self {
+            SideSeries::Ids(ids) => {
+                let global = if global { "GLOBAL " } else { "" };
+                format!("fingerprint {global}IN (\n{ids}\n)")
+            }
+            SideSeries::Known { list, .. } => format!("fingerprint IN ({list})"),
+        }
+    }
+}
+
 /// Issue #579 part 4: one side of a pushed node, as its statements read it.
 #[derive(Debug, Clone, Copy)]
 pub struct SideSql<'a> {
     pub tenant: &'a Tenant,
     pub samples_table: &'a str,
     pub labels_table: &'a str,
-    pub ids_sql: &'a str,
+    /// Issue #18 part 2c: how the statements name the side's series.
+    pub series: SideSeries<'a>,
     pub metric_name: &'a str,
     pub func: PushedRangeFn,
     pub range_ms: i64,
@@ -719,85 +772,37 @@ pub struct SideSql<'a> {
     pub level: Option<LevelRead<'a>>,
 }
 
-/// `CAST([(a, b), …], 'Array(Tuple(Int64, Int64))')`.
-fn intervals_literal(ivs: &[(i64, i64)]) -> String {
-    let items = ivs
-        .iter()
-        .map(|(a, b)| format!("({a}, {b})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("CAST([{items}], 'Array(Tuple(Int64, Int64))')")
-}
-
-/// The shard a row of a level table was read from: `_shard_num` on the
-/// distributed table, else 1 — `rollup::level_fetch`'s own column.
-fn shard_column(clustered: bool) -> &'static str {
-    if clustered {
-        "_shard_num"
-    } else {
-        "toUInt32(1)"
-    }
-}
-
-/// Issue #579 part 4: `LEVEL_ROWS` — one scan of the level table that
-/// returns the data rows of `served` for the selector's series and the run
-/// rows over its window, one row per series with its rows sorted, a marker
-/// row, and the replica check (plan section 5.4): unless every shard's run
-/// rows in THIS scan cover every interval of `served`, the statement raises
-/// `PULSUS_LEVEL_REPLICA_BEHIND`. The level rows are written by the shard
-/// whose slice holds the series, so the series set is read once at the
-/// initiator, `GLOBAL IN`.
+/// Issue #579 part 4: `LEVEL_ROWS` — the level table's data rows of
+/// `served` for the selector's series, one row per series with its rows
+/// sorted. Issue #18 part 2c: no run rows and no replica check; a lagging
+/// replica is passed over by `max_replica_delay_for_distributed_queries`.
 pub fn level_rows(
     tenant: &Tenant,
-    ids_sql: &str,
-    level: &LevelRead<'_>,
+    series: &SideSeries<'_>,
     table: &str,
     served: &[(i64, i64)],
 ) -> String {
-    let LevelRead {
-        clustered,
-        shards,
-        window,
-        ..
-    } = *level;
-    let shard = shard_column(clustered);
-    let tenant = tenant.sql_literal();
-    let data = sample_sql::intervals_predicate("t_end", "t_end", "<=", served);
-    let runs = sample_sql::intervals_predicate("t_end", "t_last", "<", &[window]);
-    let served = intervals_literal(served);
     format!(
-        "SELECT fingerprint, rows AS rows0, max(toUInt8(fingerprint = 0 AND arrayAll(sh -> arrayAll(i -> arrayExists(j -> j.1 <= i.1 AND i.2 <= j.2,
-    arrayFold((acc, x) -> if(empty(acc) OR x.1 > acc[-1].2, arrayPushBack(acc, x), arrayPushBack(arrayPopBack(acc), (acc[-1].1, greatest(acc[-1].2, x.2)))),
-              arraySort(arrayMap(x -> (x.2, x.3), arrayFilter(x -> x.1 = sh, runs))), CAST([], 'Array(Tuple(Int64, Int64))'))),
-  {served}), range(1, {shards} + 1)))) OVER () AS ok,
-  throwIf(ok = 0, 'PULSUS_LEVEL_REPLICA_BEHIND') AS chk
+        "SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
 FROM (
-  SELECT fingerprint,
-    arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), arrayFilter(x -> x.5 = 0, groupArray((t_end, t_last, last, inc, kind))))) AS rows,
-    arrayMap(x -> (x.1, x.2, x.3), arrayFilter(x -> x.4 = 1, groupArray((shard, t_last, t_end, kind)))) AS runs
-  FROM (
-    SELECT {shard} AS shard, kind, fingerprint, t_end, t_last, last, inc
-    FROM {table}
-    WHERE (kind = 0 AND org_id = {tenant} AND {data} AND fingerprint GLOBAL IN (
-{ids_sql}
-))
-       OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND {runs})
-  )
-  GROUP BY fingerprint
-  UNION ALL
-  SELECT toUInt128(0), CAST([], 'Array(Tuple(Int64, Int64, Float64, Float64))'), CAST([], 'Array(Tuple(UInt32, Int64, Int64))')
-)"
+  SELECT fingerprint, t_end, t_last, last, inc
+  FROM {table}
+  WHERE kind = 0 AND org_id = {} AND {} AND {}
+)
+GROUP BY fingerprint",
+        tenant.sql_literal(),
+        sample_sql::intervals_predicate("t_end", "t_end", "<=", served),
+        series.filter(true),
     )
 }
 
 /// Issue #18 part 2a: `COUNTER_GATHER`'s elements — one block per level,
 /// its `LEVEL_ROWS` rows as `(t_end, width, t_last, last, inc)`, and, from
-/// 720 s, the raw samples no level covers as `(t, 0, t, v, 0.)`. `chk`
-/// reaches each level's elements, so its check is evaluated.
+/// 720 s, the raw samples no level covers as `(t, 0, t, v, 0.)`.
 fn counter_elements(
     tenant: &Tenant,
     samples_table: &str,
-    ids_sql: &str,
+    series: &SideSeries<'_>,
     level: &LevelRead<'_>,
 ) -> Vec<String> {
     let mut out: Vec<String> = level
@@ -805,11 +810,11 @@ fn counter_elements(
         .iter()
         .map(|&(table, res_ms, served)| {
             format!(
-                "SELECT fingerprint, arrayMap(r -> (r.1, toInt64({res_ms}), r.2, r.3, r.4), arrayResize(rows0, length(rows0) + chk)) AS es
+                "SELECT fingerprint, arrayMap(r -> (r.1, toInt64({res_ms}), r.2, r.3, r.4), rows0) AS es
 FROM (
 {}
 )",
-                level_rows(tenant, ids_sql, level, table, served)
+                level_rows(tenant, series, table, served)
             )
         })
         .collect();
@@ -817,13 +822,12 @@ FROM (
         out.push(format!(
             "SELECT fingerprint, groupArray((unix_milli, toInt64(0), unix_milli, value, 0.)) AS es
 FROM {samples_table}
-WHERE org_id = {} AND {} AND fingerprint IN (
-{ids_sql}
-)
+WHERE org_id = {} AND {} AND {}
   AND reinterpretAsUInt64(value) != {STALE_NAN_DECIMAL}
 GROUP BY fingerprint",
             tenant.sql_literal(),
             sample_sql::intervals_predicate("unix_milli", "unix_milli", "<=", level.todo),
+            series.filter(false),
         ));
     }
     out
@@ -841,10 +845,10 @@ GROUP BY fingerprint",
 pub fn counter_gather(
     tenant: &Tenant,
     samples_table: &str,
-    ids_sql: &str,
+    series: &SideSeries<'_>,
     level: &LevelRead<'_>,
 ) -> String {
-    let elements = counter_elements(tenant, samples_table, ids_sql, level).join("\nUNION ALL\n");
+    let elements = counter_elements(tenant, samples_table, series, level).join("\nUNION ALL\n");
     format!(
         "SELECT fingerprint, arm, raw FROM (
 SELECT fingerprint, toUInt8(0) AS arm,
@@ -883,18 +887,17 @@ WHERE notEmpty(raw)"
 }
 
 /// Issue #579 part 4: S4, explain only — whether a `Level` side read any
-/// level row, today's `served_from_level` for a counter; `sum(chk)` makes
-/// the check run on every row. Issue #18 part 2a: over the `LEVEL_ROWS` of
-/// every level the side reads.
-pub fn level_served(tenant: &Tenant, ids_sql: &str, level: &LevelRead<'_>) -> String {
+/// level row, today's `served_from_level` for a counter. Issue #18 part
+/// 2a: over the `LEVEL_ROWS` of every level the side reads.
+pub fn level_served(tenant: &Tenant, series: &SideSeries<'_>, level: &LevelRead<'_>) -> String {
     let rows = level
         .levels
         .iter()
-        .map(|&(table, _, served)| level_rows(tenant, ids_sql, level, table, served))
+        .map(|&(table, _, served)| level_rows(tenant, series, table, served))
         .collect::<Vec<_>>()
         .join("\nUNION ALL\n");
     format!(
-        "SELECT toUInt8(countIf(fingerprint != 0 AND notEmpty(rows0)) > 0) AS served, sum(chk) AS checked
+        "SELECT toUInt8(count() > 0) AS served
 FROM (
 {rows}
 )"
@@ -906,9 +909,10 @@ FROM (
 pub fn raw_gather_within(
     tenant: &Tenant,
     samples_table: &str,
-    ids_sql: &str,
+    series: &SideSeries<'_>,
     within: &[(i64, i64)],
 ) -> String {
+    let filter = series.filter(false);
     let window = format!(
         "org_id = {} AND {}",
         tenant.sql_literal(),
@@ -917,9 +921,7 @@ pub fn raw_gather_within(
     format!(
         "                      SELECT fingerprint, toUInt8(1) AS arm, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
                       FROM {samples_table}
-                      WHERE {window} AND fingerprint IN (
-{ids_sql}
-)
+                      WHERE {window} AND {filter}
                         AND reinterpretAsUInt64(value) != {STALE_NAN_DECIMAL}
                       GROUP BY fingerprint"
     )
@@ -942,7 +944,7 @@ pub fn series_steps(side: &SideSql<'_>, grid: Grid) -> String {
                 parts.push(counter_gather(
                     side.tenant,
                     side.samples_table,
-                    side.ids_sql,
+                    &side.series,
                     level,
                 ));
             }
@@ -950,7 +952,7 @@ pub fn series_steps(side: &SideSql<'_>, grid: Grid) -> String {
                 parts.push(raw_gather_within(
                     side.tenant,
                     side.samples_table,
-                    side.ids_sql,
+                    &side.series,
                     level.read,
                 ));
             }
@@ -964,7 +966,7 @@ pub fn series_steps(side: &SideSql<'_>, grid: Grid) -> String {
         None => {
             let (lo, hi) = range_window(grid, side.range_ms);
             (
-                raw_gather_within(side.tenant, side.samples_table, side.ids_sql, &[(lo, hi)]),
+                raw_gather_within(side.tenant, side.samples_table, &side.series, &[(lo, hi)]),
                 vec![(0, grid.points)],
             )
         }
@@ -1005,6 +1007,11 @@ WHERE arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, {steps})){keep}"
 /// Issue #579 part 4: `MEMBERS` — each series' rank in `(name, ID)` order,
 /// the order the evaluator folds in, and its stored label pairs.
 pub fn members(side: &SideSql<'_>) -> String {
+    let ids = match side.series {
+        SideSeries::Ids(ids) => ids,
+        // Issue #18 part 2c: the label cache's own members.
+        SideSeries::Known { members, .. } => return members.to_string(),
+    };
     format!(
         "SELECT fingerprint, row_number() OVER (ORDER BY name, fingerprint) AS rank, JSONExtractKeysAndValues(l, 'String') AS kv
 FROM (
@@ -1019,7 +1026,7 @@ FROM (
         side.labels_table,
         side.tenant.sql_literal(),
         ch_string(side.metric_name),
-        side.ids_sql
+        ids
     )
 }
 
@@ -1083,8 +1090,8 @@ ORDER BY gid, gi"
 fn side_histograms(side: &SideSql<'_>) -> String {
     let (lo, hi) = side.window;
     format!(
-        "unix_milli > {lo} AND unix_milli <= {hi} AND fingerprint IN (\n{}\n)",
-        side.ids_sql
+        "unix_milli > {lo} AND unix_milli <= {hi} AND {}",
+        side.series.filter(false)
     )
 }
 
@@ -1112,11 +1119,9 @@ pub fn level_aggregate_fetch(
     let (lo, hi) = side.window;
     let sentinel = format!(
         "org_id = {} AND unix_milli > {lo} AND unix_milli <= {hi}
-             AND fingerprint IN (
-{}
-)",
+             AND {}",
         side.tenant.sql_literal(),
-        side.ids_sql
+        side.series.filter(false)
     );
     aggregate_over(grid, op, &inner, hist_samples_table, &sentinel)
 }
@@ -1838,7 +1843,7 @@ mod tests {
             overlaid: false,
         };
         assert_eq!(
-            counter_gather(&tenant, "metric_samples", &ids, &a),
+            counter_gather(&tenant, "metric_samples", &SideSeries::Ids(&ids), &a),
             join_section("counter_gather 720s over 60s and raw"),
             "(a)"
         );
@@ -1859,7 +1864,7 @@ mod tests {
             tenant: &tenant,
             samples_table: "metric_samples",
             labels_table: "metric_labels",
-            ids_sql: &ids,
+            series: SideSeries::Ids(&ids),
             metric_name: "p_rx_total",
             func: PushedRangeFn::Rate,
             range_ms: 300_000,
@@ -1873,9 +1878,80 @@ mod tests {
             "(b)"
         );
         assert_eq!(
-            counter_gather(&tenant, "metric_samples", &ids, &t11_level()),
+            counter_gather(
+                &tenant,
+                "metric_samples",
+                &SideSeries::Ids(&ids),
+                &t11_level()
+            ),
             join_section("counter_gather 60s"),
             "(c)"
+        );
+    }
+
+    /// **U1 (issue #18 part 2c): a known side names its series**: the
+    /// members from the label cache's pairs, and a 720 s side's steps whose
+    /// every series filter is the literal list.
+    #[test]
+    fn a_known_side_names_its_series() {
+        use pulsus_model::{Fingerprint, LabelSet};
+        let pair = |pairs: &[(&str, &str)]| {
+            LabelSet::from_verbatim(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+        };
+        let (a, b) = (
+            pair(&[("instance", "i0"), ("device", "d0")]),
+            pair(&[("instance", "i'3"), ("__unit__", "bytes")]),
+        );
+        let members = members_known(&[
+            (Fingerprint::from_raw(101).sql_literal(), &a),
+            (Fingerprint::from_raw(205).sql_literal(), &b),
+        ]);
+        assert_eq!(members, join_section("members_known two series"), "members");
+        let tenant = no_tenant();
+        let h = 3_600_000;
+        let m = 60_000;
+        let s720 = vec![
+            (T11_WINDOW.0, T11_END - 20 * h),
+            (T11_END - 19 * h, T11_END - 12 * m),
+        ];
+        let s60a = vec![
+            (T11_END - 20 * h, T11_END - 19 * h),
+            (T11_END - 12 * m, T11_END - 10 * m),
+        ];
+        let todo_a = [(T11_END - 10 * m, T11_END)];
+        let levels_a = [
+            ("metric_samples_720s", 720_000, s720.as_slice()),
+            ("metric_samples_60s", 60_000, s60a.as_slice()),
+        ];
+        let level = LevelRead {
+            clustered: false,
+            shards: 1,
+            window: T11_WINDOW,
+            levels: &levels_a,
+            todo: &todo_a,
+            read: &todo_a,
+            raw_steps: &[],
+            overlaid: false,
+        };
+        let side = SideSql {
+            tenant: &tenant,
+            samples_table: "metric_samples",
+            labels_table: "metric_labels",
+            series: SideSeries::Known {
+                list: "'101', '205'",
+                members: &members,
+            },
+            metric_name: "p_rx_total",
+            func: PushedRangeFn::Rate,
+            range_ms: 300_000,
+            scale: None,
+            window: T11_WINDOW,
+            level: Some(level),
+        };
+        assert_eq!(
+            series_steps(&side, t11_grid()),
+            join_section("series_steps 720s known"),
+            "steps"
         );
     }
 
@@ -1896,7 +1972,7 @@ mod tests {
                 tenant,
                 samples_table: "metric_samples",
                 labels_table: "metric_labels",
-                ids_sql: ids,
+                series: SideSeries::Ids(ids),
                 metric_name: name,
                 func,
                 range_ms: 300_000,
