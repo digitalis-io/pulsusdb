@@ -38,6 +38,10 @@
 #   # or: docker build -t pulsusdb:e2e .
 
 FROM docker.io/library/rust:1.93-bookworm AS planner
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clang \
+    && rm -rf /var/lib/apt/lists/*
+ENV CC=clang
 RUN cargo install cargo-chef --locked --version 0.1.77
 WORKDIR /src
 # Copies the whole build context — including vendor/promql-parser, not
@@ -48,6 +52,10 @@ COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM docker.io/library/rust:1.93-bookworm AS build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clang \
+    && rm -rf /var/lib/apt/lists/*
+ENV CC=clang
 RUN cargo install cargo-chef --locked --version 0.1.77
 WORKDIR /src
 COPY --from=planner /src/recipe.json recipe.json
@@ -82,7 +90,7 @@ ENV PULSUS_BUILD_VERSION=${PULSUS_BUILD_VERSION}
 ENV PULSUS_BUILD_REVISION=${PULSUS_BUILD_REVISION}
 RUN cargo build --release -p pulsus-server --bin pulsusdb
 
-FROM docker.io/library/debian:bookworm-slim AS runtime
+FROM docker.io/library/debian:trixie-slim AS runtime
 # `wget` backs this image's own `/ready` healthcheck (compose overrides);
 # `ca-certificates` for any outbound TLS the process makes (e.g. a
 # `CLICKHOUSE_PROTO=https` deployment); `curl` and `mawk` are what
