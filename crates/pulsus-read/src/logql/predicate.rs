@@ -2514,7 +2514,7 @@ mod tests {
             ("user_id", "body LIKE '%user\\\\_id%'"),
             ("100%", "body LIKE '%100\\\\%%'"),
             ("a\\b", "body LIKE '%a\\\\\\\\b%'"),
-            ("", "body LIKE '%%'"),
+            ("", "1"),
         ] {
             let f = LineFilter {
                 op: LineFilterOp::Contains,
@@ -3327,6 +3327,52 @@ mod tests {
         assert_eq!(
             sliding_cover(a - 1, S, E, STEP, RANGE),
             Err(BucketGridRefusal::AnchorAboveScanStart)
+        );
+    }
+
+    /// T7.0 (issue #624, part 7): the mint classifies the filter it is
+    /// given. A filter that keeps every line renders `1`, one that drops
+    /// every line renders `0`, and a positive `or` group loses the
+    /// alternatives that keep every line. A pattern that does not compile is
+    /// refused before it is classified, as today.
+    #[test]
+    fn the_line_filter_mint_classifies_filters_that_cannot_exclude_a_line() {
+        let lf = |op: LineFilterOp, alts: &[&str]| LineFilter {
+            op,
+            head: LineMatch::Text(alts[0].to_string()),
+            or_matches: alts[1..]
+                .iter()
+                .map(|a| LineMatch::Text(a.to_string()))
+                .collect(),
+        };
+        let mut failures = Vec::new();
+        for (filter, want) in [
+            (lf(LineFilterOp::Contains, &[""]), "1"),
+            (lf(LineFilterOp::NotContains, &[""]), "0"),
+            (lf(LineFilterOp::Regex, &["(?i)"]), "1"),
+            (lf(LineFilterOp::NotRegex, &[".*|.*"]), "0"),
+            (lf(LineFilterOp::Contains, &["", "x"]), "body LIKE '%x%'"),
+            (
+                lf(LineFilterOp::Regex, &[".*||||", "x"]),
+                "match(body, 'x')",
+            ),
+            (lf(LineFilterOp::NotContains, &["", "x"]), "0"),
+        ] {
+            match line_filter(&filter) {
+                Ok(got) if got.as_sql() == want => {}
+                other => failures.push(format!("{filter}: {other:?}, expected {want}")),
+            }
+        }
+        // Guard: refused as today, before any classification.
+        let refused = line_filter(&lf(LineFilterOp::Regex, &["(?x)"]));
+        if !matches!(refused, Err(PipelineError::BadRegex(_))) {
+            failures.push(format!("|~ \"(?x)\": {refused:?}, expected the refusal"));
+        }
+        assert!(
+            failures.is_empty(),
+            "{} row(s) differ:\n{}",
+            failures.len(),
+            failures.join("\n")
         );
     }
 }

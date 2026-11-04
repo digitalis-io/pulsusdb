@@ -2076,10 +2076,14 @@ const TOTAL: usize = 1_817;
 /// spelling guards (8 -> 15), and `sql.rs` loses the unwrapped statement's
 /// two value-guard renderings and their byte-exact test (6 -> 2), so its
 /// production code renders no `match(` again.
+///
+/// Issue #624, part 7: `plan.rs` (1 -> 2) and `predicate.rs` (21 -> 22) gain
+/// one each, both in `mod tests`: the `match(` a planned line filter is
+/// checked to carry once, and the fragment a pruned `or` group renders.
 const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-clickhouse/src/error.rs", 1),
     ("pulsus-read/src/logql/exec.rs", 3),
-    ("pulsus-read/src/logql/plan.rs", 1),
+    ("pulsus-read/src/logql/plan.rs", 2),
     // Issue #624, part 3d-3 adds three: a targeted `| logfmt` filter's
     // control-separator test and its `!=` key-with-no-`=` test, and the
     // expected text of the test that pins them. Issue #757 adds one: the
@@ -2087,7 +2091,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // move to bloom-filter indexes adds two more to that test, a negated
     // case-insensitive `match(identity(body), …)` and a plain
     // `match(body, …)`.
-    ("pulsus-read/src/logql/predicate.rs", 21),
+    ("pulsus-read/src/logql/predicate.rs", 22),
     // Issue #624, part 3d adds three to `sql.rs`: the `| logfmt` line
     // grammar in its `decided` column, and the out-of-range integer test in
     // each of the two `| json` key readers. Issue #624, part 4 adds twelve:
@@ -2124,7 +2128,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 107;
+const MATCH_RENDER_TOTAL: usize = 109;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
@@ -2613,6 +2617,8 @@ const PREDICATE_ITEMS: &[&str] = &[
     "mod tests :: fn the_sliding_cover_is_its_symbols_and_refuses_what_it_cannot_render() :: const STEP: i64 = 60_000_000_000",
     "mod tests :: fn the_sliding_cover_is_its_symbols_and_refuses_what_it_cannot_render() :: const RANGE: i64 = 150_000_000_000",
     "mod tests :: fn the_sliding_cover_is_its_symbols_and_refuses_what_it_cannot_render() :: const E: i64 = S + 3_600_000_000_000",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_line_filter_mint_classifies_filters_that_cannot_exclude_a_line()",
 ];
 
 /// The number of MINT-shaped entries: an `fn` whose OWN signature (the last
