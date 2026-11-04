@@ -60,12 +60,10 @@ pub struct RangeAggRow {
 }
 
 /// Issue #579 part 4: S4's one row ([`super::grouped_sql::level_served`]) —
-/// whether a `Level` side read a level row, and the sum that makes its
-/// replica check run.
+/// whether a `Level` side read a level row.
 #[derive(Debug, Clone, Copy, Row, Serialize, Deserialize)]
 pub struct LevelServedRow {
     pub served: u8,
-    pub checked: u64,
 }
 
 /// Issue #579 part 3: the distinct series a shape-A node's ID statement

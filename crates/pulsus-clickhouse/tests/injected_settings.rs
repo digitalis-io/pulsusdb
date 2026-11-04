@@ -56,6 +56,7 @@ const INJECTED_SETTINGS: &[&str] = &[
     // Issue #587: the trace fetch's own settings root carries `final = 1`
     // as a SETTING rather than as SQL text, which is what makes a retried
     // span single on a read taken before the next merge.
+    "fallback_to_stale_replicas_for_distributed_queries",
     "final",
     "format_binary_max_object_size",
     "group_by_overflow_mode",

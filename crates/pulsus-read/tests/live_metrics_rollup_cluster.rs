@@ -94,6 +94,7 @@ fn shard1b_config(database: &str) -> ChConnConfig {
 
 fn engine_config(db: &str) -> MetricsConfig {
     MetricsConfig {
+        max_replica_delay_secs: 5,
         skip_unavailable_shards: false,
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
@@ -552,6 +553,15 @@ async fn warm(f: &Fixture) -> (Arc<LabelCache>, Arc<LevelSlot>) {
     (cache, slot)
 }
 
+/// Issue #18 part 2c: a label cache over `f` that was never refreshed, so
+/// every resolution falls back to SQL.
+async fn cold_cache(f: &Fixture) -> Arc<LabelCache> {
+    Arc::new(LabelCache::new(
+        ChClient::new(shard1_config(&f.db)).await.expect("connect"),
+        cache_config(&f.db),
+    ))
+}
+
 /// An engine with the levels, pushed or not.
 async fn level_engine(
     f: &Fixture,
@@ -602,88 +612,6 @@ fn stages(explain: &pulsus_read::logql::PlanExplain) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Removes shard `node`'s coverage of `(a, b]` from its own level table,
-/// as the single-node suite's `cut_runs` does, and returns the run rows it
-/// deleted.
-async fn cut_on(node: &ChClient, db: &str, a: i64, b: i64) -> Vec<(i64, i64)> {
-    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
-    struct Run {
-        t_last: i64,
-        t_end: i64,
-    }
-    let table = format!("{db}.metric_samples_60s");
-    let mut stream = node
-        .query_stream::<Run>(
-            &format!(
-                "SELECT t_last, t_end FROM {table} WHERE kind = 1 AND t_end > {a} AND t_last < {b}"
-            ),
-            &QuerySettings::new(),
-        )
-        .await
-        .expect("read the run rows");
-    let mut overlapping = Vec::new();
-    while let Some(row) = stream.next().await {
-        let row = row.expect("decode");
-        overlapping.push((row.t_last, row.t_end));
-    }
-    drop(stream);
-    exec(
-        node,
-        &format!(
-            "ALTER TABLE {table} DELETE WHERE kind = 1 AND t_end > {a} AND t_last < {b} \
-             SETTINGS mutations_sync = 2"
-        ),
-    )
-    .await;
-    for &(t_last, t_end) in &overlapping {
-        for (lo, hi) in [(t_last, a.min(t_end)), (b.max(t_last), t_end)] {
-            if lo < hi {
-                exec(
-                    node,
-                    &format!(
-                        "INSERT INTO {table} (kind, org_id, fingerprint, t_end, t_last, built_at) \
-                         VALUES (1, '', 0, {hi}, {lo}, 0)"
-                    ),
-                )
-                .await;
-            }
-        }
-    }
-    overlapping
-}
-
-/// Every top-level statement shard 1 ran under `comment`, finished or
-/// failed, in start order.
-async fn statements(node: &ChClient, comment: &str) -> Vec<String> {
-    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
-    struct Logged {
-        query: String,
-    }
-    settle_query_log(
-        &[node],
-        &format!("is_initial_query AND log_comment = '{comment}'"),
-        1,
-    )
-    .await;
-    let mut stream = node
-        .query_stream::<Logged>(
-            &format!(
-                "SELECT query FROM system.query_log \
-                 WHERE type IN ('QueryFinish', 'ExceptionWhileProcessing') AND is_initial_query \
-                   AND log_comment = '{comment}' \
-                 ORDER BY query_start_time_microseconds"
-            ),
-            &QuerySettings::new(),
-        )
-        .await
-        .expect("query_log");
-    let mut out = Vec::new();
-    while let Some(row) = stream.next().await {
-        out.push(row.expect("decode").query);
-    }
-    out
-}
-
 /// **T7 (issue #579 part 4): a pushed level node answers on two shards.**
 /// The odd series are registered on shard 1 and their level rows built by
 /// shard 2, so a level read filtered by a shard-local series set misses
@@ -702,6 +630,10 @@ async fn a_pushed_level_node_answers_on_two_shards() {
     build_level(&f).await;
     let (cache, slot) = warm(&f).await;
     let on = level_engine(&f, &cache, &slot, true, None).await;
+    // Issue #18 part 2c: a label cache never refreshed, so each side is
+    // resolved by SQL and its level read keeps `GLOBAL IN`.
+    let cold = cold_cache(&f).await;
+    let cold_on = level_engine(&f, &cold, &slot, true, None).await;
     let off = level_engine(&f, &cache, &slot, false, None).await;
     let tenant = Tenant::from_header(None, false).expect("the empty tenant");
     let p = MetricQueryParams {
@@ -709,196 +641,26 @@ async fn a_pushed_level_node_answers_on_two_shards() {
         end_ms: f.hi,
         step_ms: MIN,
     };
-    for (q, series) in [("sum(rate(m[5m]))", 1), ("sum by (s) (rate(m[5m]))", 40)] {
-        let expr = parse(q).expect("parse");
-        let (a, _, explain) = on.query_explained(&tenant, &expr, &p).await.expect("on");
-        let (b, _, _) = off.query_explained(&tenant, &expr, &p).await.expect("off");
-        let st = stages(&explain);
-        assert!(
-            st.iter().any(|(n, sql)| n == "pushed_aggregate"
-                && sql.contains("FROM metric_samples_60s_dist\n")),
-            "{q}: no pushed statement reading the level: {st:#?}"
-        );
-        assert!(
-            !st.iter().any(|(_, sql)| sql.starts_with("declined:")),
-            "{q}: {st:#?}"
-        );
-        assert_eq!(cells(&b).len(), series, "{q}: in process");
-        assert_eq!(cells(&a), cells(&b), "{q}: pushed against in process");
-    }
-    exec(
-        &f.bootstrap,
-        &format!(
-            "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
-            f.db
-        ),
-    )
-    .await;
-}
-
-/// **T10b (issue #579 part 4): a side behind its coverage moves the whole
-/// node.** `m` and `n`, the same label sets; on a fresh build the run rows
-/// of a 10-minute interval are deleted on one shard, and the coverage hook
-/// gives them back to one side's S1. That side's check raises, and both
-/// selectors take today's route: two level fetches after the data
-/// statement, and the answer of the route without the push.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_side_behind_its_coverage_falls_back_whole() {
-    use pulsus_read::metrics::rollup::RunRow;
-    if skipping() {
-        return;
-    }
-    let f = fixture(
-        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t10"),
-        &[("m", 0), ("n", 5000)],
-        false,
-    )
-    .await;
-    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
-    let expr = parse("sum by (s) (rate(m[5m]) + rate(n[5m]))").expect("parse");
-    let p = MetricQueryParams {
-        start_ms: f.mid - 30 * MIN,
-        end_ms: f.hi,
-        step_ms: MIN,
-    };
-    let (a, b) = (f.mid - 20 * MIN, f.mid - 10 * MIN);
-    for (side, shard) in [(0usize, 1u32), (0, 2), (1, 1), (1, 2)] {
-        let what = format!("side {side}, shard {shard}");
-        exec(
-            &f.shard1,
-            &format!("TRUNCATE TABLE {}.metric_samples_60s", f.db),
-        )
-        .await;
-        exec(
-            &f.shard2,
-            &format!("TRUNCATE TABLE {}.metric_samples_60s", f.db),
-        )
-        .await;
-        build_level(&f).await;
-        let node = if shard == 1 { &f.shard1 } else { &f.shard2 };
-        let deleted = cut_on(node, &f.db, a, b).await;
-        assert!(!deleted.is_empty(), "{what}: no run row to delete");
-        exec(
-            &f.shard1b,
-            &format!("SYSTEM SYNC REPLICA {}.metric_samples_60s", f.db),
-        )
-        .await;
-        let (cache, slot) = warm(&f).await;
-        // Unique to this run: the log keeps earlier runs' rows.
-        let comment = format!(
-            "{}_t10b_{side}_{shard}_{}",
-            f.db,
-            uuid::Uuid::new_v4().simple()
-        );
-        let hook: pulsus_read::metrics::exec::CoverageHook =
-            Arc::new(move |selector, level, mut runs: Vec<RunRow>| {
-                if selector == side && level == 0 {
-                    runs.extend(deleted.iter().map(|&(t_last, t_end)| RunRow {
-                        shard,
-                        t_last,
-                        t_end,
-                    }));
-                }
-                runs
-            });
-        let hooked = level_engine(&f, &cache, &slot, true, Some(&comment))
-            .await
-            .with_coverage_hook(Arc::clone(&hook));
-        let plain = level_engine(&f, &cache, &slot, true, None).await;
-        let off = level_engine(&f, &cache, &slot, false, None).await;
-        let (x, _, explain) = hooked
-            .query_explained(&tenant, &expr, &p)
-            .await
-            .expect("hooked");
-        let (y, _, plain_explain) = plain
-            .query_explained(&tenant, &expr, &p)
-            .await
-            .expect("plain");
-        let (z, _, _) = off.query_explained(&tenant, &expr, &p).await.expect("off");
-        let st = stages(&explain);
-        assert!(
-            st.iter()
-                .any(|(n, sql)| n == "pushed_aggregate" && sql == "declined: ReplicaBehind"),
-            "{what}: {st:#?}"
-        );
-        let sent = statements(&f.shard1, &comment).await;
-        let data = sent
-            .iter()
-            .position(|q| q.starts_with("WITH ") && q.contains("PULSUS_LEVEL_REPLICA_BEHIND"))
-            .unwrap_or_else(|| panic!("{what}: no data statement: {sent:#?}"));
-        let fetches: Vec<usize> = sent
-            .iter()
-            .enumerate()
-            .filter(|(_, q)| q.starts_with("SELECT _shard_num AS shard, kind, fingerprint, t_end"))
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(
-            fetches.len(),
-            2,
-            "{what}: one level fetch a selector: {sent:#?}"
-        );
-        assert!(
-            fetches.iter().all(|i| *i > data),
-            "{what}: the level fetches follow the data statement: {sent:#?}"
-        );
-        assert_eq!(cells(&z).len(), 40, "{what}: in process");
-        assert_eq!(
-            cells(&x),
-            cells(&z),
-            "{what}: the fallback against in process"
-        );
-        let plain_stages = stages(&plain_explain);
-        assert!(
-            !plain_stages
-                .iter()
-                .any(|(_, sql)| sql.starts_with("declined:")),
-            "{what}: without the hook: {plain_stages:#?}"
-        );
-        assert!(
-            plain_stages
-                .iter()
-                .any(|(n, sql)| n == "pushed_aggregate" && sql.starts_with("WITH ")),
-            "{what}: without the hook, not pushed: {plain_stages:#?}"
-        );
-        assert_eq!(cells(&y), cells(&z), "{what}: without the hook");
-
-        // Issue #579 part 5: without explain no S4 is sent, so only the data
-        // statement's own check can raise: the same node, then a C-match.
-        for (q, data_marker) in [
-            ("sum by (s) (rate(m[5m]) + rate(n[5m]))", "WITH "),
-            (
-                "sum by (s) (rate(m[5m]) * on (s) group_left rate(n[5m]))",
-                "CAST([('', 'match')]",
-            ),
-        ] {
-            let comment = format!(
-                "{}_t10b_quiet_{side}_{shard}_{}",
-                f.db,
-                uuid::Uuid::new_v4().simple()
-            );
-            let quiet = level_engine(&f, &cache, &slot, true, Some(&comment))
-                .await
-                .with_coverage_hook(Arc::clone(&hook));
+    for (kind, on) in [("warm", &on), ("cold", &cold_on)] {
+        for (q, series) in [("sum(rate(m[5m]))", 1), ("sum by (s) (rate(m[5m]))", 40)] {
             let expr = parse(q).expect("parse");
-            let (x, _) = quiet.query(&tenant, &expr, &p).await.expect("quiet");
-            let (z, _, _) = off.query_explained(&tenant, &expr, &p).await.expect("off");
-            let sent = statements(&f.shard1, &comment).await;
-            let data = sent
-                .iter()
-                .position(|q| q.contains(data_marker) && q.contains("PULSUS_LEVEL_REPLICA_BEHIND"))
-                .unwrap_or_else(|| panic!("{what}, {q}, no explain: no data statement: {sent:#?}"));
-            let fetches = sent[data + 1..]
-                .iter()
-                .filter(|q| q.starts_with("SELECT _shard_num AS shard, kind, fingerprint, t_end"))
-                .count();
+            let (a, _, explain) = on.query_explained(&tenant, &expr, &p).await.expect("on");
+            let (b, _, _) = off.query_explained(&tenant, &expr, &p).await.expect("off");
+            let st = stages(&explain);
             assert!(
-                fetches >= 2,
-                "{what}, {q}, no explain: {fetches} level fetches after the data statement: {sent:#?}"
+                st.iter().any(|(n, sql)| n == "pushed_aggregate"
+                    && sql.contains("FROM metric_samples_60s_dist\n")),
+                "{kind} {q}: no pushed statement reading the level: {st:#?}"
             );
+            assert!(
+                !st.iter().any(|(_, sql)| sql.starts_with("declined:")),
+                "{kind} {q}: {st:#?}"
+            );
+            assert_eq!(cells(&b).len(), series, "{kind} {q}: in process");
             assert_eq!(
-                cells(&x),
-                cells(&z),
-                "{what}, {q}, no explain: against push off"
+                cells(&a),
+                cells(&b),
+                "{kind} {q}: pushed against in process"
             );
         }
     }
@@ -980,6 +742,10 @@ async fn a_coarse_node_answers_on_two_shards() {
     }
     let (cache, slot) = warm(&f).await;
     let on = level_engine(&f, &cache, &slot, true, None).await;
+    // Issue #18 part 2c: a label cache never refreshed, so each side is
+    // resolved by SQL and its level read keeps `GLOBAL IN`.
+    let cold = cold_cache(&f).await;
+    let cold_on = level_engine(&f, &cold, &slot, true, None).await;
     let off = level_engine(&f, &cache, &slot, false, None).await;
     let tenant = Tenant::from_header(None, false).expect("the empty tenant");
     let end = f.hi.div_euclid(12 * MIN) * 12 * MIN;
@@ -992,50 +758,56 @@ async fn a_coarse_node_answers_on_two_shards() {
     // then the statements — asserted empty at the end, so a wrong answer is
     // reported whatever the statement text says.
     let mut failures: Vec<String> = Vec::new();
-    for q in [
-        "sum by (s) (rate(m[12m]))",
-        "sum by (s) (rate(m[12m]) + rate(n[12m]))",
-    ] {
-        let expr = parse(q).expect("parse");
-        let (a, _, explain) = on.query_explained(&tenant, &expr, &p).await.expect("on");
-        let (b, _, off_explain) = off.query_explained(&tenant, &expr, &p).await.expect("off");
-        let (ca, cb) = (cells(&a), cells(&b));
-        if ca != cb {
-            let first = cb
-                .iter()
-                .find(|(k, v)| ca.get(*k) != Some(*v))
-                .map(|(k, _)| k.clone());
-            failures.push(format!(
-                "{q}: cells differ from push off: {} series pushed, {} in process; first {first:?}",
-                ca.len(),
-                cb.len()
-            ));
-        }
-        if cb.len() != 40 {
-            failures.push(format!("{q}: {} series in process, want 40", cb.len()));
-        }
-        let st = stages(&explain);
-        if !st.iter().any(|(n, sql)| {
-            n == "pushed_aggregate"
-                && [
-                    "FROM metric_samples_720s_dist\n",
-                    "FROM metric_samples_60s_dist\n",
-                    "FROM metric_samples_dist\n",
-                ]
-                .iter()
-                .all(|t| sql.contains(t))
-        }) {
-            failures.push(format!(
-                "{q}: no pushed statement reading the 720 s, 60 s and raw tables"
-            ));
-        }
-        if st.iter().any(|(_, sql)| sql.starts_with("declined:")) {
-            failures.push(format!("{q}: declined: {st:?}"));
-        }
-        if !off_explain.stages.iter().any(|s| {
-            s.name == "rollup_piece" && s.note.as_deref().is_some_and(|n| n.starts_with("raw ("))
-        }) {
-            failures.push(format!("{q}: in process, no raw piece"));
+    for (kind, on) in [("warm", &on), ("cold", &cold_on)] {
+        for q in [
+            "sum by (s) (rate(m[12m]))",
+            "sum by (s) (rate(m[12m]) + rate(n[12m]))",
+        ] {
+            let expr = parse(q).expect("parse");
+            let (a, _, explain) = on.query_explained(&tenant, &expr, &p).await.expect("on");
+            let (b, _, off_explain) = off.query_explained(&tenant, &expr, &p).await.expect("off");
+            let (ca, cb) = (cells(&a), cells(&b));
+            if ca != cb {
+                let first = cb
+                    .iter()
+                    .find(|(k, v)| ca.get(*k) != Some(*v))
+                    .map(|(k, _)| k.clone());
+                failures.push(format!(
+                    "{kind} {q}: cells differ from push off: {} series pushed, {} in process; first {first:?}",
+                    ca.len(),
+                    cb.len()
+                ));
+            }
+            if cb.len() != 40 {
+                failures.push(format!(
+                    "{kind} {q}: {} series in process, want 40",
+                    cb.len()
+                ));
+            }
+            let st = stages(&explain);
+            if !st.iter().any(|(n, sql)| {
+                n == "pushed_aggregate"
+                    && [
+                        "FROM metric_samples_720s_dist\n",
+                        "FROM metric_samples_60s_dist\n",
+                        "FROM metric_samples_dist\n",
+                    ]
+                    .iter()
+                    .all(|t| sql.contains(t))
+            }) {
+                failures.push(format!(
+                    "{kind} {q}: no pushed statement reading the 720 s, 60 s and raw tables"
+                ));
+            }
+            if st.iter().any(|(_, sql)| sql.starts_with("declined:")) {
+                failures.push(format!("{kind} {q}: declined: {st:?}"));
+            }
+            if !off_explain.stages.iter().any(|s| {
+                s.name == "rollup_piece"
+                    && s.note.as_deref().is_some_and(|n| n.starts_with("raw ("))
+            }) {
+                failures.push(format!("{kind} {q}: in process, no raw piece"));
+            }
         }
     }
     for (name, node) in [("shard1", &f.shard1), ("shard2", &f.shard2)] {
@@ -1138,7 +910,350 @@ async fn a_filled_node_answers_on_two_shards() {
     assert!(failures.is_empty(), "T32:\n{}", failures.join("\n"));
 }
 
+// ------------------------------------------------ issue #18 part 2c, T63
+
+/// One string `node` answers.
+async fn text_on(node: &ChClient, sql: &str) -> String {
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
+    struct T {
+        t: String,
+    }
+    let mut stream = node
+        .query_stream::<T>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let mut out = String::new();
+    while let Some(row) = stream.next().await {
+        out = row.expect("decode").t;
+    }
+    out
+}
+
+/// The hosts that ran a non-initial statement under `comment` reading
+/// `table`, on every replica of the cluster.
+async fn hosts_reading(f: &Fixture, comment: &str, table: &str) -> Vec<String> {
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
+    struct H {
+        host: String,
+    }
+    settle_query_log(
+        &[&f.shard1, &f.shard2, &f.shard1b],
+        &format!("log_comment = '{comment}'"),
+        1,
+    )
+    .await;
+    let sql = format!(
+        "SELECT hostname AS host FROM clusterAllReplicas('{CLUSTER_NAME}', system.query_log) \
+         WHERE type = 'QueryFinish' AND NOT is_initial_query AND log_comment = '{comment}' \
+           AND has(tables, '{table}')"
+    );
+    let mut stream = f
+        .shard1
+        .query_stream::<H>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode").host);
+    }
+    out
+}
+
+/// Issue #18 part 2c r20: the hosts that ran any statement under
+/// `comment` whose `tables` hold `table`, initial or not. A host reading
+/// its own shard's copy inside the initial query lists the local table
+/// there; a remote shard part lists it in its non-initial row.
+async fn hosts_reading_local(f: &Fixture, comment: &str, table: &str) -> Vec<String> {
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
+    struct H {
+        host: String,
+    }
+    settle_query_log(
+        &[&f.shard1, &f.shard2, &f.shard1b],
+        &format!("log_comment = '{comment}'"),
+        1,
+    )
+    .await;
+    let sql = format!(
+        "SELECT hostname AS host FROM clusterAllReplicas('{CLUSTER_NAME}', system.query_log) \
+         WHERE type = 'QueryFinish' AND log_comment = '{comment}' AND has(tables, '{table}')"
+    );
+    let mut stream = f
+        .shard1
+        .query_stream::<H>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode").host);
+    }
+    out
+}
+
+/// **T63 (issue #18 part 2c): a lagging replica is skipped and shown.**
+/// Shard 1's second replica stops fetching the 60 s level while shard 1
+/// builds once more, until its copy lags 5 s or more. An engine on that
+/// replica, at a 5 s limit, reads shard 1's part of the 60 s table from
+/// the other replica, push on and off, answers as push off, and its level
+/// loop shows the lag.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lagging_replica_is_skipped_and_shown() {
+    if skipping() {
+        return;
+    }
+    let f = fixture(
+        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t63"),
+        &[("m", 0)],
+        true,
+    )
+    .await;
+    build_level_to(&f, f.mid).await;
+    let table = format!("{}.metric_samples_60s", f.db);
+    exec(&f.shard1b, &format!("SYSTEM STOP FETCHES {table}")).await;
+    for node in [&f.shard1, &f.shard2] {
+        exec(node, &first_level_insert(&f.ctx, f.mid, f.hi)).await;
+    }
+    let delay_sql = format!(
+        "SELECT toString(absolute_delay) AS t FROM system.replicas \
+         WHERE database = '{}' AND table = 'metric_samples_60s'",
+        f.db
+    );
+    let mut lag = 0u64;
+    for _ in 0..60 {
+        lag = text_on(&f.shard1b, &delay_sql).await.parse().unwrap_or(0);
+        if lag >= 5 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(lag >= 5, "shard1b's 60 s copy lags {lag} s after a minute");
+    let (h1, h1b) = (
+        text_on(&f.shard1, "SELECT hostName() AS t").await,
+        text_on(&f.shard1b, "SELECT hostName() AS t").await,
+    );
+    // An engine on the lagging replica.
+    let cache = Arc::new(LabelCache::new(
+        ChClient::new(shard1b_config(&f.db)).await.expect("connect"),
+        cache_config(&f.db),
+    ));
+    cache.refresh().await.expect("refresh");
+    let slot = Arc::new(LevelSlot::new());
+    refresh_levels(&slot, &f.shard1b, &f.db, "_dist", Some(CLUSTER_NAME))
+        .await
+        .expect("level discovery");
+    let engine = |push: bool, comment: String| {
+        let cache = Arc::clone(&cache);
+        let slot = Arc::clone(&slot);
+        let db = f.db.clone();
+        async move {
+            MetricsEngine::new(
+                ChClient::new(shard1b_config(&db)).await.expect("connect"),
+                cache,
+                MetricsConfig {
+                    grouped_push: push,
+                    max_replica_delay_secs: 5,
+                    ..engine_config(&db)
+                },
+            )
+            .with_rollup_levels(slot)
+            .with_query_log_comment(comment)
+        }
+    };
+    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
+    let expr = parse("sum by (s) (rate(m[5m]))").expect("parse");
+    let p = MetricQueryParams {
+        start_ms: f.mid - 30 * MIN,
+        end_ms: f.hi,
+        step_ms: MIN,
+    };
+    let mut answers = Vec::new();
+    for push in [true, false] {
+        let comment = format!("{}_t63_{push}_{}", f.db, uuid::Uuid::new_v4().simple());
+        let e = engine(push, comment.clone()).await;
+        let (r, _) = e.query(&tenant, &expr, &p).await.expect("query");
+        answers.push(cells(&r));
+        let hosts = hosts_reading(&f, &comment, &table).await;
+        assert!(
+            !hosts.contains(&h1b),
+            "push {push}: the lagging replica {h1b} read {table}: {hosts:?}"
+        );
+        assert!(
+            hosts.contains(&h1),
+            "push {push}: shard 1's other replica {h1} read no {table}: {hosts:?}"
+        );
+    }
+    assert_eq!(answers[0].len(), 40, "push off");
+    assert_eq!(answers[0], answers[1], "push on against push off");
+    let shown = slot.replicas().unwrap_or_default();
+    assert!(
+        shown
+            .iter()
+            .any(|r| r.host == h1b && r.table == "metric_samples_60s" && r.absolute_delay >= 5),
+        "the replica slot does not show {h1b}'s lag: {shown:?}"
+    );
+    exec(&f.shard1b, &format!("SYSTEM START FETCHES {table}")).await;
+    exec(
+        &f.bootstrap,
+        &format!(
+            "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
+            f.db
+        ),
+    )
+    .await;
+}
+
+/// **T67 (issue #18 part 2c r20): a two-table statement keeps the local
+/// replica.** Shard 1's first replica stops fetching `metric_samples`
+/// while ten more minutes of one of shard 1's series land through its
+/// second replica, until the first replica's copy lags 5 s or more. An
+/// engine on the first replica, push off and the label cache never
+/// refreshed, reads with a label matcher: its sample fetch filters through
+/// the series statement in an `IN` subquery, so it is sent without the lag
+/// guard and reads shard 1's part of `metric_samples` locally, as before
+/// this part.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_two_table_statement_keeps_the_local_replica() {
+    if skipping() {
+        return;
+    }
+    let f = fixture(
+        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t67"),
+        &[("m", 0), ("n", 5000)],
+        true,
+    )
+    .await;
+    // Series `s = 10` of `m`: an even series, in shard 1's slice.
+    let fp = "toUInt128(1010)";
+    let shard = text_on(
+        &f.shard1,
+        &format!(
+            "SELECT toString(any(shardNum())) AS t FROM {}.metric_samples_dist \
+             WHERE fingerprint = {fp}",
+            f.db
+        ),
+    )
+    .await;
+    assert_eq!(shard, "1", "series 10 of m is on shard {shard}");
+    let table = format!("{}.metric_samples", f.db);
+    exec(&f.shard1, &format!("SYSTEM STOP FETCHES {table}")).await;
+    exec(
+        &f.shard1b,
+        &format!(
+            "INSERT INTO {}.metric_landing_dist (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SETTINGS insert_distributed_sync = 1 \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, 'm', {fp}, \
+                    toInt64({}) + toInt64(i) * 15000 + 2000, toFloat64(i) \
+             FROM (SELECT number AS i FROM numbers(40))",
+            f.db, f.hi
+        ),
+    )
+    .await;
+    let delay_sql = format!(
+        "SELECT toString(absolute_delay) AS t FROM system.replicas \
+         WHERE database = '{}' AND table = 'metric_samples'",
+        f.db
+    );
+    let mut lag = 0u64;
+    for _ in 0..60 {
+        lag = text_on(&f.shard1, &delay_sql).await.parse().unwrap_or(0);
+        if lag >= 5 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        lag >= 5,
+        "shard1's metric_samples lags {lag} s after a minute"
+    );
+    let (h1, h1b) = (
+        text_on(&f.shard1, "SELECT hostName() AS t").await,
+        text_on(&f.shard1b, "SELECT hostName() AS t").await,
+    );
+    let comment = format!("{}_t67_{}", f.db, uuid::Uuid::new_v4().simple());
+    let engine = MetricsEngine::new(
+        ChClient::new(shard1_config(&f.db)).await.expect("connect"),
+        cold_cache(&f).await,
+        MetricsConfig {
+            grouped_push: false,
+            max_replica_delay_secs: 5,
+            ..engine_config(&f.db)
+        },
+    )
+    .with_query_log_comment(&comment);
+    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
+    let expr = parse(r#"sum(rate(m{s=~"1.*"}[5m]))"#).expect("parse");
+    let p = MetricQueryParams {
+        start_ms: f.hi - 40 * MIN,
+        end_ms: f.hi,
+        step_ms: MIN,
+    };
+    let (_, _, explain) = engine
+        .query_explained(&tenant, &expr, &p)
+        .await
+        .expect("query");
+    let resolution: Vec<String> = explain
+        .stages
+        .iter()
+        .filter(|s| s.name == "series_resolution")
+        .map(|s| s.sql.clone())
+        .collect();
+    assert!(
+        !resolution.is_empty() && resolution.iter().all(|s| !s.starts_with("label cache:")),
+        "the series resolve by SQL: {resolution:?}"
+    );
+    let hosts = hosts_reading_local(&f, &comment, &table).await;
+    exec(&f.shard1, &format!("SYSTEM START FETCHES {table}")).await;
+    assert!(
+        hosts.contains(&h1),
+        "the local replica {h1} read no {table}: {hosts:?}"
+    );
+    assert!(
+        !hosts.contains(&h1b),
+        "the second replica {h1b} read {table}: {hosts:?}"
+    );
+    exec(
+        &f.bootstrap,
+        &format!(
+            "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
+            f.db
+        ),
+    )
+    .await;
+}
+
 // ------------------------------------------------ issue #579 part 5, T17
+
+/// Every top-level statement shard 1 ran under `comment`, finished or
+/// failed, in start order.
+async fn statements(node: &ChClient, comment: &str) -> Vec<String> {
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
+    struct Logged {
+        query: String,
+    }
+    settle_query_log(
+        &[node],
+        &format!("is_initial_query AND log_comment = '{comment}'"),
+        1,
+    )
+    .await;
+    let mut stream = node
+        .query_stream::<Logged>(
+            &format!(
+                "SELECT query FROM system.query_log \
+                 WHERE type IN ('QueryFinish', 'ExceptionWhileProcessing') AND is_initial_query \
+                   AND log_comment = '{comment}' \
+                 ORDER BY query_start_time_microseconds"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("query_log");
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode").query);
+    }
+    out
+}
 
 /// **T17 (issue #579 part 5): a match node answers on two shards.** T7's
 /// fixture with `m` and `n`: a `group_left` match pushed over both sides'

@@ -374,6 +374,7 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         ""
     };
     MetricsConfig {
+        max_replica_delay_secs: config.reader.promql_max_replica_delay.0.as_secs(),
         db: config.clickhouse.database.clone(),
         samples_table: format!("metric_samples{dist}"),
         series_table: format!("metric_series{dist}"),

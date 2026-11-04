@@ -64,6 +64,15 @@ pub(crate) struct LevelView {
     pub(crate) from_ms: u64,
 }
 
+/// Issue #18 part 2c: one replica's lag for one table.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReplicaView {
+    host: String,
+    table: String,
+    absolute_delay_seconds: u64,
+}
+
 /// `GET /admin/database` and `/admin/api/v1/database`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -76,6 +85,8 @@ pub(crate) struct DatabaseView {
     shards: Option<u32>,
     counter_buckets: Option<u32>,
     discovery_failures: u64,
+    replicas: Option<Vec<ReplicaView>>,
+    replicas_note: Option<&'static str>,
 }
 
 impl DatabaseView {
@@ -89,6 +100,8 @@ impl DatabaseView {
         ("shards", "Shards"),
         ("counterBuckets", "Counter buckets"),
         ("discoveryFailures", "Discovery failures"),
+        ("replicas", "Replica delay"),
+        ("replicasNote", "Replicas note"),
     ];
 
     pub(crate) async fn build(state: &AppState) -> Self {
@@ -117,6 +130,29 @@ impl DatabaseView {
                     ),
                 }
             };
+        // Issue #18 part 2c: each replica's lag, from the reader's level
+        // loop; clustered only.
+        let (replicas, replicas_note) = if state.config.cluster.is_none() {
+            (None, Some("not clustered"))
+        } else if !crate::serve::reader_enabled(&state.config) {
+            (None, Some("not read in writer mode"))
+        } else {
+            match state.rollup_levels.replicas() {
+                None => (Some(Vec::new()), Some("not yet read")),
+                Some(rows) => (
+                    Some(
+                        rows.into_iter()
+                            .map(|r| ReplicaView {
+                                host: r.host,
+                                table: r.table,
+                                absolute_delay_seconds: r.absolute_delay,
+                            })
+                            .collect(),
+                    ),
+                    None,
+                ),
+            }
+        };
         DatabaseView {
             database: state.config.clickhouse.database.clone(),
             cluster: state.config.cluster.clone(),
@@ -126,6 +162,8 @@ impl DatabaseView {
             shards,
             counter_buckets,
             discovery_failures: state.rollup_levels.failures(),
+            replicas,
+            replicas_note,
         }
     }
 }

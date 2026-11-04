@@ -1423,6 +1423,7 @@ mod tests {
 
     fn cfg(grouped_push: bool) -> MetricsConfig {
         MetricsConfig {
+            max_replica_delay_secs: 5,
             skip_unavailable_shards: false,
             db: "d".to_string(),
             samples_table: "metric_samples".to_string(),

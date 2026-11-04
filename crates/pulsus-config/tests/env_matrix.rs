@@ -17,7 +17,7 @@ mod support;
 use std::time::Duration;
 
 use pulsus_config::{
-    ByteSize, ChProto, Config, ExpHistogramMode, InsertMode, LogLevel, Mode,
+    ByteSize, ChProto, Config, ExpHistogramMode, HumanDuration, InsertMode, LogLevel, Mode,
     OtlpTranslationStrategy,
 };
 
@@ -436,6 +436,11 @@ const ROWS: &[Row] = &[
         var: "PULSUS_PROMQL_READ_MAX_MEMORY_BYTES",
         value: "3145728",
         check: |c| c.reader.promql_read_max_memory_bytes == 3_145_728,
+    },
+    Row {
+        var: "PULSUS_PROMQL_MAX_REPLICA_DELAY",
+        value: "1s",
+        check: |c| c.reader.promql_max_replica_delay == HumanDuration(Duration::from_secs(1)),
     },
     Row {
         var: "PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES",
@@ -909,6 +914,43 @@ fn a_null_or_empty_admin_field_in_yaml_keeps_its_default() {
             ),
             (Some(want.0), Some(want.1)),
             "{name}"
+        );
+    }
+}
+
+/// **U3b (issue #18 part 2c): `PULSUS_PROMQL_MAX_REPLICA_DELAY`'s range**:
+/// whole seconds from 1 s to 3600 s, default 5 s.
+#[test]
+fn the_replica_delay_variable_takes_whole_seconds_in_range() {
+    let _guard = support::lock_env();
+    let var = "PULSUS_PROMQL_MAX_REPLICA_DELAY";
+    let loaded = |value: Option<&str>| {
+        support::clear_all();
+        // SAFETY: the guard is held, as `support::set` requires.
+        unsafe { std::env::remove_var(var) };
+        if let Some(v) = value {
+            support::set(var, v);
+        }
+        let got = pulsus_config::load(None, None)
+            .map(|c| c.reader.promql_max_replica_delay.0)
+            .map_err(|e| e.to_string());
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(var) };
+        got
+    };
+    assert_eq!(loaded(None), Ok(Duration::from_secs(5)), "unset");
+    assert_eq!(loaded(Some("1s")), Ok(Duration::from_secs(1)), "1s");
+    assert_eq!(
+        loaded(Some("3600s")),
+        Ok(Duration::from_secs(3600)),
+        "3600s"
+    );
+    for refused in ["0s", "3601s", "1500ms"] {
+        let got = loaded(Some(refused));
+        assert!(
+            got.as_ref()
+                .is_err_and(|e| e.contains("reader.promql_max_replica_delay")),
+            "{refused}: {got:?}"
         );
     }
 }
