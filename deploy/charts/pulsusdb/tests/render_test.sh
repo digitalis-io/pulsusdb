@@ -128,7 +128,7 @@ limit_for() {
         StatefulSet) echo 52 ;;
         Service|Job) echo 63 ;;
         Deployment) echo 242 ;;
-        Pod|Ingress|HorizontalPodAutoscaler|ServiceAccount|ConfigMap|Secret|PersistentVolumeClaim|PodDisruptionBudget|NetworkPolicy) echo 253 ;;
+        Pod|Ingress|HorizontalPodAutoscaler|ServiceAccount|ConfigMap|Secret|PersistentVolumeClaim|PodDisruptionBudget|NetworkPolicy|GrafanaDatasource|Grafana) echo 253 ;;
         *) echo 0 ;;
     esac
 }

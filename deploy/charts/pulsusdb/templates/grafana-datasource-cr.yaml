@@ -1,0 +1,20 @@
+{{- if and (index .Values "grafana-operator" "enabled") .Values.grafana.datasourceProvisioning.enabled }}
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDatasource
+metadata:
+  name: {{ include "pulsusdb.fullname" . }}-loki
+  labels:
+    {{- include "pulsusdb.labels" . | nindent 4 }}
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: {{ include "pulsusdb.fullname" . }}
+  datasource:
+    name: PulsusDB (Loki compat)
+    uid: {{ printf "%s-loki" (regexReplaceAll "-+$" (include "pulsusdb.fullname" . | trunc 35) "") }}
+    type: loki
+    access: proxy
+    url: http://{{ include "pulsusdb.queryServiceName" . }}:{{ .Values.service.port }}
+    isDefault: false
+    editable: false
+{{- end }}
