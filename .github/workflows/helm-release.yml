@@ -43,7 +43,7 @@ permissions:
   id-token: write
 
 env:
-  HELM_VERSION: "v3.18.4"
+  HELM_VERSION: "v4.3.1"
   CHART_DIR: deploy/charts/pulsusdb
   OCI_REPO: oci://ghcr.io/digitalis-io/charts
 

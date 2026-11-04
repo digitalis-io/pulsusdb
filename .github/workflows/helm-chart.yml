@@ -30,7 +30,7 @@ on:
       - ".github/workflows/helm-chart.yml"
 
 env:
-  HELM_VERSION: "v3.18.4"
+  HELM_VERSION: "v4.3.1"
   KIND_VERSION: "v0.29.0"
 
 jobs:
