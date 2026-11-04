@@ -1257,7 +1257,8 @@ async fn statements(node: &ChClient, comment: &str) -> Vec<String> {
 
 /// **T17 (issue #579 part 5): a match node answers on two shards.** T7's
 /// fixture with `m` and `n`: a `group_left` match pushed over both sides'
-/// level reads; a match today's evaluator refuses takes today's route.
+/// level reads, with the label cache warm and never refreshed; a match
+/// today's evaluator refuses takes today's route.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_match_node_answers_on_two_shards() {
     if skipping() {
@@ -1295,6 +1296,35 @@ async fn a_match_node_answers_on_two_shards() {
     );
     assert_eq!(cells(&b).len(), 40, "(i): in process");
     assert_eq!(cells(&a), cells(&b), "(i): pushed against in process");
+    // (i), cold (after #18 part 2c): a label cache never refreshed, so both
+    // sides are resolved by SQL and filter `GLOBAL IN` their series.
+    let cold = cold_cache(&f).await;
+    let cold_on = level_engine(&f, &cold, &slot, true, None).await;
+    let (c, _, explain) = cold_on
+        .query_explained(&tenant, &expr, &p)
+        .await
+        .expect("cold on");
+    let st = stages(&explain);
+    let resolution: Vec<&String> = st
+        .iter()
+        .filter(|(n, _)| n == "series_resolution")
+        .map(|(_, sql)| sql)
+        .collect();
+    assert!(
+        !resolution.is_empty() && resolution.iter().all(|s| !s.starts_with("label cache:")),
+        "(i) cold: the series resolve by SQL: {resolution:?}"
+    );
+    assert!(
+        st.iter().any(|(n, sql)| n == "pushed_aggregate"
+            && sql.matches("FROM metric_samples_60s_dist\n").count() == 2),
+        "(i) cold: no pushed statement reading the level twice: {st:#?}"
+    );
+    assert!(
+        !st.iter().any(|(_, sql)| sql.starts_with("declined:")),
+        "(i) cold: {st:#?}"
+    );
+    assert_eq!(cells(&c).len(), 40, "(i) cold: pushed");
+    assert_eq!(cells(&c), cells(&b), "(i) cold: pushed against in process");
     // (ii)
     let comment = format!("{}_t17_{}", f.db, uuid::Uuid::new_v4().simple());
     let logged = level_engine(&f, &cache, &slot, true, Some(&comment)).await;

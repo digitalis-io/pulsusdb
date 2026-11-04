@@ -2237,6 +2237,92 @@ mod tests {
         );
     }
 
+    /// **U9 (issue #579 part 5, after #18 part 2c): a match statement over
+    /// two cache-answered sides reads one table per access**, so 2c's lag
+    /// guard stays on it; with a side the cache did not answer it does not.
+    #[test]
+    fn a_known_match_statement_is_one_table() {
+        use super::super::grouped::MatchSpec;
+        use crate::metrics::dispatch::one_table_per_access;
+        use pulsus_model::{Fingerprint, LabelSet};
+        use pulsus_promql::Group;
+        let labels = LabelSet::from_verbatim(
+            [("instance", "i0"), ("role", "")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        let members = members_known(&[
+            (Fingerprint::from_raw(101).sql_literal(), &labels),
+            (Fingerprint::from_raw(205).sql_literal(), &labels),
+        ]);
+        let ids = t11_ids("p_tx_total");
+        fn side<'a>(name: &'static str, series: SideSeries<'a>) -> SideSql<'a> {
+            SideSql {
+                tenant: Box::leak(Box::new(no_tenant())),
+                samples_table: "metric_samples",
+                labels_table: "metric_labels",
+                series,
+                metric_name: name,
+                func: PushedRangeFn::Rate,
+                range_ms: 300_000,
+                scale: None,
+                window: T11_WINDOW,
+                level: Some(t11_level()),
+            }
+        }
+        let known = |name: &'static str| {
+            side(
+                name,
+                SideSeries::Known {
+                    list: "'101', '205'",
+                    members: &members,
+                },
+            )
+        };
+        let (rx, tx) = (known("p_rx_total"), known("p_tx_total"));
+        let tx_ids = side("p_tx_total", SideSeries::Ids(&ids));
+        let strs = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let matches = [
+            (
+                "* on () group_left (role)",
+                BinOp::Mul,
+                MatchSpec {
+                    on: true,
+                    labels: Vec::new(),
+                    group: Group::Left(strs(&["role"])),
+                },
+            ),
+            (
+                "> ignoring (a, b)",
+                BinOp::Gt,
+                MatchSpec {
+                    on: false,
+                    labels: strs(&["a", "b"]),
+                    group: Group::OneToOne,
+                },
+            ),
+        ];
+        for (what, bin, spec) in &matches {
+            for (sides, (many, one), want) in [
+                ("both known", (&rx, &tx), true),
+                ("one by ID", (&rx, &tx_ids), false),
+            ] {
+                let sql = match_aggregate_fetch(
+                    many,
+                    one,
+                    "metric_hist_samples",
+                    None,
+                    t11_grid(),
+                    RangeAggOp::Sum,
+                    *bin,
+                    false,
+                    spec,
+                );
+                assert_eq!(one_table_per_access(&sql), want, "{what}, {sides}:\n{sql}");
+            }
+        }
+    }
+
     /// **U2 (issue #579 part 5): the match statement renders the plan's
     /// text**: section 6's `MATCHED` with each placeholder substituted, its
     /// sides' `SERIES_STEPS` and `MEMBERS` part 4's builders, inside part
