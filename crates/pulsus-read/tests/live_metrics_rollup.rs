@@ -776,6 +776,7 @@ async fn writes_since(admin: &ChClient, db: &str, since_us: i64) -> Vec<String> 
     let cutoff_us = server_now_us(admin).await;
     let filter = format!(
         "has(databases, '{db}') AND query_kind != 'Select' \
+         AND client_name != 'refreshable materialized view' \
          AND toUnixTimestamp64Micro(query_start_time_microseconds) > {since_us} \
          AND toUnixTimestamp64Micro(query_start_time_microseconds) <= {cutoff_us}"
     );
@@ -1039,6 +1040,10 @@ struct Column<'a> {
     run: &'a str,
 }
 
+/// B2's query pairs in flight at once: half the 16 cores of the database
+/// machine the suite runs on, each pair two statements.
+const B2_PAIRS: usize = 8;
+
 /// Runs one B2 column, pushing its failures, its report lines and its
 /// query-log comments.
 async fn b2_column(
@@ -1082,10 +1087,20 @@ async fn b2_column(
     let kept = |x: BTreeMap<(String, i64), f64>| -> BTreeMap<(String, i64), f64> {
         x.into_iter().filter(|((_, t), _)| *t >= c.from).collect()
     };
-    for (qi, (function, kind, query)) in queries.iter().enumerate() {
-        let on_c = format!("{}_{secs}_{qi}_on", c.run);
-        let off_c = format!("{}_{secs}_{qi}_off", c.run);
-        let (a, b) = both(c.built, query, &p, Some((&on_c, &off_c))).await;
+    let mut answers = futures::stream::iter(queries.iter().enumerate())
+        .map(|(qi, (_, _, query))| {
+            let on_c = format!("{}_{secs}_{qi}_on", c.run);
+            let off_c = format!("{}_{secs}_{qi}_off", c.run);
+            let p = &p;
+            async move {
+                let ab = both(c.built, query, p, Some((&on_c, &off_c))).await;
+                (on_c, off_c, ab)
+            }
+        })
+        .buffered(B2_PAIRS);
+    let mut each = queries.iter();
+    while let Some((on_c, off_c, (a, b))) = answers.next().await {
+        let (function, kind, query) = each.next().expect("one answer a query");
         comments.push((query.clone(), secs, on_c, off_c));
         let route = a.stages("rollup_route");
         let table = format!("metric_samples_{secs}s,");
