@@ -32,6 +32,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       serviceAccountName: {{ include "pulsusdb.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:

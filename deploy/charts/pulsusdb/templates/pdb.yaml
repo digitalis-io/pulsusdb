@@ -1,4 +1,4 @@
-{{/* Off-by-default PodDisruptionBudget(s), one per rendered pulsusdb workload. */}}
+{{/* PodDisruptionBudget(s) for pulsusdb workloads (enabled by default). */}}
 {{- if .Values.podDisruptionBudget.enabled }}
 {{- if .Values.pulsusdb.split.enabled }}
 apiVersion: policy/v1
@@ -36,5 +36,45 @@ spec:
   selector:
     matchLabels:
       {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "all") | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- if and .Values.clickhouse.enabled .Values.clickhouse.podDisruptionBudget.enabled }}
+---
+{{- if eq .Values.topology "single" }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pulsusdb.clickhouseFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.clickhouse.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "clickhouse") | nindent 6 }}
+{{- else }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pulsusdb.clickhouseFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.clickhouse.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "clickhouse") | nindent 6 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pulsusdb.clickhouseKeeperFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.clickhouse.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 6 }}
 {{- end }}
 {{- end }}

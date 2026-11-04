@@ -50,7 +50,9 @@ pulsusdb:
     enabled: false
 
   # -- Replica count for the all-mode Deployment (`split.enabled=false`).
-  replicaCount: 1
+  # Defaults to 2 so a node drain does not take the service fully offline;
+  # pair with `podDisruptionBudget.enabled=true` (the default).
+  replicaCount: 2
 
   writer:
     replicaCount: 2
@@ -80,7 +82,9 @@ pulsusdb:
     port: 3100
     log_level: info
     compat_endpoints: false
-    cors_origin: "*"
+    # -- CORS allowed origin. Empty string disables CORS (secure default).
+    # Set to `"*"` only for development/testing environments.
+    cors_origin: ""
     query_timeout: 2m
     storage_policy: null
     log_rollup_resolution: 5s
@@ -185,6 +189,9 @@ initJob:
   # table's expiry is in docs/configuration.md §7. The serving pods read it
   # back from the database the Job builds. Set it with
   # `--set initJob.retentionDays=<days>`.
+  # -- Seconds after a completed (or failed) Job is eligible for automatic
+  # garbage collection. Prevents orphaned Jobs accumulating across upgrades.
+  ttlSecondsAfterFinished: 300
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }
@@ -253,6 +260,14 @@ clickhouse:
     requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }
 
+  # -- PodDisruptionBudget for the bundled ClickHouse StatefulSet(s).
+  # Off by default because the bundled ClickHouse is a CI/fixture convenience
+  # (single replica; a PDB with minAvailable: 1 on a single-replica StatefulSet
+  # blocks node drains entirely). Enable when deploying multiple replicas.
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+
   # -- Hardened per code review round-1 finding #9: the official images
   # support running as their built-in non-root `clickhouse` user (uid/gid
   # 101). `readOnlyRootFilesystem: true` is safe only because
@@ -300,6 +315,10 @@ persistence:
 otelCollector:
   enabled: true
   image: docker.io/otel/opentelemetry-collector-contrib:0.110.0
+  # -- Immutable digest pin for the OTel Collector image — same semantics as
+  # `image.digest` for pulsusdb. When set, the tag component of `image` is
+  # dropped to avoid an invalid `repo:tag@sha256:...` ref.
+  imageDigest: ""
   # -- Passthrough escape hatch (code review round-1 finding #11): when
   # non-empty, rendered verbatim as the collector's whole config.yaml,
   # replacing this chart's own release-aware default entirely (not
@@ -405,9 +424,15 @@ hpa:
   minReplicas: 1
   maxReplicas: 5
   targetCPUUtilizationPercentage: 80
+  # -- Custom HPA metrics list (autoscaling/v2 MetricSpec array). When non-empty,
+  # replaces the default CPU utilization metric entirely. Useful for
+  # memory-based or custom queue-depth autoscaling. The writer tier (ingest)
+  # is not covered by the HPA in split mode — add a separate HPA manually if
+  # needed.
+  metrics: []
 
 podDisruptionBudget:
-  enabled: false
+  enabled: true
   minAvailable: 1
 
 # -- Additional pod-level annotations/labels for the pulsusdb Deployments
@@ -418,4 +443,31 @@ podLabels: {}
 
 nodeSelector: {}
 tolerations: []
+# -- Affinity rules for pulsusdb Deployment pods. By default empty; for
+# production multi-replica installs, add a podAntiAffinity to spread pods
+# across nodes, e.g.:
+#   podAntiAffinity:
+#     preferredDuringSchedulingIgnoredDuringExecution:
+#       - weight: 100
+#         podAffinityTerm:
+#           labelSelector:
+#             matchLabels:
+#               app.kubernetes.io/name: pulsusdb
+#           topologyKey: kubernetes.io/hostname
 affinity: {}
+
+# -- Termination grace period for pulsusdb pods (seconds). The writer's
+# in-memory ingest queue defaults to 256 MiB; 60 s gives it time to drain
+# before SIGKILL on a heavily-loaded pod.
+terminationGracePeriodSeconds: 60
+
+# -- NetworkPolicy for pulsusdb and bundled ClickHouse pods. Off by default;
+# enable to restrict ClickHouse ingress to pulsusdb pods only.
+networkPolicy:
+  enabled: false
+
+# -- Optional grafana-operator dependency (Chart.yaml `dependencies` entry).
+# When enabled, the grafana-operator is installed alongside pulsusdb so
+# GrafanaDashboard/GrafanaDataSource CRDs can be managed in the same release.
+grafanaOperator:
+  enabled: false

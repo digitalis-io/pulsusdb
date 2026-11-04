@@ -118,10 +118,14 @@ spec:
               containerPort: {{ .Values.pulsusdb.config.clickhouse.http_port }}
             - name: native
               containerPort: {{ .Values.pulsusdb.config.clickhouse.port }}
+          startupProbe:
+            httpGet: { path: /ping, port: http }
+            failureThreshold: 30
+            periodSeconds: 10
           livenessProbe:
             httpGet: { path: /ping, port: http }
-            initialDelaySeconds: 10
             periodSeconds: 10
+            failureThreshold: 3
           readinessProbe:
             httpGet: { path: /ping, port: http }
             periodSeconds: 5

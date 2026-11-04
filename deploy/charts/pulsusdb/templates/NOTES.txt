@@ -1,5 +1,10 @@
 PulsusDB ({{ .Chart.Name }} {{ .Chart.Version }}, app {{ .Chart.AppVersion }}) has been installed.
 
+{{- if not .Values.initJob.retentionDays }}
+WARNING: initJob.retentionDays is required and has no default. If the schema
+Job was not rendered, re-install with --set initJob.retentionDays=<days>.
+{{- end }}
+
 {{- if .Values.pulsusdb.split.enabled }}
 
 Ingest Service (writer):

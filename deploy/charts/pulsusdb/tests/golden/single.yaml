@@ -7,6 +7,28 @@
 # stable across renders and would make this file permanently noisy.
 
 ---
+# Source: pulsusdb/templates/pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pulsusdb
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: pulsusdb
+    app.kubernetes.io/component: all
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pulsusdb
+      app.kubernetes.io/instance: pulsusdb
+      app.kubernetes.io/component: all
+
+---
 # Source: pulsusdb/templates/serviceaccount.yaml
 apiVersion: v1
 kind: ServiceAccount
@@ -18,6 +40,9 @@ metadata:
     app.kubernetes.io/instance: pulsusdb
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: pulsusdb
+automountServiceAccountToken: false
+
 ---
 # Source: pulsusdb/templates/configmap.yaml
 apiVersion: v1
@@ -30,6 +55,7 @@ metadata:
     app.kubernetes.io/instance: pulsusdb
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: pulsusdb
 data:
   config.yaml: |
     clickhouse:
@@ -42,7 +68,7 @@ data:
       tls_skip_verify: false
     cluster: null
     compat_endpoints: false
-    cors_origin: '*'
+    cors_origin: ""
     dist_suffix: _dist
     host: 0.0.0.0
     log_level: info
@@ -62,12 +88,12 @@ data:
       max_result_bytes: 10MiB
       poll_interval: 30s
     skip_unavailable_shards: false
-    storage_policy: null
     writer:
       batch_bytes: 16MiB
       batch_ms: 200
       ingest_queue_bytes: 256MiB
       insert_mode: sync
+
 ---
 # Source: pulsusdb/templates/otel-collector-configmap.yaml
 apiVersion: v1
@@ -80,9 +106,14 @@ metadata:
     app.kubernetes.io/instance: pulsusdb
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: pulsusdb
     app.kubernetes.io/component: otel-collector
 data:
   config.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
     receivers:
       otlp:
         protocols: { grpc: { endpoint: 0.0.0.0:4317 }, http: { endpoint: 0.0.0.0:4318 } }
@@ -95,10 +126,12 @@ data:
         add_metric_suffixes: false
 
     service:
+      extensions: [health_check]
       pipelines:
         logs: { receivers: [otlp], exporters: [otlphttp] }
         metrics: { receivers: [otlp], exporters: [prometheusremotewrite/pulsus] }
         # traces/profiles pipelines land with their own milestones (M4/M5)
+
 ---
 # Source: pulsusdb/templates/clickhouse-statefulset-single.yaml
 apiVersion: v1
@@ -111,6 +144,7 @@ metadata:
     app.kubernetes.io/instance: pulsusdb
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: pulsusdb
     app.kubernetes.io/component: clickhouse
 spec:
   clusterIP: None
@@ -123,6 +157,7 @@ spec:
     app.kubernetes.io/name: pulsusdb
     app.kubernetes.io/instance: pulsusdb
     app.kubernetes.io/component: clickhouse
+
 ---
 # Source: pulsusdb/templates/otel-collector-deployment.yaml
 apiVersion: v1
@@ -135,6 +170,7 @@ metadata:
     app.kubernetes.io/instance: pulsusdb
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: pulsusdb
     app.kubernetes.io/component: otel-collector
 spec:
   type: ClusterIP
@@ -149,6 +185,7 @@ spec:
     app.kubernetes.io/name: pulsusdb
     app.kubernetes.io/instance: pulsusdb
     app.kubernetes.io/component: otel-collector
+
 ---
 # Source: pulsusdb/templates/service.yaml
 apiVersion: v1
@@ -161,6 +198,7 @@ metadata:
     app.kubernetes.io/instance: pulsusdb
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: pulsusdb
     app.kubernetes.io/component: all
 spec:
   type: ClusterIP
@@ -173,6 +211,7 @@ spec:
     app.kubernetes.io/name: pulsusdb
     app.kubernetes.io/instance: pulsusdb
     app.kubernetes.io/component: all
+
 ---
 # Source: pulsusdb/templates/deployment-all.yaml
 apiVersion: apps/v1
@@ -185,9 +224,10 @@ metadata:
     app.kubernetes.io/instance: pulsusdb
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: pulsusdb
     app.kubernetes.io/component: all
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: pulsusdb
@@ -201,11 +241,13 @@ spec:
         app.kubernetes.io/instance: pulsusdb
         app.kubernetes.io/version: "0.1.0"
         app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/part-of: pulsusdb
         app.kubernetes.io/component: all
       annotations:
-        checksum/config: 543229901a2a5d992428e16c7718e1ed0c7557c9524e206e9d9e5dd9970485ca
+        checksum/config: abbba936ee7c5a9c0e581c716eb4f8fa524bb2b4232f20248bd37de402f74a1e
         checksum/secret: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
     spec:
+      terminationGracePeriodSeconds: 60
       serviceAccountName: pulsusdb
       securityContext:
         fsGroup: 10001
@@ -282,6 +324,7 @@ spec:
           emptyDir: {}
         - name: tmp
           emptyDir: {}
+
 ---
 # Source: pulsusdb/templates/otel-collector-deployment.yaml
 apiVersion: apps/v1
@@ -294,6 +337,7 @@ metadata:
     app.kubernetes.io/instance: pulsusdb
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: pulsusdb
     app.kubernetes.io/component: otel-collector
 spec:
   replicas: 1
@@ -310,9 +354,10 @@ spec:
         app.kubernetes.io/instance: pulsusdb
         app.kubernetes.io/version: "0.1.0"
         app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/part-of: pulsusdb
         app.kubernetes.io/component: otel-collector
       annotations:
-        checksum/config: eb2a1d286e54b14e4b0e2463f635a86729947ceec6f70f180f80d1e1b91651b1
+        checksum/config: c5d2c1ac3a43942e02c65dd3d75b4e186db927a33fcd45113524f12dfa599dc3
     spec:
       securityContext:
         runAsGroup: 10001
@@ -329,6 +374,17 @@ spec:
               containerPort: 4317
             - name: otlp-http
               containerPort: 4318
+            - name: healthz
+              containerPort: 13133
+          livenessProbe:
+            httpGet: { path: /, port: healthz }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /, port: healthz }
+            periodSeconds: 5
+            failureThreshold: 3
           resources:
             limits:
               cpu: "1"
@@ -354,6 +410,7 @@ spec:
             name: pulsusdb-otel-collector-config
         - name: tmp
           emptyDir: {}
+
 ---
 # Source: pulsusdb/templates/clickhouse-statefulset-single.yaml
 apiVersion: apps/v1
@@ -366,6 +423,7 @@ metadata:
     app.kubernetes.io/instance: pulsusdb
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: pulsusdb
     app.kubernetes.io/component: clickhouse
 spec:
   serviceName: pulsusdb-clickhouse
@@ -383,6 +441,7 @@ spec:
         app.kubernetes.io/instance: pulsusdb
         app.kubernetes.io/version: "0.1.0"
         app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/part-of: pulsusdb
         app.kubernetes.io/component: clickhouse
       annotations:
         checksum/secret: ec729a4d2f4ee1e04f118cd2d6341b3194f43564abe9ff20143d3d2a2305955f
@@ -410,10 +469,14 @@ spec:
               containerPort: 8123
             - name: native
               containerPort: 9000
+          startupProbe:
+            httpGet: { path: /ping, port: http }
+            failureThreshold: 30
+            periodSeconds: 10
           livenessProbe:
             httpGet: { path: /ping, port: http }
-            initialDelaySeconds: 10
             periodSeconds: 10
+            failureThreshold: 3
           readinessProbe:
             httpGet: { path: /ping, port: http }
             periodSeconds: 5
@@ -454,21 +517,24 @@ spec:
         resources:
           requests:
             storage: 20Gi
+
 ---
 # Source: pulsusdb/templates/init-job.yaml
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: pulsusdb-init-9ff052ba
+  name: pulsusdb-init-0639b851
   labels:
     helm.sh/chart: pulsusdb-0.1.0
     app.kubernetes.io/name: pulsusdb
     app.kubernetes.io/instance: pulsusdb
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: pulsusdb
     app.kubernetes.io/component: init
 spec:
   backoffLimit: 10
+  ttlSecondsAfterFinished: 300
   template:
     metadata:
       labels:
@@ -477,6 +543,7 @@ spec:
         app.kubernetes.io/instance: pulsusdb
         app.kubernetes.io/version: "0.1.0"
         app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/part-of: pulsusdb
         app.kubernetes.io/component: init
     spec:
       restartPolicy: Never
@@ -553,6 +620,7 @@ metadata:
     app.kubernetes.io/instance: pulsusdb
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: pulsusdb
   annotations:
     "helm.sh/hook": test
     "helm.sh/hook-weight": "0"
@@ -568,7 +636,7 @@ spec:
       type: RuntimeDefault
   containers:
     - name: test-ready
-      image: ghcr.io/digitalis-io/pulsusdb:0.1.0
+      image: busybox:1.37.0
       command: ["sh", "-c"]
       args:
         - >-
@@ -585,3 +653,4 @@ spec:
   volumes:
     - name: tmp
       emptyDir: {}
+

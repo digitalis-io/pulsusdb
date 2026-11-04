@@ -83,14 +83,16 @@ spec:
               containerPort: 9181
             - name: raft
               containerPort: 9234
-          livenessProbe:
-            exec:
-              command: ["bash", "-c", "echo ruok | timeout 2 nc -w 2 127.0.0.1 9181 | grep -q imok"]
-            initialDelaySeconds: 10
+          startupProbe:
+            tcpSocket: { port: client }
+            failureThreshold: 30
             periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: client }
+            periodSeconds: 10
+            failureThreshold: 3
           readinessProbe:
-            exec:
-              command: ["bash", "-c", "echo ruok | timeout 2 nc -w 2 127.0.0.1 9181 | grep -q imok"]
+            tcpSocket: { port: client }
             periodSeconds: 5
           resources:
             {{- toYaml .Values.clickhouse.keeperResources | nindent 12 }}

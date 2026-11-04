@@ -65,6 +65,7 @@ helm.sh/chart: {{ include "pulsusdb.chart" . }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: {{ include "pulsusdb.name" . }}
 {{- end -}}
 
 {{- define "pulsusdb.selectorLabels" -}}
@@ -431,6 +432,21 @@ checksum/secret: {{ printf "%s%s" (toYaml $.Values.clickhouse.auth) (include "pu
 
 {{- define "pulsusdb.otelChecksums" -}}
 checksum/config: {{ include (print $.Template.BasePath "/otel-collector-configmap.yaml") $ | sha256sum }}
+{{- end -}}
+
+{{/*
+Full OTel Collector image reference — mirrors pulsusdb.image's digest-preference
+logic. `otelCollector.imageDigest` (sha256:<64 hex>) is preferred over the tag
+embedded in `otelCollector.image` when set, dropping the tag component to avoid
+an invalid `repo:tag@sha256:...` ref.
+*/}}
+{{- define "pulsusdb.otelImage" -}}
+{{- if .Values.otelCollector.imageDigest -}}
+{{- $repo := regexReplaceAll ":.*$" .Values.otelCollector.image "" -}}
+{{- printf "%s@%s" $repo .Values.otelCollector.imageDigest -}}
+{{- else -}}
+{{- .Values.otelCollector.image -}}
+{{- end -}}
 {{- end -}}
 
 {{/*

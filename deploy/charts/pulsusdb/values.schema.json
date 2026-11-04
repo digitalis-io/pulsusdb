@@ -90,6 +90,7 @@
         "enabled": { "type": "boolean" },
         "retentionDays": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
         "backoffLimit": { "type": "integer", "minimum": 0 },
+        "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0, "description": "Seconds after a finished Job is garbage-collected." },
         "resources": { "$ref": "#/definitions/resources" }
       },
       "$comment": "Retention has no default (issue #497): the schema Job refuses to render without it.",
@@ -127,7 +128,15 @@
         "podSecurityContext": { "type": "object", "description": "Raw k8s PodSecurityContext passthrough — deliberately not re-modeled field-by-field." },
         "securityContext": { "type": "object", "description": "Raw k8s SecurityContext passthrough — deliberately not re-modeled field-by-field." },
         "keeperPodSecurityContext": { "type": "object", "description": "Raw k8s PodSecurityContext passthrough." },
-        "keeperSecurityContext": { "type": "object", "description": "Raw k8s SecurityContext passthrough." }
+        "keeperSecurityContext": { "type": "object", "description": "Raw k8s SecurityContext passthrough." },
+        "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "minAvailable": { "type": "integer", "minimum": 0 }
+          }
+        }
       }
     },
     "persistence": {
@@ -146,6 +155,11 @@
       "properties": {
         "enabled": { "type": "boolean" },
         "image": { "type": "string", "minLength": 1, "pattern": "^[^@]+(@sha256:[0-9a-f]{64})?$" },
+        "imageDigest": {
+          "type": "string",
+          "pattern": "^(sha256:[0-9a-f]{64})?$",
+          "description": "Immutable digest pin for the OTel Collector image — preferred over the tag in `image` when set."
+        },
         "config": {
           "type": "object",
           "additionalProperties": true,
@@ -171,7 +185,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"], "description": "Service type. NodePort is for development/testing only — it exposes the port on every cluster node." },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
       }
     },
@@ -227,7 +241,12 @@
         "enabled": { "type": "boolean" },
         "minReplicas": { "type": "integer", "minimum": 1 },
         "maxReplicas": { "type": "integer", "minimum": 1 },
-        "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1, "maximum": 100 }
+        "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "metrics": {
+          "type": "array",
+          "description": "Custom autoscaling/v2 MetricSpec list. When non-empty, replaces the default CPU utilization metric.",
+          "items": { "type": "object" }
+        }
       }
     },
     "podDisruptionBudget": {
@@ -236,6 +255,26 @@
       "properties": {
         "enabled": { "type": "boolean" },
         "minAvailable": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "terminationGracePeriodSeconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Termination grace period for pulsusdb pods in seconds."
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "grafanaOperator": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Values passed to the grafana-operator subchart when grafanaOperator.enabled=true. See https://artifacthub.io/packages/helm/grafana/grafana-operator for full values reference.",
+      "properties": {
+        "enabled": { "type": "boolean" }
       }
     },
     "podAnnotations": { "type": "object", "description": "Arbitrary annotation map — deliberately left open." },

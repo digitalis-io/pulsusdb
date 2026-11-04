@@ -21,7 +21,7 @@ spec:
     {{- toYaml .Values.podSecurityContext | nindent 4 }}
   containers:
     - name: test-ready
-      image: {{ include "pulsusdb.image" . }}
+      image: busybox:1.37.0
       command: ["sh", "-c"]
       args:
         {{- if .Values.pulsusdb.split.enabled }}

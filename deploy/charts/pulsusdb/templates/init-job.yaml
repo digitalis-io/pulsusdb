@@ -50,6 +50,7 @@ spec:
 {{- end }}
 {{- define "pulsusdb.initJobSpec" -}}
 backoffLimit: {{ .Values.initJob.backoffLimit }}
+ttlSecondsAfterFinished: {{ .Values.initJob.ttlSecondsAfterFinished }}
 template:
   metadata:
     labels:

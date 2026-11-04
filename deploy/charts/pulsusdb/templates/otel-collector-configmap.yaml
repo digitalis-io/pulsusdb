@@ -27,6 +27,10 @@ data:
     {{- if .Values.otelCollector.config }}
     {{- toYaml .Values.otelCollector.config | nindent 4 }}
     {{- else }}
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
     receivers:
       otlp:
         protocols: { grpc: { endpoint: 0.0.0.0:4317 }, http: { endpoint: 0.0.0.0:4318 } }
@@ -39,6 +43,7 @@ data:
         add_metric_suffixes: false
 
     service:
+      extensions: [health_check]
       pipelines:
         logs: { receivers: [otlp], exporters: [otlphttp] }
         metrics: { receivers: [otlp], exporters: [prometheusremotewrite/pulsus] }

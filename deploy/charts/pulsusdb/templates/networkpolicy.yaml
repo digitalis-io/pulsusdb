@@ -1,0 +1,77 @@
+{{/*
+NetworkPolicy for pulsusdb and bundled ClickHouse (off by default).
+When enabled, restricts ClickHouse ingress to pulsusdb pods and shard-to-shard
+traffic, and restricts pulsusdb egress to ClickHouse ports only.
+Enable with `networkPolicy.enabled=true` for a defence-in-depth posture.
+*/}}
+{{- if .Values.networkPolicy.enabled }}
+{{- if .Values.clickhouse.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pulsusdb.clickhouseFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "clickhouse") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "pulsusdb.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: {{ .Values.pulsusdb.config.clickhouse.port }}
+          protocol: TCP
+        - port: {{ .Values.pulsusdb.config.clickhouse.http_port }}
+          protocol: TCP
+    {{- if eq .Values.topology "cluster" }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "clickhouse") | nindent 14 }}
+      ports:
+        - port: {{ .Values.pulsusdb.config.clickhouse.port }}
+          protocol: TCP
+        - port: {{ .Values.pulsusdb.config.clickhouse.http_port }}
+          protocol: TCP
+        - port: 9009
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 14 }}
+      ports:
+        - port: {{ .Values.pulsusdb.config.clickhouse.port }}
+          protocol: TCP
+    {{- end }}
+{{- if eq .Values.topology "cluster" }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pulsusdb.clickhouseKeeperFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "clickhouse") | nindent 14 }}
+      ports:
+        - port: 9181
+          protocol: TCP
+        - port: 9234
+          protocol: TCP
+{{- end }}
+{{- end }}
+{{- end }}
