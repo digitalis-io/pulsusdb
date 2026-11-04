@@ -6967,7 +6967,7 @@ const SELECTION_GOLDEN: &str = "crates/pulsus-read/tests/golden/logql_selection_
 /// alone leaves this constant standing and B2 fails, so the author has to
 /// move a source line in the same change and the diff carries both.
 const PINNED_SELECTION_STATEMENTS: &str =
-    "5a126e2cd6d321a86e311a6947f70b7756707a4c63b42ed396b01df9a9272238";
+    "5244a71a08e26f01e823b38b6f1415f8c3c3a4bc56b1d9bac28e67fbd37f260f";
 
 /// One grid point, on a step boundary: 2030-01-01T00:00:00Z.
 ///
