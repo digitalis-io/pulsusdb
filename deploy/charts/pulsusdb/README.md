@@ -94,9 +94,31 @@ Every Deployment and StatefulSet pod template carries `checksum/config` and/or `
 
 Every name this chart generates stays within its kind's limit up to Helm's own 53-character release-name cap (`_helpers.tpl`'s `pulsusdb.componentFullname`, code review round-1 finding #7): each component's suffix (`-writer`, `-reader`, `-clickhouse-shard-N`, `-clickhouse-keeper`, `-otel-collector`, ...) is reserved *before* truncating the base name to 63 characters, so two different components can never collide onto the same truncated prefix regardless of release-name length. Services, Deployments and the schema Job, its digest suffix included, stay within 63 characters; StatefulSets stay within 52, because their pods carry a `controller-revision-hash` label of `<name>-<hash>`. `tests/render_test.sh` check D renders every name with a 53-character release name and holds each kind to its limit.
 
-## Grafana Loki-compat datasource
+## Grafana datasource provisioning
 
-`grafana.datasourceProvisioning.enabled` (default `false`) renders a ConfigMap labelled `grafana_datasource: "1"` (consumable by the Grafana community chart's sidecar) provisioning a Loki-compatible datasource against the query Service. It **only works when `pulsusdb.config.compat_endpoints: true`** ([docs/configuration.md §1](../../../docs/configuration.md), [docs/api.md §8](../../../docs/api.md)) — enabling the datasource without `compat_endpoints` produces a datasource that 404s on every query; `NOTES.txt` warns about this at install time.
+`grafana.datasourceProvisioning.enabled` (default `true`) provisions Loki, Tempo, and Prometheus datasources against the query Service. Two provisioning paths are available, selected by whether grafana-operator is in use:
+
+**Community chart sidecar** (default path): renders a ConfigMap labelled `grafana_datasource: "1"` — consumable by the Grafana community Helm chart's sidecar without extra wiring.
+
+**grafana-operator CRs** (when `grafana-operator.enabled: true`): renders three `GrafanaDatasource` CRs instead, each selecting the Grafana instance via `instanceSelector.matchLabels.dashboards: <release-fullname>`. The CRs require grafana-operator v5 (`grafana.integreatly.org/v1beta1`) to be installed in the cluster.
+
+Both paths only work when `pulsusdb.config.compat_endpoints: true` ([docs/configuration.md §1](../../../docs/configuration.md), [docs/api.md §8](../../../docs/api.md)) — the Loki, Tempo, and Prometheus compat endpoints must be active for queries to succeed; `NOTES.txt` warns about this at install time.
+
+## grafana-operator integration
+
+Setting `grafana-operator.enabled: true` activates the optional [grafana-operator](https://github.com/grafana/grafana-operator) subchart (v5) and two additional templates:
+
+- **`GrafanaDatasource` CRs** (three: loki, tempo, prometheus) — rendered when `grafana.datasourceProvisioning.enabled: true`. Each targets a Grafana instance via `instanceSelector.matchLabels.dashboards: <release-fullname>`.
+- **`Grafana` CR** — rendered when `grafana.instance.enabled: true`. Creates a managed Grafana instance. The `dashboards` label on the CR matches the `GrafanaDatasource` selector automatically.
+
+The subchart condition key is `grafana-operator.enabled` (note the hyphen — the subchart's own name). Configure it under the same key in `values.yaml`:
+
+```yaml
+grafana-operator:
+  enabled: true
+```
+
+`grafana.instance` defaults (`enabled: false`) are safe to enable as-is for a quick in-cluster Grafana; set `adminPassword` before exposing the instance externally.
 
 ## Values reference
 
@@ -155,9 +177,24 @@ Every name this chart generates stays within its kind's limit up to Helm's own 5
 | `ingress.hosts` | list | `[{host: pulsusdb.example.com, paths: [{path: /, pathType: Prefix}]}]` | |
 | `hpa.enabled` | bool | `false` | Disabled skeleton only — no functional autoscaling |
 | `hpa.minReplicas` / `.maxReplicas` / `.targetCPUUtilizationPercentage` | int | `1` / `5` / `80` | |
-| `podDisruptionBudget.enabled` / `.minAvailable` | bool / int | `false` / `1` | |
+| `replicaCount` | int | `2` | Replica count for the all-mode Deployment (overrides `pulsusdb.replicaCount` when in non-split mode) |
+| `podDisruptionBudget.enabled` / `.minAvailable` | bool / int | `true` / `1` | PDB for the pulsusdb Deployments |
+| `terminationGracePeriodSeconds` | int | `60` | Grace period for all pulsusdb Deployments |
+| `networkPolicy.enabled` | bool | `false` | Render NetworkPolicy resources; restricts ClickHouse ingress to pulsusdb pods only. In cluster topology, also adds Keeper and shard-to-shard policies |
 | `podAnnotations` / `podLabels` / `nodeSelector` / `affinity` | object | `{}` / `{}` / `{}` / `{}` | The pulsusdb Deployments only |
 | `tolerations` | list | `[]` | The pulsusdb Deployments only |
+| `hpa.metrics` | list | `[]` | Additional HPA metric specs appended to the rendered `metrics:` block |
+| `initJob.ttlSecondsAfterFinished` | int | `300` | TTL before the completed schema Job is garbage-collected |
+| `otelCollector.imageDigest` | string | `""` | `sha256:<64 hex>` digest pin for the OTel Collector image — preferred over tag when set |
+| `clickhouse.podDisruptionBudget.enabled` / `.minAvailable` | bool / int | `false` / `1` | PDB for the bundled ClickHouse StatefulSet(s) |
+| `grafana.datasourceProvisioning.enabled` | bool | `true` | Provision Loki, Tempo, and Prometheus datasources. Uses ConfigMap (community chart sidecar) or `GrafanaDatasource` CRs (grafana-operator) — see above |
+| `grafana.instance.enabled` | bool | `false` | Render a `Grafana` CR (requires `grafana-operator.enabled: true`) |
+| `grafana.instance.adminUser` / `.adminPassword` | string | `admin` / `admin` | Grafana admin credentials — change `adminPassword` before exposing externally |
+| `grafana.instance.config` | object | `{}` | Additional Grafana CR config sections merged under `spec.config` |
+| `grafana.instance.ingress.enabled` / `.className` / `.host` | bool / string / string | `false` / `""` / `""` | Ingress spec inside the `Grafana` CR |
+| `grafana-operator.enabled` | bool | `false` | Enable the grafana-operator v5 subchart and activate CR-based datasource provisioning |
+| `pulsusdb.config.compat_endpoints` | bool | `true` | Enable Loki/Tempo/Prometheus compat endpoints — required for datasource provisioning to work |
+| `service.type` | string | `ClusterIP` | `NodePort` exposes the Service on a host port — not recommended for production; use an Ingress instead |
 
 Every key in `values.yaml` is in this table; `helm show values deploy/charts/pulsusdb` prints them with their comments.
 
