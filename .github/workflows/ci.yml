@@ -103,11 +103,6 @@ jobs:
           PULSUSDB_DOC_SITES_UPSTREAM: ${{ github.event.pull_request.base.sha || github.sha }}
         run: ci/checks/doc_sites.sh
 
-      # Issue #213: the release workflow's packaging scripts, tested here
-      # because the release workflow itself runs only on a tag or by hand.
-      - name: Release packaging scripts self-test
-        run: ci/checks/release_packaging_self_test.sh
-
       - name: Format check
         run: cargo fmt --all -- --check
 
@@ -3360,3 +3355,18 @@ jobs:
       - name: Tear down the cluster
         if: always()
         run: docker compose -f ci/clickhouse-cluster/compose.yaml down -v
+
+  # Issue #213: the release workflow's packaging scripts, tested on every
+  # pull request because the release workflow itself runs only on a tag or by
+  # hand. Appended last so no earlier line of this file moves.
+  release-packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - name: Release packaging scripts self-test
+        run: ci/checks/release_packaging_self_test.sh
