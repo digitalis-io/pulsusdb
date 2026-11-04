@@ -97,7 +97,7 @@ jobs:
           version: ${{ env.HELM_VERSION }}
 
       - name: Install the helm-unittest plugin
-        run: helm plugin install https://github.com/helm-unittest/helm-unittest
+        run: helm plugin install --verify=false https://github.com/helm-unittest/helm-unittest
 
       - name: "helm unittest (render/schema specs: AC #4's negative cases, probes, securityContext, env/secret passthrough)"
         run: helm unittest -f 'tests/unit/*_test.yaml' deploy/charts/pulsusdb
