@@ -34,6 +34,15 @@ data:
     receivers:
       otlp:
         protocols: { grpc: { endpoint: 0.0.0.0:4317 }, http: { endpoint: 0.0.0.0:4318 } }
+      hostmetrics:
+        collection_interval: 30s
+        scrapers:
+          cpu: {}
+          disk: {}
+          load: {}
+          filesystem: {}
+          memory: {}
+          network: {}
 
     processors:
       batch:
@@ -51,7 +60,7 @@ data:
       extensions: [health_check]
       pipelines:
         logs:    { receivers: [otlp], processors: [batch], exporters: [otlphttp] }
-        metrics: { receivers: [otlp], processors: [batch], exporters: [prometheusremotewrite/pulsus] }
+        metrics: { receivers: [otlp, hostmetrics], processors: [batch], exporters: [prometheusremotewrite/pulsus] }
         traces:  { receivers: [otlp], processors: [batch], exporters: [otlphttp] }
         # profiles pipeline lands with M5
     {{- end }}
