@@ -31,7 +31,7 @@ tests:
           value: ["--mode", "all", "--config", "/etc/pulsusdb/config.yaml"]
       - equal:
           path: spec.replicas
-          value: 1
+          value: 2
 
   - it: given default values, when rendering, then no writer/reader split Deployments are produced
     templates:
