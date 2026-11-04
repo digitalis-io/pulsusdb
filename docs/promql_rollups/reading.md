@@ -4,7 +4,7 @@
 
 **Built.** Part A (#742), part B (#744) and the follow-up that chooses the resolution by the query's time range (issue #18) are on `main`; every statement about code below is true of `main` with that follow-up. Tiering (#743 part A) and a level's own retention and move age (#743 part B) are on main.
 
-The user's account of the same rule is `docs/api.md` §3.6 (`Rollup levels`, `docs/api.md:994`).
+The user's account of the same rule is `docs/api.md` §3.6 (`Rollup levels`, `docs/api.md:1005`).
 
 ## 1. What a rollup answer is
 

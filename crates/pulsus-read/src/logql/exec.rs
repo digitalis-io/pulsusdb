@@ -1918,8 +1918,9 @@ impl LogQlEngine {
                 // instant plan is always `RouteChoice::Raw` over
                 // `log_samples` (the rollup decision requires
                 // `QuerySpec::Range`) — so the metadata column always
-                // exists here, and the merge needs it.
-                ScanProjection::WithStructuredMetadata,
+                // exists here. Issue #624, part 8: it is read unless no
+                // line's metadata can reach the answer.
+                super::rollup::counting_projection(mp, &meta),
             );
             if let Some(e) = explain.as_mut() {
                 e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
@@ -2035,6 +2036,7 @@ impl LogQlEngine {
                 &fingerprints,
                 &lowered.predicates,
                 self.config.rollup_res_ns,
+                super::rollup::counting_projection(mp, &meta),
             ) {
                 Ok(sql) => {
                     let sql = match self.key_route_test.bucketed_statement_max_memory_bytes {
@@ -2996,6 +2998,7 @@ impl LogQlEngine {
                                 &fingerprints,
                                 &lowered.predicates,
                                 self.config.rollup_res_ns,
+                                super::rollup::counting_projection(mp, &meta),
                             )
                         }
                         // Issue #624, part 4: the reduced statement, unless
@@ -3079,7 +3082,7 @@ impl LogQlEngine {
                     // The EXPLAIN twin of the execution site above, and
                     // reached under the same `step_ns.is_none()` instant
                     // condition — so it reports the query that runs.
-                    ScanProjection::WithStructuredMetadata,
+                    super::rollup::counting_projection(mp, &meta),
                 ),
             }
         };
@@ -6394,6 +6397,7 @@ fn bucketed_range_sql(
     fingerprints: &[Fingerprint],
     predicates: &[CheckedFragment],
     rollup_res_ns: u64,
+    projection: ScanProjection,
 ) -> Result<String, BucketGridRefusal> {
     // A plan with no step has no grid at all. Expressed as a refusal
     // rather than an assertion so the statement cannot be built for one.
@@ -6467,7 +6471,7 @@ fn bucketed_range_sql(
     // Issue #624: #507's statement when the range equals the step, which is
     // smaller and faster there; the sliding statement at every other range.
     if mp.range_ns.get() != step_ns {
-        return super::sql::metric_range_sliding_with_regexp(
+        return super::sql::metric_range_sliding_projected(
             tenant,
             metric_source(mp),
             services,
@@ -6480,6 +6484,7 @@ fn bucketed_range_sql(
                 range_ns: mp.range_ns.get(),
             },
             predicates,
+            projection,
             extraction,
         );
     }
@@ -6499,10 +6504,9 @@ fn bucketed_range_sql(
             step_ns,
         },
         predicates,
-        // `Lean` drops the metadata column and its only caller is
-        // `absent_over_time`, which never lowers onto this path
-        // (`compile.rs`'s `RangeAggLower::capability` makes it `Never`).
-        ScanProjection::WithStructuredMetadata,
+        // Issue #624, part 8: `counting_projection`'s answer, from the
+        // caller, which holds the hydrated streams.
+        projection,
         extraction,
     )
 }
@@ -11256,7 +11260,8 @@ mod tests {
                 &services,
                 &fingerprints,
                 &[],
-                5_000_000_000
+                5_000_000_000,
+                ScanProjection::WithStructuredMetadata,
             )
             .is_ok()
         );
@@ -11271,7 +11276,8 @@ mod tests {
                 &services,
                 &fingerprints,
                 &[],
-                5_000_000_000
+                5_000_000_000,
+                ScanProjection::WithStructuredMetadata,
             ),
             Err(BucketGridRefusal::StepNotPositive)
         );
@@ -11287,7 +11293,8 @@ mod tests {
                 &services,
                 &fingerprints,
                 &[],
-                5_000_000_000
+                5_000_000_000,
+                ScanProjection::WithStructuredMetadata,
             ),
             Err(BucketGridRefusal::AnchorAboveScanStart)
         );
@@ -11305,7 +11312,8 @@ mod tests {
                 &services,
                 &fingerprints,
                 &[],
-                5_000_000_000
+                5_000_000_000,
+                ScanProjection::WithStructuredMetadata,
             ),
             Err(BucketGridRefusal::WouldOverflow)
         );
@@ -11325,7 +11333,8 @@ mod tests {
                 &services,
                 &fingerprints,
                 &[],
-                5_000_000_000
+                5_000_000_000,
+                ScanProjection::WithStructuredMetadata,
             ),
             Err(BucketGridRefusal::WouldOverflow)
         );

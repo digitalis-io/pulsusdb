@@ -12,7 +12,7 @@ use super::labels::series_labels;
 use super::params::ValidatedDuration;
 use super::plan::{MetricPlan, RouteChoice, RoutingDecision, VectorAggSpec, parent_sum_grouping};
 use super::rows::StreamMetaRow;
-use super::sql::{MetricShape, MetricValue, ScanLowerBound};
+use super::sql::{MetricShape, MetricValue, ScanLowerBound, ScanProjection};
 
 /// Why a rollup plan reads the lines after all; each names its own routing
 /// reason, so `X-Pulsus-Explain` reports the route that ran and its cause.
@@ -82,23 +82,72 @@ pub(in crate::logql) fn rollup_route(
     ) {
         return None;
     }
-    match parent_sum_grouping(op, false, vector_aggs)? {
-        None => {}
-        Some(g) if g.kind == GroupingKind::By => {
-            if g.labels
-                .iter()
-                .any(|l| l.starts_with("__") || l.ends_with("_extracted"))
-            {
-                return None;
-            }
-        }
-        Some(_) => return None,
-    }
+    sum_names(op, vector_aggs)?;
     let res = i64::try_from(res_ns).ok().filter(|r| *r > 0)?;
     let step = step_ns?.get();
     let on_grid = |v: i64| v.rem_euclid(res) == 0;
     (on_grid(grid_start_ns) && on_grid(step) && on_grid(range_ns))
         .then(|| format!("rollup: sum over the {res} ns buckets (issue #614)"))
+}
+
+/// The names of the innermost `sum` above `op` when no line's structured
+/// metadata can reach the answer under it: none for a bare `sum`, `L` for a
+/// `sum by (L)` with no name starting `__` or ending `_extracted`. `None` for
+/// any other parent, `sum without` among them. [`streams_carry`] holds the
+/// other half: every selected stream carries every name as a stream label.
+pub(in crate::logql) fn sum_names(
+    op: RangeAggOp,
+    vector_aggs: &[VectorAggSpec],
+) -> Option<&[String]> {
+    match parent_sum_grouping(op, false, vector_aggs)? {
+        None => Some(&[]),
+        Some(g) if g.kind == GroupingKind::By => {
+            if g.labels
+                .iter()
+                .any(|l| l.starts_with("__") || l.ends_with("_extracted"))
+            {
+                None
+            } else {
+                Some(&g.labels)
+            }
+        }
+        Some(_) => None,
+    }
+}
+
+/// Whether every hydrated stream carries every one of `names` as a stream
+/// label, read from [`series_labels`]: a line's structured metadata supplies
+/// a name its stream lacks.
+pub(in crate::logql) fn streams_carry(
+    names: &[String],
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
+) -> bool {
+    meta.values().all(|m| {
+        let labels = series_labels(m);
+        names.iter().all(|n| labels.iter().any(|(k, _)| k == n))
+    })
+}
+
+/// The projection of a raw counting statement (issue #624, part 8), decided
+/// once the streams are hydrated. A clean plan — the counting shape, not the
+/// rollup, no client aggregation, no lowered metadata filter — reads `'' AS
+/// structured_metadata` when no line's metadata can reach the answer: under
+/// the rollup's own label rule ([`sum_names`] and [`streams_carry`]). Every
+/// other plan keeps the column. Under the blank shapes a non-empty
+/// `__error__` in a line's metadata is counted, as on the rollup (owner,
+/// issue #614 and 2026-11-04).
+pub(in crate::logql) fn counting_projection(
+    mp: &MetricPlan,
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
+) -> ScanProjection {
+    let clean = matches!(mp.value, MetricValue::Shaped(_))
+        && !mp.rollup
+        && mp.client.is_none()
+        && mp.metadata_lowering.is_none();
+    match sum_names(mp.op, &mp.vector_aggs) {
+        Some(names) if clean && streams_carry(names, meta) => ScanProjection::MetadataBlank,
+        _ => ScanProjection::WithStructuredMetadata,
+    }
 }
 
 /// `mp` as the raw route plans it, when `mp` is a rollup plan: the samples
@@ -140,11 +189,7 @@ pub(in crate::logql) fn rollup_or_raw<'a>(
         Some((_, Some(g), _)) => &g.labels,
         _ => &[],
     };
-    let carried = meta.values().all(|m| {
-        let labels = series_labels(m);
-        names.iter().all(|n| labels.iter().any(|(k, _)| k == n))
-    });
-    if carried {
+    if streams_carry(names, meta) {
         Cow::Borrowed(mp)
     } else {
         raw_route_of(mp, samples, RawCause::Labels)

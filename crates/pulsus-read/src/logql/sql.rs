@@ -1431,7 +1431,7 @@ pub fn metric_instant(
         sql.push_str(clause.as_sql());
     }
     sql.push_str(match projection {
-        ScanProjection::Lean => "\nGROUP BY fingerprint",
+        ScanProjection::Lean | ScanProjection::MetadataBlank => "\nGROUP BY fingerprint",
         ScanProjection::WithStructuredMetadata => "\nGROUP BY fingerprint, structured_metadata",
     });
     sql
@@ -1453,6 +1453,12 @@ pub enum ScanProjection {
     Lean,
     /// Every other metric reducer.
     WithStructuredMetadata,
+    /// `'' AS structured_metadata` in the `SELECT` list and the column
+    /// nowhere else (issue #624, part 8): the row keeps its four columns and
+    /// the statement groups by fingerprint alone, as the rollup statement
+    /// does. Taken by a clean counting plan when no line's metadata can
+    /// reach the answer (`rollup::counting_projection`).
+    MetadataBlank,
 }
 
 impl ScanProjection {
@@ -1461,6 +1467,7 @@ impl ScanProjection {
         match self {
             ScanProjection::Lean => "",
             ScanProjection::WithStructuredMetadata => ", structured_metadata",
+            ScanProjection::MetadataBlank => ", '' AS structured_metadata",
         }
     }
 }
@@ -1678,10 +1685,12 @@ pub struct BucketedScan {
 /// and its rollup half buckets an already-bucketed column, which is a
 /// different question nobody has answered.
 ///
-/// **`structured_metadata` is carried unconditionally**, in the `SELECT`
-/// list and the `GROUP BY`, in the trailing position [`metric_instant`]
-/// puts it in. It is part of the output series identity even when no error
-/// is involved — two entries of one stream differing only in a metadata
+/// **`structured_metadata` is carried under
+/// [`ScanProjection::WithStructuredMetadata`]**, in the `SELECT` list and
+/// the `GROUP BY`, in the trailing position [`metric_instant`] puts it in;
+/// [`ScanProjection::MetadataBlank`] returns `''` there and groups by
+/// fingerprint alone (issue #624, part 8). It is part of the output series
+/// identity even when no error is involved — two entries of one stream differing only in a metadata
 /// value are two series, and dropping the column would merge them into one
 /// of twice the value. **No expression here interprets the column**: it is
 /// named and grouped, never read into, and the one reader decides what it
@@ -1790,7 +1799,7 @@ pub fn metric_range_bucketed_with_regexp(
         sql.push_str(clause.as_sql());
     }
     sql.push_str(match projection {
-        ScanProjection::Lean => "\nGROUP BY fingerprint, bucket_ns",
+        ScanProjection::Lean | ScanProjection::MetadataBlank => "\nGROUP BY fingerprint, bucket_ns",
         ScanProjection::WithStructuredMetadata => {
             "\nGROUP BY fingerprint, bucket_ns, structured_metadata"
         }
@@ -1836,9 +1845,10 @@ pub struct SlidingScan {
 /// When the range equals the step, [`metric_range_bucketed`] is the
 /// statement: smaller and faster for that case.
 ///
-/// **`structured_metadata` is carried unconditionally**, as in
-/// [`metric_range_bucketed`]: it is part of the output series identity, and
-/// no expression here interprets it.
+/// **`structured_metadata` is carried**, as in [`metric_range_bucketed`]:
+/// it is part of the output series identity, and no expression here
+/// interprets it. [`metric_range_sliding_projected`] takes the blank
+/// projection (issue #624, part 8).
 ///
 /// # Refusals
 ///
@@ -1879,6 +1889,34 @@ pub fn metric_range_sliding_with_regexp(
     extra_predicates: &[CheckedFragment],
     regexp: Option<GroupExtraction<'_>>,
 ) -> Result<String, super::predicate::BucketGridRefusal> {
+    metric_range_sliding_projected(
+        tenant,
+        source,
+        services,
+        fingerprints,
+        scan,
+        extra_predicates,
+        ScanProjection::WithStructuredMetadata,
+        regexp,
+    )
+}
+
+/// [`metric_range_sliding_with_regexp`] under a chosen `projection` (issue
+/// #624, part 8). With no extraction, [`ScanProjection::MetadataBlank`]
+/// keys every level by `fingerprint` alone and returns `'' AS
+/// structured_metadata`; an extraction keeps the column whatever
+/// `projection` says, as [`metric_range_bucketed_with_regexp`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn metric_range_sliding_projected(
+    tenant: &Tenant,
+    source: MetricSource<'_>,
+    services: &[CheckedLiteral],
+    fingerprints: &[FpLiteral],
+    scan: SlidingScan,
+    extra_predicates: &[CheckedFragment],
+    projection: ScanProjection,
+    regexp: Option<GroupExtraction<'_>>,
+) -> Result<String, super::predicate::BucketGridRefusal> {
     let t = tenant.sql_literal();
     let MetricSource { table, shape } = source;
     if shape.bucket_col() != "timestamp_ns" {
@@ -1900,17 +1938,21 @@ pub fn metric_range_sliding_with_regexp(
     let lower_op = lower.sql_op();
     // Issue #624, part 3a: a `regexp` stage's captures join the group key,
     // computed one level under the innermost `SELECT`.
-    let key = match regexp {
-        Some(x) => format!("fingerprint, structured_metadata, {}", x.key_columns()),
-        None => "fingerprint, structured_metadata".to_string(),
+    // Issue #624, part 8: a blank projection keys by `fingerprint` alone.
+    let key = match (regexp, projection) {
+        (Some(x), _) => format!("fingerprint, structured_metadata, {}", x.key_columns()),
+        (None, ScanProjection::WithStructuredMetadata) => {
+            "fingerprint, structured_metadata".to_string()
+        }
+        (None, ScanProjection::Lean | ScanProjection::MetadataBlank) => "fingerprint".to_string(),
     };
     let mut lines: Vec<String> = vec![
         format!(
             "SELECT fingerprint, toInt64({grid_start_ns} + k * {step_ns}) AS bucket_ns, \
-             toUInt64(v) AS n, structured_metadata{}",
+             toUInt64(v) AS n{}",
             match regexp {
-                Some(x) => format!(", {}", x.key_columns()),
-                None => String::new(),
+                Some(x) => format!(", structured_metadata, {}", x.key_columns()),
+                None => projection.column_suffix().to_string(),
             }
         ),
         "FROM (".to_string(),
@@ -4807,6 +4849,124 @@ mod tests {
         seen.sort();
         seen.dedup();
         assert_eq!(seen.len(), cases.len(), "two rows render the same text");
+    }
+
+    /// Issue #624, part 8: the three counting statements under
+    /// [`ScanProjection::MetadataBlank`], frozen byte for byte — the column
+    /// is `'' AS structured_metadata` in the `SELECT` list and nowhere else.
+    #[test]
+    fn the_blank_projection_statements_are_byte_exact() {
+        let f = W0Fixtures::new();
+        let t = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
+        let raw = MetricSource::new("log_samples", MetricShape::RawCount);
+        let instant = metric_instant(
+            &t,
+            raw,
+            &f.one_service,
+            &f.fingerprints,
+            f.window,
+            ScanLowerBound::Exclusive,
+            &f.one_predicate,
+            ScanProjection::MetadataBlank,
+        );
+        assert_eq!(
+            instant,
+            [
+                r"SELECT fingerprint, count() AS n, '' AS structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE org_id = '' AND fingerprint IN ('18374', '99120') AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000 AND body LIKE '%CONN\\_REFUSED%'",
+                r"GROUP BY fingerprint",
+            ]
+            .join("\n"),
+            "the blank instant statement"
+        );
+        let bucketed = metric_range_bucketed(
+            &t,
+            raw,
+            &f.one_service,
+            &f.fingerprints,
+            BUCKETED_SCAN,
+            &f.one_predicate,
+            ScanProjection::MetadataBlank,
+        )
+        .expect("a renderable grid");
+        assert_eq!(
+            bucketed,
+            [
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, '' AS structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"GROUP BY fingerprint, bucket_ns",
+            ]
+            .join("\n"),
+            "the blank bucketed statement"
+        );
+        let sliding = metric_range_sliding_projected(
+            &t,
+            raw,
+            &f.one_service,
+            &f.fingerprints,
+            SLIDING_SCAN,
+            &f.one_predicate,
+            ScanProjection::MetadataBlank,
+            None,
+        )
+        .expect("a renderable sliding statement");
+        assert_eq!(
+            sliding,
+            [
+                "SELECT fingerprint, toInt64(1700000000000000000 + k * 60000000000) AS bucket_ns, toUInt64(v) AS n, '' AS structured_metadata",
+                "FROM (",
+                "  SELECT fingerprint, k0,",
+                "         sum(dv) OVER cum AS v, sum(dc) OVER cum AS p, leadInFrame(k0, 1, 61) OVER whole AS k1",
+                "  FROM (",
+                "    SELECT fingerprint, d.1 AS k0, sum(d.2) AS dv, sum(d.3) AS dc",
+                "    FROM (",
+                "      SELECT fingerprint,",
+                "             greatest(intDiv(timestamp_ns - 1699999820000000000 + 59999999999, 60000000000) - 3, 0) AS lo,",
+                "             least(intDiv(timestamp_ns - 1699999670000000000 + 59999999999, 60000000000) - 4, 60) AS hi,",
+                "             count() AS m, count() AS c",
+                "      FROM log_samples",
+                "      PREWHERE service = 'checkout'",
+                "      WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
+                "        AND timestamp_ns > 1699999850000000000 AND timestamp_ns <= 1700003600000000000",
+                "        AND body LIKE '%CONN\\\\_REFUSED%'",
+                "      GROUP BY fingerprint, lo, hi",
+                "      HAVING lo <= hi",
+                "    )",
+                "    ARRAY JOIN [(lo, toInt64(m), toInt64(c)), (hi + 1, -toInt64(m), -toInt64(c))] AS d",
+                "    GROUP BY fingerprint, k0",
+                "  )",
+                "  WINDOW cum AS (PARTITION BY fingerprint ORDER BY k0 ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),",
+                "         whole AS (PARTITION BY fingerprint ORDER BY k0 ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
+                ")",
+                "ARRAY JOIN range(k0, least(k1, 61)) AS k",
+                "WHERE p > 0",
+            ]
+            .join("\n"),
+            "the blank sliding statement"
+        );
+        // The sliding builder's old entry point keeps its text: the
+        // projected one under `WithStructuredMetadata` is it.
+        assert_eq!(
+            metric_range_sliding_projected(
+                &t,
+                raw,
+                &f.one_service,
+                &f.fingerprints,
+                SLIDING_SCAN,
+                &f.no_predicate,
+                ScanProjection::WithStructuredMetadata,
+                None,
+            )
+            .expect("renders"),
+            SLIDING_COUNT.join("\n"),
+            "the projected sliding builder under the column is N1's statement"
+        );
     }
 
     /// W2 (issue #507): the three ways an anchored grid refuses, each with

@@ -389,6 +389,17 @@ A `sum` directly above `count_over_time`, `bytes_over_time`, `rate`,
 label outside its grouping does not fail the query unless the line's own
 error set it; `__preserve_error__="true"` lets an error series through.
 
+One exception is a documented limit (issues #614 and #624 part 8, owner
+decisions): a non-empty `__error__` in a line's structured metadata does not
+fail the query, and the line is counted, when the query is
+`count_over_time`, `bytes_over_time`, `rate` or `bytes_rate` whose pipeline
+holds nothing but line filters with no `ip(…)` alternative, directly under a
+bare `sum` or a `sum by (…)` whose every name is a stream label of every
+selected stream and none starts with `__` or ends with `_extracted`, and the
+database counts it. The reference fails such a query. Where a range query
+of that shape reads the lines instead — its statement ran out of memory, or
+its grid could not be rendered — the line fails it as the reference does.
+
 `| logfmt` reads a line one token at a time. A token is `key`, `key=`,
 `key=value` or `key="quoted value"` in full, and a closing quote must be
 followed by a byte at or below a space or by the end of the line. Any other
