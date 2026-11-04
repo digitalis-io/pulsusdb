@@ -158,6 +158,11 @@ data:
       otlp:
         protocols: { grpc: { endpoint: 0.0.0.0:4317 }, http: { endpoint: 0.0.0.0:4318 } }
 
+    processors:
+      batch:
+        send_batch_size: 1000
+        send_batch_max_size: 2000
+
     exporters:
       otlphttp:
         endpoint: http://pulsusdb:3100
@@ -168,9 +173,9 @@ data:
     service:
       extensions: [health_check]
       pipelines:
-        logs: { receivers: [otlp], exporters: [otlphttp] }
-        metrics: { receivers: [otlp], exporters: [prometheusremotewrite/pulsus] }
-        traces: { receivers: [otlp], exporters: [otlphttp] }
+        logs:    { receivers: [otlp], processors: [batch], exporters: [otlphttp] }
+        metrics: { receivers: [otlp], processors: [batch], exporters: [prometheusremotewrite/pulsus] }
+        traces:  { receivers: [otlp], processors: [batch], exporters: [otlphttp] }
         # profiles pipeline lands with M5
 
 ---
@@ -398,7 +403,7 @@ spec:
         app.kubernetes.io/part-of: pulsusdb
         app.kubernetes.io/component: otel-collector
       annotations:
-        checksum/config: a5ad8aa56d30404d247bca077ef26076a3e6c7205287712455698f888291c1e6
+        checksum/config: 1cd4f51764ccdd74814c3abbb71dd7c02a6bbe91d2b78480b558eb1a0ee7223e
     spec:
       securityContext:
         runAsGroup: 10001

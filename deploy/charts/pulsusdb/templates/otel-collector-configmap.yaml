@@ -35,6 +35,11 @@ data:
       otlp:
         protocols: { grpc: { endpoint: 0.0.0.0:4317 }, http: { endpoint: 0.0.0.0:4318 } }
 
+    processors:
+      batch:
+        send_batch_size: 1000
+        send_batch_max_size: 2000
+
     exporters:
       otlphttp:
         endpoint: http://{{ include "pulsusdb.ingestServiceName" . }}:{{ .Values.service.port }}
@@ -45,9 +50,9 @@ data:
     service:
       extensions: [health_check]
       pipelines:
-        logs: { receivers: [otlp], exporters: [otlphttp] }
-        metrics: { receivers: [otlp], exporters: [prometheusremotewrite/pulsus] }
-        traces: { receivers: [otlp], exporters: [otlphttp] }
+        logs:    { receivers: [otlp], processors: [batch], exporters: [otlphttp] }
+        metrics: { receivers: [otlp], processors: [batch], exporters: [prometheusremotewrite/pulsus] }
+        traces:  { receivers: [otlp], processors: [batch], exporters: [otlphttp] }
         # profiles pipeline lands with M5
     {{- end }}
 {{- end }}
