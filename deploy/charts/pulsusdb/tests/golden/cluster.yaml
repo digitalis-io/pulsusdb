@@ -306,12 +306,26 @@ metadata:
     app.kubernetes.io/part-of: pulsusdb
     grafana_datasource: "1"
 data:
-  pulsusdb-loki.yaml: |
+  pulsusdb.yaml: |
     apiVersion: 1
     datasources:
-      - name: PulsusDB (Loki compat)
+      - name: PulsusDB (Logs)
         uid: pulsusdb-loki
         type: loki
+        access: proxy
+        url: http://pulsusdb:3100
+        isDefault: false
+        editable: false
+      - name: PulsusDB (Traces)
+        uid: pulsusdb-tempo
+        type: tempo
+        access: proxy
+        url: http://pulsusdb:3100
+        isDefault: false
+        editable: false
+      - name: PulsusDB (Metrics)
+        uid: pulsusdb-prom
+        type: prometheus
         access: proxy
         url: http://pulsusdb:3100
         isDefault: false

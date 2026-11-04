@@ -1,4 +1,8 @@
 {{- if and (index .Values "grafana-operator" "enabled") .Values.grafana.datasourceProvisioning.enabled }}
+{{- $svc := printf "http://%s:%v" (include "pulsusdb.queryServiceName" .) .Values.service.port }}
+{{- $sel := include "pulsusdb.fullname" . }}
+{{- $base := regexReplaceAll "-+$" (include "pulsusdb.fullname" . | trunc 34) "" }}
+---
 apiVersion: grafana.integreatly.org/v1beta1
 kind: GrafanaDatasource
 metadata:
@@ -8,13 +12,51 @@ metadata:
 spec:
   instanceSelector:
     matchLabels:
-      dashboards: {{ include "pulsusdb.fullname" . }}
+      dashboards: {{ $sel }}
   datasource:
-    name: PulsusDB (Loki compat)
-    uid: {{ printf "%s-loki" (regexReplaceAll "-+$" (include "pulsusdb.fullname" . | trunc 35) "") }}
+    name: PulsusDB (Logs)
+    uid: {{ printf "%s-loki" $base }}
     type: loki
     access: proxy
-    url: http://{{ include "pulsusdb.queryServiceName" . }}:{{ .Values.service.port }}
+    url: {{ $svc }}
+    isDefault: false
+    editable: false
+---
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDatasource
+metadata:
+  name: {{ include "pulsusdb.fullname" . }}-tempo
+  labels:
+    {{- include "pulsusdb.labels" . | nindent 4 }}
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: {{ $sel }}
+  datasource:
+    name: PulsusDB (Traces)
+    uid: {{ printf "%s-tempo" $base }}
+    type: tempo
+    access: proxy
+    url: {{ $svc }}
+    isDefault: false
+    editable: false
+---
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDatasource
+metadata:
+  name: {{ include "pulsusdb.fullname" . }}-prometheus
+  labels:
+    {{- include "pulsusdb.labels" . | nindent 4 }}
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: {{ $sel }}
+  datasource:
+    name: PulsusDB (Metrics)
+    uid: {{ printf "%s-prom" $base }}
+    type: prometheus
+    access: proxy
+    url: {{ $svc }}
     isDefault: false
     editable: false
 {{- end }}

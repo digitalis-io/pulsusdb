@@ -9,6 +9,8 @@ chart's sidecar watches for, so this ConfigMap is consumable by that
 chart's provisioning sidecar without any extra wiring.
 */}}
 {{- if .Values.grafana.datasourceProvisioning.enabled }}
+{{- $url := printf "http://%s:%v" (include "pulsusdb.queryServiceName" .) .Values.service.port }}
+{{- $base := regexReplaceAll "-+$" (include "pulsusdb.fullname" . | trunc 34) "" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -17,14 +19,28 @@ metadata:
     {{- include "pulsusdb.labels" . | nindent 4 }}
     grafana_datasource: "1"
 data:
-  pulsusdb-loki.yaml: |
+  pulsusdb.yaml: |
     apiVersion: 1
     datasources:
-      - name: PulsusDB (Loki compat)
-        uid: {{ printf "%s-loki" (regexReplaceAll "-+$" (include "pulsusdb.fullname" . | trunc 35) "") }}
+      - name: PulsusDB (Logs)
+        uid: {{ printf "%s-loki" $base }}
         type: loki
         access: proxy
-        url: http://{{ include "pulsusdb.queryServiceName" . }}:{{ .Values.service.port }}
+        url: {{ $url }}
+        isDefault: false
+        editable: false
+      - name: PulsusDB (Traces)
+        uid: {{ printf "%s-tempo" $base }}
+        type: tempo
+        access: proxy
+        url: {{ $url }}
+        isDefault: false
+        editable: false
+      - name: PulsusDB (Metrics)
+        uid: {{ printf "%s-prom" $base }}
+        type: prometheus
+        access: proxy
+        url: {{ $url }}
         isDefault: false
         editable: false
 {{- end }}
