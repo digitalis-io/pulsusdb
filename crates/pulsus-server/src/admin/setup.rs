@@ -194,7 +194,7 @@ const TLS: [Field; 3] = [
             pattern: PATH_PATTERN,
             placeholder: "/etc/clickhouse-server/certs/server.crt",
         },
-        help: "The server certificate, PEM. An absolute path of letters, digits, . _ / -.",
+        help: "The server certificate, PEM. Each host's certificate must be valid for that host exactly as entered above: the same DNS name or address. The other hosts check it when they copy data. An absolute path of letters, digits, . _ / -.",
     },
     Field {
         name: "tls_key",

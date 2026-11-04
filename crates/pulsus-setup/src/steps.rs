@@ -88,7 +88,7 @@ fn tls_install(v: &Validated, kind: &str) -> String {
     };
     let own = format!("-o {CH_OWNER} -g {CH_OWNER}");
     format!(
-        " Then put the TLS files at the paths the form names, readable by `{CH_OWNER}`: on each {kind} host, with that host's own certificate and key,\n\n```sh\nsudo install -D -m 644 {own} <this host's certificate> {}\nsudo install -D -m 600 {own} <this host's private key> {}\nsudo install -D -m 644 {own} <the CA certificate> {}\n```",
+        " Then put the TLS files at the paths the form names, readable by `{CH_OWNER}`: on each {kind} host, with that host's own certificate and key; the certificate must be valid for that host exactly as the form names it, the same DNS name or address, because the other hosts check it when they connect,\n\n```sh\nsudo install -D -m 644 {own} <this host's certificate> {}\nsudo install -D -m 600 {own} <this host's private key> {}\nsudo install -D -m 644 {own} <the CA certificate> {}\n```",
         t.cert, t.key, t.ca
     )
 }
