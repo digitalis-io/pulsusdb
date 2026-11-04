@@ -103,6 +103,11 @@ jobs:
           PULSUSDB_DOC_SITES_UPSTREAM: ${{ github.event.pull_request.base.sha || github.sha }}
         run: ci/checks/doc_sites.sh
 
+      # Issue #213: the release workflow's packaging scripts, tested here
+      # because the release workflow itself runs only on a tag or by hand.
+      - name: Release packaging scripts self-test
+        run: ci/checks/release_packaging_self_test.sh
+
       - name: Format check
         run: cargo fmt --all -- --check
 

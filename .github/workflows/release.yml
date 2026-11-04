@@ -403,15 +403,18 @@ jobs:
             --certificate-identity "$IDENTITY" \
             "$REF"
 
-  # Native OS packages — .deb + .rpm (issue #213). Mirrors the Docker `build`
-  # matrix: per-arch NATIVE runners (`amd64 -> ubuntu-latest`, `arm64 ->
-  # ubuntu-24.04-arm`), no QEMU. Each leg builds the release binary against a
-  # conservative glibc floor (Debian bullseye, glibc 2.31 — NOT the runtime
-  # image's bookworm), runs nfpm to emit both formats from one config, and (on a
-  # real tag) smoke-tests them in ubuntu:22.04 + rockylinux:9 containers whose
-  # glibc (2.35 / 2.34) exceeds the build floor — so the Rocky leg mechanically
-  # proves the floor is low enough. Assets are attached to the Release by the
-  # dependent `packages-release` fan-in job; nothing here touches GHCR/cosign.
+  # Native OS packages (.deb + .rpm) and the binary archive (issue #213).
+  # Mirrors the Docker `build` matrix: per-arch NATIVE runners (`amd64 ->
+  # ubuntu-latest`, `arm64 -> ubuntu-24.04-arm`), no QEMU. Each leg builds the
+  # release binary against a conservative glibc floor (Debian bullseye, glibc
+  # 2.31 — NOT the runtime image's bookworm), runs nfpm to emit both formats
+  # from one config, packs the same binary into
+  # pulsusdb-<ref without v>-linux-<arch>.tar.gz and checks that archive on
+  # every event, and on a tag push smoke-tests the packages in ubuntu:22.04 +
+  # rockylinux:9 containers whose glibc (2.35 / 2.34) exceeds the build floor,
+  # so the Rocky leg mechanically proves the floor is low enough. Assets are
+  # attached to the Release by the dependent `packages-release` fan-in job;
+  # nothing here touches GHCR/cosign.
   packages:
     strategy:
       fail-fast: false
@@ -436,16 +439,11 @@ jobs:
             exit 1
           fi
 
-      # rpm-legal version: strip the leading `v`, rewrite `-` (illegal in an rpm
-      # Version) to `~`, which sorts BELOW the release in both deb and rpm so a
-      # prerelease orders correctly (v1.2.3-rc.1 -> 1.2.3~rc.1). PKG_ARCH is the
-      # nfpm arch (mapped to x86_64/aarch64 for rpm by nfpm itself).
-      - name: Compute package version (rpm-legal)
-        run: |
-          set -euo pipefail
-          V="${GITHUB_REF_NAME#v}"; V="${V//-/~}"
-          echo "PKG_VERSION=${V:-0.0.0}" >> "$GITHUB_ENV"
-          echo "PKG_ARCH=${{ matrix.arch }}" >> "$GITHUB_ENV"
+      # PKG_VERSION, PKG_ARCH and ARCHIVE_NAME for this leg; the rules are in
+      # packaging/release-env.sh (v1.2.3-rc.1 -> 1.2.3~rc.1 and
+      # pulsusdb-1.2.3-rc.1-linux-<arch>).
+      - name: Compute release names
+        run: packaging/release-env.sh "${{ matrix.arch }}" >> "$GITHUB_ENV"
 
       # Build THIS arch's binary natively inside the glibc-2.31 floor image, with
       # the same version/revision stamp the Docker release uses. Staged to the
@@ -484,11 +482,20 @@ jobs:
           done
           mv dist/pulsusdb.real dist/pulsusdb
 
+      # The binary archive packs the same dist/pulsusdb the packages were built
+      # from, into out/ so the upload below carries it. The check runs on every
+      # event, on this leg's own native runner (packaging/archive.sh).
+      - name: Build binary archive
+        run: packaging/archive.sh build
+
+      - name: Check binary archive (members, arch, same binary, --version)
+        run: packaging/archive.sh check
+
       - name: Smoke test deb+rpm (install/upgrade/scriptlets/uninstall)
         if: github.event_name == 'push'
         run: ./packaging/smoke.sh "${{ matrix.arch }}" "${{ env.PKG_VERSION }}"
 
-      - name: Upload package artifacts
+      - name: Upload package and archive artifacts
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
@@ -497,7 +504,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Fan-in (mirrors `merge`): collect both arches' packages, checksum them, and
+  # Fan-in (mirrors `merge`): collect both arches' packages and archives, checksum them, and
   # attach them to the GitHub Release. This is the ONLY job that elevates to
   # `contents: write` (job-level, so `build`/`merge`/the workflow default stay
   # `contents: read`); it never touches GHCR/cosign. Push-gated at the job level,
@@ -509,24 +516,28 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download per-arch packages
+      - uses: actions/checkout@v7
+
+      - name: Download per-arch packages and archives
         uses: actions/download-artifact@v4
         with:
           pattern: packages-*
           merge-multiple: true
           path: dist-packages
 
-      # Create the Release if this tag has none yet (`|| true` tolerates a rerun
-      # or a pre-existing Release), then upload the four packages + SHA256SUMS,
-      # clobbering on re-run so the job is idempotent.
+      # packaging/release-assets.sh fails unless both arches' .deb, .rpm and
+      # binary archive are present and nothing else, then writes SHA256SUMS
+      # over all six. Then create the Release if this tag has none yet
+      # (`|| true` tolerates a rerun or a pre-existing Release) and upload the
+      # six assets + SHA256SUMS, clobbering on re-run so the job is idempotent.
       - name: Checksums and publish to the Release
-        working-directory: dist-packages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          sha256sum ./*.deb ./*.rpm > SHA256SUMS
+          packaging/release-assets.sh dist-packages
+          cd dist-packages
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" --generate-notes || true
           gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            ./*.deb ./*.rpm SHA256SUMS --clobber
+            ./*.deb ./*.rpm ./*.tar.gz SHA256SUMS --clobber
