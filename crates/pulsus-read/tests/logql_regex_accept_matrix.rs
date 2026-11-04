@@ -2924,8 +2924,8 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
         (
             "plan.rs",
             &[
-                ("compile_regex_as_database(", 2),
-                ("validate_unanchored_regex(", 1),
+                ("compile_regex_as_database(", 3),
+                ("validate_unanchored_regex(", 2),
                 ("compile_user_regex_anchored(", 1),
                 ("re2_rejection_construct(", 1),
             ],
@@ -2948,7 +2948,12 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
              names and indexes. It decides no verdict: a pattern it cannot compile only keeps \
              the query on today's route, whose pipeline compile then answers. **Issue #624 \
              part 4b added the second**, in `reduced_parser`, for the same purpose before an \
-             `| unwrap`.",
+             `| unwrap`. **Issue #624 part 7 added one of each** in `effective_pipeline` \
+             (D7.9): every regex alternative of a line filter is validated as it is \
+             validated today at its position, unanchored before the first line rewrite and \
+             as the database reads it after one, before the filter is classified. It \
+             decides no verdict: a stage whose pattern fails is left as written, and \
+             today's seam refuses it where it refuses it today.",
         ),
         (
             "template/funcs.rs",

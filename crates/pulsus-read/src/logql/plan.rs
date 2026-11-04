@@ -1632,6 +1632,7 @@ fn streams_plan(
     p: &QueryParams,
     ctx: &PlanCtx<'_>,
 ) -> Result<StreamsPlan, ReadError> {
+    let log_expr: &LogExpr = &*effective_log_expr(log_expr)?;
     let (start_ns, end_ns) = window_bounds_for_streams(&p.spec);
     let normalized = normalize_matchers(&log_expr.selector)?;
     let months = months_overlapping(start_ns, end_ns);
@@ -2738,6 +2739,7 @@ fn metric_plan(
         // base reaching `metric_plan` is structurally always `Range`.
         unreachable!("metric_plan is only called on Vector-chains bottoming at MetricExpr::Range")
     };
+    let range: &LogRange = &*effective_range(range)?;
     let vector_aggs =
         parse_vector_agg_params(&raw_vector_aggs, matches!(p.spec, QuerySpec::Range { .. }))?;
 
@@ -4794,6 +4796,155 @@ fn compile_one_parsed_filter(
         }
         LabelFilterExpr::Ip { .. } | LabelFilterExpr::And(_, _) | LabelFilterExpr::Or(_, _) => None,
     }
+}
+
+/// What one line filter does to the lines it sees (issue #624, part 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LineFilterEffect<'a> {
+    /// It cannot exclude a line: the reference runs no filter.
+    KeepsAll,
+    /// It excludes every line.
+    DropsAll,
+    /// It filters with these alternatives: the filter itself, or a
+    /// positive `or` group without the alternatives that keep every line.
+    Filters(std::borrow::Cow<'a, LineFilter>),
+}
+
+/// The one rule (issue #624, part 7, D7.1–D7.3), read by the planner, the
+/// SQL mint and the in-process compile. An alternative keeps every line
+/// when it is `|=` of `""`, or `|~` of a pattern
+/// [`pulsus_re2::reference_true_filter`] accepts. A positive filter keeps
+/// every line when every alternative does, and otherwise loses those that
+/// do, as the reference's `newOrFilter` drops a `TrueFilter`
+/// (`pkg/logql/log/filter.go:309-322 @ v3.7.4`); a negative filter with any
+/// such alternative drops every line. A filter with an `ip(…)` or `word(…)`
+/// alternative is not classified.
+///
+/// The caller validates every regex alternative first (D7.9): this reads
+/// the pattern and never refuses one.
+pub(crate) fn line_filter_effect(lf: &LineFilter) -> LineFilterEffect<'_> {
+    use pulsus_logql::{LineFilterOp, LineMatch};
+    let keeps = |m: &LineMatch| match (m, lf.op) {
+        (LineMatch::Text(v), LineFilterOp::Contains | LineFilterOp::NotContains) => v.is_empty(),
+        (LineMatch::Text(v), LineFilterOp::Regex | LineFilterOp::NotRegex) => {
+            pulsus_re2::reference_true_filter(v)
+        }
+        (LineMatch::Ip(_) | LineMatch::Words(_), _) => false,
+    };
+    if !lf.alternatives().all(|m| matches!(m, LineMatch::Text(_))) || !lf.alternatives().any(keeps)
+    {
+        return LineFilterEffect::Filters(std::borrow::Cow::Borrowed(lf));
+    }
+    if matches!(lf.op, LineFilterOp::NotContains | LineFilterOp::NotRegex) {
+        return LineFilterEffect::DropsAll;
+    }
+    let mut left = lf.alternatives().filter(|m| !keeps(m)).cloned();
+    match left.next() {
+        None => LineFilterEffect::KeepsAll,
+        Some(head) => LineFilterEffect::Filters(std::borrow::Cow::Owned(LineFilter {
+            op: lf.op,
+            head,
+            or_matches: left.collect(),
+        })),
+    }
+}
+
+/// The pipeline the reference runs (issue #624, part 7, D7.4): a stage that
+/// keeps every line is removed, a pruned `or` group replaces its stage,
+/// and every other stage, a filter that drops every line among them, is
+/// kept. Borrowed when nothing changes.
+///
+/// Every regex alternative is validated first, as it is validated today
+/// at its position (D7.9): unanchored before the first `line_format`,
+/// `decolorize` or `unpack`, as the database reads it after one. A stage
+/// with a pattern that fails is left as written and is not classified, so
+/// today's seams refuse it in today's order (a bad matcher regex is still
+/// reported before a bad line-filter one). The `Err` arm is not taken
+/// today.
+pub(crate) fn effective_pipeline(
+    stages: &[Stage],
+) -> Result<std::borrow::Cow<'_, [Stage]>, ReadError> {
+    let mut rewritten = false;
+    let mut out: Option<Vec<Stage>> = None;
+    for (i, stage) in stages.iter().enumerate() {
+        let replacement = match stage {
+            Stage::LineFormat(_) | Stage::Decolorize | Stage::Unpack => {
+                rewritten = true;
+                None
+            }
+            Stage::LineFilter(lf) => {
+                let regex = matches!(
+                    lf.op,
+                    pulsus_logql::LineFilterOp::Regex | pulsus_logql::LineFilterOp::NotRegex
+                );
+                let valid = !regex
+                    || lf.alternatives().all(|alt| match alt {
+                        pulsus_logql::LineMatch::Text(value) if rewritten => {
+                            super::pipeline::compile_regex_as_database(value).is_ok()
+                        }
+                        pulsus_logql::LineMatch::Text(value) => {
+                            super::pipeline::validate_unanchored_regex(value).is_ok()
+                        }
+                        _ => true,
+                    });
+                if !valid {
+                    // Left as written: today's seam refuses it, at the
+                    // point in planning it refuses it today.
+                    None
+                } else {
+                    match line_filter_effect(lf) {
+                        LineFilterEffect::KeepsAll => Some(None),
+                        LineFilterEffect::Filters(std::borrow::Cow::Owned(pruned)) => {
+                            Some(Some(Stage::LineFilter(pruned)))
+                        }
+                        LineFilterEffect::DropsAll
+                        | LineFilterEffect::Filters(std::borrow::Cow::Borrowed(_)) => None,
+                    }
+                }
+            }
+            _ => None,
+        };
+        match (replacement, &mut out) {
+            (Some(next), None) => {
+                let mut v: Vec<Stage> = stages[..i].to_vec();
+                v.extend(next);
+                out = Some(v);
+            }
+            (Some(next), Some(v)) => v.extend(next),
+            (None, Some(v)) => v.push(stage.clone()),
+            (None, None) => {}
+        }
+    }
+    Ok(match out {
+        Some(v) => std::borrow::Cow::Owned(v),
+        None => std::borrow::Cow::Borrowed(stages),
+    })
+}
+
+/// [`effective_pipeline`] over a log query (issue #624, part 7).
+fn effective_log_expr(le: &LogExpr) -> Result<std::borrow::Cow<'_, LogExpr>, ReadError> {
+    Ok(match effective_pipeline(&le.pipeline)? {
+        std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(le),
+        std::borrow::Cow::Owned(pipeline) => std::borrow::Cow::Owned(LogExpr {
+            selector: le.selector.clone(),
+            pipeline,
+        }),
+    })
+}
+
+/// [`effective_pipeline`] over a range aggregation's operand (issue #624,
+/// part 7).
+fn effective_range(range: &LogRange) -> Result<std::borrow::Cow<'_, LogRange>, ReadError> {
+    Ok(match effective_pipeline(&range.selector.pipeline)? {
+        std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(range),
+        std::borrow::Cow::Owned(pipeline) => std::borrow::Cow::Owned(LogRange {
+            selector: LogExpr {
+                selector: range.selector.selector.clone(),
+                pipeline,
+            },
+            ..range.clone()
+        }),
+    })
 }
 
 // NOTE: the file is a `plan_`-prefixed sibling, not `plan/drop_order.rs`.

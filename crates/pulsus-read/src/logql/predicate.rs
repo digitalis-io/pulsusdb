@@ -460,9 +460,9 @@ pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, Pip
     })
 }
 
-/// Compiles one pushed-down `LineFilter` stage. Positive ops (`|=`, `|~`)
-/// render exactly one predicate over `body` — `body LIKE '%needle%'` or
-/// `match(body, …)` — and negative ops (`!=`, `!~`) wrap it in `NOT (...)`,
+/// Compiles one pushed-down `LineFilter` stage (`1` or `0` when it cannot
+/// exclude a line, issue #624 part 7). Positive ops render one predicate over
+/// `body` — `body LIKE '%needle%'` or `match(body, …)` — negative ops `NOT (...)`,
 /// which is the exclusion semantic directly because `body` is a non-NULL
 /// `String` column and the positive predicate is total over it.
 ///
@@ -491,6 +491,9 @@ pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, Pip
 /// only ever sees literal/regex alternatives (`ip(…)` is served
 /// client-side).
 pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
+    if let Some(classified) = classified_line_filter(lf)? {
+        return Ok(classified);
+    }
     let mut disjuncts: Vec<String> = Vec::new();
     for alt in lf.alternatives() {
         disjuncts.push(match alt {
@@ -2287,6 +2290,33 @@ fn check_partition(classes: &MetadataNameClasses<'_>) -> Result<(), MetadataFilt
         return Err(MetadataFilterRefusal::ClassesDoNotPartition);
     }
     Ok(())
+}
+
+/// [`line_filter`] of a filter the rule classifies (issue #624, part 7):
+/// every regex alternative is validated as today, then the filter is
+/// classified (D7.9). A filter that keeps every line renders `1`, one that
+/// drops every line `0`, which reads no part, and a pruned `or` group
+/// renders as written. `None` when the filter is to be rendered as written.
+fn classified_line_filter(lf: &LineFilter) -> Result<Option<CheckedFragment>, PipelineError> {
+    if matches!(lf.op, LineFilterOp::Regex | LineFilterOp::NotRegex) {
+        for alt in lf.alternatives() {
+            if let LineMatch::Text(value) = alt {
+                ch_regex_unanchored_checked(value)?;
+            }
+        }
+    }
+    Ok(match super::plan::line_filter_effect(lf) {
+        super::plan::LineFilterEffect::KeepsAll => Some(CheckedFragment {
+            sql: "1".to_string(),
+        }),
+        super::plan::LineFilterEffect::DropsAll => Some(CheckedFragment {
+            sql: "0".to_string(),
+        }),
+        super::plan::LineFilterEffect::Filters(std::borrow::Cow::Owned(pruned)) => {
+            Some(line_filter(&pruned)?)
+        }
+        super::plan::LineFilterEffect::Filters(std::borrow::Cow::Borrowed(_)) => None,
+    })
 }
 
 #[cfg(test)]

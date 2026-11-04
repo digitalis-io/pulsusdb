@@ -2536,6 +2536,7 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn metadata_filter_and(a: &CheckedFragment, b: &CheckedFragment) -> CheckedFragment",
     "pub fn metadata_filter_or(a: &CheckedFragment, b: &CheckedFragment) -> CheckedFragment",
     "fn check_partition(classes: &MetadataNameClasses<'_>) -> Result<(), MetadataFilterRefusal>",
+    "fn classified_line_filter(lf: &LineFilter) -> Result<Option<CheckedFragment>, PipelineError>",
     "#[cfg(test)]",
     "mod tests",
     "mod tests :: use pulsus_model::Fingerprint",
@@ -2652,8 +2653,11 @@ const PREDICATE_ITEMS: &[&str] = &[
 /// `pattern_group_columns` returns `RegexpGroupColumns`, as
 /// `regexp_group_columns` does, and is not counted. **25 at issue #624,
 /// part 3d-3**: `guard_streams`, which keeps every row of the streams
-/// carrying an `_extracted` name's stem label.
-const MINT_COUNT: usize = 25;
+/// carrying an `_extracted` name's stem label. **26 at issue #624, part 7**:
+/// `classified_line_filter`, which renders `1` for a line filter that keeps
+/// every line and `0` for one that drops every line, and a pruned `or` group
+/// through `line_filter`.
+const MINT_COUNT: usize = 26;
 
 /// Attributes permitted anywhere in `predicate.rs`.
 const PREDICATE_ATTRIBUTES: &[&str] = &[
