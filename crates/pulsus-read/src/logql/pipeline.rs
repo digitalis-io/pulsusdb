@@ -1209,7 +1209,8 @@ fn compile_stage(
                 matchers.push(matcher);
             }
             let negated = matches!(lf.op, LineFilterOp::NotContains | LineFilterOp::NotRegex);
-            Ok(Some(CompiledStage::LineFilter { matchers, negated }))
+            Ok(effective_matchers(lf, matchers)
+                .map(|matchers| CompiledStage::LineFilter { matchers, negated }))
         }
         Stage::Parser(p) => {
             st.mutates_labels = true;
@@ -7851,6 +7852,37 @@ fn walk_pattern<'n, 't>(
 /// eight for no other reason.
 pub(in crate::logql) fn numeric_literal_value(lit: &NumericLiteral) -> Option<f64> {
     classify_numeric_literal(lit).ok().map(|(_, v)| v)
+}
+
+/// The matchers a compiled line filter runs (issue #624, part 7): every
+/// pattern was compiled by the caller; a filter that keeps every line runs
+/// none (`None`), a positive `or` group runs without the alternatives that
+/// keep every line, and any other filter runs as written.
+fn effective_matchers(
+    lf: &pulsus_logql::LineFilter,
+    matchers: Vec<LineMatcher>,
+) -> Option<Vec<LineMatcher>> {
+    match super::plan::line_filter_effect(lf) {
+        super::plan::LineFilterEffect::KeepsAll => None,
+        super::plan::LineFilterEffect::DropsAll
+        | super::plan::LineFilterEffect::Filters(Cow::Borrowed(_)) => Some(matchers),
+        super::plan::LineFilterEffect::Filters(Cow::Owned(pruned)) => {
+            let mut kept = pruned.alternatives().peekable();
+            Some(
+                lf.alternatives()
+                    .zip(matchers)
+                    .filter_map(|(alt, m)| {
+                        if kept.peek().is_some_and(|k| *k == alt) {
+                            kept.next();
+                            Some(m)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            )
+        }
+    }
 }
 
 #[cfg(test)]

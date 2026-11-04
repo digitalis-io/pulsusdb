@@ -243,6 +243,29 @@ mod tests {
         let mut wrong = Vec::new();
         for (query, spec, rollup) in [
             (r#"sum(count_over_time({a="b"}[1m]))"#, range(on, 15), true),
+            // Issue #624, part 7: a filter that keeps every line is the
+            // query without it; one that drops every line, or a group that
+            // still filters, is a stage.
+            (
+                r#"sum(count_over_time({a="b"} |= "" [1m]))"#,
+                range(on, 15),
+                true,
+            ),
+            (
+                r#"sum by (x) (rate({a="b"} |~ ".*||||" [1m]))"#,
+                range(on, 15),
+                true,
+            ),
+            (
+                r#"sum(count_over_time({a="b"} != "" [1m]))"#,
+                range(on, 15),
+                false,
+            ),
+            (
+                r#"sum(count_over_time({a="b"} |= "" or "x" [1m]))"#,
+                range(on, 15),
+                false,
+            ),
             (r#"sum(rate({a="b"}[5m]))"#, range(on, 60), true),
             (
                 r#"sum by (x) (bytes_over_time({a="b"}[30s]))"#,

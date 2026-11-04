@@ -798,6 +798,112 @@ fn class_span_end(cs: &[char], open: usize) -> usize {
     }
 }
 
+/// Whether the reference turns the line filter `|~ pattern` into a filter
+/// that keeps every line (issue #624, part 7), by a rule that accepts a
+/// subset of the patterns it does so for and nothing outside it:
+///
+/// ```text
+/// empty                       yes
+/// flag item (?flags)          letters only i, m, s, U, at most one `-`
+///                             with a flag after it; it pushes nothing
+/// concatenation               flag items applied in order and dropped;
+///                             none left -> yes, one -> that item, more -> no
+/// `*` or `*?`                 over `.` itself, with `s` off at that point
+/// non-capturing group         its content, walked with the group's flags
+///                             (the same letter rule); restored at `)`
+/// alternation, top level only every branch empty or exactly `.*`
+/// anything else               no
+/// ```
+///
+/// A pattern that does not parse answers `false`.
+pub fn reference_true_filter(pattern: &str) -> bool {
+    use regex_syntax::ast::{
+        Ast, Flag, Flags, FlagsItemKind, GroupKind, RepetitionKind, RepetitionOp,
+    };
+    // The letter rule: `i`, `m`, `s`, `U`, and at most one `-` with a flag
+    // after it. Returns the `s` state after the flags, or `None`.
+    fn apply(flags: &Flags, mut s: bool) -> Option<bool> {
+        if flags.items.is_empty() {
+            return None;
+        }
+        let mut negated = false;
+        let mut after_negation = 0usize;
+        for item in &flags.items {
+            match &item.kind {
+                FlagsItemKind::Negation => {
+                    if negated {
+                        return None;
+                    }
+                    negated = true;
+                }
+                FlagsItemKind::Flag(flag) => {
+                    if negated {
+                        after_negation += 1;
+                    }
+                    match flag {
+                        Flag::DotMatchesNewLine => s = !negated,
+                        Flag::CaseInsensitive | Flag::MultiLine | Flag::SwapGreed => {}
+                        _ => return None,
+                    }
+                }
+            }
+        }
+        (!negated || after_negation > 0).then_some(s)
+    }
+    fn is_dot_star(ast: &Ast, s: bool) -> bool {
+        matches!(ast, Ast::Repetition(rep)
+            if matches!(rep.op, RepetitionOp { kind: RepetitionKind::ZeroOrMore, .. })
+                && matches!(*rep.ast, Ast::Dot(_))
+                && !s)
+    }
+    // Every node but an alternation, which is accepted only at the top.
+    fn keeps(ast: &Ast, s: bool) -> bool {
+        match ast {
+            Ast::Empty(_) => true,
+            Ast::Flags(set) => apply(&set.flags, s).is_some(),
+            Ast::Concat(concat) => {
+                let mut s = s;
+                let mut left: Option<(&Ast, bool)> = None;
+                for item in &concat.asts {
+                    if let Ast::Flags(set) = item {
+                        match apply(&set.flags, s) {
+                            Some(next) => s = next,
+                            None => return false,
+                        }
+                    } else if left.replace((item, s)).is_some() {
+                        return false;
+                    }
+                }
+                left.is_none_or(|(item, s)| keeps(item, s))
+            }
+            Ast::Repetition(_) => is_dot_star(ast, s),
+            Ast::Group(group) => match &group.kind {
+                GroupKind::NonCapturing(flags) => {
+                    let s = if flags.items.is_empty() {
+                        Some(s)
+                    } else {
+                        apply(flags, s)
+                    };
+                    s.is_some_and(|s| keeps(&group.ast, s))
+                }
+                GroupKind::CaptureIndex(_) | GroupKind::CaptureName { .. } => false,
+            },
+            _ => false,
+        }
+    }
+    let Ok(ast) = regex_syntax::ast::parse::Parser::new().parse(pattern) else {
+        return false;
+    };
+    match &ast {
+        Ast::Alternation(alt) => alt.asts.iter().all(|branch| {
+            matches!(branch, Ast::Empty(_))
+                || (is_dot_star(branch, false)
+                    && matches!(branch, Ast::Repetition(rep) if rep.greedy))
+        }),
+        other => keeps(other, false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1271,5 +1377,73 @@ mod tests {
         ] {
             assert_eq!(re2_pattern_to_rust(pattern), pattern, "{pattern:?}");
         }
+    }
+
+    /// T7.0a (issue #624, part 7): `reference_true_filter` over every
+    /// pattern of the plan's pattern table.
+    #[test]
+    fn reference_true_filter_accepts_exactly_the_narrow_set() {
+        let yes = [
+            "",
+            ".*",
+            ".*|.*",
+            ".*||||",
+            ".*?",
+            "|",
+            ".*|",
+            "|.*",
+            "(?i)",
+            "(?s)",
+            "(?i).*",
+            "(?-s).*",
+            "(?s)(?-s).*",
+            "(?:.*)",
+            "(?:)",
+            "(?i:.*)",
+            "(?:(?:.*))",
+            "(?:(?i))",
+        ];
+        let no = [
+            "(?s).*",
+            "(?s:.*)",
+            "(?s)(?:.*)",
+            "(?s)|.*",
+            "x{0}|x{0}",
+            "a{0}",
+            ".{0,}",
+            "(?:.)*",
+            "(.*)",
+            "()",
+            "(.*)|()",
+            "(?:.*)*",
+            ".*?|.*",
+            "(?:.*)|.*",
+            "(?:.*|.*)",
+            ".+",
+            "^",
+            "^.*",
+            ".*.*",
+            "().*",
+            "(?:).*",
+            ".*(?:)",
+            "(.)*",
+            r"[^\n]*",
+            ".{0,5}",
+            "foo|",
+            ".*|foo",
+            "(?x)",
+            "(?x:.*)",
+        ];
+        let wrong: Vec<String> = yes
+            .iter()
+            .filter(|p| !super::reference_true_filter(p))
+            .map(|p| format!("{p:?} must keep every line"))
+            .chain(
+                no.iter()
+                    .filter(|p| super::reference_true_filter(p))
+                    .map(|p| format!("{p:?} must not")),
+            )
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
