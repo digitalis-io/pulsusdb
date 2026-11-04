@@ -170,7 +170,8 @@ data:
       pipelines:
         logs: { receivers: [otlp], exporters: [otlphttp] }
         metrics: { receivers: [otlp], exporters: [prometheusremotewrite/pulsus] }
-        # traces/profiles pipelines land with their own milestones (M4/M5)
+        traces: { receivers: [otlp], exporters: [otlphttp] }
+        # profiles pipeline lands with M5
 
 ---
 # Source: pulsusdb/templates/clickhouse-statefulset-single.yaml
@@ -397,7 +398,7 @@ spec:
         app.kubernetes.io/part-of: pulsusdb
         app.kubernetes.io/component: otel-collector
       annotations:
-        checksum/config: c5d2c1ac3a43942e02c65dd3d75b4e186db927a33fcd45113524f12dfa599dc3
+        checksum/config: a5ad8aa56d30404d247bca077ef26076a3e6c7205287712455698f888291c1e6
     spec:
       securityContext:
         runAsGroup: 10001

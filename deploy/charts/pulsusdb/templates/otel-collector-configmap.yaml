@@ -47,6 +47,7 @@ data:
       pipelines:
         logs: { receivers: [otlp], exporters: [otlphttp] }
         metrics: { receivers: [otlp], exporters: [prometheusremotewrite/pulsus] }
-        # traces/profiles pipelines land with their own milestones (M4/M5)
+        traces: { receivers: [otlp], exporters: [otlphttp] }
+        # profiles pipeline lands with M5
     {{- end }}
 {{- end }}
