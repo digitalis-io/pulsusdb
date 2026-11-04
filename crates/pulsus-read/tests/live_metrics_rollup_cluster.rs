@@ -1220,3 +1220,150 @@ async fn a_two_table_statement_keeps_the_local_replica() {
     )
     .await;
 }
+
+// ------------------------------------------------ issue #579 part 5, T17
+
+/// Every top-level statement shard 1 ran under `comment`, finished or
+/// failed, in start order.
+async fn statements(node: &ChClient, comment: &str) -> Vec<String> {
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
+    struct Logged {
+        query: String,
+    }
+    settle_query_log(
+        &[node],
+        &format!("is_initial_query AND log_comment = '{comment}'"),
+        1,
+    )
+    .await;
+    let mut stream = node
+        .query_stream::<Logged>(
+            &format!(
+                "SELECT query FROM system.query_log \
+                 WHERE type IN ('QueryFinish', 'ExceptionWhileProcessing') AND is_initial_query \
+                   AND log_comment = '{comment}' \
+                 ORDER BY query_start_time_microseconds"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("query_log");
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode").query);
+    }
+    out
+}
+
+/// **T17 (issue #579 part 5): a match node answers on two shards.** T7's
+/// fixture with `m` and `n`: a `group_left` match pushed over both sides'
+/// level reads, with the label cache warm and never refreshed; a match
+/// today's evaluator refuses takes today's route.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_match_node_answers_on_two_shards() {
+    if skipping() {
+        return;
+    }
+    let f = fixture(
+        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t17"),
+        &[("m", 0), ("n", 5000)],
+        false,
+    )
+    .await;
+    build_level(&f).await;
+    let (cache, slot) = warm(&f).await;
+    let on = level_engine(&f, &cache, &slot, true, None).await;
+    let off = level_engine(&f, &cache, &slot, false, None).await;
+    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
+    let p = MetricQueryParams {
+        start_ms: f.mid - 30 * MIN,
+        end_ms: f.hi,
+        step_ms: MIN,
+    };
+    // (i)
+    let expr = parse("sum by (s) (rate(m[5m]) * on (s) group_left rate(n[5m]))").expect("parse");
+    let (a, _, explain) = on.query_explained(&tenant, &expr, &p).await.expect("on");
+    let (b, _, _) = off.query_explained(&tenant, &expr, &p).await.expect("off");
+    let st = stages(&explain);
+    assert!(
+        st.iter().any(|(n, sql)| n == "pushed_aggregate"
+            && sql.matches("FROM metric_samples_60s_dist\n").count() == 2),
+        "(i): no pushed statement reading the level twice: {st:#?}"
+    );
+    assert!(
+        !st.iter().any(|(_, sql)| sql.starts_with("declined:")),
+        "(i): {st:#?}"
+    );
+    assert_eq!(cells(&b).len(), 40, "(i): in process");
+    assert_eq!(cells(&a), cells(&b), "(i): pushed against in process");
+    // (i), cold (after #18 part 2c): a label cache never refreshed, so both
+    // sides are resolved by SQL and filter `GLOBAL IN` their series.
+    let cold = cold_cache(&f).await;
+    let cold_on = level_engine(&f, &cold, &slot, true, None).await;
+    let (c, _, explain) = cold_on
+        .query_explained(&tenant, &expr, &p)
+        .await
+        .expect("cold on");
+    let st = stages(&explain);
+    let resolution: Vec<&String> = st
+        .iter()
+        .filter(|(n, _)| n == "series_resolution")
+        .map(|(_, sql)| sql)
+        .collect();
+    assert!(
+        !resolution.is_empty() && resolution.iter().all(|s| !s.starts_with("label cache:")),
+        "(i) cold: the series resolve by SQL: {resolution:?}"
+    );
+    assert!(
+        st.iter().any(|(n, sql)| n == "pushed_aggregate"
+            && sql.matches("FROM metric_samples_60s_dist\n").count() == 2),
+        "(i) cold: no pushed statement reading the level twice: {st:#?}"
+    );
+    assert!(
+        !st.iter().any(|(_, sql)| sql.starts_with("declined:")),
+        "(i) cold: {st:#?}"
+    );
+    assert_eq!(cells(&c).len(), 40, "(i) cold: pushed");
+    assert_eq!(cells(&c), cells(&b), "(i) cold: pushed against in process");
+    // (ii)
+    let comment = format!("{}_t17_{}", f.db, uuid::Uuid::new_v4().simple());
+    let logged = level_engine(&f, &cache, &slot, true, Some(&comment)).await;
+    let expr = parse("sum(rate(m[5m]) + ignoring (s) rate(n[5m]))").expect("parse");
+    let x = logged
+        .query(&tenant, &expr, &p)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    let y = off
+        .query(&tenant, &expr, &p)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    assert_eq!(x, y, "(ii): both engines");
+    assert!(
+        y.as_ref()
+            .is_err_and(|e| e.contains("found duplicate series for the match group {}")),
+        "(ii): {y:?}"
+    );
+    let sent = statements(&f.shard1, &comment).await;
+    let at = sent
+        .iter()
+        .position(|q| q.contains("CAST([('', 'match')]"))
+        .unwrap_or_else(|| panic!("(ii): no S3c: {sent:#?}"));
+    let fetches = sent[at + 1..]
+        .iter()
+        .filter(|q| q.starts_with("SELECT _shard_num AS shard, kind, fingerprint, t_end"))
+        .count();
+    assert!(
+        fetches >= 2,
+        "(ii): {fetches} level fetches after S3c: {sent:#?}"
+    );
+    exec(
+        &f.bootstrap,
+        &format!(
+            "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
+            f.db
+        ),
+    )
+    .await;
+}

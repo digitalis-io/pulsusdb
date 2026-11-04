@@ -84,6 +84,11 @@ static DB_P65: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read
 static DB_P30: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p30");
 static DB_P31: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p31");
 static DB_P33: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p33");
+static DB_Q12: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_q12");
+static DB_Q13: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_q13");
+static DB_Q14: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_q14");
+static DB_Q15: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_q15");
+static DB_Q18: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_q18");
 
 /// The default levels and their switch points: 60 s first, the resolution
 /// from 3 h; a shorter range reads raw (owner, 2026-10-31).
@@ -3807,7 +3812,8 @@ async fn a_vector_match_under_an_aggregate_answers_as_in_process() {
 /// **T4 (issue #579 part 4): the shapes part 4 does not push take today's
 /// route**, name their reason where section 4 names one, and answer as in
 /// process. Issue #18 part 2b: the week's three, filled at 7200 s, are
-/// pushed now (T30 (c)), so they are not here.
+/// pushed now (T30 (c)), so they are not here. Issue #579 part 5: its
+/// `on`, `ignoring` and `group_*` rows are pushed now (T12 b1-b3).
 #[tokio::test(flavor = "multi_thread")]
 async fn unpushed_shapes_take_todays_route() {
     skip_unless_live!();
@@ -3829,27 +3835,7 @@ async fn unpushed_shapes_take_todays_route() {
     )
     .with_rollup_levels(Arc::clone(&built.slot));
     let day = range(end - 15 * HOUR, end, 2 * MIN);
-    let cases: [(&str, &MetricQueryParams, Option<&str>); 11] = [
-        (
-            "sum(rate(p_rx_total[5m]) + on (instance, device) rate(p_tx_total[5m]))",
-            &day,
-            Some("Matching"),
-        ),
-        (
-            "sum(rate(p_rx_total[5m]) + ignoring (__unit__) rate(p_tx_total[5m]))",
-            &day,
-            Some("Matching"),
-        ),
-        (
-            "sum(rate(p_rx_total[5m]) * on (instance, device) group_left rate(p_tx_total[5m]))",
-            &day,
-            Some("Matching"),
-        ),
-        (
-            "sum(rate(p_rx_total[5m]) * on (instance, device) group_right rate(p_tx_total[5m]))",
-            &day,
-            Some("Matching"),
-        ),
+    let cases: [(&str, &MetricQueryParams, Option<&str>); 7] = [
         (
             "sum(rate(p_rx_total[5m]) % rate(p_tx_total[5m]))",
             &day,
@@ -5012,4 +4998,729 @@ async fn a_statement_at_the_cap_declines_and_one_below_pushes() {
     }
     built.finish().await;
     assert!(failures.is_empty(), "T65:\n{}", failures.join("\n"));
+}
+
+// ------------------------------------------- issue #579 part 5, corpus Q
+
+/// Every statement sent under `comment`, finished or failed, in start
+/// order: `(query, failed)`.
+async fn statements_in_order(admin: &ChClient, comment: &str) -> Vec<(String, bool)> {
+    #[derive(Row, serde::Serialize, serde::Deserialize)]
+    struct Logged {
+        query: String,
+        failed: u8,
+    }
+    settle_query_log(&[admin], &format!("log_comment = '{comment}'"), 1).await;
+    let mut stream = admin
+        .query_stream::<Logged>(
+            &format!(
+                "SELECT query, toUInt8(type = 'ExceptionWhileProcessing') AS failed \
+                 FROM system.query_log \
+                 WHERE type IN ('QueryFinish', 'ExceptionWhileProcessing') \
+                   AND log_comment = '{comment}' \
+                 ORDER BY query_start_time_microseconds"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("query_log");
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("decode");
+        out.push((row.query, row.failed == 1));
+    }
+    out
+}
+
+/// Corpus Q's series (part 5, plan section 12): `(metric, key, labels,
+/// seed)`, the labels canonical JSON with sorted keys.
+const CORPUS_Q: [(&str, &str, &str, u32); 27] = [
+    (
+        "q_many_total",
+        "mi0d0",
+        r#"{"device":"d0","instance":"i0"}"#,
+        100,
+    ),
+    (
+        "q_many_total",
+        "mi0d1",
+        r#"{"device":"d1","instance":"i0"}"#,
+        101,
+    ),
+    (
+        "q_many_total",
+        "mi0d2",
+        r#"{"device":"d2","instance":"i0"}"#,
+        102,
+    ),
+    (
+        "q_many_total",
+        "mi1d0",
+        r#"{"device":"d0","instance":"i1"}"#,
+        103,
+    ),
+    (
+        "q_many_total",
+        "mi1d1",
+        r#"{"device":"d1","instance":"i1"}"#,
+        104,
+    ),
+    (
+        "q_many_total",
+        "mi1d2",
+        r#"{"device":"d2","instance":"i1"}"#,
+        105,
+    ),
+    (
+        "q_many_total",
+        "mi2d0",
+        r#"{"device":"d0","instance":"i2","role":"m"}"#,
+        106,
+    ),
+    (
+        "q_many_total",
+        "mi2d1",
+        r#"{"device":"d1","instance":"i2","role":"m"}"#,
+        107,
+    ),
+    (
+        "q_many_total",
+        "mi2d2",
+        r#"{"device":"d2","instance":"i2","role":"m"}"#,
+        108,
+    ),
+    (
+        "q_many_total",
+        "mi3d0",
+        r#"{"__unit__":"bytes","device":"d0","instance":"i3"}"#,
+        109,
+    ),
+    (
+        "q_many_total",
+        "mi3d1",
+        r#"{"__unit__":"bytes","device":"d1","instance":"i3"}"#,
+        110,
+    ),
+    (
+        "q_many_total",
+        "mi3d2",
+        r#"{"__unit__":"bytes","device":"d2","instance":"i3"}"#,
+        111,
+    ),
+    (
+        "q_one_total",
+        "oi0a",
+        r#"{"instance":"i0","role":"a"}"#,
+        112,
+    ),
+    (
+        "q_one_total",
+        "oi0a2",
+        r#"{"instance":"i0","role":"a2"}"#,
+        113,
+    ),
+    (
+        "q_one_total",
+        "oi1b",
+        r#"{"instance":"i1","role":"b"}"#,
+        114,
+    ),
+    (
+        "q_one_total",
+        "oi1b2",
+        r#"{"instance":"i1","role":"b2"}"#,
+        115,
+    ),
+    ("q_one_total", "oi2", r#"{"instance":"i2"}"#, 116),
+    (
+        "q_one_total",
+        "oi3",
+        r#"{"__unit__":"bytes","instance":"i3","role":"c"}"#,
+        117,
+    ),
+    (
+        "q_peer_total",
+        "pi0",
+        r#"{"instance":"i0","zone":"z0"}"#,
+        118,
+    ),
+    (
+        "q_peer_total",
+        "pi1",
+        r#"{"instance":"i1","zone":"z1"}"#,
+        119,
+    ),
+    (
+        "q_peer_total",
+        "pi2",
+        r#"{"instance":"i2","zone":"z2"}"#,
+        120,
+    ),
+    (
+        "q_peer_total",
+        "pi3",
+        r#"{"__unit__":"bytes","instance":"i3","zone":"z3"}"#,
+        121,
+    ),
+    ("q_glob_total", "g", "{}", 122),
+    ("q_dup_total", "di0", r#"{"instance":"i0"}"#, 123),
+    (
+        "q_dup_total",
+        "di9a",
+        r#"{"instance":"i9","role":"a"}"#,
+        124,
+    ),
+    (
+        "q_dup_total",
+        "di9b",
+        r#"{"instance":"i9","role":"b"}"#,
+        125,
+    ),
+    (
+        "q_empty_total",
+        "ei1",
+        r#"{"instance":"i1","role":""}"#,
+        126,
+    ),
+];
+
+/// Corpus Q's other three series, beside [`CORPUS_Q`].
+const CORPUS_Q_MORE: [(&str, &str, &str, u32); 3] = [
+    (
+        "q_empty_total",
+        "ei2e",
+        r#"{"instance":"i2","role":""}"#,
+        127,
+    ),
+    ("q_empty_total", "ei2", r#"{"instance":"i2"}"#, 128),
+    (
+        "q_emptyb_total",
+        "bi1",
+        r#"{"instance":"i1","role":""}"#,
+        129,
+    ),
+];
+
+/// Corpus Q (part 5, plan section 12) beside corpus P, ending at `end`:
+/// the series of [`CORPUS_Q`], registered every hour of the 50 and
+/// scraped every 15 s with corpus P's jitter, each `q_one_total` rising by
+/// about 1e6 a scrape, `q_emptyb_total` by 0.1, the others by 1 to 10.
+fn corpus_q_land(db: &str, end: i64) -> Vec<String> {
+    let lo = end - 50 * HOUR;
+    let rows = CORPUS_Q
+        .iter()
+        .chain(&CORPUS_Q_MORE)
+        .map(|(m, k, l, seed)| format!("('{m}', '{k}', '{}', {seed})", l.replace('\'', "\\'")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let series = format!(
+        "CREATE TABLE {db}.rq_series ENGINE = Memory AS \
+         SELECT metric, key, labels, seed, \
+                bitOr(bitShiftLeft(toUInt128(bitShiftRight(cityHash64(metric), 32)), 96), \
+                      bitAnd(bitOr(bitShiftLeft(toUInt128(cityHash64(buf)), 64), toUInt128(xxHash64(buf))), \
+                             toUInt128('79228162514264337593543950335'))) AS fp \
+         FROM (SELECT metric, key, labels, seed, concat(metric, unhex('FF'), labels, unhex('FF')) AS buf \
+               FROM values('metric String, key String, labels String, seed UInt32', {rows}))"
+    );
+    let registrations = format!(
+        "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+         SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, metric, fp, \
+                toInt64({lo}) + toInt64(n.number) * {HOUR} + 1000, labels, 0 \
+         FROM {db}.rq_series, numbers(50) AS n"
+    );
+    let samples = format!(
+        "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+         SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, metric, fp, t, \
+                1000. * (seed + 1) + sum(inc) OVER (PARTITION BY fp ORDER BY i \
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS v \
+         FROM ( \
+           SELECT metric, fp, key, seed, i, t, \
+             multiIf(metric = 'q_one_total', 1e6 + toFloat64(cityHash64(seed, i) % 10), \
+                     metric = 'q_emptyb_total', 0.1, toFloat64(1 + cityHash64(seed, i) % 10)) AS inc \
+           FROM ( \
+             SELECT s.metric AS metric, s.fp AS fp, s.key AS key, s.seed AS seed, toInt64(n.number) AS i, \
+                    toInt64({lo}) + 15000 * i + (100 + (7919 * seed) % 14800) + (toInt64((7 * seed + 13 * i) % 201) - 100) AS t \
+             FROM {db}.rq_series AS s, numbers({n}) AS n) \
+           WHERE t <= {end} \
+             AND NOT (metric = 'q_many_total' AND t > {gap_lo} AND t <= {gap_hi}) \
+             AND NOT (key = 'oi0a' AND t >= {a_end}) \
+             AND NOT (key = 'oi0a2' AND t < {a2_from}) \
+             AND NOT (key = 'oi1b' AND t >= {b_end}) \
+             AND NOT (key = 'oi1b2' AND t < {b2_from}))",
+        n = 50 * HOUR / SCRAPE,
+        gap_lo = end - 12 * HOUR - 20 * MIN,
+        gap_hi = end - 11 * HOUR - 40 * MIN,
+        a_end = end - 12 * HOUR + 2 * MIN,
+        a2_from = end - 12 * HOUR - 2 * MIN,
+        b_end = end - 8 * HOUR,
+        b2_from = end - 8 * HOUR - 3 * MIN,
+    );
+    let markers = format!(
+        "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+         SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, s.metric, s.fp, x.t, \
+                reinterpretAsFloat64(toUInt64(9218868437227405314)) \
+         FROM (SELECT * FROM values('k String, t Int64', ('oi0a', {}), ('oi1b', {}))) AS x \
+         JOIN {db}.rq_series AS s ON s.key = x.k",
+        end - 12 * HOUR + 2 * MIN,
+        end - 8 * HOUR,
+    );
+    vec![series, registrations, samples, markers]
+}
+
+/// Corpora P and Q in one build at the default levels, P's 60 s hole cut.
+async fn corpus_pq(db: &str, end: i64) -> Built {
+    let mut land = corpus_p_land(db, end, false);
+    land.extend(corpus_q_land(db, end));
+    let built = build(db, DEFAULTS, &land, end - 50 * HOUR, end - 10 * MIN, &[]).await;
+    cut_runs(
+        &built.admin,
+        db,
+        60,
+        end - 6 * HOUR,
+        end - 5 * HOUR - 30 * MIN,
+    )
+    .await;
+    built
+}
+
+/// The group label sets of an answer, each sorted.
+fn groups_of(x: &Answer) -> std::collections::BTreeSet<String> {
+    vector_or_matrix(x).keys().map(|(l, _)| l.clone()).collect()
+}
+
+/// **T12 (issue #579 part 5): a matched binary under an aggregate answers
+/// as in process**, for every row of the plan's T12 table, and the
+/// in-process answers express what the rows pin.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_matched_binary_under_an_aggregate_answers_as_in_process() {
+    skip_unless_live!();
+    let end = p_end();
+    let built = corpus_pq(DB_Q12.name(), end).await;
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(true, None).await;
+    let t = no_tenant();
+    let v = range(end - 6 * HOUR, end, MIN);
+    let d = range(end - 15 * HOUR, end, 2 * MIN);
+    let i = range(end - HOUR, end - HOUR, 0);
+    let five = ["sum", "avg", "count", "min", "max"];
+    let mut cases: Vec<(String, MetricQueryParams)> = Vec::new();
+    let mut add =
+        |aggs: &[&str], groupings: &[&str], binary: &str, windows: &[&MetricQueryParams]| {
+            for agg in aggs {
+                for g in groupings {
+                    for w in windows {
+                        cases.push((format!("{agg} {g}({binary})"), **w));
+                    }
+                }
+            }
+        };
+    let three = ["by (instance) ", "without (device) ", ""];
+    // b1, b1c
+    for op in ["+", "/", ">", "> bool"] {
+        let b = format!("rate(p_rx_total[5m]) {op} on (instance, device) rate(p_tx_total[5m])");
+        add(&five, &three, &b, &[&d, &i]);
+    }
+    for op in [
+        "==", "!=", "<", ">=", "<=", "== bool", "!= bool", "> bool", "< bool", ">= bool", "<= bool",
+    ] {
+        let b = format!("rate(p_rx_total[5m]) {op} on (instance, device) rate(p_tx_total[5m])");
+        add(&["sum"], &three, &b, &[&d]);
+    }
+    // b2, b3
+    let two = ["by (instance) ", "without (device) "];
+    for op in ["-", "<="] {
+        let b =
+            format!("rate(p_rx_total[5m]) {op} ignoring (__name__, __unit__) rate(p_tx_total[5m])");
+        add(&["sum"], &two, &b, &[&d]);
+    }
+    for b in [
+        "rate(p_rx_total[5m]) * on (instance, device) group_left rate(p_tx_total[5m])",
+        "rate(p_rx_total[5m]) > on (instance, device) group_right rate(p_tx_total[5m])",
+    ] {
+        add(&["sum"], &two, b, &[&d]);
+    }
+    // b4, b5, b6
+    for op in ["*", "/", "<", "== bool"] {
+        let b = format!(
+            "rate(q_many_total[5m]) {op} on (instance) group_left (role) rate(q_one_total[5m])"
+        );
+        add(
+            &five,
+            &["by (instance) ", "without (device) ", "by (role) ", ""],
+            &b,
+            &[&v, &i],
+        );
+    }
+    add(
+        &["sum"],
+        &["without (device) ", "by (role) "],
+        "rate(q_many_total[5m]) - on (instance) group_left rate(q_one_total[5m])",
+        &[&v],
+    );
+    for op in ["/", ">"] {
+        let b =
+            format!("rate(q_one_total[5m]) {op} on (instance) group_right rate(q_many_total[5m])");
+        add(&five, &three, &b, &[&v, &i]);
+    }
+    // b7, b8, b10
+    for b in [
+        "rate(q_one_total[5m]) - on (instance) rate(q_peer_total[5m])",
+        "rate(q_one_total[5m]) > ignoring (role, zone) rate(q_peer_total[5m])",
+    ] {
+        add(&["sum"], &["by (instance) ", "without (role) "], b, &[&v]);
+    }
+    add(
+        &["sum"],
+        &two,
+        "rate(q_many_total[5m]) * on () group_left rate(q_glob_total[5m])",
+        &[&v],
+    );
+    add(
+        &["sum"],
+        &["by (instance) ", "without (role) "],
+        "rate(q_one_total[5m]) + on (__name__, instance) rate(q_one_total[5m])",
+        &[&v],
+    );
+    // b12, b13, b11, b9
+    add(
+        &["sum"],
+        &["by (role) ", "without (instance) "],
+        "rate(q_empty_total{instance=\"i1\"}[5m]) * on (instance) group_left rate(q_one_total[5m])",
+        &[&v],
+    );
+    add(
+        &["sum"],
+        &["by (role) "],
+        "rate(q_empty_total{instance=\"i1\"}[5m]) > rate(q_emptyb_total[5m])",
+        &[&v],
+    );
+    add(
+        &["sum"],
+        &["without (device) ", "by (role) "],
+        "rate(q_many_total[5m]) < on (instance) group_left (__name__, role) rate(q_one_total[5m])",
+        &[&v],
+    );
+    for b in [
+        "irate(q_many_total[5m]) + on (instance) group_left (role) rate(q_one_total[5m])",
+        "rate(q_one_total[5m]) + on (instance) group_right (role) irate(q_many_total[5m])",
+    ] {
+        add(&["sum"], &["by (role) "], b, &[&v]);
+    }
+    let mut failures = Vec::new();
+    for (q, p) in &cases {
+        failures.extend(pushed_against_in_process(&on, &off, q, p).await.2);
+    }
+    // Two names under `on (__name__, …)`: nothing matches.
+    let q =
+        "sum(rate(q_many_total[5m]) * on (__name__, instance) group_left rate(q_one_total[5m]))";
+    let (a, b) = futures::join!(ask(&on, &t, q, &v), ask(&off, &t, q, &v));
+    if !vector_or_matrix(&a).is_empty() || !vector_or_matrix(&b).is_empty() || a.pushed().is_empty()
+    {
+        failures.push(format!(
+            "{q}: pushed {} cells, in process {}, pushed statements {}",
+            vector_or_matrix(&a).len(),
+            vector_or_matrix(&b).len(),
+            a.pushed().len()
+        ));
+    }
+    // In process only: what the rows pin.
+    let s1 = ask(
+        &off,
+        &t,
+        "sum without (device) (rate(p_rx_total[5m]) > on (instance, device) rate(p_tx_total[5m]))",
+        &d,
+    )
+    .await;
+    if groups_of(&s1).iter().any(|g| g.contains("__unit__")) {
+        failures.push(format!("s1: a group with __unit__: {:?}", groups_of(&s1)));
+    }
+    let s2 = ask(
+        &off,
+        &t,
+        "sum by (role) (rate(q_many_total[5m]) * on (instance) group_left (role) rate(q_one_total[5m]))",
+        &v,
+    )
+    .await;
+    let want: std::collections::BTreeSet<String> = [
+        r#"[("role", "a2")]"#,
+        r#"[("role", "b2")]"#,
+        r#"[("role", "c")]"#,
+        "[]",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if groups_of(&s2) != want {
+        failures.push(format!("s2: groups {:?}", groups_of(&s2)));
+    }
+    let s3 = ask(
+        &off,
+        &t,
+        "sum without (device) (rate(q_many_total[5m]) * on (instance) group_left rate(q_one_total[5m]))",
+        &v,
+    )
+    .await;
+    let g3 = groups_of(&s3);
+    if !g3
+        .iter()
+        .any(|g| g.contains(r#"("instance", "i2")"#) && g.contains(r#"("role", "m")"#))
+        || g3
+            .iter()
+            .any(|g| g.contains(r#"("instance", "i3")"#) && g.contains("__unit__"))
+    {
+        failures.push(format!("s3: groups {g3:?}"));
+    }
+    let b12 = ask(
+        &off,
+        &t,
+        "sum by (role) (rate(q_empty_total{instance=\"i1\"}[5m]) * on (instance) group_left rate(q_one_total[5m]))",
+        &v,
+    )
+    .await;
+    if groups_of(&b12) != ["[]".to_string()].into_iter().collect() {
+        failures.push(format!("b12: in process, groups {:?}", groups_of(&b12)));
+    }
+    let b13 = ask(
+        &off,
+        &t,
+        "sum by (role) (rate(q_empty_total{instance=\"i1\"}[5m]) > rate(q_emptyb_total[5m]))",
+        &v,
+    )
+    .await;
+    if groups_of(&b13) != ["[]".to_string()].into_iter().collect() {
+        failures.push(format!("b13: in process, groups {:?}", groups_of(&b13)));
+    }
+    built.finish().await;
+    assert!(
+        failures.is_empty(),
+        "T12 ({} cases):\n{}",
+        cases.len(),
+        failures.join("\n")
+    );
+}
+
+/// The text of `query`'s error on `engine`, or a line saying it answered.
+async fn error_of(engine: &MetricsEngine, query: &str, p: &MetricQueryParams) -> String {
+    match engine
+        .query(&no_tenant(), &parse(query).expect("parse"), p)
+        .await
+    {
+        Ok(_) => "answered".to_string(),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// Whether `sent` holds a statement satisfying `first`, and after it at
+/// least two level fetches of today's route.
+fn then_two_level_fetches(
+    sent: &[(String, bool)],
+    first: impl Fn(&(String, bool)) -> bool,
+) -> bool {
+    sent.iter().position(first).is_some_and(|at| {
+        sent[at + 1..]
+            .iter()
+            .filter(|(q, _)| q.starts_with("SELECT toUInt32(1) AS shard, kind, fingerprint, t_end"))
+            .count()
+            >= 2
+    })
+}
+
+/// **T13 (issue #579 part 5): a matching error takes today's route**: both
+/// engines fail with the same text, and the pushed engine sent S3c, then
+/// today's level fetches.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_matching_error_takes_todays_route() {
+    skip_unless_live!();
+    let end = p_end();
+    let db = DB_Q13.name();
+    let built = corpus_pq(db, end).await;
+    let off = built.engine(true, None).await;
+    let v = range(end - 6 * HOUR, end, MIN);
+    let d = range(end - 15 * HOUR, end, 2 * MIN);
+    let rows: [(&str, &str, &MetricQueryParams, &[&str]); 9] = [
+        (
+            "a",
+            "sum(rate(q_one_total[5m]) + on (instance) rate(q_many_total[5m]))",
+            &v,
+            &[
+                "found duplicate series for the match group",
+                "right hand-side",
+            ],
+        ),
+        (
+            "b",
+            "sum(rate(q_many_total[5m]) + on (instance) rate(q_one_total[5m]))",
+            &v,
+            &["many-to-one matching must be explicit"],
+        ),
+        (
+            "c",
+            "sum(rate(q_many_total[5m]) * on (instance) group_left rate(q_one_total[5m]))",
+            &d,
+            &["{instance=\"i1\"} on the right hand-side"],
+        ),
+        (
+            "d",
+            "sum(rate(q_one_total[5m]) / on (instance) group_right rate(q_many_total[5m]))",
+            &d,
+            &["{instance=\"i1\"} on the left hand-side"],
+        ),
+        (
+            "e",
+            "sum(rate(q_many_total[5m]) * on (instance) group_left rate(q_dup_total[5m]))",
+            &v,
+            &["{instance=\"i9\"} on the right hand-side"],
+        ),
+        (
+            "f",
+            "sum(rate(q_many_total[5m]) * on (instance) group_left (device) rate(q_one_total[5m]))",
+            &v,
+            &["grouping labels must ensure unique matches"],
+        ),
+        (
+            "g",
+            "sum(rate(q_many_total[5m]) > on (instance) group_left (device) rate(q_one_total[5m]))",
+            &v,
+            &["grouping labels must ensure unique matches"],
+        ),
+        (
+            "h",
+            "sum(rate(q_many_total[5m]) > on (instance) rate(q_one_total[5m]))",
+            &v,
+            &["many-to-one matching must be explicit"],
+        ),
+        (
+            "i",
+            "sum by (role) (rate(q_empty_total{instance=\"i2\"}[5m]) * on (instance) group_left rate(q_one_total[5m]))",
+            &v,
+            &["grouping labels must ensure unique matches"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (row, q, p, fragments) in rows {
+        let comment = format!("{db}_t13{row}_{}", now_ms());
+        let on = built.pushed_engine(Some(&comment)).await;
+        let (a, b) = (error_of(&on, q, p).await, error_of(&off, q, p).await);
+        if a != b {
+            failures.push(format!("({row}): push on {a:?}, push off {b:?}"));
+        }
+        for f in fragments {
+            if !b.contains(f) {
+                failures.push(format!("({row}): {b:?} lacks {f:?}"));
+            }
+        }
+        let sent = statements_in_order(&built.admin, &comment).await;
+        if !then_two_level_fetches(&sent, |(q, _)| q.contains("CAST([('', 'match')]")) {
+            let brief: Vec<String> = sent
+                .iter()
+                .map(|(q, failed)| format!("{failed}: {}", q.lines().next().unwrap_or("")))
+                .collect();
+            failures.push(format!(
+                "({row}): no S3c then two level fetches: {brief:#?}"
+            ));
+        }
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T13:\n{}", failures.join("\n"));
+}
+
+/// The query of T14 and T15: `i0`'s two one-side series overlap where
+/// the many side has no sample.
+const T14_QUERY: &str = "sum by (instance) (rate(q_many_total[5m]) * on (instance) group_left (role) rate(q_one_total[5m]))";
+
+/// **T14 (issue #579 part 5): a duplicate beside an empty side is
+/// pushed.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_duplicate_beside_an_empty_side_is_pushed() {
+    skip_unless_live!();
+    let end = p_end();
+    let built = corpus_pq(DB_Q14.name(), end).await;
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(true, None).await;
+    let t = no_tenant();
+    let b = range(end - 14 * HOUR + MIN, end - 10 * HOUR, MIN);
+    let (a, x, mut failures) = pushed_against_in_process(&on, &off, T14_QUERY, &b).await;
+    if !a.declines().is_empty() {
+        failures.push(format!("declines {:?}", a.declines()));
+    }
+    let count = ask(&off, &t, "count by (instance) (rate(q_one_total[5m]))", &b).await;
+    let two = count
+        .points()
+        .iter()
+        .any(|((l, _), v)| l.contains(r#"("instance", "i0")"#) && *v == 2.0);
+    if !two {
+        failures.push("in process, i0 never has two one-side series".to_string());
+    }
+    let near = x
+        .points()
+        .keys()
+        .any(|(_, ts)| (ts - (end - 12 * HOUR)).abs() <= 10 * MIN);
+    if near {
+        failures.push("the binary answers within 10 minutes of end − 12 h".to_string());
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T14:\n{}", failures.join("\n"));
+}
+
+/// **T15 (issue #579 part 5, after #18 part 2b): a filled request pushes
+/// its match node** in the bucket ends' read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filled_request_pushes_its_match_node() {
+    skip_unless_live!();
+    let end = p_end();
+    let built = corpus_pq(DB_Q15.name(), end).await;
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(true, None).await;
+    let t = no_tenant();
+    let p = range(end - 6 * HOUR + 30_000, end - 30_000, 30_000);
+    let (a, b) = futures::join!(ask(&on, &t, T14_QUERY, &p), ask(&off, &t, T14_QUERY, &p));
+    let mut failures = Vec::new();
+    if !a.declines().is_empty() {
+        failures.push(format!("declines {:?}", a.declines()));
+    }
+    if !a
+        .pushed()
+        .iter()
+        .any(|s| s.contains("60000 AS grid_step") && s.contains("CAST([('', 'match')]"))
+    {
+        failures.push(format!(
+            "no S3c on the bucket ends: {} pushed",
+            a.pushed().len()
+        ));
+    }
+    if vector_or_matrix(&b).is_empty() {
+        failures.push("in process, empty".to_string());
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) {
+        failures.push("cells differ from push off".to_string());
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T15:\n{}", failures.join("\n"));
+}
+
+/// **T18 (issue #579 part 5, review r1): a match whose only include label
+/// is `__name__` answers as in process**, under `group_left` and
+/// `group_right`, arithmetic and comparison.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_name_only_include_answers_as_in_process() {
+    skip_unless_live!();
+    let end = p_end();
+    let built = corpus_pq(DB_Q18.name(), end).await;
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(true, None).await;
+    let v = range(end - 6 * HOUR, end, MIN);
+    let mut failures = Vec::new();
+    for b in [
+        "rate(q_many_total[5m]) * on (instance) group_left (__name__) rate(q_one_total[5m])",
+        "rate(q_one_total[5m]) * on (instance) group_right (__name__) rate(q_many_total[5m])",
+        "rate(q_many_total[5m]) < on (instance) group_left (__name__) rate(q_one_total[5m])",
+        "rate(q_one_total[5m]) > on (instance) group_right (__name__) rate(q_many_total[5m])",
+    ] {
+        for g in ["", "by (instance) ", "without (device) "] {
+            let q = format!("sum {g}({b})");
+            failures.extend(pushed_against_in_process(&on, &off, &q, &v).await.2);
+        }
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T18:\n{}", failures.join("\n"));
 }
