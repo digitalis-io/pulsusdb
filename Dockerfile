@@ -61,7 +61,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM docker.io/lukemathwalker/cargo-chef:0.1.77-rust-1.93-bookworm AS build
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends clang \
+    && apt-get install -y --no-install-recommends clang cmake \
     && rm -rf /var/lib/apt/lists/*
 ENV CC=clang
 ARG AWS_LC_SYS_NO_ASM=1
