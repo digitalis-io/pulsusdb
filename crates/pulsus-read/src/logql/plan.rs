@@ -1632,6 +1632,7 @@ fn streams_plan(
     p: &QueryParams,
     ctx: &PlanCtx<'_>,
 ) -> Result<StreamsPlan, ReadError> {
+    let log_expr: &LogExpr = &*effective_log_expr(log_expr)?;
     let (start_ns, end_ns) = window_bounds_for_streams(&p.spec);
     let normalized = normalize_matchers(&log_expr.selector)?;
     let months = months_overlapping(start_ns, end_ns);
@@ -2738,6 +2739,7 @@ fn metric_plan(
         // base reaching `metric_plan` is structurally always `Range`.
         unreachable!("metric_plan is only called on Vector-chains bottoming at MetricExpr::Range")
     };
+    let range: &LogRange = &*effective_range(range)?;
     let vector_aggs =
         parse_vector_agg_params(&raw_vector_aggs, matches!(p.spec, QuerySpec::Range { .. }))?;
 
@@ -4794,6 +4796,155 @@ fn compile_one_parsed_filter(
         }
         LabelFilterExpr::Ip { .. } | LabelFilterExpr::And(_, _) | LabelFilterExpr::Or(_, _) => None,
     }
+}
+
+/// What one line filter does to the lines it sees (issue #624, part 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LineFilterEffect<'a> {
+    /// It cannot exclude a line: the reference runs no filter.
+    KeepsAll,
+    /// It excludes every line.
+    DropsAll,
+    /// It filters with these alternatives: the filter itself, or a
+    /// positive `or` group without the alternatives that keep every line.
+    Filters(std::borrow::Cow<'a, LineFilter>),
+}
+
+/// The one rule (issue #624, part 7, D7.1–D7.3), read by the planner, the
+/// SQL mint and the in-process compile. An alternative keeps every line
+/// when it is `|=` of `""`, or `|~` of a pattern
+/// [`pulsus_re2::reference_true_filter`] accepts. A positive filter keeps
+/// every line when every alternative does, and otherwise loses those that
+/// do, as the reference's `newOrFilter` drops a `TrueFilter`
+/// (`pkg/logql/log/filter.go:309-322 @ v3.7.4`); a negative filter with any
+/// such alternative drops every line. A filter with an `ip(…)` or `word(…)`
+/// alternative is not classified.
+///
+/// The caller validates every regex alternative first (D7.9): this reads
+/// the pattern and never refuses one.
+pub(crate) fn line_filter_effect(lf: &LineFilter) -> LineFilterEffect<'_> {
+    use pulsus_logql::{LineFilterOp, LineMatch};
+    let keeps = |m: &LineMatch| match (m, lf.op) {
+        (LineMatch::Text(v), LineFilterOp::Contains | LineFilterOp::NotContains) => v.is_empty(),
+        (LineMatch::Text(v), LineFilterOp::Regex | LineFilterOp::NotRegex) => {
+            pulsus_re2::reference_true_filter(v)
+        }
+        (LineMatch::Ip(_) | LineMatch::Words(_), _) => false,
+    };
+    if !lf.alternatives().all(|m| matches!(m, LineMatch::Text(_))) || !lf.alternatives().any(keeps)
+    {
+        return LineFilterEffect::Filters(std::borrow::Cow::Borrowed(lf));
+    }
+    if matches!(lf.op, LineFilterOp::NotContains | LineFilterOp::NotRegex) {
+        return LineFilterEffect::DropsAll;
+    }
+    let mut left = lf.alternatives().filter(|m| !keeps(m)).cloned();
+    match left.next() {
+        None => LineFilterEffect::KeepsAll,
+        Some(head) => LineFilterEffect::Filters(std::borrow::Cow::Owned(LineFilter {
+            op: lf.op,
+            head,
+            or_matches: left.collect(),
+        })),
+    }
+}
+
+/// The pipeline the reference runs (issue #624, part 7, D7.4): a stage that
+/// keeps every line is removed, a pruned `or` group replaces its stage,
+/// and every other stage, a filter that drops every line among them, is
+/// kept. Borrowed when nothing changes.
+///
+/// Every regex alternative is validated first, as it is validated today
+/// at its position (D7.9): unanchored before the first `line_format`,
+/// `decolorize` or `unpack`, as the database reads it after one. A stage
+/// with a pattern that fails is left as written and is not classified, so
+/// today's seams refuse it in today's order (a bad matcher regex is still
+/// reported before a bad line-filter one). The `Err` arm is not taken
+/// today.
+pub(crate) fn effective_pipeline(
+    stages: &[Stage],
+) -> Result<std::borrow::Cow<'_, [Stage]>, ReadError> {
+    let mut rewritten = false;
+    let mut out: Option<Vec<Stage>> = None;
+    for (i, stage) in stages.iter().enumerate() {
+        let replacement = match stage {
+            Stage::LineFormat(_) | Stage::Decolorize | Stage::Unpack => {
+                rewritten = true;
+                None
+            }
+            Stage::LineFilter(lf) => {
+                let regex = matches!(
+                    lf.op,
+                    pulsus_logql::LineFilterOp::Regex | pulsus_logql::LineFilterOp::NotRegex
+                );
+                let valid = !regex
+                    || lf.alternatives().all(|alt| match alt {
+                        pulsus_logql::LineMatch::Text(value) if rewritten => {
+                            super::pipeline::compile_regex_as_database(value).is_ok()
+                        }
+                        pulsus_logql::LineMatch::Text(value) => {
+                            super::pipeline::validate_unanchored_regex(value).is_ok()
+                        }
+                        _ => true,
+                    });
+                if !valid {
+                    // Left as written: today's seam refuses it, at the
+                    // point in planning it refuses it today.
+                    None
+                } else {
+                    match line_filter_effect(lf) {
+                        LineFilterEffect::KeepsAll => Some(None),
+                        LineFilterEffect::Filters(std::borrow::Cow::Owned(pruned)) => {
+                            Some(Some(Stage::LineFilter(pruned)))
+                        }
+                        LineFilterEffect::DropsAll
+                        | LineFilterEffect::Filters(std::borrow::Cow::Borrowed(_)) => None,
+                    }
+                }
+            }
+            _ => None,
+        };
+        match (replacement, &mut out) {
+            (Some(next), None) => {
+                let mut v: Vec<Stage> = stages[..i].to_vec();
+                v.extend(next);
+                out = Some(v);
+            }
+            (Some(next), Some(v)) => v.extend(next),
+            (None, Some(v)) => v.push(stage.clone()),
+            (None, None) => {}
+        }
+    }
+    Ok(match out {
+        Some(v) => std::borrow::Cow::Owned(v),
+        None => std::borrow::Cow::Borrowed(stages),
+    })
+}
+
+/// [`effective_pipeline`] over a log query (issue #624, part 7).
+fn effective_log_expr(le: &LogExpr) -> Result<std::borrow::Cow<'_, LogExpr>, ReadError> {
+    Ok(match effective_pipeline(&le.pipeline)? {
+        std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(le),
+        std::borrow::Cow::Owned(pipeline) => std::borrow::Cow::Owned(LogExpr {
+            selector: le.selector.clone(),
+            pipeline,
+        }),
+    })
+}
+
+/// [`effective_pipeline`] over a range aggregation's operand (issue #624,
+/// part 7).
+fn effective_range(range: &LogRange) -> Result<std::borrow::Cow<'_, LogRange>, ReadError> {
+    Ok(match effective_pipeline(&range.selector.pipeline)? {
+        std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(range),
+        std::borrow::Cow::Owned(pipeline) => std::borrow::Cow::Owned(LogRange {
+            selector: LogExpr {
+                selector: range.selector.selector.clone(),
+                pipeline,
+            },
+            ..range.clone()
+        }),
+    })
 }
 
 // NOTE: the file is a `plan_`-prefixed sibling, not `plan/drop_order.rs`.
@@ -9928,6 +10079,311 @@ mod tests {
                     "{query} ({spec:?})"
                 );
             }
+        }
+    }
+
+    // Issue #624, part 7: a line filter that cannot exclude a line is not sent
+    // to the database. T7.1 and T7.2 of its plan.
+    mod true_filter_tests {
+        use super::super::super::params::{Direction, PlanCtx, QueryParams, QuerySpec};
+        use super::super::{Plan, plan};
+
+        /// The patterns the classifier accepts (§A.2's *yes* rows).
+        const YES: &[&str] = &[
+            "",
+            ".*",
+            ".*|.*",
+            ".*||||",
+            ".*?",
+            "|",
+            ".*|",
+            "|.*",
+            "(?i)",
+            "(?s)",
+            "(?i).*",
+            "(?-s).*",
+            "(?s)(?-s).*",
+            "(?:.*)",
+            "(?:)",
+            "(?i:.*)",
+            "(?:(?:.*))",
+            "(?:(?i))",
+        ];
+
+        /// The patterns it refuses (§A.2's *no* rows, `(?x)` aside).
+        const NO: &[&str] = &[
+            "(?s).*",
+            "(?s:.*)",
+            "(?s)(?:.*)",
+            "(?s)|.*",
+            "x{0}|x{0}",
+            "a{0}",
+            ".{0,}",
+            "(?:.)*",
+            "(.*)",
+            "()",
+            "(.*)|()",
+            "(?:.*)*",
+            ".*?|.*",
+            "(?:.*)|.*",
+            "(?:.*|.*)",
+            ".+",
+            "^",
+            "^.*",
+            ".*.*",
+            "().*",
+            "(?:).*",
+            ".*(?:)",
+            "(.)*",
+            r"[^\n]*",
+            ".{0,5}",
+            "foo|",
+            ".*|foo",
+        ];
+
+        fn ctx() -> PlanCtx<'static> {
+            PlanCtx {
+                tenant: Box::leak(Box::new(
+                    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                )),
+                db: "pulsus",
+                streams_idx: "log_streams_idx",
+                streams: "log_streams",
+                samples: "log_samples",
+                rollup_table: "log_metrics_5s",
+                rollup_res_ns: 5_000_000_000,
+                scan_budget_bytes: 1024,
+                max_streams: 100_000,
+                pipeline_scan_factor: 10,
+            }
+        }
+
+        fn range() -> QueryParams {
+            const S: i64 = 1_000_000_000;
+            QueryParams {
+                spec: QuerySpec::Range {
+                    start_ns: 1_800_000 * S,
+                    end_ns: 1_803_600 * S,
+                    step_ns: 60_000_000_000,
+                },
+                limit: 100,
+                direction: Direction::Backward,
+            }
+        }
+
+        /// A pipeline as each stage's `Display`, joined by a space.
+        fn shown(stages: &[pulsus_logql::Stage]) -> String {
+            stages
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        /// The pipeline of `query` as parsed: what "unchanged" means.
+        fn as_written(query: &str) -> String {
+            match pulsus_logql::parse(query).expect("parse") {
+                pulsus_logql::Expr::Log(le) => shown(&le.pipeline),
+                other => panic!("a log query, not {other:?}"),
+            }
+        }
+
+        /// `(line_filters, pipeline)` of a log query's plan, or its error.
+        fn streams(query: &str) -> Result<(Vec<String>, String), String> {
+            let expr = pulsus_logql::parse(query).map_err(|e| format!("parse: {e:?}"))?;
+            match plan(&expr, &range(), &ctx()) {
+                Ok(Plan::Streams(sp)) => Ok((
+                    sp.line_filters
+                        .iter()
+                        .map(|f| f.as_sql().to_string())
+                        .collect(),
+                    shown(&sp.pipeline),
+                )),
+                Ok(_) => Err("not a streams plan".to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+
+        /// What a row expects of `line_filters`.
+        enum Want {
+            Exactly(Vec<&'static str>),
+            /// One fragment, `match(` once: the one regex alternative left.
+            OneMatch,
+            /// One fragment with two disjuncts.
+            TwoDisjuncts,
+            /// One `NOT ((…) OR (…))` fragment.
+            NotTwo,
+        }
+
+        fn check(query: &str, want: &Want, pipeline: &str, failures: &mut Vec<String>) {
+            let (filters, got_pipeline) = match streams(query) {
+                Ok(v) => v,
+                Err(e) => {
+                    failures.push(format!("{query}: refused: {e}"));
+                    return;
+                }
+            };
+            let ok = match want {
+                Want::Exactly(w) => filters.iter().map(String::as_str).eq(w.iter().copied()),
+                Want::OneMatch => filters.len() == 1 && filters[0].matches("match(").count() == 1,
+                Want::TwoDisjuncts => {
+                    filters.len() == 1
+                        && filters[0].starts_with("((")
+                        && filters[0].matches(") OR (").count() == 1
+                }
+                Want::NotTwo => {
+                    filters.len() == 1
+                        && filters[0].starts_with("NOT ((")
+                        && filters[0].matches(") OR (").count() == 1
+                }
+            };
+            if !ok {
+                failures.push(format!("{query}: line_filters {filters:?}"));
+            }
+            if got_pipeline != pipeline {
+                failures.push(format!(
+                    "{query}: pipeline `{got_pipeline}`, expected `{pipeline}`"
+                ));
+            }
+        }
+
+        /// T7.1: the planner removes a filter that keeps every line, prunes such
+        /// an alternative from a positive `or` group, and renders a negative one
+        /// `0`. Every row is checked before the test fails.
+        #[test]
+        fn a_line_filter_that_keeps_every_line_is_not_planned() {
+            let mut failures = Vec::new();
+            let f = &mut failures;
+            let q = |stages: &str| format!(r#"{{a="b"}} {stages}"#);
+            let bt = |p: &str| format!("`{p}`");
+
+            check(&q(r#"|= """#), &Want::Exactly(vec![]), "", f);
+            for p in YES {
+                check(&q(&format!("|~ {}", bt(p))), &Want::Exactly(vec![]), "", f);
+                for query in [
+                    q(&format!(r#"|~ {} or "x""#, bt(p))),
+                    q(&format!(r#"|~ "x" or {}"#, bt(p))),
+                ] {
+                    check(&query, &Want::OneMatch, r#"|~ "x""#, f);
+                }
+                let negative = q(&format!(r#"!~ {} or "a""#, bt(p)));
+                let unchanged = as_written(&negative);
+                check(&negative, &Want::Exactly(vec!["0"]), &unchanged, f);
+            }
+            check(&q(r#"!= """#), &Want::Exactly(vec!["0"]), r#"!= """#, f);
+            check(
+                &q(r#"!~ ".*|.*""#),
+                &Want::Exactly(vec!["0"]),
+                r#"!~ ".*|.*""#,
+                f,
+            );
+            for query in [q(r#"|= "" or "x""#), q(r#"|= "x" or """#)] {
+                check(
+                    &query,
+                    &Want::Exactly(vec!["body LIKE '%x%'"]),
+                    r#"|= "x""#,
+                    f,
+                );
+            }
+            for query in [q(r#"|= "" or """#), q(r#"|~ ".*" or "|""#)] {
+                check(&query, &Want::Exactly(vec![]), "", f);
+            }
+            check(
+                &q(r#"!= "" or "x""#),
+                &Want::Exactly(vec!["0"]),
+                r#"!= "" or "x""#,
+                f,
+            );
+            check(
+                &q(r#"|= "" |= "x""#),
+                &Want::Exactly(vec!["body LIKE '%x%'"]),
+                r#"|= "x""#,
+                f,
+            );
+            check(&q(r#"| json |= """#), &Want::Exactly(vec![]), "| json", f);
+            check(
+                &q(r#"| line_format "{{.m}}" |= """#),
+                &Want::Exactly(vec![]),
+                r#"| line_format "{{.m}}""#,
+                f,
+            );
+            // Controls: every other pattern is evaluated as written.
+            for p in NO {
+                let query = q(&format!("|~ {}", bt(p)));
+                let unchanged = as_written(&query);
+                check(&query, &Want::OneMatch, &unchanged, f);
+                let query = q(&format!(r#"|~ {} or "x""#, bt(p)));
+                let unchanged = as_written(&query);
+                check(&query, &Want::TwoDisjuncts, &unchanged, f);
+            }
+            let query = q(r#"!~ "(?s).*" or "a""#);
+            let unchanged = as_written(&query);
+            check(&query, &Want::NotTwo, &unchanged, f);
+            let query = q(r#"|= ".*""#);
+            let unchanged = as_written(&query);
+            check(
+                &query,
+                &Want::Exactly(vec!["body LIKE '%.*%'"]),
+                &unchanged,
+                f,
+            );
+            let query = q(r#"|= ip("10.0.0.0/8") or """#);
+            let unchanged = as_written(&query);
+            check(&query, &Want::Exactly(vec![]), &unchanged, f);
+            // Guard: `(?x)` is refused before it is classified, as today.
+            for query in [q(r#"|~ "(?x)""#), q(r#"|~ "(?x)" or "y""#)] {
+                match streams(&query) {
+                    Err(e) if e.contains("(?x)") => {}
+                    other => failures.push(format!("{query}: must be refused, got {other:?}")),
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "{} row(s) differ:\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
+        }
+
+        /// T7.2: a counting query over such a filter plans no predicate for it,
+        /// range and instant; a negative one plans `0`.
+        #[test]
+        fn a_counting_query_plans_no_predicate_for_a_filter_that_keeps_every_line() {
+            let instant = QueryParams {
+                spec: QuerySpec::Instant {
+                    at_ns: 1_803_600_000_000_000,
+                },
+                limit: 100,
+                direction: Direction::Backward,
+            };
+            let mut failures = Vec::new();
+            for (query, want) in [
+                (r#"count_over_time({a="b"} |= "" [1m])"#, vec![]),
+                (r#"count_over_time({a="b"} |~ ".*|.*" [1m])"#, vec![]),
+                (r#"count_over_time({a="b"} != "" [1m])"#, vec!["0"]),
+            ] {
+                for (spec, params) in [("range", range()), ("instant", instant)] {
+                    let expr = pulsus_logql::parse(query).expect("parse");
+                    match plan(&expr, &params, &ctx()) {
+                        Ok(Plan::Metric(mp)) => {
+                            let got: Vec<&str> =
+                                mp.extra_predicates.iter().map(|f| f.as_sql()).collect();
+                            if got != want {
+                                failures
+                                    .push(format!("{query} ({spec}): {got:?}, expected {want:?}"));
+                            }
+                        }
+                        Ok(_) => failures.push(format!("{query} ({spec}): not a metric plan")),
+                        Err(e) => failures.push(format!("{query} ({spec}): {e}")),
+                    }
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "{} row(s) differ:\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
         }
     }
 }

@@ -2113,3 +2113,41 @@ fn logfmt_expression_skips_a_renamed_repeat_and_reads_on() {
         );
     }
 }
+
+/// T7.4 (issue #624, part 7): in process, an `or` alternative that keeps
+/// every line is dropped, as the reference drops it, so `|= "" or "x"` keeps
+/// only the lines containing `x`. A lone `|= ""` keeps every line.
+#[test]
+fn an_or_alternative_that_keeps_every_line_is_dropped_in_process() {
+    let stages_of = |query: &str| match pulsus_logql::parse(query).expect("parse") {
+        pulsus_logql::Expr::Log(log) => log.pipeline,
+        other => panic!("expected a log query, not {other:?}"),
+    };
+    let kept = |query: &str, line: &str| {
+        CompiledPipeline::compile_client_side(&stages_of(query))
+            .expect("compiles")
+            .run(line, &base(), 0)
+            .expect("no template budget breach")
+            .is_some()
+    };
+    let mut failures = Vec::new();
+    for (query, line, want) in [
+        (r#"{a="b"} |= "" or "x""#, "axb", true),
+        (r#"{a="b"} |= "" or "x""#, "ayb", false),
+        (r#"{a="b"} |~ ".*|.*" or "x""#, "axb", true),
+        (r#"{a="b"} |~ ".*|.*" or "x""#, "ayb", false),
+        // Guard.
+        (r#"{a="b"} |= """#, "", true),
+        (r#"{a="b"} |= """#, "ayb", true),
+    ] {
+        if kept(query, line) != want {
+            failures.push(format!("{query} over {line:?}: kept is not {want}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} row(s) differ:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}

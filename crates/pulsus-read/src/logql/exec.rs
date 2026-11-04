@@ -3383,7 +3383,7 @@ impl LogQlEngine {
             start_ns: b.start_ns,
             end_ns: b.end_ns,
         };
-        let (sql, routing) = if sp.line_filters.is_empty() {
+        let (sql, routing) = if matches!(expr, Expr::Log(le) if le.pipeline.is_empty()) {
             (
                 super::sql::log_stats_rollup(
                     &self.tenant,
