@@ -433,3 +433,40 @@ fn the_landing_batch_window_is_read_and_bounded_from_env_and_yaml() {
     let _ = std::fs::remove_file(&path);
     support::clear_all();
 }
+
+/// **U3a (issue #18 part 2c): `reader.promql_max_replica_delay` in YAML**:
+/// whole seconds from 1 s to 3600 s, default 5 s. Each load is asserted to
+/// succeed or fail before its value is read.
+#[test]
+fn the_replica_delay_key_takes_whole_seconds_in_range() {
+    let _guard = support::lock_env();
+    support::clear_all();
+    let load = |name: &str, value: Option<&str>| {
+        let yaml = match value {
+            Some(v) => format!("reader:\n  promql_max_replica_delay: {v}\n"),
+            None => "reader: {}\n".to_string(),
+        };
+        let path = support::write_temp_yaml(name, &yaml);
+        let got = pulsus_config::load(Some(&path), None);
+        let _ = std::fs::remove_file(&path);
+        got.map(|c| c.reader.promql_max_replica_delay.0)
+            .map_err(|e| e.to_string())
+    };
+    for (name, value, want) in [
+        ("rd-1s", Some("1s"), 1u64),
+        ("rd-3600s", Some("3600s"), 3600),
+        ("rd-absent", None, 5),
+    ] {
+        let got = load(name, value);
+        assert!(got.is_ok(), "{value:?}: refused: {got:?}");
+        assert_eq!(got, Ok(Duration::from_secs(want)), "{value:?}");
+    }
+    for refused in ["0s", "3601s", "1500ms"] {
+        let got = load(&format!("rd-{refused}"), Some(refused));
+        assert!(
+            got.as_ref()
+                .is_err_and(|e| e.contains("reader.promql_max_replica_delay")),
+            "{refused}: {got:?}"
+        );
+    }
+}

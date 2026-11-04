@@ -108,6 +108,7 @@ clickhouse:
   #traceql_tag_lookback: 20m
   #logql_read_max_memory_bytes: 8589934592
   #promql_read_max_memory_bytes: 8589934592
+  #promql_max_replica_delay: 5s
   #traceql_read_max_memory_bytes: 8589934592
   #query_eval_concurrency: 256
   #tail_poll_interval: 1s

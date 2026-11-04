@@ -384,13 +384,49 @@ e3_dump() {
         done
     done
 }
-retry 240 read_back || {
+# The two hosts of each shard, from the bundle, in form order.
+shard_of() { sed -n 's#.*<shard>\(.*\)</shard>.*#\1#p' "$bundle/nodes/$1/config.d/pulsus-node.xml"; }
+shard_pairs=""
+for s in $(i=0; for ip in $hosts; do i=$((i + 1)); shard_of "$i"; done | sort -u); do
+    pair=""; i=0
+    for ip in $hosts; do
+        i=$((i + 1))
+        if [ "$(shard_of "$i")" = "$s" ]; then pair="${pair:+$pair,}$ip"; fi
+    done
+    shard_pairs="$shard_pairs $pair"
+done
+e3=""
+retry 240 read_back || e3="E3: the sample did not read back"
+[ -n "$e3" ] || echo "setup-cluster: E3 the sample written reads back"
+# E3b: what the write put on one replica reaches the other of its shard.
+on() { curl -sS --fail-with-body --cacert "$ca" -u "pulsus:$PULSUS_CLICKHOUSE_PASSWORD" "https://$1:8443/" --data-binary "$2"; }
+queue_drained() {
+    for ip in $hosts; do
+        [ "$(on "$ip" "SELECT count() FROM system.replication_queue WHERE database = 'pulsus'")" = 0 ] || return 1
+    done
+}
+replicas_agree() {
+    for t in metric_samples metric_series metric_labels metric_label_index; do
+        for pair in $shard_pairs; do
+            a=${pair%,*}; b=${pair#*,}
+            [ "$(on "$a" "SELECT count() FROM pulsus.$t")" = "$(on "$b" "SELECT count() FROM pulsus.$t")" ] || return 1
+        done
+    done
+}
+settled() { queue_drained && replicas_agree; }
+e3b=""
+if ! retry 60 settled; then
+    if ! queue_drained; then e3b="E3b: the replication queue did not drain"
+    else e3b="E3b: the replicas of a shard hold different counts"
+    fi
+fi
+[ -n "$e3b" ] || echo "setup-cluster: E3b each shard's replicas hold the same rows"
+if [ -n "$e3$e3b" ]; then
     e3_dump
     curl -sS "$url/api/v1/query" --data-urlencode 'query=setup_e3_up' >&2 || true
     tail -20 "$work/pulsusdb.log" >&2
-    fail "E3: the sample did not read back"
-}
-echo "setup-cluster: E3 the sample written reads back"
+    fail "$e3${e3:+${e3b:+; }}$e3b"
+fi
 
 # --- E6: no plaintext listener; Keeper answers ruok only over TLS. ------------------
 refused() {

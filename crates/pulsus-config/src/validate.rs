@@ -77,6 +77,19 @@ fn positive_duration(field: &str, d: HumanDuration) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Issue #18 part 2c: `d` is whole seconds from `lo` to `hi` inclusive.
+fn whole_seconds_in(field: &str, d: HumanDuration, lo: u64, hi: u64) -> Result<(), ConfigError> {
+    let d = d.0;
+    if !d.as_millis().is_multiple_of(1000) || d.as_secs() < lo || d.as_secs() > hi {
+        return Err(value_err(
+            field,
+            &format!("{d:?} is not whole seconds from {lo}s to {hi}s"),
+            &format!("{lo}s..={hi}s"),
+        ));
+    }
+    Ok(())
+}
+
 fn positive_bytes(field: &str, b: ByteSize) -> Result<(), ConfigError> {
     if b.0 == 0 {
         return Err(value_err(field, "must be greater than zero", "> 0"));
@@ -936,6 +949,13 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     positive_duration(
         "reader.traceql_tag_lookback",
         cfg.reader.traceql_tag_lookback,
+    )?;
+    // Issue #18 part 2c: 0 s would turn ClickHouse's lag guard off.
+    whole_seconds_in(
+        "reader.promql_max_replica_delay",
+        cfg.reader.promql_max_replica_delay,
+        1,
+        3600,
     )?;
     // Issue #101: a zero eval-concurrency bound would admit no eval at all
     // (the semaphore starts with 0 permits — every query would queue

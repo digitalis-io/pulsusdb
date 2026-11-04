@@ -86,9 +86,18 @@ pub(crate) fn cluster(v: &Validated) -> String {
     out
 }
 
-/// `nodes/<i>/config.d/pulsus-node.xml` for host `i` (from 1).
+/// `nodes/<i>/config.d/pulsus-node.xml` for host `i` (from 1). With TLS
+/// the replicas fetch parts over HTTPS, from the host a replica registers
+/// as `interserver_https_host`, and check its certificate against that
+/// name; unset, the server registers its own hostname, which the
+/// certificate need not hold (issue #18 part 2c r21).
 pub(crate) fn node(v: &Validated, i: usize) -> String {
     let host = xml_text(&v.hosts[i - 1]);
+    let https = if v.tls.is_some() {
+        format!("    <interserver_https_host>{host}</interserver_https_host>\n")
+    } else {
+        String::new()
+    };
     format!(
         "<clickhouse>
     <macros>
@@ -97,7 +106,7 @@ pub(crate) fn node(v: &Validated, i: usize) -> String {
         <cluster>{}</cluster>
     </macros>
     <interserver_http_host>{host}</interserver_http_host>
-</clickhouse>
+{https}</clickhouse>
 ",
         v.shard_of(i),
         xml_text(&v.cluster)

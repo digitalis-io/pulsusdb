@@ -44,7 +44,7 @@
 //! memory with no ceiling at all. Its failure behaviour is unchanged.
 
 use futures::StreamExt;
-use pulsus_clickhouse::ChError;
+use pulsus_clickhouse::{ChError, QuerySettings};
 use pulsus_promql::PromqlError;
 
 use crate::logql::error::{ReadError, TooBroadReason};
@@ -192,6 +192,120 @@ impl std::fmt::Debug for MetricsDispatch {
     }
 }
 
+/// Issue #18 part 2c r20: whether every `IN (` and `NOT IN (` of `sql`,
+/// `GLOBAL` or not, opens a list of literals or a subquery naming no
+/// table (no `FROM` inside it), so each table access in it is checked for
+/// replica lag on its own. The server checks a replica's lag for the
+/// outer table of a Distributed read only, so a subquery over another
+/// table would follow the outer table's choice of host.
+///
+/// It fails closed: `false` also for an `IN` not followed by `(`, an
+/// unbalanced parenthesis or a quote left open. Text inside quotes is not
+/// read as keywords.
+pub(crate) fn one_table_per_access(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    // One entry per open parenthesis: whether it was opened by an `IN`.
+    let mut open: Vec<bool> = Vec::new();
+    let mut after_in = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' || c == b'"' || c == b'`' {
+            // A quoted literal or identifier: `\x` and a doubled quote
+            // stay inside it.
+            i += 1;
+            loop {
+                match b.get(i) {
+                    None => return false,
+                    Some(b'\\') => i += 2,
+                    Some(&q) if q == c && b.get(i + 1) == Some(&c) => i += 2,
+                    Some(&q) if q == c => break,
+                    Some(_) => i += 1,
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if after_in && c != b'(' {
+            return false;
+        }
+        if c == b'(' {
+            open.push(after_in);
+            after_in = false;
+        } else if c == b')' {
+            if open.pop().is_none() {
+                return false;
+            }
+        } else if c.is_ascii_alphanumeric() || c == b'_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let word = &sql[start..i];
+            if word.eq_ignore_ascii_case("IN") {
+                after_in = true;
+            } else if word.eq_ignore_ascii_case("FROM") && open.iter().any(|&by_in| by_in) {
+                return false;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    !after_in && open.is_empty()
+}
+
+/// Issue #18 part 2c r20: the three settings of
+/// [`crate::metrics::exec::lag_guard`], which only a statement
+/// [`one_table_per_access`] recognises keeps.
+const LAG_GUARD_KEYS: [&str; 3] = [
+    "max_replica_delay_for_distributed_queries",
+    "fallback_to_stale_replicas_for_distributed_queries",
+    "prefer_localhost_replica",
+];
+
+/// `settings` for `sql`: unchanged when `sql` is one-table, and otherwise
+/// without the lag guard's three settings, as before issue #18 part 2c.
+fn scoped(sql: &str, settings: &QuerySettings) -> QuerySettings {
+    if one_table_per_access(sql) {
+        return settings.clone();
+    }
+    LAG_GUARD_KEYS
+        .iter()
+        .fold(settings.clone(), |s, key| s.without(key))
+}
+
+/// The settings `fetch_rows_with` sends `sql` with: `settings` scoped by
+/// [`one_table_per_access`] and tagged with the request's `log_comment`.
+pub(crate) fn rows_with_settings(
+    sql: &str,
+    settings: &QuerySettings,
+    log_comment: Option<&str>,
+) -> QuerySettings {
+    tag(scoped(sql, settings), log_comment)
+}
+
+/// The settings `fetch_rows_charged_bytes` sends `sql` with, as
+/// [`rows_with_settings`].
+pub(crate) fn charged_bytes_settings(
+    sql: &str,
+    settings: &QuerySettings,
+    log_comment: Option<&str>,
+) -> QuerySettings {
+    tag(scoped(sql, settings), log_comment)
+}
+
+/// `settings` with `log_comment = comment`, when there is one.
+fn tag(settings: QuerySettings, log_comment: Option<&str>) -> QuerySettings {
+    match log_comment {
+        Some(c) => settings.set("log_comment", c),
+        None => settings,
+    }
+}
+
 /// **Leaf module — its entire contents are the ClickHouse handle, its
 /// constructor and its two legitimate accessors, `fetch_rows_with` and the
 /// exemplar read's `fetch_rows_charged_bytes` (issue #501 part 2), each
@@ -300,14 +414,7 @@ mod leaf {
             if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
                 return Err(ReadError::QueryTooBroad(reason));
             }
-            let tagged;
-            let settings = match &self.log_comment {
-                Some(c) => {
-                    tagged = settings.clone().set("log_comment", c.as_str());
-                    &tagged
-                }
-                None => settings,
-            };
+            let settings = &super::rows_with_settings(&sql, settings, self.log_comment.as_deref());
             let stream: ChRowStream<'_, R> = self
                 .client
                 .query_stream::<R>(&sql, settings)
@@ -336,14 +443,8 @@ mod leaf {
             if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
                 return Err(ReadError::QueryTooBroad(reason));
             }
-            let tagged;
-            let settings = match &self.log_comment {
-                Some(c) => {
-                    tagged = settings.clone().set("log_comment", c.as_str());
-                    &tagged
-                }
-                None => settings,
-            };
+            let settings =
+                &super::charged_bytes_settings(&sql, settings, self.log_comment.as_deref());
             let stream: ChRowStream<'_, R> = self
                 .client
                 .query_stream::<R>(&sql, settings)
@@ -1082,5 +1183,108 @@ mod tests {
             budget.charge(1_000).is_ok(),
             "the three accepted rows' 900 bytes were not given back before T"
         );
+    }
+
+    /// **U8 (issue #18 part 2c r20): only a statement that reads one table
+    /// per access carries the lag guard.** Each case through the
+    /// classifier and both accessors' settings step: a recognised
+    /// statement keeps the three settings, every other one is sent with
+    /// none of them, as before this part.
+    #[test]
+    fn only_a_one_table_statement_carries_the_lag_guard() {
+        use crate::metrics::grouped::{Grid, GroupedOp};
+        use pulsus_model::{Fingerprint, Tenant};
+        const KEYS: [(&str, &str); 3] = [
+            ("max_replica_delay_for_distributed_queries", "7"),
+            ("fallback_to_stale_replicas_for_distributed_queries", "1"),
+            ("prefer_localhost_replica", "1"),
+        ];
+        // (f): the grouped instant statement as the code renders it, with
+        // `the_max_template_renders_this_statement`'s arguments.
+        let grouped = crate::metrics::grouped_sql::grouped_fetch(
+            &Tenant::from_header(None, false).expect("the empty tenant"),
+            "metric_samples_dist",
+            "metric_hist_samples_dist",
+            &[
+                Fingerprint::from_raw(101).sql_literal(),
+                Fingerprint::from_raw(205).sql_literal(),
+                Fingerprint::from_raw(990).sql_literal(),
+            ],
+            &[0, 1, 0],
+            Grid {
+                start_ms: 1_782_907_200_000,
+                step_ms: 15_000,
+                points: 241,
+                lookback_ms: 300_000,
+            },
+            1_782_906_900_000,
+            1_782_910_800_000,
+            GroupedOp::Max,
+        );
+        assert!(grouped.contains("fingerprint IN fps"), "{grouped}");
+        let cases: [(&str, &str, bool); 8] = [
+            (
+                "a",
+                "SELECT fingerprint, unix_milli, value FROM metric_samples_dist \
+                 WHERE fingerprint IN ('1', '2')",
+                true,
+            ),
+            (
+                "b",
+                "SELECT fingerprint, unix_milli, value FROM metric_samples_dist \
+                 WHERE fingerprint IN (SELECT fingerprint FROM metric_series_dist WHERE metric_name = 'm')",
+                false,
+            ),
+            (
+                "c",
+                "SELECT value FROM metric_label_index_dist \
+                 WHERE key = 'k' AND value IN (SELECT value FROM metric_label_values WHERE key = 'k')",
+                false,
+            ),
+            (
+                "d",
+                "SELECT metric_name FROM metric_metadata_dist \
+                 WHERE metric_name GLOBAL IN (SELECT DISTINCT metric_name FROM metric_series_dist WHERE org_id = '')",
+                false,
+            ),
+            (
+                "e",
+                "SELECT fingerprint, unix_milli, value FROM metric_samples_dist \
+                 WHERE fingerprint IN (SELECT toUInt128(arrayJoin(splitByChar(',', '1,2'))))",
+                true,
+            ),
+            ("f", grouped.as_str(), false),
+            (
+                "g",
+                "SELECT fingerprint FROM metric_samples_dist WHERE fingerprint IN (SELECT fingerprint",
+                false,
+            ),
+            (
+                "h",
+                "SELECT fingerprint FROM metric_samples_dist WHERE fingerprint IN metric_series_dist",
+                false,
+            ),
+        ];
+        let base = crate::metrics::exec::lag_guard(QuerySettings::new(), 7);
+        for (case, sql, one_table) in cases {
+            assert_eq!(
+                one_table_per_access(sql),
+                one_table,
+                "({case}) the classifier"
+            );
+            for (step, sent) in [
+                ("fetch_rows_with", rows_with_settings(sql, &base, Some("c"))),
+                (
+                    "fetch_rows_charged_bytes",
+                    charged_bytes_settings(sql, &base, Some("c")),
+                ),
+            ] {
+                assert_eq!(sent.get("log_comment"), Some("c"), "({case}) {step}");
+                for (key, value) in KEYS {
+                    let want = if one_table { Some(value) } else { None };
+                    assert_eq!(sent.get(key), want, "({case}) {step}: {key}");
+                }
+            }
+        }
     }
 }

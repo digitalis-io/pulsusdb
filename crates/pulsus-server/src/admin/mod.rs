@@ -450,6 +450,8 @@ mod tests {
                     "shards": 3,
                     "counterBuckets": 7,
                     "discoveryFailures": 0,
+                    "replicas": [],
+                    "replicasNote": "not yet read",
                 })
             );
 
@@ -481,6 +483,86 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **U4 (issue #18 part 2c): the database view shows replica delay**,
+    /// and `/metrics` carries each pair's delay and whether the latest read
+    /// returned it.
+    #[tokio::test]
+    async fn the_database_view_shows_replica_delay() {
+        use pulsus_read::metrics::rollup::ReplicaDelay;
+        let delay = |host: &str, d: u64| ReplicaDelay {
+            host: host.to_string(),
+            table: "metric_samples_60s".to_string(),
+            absolute_delay: d,
+        };
+        let render = |st: &AppState| {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            metrics::with_local_recorder(&recorder, || {
+                crate::ops::record_replica_metrics(&st.rollup_levels)
+            });
+            handle.render()
+        };
+        let has = |text: &str, line: &str| text.lines().any(|l| l == line);
+        let clustered = || Config {
+            cluster: Some("pulsus_test_cluster".to_string()),
+            ..Config::default()
+        };
+        let st = state(clustered());
+        st.rollup_levels
+            .set_replicas(vec![delay("h1", 3), delay("h2", 0)]);
+        let r = router(&st);
+        let database = get_json(&r, "/admin/api/v1/database").await;
+        assert_eq!(
+            database["replicas"],
+            json!([
+                {"host": "h1", "table": "metric_samples_60s", "absoluteDelaySeconds": 3},
+                {"host": "h2", "table": "metric_samples_60s", "absoluteDelaySeconds": 0}
+            ])
+        );
+        assert_eq!(database["replicasNote"], Value::Null);
+        let page = get_page(&r, "/admin/database").await;
+        assert!(page.contains("<dt>Replica delay</dt>"), "{page}");
+        let text = render(&st);
+        for line in [
+            r#"pulsus_clickhouse_replica_delay_seconds{host="h1",table="metric_samples_60s"} 3"#,
+            r#"pulsus_clickhouse_replica_delay_seconds{host="h2",table="metric_samples_60s"} 0"#,
+            r#"pulsus_clickhouse_replica_seen{host="h1",table="metric_samples_60s"} 1"#,
+            r#"pulsus_clickhouse_replica_seen{host="h2",table="metric_samples_60s"} 1"#,
+        ] {
+            assert!(has(&text, line), "{line:?} not in\n{text}");
+        }
+        st.rollup_levels.set_replicas(vec![delay("h1", 4)]);
+        let database = get_json(&r, "/admin/api/v1/database").await;
+        assert_eq!(
+            database["replicas"],
+            json!([{"host": "h1", "table": "metric_samples_60s", "absoluteDelaySeconds": 4}])
+        );
+        let text = render(&st);
+        for line in [
+            r#"pulsus_clickhouse_replica_delay_seconds{host="h1",table="metric_samples_60s"} 4"#,
+            r#"pulsus_clickhouse_replica_seen{host="h1",table="metric_samples_60s"} 1"#,
+            r#"pulsus_clickhouse_replica_seen{host="h2",table="metric_samples_60s"} 0"#,
+        ] {
+            assert!(has(&text, line), "second read: {line:?} not in\n{text}");
+        }
+        // One node.
+        let one = get_json(&router(&state(Config::default())), "/admin/api/v1/database").await;
+        assert_eq!(one["replicas"], Value::Null);
+        assert_eq!(one["replicasNote"], json!("not clustered"));
+        // A clustered writer.
+        let writer = state(Config {
+            mode: Mode::Writer,
+            ..clustered()
+        });
+        let w = get_json(&router(&writer), "/admin/api/v1/database").await;
+        assert_eq!(w["replicas"], Value::Null);
+        assert_eq!(w["replicasNote"], json!("not read in writer mode"));
+        // A clustered reader before its first read.
+        let fresh = get_json(&router(&state(clustered())), "/admin/api/v1/database").await;
+        assert_eq!(fresh["replicas"], json!([]));
+        assert_eq!(fresh["replicasNote"], json!("not yet read"));
     }
 
     /// B13: a writer reads no levels, and says so.

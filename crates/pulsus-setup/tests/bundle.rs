@@ -165,6 +165,7 @@ const NODE_4: &str = "<clickhouse>
         <cluster>pulsus_cluster</cluster>
     </macros>
     <interserver_http_host>ch4</interserver_http_host>
+    <interserver_https_host>ch4</interserver_https_host>
 </clickhouse>
 ";
 
@@ -552,6 +553,39 @@ fn c8_no_tls() {
             .any(|l| l.starts_with("CLICKHOUSE_SERVERS=ch1:8123,")),
         "{env:?}"
     );
+}
+
+/// **S2 (issue #18 part 2c r21): a bundle without TLS names no HTTPS
+/// replication host.**
+#[test]
+fn a_bundle_without_tls_names_no_https_host() {
+    let files = files(&no_tls());
+    let nodes: Vec<&String> = files
+        .keys()
+        .filter(|p| p.starts_with("nodes/") && p.ends_with("/config.d/pulsus-node.xml"))
+        .collect();
+    assert!(!nodes.is_empty(), "{:?}", files.keys().collect::<Vec<_>>());
+    for path in nodes {
+        let node = file(&files, path);
+        assert!(!node.contains("interserver_https_host"), "{path}: {node}");
+    }
+}
+
+/// **S4 (issue #18 part 2c r21): the TLS step requires each host in its
+/// certificate**, in the Keeper step and in the ClickHouse step.
+#[test]
+fn the_tls_step_requires_the_host_in_the_certificate() {
+    let files = files(&example());
+    let md = file(&files, "setup.md");
+    for id in ["K1", "1"] {
+        assert!(
+            section(md, id).contains(
+                "the certificate must be valid for that host exactly as the form names it"
+            ),
+            "step {id}: {}",
+            section(md, id)
+        );
+    }
 }
 
 /// The text of `setup.md`'s section `### {id}`.

@@ -192,6 +192,9 @@ pub(crate) fn sweep_settings(
     read_max_memory_bytes: u64,
     skip_unavailable_shards: bool,
 ) -> QuerySettings {
+    // Issue #18 part 2c r20: no lag guard. The sweep nests `metric_series`
+    // inside `metric_labels`, and the server checks a replica's lag for
+    // the outer table only, so it keeps the server's replica choice.
     QuerySettings::new()
         .answer_pins(false, skip_unavailable_shards)
         .set("max_memory_usage", read_max_memory_bytes)
