@@ -15696,3 +15696,279 @@ async fn the_explained_counting_statement_is_the_one_that_runs() {
         "the reported statement reads the column:\n{explained}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #624, part 7: a line filter that cannot exclude a line is not sent
+// to the database.
+// ---------------------------------------------------------------------
+
+/// The part 7 fixture: one stream, three lines at `T-30s`, `T-20s` and
+/// `T-10s` with bodies `axb`, `ayb` and `azb` and no metadata, and `T`.
+async fn seed_624p7(name: &str) -> (ChClient, String, i64) {
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p7_{name}_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        701,
+        "c624e",
+        r#"{"app":"e","service_name":"c624e"}"#,
+    )
+    .await;
+    for (body, offset_s) in [("axb", 30i64), ("ayb", 20), ("azb", 10)] {
+        land_line_624(&admin, &db, 701, "c624e", t - offset_s * sec, body, "").await;
+    }
+    (admin, db, t)
+}
+
+/// One log query through an engine built for this run: its entry count.
+async fn log_entries_624p7(
+    db: &str,
+    comment: &str,
+    query: &str,
+    t: i64,
+) -> Result<usize, ReadError> {
+    let engine = LogQlEngine::new(
+        data_client(db).await,
+        engine_config(db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    )
+    .with_query_log_comment(comment.to_string());
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t - 60_000_000_000,
+            end_ns: t,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let (result, _warnings) = engine.query(&parse(query).expect("parse"), &params).await?;
+    let QueryResult::Streams { items, .. } = result else {
+        panic!("{query}: expected streams");
+    };
+    Ok(items.iter().map(|s| s.entries.len()).sum())
+}
+
+/// What a part 7 row requires of the statements it logged.
+enum Logged624p7 {
+    None,
+    /// The same texts and read bytes as L0's.
+    AsL0,
+    /// Every statement reads no row.
+    ReadsNothing,
+    Contains(&'static str, &'static str),
+    Lacks(&'static str),
+}
+
+/// **T7.5 (issue #624, part 7): a filter that keeps every line runs as the
+/// query without it, and one that drops every line reads nothing.** Every
+/// row is checked before the test fails.
+#[tokio::test]
+async fn a_line_filter_that_cannot_exclude_a_line_is_not_sent() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_624p7("t75").await;
+    let s = r#"{service_name="c624e"}"#;
+    let grid = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let stream = vec![
+        ("app".to_string(), "e".to_string()),
+        ("service_name".to_string(), "c624e".to_string()),
+    ];
+    let one = |labels: Vec<(String, String)>, v: f64| -> Vec<AnswerSeries> {
+        vec![(labels, vec![(t, v.to_bits())])]
+    };
+    // (id, range query, answer, statements)
+    let range_rows: Vec<(&str, String, Vec<AnswerSeries>, Logged624p7)> = vec![
+        (
+            "L0",
+            format!("count_over_time({s}[1m])"),
+            one(stream.clone(), 3.0),
+            Logged624p7::None,
+        ),
+        (
+            "L1",
+            format!(r#"count_over_time({s} |= "" [1m])"#),
+            one(stream.clone(), 3.0),
+            Logged624p7::AsL0,
+        ),
+        (
+            "L2",
+            format!(r#"count_over_time({s} |~ ".*|.*" [1m])"#),
+            one(stream.clone(), 3.0),
+            Logged624p7::AsL0,
+        ),
+        (
+            "L3",
+            format!(r#"count_over_time({s} != "" [1m])"#),
+            Vec::new(),
+            Logged624p7::ReadsNothing,
+        ),
+        (
+            "L4",
+            format!(r#"count_over_time({s} |= "" or "x" [1m])"#),
+            one(stream.clone(), 1.0),
+            Logged624p7::Contains("body LIKE '%x%'", "'%%'"),
+        ),
+        (
+            "L5",
+            format!(r#"sum(count_over_time({s} | json |= "" [1m]))"#),
+            one(Vec::new(), 3.0),
+            Logged624p7::Lacks("body"),
+        ),
+        (
+            "L9",
+            format!(
+                r#"count_over_time({s} | line_format "{{{{__line__}}}}" |~ ".*|.*" or "x" [1m])"#
+            ),
+            one(stream.clone(), 1.0),
+            Logged624p7::None,
+        ),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    let mut comments: Vec<(String, String, Logged624p7)> = Vec::new();
+    for (id, query, want, logged) in range_rows {
+        let comment = format!("c624p7-{}", uuid::Uuid::new_v4().simple());
+        match run_624(
+            &db,
+            hooks_624(false, None, None),
+            Some(&comment),
+            &query,
+            &grid,
+        )
+        .await
+        {
+            Ok(got) if got == want => {}
+            other => failures.push(format!(
+                "{id} {query}: answered {other:?}, expected {want:?}"
+            )),
+        }
+        comments.push((id.to_string(), comment, logged));
+    }
+    // L6: the instant.
+    let l6 = format!(r#"count_over_time({s} |= "" [1m])"#);
+    let comment = format!("c624p7-{}", uuid::Uuid::new_v4().simple());
+    match run_instant_624p4(&db, hooks_624(false, None, None), Some(&comment), &l6, t).await {
+        Ok(got) if got == vec![(stream.clone(), 3f64.to_bits())] => {}
+        other => failures.push(format!("L6 {l6}: answered {other:?}, expected 3")),
+    }
+    comments.push(("L6".to_string(), comment, Logged624p7::Lacks("body")));
+    // L7 and L8: the log queries.
+    for (id, query, want, logged) in [
+        (
+            "L7",
+            format!(r#"{s} |= """#),
+            3usize,
+            Logged624p7::Lacks("LIKE"),
+        ),
+        ("L8", format!(r#"{s} != """#), 0, Logged624p7::ReadsNothing),
+    ] {
+        let comment = format!("c624p7-{}", uuid::Uuid::new_v4().simple());
+        match log_entries_624p7(&db, &comment, &query, t).await {
+            Ok(n) if n == want => {}
+            other => failures.push(format!("{id} {query}: {other:?} entries, expected {want}")),
+        }
+        comments.push((id.to_string(), comment, logged));
+    }
+
+    let all: Vec<String> = comments.iter().map(|(_, c, _)| c.clone()).collect();
+    let logged = logged_624(&admin, &all).await;
+    let rows_of = |c: &str| logged.get(c).cloned().unwrap_or_default();
+    let texts = |rows: &[CommentedRow624]| -> Vec<String> {
+        rows.iter()
+            .map(|r| statement_text_624p8(&r.query).to_string())
+            .collect()
+    };
+    let l0 = rows_of(&comments[0].1);
+    for (id, comment, want) in &comments {
+        let rows = rows_of(comment);
+        let ok = match want {
+            Logged624p7::None => true,
+            Logged624p7::AsL0 => {
+                texts(&rows) == texts(&l0)
+                    && rows.iter().map(|r| r.read_bytes).sum::<u64>()
+                        == l0.iter().map(|r| r.read_bytes).sum::<u64>()
+            }
+            Logged624p7::ReadsNothing => !rows.is_empty() && rows.iter().all(|r| r.read_rows == 0),
+            Logged624p7::Contains(has, lacks) => rows
+                .iter()
+                .any(|r| r.query.contains(has) && !r.query.contains(lacks)),
+            Logged624p7::Lacks(lacks) => {
+                !rows.is_empty()
+                    && rows
+                        .iter()
+                        .all(|r| !statement_text_624p8(&r.query).contains(lacks))
+            }
+        };
+        if !ok {
+            failures.push(format!(
+                "{id}: the statements are not as required:\n{}",
+                rows.iter()
+                    .map(|r| format!(
+                        "read_rows {} read_bytes {}\n{}",
+                        r.read_rows,
+                        r.read_bytes,
+                        statement_text_624p8(&r.query)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        for r in &rows {
+            eprintln!(
+                "T7.5 {id}: read_rows {} read_bytes {}",
+                r.read_rows, r.read_bytes
+            );
+        }
+    }
+    drop_db_624(&admin, &db).await;
+    assert!(
+        failures.is_empty(),
+        "{} row(s) differ:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// **T7.6 (issue #624, part 7): `/stats` keeps its exact scan for a line
+/// filter as written**, even one that keeps every line.
+#[tokio::test]
+async fn stats_keep_the_exact_scan_for_a_filter_as_written() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_624p7("t76").await;
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
+    let got = engine
+        .stats_explained(
+            &parse(r#"{service_name="c624e"} |= """#).expect("parse"),
+            pulsus_read::logql::TimeBounds {
+                start_ns: t - 60_000_000_000,
+                end_ns: t,
+            },
+        )
+        .await;
+    drop_db_624(&admin, &db).await;
+    let (stats, explain) = got.expect("stats");
+    assert_eq!((stats.entries, stats.bytes), (3, 9), "{stats:?}");
+    assert_eq!(
+        explain.routing.map(|r| r.chosen),
+        Some(pulsus_read::logql::RouteChoice::Raw),
+        "the exact scan"
+    );
+}

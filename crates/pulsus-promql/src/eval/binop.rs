@@ -562,22 +562,39 @@ struct PairCtx<'a> {
     swapped: bool,
 }
 
-/// Hashes a value with a fixed-seed deterministic hasher (issue #93,
-/// finding 1). Used ONLY to key the many-to-one **output-identity** dedup
-/// set on a 64-bit hash rather than a per-pair full-`Labels` clone — the
-/// exact analogue of upstream's `insertSig := metric.Hash()` (engine.go @
-/// 40af9c2 L3258), where a 64-bit collision is likewise accepted. The
-/// SIGNATURE-level dedup does NOT use this: it keys on the full
-/// [`MatchKey`] (collision-free), mirroring upstream's collision-free
-/// `sigOrdinal` — see [`MatchState`]. `DefaultHasher::new` is fixed-seed
-/// (not the randomized `RandomState`), so the same identity always hashes
-/// the same within a run; determinism across runs is irrelevant here (each
-/// set lives one `vector_vector` call).
-fn identity_hash<T: std::hash::Hash>(v: &T) -> u64 {
-    use std::hash::Hasher;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    v.hash(&mut h);
-    h.finish()
+/// Issue #579 part 5: the reference's 64-bit key of an output identity —
+/// `xxHash64` over each label with a value, `__name__` included when the
+/// name is set, sorted by name, each written as its length and its bytes
+/// (a length under 255 one byte, else `0xFF` and three bytes little-endian).
+pub(crate) fn reference_identity_key(labels: &Labels, metric_name: Option<&str>) -> u64 {
+    let mut pairs: Vec<(&str, &str)> = labels
+        .0
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    if let Some(name) = metric_name.filter(|n| !n.is_empty()) {
+        pairs.push(("__name__", name));
+    }
+    pairs.sort_unstable();
+    let mut bytes = Vec::new();
+    for (k, v) in pairs {
+        for part in [k, v] {
+            let n = part.len();
+            if n < 255 {
+                bytes.push(n as u8);
+            } else {
+                bytes.extend_from_slice(&[
+                    255,
+                    (n & 255) as u8,
+                    ((n >> 8) & 255) as u8,
+                    ((n >> 16) & 255) as u8,
+                ]);
+            }
+            bytes.extend_from_slice(part.as_bytes());
+        }
+    }
+    xxhash_rust::xxh64::xxh64(&bytes, 0)
 }
 
 /// Match-signature bookkeeping + output accumulator for one
@@ -600,7 +617,7 @@ fn identity_hash<T: std::hash::Hash>(v: &T) -> u64 {
 /// So the SIGNATURE dedup keys on the full [`MatchKey`] here (collision-free
 /// equality — our per-call analogue of upstream's per-series `sigOrdinal`),
 /// and ONLY the inner output-identity set uses the 64-bit
-/// [`identity_hash`] (upstream `metric.Hash()`).
+/// [`reference_identity_key`] (upstream `metric.Hash()`).
 ///
 /// **Issue #93 (finding 1 — range-binop allocation reclaim), round-2
 /// correction:** the profiled hotspot was the per-(step × many-side series)
@@ -740,6 +757,10 @@ fn emit_pair(
         }
     }
 
+    // Issue #579 part 5 (B4a): the reference removes an empty-valued
+    // label from every result before its identity and the aggregate.
+    labels.0.retain(|(_, v)| !v.is_empty());
+
     // Duplicate detection — BEFORE the keep filter (upstream registers the
     // signature/identity even for a filtered-out comparison). Issue #93
     // (finding 1) + round-2 review: the SIGNATURE key is the full
@@ -747,7 +768,7 @@ fn emit_pair(
     // the FIRST sight of each distinct signature — never per matched pair,
     // so the per-cell full-`Labels` clone the profile pinned stays gone.
     // The INNER many-to-one output-identity set keeps the 64-bit
-    // [`identity_hash`] (upstream `metric.Hash()`, collision-accepted).
+    // [`reference_identity_key`] (upstream `metric.Hash()`, collision-accepted).
     if one_to_one {
         if state.one_to_one_matched.contains(key) {
             return Err(PromqlError::BadMatching {
@@ -758,7 +779,7 @@ fn emit_pair(
         }
         state.one_to_one_matched.insert(key.clone());
     } else {
-        let out_hash = identity_hash(&(&labels, &metric_name));
+        let out_hash = reference_identity_key(&labels, metric_name.as_deref());
         let inserted = match state.many_matched.get_mut(key) {
             Some(set) => set.insert(out_hash),
             None => {
@@ -3104,5 +3125,138 @@ mod tests {
         assert_eq!(out[0].metric_name.as_deref(), Some("test_metric"));
         assert!(!out[0].drop_name);
         assert!(annos.is_empty());
+    }
+
+    // -- issue #579 part 5: the reference's identity key, empty labels
+
+    /// **U4 (issue #579 part 5): the identity key is the reference's**:
+    /// `xxHash64` of the reference's default label encoding.
+    #[test]
+    fn the_identity_key_is_the_references() {
+        let l = |pairs: &[(&str, &str)]| {
+            Labels::new(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+        };
+        let x254 = "x".repeat(254);
+        let x255 = "x".repeat(255);
+        let x300 = "x".repeat(300);
+        let cases: [(Labels, Option<&str>, u64); 9] = [
+            (
+                l(&[("device", "d0"), ("instance", "i0")]),
+                Some("q_one_total"),
+                10_862_058_126_096_718_055,
+            ),
+            (
+                l(&[("device", "d1"), ("instance", "i2"), ("role", "m")]),
+                None,
+                11_498_421_115_328_139_097,
+            ),
+            (
+                l(&[("__unit__", "bytes"), ("instance", "i3")]),
+                None,
+                303_765_800_756_503_461,
+            ),
+            (l(&[]), None, 17_241_709_254_077_376_921),
+            (l(&[("a", ""), ("b", "y")]), None, 8_496_399_924_857_557_067),
+            (l(&[("é", "v")]), None, 16_833_172_124_303_451_532),
+            (l(&[("a", &x254)]), None, 15_390_423_940_348_798_586),
+            (l(&[("a", &x255)]), None, 7_843_869_350_762_009_678),
+            (
+                l(&[("a", &x300), ("b", "é")]),
+                None,
+                2_939_218_523_603_856_172,
+            ),
+        ];
+        for (labels, name, want) in &cases {
+            assert_eq!(
+                reference_identity_key(labels, *name),
+                *want,
+                "{labels:?} {name:?}"
+            );
+        }
+        assert_eq!(
+            reference_identity_key(&l(&[("a", ""), ("b", "y")]), None),
+            reference_identity_key(&l(&[("b", "y")]), None),
+            "an empty value is removed before the key"
+        );
+    }
+
+    /// **U5 (issue #579 part 5): a binary result drops its empty-valued
+    /// labels**, before its identity is checked.
+    #[test]
+    fn a_binary_result_drops_its_empty_labels() {
+        let m = sample(&[("i", "x"), ("a", "")], 1.0);
+        let o = sample(&[("i", "x")], 1.0);
+        let out = vv_group(
+            BinOp::Mul,
+            false,
+            &on(&["i"]),
+            &group_left(&[]),
+            std::slice::from_ref(&m),
+            std::slice::from_ref(&o),
+        )
+        .expect("one match");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            out[0].labels,
+            Labels::new([("i".to_string(), "x".to_string())])
+        );
+        assert_eq!(out[0].v, 1.0);
+        let err = vv_group(
+            BinOp::Mul,
+            false,
+            &on(&["i"]),
+            &group_left(&[]),
+            &[m.clone(), sample(&[("i", "x")], 2.0)],
+            std::slice::from_ref(&o),
+        );
+        assert!(
+            err.as_ref().is_err_and(|e| e
+                .to_string()
+                .contains("grouping labels must ensure unique matches")),
+            "{err:?}"
+        );
+        let out = vv(
+            BinOp::Add,
+            false,
+            &on(&["i", "a"]),
+            std::slice::from_ref(&m),
+            &[sample(&[("i", "x"), ("a", "")], 1.0)],
+        )
+        .expect("one-to-one");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            out[0].labels,
+            Labels::new([("i".to_string(), "x".to_string())])
+        );
+    }
+
+    /// **U4b (issue #579 part 5, review r1): the evaluator keys an output
+    /// identity by the reference's key** — the key `emit_pair` stores for
+    /// a `group_left` pair is U4's for the same labels and name.
+    #[test]
+    fn the_evaluator_stores_the_references_identity_key() {
+        let matching = on(&["instance"]);
+        let include: Vec<String> = Vec::new();
+        let ctx = PairCtx {
+            op: BinOp::Gt,
+            bool_modifier: false,
+            matching: &matching,
+            include: Some(&include),
+            swapped: false,
+        };
+        let mut state = MatchState {
+            one_to_one_matched: HashSet::new(),
+            many_matched: HashMap::new(),
+            out: Vec::new(),
+        };
+        let ls = named_sample("q_one_total", &[("device", "d0"), ("instance", "i0")], 2.0);
+        let rs = named_sample("q_peer_total", &[("instance", "i0")], 1.0);
+        let key = matching_key(&ls.labels, &ls.metric_name, &matching);
+        emit_pair(&ctx, &mut state, &ls, &rs, &key, 0, &mut Annotations::new()).expect("one pair");
+        assert_eq!(
+            state.many_matched.get(&key),
+            Some(&HashSet::from([10_862_058_126_096_718_055u64])),
+            "the stored key is the reference's for {{device=\"d0\", instance=\"i0\"}} named q_one_total"
+        );
     }
 }

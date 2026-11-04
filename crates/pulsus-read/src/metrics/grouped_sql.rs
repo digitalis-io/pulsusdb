@@ -1126,11 +1126,204 @@ pub fn level_aggregate_fetch(
     aggregate_over(grid, op, &inner, hist_samples_table, &sentinel)
 }
 
+/// Issue #579 part 5: the key of S3c's matching sentinel row — a step at
+/// which today's evaluator raises a matching error. No series' labels make
+/// it, as [`HISTOGRAM_SENTINEL_KEY`].
+pub const MATCH_SENTINEL_KEY: &str = "CAST([('', 'match')], 'Array(Tuple(String, String))')";
+
+/// Issue #579 part 5: shape C with `on`, `ignoring` or `group_*`, one time
+/// chunk (S3c), its sides in `(many, one)` order: `(lhs, rhs)`, or `(rhs,
+/// lhs)` under `group_right`. Both sides' step rows are grouped by
+/// `(signature, step)`; a step at which today's evaluator raises a matching
+/// error gives the matching sentinel row instead of its outputs (plan
+/// section 5, E1-E3), and every output drops its empty-valued labels.
+#[allow(clippy::too_many_arguments)]
+pub fn match_aggregate_fetch(
+    many: &SideSql<'_>,
+    one: &SideSql<'_>,
+    hist_samples_table: &str,
+    grouping: Option<&Grouping>,
+    grid: Grid,
+    op: RangeAggOp,
+    bin: BinOp,
+    bool_modifier: bool,
+    spec: &super::grouped::MatchSpec,
+) -> String {
+    use pulsus_promql::Group;
+    let list = |labels: &[String]| {
+        labels
+            .iter()
+            .map(|l| ch_string(l))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let labels = list(&spec.labels);
+    let sig = |name: &str| {
+        if spec.on && spec.labels.iter().any(|l| l == "__name__") {
+            format!(
+                "arrayConcat(arrayFilter(k -> k.1 IN ({labels}), m.kv), [('__name__', {})])",
+                ch_string(name)
+            )
+        } else if spec.on {
+            format!("arrayFilter(k -> k.1 IN ({labels}), m.kv)")
+        } else {
+            format!("arrayFilter(k -> k.1 NOT IN ({labels}), m.kv)")
+        }
+    };
+    let (right, include) = match &spec.group {
+        Group::OneToOne => (false, None),
+        Group::Left(i) => (false, Some(i)),
+        Group::Right(i) => (true, Some(i)),
+    };
+    let (l, r) = if right {
+        ("one[1].2", "x.2")
+    } else {
+        ("x.2", "one[1].2")
+    };
+    let cmp = match bin {
+        BinOp::Eq => Some("="),
+        BinOp::Ne => Some("!="),
+        BinOp::Gt => Some(">"),
+        BinOp::Lt => Some("<"),
+        BinOp::Ge => Some(">="),
+        BinOp::Le => Some("<="),
+        _ => None,
+    };
+    let (val, keep) = match cmp {
+        None => {
+            let arith = match bin {
+                BinOp::Add => "+",
+                BinOp::Sub => "-",
+                BinOp::Mul => "*",
+                _ => "/",
+            };
+            (format!("{l} {arith} {r}"), "1".to_string())
+        }
+        Some(c) if bool_modifier => (format!("toFloat64({l} {c} {r})"), "1".to_string()),
+        Some(c) => (l.to_string(), format!("{l} {c} {r}")),
+    };
+    let arith = cmp.is_none();
+    // Each label list is built as a vector and joined, so a list never
+    // renders empty or with a leading comma. An include list holding only
+    // `__name__` takes the empty list's form: the name is `{IDNAME}`'s.
+    let kept = include.map(|i| {
+        i.iter()
+            .filter(|l| *l != "__name__")
+            .map(|l| ch_string(l))
+            .collect::<Vec<_>>()
+    });
+    let outkv = match &kept {
+        None if arith => {
+            "arrayFilter(k -> k.1 NOT IN ('__name__', '__type__', '__unit__'), sig)".to_string()
+        }
+        None => "arrayFilter(k -> k.1 != '__name__', sig)".to_string(),
+        Some(inc) if inc.is_empty() && arith => {
+            "arrayFilter(k -> k.1 NOT IN ('__type__', '__unit__'), x.3)".to_string()
+        }
+        Some(inc) if inc.is_empty() => "x.3".to_string(),
+        Some(inc) => {
+            let mut removed = inc.clone();
+            if arith {
+                removed.extend(["'__type__'".to_string(), "'__unit__'".to_string()]);
+            }
+            format!(
+                "arraySort(arrayConcat(arrayFilter(k -> k.1 NOT IN ({}), x.3), \
+                 arrayFilter(k -> k.1 IN ({}) AND k.2 != '', one[1].3)))",
+                removed.join(", "),
+                inc.join(", ")
+            )
+        }
+    };
+    let outkv = format!("arrayFilter(k -> k.2 != '', {outkv})");
+    let e1 = "(length(one) >= 2 AND any_many = 1)";
+    let bad = match include {
+        None => format!("{e1} OR (length(many) >= 2 AND notEmpty(one))"),
+        Some(i) => {
+            let idname = if i.iter().any(|l| l == "__name__") {
+                format!("[('__name__', {})]", ch_string(one.metric_name))
+            } else if !arith {
+                format!("[('__name__', {})]", ch_string(many.metric_name))
+            } else {
+                "CAST([], 'Array(Tuple(String, String))')".to_string()
+            };
+            let enc = |e: &str| {
+                format!(
+                    "if(length({e}) < 255, concat(char(length({e})), {e}), concat(char(255), \
+                     char(length({e}) % 256), char(intDiv(length({e}), 256) % 256), \
+                     char(intDiv(length({e}), 65536) % 256), {e}))"
+                )
+            };
+            let idkey = format!(
+                "xxHash64(arrayStringConcat(arrayMap(k -> concat({}, {}), arraySort(arrayConcat({outkv}, {idname})))))",
+                enc("k.1"),
+                enc("k.2")
+            );
+            format!(
+                "{e1} OR (length(one) = 1 AND length(arrayDistinct(arrayMap(x -> {idkey}, many))) < length(many))"
+            )
+        }
+    };
+    let gkey = group_key_over(grouping, &outkv);
+    let out = format!(
+        "if(length(one) = 1, arrayMap(x -> ({gkey}, x.1, {val}), arrayFilter(x -> {keep}, many)), \
+         CAST([], 'Array(Tuple(Array(Tuple(String, String)), UInt64, Float64))'))"
+    );
+    let inner = format!(
+        "    SELECT o.1 AS gid, o.2 AS rank, gi, o.3 AS v
+    FROM (
+      SELECT gi, sig, many, one, any_many, {bad} AS bad
+      FROM (
+        SELECT sig, gi, many, one, max(notEmpty(many)) OVER (PARTITION BY gi) AS any_many
+        FROM (
+          SELECT sig, gi,
+            groupArrayIf((rank, v, kv), side = 0) AS many,
+            groupArrayIf((rank, v, kv), side = 1) AS one
+          FROM (
+            SELECT toUInt8(0) AS side, s.gi AS gi, m.rank AS rank, s.v AS v, m.kv AS kv, {} AS sig
+            FROM (
+{}
+            ) AS s
+            INNER JOIN (
+{}
+            ) AS m USING (fingerprint)
+            UNION ALL
+            SELECT toUInt8(1) AS side, s.gi AS gi, m.rank AS rank, s.v AS v, m.kv AS kv, {} AS sig
+            FROM (
+{}
+            ) AS s
+            INNER JOIN (
+{}
+            ) AS m USING (fingerprint)
+          )
+          GROUP BY sig, gi
+        )
+      )
+    )
+    ARRAY JOIN if(bad, [({MATCH_SENTINEL_KEY}, toUInt64(0), nan)], {out}) AS o",
+        sig(many.metric_name),
+        series_steps(many, grid),
+        members(many),
+        sig(one.metric_name),
+        series_steps(one, grid),
+        members(one),
+    );
+    // S3b's histogram condition, its sides in written order.
+    let (lhs, rhs) = if right { (one, many) } else { (many, one) };
+    let sentinel = format!(
+        "org_id = {} AND (({}) OR ({}))",
+        lhs.tenant.sql_literal(),
+        side_histograms(lhs),
+        side_histograms(rhs)
+    );
+    aggregate_over(grid, op, &inner, hist_samples_table, &sentinel)
+}
+
 /// Issue #579 part 4: shape C, one time chunk (S3b): both sides' steps,
 /// their series paired by label set, the operator, and the aggregate over
 /// the left member's rank. Arithmetic drops `__type__`/`__unit__` from the
 /// output labels; a comparison keeps them, filtering on its result or,
-/// under `bool`, answering it.
+/// under `bool`, answering it. Issue #579 part 5: every output drops its
+/// empty-valued labels, as the reference's result builder does.
 #[allow(clippy::too_many_arguments)]
 pub fn join_aggregate_fetch(
     lhs: &SideSql<'_>,
@@ -1161,13 +1354,17 @@ pub fn join_aggregate_fetch(
         None => (
             format!("l.v {arith} r.v"),
             String::new(),
-            "arrayFilter(kv -> kv.1 NOT IN ('__type__', '__unit__'), lm.kv)",
+            "arrayFilter(k -> k.2 != '', arrayFilter(kv -> kv.1 NOT IN ('__type__', '__unit__'), lm.kv))",
         ),
-        Some(c) if bool_modifier => (format!("toFloat64(l.v {c} r.v)"), String::new(), "lm.kv"),
+        Some(c) if bool_modifier => (
+            format!("toFloat64(l.v {c} r.v)"),
+            String::new(),
+            "arrayFilter(k -> k.2 != '', lm.kv)",
+        ),
         Some(c) => (
             "l.v".to_string(),
             format!("\n    WHERE l.v {c} r.v"),
-            "lm.kv",
+            "arrayFilter(k -> k.2 != '', lm.kv)",
         ),
     };
     let inner = format!(
@@ -2024,5 +2221,242 @@ mod tests {
             ),
             join_section("count without (device) (rate > bool irate)")
         );
+        // Issue #579 part 5, U6: the filtering comparison's arm.
+        assert_eq!(
+            join_aggregate_fetch(
+                &rx,
+                &tx_irate,
+                "metric_hist_samples",
+                without_device.as_ref(),
+                t11_grid(),
+                RangeAggOp::Count,
+                BinOp::Gt,
+                false,
+            ),
+            join_section("count without (device) (rate > irate)")
+        );
+    }
+
+    /// **U9 (issue #579 part 5, after #18 part 2c): a match statement over
+    /// two cache-answered sides reads one table per access**, so 2c's lag
+    /// guard stays on it; with a side the cache did not answer it does not.
+    #[test]
+    fn a_known_match_statement_is_one_table() {
+        use super::super::grouped::MatchSpec;
+        use crate::metrics::dispatch::one_table_per_access;
+        use pulsus_model::{Fingerprint, LabelSet};
+        use pulsus_promql::Group;
+        let labels = LabelSet::from_verbatim(
+            [("instance", "i0"), ("role", "")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        let members = members_known(&[
+            (Fingerprint::from_raw(101).sql_literal(), &labels),
+            (Fingerprint::from_raw(205).sql_literal(), &labels),
+        ]);
+        let ids = t11_ids("p_tx_total");
+        fn side<'a>(name: &'static str, series: SideSeries<'a>) -> SideSql<'a> {
+            SideSql {
+                tenant: Box::leak(Box::new(no_tenant())),
+                samples_table: "metric_samples",
+                labels_table: "metric_labels",
+                series,
+                metric_name: name,
+                func: PushedRangeFn::Rate,
+                range_ms: 300_000,
+                scale: None,
+                window: T11_WINDOW,
+                level: Some(t11_level()),
+            }
+        }
+        let known = |name: &'static str| {
+            side(
+                name,
+                SideSeries::Known {
+                    list: "'101', '205'",
+                    members: &members,
+                },
+            )
+        };
+        let (rx, tx) = (known("p_rx_total"), known("p_tx_total"));
+        let tx_ids = side("p_tx_total", SideSeries::Ids(&ids));
+        let strs = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let matches = [
+            (
+                "* on () group_left (role)",
+                BinOp::Mul,
+                MatchSpec {
+                    on: true,
+                    labels: Vec::new(),
+                    group: Group::Left(strs(&["role"])),
+                },
+            ),
+            (
+                "> ignoring (a, b)",
+                BinOp::Gt,
+                MatchSpec {
+                    on: false,
+                    labels: strs(&["a", "b"]),
+                    group: Group::OneToOne,
+                },
+            ),
+        ];
+        for (what, bin, spec) in &matches {
+            for (sides, (many, one), want) in [
+                ("both known", (&rx, &tx), true),
+                ("one by ID", (&rx, &tx_ids), false),
+            ] {
+                let sql = match_aggregate_fetch(
+                    many,
+                    one,
+                    "metric_hist_samples",
+                    None,
+                    t11_grid(),
+                    RangeAggOp::Sum,
+                    *bin,
+                    false,
+                    spec,
+                );
+                assert_eq!(one_table_per_access(&sql), want, "{what}, {sides}:\n{sql}");
+            }
+        }
+    }
+
+    /// **U2 (issue #579 part 5): the match statement renders the plan's
+    /// text**: section 6's `MATCHED` with each placeholder substituted, its
+    /// sides' `SERIES_STEPS` and `MEMBERS` part 4's builders, inside part
+    /// 4's aggregate with S3b's histogram condition.
+    #[test]
+    fn the_match_statement_renders_the_plans_text() {
+        use super::super::grouped::MatchSpec;
+        use pulsus_promql::Group;
+        let tenant = no_tenant();
+        let (rx_ids, tx_ids) = (t11_ids("p_rx_total"), t11_ids("p_tx_total"));
+        let side =
+            |name: &'static str, ids: &'static str, level: Option<LevelRead<'static>>| SideSql {
+                tenant: Box::leak(Box::new(no_tenant())),
+                samples_table: "metric_samples",
+                labels_table: "metric_labels",
+                series: SideSeries::Ids(ids),
+                metric_name: name,
+                func: PushedRangeFn::Rate,
+                range_ms: 300_000,
+                scale: None,
+                window: T11_WINDOW,
+                level,
+            };
+        let rx_ids: &'static str = Box::leak(rx_ids.into_boxed_str());
+        let tx_ids: &'static str = Box::leak(tx_ids.into_boxed_str());
+        let rx = side("p_rx_total", rx_ids, Some(t11_level()));
+        let tx = side("p_tx_total", tx_ids, Some(t11_level()));
+        let (rx_raw, tx_raw) = (
+            side("p_rx_total", rx_ids, None),
+            side("p_tx_total", tx_ids, None),
+        );
+        let strs = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let on = |labels: &[&str], group: Group| MatchSpec {
+            on: true,
+            labels: strs(labels),
+            group,
+        };
+        let cases = [
+            (
+                "S3c (a) sum by (instance) (rate + on (instance) rate)",
+                (&rx, &tx, &rx, &tx),
+                grouping_of("by (instance)"),
+                RangeAggOp::Sum,
+                BinOp::Add,
+                false,
+                on(&["instance"], Group::OneToOne),
+            ),
+            (
+                "S3c (b) max without (device) (rate > on (instance) group_left (role) rate)",
+                (&rx, &tx, &rx, &tx),
+                grouping_of("without (device)"),
+                RangeAggOp::Max,
+                BinOp::Gt,
+                false,
+                on(&["instance"], Group::Left(strs(&["role"]))),
+            ),
+            (
+                "S3c (c) sum (rate / on (instance) group_right rate), raw",
+                (&tx_raw, &rx_raw, &rx_raw, &tx_raw),
+                None,
+                RangeAggOp::Sum,
+                BinOp::Div,
+                false,
+                on(&["instance"], Group::Right(Vec::new())),
+            ),
+            (
+                "S3c (d) sum by (instance) (rate != on (instance) rate)",
+                (&rx, &tx, &rx, &tx),
+                grouping_of("by (instance)"),
+                RangeAggOp::Sum,
+                BinOp::Ne,
+                false,
+                on(&["instance"], Group::OneToOne),
+            ),
+            (
+                "S3c (e) count (rate >= bool on (__name__, instance) group_left (__name__, role) rate)",
+                (&rx, &tx, &rx, &tx),
+                None,
+                RangeAggOp::Count,
+                BinOp::Ge,
+                true,
+                on(
+                    &["__name__", "instance"],
+                    Group::Left(strs(&["__name__", "role"])),
+                ),
+            ),
+            // Review r1, finding 1: `__name__` the only include label.
+            (
+                "S3c (f) sum (rate * on (instance) group_left (__name__) rate)",
+                (&rx, &tx, &rx, &tx),
+                None,
+                RangeAggOp::Sum,
+                BinOp::Mul,
+                false,
+                on(&["instance"], Group::Left(strs(&["__name__"]))),
+            ),
+            (
+                "S3c (g) sum (rate * on (instance) group_right (__name__) rate)",
+                (&tx, &rx, &rx, &tx),
+                None,
+                RangeAggOp::Sum,
+                BinOp::Mul,
+                false,
+                on(&["instance"], Group::Right(strs(&["__name__"]))),
+            ),
+        ];
+        for (key, (many, one, lhs, rhs), grouping, op, bin, bool_modifier, spec) in &cases {
+            let matched = join_section(key)
+                .replace("{SERIES_STEPS(M)}", &series_steps(many, t11_grid()))
+                .replace("{MEMBERS(M)}", &members(many))
+                .replace("{SERIES_STEPS(O)}", &series_steps(one, t11_grid()))
+                .replace("{MEMBERS(O)}", &members(one));
+            let sentinel = format!(
+                "org_id = {} AND (({}) OR ({}))",
+                tenant.sql_literal(),
+                side_histograms(lhs),
+                side_histograms(rhs)
+            );
+            let want = aggregate_over(t11_grid(), *op, &matched, "metric_hist_samples", &sentinel);
+            assert_eq!(
+                match_aggregate_fetch(
+                    many,
+                    one,
+                    "metric_hist_samples",
+                    grouping.as_ref(),
+                    t11_grid(),
+                    *op,
+                    *bin,
+                    *bool_modifier,
+                    spec,
+                ),
+                want,
+                "{key}"
+            );
+        }
     }
 }
