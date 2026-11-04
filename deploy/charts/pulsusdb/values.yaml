@@ -81,7 +81,7 @@ pulsusdb:
     host: 0.0.0.0
     port: 3100
     log_level: info
-    compat_endpoints: false
+    compat_endpoints: true
     # -- CORS allowed origin. Empty string disables CORS (secure default).
     # Set to `"*"` only for development/testing environments.
     cors_origin: ""
@@ -346,11 +346,9 @@ otelCollector:
 
 grafana:
   # -- Parity with `deploy/e2e/grafana/provisioning/datasources/loki.yaml`;
-  # off by default because the datasource only works when
-  # `pulsusdb.config.compat_endpoints=true` (docs/configuration.md §1,
-  # docs/api.md §8) — NOTES.txt/README call this coupling out.
+  # enabled by default alongside `pulsusdb.config.compat_endpoints=true`.
   datasourceProvisioning:
-    enabled: false
+    enabled: true
 
 serviceAccount:
   create: true

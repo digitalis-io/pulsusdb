@@ -67,7 +67,7 @@ data:
       server: pulsusdb-clickhouse
       tls_skip_verify: false
     cluster: null
-    compat_endpoints: false
+    compat_endpoints: true
     cors_origin: ""
     dist_suffix: _dist
     host: 0.0.0.0
@@ -93,6 +93,32 @@ data:
       batch_ms: 200
       ingest_queue_bytes: 256MiB
       insert_mode: sync
+
+---
+# Source: pulsusdb/templates/grafana-datasource-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulsusdb-grafana-datasource
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: pulsusdb
+    grafana_datasource: "1"
+data:
+  pulsusdb-loki.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: PulsusDB (Loki compat)
+        uid: pulsusdb-loki
+        type: loki
+        access: proxy
+        url: http://pulsusdb:3100
+        isDefault: false
+        editable: false
 
 ---
 # Source: pulsusdb/templates/otel-collector-configmap.yaml
@@ -244,7 +270,7 @@ spec:
         app.kubernetes.io/part-of: pulsusdb
         app.kubernetes.io/component: all
       annotations:
-        checksum/config: abbba936ee7c5a9c0e581c716eb4f8fa524bb2b4232f20248bd37de402f74a1e
+        checksum/config: 0989d25d240236732bf9904771f9dfdfc8976aecccb12e04e048682828e64c60
         checksum/secret: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
     spec:
       terminationGracePeriodSeconds: 60
