@@ -269,10 +269,10 @@
         "enabled": { "type": "boolean" }
       }
     },
-    "grafanaOperator": {
+    "grafana-operator": {
       "type": "object",
       "additionalProperties": true,
-      "description": "Values passed to the grafana-operator subchart when grafanaOperator.enabled=true. See https://artifacthub.io/packages/helm/grafana/grafana-operator for full values reference.",
+      "description": "Values passed to the grafana-operator subchart when grafana-operator.enabled=true. See https://artifacthub.io/packages/helm/grafana/grafana-operator for full values reference.",
       "properties": {
         "enabled": { "type": "boolean" }
       }

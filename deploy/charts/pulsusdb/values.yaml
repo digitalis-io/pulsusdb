@@ -467,5 +467,5 @@ networkPolicy:
 # -- Optional grafana-operator dependency (Chart.yaml `dependencies` entry).
 # When enabled, the grafana-operator is installed alongside pulsusdb so
 # GrafanaDashboard/GrafanaDataSource CRDs can be managed in the same release.
-grafanaOperator:
+grafana-operator:
   enabled: false

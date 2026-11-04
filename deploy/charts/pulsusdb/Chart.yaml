@@ -36,10 +36,9 @@ maintainers:
     url: https://digitalis.io
 dependencies:
   - name: grafana-operator
-    alias: grafanaOperator
     version: ">=5.0.0-0"
     repository: https://grafana.github.io/helm-charts
-    condition: grafanaOperator.enabled
+    condition: grafana-operator.enabled
 
 annotations:
   # OCI publish parity with .github/workflows/release.yml's image labels
