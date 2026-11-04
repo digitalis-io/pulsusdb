@@ -1,7 +1,8 @@
 # Releasing
 
 How to cut a PulsusDB release: publishing a versioned container image to
-GHCR. This is the procedure `.github/workflows/release.yml` (issue #23)
+GHCR, and attaching the server binary and native OS packages to a GitHub
+Release (§7). This is the procedure `.github/workflows/release.yml` (issue #23)
 automates once a `v*` tag is pushed — there is no separate "release" button
 or draft-release step; the tag *is* the release trigger.
 
@@ -52,10 +53,12 @@ SBOM/provenance attestation (issue #44) bind that merged-index digest, never a
 mutable tag.
 
 A build-only dry-run is available via the workflow's `workflow_dispatch`
-trigger (Actions → Release → Run workflow): it builds both arches on their
-native runners with no push and no load, so you can prove the arm64 build
-works before merging a change to the release path — the tag-only trigger
-otherwise gives no pre-merge signal.
+trigger (Actions → Release → Run workflow). On both arches' native runners it
+builds the image with no push and no load, builds the `.deb`, `.rpm` and
+binary archive, and runs the binary archive check (§7). It publishes nothing
+and creates no Release. Use it to prove the arm64 build works before merging
+a change to the release path; the tag-only trigger otherwise gives no
+pre-merge signal.
 
 The runtime stage runs as the non-root `pulsus` user (uid/gid `10001`) with
 its working directory set to `/var/lib/pulsusdb`, owned by that user — so
@@ -280,10 +283,11 @@ of publishing. Ancestry no longer rests on convention; branch protection
 is still required for the *behavioural test* gate (`chart-test-kind`),
 which no workflow step re-runs.
 
-## 7. OS packages (.deb + .rpm)
+## 7. Binary archives and OS packages (.tar.gz, .deb, .rpm)
 
-The same `v*` tag that publishes the GHCR image also builds native OS packages
-(issue #213) and **attaches them to the GitHub Release** (owner decision:
+The same `v*` tag that publishes the GHCR image also builds the server
+binary, as a plain archive and as native OS packages (issue #213), and
+**attaches them to the GitHub Release** (owner decision:
 Releases-only — no hosted apt/yum repo). This is the `packages` /
 `packages-release` job pair in `.github/workflows/release.yml`, mirroring the
 Docker `build`/`merge` split: per-arch native runners (`amd64 -> ubuntu-latest`,
@@ -291,23 +295,28 @@ Docker `build`/`merge` split: per-arch native runners (`amd64 -> ubuntu-latest`,
 carries the same byte-identical tag-ancestry gate and never touches
 GHCR/cosign; only the fan-in job elevates to `contents: write`.
 
-**What is produced**, from one `packaging/nfpm.yaml` (nfpm emits both formats):
+**What is produced**, from one build of the binary per arch (nfpm emits both
+package formats from one `packaging/nfpm.yaml`):
 
 | Asset | |
 |-------|---|
+| `pulsusdb-<tagver>-linux-amd64.tar.gz`, `pulsusdb-<tagver>-linux-arm64.tar.gz` | `pulsusdb`, `LICENSE` and the default `config.yaml`, for the distros below |
 | `pulsusdb_<ver>_amd64.deb`, `pulsusdb_<ver>_arm64.deb` | Debian/Ubuntu |
 | `pulsusdb-<ver>-1.x86_64.rpm`, `pulsusdb-<ver>-1.aarch64.rpm` | RHEL/Rocky/Alma/Fedora |
-| `SHA256SUMS` | checksums for all four (no GPG signing for v1) |
+| `SHA256SUMS` | checksums for all six (no GPG signing for v1) |
 
-A prerelease tag's `-` is rewritten to `~` in the package version
-(`v1.2.3-rc.1` → `1.2.3~rc.1`), legal and correctly-ordered in both formats.
+`<tagver>` is the tag without its leading `v`. `<ver>` is the same, except that
+a prerelease tag's `-` is rewritten to `~` (`v1.2.3-rc.1` → `1.2.3~rc.1`), legal
+and correctly-ordered in both package formats. The archive keeps the `-`:
+`pulsusdb-1.2.3-rc.1-linux-amd64.tar.gz`, matching what its `--version` prints.
 
 **glibc floor / supported distros.** The binary is built dynamically against a
 conservative glibc floor — Debian **bullseye, glibc 2.31** (not the runtime
 image's bookworm), so it is **not** musl-static (a static musl build would
 penalise the query engine's allocator). rustls means glibc + libgcc are
 effectively the only runtime deps. The floor supports **Debian 11+, Ubuntu
-20.04+, RHEL/Rocky/AlmaLinux 9+, and Fedora**. The CI smoke test installs the
+20.04+, RHEL/Rocky/AlmaLinux 9+, and Fedora**. The binary archive carries the same
+binary, so the same floor applies to it. The CI smoke test installs the
 `.deb` on `ubuntu:22.04` (glibc 2.35) and the `.rpm` on `rockylinux:9` (glibc
 2.34); the Rocky leg is the mechanical proof the floor is low enough. EL8
 (glibc 2.28) is a possible follow-up (it would require dropping the build base
@@ -360,4 +369,37 @@ sudo dnf install ./pulsusdb-<ver>-1.x86_64.rpm
 sudo systemctl enable --now pulsusdb
 ```
 
-Verify a download against the Release's `SHA256SUMS` with `sha256sum -c`.
+### Running from the binary archive
+
+The archive unpacks into one directory, `pulsusdb-<tagver>-linux-<arch>/`:
+
+| File | |
+|------|---|
+| `pulsusdb` | the server binary, byte-for-byte the one the `.deb` and `.rpm` install as `/usr/bin/pulsusdb` |
+| `LICENSE` | the GNU Affero General Public License v3.0 |
+| `config.yaml` | the complete commented config schema, the file the packages install as `/etc/pulsusdb/config.yaml` |
+
+```sh
+tar -xzf pulsusdb-1.2.3-linux-amd64.tar.gz
+cd pulsusdb-1.2.3-linux-amd64
+./pulsusdb --version
+# pulsusdb 1.2.3 (<40-char commit sha>)
+# edit config.yaml to point at your ClickHouse, then:
+./pulsusdb --config config.yaml
+```
+
+Nothing is installed: no user, no systemd unit, no data directory. The
+writer's insert-failure spool (`./spool/`, docs/configuration.md §5) is
+created under the working directory, so start the server from a directory its
+user can write. Before the archive is attached, the release workflow unpacks
+it on that architecture's own runner and fails unless the binary is built for
+that architecture, has the same sha256 as the `.deb`'s, and prints exactly
+`pulsusdb <tagver> (<commit sha>)` for `--version`.
+
+### Verifying a download
+
+In the directory holding the downloads and the Release's `SHA256SUMS`:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS
+```

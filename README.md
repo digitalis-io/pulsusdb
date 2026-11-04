@@ -58,7 +58,7 @@ Design documents live in [`docs/`](docs/) and are written before the code:
 | `docs/features.md` | Full feature list and compatibility matrix |
 | `docs/api.md` | Every ingestion and query endpoint, with parameters and wire formats |
 | `docs/configuration.md` | Environment variables, deployment modes, ClickHouse setup |
-| `docs/releasing.md` | Cutting a release: GHCR image publishing procedure and tag policy |
+| `docs/releasing.md` | Cutting a release: the GHCR image, the binary archives and OS packages, and the tag policy |
 
 Development is tracked through GitHub issues; each issue maps to a scoped unit of work from these documents.
 
@@ -78,9 +78,9 @@ The default install is a self-contained single-node stack — bundled ClickHouse
 
 **The `pulsusdb` application image is not published to a registry yet** (tracked separately) — real installs need `--set image.tag=<a locally built or future released tag>` until that lands.
 
-## Installing native packages (.deb / .rpm)
+## Installing from a GitHub Release (.deb / .rpm / .tar.gz)
 
-Each `v*` release attaches native `.deb` and `.rpm` packages (amd64 + arm64) plus a `SHA256SUMS` file to its [GitHub Release](https://github.com/digitalis-io/pulsusdb/releases):
+Each `v*` release attaches native `.deb` and `.rpm` packages and a plain binary archive, for amd64 and arm64, plus a `SHA256SUMS` file to its [GitHub Release](https://github.com/digitalis-io/pulsusdb/releases):
 
 ```sh
 # Debian / Ubuntu (20.04+)
@@ -94,6 +94,14 @@ A package installs the binary to `/usr/bin/pulsusdb`, a `pulsusdb.service` syste
 
 ```sh
 sudo systemctl enable --now pulsusdb
+```
+
+Without a package manager, unpack the binary archive instead. It holds the same binary the packages install, the licence and the commented `config.yaml`:
+
+```sh
+tar -xzf pulsusdb-1.2.3-linux-amd64.tar.gz
+cd pulsusdb-1.2.3-linux-amd64
+./pulsusdb --config config.yaml
 ```
 
 See [docs/releasing.md §7](docs/releasing.md) for the supported-distro (glibc) floor and upgrade behaviour.
