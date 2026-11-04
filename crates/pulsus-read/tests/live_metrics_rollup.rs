@@ -593,7 +593,7 @@ async fn corpus_d(
 /// A corpus only its `members` read: built once per test process by the
 /// first member to lease it, dropped when every member has finished.
 struct Shared {
-    base: &'static str,
+    db: pulsus_testkit::TestDb,
     corpus: Corpus,
     members: &'static [&'static str],
     state: tokio::sync::Mutex<SharedState>,
@@ -645,9 +645,13 @@ impl Corpus {
 }
 
 impl Shared {
-    const fn new(base: &'static str, corpus: Corpus, members: &'static [&'static str]) -> Self {
+    const fn new(
+        db: pulsus_testkit::TestDb,
+        corpus: Corpus,
+        members: &'static [&'static str],
+    ) -> Self {
         Self {
-            base,
+            db,
             corpus,
             members,
             state: tokio::sync::Mutex::const_new(SharedState::EMPTY),
@@ -662,17 +666,16 @@ impl Shared {
             .members
             .iter()
             .position(|m| *m == test)
-            .unwrap_or_else(|| panic!("{test} is not a member of {}", self.base));
+            .unwrap_or_else(|| panic!("{test} is not a member of {}", self.db.name()));
         if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test") {
-            let db = pulsus_testkit::test_db(&format!("{}_{k}", self.base));
+            let db = format!("{}_{k}", self.db.name());
             println!("{test}: private database {db}");
             return self.corpus.build(&db).await;
         }
         let (ctx, anchor) = {
             let mut state = self.state.lock().await;
             if state.built.is_none() {
-                let db = pulsus_testkit::test_db(self.base);
-                let (built, anchor) = self.corpus.build(&db).await;
+                let (built, anchor) = self.corpus.build(self.db.name()).await;
                 state.since_us = server_now_us(&built.admin).await;
                 state.released = 0;
                 state.built = Some((built.ctx.clone(), anchor));
@@ -690,7 +693,7 @@ impl Shared {
 }
 
 static D5_8: Shared = Shared::new(
-    "pulsus_read_it_rollup_d5_8",
+    pulsus_testkit::TestDb::new("pulsus_read_it_rollup_d5_8"),
     Corpus::D(FIVE, 0..8),
     &[
         "each_served_function_is_within_its_distance",
@@ -700,7 +703,7 @@ static D5_8: Shared = Shared::new(
     ],
 );
 static D60_8: Shared = Shared::new(
-    "pulsus_read_it_rollup_d60_8",
+    pulsus_testkit::TestDb::new("pulsus_read_it_rollup_d60_8"),
     Corpus::D(DEFAULTS, 0..8),
     &[
         "a_week_and_three_hours_fill_from_their_levels",
@@ -708,7 +711,7 @@ static D60_8: Shared = Shared::new(
     ],
 );
 static D60_2: Shared = Shared::new(
-    "pulsus_read_it_rollup_d60_2",
+    pulsus_testkit::TestDb::new("pulsus_read_it_rollup_d60_2"),
     Corpus::D(DEFAULTS, 6..8),
     &[
         "a_range_below_the_first_level_reads_raw",
@@ -718,7 +721,7 @@ static D60_2: Shared = Shared::new(
     ],
 );
 static P: Shared = Shared::new(
-    "pulsus_read_it_rollup_p",
+    pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p"),
     Corpus::P,
     &[
         "pushdown_on_the_request_grid_and_when_filled",
@@ -731,7 +734,7 @@ static P: Shared = Shared::new(
     ],
 );
 static P2: Shared = Shared::new(
-    "pulsus_read_it_rollup_p2",
+    pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p2"),
     Corpus::P2,
     &[
         "a_coarse_level_aggregate_answers_as_in_process",
