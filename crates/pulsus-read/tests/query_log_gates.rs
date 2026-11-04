@@ -3813,6 +3813,7 @@ struct CommentedRow624 {
     exception_code: i32,
     read_rows: u64,
     result_rows: u64,
+    read_bytes: u64,
 }
 
 /// Every finished or failed statement over `log_samples` under each of
@@ -3838,7 +3839,7 @@ async fn logged_624(
             .await
             .expect("flush logs");
         let sql = format!(
-            "SELECT log_comment, query, exception_code, read_rows, result_rows \
+            "SELECT log_comment, query, exception_code, read_rows, result_rows, read_bytes \
              FROM system.query_log WHERE log_comment IN ({list}) AND type != 'QueryStart' \
              AND query LIKE '%log_samples%' AND query NOT LIKE '%system.query_log%' \
              ORDER BY event_time_microseconds ASC"
@@ -6943,7 +6944,7 @@ async fn every_refusal_lands_as_the_table_says() {
 //
 // **Two of the five call sites §1.3's row names are read, not run**: the
 // binary/`variants` tree (`exec.rs:2455`) and the extracted-field
-// group-key read (`exec.rs:5534`). Neither is reachable from the three
+// group-key read (`exec.rs:5534`). Neither is reachable from the
 // routes below, so the row carries them on the source alone and this
 // test does not close them.
 //
@@ -6966,7 +6967,7 @@ const SELECTION_GOLDEN: &str = "crates/pulsus-read/tests/golden/logql_selection_
 /// alone leaves this constant standing and B2 fails, so the author has to
 /// move a source line in the same change and the diff carries both.
 const PINNED_SELECTION_STATEMENTS: &str =
-    "035c8db511ba9378f461d69bb14db0b3e892373e80a1b438a85927217bbe12aa";
+    "5a126e2cd6d321a86e311a6947f70b7756707a4c63b42ed396b01df9a9272238";
 
 /// One grid point, on a step boundary: 2030-01-01T00:00:00Z.
 ///
@@ -7014,21 +7015,27 @@ struct SelectionBlock {
     statements: Vec<(String, String)>,
 }
 
-/// What each route drives: its base query, its request, and the seven
-/// wrappings of that base.
+/// What each route drives: its base query, its request, and the wrappings
+/// of that base.
 ///
-/// The two range routes differ in the ONE stage that decides the route —
-/// `| json | __error__=""` goes beyond a line filter, so the first
-/// aggregation level cannot lower — and the test asserts their routing
-/// reasons differ, so a change that quietly sent both down one path fails
-/// rather than passing twice over the same statements.
+/// The client-aggregated route differs from the bucketed ones in the ONE
+/// stage that decides the route — `| json | __error__=""` goes beyond a line
+/// filter, so the first aggregation level cannot lower — and the test asserts
+/// their routing reasons differ, so a change that quietly sent both down one
+/// path fails rather than passing twice over the same statements.
 ///
-/// **Four wrappings put the selection OUTERMOST and three put it inside.**
-/// The chain is stored outer-first and walked with `aggs.iter().rev()`
-/// (`post_agg.rs:3018`), so an outermost-only matrix leaves
-/// `vector_aggs.last()` — the innermost spec — never a selection, and a
-/// change that lowered only an innermost selection would pass. Both
-/// nested shapes are ordinary queries that answer `200`:
+/// **The bucketed reads are split by the innermost aggregation** (issue
+/// #624, part 8): a counting statement under an innermost `sum by` of stream
+/// labels reads `'' AS structured_metadata`, and one under an innermost
+/// selection, or with no parent at all, groups by the column. So the
+/// outermost and middle selections sit in the first route of each pair, over
+/// a `sum by` base, and the innermost ones in the second, "metadata grouped",
+/// over a bare `count_over_time` base. The client-aggregated route keeps all
+/// seven. The chain is stored outer-first and walked with
+/// `aggs.iter().rev()` (`post_agg.rs:3018`), so an outermost-only matrix
+/// leaves `vector_aggs.last()` — the innermost spec — never a selection, and
+/// a change that lowered only an innermost selection would pass. The nested
+/// shapes are ordinary queries that answer `200`:
 ///
 ///     sum by (service_name) (topk(2, count_over_time(SEL[1m])))
 ///     topk(2, sum by (service_name) (bottomk(5, count_over_time(SEL[1m]))))
@@ -7037,7 +7044,7 @@ struct SelectionBlock {
 /// The third has a selection that is neither the first spec nor the last,
 /// so a condition indexed at EITHER end misses it. What the check rests on
 /// is therefore membership of the chain, not a position in it.
-fn selection_routes() -> Vec<(&'static str, String, QueryParams, [String; 7])> {
+fn selection_routes() -> Vec<(&'static str, String, QueryParams, Vec<String>)> {
     let range = QueryParams {
         spec: QuerySpec::Range {
             start_ns: SEL_AT_NS,
@@ -7061,47 +7068,77 @@ fn selection_routes() -> Vec<(&'static str, String, QueryParams, [String; 7])> {
     let parsed = r#"{env="prod"} | json | __error__=""#.to_string() + "\" ";
     let base_of = |sel: &str| format!("sum by (service_name) (count_over_time({sel}[1m]))");
     let bucketed = base_of(plain);
+    let grouped = format!("count_over_time({plain}[1m])");
     let client = base_of(&parsed);
-    // `second` is the operator and its parameter, e.g. `bottomk(1`.
-    let six = |sel: &str, second: &str| {
+    // The selection OUTERMOST, over the base. `second` is the operator and
+    // its parameter, e.g. `bottomk(1`.
+    let outer = |sel: &str, second: &str| {
         let base = base_of(sel);
-        [
+        vec![
             format!("topk(2, {base})"),
             format!("{second}, {base})"),
             format!("sort({base})"),
             format!("sort_desc({base})"),
+        ]
+    };
+    // The selection is NEITHER the first spec NOR the last, so a condition
+    // indexed at either end misses it in both directions. `sum by (pod)`
+    // groups on the corpus's second label, so the middle stage is a
+    // grouping of its own rather than a repeat of the outer one.
+    let middle = |sel: &str| {
+        format!("sum by (service_name) (topk(2, sum by (pod) (count_over_time({sel}[1m]))))")
+    };
+    let innermost = |sel: &str| {
+        vec![
             // The selection is the INNERMOST spec: `vector_aggs.last()`.
             format!("sum by (service_name) (topk(2, count_over_time({sel}[1m])))"),
             // A selection at both ends of one chain.
             format!("topk(2, sum by (service_name) (bottomk(5, count_over_time({sel}[1m]))))"),
-            // The selection is NEITHER the first spec NOR the last, so a
-            // condition indexed at either end misses it in both
-            // directions. `sum by (pod)` groups on the corpus's second
-            // label, so the middle stage is a real grouping rather than a
-            // repeat of the outer one.
-            format!("sum by (service_name) (topk(2, sum by (pod) (count_over_time({sel}[1m]))))"),
         ]
+    };
+    let first = |sel: &str, second: &str| {
+        let mut v = outer(sel, second);
+        v.push(middle(sel));
+        v
+    };
+    let seven = |sel: &str, second: &str| {
+        let mut v = outer(sel, second);
+        v.extend(innermost(sel));
+        v.push(middle(sel));
+        v
     };
     vec![
         (
             "range, bucketed read",
             bucketed.clone(),
             range,
-            six(plain, "bottomk(1"),
+            first(plain, "bottomk(1"),
+        ),
+        (
+            "range, bucketed read, metadata grouped",
+            grouped.clone(),
+            range,
+            innermost(plain),
         ),
         (
             "range, client-aggregated read",
             client,
             range,
-            six(&parsed, "bottomk(1"),
+            seven(&parsed, "bottomk(1"),
         ),
         // `approx_topk` replaces `bottomk` here: it is refused on a range
-        // query and this is the only route that can carry it.
+        // query and only the instant routes can carry it.
         (
             "instant read",
             bucketed,
             instant,
-            six(plain, "approx_topk(2"),
+            first(plain, "approx_topk(2"),
+        ),
+        (
+            "instant read, metadata grouped",
+            grouped,
+            instant,
+            innermost(plain),
         ),
     ]
 }
@@ -7128,7 +7165,7 @@ fn is_selection_op(op: &pulsus_logql::VectorAggOp) -> bool {
 /// query on the same route and would silently make that run prove
 /// nothing, so it fails here instead, naming the operator it found.
 ///
-/// **Membership, not position.** The seven wrappings put a selection
+/// **Membership, not position.** The wrappings put a selection
 /// first, last and in the middle, so nothing here may be indexed at an
 /// end: this walks the whole chain.
 fn every_base_query_carries_no_selection(db: &str) {
@@ -7296,7 +7333,7 @@ fn render_selection_golden(blocks: &[SelectionBlock]) -> String {
 }
 
 const SELECTION_GOLDEN_HEADER: &str = "\
-# The statements the three LogQL routes issue for `docs/query-to-sql.md` §1.3's
+# The statements the LogQL routes issue for `docs/query-to-sql.md` §1.3's
 # selection row, committed so that the check compares live SQL with bytes this
 # engine did not produce at test time.
 #
@@ -7696,7 +7733,7 @@ async fn the_selection_operators_add_no_clause_to_any_statement() {
     let golden = parse_selection_golden(&golden_text);
     assert_eq!(
         golden.len(),
-        3,
+        5,
         "{SELECTION_GOLDEN} holds one block per route"
     );
     for block in &golden {
@@ -15214,4 +15251,448 @@ fn empty_term() -> &'static pulsus_read::traces::tenant_scope::TenantTerm {
             pulsus_read::traces::tenant_scope::TenantTerm::of(&empty_tenant())
         });
     &TERM
+}
+
+// ---------------------------------------------------------------------
+// Issue #624, part 8: the counting statements read structured metadata only
+// when the answer can need it.
+// ---------------------------------------------------------------------
+
+/// The statement text the database logged, without the output format the
+/// client appends.
+fn statement_text_624p8(query: &str) -> &str {
+    match query.rfind("FORMAT RowBinary") {
+        Some(i) => query[..i].trim_end(),
+        None => query.trim_end(),
+    }
+}
+
+/// The counting statement over `log_samples` among one run's logged rows.
+fn counting_statement_624p8(rows: &[CommentedRow624]) -> Result<&CommentedRow624, String> {
+    let found: Vec<&CommentedRow624> = rows
+        .iter()
+        .filter(|r| r.query.starts_with("SELECT fingerprint,") && r.query.contains(" AS n"))
+        .collect();
+    match found.as_slice() {
+        [one] => Ok(one),
+        other => Err(format!(
+            "exactly one counting statement expected, found {}: {rows:#?}",
+            other.len()
+        )),
+    }
+}
+
+/// "blank": the statement names `structured_metadata` once, in
+/// `'' AS structured_metadata`.
+fn is_blank_624p8(query: &str) -> bool {
+    query.matches("structured_metadata").count() == 1 && query.contains("'' AS structured_metadata")
+}
+
+/// "kept": the statement groups by `structured_metadata`, in the bucketed,
+/// the instant or the sliding form.
+fn is_kept_624p8(query: &str) -> bool {
+    let q = statement_text_624p8(query);
+    q.contains("GROUP BY fingerprint, bucket_ns, structured_metadata")
+        || q.ends_with("GROUP BY fingerprint, structured_metadata")
+        || q.contains("PARTITION BY fingerprint, structured_metadata ORDER BY")
+}
+
+/// The part 8 fixture: three streams of `c624m` and one of `c624x`, nine
+/// lines inside `(T-60s, T]`, and `T`.
+///
+/// ```text
+/// 801 {app=a, host=h1}                    l1 -50s lvl=info; l2 -40s lvl=warn; l3 -30s host=zz
+/// 802 {app=a, host=h2}                    l4 -45s none;     l5 -35s lvl=info
+/// 803 {app=a}                             l6 -25s host=h9;  l7 -15s none
+/// 804 {app=a, host=h1, host_extracted=s}  l8 -20s host=zz;  l9 -10s none   (c624x)
+/// ```
+async fn seed_624p8(name: &str) -> (ChClient, String, i64) {
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p8_{name}_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    let svc = "c624m";
+    for (fp, labels) in [
+        (801u64, r#"{"app":"a","host":"h1","service_name":"c624m"}"#),
+        (802u64, r#"{"app":"a","host":"h2","service_name":"c624m"}"#),
+        (803u64, r#"{"app":"a","service_name":"c624m"}"#),
+    ] {
+        land_stream_624(&admin, &db, t, fp, svc, labels).await;
+    }
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        804,
+        "c624x",
+        r#"{"app":"a","host":"h1","host_extracted":"s","service_name":"c624x"}"#,
+    )
+    .await;
+    land_line_624(
+        &admin,
+        &db,
+        804,
+        "c624x",
+        t - 20 * sec,
+        "l8",
+        r#"{"host":"zz"}"#,
+    )
+    .await;
+    land_line_624(&admin, &db, 804, "c624x", t - 10 * sec, "l9", "").await;
+    for (fp, body, offset_s, sm) in [
+        (801u64, "l1", 50i64, r#"{"lvl":"info"}"#),
+        (801, "l2", 40, r#"{"lvl":"warn"}"#),
+        (801, "l3", 30, r#"{"host":"zz"}"#),
+        (802, "l4", 45, ""),
+        (802, "l5", 35, r#"{"lvl":"info"}"#),
+        (803, "l6", 25, r#"{"host":"h9"}"#),
+        (803, "l7", 15, ""),
+    ] {
+        land_line_624(&admin, &db, fp, svc, t - offset_s * sec, body, sm).await;
+    }
+    (admin, db, t)
+}
+
+/// One series of an expected answer: its labels and `(at, value)` points.
+fn series_624p8(labels: &[(&str, &str)], points: &[(i64, f64)]) -> AnswerSeries {
+    let mut l: Vec<(String, String)> = labels
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    l.sort();
+    (l, points.iter().map(|(t, v)| (*t, v.to_bits())).collect())
+}
+
+/// What a part 8 query's statement must be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Statement624p8 {
+    Kept,
+    Blank,
+    /// Blank, and the instant form: grouped by `fingerprint` alone.
+    BlankInstant,
+    /// Blank, and the sliding form: partitioned by `fingerprint` alone.
+    BlankSliding,
+}
+
+/// **T8.1 (issue #624, part 8): a counting statement reads `'' AS
+/// structured_metadata` exactly when no line's metadata can reach the
+/// answer**, and every query answers the literal the fixture implies on
+/// either statement. Every row is checked before the test fails, so one run
+/// names every row that differs.
+#[tokio::test]
+async fn the_counting_statements_read_metadata_only_when_the_answer_needs_it() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_624p8("t81").await;
+    let sec = 1_000_000_000i64;
+    let a = r#"{service_name="c624m"}"#;
+    let h = r#"{service_name="c624m", host=~"h.+"}"#;
+    let x = r#"{service_name="c624x"}"#;
+    let at_t = |v: f64| vec![(t, v)];
+    let grid = |end_ns: i64| QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let host = |v: &'static str| [("host", v)];
+    // (id, query, end, expected answer, statement)
+    type Row624p8 = (&'static str, String, i64, Vec<AnswerSeries>, Statement624p8);
+    let one = |labels: &[(&str, &str)]| series_624p8(labels, &at_t(1.0));
+    let full_h1 = |extra: (&'static str, &'static str)| {
+        vec![
+            ("app", "a"),
+            ("host", "h1"),
+            extra,
+            ("service_name", "c624m"),
+        ]
+    };
+    let rows: Vec<Row624p8> = vec![
+        (
+            "Q1",
+            format!(r#"sum by (host) (count_over_time({a} |= "l" [1m]))"#),
+            t,
+            vec![
+                series_624p8(&host("h1"), &at_t(3.0)),
+                series_624p8(&host("h2"), &at_t(2.0)),
+                series_624p8(&host("h9"), &at_t(1.0)),
+                series_624p8(&[], &at_t(1.0)),
+            ],
+            Statement624p8::Kept,
+        ),
+        (
+            "Q2",
+            format!(r#"sum by (host) (count_over_time({h} |= "l" [1m]))"#),
+            t,
+            vec![
+                series_624p8(&host("h1"), &at_t(3.0)),
+                series_624p8(&host("h2"), &at_t(2.0)),
+            ],
+            Statement624p8::Blank,
+        ),
+        (
+            "Q3",
+            format!(r#"sum(count_over_time({a} |= "l" [1m]))"#),
+            t,
+            vec![series_624p8(&[], &at_t(7.0))],
+            Statement624p8::Blank,
+        ),
+        (
+            "Q4",
+            format!(r#"sum by (lvl) (count_over_time({a} |= "l" [1m]))"#),
+            t,
+            vec![
+                series_624p8(&[("lvl", "info")], &at_t(2.0)),
+                series_624p8(&[("lvl", "warn")], &at_t(1.0)),
+                series_624p8(&[], &at_t(4.0)),
+            ],
+            Statement624p8::Kept,
+        ),
+        (
+            "Q5",
+            format!(r#"sum by (host_extracted) (count_over_time({h} |= "l" [1m]))"#),
+            t,
+            vec![
+                series_624p8(&[("host_extracted", "zz")], &at_t(1.0)),
+                series_624p8(&[], &at_t(4.0)),
+            ],
+            Statement624p8::Kept,
+        ),
+        (
+            "Q6",
+            format!(r#"sum without (app) (count_over_time({h} |= "l" [1m]))"#),
+            t,
+            vec![
+                one(&[("host", "h1"), ("lvl", "info"), ("service_name", "c624m")]),
+                one(&[("host", "h1"), ("lvl", "warn"), ("service_name", "c624m")]),
+                one(&[
+                    ("host", "h1"),
+                    ("host_extracted", "zz"),
+                    ("service_name", "c624m"),
+                ]),
+                one(&[("host", "h2"), ("service_name", "c624m")]),
+                one(&[("host", "h2"), ("lvl", "info"), ("service_name", "c624m")]),
+            ],
+            Statement624p8::Kept,
+        ),
+        (
+            "Q7",
+            format!(r#"max by (host) (count_over_time({h} |= "l" [1m]))"#),
+            t,
+            vec![one(&host("h1")), one(&host("h2"))],
+            Statement624p8::Kept,
+        ),
+        (
+            "Q8",
+            format!(r#"count_over_time({h} |= "l" [1m])"#),
+            t,
+            vec![
+                one(&full_h1(("lvl", "info"))),
+                one(&full_h1(("lvl", "warn"))),
+                one(&full_h1(("host_extracted", "zz"))),
+                one(&[("app", "a"), ("host", "h2"), ("service_name", "c624m")]),
+                one(&[
+                    ("app", "a"),
+                    ("host", "h2"),
+                    ("lvl", "info"),
+                    ("service_name", "c624m"),
+                ]),
+            ],
+            Statement624p8::Kept,
+        ),
+        (
+            "Q10",
+            format!(r#"sum by (host) (count_over_time({h} |= "l" [2m]))"#),
+            t + 60 * sec,
+            vec![
+                series_624p8(&host("h1"), &[(t, 3.0), (t + 60 * sec, 3.0)]),
+                series_624p8(&host("h2"), &[(t, 2.0), (t + 60 * sec, 2.0)]),
+            ],
+            Statement624p8::BlankSliding,
+        ),
+        (
+            "Q11",
+            format!(r#"sum by (host) (bytes_over_time({h} |= "l" [1m]))"#),
+            t,
+            vec![
+                series_624p8(&host("h1"), &at_t(6.0)),
+                series_624p8(&host("h2"), &at_t(4.0)),
+            ],
+            Statement624p8::Blank,
+        ),
+        (
+            "Q12",
+            format!(r#"topk(1, sum by (host) (rate({h} |= "l" [1m])))"#),
+            t,
+            vec![series_624p8(&host("h1"), &at_t(0.05))],
+            Statement624p8::Blank,
+        ),
+        // 804 carries `host_extracted` as a stream label, so only the
+        // `_extracted` rule keeps the column: `l8`'s metadata `host` is
+        // renamed onto it and wins.
+        (
+            "Q13",
+            format!(r#"sum by (host_extracted) (count_over_time({x} |= "l" [1m]))"#),
+            t,
+            vec![
+                series_624p8(&[("host_extracted", "s")], &at_t(1.0)),
+                series_624p8(&[("host_extracted", "zz")], &at_t(1.0)),
+            ],
+            Statement624p8::Kept,
+        ),
+    ];
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut comments: Vec<(&'static str, String, Statement624p8)> = Vec::new();
+    for (id, query, end, want, statement) in &rows {
+        let comment = format!("c624p8-{}", uuid::Uuid::new_v4().simple());
+        match run_624(
+            &db,
+            hooks_624(false, None, None),
+            Some(&comment),
+            query,
+            &grid(*end),
+        )
+        .await
+        {
+            Ok(got) => {
+                let mut want = want.clone();
+                want.sort();
+                if got != want {
+                    failures.push(format!(
+                        "{id} {query}: answered {got:?}, the fixture requires {want:?}"
+                    ));
+                }
+            }
+            Err(e) => failures.push(format!("{id} {query}: failed: {e:?}")),
+        }
+        comments.push((id, comment, *statement));
+    }
+    // Q9: Q2's query at the instant `T`.
+    let q9 = format!(r#"sum by (host) (count_over_time({h} |= "l" [1m]))"#);
+    let q9_comment = format!("c624p8-{}", uuid::Uuid::new_v4().simple());
+    match run_instant_624p4(&db, hooks_624(false, None, None), Some(&q9_comment), &q9, t).await {
+        Ok(got) => {
+            let want: InstantAnswer624p4 = vec![
+                (vec![("host".to_string(), "h1".to_string())], 3f64.to_bits()),
+                (vec![("host".to_string(), "h2".to_string())], 2f64.to_bits()),
+            ];
+            if got != want {
+                failures.push(format!(
+                    "Q9 {q9} at T: answered {got:?}, the fixture requires {want:?}"
+                ));
+            }
+        }
+        Err(e) => failures.push(format!("Q9 {q9} at T: failed: {e:?}")),
+    }
+    comments.push(("Q9", q9_comment, Statement624p8::BlankInstant));
+
+    let all: Vec<String> = comments.iter().map(|(_, c, _)| c.clone()).collect();
+    let logged = logged_624(&admin, &all).await;
+    let mut bytes: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for (id, comment, statement) in &comments {
+        let rows = logged.get(comment).map(Vec::as_slice).unwrap_or(&[]);
+        let row = match counting_statement_624p8(rows) {
+            Ok(r) => r,
+            Err(e) => {
+                failures.push(format!("{id}: {e}"));
+                continue;
+            }
+        };
+        bytes.insert(id, row.read_bytes);
+        let q = statement_text_624p8(&row.query);
+        let ok = match statement {
+            Statement624p8::Kept => is_kept_624p8(q) && !q.contains("'' AS structured_metadata"),
+            Statement624p8::Blank => is_blank_624p8(q),
+            Statement624p8::BlankInstant => {
+                is_blank_624p8(q) && q.ends_with("\nGROUP BY fingerprint")
+            }
+            Statement624p8::BlankSliding => {
+                is_blank_624p8(q) && q.contains("PARTITION BY fingerprint ORDER BY")
+            }
+        };
+        if !ok {
+            failures.push(format!("{id}: the statement is not {statement:?}:\n{q}"));
+        }
+    }
+    match (bytes.get("Q2"), bytes.get("Q8")) {
+        (Some(q2), Some(q8)) if q2 < q8 => {}
+        (q2, q8) => failures.push(format!(
+            "Q2 must read fewer bytes than Q8 over the same lines: Q2 read {q2:?}, Q8 {q8:?}"
+        )),
+    }
+    for (id, b) in {
+        let mut v: Vec<(&&str, &u64)> = bytes.iter().collect();
+        v.sort();
+        v
+    } {
+        eprintln!("T8.1 {id}: read_bytes {b}");
+    }
+    drop_db_624(&admin, &db).await;
+    assert!(
+        failures.is_empty(),
+        "{} row(s) differ:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// **T8.2 (issue #624, part 8): EXPLAIN reports the statement that runs.**
+/// Q2 of T8.1 through `explain` and through `query_explained`: the two
+/// `metric_read` texts are equal and read `'' AS structured_metadata`.
+#[tokio::test]
+async fn the_explained_counting_statement_is_the_one_that_runs() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_624p8("t82").await;
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let expr = parse(
+        r#"sum by (host) (count_over_time({service_name="c624m", host=~"h.+"} |= "l" [1m]))"#,
+    )
+    .expect("parse");
+    let read = |stages: &[pulsus_read::logql::ExplainStage]| {
+        stages
+            .iter()
+            .find(|s| s.name == "metric_read")
+            .map(|s| s.sql.clone())
+            .expect("a metric read is reported")
+    };
+    let explained = read(
+        &engine
+            .explain(&expr, &params)
+            .await
+            .expect("explain")
+            .stages,
+    );
+    let (_r, _w, executed) = engine
+        .query_explained(&expr, &params)
+        .await
+        .expect("query with explain");
+    let executed = read(&executed.stages);
+    drop_db_624(&admin, &db).await;
+    assert_eq!(
+        explained, executed,
+        "EXPLAIN must report the statement that runs"
+    );
+    assert!(
+        explained.contains("'' AS structured_metadata"),
+        "the reported statement reads the column:\n{explained}"
+    );
 }
