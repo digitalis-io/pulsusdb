@@ -4,8 +4,8 @@
 
 Ship everything through the **OpenTelemetry Collector**, query with the languages you already know — no query languages to relearn, no lock-in.
 
-* **OpenTelemetry-native** — the OTel Collector is the ingestion path: OTLP for logs, metrics, traces, and profiles (plus Prometheus remote write); additional push protocols available as optional compatibility receivers
-* **Familiar** — query with **LogQL**, **PromQL**, and **TraceQL** through PulsusDB's own product-neutral HTTP API; the standard Prometheus API is served natively, with **full PromQL compliance** (validated against the upstream Prometheus test corpus) as a hard requirement
+* **OpenTelemetry-native** — the OTel Collector is the ingestion path: OTLP for logs, metrics, traces, and profiles (plus remote write); additional push protocols available as optional compatibility receivers
+* **Familiar** — query with **LogQL**, **PromQL**, and **TraceQL** through PulsusDB's own product-neutral HTTP API, with **full PromQL compliance** as a hard requirement
 * **Compatible when you want it** — a config flag mounts third-party-compatible API endpoints so existing datasources and dashboards keep working unmodified
 * **Fast where it matters** — the storage schema and query planner are designed **read-path first**, for the dashboard and search workloads that observability systems actually serve
 * **Simple to run** — a single static binary that scales from a laptop to a sharded ClickHouse cluster
@@ -66,18 +66,6 @@ Development is tracked through GitHub issues; each issue maps to a scoped unit o
 
 PulsusDB is not yet runnable — the first milestone is a working ingest + query path for logs. Watch the repository or the issue tracker to follow progress.
 
-## Deploying with Helm
-
-A Helm chart is available under [`deploy/charts/pulsusdb`](deploy/charts/pulsusdb), published as an OCI artifact:
-
-```sh
-helm install my-pulsusdb oci://ghcr.io/digitalis-io/charts/pulsusdb --version <chart-version>
-```
-
-The default install is a self-contained single-node stack — bundled ClickHouse, one all-mode `pulsusdb` Deployment, and an OTel Collector — the Kubernetes equivalent of the docker-compose quickstart in [docs/configuration.md §10](docs/configuration.md). See the [chart README](deploy/charts/pulsusdb/README.md) for the full values reference, the two orthogonal topology axes (bundled-ClickHouse sharding vs. writer/reader process split), and the probe contract.
-
-**The `pulsusdb` application image is not published to a registry yet** (tracked separately) — real installs need `--set image.tag=<a locally built or future released tag>` until that lands.
-
 ## Installing from a GitHub Release (.deb / .rpm / .tar.gz)
 
 Each `v*` release attaches native `.deb` and `.rpm` packages and a plain binary archive, for amd64 and arm64, plus a `SHA256SUMS` file to its [GitHub Release](https://github.com/digitalis-io/pulsusdb/releases):
@@ -116,4 +104,4 @@ Released under the [GNU Affero General Public License v3.0](LICENSE).
 
 ---
 
-*Grafana®, Loki™, and Tempo® are trademarks of Raintank/Grafana Labs. Prometheus is a trademark of The Linux Foundation. ClickHouse® is a trademark of ClickHouse, Inc. PulsusDB is an independent project, not affiliated with or endorsed by any of them.*
+*ClickHouse® is a trademark of ClickHouse, Inc. PulsusDB is an independent project, not affiliated with or endorsed by it.*
