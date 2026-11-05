@@ -275,14 +275,11 @@ jobs:
           labels: |
             org.opencontainers.image.licenses=AGPL-3.0-only
 
-      # Assemble the OCI index from the per-arch digests and capture ITS OWN
-      # digest from `imagetools create`'s metadata file — the immutable digest
-      # of the index THIS run created. We never re-inspect the mutable version
-      # tag to resolve the digest (that was a TOCTOU: a concurrent rerun/retag
-      # could bind the signature/attestations to a different index). The
-      # metadata file is written to `$RUNNER_TEMP`, OUTSIDE the
-      # `working-directory: /tmp/digests` where the `printf ... *` glob runs,
-      # so it is never swept in as a bogus digest argument to `create`.
+      # Assemble the OCI index from the per-arch digests, then read ITS digest
+      # back from the registry through the first tag just pushed. Every later
+      # step addresses the index by this immutable digest, never by a tag.
+      # `imagetools create --metadata-file` is not used: it writes no
+      # `containerimage.digest` for an index, which failed the v0.0.1 run.
       - name: Create multi-arch index and capture its digest
         id: index
         working-directory: /tmp/digests
@@ -291,12 +288,12 @@ jobs:
           # Intentional word-splitting of the tag/ref lists below.
           # shellcheck disable=SC2046,SC2086
           docker buildx imagetools create \
-            --metadata-file "${RUNNER_TEMP}/index-metadata.json" \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf 'ghcr.io/digitalis-io/pulsusdb@sha256:%s ' *)
-          DIGEST=$(jq -r '."containerimage.digest"' "${RUNNER_TEMP}/index-metadata.json")
+          TAG=$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          DIGEST=$(docker buildx imagetools inspect "$TAG" --format '{{json .Manifest}}' | jq -r .digest)
           if [ -z "$DIGEST" ] || [ "$DIGEST" = null ]; then
-            echo "::error::imagetools create emitted no containerimage.digest"
+            echo "::error::no index digest read back for $TAG"
             exit 1
           fi
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
@@ -318,8 +315,8 @@ jobs:
       # --- Supply chain: keyless cosign sign + attestations (issue #44) ---
       #
       # Everything keys off the exact created OCI *index* digest
-      # (`steps.index.outputs.digest`, from `imagetools create`'s metadata
-      # file) — never a mutable tag. Signing the index transitively covers both
+      # (`steps.index.outputs.digest`, read back right after `imagetools
+      # create`) — never a mutable tag. Signing the index transitively covers both
       # child (amd64 + arm64) manifests via their content-addressed digests.
       # We are already logged in to ghcr.io (docker/login-action above), so
       # cosign reuses that credential. Keyless: the workflow's OIDC token ->
@@ -356,12 +353,17 @@ jobs:
       # attached as a keyless cosign attestation keyed to the same digest.
       # syft on an index resolves to a single platform (amd64) for v1;
       # per-arch SBOMs are a follow-up (out of scope, noted in docs).
+      # `upload-release-assets: false`: on a tag push the action otherwise
+      # uploads the SBOM to the tag's Release, which this job's
+      # `contents: read` cannot do, so the step would fail. The Release
+      # assets are `packages-release`'s alone.
       - name: Generate SBOM (SPDX-JSON)
         uses: anchore/sbom-action@v0
         with:
           image: ghcr.io/digitalis-io/pulsusdb@${{ steps.index.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
+          upload-release-assets: false
 
       - name: Attest SBOM (keyless)
         env:

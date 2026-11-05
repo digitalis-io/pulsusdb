@@ -46,11 +46,10 @@ tag/label scheme is unchanged; only the digest a tag points to is an image
 **index** rather than a single image manifest (pull-by-tag and
 pull-by-child-digest both still work).
 
-The `merge` job captures the created index's own digest from
-`imagetools create --metadata-file` (the `containerimage.digest` field) — the
-immutable digest of the index this run just built — and the keyless signing +
-SBOM/provenance attestation (issue #44) bind that merged-index digest, never a
-mutable tag.
+The `merge` job reads the created index's digest back from the registry
+(`imagetools inspect` on the first tag it just pushed), and the keyless
+signing + SBOM/provenance attestation (issue #44) bind that merged-index
+digest, never a mutable tag.
 
 A build-only dry-run is available via the workflow's `workflow_dispatch`
 trigger (Actions → Release → Run workflow). On both arches' native runners it
