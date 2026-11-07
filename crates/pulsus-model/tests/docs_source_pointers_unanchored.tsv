@@ -4,14 +4,15 @@ docs/116.md	clickhouse/src/client.rs:103-141	not_in_this_repository
 docs/116.md	client.rs:117-122	no_name_the_target_file_holds
 docs/116.md	crates/pulsus-write/src/writer/spool.rs:98	no_name_the_target_file_holds
 docs/116.md	docs/architecture.md:201	no_name_the_target_file_holds
+docs/116.md	docs/architecture.md:35	no_name_the_target_file_holds
 docs/116.md	docs/architecture.md:53	no_name_the_target_file_holds
 docs/116.md	docs/schemas.md:1095	no_name_the_target_file_holds
 docs/116.md	docs/schemas.md:246	no_name_the_target_file_holds
+docs/116.md	docs/schemas.md:61	no_name_the_target_file_holds
 docs/116.md	ingest/http.rs:116-121	no_name_the_target_file_holds
 docs/116.md	schemas.md:173	no_name_the_target_file_holds
 docs/116.md	schemas.md:246	no_name_the_target_file_holds
-docs/116.md	schemas.md:528	no_name_the_target_file_holds
-docs/116.md	schemas.md:555	no_name_the_target_file_holds
+docs/116.md	schemas.md:539	no_name_the_target_file_holds
 docs/116.md	writer/config.rs:21	pinned_to_another_version
 docs/116.md	writer/config.rs:21-26	pinned_to_another_version
 docs/116.md	writer/rows.rs:413	no_name_the_target_file_holds
@@ -674,6 +675,7 @@ docs/features.md	pkg/validation/limits.go:371	pinned_to_another_version
 docs/features.md	syntax/extractor.go:46-47	not_in_this_repository
 docs/features.md	tempodb/encoding/vparquet4/nested_set_model.go:11-12	pinned_to_another_version
 docs/features.md	tempodb/encoding/vparquet4/nested_set_model.go:57	pinned_to_another_version
+docs/promql_rollups/reading.md	docs/api.md:1005	no_name_the_target_file_holds
 docs/query-lowering.md	../crates/pulsus-read/src/traces/filter.rs:2732	not_in_this_repository
 docs/query-lowering.md	../crates/pulsus-read/src/traces/metrics_sql.rs:209	not_in_this_repository
 docs/query-lowering.md	../crates/pulsus-read/src/traces/metrics_sql.rs:361	not_in_this_repository
