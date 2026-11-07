@@ -38,7 +38,11 @@
 //! and no registration backfill on this path. A push emits a metric's
 //! descriptor as a kind-3 row only when this writer has not sent the same
 //! descriptor within its hour (issue #623, [`DescriptorCache`]); that cache
-//! too is promoted only when the block commits. `metric_metadata` is a
+//! too is promoted only when the block commits. Both caches hold what this
+//! writer's commits recorded since it last forgot: every ending but a commit
+//! empties both (issue #786), so a later push sends its series
+//! registrations and its descriptors again unless a commit in between
+//! recorded them. `metric_metadata` is a
 //! `ReplacingMergeTree(updated_ns)` keyed on the whole descriptor `(org_id,
 //! metric_name, metric_type, help, unit)` (issue #500), so a resend
 //! collapses on merge, a name keeps every distinct descriptor, and one no
@@ -331,6 +335,20 @@ impl MetricWriter {
                 }
             });
 
+        let lru_for_failure = series_lru.clone();
+        let descriptors_for_failure = descriptors.clone();
+        let on_failure: crate::writer::landing::FailureHook = Arc::new(move || {
+            let series = lru_for_failure
+                .lock()
+                .expect("series lru mutex poisoned")
+                .take();
+            let sent = descriptors_for_failure
+                .lock()
+                .expect("descriptor cache mutex poisoned")
+                .take();
+            drop((series, sent));
+        });
+
         let ctx = Arc::new(LandingContext {
             table: tables.landing,
             inserter: landing,
@@ -339,6 +357,7 @@ impl MetricWriter {
             queued_bytes: queued_bytes.clone(),
             spool,
             on_commit: Some(on_commit),
+            on_failure: Some(on_failure),
             retries: runtime.metrics_landing_retries,
             max_rows: runtime.metrics_landing_max_rows,
             // Metrics blocks are never batched (issue #494 part 2): a samples

@@ -15,15 +15,19 @@
 //! docs/schemas.md §2.1) collapses,
 //! so this cache trades a little redundant writing for a simple,
 //! well-understood eviction policy — never correctness. Optimistic
-//! promotion is deliberately NOT implemented: `insert` is called only after
-//! a row's flush is confirmed `Ok` (see `crate::writer::table`'s
-//! `on_flush_success` hook), never at admission time.
+//! promotion is deliberately NOT implemented: a cache is promoted by the
+//! landing commit hook (`crate::writer::landing`'s `CommitHook`), never at
+//! admission time. It is emptied by every ending but a commit (issue #786:
+//! the landing `FailureHook`), and the log writer's stream cache
+//! ([`StreamCache`]) is also emptied once per [`STREAM_RESEND_INTERVAL`].
 
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
+use std::time::Duration;
 
 use pulsus_model::Fingerprint;
+use tokio::time::Instant;
 
 /// `(tenant, fingerprint, month-as-days-since-epoch)` — the same key
 /// `docs/schemas.md §3.1`'s monthly `log_streams` partitions dedup on.
@@ -63,6 +67,56 @@ pub type SeriesLru = LruSet<SeriesKey>;
 /// The resend interval for a metric's descriptor (issue #623): a descriptor
 /// that has not changed is sent again once its hour turns.
 pub const DESCRIPTOR_RESEND_MS: i64 = 3_600_000;
+
+/// How long the log writer's stream cache is kept before it is emptied
+/// whole (issue #786), so a registration the stream tables lost is sent
+/// again within this long of the commit that recorded it.
+pub const STREAM_RESEND_INTERVAL: Duration = Duration::from_secs(3_600);
+
+/// The log writer's stream registration cache (issue #786): the keys this
+/// writer's commits registered since it last forgot, and when it last
+/// emptied itself on its own.
+pub struct StreamCache {
+    keys: StreamLru,
+    since: Instant,
+    interval: Duration,
+}
+
+impl StreamCache {
+    pub fn new(capacity: usize, interval: Duration, now: Instant) -> Self {
+        StreamCache {
+            keys: LruSet::new(capacity),
+            since: now,
+            interval,
+        }
+    }
+
+    /// Empties the cache once `interval` has passed since it was last
+    /// emptied this way, handing back what it held so the caller can drop
+    /// it after releasing its lock.
+    pub fn roll(&mut self, now: Instant) -> Option<StreamLru> {
+        if now.saturating_duration_since(self.since) >= self.interval {
+            self.since = now;
+            Some(self.keys.take())
+        } else {
+            None
+        }
+    }
+
+    pub fn contains(&mut self, key: &StreamKey) -> bool {
+        self.keys.contains(key)
+    }
+
+    pub fn insert(&mut self, key: StreamKey) {
+        self.keys.insert(key);
+    }
+
+    /// Empties the cache, handing back what it held. The interval's start
+    /// is unchanged.
+    pub fn forget_all(&mut self) -> StreamLru {
+        self.keys.take()
+    }
+}
 
 /// When the writer last sent one descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +196,12 @@ impl DescriptorCache {
         self.sent.insert(key, SentDescriptor { hour, updated_ns });
     }
 
+    /// Empties the cache, handing back what it held.
+    pub fn take(&mut self) -> Self {
+        let capacity = self.names.capacity;
+        std::mem::replace(self, DescriptorCache::new(capacity))
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.sent.len()
@@ -202,6 +262,11 @@ impl<K: Clone + Eq + Hash> LruSet<K> {
 
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
+    }
+
+    /// Empties the set, handing back what it held.
+    pub fn take(&mut self) -> Self {
+        std::mem::replace(self, LruSet::new(self.capacity))
     }
 
     /// `true` if `key` is cached, promoting it to most-recently-used.
@@ -475,5 +540,61 @@ mod tests {
             "the oldest was evicted"
         );
         assert!(cache.is_current("", "c", "gauge", "", "", 5));
+    }
+
+    // -- forgetting (issue #786) ---------------------------------------
+
+    fn stream_key(fp: u128) -> StreamKey {
+        (Arc::from(""), Fingerprint::from_raw(fp), 1)
+    }
+
+    #[test]
+    fn the_stream_cache_forgets_everything_once_the_interval_has_passed() {
+        let t0 = Instant::now();
+        let mut cache = StreamCache::new(10, Duration::from_secs(3_600), t0);
+        let k = stream_key(1);
+        cache.insert(k.clone());
+        assert!(
+            cache.roll(t0 + Duration::from_secs(3_599)).is_none(),
+            "nothing is forgotten before the interval has passed"
+        );
+        assert!(cache.contains(&k), "the key is still held at 3599 s");
+        let forgotten = cache
+            .roll(t0 + Duration::from_secs(3_600))
+            .expect("the cache is emptied once the interval has passed");
+        assert_eq!(forgotten.len(), 1, "it hands back what it held");
+        assert!(!cache.contains(&k), "and no longer holds the key");
+        assert!(
+            cache.roll(t0 + Duration::from_secs(3_600)).is_none(),
+            "the interval restarts at the reset"
+        );
+    }
+
+    #[test]
+    fn forget_all_hands_back_what_the_cache_held() {
+        let t0 = Instant::now();
+        let mut cache = StreamCache::new(10, Duration::from_secs(3_600), t0);
+        cache.insert(stream_key(1));
+        cache.insert(stream_key(2));
+        let forgotten = cache.forget_all();
+        assert_eq!(forgotten.len(), 2, "both keys are handed back");
+        assert!(!cache.contains(&stream_key(1)));
+        assert!(!cache.contains(&stream_key(2)));
+        assert!(
+            cache.roll(t0 + Duration::from_secs(3_599)).is_none(),
+            "a forget does not move the interval's start"
+        );
+    }
+
+    #[test]
+    fn take_empties_the_descriptor_cache() {
+        let mut cache = DescriptorCache::new(10);
+        cache.promote("", "up", "gauge", "h", "", 5, 100);
+        let taken = cache.take();
+        assert_eq!(taken.len(), 1, "the promoted descriptor is handed back");
+        assert!(
+            !cache.is_current("", "up", "gauge", "h", "", 5),
+            "the remaining cache holds nothing"
+        );
     }
 }

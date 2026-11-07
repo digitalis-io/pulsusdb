@@ -31,6 +31,7 @@ xtask/docker/certs/
 # directory, per `writer::config::WriterRuntime`'s documented constant.
 /spool/
 crates/pulsus-write/spool/
+crates/pulsus-server/spool/
 # pulsus-read's #167 live executor-proof test drives the same writer
 # core (dev-dep), so its injected poison spools land under this crate
 # too when run locally.

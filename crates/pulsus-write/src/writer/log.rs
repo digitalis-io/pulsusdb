@@ -32,7 +32,11 @@
 //!
 //! **Registration**: `StreamLru` promotion stays success-only — the LRU is
 //! promoted when the block commits, never at admission — keyed
-//! `(tenant, fingerprint, month)` (issue #653). A registration is a kind-1 row inside the lines'
+//! `(tenant, fingerprint, month)` (issue #653). The cache holds what this
+//! writer's commits registered since it last forgot (issue #786): every
+//! ending but a commit forgets all of it, and so does the first admission
+//! once `STREAM_RESEND_INTERVAL` has passed since the cache was last emptied
+//! that way. A registration is a kind-1 row inside the lines'
 //! own block rather than its own insert, so there is no "lines committed,
 //! registration lost" orphan left to heal and **no registration backfill on
 //! this path** (issue #134's mechanism goes with it).
@@ -70,12 +74,12 @@ use crate::writer::config::WriterRuntime;
 use crate::writer::drain::{AdmissionPass, DrainBoundary};
 use crate::writer::error::WriteError;
 use crate::writer::landing::{
-    LandingBlock, LandingContext, LandingFate, LandingQueue, MSG_SHUTDOWN_QUEUED, TerminalCause,
-    day_span, landing_charge, settle_block, spawn_landing_worker,
+    FailureHook, LandingBlock, LandingContext, LandingFate, LandingQueue, MSG_SHUTDOWN_QUEUED,
+    TerminalCause, day_span, landing_charge, settle_block, spawn_landing_worker,
 };
 use crate::writer::metrics::{WriterMetrics, WriterMetricsSnapshot};
 use crate::writer::push_dedup::{self, Admission, ClaimTicket, PushDedup};
-use crate::writer::registration::{StreamKey, StreamLru};
+use crate::writer::registration::{StreamCache, StreamKey, StreamLru};
 use crate::writer::rows::{LogLandingRow, LogSampleRow, LogStreamRow};
 use crate::writer::spool::SpoolWriter;
 use crate::writer::table::{BlockInserter, ChBlockInserter, XorShift64, spawn_dedup_ticker};
@@ -153,7 +157,7 @@ struct Shared {
     queued_bytes: Arc<AtomicU64>,
     runtime: Arc<WriterRuntime>,
     metrics: Arc<WriterMetrics>,
-    lru: Arc<Mutex<StreamLru>>,
+    lru: Arc<Mutex<StreamCache>>,
     /// The shutdown boundary: the admission gate, the announced deadline and
     /// every task this writer spawned (`writer::drain`).
     boundary: DrainBoundary,
@@ -228,7 +232,11 @@ impl LogWriter {
         let queued_bytes = Arc::new(AtomicU64::new(0));
         let spool = Arc::new(SpoolWriter::new(runtime.spool_dir.clone(), metrics.clone()));
         let boundary = DrainBoundary::new();
-        let lru = Arc::new(Mutex::new(StreamLru::new(runtime.lru_capacity)));
+        let lru = Arc::new(Mutex::new(StreamCache::new(
+            runtime.lru_capacity,
+            runtime.stream_resend_interval,
+            tokio::time::Instant::now(),
+        )));
 
         // Issue #494: one index per signal. The landing insert is the one
         // target, so it is the one thing a suppressed caller's answer waits
@@ -243,9 +251,13 @@ impl LogWriter {
         });
 
         // `log_streams`'s success-only LRU promotion: populated ONLY here,
-        // after a confirmed commit — never optimistically at admission. A push
-        // whose insert failed emits its registration rows again next time,
-        // which is what removed the need for a registration backfill.
+        // after a confirmed commit — never optimistically at admission. The
+        // cache then holds what this writer's commits registered since it last
+        // forgot: the failure hook below forgets everything at every ending
+        // but a commit, and admission forgets everything once the resend
+        // interval has passed (issue #786). A push whose insert failed emits
+        // its registration rows again next time, which is what removed the
+        // need for a registration backfill.
         let lru_for_hook = lru.clone();
         let on_commit: crate::writer::landing::CommitHook<LogLandingRow> =
             Arc::new(move |parts: &[&[LogLandingRow]]| {
@@ -256,6 +268,14 @@ impl LogWriter {
                     }
                 }
             });
+        let cache = lru.clone();
+        let on_failure: FailureHook = Arc::new(move || {
+            let forgotten = cache
+                .lock()
+                .expect("stream lru mutex poisoned")
+                .forget_all();
+            drop(forgotten);
+        });
 
         let ctx = Arc::new(LandingContext {
             table: tables.landing,
@@ -265,6 +285,7 @@ impl LogWriter {
             queued_bytes: queued_bytes.clone(),
             spool,
             on_commit: Some(on_commit),
+            on_failure: Some(on_failure),
             retries: runtime.log_landing_retries,
             max_rows: runtime.log_landing_max_rows,
             // Issue #494 part 2: log blocks are batched, and each batch's
@@ -384,8 +405,10 @@ impl LogWriter {
             .sum();
 
         // LRU-gate stream registration: a hit means this `(fingerprint,
-        // month)` was already durably registered by a prior committed block,
-        // so this request's copy is skipped entirely. A miss (including a
+        // month)` was registered by a block this writer committed since the
+        // cache last forgot — at a failed ending, or once the resend interval
+        // has passed (issue #786) — so this request's copy is skipped
+        // entirely. A miss (including a
         // concurrent, still-uncommitted duplicate) is landed; the
         // duplicate-tolerant design is documented on `writer::registration`.
         //
@@ -395,8 +418,12 @@ impl LogWriter {
         // issue #494's suppression path is observably unchanged.
         let count = suppressed.is_none();
         let mut new_streams: Vec<&StreamRow> = Vec::new();
+        // What the hourly reset hands back is dropped after the lock is
+        // released, so no admission waits behind it.
+        let expired: Option<StreamLru>;
         {
             let mut lru = self.shared.lru.lock().expect("stream lru mutex poisoned");
+            expired = lru.roll(admitted_at);
             for stream in &batch.streams {
                 let key = (
                     Arc::clone(tenant.as_arc()),
@@ -421,6 +448,7 @@ impl LogWriter {
                 }
             }
         }
+        drop(expired);
         let stream_bytes: u64 = new_streams
             .iter()
             .copied()

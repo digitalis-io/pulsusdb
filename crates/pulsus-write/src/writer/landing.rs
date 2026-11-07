@@ -299,6 +299,11 @@ impl<R> LandingBlock<R> {
 /// `type_complexity`.
 pub(crate) type CommitHook<R> = Arc<dyn Fn(&[&[R]]) + Send + Sync>;
 
+/// A callback for every ending but a commit: the signal's registration
+/// caches are emptied, so the next push of each stream or series registers
+/// it again (issue #786).
+pub(crate) type FailureHook = Arc<dyn Fn() + Send + Sync>;
+
 /// What a landing worker needs to run a batch to an ending.
 pub(crate) struct LandingContext<R> {
     pub(crate) table: Arc<str>,
@@ -315,6 +320,9 @@ pub(crate) struct LandingContext<R> {
     /// rather than on the block, so what a queued block holds does not grow
     /// with the push.
     pub(crate) on_commit: Option<CommitHook<R>>,
+    /// Called once per batch by [`settle_batch`], before any member's claim
+    /// is reported.
+    pub(crate) on_failure: Option<FailureHook>,
     /// `PULSUS_<SIGNAL>_LANDING_RETRIES`, resolved by the signal's writer so
     /// this loop names no signal's config key.
     pub(crate) retries: u32,
@@ -860,6 +868,9 @@ pub(crate) async fn settle_batch<R>(
     use futures::StreamExt;
 
     let (kind, outcome, msg) = fate.settle();
+    if let Some(hook) = &ctx.on_failure {
+        hook();
+    }
     for member in &mut members {
         member.report_claim(outcome);
     }
@@ -960,6 +971,7 @@ mod tests {
             queued_bytes: Arc::new(AtomicU64::new(0)),
             spool: Arc::new(SpoolWriter::new(spool_dir.clone(), metrics)),
             on_commit: None,
+            on_failure: None,
             retries: 0,
             max_rows: 1_000,
             batch_settings: None,

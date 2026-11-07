@@ -204,9 +204,11 @@ impl TraceLandingPath {
             table_metrics: metrics.landing.clone(),
             queued_bytes: queued_bytes.clone(),
             spool,
-            // Nothing is promoted at a trace commit: there is no cache of
-            // anything already written anywhere on this path.
+            // Nothing is promoted at a trace commit, and nothing is forgotten
+            // at a failure: there is no cache of anything already written
+            // anywhere on this path.
             on_commit: None,
+            on_failure: None,
             retries: runtime.trace_landing_retries,
             max_rows: runtime.trace_landing_max_rows,
             // Issue #494 part 2: trace blocks are batched, and each batch's

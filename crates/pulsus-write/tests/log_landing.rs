@@ -1051,6 +1051,127 @@ async fn a_failed_log_block_leaves_the_stream_lru_empty_so_the_next_push_re_regi
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// One synchronous push of `two_lines_one_stream(1)`, awaited under a
+/// bound so a case that never settles fails rather than hangs.
+async fn push_one_stream(writer: &LogWriter) -> Result<(), pulsus_write::LogsIngestError> {
+    tokio::time::timeout(
+        Duration::from_secs(600),
+        writer
+            .admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                two_lines_one_stream(1),
+                PushHeaders::default(),
+            )
+            .expect("queue has room"),
+    )
+    .await
+    .expect("the loop settles")
+}
+
+/// **Issue #786, R1.** A block that ends without a commit forgets every
+/// stream registration the writer holds, including one an earlier commit
+/// recorded, so the next push of that stream carries its kind-1 row again.
+/// Both endings: an unknown fate and a refused insert.
+#[tokio::test(start_paused = true)]
+async fn a_failed_log_block_forgets_registrations_an_earlier_commit_recorded() {
+    for (failure, spool_kind) in [(Act::Uncertain, "uncertain"), (Act::Poison, "poison")] {
+        let cfg = WriterConfig {
+            log_landing_retries: 0,
+            log_patterns: false,
+            ingest_dedup: false,
+            ..unbatched_config()
+        };
+        let root = spool_root("forget-on-failure");
+        let inserter = MockInserter::new(vec![
+            Step::now(Act::Ok),
+            Step::now(failure),
+            Step::now(Act::Ok),
+        ]);
+        let writer = writer_with(&cfg, &root, inserter.clone());
+
+        push_one_stream(&writer)
+            .await
+            .expect("the first push commits");
+        push_one_stream(&writer)
+            .await
+            .expect_err("the second push's insert fails");
+        push_one_stream(&writer)
+            .await
+            .expect("the third push commits");
+
+        assert_eq!(
+            spool_records(&root, spool_kind).len(),
+            1,
+            "{failure:?}: the failed block was spooled"
+        );
+        let second = inserter.rows_of(1);
+        assert_eq!(
+            rows_of_kind(&second, 1).len(),
+            0,
+            "{failure:?}: the first push registered the stream, so the second \
+             carried no registration: {second:#?}"
+        );
+        let first = inserter.rows_of(0);
+        let third = inserter.rows_of(2);
+        let registered = rows_of_kind(&first, 1);
+        let again = rows_of_kind(&third, 1);
+        assert_eq!(
+            again.len(),
+            1,
+            "{failure:?}: the failure forgot the registration, so the third push \
+             carries it again: {third:#?}"
+        );
+        assert_eq!(again[0]["fingerprint"], registered[0]["fingerprint"]);
+        assert_eq!(again[0]["labels"], registered[0]["labels"]);
+
+        writer.shutdown(Duration::from_secs(2)).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// **Issue #786, R2.** The stream cache is emptied once
+/// `STREAM_RESEND_INTERVAL` (3600 s) has passed since it was last emptied,
+/// so a registration is sent again by the first push at least an hour after
+/// the commit that recorded it — and not before.
+#[tokio::test(start_paused = true)]
+async fn a_stream_registration_is_sent_again_once_the_resend_interval_has_passed() {
+    let cfg = WriterConfig {
+        log_landing_retries: 0,
+        log_patterns: false,
+        ingest_dedup: false,
+        ..unbatched_config()
+    };
+    let root = spool_root("resend-interval");
+    let inserter = MockInserter::always(Act::Ok);
+    let t0 = tokio::time::Instant::now();
+    let writer = writer_with(&cfg, &root, inserter.clone());
+
+    push_one_stream(&writer).await.expect("push 1 commits");
+    push_one_stream(&writer).await.expect("push 2 commits");
+    assert_eq!(
+        t0.elapsed(),
+        Duration::ZERO,
+        "no timer moved the paused clock"
+    );
+    tokio::time::advance(Duration::from_secs(3_599)).await;
+    assert_eq!(t0.elapsed(), Duration::from_secs(3_599));
+    push_one_stream(&writer).await.expect("push 3 commits");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    push_one_stream(&writer).await.expect("push 4 commits");
+
+    let registrations: Vec<usize> = (0..inserter.call_count())
+        .map(|call| rows_of_kind(&inserter.rows_of(call), 1).len())
+        .collect();
+    assert_eq!(
+        registrations,
+        vec![1, 0, 0, 1],
+        "registered at the first push, held for 3599 s, sent again at 3600 s"
+    );
+
+    writer.shutdown(Duration::from_secs(2)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
 // -- the token, the endings and the shutdown --------------------------
 
 /// **T21.** A token is minted per sealed block and repeated byte-identically
