@@ -339,6 +339,7 @@ impl MetricWriter {
             queued_bytes: queued_bytes.clone(),
             spool,
             on_commit: Some(on_commit),
+            on_failure: None,
             retries: runtime.metrics_landing_retries,
             max_rows: runtime.metrics_landing_max_rows,
             // Metrics blocks are never batched (issue #494 part 2): a samples

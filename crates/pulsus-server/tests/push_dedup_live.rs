@@ -91,7 +91,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use prost::Message;
-use pulsus_clickhouse::{ChClient, QuerySettings, Row};
+use pulsus_clickhouse::{ChClient, Idempotency, QuerySettings, Row};
 use pulsus_model::Fingerprint;
 use pulsus_write::SeriesRef;
 use pulsus_write::protocols::loki_push::{EntryAdapter, PushRequest, StreamAdapter, Timestamp};
@@ -118,6 +118,7 @@ const COLLAPSE_PORT: u16 = 31_634;
 const BUDGET_PORT: u16 = 31_635;
 const MECHANISM_OFF_PORT: u16 = 31_636;
 const DESCRIPTOR_RACE_PORT: u16 = 31_638;
+const REREGISTER_PORT: u16 = 31_639;
 
 /// `2026-01-15T00:00:00Z` in nanoseconds — `T mod 5s == 0` and
 /// `T mod 10s == 0`, so L1's two entries share one rollup bucket and one
@@ -1112,6 +1113,119 @@ async fn a_concurrent_descriptor_race_leaves_one_visible_row() {
          would duplicate, never the one a repeat would correct",
     )
     .await;
+}
+
+// ---------------------------------------------------------------------
+// Issue #786 — a stream the tables lost is registered again
+// ---------------------------------------------------------------------
+
+/// Reads `sql` until it answers `want` or 30 s pass, and returns the last
+/// value read, so the caller's own assertion is what fails.
+async fn settle_scalar(client: &ChClient, sql: &str, want: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let last = scalar(client, sql).await;
+        if last == want || Instant::now() >= deadline {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// **Issue #786, R4.** The stream tables lose a registered stream while the
+/// writer runs, and the next push's insert fails. The failure empties the
+/// writer's stream cache, so the push after it registers the stream again,
+/// and `/labels` lists it.
+#[tokio::test]
+async fn a_stream_the_tables_lost_is_registered_again_after_a_failed_insert() {
+    if !should_run() {
+        eprintln!("skipping: PULSUS_TEST_CLICKHOUSE is not set");
+        return;
+    }
+    assert_port_free(REREGISTER_PORT);
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("a786_reregister")).await;
+    let _server = spawn_ready(REREGISTER_PORT, &db, &[("PULSUS_LOG_LANDING_RETRIES", "0")]);
+    let client = client_for(db.name()).await;
+    let ddl = |sql: String| {
+        let client = &client;
+        async move {
+            client
+                .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    };
+    let base = epoch_ms() * 1_000_000;
+
+    let p1 = push_logs(REREGISTER_PORT, &logs_body("rereg", base), &[]);
+    assert_eq!(p1.status, 204, "P1: {}", p1.body);
+    wait_for_scalar(
+        &client,
+        "SELECT count() AS n FROM log_streams WHERE service = 'rereg'",
+        1,
+        "P1 registered its stream",
+    )
+    .await;
+
+    // The tables lose the stream while the writer runs.
+    ddl(format!("TRUNCATE TABLE {db}.log_streams")).await;
+    ddl(format!("TRUNCATE TABLE {db}.log_streams_idx")).await;
+    ddl(format!("DETACH TABLE {db}.log_streams")).await;
+    let p2 = push_logs(
+        REREGISTER_PORT,
+        &logs_body("rereg", base + 10_000_000_000),
+        &[],
+    );
+    ddl(format!("ATTACH TABLE {db}.log_streams")).await;
+    assert_eq!(p2.status, 500, "P2: {}", p2.body);
+    assert!(
+        p2.body.contains("insert commit fate is unknown"),
+        "P2: {}",
+        p2.body
+    );
+
+    let p3 = push_logs(
+        REREGISTER_PORT,
+        &logs_body("rereg", base + 20_000_000_000),
+        &[],
+    );
+    assert_eq!(p3.status, 204, "P3: {}", p3.body);
+
+    let streams = settle_scalar(
+        &client,
+        "SELECT count() AS n FROM log_streams WHERE service = 'rereg'",
+        1,
+    )
+    .await;
+    assert_eq!(streams, 1, "P3 registered the stream again");
+    let index = settle_scalar(
+        &client,
+        "SELECT count() AS n FROM log_streams_idx \
+         WHERE fingerprint IN (SELECT fingerprint FROM log_samples WHERE service = 'rereg')",
+        2,
+    )
+    .await;
+    assert_eq!(index, 2, "with one index row per label");
+
+    let hour_ns = 3_600_000_000_000i64;
+    let path = format!(
+        "/api/logs/v1/labels?start={}&end={}",
+        base - hour_ns,
+        base + hour_ns
+    );
+    let want = serde_json::json!(["job", "service_name"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let labels = loop {
+        let response = http_get(REREGISTER_PORT, &path);
+        assert_eq!(response.status, 200, "/labels: {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body).expect("a JSON body");
+        let data = body["data"].clone();
+        if data == want || Instant::now() >= deadline {
+            break data;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    assert_eq!(labels, want, "/labels lists the pushed stream's names");
 }
 
 // ---------------------------------------------------------------------

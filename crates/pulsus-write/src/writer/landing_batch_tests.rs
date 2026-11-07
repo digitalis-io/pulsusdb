@@ -249,6 +249,9 @@ struct Opts {
     metrics: bool,
     park_spool: bool,
     hold_first: bool,
+    /// The context's failure hook reports each call on an `entered`
+    /// channel, then blocks until the case sends on `release` (issue #786).
+    failure_gate: bool,
 }
 
 impl Default for Opts {
@@ -265,6 +268,7 @@ impl Default for Opts {
             metrics: false,
             park_spool: false,
             hold_first: false,
+            failure_gate: false,
         }
     }
 }
@@ -282,6 +286,9 @@ struct Rig<R> {
     workers: Vec<tokio::task::JoinHandle<()>>,
     observers: Vec<tokio::task::JoinHandle<()>>,
     t0: Instant,
+    /// With [`Opts::failure_gate`]: the failure hook's `entered` receiver and
+    /// `release` sender.
+    failure_gate: Option<(std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>)>,
 }
 
 impl<R: TestRow> Rig<R> {
@@ -318,6 +325,18 @@ impl<R: TestRow> Rig<R> {
                     .push(parts.iter().map(|p| p.to_vec()).collect());
             })
         };
+        let (on_failure, failure_gate) = if opts.failure_gate {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let release_rx = Mutex::new(release_rx);
+            let hook: FailureHook = Arc::new(move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.lock().expect("release").recv();
+            });
+            (Some(hook), Some((entered_rx, release_tx)))
+        } else {
+            (None, None)
+        };
         let ctx = Arc::new(LandingContext {
             table: Arc::from(R::TABLE),
             inserter: inserter.clone(),
@@ -326,6 +345,7 @@ impl<R: TestRow> Rig<R> {
             queued_bytes: Arc::new(AtomicU64::new(0)),
             spool: Arc::new(SpoolWriter::new(spool_dir, metrics).with_gate(gate.clone())),
             on_commit: Some(hook),
+            on_failure,
             retries: opts.retries,
             max_rows: opts.max_rows,
             batch_settings: if opts.metrics {
@@ -353,6 +373,7 @@ impl<R: TestRow> Rig<R> {
             workers,
             observers: Vec::new(),
             t0: Instant::now(),
+            failure_gate,
         }
     }
 
@@ -394,6 +415,40 @@ impl<R: TestRow> Rig<R> {
             claim
         };
         self.push_with_claim(member, rows, bytes, admitted_ms, span, claim);
+    }
+
+    /// [`Self::push_with_claim`] with a recorded claim and no span, handing
+    /// back the member's waiter instead of spawning an observer for it.
+    fn push_waiting(
+        &mut self,
+        member: u32,
+        rows: u32,
+        bytes: u64,
+        admitted_ms: i64,
+    ) -> oneshot::Receiver<Result<(), WriteError>> {
+        let claim = ClaimTicket::inert().recorded(u64::from(member), self.claims.clone());
+        let claim = if R::REPLAY_SAFE {
+            claim.replay_safe()
+        } else {
+            claim
+        };
+        let (wtx, wrx) = oneshot::channel();
+        self.ctx.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        let block = LandingBlock::seal(
+            (0..rows).map(|i| R::tagged(member, i)).collect(),
+            bytes,
+            QuerySettings::new(),
+            claim,
+            Some(wtx),
+            self.at(admitted_ms),
+            None,
+        );
+        self.tx
+            .as_ref()
+            .expect("the queue is open")
+            .send(block)
+            .unwrap_or_else(|_| panic!("the queue is open"));
+        wrx
     }
 
     fn push_with_claim(
@@ -1635,4 +1690,43 @@ async fn u12_the_worker_matches_the_reference_model() {
         counts.iter().all(|&c| c > 0),
         "the generated cases reach every listed situation (deadline in a lapse, a backoff reaching it, an uncertain attempt then the deadline in its backoff): {counts:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #786: the failure hook runs before the caller is answered.
+// ---------------------------------------------------------------------------
+
+/// **R6.** A batch that ends without a commit runs the context's failure hook
+/// before any member is answered, so a client that resends after its `500`
+/// is admitted against the emptied registration caches. The hook blocks a
+/// runtime thread while the case looks at the waiter, hence two workers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn u21_the_failure_hook_runs_before_the_caller_is_answered() {
+    let opts = Opts {
+        window_ms: 0,
+        retries: 0,
+        script: vec![(Outcome::Poison, Duration::ZERO)],
+        failure_gate: true,
+        ..Opts::default()
+    };
+    let mut rig = Rig::<LogLandingRow>::new(&opts);
+    let (entered, release) = rig.failure_gate.take().expect("the failure gate");
+    let mut rx = rig.push_waiting(1, 1, 101, 0);
+
+    let entered = tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(5)))
+        .await
+        .expect("the blocking read");
+    assert!(entered.is_ok(), "the failure hook never ran");
+    let early = rx.try_recv();
+    assert!(
+        matches!(early, Err(oneshot::error::TryRecvError::Empty)),
+        "the caller is not answered while the failure hook runs: {early:?}"
+    );
+    release.send(()).expect("the hook waits for this");
+    let answer = tokio::time::timeout(Duration::from_secs(5), rx).await;
+    assert!(
+        matches!(answer, Ok(Ok(Err(WriteError::Poisoned(_))))),
+        "the caller is answered once the hook returns: {answer:?}"
+    );
+    rig.finish().await;
 }

@@ -27,7 +27,7 @@ use pulsus_config::WriterConfig;
 use pulsus_model::{Date, Fingerprint, LabelSet, UnixNano};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
-use pulsus_write::writer::{LogWriter, WriterTables};
+use pulsus_write::writer::{ChBlockInserter, LogWriter, WriterRuntime, WriterTables};
 use pulsus_write::{LogRow, LogSink, ParsedLogs, PushHeaders, StreamRow};
 
 const SERVICE: &str = "checkout-api";
@@ -148,6 +148,11 @@ async fn count(client: &ChClient, sql: &str) -> u64 {
 /// `log_streams_idx` takes exactly two rows; both lines in one 10 s window, so
 /// the rollup takes one bucket.
 fn fixture() -> (ParsedLogs, u64) {
+    fixture_for(42)
+}
+
+/// [`fixture`] with the stream's fingerprint `fp`.
+fn fixture_for(fp: u128) -> (ParsedLogs, u64) {
     let ts = now_ns();
     let bodies = ["request 1 completed", "request 2 completed"];
     let body_bytes: u64 = bodies.iter().map(|b| b.len() as u64).sum();
@@ -160,7 +165,7 @@ fn fixture() -> (ParsedLogs, u64) {
             .iter()
             .map(|body| LogRow {
                 service: SERVICE.to_string(),
-                fingerprint: Fingerprint::from_raw(42),
+                fingerprint: Fingerprint::from_raw(fp),
                 timestamp_ns: UnixNano(ts),
                 severity: 0,
                 body: (*body).to_string(),
@@ -169,7 +174,7 @@ fn fixture() -> (ParsedLogs, u64) {
             .collect(),
         streams: vec![StreamRow {
             month: Date::start_of_month_utc(ts).expect("a representable month"),
-            fingerprint: Fingerprint::from_raw(42),
+            fingerprint: Fingerprint::from_raw(fp),
             service: SERVICE.to_string(),
             labels,
             updated_ns: ts,
@@ -544,6 +549,100 @@ async fn eight_log_pushes_admitted_together_are_one_landing_insert() {
     );
 
     writer.shutdown(Duration::from_secs(5)).await;
+    drop_database(&bootstrap, &db).await;
+}
+
+/// **Issue #786, R5.** A commit made while the stream views were detached
+/// stores the lines and no registration, and the writer still records the
+/// stream as registered. The stream cache is emptied once its resend
+/// interval has passed, so a push after that registers the stream again.
+#[tokio::test]
+async fn a_commit_the_stream_views_missed_is_registered_again_after_the_interval() {
+    skip_unless_live!();
+    let (bootstrap, db, client, default_writer) =
+        live_writer(pulsus_testkit::test_db("pulsus_write_it_log_stream_resend")).await;
+    default_writer.shutdown(Duration::from_secs(5)).await;
+
+    let spool = std::env::temp_dir().join(format!(
+        "pulsus-live-log-stream-resend-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let mut runtime = WriterRuntime::from_config(&unbatched_config());
+    runtime.stream_resend_interval = Duration::from_secs(2);
+    runtime.spool_dir = spool.clone();
+    let writer = LogWriter::with_landing_inserter_and_runtime(
+        Arc::new(ChBlockInserter::new(client.clone())),
+        runtime,
+        WriterTables::logs_default(),
+    );
+    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
+    let push = |fp: u128| {
+        writer
+            .admit_flush(&tenant, fixture_for(fp).0, PushHeaders::default())
+            .expect("the queue has room")
+    };
+    let ddl = |sql: String| {
+        let client = client.clone();
+        async move {
+            client
+                .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    };
+    let streams_of =
+        |fp: u128| format!("SELECT count() AS n FROM {db}.log_streams WHERE fingerprint = {fp}");
+
+    push(42).await.expect("P1 commits");
+    assert_eq!(
+        count(&client, &streams_of(42)).await,
+        1,
+        "P1 registered its stream"
+    );
+
+    ddl(format!("DETACH TABLE {db}.log_streams_mv")).await;
+    ddl(format!("DETACH TABLE {db}.log_streams_idx_mv")).await;
+    push(786).await.expect("P2 commits");
+    ddl(format!("ATTACH TABLE {db}.log_streams_mv")).await;
+    ddl(format!("ATTACH TABLE {db}.log_streams_idx_mv")).await;
+    assert_eq!(
+        count(
+            &client,
+            &format!("SELECT count() AS n FROM {db}.log_samples WHERE fingerprint = 786")
+        )
+        .await,
+        2,
+        "P2 stored its lines"
+    );
+    assert_eq!(
+        count(&client, &streams_of(786)).await,
+        0,
+        "and no registration: the commit the stream views missed"
+    );
+
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    push(786).await.expect("P3 commits");
+    assert_eq!(
+        count(&client, &streams_of(786)).await,
+        1,
+        "the interval passed, so P3 registered the stream again"
+    );
+    assert_eq!(
+        count(
+            &client,
+            &format!("SELECT count() AS n FROM {db}.log_streams_idx WHERE fingerprint = 786")
+        )
+        .await,
+        2,
+        "with its two index rows"
+    );
+
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&spool).ok();
     drop_database(&bootstrap, &db).await;
 }
 

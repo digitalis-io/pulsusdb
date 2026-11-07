@@ -265,6 +265,7 @@ impl LogWriter {
             queued_bytes: queued_bytes.clone(),
             spool,
             on_commit: Some(on_commit),
+            on_failure: None,
             retries: runtime.log_landing_retries,
             max_rows: runtime.log_landing_max_rows,
             // Issue #494 part 2: log blocks are batched, and each batch's

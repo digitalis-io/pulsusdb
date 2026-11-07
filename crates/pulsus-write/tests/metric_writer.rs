@@ -2340,6 +2340,84 @@ async fn a_descriptor_whose_block_failed_is_sent_again() {
     panic!("two attempts in a row crossed an hour boundary");
 }
 
+/// **Issue #786, R3.** A metrics block that ends without a commit forgets
+/// every series registration and every descriptor the writer holds,
+/// including those an earlier commit recorded, so the next push carries its
+/// kind-2 rows and its descriptor again. Both endings: an unknown fate and a
+/// refused insert.
+///
+/// The writer keys the hourly resend on the wall clock, so a run that
+/// crosses an hour boundary is repeated rather than read.
+#[tokio::test]
+async fn a_failed_metrics_block_forgets_the_series_and_descriptors_an_earlier_commit_recorded() {
+    for failure in [Act::Uncertain, Act::Poison] {
+        let mut checked = false;
+        for _attempt in 0..2 {
+            let hour = descriptor_hour();
+            let cfg = WriterConfig {
+                metrics_landing_inserters: 1,
+                metrics_landing_retries: 0,
+                ingest_dedup: false,
+                ..Default::default()
+            };
+            let root = spool_root("forget-on-failure");
+            let inserter = MockInserter::new(vec![
+                Step::now(Act::Ok),
+                Step::now(Act::Ok),
+                Step::now(failure),
+                Step::now(Act::Ok),
+                Step::now(Act::Ok),
+            ]);
+            let writer = writer_with(&cfg, &root, inserter.clone());
+
+            push_and_commit(&writer, mixed_push(1_000, 1, true)).await;
+            answer_of(
+                &writer,
+                &no_tenant(),
+                mixed_push(1_001, 2, false),
+                PushHeaders::default(),
+            )
+            .await
+            .expect_err("the second push's insert fails");
+            wait_for(|| writer.metrics().queue_bytes == 0).await;
+            push_and_commit(&writer, mixed_push(1_002, 3, true)).await;
+            writer.shutdown(Duration::from_secs(2)).await;
+            std::fs::remove_dir_all(&root).ok();
+            if descriptor_hour() != hour {
+                continue;
+            }
+
+            let n = rows_of_kind(&inserter.rows_of(0), 2).len();
+            assert!(n > 0, "{failure:?}: the first push registered its series");
+            assert_eq!(
+                rows_of_kind(&inserter.rows_of(2), 2).len(),
+                0,
+                "{failure:?}: so the second push carried no registration"
+            );
+            assert_eq!(
+                rows_of_kind(&inserter.rows_of(3), 2).len(),
+                n,
+                "{failure:?}: the failure forgot the series, so the third push \
+                 registers them again"
+            );
+            assert_eq!(
+                inserter.call_count(),
+                5,
+                "{failure:?}: the third push's descriptor was due again, so it \
+                 is two inserts"
+            );
+            assert_eq!(
+                kinds(&inserter.rows_of(4)),
+                vec![3],
+                "{failure:?}: and the fifth insert is its descriptor block"
+            );
+            checked = true;
+            break;
+        }
+        assert!(checked, "two attempts in a row crossed an hour boundary");
+    }
+}
+
 // -- the block's columns ----------------------------------------------
 
 /// Every landing column carries the value its kind was built from, in the

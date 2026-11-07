@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use pulsus_config::WriterConfig;
 
+use crate::writer::registration::STREAM_RESEND_INTERVAL;
+
 /// Base delay for the landing workers' exponential-backoff-with-full-jitter
 /// retry policy (`writer::table`'s hand-rolled xorshift jitter — no `rand`
 /// dependency).
@@ -72,6 +74,12 @@ pub struct WriterRuntime {
     #[doc(hidden)]
     pub retry_jitter_seed: Option<u64>,
     pub lru_capacity: usize,
+    /// How long the log writer's stream cache is kept before it is emptied
+    /// whole: [`STREAM_RESEND_INTERVAL`] (issue #786). Read by `LogWriter`
+    /// alone. A field rather than the constant read in place, so a live case
+    /// can set seconds instead of waiting an hour.
+    #[doc(hidden)]
+    pub stream_resend_interval: Duration,
     pub spool_dir: PathBuf,
     /// `PULSUS_LOG_PATTERNS` (M7-C3, issue #171): the ingest-time log-pattern
     /// extraction kill-switch. `false` ⇒ zero extraction work and zero
@@ -164,6 +172,7 @@ impl WriterRuntime {
             retry_max_delay: RETRY_MAX_DELAY,
             retry_jitter_seed: None,
             lru_capacity: LRU_CAPACITY,
+            stream_resend_interval: STREAM_RESEND_INTERVAL,
             spool_dir: PathBuf::from(SPOOL_DIR),
             log_patterns: cfg.log_patterns,
             ingest_dedup: cfg.ingest_dedup,
