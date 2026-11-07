@@ -1682,13 +1682,16 @@ dependencies = [
  "hyper-util",
  "pulsus-config",
  "pulsus-testkit",
+ "rcgen",
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
  "serde",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]

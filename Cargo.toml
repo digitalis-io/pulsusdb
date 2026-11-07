@@ -50,10 +50,11 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 # ADR 0007 (issue #382) redirects this requirement to a vendored, patched copy
 # via the `[patch.crates-io]` entry below; every `clickhouse::...` import path
 # and the feature set here are unchanged.
-clickhouse = { version = "0.15", features = ["rustls-tls-webpki-roots", "futures03"] }
+clickhouse = { version = "0.15", features = ["futures03"] }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = "1"
 hyper-rustls = { version = "0.27", features = ["ring", "http1"] }
+webpki-roots = "1"
 # Inbound TLS termination on the HTTP listener (issue #174): tokio-rustls
 # wraps accepted TCP streams, rustls-pemfile loads the operator-supplied
 # PEM cert/key (`PULSUS_TLS_CERT`/`PULSUS_TLS_KEY`). Both were already in

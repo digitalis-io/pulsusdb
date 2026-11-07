@@ -21,6 +21,8 @@ pub mod json_column;
 mod pool;
 mod settings;
 mod tls;
+#[cfg(test)]
+mod tls_tests;
 
 pub use client::{ChClient, ChRow, ChRowStream, Row};
 pub use config::{ChConnConfig, ChEndpoint, ChProto, ConsistencyConfig, ResolvedEndpoint};
