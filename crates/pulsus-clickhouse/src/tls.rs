@@ -136,6 +136,37 @@ pub(crate) fn ca_file_ch_client(path: &str) -> Result<clickhouse::Client, ChErro
     Ok(clickhouse::Client::with_http_client(http))
 }
 
+/// The roots an `https` server is checked against when
+/// `CLICKHOUSE_TLS_CA_FILE` is unset. Stub (issue #790, tests first).
+pub(crate) fn public_roots() -> rustls::RootCertStore {
+    rustls::RootCertStore::empty()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Unit tests only: CA certificates `public_roots` appends, so a test server
+    /// can be trusted through the no-CA-file path. Read on the building thread.
+    pub(crate) static TEST_ROOTS: std::cell::RefCell<Vec<rustls_pki_types::CertificateDer<'static>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A client whose HTTPS transport verifies the server's certificate and name
+/// against `roots`. Stub (issue #790, tests first).
+pub(crate) fn verified_ch_client(
+    _roots: rustls::RootCertStore,
+) -> Result<clickhouse::Client, ChError> {
+    Ok(clickhouse::Client::default())
+}
+
+/// What `apply_transport` sets. A test can implement it to see both calls.
+pub(crate) trait TransportKnobs {
+    fn set_tcp_keepalive(&mut self, d: std::time::Duration);
+    fn set_pool_idle_timeout(&mut self, d: std::time::Duration);
+}
+
+/// Stub (issue #790, tests first).
+pub(crate) fn apply_transport(_k: &mut impl TransportKnobs) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

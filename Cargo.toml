@@ -54,6 +54,7 @@ clickhouse = { version = "0.15", features = ["rustls-tls-webpki-roots", "futures
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = "1"
 hyper-rustls = { version = "0.27", features = ["ring", "http1"] }
+webpki-roots = "1"
 # Inbound TLS termination on the HTTP listener (issue #174): tokio-rustls
 # wraps accepted TCP streams, rustls-pemfile loads the operator-supplied
 # PEM cert/key (`PULSUS_TLS_CERT`/`PULSUS_TLS_KEY`). Both were already in

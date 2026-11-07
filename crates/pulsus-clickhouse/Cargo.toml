@@ -16,6 +16,7 @@ rustls-pki-types.workspace = true
 rustls-pemfile.workspace = true
 hyper-rustls.workspace = true
 hyper-util.workspace = true
+webpki-roots.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
@@ -32,3 +33,7 @@ pulsus-config = { path = "../pulsus-config" }
 # the type parser from a workspace crate; the root `[patch.crates-io]` entry
 # redirects this requirement to `vendor/clickhouse-types`.
 clickhouse-types = "0.1.2"
+# Issue #790: test-only — the TLS tests make their certificates with
+# `rcgen` and serve them over loopback with `tokio-rustls`.
+rcgen = "0.13"
+tokio-rustls.workspace = true
