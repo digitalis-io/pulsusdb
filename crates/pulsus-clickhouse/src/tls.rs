@@ -1,5 +1,7 @@
-//! TLS client construction: skip-verify for `CLICKHOUSE_TLS_SKIP_VERIFY`, and
-//! a private CA for `CLICKHOUSE_TLS_CA_FILE` (issue #746 part D).
+//! TLS client construction: skip-verify for `CLICKHOUSE_TLS_SKIP_VERIFY`, a
+//! private CA for `CLICKHOUSE_TLS_CA_FILE` (issue #746 part D), and the
+//! public roots built into the binary otherwise (issue #790). All three are
+//! built by [`https_ch_client`].
 //!
 //! Encryption is preserved end-to-end; only the peer certificate is left
 //! unchecked (edge case #5, see [`crate::ChClient::new`]'s startup warning).
@@ -8,8 +10,10 @@
 //! workspace `bin` target.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 
 use crate::error::ChError;
@@ -90,13 +94,7 @@ fn danger_skip_verify_tls_config() -> Result<Arc<rustls::ClientConfig>, ChError>
 /// `.with_url`/`.with_database`/`.with_user`/`.with_password`.
 pub(crate) fn skip_verify_ch_client() -> Result<clickhouse::Client, ChError> {
     let tls_config = (*danger_skip_verify_tls_config()?).clone();
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config)
-        .https_only()
-        .enable_http1()
-        .build();
-    let http = HyperClient::builder(TokioExecutor::new()).build(connector);
-    Ok(clickhouse::Client::with_http_client(http))
+    Ok(https_ch_client(tls_config))
 }
 
 /// The CA certificates of the PEM file at `path`, as a root store. Every
@@ -116,30 +114,18 @@ pub fn ca_root_store(path: &str) -> Result<rustls::RootCertStore, ChError> {
     Ok(roots)
 }
 
-/// A `clickhouse::Client` whose HTTPS transport verifies the server against
-/// the CA file at `path` only, with the same explicit `ring` provider as
-/// the skip-verify builder above.
-pub(crate) fn ca_file_ch_client(path: &str) -> Result<clickhouse::Client, ChError> {
-    let roots = ca_root_store(path)?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let tls_config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| ChError::Config(format!("rustls: default protocol versions: {e}")))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config)
-        .https_only()
-        .enable_http1()
-        .build();
-    let http = HyperClient::builder(TokioExecutor::new()).build(connector);
-    Ok(clickhouse::Client::with_http_client(http))
-}
-
 /// The roots an `https` server is checked against when
-/// `CLICKHOUSE_TLS_CA_FILE` is unset. Stub (issue #790, tests first).
+/// `CLICKHOUSE_TLS_CA_FILE` is unset: the public set built into the binary.
 pub(crate) fn public_roots() -> rustls::RootCertStore {
-    rustls::RootCertStore::empty()
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    #[cfg(test)]
+    TEST_ROOTS.with(|extra| {
+        for cert in extra.borrow().iter() {
+            roots.add(cert.clone()).expect("a test root parses");
+        }
+    });
+    roots
 }
 
 #[cfg(test)]
@@ -151,21 +137,65 @@ thread_local! {
 }
 
 /// A client whose HTTPS transport verifies the server's certificate and name
-/// against `roots`. Stub (issue #790, tests first).
+/// against `roots`, with the explicit `ring` provider.
 pub(crate) fn verified_ch_client(
-    _roots: rustls::RootCertStore,
+    roots: rustls::RootCertStore,
 ) -> Result<clickhouse::Client, ChError> {
-    Ok(clickhouse::Client::default())
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let tls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| ChError::Config(format!("rustls: default protocol versions: {e}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(https_ch_client(tls_config))
 }
+
+/// The plain-HTTP default client's transport settings
+/// (vendor/clickhouse/src/http_client.rs:40-44).
+pub(crate) const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What `apply_transport` sets. A test can implement it to see both calls.
 pub(crate) trait TransportKnobs {
-    fn set_tcp_keepalive(&mut self, d: std::time::Duration);
-    fn set_pool_idle_timeout(&mut self, d: std::time::Duration);
+    fn set_tcp_keepalive(&mut self, d: Duration);
+    fn set_pool_idle_timeout(&mut self, d: Duration);
 }
 
-/// Stub (issue #790, tests first).
-pub(crate) fn apply_transport(_k: &mut impl TransportKnobs) {}
+pub(crate) fn apply_transport(k: &mut impl TransportKnobs) {
+    k.set_tcp_keepalive(TCP_KEEPALIVE);
+    k.set_pool_idle_timeout(POOL_IDLE_TIMEOUT);
+}
+
+struct Transport {
+    connector: HttpConnector,
+    client: hyper_util::client::legacy::Builder,
+}
+
+impl TransportKnobs for Transport {
+    fn set_tcp_keepalive(&mut self, d: Duration) {
+        self.connector.set_keepalive(Some(d));
+    }
+    fn set_pool_idle_timeout(&mut self, d: Duration) {
+        self.client.pool_idle_timeout(d);
+    }
+}
+
+/// The one place a TLS `clickhouse::Client` is built.
+pub(crate) fn https_ch_client(tls_config: rustls::ClientConfig) -> clickhouse::Client {
+    let mut t = Transport {
+        connector: HttpConnector::new(),
+        client: HyperClient::builder(TokioExecutor::new()),
+    };
+    apply_transport(&mut t);
+    // The URL is `https`; the TLS layer below does the dialling.
+    t.connector.enforce_http(false);
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_only()
+        .enable_http1()
+        .wrap_connector(t.connector);
+    clickhouse::Client::with_http_client(t.client.build(https))
+}
 
 #[cfg(test)]
 mod tests {
