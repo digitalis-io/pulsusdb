@@ -15,9 +15,11 @@
 //! docs/schemas.md §2.1) collapses,
 //! so this cache trades a little redundant writing for a simple,
 //! well-understood eviction policy — never correctness. Optimistic
-//! promotion is deliberately NOT implemented: `insert` is called only after
-//! a row's flush is confirmed `Ok` (see `crate::writer::table`'s
-//! `on_flush_success` hook), never at admission time.
+//! promotion is deliberately NOT implemented: a cache is promoted by the
+//! landing commit hook (`crate::writer::landing`'s `CommitHook`), never at
+//! admission time. It is emptied by every ending but a commit (issue #786:
+//! the landing `FailureHook`), and the log writer's stream cache
+//! ([`StreamCache`]) is also emptied once per [`STREAM_RESEND_INTERVAL`].
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -89,10 +91,16 @@ impl StreamCache {
         }
     }
 
-    /// Step 0 stub: never forgets.
+    /// Empties the cache once `interval` has passed since it was last
+    /// emptied this way, handing back what it held so the caller can drop
+    /// it after releasing its lock.
     pub fn roll(&mut self, now: Instant) -> Option<StreamLru> {
-        let _ = (now, self.since, self.interval);
-        None
+        if now.saturating_duration_since(self.since) >= self.interval {
+            self.since = now;
+            Some(self.keys.take())
+        } else {
+            None
+        }
     }
 
     pub fn contains(&mut self, key: &StreamKey) -> bool {
@@ -103,9 +111,10 @@ impl StreamCache {
         self.keys.insert(key);
     }
 
-    /// Step 0 stub: keeps its keys.
+    /// Empties the cache, handing back what it held. The interval's start
+    /// is unchanged.
     pub fn forget_all(&mut self) -> StreamLru {
-        LruSet::new(1)
+        self.keys.take()
     }
 }
 
@@ -187,9 +196,10 @@ impl DescriptorCache {
         self.sent.insert(key, SentDescriptor { hour, updated_ns });
     }
 
-    /// Step 0 stub: leaves `self` unchanged.
+    /// Empties the cache, handing back what it held.
     pub fn take(&mut self) -> Self {
-        DescriptorCache::new(self.names.capacity)
+        let capacity = self.names.capacity;
+        std::mem::replace(self, DescriptorCache::new(capacity))
     }
 
     #[cfg(test)]
@@ -254,9 +264,9 @@ impl<K: Clone + Eq + Hash> LruSet<K> {
         self.index.is_empty()
     }
 
-    /// Step 0 stub: leaves `self` unchanged.
+    /// Empties the set, handing back what it held.
     pub fn take(&mut self) -> Self {
-        LruSet::new(self.capacity)
+        std::mem::replace(self, LruSet::new(self.capacity))
     }
 
     /// `true` if `key` is cached, promoting it to most-recently-used.

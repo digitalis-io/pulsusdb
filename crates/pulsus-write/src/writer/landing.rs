@@ -868,6 +868,9 @@ pub(crate) async fn settle_batch<R>(
     use futures::StreamExt;
 
     let (kind, outcome, msg) = fate.settle();
+    if let Some(hook) = &ctx.on_failure {
+        hook();
+    }
     for member in &mut members {
         member.report_claim(outcome);
     }
