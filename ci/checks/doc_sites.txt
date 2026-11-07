@@ -143,7 +143,8 @@ rewrite docs/decisions/0006-log-pattern-extraction.md:52-62 refs=#603
 # rewritten when that filter's range read moved into the database.
 # Issue #757 adds #757, its own issue, where the pushability table gains
 # its `word(…)` rows.
-rewrite crates/pulsus-read/src/logql/plan.rs:5573-5581 refs=#507,#544,#624,#12,#614,#757
+# Issue #793 adds #793, its own issue, where the stream matchers take their roles.
+rewrite crates/pulsus-read/src/logql/plan.rs:5573-5581 refs=#507,#544,#624,#12,#614,#757,#793
 leave docs/116.md:76-76
 leave docs/traceql-schema-migration.md:2289-2289
 # #478 and #555 join this column for the same reason as `docs/schemas.md`'s:

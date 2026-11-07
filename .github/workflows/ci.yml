@@ -1030,7 +1030,7 @@ jobs:
       # construct that carries a user regex x the pattern classes where
       # Go's regexp and the Rust regex crate disagree, plus the two
       # positions that MASK the whole set (a `| regexp` without a named
-      # capture, and a selector with no positive matcher: both sides
+      # capture, and a selector whose one matcher matches the empty string: both sides
       # refuse those for reasons that have nothing to do with the regex),
       # plus the template-function axis, whose reference half needs one
       # pushed line. Put to this same container and compared against the
@@ -1737,6 +1737,14 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test live_logs_tenants
+
+      # Issue #793: a matcher that matches the empty string selects the
+      # streams without its label, on every read that takes a selector.
+      - name: Live logs empty matcher
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test live_logs_empty_matcher
 
       # Issue #653: `X-Scope-OrgID` on every log route through the
       # binary — the sorting keys, three tenants' pushes on every route,

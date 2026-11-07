@@ -55,8 +55,8 @@
 //!    disagrees on **0 of 42** patterns. The matrix therefore probes
 //!    `| regexp "(?P<c>{P})"`, and the bare form is kept in [`MASKED`]
 //!    with a test that it still masks.
-//! 2. **`{app!~"P"}` masks everything.** A selector with no positive
-//!    matcher is refused outright on both sides — the reference with
+//! 2. **`{app!~"P"}` masks everything.** A selector whose one matcher
+//!    matches the empty string is refused on both sides — the reference with
 //!    `queries require at least one regexp or equality matcher…`, we with
 //!    `ReadError::EmptyMatcherSet`. Measured: **0 of 42** disagree. The
 //!    negated-selector position is spelled `{app="x", host!~"{P}"}`.
@@ -301,9 +301,10 @@ const POSITIONS: &[Position] = &[
     Position {
         id: "sel_nre",
         template: r#"{app="x", host!~"{P}"}"#,
-        why: "the selector's `!~`. Spelled WITH a positive matcher on purpose: `{app!~\"P\"}` \
-              alone is refused on both sides for having no positive matcher, which masks the \
-              whole pattern set — see `MASKED`.",
+        why: "the selector's `!~`. Spelled WITH `app=\"x\"`, a matcher that does not match the \
+              empty string, on purpose: `{app!~\"P\"}` alone is refused on both sides because \
+              its one matcher matches the empty string, which masks the whole pattern set — see \
+              `MASKED`.",
         reference: Rule::PerPattern,
         pulsus: Rule::PerPattern,
     },
@@ -463,7 +464,8 @@ const MASKED: &[Position] = &[
     Position {
         id: "MASKED_sel_nre_alone",
         template: r#"{app!~"{P}"}"#,
-        why: "a selector with no positive matcher is refused before the regex is looked at: \
+        why: "a selector whose one matcher matches the empty string is refused (no pattern \
+              here that the crate accepts matches it, so `app!~P` does): \
               the reference with `queries require at least one regexp or equality matcher \
               that does not have an empty-compatible value`, PulsusDB with \
               `ReadError::EmptyMatcherSet`. Measured: 0 of 42 points disagree.",
