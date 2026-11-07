@@ -55,8 +55,8 @@
 //!    disagrees on **0 of 42** patterns. The matrix therefore probes
 //!    `| regexp "(?P<c>{P})"`, and the bare form is kept in [`MASKED`]
 //!    with a test that it still masks.
-//! 2. **`{app!~"P"}` masks everything.** A selector with no positive
-//!    matcher is refused outright on both sides — the reference with
+//! 2. **`{app!~"P"}` masks everything.** A selector whose one matcher
+//!    matches the empty string is refused on both sides — the reference with
 //!    `queries require at least one regexp or equality matcher…`, we with
 //!    `ReadError::EmptyMatcherSet`. Measured: **0 of 42** disagree. The
 //!    negated-selector position is spelled `{app="x", host!~"{P}"}`.
@@ -301,9 +301,10 @@ const POSITIONS: &[Position] = &[
     Position {
         id: "sel_nre",
         template: r#"{app="x", host!~"{P}"}"#,
-        why: "the selector's `!~`. Spelled WITH a positive matcher on purpose: `{app!~\"P\"}` \
-              alone is refused on both sides for having no positive matcher, which masks the \
-              whole pattern set — see `MASKED`.",
+        why: "the selector's `!~`. Spelled WITH `app=\"x\"`, a matcher that does not match the \
+              empty string, on purpose: `{app!~\"P\"}` alone is refused on both sides because \
+              its one matcher matches the empty string, which masks the whole pattern set — see \
+              `MASKED`.",
         reference: Rule::PerPattern,
         pulsus: Rule::PerPattern,
     },
@@ -463,7 +464,8 @@ const MASKED: &[Position] = &[
     Position {
         id: "MASKED_sel_nre_alone",
         template: r#"{app!~"{P}"}"#,
-        why: "a selector with no positive matcher is refused before the regex is looked at: \
+        why: "a selector whose one matcher matches the empty string is refused (no pattern \
+              here that the crate accepts matches it, so `app!~P` does): \
               the reference with `queries require at least one regexp or equality matcher \
               that does not have an empty-compatible value`, PulsusDB with \
               `ReadError::EmptyMatcherSet`. Measured: 0 of 42 points disagree.",
@@ -2883,12 +2885,12 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
                 ("compile_regex(", 4),
                 ("compile_regex_as_database(", 4),
                 ("validate_regex_as_database(", 1),
-                ("compile_anchored_regex(", 4),
+                ("compile_anchored_regex(", 5),
                 ("validate_anchored_regex(", 1),
                 ("validate_unanchored_regex(", 1),
                 ("compile_drop_keep(", 3),
                 ("compile_user_regex(", 2),
-                ("compile_user_regex_anchored(", 1),
+                ("compile_user_regex_anchored(", 2),
                 ("re2_rejection_construct(", 1),
                 ("re2_reject_precheck(", 4),
             ],
@@ -2919,7 +2921,11 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
              §9.2, which RE2 reads as literals — and `line_after_line_format`/`regexp_named` \
              measure exactly that. The fourth `compile_regex_as_database(` is \
              `validate_regex_as_database`, which the `extractGroups` renderer calls (issue #624 \
-             part 3a, code review round 1).",
+             part 3a, code review round 1). **Issue #793 added one of each** in \
+             `anchored_regex_matches_empty`: a stream selector's verdict on the empty string. \
+             It decides a matcher's role, not acceptance: the as-written compile refuses \
+             exactly what it refuses today, and the rewrite is read only for its answer on \
+             \"\".",
         ),
         (
             "plan.rs",

@@ -1858,3 +1858,232 @@ fn an_offset_inside_the_timestamp_axis_still_renders_its_real_window() {
         "expected the shifted-but-representable window, got:\n{sql}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #793 — a matcher that matches the empty string selects streams
+// without its label. A stream without label `k` reads as `k=""`: a key is
+// required when one of its matchers does not match `""`, and a selector
+// needs at least one such matcher.
+// ---------------------------------------------------------------------
+
+fn stage1_793(query: &str) -> String {
+    streams_plan(query, &range_params(100, Direction::Backward)).stage1_sql
+}
+
+/// The plan result of `query`, as text: `Ok` with the stage-1 SQL of a
+/// streams plan, or the error.
+fn plan_793(query: &str) -> Result<String, String> {
+    let expr = parse(query).expect("parse");
+    match plan(&expr, &range_params(100, Direction::Backward), &ctx()) {
+        Ok(Plan::Streams(sp)) => Ok(sp.stage1_sql),
+        Ok(other) => Err(format!("not a streams plan: {other:?}")),
+        Err(e) => Err(format!("{e:?}")),
+    }
+}
+
+const S2_793: &str = "SELECT fingerprint\n\
+     FROM log_streams_idx\n\
+     WHERE org_id = '' AND month = '2026-07-01'\n\
+     \x20 AND ((key = 'host' AND match(val, '^(?:.+)$')) OR (key = 'unit' AND val != ''))\n\
+     GROUP BY fingerprint\n\
+     HAVING uniqExactIf((key, val), (key = 'host' AND match(val, '^(?:.+)$'))) = 1\n\
+     \x20  AND countIf((key = 'unit' AND val != '')) = 0";
+
+/// S1: a `=~` that matches `""` is a failure branch, not a required key.
+#[test]
+fn s1_793_a_regex_matching_empty_does_not_require_its_key() {
+    assert_eq!(
+        stage1_793(r#"{host=~".+", unit=~".*"}"#),
+        "SELECT fingerprint\n\
+         FROM log_streams_idx\n\
+         WHERE org_id = '' AND month = '2026-07-01'\n\
+         \x20 AND ((key = 'host' AND match(val, '^(?:.+)$')) OR (key = 'unit' AND NOT match(val, '^(?:.*)$')))\n\
+         GROUP BY fingerprint\n\
+         HAVING uniqExactIf((key, val), (key = 'host' AND match(val, '^(?:.+)$'))) = 1\n\
+         \x20  AND countIf((key = 'unit' AND NOT match(val, '^(?:.*)$'))) = 0"
+    );
+}
+
+/// S2: `unit=""` selects the streams without `unit`.
+#[test]
+fn s2_793_an_empty_equality_selects_streams_without_the_label() {
+    assert_eq!(stage1_793(r#"{host=~".+", unit=""}"#), S2_793);
+}
+
+/// S2m: the metric path reaches the same rule.
+#[test]
+fn s2m_793_the_metric_path_reaches_the_same_rule() {
+    let mp = metric_plan(
+        r#"sum(count_over_time({host=~".+", unit=""}[5m]))"#,
+        &range_params(100, Direction::Backward),
+    );
+    assert_eq!(mp.stage1_sql, S2_793);
+}
+
+/// S3 (control): the issue's negative row stays byte-identical.
+#[test]
+fn s3_793_a_negative_regex_not_matching_empty_is_unchanged() {
+    assert_eq!(
+        stage1_793(r#"{host=~".+", unit!~".+"}"#),
+        "SELECT fingerprint\n\
+         FROM log_streams_idx\n\
+         WHERE org_id = '' AND month = '2026-07-01'\n\
+         \x20 AND ((key = 'host' AND match(val, '^(?:.+)$')) OR (key = 'unit' AND match(val, '^(?:.+)$')))\n\
+         GROUP BY fingerprint\n\
+         HAVING uniqExactIf((key, val), (key = 'host' AND match(val, '^(?:.+)$'))) = 1\n\
+         \x20  AND countIf((key = 'unit' AND match(val, '^(?:.+)$'))) = 0"
+    );
+}
+
+/// S4: `unit!=""` requires `unit`.
+#[test]
+fn s4_793_not_equal_empty_requires_the_label() {
+    assert_eq!(
+        stage1_793(r#"{host=~".+", unit!=""}"#),
+        "SELECT fingerprint\n\
+         FROM log_streams_idx\n\
+         WHERE org_id = '' AND month = '2026-07-01'\n\
+         \x20 AND ((key = 'host' AND match(val, '^(?:.+)$')) OR (key = 'unit') OR (key = 'unit' AND val = ''))\n\
+         GROUP BY fingerprint\n\
+         HAVING uniqExactIf((key, val), (key = 'host' AND match(val, '^(?:.+)$')) OR (key = 'unit')) = 2\n\
+         \x20  AND countIf((key = 'unit' AND val = '')) = 0"
+    );
+}
+
+/// S5: `{unit!=""}` alone is served.
+#[test]
+fn s5_793_not_equal_empty_alone_is_served() {
+    assert_eq!(
+        plan_793(r#"{unit!=""}"#),
+        Ok("SELECT fingerprint\n\
+            FROM log_streams_idx\n\
+            WHERE org_id = '' AND month = '2026-07-01'\n\
+            \x20 AND ((key = 'unit') OR (key = 'unit' AND val = ''))\n\
+            GROUP BY fingerprint\n\
+            HAVING uniqExactIf((key, val), (key = 'unit')) = 1\n\
+            \x20  AND countIf((key = 'unit' AND val = '')) = 0"
+            .to_string())
+    );
+}
+
+/// S6: failure-branch order — negatives in matcher order, then the
+/// demoted group's.
+#[test]
+fn s6_793_failure_branches_keep_negatives_first() {
+    assert_eq!(
+        stage1_793(r#"{service_name="checkout", unit=~".*", unit!="a"}"#),
+        "SELECT fingerprint\n\
+         FROM log_streams_idx\n\
+         WHERE org_id = '' AND month = '2026-07-01'\n\
+         \x20 AND ((key = 'service_name' AND val = 'checkout') OR (key = 'unit' AND val = 'a') OR (key = 'unit' AND NOT match(val, '^(?:.*)$')))\n\
+         GROUP BY fingerprint\n\
+         HAVING uniqExactIf((key, val), (key = 'service_name' AND val = 'checkout')) = 1\n\
+         \x20  AND countIf((key = 'unit' AND val = 'a') OR (key = 'unit' AND NOT match(val, '^(?:.*)$'))) = 0"
+    );
+}
+
+/// S7 (control): a group with one pattern that cannot match `""` stays
+/// positive.
+#[test]
+fn s7_793_a_group_with_one_non_empty_pattern_stays_required() {
+    assert_eq!(
+        stage1_793(r#"{host=~".+", unit=~".*", unit=~".+"}"#),
+        "SELECT fingerprint\n\
+         FROM log_streams_idx\n\
+         WHERE org_id = '' AND month = '2026-07-01'\n\
+         \x20 AND ((key = 'host' AND match(val, '^(?:.+)$')) OR (key = 'unit' AND match(val, '^(?:.*)$') AND match(val, '^(?:.+)$')))\n\
+         GROUP BY fingerprint\n\
+         HAVING uniqExact(key, val) = 2"
+    );
+}
+
+/// S8 (control): the verdict on `""` is the database's reading of the
+/// pattern, not the as-written one.
+#[test]
+fn s8_793_the_verdict_on_empty_is_the_databases() {
+    assert_eq!(
+        stage1_793(r#"{host=~".+", unit=~"[a[b]]?"}"#),
+        "SELECT fingerprint\n\
+         FROM log_streams_idx\n\
+         WHERE org_id = '' AND month = '2026-07-01'\n\
+         \x20 AND ((key = 'host' AND match(val, '^(?:.+)$')) OR (key = 'unit' AND match(val, '^(?:[a[b]]?)$')))\n\
+         GROUP BY fingerprint\n\
+         HAVING uniqExact(key, val) = 2"
+    );
+}
+
+/// S9: a selector with no matcher that fails to match `""` is refused.
+#[test]
+fn s9_793_a_selector_every_matcher_of_which_matches_empty_is_refused() {
+    for q in [r#"{unit=~".*"}"#, r#"{unit=""}"#, r#"{unit=~".*", foo=""}"#] {
+        let expr = parse(q).expect("parse");
+        let got = plan(&expr, &range_params(100, Direction::Backward), &ctx());
+        assert!(
+            matches!(got, Err(pulsus_read::logql::ReadError::EmptyMatcherSet)),
+            "{q}: expected EmptyMatcherSet, got {:?}",
+            got.map(|_| "a plan")
+        );
+    }
+}
+
+/// S9c (control): `{unit!="x"}` matches `""` and stays refused.
+#[test]
+fn s9c_793_a_negative_matching_empty_alone_stays_refused() {
+    let q = r#"{unit!="x"}"#;
+    let expr = parse(q).expect("parse");
+    let got = plan(&expr, &range_params(100, Direction::Backward), &ctx());
+    assert!(
+        matches!(got, Err(pulsus_read::logql::ReadError::EmptyMatcherSet)),
+        "{q}: expected EmptyMatcherSet, got {:?}",
+        got.map(|_| "a plan")
+    );
+}
+
+/// S10 (control): a key a negative requires keeps its group positive.
+#[test]
+fn s10_793_a_key_a_negative_requires_keeps_its_group_positive() {
+    assert_eq!(
+        stage1_793(r#"{host=~".+", unit=~".*", unit!=""}"#),
+        "SELECT fingerprint\n\
+         FROM log_streams_idx\n\
+         WHERE org_id = '' AND month = '2026-07-01'\n\
+         \x20 AND ((key = 'host' AND match(val, '^(?:.+)$')) OR (key = 'unit' AND match(val, '^(?:.*)$')) OR (key = 'unit' AND val = ''))\n\
+         GROUP BY fingerprint\n\
+         HAVING uniqExactIf((key, val), (key = 'host' AND match(val, '^(?:.+)$')) OR (key = 'unit' AND match(val, '^(?:.*)$'))) = 2\n\
+         \x20  AND countIf((key = 'unit' AND val = '')) = 0"
+    );
+}
+
+/// S11: a `!~` whose regex matches `""` requires the key, and every value
+/// fails it: no stream.
+#[test]
+fn s11_793_a_negative_regex_matching_empty_requires_the_key() {
+    assert_eq!(
+        stage1_793(r#"{host=~".+", unit!~".*"}"#),
+        "SELECT fingerprint\n\
+         FROM log_streams_idx\n\
+         WHERE org_id = '' AND month = '2026-07-01'\n\
+         \x20 AND ((key = 'host' AND match(val, '^(?:.+)$')) OR (key = 'unit') OR (key = 'unit' AND match(val, '^(?:.*)$')))\n\
+         GROUP BY fingerprint\n\
+         HAVING uniqExactIf((key, val), (key = 'host' AND match(val, '^(?:.+)$')) OR (key = 'unit')) = 2\n\
+         \x20  AND countIf((key = 'unit' AND match(val, '^(?:.*)$'))) = 0"
+    );
+}
+
+/// S12: where the database's reading of the pattern does not compile, the
+/// as-written compile decides. The pattern is `[\pL--\d]*`; `ch_string`
+/// doubles each backslash in the statement text.
+#[test]
+fn s12_793_the_as_written_verdict_decides_when_the_rewrite_does_not_compile() {
+    assert_eq!(
+        plan_793(r#"{host=~".+", unit=~"[\\pL--\\d]*"}"#),
+        Ok("SELECT fingerprint\n\
+            FROM log_streams_idx\n\
+            WHERE org_id = '' AND month = '2026-07-01'\n\
+            \x20 AND ((key = 'host' AND match(val, '^(?:.+)$')) OR (key = 'unit' AND NOT match(val, '^(?:[\\\\pL--\\\\d]*)$')))\n\
+            GROUP BY fingerprint\n\
+            HAVING uniqExactIf((key, val), (key = 'host' AND match(val, '^(?:.+)$'))) = 1\n\
+            \x20  AND countIf((key = 'unit' AND NOT match(val, '^(?:[\\\\pL--\\\\d]*)$'))) = 0"
+            .to_string())
+    );
+}

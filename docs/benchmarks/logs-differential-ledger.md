@@ -4515,7 +4515,7 @@ often than they agree about it.
   the scouting run and each now built into the fixture: probing `| regexp`
   **without** a named capture (both sides refuse it for that reason alone
   — 0 of 44 disagree); probing the negated selector as `{app!~"P"}` (both
-  sides refuse a selector with no positive matcher — 0 of 44 disagree);
+  sides refuse it: no probed pattern either side accepts matches the empty string, so `app!~"P"` does, and a selector needs a matcher that does not — 0 of 44 disagree);
   and putting the live leg to a window older than `query_ingesters_within`
   (the reference's line filter is a build error, so it answers `200` there
   — the leg would score the whole of Direction B as agreement).

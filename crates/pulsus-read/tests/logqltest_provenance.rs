@@ -2080,6 +2080,10 @@ const TOTAL: usize = 1_817;
 /// Issue #624, part 7: `plan.rs` (1 -> 2) and `predicate.rs` (21 -> 22) gain
 /// one each, both in `mod tests`: the `match(` a planned line filter is
 /// checked to carry once, and the fragment a pruned `or` group renders.
+///
+/// Issue #793: `predicate.rs` (22 -> 23) gains one, the failure branch
+/// `index_re_failure_branch` renders for a `=~` whose pattern matches the
+/// empty string.
 const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-clickhouse/src/error.rs", 1),
     ("pulsus-read/src/logql/exec.rs", 3),
@@ -2091,7 +2095,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // move to bloom-filter indexes adds two more to that test, a negated
     // case-insensitive `match(identity(body), …)` and a plain
     // `match(body, …)`.
-    ("pulsus-read/src/logql/predicate.rs", 22),
+    ("pulsus-read/src/logql/predicate.rs", 23),
     // Issue #624, part 3d adds three to `sql.rs`: the `| logfmt` line
     // grammar in its `decided` column, and the out-of-range integer test in
     // each of the two `| json` key readers. Issue #624, part 4 adds twelve:
@@ -2128,7 +2132,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 109;
+const MATCH_RENDER_TOTAL: usize = 110;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
@@ -2537,6 +2541,8 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn metadata_filter_or(a: &CheckedFragment, b: &CheckedFragment) -> CheckedFragment",
     "fn check_partition(classes: &MetadataNameClasses<'_>) -> Result<(), MetadataFilterRefusal>",
     "fn classified_line_filter(lf: &LineFilter) -> Result<Option<CheckedFragment>, PipelineError>",
+    "pub fn index_eq_empty_failure_branch(key: &str) -> CheckedFragment",
+    "pub fn index_re_failure_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError>",
     "#[cfg(test)]",
     "mod tests",
     "mod tests :: use pulsus_model::Fingerprint",
@@ -2656,8 +2662,10 @@ const PREDICATE_ITEMS: &[&str] = &[
 /// carrying an `_extracted` name's stem label. **26 at issue #624, part 7**:
 /// `classified_line_filter`, which renders `1` for a line filter that keeps
 /// every line and `0` for one that drops every line, and a pruned `or` group
-/// through `line_filter`.
-const MINT_COUNT: usize = 26;
+/// through `line_filter`. **28 at issue #793**: `index_eq_empty_failure_branch`
+/// and `index_re_failure_branch`, the failure branches of a `=`/`=~` whose
+/// key no matcher requires.
+const MINT_COUNT: usize = 28;
 
 /// Attributes permitted anywhere in `predicate.rs`.
 const PREDICATE_ATTRIBUTES: &[&str] = &[

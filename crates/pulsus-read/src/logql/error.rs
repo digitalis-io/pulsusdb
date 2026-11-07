@@ -694,11 +694,11 @@ pub enum ReadError {
     #[error("promql: {0}")]
     Promql(#[from] pulsus_promql::PromqlError),
 
-    /// The selector has no positive (`=`/`=~`) matcher — Loki's
-    /// "match-everything" rejection (task-manager resolution #2: the coarse
-    /// "≥1 positive matcher" rule; precise regex-matches-empty detection is
-    /// deferred to M6).
-    #[error("selector matches everything: at least one equality or regexp matcher is required")]
+    /// The selector has no matcher that fails to match the empty string
+    /// (issue #793).
+    #[error(
+        "selector matches everything: at least one matcher that does not match the empty string is required (app=~\".+\" qualifies, app=~\".*\" does not)"
+    )]
     EmptyMatcherSet,
 
     /// Two `Eq` matchers on the same label key with different literal
@@ -1073,7 +1073,7 @@ mod tests {
         assert!(
             ReadError::EmptyMatcherSet
                 .to_string()
-                .contains("at least one equality or regexp matcher")
+                .contains("at least one matcher that does not match the empty string")
         );
     }
 

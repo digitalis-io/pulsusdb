@@ -54,10 +54,10 @@ Those are three projections of one traversal. `metric_pipeline_construct` is exa
 returning the first refusal and its reason"; `has_unpushed_dropping_stage` is "did the boundary
 fall short"; `compile_line_filters` is "the predicate the fold accumulated".
 
-Underneath them, `is_pushable_line_filter` (`plan.rs:4358`) carries a doc comment that states the
+Underneath them, `is_pushable_line_filter` (`plan.rs:4393`) carries a doc comment that states the
 problem in the codebase's own words — *"the single source of truth for 'does this line filter push
 down to SQL, or must it run in the client pipeline?' … so the two paths never drift"* — and it has
-five call sites across three files: `plan.rs:1708`, `plan.rs:1730`, `plan.rs:4333`,
+five call sites across three files: `plan.rs:1708`, `plan.rs:1730`, `plan.rs:4368`,
 `pipeline.rs:1180`, `exec.rs:2810`.
 
 TraceQL computes the same thing a fourth time and shares none of it:
@@ -414,7 +414,7 @@ disagrees on **463**; and the model below disagrees on **0**.
 
 **What that 0 covers, stated wherever the number appears.** The comparison is the **ordered list of
 line-filter values the model would conjoin** against the ordered list a **transcription** of
-`compile_line_filters` (`crates/pulsus-read/src/logql/plan.rs:4325`) emits — not against emitted
+`compile_line_filters` (`crates/pulsus-read/src/logql/plan.rs:4360`) emits — not against emitted
 SQL, and not against a running server. So 0 means the two agree on **which filters push and in what
 order**, over that atom set at that chain length. It does **not** cover the operator each filter
 renders, the escaping, the rest of the statement, or any stage the atom set does not contain. Two
@@ -565,7 +565,7 @@ exit=101
 ```
 
 That run's `predicate` line is a line filter pushed into SQL **after** a `line_format`, which is
-exactly the rule `compile_line_filters` breaks at today (`plan.rs:4340`). Break B's panic traces to the unchanged
+exactly the rule `compile_line_filters` breaks at today (`plan.rs:4375`). Break B's panic traces to the unchanged
 provenance and nothing incidental: with `body` left `Stored`, link 3's `capability` answers `Yes`,
 so it lowers.
 
@@ -1668,7 +1668,7 @@ maps to **`400`** with `Content-Type: text/plain; charset=utf-8` and `X-Content-
 
 **How this table is derived, because the previous one was transcribed and missed two rejections a
 user can reach today.** The enumeration is over a literal scope: **every `ReadError::` construction
-in `crates/pulsus-read/src/logql/plan.rs` above `mod tests` (`plan.rs:4967`)**, which is 25 sites at
+in `crates/pulsus-read/src/logql/plan.rs` above `mod tests` (`plan.rs:5002`)**, which is 25 sites at
 `2f78c53`, listed by `grep -n 'ReadError::[A-Z]' crates/pulsus-read/src/logql/plan.rs`. Every one of
 the 25 is either a row below or is excluded beneath the table with its reason, so completeness is a
 property of that grep and not of anyone's reading. Each row's body **and its reachability** were
@@ -1723,13 +1723,13 @@ lists and none in neither.
 - `plan.rs:3629`, `plan.rs:3636`, `plan.rs:3645` — the same three range-aggregation arity
   rejections as the rows above, re-checked on the `variants(…)` path. Identical bodies, identical
   links, reached only through a construct that is not in the chain.
-- `plan.rs:4258` (`ContradictoryMatchers`) and `plan.rs:4288` (`EmptyMatcherSet`) — the
+- `plan.rs:4262` (`ContradictoryMatchers`) and `plan.rs:4333` (`EmptyMatcherSet`) — the
   **selector's** payload. `Source` "always lowers" and has no rejectable payload of its own; the
   selector is refused before a chain is built. Recorded rather than assumed:
-  `{service_name="checkout", service_name="other"}` does return
-  `matchers are contradictory: the selector can never match a stream`, while `{service_name=~".*"}`
-  **plans** — so `plan.rs:4288` was not reached by the obvious candidate and is excluded on the
-  link argument, not on a demonstration.
+  `{service_name="checkout", service_name="other"}` returns
+  `matchers are contradictory: the selector can never match a stream`, and `{service_name=~".*"}`
+  returns `selector matches everything: …`, because none of its matchers fails to match the empty
+  string (issue #793).
 
 §3.1's TraceQL table was enumerated the same way in the previous round, in the source direction over
 `crates/pulsus-read/src/traces/search_plan.rs`, and came back complete at eleven rows; it is not
@@ -1746,7 +1746,7 @@ says so in its own doc comment; that is why `RangeAgg::param` and `VectorAgg::pa
 
 | link | accepts → produces | precondition to lower | residual state effect | disposition | continuation |
 |---|---|---|---|---|---|
-| `LineFilter(lf)` (`ast.rs:134`) | `Lines` → `Lines` | `body` provenance resolves to a SQL expression — `Stored`, or `Computed(e)` from `decolorize`/`unpack` (§5) — **and** `is_pushable_line_filter(lf)` (`plan.rs:4358`: no `ip()` alternative) | **clears `exact`**: it removes lines in the evaluator, so the SQL result is a superset | conditional | *none* |
+| `LineFilter(lf)` (`ast.rs:134`) | `Lines` → `Lines` | `body` provenance resolves to a SQL expression — `Stored`, or `Computed(e)` from `decolorize`/`unpack` (§5) — **and** `is_pushable_line_filter(lf)` (`plan.rs:4393`: no `ip()` alternative) | **clears `exact`**: it removes lines in the evaluator, so the SQL result is a superset | conditional | *none* |
 | `Parser(Json { extractions })` (`ast.rs:237`) | `Lines` → `Lines`, `cols` widened by an open source over `body` | `body`'s provenance is expressible | `cols` still widened, but with an **evaluator-only** open source whose `resolve` answers `None`, so a following `LabelFilter` goes residual instead of lowering against a name SQL cannot see. Does **not** clear `exact` | conditional. **Issue #624 part 3b: a counting range query over pushable line filters, this stage and only label filters lowers** — bare under a parent `sum` or `sum by`, targeted under any parent when every expression is one plain top-level field — with the key labels read in the statement and the stages after it run once per group over a document of those keys. **Whether that query lowers is the planner's decision (`json_count_route`)**, as for `Regexp` below, so this link stays residual in the model | *none* |
 | `Parser(Logfmt { strict, keep_empty, extractions })` (`ast.rs:242`) | as above | as above | as above | conditional. **Issue #624 part 3d: a counting range query over pushable line filters, this stage with any flags and only label filters, `drop` and `keep` lowers** — bare under a parent `sum` or `sum by`, targeted under any parent — with the line's fields whose sanitised key is a name the answer reads sent in the statement, and the stages after it run once per group over those fields. As for `Json`, **whether that query lowers is the planner's decision (`logfmt_count_route`)**, so this link stays residual in the model | *none* |
 | `Parser(Regexp(re))` (`ast.rs:248`) | as above, names = capture groups | as above, and the pattern expressible | as above | conditional. **Issue #624 part 3a: the statement runs it** — `extractGroups(body, 're')` as an element of the raw reads' `rx` column, and, in a counting range query, as the group key's `matched` and captures, with the stages after it run once per group. **Whether that query lowers is the planner's decision (`regexp_count_route`), as window-grid representability is:** it turns on the reducer and on every stage after the parser, which a per-link capability does not see, so this link stays residual in the model and the model-agreement walks over log-query chains are unchanged | *none* |
@@ -1797,7 +1797,7 @@ because the merge happens at range and not at instant.
 #### Three rules the model derives rather than restates
 
 - **`compile_line_filters`' `break`.** It does two things: it skips a non-pushable filter, and it
-  `break`s at `LineFormat | Decolorize | Unpack` (`plan.rs:4340`). The first is the
+  `break`s at `LineFormat | Decolorize | Unpack` (`plan.rs:4375`). The first is the
   `is_pushable_line_filter` precondition above. The second is not a special case here — it is
   `body`'s provenance turning `Computed`. The documented *exception* falls out too: a filter after a
   **parser** still lowers, because *"parsers read but never rewrite the line"* (`plan.rs:4084`), so
@@ -2335,7 +2335,7 @@ load ≤ 1.41, is on [#478](https://github.com/digitalis-io/pulsusdb/issues/478)
 ### 9.6 The stopping rule: what the first version of this document got wrong
 
 The fold originally returned at the first refusal. Measured on **#507**'s LogQL corpus, against the
-shipped `compile_line_filters` (`crates/pulsus-read/src/logql/plan.rs:4325`) transcribed as the
+shipped `compile_line_filters` (`crates/pulsus-read/src/logql/plan.rs:4360`) transcribed as the
 oracle, over every chain of length 3 built from 15 concrete LogQL atoms parsed with our real
 parser — an equality on the **ordered** list of pushed predicates, not a count and not a
 containment:
@@ -4992,11 +4992,11 @@ to be that argument as tests: the model must reproduce **each** walk, not just t
 measured. None of them exists at base.
 
 These are **lib unit tests**, because `compile_line_filters` is `pub(crate)`
-(`crates/pulsus-read/src/logql/plan.rs:4325`) and `has_unpushed_dropping_stage` (`:1693`) and
+(`crates/pulsus-read/src/logql/plan.rs:4360`) and `has_unpushed_dropping_stage` (`:1693`) and
 `metric_pipeline_construct` (`:1727`) are private — an integration test cannot call any of them.
-**They go in `plan.rs`'s existing `mod tests` (`plan.rs:4967`), and no production item is widened
+**They go in `plan.rs`'s existing `mod tests` (`plan.rs:5002`), and no production item is widened
 for them.** That module is a child of `logql::plan`, so it already reaches both private functions —
-directly, and again through its `use super::*` (`plan.rs:5142`). An earlier version of this section
+directly, and again through its `use super::*` (`plan.rs:5177`). An earlier version of this section
 offered a second option — **#492 part 1** writes them wherever they go — moving the gates to
 `logql::compile`'s test module with the two functions raised to `pub(super)`. That option is **withdrawn**: the widening was never needed, and a design
 that offers two placements has not decided.
@@ -5017,7 +5017,7 @@ line rewrites, parsers and `label_format` — every stage the 15-atom set does n
 
 **What these three gates will NOT establish once #492 part 1 has written them, because they share a
 helper — today they establish nothing, because they do not exist.** All three walks call
-`is_pushable_line_filter` (`crates/pulsus-read/src/logql/plan.rs:4358`) — `plan.rs:4333`,
+`is_pushable_line_filter` (`crates/pulsus-read/src/logql/plan.rs:4393`) — `plan.rs:4368`,
 `plan.rs:1709`, `plan.rs:1730` — and so does the model's `LineFilter::capability` (§7.1). The
 sharing is deliberate and stays: that function's doc comment calls itself *"the single source of
 truth for 'does this line filter push down to SQL, or must it run in the client pipeline?' … so the
@@ -5541,12 +5541,12 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 653 |
-| of those, citing a bare basename | 478 |
+| citation occurrences in the five artefacts | 652 |
+| of those, citing a bare basename | 477 |
 | of those, written as a continuation of a citation earlier in the paragraph | 65 |
 | of those continuations, on a later line than the citation they continue | 26 |
 | `(document, token)` pairs the rule resolves | 254 |
-| occurrences those resolved pairs cover | 349 |
+| occurrences those resolved pairs cover | 348 |
 | `(document, token)` pairs it cannot resolve | 197 |
 | occurrences those frozen pairs cover | 304 |
 | resolved rows anchored on a token the citing prose prints | 139 |
@@ -5568,7 +5568,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 653 citation occurrences the five artefacts make, 478 name a bare basename and 65 are written as a continuation of a citation earlier on the same line. The rule resolves 254 `(document, token)` pairs covering 349 occurrences, and cannot resolve 197 covering 304. Of the resolved rows, 139 are anchored on a token the citing prose prints and 115 on a snapshot of the cited line.
+Of the 652 citation occurrences the five artefacts make, 477 name a bare basename and 65 are written as a continuation of a citation earlier on the same line. The rule resolves 254 `(document, token)` pairs covering 348 occurrences, and cannot resolve 197 covering 304. Of the resolved rows, 139 are anchored on a token the citing prose prints and 115 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 1 citations, all of them read one at a time. 1 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

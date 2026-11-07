@@ -2319,6 +2319,29 @@ fn classified_line_filter(lf: &LineFilter) -> Result<Option<CheckedFragment>, Pi
     })
 }
 
+/// `(key = 'k' AND val != '')` — the failure branch of `k=""` for a key no
+/// matcher requires (issue #793): a stream carrying `k` fails it on any
+/// value. The counterpart of [`index_nre_branch`]; infallible, as it takes
+/// no regex.
+pub fn index_eq_empty_failure_branch(key: &str) -> CheckedFragment {
+    CheckedFragment {
+        sql: format!("(key = {} AND val != '')", ch_string(key)),
+    }
+}
+
+/// `(key = 'k' AND NOT match(val, '^(?:p)$'))` — the failure branch of a
+/// `k=~"p"` whose pattern matches `""`, for a key no matcher requires
+/// (issue #793). Validated as [`index_nre_branch`] is.
+pub fn index_re_failure_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError> {
+    Ok(CheckedFragment {
+        sql: format!(
+            "(key = {} AND NOT match(val, {}))",
+            ch_string(key),
+            ch_regex_anchored_checked(pattern)?
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use pulsus_model::Fingerprint;
