@@ -2883,12 +2883,12 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
                 ("compile_regex(", 4),
                 ("compile_regex_as_database(", 4),
                 ("validate_regex_as_database(", 1),
-                ("compile_anchored_regex(", 4),
+                ("compile_anchored_regex(", 5),
                 ("validate_anchored_regex(", 1),
                 ("validate_unanchored_regex(", 1),
                 ("compile_drop_keep(", 3),
                 ("compile_user_regex(", 2),
-                ("compile_user_regex_anchored(", 1),
+                ("compile_user_regex_anchored(", 2),
                 ("re2_rejection_construct(", 1),
                 ("re2_reject_precheck(", 4),
             ],
@@ -2919,7 +2919,11 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
              §9.2, which RE2 reads as literals — and `line_after_line_format`/`regexp_named` \
              measure exactly that. The fourth `compile_regex_as_database(` is \
              `validate_regex_as_database`, which the `extractGroups` renderer calls (issue #624 \
-             part 3a, code review round 1).",
+             part 3a, code review round 1). **Issue #793 added one of each** in \
+             `anchored_regex_matches_empty`: a stream selector's verdict on the empty string. \
+             It decides a matcher's role, not acceptance: the as-written compile refuses \
+             exactly what it refuses today, and the rewrite is read only for its answer on \
+             \"\".",
         ),
         (
             "plan.rs",

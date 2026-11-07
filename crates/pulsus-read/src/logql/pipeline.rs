@@ -7885,6 +7885,19 @@ fn effective_matchers(
     }
 }
 
+/// Issue #793: whether a stream matcher's pattern matches "" — what a stream
+/// without the label reads as. Acceptance and its error are today's: the
+/// pattern as written must compile. The verdict is the pattern as the
+/// database reads it; the as-written compile decides only where the rewrite
+/// does not compile.
+pub(super) fn anchored_regex_matches_empty(pattern: &str) -> Result<bool, PipelineError> {
+    let as_written = compile_anchored_regex(pattern)?;
+    Ok(
+        pulsus_re2::compile_user_regex_anchored(&pulsus_re2::re2_pattern_to_rust(pattern))
+            .map_or_else(|_| as_written.is_match(""), |re| re.is_match("")),
+    )
+}
+
 #[cfg(test)]
 mod tests {
 

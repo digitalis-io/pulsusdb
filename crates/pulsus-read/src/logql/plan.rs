@@ -4203,15 +4203,16 @@ fn build_probes(
 /// single-pass shape (architect plan amendment §1).
 #[derive(Debug)]
 struct NormalizedMatchers {
-    /// One pre-rendered, parenthesized OR-branch per **distinct positive
-    /// key** — the collapse that keeps `HAVING uniqExact(key, val) = n`
-    /// (or its `If`-conditional form) valid (architect plan: "Matcher
-    /// normalisation").
+    /// One pre-rendered, parenthesized OR-branch per distinct key a
+    /// selected stream must carry (issue #793) — the collapse that keeps
+    /// `HAVING uniqExact(key, val) = n` (or its `If`-conditional form) valid
+    /// (architect plan: "Matcher normalisation").
     positive_branches: Vec<CheckedFragment>,
-    /// One pre-rendered, parenthesized OR-branch per negative matcher
-    /// (`Neq`/`Nre`) — deliberately *not* collapsed per key: `countIf(...)
-    /// = 0` is correct whether one or several negative branches target the
-    /// same key.
+    /// One pre-rendered, parenthesized OR-branch per way a stream carrying
+    /// the key fails: every `!=`/`!~`, and every `=`/`=~` of a key no matcher
+    /// requires (issue #793) — deliberately *not* collapsed per key:
+    /// `countIf(...) = 0` is correct whether one or several branches target
+    /// the same key.
     negative_branches: Vec<CheckedFragment>,
     /// Distinct label keys carrying a regex matcher (`Re` or `Nre`) — the
     /// only case that warrants a selectivity probe (architect plan:
@@ -4241,6 +4242,9 @@ fn normalize_matchers(selector: &StreamSelector) -> Result<NormalizedMatchers, R
     let mut positive_groups: HashMap<String, PositiveGroup> = HashMap::new();
     let mut negative_branches: Vec<CheckedFragment> = Vec::new();
     let mut probe_keys: Vec<String> = Vec::new();
+    // Issue #793: the keys a negative matcher requires — one that does not
+    // match "" — in first-appearance order, unique.
+    let mut required_by_negative: Vec<String> = Vec::new();
 
     for Matcher { name, op, value } in &selector.matchers {
         match op {
@@ -4276,26 +4280,57 @@ fn normalize_matchers(selector: &StreamSelector) -> Result<NormalizedMatchers, R
             }
             MatchOp::Neq => {
                 negative_branches.push(super::predicate::index_neq_branch(name, value));
+                if value.is_empty() && !required_by_negative.contains(name) {
+                    required_by_negative.push(name.clone());
+                }
             }
             MatchOp::Nre => {
                 push_probe_key(&mut probe_keys, name);
                 negative_branches.push(super::predicate::index_nre_branch(name, value)?);
+                if super::pipeline::anchored_regex_matches_empty(value)?
+                    && !required_by_negative.contains(name)
+                {
+                    required_by_negative.push(name.clone());
+                }
             }
         }
     }
 
-    if positive_order.is_empty() {
-        return Err(ReadError::EmptyMatcherSet);
-    }
-
+    // Issue #793: a stream without `k` reads as `k=""`. A key is required
+    // when its `=`/`=~` group or one of its negatives does not match "";
+    // otherwise the group's matchers become failure branches, after the
+    // negatives.
     let mut positive_branches: Vec<CheckedFragment> = Vec::with_capacity(positive_order.len());
     for key in &positive_order {
         let group = &positive_groups[key];
-        positive_branches.push(super::predicate::index_positive_branch(
-            &group.key,
-            group.eq_value.as_deref(),
-            &group.re_patterns,
-        )?);
+        let mut group_matches_empty = group.eq_value.as_deref().is_none_or(str::is_empty);
+        for p in &group.re_patterns {
+            // Every pattern is compiled, no short-circuit, so a bad pattern
+            // is reported wherever it sits.
+            group_matches_empty &= super::pipeline::anchored_regex_matches_empty(p)?;
+        }
+        if !group_matches_empty || required_by_negative.contains(key) {
+            positive_branches.push(super::predicate::index_positive_branch(
+                &group.key,
+                group.eq_value.as_deref(),
+                &group.re_patterns,
+            )?);
+        } else {
+            if group.eq_value.is_some() {
+                negative_branches.push(super::predicate::index_eq_empty_failure_branch(&group.key));
+            }
+            for p in &group.re_patterns {
+                negative_branches.push(super::predicate::index_re_failure_branch(&group.key, p)?);
+            }
+        }
+    }
+    for key in &required_by_negative {
+        if !positive_groups.contains_key(key) {
+            positive_branches.push(super::predicate::index_positive_branch(key, None, &[])?);
+        }
+    }
+    if positive_branches.is_empty() {
+        return Err(ReadError::EmptyMatcherSet);
     }
 
     Ok(NormalizedMatchers {
