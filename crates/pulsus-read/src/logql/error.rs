@@ -1073,7 +1073,7 @@ mod tests {
         assert!(
             ReadError::EmptyMatcherSet
                 .to_string()
-                .contains("at least one equality or regexp matcher")
+                .contains("at least one matcher that does not match the empty string")
         );
     }
 

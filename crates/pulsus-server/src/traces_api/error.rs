@@ -1075,7 +1075,7 @@ mod tests {
                 "Read",
                 ApiError::Read(ReadError::EmptyMatcherSet),
                 StatusCode::BAD_REQUEST,
-                r#"selector matches everything: at least one equality or regexp matcher is required"#,
+                r#"selector matches everything: at least one matcher that does not match the empty string is required (app=~".+" qualifies, app=~".*" does not)"#,
                 None,
             ),
             (
