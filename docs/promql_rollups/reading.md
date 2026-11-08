@@ -183,7 +183,7 @@ The routed reads include the finer levels and raw after each level's watermark.
 
 ### 4.2 From a running server
 
-`GET /api/v1/status/runtimeinfo` carries `rollupLevels`: the discovered levels in duration form, smallest first (`rollup_levels`, `crates/pulsus-server/src/prom_api/encode.rs:1017`; `status_runtimeinfo`, `crates/pulsus-server/src/prom_api/handlers.rs:753`). `["1m","12m","2h","1d"]` for the default; `[]` when none are built and before the first discovery.
+`GET /api/v1/status/runtimeinfo` carries `rollupLevels`: the discovered levels in duration form, smallest first (`rollup_levels`, `crates/pulsus-server/src/prom_api/encode.rs:1045`; `status_runtimeinfo`, `crates/pulsus-server/src/prom_api/handlers.rs:753`). `["1m","12m","2h","1d"]` for the default; `[]` when none are built and before the first discovery.
 
 | candidate | verdict |
 |---|---|
@@ -203,7 +203,7 @@ With `X-Pulsus-Explain: 1`, a routed selector has:
 | `hist_sample_fetch` | the selector's native-histogram read, when it has one |
 | `rollup_piece`, one per interval served, in time order, from the first chunk | `<table>.<column> served (a, b]`, `raw (a, b]`, or `<table> served nothing`, each with its statement |
 
-`exactness` is `"rollup"` when the query's steps take the value of the bucket that holds them (R2), when a selector's range was rounded (R2a), even when only raw served it (`e.rollup |=`, `crates/pulsus-read/src/metrics/exec.rs:1592`), or when a kept level row served the selector in some chunk (for `Max`, `Min`, `Sum` and `Avg`, a row with `count > 0`) and, for a counter under 720 s, some step's window touches no interval read from raw (`level_window_exists`, `crates/pulsus-read/src/metrics/rollup.rs:905`); otherwise `"raw-exact"` (`exactness: if e.rollup`, `crates/pulsus-server/src/prom_api/encode.rs:368`).
+`exactness` is `"rollup"` when the query's steps take the value of the bucket that holds them (R2), when a selector's range was rounded (R2a), even when only raw served it (`e.rollup |=`, `crates/pulsus-read/src/metrics/exec.rs:1592`), or when a kept level row served the selector in some chunk (for `Max`, `Min`, `Sum` and `Avg`, a row with `count > 0`) and, for a counter under 720 s, some step's window touches no interval read from raw (`level_window_exists`, `crates/pulsus-read/src/metrics/rollup.rs:905`); otherwise `"raw-exact"` (`exactness: if e.rollup`, `crates/pulsus-server/src/prom_api/encode.rs:396`).
 
 ## 5. What this evidence cannot see
 

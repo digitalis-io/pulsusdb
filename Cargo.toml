@@ -120,6 +120,10 @@ getrandom = "0.3"
 # the stored bits), plus crates/pulsus-read/tests/logql_json_float_roundtrip.rs
 # for the read path.
 serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
+# Issue #795 part 3: the PromQL query writer's sample values and timestamps.
+# Both are already in the lock through serde_json.
+itoa = "1"
+zmij = "1"
 
 # OTLP logs (issue #8), metrics (issue #27), and traces (issue #54)
 # receivers. `opentelemetry-proto` supplies `prost`-generated OTLP message
