@@ -4,8 +4,9 @@
 //! `serde_json::Value` DOM over a result set (issue #32 architect plan,
 //! mirroring `logs_api::encode`'s own contract).
 //!
-//! [`stream_array`] is a **self-contained copy** of `logs_api::encode`'s
-//! own primitive (architect plan: `prom_api` is fully self-contained —
+//! [`stream_array`] began as a copy of `logs_api::encode`'s own primitive;
+//! since issue #795 its renderer appends to the chunk rather than returning
+//! one (architect plan: `prom_api` is fully self-contained —
 //! coders may be editing `logs_api/` concurrently, so extracting a shared
 //! helper now would be a merge-conflict magnet), including the `.fuse()`
 //! issue-#24 fix: the raw `unfold` stream is `.fuse()`d before
@@ -44,16 +45,16 @@ use pulsus_read::{
 
 use crate::app::BuildInfo;
 
-/// Builds a streaming JSON body: `prefix`, then `render(item)` for each
-/// item in `items` (comma-separated), then `suffix`. `items` (the already-
-/// materialized, domain data) is moved into the stream's state and lives
-/// for the whole drain — only the *current* item's `render()` output is
-/// additional, temporary encoder memory. See the module doc for the
+/// Builds a streaming JSON body: `prefix`, then `render(item, chunk)`
+/// appending each item to its chunk (comma-separated), then `suffix`.
+/// `items` (the already-materialized, domain data) is moved into the
+/// stream's state and lives for the whole drain — only the *current* item's
+/// chunk is additional, temporary encoder memory. See the module doc for the
 /// `.fuse()` rationale (issue #24).
 fn stream_array<T, R>(prefix: Vec<u8>, items: Vec<T>, render: R, suffix: Vec<u8>) -> Body
 where
     T: Send + 'static,
-    R: Fn(&T) -> Vec<u8> + Send + 'static,
+    R: Fn(&T, &mut Vec<u8>) + Send + 'static,
 {
     enum Step {
         Prefix,
@@ -90,8 +91,11 @@ where
                 Some((Ok::<_, std::io::Error>(Bytes::from(bytes)), state))
             }
             Step::Item(i) => {
-                let mut chunk = if i > 0 { vec![b','] } else { Vec::new() };
-                chunk.extend((state.render)(&state.items[i]));
+                let mut chunk = Vec::new();
+                if i > 0 {
+                    chunk.push(b',');
+                }
+                (state.render)(&state.items[i], &mut chunk);
                 let next = i + 1;
                 state.step = if next < state.items.len() {
                     Step::Item(next)
@@ -124,12 +128,40 @@ fn json_string(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
+/// [`json_string`] appended to `out` (issue #795), through the same
+/// serializer.
+fn push_json_string(out: &mut Vec<u8>, s: &str) {
+    serde_json::to_writer(&mut *out, s).expect("a str always serialises");
+}
+
 fn labels_object_json(labels: &[(String, String)]) -> String {
-    let map: serde_json::Map<String, serde_json::Value> = labels
-        .iter()
-        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-        .collect();
-    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
+    let mut out = Vec::new();
+    push_labels_object(&mut out, labels);
+    String::from_utf8(out).expect("labels are UTF-8")
+}
+
+/// The labels as a JSON object, appended to `out` (issue #795): keys in
+/// byte order, and of a repeated key only its last value — the text a
+/// `serde_json::Map` (a `BTreeMap` in this workspace, which does not enable
+/// `preserve_order`) built from the same pairs gives.
+fn push_labels_object(out: &mut Vec<u8>, labels: &[(String, String)]) {
+    let mut refs: Vec<&(String, String)> = labels.iter().collect();
+    refs.sort_by(|a, b| a.0.cmp(&b.0));
+    out.push(b'{');
+    let mut first = true;
+    for (i, (k, v)) in refs.iter().map(|kv| (&kv.0, &kv.1)).enumerate() {
+        if refs.get(i + 1).is_some_and(|next| next.0 == *k) {
+            continue;
+        }
+        if !first {
+            out.push(b',');
+        }
+        first = false;
+        push_json_string(out, k);
+        out.push(b':');
+        push_json_string(out, v);
+    }
+    out.push(b'}');
 }
 
 // ---------------------------------------------------------------------
@@ -149,64 +181,94 @@ fn labels_object_json(labels: &[(String, String)]) -> String {
 /// capture server: `1e21` -> `"1000000000000000000000"` (not `"1e+21"`),
 /// `5e-324` -> a ~323-zero fixed-point fraction (not `"5e-324"`), and
 /// `1.7976931348623157e308` (`f64::MAX`) -> the full ~309-digit integer.
-/// This function therefore always renders `%f`-style via [`render_fixed`]
-/// — never scientific notation — reproducing Go's shortest round-trip
-/// decimal digits (via `format!("{v:e}")`'s mantissa) placed at the
-/// correct decimal-point position for *every* finite magnitude, including
-/// the `5e-324` subnormal boundary. Special values first (`NaN`/`+Inf`/
+/// This function therefore always renders `%f`-style via
+/// [`push_prom_float`]'s fixed-point step — never scientific notation —
+/// reproducing Go's shortest round-trip decimal digits (via
+/// `format!("{v:e}")`'s mantissa) placed at the correct decimal-point
+/// position for *every* finite magnitude, including the `5e-324`
+/// subnormal boundary. Special values first (`NaN`/`+Inf`/
 /// `-Inf` as literal strings, `-0`/`0` verbatim). Sample values are always
 /// emitted as **quoted** JSON strings by the caller (Prometheus
 /// convention), never bare numbers — this function itself returns the
 /// unquoted text.
+///
+/// Since issue #795 a test wrapper over [`push_prom_float`], which every
+/// writer calls.
+#[cfg(test)]
 pub(crate) fn prom_float(v: f64) -> String {
+    let mut out = Vec::new();
+    push_prom_float(&mut out, v);
+    String::from_utf8(out).expect("ASCII")
+}
+
+/// [`prom_float`] appended to `out` (issue #795).
+pub(crate) fn push_prom_float(out: &mut Vec<u8>, v: f64) {
     if v.is_nan() {
-        return "NaN".to_string();
+        out.extend_from_slice(b"NaN");
+        return;
     }
     if v.is_infinite() {
-        return if v.is_sign_positive() {
-            "+Inf".to_string()
+        out.extend_from_slice(if v.is_sign_positive() {
+            b"+Inf"
         } else {
-            "-Inf".to_string()
-        };
+            b"-Inf"
+        });
+        return;
     }
     if v == 0.0 {
-        return if v.is_sign_negative() {
-            "-0".to_string()
-        } else {
-            "0".to_string()
-        };
+        out.extend_from_slice(if v.is_sign_negative() { b"-0" } else { b"0" });
+        return;
     }
 
-    let sci = format!("{v:e}");
-    let (mantissa_part, exp_str) = sci
-        .split_once('e')
+    // The longest f64 `{:e}` text is 24 bytes (`-2.2250738585072014e-308`).
+    let mut buf = [0u8; 32];
+    let len = {
+        let mut cursor: &mut [u8] = &mut buf;
+        std::io::Write::write_fmt(&mut cursor, format_args!("{v:e}"))
+            .expect("an f64's {v:e} text fits 32 bytes");
+        32 - cursor.len()
+    };
+    let sci = &buf[..len];
+    let e = sci
+        .iter()
+        .position(|&b| b == b'e')
         .expect("Rust's {v:e} formatter always emits exactly one 'e'");
-    let exp: i32 = exp_str
+    let (mantissa_part, exp_part) = (&sci[..e], &sci[e + 1..]);
+    let exp: i32 = std::str::from_utf8(exp_part)
+        .expect("ASCII")
         .parse()
         .expect("Rust's {v:e} exponent is always a valid integer literal");
 
-    let negative = mantissa_part.starts_with('-');
-    let mantissa = mantissa_part.strip_prefix('-').unwrap_or(mantissa_part);
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let mut digits = [0u8; 32];
+    let mut n = 0;
+    for &b in mantissa_part {
+        if b != b'-' && b != b'.' {
+            digits[n] = b;
+            n += 1;
+        }
+    }
+    let digits = &digits[..n];
+    if mantissa_part.first() == Some(&b'-') {
+        out.push(b'-');
+    }
 
-    let body = render_fixed(&digits, exp);
-    if negative { format!("-{body}") } else { body }
-}
-
-/// Go `%f`-style rendering: the decimal point sits `exp + 1` digits from
-/// the left of `digits` (Rust's shortest-round-trip mantissa never carries
-/// a trailing zero, so no trailing-zero trim is ever needed here).
-fn render_fixed(digits: &str, exp: i32) -> String {
+    // Go `%f`-style rendering: the decimal point sits `exp + 1` digits from
+    // the left of `digits` (Rust's shortest-round-trip mantissa never
+    // carries a trailing zero, so no trailing-zero trim is ever needed
+    // here).
     let point = exp + 1;
     if point <= 0 {
-        let zeros = "0".repeat((-point) as usize);
-        format!("0.{zeros}{digits}")
+        out.extend_from_slice(b"0.");
+        out.resize(out.len() + (-point) as usize, b'0');
+        out.extend_from_slice(digits);
     } else if (point as usize) >= digits.len() {
-        let zeros = "0".repeat(point as usize - digits.len());
-        format!("{digits}{zeros}")
+        out.extend_from_slice(digits);
+        out.resize(out.len() + point as usize - digits.len(), b'0');
     } else {
         let (whole, frac) = digits.split_at(point as usize);
-        format!("{whole}.{frac}")
+        out.extend_from_slice(whole);
+        out.push(b'.');
+        out.extend_from_slice(frac);
     }
 }
 
@@ -217,19 +279,44 @@ fn render_fixed(digits: &str, exp: i32) -> String {
 /// the module doc). Emitted as a **bare** JSON number by the caller, never
 /// a quoted string.
 pub(crate) fn prom_timestamp(ms: i64) -> String {
+    let mut out = Vec::new();
+    push_prom_timestamp(&mut out, ms);
+    String::from_utf8(out).expect("ASCII")
+}
+
+/// [`prom_timestamp`] appended to `out` (issue #795): the trimmed
+/// `{millis:03}` written digit by digit.
+fn push_prom_timestamp(out: &mut Vec<u8>, ms: i64) {
     let secs = ms.div_euclid(1000);
     let millis = ms.rem_euclid(1000);
-    if millis == 0 {
-        return secs.to_string();
+    std::io::Write::write_fmt(out, format_args!("{secs}")).expect("a Vec never fails a write");
+    if millis != 0 {
+        let (hundreds, tens, ones) = (millis / 100, millis / 10 % 10, millis % 10);
+        out.push(b'.');
+        out.push(b'0' + hundreds as u8);
+        if tens != 0 || ones != 0 {
+            out.push(b'0' + tens as u8);
+        }
+        if ones != 0 {
+            out.push(b'0' + ones as u8);
+        }
     }
-    let frac = format!("{millis:03}");
-    let trimmed = frac.trim_end_matches('0');
-    format!("{secs}.{trimmed}")
 }
 
 /// Sample values are always quoted JSON strings (docs/api.md §3.1).
 fn quoted_value(v: f64) -> String {
-    json_string(&prom_float(v))
+    let mut out = Vec::new();
+    push_quoted_value(&mut out, v);
+    String::from_utf8(out).expect("ASCII")
+}
+
+/// [`quoted_value`] appended to `out` (issue #795). The text is only
+/// digits, `.`, `-`, `+Inf`, `-Inf` and `NaN`, which JSON escaping leaves
+/// alone.
+fn push_quoted_value(out: &mut Vec<u8>, v: f64) {
+    out.push(b'"');
+    push_prom_float(out, v);
+    out.push(b'"');
 }
 
 /// The error envelope `query_response`'s unreachable `QueryResult::Streams`
@@ -307,34 +394,32 @@ fn explain_suffix(mut suffix: String, explain: Option<&PlanExplain>) -> String {
 // per the architect plan amendment).
 // ---------------------------------------------------------------------
 
-fn render_matrix_item(s: &MatrixSeries) -> Vec<u8> {
-    let mut points = String::new();
+fn push_matrix_item(s: &MatrixSeries, out: &mut Vec<u8>) {
+    out.reserve(64 + 32 * s.points.len());
+    out.extend_from_slice(b"{\"metric\":");
+    push_labels_object(out, &s.labels);
+    out.extend_from_slice(b",\"values\":[");
     for (i, (t_ms, value)) in s.points.iter().enumerate() {
         if i > 0 {
-            points.push(',');
+            out.push(b',');
         }
-        points.push_str(&format!(
-            "[{},{}]",
-            prom_timestamp(*t_ms),
-            quoted_value(*value)
-        ));
+        out.push(b'[');
+        push_prom_timestamp(out, *t_ms);
+        out.push(b',');
+        push_quoted_value(out, *value);
+        out.push(b']');
     }
-    format!(
-        "{{\"metric\":{},\"values\":[{}]}}",
-        labels_object_json(&s.labels),
-        points
-    )
-    .into_bytes()
+    out.extend_from_slice(b"]}");
 }
 
-fn render_vector_item(s: &VectorSample, at_ms: i64) -> Vec<u8> {
-    format!(
-        "{{\"metric\":{},\"value\":[{},{}]}}",
-        labels_object_json(&s.labels),
-        prom_timestamp(at_ms),
-        quoted_value(s.value)
-    )
-    .into_bytes()
+fn push_vector_item(s: &VectorSample, at_ms: i64, out: &mut Vec<u8>) {
+    out.extend_from_slice(b"{\"metric\":");
+    push_labels_object(out, &s.labels);
+    out.extend_from_slice(b",\"value\":[");
+    push_prom_timestamp(out, at_ms);
+    out.push(b',');
+    push_quoted_value(out, s.value);
+    out.extend_from_slice(b"]}");
 }
 
 /// M7-A5b-i: the boundary-inclusivity code upstream's `MarshalHistogram`
@@ -358,59 +443,59 @@ fn histogram_boundary_code(lower_inclusive: bool, upper_inclusive: bool) -> u8 {
 /// [`prom_float`]'s own contract — bit-for-bit `MarshalFloat`); zero-count
 /// buckets are skipped; the `buckets` key is omitted entirely when every
 /// bucket is empty (upstream's `bucketFound` guard).
-fn render_histogram_json(h: &pulsus_model::FloatHistogram) -> String {
-    let mut buckets = String::new();
+fn push_histogram_json(out: &mut Vec<u8>, h: &pulsus_model::FloatHistogram) {
+    out.extend_from_slice(b"{\"count\":");
+    push_quoted_value(out, h.count);
+    out.extend_from_slice(b",\"sum\":");
+    push_quoted_value(out, h.sum);
     let mut any = false;
     for b in h.all_buckets() {
         if b.count == 0.0 {
             continue;
         }
-        if any {
-            buckets.push(',');
-        }
+        out.extend_from_slice(if any { b"," } else { b",\"buckets\":[" });
         any = true;
         let code = histogram_boundary_code(b.lower_inclusive, b.upper_inclusive);
-        buckets.push_str(&format!(
-            "[{code},{},{},{}]",
-            quoted_value(b.lower),
-            quoted_value(b.upper),
-            quoted_value(b.count)
-        ));
+        out.push(b'[');
+        out.push(b'0' + code);
+        out.push(b',');
+        push_quoted_value(out, b.lower);
+        out.push(b',');
+        push_quoted_value(out, b.upper);
+        out.push(b',');
+        push_quoted_value(out, b.count);
+        out.push(b']');
     }
-    let buckets_field = if any {
-        format!(",\"buckets\":[{buckets}]")
-    } else {
-        String::new()
-    };
-    format!(
-        "{{\"count\":{},\"sum\":{}{buckets_field}}}",
-        quoted_value(h.count),
-        quoted_value(h.sum)
-    )
+    if any {
+        out.push(b']');
+    }
+    out.push(b'}');
 }
 
-fn render_hist_or_float(v: &HistOrFloat) -> String {
+fn push_hist_or_float(out: &mut Vec<u8>, v: &HistOrFloat) {
     match v {
-        HistOrFloat::Float(f) => quoted_value(*f),
-        HistOrFloat::Hist(h) => render_histogram_json(h),
+        HistOrFloat::Float(f) => push_quoted_value(out, *f),
+        HistOrFloat::Hist(h) => push_histogram_json(out, h),
     }
 }
 
 /// M7-A5b-i: one `QueryResult::VectorHist` element — `"value"` for a float,
 /// `"histogram"` for a native histogram (`web/api/v1/json_codec.go`
 /// `marshalSampleJSON`, pinned `40af9c2`).
-fn render_hist_vector_item(s: &HistVectorSample, at_ms: i64) -> Vec<u8> {
-    let key = match &s.value {
-        HistOrFloat::Float(_) => "value",
-        HistOrFloat::Hist(_) => "histogram",
+fn push_hist_vector_item(s: &HistVectorSample, at_ms: i64, out: &mut Vec<u8>) {
+    let key: &[u8] = match &s.value {
+        HistOrFloat::Float(_) => b"value",
+        HistOrFloat::Hist(_) => b"histogram",
     };
-    format!(
-        "{{\"metric\":{},\"{key}\":[{},{}]}}",
-        labels_object_json(&s.labels),
-        prom_timestamp(at_ms),
-        render_hist_or_float(&s.value)
-    )
-    .into_bytes()
+    out.extend_from_slice(b"{\"metric\":");
+    push_labels_object(out, &s.labels);
+    out.extend_from_slice(b",\"");
+    out.extend_from_slice(key);
+    out.extend_from_slice(b"\":[");
+    push_prom_timestamp(out, at_ms);
+    out.push(b',');
+    push_hist_or_float(out, &s.value);
+    out.extend_from_slice(b"]}");
 }
 
 /// M7-A5b-i: one `QueryResult::MatrixHist` series — upstream splits float
@@ -419,42 +504,36 @@ fn render_hist_vector_item(s: &HistVectorSample, at_ms: i64) -> Vec<u8> {
 /// `40af9c2`), each internally time-ordered but not interleaved with the
 /// other; both keys are omitted when empty (mirrors the float `"values"`-
 /// only shape when there are no histogram points at all).
-fn render_hist_matrix_item(s: &HistMatrixSeries) -> Vec<u8> {
-    let mut values = String::new();
-    let mut any_values = false;
-    let mut histograms = String::new();
-    let mut any_histograms = false;
+fn push_hist_matrix_item(s: &HistMatrixSeries, out: &mut Vec<u8>) {
+    let mut values: Vec<u8> = Vec::new();
+    let mut histograms: Vec<u8> = Vec::new();
     for (t_ms, v) in &s.points {
-        match v {
-            HistOrFloat::Float(f) => {
-                if any_values {
-                    values.push(',');
-                }
-                any_values = true;
-                values.push_str(&format!("[{},{}]", prom_timestamp(*t_ms), quoted_value(*f)));
-            }
-            HistOrFloat::Hist(h) => {
-                if any_histograms {
-                    histograms.push(',');
-                }
-                any_histograms = true;
-                histograms.push_str(&format!(
-                    "[{},{}]",
-                    prom_timestamp(*t_ms),
-                    render_histogram_json(h)
-                ));
-            }
+        let array = match v {
+            HistOrFloat::Float(_) => &mut values,
+            HistOrFloat::Hist(_) => &mut histograms,
+        };
+        if !array.is_empty() {
+            array.push(b',');
         }
+        array.push(b'[');
+        push_prom_timestamp(array, *t_ms);
+        array.push(b',');
+        push_hist_or_float(array, v);
+        array.push(b']');
     }
-    let mut body = format!("{{\"metric\":{}", labels_object_json(&s.labels));
-    if any_values {
-        body.push_str(&format!(",\"values\":[{values}]"));
+    out.extend_from_slice(b"{\"metric\":");
+    push_labels_object(out, &s.labels);
+    if !values.is_empty() {
+        out.extend_from_slice(b",\"values\":[");
+        out.extend_from_slice(&values);
+        out.push(b']');
     }
-    if any_histograms {
-        body.push_str(&format!(",\"histograms\":[{histograms}]"));
+    if !histograms.is_empty() {
+        out.extend_from_slice(b",\"histograms\":[");
+        out.extend_from_slice(&histograms);
+        out.push(b']');
     }
-    body.push('}');
-    body.into_bytes()
+    out.push(b'}');
 }
 
 /// M7-A5b-i: the `warnings`/`infos` envelope suffix — TOP-LEVEL siblings of
@@ -616,7 +695,7 @@ pub(crate) fn query_response_annotated(
             json_response(stream_array(
                 prefix,
                 items,
-                move |s: &VectorSample| render_vector_item(s, at_ms),
+                move |s: &VectorSample, out: &mut Vec<u8>| push_vector_item(s, at_ms, out),
                 suffix,
             ))
         }
@@ -627,11 +706,11 @@ pub(crate) fn query_response_annotated(
                     .to_vec();
             let suffix = explain_suffix("]".to_string(), explain.as_ref());
             let suffix = format!("{suffix}}}{annos}}}").into_bytes();
-            json_response(stream_array(prefix, items, render_matrix_item, suffix))
+            json_response(stream_array(prefix, items, push_matrix_item, suffix))
         }
         // M7-A5b-i: a histogram-valued instant result — same shape as the
         // `Vector` arm above, one level of indirection through
-        // `render_hist_vector_item` for the per-element `"value"`/
+        // `push_hist_vector_item` for the per-element `"value"`/
         // `"histogram"` key choice.
         QueryResult::VectorHist(mut items) => {
             if !ordered {
@@ -645,7 +724,7 @@ pub(crate) fn query_response_annotated(
             json_response(stream_array(
                 prefix,
                 items,
-                move |s: &HistVectorSample| render_hist_vector_item(s, at_ms),
+                move |s: &HistVectorSample, out: &mut Vec<u8>| push_hist_vector_item(s, at_ms, out),
                 suffix,
             ))
         }
@@ -657,7 +736,7 @@ pub(crate) fn query_response_annotated(
                     .to_vec();
             let suffix = explain_suffix("]".to_string(), explain.as_ref());
             let suffix = format!("{suffix}}}{annos}}}").into_bytes();
-            json_response(stream_array(prefix, items, render_hist_matrix_item, suffix))
+            json_response(stream_array(prefix, items, push_hist_matrix_item, suffix))
         }
         // Code-review round-1 fix: `explain` must nest under `data`
         // exactly like the vector/matrix arms above — the data object is
@@ -746,7 +825,7 @@ pub(crate) fn string_array_response(items: Vec<String>, warning: Option<&'static
     json_response(stream_array(
         prefix,
         items,
-        |s: &String| json_string(s).into_bytes(),
+        |s: &String, out: &mut Vec<u8>| out.extend_from_slice(json_string(s).as_bytes()),
         array_suffix(warning),
     ))
 }
@@ -762,7 +841,9 @@ pub(crate) fn series_response(
     json_response(stream_array(
         prefix,
         items,
-        |pairs: &Vec<(String, String)>| labels_object_json(pairs).into_bytes(),
+        |pairs: &Vec<(String, String)>, out: &mut Vec<u8>| {
+            out.extend_from_slice(labels_object_json(pairs).as_bytes())
+        },
         array_suffix(warning),
     ))
 }
@@ -810,7 +891,9 @@ pub(crate) fn metadata_response(mut items: Vec<MetricMeta>) -> Response {
     json_response(stream_array(
         prefix,
         groups,
-        |group: &Vec<MetricMeta>| render_metadata_entry(group),
+        |group: &Vec<MetricMeta>, out: &mut Vec<u8>| {
+            out.extend_from_slice(&render_metadata_entry(group))
+        },
         suffix,
     ))
 }
@@ -832,7 +915,7 @@ pub(crate) fn query_exemplars_response(answer: Option<Vec<ExemplarSeries>>) -> R
     json_response(stream_array(
         b"{\"status\":\"success\",\"data\":[".to_vec(),
         series,
-        render_exemplar_series,
+        |s: &ExemplarSeries, out: &mut Vec<u8>| out.extend_from_slice(&render_exemplar_series(s)),
         b"]}".to_vec(),
     ))
 }

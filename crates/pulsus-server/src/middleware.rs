@@ -26,9 +26,12 @@ pub(crate) fn trace_layer() -> TraceLayer<SharedClassifier<ServerErrorsAsFailure
     TraceLayer::new_for_http()
 }
 
-/// Gzip response compression (applied globally).
+/// Gzip response level (issue #795): level 2 of 9.
+pub(crate) const RESPONSE_GZIP_LEVEL: i32 = 2;
+
+/// Gzip response compression (applied globally), at [`RESPONSE_GZIP_LEVEL`].
 pub(crate) fn compression_layer() -> CompressionLayer {
-    CompressionLayer::new()
+    CompressionLayer::new().quality(tower_http::CompressionLevel::Precise(RESPONSE_GZIP_LEVEL))
 }
 
 /// `Access-Control-Allow-Origin` per `PULSUS_CORS_ORIGIN` (applied

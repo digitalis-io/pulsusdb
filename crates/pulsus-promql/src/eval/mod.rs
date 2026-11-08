@@ -31,6 +31,7 @@ pub mod staleness;
 pub mod window;
 
 use std::cell::{Cell, RefCell};
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -195,6 +196,14 @@ enum StepValue {
 /// set — upstream hashes the complete label set, `__name__` included.
 type SeriesIdentity = (Option<String>, Labels);
 
+/// A range step's value held for the later steps of its bucket (issue
+/// #795): a vector as its series' indices into the range accumulator, so a
+/// held step neither clones nor hashes labels.
+enum Held {
+    Vector(Vec<(usize, f64, Option<Box<pulsus_model::FloatHistogram>>)>),
+    Scalar(f64),
+}
+
 /// Cooperative cancellation, checked at eval-loop checkpoints (issue #93):
 /// once per range step, once per subquery inner-grid point, and before the
 /// single instant `eval_step`. `None` (via [`CancelToken::never`]) means
@@ -324,7 +333,6 @@ fn evaluate_counted_with(
     cancel: CancelToken,
     allow_direct: bool,
 ) -> Result<(QueryValue, EvalCounts, Annotations), PromqlError> {
-    let _ = allow_direct;
     let p = &plan.params;
 
     // Issue #125: build the per-flagged-selector stats-reduced view ONCE,
@@ -426,6 +434,22 @@ fn evaluate_counted_with(
         return Ok((value, counts, caches.annotations.take()));
     }
 
+    if allow_direct
+        && let PlanExpr::Selector(id) = &plan.root
+        && !plan.selectors[*id].smoothed
+        && caches.step_invariant_marked.is_empty()
+    {
+        counts.direct_selector_ranges += 1;
+        let out = selector_range(&plan.selectors[*id], data, p, &caches.cancel)?;
+        flush_ratio_warnings(&caches);
+        counts.step_invariant_evals = caches.step_invariant_evals.get();
+        let value = finalize_metadata_labels(
+            QueryValue::Matrix(out),
+            &mut counts.finalize_matrix_merge_passes,
+        )?;
+        return Ok((value, counts, caches.annotations.take()));
+    }
+
     // Issue #68 (plan v3 Δ5, superseding the #37 `Labels`-only key): the
     // range accumulator keys on the FULL upstream series identity
     // `(metric_name, Labels)` — upstream hashes the complete label set,
@@ -457,7 +481,11 @@ fn evaluate_counted_with(
     // `drop_name` into the key instead would split that series into a
     // kept half and a dropped half with DIFFERENT post-strip labelsets —
     // two output series where upstream has one.
-    let mut vector_points: HashMap<SeriesIdentity, (bool, Vec<Point>)> = HashMap::new();
+    //
+    // Issue #795: the map holds each identity's index into `acc`; a held
+    // step pushes its points by index without cloning or hashing labels.
+    let mut index: HashMap<SeriesIdentity, usize> = HashMap::new();
+    let mut acc: Vec<(bool, Vec<Point>)> = Vec::new();
     let mut scalar_points: Vec<Point> = Vec::new();
     let mut saw_vector = false;
     let mut saw_scalar = false;
@@ -469,7 +497,7 @@ fn evaluate_counted_with(
     // own times. Points stay at the request's times, so the identity map
     // and the name latch below are those of any range query.
     let fill = plan.selectors.first().and_then(|s| s.fill);
-    let mut held: Option<(i64, StepValue)> = None;
+    let mut held: Option<(i64, Held)> = None;
     let mut t = p.start_ms;
     while t <= p.end_ms {
         // Issue #93: one `Relaxed` load per step — O(1), no allocation, no
@@ -481,63 +509,76 @@ fn evaluate_counted_with(
             Some(f) if t <= f.until_ms => -(-t).div_euclid(f.width_ms) * f.width_ms,
             _ => t,
         };
-        let value = match &held {
-            Some((at, v)) if fill.is_some() && *at == tau => v.clone(),
-            _ => {
-                let v = eval_step(
-                    &plan.root,
-                    &plan.selectors,
-                    data,
-                    tau,
-                    p.lookback_ms,
-                    &caches,
-                )?;
-                if fill.is_some() {
-                    held = Some((tau, v.clone()));
+        match &held {
+            Some((at, h)) if fill.is_some() && *at == tau => match h {
+                Held::Vector(rows) => {
+                    saw_vector = true;
+                    for (i, v, h) in rows {
+                        acc[*i].1.push(Point {
+                            t_ms: t,
+                            v: *v,
+                            h: h.clone(),
+                        });
+                    }
                 }
-                v
-            }
-        };
-        match value {
-            StepValue::Vector(v) => {
-                saw_vector = true;
-                for s in v {
-                    let InstantSample {
-                        labels,
-                        metric_name,
-                        drop_name,
-                        t_ms: _,
-                        v: value,
-                        h,
-                    } = s;
-                    vector_points
-                        .entry((metric_name, labels))
-                        // First step wins (the latch): later inserts only
-                        // append points.
-                        .or_insert_with(|| (drop_name, Vec::new()))
-                        .1
+                Held::Scalar(v) => {
+                    saw_scalar = true;
+                    scalar_points.push(Point::float(t, *v));
+                }
+            },
+            _ => match eval_step(
+                &plan.root,
+                &plan.selectors,
+                data,
+                tau,
+                p.lookback_ms,
+                &caches,
+            )? {
+                StepValue::Vector(v) => {
+                    saw_vector = true;
+                    let mut rows = Vec::new();
+                    for s in v {
+                        let i = match index.entry((s.metric_name, s.labels)) {
+                            Entry::Occupied(e) => *e.get(),
+                            // First step wins (the latch): later steps only
+                            // append points.
+                            Entry::Vacant(e) => {
+                                acc.push((s.drop_name, Vec::new()));
+                                *e.insert(acc.len() - 1)
+                            }
+                        };
+                        if fill.is_some() {
+                            rows.push((i, s.v, s.h.clone()));
+                        }
                         // M7-A5a: the histogram channel rides the range
                         // materialization step point (the second selection
                         // site) verbatim; float steps carry `h: None`.
-                        .push(Point {
+                        acc[i].1.push(Point {
                             t_ms: t,
-                            v: value,
-                            h,
+                            v: s.v,
+                            h: s.h,
                         });
+                    }
+                    if fill.is_some() {
+                        held = Some((tau, Held::Vector(rows)));
+                    }
                 }
-            }
-            StepValue::Scalar(v) => {
-                saw_scalar = true;
-                scalar_points.push(Point::float(t, v));
-            }
-            // Unreachable through `plan()`: string-typed range queries
-            // are rejected at plan time (defense in depth, the scalar-
-            // subquery precedent).
-            StepValue::String(_) => {
-                return Err(PromqlError::Unsupported {
-                    construct: "string literal in a range query".to_string(),
-                });
-            }
+                StepValue::Scalar(v) => {
+                    saw_scalar = true;
+                    scalar_points.push(Point::float(t, v));
+                    if fill.is_some() {
+                        held = Some((tau, Held::Scalar(v)));
+                    }
+                }
+                // Unreachable through `plan()`: string-typed range queries
+                // are rejected at plan time (defense in depth, the scalar-
+                // subquery precedent).
+                StepValue::String(_) => {
+                    return Err(PromqlError::Unsupported {
+                        construct: "string literal in a range query".to_string(),
+                    });
+                }
+            },
         }
         t += p.step_ms;
     }
@@ -560,13 +601,13 @@ fn evaluate_counted_with(
         ));
     }
 
-    let mut out: Vec<RangeSeries> = vector_points
+    let mut out: Vec<RangeSeries> = index
         .into_iter()
-        .map(|((metric_name, labels), (drop_name, points))| RangeSeries {
+        .map(|((metric_name, labels), i)| RangeSeries {
             labels,
             metric_name,
-            drop_name,
-            points,
+            drop_name: acc[i].0,
+            points: std::mem::take(&mut acc[i].1),
         })
         .collect();
     // `(labels, metric_name)` tie-break (plan v3 Δ5): the wire order is
@@ -2261,6 +2302,70 @@ fn window_end(sel: &SelectorSpec, t_ms: i64) -> (i64, Option<i64>, bool) {
         Some(f) if t_ms <= f.until_ms => (t_ms - sel.offset_ms, sel.range_ms, false),
         Some(f) => (t_ms - sel.offset_ms, f.tail_range_ms, true),
     }
+}
+
+/// Issue #795: a range query whose root is a plain selector. Each series'
+/// labels are cloned once and its identity hashed once; the step loop does
+/// both at every step. Same points, same order, same latch (`drop_name`
+/// false) as the step loop.
+fn selector_range(
+    sel: &SelectorSpec,
+    data: &EvalData<'_>,
+    p: &crate::plan::PlanParams,
+    cancel: &CancelToken,
+) -> Result<Vec<RangeSeries>, PromqlError> {
+    let mut index: HashMap<(Option<&str>, &Labels), usize> = HashMap::new();
+    let mut out: Vec<RangeSeries> = Vec::new();
+    // Per read (first, second): each fetched series' index into `out`.
+    let mut slots: [Vec<Option<usize>>; 2] = [Vec::new(), Vec::new()];
+    let fill = sel.fill;
+    let mut t = p.start_ms;
+    while t <= p.end_ms {
+        if cancel.is_cancelled() {
+            return Err(PromqlError::Cancelled);
+        }
+        let tau = match fill {
+            Some(f) if t <= f.until_ms => -(-t).div_euclid(f.width_ms) * f.width_ms,
+            _ => t,
+        };
+        let (eff_t, _, tail) = window_end(sel, tau);
+        let read = data.get_read(sel.id, tail);
+        let slot = &mut slots[usize::from(tail)];
+        if slot.len() != read.len() {
+            *slot = vec![None; read.len()];
+        }
+        for (k, series) in read.iter().enumerate() {
+            let Some(sample) = staleness::instant_value(&series.samples, eff_t, p.lookback_ms)
+            else {
+                continue;
+            };
+            let i = match slot[k] {
+                Some(i) => i,
+                None => {
+                    let name = series.metric_name.as_deref().or(sel.metric_name.as_deref());
+                    let i = *index.entry((name, &series.labels)).or_insert_with(|| {
+                        out.push(RangeSeries {
+                            labels: series.labels.clone(),
+                            metric_name: name.map(str::to_owned),
+                            drop_name: false,
+                            points: Vec::new(),
+                        });
+                        out.len() - 1
+                    });
+                    slot[k] = Some(i);
+                    i
+                }
+            };
+            out[i].points.push(Point {
+                t_ms: t,
+                v: sample.v,
+                h: sample.h,
+            });
+        }
+        t += p.step_ms;
+    }
+    out.sort_by(|a, b| (&a.labels, &a.metric_name).cmp(&(&b.labels, &b.metric_name)));
+    Ok(out)
 }
 
 /// Issue #18: `written / read` when a selector's range was read wider than
