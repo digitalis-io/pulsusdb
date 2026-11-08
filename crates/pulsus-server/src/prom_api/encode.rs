@@ -272,6 +272,21 @@ pub(crate) fn push_prom_float(out: &mut Vec<u8>, v: f64) {
     }
 }
 
+/// A sample value's text (issue #795 part 3): a finite value as text that
+/// parses back to the same `f64`, bit for bit, `zmij`'s shortest round-trip
+/// text without a trailing `.0`; every NaN as `NaN`; the infinities as `+Inf`
+/// and `-Inf`.
+fn push_sample_value(out: &mut Vec<u8>, v: f64) {
+    push_prom_float(out, v);
+}
+
+/// [`push_sample_value`] in quotes.
+fn push_quoted_sample(out: &mut Vec<u8>, v: f64) {
+    out.push(b'"');
+    push_sample_value(out, v);
+    out.push(b'"');
+}
+
 /// Prometheus-style timestamp (`jsonutil.MarshalTimestamp`): integer
 /// seconds when `ms` lands exactly on a second boundary, else
 /// `secs.fff`-with-trailing-zeros-trimmed — deliberately diverges from
@@ -2456,8 +2471,12 @@ mod tests {
         format!("{secs}.{trimmed}")
     }
 
-    fn quoted_value_before(v: f64) -> String {
-        json_string(&prom_float_before(v))
+    /// The new sample-value writer's quoted text (issue #795 part 3): the
+    /// value calls of E4's `_before` renderers write through it.
+    fn quoted_sample_for_test(v: f64) -> String {
+        let mut out = Vec::new();
+        push_quoted_sample(&mut out, v);
+        String::from_utf8(out).expect("ASCII")
     }
 
     fn labels_object_json_before(labels: &[(String, String)]) -> String {
@@ -2477,7 +2496,7 @@ mod tests {
             points.push_str(&format!(
                 "[{},{}]",
                 prom_timestamp_before(*t_ms),
-                quoted_value_before(*value)
+                quoted_sample_for_test(*value)
             ));
         }
         format!(
@@ -2493,7 +2512,7 @@ mod tests {
             "{{\"metric\":{},\"value\":[{},{}]}}",
             labels_object_json_before(&s.labels),
             prom_timestamp_before(at_ms),
-            quoted_value_before(s.value)
+            quoted_sample_for_test(s.value)
         )
         .into_bytes()
     }
@@ -2512,9 +2531,9 @@ mod tests {
             let code = histogram_boundary_code(b.lower_inclusive, b.upper_inclusive);
             buckets.push_str(&format!(
                 "[{code},{},{},{}]",
-                quoted_value_before(b.lower),
-                quoted_value_before(b.upper),
-                quoted_value_before(b.count)
+                quoted_sample_for_test(b.lower),
+                quoted_sample_for_test(b.upper),
+                quoted_sample_for_test(b.count)
             ));
         }
         let buckets_field = if any {
@@ -2524,14 +2543,14 @@ mod tests {
         };
         format!(
             "{{\"count\":{},\"sum\":{}{buckets_field}}}",
-            quoted_value_before(h.count),
-            quoted_value_before(h.sum)
+            quoted_sample_for_test(h.count),
+            quoted_sample_for_test(h.sum)
         )
     }
 
     fn render_hist_or_float_before(v: &HistOrFloat) -> String {
         match v {
-            HistOrFloat::Float(f) => quoted_value_before(*f),
+            HistOrFloat::Float(f) => quoted_sample_for_test(*f),
             HistOrFloat::Hist(h) => render_histogram_json_before(h),
         }
     }
@@ -2565,7 +2584,7 @@ mod tests {
                     values.push_str(&format!(
                         "[{},{}]",
                         prom_timestamp_before(*t_ms),
-                        quoted_value_before(*f)
+                        quoted_sample_for_test(*f)
                     ));
                 }
                 HistOrFloat::Hist(h) => {
@@ -2675,16 +2694,153 @@ mod tests {
     /// **E2 (issue #795): `prom_timestamp` writes what it wrote before.**
     #[test]
     fn prom_timestamp_writes_what_it_wrote_before() {
-        let mut values: Vec<i64> = (-3_000..=3_000).collect();
-        values.extend([i64::MIN, i64::MAX, i64::MIN + 1]);
+        // Issue #795 part 3: the non-negative times only; below zero the
+        // copy is wrong, and T1 pins those.
+        let mut values: Vec<i64> = (0..=3_000).collect();
+        values.push(i64::MAX);
         let mut rng = XorShift::new();
-        values.extend((0..100_000).map(|_| rng.next() as i64));
+        values.extend((0..100_000).map(|_| (rng.next() >> 1) as i64));
         for ms in values {
             assert_eq!(
                 prom_timestamp(ms),
                 prom_timestamp_before(ms),
                 "prom_timestamp({ms})"
             );
+        }
+    }
+
+    /// **T1 (issue #795 part 3): a negative timestamp is the same
+    /// instant**: `-` and then the text of its absolute value.
+    #[test]
+    fn a_negative_timestamp_is_the_same_instant() {
+        for (ms, want) in [
+            (-1500, "-1.5"),
+            (-1, "-0.001"),
+            (-10, "-0.01"),
+            (-999, "-0.999"),
+            (-1000, "-1"),
+            (-1001, "-1.001"),
+            (-5000, "-5"),
+            (-1_435_781_451_250, "-1435781451.25"),
+            (i64::MIN, "-9223372036854775.808"),
+        ] {
+            assert_eq!(prom_timestamp(ms), want, "prom_timestamp({ms})");
+        }
+        let mut values: Vec<i64> = (-3_000..=-1).collect();
+        let mut rng = XorShift::new();
+        values.extend((0..100_000).map(|_| (rng.next() | (1 << 63)) as i64));
+        for ms in values.into_iter().filter(|&ms| ms != i64::MIN) {
+            assert_eq!(
+                prom_timestamp(ms),
+                format!("-{}", prom_timestamp_before(ms.unsigned_abs() as i64)),
+                "prom_timestamp({ms})"
+            );
+        }
+    }
+
+    /// V1 and V2's text of one value through [`push_sample_value`].
+    fn sample_text(v: f64) -> String {
+        let mut out = Vec::new();
+        push_sample_value(&mut out, v);
+        String::from_utf8(out).expect("ASCII")
+    }
+
+    /// **V1 (issue #795 part 3): a finite sample value parses back to its
+    /// bits**; every NaN is `NaN`, the infinities `+Inf` and `-Inf`.
+    #[test]
+    fn a_finite_sample_value_parses_back_to_its_bits() {
+        let mut values: Vec<f64> = Vec::new();
+        for k in -324..=308 {
+            let p: f64 = format!("1e{k}").parse().expect("a power of ten");
+            values.extend([p, p.next_up(), p.next_down()]);
+        }
+        for edge in [1e-5_f64, 1e16] {
+            let (mut up, mut down) = (edge, edge);
+            for _ in 0..4 {
+                up = up.next_up();
+                down = down.next_down();
+                values.extend([up, down]);
+            }
+            values.push(edge);
+        }
+        values.extend([
+            5e-324,
+            f64::from_bits(0x000F_FFFF_FFFF_FFFF),
+            f64::MIN_POSITIVE,
+            f64::MIN_POSITIVE.next_up(),
+            f64::MIN_POSITIVE.next_down(),
+            f64::MAX,
+            0.0,
+            f64::INFINITY,
+        ]);
+        values.extend((0..=100_000).map(f64::from));
+        let two53 = 9_007_199_254_740_992_i64;
+        values.extend((-1000..=1000).map(|j| (two53 + j) as f64));
+        let negated: Vec<f64> = values.iter().map(|v| -v).collect();
+        values.extend(negated);
+        for payload in 1..=1000_u64 {
+            values.push(f64::from_bits(0x7FF0_0000_0000_0000 | payload));
+            values.push(f64::from_bits(0xFFF0_0000_0000_0000 | payload));
+        }
+        let mut rng = XorShift::new();
+        values.extend((0..5_000_000).map(|_| f64::from_bits(rng.next())));
+        for v in values {
+            let text = sample_text(v);
+            if v.is_nan() {
+                // Payload and sign are not kept: one spelling for every NaN.
+                assert_eq!(text, "NaN", "NaN bits {:#x}", v.to_bits());
+            } else if v.is_infinite() {
+                assert_eq!(text, if v > 0.0 { "+Inf" } else { "-Inf" });
+            } else {
+                assert!(
+                    text.bytes().all(|b| b"-0123456789.e+".contains(&b)),
+                    "{text}: only digits, sign, point and exponent"
+                );
+                assert!(!text.ends_with(".0"), "{text} ends in .0");
+                let back: f64 = text.parse().expect("the text is a number");
+                assert_eq!(back.to_bits(), v.to_bits(), "{text} reads back to {v:e}");
+            }
+        }
+    }
+
+    /// **V2 (issue #795 part 3): ordinary sample values keep today's
+    /// text**: integers under 2^53 and decimals of 1 to 15 significant
+    /// digits whose leading digit's exponent is from -5 to 15.
+    #[test]
+    fn ordinary_sample_values_keep_todays_text() {
+        let mut rng = XorShift::new();
+        for _ in 0..2_500_000 {
+            let m = (rng.next() >> 11) as f64;
+            let v = if rng.next() & 1 == 0 { m } else { -m };
+            assert_eq!(sample_text(v), prom_float(v), "integer {v:e}");
+        }
+        for _ in 0..2_500_000 {
+            let digits = 1 + rng.below(15) as i32;
+            let mant =
+                10_u64.pow(digits as u32 - 1) + rng.next() % (9 * 10_u64.pow(digits as u32 - 1));
+            let lead = -5 + rng.below(21) as i32;
+            let e = lead - (digits - 1);
+            let sign = if rng.next() & 1 == 0 { "" } else { "-" };
+            let v: f64 = format!("{sign}{mant}e{e}").parse().expect("a decimal");
+            assert_eq!(sample_text(v), prom_float(v), "decimal {sign}{mant}e{e}");
+        }
+    }
+
+    /// **V3 (issue #795 part 3): extreme sample values use an exponent.**
+    #[test]
+    fn extreme_sample_values_use_an_exponent() {
+        for (v, want) in [
+            (1e21, "1e+21"),
+            (1e-7, "1e-7"),
+            (1e16, "1e+16"),
+            (5e-324, "5e-324"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (-2.5e-10, "-2.5e-10"),
+            (1e300, "1e+300"),
+            (1e-5, "0.00001"),
+            (1e15, "1000000000000000"),
+        ] {
+            assert_eq!(sample_text(v), want, "{v:e}");
         }
     }
 
@@ -2786,7 +2942,7 @@ mod tests {
     }
 
     /// `Hh1`, `Hh2`, `Hh3` of E4.
-    fn e4_histograms() -> [HistOrFloat; 3] {
+    fn e4_histograms() -> [HistOrFloat; 4] {
         [
             hist((
                 0,
@@ -2818,18 +2974,27 @@ mod tests {
                 (vec![], vec![]),
                 vec![0.5, 1.0, 2.5],
             )),
+            // `Hh4` (issue #795 part 3): bounds of about 4.7e-10, which the
+            // sample writer puts in exponent notation.
+            hist((
+                0,
+                0.0,
+                0,
+                1,
+                1e-9,
+                (vec![span(-30, 1)], vec![1]),
+                (vec![], vec![]),
+                vec![],
+            )),
         ]
     }
 
     fn random_hist_or_float(rng: &mut XorShift) -> HistOrFloat {
-        let i = rng.below(4);
-        if i == 3 {
+        let i = rng.below(5);
+        if i == 4 {
             HistOrFloat::Float(random_value(rng))
         } else {
-            e4_histograms()
-                .into_iter()
-                .nth(i)
-                .expect("three histograms")
+            e4_histograms().into_iter().nth(i).expect("four histograms")
         }
     }
 
@@ -2861,7 +3026,12 @@ mod tests {
             .map(|_| MatrixSeries {
                 labels: random_labels(&mut rng),
                 points: (0..rng.below(9))
-                    .map(|_| (random_ms(&mut rng), random_value(&mut rng)))
+                    .map(|_| {
+                        (
+                            random_ms(&mut rng).checked_abs().unwrap_or(i64::MAX),
+                            random_value(&mut rng),
+                        )
+                    })
                     .collect(),
             })
             .collect();
@@ -2875,7 +3045,12 @@ mod tests {
             .map(|_| HistMatrixSeries {
                 labels: random_labels(&mut rng),
                 points: (0..rng.below(9))
-                    .map(|_| (random_ms(&mut rng), random_hist_or_float(&mut rng)))
+                    .map(|_| {
+                        (
+                            random_ms(&mut rng).checked_abs().unwrap_or(i64::MAX),
+                            random_hist_or_float(&mut rng),
+                        )
+                    })
                     .collect(),
             })
             .collect();
