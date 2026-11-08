@@ -691,22 +691,27 @@ mod tests {
         }
     }
 
-    /// **G1 (issue #795): responses are gzipped at level 2.** One fixed
-    /// 1 MiB body through the product layer, an explicit level-2 layer and
-    /// the default layer: the product bytes are the level-2 bytes, and not
-    /// the default's.
+    /// G1's and G2's body: 944,438 bytes of small JSON objects.
+    fn gzip_test_body() -> String {
+        (0..40_000)
+            .map(|i: u64| format!("{{\"t\":{i},\"v\":\"{}\"}}", i * 7919 % 100_000))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// **G1 (issue #795): responses are gzipped at level 7.** One fixed
+    /// body through the product layer, an explicit level-7 layer and the
+    /// default layer: the product bytes are the level-7 bytes, and not the
+    /// default's.
     #[tokio::test]
-    async fn responses_are_gzipped_at_level_two() {
+    async fn responses_are_gzipped_at_level_seven() {
         use axum::body::{Body, to_bytes};
         use axum::routing::get;
         use tower::ServiceExt;
         use tower_http::CompressionLevel;
 
         async fn gzipped(layer: CompressionLayer) -> Vec<u8> {
-            let body: String = (0..40_000)
-                .map(|i: u64| format!("{{\"t\":{i},\"v\":\"{}\"}}", i * 7919 % 100_000))
-                .collect::<Vec<_>>()
-                .join(",");
+            let body = gzip_test_body();
             let router: axum::Router = axum::Router::new()
                 .route("/x", get(move || async move { body }))
                 .layer(layer);
@@ -730,13 +735,33 @@ mod tests {
         }
 
         let product = gzipped(compression_layer()).await;
-        let level_two =
-            gzipped(CompressionLayer::new().quality(CompressionLevel::Precise(2))).await;
+        let level_seven =
+            gzipped(CompressionLayer::new().quality(CompressionLevel::Precise(7))).await;
         let default = gzipped(CompressionLayer::new()).await;
-        assert!(product == level_two, "the product layer gzips at level 2");
+        assert!(product == level_seven, "the product layer gzips at level 7");
         assert!(
             product != default,
             "the product layer is not the default level"
+        );
+    }
+
+    /// **G2 (issue #795): gzip runs on the `zlib-rs` backend.** G1's body
+    /// through `flate2` at level 7 gives `zlib-rs`'s length, not
+    /// `miniz_oxide`'s.
+    #[test]
+    fn gzip_runs_on_the_zlib_rs_backend() {
+        use std::io::Write;
+
+        let body = gzip_test_body();
+        assert_eq!(body.len(), 944_438, "G1's body");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(7));
+        encoder.write_all(body.as_bytes()).expect("write");
+        let out = encoder.finish().expect("finish");
+        assert_eq!(
+            out.len(),
+            229_359,
+            "level 7 gives 229,359 bytes on zlib-rs 0.6.8 and 238,988 on miniz_oxide; \
+             a zlib-rs update in Cargo.lock may move the first figure"
         );
     }
 }
