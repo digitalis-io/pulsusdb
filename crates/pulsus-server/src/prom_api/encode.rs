@@ -16,16 +16,17 @@
 //! be polled again once it returns `Poll::Ready(None)`, and panics
 //! otherwise. `Fuse` makes that extra poll a safe no-op.
 //!
-//! **Two formatters are Prometheus-exact, not Rust `Display`** — see each
-//! function's own doc: [`prom_float`] reproduces Go
-//! `strconv.FormatFloat(v,'f',-1,64)` (always fixed-point, **never**
-//! scientific notation — a correction to the architect plan amendment §2's
-//! pinned `'g'` mechanism, made against a live capture of real
-//! `prom/prometheus:v3.13.0`; see [`prom_float`]'s own doc and this
-//! issue's implementation notes); [`prom_timestamp`] trims trailing zeros
-//! (diverging from `logs_api::encode`'s own `format_unix_seconds`, which
-//! always pads `.fff` — a deliberate difference, not an oversight, because
-//! Prometheus's own `jsonutil.MarshalTimestamp` trims).
+//! **Value and timestamp text.** A sample value in a vector, matrix or
+//! histogram is written by [`push_sample_value`] (issue #795 part 3): a finite
+//! value as text that parses back to the same `f64`, not necessarily the reference's
+//! digits (docs/api.md §3.1). A scalar result keeps [`prom_float`]'s text,
+//! Go `strconv.FormatFloat(v,'f',-1,64)`, which the captured scalar fixtures
+//! pin. [`prom_timestamp`] writes whole seconds, then a `.` and the
+//! millisecond digits with trailing zeros trimmed, and a negative time as
+//! `-` and then the text of its absolute value. The reference's scalar
+//! timestamp is the same text. Its vector and matrix timestamps keep three
+//! fraction digits (`1.500` where this writes `1.5`); both parse to the same
+//! number.
 //!
 //! **Ordering (determinism):** every response shape here sorts its items by
 //! label vector (vector/matrix: the label vector itself; series: the full
@@ -277,7 +278,15 @@ pub(crate) fn push_prom_float(out: &mut Vec<u8>, v: f64) {
 /// text without a trailing `.0`; every NaN as `NaN`; the infinities as `+Inf`
 /// and `-Inf`.
 fn push_sample_value(out: &mut Vec<u8>, v: f64) {
-    push_prom_float(out, v);
+    if v.is_nan() {
+        out.extend_from_slice(b"NaN");
+    } else if v.is_infinite() {
+        out.extend_from_slice(if v > 0.0 { b"+Inf" } else { b"-Inf" });
+    } else {
+        let mut buf = zmij::Buffer::new();
+        let text = buf.format_finite(v).as_bytes();
+        out.extend_from_slice(text.strip_suffix(b".0").unwrap_or(text));
+    }
 }
 
 /// [`push_sample_value`] in quotes.
@@ -287,24 +296,28 @@ fn push_quoted_sample(out: &mut Vec<u8>, v: f64) {
     out.push(b'"');
 }
 
-/// Prometheus-style timestamp (`jsonutil.MarshalTimestamp`): integer
-/// seconds when `ms` lands exactly on a second boundary, else
-/// `secs.fff`-with-trailing-zeros-trimmed — deliberately diverges from
-/// `logs_api::encode::format_unix_seconds`'s always-`.fff` padding (see
-/// the module doc). Emitted as a **bare** JSON number by the caller, never
-/// a quoted string.
+/// The text of every timestamp this file writes (issue #795): whole seconds,
+/// then a `.` and the millisecond digits with trailing zeros trimmed; a
+/// negative time is `-` and then the text of its absolute value. The
+/// reference's vector and matrix writer keeps three fraction digits instead;
+/// both parse to the same number. Emitted as a **bare** JSON number by the
+/// caller, never a quoted string.
 pub(crate) fn prom_timestamp(ms: i64) -> String {
     let mut out = Vec::new();
     push_prom_timestamp(&mut out, ms);
     String::from_utf8(out).expect("ASCII")
 }
 
-/// [`prom_timestamp`] appended to `out` (issue #795): the trimmed
-/// `{millis:03}` written digit by digit.
+/// [`prom_timestamp`] appended to `out` (issue #795): whole seconds, then a
+/// `.` and the millisecond digits with trailing zeros trimmed; a negative
+/// time is `-` and then the same text for its absolute value.
 fn push_prom_timestamp(out: &mut Vec<u8>, ms: i64) {
-    let secs = ms.div_euclid(1000);
-    let millis = ms.rem_euclid(1000);
-    std::io::Write::write_fmt(out, format_args!("{secs}")).expect("a Vec never fails a write");
+    if ms < 0 {
+        out.push(b'-');
+    }
+    let abs = ms.unsigned_abs();
+    let (secs, millis) = (abs / 1000, abs % 1000);
+    out.extend_from_slice(itoa::Buffer::new().format(secs).as_bytes());
     if millis != 0 {
         let (hundreds, tens, ones) = (millis / 100, millis / 10 % 10, millis % 10);
         out.push(b'.');
@@ -421,7 +434,7 @@ fn push_matrix_item(s: &MatrixSeries, out: &mut Vec<u8>) {
         out.push(b'[');
         push_prom_timestamp(out, *t_ms);
         out.push(b',');
-        push_quoted_value(out, *value);
+        push_quoted_sample(out, *value);
         out.push(b']');
     }
     out.extend_from_slice(b"]}");
@@ -433,7 +446,7 @@ fn push_vector_item(s: &VectorSample, at_ms: i64, out: &mut Vec<u8>) {
     out.extend_from_slice(b",\"value\":[");
     push_prom_timestamp(out, at_ms);
     out.push(b',');
-    push_quoted_value(out, s.value);
+    push_quoted_sample(out, s.value);
     out.extend_from_slice(b"]}");
 }
 
@@ -454,15 +467,15 @@ fn histogram_boundary_code(lower_inclusive: bool, upper_inclusive: bool) -> u8 {
 /// Renders a native histogram to Prometheus's `MarshalHistogram` wire shape
 /// (`util/jsonutil/marshal.go`, pinned `40af9c2`):
 /// `{"count":"<c>","sum":"<s>","buckets":[[<code>,"<lower>","<upper>","<count>"],…]}`
-/// — `count`/`sum`/bucket fields are quoted float strings (`quoted_value`,
-/// [`prom_float`]'s own contract — bit-for-bit `MarshalFloat`); zero-count
+/// — `count`/`sum`/bucket fields are quoted float strings
+/// ([`push_quoted_sample`], [`push_sample_value`]'s contract); zero-count
 /// buckets are skipped; the `buckets` key is omitted entirely when every
 /// bucket is empty (upstream's `bucketFound` guard).
 fn push_histogram_json(out: &mut Vec<u8>, h: &pulsus_model::FloatHistogram) {
     out.extend_from_slice(b"{\"count\":");
-    push_quoted_value(out, h.count);
+    push_quoted_sample(out, h.count);
     out.extend_from_slice(b",\"sum\":");
-    push_quoted_value(out, h.sum);
+    push_quoted_sample(out, h.sum);
     let mut any = false;
     for b in h.all_buckets() {
         if b.count == 0.0 {
@@ -474,11 +487,11 @@ fn push_histogram_json(out: &mut Vec<u8>, h: &pulsus_model::FloatHistogram) {
         out.push(b'[');
         out.push(b'0' + code);
         out.push(b',');
-        push_quoted_value(out, b.lower);
+        push_quoted_sample(out, b.lower);
         out.push(b',');
-        push_quoted_value(out, b.upper);
+        push_quoted_sample(out, b.upper);
         out.push(b',');
-        push_quoted_value(out, b.count);
+        push_quoted_sample(out, b.count);
         out.push(b']');
     }
     if any {
@@ -489,7 +502,7 @@ fn push_histogram_json(out: &mut Vec<u8>, h: &pulsus_model::FloatHistogram) {
 
 fn push_hist_or_float(out: &mut Vec<u8>, v: &HistOrFloat) {
     match v {
-        HistOrFloat::Float(f) => push_quoted_value(out, *f),
+        HistOrFloat::Float(f) => push_quoted_sample(out, *f),
         HistOrFloat::Hist(h) => push_histogram_json(out, h),
     }
 }

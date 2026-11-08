@@ -78,6 +78,9 @@ rustls-pemfile.workspace = true
 tokio-rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Issue #795 part 3: sample value and timestamp text in prom_api::encode.
+itoa.workspace = true
+zmij.workspace = true
 serde_norway.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
