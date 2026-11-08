@@ -26,9 +26,12 @@ pub(crate) fn trace_layer() -> TraceLayer<SharedClassifier<ServerErrorsAsFailure
     TraceLayer::new_for_http()
 }
 
-/// Gzip response compression (applied globally).
+/// Gzip response level (issue #795): level 7 of 9, on the `zlib-rs` backend.
+pub(crate) const RESPONSE_GZIP_LEVEL: i32 = 7;
+
+/// Gzip response compression (applied globally), at [`RESPONSE_GZIP_LEVEL`].
 pub(crate) fn compression_layer() -> CompressionLayer {
-    CompressionLayer::new()
+    CompressionLayer::new().quality(tower_http::CompressionLevel::Precise(RESPONSE_GZIP_LEVEL))
 }
 
 /// `Access-Control-Allow-Origin` per `PULSUS_CORS_ORIGIN` (applied
@@ -686,5 +689,79 @@ mod tests {
                 .expect("body");
             assert_eq!(String::from_utf8_lossy(&body), want_body, "{path}");
         }
+    }
+
+    /// G1's and G2's body: 944,438 bytes of small JSON objects.
+    fn gzip_test_body() -> String {
+        (0..40_000)
+            .map(|i: u64| format!("{{\"t\":{i},\"v\":\"{}\"}}", i * 7919 % 100_000))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// **G1 (issue #795): responses are gzipped at level 7.** One fixed
+    /// body through the product layer, an explicit level-7 layer and the
+    /// default layer: the product bytes are the level-7 bytes, and not the
+    /// default's.
+    #[tokio::test]
+    async fn responses_are_gzipped_at_level_seven() {
+        use axum::body::{Body, to_bytes};
+        use axum::routing::get;
+        use tower::ServiceExt;
+        use tower_http::CompressionLevel;
+
+        async fn gzipped(layer: CompressionLayer) -> Vec<u8> {
+            let body = gzip_test_body();
+            let router: axum::Router = axum::Router::new()
+                .route("/x", get(move || async move { body }))
+                .layer(layer);
+            let request = Request::builder()
+                .uri("/x")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap();
+            let res = router.oneshot(request).await.unwrap();
+            assert_eq!(
+                res.headers()
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok()),
+                Some("gzip"),
+                "the response is gzip-encoded"
+            );
+            to_bytes(res.into_body(), usize::MAX)
+                .await
+                .expect("body")
+                .to_vec()
+        }
+
+        let product = gzipped(compression_layer()).await;
+        let level_seven =
+            gzipped(CompressionLayer::new().quality(CompressionLevel::Precise(7))).await;
+        let default = gzipped(CompressionLayer::new()).await;
+        assert!(product == level_seven, "the product layer gzips at level 7");
+        assert!(
+            product != default,
+            "the product layer is not the default level"
+        );
+    }
+
+    /// **G2 (issue #795): gzip runs on the `zlib-rs` backend.** G1's body
+    /// through `flate2` at level 7 gives `zlib-rs`'s length, not
+    /// `miniz_oxide`'s.
+    #[test]
+    fn gzip_runs_on_the_zlib_rs_backend() {
+        use std::io::Write;
+
+        let body = gzip_test_body();
+        assert_eq!(body.len(), 944_438, "G1's body");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(7));
+        encoder.write_all(body.as_bytes()).expect("write");
+        let out = encoder.finish().expect("finish");
+        assert_eq!(
+            out.len(),
+            229_359,
+            "level 7 gives 229,359 bytes on zlib-rs 0.6.8 and 238,988 on miniz_oxide; \
+             a zlib-rs update in Cargo.lock may move the first figure"
+        );
     }
 }

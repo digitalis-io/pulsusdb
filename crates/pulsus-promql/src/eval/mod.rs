@@ -31,6 +31,7 @@ pub mod staleness;
 pub mod window;
 
 use std::cell::{Cell, RefCell};
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -195,6 +196,14 @@ enum StepValue {
 /// set — upstream hashes the complete label set, `__name__` included.
 type SeriesIdentity = (Option<String>, Labels);
 
+/// A range step's value held for the later steps of its bucket (issue
+/// #795): a vector as its series' indices into the range accumulator, so a
+/// held step neither clones nor hashes labels.
+enum Held {
+    Vector(Vec<(usize, f64, Option<Box<pulsus_model::FloatHistogram>>)>),
+    Scalar(f64),
+}
+
 /// Cooperative cancellation, checked at eval-loop checkpoints (issue #93):
 /// once per range step, once per subquery inner-grid point, and before the
 /// single instant `eval_step`. `None` (via [`CancelToken::never`]) means
@@ -251,7 +260,7 @@ pub fn evaluate_cancellable(
     data: &SeriesData,
     cancel: CancelToken,
 ) -> Result<(QueryValue, Annotations), PromqlError> {
-    evaluate_counted_with(plan, data, cancel)
+    evaluate_counted_with(plan, data, cancel, true)
         .map(|(value, _counts, annotations)| (value, annotations))
 }
 
@@ -289,6 +298,8 @@ struct EvalCounts {
     /// (`tests::finalize_skips_the_matrix_merge_pass_when_no_series_is_drop_marked`),
     /// a `drop_name` case MUST count > 0.
     finalize_matrix_merge_passes: u64,
+    /// Range queries answered by `selector_range` (issue #795).
+    direct_selector_ranges: u64,
 }
 
 /// [`evaluate`] plus [`EvalCounts`] and the drained [`Annotations`] sink —
@@ -299,14 +310,28 @@ fn evaluate_counted(
     plan: &QueryPlan,
     data: &SeriesData,
 ) -> Result<(QueryValue, EvalCounts, Annotations), PromqlError> {
-    evaluate_counted_with(plan, data, CancelToken::never())
+    evaluate_counted_with(plan, data, CancelToken::never(), true)
+}
+
+/// [`evaluate_counted`] with the plain-selector route off (issue #795):
+/// every range query runs the step loop, so tests can compare the two
+/// routes on one input.
+#[cfg(test)]
+fn evaluate_step_loop(
+    plan: &QueryPlan,
+    data: &SeriesData,
+) -> Result<(QueryValue, EvalCounts, Annotations), PromqlError> {
+    evaluate_counted_with(plan, data, CancelToken::never(), false)
 }
 
 /// [`evaluate_counted`] with an explicit [`CancelToken`] (issue #93).
+/// `allow_direct` (issue #795) lets a range query whose root is a plain
+/// selector skip the step loop.
 fn evaluate_counted_with(
     plan: &QueryPlan,
     data: &SeriesData,
     cancel: CancelToken,
+    allow_direct: bool,
 ) -> Result<(QueryValue, EvalCounts, Annotations), PromqlError> {
     let p = &plan.params;
 
@@ -409,6 +434,22 @@ fn evaluate_counted_with(
         return Ok((value, counts, caches.annotations.take()));
     }
 
+    if allow_direct
+        && let PlanExpr::Selector(id) = &plan.root
+        && !plan.selectors[*id].smoothed
+        && caches.step_invariant_marked.is_empty()
+    {
+        counts.direct_selector_ranges += 1;
+        let out = selector_range(&plan.selectors[*id], data, p, &caches.cancel)?;
+        flush_ratio_warnings(&caches);
+        counts.step_invariant_evals = caches.step_invariant_evals.get();
+        let value = finalize_metadata_labels(
+            QueryValue::Matrix(out),
+            &mut counts.finalize_matrix_merge_passes,
+        )?;
+        return Ok((value, counts, caches.annotations.take()));
+    }
+
     // Issue #68 (plan v3 Δ5, superseding the #37 `Labels`-only key): the
     // range accumulator keys on the FULL upstream series identity
     // `(metric_name, Labels)` — upstream hashes the complete label set,
@@ -440,7 +481,11 @@ fn evaluate_counted_with(
     // `drop_name` into the key instead would split that series into a
     // kept half and a dropped half with DIFFERENT post-strip labelsets —
     // two output series where upstream has one.
-    let mut vector_points: HashMap<SeriesIdentity, (bool, Vec<Point>)> = HashMap::new();
+    //
+    // Issue #795: the map holds each identity's index into `acc`; a held
+    // step pushes its points by index without cloning or hashing labels.
+    let mut index: HashMap<SeriesIdentity, usize> = HashMap::new();
+    let mut acc: Vec<(bool, Vec<Point>)> = Vec::new();
     let mut scalar_points: Vec<Point> = Vec::new();
     let mut saw_vector = false;
     let mut saw_scalar = false;
@@ -452,7 +497,7 @@ fn evaluate_counted_with(
     // own times. Points stay at the request's times, so the identity map
     // and the name latch below are those of any range query.
     let fill = plan.selectors.first().and_then(|s| s.fill);
-    let mut held: Option<(i64, StepValue)> = None;
+    let mut held: Option<(i64, Held)> = None;
     let mut t = p.start_ms;
     while t <= p.end_ms {
         // Issue #93: one `Relaxed` load per step — O(1), no allocation, no
@@ -464,63 +509,76 @@ fn evaluate_counted_with(
             Some(f) if t <= f.until_ms => -(-t).div_euclid(f.width_ms) * f.width_ms,
             _ => t,
         };
-        let value = match &held {
-            Some((at, v)) if fill.is_some() && *at == tau => v.clone(),
-            _ => {
-                let v = eval_step(
-                    &plan.root,
-                    &plan.selectors,
-                    data,
-                    tau,
-                    p.lookback_ms,
-                    &caches,
-                )?;
-                if fill.is_some() {
-                    held = Some((tau, v.clone()));
+        match &held {
+            Some((at, h)) if fill.is_some() && *at == tau => match h {
+                Held::Vector(rows) => {
+                    saw_vector = true;
+                    for (i, v, h) in rows {
+                        acc[*i].1.push(Point {
+                            t_ms: t,
+                            v: *v,
+                            h: h.clone(),
+                        });
+                    }
                 }
-                v
-            }
-        };
-        match value {
-            StepValue::Vector(v) => {
-                saw_vector = true;
-                for s in v {
-                    let InstantSample {
-                        labels,
-                        metric_name,
-                        drop_name,
-                        t_ms: _,
-                        v: value,
-                        h,
-                    } = s;
-                    vector_points
-                        .entry((metric_name, labels))
-                        // First step wins (the latch): later inserts only
-                        // append points.
-                        .or_insert_with(|| (drop_name, Vec::new()))
-                        .1
+                Held::Scalar(v) => {
+                    saw_scalar = true;
+                    scalar_points.push(Point::float(t, *v));
+                }
+            },
+            _ => match eval_step(
+                &plan.root,
+                &plan.selectors,
+                data,
+                tau,
+                p.lookback_ms,
+                &caches,
+            )? {
+                StepValue::Vector(v) => {
+                    saw_vector = true;
+                    let mut rows = Vec::new();
+                    for s in v {
+                        let i = match index.entry((s.metric_name, s.labels)) {
+                            Entry::Occupied(e) => *e.get(),
+                            // First step wins (the latch): later steps only
+                            // append points.
+                            Entry::Vacant(e) => {
+                                acc.push((s.drop_name, Vec::new()));
+                                *e.insert(acc.len() - 1)
+                            }
+                        };
+                        if fill.is_some() {
+                            rows.push((i, s.v, s.h.clone()));
+                        }
                         // M7-A5a: the histogram channel rides the range
                         // materialization step point (the second selection
                         // site) verbatim; float steps carry `h: None`.
-                        .push(Point {
+                        acc[i].1.push(Point {
                             t_ms: t,
-                            v: value,
-                            h,
+                            v: s.v,
+                            h: s.h,
                         });
+                    }
+                    if fill.is_some() {
+                        held = Some((tau, Held::Vector(rows)));
+                    }
                 }
-            }
-            StepValue::Scalar(v) => {
-                saw_scalar = true;
-                scalar_points.push(Point::float(t, v));
-            }
-            // Unreachable through `plan()`: string-typed range queries
-            // are rejected at plan time (defense in depth, the scalar-
-            // subquery precedent).
-            StepValue::String(_) => {
-                return Err(PromqlError::Unsupported {
-                    construct: "string literal in a range query".to_string(),
-                });
-            }
+                StepValue::Scalar(v) => {
+                    saw_scalar = true;
+                    scalar_points.push(Point::float(t, v));
+                    if fill.is_some() {
+                        held = Some((tau, Held::Scalar(v)));
+                    }
+                }
+                // Unreachable through `plan()`: string-typed range queries
+                // are rejected at plan time (defense in depth, the scalar-
+                // subquery precedent).
+                StepValue::String(_) => {
+                    return Err(PromqlError::Unsupported {
+                        construct: "string literal in a range query".to_string(),
+                    });
+                }
+            },
         }
         t += p.step_ms;
     }
@@ -543,13 +601,13 @@ fn evaluate_counted_with(
         ));
     }
 
-    let mut out: Vec<RangeSeries> = vector_points
+    let mut out: Vec<RangeSeries> = index
         .into_iter()
-        .map(|((metric_name, labels), (drop_name, points))| RangeSeries {
+        .map(|((metric_name, labels), i)| RangeSeries {
             labels,
             metric_name,
-            drop_name,
-            points,
+            drop_name: acc[i].0,
+            points: std::mem::take(&mut acc[i].1),
         })
         .collect();
     // `(labels, metric_name)` tie-break (plan v3 Δ5): the wire order is
@@ -2244,6 +2302,70 @@ fn window_end(sel: &SelectorSpec, t_ms: i64) -> (i64, Option<i64>, bool) {
         Some(f) if t_ms <= f.until_ms => (t_ms - sel.offset_ms, sel.range_ms, false),
         Some(f) => (t_ms - sel.offset_ms, f.tail_range_ms, true),
     }
+}
+
+/// Issue #795: a range query whose root is a plain selector. Each series'
+/// labels are cloned once and its identity hashed once; the step loop does
+/// both at every step. Same points, same order, same latch (`drop_name`
+/// false) as the step loop.
+fn selector_range(
+    sel: &SelectorSpec,
+    data: &EvalData<'_>,
+    p: &crate::plan::PlanParams,
+    cancel: &CancelToken,
+) -> Result<Vec<RangeSeries>, PromqlError> {
+    let mut index: HashMap<(Option<&str>, &Labels), usize> = HashMap::new();
+    let mut out: Vec<RangeSeries> = Vec::new();
+    // Per read (first, second): each fetched series' index into `out`.
+    let mut slots: [Vec<Option<usize>>; 2] = [Vec::new(), Vec::new()];
+    let fill = sel.fill;
+    let mut t = p.start_ms;
+    while t <= p.end_ms {
+        if cancel.is_cancelled() {
+            return Err(PromqlError::Cancelled);
+        }
+        let tau = match fill {
+            Some(f) if t <= f.until_ms => -(-t).div_euclid(f.width_ms) * f.width_ms,
+            _ => t,
+        };
+        let (eff_t, _, tail) = window_end(sel, tau);
+        let read = data.get_read(sel.id, tail);
+        let slot = &mut slots[usize::from(tail)];
+        if slot.len() != read.len() {
+            *slot = vec![None; read.len()];
+        }
+        for (k, series) in read.iter().enumerate() {
+            let Some(sample) = staleness::instant_value(&series.samples, eff_t, p.lookback_ms)
+            else {
+                continue;
+            };
+            let i = match slot[k] {
+                Some(i) => i,
+                None => {
+                    let name = series.metric_name.as_deref().or(sel.metric_name.as_deref());
+                    let i = *index.entry((name, &series.labels)).or_insert_with(|| {
+                        out.push(RangeSeries {
+                            labels: series.labels.clone(),
+                            metric_name: name.map(str::to_owned),
+                            drop_name: false,
+                            points: Vec::new(),
+                        });
+                        out.len() - 1
+                    });
+                    slot[k] = Some(i);
+                    i
+                }
+            };
+            out[i].points.push(Point {
+                t_ms: t,
+                v: sample.v,
+                h: sample.h,
+            });
+        }
+        t += p.step_ms;
+    }
+    out.sort_by(|a, b| (&a.labels, &a.metric_name).cmp(&(&b.labels, &b.metric_name)));
+    Ok(out)
 }
 
 /// Issue #18: `written / read` when a selector's range was read wider than
@@ -10032,7 +10154,7 @@ mod tests {
     /// The plan of `q` on the grid `(120 s, 2400 s, 120 s)`, every selector
     /// filled at 720 s until 2160 s, read at its bucket ends over `range`
     /// and after them over `tail_range`; `first` is every selector's first
-    /// read and `second` its second.
+    /// read and `second` its second. Evaluated.
     fn filled(
         q: &str,
         range: Option<i64>,
@@ -10040,6 +10162,18 @@ mod tests {
         first: &[Sample],
         second: &[Sample],
     ) -> QueryValue {
+        let (planned, data) = filled_input(q, range, tail_range, first, second);
+        evaluate(&planned, &data).expect("evaluate")
+    }
+
+    /// [`filled`]'s plan and data, before evaluation (issue #795).
+    fn filled_input(
+        q: &str,
+        range: Option<i64>,
+        tail_range: Option<i64>,
+        first: &[Sample],
+        second: &[Sample],
+    ) -> (QueryPlan, SeriesData) {
         let mut planned = plan(
             &crate::parser::parse(q).unwrap(),
             params(120_000, 2_400_000, 120_000),
@@ -10057,7 +10191,7 @@ mod tests {
             tail.insert(sel.id, vec![series(1, &[("job", "x")], second.to_vec())]);
         }
         data.take_as_tail(tail, 2_280_000);
-        evaluate(&planned, &data).expect("evaluate")
+        (planned, data)
     }
 
     /// The 20 times of [`filled`]'s grid.
@@ -10185,5 +10319,300 @@ mod tests {
             c12 * scale,
             s12 * scale
         );
+    }
+
+    // -- issue #795: a plain selector at the root of a range query is
+    //    answered series by series --
+
+    /// `single_histogram()` as a float histogram.
+    fn h1() -> pulsus_model::FloatHistogram {
+        single_histogram().to_float()
+    }
+
+    /// [`h1`] with `sum = 6.0`.
+    fn h2() -> pulsus_model::FloatHistogram {
+        let mut h = h1();
+        h.sum = 6.0;
+        h
+    }
+
+    /// The plan of `q` on `p` over one selector's series.
+    fn planned_over(q: &str, p: PlanParams, series: Vec<FetchedSeries>) -> (QueryPlan, SeriesData) {
+        let planned = plan(&crate::parser::parse(q).unwrap(), p).expect("plan");
+        let mut data = SeriesData::new();
+        data.insert(0, series);
+        (planned, data)
+    }
+
+    /// T3's input: two names sharing `{job=x}`, a histogram turning into a
+    /// float, a stale marker, and a series with no sample in range.
+    fn identities_input() -> (QueryPlan, SeriesData) {
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        planned_over(
+            r#"{__name__=~"a|b"}"#,
+            params(0, 300_000, 60_000),
+            vec![
+                named_series("a", 1, &[("job", "x")], vec![s(0, 1.0), s(120_000, 2.0)]),
+                named_series(
+                    "b",
+                    2,
+                    &[("job", "x")],
+                    vec![s(60_000, 5.0), s(180_000, stale)],
+                ),
+                named_series(
+                    "a",
+                    3,
+                    &[("job", "y")],
+                    vec![Sample::hist(0, h1()), s(240_000, 7.0)],
+                ),
+                named_series("a", 4, &[("job", "z")], vec![s(-400_000, 1.0)]),
+            ],
+        )
+    }
+
+    /// T4's input.
+    fn filled_float_input() -> (QueryPlan, SeriesData) {
+        filled_input(
+            "x",
+            None,
+            None,
+            &[s(600_000, 1.0), s(1_400_000, 2.0), s(2_100_000, 3.0)],
+            &[s(2_250_000, 9.0)],
+        )
+    }
+
+    /// T5's input.
+    fn filled_hist_input() -> (QueryPlan, SeriesData) {
+        filled_input(
+            "x",
+            None,
+            None,
+            &[
+                Sample::hist(600_000, h1()),
+                Sample::hist(1_400_000, h2()),
+                s(2_100_000, 3.0),
+            ],
+            &[Sample::hist(2_250_000, h1())],
+        )
+    }
+
+    /// T2's fourth input: `-0.0`, a NaN that is not a stale marker, `0.0`.
+    fn signed_zero_input() -> (QueryPlan, SeriesData) {
+        planned_over(
+            "x",
+            params(0, 120_000, 60_000),
+            vec![series(
+                1,
+                &[("job", "a")],
+                vec![s(0, -0.0), s(60_000, f64::NAN), s(120_000, 0.0)],
+            )],
+        )
+    }
+
+    /// A one-sample series at 0 s, the input of T1 (a), (c), (d), (e).
+    fn one_sample() -> Vec<FetchedSeries> {
+        vec![series(1, &[("job", "a")], vec![s(0, 1.0)])]
+    }
+
+    /// A matrix projected to bits: per series `(labels, metric_name,
+    /// drop_name)`, per point `(t_ms, v.to_bits(), h.is_some())`.
+    #[allow(clippy::type_complexity)]
+    fn bits(v: &QueryValue) -> Vec<(Labels, Option<String>, bool, Vec<(i64, u64, bool)>)> {
+        let QueryValue::Matrix(m) = v else {
+            panic!("a range query answers a matrix: {v:?}");
+        };
+        m.iter()
+            .map(|r| {
+                (
+                    r.labels.clone(),
+                    r.metric_name.clone(),
+                    r.drop_name,
+                    r.points
+                        .iter()
+                        .map(|p| (p.t_ms, p.v.to_bits(), p.h.is_some()))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// **T1 (issue #795): a plain selector range is answered series by
+    /// series**, and nothing else is.
+    #[test]
+    fn a_plain_selector_range_is_answered_series_by_series() {
+        let cases: Vec<(&str, (QueryPlan, SeriesData), u64)> = vec![
+            (
+                "(a) x over a range",
+                planned_over("x", params(0, 600_000, 60_000), one_sample()),
+                1,
+            ),
+            ("(b) T3's input", identities_input(), 1),
+            (
+                "(c) rate(x[5m])",
+                planned_over("rate(x[5m])", params(0, 600_000, 60_000), one_sample()),
+                0,
+            ),
+            (
+                "(d) x @ 300",
+                planned_over("x @ 300", params(0, 600_000, 60_000), one_sample()),
+                0,
+            ),
+            (
+                "(e) x at one instant",
+                planned_over("x", params(0, 0, 0), one_sample()),
+                0,
+            ),
+        ];
+        for (name, (planned, data), want) in cases {
+            let (_value, counts, _annotations) = evaluate_counted(&planned, &data).unwrap();
+            assert_eq!(
+                counts.direct_selector_ranges, want,
+                "{name}: direct_selector_ranges"
+            );
+        }
+    }
+
+    /// **T2 (issue #795): the direct route and the step loop agree**, bit
+    /// for bit, `-0.0` and NaN included.
+    #[test]
+    fn the_direct_route_and_the_step_loop_agree() {
+        let inputs = [
+            ("T3", identities_input()),
+            ("T4", filled_float_input()),
+            ("T5", filled_hist_input()),
+            ("signed zero and NaN", signed_zero_input()),
+        ];
+        for (name, (planned, data)) in inputs {
+            let direct = evaluate(&planned, &data).expect("evaluate");
+            let (stepped, _, _) = evaluate_step_loop(&planned, &data).expect("step loop");
+            assert_eq!(bits(&direct), bits(&stepped), "{name}: the two routes");
+            let (QueryValue::Matrix(a), QueryValue::Matrix(b)) = (&direct, &stepped) else {
+                panic!("{name}: both answer a matrix");
+            };
+            for (x, y) in a.iter().zip(b) {
+                for (p, q) in x.points.iter().zip(&y.points) {
+                    if let (Some(hp), Some(hq)) = (&p.h, &q.h) {
+                        assert!(hp.bits_eq(hq), "{name}: histogram at {}", p.t_ms);
+                    }
+                }
+            }
+        }
+    }
+
+    /// **T3 (issue #795): a plain selector range keeps each identity and
+    /// its points.** Lookback is `(t − 300 s, t]`; a stale marker ends
+    /// series `b`; series 4's one sample is out of range.
+    #[test]
+    fn a_plain_selector_range_keeps_each_identity_and_its_points() {
+        let (planned, data) = identities_input();
+        let value = evaluate(&planned, &data).expect("evaluate");
+        let QueryValue::Matrix(m) = value else {
+            panic!("a range query answers a matrix: {value:?}");
+        };
+        let labels = |job: &str| Labels::new([("job".to_string(), job.to_string())]);
+        let floats = |pts: &[(i64, f64)]| -> Vec<Point> {
+            pts.iter().map(|&(t, v)| Point::float(t, v)).collect()
+        };
+        let want = vec![
+            RangeSeries {
+                labels: labels("x"),
+                metric_name: Some("a".to_string()),
+                drop_name: false,
+                points: floats(&[
+                    (0, 1.0),
+                    (60_000, 1.0),
+                    (120_000, 2.0),
+                    (180_000, 2.0),
+                    (240_000, 2.0),
+                    (300_000, 2.0),
+                ]),
+            },
+            RangeSeries {
+                labels: labels("x"),
+                metric_name: Some("b".to_string()),
+                drop_name: false,
+                points: floats(&[(60_000, 5.0), (120_000, 5.0)]),
+            },
+            RangeSeries {
+                labels: labels("y"),
+                metric_name: Some("a".to_string()),
+                drop_name: false,
+                points: vec![
+                    Point::hist(0, h1()),
+                    Point::hist(60_000, h1()),
+                    Point::hist(120_000, h1()),
+                    Point::hist(180_000, h1()),
+                    Point::float(240_000, 7.0),
+                    Point::float(300_000, 7.0),
+                ],
+            },
+        ];
+        assert_eq!(m.len(), 3, "three identities: {m:?}");
+        assert_eq!(m, want);
+    }
+
+    /// The answer of `input` through `evaluate` and through the step loop.
+    fn both_routes(input: fn() -> (QueryPlan, SeriesData)) -> [(&'static str, QueryValue); 2] {
+        let (planned, data) = input();
+        let direct = evaluate(&planned, &data).expect("evaluate");
+        let (stepped, _, _) = evaluate_step_loop(&planned, &data).expect("step loop");
+        [("evaluate", direct), ("step loop", stepped)]
+    }
+
+    /// **T4 (issue #795): a filled plain selector reads its bucket and
+    /// merges both reads.** Each step takes the sample at or before its
+    /// bucket end `τ`; the last two take the second read's.
+    #[test]
+    fn a_filled_plain_selector_reads_its_bucket_and_merges_both_reads() {
+        let want: Vec<Point> = filled_times()
+            .into_iter()
+            .map(|t| {
+                let v = if t <= 720_000 {
+                    1.0
+                } else if t <= 1_440_000 {
+                    2.0
+                } else if t <= 2_160_000 {
+                    3.0
+                } else {
+                    9.0
+                };
+                Point::float(t, v)
+            })
+            .collect();
+        for (route, value) in both_routes(filled_float_input) {
+            let QueryValue::Matrix(m) = value else {
+                panic!("{route}: a range query answers a matrix: {value:?}");
+            };
+            assert_eq!(m.len(), 1, "{route}: one series: {m:?}");
+            assert_eq!(m[0].metric_name.as_deref(), Some("x"), "{route}: name");
+            assert_eq!(m[0].points, want, "{route}: points");
+        }
+    }
+
+    /// **T5 (issue #795): a held step carries its histogram on both
+    /// routes.**
+    #[test]
+    fn a_held_step_carries_its_histogram_on_both_routes() {
+        let want: Vec<Point> = filled_times()
+            .into_iter()
+            .map(|t| {
+                if t <= 720_000 {
+                    Point::hist(t, h1())
+                } else if t <= 1_440_000 {
+                    Point::hist(t, h2())
+                } else if t <= 2_160_000 {
+                    Point::float(t, 3.0)
+                } else {
+                    Point::hist(t, h1())
+                }
+            })
+            .collect();
+        for (route, value) in both_routes(filled_hist_input) {
+            let QueryValue::Matrix(m) = value else {
+                panic!("{route}: a range query answers a matrix: {value:?}");
+            };
+            assert_eq!(m.len(), 1, "{route}: one series: {m:?}");
+            assert_eq!(m[0].points, want, "{route}: points");
+        }
     }
 }
