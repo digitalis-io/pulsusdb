@@ -687,4 +687,53 @@ mod tests {
             assert_eq!(String::from_utf8_lossy(&body), want_body, "{path}");
         }
     }
+
+    /// **G1 (issue #795): responses are gzipped at level 2.** One fixed
+    /// 1 MiB body through the product layer, an explicit level-2 layer and
+    /// the default layer: the product bytes are the level-2 bytes, and not
+    /// the default's.
+    #[tokio::test]
+    async fn responses_are_gzipped_at_level_two() {
+        use axum::body::{Body, to_bytes};
+        use axum::routing::get;
+        use tower::ServiceExt;
+        use tower_http::CompressionLevel;
+
+        async fn gzipped(layer: CompressionLayer) -> Vec<u8> {
+            let body: String = (0..40_000)
+                .map(|i: u64| format!("{{\"t\":{i},\"v\":\"{}\"}}", i * 7919 % 100_000))
+                .collect::<Vec<_>>()
+                .join(",");
+            let router: axum::Router = axum::Router::new()
+                .route("/x", get(move || async move { body }))
+                .layer(layer);
+            let request = Request::builder()
+                .uri("/x")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap();
+            let res = router.oneshot(request).await.unwrap();
+            assert_eq!(
+                res.headers()
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok()),
+                Some("gzip"),
+                "the response is gzip-encoded"
+            );
+            to_bytes(res.into_body(), usize::MAX)
+                .await
+                .expect("body")
+                .to_vec()
+        }
+
+        let product = gzipped(compression_layer()).await;
+        let level_two =
+            gzipped(CompressionLayer::new().quality(CompressionLevel::Precise(2))).await;
+        let default = gzipped(CompressionLayer::new()).await;
+        assert!(product == level_two, "the product layer gzips at level 2");
+        assert!(
+            product != default,
+            "the product layer is not the default level"
+        );
+    }
 }

@@ -251,7 +251,7 @@ pub fn evaluate_cancellable(
     data: &SeriesData,
     cancel: CancelToken,
 ) -> Result<(QueryValue, Annotations), PromqlError> {
-    evaluate_counted_with(plan, data, cancel)
+    evaluate_counted_with(plan, data, cancel, true)
         .map(|(value, _counts, annotations)| (value, annotations))
 }
 
@@ -289,6 +289,8 @@ struct EvalCounts {
     /// (`tests::finalize_skips_the_matrix_merge_pass_when_no_series_is_drop_marked`),
     /// a `drop_name` case MUST count > 0.
     finalize_matrix_merge_passes: u64,
+    /// Range queries answered by `selector_range` (issue #795).
+    direct_selector_ranges: u64,
 }
 
 /// [`evaluate`] plus [`EvalCounts`] and the drained [`Annotations`] sink —
@@ -299,15 +301,30 @@ fn evaluate_counted(
     plan: &QueryPlan,
     data: &SeriesData,
 ) -> Result<(QueryValue, EvalCounts, Annotations), PromqlError> {
-    evaluate_counted_with(plan, data, CancelToken::never())
+    evaluate_counted_with(plan, data, CancelToken::never(), true)
+}
+
+/// [`evaluate_counted`] with the plain-selector route off (issue #795):
+/// every range query runs the step loop, so tests can compare the two
+/// routes on one input.
+#[cfg(test)]
+fn evaluate_step_loop(
+    plan: &QueryPlan,
+    data: &SeriesData,
+) -> Result<(QueryValue, EvalCounts, Annotations), PromqlError> {
+    evaluate_counted_with(plan, data, CancelToken::never(), false)
 }
 
 /// [`evaluate_counted`] with an explicit [`CancelToken`] (issue #93).
+/// `allow_direct` (issue #795) lets a range query whose root is a plain
+/// selector skip the step loop.
 fn evaluate_counted_with(
     plan: &QueryPlan,
     data: &SeriesData,
     cancel: CancelToken,
+    allow_direct: bool,
 ) -> Result<(QueryValue, EvalCounts, Annotations), PromqlError> {
+    let _ = allow_direct;
     let p = &plan.params;
 
     // Issue #125: build the per-flagged-selector stats-reduced view ONCE,
@@ -10032,7 +10049,7 @@ mod tests {
     /// The plan of `q` on the grid `(120 s, 2400 s, 120 s)`, every selector
     /// filled at 720 s until 2160 s, read at its bucket ends over `range`
     /// and after them over `tail_range`; `first` is every selector's first
-    /// read and `second` its second.
+    /// read and `second` its second. Evaluated.
     fn filled(
         q: &str,
         range: Option<i64>,
@@ -10040,6 +10057,18 @@ mod tests {
         first: &[Sample],
         second: &[Sample],
     ) -> QueryValue {
+        let (planned, data) = filled_input(q, range, tail_range, first, second);
+        evaluate(&planned, &data).expect("evaluate")
+    }
+
+    /// [`filled`]'s plan and data, before evaluation (issue #795).
+    fn filled_input(
+        q: &str,
+        range: Option<i64>,
+        tail_range: Option<i64>,
+        first: &[Sample],
+        second: &[Sample],
+    ) -> (QueryPlan, SeriesData) {
         let mut planned = plan(
             &crate::parser::parse(q).unwrap(),
             params(120_000, 2_400_000, 120_000),
@@ -10057,7 +10086,7 @@ mod tests {
             tail.insert(sel.id, vec![series(1, &[("job", "x")], second.to_vec())]);
         }
         data.take_as_tail(tail, 2_280_000);
-        evaluate(&planned, &data).expect("evaluate")
+        (planned, data)
     }
 
     /// The 20 times of [`filled`]'s grid.
@@ -10185,5 +10214,300 @@ mod tests {
             c12 * scale,
             s12 * scale
         );
+    }
+
+    // -- issue #795: a plain selector at the root of a range query is
+    //    answered series by series --
+
+    /// `single_histogram()` as a float histogram.
+    fn h1() -> pulsus_model::FloatHistogram {
+        single_histogram().to_float()
+    }
+
+    /// [`h1`] with `sum = 6.0`.
+    fn h2() -> pulsus_model::FloatHistogram {
+        let mut h = h1();
+        h.sum = 6.0;
+        h
+    }
+
+    /// The plan of `q` on `p` over one selector's series.
+    fn planned_over(q: &str, p: PlanParams, series: Vec<FetchedSeries>) -> (QueryPlan, SeriesData) {
+        let planned = plan(&crate::parser::parse(q).unwrap(), p).expect("plan");
+        let mut data = SeriesData::new();
+        data.insert(0, series);
+        (planned, data)
+    }
+
+    /// T3's input: two names sharing `{job=x}`, a histogram turning into a
+    /// float, a stale marker, and a series with no sample in range.
+    fn identities_input() -> (QueryPlan, SeriesData) {
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        planned_over(
+            r#"{__name__=~"a|b"}"#,
+            params(0, 300_000, 60_000),
+            vec![
+                named_series("a", 1, &[("job", "x")], vec![s(0, 1.0), s(120_000, 2.0)]),
+                named_series(
+                    "b",
+                    2,
+                    &[("job", "x")],
+                    vec![s(60_000, 5.0), s(180_000, stale)],
+                ),
+                named_series(
+                    "a",
+                    3,
+                    &[("job", "y")],
+                    vec![Sample::hist(0, h1()), s(240_000, 7.0)],
+                ),
+                named_series("a", 4, &[("job", "z")], vec![s(-400_000, 1.0)]),
+            ],
+        )
+    }
+
+    /// T4's input.
+    fn filled_float_input() -> (QueryPlan, SeriesData) {
+        filled_input(
+            "x",
+            None,
+            None,
+            &[s(600_000, 1.0), s(1_400_000, 2.0), s(2_100_000, 3.0)],
+            &[s(2_250_000, 9.0)],
+        )
+    }
+
+    /// T5's input.
+    fn filled_hist_input() -> (QueryPlan, SeriesData) {
+        filled_input(
+            "x",
+            None,
+            None,
+            &[
+                Sample::hist(600_000, h1()),
+                Sample::hist(1_400_000, h2()),
+                s(2_100_000, 3.0),
+            ],
+            &[Sample::hist(2_250_000, h1())],
+        )
+    }
+
+    /// T2's fourth input: `-0.0`, a NaN that is not a stale marker, `0.0`.
+    fn signed_zero_input() -> (QueryPlan, SeriesData) {
+        planned_over(
+            "x",
+            params(0, 120_000, 60_000),
+            vec![series(
+                1,
+                &[("job", "a")],
+                vec![s(0, -0.0), s(60_000, f64::NAN), s(120_000, 0.0)],
+            )],
+        )
+    }
+
+    /// A one-sample series at 0 s, the input of T1 (a), (c), (d), (e).
+    fn one_sample() -> Vec<FetchedSeries> {
+        vec![series(1, &[("job", "a")], vec![s(0, 1.0)])]
+    }
+
+    /// A matrix projected to bits: per series `(labels, metric_name,
+    /// drop_name)`, per point `(t_ms, v.to_bits(), h.is_some())`.
+    #[allow(clippy::type_complexity)]
+    fn bits(v: &QueryValue) -> Vec<(Labels, Option<String>, bool, Vec<(i64, u64, bool)>)> {
+        let QueryValue::Matrix(m) = v else {
+            panic!("a range query answers a matrix: {v:?}");
+        };
+        m.iter()
+            .map(|r| {
+                (
+                    r.labels.clone(),
+                    r.metric_name.clone(),
+                    r.drop_name,
+                    r.points
+                        .iter()
+                        .map(|p| (p.t_ms, p.v.to_bits(), p.h.is_some()))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// **T1 (issue #795): a plain selector range is answered series by
+    /// series**, and nothing else is.
+    #[test]
+    fn a_plain_selector_range_is_answered_series_by_series() {
+        let cases: Vec<(&str, (QueryPlan, SeriesData), u64)> = vec![
+            (
+                "(a) x over a range",
+                planned_over("x", params(0, 600_000, 60_000), one_sample()),
+                1,
+            ),
+            ("(b) T3's input", identities_input(), 1),
+            (
+                "(c) rate(x[5m])",
+                planned_over("rate(x[5m])", params(0, 600_000, 60_000), one_sample()),
+                0,
+            ),
+            (
+                "(d) x @ 300",
+                planned_over("x @ 300", params(0, 600_000, 60_000), one_sample()),
+                0,
+            ),
+            (
+                "(e) x at one instant",
+                planned_over("x", params(0, 0, 0), one_sample()),
+                0,
+            ),
+        ];
+        for (name, (planned, data), want) in cases {
+            let (_value, counts, _annotations) = evaluate_counted(&planned, &data).unwrap();
+            assert_eq!(
+                counts.direct_selector_ranges, want,
+                "{name}: direct_selector_ranges"
+            );
+        }
+    }
+
+    /// **T2 (issue #795): the direct route and the step loop agree**, bit
+    /// for bit, `-0.0` and NaN included.
+    #[test]
+    fn the_direct_route_and_the_step_loop_agree() {
+        let inputs = [
+            ("T3", identities_input()),
+            ("T4", filled_float_input()),
+            ("T5", filled_hist_input()),
+            ("signed zero and NaN", signed_zero_input()),
+        ];
+        for (name, (planned, data)) in inputs {
+            let direct = evaluate(&planned, &data).expect("evaluate");
+            let (stepped, _, _) = evaluate_step_loop(&planned, &data).expect("step loop");
+            assert_eq!(bits(&direct), bits(&stepped), "{name}: the two routes");
+            let (QueryValue::Matrix(a), QueryValue::Matrix(b)) = (&direct, &stepped) else {
+                panic!("{name}: both answer a matrix");
+            };
+            for (x, y) in a.iter().zip(b) {
+                for (p, q) in x.points.iter().zip(&y.points) {
+                    if let (Some(hp), Some(hq)) = (&p.h, &q.h) {
+                        assert!(hp.bits_eq(hq), "{name}: histogram at {}", p.t_ms);
+                    }
+                }
+            }
+        }
+    }
+
+    /// **T3 (issue #795): a plain selector range keeps each identity and
+    /// its points.** Lookback is `(t − 300 s, t]`; a stale marker ends
+    /// series `b`; series 4's one sample is out of range.
+    #[test]
+    fn a_plain_selector_range_keeps_each_identity_and_its_points() {
+        let (planned, data) = identities_input();
+        let value = evaluate(&planned, &data).expect("evaluate");
+        let QueryValue::Matrix(m) = value else {
+            panic!("a range query answers a matrix: {value:?}");
+        };
+        let labels = |job: &str| Labels::new([("job".to_string(), job.to_string())]);
+        let floats = |pts: &[(i64, f64)]| -> Vec<Point> {
+            pts.iter().map(|&(t, v)| Point::float(t, v)).collect()
+        };
+        let want = vec![
+            RangeSeries {
+                labels: labels("x"),
+                metric_name: Some("a".to_string()),
+                drop_name: false,
+                points: floats(&[
+                    (0, 1.0),
+                    (60_000, 1.0),
+                    (120_000, 2.0),
+                    (180_000, 2.0),
+                    (240_000, 2.0),
+                    (300_000, 2.0),
+                ]),
+            },
+            RangeSeries {
+                labels: labels("x"),
+                metric_name: Some("b".to_string()),
+                drop_name: false,
+                points: floats(&[(60_000, 5.0), (120_000, 5.0)]),
+            },
+            RangeSeries {
+                labels: labels("y"),
+                metric_name: Some("a".to_string()),
+                drop_name: false,
+                points: vec![
+                    Point::hist(0, h1()),
+                    Point::hist(60_000, h1()),
+                    Point::hist(120_000, h1()),
+                    Point::hist(180_000, h1()),
+                    Point::float(240_000, 7.0),
+                    Point::float(300_000, 7.0),
+                ],
+            },
+        ];
+        assert_eq!(m.len(), 3, "three identities: {m:?}");
+        assert_eq!(m, want);
+    }
+
+    /// The answer of `input` through `evaluate` and through the step loop.
+    fn both_routes(input: fn() -> (QueryPlan, SeriesData)) -> [(&'static str, QueryValue); 2] {
+        let (planned, data) = input();
+        let direct = evaluate(&planned, &data).expect("evaluate");
+        let (stepped, _, _) = evaluate_step_loop(&planned, &data).expect("step loop");
+        [("evaluate", direct), ("step loop", stepped)]
+    }
+
+    /// **T4 (issue #795): a filled plain selector reads its bucket and
+    /// merges both reads.** Each step takes the sample at or before its
+    /// bucket end `τ`; the last two take the second read's.
+    #[test]
+    fn a_filled_plain_selector_reads_its_bucket_and_merges_both_reads() {
+        let want: Vec<Point> = filled_times()
+            .into_iter()
+            .map(|t| {
+                let v = if t <= 720_000 {
+                    1.0
+                } else if t <= 1_440_000 {
+                    2.0
+                } else if t <= 2_160_000 {
+                    3.0
+                } else {
+                    9.0
+                };
+                Point::float(t, v)
+            })
+            .collect();
+        for (route, value) in both_routes(filled_float_input) {
+            let QueryValue::Matrix(m) = value else {
+                panic!("{route}: a range query answers a matrix: {value:?}");
+            };
+            assert_eq!(m.len(), 1, "{route}: one series: {m:?}");
+            assert_eq!(m[0].metric_name.as_deref(), Some("x"), "{route}: name");
+            assert_eq!(m[0].points, want, "{route}: points");
+        }
+    }
+
+    /// **T5 (issue #795): a held step carries its histogram on both
+    /// routes.**
+    #[test]
+    fn a_held_step_carries_its_histogram_on_both_routes() {
+        let want: Vec<Point> = filled_times()
+            .into_iter()
+            .map(|t| {
+                if t <= 720_000 {
+                    Point::hist(t, h1())
+                } else if t <= 1_440_000 {
+                    Point::hist(t, h2())
+                } else if t <= 2_160_000 {
+                    Point::float(t, 3.0)
+                } else {
+                    Point::hist(t, h1())
+                }
+            })
+            .collect();
+        for (route, value) in both_routes(filled_hist_input) {
+            let QueryValue::Matrix(m) = value else {
+                panic!("{route}: a range query answers a matrix: {value:?}");
+            };
+            assert_eq!(m.len(), 1, "{route}: one series: {m:?}");
+            assert_eq!(m[0].points, want, "{route}: points");
+        }
     }
 }
