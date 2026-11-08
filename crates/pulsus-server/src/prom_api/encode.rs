@@ -934,8 +934,8 @@ pub(crate) fn metadata_response(mut items: Vec<MetricMeta>) -> Response {
 /// query with no selector — is `{"status":"success"}` with no `data`, as
 /// the reference's envelope omits a nil result; otherwise one object per
 /// series, `seriesLabels` then `exemplars`, each exemplar `labels`,
-/// `value` (the samples' formatter, quoted) and `timestamp`
-/// (`web/api/v1/json_codec.go`, `marshalExemplarJSON`).
+/// `value` ([`quoted_value`]'s fixed notation, not the samples' writer)
+/// and `timestamp` (`web/api/v1/json_codec.go`, `marshalExemplarJSON`).
 pub(crate) fn query_exemplars_response(answer: Option<Vec<ExemplarSeries>>) -> Response {
     let Some(series) = answer else {
         return json_response(Body::from(r#"{"status":"success"}"#));
