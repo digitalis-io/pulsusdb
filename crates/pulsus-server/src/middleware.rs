@@ -26,8 +26,8 @@ pub(crate) fn trace_layer() -> TraceLayer<SharedClassifier<ServerErrorsAsFailure
     TraceLayer::new_for_http()
 }
 
-/// Gzip response level (issue #795): level 2 of 9.
-pub(crate) const RESPONSE_GZIP_LEVEL: i32 = 2;
+/// Gzip response level (issue #795): level 7 of 9, on the `zlib-rs` backend.
+pub(crate) const RESPONSE_GZIP_LEVEL: i32 = 7;
 
 /// Gzip response compression (applied globally), at [`RESPONSE_GZIP_LEVEL`].
 pub(crate) fn compression_layer() -> CompressionLayer {
