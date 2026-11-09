@@ -25,6 +25,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -119,12 +120,16 @@ impl CacheKey {
 pub enum Points {
     Float(Vec<(i64, f64)>),
     Mixed(Vec<(i64, HistOrFloat)>),
+    /// A float series' points: its range of the one allocation every
+    /// series of the entry shares.
+    Flat(Arc<[(i64, f64)]>, Range<usize>),
 }
 
 impl Points {
     fn shrink(&mut self) {
         match self {
             Points::Float(v) => v.shrink_to_fit(),
+            Points::Flat(..) => {}
             Points::Mixed(v) => {
                 v.shrink_to_fit();
                 for (_, p) in v.iter_mut() {
@@ -161,6 +166,18 @@ pub struct Entry {
     pub charge_bound: u64,
     /// What [`charge`] counted when the entry was stored.
     pub bytes: u64,
+}
+
+/// What [`ReadCache::store`] did, decided in one hold of the store's lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOutcome {
+    /// The entry is stored; `through` is its `c1`.
+    Published { through: Option<i64> },
+    /// Nothing was stored; `through` is the `c1` of what is stored under
+    /// the key, if anything.
+    NotPublished { through: Option<i64> },
+    /// A clear moved the generation: nothing was stored.
+    Stale,
 }
 
 /// What the cache decided for one request.
@@ -311,6 +328,10 @@ pub struct ReadCache {
     metrics: ReadCacheMetrics,
     poll: RwLock<PollState>,
     clock: Clock,
+    /// TEST SEAM: run between a hit's merge and its store or final
+    /// generation read.
+    #[cfg(test)]
+    after_merge: Option<Box<dyn Fn(&ReadCache) + Send + Sync>>,
 }
 
 fn wall_clock_ms() -> i64 {
@@ -336,7 +357,15 @@ impl ReadCache {
             metrics: ReadCacheMetrics::default(),
             poll: RwLock::new(PollState::default()),
             clock: Box::new(wall_clock_ms),
+            #[cfg(test)]
+            after_merge: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_after_merge(mut self, hook: impl Fn(&ReadCache) + Send + Sync + 'static) -> Self {
+        self.after_merge = Some(Box::new(hook));
+        self
     }
 
     /// TEST SEAM: a clock other than the wall clock.
@@ -384,7 +413,15 @@ impl ReadCache {
 
     /// Stores `entry` under `key` unless a clear moved the generation past
     /// `generation`. `false` when nothing was stored.
-    pub fn store(&self, key: CacheKey, mut entry: Entry, generation: u64) -> bool {
+    pub fn store(&self, key: CacheKey, entry: Entry, generation: u64) -> StoreOutcome {
+        if self.store_bool(key, entry, generation) {
+            StoreOutcome::Published { through: None }
+        } else {
+            StoreOutcome::NotPublished { through: None }
+        }
+    }
+
+    fn store_bool(&self, key: CacheKey, mut entry: Entry, generation: u64) -> bool {
         let mut store = lock(&self.store);
         if self.generation() != generation {
             return false;
@@ -670,6 +707,7 @@ fn keep(
             .filter(|(_, p)| match p {
                 Points::Float(v) => !v.is_empty(),
                 Points::Mixed(v) => !v.is_empty(),
+                Points::Flat(_, r) => !r.is_empty(),
             })
             .collect(),
         c0_ms: start_ms,
@@ -719,6 +757,7 @@ pub fn charge(key: &CacheKey, entry: &Entry) -> u64 {
             .sum::<usize>();
         bytes += match points {
             Points::Float(v) => v.capacity() * size_of::<(i64, f64)>(),
+            Points::Flat(..) => 0,
             Points::Mixed(v) => {
                 v.capacity() * size_of::<(i64, HistOrFloat)>()
                     + v.iter()
@@ -767,6 +806,11 @@ pub fn merge(entry: &Entry, tail: QueryResult, start_ms: i64, end_ms: i64) -> Op
         match kept {
             Points::Float(v) => {
                 for (t, x) in v.iter().filter(|(t, _)| *t <= entry.c1_ms) {
+                    push(labels, *t, HistOrFloat::Float(*x));
+                }
+            }
+            Points::Flat(all, r) => {
+                for (t, x) in all[r.clone()].iter().filter(|(t, _)| *t <= entry.c1_ms) {
                     push(labels, *t, HistOrFloat::Float(*x));
                 }
             }
@@ -994,6 +1038,10 @@ where
             && cache.generation() == g0
             && let Some(answer) = merge(&e, tail_result, p.start_ms, p.end_ms)
         {
+            #[cfg(test)]
+            if let Some(hook) = &cache.after_merge {
+                hook(cache);
+            }
             let mut kept_through = Some(e.c1_ms);
             if cache.fills_allowed(v)
                 && cache.identity_fresh()
@@ -1007,7 +1055,10 @@ where
                     e.first_fill_ms,
                     bound,
                 )
-                && cache.store(req.key.clone(), entry, g0)
+                && matches!(
+                    cache.store(req.key.clone(), entry, g0),
+                    StoreOutcome::Published { .. }
+                )
             {
                 kept_through = Some(c1);
             }
@@ -1037,7 +1088,10 @@ where
             now,
             charged,
         )
-        && cache.store(req.key.clone(), entry, g0)
+        && matches!(
+            cache.store(req.key.clone(), entry, g0),
+            StoreOutcome::Published { .. }
+        )
     {
         stored_through = Some(c1);
     }
@@ -1403,6 +1457,10 @@ mod tests {
         params(p.start_ms + by, p.end_ms + by, p.step_ms)
     }
 
+    fn published(o: StoreOutcome) -> bool {
+        matches!(o, StoreOutcome::Published { .. })
+    }
+
     // --- §5.4: what is kept --------------------------------------------------
 
     #[test]
@@ -1590,11 +1648,11 @@ mod tests {
         // Budget 1,000 for entries of 300, share 50 %, in the same ratio.
         let r = rig_with(unit * 10 / 3, 50, false);
         let g = r.cache.generation();
-        assert!(r.cache.store(k("b", "q1"), e.clone(), g));
-        assert!(r.cache.store(k("a", "q1"), e.clone(), g));
-        assert!(r.cache.store(k("a", "q2"), e.clone(), g));
+        assert!(published(r.cache.store(k("b", "q1"), e.clone(), g)));
+        assert!(published(r.cache.store(k("a", "q1"), e.clone(), g)));
+        assert!(published(r.cache.store(k("a", "q2"), e.clone(), g)));
         assert_eq!(r.cache.snapshot().evictions_total, 0);
-        assert!(r.cache.store(k("a", "q3"), e.clone(), g));
+        assert!(published(r.cache.store(k("a", "q3"), e.clone(), g)));
         assert!(
             r.cache.lookup(&k("a", "q1")).is_none(),
             "a's oldest evicted"
@@ -1731,54 +1789,120 @@ mod tests {
         assert_eq!(r.cache.usage().1, 0);
     }
 
-    #[test]
-    fn u13_every_vector_is_charged_by_capacity() {
-        let p = params(0, 0, 15_000);
-        let key = CacheKey::new(tenant(""), "h", &p, 300_000, None);
-        let build = |cap_factor: usize| {
-            let points: Vec<(i64, HistOrFloat)> = (0..100)
-                .map(|i| {
-                    let mut h = *hist();
-                    let mut b = Vec::with_capacity(50 * cap_factor);
-                    b.extend(std::iter::repeat_n(1.0, 50));
-                    h.positive_buckets = b;
-                    (i, HistOrFloat::Hist(Box::new(h)))
-                })
-                .collect();
-            let mut pts = Vec::with_capacity(points.len() * cap_factor);
-            pts.extend(points);
-            Entry {
-                annotations: Vec::new(),
-                series: vec![(labels("a"), Points::Mixed(pts))],
-                c0_ms: 0,
-                c1_ms: 0,
-                first_fill_ms: 0,
-                charge_bound: 0,
-                bytes: 0,
-            }
-        };
-        let mut shrunk = build(4);
-        shrink_entry(&mut shrunk);
-        let charged = charge(&key, &shrunk);
-        let Points::Mixed(points) = &shrunk.series[0].1 else {
-            unreachable!()
-        };
-        let mut independent = points.capacity() * std::mem::size_of::<(i64, HistOrFloat)>();
-        for (_, p) in points {
-            if let HistOrFloat::Hist(h) = p {
-                independent += h.positive_buckets.capacity() * 8
-                    + h.negative_buckets.capacity() * 8
-                    + h.custom_values.capacity() * 8
-                    + h.positive_spans.capacity() * std::mem::size_of::<pulsus_model::Span>()
-                    + h.negative_spans.capacity() * std::mem::size_of::<pulsus_model::Span>();
+    /// The charge of an entry, summed here from the key, the entry and
+    /// every allocation it keeps (§5.6, addendum 5 §2.2).
+    fn independent_charge(key: &CacheKey, e: &Entry) -> usize {
+        use std::mem::size_of;
+        let mut n = size_of::<CacheKey>() + key.query.len() + key.tenant.as_str().len();
+        n += size_of::<Entry>() + ENTRY_OVERHEAD_BYTES as usize;
+        n += e.annotations.capacity() * size_of::<String>();
+        n += e.annotations.iter().map(|a| a.capacity()).sum::<usize>();
+        n += e.series.capacity() * size_of::<(Vec<(String, String)>, Points)>();
+        let mut flat_counted = 0;
+        for (labels, points) in &e.series {
+            n += labels.capacity() * size_of::<(String, String)>();
+            n += labels
+                .iter()
+                .map(|(k, v)| k.capacity() + v.capacity())
+                .sum::<usize>();
+            match points {
+                Points::Flat(all, r) => {
+                    if r.start == 0 {
+                        flat_counted += 1;
+                        n += all.len() * size_of::<(i64, f64)>() + 16;
+                    }
+                }
+                Points::Float(v) => n += v.capacity() * size_of::<(i64, f64)>(),
+                Points::Mixed(v) => {
+                    n += v.capacity() * size_of::<(i64, HistOrFloat)>();
+                    for (_, x) in v {
+                        if let HistOrFloat::Hist(h) = x {
+                            n += size_of::<FloatHistogram>()
+                                + h.positive_buckets.capacity() * 8
+                                + h.negative_buckets.capacity() * 8
+                                + h.custom_values.capacity() * 8
+                                + h.positive_spans.capacity() * size_of::<pulsus_model::Span>()
+                                + h.negative_spans.capacity() * size_of::<pulsus_model::Span>();
+                        }
+                    }
+                }
             }
         }
-        assert!(
-            charged as usize >= independent,
-            "charged {charged} against {independent}"
+        assert!(flat_counted <= 1, "one flat term per entry");
+        n
+    }
+
+    #[test]
+    fn u13_keep_makes_one_float_allocation_and_charges_it_once() {
+        let p = params(0, 1_440 * 15_000, 15_000);
+        let key = CacheKey::new(tenant(""), "f", &p, 300_000, None);
+        // Float: three series of 1,441 points.
+        let floats = QueryResult::Matrix(
+            ["a", "b", "c"]
+                .iter()
+                .map(|n| MatrixSeries {
+                    labels: labels(n),
+                    points: (0..1_441).map(|i| (i * 15_000, i as f64)).collect(),
+                })
+                .collect(),
         );
-        let unshrunk = build(4);
-        assert!(charge(&key, &unshrunk) > charged, "capacity, not length");
+        let e = keep(&floats, p.start_ms, p.end_ms, Vec::new(), 0, 0).expect("a matrix");
+        assert_eq!(e.series.len(), 3);
+        let flats: Vec<&Arc<[(i64, f64)]>> = e
+            .series
+            .iter()
+            .filter_map(|(_, pts)| match pts {
+                Points::Flat(all, r) => {
+                    assert_eq!(r.len(), 1_441);
+                    Some(all)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            flats.len(),
+            3,
+            "every float series is Flat: {:?}",
+            e.series[0].1
+        );
+        assert!(
+            flats.iter().all(|a| Arc::ptr_eq(a, flats[0])),
+            "one allocation"
+        );
+        assert_eq!(flats[0].len(), 3 * 1_441);
+        assert_eq!(charge(&key, &e) as usize, independent_charge(&key, &e));
+        // Histogram: 100 points with 50-element bucket vectors, built with
+        // spare capacity.
+        let hist_points: Vec<(i64, HistOrFloat)> = (0..100)
+            .map(|i| {
+                let mut h = *hist();
+                let mut b = Vec::with_capacity(200);
+                b.extend(std::iter::repeat_n(1.0, 50));
+                h.positive_buckets = b;
+                (i * 15_000, HistOrFloat::Hist(Box::new(h)))
+            })
+            .collect();
+        let mut spare = Vec::with_capacity(400);
+        spare.extend(hist_points);
+        let hists = QueryResult::MatrixHist(vec![HistMatrixSeries {
+            labels: labels("h"),
+            points: spare,
+        }]);
+        let e = keep(&hists, p.start_ms, p.end_ms, Vec::new(), 0, 0).expect("a matrix");
+        let Points::Mixed(v) = &e.series[0].1 else {
+            panic!("a histogram series stays Mixed: {:?}", e.series[0].1)
+        };
+        assert_eq!(v.len(), 100);
+        assert_eq!(v.capacity(), v.len());
+        for (_, x) in v {
+            let HistOrFloat::Hist(h) = x else {
+                unreachable!()
+            };
+            assert_eq!(h.positive_buckets.len(), 50);
+            assert_eq!(h.positive_buckets.capacity(), h.positive_buckets.len());
+            assert_eq!(h.positive_spans.capacity(), h.positive_spans.len());
+        }
+        assert_eq!(charge(&key, &e) as usize, independent_charge(&key, &e));
     }
 
     #[tokio::test]
@@ -1832,7 +1956,11 @@ mod tests {
         let r = rig();
         let p = params(0, 0, 15_000);
         let g = r.cache.generation();
-        assert!(r.cache.store(key_for("up", &p), small_entry(), g));
+        assert!(published(r.cache.store(
+            key_for("up", &p),
+            small_entry(),
+            g
+        )));
         r.cache.record_identity(r.now(), vec!["other".to_string()]);
         assert_eq!(r.cache.generation(), g + 1);
         assert_eq!(r.cache.usage().1, 0);
@@ -2064,7 +2192,11 @@ mod tests {
         let key = key_for(q, &p);
         let mut e = (*r.cache.lookup(&key).expect("kept")).clone();
         e.annotations = entry_text;
-        assert!(r.cache.store(key.clone(), e, r.cache.generation()));
+        assert!(published(r.cache.store(
+            key.clone(),
+            e,
+            r.cache.generation()
+        )));
         let before = r.cache.lookup(&key).expect("kept");
         let c = Calls::default();
         let a = run_with(
@@ -2115,5 +2247,212 @@ mod tests {
         .await;
         assert_eq!(c.tail.load(Ordering::SeqCst), 0, "(c) no tail");
         assert_eq!(c.full.load(Ordering::SeqCst), 1, "(c) full");
+    }
+
+    // --- addendum 5 §4 ---------------------------------------------------------
+
+    #[test]
+    fn u23_keep_then_merge_returns_every_kept_float_bit_for_bit() {
+        let specials = [f64::NAN, f64::INFINITY, -0.0, f64::NEG_INFINITY, 0.0, 1.5];
+        let series: Vec<MatrixSeries> = ["a", "b"]
+            .iter()
+            .enumerate()
+            .map(|(j, n)| MatrixSeries {
+                labels: labels(n),
+                points: (0..40)
+                    .map(|i| (i * 10, specials[(i as usize + j) % specials.len()]))
+                    .collect(),
+            })
+            .collect();
+        let (start, c1) = (50, 300);
+        let e = keep(
+            &QueryResult::Matrix(series.clone()),
+            start,
+            c1,
+            Vec::new(),
+            0,
+            0,
+        )
+        .expect("a matrix");
+        assert!(
+            e.series.iter().all(|(_, p)| matches!(p, Points::Flat(..))),
+            "keep made the float series Flat: {:?}",
+            e.series[0].1
+        );
+        let merged = merge(&e, QueryResult::Matrix(Vec::new()), start, 390);
+        let Some(QueryResult::Matrix(m)) = merged else {
+            panic!("a float matrix: {merged:?}")
+        };
+        assert_eq!(m.len(), 2);
+        for (got, want) in m.iter().zip(&series) {
+            assert_eq!(got.labels, want.labels);
+            let want: Vec<(i64, u64)> = want
+                .points
+                .iter()
+                .filter(|(t, _)| *t >= start && *t <= c1)
+                .map(|(t, x)| (*t, x.to_bits()))
+                .collect();
+            let got: Vec<(i64, u64)> = got.points.iter().map(|(t, x)| (*t, x.to_bits())).collect();
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn u25_merge_builds_each_series_once_at_its_exact_length() {
+        let step = 15_000;
+        let c1 = 1_440 * step;
+        let entry_series: Vec<MatrixSeries> = (0..10)
+            .map(|j| MatrixSeries {
+                labels: labels(&format!("s{j}")),
+                points: (0..1_441).map(|i| (i * step, (i + j) as f64)).collect(),
+            })
+            .collect();
+        let e = keep(
+            &QueryResult::Matrix(entry_series.clone()),
+            0,
+            c1,
+            Vec::new(),
+            0,
+            0,
+        )
+        .expect("a matrix");
+        let tail: Vec<MatrixSeries> = (0..10)
+            .map(|j| MatrixSeries {
+                labels: labels(&format!("s{j}")),
+                points: (1_441..1_461).map(|i| (i * step, (i * j) as f64)).collect(),
+            })
+            .collect();
+        let end = 1_460 * step;
+        let merged = merge(&e, QueryResult::Matrix(tail.clone()), 0, end);
+        let Some(QueryResult::Matrix(m)) = merged else {
+            panic!("a float matrix: {merged:?}")
+        };
+        assert_eq!(m.len(), 10);
+        for (j, s) in m.iter().enumerate() {
+            assert_eq!(s.points.len(), 1_461);
+            assert_eq!(s.points.capacity(), s.points.len(), "series {j}");
+            let mut want = entry_series[j].points.clone();
+            want.extend(tail[j].points.iter().copied());
+            assert_eq!(s.labels, entry_series[j].labels);
+            assert_eq!(s.points, want, "series {j}");
+        }
+    }
+
+    /// An entry of one series whose last kept point is `c1`.
+    fn entry_through(c1: i64, n: usize) -> Entry {
+        Entry {
+            series: vec![(
+                labels("a"),
+                Points::Float((0..n as i64).map(|i| (i, 1.0)).collect()),
+            )],
+            c1_ms: c1,
+            ..small_entry()
+        }
+    }
+
+    #[test]
+    fn u34_store_decides_publication_and_through_in_one_step() {
+        let r = rig_with(200_000, 50, false);
+        let p = params(0, 0, 15_000);
+        let k = key_for("up", &p);
+        let g = r.cache.generation();
+        // Control.
+        assert_eq!(
+            r.cache.store(k.clone(), entry_through(100, 1), g),
+            StoreOutcome::Published { through: Some(100) },
+            "control"
+        );
+        assert_eq!(
+            r.cache.store(k.clone(), entry_through(200, 1), g),
+            StoreOutcome::Published { through: Some(200) }
+        );
+        assert_eq!(r.cache.lookup(&k).expect("stored").c1_ms, 200);
+        r.cache.clear();
+        assert_eq!(
+            r.cache.store(k.clone(), entry_through(250, 1), g),
+            StoreOutcome::Stale
+        );
+        assert!(r.cache.lookup(&k).is_none(), "nothing stored");
+        let g = r.cache.generation();
+        assert_eq!(
+            r.cache.store(k.clone(), entry_through(300, 1), g),
+            StoreOutcome::Published { through: Some(300) }
+        );
+        // 10,000 points: 160,000 bytes, above the 100,000-byte share.
+        let before = r.cache.snapshot().evictions_total;
+        assert_eq!(
+            r.cache.store(k.clone(), entry_through(400, 10_000), g),
+            StoreOutcome::NotPublished { through: Some(300) }
+        );
+        assert_eq!(r.cache.snapshot().evictions_total, before + 1);
+        assert_eq!(r.cache.lookup(&k).expect("the 300 entry stays").c1_ms, 300);
+    }
+
+    /// U37: a fill made, then a request whose hook runs after the merge.
+    async fn u37_case(
+        clustered: bool,
+        fills: bool,
+        clear: bool,
+    ) -> (Answer, MetricQueryParams, usize) {
+        let r = rig_with(64 * 1024 * 1024, 50, clustered);
+        r.refresh_identity();
+        let lag = |r: &Rig, v: u64| {
+            for t in [20_000, 15_000, 10_000, 5_000, 0] {
+                r.cache.record_lag(r.now() - t, v);
+            }
+        };
+        if clustered {
+            lag(&r, 0);
+        }
+        let q = "rate(x[5m])";
+        let p = window(&r, 0);
+        let c = Calls::default();
+        assert_eq!(
+            run(&r, &c, request(q, p, u64::MAX)).await.header,
+            Header::Miss
+        );
+        let Rig { cache, clock } = r;
+        let cache = if clear {
+            cache.with_after_merge(|c| c.clear())
+        } else {
+            cache.with_after_merge(|_| {})
+        };
+        let r = Rig { cache, clock };
+        if clustered && !fills {
+            lag(&r, 9);
+        }
+        let full_calls = AtomicUsize::new(0);
+        let full = |q: MetricQueryParams| {
+            full_calls.fetch_add(1, Ordering::SeqCst);
+            async move { R::Ok((grid_matrix(&q, 1_000.0), Annotations::new(), 10)) }
+        };
+        let tail = |q: MetricQueryParams| async move {
+            R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10))
+        };
+        let a = answer_range(&r.cache, request(q, p, u64::MAX), full, tail)
+            .await
+            .expect("answered");
+        (a, p, full_calls.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn u37_a_clear_after_the_merge_means_a_full_evaluation() {
+        // Control: no clear, a hit, the full closure not called.
+        let (a, _, full) = u37_case(false, true, false).await;
+        assert_eq!(a.header, Header::Hit, "control");
+        assert_eq!(full, 0, "control");
+        let (a, _, full) = u37_case(true, false, false).await;
+        assert_eq!(a.header, Header::Hit, "control, no fill");
+        assert_eq!(full, 0, "control, no fill");
+        // (a) fills allowed: the store finds the generation moved.
+        let (a, p, full) = u37_case(false, true, true).await;
+        assert_eq!(full, 1, "(a) full");
+        assert_eq!(a.result, grid_matrix(&p, 1_000.0), "(a) the full answer");
+        assert_ne!(a.header, Header::Hit, "(a)");
+        // (b) fills not allowed: the final generation read finds it moved.
+        let (a, p, full) = u37_case(true, false, true).await;
+        assert_eq!(full, 1, "(b) full");
+        assert_eq!(a.result, grid_matrix(&p, 1_000.0), "(b) the full answer");
+        assert_ne!(a.header, Header::Hit, "(b)");
     }
 }

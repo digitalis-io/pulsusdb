@@ -5324,6 +5324,15 @@ mod tests {
         }
     }
 
+    /// Issue #778: a plan with `uses_duration_expr` cleared, so a duration
+    /// expression's plan compares with its literal's on everything else.
+    fn literal_view(p: QueryPlan) -> QueryPlan {
+        QueryPlan {
+            uses_duration_expr: false,
+            ..p
+        }
+    }
+
     /// AC7, the Tier-1 plan-equality perf gate: duration resolution is
     /// plan-time constant folding — the resulting `QueryPlan` is
     /// byte-identical to the one the equivalent literal produces, so the
@@ -5332,17 +5341,19 @@ mod tests {
     fn duration_expressions_fold_to_the_identical_literal_plan() {
         let expr_a = parse("changes(http_requests[26m+4m])").unwrap();
         let expr_b = parse("changes(http_requests[30m])").unwrap();
-        assert_eq!(
-            plan(&expr_a, params_experimental()).unwrap(),
-            plan(&expr_b, params_experimental()).unwrap(),
-        );
+        let pa = plan(&expr_a, params_experimental()).unwrap();
+        let pb = plan(&expr_b, params_experimental()).unwrap();
+        assert!(pa.uses_duration_expr);
+        assert!(!pb.uses_duration_expr);
+        assert_eq!(literal_view(pa), pb);
 
         let expr_a = parse("count_over_time(m[step()])").unwrap();
         let expr_b = parse("count_over_time(m[10s])").unwrap();
-        assert_eq!(
-            plan(&expr_a, range_params()).unwrap(),
-            plan(&expr_b, range_params()).unwrap(),
-        );
+        let pa = plan(&expr_a, range_params()).unwrap();
+        let pb = plan(&expr_b, range_params()).unwrap();
+        assert!(pa.uses_duration_expr);
+        assert!(!pb.uses_duration_expr);
+        assert_eq!(literal_view(pa), pb);
     }
 
     /// Resolution semantics against upstream durations.go: offsets may be
@@ -5471,7 +5482,10 @@ mod tests {
         let wrapped = parse("rate(m[(0.0009999996)])").unwrap();
         let plain = parse("rate(m[0.0009999996])").unwrap();
         let wrapped_plan = plan(&wrapped, params_experimental()).unwrap();
-        assert_eq!(wrapped_plan, plan(&plain, params_experimental()).unwrap());
+        let plain_plan = plan(&plain, params_experimental()).unwrap();
+        assert!(wrapped_plan.uses_duration_expr);
+        assert!(!plain_plan.uses_duration_expr);
+        assert_eq!(literal_view(wrapped_plan.clone()), plain_plan);
         assert_eq!(wrapped_plan.selectors[0].range_ms, Some(1));
         // ... and at a large in-range magnitude (~285 years): the
         // resolver's conversion must be integer-ns then integer-ms,
@@ -5480,25 +5494,28 @@ mod tests {
         // here (#84 review round 2).
         let wrapped = parse("rate(m[(9000000000.008)])").unwrap();
         let plain = parse("rate(m[9000000000.008])").unwrap();
-        assert_eq!(
-            plan(&wrapped, params_experimental()).unwrap(),
-            plan(&plain, params_experimental()).unwrap(),
-        );
+        let pa = plan(&wrapped, params_experimental()).unwrap();
+        let pb = plan(&plain, params_experimental()).unwrap();
+        assert!(pa.uses_duration_expr);
+        assert!(!pb.uses_duration_expr);
+        assert_eq!(literal_view(pa), pb);
         // The plain-literal equivalents of the (a) whole-expression
         // guards, for symmetry: parenthesised 30m folds to the same plan
         // as the bare literal.
         let expr_a = parse("rate(m[(30m)])").unwrap();
         let expr_b = parse("rate(m[30m])").unwrap();
-        assert_eq!(
-            plan(&expr_a, params_experimental()).unwrap(),
-            plan(&expr_b, params_experimental()).unwrap(),
-        );
+        let pa = plan(&expr_a, params_experimental()).unwrap();
+        let pb = plan(&expr_b, params_experimental()).unwrap();
+        assert!(pa.uses_duration_expr);
+        assert!(!pb.uses_duration_expr);
+        assert_eq!(literal_view(pa), pb);
         let expr_a = parse("m offset (5)").unwrap();
         let expr_b = parse("m offset 5").unwrap();
-        assert_eq!(
-            plan(&expr_a, params_experimental()).unwrap(),
-            plan(&expr_b, params_experimental()).unwrap(),
-        );
+        let pa = plan(&expr_a, params_experimental()).unwrap();
+        let pb = plan(&expr_b, params_experimental()).unwrap();
+        assert!(pa.uses_duration_expr);
+        assert!(!pb.uses_duration_expr);
+        assert_eq!(literal_view(pa), pb);
 
         // (c) the parenthesised literal is still gated when the flag is
         // off — upstream parity (`foo[(5m)]` flag-off is the gate error
