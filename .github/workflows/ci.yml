@@ -1563,7 +1563,7 @@ jobs:
         run: cargo test -p pulsus-read --test live_metrics_rollup
 
       # Issue #18 part A: each rollup level's rows equal their aggregates
-      # from raw or the level below; run rows, holes, the projection read
+      # from raw or the level below; run rows, holes, the stage read and its fallback,
       # and expiry. Reuses this job's container.
       - name: Live rollup level tests
         env:

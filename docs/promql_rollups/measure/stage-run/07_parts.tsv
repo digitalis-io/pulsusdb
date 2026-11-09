@@ -1,280 +1,273 @@
 phase	kind	database	table	part	partition_or_projection	rows	bytes_on_disk	compressed_bytes	serialization
-unmerged	part	m800_a	metric_samples_60s	20261108_2_2_0	2026-11-08	1200001	48950462	21664641	
-unmerged	part	m800_a	metric_samples_60s	20261108_3_3_0	2026-11-08	1200001	48955768	21675850	
-unmerged	part	m800_a	metric_samples_60s	20261108_4_4_0	2026-11-08	1200001	48955177	21671976	
-unmerged	part	m800_a	metric_samples_60s	20261108_5_5_0	2026-11-08	1200001	48946779	21664678	
-unmerged	part	m800_a	metric_samples_60s	20261108_6_6_0	2026-11-08	1200001	48957013	21674285	
-unmerged	part	m800_a	metric_samples_60s	20261109_13_18_1	2026-11-09	7200006	284860006	121301490	
-unmerged	part	m800_a	metric_samples_60s	20261109_19_24_1	2026-11-09	7200006	284877074	121322522	
-unmerged	part	m800_a	metric_samples_60s	20261109_25_25_0	2026-11-09	1200001	48949316	21670541	
-unmerged	part	m800_a	metric_samples_60s	20261109_26_72_3	2026-11-09	940047	38732836	17317201	
-unmerged	part	m800_a	metric_samples_60s	20261109_73_78_1	2026-11-09	120006	6907762	3141753	
-unmerged	part	m800_a	metric_samples_60s	20261109_79_84_1	2026-11-09	120006	6446192	3137756	
-unmerged	part	m800_a	metric_samples_60s	20261109_7_12_1	2026-11-09	7200006	284898551	121348468	
-unmerged	part	m800_a	metric_samples_60s	20261109_85_85_0	2026-11-09	20001	1927088	997423	
-unmerged	projection_part	m800_a	metric_samples_60s	20261108_2_2_0	by_parent	1200001	27225365	27185830	
-unmerged	projection_part	m800_a	metric_samples_60s	20261108_3_3_0	by_parent	1200001	27219342	27179778	
-unmerged	projection_part	m800_a	metric_samples_60s	20261108_4_4_0	by_parent	1200001	27222639	27183054	
-unmerged	projection_part	m800_a	metric_samples_60s	20261108_5_5_0	by_parent	1200001	27221573	27182024	
-unmerged	projection_part	m800_a	metric_samples_60s	20261108_6_6_0	by_parent	1200001	27222205	27182661	
-unmerged	projection_part	m800_a	metric_samples_60s	20261109_13_18_1	by_parent	7200006	163314478	163090329	
-unmerged	projection_part	m800_a	metric_samples_60s	20261109_19_24_1	by_parent	7200006	163310331	163085384	
-unmerged	projection_part	m800_a	metric_samples_60s	20261109_25_25_0	by_parent	1200001	27218205	27178649	
-unmerged	projection_part	m800_a	metric_samples_60s	20261109_26_72_3	by_parent	940047	21362797	21330967	
-unmerged	projection_part	m800_a	metric_samples_60s	20261109_73_78_1	by_parent	120006	3737840	3729737	
-unmerged	projection_part	m800_a	metric_samples_60s	20261109_79_84_1	by_parent	120006	3280332	3272057	
-unmerged	projection_part	m800_a	metric_samples_60s	20261109_7_12_1	by_parent	7200006	163305983	163081459	
-unmerged	projection_part	m800_a	metric_samples_60s	20261109_85_85_0	by_parent	20001	907628	904965	
+unmerged	part	m800_a	metric_samples_60s	20261108_2_2_0	2026-11-08	1200001	48950543	21664641	
+unmerged	part	m800_a	metric_samples_60s	20261108_3_3_0	2026-11-08	1200001	48955359	21675825	
+unmerged	part	m800_a	metric_samples_60s	20261108_4_4_0	2026-11-08	1200001	48955132	21671981	
+unmerged	part	m800_a	metric_samples_60s	20261108_5_5_0	2026-11-08	1200001	48946770	21664670	
+unmerged	part	m800_a	metric_samples_60s	20261109_12_17_1	2026-11-09	7200006	284891514	121337261	
+unmerged	part	m800_a	metric_samples_60s	20261109_18_23_1	2026-11-09	7200006	284807975	121258296	
+unmerged	part	m800_a	metric_samples_60s	20261109_24_24_0	2026-11-09	1200001	48953734	21673475	
+unmerged	part	m800_a	metric_samples_60s	20261109_25_25_0	2026-11-09	1200001	48949292	21670550	
+unmerged	part	m800_a	metric_samples_60s	20261109_26_61_2	2026-11-09	720036	29853818	13482806	
+unmerged	part	m800_a	metric_samples_60s	20261109_62_67_1	2026-11-09	120006	6449843	3140282	
+unmerged	part	m800_a	metric_samples_60s	20261109_68_73_1	2026-11-09	120006	6446707	3136426	
+unmerged	part	m800_a	metric_samples_60s	20261109_6_11_1	2026-11-09	7200006	284891252	121334747	
+unmerged	part	m800_a	metric_samples_60s	20261109_74_79_1	2026-11-09	120006	6447254	3138768	
+unmerged	part	m800_a	metric_samples_60s	20261109_80_85_1	2026-11-09	120006	6447574	3136357	
+unmerged	projection_part	m800_a	metric_samples_60s	20261108_2_2_0	by_parent	1200001	27225453	27185918	
+unmerged	projection_part	m800_a	metric_samples_60s	20261108_3_3_0	by_parent	1200001	27218946	27179363	
+unmerged	projection_part	m800_a	metric_samples_60s	20261108_4_4_0	by_parent	1200001	27222584	27183017	
+unmerged	projection_part	m800_a	metric_samples_60s	20261108_5_5_0	by_parent	1200001	27221549	27182002	
+unmerged	projection_part	m800_a	metric_samples_60s	20261109_12_17_1	by_parent	7200006	163310534	163086232	
+unmerged	projection_part	m800_a	metric_samples_60s	20261109_18_23_1	by_parent	7200006	163305854	163081056	
+unmerged	projection_part	m800_a	metric_samples_60s	20261109_24_24_0	by_parent	1200001	27219651	27180029	
+unmerged	projection_part	m800_a	metric_samples_60s	20261109_25_25_0	by_parent	1200001	27218221	27178705	
+unmerged	projection_part	m800_a	metric_samples_60s	20261109_26_61_2	by_parent	720036	16325309	16300425	
+unmerged	projection_part	m800_a	metric_samples_60s	20261109_62_67_1	by_parent	120006	3281337	3273051	
+unmerged	projection_part	m800_a	metric_samples_60s	20261109_68_73_1	by_parent	120006	3282078	3273815	
+unmerged	projection_part	m800_a	metric_samples_60s	20261109_6_11_1	by_parent	7200006	163312492	163087901	
+unmerged	projection_part	m800_a	metric_samples_60s	20261109_74_79_1	by_parent	120006	3280290	3272005	
+unmerged	projection_part	m800_a	metric_samples_60s	20261109_80_85_1	by_parent	120006	3283033	3274753	
 unmerged	built_at	m800_a	metric_samples_60s	20261108_2_2_0		1200001	12386	11172	Default
 unmerged	built_at	m800_a	metric_samples_60s	20261108_3_3_0		1200001	12386	11172	Default
 unmerged	built_at	m800_a	metric_samples_60s	20261108_4_4_0		1200001	12386	11172	Default
 unmerged	built_at	m800_a	metric_samples_60s	20261108_5_5_0		1200001	12386	11172	Default
-unmerged	built_at	m800_a	metric_samples_60s	20261108_6_6_0		1200001	12386	11172	Default
-unmerged	built_at	m800_a	metric_samples_60s	20261109_13_18_1		7200006	73789	66804	Default
-unmerged	built_at	m800_a	metric_samples_60s	20261109_19_24_1		7200006	73789	66804	Default
+unmerged	built_at	m800_a	metric_samples_60s	20261109_12_17_1		7200006	73789	66804	Default
+unmerged	built_at	m800_a	metric_samples_60s	20261109_18_23_1		7200006	73789	66804	Default
+unmerged	built_at	m800_a	metric_samples_60s	20261109_24_24_0		1200001	12386	11172	Default
 unmerged	built_at	m800_a	metric_samples_60s	20261109_25_25_0		1200001	12386	11172	Default
-unmerged	built_at	m800_a	metric_samples_60s	20261109_26_72_3		940047	9725	8740	Default
-unmerged	built_at	m800_a	metric_samples_60s	20261109_73_78_1		120006	0	0	Default
-unmerged	built_at	m800_a	metric_samples_60s	20261109_79_84_1		120006	0	0	Default
-unmerged	built_at	m800_a	metric_samples_60s	20261109_7_12_1		7200006	73789	66804	Default
-unmerged	built_at	m800_a	metric_samples_60s	20261109_85_85_0		20001	0	0	Default
-unmerged	part	m800_a	metric_samples_720s	20261108_13_13_0	2026-11-08	200001	9946430	4651559	
-unmerged	part	m800_a	metric_samples_720s	20261108_14_14_0	2026-11-08	200001	9948665	4654850	
-unmerged	part	m800_a	metric_samples_720s	20261108_15_15_0	2026-11-08	100001	5650601	2786886	
-unmerged	part	m800_a	metric_samples_720s	20261109_16_21_1	2026-11-09	1100006	47949692	21137311	
-unmerged	part	m800_a	metric_samples_720s	20261109_22_22_0	2026-11-09	200001	9947563	4652756	
-unmerged	part	m800_a	metric_samples_720s	20261109_23_23_0	2026-11-09	200001	9945009	4650107	
-unmerged	part	m800_a	metric_samples_720s	20261109_24_24_0	2026-11-09	200001	9939691	4647313	
-unmerged	part	m800_a	metric_samples_720s	20261109_25_25_0	2026-11-09	200001	9943682	4652446	
-unmerged	part	m800_a	metric_samples_720s	20261109_26_26_0	2026-11-09	100001	5646781	2784429	
-unmerged	projection_part	m800_a	metric_samples_720s	20261108_13_13_0	by_parent	200001	5264763	5255701	
-unmerged	projection_part	m800_a	metric_samples_720s	20261108_14_14_0	by_parent	200001	5263717	5254654	
-unmerged	projection_part	m800_a	metric_samples_720s	20261108_15_15_0	by_parent	100001	2835561	2828468	
-unmerged	projection_part	m800_a	metric_samples_720s	20261109_16_21_1	by_parent	1100006	26753134	26716171	
-unmerged	projection_part	m800_a	metric_samples_720s	20261109_22_22_0	by_parent	200001	5264679	5255615	
-unmerged	projection_part	m800_a	metric_samples_720s	20261109_23_23_0	by_parent	200001	5264736	5255683	
-unmerged	projection_part	m800_a	metric_samples_720s	20261109_24_24_0	by_parent	200001	5262186	5253126	
-unmerged	projection_part	m800_a	metric_samples_720s	20261109_25_25_0	by_parent	200001	5261111	5252051	
-unmerged	projection_part	m800_a	metric_samples_720s	20261109_26_26_0	by_parent	100001	2834109	2826994	
+unmerged	built_at	m800_a	metric_samples_60s	20261109_26_61_2		720036	7466	6688	Default
+unmerged	built_at	m800_a	metric_samples_60s	20261109_62_67_1		120006	0	0	Default
+unmerged	built_at	m800_a	metric_samples_60s	20261109_68_73_1		120006	0	0	Default
+unmerged	built_at	m800_a	metric_samples_60s	20261109_6_11_1		7200006	73789	66804	Default
+unmerged	built_at	m800_a	metric_samples_60s	20261109_74_79_1		120006	0	0	Default
+unmerged	built_at	m800_a	metric_samples_60s	20261109_80_85_1		120006	0	0	Default
+unmerged	part	m800_a	metric_samples_720s	20261108_13_13_0	2026-11-08	200001	9292485	4651548	
+unmerged	part	m800_a	metric_samples_720s	20261108_14_14_0	2026-11-08	200001	9296201	4654848	
+unmerged	part	m800_a	metric_samples_720s	20261109_15_20_1	2026-11-09	1200006	50685520	22976081	
+unmerged	part	m800_a	metric_samples_720s	20261109_21_21_0	2026-11-09	200001	9294341	4652766	
+unmerged	part	m800_a	metric_samples_720s	20261109_22_22_0	2026-11-09	200001	9292188	4650070	
+unmerged	part	m800_a	metric_samples_720s	20261109_23_23_0	2026-11-09	200001	9288145	4647321	
+unmerged	part	m800_a	metric_samples_720s	20261109_24_24_0	2026-11-09	200001	9292657	4652448	
+unmerged	part	m800_a	metric_samples_720s	20261109_25_25_0	2026-11-09	100001	5644151	2783526	
+unmerged	projection_part	m800_a	metric_samples_720s	20261108_13_13_0	by_parent	200001	4610822	4601810	
+unmerged	projection_part	m800_a	metric_samples_720s	20261108_14_14_0	by_parent	200001	4611248	4602240	
+unmerged	projection_part	m800_a	metric_samples_720s	20261109_15_20_1	by_parent	1200006	27647475	27607232	
+unmerged	projection_part	m800_a	metric_samples_720s	20261109_21_21_0	by_parent	200001	4611474	4602471	
+unmerged	projection_part	m800_a	metric_samples_720s	20261109_22_22_0	by_parent	200001	4611942	4602937	
+unmerged	projection_part	m800_a	metric_samples_720s	20261109_23_23_0	by_parent	200001	4610633	4601631	
+unmerged	projection_part	m800_a	metric_samples_720s	20261109_24_24_0	by_parent	200001	4610046	4601040	
+unmerged	projection_part	m800_a	metric_samples_720s	20261109_25_25_0	by_parent	100001	2832312	2825196	
 unmerged	built_at	m800_a	metric_samples_720s	20261108_13_13_0		200001	2178	1900	Default
 unmerged	built_at	m800_a	metric_samples_720s	20261108_14_14_0		200001	2178	1900	Default
-unmerged	built_at	m800_a	metric_samples_720s	20261108_15_15_0		100001	0	0	Default
-unmerged	built_at	m800_a	metric_samples_720s	20261109_16_21_1		1100006	44159	42799	Default
+unmerged	built_at	m800_a	metric_samples_720s	20261109_15_20_1		1200006	34059	32621	Default
+unmerged	built_at	m800_a	metric_samples_720s	20261109_21_21_0		200001	2178	1900	Default
 unmerged	built_at	m800_a	metric_samples_720s	20261109_22_22_0		200001	2178	1900	Default
 unmerged	built_at	m800_a	metric_samples_720s	20261109_23_23_0		200001	2178	1900	Default
 unmerged	built_at	m800_a	metric_samples_720s	20261109_24_24_0		200001	2178	1900	Default
-unmerged	built_at	m800_a	metric_samples_720s	20261109_25_25_0		200001	2178	1900	Default
-unmerged	built_at	m800_a	metric_samples_720s	20261109_26_26_0		100001	0	0	Default
+unmerged	built_at	m800_a	metric_samples_720s	20261109_25_25_0		100001	0	0	Default
 unmerged	part	m800_a	metric_samples_7200s	20261109_11_11_0	2026-11-09	1	3639	625	
-unmerged	part	m800_a	metric_samples_7200s	20261109_12_12_0	2026-11-09	20001	1024861	1001733	
+unmerged	part	m800_a	metric_samples_7200s	20261109_12_12_0	2026-11-09	20001	1027623	1004503	
 unmerged	built_at	m800_a	metric_samples_7200s	20261109_11_11_0		1	0	0	Default
 unmerged	built_at	m800_a	metric_samples_7200s	20261109_12_12_0		20001	0	0	Default
-unmerged	part	m800_b	metric_samples_60s	20261108_2_2_0	2026-11-08	1200001	21714275	21653601	
-unmerged	part	m800_b	metric_samples_60s	20261108_3_3_0	2026-11-08	1200001	21725604	21664810	
-unmerged	part	m800_b	metric_samples_60s	20261108_4_4_0	2026-11-08	1200001	21721716	21660936	
-unmerged	part	m800_b	metric_samples_60s	20261108_5_5_0	2026-11-08	1200001	21714384	21653638	
-unmerged	part	m800_b	metric_samples_60s	20261108_6_6_0	2026-11-08	1200001	21723986	21663245	
-unmerged	part	m800_b	metric_samples_60s	20261109_13_18_1	2026-11-09	7200006	121480024	121234833	
-unmerged	part	m800_b	metric_samples_60s	20261109_19_24_1	2026-11-09	7200006	121501239	121255865	
-unmerged	part	m800_b	metric_samples_60s	20261109_25_25_0	2026-11-09	1200001	21720289	21659501	
-unmerged	part	m800_b	metric_samples_60s	20261109_26_54_3	2026-11-09	580029	11205848	11164314	
-unmerged	part	m800_b	metric_samples_60s	20261109_55_66_2	2026-11-09	240012	5177810	5147355	
-unmerged	part	m800_b	metric_samples_60s	20261109_67_78_2	2026-11-09	240012	5170660	5140136	
-unmerged	part	m800_b	metric_samples_60s	20261109_79_83_1	2026-11-09	100005	2798117	2771142	
-unmerged	part	m800_b	metric_samples_60s	20261109_7_12_1	2026-11-09	7200006	121527064	121281811	
-unmerged	part	m800_b	metric_samples_60s	20261109_84_84_0	2026-11-09	20001	1012793	990822	
-unmerged	part	m800_b	metric_samples_60s	20261109_85_85_0	2026-11-09	20001	1018861	996854	
+unmerged	part	m800_b	metric_samples_60s	20261108_2_2_0	2026-11-08	1200001	21714268	21653601	
+unmerged	part	m800_b	metric_samples_60s	20261108_3_3_0	2026-11-08	1200001	21725591	21664785	
+unmerged	part	m800_b	metric_samples_60s	20261108_4_4_0	2026-11-08	1200001	21721726	21660941	
+unmerged	part	m800_b	metric_samples_60s	20261108_5_5_0	2026-11-08	1200001	21714399	21653630	
+unmerged	part	m800_b	metric_samples_60s	20261109_12_17_1	2026-11-09	7200006	121515476	121270604	
+unmerged	part	m800_b	metric_samples_60s	20261109_18_23_1	2026-11-09	7200006	121436617	121191639	
+unmerged	part	m800_b	metric_samples_60s	20261109_24_24_0	2026-11-09	1200001	21723261	21662435	
+unmerged	part	m800_b	metric_samples_60s	20261109_25_25_0	2026-11-09	1200001	21720249	21659510	
+unmerged	part	m800_b	metric_samples_60s	20261109_26_52_3	2026-11-09	540027	10505520	10465261	
+unmerged	part	m800_b	metric_samples_60s	20261109_53_67_2	2026-11-09	300015	6337949	6305422	
+unmerged	part	m800_b	metric_samples_60s	20261109_68_82_2	2026-11-09	300015	6330302	6297806	
+unmerged	part	m800_b	metric_samples_60s	20261109_6_11_1	2026-11-09	7200006	121513256	121268090	
+unmerged	part	m800_b	metric_samples_60s	20261109_83_83_0	2026-11-09	20001	1020341	998314	
+unmerged	part	m800_b	metric_samples_60s	20261109_84_84_0	2026-11-09	20001	1012776	990803	
+unmerged	part	m800_b	metric_samples_60s	20261109_85_85_0	2026-11-09	20001	1018862	996851	
 unmerged	built_at	m800_b	metric_samples_60s	20261108_2_2_0		1200001	1556	132	Sparse
 unmerged	built_at	m800_b	metric_samples_60s	20261108_3_3_0		1200001	1556	132	Sparse
 unmerged	built_at	m800_b	metric_samples_60s	20261108_4_4_0		1200001	1556	132	Sparse
 unmerged	built_at	m800_b	metric_samples_60s	20261108_5_5_0		1200001	1556	132	Sparse
-unmerged	built_at	m800_b	metric_samples_60s	20261108_6_6_0		1200001	1556	132	Sparse
-unmerged	built_at	m800_b	metric_samples_60s	20261109_13_18_1		7200006	8277	147	Sparse
-unmerged	built_at	m800_b	metric_samples_60s	20261109_19_24_1		7200006	8277	147	Sparse
+unmerged	built_at	m800_b	metric_samples_60s	20261109_12_17_1		7200006	8277	147	Sparse
+unmerged	built_at	m800_b	metric_samples_60s	20261109_18_23_1		7200006	8277	147	Sparse
+unmerged	built_at	m800_b	metric_samples_60s	20261109_24_24_0		1200001	1556	132	Sparse
 unmerged	built_at	m800_b	metric_samples_60s	20261109_25_25_0		1200001	1556	132	Sparse
-unmerged	built_at	m800_b	metric_samples_60s	20261109_26_54_3		580029	904	140	Sparse
-unmerged	built_at	m800_b	metric_samples_60s	20261109_55_66_2		240012	536	140	Sparse
-unmerged	built_at	m800_b	metric_samples_60s	20261109_67_78_2		240012	536	140	Sparse
-unmerged	built_at	m800_b	metric_samples_60s	20261109_79_83_1		100005	0	0	Sparse
-unmerged	built_at	m800_b	metric_samples_60s	20261109_7_12_1		7200006	8277	147	Sparse
+unmerged	built_at	m800_b	metric_samples_60s	20261109_26_52_3		540027	859	140	Sparse
+unmerged	built_at	m800_b	metric_samples_60s	20261109_53_67_2		300015	601	140	Sparse
+unmerged	built_at	m800_b	metric_samples_60s	20261109_68_82_2		300015	601	140	Sparse
+unmerged	built_at	m800_b	metric_samples_60s	20261109_6_11_1		7200006	8277	147	Sparse
+unmerged	built_at	m800_b	metric_samples_60s	20261109_83_83_0		20001	0	0	Sparse
 unmerged	built_at	m800_b	metric_samples_60s	20261109_84_84_0		20001	0	0	Sparse
 unmerged	built_at	m800_b	metric_samples_60s	20261109_85_85_0		20001	0	0	Sparse
-unmerged	part	m800_b	metric_samples_60s_stage	1794258000_14_19_1	2026-11-09 21:00:00	7200006	154333081	154086100	
-unmerged	part	m800_b	metric_samples_60s_stage	1794258000_20_25_1	2026-11-09 21:00:00	7200006	154318147	154071100	
-unmerged	part	m800_b	metric_samples_60s_stage	1794258000_26_59_3	2026-11-09 21:00:00	680034	14778579	14733428	
-unmerged	part	m800_b	metric_samples_60s_stage	1794258000_2_7_1	2026-11-09 21:00:00	7200006	154346902	154100039	
-unmerged	part	m800_b	metric_samples_60s_stage	1794258000_60_83_3	2026-11-09 21:00:00	480024	11000488	10962224	
-unmerged	part	m800_b	metric_samples_60s_stage	1794258000_84_84_0	2026-11-09 21:00:00	20001	1012832	990850	
-unmerged	part	m800_b	metric_samples_60s_stage	1794258000_85_85_0	2026-11-09 21:00:00	20001	1017869	995828	
-unmerged	part	m800_b	metric_samples_60s_stage	1794258000_8_13_1	2026-11-09 21:00:00	7200006	154348769	154101696	
-unmerged	part	m800_b	metric_samples_720s	20261108_13_13_0	2026-11-08	200001	4679982	4649791	
-unmerged	part	m800_b	metric_samples_720s	20261108_14_14_0	2026-11-08	200001	4683263	4653082	
-unmerged	part	m800_b	metric_samples_720s	20261108_15_15_0	2026-11-08	100001	2811934	2783821	
-unmerged	part	m800_b	metric_samples_720s	20261109_16_21_1	2026-11-09	1100006	21154051	21094778	
-unmerged	part	m800_b	metric_samples_720s	20261109_22_22_0	2026-11-09	200001	4681194	4650982	
-unmerged	part	m800_b	metric_samples_720s	20261109_23_23_0	2026-11-09	200001	4678588	4648339	
-unmerged	part	m800_b	metric_samples_720s	20261109_24_24_0	2026-11-09	200001	4675820	4645545	
-unmerged	part	m800_b	metric_samples_720s	20261109_25_25_0	2026-11-09	200001	4680886	4650678	
-unmerged	part	m800_b	metric_samples_720s	20261109_26_26_0	2026-11-09	100001	2809531	2781394	
+unmerged	part	m800_b	metric_samples_60s_stage	1794261600_14_19_1	2026-11-09 22:00:00	7200006	154333248	154086221	
+unmerged	part	m800_b	metric_samples_60s_stage	1794261600_20_25_1	2026-11-09 22:00:00	7200006	154318000	154071054	
+unmerged	part	m800_b	metric_samples_60s_stage	1794261600_26_59_3	2026-11-09 22:00:00	680034	14778693	14733518	
+unmerged	part	m800_b	metric_samples_60s_stage	1794261600_2_7_1	2026-11-09 22:00:00	7200006	154346912	154100064	
+unmerged	part	m800_b	metric_samples_60s_stage	1794261600_60_83_3	2026-11-09 22:00:00	480024	11000455	10962207	
+unmerged	part	m800_b	metric_samples_60s_stage	1794261600_84_84_0	2026-11-09 22:00:00	20001	1012828	990810	
+unmerged	part	m800_b	metric_samples_60s_stage	1794261600_85_85_0	2026-11-09 22:00:00	20001	1017893	995842	
+unmerged	part	m800_b	metric_samples_60s_stage	1794261600_8_13_1	2026-11-09 22:00:00	7200006	154348583	154101658	
+unmerged	part	m800_b	metric_samples_720s	20261108_13_13_0	2026-11-08	200001	4679978	4649780	
+unmerged	part	m800_b	metric_samples_720s	20261108_14_14_0	2026-11-08	200001	4683268	4653080	
+unmerged	part	m800_b	metric_samples_720s	20261109_15_20_1	2026-11-09	1200006	23005633	22943616	
+unmerged	part	m800_b	metric_samples_720s	20261109_21_21_0	2026-11-09	200001	4681173	4650987	
+unmerged	part	m800_b	metric_samples_720s	20261109_22_22_0	2026-11-09	200001	4678602	4648344	
+unmerged	part	m800_b	metric_samples_720s	20261109_23_23_0	2026-11-09	200001	4675827	4645553	
+unmerged	part	m800_b	metric_samples_720s	20261109_24_24_0	2026-11-09	200001	4680926	4650680	
+unmerged	part	m800_b	metric_samples_720s	20261109_25_25_0	2026-11-09	100001	2809541	2781383	
 unmerged	built_at	m800_b	metric_samples_720s	20261108_13_13_0		200001	483	132	Sparse
 unmerged	built_at	m800_b	metric_samples_720s	20261108_14_14_0		200001	483	132	Sparse
-unmerged	built_at	m800_b	metric_samples_720s	20261108_15_15_0		100001	0	0	Sparse
-unmerged	built_at	m800_b	metric_samples_720s	20261109_16_21_1		1100006	1488	150	Sparse
+unmerged	built_at	m800_b	metric_samples_720s	20261109_15_20_1		1200006	1596	150	Sparse
+unmerged	built_at	m800_b	metric_samples_720s	20261109_21_21_0		200001	483	132	Sparse
 unmerged	built_at	m800_b	metric_samples_720s	20261109_22_22_0		200001	483	132	Sparse
 unmerged	built_at	m800_b	metric_samples_720s	20261109_23_23_0		200001	483	132	Sparse
 unmerged	built_at	m800_b	metric_samples_720s	20261109_24_24_0		200001	483	132	Sparse
-unmerged	built_at	m800_b	metric_samples_720s	20261109_25_25_0		200001	483	132	Sparse
-unmerged	built_at	m800_b	metric_samples_720s	20261109_26_26_0		100001	0	0	Sparse
-unmerged	part	m800_b	metric_samples_720s_stage	1794258000_13_18_1	2026-11-09 21:00:00	1200007	28728964	28666871	
-unmerged	part	m800_b	metric_samples_720s_stage	1794258000_19_24_1	2026-11-09 21:00:00	1200006	28730764	28668520	
-unmerged	part	m800_b	metric_samples_720s_stage	1794258000_25_25_0	2026-11-09 21:00:00	100001	2811112	2782828	
+unmerged	built_at	m800_b	metric_samples_720s	20261109_25_25_0		100001	0	0	Sparse
+unmerged	part	m800_b	metric_samples_720s_stage	1794261600_13_18_1	2026-11-09 22:00:00	1200006	27984628	27921677	
+unmerged	part	m800_b	metric_samples_720s_stage	1794261600_19_24_1	2026-11-09 22:00:00	1200006	27977655	27914709	
+unmerged	part	m800_b	metric_samples_720s_stage	1794261600_25_25_0	2026-11-09 22:00:00	100001	2811059	2782808	
 unmerged	part	m800_b	metric_samples_7200s	20261109_11_11_0	2026-11-09	1	3639	625	
-unmerged	part	m800_b	metric_samples_7200s	20261109_12_12_0	2026-11-09	20001	1024105	1000991	
+unmerged	part	m800_b	metric_samples_7200s	20261109_12_12_0	2026-11-09	20001	1027076	1003934	
 unmerged	built_at	m800_b	metric_samples_7200s	20261109_11_11_0		1	0	0	Default
 unmerged	built_at	m800_b	metric_samples_7200s	20261109_12_12_0		20001	0	0	Sparse
-unmerged	part	m800_c	metric_samples_60s	20261108_2_2_0	2026-11-08	1200001	21714275	21653601	
-unmerged	part	m800_c	metric_samples_60s	20261108_3_3_0	2026-11-08	1200001	21725604	21664810	
-unmerged	part	m800_c	metric_samples_60s	20261108_4_4_0	2026-11-08	1200001	21721716	21660936	
-unmerged	part	m800_c	metric_samples_60s	20261108_5_5_0	2026-11-08	1200001	21714384	21653638	
-unmerged	part	m800_c	metric_samples_60s	20261108_6_6_0	2026-11-08	1200001	21723986	21663245	
-unmerged	part	m800_c	metric_samples_60s	20261109_13_18_1	2026-11-09	7200006	121480024	121234833	
-unmerged	part	m800_c	metric_samples_60s	20261109_19_24_1	2026-11-09	7200006	121501239	121255865	
-unmerged	part	m800_c	metric_samples_60s	20261109_25_25_0	2026-11-09	1200001	21720289	21659501	
-unmerged	part	m800_c	metric_samples_60s	20261109_26_55_3	2026-11-09	600030	11492270	11450209	
-unmerged	part	m800_c	metric_samples_60s	20261109_56_67_2	2026-11-09	240012	5175625	5145106	
-unmerged	part	m800_c	metric_samples_60s	20261109_68_82_2	2026-11-09	300015	6330323	6297786	
-unmerged	part	m800_c	metric_samples_60s	20261109_7_12_1	2026-11-09	7200006	121527064	121281811	
-unmerged	part	m800_c	metric_samples_60s	20261109_83_83_0	2026-11-09	20001	1020340	998313	
-unmerged	part	m800_c	metric_samples_60s	20261109_84_84_0	2026-11-09	20001	1012793	990822	
-unmerged	part	m800_c	metric_samples_60s	20261109_85_85_0	2026-11-09	20001	1018861	996854	
+unmerged	part	m800_c	metric_samples_60s	20261108_2_2_0	2026-11-08	1200001	21714268	21653601	
+unmerged	part	m800_c	metric_samples_60s	20261108_3_3_0	2026-11-08	1200001	21725591	21664785	
+unmerged	part	m800_c	metric_samples_60s	20261108_4_4_0	2026-11-08	1200001	21721726	21660941	
+unmerged	part	m800_c	metric_samples_60s	20261108_5_5_0	2026-11-08	1200001	21714399	21653630	
+unmerged	part	m800_c	metric_samples_60s	20261109_12_17_1	2026-11-09	7200006	121515476	121270604	
+unmerged	part	m800_c	metric_samples_60s	20261109_18_23_1	2026-11-09	7200006	121436617	121191639	
+unmerged	part	m800_c	metric_samples_60s	20261109_24_24_0	2026-11-09	1200001	21723261	21662435	
+unmerged	part	m800_c	metric_samples_60s	20261109_25_25_0	2026-11-09	1200001	21720249	21659510	
+unmerged	part	m800_c	metric_samples_60s	20261109_26_52_3	2026-11-09	540027	10505520	10465261	
+unmerged	part	m800_c	metric_samples_60s	20261109_53_67_2	2026-11-09	300015	6337949	6305422	
+unmerged	part	m800_c	metric_samples_60s	20261109_68_82_2	2026-11-09	300015	6330302	6297806	
+unmerged	part	m800_c	metric_samples_60s	20261109_6_11_1	2026-11-09	7200006	121513256	121268090	
+unmerged	part	m800_c	metric_samples_60s	20261109_83_83_0	2026-11-09	20001	1020341	998314	
+unmerged	part	m800_c	metric_samples_60s	20261109_84_84_0	2026-11-09	20001	1012776	990803	
+unmerged	part	m800_c	metric_samples_60s	20261109_85_85_0	2026-11-09	20001	1018862	996851	
 unmerged	built_at	m800_c	metric_samples_60s	20261108_2_2_0		1200001	1556	132	Sparse
 unmerged	built_at	m800_c	metric_samples_60s	20261108_3_3_0		1200001	1556	132	Sparse
 unmerged	built_at	m800_c	metric_samples_60s	20261108_4_4_0		1200001	1556	132	Sparse
 unmerged	built_at	m800_c	metric_samples_60s	20261108_5_5_0		1200001	1556	132	Sparse
-unmerged	built_at	m800_c	metric_samples_60s	20261108_6_6_0		1200001	1556	132	Sparse
-unmerged	built_at	m800_c	metric_samples_60s	20261109_13_18_1		7200006	8277	147	Sparse
-unmerged	built_at	m800_c	metric_samples_60s	20261109_19_24_1		7200006	8277	147	Sparse
+unmerged	built_at	m800_c	metric_samples_60s	20261109_12_17_1		7200006	8277	147	Sparse
+unmerged	built_at	m800_c	metric_samples_60s	20261109_18_23_1		7200006	8277	147	Sparse
+unmerged	built_at	m800_c	metric_samples_60s	20261109_24_24_0		1200001	1556	132	Sparse
 unmerged	built_at	m800_c	metric_samples_60s	20261109_25_25_0		1200001	1556	132	Sparse
-unmerged	built_at	m800_c	metric_samples_60s	20261109_26_55_3		600030	923	140	Sparse
-unmerged	built_at	m800_c	metric_samples_60s	20261109_56_67_2		240012	536	140	Sparse
+unmerged	built_at	m800_c	metric_samples_60s	20261109_26_52_3		540027	859	140	Sparse
+unmerged	built_at	m800_c	metric_samples_60s	20261109_53_67_2		300015	601	140	Sparse
 unmerged	built_at	m800_c	metric_samples_60s	20261109_68_82_2		300015	601	140	Sparse
-unmerged	built_at	m800_c	metric_samples_60s	20261109_7_12_1		7200006	8277	147	Sparse
+unmerged	built_at	m800_c	metric_samples_60s	20261109_6_11_1		7200006	8277	147	Sparse
 unmerged	built_at	m800_c	metric_samples_60s	20261109_83_83_0		20001	0	0	Sparse
 unmerged	built_at	m800_c	metric_samples_60s	20261109_84_84_0		20001	0	0	Sparse
 unmerged	built_at	m800_c	metric_samples_60s	20261109_85_85_0		20001	0	0	Sparse
-unmerged	part	m800_c	metric_samples_60s_stage	1794258000_14_19_1	2026-11-09 21:00:00	7200006	154333081	154086100	
-unmerged	part	m800_c	metric_samples_60s_stage	1794258000_20_25_1	2026-11-09 21:00:00	7200006	154318147	154071100	
-unmerged	part	m800_c	metric_samples_60s_stage	1794258000_26_59_3	2026-11-09 21:00:00	680034	14778606	14733453	
-unmerged	part	m800_c	metric_samples_60s_stage	1794258000_2_7_1	2026-11-09 21:00:00	7200006	154346903	154100039	
-unmerged	part	m800_c	metric_samples_60s_stage	1794258000_60_83_3	2026-11-09 21:00:00	480024	11000466	10962201	
-unmerged	part	m800_c	metric_samples_60s_stage	1794258000_84_84_0	2026-11-09 21:00:00	20001	1012832	990850	
-unmerged	part	m800_c	metric_samples_60s_stage	1794258000_85_85_0	2026-11-09 21:00:00	20001	1017869	995828	
-unmerged	part	m800_c	metric_samples_60s_stage	1794258000_8_13_1	2026-11-09 21:00:00	7200006	154348769	154101696	
-merged	part	m800_a	metric_samples_60s	20261108_2_6_1	2026-11-08	6000005	237944293	101634289	
-merged	part	m800_a	metric_samples_60s	20261109_7_85_4	2026-11-09	24000079	936864266	391827916	
-merged	projection_part	m800_a	metric_samples_60s	20261108_2_6_1	by_parent	6000005	136102203	135913881	
-merged	projection_part	m800_a	metric_samples_60s	20261109_7_85_4	by_parent	24000079	544341317	543601812	
-merged	built_at	m800_a	metric_samples_60s	20261108_2_6_1		6000005	61570	55708	Default
-merged	built_at	m800_a	metric_samples_60s	20261109_7_85_4		24000079	245789	222680	Default
-merged	part	m800_a	metric_samples_720s	20261108_39_39_0	2026-11-08	200001	9946430	4651558	
-merged	part	m800_a	metric_samples_720s	20261108_40_40_0	2026-11-08	200001	9948665	4654850	
-merged	part	m800_a	metric_samples_720s	20261108_41_41_0	2026-11-08	100001	5650601	2786886	
-merged	part	m800_a	metric_samples_720s	20261109_42_47_1	2026-11-09	1100006	47893922	21139382	
-merged	part	m800_a	metric_samples_720s	20261109_48_48_0	2026-11-09	200001	9947564	4652757	
-merged	part	m800_a	metric_samples_720s	20261109_49_49_0	2026-11-09	200001	9945014	4650107	
-merged	part	m800_a	metric_samples_720s	20261109_50_50_0	2026-11-09	200001	9939691	4647313	
-merged	part	m800_a	metric_samples_720s	20261109_51_51_0	2026-11-09	200001	9943682	4652446	
-merged	part	m800_a	metric_samples_720s	20261109_52_52_0	2026-11-09	100001	5646781	2784429	
-merged	projection_part	m800_a	metric_samples_720s	20261108_39_39_0	by_parent	200001	5264763	5255701	
-merged	projection_part	m800_a	metric_samples_720s	20261108_40_40_0	by_parent	200001	5263717	5254654	
-merged	projection_part	m800_a	metric_samples_720s	20261108_41_41_0	by_parent	100001	2835561	2828468	
-merged	projection_part	m800_a	metric_samples_720s	20261109_42_47_1	by_parent	1100006	26695255	26658271	
-merged	projection_part	m800_a	metric_samples_720s	20261109_48_48_0	by_parent	200001	5264678	5255614	
-merged	projection_part	m800_a	metric_samples_720s	20261109_49_49_0	by_parent	200001	5264741	5255688	
-merged	projection_part	m800_a	metric_samples_720s	20261109_50_50_0	by_parent	200001	5262186	5253126	
-merged	projection_part	m800_a	metric_samples_720s	20261109_51_51_0	by_parent	200001	5261111	5252051	
-merged	projection_part	m800_a	metric_samples_720s	20261109_52_52_0	by_parent	100001	2834109	2826994	
+unmerged	part	m800_c	metric_samples_60s_stage	1794261600_14_19_1	2026-11-09 22:00:00	7200006	154333248	154086221	
+unmerged	part	m800_c	metric_samples_60s_stage	1794261600_20_25_1	2026-11-09 22:00:00	7200006	154318000	154071054	
+unmerged	part	m800_c	metric_samples_60s_stage	1794261600_26_59_3	2026-11-09 22:00:00	680034	14778637	14733466	
+unmerged	part	m800_c	metric_samples_60s_stage	1794261600_2_7_1	2026-11-09 22:00:00	7200006	154346909	154100063	
+unmerged	part	m800_c	metric_samples_60s_stage	1794261600_60_83_3	2026-11-09 22:00:00	480024	11000494	10962245	
+unmerged	part	m800_c	metric_samples_60s_stage	1794261600_84_84_0	2026-11-09 22:00:00	20001	1012828	990810	
+unmerged	part	m800_c	metric_samples_60s_stage	1794261600_85_85_0	2026-11-09 22:00:00	20001	1017893	995842	
+unmerged	part	m800_c	metric_samples_60s_stage	1794261600_8_13_1	2026-11-09 22:00:00	7200006	154348583	154101658	
+merged	part	m800_a	metric_samples_60s	20261108_2_5_1	2026-11-08	4800004	190885000	81831804	
+merged	part	m800_a	metric_samples_60s	20261109_6_85_3	2026-11-09	25200080	983055636	410777072	
+merged	projection_part	m800_a	metric_samples_60s	20261108_2_5_1	by_parent	4800004	108880308	108730383	
+merged	projection_part	m800_a	metric_samples_60s	20261109_6_85_3	by_parent	25200080	571553906	570777164	
+merged	built_at	m800_a	metric_samples_60s	20261108_2_5_1		4800004	49228	44536	Default
+merged	built_at	m800_a	metric_samples_60s	20261109_6_85_3		25200080	258148	233851	Default
+merged	part	m800_a	metric_samples_720s	20261108_38_38_0	2026-11-08	200001	9292485	4651547	
+merged	part	m800_a	metric_samples_720s	20261108_39_39_0	2026-11-08	200001	9296201	4654848	
+merged	part	m800_a	metric_samples_720s	20261109_40_45_1	2026-11-09	1200006	50685497	22976090	
+merged	part	m800_a	metric_samples_720s	20261109_46_46_0	2026-11-09	200001	9294332	4652755	
+merged	part	m800_a	metric_samples_720s	20261109_47_47_0	2026-11-09	200001	9292231	4650112	
+merged	part	m800_a	metric_samples_720s	20261109_48_48_0	2026-11-09	200001	9288145	4647321	
+merged	part	m800_a	metric_samples_720s	20261109_49_49_0	2026-11-09	200001	9292657	4652448	
+merged	part	m800_a	metric_samples_720s	20261109_50_50_0	2026-11-09	100001	5646965	2784420	
+merged	projection_part	m800_a	metric_samples_720s	20261108_38_38_0	by_parent	200001	4610822	4601810	
+merged	projection_part	m800_a	metric_samples_720s	20261108_39_39_0	by_parent	200001	4611248	4602240	
+merged	projection_part	m800_a	metric_samples_720s	20261109_40_45_1	by_parent	1200006	27647480	27607232	
+merged	projection_part	m800_a	metric_samples_720s	20261109_46_46_0	by_parent	200001	4611474	4602471	
+merged	projection_part	m800_a	metric_samples_720s	20261109_47_47_0	by_parent	200001	4611944	4602939	
+merged	projection_part	m800_a	metric_samples_720s	20261109_48_48_0	by_parent	200001	4610633	4601631	
+merged	projection_part	m800_a	metric_samples_720s	20261109_49_49_0	by_parent	200001	4610046	4601040	
+merged	projection_part	m800_a	metric_samples_720s	20261109_50_50_0	by_parent	100001	2834302	2827135	
+merged	built_at	m800_a	metric_samples_720s	20261108_38_38_0		200001	2178	1900	Default
 merged	built_at	m800_a	metric_samples_720s	20261108_39_39_0		200001	2178	1900	Default
-merged	built_at	m800_a	metric_samples_720s	20261108_40_40_0		200001	2178	1900	Default
-merged	built_at	m800_a	metric_samples_720s	20261108_41_41_0		100001	0	0	Default
-merged	built_at	m800_a	metric_samples_720s	20261109_42_47_1		1100006	46230	44871	Default
+merged	built_at	m800_a	metric_samples_720s	20261109_40_45_1		1200006	34029	32629	Default
+merged	built_at	m800_a	metric_samples_720s	20261109_46_46_0		200001	2178	1900	Default
+merged	built_at	m800_a	metric_samples_720s	20261109_47_47_0		200001	2178	1900	Default
 merged	built_at	m800_a	metric_samples_720s	20261109_48_48_0		200001	2178	1900	Default
 merged	built_at	m800_a	metric_samples_720s	20261109_49_49_0		200001	2178	1900	Default
-merged	built_at	m800_a	metric_samples_720s	20261109_50_50_0		200001	2178	1900	Default
-merged	built_at	m800_a	metric_samples_720s	20261109_51_51_0		200001	2178	1900	Default
-merged	built_at	m800_a	metric_samples_720s	20261109_52_52_0		100001	0	0	Default
+merged	built_at	m800_a	metric_samples_720s	20261109_50_50_0		100001	0	0	Default
 merged	part	m800_a	metric_samples_7200s	20261109_23_23_0	2026-11-09	1	3639	625	
-merged	part	m800_a	metric_samples_7200s	20261109_24_24_0	2026-11-09	20001	1024861	1001733	
+merged	part	m800_a	metric_samples_7200s	20261109_24_24_0	2026-11-09	20001	1027623	1004503	
 merged	built_at	m800_a	metric_samples_7200s	20261109_23_23_0		1	0	0	Default
 merged	built_at	m800_a	metric_samples_7200s	20261109_24_24_0		20001	0	0	Default
-merged	part	m800_b	metric_samples_60s	20261108_2_6_1	2026-11-08	6000005	101787478	101578727	
-merged	part	m800_b	metric_samples_60s	20261109_7_85_4	2026-11-09	24000079	392304350	391605538	
-merged	built_at	m800_b	metric_samples_60s	20261108_2_6_1		6000005	6950	146	Sparse
-merged	built_at	m800_b	metric_samples_60s	20261109_7_85_4		24000079	27181	302	Sparse
-merged	part	m800_b	metric_samples_60s_stage	1794258000_2_85_4	2026-11-09 21:00:00	30000084	643004321	642061861	
-merged	part	m800_b	metric_samples_720s	20261108_39_39_0	2026-11-08	200001	4679982	4649791	
-merged	part	m800_b	metric_samples_720s	20261108_40_40_0	2026-11-08	200001	4683263	4653082	
-merged	part	m800_b	metric_samples_720s	20261108_41_41_0	2026-11-08	100001	2811934	2783821	
-merged	part	m800_b	metric_samples_720s	20261109_42_47_1	2026-11-09	1100006	21153892	21094662	
-merged	part	m800_b	metric_samples_720s	20261109_48_48_0	2026-11-09	200001	4681203	4650993	
-merged	part	m800_b	metric_samples_720s	20261109_49_49_0	2026-11-09	200001	4678588	4648339	
-merged	part	m800_b	metric_samples_720s	20261109_50_50_0	2026-11-09	200001	4675820	4645545	
-merged	part	m800_b	metric_samples_720s	20261109_51_51_0	2026-11-09	200001	4680886	4650678	
-merged	part	m800_b	metric_samples_720s	20261109_52_52_0	2026-11-09	100001	2809482	2781364	
+merged	part	m800_b	metric_samples_60s	20261108_2_5_1	2026-11-08	4800004	81961021	81787413	
+merged	part	m800_b	metric_samples_60s	20261109_6_85_4	2026-11-09	25200080	411272203	410543523	
+merged	built_at	m800_b	metric_samples_60s	20261108_2_5_1		4800004	5549	145	Sparse
+merged	built_at	m800_b	metric_samples_60s	20261109_6_85_4		25200080	28612	302	Sparse
+merged	part	m800_b	metric_samples_60s_stage	1794261600_2_85_4	2026-11-09 22:00:00	30000084	643004681	642061857	
+merged	part	m800_b	metric_samples_720s	20261108_38_38_0	2026-11-08	200001	4679978	4649780	
+merged	part	m800_b	metric_samples_720s	20261108_39_39_0	2026-11-08	200001	4683268	4653080	
+merged	part	m800_b	metric_samples_720s	20261109_40_45_1	2026-11-09	1200006	23005632	22943616	
+merged	part	m800_b	metric_samples_720s	20261109_46_46_0	2026-11-09	200001	4681182	4650998	
+merged	part	m800_b	metric_samples_720s	20261109_47_47_0	2026-11-09	200001	4678602	4648344	
+merged	part	m800_b	metric_samples_720s	20261109_48_48_0	2026-11-09	200001	4675827	4645553	
+merged	part	m800_b	metric_samples_720s	20261109_49_49_0	2026-11-09	200001	4680926	4650680	
+merged	part	m800_b	metric_samples_720s	20261109_50_50_0	2026-11-09	100001	2809478	2781353	
+merged	built_at	m800_b	metric_samples_720s	20261108_38_38_0		200001	483	132	Sparse
 merged	built_at	m800_b	metric_samples_720s	20261108_39_39_0		200001	483	132	Sparse
-merged	built_at	m800_b	metric_samples_720s	20261108_40_40_0		200001	483	132	Sparse
-merged	built_at	m800_b	metric_samples_720s	20261108_41_41_0		100001	0	0	Sparse
-merged	built_at	m800_b	metric_samples_720s	20261109_42_47_1		1100006	1488	150	Sparse
+merged	built_at	m800_b	metric_samples_720s	20261109_40_45_1		1200006	1597	151	Sparse
+merged	built_at	m800_b	metric_samples_720s	20261109_46_46_0		200001	483	132	Sparse
+merged	built_at	m800_b	metric_samples_720s	20261109_47_47_0		200001	483	132	Sparse
 merged	built_at	m800_b	metric_samples_720s	20261109_48_48_0		200001	483	132	Sparse
 merged	built_at	m800_b	metric_samples_720s	20261109_49_49_0		200001	483	132	Sparse
-merged	built_at	m800_b	metric_samples_720s	20261109_50_50_0		200001	483	132	Sparse
-merged	built_at	m800_b	metric_samples_720s	20261109_51_51_0		200001	483	132	Sparse
-merged	built_at	m800_b	metric_samples_720s	20261109_52_52_0		100001	0	0	Sparse
-merged	part	m800_b	metric_samples_720s_stage	1794258000_38_43_1	2026-11-09 21:00:00	1200007	28728786	28666681	
-merged	part	m800_b	metric_samples_720s_stage	1794258000_44_49_1	2026-11-09 21:00:00	1200006	28730577	28668338	
-merged	part	m800_b	metric_samples_720s_stage	1794258000_50_50_0	2026-11-09 21:00:00	100001	2811641	2783402	
+merged	built_at	m800_b	metric_samples_720s	20261109_50_50_0		100001	0	0	Sparse
+merged	part	m800_b	metric_samples_720s_stage	1794261600_38_43_1	2026-11-09 22:00:00	1200006	27984646	27921683	
+merged	part	m800_b	metric_samples_720s_stage	1794261600_44_49_1	2026-11-09 22:00:00	1200006	27977663	27914714	
+merged	part	m800_b	metric_samples_720s_stage	1794261600_50_50_0	2026-11-09 22:00:00	100001	2811651	2783382	
 merged	part	m800_b	metric_samples_7200s	20261109_23_23_0	2026-11-09	1	3639	625	
-merged	part	m800_b	metric_samples_7200s	20261109_24_24_0	2026-11-09	20001	1024273	1001164	
+merged	part	m800_b	metric_samples_7200s	20261109_24_24_0	2026-11-09	20001	1027076	1003934	
 merged	built_at	m800_b	metric_samples_7200s	20261109_23_23_0		1	0	0	Default
 merged	built_at	m800_b	metric_samples_7200s	20261109_24_24_0		20001	0	0	Sparse
-merged	part	m800_c	metric_samples_60s	20261108_2_6_1	2026-11-08	6000005	101787478	101578727	
-merged	part	m800_c	metric_samples_60s	20261109_7_85_4	2026-11-09	24000079	392304350	391605538	
-merged	built_at	m800_c	metric_samples_60s	20261108_2_6_1		6000005	6950	146	Sparse
-merged	built_at	m800_c	metric_samples_60s	20261109_7_85_4		24000079	27181	302	Sparse
-merged	part	m800_c	metric_samples_60s_stage	1794258000_2_85_4_86	2026-11-09 21:00:00	28800083	617292992	616386443	
-merged	part	m800_c	metric_samples_720s	20261109_11_11_0	2026-11-09	1	3639	625	
-merged	part	m800_c	metric_samples_720s	20261109_12_12_0	2026-11-09	200001	4681946	4651689	
+merged	part	m800_c	metric_samples_60s	20261108_2_5_1	2026-11-08	4800004	81961021	81787413	
+merged	part	m800_c	metric_samples_60s	20261109_6_85_4	2026-11-09	25200080	411272203	410543523	
+merged	built_at	m800_c	metric_samples_60s	20261108_2_5_1		4800004	5549	145	Sparse
+merged	built_at	m800_c	metric_samples_60s	20261109_6_85_4		25200080	28612	302	Sparse
+merged	part	m800_c	metric_samples_60s_stage	1794261600_2_85_4_86	2026-11-09 22:00:00	28800083	617293267	616386363	
+merged	part	m800_c	metric_samples_720s	20261109_11_11_0	2026-11-09	1	3641	625	
+merged	part	m800_c	metric_samples_720s	20261109_12_12_0	2026-11-09	200001	4681900	4651690	
 merged	built_at	m800_c	metric_samples_720s	20261109_11_11_0		1	0	0	Default
 merged	built_at	m800_c	metric_samples_720s	20261109_12_12_0		200001	483	132	Sparse
-merged	part	m800_c	metric_samples_720s_stage	1794258000_11_11_0	2026-11-09 21:00:00	1	3609	586	
-merged	part	m800_c	metric_samples_720s_stage	1794258000_12_12_0	2026-11-09 21:00:00	200001	4685708	4655514	
+merged	part	m800_c	metric_samples_720s_stage	1794261600_11_11_0	2026-11-09 22:00:00	1	3610	586	
+merged	part	m800_c	metric_samples_720s_stage	1794261600_12_12_0	2026-11-09 22:00:00	200001	5423808	5393573	
 
-# active parts counted just before each build: the source's stage (the source level itself in m800_a, which has none), then the source level
+# active parts counted just before each build: the source's stage (the source level itself where it has none), then the source level
 build	source_stage_parts	source_level_parts
-m800_a unmerged 720 ten r1	13	13
-m800_a unmerged 720 ten r2	13	13
-m800_a unmerged 720 ten r3	13	13
-m800_a unmerged 720 one r1	13	13
-m800_a unmerged 720 one r2	13	13
-m800_a unmerged 720 one r3	13	13
-m800_a unmerged 7200 ten r1	9	9
-m800_a unmerged 7200 ten r2	9	9
-m800_a unmerged 7200 ten r3	9	9
-m800_a unmerged 7200 one r1	9	9
-m800_a unmerged 7200 one r2	9	9
-m800_a unmerged 7200 one r3	9	9
+m800_a unmerged 720 ten r1	14	14
+m800_a unmerged 720 ten r2	14	14
+m800_a unmerged 720 ten r3	14	14
+m800_a unmerged 720 one r1	14	14
+m800_a unmerged 720 one r2	14	14
+m800_a unmerged 720 one r3	14	14
+m800_a unmerged 7200 ten r1	8	8
+m800_a unmerged 7200 ten r2	8	8
+m800_a unmerged 7200 ten r3	8	8
+m800_a unmerged 7200 one r1	8	8
+m800_a unmerged 7200 one r2	8	8
+m800_a unmerged 7200 one r3	8	8
 m800_b unmerged 720 ten r1	8	15
 m800_b unmerged 720 ten r2	8	15
 m800_b unmerged 720 ten r3	8	15
 m800_b unmerged 720 one r1	8	15
 m800_b unmerged 720 one r2	8	15
 m800_b unmerged 720 one r3	8	15
-m800_b unmerged 7200 ten r1	8	9
-m800_b unmerged 7200 ten r2	3	9
-m800_b unmerged 7200 ten r3	3	9
-m800_b unmerged 7200 one r1	3	9
-m800_b unmerged 7200 one r2	3	9
-m800_b unmerged 7200 one r3	3	9
+m800_b unmerged 7200 ten r1	8	8
+m800_b unmerged 7200 ten r2	3	8
+m800_b unmerged 7200 ten r3	3	8
+m800_b unmerged 7200 one r1	3	8
+m800_b unmerged 7200 one r2	3	8
+m800_b unmerged 7200 one r3	3	8
 m800_c unmerged 720 ten r1	8	15
 m800_c unmerged 720 ten r2	8	15
 m800_c unmerged 720 ten r3	8	15
@@ -284,26 +277,26 @@ m800_a merged 720 ten r3	2	2
 m800_a merged 720 one r1	2	2
 m800_a merged 720 one r2	2	2
 m800_a merged 720 one r3	2	2
-m800_a merged 7200 ten r1	9	9
-m800_a merged 7200 ten r2	9	9
-m800_a merged 7200 ten r3	9	9
-m800_a merged 7200 one r1	9	9
-m800_a merged 7200 one r2	9	9
-m800_a merged 7200 one r3	9	9
+m800_a merged 7200 ten r1	8	8
+m800_a merged 7200 ten r2	8	8
+m800_a merged 7200 ten r3	8	8
+m800_a merged 7200 one r1	8	8
+m800_a merged 7200 one r2	8	8
+m800_a merged 7200 one r3	8	8
 m800_b merged 720 ten r1	1	2
 m800_b merged 720 ten r2	1	2
 m800_b merged 720 ten r3	1	2
 m800_b merged 720 one r1	1	2
 m800_b merged 720 one r2	1	2
 m800_b merged 720 one r3	1	2
-m800_b merged 7200 ten r1	8	9
-m800_b merged 7200 ten r2	3	9
-m800_b merged 7200 ten r3	3	9
-m800_b merged 7200 one r1	3	9
-m800_b merged 7200 one r2	3	9
-m800_b merged 7200 one r3	3	9
+m800_b merged 7200 ten r1	8	8
+m800_b merged 7200 ten r2	3	8
+m800_b merged 7200 ten r3	3	8
+m800_b merged 7200 one r1	3	8
+m800_b merged 7200 one r2	3	8
+m800_b merged 7200 one r3	3	8
 m800_c merged 720 ten r1	1	2
 m800_c merged 720 ten r2	1	2
 m800_c merged 720 ten r3	1	2
 
-# H0 of the first hour: 1794164400000; the run clock written as built_at: 1794261047702
+# H0 of the first hour: 1794168000000; the run clock written as built_at: 1794264535975
