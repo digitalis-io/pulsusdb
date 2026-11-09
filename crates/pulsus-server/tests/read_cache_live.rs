@@ -511,18 +511,17 @@ struct Rig {
     db: live_db::ScopedDb,
 }
 
-async fn rig(name: &str, a_port: u16, b_port: u16, env: &[(&str, &str)]) -> Rig {
-    rig_retained(name, a_port, b_port, env, None).await
+async fn rig(db: live_db::ScopedDb, a_port: u16, b_port: u16, env: &[(&str, &str)]) -> Rig {
+    rig_retained(db, a_port, b_port, env, None).await
 }
 
 async fn rig_retained(
-    name: &str,
+    db: live_db::ScopedDb,
     a_port: u16,
     b_port: u16,
     env: &[(&str, &str)],
     retention_days: Option<u32>,
 ) -> Rig {
-    let db = live_db::ScopedDb::fresh(name.to_string()).await;
     if let Some(days) = retention_days {
         live_db::state_retention(&db, days).await;
     }
@@ -545,7 +544,7 @@ async fn l1_l2_a_shifted_repeat_is_a_hit() {
     let a_port: u16 = 31_426;
     let b_port: u16 = 31_427;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l1_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l1_it")).await,
         a_port,
         b_port,
         &[],
@@ -575,7 +574,7 @@ async fn l3_late_data_is_not_in_kept_points() {
     let a_port: u16 = 31_428;
     let b_port: u16 = 31_429;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l3_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l3_it")).await,
         a_port,
         b_port,
         &[],
@@ -615,7 +614,7 @@ async fn l4_eviction_lets_late_data_in() {
     let b_port: u16 = 31_431;
     let c_port: u16 = 31_432;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l4_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l4_it")).await,
         a_port,
         b_port,
         &[],
@@ -660,7 +659,7 @@ async fn l5_new_level_rows_are_read_by_the_tail() {
     let a_port: u16 = 31_433;
     let b_port: u16 = 31_434;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l5_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l5_it")).await,
         a_port,
         b_port,
         &[],
@@ -688,7 +687,7 @@ async fn l6_a_tail_is_routed_as_its_whole_request() {
     let a_port: u16 = 31_435;
     let b_port: u16 = 31_436;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l6_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l6_it")).await,
         a_port,
         b_port,
         &[],
@@ -714,7 +713,7 @@ async fn l7_at_is_refused() {
     let a_port: u16 = 31_437;
     let b_port: u16 = 31_438;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l7_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l7_it")).await,
         a_port,
         b_port,
         &[],
@@ -736,7 +735,7 @@ async fn l8_an_on_time_sample_is_shown() {
     let a_port: u16 = 31_439;
     let b_port: u16 = 31_440;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l8_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l8_it")).await,
         a_port,
         b_port,
         &[],
@@ -766,7 +765,7 @@ async fn l9_tenants_do_not_share() {
     let a_port: u16 = 31_441;
     let b_port: u16 = 31_442;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l9_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l9_it")).await,
         a_port,
         b_port,
         &[],
@@ -788,7 +787,7 @@ async fn l10_a_recreated_database_is_cleared() {
     let a_port: u16 = 31_443;
     let b_port: u16 = 31_444;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l10_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l10_it")).await,
         a_port,
         b_port,
         &[],
@@ -819,7 +818,7 @@ async fn l12_an_info_is_kept_with_its_points() {
     let a_port: u16 = 31_445;
     let b_port: u16 = 31_446;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l12_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l12_it")).await,
         a_port,
         b_port,
         &[],
@@ -838,7 +837,7 @@ async fn l13_limit_is_applied_after_the_merge() {
     let a_port: u16 = 31_447;
     let b_port: u16 = 31_448;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l13_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l13_it")).await,
         a_port,
         b_port,
         &[],
@@ -862,7 +861,7 @@ async fn l14_data_near_the_retention_floor_bypasses() {
     let a_port: u16 = 31_449;
     let b_port: u16 = 31_450;
     let r = rig_retained(
-        &pulsus_testkit::test_db("pulsus_read_cache_l14_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l14_it")).await,
         a_port,
         b_port,
         &[],
@@ -897,7 +896,7 @@ async fn l15_a_sample_at_the_refresh_end_is_shown() {
     let a_port: u16 = 31_451;
     let b_port: u16 = 31_452;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l15_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l15_it")).await,
         a_port,
         b_port,
         &[],
@@ -930,7 +929,7 @@ async fn l16_a_duration_expression_is_refused() {
     let a_port: u16 = 31_453;
     let b_port: u16 = 31_454;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l16_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l16_it")).await,
         a_port,
         b_port,
         &[("PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS", "true")],
@@ -1091,7 +1090,7 @@ async fn l21_native_histograms_are_kept() {
     let a_port: u16 = 31_458;
     let b_port: u16 = 31_459;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l21_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l21_it")).await,
         a_port,
         b_port,
         &[],
@@ -1113,7 +1112,7 @@ async fn l22_refused_shapes_never_touch_the_cache() {
     let a_port: u16 = 31_465;
     let b_port: u16 = 31_466;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l22_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l22_it")).await,
         a_port,
         b_port,
         &[],
@@ -1144,7 +1143,7 @@ async fn l23_or_bypasses() {
     let a_port: u16 = 31_467;
     let b_port: u16 = 31_468;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l23_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l23_it")).await,
         a_port,
         b_port,
         &[],
@@ -1177,7 +1176,7 @@ async fn l24_a_forced_monotonicity_info_is_never_kept() {
     let a_port: u16 = 31_469;
     let b_port: u16 = 31_470;
     let r = rig(
-        &pulsus_testkit::test_db("pulsus_read_cache_l24_it"),
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l24_it")).await,
         a_port,
         b_port,
         &[],
