@@ -997,8 +997,8 @@ mod tests {
             out.contains("A 86400s 86400000 EVERY 1 DAY OFFSET 780 SECOND\n"),
             "{out}"
         );
-        // The next level is a whole day, so the 720 s level feeds no
-        // projection.
+        // The next level is a whole day, so the 720 s level has no
+        // stage.
         assert!(out.contains("F 720000\nA 86400s"), "{out}");
         assert!(!out.contains("\nP "), "{out}");
         assert!(out.contains("N metric_samples_720s\ntail\n"), "{out}");
