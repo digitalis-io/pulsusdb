@@ -2054,7 +2054,9 @@ const LEVEL_VIEWS: [&str; 4] = [
 /// holds it. After one 60 s run on every replica, the level read through its
 /// wrapper has one data row per bucket, counting every sample pushed, that
 /// one included; and each shard holds one run row from that run, so the
-/// second replica wrote none.
+/// second replica wrote none. Issue #800: the 60 s level's stage exists on
+/// both of shard 1's replicas, the builder's holds a run row and the second
+/// replica's nothing, and the level's data rows are the same on both.
 #[tokio::test]
 async fn each_shard_builds_its_slice_once() {
     skip_unless_live!();
@@ -2093,6 +2095,14 @@ async fn each_shard_builds_its_slice_once() {
                 &format!("TRUNCATE TABLE {db}.{table} SETTINGS alter_sync = 2"),
             )
             .await;
+        }
+    }
+    // Issue #800: a stage is local to its replica, so each replica's is
+    // emptied.
+    for r in replicas {
+        for view in LEVEL_VIEWS {
+            let table = view.trim_end_matches("_mv");
+            exec_on(r, &format!("TRUNCATE TABLE IF EXISTS {db}.{table}_stage")).await;
         }
     }
 
@@ -2202,6 +2212,47 @@ async fn each_shard_builds_its_slice_once() {
         })
         .collect();
 
+    // Issue #800: the stage is filled on the replica that inserts, so only
+    // the builder's holds the run's rows, while the level itself is
+    // replicated to both.
+    let mut staged_here = Vec::new();
+    for (name, r) in [("shard 1", &shard1), ("shard 1's second replica", &shard1b)] {
+        let n = ints_on(
+            r,
+            &format!(
+                "SELECT toInt64(count()) AS v FROM system.tables \
+                 WHERE database = '{db}' AND name = 'metric_samples_60s_stage'"
+            ),
+        )
+        .await[0];
+        staged_here.push((name, n));
+    }
+    let staged_runs = if staged_here.iter().all(|(_, n)| *n == 1) {
+        let runs_on_builder = ints_on(
+            &shard1,
+            &format!(
+                "SELECT toInt64(count()) AS v FROM {db}.metric_samples_60s_stage WHERE kind = 1"
+            ),
+        )
+        .await[0];
+        let rows_on_second = ints_on(
+            &shard1b,
+            &format!("SELECT toInt64(count()) AS v FROM {db}.metric_samples_60s_stage"),
+        )
+        .await[0];
+        Some((runs_on_builder, rows_on_second))
+    } else {
+        None
+    };
+    let level_rows = format!(
+        "SELECT toString((fingerprint, t_end, t_last, reinterpretAsUInt64(last), \
+         reinterpretAsUInt64(min), reinterpretAsUInt64(max), reinterpretAsUInt64(sum), \
+         count, reinterpretAsUInt64(inc), flags)) AS s \
+         FROM {db}.metric_samples_60s WHERE kind = 0 ORDER BY s"
+    );
+    let level_on_builder = strings_on(&shard1, &level_rows).await;
+    let level_on_second = strings_on(&shard1b, &level_rows).await;
+
     let mut runs = Vec::new();
     for (name, r) in [
         ("shard 1", &shard1),
@@ -2237,6 +2288,28 @@ async fn each_shard_builds_its_slice_once() {
             ("shard 2", 1)
         ],
         "one run row per shard, from its first replica: a second replica's run would add one"
+    );
+    assert_eq!(
+        staged_here,
+        vec![("shard 1", 1), ("shard 1's second replica", 1)],
+        "both replicas of shard 1 carry the 60 s level's stage"
+    );
+    let (runs_on_builder, rows_on_second) = staged_runs.expect("the stage exists on both");
+    assert!(
+        runs_on_builder >= 1,
+        "the builder's stage holds its run row: {runs_on_builder}"
+    );
+    assert_eq!(
+        rows_on_second, 0,
+        "the second replica's stage holds nothing: the stage is filled where the level is inserted"
+    );
+    assert!(
+        !level_on_builder.is_empty(),
+        "the builder's 60 s level holds the run's data rows"
+    );
+    assert_eq!(
+        level_on_second, level_on_builder,
+        "the second replica's 60 s level holds the builder's data rows"
     );
 }
 

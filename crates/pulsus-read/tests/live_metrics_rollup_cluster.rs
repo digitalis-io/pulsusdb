@@ -243,6 +243,16 @@ async fn fixture(db: String, metrics: &[(&str, u32)], sharded: bool) -> Fixture 
             exec(node, &format!("TRUNCATE TABLE {db}.metric_samples_{r}s")).await;
         }
     }
+    // Issue #800: a stage is local to its node, so each node's is emptied.
+    for node in [&shard1, &shard2, &shard1b] {
+        for r in &ctx.rollup_levels {
+            exec(
+                node,
+                &format!("TRUNCATE TABLE IF EXISTS {db}.metric_samples_{r}s_stage"),
+            )
+            .await;
+        }
+    }
 
     let mid = (chrono::Utc::now().timestamp_millis() / HOUR) * HOUR - HOUR;
     let lo = mid - 2 * HOUR;
@@ -348,6 +358,16 @@ async fn a_run_row_is_read_with_its_data() {
     for node in [&shard1, &shard2] {
         for r in &ctx.rollup_levels {
             exec(node, &format!("TRUNCATE TABLE {db}.metric_samples_{r}s")).await;
+        }
+    }
+    // Issue #800: a stage is local to its node, so each node's is emptied.
+    for node in [&shard1, &shard2, &shard1b] {
+        for r in &ctx.rollup_levels {
+            exec(
+                node,
+                &format!("TRUNCATE TABLE IF EXISTS {db}.metric_samples_{r}s_stage"),
+            )
+            .await;
         }
     }
 

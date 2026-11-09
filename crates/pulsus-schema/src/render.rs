@@ -993,6 +993,39 @@ mod tests {
         assert!(out.contains("N metric_samples_720s\ntail\n"), "{out}");
     }
 
+    /// Issue #800: `{{stage}}` names the level below's stage for a later
+    /// level shorter than a day, and the level below itself for the day
+    /// level, which reads its source's day partition.
+    #[test]
+    fn the_stage_token_names_the_stage_or_the_level() {
+        const BLOCK: &str = "head\n--@level-next S {{source}} {{stage}}\ntail\n";
+        assert_eq!(
+            expand_levels(BLOCK, (&[5, 60], &[60, 3600], 5, &[], &[])),
+            "head\nS metric_samples_5s metric_samples_5s_stage\ntail\n"
+        );
+        assert_eq!(
+            expand_levels(BLOCK, (&[720, 86400], &[86400, 7776000], 5, &[], &[])),
+            "head\nS metric_samples_720s metric_samples_720s\ntail\n"
+        );
+        assert_eq!(
+            expand_levels(
+                BLOCK,
+                (
+                    &[60, 720, 7200, 86400],
+                    &[60, 86400, 604800, 7776000],
+                    5,
+                    &[],
+                    &[]
+                )
+            ),
+            "head\n\
+             S metric_samples_60s metric_samples_60s_stage\n\
+             S metric_samples_720s metric_samples_720s_stage\n\
+             S metric_samples_7200s metric_samples_7200s\n\
+             tail\n"
+        );
+    }
+
     /// Issue #18: the lists `parse_rollup_levels` refuses, each with the
     /// message of the first rule it breaks, and the lists it accepts.
     #[test]
