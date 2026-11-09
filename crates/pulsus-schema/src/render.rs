@@ -615,7 +615,8 @@ enum LevelLine {
     /// `--@level-next `: every later level, built from the level below.
     Next,
     /// `--@level-feeds `: every level whose next level is shorter than a
-    /// day; a day-long run reads its source's day partition.
+    /// day: its stage and the view that fills it; a day-long run reads its
+    /// source's day partition.
     Feeds,
     /// `--@level-cold `: every level that moves to the cold volume (issue #743 part B).
     Cold,
@@ -654,7 +655,9 @@ fn timer_unit(v: u32) -> String {
 /// and at the end, they are emitted for each level that keeps them, with
 /// the marker and its one space removed and the level tokens replaced:
 /// `{{level}}` (`<R>s`), `{{level_ms}}` (`<R>000`), `{{source}}` (the level
-/// below's table), `{{parent_ms}}` (the next level's milliseconds),
+/// below's table), `{{stage}}` (the level below's stage, or the level below
+/// itself when it has none: the day level), `{{parent_ms}}` (the next
+/// level's milliseconds),
 /// `{{period_ms}}` (the first level's period, `max(R_1, 60)`, in
 /// milliseconds), `{{timer}}`, `{{level_retention_days}}` (the level's
 /// retention, or `{{retention_days}}` when the list is empty, which
@@ -717,6 +720,13 @@ fn emit_levels(out: &mut String, block: &[(LevelLine, &str)], set: LevelSet<'_>)
             0 => String::new(),
             _ => format!("metric_samples_{}s", levels[i - 1]),
         };
+        // Issue #800: a later level shorter than a day reads the level
+        // below's stage; the day level reads the level below itself.
+        let stage = match i {
+            0 => String::new(),
+            _ if r < 86_400 => format!("metric_samples_{}s_stage", levels[i - 1]),
+            _ => source.clone(),
+        };
         let parent_ms = levels
             .get(i + 1)
             .map(|next| format!("{next}000"))
@@ -754,6 +764,7 @@ fn emit_levels(out: &mut String, block: &[(LevelLine, &str)], set: LevelSet<'_>)
                 .replace("{{level}}", &level)
                 .replace("{{level_ms}}", &level_ms)
                 .replace("{{source}}", &source)
+                .replace("{{stage}}", &stage)
                 .replace("{{parent_ms}}", &parent_ms)
                 .replace("{{period_ms}}", &period_ms)
                 .replace("{{from_ms}}", &from_ms)
