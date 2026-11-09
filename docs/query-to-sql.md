@@ -258,7 +258,7 @@ ClickHouse streams the rows and sorts nothing (`sql.rs:1317-1322`).
 `metric_range` renders `intDiv(bucket_ns, <step>) * <step> AS step` over a rollup table, a floor
 grid; no read path calls it, and the old `RouteChoice::Rollup` arm (`plan.rs:3255`) is unreachable.
 A range query that is **not** a clean bucketed chain is put on the client-aggregated path by
-`let client = if … || is_range` (`plan.rs:2428`), unchanged. A clean one is routed by the rollup arm
+`let client = if … || is_range` (`crates/pulsus-read/src/logql/plan.rs:2890`), unchanged. A clean one is routed by the rollup arm
 (`plan.rs:3192`), which chooses `RouteChoice::Rollup` only when `rollup::rollup_route` admits it and
 renders `metric_range_rollup`; otherwise by the `else if bucketed_range` arm (`plan.rs:3204`), which
 chooses `RouteChoice::Raw` and renders `metric_range_bucketed` or `metric_range_sliding`. The reduced

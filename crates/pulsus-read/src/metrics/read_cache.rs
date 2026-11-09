@@ -18,7 +18,10 @@
 //!
 //! **Memory.** Every retained allocation is charged by capacity
 //! ([`charge`]); past the budget the least recently used entries go, a
-//! tenant past its share losing its own first.
+//! tenant past its share losing its own first. A float answer's points are
+//! one allocation, so with the allocator's mapping threshold fixed
+//! (`pulsus_server::allocator`) an evicted answer's memory goes back to the
+//! system.
 //!
 //! A plain in-memory, byte-weighted LRU: no new crate, nothing on disk,
 //! nothing shared between nodes.
@@ -319,6 +322,8 @@ impl Store {
 }
 
 type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
+#[cfg(test)]
+type Hook = Box<dyn Fn(&ReadCache) + Send + Sync>;
 
 /// The per-process read cache.
 pub struct ReadCache {
@@ -331,7 +336,7 @@ pub struct ReadCache {
     /// TEST SEAM: run between a hit's merge and its store or final
     /// generation read.
     #[cfg(test)]
-    after_merge: Option<Box<dyn Fn(&ReadCache) + Send + Sync>>,
+    after_merge: Option<Hook>,
 }
 
 fn wall_clock_ms() -> i64 {
@@ -411,53 +416,95 @@ impl ReadCache {
         Some(entry)
     }
 
-    /// Stores `entry` under `key` unless a clear moved the generation past
-    /// `generation`. `false` when nothing was stored.
-    pub fn store(&self, key: CacheKey, entry: Entry, generation: u64) -> StoreOutcome {
-        if self.store_bool(key, entry, generation) {
-            StoreOutcome::Published { through: None }
-        } else {
-            StoreOutcome::NotPublished { through: None }
-        }
-    }
-
-    fn store_bool(&self, key: CacheKey, mut entry: Entry, generation: u64) -> bool {
-        let mut store = lock(&self.store);
-        if self.generation() != generation {
-            return false;
-        }
-        let share = self.config.budget_bytes * u64::from(self.config.tenant_share_pct) / 100;
+    /// Stores `entry` under `key`, deciding in one hold of the store's lock
+    /// (addendum 5 §2.3), in this order:
+    ///
+    /// 1. a clear moved the generation past `generation`: [`StoreOutcome::Stale`];
+    /// 2. the entry's charge is above the tenant share or the budget: counted
+    ///    as an eviction, and whatever is stored under `key` stays;
+    /// 3. least recently used entries other than `key`'s are evicted, a
+    ///    tenant past its share losing its own first, until the stored total
+    ///    with the entry fits the budget; then `key`'s own if still needed;
+    /// 4. the entry replaces whatever is stored under `key`.
+    ///
+    /// `through` is the `c1` of the entry stored under `key` when the lock is
+    /// released. The entry is built and charged before the lock. Inside it
+    /// the step allocates only for its own bookkeeping, the map and LRU
+    /// order growing and copies of the key; an allocation failure there
+    /// aborts the process, as anywhere in it, and nothing in the step
+    /// panics, so no hold ends with the store half changed.
+    pub fn store(&self, key: CacheKey, mut entry: Entry, generation: u64) -> StoreOutcome {
         entry.bytes = charge(&key, &entry);
-        store.remove(&key);
-        if entry.bytes > share {
-            self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
-            return false;
+        let entry = Arc::new(entry);
+        let mut store = lock(&self.store);
+        let store = &mut *store;
+        if self.generation() != generation {
+            return StoreOutcome::Stale;
         }
+        let budget = self.config.budget_bytes;
+        let share = budget * u64::from(self.config.tenant_share_pct) / 100;
+        let stored_through = |store: &Store| store.map.get(&key).map(|(e, _)| e.c1_ms);
+        if entry.bytes > share || entry.bytes > budget {
+            self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
+            return StoreOutcome::NotPublished {
+                through: stored_through(store),
+            };
+        }
+        // What `key`'s tenant would hold with the entry in place of `key`'s.
+        let tenant_with_entry = |store: &Store| {
+            let own = store.map.get(&key).map_or(0, |(e, _)| e.bytes);
+            store
+                .per_tenant
+                .get(&key.tenant)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(own)
+                + entry.bytes
+        };
+        while store.total + entry.bytes > budget {
+            let held = |store: &Store, t: &Tenant| {
+                if *t == key.tenant {
+                    tenant_with_entry(store)
+                } else {
+                    store.per_tenant.get(t).copied().unwrap_or(0)
+                }
+            };
+            let over = store
+                .lru
+                .values()
+                .find(|k| **k != key && held(store, &k.tenant) > share)
+                .cloned();
+            let victim = over
+                .or_else(|| store.lru.values().find(|k| **k != key).cloned())
+                .or_else(|| store.map.contains_key(&key).then(|| key.clone()));
+            let Some(victim) = victim else {
+                break;
+            };
+            store.remove(&victim);
+            self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        if store.total + entry.bytes > budget {
+            return StoreOutcome::NotPublished {
+                through: stored_through(store),
+            };
+        }
+        store.remove(&key);
+        let through = entry.c1_ms;
         store.tick += 1;
         let tick = store.tick;
         store.total += entry.bytes;
         *store.per_tenant.entry(key.tenant.clone()).or_insert(0) += entry.bytes;
         store.lru.insert(tick, key.clone());
-        store.map.insert(key.clone(), (Arc::new(entry), tick));
-        while store.total > self.config.budget_bytes {
-            // A tenant past its share loses its own least recently used
-            // entries first; otherwise the least recently used goes.
-            let over: Option<CacheKey> = store
-                .lru
-                .values()
-                .find(|k| store.per_tenant.get(&k.tenant).copied().unwrap_or(0) > share)
-                .cloned();
-            let victim = match over {
-                Some(k) => k,
-                None => match store.lru.values().next() {
-                    Some(k) => k.clone(),
-                    None => break,
-                },
-            };
-            store.remove(&victim);
-            self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
+        store.map.insert(key, (entry, tick));
+        StoreOutcome::Published {
+            through: Some(through),
         }
-        store.map.contains_key(&key)
+    }
+
+    /// The `c1` of the entry stored under `key`, without making it recently
+    /// used.
+    pub fn kept_through(&self, key: &CacheKey) -> Option<i64> {
+        lock(&self.store).map.get(key).map(|(e, _)| e.c1_ms)
     }
 
     /// The charged bytes and entry count.
@@ -656,8 +703,18 @@ pub fn rendered_annotations(annotations: &Annotations, query: &str) -> Vec<Strin
         .collect()
 }
 
+/// The indices of `points` with a timestamp in `[start, c1]`; the points
+/// are in time order, as an evaluation returns them.
+fn kept_range<P>(points: &[(i64, P)], start_ms: i64, c1_ms: i64) -> Range<usize> {
+    let lo = points.partition_point(|(t, _)| *t < start_ms);
+    let hi = points.partition_point(|(t, _)| *t <= c1_ms).max(lo);
+    lo..hi
+}
+
 /// The points of `result` in `[start, c1]`, as an entry; `None` when the
-/// result is not a matrix.
+/// result is not a matrix. A float answer's points go in one allocation
+/// every series holds a range of; an answer with a histogram point in that
+/// range keeps each series' points in a vector of its own, at its length.
 fn keep(
     result: &QueryResult,
     start_ms: i64,
@@ -666,50 +723,48 @@ fn keep(
     first_fill_ms: i64,
     charge_bound: u64,
 ) -> Option<Entry> {
-    let in_range = |t: i64| t >= start_ms && t <= c1_ms;
-    let series: Vec<(Vec<(String, String)>, Points)> = match result {
-        QueryResult::Matrix(items) => items
-            .iter()
-            .map(|s| {
-                (
-                    s.labels.clone(),
-                    Points::Float(
-                        s.points
-                            .iter()
-                            .copied()
-                            .filter(|(t, _)| in_range(*t))
-                            .collect(),
-                    ),
+    let series = match result {
+        QueryResult::Matrix(items) => {
+            let parts: Vec<(&MatrixSeries, &[(i64, f64)])> = items
+                .iter()
+                .map(|s| (s, &s.points[kept_range(&s.points, start_ms, c1_ms)]))
+                .filter(|(_, kept)| !kept.is_empty())
+                .collect();
+            flat_series(parts.iter().map(|(s, kept)| (&s.labels, *kept)), |p| *p)
+        }
+        QueryResult::MatrixHist(items) => {
+            let parts: Vec<(&HistMatrixSeries, &[(i64, HistOrFloat)])> = items
+                .iter()
+                .map(|s| (s, &s.points[kept_range(&s.points, start_ms, c1_ms)]))
+                .filter(|(_, kept)| !kept.is_empty())
+                .collect();
+            let any_hist = parts
+                .iter()
+                .any(|(_, kept)| kept.iter().any(|(_, x)| matches!(x, HistOrFloat::Hist(_))));
+            if any_hist {
+                parts
+                    .iter()
+                    .map(|(s, kept)| {
+                        let mut v = Vec::with_capacity(kept.len());
+                        v.extend(kept.iter().cloned());
+                        (s.labels.clone(), Points::Mixed(v))
+                    })
+                    .collect()
+            } else {
+                flat_series(
+                    parts.iter().map(|(s, kept)| (&s.labels, *kept)),
+                    |(t, x)| match x {
+                        HistOrFloat::Float(f) => (*t, *f),
+                        HistOrFloat::Hist(_) => unreachable!("no histogram point"),
+                    },
                 )
-            })
-            .collect(),
-        QueryResult::MatrixHist(items) => items
-            .iter()
-            .map(|s| {
-                (
-                    s.labels.clone(),
-                    Points::Mixed(
-                        s.points
-                            .iter()
-                            .filter(|(t, _)| in_range(*t))
-                            .cloned()
-                            .collect(),
-                    ),
-                )
-            })
-            .collect(),
+            }
+        }
         _ => return None,
     };
     let mut entry = Entry {
         annotations,
-        series: series
-            .into_iter()
-            .filter(|(_, p)| match p {
-                Points::Float(v) => !v.is_empty(),
-                Points::Mixed(v) => !v.is_empty(),
-                Points::Flat(_, r) => !r.is_empty(),
-            })
-            .collect(),
+        series,
         c0_ms: start_ms,
         c1_ms,
         first_fill_ms,
@@ -718,6 +773,27 @@ fn keep(
     };
     shrink_entry(&mut entry);
     Some(entry)
+}
+
+/// Every series' kept float points in one allocation, each series holding
+/// its range of it.
+fn flat_series<'a, P: 'a>(
+    parts: impl Iterator<Item = (&'a Vec<(String, String)>, &'a [P])> + Clone,
+    point: impl Fn(&P) -> (i64, f64),
+) -> Vec<(Vec<(String, String)>, Points)> {
+    let total: usize = parts.clone().map(|(_, kept)| kept.len()).sum();
+    let mut all: Vec<(i64, f64)> = Vec::with_capacity(total);
+    let mut ranges = Vec::new();
+    for (labels, kept) in parts {
+        let from = all.len();
+        all.extend(kept.iter().map(&point));
+        ranges.push((labels.clone(), from..all.len()));
+    }
+    let all: Arc<[(i64, f64)]> = Arc::from(all);
+    ranges
+        .into_iter()
+        .map(|(labels, r)| (labels, Points::Flat(Arc::clone(&all), r)))
+        .collect()
 }
 
 /// `shrink_to_fit` on every vector and string an entry keeps.
@@ -757,6 +833,9 @@ pub fn charge(key: &CacheKey, entry: &Entry) -> u64 {
             .sum::<usize>();
         bytes += match points {
             Points::Float(v) => v.capacity() * size_of::<(i64, f64)>(),
+            // The one allocation every series shares, and its `Arc` counts,
+            // counted on the series whose range starts it.
+            Points::Flat(all, r) if r.start == 0 => all.len() * size_of::<(i64, f64)>() + 16,
             Points::Flat(..) => 0,
             Points::Mixed(v) => {
                 v.capacity() * size_of::<(i64, HistOrFloat)>()
@@ -782,100 +861,195 @@ fn histogram_bytes(h: &FloatHistogram) -> usize {
         + h.custom_values.capacity() * size_of::<f64>()
 }
 
-/// One series' points, as the merge builds them.
-type MergedSeriesPoints = Vec<(i64, HistOrFloat)>;
-/// One series' labels and its points.
-type MergedSeries = (Vec<(String, String)>, MergedSeriesPoints);
+/// A tail series' points.
+enum TailPoints {
+    Float(Vec<(i64, f64)>),
+    Mixed(Vec<(i64, HistOrFloat)>),
+}
+
+/// One series' kept points as the merge reads them.
+enum KeptPoints<'a> {
+    Float(&'a [(i64, f64)]),
+    Mixed(&'a [(i64, HistOrFloat)]),
+}
+
+fn kept_points(p: &Points) -> KeptPoints<'_> {
+    match p {
+        Points::Float(v) => KeptPoints::Float(v),
+        Points::Flat(all, r) => KeptPoints::Float(&all[r.clone()]),
+        Points::Mixed(v) => KeptPoints::Mixed(v),
+    }
+}
 
 /// The kept points in `[start, c1]`, then the tail's (§5.3). A series with
 /// no point in `[start, end]` is dropped; the answer is `MatrixHist` when a
-/// histogram point remains. `None` when the tail is not a matrix.
+/// histogram point remains. `None` when the tail is not a matrix. Each
+/// output series is built once, at its length, and its labels cloned once.
 pub fn merge(entry: &Entry, tail: QueryResult, start_ms: i64, end_ms: i64) -> Option<QueryResult> {
-    let mut order: Vec<Vec<(String, String)>> = Vec::new();
-    let mut points: HashMap<Vec<(String, String)>, MergedSeriesPoints> = HashMap::new();
-    let mut push = |labels: &Vec<(String, String)>, t: i64, v: HistOrFloat| {
-        if t < start_ms || t > end_ms {
-            return;
-        }
-        if !points.contains_key(labels) {
-            order.push(labels.clone());
-        }
-        points.entry(labels.clone()).or_default().push((t, v));
-    };
-    for (labels, kept) in &entry.series {
-        match kept {
-            Points::Float(v) => {
-                for (t, x) in v.iter().filter(|(t, _)| *t <= entry.c1_ms) {
-                    push(labels, *t, HistOrFloat::Float(*x));
-                }
-            }
-            Points::Flat(all, r) => {
-                for (t, x) in all[r.clone()].iter().filter(|(t, _)| *t <= entry.c1_ms) {
-                    push(labels, *t, HistOrFloat::Float(*x));
-                }
-            }
-            Points::Mixed(v) => {
-                for (t, x) in v.iter().filter(|(t, _)| *t <= entry.c1_ms) {
-                    push(labels, *t, x.clone());
-                }
-            }
-        }
-    }
-    match tail {
-        QueryResult::Matrix(items) => {
-            for s in items {
-                for (t, x) in s.points {
-                    if t > entry.c1_ms {
-                        push(&s.labels, t, HistOrFloat::Float(x));
-                    }
-                }
-            }
-        }
-        QueryResult::MatrixHist(items) => {
-            for s in items {
-                for (t, x) in s.points {
-                    if t > entry.c1_ms {
-                        push(&s.labels, t, x);
-                    }
-                }
-            }
-        }
+    let c1 = entry.c1_ms;
+    let kept_in = |t: i64| t >= start_ms && t <= end_ms && t <= c1;
+    let tail_in = |t: i64| t >= start_ms && t <= end_ms && t > c1;
+    let mut tails: Vec<(Vec<(String, String)>, TailPoints)> = match tail {
+        QueryResult::Matrix(items) => items
+            .into_iter()
+            .map(|s| (s.labels, TailPoints::Float(s.points)))
+            .collect(),
+        QueryResult::MatrixHist(items) => items
+            .into_iter()
+            .map(|s| (s.labels, TailPoints::Mixed(s.points)))
+            .collect(),
         _ => return None,
-    }
-    let any_hist = points
-        .values()
-        .any(|v| v.iter().any(|(_, x)| matches!(x, HistOrFloat::Hist(_))));
-    let series: Vec<MergedSeries> = order
-        .into_iter()
-        .filter_map(|labels| {
-            let pts = points.remove(&labels)?;
-            Some((labels, pts))
-        })
+    };
+    let kept: Vec<(&Vec<(String, String)>, KeptPoints<'_>)> = entry
+        .series
+        .iter()
+        .map(|(labels, p)| (labels, kept_points(p)))
         .collect();
-    Some(if any_hist {
-        QueryResult::MatrixHist(
-            series
-                .into_iter()
-                .map(|(labels, points)| HistMatrixSeries { labels, points })
-                .collect(),
-        )
-    } else {
-        QueryResult::Matrix(
-            series
-                .into_iter()
-                .map(|(labels, points)| MatrixSeries {
-                    labels,
-                    points: points
-                        .into_iter()
-                        .map(|(t, x)| match x {
-                            HistOrFloat::Float(f) => (t, f),
-                            HistOrFloat::Hist(_) => unreachable!("no histogram point"),
-                        })
-                        .collect(),
-                })
-                .collect(),
-        )
-    })
+    let kept_count = |k: &KeptPoints<'_>| match k {
+        KeptPoints::Float(v) => v.iter().filter(|(t, _)| kept_in(*t)).count(),
+        KeptPoints::Mixed(v) => v.iter().filter(|(t, _)| kept_in(*t)).count(),
+    };
+    let tail_count = |p: &TailPoints| match p {
+        TailPoints::Float(v) => v.iter().filter(|(t, _)| tail_in(*t)).count(),
+        TailPoints::Mixed(v) => v.iter().filter(|(t, _)| tail_in(*t)).count(),
+    };
+    let any_hist = kept.iter().any(|(_, k)| match k {
+        KeptPoints::Mixed(v) => v
+            .iter()
+            .any(|(t, x)| kept_in(*t) && matches!(x, HistOrFloat::Hist(_))),
+        KeptPoints::Float(_) => false,
+    }) || tails.iter().any(|(_, p)| match p {
+        TailPoints::Mixed(v) => v
+            .iter()
+            .any(|(t, x)| tail_in(*t) && matches!(x, HistOrFloat::Hist(_))),
+        TailPoints::Float(_) => false,
+    });
+    // The tail series each kept series continues. A kept series with no
+    // point in range leaves its tail to be placed in the tail's order.
+    let mut used = vec![false; tails.len()];
+    let pairs: Vec<(usize, Option<usize>)> = {
+        let index: HashMap<&Vec<(String, String)>, usize> = tails
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, (labels, _))| (labels, i))
+            .collect();
+        kept.iter()
+            .enumerate()
+            .filter(|(_, (_, k))| kept_count(k) > 0)
+            .map(|(i, (labels, _))| {
+                let ti = index.get(*labels).copied().filter(|ti| !used[*ti]);
+                if let Some(ti) = ti {
+                    used[ti] = true;
+                }
+                (i, ti)
+            })
+            .collect()
+    };
+    let mut out = Output::new(any_hist, pairs.len() + used.iter().filter(|u| !**u).count());
+    for (i, ti) in pairs {
+        let (labels, k) = &kept[i];
+        let n = kept_count(k) + ti.map_or(0, |ti| tail_count(&tails[ti].1));
+        let mut series = out.series(n);
+        match k {
+            KeptPoints::Float(v) => series.floats(v.iter().filter(|(t, _)| kept_in(*t)).copied()),
+            KeptPoints::Mixed(v) => series.mixed(v.iter().filter(|(t, _)| kept_in(*t)).cloned()),
+        }
+        if let Some(ti) = ti {
+            series.tail(
+                std::mem::replace(&mut tails[ti].1, TailPoints::Float(Vec::new())),
+                tail_in,
+            );
+        }
+        out.push((*labels).clone(), series);
+    }
+    for (ti, (labels, points)) in tails.into_iter().enumerate() {
+        if used[ti] {
+            continue;
+        }
+        let n = tail_count(&points);
+        if n == 0 {
+            continue;
+        }
+        let mut series = out.series(n);
+        series.tail(points, tail_in);
+        out.push(labels, series);
+    }
+    Some(out.finish())
+}
+
+/// The merge's answer, float or histogram, built series by series.
+enum Output {
+    Float(Vec<MatrixSeries>),
+    Mixed(Vec<HistMatrixSeries>),
+}
+
+/// One output series' points, at the capacity it was counted to need.
+enum OutSeries {
+    Float(Vec<(i64, f64)>),
+    Mixed(Vec<(i64, HistOrFloat)>),
+}
+
+impl Output {
+    fn new(any_hist: bool, series: usize) -> Self {
+        if any_hist {
+            Output::Mixed(Vec::with_capacity(series))
+        } else {
+            Output::Float(Vec::with_capacity(series))
+        }
+    }
+
+    fn series(&self, n: usize) -> OutSeries {
+        match self {
+            Output::Float(_) => OutSeries::Float(Vec::with_capacity(n)),
+            Output::Mixed(_) => OutSeries::Mixed(Vec::with_capacity(n)),
+        }
+    }
+
+    fn push(&mut self, labels: Vec<(String, String)>, series: OutSeries) {
+        match (self, series) {
+            (Output::Float(out), OutSeries::Float(points)) => {
+                out.push(MatrixSeries { labels, points })
+            }
+            (Output::Mixed(out), OutSeries::Mixed(points)) => {
+                out.push(HistMatrixSeries { labels, points })
+            }
+            _ => unreachable!("a series is built for its answer"),
+        }
+    }
+
+    fn finish(self) -> QueryResult {
+        match self {
+            Output::Float(s) => QueryResult::Matrix(s),
+            Output::Mixed(s) => QueryResult::MatrixHist(s),
+        }
+    }
+}
+
+impl OutSeries {
+    fn floats(&mut self, points: impl Iterator<Item = (i64, f64)>) {
+        match self {
+            OutSeries::Float(v) => v.extend(points),
+            OutSeries::Mixed(v) => v.extend(points.map(|(t, f)| (t, HistOrFloat::Float(f)))),
+        }
+    }
+
+    fn mixed(&mut self, points: impl Iterator<Item = (i64, HistOrFloat)>) {
+        match self {
+            OutSeries::Float(v) => v.extend(points.map(|(t, x)| match x {
+                HistOrFloat::Float(f) => (t, f),
+                HistOrFloat::Hist(_) => unreachable!("no histogram point"),
+            })),
+            OutSeries::Mixed(v) => v.extend(points),
+        }
+    }
+
+    fn tail(&mut self, points: TailPoints, tail_in: impl Fn(i64) -> bool) {
+        match points {
+            TailPoints::Float(v) => self.floats(v.into_iter().filter(|(t, _)| tail_in(*t))),
+            TailPoints::Mixed(v) => self.mixed(v.into_iter().filter(|(t, _)| tail_in(*t))),
+        }
+    }
 }
 
 // -- the plan-shape gate (§5.9) ---------------------------------------------
@@ -989,6 +1163,9 @@ where
     TF: Future<Output = Result<Evaluated, E>>,
 {
     let g0 = cache.generation();
+    // The generation the miss path stores under: `g0`, or the one read
+    // after a hit found a clear had run.
+    let mut g = g0;
     let p = req.params;
     let refuse = |reason: BypassReason| {
         cache.count(Header::Bypass, Some(reason));
@@ -1042,10 +1219,8 @@ where
             if let Some(hook) = &cache.after_merge {
                 hook(cache);
             }
-            let mut kept_through = Some(e.c1_ms);
-            if cache.fills_allowed(v)
+            let stored = if cache.fills_allowed(v)
                 && cache.identity_fresh()
-                && cache.generation() == g0
                 && let Some(c1) = through(&answer)
                 && let Some(entry) = keep(
                     &answer,
@@ -1054,22 +1229,32 @@ where
                     e.annotations.clone(),
                     e.first_fill_ms,
                     bound,
-                )
-                && matches!(
-                    cache.store(req.key.clone(), entry, g0),
-                    StoreOutcome::Published { .. }
-                )
-            {
-                kept_through = Some(c1);
+                ) {
+                Some(cache.store(req.key.clone(), entry, g0))
+            } else {
+                None
+            };
+            let through_ms = match stored {
+                Some(StoreOutcome::Published { through })
+                | Some(StoreOutcome::NotPublished { through }) => Some(through),
+                // A clear after the lookup: the merge is discarded.
+                Some(StoreOutcome::Stale) => None,
+                // Nothing stored: the kept points served only while no
+                // clear has run since the lookup.
+                None if cache.generation() == g0 => Some(cache.kept_through(&req.key)),
+                None => None,
+            };
+            if let Some(through_ms) = through_ms {
+                cache.count(Header::Hit, None);
+                return Ok(Answer {
+                    result: answer,
+                    annotations: tail_ann,
+                    outcome: Outcome::Hit,
+                    header: Header::Hit,
+                    through_ms,
+                });
             }
-            cache.count(Header::Hit, None);
-            return Ok(Answer {
-                result: answer,
-                annotations: tail_ann,
-                outcome: Outcome::Hit,
-                header: Header::Hit,
-                through_ms: kept_through,
-            });
+            g = cache.generation();
         }
     }
 
@@ -1078,7 +1263,6 @@ where
     if !annotations.has_mergeable()
         && cache.fills_allowed(v)
         && cache.identity_fresh()
-        && cache.generation() == g0
         && let Some(c1) = through(&result)
         && let Some(entry) = keep(
             &result,
@@ -1088,12 +1272,9 @@ where
             now,
             charged,
         )
-        && matches!(
-            cache.store(req.key.clone(), entry, g0),
-            StoreOutcome::Published { .. }
-        )
+        && let StoreOutcome::Published { through } = cache.store(req.key.clone(), entry, g)
     {
-        stored_through = Some(c1);
+        stored_through = through;
     }
     let header = if stored_through.is_some() {
         cache.count(Header::Miss, None);

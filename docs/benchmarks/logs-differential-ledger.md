@@ -4266,7 +4266,7 @@ unexplained.
 
   **The escape is the PUSHDOWN, not the construct**, which the first
   version of this correction got wrong by writing "line filter" flat.
-  `VariantSpec::try_new` (`plan.rs:2684`) does compile the variant's
+  `VariantSpec::try_new` (`crates/pulsus-read/src/logql/plan.rs:3605`) does compile the variant's
   discarded prefix, but `compile_stage` returns `Ok(None)` for a pushable
   line filter (`pipeline.rs:1175-1180`) before it reaches `compile_regex_as_database` at
   `:1200`; a pushable filter's regex is validated on the SQL-rendering

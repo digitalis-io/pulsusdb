@@ -191,7 +191,7 @@ docs/benchmarks/logs-differential-ledger.md	context.go:84	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	crates/pulsus-read/src/logql/pipeline.rs:504	no_name_the_target_file_holds
 docs/benchmarks/logs-differential-ledger.md	crates/pulsus-schema/src/catalog.rs:224-238	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	crates/pulsus-server/src/logs_api/error.rs:160	no_name_the_target_file_holds
-docs/benchmarks/logs-differential-ledger.md	crates/pulsus-server/src/serve.rs:235	no_name_the_target_file_holds
+docs/benchmarks/logs-differential-ledger.md	crates/pulsus-server/src/serve.rs:241	no_name_the_target_file_holds
 docs/benchmarks/logs-differential-ledger.md	de.rs:1102	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	de.rs:1375	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	de.rs:63	pinned_to_another_version
@@ -690,6 +690,8 @@ docs/query-lowering.md	crates/pulsus-clickhouse/src/lib.rs:3	no_name_the_target_
 docs/query-lowering.md	crates/pulsus-config/src/model.rs:693	pinned_to_another_version
 docs/query-lowering.md	crates/pulsus-config/src/model.rs:698	pinned_to_another_version
 docs/query-lowering.md	crates/pulsus-read/src/canonical_labels.rs:131-163	no_name_the_target_file_holds
+docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:2791	no_name_the_target_file_holds
+docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:2824	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-read/src/logql/post_agg.rs:3307-3350	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-read/src/logql/predicate.rs:257	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-read/src/logql/predicate.rs:295	no_name_the_target_file_holds
@@ -960,7 +962,6 @@ docs/query-to-sql.md	plan.rs:1744	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1745	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1747	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1748	ambiguous_basename
-docs/query-to-sql.md	plan.rs:2428	ambiguous_basename
 docs/query-to-sql.md	plan.rs:2429	ambiguous_basename
 docs/query-to-sql.md	plan.rs:2832	ambiguous_basename
 docs/query-to-sql.md	plan.rs:2858	ambiguous_basename

@@ -17,18 +17,42 @@ pub const MMAP_THRESHOLD_BYTES: i32 = 65_536;
 pub const MMAP_MAX: i32 = 32_765;
 
 /// Applies the settings when the read cache's budget is above 0, as server
-/// startup does. `false` when the budget is 0 or a setting did not apply:
-/// the read cache is then not built, and requests are answered as with the
-/// cache off.
+/// startup does. `false` when the budget is 0 or a setting did not apply
+/// (logged at warn): the read cache is then not built, and requests are
+/// answered as with the cache off. With a C library other than glibc
+/// nothing is set.
 pub fn prepare_read_cache(budget_bytes: u64) -> bool {
     prepare_with(budget_bytes, set)
 }
 
 /// [`prepare_read_cache`] with the setter passed in, for its tests.
 #[doc(hidden)]
-pub fn prepare_with(budget_bytes: u64, set: impl FnMut(i32, i32) -> i32) -> bool {
-    let _ = set;
-    budget_bytes > 0
+pub fn prepare_with(budget_bytes: u64, mut set: impl FnMut(i32, i32) -> i32) -> bool {
+    if budget_bytes == 0 {
+        return false;
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    for (name, param, value) in [
+        (
+            "M_MMAP_THRESHOLD",
+            libc::M_MMAP_THRESHOLD,
+            MMAP_THRESHOLD_BYTES,
+        ),
+        ("M_MMAP_MAX", libc::M_MMAP_MAX, MMAP_MAX),
+    ] {
+        if set(param, value) == 0 {
+            tracing::warn!(
+                setting = name,
+                value,
+                "the allocator did not accept a setting the read cache needs; \
+                 the read cache is off"
+            );
+            return false;
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let _ = &mut set;
+    true
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]

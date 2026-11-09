@@ -596,13 +596,15 @@ fn spawn_reconnect_loop(
                         {
                             Ok(client) => {
                                 // Issue #778: the read cache and its 5 s
-                                // poll, when its budget is above 0.
-                                if config.reader.read_cache_bytes.0 > 0
-                                    && let Ok(poll_client) = ChClient::from_shared_pool(
-                                        Arc::clone(&pool),
-                                        config.query_timeout.0,
-                                    )
-                                    .with_consistency(consistency_from(&config))
+                                // poll, when its budget is above 0 and the
+                                // allocator took the settings it needs.
+                                if pulsus_server::allocator::prepare_read_cache(
+                                    config.reader.read_cache_bytes.0,
+                                ) && let Ok(poll_client) = ChClient::from_shared_pool(
+                                    Arc::clone(&pool),
+                                    config.query_timeout.0,
+                                )
+                                .with_consistency(consistency_from(&config))
                                 {
                                     use pulsus_read::metrics::read_cache;
                                     let cache = Arc::new(read_cache::ReadCache::new(

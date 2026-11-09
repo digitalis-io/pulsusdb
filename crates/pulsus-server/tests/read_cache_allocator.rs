@@ -14,7 +14,11 @@ fn u39_a_freed_block_over_the_fixed_threshold_leaves_the_process() {
         pulsus_server::allocator::prepare_read_cache(1 << 30),
         "the settings applied"
     );
-    let v = vec![7u8; 100 * 1024];
+    // glibc serves a request from the free space at the top of the heap
+    // when it fits, and maps it only when it does not; the first blocks use
+    // that space up, so the last is placed by the threshold alone.
+    let mut held: Vec<Vec<u8>> = (0..4).map(|_| vec![7u8; 100 * 1024]).collect();
+    let v = held.pop().expect("four blocks");
     let range = maps::range_of(&v);
     assert!(maps::covered(&range), "mapped while held");
     drop(v);
@@ -22,4 +26,5 @@ fn u39_a_freed_block_over_the_fixed_threshold_leaves_the_process() {
         !maps::covered(&range),
         "no mapping covers any byte of the freed block"
     );
+    drop(held);
 }

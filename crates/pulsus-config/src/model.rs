@@ -640,8 +640,8 @@ pub struct ReaderConfig {
     /// Issue #778: memory for the read cache of `/api/v1/query_range`
     /// answers, every allocation an answer keeps; `0` turns it off.
     pub read_cache_bytes: ByteSize,
-    /// Issue #778: the percent of `read_cache_bytes` one tenant's answers
-    /// may hold, `1..=100` (validated at startup).
+    /// Issue #778: the percent of `read_cache_bytes` past which a tenant's answers
+    /// are evicted first; an answer larger than it is not kept. `1..=100` (validated).
     pub read_cache_tenant_share: u8,
 }
 
