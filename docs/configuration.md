@@ -181,6 +181,8 @@ A trace request is also bounded **before** any of that, by a fixed ceiling on th
 | `PULSUS_TAIL_SEND_TIMEOUT` | `30s` | per-send deadline on a tail WebSocket write; a client that stops reading past it is disconnected |
 | `PULSUS_TAIL_MAX_FETCH_LIMIT` | `5000` | hard cap on one tail poll's fetched-row `LIMIT`; a client `limit` above it is silently clamped before the query is built. Accepted range `1..=5000000`: values above the ceiling are rejected at config load, since they would make the pre-query clamp inert. Scale tuning routes to #25 |
 | `PULSUS_TAIL_CATCHUP_SLICE` | `60s` | maximum time window one tail poll may scan/sort; backlog catch-up proceeds one slice per query, re-polling immediately until caught up (must be > 0) |
+| `PULSUS_READ_CACHE_BYTES` | `256MiB` | memory for the read cache of `/api/v1/query_range` answers ([api.md §3.2](api.md)), counted over every allocation an answer keeps; past it the least recently used answer is evicted. `0` turns the cache off. Reader and `all` roles; each process keeps its own. A sample sent more than 60 s after its own timestamp can be missing from the points an answer kept before it arrived until they are evaluated again, at most an hour after they were first kept (api.md §3.2) |
+| `PULSUS_READ_CACHE_TENANT_SHARE` | `50` | the most of `PULSUS_READ_CACHE_BYTES` one tenant's answers may hold, in percent, `1` to `100`; past it that tenant's least recently used answer is evicted first |
 
 ## 7. Retention (`schema/schema.sh`)
 
@@ -475,6 +477,8 @@ reader:
   tail_send_timeout: 30s
   tail_max_fetch_limit: 5000
   tail_catchup_slice: 60s
+  read_cache_bytes: 256MiB
+  read_cache_tenant_share: 50
 
 ruler:
   enabled: false

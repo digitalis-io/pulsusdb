@@ -12,6 +12,7 @@ is versioned independently — see `deploy/charts/pulsusdb/Chart.yaml` and
 
 ### Added
 
+- A per-process read cache of PromQL range answers (issue #778 part 1).
 - `service_name` discovery at log ingest, on both receivers (issue #379).
   A stream pushed without a `service_name` label now gains one, as Loki
   3.7.4 gives it one: on `/loki/api/v1/push` the first of thirteen
