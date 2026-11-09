@@ -2252,7 +2252,7 @@ FROM system.one
 HAVING hi > lo)
 ORDER BY conn_type = '', org_id, minute, client_minute, client, server, conn_type
 SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_rows_to_read = 60000000, read_overflow_mode = 'throw', max_execution_time = 50,
-         max_insert_threads = 1, max_insert_block_size = 100000000, min_insert_block_size_rows = 100000000, min_insert_block_size_bytes = 10000000000;"#;
+         max_insert_threads = 1, max_insert_block_size = 100000000, min_insert_block_size_rows = 100000000, min_insert_block_size_bytes = 10000000000, parallel_distributed_insert_select = 0;"#;
 
 /// The clustered view's first line (part C §3), in place of the
 /// single-node one: the replication log copied (for `spans`, or its
@@ -3458,14 +3458,14 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             vec![],
             vec!["--mode", "single"],
             single(),
-            "792b8bf20e338145e8cdf741c4d6e2688efe492b2333e0214c95d5dcce5b0d94",
+            "434f6ef1dfc933f746940bff84b1c311a2855333b38174f3cb93d7d5c220f3c4",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "353f0982d8100bca22375357c2e564d7898819b4af4adcde52580e4275ff1cd9",
+            "e52d07ebd5b4b768cde2b665476ad6946e25d0c4185f30b443b765fd33e8b0b9",
         ),
         (
             "clustered with a storage policy",
@@ -3475,7 +3475,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "c87335332c29e27d00784aff7d2c66fe36366a37811fcc0dfb170c7b1a8f09e8",
+            "cd26e9e044f1f4aa0e82b93110629318a47f0e8da6b912e47f14375582c8ba33",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {

@@ -3,8 +3,10 @@
 //! or `-keeper` followed by `:` or `@` — is the supported floor,
 //! 26.8.21.10, by tag or by its registry digest. A record of an earlier
 //! measurement names its server in prose ("server 24.8"), never as a
-//! reference. The one exception is the CI leg that proves an older server is
-//! refused, which must be there exactly once.
+//! reference. There are two exceptions. The first is the CI leg that proves
+//! an older server is refused, which must be there exactly once. The second
+//! is the override that runs the cluster fixture's three servers on
+//! 26.10.2.103 (issue #798).
 
 // The image names are written without a tag here, so that this file, which
 // the test reads like any other, holds no pullable reference of its own.
@@ -17,6 +19,13 @@ const KEEPER_DIGEST: &str =
     "sha256:112ce72cf0ad4c48b5884159d40c4821914c06e3df3e73da61a5b69398960c63";
 /// The CI leg that proves an older server is refused: its file and tag.
 const REFUSAL_LEG: (&str, &str) = (".github/workflows/ci.yml", "24.8");
+/// The newer server the clustered trace suite also runs on (issue #798):
+/// its file, its registry digest, and how many times the file names it.
+const NEWER: (&str, &str, usize) = (
+    "ci/clickhouse-cluster/compose.26.10.yaml",
+    "sha256:b2bfa4d8399ee9973868cc5c1754cb506a6f4b86fbddc41010cc090beb55c85e",
+    3,
+);
 
 fn floor(reference: &str) -> bool {
     reference == format!("{SERVER}:{FLOOR_TAG}")
@@ -36,6 +45,7 @@ fn every_server_image_pin_is_the_floor() {
         .expect("git ls-files");
     let files = String::from_utf8(out.stdout).expect("utf-8");
     let mut refusal = 0usize;
+    let mut newer = 0usize;
     let mut pins = 0usize;
     let mut wrong: Vec<String> = Vec::new();
     for file in files.lines() {
@@ -61,6 +71,10 @@ fn every_server_image_pin_is_the_floor() {
                 if floor(reference) {
                     continue;
                 }
+                if file == NEWER.0 && reference == format!("{SERVER}@{}", NEWER.1) {
+                    newer += 1;
+                    continue;
+                }
                 if file == REFUSAL_LEG.0 && reference == format!("{SERVER}:{}", REFUSAL_LEG.1) {
                     refusal += 1;
                 } else {
@@ -71,6 +85,12 @@ fn every_server_image_pin_is_the_floor() {
     }
     if refusal != 1 {
         wrong.push(format!("the refusal leg found {refusal} times, want 1"));
+    }
+    if newer != NEWER.2 {
+        wrong.push(format!(
+            "the {} pin found {newer} times, want {}",
+            NEWER.0, NEWER.2
+        ));
     }
     // A floor on the finder, not on the tree: it proves the scan matches
     // the references it exists for, and sits below the tree's count so that
