@@ -37,7 +37,7 @@ The user's account is `docs/api.md` §3.6 and the setting's is `docs/configurati
 | D15 | At a level under 720 s, a `rate` or `increase` window that reaches into time no level covers is computed wholly from raw | — | `reading.md` §1 |
 | D16 | A level whose next level is shorter than a day carries a stage that the next level's run reads where it covers, the level itself elsewhere; it expires by staging time | — | `building.md` §2.2, §3.1 |
 | D17 | The query ranges at which the resolution switches to each level, and the counter bucket count, are set when the schema is built and stored in each level table's comment, where the server reads them | owner (2026-10-26) | `building.md` §1, `reading.md` §2 |
-| D18 | A level's `sum` and `inc` may differ in their last bits from build to build; every other column is fixed by the source rows | owner (2026-11-09) | `building.md` §3.2 |
+| D18 | A level's `sum` and `inc` may differ from build to build by whatever the order of addition produces, as today's builds do; on terms that cancel the difference can be large relative to a small result. Every other column is fixed by the source rows | owner (2026-11-09) | `building.md` §3.2 |
 
 **How the engine is meant to be used, and what differs.** The engine's ordinary rollup is an insert-time materialized view into an aggregating table, as `log_metrics_<res>` is built (`schema/schema.sql:583`, `log_metrics_{{log_rollup_suffix}}_mv`). The levels use refreshable views on timers instead, as `service_edges_mv` is built (`schema/schema.sql:828`). That follows the owner's decision on timers. What it costs, and how the cost is kept down, is `building.md` §3.4 and §5.
 
