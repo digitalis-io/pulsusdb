@@ -548,4 +548,4 @@ service:
 
 Query via the PulsusDB API (`/api/logs/v1`, `/api/v1`, `/api/traces/v1`, `/api/profiles/v1`). To use existing dashboards or datasources that speak third-party observability APIs, set `PULSUS_COMPAT_ENDPOINTS=true` and point them at `http://pulsusdb:3100`.
 
-**Minimum supported ClickHouse: 26.8 LTS** (the supported LTS line; servers before 26.3 do not tag an HTTP-200 mid-stream exception, so it cannot be told apart from result text — issue #412). `schema/schema.sh` verifies the server version before it sends anything and refuses an older server; the serving process verifies it again at startup.
+**Minimum supported ClickHouse: 26.8 LTS** (the supported LTS line; servers before 26.3 do not tag an HTTP-200 mid-stream exception, so it cannot be told apart from result text — issue #412). `schema/schema.sh` verifies the server version before it sends anything and refuses an older server; the serving process verifies it again at startup. CI also runs the clustered trace suite on ClickHouse 26.10.2.103.

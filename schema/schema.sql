@@ -873,7 +873,7 @@ FROM system.one
 HAVING hi > lo)
 ORDER BY conn_type = '', org_id, minute, client_minute, client, server, conn_type
 SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_rows_to_read = {{graph_job_max_rows}}, read_overflow_mode = 'throw', max_execution_time = 50,
-         max_insert_threads = 1, max_insert_block_size = 100000000, min_insert_block_size_rows = 100000000, min_insert_block_size_bytes = 10000000000;
+         max_insert_threads = 1, max_insert_block_size = 100000000, min_insert_block_size_rows = 100000000, min_insert_block_size_bytes = 10000000000, parallel_distributed_insert_select = 0;
 
 CREATE MATERIALIZED VIEW {{db}}.traces_mv{{on_cluster}} TO {{db}}.traces{{route_suffix}}
 AS SELECT
