@@ -743,12 +743,17 @@ fn histogram_bytes(h: &FloatHistogram) -> usize {
         + h.custom_values.capacity() * size_of::<f64>()
 }
 
+/// One series' points, as the merge builds them.
+type MergedSeriesPoints = Vec<(i64, HistOrFloat)>;
+/// One series' labels and its points.
+type MergedSeries = (Vec<(String, String)>, MergedSeriesPoints);
+
 /// The kept points in `[start, c1]`, then the tail's (§5.3). A series with
 /// no point in `[start, end]` is dropped; the answer is `MatrixHist` when a
 /// histogram point remains. `None` when the tail is not a matrix.
 pub fn merge(entry: &Entry, tail: QueryResult, start_ms: i64, end_ms: i64) -> Option<QueryResult> {
     let mut order: Vec<Vec<(String, String)>> = Vec::new();
-    let mut points: HashMap<Vec<(String, String)>, Vec<(i64, HistOrFloat)>> = HashMap::new();
+    let mut points: HashMap<Vec<(String, String)>, MergedSeriesPoints> = HashMap::new();
     let mut push = |labels: &Vec<(String, String)>, t: i64, v: HistOrFloat| {
         if t < start_ms || t > end_ms {
             return;
@@ -796,7 +801,7 @@ pub fn merge(entry: &Entry, tail: QueryResult, start_ms: i64, end_ms: i64) -> Op
     let any_hist = points
         .values()
         .any(|v| v.iter().any(|(_, x)| matches!(x, HistOrFloat::Hist(_))));
-    let series: Vec<(Vec<(String, String)>, Vec<(i64, HistOrFloat)>)> = order
+    let series: Vec<MergedSeries> = order
         .into_iter()
         .filter_map(|labels| {
             let pts = points.remove(&labels)?;
@@ -1349,6 +1354,7 @@ mod tests {
 
     type R = Result<Evaluated, ()>;
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_with(
         r: &Rig,
         calls: &Calls,
@@ -1419,7 +1425,7 @@ mod tests {
         let p = params(0, V - 500_000, 600_000);
         let t_last = (V - 500_000).div_euclid(600_000) * 600_000;
         let gl = t_last.div_euclid(60_000) * 60_000;
-        assert!(V - SETTLE_MS > gl && V - 100_000 > gl);
+        assert!(V - SETTLE_MS > gl, "V − S and W both exceed gl");
         let want = (gl - 60_000).div_euclid(600_000) * 600_000;
         assert_eq!(
             keep_through(V, 0, &p, 60_000, Some(V - 100_000)),

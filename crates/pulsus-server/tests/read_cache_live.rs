@@ -356,7 +356,11 @@ fn value(metric: &str, tenant: &str, i: usize, k: i64) -> f64 {
 }
 
 /// A remote write of float series, each `(labels, [(ms, value)])`.
-fn remote_write(series: &[(Vec<(String, String)>, Vec<(i64, f64)>)]) -> Vec<u8> {
+/// One float series of a remote write: its labels and its `(ms, value)`
+/// samples.
+type FloatSeries = (Vec<(String, String)>, Vec<(i64, f64)>);
+
+fn remote_write(series: &[FloatSeries]) -> Vec<u8> {
     use prost::Message;
     use pulsus_write::protocols::remote_write::{Label, Sample, TimeSeries, WriteRequest};
     let req = WriteRequest {
