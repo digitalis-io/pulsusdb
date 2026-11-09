@@ -841,13 +841,18 @@ async fn a_hole_is_skipped_at_every_level() {
 /// wrote, a granule at each end of the window in each of the stage's `P`
 /// active parts, a granule of run rows in each of the source level's
 /// `P_level`, its own watermark scan and the run-row branch, counted from
-/// `system.parts` before the runs. A run that read the source level's data
-/// would read its 576,000-row day partition. The 86400 s level's source has
-/// no stage (a day-long run reads its source's day partition), and its data run reads
-/// at most `S + Σ_p min(rows_p, 1024) + O + 1`, taken from `system.parts`
-/// before it: the 7200 s table's rows in the day's partition, one granule
-/// of run rows per source part, its own table's watermark scan, and the
-/// run-row branch.
+/// `system.parts` before the runs. A 720 s run that read the 60 s level's
+/// data would read its 576,000-row day partition and fail the bound.
+/// `written` counts a run's rows once per table they reach (the level, and
+/// its stage when it has one), so the bound is loose: at the 7200 s level it
+/// exceeds the 720 s level's 48,000-row day partition, and there the runs
+/// are held to `projections = []` and `tables` only. The 86400 s level's
+/// source has no stage (a day-long run reads its source's day partition),
+/// and its data run reads at most `S + 2 × Σ_p min(rows_p, 1024) + O + 1`,
+/// taken from `system.parts` before it: the 7200 s table's rows in the
+/// day's partition, two scans of one granule of run rows per source part
+/// (the plan's and the `staged` scalar's), its own table's watermark scan,
+/// and the run-row branch.
 #[tokio::test]
 async fn each_run_reads_its_window() {
     skip_unless_live!();
@@ -974,7 +979,7 @@ async fn each_run_reads_its_window() {
     )
     .await as u64;
     let ceiling = parts.iter().map(|p| p.rows).sum::<u64>()
-        + parts.iter().map(|p| p.rows.min(1024)).sum::<u64>()
+        + 2 * parts.iter().map(|p| p.rows.min(1024)).sum::<u64>()
         + own
         + 1;
     until_idle(&client, db, 86400, 30).await;
@@ -1165,7 +1170,10 @@ async fn a_run_stages_what_the_next_level_reads() {
     // (2)
     let projections = int(
         &client,
-        &format!("SELECT toInt64(count()) AS v FROM system.projections WHERE database = '{db}'"),
+        &format!(
+            "SELECT toInt64(count()) AS v FROM system.projections \
+             WHERE database = '{db}' AND startsWith(table, 'metric_samples_')"
+        ),
     )
     .await;
     assert_eq!(projections, 0, "(2) no projection");
