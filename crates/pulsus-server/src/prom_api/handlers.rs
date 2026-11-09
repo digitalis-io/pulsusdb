@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 
 use pulsus_model::Tenant;
 use pulsus_promql::parser::Expr;
+use pulsus_read::metrics::read_cache;
 use pulsus_read::{DataWindow, DiscoveryFilter, MetricQueryParams, MetricsEngine};
 
 use crate::app::AppState;
@@ -221,6 +222,9 @@ async fn query_impl(
         step_ms: 0,
     };
     let server_deadline = state.config.query_timeout.0;
+    if let Some(cache) = state.read_cache.get() {
+        cache.record_bypass(read_cache::BypassReason::Instant);
+    }
     let work = async {
         let engine = engine_with_lookback(&state, lookback_ms).await?;
         run_query(&engine, tenant, &expr, query, &query_params, opts, at_ms).await
@@ -305,7 +309,17 @@ async fn query_range_impl(
     let server_deadline = state.config.query_timeout.0;
     let work = async {
         let engine = engine_with_lookback(&state, lookback_ms).await?;
-        run_query(&engine, tenant, &expr, query, &query_params, opts, end_ms).await
+        run_range_query(
+            &state,
+            engine,
+            tenant,
+            &expr,
+            query,
+            &query_params,
+            opts,
+            end_ms,
+        )
+        .await
     };
     match params::run_under_request_deadline(requested, server_deadline, work).await {
         Ok(res) => res,
@@ -402,6 +416,109 @@ async fn run_query(
             shape,
         ))
     }
+}
+
+/// Issue #778: `X-Pulsus-Read-Cache`, and with `hit` or `miss` the last
+/// point kept.
+fn with_read_cache_headers(
+    mut res: Response,
+    header: read_cache::Header,
+    through_ms: Option<i64>,
+) -> Response {
+    let headers = res.headers_mut();
+    headers.insert(
+        axum::http::HeaderName::from_static("x-pulsus-read-cache"),
+        axum::http::HeaderValue::from_static(header.as_str()),
+    );
+    if let Some(ms) = through_ms.filter(|_| header != read_cache::Header::Bypass)
+        && let Ok(v) = axum::http::HeaderValue::from_str(&ms.to_string())
+    {
+        headers.insert(
+            axum::http::HeaderName::from_static("x-pulsus-read-cache-through"),
+            v,
+        );
+    }
+    res
+}
+
+/// Issue #778: a range query through the read cache when it is built and
+/// the request carries no explain header; otherwise [`run_query`].
+#[allow(clippy::too_many_arguments)]
+async fn run_range_query(
+    state: &AppState,
+    engine: MetricsEngine,
+    tenant: &Tenant,
+    expr: &Expr,
+    query: &str,
+    p: &MetricQueryParams,
+    opts: ResponseOptions,
+    at_ms: i64,
+) -> Result<Response, ApiError> {
+    let cache = state.read_cache.get().cloned();
+    let cache = match cache {
+        Some(c) if !opts.explain => c,
+        other => {
+            if let Some(c) = other {
+                c.record_bypass(read_cache::BypassReason::Explain);
+            }
+            let res = run_query(&engine, tenant, expr, query, p, opts, at_ms).await?;
+            return Ok(with_read_cache_headers(
+                res,
+                read_cache::Header::Bypass,
+                None,
+            ));
+        }
+    };
+    let engine = engine.with_routing_span_ms(p.end_ms - p.start_ms);
+    let facts = engine.plan_facts(expr, p)?;
+    let key = read_cache::CacheKey::new(
+        tenant.clone(),
+        query,
+        p,
+        engine.lookback_ms(),
+        engine.resolution_ms(p),
+    );
+    let now = cache.now_ms();
+    let req = read_cache::RangeRequest {
+        key,
+        query,
+        params: *p,
+        facts,
+        max_samples: state.config.reader.promql_max_samples,
+        retention_floor_ms: state
+            .retention_days()
+            .map(|d| now - i64::from(d) * 86_400_000 + 86_400_000),
+        sweep_time_ms: state
+            .label_cache
+            .get()
+            .and_then(|c| c.sweep_time_ms(tenant)),
+    };
+    let eval = |q: MetricQueryParams| {
+        let engine = &engine;
+        async move {
+            let (r, a, f) = engine.query_with_facts(tenant, expr, &q).await?;
+            Ok::<_, ApiError>((r, a, f.charged_samples))
+        }
+    };
+    let answer = read_cache::answer_range(&cache, req, eval, eval).await?;
+    let shape = encode::ResponseShape {
+        ordered: false,
+        limit: opts.limit,
+        stats_requested: opts.stats_requested,
+    };
+    let res = encode::query_response_annotated(
+        answer.result,
+        None,
+        at_ms,
+        query,
+        answer.annotations,
+        shape,
+    );
+    Ok(with_read_cache_headers(
+        res,
+        answer.header,
+        answer.through_ms,
+    ))
 }
 
 // ---------------------------------------------------------------------
@@ -826,6 +943,7 @@ mod tests {
             label_cache: Arc::new(std::sync::OnceLock::new()),
             rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
             graph_target: pulsus_read::GraphTargetCache::default(),
+            read_cache: Default::default(),
             eval_gate: Arc::new(pulsus_read::EvalGate::new(
                 pulsus_config::Config::default()
                     .reader

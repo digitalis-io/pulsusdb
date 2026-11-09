@@ -90,6 +90,7 @@ pub mod grouped_sql;
 pub mod labels;
 pub mod matcher;
 mod re2_authority;
+pub mod read_cache;
 pub mod refresh;
 pub mod rollup;
 pub mod rows;

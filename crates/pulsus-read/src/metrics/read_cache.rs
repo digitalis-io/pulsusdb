@@ -1,0 +1,1895 @@
+//! Issue #778 part 1: the per-process read cache of PromQL range answers.
+//!
+//! A range answer's points that can no longer change are kept, keyed by the
+//! request's tenant, query text, grid and span. A repeat of the request is
+//! answered from the kept points plus an evaluation of the points after them
+//! (the tail), routed as the whole request is. Only plans built from an
+//! allow-list ([`shape_allowed`]) use the cache; every other request is
+//! evaluated in full and nothing is kept.
+//!
+//! **What is kept.** A point is kept once it is [`SETTLE_MS`] older than
+//! `V` (the request time, or the label cache's last sweep when that is
+//! older), its rollup buckets are built, and, clustered, only while every
+//! `metric_*` replica has lagged under [`LAG_FILL_LIMIT_S`] since
+//! `V − 10 s`. A kept point is what an uncached read of it returned when it
+//! was kept. A sample pushed more than [`ON_TIME_MS`] after its own
+//! timestamp can be missing from it until it is evaluated again, at the
+//! latest [`ENTRY_MAX_AGE_MS`] after the entry was first filled.
+//!
+//! **Memory.** Every retained allocation is charged by capacity
+//! ([`charge`]); past the budget the least recently used entries go, a
+//! tenant past its share losing its own first.
+//!
+//! A plain in-memory, byte-weighted LRU: no new crate, nothing on disk,
+//! nothing shared between nodes.
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+
+use pulsus_clickhouse::{ChClient, QuerySettings, Row};
+use pulsus_model::{FloatHistogram, Tenant};
+use pulsus_promql::{Annotations, QueryPlan};
+use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
+
+use super::exec::{MetricQueryParams, PlanFacts};
+use super::rollup::LevelSlot;
+use crate::logql::escape::ch_string;
+use crate::logql::{HistOrFloat, QueryResult};
+
+/// A sample whose push reaches PulsusDB within this of its timestamp is in
+/// every kept point it affects (`L`).
+pub const ON_TIME_MS: i64 = 60_000;
+/// Receive to visible on every replica a read can use (`D`): the landing
+/// bound 120 s, the lag gate 15 s, clock skew 5 s, spare 40 s.
+pub const RECEIVE_TO_VISIBLE_MS: i64 = 180_000;
+/// The freshness window `S = L + D`: no point newer than `V − S` is kept.
+pub const SETTLE_MS: i64 = ON_TIME_MS + RECEIVE_TO_VISIBLE_MS;
+/// How often [`spawn_poll_loop`] reads replica lag, watermarks and identity.
+pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// A `metric_*` replica lagging this many seconds or more stops fills.
+pub const LAG_FILL_LIMIT_S: u64 = 5;
+/// The longest gap between two lag reads a fill accepts.
+pub const LAG_READ_MAX_AGE_MS: i64 = 10_000;
+/// An entry first filled longer ago than this is evaluated again in full
+/// (`T_max`).
+pub const ENTRY_MAX_AGE_MS: i64 = 3_600_000;
+/// Map bucket, LRU links and the `Arc` header, per entry.
+pub const ENTRY_OVERHEAD_BYTES: u64 = 256;
+/// How far back the lag history reaches.
+const LAG_HISTORY_MS: i64 = 300_000;
+/// How long a successful identity read stays fresh.
+const IDENTITY_FRESH_MS: i64 = 10_000;
+/// The annotation caps the response encoder renders with.
+const ANNOTATION_CAP: usize = 10;
+
+/// The cache's size and tenant share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadCacheConfig {
+    pub budget_bytes: u64,
+    pub tenant_share_pct: u8,
+    /// Clustered: fills need the replica-lag gate.
+    pub clustered: bool,
+}
+
+/// What one request is looked up by.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CacheKey {
+    pub tenant: Tenant,
+    /// The raw query text: annotation positions index into it.
+    pub query: Arc<str>,
+    pub step_ms: i64,
+    /// `start mod step`.
+    pub phase_ms: i64,
+    /// `end − start`, what `range()` would resolve to and the routing span.
+    pub span_ms: i64,
+    pub lookback_ms: i64,
+    /// The rollup resolution the whole request reads at, `0` raw.
+    pub resolution_ms: i64,
+}
+
+impl CacheKey {
+    /// The key of a range request.
+    pub fn new(
+        tenant: Tenant,
+        query: &str,
+        p: &MetricQueryParams,
+        lookback_ms: i64,
+        resolution_ms: Option<i64>,
+    ) -> Self {
+        // Red rule (issue #778 part 1, commit 1): a do-nothing version.
+        let _ = (lookback_ms, resolution_ms);
+        CacheKey {
+            tenant,
+            query: Arc::from(query),
+            step_ms: p.step_ms,
+            phase_ms: 0,
+            span_ms: 0,
+            lookback_ms: 0,
+            resolution_ms: 0,
+        }
+    }
+}
+
+/// One series' kept points.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Points {
+    Float(Vec<(i64, f64)>),
+    Mixed(Vec<(i64, HistOrFloat)>),
+}
+
+impl Points {
+    fn shrink(&mut self) {
+        match self {
+            Points::Float(v) => v.shrink_to_fit(),
+            Points::Mixed(v) => {
+                v.shrink_to_fit();
+                for (_, p) in v.iter_mut() {
+                    if let HistOrFloat::Hist(h) = p {
+                        shrink_histogram(h);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn shrink_histogram(h: &mut FloatHistogram) {
+    h.positive_spans.shrink_to_fit();
+    h.negative_spans.shrink_to_fit();
+    h.positive_buckets.shrink_to_fit();
+    h.negative_buckets.shrink_to_fit();
+    h.custom_values.shrink_to_fit();
+}
+
+/// A kept answer: its rendered annotations, its series' points in
+/// `[c0, c1]`, when it was first filled, and the charge bound.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    /// The answer's annotations as the encoder renders them, each prefixed
+    /// `w:` (warning) or `i:` (info).
+    pub annotations: Vec<String>,
+    pub series: Vec<(Vec<(String, String)>, Points)>,
+    pub c0_ms: i64,
+    pub c1_ms: i64,
+    pub first_fill_ms: i64,
+    /// The samples a fresh evaluation of the kept answer's data charges at
+    /// most.
+    pub charge_bound: u64,
+    /// What [`charge`] counted when the entry was stored.
+    pub bytes: u64,
+}
+
+/// What the cache decided for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Hit,
+    Miss,
+    Bypass(BypassReason),
+}
+
+/// Why a request did not use the cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BypassReason {
+    Off,
+    Instant,
+    Explain,
+    Shape,
+    Retention,
+    NoFill,
+}
+
+impl BypassReason {
+    pub const ALL: [BypassReason; 6] = [
+        BypassReason::Off,
+        BypassReason::Instant,
+        BypassReason::Explain,
+        BypassReason::Shape,
+        BypassReason::Retention,
+        BypassReason::NoFill,
+    ];
+
+    /// The `reason` label of `pulsus_read_cache_bypass_total`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BypassReason::Off => "off",
+            BypassReason::Instant => "instant",
+            BypassReason::Explain => "explain",
+            BypassReason::Shape => "shape",
+            BypassReason::Retention => "retention",
+            BypassReason::NoFill => "no_fill",
+        }
+    }
+
+    fn index(self) -> usize {
+        BypassReason::ALL
+            .iter()
+            .position(|r| *r == self)
+            .expect("listed")
+    }
+}
+
+/// The value of `X-Pulsus-Read-Cache`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Header {
+    Hit,
+    Miss,
+    Bypass,
+}
+
+impl Header {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Header::Hit => "hit",
+            Header::Miss => "miss",
+            Header::Bypass => "bypass",
+        }
+    }
+}
+
+/// The cache's counters, read by `/metrics`.
+#[derive(Debug, Default)]
+pub struct ReadCacheMetrics {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    bypasses: AtomicU64,
+    bypass_reasons: [AtomicU64; 6],
+    evictions: AtomicU64,
+    clears: AtomicU64,
+    poll_failures: AtomicU64,
+}
+
+/// A copy of the counters and gauges, for `/metrics`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReadCacheSnapshot {
+    pub hits_total: u64,
+    pub misses_total: u64,
+    pub bypasses_total: u64,
+    /// `(reason, count)` for every [`BypassReason`].
+    pub bypass_total: Vec<(&'static str, u64)>,
+    pub bytes: u64,
+    pub entries: u64,
+    pub evictions_total: u64,
+    pub clears_total: u64,
+    pub poll_failures_total: u64,
+}
+
+/// What the 5 s poll last read.
+#[derive(Debug, Default)]
+struct PollState {
+    /// `(read at, max delay s)`, the last five minutes.
+    lag_history: VecDeque<(i64, u64)>,
+    /// `(read at, [(level width, watermark)])`.
+    watermarks: Option<(i64, Vec<(i64, i64)>)>,
+    identity: Option<Arc<[String]>>,
+    /// The start of the last successful identity read.
+    identity_ok_at: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+struct Store {
+    map: HashMap<CacheKey, (Arc<Entry>, u64)>,
+    /// LRU order: tick to key.
+    lru: BTreeMap<u64, CacheKey>,
+    tick: u64,
+    total: u64,
+    per_tenant: HashMap<Tenant, u64>,
+}
+
+impl Store {
+    fn remove(&mut self, key: &CacheKey) -> Option<Arc<Entry>> {
+        let (entry, tick) = self.map.remove(key)?;
+        self.lru.remove(&tick);
+        self.total = self.total.saturating_sub(entry.bytes);
+        if let Some(t) = self.per_tenant.get_mut(&key.tenant) {
+            *t = t.saturating_sub(entry.bytes);
+            if *t == 0 {
+                self.per_tenant.remove(&key.tenant);
+            }
+        }
+        Some(entry)
+    }
+
+    fn clear(&mut self) {
+        *self = Store {
+            tick: self.tick,
+            ..Store::default()
+        };
+    }
+}
+
+type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
+
+/// The per-process read cache.
+pub struct ReadCache {
+    store: Mutex<Store>,
+    generation: AtomicU64,
+    config: ReadCacheConfig,
+    metrics: ReadCacheMetrics,
+    poll: RwLock<PollState>,
+    clock: Clock,
+}
+
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+impl ReadCache {
+    pub fn new(config: ReadCacheConfig) -> Self {
+        ReadCache {
+            store: Mutex::new(Store::default()),
+            generation: AtomicU64::new(0),
+            config,
+            metrics: ReadCacheMetrics::default(),
+            poll: RwLock::new(PollState::default()),
+            clock: Box::new(wall_clock_ms),
+        }
+    }
+
+    /// TEST SEAM: a clock other than the wall clock.
+    #[doc(hidden)]
+    pub fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
+    pub fn config(&self) -> ReadCacheConfig {
+        self.config
+    }
+
+    pub fn now_ms(&self) -> i64 {
+        (self.clock)()
+    }
+
+    /// The fence a clear moves.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Empties the store and moves the generation, so a request that
+    /// started before neither serves nor stores.
+    pub fn clear(&self) {
+        let mut store = lock(&self.store);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        store.clear();
+        self.metrics.clears.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The entry under `key`, made most recently used.
+    pub fn lookup(&self, key: &CacheKey) -> Option<Arc<Entry>> {
+        // Red rule (issue #778 part 1, commit 1): a do-nothing version.
+        let _ = key;
+        None
+    }
+
+    /// Stores `entry` under `key` unless a clear moved the generation past
+    /// `generation`. `false` when nothing was stored.
+    pub fn store(&self, key: CacheKey, mut entry: Entry, generation: u64) -> bool {
+        let mut store = lock(&self.store);
+        if self.generation() != generation {
+            return false;
+        }
+        let share = self.config.budget_bytes * u64::from(self.config.tenant_share_pct) / 100;
+        entry.bytes = charge(&key, &entry);
+        store.remove(&key);
+        if entry.bytes > share {
+            self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        store.tick += 1;
+        let tick = store.tick;
+        store.total += entry.bytes;
+        *store.per_tenant.entry(key.tenant.clone()).or_insert(0) += entry.bytes;
+        store.lru.insert(tick, key.clone());
+        store.map.insert(key.clone(), (Arc::new(entry), tick));
+        while store.total > self.config.budget_bytes {
+            // A tenant past its share loses its own least recently used
+            // entries first; otherwise the least recently used goes.
+            let over: Option<CacheKey> = store
+                .lru
+                .values()
+                .find(|k| store.per_tenant.get(&k.tenant).copied().unwrap_or(0) > share)
+                .cloned();
+            let victim = match over {
+                Some(k) => k,
+                None => match store.lru.values().next() {
+                    Some(k) => k.clone(),
+                    None => break,
+                },
+            };
+            store.remove(&victim);
+            self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        store.map.contains_key(&key)
+    }
+
+    /// The charged bytes and entry count.
+    pub fn usage(&self) -> (u64, u64) {
+        let store = lock(&self.store);
+        (store.total, store.map.len() as u64)
+    }
+
+    fn count(&self, header: Header, reason: Option<BypassReason>) {
+        match header {
+            Header::Hit => self.metrics.hits.fetch_add(1, Ordering::Relaxed),
+            Header::Miss => self.metrics.misses.fetch_add(1, Ordering::Relaxed),
+            Header::Bypass => self.metrics.bypasses.fetch_add(1, Ordering::Relaxed),
+        };
+        // Red rule (issue #778 part 1, commit 1): no bypass reason recorded.
+        let _ = reason;
+    }
+
+    /// Counts a request that bypassed the cache before reaching it.
+    pub fn record_bypass(&self, reason: BypassReason) {
+        self.count(Header::Bypass, Some(reason));
+    }
+
+    pub fn snapshot(&self) -> ReadCacheSnapshot {
+        let (bytes, entries) = self.usage();
+        let m = &self.metrics;
+        ReadCacheSnapshot {
+            hits_total: m.hits.load(Ordering::Relaxed),
+            misses_total: m.misses.load(Ordering::Relaxed),
+            bypasses_total: m.bypasses.load(Ordering::Relaxed),
+            bypass_total: BypassReason::ALL
+                .iter()
+                .map(|r| {
+                    (
+                        r.as_str(),
+                        m.bypass_reasons[r.index()].load(Ordering::Relaxed),
+                    )
+                })
+                .collect(),
+            bytes,
+            entries,
+            evictions_total: m.evictions.load(Ordering::Relaxed),
+            clears_total: m.clears.load(Ordering::Relaxed),
+            poll_failures_total: m.poll_failures.load(Ordering::Relaxed),
+        }
+    }
+
+    // -- the poll's state ---------------------------------------------------
+
+    fn poll_read(&self) -> std::sync::RwLockReadGuard<'_, PollState> {
+        match self.poll.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    fn poll_write(&self) -> std::sync::RwLockWriteGuard<'_, PollState> {
+        match self.poll.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// P1: the worst `metric_*` replica lag, read at `at_ms`.
+    pub fn record_lag(&self, at_ms: i64, max_delay_s: u64) {
+        let mut poll = self.poll_write();
+        poll.lag_history.push_back((at_ms, max_delay_s));
+        while poll
+            .lag_history
+            .front()
+            .is_some_and(|(t, _)| *t < at_ms - LAG_HISTORY_MS)
+        {
+            poll.lag_history.pop_front();
+        }
+    }
+
+    /// P2: each level's watermark, `(width, watermark)`, read at `at_ms`.
+    pub fn record_watermarks(&self, at_ms: i64, watermarks: Vec<(i64, i64)>) {
+        self.poll_write().watermarks = Some((at_ms, watermarks));
+    }
+
+    /// P3: the database identity set, read by a statement started at
+    /// `started_ms`. A set other than the last clears the cache.
+    pub fn record_identity(&self, started_ms: i64, ids: Vec<String>) {
+        // Red rule (issue #778 part 1, commit 1): a do-nothing version.
+        let mut poll = self.poll_write();
+        poll.identity = Some(ids.into());
+        poll.identity_ok_at = Some(started_ms);
+    }
+
+    /// A poll statement failed.
+    pub fn record_poll_failure(&self) {
+        self.metrics.poll_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The last successful identity read started under 10 s ago.
+    pub fn identity_fresh(&self) -> bool {
+        let now = self.now_ms();
+        self.poll_read()
+            .identity_ok_at
+            .is_some_and(|t| now - t < IDENTITY_FRESH_MS)
+    }
+
+    /// Alone: true. Clustered: the lag history covers `[V − 10 s, now]` with
+    /// no gap above [`LAG_READ_MAX_AGE_MS`], every read under
+    /// [`LAG_FILL_LIMIT_S`].
+    pub fn fills_allowed(&self, v_ms: i64) -> bool {
+        // Red rule (issue #778 part 1, commit 1): a do-nothing version.
+        let _ = v_ms;
+        true
+    }
+
+    /// `W`: the least latest watermark over the levels of width at most
+    /// `res_ms`, `None` when none was read.
+    pub fn watermark(&self, res_ms: i64) -> Option<i64> {
+        let poll = self.poll_read();
+        let (_, wms) = poll.watermarks.as_ref()?;
+        wms.iter()
+            .filter(|(w, _)| *w > 0 && *w <= res_ms)
+            .map(|(_, wm)| *wm)
+            .min()
+    }
+}
+
+// -- what is kept, and its charge -------------------------------------------
+
+/// The last grid point kept (`c1`), or `None` when nothing is kept (§5.4).
+/// `res_ms` is `0` raw; at a level, `watermark` is `W`.
+pub fn keep_through(
+    v_ms: i64,
+    reach_ms: i64,
+    p: &MetricQueryParams,
+    res_ms: i64,
+    watermark: Option<i64>,
+) -> Option<i64> {
+    // Red rule (issue #778 part 1, commit 1): a do-nothing version.
+    let _ = (v_ms, reach_ms, p, res_ms, watermark);
+    None
+}
+
+/// The rendered annotations an entry compares, as the encoder renders
+/// them.
+pub fn rendered_annotations(annotations: &Annotations, query: &str) -> Vec<String> {
+    let (warnings, infos) = annotations.as_strings(query, ANNOTATION_CAP, ANNOTATION_CAP);
+    warnings
+        .into_iter()
+        .map(|w| format!("w:{w}"))
+        .chain(infos.into_iter().map(|i| format!("i:{i}")))
+        .collect()
+}
+
+/// The points of `result` in `[start, c1]`, as an entry; `None` when the
+/// result is not a matrix.
+fn keep(
+    result: &QueryResult,
+    start_ms: i64,
+    c1_ms: i64,
+    annotations: Vec<String>,
+    first_fill_ms: i64,
+    charge_bound: u64,
+) -> Option<Entry> {
+    let in_range = |t: i64| t >= start_ms && t <= c1_ms;
+    let series: Vec<(Vec<(String, String)>, Points)> = match result {
+        QueryResult::Matrix(items) => items
+            .iter()
+            .map(|s| {
+                (
+                    s.labels.clone(),
+                    Points::Float(
+                        s.points
+                            .iter()
+                            .copied()
+                            .filter(|(t, _)| in_range(*t))
+                            .collect(),
+                    ),
+                )
+            })
+            .collect(),
+        QueryResult::MatrixHist(items) => items
+            .iter()
+            .map(|s| {
+                (
+                    s.labels.clone(),
+                    Points::Mixed(
+                        s.points
+                            .iter()
+                            .filter(|(t, _)| in_range(*t))
+                            .cloned()
+                            .collect(),
+                    ),
+                )
+            })
+            .collect(),
+        _ => return None,
+    };
+    let mut entry = Entry {
+        annotations,
+        series: series
+            .into_iter()
+            .filter(|(_, p)| match p {
+                Points::Float(v) => !v.is_empty(),
+                Points::Mixed(v) => !v.is_empty(),
+            })
+            .collect(),
+        c0_ms: start_ms,
+        c1_ms,
+        first_fill_ms,
+        charge_bound,
+        bytes: 0,
+    };
+    shrink_entry(&mut entry);
+    Some(entry)
+}
+
+/// `shrink_to_fit` on every vector and string an entry keeps.
+pub fn shrink_entry(entry: &mut Entry) {
+    entry.annotations.shrink_to_fit();
+    for a in &mut entry.annotations {
+        a.shrink_to_fit();
+    }
+    entry.series.shrink_to_fit();
+    for (labels, points) in &mut entry.series {
+        labels.shrink_to_fit();
+        for (k, v) in labels.iter_mut() {
+            k.shrink_to_fit();
+            v.shrink_to_fit();
+        }
+        points.shrink();
+    }
+}
+
+/// Every retained allocation of `key` and `entry`, by capacity (§5.6).
+pub fn charge(key: &CacheKey, entry: &Entry) -> u64 {
+    // Red rule (issue #778 part 1, commit 1): a do-nothing version.
+    let _ = (key, entry);
+    0
+}
+
+/// The kept points in `[start, c1]`, then the tail's (§5.3). A series with
+/// no point in `[start, end]` is dropped; the answer is `MatrixHist` when a
+/// histogram point remains. `None` when the tail is not a matrix.
+pub fn merge(entry: &Entry, tail: QueryResult, start_ms: i64, end_ms: i64) -> Option<QueryResult> {
+    // Red rule (issue #778 part 1, commit 1): a do-nothing version.
+    let _ = (entry, tail, start_ms, end_ms);
+    None
+}
+
+// -- the plan-shape gate (§5.9) ---------------------------------------------
+
+/// `true` only when the plan uses no duration expression and every node and
+/// selector is on the allow-list: a point at `t` depends only on samples in
+/// a fixed-width window ending at `t − offset`, and its labels are decided
+/// by that step alone.
+pub fn shape_allowed(plan: &QueryPlan) -> bool {
+    // Red rule (issue #778 part 1, commit 1): a do-nothing version.
+    let _ = plan;
+    true
+}
+
+// -- the hit and miss paths (§5.2) ------------------------------------------
+
+/// One range request, as the cache sees it.
+pub struct RangeRequest<'a> {
+    pub key: CacheKey,
+    /// The raw query text the annotations render against.
+    pub query: &'a str,
+    pub params: MetricQueryParams,
+    pub facts: PlanFacts,
+    /// `PULSUS_PROMQL_MAX_SAMPLES`.
+    pub max_samples: u64,
+    /// `now − retention_days·1 d + 1 d`; `None` when the retention is not
+    /// known yet.
+    pub retention_floor_ms: Option<i64>,
+    /// The label cache's last sweep for the tenant, `None` when cold.
+    pub sweep_time_ms: Option<i64>,
+}
+
+/// An evaluation's answer: the result, its annotations, and what it
+/// charged.
+pub type Evaluated = (QueryResult, Annotations, u64);
+
+/// What a request is answered with.
+pub struct Answer {
+    pub result: QueryResult,
+    pub annotations: Annotations,
+    pub outcome: Outcome,
+    /// `X-Pulsus-Read-Cache`.
+    pub header: Header,
+    /// `X-Pulsus-Read-Cache-Through`: the last point kept, on `hit` and
+    /// `miss` when anything is kept.
+    pub through_ms: Option<i64>,
+}
+
+/// Answers `req` from the cache when it can, else from `full`. `tail` is
+/// evaluated over the points after an entry's last kept one. The caller's
+/// error, if any, is the answer, as it is without the cache.
+pub async fn answer_range<E, F, FF, T, TF>(
+    cache: &ReadCache,
+    req: RangeRequest<'_>,
+    full: F,
+    tail: T,
+) -> Result<Answer, E>
+where
+    F: FnOnce(MetricQueryParams) -> FF,
+    FF: Future<Output = Result<Evaluated, E>>,
+    T: FnOnce(MetricQueryParams) -> TF,
+    TF: Future<Output = Result<Evaluated, E>>,
+{
+    let g0 = cache.generation();
+    let p = req.params;
+    let refuse = |reason: BypassReason| {
+        cache.count(Header::Bypass, Some(reason));
+    };
+    if !req.facts.shape_allowed {
+        refuse(BypassReason::Shape);
+        return bypass_full(full, p, BypassReason::Shape).await;
+    }
+    // Red rule (issue #778 part 1, commit 1): the retention check admits.
+    let retention_ok = true;
+    if !retention_ok {
+        refuse(BypassReason::Retention);
+        return bypass_full(full, p, BypassReason::Retention).await;
+    }
+    let now = cache.now_ms();
+    let v = now.min(req.sweep_time_ms.unwrap_or(now));
+    let res = req.key.resolution_ms;
+    // `W`, read before the evaluation.
+    let watermark = if res > 0 { cache.watermark(res) } else { None };
+    let through = |answer: &QueryResult| {
+        keep_through(v, req.facts.reach_ms, &p, res, watermark)
+            .filter(|_| matches!(answer, QueryResult::Matrix(_) | QueryResult::MatrixHist(_)))
+    };
+
+    if let Some(e) = cache.lookup(&req.key)
+        && e.c0_ms <= p.start_ms
+        && p.start_ms <= e.c1_ms + p.step_ms
+        && now - e.first_fill_ms < ENTRY_MAX_AGE_MS
+        && cache.identity_fresh()
+    {
+        let tail_p = MetricQueryParams {
+            start_ms: e.c1_ms + p.step_ms,
+            end_ms: p.end_ms,
+            step_ms: p.step_ms,
+        };
+        let (tail_result, tail_ann, tail_charged) = if tail_p.start_ms > tail_p.end_ms {
+            (QueryResult::Matrix(Vec::new()), Annotations::new(), 0)
+        } else {
+            tail(tail_p).await?
+        };
+        let bound = e.charge_bound.saturating_add(tail_charged);
+        if !tail_ann.has_mergeable()
+            && rendered_annotations(&tail_ann, req.query) == e.annotations
+            && bound <= req.max_samples
+            && cache.identity_fresh()
+            && cache.generation() == g0
+            && let Some(answer) = merge(&e, tail_result, p.start_ms, p.end_ms)
+        {
+            let mut kept_through = Some(e.c1_ms);
+            if cache.fills_allowed(v)
+                && cache.identity_fresh()
+                && cache.generation() == g0
+                && let Some(c1) = through(&answer)
+                && let Some(entry) = keep(
+                    &answer,
+                    p.start_ms,
+                    c1,
+                    e.annotations.clone(),
+                    e.first_fill_ms,
+                    bound,
+                )
+                && cache.store(req.key.clone(), entry, g0)
+            {
+                kept_through = Some(c1);
+            }
+            cache.count(Header::Hit, None);
+            return Ok(Answer {
+                result: answer,
+                annotations: tail_ann,
+                outcome: Outcome::Hit,
+                header: Header::Hit,
+                through_ms: kept_through,
+            });
+        }
+    }
+
+    let (result, annotations, charged) = full(p).await?;
+    let mut stored_through = None;
+    if !annotations.has_mergeable()
+        && cache.fills_allowed(v)
+        && cache.identity_fresh()
+        && cache.generation() == g0
+        && let Some(c1) = through(&result)
+        && let Some(entry) = keep(
+            &result,
+            p.start_ms,
+            c1,
+            rendered_annotations(&annotations, req.query),
+            now,
+            charged,
+        )
+        && cache.store(req.key.clone(), entry, g0)
+    {
+        stored_through = Some(c1);
+    }
+    let header = if stored_through.is_some() {
+        cache.count(Header::Miss, None);
+        Header::Miss
+    } else {
+        cache.count(Header::Bypass, Some(BypassReason::NoFill));
+        Header::Bypass
+    };
+    Ok(Answer {
+        result,
+        annotations,
+        outcome: Outcome::Miss,
+        header,
+        through_ms: stored_through,
+    })
+}
+
+async fn bypass_full<E, F, FF>(
+    full: F,
+    p: MetricQueryParams,
+    reason: BypassReason,
+) -> Result<Answer, E>
+where
+    F: FnOnce(MetricQueryParams) -> FF,
+    FF: Future<Output = Result<Evaluated, E>>,
+{
+    let (result, annotations, _) = full(p).await?;
+    Ok(Answer {
+        result,
+        annotations,
+        outcome: Outcome::Bypass(reason),
+        header: Header::Bypass,
+        through_ms: None,
+    })
+}
+
+// -- the poll (§5.5) ---------------------------------------------------------
+
+#[derive(Debug, Row, Serialize, Deserialize)]
+struct LagRow {
+    lag_s: u64,
+}
+
+#[derive(Debug, Row, Serialize, Deserialize)]
+struct WatermarkRow {
+    level: u32,
+    shard: u32,
+    watermark_ms: i64,
+}
+
+#[derive(Debug, Row, Serialize, Deserialize)]
+struct IdentityRow {
+    ids: Vec<String>,
+}
+
+/// P1: the worst replica lag of the metrics tables.
+pub fn lag_sql(cluster: &str, db: &str) -> String {
+    format!(
+        "SELECT max(absolute_delay) AS lag_s FROM clusterAllReplicas({}, system.replicas) \
+         WHERE database = {} AND startsWith(table, 'metric_') SETTINGS skip_unavailable_shards = 1",
+        ch_string(cluster),
+        ch_string(db)
+    )
+}
+
+/// P2: every level's run-row watermark, per shard; `None` with no level.
+pub fn watermark_sql(db: &str, tables: &[String], clustered: bool) -> Option<String> {
+    if tables.is_empty() {
+        return None;
+    }
+    let shard = if clustered {
+        "_shard_num"
+    } else {
+        "toUInt32(1)"
+    };
+    Some(
+        tables
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                format!(
+                    "SELECT toUInt32({i}) AS level, toUInt32({shard}) AS shard, max(t_end) AS watermark_ms \
+                     FROM {db}.{t} WHERE kind = 1 AND org_id = '' AND fingerprint = 0 GROUP BY level, shard"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL "),
+    )
+}
+
+/// P3: the database identity set.
+pub fn identity_sql(cluster: Option<&str>, db: &str) -> String {
+    match cluster {
+        Some(c) => format!(
+            "SELECT arraySort(groupUniqArray(toString(uuid))) AS ids \
+             FROM clusterAllReplicas({}, system.databases) WHERE name = {} \
+             SETTINGS skip_unavailable_shards = 1",
+            ch_string(c),
+            ch_string(db)
+        ),
+        None => format!(
+            "SELECT arraySort(groupUniqArray(toString(uuid))) AS ids \
+             FROM system.databases WHERE name = {}",
+            ch_string(db)
+        ),
+    }
+}
+
+async fn fetch<R: pulsus_clickhouse::ChRow>(
+    client: &ChClient,
+    sql: &str,
+) -> Result<Vec<R>, pulsus_clickhouse::ChError> {
+    use futures::StreamExt;
+    let mut stream = client.query_stream::<R>(sql, &QuerySettings::new()).await?;
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// One poll: P1 (clustered), P2, P3.
+pub async fn poll_once(
+    cache: &ReadCache,
+    client: &ChClient,
+    db: &str,
+    cluster: Option<&str>,
+    levels: &LevelSlot,
+) {
+    if let Some(c) = cluster {
+        let at = cache.now_ms();
+        match fetch::<LagRow>(client, &lag_sql(c, db)).await {
+            Ok(rows) => cache.record_lag(at, rows.first().map_or(0, |r| r.lag_s)),
+            Err(err) => {
+                cache.record_poll_failure();
+                tracing::warn!(error = %err, "read cache: replica lag read failed");
+            }
+        }
+    }
+    if let Some(lv) = levels.get().filter(|l| !l.levels.is_empty()) {
+        let tables: Vec<String> = lv.levels.iter().map(|l| l.table.clone()).collect();
+        if let Some(sql) = watermark_sql(db, &tables, cluster.is_some()) {
+            let at = cache.now_ms();
+            match fetch::<WatermarkRow>(client, &sql).await {
+                Ok(rows) => {
+                    let shards = lv.shards.max(1);
+                    let wms = lv
+                        .levels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, l)| {
+                            let wm = (1..=shards)
+                                .map(|s| {
+                                    rows.iter()
+                                        .find(|r| r.level as usize == i && r.shard == s)
+                                        .map_or(0, |r| r.watermark_ms)
+                                })
+                                .min()
+                                .unwrap_or(0);
+                            (l.res_ms, wm)
+                        })
+                        .collect();
+                    cache.record_watermarks(at, wms);
+                }
+                Err(err) => {
+                    cache.record_poll_failure();
+                    tracing::warn!(error = %err, "read cache: watermark read failed");
+                }
+            }
+        }
+    }
+    let started = cache.now_ms();
+    match fetch::<IdentityRow>(client, &identity_sql(cluster, db)).await {
+        Ok(rows) => cache.record_identity(
+            started,
+            rows.into_iter().next().map_or_else(Vec::new, |r| r.ids),
+        ),
+        Err(err) => {
+            cache.record_poll_failure();
+            tracing::warn!(error = %err, "read cache: identity read failed");
+        }
+    }
+}
+
+/// The poll loop: every [`POLL_INTERVAL`], the first at once.
+pub fn spawn_poll_loop(
+    cache: Arc<ReadCache>,
+    client: ChClient,
+    db: String,
+    cluster: Option<String>,
+    levels: Arc<LevelSlot>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(POLL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            poll_once(&cache, &client, &db, cluster.as_deref(), &levels).await;
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logql::{HistMatrixSeries, MatrixSeries};
+    use std::sync::atomic::{AtomicI64, AtomicUsize};
+
+    const V: i64 = 10_000_000_000;
+
+    struct Rig {
+        cache: ReadCache,
+        clock: Arc<AtomicI64>,
+    }
+
+    fn rig_with(budget: u64, share: u8, clustered: bool) -> Rig {
+        let clock = Arc::new(AtomicI64::new(V));
+        let c = Arc::clone(&clock);
+        let cache = ReadCache::new(ReadCacheConfig {
+            budget_bytes: budget,
+            tenant_share_pct: share,
+            clustered,
+        })
+        .with_clock(move || c.load(Ordering::SeqCst));
+        Rig { cache, clock }
+    }
+
+    /// A single-node cache with a fresh identity read.
+    fn rig() -> Rig {
+        let r = rig_with(64 * 1024 * 1024, 50, false);
+        r.cache.record_identity(V, vec!["db".to_string()]);
+        r
+    }
+
+    impl Rig {
+        fn now(&self) -> i64 {
+            self.clock.load(Ordering::SeqCst)
+        }
+        fn advance(&self, ms: i64) {
+            self.clock.fetch_add(ms, Ordering::SeqCst);
+        }
+        fn refresh_identity(&self) {
+            self.cache
+                .record_identity(self.now(), vec!["db".to_string()]);
+        }
+    }
+
+    fn tenant(t: &str) -> Tenant {
+        if t.is_empty() {
+            Tenant::from_header(None, false).expect("the empty tenant")
+        } else {
+            let h = axum_header(t);
+            Tenant::from_header(Some(&h), false).expect("a tenant")
+        }
+    }
+
+    fn axum_header(t: &str) -> http::HeaderValue {
+        http::HeaderValue::from_str(t).expect("a header value")
+    }
+
+    fn params(start: i64, end: i64, step: i64) -> MetricQueryParams {
+        MetricQueryParams {
+            start_ms: start,
+            end_ms: end,
+            step_ms: step,
+        }
+    }
+
+    fn key_for(q: &str, p: &MetricQueryParams) -> CacheKey {
+        CacheKey::new(tenant(""), q, p, 300_000, None)
+    }
+
+    fn allowed() -> PlanFacts {
+        PlanFacts {
+            shape_allowed: true,
+            oldest_input_ms: 0,
+            reach_ms: 0,
+        }
+    }
+
+    fn request<'a>(q: &'a str, p: MetricQueryParams, max_samples: u64) -> RangeRequest<'a> {
+        RangeRequest {
+            key: key_for(q, &p),
+            query: q,
+            params: p,
+            facts: allowed(),
+            max_samples,
+            retention_floor_ms: Some(i64::MIN),
+            sweep_time_ms: None,
+        }
+    }
+
+    /// A one-series matrix over the grid of `p`, value `base + t / 1000`.
+    fn grid_matrix(p: &MetricQueryParams, base: f64) -> QueryResult {
+        let mut points = Vec::new();
+        let mut t = p.start_ms;
+        while t <= p.end_ms {
+            points.push((t, base + (t / 1000) as f64));
+            t += p.step_ms;
+        }
+        QueryResult::Matrix(vec![MatrixSeries {
+            labels: vec![("job".to_string(), "x".to_string())],
+            points,
+        }])
+    }
+
+    /// Counts and answers the full and tail evaluations.
+    #[derive(Default)]
+    struct Calls {
+        full: AtomicUsize,
+        tail: AtomicUsize,
+    }
+
+    type R = Result<Evaluated, ()>;
+
+    async fn run_with(
+        r: &Rig,
+        calls: &Calls,
+        req: RangeRequest<'_>,
+        full_ann: Annotations,
+        full_charge: u64,
+        tail_ann: Annotations,
+        tail_charge: u64,
+        during_tail: impl FnOnce(),
+    ) -> Answer {
+        let full = |q: MetricQueryParams| {
+            calls.full.fetch_add(1, Ordering::SeqCst);
+            async move { R::Ok((grid_matrix(&q, 0.0), full_ann, full_charge)) }
+        };
+        let tail = |q: MetricQueryParams| {
+            calls.tail.fetch_add(1, Ordering::SeqCst);
+            during_tail();
+            async move { R::Ok((grid_matrix(&q, 0.0), tail_ann, tail_charge)) }
+        };
+        answer_range(&r.cache, req, full, tail)
+            .await
+            .expect("answered")
+    }
+
+    async fn run(r: &Rig, calls: &Calls, req: RangeRequest<'_>) -> Answer {
+        run_with(
+            r,
+            calls,
+            req,
+            Annotations::new(),
+            10,
+            Annotations::new(),
+            10,
+            || {},
+        )
+        .await
+    }
+
+    /// A two-hour range at 15 s, ending `ago` before the rig's clock.
+    fn window(r: &Rig, ago: i64) -> MetricQueryParams {
+        let end = (r.now() - ago).div_euclid(15_000) * 15_000;
+        params(end - 7_200_000, end, 15_000)
+    }
+
+    fn shifted(p: &MetricQueryParams, by: i64) -> MetricQueryParams {
+        params(p.start_ms + by, p.end_ms + by, p.step_ms)
+    }
+
+    // --- §5.4: what is kept --------------------------------------------------
+
+    #[test]
+    fn u1_raw_keeps_to_the_last_grid_point_four_minutes_old() {
+        let p = params(0, V, 15_000);
+        let want = (V - 240_000).div_euclid(15_000) * 15_000;
+        assert_eq!(keep_through(V, 0, &p, 0, None), Some(want));
+    }
+
+    #[test]
+    fn u2_a_level_keeps_to_its_watermark_less_reach_and_width() {
+        let p = params(0, V, 15_000);
+        let w = V - 400_000;
+        let want = (w - 300_000 - 60_000).div_euclid(15_000) * 15_000;
+        assert_eq!(keep_through(V, 300_000, &p, 60_000, Some(w)), Some(want));
+    }
+
+    #[test]
+    fn u3_a_level_keeps_nothing_past_the_last_bucket_before_t_last() {
+        let p = params(0, V - 500_000, 600_000);
+        let t_last = (V - 500_000).div_euclid(600_000) * 600_000;
+        let gl = t_last.div_euclid(60_000) * 60_000;
+        assert!(V - SETTLE_MS > gl && V - 100_000 > gl);
+        let want = (gl - 60_000).div_euclid(600_000) * 600_000;
+        assert_eq!(
+            keep_through(V, 0, &p, 60_000, Some(V - 100_000)),
+            Some(want)
+        );
+    }
+
+    // --- §5.3: the merge -----------------------------------------------------
+
+    fn labels(n: &str) -> Vec<(String, String)> {
+        vec![("s".to_string(), n.to_string())]
+    }
+
+    #[test]
+    fn u4_merge_keeps_continuing_series_and_drops_series_out_of_range() {
+        let entry = Entry {
+            annotations: Vec::new(),
+            series: vec![
+                (
+                    labels("a"),
+                    Points::Float(vec![(0, 1.0), (10, 2.0), (20, 3.0)]),
+                ),
+                (labels("b"), Points::Float(vec![(0, 9.0)])),
+            ],
+            c0_ms: 0,
+            c1_ms: 20,
+            first_fill_ms: 0,
+            charge_bound: 0,
+            bytes: 0,
+        };
+        let tail = QueryResult::Matrix(vec![
+            MatrixSeries {
+                labels: labels("a"),
+                points: vec![(30, 4.0)],
+            },
+            MatrixSeries {
+                labels: labels("c"),
+                points: vec![(30, 7.0)],
+            },
+        ]);
+        let merged = merge(&entry, tail, 10, 30);
+        assert!(
+            matches!(merged, Some(QueryResult::Matrix(_))),
+            "a float matrix: {merged:?}"
+        );
+        let Some(QueryResult::Matrix(mut m)) = merged else {
+            unreachable!()
+        };
+        m.sort_by(|a, b| a.labels.cmp(&b.labels));
+        assert_eq!(
+            m,
+            vec![
+                MatrixSeries {
+                    labels: labels("a"),
+                    points: vec![(10, 2.0), (20, 3.0), (30, 4.0)],
+                },
+                MatrixSeries {
+                    labels: labels("c"),
+                    points: vec![(30, 7.0)],
+                },
+            ]
+        );
+    }
+
+    fn hist() -> Box<FloatHistogram> {
+        Box::new(
+            pulsus_model::NativeHistogram {
+                counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
+                schema: 0,
+                zero_threshold: 0.0,
+                zero_count: 0,
+                count: 1,
+                sum: 1.0,
+                positive_spans: vec![pulsus_model::Span {
+                    offset: 0,
+                    length: 1,
+                }],
+                negative_spans: vec![],
+                positive_buckets: vec![1],
+                negative_buckets: vec![],
+                custom_values: vec![],
+            }
+            .to_float(),
+        )
+    }
+
+    #[test]
+    fn u5_a_histogram_point_makes_the_answer_matrix_hist_only_while_in_range() {
+        let entry = Entry {
+            annotations: Vec::new(),
+            series: vec![(labels("a"), Points::Float(vec![(0, 1.0), (10, 2.0)]))],
+            c0_ms: 0,
+            c1_ms: 10,
+            first_fill_ms: 0,
+            charge_bound: 0,
+            bytes: 0,
+        };
+        let tail = || {
+            QueryResult::MatrixHist(vec![HistMatrixSeries {
+                labels: labels("a"),
+                points: vec![(20, HistOrFloat::Hist(hist()))],
+            }])
+        };
+        let merged = merge(&entry, tail(), 0, 20);
+        assert!(
+            matches!(merged, Some(QueryResult::MatrixHist(_))),
+            "MatrixHist, got {merged:?}"
+        );
+        if let Some(QueryResult::MatrixHist(m)) = merged {
+            assert_eq!(m.len(), 1);
+            assert_eq!(
+                m[0].points[..2],
+                [(0, HistOrFloat::Float(1.0)), (10, HistOrFloat::Float(2.0))]
+            );
+            assert!(matches!(m[0].points[2], (20, HistOrFloat::Hist(_))));
+        }
+        let mixed = Entry {
+            series: vec![(
+                labels("a"),
+                Points::Mixed(vec![
+                    (0, HistOrFloat::Hist(hist())),
+                    (10, HistOrFloat::Float(2.0)),
+                ]),
+            )],
+            ..entry
+        };
+        let float_tail = QueryResult::Matrix(vec![MatrixSeries {
+            labels: labels("a"),
+            points: vec![(20, 3.0)],
+        }]);
+        assert_eq!(
+            merge(&mixed, float_tail, 10, 20),
+            Some(QueryResult::Matrix(vec![MatrixSeries {
+                labels: labels("a"),
+                points: vec![(10, 2.0), (20, 3.0)],
+            }]))
+        );
+    }
+
+    // --- §5.6: limits ----------------------------------------------------------
+
+    fn small_entry() -> Entry {
+        Entry {
+            annotations: Vec::new(),
+            series: vec![(labels("a"), Points::Float(vec![(0, 1.0)]))],
+            c0_ms: 0,
+            c1_ms: 0,
+            first_fill_ms: 0,
+            charge_bound: 0,
+            bytes: 0,
+        }
+    }
+
+    #[test]
+    fn u8_a_tenant_past_its_share_loses_its_own_oldest_first() {
+        let p = params(0, 0, 15_000);
+        let k = |t: &str, q: &str| CacheKey::new(tenant(t), q, &p, 300_000, None);
+        let mut e = small_entry();
+        shrink_entry(&mut e);
+        let unit = charge(&k("a", "q1"), &e);
+        assert!(unit > 0, "an entry is charged");
+        // Budget 1,000 for entries of 300, share 50 %, in the same ratio.
+        let r = rig_with(unit * 10 / 3, 50, false);
+        let g = r.cache.generation();
+        assert!(r.cache.store(k("b", "q1"), e.clone(), g));
+        assert!(r.cache.store(k("a", "q1"), e.clone(), g));
+        assert!(r.cache.store(k("a", "q2"), e.clone(), g));
+        assert_eq!(r.cache.snapshot().evictions_total, 0);
+        assert!(r.cache.store(k("a", "q3"), e.clone(), g));
+        assert!(
+            r.cache.lookup(&k("a", "q1")).is_none(),
+            "a's oldest evicted"
+        );
+        assert!(r.cache.lookup(&k("b", "q1")).is_some(), "b kept");
+        assert!(r.cache.lookup(&k("a", "q3")).is_some());
+        let (total, _) = r.cache.usage();
+        assert!(total <= unit * 10 / 3, "total {total}");
+        assert_eq!(r.cache.snapshot().evictions_total, 1);
+    }
+
+    #[tokio::test]
+    async fn u9_an_entry_first_filled_t_max_ago_is_evaluated_in_full() {
+        let r = rig();
+        let c = Calls::default();
+        let q = "rate(x[5m])";
+        let p = window(&r, 1_800_000);
+        assert_eq!(
+            run(&r, &c, request(q, p, u64::MAX)).await.header,
+            Header::Miss
+        );
+        r.advance(ENTRY_MAX_AGE_MS - 1);
+        r.refresh_identity();
+        // Control: a millisecond inside T_max the entry still serves.
+        let a = run(&r, &c, request(q, p, u64::MAX)).await;
+        assert_eq!(a.outcome, Outcome::Hit, "control");
+        r.advance(1);
+        r.refresh_identity();
+        assert_eq!(
+            run(&r, &c, request(q, p, u64::MAX)).await.outcome,
+            Outcome::Miss
+        );
+    }
+
+    fn warned(text: &str) -> Annotations {
+        let mut a = Annotations::new();
+        a.plain_warning(text);
+        a
+    }
+
+    #[tokio::test]
+    async fn u10_tail_annotations_other_than_the_entry_s_mean_a_full_evaluation() {
+        let r = rig();
+        let c = Calls::default();
+        let q = "rate(x[5m])";
+        let p = window(&r, 0);
+        let a = run_with(
+            &r,
+            &c,
+            request(q, p, u64::MAX),
+            warned("x"),
+            10,
+            warned("x"),
+            10,
+            || {},
+        )
+        .await;
+        assert_eq!(a.header, Header::Miss);
+        // Control: the same annotations hit.
+        let a = run_with(
+            &r,
+            &c,
+            request(q, p, u64::MAX),
+            warned("x"),
+            10,
+            warned("x"),
+            10,
+            || {},
+        )
+        .await;
+        assert_eq!(a.outcome, Outcome::Hit, "control");
+        let a = run_with(
+            &r,
+            &c,
+            request(q, p, u64::MAX),
+            warned("x"),
+            10,
+            warned("y"),
+            10,
+            || {},
+        )
+        .await;
+        assert_eq!(a.outcome, Outcome::Miss);
+    }
+
+    #[test]
+    fn u11_tenant_phase_and_span_each_part_the_key() {
+        let k = |t: &str, phase: i64, span: i64| {
+            let p = params(1_000_000 + phase, 1_000_000 + phase + span, 15_000);
+            CacheKey::new(tenant(t), "up", &p, 300_000, None)
+        };
+        let keys: std::collections::HashSet<CacheKey> = [
+            k("a", 0, 7_200_000),
+            k("b", 0, 7_200_000),
+            k("a", 5_000, 7_200_000),
+            k("a", 0, 10_800_000),
+            k("b", 5_000, 10_800_000),
+            k("b", 0, 10_800_000),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn u12_a_clear_between_the_tail_and_the_store_stores_nothing() {
+        let r = rig();
+        let c = Calls::default();
+        let q = "rate(x[5m])";
+        let p = window(&r, 0);
+        assert_eq!(
+            run(&r, &c, request(q, p, u64::MAX)).await.header,
+            Header::Miss
+        );
+        // Control: a hit.
+        assert_eq!(
+            run(&r, &c, request(q, p, u64::MAX)).await.outcome,
+            Outcome::Hit,
+            "control"
+        );
+        let a = run_with(
+            &r,
+            &c,
+            request(q, p, u64::MAX),
+            Annotations::new(),
+            10,
+            Annotations::new(),
+            10,
+            || r.cache.clear(),
+        )
+        .await;
+        assert_eq!(a.outcome, Outcome::Miss);
+        assert!(r.cache.lookup(&key_for(q, &p)).is_none(), "nothing stored");
+        assert_eq!(r.cache.usage().1, 0);
+    }
+
+    #[test]
+    fn u13_every_vector_is_charged_by_capacity() {
+        let p = params(0, 0, 15_000);
+        let key = CacheKey::new(tenant(""), "h", &p, 300_000, None);
+        let build = |cap_factor: usize| {
+            let points: Vec<(i64, HistOrFloat)> = (0..100)
+                .map(|i| {
+                    let mut h = *hist();
+                    let mut b = Vec::with_capacity(50 * cap_factor);
+                    b.extend(std::iter::repeat_n(1.0, 50));
+                    h.positive_buckets = b;
+                    (i, HistOrFloat::Hist(Box::new(h)))
+                })
+                .collect();
+            let mut pts = Vec::with_capacity(points.len() * cap_factor);
+            pts.extend(points);
+            Entry {
+                annotations: Vec::new(),
+                series: vec![(labels("a"), Points::Mixed(pts))],
+                c0_ms: 0,
+                c1_ms: 0,
+                first_fill_ms: 0,
+                charge_bound: 0,
+                bytes: 0,
+            }
+        };
+        let mut shrunk = build(4);
+        shrink_entry(&mut shrunk);
+        let charged = charge(&key, &shrunk);
+        let Points::Mixed(points) = &shrunk.series[0].1 else {
+            unreachable!()
+        };
+        let mut independent = points.capacity() * std::mem::size_of::<(i64, HistOrFloat)>();
+        for (_, p) in points {
+            if let HistOrFloat::Hist(h) = p {
+                independent += h.positive_buckets.capacity() * 8
+                    + h.negative_buckets.capacity() * 8
+                    + h.custom_values.capacity() * 8
+                    + h.positive_spans.capacity() * std::mem::size_of::<pulsus_model::Span>()
+                    + h.negative_spans.capacity() * std::mem::size_of::<pulsus_model::Span>();
+            }
+        }
+        assert!(
+            charged as usize >= independent,
+            "charged {charged} against {independent}"
+        );
+        let unshrunk = build(4);
+        assert!(charge(&key, &unshrunk) > charged, "capacity, not length");
+    }
+
+    #[tokio::test]
+    async fn u14_a_hit_whose_charge_could_pass_the_cap_is_evaluated_in_full() {
+        let r = rig();
+        let c = Calls::default();
+        let q = "rate(x[5m])";
+        let p = window(&r, 0);
+        let go = |tail_charge: u64| {
+            run_with(
+                &r,
+                &c,
+                request(q, p, 1_000),
+                Annotations::new(),
+                900,
+                Annotations::new(),
+                tail_charge,
+                || {},
+            )
+        };
+        assert_eq!(go(0).await.header, Header::Miss);
+        // Control: 900 + 100 is within the cap.
+        assert_eq!(go(100).await.outcome, Outcome::Hit, "control");
+        assert_eq!(go(200).await.outcome, Outcome::Miss);
+    }
+
+    #[test]
+    fn u15_fills_need_a_whole_lag_history_under_five_seconds() {
+        let r = rig_with(1 << 20, 50, true);
+        let now = r.now();
+        let v = now;
+        // A 12 s gap inside [V − 10 s, now].
+        r.cache.record_lag(now - 20_000, 0);
+        r.cache.record_lag(now - 15_000, 0);
+        r.cache.record_lag(now - 3_000, 0);
+        assert!(!r.cache.fills_allowed(v), "a 12 s gap");
+        let r = rig_with(1 << 20, 50, true);
+        for t in [20_000, 15_000, 10_000, 5_000, 0] {
+            r.cache.record_lag(now - t, if t == 5_000 { 5 } else { 0 });
+        }
+        assert!(!r.cache.fills_allowed(v), "one read of 5");
+        let r = rig_with(1 << 20, 50, true);
+        for t in [20_000, 15_000, 10_000, 5_000, 0] {
+            r.cache.record_lag(now - t, 4);
+        }
+        assert!(r.cache.fills_allowed(v), "reads 5 s apart, all under 5");
+    }
+
+    #[test]
+    fn u16_a_new_database_identity_clears_the_cache() {
+        let r = rig();
+        let p = params(0, 0, 15_000);
+        let g = r.cache.generation();
+        assert!(r.cache.store(key_for("up", &p), small_entry(), g));
+        r.cache.record_identity(r.now(), vec!["other".to_string()]);
+        assert_eq!(r.cache.generation(), g + 1);
+        assert_eq!(r.cache.usage().1, 0);
+        assert_eq!(r.cache.snapshot().clears_total, 1);
+    }
+
+    #[tokio::test]
+    async fn u17_a_hit_without_the_lag_gate_serves_but_keeps_no_more() {
+        let r = rig_with(64 * 1024 * 1024, 50, true);
+        r.refresh_identity();
+        let lag = |r: &Rig, v: u64| {
+            for t in [20_000, 15_000, 10_000, 5_000, 0] {
+                r.cache.record_lag(r.now() - t, v);
+            }
+        };
+        lag(&r, 0);
+        let c = Calls::default();
+        let q = "rate(x[5m])";
+        let p = window(&r, 0);
+        assert_eq!(
+            run(&r, &c, request(q, p, u64::MAX)).await.header,
+            Header::Miss
+        );
+        let before = r.cache.lookup(&key_for(q, &p)).expect("kept");
+        r.advance(60_000);
+        r.refresh_identity();
+        lag(&r, 9);
+        let p2 = shifted(&p, 60_000);
+        let a = run(&r, &c, request(q, p2, u64::MAX)).await;
+        assert_eq!(a.outcome, Outcome::Hit);
+        assert_eq!(a.through_ms, Some(before.c1_ms));
+        let after = r.cache.lookup(&key_for(q, &p2)).expect("still kept");
+        assert_eq!(*after, *before, "the entry is unchanged");
+    }
+
+    #[tokio::test]
+    async fn u18_identity_unread_for_ten_seconds_bypasses_until_read_again() {
+        let r = rig();
+        let c = Calls::default();
+        let q = "rate(x[5m])";
+        let p = window(&r, 1_800_000);
+        assert_eq!(
+            run(&r, &c, request(q, p, u64::MAX)).await.header,
+            Header::Miss
+        );
+        r.advance(11_000);
+        let a = run(&r, &c, request(q, p, u64::MAX)).await;
+        assert_eq!(a.header, Header::Bypass, "no hit and nothing stored");
+        assert_eq!(a.outcome, Outcome::Miss);
+        r.refresh_identity();
+        assert_eq!(
+            run(&r, &c, request(q, p, u64::MAX)).await.outcome,
+            Outcome::Hit
+        );
+    }
+
+    #[tokio::test]
+    async fn u19_a_replacement_keeps_the_first_fill_time() {
+        let r = rig();
+        let c = Calls::default();
+        let q = "rate(x[5m])";
+        let mut p = window(&r, 0);
+        assert_eq!(
+            run(&r, &c, request(q, p, u64::MAX)).await.header,
+            Header::Miss
+        );
+        let first = r.cache.lookup(&key_for(q, &p)).expect("kept").first_fill_ms;
+        let mut hits = 0;
+        loop {
+            r.advance(60_000);
+            r.refresh_identity();
+            p = shifted(&p, 60_000);
+            let a = run(&r, &c, request(q, p, u64::MAX)).await;
+            if r.now() - first >= ENTRY_MAX_AGE_MS {
+                assert_eq!(a.outcome, Outcome::Miss, "at first_fill + T_max");
+                break;
+            }
+            assert_eq!(a.outcome, Outcome::Hit);
+            hits += 1;
+            let e = r.cache.lookup(&key_for(q, &p)).expect("replaced");
+            assert_eq!(e.first_fill_ms, first);
+        }
+        assert_eq!(hits, 59);
+    }
+
+    fn planned(q: &str, step: i64) -> QueryPlan {
+        let expr = pulsus_promql::parse(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let params = pulsus_promql::PlanParams {
+            start_ms: 3_600_000,
+            end_ms: if step == 0 { 3_600_000 } else { 10_800_000 },
+            step_ms: step,
+            lookback_ms: 300_000,
+            experimental_functions: true,
+        };
+        pulsus_promql::plan(&expr, params).unwrap_or_else(|e| panic!("{q}: {e}"))
+    }
+
+    #[test]
+    fn u20_the_gate_admits_the_listed_shapes_only() {
+        // One query per §5.9 row; the instant-only rows are planned instant.
+        let allowed = [
+            ("Selector, offset", "x offset 5m", 60_000),
+            ("Selector, negative offset", "x offset -5m", 60_000),
+            ("RangeFn", "rate(x[5m])", 60_000),
+            ("OverTime", "max_over_time(x[5m])", 60_000),
+            ("OverTimeParam", "quantile_over_time(0.9, x[5m])", 60_000),
+            ("Aggregate", "sum by (i) (rate(x[5m]))", 60_000),
+            ("Aggregate topk", "topk(3, x)", 60_000),
+            ("Binary", "x * on(i) group_left(j) y", 60_000),
+            ("Binary bool", "x > bool 1", 60_000),
+            ("Unary minus", "-x", 60_000),
+            ("SetOp and", "x and y", 60_000),
+            ("SetOp unless", "x unless y", 60_000),
+            (
+                "HistogramQuantile",
+                "histogram_quantile(0.9, rate(h[5m]))",
+                60_000,
+            ),
+            ("Scalar", "1 + 2", 60_000),
+        ];
+        let refused = [
+            ("duration expression", "rate(x[range() / 24])", 60_000),
+            ("@", "rate(x[5m] @ end())", 60_000),
+            ("subquery", "rate(x[5m:1m])", 60_000),
+            ("SetOp or", "(x > 50) or (x + 1)", 60_000),
+            ("anchored", "rate(x[5m] anchored)", 60_000),
+            ("smoothed", "rate(x[5m] smoothed)", 60_000),
+            ("Binary fill", "x + fill(0) y", 60_000),
+            ("Aggregate group", "group(x)", 60_000),
+            ("Aggregate stddev", "stddev(x)", 60_000),
+            ("Aggregate stdvar", "stdvar(x)", 60_000),
+            ("Aggregate quantile", "quantile(0.9, x)", 60_000),
+            ("Aggregate limitk", "limitk(2, x)", 60_000),
+            ("Aggregate limit_ratio", "limit_ratio(0.5, x)", 60_000),
+            ("CountValues", "count_values(\"v\", x)", 60_000),
+            ("Absent", "absent(x)", 60_000),
+            ("AbsentOverTime", "absent_over_time(x[5m])", 60_000),
+            (
+                "LabelReplace",
+                "label_replace(x, \"a\", \"$1\", \"i\", \"(.*)\")",
+                60_000,
+            ),
+            ("LabelJoin", "label_join(x, \"a\", \",\", \"i\")", 60_000),
+            (
+                "HistogramQuantiles",
+                "histogram_quantiles(h, \"q\", 0.5, 0.9)",
+                60_000,
+            ),
+            ("HistogramAccessor", "histogram_count(h)", 60_000),
+            ("HistogramFraction", "histogram_fraction(0, 1, h)", 60_000),
+            ("MathFn", "abs(x)", 60_000),
+            ("ScalarFn", "clamp_min(x, 0)", 60_000),
+            ("Time", "time()", 60_000),
+            ("DateFn", "hour()", 60_000),
+            ("Timestamp", "timestamp(x)", 60_000),
+            ("ScalarOf", "scalar(x)", 60_000),
+            ("VectorOf", "vector(1)", 60_000),
+            ("Info", "info(x)", 60_000),
+            ("Sort", "sort(x)", 0),
+            ("SortByLabel", "sort_by_label(x, \"i\")", 0),
+            ("RangeVector", "x[5m]", 0),
+            ("StringLiteral", "\"s\"", 0),
+        ];
+        for (row, q, step) in allowed {
+            assert!(shape_allowed(&planned(q, step)), "allowed row {row}: {q}");
+        }
+        for (row, q, step) in refused {
+            assert!(!shape_allowed(&planned(q, step)), "refused row {row}: {q}");
+        }
+    }
+
+    #[tokio::test]
+    async fn u21_identity_lapsing_during_the_tail_means_a_full_evaluation() {
+        let r = rig();
+        let c = Calls::default();
+        let q = "rate(x[5m])";
+        let p = window(&r, 0);
+        assert_eq!(
+            run(&r, &c, request(q, p, u64::MAX)).await.header,
+            Header::Miss
+        );
+        let c = Calls::default();
+        let a = run_with(
+            &r,
+            &c,
+            request(q, p, u64::MAX),
+            Annotations::new(),
+            10,
+            Annotations::new(),
+            10,
+            || r.advance(11_000),
+        )
+        .await;
+        assert_eq!(c.tail.load(Ordering::SeqCst), 1, "the tail ran");
+        assert_eq!(c.full.load(Ordering::SeqCst), 1, "then a full evaluation");
+        assert_eq!(a.outcome, Outcome::Miss);
+        assert_eq!(a.result, grid_matrix(&p, 0.0), "the full answer");
+    }
+
+    fn forced() -> Annotations {
+        let mut a = Annotations::new();
+        a.forced_monotonicity_info_at(
+            0,
+            "PromQL info: input to histogram_quantile needed to be fixed for monotonicity",
+            pulsus_promql::ForcedMonotonicityDetail::single(1_000, 0.5, 1.0, 1.0),
+        );
+        a
+    }
+
+    #[tokio::test]
+    async fn u22_a_mergeable_annotation_is_never_kept_nor_answered_from_kept_points() {
+        let q = "histogram_quantile(0.9, rate(h_bucket[5m]))";
+        // (a) control: rendered annotations equal and no detail: a hit.
+        let r = rig();
+        let p = window(&r, 0);
+        let c = Calls::default();
+        assert_eq!(
+            run(&r, &c, request(q, p, u64::MAX)).await.header,
+            Header::Miss
+        );
+        let c = Calls::default();
+        let a = run(&r, &c, request(q, p, u64::MAX)).await;
+        assert_eq!(c.tail.load(Ordering::SeqCst), 1, "(a) tail");
+        assert_eq!(c.full.load(Ordering::SeqCst), 0, "(a) full");
+        assert_eq!(a.outcome, Outcome::Hit, "(a)");
+        // (b) the tail carries a forced-monotonicity detail whose rendering
+        // equals the entry's.
+        let entry_text = rendered_annotations(&forced(), q);
+        let key = key_for(q, &p);
+        let mut e = (*r.cache.lookup(&key).expect("kept")).clone();
+        e.annotations = entry_text;
+        assert!(r.cache.store(key.clone(), e, r.cache.generation()));
+        let before = r.cache.lookup(&key).expect("kept");
+        let c = Calls::default();
+        let a = run_with(
+            &r,
+            &c,
+            request(q, p, u64::MAX),
+            forced(),
+            10,
+            forced(),
+            10,
+            || {},
+        )
+        .await;
+        assert_eq!(c.tail.load(Ordering::SeqCst), 1, "(b) tail");
+        assert_eq!(c.full.load(Ordering::SeqCst), 1, "(b) full");
+        assert_eq!(a.outcome, Outcome::Miss, "(b)");
+        assert_eq!(
+            *r.cache.lookup(&key).expect("kept"),
+            *before,
+            "(b) unchanged"
+        );
+        // (c) a miss whose answer carries one is not stored.
+        let r = rig();
+        let c = Calls::default();
+        let a = run_with(
+            &r,
+            &c,
+            request(q, p, u64::MAX),
+            forced(),
+            10,
+            forced(),
+            10,
+            || {},
+        )
+        .await;
+        assert_eq!(a.header, Header::Bypass, "(c) not stored");
+        let c = Calls::default();
+        run_with(
+            &r,
+            &c,
+            request(q, p, u64::MAX),
+            forced(),
+            10,
+            forced(),
+            10,
+            || {},
+        )
+        .await;
+        assert_eq!(c.tail.load(Ordering::SeqCst), 0, "(c) no tail");
+        assert_eq!(c.full.load(Ordering::SeqCst), 1, "(c) full");
+    }
+}

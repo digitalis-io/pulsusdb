@@ -2040,6 +2040,31 @@ mod tests {
         }
     }
 
+    /// Issue #778: the read cache's tenant share is a percent from 1 to
+    /// 100, refused outside it naming its field; the defaults are 256 MiB
+    /// and 50.
+    #[test]
+    fn the_read_cache_tenant_share_is_1_to_100_and_the_defaults_are_256mib_and_50() {
+        let d = Config::default();
+        assert_eq!(d.reader.read_cache_bytes.0, 256 * 1024 * 1024);
+        assert_eq!(d.reader.read_cache_tenant_share, 50);
+        for share in [0u8, 101] {
+            let mut cfg = Config::default();
+            cfg.reader.read_cache_tenant_share = share;
+            match validate(&cfg) {
+                Err(ConfigError::Value { field, .. }) => {
+                    assert_eq!(field, "reader.read_cache_tenant_share", "share {share}");
+                }
+                other => panic!("share {share}: expected a Value error, got {other:?}"),
+            }
+        }
+        for share in [1u8, 100] {
+            let mut cfg = Config::default();
+            cfg.reader.read_cache_tenant_share = share;
+            assert!(validate(&cfg).is_ok(), "share {share}");
+        }
+    }
+
     /// Issue #43: a multi-endpoint entry with an empty host is rejected at
     /// load, naming the indexed field.
     #[test]

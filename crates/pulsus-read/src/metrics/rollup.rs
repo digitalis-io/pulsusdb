@@ -289,10 +289,19 @@ pub struct Route {
 /// read. `None` for an instant query, no levels, or a range below the
 /// first switch point.
 pub fn resolution(p: &MetricQueryParams, levels: &Levels) -> Option<i64> {
-    if p.step_ms <= 0 || p.end_ms < p.start_ms {
+    if p.end_ms < p.start_ms {
         return None;
     }
-    let span = i128::from(p.end_ms) - i128::from(p.start_ms);
+    resolution_for_span(p.end_ms - p.start_ms, p.step_ms, levels)
+}
+
+/// Issue #778: [`resolution`] for a range of `span_ms`, whatever the grid
+/// it is evaluated on: a read cache tail is routed as its whole request is.
+pub fn resolution_for_span(span_ms: i64, step_ms: i64, levels: &Levels) -> Option<i64> {
+    if step_ms <= 0 || span_ms < 0 {
+        return None;
+    }
+    let span = i128::from(span_ms);
     levels
         .levels
         .iter()
@@ -375,7 +384,19 @@ pub fn lattice_range(sel: &SelectorSpec, levels: &Levels, width: i64) -> Option<
 
 /// D2 and D5: the lattice of a range query, or `None` for `main`'s path.
 pub fn lattice(plan: &QueryPlan, p: &MetricQueryParams, levels: &Levels) -> Option<Lattice> {
-    let width = resolution(p, levels)?;
+    lattice_with(plan, p, levels, resolution(p, levels)?)
+}
+
+/// Issue #778: [`lattice`] at a given resolution `width`.
+pub fn lattice_with(
+    plan: &QueryPlan,
+    p: &MetricQueryParams,
+    levels: &Levels,
+    width: i64,
+) -> Option<Lattice> {
+    if p.step_ms <= 0 {
+        return None;
+    }
     if plan.selectors.is_empty()
         || plan.selectors.iter().any(|s| s.at_ms.is_some())
         || pulsus_promql::reads_eval_time(&plan.root)
