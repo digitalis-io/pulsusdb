@@ -976,6 +976,10 @@ pub struct QueryPlan {
     pub root: PlanExpr,
     pub selectors: Vec<SelectorSpec>,
     pub params: PlanParams,
+    /// Issue #778: a duration expression (`range()`, `step()`, arithmetic in
+    /// a range, offset or subquery field) was planned. Such a query reads
+    /// the request's own span, so the read cache refuses it.
+    pub uses_duration_expr: bool,
 }
 
 // Issue #33 architect adjudication (superseding #31's ratified zero-
@@ -1029,9 +1033,20 @@ struct Planner {
     step_ms: i64,
     ctx: SubqueryCtx,
     subquery_depth: usize,
+    /// Issue #778: set when a duration expression is planned
+    /// ([`QueryPlan::uses_duration_expr`]). A `Cell` because the subquery
+    /// fields are resolved through `&Planner`.
+    uses_duration_expr: std::cell::Cell<bool>,
 }
 
 impl Planner {
+    /// Issue #778: records that `e` is a duration expression, if it is one.
+    fn note_duration_expr(&self, e: &Option<DurationExpr>) {
+        if e.is_some() {
+            self.uses_duration_expr.set(true);
+        }
+    }
+
     /// `info_family` (issue #82, retroactive re-review v4 Δ1): `true`
     /// only from `plan_info`'s single call site — marks the synthetic
     /// `*_info` metadata-family selector for the reader's
@@ -1172,6 +1187,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
                 root: PlanExpr::StringLiteral(s.val.clone()),
                 selectors: Vec::new(),
                 params,
+                uses_duration_expr: false,
             });
         }
         // Issue #154 (owner-approved): a TOP-LEVEL matrix selector of an
@@ -1193,6 +1209,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
                 step_ms: params.step_ms,
                 ctx: SubqueryCtx::default(),
                 subquery_depth: 0,
+                uses_duration_expr: std::cell::Cell::new(false),
             };
             // Directly through the matrix-selector planner — the
             // identical `SelectorSpec` fetch/pushdown as `rate()`'s
@@ -1214,6 +1231,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
             // caller of `plan_range_source` keeps it.
             let id = plan_matrix_selector_id(&mut planner, ms)?;
             let source = RangeSource::Selector(id);
+            let uses_duration_expr = planner.uses_duration_expr.get();
             let mut selectors = planner.selectors;
             let root = PlanExpr::RangeVector { source };
             detect_histogram_stats(&root, &mut selectors);
@@ -1222,6 +1240,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
                 root,
                 selectors,
                 params,
+                uses_duration_expr,
             });
         }
     }
@@ -1234,8 +1253,10 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
         step_ms: params.step_ms,
         ctx: SubqueryCtx::default(),
         subquery_depth: 0,
+        uses_duration_expr: std::cell::Cell::new(false),
     };
     let root = plan_expr(&mut planner, expr)?;
+    let uses_duration_expr = planner.uses_duration_expr.get();
     let mut selectors = planner.selectors;
     detect_histogram_stats(&root, &mut selectors);
     assign_rollup_use(&root, &mut selectors);
@@ -1243,6 +1264,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
         root,
         selectors,
         params,
+        uses_duration_expr,
     })
 }
 
@@ -1941,6 +1963,7 @@ fn plan_vector_selector(
 ) -> Result<PlanExpr, PromqlError> {
     // Issue #84/#150: gate before any resolution.
     gate_duration_expr(&vs.offset_expr, planner.experimental)?;
+    planner.note_duration_expr(&vs.offset_expr);
     gate_extended_modifier(vs.anchored, vs.smoothed, planner.experimental)?;
     let (metric_name, name_matchers, matchers) = extract_name_and_matchers(vs)?;
     let at_ms = planner.resolve_at(&vs.at);
@@ -1971,6 +1994,8 @@ fn plan_matrix_selector_id(
     // Issue #84/#150: gate before any resolution.
     gate_duration_expr(&ms.range_expr, planner.experimental)?;
     gate_duration_expr(&ms.vs.offset_expr, planner.experimental)?;
+    planner.note_duration_expr(&ms.range_expr);
+    planner.note_duration_expr(&ms.vs.offset_expr);
     gate_extended_modifier(ms.vs.anchored, ms.vs.smoothed, planner.experimental)?;
     let (metric_name, name_matchers, matchers) = extract_name_and_matchers(&ms.vs)?;
     let at_ms = planner.resolve_at(&ms.vs.at);
@@ -2040,6 +2065,9 @@ fn resolve_subquery_fields(
     gate_duration_expr(&sq.range_expr, planner.experimental)?;
     gate_duration_expr(&sq.step_expr, planner.experimental)?;
     gate_duration_expr(&sq.offset_expr, planner.experimental)?;
+    planner.note_duration_expr(&sq.range_expr);
+    planner.note_duration_expr(&sq.step_expr);
+    planner.note_duration_expr(&sq.offset_expr);
     let range_ms = planner.resolve_range_ms(sq.range, &sq.range_expr)?;
     let step_ms = match &sq.step_expr {
         Some(e) => resolve_duration_expr(e, planner.step_ms, planner.query_range_ms(), false)?,

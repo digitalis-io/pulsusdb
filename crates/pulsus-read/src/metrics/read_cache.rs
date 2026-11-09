@@ -30,14 +30,15 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use pulsus_clickhouse::{ChClient, QuerySettings, Row};
 use pulsus_model::{FloatHistogram, Tenant};
-use pulsus_promql::{Annotations, QueryPlan};
+use pulsus_promql::plan::RangeSource;
+use pulsus_promql::{AggOp, Annotations, FillValues, PlanExpr, QueryPlan, SelectorSpec, SetOp};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
 use super::exec::{MetricQueryParams, PlanFacts};
 use super::rollup::LevelSlot;
 use crate::logql::escape::ch_string;
-use crate::logql::{HistOrFloat, QueryResult};
+use crate::logql::{HistMatrixSeries, HistOrFloat, MatrixSeries, QueryResult};
 
 /// A sample whose push reaches PulsusDB within this of its timestamp is in
 /// every kept point it affects (`L`).
@@ -62,6 +63,8 @@ pub const ENTRY_OVERHEAD_BYTES: u64 = 256;
 const LAG_HISTORY_MS: i64 = 300_000;
 /// How long a successful identity read stays fresh.
 const IDENTITY_FRESH_MS: i64 = 10_000;
+/// The span `V − 10 s` of the lag gate.
+const LAG_GATE_SPAN_MS: i64 = 10_000;
 /// The annotation caps the response encoder renders with.
 const ANNOTATION_CAP: usize = 10;
 
@@ -99,16 +102,14 @@ impl CacheKey {
         lookback_ms: i64,
         resolution_ms: Option<i64>,
     ) -> Self {
-        // Red rule (issue #778 part 1, commit 1): a do-nothing version.
-        let _ = (lookback_ms, resolution_ms);
         CacheKey {
             tenant,
             query: Arc::from(query),
             step_ms: p.step_ms,
-            phase_ms: 0,
-            span_ms: 0,
-            lookback_ms: 0,
-            resolution_ms: 0,
+            phase_ms: p.start_ms.rem_euclid(p.step_ms.max(1)),
+            span_ms: p.end_ms - p.start_ms,
+            lookback_ms,
+            resolution_ms: resolution_ms.unwrap_or(0),
         }
     }
 }
@@ -369,9 +370,16 @@ impl ReadCache {
 
     /// The entry under `key`, made most recently used.
     pub fn lookup(&self, key: &CacheKey) -> Option<Arc<Entry>> {
-        // Red rule (issue #778 part 1, commit 1): a do-nothing version.
-        let _ = key;
-        None
+        let mut store = lock(&self.store);
+        let store = &mut *store;
+        store.tick += 1;
+        let tick = store.tick;
+        let (entry, old) = store.map.get_mut(key)?;
+        let entry = Arc::clone(entry);
+        let old_tick = std::mem::replace(old, tick);
+        store.lru.remove(&old_tick);
+        store.lru.insert(tick, key.clone());
+        Some(entry)
     }
 
     /// Stores `entry` under `key` unless a clear moved the generation past
@@ -427,8 +435,9 @@ impl ReadCache {
             Header::Miss => self.metrics.misses.fetch_add(1, Ordering::Relaxed),
             Header::Bypass => self.metrics.bypasses.fetch_add(1, Ordering::Relaxed),
         };
-        // Red rule (issue #778 part 1, commit 1): no bypass reason recorded.
-        let _ = reason;
+        if let Some(r) = reason {
+            self.metrics.bypass_reasons[r.index()].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Counts a request that bypassed the cache before reaching it.
@@ -497,10 +506,17 @@ impl ReadCache {
     /// P3: the database identity set, read by a statement started at
     /// `started_ms`. A set other than the last clears the cache.
     pub fn record_identity(&self, started_ms: i64, ids: Vec<String>) {
-        // Red rule (issue #778 part 1, commit 1): a do-nothing version.
-        let mut poll = self.poll_write();
-        poll.identity = Some(ids.into());
-        poll.identity_ok_at = Some(started_ms);
+        let ids: Arc<[String]> = ids.into();
+        let changed = {
+            let mut poll = self.poll_write();
+            let changed = poll.identity.as_ref().is_some_and(|last| **last != *ids);
+            poll.identity = Some(ids);
+            poll.identity_ok_at = Some(started_ms);
+            changed
+        };
+        if changed {
+            self.clear();
+        }
     }
 
     /// A poll statement failed.
@@ -520,9 +536,34 @@ impl ReadCache {
     /// no gap above [`LAG_READ_MAX_AGE_MS`], every read under
     /// [`LAG_FILL_LIMIT_S`].
     pub fn fills_allowed(&self, v_ms: i64) -> bool {
-        // Red rule (issue #778 part 1, commit 1): a do-nothing version.
-        let _ = v_ms;
-        true
+        if !self.config.clustered {
+            return true;
+        }
+        let now = self.now_ms();
+        let from = v_ms - LAG_GATE_SPAN_MS;
+        let poll = self.poll_read();
+        let reads: Vec<(i64, u64)> = poll
+            .lag_history
+            .iter()
+            .copied()
+            .filter(|(t, _)| *t <= now)
+            .collect();
+        let before = reads.iter().rev().find(|(t, _)| *t < from).copied();
+        let mut covered: Vec<(i64, u64)> = before.into_iter().collect();
+        covered.extend(reads.iter().copied().filter(|(t, _)| *t >= from));
+        if covered.is_empty() {
+            return false;
+        }
+        // Gaps are between consecutive reads, the read before `V − 10 s`
+        // included; with none before it, the first gap is from `V − 10 s`.
+        let mut edge = covered[0].0.min(from);
+        for (t, lag) in &covered {
+            if *lag >= LAG_FILL_LIMIT_S || *t - edge > LAG_READ_MAX_AGE_MS {
+                return false;
+            }
+            edge = edge.max(*t);
+        }
+        now - edge <= LAG_READ_MAX_AGE_MS
     }
 
     /// `W`: the least latest watermark over the levels of width at most
@@ -548,9 +589,23 @@ pub fn keep_through(
     res_ms: i64,
     watermark: Option<i64>,
 ) -> Option<i64> {
-    // Red rule (issue #778 part 1, commit 1): a do-nothing version.
-    let _ = (v_ms, reach_ms, p, res_ms, watermark);
-    None
+    if p.step_ms <= 0 || p.end_ms < p.start_ms {
+        return None;
+    }
+    let reach = reach_ms.max(0);
+    let t_last = p.start_ms + (p.end_ms - p.start_ms).div_euclid(p.step_ms) * p.step_ms;
+    let k = if res_ms == 0 {
+        v_ms - SETTLE_MS - reach
+    } else {
+        let w = watermark?;
+        let gl = t_last.div_euclid(res_ms) * res_ms;
+        (v_ms - SETTLE_MS).min(w).min(gl) - reach - res_ms
+    };
+    let k = k.min(t_last);
+    if k < p.start_ms {
+        return None;
+    }
+    Some(p.start_ms + (k - p.start_ms).div_euclid(p.step_ms) * p.step_ms)
 }
 
 /// The rendered annotations an entry compares, as the encoder renders
@@ -646,18 +701,132 @@ pub fn shrink_entry(entry: &mut Entry) {
 
 /// Every retained allocation of `key` and `entry`, by capacity (§5.6).
 pub fn charge(key: &CacheKey, entry: &Entry) -> u64 {
-    // Red rule (issue #778 part 1, commit 1): a do-nothing version.
-    let _ = (key, entry);
-    0
+    use std::mem::size_of;
+    let mut bytes = size_of::<CacheKey>() + key.query.len() + key.tenant.as_str().len();
+    bytes += size_of::<Entry>() + ENTRY_OVERHEAD_BYTES as usize;
+    bytes += entry.annotations.capacity() * size_of::<String>();
+    bytes += entry
+        .annotations
+        .iter()
+        .map(String::capacity)
+        .sum::<usize>();
+    bytes += entry.series.capacity() * size_of::<(Vec<(String, String)>, Points)>();
+    for (labels, points) in &entry.series {
+        bytes += labels.capacity() * size_of::<(String, String)>();
+        bytes += labels
+            .iter()
+            .map(|(k, v)| k.capacity() + v.capacity())
+            .sum::<usize>();
+        bytes += match points {
+            Points::Float(v) => v.capacity() * size_of::<(i64, f64)>(),
+            Points::Mixed(v) => {
+                v.capacity() * size_of::<(i64, HistOrFloat)>()
+                    + v.iter()
+                        .map(|(_, p)| match p {
+                            HistOrFloat::Hist(h) => histogram_bytes(h),
+                            HistOrFloat::Float(_) => 0,
+                        })
+                        .sum::<usize>()
+            }
+        };
+    }
+    bytes as u64
+}
+
+fn histogram_bytes(h: &FloatHistogram) -> usize {
+    use std::mem::size_of;
+    size_of::<FloatHistogram>()
+        + h.positive_spans.capacity() * size_of::<pulsus_model::Span>()
+        + h.negative_spans.capacity() * size_of::<pulsus_model::Span>()
+        + h.positive_buckets.capacity() * size_of::<f64>()
+        + h.negative_buckets.capacity() * size_of::<f64>()
+        + h.custom_values.capacity() * size_of::<f64>()
 }
 
 /// The kept points in `[start, c1]`, then the tail's (§5.3). A series with
 /// no point in `[start, end]` is dropped; the answer is `MatrixHist` when a
 /// histogram point remains. `None` when the tail is not a matrix.
 pub fn merge(entry: &Entry, tail: QueryResult, start_ms: i64, end_ms: i64) -> Option<QueryResult> {
-    // Red rule (issue #778 part 1, commit 1): a do-nothing version.
-    let _ = (entry, tail, start_ms, end_ms);
-    None
+    let mut order: Vec<Vec<(String, String)>> = Vec::new();
+    let mut points: HashMap<Vec<(String, String)>, Vec<(i64, HistOrFloat)>> = HashMap::new();
+    let mut push = |labels: &Vec<(String, String)>, t: i64, v: HistOrFloat| {
+        if t < start_ms || t > end_ms {
+            return;
+        }
+        if !points.contains_key(labels) {
+            order.push(labels.clone());
+        }
+        points.entry(labels.clone()).or_default().push((t, v));
+    };
+    for (labels, kept) in &entry.series {
+        match kept {
+            Points::Float(v) => {
+                for (t, x) in v.iter().filter(|(t, _)| *t <= entry.c1_ms) {
+                    push(labels, *t, HistOrFloat::Float(*x));
+                }
+            }
+            Points::Mixed(v) => {
+                for (t, x) in v.iter().filter(|(t, _)| *t <= entry.c1_ms) {
+                    push(labels, *t, x.clone());
+                }
+            }
+        }
+    }
+    match tail {
+        QueryResult::Matrix(items) => {
+            for s in items {
+                for (t, x) in s.points {
+                    if t > entry.c1_ms {
+                        push(&s.labels, t, HistOrFloat::Float(x));
+                    }
+                }
+            }
+        }
+        QueryResult::MatrixHist(items) => {
+            for s in items {
+                for (t, x) in s.points {
+                    if t > entry.c1_ms {
+                        push(&s.labels, t, x);
+                    }
+                }
+            }
+        }
+        _ => return None,
+    }
+    let any_hist = points
+        .values()
+        .any(|v| v.iter().any(|(_, x)| matches!(x, HistOrFloat::Hist(_))));
+    let series: Vec<(Vec<(String, String)>, Vec<(i64, HistOrFloat)>)> = order
+        .into_iter()
+        .filter_map(|labels| {
+            let pts = points.remove(&labels)?;
+            Some((labels, pts))
+        })
+        .collect();
+    Some(if any_hist {
+        QueryResult::MatrixHist(
+            series
+                .into_iter()
+                .map(|(labels, points)| HistMatrixSeries { labels, points })
+                .collect(),
+        )
+    } else {
+        QueryResult::Matrix(
+            series
+                .into_iter()
+                .map(|(labels, points)| MatrixSeries {
+                    labels,
+                    points: points
+                        .into_iter()
+                        .map(|(t, x)| match x {
+                            HistOrFloat::Float(f) => (t, f),
+                            HistOrFloat::Hist(_) => unreachable!("no histogram point"),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        )
+    })
 }
 
 // -- the plan-shape gate (§5.9) ---------------------------------------------
@@ -667,9 +836,58 @@ pub fn merge(entry: &Entry, tail: QueryResult, start_ms: i64, end_ms: i64) -> Op
 /// a fixed-width window ending at `t − offset`, and its labels are decided
 /// by that step alone.
 pub fn shape_allowed(plan: &QueryPlan) -> bool {
-    // Red rule (issue #778 part 1, commit 1): a do-nothing version.
-    let _ = plan;
-    true
+    !plan.uses_duration_expr
+        && plan.selectors.iter().all(selector_allowed)
+        && node_allowed(&plan.root)
+}
+
+fn selector_allowed(s: &SelectorSpec) -> bool {
+    s.fetch.at_ms.is_none() && s.at_ms.is_none() && !s.anchored && !s.smoothed && !s.in_subquery
+}
+
+fn is_scalar(e: &PlanExpr) -> bool {
+    matches!(e, PlanExpr::Scalar(_))
+}
+
+fn operand_allowed(e: &PlanExpr) -> bool {
+    is_scalar(e) || node_allowed(e)
+}
+
+fn node_allowed(e: &PlanExpr) -> bool {
+    match e {
+        PlanExpr::Selector(_) | PlanExpr::Scalar(_) => true,
+        PlanExpr::RangeFn { source, .. } | PlanExpr::OverTime { source, .. } => {
+            matches!(source, RangeSource::Selector(_))
+        }
+        PlanExpr::OverTimeParam { source, args, .. } => {
+            matches!(source, RangeSource::Selector(_)) && args.iter().all(|a| is_scalar(a))
+        }
+        PlanExpr::Aggregate {
+            op, expr, param, ..
+        } => {
+            matches!(
+                op,
+                AggOp::Sum
+                    | AggOp::Avg
+                    | AggOp::Min
+                    | AggOp::Max
+                    | AggOp::Count
+                    | AggOp::Topk
+                    | AggOp::Bottomk
+            ) && param.as_deref().is_none_or(is_scalar)
+                && node_allowed(expr)
+        }
+        PlanExpr::Binary { lhs, rhs, fill, .. } => {
+            *fill == FillValues::default() && operand_allowed(lhs) && operand_allowed(rhs)
+        }
+        PlanExpr::SetOp { op, lhs, rhs, .. } => {
+            matches!(op, SetOp::And | SetOp::Unless) && node_allowed(lhs) && node_allowed(rhs)
+        }
+        PlanExpr::HistogramQuantile { quantile, expr, .. } => {
+            is_scalar(quantile) && node_allowed(expr)
+        }
+        _ => false,
+    }
 }
 
 // -- the hit and miss paths (§5.2) ------------------------------------------
@@ -730,8 +948,9 @@ where
         refuse(BypassReason::Shape);
         return bypass_full(full, p, BypassReason::Shape).await;
     }
-    // Red rule (issue #778 part 1, commit 1): the retention check admits.
-    let retention_ok = true;
+    let retention_ok = req
+        .retention_floor_ms
+        .is_some_and(|floor| req.facts.oldest_input_ms >= floor);
     if !retention_ok {
         refuse(BypassReason::Retention);
         return bypass_full(full, p, BypassReason::Retention).await;
@@ -1021,7 +1240,6 @@ pub fn spawn_poll_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logql::{HistMatrixSeries, MatrixSeries};
     use std::sync::atomic::{AtomicI64, AtomicUsize};
 
     const V: i64 = 10_000_000_000;

@@ -1037,6 +1037,17 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         ));
     }
     positive_duration("reader.tail_catchup_slice", cfg.reader.tail_catchup_slice)?;
+    // Issue #778: a tenant's share of the read cache, in percent.
+    let share = cfg.reader.read_cache_tenant_share;
+    if !(1..=100).contains(&share) {
+        return Err(range_err(
+            "reader.read_cache_tenant_share",
+            u64::from(share),
+            1,
+            100,
+            "percent",
+        ));
+    }
     positive_duration("log_rollup_resolution", cfg.log_rollup_resolution)?;
     positive_duration("ruler.poll_interval", cfg.ruler.poll_interval)?;
     positive_bytes("ruler.max_result_bytes", cfg.ruler.max_result_bytes)?;
