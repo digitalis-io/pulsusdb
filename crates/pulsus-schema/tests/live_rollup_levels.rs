@@ -1259,7 +1259,8 @@ async fn a_run_stages_what_the_next_level_reads() {
     let buckets: i64 = union(runs_60.iter().copied())
         .iter()
         .map(|&(lo, hi)| {
-            let first = lo.div_euclid(12 * MINUTE) + 1;
+            // The first bucket end with its whole bucket after `lo`.
+            let first = (lo + 12 * MINUTE - 1).div_euclid(12 * MINUTE) + 1;
             let last = hi.div_euclid(12 * MINUTE);
             (last - first + 1).max(0)
         })
