@@ -1,0 +1,14 @@
+# Issue #798: the fixture's three servers on ClickHouse 26.10.2.103, pinned
+# by the registry digest of that tag, read on 2026-11-08. Laid over
+# compose.yaml, which keeps Keeper, the object store, the network and every
+# mount; only the server image differs.
+#
+#   docker compose -f ci/clickhouse-cluster/compose.yaml \
+#     -f ci/clickhouse-cluster/compose.26.10.yaml up -d
+services:
+  ch-shard1:
+    image: docker.io/clickhouse/clickhouse-server@sha256:b2bfa4d8399ee9973868cc5c1754cb506a6f4b86fbddc41010cc090beb55c85e
+  ch-shard1b:
+    image: docker.io/clickhouse/clickhouse-server@sha256:b2bfa4d8399ee9973868cc5c1754cb506a6f4b86fbddc41010cc090beb55c85e
+  ch-shard2:
+    image: docker.io/clickhouse/clickhouse-server@sha256:b2bfa4d8399ee9973868cc5c1754cb506a6f4b86fbddc41010cc090beb55c85e

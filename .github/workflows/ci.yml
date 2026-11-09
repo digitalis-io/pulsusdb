@@ -2943,6 +2943,64 @@ jobs:
         if: always()
         run: docker compose -f ci/clickhouse-cluster/compose.yaml down -v
 
+  # Issue #798: the clustered trace suite on ClickHouse 26.10.2.103. That
+  # server refused the service-graph refresh at planning (`TOO_BIG_AST`)
+  # while every job here ran the 26.8 floor. Same fixture, with the three
+  # servers' image laid over by `compose.26.10.yaml`.
+  schema-it-cluster-26-10:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Start the 2-shard cluster on 26.10
+        run: docker compose -f ci/clickhouse-cluster/compose.yaml -f ci/clickhouse-cluster/compose.26.10.yaml up -d
+
+      - name: Wait for cluster health
+        run: |
+          for _ in $(seq 1 60); do
+            h1=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard1-it 2>/dev/null || echo starting)
+            h1b=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard1b-it 2>/dev/null || echo starting)
+            h2=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard2-it 2>/dev/null || echo starting)
+            hk=$(docker inspect -f '{{.State.Health.Status}}' pulsus-keeper-it 2>/dev/null || echo starting)
+            if [ "$h1" = healthy ] && [ "$h1b" = healthy ] && [ "$h2" = healthy ] && [ "$hk" = healthy ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::cluster did not become healthy in time"
+          docker ps -a
+          exit 1
+
+      - name: Every server is 26.10.2.103
+        run: |
+          for svc in ch-shard1 ch-shard1b ch-shard2; do
+            v=$(docker compose -f ci/clickhouse-cluster/compose.yaml -f ci/clickhouse-cluster/compose.26.10.yaml \
+                  exec -T "$svc" clickhouse-client -q 'SELECT version()')
+            echo "$svc: $v"
+            if [ "$v" != "26.10.2.103" ]; then
+              echo "::error::$svc runs $v, expected 26.10.2.103"
+              exit 1
+            fi
+          done
+
+      - name: Nested-set search and the service graph on 26.10 (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test traces_nested_set_cluster -- --show-output --skip the_job_keeps_up_under_steady_ingest
+
+      - name: Tear down the cluster
+        if: always()
+        run: docker compose -f ci/clickhouse-cluster/compose.yaml -f ci/clickhouse-cluster/compose.26.10.yaml down -v
+
   # Issue #7: e2e harness skeleton. Both legs build the local `pulsusdb:e2e`
   # image once via buildx (GHA layer cache, so the image build itself is
   # fast on both legs) then hand the whole stack lifecycle — up, poll

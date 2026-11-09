@@ -9,6 +9,7 @@
 #
 # Both images below are 26.8.21.10, pinned by digest. The reason is in
 # `.github/workflows/ci.yml`, above its "Start ClickHouse 26.8" step.
+# `compose.26.10.yaml` lays 26.10.2.103 over the three servers (issue #798).
 #
 # Bring up:
 #   podman-compose -f ci/clickhouse-cluster/compose.yaml up -d
