@@ -69,7 +69,7 @@ The window algebra of issue #18 part 3 (#740) stays as the raw functions' arithm
 | one start point per window, at its first row | measured the same as one per row on normal and sparse counters, and further from raw on stopping counters (`reading.md` §1.1) |
 | `irate`, `delta`, `resets` from a level | measured: `irate` p99 81 % at the 720 s level, `delta` median 94 %, and `resets` misses resets (`reading.md` §1.2) |
 | a parent-block main key on each level | every query would read 4 to 120 times more rows (`building.md` §6.3); the block key is the stage's, which only the runs read |
-| the next level's run reading the level itself, no stage or projection | one 720 s bucket of 20,000 series read 20,401,043 rows, the whole day partition, 84.5 times the projection's 241,555: in a series-first key every series' rows of any window share its granules (`building.md` §3.4) |
+| the next level's run reading the level itself, no stage or projection | one 720 s bucket of 20,000 series read 20,401,043 rows, the whole day partition, 84.5 times the projection's 241,555: in a series-first key every series' rows of any window share its granules. Measured on one server, output not kept, as are the next two rows' figures |
 | that read with `index_granularity = 128` | 2,800,147 rows, 11.6 times the projection's |
 | a projection holding only `_part_offset`, on the bucket key | the server did not use it (20,401,043 rows read), and it stored 167,584,767 B, 35 % of the level |
 | a replicated stage | it would send a second copy of the level to every replica; only its shard's builder writes and reads the stage |
