@@ -74,19 +74,12 @@ pub struct ChClient {
 
 impl ChClient {
     /// Connects `cfg.pool_size` connections and validates them with one
-    /// `SELECT 1` (see [`ChPool::connect`]). Emits a warning to stderr if
-    /// `tls_skip_verify` is set (edge case #5 — this relaxes certificate
+    /// `SELECT 1` (see [`ChPool::connect`], which emits a warning to stderr if
+    /// `tls_skip_verify` is set: edge case #5 — this relaxes certificate
     /// verification only, it must never look like a silent plaintext
     /// downgrade).
     pub async fn new(cfg: ChConnConfig) -> Result<Self, ChError> {
         cfg.validate()?;
-        if cfg.tls_skip_verify {
-            eprintln!(
-                "pulsus-clickhouse: CLICKHOUSE_TLS_SKIP_VERIFY=true — certificate verification \
-                 is DISABLED for this ClickHouse connection. The connection is still encrypted \
-                 (TLS is not downgraded to plaintext); only the peer certificate is unchecked."
-            );
-        }
         let default_timeout = cfg.query_timeout;
         // `cfg.consistency` is `Copy`; read it before the pool consumes `cfg`.
         // `cfg.validate()` above already enforced the quorum/deadline

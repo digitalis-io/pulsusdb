@@ -996,6 +996,10 @@ pub struct LabelCache {
     /// start. The refresh loop sweeps each, with that tenant's statement.
     pub(crate) tenants: RwLock<HashMap<Tenant, Arc<TenantCache>>>,
     pub(crate) metrics: CacheMetrics,
+    /// Issue #803: one pass at a time. A pass rebinds the one client at the
+    /// start of each attempt, so two passes at once would move each other's
+    /// binding mid-request.
+    pass: tokio::sync::Mutex<()>,
 }
 
 /// One tenant's resident cache (issue #635 part 4): its snapshot, swept
@@ -1037,6 +1041,7 @@ impl LabelCache {
             config: cfg,
             tenants: RwLock::new(tenants),
             metrics: CacheMetrics::default(),
+            pass: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1084,6 +1089,7 @@ impl LabelCache {
     /// both attempts fail, every tenant keeps its last good snapshot and
     /// counts one refresh failure.
     async fn refresh_pass(&self, tenants: &[Tenant]) -> Result<(), pulsus_clickhouse::ChError> {
+        let _one_pass = self.pass.lock().await;
         let client = &self.client;
         let config = &self.config;
         let outcome = client

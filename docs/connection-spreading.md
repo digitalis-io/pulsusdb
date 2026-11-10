@@ -90,19 +90,24 @@ A **write** lease (every insert, `execute`, `ping`) chooses an endpoint with a p
 ## Failover
 
 Selection carries no active health probing on the hot path. Instead, a
-**transport-class failure** on a real query — a connection/timeout/IO error or
-a retryable ClickHouse server code, never a bad-SQL/decode/logic error —
-demotes that endpoint. Health is published as lock-free mirror atomics for the
-hot path (`get()`'s healthy+fresh path never locks anything), backed by a tiny
-non-async transition lock — never held across an `.await`, never in `Drop` —
-that makes every state change (a demotion, a promotion, or a probe outcome)
-one atomic critical section. The next `get()` skips a demoted endpoint until a
-short cooldown elapses, then re-admits it as a probe candidate; a successful
-probe re-promotes it immediately. This matches "immediately start using other
-AZs on disconnect" with zero healthy-path overhead: at most one failed request
-per newly-dead endpoint.
+failure on a real statement demotes its endpoint. For a **write**, that is a
+transport-class failure: a connection, timeout or IO error, or a retryable
+ClickHouse server code. For a **read**, it is a server failure: a connection
+or IO error, or a network-class server code; a read that times out demotes
+nothing. A bad-SQL, decode or logic error never demotes. Health is published
+as lock-free mirror atomics for the hot path (`get()`'s healthy+fresh path
+never locks anything), backed by a tiny non-async transition lock — never
+held across an `.await`, never in `Drop` — that makes every state change (a
+demotion, a promotion, or a probe outcome) one atomic critical section. The
+next `get()` skips a demoted endpoint until a short cooldown elapses, then
+re-admits it as a probe candidate; a successful probe re-promotes it
+immediately, and new read requests skip it while it is demoted. This matches
+"immediately start using other AZs on disconnect" with zero healthy-path
+overhead. Every statement already running on an endpoint when it goes down
+can fail on it, however many requests those are: each such read request runs
+again elsewhere, and each such write returns its error.
 
-A read request whose endpoint fails is not continued elsewhere: its partial results are dropped and the whole request runs once more on another healthy endpoint, and a live tail repeats the failed poll. A read timeout is the request's own deadline: it demotes nothing and is not run again.
+A read request whose endpoint fails is not continued elsewhere: its partial results are dropped and the whole request runs once more on another healthy endpoint, never the one that failed, and a live tail repeats the failed read on another endpoint. No read runs more than twice. A read timeout is the request's own deadline: it demotes nothing and is not run again.
 
 Startup uses "ping-any": the pool starts if at least one endpoint answers, so
 a partially-degraded cluster is still serviceable.

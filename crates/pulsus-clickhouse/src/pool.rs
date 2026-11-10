@@ -70,8 +70,9 @@ const STALE_AFTER_MS: u64 = 30_000;
 
 /// After a transport failure demotes an endpoint, it is skipped entirely
 /// (while any other endpoint is healthy) until this cooldown elapses, after
-/// which it re-enters as a probe candidate. Bounds the "one failed request
-/// per newly-dead endpoint" cost to at most one per cooldown window.
+/// which it re-enters as a probe candidate, so a dead endpoint costs a write
+/// at most one failed probe or statement per cooldown window beyond those
+/// already running on it when it went down.
 const UNHEALTHY_COOLDOWN_MS: u64 = 5_000;
 
 /// How often the background re-probe pass ([`spawn_reprobe_loop`]) scans for
@@ -493,6 +494,17 @@ impl ChPool {
     /// begin demoted and are skipped until they recover.
     pub async fn connect(cfg: ChConnConfig) -> Result<Self, ChError> {
         cfg.validate()?;
+        // Edge case #5: relaxing certificate verification must never look
+        // like a silent plaintext downgrade. Said here, at every pool's
+        // connect, so the startup bootstrap pool and the serving pool say it
+        // too (code review r1 of #803), not only `ChClient::new`.
+        if cfg.tls_skip_verify {
+            eprintln!(
+                "pulsus-clickhouse: CLICKHOUSE_TLS_SKIP_VERIFY=true — certificate verification \
+                 is DISABLED for this ClickHouse connection. The connection is still encrypted \
+                 (TLS is not downgraded to plaintext); only the peer certificate is unchecked."
+            );
+        }
         let resolved = cfg.resolved_endpoints();
         let mut endpoints = Vec::with_capacity(resolved.len());
         for r in &resolved {
@@ -648,8 +660,6 @@ impl ChPool {
     /// exists (issue #803): a request run again after a server failure does
     /// not go back to that server, even once it is promoted again.
     pub(crate) fn bind_read_avoiding(&self, avoid: Option<usize>) -> usize {
-        // Round-3 stub: `avoid` is not consulted.
-        let _ = avoid;
         let rr = self.next_rr_read.fetch_add(1, Ordering::Relaxed);
         let states = self.endpoint_states(self.now_ms());
         let zone = preferred_zone(
@@ -658,8 +668,14 @@ impl ChPool {
             self.local_zone.as_deref(),
         );
         // `candidate_order` lists every endpoint, and a pool has at least
-        // one, so the order is never empty.
-        candidate_order(&states, zone, rr)[0]
+        // one, so the order is never empty. `avoid` is skipped whatever its
+        // health, unless it is the only endpoint.
+        let order = candidate_order(&states, zone, rr);
+        order
+            .iter()
+            .copied()
+            .find(|&i| Some(i) != avoid)
+            .unwrap_or(order[0])
     }
 
     /// A read lease on `b`'s endpoint (issue #803): waits for a permit and

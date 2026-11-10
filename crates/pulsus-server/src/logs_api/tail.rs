@@ -475,7 +475,8 @@ impl TailFetcher for EngineFetcher {
     fn take_server_failure(&mut self) -> bool {
         match self.engine.server_failure() {
             Some(f) if self.engine.other_healthy(f.endpoint) => {
-                self.engine.rebind();
+                // Never back to the server that failed (code review r1).
+                self.engine.rebind_avoiding(Some(f.endpoint));
                 true
             }
             _ => false,
@@ -494,8 +495,18 @@ fn accepted<T>(engine: &LogQlEngine, read: Result<T, ReadError>) -> Result<T, Re
     }
 }
 
+/// Issue #803: the producer's reads that have failed once and are being run
+/// a second time. A second failure of a marked read closes the tail.
+#[derive(Debug, Default)]
+struct FailedOver {
+    poll: bool,
+    waiting_probe: bool,
+    catch_up_probe: bool,
+    catch_up_page: bool,
+}
+
 /// Issue #803: whether a failed read may be repeated once, at once, on the
-/// server the fetcher has moved to — never twice in a row.
+/// server the fetcher has moved to — never a third time.
 fn may_fail_over<F: TailFetcher>(fetcher: &mut F, failed_over: &mut bool) -> bool {
     if !*failed_over && fetcher.take_server_failure() {
         *failed_over = true;
@@ -852,9 +863,12 @@ async fn producer_loop<F: TailFetcher>(
     // any idle sleep, whatever the recheck timer says.
     let mut unprobed: Vec<Fingerprint> = Vec::new();
     let mut catch_up: Option<CatchUp> = None;
-    // Issue #803: set when a poll's server failed and the poll is being
-    // repeated on another; a second failure in a row closes the tail.
-    let mut failed_over = false;
+    // Issue #803: which reads are being run a second time because their
+    // server failed. Each read has its own mark, cleared only when that read
+    // is accepted, so no read runs more than twice: an accepted read of
+    // another kind in between does not give a failed one a third run (code
+    // review r1).
+    let mut failed_over = FailedOver::default();
     loop {
         if *shutdown.borrow() || *cancel.borrow() {
             break;
@@ -872,7 +886,7 @@ async fn producer_loop<F: TailFetcher>(
                         };
                         match result {
                             Ok(first) => {
-                                failed_over = false;
+                                failed_over.catch_up_probe = false;
                                 match first.iter().map(|(_, ts)| *ts).min() {
                                     Some(min_first) => {
                                         cu.scan = Some(ScanState::new(min_first.saturating_sub(1)));
@@ -883,7 +897,7 @@ async fn producer_loop<F: TailFetcher>(
                             Err(e) => {
                                 // Issue #803: nothing moved; the probe is
                                 // repeated once on the server moved to.
-                                if may_fail_over(&mut fetcher, &mut failed_over) {
+                                if may_fail_over(&mut fetcher, &mut failed_over.catch_up_probe) {
                                     continue;
                                 }
                                 fail(&shared, e);
@@ -900,14 +914,14 @@ async fn producer_loop<F: TailFetcher>(
                         };
                         let caught = match result {
                             Ok(caught) => {
-                                failed_over = false;
+                                failed_over.catch_up_page = false;
                                 caught
                             }
                             Err(e) => {
                                 // Issue #803: the slice's scan did not move;
                                 // it is read again once on the server moved
                                 // to.
-                                if may_fail_over(&mut fetcher, &mut failed_over) {
+                                if may_fail_over(&mut fetcher, &mut failed_over.catch_up_page) {
                                     continue;
                                 }
                                 fail(&shared, e);
@@ -936,6 +950,9 @@ async fn producer_loop<F: TailFetcher>(
             // stay waiting with their deadlines, and the next recheck
             // waits for its timer.
             if let Some(cu) = catch_up.take() {
+                // A later catch-up's reads are other reads.
+                failed_over.catch_up_probe = false;
+                failed_over.catch_up_page = false;
                 let admitted: Vec<Fingerprint> = cu
                     .fps
                     .iter()
@@ -964,7 +981,7 @@ async fn producer_loop<F: TailFetcher>(
                     _ = cancelled(&mut shutdown, &mut cancel) => break,
                     r = fetcher.catch_up_first_lines(&fps, cfg.start_ns, ceiling) => r,
                 };
-                if result.is_err() && may_fail_over(&mut fetcher, &mut failed_over) {
+                if result.is_err() && may_fail_over(&mut fetcher, &mut failed_over.waiting_probe) {
                     // Issue #803: the probe left nothing changed — its
                     // streams are still unprobed and the recheck timer has
                     // not moved — and it runs again at once on the server
@@ -978,7 +995,7 @@ async fn producer_loop<F: TailFetcher>(
                 next_probe = next_probe.max(Instant::now() + cfg.poll_interval);
                 match result {
                     Ok(first) => {
-                        failed_over = false;
+                        failed_over.waiting_probe = false;
                         if let Some(min_first) = first.iter().map(|(_, ts)| *ts).min() {
                             let found: BTreeSet<Fingerprint> =
                                 first.iter().map(|(fp, _)| *fp).collect();
@@ -1041,7 +1058,7 @@ async fn producer_loop<F: TailFetcher>(
         };
         let mut page = match result {
             Ok(page) => {
-                failed_over = false;
+                failed_over.poll = false;
                 page
             }
             Err(e) => {
@@ -1049,8 +1066,7 @@ async fn producer_loop<F: TailFetcher>(
                 // moved to another. The poll sent no rows and the cursor did
                 // not move, so the same lower bound is polled again at once
                 // — once.
-                if !failed_over && fetcher.take_server_failure() {
-                    failed_over = true;
+                if may_fail_over(&mut fetcher, &mut failed_over.poll) {
                     continue;
                 }
                 // Fatal poll failure (e.g. a broad selector tripping the
