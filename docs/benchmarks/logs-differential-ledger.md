@@ -3709,7 +3709,7 @@ a divergence at a public surface, found while implementing the cap.
     pins alias/native identity on a short query and pins the over-cap
     rejection of that same handler directly in `stats.rs`.
   - *Over a real socket* (`axum::serve` + default hyper h1 — the exact
-    configuration `crates/pulsus-server/src/serve.rs:235,247` runs in
+    configuration `crates/pulsus-server/src/serve.rs:236,248` runs in
     production): a 65,534-byte request-target reaches the handler
     (`200`); at 65,535 bytes hyper answers **`HTTP/1.1 414 URI Too
     Long`** with `content-length: 0` and `connection: close`, before
@@ -3755,20 +3755,20 @@ a divergence at a public surface, found while implementing the cap.
   **The carrier set is not "the `GET|POST` form routes"** — that phrase is
   false in the other direction, and a reader deriving the list from it
   gets six. There are six `GET|POST` form routes per prefix, four in
-  `mount_log_query_routes` (`/query_range` `:55`, `/query` `:59`,
-  `/labels` `:63`, `/series` `:71`) and two in `mount_detected_routes`
-  (`/detected_labels` `:85`, `/detected_fields` `:89`), both helpers
-  called for each prefix (`mod.rs:99,104` native; `:114,126` alias).
+  `mount_log_query_routes` (`/query_range` `:56`, `/query` `:60`,
+  `/labels` `:64`, `/series` `:72`) and two in `mount_detected_routes`
+  (`/detected_labels` `:86`, `/detected_fields` `:90`), both helpers
+  called for each prefix (`mod.rs:100,104` native; `:114,126` alias).
   **`/labels` is `GET|POST` and is NOT a carrier:** `labels_impl`
-  (`handlers.rs:272`) consumes only `parse_bounds` — `start` and `end`.
+  (`handlers.rs:256`) consumes only `parse_bounds` — `start` and `end`.
   It never reads a `query` parameter, never builds a selector and so
   never reaches the cap seam; **among POST-form carriers**
-  `pulsus_logql::parse`/`parse_selector` occur at `handlers.rs:122`
-  (`/query_range`), `:190` (`/query`), `:365` (`/series`) and
-  `detected.rs:88`, `:153` — the five carriers and nothing else. That
+  `pulsus_logql::parse`/`parse_selector` occur at `handlers.rs:106`
+  (`/query_range`), `:160` (`/query`), `:349` (`/series`) and
+  `detected.rs:88`, `:156` — the five carriers and nothing else. That
   exclusivity is scoped to the carrier set, not repo-wide: the server
   crate has **nine** production parse sites, and the other four —
-  `patterns.rs:51`, `stats.rs:50`, `tail.rs:136`, `volume.rs:52` — take a
+  `patterns.rs:52`, `stats.rs:51`, `tail.rs:137`, `volume.rs:53` — take a
   `query` parameter on GET-only routes, so they can never receive an
   over-cap one (`git grep -nE 'pulsus_logql::parse(_selector)?\('
   -- crates/pulsus-server/src` = 10 lines, the tenth being the
@@ -3777,7 +3777,7 @@ a divergence at a public surface, found while implementing the cap.
   exist.
   **Correction to an earlier reading:
   `/tail` is NOT such a carrier** — `/api/logs/v1/tail` is a GET
-  WebSocket upgrade (`logs_api/mod.rs:156,184`), so on the wire it sits
+  WebSocket upgrade (`logs_api/mod.rs:157,185`), so on the wire it sits
   under the same 65,534-byte ceiling; its cap enforcement is pinned at
   the params seam (`parse_tail_params`, `tail.rs`), not over a socket.
   The other GET-only routes — `/stats`, `/volume`, `/patterns`,
@@ -4301,7 +4301,7 @@ unexplained.
 - **PulsusDB behaviour (the delta): a malformed query is a `400` in every
   window.** Nothing about our rejection depends on the dates asked for:
   `plan()` and `CompiledPipeline::compile` both run before any I/O
-  (`logql/exec.rs:645`, `:939`, `:2530`, `:2832`, `logql/variants.rs:521`,
+  (`logql/exec.rs:674`, `:968`, `:2559`, `:2861`, `logql/variants.rs:521`,
   propagated with `?` and surfaced by `logs_api/error.rs` as a 400), so an
   invalid pipeline cannot reach a "no chunks, return empty" path in the
   first place.

@@ -106,6 +106,10 @@ pub struct Config {
     /// explicitly, how to determine this node's zone from cloud instance
     /// metadata at startup (`off` — the default — leaves it unset).
     pub az_detect: AzDetect,
+    /// `PULSUS_READ_SPREAD` (issue #803): which `clickhouse.servers`
+    /// endpoint a read request is sent to — `all` (default), any healthy
+    /// endpoint, taking turns; `zone`, this node's zone first, as writes.
+    pub read_spread: ReadSpread,
     /// `PULSUS_METRICS_EXP_HISTOGRAM_MODE` (M7-A4, issue #120): how OTLP
     /// exponential-histogram data points are stored. `classic` (default,
     /// current behavior unchanged) flattens to `_bucket`/`_sum`/`_count`
@@ -159,6 +163,7 @@ impl Default for Config {
             skip_unavailable_shards: false,
             availability_zone: None,
             az_detect: AzDetect::default(),
+            read_spread: ReadSpread::default(),
             exp_histogram_mode: ExpHistogramMode::default(),
             otlp_translation_strategy: OtlpTranslationStrategy::default(),
             otlp_promote_scope_metadata: false,
@@ -805,6 +810,30 @@ impl std::str::FromStr for AzDetect {
             "azure" => Ok(AzDetect::Azure),
             "auto" => Ok(AzDetect::Auto),
             _ => Err("one of: off, aws, gcp, azure, auto".to_string()),
+        }
+    }
+}
+
+/// `PULSUS_READ_SPREAD` (docs/configuration.md §4, issue #803): which
+/// endpoint a read request is sent to. `all` (default): any healthy
+/// endpoint, whatever its zone, taking turns. `zone`: this node's zone
+/// first, as writes always do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ReadSpread {
+    #[default]
+    All,
+    Zone,
+}
+
+impl std::str::FromStr for ReadSpread {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "all" => Ok(ReadSpread::All),
+            "zone" => Ok(ReadSpread::Zone),
+            _ => Err("one of: all, zone".to_string()),
         }
     }
 }

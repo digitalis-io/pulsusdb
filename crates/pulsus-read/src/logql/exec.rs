@@ -24,7 +24,7 @@ use super::rows::{
 };
 use futures::Stream;
 use futures::StreamExt;
-use pulsus_clickhouse::{ChClient, ChError, ChRow, ChRowStream, QuerySettings};
+use pulsus_clickhouse::{ChClient, ChError, ChRow, ChRowStream, QuerySettings, ServerFailure};
 use pulsus_logql::{
     Expr, LabelFilterExpr, LogExpr, MatchOp, Matcher, RangeAggOp, Stage, StreamSelector,
 };
@@ -446,6 +446,35 @@ impl LogQlEngine {
     pub fn with_discovery_max_rows(mut self, n: u64) -> Self {
         self.discovery_max_rows = n;
         self
+    }
+
+    /// The first server failure this engine's reads met since its client
+    /// was bound (issue #803).
+    pub fn server_failure(&self) -> Option<ServerFailure> {
+        self.client.server_failure()
+    }
+
+    /// Saves what this engine's accepted request read into state shared
+    /// beyond it (issue #803). The logs engine keeps nothing, so this does
+    /// nothing.
+    pub fn commit(&self) {}
+
+    /// Binds this engine's reads to a new endpoint and clears its failure
+    /// (issue #803): a live tail between polls.
+    pub fn rebind(&self) {
+        self.client.rebind();
+    }
+
+    /// [`Self::rebind`] to any endpoint but `avoid` while another exists
+    /// (issue #803): a tail whose server failed does not go back to it.
+    pub fn rebind_avoiding(&self, avoid: Option<usize>) {
+        self.client.rebind_avoiding(avoid);
+    }
+
+    /// Whether an endpoint other than `endpoint` is healthy (issue #803):
+    /// whether a tail whose server failed may repeat its poll elsewhere.
+    pub fn other_healthy(&self, endpoint: usize) -> bool {
+        self.client.other_healthy(endpoint)
     }
 
     /// The budget this read renders under.
@@ -4466,8 +4495,8 @@ impl LogQlEngine {
     ) -> Result<TailPage, ReadError> {
         let attempt = self
             .tail_attempt(&*setup, lower, upper_ns, fetch_limit)
-            .await?;
-        Ok(commit_tail_attempt(setup, attempt))
+            .await;
+        commit_tail_attempt(setup, attempt, self.server_failure())
     }
 
     /// One poll's reads, against committed state only (issue #804): the
@@ -4774,7 +4803,20 @@ pub struct TailAttempt {
 /// Keeps what an accepted [`TailAttempt`] read (issue #804) and returns its
 /// page. On the first window the joined streams are admitted with it;
 /// otherwise they are reported in [`TailPage::joined`] for a catch-up.
-pub fn commit_tail_attempt(setup: &mut TailSetup, attempt: TailAttempt) -> TailPage {
+///
+/// Only an accepted attempt is kept (issue #803): an `Err` attempt, or an
+/// `Ok` one that met a server failure, writes nothing, and the latter
+/// becomes the failure's error, so no page reaches the producer and the
+/// poll is repeated at the same lower bound.
+pub fn commit_tail_attempt(
+    setup: &mut TailSetup,
+    attempt: Result<TailAttempt, ReadError>,
+    failure: Option<ServerFailure>,
+) -> Result<TailPage, ReadError> {
+    let attempt = attempt?;
+    if let Some(f) = failure {
+        return Err(ReadError::Clickhouse(f.into()));
+    }
     merge_resolved(&mut setup.resolved, &attempt.added);
     setup.hydrated.extend(attempt.labels);
     if attempt.full_scan {
@@ -4786,7 +4828,7 @@ pub fn commit_tail_attempt(setup: &mut TailSetup, attempt: TailAttempt) -> TailP
     } else {
         page.joined = attempt.joined;
     }
-    page
+    Ok(page)
 }
 
 /// A tail planned to a metric query: the setup refuses it, and the
@@ -8965,6 +9007,70 @@ mod tests {
         }
     }
 
+    /// Issue #803 (T7, with #804's state): a tail poll whose server failed
+    /// keeps nothing it read — not the resolved union, the labels, the
+    /// admitted streams or the full-scan mark — and its page never reaches
+    /// the producer; an accepted poll keeps all of them.
+    #[test]
+    fn a_failed_tail_attempt_leaves_resolved_as_it_was() {
+        let fp = Fingerprint::from_raw;
+        let ctx = tail_test_ctx();
+        let mut setup = build_tail_setup(&ctx, r#"{app="x"}"#, 0, DAY_NS);
+        setup.resolved = vec![fp(1)];
+        let before_mark = setup.last_full_scan_lower_ns;
+        let attempt = || TailAttempt {
+            page: TailPage {
+                streams: Vec::new(),
+                next: None,
+                fetched: 7,
+                joined: Vec::new(),
+            },
+            added: vec![fp(2)],
+            labels: [(fp(2), meta_row(2))].into_iter().collect(),
+            joined: vec![fp(2)],
+            first_window: true,
+            full_scan: true,
+            lower_ns: 500,
+        };
+        let failure = ServerFailure {
+            endpoint: 0,
+            message: "reset".to_string(),
+        };
+        let unchanged = |setup: &TailSetup, what: &str| {
+            assert_eq!(setup.resolved, vec![fp(1)], "resolved after {what}");
+            assert!(setup.hydrated.is_empty(), "hydrated after {what}");
+            assert!(setup.deliverable.is_empty(), "deliverable after {what}");
+            assert_eq!(
+                setup.last_full_scan_lower_ns, before_mark,
+                "full-scan mark after {what}"
+            );
+        };
+
+        let r = commit_tail_attempt(&mut setup, Ok(attempt()), Some(failure));
+        assert!(
+            r.is_err(),
+            "an Ok attempt that met a server failure is an error"
+        );
+        unchanged(&setup, "a failed Ok attempt");
+
+        let r = commit_tail_attempt(
+            &mut setup,
+            Err(ReadError::PipelineInvalid {
+                reason: "boom".to_string(),
+            }),
+            None,
+        );
+        assert!(r.is_err());
+        unchanged(&setup, "an Err attempt");
+
+        let r = commit_tail_attempt(&mut setup, Ok(attempt()), None);
+        assert_eq!(r.expect("an accepted attempt").fetched, 7);
+        assert_eq!(setup.resolved, vec![fp(1), fp(2)]);
+        assert!(setup.hydrated.contains_key(&fp(2)));
+        assert_eq!(setup.deliverable, vec![fp(2)]);
+        assert_eq!(setup.last_full_scan_lower_ns, before_mark.max(500));
+    }
+
     fn month_literal(ts_ns: i64) -> String {
         let (y, m) = plan::year_month(ts_ns);
         format!("'{y:04}-{m:02}-01'")
@@ -9070,7 +9176,7 @@ mod tests {
             full_scan: true,
             lower_ns: 500,
         };
-        let page = commit_tail_attempt(&mut setup, a);
+        let page = commit_tail_attempt(&mut setup, Ok(a), None).expect("accepted");
         assert_eq!(setup.resolved, vec![fp(1), fp(2)]);
         let mut keys: Vec<Fingerprint> = setup.hydrated.keys().copied().collect();
         keys.sort_unstable();
@@ -9088,7 +9194,7 @@ mod tests {
             full_scan: false,
             lower_ns: 900,
         };
-        let page = commit_tail_attempt(&mut setup, b);
+        let page = commit_tail_attempt(&mut setup, Ok(b), None).expect("accepted");
         let mut keys: Vec<Fingerprint> = setup.hydrated.keys().copied().collect();
         keys.sort_unstable();
         assert_eq!(keys, vec![fp(1), fp(2), fp(3)]);

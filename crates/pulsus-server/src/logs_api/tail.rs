@@ -61,8 +61,9 @@ use tokio::sync::{Notify, watch};
 use crate::app::AppState;
 
 use super::encode;
+use super::engine::tail_engine;
 use super::error::ApiError;
-use super::handlers::{engine_for, tenant_of};
+use super::handlers::tenant_of;
 use super::params::{self, ParamError};
 
 /// Best-effort deadline on the final WebSocket Close frame. Deliberately
@@ -267,7 +268,7 @@ pub(crate) async fn tail(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let engine = match engine_for(&state, tenant).await {
+    let engine = match tail_engine(&state, tenant).await {
         Ok(engine) => engine,
         Err(e) => return e.into_response(),
     };
@@ -382,6 +383,13 @@ trait TailFetcher: Send + 'static {
     /// reported joined.
     #[cfg(test)]
     fn deadline_set(&mut self, _deadline: Instant) {}
+
+    /// Issue #803: called on a failed poll. `true` when the poll met a
+    /// server failure and the fetcher has moved to another healthy server,
+    /// so the producer may repeat the poll once at the same lower bound.
+    fn take_server_failure(&mut self) -> bool {
+        false
+    }
 }
 
 struct EngineFetcher {
@@ -436,9 +444,11 @@ impl TailFetcher for EngineFetcher {
         after_ns: i64,
         ceiling: TailCeiling,
     ) -> Result<Vec<(Fingerprint, i64)>, ReadError> {
-        self.engine
+        let first = self
+            .engine
             .tail_first_lines(&self.setup, fps, after_ns, ceiling)
-            .await
+            .await;
+        accepted(&self.engine, first)
     }
 
     async fn catch_up(
@@ -449,13 +459,60 @@ impl TailFetcher for EngineFetcher {
         ceiling: TailCeiling,
         fetch_limit: u32,
     ) -> Result<CatchUpPage, ReadError> {
-        self.engine
+        let caught = self
+            .engine
             .tail_catch_up(&self.setup, fps, lower, upper_ns, ceiling, fetch_limit)
-            .await
+            .await;
+        accepted(&self.engine, caught)
     }
 
     fn admit(&mut self, fps: &[Fingerprint]) {
         self.setup.admit(fps);
+    }
+
+    /// Issue #803: the poll's server failed and another is healthy — the
+    /// engine moves to it, and the producer repeats the poll there.
+    fn take_server_failure(&mut self) -> bool {
+        match self.engine.server_failure() {
+            Some(f) if self.engine.other_healthy(f.endpoint) => {
+                // Never back to the server that failed (code review r1).
+                self.engine.rebind_avoiding(Some(f.endpoint));
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Issue #803: a catch-up read is accepted only when its server did not
+/// fail during it; an `Ok` read that met a server failure becomes the
+/// failure's error, so the producer repeats it rather than using it.
+fn accepted<T>(engine: &LogQlEngine, read: Result<T, ReadError>) -> Result<T, ReadError> {
+    let read = read?;
+    match engine.server_failure() {
+        Some(f) => Err(ReadError::Clickhouse(f.into())),
+        None => Ok(read),
+    }
+}
+
+/// Issue #803: the producer's reads that have failed once and are being run
+/// a second time. A second failure of a marked read closes the tail.
+#[derive(Debug, Default)]
+struct FailedOver {
+    poll: bool,
+    waiting_probe: bool,
+    catch_up_probe: bool,
+    catch_up_page: bool,
+}
+
+/// Issue #803: whether a failed read may be repeated once, at once, on the
+/// server the fetcher has moved to — never a third time.
+fn may_fail_over<F: TailFetcher>(fetcher: &mut F, failed_over: &mut bool) -> bool {
+    if !*failed_over && fetcher.take_server_failure() {
+        *failed_over = true;
+        true
+    } else {
+        false
     }
 }
 
@@ -806,6 +863,12 @@ async fn producer_loop<F: TailFetcher>(
     // any idle sleep, whatever the recheck timer says.
     let mut unprobed: Vec<Fingerprint> = Vec::new();
     let mut catch_up: Option<CatchUp> = None;
+    // Issue #803: which reads are being run a second time because their
+    // server failed. Each read has its own mark, cleared only when that read
+    // is accepted, so no read runs more than twice: an accepted read of
+    // another kind in between does not give a failed one a third run (code
+    // review r1).
+    let mut failed_over = FailedOver::default();
     loop {
         if *shutdown.borrow() || *cancel.borrow() {
             break;
@@ -822,13 +885,21 @@ async fn producer_loop<F: TailFetcher>(
                             r = fetcher.catch_up_first_lines(&fps, cu.probe_after, cu.ceiling) => r,
                         };
                         match result {
-                            Ok(first) => match first.iter().map(|(_, ts)| *ts).min() {
-                                Some(min_first) => {
-                                    cu.scan = Some(ScanState::new(min_first.saturating_sub(1)));
+                            Ok(first) => {
+                                failed_over.catch_up_probe = false;
+                                match first.iter().map(|(_, ts)| *ts).min() {
+                                    Some(min_first) => {
+                                        cu.scan = Some(ScanState::new(min_first.saturating_sub(1)));
+                                    }
+                                    None => close = true,
                                 }
-                                None => close = true,
-                            },
+                            }
                             Err(e) => {
+                                // Issue #803: nothing moved; the probe is
+                                // repeated once on the server moved to.
+                                if may_fail_over(&mut fetcher, &mut failed_over.catch_up_probe) {
+                                    continue;
+                                }
                                 fail(&shared, e);
                                 break;
                             }
@@ -842,8 +913,17 @@ async fn producer_loop<F: TailFetcher>(
                             r = fetcher.catch_up(&fps, lower, upper, cu.ceiling, cfg.fetch_limit) => r,
                         };
                         let caught = match result {
-                            Ok(caught) => caught,
+                            Ok(caught) => {
+                                failed_over.catch_up_page = false;
+                                caught
+                            }
                             Err(e) => {
+                                // Issue #803: the slice's scan did not move;
+                                // it is read again once on the server moved
+                                // to.
+                                if may_fail_over(&mut fetcher, &mut failed_over.catch_up_page) {
+                                    continue;
+                                }
                                 fail(&shared, e);
                                 break;
                             }
@@ -870,6 +950,9 @@ async fn producer_loop<F: TailFetcher>(
             // stay waiting with their deadlines, and the next recheck
             // waits for its timer.
             if let Some(cu) = catch_up.take() {
+                // A later catch-up's reads are other reads.
+                failed_over.catch_up_probe = false;
+                failed_over.catch_up_page = false;
                 let admitted: Vec<Fingerprint> = cu
                     .fps
                     .iter()
@@ -898,10 +981,21 @@ async fn producer_loop<F: TailFetcher>(
                     _ = cancelled(&mut shutdown, &mut cancel) => break,
                     r = fetcher.catch_up_first_lines(&fps, cfg.start_ns, ceiling) => r,
                 };
+                if result.is_err() && may_fail_over(&mut fetcher, &mut failed_over.waiting_probe) {
+                    // Issue #803: the probe left nothing changed — its
+                    // streams are still unprobed and the recheck timer has
+                    // not moved — and it runs again at once on the server
+                    // moved to.
+                    if first_probe {
+                        unprobed = fps;
+                    }
+                    continue;
+                }
                 // A first probe never brings the next recheck forward.
                 next_probe = next_probe.max(Instant::now() + cfg.poll_interval);
                 match result {
                     Ok(first) => {
+                        failed_over.waiting_probe = false;
                         if let Some(min_first) = first.iter().map(|(_, ts)| *ts).min() {
                             let found: BTreeSet<Fingerprint> =
                                 first.iter().map(|(fp, _)| *fp).collect();
@@ -963,11 +1057,21 @@ async fn producer_loop<F: TailFetcher>(
             r = fetcher.poll(lower, upper, narrow, cfg.fetch_limit) => r,
         };
         let mut page = match result {
-            Ok(page) => page,
+            Ok(page) => {
+                failed_over.poll = false;
+                page
+            }
             Err(e) => {
+                // Issue #803: the poll's server failed and the fetcher has
+                // moved to another. The poll sent no rows and the cursor did
+                // not move, so the same lower bound is polled again at once
+                // — once.
+                if may_fail_over(&mut fetcher, &mut failed_over.poll) {
+                    continue;
+                }
                 // Fatal poll failure (e.g. a broad selector tripping the
-                // stream cap): hand the reason to the writer, which
-                // closes the socket with it.
+                // stream cap, or a second server failure in a row): hand the
+                // reason to the writer, which closes the socket with it.
                 fail(&shared, e);
                 break;
             }
@@ -2629,6 +2733,12 @@ mod tests {
         poll_script: PollScript,
         first_script: FirstScript,
         catch_script: CatchScript,
+        /// Issue #803: a failed catch-up read reports a server failure the
+        /// fetcher has moved off.
+        failover: bool,
+        last_failed: bool,
+        /// Issue #803: from this poll on, every poll fails, after a delay.
+        failing_polls_from: Option<(usize, Duration)>,
     }
 
     impl ScriptedFetcher {
@@ -2647,7 +2757,20 @@ mod tests {
                 poll_script: Box::new(poll_script),
                 first_script: Box::new(first_script),
                 catch_script: Box::new(catch_script),
+                failover: false,
+                last_failed: false,
+                failing_polls_from: None,
             }
+        }
+
+        fn with_failing_polls_from(mut self, n: usize, delay: Duration) -> Self {
+            self.failing_polls_from = Some((n, delay));
+            self
+        }
+
+        fn with_failover(mut self) -> Self {
+            self.failover = true;
+            self
         }
 
         fn record(&self, call: Call) {
@@ -2669,6 +2792,15 @@ mod tests {
             });
             let n = self.polls;
             self.polls += 1;
+            if let Some((from, delay)) = self.failing_polls_from
+                && n >= from
+            {
+                tokio::time::sleep(delay).await;
+                self.last_failed = true;
+                return Err(ReadError::PipelineInvalid {
+                    reason: format!("poll {n} failed"),
+                });
+            }
             let page = (self.poll_script)(n, lower, upper_ns);
             self.record(Call::PollDone {
                 joined: page.joined.clone(),
@@ -2721,6 +2853,7 @@ mod tests {
                 CatchStep::Hang => std::future::pending().await,
                 CatchStep::Fail(d, e) => {
                     tokio::time::sleep(d).await;
+                    self.last_failed = true;
                     Err(e)
                 }
             }
@@ -2728,6 +2861,10 @@ mod tests {
 
         fn admit(&mut self, fps: &[Fingerprint]) {
             self.record(Call::Admit(fps.to_vec()));
+        }
+
+        fn take_server_failure(&mut self) -> bool {
+            self.failover && std::mem::take(&mut self.last_failed)
         }
 
         fn deadline_set(&mut self, deadline: tokio::time::Instant) {
@@ -3098,6 +3235,104 @@ mod tests {
         assert_eq!(sent_lines(&sent.lock().unwrap()), ["A1", "A2"]);
         let calls = log.lock().unwrap().clone();
         assert!(!has_admit(&calls), "{calls:#?}");
+    }
+
+    /// Issues #803 and #804 (T9): a catch-up read whose server failed is
+    /// read again once, at once, at the same position on the server the
+    /// fetcher moved to; the tail stays open, the stream's line is sent
+    /// once and the stream is admitted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_catch_up_read_whose_server_failed_is_read_again_once() {
+        let cfg = test_cfg();
+        let start = cfg.start_ns;
+        let fetcher = ScriptedFetcher::new(
+            h1_polls,
+            move |_, _| vec![(fpn(2), start + 1)],
+            |n| match n {
+                0 => CatchStep::Fail(
+                    Duration::ZERO,
+                    ReadError::PipelineInvalid {
+                        reason: "server failed".to_string(),
+                    },
+                ),
+                _ => CatchStep::Page(catch_page(&["B1"], 1, None, &[2])),
+            },
+        )
+        .with_failover();
+        let run = ScriptedRun::start(fetcher, cfg);
+        run.wait_for(Duration::from_secs(3), has_admit).await;
+        assert!(run.closed.lock().unwrap().is_none(), "the tail stays open");
+        let (calls, lines) = run.stop().await;
+        let catches: Vec<&Call> = calls
+            .iter()
+            .map(|(_, c)| c)
+            .filter(|c| matches!(c, Call::CatchUp { .. }))
+            .collect();
+        assert!(catches.len() >= 2, "{calls:#?}");
+        assert_eq!(
+            catches[0], catches[1],
+            "the same read, at the same position"
+        );
+        assert_eq!(lines.iter().filter(|l| *l == "B1").count(), 1, "{lines:?}");
+        assert!(has_admit(&calls), "{calls:#?}");
+    }
+
+    /// T10 (issue #803, code review round 1): a poll whose server failed
+    /// is repeated once, and an accepted probe of a waiting stream between
+    /// the two does not give the poll a third run: the second failure of
+    /// that poll closes the tail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_accepted_probe_between_two_failures_of_a_poll_does_not_reset_its_count() {
+        let cfg = test_cfg();
+        let fetcher = ScriptedFetcher::new(
+            h1_polls,
+            // Every probe answers, and finds nothing, so stream 2 stays
+            // waiting and is probed again each time its timer is due.
+            |_, _| Vec::new(),
+            |_| CatchStep::Page(catch_page(&[], 0, None, &[])),
+        )
+        .with_failover()
+        // Polls 2 on fail, each after 20 ms, so the recheck timer is due
+        // between two of them.
+        .with_failing_polls_from(2, Duration::from_millis(20));
+        let ScriptedRun {
+            handle,
+            shutdown,
+            closed,
+            log,
+            ..
+        } = ScriptedRun::start(fetcher, cfg);
+        let ended = tokio::time::timeout(Duration::from_secs(3), handle).await;
+        let _ = shutdown.send(true);
+        let calls = log.lock().unwrap().clone();
+        assert!(
+            ended.is_ok(),
+            "the second failure of the poll closes the tail: {calls:#?}"
+        );
+        let polls: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, c))| matches!(c, Call::Poll { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            polls.len(),
+            4,
+            "polls 0, 1, then the failing poll twice: {calls:#?}"
+        );
+        assert!(
+            calls[polls[2]..polls[3]]
+                .iter()
+                .any(|(_, c)| matches!(c, Call::FirstLines { .. })),
+            "a probe ran between the two failures: {calls:#?}"
+        );
+        let frame = closed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("close was sent")
+            .expect("with a reason");
+        assert_eq!(frame.reason.as_str(), "poll 3 failed");
     }
 
     /// H6 (issue #804): an empty probe, or a catch-up that fetches nothing
@@ -3552,5 +3787,194 @@ mod tests {
                 absent.start_ns
             );
         }
+    }
+
+    // -- issue #803: a poll whose server failed is repeated once ----------
+
+    /// One scripted poll result, and what `take_server_failure` answers
+    /// after it.
+    type FailoverStep = (Result<TailPage, ReadError>, bool);
+
+    /// Plays `script` one poll at a time, recording each poll's lower
+    /// bound; past the end every poll waits forever, so the tail stays open
+    /// and the scripted polls are the only ones counted.
+    struct FailoverFetcher {
+        script: VecDeque<FailoverStep>,
+        lowers: Arc<Mutex<Vec<String>>>,
+        failure: bool,
+    }
+
+    impl TailFetcher for FailoverFetcher {
+        async fn poll(
+            &mut self,
+            lower: TailLower,
+            _upper_ns: i64,
+            _narrow: bool,
+            _fetch_limit: u32,
+        ) -> Result<TailPage, ReadError> {
+            let Some((result, failure)) = self.script.pop_front() else {
+                return std::future::pending().await;
+            };
+            self.lowers.lock().unwrap().push(format!("{lower:?}"));
+            self.failure = failure;
+            result
+        }
+
+        fn take_server_failure(&mut self) -> bool {
+            std::mem::take(&mut self.failure)
+        }
+    }
+
+    fn failover_page(lines: &[&str]) -> TailPage {
+        let now = params::now_ns();
+        TailPage {
+            streams: vec![stream(
+                r#"{"app":"x"}"#,
+                lines.iter().map(|l| (now, *l)).collect(),
+            )],
+            next: None,
+            fetched: lines.len() as u32,
+            joined: Vec::new(),
+        }
+    }
+
+    fn failover_error(reason: &str) -> ReadError {
+        ReadError::PipelineInvalid {
+            reason: reason.to_string(),
+        }
+    }
+
+    /// What a scripted tail did: its polls' lower bounds, every frame sent,
+    /// and the close (outer `Some` once closed).
+    struct FailoverRun {
+        lowers: Arc<Mutex<Vec<String>>>,
+        sent: Arc<Mutex<Vec<String>>>,
+        closed: Arc<Mutex<Option<Option<CloseFrame>>>>,
+        shutdown: watch::Sender<bool>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    fn run_failover(script: Vec<FailoverStep>) -> FailoverRun {
+        let lowers = Arc::new(Mutex::new(Vec::new()));
+        let fetcher = FailoverFetcher {
+            script: script.into(),
+            lowers: Arc::clone(&lowers),
+            failure: false,
+        };
+        let sender = FakeSender::new(SinkMode::Accept);
+        let (sent, closed) = (Arc::clone(&sender.sent), Arc::clone(&sender.closed));
+        let (shutdown, rx) = watch::channel(false);
+        let handle = tokio::spawn(run_tail(
+            fetcher,
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            test_cfg(),
+            rx,
+        ));
+        FailoverRun {
+            lowers,
+            sent,
+            closed,
+            shutdown,
+            handle,
+        }
+    }
+
+    /// Waits (10 ms steps, at most 5 s) until `done` holds.
+    async fn wait_for_failover(mut done: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !done() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn failover_delivered(sent: &Mutex<Vec<String>>, line: &str) -> bool {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .any(|f| f.contains(&format!("\"{line}\"")))
+    }
+
+    async fn stop_failover(run: FailoverRun) {
+        let _ = run.shutdown.send(true);
+        tokio::time::timeout(Duration::from_secs(1), run.handle)
+            .await
+            .expect("run_tail returns on shutdown")
+            .expect("no panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_failure_repeats_the_poll_once_at_the_same_lower_bound() {
+        let run = run_failover(vec![
+            (Err(failover_error("server failed")), true),
+            (Ok(failover_page(&["line-a", "line-b"])), false),
+        ]);
+        wait_for_failover(|| {
+            failover_delivered(&run.sent, "line-a") && failover_delivered(&run.sent, "line-b")
+        })
+        .await;
+        assert!(failover_delivered(&run.sent, "line-a"), "line-a delivered");
+        assert!(failover_delivered(&run.sent, "line-b"), "line-b delivered");
+        assert!(run.closed.lock().unwrap().is_none(), "the tail is open");
+        let lowers = run.lowers.lock().unwrap().clone();
+        assert_eq!(lowers.len(), 2, "{lowers:?}");
+        assert_eq!(lowers[1], lowers[0], "poll 2 repeats poll 1's lower bound");
+        stop_failover(run).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_server_failures_in_a_row_close_the_tail() {
+        let run = run_failover(vec![
+            (Err(failover_error("first failure")), true),
+            (Err(failover_error("second failure")), true),
+        ]);
+        wait_for_failover(|| run.closed.lock().unwrap().is_some()).await;
+        let closed = run.closed.lock().unwrap().clone();
+        let frame = closed
+            .expect("the tail closed")
+            .expect("with an error frame");
+        assert_eq!(frame.reason.as_str(), "second failure");
+        assert_eq!(run.lowers.lock().unwrap().len(), 2, "exactly two polls");
+        stop_failover(run).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_poll_error_that_is_not_a_server_failure_closes_at_once() {
+        let run = run_failover(vec![
+            (
+                Err(ReadError::QueryTooBroad(
+                    pulsus_read::logql::TooBroadReason::StreamCap {
+                        count: 200_000,
+                        cap: 100_000,
+                    },
+                )),
+                false,
+            ),
+            (Ok(failover_page(&["never"])), false),
+        ]);
+        wait_for_failover(|| run.closed.lock().unwrap().is_some()).await;
+        assert!(run.closed.lock().unwrap().is_some(), "the tail closed");
+        assert_eq!(run.lowers.lock().unwrap().len(), 1, "after one poll");
+        assert!(!failover_delivered(&run.sent, "never"));
+        stop_failover(run).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_successful_poll_resets_the_fail_over() {
+        let run = run_failover(vec![
+            (Err(failover_error("first failure")), true),
+            (Ok(failover_page(&["line-1"])), false),
+            (Err(failover_error("second failure")), true),
+            (Ok(failover_page(&["line-2"])), false),
+        ]);
+        wait_for_failover(|| {
+            failover_delivered(&run.sent, "line-2") || run.closed.lock().unwrap().is_some()
+        })
+        .await;
+        assert!(failover_delivered(&run.sent, "line-1"), "line-1 delivered");
+        assert!(failover_delivered(&run.sent, "line-2"), "line-2 delivered");
+        assert_eq!(run.lowers.lock().unwrap().len(), 4, "four polls");
+        assert!(run.closed.lock().unwrap().is_none(), "the tail is open");
+        stop_failover(run).await;
     }
 }

@@ -11,7 +11,7 @@ use futures::{Stream, StreamExt};
 
 use crate::config::{ChConnConfig, ConsistencyConfig};
 use crate::error::{ChError, Idempotency};
-use crate::pool::{ChPool, PooledConn};
+use crate::pool::{ChPool, PooledConn, ReadBinding, ServerFailure, StatementClass};
 use crate::settings::QuerySettings;
 
 /// Row-mapping trait re-exported from the winning crate so downstream
@@ -65,33 +65,31 @@ enum InsertPhase {
 
 pub struct ChClient {
     pool: Arc<ChPool>,
+    /// The endpoint every read of this client goes to (issue #803): bound
+    /// when the client is built, moved only by [`Self::rebind`].
+    read_binding: ReadBinding,
     default_timeout: Duration,
     consistency: ConsistencyConfig,
 }
 
 impl ChClient {
     /// Connects `cfg.pool_size` connections and validates them with one
-    /// `SELECT 1` (see [`ChPool::connect`]). Emits a warning to stderr if
+    /// `SELECT 1` (see [`ChPool::connect`], which emits a warning to stderr if
     /// `tls_skip_verify` is set (edge case #5 — this relaxes certificate
     /// verification only, it must never look like a silent plaintext
-    /// downgrade).
+    /// downgrade)).
     pub async fn new(cfg: ChConnConfig) -> Result<Self, ChError> {
         cfg.validate()?;
-        if cfg.tls_skip_verify {
-            eprintln!(
-                "pulsus-clickhouse: CLICKHOUSE_TLS_SKIP_VERIFY=true — certificate verification \
-                 is DISABLED for this ClickHouse connection. The connection is still encrypted \
-                 (TLS is not downgraded to plaintext); only the peer certificate is unchecked."
-            );
-        }
         let default_timeout = cfg.query_timeout;
         // `cfg.consistency` is `Copy`; read it before the pool consumes `cfg`.
         // `cfg.validate()` above already enforced the quorum/deadline
         // invariant against `query_timeout`.
         let consistency = cfg.consistency;
-        let pool = ChPool::connect(cfg).await?;
+        let pool = Arc::new(ChPool::connect(cfg).await?);
+        let read_binding = ReadBinding::new(pool.bind_read());
         Ok(Self {
-            pool: Arc::new(pool),
+            pool,
+            read_binding,
             default_timeout,
             consistency,
         })
@@ -103,11 +101,71 @@ impl ChClient {
     /// cheap `Arc::clone` rather than opening a second connection pool
     /// (issue #13 architect plan, resolved open question #1).
     pub fn from_shared_pool(pool: Arc<ChPool>, query_timeout: Duration) -> Self {
+        Self::from_shared_pool_avoiding(pool, query_timeout, None)
+    }
+
+    /// [`Self::from_shared_pool`], its reads bound to any endpoint but
+    /// `avoid` while another exists (issue #803): the client of a request
+    /// run again after `avoid` failed.
+    pub fn from_shared_pool_avoiding(
+        pool: Arc<ChPool>,
+        query_timeout: Duration,
+        avoid: Option<usize>,
+    ) -> Self {
+        let read_binding = ReadBinding::new(pool.bind_read_avoiding(avoid));
         Self {
             pool,
+            read_binding,
             default_timeout: query_timeout,
             consistency: ConsistencyConfig::default(),
         }
+    }
+
+    /// The first server failure a read of this client met since it was
+    /// bound (issue #803), or `None`.
+    pub fn server_failure(&self) -> Option<ServerFailure> {
+        self.read_binding.failure()
+    }
+
+    /// Binds this client's reads to a new endpoint and clears its failure
+    /// (issue #803). Never call it while one of its reads is open.
+    pub fn rebind(&self) {
+        self.rebind_avoiding(None);
+    }
+
+    /// [`Self::rebind`] to any endpoint but `avoid` while another exists
+    /// (issue #803): after `avoid` failed.
+    pub fn rebind_avoiding(&self, avoid: Option<usize>) {
+        self.read_binding
+            .rebind(self.pool.bind_read_avoiding(avoid));
+    }
+
+    /// Whether an endpoint other than `endpoint` is healthy (issue #803):
+    /// the condition for running a failed read request once more.
+    pub fn other_healthy(&self, endpoint: usize) -> bool {
+        self.pool.other_healthy(endpoint)
+    }
+
+    /// Runs one read request on this client's pool (issue #803): see
+    /// [`crate::run_read_request`]. For a caller that holds a client and
+    /// no pool — the background passes, which rebind this client at the
+    /// start of each attempt.
+    pub async fn run_read_request<T, E, F, Fut>(
+        &self,
+        attempt: F,
+        failed_after_success: impl FnOnce(ServerFailure) -> E,
+    ) -> Result<T, E>
+    where
+        F: FnMut(Option<usize>) -> Fut,
+        Fut: Future<Output = crate::request::Attempt<T, E>>,
+    {
+        crate::request::run_read_request(&self.pool, attempt, failed_after_success).await
+    }
+
+    /// A read lease on this client's bound endpoint: the lease
+    /// [`Self::query_stream`] takes.
+    pub(crate) async fn lease_read(&self) -> Result<PooledConn<'_>, ChError> {
+        self.pool.get_bound(&self.read_binding).await
     }
 
     /// Installs a [`ConsistencyConfig`] onto a shared-pool client (issue
@@ -216,7 +274,9 @@ impl ChClient {
     /// and a source table whose derived tables are maintained by materialized
     /// view can have committed its own block before a view on it throws. So
     /// every failure from the write-or-end phase — retryable or not — is
-    /// [`ChError::InsertUncertain`], which no caller auto-retries. Only a
+    /// [`ChError::InsertUncertain`], which a caller may resend only under
+    /// the same insert deduplication token, as the landing writer does
+    /// (`pulsus-write`'s `writer/landing.rs`). Only a
     /// failure raised **before** the block was sent, which is the pooled
     /// connection's checkout and the target's column-metadata read, is genuine
     /// pre-commit poison and keeps its precise class: nothing was committed,
@@ -258,7 +318,7 @@ impl ChClient {
         parts: &[&[R]],
         extra: &QuerySettings,
     ) -> Result<(), ChError> {
-        let conn = self.pool.get().await?;
+        let conn = self.pool.get(StatementClass::Write).await?;
         // Issue #114: the whole attached set — the server deadline plus,
         // when quorum is enabled, the quorum trio — is the single testable
         // `insert_settings_of`, applied pair-by-pair (the `Insert` builder
@@ -346,7 +406,7 @@ impl ChClient {
         sql: &str,
         s: &QuerySettings,
     ) -> Result<ChRowStream<'_, R>, ChError> {
-        let conn = self.pool.get().await?;
+        let conn = self.lease_read().await?;
         // Issue #114: caller settings + (when enabled)
         // `select_sequential_consistency` + the stream deadline, as the
         // single testable `read_settings_of`.
@@ -420,7 +480,7 @@ impl ChClient {
             .with_max_execution_time(self.default_timeout);
         let mut attempt = 0u32;
         loop {
-            let conn = self.pool.get().await?;
+            let conn = self.pool.get(StatementClass::Write).await?;
             let q = settings.apply_to_query(conn.client().query(sql));
             let result = tokio::time::timeout(self.default_timeout, q.execute())
                 .await
@@ -532,12 +592,13 @@ where
             Poll::Ready(Some(Err(e))) => {
                 this.done = true;
                 let err = ChError::from(e);
-                // A transport-class failure mid-stream demotes this endpoint
-                // so the next query fails over (no-op for decode/logic errors
-                // — guarded in `report_transport_failure`). The deadline arm
-                // above is intentionally excluded: a self-imposed client
-                // timeout does not mean the endpoint is unhealthy.
-                this.conn.report_transport_failure(&err);
+                // A server failure mid-stream demotes this endpoint and marks
+                // the read request (issue #803; no-op for timeouts, decode
+                // and logic errors — guarded in `report_read_failure`). The
+                // deadline arm above is intentionally excluded: a
+                // self-imposed client timeout does not mean the endpoint is
+                // unhealthy.
+                this.conn.report_read_failure(&err);
                 Poll::Ready(Some(Err(err)))
             }
             Poll::Ready(None) => {
@@ -687,5 +748,245 @@ mod tests {
         assert_eq!(s.get("select_sequential_consistency"), Some("1"));
         assert_eq!(s.get("max_bytes_to_read"), Some("42"));
         assert_eq!(s.get("max_execution_time"), Some("120.000"));
+    }
+
+    // ---- issue #803: one read request, one server ----
+
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::config::ReadSpread;
+    use crate::pool::test_pool;
+    use crate::request::{Attempt, run_read_request};
+
+    fn pool3() -> Arc<ChPool> {
+        Arc::new(test_pool(
+            vec![
+                (Some("a"), "http://a:8123"),
+                (Some("b"), "http://b:8123"),
+                (Some("c"), "http://c:8123"),
+            ],
+            Some("a"),
+            ReadSpread::All,
+            8,
+        ))
+    }
+
+    fn client(pool: &Arc<ChPool>) -> ChClient {
+        ChClient::from_shared_pool(Arc::clone(pool), Duration::from_secs(5))
+    }
+
+    fn counts(pool: &ChPool) -> Vec<u64> {
+        pool.endpoint_selection_counts()
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect()
+    }
+
+    fn delta(before: &[u64], after: &[u64]) -> Vec<u64> {
+        before.iter().zip(after).map(|(b, a)| a - b).collect()
+    }
+
+    /// One read through `client`: the empty URL fails at `Url::parse`
+    /// after the lease and before any I/O, so the result is ignored.
+    async fn read(client: &ChClient) {
+        let _ = client
+            .query_stream::<StringRow>("SELECT 1", &QuerySettings::new())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn each_client_binds_its_reads_to_one_endpoint() {
+        let pool = pool3();
+        let c1 = client(&pool);
+        let c2 = client(&pool);
+        let before = counts(&pool);
+        read(&c1).await;
+        read(&c1).await;
+        let mid = counts(&pool);
+        read(&c2).await;
+        read(&c2).await;
+        let after = counts(&pool);
+        assert_eq!(delta(&before, &mid), vec![2, 0, 0], "client 1");
+        assert_eq!(delta(&mid, &after), vec![0, 2, 0], "client 2");
+    }
+
+    #[tokio::test]
+    async fn insert_is_a_write_whatever_the_binding() {
+        let pool = pool3();
+        let c1 = client(&pool);
+        read(&c1).await;
+        // Client 2 is bound to the second endpoint, `b`.
+        let c2 = client(&pool);
+        let before = counts(&pool);
+        for _ in 0..2 {
+            let _ = c2.insert_block::<StringRow>("t", &[]).await;
+        }
+        assert_eq!(delta(&before, &counts(&pool)), vec![2, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn execute_is_a_write_whatever_the_binding() {
+        let pool = pool3();
+        let _c1 = client(&pool);
+        let c2 = client(&pool);
+        let before = counts(&pool);
+        for _ in 0..2 {
+            let _ = c2
+                .execute(
+                    "SELECT 1",
+                    &QuerySettings::new(),
+                    Idempotency::NonIdempotent,
+                )
+                .await;
+        }
+        assert_eq!(delta(&before, &counts(&pool)), vec![2, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn ping_is_a_write_whatever_the_binding() {
+        let pool = pool3();
+        let _c1 = client(&pool);
+        let c2 = client(&pool);
+        let before = counts(&pool);
+        for _ in 0..2 {
+            let _ = c2.ping().await;
+        }
+        assert_eq!(delta(&before, &counts(&pool)), vec![2, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn three_concurrent_reads_stay_on_one_server_through_a_failover_and_the_rerun_moves_all_of_them()
+     {
+        let pool = pool3();
+        let calls = AtomicUsize::new(0);
+        let seen: Mutex<Vec<Vec<usize>>> = Mutex::new(Vec::new());
+        let (pool_ref, calls_ref, seen_ref) = (&pool, &calls, &seen);
+        let out = run_read_request(
+            &pool,
+            move |avoid| async move {
+                let n = calls_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                let c = ChClient::from_shared_pool_avoiding(
+                    Arc::clone(pool_ref),
+                    Duration::from_secs(5),
+                    avoid,
+                );
+                let (l1, l2, l3) = tokio::join!(c.lease_read(), c.lease_read(), c.lease_read());
+                let (l1, l2, l3) = (
+                    l1.expect("lease 1"),
+                    l2.expect("lease 2"),
+                    l3.expect("lease 3"),
+                );
+                let mut eps = vec![l1.endpoint(), l2.endpoint(), l3.endpoint()];
+                if n == 1 {
+                    l2.report_read_failure(&ChError::Io("reset".to_string()));
+                    let l4 = c.lease_read().await.expect("lease 4");
+                    eps.push(l4.endpoint());
+                }
+                drop((l1, l2, l3));
+                seen_ref.lock().expect("seen").push(eps);
+                Attempt {
+                    result: Ok::<usize, ChError>(n),
+                    failure: c.server_failure(),
+                }
+            },
+            ChError::from,
+        )
+        .await;
+        assert_eq!(out.expect("the second attempt is accepted"), 2);
+        let seen = seen.lock().expect("seen").clone();
+        assert_eq!(seen.first(), Some(&vec![0, 0, 0, 0]), "attempt 1: {seen:?}");
+        assert_eq!(seen.get(1), Some(&vec![2, 2, 2]), "attempt 2: {seen:?}");
+        assert_eq!(counts(&pool), vec![4, 0, 3]);
+        assert!(!pool.endpoint_health()[0].1, "a demoted");
+    }
+
+    #[tokio::test]
+    async fn rebind_moves_to_a_healthy_server_and_clears_the_failure() {
+        let pool = pool3();
+        let c = client(&pool);
+        {
+            let lease = c.lease_read().await.expect("lease");
+            assert_eq!(lease.endpoint(), 0);
+            lease.report_read_failure(&ChError::Io("reset".to_string()));
+        }
+        assert!(c.server_failure().is_some(), "the failure is recorded");
+        c.rebind();
+        assert_eq!(c.server_failure(), None, "rebind clears the failure");
+        let lease = c.lease_read().await.expect("lease");
+        assert_eq!(lease.endpoint(), 2);
+    }
+
+    // ---- issue #803, code review round 1: a rerun never goes back ----
+
+    fn pool2() -> Arc<ChPool> {
+        Arc::new(test_pool(
+            vec![(None, "http://a:8123"), (None, "http://b:8123")],
+            None,
+            ReadSpread::All,
+            8,
+        ))
+    }
+
+    /// R7: the server that failed is promoted again before the rerun, and
+    /// another request's bind puts the rotation back on it. The rerun is
+    /// bound to the other server all the same, and its answer is used.
+    #[tokio::test]
+    async fn a_rerun_never_binds_the_server_that_failed_even_once_it_is_promoted() {
+        let pool = pool2();
+        let seen: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        let calls = AtomicUsize::new(0);
+        let (pool_ref, seen_ref, calls_ref) = (&pool, &seen, &calls);
+        let out = run_read_request(
+            &pool,
+            move |avoid| async move {
+                let n = calls_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                let c = ChClient::from_shared_pool_avoiding(
+                    Arc::clone(pool_ref),
+                    Duration::from_secs(5),
+                    avoid,
+                );
+                let lease = c.lease_read().await.expect("lease");
+                let ep = lease.endpoint();
+                seen_ref.lock().expect("seen").push(ep);
+                if ep == 0 {
+                    // Server `a` fails whenever it is asked.
+                    lease.report_read_failure(&ChError::Io("reset".to_string()));
+                }
+                drop(lease);
+                if n == 1 {
+                    // Another request binds meanwhile, and `a` is promoted.
+                    let _other = client(pool_ref);
+                    crate::pool::promote_for_test(pool_ref, 0);
+                }
+                Attempt {
+                    result: Ok::<usize, ChError>(n),
+                    failure: c.server_failure(),
+                }
+            },
+            ChError::from,
+        )
+        .await;
+        let seen = seen.lock().expect("seen").clone();
+        assert_eq!(seen, vec![0, 1], "the rerun is bound to `b`");
+        assert_eq!(out.expect("the rerun on `b` is accepted"), 2);
+    }
+
+    /// K8: a client rebound after its server failed is not bound to that
+    /// server again, even once it is promoted and the rotation is back on
+    /// it — the tail's rebind between polls.
+    #[tokio::test]
+    async fn rebind_avoiding_skips_the_failed_server_even_once_promoted() {
+        let pool = pool2();
+        let c = client(&pool);
+        {
+            let lease = c.lease_read().await.expect("lease");
+            assert_eq!(lease.endpoint(), 0);
+            lease.report_read_failure(&ChError::Io("reset".to_string()));
+        }
+        let _other = client(&pool);
+        crate::pool::promote_for_test(&pool, 0);
+        c.rebind_avoiding(Some(0));
+        assert_eq!(c.lease_read().await.expect("lease").endpoint(), 1);
     }
 }

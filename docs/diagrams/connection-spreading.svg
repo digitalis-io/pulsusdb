@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1120" height="720" viewBox="0 0 1120 720" role="img" aria-labelledby="title desc">
   <title id="title">PulsusDB availability-zone-aware ClickHouse connection spreading</title>
-  <desc id="desc">A PulsusDB node in availability zone A resolves its own zone (from PULSUS_AVAILABILITY_ZONE or cloud instance metadata), then its ClickHouse connection pool holds one client per configured endpoint. A single semaphore bounds total concurrency. The zone-preferring round-robin policy selects endpoints in zone A first, failing over to zones B and C only when no local endpoint answers; a transport failure demotes an endpoint for a cooldown.</desc>
+  <desc id="desc">A PulsusDB node in availability zone A resolves its own zone (from PULSUS_AVAILABILITY_ZONE or cloud instance metadata), then its ClickHouse connection pool holds one client per configured endpoint. A single semaphore bounds total concurrency. Writes go to endpoints in zone A first, failing over to zones B and C only when no local endpoint answers; each read request goes to one healthy endpoint in any zone, and runs again on another if it fails; a transport failure demotes an endpoint for a cooldown.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
@@ -48,7 +48,7 @@
 
   <rect class="zoneA" x="60" y="358" width="320" height="70" rx="6"/>
   <text class="small" x="76" y="380">candidate_order (pure, lock-free)</text>
-  <text class="tiny" x="76" y="398">zone-preferring round-robin; zero pings on hot path</text>
+  <text class="tiny" x="76" y="398">writes: local zone first; reads: one endpoint per request</text>
   <text class="tiny" x="76" y="414">local zone → other zones → cooldown-expired → rest</text>
 
   <rect class="client" x="60" y="440" width="96" height="40" rx="6"/>
@@ -61,7 +61,7 @@
   <text class="tiny" x="76" y="520">a streaming cursor stays pinned to its endpoint (RAII lease)</text>
 
   <!-- Zone A endpoints -->
-  <text class="title" x="620" y="120">ClickHouse — zone A (preferred)</text>
+  <text class="title" x="620" y="120">ClickHouse — zone A (preferred for writes)</text>
   <rect class="zoneA" x="612" y="136" width="440" height="112" rx="8"/>
   <rect class="store" x="632" y="160" width="180" height="64" rx="6"/>
   <text class="label" x="652" y="188">ch1  (_dist)</text>
@@ -71,7 +71,7 @@
   <text class="tiny" x="872" y="208">az-a</text>
 
   <!-- Zone B endpoints -->
-  <text class="title" x="620" y="300">ClickHouse — zone B (failover)</text>
+  <text class="title" x="620" y="300">ClickHouse — zone B (reads; write failover)</text>
   <rect class="zoneB" x="612" y="316" width="440" height="112" rx="8"/>
   <rect class="store" x="632" y="340" width="180" height="64" rx="6"/>
   <text class="label" x="652" y="368">ch3  (_dist)</text>
@@ -81,7 +81,7 @@
   <text class="tiny" x="872" y="388">az-b — demoted (cooldown)</text>
 
   <!-- Zone C endpoints -->
-  <text class="title" x="620" y="480">ClickHouse — zone C (failover)</text>
+  <text class="title" x="620" y="480">ClickHouse — zone C (reads; write failover)</text>
   <rect class="zoneC" x="612" y="496" width="440" height="112" rx="8"/>
   <rect class="store" x="632" y="520" width="180" height="64" rx="6"/>
   <text class="label" x="652" y="548">ch5  (_dist)</text>
@@ -105,8 +105,8 @@
   <rect class="panel" x="40" y="616" width="1012" height="80" rx="8"/>
   <text class="label" x="60" y="642">Legend</text>
   <line class="preferred" x1="150" y1="662" x2="210" y2="662"/>
-  <text class="small" x="220" y="666">local-zone selection (preferred, round-robin)</text>
+  <text class="small" x="220" y="666">local zone: writes, round-robin</text>
   <line class="failover" x1="560" y1="662" x2="620" y2="662"/>
-  <text class="small" x="630" y="666">failover to another zone (only when no local endpoint answers)</text>
-  <text class="tiny" x="60" y="686">Every endpoint hosts the _dist wrapper tables: a _dist query/insert is correct from any node (docs/schemas.md §7), so spreading only changes which node coordinates the identical query.</text>
+  <text class="small" x="630" y="666">other zones: reads always; writes only on failover</text>
+  <text class="tiny" x="60" y="686">Every endpoint hosts the _dist wrapper tables: a _dist query/insert is correct from any node (docs/schemas.md §7), and the server a read request is sent to serves every statement of it.</text>
 </svg>

@@ -135,6 +135,17 @@ pub enum ChProto {
     Https,
 }
 
+/// Where a read request is sent (issue #803): `PULSUS_READ_SPREAD`.
+/// [`ReadSpread::All`] (the default) gives each read request any healthy
+/// endpoint, taking turns, whatever its zone; [`ReadSpread::Zone`] prefers
+/// this node's zone first, as writes always do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReadSpread {
+    #[default]
+    All,
+    Zone,
+}
+
 /// One ClickHouse endpoint in a multi-endpoint deployment (issue #43).
 /// `host`/`http_port` are the dial target; `zone` is the endpoint's
 /// availability zone (when known), used by the pool's zone-preferring
@@ -217,6 +228,9 @@ pub struct ChConnConfig {
     /// Default is all-off (strong consistency is opt-in), so this is
     /// byte-for-byte the pre-#114 insert/select behaviour.
     pub consistency: ConsistencyConfig,
+    /// `PULSUS_READ_SPREAD` (issue #803, default [`ReadSpread::All`]):
+    /// which endpoint a read request is bound to.
+    pub read_spread: ReadSpread,
 }
 
 impl Default for ChConnConfig {
@@ -236,6 +250,7 @@ impl Default for ChConnConfig {
             endpoints: Vec::new(),
             local_zone: None,
             consistency: ConsistencyConfig::default(),
+            read_spread: ReadSpread::All,
         }
     }
 }

@@ -317,7 +317,7 @@ come from the request.
 | any `_over_time` with `\| unwrap` | each window's reducer, for eleven, in the reduced statement | *emitted today* (issue #624 parts 4 and 4b) for `sum_`, `avg_`, `min_`, `max_`, `stddev_`, `stdvar_`, `quantile_`, `first_`, `last_over_time`, `rate` and `rate_counter` with no parser, or after one `\| json`, `\| logfmt`, `\| regexp` or `\| pattern` — `metric_range_reduced` (`sql.rs:2471`): `arrayCumSum`, the reference's `avg_over_time` recurrence as an `arrayFold`, `varPopStable`, the quantile's ceiling index, `min`/`max` of `(timestamp, stream hash, value)` for first and last, and the reset-aware increase `rate_counter` extrapolates in the engine. Every other chain is *evaluated after the read*, `plan.rs:1744` |
 | `absent_over_time` | `count()`, per grid point | *emitted today* (issue #624 part 2): the counting statement's rows say which windows hold a line, and the answer is 1 at every grid point no counted row covers |
 | `sum by (level) (…)` | none | *evaluated after the read*. `has_grouping` forces the client path (`plan.rs:2895`) |
-| `topk(k, …)`, `bottomk(k, …)`, `approx_topk(k, …)`, `sort(…)`, `sort_desc(…)` | none | *evaluated after the read*. The planner records the chain on `MetricPlan::vector_aggs` (`plan.rs:362`) and nothing reads it when deciding what to lower — `bucketed_range` (`plan.rs:3086`) does not consult it — so no statement on any route carries the selection. `pulsus-server` applies it to the result the read produced: `post_agg.rs:1042` sends a matrix to `select_k_range` (`:807`), `post_agg.rs:1110` sends a vector to `select_k_instant` (`:858`), and `approx_topk` goes to `approx_topk_instant` (`post_agg.rs:983`). Applied at `logql/exec.rs:2184` (the bucketed range read), `logql/exec.rs:2597` (the client-aggregated range read, where the INNERMOST selection is folded at the leaf over the same rows instead — `client_agg.rs:2207`, `logql/fold.rs:543`), `logql/exec.rs:1950` (instant) and `logql/exec.rs:2785` (a binary or `variants` tree). **One refusal:** `approx_topk` on a range query is a `400` at plan time, `count min sketches are only supported on instant queries` (`plan.rs:1538`). §2.8's LogQL56 carries the statement the range form issues |
+| `topk(k, …)`, `bottomk(k, …)`, `approx_topk(k, …)`, `sort(…)`, `sort_desc(…)` | none | *evaluated after the read*. The planner records the chain on `MetricPlan::vector_aggs` (`plan.rs:362`) and nothing reads it when deciding what to lower — `bucketed_range` (`plan.rs:3086`) does not consult it — so no statement on any route carries the selection. `pulsus-server` applies it to the result the read produced: `post_agg.rs:1042` sends a matrix to `select_k_range` (`:807`), `post_agg.rs:1110` sends a vector to `select_k_instant` (`:858`), and `approx_topk` goes to `approx_topk_instant` (`post_agg.rs:983`). Applied at `logql/exec.rs:2213` (the bucketed range read), `logql/exec.rs:2626` (the client-aggregated range read, where the INNERMOST selection is folded at the leaf over the same rows instead — `client_agg.rs:2207`, `logql/fold.rs:543`), `logql/exec.rs:1979` (instant) and `logql/exec.rs:2814` (a binary or `variants` tree). **One refusal:** `approx_topk` on a range query is a `400` at plan time, `count min sketches are only supported on instant queries` (`plan.rs:1538`). §2.8's LogQL56 carries the statement the range form issues |
 | `label_replace(…)` | none | *evaluated after the read* |
 | ordering, log query | `ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC` | *emitted today*, `sql.rs:788`. All four columns follow the request direction. The four-column key is what makes rows that share a timestamp come back in the same order every run |
 | ordering, range metric query | `ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC` on the raw read; none on the two lowered reads | *emitted today*, `crates/pulsus-read/src/logql/sql.rs:1649`. This is the table's own primary key, so ClickHouse streams the rows and sorts nothing. The lowered reads return groups, which the reader folds without an order |
@@ -2008,12 +2008,12 @@ sequenceDiagram
   EN-->>C: 200 {"status":"success","data":{"resultType":"streams",...}}
 ```
 
-Under `crates/`: the route is mounted at `pulsus-server/src/logs_api/mod.rs:55-59` and planned at
+Under `crates/`: the route is mounted at `pulsus-server/src/logs_api/mod.rs:56-60` and planned at
 `pulsus-read/src/logql/plan.rs:1057`. The three passes that make this decision today are `plan.rs:4360`,
 `plan.rs:1694` and `plan.rs:1720`; LogQL's compiler keeps or replaces them itself, and does not move
 them into the core (owner decision, #507). Evaluation after the read is `logql/pipeline.rs:1360`. The
 TraceQL equivalents are `traces/search_plan.rs:1121`, `traces/search_sql.rs:170` and
-`traces/exec.rs:1322`.
+`traces/exec.rs:1365`.
 
 ### 3.3 The decision, per step
 
@@ -5272,15 +5272,15 @@ engine will read, and what it will return:
 | LogQL entry limit | default 100, ceiling 5,000; above the ceiling is `400` | `docs/api.md` §2.1 |
 | LogQL metric grid | at most 11,000 intervals; over it is `422` | `logql/window.rs:148` |
 | LogQL stream count | 100,000 fingerprints | `logql/params.rs:124` |
-| LogQL byte scan budget | `reader.logql_scan_budget_bytes`, default 50 GiB | field at `pulsus-config/src/model.rs:506`, default at `:656`. Exhausting it returns the entries already kept, with `stats.pulsus_partial: true` |
-| LogQL per-query memory | `reader.logql_read_max_memory_bytes`, default 8 GiB | field at `model.rs:577`, default at `:668`; exceeding it is `422`. The setting refuses rather than writing intermediate state to disk |
+| LogQL byte scan budget | `reader.logql_scan_budget_bytes`, default 50 GiB | field at `pulsus-config/src/model.rs:511`, default at `:661`. Exhausting it returns the entries already kept, with `stats.pulsus_partial: true` |
+| LogQL per-query memory | `reader.logql_read_max_memory_bytes`, default 8 GiB | field at `model.rs:582`, default at `:673`; exceeding it is `422`. The setting refuses rather than writing intermediate state to disk |
 | LogQL result bytes | 1 GiB still held when the statement ends | `logql/charge.rs:1326`; refused `422`, never cut short |
-| LogQL over-fetch factor | `reader.logql_pipeline_scan_factor`, default 10 | field at `model.rs:528`, default at `:690` @ 1cdb3e5e. Applies only while a stage that drops lines is evaluated after the read |
+| LogQL over-fetch factor | `reader.logql_pipeline_scan_factor`, default 10 | field at `model.rs:533`, default at `:690` @ 1cdb3e5e. Applies only while a stage that drops lines is evaluated after the read |
 | TraceQL candidates | `reader.traceql_max_candidates`, default 100,000 | field at `model.rs:544` @ 1cdb3e5e, default at `:692` @ 1cdb3e5e. Per first statement and for the merged set |
 | TraceQL batch size | 32 traces | `traces/exec.rs:126` @ 1cdb3e5e |
 | spans per trace | 10,000 | `traces/exec.rs:131` @ 1cdb3e5e; a trace over it is reported incomplete |
 | TraceQL span-read bytes | 256 MiB | `traces/exec.rs:84` |
-| ClickHouse result bytes, traces | 64 MiB, refusing rather than truncating | `traces/exec.rs:96`, applied at `:1363` |
+| ClickHouse result bytes, traces | 64 MiB, refusing rather than truncating | `traces/exec.rs:96`, applied at `:1406` |
 | rendered SQL text | 8 MiB; at or past it is `422 query_too_broad` | `pulsus-read/src/querytext.rs:52` |
 | syntax tree, reduced statement after `\| logfmt` | `max_ast_elements` 1,000,000 and `max_expanded_ast_elements` 10,000,000 on that statement only; at the server's default of 50,000 it fails with `TOO_BIG_AST` | `logql/sql.rs` `metric_range_reduced` |
 | handover size | at most one set of values written into the text of the next statement. 32,768 literal ids is `Code: 168. DB::Exception: AST is too big. Maximum: 50000.` | ADR 0008 D3 |

@@ -39,8 +39,9 @@ use pulsus_read::TimeBounds;
 use crate::app::AppState;
 
 use super::encode;
+use super::engine::with_engine;
 use super::error::ApiError;
-use super::handlers::{engine_for, parse_bounds_ordered, read_form_pairs, tenant_of};
+use super::handlers::{parse_bounds_ordered, read_form_pairs, tenant_of};
 use super::params::{self, ParamError};
 use pulsus_model::Tenant;
 
@@ -108,16 +109,18 @@ async fn detected_labels_impl(
     let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
 
-    let engine = engine_for(&state, tenant).await?;
-    if wants_explain(headers) {
-        let (labels, explain) = engine
-            .detected_labels_explained(selector.as_ref(), bounds)
-            .await?;
-        Ok(encode::detected_labels_response(labels, Some(explain)))
-    } else {
-        let labels = engine.detected_labels(selector.as_ref(), bounds).await?;
-        Ok(encode::detected_labels_response(labels, None))
-    }
+    let explain = wants_explain(headers);
+    let selector = selector.as_ref();
+    let (labels, explain) = with_engine(&state, &tenant, |engine| async move {
+        if explain {
+            let (labels, explain) = engine.detected_labels_explained(selector, bounds).await?;
+            Ok((labels, Some(explain)))
+        } else {
+            Ok((engine.detected_labels(selector, bounds).await?, None))
+        }
+    })
+    .await?;
+    Ok(encode::detected_labels_response(labels, explain))
 }
 
 // ---------------------------------------------------------------------
@@ -188,22 +191,23 @@ async fn detected_fields_impl(
         params::get(&pairs, "field_limit"),
     )?;
 
-    let engine = engine_for(&state, tenant).await?;
-    if wants_explain(headers) {
-        let (out, explain) = engine
-            .detected_fields_explained(&expr, bounds, line_limit, field_limit)
-            .await?;
-        Ok(encode::detected_fields_response(
-            out,
-            field_limit,
-            Some(explain),
-        ))
-    } else {
-        let out = engine
-            .detected_fields(&expr, bounds, line_limit, field_limit)
-            .await?;
-        Ok(encode::detected_fields_response(out, field_limit, None))
-    }
+    let explain = wants_explain(headers);
+    let expr = &expr;
+    let (out, explain) = with_engine(&state, &tenant, |engine| async move {
+        if explain {
+            let (out, explain) = engine
+                .detected_fields_explained(expr, bounds, line_limit, field_limit)
+                .await?;
+            Ok((out, Some(explain)))
+        } else {
+            let out = engine
+                .detected_fields(expr, bounds, line_limit, field_limit)
+                .await?;
+            Ok((out, None))
+        }
+    })
+    .await?;
+    Ok(encode::detected_fields_response(out, field_limit, explain))
 }
 
 // ---------------------------------------------------------------------
@@ -282,26 +286,27 @@ async fn detected_field_values_impl(
         params::get(&pairs, "field_limit"),
     )?;
 
-    let engine = engine_for(&state, tenant).await?;
-    if wants_explain(headers) {
-        let (out, explain) = engine
-            .detected_field_values_explained(name, &expr, bounds, line_limit, value_limit)
-            .await?;
-        Ok(encode::detected_field_values_response(
-            out,
-            value_limit,
-            Some(explain),
-        ))
-    } else {
-        let out = engine
-            .detected_field_values(name, &expr, bounds, line_limit, value_limit)
-            .await?;
-        Ok(encode::detected_field_values_response(
-            out,
-            value_limit,
-            None,
-        ))
-    }
+    let explain = wants_explain(headers);
+    let expr = &expr;
+    let (out, explain) = with_engine(&state, &tenant, |engine| async move {
+        if explain {
+            let (out, explain) = engine
+                .detected_field_values_explained(name, expr, bounds, line_limit, value_limit)
+                .await?;
+            Ok((out, Some(explain)))
+        } else {
+            let out = engine
+                .detected_field_values(name, expr, bounds, line_limit, value_limit)
+                .await?;
+            Ok((out, None))
+        }
+    })
+    .await?;
+    Ok(encode::detected_field_values_response(
+        out,
+        value_limit,
+        explain,
+    ))
 }
 
 #[cfg(test)]

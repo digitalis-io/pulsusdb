@@ -26,8 +26,7 @@ node degrades.
 This is a PulsusDB-side, connection-level concern. It does **not** change any
 SQL, pushdown, granule pruning, projection choice, or `_dist` fan-out — a
 `_dist` (Distributed) query or insert is correct from **any** cluster node
-(docs/schemas.md §7), so spreading only changes *which node coordinates the
-identical query*, never the result.
+(docs/schemas.md §7), so spreading changes *which node coordinates the identical query*. The SQL does not change, but the coordinator decides which replicas serve the read, and a replica still receiving a block answers without it. That is why every statement of one read request goes to one server (see How the pool works).
 
 **One write is placed by the endpoint it was sent to**, and it is still correct
 from any of them: a logs or metrics push inserts into `log_landing` /
@@ -42,13 +41,14 @@ unchanged, every endpoint still being a cluster member.
 
 ## Configuration
 
-Two settings drive it (docs/configuration.md §2 and §4):
+These settings drive it (docs/configuration.md §2 and §4):
 
 | Setting | Purpose |
 |---------|---------|
 | `CLICKHOUSE_SERVERS` (`clickhouse.servers`) | the endpoint list — `host[:port][=zone]`, comma-separated in the env form |
 | `PULSUS_AVAILABILITY_ZONE` (`availability_zone`) | this node's own zone (operator-supplied) |
 | `PULSUS_AZ_DETECT` (`az_detect`) | auto-detect this node's zone from cloud metadata when not set explicitly |
+| `PULSUS_READ_SPREAD` (`read_spread`) | `all` (default): each read request goes to any one endpoint, taking turns; `zone`: to one in this node's zone first, as writes do |
 
 Backward compatible: with none of these set, PulsusDB dials the single
 `CLICKHOUSE_SERVER`/`CLICKHOUSE_HTTP_PORT` endpoint exactly as before.
@@ -85,27 +85,33 @@ it is not multiplied by the endpoint count, and the RAII lease discipline is
 unchanged (a streaming cursor owns exactly one permit and one endpoint for its
 whole lifetime, released on drop).
 
-Each `get()` chooses an endpoint with a pure, lock-free policy
-(`candidate_order`): endpoints in the node's local zone lead (round-robin
-among them), then other-zone endpoints (round-robin), then demoted endpoints
-whose cooldown has expired, then the rest. On the healthy path this is a few
-atomic loads, a modulo, and a zone compare — **no ping, no allocation, no
-extra round-trip.**
+A **write** lease (every insert, `execute`, `ping`) chooses an endpoint with a pure, lock-free policy (`candidate_order`): endpoints in this node's zone lead (round-robin among them), then the other healthy endpoints (round-robin), then demoted endpoints whose cooldown has expired, then the rest. A **read request** is bound to one endpoint when its client is built: the first of that same order, with no zone leading under `read_spread: all` and this node's zone under `zone`, from a rotation of its own. Every read of that client is leased on that endpoint, whatever happens to its health meanwhile, so a request never moves between endpoints while it runs. If a read reports a server failure, the endpoint is demoted and the request is marked. When it ends, it runs once more with a new client and so a new endpoint, and only the run whose answer is used may update a cache. On the healthy path this is a few atomic loads, a modulo, and a zone compare — **no ping and no extra round-trip.**
 
 ## Failover
 
 Selection carries no active health probing on the hot path. Instead, a
-**transport-class failure** on a real query — a connection/timeout/IO error or
-a retryable ClickHouse server code, never a bad-SQL/decode/logic error —
-demotes that endpoint. Health is published as lock-free mirror atomics for the
-hot path (`get()`'s healthy+fresh path never locks anything), backed by a tiny
-non-async transition lock — never held across an `.await`, never in `Drop` —
-that makes every state change (a demotion, a promotion, or a probe outcome)
-one atomic critical section. The next `get()` skips a demoted endpoint until a
-short cooldown elapses, then re-admits it as a probe candidate; a successful
-probe re-promotes it immediately. This matches "immediately start using other
-AZs on disconnect" with zero healthy-path overhead: at most one failed request
-per newly-dead endpoint.
+failure on a real statement demotes its endpoint. For a **write**, that is a
+transport-class failure: a connection, timeout or IO error, or a retryable
+ClickHouse server code. For a **read**, it is a server failure: a connection
+or IO error, or a network-class server code; a read that times out demotes
+nothing. A bad-SQL, decode or logic error never demotes. Health is published
+as lock-free mirror atomics for the hot path (`get()`'s healthy+fresh path
+never locks anything), backed by a tiny non-async transition lock — never
+held across an `.await`, never in `Drop` — that makes every state change (a
+demotion, a promotion, or a probe outcome) one atomic critical section. A
+write's `get()` ranks a demoted endpoint below every healthy one, and once a
+short cooldown has elapsed, above the demoted endpoints still cooling. It
+reaches a demoted endpoint only when the endpoints ahead of it do not answer,
+before its cooldown ends as well, and probes it before using it; a successful
+probe re-promotes it immediately. New read requests are bound to it while it is demoted only when
+no endpoint is healthy. This matches "immediately start using other AZs on
+disconnect" with zero healthy-path overhead. Every statement already running
+on an endpoint when it goes down can fail on it, however many requests those
+are: each such write returns its error, and each such read request runs again
+on another endpoint if one is healthy at that moment, or returns its error if
+none is.
+
+A read request whose endpoint fails is not continued elsewhere: its partial results are dropped, and if another endpoint is healthy at the moment it fails, the whole request runs once more, bound to any endpoint except the one that failed, whatever that endpoint's health by then; a live tail repeats the failed read the same way. No read runs more than twice. A read timeout is the request's own deadline: it demotes nothing and is not run again.
 
 Startup uses "ping-any": the pool starts if at least one endpoint answers, so
 a partially-degraded cluster is still serviceable.

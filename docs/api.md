@@ -693,7 +693,7 @@ a POST form body**: `/query`, `/query_range`, `/series` (per `match[]`),
 `/detected_labels`, `/detected_fields`, and — since issue #406 Part B2
 added `POST` to them — `/stats`, `/volume` and `/patterns`, each on both
 the native and `/loki/api/v1` prefixes
-(`crates/pulsus-server/src/logs_api/mod.rs:56-94,128-174`; all three of
+(`crates/pulsus-server/src/logs_api/mod.rs:57-95,129-175`; all three of
 the late additions reach the cap through the same `parse_logql` seam).
 That set is narrower than "the `GET|POST` form routes", of which there
 are ten: `/labels` and `/label/{name}/values` are `GET|POST`
@@ -730,12 +730,12 @@ capped before it leaves the client and a proxied one an order of
 magnitude below our limit, so what remains is a non-browser client
 talking straight to the database — and that client has a carrier: since
 issue #406 Part B2 **every query-carrying log route accepts a POST form
-body** (`crates/pulsus-server/src/logs_api/mod.rs:56-94,128-174`), where
+body** (`crates/pulsus-server/src/logs_api/mod.rs:57-95,129-175`), where
 the 131,071-byte text cap is the only bound. The sole exception is
 `/tail`, which is `GET`-only here and effectively `GET`-only there too (a
 POST cannot carry a WebSocket handshake; the reference's `POST`
 registration is nominal and it answers `400` to one — measured
-2026-08-10, `crates/pulsus-server/src/logs_api/mod.rs:148-153`). Reopen if a client turns up that can only
+2026-08-10, `crates/pulsus-server/src/logs_api/mod.rs:149-154`). Reopen if a client turns up that can only
 `GET` and needs more than ~65.5 KB of request-target.
 
 **Accepted divergence — LogQL nesting depth (issue #256, closed
