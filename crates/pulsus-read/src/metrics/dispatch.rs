@@ -366,6 +366,13 @@ mod leaf {
             self
         }
 
+        /// Issue #803: the first server failure this dispatch's reads met.
+        /// A read of the client's own record, which cannot dispatch, so the
+        /// leaf module's rule above still holds.
+        pub(crate) fn server_failure(&self) -> Option<pulsus_clickhouse::ServerFailure> {
+            self.client.server_failure()
+        }
+
         /// Wraps [`ChClient::query_stream`] with the placeholder-escaping
         /// fix [`escape_query_placeholders`] applies — the `SqlFallback`
         /// sub-query's `^(?:...)$` regex predicates always carry a literal

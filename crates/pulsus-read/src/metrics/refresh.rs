@@ -16,13 +16,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use pulsus_clickhouse::{ChError, QuerySettings};
+use pulsus_clickhouse::{ChClient, ChError, QuerySettings};
 use pulsus_model::{Fingerprint, LabelSet, Tenant, floor_to_activity_bucket};
 
 use super::matcher::DataWindow;
 use tokio::task::JoinHandle;
 
-use super::labels::{CacheSnapshot, LabelCache, TenantCache};
+use super::labels::{CacheSnapshot, LabelCache, LabelCacheConfig, TenantCache};
 use super::rows::SeriesRow;
 
 /// Renders the §5.2 sweep SQL ([`super::sql::sweep_query`]): every series
@@ -52,40 +52,66 @@ pub(crate) fn now_unix_ms() -> i64 {
     i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// One sweep + swap: streams [`SeriesRow`]s, builds a whole new
-/// [`CacheSnapshot`], swaps it into `cache.snapshot` under a brief write
-/// lock (never held across an `.await`), and updates `cache.metrics`. On a
-/// `ChError`, the last good snapshot is left untouched and
-/// `refresh_failures_total` is bumped — this is the self-healing contract
-/// [`LabelCache::refresh`] and [`spawn_refresh_loop`] both rely on.
-pub(crate) async fn run_sweep(
-    cache: &LabelCache,
+/// One tenant's sweep, built but not yet swapped in (issue #803): the
+/// maps, the sweep's own `now_ms` and its floored lower bound. The
+/// generation is set at the swap, from the tenant's snapshot then.
+#[derive(Debug, Default)]
+pub(crate) struct SweptSnapshot {
+    pub(crate) by_fingerprint: HashMap<Fingerprint, LabelSet>,
+    pub(crate) by_metric: HashMap<String, Vec<Fingerprint>>,
+    pub(crate) sweep_time_ms: i64,
+    pub(crate) covered_from_ms: i64,
+}
+
+impl SweptSnapshot {
+    pub(crate) fn series_count(&self) -> u64 {
+        self.by_fingerprint.len() as u64
+    }
+
+    /// Swaps this sweep into `slot` under a brief write lock (never held
+    /// across an `.await`), one generation past the snapshot it replaces.
+    pub(crate) fn swap_into(self, slot: &TenantCache) {
+        let generation = slot.current_snapshot().generation.saturating_add(1);
+        let snapshot = CacheSnapshot {
+            by_fingerprint: self.by_fingerprint,
+            by_metric: self.by_metric,
+            // The sweep's own `now_ms` (code review round-2 fix: this — not a
+            // wall-clock `Instant` captured at swap time — is the recency
+            // anchor `resolve_over`'s upper-bound gate and `LabelCache::age_ms`
+            // both measure against; see `CacheSnapshot::sweep_time_ms`'s doc
+            // comment).
+            sweep_time_ms: self.sweep_time_ms,
+            covered_from_ms: self.covered_from_ms,
+            generation,
+        };
+        let mut guard = match slot.snapshot.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Arc::new(snapshot);
+    }
+}
+
+/// One tenant's sweep (issue #803): streams [`SeriesRow`]s and builds the
+/// maps of a new snapshot, touching no cache state.
+pub(crate) async fn sweep_tenant(
+    client: &ChClient,
+    config: &LabelCacheConfig,
     tenant: &Tenant,
-    slot: &TenantCache,
-) -> Result<(), ChError> {
+) -> Result<SweptSnapshot, ChError> {
     let now_ms = now_unix_ms();
-    let lower_bound_ms = floor_to_activity_bucket(
-        now_ms - cache.config.window_ms,
-        pulsus_model::ACTIVITY_BUCKET_MS,
-    );
+    let lower_bound_ms =
+        floor_to_activity_bucket(now_ms - config.window_ms, pulsus_model::ACTIVITY_BUCKET_MS);
     let sql = sweep_sql(
         tenant,
-        &cache.config.series_table,
-        &cache.config.labels_table,
+        &config.series_table,
+        &config.labels_table,
         DataWindow {
             start_ms: lower_bound_ms,
             end_ms: now_ms,
         },
     );
-
-    let result = fetch_rows(cache, &sql).await;
-    let rows = match result {
-        Ok(rows) => rows,
-        Err(err) => {
-            cache.metrics.record_refresh_failure();
-            return Err(err);
-        }
-    };
+    let rows = fetch_rows(client, config, &sql).await?;
 
     let mut by_fingerprint: HashMap<Fingerprint, LabelSet> = HashMap::with_capacity(rows.len());
     let mut by_metric: HashMap<String, Vec<Fingerprint>> = HashMap::new();
@@ -108,33 +134,46 @@ pub(crate) async fn run_sweep(
         fps.sort_unstable();
         fps.dedup();
     }
-
-    let series_count = by_fingerprint.len() as u64;
-    let generation = slot.current_snapshot().generation.saturating_add(1);
-    let snapshot = CacheSnapshot {
+    Ok(SweptSnapshot {
         by_fingerprint,
         by_metric,
-        // The sweep's own `now_ms` (code review round-2 fix: this — not a
-        // wall-clock `Instant` captured at swap time — is the recency
-        // anchor `resolve_over`'s upper-bound gate and `LabelCache::age_ms`
-        // both measure against; see `CacheSnapshot::sweep_time_ms`'s doc
-        // comment).
         sweep_time_ms: now_ms,
         covered_from_ms: lower_bound_ms,
-        generation,
-    };
+    })
+}
 
-    {
-        let mut guard = match slot.snapshot.write() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *guard = Arc::new(snapshot);
+/// What one label-cache pass read (issue #803): every tenant swept, every
+/// tenant whose statement failed, and the first such failure. Saved by
+/// [`LabelCache::commit_sweep`] only once the pass is accepted.
+#[derive(Debug, Default)]
+pub(crate) struct SweepOutcome {
+    pub(crate) swept: Vec<(Tenant, SweptSnapshot)>,
+    pub(crate) failed: Vec<Tenant>,
+    pub(crate) first_error: Option<ChError>,
+}
+
+/// One attempt of a label-cache pass (issue #803): every tenant's
+/// statement, in order, on `client`. A tenant whose statement fails goes
+/// to `failed` and the pass goes on, so the attempt itself is `Ok`; whether
+/// it met a server failure is its client's to say.
+pub(crate) async fn sweep_attempt(
+    client: &ChClient,
+    config: &LabelCacheConfig,
+    tenants: &[Tenant],
+) -> Result<SweepOutcome, ChError> {
+    let mut outcome = SweepOutcome::default();
+    for tenant in tenants {
+        match sweep_tenant(client, config, tenant).await {
+            Ok(swept) => outcome.swept.push((tenant.clone(), swept)),
+            Err(err) => {
+                outcome.failed.push(tenant.clone());
+                if outcome.first_error.is_none() {
+                    outcome.first_error = Some(err);
+                }
+            }
+        }
     }
-    cache
-        .metrics
-        .record_refresh(series_count, cache.config.cache_max_series);
-    Ok(())
+    Ok(outcome)
 }
 
 /// Issue #398: the sweep carries the same per-query memory ceiling
@@ -149,16 +188,16 @@ pub(crate) async fn run_sweep(
 /// competing for server memory; it does not, and is not meant to, change
 /// the fact that a degraded cache keeps answering `200` (recorded as
 /// remaining work on issue #398).
-async fn fetch_rows(cache: &LabelCache, sql: &str) -> Result<Vec<SeriesRow>, ChError> {
+async fn fetch_rows(
+    client: &ChClient,
+    config: &LabelCacheConfig,
+    sql: &str,
+) -> Result<Vec<SeriesRow>, ChError> {
     let mut rows = Vec::new();
-    let mut stream = cache
-        .client
+    let mut stream = client
         .query_stream::<SeriesRow>(
             sql,
-            &sweep_settings(
-                cache.config.read_max_memory_bytes,
-                cache.config.skip_unavailable_shards,
-            ),
+            &sweep_settings(config.read_max_memory_bytes, config.skip_unavailable_shards),
         )
         .await?;
     while let Some(row) = stream.next().await {
@@ -207,9 +246,9 @@ pub(crate) fn sweep_settings(
 }
 
 /// Spawns the recurring refresh task: ticks every `ttl`, running one
-/// [`run_sweep`] per tick, in a self-healing shape: a failed sweep only
-/// logs and bumps a failure
-/// counter (already done inside `run_sweep`), it never aborts the loop or
+/// [`LabelCache::refresh`] pass per tick, in a self-healing shape: a failed
+/// sweep only logs and bumps a failure
+/// counter (already done inside the pass), it never aborts the loop or
 /// panics — the next tick simply tries again. `tokio::time::interval`'s
 /// first tick fires immediately, so the cache starts warming as soon as
 /// this task is spawned, not after the first full `ttl` elapses.

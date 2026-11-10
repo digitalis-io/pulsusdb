@@ -528,6 +528,7 @@ expand_levels() {
                 line = rep(bl[j], "{{level}}", lv[i] "s")
                 line = rep(line, "{{level_ms}}", lv[i] "000")
                 line = rep(line, "{{source}}", i > 1 ? "metric_samples_" lv[i - 1] "s" : "")
+                line = rep(line, "{{stage}}", i > 1 ? "metric_samples_" lv[i - 1] "s" (lv[i] < 86400 ? "_stage" : "") : "")
                 line = rep(line, "{{parent_ms}}", i < n ? lv[i + 1] "000" : "")
                 line = rep(line, "{{period_ms}}", p "000")
                 line = rep(line, "{{from_ms}}", rg[i] "000")

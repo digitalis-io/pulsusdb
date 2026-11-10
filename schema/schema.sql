@@ -1002,12 +1002,13 @@ GROUP BY org_id, bucket, service, resource_id;
 -- `--@level-first ` for the first (built from `metric_landing`),
 -- `--@level-next ` for every later one (built from the level below) and
 -- `--@level-feeds ` for every level whose next level is shorter than a day
--- (the projection the next level's run reads; a day-long run reads its
--- source's day partition), and `--@level-cold ` for every level that moves
--- to the cold volume (issue #743: PULSUS_COLD_VOLUME set and the level's
--- PULSUS_ROLLUP_HOT_DAYS item under its retention); the marker and the one
--- space after it are removed. Level tokens: `{{level}}` (`60s`),
--- `{{level_ms}}`, `{{source}}`, `{{parent_ms}}`, `{{timer}}`,
+-- (its stage, the table the next level's run reads, and the view that
+-- fills it; a day-long run reads its source's day partition), and
+-- `--@level-cold ` for every level that moves to the cold volume (issue
+-- #743: PULSUS_COLD_VOLUME set and the level's PULSUS_ROLLUP_HOT_DAYS item
+-- under its retention); the marker and the one space after it are removed. Level tokens: `{{level}}` (`60s`),
+-- `{{level_ms}}`, `{{source}}`, `{{stage}}` (the level below's stage, or
+-- the level below itself when it has none), `{{parent_ms}}`, `{{timer}}`,
 -- `{{period_ms}}`, `{{level_retention_days}}` (the level's
 -- PULSUS_ROLLUP_RETENTION_DAYS item, else `{{retention_days}}`) and
 -- `{{level_hot_days}}`.
@@ -1026,7 +1027,6 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level     inc Float64 CODEC(Gorilla(8), ZSTD(1)),
 --@level     flags UInt8 CODEC(T64, ZSTD(1)),
 --@level     built_at Int64 CODEC(DoubleDelta, ZSTD(1))
---@level-feeds     , PROJECTION by_parent (SELECT * ORDER BY (intDiv(t_end - 1, {{parent_ms}}), org_id, fingerprint, t_end))
 --@level )
 --@level --@single  ENGINE = MergeTree
 --@level --@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_samples_{{level}}', '{replica}')
@@ -1039,6 +1039,30 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level COMMENT 'rollup_res_ms={{level_ms}} rollup_from_ms={{from_ms}} counter_buckets={{counter_buckets}}';
 --@level --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_samples_{{level}}{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_samples_{{level}}
 --@level --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_samples_{{level}}', cityHash64(fingerprint));
+--@level-feeds CREATE TABLE IF NOT EXISTS {{db}}.metric_samples_{{level}}_stage{{on_cluster}}
+--@level-feeds (
+--@level-feeds     kind UInt8,
+--@level-feeds     org_id LowCardinality(String),
+--@level-feeds     fingerprint UInt128 CODEC(ZSTD(1)),
+--@level-feeds     t_end Int64 CODEC(DoubleDelta, ZSTD(1)),
+--@level-feeds     t_last Int64 CODEC(DoubleDelta, ZSTD(1)),
+--@level-feeds     last Float64 CODEC(Gorilla(8), ZSTD(1)),
+--@level-feeds     min Float64 CODEC(Gorilla(8), ZSTD(1)),
+--@level-feeds     max Float64 CODEC(Gorilla(8), ZSTD(1)),
+--@level-feeds     sum Float64 CODEC(Gorilla(8), ZSTD(1)),
+--@level-feeds     count UInt32 CODEC(T64, ZSTD(1)),
+--@level-feeds     inc Float64 CODEC(Gorilla(8), ZSTD(1)),
+--@level-feeds     flags UInt8 CODEC(T64, ZSTD(1)),
+--@level-feeds     staged_at DateTime('UTC') DEFAULT now()
+--@level-feeds )
+--@level-feeds ENGINE = MergeTree
+--@level-feeds PARTITION BY toStartOfHour(staged_at)
+--@level-feeds ORDER BY (kind, intDiv(t_end - 1, {{parent_ms}}), org_id, fingerprint, t_end)
+--@level-feeds TTL staged_at + toIntervalHour({{metrics_landing_retention_hours}} + 2 * intDiv({{parent_ms}} + 3599999, 3600000) + 1)
+--@level-feeds SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 1024{{storage_policy_local}};
+--@level-feeds CREATE MATERIALIZED VIEW {{db}}.metric_samples_{{level}}_stage_mv{{on_cluster}} TO {{db}}.metric_samples_{{level}}_stage
+--@level-feeds AS SELECT kind, org_id, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags
+--@level-feeds FROM {{db}}.metric_samples_{{level}};
 --@level CREATE MATERIALIZED VIEW {{db}}.metric_samples_{{level}}_mv{{on_cluster}} REFRESH {{timer}} APPEND TO {{db}}.metric_samples_{{level}}
 --@level --@single  AS WITH toUInt8(1) AS builder, toUInt256(1) AS n_shards, toUInt256(0) AS shard_ix,
 --@level --@cluster AS WITH (SELECT toUInt8(any(replica_num) = (SELECT min(replica_num) FROM system.clusters WHERE cluster = '{{cluster}}' AND shard_num = (SELECT any(shard_num) FROM system.clusters WHERE cluster = '{{cluster}}' AND is_local))) FROM system.clusters WHERE cluster = '{{cluster}}' AND is_local) AS builder,
@@ -1065,6 +1089,9 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level-next               FROM (SELECT (SELECT max(t_end) FROM {{db}}.metric_samples_{{level}} WHERE org_id = '' AND fingerprint = 0 AND kind = 1) AS w0, t_last, t_end
 --@level-next                     FROM {{db}}.{{source}} WHERE org_id = '' AND fingerprint = 0 AND kind = 1)
 --@level-next               WHERE t_end > w0))) AS plan,
+--@level-next      (SELECT arrayFold((acc, x) -> if(empty(acc) OR x.1 > acc[-1].2, arrayPushBack(acc, x), arrayPushBack(arrayPopBack(acc), (acc[-1].1, greatest(acc[-1].2, x.2)))),
+--@level-next                        arraySort(groupArray((t_last, t_end))), CAST([], 'Array(Tuple(Int64, Int64))'))
+--@level-next       FROM {{db}}.{{stage}} WHERE org_id = '' AND fingerprint = 0 AND kind = 1) AS staged,
 --@level      tupleElement(plan, 1) AS lo,
 --@level      tupleElement(plan, 2) AS hi,
 --@level      builder = 1 AND tupleElement(plan, 3) AS work
@@ -1072,7 +1099,7 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level-first   maxIf(unix_milli, bits != 9218868437227405314) AS t_last, argMaxIf(value, (unix_milli, bits), bits != 9218868437227405314) AS last,
 --@level-first   minIf(value, NOT isNaN(value)) AS min, maxIf(value, NOT isNaN(value)) AS max,
 --@level-first   sumIf(value, NOT isNaN(value)) AS sum, toUInt32(countIf(NOT isNaN(value))) AS count,
---@level-first   sum(d) AS inc, toUInt8(if(argMax(bits, (unix_milli, bits)) = 9218868437227405314, 1, 0) + if(countIf(isNaN(value) AND bits != 9218868437227405314) > 0, 2, 0)) AS flags, any(now_ms) AS built_at
+--@level-first   sum(d) AS inc, toUInt8(if(argMax(bits, (unix_milli, bits)) = 9218868437227405314, 1, 0) + if(countIf(isNaN(value) AND bits != 9218868437227405314) > 0, 2, 0)) AS flags, toInt64(0) AS built_at
 --@level-first FROM (
 --@level-first   SELECT org_id, fingerprint, unix_milli, bits, value,
 --@level-first     if(q IS NULL OR isNaN(value) OR isNaN(assumeNotNull(q)), 0.,
@@ -1111,13 +1138,21 @@ GROUP BY org_id, bucket, service, resource_id;
 --@level-next SELECT toUInt8(0) AS kind, org_id, fingerprint, (intDiv(te - 1, {{level_ms}}) + 1) * {{level_ms}} AS t_end,
 --@level-next   max(tl) AS t_last, argMax(lv, tl) AS last,
 --@level-next   minIf(mn, ct > 0) AS min, maxIf(mx, ct > 0) AS max,
---@level-next   sum(sm) AS sum, toUInt32(sum(ct)) AS count, sum(ic) AS inc, toUInt8(bitAnd(argMax(fl, te), 1) + bitAnd(groupBitOr(fl), 2)) AS flags, any(now_ms) AS built_at
+--@level-next   sum(sm) AS sum, toUInt32(sum(ct)) AS count, sum(ic) AS inc, toUInt8(bitAnd(argMax(fl, te), 1) + bitAnd(groupBitOr(fl), 2)) AS flags, toInt64(0) AS built_at
 --@level-next FROM (SELECT org_id, fingerprint, t_end AS te, t_last AS tl, last AS lv, min AS mn, max AS mx,
 --@level-next              sum AS sm, count AS ct, inc AS ic, flags AS fl
---@level-next       FROM {{db}}.{{source}}
+--@level-next       FROM {{db}}.{{stage}}
 --@level-next       WHERE work AND kind = 0
 --@level-next         AND intDiv(t_end - 1, {{level_ms}}) BETWEEN intDiv(lo, {{level_ms}}) AND intDiv(hi - 1, {{level_ms}})
---@level-next         AND t_end > lo AND t_end <= hi)
+--@level-next         AND t_end > lo AND t_end <= hi
+--@level-next         AND arrayExists(c -> t_end > c.1 AND t_end <= c.2, staged)
+--@level-next       UNION ALL
+--@level-next       SELECT org_id, fingerprint, t_end AS te, t_last AS tl, last AS lv, min AS mn, max AS mx,
+--@level-next              sum AS sm, count AS ct, inc AS ic, flags AS fl
+--@level-next       FROM {{db}}.{{source}}
+--@level-next       WHERE work AND NOT arrayExists(c -> c.1 <= lo AND c.2 >= hi, staged) AND kind = 0
+--@level-next         AND t_end > lo AND t_end <= hi
+--@level-next         AND NOT arrayExists(c -> t_end > c.1 AND t_end <= c.2, staged))
 --@level-next GROUP BY org_id, fingerprint, t_end
 --@level UNION ALL
 --@level SELECT toUInt8(1), '', toUInt128(0), r.2, r.1, 0., 0., 0., 0., toUInt32(0), 0., toUInt8(0), now_ms

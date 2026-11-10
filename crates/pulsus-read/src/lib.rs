@@ -13,13 +13,14 @@ pub mod traces;
 
 pub use eval_gate::{DEFAULT_EVAL_CONCURRENCY, EvalGate, EvalGateSnapshot};
 pub use logql::{
-    DEFAULT_MAX_STREAMS, DetectedFieldOut, DetectedFieldValues, DetectedFields, DetectedLabelOut,
-    Direction, DiscoveryAnswer, EngineConfig, EntryCategories, ExplainStage, HistMatrixSeries,
-    HistOrFloat, HistVectorSample, LogQlEngine, LogStats, MatrixSeries, PatternSeries, PlanCtx,
-    PlanExplain, QueryParams, QueryResult, QuerySpec, ReadError, ResponseOptions, RouteChoice,
-    RoutingDecision, StreamResult, TAIL_REGISTRATION_GRACE_NS, TailCursor, TailLower, TailPage,
+    CatchUpPage, DEFAULT_MAX_STREAMS, DetectedFieldOut, DetectedFieldValues, DetectedFields,
+    DetectedLabelOut, Direction, DiscoveryAnswer, EngineConfig, EntryCategories, ExplainStage,
+    HistMatrixSeries, HistOrFloat, HistVectorSample, LogQlEngine, LogStats, MatrixSeries,
+    PatternSeries, PlanCtx, PlanExplain, QueryParams, QueryResult, QuerySpec, ReadError,
+    ResponseOptions, RouteChoice, RoutingDecision, StreamResult, TAIL_CATCH_UP_RECHECK_NS,
+    TAIL_REGISTRATION_GRACE_NS, TailAttempt, TailCeiling, TailCursor, TailLower, TailPage,
     TailSetup, TimeBounds, VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery, Warnings,
-    WireArity,
+    WireArity, commit_tail_attempt,
 };
 pub use metrics::{
     CacheMetricsSnapshot, DEFAULT_STALENESS_MULTIPLIER, DataWindow, DiscoveryFilter,

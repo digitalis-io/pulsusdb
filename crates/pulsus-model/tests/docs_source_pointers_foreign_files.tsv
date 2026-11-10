@@ -8,7 +8,6 @@ ast.go
 ast_execute.go
 ast_stringer.go
 block_traceql.go
-clickhouse/src/client.rs
 cmd/tempo/app/modules.go
 compressed.go
 config.go

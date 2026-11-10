@@ -49,8 +49,8 @@ use pulsus_model::{Tenant, tenant_from_headers};
 
 use crate::app::AppState;
 
+use super::engine::with_engine;
 use super::error::ApiError;
-use super::handlers::engine_for;
 use super::params::{TagLookup, TagScope};
 use super::tags_response::{TagNamesAnswer, TagValuesAnswer};
 use super::{intrinsics, params, tags_response};
@@ -77,7 +77,7 @@ async fn tags_impl(state: AppState, tenant: Tenant, raw: &str) -> Result<Respons
     // ClickHouse — the search surface's parse-before-engine ordering.
     let params = params::parse_tags_params(raw)?;
     let limit = params::parse_tag_limit(&params::parse_pairs(raw));
-    // The two static scopes short-circuit before `engine_for`: they issue
+    // The two static scopes short-circuit before `with_engine`: they issue
     // NO ClickHouse query at all (issue #475), which is what the
     // zero-delta gate in `traces_tags_live.rs` measures.
     let names = match params.scope {
@@ -94,8 +94,12 @@ async fn tags_impl(state: AppState, tenant: Tenant, raw: &str) -> Result<Respons
             )));
         }
         scope => {
-            let (engine, floor) = (engine_for(&state, tenant).await?, catalog_floor_ns(&state)?);
-            engine.list_tag_names(attribute_scope(scope), floor).await?
+            let state_ref = &state;
+            with_engine(&state, &tenant, None, |engine| async move {
+                let floor = catalog_floor_ns(state_ref)?;
+                Ok(engine.list_tag_names(attribute_scope(scope), floor).await?)
+            })
+            .await?
         }
     };
     Ok(ok_json(tags_response::render_tag_names(
@@ -234,17 +238,20 @@ pub(super) async fn values_for(
                 intrinsics::intrinsic_tag_values(intrinsic),
             )),
             TagValueSource::Store => {
-                let engine = engine_for(state, tenant).await?;
-                Ok(ValuesSource::Values(
-                    engine.list_span_name_values(req).await?,
-                ))
+                let values = with_engine(state, &tenant, None, |engine| async move {
+                    Ok(engine.list_span_name_values(req).await?)
+                })
+                .await?;
+                Ok(ValuesSource::Values(values))
             }
         },
         TagLookup::Attribute { scope, key } => {
-            let engine = engine_for(state, tenant).await?;
-            Ok(ValuesSource::Values(
-                engine.list_tag_values(&key, scope.as_deref(), req).await?,
-            ))
+            let (key, scope) = (&key, scope.as_deref());
+            let values = with_engine(state, &tenant, None, |engine| async move {
+                Ok(engine.list_tag_values(key, scope, req).await?)
+            })
+            .await?;
+            Ok(ValuesSource::Values(values))
         }
     }
 }

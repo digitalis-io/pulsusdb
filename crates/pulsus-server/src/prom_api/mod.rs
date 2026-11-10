@@ -30,6 +30,7 @@
 // issue #59) reuse `encode::query_response` — their responses are the
 // same Prometheus matrix/vector envelope byte-for-byte.
 pub(crate) mod encode;
+mod engine;
 mod error;
 mod handlers;
 mod params;

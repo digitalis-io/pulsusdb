@@ -215,6 +215,11 @@ const ROWS: &[Row] = &[
         check: |c| c.az_detect == pulsus_config::AzDetect::Auto,
     },
     Row {
+        var: "PULSUS_READ_SPREAD",
+        value: "zone",
+        check: |c| c.read_spread == pulsus_config::ReadSpread::Zone,
+    },
+    Row {
         var: "PULSUS_BATCH_BYTES",
         value: "4MiB",
         check: |c| c.writer.batch_bytes == ByteSize(4 * 1024 * 1024),

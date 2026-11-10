@@ -186,7 +186,8 @@ fn first_level_insert(ctx: &RenderCtx, lo: i64, hi: i64) -> String {
     )
 }
 
-/// Builds `ctx` fresh with every level view stopped and its table emptied.
+/// Builds `ctx` fresh with every level view stopped and its table and its
+/// stage, where it has one, emptied.
 async fn fresh(bootstrap: &ChClient, ctx: &RenderCtx) {
     drop_database(bootstrap, &ctx.db).await;
     run_init(bootstrap, ctx).await.expect("run_init");
@@ -199,6 +200,15 @@ async fn fresh(bootstrap: &ChClient, ctx: &RenderCtx) {
         exec(
             bootstrap,
             &format!("TRUNCATE TABLE {}.metric_samples_{r}s", ctx.db),
+        )
+        .await;
+        // Issue #800: the level's stage holds the creation run's run row.
+        exec(
+            bootstrap,
+            &format!(
+                "TRUNCATE TABLE IF EXISTS {}.metric_samples_{r}s_stage",
+                ctx.db
+            ),
         )
         .await;
     }
@@ -5468,15 +5478,17 @@ async fn same_build(case: SameCase) {
                     runs.len()
                 );
             }
-            // (e) each data row stamped as the run row covering its bucket.
+            // (e) issue #800: data rows carry no clock, run rows the run's.
             for row in data {
-                let run = runs
-                    .iter()
-                    .find(|u| u.t_last <= row.t_end - res && row.t_end <= u.t_end);
                 assert_eq!(
-                    run.map(|u| u.built_at),
-                    Some(row.built_at),
-                    "(e) level {r}s, the {name}'s database: the run row covering {row:?}: {run:?}"
+                    row.built_at, 0,
+                    "(e) level {r}s, the {name}'s database: a data row with a clock: {row:?}"
+                );
+            }
+            for u in runs {
+                assert!(
+                    u.built_at > 0,
+                    "(e) level {r}s, the {name}'s database: a run row without the run's clock: {u:?}"
                 );
             }
             for u in runs {
@@ -5503,8 +5515,9 @@ async fn same_build(case: SameCase) {
 /// levels built by their views in one database and by the setup statement
 /// in the other. Per level, each database's run rows cover the union the
 /// cut leaves, the data rows of the two are equal (`sum` and `inc` within
-/// a relative 1e-9), each lies inside that union and carries its run row's
-/// `built_at`, a view run spans at most 10 buckets and a setup run one day.
+/// a relative 1e-9), each lies inside that union and carries `built_at` 0
+/// while each run row carries its run's clock (issue #800), a view run spans
+/// at most 10 buckets and a setup run one day.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_setup_build_equals_the_view_build_at_the_default_levels() {
     skip_unless_live!();

@@ -54,6 +54,10 @@ static DB_EXPIRY: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_levels_expiry");
 static DB_DISCOVERY: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_levels_discovery");
+static DB_STAGE: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_levels_stage");
+static DB_STAGE_MISS: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_levels_stage_miss");
 
 /// Part A's levels, 60 s first, which these cases were written for, the
 /// 60 s level the resolution from a range of 60 s.
@@ -152,7 +156,7 @@ struct NameRow {
 
 /// Builds `ctx` fresh and readies its levels for the test's own runs: the
 /// level views must exist, each one's creation run is waited for, the view
-/// is stopped, and its table emptied.
+/// is stopped, and its table and its stage, where it has one, emptied.
 async fn fresh(client: &ChClient, ctx: &RenderCtx) {
     let db = &ctx.db;
     drop_db(client, db).await;
@@ -189,6 +193,12 @@ async fn fresh(client: &ChClient, ctx: &RenderCtx) {
     }
     for r in &ctx.rollup_levels {
         exec(client, &format!("TRUNCATE TABLE {db}.metric_samples_{r}s")).await;
+        // Issue #800: the level's stage holds the creation run's run row.
+        exec(
+            client,
+            &format!("TRUNCATE TABLE IF EXISTS {db}.metric_samples_{r}s_stage"),
+        )
+        .await;
     }
 }
 
@@ -825,13 +835,24 @@ async fn a_hole_is_skipped_at_every_level() {
 /// reading. (ii) In another database, one UTC day `T−2` of 60 s rows for 400
 /// series and one run row for the day, built by the test; the 720 s, 7200 s
 /// and 86400 s levels run until idle. Every 720 s and 7200 s run that wrote
-/// data read its source through the source's `by_parent` projection, at
-/// least 12 and 2 of them. The 86400 s level's source has no projection (a
-/// day-long run reads its source's day partition), and its data run reads
-/// at most `S + Σ_p min(rows_p, 1024) + O + 1`, taken from `system.parts`
-/// before it: the 7200 s table's rows in the day's partition, one granule
-/// of run rows per source part, its own table's watermark scan, and the
-/// run-row branch.
+/// data read no projection and read its source's stage (issue #800), at
+/// least 12 and 2 of them, and read at most `(R ÷ R_source) × written + 2 ×
+/// 1024 × P + 1024 × P_level + 1024 + 1` rows: the source rows of what it
+/// wrote, a granule at each end of the window in each of the stage's `P`
+/// active parts, a granule of run rows in each of the source level's
+/// `P_level`, its own watermark scan and the run-row branch, counted from
+/// `system.parts` before the runs. A 720 s run that read the 60 s level's
+/// data would read its 576,000-row day partition and fail the bound.
+/// `written` counts a run's rows once per table they reach (the level, and
+/// its stage when it has one), so the bound is loose: at the 7200 s level it
+/// exceeds the 720 s level's 48,000-row day partition, and there the runs
+/// are held to `projections = []` and `tables` only. The 86400 s level's
+/// source has no stage (a day-long run reads its source's day partition),
+/// and its data run reads at most `S + 2 × Σ_p min(rows_p, 1024) + O + 1`,
+/// taken from `system.parts` before it: the 7200 s table's rows in the
+/// day's partition, two scans of one granule of run rows per source part
+/// (the plan's and the `staged` scalar's), its own table's watermark scan,
+/// and the run-row branch.
 #[tokio::test]
 async fn each_run_reads_its_window() {
     skip_unless_live!();
@@ -921,8 +942,25 @@ async fn each_run_reads_its_window() {
     )
     .await;
     insert_level(&client, db, 60, &[], &[(day, day + DAY)]).await;
-    until_idle(&client, db, 720, 30).await;
-    until_idle(&client, db, 7200, 30).await;
+    // Issue #800: the active parts of each source's stage and of the source
+    // level itself, before the runs that read them.
+    let active_parts = |table: String| {
+        format!(
+            "SELECT toInt64(count()) AS v FROM system.parts \
+             WHERE database = '{db}' AND table = '{table}' AND active"
+        )
+    };
+    let mut parts_before = BTreeMap::new();
+    for (r, source) in [(720u32, 60u32), (7200, 720)] {
+        let p = int(
+            &client,
+            &active_parts(format!("metric_samples_{source}s_stage")),
+        )
+        .await as u64;
+        let p_level = int(&client, &active_parts(format!("metric_samples_{source}s"))).await as u64;
+        parts_before.insert(r, (p, p_level));
+        until_idle(&client, db, r, 30).await;
+    }
     #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
     struct PartRow {
         rows: u64,
@@ -941,7 +979,7 @@ async fn each_run_reads_its_window() {
     )
     .await as u64;
     let ceiling = parts.iter().map(|p| p.rows).sum::<u64>()
-        + parts.iter().map(|p| p.rows.min(1024)).sum::<u64>()
+        + 2 * parts.iter().map(|p| p.rows.min(1024)).sum::<u64>()
         + own
         + 1;
     until_idle(&client, db, 86400, 30).await;
@@ -965,10 +1003,11 @@ async fn each_run_reads_its_window() {
         read_rows: u64,
         written_rows: u64,
         projections: Vec<String>,
+        tables: Vec<String>,
     }
     let runs_of = |r: u32| {
         format!(
-            "SELECT read_rows, written_rows, projections FROM system.query_log \
+            "SELECT read_rows, written_rows, projections, tables FROM system.query_log \
              WHERE type = 'QueryFinish' AND event_time_microseconds >= fromUnixTimestamp64Milli({since}) \
              AND query LIKE 'INSERT INTO {db}.metric_samples_{r}s (%' \
              AND query LIKE '%builder%' AND written_rows > 1"
@@ -981,12 +1020,26 @@ async fn each_run_reads_its_window() {
             "{r}s: {} runs wrote data, want at least {at_least}: {logged:?}",
             logged.len()
         );
-        let projection = format!("{db}.metric_samples_{source}s.by_parent");
+        let stage = format!("{db}.metric_samples_{source}s_stage");
+        let (p, p_level) = parts_before[&r];
+        let ratio = u64::from(r / source);
         for l in &logged {
             assert!(
-                l.projections.contains(&projection),
-                "{r}s: a run that wrote {} rows read without {projection}: {logged:?}",
+                l.projections.is_empty(),
+                "{r}s: a run read through a projection: {logged:?}"
+            );
+            assert!(
+                l.tables.contains(&stage),
+                "{r}s: a run that wrote {} rows did not read {stage}: {logged:?}",
                 l.written_rows
+            );
+            let bound = ratio * l.written_rows + 2 * 1024 * p + 1024 * p_level + 1024 + 1;
+            assert!(
+                l.read_rows <= bound,
+                "{r}s: a run that wrote {} rows read {}, above {bound} \
+                 ({p} stage parts, {p_level} level parts): {logged:?}",
+                l.written_rows,
+                l.read_rows
             );
         }
     }
@@ -1002,6 +1055,390 @@ async fn each_run_reads_its_window() {
             l.read_rows
         );
     }
+    drop_db(&client, db).await;
+}
+
+/// The names in `db` that contain `stage`, sorted.
+async fn stage_names(client: &ChClient, db: &str) -> Vec<String> {
+    rows::<NameRow>(
+        client,
+        &format!(
+            "SELECT name FROM system.tables WHERE database = '{db}' \
+             AND name LIKE '%stage%' ORDER BY name"
+        ),
+    )
+    .await
+    .into_iter()
+    .map(|r| r.name)
+    .collect()
+}
+
+/// The `kind = 0` rows of `a` not in `b` and of `b` not in `a`, counted
+/// with their repeats, on every column but `built_at` and `staged_at`,
+/// floats as bits.
+async fn except_both_ways(client: &ChClient, db: &str, a: &str, b: &str) -> (i64, i64) {
+    let cols = "kind, org_id, fingerprint, t_end, t_last, reinterpretAsUInt64(last) AS lb, \
+                reinterpretAsUInt64(min) AS nb, reinterpretAsUInt64(max) AS xb, \
+                reinterpretAsUInt64(sum) AS sb, count, reinterpretAsUInt64(inc) AS ib, flags";
+    let one_way = |x: &str, y: &str| {
+        format!(
+            "SELECT toInt64(count()) AS v FROM (SELECT {cols} FROM {db}.{x} WHERE kind = 0 \
+             EXCEPT ALL SELECT {cols} FROM {db}.{y} WHERE kind = 0)"
+        )
+    };
+    (
+        int(client, &one_way(a, b)).await,
+        int(client, &one_way(b, a)).await,
+    )
+}
+
+/// The `(t_last, t_end)` of `table`'s run rows, sorted.
+async fn run_pairs(client: &ChClient, db: &str, table: &str) -> Vec<(i64, i64)> {
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct PairRow {
+        t_last: i64,
+        t_end: i64,
+    }
+    rows::<PairRow>(
+        client,
+        &format!("SELECT t_last, t_end FROM {db}.{table} WHERE kind = 1 ORDER BY t_last, t_end"),
+    )
+    .await
+    .into_iter()
+    .map(|r| (r.t_last, r.t_end))
+    .collect()
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct IntsRow {
+    v: Vec<i64>,
+}
+
+/// **L2 (issue #800): a run stages what the next level reads.** 400 series
+/// land at 15 s over 40 minutes ending 3 minutes ago, a first-level run row
+/// is seeded at the window start, and the 60 s and then the 720 s level run
+/// until idle. The default levels carry two stages, on 60 s and 720 s, each
+/// with its view, and no projection. The 60 s stage holds the 60 s level's
+/// data rows, every column but `built_at` equal as bits, and its run rows;
+/// data rows carry `built_at` 0 and run rows a clock; each stage part is due
+/// 9 h (60 s) and 11 h (720 s) after it was staged; and the 720 s level's
+/// rows are its stage's too, one per series for every 720 s bucket wholly
+/// inside the 60 s coverage.
+#[tokio::test]
+async fn a_run_stages_what_the_next_level_reads() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = DB_STAGE.name();
+    fresh(&client, &part_a(db, 7)).await;
+    let now = now_ms(&client).await;
+    let end = now / MINUTE * MINUTE - 3 * MINUTE;
+    let start = end - 40 * MINUTE;
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, '', toUInt128(number % 400 + 1), \
+                    {start} + (intDiv(number, 400) + 1) * 15000, toFloat64(number % 97) \
+             FROM numbers(64000)"
+        ),
+    )
+    .await;
+    // The seed is a run row like any other, with a clock.
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {db}.metric_samples_60s (kind, org_id, fingerprint, t_end, t_last, built_at) \
+             VALUES (1, '', 0, {start}, {}, 1)",
+            start - MINUTE
+        ),
+    )
+    .await;
+    until_idle(&client, db, 60, 20).await;
+    until_idle(&client, db, 720, 20).await;
+
+    // (1)
+    assert_eq!(
+        stage_names(&client, db).await,
+        vec![
+            "metric_samples_60s_stage",
+            "metric_samples_60s_stage_mv",
+            "metric_samples_720s_stage",
+            "metric_samples_720s_stage_mv",
+        ],
+        "(1) the stages and their views"
+    );
+    // (2)
+    let projections = int(
+        &client,
+        &format!(
+            "SELECT toInt64(count()) AS v FROM system.projections \
+             WHERE database = '{db}' AND startsWith(table, 'metric_samples_')"
+        ),
+    )
+    .await;
+    assert_eq!(projections, 0, "(2) no projection");
+    // (3)
+    assert_eq!(
+        except_both_ways(
+            &client,
+            db,
+            "metric_samples_60s",
+            "metric_samples_60s_stage"
+        )
+        .await,
+        (0, 0),
+        "(3) the 60 s stage's data rows are the level's"
+    );
+    let data_60 = int(
+        &client,
+        &format!("SELECT toInt64(count()) AS v FROM {db}.metric_samples_60s WHERE kind = 0"),
+    )
+    .await;
+    assert_eq!(data_60, 400 * 40, "(3) every series has a row per minute");
+    // (4)
+    let runs_60 = run_pairs(&client, db, "metric_samples_60s").await;
+    assert_eq!(
+        run_pairs(&client, db, "metric_samples_60s_stage").await,
+        runs_60,
+        "(4) the 60 s stage's run rows are the level's"
+    );
+    // (5)
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+    struct ClockRow {
+        data_with_clock: u64,
+        runs_without: u64,
+    }
+    for r in [60u32, 720] {
+        let got = rows::<ClockRow>(
+            &client,
+            &format!(
+                "SELECT countIf(kind = 0 AND built_at != 0) AS data_with_clock, \
+                        countIf(kind = 1 AND built_at <= 0) AS runs_without \
+                 FROM {db}.metric_samples_{r}s"
+            ),
+        )
+        .await;
+        assert_eq!(
+            got,
+            vec![ClockRow {
+                data_with_clock: 0,
+                runs_without: 0
+            }],
+            "(5) the {r}s level's data rows carry 0 and its run rows a clock"
+        );
+    }
+    // (6)
+    for (r, due) in [(60u32, 32_400i64), (720, 39_600)] {
+        let got = rows::<IntsRow>(
+            &client,
+            &format!(
+                "SELECT groupUniqArray(toInt64(delete_ttl_info_max) - toInt64(max_time)) AS v \
+                 FROM system.parts WHERE database = '{db}' \
+                 AND table = 'metric_samples_{r}s_stage' AND active"
+            ),
+        )
+        .await;
+        assert_eq!(
+            got.first().map(|g| g.v.clone()),
+            Some(vec![due]),
+            "(6) every {r}s stage part is due {due} s after it was staged"
+        );
+    }
+    // (7)
+    assert_eq!(
+        except_both_ways(
+            &client,
+            db,
+            "metric_samples_720s",
+            "metric_samples_720s_stage"
+        )
+        .await,
+        (0, 0),
+        "(7) the 720 s stage's data rows are the level's"
+    );
+    let buckets: i64 = union(runs_60.iter().copied())
+        .iter()
+        .map(|&(lo, hi)| {
+            // The first bucket end with its whole bucket after `lo`.
+            let first = (lo + 12 * MINUTE - 1).div_euclid(12 * MINUTE) + 1;
+            let last = hi.div_euclid(12 * MINUTE);
+            (last - first + 1).max(0)
+        })
+        .sum();
+    assert!(buckets > 0, "(7) the 60 s coverage holds a 720 s bucket");
+    let data_720 = int(
+        &client,
+        &format!("SELECT toInt64(count()) AS v FROM {db}.metric_samples_720s WHERE kind = 0"),
+    )
+    .await;
+    assert_eq!(
+        data_720,
+        400 * buckets,
+        "(7) one 720 s row per series for each bucket wholly inside the 60 s coverage"
+    );
+    drop_db(&client, db).await;
+}
+
+/// One insert into `db`'s 60 s level, one statement and so one block: 10
+/// series `s = 1..10` × 60 rows over `(lo, lo + 1 h]` (`last = min = max =
+/// s`, `count = 4`, `sum = 4 × s`, `inc = 0`, `flags = 0`) and one run row
+/// `(lo, lo + 1 h]`.
+fn hour_insert(db: &str, lo: i64) -> String {
+    format!(
+        "INSERT INTO {db}.metric_samples_60s (kind, org_id, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags, built_at) \
+         SELECT toUInt8(n = 600) AS k, '', if(k = 1, toUInt128(0), toUInt128(intDiv(n, 60) + 1)) AS s, \
+                if(k = 1, toInt64({lo} + {HOUR}), toInt64({lo} + (n % 60 + 1) * 60000)) AS te, \
+                if(k = 1, toInt64({lo}), te - 1000), if(k = 1, 0., toFloat64(s)) AS v, v, v, 4 * v, \
+                toUInt32(if(k = 1, 0, 4)), 0., toUInt8(0), \
+                if(k = 1, toInt64(toUnixTimestamp64Milli(now64())), toInt64(0)) \
+         FROM (SELECT number AS n FROM numbers(601))"
+    )
+}
+
+/// **L3 (issue #800): a run the stage missed is built from the level.**
+/// Levels `60, 720`; `h` the start of the current UTC hour less 5 h. Five
+/// one-statement inserts write hours `0..4` into the 60 s level, 10 series
+/// each and one run row. Hour 1's stage write is refused by a constraint on
+/// the stage, so its insert fails after the level kept its rows. After hour
+/// 4, hour 3's rows, data and run row, are deleted from the stage. This
+/// simulates expiry by deleting one source-time hour, where the server's
+/// expiry drops a part by its hour of staging; both leave the stage
+/// without rows the level holds. The 720 s level then runs until idle and
+/// covers all five hours, 25 buckets × 10 series with `count = 48` and `sum
+/// = 48 × s`: hours 1 and 3 read from the level itself. With the 60 s level
+/// and its stage emptied afterwards, as their expiry would leave them, the
+/// 720 s level is unchanged.
+#[tokio::test]
+async fn a_run_the_stage_missed_is_built_from_the_level() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = DB_STAGE_MISS.name();
+    let ctx = RenderCtx {
+        rollup_levels: vec![60, 720],
+        ..part_a(db, 7)
+    };
+    fresh(&client, &ctx).await;
+    // (1), before any statement names the stage.
+    assert_eq!(
+        stage_names(&client, db).await,
+        vec!["metric_samples_60s_stage", "metric_samples_60s_stage_mv"],
+        "(1) the 60 s level's stage and its view"
+    );
+    let h = now_ms(&client).await / HOUR * HOUR - 5 * HOUR;
+    let stage = format!("{db}.metric_samples_60s_stage");
+    for k in 0..5i64 {
+        let insert = hour_insert(db, h + k * HOUR);
+        if k == 1 {
+            exec(
+                &client,
+                &format!("ALTER TABLE {stage} ADD CONSTRAINT refuse CHECK kind > 1"),
+            )
+            .await;
+            let refused = client
+                .execute(&insert, &QuerySettings::new(), Idempotency::NonIdempotent)
+                .await;
+            assert!(
+                refused.is_err(),
+                "hour 1's insert fails on the stage's constraint"
+            );
+            exec(
+                &client,
+                &format!("ALTER TABLE {stage} DROP CONSTRAINT refuse"),
+            )
+            .await;
+        } else {
+            exec(&client, &insert).await;
+        }
+    }
+    exec(
+        &client,
+        &format!(
+            "ALTER TABLE {stage} DELETE WHERE t_end > {} AND t_end <= {} SETTINGS mutations_sync = 2",
+            h + 3 * HOUR,
+            h + 4 * HOUR
+        ),
+    )
+    .await;
+
+    // (2)
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+    struct Held {
+        data: u64,
+        runs: u64,
+        in_missed: u64,
+    }
+    let held = |table: &str| {
+        format!(
+            "SELECT countIf(kind = 0) AS data, countIf(kind = 1) AS runs, \
+                    countIf((t_end > {h1} AND t_end <= {h2}) OR (t_end > {h3} AND t_end <= {h4})) AS in_missed \
+             FROM {db}.{table}",
+            h1 = h + HOUR,
+            h2 = h + 2 * HOUR,
+            h3 = h + 3 * HOUR,
+            h4 = h + 4 * HOUR
+        )
+    };
+    assert_eq!(
+        rows::<Held>(&client, &held("metric_samples_60s")).await,
+        vec![Held {
+            data: 3_000,
+            runs: 5,
+            in_missed: 1_200 + 2
+        }],
+        "(2) the 60 s level holds all five hours"
+    );
+    assert_eq!(
+        rows::<Held>(&client, &held("metric_samples_60s_stage")).await,
+        vec![Held {
+            data: 1_800,
+            runs: 3,
+            in_missed: 0
+        }],
+        "(2) the stage holds hours 0, 2 and 4"
+    );
+
+    until_idle(&client, db, 720, 20).await;
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+    struct Built {
+        fingerprint: u128,
+        count: u32,
+        sum: f64,
+        min: f64,
+        max: f64,
+        last: f64,
+    }
+    let check = |stage: &str, runs: Vec<RunRow>, built: Vec<Built>| {
+        assert_eq!(
+            union(runs.iter().map(|r| (r.t_last, r.t_end))),
+            vec![(h, h + 5 * HOUR)],
+            "(3) {stage}: the 720 s run rows cover the five hours: {runs:?}"
+        );
+        assert_eq!(built.len(), 250, "(4) {stage}: 25 buckets × 10 series");
+        for b in &built {
+            let s = b.fingerprint as f64;
+            assert!(
+                b.count == 48 && b.sum == 48.0 * s && b.min == s && b.max == s && b.last == s,
+                "(4) {stage}: each 720 s row aggregates 12 rows of the 60 s level: {b:?}"
+            );
+        }
+    };
+    let built_sql = format!(
+        "SELECT fingerprint, count, sum, min, max, last FROM {db}.metric_samples_720s \
+         WHERE kind = 0 ORDER BY fingerprint, t_end"
+    );
+    check(
+        "after the runs",
+        run_rows(&client, db, 720).await,
+        rows::<Built>(&client, &built_sql).await,
+    );
+    // (5)
+    exec(&client, &format!("TRUNCATE TABLE {db}.metric_samples_60s")).await;
+    exec(&client, &format!("TRUNCATE TABLE {stage}")).await;
+    check(
+        "with nothing finer left",
+        run_rows(&client, db, 720).await,
+        rows::<Built>(&client, &built_sql).await,
+    );
     drop_db(&client, db).await;
 }
 

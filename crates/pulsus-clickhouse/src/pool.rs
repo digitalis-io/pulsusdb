@@ -12,16 +12,23 @@
 //! uniform lease API so callers do not need to know which crate ships
 //! underneath.
 //!
-//! **Connection spreading (issue #43).** The pool holds one
-//! `clickhouse::Client` per distinct endpoint and picks one endpoint per
-//! `get()` via the pure, lock-free [`candidate_order`] policy: prefer
-//! healthy endpoints in this node's own availability zone (round-robin
-//! within them), then healthy endpoints in other zones (round-robin), then
-//! demoted endpoints whose cooldown has expired, then the rest. There is
-//! **no ping on the healthy hot path** — an endpoint is probed only when it
-//! is unhealthy or has gone stale. A transport failure on a real query
-//! demotes its endpoint (via [`PooledConn::report_transport_failure`]) so
-//! the *next* `get()` fails over. Health is published as lock-free mirror
+//! **Connection spreading (issues #43 and #803).** The pool holds one
+//! `clickhouse::Client` per distinct endpoint. A **write** lease (`get`)
+//! picks one endpoint per statement via the pure, lock-free
+//! [`candidate_order`] policy: prefer healthy endpoints in this node's own
+//! availability zone (round-robin within them), then healthy endpoints in
+//! other zones (round-robin), then demoted endpoints whose cooldown has
+//! expired, then the rest. A **read request** is bound to one endpoint when
+//! its client is built ([`ChPool::bind_read`]: the first of that same
+//! order, from a rotation of its own, with no zone leading under
+//! `read_spread: all`), and every read of the client is leased there
+//! ([`ChPool::get_bound`]) whatever happens to its health meanwhile. There
+//! is **no ping on the healthy hot path** — a write's endpoint is probed
+//! only when it is unhealthy or has gone stale. A transport failure on a
+//! write demotes its endpoint (via [`PooledConn::report_transport_failure`])
+//! so the *next* `get()` fails over; a server failure on a read demotes its
+//! endpoint and marks the request (via [`PooledConn::report_read_failure`]),
+//! which then runs once more on another endpoint (`crate::request`). Health is published as lock-free mirror
 //! atomics for the hot path, backed by a tiny non-async transition lock
 //! (never held across an `.await`) that makes every state change — a
 //! demotion, a promotion, or a probe outcome — one atomic critical section;
@@ -46,13 +53,13 @@
 //! selection happens *before* hand-out and never extends the lease.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Semaphore, SemaphorePermit};
 
-use crate::config::{ChConnConfig, ChProto};
+use crate::config::{ChConnConfig, ChProto, ReadSpread};
 use crate::error::ChError;
 use crate::tls;
 
@@ -61,10 +68,12 @@ use crate::tls;
 const STALE_AFTER: Duration = Duration::from_secs(30);
 const STALE_AFTER_MS: u64 = 30_000;
 
-/// After a transport failure demotes an endpoint, it is skipped entirely
-/// (while any other endpoint is healthy) until this cooldown elapses, after
-/// which it re-enters as a probe candidate. Bounds the "one failed request
-/// per newly-dead endpoint" cost to at most one per cooldown window.
+/// After a transport failure demotes an endpoint, a write's `get()` reaches
+/// it only when no healthy endpoint ahead of it answers, and probes it before
+/// handing it out; once this cooldown elapses it ranks above the endpoints
+/// still cooling. This is not a cap on failed probes: concurrent callers can
+/// probe the same endpoint at once, and when no healthy endpoint answers,
+/// callers reach it before its cooldown ends.
 const UNHEALTHY_COOLDOWN_MS: u64 = 5_000;
 
 /// How often the background re-probe pass ([`spawn_reprobe_loop`]) scans for
@@ -370,11 +379,105 @@ fn rotate_into(out: &mut Vec<usize>, tier: &[usize], rr: u64) {
     }
 }
 
+/// What a statement does, which decides how its endpoint is chosen (issue
+/// #803): a write keeps to this node's zone, a read request takes turns
+/// over every healthy endpoint unless `read_spread` is `zone`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StatementClass {
+    Read,
+    Write,
+}
+
+/// The zone [`candidate_order`] puts first for `class` (issue #803):
+/// writes, and reads under [`ReadSpread::Zone`], this node's own; reads
+/// under [`ReadSpread::All`] none.
+pub(crate) fn preferred_zone(
+    class: StatementClass,
+    read_spread: ReadSpread,
+    local_zone: Option<&str>,
+) -> Option<&str> {
+    match (class, read_spread) {
+        (StatementClass::Read, ReadSpread::All) => None,
+        (StatementClass::Read, ReadSpread::Zone) | (StatementClass::Write, _) => local_zone,
+    }
+}
+
+/// A ClickHouse server failure a read request met (issue #803): which
+/// endpoint, and what it said. The first one a request meets is kept on its
+/// binding, and the request runs once more on another server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerFailure {
+    pub endpoint: usize,
+    pub message: String,
+}
+
+impl From<ServerFailure> for ChError {
+    fn from(f: ServerFailure) -> Self {
+        ChError::Connect(format!(
+            "the ClickHouse server failed during the request: {}",
+            f.message
+        ))
+    }
+}
+
+/// One read request's endpoint (issue #803): chosen when its client is
+/// built, and used by every read the client makes until it is rebound.
+/// Records the first server failure any of those reads reported.
+pub(crate) struct ReadBinding {
+    idx: AtomicUsize,
+    failure: Mutex<Option<ServerFailure>>,
+}
+
+impl ReadBinding {
+    pub(crate) fn new(idx: usize) -> Self {
+        Self {
+            idx: AtomicUsize::new(idx),
+            failure: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn endpoint(&self) -> usize {
+        self.idx.load(Ordering::Relaxed)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<ServerFailure>> {
+        match self.failure.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    pub(crate) fn failure(&self) -> Option<ServerFailure> {
+        self.lock().clone()
+    }
+
+    fn record_failure(&self, f: ServerFailure) {
+        let mut guard = self.lock();
+        if guard.is_none() {
+            *guard = Some(f);
+        }
+    }
+
+    /// Moves the binding to `idx` and clears its failure.
+    pub(crate) fn rebind(&self, idx: usize) {
+        let mut guard = self.lock();
+        *guard = None;
+        self.idx.store(idx, Ordering::Relaxed);
+    }
+}
+
 pub struct ChPool {
     endpoints: Vec<Endpoint>,
     semaphore: Arc<Semaphore>,
-    /// Free-running round-robin counter; one `fetch_add` per `get()`.
-    next_rr: AtomicU64,
+    /// Free-running round-robin counter for read bindings; one `fetch_add`
+    /// per [`ChPool::bind_read`] (issue #803).
+    next_rr_read: AtomicU64,
+    /// Free-running round-robin counter for writes; one `fetch_add` per
+    /// [`ChPool::get`]. A counter of its own, so reads mixed in do not skew
+    /// the write rotation, nor writes the read one.
+    next_rr_write: AtomicU64,
+    /// `PULSUS_READ_SPREAD` (issue #803).
+    read_spread: ReadSpread,
     local_zone: Option<String>,
     /// Monotonic base for all endpoint timestamps. Offset into the past by
     /// [`STALE_AFTER`] so freshly-connected endpoints read as stale until
@@ -392,6 +495,17 @@ impl ChPool {
     /// begin demoted and are skipped until they recover.
     pub async fn connect(cfg: ChConnConfig) -> Result<Self, ChError> {
         cfg.validate()?;
+        // Edge case #5: relaxing certificate verification must never look
+        // like a silent plaintext downgrade. Said here, at every pool's
+        // connect, so the startup bootstrap pool and the serving pool say it
+        // too (code review r1 of #803), not only `ChClient::new`.
+        if cfg.tls_skip_verify {
+            eprintln!(
+                "pulsus-clickhouse: CLICKHOUSE_TLS_SKIP_VERIFY=true — certificate verification \
+                 is DISABLED for this ClickHouse connection. The connection is still encrypted \
+                 (TLS is not downgraded to plaintext); only the peer certificate is unchecked."
+            );
+        }
         let resolved = cfg.resolved_endpoints();
         let mut endpoints = Vec::with_capacity(resolved.len());
         for r in &resolved {
@@ -406,7 +520,9 @@ impl ChPool {
         let pool = Self {
             semaphore: Arc::new(Semaphore::new(cfg.pool_size)),
             endpoints,
-            next_rr: AtomicU64::new(0),
+            next_rr_read: AtomicU64::new(0),
+            next_rr_write: AtomicU64::new(0),
+            read_spread: cfg.read_spread,
             local_zone: cfg.local_zone.clone(),
             base: Instant::now()
                 .checked_sub(STALE_AFTER)
@@ -453,24 +569,17 @@ impl ChPool {
     /// chosen candidate fails its probe it is demoted and the next candidate
     /// is tried; the last transport error is returned only if every
     /// candidate is unreachable.
-    pub async fn get(&self) -> Result<PooledConn<'_>, ChError> {
-        let permit = tokio::time::timeout(self.query_timeout, self.semaphore.acquire())
-            .await
-            .map_err(|_| ChError::Timeout("pool exhausted: no connection available".to_string()))?
-            .expect("semaphore is never closed for the pool's lifetime");
+    pub(crate) async fn get(&self, class: StatementClass) -> Result<PooledConn<'_>, ChError> {
+        let permit = self.acquire_permit().await?;
 
-        let rr = self.next_rr.fetch_add(1, Ordering::Relaxed);
+        let rr = self.next_rr_write.fetch_add(1, Ordering::Relaxed);
         let now = self.now_ms();
-        let states: Vec<EndpointState<'_>> = self
-            .endpoints
-            .iter()
-            .map(|ep| EndpointState {
-                zone: ep.zone.as_deref(),
-                healthy: ep.health.is_healthy(),
-                probe_ok: ep.health.cooldown_expired(now),
-            })
-            .collect();
-        let order = candidate_order(&states, self.local_zone.as_deref(), rr);
+        let states = self.endpoint_states(now);
+        let order = candidate_order(
+            &states,
+            preferred_zone(class, self.read_spread, self.local_zone.as_deref()),
+            rr,
+        );
 
         let mut last_err = None;
         for idx in order {
@@ -508,6 +617,7 @@ impl ChPool {
                 client: ep.client.clone(),
                 endpoint_idx: idx,
                 pool: self,
+                binding: None,
                 _permit: permit,
             });
         }
@@ -516,10 +626,92 @@ impl ChPool {
             .unwrap_or_else(|| ChError::Connect("no ClickHouse endpoint available".to_string())))
     }
 
+    /// One of the pool's permits, waiting at most `query_timeout`.
+    async fn acquire_permit(&self) -> Result<SemaphorePermit<'_>, ChError> {
+        Ok(
+            tokio::time::timeout(self.query_timeout, self.semaphore.acquire())
+                .await
+                .map_err(|_| {
+                    ChError::Timeout("pool exhausted: no connection available".to_string())
+                })?
+                .expect("semaphore is never closed for the pool's lifetime"),
+        )
+    }
+
+    /// Every endpoint's zone and health at `now`, for [`candidate_order`].
+    fn endpoint_states(&self, now: u64) -> Vec<EndpointState<'_>> {
+        self.endpoints
+            .iter()
+            .map(|ep| EndpointState {
+                zone: ep.zone.as_deref(),
+                healthy: ep.health.is_healthy(),
+                probe_ok: ep.health.cooldown_expired(now),
+            })
+            .collect()
+    }
+
+    /// The endpoint a new read request is bound to (issue #803): the first
+    /// of [`candidate_order`] with [`preferred_zone`] for reads, from the
+    /// read rotation. No I/O and no await.
+    pub(crate) fn bind_read(&self) -> usize {
+        self.bind_read_avoiding(None)
+    }
+
+    /// [`Self::bind_read`], never binding `avoid` while another endpoint
+    /// exists (issue #803): a request run again after a server failure does
+    /// not go back to that server, even once it is promoted again.
+    pub(crate) fn bind_read_avoiding(&self, avoid: Option<usize>) -> usize {
+        let rr = self.next_rr_read.fetch_add(1, Ordering::Relaxed);
+        let states = self.endpoint_states(self.now_ms());
+        let zone = preferred_zone(
+            StatementClass::Read,
+            self.read_spread,
+            self.local_zone.as_deref(),
+        );
+        // `candidate_order` lists every endpoint, and a pool has at least
+        // one, so the order is never empty. `avoid` is skipped whatever its
+        // health, unless it is the only endpoint.
+        let order = candidate_order(&states, zone, rr);
+        order
+            .iter()
+            .copied()
+            .find(|&i| Some(i) != avoid)
+            .unwrap_or(order[0])
+    }
+
+    /// A read lease on `b`'s endpoint (issue #803): waits for a permit and
+    /// records the selection. It does not look at the endpoint's health and
+    /// sends no probe, so a request never moves while it runs.
+    pub(crate) async fn get_bound<'a>(
+        &'a self,
+        b: &'a ReadBinding,
+    ) -> Result<PooledConn<'a>, ChError> {
+        let permit = self.acquire_permit().await?;
+        let idx = b.endpoint();
+        let ep = &self.endpoints[idx];
+        ep.health.record_selection(self.now_ms());
+        Ok(PooledConn {
+            client: ep.client.clone(),
+            endpoint_idx: idx,
+            pool: self,
+            binding: Some(b),
+            _permit: permit,
+        })
+    }
+
+    /// Whether an endpoint other than `idx` is healthy (issue #803): the
+    /// condition for running a failed read request once more.
+    pub(crate) fn other_healthy(&self, idx: usize) -> bool {
+        self.endpoints
+            .iter()
+            .enumerate()
+            .any(|(i, ep)| i != idx && ep.health.is_healthy())
+    }
+
     /// Health probe (`SELECT 1`) against one selected endpoint. A transport
     /// failure here demotes that endpoint so the next `get()` fails over.
     pub async fn ping(&self) -> Result<(), ChError> {
-        let conn = self.get().await?;
+        let conn = self.get(StatementClass::Write).await?;
         let result = ping_client(conn.client()).await;
         if let Err(ref e) = result {
             conn.report_transport_failure(e);
@@ -721,12 +913,38 @@ pub struct PooledConn<'a> {
     client: clickhouse::Client,
     endpoint_idx: usize,
     pool: &'a ChPool,
+    /// The read request this lease serves (issue #803); `None` for a write.
+    binding: Option<&'a ReadBinding>,
     _permit: SemaphorePermit<'a>,
 }
 
 impl PooledConn<'_> {
     pub(crate) fn client(&self) -> &clickhouse::Client {
         &self.client
+    }
+
+    /// The index of the endpoint this lease is on.
+    #[cfg(test)]
+    pub(crate) fn endpoint(&self) -> usize {
+        self.endpoint_idx
+    }
+
+    /// A read lease's failure report (issue #803): when `err` is a server
+    /// failure ([`ChError::is_server_failure`]), demotes the endpoint and
+    /// records the failure on the request's binding; otherwise nothing.
+    pub(crate) fn report_read_failure(&self, err: &ChError) {
+        if !err.is_server_failure() {
+            return;
+        }
+        self.pool.endpoints[self.endpoint_idx]
+            .health
+            .mark_unhealthy(self.pool.now_ms());
+        if let Some(b) = self.binding {
+            b.record_failure(ServerFailure {
+                endpoint: self.endpoint_idx,
+                message: err.to_string(),
+            });
+        }
     }
 
     /// Demotes this lease's endpoint **iff** `err` is a transport-class
@@ -743,6 +961,55 @@ impl PooledConn<'_> {
                 .mark_unhealthy(self.pool.now_ms());
         }
     }
+}
+
+/// Builds a pool over endpoints with lazy (never-dialed) clients, all
+/// starting healthy + freshly checked, so `get()` on the hot path
+/// performs no I/O. For the selection/demotion unit tests only.
+#[cfg(test)]
+pub(crate) fn test_pool(
+    endpoints: Vec<(Option<&str>, &str)>,
+    local_zone: Option<&str>,
+    read_spread: ReadSpread,
+    permits: usize,
+) -> ChPool {
+    let now_base = Instant::now();
+    let eps: Vec<Endpoint> = endpoints
+        .into_iter()
+        .map(|(zone, label)| {
+            let health = EndpointHealth::new();
+            // Mark freshly checked so the hot path skips the probe.
+            health.mark_healthy(0);
+            Endpoint {
+                client: clickhouse::Client::default(),
+                zone: zone.map(str::to_string),
+                label: label.to_string(),
+                health,
+            }
+        })
+        .collect();
+    ChPool {
+        semaphore: Arc::new(Semaphore::new(permits)),
+        endpoints: eps,
+        next_rr_read: AtomicU64::new(0),
+        next_rr_write: AtomicU64::new(0),
+        read_spread,
+        local_zone: local_zone.map(str::to_string),
+        base: now_base,
+        query_timeout: Duration::from_secs(5),
+    }
+}
+
+/// Promotes endpoint `idx` at the pool's current clock (tests only).
+#[cfg(test)]
+pub(crate) fn promote_for_test(pool: &ChPool, idx: usize) {
+    pool.endpoints[idx].health.mark_healthy(pool.now_ms());
+}
+
+/// Demotes endpoint `idx` at the pool's current clock (tests only).
+#[cfg(test)]
+pub(crate) fn demote_for_test(pool: &ChPool, idx: usize) {
+    pool.endpoints[idx].health.mark_unhealthy(pool.now_ms());
 }
 
 #[cfg(test)]
@@ -946,39 +1213,6 @@ mod tests {
         );
     }
 
-    /// Builds a pool over endpoints with lazy (never-dialed) clients, all
-    /// starting healthy + freshly checked, so `get()` on the hot path
-    /// performs no I/O. For the selection/demotion unit tests only.
-    fn test_pool(
-        endpoints: Vec<(Option<&str>, &str)>,
-        local_zone: Option<&str>,
-        permits: usize,
-    ) -> ChPool {
-        let now_base = Instant::now();
-        let eps: Vec<Endpoint> = endpoints
-            .into_iter()
-            .map(|(zone, label)| {
-                let health = EndpointHealth::new();
-                // Mark freshly checked so the hot path skips the probe.
-                health.mark_healthy(0);
-                Endpoint {
-                    client: clickhouse::Client::default(),
-                    zone: zone.map(str::to_string),
-                    label: label.to_string(),
-                    health,
-                }
-            })
-            .collect();
-        ChPool {
-            semaphore: Arc::new(Semaphore::new(permits)),
-            endpoints: eps,
-            next_rr: AtomicU64::new(0),
-            local_zone: local_zone.map(str::to_string),
-            base: now_base,
-            query_timeout: Duration::from_secs(5),
-        }
-    }
-
     #[tokio::test]
     async fn get_spreads_across_endpoints_without_io() {
         // Healthy + fresh endpoints -> get() returns immediately (no ping),
@@ -987,10 +1221,14 @@ mod tests {
         let pool = test_pool(
             vec![(None, "http://a:8123"), (None, "http://b:8123")],
             None,
+            ReadSpread::All,
             8,
         );
         for _ in 0..10 {
-            let conn = pool.get().await.expect("hot-path get needs no server");
+            let conn = pool
+                .get(StatementClass::Write)
+                .await
+                .expect("hot-path get needs no server");
             drop(conn);
         }
         let counts = pool.endpoint_selection_counts();
@@ -1007,9 +1245,9 @@ mod tests {
         // Trip the demotion deterministically: a retryable (transport-class)
         // error demotes the leased endpoint; a non-retryable (logic) error
         // leaves it healthy.
-        let pool = test_pool(vec![(None, "http://a:8123")], None, 8);
+        let pool = test_pool(vec![(None, "http://a:8123")], None, ReadSpread::All, 8);
 
-        let conn = pool.get().await.expect("get");
+        let conn = pool.get(StatementClass::Write).await.expect("get");
         conn.report_transport_failure(&ChError::Io("connection reset".to_string()));
         assert!(
             !pool.endpoint_health()[0].1,
@@ -1018,7 +1256,7 @@ mod tests {
 
         // Recover, then a logic error must NOT demote.
         pool.endpoints[0].health.mark_healthy(pool.now_ms());
-        let conn = pool.get().await.expect("get");
+        let conn = pool.get(StatementClass::Write).await.expect("get");
         conn.report_transport_failure(&ChError::Decode("bad row".to_string()));
         assert!(
             pool.endpoint_health()[0].1,
@@ -1040,6 +1278,7 @@ mod tests {
                 (Some("az-b"), "http://remote:8123"),
             ],
             Some("az-a"),
+            ReadSpread::All,
             8,
         );
         pool.endpoints[0].health.mark_unhealthy(0);
@@ -1082,7 +1321,7 @@ mod tests {
         );
 
         for _ in 0..10 {
-            let conn = pool.get().await.expect("get");
+            let conn = pool.get(StatementClass::Write).await.expect("get");
             drop(conn);
         }
         let counts = pool.endpoint_selection_counts();
@@ -1095,7 +1334,7 @@ mod tests {
         // AC2: success, failure, success, success -> unhealthy until the 4th
         // pass; the failure restarts the cooldown, so a pass run inside the
         // restarted cooldown makes zero probe calls.
-        let pool = test_pool(vec![(None, "http://a:8123")], None, 8);
+        let pool = test_pool(vec![(None, "http://a:8123")], None, ReadSpread::All, 8);
         pool.endpoints[0].health.mark_unhealthy(0);
         let invocations = Arc::new(AtomicUsize::new(0));
 
@@ -1183,6 +1422,7 @@ mod tests {
         let pool = test_pool(
             vec![(None, "http://a:8123"), (None, "http://b:8123")],
             None,
+            ReadSpread::All,
             8,
         );
         let invocations = Arc::new(AtomicUsize::new(0));
@@ -1234,6 +1474,7 @@ mod tests {
                 (Some("az-a"), "http://b:8123"),
             ],
             Some("az-a"),
+            ReadSpread::All,
             1,
         ));
         pool.endpoints[1].health.mark_unhealthy(0);
@@ -1245,12 +1486,18 @@ mod tests {
         // `PooledConn<'_>` can't cross the spawn boundary as a return value —
         // the lease's lifetime is tied to the pool it borrows) and signals
         // acquisition/release over oneshot channels instead.
-        let conn0 = pool.get().await.expect("conn0 takes the sole permit");
+        let conn0 = pool
+            .get(StatementClass::Write)
+            .await
+            .expect("conn0 takes the sole permit");
         let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel::<()>();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let waiter_pool = Arc::clone(&pool);
         let waiter = tokio::spawn(async move {
-            let conn = waiter_pool.get().await.expect("queued get() resolves");
+            let conn = waiter_pool
+                .get(StatementClass::Write)
+                .await
+                .expect("queued get() resolves");
             let _ = acquired_tx.send(());
             let _ = release_rx.await;
             drop(conn);
@@ -1330,7 +1577,7 @@ mod tests {
         // be discarded if a concurrent transition (e.g. get()'s own
         // emergency probe) already promoted the endpoint after the pass
         // snapshotted its generation.
-        let pool = test_pool(vec![(None, "http://a:8123")], None, 8);
+        let pool = test_pool(vec![(None, "http://a:8123")], None, ReadSpread::All, 8);
         pool.endpoints[0].health.mark_unhealthy(1_000);
         let now = 1_000 + UNHEALTHY_COOLDOWN_MS;
 
@@ -1372,7 +1619,7 @@ mod tests {
         // AC10 (v3), race reverse: a late get()-probe success applying
         // against a stale (pre-demotion) generation snapshot must be
         // discarded, not resurrect the endpoint.
-        let pool = test_pool(vec![(None, "http://a:8123")], None, 8);
+        let pool = test_pool(vec![(None, "http://a:8123")], None, ReadSpread::All, 8);
         pool.endpoints[0].health.mark_unhealthy(1_000);
         let now = 1_000 + UNHEALTHY_COOLDOWN_MS;
 
@@ -1419,5 +1666,223 @@ mod tests {
             1_000,
             "a discarded stale probe failure must not touch the cooldown mirror"
         );
+    }
+
+    // ---- issue #803: reads bound per request, writes keep to the zone ----
+
+    fn zoned_pool(read_spread: ReadSpread) -> ChPool {
+        test_pool(
+            vec![
+                (Some("a"), "http://a:8123"),
+                (Some("b"), "http://b:8123"),
+                (Some("c"), "http://c:8123"),
+            ],
+            Some("a"),
+            read_spread,
+            8,
+        )
+    }
+
+    fn tally(endpoints: usize, picks: &[usize]) -> Vec<u64> {
+        let mut out = vec![0u64; endpoints];
+        for &i in picks {
+            out[i] += 1;
+        }
+        out
+    }
+
+    fn selections(pool: &ChPool) -> Vec<u64> {
+        pool.endpoint_selection_counts()
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect()
+    }
+
+    async fn write(pool: &ChPool) {
+        drop(
+            pool.get(StatementClass::Write)
+                .await
+                .expect("a hot-path write lease needs no server"),
+        );
+    }
+
+    #[tokio::test]
+    async fn binds_spread_over_every_zone_while_writes_keep_to_the_local_one() {
+        let pool = zoned_pool(ReadSpread::All);
+        let binds: Vec<usize> = (0..30).map(|_| pool.bind_read()).collect();
+        for _ in 0..30 {
+            write(&pool).await;
+        }
+        assert_eq!(tally(3, &binds), vec![10, 10, 10], "binds: {binds:?}");
+        assert_eq!(selections(&pool), vec![30, 0, 0], "writes");
+    }
+
+    #[test]
+    fn read_spread_zone_binds_in_the_local_zone() {
+        let pool = zoned_pool(ReadSpread::Zone);
+        let binds: Vec<usize> = (0..30).map(|_| pool.bind_read()).collect();
+        assert_eq!(tally(3, &binds), vec![30, 0, 0], "binds: {binds:?}");
+    }
+
+    #[tokio::test]
+    async fn interleaved_writes_do_not_skew_the_binds() {
+        let pool = zoned_pool(ReadSpread::All);
+        let mut binds = Vec::new();
+        for _ in 0..30 {
+            write(&pool).await;
+            write(&pool).await;
+            binds.push(pool.bind_read());
+        }
+        assert_eq!(tally(3, &binds), vec![10, 10, 10], "binds: {binds:?}");
+        assert_eq!(selections(&pool), vec![60, 0, 0], "writes");
+    }
+
+    #[tokio::test]
+    async fn interleaved_binds_do_not_skew_the_writes() {
+        let pool = test_pool(
+            vec![
+                (Some("a"), "http://a1:8123"),
+                (Some("a"), "http://a2:8123"),
+                (Some("b"), "http://b:8123"),
+            ],
+            Some("a"),
+            ReadSpread::All,
+            8,
+        );
+        for _ in 0..20 {
+            let _ = pool.bind_read();
+            write(&pool).await;
+        }
+        assert_eq!(selections(&pool), vec![10, 10, 0], "writes");
+    }
+
+    #[test]
+    fn a_bind_skips_a_demoted_endpoint() {
+        let pool = zoned_pool(ReadSpread::All);
+        demote_for_test(&pool, 1);
+        let binds: Vec<usize> = (0..20).map(|_| pool.bind_read()).collect();
+        assert_eq!(tally(3, &binds), vec![10, 0, 10], "binds: {binds:?}");
+    }
+
+    #[tokio::test]
+    async fn one_endpoint_serves_both_classes() {
+        for (zone, local) in [(Some("a"), Some("a")), (None, None)] {
+            let pool = test_pool(vec![(zone, "http://a:8123")], local, ReadSpread::All, 8);
+            for _ in 0..10 {
+                assert_eq!(pool.bind_read(), 0, "zone {zone:?}");
+                write(&pool).await;
+            }
+            assert_eq!(selections(&pool), vec![10], "zone {zone:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unzoned_writes_spread_evenly() {
+        let pool = test_pool(
+            vec![(Some("a"), "http://a:8123"), (Some("b"), "http://b:8123")],
+            None,
+            ReadSpread::All,
+            8,
+        );
+        for _ in 0..10 {
+            write(&pool).await;
+        }
+        assert_eq!(selections(&pool), vec![5, 5]);
+    }
+
+    #[test]
+    fn preferred_zone_table() {
+        for class in [StatementClass::Read, StatementClass::Write] {
+            for spread in [ReadSpread::All, ReadSpread::Zone] {
+                for local in [Some("a"), None] {
+                    let expected = match (class, spread, local) {
+                        (StatementClass::Read, ReadSpread::All, Some(_)) => None,
+                        (_, _, None) => None,
+                        _ => Some("a"),
+                    };
+                    assert_eq!(
+                        preferred_zone(class, spread, local),
+                        expected,
+                        "{class:?} {spread:?} {local:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn get_bound_ignores_health() {
+        let pool = zoned_pool(ReadSpread::All);
+        let binding = ReadBinding::new(pool.bind_read());
+        assert_eq!(binding.endpoint(), 0);
+        demote_for_test(&pool, 0);
+        for _ in 0..3 {
+            let conn = pool.get_bound(&binding).await.expect("a bound lease");
+            drop(conn);
+        }
+        assert_eq!(selections(&pool), vec![3, 0, 0]);
+    }
+
+    #[test]
+    fn other_healthy_table() {
+        let pool = zoned_pool(ReadSpread::All);
+        demote_for_test(&pool, 0);
+        assert!(pool.other_healthy(0), "a demoted, b healthy");
+
+        let one = test_pool(vec![(None, "http://a:8123")], None, ReadSpread::All, 8);
+        assert!(!one.other_healthy(0), "one endpoint");
+
+        let rest_down = zoned_pool(ReadSpread::All);
+        demote_for_test(&rest_down, 1);
+        demote_for_test(&rest_down, 2);
+        assert!(!rest_down.other_healthy(0), "every other endpoint demoted");
+    }
+
+    #[test]
+    fn server_failure_table() {
+        let server = |code| ChError::Server {
+            code,
+            message: format!("Code: {code}. DB::Exception: test"),
+        };
+        let failures = [
+            ChError::Connect("refused".to_string()),
+            ChError::Io("reset".to_string()),
+            server(209),
+            server(210),
+            server(279),
+            server(202),
+            server(425),
+        ];
+        for e in &failures {
+            assert!(e.is_server_failure(), "{e:?} is a server failure");
+        }
+        let others = [
+            ChError::Timeout("deadline".to_string()),
+            server(159),
+            server(60),
+            ChError::Decode("bad row".to_string()),
+        ];
+        for e in &others {
+            assert!(!e.is_server_failure(), "{e:?} is not a server failure");
+        }
+    }
+
+    /// U12 (issue #803, code review round 1): a bind that must avoid an
+    /// endpoint never returns it while another exists, healthy or not, and
+    /// returns it when it is the only one.
+    #[test]
+    fn a_bind_avoids_the_failed_endpoint_while_another_exists() {
+        let pool = test_pool(
+            vec![(None, "http://a:8123"), (None, "http://b:8123")],
+            None,
+            ReadSpread::All,
+            8,
+        );
+        let binds: Vec<usize> = (0..10).map(|_| pool.bind_read_avoiding(Some(0))).collect();
+        assert_eq!(binds, vec![1; 10]);
+        demote_for_test(&pool, 1);
+        assert_eq!(pool.bind_read_avoiding(Some(0)), 1, "even demoted");
+        let one = test_pool(vec![(None, "http://a:8123")], None, ReadSpread::All, 8);
+        assert_eq!(one.bind_read_avoiding(Some(0)), 0, "the only endpoint");
     }
 }

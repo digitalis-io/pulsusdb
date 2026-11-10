@@ -10,13 +10,10 @@
 use std::sync::Arc;
 
 use pulsus_clickhouse::{
-    ChClient, ChConnConfig, ChEndpoint, ChError, ChPool, ChProto, ConsistencyConfig,
+    ChClient, ChConnConfig, ChEndpoint, ChError, ChPool, ChProto, ConsistencyConfig, ReadSpread,
 };
 use pulsus_config::Config;
-use pulsus_read::{
-    EngineConfig, LabelCache, LabelCacheConfig, LogQlEngine, MetricsConfig, MetricsEngine,
-    TraceEngine, TraceReadConfig,
-};
+use pulsus_read::{EngineConfig, LabelCache, LabelCacheConfig, MetricsConfig, TraceReadConfig};
 use pulsus_schema::{NameCatalogue, SchemaError};
 use pulsus_write::{MetricWriterTables, TraceWriterTables, WriterTables};
 
@@ -65,6 +62,12 @@ pub(crate) fn conn_config_from(config: &Config) -> ChConnConfig {
         // `..conn_config_from`. The shared-pool read/write clients install
         // it via the fallible `ChClient::with_consistency`.
         consistency: consistency_from(config),
+        // Issue #803: `PULSUS_READ_SPREAD`, which endpoint a read request is
+        // bound to; writes keep to `local_zone` under either value.
+        read_spread: match config.read_spread {
+            pulsus_config::ReadSpread::All => ReadSpread::All,
+            pulsus_config::ReadSpread::Zone => ReadSpread::Zone,
+        },
     }
 }
 
@@ -128,9 +131,10 @@ pub(crate) enum NameCheckError {
 /// Reads back every setting and function name this build sends that was not
 /// already in the tree, before anything sends one (issue #603).
 ///
-/// It builds a bootstrap client of its own, so it does not need the target
-/// database to exist, and drops it again: the check runs before the serving
-/// pool is connected and before any DDL.
+/// It reads over `client`, a client of the bootstrap pool, so it does not
+/// need the target database to exist: the check runs before the serving
+/// pool is connected and before any DDL. With [`read_schema_retention`] it
+/// is one read request (issue #803, `serve.rs`).
 ///
 /// **The version gate comes first** (issue #603 code review round 7). Every
 /// name here exists on the minimum supported server, so on an older one some
@@ -138,20 +142,16 @@ pub(crate) enum NameCheckError {
 /// to report, since it is the thing an operator can act on. Reporting the
 /// names instead buries the reason under its symptom.
 pub(crate) async fn check_server_names(
-    config: &Config,
+    client: &ChClient,
     required: &[(&'static str, NameCatalogue)],
 ) -> Result<(), NameCheckError> {
-    let client = ChClient::new(bootstrap_conn_config_from(config))
-        .await
-        .map_err(NameCheckError::Connect)?;
-    let version = pulsus_schema::server_version(&client)
+    let version = pulsus_schema::server_version(client)
         .await
         .map_err(NameCheckError::Statement)?;
     pulsus_schema::check_version(&version).map_err(NameCheckError::Statement)?;
-    let absent = pulsus_schema::absent_server_names(&client, required)
+    let absent = pulsus_schema::absent_server_names(client, required)
         .await
         .map_err(NameCheckError::Statement)?;
-    drop(client);
     if absent.is_empty() {
         Ok(())
     } else {
@@ -171,17 +171,16 @@ pub(crate) async fn check_server_names(
 /// host without the database or not answering, is
 /// [`NameCheckError::RetentionDisagrees`]. All three are retried.
 ///
-/// Reads the catalogue over a bootstrap client of its own, for
+/// Reads the catalogue over `client`, a client of the bootstrap pool, for
 /// [`check_server_names`]' reason: the target database may not exist.
-pub(crate) async fn read_schema_retention(config: &Config) -> Result<u32, NameCheckError> {
-    let client = ChClient::new(bootstrap_conn_config_from(config))
-        .await
-        .map_err(NameCheckError::Connect)?;
+pub(crate) async fn read_schema_retention(
+    client: &ChClient,
+    config: &Config,
+) -> Result<u32, NameCheckError> {
     let db = &config.clickhouse.database;
-    let state = pulsus_schema::schema_retention(&client, config.cluster.as_deref(), db)
+    let state = pulsus_schema::schema_retention(client, config.cluster.as_deref(), db)
         .await
         .map_err(NameCheckError::Statement)?;
-    drop(client);
     match state {
         pulsus_schema::SchemaRetention::Agreed(days) => Ok(days),
         pulsus_schema::SchemaRetention::Absent => Err(NameCheckError::SchemaAbsent(db.clone())),
@@ -307,20 +306,6 @@ pub(crate) fn trace_writer_tables_from(config: &Config) -> TraceWriterTables {
     TraceWriterTables::landing_for(landing_suffix(config))
 }
 
-/// Builds a [`LogQlEngine`] over `pool` — the same `Arc<ChPool>` `AppState`
-/// already holds (`ChClient::from_shared_pool`, issue #13 resolved open
-/// question #1), so a `/api/logs/v1` request never opens a second
-/// connection pool. The engine reads `tenant`'s rows alone (issue #653).
-pub(crate) fn logql_engine(
-    pool: Arc<ChPool>,
-    config: &Config,
-    tenant: pulsus_model::Tenant,
-) -> Result<LogQlEngine, ChError> {
-    let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
-        .with_consistency(consistency_from(config))?;
-    Ok(LogQlEngine::new(client, engine_config_from(config), tenant))
-}
-
 /// Maps `Config` to [`pulsus_read::LabelCacheConfig`] (issue #30 architect
 /// plan): on a cluster the cache reads `metric_series` and `metric_labels`
 /// through their `PULSUS_DIST_SUFFIX` wrappers; the metrics writer inserts
@@ -352,8 +337,8 @@ pub(crate) fn label_cache_config_from(config: &Config) -> LabelCacheConfig {
     }
 }
 
-/// Builds a [`LabelCache`] over `pool`, mirroring [`logql_engine`]'s
-/// "shared pool, no second connection" contract.
+/// Builds a [`LabelCache`] over `pool`, mirroring the request engines'
+/// "shared pool, no second connection" contract (`*_api/engine.rs`).
 pub(crate) fn build_label_cache(pool: Arc<ChPool>, config: &Config) -> Result<LabelCache, ChError> {
     let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
         .with_consistency(consistency_from(config))?;
@@ -427,26 +412,6 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
     }
 }
 
-/// Builds a [`MetricsEngine`] over `pool` and the already-constructed
-/// `label_cache` — the same `Arc<ChPool>`/`Arc<LabelCache>` `AppState`
-/// already holds, mirroring [`logql_engine`]'s "shared pool, no second
-/// connection" contract (issue #32).
-pub(crate) fn metrics_engine(
-    pool: Arc<ChPool>,
-    label_cache: Arc<LabelCache>,
-    config: &Config,
-    eval_gate: Arc<pulsus_read::EvalGate>,
-    rollup_levels: Arc<pulsus_read::metrics::rollup::LevelSlot>,
-) -> Result<MetricsEngine, ChError> {
-    let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
-        .with_consistency(consistency_from(config))?;
-    Ok(
-        MetricsEngine::new(client, label_cache, metrics_config_from(config))
-            .with_eval_gate(eval_gate)
-            .with_rollup_levels(rollup_levels),
-    )
-}
-
 /// Maps `Config` to [`pulsus_read::TraceReadConfig`] (issues #55/#57):
 /// both trace tables are `_dist`-aware exactly as every other read/write
 /// table mapping in this module — a configured `cluster` reads through
@@ -457,28 +422,6 @@ pub(crate) fn metrics_engine(
 /// from `reader.traceql_scan_budget_rows`.
 pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
     TraceReadConfig::from_config(config)
-}
-
-/// Builds a [`TraceEngine`] over `pool`, mirroring [`logql_engine`]'s
-/// "shared pool, no second connection" contract, with the process's one
-/// service-graph target cache (issue #599).
-pub(crate) fn trace_engine(
-    pool: Arc<ChPool>,
-    config: &Config,
-    graph_target: pulsus_read::GraphTargetCache,
-    tenant: pulsus_model::Tenant,
-) -> Result<TraceEngine, ChError> {
-    let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
-        .with_consistency(consistency_from(config))?;
-    Ok(
-        TraceEngine::new(client, trace_read_config_from(config), tenant)
-            .with_indexed_attrs(
-                pulsus_read::traces::spans::attr_index::IndexedAttr::from_config(
-                    &config.traceql_indexed_attributes,
-                ),
-            )
-            .with_graph_target_cache(graph_target),
-    )
 }
 
 #[cfg(test)]
@@ -497,6 +440,20 @@ mod tests {
             format!("{:?}", conn_config_from(&Config::default())),
             format!("{:?}", ChConnConfig::default()),
         );
+    }
+
+    /// Issue #803 (C3): `PULSUS_READ_SPREAD` reaches the pool's config.
+    #[test]
+    fn conn_config_from_maps_read_spread() {
+        assert_eq!(
+            conn_config_from(&Config::default()).read_spread,
+            ReadSpread::All
+        );
+        let config = Config {
+            read_spread: pulsus_config::ReadSpread::Zone,
+            ..Config::default()
+        };
+        assert_eq!(conn_config_from(&config).read_spread, ReadSpread::Zone);
     }
 
     /// Issue #506: `ReaderConfig::traceql_max_series` says it mirrors the

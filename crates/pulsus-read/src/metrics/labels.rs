@@ -996,6 +996,10 @@ pub struct LabelCache {
     /// start. The refresh loop sweeps each, with that tenant's statement.
     pub(crate) tenants: RwLock<HashMap<Tenant, Arc<TenantCache>>>,
     pub(crate) metrics: CacheMetrics,
+    /// Issue #803: one pass at a time. A pass rebinds the one client at the
+    /// start of each attempt, so two passes at once would move each other's
+    /// binding mid-request.
+    pass: tokio::sync::Mutex<()>,
 }
 
 /// One tenant's resident cache (issue #635 part 4): its snapshot, swept
@@ -1037,31 +1041,79 @@ impl LabelCache {
             config: cfg,
             tenants: RwLock::new(tenants),
             metrics: CacheMetrics::default(),
+            pass: tokio::sync::Mutex::new(()),
         }
     }
 
     /// One refresh sweep + atomic swap for every tenant in use (delegates
     /// to [`super::refresh`], the only ClickHouse-touching code in this
-    /// module). A failed sweep leaves that tenant's last good snapshot in
-    /// place — see [`super::refresh::run_sweep`]'s doc comment — and the
-    /// others are still swept; the first failure is returned.
+    /// module), as one read request (issue #803). A tenant whose statement
+    /// fails keeps its last good snapshot while the others swap, and the
+    /// first failure is returned.
     pub async fn refresh(&self) -> Result<(), pulsus_clickhouse::ChError> {
-        let mut first_err = None;
-        for tenant in self.tenants_in_use() {
-            if let Err(err) = self.refresh_tenant(&tenant).await
-                && first_err.is_none()
-            {
-                first_err = Some(err);
-            }
-        }
-        first_err.map_or(Ok(()), Err)
+        self.refresh_pass(&self.tenants_in_use()).await
     }
 
     /// One sweep of `tenant`'s cache (issue #635 part 4), which puts the
-    /// tenant in use.
+    /// tenant in use: a pass over that one tenant.
     pub async fn refresh_tenant(&self, tenant: &Tenant) -> Result<(), pulsus_clickhouse::ChError> {
-        let slot = self.tenant_cache(tenant);
-        super::refresh::run_sweep(self, tenant, &slot).await
+        self.tenant_cache(tenant);
+        self.refresh_pass(std::slice::from_ref(tenant)).await
+    }
+
+    /// Saves an accepted label-cache pass (issue #803): swaps each swept
+    /// tenant's snapshot in, counts one refresh failure per tenant whose
+    /// statement failed, and returns the first such failure, as
+    /// [`Self::refresh`] always has. A tenant that failed keeps its last
+    /// good snapshot while the others swap.
+    pub(crate) fn commit_sweep(
+        &self,
+        outcome: super::refresh::SweepOutcome,
+    ) -> Result<(), pulsus_clickhouse::ChError> {
+        for (tenant, swept) in outcome.swept {
+            let slot = self.tenant_cache(&tenant);
+            let series_count = swept.series_count();
+            swept.swap_into(&slot);
+            self.metrics
+                .record_refresh(series_count, self.config.cache_max_series);
+        }
+        for _ in &outcome.failed {
+            self.metrics.record_refresh_failure();
+        }
+        outcome.first_error.map_or(Ok(()), Err)
+    }
+
+    /// One label-cache pass over `tenants` (issue #803): one read request,
+    /// every tenant's statement on one server, run once more on another
+    /// when that server fails. Only the accepted attempt is saved; when
+    /// both attempts fail, every tenant keeps its last good snapshot and
+    /// counts one refresh failure.
+    async fn refresh_pass(&self, tenants: &[Tenant]) -> Result<(), pulsus_clickhouse::ChError> {
+        let _one_pass = self.pass.lock().await;
+        let client = &self.client;
+        let config = &self.config;
+        let outcome = client
+            .run_read_request(
+                move |avoid| async move {
+                    client.rebind_avoiding(avoid);
+                    let result = super::refresh::sweep_attempt(client, config, tenants).await;
+                    pulsus_clickhouse::Attempt {
+                        result,
+                        failure: client.server_failure(),
+                    }
+                },
+                pulsus_clickhouse::ChError::from,
+            )
+            .await;
+        match outcome {
+            Ok(outcome) => self.commit_sweep(outcome),
+            Err(err) => {
+                for _ in tenants {
+                    self.metrics.record_refresh_failure();
+                }
+                Err(err)
+            }
+        }
     }
 
     /// The tenants the refresh loop sweeps, sorted.
@@ -2868,6 +2920,67 @@ mod tests {
                 .series_count_by_metric_name
                 .len(),
             15
+        );
+    }
+
+    /// Issue #803 (T6): an accepted pass in which one tenant's statement
+    /// failed for a reason other than a server failure keeps that tenant's
+    /// old snapshot, swaps the others, counts one failure and returns it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_sweep_keeps_the_tenants_that_succeeded() {
+        use crate::metrics::pass_failure_tests::{cache_config, stub_client};
+        use crate::metrics::refresh::{SweepOutcome, SweptSnapshot};
+        use crate::metrics::stub_server::{Mode, StubServer};
+
+        let stub = StubServer::start(Mode::Code(60));
+        let cache = LabelCache::new(stub_client(&[&stub]).await, cache_config());
+        let t1 = Tenant::from_header(None, false).expect("the empty tenant");
+        let t2 = Tenant::from_header(Some(&http::HeaderValue::from_static("t2")), false)
+            .expect("tenant t2");
+        for t in [&t1, &t2] {
+            let slot = cache.tenant_cache(t);
+            *slot.snapshot.write().expect("snapshot lock") =
+                Arc::new(snapshot(Vec::new(), 0, BASE_SWEEP_MS, 1));
+        }
+        let fp = Fingerprint::from_raw(42);
+        let mut by_fingerprint = HashMap::new();
+        by_fingerprint.insert(fp, LabelSet::default());
+        let s = SweptSnapshot {
+            by_fingerprint,
+            by_metric: HashMap::from([("up".to_string(), vec![fp])]),
+            sweep_time_ms: BASE_SWEEP_MS,
+            covered_from_ms: 0,
+        };
+        let failures_before = cache.metrics.snapshot().refresh_failures_total;
+        let out = cache.commit_sweep(SweepOutcome {
+            swept: vec![(t2.clone(), s)],
+            failed: vec![t1.clone()],
+            first_error: Some(pulsus_clickhouse::ChError::Server {
+                code: 241,
+                message: "Code: 241. DB::Exception: memory".to_string(),
+            }),
+        });
+        assert!(
+            matches!(
+                out,
+                Err(pulsus_clickhouse::ChError::Server { code: 241, .. })
+            ),
+            "{out:?}"
+        );
+        let s2 = cache.tenant_cache(&t2).current_snapshot();
+        assert_eq!(s2.generation, 2, "t2 swapped");
+        assert!(
+            s2.by_fingerprint.contains_key(&fp),
+            "t2 holds the new snapshot"
+        );
+        assert_eq!(
+            cache.tenant_cache(&t1).current_snapshot().generation,
+            1,
+            "t1 keeps its old snapshot"
+        );
+        assert_eq!(
+            cache.metrics.snapshot().refresh_failures_total - failures_before,
+            1
         );
     }
 }

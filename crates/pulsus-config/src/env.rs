@@ -54,6 +54,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_SKIP_UNAVAILABLE_SHARDS",
     "PULSUS_AVAILABILITY_ZONE",
     "PULSUS_AZ_DETECT",
+    "PULSUS_READ_SPREAD",
     "PULSUS_BATCH_BYTES",
     "PULSUS_BATCH_MS",
     "PULSUS_INSERT_MODE",
@@ -343,6 +344,9 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("PULSUS_AZ_DETECT") {
         cfg.az_detect = parse_enum("PULSUS_AZ_DETECT", &v)?;
+    }
+    if let Some(v) = read("PULSUS_READ_SPREAD") {
+        cfg.read_spread = parse_enum("PULSUS_READ_SPREAD", &v)?;
     }
     if let Some(v) = read("PULSUS_BATCH_BYTES") {
         cfg.writer.batch_bytes = parse_size("PULSUS_BATCH_BYTES", &v)?;

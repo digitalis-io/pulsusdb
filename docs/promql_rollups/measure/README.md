@@ -2,7 +2,7 @@
 
 **Built.** Part A (#742) and part B (#744) are on `main` (`docs/promql_rollups/README.md` §2). The files here are the measurements behind the design and one recorded run of the built read path's live tests.
 
-The Python ports take their inputs as arguments, or generate them, and need no server. The statements in `projection-run/` name the database they ran in, `arch18r12_m`, which was dropped afterwards.
+The Python ports take their inputs as arguments, or generate them, and need no server. The statements in `projection-run/` name the database they ran in, `arch18r12_m`, which was dropped afterwards; those in `stage-run/` name `m800_a`, `m800_b` and `m800_c`, also dropped (issue #800).
 
 ## What is here
 
@@ -17,6 +17,14 @@ The Python ports take their inputs as arguments, or generate them, and need no s
 | `projection-run/07_query_log.tsv` | `system.query_log` for every run: rows read and written, time, memory, `projections` | `building.md` §3.4 |
 | `projection-run/08_720s_rows.tsv`, `09_60s_rows.tsv`, `10_60s_parts.tsv` | the rows of both levels by `kind`, and the 60 s level's parts | `building.md` §2.3, §3.4 |
 | `projection-run/corpus_bounds.txt` | the corpus's first and last millisecond | `building.md` §3.4 |
+| `stage-run/01_before_ddl.sql`, `stage-run/02_after_ddl.sql` | the rendered single-node 60 s, 720 s and 7200 s tables and views before issue #800 (`m800_a`, the projection) and after it (`m800_b`, the stages and their views) | `building.md` §3.4 |
+| `stage-run/03_test_data.sql` | the 84 inserts into `m800_a`'s 60 s level, `H0` and `g` as literals; `m800_b` and `m800_c` took the same statements with `built_at` 0 on data rows | `building.md` §3.4 |
+| `stage-run/04_runs_before.sql`, `stage-run/05_runs_after.sql` | each 720 s and 7200 s build as run in `m800_a` and `m800_b`, its seed run row first, unmerged and merged | `building.md` §3.4 |
+| `stage-run/06_query_log.tsv` | `system.query_log` for every insert and build, then `system.query_views_log` for the views each build fired | `building.md` §3.4 |
+| `stage-run/07_parts.tsv` | `system.parts`, `system.projection_parts` and `built_at`'s `system.parts_columns` row per part, unmerged and merged, then the active parts counted before each build | `building.md` §2.2, §3.4 |
+| `stage-run/08_rows_compare.tsv` | per pair of builds: rows, rows in one and not the other on every column and on every column but `sum` and `inc`, and the rows whose `sum` or `inc` differ with the most adjacent `Float64` values apart | `building.md` §3.2, §3.4 |
+| `stage-run/09_fallback_runs.sql` | the third database's deleted stage hour and its `ten` builds, unmerged and merged | `building.md` §3.4 |
+| `stage-run/10_view_read.sql`, `stage-run/10_view_read.tsv` | the same 30,000-row insert into a table without and with a copying insert-triggered view, and the server's `system.query_log` and `system.query_views_log` rows for both | `building.md` §3.4 |
 | `results/live-metrics-rollup.txt` | the last run of `crates/pulsus-read/tests/live_metrics_rollup.rs` recorded during part B's work, against the development server, all nine tests passing; it was not re-run on the merged commit: per function, level and series kind, `n`, p99 and maximum of the distance from raw, and `read_rows` of both routes per query; the cut-level comparisons of `a_window_touching_raw_is_raw` | `reading.md` §1.1, §3.1 |
 | `partB-ports/bounds.py`, `partB-ports/bounds.txt` | a port of the read rule (§1 of `reading.md`) on generated counters and gauges, 14 days, 40 series per kind; output for `15` and then `60`. The test bounds of `reading.md` §1.1 are twice the larger of its p99 and the earlier measurement | `reading.md` §1.1 |
 | `partB-ports/bounds_fixed.py`, `partB-ports/bounds_fixed.txt` | the same for sparse counters with the predecessor taken up to 24 hours back; output for `15` and then `60` | `reading.md` §1.1 |
@@ -28,6 +36,8 @@ The Python ports take their inputs as arguments, or generate them, and need no s
 Edits made when the files were copied here, and no other: two comment lines in `counter_distance.py`, two in `partB-ports/startpoints.py` and two in `partB-ports/tail720.py` were reworded, and `gauge_distance.py` gained two comment lines giving its usage. The code is as it ran. Every port was re-run after the edits. `counter_distance.py` and all six `partB-ports/` scripts reproduced their kept outputs byte for byte; `gauge_distance.py`'s output in `results/` is that re-run. `results/live-metrics-rollup.txt` is the test run's output less the two lines naming the build directory.
 
 **The gauge port's inputs are not here.** `INPUT_DIR` holds `raw<S>.tsv` (`fingerprint`, `unix_milli`, `value`), `lv60_<S>.tsv` and `lv720_<S>.tsv` (`fingerprint`, `t_end`, `t_last`, `last`, `min`, `max`, `sum`, `count`) and `kinds.tsv` (`fingerprint`, kind). They were exported from a database since dropped: 4,000 series over one day, about 150 MB. The statements that generated the corpus, built the level rows and exported them were not kept. Those level rows were built by an earlier statement without the exact-repeat drop of D12.
+
+**The script that drove `stage-run/` is not here**; its statement files are what it sent, and `06_query_log.tsv` and `07_parts.tsv` are what it read back.
 
 **How the recorded run was driven is not here.** The statement files are what ran. The commands that loaded 4,000 series at 15 s over three hours into landing, and that read `system.query_log` and `system.parts` into the `.tsv` files, were not kept.
 

@@ -1563,7 +1563,7 @@ jobs:
         run: cargo test -p pulsus-read --test live_metrics_rollup
 
       # Issue #18 part A: each rollup level's rows equal their aggregates
-      # from raw or the level below; run rows, holes, the projection read
+      # from raw or the level below; run rows, holes, the stage read and its fallback,
       # and expiry. Reuses this job's container.
       - name: Live rollup level tests
         env:
@@ -2337,6 +2337,13 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-server --test live_server
 
+      # Issue #803: startup checks move off a server that fails them.
+      - name: Startup checks fail over
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test live_startup_failover
+
       # Issue #174: spawns the real `pulsusdb` binary with
       # PULSUS_TLS_CERT/PULSUS_TLS_KEY set (rcgen material generated at
       # run time — no committed keys) and proves the inbound TLS listener
@@ -2501,8 +2508,8 @@ jobs:
           schema/schema.sh
           catalogue > /tmp/schema-first.tsv
           objects=$(wc -l < /tmp/schema-first.tsv)
-          if [ "$objects" -ne 55 ]; then
-            echo "::error::expected 55 objects in the single-node schema, got $objects"
+          if [ "$objects" -ne 59 ]; then
+            echo "::error::expected 59 objects in the single-node schema, got $objects"
             cut -f1 /tmp/schema-first.tsv
             exit 1
           fi
@@ -2677,8 +2684,8 @@ jobs:
           catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 76 ]; then
-            echo "::error::expected 76 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 80 ]; then
+            echo "::error::expected 80 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -2826,6 +2833,14 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-clickhouse --test live_spreading
 
+      # Issue #803: each read request goes to one server, requests take
+      # turns over both nodes, a request whose server drops runs again on
+      # another, and writes keep to the node this process's zone prefers.
+      - name: Reads spread, writes keep to the preferred zone (two nodes)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-clickhouse --test live_read_spread
+
       - name: Tear down the cluster
         if: always()
         run: docker compose -f ci/clickhouse-cluster/compose.yaml down -v
@@ -2908,8 +2923,8 @@ jobs:
           catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 76 ]; then
-            echo "::error::expected 76 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 80 ]; then
+            echo "::error::expected 80 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi

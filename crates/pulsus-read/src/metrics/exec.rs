@@ -566,6 +566,10 @@ pub struct MetricsEngine {
     /// Issue #778: the span a range query is routed by, in place of its own
     /// `end − start`. A read cache tail is routed as its whole request is.
     routing_span_ms: Option<i64>,
+    /// TEST SEAM (issue #778): a server failure [`MetricsEngine::server_failure`]
+    /// reports whatever the reads met.
+    #[cfg(test)]
+    injected_failure: Option<pulsus_clickhouse::ServerFailure>,
 }
 
 /// Issue #778: what planning alone says about a query, for the read cache.
@@ -616,7 +620,17 @@ impl MetricsEngine {
             rollup_answer_hook: None,
             statement_cap: crate::querytext::MAX_QUERY_TEXT_BYTES,
             routing_span_ms: None,
+            #[cfg(test)]
+            injected_failure: None,
         }
+    }
+
+    /// TEST SEAM (issue #778): this engine reports `f` as its server
+    /// failure.
+    #[cfg(test)]
+    pub(crate) fn with_injected_failure(mut self, f: pulsus_clickhouse::ServerFailure) -> Self {
+        self.injected_failure = Some(f);
+        self
     }
 
     /// Issue #778: routes every range query of this engine by `span_ms`
@@ -704,6 +718,21 @@ impl MetricsEngine {
         self.dispatch = self.dispatch.with_log_comment(comment.into());
         self
     }
+
+    /// Issue #803: the first server failure this engine's reads met since
+    /// its client was bound.
+    pub fn server_failure(&self) -> Option<pulsus_clickhouse::ServerFailure> {
+        #[cfg(test)]
+        if let Some(f) = &self.injected_failure {
+            return Some(f.clone());
+        }
+        self.dispatch.server_failure()
+    }
+
+    /// Issue #803: saves what this engine's accepted request read into
+    /// state shared beyond it. The metrics engine keeps nothing, so this
+    /// does nothing.
+    pub fn commit(&self) {}
 
     /// Issue #499: the request's `lookback_delta`, in milliseconds, as the
     /// staleness lookback every plan of this engine uses.

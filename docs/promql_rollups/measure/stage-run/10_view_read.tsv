@@ -1,0 +1,8 @@
+# system.query_log
+log_comment	query_id	read_rows	written_rows
+m800 view-read plain	076c11bb-5410-41c0-b6d1-9566a7629f30	30000	30000
+m800 view-read viewed	e944d8e5-dacf-4123-9be4-79efbd68e940	60000	60000
+
+# system.query_views_log
+log_comment	view_name	read_rows	written_rows
+m800 view-read viewed	m800_view.viewed_mv	30000	30000
