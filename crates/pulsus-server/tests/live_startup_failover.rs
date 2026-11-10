@@ -50,7 +50,7 @@ impl Drop for ChildGuard {
 
 /// Spawns `pulsusdb` on `port` over `db`, with the stub listed before this
 /// job's server.
-fn spawn(port: u16, db: &ScopedDb, stub: &StubServer) -> ChildGuard {
+fn spawn(port: u16, db: &ScopedDb, stub: &StubServer, capture: bool) -> ChildGuard {
     let servers = format!(
         "127.0.0.1:{},{}:{}",
         stub.addr.port(),
@@ -62,7 +62,12 @@ fn spawn(port: u16, db: &ScopedDb, stub: &StubServer) -> ChildGuard {
         .env("PULSUS_PORT", port.to_string())
         .env("CLICKHOUSE_SERVERS", servers)
         .env("CLICKHOUSE_DB", db.name())
-        .stdout(std::process::Stdio::null())
+        // `tracing`'s subscriber writes to stdout; S1 reads it.
+        .stdout(if capture {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .spawn()
         .expect("spawn pulsusdb");
     ChildGuard(child)
@@ -89,13 +94,24 @@ async fn startup_checks_move_off_a_server_that_fails_them() {
     let port: u16 = 31_250;
     let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_startup_failover_s1_it")).await;
     let stub = StubServer::start(Mode::Code(210));
-    let server = spawn(port, &db, &stub);
+    let mut server = spawn(port, &db, &stub, true);
+    let mut out = server.0.stdout.take().expect("piped stdout");
 
     let ready = tokio::task::spawn_blocking(move || ready_within_30s(port))
         .await
         .expect("the readiness poll");
+    // The child never exits, so the read is bounded by killing it first.
     drop(server);
+    let mut log = String::new();
+    let _ = out.read_to_string(&mut log);
     assert!(ready, "/ready must reach 200 within 30 s");
+    // The checks ran once more at once on the next server: no iteration
+    // failed and backed off, which is what a startup that only moved on at
+    // its next iteration would log.
+    assert!(
+        !log.contains("clickhouse startup step failed"),
+        "the checks must run again at once, not after a backoff: {log}"
+    );
     assert!(
         stub.answered() >= 1,
         "the stub received a check statement: {:?}",
@@ -116,7 +132,7 @@ async fn startup_checks_reach_the_next_server_on_the_next_iteration() {
         reply: Reply::Strings("v", vec!["1.0".to_string()]),
         otherwise: Reply::Code(210),
     });
-    let server = spawn(port, &db, &stub);
+    let server = spawn(port, &db, &stub, false);
 
     let ready = tokio::task::spawn_blocking(move || ready_within_30s(port))
         .await

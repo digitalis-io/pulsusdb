@@ -2717,6 +2717,10 @@ mod tests {
         poll_script: PollScript,
         first_script: FirstScript,
         catch_script: CatchScript,
+        /// Issue #803: a failed catch-up read reports a server failure the
+        /// fetcher has moved off.
+        failover: bool,
+        last_failed: bool,
     }
 
     impl ScriptedFetcher {
@@ -2735,7 +2739,14 @@ mod tests {
                 poll_script: Box::new(poll_script),
                 first_script: Box::new(first_script),
                 catch_script: Box::new(catch_script),
+                failover: false,
+                last_failed: false,
             }
+        }
+
+        fn with_failover(mut self) -> Self {
+            self.failover = true;
+            self
         }
 
         fn record(&self, call: Call) {
@@ -2809,6 +2820,7 @@ mod tests {
                 CatchStep::Hang => std::future::pending().await,
                 CatchStep::Fail(d, e) => {
                     tokio::time::sleep(d).await;
+                    self.last_failed = true;
                     Err(e)
                 }
             }
@@ -2816,6 +2828,10 @@ mod tests {
 
         fn admit(&mut self, fps: &[Fingerprint]) {
             self.record(Call::Admit(fps.to_vec()));
+        }
+
+        fn take_server_failure(&mut self) -> bool {
+            self.failover && std::mem::take(&mut self.last_failed)
         }
 
         fn deadline_set(&mut self, deadline: tokio::time::Instant) {
@@ -3186,6 +3202,46 @@ mod tests {
         assert_eq!(sent_lines(&sent.lock().unwrap()), ["A1", "A2"]);
         let calls = log.lock().unwrap().clone();
         assert!(!has_admit(&calls), "{calls:#?}");
+    }
+
+    /// Issues #803 and #804 (T9): a catch-up read whose server failed is
+    /// read again once, at once, at the same position on the server the
+    /// fetcher moved to; the tail stays open, the stream's line is sent
+    /// once and the stream is admitted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_catch_up_read_whose_server_failed_is_read_again_once() {
+        let cfg = test_cfg();
+        let start = cfg.start_ns;
+        let fetcher = ScriptedFetcher::new(
+            h1_polls,
+            move |_, _| vec![(fpn(2), start + 1)],
+            |n| match n {
+                0 => CatchStep::Fail(
+                    Duration::ZERO,
+                    ReadError::PipelineInvalid {
+                        reason: "server failed".to_string(),
+                    },
+                ),
+                _ => CatchStep::Page(catch_page(&["B1"], 1, None, &[2])),
+            },
+        )
+        .with_failover();
+        let run = ScriptedRun::start(fetcher, cfg);
+        run.wait_for(Duration::from_secs(3), has_admit).await;
+        assert!(run.closed.lock().unwrap().is_none(), "the tail stays open");
+        let (calls, lines) = run.stop().await;
+        let catches: Vec<&Call> = calls
+            .iter()
+            .map(|(_, c)| c)
+            .filter(|c| matches!(c, Call::CatchUp { .. }))
+            .collect();
+        assert!(catches.len() >= 2, "{calls:#?}");
+        assert_eq!(
+            catches[0], catches[1],
+            "the same read, at the same position"
+        );
+        assert_eq!(lines.iter().filter(|l| *l == "B1").count(), 1, "{lines:?}");
+        assert!(has_admit(&calls), "{calls:#?}");
     }
 
     /// H6 (issue #804): an empty probe, or a catch-up that fetches nothing
