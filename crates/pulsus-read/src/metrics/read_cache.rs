@@ -21,7 +21,7 @@
 //! tenant past its share losing its own first. A float answer's points are
 //! one allocation, so with the allocator's mapping threshold fixed
 //! (`pulsus_server::allocator`) an evicted answer that was its own mapping
-//! goes back to the system; one served from free heap space stays with it.
+//! goes back to the system; one served from heap space stays unless glibc trims it.
 //!
 //! A plain in-memory, byte-weighted LRU: no new crate, nothing on disk,
 //! nothing shared between nodes.

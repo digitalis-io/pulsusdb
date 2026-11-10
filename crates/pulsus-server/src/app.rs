@@ -67,7 +67,8 @@ pub(crate) struct AppState {
     /// target on every request.
     pub(crate) graph_target: pulsus_read::GraphTargetCache,
     /// Issue #778: the per-process read cache of range answers; set at startup on the
-    /// reader and `all` roles when its budget is above 0 and the allocator took its settings.
+    /// reader and `all` roles when its budget is above 0 and, on glibc, the allocator took
+    /// its settings. With another C library nothing is set and the cache is built.
     pub(crate) read_cache: Arc<OnceLock<Arc<pulsus_read::metrics::read_cache::ReadCache>>>,
     pub(crate) eval_gate: Arc<pulsus_read::EvalGate>,
     pub(crate) started_at: std::time::SystemTime,

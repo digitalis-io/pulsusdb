@@ -1,15 +1,17 @@
 //! Issue #778: the allocator settings the read cache runs with.
 //!
 //! glibc serves a request from free heap space when a free chunk or the top
-//! of the heap holds it. Otherwise a request above its mapping threshold
-//! gets a mapping of its own, returned to the system when it is freed, and
-//! a request below it grows the heap, which keeps what is freed for reuse.
+//! of the heap holds it. Otherwise a request whose block (the request and
+//! glibc's chunk header) is at or above its mapping threshold gets a mapping
+//! of its own, returned to the system when it is freed, and a smaller one
+//! grows the heap, which keeps what is freed for reuse except what glibc
+//! trims from the top of the heap.
 //! Unless the threshold is fixed, glibc raises it to the size of each mapped
 //! block freed, so after the first kept answer is evicted the next ones are
 //! heap blocks again, and memory the cache freed stays with the process.
-//! With the threshold fixed at 64 KiB, a kept answer of 64 KiB or more is
-//! its own mapping unless free heap space already holds it; one under
-//! 64 KiB is always on the heap.
+//! With the threshold fixed at 64 KiB, a kept answer whose block is 64 KiB
+//! or more is its own mapping unless free heap space already holds it; one
+//! whose block is under 64 KiB is always on the heap.
 
 /// The fixed mapping threshold, `M_MMAP_THRESHOLD`.
 pub const MMAP_THRESHOLD_BYTES: i32 = 65_536;
@@ -25,11 +27,12 @@ pub const GLIBC_DEFAULT_MMAP_MAX: i32 = 65_536;
 /// Applies the settings when the read cache's budget is above 0, as server
 /// startup does. `false` when the budget is 0 or a setting did not apply
 /// (logged at warn): the read cache is then not built, and requests are
-/// answered as with the cache off. The bound on mappings goes first, so
-/// when the threshold is refused only that bound has changed, and it is put
-/// back at glibc's default. Setting the threshold cannot be undone, as it
-/// also stops glibc moving it, which is why it goes last. With a C library
-/// other than glibc nothing is set.
+/// answered as with the cache off. The bound on mappings goes first: if it
+/// is refused nothing has changed. If the threshold is then refused, the
+/// bound is put back at glibc's default, but glibc no longer moves the
+/// threshold, since setting either value stops that and nothing restores
+/// it. With a C library other than glibc nothing is set, and `true` is
+/// returned whenever the budget is above 0.
 pub fn prepare_read_cache(budget_bytes: u64) -> bool {
     prepare_with(budget_bytes, set)
 }
@@ -97,9 +100,10 @@ mod tests {
     }
 
     /// Both settings applied leave the cache on. A setting that does not
-    /// apply leaves it off and the allocator as it found it: the bound on
-    /// mappings goes first, so a refused threshold has only that bound to
-    /// put back, at glibc's default. A budget of 0 sets nothing.
+    /// apply leaves it off. The bound on mappings goes first, so a refused
+    /// bound sets nothing more, and a refused threshold has the bound put
+    /// back at glibc's default (glibc still stops moving the threshold once
+    /// the bound is set). A budget of 0 sets nothing.
     #[test]
     fn a_setting_that_does_not_apply_leaves_the_read_cache_off() {
         let (on, calls) = run(None);
