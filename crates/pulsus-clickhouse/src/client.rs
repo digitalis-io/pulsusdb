@@ -274,7 +274,9 @@ impl ChClient {
     /// and a source table whose derived tables are maintained by materialized
     /// view can have committed its own block before a view on it throws. So
     /// every failure from the write-or-end phase — retryable or not — is
-    /// [`ChError::InsertUncertain`], which no caller auto-retries. Only a
+    /// [`ChError::InsertUncertain`], which a caller may resend only under
+    /// the same insert deduplication token, as the landing writer does
+    /// (`pulsus-write`'s `writer/landing.rs`). Only a
     /// failure raised **before** the block was sent, which is the pooled
     /// connection's checkout and the target's column-metadata read, is genuine
     /// pre-commit poison and keeps its precise class: nothing was committed,
