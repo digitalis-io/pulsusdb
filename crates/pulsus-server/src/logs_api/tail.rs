@@ -5041,6 +5041,10 @@ mod tests {
         flush_script: VecDeque<bool>,
         text_err_after_buffer: bool,
         ready_seen: bool,
+        /// After the first `start_send`, `poll_ready` is pending, waking
+        /// itself at once, until the clock reaches this instant.
+        ready_from_after_first_send: Option<TInstant>,
+        sends: usize,
     }
 
     impl Sink<Message> for ScriptSink {
@@ -5050,7 +5054,11 @@ mod tests {
             mut self: Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Result<(), ()>> {
-            if self.ready_script.pop_front() == Some(false) {
+            let held = self.sends > 0
+                && self
+                    .ready_from_after_first_send
+                    .is_some_and(|from| TInstant::now() < from);
+            if held || self.ready_script.pop_front() == Some(false) {
                 self.log
                     .lock()
                     .unwrap()
@@ -5069,6 +5077,7 @@ mod tests {
                 Message::Close(_) => ("start_send(Close)", "Close".to_string()),
                 _ => ("start_send(other)", String::new()),
             };
+            self.sends += 1;
             if !std::mem::take(&mut self.ready_seen) {
                 self.log.lock().unwrap().push(format!("rejected {label}"));
                 return Err(());
@@ -5145,6 +5154,50 @@ mod tests {
         let log = log.lock().unwrap().clone();
         let written = written.lock().unwrap().clone();
         (log, written)
+    }
+
+    /// P5 (issue #806, code review round 3): the Close is tried for at most
+    /// `CLOSE_GRACE`. A socket that becomes ready only when that time is up
+    /// gets no Close: nothing is handed over or written after it.
+    #[tokio::test(start_paused = true)]
+    async fn the_production_close_hands_nothing_over_after_its_deadline() {
+        let t0 = TInstant::now();
+        let sink = ScriptSink {
+            ready_from_after_first_send: Some(t0 + ms(GRACE_MS)),
+            ..ScriptSink::default()
+        };
+        let (log, written) = (Arc::clone(&sink.log), Arc::clone(&sink.written));
+        let (tx, rx) = mpsc::channel(4);
+        tx.try_send(page_event("A1", 1)).expect("room");
+        drop(tx);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (cancel_tx, cancel) = watch::channel(false);
+        let handle = tokio::spawn(writer_loop(
+            SinkSender(sink),
+            rx,
+            test_cfg(),
+            shutdown,
+            cancel,
+            Arc::new(cancel_tx),
+        ));
+        // A1 is written; the Close waits for readiness.
+        yield_until(|| {
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l == "poll_ready (pending)")
+        })
+        .await;
+        tokio::time::advance(ms(GRACE_MS)).await;
+        yield_until(|| handle.is_finished()).await;
+        handle.await.expect("no panic");
+        let log = log.lock().unwrap().clone();
+        assert!(
+            !log.iter().any(|l| l == "start_send(Close)"),
+            "the Close is not handed over at its deadline: {log:?}"
+        );
+        let written = written.lock().unwrap().clone();
+        assert_eq!(written.len(), 1, "only A1 is written: {written:?}");
     }
 
     /// P1 (issue #806): the production sender drops the socket when the
