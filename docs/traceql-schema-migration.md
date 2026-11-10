@@ -5221,10 +5221,10 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
 
 ### `crates/pulsus-clickhouse/src/pool.rs`
 
-**`:887-886`**
+**`:887-887`**
 
 ```rust
-  695          clickhouse::Client::default()
+  887          _ => clickhouse::Client::default(),
 ```
 
 ### `vendor/clickhouse/Cargo.toml`

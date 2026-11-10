@@ -98,10 +98,12 @@ nothing. A bad-SQL, decode or logic error never demotes. Health is published
 as lock-free mirror atomics for the hot path (`get()`'s healthy+fresh path
 never locks anything), backed by a tiny non-async transition lock — never
 held across an `.await`, never in `Drop` — that makes every state change (a
-demotion, a promotion, or a probe outcome) one atomic critical section. The
-next `get()` skips a demoted endpoint until a short cooldown elapses, then
-re-admits it as a probe candidate; a successful probe re-promotes it
-immediately. New read requests are bound to it while it is demoted only when
+demotion, a promotion, or a probe outcome) one atomic critical section. A
+write's `get()` ranks a demoted endpoint below every healthy one, and once a
+short cooldown has elapsed, above the demoted endpoints still cooling. It
+reaches a demoted endpoint only when the endpoints ahead of it do not answer,
+before its cooldown ends as well, and probes it before using it; a successful
+probe re-promotes it immediately. New read requests are bound to it while it is demoted only when
 no endpoint is healthy. This matches "immediately start using other AZs on
 disconnect" with zero healthy-path overhead. Every statement already running
 on an endpoint when it goes down can fail on it, however many requests those
@@ -109,7 +111,7 @@ are: each such write returns its error, and each such read request runs again
 on another endpoint if one is healthy at that moment, or returns its error if
 none is.
 
-A read request whose endpoint fails is not continued elsewhere: its partial results are dropped and the whole request runs once more on another healthy endpoint, never the one that failed, and a live tail repeats the failed read on another endpoint. No read runs more than twice. A read timeout is the request's own deadline: it demotes nothing and is not run again.
+A read request whose endpoint fails is not continued elsewhere: its partial results are dropped, and if another endpoint is healthy at the moment it fails, the whole request runs once more, bound to any endpoint except the one that failed, whatever that endpoint's health by then; a live tail repeats the failed read the same way. No read runs more than twice. A read timeout is the request's own deadline: it demotes nothing and is not run again.
 
 Startup uses "ping-any": the pool starts if at least one endpoint answers, so
 a partially-degraded cluster is still serviceable.
