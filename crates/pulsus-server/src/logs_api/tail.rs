@@ -533,8 +533,13 @@ trait TailSender: Send + 'static {
     /// BEFORE this boundary, so the hermetic sender fake captures the
     /// frame the production wiring produced — the render seam is
     /// pinned, and the impls are pure transport with no rendering
-    /// decision left to bypass.
-    fn send_close(&mut self, frame: Option<CloseFrame>) -> impl Future<Output = ()> + Send;
+    /// decision left to bypass. Nothing is handed over or written at or
+    /// after `deadline` (issue #806).
+    fn send_close(
+        &mut self,
+        frame: Option<CloseFrame>,
+        deadline: Instant,
+    ) -> impl Future<Output = ()> + Send;
 }
 
 /// The inbound half (review round 1, medium): a dedicated reader task
@@ -582,18 +587,21 @@ impl<S: Sink<Message> + Unpin + Send + 'static> TailSender for SinkSender<S> {
         self.flush_inner().await
     }
 
-    /// `ready`, `start_send(Close)`, then `flush`, as `SinkExt::send` does.
-    async fn send_close(&mut self, frame: Option<CloseFrame>) {
-        if self.ready_inner().await.is_err() {
+    /// `ready`, `start_send(Close)`, then `flush`, as `SinkExt::send` does,
+    /// each step behind the clock: none is polled or started at or after
+    /// `deadline`.
+    async fn send_close(&mut self, frame: Option<CloseFrame>, deadline: Instant) {
+        if within(deadline, self.ready_inner()).await != Some(Ok(())) {
             return;
         }
-        if Pin::new(&mut self.0)
-            .start_send(Message::Close(frame))
-            .is_err()
+        if Instant::now() >= deadline
+            || Pin::new(&mut self.0)
+                .start_send(Message::Close(frame))
+                .is_err()
         {
             return;
         }
-        let _ = self.flush_inner().await;
+        let _ = within(deadline, self.flush_inner()).await;
     }
 }
 
@@ -1515,6 +1523,17 @@ async fn before<F: Future + Unpin>(deadline: Instant, fut: &mut F) -> Option<F::
     .await
 }
 
+/// Runs `fut` until `deadline`, polling it only while the clock is before
+/// it; `None` when the deadline came first.
+async fn within<F: Future>(deadline: Instant, fut: F) -> Option<F::Output> {
+    tokio::pin!(fut);
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => None,
+        out = before(deadline, &mut fut) => out,
+    }
+}
+
 /// What ended one of the writer's waits.
 enum Got {
     /// The connection must stop, or the step's deadline passed.
@@ -1573,7 +1592,8 @@ async fn writer_loop<S: TailSender, E: EventSource>(
                 // so every `TailSender` receives the production renderer's
                 // output (issue #240 re-review).
                 let frame = reason.map(error_close_frame);
-                let _ = tokio::time::timeout(CLOSE_GRACE, sender.send_close(frame)).await;
+                let deadline = Instant::now() + CLOSE_GRACE;
+                let _ = within(deadline, sender.send_close(frame, deadline)).await;
                 break;
             }
             Action::Wait { until } => inputs.wait(until).await,
@@ -2382,7 +2402,7 @@ mod tests {
             Ok(())
         }
 
-        async fn send_close(&mut self, frame: Option<CloseFrame>) {
+        async fn send_close(&mut self, frame: Option<CloseFrame>, _deadline: TInstant) {
             self.note(Wire::CloseStart);
             if self.close_mode == CloseMode::Block {
                 std::future::pending::<()>().await;
