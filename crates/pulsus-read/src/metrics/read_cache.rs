@@ -20,8 +20,8 @@
 //! ([`charge`]); past the budget the least recently used entries go, a
 //! tenant past its share losing its own first. A float answer's points are
 //! one allocation, so with the allocator's mapping threshold fixed
-//! (`pulsus_server::allocator`) an evicted answer's memory goes back to the
-//! system.
+//! (`pulsus_server::allocator`) an evicted answer that was its own mapping
+//! goes back to the system; one served from free heap space stays with it.
 //!
 //! A plain in-memory, byte-weighted LRU: no new crate, nothing on disk,
 //! nothing shared between nodes.
@@ -194,7 +194,6 @@ pub enum Outcome {
 /// Why a request did not use the cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BypassReason {
-    Off,
     Instant,
     Explain,
     Shape,
@@ -203,8 +202,7 @@ pub enum BypassReason {
 }
 
 impl BypassReason {
-    pub const ALL: [BypassReason; 6] = [
-        BypassReason::Off,
+    pub const ALL: [BypassReason; 5] = [
         BypassReason::Instant,
         BypassReason::Explain,
         BypassReason::Shape,
@@ -215,7 +213,6 @@ impl BypassReason {
     /// The `reason` label of `pulsus_read_cache_bypass_total`.
     pub fn as_str(self) -> &'static str {
         match self {
-            BypassReason::Off => "off",
             BypassReason::Instant => "instant",
             BypassReason::Explain => "explain",
             BypassReason::Shape => "shape",
@@ -256,7 +253,7 @@ pub struct ReadCacheMetrics {
     hits: AtomicU64,
     misses: AtomicU64,
     bypasses: AtomicU64,
-    bypass_reasons: [AtomicU64; 6],
+    bypass_reasons: [AtomicU64; 5],
     evictions: AtomicU64,
     clears: AtomicU64,
     poll_failures: AtomicU64,

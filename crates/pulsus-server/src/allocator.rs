@@ -1,13 +1,15 @@
 //! Issue #778: the allocator settings the read cache runs with.
 //!
-//! glibc serves a block above its mapping threshold from a mapping of its
-//! own and returns it to the system when it is freed; a block below the
-//! threshold comes from the heap, which keeps what is freed for reuse.
+//! glibc serves a request from free heap space when a free chunk or the top
+//! of the heap holds it. Otherwise a request above its mapping threshold
+//! gets a mapping of its own, returned to the system when it is freed, and
+//! a request below it grows the heap, which keeps what is freed for reuse.
 //! Unless the threshold is fixed, glibc raises it to the size of each mapped
 //! block freed, so after the first kept answer is evicted the next ones are
 //! heap blocks again, and memory the cache freed stays with the process.
-//! Fixing the threshold at 64 KiB makes each kept answer of 64 KiB or more
-//! its own mapping.
+//! With the threshold fixed at 64 KiB, a kept answer of 64 KiB or more is
+//! its own mapping unless free heap space already holds it; one under
+//! 64 KiB is always on the heap.
 
 /// The fixed mapping threshold, `M_MMAP_THRESHOLD`.
 pub const MMAP_THRESHOLD_BYTES: i32 = 65_536;
@@ -15,14 +17,19 @@ pub const MMAP_THRESHOLD_BYTES: i32 = 65_536;
 /// default limit of 65,530, so the allocator's own mappings leave room for
 /// the rest of the process. Past it the allocator uses the heap.
 pub const MMAP_MAX: i32 = 32_765;
-/// glibc's own `M_MMAP_MAX`, put back when the threshold is refused.
-pub const GLIBC_DEFAULT_MMAP_MAX: i32 = 0;
+/// glibc's default `M_MMAP_MAX`, put back when the threshold is refused.
+/// glibc gives no way to read the value it had, so one set through the
+/// environment before start is not what is put back.
+pub const GLIBC_DEFAULT_MMAP_MAX: i32 = 65_536;
 
 /// Applies the settings when the read cache's budget is above 0, as server
 /// startup does. `false` when the budget is 0 or a setting did not apply
 /// (logged at warn): the read cache is then not built, and requests are
-/// answered as with the cache off. With a C library other than glibc
-/// nothing is set.
+/// answered as with the cache off. The bound on mappings goes first, so
+/// when the threshold is refused only that bound has changed, and it is put
+/// back at glibc's default. Setting the threshold cannot be undone, as it
+/// also stops glibc moving it, which is why it goes last. With a C library
+/// other than glibc nothing is set.
 pub fn prepare_read_cache(budget_bytes: u64) -> bool {
     prepare_with(budget_bytes, set)
 }
@@ -34,21 +41,27 @@ pub fn prepare_with(budget_bytes: u64, mut set: impl FnMut(i32, i32) -> i32) -> 
         return false;
     }
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    for (name, param, value) in [
-        (
-            "M_MMAP_THRESHOLD",
-            libc::M_MMAP_THRESHOLD,
-            MMAP_THRESHOLD_BYTES,
-        ),
-        ("M_MMAP_MAX", libc::M_MMAP_MAX, MMAP_MAX),
-    ] {
-        if set(param, value) == 0 {
+    {
+        let refused = |name: &str, value: i32| {
             tracing::warn!(
                 setting = name,
                 value,
                 "the allocator did not accept a setting the read cache needs; \
                  the read cache is off"
             );
+        };
+        if set(libc::M_MMAP_MAX, MMAP_MAX) == 0 {
+            refused("M_MMAP_MAX", MMAP_MAX);
+            return false;
+        }
+        if set(libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD_BYTES) == 0 {
+            refused("M_MMAP_THRESHOLD", MMAP_THRESHOLD_BYTES);
+            if set(libc::M_MMAP_MAX, GLIBC_DEFAULT_MMAP_MAX) == 0 {
+                tracing::warn!(
+                    value = GLIBC_DEFAULT_MMAP_MAX,
+                    "the allocator did not take M_MMAP_MAX back to its default"
+                );
+            }
             return false;
         }
     }
