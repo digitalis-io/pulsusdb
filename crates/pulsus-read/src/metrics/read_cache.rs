@@ -759,6 +759,11 @@ fn keep(
         }
         _ => return None,
     };
+    // A store with no kept point stores nothing (§5.4): an answer with no
+    // series in `[start, c1]` is evaluated in full again next time.
+    if series.is_empty() {
+        return None;
+    }
     let mut entry = Entry {
         annotations,
         series,
@@ -1380,9 +1385,10 @@ pub fn identity_sql(cluster: Option<&str>, db: &str) -> String {
     }
 }
 
-/// The settings of every statement the poll sends.
+/// The settings of every statement the poll sends: a `log_comment` naming
+/// the task, which no request id (32 hex characters) can be taken for.
 pub fn poll_settings() -> QuerySettings {
-    QuerySettings::new()
+    QuerySettings::new().set("log_comment", "background:read-cache-poll")
 }
 
 async fn fetch<R: pulsus_clickhouse::ChRow>(

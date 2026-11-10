@@ -177,11 +177,6 @@ struct ShardsRow {
     shards: u32,
 }
 
-/// The settings of every statement the level discovery sends.
-pub(crate) fn level_settings() -> QuerySettings {
-    QuerySettings::new()
-}
-
 async fn fetch<R: pulsus_clickhouse::ChRow>(
     client: &ChClient,
     sql: &str,
@@ -1015,6 +1010,12 @@ pub fn column_of(use_: RollupUse) -> &'static str {
         RollupUse::Avg => "sum / count",
         RollupUse::Counter => "last, inc",
     }
+}
+
+/// The settings of every statement the level discovery sends, its replica
+/// delay read included: a `log_comment` naming the task.
+pub(crate) fn level_settings() -> QuerySettings {
+    QuerySettings::new().set("log_comment", "background:rollup-levels")
 }
 
 #[cfg(test)]
