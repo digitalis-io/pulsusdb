@@ -5,7 +5,16 @@
 //! loop: each poll runs the IDENTICAL stage-1/2/3 plan machinery and the
 //! SAME `CompiledPipeline` as the query path (`LogQlEngine::tail_poll` —
 //! the task-manager-ratified semantics-drift-free invariant), fetching
-//! one keyset page in global composite row order.
+//! one keyset page in global composite row order; across pages each
+//! stream's entries stay in timestamp order. A stream whose labels become
+//! readable after the scan passed some of its lines waits outside the scan
+//! until a catch-up has read its lines from `start` to the cursor, one
+//! slice per line query, then joins it; no read of its lines starts
+//! `TAIL_CATCH_UP_RECHECK_NS` or more after its labels were read, and it
+//! joins the scan after the one read already running then returns, within
+//! that read's configured query timeout (`PULSUS_QUERY_TIMEOUT`); its older
+//! entries arrive after newer entries of other streams (per-stream order,
+//! issue #804).
 //!
 //! **Cursor** (round-4 adjudication): `(scan watermark, boundary
 //! cursor)`. The watermark advances to each exhausted slice's upper
@@ -27,10 +36,12 @@
 //! joins the producer and owns the connection-slot permit for the
 //! socket's lifetime.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{RawQuery, State};
@@ -413,6 +424,34 @@ impl TailFetcher for EngineFetcher {
             .tail_poll(&mut self.setup, lower, upper_ns, fetch_limit)
             .await
     }
+
+    async fn catch_up_first_lines(
+        &mut self,
+        fps: &[Fingerprint],
+        after_ns: i64,
+        ceiling: TailCeiling,
+    ) -> Result<Vec<(Fingerprint, i64)>, ReadError> {
+        self.engine
+            .tail_first_lines(&self.setup, fps, after_ns, ceiling)
+            .await
+    }
+
+    async fn catch_up(
+        &mut self,
+        fps: &[Fingerprint],
+        lower: TailLower,
+        upper_ns: i64,
+        ceiling: TailCeiling,
+        fetch_limit: u32,
+    ) -> Result<CatchUpPage, ReadError> {
+        self.engine
+            .tail_catch_up(&self.setup, fps, lower, upper_ns, ceiling, fetch_limit)
+            .await
+    }
+
+    fn admit(&mut self, fps: &[Fingerprint]) {
+        self.setup.admit(fps);
+    }
 }
 
 /// The outbound half of the split socket — axum's `SplitSink` in
@@ -752,9 +791,125 @@ async fn producer_loop<F: TailFetcher>(
     let mut state = ScanState::new(cfg.start_ns);
     let mut live_since_ns: Option<i64> = None;
     let mut qualifying_scan_done = false;
+    // Issue #804: streams whose labels were read after the first window,
+    // each with its deadline, wait outside the main scan until a catch-up
+    // has read their lines up to the scan's position.
+    let recheck = Duration::from_nanos(u64::try_from(cfg.catch_up_recheck_ns).unwrap_or(0));
+    let mut waiting: Vec<(Fingerprint, Instant)> = Vec::new();
+    let mut next_probe = Instant::now();
+    let mut catch_up: Option<CatchUp> = None;
     loop {
         if *shutdown.borrow() || *cancel.borrow() {
             break;
+        }
+        if let Some(cu) = catch_up.as_mut() {
+            expire(&mut fetcher, &mut cu.fps, &mut waiting);
+            let mut close = cu.fps.is_empty();
+            if !close {
+                let fps: Vec<Fingerprint> = cu.fps.iter().map(|(fp, _)| *fp).collect();
+                match cu.scan {
+                    None => {
+                        let result = tokio::select! {
+                            _ = cancelled(&mut shutdown, &mut cancel) => break,
+                            r = fetcher.catch_up_first_lines(&fps, cu.probe_after, cu.ceiling) => r,
+                        };
+                        match result {
+                            Ok(first) => match first.iter().map(|(_, ts)| *ts).min() {
+                                Some(min_first) => {
+                                    cu.scan = Some(ScanState::new(min_first.saturating_sub(1)));
+                                }
+                                None => close = true,
+                            },
+                            Err(e) => {
+                                fail(&shared, e);
+                                break;
+                            }
+                        }
+                    }
+                    Some(mut scan) => {
+                        let (lower, lower_ts) = scan.lower();
+                        let upper = cu.ceiling.ts().min(lower_ts.saturating_add(cfg.slice_ns));
+                        let result = tokio::select! {
+                            _ = cancelled(&mut shutdown, &mut cancel) => break,
+                            r = fetcher.catch_up(&fps, lower, upper, cu.ceiling, cfg.fetch_limit) => r,
+                        };
+                        let caught = match result {
+                            Ok(caught) => caught,
+                            Err(e) => {
+                                fail(&shared, e);
+                                break;
+                            }
+                        };
+                        cu.fetched.extend(caught.fetched_fps);
+                        let exhausted = scan.observe(&caught.page, upper, cfg.fetch_limit);
+                        push_page(&shared, caught.page.streams);
+                        if !exhausted {
+                            cu.scan = Some(scan);
+                        } else if upper >= cu.ceiling.ts() {
+                            close = true;
+                        } else {
+                            cu.probe_after = upper;
+                            cu.scan = None;
+                        }
+                    }
+                }
+            }
+            if !close {
+                // No idle sleep while a catch-up is open.
+                continue;
+            }
+            // Closing: admit the streams a page fetched from; the rest
+            // stay waiting with their deadlines, and the next recheck
+            // waits for its timer.
+            if let Some(cu) = catch_up.take() {
+                let admitted: Vec<Fingerprint> = cu
+                    .fps
+                    .iter()
+                    .map(|(fp, _)| *fp)
+                    .filter(|fp| cu.fetched.contains(fp))
+                    .collect();
+                if !admitted.is_empty() {
+                    fetcher.admit(&admitted);
+                    waiting.retain(|(fp, _)| !admitted.contains(fp));
+                }
+            }
+        } else if !waiting.is_empty() {
+            let mut all = std::mem::take(&mut waiting);
+            expire(&mut fetcher, &mut all, &mut waiting);
+            waiting = all;
+            if !waiting.is_empty() && Instant::now() >= next_probe {
+                let ceiling = TailCeiling::of(state.lower().0);
+                let fps: Vec<Fingerprint> = waiting.iter().map(|(fp, _)| *fp).collect();
+                let result = tokio::select! {
+                    _ = cancelled(&mut shutdown, &mut cancel) => break,
+                    r = fetcher.catch_up_first_lines(&fps, cfg.start_ns, ceiling) => r,
+                };
+                next_probe = Instant::now() + cfg.poll_interval;
+                match result {
+                    Ok(first) => {
+                        if let Some(min_first) = first.iter().map(|(_, ts)| *ts).min() {
+                            let found: BTreeSet<Fingerprint> =
+                                first.iter().map(|(fp, _)| *fp).collect();
+                            catch_up = Some(CatchUp {
+                                fps: waiting
+                                    .iter()
+                                    .filter(|(fp, _)| found.contains(fp))
+                                    .copied()
+                                    .collect(),
+                                ceiling,
+                                probe_after: cfg.start_ns,
+                                scan: Some(ScanState::new(min_first.saturating_sub(1))),
+                                fetched: BTreeSet::new(),
+                            });
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        fail(&shared, e);
+                        break;
+                    }
+                }
+            }
         }
         let now = params::now_ns();
         let horizon = now.saturating_sub(cfg.delay_ns);
@@ -792,17 +947,24 @@ async fn producer_loop<F: TailFetcher>(
             _ = cancelled(&mut shutdown, &mut cancel) => break,
             r = fetcher.poll(lower, upper, narrow, cfg.fetch_limit) => r,
         };
-        let page = match result {
+        let mut page = match result {
             Ok(page) => page,
             Err(e) => {
                 // Fatal poll failure (e.g. a broad selector tripping the
                 // stream cap): hand the reason to the writer, which
                 // closes the socket with it.
-                shared.lock().error = Some(e.to_string());
-                shared.notify.notify_one();
+                fail(&shared, e);
                 break;
             }
         };
+        // Read after the poll has returned, so a slow poll does not use up
+        // a joined stream's time.
+        let deadline = Instant::now() + recheck;
+        waiting.extend(
+            std::mem::take(&mut page.joined)
+                .into_iter()
+                .map(|fp| (fp, deadline)),
+        );
         // This poll's stage-1 COMPLETED; if it started at dwell >= grace
         // it was the qualifying full-span scan (narrow was false when it
         // ran) — narrowing is permitted from the NEXT refresh only.
@@ -810,10 +972,7 @@ async fn producer_loop<F: TailFetcher>(
             qualifying_scan_done = true;
         }
         let exhausted = state.observe(&page, upper, cfg.fetch_limit);
-        if page.streams.iter().any(|s| !s.entries.is_empty()) {
-            shared.lock().push_evicting(page.streams);
-            shared.notify.notify_one();
-        }
+        push_page(&shared, page.streams);
         // Caught up ⇒ idle for one poll interval; otherwise (full page,
         // or more backlog slices ahead) re-poll immediately.
         if exhausted
@@ -824,6 +983,58 @@ async fn producer_loop<F: TailFetcher>(
         }
     }
     let _ = cancel_tx.send(true);
+}
+
+/// One open catch-up (issue #804): the streams it reads, each with its
+/// deadline, up to `ceiling`, the main scan's position when it opened.
+struct CatchUp {
+    fps: Vec<(Fingerprint, Instant)>,
+    ceiling: TailCeiling,
+    /// The probe's lower bound.
+    probe_after: i64,
+    /// `None`: the probe runs next.
+    scan: Option<ScanState>,
+    /// Every stream a page fetched a row from.
+    fetched: BTreeSet<Fingerprint>,
+}
+
+/// Run before every probe and every catch-up page (issue #804): admits the
+/// entries of `list` whose deadline has passed, at the main scan's current
+/// position, and removes them from `list` and from `waiting`. Their lines
+/// below that position that no read started before the deadline read are
+/// never sent.
+fn expire<F: TailFetcher>(
+    fetcher: &mut F,
+    list: &mut Vec<(Fingerprint, Instant)>,
+    waiting: &mut Vec<(Fingerprint, Instant)>,
+) {
+    let now = Instant::now();
+    let expired: Vec<Fingerprint> = list
+        .iter()
+        .filter(|(_, deadline)| *deadline <= now)
+        .map(|(fp, _)| *fp)
+        .collect();
+    if expired.is_empty() {
+        return;
+    }
+    fetcher.admit(&expired);
+    list.retain(|(fp, _)| !expired.contains(fp));
+    waiting.retain(|(fp, _)| !expired.contains(fp));
+}
+
+/// Queues a page's streams for the writer, when any carries an entry.
+fn push_page(shared: &Shared, streams: Vec<StreamResult>) {
+    if streams.iter().any(|s| !s.entries.is_empty()) {
+        shared.lock().push_evicting(streams);
+        shared.notify.notify_one();
+    }
+}
+
+/// A fatal read failure: hands the reason to the writer, which closes the
+/// socket with it.
+fn fail(shared: &Shared, e: ReadError) {
+    shared.lock().error = Some(e.to_string());
+    shared.notify.notify_one();
 }
 
 /// The dedicated inbound-reader task (review round 1, medium): waits for
@@ -2673,7 +2884,7 @@ mod tests {
             .take(4)
             .collect();
         let ceiling = TailCeiling::AtOrBelow(u2);
-        let want = vec![
+        let want = [
             Call::FirstLines {
                 fps: vec![fpn(2)],
                 after: start,
@@ -2704,6 +2915,8 @@ mod tests {
         let mut cfg = test_cfg();
         cfg.fetch_limit = 2;
         cfg.slice_ns = 2 * MS;
+        // Five frames arrive back to back; a depth of 4 could evict one.
+        cfg.channel_depth = 64;
         let start = cfg.start_ns;
         let c = TailCursor {
             tuple: (start + MS, fpn(2), 0),

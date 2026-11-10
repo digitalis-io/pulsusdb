@@ -1227,15 +1227,23 @@ pub fn stage3_keyset_with_rx(
     sql
 }
 
-/// S4 of the live tail (issue #804).
+/// S4 of the live tail (issue #804): each stream in `fingerprints` that
+/// has a line in `window`, with its earliest timestamp. It reads only the
+/// `fingerprint` and `timestamp_ns` columns of those streams' granules.
 pub fn tail_first_lines(
-    _tenant: &Tenant,
-    _samples_table: &str,
-    _services: &[CheckedLiteral],
-    _fingerprints: &[FpLiteral],
-    _window: TimeWindow,
+    tenant: &Tenant,
+    samples_table: &str,
+    services: &[CheckedLiteral],
+    fingerprints: &[FpLiteral],
+    window: TimeWindow,
 ) -> String {
-    String::new()
+    let t = tenant.sql_literal();
+    let service_pred = service_predicate(services);
+    let fp_list = fp_list(fingerprints);
+    let TimeWindow { start_ns, end_ns } = window;
+    format!(
+        "SELECT fingerprint, min(timestamp_ns) AS first_ns\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE org_id = {t} AND fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}\nGROUP BY fingerprint"
+    )
 }
 
 /// The `/api/logs/v1/stats` rollup-served aggregation (issue #74, no line

@@ -17,7 +17,7 @@ use super::pipeline::{CompiledPipeline, ParentSum};
 use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, StreamsPlan};
 use super::predicate::{BucketGridRefusal, CheckedFragment, CheckedLiteral};
 use super::rows::{
-    DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricInstantRow,
+    DetectedLabelRow, FirstLineRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricInstantRow,
     MetricRangeBucketRow, MetricRangeJsonRow, MetricRangeLogfmtRow, MetricRangeRegexpRow,
     MetricReducedRow, MetricScanRow, MetricScanRxRow, PatternFetchRow, SampleRow, SampleRxRow,
     StreamMetaRow, StreamRow, TailSampleRow, TailSampleRxRow, VolumeRow,
@@ -3194,16 +3194,24 @@ pub enum TailCeiling {
 }
 
 impl TailCeiling {
-    pub fn of(_lower: TailLower) -> Self {
-        Self::AtOrBelow(i64::MIN)
+    pub fn of(lower: TailLower) -> Self {
+        match lower {
+            TailLower::Start { start_ns } => Self::AtOrBelow(start_ns),
+            TailLower::After(c) => Self::Before(c.tuple.0, c.tuple.1),
+        }
     }
 
     pub fn ts(self) -> i64 {
-        i64::MIN
+        match self {
+            Self::AtOrBelow(t) | Self::Before(t, _) => t,
+        }
     }
 
-    pub fn admits(self, _ts: i64, _fp: Fingerprint) -> bool {
-        false
+    pub fn admits(self, ts: i64, fp: Fingerprint) -> bool {
+        match self {
+            Self::AtOrBelow(t) => ts <= t,
+            Self::Before(t, f) => (ts, fp) < (t, f),
+        }
     }
 }
 
@@ -3226,7 +3234,8 @@ pub struct TailPage {
     pub next: Option<TailCursor>,
     pub fetched: u32,
     /// The streams whose labels this poll read for the first time and
-    /// which are not in the stage-3 list, sorted (issue #804).
+    /// which are not in the stage-3 list, sorted (issue #804). Empty on
+    /// the first window, where those streams go straight into the list.
     pub joined: Vec<Fingerprint>,
 }
 
@@ -3243,10 +3252,15 @@ pub struct TailPage {
 /// the writer's retry constants) — deliberately not an env/config/request
 /// knob (a knob would invite masking #134-class failures with unbounded
 /// read-side rescans; reconnect is the existing, no-knob remedy).
+/// Once stage 1 is narrowed, a full-span stage 1 also runs once per GRACE of
+/// cursor time, so a registration readable later than GRACE is still found
+/// (issue #804).
 pub const TAIL_REGISTRATION_GRACE_NS: i64 = 3_600_000_000_000;
 
-/// How long a joined stream may be caught up before it is admitted without
-/// the rest (issue #804).
+/// How long, on a monotonic clock from the return of its joining poll, a
+/// stream whose labels are readable may be read for lines the tail has
+/// passed before it is admitted without the rest (issue #804). A documented
+/// constant, not a knob, for the same reason as `TAIL_REGISTRATION_GRACE_NS`.
 pub const TAIL_CATCH_UP_RECHECK_NS: i64 = 60_000_000_000;
 
 /// The per-connection tail setup (issue #74): the streams plan and the
@@ -3285,8 +3299,9 @@ pub const TAIL_CATCH_UP_RECHECK_NS: i64 = 60_000_000_000;
 ///   ingest-side atomicity/backfill remedy).
 /// - `M ∈ U`: every registration into `M` visible by
 ///   `end(M) + delay + GRACE` is caught by some full-span or in-band scan
-///   and cached permanently; every MISSED registration is provably later
-///   than that bound (issue #134 residual class (ii)). The floor's clamp
+///   and cached permanently; a registration visible later is found by the
+///   full-span stage 1 that a narrowed connection runs once per GRACE of
+///   cursor time, and its stream is then caught up (issue #804). The floor's clamp
 ///   arm (`scan_floor_ns` never drops below `s`) never excludes a
 ///   universe month — only the `lower_ns - GRACE` arm can, and only once
 ///   it has advanced past `s`.
@@ -3304,6 +3319,14 @@ pub const TAIL_CATCH_UP_RECHECK_NS: i64 = 60_000_000_000;
 /// obeys (reject, not silently truncate). These fields are only ever
 /// constructed by [`LogQlEngine::tail_setup`], so `TailSetup`'s public
 /// re-export surface is unchanged.
+///
+/// Stage 3 reads only the streams admitted to it (issue #804): `hydrated`
+/// holds the labels of every stream kept for this connection, never removed
+/// and never re-read; `deliverable` is the sorted list of admitted streams,
+/// stage 3's `IN` list; `last_full_scan_lower_ns` is the lower bound of the
+/// last committed poll whose stage 1 covered every month from `start`.
+/// [`TailSetup::admit`] is the producer's, after the catch-up read that
+/// justifies it.
 #[derive(Debug)]
 pub struct TailSetup {
     pub plan: StreamsPlan,
@@ -3330,40 +3353,20 @@ pub struct TailSetup {
     /// #463) — the tail's whole lifetime, since the header is read once
     /// at upgrade and a WebSocket has no per-frame request.
     opts: ResponseOptions,
+    /// Labels of every stream kept for this connection (issue #804).
     hydrated: HashMap<Fingerprint, StreamMetaRow>,
+    /// Admitted streams, sorted: stage 3's `IN` list (issue #804).
     deliverable: Vec<Fingerprint>,
+    /// Lower bound of the last committed poll whose stage 1 covered every
+    /// month from `start` (issue #804).
     last_full_scan_lower_ns: i64,
 }
 
 impl TailSetup {
     /// The producer admits these streams to stage 3 (their catch-up, if any, is done).
-    pub fn admit(&mut self, _fps: &[Fingerprint]) {}
-}
-
-/// One poll's reads, held until [`commit_tail_attempt`] keeps them (issue
-/// #804).
-#[derive(Debug)]
-pub struct TailAttempt {
-    page: TailPage,
-    added: Vec<Fingerprint>,
-    labels: HashMap<Fingerprint, StreamMetaRow>,
-    joined: Vec<Fingerprint>,
-    first_window: bool,
-    full_scan: bool,
-    lower_ns: i64,
-}
-
-/// Keeps what an accepted [`TailAttempt`] read (issue #804).
-pub fn commit_tail_attempt(_setup: &mut TailSetup, attempt: TailAttempt) -> TailPage {
-    let _ = (
-        &attempt.added,
-        &attempt.labels,
-        &attempt.joined,
-        attempt.first_window,
-        attempt.full_scan,
-        attempt.lower_ns,
-    );
-    attempt.page
+    pub fn admit(&mut self, fps: &[Fingerprint]) {
+        merge_resolved(&mut self.deliverable, fps);
+    }
 }
 
 /// Whether a `/stats` pipeline is fully served by pushdown aggregation: a
@@ -4450,10 +4453,13 @@ impl LogQlEngine {
     /// revision): re-resolves stage-1 over the (now month-narrowed)
     /// `setup.plan`, MERGES the result into `setup.resolved` (the
     /// cumulative cache — see [`TailSetup`]'s doc for why this is
-    /// data-loss-free despite the narrowed month window), hydrates and
-    /// fetches one keyset page over the cached union, and runs the SAME
-    /// `CompiledPipeline` the query path runs. The cursor advances past
-    /// every *fetched* row (pipeline-dropped lines never re-fetch).
+    /// data-loss-free despite the narrowed month window), hydrates the
+    /// streams whose labels are not yet held, and fetches one keyset page
+    /// over the admitted streams, running the SAME `CompiledPipeline` the
+    /// query path runs. The cursor advances past every *fetched* row
+    /// (pipeline-dropped lines never re-fetch). Stage 3 reads admitted
+    /// streams; everything the poll learns is kept only when it succeeds
+    /// (`commit_tail_attempt`).
     pub async fn tail_poll(
         &self,
         setup: &mut TailSetup,
@@ -4461,30 +4467,199 @@ impl LogQlEngine {
         upper_ns: i64,
         fetch_limit: u32,
     ) -> Result<TailPage, ReadError> {
+        let attempt = self
+            .tail_attempt(&*setup, lower, upper_ns, fetch_limit)
+            .await?;
+        Ok(commit_tail_attempt(setup, attempt))
+    }
+
+    /// One poll's reads, against committed state only (issue #804): the
+    /// result is kept by [`commit_tail_attempt`], so a poll that fails
+    /// part-way keeps nothing it learned.
+    pub async fn tail_attempt(
+        &self,
+        setup: &TailSetup,
+        lower: TailLower,
+        upper_ns: i64,
+        fetch_limit: u32,
+    ) -> Result<TailAttempt, ReadError> {
         let prev = match lower {
             TailLower::After(c) => Some(c),
             TailLower::Start { .. } => None,
         };
-        let new_fps = self.resolve_fingerprints(&setup.plan.stage1_sql).await?;
-        merge_resolved(&mut setup.resolved, &new_fps);
-        check_stream_cap(setup.resolved.len(), self.config.max_streams)?;
-        if setup.resolved.is_empty() {
-            return Ok(TailPage {
+        let lower_ns = match lower {
+            TailLower::Start { start_ns } => start_ns,
+            TailLower::After(c) => c.tuple.0,
+        };
+        let start = spec_start_ns(&setup.base_params.spec);
+        let first_window = matches!(lower, TailLower::Start { start_ns } if start_ns == start);
+        let plan_full = setup.covered_months.0 == plan::year_month(start);
+        let sweep = !plan_full
+            && lower_ns.saturating_sub(setup.last_full_scan_lower_ns) >= TAIL_REGISTRATION_GRACE_NS;
+        let mut found = self.resolve_fingerprints(&setup.plan.stage1_sql).await?;
+        if sweep {
+            let sql = self.full_span_stage1(setup, start, upper_ns.max(lower_ns))?;
+            found.extend(self.resolve_fingerprints(&sql).await?);
+            found.sort_unstable();
+            found.dedup();
+        }
+        let added: Vec<Fingerprint> = found
+            .into_iter()
+            .filter(|fp| setup.resolved.binary_search(fp).is_err())
+            .collect();
+        check_stream_cap(setup.resolved.len() + added.len(), self.config.max_streams)?;
+        let mut pending: Vec<Fingerprint> = setup
+            .resolved
+            .iter()
+            .chain(&added)
+            .filter(|fp| !setup.hydrated.contains_key(fp))
+            .copied()
+            .collect();
+        pending.sort_unstable();
+        let labels = if pending.is_empty() {
+            HashMap::new()
+        } else {
+            self.hydrate(&setup.plan.streams_table, &pending).await?
+        };
+        let mut joined: Vec<Fingerprint> = labels.keys().copied().collect();
+        joined.sort_unstable();
+        // First window: nothing has been passed, so the new streams need no
+        // catch-up and are read here. `setup.hydrated` is empty then (no
+        // poll has committed), so `labels` is the map.
+        let (meta, fps): (&HashMap<Fingerprint, StreamMetaRow>, &[Fingerprint]) =
+            if first_window && !joined.is_empty() {
+                debug_assert!(setup.deliverable.is_empty());
+                (&labels, &joined)
+            } else {
+                (&setup.hydrated, &setup.deliverable)
+            };
+        let page = if fps.is_empty() {
+            TailPage {
                 streams: Vec::new(),
                 next: prev,
                 fetched: 0,
                 joined: Vec::new(),
-            });
+            }
+        } else {
+            self.tail_fetch(setup, meta, fps, lower, upper_ns, fetch_limit, None)
+                .await?
+                .page
+        };
+        Ok(TailAttempt {
+            page,
+            added,
+            labels,
+            joined,
+            first_window,
+            full_scan: plan_full || sweep,
+            lower_ns,
+        })
+    }
+
+    /// Stage 1 over every month from `start` to `hi`, built by
+    /// [`plan::plan`] as `refresh_tail_months` builds it — no I/O.
+    fn full_span_stage1(
+        &self,
+        setup: &TailSetup,
+        start: i64,
+        hi: i64,
+    ) -> Result<String, ReadError> {
+        let mut qp = setup.base_params;
+        if let QuerySpec::Range {
+            start_ns, end_ns, ..
+        } = &mut qp.spec
+        {
+            *start_ns = start;
+            *end_ns = hi;
         }
-        // The full cumulative cache — not just this poll's narrow stage-1
-        // result — feeds stage-2 hydration and the stage-3 fetch (issue
-        // #94: the orphan-cache mechanism). A shared borrow, not a clone:
-        // `setup` is not mutated again before this borrow's last use.
-        let fingerprints = &setup.resolved;
-        let meta = self
-            .hydrate(&setup.plan.streams_table, fingerprints)
+        match plan::plan(&setup.expr, &qp, &self.config.plan_ctx(&self.tenant))? {
+            Plan::Streams(sp) => Ok(sp.stage1_sql),
+            Plan::Metric(_) | Plan::MetricBinary(_) => Err(ReadError::PipelineInvalid {
+                reason: "tail requires a log stream query (metric queries cannot be tailed)"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// S5 (issue #804): one catch-up step over `fps`, `lower`..`upper_ns`,
+    /// rows outside `ceiling` dropped.
+    pub async fn tail_catch_up(
+        &self,
+        setup: &TailSetup,
+        fps: &[Fingerprint],
+        lower: TailLower,
+        upper_ns: i64,
+        ceiling: TailCeiling,
+        fetch_limit: u32,
+    ) -> Result<CatchUpPage, ReadError> {
+        self.tail_fetch(
+            setup,
+            &setup.hydrated,
+            fps,
+            lower,
+            upper_ns,
+            fetch_limit,
+            Some(ceiling),
+        )
+        .await
+    }
+
+    /// S4 (issue #804): each of `fps` that has a line in
+    /// `(after_ns, ceiling.ts()]`, with its earliest one, sorted.
+    pub async fn tail_first_lines(
+        &self,
+        setup: &TailSetup,
+        fps: &[Fingerprint],
+        after_ns: i64,
+        ceiling: TailCeiling,
+    ) -> Result<Vec<(Fingerprint, i64)>, ReadError> {
+        let sql = super::sql::tail_first_lines(
+            &self.tenant,
+            &setup.plan.samples_table,
+            &distinct_escaped_services(&setup.hydrated),
+            &sql_literals(fps),
+            super::sql::TimeWindow {
+                start_ns: after_ns,
+                end_ns: ceiling.ts(),
+            },
+        );
+        let mut out = Vec::new();
+        let mut stream = self
+            .query_stream::<FirstLineRow>(&sql, &self.budget_settings())
             .await?;
-        let services = distinct_escaped_services(&meta);
+        while let Some(row) = stream.next().await {
+            let row = row.map_err(|e| {
+                map_read_error(
+                    e,
+                    self.config.scan_budget_bytes,
+                    self.config.read_max_memory_bytes,
+                )
+            })?;
+            out.push((row.fingerprint, row.first_ns));
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// One keyset page over `fps` with the labels in `meta` (issue #74;
+    /// issue #804 made the list and the map arguments). `ceiling`, when
+    /// set, drops every row the main scan has not passed.
+    #[allow(clippy::too_many_arguments)]
+    async fn tail_fetch(
+        &self,
+        setup: &TailSetup,
+        meta: &HashMap<Fingerprint, StreamMetaRow>,
+        fingerprints: &[Fingerprint],
+        lower: TailLower,
+        upper_ns: i64,
+        fetch_limit: u32,
+        ceiling: Option<TailCeiling>,
+    ) -> Result<CatchUpPage, ReadError> {
+        let prev = match lower {
+            TailLower::After(c) => Some(c),
+            TailLower::Start { .. } => None,
+        };
+        let services = distinct_escaped_services(meta);
 
         // Tail is forward-only (oldest→newest); `KeysetLower::First`
         // carries the API `start` bound in the window, later pages carry
@@ -4532,8 +4707,9 @@ impl LogQlEngine {
         // now charged and chunked as they arrive, and the cursor walks
         // the raw page incrementally through the same
         // [`TailCursorTracker`] the paged loops use.
-        let mut acc = StreamAccumulator::with_opts(&meta, fetch_limit, setup.opts);
+        let mut acc = StreamAccumulator::with_opts(meta, fetch_limit, setup.opts);
         let mut tracker = TailCursorTracker::new();
+        let mut fetched_fps: BTreeSet<Fingerprint> = BTreeSet::new();
         {
             // Scoped: the row stream holds its pooled connection until
             // dropped (the `ChRowStream` lease rule).
@@ -4553,6 +4729,10 @@ impl LogQlEngine {
                     )
                 })?;
                 tracker.observe(row.timestamp_ns, row.fingerprint, row.body_hash);
+                fetched_fps.insert(row.fingerprint);
+                if ceiling.is_some_and(|c| !c.admits(row.timestamp_ns, row.fingerprint)) {
+                    continue; // past the main scan's lower bound: the main scan delivers it
+                }
                 acc.push_row(
                     SampleRow {
                         fingerprint: row.fingerprint,
@@ -4568,46 +4748,51 @@ impl LogQlEngine {
         acc.flush_chunk(&setup.compiled)?;
         let (next, fetched) = tracker.finish(prev);
         let streams = acc.into_streams();
-        Ok(TailPage {
-            streams,
-            next,
-            fetched,
-            joined: Vec::new(),
-        })
-    }
-
-    /// S5 (issue #804): one catch-up step over `fps`.
-    pub async fn tail_catch_up(
-        &self,
-        _setup: &TailSetup,
-        _fps: &[Fingerprint],
-        _lower: TailLower,
-        _upper_ns: i64,
-        _ceiling: TailCeiling,
-        _fetch_limit: u32,
-    ) -> Result<CatchUpPage, ReadError> {
         Ok(CatchUpPage {
             page: TailPage {
-                streams: Vec::new(),
-                next: None,
-                fetched: 0,
+                streams,
+                next,
+                fetched,
                 joined: Vec::new(),
             },
-            fetched_fps: Vec::new(),
+            fetched_fps: fetched_fps.into_iter().collect(),
         })
     }
+}
 
-    /// S4 (issue #804): each of `fps` that has a line in
-    /// `(after_ns, ceiling.ts()]`, with its earliest one, sorted.
-    pub async fn tail_first_lines(
-        &self,
-        _setup: &TailSetup,
-        _fps: &[Fingerprint],
-        _after_ns: i64,
-        _ceiling: TailCeiling,
-    ) -> Result<Vec<(Fingerprint, i64)>, ReadError> {
-        Ok(Vec::new())
+/// One poll's reads, held until [`commit_tail_attempt`] keeps them (issue
+/// #804).
+#[derive(Debug)]
+pub struct TailAttempt {
+    page: TailPage,
+    /// Resolved, not yet in `setup.resolved`; sorted.
+    added: Vec<Fingerprint>,
+    /// Read by this poll's stage 2.
+    labels: HashMap<Fingerprint, StreamMetaRow>,
+    /// `labels`' keys, sorted.
+    joined: Vec<Fingerprint>,
+    /// The lower bound is the setup start.
+    first_window: bool,
+    full_scan: bool,
+    lower_ns: i64,
+}
+
+/// Keeps what an accepted [`TailAttempt`] read (issue #804) and returns its
+/// page. On the first window the joined streams are admitted with it;
+/// otherwise they are reported in [`TailPage::joined`] for a catch-up.
+pub fn commit_tail_attempt(setup: &mut TailSetup, attempt: TailAttempt) -> TailPage {
+    merge_resolved(&mut setup.resolved, &attempt.added);
+    setup.hydrated.extend(attempt.labels);
+    if attempt.full_scan {
+        setup.last_full_scan_lower_ns = setup.last_full_scan_lower_ns.max(attempt.lower_ns);
     }
+    let mut page = attempt.page;
+    if attempt.first_window {
+        merge_resolved(&mut setup.deliverable, &attempt.joined);
+    } else {
+        page.joined = attempt.joined;
+    }
+    page
 }
 
 /// The `start` bound of a [`QuerySpec`] (the `at` instant for an instant
