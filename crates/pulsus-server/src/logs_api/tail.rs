@@ -23,22 +23,18 @@
 //! occurrence-count keyset tuple) moves only on fetched rows and resumes
 //! a `LIMIT`-split tie group exactly-once via the SQL `OFFSET`.
 //!
-//! **Topology** (plan v3 D3/D4): a producer task (poll loop) and the
-//! socket-owning writer are joined by a bounded evicting [`FrameBuf`] —
-//! saturation (a client not draining) evicts the OLDEST frame into a
-//! persistent cumulative drop accumulator, reported on the wire as a
-//! capped `dropped_entries` sample plus the exact `dropped_total`. A
-//! shared two-way `watch` cancellation (process shutdown + per-connection
-//! cancel) races EVERY await — engine polls, Text sends (additionally
-//! bounded by `tail_send_timeout`), and the best-effort Close — so
-//! neither a wedged ClickHouse read nor a non-reading client can stall
-//! graceful shutdown. Either task's exit cancels its sibling; the writer
-//! joins the producer and owns the connection-slot permit for the
-//! socket's lifetime.
+//! **Topology** (issue #806): A producer task sends pages and a fatal
+//! error, in order, over one channel to the writer, which alone owns the
+//! frame queue (bounded, evicting the oldest into a drop accumulator), the
+//! error, the shutdown drain and the socket. The writer's decisions are
+//! the pure `ConnState`; every socket step is preceded by its deadline
+//! check, and a Close is never sent after a Text that was handed over and
+//! is not known to be written. The reader only reports the client's close.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -48,6 +44,7 @@ use axum::extract::{RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 
+use futures::Sink;
 use pulsus_config::Config;
 use pulsus_logql::Expr;
 use pulsus_model::Fingerprint;
@@ -56,7 +53,7 @@ use pulsus_read::{
     StreamResult, TAIL_CATCH_UP_RECHECK_NS, TAIL_REGISTRATION_GRACE_NS, TailCeiling, TailLower,
     TailPage, TailSetup,
 };
-use tokio::sync::{Notify, watch};
+use tokio::sync::{mpsc, watch};
 
 use crate::app::AppState;
 
@@ -315,7 +312,7 @@ pub(crate) async fn tail(
         let (sink, stream) = socket.split();
         run_tail(
             fetcher,
-            AxumSender(sink),
+            SinkSender(sink),
             AxumReceiver(stream),
             cfg,
             shutdown,
@@ -516,45 +513,95 @@ fn may_fail_over<F: TailFetcher>(fetcher: &mut F, failed_over: &mut bool) -> boo
     }
 }
 
-/// The outbound half of the split socket — axum's `SplitSink` in
-/// production, a fake sink in the hermetic tests.
+/// The outbound half of the split socket, in the three steps of a Text
+/// send (issue #806): `ready`, `start`, `flush`. The writer checks the
+/// step's deadline before each, and marks a Text half sent from `start`
+/// until `flush` returns, so it never sends a Close that would first write
+/// the rest of it. [`SinkSender`] in production, a scripted socket in the
+/// tests.
 trait TailSender: Send + 'static {
-    fn send_text(&mut self, text: String) -> impl Future<Output = Result<(), ()>> + Send;
+    /// Waits until the socket can take a frame. Hands nothing over, so it
+    /// can be cancelled.
+    fn ready(&mut self) -> impl Future<Output = Result<(), ()>> + Send;
+    /// Hands a Text frame to the socket. From the call on, the frame may be
+    /// wholly or partly handed over, whatever this returns.
+    fn start(&mut self, text: String) -> Result<(), ()>;
+    /// Writes what was handed over.
+    fn flush(&mut self) -> impl Future<Output = Result<(), ()>> + Send;
     /// Takes the ALREADY-RENDERED close frame (issue #240 re-review):
     /// `writer_loop` maps the reason through [`error_close_frame`]
     /// BEFORE this boundary, so the hermetic sender fake captures the
     /// frame the production wiring produced — the render seam is
     /// pinned, and the impls are pure transport with no rendering
-    /// decision left to bypass.
-    fn send_close(&mut self, frame: Option<CloseFrame>) -> impl Future<Output = ()> + Send;
+    /// decision left to bypass. Nothing is handed over or written at or
+    /// after `deadline` (issue #806).
+    fn send_close(
+        &mut self,
+        frame: Option<CloseFrame>,
+        deadline: Instant,
+    ) -> impl Future<Output = ()> + Send;
 }
 
 /// The inbound half (review round 1, medium): a dedicated reader task
-/// awaits `closed()` INDEPENDENTLY of the writer, so a client Close (or
-/// transport error) reaches the shared cancellation even while the
-/// writer sits inside a backpressured `send_text` — the in-flight send
-/// is then cancelled via the watch, releasing the producer and the
-/// connection permit immediately instead of after `tail_send_timeout`.
+/// awaits `closed()` independently of the writer, so a client Close (or
+/// transport error) sets the cancellation even while the writer waits on
+/// a backpressured socket step, which then stops, releasing the producer
+/// and the connection permit at once instead of after
+/// `tail_send_timeout`.
 trait TailReceiver: Send + 'static {
     /// Resolves when the client sent Close or the transport ended/errored
     /// (other inbound frames — ping/pong/text — are ignored).
     fn closed(&mut self) -> impl Future<Output = ()> + Send;
 }
 
-struct AxumSender(futures::stream::SplitSink<WebSocket, Message>);
+/// The production sender over any WebSocket `Sink` (the socket's
+/// `SplitSink` in production). Every sink error becomes `Err(())`.
+struct SinkSender<S>(S);
 
-impl TailSender for AxumSender {
-    async fn send_text(&mut self, text: String) -> Result<(), ()> {
-        use futures::SinkExt;
-        self.0
-            .send(Message::Text(text.into()))
+impl<S: Sink<Message> + Unpin + Send + 'static> SinkSender<S> {
+    async fn ready_inner(&mut self) -> Result<(), ()> {
+        std::future::poll_fn(|cx| Pin::new(&mut self.0).poll_ready(cx))
             .await
             .map_err(|_| ())
     }
 
-    async fn send_close(&mut self, frame: Option<CloseFrame>) {
-        use futures::SinkExt;
-        let _ = self.0.send(Message::Close(frame)).await;
+    async fn flush_inner(&mut self) -> Result<(), ()> {
+        std::future::poll_fn(|cx| Pin::new(&mut self.0).poll_flush(cx))
+            .await
+            .map_err(|_| ())
+    }
+}
+
+impl<S: Sink<Message> + Unpin + Send + 'static> TailSender for SinkSender<S> {
+    async fn ready(&mut self) -> Result<(), ()> {
+        self.ready_inner().await
+    }
+
+    fn start(&mut self, text: String) -> Result<(), ()> {
+        Pin::new(&mut self.0)
+            .start_send(Message::Text(text.into()))
+            .map_err(|_| ())
+    }
+
+    async fn flush(&mut self) -> Result<(), ()> {
+        self.flush_inner().await
+    }
+
+    /// `ready`, `start_send(Close)`, then `flush`, as `SinkExt::send` does,
+    /// each step behind the clock: none is polled or started at or after
+    /// `deadline`.
+    async fn send_close(&mut self, frame: Option<CloseFrame>, deadline: Instant) {
+        if within(deadline, self.ready_inner()).await != Some(Ok(())) {
+            return;
+        }
+        if Instant::now() >= deadline
+            || Pin::new(&mut self.0)
+                .start_send(Message::Close(frame))
+                .is_err()
+        {
+            return;
+        }
+        let _ = within(deadline, self.flush_inner()).await;
     }
 }
 
@@ -639,9 +686,6 @@ struct FrameBuf {
     frames: VecDeque<Vec<StreamResult>>,
     dropped: DroppedAcc,
     cap: usize,
-    /// A fatal producer error (e.g. "query too broad" from a stream-cap
-    /// breach); the writer drains, then closes with this reason.
-    error: Option<String>,
 }
 
 impl FrameBuf {
@@ -654,7 +698,6 @@ impl FrameBuf {
                 cap: dropped_sample_cap,
             },
             cap,
-            error: None,
         }
     }
 
@@ -697,6 +740,7 @@ impl FrameBuf {
 
 /// One popped-but-not-yet-encoded frame: owned state moved out under the
 /// lock, encoded outside it.
+#[derive(Debug)]
 struct PoppedFrame {
     streams: Vec<StreamResult>,
     dropped: Vec<Dropped>,
@@ -714,19 +758,195 @@ impl PoppedFrame {
     }
 }
 
-struct Shared {
-    buf: Mutex<FrameBuf>,
-    notify: Notify,
+/// What the producer sends the writer, in order, over one channel (issue
+/// #806): pages, then at most one fatal error; the channel's close is the
+/// end.
+#[derive(Debug)]
+enum Event {
+    Page(Vec<StreamResult>),
+    Fatal(String),
 }
 
-impl Shared {
-    fn lock(&self) -> std::sync::MutexGuard<'_, FrameBuf> {
-        // Poison recovery: a panicked lock holder cannot corrupt a
-        // VecDeque of owned frames; continuing with the inner value is
-        // strictly better than cascading the panic through shutdown.
-        self.buf
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// What [`EventSource::try_next`] found.
+#[derive(Debug)]
+enum TryNext {
+    Event(Event),
+    Empty,
+    Closed,
+}
+
+/// The writer's input (issue #806): the producer's channel in production,
+/// a scripted source in the tests.
+trait EventSource: Send {
+    fn try_next(&mut self) -> TryNext;
+    fn next(&mut self) -> impl Future<Output = Option<Event>> + Send;
+}
+
+impl EventSource for mpsc::Receiver<Event> {
+    fn try_next(&mut self) -> TryNext {
+        match self.try_recv() {
+            Ok(ev) => TryNext::Event(ev),
+            Err(mpsc::error::TryRecvError::Empty) => TryNext::Empty,
+            Err(mpsc::error::TryRecvError::Disconnected) => TryNext::Closed,
+        }
+    }
+
+    fn next(&mut self) -> impl Future<Output = Option<Event>> + Send {
+        self.recv()
+    }
+}
+
+/// The writer's next step, decided by [`ConnState::decide`] (issue #806).
+#[derive(Debug)]
+enum Action {
+    Send {
+        frame: PoppedFrame,
+        deadline: Instant,
+    },
+    Wait {
+        until: Option<Instant>,
+    },
+    Close(Option<String>),
+    Drop,
+}
+
+/// The writer's state and decisions (issue #806), with no I/O.
+#[derive(Debug)]
+struct ConnState {
+    queue: FrameBuf,
+    fatal: Option<String>,
+    /// The channel closed (after `Fatal`, or the producer returned).
+    producer_done: bool,
+    drain_until: Option<Instant>,
+    /// The client closed, or a step failed or passed its deadline.
+    must_stop: bool,
+    /// A Text was handed to the sink and is not known to be written.
+    half_sent: bool,
+    send_timeout: Duration,
+}
+
+impl ConnState {
+    fn new(depth: usize, dropped_sample_cap: usize, send_timeout: Duration) -> Self {
+        ConnState {
+            queue: FrameBuf::new(depth, dropped_sample_cap),
+            fatal: None,
+            producer_done: false,
+            drain_until: None,
+            must_stop: false,
+            half_sent: false,
+            send_timeout,
+        }
+    }
+
+    /// An event from the producer; `None`: its channel closed. A page goes
+    /// into the queue, evicting the oldest frame past the depth.
+    fn on_event(&mut self, ev: Option<Event>) {
+        match ev {
+            Some(Event::Page(streams)) => self.queue.push_evicting(streams),
+            Some(Event::Fatal(reason)) => {
+                self.fatal = Some(reason);
+                self.producer_done = true;
+            }
+            None => self.producer_done = true,
+        }
+    }
+
+    /// Shutdown reached the connection: the drain ends `CLOSE_GRACE` after
+    /// it was first read.
+    fn on_shutdown(&mut self, now: Instant) {
+        if self.drain_until.is_none() {
+            self.drain_until = Some(now + CLOSE_GRACE);
+        }
+    }
+
+    fn on_must_stop(&mut self) {
+        self.must_stop = true;
+    }
+
+    fn on_handed_over(&mut self) {
+        self.half_sent = true;
+    }
+
+    fn on_written(&mut self) {
+        self.half_sent = false;
+    }
+
+    /// The next step. The first case that applies: the connection must
+    /// stop; the shutdown drain has run out; a queued frame is sent; the
+    /// producer is done; otherwise wait. Every end is a Close, unless a
+    /// Text is half sent, which drops the socket.
+    fn decide(&mut self, now: Instant) -> Action {
+        let end = |s: &mut Self, reason: Option<String>| {
+            if s.half_sent {
+                Action::Drop
+            } else {
+                Action::Close(reason)
+            }
+        };
+        if self.must_stop {
+            return end(self, None);
+        }
+        if self.drain_until.is_some_and(|d| now >= d) {
+            let reason = self.fatal.take();
+            return end(self, reason);
+        }
+        if let Some(frame) = self.queue.pop_next() {
+            let normal = now + self.send_timeout;
+            return Action::Send {
+                frame,
+                deadline: self.drain_until.map_or(normal, |d| normal.min(d)),
+            };
+        }
+        if self.producer_done {
+            let reason = self.fatal.take();
+            return end(self, reason);
+        }
+        Action::Wait {
+            until: self.drain_until,
+        }
+    }
+}
+
+/// Reads the inputs already visible into `st` before a decision (issue
+/// #806).
+#[allow(clippy::too_many_arguments)]
+fn observe_inputs<E: EventSource>(
+    st: &mut ConnState,
+    shutdown: &mut watch::Receiver<bool>,
+    shutdown_open: &mut bool,
+    cancel: &watch::Receiver<bool>,
+    src: &mut E,
+    rx_open: &mut bool,
+    now: Instant,
+) {
+    if *cancel.borrow() {
+        st.on_must_stop();
+    }
+    if *shutdown_open {
+        match shutdown.has_changed() {
+            // The sender is gone: that is shutdown too.
+            Err(_) => {
+                *shutdown_open = false;
+                st.on_shutdown(now);
+            }
+            Ok(_) => {
+                if *shutdown.borrow_and_update() {
+                    st.on_shutdown(now);
+                }
+            }
+        }
+    }
+    // At most one event per decision, so a source that is never empty
+    // cannot delay a decision.
+    if *rx_open {
+        match src.try_next() {
+            TryNext::Event(ev) => st.on_event(Some(ev)),
+            TryNext::Closed => {
+                *rx_open = false;
+                st.on_event(None);
+            }
+            TryNext::Empty => {}
+        }
     }
 }
 
@@ -844,11 +1064,10 @@ async fn sleep_or_cancelled(
 /// qualifying scan).
 async fn producer_loop<F: TailFetcher>(
     mut fetcher: F,
-    shared: Arc<Shared>,
+    events: mpsc::Sender<Event>,
     cfg: TailLoopConfig,
     mut shutdown: watch::Receiver<bool>,
     mut cancel: watch::Receiver<bool>,
-    cancel_tx: Arc<watch::Sender<bool>>,
 ) {
     let mut state = ScanState::new(cfg.start_ns);
     let mut live_since_ns: Option<i64> = None;
@@ -900,7 +1119,7 @@ async fn producer_loop<F: TailFetcher>(
                                 if may_fail_over(&mut fetcher, &mut failed_over.catch_up_probe) {
                                     continue;
                                 }
-                                fail(&shared, e);
+                                let _ = send_fatal(&events, e, &mut shutdown, &mut cancel).await;
                                 break;
                             }
                         }
@@ -924,13 +1143,17 @@ async fn producer_loop<F: TailFetcher>(
                                 if may_fail_over(&mut fetcher, &mut failed_over.catch_up_page) {
                                     continue;
                                 }
-                                fail(&shared, e);
+                                let _ = send_fatal(&events, e, &mut shutdown, &mut cancel).await;
                                 break;
                             }
                         };
                         cu.fetched.extend(caught.fetched_fps);
                         let exhausted = scan.observe(&caught.page, upper, cfg.fetch_limit);
-                        push_page(&shared, caught.page.streams);
+                        if !send_page(&events, caught.page.streams, &mut shutdown, &mut cancel)
+                            .await
+                        {
+                            break;
+                        }
                         if !exhausted {
                             cu.scan = Some(scan);
                         } else if upper >= cu.ceiling.ts() {
@@ -1014,7 +1237,7 @@ async fn producer_loop<F: TailFetcher>(
                         }
                     }
                     Err(e) => {
-                        fail(&shared, e);
+                        let _ = send_fatal(&events, e, &mut shutdown, &mut cancel).await;
                         break;
                     }
                 }
@@ -1072,7 +1295,7 @@ async fn producer_loop<F: TailFetcher>(
                 // Fatal poll failure (e.g. a broad selector tripping the
                 // stream cap, or a second server failure in a row): hand the
                 // reason to the writer, which closes the socket with it.
-                fail(&shared, e);
+                let _ = send_fatal(&events, e, &mut shutdown, &mut cancel).await;
                 break;
             }
         };
@@ -1096,7 +1319,9 @@ async fn producer_loop<F: TailFetcher>(
             qualifying_scan_done = true;
         }
         let exhausted = state.observe(&page, upper, cfg.fetch_limit);
-        push_page(&shared, page.streams);
+        if !send_page(&events, page.streams, &mut shutdown, &mut cancel).await {
+            break;
+        }
         // Caught up ⇒ idle for one poll interval; otherwise (full page,
         // or more backlog slices ahead) re-poll immediately.
         if exhausted
@@ -1107,7 +1332,8 @@ async fn producer_loop<F: TailFetcher>(
             break;
         }
     }
-    let _ = cancel_tx.send(true);
+    // Returning drops the event sender: the writer reads that as the
+    // end of the producer.
 }
 
 /// One open catch-up (issue #804): the streams it reads, each with its
@@ -1147,98 +1373,265 @@ fn expire<F: TailFetcher>(
     waiting.retain(|(fp, _)| !expired.contains(fp));
 }
 
-/// Queues a page's streams for the writer, when any carries an entry.
-fn push_page(shared: &Shared, streams: Vec<StreamResult>) {
-    if streams.iter().any(|s| !s.entries.is_empty()) {
-        shared.lock().push_evicting(streams);
-        shared.notify.notify_one();
+/// Sends a page's streams to the writer, when any carries an entry,
+/// racing shutdown and the cancellation (issue #806); `false` when the
+/// producer must stop.
+async fn send_page(
+    events: &mpsc::Sender<Event>,
+    streams: Vec<StreamResult>,
+    shutdown: &mut watch::Receiver<bool>,
+    cancel: &mut watch::Receiver<bool>,
+) -> bool {
+    if !streams.iter().any(|s| !s.entries.is_empty()) {
+        return true;
+    }
+    tokio::select! {
+        _ = cancelled(shutdown, cancel) => false,
+        r = events.send(Event::Page(streams)) => r.is_ok(),
     }
 }
 
-/// A fatal read failure: hands the reason to the writer, which closes the
-/// socket with it.
-fn fail(shared: &Shared, e: ReadError) {
-    shared.lock().error = Some(e.to_string());
-    shared.notify.notify_one();
+/// A fatal read failure: sends the reason to the writer, after every page
+/// sent before it, racing shutdown and the cancellation (issue #806).
+async fn send_fatal(
+    events: &mpsc::Sender<Event>,
+    e: ReadError,
+    shutdown: &mut watch::Receiver<bool>,
+    cancel: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        _ = cancelled(shutdown, cancel) => false,
+        r = events.send(Event::Fatal(e.to_string())) => r.is_ok(),
+    }
 }
 
-/// The dedicated inbound-reader task (review round 1, medium): waits for
-/// a client Close/transport end on the split stream and fires the shared
-/// cancellation — independent of the writer, so a Close lands even while
-/// a `send_text` is backpressured mid-flight.
+/// The inbound-reader task: waits for the client to close (a Close frame
+/// or the transport ending) and sets the cancellation then, and on
+/// nothing else. It stops when the writer sets the cancellation.
 async fn reader_loop<R: TailReceiver>(
     mut receiver: R,
-    mut shutdown: watch::Receiver<bool>,
     mut cancel: watch::Receiver<bool>,
     cancel_tx: Arc<watch::Sender<bool>>,
 ) {
     tokio::select! {
-        _ = cancelled(&mut shutdown, &mut cancel) => {}
-        _ = receiver.closed() => {}
+        _ = cancel.wait_for(|stop| *stop) => {}
+        _ = receiver.closed() => {
+            let _ = cancel_tx.send(true);
+        }
     }
-    let _ = cancel_tx.send(true);
 }
 
-async fn writer_loop<S: TailSender>(
+/// The writer's inputs, borrowed by its waits.
+struct Inputs<'a, E> {
+    st: &'a mut ConnState,
+    src: &'a mut E,
+    rx_open: &'a mut bool,
+    shutdown: &'a mut watch::Receiver<bool>,
+    shutdown_open: &'a mut bool,
+    cancel: &'a mut watch::Receiver<bool>,
+}
+
+impl<E: EventSource> Inputs<'_, E> {
+    /// A shutdown change: shutdown when the value is `true` or the sender
+    /// is gone.
+    fn on_shutdown_changed(&mut self, changed: Result<(), watch::error::RecvError>) {
+        let now = Instant::now();
+        match changed {
+            Err(_) => {
+                *self.shutdown_open = false;
+                self.st.on_shutdown(now);
+            }
+            Ok(()) => {
+                if *self.shutdown.borrow_and_update() {
+                    self.st.on_shutdown(now);
+                }
+            }
+        }
+    }
+
+    fn on_received(&mut self, ev: Option<Event>) {
+        if ev.is_none() {
+            *self.rx_open = false;
+        }
+        self.st.on_event(ev);
+    }
+
+    /// Runs one socket step until it ends or `deadline`. The order, in
+    /// every wait: the connection having to stop, the deadline, shutdown
+    /// (which lowers the deadline to the drain's), the step, then a
+    /// receive, taken only while the step is pending. `false`: the step
+    /// failed, was cancelled or ran out of time.
+    async fn step<F>(&mut self, fut: F, mut deadline: Instant) -> bool
+    where
+        F: Future<Output = Result<(), ()>>,
+    {
+        tokio::pin!(fut);
+        loop {
+            let (shutdown_open, rx_open) = (*self.shutdown_open, *self.rx_open);
+            let got = tokio::select! {
+                biased;
+                _ = self.cancel.wait_for(|stop| *stop) => Got::Stop,
+                _ = tokio::time::sleep_until(deadline) => Got::Stop,
+                changed = self.shutdown.changed(), if shutdown_open => Got::Shutdown(changed),
+                done = before(deadline, &mut fut) => done.map_or(Got::Stop, |r| Got::Step(r.is_ok())),
+                ev = self.src.next(), if rx_open => Got::Event(ev),
+            };
+            match got {
+                Got::Stop => return false,
+                Got::Step(ok) => return ok,
+                Got::Shutdown(changed) => {
+                    self.on_shutdown_changed(changed);
+                    if let Some(d) = self.st.drain_until {
+                        deadline = deadline.min(d);
+                    }
+                }
+                Got::Event(ev) => self.on_received(ev),
+                Got::Woke => {}
+            }
+        }
+    }
+
+    /// Waits for one input, or until `until`.
+    async fn wait(&mut self, until: Option<Instant>) {
+        let (shutdown_open, rx_open) = (*self.shutdown_open, *self.rx_open);
+        let got = tokio::select! {
+            biased;
+            _ = self.cancel.wait_for(|stop| *stop) => Got::Stop,
+            _ = sleep_until_some(until) => Got::Woke,
+            changed = self.shutdown.changed(), if shutdown_open => Got::Shutdown(changed),
+            ev = self.src.next(), if rx_open => Got::Event(ev),
+        };
+        match got {
+            Got::Stop => self.st.on_must_stop(),
+            Got::Shutdown(changed) => self.on_shutdown_changed(changed),
+            Got::Event(ev) => self.on_received(ev),
+            Got::Woke | Got::Step(_) => {}
+        }
+    }
+}
+
+/// Polls `fut` only while the clock is before `deadline`: `None` once it
+/// is not. The timer wakes on whole milliseconds and can still be pending
+/// just after the deadline, so the step is guarded by the clock itself.
+async fn before<F: Future + Unpin>(deadline: Instant, fut: &mut F) -> Option<F::Output> {
+    std::future::poll_fn(|cx| {
+        if Instant::now() >= deadline {
+            return std::task::Poll::Ready(None);
+        }
+        Pin::new(&mut *fut).poll(cx).map(Some)
+    })
+    .await
+}
+
+/// Runs `fut` until `deadline`, polling it only while the clock is before
+/// it; `None` when the deadline came first.
+async fn within<F: Future>(deadline: Instant, fut: F) -> Option<F::Output> {
+    tokio::pin!(fut);
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => None,
+        out = before(deadline, &mut fut) => out,
+    }
+}
+
+/// What ended one of the writer's waits.
+enum Got {
+    /// The connection must stop, or the step's deadline passed.
+    Stop,
+    /// The wait's own deadline.
+    Woke,
+    Shutdown(Result<(), watch::error::RecvError>),
+    Step(bool),
+    Event(Option<Event>),
+}
+
+/// Sleeps until `until`, or forever when there is none.
+async fn sleep_until_some(until: Option<Instant>) {
+    match until {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The writer (issue #806): the one owner of the frame queue, the fatal
+/// error, the shutdown drain and the socket. Each pass reads the inputs
+/// already visible, then carries out [`ConnState::decide`]'s decision.
+async fn writer_loop<S: TailSender, E: EventSource>(
     mut sender: S,
-    shared: Arc<Shared>,
+    mut src: E,
     cfg: TailLoopConfig,
     mut shutdown: watch::Receiver<bool>,
     mut cancel: watch::Receiver<bool>,
     cancel_tx: Arc<watch::Sender<bool>>,
 ) {
-    let mut close_reason: Option<String> = None;
-    'conn: loop {
-        // Drain every queued frame before waiting again (a Notify permit
-        // does not count queued items). State pops under the lock;
-        // ENCODING happens after the guard drops (review round 1, low).
-        loop {
-            let popped = shared.lock().pop_next();
-            let Some(popped) = popped else { break };
-            let text = popped.encode(&cfg.encoding_flags);
-            tokio::select! {
-                _ = cancelled(&mut shutdown, &mut cancel) => break 'conn,
-                sent = tokio::time::timeout(cfg.send_timeout, sender.send_text(text)) => {
-                    match sent {
-                        Ok(Ok(())) => {}
-                        // Send timeout (a client that stopped reading) or
-                        // transport error: disconnect.
-                        Ok(Err(())) | Err(_) => break 'conn,
-                    }
+    let mut st = ConnState::new(cfg.channel_depth, cfg.dropped_sample_cap, cfg.send_timeout);
+    let (mut shutdown_open, mut rx_open) = (true, true);
+    loop {
+        observe_inputs(
+            &mut st,
+            &mut shutdown,
+            &mut shutdown_open,
+            &cancel,
+            &mut src,
+            &mut rx_open,
+            Instant::now(),
+        );
+        let action = st.decide(Instant::now());
+        let mut inputs = Inputs {
+            st: &mut st,
+            src: &mut src,
+            rx_open: &mut rx_open,
+            shutdown: &mut shutdown,
+            shutdown_open: &mut shutdown_open,
+            cancel: &mut cancel,
+        };
+        match action {
+            Action::Drop => break,
+            Action::Close(reason) => {
+                // The error reason is rendered into the wire frame here,
+                // so every `TailSender` receives the production renderer's
+                // output (issue #240 re-review).
+                let frame = reason.map(error_close_frame);
+                let deadline = Instant::now() + CLOSE_GRACE;
+                let _ = within(deadline, sender.send_close(frame, deadline)).await;
+                break;
+            }
+            Action::Wait { until } => inputs.wait(until).await,
+            Action::Send { frame, deadline } => {
+                let text = frame.encode(&cfg.encoding_flags);
+                if !inputs.step(sender.ready(), deadline).await {
+                    inputs.st.on_must_stop();
+                    continue;
+                }
+                // A shutdown read while waiting for readiness lowers the
+                // deadline of what follows to the drain's.
+                let deadline = inputs.st.drain_until.map_or(deadline, |d| deadline.min(d));
+                // Checked immediately before handing over: nothing is
+                // handed over at or after a deadline.
+                if Instant::now() >= deadline || *inputs.cancel.borrow() {
+                    inputs.st.on_must_stop();
+                    continue;
+                }
+                inputs.st.on_handed_over();
+                if sender.start(text).is_err() {
+                    inputs.st.on_must_stop();
+                    continue;
+                }
+                if inputs.step(sender.flush(), deadline).await {
+                    inputs.st.on_written();
+                } else {
+                    inputs.st.on_must_stop();
                 }
             }
         }
-        if let Some(reason) = shared.lock().error.take() {
-            close_reason = Some(reason);
-            break;
-        }
-        if *shutdown.borrow() || *cancel.borrow() {
-            break;
-        }
-        tokio::select! {
-            _ = cancelled(&mut shutdown, &mut cancel) => break,
-            _ = shared.notify.notified() => {}
-        }
     }
-    // Whatever path broke the loop, a pending producer error is the close
-    // reason (the producer's cancel can win the select race against its
-    // own error notification).
-    if close_reason.is_none() {
-        close_reason = shared.lock().error.take();
-    }
-    // Cancel the siblings FIRST so they stop while the (bounded,
-    // best-effort) Close goes out. The error reason is rendered into
-    // the wire frame HERE, on the shared path, so every `TailSender`
-    // receives the production renderer's output (issue #240 re-review).
     let _ = cancel_tx.send(true);
-    let frame = close_reason.map(error_close_frame);
-    let _ = tokio::time::timeout(CLOSE_GRACE, sender.send_close(frame)).await;
 }
 
 /// Runs one tail connection to completion: spawns the producer and the
-/// inbound reader, runs the writer on the upgrade task, and joins both
-/// on the way out (any task's exit cancels the others via the shared
-/// watch).
+/// inbound reader, runs the writer on the upgrade task, and joins both on
+/// the way out. The writer sets the cancellation when it returns, which
+/// stops the other two.
 async fn run_tail<F: TailFetcher, S: TailSender, R: TailReceiver>(
     fetcher: F,
     sender: S,
@@ -1246,27 +1639,22 @@ async fn run_tail<F: TailFetcher, S: TailSender, R: TailReceiver>(
     cfg: TailLoopConfig,
     shutdown: watch::Receiver<bool>,
 ) {
-    let shared = Arc::new(Shared {
-        buf: Mutex::new(FrameBuf::new(cfg.channel_depth, cfg.dropped_sample_cap)),
-        notify: Notify::new(),
-    });
+    let (events, rx) = mpsc::channel(1);
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let cancel_tx = Arc::new(cancel_tx);
     let producer = tokio::spawn(producer_loop(
         fetcher,
-        Arc::clone(&shared),
+        events,
         cfg.clone(),
         shutdown.clone(),
         cancel_rx.clone(),
-        Arc::clone(&cancel_tx),
     ));
     let reader = tokio::spawn(reader_loop(
         receiver,
-        shutdown.clone(),
         cancel_rx.clone(),
         Arc::clone(&cancel_tx),
     ));
-    writer_loop(sender, shared, cfg, shutdown, cancel_rx, cancel_tx).await;
+    writer_loop(sender, rx, cfg, shutdown, cancel_rx, cancel_tx).await;
     let _ = producer.await;
     let _ = reader.await;
 }
@@ -1275,6 +1663,8 @@ async fn run_tail<F: TailFetcher, S: TailSender, R: TailReceiver>(
 mod tests {
     use super::*;
     use pulsus_model::Fingerprint;
+
+    use std::sync::Mutex;
 
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Instant;
@@ -1304,7 +1694,7 @@ mod tests {
     /// re-review 2).
     async fn production_close_frame(reason: &str) -> CloseFrame {
         let (_tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::Accept);
+        let sender = WireSender::new();
         let closed = Arc::clone(&sender.closed);
         let handle = tokio::spawn(run_tail(
             PipelineInvalidFetcher(reason.to_string()),
@@ -1382,7 +1772,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn graceful_shutdown_closes_bare_with_no_frame() {
         let (tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::Accept);
+        let sender = WireSender::new();
         let closed = Arc::clone(&sender.closed);
         let handle = tokio::spawn(run_tail(
             FrameEveryPoll,
@@ -1841,17 +2231,6 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum SinkMode {
-        /// `send_text` succeeds instantly.
-        Accept,
-        /// `send_text` never completes (a client that stopped reading,
-        /// with full kernel buffers).
-        BlockForever,
-        /// `send_text` fails immediately (transport error).
-        Fail,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum RecvMode {
         /// Inbound side stays silent forever.
         Silent,
@@ -1859,40 +2238,178 @@ mod tests {
         CloseSoon,
     }
 
-    struct FakeSender {
-        mode: SinkMode,
-        sent: Arc<Mutex<Vec<String>>>,
+    type TInstant = tokio::time::Instant;
+
+    /// One event on a [`WireSender`]'s log (issue #806). A scripted source
+    /// writes its reads into the same log.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Wire {
+        ReadyStart,
+        Ready,
+        Start(String),
+        FlushStart,
+        Flushed,
+        CloseStart,
+        Closed,
+        /// A [`GatedFloodSource`] read: `try_next` (`false`) or `next` (`true`).
+        Read(bool),
+    }
+
+    type WireLog = Arc<Mutex<Vec<(TInstant, Wire)>>>;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ReadyMode {
+        Ready,
+        /// Waits until the test releases [`WireSender::ready_gate`].
+        Gate,
+        Pending,
+        Fail,
+        Sleep(Duration),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum StartMode {
+        Ok,
+        /// Buffers the text, then fails.
+        BufferThenErr,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FlushMode {
+        Ready,
+        YieldOnce,
+        /// Waits until the test releases [`WireSender::gate`].
+        Gate,
+        Sleep(Duration),
+        Pending,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CloseMode {
+        Ready,
+        Block,
+    }
+
+    /// The scripted socket (issue #806): `start` buffers a Text, `flush`
+    /// moves the buffer to `wire`, and every call is logged with its
+    /// instant.
+    struct WireSender {
+        ready_mode: ReadyMode,
+        start_mode: StartMode,
+        flush_modes: VecDeque<FlushMode>,
+        flush_default: FlushMode,
+        close_mode: CloseMode,
+        log: WireLog,
+        buffered: Arc<Mutex<Vec<String>>>,
+        wire: Arc<Mutex<Vec<String>>>,
         /// Outer `Some` = a close was sent; inner = the wire frame the
         /// PRODUCTION path rendered (`writer_loop` maps through
         /// `error_close_frame` before the `TailSender` boundary — issue
         /// #240 re-review: the fake captures, never re-renders).
         closed: Arc<Mutex<Option<Option<CloseFrame>>>>,
+        gate: Arc<tokio::sync::Notify>,
+        ready_gate: Arc<tokio::sync::Notify>,
     }
 
-    impl FakeSender {
-        fn new(mode: SinkMode) -> Self {
-            FakeSender {
-                mode,
-                sent: Arc::new(Mutex::new(Vec::new())),
+    impl WireSender {
+        fn new() -> Self {
+            WireSender {
+                ready_mode: ReadyMode::Ready,
+                start_mode: StartMode::Ok,
+                flush_modes: VecDeque::new(),
+                flush_default: FlushMode::Ready,
+                close_mode: CloseMode::Ready,
+                log: Arc::new(Mutex::new(Vec::new())),
+                buffered: Arc::new(Mutex::new(Vec::new())),
+                wire: Arc::new(Mutex::new(Vec::new())),
                 closed: Arc::new(Mutex::new(None)),
+                gate: Arc::new(tokio::sync::Notify::new()),
+                ready_gate: Arc::new(tokio::sync::Notify::new()),
             }
+        }
+
+        fn ready(mut self, m: ReadyMode) -> Self {
+            self.ready_mode = m;
+            self
+        }
+
+        fn start(mut self, m: StartMode) -> Self {
+            self.start_mode = m;
+            self
+        }
+
+        fn flush(mut self, m: FlushMode) -> Self {
+            self.flush_default = m;
+            self
+        }
+
+        /// The modes of the first flushes, in order; `flush`'s mode after.
+        fn flushes(mut self, ms: &[FlushMode]) -> Self {
+            self.flush_modes = ms.iter().copied().collect();
+            self
+        }
+
+        fn close(mut self, m: CloseMode) -> Self {
+            self.close_mode = m;
+            self
+        }
+
+        fn note(&self, w: Wire) {
+            self.log.lock().unwrap().push((TInstant::now(), w));
+        }
+
+        fn write_buffered(&self) {
+            let mut b = self.buffered.lock().unwrap();
+            self.wire.lock().unwrap().extend(b.drain(..));
         }
     }
 
-    impl TailSender for FakeSender {
-        async fn send_text(&mut self, text: String) -> Result<(), ()> {
-            match self.mode {
-                SinkMode::Accept => {
-                    self.sent.lock().unwrap().push(text);
-                    Ok(())
-                }
-                SinkMode::BlockForever => std::future::pending().await,
-                SinkMode::Fail => Err(()),
+    impl TailSender for WireSender {
+        async fn ready(&mut self) -> Result<(), ()> {
+            self.note(Wire::ReadyStart);
+            match self.ready_mode {
+                ReadyMode::Ready => {}
+                ReadyMode::Gate => self.ready_gate.notified().await,
+                ReadyMode::Pending => std::future::pending::<()>().await,
+                ReadyMode::Fail => return Err(()),
+                ReadyMode::Sleep(d) => tokio::time::sleep(d).await,
+            }
+            self.note(Wire::Ready);
+            Ok(())
+        }
+
+        fn start(&mut self, text: String) -> Result<(), ()> {
+            self.note(Wire::Start(text.clone()));
+            self.buffered.lock().unwrap().push(text);
+            match self.start_mode {
+                StartMode::Ok => Ok(()),
+                StartMode::BufferThenErr => Err(()),
             }
         }
 
-        async fn send_close(&mut self, frame: Option<CloseFrame>) {
+        async fn flush(&mut self) -> Result<(), ()> {
+            self.note(Wire::FlushStart);
+            let mode = self.flush_modes.pop_front().unwrap_or(self.flush_default);
+            match mode {
+                FlushMode::Ready => {}
+                FlushMode::YieldOnce => tokio::task::yield_now().await,
+                FlushMode::Gate => self.gate.notified().await,
+                FlushMode::Sleep(d) => tokio::time::sleep(d).await,
+                FlushMode::Pending => std::future::pending::<()>().await,
+            }
+            self.write_buffered();
+            self.note(Wire::Flushed);
+            Ok(())
+        }
+
+        async fn send_close(&mut self, frame: Option<CloseFrame>, _deadline: TInstant) {
+            self.note(Wire::CloseStart);
+            if self.close_mode == CloseMode::Block {
+                std::future::pending::<()>().await;
+            }
+            self.write_buffered();
             *self.closed.lock().unwrap() = Some(frame);
+            self.note(Wire::Closed);
         }
     }
 
@@ -1907,14 +2424,23 @@ mod tests {
         }
     }
 
+    /// A client that closes when the test says so (issue #806).
+    struct SignalReceiver(Arc<tokio::sync::Notify>);
+
+    impl TailReceiver for SignalReceiver {
+        async fn closed(&mut self) {
+            self.0.notified().await;
+        }
+    }
+
     /// Issue #74 AC4 (v3 rewrite, cancellation-not-timeout): shutdown
     /// while the writer's send is blocked on a non-reading client — with
     /// a 60s send timeout, `run_tail` must return well under 1s, proving
     /// CANCELLATION unblocked it, not timeout expiry.
     #[tokio::test(flavor = "multi_thread")]
-    async fn shutdown_under_blocked_send_returns_via_cancellation_not_timeout() {
+    async fn shutdown_under_blocked_send_returns_within_the_close_grace_not_the_send_timeout() {
         let (tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::BlockForever);
+        let sender = WireSender::new().ready(ReadyMode::Pending);
         let handle = tokio::spawn(run_tail(
             FrameEveryPoll,
             sender,
@@ -1938,7 +2464,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn shutdown_under_hanging_poll_returns_promptly() {
         let (tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::Accept);
+        let sender = WireSender::new();
         let handle = tokio::spawn(run_tail(
             HangingFetcher,
             sender,
@@ -1959,7 +2485,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn writer_send_failure_cancels_the_producer_and_run_tail_returns() {
         let (_tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::Fail);
+        let sender = WireSender::new().ready(ReadyMode::Fail);
         let handle = tokio::spawn(run_tail(
             FrameEveryPoll,
             sender,
@@ -1978,7 +2504,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn client_close_cancels_both_tasks_even_mid_poll() {
         let (_tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::Accept);
+        let sender = WireSender::new();
         let handle = tokio::spawn(run_tail(
             HangingFetcher,
             sender,
@@ -1993,7 +2519,7 @@ mod tests {
     }
 
     /// Review round 1 (medium): a client Close arriving WHILE the
-    /// writer's `send_text` is blocked on backpressure must still tear
+    /// writer's socket step is blocked on backpressure must still tear
     /// the connection down promptly — the independent inbound reader
     /// fires the shared cancellation, which the in-flight send races —
     /// releasing the producer AND the connection-slot permit in well
@@ -2001,7 +2527,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn client_close_during_blocked_send_releases_producer_and_permit_promptly() {
         let (_tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::BlockForever);
+        let sender = WireSender::new().ready(ReadyMode::Pending);
         // The handler's exact permit topology: an owned permit moved into
         // the connection future, dropped when run_tail returns.
         let slots = Arc::new(tokio::sync::Semaphore::new(1));
@@ -2036,7 +2562,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn producer_error_closes_the_socket_with_the_reason() {
         let (_tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::Accept);
+        let sender = WireSender::new();
         let closed = Arc::clone(&sender.closed);
         let handle = tokio::spawn(run_tail(
             FailingFetcher,
@@ -2064,8 +2590,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn frames_flow_from_producer_to_writer() {
         let (tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::Accept);
-        let sent = Arc::clone(&sender.sent);
+        let sender = WireSender::new();
+        let sent = Arc::clone(&sender.wire);
         let handle = tokio::spawn(run_tail(
             FrameEveryPoll,
             sender,
@@ -2134,7 +2660,7 @@ mod tests {
         cfg.slice_ns = 1_000_000_000; // 1s slices
         cfg.start_ns = params::now_ns() - 10_000_000_000;
         let (tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::Accept);
+        let sender = WireSender::new();
         let handle = tokio::spawn(run_tail(
             fetcher,
             sender,
@@ -2264,7 +2790,7 @@ mod tests {
         cfg.narrow_grace_ns = 50_000_000; // 50ms
         cfg.poll_interval = Duration::from_millis(200);
         let (tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::Accept);
+        let sender = WireSender::new();
         let handle = tokio::spawn(run_tail(
             fetcher,
             sender,
@@ -2307,7 +2833,7 @@ mod tests {
         cfg.narrow_grace_ns = 50_000_000; // 50ms
         cfg.poll_interval = Duration::from_millis(5);
         let (tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::Accept);
+        let sender = WireSender::new();
         let handle = tokio::spawn(run_tail(
             fetcher,
             sender,
@@ -2348,7 +2874,7 @@ mod tests {
         cfg.narrow_grace_ns = 50_000_000; // 50ms
         cfg.poll_interval = Duration::from_millis(5);
         let (tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::Accept);
+        let sender = WireSender::new();
         let handle = tokio::spawn(run_tail(
             fetcher,
             sender,
@@ -2396,7 +2922,7 @@ mod tests {
         cfg.slice_ns = 1_000_000_000; // 1s slices
         cfg.start_ns = params::now_ns() - 10_000_000_000; // a 10-slice backlog
         let (tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::Accept);
+        let sender = WireSender::new();
         let handle = tokio::spawn(run_tail(
             fetcher,
             sender,
@@ -2439,7 +2965,7 @@ mod tests {
         cfg.poll_interval = Duration::from_millis(5);
         cfg.slice_ns = 10_000_000; // 10ms slices — a short re-catchup after falling behind
         let (tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::Accept);
+        let sender = WireSender::new();
         let handle = tokio::spawn(run_tail(
             fetcher,
             sender,
@@ -2533,7 +3059,7 @@ mod tests {
         cfg.slice_ns = 10_000_000; // 10ms slices
         cfg.start_ns = params::now_ns() - 1_000 * cfg.slice_ns; // a 1000-slice backlog
         let (tx, rx) = watch::channel(false);
-        let sender = FakeSender::new(SinkMode::Accept);
+        let sender = WireSender::new();
         let handle = tokio::spawn(run_tail(
             fetcher,
             sender,
@@ -2924,8 +3450,8 @@ mod tests {
         fn start(fetcher: ScriptedFetcher, cfg: TailLoopConfig) -> Self {
             let log = Arc::clone(&fetcher.log);
             let (tx, rx) = watch::channel(false);
-            let sender = FakeSender::new(SinkMode::Accept);
-            let sent = Arc::clone(&sender.sent);
+            let sender = WireSender::new();
+            let sent = Arc::clone(&sender.wire);
             let closed = Arc::clone(&sender.closed);
             let handle = tokio::spawn(run_tail(
                 fetcher,
@@ -3200,12 +3726,9 @@ mod tests {
         let fetcher = ScriptedFetcher::new(
             h1_polls,
             move |_, _| vec![(fpn(2), start + 1)],
-            // The failure comes 50 ms late: a fatal error closes the
-            // connection, and a frame queued just before it can lose the
-            // writer's race with the close, which is not what this pins.
             |_| {
                 CatchStep::Fail(
-                    Duration::from_millis(50),
+                    Duration::ZERO,
                     ReadError::PipelineInvalid {
                         reason: "catch-up failed".to_string(),
                     },
@@ -3650,6 +4173,1115 @@ mod tests {
         }
     }
 
+    // -- issue #806: one owner of the queue, the error and the socket ----
+
+    const GRACE_MS: u64 = 250;
+
+    /// A one-entry page whose line is `line`, at timestamp `ts`.
+    fn page_event(line: &str, ts: i64) -> Event {
+        Event::Page(vec![stream(r#"{"app":"x"}"#, vec![(ts, line)])])
+    }
+
+    fn frame_lines(frame: &PoppedFrame) -> Vec<String> {
+        frame
+            .streams
+            .iter()
+            .flat_map(|s| s.entries.iter().map(|(_, l)| l.clone()))
+            .collect()
+    }
+
+    fn conn(depth: usize) -> ConnState {
+        ConnState::new(depth, 1_000, Duration::from_secs(60))
+    }
+
+    /// Sends every frame `decide` gives, marking each written, and returns
+    /// their lines and the action that ended it.
+    fn send_all(st: &mut ConnState, now: TInstant) -> (Vec<Vec<String>>, Action) {
+        let mut sent = Vec::new();
+        loop {
+            match st.decide(now) {
+                Action::Send { frame, .. } => {
+                    sent.push(frame_lines(&frame));
+                    st.on_handed_over();
+                    st.on_written();
+                }
+                other => return (sent, other),
+            }
+        }
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// S1 (issue #806): every page queued before the fatal error is sent,
+    /// then the Close carries the error.
+    #[test]
+    fn pages_then_fatal_are_all_sent_then_closed_with_the_reason() {
+        let mut st = conn(4);
+        for (i, l) in ["A1", "A2", "A3"].iter().enumerate() {
+            st.on_event(Some(page_event(l, i as i64)));
+        }
+        st.on_event(Some(Event::Fatal("boom".to_string())));
+        let (sent, end) = send_all(&mut st, TInstant::now());
+        assert_eq!(sent, [["A1"], ["A2"], ["A3"]]);
+        assert!(
+            matches!(end, Action::Close(Some(ref r)) if r == "boom"),
+            "{end:?}"
+        );
+    }
+
+    /// S2 (issue #806): a page that arrives after the writer saw an empty
+    /// queue still goes out before the fatal Close.
+    #[test]
+    fn a_page_that_arrives_after_an_empty_queue_is_sent_before_the_fatal_close() {
+        let mut st = conn(4);
+        let now = TInstant::now();
+        assert!(matches!(st.decide(now), Action::Wait { until: None }));
+        st.on_event(Some(page_event("A", 1)));
+        st.on_event(Some(Event::Fatal("boom".to_string())));
+        let (sent, end) = send_all(&mut st, now);
+        assert_eq!(sent, [["A"]]);
+        assert!(
+            matches!(end, Action::Close(Some(ref r)) if r == "boom"),
+            "{end:?}"
+        );
+    }
+
+    /// S3 (issue #806): a shutdown drain waits for the producer's channel
+    /// to close, sending what arrives meanwhile within the drain.
+    #[test]
+    fn a_shutdown_drain_waits_for_the_producer() {
+        let mut st = conn(4);
+        let t0 = TInstant::now();
+        st.on_shutdown(t0);
+        assert!(matches!(st.decide(t0), Action::Wait { until: Some(u) } if u == t0 + ms(GRACE_MS)));
+        st.on_event(Some(page_event("A", 1)));
+        match st.decide(t0) {
+            Action::Send { frame, deadline } => {
+                assert_eq!(frame_lines(&frame), ["A"]);
+                assert!(deadline <= t0 + ms(GRACE_MS));
+            }
+            other => panic!("expected Send A, got {other:?}"),
+        }
+        st.on_handed_over();
+        st.on_written();
+        st.on_event(None);
+        assert!(matches!(st.decide(t0), Action::Close(None)));
+    }
+
+    /// S4 (issue #806): the drain stops at its deadline: a Close when
+    /// nothing is half sent, no Close when something is.
+    #[test]
+    fn the_drain_cuts_at_its_deadline() {
+        let t0 = TInstant::now();
+        for half_sent in [false, true] {
+            let mut st = conn(4);
+            st.on_shutdown(t0);
+            for (i, l) in ["F1", "F2", "F3"].iter().enumerate() {
+                st.on_event(Some(page_event(l, i as i64)));
+            }
+            match st.decide(t0) {
+                Action::Send { frame, deadline } => {
+                    assert_eq!(frame_lines(&frame), ["F1"]);
+                    assert_eq!(deadline, t0 + ms(GRACE_MS));
+                }
+                other => panic!("expected Send F1, got {other:?}"),
+            }
+            st.on_handed_over();
+            if !half_sent {
+                st.on_written();
+            }
+            let end = st.decide(t0 + ms(GRACE_MS));
+            if half_sent {
+                assert!(matches!(end, Action::Drop), "{end:?}");
+            } else {
+                assert!(matches!(end, Action::Close(None)), "{end:?}");
+            }
+        }
+    }
+
+    /// S5 (issue #806): once the connection must stop no data frame is
+    /// sent, even with frames and an error queued.
+    #[test]
+    fn no_data_frame_after_the_connection_must_stop() {
+        let mut st = conn(4);
+        st.on_event(Some(page_event("A1", 1)));
+        st.on_event(Some(page_event("A2", 2)));
+        st.on_event(Some(Event::Fatal("boom".to_string())));
+        st.on_must_stop();
+        let end = st.decide(TInstant::now());
+        assert!(matches!(end, Action::Close(None)), "{end:?}");
+        assert_eq!(st.queue.frames.len(), 2);
+    }
+
+    /// S6 (issue #806): a Text handed over and not known to be written
+    /// means no Close: the socket is dropped.
+    #[test]
+    fn a_half_sent_text_drops_the_socket() {
+        let mut st = conn(4);
+        st.on_event(Some(page_event("A", 1)));
+        let now = TInstant::now();
+        assert!(matches!(st.decide(now), Action::Send { .. }));
+        st.on_handed_over();
+        st.on_must_stop();
+        assert!(matches!(st.decide(now), Action::Drop));
+    }
+
+    /// S7 (issue #806): a send is decided up to, and not at, the drain's
+    /// deadline.
+    #[test]
+    fn no_send_is_decided_at_or_after_the_deadline() {
+        let t0 = TInstant::now();
+        let mut st = conn(4);
+        st.on_shutdown(t0);
+        st.on_event(Some(page_event("A", 1)));
+        assert!(matches!(
+            st.decide(t0 + ms(GRACE_MS - 1)),
+            Action::Send { .. }
+        ));
+        let mut st = conn(4);
+        st.on_shutdown(t0);
+        st.on_event(Some(page_event("A", 1)));
+        let end = st.decide(t0 + ms(GRACE_MS));
+        assert!(matches!(end, Action::Close(None)), "{end:?}");
+    }
+
+    /// S8 (issue #806): a page waiting when the error comes evicts the
+    /// oldest queued frame by the slow-client rule, and the eviction is
+    /// reported before the Close: depth + 1 sends, nothing lost unreported.
+    #[test]
+    fn a_page_waiting_when_the_error_comes_evicts_by_the_slow_client_rule_and_is_reported() {
+        let mut st = conn(2);
+        let now = TInstant::now();
+        st.on_event(Some(page_event("A1", 1)));
+        let first = match st.decide(now) {
+            Action::Send { frame, .. } => frame_lines(&frame),
+            other => panic!("expected Send A1, got {other:?}"),
+        };
+        assert_eq!(first, ["A1"]);
+        st.on_handed_over();
+        st.on_event(Some(page_event("A2", 2)));
+        st.on_event(Some(page_event("A3", 3)));
+        st.on_event(Some(page_event("A4", 4)));
+        st.on_event(Some(Event::Fatal("boom".to_string())));
+        st.on_written();
+        match st.decide(now) {
+            Action::Send { frame, .. } => {
+                assert_eq!(frame_lines(&frame), ["A3"]);
+                assert_eq!(frame.dropped_total, 1);
+                assert_eq!(
+                    frame
+                        .dropped
+                        .iter()
+                        .map(|d| d.timestamp_ns)
+                        .collect::<Vec<_>>(),
+                    [2]
+                );
+            }
+            other => panic!("expected Send A3, got {other:?}"),
+        }
+        st.on_handed_over();
+        st.on_written();
+        let (sent, end) = send_all(&mut st, now);
+        assert_eq!(sent, [["A4"]]);
+        assert!(
+            matches!(end, Action::Close(Some(ref r)) if r == "boom"),
+            "{end:?}"
+        );
+    }
+
+    /// S9 (issue #806): a shutdown channel whose sender is gone is read as
+    /// shutdown before the frame is taken, so the frame's deadline is the
+    /// drain's.
+    #[test]
+    fn a_closed_shutdown_channel_is_read_before_the_frame_is_taken() {
+        let (shutdown_tx, mut shutdown) = watch::channel(false);
+        drop(shutdown_tx);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(page_event("F1", 1)).expect("room");
+        let mut st = conn(4);
+        let (mut shutdown_open, mut rx_open) = (true, true);
+        let t0 = TInstant::now();
+        observe_inputs(
+            &mut st,
+            &mut shutdown,
+            &mut shutdown_open,
+            &cancel,
+            &mut rx,
+            &mut rx_open,
+            t0,
+        );
+        assert_eq!(st.drain_until, Some(t0 + ms(GRACE_MS)));
+        match st.decide(t0) {
+            Action::Send { frame, deadline } => {
+                assert_eq!(frame_lines(&frame), ["F1"]);
+                assert_eq!(deadline, t0 + ms(GRACE_MS));
+            }
+            other => panic!("expected Send F1, got {other:?}"),
+        }
+    }
+
+    /// A source that replays a script of `try_next` answers; `next` never
+    /// answers.
+    struct ScriptSource(VecDeque<TryNext>);
+
+    impl EventSource for ScriptSource {
+        fn try_next(&mut self) -> TryNext {
+            self.0.pop_front().unwrap_or(TryNext::Empty)
+        }
+
+        fn next(&mut self) -> impl Future<Output = Option<Event>> + Send {
+            std::future::pending()
+        }
+    }
+
+    /// S10 (issue #806): each `observe_inputs` takes at most one event, in
+    /// order.
+    #[test]
+    fn observe_inputs_takes_one_event_per_call_in_order() {
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let mut src = ScriptSource(VecDeque::from([
+            TryNext::Event(page_event("A", 1)),
+            TryNext::Event(Event::Fatal("boom".to_string())),
+            TryNext::Closed,
+        ]));
+        let mut st = conn(4);
+        let (mut shutdown_open, mut rx_open) = (true, true);
+        let t0 = TInstant::now();
+        let mut observe = |st: &mut ConnState, rx_open: &mut bool| {
+            observe_inputs(
+                st,
+                &mut shutdown,
+                &mut shutdown_open,
+                &cancel,
+                &mut src,
+                rx_open,
+                t0,
+            )
+        };
+        observe(&mut st, &mut rx_open);
+        assert_eq!(st.queue.frames.len(), 1);
+        assert_eq!(st.fatal, None);
+        observe(&mut st, &mut rx_open);
+        assert_eq!(st.fatal.as_deref(), Some("boom"));
+        assert!(rx_open);
+        observe(&mut st, &mut rx_open);
+        assert!(st.producer_done);
+        assert!(!rx_open);
+        assert!(matches!(st.decide(t0), Action::Send { .. }));
+    }
+
+    /// Waits, by yielding only (time does not move), until `done` holds;
+    /// panics after 100,000 yields.
+    async fn yield_until(mut done: impl FnMut() -> bool) {
+        for _ in 0..100_000 {
+            if done() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the expected event never came");
+    }
+
+    fn logged(log: &WireLog, pred: impl Fn(&Wire) -> bool) -> usize {
+        log.lock().unwrap().iter().filter(|(_, w)| pred(w)).count()
+    }
+
+    fn time_of(log: &WireLog, pred: impl Fn(&Wire) -> bool) -> Option<TInstant> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .find(|(_, w)| pred(w))
+            .map(|(t, _)| *t)
+    }
+
+    fn lines_of_wire(wire: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        sent_lines(&wire.lock().unwrap())
+    }
+
+    /// A source with input always waiting (issue #806, D14): `try_next`
+    /// always yields a page; `next` yields one only when the test has added
+    /// a permit. It logs each read on the sender's log, and panics after
+    /// more than 10 reads since the last socket step, so a writer that
+    /// drains it fails rather than spins.
+    struct GatedFloodSource {
+        log: WireLog,
+        permits: Arc<tokio::sync::Semaphore>,
+        n: i64,
+    }
+
+    impl GatedFloodSource {
+        fn read(&mut self, via_next: bool) -> Event {
+            let mut log = self.log.lock().unwrap();
+            let since_step = log
+                .iter()
+                .rev()
+                .take_while(|(_, w)| !matches!(w, Wire::Ready | Wire::Flushed))
+                .filter(|(_, w)| matches!(w, Wire::Read(_)))
+                .count();
+            assert!(since_step < 10, "more than 10 reads between socket steps");
+            log.push((TInstant::now(), Wire::Read(via_next)));
+            self.n += 1;
+            page_event(&format!("P{}", self.n), self.n)
+        }
+    }
+
+    impl EventSource for GatedFloodSource {
+        fn try_next(&mut self) -> TryNext {
+            TryNext::Event(self.read(false))
+        }
+
+        async fn next(&mut self) -> Option<Event> {
+            self.permits.acquire().await.expect("open").forget();
+            Some(self.read(true))
+        }
+    }
+
+    /// D14 (issue #806): a source with input always waiting cannot delay a
+    /// ready socket step or the shutdown cut. P1's flush is held by a gate
+    /// so that its completion and a receive become ready in the same
+    /// synchronous step of the test (the gate and the permit are released
+    /// together, with no await between, on this current-thread runtime):
+    /// the writer's next poll finds both ready, and the step must win.
+    #[tokio::test(start_paused = true)]
+    async fn a_source_with_input_always_waiting_cannot_delay_sends_or_the_shutdown_cut() {
+        let sender = WireSender::new()
+            .flushes(&[FlushMode::Gate])
+            .flush(FlushMode::Sleep(ms(100)));
+        let (log, wire, closed, gate) = (
+            Arc::clone(&sender.log),
+            Arc::clone(&sender.wire),
+            Arc::clone(&sender.closed),
+            Arc::clone(&sender.gate),
+        );
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let src = GatedFloodSource {
+            log: Arc::clone(&log),
+            permits: Arc::clone(&permits),
+            n: 0,
+        };
+        let (_shutdown_tx, shutdown) = watch::channel(true);
+        let (cancel_tx, cancel) = watch::channel(false);
+        let t0 = TInstant::now();
+        let handle = tokio::spawn(writer_loop(
+            sender,
+            src,
+            test_cfg(),
+            shutdown,
+            cancel,
+            Arc::new(cancel_tx),
+        ));
+        yield_until(|| logged(&log, |w| *w == Wire::FlushStart) == 1).await;
+        tokio::time::advance(ms(100)).await;
+        // Released together: P1's flush and one receive are ready at the
+        // writer's next poll.
+        gate.notify_one();
+        permits.add_permits(1);
+        yield_until(|| {
+            logged(&log, |w| *w == Wire::Flushed) == 1
+                && logged(&log, |w| *w == Wire::Read(true)) >= 1
+        })
+        .await;
+        {
+            let l = log.lock().unwrap();
+            let flushed = l
+                .iter()
+                .position(|(_, w)| *w == Wire::Flushed)
+                .expect("P1 flushed");
+            let received = l
+                .iter()
+                .position(|(_, w)| *w == Wire::Read(true))
+                .expect("a receive");
+            assert!(
+                flushed < received,
+                "the ready step goes before the ready receive: {l:?}"
+            );
+        }
+        tokio::time::advance(ms(100)).await;
+        yield_until(|| logged(&log, |w| *w == Wire::FlushStart) == 3).await;
+        tokio::time::advance(ms(50)).await;
+        yield_until(|| handle.is_finished()).await;
+        handle.await.expect("no panic");
+        assert_eq!(TInstant::now() - t0, ms(GRACE_MS));
+        assert_eq!(lines_of_wire(&wire), ["P1", "P2"]);
+        assert!(
+            closed.lock().unwrap().is_none(),
+            "no Close after a half-sent frame"
+        );
+        let l = log.lock().unwrap();
+        let third = l
+            .iter()
+            .filter(|(_, w)| matches!(w, Wire::Start(_)))
+            .nth(2)
+            .map(|(t, _)| *t)
+            .expect("a third frame handed over");
+        assert_eq!(third - t0, ms(200));
+        let mut reads = 0;
+        for (_, w) in l.iter() {
+            match w {
+                Wire::Ready | Wire::Flushed => reads = 0,
+                Wire::Read(_) => {
+                    reads += 1;
+                    assert!(
+                        reads <= 2,
+                        "more than two reads between socket steps: {l:?}"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Polls a script of lines, each a full page, then an error if one is
+    /// given, then never answers.
+    struct Polls {
+        lines: VecDeque<&'static str>,
+        then: Option<String>,
+    }
+
+    impl TailFetcher for Polls {
+        async fn poll(
+            &mut self,
+            _lower: TailLower,
+            upper_ns: i64,
+            _narrow: bool,
+            fetch_limit: u32,
+        ) -> Result<TailPage, ReadError> {
+            if let Some(line) = self.lines.pop_front() {
+                return Ok(TailPage {
+                    streams: vec![stream(r#"{"app":"x"}"#, vec![(upper_ns, line)])],
+                    next: Some(TailCursor {
+                        tuple: (upper_ns, Fingerprint::from_raw(1), 0),
+                        seen: 1,
+                    }),
+                    fetched: fetch_limit,
+                    joined: Vec::new(),
+                });
+            }
+            if let Some(reason) = self.then.take() {
+                return Err(ReadError::PipelineInvalid { reason });
+            }
+            std::future::pending().await
+        }
+    }
+
+    fn polls(lines: &[&'static str], then: Option<&str>) -> Polls {
+        Polls {
+            lines: lines.iter().copied().collect(),
+            then: then.map(str::to_string),
+        }
+    }
+
+    /// D1 (issue #806): a fatal error closes the connection only after
+    /// every frame queued before it is written.
+    #[tokio::test]
+    async fn a_fatal_error_closes_only_after_every_frame_queued_before_it() {
+        let sender = WireSender::new().flush(FlushMode::YieldOnce);
+        let (wire, closed) = (Arc::clone(&sender.wire), Arc::clone(&sender.closed));
+        let (_tx, rx) = watch::channel(false);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_tail(
+                polls(&["A1", "A2", "A3"], Some("boom")),
+                sender,
+                FakeReceiver(RecvMode::Silent),
+                test_cfg(),
+                rx,
+            ),
+        )
+        .await
+        .expect("the tail closes");
+        assert_eq!(lines_of_wire(&wire), ["A1", "A2", "A3"]);
+        let frame = closed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a Close")
+            .expect("with a frame");
+        assert_eq!(frame.code, close_code::ERROR);
+        assert_eq!(frame.reason.as_str(), "boom");
+    }
+
+    /// D2 (issue #806): shutdown writes the frame in flight, then a bare
+    /// Close.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_writes_the_frame_in_flight_before_the_close() {
+        let sender = WireSender::new().flush(FlushMode::Gate);
+        let (log, wire, closed, gate) = (
+            Arc::clone(&sender.log),
+            Arc::clone(&sender.wire),
+            Arc::clone(&sender.closed),
+            Arc::clone(&sender.gate),
+        );
+        let (tx, rx) = watch::channel(false);
+        let t0 = TInstant::now();
+        let handle = tokio::spawn(run_tail(
+            polls(&["A1"], None),
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            test_cfg(),
+            rx,
+        ));
+        yield_until(|| logged(&log, |w| *w == Wire::FlushStart) == 1).await;
+        tx.send(true).expect("receiver alive");
+        tokio::time::sleep(ms(10)).await;
+        assert!(
+            closed.lock().unwrap().is_none(),
+            "no Close before the release"
+        );
+        gate.notify_one();
+        handle.await.expect("no panic");
+        assert!(TInstant::now() - t0 < ms(600));
+        assert_eq!(lines_of_wire(&wire), ["A1"]);
+        assert_eq!(*closed.lock().unwrap(), Some(None), "a bare Close");
+    }
+
+    /// D3 (issue #806): shutdown with a client that never reads: the Close
+    /// starts at the drain's end and the connection ends one grace later.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_with_a_client_that_never_reads_ends_within_two_grace_periods() {
+        let sender = WireSender::new()
+            .ready(ReadyMode::Pending)
+            .close(CloseMode::Block);
+        let (log, wire) = (Arc::clone(&sender.log), Arc::clone(&sender.wire));
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(run_tail(
+            FrameEveryPoll,
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            test_cfg(),
+            rx,
+        ));
+        yield_until(|| logged(&log, |w| *w == Wire::ReadyStart) >= 1).await;
+        let t0 = TInstant::now();
+        tx.send(true).expect("receiver alive");
+        handle.await.expect("no panic");
+        let ended = TInstant::now() - t0;
+        let close = time_of(&log, |w| *w == Wire::CloseStart).expect("the Close starts") - t0;
+        assert!(
+            close >= ms(249) && close <= ms(251),
+            "the Close starts at {close:?}"
+        );
+        assert!(ended >= ms(499) && ended <= ms(501), "returns at {ended:?}");
+        assert!(wire.lock().unwrap().is_empty());
+    }
+
+    /// D7 (issue #806): a shutdown sender that is gone starts the drain
+    /// deadline, as `true` does.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_shutdown_sender_starts_the_drain_deadline() {
+        let sender = WireSender::new().flush(FlushMode::Sleep(ms(100)));
+        let (log, wire, closed) = (
+            Arc::clone(&sender.log),
+            Arc::clone(&sender.wire),
+            Arc::clone(&sender.closed),
+        );
+        let (tx, rx) = mpsc::channel(4);
+        for (i, l) in ["F1", "F2", "F3"].iter().enumerate() {
+            tx.try_send(page_event(l, i as i64)).expect("room");
+        }
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        drop(shutdown_tx);
+        let (cancel_tx, cancel) = watch::channel(false);
+        let t0 = TInstant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            writer_loop(
+                sender,
+                rx,
+                test_cfg(),
+                shutdown,
+                cancel,
+                Arc::new(cancel_tx),
+            ),
+        )
+        .await
+        .expect("the writer returns within 2 s");
+        assert_eq!(TInstant::now() - t0, ms(GRACE_MS));
+        assert_eq!(lines_of_wire(&wire), ["F1", "F2"]);
+        let third = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, w)| matches!(w, Wire::Start(_)))
+            .nth(2)
+            .map(|(t, _)| *t)
+            .expect("F3 handed over");
+        assert_eq!(third - t0, ms(200));
+        assert!(closed.lock().unwrap().is_none(), "no Close");
+        drop(tx);
+    }
+
+    /// D9-D11 (issue #806): the three ways a connection must stop during a
+    /// flush send no Close after the Text handed over.
+    async fn stop_during_a_flush(how: &str) -> (Duration, Vec<String>, Option<Option<CloseFrame>>) {
+        let sender = WireSender::new().flush(FlushMode::Pending);
+        let (log, wire, closed) = (
+            Arc::clone(&sender.log),
+            Arc::clone(&sender.wire),
+            Arc::clone(&sender.closed),
+        );
+        let client = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = watch::channel(false);
+        let mut cfg = test_cfg();
+        if how == "send timeout" {
+            cfg.send_timeout = ms(100);
+        }
+        let handle = tokio::spawn(run_tail(
+            polls(&["A1"], None),
+            sender,
+            SignalReceiver(Arc::clone(&client)),
+            cfg,
+            rx,
+        ));
+        yield_until(|| logged(&log, |w| matches!(w, Wire::Start(_))) == 1).await;
+        let t0 = TInstant::now();
+        match how {
+            "client close" => client.notify_one(),
+            "shutdown" => tx.send(true).expect("receiver alive"),
+            _ => {}
+        }
+        handle.await.expect("no panic");
+        let ended = TInstant::now() - t0;
+        let wire = wire.lock().unwrap().clone();
+        let closed = closed.lock().unwrap().clone();
+        (ended, wire, closed)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_client_close_during_a_flush_sends_no_close_after_the_handed_over_text() {
+        let (ended, wire, closed) = stop_during_a_flush("client close").await;
+        assert!(wire.is_empty(), "{wire:?}");
+        assert!(closed.is_none(), "{closed:?}");
+        assert_eq!(ended, Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_send_timeout_during_a_flush_sends_no_close_after_the_handed_over_text() {
+        let (ended, wire, closed) = stop_during_a_flush("send timeout").await;
+        assert!(wire.is_empty(), "{wire:?}");
+        assert!(closed.is_none(), "{closed:?}");
+        assert!(ended <= ms(100), "{ended:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_cut_during_a_flush_sends_no_close_after_the_handed_over_text() {
+        let (ended, wire, closed) = stop_during_a_flush("shutdown").await;
+        assert!(wire.is_empty(), "{wire:?}");
+        assert!(closed.is_none(), "{closed:?}");
+        assert_eq!(ended, ms(GRACE_MS));
+    }
+
+    /// D12 (issue #806): a hand-off that buffers and then fails drops the
+    /// socket without a Close.
+    #[tokio::test]
+    async fn a_hand_off_error_drops_the_socket_without_a_close() {
+        let sender = WireSender::new().start(StartMode::BufferThenErr);
+        let (wire, closed) = (Arc::clone(&sender.wire), Arc::clone(&sender.closed));
+        let (_tx, rx) = watch::channel(false);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_tail(
+                polls(&["A1"], None),
+                sender,
+                FakeReceiver(RecvMode::Silent),
+                test_cfg(),
+                rx,
+            ),
+        )
+        .await
+        .expect("the tail ends");
+        assert!(wire.lock().unwrap().is_empty());
+        assert!(closed.lock().unwrap().is_none());
+    }
+
+    /// D13 (issue #806): a step that becomes ready at its deadline hands
+    /// nothing over.
+    #[tokio::test(start_paused = true)]
+    async fn a_step_ready_at_its_deadline_hands_nothing_over() {
+        let sender = WireSender::new()
+            .ready(ReadyMode::Sleep(ms(100)))
+            .flush(FlushMode::Pending);
+        let (buffered, wire, closed) = (
+            Arc::clone(&sender.buffered),
+            Arc::clone(&sender.wire),
+            Arc::clone(&sender.closed),
+        );
+        let mut cfg = test_cfg();
+        cfg.send_timeout = ms(100);
+        let (_tx, rx) = watch::channel(false);
+        let t0 = TInstant::now();
+        run_tail(
+            polls(&["A1"], None),
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            cfg,
+            rx,
+        )
+        .await;
+        assert!(buffered.lock().unwrap().is_empty());
+        assert!(wire.lock().unwrap().is_empty());
+        assert_eq!(*closed.lock().unwrap(), Some(None), "a bare Close");
+        assert_eq!(TInstant::now() - t0, ms(100));
+    }
+
+    /// D15 (issue #806, code review round 1): shutdown that reaches the
+    /// connection while the socket is not yet ready still bounds the flush
+    /// that follows: it is cut at the drain deadline, not the send timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_during_readiness_bounds_the_flush_that_follows() {
+        let sender = WireSender::new()
+            .ready(ReadyMode::Gate)
+            .flush(FlushMode::Pending);
+        let (log, wire, closed, ready_gate) = (
+            Arc::clone(&sender.log),
+            Arc::clone(&sender.wire),
+            Arc::clone(&sender.closed),
+            Arc::clone(&sender.ready_gate),
+        );
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(run_tail(
+            polls(&["A1"], None),
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            test_cfg(),
+            rx,
+        ));
+        yield_until(|| logged(&log, |w| *w == Wire::ReadyStart) == 1).await;
+        let t0 = TInstant::now();
+        tx.send(true).expect("receiver alive");
+        tokio::time::sleep(ms(10)).await;
+        ready_gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the flush is cut at the drain deadline, not the 60 s send timeout")
+            .expect("no panic");
+        assert_eq!(TInstant::now() - t0, ms(GRACE_MS));
+        assert_eq!(
+            logged(&log, |w| matches!(w, Wire::Start(_))),
+            1,
+            "A1 was handed over"
+        );
+        assert!(wire.lock().unwrap().is_empty());
+        assert!(
+            closed.lock().unwrap().is_none(),
+            "no Close after a half-sent frame"
+        );
+    }
+
+    /// The select order of one socket step (issue #806, code review round
+    /// 1): with the deadline already reached and the step ready, the step
+    /// fails without the step being polled.
+    #[tokio::test(start_paused = true)]
+    async fn a_step_whose_deadline_has_come_is_not_polled() {
+        let mut st = conn(4);
+        let mut src = ScriptSource(VecDeque::new());
+        let (mut rx_open, mut shutdown_open) = (true, true);
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let mut inputs = Inputs {
+            st: &mut st,
+            src: &mut src,
+            rx_open: &mut rx_open,
+            shutdown: &mut shutdown,
+            shutdown_open: &mut shutdown_open,
+            cancel: &mut cancel,
+        };
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&polled);
+        let ready_step = std::future::poll_fn(move |_| {
+            seen.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        });
+        let ok = inputs.step(ready_step, TInstant::now()).await;
+        assert!(!ok, "the step fails at its deadline");
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "a step whose deadline has come is not polled"
+        );
+    }
+
+    /// A deadline between timer ticks (issue #806, code review round 2):
+    /// the timer wakes on whole milliseconds, so it can still be pending
+    /// just after the deadline. On a paused clock the deadline is 300 us
+    /// past a tick and the clock is moved to 301 us, so the deadline has
+    /// passed and the timer has not fired. A step that is ready from then
+    /// on must not be polled: the step fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_step_is_never_polled_after_a_deadline_between_timer_ticks() {
+        let mut st = conn(4);
+        let mut src = ScriptSource(VecDeque::new());
+        let (mut rx_open, mut shutdown_open) = (true, true);
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let mut inputs = Inputs {
+            st: &mut st,
+            src: &mut src,
+            rx_open: &mut rx_open,
+            shutdown: &mut shutdown,
+            shutdown_open: &mut shutdown_open,
+            cancel: &mut cancel,
+        };
+        let deadline = TInstant::now() + Duration::from_micros(300);
+        let late = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&late);
+        // Pending, waking itself at once, until the deadline has passed;
+        // then ready.
+        let step = std::future::poll_fn(move |cx| {
+            if TInstant::now() >= deadline {
+                seen.store(true, Ordering::SeqCst);
+                return std::task::Poll::Ready(Ok(()));
+            }
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        });
+        let (ok, ()) = tokio::join!(inputs.step(step, deadline), async {
+            tokio::time::advance(Duration::from_micros(301)).await;
+        });
+        assert!(!ok, "the step fails at its deadline");
+        assert!(
+            !late.load(Ordering::SeqCst),
+            "the step was polled after its deadline"
+        );
+    }
+
+    /// A scripted WebSocket sink (issue #806). It logs every call and
+    /// rejects a `start_send` not preceded by a ready `poll_ready`.
+    #[derive(Default)]
+    struct ScriptSink {
+        log: Arc<Mutex<Vec<String>>>,
+        written: Arc<Mutex<Vec<String>>>,
+        buffer: Vec<String>,
+        /// `false`: that `poll_ready` is pending once; empty: ready.
+        ready_script: VecDeque<bool>,
+        /// `false`: that `poll_flush` is pending, with no wake; empty: ready.
+        flush_script: VecDeque<bool>,
+        text_err_after_buffer: bool,
+        ready_seen: bool,
+        /// After the first `start_send`, `poll_ready` is pending, waking
+        /// itself at once, until the clock reaches this instant.
+        ready_from_after_first_send: Option<TInstant>,
+        sends: usize,
+    }
+
+    impl Sink<Message> for ScriptSink {
+        type Error = ();
+
+        fn poll_ready(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ()>> {
+            let held = self.sends > 0
+                && self
+                    .ready_from_after_first_send
+                    .is_some_and(|from| TInstant::now() < from);
+            if held || self.ready_script.pop_front() == Some(false) {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push("poll_ready (pending)".to_string());
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            self.log.lock().unwrap().push("poll_ready".to_string());
+            self.ready_seen = true;
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), ()> {
+            let (label, text) = match &item {
+                Message::Text(t) => ("start_send(Text)", t.to_string()),
+                Message::Close(_) => ("start_send(Close)", "Close".to_string()),
+                _ => ("start_send(other)", String::new()),
+            };
+            self.sends += 1;
+            if !std::mem::take(&mut self.ready_seen) {
+                self.log.lock().unwrap().push(format!("rejected {label}"));
+                return Err(());
+            }
+            self.log.lock().unwrap().push(label.to_string());
+            self.buffer.push(text);
+            if matches!(item, Message::Text(_)) && self.text_err_after_buffer {
+                return Err(());
+            }
+            Ok(())
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ()>> {
+            self.log.lock().unwrap().push("poll_flush".to_string());
+            if self.flush_script.pop_front() == Some(false) {
+                return std::task::Poll::Pending;
+            }
+            let moved: Vec<String> = self.buffer.drain(..).collect();
+            self.written.lock().unwrap().extend(moved);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Runs `writer_loop` over `SinkSender(sink)` with `lines` queued; the
+    /// channel closes after them when `close` is set. `cancel_after_start`
+    /// sets the cancellation once a Text has been handed over.
+    async fn drive_sink(
+        sink: ScriptSink,
+        lines: &[&str],
+        close: bool,
+        cancel_after_start: bool,
+    ) -> (Vec<String>, Vec<String>) {
+        let (log, written) = (Arc::clone(&sink.log), Arc::clone(&sink.written));
+        let (tx, rx) = mpsc::channel(4);
+        for (i, l) in lines.iter().enumerate() {
+            tx.try_send(page_event(l, i as i64)).expect("room");
+        }
+        let keep = if close {
+            drop(tx);
+            None
+        } else {
+            Some(tx)
+        };
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (cancel_tx, cancel) = watch::channel(false);
+        let cancel_tx = Arc::new(cancel_tx);
+        let handle = tokio::spawn(writer_loop(
+            SinkSender(sink),
+            rx,
+            test_cfg(),
+            shutdown,
+            cancel,
+            Arc::clone(&cancel_tx),
+        ));
+        if cancel_after_start {
+            yield_until(|| log.lock().unwrap().iter().any(|l| l == "start_send(Text)")).await;
+            cancel_tx.send(true).expect("open");
+        }
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the writer returns")
+            .expect("no panic");
+        drop(keep);
+        let log = log.lock().unwrap().clone();
+        let written = written.lock().unwrap().clone();
+        (log, written)
+    }
+
+    /// P5 (issue #806, code review round 3): the Close is tried for at most
+    /// `CLOSE_GRACE`. A socket that becomes ready only when that time is up
+    /// gets no Close: nothing is handed over or written after it.
+    #[tokio::test(start_paused = true)]
+    async fn the_production_close_hands_nothing_over_after_its_deadline() {
+        let t0 = TInstant::now();
+        let sink = ScriptSink {
+            ready_from_after_first_send: Some(t0 + ms(GRACE_MS)),
+            ..ScriptSink::default()
+        };
+        let (log, written) = (Arc::clone(&sink.log), Arc::clone(&sink.written));
+        let (tx, rx) = mpsc::channel(4);
+        tx.try_send(page_event("A1", 1)).expect("room");
+        drop(tx);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (cancel_tx, cancel) = watch::channel(false);
+        let handle = tokio::spawn(writer_loop(
+            SinkSender(sink),
+            rx,
+            test_cfg(),
+            shutdown,
+            cancel,
+            Arc::new(cancel_tx),
+        ));
+        // A1 is written; the Close waits for readiness.
+        yield_until(|| {
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l == "poll_ready (pending)")
+        })
+        .await;
+        tokio::time::advance(ms(GRACE_MS)).await;
+        yield_until(|| handle.is_finished()).await;
+        handle.await.expect("no panic");
+        let log = log.lock().unwrap().clone();
+        assert!(
+            !log.iter().any(|l| l == "start_send(Close)"),
+            "the Close is not handed over at its deadline: {log:?}"
+        );
+        let written = written.lock().unwrap().clone();
+        assert_eq!(written.len(), 1, "only A1 is written: {written:?}");
+    }
+
+    /// P1 (issue #806): the production sender drops the socket when the
+    /// sink errors after buffering a Text.
+    #[tokio::test]
+    async fn the_production_sender_drops_the_socket_when_the_sink_errors_after_buffering() {
+        let sink = ScriptSink {
+            text_err_after_buffer: true,
+            ..ScriptSink::default()
+        };
+        let (log, written) = drive_sink(sink, &["A1"], false, false).await;
+        assert_eq!(log, ["poll_ready", "start_send(Text)"]);
+        assert!(written.is_empty(), "{written:?}");
+    }
+
+    /// P2 (issue #806): the production sender sends no Close after a
+    /// cancelled flush.
+    #[tokio::test(start_paused = true)]
+    async fn the_production_sender_sends_no_close_after_a_cancelled_flush() {
+        let sink = ScriptSink {
+            flush_script: VecDeque::from([false]),
+            ..ScriptSink::default()
+        };
+        let (log, written) = drive_sink(sink, &["A1"], false, true).await;
+        assert_eq!(
+            log.last().map(String::as_str),
+            Some("poll_flush"),
+            "{log:?}"
+        );
+        assert!(!log.iter().any(|l| l.contains("Close")), "{log:?}");
+        assert!(written.is_empty(), "{written:?}");
+    }
+
+    /// P3 (issue #806): the normal path writes the Text, then the Close.
+    #[tokio::test]
+    async fn the_production_sender_writes_text_then_close() {
+        let (log, written) = drive_sink(ScriptSink::default(), &["A1"], true, false).await;
+        assert_eq!(written.len(), 2, "{log:?}");
+        assert!(written[0].contains("A1"), "{written:?}");
+        assert_eq!(written[1], "Close");
+    }
+
+    /// P4 (issue #806): the production Close waits for readiness.
+    #[tokio::test]
+    async fn the_production_close_waits_for_readiness() {
+        let sink = ScriptSink {
+            ready_script: VecDeque::from([true, false, true]),
+            ..ScriptSink::default()
+        };
+        let (log, _) = drive_sink(sink, &["A1"], true, false).await;
+        assert_eq!(
+            log,
+            [
+                "poll_ready",
+                "start_send(Text)",
+                "poll_flush",
+                "poll_ready (pending)",
+                "poll_ready",
+                "start_send(Close)",
+                "poll_flush"
+            ]
+        );
+    }
+
     // -- param parsing ---------------------------------------------------
 
     fn cfg_default() -> Config {
@@ -3861,8 +5493,8 @@ mod tests {
             lowers: Arc::clone(&lowers),
             failure: false,
         };
-        let sender = FakeSender::new(SinkMode::Accept);
-        let (sent, closed) = (Arc::clone(&sender.sent), Arc::clone(&sender.closed));
+        let sender = WireSender::new();
+        let (sent, closed) = (Arc::clone(&sender.wire), Arc::clone(&sender.closed));
         let (shutdown, rx) = watch::channel(false);
         let handle = tokio::spawn(run_tail(
             fetcher,
