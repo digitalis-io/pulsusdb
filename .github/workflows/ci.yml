@@ -1563,7 +1563,7 @@ jobs:
         run: cargo test -p pulsus-read --test live_metrics_rollup
 
       # Issue #18 part A: each rollup level's rows equal their aggregates
-      # from raw or the level below; run rows, holes, the projection read
+      # from raw or the level below; run rows, holes, the stage read and its fallback,
       # and expiry. Reuses this job's container.
       - name: Live rollup level tests
         env:
@@ -2493,8 +2493,8 @@ jobs:
           schema/schema.sh
           catalogue > /tmp/schema-first.tsv
           objects=$(wc -l < /tmp/schema-first.tsv)
-          if [ "$objects" -ne 55 ]; then
-            echo "::error::expected 55 objects in the single-node schema, got $objects"
+          if [ "$objects" -ne 59 ]; then
+            echo "::error::expected 59 objects in the single-node schema, got $objects"
             cut -f1 /tmp/schema-first.tsv
             exit 1
           fi
@@ -2669,8 +2669,8 @@ jobs:
           catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 76 ]; then
-            echo "::error::expected 76 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 80 ]; then
+            echo "::error::expected 80 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -2893,8 +2893,8 @@ jobs:
           catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 76 ]; then
-            echo "::error::expected 76 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 80 ]; then
+            echo "::error::expected 80 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi

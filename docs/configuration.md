@@ -189,7 +189,7 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PULSUS_RETENTION_DAYS` | none: required | `R` in the table below, in days. A whole number from `1` to `4294967295` with no leading zero; unset or anything else is refused before the server is contacted ([errors](#schemaschemash-errors)). The script writes it into the TTLs marked `R` below, into each rollup level's (`L`) when `PULSUS_ROLLUP_RETENTION_DAYS` is unset, into the five metric catalogue tables' (`C`) as their least, and into the database comment `retention_days=<N>`; the three landing tables' TTLs (`H`) take their own hours |
-| `PULSUS_METRICS_LANDING_RETENTION_HOURS` | `6` | `H` for `metric_landing`, in hours. A whole number from `1` to `168` ([errors](#schemaschemash-errors)) |
+| `PULSUS_METRICS_LANDING_RETENTION_HOURS` | `6` | `H` for `metric_landing`, in hours. A whole number from `1` to `168` ([errors](#schemaschemash-errors)). It also sets when a rollup stage's row is due (the table below): 9 h after it is staged for the 60 s level's stage and 11 h for the 720 s level's at the defaults. A stage row is kept at least that long and is removed only by a later TTL merge. A level whose build stops long enough that the stage rows it needs are gone builds those buckets from the level below itself, which reads more but loses nothing |
 | `PULSUS_LOG_LANDING_RETENTION_HOURS` | `6` | `H` for `log_landing`, with the same rule |
 | `PULSUS_TRACE_LANDING_RETENTION_HOURS` | `6` | `H` for `trace_landing`, with the same rule |
 | `PULSUS_ROLLUP_LEVELS` | `60,720,7200,86400` | the rollup levels in seconds, smallest first; empty for none. Its rules are [errors](#schemaschemash-errors) 8-15. Choose levels above the scrape interval: a level at or below it holds about one sample per series and bucket or fewer, so it stores more than raw and saves no rows |
@@ -204,7 +204,7 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 
 **The binary reads the retention from the database.** At startup it reads the database comment and is not ready until the comment is exactly `retention_days=<N>`; its retry warning names the script. The trace read floor (a read that selects spans by a window reads no span that started `N` days or more before the request, [api.md](api.md) §4), the live-tail lower bound (`N` days and one more before the request) and `/api/v1/status/runtimeinfo`'s `storageRetention` all use that `N`. Changing retention is a rebuild with the script, which drops the database.
 
-**When a row goes.** `R` is `PULSUS_RETENTION_DAYS` and `H` the table's landing hours. `L` is a level's `PULSUS_ROLLUP_RETENTION_DAYS` item, `R` when that is unset, and `C`, the metric catalogue's retention, the largest of `R` and every `L`. A row is due at the time below, computed in whole seconds and capped at `4294967295` (2106-02-07). The server deletes due rows only during a TTL merge, which it runs on a table at most once per `merge_with_ttl_timeout`: `3600` s on the three landing tables, the server's default `14400` s on every other. "Whole part" keeps a part until every row in it is due, and a part never spans two partitions. "Row by row" deletes each due row.
+**When a row goes.** `R` is `PULSUS_RETENTION_DAYS` and `H` the table's landing hours. `L` is a level's `PULSUS_ROLLUP_RETENTION_DAYS` item, `R` when that is unset, and `C`, the metric catalogue's retention, the largest of `R` and every `L`. A row is due at the time below, computed in whole seconds and capped at `4294967295` (2106-02-07). The server deletes due rows only during a TTL merge, which it runs on a table at most once per `merge_with_ttl_timeout`: `3600` s on the three landing tables and the rollup stages, the server's default `14400` s on every other. "Whole part" keeps a part until every row in it is due, and a part never spans two partitions. "Row by row" deletes each due row.
 
 | Table | Due at | Removed | Partition |
 |-------|--------|---------|-----------|
@@ -223,6 +223,7 @@ These variables are read by `schema/schema.sh` alone. They are not configuration
 | `metric_metadata` | `updated_ns` + `C` days | row by row | none |
 | `metric_samples` | `unix_milli` + `R` days | whole part | UTC day of `unix_milli` |
 | `metric_samples_<N>s` | the end of the UTC day of `t_end − 1 ms` + `L` days | whole part | UTC day of `t_end − 1 ms` |
+| `metric_samples_<N>s_stage` | `staged_at` + `H` + 2 × ⌈the next level ÷ 3600 s⌉ + 1 hours | whole part | hour of `staged_at` |
 | `metric_series` | the end of the UTC day `day` + `C` days | whole part | `day`, a UTC day |
 | `resources` | the end of the UTC day `day` + `R` days | whole part | `day`, a UTC day |
 | `service_bucket_resources` | the start of the 5-minute `bucket` + `R` days | whole part | UTC day of `bucket` |
@@ -249,11 +250,11 @@ With `PULSUS_STORAGE_POLICY` and `PULSUS_COLD_VOLUME` set, `schema/schema.sh` gi
 | logs | `log_samples`, `log_metrics_<res>`, `log_patterns` | `PULSUS_LOGS_HOT_DAYS` |
 | traces | `spans`, `error_spans`, `tag_bucket_values`, `service_bucket_resources`, `service_edges` | `PULSUS_TRACES_HOT_DAYS` |
 | levels | `metric_samples_<N>s` | its `PULSUS_ROLLUP_HOT_DAYS` item; no move rule when that is unset or equals the level's retention |
-| never moves | `log_landing`, `log_streams`, `log_streams_idx`, `metric_labels`, `metric_label_index`, `metric_label_values`, `metric_landing`, `metric_metadata`, `metric_series`, `resources`, `tag_names`, `tag_values`, `trace_landing`, `traces` | created without `storage_policy`, on the server's `default` policy |
+| never moves | `log_landing`, `log_streams`, `log_streams_idx`, `metric_labels`, `metric_label_index`, `metric_label_values`, `metric_landing`, `metric_metadata`, `metric_series`, `resources`, `tag_names`, `tag_values`, `trace_landing`, `traces`, and each rollup stage `metric_samples_<N>s_stage` | created without `storage_policy`, on the server's `default` policy |
 
 A part moves when its newest row is older than the move age, so a UTC day `D` of raw data with move age `H` is local until `D + 1 + H` days; rows written for a day already moved go straight to the cold volume. A level's UTC day `D` with move age `H` is local until `D + 1 + H` days, as raw data is.
 
-**A table on the policy can reach the cold volume without a move rule.** When the policy's first volume has no space for a new part — an insert, a merge or a replica's fetch — the server writes that part to the next volume that has space, the cold volume here. `move_factor` `0` stops the server moving existing parts to free space; it does not stop this. So a table on the policy — a family's table before its move age, a family whose move age equals `PULSUS_RETENTION_DAYS`, or a rollup level before its move age or without one — is local only while the local volume has room. The fourteen tables in the last row are not on the policy and cannot reach the cold volume.
+**A table on the policy can reach the cold volume without a move rule.** When the policy's first volume has no space for a new part — an insert, a merge or a replica's fetch — the server writes that part to the next volume that has space, the cold volume here. `move_factor` `0` stops the server moving existing parts to free space; it does not stop this. So a table on the policy — a family's table before its move age, a family whose move age equals `PULSUS_RETENTION_DAYS`, or a rollup level before its move age or without one — is local only while the local volume has room. The tables in the last row are not on the policy and cannot reach the cold volume.
 
 Every server carries the policy, the same on every replica of every shard. For example, with `PULSUS_STORAGE_POLICY=tiered` and `PULSUS_COLD_VOLUME=cold`:
 
