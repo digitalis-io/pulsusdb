@@ -1465,7 +1465,7 @@ impl<E: EventSource> Inputs<'_, E> {
                 _ = self.cancel.wait_for(|stop| *stop) => Got::Stop,
                 _ = tokio::time::sleep_until(deadline) => Got::Stop,
                 changed = self.shutdown.changed(), if shutdown_open => Got::Shutdown(changed),
-                done = &mut fut => Got::Step(done.is_ok()),
+                done = before(deadline, &mut fut) => done.map_or(Got::Stop, |r| Got::Step(r.is_ok())),
                 ev = self.src.next(), if rx_open => Got::Event(ev),
             };
             match got {
@@ -1500,6 +1500,19 @@ impl<E: EventSource> Inputs<'_, E> {
             Got::Woke | Got::Step(_) => {}
         }
     }
+}
+
+/// Polls `fut` only while the clock is before `deadline`: `None` once it
+/// is not. The timer wakes on whole milliseconds and can still be pending
+/// just after the deadline, so the step is guarded by the clock itself.
+async fn before<F: Future + Unpin>(deadline: Instant, fut: &mut F) -> Option<F::Output> {
+    std::future::poll_fn(|cx| {
+        if Instant::now() >= deadline {
+            return std::task::Poll::Ready(None);
+        }
+        Pin::new(&mut *fut).poll(cx).map(Some)
+    })
+    .await
 }
 
 /// What ended one of the writer's waits.
