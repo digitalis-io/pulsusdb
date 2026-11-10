@@ -4971,6 +4971,50 @@ mod tests {
         );
     }
 
+    /// A deadline between timer ticks (issue #806, code review round 2):
+    /// the timer wakes on whole milliseconds, so it can still be pending
+    /// just after the deadline. On a paused clock the deadline is 300 us
+    /// past a tick and the clock is moved to 301 us, so the deadline has
+    /// passed and the timer has not fired. A step that is ready from then
+    /// on must not be polled: the step fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_step_is_never_polled_after_a_deadline_between_timer_ticks() {
+        let mut st = conn(4);
+        let mut src = ScriptSource(VecDeque::new());
+        let (mut rx_open, mut shutdown_open) = (true, true);
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let mut inputs = Inputs {
+            st: &mut st,
+            src: &mut src,
+            rx_open: &mut rx_open,
+            shutdown: &mut shutdown,
+            shutdown_open: &mut shutdown_open,
+            cancel: &mut cancel,
+        };
+        let deadline = TInstant::now() + Duration::from_micros(300);
+        let late = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&late);
+        // Pending, waking itself at once, until the deadline has passed;
+        // then ready.
+        let step = std::future::poll_fn(move |cx| {
+            if TInstant::now() >= deadline {
+                seen.store(true, Ordering::SeqCst);
+                return std::task::Poll::Ready(Ok(()));
+            }
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        });
+        let (ok, ()) = tokio::join!(inputs.step(step, deadline), async {
+            tokio::time::advance(Duration::from_micros(301)).await;
+        });
+        assert!(!ok, "the step fails at its deadline");
+        assert!(
+            !late.load(Ordering::SeqCst),
+            "the step was polled after its deadline"
+        );
+    }
+
     /// A scripted WebSocket sink (issue #806). It logs every call and
     /// rejects a `start_send` not preceded by a ready `poll_ready`.
     #[derive(Default)]
