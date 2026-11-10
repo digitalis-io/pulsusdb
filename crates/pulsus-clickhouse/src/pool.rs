@@ -641,6 +641,15 @@ impl ChPool {
     /// of [`candidate_order`] with [`preferred_zone`] for reads, from the
     /// read rotation. No I/O and no await.
     pub(crate) fn bind_read(&self) -> usize {
+        self.bind_read_avoiding(None)
+    }
+
+    /// [`Self::bind_read`], never binding `avoid` while another endpoint
+    /// exists (issue #803): a request run again after a server failure does
+    /// not go back to that server, even once it is promoted again.
+    pub(crate) fn bind_read_avoiding(&self, avoid: Option<usize>) -> usize {
+        // Round-3 stub: `avoid` is not consulted.
+        let _ = avoid;
         let rr = self.next_rr_read.fetch_add(1, Ordering::Relaxed);
         let states = self.endpoint_states(self.now_ms());
         let zone = preferred_zone(
@@ -972,6 +981,12 @@ pub(crate) fn test_pool(
         base: now_base,
         query_timeout: Duration::from_secs(5),
     }
+}
+
+/// Promotes endpoint `idx` at the pool's current clock (tests only).
+#[cfg(test)]
+pub(crate) fn promote_for_test(pool: &ChPool, idx: usize) {
+    pool.endpoints[idx].health.mark_healthy(pool.now_ms());
 }
 
 /// Demotes endpoint `idx` at the pool's current clock (tests only).
@@ -1833,5 +1848,24 @@ mod tests {
         for e in &others {
             assert!(!e.is_server_failure(), "{e:?} is not a server failure");
         }
+    }
+
+    /// U12 (issue #803, code review round 1): a bind that must avoid an
+    /// endpoint never returns it while another exists, healthy or not, and
+    /// returns it when it is the only one.
+    #[test]
+    fn a_bind_avoids_the_failed_endpoint_while_another_exists() {
+        let pool = test_pool(
+            vec![(None, "http://a:8123"), (None, "http://b:8123")],
+            None,
+            ReadSpread::All,
+            8,
+        );
+        let binds: Vec<usize> = (0..10).map(|_| pool.bind_read_avoiding(Some(0))).collect();
+        assert_eq!(binds, vec![1; 10]);
+        demote_for_test(&pool, 1);
+        assert_eq!(pool.bind_read_avoiding(Some(0)), 1, "even demoted");
+        let one = test_pool(vec![(None, "http://a:8123")], None, ReadSpread::All, 8);
+        assert_eq!(one.bind_read_avoiding(Some(0)), 0, "the only endpoint");
     }
 }

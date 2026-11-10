@@ -41,16 +41,20 @@ impl<T, E> Attempt<T, E> {
 /// result is `Ok`: with no other healthy endpoint, or on the second attempt,
 /// such an `Ok` becomes `Err(failed_after_success(failure))`, and its value
 /// is dropped.
+///
+/// `attempt` is given the endpoint it must not bind: `None` for the first
+/// attempt, and the failed server's for the second, so the second never goes
+/// back to the server that just failed even when it is healthy again.
 pub async fn run_read_request<T, E, F, Fut>(
     pool: &ChPool,
     mut attempt: F,
     failed_after_success: impl FnOnce(ServerFailure) -> E,
 ) -> Result<T, E>
 where
-    F: FnMut() -> Fut,
+    F: FnMut(Option<usize>) -> Fut,
     Fut: Future<Output = Attempt<T, E>>,
 {
-    let first = attempt().await;
+    let first = attempt(None).await;
     let Some(failure) = first.failure else {
         return first.result;
     };
@@ -59,7 +63,7 @@ where
     }
     // Everything attempt 1 built is dropped before attempt 2 starts.
     drop(first.result);
-    let second = attempt().await;
+    let second = attempt(Some(failure.endpoint)).await;
     match second.failure {
         None => second.result,
         Some(failure) => settle(second.result, failure, failed_after_success),
@@ -122,7 +126,7 @@ mod tests {
         let (script, calls_ref) = (&script, &calls);
         let out = run_read_request(
             pool,
-            move || async move {
+            move |_avoid| async move {
                 calls_ref.fetch_add(1, Ordering::SeqCst);
                 let (result, failure) = script
                     .lock()

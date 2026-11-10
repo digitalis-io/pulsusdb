@@ -36,7 +36,11 @@ async fn serving_pool(state: &AppState) -> Result<Arc<ChPool>, ApiError> {
 /// cache (clone each slot out, never hold a lock across an `.await`) —
 /// `503 unavailable` before either exists, matching `/ready` — with the
 /// request's `lookback_delta` when it set one.
-async fn engine_for(state: &AppState, lookback_ms: Option<i64>) -> Result<MetricsEngine, ApiError> {
+async fn engine_for(
+    state: &AppState,
+    lookback_ms: Option<i64>,
+    avoid: Option<usize>,
+) -> Result<MetricsEngine, ApiError> {
     let pool = serving_pool(state).await?;
     let label_cache = state
         .label_cache
@@ -52,6 +56,7 @@ async fn engine_for(state: &AppState, lookback_ms: Option<i64>) -> Result<Metric
         &state.config,
         state.eval_gate.clone(),
         Arc::clone(&state.rollup_levels),
+        avoid,
     )
     .map(crate::request_id::tag)
     .map_err(|_| ApiError::Unavailable)?;
@@ -71,8 +76,9 @@ fn metrics_engine(
     config: &Config,
     eval_gate: Arc<pulsus_read::EvalGate>,
     rollup_levels: Arc<pulsus_read::metrics::rollup::LevelSlot>,
+    avoid: Option<usize>,
 ) -> Result<MetricsEngine, ChError> {
-    let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
+    let client = ChClient::from_shared_pool_avoiding(pool, config.query_timeout.0, avoid)
         .with_consistency(chconfig::consistency_from(config))?;
     Ok(
         MetricsEngine::new(client, label_cache, chconfig::metrics_config_from(config))
@@ -103,8 +109,8 @@ where
     let run = &run;
     run_read_request(
         &pool,
-        move || async move {
-            let engine = match engine_for(state, lookback_ms).await {
+        move |avoid| async move {
+            let engine = match engine_for(state, lookback_ms, avoid).await {
                 Ok(engine) => Arc::new(engine),
                 Err(e) => return Attempt::failed_to_start(e),
             };

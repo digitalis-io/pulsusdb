@@ -108,7 +108,18 @@ impl ChClient {
     /// cheap `Arc::clone` rather than opening a second connection pool
     /// (issue #13 architect plan, resolved open question #1).
     pub fn from_shared_pool(pool: Arc<ChPool>, query_timeout: Duration) -> Self {
-        let read_binding = ReadBinding::new(pool.bind_read());
+        Self::from_shared_pool_avoiding(pool, query_timeout, None)
+    }
+
+    /// [`Self::from_shared_pool`], its reads bound to any endpoint but
+    /// `avoid` while another exists (issue #803): the client of a request
+    /// run again after `avoid` failed.
+    pub fn from_shared_pool_avoiding(
+        pool: Arc<ChPool>,
+        query_timeout: Duration,
+        avoid: Option<usize>,
+    ) -> Self {
+        let read_binding = ReadBinding::new(pool.bind_read_avoiding(avoid));
         Self {
             pool,
             read_binding,
@@ -126,7 +137,14 @@ impl ChClient {
     /// Binds this client's reads to a new endpoint and clears its failure
     /// (issue #803). Never call it while one of its reads is open.
     pub fn rebind(&self) {
-        self.read_binding.rebind(self.pool.bind_read());
+        self.rebind_avoiding(None);
+    }
+
+    /// [`Self::rebind`] to any endpoint but `avoid` while another exists
+    /// (issue #803): after `avoid` failed.
+    pub fn rebind_avoiding(&self, avoid: Option<usize>) {
+        self.read_binding
+            .rebind(self.pool.bind_read_avoiding(avoid));
     }
 
     /// Whether an endpoint other than `endpoint` is healthy (issue #803):
@@ -145,7 +163,7 @@ impl ChClient {
         failed_after_success: impl FnOnce(ServerFailure) -> E,
     ) -> Result<T, E>
     where
-        F: FnMut() -> Fut,
+        F: FnMut(Option<usize>) -> Fut,
         Fut: Future<Output = crate::request::Attempt<T, E>>,
     {
         crate::request::run_read_request(&self.pool, attempt, failed_after_success).await
@@ -851,9 +869,13 @@ mod tests {
         let (pool_ref, calls_ref, seen_ref) = (&pool, &calls, &seen);
         let out = run_read_request(
             &pool,
-            move || async move {
+            move |avoid| async move {
                 let n = calls_ref.fetch_add(1, Ordering::SeqCst) + 1;
-                let c = client(pool_ref);
+                let c = ChClient::from_shared_pool_avoiding(
+                    Arc::clone(pool_ref),
+                    Duration::from_secs(5),
+                    avoid,
+                );
                 let (l1, l2, l3) = tokio::join!(c.lease_read(), c.lease_read(), c.lease_read());
                 let (l1, l2, l3) = (
                     l1.expect("lease 1"),
@@ -898,5 +920,78 @@ mod tests {
         assert_eq!(c.server_failure(), None, "rebind clears the failure");
         let lease = c.lease_read().await.expect("lease");
         assert_eq!(lease.endpoint(), 2);
+    }
+
+    // ---- issue #803, code review round 1: a rerun never goes back ----
+
+    fn pool2() -> Arc<ChPool> {
+        Arc::new(test_pool(
+            vec![(None, "http://a:8123"), (None, "http://b:8123")],
+            None,
+            ReadSpread::All,
+            8,
+        ))
+    }
+
+    /// R7: the server that failed is promoted again before the rerun, and
+    /// another request's bind puts the rotation back on it. The rerun is
+    /// bound to the other server all the same, and its answer is used.
+    #[tokio::test]
+    async fn a_rerun_never_binds_the_server_that_failed_even_once_it_is_promoted() {
+        let pool = pool2();
+        let seen: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        let calls = AtomicUsize::new(0);
+        let (pool_ref, seen_ref, calls_ref) = (&pool, &seen, &calls);
+        let out = run_read_request(
+            &pool,
+            move |avoid| async move {
+                let n = calls_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                let c = ChClient::from_shared_pool_avoiding(
+                    Arc::clone(pool_ref),
+                    Duration::from_secs(5),
+                    avoid,
+                );
+                let lease = c.lease_read().await.expect("lease");
+                let ep = lease.endpoint();
+                seen_ref.lock().expect("seen").push(ep);
+                if ep == 0 {
+                    // Server `a` fails whenever it is asked.
+                    lease.report_read_failure(&ChError::Io("reset".to_string()));
+                }
+                drop(lease);
+                if n == 1 {
+                    // Another request binds meanwhile, and `a` is promoted.
+                    let _other = client(pool_ref);
+                    crate::pool::promote_for_test(pool_ref, 0);
+                }
+                Attempt {
+                    result: Ok::<usize, ChError>(n),
+                    failure: c.server_failure(),
+                }
+            },
+            ChError::from,
+        )
+        .await;
+        let seen = seen.lock().expect("seen").clone();
+        assert_eq!(seen, vec![0, 1], "the rerun is bound to `b`");
+        assert_eq!(out.expect("the rerun on `b` is accepted"), 2);
+    }
+
+    /// K8: a client rebound after its server failed is not bound to that
+    /// server again, even once it is promoted and the rotation is back on
+    /// it — the tail's rebind between polls.
+    #[tokio::test]
+    async fn rebind_avoiding_skips_the_failed_server_even_once_promoted() {
+        let pool = pool2();
+        let c = client(&pool);
+        {
+            let lease = c.lease_read().await.expect("lease");
+            assert_eq!(lease.endpoint(), 0);
+            lease.report_read_failure(&ChError::Io("reset".to_string()));
+        }
+        let _other = client(&pool);
+        crate::pool::promote_for_test(&pool, 0);
+        c.rebind_avoiding(Some(0));
+        assert_eq!(c.lease_read().await.expect("lease").endpoint(), 1);
     }
 }

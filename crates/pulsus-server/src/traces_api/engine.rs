@@ -42,14 +42,21 @@ async fn engine_for(
     state: &AppState,
     tenant: Tenant,
     statement_prefix: Option<&str>,
+    avoid: Option<usize>,
 ) -> Result<TraceEngine, ApiError> {
     let pool = serving_pool(state).await?;
     // Issue #114: the consistency-config invariant is already enforced at
     // config load, so this is unreachable in the shipped binary; a failure maps
     // to the existing 503 "not serving" semantics.
-    let engine = trace_engine(pool, &state.config, state.graph_target.clone(), tenant)
-        .map(crate::request_id::tag)
-        .map_err(|_| ApiError::PoolUnavailable)?;
+    let engine = trace_engine(
+        pool,
+        &state.config,
+        state.graph_target.clone(),
+        tenant,
+        avoid,
+    )
+    .map(crate::request_id::tag)
+    .map_err(|_| ApiError::PoolUnavailable)?;
     Ok(match statement_prefix {
         Some(prefix) => engine.with_statement_prefix(prefix),
         None => engine,
@@ -64,8 +71,9 @@ fn trace_engine(
     config: &Config,
     graph_target: pulsus_read::GraphTargetCache,
     tenant: Tenant,
+    avoid: Option<usize>,
 ) -> Result<TraceEngine, ChError> {
-    let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
+    let client = ChClient::from_shared_pool_avoiding(pool, config.query_timeout.0, avoid)
         .with_consistency(chconfig::consistency_from(config))?;
     Ok(
         TraceEngine::new(client, chconfig::trace_read_config_from(config), tenant)
@@ -100,8 +108,8 @@ where
     let run = &run;
     run_read_request(
         &pool,
-        move || async move {
-            let engine = match engine_for(state, tenant.clone(), statement_prefix).await {
+        move |avoid| async move {
+            let engine = match engine_for(state, tenant.clone(), statement_prefix, avoid).await {
                 Ok(engine) => Arc::new(engine),
                 Err(e) => return Attempt::failed_to_start(e),
             };

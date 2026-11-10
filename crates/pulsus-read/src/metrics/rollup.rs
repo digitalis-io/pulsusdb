@@ -282,8 +282,8 @@ pub async fn refresh_levels(
     // attempt is saved.
     let outcome = client
         .run_read_request(
-            move || async move {
-                client.rebind();
+            move |avoid| async move {
+                client.rebind_avoiding(avoid);
                 let read = levels_attempt(client, db, dist_suffix, cluster).await;
                 pulsus_clickhouse::Attempt {
                     result: Ok::<_, pulsus_clickhouse::ChError>(read),

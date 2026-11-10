@@ -36,12 +36,16 @@ async fn serving_pool(state: &AppState) -> Result<Arc<ChPool>, ApiError> {
 }
 
 /// A [`LogQlEngine`] over the serving pool, its client bound to one server.
-async fn engine_for(state: &AppState, tenant: Tenant) -> Result<LogQlEngine, ApiError> {
+async fn engine_for(
+    state: &AppState,
+    tenant: Tenant,
+    avoid: Option<usize>,
+) -> Result<LogQlEngine, ApiError> {
     let pool = serving_pool(state).await?;
     // Issue #114: the consistency-config invariant is already enforced at
     // config load, so this is unreachable in the shipped binary; a failure maps
     // to the existing 503 "not serving" semantics.
-    logql_engine(pool, &state.config, tenant)
+    logql_engine(pool, &state.config, tenant, avoid)
         .map(crate::request_id::tag)
         .map_err(|_| ApiError::PoolUnavailable)
 }
@@ -54,8 +58,9 @@ fn logql_engine(
     pool: Arc<ChPool>,
     config: &Config,
     tenant: Tenant,
+    avoid: Option<usize>,
 ) -> Result<LogQlEngine, ChError> {
-    let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
+    let client = ChClient::from_shared_pool_avoiding(pool, config.query_timeout.0, avoid)
         .with_consistency(chconfig::consistency_from(config))?;
     Ok(LogQlEngine::new(
         client,
@@ -67,7 +72,7 @@ fn logql_engine(
 /// The live tail's engine: one per connection, rebound by the tail itself
 /// between polls when its server fails (`tail.rs`).
 pub(super) async fn tail_engine(state: &AppState, tenant: Tenant) -> Result<LogQlEngine, ApiError> {
-    engine_for(state, tenant).await
+    engine_for(state, tenant, None).await
 }
 
 /// Runs one logs read request: builds the engine, then `run(engine)`, which
@@ -91,8 +96,8 @@ where
     let run = &run;
     run_read_request(
         &pool,
-        move || async move {
-            let engine = match engine_for(state, tenant.clone()).await {
+        move |avoid| async move {
+            let engine = match engine_for(state, tenant.clone(), avoid).await {
                 Ok(engine) => Arc::new(engine),
                 Err(e) => return Attempt::failed_to_start(e),
             };

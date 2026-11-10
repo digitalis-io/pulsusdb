@@ -1088,8 +1088,8 @@ impl LabelCache {
         let config = &self.config;
         let outcome = client
             .run_read_request(
-                move || async move {
-                    client.rebind();
+                move |avoid| async move {
+                    client.rebind_avoiding(avoid);
                     let result = super::refresh::sweep_attempt(client, config, tenants).await;
                     pulsus_clickhouse::Attempt {
                         result,

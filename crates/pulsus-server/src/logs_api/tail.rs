@@ -2721,6 +2721,8 @@ mod tests {
         /// fetcher has moved off.
         failover: bool,
         last_failed: bool,
+        /// Issue #803: from this poll on, every poll fails, after a delay.
+        failing_polls_from: Option<(usize, Duration)>,
     }
 
     impl ScriptedFetcher {
@@ -2741,7 +2743,13 @@ mod tests {
                 catch_script: Box::new(catch_script),
                 failover: false,
                 last_failed: false,
+                failing_polls_from: None,
             }
+        }
+
+        fn with_failing_polls_from(mut self, n: usize, delay: Duration) -> Self {
+            self.failing_polls_from = Some((n, delay));
+            self
         }
 
         fn with_failover(mut self) -> Self {
@@ -2768,6 +2776,15 @@ mod tests {
             });
             let n = self.polls;
             self.polls += 1;
+            if let Some((from, delay)) = self.failing_polls_from
+                && n >= from
+            {
+                tokio::time::sleep(delay).await;
+                self.last_failed = true;
+                return Err(ReadError::PipelineInvalid {
+                    reason: format!("poll {n} failed"),
+                });
+            }
             let page = (self.poll_script)(n, lower, upper_ns);
             self.record(Call::PollDone {
                 joined: page.joined.clone(),
@@ -3242,6 +3259,64 @@ mod tests {
         );
         assert_eq!(lines.iter().filter(|l| *l == "B1").count(), 1, "{lines:?}");
         assert!(has_admit(&calls), "{calls:#?}");
+    }
+
+    /// T10 (issue #803, code review round 1): a poll whose server failed
+    /// is repeated once, and an accepted probe of a waiting stream between
+    /// the two does not give the poll a third run: the second failure of
+    /// that poll closes the tail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_accepted_probe_between_two_failures_of_a_poll_does_not_reset_its_count() {
+        let cfg = test_cfg();
+        let fetcher = ScriptedFetcher::new(
+            h1_polls,
+            // Every probe answers, and finds nothing, so stream 2 stays
+            // waiting and is probed again each time its timer is due.
+            |_, _| Vec::new(),
+            |_| CatchStep::Page(catch_page(&[], 0, None, &[])),
+        )
+        .with_failover()
+        // Polls 2 on fail, each after 20 ms, so the recheck timer is due
+        // between two of them.
+        .with_failing_polls_from(2, Duration::from_millis(20));
+        let ScriptedRun {
+            handle,
+            shutdown,
+            closed,
+            log,
+            ..
+        } = ScriptedRun::start(fetcher, cfg);
+        let ended = tokio::time::timeout(Duration::from_secs(3), handle).await;
+        let _ = shutdown.send(true);
+        let calls = log.lock().unwrap().clone();
+        assert!(
+            ended.is_ok(),
+            "the second failure of the poll closes the tail: {calls:#?}"
+        );
+        let polls: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, c))| matches!(c, Call::Poll { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            polls.len(),
+            4,
+            "polls 0, 1, then the failing poll twice: {calls:#?}"
+        );
+        assert!(
+            calls[polls[2]..polls[3]]
+                .iter()
+                .any(|(_, c)| matches!(c, Call::FirstLines { .. })),
+            "a probe ran between the two failures: {calls:#?}"
+        );
+        let frame = closed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("close was sent")
+            .expect("with a reason");
+        assert_eq!(frame.reason.as_str(), "poll 3 failed");
     }
 
     /// H6 (issue #804): an empty probe, or a catch-up that fetches nothing

@@ -282,9 +282,13 @@ async fn three_servers_a_request_whose_server_drops_runs_again_on_one_other() {
     let (pool_ref, calls_ref, relay_ref, m1_ref, m2_ref) = (&pool, &calls, &relay_a, &m1, &m2);
     let out = run_read_request(
         &pool,
-        move || async move {
+        move |avoid| async move {
             let n = calls_ref.fetch_add(1, Ordering::SeqCst) + 1;
-            let client = ChClient::from_shared_pool(Arc::clone(pool_ref), Duration::from_secs(10));
+            let client = ChClient::from_shared_pool_avoiding(
+                Arc::clone(pool_ref),
+                Duration::from_secs(10),
+                avoid,
+            );
             if n == 1 {
                 marked_read(&client, m1_ref)
                     .await

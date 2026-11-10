@@ -732,9 +732,13 @@ async fn startup_checks(
 ) -> Result<u32, NameCheckError> {
     run_read_request(
         pool,
-        || async {
-            let client = match ChClient::from_shared_pool(Arc::clone(pool), config.query_timeout.0)
-                .with_consistency(consistency_from(config))
+        |avoid| async move {
+            let client = match ChClient::from_shared_pool_avoiding(
+                Arc::clone(pool),
+                config.query_timeout.0,
+                avoid,
+            )
+            .with_consistency(consistency_from(config))
             {
                 Ok(client) => client,
                 Err(e) => return Attempt::failed_to_start(NameCheckError::Connect(e)),

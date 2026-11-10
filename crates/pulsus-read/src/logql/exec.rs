@@ -465,6 +465,12 @@ impl LogQlEngine {
         self.client.rebind();
     }
 
+    /// [`Self::rebind`] to any endpoint but `avoid` while another exists
+    /// (issue #803): a tail whose server failed does not go back to it.
+    pub fn rebind_avoiding(&self, avoid: Option<usize>) {
+        self.client.rebind_avoiding(avoid);
+    }
+
     /// Whether an endpoint other than `endpoint` is healthy (issue #803):
     /// whether a tail whose server failed may repeat its poll elsewhere.
     pub fn other_healthy(&self, endpoint: usize) -> bool {
