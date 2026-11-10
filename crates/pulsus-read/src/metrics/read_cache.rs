@@ -32,7 +32,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use pulsus_clickhouse::{ChClient, QuerySettings, Row};
+use pulsus_clickhouse::{Attempt, ChClient, ChError, QuerySettings, Row};
 use pulsus_model::{FloatHistogram, Tenant};
 use pulsus_promql::plan::RangeSource;
 use pulsus_promql::{AggOp, Annotations, FillValues, PlanExpr, QueryPlan, SelectorSpec, SetOp};
@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
 use super::exec::{MetricQueryParams, MetricsEngine, PlanFacts};
-use super::rollup::LevelSlot;
+use super::rollup::{LevelSlot, Levels};
 use crate::ReadError;
 use crate::logql::escape::ch_string;
 use crate::logql::{HistMatrixSeries, HistOrFloat, MatrixSeries, QueryResult};
@@ -308,6 +308,20 @@ struct PollState {
     identity: Option<Arc<[String]>>,
     /// The start of the last successful identity read.
     identity_ok_at: Option<i64>,
+}
+
+impl PollState {
+    /// One lag read: appended, entries older than five minutes dropped.
+    fn push_lag(&mut self, at_ms: i64, max_delay_s: u64) {
+        self.lag_history.push_back((at_ms, max_delay_s));
+        while self
+            .lag_history
+            .front()
+            .is_some_and(|(t, _)| *t < at_ms - LAG_HISTORY_MS)
+        {
+            self.lag_history.pop_front();
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -617,50 +631,42 @@ impl ReadCache {
         }
     }
 
-    /// P1: the worst `metric_*` replica lag, read at `at_ms`.
-    pub fn record_lag(&self, at_ms: i64, max_delay_s: u64) {
-        let mut poll = self.poll_write();
-        poll.lag_history.push_back((at_ms, max_delay_s));
-        while poll
-            .lag_history
-            .front()
-            .is_some_and(|(t, _)| *t < at_ms - LAG_HISTORY_MS)
-        {
-            poll.lag_history.pop_front();
-        }
+    /// P1 seam for tests: one lag read, saved alone.
+    #[cfg(test)]
+    pub(crate) fn record_lag(&self, at_ms: i64, max_delay_s: u64) {
+        self.poll_write().push_lag(at_ms, max_delay_s);
     }
 
-    /// P2: each level's watermark, `(width, watermark)`, read at `at_ms`.
-    pub fn record_watermarks(&self, at_ms: i64, watermarks: Vec<(i64, i64)>) {
-        self.poll_write().watermarks = Some((at_ms, watermarks));
+    /// P3 seam for tests: one identity read, saved alone.
+    #[cfg(test)]
+    pub(crate) fn record_identity(&self, started_ms: i64, ids: Vec<String>) {
+        self.commit_poll(PollRead {
+            lag: None,
+            watermarks: None,
+            identity: (started_ms, ids),
+        });
     }
 
-    /// P3: the database identity set, read by a statement started at
-    /// `started_ms`. A set other than the last clears the cache.
-    pub fn record_identity(&self, started_ms: i64, ids: Vec<String>) {
-        let ids: Arc<[String]> = ids.into();
-        let changed = {
-            let mut poll = self.poll_write();
-            let changed = poll.identity.as_ref().is_some_and(|last| **last != *ids);
-            poll.identity = Some(ids);
-            poll.identity_ok_at = Some(started_ms);
-            changed
-        };
-        if changed {
-            self.clear_for_new_identity();
-        }
-    }
-
-    /// Saves what one poll read.
+    /// Saves `read` in one hold of the poll lock. A set of ids other than
+    /// the last clears the cache inside that hold, so no request sees the
+    /// new identity beside the old store. Lock order: poll, then store.
     pub fn commit_poll(&self, read: PollRead) {
+        let mut poll = self.poll_write();
         if let Some((at, s)) = read.lag {
-            self.record_lag(at, s);
+            poll.push_lag(at, s);
         }
-        if let Some((at, w)) = read.watermarks {
-            self.record_watermarks(at, w);
+        if let Some(w) = read.watermarks {
+            poll.watermarks = Some(w);
         }
         let (started, ids) = read.identity;
-        self.record_identity(started, ids);
+        let ids: Arc<[String]> = ids.into();
+        let changed = poll.identity.as_ref().is_some_and(|last| **last != *ids);
+        poll.identity = Some(ids);
+        poll.identity_ok_at = Some(started);
+        if changed {
+            // `poll` is still held.
+            self.clear_for_new_identity();
+        }
     }
 
     /// The clear a new database identity triggers.
@@ -1237,7 +1243,6 @@ where
     T: FnOnce(MetricQueryParams) -> TF,
     TF: Future<Output = Result<Evaluated, E>>,
 {
-    let _ = attempt_ok;
     let g0 = cache.generation();
     // The generation the miss path stores under: `g0`, or the one read
     // after a hit found a clear had run.
@@ -1295,7 +1300,8 @@ where
             if let Some(hook) = &cache.after_merge {
                 hook(cache);
             }
-            let stored = if cache.fills_allowed(v)
+            let stored = if attempt_ok()
+                && cache.fills_allowed(v)
                 && cache.identity_fresh()
                 && let Some(c1) = through(&answer)
                 && let Some(entry) = keep(
@@ -1336,7 +1342,8 @@ where
 
     let (result, annotations, charged) = full(p).await?;
     let mut stored_through = None;
-    if !annotations.has_mergeable()
+    if attempt_ok()
+        && !annotations.has_mergeable()
         && cache.fills_allowed(v)
         && cache.identity_fresh()
         && let Some(c1) = through(&result)
@@ -1382,7 +1389,10 @@ pub async fn answer_range_on(
         let (r, a, f) = engine.query_with_facts(tenant, expr, &q).await?;
         Ok::<_, ReadError>((r, a, f.charged_samples))
     };
-    answer_range(cache, req, eval, eval, &|| true).await
+    answer_range(cache, req, eval, eval, &|| {
+        engine.server_failure().is_none()
+    })
+    .await
 }
 
 async fn bypass_full<E, F, FF>(
@@ -1495,7 +1505,63 @@ async fn fetch<R: pulsus_clickhouse::ChRow>(
     Ok(out)
 }
 
-/// One poll: P1 (clustered), P2, P3.
+/// One poll attempt on `client`'s binding: P1, P2, P3. Saves nothing; the
+/// first error ends it.
+async fn poll_attempt(
+    now: &(dyn Fn() -> i64 + Send + Sync),
+    client: &ChClient,
+    db: &str,
+    cluster: Option<&str>,
+    levels: Option<Arc<Levels>>,
+) -> Result<PollRead, ChError> {
+    let lag = match cluster {
+        Some(c) => {
+            let at = now();
+            let rows = fetch::<LagRow>(client, &lag_sql(c, db)).await?;
+            Some((at, rows.first().map_or(0, |r| r.lag_s)))
+        }
+        None => None,
+    };
+    let mut watermarks = None;
+    if let Some(lv) = levels.filter(|l| !l.levels.is_empty()) {
+        let tables: Vec<String> = lv.levels.iter().map(|l| l.table.clone()).collect();
+        if let Some(sql) = watermark_sql(db, &tables, cluster.is_some()) {
+            let at = now();
+            let rows = fetch::<WatermarkRow>(client, &sql).await?;
+            let shards = lv.shards.max(1);
+            let wms = lv
+                .levels
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let wm = (1..=shards)
+                        .map(|s| {
+                            rows.iter()
+                                .find(|r| r.level as usize == i && r.shard == s)
+                                .map_or(0, |r| r.watermark_ms)
+                        })
+                        .min()
+                        .unwrap_or(0);
+                    (l.res_ms, wm)
+                })
+                .collect();
+            watermarks = Some((at, wms));
+        }
+    }
+    let started = now();
+    let rows = fetch::<IdentityRow>(client, &identity_sql(cluster, db)).await?;
+    Ok(PollRead {
+        lag,
+        watermarks,
+        identity: (
+            started,
+            rows.into_iter().next().map_or_else(Vec::new, |r| r.ids),
+        ),
+    })
+}
+
+/// One poll: P1 (clustered), P2, P3, as one read request. Only an attempt
+/// that succeeds saves anything, and it saves all three together.
 pub async fn poll_once(
     cache: &ReadCache,
     client: &ChClient,
@@ -1503,57 +1569,26 @@ pub async fn poll_once(
     cluster: Option<&str>,
     levels: &LevelSlot,
 ) {
-    if let Some(c) = cluster {
-        let at = cache.now_ms();
-        match fetch::<LagRow>(client, &lag_sql(c, db)).await {
-            Ok(rows) => cache.record_lag(at, rows.first().map_or(0, |r| r.lag_s)),
-            Err(err) => {
-                cache.record_poll_failure();
-                tracing::warn!(error = %err, "read cache: replica lag read failed");
-            }
-        }
-    }
-    if let Some(lv) = levels.get().filter(|l| !l.levels.is_empty()) {
-        let tables: Vec<String> = lv.levels.iter().map(|l| l.table.clone()).collect();
-        if let Some(sql) = watermark_sql(db, &tables, cluster.is_some()) {
-            let at = cache.now_ms();
-            match fetch::<WatermarkRow>(client, &sql).await {
-                Ok(rows) => {
-                    let shards = lv.shards.max(1);
-                    let wms = lv
-                        .levels
-                        .iter()
-                        .enumerate()
-                        .map(|(i, l)| {
-                            let wm = (1..=shards)
-                                .map(|s| {
-                                    rows.iter()
-                                        .find(|r| r.level as usize == i && r.shard == s)
-                                        .map_or(0, |r| r.watermark_ms)
-                                })
-                                .min()
-                                .unwrap_or(0);
-                            (l.res_ms, wm)
-                        })
-                        .collect();
-                    cache.record_watermarks(at, wms);
+    let now = || cache.now_ms();
+    let now = &now;
+    let read = client
+        .run_read_request(
+            |avoid| async move {
+                client.rebind_avoiding(avoid);
+                let result = poll_attempt(now, client, db, cluster, levels.get()).await;
+                Attempt {
+                    result,
+                    failure: client.server_failure(),
                 }
-                Err(err) => {
-                    cache.record_poll_failure();
-                    tracing::warn!(error = %err, "read cache: watermark read failed");
-                }
-            }
-        }
-    }
-    let started = cache.now_ms();
-    match fetch::<IdentityRow>(client, &identity_sql(cluster, db)).await {
-        Ok(rows) => cache.record_identity(
-            started,
-            rows.into_iter().next().map_or_else(Vec::new, |r| r.ids),
-        ),
+            },
+            ChError::from,
+        )
+        .await;
+    match read {
+        Ok(read) => cache.commit_poll(read),
         Err(err) => {
             cache.record_poll_failure();
-            tracing::warn!(error = %err, "read cache: identity read failed");
+            tracing::warn!(error = %err, "read cache: poll failed; nothing it read is saved");
         }
     }
 }
