@@ -75,9 +75,9 @@ pub struct ChClient {
 impl ChClient {
     /// Connects `cfg.pool_size` connections and validates them with one
     /// `SELECT 1` (see [`ChPool::connect`], which emits a warning to stderr if
-    /// `tls_skip_verify` is set: edge case #5 — this relaxes certificate
+    /// `tls_skip_verify` is set (edge case #5 — this relaxes certificate
     /// verification only, it must never look like a silent plaintext
-    /// downgrade).
+    /// downgrade)).
     pub async fn new(cfg: ChConnConfig) -> Result<Self, ChError> {
         cfg.validate()?;
         let default_timeout = cfg.query_timeout;
