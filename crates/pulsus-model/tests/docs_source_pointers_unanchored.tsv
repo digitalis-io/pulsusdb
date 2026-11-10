@@ -1125,7 +1125,7 @@ docs/traceql-schema-migration.md	.github/workflows/ci.yml:567-572	no_name_the_ta
 docs/traceql-schema-migration.md	.github/workflows/ci.yml:571	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-clickhouse/src/client.rs:195	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-clickhouse/src/client.rs:206	no_name_the_target_file_holds
-docs/traceql-schema-migration.md	crates/pulsus-clickhouse/src/pool.rs:886-885	no_name_the_target_file_holds
+docs/traceql-schema-migration.md	crates/pulsus-clickhouse/src/pool.rs:887-886	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-config/src/model.rs:519	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-config/src/model.rs:519-521	no_name_the_target_file_holds
 docs/traceql-schema-migration.md	crates/pulsus-config/src/model.rs:520	no_name_the_target_file_holds

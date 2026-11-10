@@ -68,11 +68,12 @@ use crate::tls;
 const STALE_AFTER: Duration = Duration::from_secs(30);
 const STALE_AFTER_MS: u64 = 30_000;
 
-/// After a transport failure demotes an endpoint, it is skipped entirely
-/// (while any other endpoint is healthy) until this cooldown elapses, after
-/// which it re-enters as a probe candidate, so a dead endpoint costs a write
-/// at most one failed probe or statement per cooldown window beyond those
-/// already running on it when it went down.
+/// After a transport failure demotes an endpoint, a write's `get()` reaches
+/// it only when no healthy endpoint ahead of it answers, and probes it before
+/// handing it out; once this cooldown elapses it ranks above the endpoints
+/// still cooling. This is not a cap on failed probes: concurrent callers can
+/// probe the same endpoint at once, and when no healthy endpoint answers,
+/// callers reach it before its cooldown ends.
 const UNHEALTHY_COOLDOWN_MS: u64 = 5_000;
 
 /// How often the background re-probe pass ([`spawn_reprobe_loop`]) scans for

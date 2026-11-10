@@ -101,11 +101,13 @@ held across an `.await`, never in `Drop` — that makes every state change (a
 demotion, a promotion, or a probe outcome) one atomic critical section. The
 next `get()` skips a demoted endpoint until a short cooldown elapses, then
 re-admits it as a probe candidate; a successful probe re-promotes it
-immediately, and new read requests skip it while it is demoted. This matches
-"immediately start using other AZs on disconnect" with zero healthy-path
-overhead. Every statement already running on an endpoint when it goes down
-can fail on it, however many requests those are: each such read request runs
-again elsewhere, and each such write returns its error.
+immediately. New read requests are bound to it while it is demoted only when
+no endpoint is healthy. This matches "immediately start using other AZs on
+disconnect" with zero healthy-path overhead. Every statement already running
+on an endpoint when it goes down can fail on it, however many requests those
+are: each such write returns its error, and each such read request runs again
+on another endpoint if one is healthy at that moment, or returns its error if
+none is.
 
 A read request whose endpoint fails is not continued elsewhere: its partial results are dropped and the whole request runs once more on another healthy endpoint, never the one that failed, and a live tail repeats the failed read on another endpoint. No read runs more than twice. A read timeout is the request's own deadline: it demotes nothing and is not run again.
 
