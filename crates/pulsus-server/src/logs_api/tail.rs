@@ -2224,6 +2224,8 @@ mod tests {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ReadyMode {
         Ready,
+        /// Waits until the test releases [`WireSender::ready_gate`].
+        Gate,
         Pending,
         Fail,
         Sleep(Duration),
@@ -2270,6 +2272,7 @@ mod tests {
         /// #240 re-review: the fake captures, never re-renders).
         closed: Arc<Mutex<Option<Option<CloseFrame>>>>,
         gate: Arc<tokio::sync::Notify>,
+        ready_gate: Arc<tokio::sync::Notify>,
     }
 
     impl WireSender {
@@ -2285,6 +2288,7 @@ mod tests {
                 wire: Arc::new(Mutex::new(Vec::new())),
                 closed: Arc::new(Mutex::new(None)),
                 gate: Arc::new(tokio::sync::Notify::new()),
+                ready_gate: Arc::new(tokio::sync::Notify::new()),
             }
         }
 
@@ -2329,6 +2333,7 @@ mod tests {
             self.note(Wire::ReadyStart);
             match self.ready_mode {
                 ReadyMode::Ready => {}
+                ReadyMode::Gate => self.ready_gate.notified().await,
                 ReadyMode::Pending => std::future::pending::<()>().await,
                 ReadyMode::Fail => return Err(()),
                 ReadyMode::Sleep(d) => tokio::time::sleep(d).await,
@@ -4885,6 +4890,82 @@ mod tests {
         assert!(wire.lock().unwrap().is_empty());
         assert_eq!(*closed.lock().unwrap(), Some(None), "a bare Close");
         assert_eq!(TInstant::now() - t0, ms(100));
+    }
+
+    /// D15 (issue #806, code review round 1): shutdown that reaches the
+    /// connection while the socket is not yet ready still bounds the flush
+    /// that follows: it is cut at the drain deadline, not the send timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_during_readiness_bounds_the_flush_that_follows() {
+        let sender = WireSender::new()
+            .ready(ReadyMode::Gate)
+            .flush(FlushMode::Pending);
+        let (log, wire, closed, ready_gate) = (
+            Arc::clone(&sender.log),
+            Arc::clone(&sender.wire),
+            Arc::clone(&sender.closed),
+            Arc::clone(&sender.ready_gate),
+        );
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(run_tail(
+            polls(&["A1"], None),
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            test_cfg(),
+            rx,
+        ));
+        yield_until(|| logged(&log, |w| *w == Wire::ReadyStart) == 1).await;
+        let t0 = TInstant::now();
+        tx.send(true).expect("receiver alive");
+        tokio::time::sleep(ms(10)).await;
+        ready_gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the flush is cut at the drain deadline, not the 60 s send timeout")
+            .expect("no panic");
+        assert_eq!(TInstant::now() - t0, ms(GRACE_MS));
+        assert_eq!(
+            logged(&log, |w| matches!(w, Wire::Start(_))),
+            1,
+            "A1 was handed over"
+        );
+        assert!(wire.lock().unwrap().is_empty());
+        assert!(
+            closed.lock().unwrap().is_none(),
+            "no Close after a half-sent frame"
+        );
+    }
+
+    /// The select order of one socket step (issue #806, code review round
+    /// 1): with the deadline already reached and the step ready, the step
+    /// fails without the step being polled.
+    #[tokio::test(start_paused = true)]
+    async fn a_step_whose_deadline_has_come_is_not_polled() {
+        let mut st = conn(4);
+        let mut src = ScriptSource(VecDeque::new());
+        let (mut rx_open, mut shutdown_open) = (true, true);
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let mut inputs = Inputs {
+            st: &mut st,
+            src: &mut src,
+            rx_open: &mut rx_open,
+            shutdown: &mut shutdown,
+            shutdown_open: &mut shutdown_open,
+            cancel: &mut cancel,
+        };
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&polled);
+        let ready_step = std::future::poll_fn(move |_| {
+            seen.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        });
+        let ok = inputs.step(ready_step, TInstant::now()).await;
+        assert!(!ok, "the step fails at its deadline");
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "a step whose deadline has come is not polled"
+        );
     }
 
     /// A scripted WebSocket sink (issue #806). It logs every call and
