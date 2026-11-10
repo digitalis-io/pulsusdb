@@ -1,8 +1,9 @@
 //! Issue #778: the allocator settings the read cache runs with.
 //!
 //! glibc serves a request from free heap space when a free chunk or the top
-//! of the heap holds it. Otherwise a request whose block (the request and
-//! glibc's chunk header) is at or above its mapping threshold gets a mapping
+//! of the heap holds it. Otherwise a request whose block (glibc's chunk size:
+//! the request plus an 8-byte size field, rounded up to a multiple of 16
+//! bytes, at least 32) is at or above its mapping threshold gets a mapping
 //! of its own, returned to the system when it is freed, and a smaller one
 //! grows the heap, which keeps what is freed for reuse except what glibc
 //! trims from the top of the heap.
