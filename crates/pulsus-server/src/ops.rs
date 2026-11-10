@@ -123,6 +123,9 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
         record_label_cache_metrics(cache);
     }
     record_eval_gate_metrics(&state.eval_gate);
+    if let Some(cache) = state.read_cache.get() {
+        record_read_cache_metrics(cache);
+    }
     record_replica_metrics(&state.rollup_levels);
     record_ingest_metrics(&state);
     (
@@ -225,6 +228,28 @@ fn record_label_cache_metrics(cache: &LabelCache) {
     metrics::counter!("pulsus_label_cache_refreshes_total").absolute(snap.refreshes_total);
     metrics::counter!("pulsus_label_cache_refresh_failures_total")
         .absolute(snap.refresh_failures_total);
+}
+
+/// Issue #778: the read cache's counters and gauges, mirrored on scrape
+/// as [`record_label_cache_metrics`] does: `.absolute()` on counters this
+/// crate does not own.
+fn record_read_cache_metrics(cache: &pulsus_read::metrics::read_cache::ReadCache) {
+    let snap = cache.snapshot();
+    for (outcome, n) in [
+        ("hit", snap.hits_total),
+        ("miss", snap.misses_total),
+        ("bypass", snap.bypasses_total),
+    ] {
+        metrics::counter!("pulsus_read_cache_requests_total", "outcome" => outcome).absolute(n);
+    }
+    for (reason, n) in snap.bypass_total {
+        metrics::counter!("pulsus_read_cache_bypass_total", "reason" => reason).absolute(n);
+    }
+    metrics::gauge!("pulsus_read_cache_bytes").set(snap.bytes as f64);
+    metrics::gauge!("pulsus_read_cache_entries").set(snap.entries as f64);
+    metrics::counter!("pulsus_read_cache_evictions_total").absolute(snap.evictions_total);
+    metrics::counter!("pulsus_read_cache_clears_total").absolute(snap.clears_total);
+    metrics::counter!("pulsus_read_cache_poll_failures_total").absolute(snap.poll_failures_total);
 }
 
 /// Issue #101: bridges the read path's [`pulsus_read::EvalGateSnapshot`]
@@ -468,6 +493,7 @@ mod tests {
             label_cache: Arc::new(std::sync::OnceLock::new()),
             rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
             graph_target: pulsus_read::GraphTargetCache::default(),
+            read_cache: Default::default(),
             eval_gate: Arc::new(pulsus_read::EvalGate::new(
                 pulsus_config::Config::default()
                     .reader
@@ -540,6 +566,7 @@ mod tests {
             label_cache: Arc::new(std::sync::OnceLock::new()),
             rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
             graph_target: pulsus_read::GraphTargetCache::default(),
+            read_cache: Default::default(),
             eval_gate: Arc::new(pulsus_read::EvalGate::new(
                 pulsus_config::Config::default()
                     .reader

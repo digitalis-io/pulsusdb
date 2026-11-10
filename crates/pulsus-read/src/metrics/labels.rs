@@ -1127,6 +1127,13 @@ impl LabelCache {
         self.metrics.snapshot()
     }
 
+    /// Issue #778: when `tenant`'s snapshot was swept, `None` while it is
+    /// cold. The read cache keeps nothing newer than this allows.
+    pub fn sweep_time_ms(&self, tenant: &Tenant) -> Option<i64> {
+        let snapshot = self.tenant_cache(tenant).current_snapshot();
+        (snapshot.generation >= 1).then_some(snapshot.sweep_time_ms)
+    }
+
     /// The empty tenant's snapshot: the single-tenant deployment's, and
     /// what readiness and the age gauge report.
     pub(crate) fn current_snapshot(&self) -> Arc<CacheSnapshot> {

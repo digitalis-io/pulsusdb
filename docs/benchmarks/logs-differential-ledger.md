@@ -3709,7 +3709,7 @@ a divergence at a public surface, found while implementing the cap.
     pins alias/native identity on a short query and pins the over-cap
     rejection of that same handler directly in `stats.rs`.
   - *Over a real socket* (`axum::serve` + default hyper h1 — the exact
-    configuration `crates/pulsus-server/src/serve.rs:235,247` runs in
+    configuration `crates/pulsus-server/src/serve.rs:241,253` runs in
     production): a 65,534-byte request-target reaches the handler
     (`200`); at 65,535 bytes hyper answers **`HTTP/1.1 414 URI Too
     Long`** with `content-length: 0` and `connection: close`, before
@@ -4266,7 +4266,7 @@ unexplained.
 
   **The escape is the PUSHDOWN, not the construct**, which the first
   version of this correction got wrong by writing "line filter" flat.
-  `VariantSpec::try_new` (`plan.rs:2684`) does compile the variant's
+  `VariantSpec::try_new` (`crates/pulsus-read/src/logql/plan.rs:3605`) does compile the variant's
   discarded prefix, but `compile_stage` returns `Ok(None)` for a pushable
   line filter (`pipeline.rs:1175-1180`) before it reaches `compile_regex_as_database` at
   `:1200`; a pushable filter's regex is validated on the SQL-rendering

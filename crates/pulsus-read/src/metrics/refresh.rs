@@ -201,6 +201,9 @@ pub(crate) fn sweep_settings(
         .set("max_bytes_before_external_group_by", 0u64)
         .set("distributed_product_mode", "local")
         .set("join_algorithm", "hash")
+        // Issue #778: the sweep names its task, as every background
+        // statement does.
+        .set("log_comment", "background:label-cache-sweep")
 }
 
 /// Spawns the recurring refresh task: ticks every `ttl`, running one

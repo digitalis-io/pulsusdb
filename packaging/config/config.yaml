@@ -119,6 +119,8 @@ clickhouse:
   #tail_send_timeout: 30s
   #tail_max_fetch_limit: 5000
   #tail_catchup_slice: 60s
+  #read_cache_bytes: 256MiB
+  #read_cache_tenant_share: 50
 
 #ruler:
   #enabled: false

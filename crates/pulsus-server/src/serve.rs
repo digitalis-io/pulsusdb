@@ -118,6 +118,10 @@ pub async fn run(config: Config) -> ExitCode {
     // cache's; its handle comes back the same way.
     let rollup_levels_slot = Arc::new(pulsus_read::metrics::rollup::LevelSlot::new());
     let (rollup_levels_tx, rollup_levels_rx) = oneshot::channel();
+    // Issue #778: the read cache, built by the reconnect loop beside the
+    // level loop on the reader and `all` roles.
+    let read_cache_slot: Arc<OnceLock<Arc<pulsus_read::metrics::read_cache::ReadCache>>> =
+        Arc::new(OnceLock::new());
     // The label cache's refresh-loop handle, handed back over a oneshot
     // channel so `run` can abort and join it at shutdown. The reconnect
     // loop is a one-shot bootstrap (see its own doc comment): it runs
@@ -147,6 +151,7 @@ pub async fn run(config: Config) -> ExitCode {
             reprobe: reprobe_tx,
             rollup_levels: rollup_levels_tx,
             rollup_slot: Arc::clone(&rollup_levels_slot),
+            read_cache_slot: Arc::clone(&read_cache_slot),
         },
         REQUIRED_SERVER_NAMES,
     );
@@ -170,6 +175,7 @@ pub async fn run(config: Config) -> ExitCode {
         label_cache: Arc::clone(&label_cache_slot),
         rollup_levels: Arc::clone(&rollup_levels_slot),
         graph_target: pulsus_read::GraphTargetCache::default(),
+        read_cache: Arc::clone(&read_cache_slot),
         eval_gate: Arc::new(pulsus_read::EvalGate::new(
             config.reader.query_eval_concurrency,
         )),
@@ -445,6 +451,8 @@ struct BackgroundHandoff {
     rollup_levels: oneshot::Sender<JoinHandle<()>>,
     /// Issue #18 part B: the slot that loop fills.
     rollup_slot: Arc<pulsus_read::metrics::rollup::LevelSlot>,
+    /// Issue #778: the read cache's slot, set beside the level loop.
+    read_cache_slot: Arc<OnceLock<Arc<pulsus_read::metrics::read_cache::ReadCache>>>,
 }
 
 /// Background task: repeatedly checks the server's preconditions and then
@@ -468,6 +476,7 @@ fn spawn_reconnect_loop(
         reprobe: reprobe_tx,
         rollup_levels: rollup_levels_tx,
         rollup_slot,
+        read_cache_slot,
     } = handoff;
     tokio::spawn(async move {
         let mut backoff = INITIAL_BACKOFF;
@@ -586,6 +595,37 @@ fn spawn_reconnect_loop(
                             .with_consistency(consistency_from(&config))
                         {
                             Ok(client) => {
+                                // Issue #778: the read cache and its 5 s
+                                // poll, when its budget is above 0 and the
+                                // allocator took the settings it needs.
+                                if pulsus_server::allocator::prepare_read_cache(
+                                    config.reader.read_cache_bytes.0,
+                                ) && let Ok(poll_client) = ChClient::from_shared_pool(
+                                    Arc::clone(&pool),
+                                    config.query_timeout.0,
+                                )
+                                .with_consistency(consistency_from(&config))
+                                {
+                                    use pulsus_read::metrics::read_cache;
+                                    let cache = Arc::new(read_cache::ReadCache::new(
+                                        read_cache::ReadCacheConfig {
+                                            budget_bytes: config.reader.read_cache_bytes.0,
+                                            tenant_share_pct: config.reader.read_cache_tenant_share,
+                                            clustered: config.cluster.is_some(),
+                                        },
+                                    ));
+                                    let _ = read_cache_slot.set(Arc::clone(&cache));
+                                    // Detached: it holds no connection
+                                    // between polls and ends with the
+                                    // process.
+                                    let _poll = read_cache::spawn_poll_loop(
+                                        cache,
+                                        poll_client,
+                                        config.clickhouse.database.clone(),
+                                        config.cluster.clone(),
+                                        Arc::clone(&rollup_slot),
+                                    );
+                                }
                                 let levels_handle = pulsus_read::metrics::rollup::spawn_level_loop(
                                     rollup_slot,
                                     client,
@@ -874,6 +914,7 @@ mod tests {
                 reprobe: reprobe_tx,
                 rollup_levels: oneshot::channel().0,
                 rollup_slot: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
+                read_cache_slot: Arc::new(OnceLock::new()),
             },
             MADE_UP,
         );
@@ -911,6 +952,7 @@ mod tests {
                 reprobe: reprobe_tx,
                 rollup_levels: oneshot::channel().0,
                 rollup_slot: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
+                read_cache_slot: Arc::new(OnceLock::new()),
             },
             REQUIRED_SERVER_NAMES,
         );
@@ -1052,6 +1094,7 @@ mod tests {
             label_cache: Arc::new(OnceLock::new()),
             rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
             graph_target: pulsus_read::GraphTargetCache::default(),
+            read_cache: Default::default(),
             eval_gate: Arc::new(pulsus_read::EvalGate::new(
                 config.reader.query_eval_concurrency,
             )),

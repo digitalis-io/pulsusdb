@@ -258,7 +258,7 @@ ClickHouse streams the rows and sorts nothing (`sql.rs:1317-1322`).
 `metric_range` renders `intDiv(bucket_ns, <step>) * <step> AS step` over a rollup table, a floor
 grid; no read path calls it, and the old `RouteChoice::Rollup` arm (`plan.rs:3255`) is unreachable.
 A range query that is **not** a clean bucketed chain is put on the client-aggregated path by
-`let client = if … || is_range` (`plan.rs:2428`), unchanged. A clean one is routed by the rollup arm
+`let client = if … || is_range` (`crates/pulsus-read/src/logql/plan.rs:2890`), unchanged. A clean one is routed by the rollup arm
 (`plan.rs:3192`), which chooses `RouteChoice::Rollup` only when `rollup::rollup_route` admits it and
 renders `metric_range_rollup`; otherwise by the `else if bucketed_range` arm (`plan.rs:3204`), which
 chooses `RouteChoice::Raw` and renders `metric_range_bucketed` or `metric_range_sliding`. The reduced
@@ -5272,8 +5272,8 @@ engine will read, and what it will return:
 | LogQL entry limit | default 100, ceiling 5,000; above the ceiling is `400` | `docs/api.md` §2.1 |
 | LogQL metric grid | at most 11,000 intervals; over it is `422` | `logql/window.rs:148` |
 | LogQL stream count | 100,000 fingerprints | `logql/params.rs:124` |
-| LogQL byte scan budget | `reader.logql_scan_budget_bytes`, default 50 GiB | field at `pulsus-config/src/model.rs:506`, default at `:656`. Exhausting it returns the entries already kept, with `stats.pulsus_partial: true` |
-| LogQL per-query memory | `reader.logql_read_max_memory_bytes`, default 8 GiB | field at `model.rs:577`, default at `:668`; exceeding it is `422`. The setting refuses rather than writing intermediate state to disk |
+| LogQL byte scan budget | `reader.logql_scan_budget_bytes`, default 50 GiB | field at `pulsus-config/src/model.rs:506`, default at `:662`. Exhausting it returns the entries already kept, with `stats.pulsus_partial: true` |
+| LogQL per-query memory | `reader.logql_read_max_memory_bytes`, default 8 GiB | field at `model.rs:577`, default at `:674`; exceeding it is `422`. The setting refuses rather than writing intermediate state to disk |
 | LogQL result bytes | 1 GiB still held when the statement ends | `logql/charge.rs:1326`; refused `422`, never cut short |
 | LogQL over-fetch factor | `reader.logql_pipeline_scan_factor`, default 10 | field at `model.rs:528`, default at `:690` @ 1cdb3e5e. Applies only while a stage that drops lines is evaluated after the read |
 | TraceQL candidates | `reader.traceql_max_candidates`, default 100,000 | field at `model.rs:544` @ 1cdb3e5e, default at `:692` @ 1cdb3e5e. Per first statement and for the merged set |
