@@ -180,7 +180,7 @@ A trace request is also bounded **before** any of that, by a fixed ceiling on th
 | `PULSUS_TAIL_CHANNEL_DEPTH` | `4` | undelivered tail frames buffered ahead of a slow WebSocket writer before the oldest frame is evicted into `dropped_entries`/`dropped_total`. Accepted range `1..=4000`: values above the ceiling are rejected at config load, since they would make the eviction bound unreachable (an unbounded frame queue). Scale tuning routes to #25 |
 | `PULSUS_TAIL_SEND_TIMEOUT` | `30s` | per-send deadline on a tail WebSocket write; a client that stops reading past it is disconnected |
 | `PULSUS_TAIL_MAX_FETCH_LIMIT` | `5000` | hard cap on one tail poll's fetched-row `LIMIT`; a client `limit` above it is silently clamped before the query is built. Accepted range `1..=5000000`: values above the ceiling are rejected at config load, since they would make the pre-query clamp inert. Scale tuning routes to #25 |
-| `PULSUS_TAIL_CATCHUP_SLICE` | `60s` | maximum time window one tail poll may scan/sort; backlog catch-up proceeds one slice per query, re-polling immediately until caught up (must be > 0) |
+| `PULSUS_TAIL_CATCHUP_SLICE` | `60s` | maximum time window one tail query may read lines from or sort; backlog catch-up proceeds one slice per query, re-polling immediately until caught up (must be > 0). One query reads timestamps only and may span more: when a stream's labels become readable late, it finds where that stream's lines between `start` and the cursor begin (docs/api.md §2.4) |
 
 ## 7. Retention (`schema/schema.sh`)
 
