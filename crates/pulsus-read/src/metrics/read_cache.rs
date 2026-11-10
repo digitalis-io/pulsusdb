@@ -2430,6 +2430,17 @@ mod tests {
         assert_eq!(c.full.load(Ordering::SeqCst), 1, "(c) full");
     }
 
+    /// A request with the cache off never reaches a cache, so no bypass
+    /// reason names that case.
+    #[test]
+    fn the_bypass_reasons_are_the_ones_a_cache_records() {
+        let labels: Vec<&str> = BypassReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["instant", "explain", "shape", "retention", "no_fill"]
+        );
+    }
+
     // --- addendum 5 §4 ---------------------------------------------------------
 
     #[test]

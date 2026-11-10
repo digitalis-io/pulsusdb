@@ -15,6 +15,8 @@ pub const MMAP_THRESHOLD_BYTES: i32 = 65_536;
 /// default limit of 65,530, so the allocator's own mappings leave room for
 /// the rest of the process. Past it the allocator uses the heap.
 pub const MMAP_MAX: i32 = 32_765;
+/// glibc's own `M_MMAP_MAX`, put back when the threshold is refused.
+pub const GLIBC_DEFAULT_MMAP_MAX: i32 = 0;
 
 /// Applies the settings when the read cache's budget is above 0, as server
 /// startup does. `false` when the budget is 0 or a setting did not apply
@@ -71,27 +73,46 @@ fn set(_param: i32, _value: i32) -> i32 {
 mod tests {
     use super::*;
 
-    /// Each setting that does not apply leaves the cache off; both applied
-    /// leave it on, and a budget of 0 sets nothing.
+    /// Every call a setter receives, and what it answers.
+    fn run(fail_on: Option<i32>) -> (bool, Vec<(i32, i32)>) {
+        let mut calls = Vec::new();
+        let on = prepare_with(1 << 30, |p, v| {
+            calls.push((p, v));
+            i32::from(Some(p) != fail_on || calls.iter().filter(|c| c.0 == p).count() > 1)
+        });
+        (on, calls)
+    }
+
+    /// Both settings applied leave the cache on. A setting that does not
+    /// apply leaves it off and the allocator as it found it: the bound on
+    /// mappings goes first, so a refused threshold has only that bound to
+    /// put back, at glibc's default. A budget of 0 sets nothing.
     #[test]
     fn a_setting_that_does_not_apply_leaves_the_read_cache_off() {
-        let mut calls = Vec::new();
-        assert!(prepare_with(1 << 30, |p, v| {
-            calls.push((p, v));
-            1
-        }));
+        let (on, calls) = run(None);
+        assert!(on, "control");
         assert_eq!(
             calls,
             [
-                (libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD_BYTES),
-                (libc::M_MMAP_MAX, MMAP_MAX)
+                (libc::M_MMAP_MAX, MMAP_MAX),
+                (libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD_BYTES)
             ],
             "control: both settings applied"
         );
-        for failing in [libc::M_MMAP_THRESHOLD, libc::M_MMAP_MAX] {
-            let setter = |param: i32, _value: i32| i32::from(param != failing);
-            assert!(!prepare_with(1 << 30, setter), "setting {failing} failed");
-        }
+        let (on, calls) = run(Some(libc::M_MMAP_MAX));
+        assert!(!on, "the bound on mappings refused");
+        assert_eq!(calls, [(libc::M_MMAP_MAX, MMAP_MAX)], "nothing else set");
+        let (on, calls) = run(Some(libc::M_MMAP_THRESHOLD));
+        assert!(!on, "the threshold refused");
+        assert_eq!(
+            calls,
+            [
+                (libc::M_MMAP_MAX, MMAP_MAX),
+                (libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD_BYTES),
+                (libc::M_MMAP_MAX, GLIBC_DEFAULT_MMAP_MAX)
+            ],
+            "the bound on mappings put back"
+        );
         let mut called = false;
         assert!(!prepare_with(0, |_, _| {
             called = true;
