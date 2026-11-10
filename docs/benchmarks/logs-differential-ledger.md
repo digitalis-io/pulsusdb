@@ -3768,7 +3768,7 @@ a divergence at a public surface, found while implementing the cap.
   `detected.rs:88`, `:153` — the five carriers and nothing else. That
   exclusivity is scoped to the carrier set, not repo-wide: the server
   crate has **nine** production parse sites, and the other four —
-  `patterns.rs:51`, `stats.rs:50`, `tail.rs:123`, `volume.rs:52` — take a
+  `patterns.rs:51`, `stats.rs:50`, `tail.rs:136`, `volume.rs:52` — take a
   `query` parameter on GET-only routes, so they can never receive an
   over-cap one (`git grep -nE 'pulsus_logql::parse(_selector)?\('
   -- crates/pulsus-server/src` = 10 lines, the tenth being the

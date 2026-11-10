@@ -5,7 +5,16 @@
 //! loop: each poll runs the IDENTICAL stage-1/2/3 plan machinery and the
 //! SAME `CompiledPipeline` as the query path (`LogQlEngine::tail_poll` —
 //! the task-manager-ratified semantics-drift-free invariant), fetching
-//! one keyset page in global composite row order.
+//! one keyset page in global composite row order; across pages each
+//! stream's entries stay in timestamp order. A stream whose labels become
+//! readable after the scan passed some of its lines waits outside the scan
+//! until a catch-up has read its lines from `start` to the cursor, one
+//! slice per line query, then joins it; no read of its lines starts
+//! `TAIL_CATCH_UP_RECHECK_NS` or more after its labels were read, and it
+//! joins the scan after the one read already running then returns, within
+//! that read's configured query timeout (`PULSUS_QUERY_TIMEOUT`); its older
+//! entries arrive after newer entries of other streams (per-stream order,
+//! issue #804).
 //!
 //! **Cursor** (round-4 adjudication): `(scan watermark, boundary
 //! cursor)`. The watermark advances to each exhausted slice's upper
@@ -27,10 +36,12 @@
 //! joins the producer and owns the connection-slot permit for the
 //! socket's lifetime.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{RawQuery, State};
@@ -39,9 +50,11 @@ use axum::response::{IntoResponse, Response};
 
 use pulsus_config::Config;
 use pulsus_logql::Expr;
+use pulsus_model::Fingerprint;
 use pulsus_read::{
-    Direction, LogQlEngine, QueryParams, QuerySpec, ReadError, ResponseOptions, StreamResult,
-    TAIL_REGISTRATION_GRACE_NS, TailLower, TailPage, TailSetup,
+    CatchUpPage, Direction, LogQlEngine, QueryParams, QuerySpec, ReadError, ResponseOptions,
+    StreamResult, TAIL_CATCH_UP_RECHECK_NS, TAIL_REGISTRATION_GRACE_NS, TailCeiling, TailLower,
+    TailPage, TailSetup,
 };
 use tokio::sync::{Notify, watch};
 
@@ -197,6 +210,11 @@ struct TailLoopConfig {
     /// (pinned by `narrow_grace_ns_defaults_to_the_production_constant`);
     /// only the hermetic producer tests inject a smaller value.
     narrow_grace_ns: i64,
+    /// How long a joined stream may be caught up before it is admitted
+    /// without the rest (issue #804): a construction-site test seam like
+    /// `narrow_grace_ns`; production always gets
+    /// [`TAIL_CATCH_UP_RECHECK_NS`].
+    catch_up_recheck_ns: i64,
     /// `X-Loki-Response-Encoding-Flags` as received at upgrade (issue
     /// #463), echoed and acted on by every frame this connection emits.
     /// `Arc` so the per-frame clone the writer loop needs is a refcount
@@ -216,6 +234,7 @@ impl TailLoopConfig {
             send_timeout: cfg.reader.tail_send_timeout.0,
             dropped_sample_cap: cfg.reader.tail_max_entries_per_frame,
             narrow_grace_ns: TAIL_REGISTRATION_GRACE_NS,
+            catch_up_recheck_ns: TAIL_CATCH_UP_RECHECK_NS,
             encoding_flags,
         }
     }
@@ -322,6 +341,47 @@ trait TailFetcher: Send + 'static {
         narrow: bool,
         fetch_limit: u32,
     ) -> impl Future<Output = Result<TailPage, ReadError>> + Send;
+
+    /// S4 (issue #804): each of `fps` with a line in `(after_ns,
+    /// ceiling.ts()]`, with its earliest one.
+    fn catch_up_first_lines(
+        &mut self,
+        _fps: &[Fingerprint],
+        _after_ns: i64,
+        _ceiling: TailCeiling,
+    ) -> impl Future<Output = Result<Vec<(Fingerprint, i64)>, ReadError>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// S5 (issue #804): one catch-up page over `fps`.
+    fn catch_up(
+        &mut self,
+        _fps: &[Fingerprint],
+        _lower: TailLower,
+        _upper_ns: i64,
+        _ceiling: TailCeiling,
+        _fetch_limit: u32,
+    ) -> impl Future<Output = Result<CatchUpPage, ReadError>> + Send {
+        async {
+            Ok(CatchUpPage {
+                page: TailPage {
+                    streams: Vec::new(),
+                    next: None,
+                    fetched: 0,
+                    joined: Vec::new(),
+                },
+                fetched_fps: Vec::new(),
+            })
+        }
+    }
+
+    /// Admits `fps` to the main scan (issue #804).
+    fn admit(&mut self, _fps: &[Fingerprint]) {}
+
+    /// Test seam: the deadline the producer gave the streams a poll
+    /// reported joined.
+    #[cfg(test)]
+    fn deadline_set(&mut self, _deadline: Instant) {}
 }
 
 struct EngineFetcher {
@@ -368,6 +428,34 @@ impl TailFetcher for EngineFetcher {
         self.engine
             .tail_poll(&mut self.setup, lower, upper_ns, fetch_limit)
             .await
+    }
+
+    async fn catch_up_first_lines(
+        &mut self,
+        fps: &[Fingerprint],
+        after_ns: i64,
+        ceiling: TailCeiling,
+    ) -> Result<Vec<(Fingerprint, i64)>, ReadError> {
+        self.engine
+            .tail_first_lines(&self.setup, fps, after_ns, ceiling)
+            .await
+    }
+
+    async fn catch_up(
+        &mut self,
+        fps: &[Fingerprint],
+        lower: TailLower,
+        upper_ns: i64,
+        ceiling: TailCeiling,
+        fetch_limit: u32,
+    ) -> Result<CatchUpPage, ReadError> {
+        self.engine
+            .tail_catch_up(&self.setup, fps, lower, upper_ns, ceiling, fetch_limit)
+            .await
+    }
+
+    fn admit(&mut self, fps: &[Fingerprint]) {
+        self.setup.admit(fps);
     }
 }
 
@@ -708,9 +796,135 @@ async fn producer_loop<F: TailFetcher>(
     let mut state = ScanState::new(cfg.start_ns);
     let mut live_since_ns: Option<i64> = None;
     let mut qualifying_scan_done = false;
+    // Issue #804: streams whose labels were read after the first window,
+    // each with its deadline, wait outside the main scan until a catch-up
+    // has read their lines up to the scan's position.
+    let recheck = Duration::from_nanos(u64::try_from(cfg.catch_up_recheck_ns).unwrap_or(0));
+    let mut waiting: Vec<(Fingerprint, Instant)> = Vec::new();
+    let mut next_probe = Instant::now();
+    // Joined streams not yet probed: their first probe runs at once, before
+    // any idle sleep, whatever the recheck timer says.
+    let mut unprobed: Vec<Fingerprint> = Vec::new();
+    let mut catch_up: Option<CatchUp> = None;
     loop {
         if *shutdown.borrow() || *cancel.borrow() {
             break;
+        }
+        if let Some(cu) = catch_up.as_mut() {
+            expire(&mut fetcher, &mut cu.fps, &mut waiting);
+            let mut close = cu.fps.is_empty();
+            if !close {
+                let fps: Vec<Fingerprint> = cu.fps.iter().map(|(fp, _)| *fp).collect();
+                match cu.scan {
+                    None => {
+                        let result = tokio::select! {
+                            _ = cancelled(&mut shutdown, &mut cancel) => break,
+                            r = fetcher.catch_up_first_lines(&fps, cu.probe_after, cu.ceiling) => r,
+                        };
+                        match result {
+                            Ok(first) => match first.iter().map(|(_, ts)| *ts).min() {
+                                Some(min_first) => {
+                                    cu.scan = Some(ScanState::new(min_first.saturating_sub(1)));
+                                }
+                                None => close = true,
+                            },
+                            Err(e) => {
+                                fail(&shared, e);
+                                break;
+                            }
+                        }
+                    }
+                    Some(mut scan) => {
+                        let (lower, lower_ts) = scan.lower();
+                        let upper = cu.ceiling.ts().min(lower_ts.saturating_add(cfg.slice_ns));
+                        let result = tokio::select! {
+                            _ = cancelled(&mut shutdown, &mut cancel) => break,
+                            r = fetcher.catch_up(&fps, lower, upper, cu.ceiling, cfg.fetch_limit) => r,
+                        };
+                        let caught = match result {
+                            Ok(caught) => caught,
+                            Err(e) => {
+                                fail(&shared, e);
+                                break;
+                            }
+                        };
+                        cu.fetched.extend(caught.fetched_fps);
+                        let exhausted = scan.observe(&caught.page, upper, cfg.fetch_limit);
+                        push_page(&shared, caught.page.streams);
+                        if !exhausted {
+                            cu.scan = Some(scan);
+                        } else if upper >= cu.ceiling.ts() {
+                            close = true;
+                        } else {
+                            cu.probe_after = upper;
+                            cu.scan = None;
+                        }
+                    }
+                }
+            }
+            if !close {
+                // No idle sleep while a catch-up is open.
+                continue;
+            }
+            // Closing: admit the streams a page fetched from; the rest
+            // stay waiting with their deadlines, and the next recheck
+            // waits for its timer.
+            if let Some(cu) = catch_up.take() {
+                let admitted: Vec<Fingerprint> = cu
+                    .fps
+                    .iter()
+                    .map(|(fp, _)| *fp)
+                    .filter(|fp| cu.fetched.contains(fp))
+                    .collect();
+                if !admitted.is_empty() {
+                    fetcher.admit(&admitted);
+                    waiting.retain(|(fp, _)| !admitted.contains(fp));
+                }
+            }
+        } else if !waiting.is_empty() {
+            let mut all = std::mem::take(&mut waiting);
+            expire(&mut fetcher, &mut all, &mut waiting);
+            waiting = all;
+            unprobed.retain(|fp| waiting.iter().any(|(w, _)| w == fp));
+            let first_probe = !unprobed.is_empty();
+            if !waiting.is_empty() && (first_probe || Instant::now() >= next_probe) {
+                let ceiling = TailCeiling::of(state.lower().0);
+                let fps: Vec<Fingerprint> = if first_probe {
+                    std::mem::take(&mut unprobed)
+                } else {
+                    waiting.iter().map(|(fp, _)| *fp).collect()
+                };
+                let result = tokio::select! {
+                    _ = cancelled(&mut shutdown, &mut cancel) => break,
+                    r = fetcher.catch_up_first_lines(&fps, cfg.start_ns, ceiling) => r,
+                };
+                // A first probe never brings the next recheck forward.
+                next_probe = next_probe.max(Instant::now() + cfg.poll_interval);
+                match result {
+                    Ok(first) => {
+                        if let Some(min_first) = first.iter().map(|(_, ts)| *ts).min() {
+                            let found: BTreeSet<Fingerprint> =
+                                first.iter().map(|(fp, _)| *fp).collect();
+                            catch_up = Some(CatchUp {
+                                fps: waiting
+                                    .iter()
+                                    .filter(|(fp, _)| found.contains(fp))
+                                    .copied()
+                                    .collect(),
+                                ceiling,
+                                probe_after: cfg.start_ns,
+                                scan: Some(ScanState::new(min_first.saturating_sub(1))),
+                                fetched: BTreeSet::new(),
+                            });
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        fail(&shared, e);
+                        break;
+                    }
+                }
+            }
         }
         let now = params::now_ns();
         let horizon = now.saturating_sub(cfg.delay_ns);
@@ -748,17 +962,29 @@ async fn producer_loop<F: TailFetcher>(
             _ = cancelled(&mut shutdown, &mut cancel) => break,
             r = fetcher.poll(lower, upper, narrow, cfg.fetch_limit) => r,
         };
-        let page = match result {
+        let mut page = match result {
             Ok(page) => page,
             Err(e) => {
                 // Fatal poll failure (e.g. a broad selector tripping the
                 // stream cap): hand the reason to the writer, which
                 // closes the socket with it.
-                shared.lock().error = Some(e.to_string());
-                shared.notify.notify_one();
+                fail(&shared, e);
                 break;
             }
         };
+        // Read after the poll has returned, so a slow poll does not use up
+        // a joined stream's time.
+        let deadline = Instant::now() + recheck;
+        #[cfg(test)]
+        if !page.joined.is_empty() {
+            fetcher.deadline_set(deadline);
+        }
+        unprobed.extend(page.joined.iter().copied());
+        waiting.extend(
+            std::mem::take(&mut page.joined)
+                .into_iter()
+                .map(|fp| (fp, deadline)),
+        );
         // This poll's stage-1 COMPLETED; if it started at dwell >= grace
         // it was the qualifying full-span scan (narrow was false when it
         // ran) — narrowing is permitted from the NEXT refresh only.
@@ -766,20 +992,70 @@ async fn producer_loop<F: TailFetcher>(
             qualifying_scan_done = true;
         }
         let exhausted = state.observe(&page, upper, cfg.fetch_limit);
-        if page.streams.iter().any(|s| !s.entries.is_empty()) {
-            shared.lock().push_evicting(page.streams);
-            shared.notify.notify_one();
-        }
+        push_page(&shared, page.streams);
         // Caught up ⇒ idle for one poll interval; otherwise (full page,
         // or more backlog slices ahead) re-poll immediately.
         if exhausted
             && live
+            && unprobed.is_empty()
             && sleep_or_cancelled(&mut shutdown, &mut cancel, cfg.poll_interval).await
         {
             break;
         }
     }
     let _ = cancel_tx.send(true);
+}
+
+/// One open catch-up (issue #804): the streams it reads, each with its
+/// deadline, up to `ceiling`, the main scan's position when it opened.
+struct CatchUp {
+    fps: Vec<(Fingerprint, Instant)>,
+    ceiling: TailCeiling,
+    /// The probe's lower bound.
+    probe_after: i64,
+    /// `None`: the probe runs next.
+    scan: Option<ScanState>,
+    /// Every stream a page fetched a row from.
+    fetched: BTreeSet<Fingerprint>,
+}
+
+/// Run before every probe and every catch-up page (issue #804): admits the
+/// entries of `list` whose deadline has passed, at the main scan's current
+/// position, and removes them from `list` and from `waiting`. Their lines
+/// below that position that no read started before the deadline read are
+/// never sent.
+fn expire<F: TailFetcher>(
+    fetcher: &mut F,
+    list: &mut Vec<(Fingerprint, Instant)>,
+    waiting: &mut Vec<(Fingerprint, Instant)>,
+) {
+    let now = Instant::now();
+    let expired: Vec<Fingerprint> = list
+        .iter()
+        .filter(|(_, deadline)| *deadline <= now)
+        .map(|(fp, _)| *fp)
+        .collect();
+    if expired.is_empty() {
+        return;
+    }
+    fetcher.admit(&expired);
+    list.retain(|(fp, _)| !expired.contains(fp));
+    waiting.retain(|(fp, _)| !expired.contains(fp));
+}
+
+/// Queues a page's streams for the writer, when any carries an entry.
+fn push_page(shared: &Shared, streams: Vec<StreamResult>) {
+    if streams.iter().any(|s| !s.entries.is_empty()) {
+        shared.lock().push_evicting(streams);
+        shared.notify.notify_one();
+    }
+}
+
+/// A fatal read failure: hands the reason to the writer, which closes the
+/// socket with it.
+fn fail(shared: &Shared, e: ReadError) {
+    shared.lock().error = Some(e.to_string());
+    shared.notify.notify_one();
 }
 
 /// The dedicated inbound-reader task (review round 1, medium): waits for
@@ -1060,6 +1336,7 @@ mod tests {
             // tests override this with an injected grace via the same
             // construction-site seam.
             narrow_grace_ns: TAIL_REGISTRATION_GRACE_NS,
+            catch_up_recheck_ns: TAIL_CATCH_UP_RECHECK_NS,
             encoding_flags: Vec::new().into(),
         }
     }
@@ -1257,6 +1534,7 @@ mod tests {
             streams: vec![],
             next: None,
             fetched: 0,
+            joined: Vec::new(),
         };
         let exhausted = s.observe(&page, 500, 10);
         assert!(exhausted);
@@ -1281,6 +1559,7 @@ mod tests {
             streams: vec![],
             next: Some(cursor),
             fetched: 10,
+            joined: Vec::new(),
         };
         let exhausted = s.observe(&page, 500, 10);
         assert!(!exhausted);
@@ -1304,6 +1583,7 @@ mod tests {
                 seen: 1,
             }),
             fetched: 4,
+            joined: Vec::new(),
         };
         assert!(s.observe(&page, 500, 10));
         assert_eq!(s.watermark_ns, 500);
@@ -1324,6 +1604,7 @@ mod tests {
             streams: vec![],
             next: Some(at_upper),
             fetched: 4,
+            joined: Vec::new(),
         };
         assert!(s.observe(&page, 500, 10));
         let (lower, _) = s.lower();
@@ -1399,6 +1680,7 @@ mod tests {
                 streams: vec![stream(r#"{"app":"x"}"#, vec![(upper_ns, "line")])],
                 next: None,
                 fetched: 1,
+                joined: Vec::new(),
             })
         }
     }
@@ -1732,6 +2014,7 @@ mod tests {
                     streams: vec![],
                     next: None,
                     fetched: 0,
+                    joined: Vec::new(),
                 })
             }
         }
@@ -1832,6 +2115,7 @@ mod tests {
                         seen: 0,
                     }),
                     fetched: fetch_limit,
+                    joined: Vec::new(),
                 }),
                 Some(FullPageMode::Frozen(ts)) => Ok(TailPage {
                     streams: vec![],
@@ -1840,11 +2124,13 @@ mod tests {
                         seen: 0,
                     }),
                     fetched: fetch_limit,
+                    joined: Vec::new(),
                 }),
                 None => Ok(TailPage {
                     streams: vec![],
                     next: None,
                     fetched: 0,
+                    joined: Vec::new(),
                 }),
             }
         }
@@ -2181,6 +2467,7 @@ mod tests {
         let p = parse_tail_params(&pairs, &cfg_default(), 7).expect("ok");
         let cfg = TailLoopConfig::new(&cfg_default(), &p, Vec::new().into());
         assert_eq!(cfg.narrow_grace_ns, TAIL_REGISTRATION_GRACE_NS);
+        assert_eq!(cfg.catch_up_recheck_ns, TAIL_CATCH_UP_RECHECK_NS);
     }
 
     // -- bare-GET rejection pin (the manifest's mounting oracle) ---------
@@ -2257,6 +2544,875 @@ mod tests {
             .await
             .expect("body");
         assert_eq!(&body[..], b"Connection header did not include 'upgrade'");
+    }
+
+    // -- issue #804: a stream that joins late is caught up, then admitted --
+
+    fn fpn(n: u128) -> Fingerprint {
+        Fingerprint::from_raw(n)
+    }
+
+    /// [`TailLower`] with equality, for the call log.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Lower {
+        Start(i64),
+        After(TailCursor),
+    }
+
+    impl Lower {
+        fn of(l: TailLower) -> Self {
+            match l {
+                TailLower::Start { start_ns } => Lower::Start(start_ns),
+                TailLower::After(c) => Lower::After(c),
+            }
+        }
+
+        fn ts(self) -> i64 {
+            match self {
+                Lower::Start(t) => t,
+                Lower::After(c) => c.tuple.0,
+            }
+        }
+    }
+
+    /// Every call the producer makes on [`ScriptedFetcher`], in order.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Call {
+        Poll {
+            lower: Lower,
+            upper: i64,
+        },
+        /// The poll above has returned, reporting these joined streams.
+        PollDone {
+            joined: Vec<Fingerprint>,
+        },
+        FirstLines {
+            fps: Vec<Fingerprint>,
+            after: i64,
+            ceiling: TailCeiling,
+        },
+        CatchUp {
+            fps: Vec<Fingerprint>,
+            lower: Lower,
+            upper: i64,
+            ceiling: TailCeiling,
+        },
+        Admit(Vec<Fingerprint>),
+        /// The deadline the producer set for the streams just joined.
+        Deadline(Instant),
+    }
+
+    type CallLog = Arc<Mutex<Vec<(Instant, Call)>>>;
+
+    /// How the scripted fetcher answers one catch-up page.
+    enum CatchStep {
+        Page(CatchUpPage),
+        /// Answered after this long.
+        Slow(Duration, CatchUpPage),
+        /// Never answered.
+        Hang,
+        /// Fails after this long.
+        Fail(Duration, ReadError),
+    }
+
+    type PollScript = Box<dyn FnMut(usize, TailLower, i64) -> TailPage + Send>;
+    type FirstScript = Box<dyn FnMut(usize, &[(Instant, Call)]) -> Vec<(Fingerprint, i64)> + Send>;
+    type CatchScript = Box<dyn FnMut(usize) -> CatchStep + Send>;
+
+    /// Answers polls, S4 and catch-up pages from scripts and records every
+    /// call, `admit` included (issue #804).
+    struct ScriptedFetcher {
+        log: CallLog,
+        polls: usize,
+        firsts: usize,
+        catches: usize,
+        poll_script: PollScript,
+        first_script: FirstScript,
+        catch_script: CatchScript,
+    }
+
+    impl ScriptedFetcher {
+        fn new(
+            poll_script: impl FnMut(usize, TailLower, i64) -> TailPage + Send + 'static,
+            first_script: impl FnMut(usize, &[(Instant, Call)]) -> Vec<(Fingerprint, i64)>
+            + Send
+            + 'static,
+            catch_script: impl FnMut(usize) -> CatchStep + Send + 'static,
+        ) -> Self {
+            ScriptedFetcher {
+                log: Arc::new(Mutex::new(Vec::new())),
+                polls: 0,
+                firsts: 0,
+                catches: 0,
+                poll_script: Box::new(poll_script),
+                first_script: Box::new(first_script),
+                catch_script: Box::new(catch_script),
+            }
+        }
+
+        fn record(&self, call: Call) {
+            self.log.lock().unwrap().push((Instant::now(), call));
+        }
+    }
+
+    impl TailFetcher for ScriptedFetcher {
+        async fn poll(
+            &mut self,
+            lower: TailLower,
+            upper_ns: i64,
+            _narrow: bool,
+            _fetch_limit: u32,
+        ) -> Result<TailPage, ReadError> {
+            self.record(Call::Poll {
+                lower: Lower::of(lower),
+                upper: upper_ns,
+            });
+            let n = self.polls;
+            self.polls += 1;
+            let page = (self.poll_script)(n, lower, upper_ns);
+            self.record(Call::PollDone {
+                joined: page.joined.clone(),
+            });
+            Ok(page)
+        }
+
+        async fn catch_up_first_lines(
+            &mut self,
+            fps: &[Fingerprint],
+            after_ns: i64,
+            ceiling: TailCeiling,
+        ) -> Result<Vec<(Fingerprint, i64)>, ReadError> {
+            self.record(Call::FirstLines {
+                fps: fps.to_vec(),
+                after: after_ns,
+                ceiling,
+            });
+            let n = self.firsts;
+            self.firsts += 1;
+            let answer = {
+                let log = self.log.lock().unwrap();
+                (self.first_script)(n, &log)
+            };
+            Ok(answer)
+        }
+
+        async fn catch_up(
+            &mut self,
+            fps: &[Fingerprint],
+            lower: TailLower,
+            upper_ns: i64,
+            ceiling: TailCeiling,
+            _fetch_limit: u32,
+        ) -> Result<CatchUpPage, ReadError> {
+            self.record(Call::CatchUp {
+                fps: fps.to_vec(),
+                lower: Lower::of(lower),
+                upper: upper_ns,
+                ceiling,
+            });
+            let n = self.catches;
+            self.catches += 1;
+            match (self.catch_script)(n) {
+                CatchStep::Page(p) => Ok(p),
+                CatchStep::Slow(d, p) => {
+                    tokio::time::sleep(d).await;
+                    Ok(p)
+                }
+                CatchStep::Hang => std::future::pending().await,
+                CatchStep::Fail(d, e) => {
+                    tokio::time::sleep(d).await;
+                    Err(e)
+                }
+            }
+        }
+
+        fn admit(&mut self, fps: &[Fingerprint]) {
+            self.record(Call::Admit(fps.to_vec()));
+        }
+
+        fn deadline_set(&mut self, deadline: tokio::time::Instant) {
+            self.record(Call::Deadline(deadline.into_std()));
+        }
+    }
+
+    /// A main-poll page: one stream holding `lines`, reporting `joined`.
+    fn lines_page(lines: &[&str], joined: &[u128]) -> TailPage {
+        let streams = if lines.is_empty() {
+            Vec::new()
+        } else {
+            vec![stream(
+                r#"{"app":"x"}"#,
+                lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| (i as i64 + 1, *l))
+                    .collect(),
+            )]
+        };
+        TailPage {
+            streams,
+            next: None,
+            fetched: lines.len() as u32,
+            joined: joined.iter().map(|&n| fpn(n)).collect(),
+        }
+    }
+
+    /// A catch-up page of `lines`, `fetched` raw rows, cursor `next`, rows
+    /// fetched from `fps`.
+    fn catch_page(
+        lines: &[&str],
+        fetched: u32,
+        next: Option<TailCursor>,
+        fps: &[u128],
+    ) -> CatchUpPage {
+        let mut page = lines_page(lines, &[]);
+        page.fetched = fetched;
+        page.next = next;
+        CatchUpPage {
+            page,
+            fetched_fps: fps.iter().map(|&n| fpn(n)).collect(),
+        }
+    }
+
+    /// One running `run_tail` over a scripted fetcher.
+    struct ScriptedRun {
+        handle: tokio::task::JoinHandle<()>,
+        shutdown: watch::Sender<bool>,
+        sent: Arc<Mutex<Vec<String>>>,
+        closed: Arc<Mutex<Option<Option<CloseFrame>>>>,
+        log: CallLog,
+    }
+
+    impl ScriptedRun {
+        fn start(fetcher: ScriptedFetcher, cfg: TailLoopConfig) -> Self {
+            let log = Arc::clone(&fetcher.log);
+            let (tx, rx) = watch::channel(false);
+            let sender = FakeSender::new(SinkMode::Accept);
+            let sent = Arc::clone(&sender.sent);
+            let closed = Arc::clone(&sender.closed);
+            let handle = tokio::spawn(run_tail(
+                fetcher,
+                sender,
+                FakeReceiver(RecvMode::Silent),
+                cfg,
+                rx,
+            ));
+            ScriptedRun {
+                handle,
+                shutdown: tx,
+                sent,
+                closed,
+                log,
+            }
+        }
+
+        /// Waits, in 5 ms steps, until `done` holds on the call log or
+        /// `limit` passes.
+        async fn wait_for(&self, limit: Duration, done: impl Fn(&[(Instant, Call)]) -> bool) {
+            let deadline = Instant::now() + limit;
+            while Instant::now() < deadline {
+                if done(&self.log.lock().unwrap()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        /// Shuts the run down; it must return within 1 s.
+        async fn stop(self) -> (Vec<(Instant, Call)>, Vec<String>) {
+            let _ = self.shutdown.send(true);
+            tokio::time::timeout(Duration::from_secs(1), self.handle)
+                .await
+                .expect("run_tail must return within 1 s of shutdown")
+                .expect("no panic");
+            let calls = self.log.lock().unwrap().clone();
+            let lines = sent_lines(&self.sent.lock().unwrap());
+            (calls, lines)
+        }
+    }
+
+    /// Every line the writer sent, in the order sent.
+    fn sent_lines(sent: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        for text in sent {
+            let frame = parse(text);
+            for s in frame["streams"].as_array().expect("streams") {
+                for v in s["values"].as_array().expect("values") {
+                    out.push(v[1].as_str().expect("line").to_string());
+                }
+            }
+        }
+        out
+    }
+
+    fn has_admit(calls: &[(Instant, Call)]) -> bool {
+        calls.iter().any(|(_, c)| matches!(c, Call::Admit(_)))
+    }
+
+    /// The index of the first `PollDone` reporting a joined stream.
+    fn joining_poll(calls: &[(Instant, Call)]) -> Option<usize> {
+        calls
+            .iter()
+            .position(|(_, c)| matches!(c, Call::PollDone { joined } if !joined.is_empty()))
+    }
+
+    /// The `upper` of the poll whose `PollDone` sits at `done`.
+    fn poll_upper(calls: &[(Instant, Call)], done: usize) -> i64 {
+        match &calls[done - 1].1 {
+            Call::Poll { upper, .. } => *upper,
+            other => panic!("expected a poll before its PollDone, got {other:?}"),
+        }
+    }
+
+    /// The calls after `from`, without the `PollDone` markers.
+    fn statements_after(calls: &[(Instant, Call)], from: usize) -> Vec<(Instant, Call)> {
+        calls[from + 1..]
+            .iter()
+            .filter(|(_, c)| !matches!(c, Call::PollDone { .. } | Call::Deadline(_)))
+            .cloned()
+            .collect()
+    }
+
+    fn count(calls: &[(Instant, Call)], pred: impl Fn(&Call) -> bool) -> usize {
+        calls.iter().filter(|(_, c)| pred(c)).count()
+    }
+
+    /// The H1 script: poll 1 sends A1, poll 2 sends A2 and reports stream
+    /// 2 joined, later polls are empty.
+    fn h1_polls(n: usize, _l: TailLower, _u: i64) -> TailPage {
+        match n {
+            0 => lines_page(&["A1"], &[]),
+            1 => lines_page(&["A2"], &[2]),
+            _ => lines_page(&[], &[]),
+        }
+    }
+
+    /// H1 (issue #804): a stream reported joined is probed, caught up from
+    /// its first line to the main scan's position, and only then admitted;
+    /// the main scan resumes where it stood.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_joined_stream_is_caught_up_then_admitted() {
+        let cfg = test_cfg();
+        let start = cfg.start_ns;
+        let fetcher = ScriptedFetcher::new(
+            h1_polls,
+            move |_, _| vec![(fpn(2), start + 1)],
+            |_| CatchStep::Page(catch_page(&["B1"], 1, None, &[2])),
+        );
+        let run = ScriptedRun::start(fetcher, cfg);
+        run.wait_for(Duration::from_secs(3), |c| {
+            c.iter()
+                .position(|(_, c)| matches!(c, Call::Admit(_)))
+                .is_some_and(|i| c[i..].iter().any(|(_, c)| matches!(c, Call::Poll { .. })))
+        })
+        .await;
+        let (calls, lines) = run.stop().await;
+        let joined = joining_poll(&calls).expect("poll 2 reported stream 2 joined");
+        let u2 = poll_upper(&calls, joined);
+        let after: Vec<Call> = statements_after(&calls, joined)
+            .into_iter()
+            .map(|(_, c)| c)
+            .take(4)
+            .collect();
+        let ceiling = TailCeiling::AtOrBelow(u2);
+        let want = [
+            Call::FirstLines {
+                fps: vec![fpn(2)],
+                after: start,
+                ceiling,
+            },
+            Call::CatchUp {
+                fps: vec![fpn(2)],
+                lower: Lower::Start(start),
+                upper: u2,
+                ceiling,
+            },
+            Call::Admit(vec![fpn(2)]),
+        ];
+        assert_eq!(after.get(..3), Some(&want[..]), "{calls:#?}");
+        assert!(
+            matches!(after.get(3), Some(Call::Poll { lower: Lower::Start(l), .. }) if *l == u2),
+            "the main scan resumes at Start{{u2}}: {calls:#?}"
+        );
+        assert_eq!(lines, ["A1", "A2", "B1"]);
+    }
+
+    /// H2 (issue #804): a catch-up walks one slice per page, re-probes for
+    /// the next line after every slice that comes back under the limit, so
+    /// empty slices are never read, and admits once a probe finds nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_catch_up_reprobes_after_each_short_slice_and_never_walks_empty_ones() {
+        const MS: i64 = 1_000_000;
+        let mut cfg = test_cfg();
+        cfg.fetch_limit = 2;
+        cfg.slice_ns = 2 * MS;
+        // Five frames arrive back to back; a depth of 4 could evict one.
+        cfg.channel_depth = 64;
+        let start = cfg.start_ns;
+        let c = TailCursor {
+            tuple: (start + MS, fpn(2), 0),
+            seen: 1,
+        };
+        let mut joined_sent = false;
+        let fetcher = ScriptedFetcher::new(
+            move |n, l, _| {
+                if n == 0 {
+                    return lines_page(&["A1"], &[]);
+                }
+                if !joined_sent && Lower::of(l).ts() >= start + 8 * MS {
+                    joined_sent = true;
+                    return lines_page(&["A2"], &[2]);
+                }
+                lines_page(&[], &[])
+            },
+            move |n, _| match n {
+                0 => vec![(fpn(2), start + 1)],
+                1 => vec![(fpn(2), start + 5 * MS)],
+                _ => Vec::new(),
+            },
+            move |n| {
+                CatchStep::Page(match n {
+                    0 => catch_page(&["B1", "B2"], 2, Some(c), &[2]),
+                    1 => catch_page(&["B3"], 1, None, &[2]),
+                    2 => catch_page(&["B4"], 1, None, &[2]),
+                    _ => catch_page(&[], 0, None, &[]),
+                })
+            },
+        );
+        let run = ScriptedRun::start(fetcher, cfg);
+        run.wait_for(Duration::from_secs(3), has_admit).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (calls, lines) = run.stop().await;
+        let joined = joining_poll(&calls).expect("a poll reported stream 2 joined");
+        let ceiling = TailCeiling::AtOrBelow(poll_upper(&calls, joined));
+        let after: Vec<Call> = statements_after(&calls, joined)
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect();
+        let kinds: Vec<String> = after
+            .iter()
+            .take(7)
+            .map(|c| match c {
+                Call::FirstLines { after, .. } => format!("FirstLines({})", after - start),
+                Call::CatchUp { lower, .. } => match lower {
+                    Lower::Start(t) => format!("CatchUp(Start{{{}}})", t - start),
+                    Lower::After(k) => format!("CatchUp(After({}))", k.tuple.0 - start),
+                },
+                Call::Admit(f) => format!("Admit({f:?})"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        let want: Vec<String> = vec![
+            "FirstLines(0)".to_string(),
+            "CatchUp(Start{0})".to_string(),
+            format!("CatchUp(After({MS}))"),
+            format!("FirstLines({})", 3 * MS),
+            format!("CatchUp(Start{{{}}})", 5 * MS - 1),
+            format!("FirstLines({})", 7 * MS - 1),
+            format!("Admit({:?})", vec![fpn(2)]),
+        ];
+        assert_eq!(kinds, want, "{calls:#?}");
+        assert_eq!(
+            count(&calls, |c| matches!(c, Call::CatchUp { .. })),
+            3,
+            "{calls:#?}"
+        );
+        for (_, c) in &calls {
+            if let Call::CatchUp {
+                lower,
+                upper,
+                ceiling: cl,
+                ..
+            } = c
+            {
+                assert_eq!(*cl, ceiling);
+                assert!(upper - lower.ts() <= 2 * MS, "slice too wide: {c:?}");
+                assert!(*upper <= ceiling.ts(), "past the ceiling: {c:?}");
+            }
+        }
+        assert_eq!(lines, ["A1", "A2", "B1", "B2", "B3", "B4"]);
+    }
+
+    /// H4 (issue #804): a catch-up page that never answers does not hold up
+    /// shutdown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_during_a_hanging_catch_up_returns_promptly() {
+        let cfg = test_cfg();
+        let start = cfg.start_ns;
+        let fetcher = ScriptedFetcher::new(
+            h1_polls,
+            move |_, _| vec![(fpn(2), start + 1)],
+            |_| CatchStep::Hang,
+        );
+        let run = ScriptedRun::start(fetcher, cfg);
+        run.wait_for(Duration::from_secs(2), |c| {
+            c.iter().any(|(_, c)| matches!(c, Call::CatchUp { .. }))
+        })
+        .await;
+        let started = Instant::now();
+        let _ = run.stop().await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// H5 (issue #804): a failed catch-up read closes the connection with
+    /// its reason, sends nothing more and admits nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_catch_up_closes_with_its_reason_and_admits_nothing() {
+        let cfg = test_cfg();
+        let start = cfg.start_ns;
+        let fetcher = ScriptedFetcher::new(
+            h1_polls,
+            move |_, _| vec![(fpn(2), start + 1)],
+            // The failure comes 50 ms late: a fatal error closes the
+            // connection, and a frame queued just before it can lose the
+            // writer's race with the close, which is not what this pins.
+            |_| {
+                CatchStep::Fail(
+                    Duration::from_millis(50),
+                    ReadError::PipelineInvalid {
+                        reason: "catch-up failed".to_string(),
+                    },
+                )
+            },
+        );
+        let run = ScriptedRun::start(fetcher, cfg);
+        let ScriptedRun {
+            handle,
+            shutdown,
+            sent,
+            closed,
+            log,
+        } = run;
+        tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("a failed catch-up must close the connection")
+            .expect("no panic");
+        drop(shutdown);
+        let frame = closed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("close was sent")
+            .expect("close carried a reason");
+        assert_eq!(frame.reason.as_str(), "catch-up failed");
+        assert_eq!(sent_lines(&sent.lock().unwrap()), ["A1", "A2"]);
+        let calls = log.lock().unwrap().clone();
+        assert!(!has_admit(&calls), "{calls:#?}");
+    }
+
+    /// H6 (issue #804): an empty probe, or a catch-up that fetches nothing
+    /// from the stream, leaves it waiting; it is admitted once a read
+    /// fetches from it, and its line is sent once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_catch_up_read_leaves_the_stream_waiting_until_a_read_fetches_from_it() {
+        let cfg = test_cfg();
+        let start = cfg.start_ns;
+        let fetcher = ScriptedFetcher::new(
+            h1_polls,
+            move |n, _| match n {
+                1 | 2 => vec![(fpn(2), start + 1)],
+                _ => Vec::new(),
+            },
+            |n| {
+                CatchStep::Page(match n {
+                    1 => catch_page(&["B1"], 1, None, &[2]),
+                    _ => catch_page(&[], 0, None, &[]),
+                })
+            },
+        );
+        let run = ScriptedRun::start(fetcher, cfg);
+        run.wait_for(Duration::from_secs(3), has_admit).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (calls, lines) = run.stop().await;
+        let joined = joining_poll(&calls).expect("poll 2 reported stream 2 joined");
+        let after: Vec<Call> = statements_after(&calls, joined)
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect();
+        let fl: Vec<usize> = after
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(c, Call::FirstLines { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(fl.len() >= 3, "three probes: {calls:#?}");
+        assert_eq!(
+            fl[0], 0,
+            "the first statement after joining is a probe: {calls:#?}"
+        );
+        let is_poll = |c: &Call| matches!(c, Call::Poll { .. });
+        let is_cu = |c: &Call| matches!(c, Call::CatchUp { .. });
+        assert!(
+            after[fl[0] + 1..fl[1]].iter().any(is_poll)
+                && !after[fl[0] + 1..fl[1]].iter().any(is_cu),
+            "an empty probe opens no catch-up: {calls:#?}"
+        );
+        assert!(is_cu(&after[fl[1] + 1]), "{calls:#?}");
+        assert!(
+            is_poll(&after[fl[1] + 2]),
+            "the empty catch-up is the only statement before the next main poll: {calls:#?}"
+        );
+        assert!(after[fl[1] + 2..fl[2]].iter().any(is_poll), "{calls:#?}");
+        assert!(is_cu(&after[fl[2] + 1]), "{calls:#?}");
+        assert_eq!(after[fl[2] + 2], Call::Admit(vec![fpn(2)]), "{calls:#?}");
+        assert_eq!(
+            count(&calls, |c| matches!(c, Call::Admit(_))),
+            1,
+            "{calls:#?}"
+        );
+        let ceilings: Vec<i64> = after
+            .iter()
+            .filter_map(|c| match c {
+                Call::FirstLines { ceiling, .. } => Some(ceiling.ts()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            ceilings.windows(2).all(|w| w[1] >= w[0]),
+            "each probe's ceiling at or above the one before: {ceilings:?}"
+        );
+        assert_eq!(lines.iter().filter(|l| *l == "B1").count(), 1, "{lines:?}");
+    }
+
+    /// The instant poll 2's `PollDone` was recorded.
+    fn joined_at(calls: &[(Instant, Call)]) -> Instant {
+        calls[joining_poll(calls).expect("poll 2 reported stream 2 joined")].0
+    }
+
+    /// H7 (issue #804): a stream whose probes stay empty is admitted, with
+    /// no catch-up, once its recheck bound has passed, and not before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_waiting_past_the_recheck_bound_is_admitted_without_lines() {
+        let mut cfg = test_cfg();
+        cfg.catch_up_recheck_ns = 50_000_000;
+        let fetcher = ScriptedFetcher::new(
+            h1_polls,
+            |_, _| Vec::new(),
+            |_| CatchStep::Page(catch_page(&[], 0, None, &[])),
+        );
+        let run = ScriptedRun::start(fetcher, cfg);
+        run.wait_for(Duration::from_secs(1), has_admit).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (calls, _) = run.stop().await;
+        let admit = calls
+            .iter()
+            .position(|(_, c)| *c == Call::Admit(vec![fpn(2)]))
+            .expect("stream 2 is admitted within 1 s");
+        assert_eq!(count(&calls, |c| matches!(c, Call::CatchUp { .. })), 0);
+        let admit_at = calls[admit].0;
+        assert!(
+            !calls[admit..]
+                .iter()
+                .any(|(t, c)| matches!(c, Call::FirstLines { .. })
+                    && *t < admit_at + Duration::from_millis(100)),
+            "no probe after admission: {calls:#?}"
+        );
+        assert!(
+            admit_at.duration_since(joined_at(&calls)) >= Duration::from_millis(50),
+            "admitted before its bound: {calls:#?}"
+        );
+    }
+
+    /// The deadline the producer recorded for the first joined stream.
+    fn producer_deadline(calls: &[(Instant, Call)]) -> Instant {
+        calls
+            .iter()
+            .find_map(|(_, c)| match c {
+                Call::Deadline(d) => Some(*d),
+                _ => None,
+            })
+            .expect("the producer set a deadline")
+    }
+
+    /// H8 (issue #804): no probe starts at or after the stream's deadline,
+    /// so a line readable only after it is neither read nor sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_line_readable_only_after_the_bound_is_neither_read_nor_sent() {
+        let mut cfg = test_cfg();
+        cfg.catch_up_recheck_ns = 50_000_000;
+        let start = cfg.start_ns;
+        let fetcher = ScriptedFetcher::new(
+            h1_polls,
+            move |_, log| {
+                if Instant::now() < producer_deadline(log) {
+                    Vec::new()
+                } else {
+                    vec![(fpn(2), start + 1)]
+                }
+            },
+            |_| CatchStep::Page(catch_page(&["B1"], 1, None, &[2])),
+        );
+        let run = ScriptedRun::start(fetcher, cfg);
+        run.wait_for(Duration::from_secs(1), has_admit).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (calls, lines) = run.stop().await;
+        assert!(has_admit(&calls), "stream 2 is admitted: {calls:#?}");
+        let deadline = producer_deadline(&calls);
+        for (t, c) in &calls {
+            if matches!(c, Call::FirstLines { .. }) {
+                assert!(
+                    *t < deadline,
+                    "a probe started after the deadline: {calls:#?}"
+                );
+            }
+        }
+        assert_eq!(
+            count(&calls, |c| matches!(c, Call::CatchUp { .. })),
+            0,
+            "{calls:#?}"
+        );
+        assert_eq!(
+            count(&calls, |c| *c == Call::Admit(vec![fpn(2)])),
+            1,
+            "{calls:#?}"
+        );
+        assert!(!lines.iter().any(|l| l == "B1"), "{lines:?}");
+    }
+
+    /// H11 (issue #804, code review round 1): a joined stream's first probe
+    /// runs before the producer idles, so a poll interval that outlasts
+    /// the stream's bound cannot admit it before its readable lines below
+    /// the cursor are read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_joined_stream_is_probed_before_an_idle_interval_that_outlasts_its_bound() {
+        let mut cfg = test_cfg();
+        cfg.poll_interval = Duration::from_millis(200);
+        cfg.catch_up_recheck_ns = 100_000_000;
+        let start = cfg.start_ns;
+        let fetcher = ScriptedFetcher::new(
+            h1_polls,
+            move |_, _| vec![(fpn(2), start + 1)],
+            |_| CatchStep::Page(catch_page(&["B1"], 1, None, &[2])),
+        );
+        let run = ScriptedRun::start(fetcher, cfg);
+        run.wait_for(Duration::from_secs(2), has_admit).await;
+        let (calls, lines) = run.stop().await;
+        let joined = joining_poll(&calls).expect("poll 2 reported stream 2 joined");
+        let first = calls[joined..]
+            .iter()
+            .position(|(_, c)| matches!(c, Call::FirstLines { .. }))
+            .map(|i| i + joined);
+        let admit = calls
+            .iter()
+            .position(|(_, c)| *c == Call::Admit(vec![fpn(2)]));
+        assert!(
+            first.is_some() && admit.is_some() && first < admit,
+            "the stream is probed before it is admitted: {calls:#?}"
+        );
+        assert_eq!(
+            count(&calls, |c| matches!(c, Call::CatchUp { .. })),
+            1,
+            "{calls:#?}"
+        );
+        assert_eq!(lines, ["A1", "A2", "B1"]);
+    }
+
+    /// H9 (issue #804): a catch-up page that returns after the deadline is
+    /// sent, and then the catch-up stops: the stream is admitted with no
+    /// further read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_catch_up_that_crosses_the_bound_stops_at_it() {
+        let mut cfg = test_cfg();
+        cfg.catch_up_recheck_ns = 100_000_000;
+        cfg.fetch_limit = 2;
+        let start = cfg.start_ns;
+        let c = TailCursor {
+            tuple: (start + 1, fpn(2), 0),
+            seen: 1,
+        };
+        let fetcher = ScriptedFetcher::new(
+            h1_polls,
+            move |_, _| vec![(fpn(2), start + 1)],
+            move |n| match n {
+                0 => CatchStep::Slow(
+                    Duration::from_millis(150),
+                    catch_page(&["B1", "B2"], 2, Some(c), &[2]),
+                ),
+                _ => CatchStep::Page(catch_page(&["B3"], 1, None, &[2])),
+            },
+        );
+        let run = ScriptedRun::start(fetcher, cfg);
+        run.wait_for(Duration::from_secs(3), |c| {
+            c.iter()
+                .position(|(_, c)| matches!(c, Call::Admit(_)))
+                .is_some_and(|i| c[i..].iter().any(|(_, c)| matches!(c, Call::Poll { .. })))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (calls, lines) = run.stop().await;
+        let joined = joining_poll(&calls).expect("poll 2 reported stream 2 joined");
+        let u2 = poll_upper(&calls, joined);
+        assert_eq!(
+            count(&calls, |c| matches!(c, Call::CatchUp { .. })),
+            1,
+            "{calls:#?}"
+        );
+        let cu = calls
+            .iter()
+            .position(|(_, c)| matches!(c, Call::CatchUp { .. }))
+            .expect("one catch-up");
+        let admit = calls
+            .iter()
+            .position(|(_, c)| *c == Call::Admit(vec![fpn(2)]))
+            .expect("stream 2 admitted");
+        assert!(admit > cu, "{calls:#?}");
+        assert!(
+            !calls[cu..]
+                .iter()
+                .any(|(_, c)| matches!(c, Call::FirstLines { .. })),
+            "no probe after the catch-up: {calls:#?}"
+        );
+        assert!(
+            matches!(
+                calls[admit..].iter().find(|(_, c)| matches!(c, Call::Poll { .. })),
+                Some((_, Call::Poll { lower: Lower::Start(l), .. })) if *l == u2
+            ),
+            "the poll after admission resumes at Start{{u2}}: {calls:#?}"
+        );
+        assert_eq!(lines, ["A1", "A2", "B1", "B2"]);
+    }
+
+    /// H10 (issue #804): rechecks keep to their own timer, at most one per
+    /// poll interval, while the main scan polls a backlog without pause.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rechecks_are_limited_by_their_own_timer_while_the_main_scan_runs_without_pause() {
+        let mut cfg = test_cfg();
+        cfg.poll_interval = Duration::from_millis(20);
+        cfg.catch_up_recheck_ns = 200_000_000;
+        cfg.slice_ns = 1_000_000;
+        cfg.start_ns = params::now_ns() - 1_000_000_000;
+        let fetcher = ScriptedFetcher::new(
+            |n, _, _| match n {
+                1 => lines_page(&[], &[2]),
+                _ => lines_page(&[], &[]),
+            },
+            |_, _| Vec::new(),
+            |_| CatchStep::Page(catch_page(&[], 0, None, &[])),
+        );
+        let run = ScriptedRun::start(fetcher, cfg);
+        run.wait_for(Duration::from_secs(3), has_admit).await;
+        let (calls, _) = run.stop().await;
+        let joined = joining_poll(&calls).expect("poll 2 reported stream 2 joined");
+        let admit = calls
+            .iter()
+            .position(|(_, c)| *c == Call::Admit(vec![fpn(2)]))
+            .expect("stream 2 admitted");
+        let span = &calls[joined..admit];
+        let polls = count(span, |c| matches!(c, Call::Poll { .. }));
+        let probes: Vec<Instant> = span
+            .iter()
+            .filter(|(_, c)| matches!(c, Call::FirstLines { .. }))
+            .map(|(t, _)| *t)
+            .collect();
+        assert!(polls > 11, "the main scan ran without pause: {polls} polls");
+        assert!(!probes.is_empty(), "the waiting stream is rechecked");
+        assert!(probes.len() <= 11, "{} rechecks", probes.len());
+        for w in probes.windows(2) {
+            assert!(
+                w[1].duration_since(w[0]) >= Duration::from_millis(20),
+                "rechecks closer than the poll interval: {probes:?}"
+            );
+        }
     }
 
     // -- param parsing ---------------------------------------------------
