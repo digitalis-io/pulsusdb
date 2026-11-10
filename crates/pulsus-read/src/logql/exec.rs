@@ -3184,6 +3184,37 @@ pub enum TailLower {
     After(TailCursor),
 }
 
+/// The positions a catch-up may deliver: exactly those the main scan has passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailCeiling {
+    /// Main scan at `Start { start_ns: t }`: rows with `timestamp_ns <= t`.
+    AtOrBelow(i64),
+    /// Main scan at `After(c)`: rows with `(timestamp_ns, fingerprint) < (c.tuple.0, c.tuple.1)`.
+    Before(i64, Fingerprint),
+}
+
+impl TailCeiling {
+    pub fn of(_lower: TailLower) -> Self {
+        Self::AtOrBelow(i64::MIN)
+    }
+
+    pub fn ts(self) -> i64 {
+        i64::MIN
+    }
+
+    pub fn admits(self, _ts: i64, _fp: Fingerprint) -> bool {
+        false
+    }
+}
+
+/// One catch-up page, and the distinct fingerprints of every row it fetched
+/// (before the ceiling or the pipeline dropped any), sorted.
+#[derive(Debug)]
+pub struct CatchUpPage {
+    pub page: TailPage,
+    pub fetched_fps: Vec<Fingerprint>,
+}
+
 /// One tail poll's result. `next` is the advanced boundary cursor
 /// (unchanged when the page fetched no rows); `fetched` is the RAW
 /// fetched-row count — `fetched == fetch_limit` means the slice may hold
@@ -3194,6 +3225,9 @@ pub struct TailPage {
     pub streams: Vec<StreamResult>,
     pub next: Option<TailCursor>,
     pub fetched: u32,
+    /// The streams whose labels this poll read for the first time and
+    /// which are not in the stage-3 list, sorted (issue #804).
+    pub joined: Vec<Fingerprint>,
 }
 
 /// Registration-visibility grace at the live edge (issue #94 v6-v8): the
@@ -3210,6 +3244,10 @@ pub struct TailPage {
 /// knob (a knob would invite masking #134-class failures with unbounded
 /// read-side rescans; reconnect is the existing, no-knob remedy).
 pub const TAIL_REGISTRATION_GRACE_NS: i64 = 3_600_000_000_000;
+
+/// How long a joined stream may be caught up before it is admitted without
+/// the rest (issue #804).
+pub const TAIL_CATCH_UP_RECHECK_NS: i64 = 60_000_000_000;
 
 /// The per-connection tail setup (issue #74): the streams plan and the
 /// compiled pipeline, built ONCE before the WebSocket upgrade (a bad
@@ -3292,6 +3330,40 @@ pub struct TailSetup {
     /// #463) — the tail's whole lifetime, since the header is read once
     /// at upgrade and a WebSocket has no per-frame request.
     opts: ResponseOptions,
+    hydrated: HashMap<Fingerprint, StreamMetaRow>,
+    deliverable: Vec<Fingerprint>,
+    last_full_scan_lower_ns: i64,
+}
+
+impl TailSetup {
+    /// The producer admits these streams to stage 3 (their catch-up, if any, is done).
+    pub fn admit(&mut self, _fps: &[Fingerprint]) {}
+}
+
+/// One poll's reads, held until [`commit_tail_attempt`] keeps them (issue
+/// #804).
+#[derive(Debug)]
+pub struct TailAttempt {
+    page: TailPage,
+    added: Vec<Fingerprint>,
+    labels: HashMap<Fingerprint, StreamMetaRow>,
+    joined: Vec<Fingerprint>,
+    first_window: bool,
+    full_scan: bool,
+    lower_ns: i64,
+}
+
+/// Keeps what an accepted [`TailAttempt`] read (issue #804).
+pub fn commit_tail_attempt(_setup: &mut TailSetup, attempt: TailAttempt) -> TailPage {
+    let _ = (
+        &attempt.added,
+        &attempt.labels,
+        &attempt.joined,
+        attempt.first_window,
+        attempt.full_scan,
+        attempt.lower_ns,
+    );
+    attempt.page
 }
 
 /// Whether a `/stats` pipeline is fully served by pushdown aggregation: a
@@ -4325,6 +4397,9 @@ impl LogQlEngine {
                     ),
                     resolved: Vec::new(),
                     opts,
+                    hydrated: HashMap::new(),
+                    deliverable: Vec::new(),
+                    last_full_scan_lower_ns: spec_start_ns(&params.spec),
                 })
             }
             Plan::Metric(_) | Plan::MetricBinary(_) => Err(ReadError::PipelineInvalid {
@@ -4398,6 +4473,7 @@ impl LogQlEngine {
                 streams: Vec::new(),
                 next: prev,
                 fetched: 0,
+                joined: Vec::new(),
             });
         }
         // The full cumulative cache — not just this poll's narrow stage-1
@@ -4496,7 +4572,41 @@ impl LogQlEngine {
             streams,
             next,
             fetched,
+            joined: Vec::new(),
         })
+    }
+
+    /// S5 (issue #804): one catch-up step over `fps`.
+    pub async fn tail_catch_up(
+        &self,
+        _setup: &TailSetup,
+        _fps: &[Fingerprint],
+        _lower: TailLower,
+        _upper_ns: i64,
+        _ceiling: TailCeiling,
+        _fetch_limit: u32,
+    ) -> Result<CatchUpPage, ReadError> {
+        Ok(CatchUpPage {
+            page: TailPage {
+                streams: Vec::new(),
+                next: None,
+                fetched: 0,
+                joined: Vec::new(),
+            },
+            fetched_fps: Vec::new(),
+        })
+    }
+
+    /// S4 (issue #804): each of `fps` that has a line in
+    /// `(after_ns, ceiling.ts()]`, with its earliest one, sorted.
+    pub async fn tail_first_lines(
+        &self,
+        _setup: &TailSetup,
+        _fps: &[Fingerprint],
+        _after_ns: i64,
+        _ceiling: TailCeiling,
+    ) -> Result<Vec<(Fingerprint, i64)>, ReadError> {
+        Ok(Vec::new())
     }
 }
 
@@ -8658,6 +8768,9 @@ mod tests {
                     covered_months: (plan::year_month(start_ns), plan::year_month(end_ns)),
                     resolved: Vec::new(),
                     opts: ResponseOptions::default(),
+                    hydrated: HashMap::new(),
+                    deliverable: Vec::new(),
+                    last_full_scan_lower_ns: start_ns,
                 }
             }
             _ => panic!("stream selector must plan to Plan::Streams"),
@@ -8700,6 +8813,101 @@ mod tests {
     const DEC_1_2023_NS: i64 = 1_701_388_800_000_000_000;
     /// Nov 1 2023 00:00:00 UTC, in ns.
     const NOV_1_2023_NS: i64 = 1_698_796_800_000_000_000;
+
+    // -- issue #804: the catch-up ceiling and the poll commit ---------------
+
+    /// Issue #804 U1: a catch-up's ceiling admits exactly the positions the
+    /// main scan has passed, on both lower-bound modes.
+    #[test]
+    fn tail_ceiling_admits_exactly_the_positions_the_main_scan_passed() {
+        let fp = Fingerprint::from_raw;
+        assert_eq!(
+            TailCeiling::of(TailLower::Start { start_ns: 100 }),
+            TailCeiling::AtOrBelow(100)
+        );
+        let c = TailCursor {
+            tuple: (100, fp(5), 7),
+            seen: 1,
+        };
+        assert_eq!(
+            TailCeiling::of(TailLower::After(c)),
+            TailCeiling::Before(100, fp(5))
+        );
+        assert!(TailCeiling::AtOrBelow(100).admits(100, fp(9)));
+        assert!(!TailCeiling::AtOrBelow(100).admits(101, fp(1)));
+        assert!(TailCeiling::Before(100, fp(5)).admits(100, fp(3)));
+        assert!(!TailCeiling::Before(100, fp(5)).admits(100, fp(9)));
+        assert!(TailCeiling::Before(100, fp(5)).admits(99, fp(9)));
+        assert_eq!(TailCeiling::AtOrBelow(100).ts(), 100);
+        assert_eq!(TailCeiling::Before(100, fp(5)).ts(), 100);
+    }
+
+    fn meta_row(fp: u128) -> StreamMetaRow {
+        StreamMetaRow {
+            fingerprint: Fingerprint::from_raw(fp),
+            service: "checkout".to_string(),
+            labels: format!(r#"{{"pod":"{fp}"}}"#),
+        }
+    }
+
+    fn empty_page() -> TailPage {
+        TailPage {
+            streams: Vec::new(),
+            next: None,
+            fetched: 0,
+            joined: Vec::new(),
+        }
+    }
+
+    /// Issue #804 U3: an accepted attempt keeps what it read. On the first
+    /// window its joined streams are admitted; after it they are reported
+    /// for a catch-up and not admitted.
+    #[test]
+    fn commit_tail_attempt_keeps_what_the_attempt_read() {
+        let fp = Fingerprint::from_raw;
+        let ctx = tail_test_ctx();
+        // A setup start of 0, below both attempts' lower bounds, so the
+        // full-scan mark is the attempt's.
+        let mut setup = build_tail_setup(&ctx, r#"{app="x"}"#, 0, 1_000);
+        setup.resolved = vec![fp(1)];
+
+        let a = TailAttempt {
+            page: empty_page(),
+            added: vec![fp(2)],
+            labels: [(fp(1), meta_row(1)), (fp(2), meta_row(2))]
+                .into_iter()
+                .collect(),
+            joined: vec![fp(1), fp(2)],
+            first_window: true,
+            full_scan: true,
+            lower_ns: 500,
+        };
+        let page = commit_tail_attempt(&mut setup, a);
+        assert_eq!(setup.resolved, vec![fp(1), fp(2)]);
+        let mut keys: Vec<Fingerprint> = setup.hydrated.keys().copied().collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec![fp(1), fp(2)]);
+        assert_eq!(setup.deliverable, vec![fp(1), fp(2)]);
+        assert_eq!(setup.last_full_scan_lower_ns, 500);
+        assert_eq!(page.joined, Vec::<Fingerprint>::new());
+
+        let b = TailAttempt {
+            page: empty_page(),
+            added: Vec::new(),
+            labels: [(fp(3), meta_row(3))].into_iter().collect(),
+            joined: vec![fp(3)],
+            first_window: false,
+            full_scan: false,
+            lower_ns: 900,
+        };
+        let page = commit_tail_attempt(&mut setup, b);
+        let mut keys: Vec<Fingerprint> = setup.hydrated.keys().copied().collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec![fp(1), fp(2), fp(3)]);
+        assert_eq!(setup.deliverable, vec![fp(1), fp(2)]);
+        assert_eq!(setup.last_full_scan_lower_ns, 500);
+        assert_eq!(page.joined, vec![fp(3)]);
+    }
 
     /// AC3(c) (catch-up phase, `narrow=false`): a refresh whose
     /// `[scan_floor_ns, upper_ns]` covers the SAME `(lo_month, hi_month)`

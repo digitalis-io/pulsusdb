@@ -26,6 +26,13 @@ pub struct StreamMetaRow {
     pub labels: String,
 }
 
+/// The live tail's S4 (issue #804): a stream's earliest line in a window.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct FirstLineRow {
+    pub fingerprint: Fingerprint,
+    pub first_ns: i64,
+}
+
 /// Stage 3 — samples (`log_samples`): one matching log line.
 /// `structured_metadata` is the per-entry canonical JSON String (issue #97),
 /// the LAST projected column (append-only, aligning with the additive
