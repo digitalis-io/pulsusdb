@@ -1042,26 +1042,18 @@ impl LabelCache {
 
     /// One refresh sweep + atomic swap for every tenant in use (delegates
     /// to [`super::refresh`], the only ClickHouse-touching code in this
-    /// module). A failed sweep leaves that tenant's last good snapshot in
-    /// place — see [`super::refresh::run_sweep`]'s doc comment — and the
-    /// others are still swept; the first failure is returned.
+    /// module), as one read request (issue #803). A tenant whose statement
+    /// fails keeps its last good snapshot while the others swap, and the
+    /// first failure is returned.
     pub async fn refresh(&self) -> Result<(), pulsus_clickhouse::ChError> {
-        let mut first_err = None;
-        for tenant in self.tenants_in_use() {
-            if let Err(err) = self.refresh_tenant(&tenant).await
-                && first_err.is_none()
-            {
-                first_err = Some(err);
-            }
-        }
-        first_err.map_or(Ok(()), Err)
+        self.refresh_pass(&self.tenants_in_use()).await
     }
 
     /// One sweep of `tenant`'s cache (issue #635 part 4), which puts the
-    /// tenant in use.
+    /// tenant in use: a pass over that one tenant.
     pub async fn refresh_tenant(&self, tenant: &Tenant) -> Result<(), pulsus_clickhouse::ChError> {
-        let slot = self.tenant_cache(tenant);
-        super::refresh::run_sweep(self, tenant, &slot).await
+        self.tenant_cache(tenant);
+        self.refresh_pass(std::slice::from_ref(tenant)).await
     }
 
     /// Saves an accepted label-cache pass (issue #803): swaps each swept
@@ -1073,8 +1065,49 @@ impl LabelCache {
         &self,
         outcome: super::refresh::SweepOutcome,
     ) -> Result<(), pulsus_clickhouse::ChError> {
-        // Commit-1 stub: swaps nothing.
+        for (tenant, swept) in outcome.swept {
+            let slot = self.tenant_cache(&tenant);
+            let series_count = swept.series_count();
+            swept.swap_into(&slot);
+            self.metrics
+                .record_refresh(series_count, self.config.cache_max_series);
+        }
+        for _ in &outcome.failed {
+            self.metrics.record_refresh_failure();
+        }
         outcome.first_error.map_or(Ok(()), Err)
+    }
+
+    /// One label-cache pass over `tenants` (issue #803): one read request,
+    /// every tenant's statement on one server, run once more on another
+    /// when that server fails. Only the accepted attempt is saved; when
+    /// both attempts fail, every tenant keeps its last good snapshot and
+    /// counts one refresh failure.
+    async fn refresh_pass(&self, tenants: &[Tenant]) -> Result<(), pulsus_clickhouse::ChError> {
+        let client = &self.client;
+        let config = &self.config;
+        let outcome = client
+            .run_read_request(
+                move || async move {
+                    client.rebind();
+                    let result = super::refresh::sweep_attempt(client, config, tenants).await;
+                    pulsus_clickhouse::Attempt {
+                        result,
+                        failure: client.server_failure(),
+                    }
+                },
+                pulsus_clickhouse::ChError::from,
+            )
+            .await;
+        match outcome {
+            Ok(outcome) => self.commit_sweep(outcome),
+            Err(err) => {
+                for _ in tenants {
+                    self.metrics.record_refresh_failure();
+                }
+                Err(err)
+            }
+        }
     }
 
     /// The tenants the refresh loop sweeps, sorted.

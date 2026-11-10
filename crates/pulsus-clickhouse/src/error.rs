@@ -52,6 +52,17 @@ const RETRYABLE_SERVER_CODES: &[i32] = &[
     425, // SYSTEM_ERROR (transient subset)
 ];
 
+/// The server codes that say the server a read request is bound to failed
+/// (issue #803): [`RETRYABLE_SERVER_CODES`] less `TIMEOUT_EXCEEDED` (159),
+/// which is the request's own deadline.
+const SERVER_FAILURE_CODES: &[i32] = &[
+    209, // SOCKET_TIMEOUT
+    210, // NETWORK_ERROR
+    279, // ALL_CONNECTION_TRIES_FAILED
+    202, // TOO_MANY_SIMULTANEOUS_QUERIES
+    425, // SYSTEM_ERROR (transient subset)
+];
+
 /// Replaces a ClickHouse `(version X.Y.Z.W (official build))` banner with
 /// `(version <redacted>)`.
 ///
@@ -106,8 +117,14 @@ impl ChError {
     /// network-class server code. A timeout is the request's own deadline
     /// and is not one, nor is a bad-SQL or logic error.
     pub fn is_server_failure(&self) -> bool {
-        // Commit-1 stub: today's transport classification.
-        self.is_retryable()
+        match self {
+            ChError::Connect(_) | ChError::Io(_) => true,
+            ChError::Server { code, .. } => SERVER_FAILURE_CODES.contains(code),
+            ChError::Timeout(_)
+            | ChError::Decode(_)
+            | ChError::Config(_)
+            | ChError::InsertUncertain(_) => false,
+        }
     }
 
     /// True only for transient faults where retrying the *same idempotent*

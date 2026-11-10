@@ -15,7 +15,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use pulsus_clickhouse::{ChClient, ChError, ChPool, spawn_reprobe_loop};
+use pulsus_clickhouse::{Attempt, ChClient, ChError, ChPool, run_read_request, spawn_reprobe_loop};
 use pulsus_config::{Config, LogLevel, Mode};
 use pulsus_read::LabelCache;
 use pulsus_schema::{NameCatalogue, REQUIRED_SERVER_NAMES, SchemaError};
@@ -29,8 +29,9 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::{self, AppState, BuildInfo};
 use crate::chconfig::{
-    NameCheckError, build_label_cache, check_server_names, conn_config_from, consistency_from,
-    metric_writer_tables_from, read_schema_retention, trace_writer_tables_from, writer_tables_from,
+    NameCheckError, bootstrap_conn_config_from, build_label_cache, check_server_names,
+    conn_config_from, consistency_from, metric_writer_tables_from, read_schema_retention,
+    trace_writer_tables_from, writer_tables_from,
 };
 use crate::ingest::{MetricWriterSink, TraceWriterSink, WriterSink};
 
@@ -471,9 +472,15 @@ fn spawn_reconnect_loop(
     } = handoff;
     tokio::spawn(async move {
         let mut backoff = INITIAL_BACKOFF;
+        // Issue #803: the bootstrap pool the startup checks read over, kept
+        // across iterations so each one's binding is the next server in the
+        // pool's rotation, and a server failure demotes that server for the
+        // next attempt. Dropped once the serving pool is published.
+        let mut bootstrap: Option<Arc<ChPool>> = None;
         loop {
-            match ensure_schema_then_connect(&config, required).await {
+            match ensure_schema_then_connect(&config, required, &mut bootstrap).await {
                 Ok((pool, retention_days)) => {
+                    drop(bootstrap.take());
                     tracing::info!(
                         retention_days,
                         "clickhouse schema ready; pool established; retention read from the database"
@@ -681,21 +688,74 @@ pub(crate) fn reader_enabled(cfg: &Config) -> bool {
 /// self-healing: a pool connect that fails after a successful check is
 /// simply checked again, and both checks are reads.
 ///
+/// **The checks are one read request (issue #803)**, over `bootstrap`, the
+/// loop's bootstrap pool, connected here when it is `None`. A server that
+/// fails them is demoted and the checks run once more at once on another;
+/// any other error goes to the loop's backoff, and the next iteration's
+/// binding is the next server in the pool's rotation.
+///
 /// **This process creates no schema.** `schema/schema.sh` does. An absent
 /// database is reported as such, naming the script, rather than becoming
 /// `UNKNOWN_DATABASE` out of the pool connect.
 async fn ensure_schema_then_connect(
     config: &Config,
     required: &'static [(&'static str, NameCatalogue)],
+    bootstrap: &mut Option<Arc<ChPool>>,
 ) -> Result<(ChPool, u32), StartupError> {
-    // Issue #603: FIRST — no name is sent before it is known to exist.
-    check_server_names(config, required).await?;
-    // Issue #497: the retention comes from the database, never a setting.
-    let retention_days = read_schema_retention(config).await?;
+    let pool = match bootstrap {
+        Some(pool) => Arc::clone(pool),
+        None => {
+            let pool = Arc::new(
+                ChPool::connect(bootstrap_conn_config_from(config))
+                    .await
+                    .map_err(StartupError::Bootstrap)?,
+            );
+            *bootstrap = Some(Arc::clone(&pool));
+            pool
+        }
+    };
+    let retention_days = startup_checks(&pool, config, required).await?;
     let pool = ChPool::connect(conn_config_from(config))
         .await
         .map_err(StartupError::Pool)?;
     Ok((pool, retention_days))
+}
+
+/// The startup checks as one read request (issue #803): one client of the
+/// bootstrap pool, bound to one server, runs the version gate, the name
+/// check and the retention read; when that server fails, the whole
+/// sequence runs once more on another healthy one.
+async fn startup_checks(
+    pool: &Arc<ChPool>,
+    config: &Config,
+    required: &'static [(&'static str, NameCatalogue)],
+) -> Result<u32, NameCheckError> {
+    run_read_request(
+        pool,
+        || async {
+            let client = match ChClient::from_shared_pool(Arc::clone(pool), config.query_timeout.0)
+                .with_consistency(consistency_from(config))
+            {
+                Ok(client) => client,
+                Err(e) => return Attempt::failed_to_start(NameCheckError::Connect(e)),
+            };
+            let result = async {
+                // Issue #603: FIRST — no name is sent before it is known to
+                // exist.
+                check_server_names(&client, required).await?;
+                // Issue #497: the retention comes from the database, never
+                // a setting.
+                read_schema_retention(&client, config).await
+            }
+            .await;
+            Attempt {
+                result,
+                failure: client.server_failure(),
+            }
+        },
+        |f| NameCheckError::Connect(ChError::from(f)),
+    )
+    .await
 }
 
 /// Initializes the global `tracing` subscriber from `cfg.log_level`
@@ -1217,7 +1277,7 @@ mod tests {
         cfg.clickhouse.http_port = 1; // nothing listens here
         // `ChPool` is not `Debug` (pulsus-clickhouse), so match manually
         // instead of `.expect_err`/`.unwrap_err`.
-        let err = match ensure_schema_then_connect(&cfg, REQUIRED_SERVER_NAMES).await {
+        let err = match ensure_schema_then_connect(&cfg, REQUIRED_SERVER_NAMES, &mut None).await {
             Err(err) => err,
             Ok(_) => panic!("nothing listens on port 1"),
         };

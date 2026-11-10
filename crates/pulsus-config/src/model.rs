@@ -826,6 +826,18 @@ pub enum ReadSpread {
     Zone,
 }
 
+impl std::str::FromStr for ReadSpread {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "all" => Ok(ReadSpread::All),
+            "zone" => Ok(ReadSpread::Zone),
+            _ => Err("one of: all, zone".to_string()),
+        }
+    }
+}
+
 /// `PULSUS_INSERT_MODE` (docs/configuration.md §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

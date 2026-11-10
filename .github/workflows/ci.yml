@@ -2329,6 +2329,13 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-server --test live_server
 
+      # Issue #803: startup checks move off a server that fails them.
+      - name: Startup checks fail over
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test live_startup_failover
+
       # Issue #174: spawns the real `pulsusdb` binary with
       # PULSUS_TLS_CERT/PULSUS_TLS_KEY set (rcgen material generated at
       # run time — no committed keys) and proves the inbound TLS listener
@@ -2810,6 +2817,14 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-clickhouse --test live_spreading
+
+      # Issue #803: each read request goes to one server, requests take
+      # turns over both nodes, a request whose server drops runs again on
+      # another, and writes keep to the node this process's zone prefers.
+      - name: Reads spread, writes keep to the preferred zone (two nodes)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-clickhouse --test live_read_spread
 
       - name: Tear down the cluster
         if: always()

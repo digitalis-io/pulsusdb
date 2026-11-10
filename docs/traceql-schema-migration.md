@@ -448,7 +448,7 @@ that costs 75% of the storage.**
 
 And the request that reads it already computes a window and throws it away. The
 values route parses `start`/`end`, defaulting to `traceql_tag_lookback` = 24 h
-(`crates/pulsus-config/src/model.rs:696` @ 1cdb3e5e, `crates/pulsus-server/src/traces_api/tags.rs:176-179`), then calls
+(`crates/pulsus-config/src/model.rs:696` @ 1cdb3e5e, `crates/pulsus-server/src/traces_api/tags.rs:180-183`), then calls
 `tag_values_sql` (`crates/pulsus-read/src/traces/spans/tags.rs:94-104` @ 9b286980), which emitted no time predicate there at all —
 because the table it reads has no time column.
 
@@ -2319,7 +2319,7 @@ Three aggregate conditions are pushed into the candidate generator today
 Losing a pushdown does not change an answer. The condition is re-evaluated over
 the hydrated spans either way; the pushed form only narrows the candidate list,
 and the plan already keeps a byte-for-byte fallback statement with nothing pushed
-(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:1262-1290`). The effect is more
+(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:1305-1333`). The effect is more
 candidates, not a different result.
 
 `by()` grouping already refuses to push whenever the generator is not
@@ -2341,7 +2341,7 @@ span row that exists carries its attributes.
 **§11 P3 predicted that this removed the class. It does not.** P3's prediction was that
 a materialized view which throws fails the whole `INSERT`, so nothing is stored rather
 than half. Measured on ClickHouse 26.3.29.7, stock config, `async_insert = 0` (the
-writer's pin, `crates/pulsus-clickhouse/src/client.rs:148`), with a view built to throw on one row of a two-row block:
+writer's pin, `crates/pulsus-clickhouse/src/client.rs:195`), with a view built to throw on one row of a two-row block:
 
     client                             Code: 395 … while pushing to view mv_throw
     SELECT count() FROM src            2
@@ -2994,7 +2994,7 @@ materialized view in §1 (`crates/pulsus-schema/src/catalog.rs:227-234, 244-256,
 (`crates/pulsus-write/src/writer/trace.rs:9-19 @ d60a960d, 137-185, 172`; `crates/pulsus-write/src/writer/table.rs:375-442` @ d60a960d;
 `crates/pulsus-write/src/writer/backfill.rs:23-28, 189-201, 214-220`); the wire framing
 (`vendor/clickhouse/src/rowbinary/ser.rs:129, 137, 146, 222`) and that the
-storage-to-reader hop is LZ4-framed (`crates/pulsus-clickhouse/src/pool.rs:695` →
+storage-to-reader hop is LZ4-framed (`crates/pulsus-clickhouse/src/pool.rs:861` →
 `vendor/clickhouse/Cargo.toml:49` `default = ["lz4"]` →
 `vendor/clickhouse/src/query.rs:221-231`, which appends `compress=1`).
 
@@ -3162,11 +3162,11 @@ from its source; the pointer is not reproduced here.
 |---|---|---|
 | phase-2 batch | 32 candidate traces | `crates/pulsus-read/src/traces/exec.rs:126` @ 1cdb3e5e |
 | candidate ceiling | 100,000 | `crates/pulsus-config/src/model.rs:692` @ 1cdb3e5e |
-| scan budget | 50,000,000 rows | `crates/pulsus-config/src/model.rs:649` |
+| scan budget | 50,000,000 rows | `crates/pulsus-config/src/model.rs:654` |
 | tag lookback default | 24 hours | `crates/pulsus-config/src/model.rs:696` @ 1cdb3e5e |
 | spans per trace cap | `LIMIT 10001 BY trace_id` | `crates/pulsus-read/src/traces/exec.rs:131` @ 1cdb3e5e |
 | tag name / value caps | 10,000 / 1,000 | `crates/pulsus-read/src/traces/exec.rs:131 @ 1cdb3e5e, 135` |
-| storage → reader wire format | RowBinary, LZ4-framed | `crates/pulsus-clickhouse/src/pool.rs:695` → `vendor/clickhouse/Cargo.toml:49` → `vendor/clickhouse/src/query.rs:221-231` |
+| storage → reader wire format | RowBinary, LZ4-framed | `crates/pulsus-clickhouse/src/pool.rs:861` → `vendor/clickhouse/Cargo.toml:49` → `vendor/clickhouse/src/query.rs:221-231` |
 | shard key | `cityHash64(trace_id)` | `schema/schema.sql:567` |
 | pushed aggregates | `uniqExact(span_id)`, `max(duration_ns)`, `min(duration_ns)` | `crates/pulsus-read/src/traces/compile.rs:478-489` |
 
@@ -4366,13 +4366,13 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
 
 ### `crates/pulsus-config/src/model.rs`
 
-**`:514-514`**
+**`:519-519`**
 
 ```rust
   514              traceql_max_candidates: 100_000,
 ```
 
-**`:514-516`**
+**`:519-521`**
 
 ```rust
   514              traceql_max_candidates: 100_000,
@@ -4380,13 +4380,13 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
   516              traceql_tag_lookback: HumanDuration(Duration::from_secs(24 * 3_600)),
 ```
 
-**`:515-515`**
+**`:520-520`**
 
 ```rust
   515              traceql_scan_budget_rows: 50_000_000,
 ```
 
-**`:516-516`**
+**`:521-521`**
 
 ```rust
   516              traceql_tag_lookback: HumanDuration(Duration::from_secs(24 * 3_600)),
@@ -4394,7 +4394,7 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
 
 ### `crates/pulsus-server/src/traces_api/tags.rs`
 
-**`:176-179`**
+**`:180-183`**
 
 ```rust
   165  /// The window the values routes read over when the client supplies none.
@@ -4505,7 +4505,7 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
   135  pub const TAG_VALUES_MAX: usize = 1_000;
 ```
 
-**`:880-921` @ d7af710e**  (42 lines in the range; comments and blanks elided, 30 shown)
+**`:923-964` @ d7af710e**  (42 lines in the range; comments and blanks elided, 30 shown)
 
 ```rust
  1825      pub async fn list_tag_values(
@@ -5157,7 +5157,7 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
 
 ### `crates/pulsus-clickhouse/src/client.rs`
 
-**`:137-137`**
+**`:184-184`**
 
 ```rust
   137              .set("async_insert", 0)
@@ -5221,7 +5221,7 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
 
 ### `crates/pulsus-clickhouse/src/pool.rs`
 
-**`:695-694`**
+**`:861-860`**
 
 ```rust
   695          clickhouse::Client::default()

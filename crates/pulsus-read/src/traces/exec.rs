@@ -394,16 +394,20 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<GraphTarget, ReadError>>,
 {
-    // Commit-1 stub: writes the shared cache directly, as today.
-    let _ = local;
-    shared.0.get_or_try_init(read).await
+    if let Some(target) = shared.0.get() {
+        return Ok(target);
+    }
+    local.get_or_try_init(read).await
 }
 
 /// Copies a request's `local` target, if it read one, into the shared
 /// cache (issue #803): [`TraceEngine::commit`].
 pub(crate) fn commit_target(shared: &GraphTargetCache, local: &tokio::sync::OnceCell<GraphTarget>) {
-    // Commit-1 stub: does nothing.
-    let _ = (shared, local);
+    if let Some(target) = local.get() {
+        // Another request may have filled it first; either holds the same
+        // definition, so the first one stays.
+        let _ = shared.0.set(target.clone());
+    }
 }
 
 /// [`TraceEngine::list_tag_names`]'s output (issue #58): distinct

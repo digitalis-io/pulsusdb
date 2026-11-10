@@ -50,9 +50,33 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Attempt<T, E>>,
 {
-    // Commit-1 stub: runs once and returns the result.
-    let _ = (pool, failed_after_success);
-    attempt().await.result
+    let first = attempt().await;
+    let Some(failure) = first.failure else {
+        return first.result;
+    };
+    if !pool.other_healthy(failure.endpoint) {
+        return settle(first.result, failure, failed_after_success);
+    }
+    // Everything attempt 1 built is dropped before attempt 2 starts.
+    drop(first.result);
+    let second = attempt().await;
+    match second.failure {
+        None => second.result,
+        Some(failure) => settle(second.result, failure, failed_after_success),
+    }
+}
+
+/// The result of an attempt that met a server failure and is not run
+/// again: its own error, or the failure's when it was `Ok`.
+fn settle<T, E>(
+    result: Result<T, E>,
+    failure: ServerFailure,
+    failed_after_success: impl FnOnce(ServerFailure) -> E,
+) -> Result<T, E> {
+    match result {
+        Err(e) => Err(e),
+        Ok(_) => Err(failed_after_success(failure)),
+    }
 }
 
 #[cfg(test)]

@@ -21,8 +21,8 @@ use pulsus_read::{TagNames, TagValues};
 
 use crate::app::AppState;
 
+use super::engine::with_engine;
 use super::error::ApiError;
-use super::handlers::engine_for;
 use super::params::TagScope;
 use super::tags::{self, attribute_scope, ok_json};
 use super::tags_response::TagNamesAnswer;
@@ -47,10 +47,13 @@ async fn tag_names_for(
     match params.scope {
         scope @ (TagScope::Intrinsic | TagScope::NoTags) => Ok(NamesSource::Static(scope)),
         scope => {
-            let engine = engine_for(&state, tenant).await?;
-            let names = engine
-                .list_tag_names(attribute_scope(scope), tags::catalog_floor_ns(&state)?)
-                .await?;
+            let state_ref = &state;
+            let names = with_engine(&state, &tenant, None, |engine| async move {
+                Ok(engine
+                    .list_tag_names(attribute_scope(scope), tags::catalog_floor_ns(state_ref)?)
+                    .await?)
+            })
+            .await?;
             Ok(NamesSource::Catalog { names, scope })
         }
     }
@@ -97,21 +100,24 @@ async fn tag_values_v1_for(
         tags::now_unix_nanos(),
         tags::tag_lookback_ns(&state),
     )?;
-    let engine = engine_for(&state, tenant).await?;
-    Ok(engine
-        .list_tag_values(
-            &key,
-            scope.as_deref(),
-            pulsus_read::TagValuesRequest {
-                // `q` is dropped rather than threaded: this route does
-                // not narrow, by ledger.
-                q: None,
-                start_ns: params.start_ns,
-                end_ns: params.end_ns,
-                floor_ns: tags::catalog_floor_ns(&state)?,
-            },
-        )
-        .await?)
+    let (key, scope, state_ref) = (&key, scope.as_deref(), &state);
+    with_engine(&state, &tenant, None, |engine| async move {
+        Ok(engine
+            .list_tag_values(
+                key,
+                scope,
+                pulsus_read::TagValuesRequest {
+                    // `q` is dropped rather than threaded: this route does
+                    // not narrow, by ledger.
+                    q: None,
+                    start_ns: params.start_ns,
+                    end_ns: params.end_ns,
+                    floor_ns: tags::catalog_floor_ns(state_ref)?,
+                },
+            )
+            .await?)
+    })
+    .await
 }
 
 /// `GET /api/search/tags` — Tempo v1 flat `{"tagNames":[…]}`.

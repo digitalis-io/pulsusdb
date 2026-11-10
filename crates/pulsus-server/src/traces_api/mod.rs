@@ -38,6 +38,7 @@
 
 mod assemble;
 mod compat;
+mod engine;
 mod error;
 mod fetch_v2;
 mod graph;

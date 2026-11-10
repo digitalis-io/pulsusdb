@@ -61,8 +61,9 @@ use tokio::sync::{Notify, watch};
 use crate::app::AppState;
 
 use super::encode;
+use super::engine::tail_engine;
 use super::error::ApiError;
-use super::handlers::{engine_for, tenant_of};
+use super::handlers::tenant_of;
 use super::params::{self, ParamError};
 
 /// Best-effort deadline on the final WebSocket Close frame. Deliberately
@@ -267,7 +268,7 @@ pub(crate) async fn tail(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let engine = match engine_for(&state, tenant).await {
+    let engine = match tail_engine(&state, tenant).await {
         Ok(engine) => engine,
         Err(e) => return e.into_response(),
     };
@@ -443,9 +444,11 @@ impl TailFetcher for EngineFetcher {
         after_ns: i64,
         ceiling: TailCeiling,
     ) -> Result<Vec<(Fingerprint, i64)>, ReadError> {
-        self.engine
+        let first = self
+            .engine
             .tail_first_lines(&self.setup, fps, after_ns, ceiling)
-            .await
+            .await;
+        accepted(&self.engine, first)
     }
 
     async fn catch_up(
@@ -456,13 +459,49 @@ impl TailFetcher for EngineFetcher {
         ceiling: TailCeiling,
         fetch_limit: u32,
     ) -> Result<CatchUpPage, ReadError> {
-        self.engine
+        let caught = self
+            .engine
             .tail_catch_up(&self.setup, fps, lower, upper_ns, ceiling, fetch_limit)
-            .await
+            .await;
+        accepted(&self.engine, caught)
     }
 
     fn admit(&mut self, fps: &[Fingerprint]) {
         self.setup.admit(fps);
+    }
+
+    /// Issue #803: the poll's server failed and another is healthy — the
+    /// engine moves to it, and the producer repeats the poll there.
+    fn take_server_failure(&mut self) -> bool {
+        match self.engine.server_failure() {
+            Some(f) if self.engine.other_healthy(f.endpoint) => {
+                self.engine.rebind();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Issue #803: a catch-up read is accepted only when its server did not
+/// fail during it; an `Ok` read that met a server failure becomes the
+/// failure's error, so the producer repeats it rather than using it.
+fn accepted<T>(engine: &LogQlEngine, read: Result<T, ReadError>) -> Result<T, ReadError> {
+    let read = read?;
+    match engine.server_failure() {
+        Some(f) => Err(ReadError::Clickhouse(f.into())),
+        None => Ok(read),
+    }
+}
+
+/// Issue #803: whether a failed read may be repeated once, at once, on the
+/// server the fetcher has moved to — never twice in a row.
+fn may_fail_over<F: TailFetcher>(fetcher: &mut F, failed_over: &mut bool) -> bool {
+    if !*failed_over && fetcher.take_server_failure() {
+        *failed_over = true;
+        true
+    } else {
+        false
     }
 }
 
@@ -813,6 +852,9 @@ async fn producer_loop<F: TailFetcher>(
     // any idle sleep, whatever the recheck timer says.
     let mut unprobed: Vec<Fingerprint> = Vec::new();
     let mut catch_up: Option<CatchUp> = None;
+    // Issue #803: set when a poll's server failed and the poll is being
+    // repeated on another; a second failure in a row closes the tail.
+    let mut failed_over = false;
     loop {
         if *shutdown.borrow() || *cancel.borrow() {
             break;
@@ -829,13 +871,21 @@ async fn producer_loop<F: TailFetcher>(
                             r = fetcher.catch_up_first_lines(&fps, cu.probe_after, cu.ceiling) => r,
                         };
                         match result {
-                            Ok(first) => match first.iter().map(|(_, ts)| *ts).min() {
-                                Some(min_first) => {
-                                    cu.scan = Some(ScanState::new(min_first.saturating_sub(1)));
+                            Ok(first) => {
+                                failed_over = false;
+                                match first.iter().map(|(_, ts)| *ts).min() {
+                                    Some(min_first) => {
+                                        cu.scan = Some(ScanState::new(min_first.saturating_sub(1)));
+                                    }
+                                    None => close = true,
                                 }
-                                None => close = true,
-                            },
+                            }
                             Err(e) => {
+                                // Issue #803: nothing moved; the probe is
+                                // repeated once on the server moved to.
+                                if may_fail_over(&mut fetcher, &mut failed_over) {
+                                    continue;
+                                }
                                 fail(&shared, e);
                                 break;
                             }
@@ -849,8 +899,17 @@ async fn producer_loop<F: TailFetcher>(
                             r = fetcher.catch_up(&fps, lower, upper, cu.ceiling, cfg.fetch_limit) => r,
                         };
                         let caught = match result {
-                            Ok(caught) => caught,
+                            Ok(caught) => {
+                                failed_over = false;
+                                caught
+                            }
                             Err(e) => {
+                                // Issue #803: the slice's scan did not move;
+                                // it is read again once on the server moved
+                                // to.
+                                if may_fail_over(&mut fetcher, &mut failed_over) {
+                                    continue;
+                                }
                                 fail(&shared, e);
                                 break;
                             }
@@ -905,10 +964,21 @@ async fn producer_loop<F: TailFetcher>(
                     _ = cancelled(&mut shutdown, &mut cancel) => break,
                     r = fetcher.catch_up_first_lines(&fps, cfg.start_ns, ceiling) => r,
                 };
+                if result.is_err() && may_fail_over(&mut fetcher, &mut failed_over) {
+                    // Issue #803: the probe left nothing changed — its
+                    // streams are still unprobed and the recheck timer has
+                    // not moved — and it runs again at once on the server
+                    // moved to.
+                    if first_probe {
+                        unprobed = fps;
+                    }
+                    continue;
+                }
                 // A first probe never brings the next recheck forward.
                 next_probe = next_probe.max(Instant::now() + cfg.poll_interval);
                 match result {
                     Ok(first) => {
+                        failed_over = false;
                         if let Some(min_first) = first.iter().map(|(_, ts)| *ts).min() {
                             let found: BTreeSet<Fingerprint> =
                                 first.iter().map(|(fp, _)| *fp).collect();
@@ -970,11 +1040,22 @@ async fn producer_loop<F: TailFetcher>(
             r = fetcher.poll(lower, upper, narrow, cfg.fetch_limit) => r,
         };
         let mut page = match result {
-            Ok(page) => page,
+            Ok(page) => {
+                failed_over = false;
+                page
+            }
             Err(e) => {
+                // Issue #803: the poll's server failed and the fetcher has
+                // moved to another. The poll sent no rows and the cursor did
+                // not move, so the same lower bound is polled again at once
+                // — once.
+                if !failed_over && fetcher.take_server_failure() {
+                    failed_over = true;
+                    continue;
+                }
                 // Fatal poll failure (e.g. a broad selector tripping the
-                // stream cap): hand the reason to the writer, which
-                // closes the socket with it.
+                // stream cap, or a second server failure in a row): hand the
+                // reason to the writer, which closes the socket with it.
                 fail(&shared, e);
                 break;
             }

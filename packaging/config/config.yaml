@@ -41,6 +41,7 @@
 #skip_unavailable_shards: false
 #availability_zone: null          # this node's AZ; pool prefers clickhouse.servers whose zone matches
 #az_detect: off                   # off | aws | gcp | azure | auto (detect zone from cloud metadata)
+#read_spread: all                 # all | zone (zone: read requests go to this node's zone first, as writes do)
 #exp_histogram_mode: classic      # classic | native | dual (OTLP exp-histogram storage; M7-A4)
 #otlp_translation_strategy: UnderscoreEscapingWithSuffixes   # UnderscoreEscapingWithSuffixes | UnderscoreEscapingWithoutSuffixes
                                   # | NoUTF8EscapingWithSuffixes | NoTranslation

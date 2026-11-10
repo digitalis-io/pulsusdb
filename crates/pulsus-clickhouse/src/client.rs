@@ -120,14 +120,35 @@ impl ChClient {
     /// The first server failure a read of this client met since it was
     /// bound (issue #803), or `None`.
     pub fn server_failure(&self) -> Option<ServerFailure> {
-        // Commit-1 stub: nothing is recorded.
-        None
+        self.read_binding.failure()
     }
 
     /// Binds this client's reads to a new endpoint and clears its failure
     /// (issue #803). Never call it while one of its reads is open.
     pub fn rebind(&self) {
-        // Commit-1 stub: does nothing.
+        self.read_binding.rebind(self.pool.bind_read());
+    }
+
+    /// Whether an endpoint other than `endpoint` is healthy (issue #803):
+    /// the condition for running a failed read request once more.
+    pub fn other_healthy(&self, endpoint: usize) -> bool {
+        self.pool.other_healthy(endpoint)
+    }
+
+    /// Runs one read request on this client's pool (issue #803): see
+    /// [`crate::run_read_request`]. For a caller that holds a client and
+    /// no pool — the background passes, which rebind this client at the
+    /// start of each attempt.
+    pub async fn run_read_request<T, E, F, Fut>(
+        &self,
+        attempt: F,
+        failed_after_success: impl FnOnce(ServerFailure) -> E,
+    ) -> Result<T, E>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = crate::request::Attempt<T, E>>,
+    {
+        crate::request::run_read_request(&self.pool, attempt, failed_after_success).await
     }
 
     /// A read lease on this client's bound endpoint: the lease

@@ -277,8 +277,29 @@ pub async fn refresh_levels(
     dist_suffix: &str,
     cluster: Option<&str>,
 ) -> Result<(), pulsus_clickhouse::ChError> {
-    // Commit-1 stub: one attempt, as today.
-    commit_levels(slot, levels_attempt(client, db, dist_suffix, cluster).await)
+    // Issue #803: one read request, every statement on one server, run
+    // once more on another when that server fails. Only the accepted
+    // attempt is saved.
+    let outcome = client
+        .run_read_request(
+            move || async move {
+                client.rebind();
+                let read = levels_attempt(client, db, dist_suffix, cluster).await;
+                pulsus_clickhouse::Attempt {
+                    result: Ok::<_, pulsus_clickhouse::ChError>(read),
+                    failure: client.server_failure(),
+                }
+            },
+            pulsus_clickhouse::ChError::from,
+        )
+        .await;
+    match outcome {
+        Ok(read) => commit_levels(slot, read),
+        Err(e) => {
+            slot.failures.fetch_add(1, Ordering::Relaxed);
+            Err(e)
+        }
+    }
 }
 
 /// How often the levels are read.

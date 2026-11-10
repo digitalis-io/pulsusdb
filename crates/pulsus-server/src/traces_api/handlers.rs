@@ -1,5 +1,5 @@
 //! The two `/api/traces/v1/trace/{traceId}` handlers (docs/api.md §4.1):
-//! acquire the pool → parse the hex trace id and the optional request
+//! parse the hex trace id and the optional request
 //! window (`params.rs`) → fetch via `TraceEngine` (`pulsus-read`, empty ⇒
 //! 404) → rebuild the OTLP `TracesData` from the fetched columns
 //! (`assemble.rs`) → negotiate the representation (`negotiate.rs`; the
@@ -28,37 +28,18 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use pulsus_model::{Tenant, TenantError, tenant_from_headers};
-use pulsus_read::{FetchRoute, TraceEngine};
+use pulsus_read::FetchRoute;
 
 use crate::request_id::{QUERY_ID_HEADER, current_or_new};
 
 use crate::app::AppState;
-use crate::chconfig;
 
 use super::assemble::{self, AssembleError, AssembledTrace};
+use super::engine::with_engine;
 use super::error::ApiError;
 use super::fetch_v2;
 use super::negotiate::{self, Wants};
 use super::params;
-
-/// Acquires the shared `Arc<ChPool>` from `AppState` (the `engine_for`
-/// pattern: clone the `Option` out from behind the lock, drop the guard
-/// before doing anything else) and builds a `TraceEngine` over it —
-/// `503 unavailable` before the pool is established, matching `/ready`.
-/// `pub(super)`: `search.rs` shares the same engine acquisition.
-pub(super) async fn engine_for(state: &AppState, tenant: Tenant) -> Result<TraceEngine, ApiError> {
-    let pool = {
-        let guard = state.pool.read().await;
-        guard.clone()
-    };
-    let pool = pool.ok_or(ApiError::PoolUnavailable)?;
-    // Issue #114: the consistency-config invariant is already enforced at
-    // config load, so this is unreachable in the real binary; a failure maps
-    // to the existing 503 "not serving" semantics.
-    chconfig::trace_engine(pool, &state.config, state.graph_target.clone(), tenant)
-        .map(crate::request_id::tag)
-        .map_err(|_| ApiError::PoolUnavailable)
-}
 
 /// `GET /api/traces/v1/trace/{traceId}` — representation by `Accept`
 /// (default JSON). Every response (success or error) carries
@@ -139,10 +120,11 @@ async fn trace_by_id_impl(
     let tenant = tenant.map_err(ApiError::Tenant)?;
     let hex32 = params::parse_trace_id(raw_trace_id)?;
     let window = params::parse_fetch_window(raw_query)?;
-    let engine = engine_for(&state, tenant)
-        .await?
-        .with_statement_prefix(stmt_prefix);
-    let fetched = engine.fetch_by_id(&hex32, window).await?;
+    let hex = &hex32;
+    let fetched = with_engine(&state, &tenant, Some(stmt_prefix), |engine| async move {
+        Ok(engine.fetch_by_id(hex, window).await?)
+    })
+    .await?;
     report_fetch_route(fetched.route);
     if fetched.spans.is_empty() {
         return Err(ApiError::NotFound);
@@ -291,10 +273,11 @@ async fn trace_by_id_v2_impl(
     let tenant = tenant.map_err(ApiError::Tenant)?;
     let hex32 = params::parse_trace_id(raw_trace_id)?;
     let window = params::parse_fetch_window(raw_query)?;
-    let engine = engine_for(&state, tenant)
-        .await?
-        .with_statement_prefix(stmt_prefix);
-    let fetched = engine.fetch_by_id(&hex32, window).await?;
+    let hex = &hex32;
+    let fetched = with_engine(&state, &tenant, Some(stmt_prefix), |engine| async move {
+        Ok(engine.fetch_by_id(hex, window).await?)
+    })
+    .await?;
     report_fetch_route(fetched.route);
     // The empty case is the whole reason this route exists: a present,
     // empty trace, not a 404.

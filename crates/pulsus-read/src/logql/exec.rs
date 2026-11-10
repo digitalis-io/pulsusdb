@@ -465,6 +465,12 @@ impl LogQlEngine {
         self.client.rebind();
     }
 
+    /// Whether an endpoint other than `endpoint` is healthy (issue #803):
+    /// whether a tail whose server failed may repeat its poll elsewhere.
+    pub fn other_healthy(&self, endpoint: usize) -> bool {
+        self.client.other_healthy(endpoint)
+    }
+
     /// The budget this read renders under.
     fn metadata_budget(&self) -> usize {
         self.metadata_fragment_budget
@@ -4801,9 +4807,10 @@ pub fn commit_tail_attempt(
     attempt: Result<TailAttempt, ReadError>,
     failure: Option<ServerFailure>,
 ) -> Result<TailPage, ReadError> {
-    // Commit-1 stub: keeps every `Ok` attempt, failure or not.
-    let _ = failure;
     let attempt = attempt?;
+    if let Some(f) = failure {
+        return Err(ReadError::Clickhouse(f.into()));
+    }
     merge_resolved(&mut setup.resolved, &attempt.added);
     setup.hydrated.extend(attempt.labels);
     if attempt.full_scan {

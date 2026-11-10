@@ -142,31 +142,6 @@ pub(crate) async fn sweep_tenant(
     })
 }
 
-/// One sweep + swap of one tenant: builds a whole new [`CacheSnapshot`],
-/// swaps it into `slot`, and updates `cache.metrics`. On a `ChError`, the
-/// last good snapshot is left untouched and `refresh_failures_total` is
-/// bumped — the self-healing contract [`LabelCache::refresh`] and
-/// [`spawn_refresh_loop`] both rely on.
-pub(crate) async fn run_sweep(
-    cache: &LabelCache,
-    tenant: &Tenant,
-    slot: &TenantCache,
-) -> Result<(), ChError> {
-    let swept = match sweep_tenant(&cache.client, &cache.config, tenant).await {
-        Ok(swept) => swept,
-        Err(err) => {
-            cache.metrics.record_refresh_failure();
-            return Err(err);
-        }
-    };
-    let series_count = swept.series_count();
-    swept.swap_into(slot);
-    cache
-        .metrics
-        .record_refresh(series_count, cache.config.cache_max_series);
-    Ok(())
-}
-
 /// What one label-cache pass read (issue #803): every tenant swept, every
 /// tenant whose statement failed, and the first such failure. Saved by
 /// [`LabelCache::commit_sweep`] only once the pass is accepted.
@@ -268,9 +243,9 @@ pub(crate) fn sweep_settings(
 }
 
 /// Spawns the recurring refresh task: ticks every `ttl`, running one
-/// [`run_sweep`] per tick, in a self-healing shape: a failed sweep only
-/// logs and bumps a failure
-/// counter (already done inside `run_sweep`), it never aborts the loop or
+/// [`LabelCache::refresh`] pass per tick, in a self-healing shape: a failed
+/// sweep only logs and bumps a failure
+/// counter (already done inside the pass), it never aborts the loop or
 /// panics — the next tick simply tries again. `tokio::time::interval`'s
 /// first tick fires immediately, so the cache starts warming as soon as
 /// this task is spawned, not after the first full `ttl` elapses.

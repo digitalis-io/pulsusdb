@@ -10,12 +10,14 @@ use axum::response::{IntoResponse, Response};
 
 use pulsus_logql::{Expr, LogExpr};
 use pulsus_model::Tenant;
-use pulsus_read::{LogQlEngine, QueryParams, QuerySpec, ResponseOptions, TimeBounds};
+use pulsus_read::{
+    PlanExplain, QueryParams, QueryResult, QuerySpec, ResponseOptions, TimeBounds, Warnings,
+};
 
 use crate::app::AppState;
-use crate::chconfig;
 
 use super::encode;
+use super::engine::with_engine;
 use super::error::ApiError;
 use super::params::{self, ParamError};
 
@@ -26,24 +28,6 @@ fn wants_explain(headers: &HeaderMap) -> bool {
         .get("x-pulsus-explain")
         .and_then(|v| v.to_str().ok())
         == Some("1")
-}
-
-/// Acquires the shared `Arc<ChPool>` from `AppState` (mirrors `ops::ready`'s
-/// pattern: clone the `Option` out from behind the lock, drop the guard
-/// before doing anything else) and builds a `LogQlEngine` over it —
-/// `503 unavailable` before the pool is established, matching `/ready`.
-pub(super) async fn engine_for(state: &AppState, tenant: Tenant) -> Result<LogQlEngine, ApiError> {
-    let pool = {
-        let guard = state.pool.read().await;
-        guard.clone()
-    };
-    let pool = pool.ok_or(ApiError::PoolUnavailable)?;
-    // Issue #114: the consistency-config invariant is already enforced at
-    // config load, so this is unreachable in the real binary; a failure maps
-    // to the existing 503 "not serving" semantics.
-    chconfig::logql_engine(pool, &state.config, tenant)
-        .map(crate::request_id::tag)
-        .map_err(|_| ApiError::PoolUnavailable)
 }
 
 /// The request's tenant (issue #653), by the metrics rule
@@ -401,9 +385,9 @@ async fn query_range_impl(
         direction,
     };
 
-    let engine = engine_for(&state, tenant).await?;
     run_query(
-        &engine,
+        &state,
+        &tenant,
         &expr,
         &query_params,
         wants_explain(headers),
@@ -475,9 +459,9 @@ async fn query_impl(
         direction,
     };
 
-    let engine = engine_for(&state, tenant).await?;
     run_query(
-        &engine,
+        &state,
+        &tenant,
         &expr,
         &query_params,
         wants_explain(headers),
@@ -488,11 +472,14 @@ async fn query_impl(
     .await
 }
 
-/// Shared success path for `query`/`query_range`: run with or without the
-/// explain side channel (single execution either way — see
-/// `LogQlEngine::query_explained`'s doc comment), then encode.
+/// Shared success path for `query`/`query_range`: one read request
+/// (issue #803) runs the query with or without the explain side channel
+/// (single execution either way — see `LogQlEngine::query_explained`'s doc
+/// comment), then the accepted result is encoded.
+#[allow(clippy::too_many_arguments)]
 async fn run_query(
-    engine: &LogQlEngine,
+    state: &AppState,
+    tenant: &Tenant,
     expr: &Expr,
     query_params: &QueryParams,
     explain: bool,
@@ -508,33 +495,43 @@ async fn run_query(
         categorize_labels: params::wants_categorize_labels(encoding_flags),
         partial_at_series_cap: logs_drilldown,
     };
-    if explain {
-        // Issue #277: `explain` lives INSIDE `data`, `warnings` outside
-        // it — the two are not siblings, so both must be threaded
-        // through and the encoder places each on its own side of
-        // `data`'s closing brace.
-        let (result, warnings, plan_explain) = engine
-            .query_explained_with(expr, query_params, opts)
-            .await?;
-        Ok(encode::query_response_warned(
-            result,
-            Some(plan_explain),
-            at_ns,
-            preserve_vector_order,
-            &warnings,
-            encoding_flags,
-        ))
-    } else {
-        let (result, warnings) = engine.query_with(expr, query_params, opts).await?;
-        Ok(encode::query_response_warned(
-            result,
-            None,
-            at_ns,
-            preserve_vector_order,
-            &warnings,
-            encoding_flags,
-        ))
-    }
+    let (result, warnings, plan_explain) =
+        query_engine_half(state, tenant, expr, query_params, explain, opts).await?;
+    // Issue #277: `explain` lives INSIDE `data`, `warnings` outside it —
+    // the two are not siblings, so both must be threaded through and the
+    // encoder places each on its own side of `data`'s closing brace.
+    Ok(encode::query_response_warned(
+        result,
+        plan_explain,
+        at_ns,
+        preserve_vector_order,
+        &warnings,
+        encoding_flags,
+    ))
+}
+
+/// [`run_query`]'s engine half: the read request, returning the query's
+/// result, its warnings and, under explain, the plan.
+async fn query_engine_half(
+    state: &AppState,
+    tenant: &Tenant,
+    expr: &Expr,
+    query_params: &QueryParams,
+    explain: bool,
+    opts: ResponseOptions,
+) -> Result<(QueryResult, Warnings, Option<PlanExplain>), ApiError> {
+    with_engine(state, tenant, |engine| async move {
+        if explain {
+            let (result, warnings, plan_explain) = engine
+                .query_explained_with(expr, query_params, opts)
+                .await?;
+            Ok((result, warnings, Some(plan_explain)))
+        } else {
+            let (result, warnings) = engine.query_with(expr, query_params, opts).await?;
+            Ok((result, warnings, None))
+        }
+    })
+    .await
 }
 
 /// The encoder's order gate (issue #406 R2). `true` suppresses
@@ -613,16 +610,18 @@ async fn labels_impl(
     let selector = super::parse_optional_selector(&pairs)?;
     let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
-    let engine = engine_for(&state, tenant).await?;
-    if wants_explain(headers) {
-        let (names, explain) = engine
-            .label_names_explained(selector.as_ref(), bounds)
-            .await?;
-        Ok(encode::string_array_response(names, Some(explain)))
-    } else {
-        let names = engine.label_names(selector.as_ref(), bounds).await?;
-        Ok(encode::string_array_response(names, None))
-    }
+    let explain = wants_explain(headers);
+    let selector = selector.as_ref();
+    let (names, explain) = with_engine(&state, &tenant, |engine| async move {
+        if explain {
+            let (names, explain) = engine.label_names_explained(selector, bounds).await?;
+            Ok((names, Some(explain)))
+        } else {
+            Ok((engine.label_names(selector, bounds).await?, None))
+        }
+    })
+    .await?;
+    Ok(encode::string_array_response(names, explain))
 }
 
 // ---------------------------------------------------------------------
@@ -686,16 +685,20 @@ async fn label_values_impl(
     let selector = super::parse_optional_selector(&pairs)?;
     let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
-    let engine = engine_for(&state, tenant).await?;
-    if wants_explain(headers) {
-        let (values, explain) = engine
-            .label_values_explained(name, selector.as_ref(), bounds)
-            .await?;
-        Ok(encode::string_array_response(values, Some(explain)))
-    } else {
-        let values = engine.label_values(name, selector.as_ref(), bounds).await?;
-        Ok(encode::string_array_response(values, None))
-    }
+    let explain = wants_explain(headers);
+    let selector = selector.as_ref();
+    let (values, explain) = with_engine(&state, &tenant, |engine| async move {
+        if explain {
+            let (values, explain) = engine
+                .label_values_explained(name, selector, bounds)
+                .await?;
+            Ok((values, Some(explain)))
+        } else {
+            Ok((engine.label_values(name, selector, bounds).await?, None))
+        }
+    })
+    .await?;
+    Ok(encode::string_array_response(values, explain))
 }
 
 // ---------------------------------------------------------------------
@@ -759,14 +762,18 @@ async fn series_impl(
     }
     let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
-    let engine = engine_for(&state, tenant).await?;
-    if wants_explain(headers) {
-        let (data, explain) = engine.series_explained(&selectors, bounds).await?;
-        Ok(encode::json_array_response(data, Some(explain)))
-    } else {
-        let data = engine.series(&selectors, bounds).await?;
-        Ok(encode::json_array_response(data, None))
-    }
+    let explain = wants_explain(headers);
+    let selectors = &selectors;
+    let (data, explain) = with_engine(&state, &tenant, |engine| async move {
+        if explain {
+            let (data, explain) = engine.series_explained(selectors, bounds).await?;
+            Ok((data, Some(explain)))
+        } else {
+            Ok((engine.series(selectors, bounds).await?, None))
+        }
+    })
+    .await?;
+    Ok(encode::json_array_response(data, explain))
 }
 
 #[cfg(test)]

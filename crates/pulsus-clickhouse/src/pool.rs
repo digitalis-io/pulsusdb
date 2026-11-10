@@ -12,16 +12,23 @@
 //! uniform lease API so callers do not need to know which crate ships
 //! underneath.
 //!
-//! **Connection spreading (issue #43).** The pool holds one
-//! `clickhouse::Client` per distinct endpoint and picks one endpoint per
-//! `get()` via the pure, lock-free [`candidate_order`] policy: prefer
-//! healthy endpoints in this node's own availability zone (round-robin
-//! within them), then healthy endpoints in other zones (round-robin), then
-//! demoted endpoints whose cooldown has expired, then the rest. There is
-//! **no ping on the healthy hot path** — an endpoint is probed only when it
-//! is unhealthy or has gone stale. A transport failure on a real query
-//! demotes its endpoint (via [`PooledConn::report_transport_failure`]) so
-//! the *next* `get()` fails over. Health is published as lock-free mirror
+//! **Connection spreading (issues #43 and #803).** The pool holds one
+//! `clickhouse::Client` per distinct endpoint. A **write** lease (`get`)
+//! picks one endpoint per statement via the pure, lock-free
+//! [`candidate_order`] policy: prefer healthy endpoints in this node's own
+//! availability zone (round-robin within them), then healthy endpoints in
+//! other zones (round-robin), then demoted endpoints whose cooldown has
+//! expired, then the rest. A **read request** is bound to one endpoint when
+//! its client is built ([`ChPool::bind_read`]: the first of that same
+//! order, from a rotation of its own, with no zone leading under
+//! `read_spread: all`), and every read of the client is leased there
+//! ([`ChPool::get_bound`]) whatever happens to its health meanwhile. There
+//! is **no ping on the healthy hot path** — a write's endpoint is probed
+//! only when it is unhealthy or has gone stale. A transport failure on a
+//! write demotes its endpoint (via [`PooledConn::report_transport_failure`])
+//! so the *next* `get()` fails over; a server failure on a read demotes its
+//! endpoint and marks the request (via [`PooledConn::report_read_failure`]),
+//! which then runs once more on another endpoint (`crate::request`). Health is published as lock-free mirror
 //! atomics for the hot path, backed by a tiny non-async transition lock
 //! (never held across an `.await`) that makes every state change — a
 //! demotion, a promotion, or a probe outcome — one atomic critical section;
@@ -382,14 +389,15 @@ pub(crate) enum StatementClass {
 /// The zone [`candidate_order`] puts first for `class` (issue #803):
 /// writes, and reads under [`ReadSpread::Zone`], this node's own; reads
 /// under [`ReadSpread::All`] none.
-pub(crate) fn preferred_zone<'a>(
+pub(crate) fn preferred_zone(
     class: StatementClass,
     read_spread: ReadSpread,
-    local_zone: Option<&'a str>,
-) -> Option<&'a str> {
-    // Commit-1 stub: every class keeps to the local zone, as today.
-    let _ = (class, read_spread);
-    local_zone
+    local_zone: Option<&str>,
+) -> Option<&str> {
+    match (class, read_spread) {
+        (StatementClass::Read, ReadSpread::All) => None,
+        (StatementClass::Read, ReadSpread::Zone) | (StatementClass::Write, _) => local_zone,
+    }
 }
 
 /// A ClickHouse server failure a read request met (issue #803): which
@@ -459,8 +467,13 @@ impl ReadBinding {
 pub struct ChPool {
     endpoints: Vec<Endpoint>,
     semaphore: Arc<Semaphore>,
-    /// Free-running round-robin counter; one `fetch_add` per `get()`.
-    next_rr: AtomicU64,
+    /// Free-running round-robin counter for read bindings; one `fetch_add`
+    /// per [`ChPool::bind_read`] (issue #803).
+    next_rr_read: AtomicU64,
+    /// Free-running round-robin counter for writes; one `fetch_add` per
+    /// [`ChPool::get`]. A counter of its own, so reads mixed in do not skew
+    /// the write rotation, nor writes the read one.
+    next_rr_write: AtomicU64,
     /// `PULSUS_READ_SPREAD` (issue #803).
     read_spread: ReadSpread,
     local_zone: Option<String>,
@@ -494,7 +507,8 @@ impl ChPool {
         let pool = Self {
             semaphore: Arc::new(Semaphore::new(cfg.pool_size)),
             endpoints,
-            next_rr: AtomicU64::new(0),
+            next_rr_read: AtomicU64::new(0),
+            next_rr_write: AtomicU64::new(0),
             read_spread: cfg.read_spread,
             local_zone: cfg.local_zone.clone(),
             base: Instant::now()
@@ -545,7 +559,7 @@ impl ChPool {
     pub(crate) async fn get(&self, class: StatementClass) -> Result<PooledConn<'_>, ChError> {
         let permit = self.acquire_permit().await?;
 
-        let rr = self.next_rr.fetch_add(1, Ordering::Relaxed);
+        let rr = self.next_rr_write.fetch_add(1, Ordering::Relaxed);
         let now = self.now_ms();
         let states = self.endpoint_states(now);
         let order = candidate_order(
@@ -627,10 +641,16 @@ impl ChPool {
     /// of [`candidate_order`] with [`preferred_zone`] for reads, from the
     /// read rotation. No I/O and no await.
     pub(crate) fn bind_read(&self) -> usize {
-        // Commit-1 stub: the write order, from the one shared counter.
-        let rr = self.next_rr.fetch_add(1, Ordering::Relaxed);
+        let rr = self.next_rr_read.fetch_add(1, Ordering::Relaxed);
         let states = self.endpoint_states(self.now_ms());
-        candidate_order(&states, self.local_zone.as_deref(), rr)[0]
+        let zone = preferred_zone(
+            StatementClass::Read,
+            self.read_spread,
+            self.local_zone.as_deref(),
+        );
+        // `candidate_order` lists every endpoint, and a pool has at least
+        // one, so the order is never empty.
+        candidate_order(&states, zone, rr)[0]
     }
 
     /// A read lease on `b`'s endpoint (issue #803): waits for a permit and
@@ -640,17 +660,26 @@ impl ChPool {
         &'a self,
         b: &'a ReadBinding,
     ) -> Result<PooledConn<'a>, ChError> {
-        // Commit-1 stub: today's per-statement selection.
-        let _ = b;
-        self.get(StatementClass::Write).await
+        let permit = self.acquire_permit().await?;
+        let idx = b.endpoint();
+        let ep = &self.endpoints[idx];
+        ep.health.record_selection(self.now_ms());
+        Ok(PooledConn {
+            client: ep.client.clone(),
+            endpoint_idx: idx,
+            pool: self,
+            binding: Some(b),
+            _permit: permit,
+        })
     }
 
     /// Whether an endpoint other than `idx` is healthy (issue #803): the
     /// condition for running a failed read request once more.
     pub(crate) fn other_healthy(&self, idx: usize) -> bool {
-        // Commit-1 stub.
-        let _ = idx;
-        false
+        self.endpoints
+            .iter()
+            .enumerate()
+            .any(|(i, ep)| i != idx && ep.health.is_healthy())
     }
 
     /// Health probe (`SELECT 1`) against one selected endpoint. A transport
@@ -869,6 +898,7 @@ impl PooledConn<'_> {
     }
 
     /// The index of the endpoint this lease is on.
+    #[cfg(test)]
     pub(crate) fn endpoint(&self) -> usize {
         self.endpoint_idx
     }
@@ -877,8 +907,18 @@ impl PooledConn<'_> {
     /// failure ([`ChError::is_server_failure`]), demotes the endpoint and
     /// records the failure on the request's binding; otherwise nothing.
     pub(crate) fn report_read_failure(&self, err: &ChError) {
-        // Commit-1 stub: today's transport report, recording nothing.
-        self.report_transport_failure(err);
+        if !err.is_server_failure() {
+            return;
+        }
+        self.pool.endpoints[self.endpoint_idx]
+            .health
+            .mark_unhealthy(self.pool.now_ms());
+        if let Some(b) = self.binding {
+            b.record_failure(ServerFailure {
+                endpoint: self.endpoint_idx,
+                message: err.to_string(),
+            });
+        }
     }
 
     /// Demotes this lease's endpoint **iff** `err` is a transport-class
@@ -925,7 +965,8 @@ pub(crate) fn test_pool(
     ChPool {
         semaphore: Arc::new(Semaphore::new(permits)),
         endpoints: eps,
-        next_rr: AtomicU64::new(0),
+        next_rr_read: AtomicU64::new(0),
+        next_rr_write: AtomicU64::new(0),
         read_spread,
         local_zone: local_zone.map(str::to_string),
         base: now_base,
