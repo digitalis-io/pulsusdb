@@ -1570,6 +1570,9 @@ async fn writer_loop<S: TailSender, E: EventSource>(
                     inputs.st.on_must_stop();
                     continue;
                 }
+                // A shutdown read while waiting for readiness lowers the
+                // deadline of what follows to the drain's.
+                let deadline = inputs.st.drain_until.map_or(deadline, |d| deadline.min(d));
                 // Checked immediately before handing over: nothing is
                 // handed over at or after a deadline.
                 if Instant::now() >= deadline || *inputs.cancel.borrow() {
