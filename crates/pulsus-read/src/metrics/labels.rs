@@ -1064,6 +1064,19 @@ impl LabelCache {
         super::refresh::run_sweep(self, tenant, &slot).await
     }
 
+    /// Saves an accepted label-cache pass (issue #803): swaps each swept
+    /// tenant's snapshot in, counts one refresh failure per tenant whose
+    /// statement failed, and returns the first such failure, as
+    /// [`Self::refresh`] always has. A tenant that failed keeps its last
+    /// good snapshot while the others swap.
+    pub(crate) fn commit_sweep(
+        &self,
+        outcome: super::refresh::SweepOutcome,
+    ) -> Result<(), pulsus_clickhouse::ChError> {
+        // Commit-1 stub: swaps nothing.
+        outcome.first_error.map_or(Ok(()), Err)
+    }
+
     /// The tenants the refresh loop sweeps, sorted.
     pub(crate) fn tenants_in_use(&self) -> Vec<Tenant> {
         let guard = match self.tenants.read() {
@@ -2861,6 +2874,67 @@ mod tests {
                 .series_count_by_metric_name
                 .len(),
             15
+        );
+    }
+
+    /// Issue #803 (T6): an accepted pass in which one tenant's statement
+    /// failed for a reason other than a server failure keeps that tenant's
+    /// old snapshot, swaps the others, counts one failure and returns it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_sweep_keeps_the_tenants_that_succeeded() {
+        use crate::metrics::pass_failure_tests::{cache_config, stub_client};
+        use crate::metrics::refresh::{SweepOutcome, SweptSnapshot};
+        use crate::metrics::stub_server::{Mode, StubServer};
+
+        let stub = StubServer::start(Mode::Code(60));
+        let cache = LabelCache::new(stub_client(&[&stub]).await, cache_config());
+        let t1 = Tenant::from_header(None, false).expect("the empty tenant");
+        let t2 = Tenant::from_header(Some(&http::HeaderValue::from_static("t2")), false)
+            .expect("tenant t2");
+        for t in [&t1, &t2] {
+            let slot = cache.tenant_cache(t);
+            *slot.snapshot.write().expect("snapshot lock") =
+                Arc::new(snapshot(Vec::new(), 0, BASE_SWEEP_MS, 1));
+        }
+        let fp = Fingerprint::from_raw(42);
+        let mut by_fingerprint = HashMap::new();
+        by_fingerprint.insert(fp, LabelSet::default());
+        let s = SweptSnapshot {
+            by_fingerprint,
+            by_metric: HashMap::from([("up".to_string(), vec![fp])]),
+            sweep_time_ms: BASE_SWEEP_MS,
+            covered_from_ms: 0,
+        };
+        let failures_before = cache.metrics.snapshot().refresh_failures_total;
+        let out = cache.commit_sweep(SweepOutcome {
+            swept: vec![(t2.clone(), s)],
+            failed: vec![t1.clone()],
+            first_error: Some(pulsus_clickhouse::ChError::Server {
+                code: 241,
+                message: "Code: 241. DB::Exception: memory".to_string(),
+            }),
+        });
+        assert!(
+            matches!(
+                out,
+                Err(pulsus_clickhouse::ChError::Server { code: 241, .. })
+            ),
+            "{out:?}"
+        );
+        let s2 = cache.tenant_cache(&t2).current_snapshot();
+        assert_eq!(s2.generation, 2, "t2 swapped");
+        assert!(
+            s2.by_fingerprint.contains_key(&fp),
+            "t2 holds the new snapshot"
+        );
+        assert_eq!(
+            cache.tenant_cache(&t1).current_snapshot().generation,
+            1,
+            "t1 keeps its old snapshot"
+        );
+        assert_eq!(
+            cache.metrics.snapshot().refresh_failures_total - failures_before,
+            1
         );
     }
 }

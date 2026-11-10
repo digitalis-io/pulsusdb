@@ -381,6 +381,31 @@ fn quoted_argument(s: &str) -> Option<(String, &str)> {
 #[derive(Debug, Clone, Default)]
 pub struct GraphTargetCache(std::sync::Arc<tokio::sync::OnceCell<GraphTarget>>);
 
+/// The [`GraphTarget`] a request uses (issue #803): the shared cache's when
+/// it is set, otherwise read once into the request's own `local` cell. It
+/// never writes `shared`: only the accepted request's [`commit_target`]
+/// does, so a target read by an attempt that is discarded is never kept.
+pub(crate) async fn resolve_target<'a, F, Fut>(
+    shared: &'a GraphTargetCache,
+    local: &'a tokio::sync::OnceCell<GraphTarget>,
+    read: F,
+) -> Result<&'a GraphTarget, ReadError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<GraphTarget, ReadError>>,
+{
+    // Commit-1 stub: writes the shared cache directly, as today.
+    let _ = local;
+    shared.0.get_or_try_init(read).await
+}
+
+/// Copies a request's `local` target, if it read one, into the shared
+/// cache (issue #803): [`TraceEngine::commit`].
+pub(crate) fn commit_target(shared: &GraphTargetCache, local: &tokio::sync::OnceCell<GraphTarget>) {
+    // Commit-1 stub: does nothing.
+    let _ = (shared, local);
+}
+
 /// [`TraceEngine::list_tag_names`]'s output (issue #58): distinct
 /// `(scope, key)` pairs in the catalog's own `(scope, key)` order, at
 /// most [`TAG_NAMES_MAX`] of them; `truncated` is the non-silent cap
@@ -694,6 +719,9 @@ pub struct TraceEngine {
     tag_read_rows: u64,
     /// The clustered service graph's target, shared across engines.
     graph_target: GraphTargetCache,
+    /// Issue #803: the target this engine read itself, copied into
+    /// `graph_target` only by [`TraceEngine::commit`].
+    local_target: tokio::sync::OnceCell<GraphTarget>,
     /// Issue #738: the request's tenant, as the term every trace read
     /// carries.
     tenant: crate::traces::tenant_scope::TenantTerm,
@@ -735,7 +763,20 @@ impl TraceEngine {
             indexed: Vec::new(),
             tag_read_rows: TAG_STORE_READ_ROWS,
             graph_target: GraphTargetCache::default(),
+            local_target: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Issue #803: the first server failure this engine's reads met since
+    /// its client was bound.
+    pub fn server_failure(&self) -> Option<pulsus_clickhouse::ServerFailure> {
+        self.dispatch.server_failure()
+    }
+
+    /// Issue #803: saves what this engine's accepted request read into
+    /// state shared beyond it — the service graph's target, if it read one.
+    pub fn commit(&self) {
+        commit_target(&self.graph_target, &self.local_target);
     }
 
     /// Shares `cache` as this engine's [`GraphTarget`] cache (issue #599):
@@ -826,33 +867,31 @@ impl TraceEngine {
     /// shared [`GraphTargetCache`]. A definition that names no target fails
     /// the request and keeps nothing, so the next call reads it again.
     async fn graph_target(&self, settings: &QuerySettings) -> Result<&GraphTarget, ReadError> {
-        self.graph_target
-            .0
-            .get_or_try_init(|| async {
-                let table = &self.config.spans_table;
-                let sql = super::spans::graph::graph_target_sql(table);
-                let mut stream = self
-                    .dispatch
-                    .query_stream::<GraphTargetRow, _>(&sql, settings, |e| {
-                        map_trace_read_error(e, &self.config)
-                    })
-                    .await?;
-                let mut definition = None;
-                while let Some(row) = stream.next().await {
-                    let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
-                    definition.get_or_insert(row.engine_full);
-                }
-                definition
-                    .as_deref()
-                    .and_then(graph_target_from_engine)
-                    .ok_or_else(|| {
-                        ReadError::Clickhouse(super::spans::graph::no_graph_target(
-                            table,
-                            definition.as_deref(),
-                        ))
-                    })
-            })
-            .await
+        resolve_target(&self.graph_target, &self.local_target, || async {
+            let table = &self.config.spans_table;
+            let sql = super::spans::graph::graph_target_sql(table);
+            let mut stream = self
+                .dispatch
+                .query_stream::<GraphTargetRow, _>(&sql, settings, |e| {
+                    map_trace_read_error(e, &self.config)
+                })
+                .await?;
+            let mut definition = None;
+            while let Some(row) = stream.next().await {
+                let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
+                definition.get_or_insert(row.engine_full);
+            }
+            definition
+                .as_deref()
+                .and_then(graph_target_from_engine)
+                .ok_or_else(|| {
+                    ReadError::Clickhouse(super::spans::graph::no_graph_target(
+                        table,
+                        definition.as_deref(),
+                    ))
+                })
+        })
+        .await
     }
 
     /// Fetches one trace from the span, per-trace and resource tables
@@ -1988,6 +2027,52 @@ fn hex16(bytes: &[u8; 16]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Issue #803: a request's graph target is read into the request's own
+    /// cell, and reaches the shared cache only through the accepted
+    /// engine's commit.
+    #[tokio::test]
+    async fn the_graph_target_reaches_the_shared_cache_only_by_commit() {
+        let shared = GraphTargetCache::default();
+        let local = tokio::sync::OnceCell::new();
+        let target = GraphTarget {
+            cluster: "c".to_string(),
+            database: "d".to_string(),
+        };
+        let calls = AtomicUsize::new(0);
+        let read = || async {
+            calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(target.clone())
+        };
+        let got = resolve_target(&shared, &local, read).await.expect("read");
+        assert_eq!(got, &target);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1, "the read ran once");
+        assert_eq!(local.get(), Some(&target), "the request's own cell is set");
+        assert!(shared.0.get().is_none(), "the shared cache is still empty");
+
+        commit_target(&shared, &local);
+        assert_eq!(
+            shared.0.get(),
+            Some(&target),
+            "commit fills the shared cache"
+        );
+
+        let later = tokio::sync::OnceCell::new();
+        let got = resolve_target(&shared, &later, || async {
+            calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(target.clone())
+        })
+        .await
+        .expect("shared");
+        assert_eq!(got, &target);
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            1,
+            "a later request uses the shared target and reads nothing"
+        );
+    }
+
     use super::*;
 
     use crate::traces::spans::fetch::BUCKET_SET_CAP;

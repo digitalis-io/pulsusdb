@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use pulsus_clickhouse::{
-    ChClient, ChConnConfig, ChEndpoint, ChError, ChPool, ChProto, ConsistencyConfig,
+    ChClient, ChConnConfig, ChEndpoint, ChError, ChPool, ChProto, ConsistencyConfig, ReadSpread,
 };
 use pulsus_config::Config;
 use pulsus_read::{
@@ -65,6 +65,8 @@ pub(crate) fn conn_config_from(config: &Config) -> ChConnConfig {
         // `..conn_config_from`. The shared-pool read/write clients install
         // it via the fallible `ChClient::with_consistency`.
         consistency: consistency_from(config),
+        // Issue #803: `PULSUS_READ_SPREAD`. Commit-1 stub: a constant.
+        read_spread: ReadSpread::All,
     }
 }
 
@@ -497,6 +499,20 @@ mod tests {
             format!("{:?}", conn_config_from(&Config::default())),
             format!("{:?}", ChConnConfig::default()),
         );
+    }
+
+    /// Issue #803 (C3): `PULSUS_READ_SPREAD` reaches the pool's config.
+    #[test]
+    fn conn_config_from_maps_read_spread() {
+        assert_eq!(
+            conn_config_from(&Config::default()).read_spread,
+            ReadSpread::All
+        );
+        let config = Config {
+            read_spread: pulsus_config::ReadSpread::Zone,
+            ..Config::default()
+        };
+        assert_eq!(conn_config_from(&config).read_spread, ReadSpread::Zone);
     }
 
     /// Issue #506: `ReaderConfig::traceql_max_series` says it mirrors the

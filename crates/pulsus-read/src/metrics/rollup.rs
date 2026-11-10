@@ -190,16 +190,24 @@ async fn fetch<R: pulsus_clickhouse::ChRow>(
     Ok(out)
 }
 
-/// One discovery: reads the levels and, clustered, the shard count, and
-/// sets `slot`. On failure the slot keeps its last good list.
-pub async fn refresh_levels(
-    slot: &LevelSlot,
+/// What one level pass read (issue #803): the levels (with the shard
+/// count), and, clustered, the replica-lag rows (`None` single-node, where
+/// that statement is not sent). Saved by [`commit_levels`].
+pub type LevelsOutcome = (
+    Result<Levels, pulsus_clickhouse::ChError>,
+    Option<Result<Vec<ReplicaDelay>, pulsus_clickhouse::ChError>>,
+);
+
+/// One attempt of the level pass (issue #803): discovery, then the shard
+/// count only if discovery succeeded, then — clustered — the replica
+/// statement whatever discovery did. Touches no slot.
+pub async fn levels_attempt(
     client: &ChClient,
     db: &str,
     dist_suffix: &str,
     cluster: Option<&str>,
-) -> Result<(), pulsus_clickhouse::ChError> {
-    let result = async {
+) -> LevelsOutcome {
+    let levels = async {
         let names: Vec<LevelNameRow> = fetch(client, &discovery_sql(db)).await?;
         let shards = match cluster {
             Some(c) => fetch::<ShardsRow>(client, &shards_sql(c))
@@ -225,16 +233,29 @@ pub async fn refresh_levels(
     }
     .await;
     // Issue #18 part 2c: clustered, each replica's lag, read with the
-    // levels. A failed read keeps the last one.
-    if let Some(c) = cluster {
-        match fetch::<ReplicaDelay>(client, &replica_delay_sql(c, db)).await {
-            Ok(rows) => slot.set_replicas(rows),
-            Err(err) => {
-                tracing::warn!(error = %err, "replica delay read failed; keeping the last read")
-            }
+    // levels.
+    let replicas = match cluster {
+        Some(c) => Some(fetch::<ReplicaDelay>(client, &replica_delay_sql(c, db)).await),
+        None => None,
+    };
+    (levels, replicas)
+}
+
+/// Saves an accepted level pass into `slot` (issue #803): the replica rows
+/// when they were read (a failed read keeps the last one), then the levels,
+/// or one more failure and the last good list.
+pub fn commit_levels(
+    slot: &LevelSlot,
+    (levels, replicas): LevelsOutcome,
+) -> Result<(), pulsus_clickhouse::ChError> {
+    match replicas {
+        Some(Ok(rows)) => slot.set_replicas(rows),
+        Some(Err(err)) => {
+            tracing::warn!(error = %err, "replica delay read failed; keeping the last read")
         }
+        None => {}
     }
-    match result {
+    match levels {
         Ok(levels) => {
             slot.set(levels);
             Ok(())
@@ -244,6 +265,20 @@ pub async fn refresh_levels(
             Err(e)
         }
     }
+}
+
+/// One discovery: reads the levels and, clustered, the shard count and the
+/// replica lag, and sets `slot`. On failure the slot keeps its last good
+/// list.
+pub async fn refresh_levels(
+    slot: &LevelSlot,
+    client: &ChClient,
+    db: &str,
+    dist_suffix: &str,
+    cluster: Option<&str>,
+) -> Result<(), pulsus_clickhouse::ChError> {
+    // Commit-1 stub: one attempt, as today.
+    commit_levels(slot, levels_attempt(client, db, dist_suffix, cluster).await)
 }
 
 /// How often the levels are read.
@@ -996,6 +1031,31 @@ mod tests {
     use pulsus_promql::{DEFAULT_LOOKBACK_MS, parse, plan};
 
     use super::*;
+
+    /// Issue #803: `commit_levels` does what `refresh_levels` did after its
+    /// reads — the replica rows whenever they were read, the levels or one
+    /// more failure.
+    #[test]
+    fn commit_levels_applies_what_the_pass_read() {
+        let slot = LevelSlot::new();
+        let lv = levels(&[5, 60]);
+        let row = |host: &str, delay| ReplicaDelay {
+            host: host.to_string(),
+            table: "metric_samples".to_string(),
+            absolute_delay: delay,
+        };
+        let rows = vec![row("h1", 1)];
+        commit_levels(&slot, (Ok(lv.clone()), Some(Ok(rows.clone())))).expect("ok");
+        assert_eq!(slot.get().as_deref(), Some(&lv));
+        assert_eq!(slot.replicas(), Some(rows));
+
+        let rows2 = vec![row("h2", 2)];
+        let err = pulsus_clickhouse::ChError::Io("reset".to_string());
+        assert!(commit_levels(&slot, (Err(err), Some(Ok(rows2.clone())))).is_err());
+        assert_eq!(slot.get().as_deref(), Some(&lv), "the levels are kept");
+        assert_eq!(slot.replicas(), Some(rows2), "the replica rows still move");
+        assert_eq!(slot.failures(), 1);
+    }
 
     /// A UTC midnight: on every level's grid.
     const BASE: i64 = 1_788_825_600_000;

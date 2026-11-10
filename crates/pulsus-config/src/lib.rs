@@ -28,7 +28,7 @@ pub use load::{load, parse};
 pub use model::{
     AzDetect, ChAuth, ChProto, ChServerEntry, ClickHouseConfig, Config, DEFAULT_ADMIN_PASSWORD,
     DEFAULT_ADMIN_USER, ExpHistogramMode, InsertMode, LogLevel, Mode, OtlpTranslationStrategy,
-    ReaderConfig, RulerConfig, WriterConfig,
+    ReadSpread, ReaderConfig, RulerConfig, WriterConfig,
 };
 pub use secret::Secret;
 pub use timezone::{TemplateTimezone, UnknownTimezone};

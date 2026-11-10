@@ -382,6 +382,13 @@ trait TailFetcher: Send + 'static {
     /// reported joined.
     #[cfg(test)]
     fn deadline_set(&mut self, _deadline: Instant) {}
+
+    /// Issue #803: called on a failed poll. `true` when the poll met a
+    /// server failure and the fetcher has moved to another healthy server,
+    /// so the producer may repeat the poll once at the same lower bound.
+    fn take_server_failure(&mut self) -> bool {
+        false
+    }
 }
 
 struct EngineFetcher {
@@ -3552,5 +3559,194 @@ mod tests {
                 absent.start_ns
             );
         }
+    }
+
+    // -- issue #803: a poll whose server failed is repeated once ----------
+
+    /// One scripted poll result, and what `take_server_failure` answers
+    /// after it.
+    type FailoverStep = (Result<TailPage, ReadError>, bool);
+
+    /// Plays `script` one poll at a time, recording each poll's lower
+    /// bound; past the end every poll waits forever, so the tail stays open
+    /// and the scripted polls are the only ones counted.
+    struct FailoverFetcher {
+        script: VecDeque<FailoverStep>,
+        lowers: Arc<Mutex<Vec<String>>>,
+        failure: bool,
+    }
+
+    impl TailFetcher for FailoverFetcher {
+        async fn poll(
+            &mut self,
+            lower: TailLower,
+            _upper_ns: i64,
+            _narrow: bool,
+            _fetch_limit: u32,
+        ) -> Result<TailPage, ReadError> {
+            let Some((result, failure)) = self.script.pop_front() else {
+                return std::future::pending().await;
+            };
+            self.lowers.lock().unwrap().push(format!("{lower:?}"));
+            self.failure = failure;
+            result
+        }
+
+        fn take_server_failure(&mut self) -> bool {
+            std::mem::take(&mut self.failure)
+        }
+    }
+
+    fn failover_page(lines: &[&str]) -> TailPage {
+        let now = params::now_ns();
+        TailPage {
+            streams: vec![stream(
+                r#"{"app":"x"}"#,
+                lines.iter().map(|l| (now, *l)).collect(),
+            )],
+            next: None,
+            fetched: lines.len() as u32,
+            joined: Vec::new(),
+        }
+    }
+
+    fn failover_error(reason: &str) -> ReadError {
+        ReadError::PipelineInvalid {
+            reason: reason.to_string(),
+        }
+    }
+
+    /// What a scripted tail did: its polls' lower bounds, every frame sent,
+    /// and the close (outer `Some` once closed).
+    struct FailoverRun {
+        lowers: Arc<Mutex<Vec<String>>>,
+        sent: Arc<Mutex<Vec<String>>>,
+        closed: Arc<Mutex<Option<Option<CloseFrame>>>>,
+        shutdown: watch::Sender<bool>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    fn run_failover(script: Vec<FailoverStep>) -> FailoverRun {
+        let lowers = Arc::new(Mutex::new(Vec::new()));
+        let fetcher = FailoverFetcher {
+            script: script.into(),
+            lowers: Arc::clone(&lowers),
+            failure: false,
+        };
+        let sender = FakeSender::new(SinkMode::Accept);
+        let (sent, closed) = (Arc::clone(&sender.sent), Arc::clone(&sender.closed));
+        let (shutdown, rx) = watch::channel(false);
+        let handle = tokio::spawn(run_tail(
+            fetcher,
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            test_cfg(),
+            rx,
+        ));
+        FailoverRun {
+            lowers,
+            sent,
+            closed,
+            shutdown,
+            handle,
+        }
+    }
+
+    /// Waits (10 ms steps, at most 5 s) until `done` holds.
+    async fn wait_for_failover(mut done: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !done() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn failover_delivered(sent: &Mutex<Vec<String>>, line: &str) -> bool {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .any(|f| f.contains(&format!("\"{line}\"")))
+    }
+
+    async fn stop_failover(run: FailoverRun) {
+        let _ = run.shutdown.send(true);
+        tokio::time::timeout(Duration::from_secs(1), run.handle)
+            .await
+            .expect("run_tail returns on shutdown")
+            .expect("no panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_failure_repeats_the_poll_once_at_the_same_lower_bound() {
+        let run = run_failover(vec![
+            (Err(failover_error("server failed")), true),
+            (Ok(failover_page(&["line-a", "line-b"])), false),
+        ]);
+        wait_for_failover(|| {
+            failover_delivered(&run.sent, "line-a") && failover_delivered(&run.sent, "line-b")
+        })
+        .await;
+        assert!(failover_delivered(&run.sent, "line-a"), "line-a delivered");
+        assert!(failover_delivered(&run.sent, "line-b"), "line-b delivered");
+        assert!(run.closed.lock().unwrap().is_none(), "the tail is open");
+        let lowers = run.lowers.lock().unwrap().clone();
+        assert_eq!(lowers.len(), 2, "{lowers:?}");
+        assert_eq!(lowers[1], lowers[0], "poll 2 repeats poll 1's lower bound");
+        stop_failover(run).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_server_failures_in_a_row_close_the_tail() {
+        let run = run_failover(vec![
+            (Err(failover_error("first failure")), true),
+            (Err(failover_error("second failure")), true),
+        ]);
+        wait_for_failover(|| run.closed.lock().unwrap().is_some()).await;
+        let closed = run.closed.lock().unwrap().clone();
+        let frame = closed
+            .expect("the tail closed")
+            .expect("with an error frame");
+        assert_eq!(frame.reason.as_str(), "second failure");
+        assert_eq!(run.lowers.lock().unwrap().len(), 2, "exactly two polls");
+        stop_failover(run).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failover_error_that_is_not_a_server_failure_closes_at_once() {
+        let run = run_failover(vec![
+            (
+                Err(ReadError::QueryTooBroad(
+                    pulsus_read::logql::TooBroadReason::StreamCap {
+                        count: 200_000,
+                        cap: 100_000,
+                    },
+                )),
+                false,
+            ),
+            (Ok(failover_page(&["never"])), false),
+        ]);
+        wait_for_failover(|| run.closed.lock().unwrap().is_some()).await;
+        assert!(run.closed.lock().unwrap().is_some(), "the tail closed");
+        assert_eq!(run.lowers.lock().unwrap().len(), 1, "after one poll");
+        assert!(!failover_delivered(&run.sent, "never"));
+        stop_failover(run).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_successful_poll_resets_the_fail_over() {
+        let run = run_failover(vec![
+            (Err(failover_error("first failure")), true),
+            (Ok(failover_page(&["line-1"])), false),
+            (Err(failover_error("second failure")), true),
+            (Ok(failover_page(&["line-2"])), false),
+        ]);
+        wait_for_failover(|| {
+            failover_delivered(&run.sent, "line-2") || run.closed.lock().unwrap().is_some()
+        })
+        .await;
+        assert!(failover_delivered(&run.sent, "line-1"), "line-1 delivered");
+        assert!(failover_delivered(&run.sent, "line-2"), "line-2 delivered");
+        assert_eq!(run.lowers.lock().unwrap().len(), 4, "four polls");
+        assert!(run.closed.lock().unwrap().is_none(), "the tail is open");
+        stop_failover(run).await;
     }
 }

@@ -101,6 +101,15 @@ pub(crate) fn redact_server_version(message: &str) -> String {
 }
 
 impl ChError {
+    /// True when the error says the ClickHouse server a read request is
+    /// bound to failed (issue #803): a connection or IO failure, or a
+    /// network-class server code. A timeout is the request's own deadline
+    /// and is not one, nor is a bad-SQL or logic error.
+    pub fn is_server_failure(&self) -> bool {
+        // Commit-1 stub: today's transport classification.
+        self.is_retryable()
+    }
+
     /// True only for transient faults where retrying the *same idempotent*
     /// operation may succeed. Poison errors (bad SQL, schema mismatch,
     /// resource-limit-without-relief) are never retryable — retrying them
