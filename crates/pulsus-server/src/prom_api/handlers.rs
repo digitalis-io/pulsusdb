@@ -465,14 +465,7 @@ async fn run_range_query(
                     .get()
                     .and_then(|c| c.sweep_time_ms(tenant)),
             };
-            let eval = |q: MetricQueryParams| {
-                let engine = &engine;
-                async move {
-                    let (r, a, f) = engine.query_with_facts(tenant, expr, &q).await?;
-                    Ok::<_, ApiError>((r, a, f.charged_samples))
-                }
-            };
-            read_cache::answer_range(&cache, req, eval, eval).await
+            Ok(read_cache::answer_range_on(&cache, &engine, tenant, expr, req).await?)
         }
     })
     .await?;

@@ -532,3 +532,81 @@ async fn l20_a_lagging_hit_keeps_nothing_more() {
     assert_eq!(ra.status, 200);
     assert!(ra.body == rb.body, "after catch-up A = B");
 }
+
+/// L27 (issue #778, #803's rule): every poll of the read cache is one read
+/// request on one server. Over 27 s of polls, the poll's statements, read
+/// back from each node's `system.query_log` and merged by start time, come
+/// in groups P1, [P2,] P3, each group on one node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l27_each_poll_reads_on_one_server() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with the cluster fixture");
+        return;
+    }
+    let port: u16 = 31_478;
+    let db = ClusterDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_cluster_l27")).await;
+    let _server = Server::spawn(port, &db, "64MiB");
+    tokio::time::sleep(Duration::from_secs(27)).await;
+    let mut rows: Vec<(u64, u8, &str)> = Vec::new();
+    for (node, config) in [
+        ("shard1", shard1_config(&db.name)),
+        ("shard2", shard2_config(&db.name)),
+    ] {
+        let c = ChClient::new(config).await.expect("a node");
+        exec(&c, "SYSTEM FLUSH LOGS").await;
+        let sql = format!(
+            "SELECT toString(toUInt64(toUnixTimestamp64Micro(query_start_time_microseconds))) || ' ' || \
+             toString(multiIf(position(query, 'absolute_delay') > 0, 1, position(query, 'watermark_ms') > 0, 2, \
+             position(query, 'system.databases') > 0, 3, 0)) AS s \
+             FROM system.query_log WHERE current_database = '{}' \
+             AND log_comment = 'background:read-cache-poll' AND type = 'QueryFinish' \
+             AND is_initial_query = 1 ORDER BY query_start_time_microseconds",
+            db.name
+        );
+        for line in c
+            .query_strings(&sql, &QuerySettings::new().set("log_comment", "l27-read"))
+            .await
+            .expect("the poll's statements")
+        {
+            let (t, p) = line.split_once(' ').expect("t p");
+            rows.push((t.parse().expect("t"), p.parse().expect("p"), node));
+        }
+    }
+    rows.sort();
+    assert!(
+        rows.iter().all(|(_, p, _)| *p != 0),
+        "L27: a poll statement of no known kind: {rows:?}"
+    );
+    let first = rows
+        .iter()
+        .position(|(_, p, _)| *p == 1)
+        .expect("L27: no lag read");
+    let mut groups: Vec<Vec<(u8, &str)>> = Vec::new();
+    let mut open: Vec<(u8, &str)> = Vec::new();
+    for (_, p, node) in &rows[first..] {
+        open.push((*p, node));
+        if *p == 3 {
+            groups.push(std::mem::take(&mut open));
+        }
+    }
+    for g in &groups {
+        let kinds: Vec<u8> = g.iter().map(|(p, _)| *p).collect();
+        assert!(
+            kinds == [1, 3] || kinds == [1, 2, 3],
+            "L27: a poll's statements out of order: {g:?} in {rows:?}"
+        );
+        assert!(
+            g.iter().all(|(_, n)| *n == g[0].1),
+            "L27: one poll on two servers: {g:?}"
+        );
+    }
+    assert!(
+        open.len() < 3 && open.iter().all(|(p, _)| *p != 3),
+        "L27: trailing statements {open:?}"
+    );
+    let with_watermarks = groups.iter().filter(|g| g.len() == 3).count();
+    assert!(
+        with_watermarks >= 4,
+        "L27: {with_watermarks} polls read the watermarks: {groups:?}"
+    );
+}

@@ -39,10 +39,12 @@ use pulsus_promql::{AggOp, Annotations, FillValues, PlanExpr, QueryPlan, Selecto
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
-use super::exec::{MetricQueryParams, PlanFacts};
+use super::exec::{MetricQueryParams, MetricsEngine, PlanFacts};
 use super::rollup::LevelSlot;
+use crate::ReadError;
 use crate::logql::escape::ch_string;
 use crate::logql::{HistMatrixSeries, HistOrFloat, MatrixSeries, QueryResult};
+use pulsus_promql::parser::Expr;
 
 /// A sample whose push reaches PulsusDB within this of its timestamp is in
 /// every kept point it affects (`L`).
@@ -274,6 +276,28 @@ pub struct ReadCacheSnapshot {
     pub poll_failures_total: u64,
 }
 
+/// What one successful poll read, saved together by
+/// [`ReadCache::commit_poll`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollRead {
+    /// P1, with a cluster: (read at, max delay s).
+    pub lag: Option<(i64, u64)>,
+    /// P2, with levels: (read at, [(level width, watermark)]).
+    pub watermarks: Option<(i64, Vec<(i64, i64)>)>,
+    /// P3: (statement start, ids).
+    pub identity: (i64, Vec<String>),
+}
+
+/// A copy of the poll state, for tests.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PollView {
+    pub lag: Vec<(i64, u64)>,
+    pub watermarks: Option<(i64, Vec<(i64, i64)>)>,
+    pub identity: Option<Vec<String>>,
+    pub identity_ok_at: Option<i64>,
+}
+
 /// What the 5 s poll last read.
 #[derive(Debug, Default)]
 struct PollState {
@@ -334,6 +358,10 @@ pub struct ReadCache {
     /// generation read.
     #[cfg(test)]
     after_merge: Option<Hook>,
+    /// TEST SEAM: run by `clear_for_new_identity` immediately before its
+    /// clear.
+    #[cfg(test)]
+    before_identity_clear: Option<Hook>,
 }
 
 fn wall_clock_ms() -> i64 {
@@ -361,6 +389,29 @@ impl ReadCache {
             clock: Box::new(wall_clock_ms),
             #[cfg(test)]
             after_merge: None,
+            #[cfg(test)]
+            before_identity_clear: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_before_identity_clear(
+        mut self,
+        hook: impl Fn(&ReadCache) + Send + Sync + 'static,
+    ) -> Self {
+        self.before_identity_clear = Some(Box::new(hook));
+        self
+    }
+
+    /// A copy of the poll state.
+    #[cfg(test)]
+    pub(crate) fn poll_view(&self) -> PollView {
+        let poll = self.poll_read();
+        PollView {
+            lag: poll.lag_history.iter().copied().collect(),
+            watermarks: poll.watermarks.clone(),
+            identity: poll.identity.as_ref().map(|ids| ids.to_vec()),
+            identity_ok_at: poll.identity_ok_at,
         }
     }
 
@@ -596,8 +647,29 @@ impl ReadCache {
             changed
         };
         if changed {
-            self.clear();
+            self.clear_for_new_identity();
         }
+    }
+
+    /// Saves what one poll read.
+    pub fn commit_poll(&self, read: PollRead) {
+        if let Some((at, s)) = read.lag {
+            self.record_lag(at, s);
+        }
+        if let Some((at, w)) = read.watermarks {
+            self.record_watermarks(at, w);
+        }
+        let (started, ids) = read.identity;
+        self.record_identity(started, ids);
+    }
+
+    /// The clear a new database identity triggers.
+    fn clear_for_new_identity(&self) {
+        #[cfg(test)]
+        if let Some(hook) = &self.before_identity_clear {
+            hook(self);
+        }
+        self.clear();
     }
 
     /// A poll statement failed.
@@ -1157,6 +1229,7 @@ pub async fn answer_range<E, F, FF, T, TF>(
     req: RangeRequest<'_>,
     full: F,
     tail: T,
+    attempt_ok: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<Answer, E>
 where
     F: FnOnce(MetricQueryParams) -> FF,
@@ -1164,6 +1237,7 @@ where
     T: FnOnce(MetricQueryParams) -> TF,
     TF: Future<Output = Result<Evaluated, E>>,
 {
+    let _ = attempt_ok;
     let g0 = cache.generation();
     // The generation the miss path stores under: `g0`, or the one read
     // after a hit found a clear had run.
@@ -1292,6 +1366,23 @@ where
         header,
         through_ms: stored_through,
     })
+}
+
+/// A range request through the cache, evaluated by `engine`. Nothing is
+/// stored once `engine` has a server failure, read after each evaluation
+/// (issue #803).
+pub async fn answer_range_on(
+    cache: &ReadCache,
+    engine: &MetricsEngine,
+    tenant: &Tenant,
+    expr: &Expr,
+    req: RangeRequest<'_>,
+) -> Result<Answer, ReadError> {
+    let eval = |q: MetricQueryParams| async move {
+        let (r, a, f) = engine.query_with_facts(tenant, expr, &q).await?;
+        Ok::<_, ReadError>((r, a, f.charged_samples))
+    };
+    answer_range(cache, req, eval, eval, &|| true).await
 }
 
 async fn bypass_full<E, F, FF>(
@@ -1617,7 +1708,7 @@ mod tests {
             during_tail();
             async move { R::Ok((grid_matrix(&q, 0.0), tail_ann, tail_charge)) }
         };
-        answer_range(&r.cache, req, full, tail)
+        answer_range(&r.cache, req, full, tail, &always)
             .await
             .expect("answered")
     }
@@ -1644,6 +1735,11 @@ mod tests {
 
     fn shifted(p: &MetricQueryParams, by: i64) -> MetricQueryParams {
         params(p.start_ms + by, p.end_ms + by, p.step_ms)
+    }
+
+    /// The attempt guard of a request whose server never failed.
+    fn always() -> bool {
+        true
     }
 
     fn published(o: StoreOutcome) -> bool {
@@ -2629,7 +2725,7 @@ mod tests {
         let tail = |q: MetricQueryParams| async move {
             R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10))
         };
-        let a = answer_range(&r.cache, request(q, p, u64::MAX), full, tail)
+        let a = answer_range(&r.cache, request(q, p, u64::MAX), full, tail, &always)
             .await
             .expect("answered");
         (a, p, full_calls.load(Ordering::SeqCst))
@@ -2716,7 +2812,7 @@ mod tests {
                 tail_calls.fetch_add(1, Ordering::SeqCst);
                 async move { R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 0)) }
             };
-            answer_range(&r.cache, request(q, p, u64::MAX), full, tail)
+            answer_range(&r.cache, request(q, p, u64::MAX), full, tail, &always)
         };
         let first = go(QueryResult::Matrix(vec![])).await.expect("answered");
         assert_eq!(first.header, Header::Bypass, "(c) first header");
@@ -2734,5 +2830,244 @@ mod tests {
             panic!("(c) a matrix")
         };
         assert_eq!(m[0].points.len(), 41, "(c) 41 points");
+    }
+
+    // --- the poll commit (#803) ---------------------------------------------------
+
+    /// Runs `req` with full and tail closures that answer as `run_with`
+    /// does and, when `flagging`, set `failed` when called; the guard reads
+    /// `failed`.
+    async fn run_guarded(
+        r: &Rig,
+        calls: &Calls,
+        req: RangeRequest<'_>,
+        failed: &std::sync::atomic::AtomicBool,
+        flagging: bool,
+    ) -> Answer {
+        let full = |q: MetricQueryParams| {
+            calls.full.fetch_add(1, Ordering::SeqCst);
+            if flagging {
+                failed.store(true, Ordering::SeqCst);
+            }
+            async move { R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10)) }
+        };
+        let tail = |q: MetricQueryParams| {
+            calls.tail.fetch_add(1, Ordering::SeqCst);
+            if flagging {
+                failed.store(true, Ordering::SeqCst);
+            }
+            async move { R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10)) }
+        };
+        let guard = || !failed.load(Ordering::SeqCst);
+        answer_range(&r.cache, req, full, tail, &guard)
+            .await
+            .expect("answered")
+    }
+
+    #[tokio::test]
+    async fn u44_a_server_failure_during_the_evaluation_stores_no_fill() {
+        let r = rig();
+        let q = "rate(x[5m])";
+        let p = window(&r, 0);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        // (a) a miss.
+        let c = Calls::default();
+        let a = run_guarded(&r, &c, request(q, p, u64::MAX), &failed, true).await;
+        assert_eq!(a.header, Header::Bypass, "(a) flagged: header");
+        assert_eq!(a.outcome, Outcome::Miss, "(a) flagged: outcome");
+        assert_eq!(r.cache.usage().1, 0, "(a) flagged: nothing stored");
+        failed.store(false, Ordering::SeqCst);
+        let a = run_guarded(&r, &c, request(q, p, u64::MAX), &failed, false).await;
+        assert_eq!(a.header, Header::Miss, "(a) control");
+        assert_eq!(r.cache.usage().1, 1, "(a) control: stored");
+        // (b) a hit.
+        let before = r.cache.lookup(&key_for(q, &p)).expect("kept");
+        r.advance(60_000);
+        r.refresh_identity();
+        let p2 = shifted(&p, 60_000);
+        let c = Calls::default();
+        let a = run_guarded(&r, &c, request(q, p2, u64::MAX), &failed, true).await;
+        assert_eq!(a.outcome, Outcome::Hit, "(b) flagged: outcome");
+        assert_eq!(c.tail.load(Ordering::SeqCst), 1, "(b) flagged: tail");
+        assert_eq!(
+            *r.cache.lookup(&key_for(q, &p2)).expect("kept"),
+            *before,
+            "(b) flagged: the entry is unchanged"
+        );
+        failed.store(false, Ordering::SeqCst);
+        let a = run_guarded(&r, &c, request(q, p2, u64::MAX), &failed, false).await;
+        assert_eq!(a.outcome, Outcome::Hit, "(b) control");
+        assert!(
+            r.cache.lookup(&key_for(q, &p2)).expect("kept").c1_ms > before.c1_ms,
+            "(b) control: replaced"
+        );
+    }
+
+    #[test]
+    fn u45_commit_poll_saves_each_read_and_clears_on_new_ids() {
+        let r = rig_with(1 << 20, 50, true);
+        let read =
+            |lag: Option<(i64, u64)>, wm: Option<(i64, Vec<(i64, i64)>)>, at: i64, ids: &str| {
+                PollRead {
+                    lag,
+                    watermarks: wm,
+                    identity: (at, vec![ids.to_string()]),
+                }
+            };
+        r.cache.commit_poll(read(
+            Some((V - 5_000, 3)),
+            Some((V - 5_000, vec![(60_000, 777)])),
+            V - 5_000,
+            "db",
+        ));
+        let g = r.cache.generation();
+        let p = params(0, 0, 15_000);
+        assert!(published(r.cache.store(
+            key_for("up", &p),
+            small_entry(),
+            g
+        )));
+        r.cache.commit_poll(read(Some((V, 0)), None, V, "db"));
+        let v = r.cache.poll_view();
+        assert_eq!(v.lag, vec![(V - 5_000, 3), (V, 0)], "after 2: lag");
+        assert_eq!(
+            v.watermarks,
+            Some((V - 5_000, vec![(60_000, 777)])),
+            "after 2: watermarks"
+        );
+        assert_eq!(v.identity_ok_at, Some(V), "after 2: identity_ok_at");
+        assert_eq!(r.cache.generation(), g, "after 2: generation");
+        assert_eq!(r.cache.usage().1, 1, "after 2: kept");
+        r.cache
+            .commit_poll(read(None, Some((V, vec![(60_000, 5)])), V, "other"));
+        let v = r.cache.poll_view();
+        assert_eq!(v.lag, vec![(V - 5_000, 3), (V, 0)], "after 3: lag");
+        assert_eq!(
+            v.watermarks,
+            Some((V, vec![(60_000, 5)])),
+            "after 3: watermarks"
+        );
+        assert_eq!(
+            v.identity,
+            Some(vec!["other".to_string()]),
+            "after 3: identity"
+        );
+        assert_eq!(r.cache.generation(), g + 1, "after 3: generation");
+        assert_eq!(r.cache.usage().1, 0, "after 3: emptied");
+        assert_eq!(r.cache.snapshot().clears_total, 1, "after 3: one clear");
+    }
+
+    #[tokio::test]
+    async fn u46_a_new_identity_is_never_seen_beside_the_old_store() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Mutex as StdMutex, OnceLock, mpsc};
+        let clock = Arc::new(AtomicI64::new(V));
+        let c = Arc::clone(&clock);
+        let slot: Arc<OnceLock<Arc<ReadCache>>> = Arc::new(OnceLock::new());
+        let held = Arc::new(AtomicBool::new(false));
+        let early = Arc::new(AtomicBool::new(false));
+        let ran = Arc::new(AtomicBool::new(false));
+        type Pending = (std::thread::JoinHandle<()>, mpsc::Receiver<(Answer, usize)>);
+        let pending: Arc<StdMutex<Option<Pending>>> = Arc::new(StdMutex::new(None));
+        let q = "rate(x[5m])";
+        let p = {
+            let end = V.div_euclid(15_000) * 15_000;
+            params(end - 7_200_000, end, 15_000)
+        };
+        let p2 = shifted(&p, 60_000);
+        let hook = {
+            let (slot, held, early, ran, pending) = (
+                Arc::clone(&slot),
+                Arc::clone(&held),
+                Arc::clone(&early),
+                Arc::clone(&ran),
+                Arc::clone(&pending),
+            );
+            move |cache: &ReadCache| {
+                if ran.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                held.store(cache.poll.try_read().is_err(), Ordering::SeqCst);
+                let shared = Arc::clone(slot.get().expect("the cache"));
+                let (tx, rx) = mpsc::channel();
+                let thread = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("a runtime");
+                    let full_calls = AtomicUsize::new(0);
+                    let answer = rt.block_on(async {
+                        let full = |q: MetricQueryParams| {
+                            full_calls.fetch_add(1, Ordering::SeqCst);
+                            async move { R::Ok((grid_matrix(&q, 1_000.0), Annotations::new(), 10)) }
+                        };
+                        let tail = |q: MetricQueryParams| async move {
+                            R::Ok((grid_matrix(&q, 1_000.0), Annotations::new(), 10))
+                        };
+                        answer_range(&shared, request(q, p2, u64::MAX), full, tail, &always)
+                            .await
+                            .expect("answered")
+                    });
+                    let _ = tx.send((answer, full_calls.load(Ordering::SeqCst)));
+                });
+                let got = rx.recv_timeout(std::time::Duration::from_secs(2));
+                early.store(got.is_ok(), Ordering::SeqCst);
+                let (tx2, rx2) = mpsc::channel();
+                if let Ok(a) = got {
+                    let _ = tx2.send(a);
+                    *pending.lock().expect("pending") = Some((thread, rx2));
+                } else {
+                    *pending.lock().expect("pending") = Some((thread, rx));
+                }
+            }
+        };
+        let cache = Arc::new(
+            ReadCache::new(ReadCacheConfig {
+                budget_bytes: 64 * 1024 * 1024,
+                tenant_share_pct: 50,
+                clustered: false,
+            })
+            .with_clock(move || c.load(Ordering::SeqCst))
+            .with_before_identity_clear(hook),
+        );
+        let _ = slot.set(Arc::clone(&cache));
+        let now = || clock.load(Ordering::SeqCst);
+        cache.record_identity(now(), vec!["db".to_string()]);
+        let full = |q: MetricQueryParams| async move {
+            R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10))
+        };
+        let tail = |q: MetricQueryParams| async move {
+            R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10))
+        };
+        let a = answer_range(&cache, request(q, p, u64::MAX), full, tail, &always)
+            .await
+            .expect("answered");
+        assert_eq!(a.header, Header::Miss, "the fill");
+        clock.fetch_add(60_000, Ordering::SeqCst);
+        cache.record_identity(now(), vec!["db".to_string()]);
+        assert!(!ran.load(Ordering::SeqCst), "no clear for the same ids");
+        cache.commit_poll(PollRead {
+            lag: None,
+            watermarks: None,
+            identity: (now(), vec!["new".to_string()]),
+        });
+        let (thread, rx) = pending
+            .lock()
+            .expect("pending")
+            .take()
+            .expect("the hook ran");
+        let (answer, full_calls) = rx.recv().expect("the thread's answer");
+        thread.join().expect("the thread");
+        assert!(
+            held.load(Ordering::SeqCst),
+            "the poll lock is held at the clear"
+        );
+        assert!(!early.load(Ordering::SeqCst), "no answer before the clear");
+        assert_eq!(answer.outcome, Outcome::Miss, "evaluated in full");
+        assert_eq!(full_calls, 1, "the full closure once");
+        assert_eq!(
+            answer.result,
+            grid_matrix(&p2, 1_000.0),
+            "no kept point served"
+        );
     }
 }
