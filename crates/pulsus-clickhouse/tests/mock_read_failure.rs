@@ -3,7 +3,7 @@
 //! own stream deadline, or the server's code 159) neither demotes its
 //! server nor marks the request; a network-class code does both.
 //!
-//! Hermetic: the stub is a std-thread server on an ephemeral loopback port
+//! No database: the stub is a std-thread server on an ephemeral loopback port
 //! (`common/stub_server.rs`).
 
 #[path = "common/stub_server.rs"]

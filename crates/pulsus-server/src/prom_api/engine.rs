@@ -44,7 +44,7 @@ async fn engine_for(state: &AppState, lookback_ms: Option<i64>) -> Result<Metric
         .cloned()
         .ok_or(ApiError::Unavailable)?;
     // Issue #114: the consistency-config invariant is already enforced at
-    // config load, so this is unreachable in the real binary; a failure maps
+    // config load, so this is unreachable in the shipped binary; a failure maps
     // to the existing 503 "not serving" semantics.
     let engine = metrics_engine(
         pool,

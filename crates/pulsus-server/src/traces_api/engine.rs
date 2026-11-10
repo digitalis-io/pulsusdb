@@ -45,7 +45,7 @@ async fn engine_for(
 ) -> Result<TraceEngine, ApiError> {
     let pool = serving_pool(state).await?;
     // Issue #114: the consistency-config invariant is already enforced at
-    // config load, so this is unreachable in the real binary; a failure maps
+    // config load, so this is unreachable in the shipped binary; a failure maps
     // to the existing 503 "not serving" semantics.
     let engine = trace_engine(pool, &state.config, state.graph_target.clone(), tenant)
         .map(crate::request_id::tag)

@@ -7,7 +7,7 @@
 //!   minimum) backs the loop off as before, and the next iteration's
 //!   binding is the next server in the kept pool's rotation.
 //!
-//! Spawns the real `pulsusdb` binary with `CLICKHOUSE_SERVERS` naming a
+//! Spawns the `pulsusdb` binary with `CLICKHOUSE_SERVERS` naming a
 //! stub ClickHouse first and this job's server second. Gated behind
 //! `PULSUS_TEST_CLICKHOUSE=1`; the single-node leg runs it.
 

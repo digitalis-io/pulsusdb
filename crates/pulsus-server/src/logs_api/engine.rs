@@ -39,7 +39,7 @@ async fn serving_pool(state: &AppState) -> Result<Arc<ChPool>, ApiError> {
 async fn engine_for(state: &AppState, tenant: Tenant) -> Result<LogQlEngine, ApiError> {
     let pool = serving_pool(state).await?;
     // Issue #114: the consistency-config invariant is already enforced at
-    // config load, so this is unreachable in the real binary; a failure maps
+    // config load, so this is unreachable in the shipped binary; a failure maps
     // to the existing 503 "not serving" semantics.
     logql_engine(pool, &state.config, tenant)
         .map(crate::request_id::tag)
