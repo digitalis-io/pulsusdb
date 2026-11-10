@@ -26,6 +26,7 @@
 
 mod detected;
 mod encode;
+mod engine;
 mod error;
 mod handlers;
 mod params;

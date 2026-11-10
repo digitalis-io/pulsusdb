@@ -127,7 +127,9 @@ rewrite docs/schemas.md:691-692
 rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624,#596,#507,#594,#602,#592,#653,#614,#597,#599,#501,#601,#738,#757,#399,#786,#778
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
-rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560
+# Issue #803 adds #803, its own issue, where the client gains a read binding,
+# its failure record and its rebind.
+rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560,#803
 # `refs=#587` is a NEW reference, not a carried one: the module declaration
 # this row protects gained a comment naming the issue that made it `pub`,
 # because `pulsus-read` and `pulsus-write` both reach the moved `JSON`

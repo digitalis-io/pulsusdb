@@ -51,16 +51,16 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 29 tables, 26 views, and
+/// The inventory, single-node: one database, 31 tables, 28 views, and
 /// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
 /// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 56, "statement count");
+    assert_eq!(stmts.len(), 60, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
-    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 29);
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 26);
+    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 31);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 28);
 
     let text = rendered(&single());
     assert!(
@@ -94,13 +94,13 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 77, "statement count");
+    assert_eq!(stmts.len(), 81, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        50,
-        "29 tables + 21 wrappers"
+        52,
+        "31 tables + 21 wrappers"
     );
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 26);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 28);
 
     let text = rendered(&clustered());
     assert!(
@@ -109,7 +109,7 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        77,
+        81,
         "every statement carries ON CLUSTER"
     );
 
@@ -388,7 +388,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 29);
+    assert_eq!(on_tables, 31);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -872,7 +872,7 @@ fn carries_landing_banner(name: &str) -> bool {
 }
 
 /// Every base table with no routing wrapper: the label values,
-/// `service_edges` and the cluster-wide ones. These are the exceptions three
+/// `service_edges`, the cluster-wide ones and the rollup stages. These are the exceptions three
 /// documents name.
 fn tables_without_a_wrapper() -> Vec<String> {
     let all = tables();
@@ -929,9 +929,9 @@ fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
     let no_wrapper = tables_without_a_wrapper();
     assert_eq!(
         no_wrapper.len(),
-        8,
-        "the label values, `service_edges` and six cluster-wide ones: \
-         {no_wrapper:?}"
+        10,
+        "the label values, `service_edges`, six cluster-wide ones and the two \
+         rollup stages: {no_wrapper:?}"
     );
     let all = tables();
     let wrapped: Vec<&String> = all.iter().filter(|t| t.wrapper).map(|t| &t.name).collect();
@@ -1015,9 +1015,10 @@ fn the_trace_sharding_key_passage_names_every_routed_trace_table() {
     }
 }
 
-/// **`metric_label_values` and `service_edges` are the only per-shard tables
-/// with no routing wrapper** (the landing tables have one since issue #494
-/// parts 1 and 1b). The label
+/// **`metric_label_values`, `service_edges` and the rollup stages are the
+/// only per-shard tables with no routing wrapper** (the landing tables have
+/// one since issue #494 parts 1 and 1b; the stages came with issue #800 and
+/// are read only by their shard's builder). The label
 /// values are named locally inside every statement that reads them (issue
 /// #635); `service_edges` is read only per shard, through `cluster(…,
 /// view(…))`, by the one statement that also pairs that shard's spans
@@ -1039,10 +1040,15 @@ fn only_the_label_values_and_the_service_edges_are_per_shard_without_a_wrapper()
     without.sort();
     assert_eq!(
         without,
-        vec!["metric_label_values", "service_edges"],
+        vec![
+            "metric_label_values",
+            "metric_samples_60s_stage",
+            "metric_samples_720s_stage",
+            "service_edges"
+        ],
         "a per-shard table with no routing wrapper that is not the label \
-         values or `service_edges` (read only per shard, issue #599 part A \
-         D9) falsifies the clustering claim in docs/architecture.md §7, \
+         values, `service_edges` (read only per shard, issue #599 part A \
+         D9) or a rollup stage (issue #800) falsifies the clustering claim in docs/architecture.md §7, \
          docs/schemas.md §7, docs/schemas.md's conventions preamble and \
          docs/features.md's clustering row"
     );
@@ -1098,7 +1104,7 @@ fn the_landing_placement_passages_name_every_landing_table() {
 const DIST_SUFFIX_ROW: &str = r##"| `PULSUS_DIST_SUFFIX` | `_dist` | suffix of the Distributed tables PulsusDB names: readers query through them, and on a cluster the writer inserts every log, metric and trace push into `log_landing`, `metric_landing` or `trace_landing` with it appended (set differently for cross-cluster read topologies, where the writing processes keep the suffix their own cluster's wrappers carry); the service graph reads the cluster and database that `spans` plus this suffix names |"##;
 
 /// `docs/configuration.md`'s topology requirement, whole (issue #494 part 1).
-const TOPOLOGY_REQUIREMENT: &str = r##"**Topology requirement:** on a cluster, every server PulsusDB inserts through — the one `CLICKHOUSE_SERVER` names, or each one `CLICKHOUSE_SERVERS` lists, and every server behind a front end at those addresses — must be a cluster member that hosts the `PULSUS_DIST_SUFFIX` wrapper tables, the three landing wrappers among them (`log_landing_dist`, `metric_landing_dist` and `trace_landing_dist` at the default suffix). An insert through a server without them fails. Each of those servers must hold the same definition of `PULSUS_CLUSTER` — the same shards, in the same order, with the same weights and the same replicas — and give every shard `internal_replication = true`, as the setup generator and the chart write it. Given that, a log or trace push goes through its table's wrapper, keyed on its receive stamp, so the push and every resend the writer makes of it reach one shard; a push the client sends again that is stored as a new push (`docs/api.md` §1.0) carries a new receive stamp and may reach another shard. A metrics push goes through `metric_landing`'s wrapper, keyed on each series' fingerprint — the key of every metrics table's wrapper — so all of a series' rows sit on one shard, and every resend of the push reaches the same shards whichever writer sends it. Each wrapper writes one live replica of a block for replication to copy to the rest. A server whose definition orders the shards differently may send a resend to another shard, where it is stored again; one without `internal_replication = true` writes every replica itself. PulsusDB detects neither. For reads, spreading only changes which node coordinates the identical query."##;
+const TOPOLOGY_REQUIREMENT: &str = r##"**Topology requirement:** on a cluster, every server PulsusDB inserts through — the one `CLICKHOUSE_SERVER` names, or each one `CLICKHOUSE_SERVERS` lists, and every server behind a front end at those addresses — must be a cluster member that hosts the `PULSUS_DIST_SUFFIX` wrapper tables, the three landing wrappers among them (`log_landing_dist`, `metric_landing_dist` and `trace_landing_dist` at the default suffix). An insert through a server without them fails. Each of those servers must hold the same definition of `PULSUS_CLUSTER` — the same shards, in the same order, with the same weights and the same replicas — and give every shard `internal_replication = true`, as the setup generator and the chart write it. Given that, a log or trace push goes through its table's wrapper, keyed on its receive stamp, so the push and every resend the writer makes of it reach one shard; a push the client sends again that is stored as a new push (`docs/api.md` §1.0) carries a new receive stamp and may reach another shard. A metrics push goes through `metric_landing`'s wrapper, keyed on each series' fingerprint — the key of every metrics table's wrapper — so all of a series' rows sit on one shard, and every resend of the push reaches the same shards whichever writer sends it. Each wrapper writes one live replica of a block for replication to copy to the rest. A server whose definition orders the shards differently may send a resend to another shard, where it is stored again; one without `internal_replication = true` writes every replica itself. PulsusDB detects neither. For reads, the server a request is sent to coordinates every statement of it, and that server's own replicas serve its shard, so every statement of one read request goes to one server."##;
 
 /// `docs/api.md` §1.0's paragraph on a log push answered `500` after part of
 /// it was stored (issue #494 part 1).
@@ -1126,8 +1132,9 @@ A synchronous push is answered as the last column says; one sent with `X-Pulsus-
 /// `docs/api.md`'s `Idempotency-Key` row, its third cell (issue #494 part 1b).
 const IDEMPOTENCY_KEY_CELL: &str = r##"issue #494, extended to the trace push by issue #586. Namespaces a push's identity in the writer process's suppression index (§1.0), while that index is on and still holds the key — until `PULSUS_INGEST_DEDUP_WINDOW` has passed: two requests with **different** keys are then two pushes whatever they carry, and the same key with the same content is one push. The same key carrying **different** content is then a client error — `400`, and nothing is stored. At another writer process, after the window, or with `PULSUS_INGEST_DEDUP=false`, the key decides nothing. Absent, a push is identified by its own content. Two tenants' identical log, metric or trace pushes, with or without one key, are two pushes. A metrics push's deduplication token in ClickHouse never reads the key, so a metrics push of the same parsed content stores its samples, series and exemplars once whatever its key (§1.0). Read on every ingest route, `/v1/traces` and the Zipkin receiver included"##;
 
-/// `docs/features.md`'s clustering row, its second cell (issue #494 part 1b).
-const CLUSTERING_CELL: &str = r##"Replicated engines; Distributed tables over every per-shard table but `metric_label_values`, which every statement names locally, and `service_edges`, which the service graph reads only per shard, and none over the cluster-wide catalogue tables; the `log_landing` and `trace_landing` wrappers are keyed on the push's receive stamp, so a log or trace push and every resend the writer makes of it reach one shard, and the `metric_landing` wrapper on each series' fingerprint, so all of a series' rows sit on one shard; shard-local pushdown for traces, and for logs the reads that do not need a fingerprint's rows to be whole on one shard"##;
+/// `docs/features.md`'s clustering row, its second cell (issue #494 part 1b;
+/// the rollup stages, issue #800).
+const CLUSTERING_CELL: &str = r##"Replicated engines on every table but the rollup stages, which only their shard's builder writes and reads; Distributed tables over every per-shard table but `metric_label_values`, which every statement names locally, `service_edges`, which the service graph reads only per shard, and the rollup stages, and none over the cluster-wide catalogue tables; the `log_landing` and `trace_landing` wrappers are keyed on the push's receive stamp, so a log or trace push and every resend the writer makes of it reach one shard, and the `metric_landing` wrapper on each series' fingerprint, so all of a series' rows sit on one shard; shard-local pushdown for traces, and for logs the reads that do not need a fingerprint's rows to be whole on one shard"##;
 
 /// Every other edit of the user documents (issue #494 part 1b): the document,
 /// the text it replaced (`None` for an insertion), and the new text.
@@ -1379,9 +1386,10 @@ fn the_citing_clustering_passages_name_the_section_holding_the_list() {
 }
 
 /// **Every passage saying the clustered tables are replicated names the
-/// tables that are not.** Since issue #18 part A there are none: every
-/// clustered table is `Replicated*`, and no passage may still except
-/// `metric_rollup_plan`, which part A removed.
+/// tables that are not.** Since issue #800 these are the rollup stages,
+/// which only their shard's builder writes and reads; every other clustered
+/// table is `Replicated*`, and no passage may still except
+/// `metric_rollup_plan`, which issue #18 part A removed.
 #[test]
 fn the_replication_passages_name_every_unreplicated_table() {
     let mut local: Vec<String> = rendered_statements(&clustered())
@@ -1399,7 +1407,7 @@ fn the_replication_passages_name_every_unreplicated_table() {
     local.sort();
     assert_eq!(
         local,
-        Vec::<String>::new(),
+        vec!["metric_samples_60s_stage", "metric_samples_720s_stage"],
         "the clustered tables that are not replicated"
     );
     for (name, anchor) in [
@@ -1412,11 +1420,14 @@ fn the_replication_passages_name_every_unreplicated_table() {
         ("schemas.md", "Enabled by `PULSUS_CLUSTER`."),
     ] {
         let line = doc_line(name, anchor);
+        assert!(
+            line.contains("but the rollup stages"),
+            "docs/{name}'s replication claim must except the rollup stages: {line}"
+        );
         for table in &local {
             assert!(
-                line.contains(&format!("but `{table}`"))
-                    || line.contains(&format!("except `{table}`")),
-                "docs/{name}'s replication claim must except `{table}`, which \
+                line.contains(&format!("`{table}`")),
+                "docs/{name}'s replication claim must name `{table}`, which \
                  is not replicated: {line}"
             );
         }
@@ -1445,6 +1456,13 @@ fn the_replication_passages_name_every_unreplicated_table() {
 /// name, target and exact sources, in both variants, so another refreshable
 /// view, or one of these reading anything else, fails here instead of
 /// passing under a rule for every refreshable view.
+///
+/// **The rollup stages' views (issue #800) are the second pinned
+/// exception.** Each copies one level's inserted block into that level's
+/// stage, which counts nothing twice: the stage is a copy that the next
+/// level's run reads in place of the level, never beside it for the same
+/// row. They are pinned by name, target and exact sources, and left out of
+/// the landing source set.
 #[test]
 fn no_insert_triggered_view_reads_a_table_another_view_writes() {
     for base in [single(), clustered()] {
@@ -1452,6 +1470,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
         let mut targets = Vec::new();
         let mut sources = Vec::new();
         let mut refreshable = Vec::new();
+        let mut stage_views = Vec::new();
         for stmt in rendered_statements(&base) {
             let Some(head) = stmt.strip_prefix("CREATE MATERIALIZED VIEW pulsus.") else {
                 continue;
@@ -1510,10 +1529,34 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
                     merged.is_empty(),
                     "an insert-triggered view reads through merge(): {stmt}"
                 );
-                sources.extend(own);
+                if target.ends_with("_stage") {
+                    own.sort();
+                    own.dedup();
+                    stage_views.push((name, target, own));
+                } else {
+                    sources.extend(own);
+                }
             }
         }
-        assert_eq!(targets.len(), 26, "{variant:?}: twenty-six views");
+        assert_eq!(targets.len(), 28, "{variant:?}: twenty-eight views");
+        stage_views.sort();
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            stage_views,
+            vec![
+                (
+                    "metric_samples_60s_stage_mv".to_string(),
+                    "metric_samples_60s_stage".to_string(),
+                    names(&["metric_samples_60s"]),
+                ),
+                (
+                    "metric_samples_720s_stage_mv".to_string(),
+                    "metric_samples_720s_stage".to_string(),
+                    names(&["metric_samples_720s"]),
+                ),
+            ],
+            "{variant:?}: the two stage views, their targets and their sources"
+        );
         refreshable.sort();
         let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
@@ -1529,13 +1572,21 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
                 (
                     "metric_samples_7200s_mv".to_string(),
                     "metric_samples_7200s".to_string(),
-                    strings(&["metric_samples_7200s", "metric_samples_720s"]),
+                    strings(&[
+                        "metric_samples_7200s",
+                        "metric_samples_720s",
+                        "metric_samples_720s_stage",
+                    ]),
                     Vec::<String>::new(),
                 ),
                 (
                     "metric_samples_720s_mv".to_string(),
                     "metric_samples_720s".to_string(),
-                    strings(&["metric_samples_60s", "metric_samples_720s"]),
+                    strings(&[
+                        "metric_samples_60s",
+                        "metric_samples_60s_stage",
+                        "metric_samples_720s",
+                    ]),
                     Vec::<String>::new(),
                 ),
                 (
@@ -2476,6 +2527,14 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
         true,
         None,
     ),
+    // Issue #800: the stages of the two levels whose next level is shorter
+    // than a day, due `H + 2 × ⌈next ÷ 3600 s⌉ + 1` hours after staging.
+    (
+        "metric_samples_60s_stage",
+        Some("TTL staged_at + toIntervalHour(3 + 2 * intDiv(720000 + 3599999, 3600000) + 1)"),
+        true,
+        Some(3600),
+    ),
     (
         "metric_samples_720s",
         Some(
@@ -2483,6 +2542,12 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
         ),
         true,
         None,
+    ),
+    (
+        "metric_samples_720s_stage",
+        Some("TTL staged_at + toIntervalHour(3 + 2 * intDiv(7200000 + 3599999, 3600000) + 1)"),
+        true,
+        Some(3600),
     ),
     (
         "metric_samples_7200s",
@@ -2609,6 +2674,7 @@ fn every_day_partition_is_a_utc_day() {
                 "PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC')",
                 "PARTITION BY toDate(minute)",
                 "PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))",
+                "PARTITION BY toStartOfHour(staged_at)",
             ],
             "{:?}",
             base.cluster
@@ -2788,16 +2854,21 @@ fn the_documented_expiry_table_names_every_table() {
         })
         .collect();
     documented.sort();
-    // The rollup levels (issue #18) are one row, `metric_samples_<N>s`.
+    // The rollup levels (issue #18) are one row, `metric_samples_<N>s`, and
+    // their stages (issue #800) one more, `metric_samples_<N>s_stage`.
     let mut want: Vec<String> = EXPIRY
         .iter()
         .map(|(n, ..)| {
-            let level = n
+            let (base, stage) = match n.strip_suffix("_stage") {
+                Some(base) => (base, "_stage"),
+                None => (*n, ""),
+            };
+            let level = base
                 .strip_prefix("metric_samples_")
                 .and_then(|rest| rest.strip_suffix('s'))
                 .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()));
             if level {
-                "metric_samples_<N>s".to_string()
+                format!("metric_samples_<N>s{stage}")
             } else {
                 n.replace("log_metrics_5s", "log_metrics_<res>")
             }
@@ -2852,11 +2923,14 @@ fn statement_headed(stmts: &[String], head: &str) -> String {
 /// order, each level's table then (clustered) its wrapper then its view, and
 /// each view's timer is the one plan Q4 derives from the sizes. Each table
 /// names its level in its comment, expires by the UTC day of `t_end − 1 ms`,
-/// is keyed by the series, and carries the projection the next level's run
-/// reads exactly when that next level is shorter than a day. The first view reads `metric_landing` with
-/// exact repeats dropped and the landing block named; every other view
-/// reads the level below with its block named; every view writes its run
-/// row in the same statement and runs on two threads. Nothing names the
+/// is keyed by the series, and carries no projection; a level whose next
+/// level is shorter than a day has a stage and the view that fills it
+/// (issue #800). The first view reads `metric_landing` with exact repeats
+/// dropped and the landing block named; every later view shorter than a
+/// day reads the level below's stage where it covers and the level below
+/// elsewhere, and the day view reads the level below; every view writes
+/// `built_at` 0 on its data rows, its run row in the same statement, and
+/// runs on two threads. Nothing names the
 /// removed `metric_rollup`, and `metric_landing` is keyed by the block.
 #[test]
 fn the_rollup_levels_render_from_one_template() {
@@ -2916,6 +2990,16 @@ fn the_rollup_levels_render_from_one_template() {
                         "CREATE TABLE IF NOT EXISTS pulsus.metric_samples_{r}s_dist{on} AS pulsus.metric_samples_{r}s"
                     ));
                 }
+                // Issue #800: a level whose next level is shorter than a day
+                // carries its stage and the view that fills it.
+                if levels.get(i + 1).is_some_and(|next| *next < 86_400) {
+                    want_heads.push(format!(
+                        "CREATE TABLE IF NOT EXISTS pulsus.metric_samples_{r}s_stage{on}"
+                    ));
+                    want_heads.push(format!(
+                        "CREATE MATERIALIZED VIEW pulsus.metric_samples_{r}s_stage_mv{on} TO pulsus.metric_samples_{r}s_stage"
+                    ));
+                }
                 want_heads.push(format!(
                     "CREATE MATERIALIZED VIEW pulsus.metric_samples_{r}s_mv{on} REFRESH {} APPEND TO pulsus.metric_samples_{r}s",
                     timers[i]
@@ -2945,17 +3029,34 @@ fn the_rollup_levels_render_from_one_template() {
                 ] {
                     assert!(lines.contains(&line.as_str()), "{what}: {r}s lacks {line}: {table}");
                 }
-                match levels.get(i + 1).filter(|next| **next < 86_400) {
-                    Some(next) => assert!(
-                        lines.contains(&format!(
-                            "    , PROJECTION by_parent (SELECT * ORDER BY (intDiv(t_end - 1, {next}000), org_id, fingerprint, t_end))"
-                        ).as_str()),
-                        "{what}: {r}s's projection is keyed by the next level: {table}"
-                    ),
-                    None => assert!(
-                        !table.contains("PROJECTION"),
-                        "{what}: a level whose next level is a day or none has no projection: {table}"
-                    ),
+                // Issue #800: no level carries a projection; a level whose
+                // next level is shorter than a day has a stage instead.
+                assert!(
+                    !table.contains("PROJECTION"),
+                    "{what}: {r}s carries a projection: {table}"
+                );
+                if let Some(next) = levels.get(i + 1).filter(|next| **next < 86_400) {
+                    let stage = statement_headed(
+                        &stmts,
+                        &format!("CREATE TABLE IF NOT EXISTS pulsus.metric_samples_{r}s_stage{on}"),
+                    );
+                    let stage_lines: Vec<&str> = stage.lines().collect();
+                    for line in [
+                        "ENGINE = MergeTree".to_string(),
+                        "PARTITION BY toStartOfHour(staged_at)".to_string(),
+                        format!(
+                            "ORDER BY (kind, intDiv(t_end - 1, {next}000), org_id, fingerprint, t_end)"
+                        ),
+                        format!(
+                            "TTL staged_at + toIntervalHour(6 + 2 * intDiv({next}000 + 3599999, 3600000) + 1)"
+                        ),
+                        "SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 1024;".to_string(),
+                    ] {
+                        assert!(
+                            stage_lines.contains(&line.as_str()),
+                            "{what}: {r}s's stage lacks {line}: {stage}"
+                        );
+                    }
                 }
 
                 let view = statement_headed(
@@ -2990,7 +3091,7 @@ fn the_rollup_levels_render_from_one_template() {
                         "anyLast(if(bits = 9218868437227405314, NULL, toNullable(reinterpretAsFloat64(bits)))) OVER (PARTITION BY org_id, fingerprint ORDER BY unix_milli, bits ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS q0,",
                         "anyLast(if(bits = 9218868437227405314, NULL, toNullable(unix_milli))) OVER (PARTITION BY org_id, fingerprint ORDER BY unix_milli, bits ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS t0",
                         "maxIf(unix_milli, bits != 9218868437227405314) AS t_last, argMaxIf(value, (unix_milli, bits), bits != 9218868437227405314) AS last,",
-                        "sum(d) AS inc, toUInt8(if(argMax(bits, (unix_milli, bits)) = 9218868437227405314, 1, 0) + if(countIf(isNaN(value) AND bits != 9218868437227405314) > 0, 2, 0)) AS flags, any(now_ms) AS built_at",
+                        "sum(d) AS inc, toUInt8(if(argMax(bits, (unix_milli, bits)) = 9218868437227405314, 1, 0) + if(countIf(isNaN(value) AND bits != 9218868437227405314) > 0, 2, 0)) AS flags, toInt64(0) AS built_at",
                         "if(isNull(q0), if(unix_milli - tp0 <= 86400000, p0, NULL), if(unix_milli - t0 <= 86400000, q0, NULL)) AS q",
                         "toNullable(argMaxIf(last, t_last, t_last > 0)) AS p0,",
                         "toNullable(maxIf(t_last, t_last > 0)) AS tp0",
@@ -3007,14 +3108,31 @@ fn the_rollup_levels_render_from_one_template() {
                     }
                 } else {
                     let source = levels[i - 1];
+                    // Issue #800: a later level shorter than a day reads its
+                    // source's stage where the stage covers the window and
+                    // the source level elsewhere; the day level reads the
+                    // source level in place of every stage name.
+                    let stage = if *r < 86_400 {
+                        format!("metric_samples_{source}s_stage")
+                    } else {
+                        format!("metric_samples_{source}s")
+                    };
                     for needle in [
+                        format!(
+                            "FROM pulsus.{stage} WHERE org_id = '' AND fingerprint = 0 AND kind = 1) AS staged,"
+                        ),
+                        format!("FROM pulsus.{stage}\n"),
                         format!("FROM pulsus.metric_samples_{source}s\n"),
+                        "NOT arrayExists(c -> c.1 <= lo AND c.2 >= hi, staged)".to_string(),
+                        format!(
+                            "FROM pulsus.metric_samples_{source}s WHERE org_id = '' AND fingerprint = 0 AND kind = 1)"
+                        ),
                         format!(
                             "AND intDiv(t_end - 1, {r}000) BETWEEN intDiv(lo, {r}000) AND intDiv(hi - 1, {r}000)"
                         ),
                         // Issue #18 part B: flag 1 from the newest row, flag
                         // 2 from any.
-                        "sum(ic) AS inc, toUInt8(bitAnd(argMax(fl, te), 1) + bitAnd(groupBitOr(fl), 2)) AS flags, any(now_ms) AS built_at".to_string(),
+                        "sum(ic) AS inc, toUInt8(bitAnd(argMax(fl, te), 1) + bitAnd(groupBitOr(fl), 2)) AS flags, toInt64(0) AS built_at".to_string(),
                         "sum AS sm, count AS ct, inc AS ic, flags AS fl".to_string(),
                     ] {
                         assert!(
@@ -3022,11 +3140,22 @@ fn the_rollup_levels_render_from_one_template() {
                             "{what}: {r}s's view lacks {needle:?}: {view}"
                         );
                     }
+                    if *r >= 86_400 {
+                        assert!(
+                            !view.contains("_stage"),
+                            "{what}: the day level names a stage: {view}"
+                        );
+                    }
                     assert!(
                         !view.contains("metric_landing"),
                         "{what}: {r}s reads landing: {view}"
                     );
                 }
+                assert!(
+                    view.contains("AS flags, toInt64(0) AS built_at")
+                        && !view.contains("any(now_ms) AS built_at"),
+                    "{what}: {r}s's data rows write built_at 0: {view}"
+                );
                 for needle in ["\nUNION ALL\n", "SETTINGS max_threads = 2,"] {
                     assert!(
                         view.contains(needle),
@@ -3176,7 +3305,9 @@ fn the_default_levels_carry_their_switch_points() {
         let stmts = rendered_statements(&ctx);
         let tables: Vec<String> = level_heads(&stmts)
             .into_iter()
-            .filter(|h| h.starts_with("CREATE TABLE") && !h.contains("_dist"))
+            .filter(|h| {
+                h.starts_with("CREATE TABLE") && !h.contains("_dist") && !h.contains("_stage")
+            })
             .collect();
         let want_tables: Vec<String> = want
             .iter()
@@ -3458,14 +3589,14 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             vec![],
             vec!["--mode", "single"],
             single(),
-            "434f6ef1dfc933f746940bff84b1c311a2855333b38174f3cb93d7d5c220f3c4",
+            "34d7f017fc07071d0817521fb879a9c5e289610475109d0a716522ab80414f10",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "e52d07ebd5b4b768cde2b665476ad6946e25d0c4185f30b443b765fd33e8b0b9",
+            "9b5d6beefae3621bf0b3f7e0d11a59a9b10e36e92d3f59b879b1f4c9cfb4e913",
         ),
         (
             "clustered with a storage policy",
@@ -3475,7 +3606,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "cd26e9e044f1f4aa0e82b93110629318a47f0e8da6b912e47f14375582c8ba33",
+            "cd6df7143744e74c757259993456fc083d5b6ff38e78aff832af9a970a60b84d",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
@@ -3711,8 +3842,8 @@ const TRACES_FAMILY: [&str; 5] = [
     "service_bucket_resources",
     "service_edges",
 ];
-/// The fourteen tables that never move (docs/configuration.md §7).
-const NEVER_MOVE: [&str; 14] = [
+/// The sixteen tables that never move (docs/configuration.md §7).
+const NEVER_MOVE: [&str; 16] = [
     "log_landing",
     "log_streams",
     "log_streams_idx",
@@ -3721,6 +3852,8 @@ const NEVER_MOVE: [&str; 14] = [
     "metric_label_values",
     "metric_landing",
     "metric_metadata",
+    "metric_samples_60s_stage",
+    "metric_samples_720s_stage",
     "metric_series",
     "resources",
     "tag_names",
@@ -3749,7 +3882,7 @@ fn move_line(table: &str, days: u32) -> String {
 /// `storage_policy = 'tiered'`.
 fn assert_tiering(what: &str, ctx: &RenderCtx, moving: &[(&str, u32)]) {
     let tables = local_tables(ctx);
-    assert_eq!(tables.len(), 29, "{what}: twenty-nine tables");
+    assert_eq!(tables.len(), 31, "{what}: thirty-one tables");
     for name in NEVER_MOVE {
         assert!(tables.contains_key(name), "{what}: {name} is rendered");
     }

@@ -2025,11 +2025,12 @@ enum ReviewedVerdict {
 // is no divergence left to hold a judgement about.
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 1] = [(
     "docs/query-lowering.md",
-    "exec.rs:1360-1362",
+    "exec.rs:1403-1405",
     0,
     ReviewedVerdict::FallbackWrong,
     "the search settings block the same section quotes; it is in traces/exec.rs \
-         (`exec.rs:3227-3233` before #602 part 2c-2b-2 renumbered it)",
+         (`exec.rs:3227-3233` before #602 part 2c-2b-2 renumbered it, and \
+         `exec.rs:1360-1362` before #803 did)",
 )];
 
 /// **Where the language fallback and the anchor rule disagree, and what a

@@ -76,9 +76,10 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
+use pulsus_model::Fingerprint;
 use pulsus_read::{
-    Direction, EngineConfig, LogQlEngine, QueryParams, QuerySpec, StreamResult, TailCursor,
-    TailLower,
+    Direction, EngineConfig, LogQlEngine, QueryParams, QuerySpec, ReadError, StreamResult,
+    TailCeiling, TailCursor, TailLower,
 };
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
@@ -526,6 +527,11 @@ async fn tie_group_split_by_the_fetch_limit_is_delivered_exactly_once() {
 // ---------------------------------------------------------------------
 
 fn engine_for_db(client: ChClient) -> LogQlEngine {
+    engine_for_db_with_budget(client, 50 * 1024 * 1024 * 1024)
+}
+
+/// [`engine_for_db`] with its scan budget set to `scan_budget_bytes`.
+fn engine_for_db_with_budget(client: ChClient, scan_budget_bytes: u64) -> LogQlEngine {
     LogQlEngine::new(
         client,
         EngineConfig {
@@ -540,7 +546,7 @@ fn engine_for_db(client: ChClient) -> LogQlEngine {
             rollup_table: "log_metrics_5s".to_string(),
             patterns_table: "log_patterns".to_string(),
             rollup_res_ns: 5_000_000_000,
-            scan_budget_bytes: 50 * 1024 * 1024 * 1024,
+            scan_budget_bytes,
             max_streams: 100_000,
             pipeline_scan_factor: 10,
             distributed: false,
@@ -1696,9 +1702,9 @@ async fn scan_gate_catches_a_gap_registration_via_the_qualifying_scan_then_narro
     seed_samples(&client1, db1, &[(F, gap_ns, "gap-line")]).await;
 
     // (3) ONE more narrow=false refresh+poll — the QUALIFYING scan: still
-    // full-span (a_lit present), F resolves, the gap sample is delivered
-    // in THIS poll's page (program order: the insert strictly precedes
-    // this scan).
+    // full-span (a_lit present), F resolves, and the gap sample is
+    // delivered by the catch-up that admits it (program order: the insert
+    // strictly precedes this scan).
     engine1
         .tail_refresh_months(&mut setup, lower, gap_ns, false)
         .expect("no I/O, cannot fail");
@@ -1716,7 +1722,36 @@ async fn scan_gate_catches_a_gap_registration_via_the_qualifying_scan_then_narro
         )
         .await
         .expect("qualifying scan poll");
-    let delivered: Vec<String> = page
+    // F resolves in this full-span scan and its labels are read, but it joins after the
+    // first window, so the producer catches it up before admitting it (plan §6.3).
+    assert!(
+        page.streams.iter().all(|s| s.entries.is_empty()),
+        "{:?}",
+        page.streams
+    );
+    assert_eq!(page.joined, vec![Fingerprint::from_raw(u128::from(F))]);
+    // The producer's main position after this under-limit page.
+    let ceiling = TailCeiling::of(TailLower::Start { start_ns: gap_ns });
+    let first = engine1
+        .tail_first_lines(&setup, &page.joined, start, ceiling)
+        .await
+        .expect("probe");
+    assert_eq!(first, vec![(Fingerprint::from_raw(u128::from(F)), gap_ns)]);
+    let caught = engine1
+        .tail_catch_up(
+            &setup,
+            &page.joined,
+            TailLower::Start {
+                start_ns: gap_ns - 1,
+            },
+            gap_ns,
+            ceiling,
+            1_000,
+        )
+        .await
+        .expect("catch-up");
+    let delivered: Vec<String> = caught
+        .page
         .streams
         .iter()
         .flat_map(|s| s.entries.iter().map(|(_, l)| l.clone()))
@@ -1726,7 +1761,12 @@ async fn scan_gate_catches_a_gap_registration_via_the_qualifying_scan_then_narro
         vec!["gap-line".to_string()],
         "the inter-poll-gap registration is caught by the qualifying full-span scan"
     );
-    let cursor = page.next.expect("cursor after the delivered gap-line");
+    assert_eq!(caught.fetched_fps, page.joined);
+    setup.admit(&page.joined);
+    let cursor = caught
+        .page
+        .next
+        .expect("cursor after the delivered gap-line");
 
     // (4) narrow=true refresh with lower ~ the resumed cursor — real
     // narrowing; A is 2 months behind `lower - GRACE` on any calendar
@@ -1854,6 +1894,711 @@ async fn scan_gate_catches_a_gap_registration_via_the_qualifying_scan_then_narro
          excluded before ever being scanned): {:?}",
         page2.streams
     );
+    assert!(
+        page2.joined.is_empty(),
+        "F2 was never resolved, so it never joined: {:?}",
+        page2.joined
+    );
 
     drop_db(db2).await;
+}
+
+// ---------------------------------------------------------------------
+// Issue #804: a stream whose registration or labels become readable after
+// its lines. The views of one landing insert commit separately, so a
+// replica (or one server, briefly) can hold a line whose stream is not
+// yet resolvable; these build those states by inserting into one target
+// table only.
+// ---------------------------------------------------------------------
+
+/// Seeds the stage-1 index rows `pod=<pod>` and `service_name=checkout`
+/// for `fp`, and nothing else: no labels row, no line.
+async fn seed_index_only(client: &ChClient, db: &str, fp: u64, pod: &str, at_ns: i64) {
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({at_ns})))");
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams_idx (org_id, month, key, val, fingerprint) VALUES \
+                 ('', {month}, 'pod', '{pod}', {fp}), \
+                 ('', {month}, 'service_name', 'checkout', {fp})"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed the index rows");
+}
+
+/// Seeds one `log_streams` labels row for `fp`, and nothing else.
+async fn seed_labels_row(client: &ChClient, db: &str, fp: u64, labels: &str, at_ns: i64) {
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams (org_id, month, fingerprint, service, labels, \
+                 updated_ns) VALUES ('', \
+                 toStartOfMonth(fromUnixTimestamp64Nano(toInt64({at_ns}))), {fp}, 'checkout', \
+                 '{labels}', 0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed the labels row");
+}
+
+#[derive(Debug, Clone, Row, serde::Serialize, serde::Deserialize)]
+struct CountRow {
+    n: u64,
+}
+
+async fn count_rows(client: &ChClient, sql: &str) -> u64 {
+    let mut stream = client
+        .query_stream::<CountRow>(sql, &QuerySettings::new())
+        .await
+        .expect("count query");
+    let row = stream.next().await.expect("one row").expect("count row");
+    row.n
+}
+
+fn fp(n: u64) -> Fingerprint {
+    Fingerprint::from_raw(u128::from(n))
+}
+
+const MS: i64 = 1_000_000;
+
+fn checkout_setup(engine: &LogQlEngine, start_ns: i64, end_ns: i64) -> pulsus_read::TailSetup {
+    let expr = pulsus_logql::parse(r#"{service_name="checkout"}"#).expect("parse");
+    let qp = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns,
+            end_ns,
+            step_ns: 1_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Forward,
+    };
+    engine.tail_setup(&expr, &qp).expect("setup")
+}
+
+/// L1 (issue #804): streams resolved before their labels are readable are
+/// not read by the main scan; once their labels are read, a catch-up up to
+/// the main scan's position sends their earlier lines and the main scan,
+/// after admission, sends the rest, so every line is delivered once.
+/// Fingerprints B = 3 < A = 5 < E = 9 put B's and E's rows at the cursor's
+/// timestamp on both sides of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_whose_labels_arrive_late_is_caught_up_exactly_once_on_both_sides_of_the_cursor() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_804_late_labels");
+    drop_db(db).await;
+    init_schema(db);
+    let client = data_client(db).await;
+    let t0 = now_ns() - 3_600_000_000_000;
+    seed_stream(
+        &client,
+        db,
+        5,
+        r#"{"pod":"a","service_name":"checkout"}"#,
+        t0,
+    )
+    .await;
+    seed_index_only(&client, db, 3, "b", t0).await;
+    seed_index_only(&client, db, 9, "e", t0).await;
+    seed_samples(
+        &client,
+        db,
+        &[
+            (5, t0, "a1"),
+            (3, t0 + 5 * MS, "b1"),
+            (5, t0 + 10 * MS, "a2"),
+            (3, t0 + 20 * MS, "b2"),
+            (5, t0 + 20 * MS, "a3"),
+            (9, t0 + 20 * MS, "e1"),
+            (9, t0 + 25 * MS, "e2"),
+        ],
+    )
+    .await;
+    let engine = engine_for_db(data_client(db).await);
+    let mut setup = checkout_setup(&engine, t0 - 1_000_000_000, t0 + 30 * MS);
+    let mut all: Vec<String> = Vec::new();
+
+    let p1 = engine
+        .tail_poll(
+            &mut setup,
+            TailLower::Start {
+                start_ns: t0 - 1_000_000_000,
+            },
+            t0 + 15 * MS,
+            100,
+        )
+        .await
+        .expect("poll 1");
+    assert_eq!(page_lines(&p1.streams), ["a1", "a2"]);
+    assert_eq!(p1.joined, Vec::<Fingerprint>::new(), "first window");
+    all.extend(page_lines(&p1.streams));
+
+    seed_labels_row(
+        &client,
+        db,
+        3,
+        r#"{"pod":"b","service_name":"checkout"}"#,
+        t0,
+    )
+    .await;
+    seed_labels_row(
+        &client,
+        db,
+        9,
+        r#"{"pod":"e","service_name":"checkout"}"#,
+        t0,
+    )
+    .await;
+
+    let p2 = engine
+        .tail_poll(
+            &mut setup,
+            TailLower::Start {
+                start_ns: t0 + 15 * MS,
+            },
+            t0 + 30 * MS,
+            1,
+        )
+        .await
+        .expect("poll 2");
+    assert_eq!(page_lines(&p2.streams), ["a3"]);
+    assert_eq!(p2.fetched, 1);
+    assert_eq!(p2.joined, vec![fp(3), fp(9)]);
+    all.extend(page_lines(&p2.streams));
+    let c2 = p2.next.expect("cursor after a3");
+
+    let ceiling = TailCeiling::of(TailLower::After(c2));
+    assert_eq!(ceiling, TailCeiling::Before(t0 + 20 * MS, fp(5)));
+    let first = engine
+        .tail_first_lines(&setup, &[fp(3), fp(9)], t0 - 1_000_000_000, ceiling)
+        .await
+        .expect("probe");
+    assert_eq!(first, vec![(fp(3), t0 + 5 * MS), (fp(9), t0 + 20 * MS)]);
+    let caught = engine
+        .tail_catch_up(
+            &setup,
+            &[fp(3), fp(9)],
+            TailLower::Start {
+                start_ns: t0 + 5 * MS - 1,
+            },
+            t0 + 20 * MS,
+            ceiling,
+            100,
+        )
+        .await
+        .expect("catch-up");
+    assert_eq!(page_lines(&caught.page.streams), ["b1", "b2"]);
+    assert_eq!(caught.fetched_fps, vec![fp(3), fp(9)]);
+    all.extend(page_lines(&caught.page.streams));
+    setup.admit(&[fp(3), fp(9)]);
+
+    let p3 = engine
+        .tail_poll(&mut setup, TailLower::After(c2), t0 + 30 * MS, 100)
+        .await
+        .expect("poll 3");
+    assert_eq!(page_lines(&p3.streams), ["e1", "e2"]);
+    all.extend(page_lines(&p3.streams));
+
+    all.sort_unstable();
+    assert_eq!(all, ["a1", "a2", "a3", "b1", "b2", "e1", "e2"]);
+    drop_db(db).await;
+}
+
+/// L2 (issue #804): labels once read are kept, so a later statement
+/// answered by a server without the labels row cannot make an admitted
+/// stream unreadable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streams_labels_once_read_survive_a_statement_answered_without_them() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_804_kept_labels");
+    drop_db(db).await;
+    init_schema(db);
+    let client = data_client(db).await;
+    let t0 = now_ns() - 3_600_000_000_000;
+    seed_stream(&client, db, 1, r#"{"service_name":"checkout"}"#, t0).await;
+    seed_samples(&client, db, &[(1, t0, "a1")]).await;
+    let engine = engine_for_db(data_client(db).await);
+    let mut setup = checkout_setup(&engine, t0 - 1_000_000_000, t0 + 30 * MS);
+
+    let p1 = engine
+        .tail_poll(
+            &mut setup,
+            TailLower::Start {
+                start_ns: t0 - 1_000_000_000,
+            },
+            t0 + 10 * MS,
+            100,
+        )
+        .await
+        .expect("poll 1");
+    assert_eq!(page_lines(&p1.streams), ["a1"]);
+
+    // As a replica without the row answers.
+    client
+        .execute(
+            &format!("TRUNCATE TABLE {db}.log_streams"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("truncate the labels");
+    seed_samples(&client, db, &[(1, t0 + 20 * MS, "a2")]).await;
+    let r = engine
+        .tail_poll(
+            &mut setup,
+            TailLower::Start {
+                start_ns: t0 + 10 * MS,
+            },
+            t0 + 30 * MS,
+            100,
+        )
+        .await;
+    assert!(
+        matches!(&r, Ok(p) if page_lines(&p.streams) == ["a2"]),
+        "{r:?}"
+    );
+    drop_db(db).await;
+}
+
+/// L3 (issue #804): once stage 1 is narrowed, a registration that becomes
+/// readable in a month the narrowed stage 1 no longer reads is found by
+/// the full-span stage 1 the tail runs once per GRACE of cursor time, and
+/// only then.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registration_readable_after_its_month_left_stage_one_is_found_within_one_grace() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    const DAY_NS: i64 = 86_400_000_000_000;
+    const SLICE_NS: i64 = 10 * DAY_NS;
+    const GRACE: i64 = pulsus_read::TAIL_REGISTRATION_GRACE_NS;
+    const P: u64 = 7_001;
+    const Q: u64 = 7_002;
+    const R: u64 = 7_003;
+    let labels = r#"{"service_name":"checkout"}"#;
+
+    // Month A: two calendar months back, as the scan-gate test builds it.
+    let now = now_ns();
+    let now_date = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(now);
+    let a_date = now_date
+        .checked_sub_months(chrono::Months::new(2))
+        .expect("2 months before a valid UTC instant is representable");
+    let a_reg_ns = a_date.timestamp_nanos_opt().expect("fits in i64 ns");
+    let a_lit = month_literal(a_reg_ns);
+    assert_ne!(a_lit, month_literal(now));
+
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_804_late_registration");
+    drop_db(db).await;
+    init_schema(db);
+    let client = data_client(db).await;
+    let engine = engine_for_db(data_client(db).await);
+    let start = a_reg_ns - 3_600_000_000_000;
+    seed_stream(&client, db, P, labels, a_reg_ns).await;
+    seed_samples(
+        &client,
+        db,
+        &[
+            (P, a_reg_ns, "p1"),
+            (Q, a_reg_ns + 1_000_000_000, "q1"),
+            (R, a_reg_ns + 2_000_000_000, "r1"),
+        ],
+    )
+    .await;
+    let mut setup = checkout_setup(&engine, start, now);
+
+    // Catch-up and two in-hold polls, narrow=false, as the scan-gate test.
+    let mut lower = start;
+    while lower < now {
+        let upper = (lower + SLICE_NS).min(now);
+        engine
+            .tail_refresh_months(&mut setup, lower, upper, false)
+            .expect("no I/O, cannot fail");
+        assert!(setup.plan.stage1_sql.contains(&a_lit));
+        engine
+            .tail_poll(
+                &mut setup,
+                TailLower::Start { start_ns: lower },
+                upper,
+                1_000,
+            )
+            .await
+            .expect("catch-up poll");
+        lower = upper;
+    }
+    for _ in 0..2 {
+        engine
+            .tail_refresh_months(&mut setup, lower, now, false)
+            .expect("no I/O, cannot fail");
+        assert!(setup.plan.stage1_sql.contains(&a_lit));
+        engine
+            .tail_poll(&mut setup, TailLower::Start { start_ns: lower }, now, 1_000)
+            .await
+            .expect("in-hold poll");
+    }
+    engine
+        .tail_refresh_months(&mut setup, now, now, true)
+        .expect("no I/O, cannot fail");
+    assert!(
+        !setup.plan.stage1_sql.contains(&a_lit),
+        "stage 1 is narrowed past month A: {}",
+        setup.plan.stage1_sql
+    );
+    let l = now;
+
+    let page = engine
+        .tail_poll(&mut setup, TailLower::Start { start_ns: l }, l, 1_000)
+        .await
+        .expect("narrowed poll");
+    assert_eq!(page.joined, Vec::<Fingerprint>::new());
+
+    seed_stream(&client, db, Q, labels, a_reg_ns).await;
+    let page = engine
+        .tail_poll(&mut setup, TailLower::Start { start_ns: l }, l, 1_000)
+        .await
+        .expect("narrowed poll after Q's registration");
+    assert_eq!(
+        page.joined,
+        Vec::<Fingerprint>::new(),
+        "within one GRACE of cursor time no full-span stage 1 runs"
+    );
+
+    engine
+        .tail_refresh_months(&mut setup, l + GRACE, l + GRACE, true)
+        .expect("no I/O, cannot fail");
+    let page = engine
+        .tail_poll(
+            &mut setup,
+            TailLower::Start {
+                start_ns: l + GRACE,
+            },
+            l + GRACE,
+            1_000,
+        )
+        .await
+        .expect("poll one GRACE later");
+    assert_eq!(page.joined, vec![fp(Q)], "the full-span stage 1 finds Q");
+    let ceiling = TailCeiling::AtOrBelow(l + GRACE);
+    let first = engine
+        .tail_first_lines(&setup, &[fp(Q)], start, ceiling)
+        .await
+        .expect("probe");
+    assert_eq!(first, vec![(fp(Q), a_reg_ns + 1_000_000_000)]);
+    let caught = engine
+        .tail_catch_up(
+            &setup,
+            &[fp(Q)],
+            TailLower::Start {
+                start_ns: a_reg_ns + 1_000_000_000 - 1,
+            },
+            l + GRACE,
+            ceiling,
+            100,
+        )
+        .await
+        .expect("catch-up");
+    assert_eq!(page_lines(&caught.page.streams), ["q1"]);
+
+    seed_stream(&client, db, R, labels, a_reg_ns).await;
+    let page = engine
+        .tail_poll(
+            &mut setup,
+            TailLower::Start {
+                start_ns: l + GRACE + 1_000_000_000,
+            },
+            l + GRACE + 1_000_000_000,
+            1_000,
+        )
+        .await
+        .expect("poll one second later");
+    assert_eq!(
+        page.joined,
+        Vec::<Fingerprint>::new(),
+        "the next full-span stage 1 is one GRACE of cursor time away"
+    );
+    drop_db(db).await;
+}
+
+/// L4 (issue #804): a poll that fails after reading labels keeps none of
+/// them, so the next poll reads them again and its stage 3 finds the line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_poll_that_fails_after_reading_labels_keeps_none_of_them() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_804_failed_poll");
+    drop_db(db).await;
+    init_schema(db);
+    let client = data_client(db).await;
+    let t0 = now_ns() - 3_600_000_000_000;
+    seed_stream(&client, db, 1, r#"{"service_name":"checkout"}"#, t0).await;
+    let line_ts = t0 + 5 * MS;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_landing \
+                 (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+                  structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
+                 SELECT toUnixTimestamp64Milli(now64(3)), 0, 'checkout', 1, {line_ts}, 0, \
+                 repeat('x', 262144), '', toDate(0), '', 0, '', 0"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed the long line");
+    // Stages 1 and 2 read far less than 64 KiB; stage 3 reads more.
+    let small = engine_for_db_with_budget(data_client(db).await, 65_536);
+    let engine = engine_for_db(data_client(db).await);
+    let mut setup = checkout_setup(&engine, t0 - 1_000_000_000, t0 + 10 * MS);
+    let lower = TailLower::Start {
+        start_ns: t0 - 1_000_000_000,
+    };
+
+    let r = small.tail_poll(&mut setup, lower, t0 + 10 * MS, 100).await;
+    assert!(matches!(r, Err(ReadError::QueryTooBroad(_))), "{r:?}");
+    let page = engine
+        .tail_poll(&mut setup, lower, t0 + 10 * MS, 100)
+        .await
+        .expect("poll 2");
+    let lines: Vec<&(i64, String)> = page.streams.iter().flat_map(|s| &s.entries).collect();
+    assert_eq!(lines.len(), 1, "{:?}", page.streams.len());
+    assert_eq!(lines[0].1.len(), 262_144);
+    drop_db(db).await;
+}
+
+/// The lines of `entries`, in arrival order.
+fn lines_of(entries: &[(serde_json::Value, i64, String)]) -> Vec<String> {
+    entries.iter().map(|(_, _, l)| l.clone()).collect()
+}
+
+/// W1 (issue #804): through the server, lines of a stream whose labels
+/// (B) or registration (C) become readable after the tail passed them are
+/// sent once, before that stream's newer lines.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_line_whose_stream_becomes_readable_after_the_tail_passed_it_is_sent_once() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_840;
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_804_ws_late");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_TAIL_POLL_INTERVAL", "200ms")]);
+    let client = data_client(db).await;
+    let s = now_ns() - 30_000_000_000;
+    seed_stream(
+        &client,
+        db,
+        1,
+        r#"{"pod":"a","service_name":"checkout"}"#,
+        s,
+    )
+    .await;
+    seed_index_only(&client, db, 2, "b", s).await;
+    seed_samples(
+        &client,
+        db,
+        &[
+            (1, s, "a1"),
+            (2, s + 1_000_000_000, "b1"),
+            (4, s + 2_000_000_000, "c1"),
+            (1, s + 3_000_000_000, "a2"),
+        ],
+    )
+    .await;
+    let query = "query=%7Bservice_name%3D%22checkout%22%7D&delay_for=5";
+    let mut ws = WsClient::connect(
+        port,
+        &format!("/api/logs/v1/tail?{query}&start={}", s - 1_000_000_000),
+    );
+
+    let phase1 = collect_entries(&mut ws, 2, Instant::now() + Duration::from_secs(20));
+    assert_eq!(lines_of(&phase1), ["a1", "a2"], "{phase1:?}");
+
+    seed_labels_row(
+        &client,
+        db,
+        2,
+        r#"{"pod":"b","service_name":"checkout"}"#,
+        s,
+    )
+    .await;
+    seed_stream(
+        &client,
+        db,
+        4,
+        r#"{"pod":"c","service_name":"checkout"}"#,
+        s,
+    )
+    .await;
+    let n = now_ns();
+    seed_samples(
+        &client,
+        db,
+        &[
+            (1, n - 1_000_000_000, "a3"),
+            (2, n - 1_000_000_000 + MS, "b2"),
+        ],
+    )
+    .await;
+
+    let phase2 = collect_entries(&mut ws, 4, Instant::now() + Duration::from_secs(20));
+    let mut sorted = lines_of(&phase2);
+    sorted.sort_unstable();
+    assert_eq!(sorted, ["a3", "b1", "b2", "c1"], "{phase2:?}");
+    let pos = |line: &str| phase2.iter().position(|(_, _, l)| l == line);
+    assert!(pos("b1") < pos("b2"), "b1 before b2: {phase2:?}");
+    let b1 = &phase2[pos("b1").expect("b1")];
+    assert_eq!(
+        b1.0,
+        serde_json::json!({"pod": "b", "service_name": "checkout"})
+    );
+    let c1 = &phase2[pos("c1").expect("c1")];
+    assert_eq!(c1.0["pod"], "c");
+
+    let extra = collect_entries(&mut ws, 1, Instant::now() + Duration::from_secs(1));
+    assert!(extra.is_empty(), "no repeat: {extra:?}");
+    ws.close();
+    drop_db(db).await;
+}
+
+/// W2 (issue #804): a stream whose labels never become readable is never
+/// sent and holds back no other stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_whose_labels_never_arrive_does_not_hold_back_the_others() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_841;
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_804_ws_no_labels");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_TAIL_POLL_INTERVAL", "200ms")]);
+    let client = data_client(db).await;
+    let s = now_ns() - 30_000_000_000;
+    seed_stream(
+        &client,
+        db,
+        1,
+        r#"{"pod":"a","service_name":"checkout"}"#,
+        s,
+    )
+    .await;
+    seed_index_only(&client, db, 6, "d", s).await;
+    seed_samples(
+        &client,
+        db,
+        &[
+            (1, s, "a1"),
+            (6, s + 1_000_000_000, "d1"),
+            (1, s + 2_000_000_000, "a2"),
+        ],
+    )
+    .await;
+    let where_d = "org_id = '' AND fingerprint = 6";
+    assert_eq!(
+        count_rows(
+            &client,
+            &format!("SELECT count() AS n FROM {db}.log_samples WHERE {where_d}")
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count_rows(
+            &client,
+            &format!("SELECT count() AS n FROM {db}.log_streams_idx WHERE {where_d}")
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        count_rows(
+            &client,
+            &format!("SELECT count() AS n FROM {db}.log_streams WHERE {where_d}")
+        )
+        .await,
+        0
+    );
+    let query = "query=%7Bservice_name%3D%22checkout%22%7D&delay_for=5";
+    let mut ws = WsClient::connect(
+        port,
+        &format!("/api/logs/v1/tail?{query}&start={}", s - 1_000_000_000),
+    );
+    let phase1 = collect_entries(&mut ws, 2, Instant::now() + Duration::from_secs(20));
+    assert_eq!(lines_of(&phase1), ["a1", "a2"], "{phase1:?}");
+    seed_samples(&client, db, &[(1, now_ns() - 1_000_000_000, "a3")]).await;
+    let phase2 = collect_entries(&mut ws, 1, Instant::now() + Duration::from_secs(20));
+    assert_eq!(lines_of(&phase2), ["a3"], "{phase2:?}");
+    let extra = collect_entries(&mut ws, 1, Instant::now() + Duration::from_secs(1));
+    assert!(extra.is_empty(), "{extra:?}");
+    ws.close();
+    drop_db(db).await;
+}
+
+/// W3 (issue #804): a joined stream's line that lands below the tail's
+/// position after its first probes found nothing is still sent, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joined_streams_line_that_lands_after_its_first_catch_up_is_sent() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_842;
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_804_ws_after_probe");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_TAIL_POLL_INTERVAL", "200ms")]);
+    let client = data_client(db).await;
+    let s = now_ns() - 30_000_000_000;
+    seed_stream(
+        &client,
+        db,
+        1,
+        r#"{"pod":"a","service_name":"checkout"}"#,
+        s,
+    )
+    .await;
+    seed_samples(&client, db, &[(1, s, "a1")]).await;
+    let query = "query=%7Bservice_name%3D%22checkout%22%7D&delay_for=5";
+    let mut ws = WsClient::connect(
+        port,
+        &format!("/api/logs/v1/tail?{query}&start={}", s - 1_000_000_000),
+    );
+    let first = collect_entries(&mut ws, 1, Instant::now() + Duration::from_secs(20));
+    assert_eq!(lines_of(&first), ["a1"], "{first:?}");
+
+    seed_index_only(&client, db, 2, "b", s).await;
+    seed_labels_row(
+        &client,
+        db,
+        2,
+        r#"{"pod":"b","service_name":"checkout"}"#,
+        s,
+    )
+    .await;
+    // B joins and its probes find nothing.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Below the tail's position, which trails now by 5 s.
+    seed_samples(&client, db, &[(2, now_ns() - 7_000_000_000, "b1")]).await;
+    let got = collect_entries(&mut ws, 1, Instant::now() + Duration::from_secs(20));
+    assert_eq!(lines_of(&got), ["b1"], "{got:?}");
+    seed_samples(&client, db, &[(1, now_ns() - 1_000_000_000, "a2")]).await;
+    let got = collect_entries(&mut ws, 1, Instant::now() + Duration::from_secs(20));
+    assert_eq!(lines_of(&got), ["a2"], "{got:?}");
+    let extra = collect_entries(&mut ws, 1, Instant::now() + Duration::from_secs(1));
+    assert!(extra.is_empty(), "{extra:?}");
+    ws.close();
+    drop_db(db).await;
 }

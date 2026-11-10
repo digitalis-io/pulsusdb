@@ -89,6 +89,11 @@ impl TraceDispatch {
         self
     }
 
+    /// Issue #803: the first server failure this dispatcher's reads met.
+    pub(super) fn server_failure(&self) -> Option<pulsus_clickhouse::ServerFailure> {
+        self.client.server_failure()
+    }
+
     /// Executes one already-rendered SQL statement and returns its row
     /// stream.
     ///

@@ -18,8 +18,9 @@ use pulsus_read::TimeBounds;
 use crate::app::AppState;
 
 use super::encode;
+use super::engine::with_engine;
 use super::error::ApiError;
-use super::handlers::{engine_for, parse_bounds_ordered, read_form_pairs, tenant_of};
+use super::handlers::{parse_bounds_ordered, read_form_pairs, tenant_of};
 use super::params::{self, ParamError};
 use pulsus_model::Tenant;
 
@@ -83,14 +84,18 @@ async fn stats_impl(
     let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
 
-    let engine = engine_for(&state, tenant).await?;
-    if wants_explain(headers) {
-        let (stats, explain) = engine.stats_explained(&expr, bounds).await?;
-        Ok(encode::stats_response(stats, Some(explain)))
-    } else {
-        let stats = engine.stats(&expr, bounds).await?;
-        Ok(encode::stats_response(stats, None))
-    }
+    let explain = wants_explain(headers);
+    let expr = &expr;
+    let (stats, explain) = with_engine(&state, &tenant, |engine| async move {
+        if explain {
+            let (stats, explain) = engine.stats_explained(expr, bounds).await?;
+            Ok((stats, Some(explain)))
+        } else {
+            Ok((engine.stats(expr, bounds).await?, None))
+        }
+    })
+    .await?;
+    Ok(encode::stats_response(stats, explain))
 }
 
 /// Stats accepts a stream selector plus line filters only: a metric

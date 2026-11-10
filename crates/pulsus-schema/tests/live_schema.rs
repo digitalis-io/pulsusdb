@@ -1092,8 +1092,11 @@ async fn the_sample_tables_fingerprint_codec_is_zstd() {
         ("metric_landing", "CODEC(Delta(8), ZSTD(1))"),
         ("metric_samples", "CODEC(ZSTD(1))"),
         ("metric_samples_60s", "CODEC(ZSTD(1))"),
+        // Issue #800: the stages copy their level's columns, codec included.
+        ("metric_samples_60s_stage", "CODEC(ZSTD(1))"),
         ("metric_samples_7200s", "CODEC(ZSTD(1))"),
         ("metric_samples_720s", "CODEC(ZSTD(1))"),
+        ("metric_samples_720s_stage", "CODEC(ZSTD(1))"),
         ("metric_samples_86400s", "CODEC(ZSTD(1))"),
         ("metric_series", "CODEC(ZSTD(1))"),
     ]

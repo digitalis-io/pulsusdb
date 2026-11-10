@@ -705,6 +705,17 @@ impl MetricsEngine {
         self
     }
 
+    /// Issue #803: the first server failure this engine's reads met since
+    /// its client was bound.
+    pub fn server_failure(&self) -> Option<pulsus_clickhouse::ServerFailure> {
+        self.dispatch.server_failure()
+    }
+
+    /// Issue #803: saves what this engine's accepted request read into
+    /// state shared beyond it. The metrics engine keeps nothing, so this
+    /// does nothing.
+    pub fn commit(&self) {}
+
     /// Issue #499: the request's `lookback_delta`, in milliseconds, as the
     /// staleness lookback every plan of this engine uses.
     pub fn with_lookback_ms(mut self, lookback_ms: i64) -> Self {

@@ -15,8 +15,8 @@ use pulsus_model::{Tenant, tenant_from_headers};
 
 use crate::app::AppState;
 
+use super::engine::with_engine;
 use super::error::ApiError;
-use super::handlers::engine_for;
 use super::{legacy, params, search_response};
 
 /// `X-Pulsus-Explain: 1` (docs/api.md "Request headers"), issue #492.
@@ -116,14 +116,23 @@ async fn search_impl(
         pulsus_read::plan_search_request(&query, &search_params, &tables, read_config.max_depth)
             .map_err(ApiError::Plan)?;
 
-    let engine = engine_for(&state, tenant).await?;
-    if !wants_explain(headers) {
-        let output = engine.search_routed(&request).await?;
+    let explain = wants_explain(headers);
+    let request = &request;
+    let (output, explain) = with_engine(&state, &tenant, None, |engine| async move {
+        if !explain {
+            return Ok((engine.search_routed(request).await?, None));
+        }
+        // One execution that also captures the per-stage SQL — the same
+        // single-pass contract the logs route has, never a second run.
+        let (output, explain) = engine.search_routed_explained(request).await?;
+        Ok((output, Some(explain)))
+    })
+    .await?;
+    // Issue #803: the response is encoded from the accepted run only, so
+    // the counters encoding records count it once.
+    let Some(explain) = explain else {
         return Ok((StatusCode::OK, Json(search_response::render(&output))).into_response());
-    }
-    // One execution that also captures the per-stage SQL — the same
-    // single-pass contract the logs route has, never a second run.
-    let (output, explain) = engine.search_routed_explained(&request).await?;
+    };
     let mut body = search_response::render(&output);
     if let Some(obj) = body.as_object_mut() {
         obj.insert(

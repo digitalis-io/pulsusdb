@@ -19,8 +19,8 @@ use pulsus_model::{Tenant, tenant_from_headers};
 
 use crate::app::AppState;
 
+use super::engine::with_engine;
 use super::error::ApiError;
-use super::handlers::engine_for;
 use super::params::{self, MetricsForm};
 
 /// `GET /api/traces/v1/metrics/query_range`.
@@ -130,7 +130,14 @@ async fn metrics_impl(
     let plan = pulsus_read::plan_trace_metrics_routed(&query, &metrics_params, &ctx, &tables)
         .map_err(ApiError::Plan)?;
 
-    let engine = engine_for(&state, tenant).await?;
+    let plan = &plan;
+    let result = with_engine(&state, &tenant, None, |engine| async move {
+        Ok(match form {
+            MetricsForm::Range => engine.metrics_range_routed(plan).await?,
+            MetricsForm::Instant => engine.metrics_instant_routed(plan).await?,
+        })
+    })
+    .await?;
     // Issue #464 wave 2: the two routes return DIFFERENT proto messages —
     // `query_range` is `tempopb.QueryRangeResponse`, `query` is
     // `tempopb.QueryInstantResponse` (`pkg/tempopb/tempo.proto:339-355` @
@@ -138,14 +145,8 @@ async fn metrics_impl(
     // encoder for both emitted the range body on the instant route, which
     // the datasource's bare `jsonpb.Unmarshal` rejects outright.
     Ok(match form {
-        MetricsForm::Range => {
-            let result = engine.metrics_range_routed(&plan).await?;
-            super::metrics_response::encode_metrics(&result)
-        }
-        MetricsForm::Instant => {
-            let result = engine.metrics_instant_routed(&plan).await?;
-            super::metrics_response::encode_metrics_instant(&result)
-        }
+        MetricsForm::Range => super::metrics_response::encode_metrics(&result),
+        MetricsForm::Instant => super::metrics_response::encode_metrics_instant(&result),
     })
 }
 

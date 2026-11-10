@@ -20,8 +20,9 @@ use pulsus_read::{TimeBounds, VolumeQuery};
 use crate::app::AppState;
 
 use super::encode;
+use super::engine::with_engine;
 use super::error::ApiError;
-use super::handlers::{engine_for, parse_bounds_ordered, read_form_pairs, tenant_of};
+use super::handlers::{parse_bounds_ordered, read_form_pairs, tenant_of};
 use super::params::{self, ParamError};
 use pulsus_model::Tenant;
 
@@ -97,14 +98,18 @@ async fn volume_impl(
         target_labels,
     };
 
-    let engine = engine_for(&state, tenant).await?;
-    if wants_explain(headers) {
-        let (entries, explain) = engine.volume_explained(&expr, &q).await?;
-        Ok(encode::volume_response(entries, end_ns, Some(explain)))
-    } else {
-        let entries = engine.volume(&expr, &q).await?;
-        Ok(encode::volume_response(entries, end_ns, None))
-    }
+    let explain = wants_explain(headers);
+    let (expr, q) = (&expr, &q);
+    let (entries, explain) = with_engine(&state, &tenant, |engine| async move {
+        if explain {
+            let (entries, explain) = engine.volume_explained(expr, q).await?;
+            Ok((entries, Some(explain)))
+        } else {
+            Ok((engine.volume(expr, q).await?, None))
+        }
+    })
+    .await?;
+    Ok(encode::volume_response(entries, end_ns, explain))
 }
 
 /// Volume accepts a bare stream selector only: a metric query has no

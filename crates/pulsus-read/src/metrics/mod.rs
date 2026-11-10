@@ -100,6 +100,15 @@ mod series_where;
 pub mod sql;
 pub mod stats;
 
+/// Issue #803: the label and level passes against stub servers (P1, P2a,
+/// P2b).
+#[cfg(test)]
+pub(crate) mod pass_failure_tests;
+/// Issue #803: the stub ClickHouse the pass-failure tests run against.
+#[cfg(test)]
+#[path = "../../../pulsus-clickhouse/tests/common/stub_server.rs"]
+pub(crate) mod stub_server;
+
 /// The issue #240 capability token, re-exported so
 /// [`crate::logql::escape::ch_regex_anchored_promql_re2`]'s pinned
 /// signature can keep naming it as `crate::metrics::PromqlRe2Fallback`.

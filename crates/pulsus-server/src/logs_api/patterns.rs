@@ -19,8 +19,9 @@ use pulsus_read::TimeBounds;
 use crate::app::AppState;
 
 use super::encode;
+use super::engine::with_engine;
 use super::error::ApiError;
-use super::handlers::{engine_for, parse_bounds, read_form_pairs, tenant_of};
+use super::handlers::{parse_bounds, read_form_pairs, tenant_of};
 use super::params::{self, ParamError};
 use pulsus_model::Tenant;
 
@@ -107,14 +108,18 @@ async fn patterns_impl(
         return Ok(encode::patterns_response(Vec::new(), None));
     }
 
-    let engine = engine_for(&state, tenant).await?;
-    if wants_explain(headers) {
-        let (series, explain) = engine.patterns_explained(&expr, bounds, step_ns).await?;
-        Ok(encode::patterns_response(series, Some(explain)))
-    } else {
-        let series = engine.patterns(&expr, bounds, step_ns).await?;
-        Ok(encode::patterns_response(series, None))
-    }
+    let explain = wants_explain(headers);
+    let expr = &expr;
+    let (series, explain) = with_engine(&state, &tenant, |engine| async move {
+        if explain {
+            let (series, explain) = engine.patterns_explained(expr, bounds, step_ns).await?;
+            Ok((series, Some(explain)))
+        } else {
+            Ok((engine.patterns(expr, bounds, step_ns).await?, None))
+        }
+    })
+    .await?;
+    Ok(encode::patterns_response(series, explain))
 }
 
 /// Patterns accepts a bare stream selector only: a metric query has no log

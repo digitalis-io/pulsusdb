@@ -2234,7 +2234,7 @@ never treat it as zero cost.
 
 **A third trap, and it is the one that decided an architectural question.** Our reader sends
 `max_block_size = 4096` on every search statement — `TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096`
-(`crates/pulsus-read/src/traces/exec.rs:105`), set in `search_settings` (`:1365`) and inherited by
+(`crates/pulsus-read/src/traces/exec.rs:105`), set in `search_settings` (`:1408`) and inherited by
 `generator_settings` (`:3267` @ 1cdb3e5e). ClickHouse 26.3.29.7's own default is **65,409**
 (`SELECT value, default FROM system.settings WHERE name = 'max_block_size'` prints `65409 65409`).
 A measurement taken at the server default is a measurement of a system we do not run, and the
@@ -2281,7 +2281,7 @@ So a re-take at the default **refuses a statement the shipped reader would run**
 metered column by anywhere between 0% and 48% on the same statement. Two competent
 measurements of §9.7's headline figure landed a factor of 4.7 apart for exactly this reason, and
 neither was wrong about what it measured. `search_settings_pin_the_layer_1_budget_contract`
-(`crates/pulsus-read/src/traces/exec.rs:2673`) is what keeps 4,096 shipped: it asserts that the
+(`crates/pulsus-read/src/traces/exec.rs:2762`) is what keeps 4,096 shipped: it asserts that the
 rendered search settings contain the substring `max_block_size` and the substring `4096` — as two
 independent substring checks, not bound to each other, so it would not catch a different value
 arriving beside a stray `4096`.
@@ -2405,7 +2405,7 @@ beside the figures they govern rather than once here, and this list is the index
 | `optimize_aggregation_in_order` | **1**, named on the rows that need it | it is what lets the span-ordered index stream the aggregation instead of holding a hash table over every span-group. On the current index order it buys nothing, because `(trace_id, span_id)` is not a prefix of that sorting key |
 | `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:698` @ 1cdb3e5e), applied by `generator_settings` (`exec.rs:3267` @ 1cdb3e5e) |
 | `max_bytes_before_external_group_by` | **0** | shipped: the generator throws rather than spilling (`exec.rs:3267`) |
-| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:693` @ 1cdb3e5e), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:1360-1362`) |
+| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:693` @ 1cdb3e5e), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:1403-1405`) |
 | `min_bytes_for_wide_part` | **10485760** | pinned in the corpus recipe so the part format is reproducible; ClickHouse's own 26.3 default happens to be the same value, and neither trace `CREATE TABLE` pins it |
 
 **The rule this section follows: every metered figure carries its instrument beside the number.**
@@ -2439,7 +2439,7 @@ between two takes, is over statements and granules. Rows read and metered bytes 
 rather than checked, and they are outside it because they were measured to be, not because
 excluding them was convenient.**
 
-`search_settings_pin_the_layer_1_budget_contract` (`crates/pulsus-read/src/traces/exec.rs:2673`)
+`search_settings_pin_the_layer_1_budget_contract` (`crates/pulsus-read/src/traces/exec.rs:2762`)
 is what keeps 4,096 shipped, and it is worth knowing exactly how much it keeps: it asserts that the
 rendered search settings contain the substring `max_block_size` and the substring `4096`, as two
 independent checks that are not bound to each other. It would not catch a different block size
@@ -3054,7 +3054,7 @@ Code: 158. DB::Exception: Limit for rows or bytes to read exceeded,
 max rows: 50.00 million, current rows: 51.31 million: While executing MergeTreeSelect…
 ```
 
-`map_trace_read_error` turns 158 into `TooBroadReason::TraceScanBudgetRows` (`exec.rs:681`) and
+`map_trace_read_error` turns 158 into `TooBroadReason::TraceScanBudgetRows` (`exec.rs:710`) and
 `ReadError::QueryTooBroad(_)` is `422` (`traces_api/error.rs:371`), so **"it fits" is false at the
 level a user experiences** until `reader.traceql_scan_budget_rows` is raised as well. All five
 classes trip it, at 51.31 / 51.31 / 55.75 / 53.30 / 52.88 million rows in the order of the table
@@ -4056,7 +4056,7 @@ at line 11). The committed goldens below carry a join and **none is planned by t
 - `traces_spans_graph/clustered.sql` and `traces_spans_graph/single_node.sql`, one `ARRAY JOIN`
   line each, from `spans_graph_sql` (`crates/pulsus-read/src/traces/spans/graph.rs:154`), the
   service graph's statement since issue #599, called from
-  `crates/pulsus-read/src/traces/exec.rs:804` and nowhere else.
+  `crates/pulsus-read/src/traces/exec.rs:849` and nowhere else.
 - `traces_metrics/compare_outer_attr.sql`, `traces_metrics/compare_status.sql` and
   `traces_metrics/compare_status_window.sql`, seven join lines each. The first was added by issue
   [#559](https://github.com/digitalis-io/pulsusdb/issues/559) — a comparison whose OUTER filter is
@@ -5572,7 +5572,7 @@ Of the 652 citation occurrences the five artefacts make, 474 name a bare basenam
 
 The language fallback and the anchor rule disagree on 1 citations, all of them read one at a time. 1 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
-The citations where the fallback answers a file the citing prose does not describe are `exec.rs:1360-1362` in `docs/query-lowering.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
+The citations where the fallback answers a file the citing prose does not describe are `exec.rs:1403-1405` in `docs/query-lowering.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
 
 <!-- end generated -->
 

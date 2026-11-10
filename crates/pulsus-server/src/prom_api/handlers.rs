@@ -12,12 +12,12 @@ use axum::response::{IntoResponse, Response};
 use pulsus_model::Tenant;
 use pulsus_promql::parser::Expr;
 use pulsus_read::metrics::read_cache;
-use pulsus_read::{DataWindow, DiscoveryFilter, MetricQueryParams, MetricsEngine};
+use pulsus_read::{DataWindow, DiscoveryFilter, MetricQueryParams};
 
 use crate::app::AppState;
-use crate::chconfig;
 
 use super::encode;
+use super::engine::{EngineOptions, with_engine};
 use super::error::{ApiError, DeadlineProducer};
 use super::params::{self, ParamError};
 
@@ -37,36 +37,6 @@ fn wants_explain(headers: &HeaderMap) -> bool {
 fn tenant_of(headers: &HeaderMap) -> Result<Tenant, ApiError> {
     pulsus_model::tenant_from_headers(headers)
         .map_err(|_| ApiError::Param(ParamError::InvalidTenant))
-}
-
-/// Acquires the shared `Arc<ChPool>` and the constructed `Arc<LabelCache>`
-/// from `AppState` (mirrors `logs_api::handlers::engine_for`'s pattern:
-/// clone each `Option`/`OnceLock` slot out, never hold a lock across an
-/// `.await`) and builds a `MetricsEngine` over both — `503 unavailable`
-/// before either exists, matching `/ready`.
-async fn engine_for(state: &AppState) -> Result<MetricsEngine, ApiError> {
-    let pool = {
-        let guard = state.pool.read().await;
-        guard.clone()
-    };
-    let pool = pool.ok_or(ApiError::Unavailable)?;
-    let label_cache = state
-        .label_cache
-        .get()
-        .cloned()
-        .ok_or(ApiError::Unavailable)?;
-    // Issue #114: the consistency-config invariant is already enforced at
-    // config load, so this is unreachable in the real binary; a failure maps
-    // to the existing 503 "not serving" semantics.
-    chconfig::metrics_engine(
-        pool,
-        label_cache,
-        &state.config,
-        state.eval_gate.clone(),
-        std::sync::Arc::clone(&state.rollup_levels),
-    )
-    .map(crate::request_id::tag)
-    .map_err(|_| ApiError::Unavailable)
 }
 
 /// Issue #471 M1: a POST's parameters are read from a MERGED view of the
@@ -225,10 +195,16 @@ async fn query_impl(
     if let Some(cache) = state.read_cache.get() {
         cache.record_bypass(read_cache::BypassReason::Instant);
     }
-    let work = async {
-        let engine = engine_with_lookback(&state, lookback_ms).await?;
-        run_query(&engine, tenant, &expr, query, &query_params, opts, at_ms).await
-    };
+    let work = run_query(
+        &state,
+        lookback_ms,
+        tenant,
+        &expr,
+        query,
+        &query_params,
+        opts,
+        at_ms,
+    );
     // `run_under_request_deadline` owns the strictly-shorter rule; the
     // handler cannot read a `Duration` out of a `RequestedTimeout`, so it
     // cannot install one itself.
@@ -307,20 +283,16 @@ async fn query_range_impl(
         step_ms,
     };
     let server_deadline = state.config.query_timeout.0;
-    let work = async {
-        let engine = engine_with_lookback(&state, lookback_ms).await?;
-        run_range_query(
-            &state,
-            engine,
-            tenant,
-            &expr,
-            query,
-            &query_params,
-            opts,
-            end_ms,
-        )
-        .await
-    };
+    let work = run_range_query(
+        &state,
+        lookback_ms,
+        tenant,
+        &expr,
+        query,
+        &query_params,
+        opts,
+        end_ms,
+    );
     match params::run_under_request_deadline(requested, server_deadline, work).await {
         Ok(res) => res,
         Err(expired) => Err(ApiError::Deadline(DeadlineProducer::RequestedTimeout(
@@ -357,25 +329,17 @@ fn query_options(
     ))
 }
 
-/// [`engine_for`], with the request's `lookback_delta` when it set one.
-async fn engine_with_lookback(
+/// Shared success path for `query`/`query_range`: one read request (issue
+/// #803), with the request's `lookback_delta` when it set one, runs the
+/// query with or without the explain side channel (single execution either
+/// way), then the accepted result is encoded. `query` is the raw query text
+/// the caller parsed `expr` from — the annotations' position offsets index
+/// into exactly this string (issue #128, upstream
+/// `AsStrings(r.FormValue("query"), 10, 10)`).
+#[allow(clippy::too_many_arguments)]
+async fn run_query(
     state: &AppState,
     lookback_ms: Option<i64>,
-) -> Result<MetricsEngine, ApiError> {
-    let engine = engine_for(state).await?;
-    Ok(match lookback_ms {
-        Some(ms) => engine.with_lookback_ms(ms),
-        None => engine,
-    })
-}
-
-/// Shared success path for `query`/`query_range`: run with or without the
-/// explain side channel (single execution either way), then encode.
-/// `query` is the raw query text the caller parsed `expr` from — the
-/// annotations' position offsets index into exactly this string (issue
-/// #128, upstream `AsStrings(r.FormValue("query"), 10, 10)`).
-async fn run_query(
-    engine: &MetricsEngine,
     tenant: &Tenant,
     expr: &Expr,
     query: &str,
@@ -394,28 +358,27 @@ async fn run_query(
         limit: opts.limit,
         stats_requested: opts.stats_requested,
     };
-    if opts.explain {
-        let (result, annotations, plan_explain) =
-            engine.query_explained(tenant, expr, query_params).await?;
-        Ok(encode::query_response_annotated(
-            result,
-            Some(plan_explain),
-            at_ms,
-            query,
-            annotations,
-            shape,
-        ))
-    } else {
-        let (result, annotations) = engine.query(tenant, expr, query_params).await?;
-        Ok(encode::query_response_annotated(
-            result,
-            None,
-            at_ms,
-            query,
-            annotations,
-            shape,
-        ))
-    }
+    let explain = opts.explain;
+    let (result, annotations, plan_explain) =
+        with_engine(state, lookback_ms, |engine| async move {
+            if explain {
+                let (result, annotations, plan_explain) =
+                    engine.query_explained(tenant, expr, query_params).await?;
+                Ok((result, annotations, Some(plan_explain)))
+            } else {
+                let (result, annotations) = engine.query(tenant, expr, query_params).await?;
+                Ok((result, annotations, None))
+            }
+        })
+        .await?;
+    Ok(encode::query_response_annotated(
+        result,
+        plan_explain,
+        at_ms,
+        query,
+        annotations,
+        shape,
+    ))
 }
 
 /// Issue #778: `X-Pulsus-Read-Cache`, and with `hit` or `miss` the last
@@ -446,7 +409,7 @@ fn with_read_cache_headers(
 #[allow(clippy::too_many_arguments)]
 async fn run_range_query(
     state: &AppState,
-    engine: MetricsEngine,
+    lookback_ms: Option<i64>,
     tenant: &Tenant,
     expr: &Expr,
     query: &str,
@@ -461,7 +424,7 @@ async fn run_range_query(
             if let Some(c) = other {
                 c.record_bypass(read_cache::BypassReason::Explain);
             }
-            let res = run_query(&engine, tenant, expr, query, p, opts, at_ms).await?;
+            let res = run_query(state, lookback_ms, tenant, expr, query, p, opts, at_ms).await?;
             return Ok(with_read_cache_headers(
                 res,
                 read_cache::Header::Bypass,
@@ -469,38 +432,50 @@ async fn run_range_query(
             ));
         }
     };
-    let engine = engine.with_routing_span_ms(p.end_ms - p.start_ms);
-    let facts = engine.plan_facts(expr, p)?;
-    let key = read_cache::CacheKey::new(
-        tenant.clone(),
-        query,
-        p,
-        engine.lookback_ms(),
-        engine.resolution_ms(p),
-    );
-    let now = cache.now_ms();
-    let req = read_cache::RangeRequest {
-        key,
-        query,
-        params: *p,
-        facts,
-        max_samples: state.config.reader.promql_max_samples,
-        retention_floor_ms: state
-            .retention_days()
-            .map(|d| now - i64::from(d) * 86_400_000 + 86_400_000),
-        sweep_time_ms: state
-            .label_cache
-            .get()
-            .and_then(|c| c.sweep_time_ms(tenant)),
+    // Issue #803: the read cache runs inside the request's attempt, on the
+    // attempt's one engine; the answer is encoded after the request is
+    // accepted.
+    let engine_options = EngineOptions {
+        lookback_ms,
+        routing_span_ms: Some(p.end_ms - p.start_ms),
     };
-    let eval = |q: MetricQueryParams| {
-        let engine = &engine;
+    let answer = with_engine(state, engine_options, |engine| {
+        let cache = std::sync::Arc::clone(&cache);
         async move {
-            let (r, a, f) = engine.query_with_facts(tenant, expr, &q).await?;
-            Ok::<_, ApiError>((r, a, f.charged_samples))
+            let facts = engine.plan_facts(expr, p)?;
+            let key = read_cache::CacheKey::new(
+                tenant.clone(),
+                query,
+                p,
+                engine.lookback_ms(),
+                engine.resolution_ms(p),
+            );
+            let now = cache.now_ms();
+            let req = read_cache::RangeRequest {
+                key,
+                query,
+                params: *p,
+                facts,
+                max_samples: state.config.reader.promql_max_samples,
+                retention_floor_ms: state
+                    .retention_days()
+                    .map(|d| now - i64::from(d) * 86_400_000 + 86_400_000),
+                sweep_time_ms: state
+                    .label_cache
+                    .get()
+                    .and_then(|c| c.sweep_time_ms(tenant)),
+            };
+            let eval = |q: MetricQueryParams| {
+                let engine = &engine;
+                async move {
+                    let (r, a, f) = engine.query_with_facts(tenant, expr, &q).await?;
+                    Ok::<_, ApiError>((r, a, f.charged_samples))
+                }
+            };
+            read_cache::answer_range(&cache, req, eval, eval).await
         }
-    };
-    let answer = read_cache::answer_range(&cache, req, eval, eval).await?;
+    })
+    .await?;
     let shape = encode::ResponseShape {
         ordered: false,
         limit: opts.limit,
@@ -572,8 +547,11 @@ async fn labels_impl(
     let limit = params::parse_truncation_limit(params::get(&pairs, "limit"))?;
     let matches = params::get_all(&pairs, "match[]");
     let filters = parse_match_selectors(&matches)?;
-    let engine = engine_for(&state).await?;
-    let names = engine.label_names(tenant, &filters, window).await?;
+    let filters = &filters;
+    let names = with_engine(&state, None, |engine| async move {
+        Ok(engine.label_names(tenant, filters, window).await?)
+    })
+    .await?;
     let warn = truncated(&names, limit);
     Ok(encode::string_array_response(
         truncate(names, limit),
@@ -642,8 +620,11 @@ async fn label_values_impl(
     let limit = params::parse_truncation_limit(params::get(&pairs, "limit"))?;
     let matches = params::get_all(&pairs, "match[]");
     let filters = parse_match_selectors(&matches)?;
-    let engine = engine_for(&state).await?;
-    let values = engine.label_values(tenant, name, &filters, window).await?;
+    let filters = &filters;
+    let values = with_engine(&state, None, |engine| async move {
+        Ok(engine.label_values(tenant, name, filters, window).await?)
+    })
+    .await?;
     let warn = truncated(&values, limit);
     Ok(encode::string_array_response(
         truncate(values, limit),
@@ -703,8 +684,11 @@ async fn series_impl(
     let window = DataWindow { start_ms, end_ms };
     let limit = params::parse_truncation_limit(params::get(&pairs, "limit"))?;
     let filters = parse_match_selectors(&matches)?;
-    let engine = engine_for(&state).await?;
-    let data = engine.series(tenant, &filters, window).await?;
+    let filters = &filters;
+    let data = with_engine(&state, None, |engine| async move {
+        Ok(engine.series(tenant, filters, window).await?)
+    })
+    .await?;
     let warn = truncated(&data, limit);
     Ok(encode::series_response(
         truncate(data, limit),
@@ -745,10 +729,12 @@ async fn metadata_impl(
     let metric = params::metric(&pairs);
     let limit = params::parse_limit(params::get(&pairs, "limit"))?;
     let limit_per_metric = params::parse_limit_per_metric(params::get(&pairs, "limit_per_metric"))?;
-    let engine = engine_for(&state).await?;
-    let items = engine
-        .metadata(tenant, metric, limit, limit_per_metric)
-        .await?;
+    let items = with_engine(&state, None, |engine| async move {
+        Ok(engine
+            .metadata(tenant, metric, limit, limit_per_metric)
+            .await?)
+    })
+    .await?;
     Ok(encode::metadata_response(items))
 }
 
@@ -834,10 +820,13 @@ async fn exemplars_impl(
             matchers,
         })
         .collect();
-    let engine = engine_for(&state).await?;
-    let answer = engine
-        .exemplars(tenant, &filters, DataWindow { start_ms, end_ms })
-        .await?;
+    let filters = &filters;
+    let answer = with_engine(&state, None, |engine| async move {
+        Ok(engine
+            .exemplars(tenant, filters, DataWindow { start_ms, end_ms })
+            .await?)
+    })
+    .await?;
     Ok(encode::query_exemplars_response(Some(answer)))
 }
 
@@ -907,8 +896,10 @@ async fn status_tsdb_impl(
     pairs: &[(String, String)],
 ) -> Result<Response, ApiError> {
     let limit = params::parse_tsdb_limit(params::get(pairs, "limit"))?;
-    let engine = engine_for(&state).await?;
-    let status = engine.tsdb_status(tenant, limit).await?;
+    let status = with_engine(&state, None, |engine| async move {
+        Ok(engine.tsdb_status(tenant, limit).await?)
+    })
+    .await?;
     Ok(encode::status_tsdb_response(status))
 }
 

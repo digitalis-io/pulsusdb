@@ -1393,7 +1393,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `{"totalJobs":1}` into the "Raw response" cell. The **streaming** search
   path renders the pair as a progress gauge (`src/streaming.ts:289-320`),
   but PulsusDB mounts no streaming search route
-  (`crates/pulsus-server/src/traces_api/mod.rs:96-123`), so that reading is
+  (`crates/pulsus-server/src/traces_api/mod.rs:97-124`), so that reading is
   unreachable for us.
 
 - **What a consumer loses.** A client reading the pair as "shards

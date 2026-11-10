@@ -226,6 +226,50 @@ fn the_three_removed_traceql_environment_variables_are_ignored() {
     support::clear_all();
 }
 
+/// Issue #803: an unknown `read_spread` — from YAML or from
+/// `PULSUS_READ_SPREAD` — fails config load naming the offending value and
+/// the accepted set. The default is `all`.
+#[test]
+fn an_unknown_read_spread_is_rejected_from_yaml_and_env() {
+    let _guard = support::lock_env();
+    support::clear_all();
+
+    assert_eq!(
+        pulsus_config::Config::default().read_spread,
+        pulsus_config::ReadSpread::All,
+        "the documented default is all"
+    );
+
+    let path = support::write_temp_yaml("unknown-read-spread", "read_spread: nearest\n");
+    match pulsus_config::load(Some(&path), None) {
+        Err(err @ pulsus_config::ConfigError::Yaml { .. }) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("nearest"),
+                "message must name the offending value: {msg}"
+            );
+        }
+        other => panic!("expected a Yaml error for an unknown read_spread, got {other:?}"),
+    }
+    let _ = std::fs::remove_file(&path);
+
+    support::set("PULSUS_READ_SPREAD", "nearest");
+    let loaded = pulsus_config::load(None, None);
+    // SAFETY: see `support::clear_all`; the guard is held.
+    unsafe { std::env::remove_var("PULSUS_READ_SPREAD") };
+    match loaded {
+        Err(pulsus_config::ConfigError::Env { var, msg }) => {
+            assert_eq!(var, "PULSUS_READ_SPREAD");
+            assert!(
+                msg.contains("nearest") && msg.contains("one of: all, zone"),
+                "message must name the value and the accepted set: {msg}"
+            );
+        }
+        other => panic!("expected an Env error for an unknown read_spread, got {other:?}"),
+    }
+    support::clear_all();
+}
+
 /// Issue #311: an unknown `reader.template_timezone` — from YAML or from
 /// `PULSUS_TEMPLATE_TIMEZONE` — fails config load naming the offending
 /// value. There is deliberately NO fallback: a server that silently

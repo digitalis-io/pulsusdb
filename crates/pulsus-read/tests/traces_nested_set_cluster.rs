@@ -1390,6 +1390,10 @@ async fn the_service_graph_answers_over_two_shards() {
         .with_graph_target_cache(cache.clone())
         .with_statement_prefix(&prefix);
         let graph = reader.service_graph(window).await.expect("C3 answers");
+        // Issue #803: the target reaches the shared cache only through the
+        // accepted engine's commit, which the server's `with_engine` makes
+        // after a request is accepted.
+        reader.commit();
         assert_eq!(calls_of(&graph), c1_edges(), "C3 request {n}");
         settle_query_log(
             &[&shard1],
