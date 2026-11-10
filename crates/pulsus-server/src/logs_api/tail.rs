@@ -3848,7 +3848,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_failover_error_that_is_not_a_server_failure_closes_at_once() {
+    async fn a_poll_error_that_is_not_a_server_failure_closes_at_once() {
         let run = run_failover(vec![
             (
                 Err(ReadError::QueryTooBroad(
