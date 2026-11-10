@@ -6209,6 +6209,8 @@ mod tests {
         // is the plain hash join.
         assert_eq!(s.get("distributed_product_mode"), Some("local"));
         assert_eq!(s.get("join_algorithm"), Some("hash"));
+        // U42 (issue #778, addendum 6): the sweep names its task.
+        assert_eq!(s.get("log_comment"), Some("background:label-cache-sweep"));
     }
 
     #[test]

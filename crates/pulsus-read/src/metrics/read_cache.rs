@@ -1380,12 +1380,17 @@ pub fn identity_sql(cluster: Option<&str>, db: &str) -> String {
     }
 }
 
+/// The settings of every statement the poll sends.
+pub fn poll_settings() -> QuerySettings {
+    QuerySettings::new()
+}
+
 async fn fetch<R: pulsus_clickhouse::ChRow>(
     client: &ChClient,
     sql: &str,
 ) -> Result<Vec<R>, pulsus_clickhouse::ChError> {
     use futures::StreamExt;
-    let mut stream = client.query_stream::<R>(sql, &QuerySettings::new()).await?;
+    let mut stream = client.query_stream::<R>(sql, &poll_settings()).await?;
     let mut out = Vec::new();
     while let Some(row) = stream.next().await {
         out.push(row?);
@@ -2643,5 +2648,85 @@ mod tests {
         assert_eq!(full, 1, "(b) full");
         assert_eq!(a.result, grid_matrix(&p, 1_000.0), "(b) the full answer");
         assert_ne!(a.header, Header::Hit, "(b)");
+    }
+
+    // --- addendum 6 -------------------------------------------------------------
+
+    #[test]
+    fn u41_the_poll_s_statements_name_their_task() {
+        assert_eq!(
+            poll_settings().get("log_comment"),
+            Some("background:read-cache-poll")
+        );
+    }
+
+    #[tokio::test]
+    async fn u40_an_answer_with_no_kept_series_is_not_stored() {
+        // (a) empty answers, float and histogram.
+        assert_eq!(
+            keep(&QueryResult::Matrix(vec![]), 0, 100, Vec::new(), 0, 0),
+            None,
+            "(a)"
+        );
+        assert_eq!(
+            keep(&QueryResult::MatrixHist(vec![]), 0, 100, Vec::new(), 0, 0),
+            None,
+            "(a) histogram"
+        );
+        // (b) a series with points only after c1, float and histogram.
+        let after = QueryResult::Matrix(vec![MatrixSeries {
+            labels: labels("a"),
+            points: vec![(110, 1.0), (120, 2.0)],
+        }]);
+        assert_eq!(keep(&after, 0, 100, Vec::new(), 0, 0), None, "(b)");
+        let after_hist = QueryResult::MatrixHist(vec![HistMatrixSeries {
+            labels: labels("a"),
+            points: vec![(110, HistOrFloat::Hist(hist()))],
+        }]);
+        assert_eq!(
+            keep(&after_hist, 0, 100, Vec::new(), 0, 0),
+            None,
+            "(b) histogram"
+        );
+        // Control: a kept point makes an entry.
+        let kept = QueryResult::Matrix(vec![MatrixSeries {
+            labels: labels("a"),
+            points: vec![(100, 1.0)],
+        }]);
+        assert!(keep(&kept, 0, 100, Vec::new(), 0, 0).is_some(), "control");
+        // (c) through `answer_range`: an empty answer, then 41 points.
+        let r = rig();
+        let end = r.now().div_euclid(15_000) * 15_000;
+        let p = params(end - 600_000, end, 15_000);
+        let q = "rate(x[1m])";
+        let full_calls = AtomicUsize::new(0);
+        let tail_calls = AtomicUsize::new(0);
+        let go = |answer: QueryResult| {
+            let full = |_: MetricQueryParams| {
+                full_calls.fetch_add(1, Ordering::SeqCst);
+                async move { R::Ok((answer, Annotations::new(), 0)) }
+            };
+            let tail = |q: MetricQueryParams| {
+                tail_calls.fetch_add(1, Ordering::SeqCst);
+                async move { R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 0)) }
+            };
+            answer_range(&r.cache, request(q, p, u64::MAX), full, tail)
+        };
+        let first = go(QueryResult::Matrix(vec![])).await.expect("answered");
+        assert_eq!(first.header, Header::Bypass, "(c) first header");
+        assert_eq!(
+            r.cache.snapshot().bypass_total[4],
+            ("no_fill", 1),
+            "(c) no_fill"
+        );
+        assert_eq!(r.cache.usage().1, 0, "(c) nothing stored");
+        let second = go(grid_matrix(&p, 0.0)).await.expect("answered");
+        assert_eq!(full_calls.load(Ordering::SeqCst), 2, "(c) full twice");
+        assert_eq!(tail_calls.load(Ordering::SeqCst), 0, "(c) no tail");
+        assert_eq!(second.header, Header::Miss, "(c) second header");
+        let QueryResult::Matrix(m) = &second.result else {
+            panic!("(c) a matrix")
+        };
+        assert_eq!(m[0].points.len(), 41, "(c) 41 points");
     }
 }

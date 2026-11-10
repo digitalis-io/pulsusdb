@@ -177,12 +177,17 @@ struct ShardsRow {
     shards: u32,
 }
 
+/// The settings of every statement the level discovery sends.
+pub(crate) fn level_settings() -> QuerySettings {
+    QuerySettings::new()
+}
+
 async fn fetch<R: pulsus_clickhouse::ChRow>(
     client: &ChClient,
     sql: &str,
 ) -> Result<Vec<R>, pulsus_clickhouse::ChError> {
     use futures::StreamExt;
-    let mut stream = client.query_stream::<R>(sql, &QuerySettings::new()).await?;
+    let mut stream = client.query_stream::<R>(sql, &level_settings()).await?;
     let mut out = Vec::new();
     while let Some(row) = stream.next().await {
         out.push(row?);
@@ -1014,6 +1019,16 @@ pub fn column_of(use_: RollupUse) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// U43 (issue #778, addendum 6): the level discovery's statements name
+    /// their task, so none is taken for a request's.
+    #[test]
+    fn u43_level_discovery_statements_name_their_task() {
+        assert_eq!(
+            super::level_settings().get("log_comment"),
+            Some("background:rollup-levels")
+        );
+    }
+
     use pulsus_promql::{DEFAULT_LOOKBACK_MS, parse, plan};
 
     use super::*;

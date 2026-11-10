@@ -1198,3 +1198,194 @@ async fn l24_a_forced_monotonicity_info_is_never_kept() {
         assert!(resp.through().is_none(), "hb {n}: no Through");
     }
 }
+
+// -- addendum 6 -------------------------------------------------------------
+
+/// One count from `sql`, sent with a `log_comment` of its own so it is not
+/// counted among the statements it counts.
+async fn count(c: &ChClient, sql: &str) -> u64 {
+    c.query_strings(sql, &QuerySettings::new().set("log_comment", "l25-count"))
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .remove(0)
+        .parse()
+        .expect("a count")
+}
+
+async fn server_now(c: &ChClient) -> String {
+    c.query_strings(
+        "SELECT toString(now64(6)) AS s",
+        &QuerySettings::new().set("log_comment", "l25-clock"),
+    )
+    .await
+    .expect("the server clock")
+    .remove(0)
+}
+
+/// L25: every statement the read cache's poll sends names its task, and no
+/// background task sends an initial SELECT without a `log_comment`; the
+/// label sweep and the level discovery name theirs too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l25_background_statements_name_their_task() {
+    skip_unless_live!();
+    let a_port: u16 = 31_475;
+    let db = live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l25_it")).await;
+    let c = client(db.name()).await;
+    let started = server_now(&c).await;
+    let _a = Server::spawn(a_port, &db, "64MiB", &[]);
+    let from = server_now(&c).await;
+    std::thread::sleep(Duration::from_secs(12));
+    let to = server_now(&c).await;
+    exec(&c, "SYSTEM FLUSH LOGS").await;
+    let d = db.name();
+    let in_window = |extra: &str| {
+        format!(
+            "SELECT toString(count()) AS s FROM system.query_log \
+             WHERE type = 'QueryFinish' AND query_kind = 'Select' AND current_database = '{d}' \
+               AND query_start_time_microseconds > toDateTime64('{from}', 6) \
+               AND query_start_time_microseconds < toDateTime64('{to}', 6) AND {extra}"
+        )
+    };
+    let since_start = |tag: &str| {
+        format!(
+            "SELECT toString(count()) AS s FROM system.query_log \
+             WHERE type = 'QueryFinish' AND current_database = '{d}' \
+               AND query_start_time_microseconds > toDateTime64('{started}', 6) \
+               AND log_comment = '{tag}'"
+        )
+    };
+    let poll = count(&c, &in_window("log_comment = 'background:read-cache-poll'")).await;
+    let unnamed = count(
+        &c,
+        &in_window("is_initial_query AND log_comment = '' AND query != 'SELECT 1'"),
+    )
+    .await;
+    let sweep = count(&c, &since_start("background:label-cache-sweep")).await;
+    let levels = count(&c, &since_start("background:rollup-levels")).await;
+    assert!(poll >= 2, "L25: the poll's statements in 12 s: {poll}");
+    assert_eq!(unnamed, 0, "L25: initial SELECTs with no log_comment");
+    assert!(sweep >= 1, "L25: the label sweep's statements: {sweep}");
+    assert!(
+        levels >= 1,
+        "L25: the level discovery's statements: {levels}"
+    );
+}
+
+/// L26: an answer with no series is not kept, so a series the label cache
+/// lists only later is shown in full once it does (the e2e naming
+/// scenario's push and query). C's first request is made after one of its
+/// label sweeps and before the next, which the sweep counter confirms; an
+/// attempt that misses that window is repeated with a new series.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l26_an_empty_answer_is_not_kept() {
+    skip_unless_live!();
+    let b_port: u16 = 31_476;
+    let c_port: u16 = 31_477;
+    let db = live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l26_it")).await;
+    stop_levels(&db).await;
+    let b = Server::spawn(b_port, &db, "0", &[]);
+    let c = Server::spawn(c_port, &db, "64MiB", &[("PULSUS_CACHE_TTL", "20s")]);
+    let sweeps = || c.metric("pulsus_label_cache_refreshes_total");
+    // Tenant `a`'s label cache on C is swept from its first request on.
+    let warm = http(
+        c.port,
+        "GET",
+        "/api/v1/query?query=rc_new_total",
+        &[("X-Scope-OrgID", "a")],
+        b"",
+    );
+    assert_eq!(warm.status, 200, "L26: C's first request for tenant a");
+    let mut attempt = 0;
+    let (q, start, end) = loop {
+        attempt += 1;
+        assert!(
+            attempt <= 4,
+            "L26: no attempt fell between two of C's sweeps with tenant a's cache warm"
+        );
+        // Just after a sweep of C.
+        let before = sweeps();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while sweeps() == before {
+            assert!(
+                Instant::now() < deadline,
+                "L26: C did not sweep within 30 s"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let swept = sweeps();
+        let run = format!("l26-{attempt}");
+        let end = (now_ms() - MINUTE).div_euclid(STEP) * STEP;
+        let points: Vec<(i64, f64)> = (0..=44)
+            .map(|k| (end - 11 * MINUTE + k * STEP, (k * 3) as f64))
+            .collect();
+        push_series(
+            b.port,
+            "a",
+            labels(
+                "rc_new_total",
+                &[("run", run.clone()), ("region", "eu".to_string())],
+            ),
+            points,
+        );
+        let q = format!("sum by (region) (rate(rc_new_total{{run=\"{run}\"}}[1m]))");
+        let missed = label_misses(&c);
+        let first = Range::new(&q, end - 10 * MINUTE, end, STEP).send(c.port);
+        assert_eq!(first.status, 200, "L26: C's first request");
+        if sweeps() != swept || label_misses(&c) != missed {
+            // C swept during the request, or its label cache did not answer
+            // it: the series may be listed. Again with a new series.
+            continue;
+        }
+        assert_eq!(
+            points_of(&first.body),
+            None,
+            "L26: C's first answer has no series"
+        );
+        assert_eq!(first.cache(), "bypass", "L26: C's first header");
+        break (q, end - 10 * MINUTE, end);
+    };
+    let range = Range::new(&q, start, end, STEP);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let want = loop {
+        let rb = range.send(b.port);
+        assert_eq!(rb.status, 200, "L26: B");
+        if points_of(&rb.body) == Some(41) {
+            break rb.body;
+        }
+        assert!(Instant::now() < deadline, "L26: B never answered 41 points");
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let rc = range.send(c.port);
+        if rc.body == want {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "L26: within 25 s C's body never equalled B's: header {}, points {:?}",
+            rc.cache(),
+            points_of(&rc.body)
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Every request the label cache did not answer, by any reason.
+fn label_misses(s: &Server) -> u64 {
+    http(s.port, "GET", "/metrics", &[], b"")
+        .body
+        .lines()
+        .filter(|l| l.starts_with("pulsus_label_cache_misses_total{"))
+        .filter_map(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())
+        .sum::<f64>() as u64
+}
+
+/// The points of a range answer's one series; `None` when it has none.
+fn points_of(body: &str) -> Option<usize> {
+    let v: serde_json::Value = serde_json::from_str(body).expect("a JSON answer");
+    let result = v["data"]["result"].as_array().expect("a result array");
+    result
+        .first()
+        .map(|s| s["values"].as_array().map_or(0, Vec::len))
+}
