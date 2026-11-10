@@ -802,6 +802,9 @@ async fn producer_loop<F: TailFetcher>(
     let recheck = Duration::from_nanos(u64::try_from(cfg.catch_up_recheck_ns).unwrap_or(0));
     let mut waiting: Vec<(Fingerprint, Instant)> = Vec::new();
     let mut next_probe = Instant::now();
+    // Joined streams not yet probed: their first probe runs at once, before
+    // any idle sleep, whatever the recheck timer says.
+    let mut unprobed: Vec<Fingerprint> = Vec::new();
     let mut catch_up: Option<CatchUp> = None;
     loop {
         if *shutdown.borrow() || *cancel.borrow() {
@@ -882,14 +885,21 @@ async fn producer_loop<F: TailFetcher>(
             let mut all = std::mem::take(&mut waiting);
             expire(&mut fetcher, &mut all, &mut waiting);
             waiting = all;
-            if !waiting.is_empty() && Instant::now() >= next_probe {
+            unprobed.retain(|fp| waiting.iter().any(|(w, _)| w == fp));
+            let first_probe = !unprobed.is_empty();
+            if !waiting.is_empty() && (first_probe || Instant::now() >= next_probe) {
                 let ceiling = TailCeiling::of(state.lower().0);
-                let fps: Vec<Fingerprint> = waiting.iter().map(|(fp, _)| *fp).collect();
+                let fps: Vec<Fingerprint> = if first_probe {
+                    std::mem::take(&mut unprobed)
+                } else {
+                    waiting.iter().map(|(fp, _)| *fp).collect()
+                };
                 let result = tokio::select! {
                     _ = cancelled(&mut shutdown, &mut cancel) => break,
                     r = fetcher.catch_up_first_lines(&fps, cfg.start_ns, ceiling) => r,
                 };
-                next_probe = Instant::now() + cfg.poll_interval;
+                // A first probe never brings the next recheck forward.
+                next_probe = next_probe.max(Instant::now() + cfg.poll_interval);
                 match result {
                     Ok(first) => {
                         if let Some(min_first) = first.iter().map(|(_, ts)| *ts).min() {
@@ -969,6 +979,7 @@ async fn producer_loop<F: TailFetcher>(
         if !page.joined.is_empty() {
             fetcher.deadline_set(deadline);
         }
+        unprobed.extend(page.joined.iter().copied());
         waiting.extend(
             std::mem::take(&mut page.joined)
                 .into_iter()
@@ -986,6 +997,7 @@ async fn producer_loop<F: TailFetcher>(
         // or more backlog slices ahead) re-poll immediately.
         if exhausted
             && live
+            && unprobed.is_empty()
             && sleep_or_cancelled(&mut shutdown, &mut cancel, cfg.poll_interval).await
         {
             break;
@@ -2599,7 +2611,8 @@ mod tests {
         Slow(Duration, CatchUpPage),
         /// Never answered.
         Hang,
-        Fail(ReadError),
+        /// Fails after this long.
+        Fail(Duration, ReadError),
     }
 
     type PollScript = Box<dyn FnMut(usize, TailLower, i64) -> TailPage + Send>;
@@ -2706,7 +2719,10 @@ mod tests {
                     Ok(p)
                 }
                 CatchStep::Hang => std::future::pending().await,
-                CatchStep::Fail(e) => Err(e),
+                CatchStep::Fail(d, e) => {
+                    tokio::time::sleep(d).await;
+                    Err(e)
+                }
             }
         }
 
@@ -3047,10 +3063,16 @@ mod tests {
         let fetcher = ScriptedFetcher::new(
             h1_polls,
             move |_, _| vec![(fpn(2), start + 1)],
+            // The failure comes 50 ms late: a fatal error closes the
+            // connection, and a frame queued just before it can lose the
+            // writer's race with the close, which is not what this pins.
             |_| {
-                CatchStep::Fail(ReadError::PipelineInvalid {
-                    reason: "catch-up failed".to_string(),
-                })
+                CatchStep::Fail(
+                    Duration::from_millis(50),
+                    ReadError::PipelineInvalid {
+                        reason: "catch-up failed".to_string(),
+                    },
+                )
             },
         );
         let run = ScriptedRun::start(fetcher, cfg);
