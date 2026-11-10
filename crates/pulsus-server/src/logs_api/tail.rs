@@ -377,6 +377,11 @@ trait TailFetcher: Send + 'static {
 
     /// Admits `fps` to the main scan (issue #804).
     fn admit(&mut self, _fps: &[Fingerprint]) {}
+
+    /// Test seam: the deadline the producer gave the streams a poll
+    /// reported joined.
+    #[cfg(test)]
+    fn deadline_set(&mut self, _deadline: Instant) {}
 }
 
 struct EngineFetcher {
@@ -960,6 +965,10 @@ async fn producer_loop<F: TailFetcher>(
         // Read after the poll has returned, so a slow poll does not use up
         // a joined stream's time.
         let deadline = Instant::now() + recheck;
+        #[cfg(test)]
+        if !page.joined.is_empty() {
+            fetcher.deadline_set(deadline);
+        }
         waiting.extend(
             std::mem::take(&mut page.joined)
                 .into_iter()
@@ -2577,6 +2586,8 @@ mod tests {
             ceiling: TailCeiling,
         },
         Admit(Vec<Fingerprint>),
+        /// The deadline the producer set for the streams just joined.
+        Deadline(Instant),
     }
 
     type CallLog = Arc<Mutex<Vec<(Instant, Call)>>>;
@@ -2701,6 +2712,10 @@ mod tests {
 
         fn admit(&mut self, fps: &[Fingerprint]) {
             self.record(Call::Admit(fps.to_vec()));
+        }
+
+        fn deadline_set(&mut self, deadline: tokio::time::Instant) {
+            self.record(Call::Deadline(deadline.into_std()));
         }
     }
 
@@ -2837,7 +2852,7 @@ mod tests {
     fn statements_after(calls: &[(Instant, Call)], from: usize) -> Vec<(Instant, Call)> {
         calls[from + 1..]
             .iter()
-            .filter(|(_, c)| !matches!(c, Call::PollDone { .. }))
+            .filter(|(_, c)| !matches!(c, Call::PollDone { .. } | Call::Deadline(_)))
             .cloned()
             .collect()
     }
@@ -3176,6 +3191,17 @@ mod tests {
         );
     }
 
+    /// The deadline the producer recorded for the first joined stream.
+    fn producer_deadline(calls: &[(Instant, Call)]) -> Instant {
+        calls
+            .iter()
+            .find_map(|(_, c)| match c {
+                Call::Deadline(d) => Some(*d),
+                _ => None,
+            })
+            .expect("the producer set a deadline")
+    }
+
     /// H8 (issue #804): no probe starts at or after the stream's deadline,
     /// so a line readable only after it is neither read nor sent.
     #[tokio::test(flavor = "multi_thread")]
@@ -3186,8 +3212,7 @@ mod tests {
         let fetcher = ScriptedFetcher::new(
             h1_polls,
             move |_, log| {
-                let deadline = joined_at(log) + Duration::from_millis(50);
-                if Instant::now() < deadline {
+                if Instant::now() < producer_deadline(log) {
                     Vec::new()
                 } else {
                     vec![(fpn(2), start + 1)]
@@ -3200,7 +3225,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let (calls, lines) = run.stop().await;
         assert!(has_admit(&calls), "stream 2 is admitted: {calls:#?}");
-        let deadline = joined_at(&calls) + Duration::from_millis(50);
+        let deadline = producer_deadline(&calls);
         for (t, c) in &calls {
             if matches!(c, Call::FirstLines { .. }) {
                 assert!(
@@ -3220,6 +3245,44 @@ mod tests {
             "{calls:#?}"
         );
         assert!(!lines.iter().any(|l| l == "B1"), "{lines:?}");
+    }
+
+    /// H11 (issue #804, code review round 1): a joined stream's first probe
+    /// runs before the producer idles, so a poll interval that outlasts
+    /// the stream's bound cannot admit it before its readable lines below
+    /// the cursor are read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_joined_stream_is_probed_before_an_idle_interval_that_outlasts_its_bound() {
+        let mut cfg = test_cfg();
+        cfg.poll_interval = Duration::from_millis(200);
+        cfg.catch_up_recheck_ns = 100_000_000;
+        let start = cfg.start_ns;
+        let fetcher = ScriptedFetcher::new(
+            h1_polls,
+            move |_, _| vec![(fpn(2), start + 1)],
+            |_| CatchStep::Page(catch_page(&["B1"], 1, None, &[2])),
+        );
+        let run = ScriptedRun::start(fetcher, cfg);
+        run.wait_for(Duration::from_secs(2), has_admit).await;
+        let (calls, lines) = run.stop().await;
+        let joined = joining_poll(&calls).expect("poll 2 reported stream 2 joined");
+        let first = calls[joined..]
+            .iter()
+            .position(|(_, c)| matches!(c, Call::FirstLines { .. }))
+            .map(|i| i + joined);
+        let admit = calls
+            .iter()
+            .position(|(_, c)| *c == Call::Admit(vec![fpn(2)]));
+        assert!(
+            first.is_some() && admit.is_some() && first < admit,
+            "the stream is probed before it is admitted: {calls:#?}"
+        );
+        assert_eq!(
+            count(&calls, |c| matches!(c, Call::CatchUp { .. })),
+            1,
+            "{calls:#?}"
+        );
+        assert_eq!(lines, ["A1", "A2", "B1"]);
     }
 
     /// H9 (issue #804): a catch-up page that returns after the deadline is
