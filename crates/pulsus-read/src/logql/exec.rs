@@ -4405,10 +4405,7 @@ impl LogQlEngine {
                     last_full_scan_lower_ns: spec_start_ns(&params.spec),
                 })
             }
-            Plan::Metric(_) | Plan::MetricBinary(_) => Err(ReadError::PipelineInvalid {
-                reason: "tail requires a log stream query (metric queries cannot be tailed)"
-                    .to_string(),
-            }),
+            Plan::Metric(_) | Plan::MetricBinary(_) => Err(tail_needs_a_log_query()),
         }
     }
 
@@ -4574,10 +4571,7 @@ impl LogQlEngine {
         }
         match plan::plan(&setup.expr, &qp, &self.config.plan_ctx(&self.tenant))? {
             Plan::Streams(sp) => Ok(sp.stage1_sql),
-            Plan::Metric(_) | Plan::MetricBinary(_) => Err(ReadError::PipelineInvalid {
-                reason: "tail requires a log stream query (metric queries cannot be tailed)"
-                    .to_string(),
-            }),
+            Plan::Metric(_) | Plan::MetricBinary(_) => Err(tail_needs_a_log_query()),
         }
     }
 
@@ -4793,6 +4787,15 @@ pub fn commit_tail_attempt(setup: &mut TailSetup, attempt: TailAttempt) -> TailP
         page.joined = attempt.joined;
     }
     page
+}
+
+/// A tail planned to a metric query: the setup refuses it, and the
+/// full-span stage 1 (issue #804) replans the same expression, so it
+/// cannot meet one.
+fn tail_needs_a_log_query() -> ReadError {
+    ReadError::PipelineInvalid {
+        reason: "tail requires a log stream query (metric queries cannot be tailed)".to_string(),
+    }
 }
 
 /// The `start` bound of a [`QuerySpec`] (the `at` instant for an instant

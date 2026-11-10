@@ -1227,25 +1227,6 @@ pub fn stage3_keyset_with_rx(
     sql
 }
 
-/// S4 of the live tail (issue #804): each stream in `fingerprints` that
-/// has a line in `window`, with its earliest timestamp. It reads only the
-/// `fingerprint` and `timestamp_ns` columns of those streams' granules.
-pub fn tail_first_lines(
-    tenant: &Tenant,
-    samples_table: &str,
-    services: &[CheckedLiteral],
-    fingerprints: &[FpLiteral],
-    window: TimeWindow,
-) -> String {
-    let t = tenant.sql_literal();
-    let service_pred = service_predicate(services);
-    let fp_list = fp_list(fingerprints);
-    let TimeWindow { start_ns, end_ns } = window;
-    format!(
-        "SELECT fingerprint, min(timestamp_ns) AS first_ns\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE org_id = {t} AND fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}\nGROUP BY fingerprint"
-    )
-}
-
 /// The `/api/logs/v1/stats` rollup-served aggregation (issue #74, no line
 /// filter): zero body reads — `sum(count)`/`sum(bytes)` off
 /// `log_metrics_<res>` (PK `(fingerprint, bucket_ns)`), `streams` as
@@ -2989,6 +2970,25 @@ pub(in crate::logql) fn fp_array(fingerprints: &[FpLiteral]) -> String {
     pulsus_model::FpArray(fingerprints).to_string()
 }
 
+/// S4 of the live tail (issue #804): each stream in `fingerprints` that
+/// has a line in `window`, with its earliest timestamp. It reads only the
+/// `fingerprint` and `timestamp_ns` columns of those streams' granules.
+pub fn tail_first_lines(
+    tenant: &Tenant,
+    samples_table: &str,
+    services: &[CheckedLiteral],
+    fingerprints: &[FpLiteral],
+    window: TimeWindow,
+) -> String {
+    let t = tenant.sql_literal();
+    let service_pred = service_predicate(services);
+    let fp_list = fp_list(fingerprints);
+    let TimeWindow { start_ns, end_ns } = window;
+    format!(
+        "SELECT fingerprint, min(timestamp_ns) AS first_ns\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE org_id = {t} AND fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}\nGROUP BY fingerprint"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3006,34 +3006,6 @@ mod tests {
     /// expectations below carry that text instead. The property under test
     /// — the builder appends each fragment behind its own `AND` — is
     /// unchanged.
-    /// Issue #804 U2: the live tail's S4 renders one row per stream, the
-    /// earliest timestamp of each, over exactly the window given.
-    #[test]
-    fn tail_first_lines_renders_one_row_per_stream() {
-        let sql = tail_first_lines(
-            &Tenant::from_header(None, false).expect("the empty tenant"),
-            "log_samples",
-            &[literal("checkout")],
-            &[
-                Fingerprint::from_raw(3).sql_literal(),
-                Fingerprint::from_raw(9).sql_literal(),
-            ],
-            TimeWindow {
-                start_ns: 100,
-                end_ns: 200,
-            },
-        );
-        assert_eq!(
-            sql,
-            "SELECT fingerprint, min(timestamp_ns) AS first_ns\n\
-             FROM log_samples\n\
-             PREWHERE service = 'checkout'\n\
-             WHERE org_id = '' AND fingerprint IN ('3', '9')\n  \
-             AND timestamp_ns > 100 AND timestamp_ns <= 200\n\
-             GROUP BY fingerprint"
-        );
-    }
-
     fn err_line_filter() -> CheckedFragment {
         crate::logql::predicate::line_filter(&pulsus_logql::LineFilter {
             op: pulsus_logql::LineFilterOp::Contains,
@@ -6112,4 +6084,32 @@ mod tests {
         "ARRAY JOIN range(k0, least(k1, 9)) AS k",
         "WHERE p > 0",
     ];
+
+    /// Issue #804 U2: the live tail's S4 renders one row per stream, the
+    /// earliest timestamp of each, over exactly the window given.
+    #[test]
+    fn tail_first_lines_renders_one_row_per_stream() {
+        let sql = tail_first_lines(
+            &Tenant::from_header(None, false).expect("the empty tenant"),
+            "log_samples",
+            &[literal("checkout")],
+            &[
+                Fingerprint::from_raw(3).sql_literal(),
+                Fingerprint::from_raw(9).sql_literal(),
+            ],
+            TimeWindow {
+                start_ns: 100,
+                end_ns: 200,
+            },
+        );
+        assert_eq!(
+            sql,
+            "SELECT fingerprint, min(timestamp_ns) AS first_ns\n\
+             FROM log_samples\n\
+             PREWHERE service = 'checkout'\n\
+             WHERE org_id = '' AND fingerprint IN ('3', '9')\n  \
+             AND timestamp_ns > 100 AND timestamp_ns <= 200\n\
+             GROUP BY fingerprint"
+        );
+    }
 }
