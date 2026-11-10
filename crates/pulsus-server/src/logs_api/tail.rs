@@ -23,23 +23,18 @@
 //! occurrence-count keyset tuple) moves only on fetched rows and resumes
 //! a `LIMIT`-split tie group exactly-once via the SQL `OFFSET`.
 //!
-//! **Topology** (plan v3 D3/D4): a producer task (poll loop) and the
-//! socket-owning writer are joined by a bounded evicting [`FrameBuf`] —
-//! saturation (a client not draining) evicts the OLDEST frame into a
-//! persistent cumulative drop accumulator, reported on the wire as a
-//! capped `dropped_entries` sample plus the exact `dropped_total`. A
-//! shared two-way `watch` cancellation (process shutdown + per-connection
-//! cancel) races EVERY await — engine polls, Text sends (additionally
-//! bounded by `tail_send_timeout`), and the best-effort Close — so
-//! neither a wedged ClickHouse read nor a non-reading client can stall
-//! graceful shutdown. Either task's exit cancels its sibling; the writer
-//! joins the producer and owns the connection-slot permit for the
-//! socket's lifetime.
+//! **Topology** (issue #806): A producer task sends pages and a fatal
+//! error, in order, over one channel to the writer, which alone owns the
+//! frame queue (bounded, evicting the oldest into a drop accumulator), the
+//! error, the shutdown drain and the socket. The writer's decisions are
+//! the pure `ConnState`; every socket step is preceded by its deadline
+//! check, and a Close is never sent after a Text that was handed over and
+//! is not known to be written. The reader only reports the client's close.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -58,7 +53,7 @@ use pulsus_read::{
     StreamResult, TAIL_CATCH_UP_RECHECK_NS, TAIL_REGISTRATION_GRACE_NS, TailCeiling, TailLower,
     TailPage, TailSetup,
 };
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 
 use crate::app::AppState;
 
@@ -518,8 +513,12 @@ fn may_fail_over<F: TailFetcher>(fetcher: &mut F, failed_over: &mut bool) -> boo
     }
 }
 
-/// The outbound half of the split socket — axum's `SplitSink` in
-/// production, a fake sink in the hermetic tests.
+/// The outbound half of the split socket, in the three steps of a Text
+/// send (issue #806): `ready`, `start`, `flush`. The writer checks the
+/// step's deadline before each, and marks a Text half sent from `start`
+/// until `flush` returns, so it never sends a Close that would first write
+/// the rest of it. [`SinkSender`] in production, a scripted socket in the
+/// tests.
 trait TailSender: Send + 'static {
     /// Waits until the socket can take a frame. Hands nothing over, so it
     /// can be cancelled.
@@ -539,11 +538,11 @@ trait TailSender: Send + 'static {
 }
 
 /// The inbound half (review round 1, medium): a dedicated reader task
-/// awaits `closed()` INDEPENDENTLY of the writer, so a client Close (or
-/// transport error) reaches the shared cancellation even while the
-/// writer sits inside a backpressured `send_text` — the in-flight send
-/// is then cancelled via the watch, releasing the producer and the
-/// connection permit immediately instead of after `tail_send_timeout`.
+/// awaits `closed()` independently of the writer, so a client Close (or
+/// transport error) sets the cancellation even while the writer waits on
+/// a backpressured socket step, which then stops, releasing the producer
+/// and the connection permit at once instead of after
+/// `tail_send_timeout`.
 trait TailReceiver: Send + 'static {
     /// Resolves when the client sent Close or the transport ended/errored
     /// (other inbound frames — ping/pong/text — are ignored).
@@ -679,9 +678,6 @@ struct FrameBuf {
     frames: VecDeque<Vec<StreamResult>>,
     dropped: DroppedAcc,
     cap: usize,
-    /// A fatal producer error (e.g. "query too broad" from a stream-cap
-    /// breach); the writer drains, then closes with this reason.
-    error: Option<String>,
 }
 
 impl FrameBuf {
@@ -694,7 +690,6 @@ impl FrameBuf {
                 cap: dropped_sample_cap,
             },
             cap,
-            error: None,
         }
     }
 
@@ -752,22 +747,6 @@ impl PoppedFrame {
             self.dropped_total,
             encoding_flags,
         )
-    }
-}
-
-struct Shared {
-    buf: Mutex<FrameBuf>,
-    notify: Notify,
-}
-
-impl Shared {
-    fn lock(&self) -> std::sync::MutexGuard<'_, FrameBuf> {
-        // Poison recovery: a panicked lock holder cannot corrupt a
-        // VecDeque of owned frames; continuing with the inner value is
-        // strictly better than cascading the panic through shutdown.
-        self.buf
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -851,18 +830,72 @@ impl ConnState {
         }
     }
 
-    fn on_event(&mut self, _ev: Option<Event>) {}
+    /// An event from the producer; `None`: its channel closed. A page goes
+    /// into the queue, evicting the oldest frame past the depth.
+    fn on_event(&mut self, ev: Option<Event>) {
+        match ev {
+            Some(Event::Page(streams)) => self.queue.push_evicting(streams),
+            Some(Event::Fatal(reason)) => {
+                self.fatal = Some(reason);
+                self.producer_done = true;
+            }
+            None => self.producer_done = true,
+        }
+    }
 
-    fn on_shutdown(&mut self, _now: Instant) {}
+    /// Shutdown reached the connection: the drain ends `CLOSE_GRACE` after
+    /// it was first read.
+    fn on_shutdown(&mut self, now: Instant) {
+        if self.drain_until.is_none() {
+            self.drain_until = Some(now + CLOSE_GRACE);
+        }
+    }
 
-    fn on_must_stop(&mut self) {}
+    fn on_must_stop(&mut self) {
+        self.must_stop = true;
+    }
 
-    fn on_handed_over(&mut self) {}
+    fn on_handed_over(&mut self) {
+        self.half_sent = true;
+    }
 
-    fn on_written(&mut self) {}
+    fn on_written(&mut self) {
+        self.half_sent = false;
+    }
 
-    fn decide(&mut self, _now: Instant) -> Action {
-        Action::Close(self.fatal.take())
+    /// The next step. The first case that applies: the connection must
+    /// stop; the shutdown drain has run out; a queued frame is sent; the
+    /// producer is done; otherwise wait. Every end is a Close, unless a
+    /// Text is half sent, which drops the socket.
+    fn decide(&mut self, now: Instant) -> Action {
+        let end = |s: &mut Self, reason: Option<String>| {
+            if s.half_sent {
+                Action::Drop
+            } else {
+                Action::Close(reason)
+            }
+        };
+        if self.must_stop {
+            return end(self, None);
+        }
+        if self.drain_until.is_some_and(|d| now >= d) {
+            let reason = self.fatal.take();
+            return end(self, reason);
+        }
+        if let Some(frame) = self.queue.pop_next() {
+            let normal = now + self.send_timeout;
+            return Action::Send {
+                frame,
+                deadline: self.drain_until.map_or(normal, |d| normal.min(d)),
+            };
+        }
+        if self.producer_done {
+            let reason = self.fatal.take();
+            return end(self, reason);
+        }
+        Action::Wait {
+            until: self.drain_until,
+        }
     }
 }
 
@@ -870,14 +903,43 @@ impl ConnState {
 /// #806).
 #[allow(clippy::too_many_arguments)]
 fn observe_inputs<E: EventSource>(
-    _st: &mut ConnState,
-    _shutdown: &mut watch::Receiver<bool>,
-    _shutdown_open: &mut bool,
-    _cancel: &watch::Receiver<bool>,
-    _src: &mut E,
-    _rx_open: &mut bool,
-    _now: Instant,
+    st: &mut ConnState,
+    shutdown: &mut watch::Receiver<bool>,
+    shutdown_open: &mut bool,
+    cancel: &watch::Receiver<bool>,
+    src: &mut E,
+    rx_open: &mut bool,
+    now: Instant,
 ) {
+    if *cancel.borrow() {
+        st.on_must_stop();
+    }
+    if *shutdown_open {
+        match shutdown.has_changed() {
+            // The sender is gone: that is shutdown too.
+            Err(_) => {
+                *shutdown_open = false;
+                st.on_shutdown(now);
+            }
+            Ok(_) => {
+                if *shutdown.borrow_and_update() {
+                    st.on_shutdown(now);
+                }
+            }
+        }
+    }
+    // At most one event per decision, so a source that is never empty
+    // cannot delay a decision.
+    if *rx_open {
+        match src.try_next() {
+            TryNext::Event(ev) => st.on_event(Some(ev)),
+            TryNext::Closed => {
+                *rx_open = false;
+                st.on_event(None);
+            }
+            TryNext::Empty => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -994,11 +1056,10 @@ async fn sleep_or_cancelled(
 /// qualifying scan).
 async fn producer_loop<F: TailFetcher>(
     mut fetcher: F,
-    shared: Arc<Shared>,
+    events: mpsc::Sender<Event>,
     cfg: TailLoopConfig,
     mut shutdown: watch::Receiver<bool>,
     mut cancel: watch::Receiver<bool>,
-    cancel_tx: Arc<watch::Sender<bool>>,
 ) {
     let mut state = ScanState::new(cfg.start_ns);
     let mut live_since_ns: Option<i64> = None;
@@ -1050,7 +1111,7 @@ async fn producer_loop<F: TailFetcher>(
                                 if may_fail_over(&mut fetcher, &mut failed_over.catch_up_probe) {
                                     continue;
                                 }
-                                fail(&shared, e);
+                                let _ = send_fatal(&events, e, &mut shutdown, &mut cancel).await;
                                 break;
                             }
                         }
@@ -1074,13 +1135,17 @@ async fn producer_loop<F: TailFetcher>(
                                 if may_fail_over(&mut fetcher, &mut failed_over.catch_up_page) {
                                     continue;
                                 }
-                                fail(&shared, e);
+                                let _ = send_fatal(&events, e, &mut shutdown, &mut cancel).await;
                                 break;
                             }
                         };
                         cu.fetched.extend(caught.fetched_fps);
                         let exhausted = scan.observe(&caught.page, upper, cfg.fetch_limit);
-                        push_page(&shared, caught.page.streams);
+                        if !send_page(&events, caught.page.streams, &mut shutdown, &mut cancel)
+                            .await
+                        {
+                            break;
+                        }
                         if !exhausted {
                             cu.scan = Some(scan);
                         } else if upper >= cu.ceiling.ts() {
@@ -1164,7 +1229,7 @@ async fn producer_loop<F: TailFetcher>(
                         }
                     }
                     Err(e) => {
-                        fail(&shared, e);
+                        let _ = send_fatal(&events, e, &mut shutdown, &mut cancel).await;
                         break;
                     }
                 }
@@ -1222,7 +1287,7 @@ async fn producer_loop<F: TailFetcher>(
                 // Fatal poll failure (e.g. a broad selector tripping the
                 // stream cap, or a second server failure in a row): hand the
                 // reason to the writer, which closes the socket with it.
-                fail(&shared, e);
+                let _ = send_fatal(&events, e, &mut shutdown, &mut cancel).await;
                 break;
             }
         };
@@ -1246,7 +1311,9 @@ async fn producer_loop<F: TailFetcher>(
             qualifying_scan_done = true;
         }
         let exhausted = state.observe(&page, upper, cfg.fetch_limit);
-        push_page(&shared, page.streams);
+        if !send_page(&events, page.streams, &mut shutdown, &mut cancel).await {
+            break;
+        }
         // Caught up ⇒ idle for one poll interval; otherwise (full page,
         // or more backlog slices ahead) re-poll immediately.
         if exhausted
@@ -1257,7 +1324,8 @@ async fn producer_loop<F: TailFetcher>(
             break;
         }
     }
-    let _ = cancel_tx.send(true);
+    // Returning drops the event sender: the writer reads that as the
+    // end of the producer.
 }
 
 /// One open catch-up (issue #804): the streams it reads, each with its
@@ -1297,45 +1365,165 @@ fn expire<F: TailFetcher>(
     waiting.retain(|(fp, _)| !expired.contains(fp));
 }
 
-/// Queues a page's streams for the writer, when any carries an entry.
-fn push_page(shared: &Shared, streams: Vec<StreamResult>) {
-    if streams.iter().any(|s| !s.entries.is_empty()) {
-        shared.lock().push_evicting(streams);
-        shared.notify.notify_one();
+/// Sends a page's streams to the writer, when any carries an entry,
+/// racing shutdown and the cancellation (issue #806); `false` when the
+/// producer must stop.
+async fn send_page(
+    events: &mpsc::Sender<Event>,
+    streams: Vec<StreamResult>,
+    shutdown: &mut watch::Receiver<bool>,
+    cancel: &mut watch::Receiver<bool>,
+) -> bool {
+    if !streams.iter().any(|s| !s.entries.is_empty()) {
+        return true;
+    }
+    tokio::select! {
+        _ = cancelled(shutdown, cancel) => false,
+        r = events.send(Event::Page(streams)) => r.is_ok(),
     }
 }
 
-/// A fatal read failure: hands the reason to the writer, which closes the
-/// socket with it.
-fn fail(shared: &Shared, e: ReadError) {
-    shared.lock().error = Some(e.to_string());
-    shared.notify.notify_one();
+/// A fatal read failure: sends the reason to the writer, after every page
+/// sent before it, racing shutdown and the cancellation (issue #806).
+async fn send_fatal(
+    events: &mpsc::Sender<Event>,
+    e: ReadError,
+    shutdown: &mut watch::Receiver<bool>,
+    cancel: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        _ = cancelled(shutdown, cancel) => false,
+        r = events.send(Event::Fatal(e.to_string())) => r.is_ok(),
+    }
 }
 
-/// The dedicated inbound-reader task (review round 1, medium): waits for
-/// a client Close/transport end on the split stream and fires the shared
-/// cancellation — independent of the writer, so a Close lands even while
-/// a `send_text` is backpressured mid-flight.
+/// The inbound-reader task: waits for the client to close (a Close frame
+/// or the transport ending) and sets the cancellation then, and on
+/// nothing else. It stops when the writer sets the cancellation.
 async fn reader_loop<R: TailReceiver>(
     mut receiver: R,
-    mut shutdown: watch::Receiver<bool>,
     mut cancel: watch::Receiver<bool>,
     cancel_tx: Arc<watch::Sender<bool>>,
 ) {
     tokio::select! {
-        _ = cancelled(&mut shutdown, &mut cancel) => {}
-        _ = receiver.closed() => {}
+        _ = cancel.wait_for(|stop| *stop) => {}
+        _ = receiver.closed() => {
+            let _ = cancel_tx.send(true);
+        }
     }
-    let _ = cancel_tx.send(true);
 }
 
-/// Temporary (issue #806, commit 1): today's one-call Text send.
-async fn send_text<S: TailSender>(s: &mut S, text: String) -> Result<(), ()> {
-    s.ready().await?;
-    s.start(text)?;
-    s.flush().await
+/// The writer's inputs, borrowed by its waits.
+struct Inputs<'a, E> {
+    st: &'a mut ConnState,
+    src: &'a mut E,
+    rx_open: &'a mut bool,
+    shutdown: &'a mut watch::Receiver<bool>,
+    shutdown_open: &'a mut bool,
+    cancel: &'a mut watch::Receiver<bool>,
 }
 
+impl<E: EventSource> Inputs<'_, E> {
+    /// A shutdown change: shutdown when the value is `true` or the sender
+    /// is gone.
+    fn on_shutdown_changed(&mut self, changed: Result<(), watch::error::RecvError>) {
+        let now = Instant::now();
+        match changed {
+            Err(_) => {
+                *self.shutdown_open = false;
+                self.st.on_shutdown(now);
+            }
+            Ok(()) => {
+                if *self.shutdown.borrow_and_update() {
+                    self.st.on_shutdown(now);
+                }
+            }
+        }
+    }
+
+    fn on_received(&mut self, ev: Option<Event>) {
+        if ev.is_none() {
+            *self.rx_open = false;
+        }
+        self.st.on_event(ev);
+    }
+
+    /// Runs one socket step until it ends or `deadline`. The order, in
+    /// every wait: the connection having to stop, the deadline, shutdown
+    /// (which lowers the deadline to the drain's), the step, then a
+    /// receive, taken only while the step is pending. `false`: the step
+    /// failed, was cancelled or ran out of time.
+    async fn step<F>(&mut self, fut: F, mut deadline: Instant) -> bool
+    where
+        F: Future<Output = Result<(), ()>>,
+    {
+        tokio::pin!(fut);
+        loop {
+            let (shutdown_open, rx_open) = (*self.shutdown_open, *self.rx_open);
+            let got = tokio::select! {
+                biased;
+                _ = self.cancel.wait_for(|stop| *stop) => Got::Stop,
+                _ = tokio::time::sleep_until(deadline) => Got::Stop,
+                changed = self.shutdown.changed(), if shutdown_open => Got::Shutdown(changed),
+                done = &mut fut => Got::Step(done.is_ok()),
+                ev = self.src.next(), if rx_open => Got::Event(ev),
+            };
+            match got {
+                Got::Stop => return false,
+                Got::Step(ok) => return ok,
+                Got::Shutdown(changed) => {
+                    self.on_shutdown_changed(changed);
+                    if let Some(d) = self.st.drain_until {
+                        deadline = deadline.min(d);
+                    }
+                }
+                Got::Event(ev) => self.on_received(ev),
+                Got::Woke => {}
+            }
+        }
+    }
+
+    /// Waits for one input, or until `until`.
+    async fn wait(&mut self, until: Option<Instant>) {
+        let (shutdown_open, rx_open) = (*self.shutdown_open, *self.rx_open);
+        let got = tokio::select! {
+            biased;
+            _ = self.cancel.wait_for(|stop| *stop) => Got::Stop,
+            _ = sleep_until_some(until) => Got::Woke,
+            changed = self.shutdown.changed(), if shutdown_open => Got::Shutdown(changed),
+            ev = self.src.next(), if rx_open => Got::Event(ev),
+        };
+        match got {
+            Got::Stop => self.st.on_must_stop(),
+            Got::Shutdown(changed) => self.on_shutdown_changed(changed),
+            Got::Event(ev) => self.on_received(ev),
+            Got::Woke | Got::Step(_) => {}
+        }
+    }
+}
+
+/// What ended one of the writer's waits.
+enum Got {
+    /// The connection must stop, or the step's deadline passed.
+    Stop,
+    /// The wait's own deadline.
+    Woke,
+    Shutdown(Result<(), watch::error::RecvError>),
+    Step(bool),
+    Event(Option<Event>),
+}
+
+/// Sleeps until `until`, or forever when there is none.
+async fn sleep_until_some(until: Option<Instant>) {
+    match until {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The writer (issue #806): the one owner of the frame queue, the fatal
+/// error, the shutdown drain and the socket. Each pass reads the inputs
+/// already visible, then carries out [`ConnState::decide`]'s decision.
 async fn writer_loop<S: TailSender, E: EventSource>(
     mut sender: S,
     mut src: E,
@@ -1344,126 +1532,70 @@ async fn writer_loop<S: TailSender, E: EventSource>(
     mut cancel: watch::Receiver<bool>,
     cancel_tx: Arc<watch::Sender<bool>>,
 ) {
-    let mut queue = FrameBuf::new(cfg.channel_depth, cfg.dropped_sample_cap);
-    let mut error: Option<String> = None;
-    let mut rx_open = true;
-    let mut close_reason: Option<String> = None;
-    'conn: loop {
-        while rx_open {
-            match src.try_next() {
-                TryNext::Event(Event::Page(streams)) => queue.push_evicting(streams),
-                TryNext::Event(Event::Fatal(reason)) => error = Some(reason),
-                TryNext::Closed => rx_open = false,
-                TryNext::Empty => break,
+    let mut st = ConnState::new(cfg.channel_depth, cfg.dropped_sample_cap, cfg.send_timeout);
+    let (mut shutdown_open, mut rx_open) = (true, true);
+    loop {
+        observe_inputs(
+            &mut st,
+            &mut shutdown,
+            &mut shutdown_open,
+            &cancel,
+            &mut src,
+            &mut rx_open,
+            Instant::now(),
+        );
+        let action = st.decide(Instant::now());
+        let mut inputs = Inputs {
+            st: &mut st,
+            src: &mut src,
+            rx_open: &mut rx_open,
+            shutdown: &mut shutdown,
+            shutdown_open: &mut shutdown_open,
+            cancel: &mut cancel,
+        };
+        match action {
+            Action::Drop => break,
+            Action::Close(reason) => {
+                // The error reason is rendered into the wire frame here,
+                // so every `TailSender` receives the production renderer's
+                // output (issue #240 re-review).
+                let frame = reason.map(error_close_frame);
+                let _ = tokio::time::timeout(CLOSE_GRACE, sender.send_close(frame)).await;
+                break;
             }
-        }
-        while let Some(popped) = queue.pop_next() {
-            let text = popped.encode(&cfg.encoding_flags);
-            tokio::select! {
-                _ = cancelled(&mut shutdown, &mut cancel) => break 'conn,
-                sent = tokio::time::timeout(cfg.send_timeout, send_text(&mut sender, text)) => {
-                    match sent {
-                        Ok(Ok(())) => {}
-                        Ok(Err(())) | Err(_) => break 'conn,
-                    }
+            Action::Wait { until } => inputs.wait(until).await,
+            Action::Send { frame, deadline } => {
+                let text = frame.encode(&cfg.encoding_flags);
+                if !inputs.step(sender.ready(), deadline).await {
+                    inputs.st.on_must_stop();
+                    continue;
+                }
+                // Checked immediately before handing over: nothing is
+                // handed over at or after a deadline.
+                if Instant::now() >= deadline || *inputs.cancel.borrow() {
+                    inputs.st.on_must_stop();
+                    continue;
+                }
+                inputs.st.on_handed_over();
+                if sender.start(text).is_err() {
+                    inputs.st.on_must_stop();
+                    continue;
+                }
+                if inputs.step(sender.flush(), deadline).await {
+                    inputs.st.on_written();
+                } else {
+                    inputs.st.on_must_stop();
                 }
             }
         }
-        if let Some(reason) = error.take() {
-            close_reason = Some(reason);
-            break;
-        }
-        if *shutdown.borrow() || *cancel.borrow() || !rx_open {
-            break;
-        }
-        tokio::select! {
-            _ = cancelled(&mut shutdown, &mut cancel) => break,
-            ev = src.next() => match ev {
-                Some(Event::Page(streams)) => queue.push_evicting(streams),
-                Some(Event::Fatal(reason)) => error = Some(reason),
-                None => rx_open = false,
-            },
-        }
-    }
-    if close_reason.is_none() {
-        close_reason = error.take();
-    }
-    // As today's shared buffer: an error already sent is the close reason,
-    // whichever path broke the loop.
-    while close_reason.is_none()
-        && let TryNext::Event(ev) = src.try_next()
-    {
-        if let Event::Fatal(reason) = ev {
-            close_reason = Some(reason);
-        }
     }
     let _ = cancel_tx.send(true);
-    let frame = close_reason.map(error_close_frame);
-    let _ = tokio::time::timeout(CLOSE_GRACE, sender.send_close(frame)).await;
-}
-
-/// Today's writer over the shared buffer (issue #806, commit 1: run_tail
-/// still uses it).
-async fn shared_writer_loop<S: TailSender>(
-    mut sender: S,
-    shared: Arc<Shared>,
-    cfg: TailLoopConfig,
-    mut shutdown: watch::Receiver<bool>,
-    mut cancel: watch::Receiver<bool>,
-    cancel_tx: Arc<watch::Sender<bool>>,
-) {
-    let mut close_reason: Option<String> = None;
-    'conn: loop {
-        // Drain every queued frame before waiting again (a Notify permit
-        // does not count queued items). State pops under the lock;
-        // ENCODING happens after the guard drops (review round 1, low).
-        loop {
-            let popped = shared.lock().pop_next();
-            let Some(popped) = popped else { break };
-            let text = popped.encode(&cfg.encoding_flags);
-            tokio::select! {
-                _ = cancelled(&mut shutdown, &mut cancel) => break 'conn,
-                sent = tokio::time::timeout(cfg.send_timeout, send_text(&mut sender, text)) => {
-                    match sent {
-                        Ok(Ok(())) => {}
-                        // Send timeout (a client that stopped reading) or
-                        // transport error: disconnect.
-                        Ok(Err(())) | Err(_) => break 'conn,
-                    }
-                }
-            }
-        }
-        if let Some(reason) = shared.lock().error.take() {
-            close_reason = Some(reason);
-            break;
-        }
-        if *shutdown.borrow() || *cancel.borrow() {
-            break;
-        }
-        tokio::select! {
-            _ = cancelled(&mut shutdown, &mut cancel) => break,
-            _ = shared.notify.notified() => {}
-        }
-    }
-    // Whatever path broke the loop, a pending producer error is the close
-    // reason (the producer's cancel can win the select race against its
-    // own error notification).
-    if close_reason.is_none() {
-        close_reason = shared.lock().error.take();
-    }
-    // Cancel the siblings FIRST so they stop while the (bounded,
-    // best-effort) Close goes out. The error reason is rendered into
-    // the wire frame HERE, on the shared path, so every `TailSender`
-    // receives the production renderer's output (issue #240 re-review).
-    let _ = cancel_tx.send(true);
-    let frame = close_reason.map(error_close_frame);
-    let _ = tokio::time::timeout(CLOSE_GRACE, sender.send_close(frame)).await;
 }
 
 /// Runs one tail connection to completion: spawns the producer and the
-/// inbound reader, runs the writer on the upgrade task, and joins both
-/// on the way out (any task's exit cancels the others via the shared
-/// watch).
+/// inbound reader, runs the writer on the upgrade task, and joins both on
+/// the way out. The writer sets the cancellation when it returns, which
+/// stops the other two.
 async fn run_tail<F: TailFetcher, S: TailSender, R: TailReceiver>(
     fetcher: F,
     sender: S,
@@ -1471,27 +1603,22 @@ async fn run_tail<F: TailFetcher, S: TailSender, R: TailReceiver>(
     cfg: TailLoopConfig,
     shutdown: watch::Receiver<bool>,
 ) {
-    let shared = Arc::new(Shared {
-        buf: Mutex::new(FrameBuf::new(cfg.channel_depth, cfg.dropped_sample_cap)),
-        notify: Notify::new(),
-    });
+    let (events, rx) = mpsc::channel(1);
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let cancel_tx = Arc::new(cancel_tx);
     let producer = tokio::spawn(producer_loop(
         fetcher,
-        Arc::clone(&shared),
+        events,
         cfg.clone(),
         shutdown.clone(),
         cancel_rx.clone(),
-        Arc::clone(&cancel_tx),
     ));
     let reader = tokio::spawn(reader_loop(
         receiver,
-        shutdown.clone(),
         cancel_rx.clone(),
         Arc::clone(&cancel_tx),
     ));
-    shared_writer_loop(sender, shared, cfg, shutdown, cancel_rx, cancel_tx).await;
+    writer_loop(sender, rx, cfg, shutdown, cancel_rx, cancel_tx).await;
     let _ = producer.await;
     let _ = reader.await;
 }
@@ -2351,7 +2478,7 @@ mod tests {
     }
 
     /// Review round 1 (medium): a client Close arriving WHILE the
-    /// writer's `send_text` is blocked on backpressure must still tear
+    /// writer's socket step is blocked on backpressure must still tear
     /// the connection down promptly — the independent inbound reader
     /// fires the shared cancellation, which the in-flight send races —
     /// releasing the producer AND the connection-slot permit in well
