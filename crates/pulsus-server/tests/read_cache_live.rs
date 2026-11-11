@@ -811,7 +811,8 @@ async fn l10_a_recreated_database_is_cleared() {
     same(&r.a, &r.b, l2, "L2 after the rebuild");
 }
 
-/// L12: a gauge under `rate`, twice; the repeat is a hit.
+/// L12 (#835): an answer with an info is not kept: its repeat is read in
+/// full.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l12_an_answer_with_an_info_is_not_kept() {
     skip_unless_live!();
@@ -824,13 +825,27 @@ async fn l12_an_answer_with_an_info_is_not_kept() {
         &[],
     )
     .await;
-    let end = now_ms().div_euclid(STEP) * STEP;
-    let q = Range::new("rate(g[5m])", end - 2 * HOUR, end, STEP);
+    // `max` over native histograms and one float series of the same name
+    // answers the float series and raises the info that histograms were
+    // ignored.
+    load_histograms(r.b.port, &r.times);
+    let samples = (r.times.now0 - r.times.t0) / 5_000;
+    push_series(
+        r.b.port,
+        "a",
+        labels("hh", &[("f", "1".to_string())]),
+        (0..=samples)
+            .map(|k| (r.times.t0 + k * 5_000, k as f64))
+            .collect(),
+    );
+    let q = r.times.l1("max(hh)");
     let first = same(&r.a, &r.b, q, "L12 first");
     assert!(
-        first.body.contains("\"infos\""),
-        "L12: the answer has an info"
+        first.body.contains("ignored histogram in max aggregation"),
+        "L12: the answer has an info: {}",
+        cut(&first.body)
     );
+    assert!(points_of(&first.body).unwrap_or(0) > 0, "L12: an answer");
     let second = same(&r.a, &r.b, q, "L12 second");
     assert_eq!(second.cache(), "bypass", "L12: nothing was kept");
     assert!(
@@ -1107,8 +1122,21 @@ async fn l28_a_tail_past_the_cap_is_a_422() {
     assert_eq!(rb.status, 422, "L28: B refuses: {}", cut(&rb.body));
     assert_eq!(ra.status, 422, "L28: A refuses: {}", cut(&ra.body));
     assert_eq!(ra.body, rb.body, "L28: the same refusal");
+    // One read of the tail: a raw read is its float statement and its
+    // histogram statement, both over the tail's window alone.
     let sent = statements_of(&db, &query_id(&ra)).await;
-    assert_eq!(sent.len(), 1, "L28: A's statements {sent:#?}");
+    assert_eq!(sent.len(), 2, "L28: A's statements {sent:#?}");
+    let lower = |q: &str| {
+        q.split("unix_milli > ")
+            .nth(1)
+            .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse::<i64>().ok())
+    };
+    assert!(
+        sent.iter()
+            .all(|q| lower(q).is_some_and(|lo| lo > refresh.end - 30 * MINUTE)),
+        "L28: a statement reads more than the tail: {sent:#?}"
+    );
     drop(a);
     drop(b);
 }
