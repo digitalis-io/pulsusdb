@@ -1414,6 +1414,25 @@ fn query_id(r: &Resp) -> String {
         .to_string()
 }
 
+/// The result rows of each statement one request sent, by its
+/// `X-Pulsus-Query-Id`.
+async fn result_rows_of(db: &str, id: &str) -> Vec<u64> {
+    let c = client(db).await;
+    exec(&c, "SYSTEM FLUSH LOGS").await;
+    c.query_strings(
+        &format!(
+            "SELECT toString(result_rows) AS s FROM system.query_log \
+             WHERE type = 'QueryFinish' AND is_initial_query AND log_comment = '{id}'"
+        ),
+        &QuerySettings::new().set("log_comment", "t810-log"),
+    )
+    .await
+    .expect("query_log")
+    .iter()
+    .map(|n| n.parse().expect("a count"))
+    .collect()
+}
+
 /// One native-histogram counter through `port`, a sample every 5 s over
 /// `(t0, now0]`.
 fn push_histogram(port: u16, tenant: &str, labels: Vec<(String, String)>, times: &Times) {
@@ -1468,8 +1487,8 @@ fn push_histogram(port: u16, tenant: &str, labels: Vec<(String, String)>, times:
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_routed_repeat_with_a_new_info_is_one_statement() {
     skip_unless_live!();
-    let a_port: u16 = 32_810;
-    let b_port: u16 = 32_811;
+    let a_port: u16 = 31_900;
+    let b_port: u16 = 31_901;
     let r = rig(
         live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_t810_20_it")).await,
         a_port,
@@ -1482,7 +1501,12 @@ async fn a_routed_repeat_with_a_new_info_is_one_statement() {
         let points: Vec<(i64, f64)> = (0..=samples)
             .map(|k| (r.times.t0 + k * 5_000, (j as f64 + 1.0) * k as f64))
             .collect();
-        push_series(r.b.port, "a", labels("h_bucket", &[("le", le.to_string())]), points);
+        push_series(
+            r.b.port,
+            "a",
+            labels("h_bucket", &[("le", le.to_string())]),
+            points,
+        );
     }
     let t1 = (r.times.now0 - 30 * MINUTE).div_euclid(MINUTE) * MINUTE;
     write_level(&r.db, r.times.t0.div_euclid(MINUTE) * MINUTE, t1).await;
@@ -1496,18 +1520,30 @@ async fn a_routed_repeat_with_a_new_info_is_one_statement() {
     let first = same(&r.a, &r.b, q, "T20 first");
     assert_eq!(first.cache(), "miss", "T20: the first is kept");
     assert!(first.through().is_some(), "T20: the first has a Through");
-    assert!(!first.body.contains("\"infos\""), "T20: the first has no info");
+    assert!(
+        !first.body.contains("\"infos\""),
+        "T20: the first has no info"
+    );
     // `le="0.5"` jumps after `t1`, above `le="1"`, and the level is
     // written over the jump.
     let jump: Vec<(i64, f64)> = (0..12)
         .map(|k| (t1 + 2_500 + k * 5_000, 1e9 + k as f64))
         .collect();
-    push_series(r.b.port, "a", labels("h_bucket", &[("le", "0.5".to_string())]), jump);
+    push_series(
+        r.b.port,
+        "a",
+        labels("h_bucket", &[("le", "0.5".to_string())]),
+        jump,
+    );
     write_level(&r.db, t1, t1 + MINUTE).await;
     Server::settle_poll();
     let second = same(&r.a, &r.b, q.shifted(MINUTE), "T20 repeat");
     assert_eq!(second.cache(), "hit", "T20: the repeat");
-    assert!(second.body.contains("\"infos\""), "T20: the info: {}", cut(&second.body));
+    assert!(
+        second.body.contains("\"infos\""),
+        "T20: the info: {}",
+        cut(&second.body)
+    );
     let sent = statements_of(&r.db, &query_id(&second)).await;
     assert_eq!(sent.len(), 1, "T20: the repeat's statements {sent:#?}");
 }
@@ -1517,22 +1553,28 @@ async fn a_routed_repeat_with_a_new_info_is_one_statement() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_routed_hit_past_the_sample_cap_is_refused_in_one_statement() {
     skip_unless_live!();
-    let a_port: u16 = 32_812;
-    let b_port: u16 = 32_813;
-    let db = live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_t810_22_it")).await;
+    let a_port: u16 = 31_902;
+    let b_port: u16 = 31_903;
+    let db =
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_t810_22_it")).await;
     stop_levels(&db).await;
     let times = Times::new();
     {
-        let loader_port: u16 = 32_814;
+        let loader_port: u16 = 31_904;
         let loader = Server::spawn(loader_port, &db, "0", &[]);
         load_fixture(loader.port, &times, 0.0);
     }
     let end = now_ms().div_euclid(STEP) * STEP;
     let l1 = Range::new("rate(rc_total[5m])", end - 4 * HOUR, end, STEP);
-    write_level(&db, times.t0.div_euclid(MINUTE) * MINUTE, end.div_euclid(MINUTE) * MINUTE).await;
-    // The level rows L1 reads: its lattice's fetch window, 5 m before the
-    // first bucket end, to its last step.
-    let lo = (l1.start + MINUTE - 1).div_euclid(MINUTE) * MINUTE - 5 * MINUTE;
+    write_level(
+        &db,
+        times.t0.div_euclid(MINUTE) * MINUTE,
+        end.div_euclid(MINUTE) * MINUTE,
+    )
+    .await;
+    // The level rows L1 reads: its lattice's fetch window, the 5 m range
+    // and the 5 m lookback before the first bucket end, to its last step.
+    let lo = (l1.start + MINUTE - 1).div_euclid(MINUTE) * MINUTE - 10 * MINUTE;
     let charge = {
         #[derive(pulsus_clickhouse::Row, serde::Deserialize, serde::Serialize)]
         struct N {
@@ -1554,13 +1596,25 @@ async fn a_routed_hit_past_the_sample_cap_is_refused_in_one_statement() {
             .expect("count");
         s.next().await.expect("a row").expect("a count").n
     };
-    let cap = (charge + 300).to_string();
+    // Room for L2's tail, 20 series over about 15 buckets; the refresh's
+    // tail adds the 40 new series' rows.
+    let cap = (charge + 400).to_string();
     let env = [("PULSUS_PROMQL_MAX_SAMPLES", cap.as_str())];
     let b = Server::spawn(b_port, &db, "0", &env);
     let a = Server::spawn(a_port, &db, "64MiB", &env);
     Server::settle_poll();
-    assert_eq!(same(&a, &b, l1, "L1").cache(), "miss", "T22: L1");
-    assert_eq!(same(&a, &b, l1.shifted(MINUTE), "L2").cache(), "hit", "T22: L2");
+    let first = same(&a, &b, l1, "L1");
+    println!(
+        "T22: charge counted {charge}, L1's result rows {:?}",
+        result_rows_of(&db, &query_id(&first)).await
+    );
+    assert_eq!(first.cache(), "miss", "T22: L1");
+    let second = same(&a, &b, l1.shifted(MINUTE), "L2");
+    println!(
+        "T22: L2's result rows {:?}",
+        result_rows_of(&db, &query_id(&second)).await
+    );
+    assert_eq!(second.cache(), "hit", "T22: L2");
     // 40 more series, 200 samples each, ending now, and their level rows.
     let now = now_ms().div_euclid(5_000) * 5_000;
     for i in 20..60 {
@@ -1608,6 +1662,10 @@ async fn a_routed_hit_past_the_sample_cap_is_refused_in_one_statement() {
     assert_eq!(ra.status, 422, "T22: A refuses: {}", ra.body);
     assert_eq!(ra.body, rb.body, "T22: the same refusal");
     let sent = statements_of(&db, &query_id(&ra)).await;
+    println!(
+        "T22: the refresh's result rows on A {:?}",
+        result_rows_of(&db, &query_id(&ra)).await
+    );
     assert_eq!(sent.len(), 1, "T22: A's statements {sent:#?}");
     drop(a);
     drop(b);
@@ -1617,8 +1675,8 @@ async fn a_routed_hit_past_the_sample_cap_is_refused_in_one_statement() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_query_with_an_unrouted_read_is_never_kept() {
     skip_unless_live!();
-    let a_port: u16 = 32_815;
-    let b_port: u16 = 32_816;
+    let a_port: u16 = 31_905;
+    let b_port: u16 = 31_906;
     let r = rig(
         live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_t810_23_it")).await,
         a_port,
@@ -1632,10 +1690,30 @@ async fn a_query_with_an_unrouted_read_is_never_kept() {
             .map(|k| (r.times.t0 + k * 5_000, rate * k as f64))
             .collect()
     };
-    push_series(r.b.port, "a", labels("a", &[("x", "f".to_string())]), counter(1.0));
-    push_histogram(r.b.port, "a", labels("a", &[("x", "h".to_string())]), &r.times);
-    push_series(r.b.port, "a", labels("b", &[("x", "f".to_string())]), counter(2.0));
-    push_series(r.b.port, "a", labels("b", &[("x", "h".to_string())]), counter(3.0));
+    push_series(
+        r.b.port,
+        "a",
+        labels("a", &[("x", "f".to_string())]),
+        counter(1.0),
+    );
+    push_histogram(
+        r.b.port,
+        "a",
+        labels("a", &[("x", "h".to_string())]),
+        &r.times,
+    );
+    push_series(
+        r.b.port,
+        "a",
+        labels("b", &[("x", "f".to_string())]),
+        counter(2.0),
+    );
+    push_series(
+        r.b.port,
+        "a",
+        labels("b", &[("x", "h".to_string())]),
+        counter(3.0),
+    );
     let end = (r.times.now0 - 30 * MINUTE).div_euclid(MINUTE) * MINUTE;
     write_level(&r.db, r.times.t0.div_euclid(MINUTE) * MINUTE, end).await;
     Server::settle_poll();
@@ -1644,12 +1722,33 @@ async fn a_query_with_an_unrouted_read_is_never_kept() {
     assert_eq!(first.cache(), "bypass", "T23: the first is not kept");
     let ra = q.shifted(MINUTE).send(r.a.port);
     let rb = q.shifted(MINUTE).send(r.b.port);
-    assert_eq!((ra.status, rb.status), (200, 200), "T23: {} / {}", ra.body, rb.body);
+    assert_eq!(
+        (ra.status, rb.status),
+        (200, 200),
+        "T23: {} / {}",
+        ra.body,
+        rb.body
+    );
     assert_eq!(ra.cache(), "bypass", "T23: the second");
     assert!(ra.body == rb.body, "T23: A and B differ");
-    let (sa, sb) = (
-        statements_of(&r.db, &query_id(&ra)).await,
-        statements_of(&r.db, &query_id(&rb)).await,
+    // The same reads on A and B. Each server's own label cache decides
+    // whether a statement names its series by a list or by the ID
+    // statement, and whether a raw read hydrates its labels by a statement
+    // of its own; so the texts are compared by their first line, and the
+    // label statement is left out.
+    let head = |sent: Vec<String>| -> Vec<String> {
+        sent.iter()
+            .map(|q| q.lines().next().unwrap_or("").to_string())
+            .filter(|q| !q.starts_with("SELECT fingerprint, any(name) AS metric_name"))
+            .collect()
+    };
+    let (mut sa, mut sb) = (
+        head(statements_of(&r.db, &query_id(&ra)).await),
+        head(statements_of(&r.db, &query_id(&rb)).await),
     );
+    // The reads of one request run concurrently.
+    sa.sort();
+    sb.sort();
+    assert!(!sb.is_empty(), "T23: B's statements");
     assert_eq!(sa, sb, "T23: the second's statements on A and B");
 }

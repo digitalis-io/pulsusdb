@@ -2144,13 +2144,19 @@ async fn every_bucket_is_one_part_with_its_run_row() {
     let db = DB_ONE_PART.name();
     let ctx = RenderCtx::for_tests(db, 7);
     fresh(&client, &ctx).await;
-    for r in &ctx.rollup_levels {
-        exec(&client, &format!("SYSTEM STOP MERGES {db}.metric_samples_{r}s")).await;
-        exec(
-            &client,
-            &format!("SYSTEM STOP MERGES IF EXISTS {db}.metric_samples_{r}s_stage"),
-        )
-        .await;
+    let tables: Vec<String> = rows::<NameRow>(
+        &client,
+        &format!(
+            "SELECT name FROM system.tables WHERE database = '{db}' \
+             AND (match(name, '^metric_samples_[0-9]+s$') OR match(name, '^metric_samples_[0-9]+s_stage$')) ORDER BY name"
+        ),
+    )
+    .await
+    .into_iter()
+    .map(|r| r.name)
+    .collect();
+    for t in &tables {
+        exec(&client, &format!("SYSTEM STOP MERGES {db}.{t}")).await;
     }
     let now = now_ms(&client).await;
     let start = now / MINUTE * MINUTE - 20 * MINUTE;
@@ -2215,7 +2221,9 @@ async fn every_bucket_is_one_part_with_its_run_row() {
             &format!("SELECT toInt64(countIf(kind = 0)) AS v FROM {t}"),
         )
         .await;
-        println!("{t}: {data} data rows; {orphans} parts without a run row, {split} split buckets, {outside} rows outside");
+        println!(
+            "{t}: {data} data rows; {orphans} parts without a run row, {split} split buckets, {outside} rows outside"
+        );
         if orphans != 0 || split != 0 || outside != 0 {
             failures.push(format!(
                 "{t}: {orphans} parts without a run row, {split} buckets in two parts, {outside} rows outside their part's runs"
@@ -2228,6 +2236,9 @@ async fn every_bucket_is_one_part_with_its_run_row() {
     )
     .await;
     drop_db(&client, db).await;
-    assert!(first >= 70_000 * 10, "T9: the first level holds {first} rows");
+    assert!(
+        first >= 70_000 * 10,
+        "T9: the first level holds {first} rows"
+    );
     assert!(failures.is_empty(), "T9:\n{}", failures.join("\n"));
 }

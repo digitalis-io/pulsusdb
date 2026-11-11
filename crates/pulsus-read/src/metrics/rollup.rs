@@ -11,14 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use pulsus_clickhouse::{ChClient, QuerySettings, Row};
-use pulsus_model::{Fingerprint, FpLiteral, STALE_NAN_BITS, Tenant};
+use pulsus_model::{Fingerprint, STALE_NAN_BITS, Tenant};
 use pulsus_promql::{PlanParams, QueryPlan, RawOverlay, RollupUse, Sample, SelectorSpec};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
 use super::TenantSql;
 use super::exec::MetricQueryParams;
-use super::sample_sql::{intervals_predicate, render_fingerprint_list};
 use crate::logql::escape::ch_string;
 
 /// One rollup level: its bucket width, the table a read names, and the
@@ -366,6 +365,24 @@ pub fn resolution_for_span(span_ms: i64, step_ms: i64, levels: &Levels) -> Optio
         .map(|l| l.res_ms)
 }
 
+/// Issue #810 (D5): an instant query's resolution, the largest level whose
+/// switch point is at most its smallest selector range (a selector with no
+/// range counts 0); `None` when no level's is.
+pub fn instant_resolution(plan: &QueryPlan, levels: &Levels) -> Option<i64> {
+    let span = plan
+        .selectors
+        .iter()
+        .map(|s| s.range_ms.unwrap_or(0))
+        .min()?;
+    let span = i128::from(span);
+    levels
+        .levels
+        .iter()
+        .rev()
+        .find(|l| l.res_ms > 0 && i128::from(l.from_ms) <= span)
+        .map(|l| l.res_ms)
+}
+
 /// D6: for a range query's selector of use `Counter` that is `eligible`
 /// and has no level under `route`, the range it is read with, `r'`, and
 /// the level it then routes to. `None` when the query is instant, the
@@ -419,15 +436,15 @@ pub fn min_buckets(levels: &Levels, use_: RollupUse, w: i64) -> i64 {
     }
 }
 
-/// D5 and F2: a lattice-path range query.
+/// D5: a lattice-path range query. Issue #810 (D3): every step is read at
+/// a bucket end, up to `⌈t_last / L⌉ × L`; there is no tail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lattice {
     /// `L`, the request's resolution.
     pub width: i64,
-    /// `gl`; `None` when the request's own times are bucket ends.
+    /// `gu = ⌈t_last / L⌉ × L`; `None` when the request's own times are
+    /// bucket ends.
     pub until_ms: Option<i64>,
-    /// F2's grid `(t1, end, step)`; `None` when no step follows `gl`.
-    pub tail: Option<MetricQueryParams>,
 }
 
 /// D3: the range a selector is read with at the bucket ends; `None` without a range or a use.
@@ -467,27 +484,21 @@ pub fn lattice_with(
     );
     let t_last = start + (end - start).div_euclid(step) * step;
     let g0 = -(-start).div_euclid(w) * w;
-    let gl = t_last.div_euclid(w) * w;
-    if g0 > gl {
+    let gu = -(-t_last).div_euclid(w) * w;
+    if g0 > gu {
         return None;
     }
     let on_grid = start.rem_euclid(w) == 0 && step.rem_euclid(w) == 0;
-    let (until_ms, tail) = if on_grid {
-        (None, None)
+    let until_ms = if on_grid {
+        None
     } else {
-        let t1 = start + ((gl - start).div_euclid(step) + 1) * step;
-        let tail = (t1 <= end).then(|| MetricQueryParams {
-            start_ms: i64::try_from(t1).unwrap_or(i64::MAX),
-            end_ms: p.end_ms,
-            step_ms: p.step_ms,
-        });
-        (Some(i64::try_from(gl).ok()?), tail)
+        Some(i64::try_from(gu).ok()?)
     };
     let epp = match until_ms {
         None => plan.params,
-        Some(gl) => PlanParams {
+        Some(gu) => PlanParams {
             start_ms: i64::try_from(g0).ok()?,
-            end_ms: gl,
+            end_ms: gu,
             step_ms: width,
             ..plan.params
         },
@@ -499,11 +510,7 @@ pub fn lattice_with(
         }
         eligible(&s) && route(&s, &epp, levels, width).is_some()
     });
-    fits.then_some(Lattice {
-        width,
-        until_ms,
-        tail,
-    })
+    fits.then_some(Lattice { width, until_ms })
 }
 
 /// Plan section 3 and issue #18 follow-up R3: the largest level of width
@@ -568,34 +575,6 @@ pub fn eligible(sel: &SelectorSpec) -> bool {
     sel.metric_name.is_some() && sel.name_matchers.is_empty() && !excluded(sel)
 }
 
-/// Plan section 2: one level fetch over the intervals `within`, each
-/// `(lo, hi]`, for one fingerprint chunk: its data rows and the run rows
-/// that overlap an interval.
-pub fn level_fetch(
-    tenant: &Tenant,
-    table: &str,
-    fps: &[FpLiteral],
-    within: &[(i64, i64)],
-    clustered: bool,
-) -> String {
-    let shard = if clustered {
-        "_shard_num"
-    } else {
-        "toUInt32(1)"
-    };
-    format!(
-        "SELECT {shard} AS shard, kind, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags\n\
-         FROM {table}\n\
-         WHERE (kind = 0 AND org_id = {} AND fingerprint IN ({}) AND {})\n   \
-         OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND {})\n\
-         ORDER BY kind, fingerprint, t_end",
-        tenant.sql_literal(),
-        render_fingerprint_list(fps),
-        intervals_predicate("t_end", "t_end", "<=", within),
-        intervals_predicate("t_end", "t_last", "<", within),
-    )
-}
-
 /// Issue #810 (D11): the tables one routed statement reads.
 #[derive(Debug, Clone, Copy)]
 pub struct RoutedTables<'a> {
@@ -618,26 +597,183 @@ pub struct RoutedWindow<'a> {
     pub hist_where: &'a str,
 }
 
+/// Issue #810 (D11): `metric_hist_samples`' value columns as one tuple.
+pub const HIST_TUPLE: &str = "Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), \
+Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8)";
+
 /// Issue #810 (D11): one routed selector's one statement, and whether it
 /// names its series by `ids` (with the labels arm) rather than `known`.
+/// `known` is used when the statement it renders is under `text_cap`,
+/// measured over its escaped text as the dispatcher measures it.
 pub fn routed_fetch(
-    _tenant: &Tenant,
-    _tables: &RoutedTables<'_>,
-    _name: &str,
-    _window: &RoutedWindow<'_>,
-    _known: Option<&str>,
-    _ids: &str,
-    _text_cap: u64,
+    tenant: &Tenant,
+    tables: &RoutedTables<'_>,
+    name: &str,
+    window: &RoutedWindow<'_>,
+    known: Option<&str>,
+    ids: &str,
+    text_cap: u64,
 ) -> (String, bool) {
-    (String::new(), false)
+    if let Some(list) = known {
+        let sql = routed_statement(tenant, tables, name, window, Some(list), ids);
+        if (crate::logql::exec::escape_query_placeholders(&sql).len() as u64) < text_cap {
+            return (sql, false);
+        }
+    }
+    (
+        routed_statement(tenant, tables, name, window, None, ids),
+        true,
+    )
 }
 
-/// One row of a level fetch: a data row (`kind = 0`) or a run row
-/// (`kind = 1`).
+/// Plan section 2.3: the level arm, the raw arms (read only with
+/// `hist_n > 0`), with no list the labels arm, and `hist_n`'s own row.
+fn routed_statement(
+    tenant: &Tenant,
+    tables: &RoutedTables<'_>,
+    name: &str,
+    window: &RoutedWindow<'_>,
+    known: Option<&str>,
+    ids: &str,
+) -> String {
+    let org = tenant.sql_literal();
+    let (lo, hi) = window.level;
+    let (rlo, rhi) = window.raw;
+    let hist = format!("Array({HIST_TUPLE})");
+    let (level_filter, raw_filter) = match known {
+        Some(list) => (
+            format!("fingerprint IN ({list})"),
+            format!("fingerprint IN ({list})"),
+        ),
+        None => (
+            format!("fingerprint GLOBAL IN (\n{ids}\n)"),
+            format!("fingerprint IN (\n{ids}\n)"),
+        ),
+    };
+    let labels_arm = match known {
+        Some(_) => String::new(),
+        None => format!(
+            "  UNION ALL
+  SELECT toUInt8(2) AS arm, fingerprint, toInt64(0) AS t, toInt64(0) AS t_last, 0. AS last, 0. AS min,
+         0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags, CAST([], '{hist}') AS h, labels
+  FROM (
+{}
+  )
+",
+            super::sql::series_labels_by_fingerprint(
+                tenant,
+                tables.labels,
+                &[name.to_string()],
+                ids
+            )
+        ),
+    };
+    format!(
+        "WITH ifNull((SELECT count() FROM {hist_table} WHERE org_id = {org} AND ({hist_where})), 0) AS hist_n
+SELECT arm, fingerprint, t, t_last, last, min, max, sum, count, inc, flags, h, labels FROM (
+  SELECT toUInt8(0) AS arm, fingerprint, t_end AS t, t_last, last, min, max, sum, count, inc, flags,
+         CAST([], '{hist}') AS h, '' AS labels
+  FROM {level}
+  WHERE kind = 0 AND org_id = {org} AND t_end > {lo} AND t_end <= {hi} AND {level_filter} AND hist_n = 0
+  UNION ALL
+  SELECT toUInt8(3) AS arm, fingerprint, unix_milli AS t, toInt64(0) AS t_last, value AS last, 0. AS min,
+         0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags, CAST([], '{hist}') AS h, '' AS labels
+  FROM {samples}
+  WHERE org_id = {org} AND unix_milli > {rlo} AND unix_milli <= {rhi} AND {raw_filter} AND hist_n > 0
+  UNION ALL
+  SELECT toUInt8(1) AS arm, hs.fingerprint AS fingerprint, hs.unix_milli AS t, toInt64(0) AS t_last,
+         0. AS last, 0. AS min, 0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags,
+         [CAST((hs.schema, hs.zero_threshold, hs.zero_count, hs.count, hs.sum, hs.pos_span_offsets,
+                hs.pos_span_lengths, hs.pos_bucket_deltas, hs.neg_span_offsets, hs.neg_span_lengths,
+                hs.neg_bucket_deltas, hs.custom_values, hs.counter_reset_hint), '{HIST_TUPLE}')] AS h, '' AS labels
+  FROM {hist_table} AS hs
+  WHERE hs.org_id = {org} AND hs.unix_milli > {rlo} AND hs.unix_milli <= {rhi} AND {raw_filter} AND hist_n > 0
+{labels_arm}  UNION ALL
+  SELECT toUInt8(4) AS arm, toUInt128(0) AS fingerprint, toInt64(hist_n) AS t, toInt64(0) AS t_last, 0. AS last,
+         0. AS min, 0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags, CAST([], '{hist}') AS h, '' AS labels
+)
+ORDER BY arm, fingerprint, t, reinterpretAsUInt64(last)",
+        hist_table = tables.hist,
+        hist_where = window.hist_where,
+        level = tables.level,
+        samples = tables.samples,
+    )
+}
+
+/// One histogram sample of a routed statement's arm 1, in
+/// `metric_hist_samples`' column order: [`HIST_TUPLE`], read as a tuple.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HistTuple {
+    pub schema: i8,
+    pub zero_threshold: f64,
+    pub zero_count: u64,
+    pub count: u64,
+    pub sum: f64,
+    pub pos_span_offsets: Vec<i32>,
+    pub pos_span_lengths: Vec<u32>,
+    pub pos_bucket_deltas: Vec<i64>,
+    pub neg_span_offsets: Vec<i32>,
+    pub neg_span_lengths: Vec<u32>,
+    pub neg_bucket_deltas: Vec<i64>,
+    pub custom_values: Vec<f64>,
+    pub counter_reset_hint: u8,
+}
+
+impl<'de> Deserialize<'de> for HistTuple {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = HistTuple;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a histogram sample tuple of 13 elements")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<HistTuple, A::Error> {
+                let missing = |i| serde::de::Error::invalid_length(i, &self);
+                Ok(HistTuple {
+                    schema: a.next_element()?.ok_or_else(|| missing(0))?,
+                    zero_threshold: a.next_element()?.ok_or_else(|| missing(1))?,
+                    zero_count: a.next_element()?.ok_or_else(|| missing(2))?,
+                    count: a.next_element()?.ok_or_else(|| missing(3))?,
+                    sum: a.next_element()?.ok_or_else(|| missing(4))?,
+                    pos_span_offsets: a.next_element()?.ok_or_else(|| missing(5))?,
+                    pos_span_lengths: a.next_element()?.ok_or_else(|| missing(6))?,
+                    pos_bucket_deltas: a.next_element()?.ok_or_else(|| missing(7))?,
+                    neg_span_offsets: a.next_element()?.ok_or_else(|| missing(8))?,
+                    neg_span_lengths: a.next_element()?.ok_or_else(|| missing(9))?,
+                    neg_bucket_deltas: a.next_element()?.ok_or_else(|| missing(10))?,
+                    custom_values: a.next_element()?.ok_or_else(|| missing(11))?,
+                    counter_reset_hint: a.next_element()?.ok_or_else(|| missing(12))?,
+                })
+            }
+        }
+        d.deserialize_tuple(13, V)
+    }
+}
+
+/// Issue #810 (D11): one row of a routed statement.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct RoutedRow {
+    pub arm: u8,
+    pub fingerprint: Fingerprint,
+    pub t: i64,
+    pub t_last: i64,
+    pub last: f64,
+    pub min: f64,
+    pub max: f64,
+    pub sum: f64,
+    pub count: u32,
+    pub inc: f64,
+    pub flags: u8,
+    pub h: Vec<HistTuple>,
+    pub labels: String,
+}
+
+/// One data row of a level, as a routed statement's level arm returns it.
 #[derive(Debug, Clone, Copy, PartialEq, Row, Serialize, Deserialize)]
 pub struct LevelRow {
-    pub shard: u32,
-    pub kind: u8,
     pub fingerprint: Fingerprint,
     pub t_end: i64,
     pub t_last: i64,
@@ -652,104 +788,26 @@ pub struct LevelRow {
     pub flags: u8,
 }
 
-/// Issue #579 part 4: S1, a pushed node's coverage statement — the run rows
-/// of `table` that overlap `window`, `(lo, hi]`, each with the shard that
-/// answered it: [`level_fetch`]'s run rows without its data rows.
-pub fn level_runs(table: &str, window: (i64, i64), clustered: bool) -> String {
-    level_runs_within(table, &[window], clustered)
-}
-
-/// Issue #18 part 2c: [`level_runs`] over the intervals `within`, each
-/// `(lo, hi]`: a finer level's coverage over what the coarser ones left.
-pub fn level_runs_within(table: &str, within: &[(i64, i64)], clustered: bool) -> String {
-    let shard = if clustered {
-        "_shard_num"
-    } else {
-        "toUInt32(1)"
-    };
-    format!(
-        "SELECT {shard} AS shard, t_last, t_end\n\
-         FROM {table}\n\
-         WHERE kind = 1 AND org_id = '' AND fingerprint = 0 AND {}",
-        intervals_predicate("t_end", "t_last", "<", within),
-    )
-}
-
-/// One run row: the shard that answered it and its interval
-/// `(t_last, t_end]`. Part 4 reads S1 ([`level_runs`]) into it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
-pub struct RunRow {
-    pub shard: u32,
-    pub t_last: i64,
-    pub t_end: i64,
-}
-
 /// Sorted, disjoint, left-open right-closed intervals `(a, b]`.
 pub type Intervals = Vec<(i64, i64)>;
 
-/// Plan Q7: per shard, the union of its run rows' intervals; the
-/// intersection over shards `1..=shards`. A shard with no run row covers
-/// nothing.
-pub fn coverage(runs: &[RunRow], shards: u32) -> Intervals {
-    let mut out: Option<Intervals> = None;
-    for shard in 1..=shards {
-        let mine = union(
-            runs.iter()
-                .filter(|r| r.shard == shard)
-                .map(|r| (r.t_last, r.t_end)),
-        );
-        out = Some(match out {
-            None => mine,
-            Some(acc) => intersect(&acc, &mine),
-        });
-    }
-    out.unwrap_or_default()
-}
-
-/// The union of `(a, b]` intervals, adjacent ones merged.
-fn union(intervals: impl IntoIterator<Item = (i64, i64)>) -> Intervals {
-    let mut all: Vec<(i64, i64)> = intervals.into_iter().filter(|(a, b)| a < b).collect();
-    all.sort_unstable();
-    let mut out: Intervals = Vec::new();
-    for (a, b) in all {
-        match out.last_mut() {
-            Some(last) if a <= last.1 => last.1 = last.1.max(b),
-            _ => out.push((a, b)),
-        }
-    }
-    out
-}
-
-/// `a` without `b`.
-pub fn subtract(a: &[(i64, i64)], b: &[(i64, i64)]) -> Intervals {
-    let b = union(b.iter().copied());
-    let mut out = Vec::new();
-    for &(lo, hi) in &union(a.iter().copied()) {
-        let mut at = lo;
-        for &(c, d) in &b {
-            if d <= at || c >= hi {
-                continue;
-            }
-            if c > at {
-                out.push((at, c));
-            }
-            at = at.max(d);
-            if at >= hi {
-                break;
-            }
-        }
-        if at < hi {
-            out.push((at, hi));
-        }
-    }
-    out
-}
-
 /// `a` and `b` both.
 pub fn intersect(a: &[(i64, i64)], b: &[(i64, i64)]) -> Intervals {
-    let b = union(b.iter().copied());
+    let merged = |x: &[(i64, i64)]| {
+        let mut all: Vec<(i64, i64)> = x.iter().copied().filter(|(lo, hi)| lo < hi).collect();
+        all.sort_unstable();
+        let mut out: Intervals = Vec::new();
+        for (lo, hi) in all {
+            match out.last_mut() {
+                Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                _ => out.push((lo, hi)),
+            }
+        }
+        out
+    };
+    let b = merged(b);
     let mut out = Vec::new();
-    for &(lo, hi) in &union(a.iter().copied()) {
+    for &(lo, hi) in &merged(a) {
         for &(c, d) in &b {
             let (x, y) = (lo.max(c), hi.min(d));
             if x < y {
@@ -757,62 +815,7 @@ pub fn intersect(a: &[(i64, i64)], b: &[(i64, i64)]) -> Intervals {
             }
         }
     }
-    union(out)
-}
-
-/// Issue #18 part 2a: a pushed `Level` side's pieces of its fetch window,
-/// from each level's coverage statement (S1): what each level serves, the
-/// time no level covers, and the raw read around it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Pieces {
-    /// `(level index, intervals)`, from the route's level down; a level
-    /// that serves nothing is left out.
-    pub served: Vec<(usize, Intervals)>,
-    /// The window less every level's coverage.
-    pub todo: Intervals,
-    /// `todo` widened by the range on both sides inside the window when the
-    /// counter is overlaid; `todo` itself otherwise.
-    pub read: Intervals,
-}
-
-/// Issue #18 part 2a: today's level loop (`rollup_chunk`) over the S1 rows
-/// of each level `(index, runs)`: from the route's level down, each level
-/// serves what it covers of what the coarser ones left; the rest is raw,
-/// read widened by the range under 720 s (plan Q12), as it is from 720 s.
-pub fn level_pieces(
-    runs: &[(usize, Vec<RunRow>)],
-    shards: u32,
-    window: (i64, i64),
-    range_ms: i64,
-    overlaid: bool,
-) -> Pieces {
-    let mut levels: Vec<&(usize, Vec<RunRow>)> = runs.iter().collect();
-    levels.sort_by_key(|(k, _)| std::cmp::Reverse(*k));
-    let mut todo = vec![window];
-    let mut served = Vec::new();
-    for (k, rows) in levels {
-        let covered = coverage(rows, shards);
-        let mine = intersect(&covered, &todo);
-        todo = subtract(&todo, &covered);
-        if !mine.is_empty() {
-            served.push((*k, mine));
-        }
-    }
-    let read = if overlaid {
-        widen(&todo, range_ms, window)
-    } else {
-        todo.clone()
-    };
-    Pieces { served, todo, read }
-}
-
-/// The most intervals one level or raw statement names.
-pub const MAX_STATEMENT_INTERVALS: usize = 64;
-
-/// Whether `t` lies in one of `a`'s intervals.
-pub fn contains(a: &[(i64, i64)], t: i64) -> bool {
-    let i = a.partition_point(|&(_, hi)| hi < t);
-    a.get(i).is_some_and(|&(lo, hi)| lo < t && t <= hi)
+    merged(&out)
 }
 
 /// One element of a series' merged sequence (plan section 4 step 4): a
@@ -1013,41 +1016,6 @@ fn counter(seq: &[Tagged], out: &mut Vec<Sample>) {
             }
         }
     }
-}
-
-/// Plan section 7: whether some step's window `(t − offset − range,
-/// t − offset]` touches none of `pieces`.
-pub fn level_window_exists(sel: &SelectorSpec, p: &PlanParams, pieces: &Intervals) -> bool {
-    let range = sel.range_ms.unwrap_or(0);
-    let clear = |t: i64| {
-        let hi = t - sel.offset_ms;
-        let lo = hi - range;
-        !pieces.iter().any(|&(a, b)| lo < b && hi > a)
-    };
-    if let Some(t) = sel.at_ms {
-        return clear(t);
-    }
-    let (end, step) = (p.end_ms, p.step_ms);
-    if step <= 0 || p.start_ms == end {
-        return clear(p.start_ms);
-    }
-    let mut t = p.start_ms;
-    while t <= end {
-        if clear(t) {
-            return true;
-        }
-        t += step;
-    }
-    false
-}
-
-/// The intervals of `a`, each widened by `by` on both sides and clipped to
-/// `within`, merged.
-pub fn widen(a: &[(i64, i64)], by: i64, within: (i64, i64)) -> Intervals {
-    union(
-        a.iter()
-            .map(|&(x, y)| ((x - by).max(within.0), (y + by).min(within.1))),
-    )
 }
 
 /// `86400000` → `1d`, `7200000` → `2h`, `720000` → `12m`, `60000` → `1m`,
@@ -1399,9 +1367,9 @@ mod tests {
         lattice(&planned, &p, &lv)
     }
 
-    /// **U10 (issue #18): the lattice of a request.** The bucket ends, the
-    /// last of them and the newest steps' grid; `None` where D2 keeps the
-    /// request's own steps.
+    /// **U10 (issue #18): the lattice of a request.** The width and the last
+    /// bucket end the steps are read at, `⌈t_last / L⌉ × L` (issue #810, no
+    /// tail); `None` where D2 keeps the request's own steps.
     #[test]
     fn the_lattice_of_a_request() {
         let s = BASE + 6 * MIN;
@@ -1410,12 +1378,7 @@ mod tests {
             two_days("rate(x[2m15s])"),
             Some(Lattice {
                 width: 720_000,
-                until_ms: Some(BASE + 2 * DAY),
-                tail: Some(query(
-                    BASE + 2 * DAY + 2 * MIN,
-                    BASE + 2 * DAY + 6 * MIN,
-                    120_000
-                )),
+                until_ms: Some(BASE + 2 * DAY + 12 * MIN),
             }),
             "(a)"
         );
@@ -1424,7 +1387,6 @@ mod tests {
             Some(Lattice {
                 width: 720_000,
                 until_ms: Some(BASE + 2 * DAY),
-                tail: None,
             }),
             "(b)"
         );
@@ -1433,7 +1395,6 @@ mod tests {
             Some(Lattice {
                 width: 7_200_000,
                 until_ms: None,
-                tail: None,
             }),
             "(c)"
         );
@@ -1445,8 +1406,11 @@ mod tests {
         assert_eq!(two_days("vector(1)"), None, "(i)");
         assert_eq!(
             lattice_of("rate(x[2m15s])", s, 2 * DAY, 3 * DAY),
-            None,
-            "(j): no bucket end at or before the last step"
+            Some(Lattice {
+                width: 720_000,
+                until_ms: Some(BASE + 12 * MIN),
+            }),
+            "(j): one step, read at the bucket end that holds it"
         );
         assert_eq!(two_days("x * 0 + time()"), None, "(k)");
         assert_eq!(two_days("timestamp(x)"), None, "(l)");
@@ -1465,7 +1429,6 @@ mod tests {
             .expect("a lattice");
         assert_eq!(l.width, 60_000, "the width");
         assert_eq!(l.until_ms, Some(BASE + 13 * HOUR + MIN), "until");
-        assert_eq!(l.tail, None, "no tail");
     }
 
     /// **T12 (issue #810): a long list reads by its IDs.** The cache's list
@@ -1771,8 +1734,6 @@ mod tests {
 
     fn row(t_end: i64, t_last: i64, last: f64, inc: f64, count: u32) -> LevelRow {
         LevelRow {
-            shard: 1,
-            kind: 0,
             fingerprint: Fingerprint::from_raw(7),
             t_end,
             t_last,
@@ -2002,76 +1963,6 @@ mod tests {
         );
     }
 
-    fn run(shard: u32, t_last: i64, t_end: i64) -> RunRow {
-        RunRow {
-            shard,
-            t_last,
-            t_end,
-        }
-    }
-
-    /// **U2 (issue #18 part 2a): `level_pieces` splits the window as the
-    /// route's level loop does**: each level serves what it covers of what
-    /// the coarser ones left, and the raw read is the rest, widened only
-    /// when the counter is overlaid.
-    #[test]
-    fn level_pieces_split_the_window_as_the_route_does() {
-        let w = (0, 100);
-        let one = |runs: Vec<(usize, Vec<RunRow>)>, overlaid: bool| {
-            level_pieces(&runs, 1, w, 10, overlaid)
-        };
-        // (a) the route's level covers the whole window.
-        let a = one(vec![(1, vec![run(1, 0, 100)]), (0, vec![])], false);
-        assert_eq!(a.served, vec![(1, vec![(0, 100)])], "(a)");
-        assert_eq!(a.todo, Vec::<(i64, i64)>::new(), "(a)");
-        // (b) the finer level serves only the coarser one's gap.
-        let b = one(
-            vec![
-                (1, vec![run(1, 0, 40), run(1, 60, 100)]),
-                (0, vec![run(1, 0, 100)]),
-            ],
-            false,
-        );
-        assert_eq!(
-            b.served,
-            vec![(1, vec![(0, 40), (60, 100)]), (0, vec![(40, 60)])],
-            "(b)"
-        );
-        assert_eq!(b.todo, Vec::<(i64, i64)>::new(), "(b)");
-        // (c) the rest is raw, read as it is.
-        let c = one(
-            vec![(1, vec![run(1, 0, 40)]), (0, vec![run(1, 0, 50)])],
-            false,
-        );
-        assert_eq!(
-            c.served,
-            vec![(1, vec![(0, 40)]), (0, vec![(40, 50)])],
-            "(c)"
-        );
-        assert_eq!(c.todo, vec![(50, 100)], "(c)");
-        assert_eq!(c.read, c.todo, "(c) not overlaid");
-        // (d) overlaid: the raw read widened by the range.
-        let d = one(
-            vec![(1, vec![run(1, 0, 40)]), (0, vec![run(1, 0, 50)])],
-            true,
-        );
-        assert_eq!(d.todo, vec![(50, 100)], "(d)");
-        assert_eq!(d.read, vec![(40, 100)], "(d) overlaid, range 10");
-        // (e) a level on one shard of two covers nothing.
-        let e = level_pieces(
-            &[
-                (1, vec![run(1, 0, 100)]),
-                (0, vec![run(1, 0, 100), run(2, 0, 100)]),
-            ],
-            2,
-            w,
-            10,
-            false,
-        );
-        assert_eq!(e.served, vec![(0, vec![(0, 100)])], "(e)");
-        assert_eq!(e.todo, Vec::<(i64, i64)>::new(), "(e)");
-    }
-
     /// **U5 (issue #18 part 2c): the replica-delay statement skips an
     /// unreachable replica.**
     #[test]
@@ -2079,79 +1970,6 @@ mod tests {
         assert_eq!(
             replica_delay_sql("pulsus_test_cluster", "pulsus"),
             "SELECT hostName() AS host, table, absolute_delay FROM clusterAllReplicas('pulsus_test_cluster', system.replicas) WHERE database = 'pulsus' ORDER BY host, table SETTINGS skip_unavailable_shards = 1"
-        );
-    }
-
-    /// **B1d (issue #18 part B): coverage is each shard's union of run
-    /// intervals, intersected over every shard of the cluster.**
-    #[test]
-    fn b1d_coverage_intersects_every_shard() {
-        let runs = [
-            run(1, 0, 100),
-            run(1, 100, 200),
-            run(2, 0, 50),
-            run(2, 80, 200),
-        ];
-        assert_eq!(
-            coverage(&runs, 2),
-            vec![(0, 50), (80, 200)],
-            "the gap of shard 2"
-        );
-        assert_eq!(
-            coverage(&runs[..2], 1),
-            vec![(0, 200)],
-            "adjacent runs merge"
-        );
-        assert_eq!(
-            coverage(&runs, 3),
-            Vec::<(i64, i64)>::new(),
-            "a shard with no run row covers nothing"
-        );
-        assert_eq!(coverage(&[], 1), Vec::<(i64, i64)>::new());
-        assert_eq!(subtract(&[(0, 200)], &[(0, 50), (80, 200)]), vec![(50, 80)]);
-        assert_eq!(
-            subtract(&[(10, 300)], &[(0, 50), (80, 200)]),
-            vec![(50, 80), (200, 300)]
-        );
-        assert_eq!(
-            intersect(&[(10, 300)], &[(0, 50), (80, 200)]),
-            vec![(10, 50), (80, 200)]
-        );
-    }
-
-    fn no_tenant() -> Tenant {
-        Tenant::from_header(None, false).expect("the empty tenant")
-    }
-
-    /// **B1e and U1 (issue #18): the level fetch is plan section 2's
-    /// statement**, `toUInt32(1)` on one node and `_shard_num` clustered;
-    /// one interval keeps its text, two are `OR`ed in both halves.
-    #[test]
-    fn b1e_the_level_fetch_statement() {
-        let fps = [
-            Fingerprint::from_raw(101).sql_literal(),
-            Fingerprint::from_raw(205).sql_literal(),
-        ];
-        let body = "kind, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags\n";
-        let rest = "WHERE (kind = 0 AND org_id = '' AND fingerprint IN ('101', '205') AND t_end > 1000 AND t_end <= 9000)\n   OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > 1000 AND t_last < 9000)\nORDER BY kind, fingerprint, t_end";
-        let one = [(1000, 9000)];
-        assert_eq!(
-            level_fetch(&no_tenant(), "metric_samples_720s", &fps, &one, false),
-            format!("SELECT toUInt32(1) AS shard, {body}FROM metric_samples_720s\n{rest}")
-        );
-        assert_eq!(
-            level_fetch(&no_tenant(), "metric_samples_720s_dist", &fps, &one, true),
-            format!("SELECT _shard_num AS shard, {body}FROM metric_samples_720s_dist\n{rest}")
-        );
-        let two = [(1000, 2000), (8000, 9000)];
-        let rest = "WHERE (kind = 0 AND org_id = '' AND fingerprint IN ('101', '205') AND ((t_end > 1000 AND t_end <= 2000) OR (t_end > 8000 AND t_end <= 9000)))\n   OR (kind = 1 AND org_id = '' AND fingerprint = 0 AND ((t_end > 1000 AND t_last < 2000) OR (t_end > 8000 AND t_last < 9000)))\nORDER BY kind, fingerprint, t_end";
-        assert_eq!(
-            level_fetch(&no_tenant(), "metric_samples_60s", &fps, &two, false),
-            format!("SELECT toUInt32(1) AS shard, {body}FROM metric_samples_60s\n{rest}")
-        );
-        assert_eq!(
-            level_fetch(&no_tenant(), "metric_samples_60s_dist", &fps, &two, true),
-            format!("SELECT _shard_num AS shard, {body}FROM metric_samples_60s_dist\n{rest}")
         );
     }
 

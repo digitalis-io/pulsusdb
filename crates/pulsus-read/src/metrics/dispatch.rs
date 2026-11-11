@@ -417,6 +417,20 @@ mod leaf {
             settings: &QuerySettings,
             budget: Option<&SampleBudget>,
         ) -> Result<Vec<R>, ReadError> {
+            self.fetch_rows_charging(sql, settings, budget, |_| true)
+                .await
+        }
+
+        /// Issue #810: [`Self::fetch_rows_with`], charging `budget` only for
+        /// the rows `charge` accepts: a routed statement's labels and
+        /// `hist_n` rows are series hydration, never charged.
+        pub(crate) async fn fetch_rows_charging<R: ChRow>(
+            &self,
+            sql: String,
+            settings: &QuerySettings,
+            budget: Option<&SampleBudget>,
+            charge: impl Fn(&R) -> bool,
+        ) -> Result<Vec<R>, ReadError> {
             let sql = escape_query_placeholders(&sql);
             if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
                 return Err(ReadError::QueryTooBroad(reason));
@@ -427,7 +441,7 @@ mod leaf {
                 .query_stream::<R>(&sql, settings)
                 .await
                 .map_err(|e| map_metrics_read_error(e, self.read_max_memory_bytes))?;
-            drain_charged(stream, budget, self.read_max_memory_bytes).await
+            drain_charged(stream, budget, self.read_max_memory_bytes, charge).await
         }
 
         /// [`Self::fetch_rows_with`] for an exemplar statement (issue #501
@@ -509,6 +523,7 @@ pub(crate) async fn drain_charged<R, S>(
     mut stream: S,
     budget: Option<&SampleBudget>,
     read_max_memory_bytes: u64,
+    charge: impl Fn(&R) -> bool,
 ) -> Result<Vec<R>, ReadError>
 where
     S: futures::Stream<Item = Result<R, ChError>> + Unpin,
@@ -516,7 +531,9 @@ where
     let mut out = Vec::new();
     while let Some(row) = stream.next().await {
         let row = row.map_err(|e| map_metrics_read_error(e, read_max_memory_bytes))?;
-        if let Some(b) = budget {
+        if let Some(b) = budget
+            && charge(&row)
+        {
             b.charge_one().map_err(ReadError::QueryTooBroad)?;
         }
         out.push(row);
@@ -662,7 +679,7 @@ mod tests {
     #[tokio::test]
     async fn the_budget_refuses_mid_statement_before_a_later_row_fails() {
         let budget = SampleBudget::new(2);
-        let err = drain_charged(rows_then_error(3), Some(&budget), TEST_READ_MEM)
+        let err = drain_charged(rows_then_error(3), Some(&budget), TEST_READ_MEM, |_| true)
             .await
             .expect_err("a cap below the rows must refuse");
         match err {
@@ -682,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn a_cap_equal_to_the_rows_admits_them_and_the_streams_error_surfaces() {
         let budget = SampleBudget::new(3);
-        let err = drain_charged(rows_then_error(3), Some(&budget), TEST_READ_MEM)
+        let err = drain_charged(rows_then_error(3), Some(&budget), TEST_READ_MEM, |_| true)
             .await
             .expect_err("the stream ends in an error");
         // Both refusals are `QueryTooBroad`; the REASON is what separates
@@ -704,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_row_is_not_charged() {
         let budget = SampleBudget::new(3);
-        let _ = drain_charged(rows_then_error(3), Some(&budget), TEST_READ_MEM).await;
+        let _ = drain_charged(rows_then_error(3), Some(&budget), TEST_READ_MEM, |_| true).await;
         // Three admitted, none spent on the failure: the fourth charge is
         // the first to breach.
         assert!(
@@ -718,7 +735,7 @@ mod tests {
     #[tokio::test]
     async fn an_uncharged_drain_returns_every_row() {
         let rows: Vec<Result<u32, ChError>> = (0..5u32).map(Ok).collect();
-        let got = drain_charged(futures::stream::iter(rows), None, TEST_READ_MEM)
+        let got = drain_charged(futures::stream::iter(rows), None, TEST_READ_MEM, |_| true)
             .await
             .expect("a clean stream");
         assert_eq!(got, vec![0, 1, 2, 3, 4]);

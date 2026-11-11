@@ -437,7 +437,7 @@ async fn run_range_query(
     // accepted.
     let engine_options = EngineOptions {
         lookback_ms,
-        routing_span_ms: Some(p.end_ms - p.start_ms),
+        request: Some(*p),
     };
     let answer = with_engine(state, engine_options, |engine| {
         let cache = std::sync::Arc::clone(&cache);
@@ -449,7 +449,8 @@ async fn run_range_query(
                 p,
                 engine.lookback_ms(),
                 engine.resolution_ms(p),
-            );
+            )
+            .with_levels_id(engine.levels_id());
             let now = cache.now_ms();
             let req = read_cache::RangeRequest {
                 key,

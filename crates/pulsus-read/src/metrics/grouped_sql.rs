@@ -672,32 +672,14 @@ fn avg_fold(values: &str, state: &str) -> String {
     )
 }
 
-/// Issue #18 part 2a: one level a `Level` side reads — its table, its
-/// width in milliseconds, and the intervals it serves.
-pub type LevelServed<'a> = (&'a str, i64, &'a [(i64, i64)]);
-
-/// Issue #579 part 4: a `Level` side's reads for one time chunk, as phase 1
-/// computed them from its coverage statement (S1).
+/// Issue #579 part 4: a `Level` side's read for one time chunk. Issue #810
+/// (D1): the route's level alone, over the fetch window cut to the chunk.
 #[derive(Debug, Clone, Copy)]
 pub struct LevelRead<'a> {
-    pub clustered: bool,
-    pub shards: u32,
-    /// The selector's fetch window `(lo, hi]`: S1's run predicate.
-    pub window: (i64, i64),
-    /// Issue #18 part 2a: each level the side reads, `(table, width ms,
-    /// served)`, from the route's level down, its served part cut to `(lo,
-    /// chunk end]`; a level that serves nothing is not listed.
-    pub levels: &'a [LevelServed<'a>],
-    /// Issue #18 part 2a: the window no level covers, cut likewise.
-    pub todo: &'a [(i64, i64)],
-    /// The raw read around the uncovered part, cut likewise.
-    pub read: &'a [(i64, i64)],
-    /// The chunk's grid indices whose window reaches the uncovered part,
-    /// chunk-relative, `[g0, g1)`; empty unless `overlaid`.
-    pub raw_steps: &'a [(u32, u32)],
-    /// Issue #18 part 2a: the raw samples are read through the overlay
-    /// (a route under 720 s), not folded into the counter.
-    pub overlaid: bool,
+    pub table: &'a str,
+    pub res_ms: i64,
+    /// `(lo, min(chunk end, hi)]`, `hi` the fetch window's end (D3).
+    pub served: (i64, i64),
 }
 
 /// Issue #18 part 2c: how a side's statements name its series: the ID
@@ -721,6 +703,9 @@ pub enum SideSeries<'a> {
 /// query has a routed selector.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Counts<'a> {
+    // `series_n`: the expression counting the statement's series; `cap`:
+    // what `series_n * grid_n` is gated on; `hist_where`: `hist_n`'s whole
+    // condition, its tenant included.
     pub series_n: Option<&'a str>,
     pub cap: usize,
     pub hist_where: Option<&'a str>,
@@ -755,16 +740,33 @@ FROM (SELECT arrayJoin(CAST([{members}], 'Array(Tuple(UInt128, UInt64, Array(Tup
     )
 }
 
+/// Issue #810 (D10): where a gated read names the cap; [`aggregate_over`]
+/// replaces it with the statement's cap.
+const SERIES_CAP: &str = "__pulsus_series_cap__";
+
 impl SideSeries<'_> {
     /// The statements' series filter: the literal list for a known side,
-    /// else `fingerprint [GLOBAL ]IN (ids)`.
+    /// else `fingerprint [GLOBAL ]IN (ids)`; on a gated side, with the gate.
     pub fn filter(&self, global: bool) -> String {
-        match self {
+        let read = match self {
             SideSeries::Ids { ids, .. } => {
                 let global = if global { "GLOBAL " } else { "" };
                 format!("fingerprint {global}IN (\n{ids}\n)")
             }
             SideSeries::Known { list, .. } => format!("fingerprint IN ({list})"),
+        };
+        format!("{read}{}", self.gate())
+    }
+
+    /// ` AND series_n * grid_n <= {cap}` on a gated side, else nothing.
+    fn gate(&self) -> String {
+        let gated = match self {
+            SideSeries::Ids { gated, .. } | SideSeries::Known { gated, .. } => *gated,
+        };
+        if gated {
+            format!(" AND series_n * grid_n <= {SERIES_CAP}")
+        } else {
+            String::new()
         }
     }
 }
@@ -790,64 +792,39 @@ pub struct SideSql<'a> {
 }
 
 /// Issue #579 part 4: `LEVEL_ROWS` — the level table's data rows of
-/// `served` for the selector's series, one row per series with its rows
-/// sorted. Issue #18 part 2c: no run rows and no replica check; a lagging
-/// replica is passed over by `max_replica_delay_for_distributed_queries`.
+/// `(lo, hi]` for the selector's series, one row per series with its rows
+/// sorted. Issue #810: read only while the query has no native-histogram
+/// sample (`hist_n = 0`, D9).
 pub fn level_rows(
     tenant: &Tenant,
     series: &SideSeries<'_>,
     table: &str,
-    served: &[(i64, i64)],
+    (lo, hi): (i64, i64),
 ) -> String {
     format!(
         "SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
 FROM (
   SELECT fingerprint, t_end, t_last, last, inc
   FROM {table}
-  WHERE kind = 0 AND org_id = {} AND {} AND {}
+  WHERE kind = 0 AND org_id = {} AND t_end > {lo} AND t_end <= {hi} AND {} AND hist_n = 0
 )
 GROUP BY fingerprint",
         tenant.sql_literal(),
-        sample_sql::intervals_predicate("t_end", "t_end", "<=", served),
         series.filter(true),
     )
 }
 
-/// Issue #18 part 2a: `COUNTER_GATHER`'s elements — one block per level,
-/// its `LEVEL_ROWS` rows as `(t_end, width, t_last, last, inc)`, and, from
-/// 720 s, the raw samples no level covers as `(t, 0, t, v, 0.)`.
-fn counter_elements(
-    tenant: &Tenant,
-    samples_table: &str,
-    series: &SideSeries<'_>,
-    level: &LevelRead<'_>,
-) -> Vec<String> {
-    let mut out: Vec<String> = level
-        .levels
-        .iter()
-        .map(|&(table, res_ms, served)| {
-            format!(
-                "SELECT fingerprint, arrayMap(r -> (r.1, toInt64({res_ms}), r.2, r.3, r.4), rows0) AS es
+/// Issue #810: `COUNTER_GATHER`'s elements — the route's level's
+/// `LEVEL_ROWS` rows as `(t_end, width, t_last, last, inc)`.
+fn counter_elements(tenant: &Tenant, series: &SideSeries<'_>, level: &LevelRead<'_>) -> String {
+    format!(
+        "SELECT fingerprint, arrayMap(r -> (r.1, toInt64({}), r.2, r.3, r.4), rows0) AS es
 FROM (
 {}
 )",
-                level_rows(tenant, series, table, served)
-            )
-        })
-        .collect();
-    if !level.overlaid && !level.todo.is_empty() {
-        out.push(format!(
-            "SELECT fingerprint, groupArray((unix_milli, toInt64(0), unix_milli, value, 0.)) AS es
-FROM {samples_table}
-WHERE org_id = {} AND {} AND {}
-  AND reinterpretAsUInt64(value) != {STALE_NAN_DECIMAL}
-GROUP BY fingerprint",
-            tenant.sql_literal(),
-            sample_sql::intervals_predicate("unix_milli", "unix_milli", "<=", level.todo),
-            series.filter(false),
-        ));
-    }
-    out
+        level.res_ms,
+        level_rows(tenant, series, level.table, level.served)
+    )
 }
 
 /// Issue #18 part 2a: `COUNTER_GATHER` — a `Level` arm's points: one
@@ -859,13 +836,8 @@ GROUP BY fingerprint",
 /// start point. Each point carries its element's position and a sub-order
 /// (the start point first), so points at one time keep the fold's order.
 /// Stale markers are dropped and the groups with no point removed last.
-pub fn counter_gather(
-    tenant: &Tenant,
-    samples_table: &str,
-    series: &SideSeries<'_>,
-    level: &LevelRead<'_>,
-) -> String {
-    let elements = counter_elements(tenant, samples_table, series, level).join("\nUNION ALL\n");
+pub fn counter_gather(tenant: &Tenant, series: &SideSeries<'_>, level: &LevelRead<'_>) -> String {
+    let elements = counter_elements(tenant, series, level);
     format!(
         "SELECT fingerprint, arm, raw FROM (
 SELECT fingerprint, toUInt8(0) AS arm,
@@ -903,24 +875,6 @@ WHERE notEmpty(raw)"
     )
 }
 
-/// Issue #579 part 4: S4, explain only — whether a `Level` side read any
-/// level row, today's `served_from_level` for a counter. Issue #18 part
-/// 2a: over the `LEVEL_ROWS` of every level the side reads.
-pub fn level_served(tenant: &Tenant, series: &SideSeries<'_>, level: &LevelRead<'_>) -> String {
-    let rows = level
-        .levels
-        .iter()
-        .map(|&(table, _, served)| level_rows(tenant, series, table, served))
-        .collect::<Vec<_>>()
-        .join("\nUNION ALL\n");
-    format!(
-        "SELECT toUInt8(count() > 0) AS served
-FROM (
-{rows}
-)"
-    )
-}
-
 /// Issue #579 part 4: a side's raw points over the intervals `within`, its
 /// `arm` 1: part 3's gather over a list of intervals.
 pub fn raw_gather_within(
@@ -950,60 +904,34 @@ pub fn raw_gather_within(
 /// steps), the level elsewhere.
 pub fn series_steps(side: &SideSql<'_>, grid: Grid) -> String {
     let range = side.range_ms.to_string();
-    let (gather, steps) = match &side.level {
-        Some(level) => {
-            // Issue #18 part 2a: under 720 s the raw samples stay in part 4's
-            // raw arm. A chunk in which no level serves and the counter
-            // takes no raw sample reads the raw arm alone.
-            let counter = !level.levels.is_empty() || (!level.overlaid && !level.todo.is_empty());
-            let mut parts = Vec::new();
-            if counter {
-                parts.push(counter_gather(
-                    side.tenant,
-                    side.samples_table,
-                    &side.series,
-                    level,
-                ));
-            }
-            if !counter || (level.overlaid && !level.read.is_empty()) {
-                parts.push(raw_gather_within(
-                    side.tenant,
-                    side.samples_table,
-                    &side.series,
-                    level.read,
-                ));
-            }
-            let steps = if level.overlaid {
-                level.raw_steps.to_vec()
-            } else {
-                Vec::new()
-            };
-            (parts.join("\nUNION ALL\n"), steps)
-        }
+    // Issue #810 (D1): a level side reads its level's rows alone; a raw
+    // side its raw samples over the grid's windows.
+    let (gather, raw) = match &side.level {
+        Some(level) => (counter_gather(side.tenant, &side.series, level), false),
         None => {
             let (lo, hi) = range_window(grid, side.range_ms);
             (
                 raw_gather_within(side.tenant, side.samples_table, &side.series, &[(lo, hi)]),
-                vec![(0, grid.points)],
+                true,
             )
         }
     };
-    let steps = if steps.is_empty() {
-        "CAST([], 'Array(Tuple(UInt32, UInt32))')".to_string()
-    } else {
-        format!(
-            "[{}]",
-            steps
-                .iter()
-                .map(|(a, b)| format!("({a}, {b})"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-    let keep = if matches!(side.func, PushedRangeFn::Irate) {
-        format!(" AND t_p > grid_start + gi * grid_step - {range} AND t_l != t_p")
-    } else {
+    let mut keep = Vec::new();
+    if raw {
+        keep.push(format!(
+            "arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, [(0, {})]))",
+            grid.points
+        ));
+    }
+    if matches!(side.func, PushedRangeFn::Irate) {
+        keep.push(format!(
+            "t_p > grid_start + gi * grid_step - {range} AND t_l != t_p"
+        ));
+    }
+    let keep = if keep.is_empty() {
         String::new()
+    } else {
+        format!("\nWHERE {}", keep.join(" AND "))
     };
     let value = value_text(side.func, &range, side.scale);
     let windows = series_windows(&gather, " arm,", &range, side.func);
@@ -1016,18 +944,22 @@ FROM (
   FROM (
 {windows}
   )
-)
-WHERE arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, {steps})){keep}"
+){keep}"
     )
 }
 
 /// Issue #579 part 4: `MEMBERS` — each series' rank in `(name, ID)` order,
 /// the order the evaluator folds in, and its stored label pairs.
 pub fn members(side: &SideSql<'_>) -> String {
+    let gate = side.series.gate();
     let ids = match side.series {
         SideSeries::Ids { ids, .. } => ids,
-        // Issue #18 part 2c: the label cache's own members.
-        SideSeries::Known { members, .. } => return members.to_string(),
+        // Issue #18 part 2c: the label cache's own members. Issue #810:
+        // gated after the `arrayJoin` subquery.
+        SideSeries::Known { members, .. } if gate.is_empty() => return members.to_string(),
+        SideSeries::Known { members, .. } => {
+            return format!("{members}\nWHERE series_n * grid_n <= {SERIES_CAP}");
+        }
     };
     format!(
         "SELECT fingerprint, row_number() OVER (ORDER BY name, fingerprint) AS rank, JSONExtractKeysAndValues(l, 'String') AS kv
@@ -1037,7 +969,7 @@ FROM (
   WHERE org_id = {} AND metric_name = {}
     AND fingerprint IN (
 {}
-    )
+    ){gate}
   GROUP BY fingerprint
 )",
         side.labels_table,
@@ -1065,15 +997,26 @@ pub fn group_key_over(grouping: Option<&Grouping>, kv: &str) -> String {
     }
 }
 
+/// Issue #810 (D10): the key of the row carrying a pushed statement's own
+/// series count, `series_n`. No series' labels make it.
+pub const SERIES_SENTINEL_KEY: &str = "CAST([('', 'series')], 'Array(Tuple(String, String))')";
+
+/// Issue #810 (D9): the key of the row carrying `hist_n`, the query's
+/// routed selectors' native-histogram samples.
+pub const HIST_N_SENTINEL_KEY: &str = "CAST([('', 'hist_n')], 'Array(Tuple(String, String))')";
+
 /// The groups stage both part-4 statements share: `inner` gives `gid,
 /// rank, gi, v`; the sentinel row carries the histogram count of
-/// `sentinel_where`.
+/// `sentinel_where`. Issue #810: with `counts.series_n`, the statement's
+/// series count and its gate; with `counts.hist_where`, `hist_n` and its
+/// row.
 fn aggregate_over(
     grid: Grid,
     op: RangeAggOp,
     inner: &str,
     hist_samples_table: &str,
     sentinel_where: &str,
+    counts: &Counts<'_>,
 ) -> String {
     let Grid {
         start_ms,
@@ -1082,8 +1025,24 @@ fn aggregate_over(
         ..
     } = grid;
     let agg = range_agg_expression(op);
-    format!(
-        "WITH {start_ms} AS grid_start, {step_ms} AS grid_step, {points} AS grid_n
+    let mut with = format!("{start_ms} AS grid_start, {step_ms} AS grid_step, {points} AS grid_n");
+    let mut rows = String::new();
+    if let Some(series_n) = counts.series_n {
+        with.push_str(&format!(",\n     ifNull(({series_n}), 0) AS series_n"));
+        rows.push_str(&format!(
+            "\nUNION ALL\nSELECT {SERIES_SENTINEL_KEY} AS gid, toUInt32(0) AS gi, toFloat64(series_n) AS agg"
+        ));
+    }
+    if let Some(hist_where) = counts.hist_where {
+        with.push_str(&format!(
+            ",\n     ifNull((SELECT count() FROM {hist_samples_table} WHERE {hist_where}), 0) AS hist_n"
+        ));
+        rows.push_str(&format!(
+            "\nUNION ALL\nSELECT {HIST_N_SENTINEL_KEY} AS gid, toUInt32(0) AS gi, toFloat64(hist_n) AS agg"
+        ));
+    }
+    let sql = format!(
+        "WITH {with}
 SELECT gid, gi, agg FROM (
 SELECT gid, gi,
 {agg}
@@ -1097,9 +1056,10 @@ FROM (
 )
 UNION ALL
 SELECT {HISTOGRAM_SENTINEL_KEY} AS gid, toUInt32(0) AS gi,
-  toFloat64((SELECT count() FROM {hist_samples_table} WHERE {sentinel_where})) AS agg
+  toFloat64((SELECT count() FROM {hist_samples_table} WHERE {sentinel_where})) AS agg{rows}
 ORDER BY gid, gi"
-    )
+    );
+    sql.replace(SERIES_CAP, &counts.cap.to_string())
 }
 
 /// `unix_milli > lo AND unix_milli <= hi AND fingerprint IN (ids)`: one
@@ -1120,7 +1080,7 @@ pub fn level_aggregate_fetch(
     grouping: Option<&Grouping>,
     grid: Grid,
     op: RangeAggOp,
-    _counts: &Counts<'_>,
+    counts: &Counts<'_>,
 ) -> String {
     let inner = format!(
         "    SELECT {} AS gid, m.rank AS rank, s.gi AS gi, s.v AS v
@@ -1141,7 +1101,7 @@ pub fn level_aggregate_fetch(
         side.tenant.sql_literal(),
         side.series.filter(false)
     );
-    aggregate_over(grid, op, &inner, hist_samples_table, &sentinel)
+    aggregate_over(grid, op, &inner, hist_samples_table, &sentinel, counts)
 }
 
 /// Issue #579 part 5: the key of S3c's matching sentinel row — a step at
@@ -1166,7 +1126,7 @@ pub fn match_aggregate_fetch(
     bin: BinOp,
     bool_modifier: bool,
     spec: &super::grouped::MatchSpec,
-    _counts: &Counts<'_>,
+    counts: &Counts<'_>,
 ) -> String {
     use pulsus_promql::Group;
     let list = |labels: &[String]| {
@@ -1334,7 +1294,7 @@ pub fn match_aggregate_fetch(
         side_histograms(lhs),
         side_histograms(rhs)
     );
-    aggregate_over(grid, op, &inner, hist_samples_table, &sentinel)
+    aggregate_over(grid, op, &inner, hist_samples_table, &sentinel, counts)
 }
 
 /// Issue #579 part 4: shape C, one time chunk (S3b): both sides' steps,
@@ -1353,7 +1313,7 @@ pub fn join_aggregate_fetch(
     op: RangeAggOp,
     bin: BinOp,
     bool_modifier: bool,
-    _counts: &Counts<'_>,
+    counts: &Counts<'_>,
 ) -> String {
     let cmp = match bin {
         BinOp::Eq => Some("="),
@@ -1416,7 +1376,7 @@ pub fn join_aggregate_fetch(
         side_histograms(lhs),
         side_histograms(rhs)
     );
-    aggregate_over(grid, op, &inner, hist_samples_table, &sentinel)
+    aggregate_over(grid, op, &inner, hist_samples_table, &sentinel, counts)
 }
 
 #[cfg(test)]
@@ -1978,32 +1938,22 @@ mod tests {
     const T11_START: i64 = 1_793_300_400_000;
     const T11_END: i64 = T11_START + 720 * 120_000;
     const T11_WINDOW: (i64, i64) = (T11_START - 600_000, T11_END);
-    const T11_SERVED: [(i64, i64); 2] = [
-        (T11_WINDOW.0, T11_END - 21_600_000),
-        (T11_END - 19_800_000, T11_END - 600_000),
-    ];
-    const T11_READ: [(i64, i64); 2] = [
-        (T11_END - 21_900_000, T11_END - 19_500_000),
-        (T11_END - 900_000, T11_END),
-    ];
-    const T11_STEPS: [(u32, u32); 2] = [(541, 559), (715, 721)];
-
-    const T11_TODO: [(i64, i64); 2] = [
-        (T11_END - 21_600_000, T11_END - 19_800_000),
-        (T11_END - 600_000, T11_END),
-    ];
-
     fn t11_level() -> LevelRead<'static> {
-        const LEVELS: [LevelServed<'static>; 1] = [("metric_samples_60s", 60_000, &T11_SERVED)];
         LevelRead {
-            clustered: false,
-            shards: 1,
-            window: T11_WINDOW,
-            read: &T11_READ,
-            raw_steps: &T11_STEPS,
-            levels: &LEVELS,
-            todo: &T11_TODO,
-            overlaid: true,
+            table: "metric_samples_60s",
+            res_ms: 60_000,
+            served: T11_WINDOW,
+        }
+    }
+
+    /// A level side's statement counts the query's histograms (`hist_n`).
+    fn t11_counts() -> Counts<'static> {
+        Counts {
+            series_n: None,
+            cap: 0,
+            hist_where: Some(
+                "org_id = '' AND ((fingerprint IN (\nSELECT fingerprint FROM metric_series\n) AND unix_milli > 1782906600000 AND unix_milli <= 1782993600000))",
+            ),
         }
     }
 
@@ -2026,79 +1976,57 @@ mod tests {
             .1
     }
 
-    /// **U3 (issue #18 part 2a): the counter gather renders the plan's
-    /// text byte for byte**: (a) a 720 s side over a 60 s level and raw
-    /// samples; (b) a 60 s side over a 5 s level, overlaid, with the raw
-    /// arm; (c) a 60 s side at the finest level, part 4's case.
+    /// **U3 (issue #18 part 2a, issue #810): the counter gather renders its
+    /// text byte for byte**: (a) a 720 s side; (b) a 60 s side's steps;
+    /// (c) a 60 s side, part 4's case. Each reads its route's level alone.
     #[test]
     fn the_counter_gather_renders_the_plans_text() {
         let tenant = no_tenant();
         let ids = t11_ids("p_rx_total");
-        let h = 3_600_000;
-        let m = 60_000;
-        let s720 = vec![
-            (T11_WINDOW.0, T11_END - 20 * h),
-            (T11_END - 19 * h, T11_END - 12 * m),
-        ];
-        let s60a = vec![
-            (T11_END - 20 * h, T11_END - 19 * h),
-            (T11_END - 12 * m, T11_END - 10 * m),
-        ];
-        let todo_a = [(T11_END - 10 * m, T11_END)];
-        let levels_a = [
-            ("metric_samples_720s", 720_000, s720.as_slice()),
-            ("metric_samples_60s", 60_000, s60a.as_slice()),
-        ];
         let a = LevelRead {
-            clustered: false,
-            shards: 1,
-            window: T11_WINDOW,
-            levels: &levels_a,
-            todo: &todo_a,
-            read: &todo_a,
-            raw_steps: &[],
-            overlaid: false,
-        };
-        assert_eq!(
-            counter_gather(&tenant, "metric_samples", &SideSeries::Ids { ids: &ids, gated: false }, &a),
-            join_section("counter_gather 720s over 60s and raw"),
-            "(a)"
-        );
-        let s60b = vec![
-            (T11_WINDOW.0, T11_END - 6 * h),
-            (T11_END - 5 * h - 30 * m, T11_END - 4 * h),
-        ];
-        let s5b = vec![(T11_END - 4 * h, T11_END - 10 * m)];
-        let levels_b = [
-            ("metric_samples_60s", 60_000, s60b.as_slice()),
-            ("metric_samples_5s", 5_000, s5b.as_slice()),
-        ];
-        let b = LevelRead {
-            levels: &levels_b,
+            table: "metric_samples_720s",
+            res_ms: 720_000,
             ..t11_level()
         };
+        assert_eq!(
+            counter_gather(
+                &tenant,
+                &SideSeries::Ids {
+                    ids: &ids,
+                    gated: false
+                },
+                &a
+            ),
+            join_section("counter_gather 720s"),
+            "(a)"
+        );
         let side = SideSql {
             tenant: &tenant,
             samples_table: "metric_samples",
             labels_table: "metric_labels",
-            series: SideSeries::Ids { ids: &ids, gated: false },
+            series: SideSeries::Ids {
+                ids: &ids,
+                gated: false,
+            },
             metric_name: "p_rx_total",
             func: PushedRangeFn::Rate,
             range_ms: 300_000,
             scale: None,
             window: T11_WINDOW,
-            level: Some(b),
+            level: Some(t11_level()),
         };
         assert_eq!(
             series_steps(&side, t11_grid()),
-            join_section("series_steps 60s over 5s"),
+            join_section("series_steps 60s"),
             "(b)"
         );
         assert_eq!(
             counter_gather(
                 &tenant,
-                "metric_samples",
-                &SideSeries::Ids { ids: &ids, gated: false },
+                &SideSeries::Ids {
+                    ids: &ids,
+                    gated: false
+                },
                 &t11_level()
             ),
             join_section("counter_gather 60s"),
@@ -2125,30 +2053,10 @@ mod tests {
         ]);
         assert_eq!(members, join_section("members_known two series"), "members");
         let tenant = no_tenant();
-        let h = 3_600_000;
-        let m = 60_000;
-        let s720 = vec![
-            (T11_WINDOW.0, T11_END - 20 * h),
-            (T11_END - 19 * h, T11_END - 12 * m),
-        ];
-        let s60a = vec![
-            (T11_END - 20 * h, T11_END - 19 * h),
-            (T11_END - 12 * m, T11_END - 10 * m),
-        ];
-        let todo_a = [(T11_END - 10 * m, T11_END)];
-        let levels_a = [
-            ("metric_samples_720s", 720_000, s720.as_slice()),
-            ("metric_samples_60s", 60_000, s60a.as_slice()),
-        ];
         let level = LevelRead {
-            clustered: false,
-            shards: 1,
-            window: T11_WINDOW,
-            levels: &levels_a,
-            todo: &todo_a,
-            read: &todo_a,
-            raw_steps: &[],
-            overlaid: false,
+            table: "metric_samples_720s",
+            res_ms: 720_000,
+            ..t11_level()
         };
         let side = SideSql {
             tenant: &tenant,
@@ -2238,8 +2146,10 @@ mod tests {
         );
         let _ = &tenant;
         let n = |text: &str, p: &str| text.matches(p).count();
-        let gates = n(&sql, " AND series_n * grid_n <= 8192") + n(&sql, "WHERE series_n * grid_n <= 8192");
-        let reads = n(&sql, "fingerprint IN (") + n(&sql, "fingerprint GLOBAL IN (")
+        let gates =
+            n(&sql, " AND series_n * grid_n <= 8192") + n(&sql, "WHERE series_n * grid_n <= 8192");
+        let reads = n(&sql, "fingerprint IN (")
+            + n(&sql, "fingerprint GLOBAL IN (")
             + n(&sql, "arrayJoin(CAST([")
             - n(&hist_where, "fingerprint IN (");
         assert!(reads > 0, "{sql}");
@@ -2299,7 +2209,7 @@ mod tests {
                 RangeAggOp::Sum,
                 BinOp::Add,
                 false,
-                &Counts::default(),
+                &t11_counts(),
             ),
             join_section("sum by (instance) (rate + rate)")
         );
@@ -2313,7 +2223,7 @@ mod tests {
                 RangeAggOp::Count,
                 BinOp::Gt,
                 true,
-                &Counts::default(),
+                &t11_counts(),
             ),
             join_section("count without (device) (rate > bool irate)")
         );
@@ -2328,7 +2238,7 @@ mod tests {
                 RangeAggOp::Count,
                 BinOp::Gt,
                 false,
-                &Counts::default(),
+                &t11_counts(),
             ),
             join_section("count without (device) (rate > irate)")
         );
@@ -2378,7 +2288,13 @@ mod tests {
             )
         };
         let (rx, tx) = (known("p_rx_total"), known("p_tx_total"));
-        let tx_ids = side("p_tx_total", SideSeries::Ids { ids: &ids, gated: false });
+        let tx_ids = side(
+            "p_tx_total",
+            SideSeries::Ids {
+                ids: &ids,
+                gated: false,
+            },
+        );
         let strs = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let matches = [
             (
@@ -2540,7 +2456,14 @@ mod tests {
                 side_histograms(lhs),
                 side_histograms(rhs)
             );
-            let want = aggregate_over(t11_grid(), *op, &matched, "metric_hist_samples", &sentinel);
+            let want = aggregate_over(
+                t11_grid(),
+                *op,
+                &matched,
+                "metric_hist_samples",
+                &sentinel,
+                &Counts::default(),
+            );
             assert_eq!(
                 match_aggregate_fetch(
                     many,

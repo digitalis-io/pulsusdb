@@ -1,4 +1,4 @@
--- golden[counter_gather 720s over 60s and raw]
+-- golden[counter_gather 720s]
 SELECT fingerprint, arm, raw FROM (
 SELECT fingerprint, toUInt8(0) AS arm,
   arrayMap(q -> (q.1, q.4), arraySort(arrayFilter(q -> q.4 != 9218868437227405314, arrayFlatten(arrayMap((x, i, c) ->
@@ -29,7 +29,7 @@ SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_
 FROM (
   SELECT fingerprint, t_end, t_last, last, inc
   FROM metric_samples_720s
-  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793314800000) OR (t_end > 1793318400000 AND t_end <= 1793386080000)) AND fingerprint GLOBAL IN (
+  WHERE kind = 0 AND org_id = '' AND t_end > 1793299800000 AND t_end <= 1793386800000 AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -39,47 +39,10 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_rx_total'
   )
-)
-)
-GROUP BY fingerprint
-)
-UNION ALL
-SELECT fingerprint, arrayMap(r -> (r.1, toInt64(60000), r.2, r.3, r.4), rows0) AS es
-FROM (
-SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
-FROM (
-  SELECT fingerprint, t_end, t_last, last, inc
-  FROM metric_samples_60s
-  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793314800000 AND t_end <= 1793318400000) OR (t_end > 1793386080000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
-SELECT fingerprint
-FROM metric_series
-WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
-  AND bitAnd(hours, 16777215) != 0
-  AND fingerprint IN (
-    SELECT fingerprint
-    FROM metric_labels
-    WHERE metric_name = 'p_rx_total'
-  )
-)
+) AND hist_n = 0
 )
 GROUP BY fingerprint
 )
-UNION ALL
-SELECT fingerprint, groupArray((unix_milli, toInt64(0), unix_milli, value, 0.)) AS es
-FROM metric_samples
-WHERE org_id = '' AND unix_milli > 1793386200000 AND unix_milli <= 1793386800000 AND fingerprint IN (
-SELECT fingerprint
-FROM metric_series
-WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
-  AND bitAnd(hours, 16777215) != 0
-  AND fingerprint IN (
-    SELECT fingerprint
-    FROM metric_labels
-    WHERE metric_name = 'p_rx_total'
-  )
-)
-  AND reinterpretAsUInt64(value) != 9218868437227405314
-GROUP BY fingerprint
         )
         GROUP BY fingerprint
       )
@@ -88,7 +51,7 @@ GROUP BY fingerprint
 )
 )
 WHERE notEmpty(raw)
--- golden[series_steps 60s over 5s]
+-- golden[series_steps 60s]
 SELECT fingerprint, toUInt32(st.4) AS gi,
   st.1.2 AS i_f, st.1.1 AS t_f, st.1.3 AS y_f, st.2.2 AS i_l, st.2.1 AS t_l, st.2.3 AS y_l, st.3 AS result,
         i_l - i_f + 1 AS n,
@@ -171,7 +134,7 @@ SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_
 FROM (
   SELECT fingerprint, t_end, t_last, last, inc
   FROM metric_samples_60s
-  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793372400000)) AND fingerprint GLOBAL IN (
+  WHERE kind = 0 AND org_id = '' AND t_end > 1793299800000 AND t_end <= 1793386800000 AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -181,28 +144,7 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_rx_total'
   )
-)
-)
-GROUP BY fingerprint
-)
-UNION ALL
-SELECT fingerprint, arrayMap(r -> (r.1, toInt64(5000), r.2, r.3, r.4), rows0) AS es
-FROM (
-SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
-FROM (
-  SELECT fingerprint, t_end, t_last, last, inc
-  FROM metric_samples_5s
-  WHERE kind = 0 AND org_id = '' AND t_end > 1793372400000 AND t_end <= 1793386200000 AND fingerprint GLOBAL IN (
-SELECT fingerprint
-FROM metric_series
-WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
-  AND bitAnd(hours, 16777215) != 0
-  AND fingerprint IN (
-    SELECT fingerprint
-    FROM metric_labels
-    WHERE metric_name = 'p_rx_total'
-  )
-)
+) AND hist_n = 0
 )
 GROUP BY fingerprint
 )
@@ -214,22 +156,6 @@ GROUP BY fingerprint
 )
 )
 WHERE notEmpty(raw)
-UNION ALL
-                      SELECT fingerprint, toUInt8(1) AS arm, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
-                      FROM metric_samples
-                      WHERE org_id = '' AND ((unix_milli > 1793364900000 AND unix_milli <= 1793367300000) OR (unix_milli > 1793385900000 AND unix_milli <= 1793386800000)) AND fingerprint IN (
-SELECT fingerprint
-FROM metric_series
-WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
-  AND bitAnd(hours, 16777215) != 0
-  AND fingerprint IN (
-    SELECT fingerprint
-    FROM metric_labels
-    WHERE metric_name = 'p_rx_total'
-  )
-)
-                        AND reinterpretAsUInt64(value) != 9218868437227405314
-                      GROUP BY fingerprint
                     )
                   )
                 )
@@ -239,7 +165,6 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
         )
   )
 )
-WHERE arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, [(541, 559), (715, 721)]))
 -- golden[counter_gather 60s]
 SELECT fingerprint, arm, raw FROM (
 SELECT fingerprint, toUInt8(0) AS arm,
@@ -271,7 +196,7 @@ SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_
 FROM (
   SELECT fingerprint, t_end, t_last, last, inc
   FROM metric_samples_60s
-  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
+  WHERE kind = 0 AND org_id = '' AND t_end > 1793299800000 AND t_end <= 1793386800000 AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -281,7 +206,7 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_rx_total'
   )
-)
+) AND hist_n = 0
 )
 GROUP BY fingerprint
 )
@@ -294,7 +219,10 @@ GROUP BY fingerprint
 )
 WHERE notEmpty(raw)
 -- golden[sum by (instance) (rate + rate)]
-WITH 1793300400000 AS grid_start, 120000 AS grid_step, 721 AS grid_n
+WITH 1793300400000 AS grid_start, 120000 AS grid_step, 721 AS grid_n,
+     ifNull((SELECT count() FROM metric_hist_samples WHERE org_id = '' AND ((fingerprint IN (
+SELECT fingerprint FROM metric_series
+) AND unix_milli > 1782906600000 AND unix_milli <= 1782993600000))), 0) AS hist_n
 SELECT gid, gi, agg FROM (
 SELECT gid, gi,
   arrayCumSum(arrayPushFront(vs, 0.)) AS t,
@@ -389,7 +317,7 @@ SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_
 FROM (
   SELECT fingerprint, t_end, t_last, last, inc
   FROM metric_samples_60s
-  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
+  WHERE kind = 0 AND org_id = '' AND t_end > 1793299800000 AND t_end <= 1793386800000 AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -399,7 +327,7 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_rx_total'
   )
-)
+) AND hist_n = 0
 )
 GROUP BY fingerprint
 )
@@ -411,22 +339,6 @@ GROUP BY fingerprint
 )
 )
 WHERE notEmpty(raw)
-UNION ALL
-                      SELECT fingerprint, toUInt8(1) AS arm, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
-                      FROM metric_samples
-                      WHERE org_id = '' AND ((unix_milli > 1793364900000 AND unix_milli <= 1793367300000) OR (unix_milli > 1793385900000 AND unix_milli <= 1793386800000)) AND fingerprint IN (
-SELECT fingerprint
-FROM metric_series
-WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
-  AND bitAnd(hours, 16777215) != 0
-  AND fingerprint IN (
-    SELECT fingerprint
-    FROM metric_labels
-    WHERE metric_name = 'p_rx_total'
-  )
-)
-                        AND reinterpretAsUInt64(value) != 9218868437227405314
-                      GROUP BY fingerprint
                     )
                   )
                 )
@@ -436,7 +348,6 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
         )
   )
 )
-WHERE arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, [(541, 559), (715, 721)]))
     ) AS l
     INNER JOIN (
       SELECT lm.fingerprint AS lfp, rm.fingerprint AS rfp, lm.rank AS rank, arrayFilter(kv -> kv.1 IN ('instance'), arrayFilter(k -> k.2 != '', arrayFilter(kv -> kv.1 NOT IN ('__type__', '__unit__'), lm.kv))) AS gkey
@@ -564,7 +475,7 @@ SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_
 FROM (
   SELECT fingerprint, t_end, t_last, last, inc
   FROM metric_samples_60s
-  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
+  WHERE kind = 0 AND org_id = '' AND t_end > 1793299800000 AND t_end <= 1793386800000 AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -574,7 +485,7 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_tx_total'
   )
-)
+) AND hist_n = 0
 )
 GROUP BY fingerprint
 )
@@ -586,22 +497,6 @@ GROUP BY fingerprint
 )
 )
 WHERE notEmpty(raw)
-UNION ALL
-                      SELECT fingerprint, toUInt8(1) AS arm, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
-                      FROM metric_samples
-                      WHERE org_id = '' AND ((unix_milli > 1793364900000 AND unix_milli <= 1793367300000) OR (unix_milli > 1793385900000 AND unix_milli <= 1793386800000)) AND fingerprint IN (
-SELECT fingerprint
-FROM metric_series
-WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
-  AND bitAnd(hours, 16777215) != 0
-  AND fingerprint IN (
-    SELECT fingerprint
-    FROM metric_labels
-    WHERE metric_name = 'p_tx_total'
-  )
-)
-                        AND reinterpretAsUInt64(value) != 9218868437227405314
-                      GROUP BY fingerprint
                     )
                   )
                 )
@@ -611,7 +506,6 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
         )
   )
 )
-WHERE arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, [(541, 559), (715, 721)]))
     ) AS r ON r.fingerprint = p.rfp AND r.gi = l.gi
   )
   GROUP BY gid, gi
@@ -640,9 +534,14 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     WHERE metric_name = 'p_tx_total'
   )
 ))))) AS agg
+UNION ALL
+SELECT CAST([('', 'hist_n')], 'Array(Tuple(String, String))') AS gid, toUInt32(0) AS gi, toFloat64(hist_n) AS agg
 ORDER BY gid, gi
 -- golden[count without (device) (rate > bool irate)]
-WITH 1793300400000 AS grid_start, 120000 AS grid_step, 721 AS grid_n
+WITH 1793300400000 AS grid_start, 120000 AS grid_step, 721 AS grid_n,
+     ifNull((SELECT count() FROM metric_hist_samples WHERE org_id = '' AND ((fingerprint IN (
+SELECT fingerprint FROM metric_series
+) AND unix_milli > 1782906600000 AND unix_milli <= 1782993600000))), 0) AS hist_n
 SELECT gid, gi, agg FROM (
 SELECT gid, gi,
   toFloat64(length(vs)) AS agg
@@ -733,7 +632,7 @@ SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_
 FROM (
   SELECT fingerprint, t_end, t_last, last, inc
   FROM metric_samples_60s
-  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
+  WHERE kind = 0 AND org_id = '' AND t_end > 1793299800000 AND t_end <= 1793386800000 AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -743,7 +642,7 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_rx_total'
   )
-)
+) AND hist_n = 0
 )
 GROUP BY fingerprint
 )
@@ -755,22 +654,6 @@ GROUP BY fingerprint
 )
 )
 WHERE notEmpty(raw)
-UNION ALL
-                      SELECT fingerprint, toUInt8(1) AS arm, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
-                      FROM metric_samples
-                      WHERE org_id = '' AND ((unix_milli > 1793364900000 AND unix_milli <= 1793367300000) OR (unix_milli > 1793385900000 AND unix_milli <= 1793386800000)) AND fingerprint IN (
-SELECT fingerprint
-FROM metric_series
-WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
-  AND bitAnd(hours, 16777215) != 0
-  AND fingerprint IN (
-    SELECT fingerprint
-    FROM metric_labels
-    WHERE metric_name = 'p_rx_total'
-  )
-)
-                        AND reinterpretAsUInt64(value) != 9218868437227405314
-                      GROUP BY fingerprint
                     )
                   )
                 )
@@ -780,7 +663,6 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
         )
   )
 )
-WHERE arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, [(541, 559), (715, 721)]))
     ) AS l
     INNER JOIN (
       SELECT lm.fingerprint AS lfp, rm.fingerprint AS rfp, lm.rank AS rank, arrayFilter(kv -> kv.1 NOT IN ('device'), arrayFilter(k -> k.2 != '', lm.kv)) AS gkey
@@ -921,6 +803,8 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     WHERE metric_name = 'p_tx_total'
   )
 ))))) AS agg
+UNION ALL
+SELECT CAST([('', 'hist_n')], 'Array(Tuple(String, String))') AS gid, toUInt32(0) AS gi, toFloat64(hist_n) AS agg
 ORDER BY gid, gi
 -- golden[members_known two series]
 SELECT m.1 AS fingerprint, m.2 AS rank, m.3 AS kv
@@ -1008,27 +892,10 @@ SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_
 FROM (
   SELECT fingerprint, t_end, t_last, last, inc
   FROM metric_samples_720s
-  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793314800000) OR (t_end > 1793318400000 AND t_end <= 1793386080000)) AND fingerprint IN ('101', '205')
+  WHERE kind = 0 AND org_id = '' AND t_end > 1793299800000 AND t_end <= 1793386800000 AND fingerprint IN ('101', '205') AND hist_n = 0
 )
 GROUP BY fingerprint
 )
-UNION ALL
-SELECT fingerprint, arrayMap(r -> (r.1, toInt64(60000), r.2, r.3, r.4), rows0) AS es
-FROM (
-SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
-FROM (
-  SELECT fingerprint, t_end, t_last, last, inc
-  FROM metric_samples_60s
-  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793314800000 AND t_end <= 1793318400000) OR (t_end > 1793386080000 AND t_end <= 1793386200000)) AND fingerprint IN ('101', '205')
-)
-GROUP BY fingerprint
-)
-UNION ALL
-SELECT fingerprint, groupArray((unix_milli, toInt64(0), unix_milli, value, 0.)) AS es
-FROM metric_samples
-WHERE org_id = '' AND unix_milli > 1793386200000 AND unix_milli <= 1793386800000 AND fingerprint IN ('101', '205')
-  AND reinterpretAsUInt64(value) != 9218868437227405314
-GROUP BY fingerprint
         )
         GROUP BY fingerprint
       )
@@ -1046,9 +913,11 @@ WHERE notEmpty(raw)
         )
   )
 )
-WHERE arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, CAST([], 'Array(Tuple(UInt32, UInt32))')))
 -- golden[count without (device) (rate > irate)]
-WITH 1793300400000 AS grid_start, 120000 AS grid_step, 721 AS grid_n
+WITH 1793300400000 AS grid_start, 120000 AS grid_step, 721 AS grid_n,
+     ifNull((SELECT count() FROM metric_hist_samples WHERE org_id = '' AND ((fingerprint IN (
+SELECT fingerprint FROM metric_series
+) AND unix_milli > 1782906600000 AND unix_milli <= 1782993600000))), 0) AS hist_n
 SELECT gid, gi, agg FROM (
 SELECT gid, gi,
   toFloat64(length(vs)) AS agg
@@ -1139,7 +1008,7 @@ SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_
 FROM (
   SELECT fingerprint, t_end, t_last, last, inc
   FROM metric_samples_60s
-  WHERE kind = 0 AND org_id = '' AND ((t_end > 1793299800000 AND t_end <= 1793365200000) OR (t_end > 1793367000000 AND t_end <= 1793386200000)) AND fingerprint GLOBAL IN (
+  WHERE kind = 0 AND org_id = '' AND t_end > 1793299800000 AND t_end <= 1793386800000 AND fingerprint GLOBAL IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
@@ -1149,7 +1018,7 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     FROM metric_labels
     WHERE metric_name = 'p_rx_total'
   )
-)
+) AND hist_n = 0
 )
 GROUP BY fingerprint
 )
@@ -1161,22 +1030,6 @@ GROUP BY fingerprint
 )
 )
 WHERE notEmpty(raw)
-UNION ALL
-                      SELECT fingerprint, toUInt8(1) AS arm, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
-                      FROM metric_samples
-                      WHERE org_id = '' AND ((unix_milli > 1793364900000 AND unix_milli <= 1793367300000) OR (unix_milli > 1793385900000 AND unix_milli <= 1793386800000)) AND fingerprint IN (
-SELECT fingerprint
-FROM metric_series
-WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
-  AND bitAnd(hours, 16777215) != 0
-  AND fingerprint IN (
-    SELECT fingerprint
-    FROM metric_labels
-    WHERE metric_name = 'p_rx_total'
-  )
-)
-                        AND reinterpretAsUInt64(value) != 9218868437227405314
-                      GROUP BY fingerprint
                     )
                   )
                 )
@@ -1186,7 +1039,6 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
         )
   )
 )
-WHERE arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, [(541, 559), (715, 721)]))
     ) AS l
     INNER JOIN (
       SELECT lm.fingerprint AS lfp, rm.fingerprint AS rfp, lm.rank AS rank, arrayFilter(kv -> kv.1 NOT IN ('device'), arrayFilter(k -> k.2 != '', lm.kv)) AS gkey
@@ -1328,6 +1180,8 @@ WHERE day BETWEEN '2026-10-29' AND '2026-10-30'
     WHERE metric_name = 'p_tx_total'
   )
 ))))) AS agg
+UNION ALL
+SELECT CAST([('', 'hist_n')], 'Array(Tuple(String, String))') AS gid, toUInt32(0) AS gi, toFloat64(hist_n) AS agg
 ORDER BY gid, gi
 -- golden[S3c (a) sum by (instance) (rate + on (instance) rate)]
     SELECT o.1 AS gid, o.2 AS rank, gi, o.3 AS v

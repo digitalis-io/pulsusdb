@@ -556,16 +556,14 @@ pub struct MetricsEngine {
     /// Issue #18 part B: the process-wide rollup level list. `None` reads
     /// every selector raw.
     rollup_levels: Option<std::sync::Arc<super::rollup::LevelSlot>>,
-    /// TEST SEAM (issue #18 part B): replaces a level fetch's answer, by
-    /// its statement text. `None` in production.
-    rollup_answer_hook: Option<RollupAnswerHook>,
     /// TEST SEAM (issue #18 part 2c): the statement-size cap F13 refuses a
     /// pushed node at; [`crate::querytext::MAX_QUERY_TEXT_BYTES`] in
     /// production.
     statement_cap: u64,
-    /// Issue #778: the span a range query is routed by, in place of its own
-    /// `end − start`. A read cache tail is routed as its whole request is.
-    routing_span_ms: Option<i64>,
+    /// Issue #810 (D14): the whole request this engine's evaluations
+    /// belong to. A read cache tail is routed by its span, and its
+    /// histogram count and raw read (D9) are of it.
+    request: Option<MetricQueryParams>,
     /// TEST SEAM (issue #778): a server failure [`MetricsEngine::server_failure`]
     /// reports whatever the reads met.
     #[cfg(test)]
@@ -612,11 +610,6 @@ pub enum ReadMix {
     Unrouted,
 }
 
-/// TEST SEAM (issue #18 part B): a level fetch's answer by its statement
-/// text, or `None` to send the statement.
-pub type RollupAnswerHook =
-    std::sync::Arc<dyn Fn(&str) -> Option<Vec<super::rollup::LevelRow>> + Send + Sync>;
-
 impl MetricsEngine {
     pub fn new(
         client: ChClient,
@@ -637,9 +630,8 @@ impl MetricsEngine {
             lookback_ms: DEFAULT_LOOKBACK_MS,
             exemplar_answer_bytes: super::exemplars::EXEMPLAR_ANSWER_BYTES,
             rollup_levels: None,
-            rollup_answer_hook: None,
             statement_cap: crate::querytext::MAX_QUERY_TEXT_BYTES,
-            routing_span_ms: None,
+            request: None,
             #[cfg(test)]
             injected_failure: None,
         }
@@ -655,15 +647,30 @@ impl MetricsEngine {
 
     /// Issue #810 (D14): the whole request this engine's evaluations belong
     /// to; a read cache tail is routed, and read raw, as its request is.
-    pub fn with_request(self, _request: MetricQueryParams) -> Self {
+    pub fn with_request(mut self, request: MetricQueryParams) -> Self {
+        self.request = Some(request);
         self
     }
 
-    /// Issue #778: routes every range query of this engine by `span_ms`
-    /// rather than by its own `end − start`.
-    pub fn with_routing_span_ms(mut self, span_ms: i64) -> Self {
-        self.routing_span_ms = Some(span_ms);
-        self
+    /// Issue #810 (D14): the identity of the level list a request reads,
+    /// a hash of each level's width, switch point and table, the counter
+    /// bucket count and the shard count; `0` with no levels.
+    pub fn levels_id(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let Some(lv) = self
+            .rollup_levels
+            .as_ref()
+            .and_then(|slot| slot.get())
+            .filter(|l| !l.levels.is_empty())
+        else {
+            return 0;
+        };
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for l in &lv.levels {
+            (l.res_ms, l.from_ms, &l.table).hash(&mut h);
+        }
+        (lv.counter_buckets, lv.shards).hash(&mut h);
+        h.finish().max(1)
     }
 
     /// Issue #778: the staleness lookback this engine plans with.
@@ -720,14 +727,6 @@ impl MetricsEngine {
     /// reads.
     pub fn with_rollup_levels(mut self, slot: std::sync::Arc<super::rollup::LevelSlot>) -> Self {
         self.rollup_levels = Some(slot);
-        self
-    }
-
-    /// TEST SEAM (issue #18 part B) — see [`RollupAnswerHook`]. Never
-    /// called by `pulsus-server`.
-    #[doc(hidden)]
-    pub fn with_rollup_answer_hook(mut self, hook: RollupAnswerHook) -> Self {
-        self.rollup_answer_hook = Some(hook);
         self
     }
 
@@ -869,38 +868,76 @@ impl MetricsEngine {
         let plan_params = p.plan_params(self.config.experimental_functions, self.lookback_ms);
         let mut plan = pulsus_promql::plan(expr, plan_params)?;
         let plan_facts = facts.as_ref().map(|_| plan_facts_of(&plan));
-        // Issue #778: the resolution a range query is routed at, from the
-        // routing span when one is set.
-        let width = levels.as_ref().and_then(|lv| match self.routing_span_ms {
-            Some(span) => super::rollup::resolution_for_span(span, p.step_ms, lv),
-            None => super::rollup::resolution(p, lv),
+        // Issue #810 (D14): a read cache tail is routed, and read raw, as
+        // its whole request is.
+        let whole = self.request.unwrap_or(*p);
+        // D9: the query planned over the evaluated grid with no routing.
+        let raw_plan = pulsus_promql::plan(
+            expr,
+            whole.plan_params(self.config.experimental_functions, self.lookback_ms),
+        )?;
+        // Issue #778: the resolution a range query is routed at, by the
+        // whole request's span.
+        let width = levels.as_ref().and_then(|lv| {
+            super::rollup::resolution_for_span(whole.end_ms - whole.start_ms, p.step_ms, lv)
         });
         // Issue #18: a range query whose range selects a level, and whose
-        // selectors that level or a finer one serves at its bucket ends, is
-        // read at them (`rollup::lattice`).
+        // selectors that level serves at its bucket ends, is read at them
+        // (`rollup::lattice`).
         let lattice = levels.as_ref().filter(|_| p.step_ms > 0).and_then(|lv| {
             super::rollup::lattice_with(&plan, p, lv, width?)
                 .map(|l| (std::sync::Arc::clone(lv), l))
         });
-        let data = match lattice {
+        let (routing, read_params) = match &lattice {
             None => {
-                let routing = request_grid_routing(&plan, p, levels, self.routing_span_ms);
+                let routing = request_grid_routing(&plan, p, levels, self.request.as_ref());
                 round_on_request_grid(&mut plan, routing.as_ref());
-                self.read_selectors(tenant, &plan, p, routing, true, &budget, explain)
-                    .await?
+                (routing, plan.params)
             }
             Some((lv, l)) => {
                 for sel in &mut plan.selectors {
-                    if let Some(r) = super::rollup::lattice_range(sel, &lv, l.width) {
+                    if let Some(r) = super::rollup::lattice_range(sel, lv, l.width) {
                         sel.range_ms = Some(r);
                     }
                 }
-                // D9: `rollup_lattice` first, then the reads' stages. Issue
-                // #18 part 2b: each read decides its own nodes.
+                let params = match l.until_ms {
+                    None => plan.params,
+                    Some(gu) => bucket_ends(p, l.width, gu)
+                        .plan_params(self.config.experimental_functions, self.lookback_ms),
+                };
+                (Some((std::sync::Arc::clone(lv), l.width)), params)
+            }
+        };
+        // D9 and D14: each selector's arm, the query's routed selectors'
+        // histogram condition, and how the reads are routed.
+        let arms: Vec<super::grouped::Arm> = plan
+            .selectors
+            .iter()
+            .map(|sel| arm_of(sel, &read_params, routing.as_ref()))
+            .collect();
+        let scope = self.hist_scope(tenant, &plan, &raw_plan, &arms);
+        let reads = read_mix(&arms);
+        let rollup_before = explain.as_ref().is_some_and(|e| e.rollup);
+        let data = match lattice {
+            None => {
+                self.read_selectors(
+                    tenant,
+                    &plan,
+                    p,
+                    routing,
+                    true,
+                    &budget,
+                    explain.as_deref_mut(),
+                    &scope,
+                    None,
+                )
+                .await?
+            }
+            Some((lv, l)) => {
+                // D9: `rollup_lattice` first, then the reads' stages.
                 if let Some(e) = explain.as_mut() {
                     e.push("rollup_lattice", String::new(), Some(lattice_note(&l, p)));
-                    // A filled step takes its bucket's value; an unfilled
-                    // query keeps today's rule, inside `read_selectors`.
+                    // A filled step takes its bucket's value.
                     e.rollup |= l.until_ms.is_some();
                 }
                 match l.until_ms {
@@ -912,16 +949,38 @@ impl MetricsEngine {
                             Some((lv, l.width)),
                             true,
                             &budget,
-                            explain,
+                            explain.as_deref_mut(),
+                            &scope,
+                            None,
                         )
                         .await?
                     }
-                    Some(gl) => {
-                        self.read_filled(tenant, &mut plan, p, (lv, l, gl), &budget, explain)
-                            .await?
+                    Some(gu) => {
+                        self.read_filled(
+                            tenant,
+                            &mut plan,
+                            p,
+                            (lv, l.width, gu),
+                            &budget,
+                            explain.as_deref_mut(),
+                            &scope,
+                        )
+                        .await?
                     }
                 }
             }
+        };
+        // D9: a routed selector met a native-histogram sample: every read
+        // returned the raw samples, and the query is evaluated as with
+        // routing off.
+        let raw = scope.seen();
+        let plan = if raw {
+            if let Some(e) = explain.as_mut() {
+                e.rollup = rollup_before;
+            }
+            raw_plan
+        } else {
+            plan
         };
 
         // Issue #93 (finding 2): `pulsus_promql::evaluate` is CPU-bound and
@@ -971,98 +1030,52 @@ impl MetricsEngine {
             *f = QueryFacts {
                 charged_samples: budget.used(),
                 plan: pf,
-                reads: ReadMix::Unrouted,
-                raw: false,
-                whole: false,
+                reads,
+                raw,
+                whole: raw && self.request.is_some(),
             };
         }
         Ok((value_to_query_result(value), annotations))
     }
 
-    /// Issue #18: the two reads of a range query filled from a level's
-    /// bucket ends — the bucket ends `(g0, gl, L)` and, when a step follows
-    /// `gl`, the steps after it (F2) — concurrently, over one budget. Sets
-    /// each selector's `fill`. Issue #18 part 2b: each read decides and
-    /// pushes its own nodes, as an unfilled request does.
+    /// Issue #18: a range query filled from a level's bucket ends `(g0,
+    /// gu, L)`. Issue #810 (D3): one read, every selector's fetch window
+    /// ending at the last step less its offset; every step takes the bucket
+    /// that holds it. Sets each selector's `fill`.
+    #[allow(clippy::too_many_arguments)]
     async fn read_filled(
         &self,
         tenant: &Tenant,
         plan: &mut pulsus_promql::QueryPlan,
         p: &MetricQueryParams,
-        (lv, l, gl): (
-            std::sync::Arc<super::rollup::Levels>,
-            super::rollup::Lattice,
-            i64,
-        ),
+        (lv, w, gu): (std::sync::Arc<super::rollup::Levels>, i64, i64),
         budget: &SampleBudget,
         explain: Option<&mut PlanExplain>,
+        scope: &HistScope,
     ) -> Result<SeriesData, ReadError> {
-        let w = l.width;
-        let qa = MetricQueryParams {
-            start_ms: -(-p.start_ms).div_euclid(w) * w,
-            end_ms: gl,
-            step_ms: w,
-        };
+        let qa = bucket_ends(p, w, gu);
         let mut first = plan.clone();
         first.params = qa.plan_params(self.config.experimental_functions, self.lookback_ms);
-        let second = l.tail.map(|t| {
-            let mut q = plan.clone();
-            q.params = t.plan_params(self.config.experimental_functions, self.lookback_ms);
-            for (s, orig) in q.selectors.iter_mut().zip(&plan.selectors) {
-                s.range_ms = orig.written_range_ms;
-                if let Some(r) = super::rollup::round_counter_range(s, &q.params, &lv, w) {
-                    s.range_ms = Some(r);
-                }
-            }
-            (q, t)
-        });
-        let (mut e1, mut e2) = (
-            explain.as_ref().map(|_| PlanExplain::new("metrics")),
-            explain.as_ref().map(|_| PlanExplain::new("metrics")),
-        );
-        let a = self.read_selectors(
-            tenant,
-            &first,
-            &qa,
-            Some((std::sync::Arc::clone(&lv), w)),
-            true,
-            budget,
-            e1.as_mut(),
-        );
-        let b = async {
-            match &second {
-                Some((q, t)) => self
-                    .read_selectors(
-                        tenant,
-                        q,
-                        t,
-                        Some((std::sync::Arc::clone(&lv), w)),
-                        true,
-                        budget,
-                        e2.as_mut(),
-                    )
-                    .await
-                    .map(Some),
-                None => Ok(None),
-            }
-        };
-        let (a, b) = join(a, b).await;
-        let (mut data, b) = (a?, b?);
-        for (i, s) in plan.selectors.iter_mut().enumerate() {
-            let tail_range_ms = second.as_ref().and_then(|(q, _)| q.selectors[i].range_ms);
+        let t_last = p.start_ms + (p.end_ms - p.start_ms).div_euclid(p.step_ms) * p.step_ms;
+        let data = self
+            .read_selectors(
+                tenant,
+                &first,
+                &qa,
+                Some((lv, w)),
+                true,
+                budget,
+                explain,
+                scope,
+                Some(t_last),
+            )
+            .await?;
+        for s in plan.selectors.iter_mut() {
             s.fill = Some(pulsus_promql::SelectorFill {
                 width_ms: w,
-                until_ms: gl,
-                tail_range_ms,
+                until_ms: gu,
+                tail_range_ms: None,
             });
-        }
-        if let (Some(b), Some((_, t))) = (b, &second) {
-            data.take_as_tail(b, t.start_ms);
-        }
-        if let Some(e) = explain {
-            for x in [e1, e2].into_iter().flatten() {
-                e.append(x);
-            }
         }
         Ok(data)
     }
@@ -1081,6 +1094,8 @@ impl MetricsEngine {
         push: bool,
         budget: &SampleBudget,
         mut explain: Option<&mut PlanExplain>,
+        scope: &HistScope,
+        read_until: Option<i64>,
     ) -> Result<SeriesData, ReadError> {
         let plan_params = plan.params;
         // Issue #579 part 4: each selector's arm, by `routed_series`' own
@@ -1178,14 +1193,15 @@ impl MetricsEngine {
         // The pushes a resolution has confirmed: the decision and the
         // statements it renders. A selector is owned by at most one node.
         let mut pending: Vec<PendingPush> = Vec::new();
-        // Part 4: each shape-C node's recorded sides, by `self_pos`, and the
-        // nodes F11 sent back to today's route.
+        // Part 4: each shape-C node's recorded sides, by `self_pos`.
         let mut sides: HashMap<usize, Vec<PushSide>> = HashMap::new();
-        let mut declined: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        // Issue #18 part 2c r10: the coverage statements this read sends.
-        let mut coverage_memo = CoverageMemo::default();
         for (selector_id, sel) in plan.selectors.iter().enumerate() {
             let (lower_excl, upper_incl) = sel.fetch_window(&plan_params);
+            // Issue #810 (D3): nothing after the last step is read.
+            let upper_incl = match read_until {
+                Some(t) => upper_incl.min(t - sel.offset_ms),
+                None => upper_incl,
+            };
             let window = DataWindow {
                 start_ms: lower_excl,
                 end_ms: upper_incl,
@@ -1392,7 +1408,6 @@ impl MetricsEngine {
             // fallback is today's route.
             let level_owned = owners
                 .get(&selector_id)
-                .filter(|n| !declined.contains(&n.self_pos))
                 .filter(|n| !matches!(n.kind, super::grouped::PushKind::Instant(_)))
                 .filter(|_| matches!(arms.get(&selector_id), Some(super::grouped::Arm::Level(_))))
                 .cloned();
@@ -1437,48 +1452,20 @@ impl MetricsEngine {
                                 tenant,
                                 sel,
                                 route.clone(),
-                                std::sync::Arc::clone(levels),
                                 series,
                                 (lower_excl, upper_incl),
                                 &plan_params,
                                 None,
+                                scope,
                             );
                             if let Some(e) = explain.as_mut() {
                                 push_rollup_route(e, sel, &route, &plan_params);
                             }
-                            let level = self
-                                .level_coverage(
-                                    sel,
-                                    &route,
-                                    levels,
-                                    (lower_excl, upper_incl),
-                                    &mut coverage_memo,
-                                    explain.as_deref_mut(),
-                                )
-                                .await?;
-                            let grid = match &node.kind {
-                                super::grouped::PushKind::Range(r) => r.grid,
-                                super::grouped::PushKind::Join(j) => j.grid,
-                                super::grouped::PushKind::Instant(g) => g.grid,
+                            let level = LevelSide {
+                                table: route.table.clone(),
+                                res_ms: route.res_ms,
+                                window: (lower_excl, upper_incl),
                             };
-                            // F11: a statement names at most 64 intervals.
-                            if level.exceeds(grid, sel.range_ms.unwrap_or(0)) {
-                                if let Some(e) = explain.as_mut() {
-                                    e.push(
-                                        "pushed_aggregate",
-                                        "declined: TooManyIntervals".to_string(),
-                                        Some(
-                                            "issue #579: a level side's coverage is in more \
-                                             pieces than one statement names; the node takes \
-                                             today's route"
-                                                .to_string(),
-                                        ),
-                                    );
-                                }
-                                declined.insert(node.self_pos);
-                                fetch_plans.push(fallback);
-                                continue;
-                            }
                             let side = PushSide {
                                 selector: selector_id,
                                 ids_sql,
@@ -1501,6 +1488,8 @@ impl MetricsEngine {
                                         explain.as_deref_mut(),
                                         &mut reads,
                                         &mut pending,
+                                        budget,
+                                        scope,
                                     )
                                     .await?
                                     // F13: the node takes today's route.
@@ -1536,16 +1525,16 @@ impl MetricsEngine {
             };
             let resolution = match resolution {
                 Err(resolution) => resolution,
-                Ok((levels, (route, series))) => {
+                Ok((_, (route, series))) => {
                     fetch_plans.push(self.rollup_fetch_plan(
                         tenant,
                         sel,
                         route,
-                        std::sync::Arc::clone(levels),
                         series,
                         (lower_excl, upper_incl),
                         &plan_params,
                         explain.as_deref_mut(),
+                        scope,
                     ));
                     continue;
                 }
@@ -1554,11 +1543,7 @@ impl MetricsEngine {
             // Issues #549 and #579: the pushed node, decided on the SAME
             // resolution the declining path then consumes — `members_of`
             // borrows it, so there is no clone and no second resolve.
-            match owners
-                .get(&selector_id)
-                .filter(|n| !declined.contains(&n.self_pos))
-                .map(|n| (n.self_pos, &n.kind))
-            {
+            match owners.get(&selector_id).map(|n| (n.self_pos, &n.kind)) {
                 Some((self_pos, super::grouped::PushKind::Instant(shape))) => {
                     match super::grouped::members_of(&resolution, metric_name)
                         .and_then(|members| super::grouped::decide(shape, &members, shape.grid))
@@ -1691,7 +1676,7 @@ impl MetricsEngine {
             let Some(mut recorded) = sides.remove(&node.self_pos) else {
                 continue;
             };
-            if recorded.len() == 2 && !declined.contains(&node.self_pos) {
+            if recorded.len() == 2 {
                 recorded.sort_by_key(|s| s.selector != shape.lhs.selector);
                 // F13: the node takes today's route.
                 if let Some(back) = self
@@ -1703,6 +1688,8 @@ impl MetricsEngine {
                         explain.as_deref_mut(),
                         &mut reads,
                         &mut pending,
+                        budget,
+                        scope,
                     )
                     .await?
                 {
@@ -1743,7 +1730,9 @@ impl MetricsEngine {
             .selectors
             .iter()
             .zip(fetch_plans)
-            .map(|(sel, fetch_plan)| self.execute_fetch_plan(tenant, sel, fetch_plan, budget));
+            .map(|(sel, fetch_plan)| {
+                self.execute_fetch_plan(tenant, sel, fetch_plan, budget, scope)
+            });
         let pushes = pending.into_iter().map(|p| self.run_push(p, budget));
         let (fetched, pushed) = join(join_all(fetches), join_all(pushes)).await;
 
@@ -1772,11 +1761,30 @@ impl MetricsEngine {
         let mut fallbacks: Vec<(SelectorId, SelectorFetchPlan)> = Vec::new();
         for result in pushed {
             let result = result?;
+            // Issue #810 (D9): the node's own histogram count, and `hist_n`,
+            // the query's routed selectors'.
+            let (own, hist_n) =
+                match &result {
+                    PushResult::Range { chunks, .. } => chunks
+                        .iter()
+                        .flat_map(|(_, rows)| rows)
+                        .fold((0.0, 0.0), |(own, n), r| {
+                            if super::grouped::is_histogram_sentinel(&r.gid) {
+                                (own + r.agg.unwrap_or(0.0), n)
+                            } else if super::grouped::is_hist_n_sentinel(&r.gid) {
+                                (own, n + r.agg.unwrap_or(0.0))
+                            } else {
+                                (own, n)
+                            }
+                        }),
+                    PushResult::Instant { .. } => (0.0, 0.0),
+                };
+            if hist_n > 0.0 {
+                scope.saw_histograms();
+            }
             let reason = match &result {
-                PushResult::Range { chunks, .. }
-                    if chunks.iter().flat_map(|(_, rows)| rows).any(|r| {
-                        super::grouped::is_histogram_sentinel(&r.gid) && r.agg.unwrap_or(0.0) > 0.0
-                    }) =>
+                PushResult::Range { level_sides, .. }
+                    if own > 0.0 || (hist_n > 0.0 && !level_sides.is_empty()) =>
                 {
                     Some((
                         "declined: HistogramSamples",
@@ -1806,28 +1814,17 @@ impl MetricsEngine {
                 chunks,
                 fallbacks: node_fallbacks,
                 drop_name,
-                served,
+                level_sides,
             } = result
             else {
                 kept.push(result);
                 continue;
             };
             let Some((declined, note)) = reason else {
-                // Part 4: a `Level` side of a kept node sets the explain
-                // flag by today's rule (`rollup_chunk`'s
-                // `served_from_level`), from S4.
+                // Issue #810 (D6): a level side marks the answer `rollup`
+                // whatever rows it returned.
                 if let Some(e) = explain.as_mut() {
-                    // Issue #18 part 2a: from 720 s (no overlay) a level row
-                    // read sets the flag whatever the windows touch, as
-                    // `rollup_chunk`'s flag is set there.
-                    for (selector, read_level, todo) in &served {
-                        let sel = &plan.selectors[*selector];
-                        e.rollup |= (*read_level
-                            && todo.as_ref().is_none_or(|todo| {
-                                super::rollup::level_window_exists(sel, &plan_params, todo)
-                            }))
-                            || sel.written_range_ms != sel.range_ms;
-                    }
+                    e.rollup |= !level_sides.is_empty();
                 }
                 kept.push(PushResult::Range {
                     self_pos,
@@ -1835,7 +1832,7 @@ impl MetricsEngine {
                     chunks,
                     fallbacks: Vec::new(),
                     drop_name,
-                    served: Vec::new(),
+                    level_sides: Vec::new(),
                 });
                 continue;
             };
@@ -1854,7 +1851,13 @@ impl MetricsEngine {
         let refetched: Vec<Result<FetchedWithTrace, ReadError>> =
             join_all(fallbacks.iter_mut().map(|(selector, fallback)| {
                 let fetch_plan = std::mem::replace(fallback, SelectorFetchPlan::Empty);
-                self.execute_fetch_plan(tenant, &plan.selectors[*selector], fetch_plan, budget)
+                self.execute_fetch_plan(
+                    tenant,
+                    &plan.selectors[*selector],
+                    fetch_plan,
+                    budget,
+                    scope,
+                )
             }))
             .await;
         for ((selector, _), series) in fallbacks.into_iter().zip(refetched) {
@@ -2182,7 +2185,8 @@ impl MetricsEngine {
             sqls,
             fallbacks: vec![(selector_id, fallback)],
             drop_name: true,
-            levels: Vec::new(),
+            fetched: None,
+            level_sides: Vec::new(),
         });
         Ok(())
     }
@@ -2506,6 +2510,7 @@ impl MetricsEngine {
         sel: &SelectorSpec,
         fetch_plan: SelectorFetchPlan,
         budget: &SampleBudget,
+        scope: &HistScope,
     ) -> Result<FetchedWithTrace, ReadError> {
         // Issue #135 TEST SEAM: when a probe is installed, park here until
         // released — proving (via `FetchProbe::max_in_flight`) that
@@ -2519,7 +2524,7 @@ impl MetricsEngine {
         let series = match fetch_plan {
             SelectorFetchPlan::Empty => Ok(Vec::new()),
             SelectorFetchPlan::Rollup(plan) => {
-                return self.fetch_rollup(tenant, sel, *plan, budget).await;
+                return self.fetch_rollup(sel, *plan, budget, scope).await;
             }
             SelectorFetchPlan::Chunks {
                 sqls,
@@ -2653,81 +2658,13 @@ impl MetricsEngine {
         series.map(|s| (s, None))
     }
 
-    /// Issue #579 part 4: S1, a `Level` side's coverage, read before its
-    /// node's statements are rendered, and what today's route derives from
-    /// it: the served, uncovered and raw-read intervals of the fetch window.
-    /// Issue #18 part 2a: one S1 per level from the route's down to the
-    /// finest, sent together, each level serving what the coarser ones left.
-    async fn level_coverage(
-        &self,
-        sel: &SelectorSpec,
-        route: &super::rollup::Route,
-        levels: &super::rollup::Levels,
-        window: (i64, i64),
-        memo: &mut CoverageMemo,
-        explain: Option<&mut PlanExplain>,
-    ) -> Result<LevelSide, ReadError> {
-        // Issue #18 part 2c: in `rollup_chunk`'s own order — each level's
-        // coverage over what the coarser ones left, sent only while
-        // something is left.
-        let mut explain = explain;
-        let mut todo = vec![window];
-        let mut runs = Vec::new();
-        for k in (0..=route.level).rev() {
-            if todo.is_empty() {
-                break;
-            }
-            let table = &levels.levels[k].table;
-            let sql = super::rollup::level_runs_within(table, &todo, self.config.distributed);
-            // Issue #18 part 2c r10: a statement another side of this read
-            // already sent is not sent again, and has no second stage.
-            let rows: Vec<super::rollup::RunRow> = match memo.lookup(table, &sql) {
-                Some(rows) => rows,
-                None => {
-                    if let Some(e) = explain.as_mut() {
-                        e.push("pushed_coverage", sql.clone(), None);
-                    }
-                    let rows: Vec<super::rollup::RunRow> =
-                        self.fetch_series_rows(sql.clone()).await?;
-                    memo.record(table, sql, rows.clone());
-                    rows
-                }
-            };
-            todo = super::rollup::subtract(&todo, &super::rollup::coverage(&rows, levels.shards));
-            runs.push((k, rows));
-        }
-        let overlaid = super::rollup::overlaid(route.use_, route.res_ms);
-        let pieces = super::rollup::level_pieces(
-            &runs,
-            levels.shards,
-            window,
-            sel.range_ms.unwrap_or(0),
-            overlaid,
-        );
-        Ok(LevelSide {
-            shards: levels.shards,
-            window,
-            levels: pieces
-                .served
-                .into_iter()
-                .map(|(k, served)| {
-                    (
-                        levels.levels[k].table.clone(),
-                        levels.levels[k].res_ms,
-                        served,
-                    )
-                })
-                .collect(),
-            todo: pieces.todo,
-            read: pieces.read,
-            overlaid,
-        })
-    }
-
     /// Issue #579 part 4: a shape-A node over a rollup level, or a shape-C
-    /// node, whose sides phase 1 recorded — S2 where a side's series count
-    /// is unknown, its statements split by time, its explain entries, and
-    /// the pending push with every side's fallback.
+    /// node, whose sides phase 1 recorded — its statements split by time,
+    /// its explain entries, and the pending push with every side's
+    /// fallback. Issue #810 (D10): where a side's series count is unknown,
+    /// the node's statement counts its series itself, gated on the cap,
+    /// and is sent now: under the cap its rows are the node's answer; over
+    /// it, the chunks are rendered with that count.
     #[allow(clippy::too_many_arguments)]
     async fn stage_pushed_node(
         &self,
@@ -2738,78 +2675,21 @@ impl MetricsEngine {
         explain: Option<&mut PlanExplain>,
         reads: &mut compile::SelectorReads,
         pending: &mut Vec<PendingPush>,
+        budget: &SampleBudget,
+        scope: &HistScope,
     ) -> Result<Option<Vec<PushSide>>, ReadError> {
         let mut explain = explain;
-        let mut series = 0usize;
-        for side in &sides {
-            series += match side.series {
-                Some(n) => n,
-                None => {
-                    let count_sql = super::grouped_sql::series_count(&side.ids_sql);
-                    if let Some(e) = explain.as_mut() {
-                        e.push("pushed_series_count", count_sql.clone(), None);
-                    }
-                    let rows: Vec<super::grouped_rows::SeriesCountRow> =
-                        self.fetch_series_rows(count_sql).await?;
-                    rows.first()
-                        .map_or(0, |r| usize::try_from(r.n).unwrap_or(usize::MAX))
-                }
-            };
-        }
         let specs = shape.sides();
         let grid = shape.grid();
-        let sqls: Vec<(u32, String)> = if series == 0 {
-            Vec::new()
-        } else {
-            super::grouped::time_chunks(grid, series, self.pushed_series_steps_cap)
-                .into_iter()
-                .map(|(g0, chunk)| (g0, self.render_chunk(tenant, &shape, &specs, &sides, chunk)))
-                .collect()
-        };
-        // S4, the explain flag's input, one per `Level` side, over every
-        // level it reads; a side no level serves has none. Rendered only
-        // under explain, its only reader.
-        let mut levels = Vec::new();
-        if explain.is_some() {
-            for side in &sides {
-                let Some(level) = &side.level else {
-                    continue;
-                };
-                let served: Vec<super::grouped_sql::LevelServed<'_>> = level
-                    .levels
-                    .iter()
-                    .map(|(table, res_ms, served)| (table.as_str(), *res_ms, served.as_slice()))
-                    .collect();
-                let sql = (!served.is_empty()).then(|| {
-                    super::grouped_sql::level_served(
-                        tenant,
-                        &side.sql_series(),
-                        &super::grouped_sql::LevelRead {
-                            clustered: self.config.distributed,
-                            shards: level.shards,
-                            window: level.window,
-                            levels: &served,
-                            todo: &level.todo,
-                            read: &level.read,
-                            raw_steps: &[],
-                            overlaid: level.overlaid,
-                        },
-                    )
-                });
-                let todo = level.overlaid.then(|| level.todo.clone());
-                levels.push((side.selector, sql, todo));
-            }
-        }
+        let cap = self.pushed_series_steps_cap;
+        let statement_cap = self.statement_cap;
         // Issue #18 part 2c, F13: a statement the dispatcher would refuse
         // (`len >= cap` over its escaped text) declines the node; every
-        // selector takes today's route, which reads in fingerprint chunks.
-        let cap = self.statement_cap;
-        let too_large = sqls
-            .iter()
-            .map(|(_, sql)| sql)
-            .chain(levels.iter().filter_map(|(_, sql, _)| sql.as_ref()))
-            .any(|sql| crate::logql::exec::escape_query_placeholders(sql).len() as u64 >= cap);
-        if too_large {
+        // selector takes today's route.
+        let too_large = |sql: &str| {
+            crate::logql::exec::escape_query_placeholders(sql).len() as u64 >= statement_cap
+        };
+        let decline = |explain: Option<&mut PlanExplain>| {
             if let Some(e) = explain {
                 e.push(
                     "pushed_aggregate",
@@ -2821,11 +2701,101 @@ impl MetricsEngine {
                     ),
                 );
             }
-            return Ok(Some(sides));
-        }
-        if let Some(e) = explain {
+        };
+        let hist_where = scope.where_sql();
+        let chunked = |series: usize| -> Vec<(u32, String)> {
+            let counts = super::grouped_sql::Counts {
+                series_n: None,
+                cap,
+                hist_where,
+            };
+            super::grouped::time_chunks(grid, series, cap)
+                .into_iter()
+                .map(|(g0, chunk)| {
+                    (
+                        g0,
+                        self.render_chunk(tenant, &shape, &specs, &sides, chunk, &counts, false),
+                    )
+                })
+                .collect()
+        };
+        let mut fetched = None;
+        let sqls: Vec<(u32, String)> = if sides.iter().any(|s| s.series.is_none()) {
+            let series_n = sides
+                .iter()
+                .map(|s| match s.series {
+                    Some(n) => n.to_string(),
+                    None => format!("(SELECT uniqExact(fingerprint) FROM (\n{}\n))", s.ids_sql),
+                })
+                .collect::<Vec<_>>()
+                .join(" + ");
+            let counts = super::grouped_sql::Counts {
+                series_n: Some(&series_n),
+                cap,
+                hist_where,
+            };
+            let sql = self.render_chunk(tenant, &shape, &specs, &sides, grid, &counts, true);
+            if too_large(&sql) {
+                decline(explain);
+                return Ok(Some(sides));
+            }
+            if let Some(e) = explain.as_mut() {
+                e.push("pushed_aggregate", sql.clone(), None);
+            }
+            let rows: Vec<super::grouped_rows::RangeAggRow> = self
+                .fetch_rows_with(sql, &self.series_settings(), Some(budget))
+                .await?;
+            let n = rows
+                .iter()
+                .find(|r| super::grouped::is_series_sentinel(&r.gid))
+                .and_then(|r| r.agg)
+                .map_or(0, |n| n as usize);
+            if n.saturating_mul(grid.points as usize) <= cap {
+                fetched = Some(vec![(0u32, rows)]);
+                Vec::new()
+            } else {
+                let sqls = chunked(n);
+                if sqls.iter().any(|(_, sql)| too_large(sql)) {
+                    decline(explain);
+                    return Ok(Some(sides));
+                }
+                if let (Some(e), Some((_, first))) = (explain.as_mut(), sqls.first()) {
+                    e.push(
+                        "pushed_aggregate",
+                        first.clone(),
+                        Some(format!(
+                            "(+{} more statements like this one, split by time)",
+                            sqls.len() - 1
+                        )),
+                    );
+                }
+                sqls
+            }
+        } else {
+            let series: usize = sides.iter().filter_map(|s| s.series).sum();
+            let sqls = if series == 0 {
+                Vec::new()
+            } else {
+                chunked(series)
+            };
+            if sqls.iter().any(|(_, sql)| too_large(sql)) {
+                decline(explain);
+                return Ok(Some(sides));
+            }
+            if let (Some(e), Some((_, first))) = (explain.as_mut(), sqls.first()) {
+                let note = (sqls.len() > 1).then(|| {
+                    format!(
+                        "(+{} more statements like this one, split by time)",
+                        sqls.len() - 1
+                    )
+                });
+                e.push("pushed_aggregate", first.clone(), note);
+            }
+            sqls
+        };
+        if explain.is_some() && (!sqls.is_empty() || fetched.is_some()) {
             for (side, spec) in sides.iter().zip(&specs) {
-                if side.level.is_some() || sqls.is_empty() {
+                if side.level.is_some() {
                     continue;
                 }
                 let (lo, hi) = super::grouped_sql::range_window(grid, spec.range_ms);
@@ -2839,22 +2809,13 @@ impl MetricsEngine {
                     shape: compile::PqlShape::Samples,
                 });
             }
-            if let Some((_, first)) = sqls.first() {
-                let note = (sqls.len() > 1).then(|| {
-                    format!(
-                        "(+{} more statements like this one, split by time)",
-                        sqls.len() - 1
-                    )
-                });
-                e.push("pushed_aggregate", first.clone(), note);
-            }
-            for (_, sql, _) in &levels {
-                if let Some(sql) = sql {
-                    e.push("pushed_level_rows", sql.clone(), None);
-                }
-            }
         }
         let (push, drop_name) = shape.push();
+        let level_sides = sides
+            .iter()
+            .filter(|s| s.level.is_some())
+            .map(|s| s.selector)
+            .collect();
         pending.push(PendingPush::Range {
             self_pos,
             push,
@@ -2864,15 +2825,17 @@ impl MetricsEngine {
                 .map(|s| (s.selector, s.fallback))
                 .collect(),
             drop_name,
-            levels,
+            fetched,
+            level_sides,
         });
         Ok(None)
     }
 
-    /// Issue #579 part 4: one time chunk's statement. Each `Level` side
-    /// reads its served and raw intervals from the window's start to the
-    /// chunk's end — the counter starts at the window's first row in every
-    /// chunk — and the raw steps of the chunk's own grid.
+    /// Issue #579 part 4: one time chunk's statement. Issue #810: each
+    /// `Level` side reads its route's level from the fetch window's start
+    /// to the chunk's end, cut at the window's end (D3) — the counter
+    /// starts at the window's first row in every chunk.
+    #[allow(clippy::too_many_arguments)]
     fn render_chunk(
         &self,
         tenant: &Tenant,
@@ -2880,77 +2843,29 @@ impl MetricsEngine {
         specs: &[SideSpec<'_>],
         sides: &[PushSide],
         grid: super::grouped::Grid,
+        counts: &super::grouped_sql::Counts<'_>,
+        gated: bool,
     ) -> String {
-        use super::rollup::intersect;
         let chunk_end = grid.start_ms + (i64::from(grid.points) - 1) * grid.step_ms;
-        let cuts: Vec<Option<ChunkCut>> = sides
-            .iter()
-            .zip(specs)
-            .map(|(side, spec)| {
-                side.level.as_ref().map(|l| {
-                    let cut = [(l.window.0, chunk_end)];
-                    ChunkCut {
-                        levels: l
-                            .levels
-                            .iter()
-                            .map(|(table, res_ms, served)| {
-                                (table.clone(), *res_ms, intersect(served, &cut))
-                            })
-                            .filter(|(_, _, served)| !served.is_empty())
-                            .collect(),
-                        todo: intersect(&l.todo, &cut),
-                        read: intersect(&l.read, &cut),
-                        raw_steps: if l.overlaid {
-                            super::grouped::raw_steps(grid, spec.range_ms, &l.todo)
-                        } else {
-                            Vec::new()
-                        },
-                    }
-                })
-            })
-            .collect();
-        let served: Vec<Option<Vec<super::grouped_sql::LevelServed<'_>>>> = cuts
-            .iter()
-            .map(|cut| {
-                cut.as_ref().map(|c| {
-                    c.levels
-                        .iter()
-                        .map(|(table, res_ms, served)| (table.as_str(), *res_ms, served.as_slice()))
-                        .collect()
-                })
-            })
-            .collect();
         let sql_sides: Vec<super::grouped_sql::SideSql<'_>> = sides
             .iter()
             .zip(specs)
-            .zip(cuts.iter().zip(&served))
-            .map(
-                |((side, spec), (cut, served))| super::grouped_sql::SideSql {
-                    tenant,
-                    samples_table: &self.config.samples_table,
-                    labels_table: &self.config.labels_table,
-                    series: side.sql_series(),
-                    metric_name: spec.metric_name,
-                    func: spec.func,
-                    range_ms: spec.range_ms,
-                    scale: spec.scale,
-                    window: side.window,
-                    level: side
-                        .level
-                        .as_ref()
-                        .zip(cut.as_ref().zip(served.as_ref()))
-                        .map(|(l, (cut, served))| super::grouped_sql::LevelRead {
-                            clustered: self.config.distributed,
-                            shards: l.shards,
-                            window: l.window,
-                            levels: served,
-                            todo: &cut.todo,
-                            read: &cut.read,
-                            raw_steps: &cut.raw_steps,
-                            overlaid: l.overlaid,
-                        }),
-                },
-            )
+            .map(|(side, spec)| super::grouped_sql::SideSql {
+                tenant,
+                samples_table: &self.config.samples_table,
+                labels_table: &self.config.labels_table,
+                series: side.sql_series(gated),
+                metric_name: spec.metric_name,
+                func: spec.func,
+                range_ms: spec.range_ms,
+                scale: spec.scale,
+                window: side.window,
+                level: side.level.as_ref().map(|l| super::grouped_sql::LevelRead {
+                    table: &l.table,
+                    res_ms: l.res_ms,
+                    served: (l.window.0, chunk_end.min(l.window.1)),
+                }),
+            })
             .collect();
         match shape {
             NodeShape::Level(r, _) => super::grouped_sql::level_aggregate_fetch(
@@ -2959,7 +2874,7 @@ impl MetricsEngine {
                 r.grouping.as_ref(),
                 grid,
                 r.op,
-                &super::grouped_sql::Counts::default(),
+                counts,
             ),
             NodeShape::Join(j) => match &j.matching {
                 None => super::grouped_sql::join_aggregate_fetch(
@@ -2971,7 +2886,7 @@ impl MetricsEngine {
                     j.op,
                     j.bin,
                     j.bool_modifier,
-                    &super::grouped_sql::Counts::default(),
+                    counts,
                 ),
                 // Part 5: S3c, its sides in (many, one) order.
                 Some(spec) => {
@@ -2990,385 +2905,208 @@ impl MetricsEngine {
                         j.bin,
                         j.bool_modifier,
                         spec,
-                        &super::grouped_sql::Counts::default(),
+                        counts,
                     )
                 }
             },
         }
     }
 
-    /// Issue #18 part B: a routed selector's fetch plan, and its
-    /// `rollup_route` explain stage; for a selector the label cache could
-    /// not answer, its `rollup_series` stage before it (issue #18
-    /// follow-up, R4).
+    /// Issue #810 (D11): a routed selector's one statement, and its
+    /// `rollup_route` explain stage.
     #[allow(clippy::too_many_arguments)]
     fn rollup_fetch_plan(
         &self,
         tenant: &Tenant,
         sel: &SelectorSpec,
         route: super::rollup::Route,
-        levels: std::sync::Arc<super::rollup::Levels>,
         series: RollupSeries,
         window: (i64, i64),
         p: &pulsus_promql::PlanParams,
         explain: Option<&mut PlanExplain>,
+        scope: &HistScope,
     ) -> SelectorFetchPlan {
-        let (series, hist_sqls) = match series {
+        let name = sel.metric_name.as_deref().unwrap_or("");
+        let (pairs, ids) = match series {
             RollupSeries::Known(mut pairs) => {
                 pairs.sort_unstable_by_key(|(fp, _)| *fp);
-                let fps: Vec<Fingerprint> = pairs.iter().map(|(fp, _)| *fp).collect();
-                let hist_sqls = build_hist_chunk_sqls(
+                let ids = super::sql::historical_series_subquery(
                     tenant,
-                    &self.config.hist_samples_table,
-                    fps,
-                    window.0,
-                    window.1,
+                    &self.config.series_table,
+                    &self.config.labels_table,
+                    name,
+                    DataWindow {
+                        start_ms: window.0,
+                        end_ms: window.1,
+                    },
+                    &sel.matchers,
                 );
-                (RollupSeries::Known(pairs), hist_sqls)
+                (Some(pairs), ids)
             }
-            RollupSeries::Resolve(ids_sql) => {
-                let hist_sql = sample_sql::hist_sample_fetch_subquery(
-                    tenant,
-                    &self.config.hist_samples_table,
-                    &ids_sql,
-                    window.0,
-                    window.1,
-                );
-                (RollupSeries::Resolve(ids_sql), vec![hist_sql])
-            }
+            RollupSeries::Resolve(ids_sql) => (None, ids_sql),
         };
+        let known = pairs.as_ref().map(|pairs| {
+            let fps: Vec<Fingerprint> = pairs.iter().map(|(fp, _)| *fp).collect();
+            sample_sql::render_fingerprint_list(&sql_literals(&fps))
+        });
+        let raw_window = scope.raw_window(sel.id).unwrap_or(window);
+        let (sql, by_ids) = super::rollup::routed_fetch(
+            tenant,
+            &super::rollup::RoutedTables {
+                level: &route.table,
+                samples: &self.config.samples_table,
+                hist: &self.config.hist_samples_table,
+                labels: &self.config.labels_table,
+            },
+            name,
+            &super::rollup::RoutedWindow {
+                level: window,
+                raw: raw_window,
+                hist_where: scope.cond().unwrap_or("0"),
+            },
+            known.as_deref(),
+            &ids,
+            self.statement_cap,
+        );
         if let Some(e) = explain {
-            if let (RollupSeries::Resolve(ids_sql), Some(name)) = (&series, &sel.metric_name) {
-                e.push(
-                    "rollup_series",
-                    self.rollup_series_sql(tenant, name, ids_sql),
-                    Some("the series and their labels, read before the levels".to_string()),
-                );
-            }
             push_rollup_route(e, sel, &route, p);
-            if let Some(first) = hist_sqls.first() {
-                e.push("hist_sample_fetch", first.clone(), None);
-            }
         }
         SelectorFetchPlan::Rollup(Box::new(RollupFetch {
             route,
-            levels,
-            series,
-            hist_sqls,
+            pairs: if by_ids { None } else { pairs },
+            sql,
             window,
-            params: *p,
+            raw_window,
         }))
     }
 
-    /// Issue #18 follow-up, R4: the statement a routed selector the label
-    /// cache could not answer reads its series and labels by, the one the
-    /// raw fallback hydrates its labels by.
-    fn rollup_series_sql(&self, tenant: &Tenant, metric_name: &str, ids_sql: &str) -> String {
-        super::sql::series_labels_by_fingerprint(
-            tenant,
-            &self.config.labels_table,
-            &[metric_name.to_string()],
-            ids_sql,
-        )
-    }
-
-    /// Issue #18 part B: plan section 4 for every fingerprint chunk,
-    /// concurrently, beside the selector's histogram reads.
+    /// Issue #810 (D11): a routed selector's one statement, sent: its level
+    /// rows as pseudo-samples, or (`hist_n > 0`, D9) its raw floats and
+    /// native histograms, and its series' labels from the cache's list or
+    /// the statement's labels arm.
     async fn fetch_rollup(
         &self,
-        tenant: &Tenant,
         sel: &SelectorSpec,
-        mut plan: RollupFetch,
+        plan: RollupFetch,
         budget: &SampleBudget,
+        scope: &HistScope,
     ) -> Result<FetchedWithTrace, ReadError> {
+        use super::rollup::{RoutedRow, Tagged, assemble, column_of};
         let metric_name = concrete_name(sel)?;
-        // Issue #18 follow-up, R4: a selector the label cache could not
-        // answer first reads its series and labels, under the settings the
-        // raw fallback reads them by; its histogram read is over the same
-        // series statement, under the same settings.
-        let series = std::mem::replace(&mut plan.series, RollupSeries::Known(Vec::new()));
-        let (pairs, nested) = match series {
-            RollupSeries::Known(pairs) => (pairs, false),
-            RollupSeries::Resolve(ids_sql) => {
-                let rows: Vec<super::rows::SeriesRow> = self
-                    .fetch_series_rows(self.rollup_series_sql(tenant, metric_name, &ids_sql))
-                    .await?;
-                let mut pairs: Vec<(Fingerprint, LabelSet)> = rows
-                    .into_iter()
-                    .map(|r| {
-                        (
-                            r.fingerprint,
-                            crate::canonical_labels::parse_canonical_label_set(&r.labels),
-                        )
-                    })
-                    .collect();
-                pairs.sort_unstable_by_key(|(fp, _)| *fp);
-                pairs.dedup_by_key(|(fp, _)| *fp);
-                (pairs, true)
-            }
-        };
-        let fps: Vec<Fingerprint> = pairs.iter().map(|(fp, _)| *fp).collect();
-        let labels_by_fp: HashMap<Fingerprint, LabelSet> = pairs.into_iter().collect();
-        let literals = sql_literals(&fps);
-        let chunks = sample_sql::chunk_fingerprints(&literals, sample_sql::CHUNK_THRESHOLD);
-        let mut at = 0usize;
-        let chunk_fps: Vec<&[Fingerprint]> = chunks
-            .iter()
-            .map(|c| {
-                let fps = &fps[at..at + c.len()];
-                at += c.len();
-                fps
-            })
-            .collect();
-        let hist_settings = series_read_settings(
-            self.config.read_max_memory_bytes,
-            self.config.distributed,
-            self.config.skip_unavailable_shards,
-            self.config.max_replica_delay_secs,
-        );
-        let (floats, hist_rows) = join(
-            join_all(
-                chunks
-                    .iter()
-                    .zip(&chunk_fps)
-                    .map(|(chunk, fps)| self.rollup_chunk(tenant, sel, &plan, chunk, fps, budget)),
-            ),
-            fetch_all_concurrently(plan.hist_sqls.clone(), |sql| async {
-                if nested {
-                    self.fetch_rows_with::<HistSampleRow>(sql, &hist_settings, Some(budget))
-                        .await
-                } else {
-                    self.fetch_sample_rows::<HistSampleRow>(sql, budget).await
-                }
-            }),
-        )
-        .await;
-        let hist_rows = hist_rows?;
-        let mut rows = Vec::new();
-        let mut trace = RollupTrace {
-            stages: Vec::new(),
-            served_from_level: false,
-        };
-        // Plan Q12: each series' uncovered intervals and its raw samples.
-        let mut pieces_of: HashMap<Fingerprint, super::rollup::Intervals> = HashMap::new();
-        let mut overlay_rows: Option<Vec<SampleRow>> = None;
-        for (i, chunk) in floats.into_iter().enumerate() {
-            let mut chunk = chunk?;
-            trace.served_from_level |= chunk.served_from_level;
-            if i == 0 {
-                chunk.stages.sort_by_key(|(at, ..)| *at);
-                trace.stages = chunk
-                    .stages
-                    .into_iter()
-                    .map(|(_, sql, note)| (sql, note))
-                    .collect();
-            }
-            rows.append(&mut chunk.rows);
-            if let Some((pieces, mut raw)) = chunk.overlay {
-                for fp in &chunk.fps {
-                    pieces_of.insert(*fp, pieces.clone());
-                }
-                overlay_rows.get_or_insert_with(Vec::new).append(&mut raw);
-            }
+        let rows: Vec<RoutedRow> = self
+            .fetch_rows_charging(
+                plan.sql.clone(),
+                &self.series_settings(),
+                budget,
+                |r: &RoutedRow| matches!(r.arm, 0 | 1 | 3),
+            )
+            .await?;
+        let hist_n = rows.iter().find(|r| r.arm == 4).map_or(0, |r| r.t);
+        let mut labels_by_fp: HashMap<Fingerprint, LabelSet> =
+            plan.pairs.unwrap_or_default().into_iter().collect();
+        for r in rows.iter().filter(|r| r.arm == 2) {
+            labels_by_fp
+                .entry(r.fingerprint)
+                .or_insert_with(|| crate::canonical_labels::parse_canonical_label_set(&r.labels));
         }
-        let Some(overlay_rows) = overlay_rows else {
-            let series = group_merged_rows(rows, hist_rows, &labels_by_fp, metric_name)?;
-            return Ok((series, Some(trace)));
-        };
-        // The overlay holds the raw route's own samples: the raw floats and
-        // the histogram samples, merged as the raw route merges them.
-        let overlay: HashMap<Fingerprint, Vec<pulsus_promql::Sample>> =
-            group_merged_rows(overlay_rows, hist_rows.clone(), &labels_by_fp, metric_name)?
-                .into_iter()
-                .map(|s| (s.fingerprint, s.samples))
-                .collect();
-        let mut series = group_merged_rows(rows, hist_rows, &labels_by_fp, metric_name)?;
-        let present: std::collections::HashSet<Fingerprint> =
-            series.iter().map(|s| s.fingerprint).collect();
-        for (fp, _) in overlay.iter().filter(|(fp, _)| !present.contains(*fp)) {
-            if let Some(labels) = labels_by_fp.get(fp) {
-                series.push(FetchedSeries {
-                    fingerprint: *fp,
-                    metric_name: Some(metric_name.to_string()),
-                    labels: to_promql_labels(labels),
-                    samples: Vec::new(),
-                    start_ts: None,
-                    raw_overlay: None,
-                });
-            }
-        }
-        series.sort_by_key(|s| s.fingerprint);
-        let mut overlay = overlay;
-        for s in &mut series {
-            s.raw_overlay = Some(pulsus_promql::RawOverlay {
-                pieces: pieces_of.get(&s.fingerprint).cloned().unwrap_or_default(),
-                samples: overlay.remove(&s.fingerprint).unwrap_or_default(),
-            });
-        }
-        Ok((series, Some(trace)))
-    }
-
-    /// Issue #18 part B: one fingerprint chunk of a routed selector. The
-    /// chosen level, then each finer level from coarsest to finest, then
-    /// raw, each over the intervals still not covered, at most
-    /// [`super::rollup::MAX_STATEMENT_INTERVALS`] to a statement; each keeps
-    /// only what falls in its own coverage of that remainder (plan section
-    /// 4).
-    async fn rollup_chunk(
-        &self,
-        tenant: &Tenant,
-        sel: &SelectorSpec,
-        plan: &RollupFetch,
-        fps: &[FpLiteral],
-        chunk_fps: &[Fingerprint],
-        budget: &SampleBudget,
-    ) -> Result<RollupChunk, ReadError> {
-        use super::rollup::{
-            MAX_STATEMENT_INTERVALS, RunRow, Tagged, assemble, column_of, contains, coverage,
-            intersect, level_fetch, level_window_exists, overlaid, subtract, widen,
-        };
-        let use_ = plan.route.use_;
-        let over = overlaid(use_, plan.route.res_ms);
-        let mut todo = vec![plan.window];
-        let mut seqs: std::collections::BTreeMap<Fingerprint, Vec<Tagged>> =
-            std::collections::BTreeMap::new();
-        let mut stages: Vec<(i64, String, String)> = Vec::new();
-        for level in plan.levels.levels[..=plan.route.level].iter().rev() {
-            if todo.is_empty() {
-                break;
-            }
-            // Issue #18: each statement names its intervals, never their
-            // hull, so it returns only rows inside what is still needed.
-            let mut rows = Vec::new();
-            let mut sqls = Vec::new();
-            for ask in todo.chunks(MAX_STATEMENT_INTERVALS) {
-                let sql = level_fetch(tenant, &level.table, fps, ask, self.config.distributed);
-                rows.extend(self.level_rows(sql.clone(), budget).await?);
-                sqls.push((ask.to_vec(), sql));
-            }
-            let runs: Vec<RunRow> = rows
+        if hist_n > 0 {
+            scope.saw_histograms();
+            let (rlo, rhi) = plan.raw_window;
+            let floats: Vec<SampleRow> = rows
                 .iter()
-                .filter(|r| r.kind == 1)
-                .map(|r| RunRow {
-                    shard: r.shard,
-                    t_last: r.t_last,
-                    t_end: r.t_end,
+                .filter(|r| r.arm == 3)
+                .map(|r| SampleRow {
+                    fingerprint: r.fingerprint,
+                    unix_milli: r.t,
+                    value: r.last,
                 })
                 .collect();
-            let covered = coverage(&runs, plan.levels.shards);
-            let served = intersect(&covered, &todo);
-            for row in rows {
-                if row.kind == 0 && contains(&served, row.t_end) {
-                    seqs.entry(row.fingerprint)
-                        .or_default()
-                        .push(Tagged::Level {
-                            res_ms: level.res_ms,
-                            row,
-                        });
-                }
-            }
-            for (ask, sql) in &sqls {
-                let mine = intersect(&served, ask);
-                if mine.is_empty() {
-                    stages.push((
-                        ask[0].0,
-                        sql.clone(),
-                        format!("{} served nothing", level.table),
-                    ));
-                }
-                for (x, y) in &mine {
-                    stages.push((
-                        *x,
-                        sql.clone(),
-                        format!("{}.{} served ({x}, {y}]", level.table, column_of(use_)),
-                    ));
-                }
-            }
-            todo = subtract(&todo, &covered);
+            let hists: Vec<HistSampleRow> = rows
+                .iter()
+                .filter(|r| r.arm == 1)
+                .filter_map(|r| {
+                    r.h.first().map(|h| HistSampleRow {
+                        fingerprint: r.fingerprint,
+                        unix_milli: r.t,
+                        schema: h.schema,
+                        zero_threshold: h.zero_threshold,
+                        zero_count: h.zero_count,
+                        count: h.count,
+                        sum: h.sum,
+                        pos_span_offsets: h.pos_span_offsets.clone(),
+                        pos_span_lengths: h.pos_span_lengths.clone(),
+                        pos_bucket_deltas: h.pos_bucket_deltas.clone(),
+                        neg_span_offsets: h.neg_span_offsets.clone(),
+                        neg_span_lengths: h.neg_span_lengths.clone(),
+                        neg_bucket_deltas: h.neg_bucket_deltas.clone(),
+                        custom_values: h.custom_values.clone(),
+                        counter_reset_hint: h.counter_reset_hint,
+                    })
+                })
+                .collect();
+            let series = group_merged_rows(floats, hists, &labels_by_fp, metric_name)?;
+            let trace = RollupTrace {
+                stages: vec![(
+                    plan.sql,
+                    format!("native histograms: read raw ({rlo}, {rhi}]"),
+                )],
+                served_from_level: false,
+            };
+            return Ok((series, Some(trace)));
         }
-        // Plan Q12: under 720 s a counter's raw read is each uncovered
-        // interval widened by the range on both sides, inside the window.
-        let read = if over {
-            widen(&todo, sel.range_ms.unwrap_or(0), plan.window)
-        } else {
-            todo.clone()
-        };
-        for ask in read.chunks(MAX_STATEMENT_INTERVALS) {
-            let sql = sample_sql::sample_fetch_within(tenant, &self.config.samples_table, fps, ask);
-            let raw: Vec<SampleRow> = self.fetch_sample_rows(sql.clone(), budget).await?;
-            for r in raw {
-                if contains(&read, r.unix_milli) {
-                    seqs.entry(r.fingerprint).or_default().push(Tagged::Raw(
-                        pulsus_promql::Sample::float(r.unix_milli, r.value),
-                    ));
-                }
-            }
-            // Each uncovered interval's stage carries the statement of the
-            // chunk that holds it.
-            for (x, y) in &todo {
-                if ask.iter().any(|&(a, b)| a <= *x && *y <= b) {
-                    stages.push((*x, sql.clone(), format!("raw ({x}, {y}]")));
-                }
-            }
-        }
-        let mut rows = Vec::new();
-        let mut raw_rows = Vec::new();
-        let mut served_from_level = false;
-        for (fingerprint, mut seq) in seqs {
-            // Stable: raw samples at one millisecond keep their read order.
-            seq.sort_by_key(Tagged::at);
-            served_from_level |= seq.iter().any(|t| match t {
-                Tagged::Level { row, .. } => {
-                    matches!(
-                        use_,
-                        pulsus_promql::RollupUse::Last | pulsus_promql::RollupUse::Counter
-                    ) || row.count > 0
-                }
-                Tagged::Raw(_) => false,
-            });
-            let (points, overlay) = assemble(use_, plan.route.res_ms, &seq, &todo);
-            rows.extend(points.into_iter().map(|s| SampleRow {
-                fingerprint,
+        let use_ = plan.route.use_;
+        let res_ms = plan.route.res_ms;
+        let mut points = Vec::new();
+        let mut seq: Vec<Tagged> = Vec::new();
+        let mut at: Option<Fingerprint> = None;
+        let flush = |fp: Fingerprint, seq: &mut Vec<Tagged>, points: &mut Vec<SampleRow>| {
+            let (pts, _) = assemble(use_, res_ms, seq, &Vec::new());
+            points.extend(pts.into_iter().map(|s| SampleRow {
+                fingerprint: fp,
                 unix_milli: s.t_ms,
                 value: s.v,
             }));
-            if let Some(o) = overlay {
-                raw_rows.extend(o.samples.into_iter().map(|s| SampleRow {
-                    fingerprint,
-                    unix_milli: s.t_ms,
-                    value: s.v,
-                }));
+            seq.clear();
+        };
+        for r in rows.iter().filter(|r| r.arm == 0) {
+            if at.is_some_and(|fp| fp != r.fingerprint) {
+                flush(at.expect("a series"), &mut seq, &mut points);
             }
+            at = Some(r.fingerprint);
+            seq.push(Tagged::Level {
+                res_ms,
+                row: super::rollup::LevelRow {
+                    fingerprint: r.fingerprint,
+                    t_end: r.t,
+                    t_last: r.t_last,
+                    last: r.last,
+                    min: r.min,
+                    max: r.max,
+                    sum: r.sum,
+                    count: r.count,
+                    inc: r.inc,
+                    flags: r.flags,
+                },
+            });
         }
-        if over {
-            served_from_level &= level_window_exists(sel, &plan.params, &todo);
+        if let Some(fp) = at {
+            flush(fp, &mut seq, &mut points);
         }
-        Ok(RollupChunk {
-            rows,
-            stages,
-            served_from_level,
-            overlay: over.then_some((todo, raw_rows)),
-            fps: chunk_fps.to_vec(),
-        })
-    }
-
-    /// Issue #18 part B: one level fetch's rows, charged to the query's
-    /// sample budget as they drain — or the answer hook's, when a test
-    /// installed one.
-    async fn level_rows(
-        &self,
-        sql: String,
-        budget: &SampleBudget,
-    ) -> Result<Vec<super::rollup::LevelRow>, ReadError> {
-        if let Some(hook) = &self.rollup_answer_hook
-            && let Some(rows) = hook(&sql)
-        {
-            for _ in &rows {
-                budget.charge_one().map_err(ReadError::QueryTooBroad)?;
-            }
-            return Ok(rows);
-        }
-        self.fetch_sample_rows(sql, budget).await
+        let series = group_merged_rows(points, Vec::new(), &labels_by_fp, metric_name)?;
+        let (lo, hi) = plan.window;
+        let trace = RollupTrace {
+            stages: vec![(
+                plan.sql,
+                format!(
+                    "{}.{} served ({lo}, {hi}]",
+                    plan.route.table,
+                    column_of(use_)
+                ),
+            )],
+            // D6: a selector read at a level marks the answer `rollup`.
+            served_from_level: true,
+        };
+        Ok((series, Some(trace)))
     }
 
     /// Issues #549 and #579: runs one pushed node's statements.
@@ -3396,18 +3134,26 @@ impl MetricsEngine {
                 sqls,
                 fallbacks,
                 drop_name,
-                levels,
+                fetched,
+                level_sides,
             } => {
+                // Issue #810 (D10): a statement sent while staging is the
+                // node's answer.
+                if let Some(chunks) = fetched {
+                    return Ok(PushResult::Range {
+                        self_pos,
+                        push,
+                        chunks,
+                        fallbacks,
+                        drop_name,
+                        level_sides,
+                    });
+                }
                 // Issue #579 part 3 (D3): one chunk after another, so a
                 // node holds one statement's memory in the database, not
                 // the chunk count times it. Each statement nests the
                 // series tables, so it carries `series_read_settings`.
-                let settings = series_read_settings(
-                    self.config.read_max_memory_bytes,
-                    self.config.distributed,
-                    self.config.skip_unavailable_shards,
-                    self.config.max_replica_delay_secs,
-                );
+                let settings = self.series_settings();
                 let mut chunks = Vec::with_capacity(sqls.len());
                 for (g0, sql) in sqls {
                     let rows = self
@@ -3419,27 +3165,13 @@ impl MetricsEngine {
                         .await?;
                     chunks.push((g0, rows));
                 }
-                // Part 4: S4, sent only under explain.
-                let mut served = Vec::with_capacity(levels.len());
-                for (selector, sql, todo) in levels {
-                    let Some(sql) = sql else {
-                        served.push((selector, false, todo));
-                        continue;
-                    };
-                    let rows = self
-                        .fetch_rows_with::<super::grouped_rows::LevelServedRow>(
-                            sql, &settings, None,
-                        )
-                        .await?;
-                    served.push((selector, rows.first().is_some_and(|r| r.served == 1), todo));
-                }
                 Ok(PushResult::Range {
                     self_pos,
                     push,
                     chunks,
                     fallbacks,
                     drop_name,
-                    served,
+                    level_sides,
                 })
             }
         }
@@ -3511,6 +3243,84 @@ impl MetricsEngine {
             None,
         )
         .await
+    }
+
+    /// Issue #810 (D9): the routed selectors of `plan` (each `arms` entry
+    /// `Level`), each with its ID statement and its fetch window in
+    /// `raw_plan`, the routing-off plan.
+    fn hist_scope(
+        &self,
+        tenant: &Tenant,
+        plan: &pulsus_promql::QueryPlan,
+        raw_plan: &pulsus_promql::QueryPlan,
+        arms: &[super::grouped::Arm],
+    ) -> HistScope {
+        use super::TenantSql;
+        let mut conds = Vec::new();
+        let mut raw_windows = HashMap::new();
+        for (sel, arm) in plan.selectors.iter().zip(arms) {
+            let (super::grouped::Arm::Level(_), Some(name)) = (arm, sel.metric_name.as_deref())
+            else {
+                continue;
+            };
+            let Some(raw) = raw_plan.selectors.iter().find(|r| r.id == sel.id) else {
+                continue;
+            };
+            let (lo, hi) = raw.fetch_window(&raw_plan.params);
+            let ids = super::sql::historical_series_subquery(
+                tenant,
+                &self.config.series_table,
+                &self.config.labels_table,
+                name,
+                DataWindow {
+                    start_ms: lo,
+                    end_ms: hi,
+                },
+                &raw.matchers,
+            );
+            conds.push(format!(
+                "(fingerprint IN (\n{ids}\n) AND unix_milli > {lo} AND unix_milli <= {hi})"
+            ));
+            raw_windows.insert(sel.id, (lo, hi));
+        }
+        let cond = (!conds.is_empty()).then(|| conds.join(" OR "));
+        let full = cond
+            .as_ref()
+            .map(|c| format!("org_id = {} AND ({c})", tenant.sql_literal()));
+        HistScope {
+            cond,
+            full,
+            raw_windows,
+            seen: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// [`series_read_settings`] under this engine's configuration.
+    fn series_settings(&self) -> QuerySettings {
+        series_read_settings(
+            self.config.read_max_memory_bytes,
+            self.config.distributed,
+            self.config.skip_unavailable_shards,
+            self.config.max_replica_delay_secs,
+        )
+    }
+
+    /// Issue #810: [`Self::fetch_rows_with`] charging `budget` only for the
+    /// rows `charge` accepts.
+    async fn fetch_rows_charging<R: ChRow>(
+        &self,
+        sql: String,
+        settings: &QuerySettings,
+        budget: &SampleBudget,
+        charge: impl Fn(&R) -> bool,
+    ) -> Result<Vec<R>, ReadError> {
+        let _statement = match &self.statement_probe {
+            Some(p) => Some(p.enter().await),
+            None => None,
+        };
+        self.dispatch
+            .fetch_rows_charging(sql, settings, Some(budget), charge)
+            .await
     }
 
     /// [`Self::fetch_rows`] for a series read that nests the label table
@@ -4570,23 +4380,22 @@ fn instant_push_declined(explain: Option<&mut PlanExplain>, reason: super::group
 }
 
 /// Issue #18: a query read at its own steps — the request's grid. Its
-/// range picks the widest level a selector may read; each selector reads
-/// the widest level at most that whose buckets end at its window edges
-/// (`rollup::route`). An instant query routes at the smallest level.
+/// range (issue #810: the whole request's, `request`) picks the widest
+/// level a selector may read; each selector reads the widest level at most
+/// that whose buckets end at its window edges (`rollup::route`). Issue
+/// #810 (D5): an instant query by its smallest selector range.
 fn request_grid_routing(
-    _plan: &pulsus_promql::QueryPlan,
+    plan: &pulsus_promql::QueryPlan,
     p: &MetricQueryParams,
     levels: Option<std::sync::Arc<super::rollup::Levels>>,
-    routing_span_ms: Option<i64>,
+    request: Option<&MetricQueryParams>,
 ) -> Option<(std::sync::Arc<super::rollup::Levels>, i64)> {
     levels.and_then(|levels| {
         let res = if p.step_ms == 0 {
-            Some(levels.levels[0].res_ms)
+            super::rollup::instant_resolution(plan, &levels)
         } else {
-            match routing_span_ms {
-                Some(span) => super::rollup::resolution_for_span(span, p.step_ms, &levels),
-                None => super::rollup::resolution(p, &levels),
-            }
+            let whole = request.unwrap_or(p);
+            super::rollup::resolution_for_span(whole.end_ms - whole.start_ms, p.step_ms, &levels)
         };
         res.map(|res| (levels, res))
     })
@@ -4611,20 +4420,69 @@ fn round_on_request_grid(
 /// Issue #18, D9: the `rollup_lattice` stage's note.
 fn lattice_note(l: &super::rollup::Lattice, p: &MetricQueryParams) -> String {
     let width = super::rollup::duration_text(l.width);
-    let Some(gl) = l.until_ms else {
+    let Some(gu) = l.until_ms else {
         return format!("lattice {width} on the request's steps");
     };
     let g0 = -(-p.start_ms).div_euclid(l.width) * l.width;
-    let mut note =
-        format!("lattice {width} from {g0} to {gl}, each step takes the bucket that holds it");
-    if let Some(t) = l.tail {
-        note.push_str(&format!(
-            "; steps from {} at step {}",
-            t.start_ms,
-            super::rollup::duration_text(t.step_ms)
-        ));
+    format!("lattice {width} from {g0} to {gu}, each step takes the bucket that holds it")
+}
+
+/// Issue #18: the bucket ends `(⌈start / L⌉ × L, gu, L)` a filled range
+/// query is read at.
+fn bucket_ends(p: &MetricQueryParams, w: i64, gu: i64) -> MetricQueryParams {
+    MetricQueryParams {
+        start_ms: -(-p.start_ms).div_euclid(w) * w,
+        end_ms: gu,
+        step_ms: w,
     }
-    note
+}
+
+/// Issue #810 (D14): how a query's reads are routed, from each selector's
+/// arm.
+fn read_mix(arms: &[super::grouped::Arm]) -> ReadMix {
+    let routed = arms
+        .iter()
+        .filter(|a| matches!(a, super::grouped::Arm::Level(_)))
+        .count();
+    match routed {
+        0 => ReadMix::Unrouted,
+        n if n == arms.len() => ReadMix::AllRouted,
+        _ => ReadMix::Mixed,
+    }
+}
+
+/// Issue #810 (D9): the query's routed selectors' native-histogram
+/// condition, each selector's window in the routing-off plan, and whether
+/// any read found `hist_n > 0`.
+struct HistScope {
+    /// `{HIST_WHERE}`, `None` with no routed selector.
+    cond: Option<String>,
+    /// `org_id = {tenant} AND ({HIST_WHERE})`.
+    full: Option<String>,
+    raw_windows: HashMap<SelectorId, (i64, i64)>,
+    seen: std::sync::atomic::AtomicBool,
+}
+
+impl HistScope {
+    fn cond(&self) -> Option<&str> {
+        self.cond.as_deref()
+    }
+
+    fn where_sql(&self) -> Option<&str> {
+        self.full.as_deref()
+    }
+
+    fn raw_window(&self, id: SelectorId) -> Option<(i64, i64)> {
+        self.raw_windows.get(&id).copied()
+    }
+
+    fn saw_histograms(&self) {
+        self.seen.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn seen(&self) -> bool {
+        self.seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Issue #579 part 4: a selector's arm — `Level` exactly where
@@ -4701,26 +4559,6 @@ fn push_fallback_stages(e: &mut PlanExplain, fallback: &SelectorFetchPlan) {
     }
 }
 
-/// Issue #18 part 2c: the coverage statements one `read_selectors` call
-/// has sent, by their text, so a side whose next statement is one already
-/// sent takes its rows instead of sending it again. The text names the
-/// table and the intervals, so two sides share a statement exactly when
-/// they read one level over the same intervals.
-#[derive(Debug, Default)]
-struct CoverageMemo(HashMap<String, Vec<super::rollup::RunRow>>);
-
-impl CoverageMemo {
-    /// The rows of the statement `sql` over `table`, when it was sent.
-    fn lookup(&self, _table: &str, sql: &str) -> Option<Vec<super::rollup::RunRow>> {
-        self.0.get(sql).cloned()
-    }
-
-    /// Records the rows the statement `sql` over `table` read.
-    fn record(&mut self, _table: &str, sql: String, rows: Vec<super::rollup::RunRow>) {
-        self.0.insert(sql, rows);
-    }
-}
-
 /// Issue #579 part 4: one side of a pushed node as phase 1 recorded it.
 struct PushSide {
     selector: SelectorId,
@@ -4741,55 +4579,29 @@ struct PushSide {
 }
 
 impl PushSide {
-    /// How the side's statements name its series.
-    fn sql_series(&self) -> super::grouped_sql::SideSeries<'_> {
+    /// How the side's statements name its series; `gated` on a statement
+    /// that counts its own series (issue #810, D10).
+    fn sql_series(&self, gated: bool) -> super::grouped_sql::SideSeries<'_> {
         match &self.known {
             Some((list, members)) => super::grouped_sql::SideSeries::Known {
                 list,
                 members,
-                gated: false,
+                gated,
             },
             None => super::grouped_sql::SideSeries::Ids {
                 ids: &self.ids_sql,
-                gated: false,
+                gated,
             },
         }
     }
 }
 
-/// One `Level` side's levels, uncovered and raw-read intervals and raw
-/// steps, cut to one time chunk.
-struct ChunkCut {
-    levels: Vec<(String, i64, super::rollup::Intervals)>,
-    todo: super::rollup::Intervals,
-    read: super::rollup::Intervals,
-    raw_steps: Vec<(u32, u32)>,
-}
-
-/// Issue #579 part 4: a `Level` side's coverage, from S1. Issue #18 part
-/// 2a: every level it reads.
+/// Issue #579 part 4: a `Level` side's level. Issue #810 (D1): the
+/// route's level alone, over the selector's fetch window.
 struct LevelSide {
-    shards: u32,
+    table: String,
+    res_ms: i64,
     window: (i64, i64),
-    /// `(table, width ms, served)` of each level that serves part of the
-    /// window, from the route's level down.
-    levels: Vec<(String, i64, super::rollup::Intervals)>,
-    todo: super::rollup::Intervals,
-    read: super::rollup::Intervals,
-    /// The route is under 720 s: its raw samples are read through the
-    /// overlay, not folded into the counter.
-    overlaid: bool,
-}
-
-impl LevelSide {
-    /// F11: a list longer than one statement names.
-    fn exceeds(&self, grid: super::grouped::Grid, range_ms: i64) -> bool {
-        let max = super::rollup::MAX_STATEMENT_INTERVALS;
-        self.levels.iter().any(|(_, _, served)| served.len() > max)
-            || self.todo.len() > max
-            || self.read.len() > max
-            || super::grouped::raw_steps(grid, range_ms, &self.todo).len() > max
-    }
 }
 
 /// Issue #579 part 4: the node a [`PushSide`] list is staged for: shape A
@@ -4890,9 +4702,11 @@ enum PendingPush {
         /// The output's delayed name drop: `true` over a range function,
         /// shape C's `bool` (part 4, plan section 5.3).
         drop_name: bool,
-        /// Part 4, explain only: each `Level` side's S4 and its uncovered
-        /// intervals.
-        levels: Vec<(SelectorId, Option<String>, Option<super::rollup::Intervals>)>,
+        /// Issue #810 (D10): the rows of the statement staging already sent,
+        /// which are the node's answer.
+        fetched: Option<Vec<(u32, Vec<super::grouped_rows::RangeAggRow>)>>,
+        /// The node's `Level` sides.
+        level_sides: Vec<SelectorId>,
     },
 }
 
@@ -4909,9 +4723,8 @@ enum PushResult {
         chunks: Vec<(u32, Vec<super::grouped_rows::RangeAggRow>)>,
         fallbacks: Vec<(SelectorId, SelectorFetchPlan)>,
         drop_name: bool,
-        /// Part 4, explain only: per `Level` side, whether S4 found a level
-        /// row, and its uncovered intervals.
-        served: Vec<(SelectorId, bool, Option<super::rollup::Intervals>)>,
+        /// The node's `Level` sides.
+        level_sides: Vec<SelectorId>,
     },
 }
 
@@ -5010,16 +4823,16 @@ enum RollupSeries {
     Resolve(String),
 }
 
-/// Issue #18 part B: a routed selector's fetch, decided in phase 1.
+/// Issue #810 (D11): a routed selector's one statement, decided in phase 1.
 struct RollupFetch {
     route: super::rollup::Route,
-    levels: std::sync::Arc<super::rollup::Levels>,
-    series: RollupSeries,
-    hist_sqls: Vec<String>,
+    /// The label cache's series, when the statement names them by its list.
+    pairs: Option<Vec<(Fingerprint, LabelSet)>>,
+    sql: String,
     /// The selector's fetch window `(lo, hi]`.
     window: (i64, i64),
-    /// The query's parameters, for `level_window_exists` (plan section 7).
-    params: pulsus_promql::PlanParams,
+    /// Its window in the routing-off plan, read with `hist_n > 0` (D9).
+    raw_window: (i64, i64),
 }
 
 /// Issue #18 part B: what a routed selector's fetch read, for explain.
@@ -5033,20 +4846,6 @@ pub(super) struct RollupTrace {
 
 /// A selector's fetched series and, for a routed selector, its trace.
 type FetchedWithTrace = (Vec<FetchedSeries>, Option<RollupTrace>);
-
-/// One chunk of a routed selector: its pseudo-samples as sample rows,
-/// ascending by series and time, and its pieces.
-struct RollupChunk {
-    rows: Vec<SampleRow>,
-    stages: Vec<(i64, String, String)>,
-    served_from_level: bool,
-    /// Plan Q12: the chunk's uncovered intervals and its raw samples as
-    /// read around them, ascending by series and time; `None` on a route
-    /// that folds raw into its points.
-    overlay: Option<(super::rollup::Intervals, Vec<SampleRow>)>,
-    /// The chunk's series IDs, ascending.
-    fps: Vec<Fingerprint>,
-}
 
 /// Issue #316: the 400 `bad_data` an uncompilable `__name__` regex earns,
 /// for the two concrete-name sites that evaluate name matchers in-process
@@ -6426,46 +6225,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// **U6 (issue #18 part 2c r10): coverage statements are shared by
-    /// their text** — two sides over one table and the same intervals send
-    /// one statement and read the same rows; a side over other intervals
-    /// sends its own.
-    #[test]
-    fn a_coverage_statement_is_sent_once_per_text() {
-        use super::super::rollup::{RunRow, level_runs};
-        let run = |t_last: i64, t_end: i64| RunRow {
-            shard: 1,
-            t_last,
-            t_end,
-        };
-        let sides = [
-            ("metric_samples_60s", (0, 100), vec![run(0, 100)]),
-            ("metric_samples_60s", (0, 100), vec![run(0, 50)]),
-            ("metric_samples_60s", (40, 100), vec![run(40, 70)]),
-        ];
-        let mut memo = CoverageMemo::default();
-        let mut sent = 0;
-        let mut got = Vec::new();
-        for (table, todo, rows) in &sides {
-            let sql = level_runs(table, *todo, false);
-            let runs = match memo.lookup(table, &sql) {
-                Some(runs) => runs,
-                None => {
-                    sent += 1;
-                    memo.record(table, sql, rows.clone());
-                    rows.clone()
-                }
-            };
-            got.push(runs);
-        }
-        assert_eq!(sent, 2, "statements sent");
-        assert_eq!(
-            got[1], got[0],
-            "the second side reads the first side's rows"
-        );
-        assert_eq!(got[2], vec![run(40, 70)], "the third side reads its own");
     }
 
     /// **U2 (issue #18 part 2c): the request-path settings builders carry

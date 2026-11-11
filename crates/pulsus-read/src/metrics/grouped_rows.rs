@@ -59,13 +59,6 @@ pub struct RangeAggRow {
     pub agg: Option<f64>,
 }
 
-/// Issue #579 part 4: S4's one row ([`super::grouped_sql::level_served`]) —
-/// whether a `Level` side read a level row.
-#[derive(Debug, Clone, Copy, Row, Serialize, Deserialize)]
-pub struct LevelServedRow {
-    pub served: u8,
-}
-
 /// Issue #579 part 3: the distinct series a shape-A node's ID statement
 /// selects ([`super::grouped_sql::series_count`]).
 #[derive(Debug, Clone, Copy, Row, Serialize, Deserialize)]
