@@ -1,4 +1,4 @@
-> **Stale on the PromQL push.** Since issue #18 parts 2a and 2b, a pushed aggregate reads any rollup level, with the finer levels and raw samples where a level does not cover, and a request filled from a level decides its nodes in each of its reads as an unfilled request does, and the pushed statement has no replica check; a statement recognised as reading one table per access skips a lagging replica (`PULSUS_PROMQL_MAX_REPLICA_DELAY`), and every other statement keeps the server's replica choice. Since issue #579 part 5, an aggregate over a vector match with `on`, `ignoring`, `group_left` or `group_right` also runs in ClickHouse. Passages below that say the push reads only the 60 s level, that a coarser route declines its node, that a filled request pushes no node, or that only one-to-one matches, or only the shapes they list, are pushed, are out of date. Current behaviour: `docs/configuration.md`, `PULSUS_PROMQL_GROUPED_PUSH`, and `docs/api.md` §3.6. Since issue #810 part 1, a routed selector reads only its route's level for its float series, in one statement with, when needed, its labels; a query meeting native histograms is read raw in the same statements; a pushed node counts its own series; no coverage statement, no finer level, no raw float samples. §3 and the overlay passages of §1 are replaced by §3 below.
+> **Stale on the PromQL push.** Since issue #18 parts 2a and 2b, a pushed aggregate reads any rollup level, with the finer levels and raw samples where a level does not cover, and a request filled from a level decides its nodes in each of its reads as an unfilled request does, and the pushed statement has no replica check; a statement recognised as reading one table per access skips a lagging replica (`PULSUS_PROMQL_MAX_REPLICA_DELAY`), and every other statement keeps the server's replica choice. Since issue #579 part 5, an aggregate over a vector match with `on`, `ignoring`, `group_left` or `group_right` also runs in ClickHouse. Passages below that say the push reads only the 60 s level, that a coarser route declines its node, that a filled request pushes no node, or that only one-to-one matches, or only the shapes they list, are pushed, are out of date. Current behaviour: `docs/configuration.md`, `PULSUS_PROMQL_GROUPED_PUSH`, and `docs/api.md` §3.6. Since issue #810 part 1, a routed selector reads only its route's level for its float series, in one statement with, when needed, its labels; a query whose selectors read at a level have a native-histogram sample in their range is read raw, which can take more statements; a pushed node counts its own series; no coverage statement, no finer level, no raw float samples. §3 and the overlay passages of §1 are replaced by §3 below.
 
 # PromQL rollups: reading the levels
 
@@ -17,7 +17,7 @@ The read path hands the engine pseudo-samples built from the level's rows, in ti
 | `Counter` | `rate`, `increase` |
 | none | every other function: the selector reads raw |
 
-The points each level row gives (`level_points`, `crates/pulsus-read/src/metrics/rollup.rs:918`; `counter`, `crates/pulsus-read/src/metrics/rollup.rs:930`):
+The points each level row gives (`level_points`, `crates/pulsus-read/src/metrics/rollup.rs:984`; `counter`, `crates/pulsus-read/src/metrics/rollup.rs:1028`):
 
 | `RollupUse` | points from one level row |
 |---|---|
@@ -30,7 +30,7 @@ Stale markers and NaN read as raw for the bit-equal functions: a routed `Last` s
 
 ### 1.1 Distance from raw, measured on the engine
 
-`each_served_function_is_within_its_distance` (`crates/pulsus-read/tests/live_metrics_rollup.rs:1201`): corpus D, 260 series over 8 days at a 15 s scrape, built at every level of the five-level set `5,60,720,7200,86400`; each function sent with routing on and off; per level `res`, step `res`, over the last day at 60 s, the last 3 days at 720 s and all 8 days at 7200 s and 86400 s; `rate`, `increase` over `5 × res`, the others over `res` and `5 × res`. `d = |a − b| / |b|` (`|a|` when `b = 0`; 1 when only one answer is present); p99 by nearest rank. Output: `measure/results/live-metrics-rollup.txt`. Run before the levels followed the query's time range and before the 5 s default, so each level was reached by its step; the windows a level serves are the same bucket-end windows today.
+`each_served_function_is_within_its_distance` (`crates/pulsus-read/tests/live_metrics_rollup.rs:1204`): corpus D, 260 series over 8 days at a 15 s scrape, built at every level of the five-level set `5,60,720,7200,86400`; each function sent with routing on and off; per level `res`, step `res`, over the last day at 60 s, the last 3 days at 720 s and all 8 days at 7200 s and 86400 s; `rate`, `increase` over `5 × res`, the others over `res` and `5 × res`. `d = |a − b| / |b|` (`|a|` when `b = 0`; 1 when only one answer is present); p99 by nearest rank. Output: `measure/results/live-metrics-rollup.txt`. Run before the levels followed the query's time range and before the 5 s default, so each level was reached by its step; the windows a level serves are the same bucket-end windows today.
 
 Bit-equal at every level and on every series kind: `max_over_time`, `min_over_time`, `last_over_time`, `present_over_time`, `absent_over_time`, `timestamp` and the bare selector. `sum_over_time` and `avg_over_time` differed by at most 2.39e-13 (addition order).
 
@@ -45,7 +45,7 @@ Bit-equal at every level and on every series kind: `max_over_time`, `min_over_ti
 
 The bounds are the published figures of `docs/api.md` §3.6: twice the larger of the Python port's p99 (`measure/partB-ports/bounds.py`) and the earlier design measurement, rounded up. The test's bound for `avg_over_time` on gauges (0.0057 at 60 s, 0.0214 above) is wider than what corpus D gives, because each corpus D series has its own phase inside a scrape interval and no sample sits on a bucket edge. With every sample on an edge, jitter moves samples between buckets, and `avg_over_time`'s p99 measured 0.358 at 60 s, 0.595 at 720 s, 0.0557 at 7200 s and 0.0246 at 86400 s; output not kept.
 
-**Two other differences, both in `docs/api.md` §3.6.** From the 720 s level and coarser, a `rate` or `increase` window holding one sample of a counter has a value where raw has none, when a level row serves that sample: the row's start point and its sample are two points. A step between two samples more than 24 hours apart is counted by no level (the predecessor rule of `building.md` §3.1): a counter sampled at 23:59:30 and next at 00:00:00 a day later reads `increase(x[5d])` 0 from the 86400 s level at that midnight, where raw reads 45. `stale_and_nan_read_as_raw` (`crates/pulsus-read/tests/live_metrics_rollup.rs:1631`) asserts that counter's routed and raw values at every level exactly: absent at 60 s on both routes, 0 routed and absent raw at 720 s and 7200 s, 0 routed and 45 raw at 86400 s.
+**Two other differences, both in `docs/api.md` §3.6.** From the 720 s level and coarser, a `rate` or `increase` window holding one sample of a counter has a value where raw has none, when a level row serves that sample: the row's start point and its sample are two points. A step between two samples more than 24 hours apart is counted by no level (the predecessor rule of `building.md` §3.1): a counter sampled at 23:59:30 and next at 00:00:00 a day later reads `increase(x[5d])` 0 from the 86400 s level at that midnight, where raw reads 45. `stale_and_nan_read_as_raw` (`crates/pulsus-read/tests/live_metrics_rollup.rs:1634`) asserts that counter's routed and raw values at every level exactly: absent at 60 s on both routes, 0 routed and absent raw at 720 s and 7200 s, 0 routed and 45 raw at 86400 s.
 
 **Why the start point is one per row.** One start point per window, at `max(bucket start, lo) + 1`, against one per row: equal p99 and maximum on normal and sparse counters at 720 s and 7200 s; on stopping counters per row is closer, p99 0.0704 against 0.125 at 720 s and a 15 s scrape, 0.0634 against 0.118 at a 60 s scrape, equal at 7200 s (`measure/partB-ports/startpoints.txt`).
 
@@ -139,8 +139,8 @@ ORDER BY arm, fingerprint, t, reinterpretAsUInt64(last)
 |---|---|
 | `(lo, hi]` | the selector's fetch window, `hi` at `t_last` less `offset` |
 | `(rlo, rhi]` | the selector's window in the routing-off plan |
-| `{HIST_WHERE}` | the `OR` over the query's routed selectors of `fingerprint IN ({ID statement}) AND unix_milli > {rlo} AND unix_milli <= {rhi}` |
-| `hist_n > 0` | every routed read returns raw samples, every pushed node with a level side falls back, and the query is evaluated as with routing off |
+| `{HIST_WHERE}` | the `OR` of `fingerprint IN ({S}) AND unix_milli > {rlo} AND unix_milli <= {rhi}` for the statement's own selector, and the same by the cache's list for each other routed selector the cache lists; the others are left out of a statement they would take past the query text cap |
+| `hist_n > 0` | the statement returns raw samples, a pushed node with a level side falls back, and the query is evaluated as with routing off: a read that returned level rows, and a pushed node kept on its level answer, is read again raw in one statement of the raw arms alone |
 | settings | `series_read_settings` for every routed statement |
 | budget | the level and raw rows are charged; the labels and `hist_n` rows are not |
 | history before a level's first run, and any bucket never built | no value from the level |
@@ -183,7 +183,7 @@ With `X-Pulsus-Explain: 1`, a routed selector has:
 
 | stage | note |
 |---|---|
-| `rollup_route` | `<table>, use <RollupUse>, step <s>, range <r>`, and ` (asked <written>)` after the range when it was rounded (`push_rollup_route`, `crates/pulsus-read/src/metrics/exec.rs:4504`) |
+| `rollup_route` | `<table>, use <RollupUse>, step <s>, range <r>`, and ` (asked <written>)` after the range when it was rounded (`push_rollup_route`, `crates/pulsus-read/src/metrics/exec.rs:4693`) |
 | `rollup_piece` | the selector's one statement and `<table>.<column> served (lo, hi]`, or `native histograms: read raw (rlo, rhi]` |
 
 `exactness` is `"rollup"` when the query's steps take the value of the bucket that holds them (R2), when a selector's range was rounded (R2a), or when a selector is read at a level, whatever rows it returned; a query read raw for native histograms is `"raw-exact"`, as with routing off (`exactness: if e.rollup`, `crates/pulsus-server/src/prom_api/encode.rs:396`).
