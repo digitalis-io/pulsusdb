@@ -637,6 +637,8 @@ enum Corpus {
     P,
     /// `corpus_p2(db, p_end())`.
     P2,
+    /// `corpus_h(db, p_end())` (issue #810).
+    H,
 }
 
 impl Corpus {
@@ -654,6 +656,10 @@ impl Corpus {
             Corpus::P2 => {
                 let end = p_end();
                 (corpus_p2(db, end).await, end)
+            }
+            Corpus::H => {
+                let end = p_end();
+                (corpus_h(db, end).await, end)
             }
         }
     }
@@ -746,6 +752,24 @@ static P: Shared = Shared::new(
         "unpushed_shapes_take_todays_route",
         "a_split_level_node_reads_its_prefix",
         "a_filled_request_pushes_both_reads",
+        "a_panel_at_a_level_is_one_statement",
+        "an_in_process_routed_selector_is_one_statement",
+        "a_node_the_cache_cannot_list_is_one_statement",
+        "a_listed_and_an_unlisted_side_are_gated_over_the_cap",
+    ],
+);
+static H: Shared = Shared::new(
+    pulsus_testkit::TestDb::new("pulsus_read_it_rollup_h810"),
+    Corpus::H,
+    &[
+        "a_query_over_native_histograms_reads_raw",
+        "the_histogram_count_spans_the_query",
+        "a_pushed_node_over_histograms_reads_raw",
+        "a_raw_tail_answers_its_whole_request",
+        "an_unrouted_join_over_histograms_falls_back",
+        "a_mixed_join_falls_back_on_its_raw_side",
+        "a_level_node_falls_back_on_another_selectors_histograms",
+        "a_raw_only_node_stays_pushed_in_a_raw_query",
     ],
 );
 static P2: Shared = Shared::new(
@@ -762,13 +786,14 @@ static P2: Shared = Shared::new(
 );
 
 /// The five groups, by their statics' names.
-fn groups() -> [(&'static str, &'static Shared); 5] {
+fn groups() -> [(&'static str, &'static Shared); 6] {
     [
         ("D5_8", &D5_8),
         ("D60_8", &D60_8),
         ("D60_2", &D60_2),
         ("P", &P),
         ("P2", &P2),
+        ("H", &H),
     ]
 }
 
@@ -1923,6 +1948,26 @@ async fn the_unrouted_classes_read_raw() {
         "nothing was served from a level: raw-exact"
     );
     assert_eq!(canonical(&a.result), canonical(&b.result));
+
+    // T11 (issue #810, D9): a pushed node over the mixed metric is its own
+    // statement, which reads no level, then one statement read raw.
+    let comment = format!("{db}_t11_{}", now_ms());
+    let pushed = MetricsEngine::new(built.client().await, Arc::clone(&built.cache), engine_config(db, true))
+        .with_rollup_levels(Arc::clone(&built.slot))
+        .with_query_log_comment(&comment);
+    let q = "sum by (s) (rate(rollup_mixed[1h]))";
+    let a = ask(&pushed, &no_tenant(), q, &p).await;
+    let b = ask(&raw, &no_tenant(), q, &p).await;
+    let sent = logged(&built.admin, &comment).await;
+    let tables: Vec<&Vec<String>> = sent.iter().map(|r| &r.tables).collect();
+    assert_eq!(sent.len(), 2, "T11: statements {tables:?}");
+    assert!(
+        sent[1].tables.contains(&format!("{db}.metric_samples"))
+            && sent[1].tables.contains(&format!("{db}.metric_hist_samples")),
+        "T11: the second reads raw: {tables:?}"
+    );
+    assert!(!vector_or_matrix(&b).is_empty(), "T11: an answer");
+    assert_eq!(vector_or_matrix(&a), vector_or_matrix(&b), "T11: as raw");
     built.finish().await;
 }
 
@@ -6344,4 +6389,859 @@ async fn a_name_only_include_answers_as_in_process() {
     }
     built.finish().await;
     assert!(failures.is_empty(), "T18:\n{}", failures.join("\n"));
+}
+
+// ---------------------------------------------------------------- #810
+//
+// Issue #810 part 1: a query read at a rollup level sends one statement per
+// read, and that statement reads only the level.
+
+static DB_T2: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t810_2");
+static DB_T8: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t810_8");
+static DB_T14: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t810_14");
+
+/// A per-test comment, unique to this run.
+fn comment_for(db: &str, what: &str) -> String {
+    format!("{db}_{what}_{}", now_ms())
+}
+
+/// Whether a logged statement read `table`.
+fn reads_table(r: &LoggedRead, table: &str) -> bool {
+    r.tables.iter().any(|t| t == table)
+}
+
+/// The tables of every logged statement, one line each.
+fn brief(sent: &[LoggedRead]) -> Vec<String> {
+    sent.iter()
+        .map(|r| {
+            format!(
+                "{} rows, {:?}: {}",
+                r.read_rows,
+                r.tables,
+                r.query.lines().next().unwrap_or("")
+            )
+        })
+        .collect()
+}
+
+/// The text of `sql` with every gate condition of issue #810 replaced by
+/// `1`: the cap gate, the level reads' `hist_n = 0` and the raw arms'
+/// `hist_n > 0`.
+fn ungated(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    let gate = "series_n * grid_n <= ";
+    while let Some(at) = rest.find(gate) {
+        out.push_str(&rest[..at]);
+        out.push('1');
+        let tail = &rest[at + gate.len()..];
+        let digits = tail.chars().take_while(|c| c.is_ascii_digit()).count();
+        rest = &tail[digits..];
+    }
+    out.push_str(rest);
+    out.replace("hist_n = 0", "1").replace("hist_n > 0", "1")
+}
+
+/// The granules `EXPLAIN indexes = 1` of `sql` selects on `table`, summed
+/// over its read steps; `0` with no read step of it.
+async fn granules(admin: &ChClient, sql: &str, table: &str) -> u64 {
+    let explain = format!("SELECT explain AS s FROM (EXPLAIN indexes = 1 {sql})");
+    let lines = admin
+        .query_strings(
+            &explain,
+            &QuerySettings::new()
+                .set("max_memory_usage", 4_294_967_296u64)
+                .set("log_comment", "t810-explain"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("explain failed: {e}\nSQL:\n{explain}"));
+    let mut total = 0u64;
+    let mut current: Option<bool> = None;
+    let mut last: Option<u64> = None;
+    let flush = |current: Option<bool>, last: Option<u64>, total: &mut u64| {
+        if current == Some(true) {
+            *total += last.unwrap_or(0);
+        }
+    };
+    for line in &lines {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("ReadFromMergeTree (") {
+            flush(current, last, &mut total);
+            let name = rest.trim_end_matches(')');
+            current = Some(name == table);
+            last = None;
+        } else if let Some(g) = l.strip_prefix("Granules: ") {
+            last = g.split('/').next().and_then(|n| n.trim().parse().ok());
+        }
+    }
+    flush(current, last, &mut total);
+    total
+}
+
+/// The gate check of plan section 6: on `table`, `sql` selects no granule,
+/// and with its gates removed at least `⌈x / 8192⌉`. The two figures.
+async fn gate_check(admin: &ChClient, sql: &str, table: &str, x: u64) -> (u64, u64, Vec<String>) {
+    let gated = granules(admin, sql, table).await;
+    let open = granules(admin, &ungated(sql), table).await;
+    let mut failures = Vec::new();
+    if gated != 0 {
+        failures.push(format!("{table}: {gated} granules selected under the gate"));
+    }
+    let want = x.div_ceil(8192);
+    if open < want {
+        failures.push(format!(
+            "{table}: {open} granules with the gate removed, under {want} ({x} rows held back)"
+        ));
+    }
+    println!("gate check {table}: gated {gated}, ungated {open}, rows held back {x}");
+    (gated, open, failures)
+}
+
+/// One count from `sql`.
+async fn count_of(admin: &ChClient, sql: &str) -> u64 {
+    let v = ints(admin, &format!("SELECT toInt64(({sql})) AS v")).await;
+    u64::try_from(v[0]).expect("a count")
+}
+
+/// The data rows of `table` of the series of `metric` matching `extra`
+/// with `t_end` in `(lo, hi]`.
+async fn level_rows_of(
+    admin: &ChClient,
+    db: &str,
+    table: &str,
+    metric: &str,
+    extra: &str,
+    (lo, hi): (i64, i64),
+) -> u64 {
+    count_of(
+        admin,
+        &format!(
+            "SELECT count() FROM {db}.{table} WHERE kind = 0 AND t_end > {lo} AND t_end <= {hi} \
+             AND fingerprint IN (SELECT fingerprint FROM {db}.metric_labels \
+                                 WHERE metric_name = '{metric}'{extra})"
+        ),
+    )
+    .await
+}
+
+/// The raw samples of `metric` with `unix_milli` in `(lo, hi]`.
+async fn raw_rows_of(admin: &ChClient, db: &str, metric: &str, (lo, hi): (i64, i64)) -> u64 {
+    count_of(
+        admin,
+        &format!(
+            "SELECT count() FROM {db}.metric_samples WHERE unix_milli > {lo} AND unix_milli <= {hi} \
+             AND fingerprint IN (SELECT fingerprint FROM {db}.metric_labels \
+                                 WHERE metric_name = '{metric}')"
+        ),
+    )
+    .await
+}
+
+/// **T1 (issue #810): a panel at a level is one statement**, reading the
+/// route's level and no raw sample.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panel_at_a_level_is_one_statement() {
+    skip_unless_live!();
+    let (built, end) = P.lease("a_panel_at_a_level_is_one_statement").await;
+    let db = built.db().to_string();
+    let mut failures = Vec::new();
+    for (what, q, p, level, not) in [
+        (
+            "a",
+            "sum by (instance) (rate(p_rx_total[1m]))",
+            range(end - 3 * HOUR - 30_000, end - 30_000, SCRAPE),
+            "metric_samples_60s",
+            vec!["metric_samples"],
+        ),
+        (
+            "b",
+            "sum by (instance) (rate(p_rx_total[2m15s]))",
+            range(end - DAY, end, 2 * MIN),
+            "metric_samples_720s",
+            vec!["metric_samples_60s", "metric_samples"],
+        ),
+    ] {
+        let comment = comment_for(&db, &format!("t1{what}"));
+        let e = built.pushed_engine(Some(&comment)).await;
+        e.query(&no_tenant(), &parse(q).expect("parse"), &p)
+            .await
+            .expect("the panel");
+        let sent = logged(&built.admin, &comment).await;
+        if sent.len() != 1 {
+            failures.push(format!("({what}) {} statements: {:#?}", sent.len(), brief(&sent)));
+            continue;
+        }
+        if !reads_table(&sent[0], &format!("{db}.{level}")) {
+            failures.push(format!("({what}) {level} not read: {:#?}", brief(&sent)));
+        }
+        for t in not {
+            if reads_table(&sent[0], &format!("{db}.{t}")) {
+                failures.push(format!("({what}) {t} read: {:#?}", brief(&sent)));
+            }
+        }
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T1:\n{}", failures.join("\n"));
+}
+
+/// Issue #810: one counter `c`, sampled every 15 s on the boundary over
+/// `(end − 4 h, end]`, valued `1e6 +` the seconds since `end − 4 h`, its
+/// first level built to `built_to`. The default levels; only the first is
+/// built.
+async fn one_counter(db: &str, end: i64, built_to: i64) -> Built {
+    let lo = end - 4 * HOUR;
+    let fp = "toUInt128('24000000000000000000000000000000810001')";
+    let land = vec![
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, 'c', {fp}, \
+                    toInt64({lo}) + toInt64(number) * {HOUR} + 1000, '{{\"job\":\"c\"}}', 0 FROM numbers(5)"
+        ),
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, 'c', {fp}, \
+                    toInt64({lo}) + toInt64(number) * {SCRAPE}, 1e6 + toFloat64(number) * 15 \
+             FROM numbers(1, {})",
+            4 * HOUR / SCRAPE
+        ),
+    ];
+    let (bootstrap, admin, ctx) = first_only(db, DEFAULTS, &land, lo, built_to).await;
+    warm(bootstrap, admin, ctx, &[]).await
+}
+
+/// The anchor of [`one_counter`]'s cases: a whole minute, an hour ago.
+fn minute_end() -> i64 {
+    (now_ms() / HOUR) * HOUR - HOUR
+}
+
+/// **T2 (issue #810, D3, §3): the newest steps serve what the level has.**
+#[tokio::test(flavor = "multi_thread")]
+async fn the_newest_steps_serve_what_the_level_has() {
+    skip_unless_live!();
+    let end = minute_end();
+    let w = end - 10 * MIN;
+    let built = one_counter(DB_T2.name(), end, w).await;
+    let q = "sum(rate(c[1m]))";
+    let p = range(end - 3 * HOUR, end, SCRAPE);
+    let t = no_tenant();
+    let mut failures = Vec::new();
+    for (name, e) in [
+        ("pushed", built.pushed_engine(None).await),
+        ("in process", built.engine(true, None).await),
+    ] {
+        let points = ask(&e, &t, q, &p).await.points();
+        for step in times_of(&p) {
+            let g = ceil_to(step, MIN);
+            let k = (g - w) / MIN;
+            let want = match k {
+                ..=1 => Some(1.0),
+                2 => Some(0.7),
+                3 => Some(0.5),
+                _ => None,
+            };
+            let got = points
+                .iter()
+                .find(|((_, at), _)| *at == step)
+                .map(|(_, v)| *v);
+            let ok = match (want, got) {
+                (Some(a), Some(b)) => (a - b).abs() <= 1e-12,
+                (None, None) => true,
+                _ => false,
+            };
+            if !ok {
+                failures.push(format!("{name} at {step} (k = {k}): want {want:?}, got {got:?}"));
+            }
+        }
+    }
+    let raw = ask(&built.engine(false, None).await, &t, q, &p).await.points();
+    for step in times_of(&p) {
+        let got = raw.iter().find(|((_, at), _)| *at == step).map(|(_, v)| *v);
+        if got.is_none_or(|v| (v - 1.0).abs() > 1e-12) {
+            failures.push(format!("raw at {step}: got {got:?}"));
+        }
+    }
+    built.finish().await;
+    assert!(
+        failures.is_empty(),
+        "T2: {} failures, first 20:\n{}",
+        failures.len(),
+        failures.iter().take(20).cloned().collect::<Vec<_>>().join("\n")
+    );
+}
+
+/// **T3 (issue #810, D11): an in-process routed selector is one statement.**
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_process_routed_selector_is_one_statement() {
+    skip_unless_live!();
+    let (built, end) = P
+        .lease("an_in_process_routed_selector_is_one_statement")
+        .await;
+    let db = built.db().to_string();
+    let t = no_tenant();
+    let mut failures = Vec::new();
+    let q = "max_over_time(p_rx_total[1m])";
+    let p = range(end - 6 * HOUR, end, MIN);
+    let cold = Arc::new(LabelCache::new(
+        ChClient::new(test_config(&db)).await.expect("connect"),
+        cache_config(&db),
+    ));
+    let mut answers = Vec::new();
+    for (what, q, p, warm_cache) in [
+        ("a", q, p, true),
+        ("b", q, p, false),
+        (
+            "c",
+            "max_over_time(p_rx_total[3h])",
+            range(end - 30 * MIN, end - 30 * MIN, 0),
+            true,
+        ),
+    ] {
+        let comment = comment_for(&db, &format!("t3{what}"));
+        let e = if warm_cache {
+            built.engine(true, Some(&comment)).await
+        } else {
+            MetricsEngine::new(
+                built.client().await,
+                Arc::clone(&cold),
+                engine_config(&db, false),
+            )
+            .with_rollup_levels(Arc::clone(&built.slot))
+            .with_query_log_comment(&comment)
+        };
+        let (result, _) = e
+            .query(&t, &parse(q).expect("parse"), &p)
+            .await
+            .unwrap_or_else(|e| panic!("({what}): {e:?}"));
+        answers.push(Answer {
+            result,
+            explain: PlanExplain::new("metrics"),
+        });
+        let sent = logged(&built.admin, &comment).await;
+        if sent.len() != 1 {
+            failures.push(format!("({what}) {} statements: {:#?}", sent.len(), brief(&sent)));
+            continue;
+        }
+        let s = &sent[0];
+        if !reads_table(s, &format!("{db}.metric_samples_60s")) {
+            failures.push(format!("({what}) the 60 s level not read: {:#?}", brief(&sent)));
+        }
+        if s.query.contains("kind = 1") {
+            failures.push(format!("({what}) run rows read"));
+        }
+        if what == "b" {
+            if !reads_table(s, &format!("{db}.metric_labels")) {
+                failures.push(format!("(b) the labels not read: {:#?}", brief(&sent)));
+            }
+        } else {
+            let lo = if p.step_ms == 0 {
+                p.start_ms - 3 * HOUR
+            } else {
+                p.start_ms - MIN
+            };
+            let x = raw_rows_of(&built.admin, &db, "p_rx_total", (lo, p.end_ms)).await;
+            let (_, _, f) = gate_check(&built.admin, &s.query, &format!("{db}.metric_samples"), x).await;
+            failures.extend(f.into_iter().map(|f| format!("({what}) {f}")));
+        }
+    }
+    if answers[0].cells() != answers[1].cells() || answers[0].cells().is_empty() {
+        failures.push("(b) differs from (a)".to_string());
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T3:\n{}", failures.join("\n"));
+}
+
+/// **T8 (issue #810, D6): a level with no rows reads as `rollup`.** Only the
+/// 60 s level is built; a 16 h range at 2 m is routed to 720 s.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_level_with_no_rows_reads_as_rollup() {
+    skip_unless_live!();
+    let end = minute_end();
+    let built = one_counter(DB_T8.name(), end, end - 10 * MIN).await;
+    let p = range(end - 16 * HOUR, end, 2 * MIN);
+    let t = no_tenant();
+    let mut failures = Vec::new();
+    for (name, e) in [
+        ("pushed", built.pushed_engine(None).await),
+        ("in process", built.engine(true, None).await),
+    ] {
+        for q in ["sum(rate(c[2m15s]))", "max_over_time(c[2m])"] {
+            let a = ask(&e, &t, q, &p).await;
+            if !a.points().is_empty() {
+                failures.push(format!("{name} {q}: {} points", a.points().len()));
+            }
+            if !a.explain.rollup {
+                failures.push(format!("{name} {q}: not marked rollup"));
+            }
+        }
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T8:\n{}", failures.join("\n"));
+}
+
+/// **T10 (issue #810, D10): a node the cache cannot list is one statement**,
+/// and over the cap the first statement returns only the count, its level
+/// reads gated off.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_the_cache_cannot_list_is_one_statement() {
+    skip_unless_live!();
+    let (built, end) = P
+        .lease("a_node_the_cache_cannot_list_is_one_statement")
+        .await;
+    let db = built.db().to_string();
+    let t = no_tenant();
+    let q = "sum(rate(p_rx_total[2m15s]))";
+    let p = range(end - 15 * HOUR, end, 2 * MIN);
+    let warm = vector_or_matrix(&ask(&built.pushed_engine(None).await, &t, q, &p).await);
+    let cold = Arc::new(LabelCache::new(
+        ChClient::new(test_config(&db)).await.expect("connect"),
+        cache_config(&db),
+    ));
+    let mut failures = Vec::new();
+    for (what, cap, want) in [("a", None, 1usize), ("b", Some(8_192usize), 3)] {
+        let comment = comment_for(&db, &format!("t10{what}"));
+        let mut e = MetricsEngine::new(built.client().await, Arc::clone(&cold), engine_config(&db, true))
+            .with_rollup_levels(Arc::clone(&built.slot))
+            .with_query_log_comment(&comment);
+        if let Some(cap) = cap {
+            e = e.with_pushed_series_steps_cap(cap);
+        }
+        let a = ask(&e, &t, q, &p).await;
+        if vector_or_matrix(&a) != warm || warm.is_empty() {
+            failures.push(format!("({what}) differs from the warm pushed engine"));
+        }
+        let sent = logged(&built.admin, &comment).await;
+        if sent.len() != want {
+            failures.push(format!("({what}) {} statements: {:#?}", sent.len(), brief(&sent)));
+            continue;
+        }
+        if what == "b" {
+            // The fetch window: the range and the 2 m15 s range rounded to
+            // 3 m (60 s × 3), before the first step.
+            let l = level_rows_of(
+                &built.admin,
+                &db,
+                "metric_samples_60s",
+                "p_rx_total",
+                "",
+                (p.start_ms - 3 * MIN, p.end_ms),
+            )
+            .await;
+            let (_, _, f) =
+                gate_check(&built.admin, &sent[0].query, &format!("{db}.metric_samples_60s"), l).await;
+            failures.extend(f.into_iter().map(|f| format!("(b) {f}")));
+        }
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T10:\n{}", failures.join("\n"));
+}
+
+/// The fingerprint literal of issue #810's fixture `H`, series `n`.
+fn h_fp(n: u32) -> String {
+    format!("toUInt128('24000000000000000000000000000000810{n:03}')")
+}
+
+/// Corpus H (issue #810) ending at `end`, every 15 s over `(end − 4 h,
+/// end]`: metric `c` with a float counter `{s="f"}`, a native-histogram
+/// series `{s="h"}`, and `{s="m"}` with histogram samples over `(end − 4 h,
+/// end − 2 h]` and float samples after; metrics `d` and `e`, two float
+/// counters each, `{s="f"}` and `{s="h"}`.
+fn corpus_h_land(db: &str, end: i64) -> Vec<String> {
+    let lo = end - 4 * HOUR;
+    let n = 4 * HOUR / SCRAPE;
+    let mut land = Vec::new();
+    let float = |fp: &str, name: &str, rate: f64, from: i64| {
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, '{name}', {fp}, \
+                    toInt64({lo}) + toInt64(number) * {SCRAPE}, 1e6 + toFloat64(number) * {rate} \
+             FROM numbers({from}, {})",
+            n + 1 - from
+        )
+    };
+    let hist = |fp: &str, upto: i64| {
+        format!(
+            "INSERT INTO {db}.metric_hist_samples (org_id, fingerprint, unix_milli, schema, zero_threshold, zero_count, \
+                                                   count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
+                                                   neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values) \
+             SELECT '', {fp}, toInt64({lo}) + toInt64(number) * {SCRAPE}, 0, 0., 0, 4 + number, \
+                    5. + toFloat64(number), [0], [3], [1, 1, -1], [], [], [], [] \
+             FROM numbers(1, {upto})"
+        )
+    };
+    for (k, (name, s)) in [
+        ("c", "f"),
+        ("c", "h"),
+        ("c", "m"),
+        ("d", "f"),
+        ("d", "h"),
+        ("e", "f"),
+        ("e", "h"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fp = h_fp(k as u32 + 1);
+        land.push(format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, '{name}', {fp}, \
+                    toInt64({lo}) + toInt64(number) * {HOUR} + 1000, '{{\"s\":\"{s}\"}}', 0 FROM numbers(5)"
+        ));
+        let rate = 15.0 * (k as f64 + 1.0);
+        match (name, s) {
+            ("c", "h") => land.push(hist(&fp, n)),
+            ("c", "m") => {
+                land.push(hist(&fp, n / 2));
+                land.push(float(&fp, name, rate, n / 2 + 1));
+            }
+            _ => land.push(float(&fp, name, rate, 1)),
+        }
+    }
+    land
+}
+
+/// Corpus H built at the default levels, its first level to `end`.
+async fn corpus_h(db: &str, end: i64) -> Built {
+    let (bootstrap, admin, ctx) =
+        first_only(db, DEFAULTS, &corpus_h_land(db, end), end - 4 * HOUR, end).await;
+    warm(bootstrap, admin, ctx, &[]).await
+}
+
+/// T16's range over corpus H: 3 h at 15 s, off the minute.
+fn h_range(end: i64) -> MetricQueryParams {
+    range(end - 3 * HOUR - 30 * MIN + SCRAPE, end - 30 * MIN + SCRAPE, SCRAPE)
+}
+
+/// **T16 (issue #810, D9): a query over native histograms reads raw.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_over_native_histograms_reads_raw() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_query_over_native_histograms_reads_raw").await;
+    let db = built.db().to_string();
+    let p = h_range(end);
+    let t = no_tenant();
+    let off = built.engine(false, None).await;
+    let mut failures = Vec::new();
+    for (k, q) in [
+        "rate(c[1m])",
+        "c",
+        "last_over_time(c[1m])",
+        "absent_over_time(c{s=\"h\"}[1m])",
+        "absent(c)",
+        "sum by (s) (c)",
+        "rate(d[1m])",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let comment = comment_for(&db, &format!("t16_{k}"));
+        let on = built.engine(true, Some(&comment)).await;
+        let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+        let sent = logged(&built.admin, &comment).await;
+        if sent.len() != 1 {
+            failures.push(format!("{q}: {} statements: {:#?}", sent.len(), brief(&sent)));
+        }
+        if q.starts_with("rate(d") {
+            if !a.explain.rollup {
+                failures.push(format!("{q}: not marked rollup"));
+            }
+            if !a
+                .stages("rollup_piece")
+                .iter()
+                .any(|n| n.contains("metric_samples_60s"))
+            {
+                failures.push(format!("{q}: rollup_piece {:?}", a.stages("rollup_piece")));
+            }
+            continue;
+        }
+        if a.explain.rollup {
+            failures.push(format!("{q}: marked rollup"));
+        }
+        if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+            failures.push(format!("{q}: differs from routing off"));
+        }
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T16:\n{}", failures.join("\n"));
+}
+
+/// **T17 (issue #810, D9): the histogram count spans the query.**
+#[tokio::test(flavor = "multi_thread")]
+async fn the_histogram_count_spans_the_query() {
+    skip_unless_live!();
+    let (built, end) = H.lease("the_histogram_count_spans_the_query").await;
+    let db = built.db().to_string();
+    let p = h_range(end);
+    let t = no_tenant();
+    let q = "last_over_time(c[1m]) or last_over_time(d[1m])";
+    let comment = comment_for(&db, "t17");
+    let on = built.engine(true, Some(&comment)).await;
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    let sent = logged(&built.admin, &comment).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 2 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    }
+    let pieces = a.stages("rollup_piece");
+    if pieces.len() != 2 || !pieces.iter().all(|n| n.contains("read raw")) {
+        failures.push(format!("rollup_piece {pieces:?}"));
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+        failures.push("differs from routing off".to_string());
+    }
+    assert!(failures.is_empty(), "T17:\n{}", failures.join("\n"));
+}
+
+/// **T18 (issue #810, D9): a pushed node over histograms reads raw.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pushed_node_over_histograms_reads_raw() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_pushed_node_over_histograms_reads_raw").await;
+    let db = built.db().to_string();
+    let p = h_range(end);
+    let t = no_tenant();
+    let q = "sum by (s) (rate(c[1m]))";
+    let comment = comment_for(&db, "t18");
+    let on = built.pushed_engine(Some(&comment)).await;
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    let sent = logged(&built.admin, &comment).await;
+    let mut failures = Vec::new();
+    if sent.len() != 2 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    } else {
+        // The lattice's fetch window: 5 m (the counter's five buckets)
+        // before the first bucket end, to the last step.
+        let lo = ceil_to(p.start_ms, MIN) - 5 * MIN;
+        let k = level_rows_of(&built.admin, &db, "metric_samples_60s", "c", "", (lo, p.end_ms)).await;
+        let (_, _, f) =
+            gate_check(&built.admin, &sent[0].query, &format!("{db}.metric_samples_60s"), k).await;
+        failures.extend(f);
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+        failures.push("differs from routing off".to_string());
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T18:\n{}", failures.join("\n"));
+}
+
+/// **T21 (issue #810, D14): a raw tail answers its whole request.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_raw_tail_answers_its_whole_request() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_raw_tail_answers_its_whole_request").await;
+    let db = built.db().to_string();
+    let whole = h_range(end);
+    let tail = range(whole.end_ms - 10 * MIN, whole.end_ms, SCRAPE);
+    let t = no_tenant();
+    let q = "rate(c[1m])";
+    let comment = comment_for(&db, "t21");
+    let on = built.engine(true, Some(&comment)).await.with_request(whole);
+    let expr = parse(q).expect("parse");
+    let (result, _, facts) = on.query_with_facts(&t, &expr, &tail).await.expect("the tail");
+    let off = ask(&built.engine(false, None).await, &t, q, &whole).await;
+    let sent = logged(&built.admin, &comment).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 1 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    }
+    if !(facts.raw && facts.whole) {
+        failures.push(format!("raw {}, whole {}", facts.raw, facts.whole));
+    }
+    let a = Answer {
+        result,
+        explain: PlanExplain::new("metrics"),
+    };
+    if a.cells() != off.cells() || off.cells().is_empty() {
+        failures.push("differs from routing off over the whole range".to_string());
+    }
+    assert!(failures.is_empty(), "T21:\n{}", failures.join("\n"));
+}
+
+/// The four-hour range at 60 s of T25 and T27, on the minute.
+fn h_four_hours(end: i64) -> MetricQueryParams {
+    range(end - 4 * HOUR, end, MIN)
+}
+
+/// **T24 (issue #810): an unrouted join over histograms falls back.**
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrouted_join_over_histograms_falls_back() {
+    skip_unless_live!();
+    let (built, end) = H.lease("an_unrouted_join_over_histograms_falls_back").await;
+    let p = range(end - HOUR, end, SCRAPE);
+    let t = no_tenant();
+    let q = "sum(rate(c[5m]) + rate(d[5m]))";
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    built.finish().await;
+    assert!(
+        a.declines().contains(&"declined: HistogramSamples"),
+        "T24: declines {:?}",
+        a.declines()
+    );
+    assert!(!vector_or_matrix(&b).is_empty(), "T24: an answer");
+    assert_eq!(vector_or_matrix(&a), vector_or_matrix(&b), "T24");
+}
+
+/// **T25 (issue #810): a mixed join falls back on its raw side.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mixed_join_falls_back_on_its_raw_side() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_mixed_join_falls_back_on_its_raw_side").await;
+    let p = h_four_hours(end);
+    let t = no_tenant();
+    let q = "sum(rate(d[5m]) + irate(c[5m]))";
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(true, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    built.finish().await;
+    assert!(
+        a.declines().contains(&"declined: HistogramSamples"),
+        "T25: declines {:?}",
+        a.declines()
+    );
+    assert!(a.explain.rollup, "T25: d is read at its level");
+    assert!(!vector_or_matrix(&b).is_empty(), "T25: an answer");
+    assert_eq!(vector_or_matrix(&a), vector_or_matrix(&b), "T25");
+}
+
+/// **T26 (issue #810, D9): a level node falls back on another selector's
+/// histograms.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_level_node_falls_back_on_another_selectors_histograms() {
+    skip_unless_live!();
+    let (built, end) = H
+        .lease("a_level_node_falls_back_on_another_selectors_histograms")
+        .await;
+    let p = h_range(end);
+    let t = no_tenant();
+    let q = "sum(rate(d[1m])) + count(last_over_time(c[1m]))";
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    built.finish().await;
+    assert!(
+        a.declines().contains(&"declined: HistogramSamples"),
+        "T26: declines {:?}",
+        a.declines()
+    );
+    assert!(!a.explain.rollup, "T26: read raw");
+    assert!(!vector_or_matrix(&b).is_empty(), "T26: an answer");
+    assert_eq!(vector_or_matrix(&a), vector_or_matrix(&b), "T26");
+}
+
+/// **T27 (issue #810, D9): a raw-only node stays pushed in a raw query.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_raw_only_node_stays_pushed_in_a_raw_query() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_raw_only_node_stays_pushed_in_a_raw_query").await;
+    let p = h_four_hours(end);
+    let t = no_tenant();
+    let q = "last_over_time(c[5m]) or sum(irate(d[5m]) + irate(e[5m]))";
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    built.finish().await;
+    assert!(a.declines().is_empty(), "T27: declines {:?}", a.declines());
+    assert!(!a.pushed().is_empty(), "T27: the join is pushed");
+    assert!(!a.explain.rollup, "T27: read raw");
+    assert!(!vector_or_matrix(&b).is_empty(), "T27: an answer");
+    assert_eq!(vector_or_matrix(&a), vector_or_matrix(&b), "T27");
+}
+
+/// **T14 (issue #810, D3): nothing after the last step is read.**
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_after_the_last_step_is_read() {
+    skip_unless_live!();
+    let end = minute_end();
+    let built = one_counter(DB_T14.name(), end, end).await;
+    let db = built.db().to_string();
+    let e_last = end - 30 * MIN + SCRAPE;
+    let p = range(e_last - 3 * HOUR, e_last, SCRAPE);
+    let q = "rate(c[1m])";
+    let comment = comment_for(&db, "t14");
+    let on = built.engine(true, Some(&comment)).await;
+    let t = no_tenant();
+    let a = ask(&on, &t, q, &p).await;
+    let sent = logged(&built.admin, &comment).await;
+    exec(
+        &built.admin,
+        &format!(
+            "ALTER TABLE {db}.metric_samples_60s UPDATE inc = inc + 1000, last = last + 1000 \
+             WHERE kind = 0 AND t_end = {} SETTINGS mutations_sync = 2",
+            e_last + 45_000
+        ),
+    )
+    .await;
+    let b = ask(&built.engine(true, None).await, &t, q, &p).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 1 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    } else if !sent[0].query.contains(&format!("t_end <= {e_last}")) {
+        failures.push(format!("the level arm does not end at {e_last}:\n{}", sent[0].query));
+    }
+    if a.cells() != b.cells() {
+        failures.push("A and B differ".to_string());
+    }
+    if !a.points().keys().any(|(_, at)| *at == e_last) {
+        failures.push(format!("no point at {e_last}"));
+    }
+    assert!(failures.is_empty(), "T14:\n{}", failures.join("\n"));
+}
+
+/// **T15 (issue #810, D10): a listed and an unlisted side are gated over
+/// the cap.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listed_and_an_unlisted_side_are_gated_over_the_cap() {
+    skip_unless_live!();
+    let (built, end) = P
+        .lease("a_listed_and_an_unlisted_side_are_gated_over_the_cap")
+        .await;
+    let db = built.db().to_string();
+    let mut cfg = cache_config(&db);
+    cfg.window_ms = 16 * DAY;
+    cfg.cache_max_series = 20;
+    let cache = Arc::new(LabelCache::new(
+        ChClient::new(test_config(&db)).await.expect("connect"),
+        cfg,
+    ));
+    cache.refresh().await.expect("refresh");
+    let comment = comment_for(&db, "t15");
+    let on = MetricsEngine::new(built.client().await, cache, engine_config(&db, true))
+        .with_rollup_levels(Arc::clone(&built.slot))
+        .with_pushed_series_steps_cap(8_192)
+        .with_query_log_comment(&comment);
+    let q = "sum by (instance) (rate(p_rx_total[2m15s]) + rate(p_tx_total{instance=~\"i0|i1\"}[2m15s]))";
+    let p = range(end - 15 * HOUR, end, 2 * MIN);
+    let t = no_tenant();
+    let off = built.engine(true, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    let sent = logged(&built.admin, &comment).await;
+    let mut failures = Vec::new();
+    if sent.len() != 3 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    } else {
+        let k = level_rows_of(
+            &built.admin,
+            &db,
+            "metric_samples_60s",
+            "p_tx_total",
+            " AND JSONExtractString(labels, 'instance') IN ('i0', 'i1')",
+            (p.start_ms - 3 * MIN, p.end_ms),
+        )
+        .await;
+        let (_, _, f) =
+            gate_check(&built.admin, &sent[0].query, &format!("{db}.metric_samples_60s"), k).await;
+        failures.extend(f);
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+        failures.push("differs from the in-process engine".to_string());
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T15:\n{}", failures.join("\n"));
 }

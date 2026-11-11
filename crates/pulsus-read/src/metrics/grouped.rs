@@ -2408,6 +2408,29 @@ mod tests {
         assert_eq!(push.grid, s.grid);
     }
 
+    /// **T7 (issue #810, D8): the split starts above the cap.** A 15 s grid
+    /// of 1,024 points: 1,024 series is 1,048,576 series-steps, one
+    /// statement; 1,025 is 1,049,600, two.
+    #[test]
+    fn the_split_starts_above_the_cap() {
+        let grid = Grid {
+            start_ms: 1_000,
+            step_ms: 15_000,
+            points: 1_024,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
+        };
+        assert_eq!(
+            time_chunks(grid, 1_024, PUSHED_SERIES_STEPS_PER_STATEMENT).len(),
+            1,
+            "at the cap"
+        );
+        assert_eq!(
+            time_chunks(grid, 1_025, PUSHED_SERIES_STEPS_PER_STATEMENT).len(),
+            2,
+            "over the cap"
+        );
+    }
+
     /// Section 3.4: over the cap, the grid is split by time, never by
     /// series. 128 series at 5,761 steps under a cap of 262,144 is 2,048
     /// steps a chunk, three chunks.

@@ -705,8 +705,25 @@ pub struct LevelRead<'a> {
 /// fingerprints and members as literals.
 #[derive(Debug, Clone, Copy)]
 pub enum SideSeries<'a> {
-    Ids(&'a str),
-    Known { list: &'a str, members: &'a str },
+    /// Issue #810 (D10): `gated` when the statement counts its own series
+    /// and every read of the side is gated on the cap.
+    Ids { ids: &'a str, gated: bool },
+    Known {
+        list: &'a str,
+        members: &'a str,
+        gated: bool,
+    },
+}
+
+/// Issue #810 (D9, D10): what a pushed statement counts beside its groups:
+/// its series, when a side is not listed, gated on `cap`, and `hist_n`, the
+/// query's routed selectors' histogram samples (`{HIST_WHERE}`), when the
+/// query has a routed selector.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Counts<'a> {
+    pub series_n: Option<&'a str>,
+    pub cap: usize,
+    pub hist_where: Option<&'a str>,
 }
 
 /// Issue #18 part 2c: `MEMBERS_KNOWN` — a side's members from the label
@@ -743,7 +760,7 @@ impl SideSeries<'_> {
     /// else `fingerprint [GLOBAL ]IN (ids)`.
     pub fn filter(&self, global: bool) -> String {
         match self {
-            SideSeries::Ids(ids) => {
+            SideSeries::Ids { ids, .. } => {
                 let global = if global { "GLOBAL " } else { "" };
                 format!("fingerprint {global}IN (\n{ids}\n)")
             }
@@ -1008,7 +1025,7 @@ WHERE arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, {steps})){keep}"
 /// the order the evaluator folds in, and its stored label pairs.
 pub fn members(side: &SideSql<'_>) -> String {
     let ids = match side.series {
-        SideSeries::Ids(ids) => ids,
+        SideSeries::Ids { ids, .. } => ids,
         // Issue #18 part 2c: the label cache's own members.
         SideSeries::Known { members, .. } => return members.to_string(),
     };
@@ -1103,6 +1120,7 @@ pub fn level_aggregate_fetch(
     grouping: Option<&Grouping>,
     grid: Grid,
     op: RangeAggOp,
+    _counts: &Counts<'_>,
 ) -> String {
     let inner = format!(
         "    SELECT {} AS gid, m.rank AS rank, s.gi AS gi, s.v AS v
@@ -1148,6 +1166,7 @@ pub fn match_aggregate_fetch(
     bin: BinOp,
     bool_modifier: bool,
     spec: &super::grouped::MatchSpec,
+    _counts: &Counts<'_>,
 ) -> String {
     use pulsus_promql::Group;
     let list = |labels: &[String]| {
@@ -1334,6 +1353,7 @@ pub fn join_aggregate_fetch(
     op: RangeAggOp,
     bin: BinOp,
     bool_modifier: bool,
+    _counts: &Counts<'_>,
 ) -> String {
     let cmp = match bin {
         BinOp::Eq => Some("="),
@@ -2040,7 +2060,7 @@ mod tests {
             overlaid: false,
         };
         assert_eq!(
-            counter_gather(&tenant, "metric_samples", &SideSeries::Ids(&ids), &a),
+            counter_gather(&tenant, "metric_samples", &SideSeries::Ids { ids: &ids, gated: false }, &a),
             join_section("counter_gather 720s over 60s and raw"),
             "(a)"
         );
@@ -2061,7 +2081,7 @@ mod tests {
             tenant: &tenant,
             samples_table: "metric_samples",
             labels_table: "metric_labels",
-            series: SideSeries::Ids(&ids),
+            series: SideSeries::Ids { ids: &ids, gated: false },
             metric_name: "p_rx_total",
             func: PushedRangeFn::Rate,
             range_ms: 300_000,
@@ -2078,7 +2098,7 @@ mod tests {
             counter_gather(
                 &tenant,
                 "metric_samples",
-                &SideSeries::Ids(&ids),
+                &SideSeries::Ids { ids: &ids, gated: false },
                 &t11_level()
             ),
             join_section("counter_gather 60s"),
@@ -2137,6 +2157,7 @@ mod tests {
             series: SideSeries::Known {
                 list: "'101', '205'",
                 members: &members,
+                gated: false,
             },
             metric_name: "p_rx_total",
             func: PushedRangeFn::Rate,
@@ -2150,6 +2171,79 @@ mod tests {
             join_section("series_steps 720s known"),
             "steps"
         );
+    }
+
+    /// **T13 (issue #810, D10): every read of a counted statement is gated.**
+    /// Shape C with an `Ids` side and a `Known` side of 3 literals, both
+    /// gated, its series counted: every series read of either side, the
+    /// level rows, the histogram count and the members alike, carries the
+    /// gate, so the gates equal the reads (`hist_n`'s own condition, which
+    /// is never gated, aside).
+    #[test]
+    fn every_read_of_a_counted_statement_is_gated() {
+        let tenant = no_tenant();
+        let ids = "SELECT fingerprint FROM metric_series";
+        let labels: Vec<pulsus_model::LabelSet> = (0..3)
+            .map(|i| {
+                pulsus_model::LabelSet::from_verbatim([("instance".to_string(), format!("i{i}"))])
+            })
+            .collect();
+        let fps: Vec<FpLiteral> = (1..=3u128)
+            .map(|i| Fingerprint::from_raw(i).sql_literal())
+            .collect();
+        let pairs: Vec<(FpLiteral, &pulsus_model::LabelSet)> =
+            fps.iter().cloned().zip(labels.iter()).collect();
+        let members = members_known(&pairs);
+        let list = sample_sql::render_fingerprint_list(&fps);
+        let side = |series: SideSeries<'static>, name: &'static str| SideSql {
+            tenant: Box::leak(Box::new(no_tenant())),
+            samples_table: "metric_samples",
+            labels_table: "metric_labels",
+            series,
+            metric_name: name,
+            func: PushedRangeFn::Rate,
+            range_ms: 300_000,
+            scale: None,
+            window: T11_WINDOW,
+            level: Some(t11_level()),
+        };
+        let lhs = side(SideSeries::Ids { ids, gated: true }, "p_rx_total");
+        let rhs = side(
+            SideSeries::Known {
+                list: Box::leak(list.into_boxed_str()),
+                members: Box::leak(members.into_boxed_str()),
+                gated: true,
+            },
+            "p_tx_total",
+        );
+        let hist_where = format!(
+            "fingerprint IN ({ids}) AND unix_milli > {} AND unix_milli <= {}",
+            T11_WINDOW.0, T11_WINDOW.1
+        );
+        let series_n = format!("(SELECT uniqExact(fingerprint) FROM ({ids})) + 3");
+        let sql = join_aggregate_fetch(
+            &lhs,
+            &rhs,
+            "metric_hist_samples",
+            None,
+            t11_grid(),
+            RangeAggOp::Sum,
+            BinOp::Add,
+            false,
+            &Counts {
+                series_n: Some(&series_n),
+                cap: 8_192,
+                hist_where: Some(&hist_where),
+            },
+        );
+        let _ = &tenant;
+        let n = |text: &str, p: &str| text.matches(p).count();
+        let gates = n(&sql, " AND series_n * grid_n <= 8192") + n(&sql, "WHERE series_n * grid_n <= 8192");
+        let reads = n(&sql, "fingerprint IN (") + n(&sql, "fingerprint GLOBAL IN (")
+            + n(&sql, "arrayJoin(CAST([")
+            - n(&hist_where, "fingerprint IN (");
+        assert!(reads > 0, "{sql}");
+        assert_eq!(gates, reads, "every read gated:\n{sql}");
     }
 
     /// T11: shape C under `+`, both sides at the level, and under `> bool`
@@ -2169,7 +2263,7 @@ mod tests {
                 tenant,
                 samples_table: "metric_samples",
                 labels_table: "metric_labels",
-                series: SideSeries::Ids(ids),
+                series: SideSeries::Ids { ids, gated: false },
                 metric_name: name,
                 func,
                 range_ms: 300_000,
@@ -2205,6 +2299,7 @@ mod tests {
                 RangeAggOp::Sum,
                 BinOp::Add,
                 false,
+                &Counts::default(),
             ),
             join_section("sum by (instance) (rate + rate)")
         );
@@ -2218,6 +2313,7 @@ mod tests {
                 RangeAggOp::Count,
                 BinOp::Gt,
                 true,
+                &Counts::default(),
             ),
             join_section("count without (device) (rate > bool irate)")
         );
@@ -2232,6 +2328,7 @@ mod tests {
                 RangeAggOp::Count,
                 BinOp::Gt,
                 false,
+                &Counts::default(),
             ),
             join_section("count without (device) (rate > irate)")
         );
@@ -2276,11 +2373,12 @@ mod tests {
                 SideSeries::Known {
                     list: "'101', '205'",
                     members: &members,
+                    gated: false,
                 },
             )
         };
         let (rx, tx) = (known("p_rx_total"), known("p_tx_total"));
-        let tx_ids = side("p_tx_total", SideSeries::Ids(&ids));
+        let tx_ids = side("p_tx_total", SideSeries::Ids { ids: &ids, gated: false });
         let strs = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let matches = [
             (
@@ -2317,6 +2415,7 @@ mod tests {
                     *bin,
                     false,
                     spec,
+                    &Counts::default(),
                 );
                 assert_eq!(one_table_per_access(&sql), want, "{what}, {sides}:\n{sql}");
             }
@@ -2338,7 +2437,7 @@ mod tests {
                 tenant: Box::leak(Box::new(no_tenant())),
                 samples_table: "metric_samples",
                 labels_table: "metric_labels",
-                series: SideSeries::Ids(ids),
+                series: SideSeries::Ids { ids, gated: false },
                 metric_name: name,
                 func: PushedRangeFn::Rate,
                 range_ms: 300_000,
@@ -2453,6 +2552,7 @@ mod tests {
                     *bin,
                     *bool_modifier,
                     spec,
+                    &Counts::default(),
                 ),
                 want,
                 "{key}"

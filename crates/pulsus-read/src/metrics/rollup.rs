@@ -596,6 +596,42 @@ pub fn level_fetch(
     )
 }
 
+/// Issue #810 (D11): the tables one routed statement reads.
+#[derive(Debug, Clone, Copy)]
+pub struct RoutedTables<'a> {
+    /// The route's level table.
+    pub level: &'a str,
+    pub samples: &'a str,
+    pub hist: &'a str,
+    pub labels: &'a str,
+}
+
+/// Issue #810 (D11): the windows one routed statement reads.
+#[derive(Debug, Clone, Copy)]
+pub struct RoutedWindow<'a> {
+    /// `(lo, hi]`, the selector's fetch window, `hi` at `t_last` less the
+    /// offset (D3).
+    pub level: (i64, i64),
+    /// `(rlo, rhi]`, the selector's window in the routing-off plan.
+    pub raw: (i64, i64),
+    /// `{HIST_WHERE}`, the query's routed selectors' histogram condition.
+    pub hist_where: &'a str,
+}
+
+/// Issue #810 (D11): one routed selector's one statement, and whether it
+/// names its series by `ids` (with the labels arm) rather than `known`.
+pub fn routed_fetch(
+    _tenant: &Tenant,
+    _tables: &RoutedTables<'_>,
+    _name: &str,
+    _window: &RoutedWindow<'_>,
+    _known: Option<&str>,
+    _ids: &str,
+    _text_cap: u64,
+) -> (String, bool) {
+    (String::new(), false)
+}
+
 /// One row of a level fetch: a data row (`kind = 0`) or a run row
 /// (`kind = 1`).
 #[derive(Debug, Clone, Copy, PartialEq, Row, Serialize, Deserialize)]
@@ -1418,6 +1454,52 @@ mod tests {
         assert!(two_days("hour(x)").is_some(), "(n)");
         assert_eq!(two_days("predict_linear(x[5m], 60)"), None, "(o)");
         assert_eq!(two_days("max_over_time(rate(x[5m])[1h:5m])"), None, "(p)");
+    }
+
+    /// **T4 (issue #810): the lattice has no tail.** The default levels
+    /// (60 s from 3 h), `10:00:00` to `13:00:30` at 15 s: every step is read
+    /// at its bucket end, the last at `⌈13:00:30 / 1 m⌉ × 1 m = 13:01:00`.
+    #[test]
+    fn lattice_has_no_tail() {
+        let l = lattice_of("rate(x[5m])", BASE + 10 * HOUR, 3 * HOUR + 30_000, 15_000)
+            .expect("a lattice");
+        assert_eq!(l.width, 60_000, "the width");
+        assert_eq!(l.until_ms, Some(BASE + 13 * HOUR + MIN), "until");
+        assert_eq!(l.tail, None, "no tail");
+    }
+
+    /// **T12 (issue #810): a long list reads by its IDs.** The cache's list
+    /// of 10 series renders under the statement cap; at a cap of 200 bytes
+    /// the statement names its series by the ID statement and reads their
+    /// labels in its own arm.
+    #[test]
+    fn a_long_list_reads_by_its_ids() {
+        let tenant = Tenant::from_header(None, false).expect("the empty tenant");
+        let list = (1..=10)
+            .map(|i| format!("toUInt128('{i}')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tables = RoutedTables {
+            level: "metric_samples_60s",
+            samples: "metric_samples",
+            hist: "metric_hist_samples",
+            labels: "metric_labels",
+        };
+        let window = RoutedWindow {
+            level: (1_000, 2_000),
+            raw: (900, 2_000),
+            hist_where: "fingerprint IN (SELECT fingerprint FROM metric_series) AND unix_milli > 900 AND unix_milli <= 2000",
+        };
+        let ids = "SELECT fingerprint FROM metric_series";
+        let (small, by_ids) = routed_fetch(&tenant, &tables, "m", &window, Some(&list), ids, 200);
+        assert!(by_ids, "at 200 bytes: by the IDs");
+        assert!(small.contains("fingerprint GLOBAL IN ("), "{small}");
+        assert!(small.contains("toUInt8(2) AS arm"), "{small}");
+        let cap = crate::querytext::MAX_QUERY_TEXT_BYTES;
+        let (big, by_ids) = routed_fetch(&tenant, &tables, "m", &window, Some(&list), ids, cap);
+        assert!(!by_ids, "at the cap: by the list");
+        assert!(big.contains(&list), "{big}");
+        assert!(!big.contains("toUInt8(2)"), "{big}");
     }
 
     fn all() -> Levels {

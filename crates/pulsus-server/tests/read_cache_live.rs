@@ -1389,3 +1389,267 @@ fn points_of(body: &str) -> Option<usize> {
         .first()
         .map(|s| s["values"].as_array().map_or(0, Vec::len))
 }
+
+// -- issue #810 -------------------------------------------------------------
+
+/// The statements one request sent, by its `X-Pulsus-Query-Id`.
+async fn statements_of(db: &str, id: &str) -> Vec<String> {
+    let c = client(db).await;
+    exec(&c, "SYSTEM FLUSH LOGS").await;
+    c.query_strings(
+        &format!(
+            "SELECT query AS s FROM system.query_log \
+             WHERE type = 'QueryFinish' AND is_initial_query AND log_comment = '{id}' \
+             ORDER BY query_start_time_microseconds"
+        ),
+        &QuerySettings::new().set("log_comment", "t810-log"),
+    )
+    .await
+    .expect("query_log")
+}
+
+fn query_id(r: &Resp) -> String {
+    r.header("x-pulsus-query-id")
+        .expect("an X-Pulsus-Query-Id")
+        .to_string()
+}
+
+/// One native-histogram counter through `port`, a sample every 5 s over
+/// `(t0, now0]`.
+fn push_histogram(port: u16, tenant: &str, labels: Vec<(String, String)>, times: &Times) {
+    use prost::Message;
+    use pulsus_write::protocols::remote_write::{
+        BucketSpan, Histogram, HistogramCount, Label, TimeSeries, WriteRequest,
+    };
+    let samples = (times.now0 - times.t0) / 5_000;
+    let hs: Vec<Histogram> = (1..=samples)
+        .map(|k| {
+            let n = k as u64;
+            Histogram {
+                count: Some(HistogramCount::Int(3 * n)),
+                sum: 1.5 * n as f64,
+                schema: 0,
+                zero_threshold: 0.001,
+                zero_count: Some(HistogramCount::Int(0)),
+                positive_spans: vec![BucketSpan {
+                    offset: 0,
+                    length: 3,
+                }],
+                positive_deltas: vec![n as i64, 0, 0],
+                timestamp: times.t0 + k * 5_000,
+                ..Default::default()
+            }
+        })
+        .collect();
+    for chunk in hs.chunks(2_000) {
+        let req = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: labels
+                    .iter()
+                    .map(|(n, v)| Label {
+                        name: n.clone(),
+                        value: v.clone(),
+                    })
+                    .collect(),
+                histograms: chunk.to_vec(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let body = snap::raw::Encoder::new()
+            .compress_vec(&req.encode_to_vec())
+            .expect("snappy");
+        push(port, tenant, &body);
+    }
+}
+
+/// **T20 (issue #810, D14): a routed repeat with a new info is one
+/// statement.**
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_routed_repeat_with_a_new_info_is_one_statement() {
+    skip_unless_live!();
+    let a_port: u16 = 32_810;
+    let b_port: u16 = 32_811;
+    let r = rig(
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_t810_20_it")).await,
+        a_port,
+        b_port,
+        &[],
+    )
+    .await;
+    let samples = (r.times.now0 - r.times.t0) / 5_000;
+    for (j, le) in ["0.5", "1", "+Inf"].into_iter().enumerate() {
+        let points: Vec<(i64, f64)> = (0..=samples)
+            .map(|k| (r.times.t0 + k * 5_000, (j as f64 + 1.0) * k as f64))
+            .collect();
+        push_series(r.b.port, "a", labels("h_bucket", &[("le", le.to_string())]), points);
+    }
+    let t1 = (r.times.now0 - 30 * MINUTE).div_euclid(MINUTE) * MINUTE;
+    write_level(&r.db, r.times.t0.div_euclid(MINUTE) * MINUTE, t1).await;
+    Server::settle_poll();
+    let q = Range::new(
+        "histogram_quantile(0.9, sum by (le) (rate(h_bucket[5m])))",
+        t1 - 4 * HOUR,
+        t1,
+        STEP,
+    );
+    let first = same(&r.a, &r.b, q, "T20 first");
+    assert_eq!(first.cache(), "miss", "T20: the first is kept");
+    assert!(first.through().is_some(), "T20: the first has a Through");
+    assert!(!first.body.contains("\"infos\""), "T20: the first has no info");
+    // `le="0.5"` jumps after `t1`, above `le="1"`, and the level is
+    // written over the jump.
+    let jump: Vec<(i64, f64)> = (0..12)
+        .map(|k| (t1 + 2_500 + k * 5_000, 1e9 + k as f64))
+        .collect();
+    push_series(r.b.port, "a", labels("h_bucket", &[("le", "0.5".to_string())]), jump);
+    write_level(&r.db, t1, t1 + MINUTE).await;
+    Server::settle_poll();
+    let second = same(&r.a, &r.b, q.shifted(MINUTE), "T20 repeat");
+    assert_eq!(second.cache(), "hit", "T20: the repeat");
+    assert!(second.body.contains("\"infos\""), "T20: the info: {}", cut(&second.body));
+    let sent = statements_of(&r.db, &query_id(&second)).await;
+    assert_eq!(sent.len(), 1, "T20: the repeat's statements {sent:#?}");
+}
+
+/// **T22 (issue #810, D14): a routed hit past the sample cap is refused in
+/// one statement.**
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_routed_hit_past_the_sample_cap_is_refused_in_one_statement() {
+    skip_unless_live!();
+    let a_port: u16 = 32_812;
+    let b_port: u16 = 32_813;
+    let db = live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_t810_22_it")).await;
+    stop_levels(&db).await;
+    let times = Times::new();
+    {
+        let loader_port: u16 = 32_814;
+        let loader = Server::spawn(loader_port, &db, "0", &[]);
+        load_fixture(loader.port, &times, 0.0);
+    }
+    let end = now_ms().div_euclid(STEP) * STEP;
+    let l1 = Range::new("rate(rc_total[5m])", end - 4 * HOUR, end, STEP);
+    write_level(&db, times.t0.div_euclid(MINUTE) * MINUTE, end.div_euclid(MINUTE) * MINUTE).await;
+    // The level rows L1 reads: its lattice's fetch window, 5 m before the
+    // first bucket end, to its last step.
+    let lo = (l1.start + MINUTE - 1).div_euclid(MINUTE) * MINUTE - 5 * MINUTE;
+    let charge = {
+        #[derive(pulsus_clickhouse::Row, serde::Deserialize, serde::Serialize)]
+        struct N {
+            n: u64,
+        }
+        let c = client(&db).await;
+        let sql = format!(
+            "SELECT count() AS n FROM {}.metric_samples_60s WHERE kind = 0 AND org_id = 'a' \
+             AND t_end > {lo} AND t_end <= {} AND fingerprint IN \
+             (SELECT fingerprint FROM {}.metric_labels WHERE org_id = 'a' AND metric_name = 'rc_total')",
+            db.name(),
+            l1.end,
+            db.name()
+        );
+        use futures::StreamExt;
+        let mut s = c
+            .query_stream::<N>(&sql, &QuerySettings::new())
+            .await
+            .expect("count");
+        s.next().await.expect("a row").expect("a count").n
+    };
+    let cap = (charge + 300).to_string();
+    let env = [("PULSUS_PROMQL_MAX_SAMPLES", cap.as_str())];
+    let b = Server::spawn(b_port, &db, "0", &env);
+    let a = Server::spawn(a_port, &db, "64MiB", &env);
+    Server::settle_poll();
+    assert_eq!(same(&a, &b, l1, "L1").cache(), "miss", "T22: L1");
+    assert_eq!(same(&a, &b, l1.shifted(MINUTE), "L2").cache(), "hit", "T22: L2");
+    // 40 more series, 200 samples each, ending now, and their level rows.
+    let now = now_ms().div_euclid(5_000) * 5_000;
+    for i in 20..60 {
+        push_series(
+            a.port,
+            "a",
+            labels("rc_total", &[("i", i.to_string())]),
+            (0..200)
+                .map(|k| (now - (199 - k) * 5_000, k as f64))
+                .collect(),
+        );
+    }
+    write_level(
+        &db,
+        end.div_euclid(MINUTE) * MINUTE,
+        (now + MINUTE).div_euclid(MINUTE) * MINUTE,
+    )
+    .await;
+    // Rows of the new series before `end` too.
+    {
+        let c = client(&db).await;
+        exec(
+            &c,
+            &format!(
+                "INSERT INTO {d}.metric_samples_60s (kind, org_id, fingerprint, t_end, t_last, last, \
+                 min, max, sum, count, inc, flags, built_at) \
+                 SELECT 0, org_id, fingerprint, (intDiv(unix_milli - 1, 60000) + 1) * 60000 AS te, \
+                 max(unix_milli), argMax(value, unix_milli), min(value), max(value), sum(value), \
+                 toUInt32(count()), max(value) - min(value), 0, 0 \
+                 FROM {d}.metric_samples WHERE unix_milli <= {e} AND fingerprint IN \
+                 (SELECT fingerprint FROM {d}.metric_labels WHERE org_id = 'a' AND metric_name = 'rc_total' \
+                  AND toUInt32OrZero(JSONExtractString(labels, 'i')) >= 20) \
+                 GROUP BY org_id, fingerprint, te",
+                d = db.name(),
+                e = end.div_euclid(MINUTE) * MINUTE
+            ),
+        )
+        .await;
+    }
+    Server::settle_poll();
+    let refresh = l1.shifted(2 * MINUTE);
+    let ra = refresh.send(a.port);
+    let rb = refresh.send(b.port);
+    assert_eq!(rb.status, 422, "T22: B refuses: {}", rb.body);
+    assert_eq!(ra.status, 422, "T22: A refuses: {}", ra.body);
+    assert_eq!(ra.body, rb.body, "T22: the same refusal");
+    let sent = statements_of(&db, &query_id(&ra)).await;
+    assert_eq!(sent.len(), 1, "T22: A's statements {sent:#?}");
+    drop(a);
+    drop(b);
+}
+
+/// **T23 (issue #810, D14): a query with an unrouted read is never kept.**
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_query_with_an_unrouted_read_is_never_kept() {
+    skip_unless_live!();
+    let a_port: u16 = 32_815;
+    let b_port: u16 = 32_816;
+    let r = rig(
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_t810_23_it")).await,
+        a_port,
+        b_port,
+        &[],
+    )
+    .await;
+    let samples = (r.times.now0 - r.times.t0) / 5_000;
+    let counter = |rate: f64| -> Vec<(i64, f64)> {
+        (1..=samples)
+            .map(|k| (r.times.t0 + k * 5_000, rate * k as f64))
+            .collect()
+    };
+    push_series(r.b.port, "a", labels("a", &[("x", "f".to_string())]), counter(1.0));
+    push_histogram(r.b.port, "a", labels("a", &[("x", "h".to_string())]), &r.times);
+    push_series(r.b.port, "a", labels("b", &[("x", "f".to_string())]), counter(2.0));
+    push_series(r.b.port, "a", labels("b", &[("x", "h".to_string())]), counter(3.0));
+    let end = (r.times.now0 - 30 * MINUTE).div_euclid(MINUTE) * MINUTE;
+    write_level(&r.db, r.times.t0.div_euclid(MINUTE) * MINUTE, end).await;
+    Server::settle_poll();
+    let q = Range::new("rate(a[5m]) + irate(b[5m])", end - 4 * HOUR, end, MINUTE);
+    let first = same(&r.a, &r.b, q, "T23 first");
+    assert_eq!(first.cache(), "bypass", "T23: the first is not kept");
+    let ra = q.shifted(MINUTE).send(r.a.port);
+    let rb = q.shifted(MINUTE).send(r.b.port);
+    assert_eq!((ra.status, rb.status), (200, 200), "T23: {} / {}", ra.body, rb.body);
+    assert_eq!(ra.cache(), "bypass", "T23: the second");
+    assert!(ra.body == rb.body, "T23: A and B differ");
+    let (sa, sb) = (
+        statements_of(&r.db, &query_id(&ra)).await,
+        statements_of(&r.db, &query_id(&rb)).await,
+    );
+    assert_eq!(sa, sb, "T23: the second's statements on A and B");
+}

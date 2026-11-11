@@ -590,6 +590,26 @@ pub struct QueryFacts {
     /// The sample rows the evaluation materialised (`SampleBudget::used`).
     pub charged_samples: u64,
     pub plan: PlanFacts,
+    /// Issue #810: whether every read was routed to a level, some were, or
+    /// none.
+    pub reads: ReadMix,
+    /// Issue #810 (D9): the query was read and evaluated raw because a
+    /// routed selector meets a native-histogram sample.
+    pub raw: bool,
+    /// Issue #810 (D14): the result answers the whole request set by
+    /// [`MetricsEngine::with_request`], not only the grid asked.
+    pub whole: bool,
+}
+
+/// Issue #810 (D14): how a request's reads were routed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadMix {
+    /// Every read is routed to a rollup level.
+    AllRouted,
+    /// A routed read and an unrouted one.
+    Mixed,
+    /// No read is routed.
+    Unrouted,
 }
 
 /// TEST SEAM (issue #18 part B): a level fetch's answer by its statement
@@ -630,6 +650,12 @@ impl MetricsEngine {
     #[cfg(test)]
     pub(crate) fn with_injected_failure(mut self, f: pulsus_clickhouse::ServerFailure) -> Self {
         self.injected_failure = Some(f);
+        self
+    }
+
+    /// Issue #810 (D14): the whole request this engine's evaluations belong
+    /// to; a read cache tail is routed, and read raw, as its request is.
+    pub fn with_request(self, _request: MetricQueryParams) -> Self {
         self
     }
 
@@ -680,6 +706,9 @@ impl MetricsEngine {
                 oldest_input_ms: i64::MAX,
                 reach_ms: 0,
             },
+            reads: ReadMix::Unrouted,
+            raw: false,
+            whole: false,
         };
         let (result, annotations) = self
             .query_inner_facts(tenant, expr, p, None, Some(&mut facts))
@@ -855,7 +884,7 @@ impl MetricsEngine {
         });
         let data = match lattice {
             None => {
-                let routing = request_grid_routing(p, levels, self.routing_span_ms);
+                let routing = request_grid_routing(&plan, p, levels, self.routing_span_ms);
                 round_on_request_grid(&mut plan, routing.as_ref());
                 self.read_selectors(tenant, &plan, p, routing, true, &budget, explain)
                     .await?
@@ -942,6 +971,9 @@ impl MetricsEngine {
             *f = QueryFacts {
                 charged_samples: budget.used(),
                 plan: pf,
+                reads: ReadMix::Unrouted,
+                raw: false,
+                whole: false,
             };
         }
         Ok((value_to_query_result(value), annotations))
@@ -2927,6 +2959,7 @@ impl MetricsEngine {
                 r.grouping.as_ref(),
                 grid,
                 r.op,
+                &super::grouped_sql::Counts::default(),
             ),
             NodeShape::Join(j) => match &j.matching {
                 None => super::grouped_sql::join_aggregate_fetch(
@@ -2938,6 +2971,7 @@ impl MetricsEngine {
                     j.op,
                     j.bin,
                     j.bool_modifier,
+                    &super::grouped_sql::Counts::default(),
                 ),
                 // Part 5: S3c, its sides in (many, one) order.
                 Some(spec) => {
@@ -2956,6 +2990,7 @@ impl MetricsEngine {
                         j.bin,
                         j.bool_modifier,
                         spec,
+                        &super::grouped_sql::Counts::default(),
                     )
                 }
             },
@@ -4539,6 +4574,7 @@ fn instant_push_declined(explain: Option<&mut PlanExplain>, reason: super::group
 /// the widest level at most that whose buckets end at its window edges
 /// (`rollup::route`). An instant query routes at the smallest level.
 fn request_grid_routing(
+    _plan: &pulsus_promql::QueryPlan,
     p: &MetricQueryParams,
     levels: Option<std::sync::Arc<super::rollup::Levels>>,
     routing_span_ms: Option<i64>,
@@ -4708,8 +4744,15 @@ impl PushSide {
     /// How the side's statements name its series.
     fn sql_series(&self) -> super::grouped_sql::SideSeries<'_> {
         match &self.known {
-            Some((list, members)) => super::grouped_sql::SideSeries::Known { list, members },
-            None => super::grouped_sql::SideSeries::Ids(&self.ids_sql),
+            Some((list, members)) => super::grouped_sql::SideSeries::Known {
+                list,
+                members,
+                gated: false,
+            },
+            None => super::grouped_sql::SideSeries::Ids {
+                ids: &self.ids_sql,
+                gated: false,
+            },
         }
     }
 }
@@ -8207,5 +8250,56 @@ mod routed_series_tests {
             )),
             "the control: the label cache's selector is routed"
         );
+    }
+}
+
+/// Issue #810, D5: an instant query reads a level only when every
+/// selector's range is at or past that level's switch point.
+#[cfg(test)]
+mod instant_routing_tests {
+    use super::*;
+    use crate::metrics::rollup::{Level, Levels};
+
+    /// The default levels, each the resolution from its own switch point.
+    fn defaults() -> std::sync::Arc<Levels> {
+        std::sync::Arc::new(Levels {
+            levels: pulsus_schema::DEFAULT_ROLLUP_LEVELS
+                .iter()
+                .zip(pulsus_schema::DEFAULT_ROLLUP_RANGES)
+                .map(|(&s, &from)| Level {
+                    res_ms: i64::from(s) * 1000,
+                    table: format!("metric_samples_{s}s"),
+                    from_ms: u64::from(from) * 1000,
+                })
+                .collect(),
+            shards: 1,
+            counter_buckets: 5,
+        })
+    }
+
+    /// **T5 (issue #810): an instant query routes only for a long range.**
+    /// `rate(x[5m])` is under the first switch point (3 h); `increase(x[30d])`
+    /// is past 7 days (2 h) and under 90 days (1 d); `increase(x[30d]) / x`
+    /// has a selector with no range, which counts 0.
+    #[test]
+    fn an_instant_query_routes_only_for_a_long_range() {
+        // A UTC midnight, on every level's grid.
+        let t = 1_788_825_600_000;
+        let p = MetricQueryParams {
+            start_ms: t,
+            end_ms: t,
+            step_ms: 0,
+        };
+        let got = |q: &str| {
+            let plan = pulsus_promql::plan(
+                &pulsus_promql::parse(q).unwrap(),
+                p.plan_params(true, pulsus_promql::DEFAULT_LOOKBACK_MS),
+            )
+            .unwrap();
+            request_grid_routing(&plan, &p, Some(defaults()), None).map(|(_, res)| res)
+        };
+        assert_eq!(got("rate(x[5m])"), None, "rate(x[5m])");
+        assert_eq!(got("increase(x[30d])"), Some(7_200_000), "increase(x[30d])");
+        assert_eq!(got("increase(x[30d]) / x"), None, "increase(x[30d]) / x");
     }
 }

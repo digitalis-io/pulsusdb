@@ -39,9 +39,10 @@ use pulsus_promql::{AggOp, Annotations, FillValues, PlanExpr, QueryPlan, Selecto
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
-use super::exec::{MetricQueryParams, MetricsEngine, PlanFacts};
+use super::exec::{MetricQueryParams, MetricsEngine, PlanFacts, ReadMix};
 use super::rollup::{LevelSlot, Levels};
 use crate::ReadError;
+use crate::logql::TooBroadReason;
 use crate::logql::escape::ch_string;
 use crate::logql::{HistMatrixSeries, HistOrFloat, MatrixSeries, QueryResult};
 use pulsus_promql::parser::Expr;
@@ -372,6 +373,9 @@ pub struct ReadCache {
     /// generation read.
     #[cfg(test)]
     after_merge: Option<Hook>,
+    /// TEST SEAM (issue #810): run on a hit right after its lookup.
+    #[cfg(test)]
+    after_lookup: Option<Hook>,
     /// TEST SEAM: run by `clear_for_new_identity` immediately before its
     /// clear.
     #[cfg(test)]
@@ -404,6 +408,8 @@ impl ReadCache {
             #[cfg(test)]
             after_merge: None,
             #[cfg(test)]
+            after_lookup: None,
+            #[cfg(test)]
             before_identity_clear: None,
         }
     }
@@ -427,6 +433,15 @@ impl ReadCache {
             identity: poll.identity.as_ref().map(|ids| ids.to_vec()),
             identity_ok_at: poll.identity_ok_at,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_lookup(
+        mut self,
+        hook: impl Fn(&ReadCache) + Send + Sync + 'static,
+    ) -> Self {
+        self.after_lookup = Some(Box::new(hook));
+        self
     }
 
     #[cfg(test)]
@@ -1211,9 +1226,32 @@ pub struct RangeRequest<'a> {
     pub sweep_time_ms: Option<i64>,
 }
 
-/// An evaluation's answer: the result, its annotations, and what it
-/// charged.
-pub type Evaluated = (QueryResult, Annotations, u64);
+/// What an evaluation charged and how it read (issue #810).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvalFacts {
+    /// The sample rows it materialised.
+    pub charged: u64,
+    pub reads: ReadMix,
+    /// Read and evaluated raw for native histograms (D9).
+    pub raw: bool,
+    /// The result answers the whole request, not only the grid asked.
+    pub whole: bool,
+}
+
+impl EvalFacts {
+    /// An evaluation with no routed read.
+    pub fn unrouted(charged: u64) -> Self {
+        EvalFacts {
+            charged,
+            reads: ReadMix::Unrouted,
+            raw: false,
+            whole: false,
+        }
+    }
+}
+
+/// An evaluation's answer: the result, its annotations, and its facts.
+pub type Evaluated = (QueryResult, Annotations, EvalFacts);
 
 /// What a request is answered with.
 pub struct Answer {
@@ -1230,14 +1268,16 @@ pub struct Answer {
 /// Answers `req` from the cache when it can, else from `full`. `tail` is
 /// evaluated over the points after an entry's last kept one. The caller's
 /// error, if any, is the answer, as it is without the cache.
-pub async fn answer_range<E, F, FF, T, TF>(
+pub async fn answer_range<E, F, FF, T, TF, R>(
     cache: &ReadCache,
     req: RangeRequest<'_>,
     full: F,
     tail: T,
+    _refuse: R,
     attempt_ok: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<Answer, E>
 where
+    R: FnOnce(u64) -> E,
     F: FnOnce(MetricQueryParams) -> FF,
     FF: Future<Output = Result<Evaluated, E>>,
     T: FnOnce(MetricQueryParams) -> TF,
@@ -1283,11 +1323,16 @@ where
             end_ms: p.end_ms,
             step_ms: p.step_ms,
         };
-        let (tail_result, tail_ann, tail_charged) = if tail_p.start_ms > tail_p.end_ms {
-            (QueryResult::Matrix(Vec::new()), Annotations::new(), 0)
+        let (tail_result, tail_ann, tail_facts) = if tail_p.start_ms > tail_p.end_ms {
+            (
+                QueryResult::Matrix(Vec::new()),
+                Annotations::new(),
+                EvalFacts::unrouted(0),
+            )
         } else {
             tail(tail_p).await?
         };
+        let tail_charged = tail_facts.charged;
         let bound = e.charge_bound.saturating_add(tail_charged);
         if !tail_ann.has_mergeable()
             && rendered_annotations(&tail_ann, req.query) == e.annotations
@@ -1340,7 +1385,8 @@ where
         }
     }
 
-    let (result, annotations, charged) = full(p).await?;
+    let (result, annotations, full_facts) = full(p).await?;
+    let charged = full_facts.charged;
     let mut stored_through = None;
     if attempt_ok()
         && !annotations.has_mergeable()
@@ -1387,11 +1433,22 @@ pub async fn answer_range_on(
 ) -> Result<Answer, ReadError> {
     let eval = |q: MetricQueryParams| async move {
         let (r, a, f) = engine.query_with_facts(tenant, expr, &q).await?;
-        Ok::<_, ReadError>((r, a, f.charged_samples))
+        let facts = EvalFacts {
+            charged: f.charged_samples,
+            reads: f.reads,
+            raw: f.raw,
+            whole: f.whole,
+        };
+        Ok::<_, ReadError>((r, a, facts))
     };
-    answer_range(cache, req, eval, eval, &|| {
-        engine.server_failure().is_none()
-    })
+    answer_range(
+        cache,
+        req,
+        eval,
+        eval,
+        |cap| ReadError::QueryTooBroad(TooBroadReason::MetricSamples { cap }),
+        &|| engine.server_failure().is_none(),
+    )
     .await
 }
 
@@ -1404,7 +1461,7 @@ where
     F: FnOnce(MetricQueryParams) -> FF,
     FF: Future<Output = Result<Evaluated, E>>,
 {
-    let (result, annotations, _) = full(p).await?;
+    let (result, annotations, _facts) = full(p).await?;
     Ok(Answer {
         result,
         annotations,
@@ -1736,14 +1793,14 @@ mod tests {
     ) -> Answer {
         let full = |q: MetricQueryParams| {
             calls.full.fetch_add(1, Ordering::SeqCst);
-            async move { R::Ok((grid_matrix(&q, 0.0), full_ann, full_charge)) }
+            async move { R::Ok((grid_matrix(&q, 0.0), full_ann, EvalFacts::unrouted(full_charge))) }
         };
         let tail = |q: MetricQueryParams| {
             calls.tail.fetch_add(1, Ordering::SeqCst);
             during_tail();
-            async move { R::Ok((grid_matrix(&q, 0.0), tail_ann, tail_charge)) }
+            async move { R::Ok((grid_matrix(&q, 0.0), tail_ann, EvalFacts::unrouted(tail_charge))) }
         };
-        answer_range(&r.cache, req, full, tail, &always)
+        answer_range(&r.cache, req, full, tail, |_| (), &always)
             .await
             .expect("answered")
     }
@@ -2755,12 +2812,12 @@ mod tests {
         let full_calls = AtomicUsize::new(0);
         let full = |q: MetricQueryParams| {
             full_calls.fetch_add(1, Ordering::SeqCst);
-            async move { R::Ok((grid_matrix(&q, 1_000.0), Annotations::new(), 10)) }
+            async move { R::Ok((grid_matrix(&q, 1_000.0), Annotations::new(), EvalFacts::unrouted(10))) }
         };
         let tail = |q: MetricQueryParams| async move {
-            R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10))
+            R::Ok((grid_matrix(&q, 0.0), Annotations::new(), EvalFacts::unrouted(10)))
         };
-        let a = answer_range(&r.cache, request(q, p, u64::MAX), full, tail, &always)
+        let a = answer_range(&r.cache, request(q, p, u64::MAX), full, tail, |_| (), &always)
             .await
             .expect("answered");
         (a, p, full_calls.load(Ordering::SeqCst))
@@ -2841,13 +2898,13 @@ mod tests {
         let go = |answer: QueryResult| {
             let full = |_: MetricQueryParams| {
                 full_calls.fetch_add(1, Ordering::SeqCst);
-                async move { R::Ok((answer, Annotations::new(), 0)) }
+                async move { R::Ok((answer, Annotations::new(), EvalFacts::unrouted(0))) }
             };
             let tail = |q: MetricQueryParams| {
                 tail_calls.fetch_add(1, Ordering::SeqCst);
-                async move { R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 0)) }
+                async move { R::Ok((grid_matrix(&q, 0.0), Annotations::new(), EvalFacts::unrouted(0))) }
             };
-            answer_range(&r.cache, request(q, p, u64::MAX), full, tail, &always)
+            answer_range(&r.cache, request(q, p, u64::MAX), full, tail, |_| (), &always)
         };
         let first = go(QueryResult::Matrix(vec![])).await.expect("answered");
         assert_eq!(first.header, Header::Bypass, "(c) first header");
@@ -2884,17 +2941,17 @@ mod tests {
             if flagging {
                 failed.store(true, Ordering::SeqCst);
             }
-            async move { R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10)) }
+            async move { R::Ok((grid_matrix(&q, 0.0), Annotations::new(), EvalFacts::unrouted(10))) }
         };
         let tail = |q: MetricQueryParams| {
             calls.tail.fetch_add(1, Ordering::SeqCst);
             if flagging {
                 failed.store(true, Ordering::SeqCst);
             }
-            async move { R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10)) }
+            async move { R::Ok((grid_matrix(&q, 0.0), Annotations::new(), EvalFacts::unrouted(10))) }
         };
         let guard = || !failed.load(Ordering::SeqCst);
-        answer_range(&r.cache, req, full, tail, &guard)
+        answer_range(&r.cache, req, full, tail, |_| (), &guard)
             .await
             .expect("answered")
     }
@@ -3033,12 +3090,12 @@ mod tests {
                     let answer = rt.block_on(async {
                         let full = |q: MetricQueryParams| {
                             full_calls.fetch_add(1, Ordering::SeqCst);
-                            async move { R::Ok((grid_matrix(&q, 1_000.0), Annotations::new(), 10)) }
+                            async move { R::Ok((grid_matrix(&q, 1_000.0), Annotations::new(), EvalFacts::unrouted(10))) }
                         };
                         let tail = |q: MetricQueryParams| async move {
-                            R::Ok((grid_matrix(&q, 1_000.0), Annotations::new(), 10))
+                            R::Ok((grid_matrix(&q, 1_000.0), Annotations::new(), EvalFacts::unrouted(10)))
                         };
-                        answer_range(&shared, request(q, p2, u64::MAX), full, tail, &always)
+                        answer_range(&shared, request(q, p2, u64::MAX), full, tail, |_| (), &always)
                             .await
                             .expect("answered")
                     });
@@ -3068,12 +3125,12 @@ mod tests {
         let now = || clock.load(Ordering::SeqCst);
         cache.record_identity(now(), vec!["db".to_string()]);
         let full = |q: MetricQueryParams| async move {
-            R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10))
+            R::Ok((grid_matrix(&q, 0.0), Annotations::new(), EvalFacts::unrouted(10)))
         };
         let tail = |q: MetricQueryParams| async move {
-            R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10))
+            R::Ok((grid_matrix(&q, 0.0), Annotations::new(), EvalFacts::unrouted(10)))
         };
-        let a = answer_range(&cache, request(q, p, u64::MAX), full, tail, &always)
+        let a = answer_range(&cache, request(q, p, u64::MAX), full, tail, |_| (), &always)
             .await
             .expect("answered");
         assert_eq!(a.header, Header::Miss, "the fill");

@@ -1387,3 +1387,149 @@ async fn a_match_node_answers_on_two_shards() {
     )
     .await;
 }
+
+// ------------------------------------------------------ issue #810, T6 / T28
+
+/// The fixture's `s` labels of the series stored on `node`.
+async fn local_series(f: &Fixture, node: &ChClient) -> Vec<String> {
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
+    struct S {
+        s: String,
+    }
+    let sql = format!(
+        "SELECT DISTINCT JSONExtractString(labels, 's') AS s FROM {}.metric_labels ORDER BY s",
+        f.db
+    );
+    let mut stream = node
+        .query_stream::<S>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode").s);
+    }
+    out
+}
+
+/// **T6 (issue #810): a pushed level node is one statement on two shards**,
+/// each shard's series answered from that shard's own newest bucket: the
+/// last hour is built on shard 1 only, so its steps sum shard 1's series.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pushed_level_node_is_one_statement_on_two_shards() {
+    if skipping() {
+        return;
+    }
+    let f = fixture(
+        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t810_6"),
+        &[("m", 0)],
+        true,
+    )
+    .await;
+    build_level_to(&f, f.hi - HOUR).await;
+    exec(&f.shard1, &first_level_insert(&f.ctx, f.hi - HOUR, f.hi)).await;
+    exec(
+        &f.shard1b,
+        &format!("SYSTEM SYNC REPLICA {}.metric_samples_60s", f.db),
+    )
+    .await;
+    let (cache, slot) = warm(&f).await;
+    let comment = format!("{}_t6_{}", f.db, chrono::Utc::now().timestamp_millis());
+    let on = level_engine(&f, &cache, &slot, true, Some(&comment)).await;
+    let off = level_engine(&f, &cache, &slot, false, None).await;
+    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
+    let p = MetricQueryParams {
+        start_ms: f.hi - 3 * HOUR,
+        end_ms: f.hi,
+        step_ms: MIN,
+    };
+    let (a, _) = on
+        .query(&tenant, &parse("sum(rate(m[5m]))").expect("parse"), &p)
+        .await
+        .expect("pushed");
+    let mine = local_series(&f, &f.shard1).await;
+    let only = format!("sum(rate(m{{s=~\"{}\"}}[5m]))", mine.join("|"));
+    let (b, _) = off
+        .query(&tenant, &parse(&only).expect("parse"), &p)
+        .await
+        .expect("shard 1's series");
+    let sent = statements(&f.shard1, &comment).await;
+    let mut failures = Vec::new();
+    if sent.len() != 1 {
+        failures.push(format!("{} statements: {sent:#?}", sent.len()));
+    }
+    if mine.is_empty() || mine.len() >= 40 {
+        failures.push(format!("shard 1 holds {} series", mine.len()));
+    }
+    let (ca, cb) = (cells(&a), cells(&b));
+    let at = |c: &std::collections::BTreeMap<String, Vec<(i64, u64)>>, t: i64| {
+        c.values()
+            .next()
+            .and_then(|pts| pts.iter().find(|(x, _)| *x == t).map(|(_, v)| f64::from_bits(*v)))
+    };
+    let mut t = f.hi - HOUR + 6 * MIN;
+    let mut compared = 0;
+    while t <= f.hi {
+        match (at(&ca, t), at(&cb, t)) {
+            (Some(x), Some(y)) if (x - y).abs() <= 1e-9 * y.abs().max(1.0) => compared += 1,
+            other => failures.push(format!("at {t}: pushed and shard 1's series {other:?}")),
+        }
+        t += MIN;
+    }
+    if compared == 0 {
+        failures.push("no step compared".to_string());
+    }
+    exec(
+        &f.bootstrap,
+        &format!(
+            "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
+            f.db
+        ),
+    )
+    .await;
+    assert!(failures.is_empty(), "T6:\n{}", failures.join("\n"));
+}
+
+/// **T28 (issue #810): a listed selector reads on two shards** in one
+/// statement, under the settings a nested series read needs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listed_selector_reads_on_two_shards() {
+    if skipping() {
+        return;
+    }
+    let f = fixture(
+        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t810_28"),
+        &[("m", 0)],
+        true,
+    )
+    .await;
+    build_level(&f).await;
+    let (cache, slot) = warm(&f).await;
+    let comment = format!("{}_t28_{}", f.db, chrono::Utc::now().timestamp_millis());
+    let on = level_engine(&f, &cache, &slot, false, Some(&comment)).await;
+    let off = MetricsEngine::new(
+        ChClient::new(shard1_config(&f.db)).await.expect("connect"),
+        Arc::clone(&cache),
+        engine_config(&f.db),
+    );
+    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
+    let p = MetricQueryParams {
+        start_ms: f.hi - 3 * HOUR,
+        end_ms: f.hi,
+        step_ms: MIN,
+    };
+    let expr = parse("max_over_time(m[1m])").expect("parse");
+    let (a, _) = on.query(&tenant, &expr, &p).await.expect("routed");
+    let (b, _) = off.query(&tenant, &expr, &p).await.expect("routing off");
+    let sent = statements(&f.shard1, &comment).await;
+    exec(
+        &f.bootstrap,
+        &format!(
+            "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
+            f.db
+        ),
+    )
+    .await;
+    assert_eq!(sent.len(), 1, "T28: statements {sent:#?}");
+    assert!(!cells(&b).is_empty(), "T28: an answer");
+    assert_eq!(cells(&a), cells(&b), "T28: as routing off");
+}
