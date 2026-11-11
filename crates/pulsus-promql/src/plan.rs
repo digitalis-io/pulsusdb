@@ -976,6 +976,10 @@ pub struct QueryPlan {
     pub root: PlanExpr,
     pub selectors: Vec<SelectorSpec>,
     pub params: PlanParams,
+    /// Issue #778: a duration expression (`range()`, `step()`, arithmetic in
+    /// a range, offset or subquery field) was planned. Such a query reads
+    /// the request's own span, so the read cache refuses it.
+    pub uses_duration_expr: bool,
 }
 
 // Issue #33 architect adjudication (superseding #31's ratified zero-
@@ -1029,9 +1033,20 @@ struct Planner {
     step_ms: i64,
     ctx: SubqueryCtx,
     subquery_depth: usize,
+    /// Issue #778: set when a duration expression is planned
+    /// ([`QueryPlan::uses_duration_expr`]). A `Cell` because the subquery
+    /// fields are resolved through `&Planner`.
+    uses_duration_expr: std::cell::Cell<bool>,
 }
 
 impl Planner {
+    /// Issue #778: records that `e` is a duration expression, if it is one.
+    fn note_duration_expr(&self, e: &Option<DurationExpr>) {
+        if e.is_some() {
+            self.uses_duration_expr.set(true);
+        }
+    }
+
     /// `info_family` (issue #82, retroactive re-review v4 Δ1): `true`
     /// only from `plan_info`'s single call site — marks the synthetic
     /// `*_info` metadata-family selector for the reader's
@@ -1172,6 +1187,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
                 root: PlanExpr::StringLiteral(s.val.clone()),
                 selectors: Vec::new(),
                 params,
+                uses_duration_expr: false,
             });
         }
         // Issue #154 (owner-approved): a TOP-LEVEL matrix selector of an
@@ -1193,6 +1209,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
                 step_ms: params.step_ms,
                 ctx: SubqueryCtx::default(),
                 subquery_depth: 0,
+                uses_duration_expr: std::cell::Cell::new(false),
             };
             // Directly through the matrix-selector planner — the
             // identical `SelectorSpec` fetch/pushdown as `rate()`'s
@@ -1214,6 +1231,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
             // caller of `plan_range_source` keeps it.
             let id = plan_matrix_selector_id(&mut planner, ms)?;
             let source = RangeSource::Selector(id);
+            let uses_duration_expr = planner.uses_duration_expr.get();
             let mut selectors = planner.selectors;
             let root = PlanExpr::RangeVector { source };
             detect_histogram_stats(&root, &mut selectors);
@@ -1222,6 +1240,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
                 root,
                 selectors,
                 params,
+                uses_duration_expr,
             });
         }
     }
@@ -1234,8 +1253,10 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
         step_ms: params.step_ms,
         ctx: SubqueryCtx::default(),
         subquery_depth: 0,
+        uses_duration_expr: std::cell::Cell::new(false),
     };
     let root = plan_expr(&mut planner, expr)?;
+    let uses_duration_expr = planner.uses_duration_expr.get();
     let mut selectors = planner.selectors;
     detect_histogram_stats(&root, &mut selectors);
     assign_rollup_use(&root, &mut selectors);
@@ -1243,6 +1264,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
         root,
         selectors,
         params,
+        uses_duration_expr,
     })
 }
 
@@ -1941,6 +1963,7 @@ fn plan_vector_selector(
 ) -> Result<PlanExpr, PromqlError> {
     // Issue #84/#150: gate before any resolution.
     gate_duration_expr(&vs.offset_expr, planner.experimental)?;
+    planner.note_duration_expr(&vs.offset_expr);
     gate_extended_modifier(vs.anchored, vs.smoothed, planner.experimental)?;
     let (metric_name, name_matchers, matchers) = extract_name_and_matchers(vs)?;
     let at_ms = planner.resolve_at(&vs.at);
@@ -1971,6 +1994,8 @@ fn plan_matrix_selector_id(
     // Issue #84/#150: gate before any resolution.
     gate_duration_expr(&ms.range_expr, planner.experimental)?;
     gate_duration_expr(&ms.vs.offset_expr, planner.experimental)?;
+    planner.note_duration_expr(&ms.range_expr);
+    planner.note_duration_expr(&ms.vs.offset_expr);
     gate_extended_modifier(ms.vs.anchored, ms.vs.smoothed, planner.experimental)?;
     let (metric_name, name_matchers, matchers) = extract_name_and_matchers(&ms.vs)?;
     let at_ms = planner.resolve_at(&ms.vs.at);
@@ -2040,6 +2065,9 @@ fn resolve_subquery_fields(
     gate_duration_expr(&sq.range_expr, planner.experimental)?;
     gate_duration_expr(&sq.step_expr, planner.experimental)?;
     gate_duration_expr(&sq.offset_expr, planner.experimental)?;
+    planner.note_duration_expr(&sq.range_expr);
+    planner.note_duration_expr(&sq.step_expr);
+    planner.note_duration_expr(&sq.offset_expr);
     let range_ms = planner.resolve_range_ms(sq.range, &sq.range_expr)?;
     let step_ms = match &sq.step_expr {
         Some(e) => resolve_duration_expr(e, planner.step_ms, planner.query_range_ms(), false)?,
@@ -5296,6 +5324,15 @@ mod tests {
         }
     }
 
+    /// Issue #778: a plan with `uses_duration_expr` cleared, so a duration
+    /// expression's plan compares with its literal's on everything else.
+    fn literal_view(p: QueryPlan) -> QueryPlan {
+        QueryPlan {
+            uses_duration_expr: false,
+            ..p
+        }
+    }
+
     /// AC7, the Tier-1 plan-equality perf gate: duration resolution is
     /// plan-time constant folding — the resulting `QueryPlan` is
     /// byte-identical to the one the equivalent literal produces, so the
@@ -5304,17 +5341,19 @@ mod tests {
     fn duration_expressions_fold_to_the_identical_literal_plan() {
         let expr_a = parse("changes(http_requests[26m+4m])").unwrap();
         let expr_b = parse("changes(http_requests[30m])").unwrap();
-        assert_eq!(
-            plan(&expr_a, params_experimental()).unwrap(),
-            plan(&expr_b, params_experimental()).unwrap(),
-        );
+        let pa = plan(&expr_a, params_experimental()).unwrap();
+        let pb = plan(&expr_b, params_experimental()).unwrap();
+        assert!(pa.uses_duration_expr);
+        assert!(!pb.uses_duration_expr);
+        assert_eq!(literal_view(pa), pb);
 
         let expr_a = parse("count_over_time(m[step()])").unwrap();
         let expr_b = parse("count_over_time(m[10s])").unwrap();
-        assert_eq!(
-            plan(&expr_a, range_params()).unwrap(),
-            plan(&expr_b, range_params()).unwrap(),
-        );
+        let pa = plan(&expr_a, range_params()).unwrap();
+        let pb = plan(&expr_b, range_params()).unwrap();
+        assert!(pa.uses_duration_expr);
+        assert!(!pb.uses_duration_expr);
+        assert_eq!(literal_view(pa), pb);
     }
 
     /// Resolution semantics against upstream durations.go: offsets may be
@@ -5443,7 +5482,10 @@ mod tests {
         let wrapped = parse("rate(m[(0.0009999996)])").unwrap();
         let plain = parse("rate(m[0.0009999996])").unwrap();
         let wrapped_plan = plan(&wrapped, params_experimental()).unwrap();
-        assert_eq!(wrapped_plan, plan(&plain, params_experimental()).unwrap());
+        let plain_plan = plan(&plain, params_experimental()).unwrap();
+        assert!(wrapped_plan.uses_duration_expr);
+        assert!(!plain_plan.uses_duration_expr);
+        assert_eq!(literal_view(wrapped_plan.clone()), plain_plan);
         assert_eq!(wrapped_plan.selectors[0].range_ms, Some(1));
         // ... and at a large in-range magnitude (~285 years): the
         // resolver's conversion must be integer-ns then integer-ms,
@@ -5452,25 +5494,28 @@ mod tests {
         // here (#84 review round 2).
         let wrapped = parse("rate(m[(9000000000.008)])").unwrap();
         let plain = parse("rate(m[9000000000.008])").unwrap();
-        assert_eq!(
-            plan(&wrapped, params_experimental()).unwrap(),
-            plan(&plain, params_experimental()).unwrap(),
-        );
+        let pa = plan(&wrapped, params_experimental()).unwrap();
+        let pb = plan(&plain, params_experimental()).unwrap();
+        assert!(pa.uses_duration_expr);
+        assert!(!pb.uses_duration_expr);
+        assert_eq!(literal_view(pa), pb);
         // The plain-literal equivalents of the (a) whole-expression
         // guards, for symmetry: parenthesised 30m folds to the same plan
         // as the bare literal.
         let expr_a = parse("rate(m[(30m)])").unwrap();
         let expr_b = parse("rate(m[30m])").unwrap();
-        assert_eq!(
-            plan(&expr_a, params_experimental()).unwrap(),
-            plan(&expr_b, params_experimental()).unwrap(),
-        );
+        let pa = plan(&expr_a, params_experimental()).unwrap();
+        let pb = plan(&expr_b, params_experimental()).unwrap();
+        assert!(pa.uses_duration_expr);
+        assert!(!pb.uses_duration_expr);
+        assert_eq!(literal_view(pa), pb);
         let expr_a = parse("m offset (5)").unwrap();
         let expr_b = parse("m offset 5").unwrap();
-        assert_eq!(
-            plan(&expr_a, params_experimental()).unwrap(),
-            plan(&expr_b, params_experimental()).unwrap(),
-        );
+        let pa = plan(&expr_a, params_experimental()).unwrap();
+        let pb = plan(&expr_b, params_experimental()).unwrap();
+        assert!(pa.uses_duration_expr);
+        assert!(!pb.uses_duration_expr);
+        assert_eq!(literal_view(pa), pb);
 
         // (c) the parenthesised literal is still gated when the flag is
         // off — upstream parity (`foo[(5m)]` flag-off is the gate error

@@ -498,6 +498,16 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.tail_catchup_slice.0 == Duration::from_secs(120),
     },
     Row {
+        var: "PULSUS_READ_CACHE_BYTES",
+        value: "64MiB",
+        check: |c| c.reader.read_cache_bytes.0 == 67_108_864,
+    },
+    Row {
+        var: "PULSUS_READ_CACHE_TENANT_SHARE",
+        value: "30",
+        check: |c| c.reader.read_cache_tenant_share == 30,
+    },
+    Row {
         var: "PULSUS_RULER_ENABLED",
         value: "true",
         check: |c| c.ruler.enabled,

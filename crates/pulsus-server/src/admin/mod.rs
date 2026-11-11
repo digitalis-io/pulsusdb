@@ -104,6 +104,7 @@ mod tests {
             label_cache: Arc::new(OnceLock::new()),
             rollup_levels: Arc::new(LevelSlot::new()),
             graph_target: pulsus_read::GraphTargetCache::default(),
+            read_cache: Default::default(),
             eval_gate: Arc::new(pulsus_read::EvalGate::new(
                 Config::default().reader.query_eval_concurrency,
             )),

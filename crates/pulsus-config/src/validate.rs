@@ -1037,6 +1037,17 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         ));
     }
     positive_duration("reader.tail_catchup_slice", cfg.reader.tail_catchup_slice)?;
+    // Issue #778: a tenant's share of the read cache, in percent.
+    let share = cfg.reader.read_cache_tenant_share;
+    if !(1..=100).contains(&share) {
+        return Err(range_err(
+            "reader.read_cache_tenant_share",
+            u64::from(share),
+            1,
+            100,
+            "percent",
+        ));
+    }
     positive_duration("log_rollup_resolution", cfg.log_rollup_resolution)?;
     positive_duration("ruler.poll_interval", cfg.ruler.poll_interval)?;
     positive_bytes("ruler.max_result_bytes", cfg.ruler.max_result_bytes)?;
@@ -2037,6 +2048,31 @@ mod tests {
                 }
                 other => panic!("{field}: expected a Value error, got {other:?}"),
             }
+        }
+    }
+
+    /// Issue #778: the read cache's tenant share is a percent from 1 to
+    /// 100, refused outside it naming its field; the defaults are 256 MiB
+    /// and 50.
+    #[test]
+    fn the_read_cache_tenant_share_is_1_to_100_and_the_defaults_are_256mib_and_50() {
+        let d = Config::default();
+        assert_eq!(d.reader.read_cache_bytes.0, 256 * 1024 * 1024);
+        assert_eq!(d.reader.read_cache_tenant_share, 50);
+        for share in [0u8, 101] {
+            let mut cfg = Config::default();
+            cfg.reader.read_cache_tenant_share = share;
+            match validate(&cfg) {
+                Err(ConfigError::Value { field, .. }) => {
+                    assert_eq!(field, "reader.read_cache_tenant_share", "share {share}");
+                }
+                other => panic!("share {share}: expected a Value error, got {other:?}"),
+            }
+        }
+        for share in [1u8, 100] {
+            let mut cfg = Config::default();
+            cfg.reader.read_cache_tenant_share = share;
+            assert!(validate(&cfg).is_ok(), "share {share}");
         }
     }
 

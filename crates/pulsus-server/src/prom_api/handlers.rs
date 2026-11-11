@@ -11,12 +11,13 @@ use axum::response::{IntoResponse, Response};
 
 use pulsus_model::Tenant;
 use pulsus_promql::parser::Expr;
+use pulsus_read::metrics::read_cache;
 use pulsus_read::{DataWindow, DiscoveryFilter, MetricQueryParams};
 
 use crate::app::AppState;
 
 use super::encode;
-use super::engine::with_engine;
+use super::engine::{EngineOptions, with_engine};
 use super::error::{ApiError, DeadlineProducer};
 use super::params::{self, ParamError};
 
@@ -191,6 +192,9 @@ async fn query_impl(
         step_ms: 0,
     };
     let server_deadline = state.config.query_timeout.0;
+    if let Some(cache) = state.read_cache.get() {
+        cache.record_bypass(read_cache::BypassReason::Instant);
+    }
     let work = run_query(
         &state,
         lookback_ms,
@@ -279,7 +283,7 @@ async fn query_range_impl(
         step_ms,
     };
     let server_deadline = state.config.query_timeout.0;
-    let work = run_query(
+    let work = run_range_query(
         &state,
         lookback_ms,
         tenant,
@@ -374,6 +378,114 @@ async fn run_query(
         query,
         annotations,
         shape,
+    ))
+}
+
+/// Issue #778: `X-Pulsus-Read-Cache`, and with `hit` or `miss` the last
+/// point kept.
+fn with_read_cache_headers(
+    mut res: Response,
+    header: read_cache::Header,
+    through_ms: Option<i64>,
+) -> Response {
+    let headers = res.headers_mut();
+    headers.insert(
+        axum::http::HeaderName::from_static("x-pulsus-read-cache"),
+        axum::http::HeaderValue::from_static(header.as_str()),
+    );
+    if let Some(ms) = through_ms.filter(|_| header != read_cache::Header::Bypass)
+        && let Ok(v) = axum::http::HeaderValue::from_str(&ms.to_string())
+    {
+        headers.insert(
+            axum::http::HeaderName::from_static("x-pulsus-read-cache-through"),
+            v,
+        );
+    }
+    res
+}
+
+/// Issue #778: a range query through the read cache when it is built and
+/// the request carries no explain header; otherwise [`run_query`].
+#[allow(clippy::too_many_arguments)]
+async fn run_range_query(
+    state: &AppState,
+    lookback_ms: Option<i64>,
+    tenant: &Tenant,
+    expr: &Expr,
+    query: &str,
+    p: &MetricQueryParams,
+    opts: ResponseOptions,
+    at_ms: i64,
+) -> Result<Response, ApiError> {
+    let cache = state.read_cache.get().cloned();
+    let cache = match cache {
+        Some(c) if !opts.explain => c,
+        other => {
+            if let Some(c) = other {
+                c.record_bypass(read_cache::BypassReason::Explain);
+            }
+            let res = run_query(state, lookback_ms, tenant, expr, query, p, opts, at_ms).await?;
+            return Ok(with_read_cache_headers(
+                res,
+                read_cache::Header::Bypass,
+                None,
+            ));
+        }
+    };
+    // Issue #803: the read cache runs inside the request's attempt, on the
+    // attempt's one engine; the answer is encoded after the request is
+    // accepted.
+    let engine_options = EngineOptions {
+        lookback_ms,
+        routing_span_ms: Some(p.end_ms - p.start_ms),
+    };
+    let answer = with_engine(state, engine_options, |engine| {
+        let cache = std::sync::Arc::clone(&cache);
+        async move {
+            let facts = engine.plan_facts(expr, p)?;
+            let key = read_cache::CacheKey::new(
+                tenant.clone(),
+                query,
+                p,
+                engine.lookback_ms(),
+                engine.resolution_ms(p),
+            );
+            let now = cache.now_ms();
+            let req = read_cache::RangeRequest {
+                key,
+                query,
+                params: *p,
+                facts,
+                max_samples: state.config.reader.promql_max_samples,
+                retention_floor_ms: state
+                    .retention_days()
+                    .map(|d| now - i64::from(d) * 86_400_000 + 86_400_000),
+                sweep_time_ms: state
+                    .label_cache
+                    .get()
+                    .and_then(|c| c.sweep_time_ms(tenant)),
+            };
+            Ok(read_cache::answer_range_on(&cache, &engine, tenant, expr, req).await?)
+        }
+    })
+    .await?;
+    let shape = encode::ResponseShape {
+        ordered: false,
+        limit: opts.limit,
+        stats_requested: opts.stats_requested,
+    };
+    let res = encode::query_response_annotated(
+        answer.result,
+        None,
+        at_ms,
+        query,
+        answer.annotations,
+        shape,
+    );
+    Ok(with_read_cache_headers(
+        res,
+        answer.header,
+        answer.through_ms,
     ))
 }
 
@@ -815,6 +927,7 @@ mod tests {
             label_cache: Arc::new(std::sync::OnceLock::new()),
             rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
             graph_target: pulsus_read::GraphTargetCache::default(),
+            read_cache: Default::default(),
             eval_gate: Arc::new(pulsus_read::EvalGate::new(
                 pulsus_config::Config::default()
                     .reader

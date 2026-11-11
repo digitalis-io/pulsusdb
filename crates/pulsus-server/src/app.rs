@@ -66,6 +66,10 @@ pub(crate) struct AppState {
     /// `TraceEngine` per request, so an engine-local cache would read the
     /// target on every request.
     pub(crate) graph_target: pulsus_read::GraphTargetCache,
+    /// Issue #778: the per-process read cache of range answers; set at startup on the
+    /// reader and `all` roles when its budget is above 0 and, on glibc, the allocator took
+    /// its settings. With another C library nothing is set and the cache is built.
+    pub(crate) read_cache: Arc<OnceLock<Arc<pulsus_read::metrics::read_cache::ReadCache>>>,
     pub(crate) eval_gate: Arc<pulsus_read::EvalGate>,
     pub(crate) started_at: std::time::SystemTime,
     /// The live-tail runtime bundle (issue #74): the process shutdown
@@ -226,6 +230,7 @@ mod tests {
             label_cache: Arc::new(std::sync::OnceLock::new()),
             rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
             graph_target: pulsus_read::GraphTargetCache::default(),
+            read_cache: Default::default(),
             eval_gate: Arc::new(pulsus_read::EvalGate::new(
                 pulsus_config::Config::default()
                     .reader

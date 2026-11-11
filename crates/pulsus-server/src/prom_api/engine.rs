@@ -38,7 +38,7 @@ async fn serving_pool(state: &AppState) -> Result<Arc<ChPool>, ApiError> {
 /// request's `lookback_delta` when it set one.
 async fn engine_for(
     state: &AppState,
-    lookback_ms: Option<i64>,
+    options: EngineOptions,
     avoid: Option<usize>,
 ) -> Result<MetricsEngine, ApiError> {
     let pool = serving_pool(state).await?;
@@ -60,10 +60,34 @@ async fn engine_for(
     )
     .map(crate::request_id::tag)
     .map_err(|_| ApiError::Unavailable)?;
-    Ok(match lookback_ms {
+    let engine = match options.lookback_ms {
         Some(ms) => engine.with_lookback_ms(ms),
         None => engine,
+    };
+    Ok(match options.routing_span_ms {
+        Some(span) => engine.with_routing_span_ms(span),
+        None => engine,
     })
+}
+
+/// What a request sets on its engine beyond the defaults: its
+/// `lookback_delta`, and (issue #778, a range request through the read
+/// cache) the span every range evaluation of the request is routed by, so
+/// a cached answer's tail reads the level its whole request reads.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct EngineOptions {
+    pub(super) lookback_ms: Option<i64>,
+    pub(super) routing_span_ms: Option<i64>,
+}
+
+impl From<Option<i64>> for EngineOptions {
+    /// A request's `lookback_delta` alone.
+    fn from(lookback_ms: Option<i64>) -> Self {
+        EngineOptions {
+            lookback_ms,
+            routing_span_ms: None,
+        }
+    }
 }
 
 /// Builds a [`MetricsEngine`] over `pool` and the already-constructed
@@ -87,7 +111,7 @@ fn metrics_engine(
     )
 }
 
-/// Runs one metrics read request: builds the engine (with `lookback_ms`
+/// Runs one metrics read request: builds the engine (with `options`
 /// when the request set one), then `run(engine)`, which makes the engine
 /// calls and returns their materialised result. When the engine's server
 /// fails during the run and another server is healthy, the run and its
@@ -95,13 +119,14 @@ fn metrics_engine(
 /// committed and `run`'s result returned.
 pub(super) async fn with_engine<T, F, Fut>(
     state: &AppState,
-    lookback_ms: Option<i64>,
+    options: impl Into<EngineOptions>,
     run: F,
 ) -> Result<T, ApiError>
 where
     F: FnMut(Arc<MetricsEngine>) -> Fut,
     Fut: Future<Output = Result<T, ApiError>>,
 {
+    let options = options.into();
     let pool = serving_pool(state).await?;
     // `run` is called once per attempt from a closure that returns a
     // future; the lock only spans the call that makes `run`'s future.
@@ -110,7 +135,7 @@ where
     run_read_request(
         &pool,
         move |avoid| async move {
-            let engine = match engine_for(state, lookback_ms, avoid).await {
+            let engine = match engine_for(state, options, avoid).await {
                 Ok(engine) => Arc::new(engine),
                 Err(e) => return Attempt::failed_to_start(e),
             };

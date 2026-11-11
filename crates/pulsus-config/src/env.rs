@@ -109,6 +109,8 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_TAIL_SEND_TIMEOUT",
     "PULSUS_TAIL_MAX_FETCH_LIMIT",
     "PULSUS_TAIL_CATCHUP_SLICE",
+    "PULSUS_READ_CACHE_BYTES",
+    "PULSUS_READ_CACHE_TENANT_SHARE",
     "PULSUS_RULER_ENABLED",
     "PULSUS_RULER_POLL_INTERVAL",
     "PULSUS_RULER_MAX_RESULT_BYTES",
@@ -509,6 +511,12 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("PULSUS_TAIL_CATCHUP_SLICE") {
         cfg.reader.tail_catchup_slice = parse_dur("PULSUS_TAIL_CATCHUP_SLICE", &v)?;
+    }
+    if let Some(v) = read("PULSUS_READ_CACHE_BYTES") {
+        cfg.reader.read_cache_bytes = parse_size("PULSUS_READ_CACHE_BYTES", &v)?;
+    }
+    if let Some(v) = read("PULSUS_READ_CACHE_TENANT_SHARE") {
+        cfg.reader.read_cache_tenant_share = parse_int("PULSUS_READ_CACHE_TENANT_SHARE", &v)?;
     }
     if let Some(v) = read("PULSUS_RULER_ENABLED") {
         cfg.ruler.enabled = parse_bool("PULSUS_RULER_ENABLED", &v)?;

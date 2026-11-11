@@ -1818,6 +1818,14 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: ci/test-summary.sh run prom_api_live -p pulsus-server --test prom_api_live
 
+      # Issue #778 part 1: the read cache; two `pulsusdb` processes, cache on
+      # and cache off, over one database, answers compared byte for byte.
+      - name: Live read cache suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: ci/test-summary.sh run read_cache_live -p pulsus-server --test read_cache_live
+
       # Issue #471 M2: spawns the real `pulsusdb` binary behind a TCP
       # proxy that stops forwarding, so a request cannot complete and the
       # request deadline is observed on the wire — `503` + the PromQL
@@ -2737,6 +2745,13 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-read --test live_metrics_rollup_cluster
+
+      # Issue #778 part 1: the read cache's replica-lag gate, with fetches
+      # stopped on shard 1's second replica.
+      - name: Live read cache cluster tests
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-server --test read_cache_cluster_live
 
       # Issue #136: the metrics SqlFallback fetch's double-distributed
       # `fingerprint IN (SELECT … FROM metric_series_dist …)` shape, denied

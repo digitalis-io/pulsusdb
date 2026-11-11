@@ -90,6 +90,7 @@ pub mod grouped_sql;
 pub mod labels;
 pub mod matcher;
 mod re2_authority;
+pub mod read_cache;
 pub mod refresh;
 pub mod rollup;
 pub mod rows;
@@ -103,6 +104,10 @@ pub mod stats;
 /// P2b).
 #[cfg(test)]
 pub(crate) mod pass_failure_tests;
+/// Issue #778: the read cache's poll and fill against stub servers
+/// (#803's rule).
+#[cfg(test)]
+mod read_cache_stub_tests;
 /// Issue #803: the stub ClickHouse the pass-failure tests run against.
 #[cfg(test)]
 #[path = "../../../pulsus-clickhouse/tests/common/stub_server.rs"]

@@ -57,7 +57,6 @@ docs/query-lowering.md	plan.rs:1709	ambiguous_basename
 docs/query-lowering.md	plan.rs:1730	ambiguous_basename
 docs/query-lowering.md	plan.rs:179	ambiguous_basename
 docs/query-lowering.md	plan.rs:2258	ambiguous_basename
-docs/query-lowering.md	plan.rs:2263	ambiguous_basename
 docs/query-lowering.md	plan.rs:2648	ambiguous_basename
 docs/query-lowering.md	plan.rs:2649	ambiguous_basename
 docs/query-lowering.md	plan.rs:3629	ambiguous_basename
@@ -135,7 +134,6 @@ docs/query-to-sql.md	plan.rs:1744	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1745	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1747	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1748	ambiguous_basename
-docs/query-to-sql.md	plan.rs:2428	ambiguous_basename
 docs/query-to-sql.md	plan.rs:2429	ambiguous_basename
 docs/query-to-sql.md	plan.rs:2513	ambiguous_basename
 docs/query-to-sql.md	plan.rs:2832	ambiguous_basename

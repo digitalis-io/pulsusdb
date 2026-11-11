@@ -88,6 +88,9 @@ tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Issue #778: `mallopt`, to fix glibc's mapping threshold when the read
+# cache is on (`allocator.rs`). Already in the lock through other crates.
+libc = "0.2"
 
 [dev-dependencies]
 pulsus-schema-testkit = { path = "../pulsus-schema-testkit" }

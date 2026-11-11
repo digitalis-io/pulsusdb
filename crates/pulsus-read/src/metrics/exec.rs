@@ -486,6 +486,11 @@ impl SampleBudget {
         Ok(())
     }
 
+    /// Issue #778: the rows admitted so far, the request's charge.
+    pub(super) fn used(&self) -> u64 {
+        self.used.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// TEST SEAM: pre-loads the admitted count so ceiling-scale boundary
     /// tests never iterate 5×10^10 charges (`eval_gate`'s seeded-counter
     /// precedent).
@@ -558,6 +563,33 @@ pub struct MetricsEngine {
     /// pushed node at; [`crate::querytext::MAX_QUERY_TEXT_BYTES`] in
     /// production.
     statement_cap: u64,
+    /// Issue #778: the span a range query is routed by, in place of its own
+    /// `end − start`. A read cache tail is routed as its whole request is.
+    routing_span_ms: Option<i64>,
+    /// TEST SEAM (issue #778): a server failure [`MetricsEngine::server_failure`]
+    /// reports whatever the reads met.
+    #[cfg(test)]
+    injected_failure: Option<pulsus_clickhouse::ServerFailure>,
+}
+
+/// Issue #778: what planning alone says about a query, for the read cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanFacts {
+    /// The plan-shape gate (`read_cache::shape_allowed`).
+    pub shape_allowed: bool,
+    /// The least lower bound of every selector's fetch window; `i64::MAX`
+    /// with no selector.
+    pub oldest_input_ms: i64,
+    /// How far past a step's time a point reads (a negative offset).
+    pub reach_ms: i64,
+}
+
+/// Issue #778: what an evaluation charged, beside what planning says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryFacts {
+    /// The sample rows the evaluation materialised (`SampleBudget::used`).
+    pub charged_samples: u64,
+    pub plan: PlanFacts,
 }
 
 /// TEST SEAM (issue #18 part B): a level fetch's answer by its statement
@@ -587,7 +619,72 @@ impl MetricsEngine {
             rollup_levels: None,
             rollup_answer_hook: None,
             statement_cap: crate::querytext::MAX_QUERY_TEXT_BYTES,
+            routing_span_ms: None,
+            #[cfg(test)]
+            injected_failure: None,
         }
+    }
+
+    /// TEST SEAM (issue #778): this engine reports `f` as its server
+    /// failure.
+    #[cfg(test)]
+    pub(crate) fn with_injected_failure(mut self, f: pulsus_clickhouse::ServerFailure) -> Self {
+        self.injected_failure = Some(f);
+        self
+    }
+
+    /// Issue #778: routes every range query of this engine by `span_ms`
+    /// rather than by its own `end − start`.
+    pub fn with_routing_span_ms(mut self, span_ms: i64) -> Self {
+        self.routing_span_ms = Some(span_ms);
+        self
+    }
+
+    /// Issue #778: the staleness lookback this engine plans with.
+    pub fn lookback_ms(&self) -> i64 {
+        self.lookback_ms
+    }
+
+    /// Issue #778: the rollup resolution a range query over `p` reads at,
+    /// `None` raw.
+    pub fn resolution_ms(&self, p: &MetricQueryParams) -> Option<i64> {
+        let levels = self
+            .rollup_levels
+            .as_ref()
+            .and_then(|slot| slot.get())
+            .filter(|l| !l.levels.is_empty())?;
+        super::rollup::resolution(p, &levels)
+    }
+
+    /// Issue #778: the facts the read cache decides on, from planning
+    /// alone; no statement is sent.
+    pub fn plan_facts(&self, expr: &Expr, p: &MetricQueryParams) -> Result<PlanFacts, ReadError> {
+        let plan = pulsus_promql::plan(
+            expr,
+            p.plan_params(self.config.experimental_functions, self.lookback_ms),
+        )?;
+        Ok(plan_facts_of(&plan))
+    }
+
+    /// Issue #778: [`MetricsEngine::query`] plus what it charged.
+    pub async fn query_with_facts(
+        &self,
+        tenant: &Tenant,
+        expr: &Expr,
+        p: &MetricQueryParams,
+    ) -> Result<(QueryResult, pulsus_promql::Annotations, QueryFacts), ReadError> {
+        let mut facts = QueryFacts {
+            charged_samples: 0,
+            plan: PlanFacts {
+                shape_allowed: false,
+                oldest_input_ms: i64::MAX,
+                reach_ms: 0,
+            },
+        };
+        let (result, annotations) = self
+            .query_inner_facts(tenant, expr, p, None, Some(&mut facts))
+            .await?;
+        Ok((result, annotations, facts))
     }
 
     /// Issue #18 part B: the process-wide rollup level list the router
@@ -625,6 +722,10 @@ impl MetricsEngine {
     /// Issue #803: the first server failure this engine's reads met since
     /// its client was bound.
     pub fn server_failure(&self) -> Option<pulsus_clickhouse::ServerFailure> {
+        #[cfg(test)]
+        if let Some(f) = &self.injected_failure {
+            return Some(f.clone());
+        }
         self.dispatch.server_failure()
     }
 
@@ -717,7 +818,18 @@ impl MetricsEngine {
         tenant: &Tenant,
         expr: &Expr,
         p: &MetricQueryParams,
+        explain: Option<&mut PlanExplain>,
+    ) -> Result<(QueryResult, pulsus_promql::Annotations), ReadError> {
+        self.query_inner_facts(tenant, expr, p, explain, None).await
+    }
+
+    async fn query_inner_facts(
+        &self,
+        tenant: &Tenant,
+        expr: &Expr,
+        p: &MetricQueryParams,
         mut explain: Option<&mut PlanExplain>,
+        facts: Option<&mut QueryFacts>,
     ) -> Result<(QueryResult, pulsus_promql::Annotations), ReadError> {
         let budget = SampleBudget::new(self.config.max_samples);
         let levels = self
@@ -727,15 +839,23 @@ impl MetricsEngine {
             .filter(|l| !l.levels.is_empty());
         let plan_params = p.plan_params(self.config.experimental_functions, self.lookback_ms);
         let mut plan = pulsus_promql::plan(expr, plan_params)?;
+        let plan_facts = facts.as_ref().map(|_| plan_facts_of(&plan));
+        // Issue #778: the resolution a range query is routed at, from the
+        // routing span when one is set.
+        let width = levels.as_ref().and_then(|lv| match self.routing_span_ms {
+            Some(span) => super::rollup::resolution_for_span(span, p.step_ms, lv),
+            None => super::rollup::resolution(p, lv),
+        });
         // Issue #18: a range query whose range selects a level, and whose
         // selectors that level or a finer one serves at its bucket ends, is
         // read at them (`rollup::lattice`).
         let lattice = levels.as_ref().filter(|_| p.step_ms > 0).and_then(|lv| {
-            super::rollup::lattice(&plan, p, lv).map(|l| (std::sync::Arc::clone(lv), l))
+            super::rollup::lattice_with(&plan, p, lv, width?)
+                .map(|l| (std::sync::Arc::clone(lv), l))
         });
         let data = match lattice {
             None => {
-                let routing = request_grid_routing(p, levels);
+                let routing = request_grid_routing(p, levels, self.routing_span_ms);
                 round_on_request_grid(&mut plan, routing.as_ref());
                 self.read_selectors(tenant, &plan, p, routing, true, &budget, explain)
                     .await?
@@ -818,6 +938,12 @@ impl MetricsEngine {
             pulsus_promql::evaluate_cancellable,
         )
         .await?;
+        if let (Some(f), Some(pf)) = (facts, plan_facts) {
+            *f = QueryFacts {
+                charged_samples: budget.used(),
+                plan: pf,
+            };
+        }
         Ok((value_to_query_result(value), annotations))
     }
 
@@ -4415,12 +4541,16 @@ fn instant_push_declined(explain: Option<&mut PlanExplain>, reason: super::group
 fn request_grid_routing(
     p: &MetricQueryParams,
     levels: Option<std::sync::Arc<super::rollup::Levels>>,
+    routing_span_ms: Option<i64>,
 ) -> Option<(std::sync::Arc<super::rollup::Levels>, i64)> {
     levels.and_then(|levels| {
         let res = if p.step_ms == 0 {
             Some(levels.levels[0].res_ms)
         } else {
-            super::rollup::resolution(p, &levels)
+            match routing_span_ms {
+                Some(span) => super::rollup::resolution_for_span(span, p.step_ms, &levels),
+                None => super::rollup::resolution(p, &levels),
+            }
         };
         res.map(|res| (levels, res))
     })
@@ -5803,6 +5933,35 @@ fn vector_to_query_result(vector: Vec<InstantSample>) -> QueryResult {
 /// (`vector_to_query_result`/the plain `QueryResult::Matrix` arm), so float
 /// output stays byte-identical (AC5) and no path emits `0.0` for a
 /// histogram.
+/// Issue #778: [`PlanFacts`] of a planned query.
+fn plan_facts_of(plan: &pulsus_promql::QueryPlan) -> PlanFacts {
+    let oldest_input_ms = plan
+        .selectors
+        .iter()
+        .map(|s| s.fetch_window(&plan.params).0)
+        .min()
+        .unwrap_or(i64::MAX);
+    let reach_ms = plan
+        .selectors
+        .iter()
+        .map(|s| {
+            let upper_extra = if s.smoothed {
+                plan.params.lookback_ms
+            } else {
+                0
+            };
+            upper_extra - s.fetch.total_offset_ms
+        })
+        .max()
+        .unwrap_or(0)
+        .max(0);
+    PlanFacts {
+        shape_allowed: super::read_cache::shape_allowed(plan),
+        oldest_input_ms,
+        reach_ms,
+    }
+}
+
 fn value_to_query_result(value: QueryValue) -> QueryResult {
     match value {
         QueryValue::Vector(v) => {
@@ -6079,6 +6238,8 @@ mod tests {
         // is the plain hash join.
         assert_eq!(s.get("distributed_product_mode"), Some("local"));
         assert_eq!(s.get("join_algorithm"), Some("hash"));
+        // U42 (issue #778, addendum 6): the sweep names its task.
+        assert_eq!(s.get("log_comment"), Some("background:label-cache-sweep"));
     }
 
     #[test]

@@ -280,6 +280,14 @@ impl Annotations {
         self.items.is_empty()
     }
 
+    /// Issue #778: `true` when an item carries a
+    /// [`ForcedMonotonicityDetail`], the one kind [`Self::add_item`] merges by
+    /// widening: its rendered text depends on every firing, so it cannot be
+    /// compared across an evaluation split in time.
+    pub fn has_mergeable(&self) -> bool {
+        self.items.iter().any(|i| i.detail.is_some())
+    }
+
     /// Merges `other`'s items into `self`, preserving dedup and merging
     /// detail payloads on key collision — upstream `Annotations.Merge`
     /// (`annotations.go:58-75`), which applies the same `annoError.Merge`
