@@ -1818,17 +1818,16 @@ impl MetricsEngine {
                         }),
                     PushResult::Instant { .. } => (0.0, 0.0),
                 };
-            let has_level =
-                matches!(&result, PushResult::Range { level_sides, .. } if !level_sides.is_empty());
             // `hist_n` counts the node's `Level` sides and the other listed
             // routed selectors; its own sentinel also counts a `Raw` side.
             if hist_n > 0.0 {
                 scope.saw_histograms();
             }
-            // F6: a node whose statement counted a histogram, its own or
-            // another listed routed selector's on a `Level` side, falls back.
+            // F6: a node falls back on its own sides' histograms alone. One
+            // whose statement counted only another selector's keeps its
+            // answer here, and is read again raw below, one statement a side.
             let reason = match &result {
-                PushResult::Range { .. } if own > 0.0 || (hist_n > 0.0 && has_level) => Some((
+                PushResult::Range { .. } if own > 0.0 => Some((
                     "declined: HistogramSamples",
                     "issue #579: the window holds histogram samples; this selector \
                      takes the sample fetch",
