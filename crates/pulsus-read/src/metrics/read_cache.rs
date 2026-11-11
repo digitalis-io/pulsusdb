@@ -1896,13 +1896,12 @@ mod tests {
         }
     }
 
-    fn request<'a>(q: &'a str, p: MetricQueryParams, max_samples: u64) -> RangeRequest<'a> {
+    fn request<'a>(q: &'a str, p: MetricQueryParams) -> RangeRequest<'a> {
         RangeRequest {
             key: key_for(q, &p),
             query: q,
             params: p,
             facts: allowed(),
-            max_samples,
             retention_floor_ms: Some(i64::MIN),
             sweep_time_ms: None,
         }
@@ -1931,8 +1930,11 @@ mod tests {
 
     type R = Result<Evaluated, ()>;
 
+    /// `run_with`, returning the result. A full or tail evaluation whose
+    /// charge passes `cap` is refused with `Err`, as the engine's budget
+    /// refuses it.
     #[allow(clippy::too_many_arguments)]
-    async fn run_with(
+    async fn try_run_with(
         r: &Rig,
         calls: &Calls,
         req: RangeRequest<'_>,
@@ -1940,11 +1942,15 @@ mod tests {
         full_charge: u64,
         tail_ann: Annotations,
         tail_charge: u64,
+        cap: u64,
         during_tail: impl FnOnce(),
-    ) -> Answer {
+    ) -> Result<Answer, ()> {
         let full = |q: MetricQueryParams| {
             calls.full.fetch_add(1, Ordering::SeqCst);
             async move {
+                if full_charge > cap {
+                    return Err(());
+                }
                 R::Ok((
                     grid_matrix(&q, 0.0),
                     full_ann,
@@ -1956,6 +1962,9 @@ mod tests {
             calls.tail.fetch_add(1, Ordering::SeqCst);
             during_tail();
             async move {
+                if tail_charge > cap {
+                    return Err(());
+                }
                 R::Ok((
                     grid_matrix(&q, 0.0),
                     tail_ann,
@@ -1963,9 +1972,43 @@ mod tests {
                 ))
             }
         };
-        answer_range(&r.cache, req, full, tail, |_| (), &always)
-            .await
-            .expect("answered")
+        answer_range(&r.cache, req, full, tail, &always).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_with(
+        r: &Rig,
+        calls: &Calls,
+        req: RangeRequest<'_>,
+        full_ann: Annotations,
+        full_charge: u64,
+        tail_ann: Annotations,
+        tail_charge: u64,
+        during_tail: impl FnOnce(),
+    ) -> Answer {
+        try_run_with(
+            r,
+            calls,
+            req,
+            full_ann,
+            full_charge,
+            tail_ann,
+            tail_charge,
+            u64::MAX,
+            during_tail,
+        )
+        .await
+        .expect("answered")
+    }
+
+    fn counts(c: &Calls) -> (usize, usize) {
+        (c.tail.load(Ordering::SeqCst), c.full.load(Ordering::SeqCst))
+    }
+
+    fn info(text: &str) -> Annotations {
+        let mut a = Annotations::new();
+        a.info_at(0, text);
+        a
     }
 
     async fn run(r: &Rig, calls: &Calls, req: RangeRequest<'_>) -> Answer {
@@ -2040,7 +2083,6 @@ mod tests {
     #[test]
     fn u4_merge_keeps_continuing_series_and_drops_series_out_of_range() {
         let entry = Entry {
-            annotations: Vec::new(),
             series: vec![
                 (
                     labels("a"),
@@ -2051,7 +2093,6 @@ mod tests {
             c0_ms: 0,
             c1_ms: 20,
             first_fill_ms: 0,
-            charge_bound: 0,
             bytes: 0,
             reads: ReadMix::Unrouted,
         };
@@ -2114,12 +2155,10 @@ mod tests {
     #[test]
     fn u5_a_histogram_point_makes_the_answer_matrix_hist_only_while_in_range() {
         let entry = Entry {
-            annotations: Vec::new(),
             series: vec![(labels("a"), Points::Float(vec![(0, 1.0), (10, 2.0)]))],
             c0_ms: 0,
             c1_ms: 10,
             first_fill_ms: 0,
-            charge_bound: 0,
             bytes: 0,
             reads: ReadMix::Unrouted,
         };
@@ -2169,12 +2208,10 @@ mod tests {
 
     fn small_entry() -> Entry {
         Entry {
-            annotations: Vec::new(),
             series: vec![(labels("a"), Points::Float(vec![(0, 1.0)]))],
             c0_ms: 0,
             c1_ms: 0,
             first_fill_ms: 0,
-            charge_bound: 0,
             bytes: 0,
             reads: ReadMix::Unrouted,
         }
@@ -2213,21 +2250,15 @@ mod tests {
         let c = Calls::default();
         let q = "rate(x[5m])";
         let p = window(&r, 1_800_000);
-        assert_eq!(
-            run(&r, &c, request(q, p, u64::MAX)).await.header,
-            Header::Miss
-        );
+        assert_eq!(run(&r, &c, request(q, p)).await.header, Header::Miss);
         r.advance(ENTRY_MAX_AGE_MS - 1);
         r.refresh_identity();
         // Control: a millisecond inside T_max the entry still serves.
-        let a = run(&r, &c, request(q, p, u64::MAX)).await;
+        let a = run(&r, &c, request(q, p)).await;
         assert_eq!(a.outcome, Outcome::Hit, "control");
         r.advance(1);
         r.refresh_identity();
-        assert_eq!(
-            run(&r, &c, request(q, p, u64::MAX)).await.outcome,
-            Outcome::Miss
-        );
+        assert_eq!(run(&r, &c, request(q, p)).await.outcome, Outcome::Miss);
     }
 
     fn warned(text: &str) -> Annotations {
@@ -2236,53 +2267,44 @@ mod tests {
         a
     }
 
+    /// T8 (#835): a tail with annotations is answered from it, and the
+    /// merge is not kept.
     #[tokio::test]
-    async fn u10_tail_annotations_other_than_the_entry_s_mean_a_full_evaluation() {
+    async fn u10_a_tail_with_annotations_is_answered_from_it_and_not_kept() {
         let r = rig();
         let c = Calls::default();
         let q = "rate(x[5m])";
         let p = window(&r, 0);
+        assert_eq!(run(&r, &c, request(q, p)).await.header, Header::Miss);
+        let key = key_for(q, &p);
+        let before = r.cache.lookup(&key).expect("kept");
+        r.advance(60_000);
+        r.refresh_identity();
+        let p2 = shifted(&p, 60_000);
         let a = run_with(
             &r,
             &c,
-            request(q, p, u64::MAX),
-            warned("x"),
-            10,
-            warned("x"),
-            10,
-            || {},
-        )
-        .await;
-        assert_eq!(a.header, Header::Miss);
-        // Control: the same annotations hit.
-        let a = run_with(
-            &r,
-            &c,
-            request(q, p, u64::MAX),
-            warned("x"),
-            10,
-            warned("x"),
-            10,
-            || {},
-        )
-        .await;
-        assert_eq!(a.outcome, Outcome::Hit, "control");
-        let a = run_with(
-            &r,
-            &c,
-            request(q, p, u64::MAX),
-            warned("x"),
+            request(q, p2),
+            Annotations::new(),
             10,
             warned("y"),
             10,
             || {},
         )
         .await;
-        assert_eq!(a.outcome, Outcome::Miss);
+        assert_eq!(a.outcome, Outcome::Hit);
+        assert_eq!(
+            a.annotations.base_messages(),
+            warned("y").base_messages(),
+            "the tail's annotations"
+        );
+        assert_eq!(counts(&c), (1, 1), "(tail, full)");
+        assert_eq!(*r.cache.lookup(&key).expect("kept"), *before, "unchanged");
     }
 
+    /// T1 (#835): tenant and phase part the key; the range length does not.
     #[test]
-    fn u11_tenant_phase_and_span_each_part_the_key() {
+    fn u11_tenant_and_phase_part_the_key_and_length_does_not() {
         let k = |t: &str, phase: i64, span: i64| {
             let p = params(1_000_000 + phase, 1_000_000 + phase + span, 15_000);
             CacheKey::new(tenant(t), "up", &p, 300_000, None)
@@ -2297,29 +2319,35 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        assert_eq!(keys.len(), 6);
+        assert_eq!(keys.len(), 4);
+        assert_eq!(k("a", 0, 7_200_000), k("a", 0, 10_800_000));
+        // Guard: the resolution still parts the key.
+        let p = params(1_000_000, 8_200_000, 15_000);
+        assert_ne!(
+            CacheKey::new(tenant("a"), "up", &p, 300_000, Some(60_000)),
+            CacheKey::new(tenant("a"), "up", &p, 300_000, None)
+        );
     }
 
+    /// T9 (#835): a clear during the tail serves the merge and stores
+    /// nothing.
     #[tokio::test]
-    async fn u12_a_clear_between_the_tail_and_the_store_stores_nothing() {
+    async fn u12_a_clear_during_the_tail_serves_the_merge_and_stores_nothing() {
         let r = rig();
         let c = Calls::default();
         let q = "rate(x[5m])";
         let p = window(&r, 0);
-        assert_eq!(
-            run(&r, &c, request(q, p, u64::MAX)).await.header,
-            Header::Miss
-        );
+        assert_eq!(run(&r, &c, request(q, p)).await.header, Header::Miss);
         // Control: a hit.
         assert_eq!(
-            run(&r, &c, request(q, p, u64::MAX)).await.outcome,
+            run(&r, &c, request(q, p)).await.outcome,
             Outcome::Hit,
             "control"
         );
         let a = run_with(
             &r,
             &c,
-            request(q, p, u64::MAX),
+            request(q, p),
             Annotations::new(),
             10,
             Annotations::new(),
@@ -2327,7 +2355,9 @@ mod tests {
             || r.cache.clear(),
         )
         .await;
-        assert_eq!(a.outcome, Outcome::Miss);
+        assert_eq!(a.outcome, Outcome::Hit);
+        assert_eq!(a.result, grid_matrix(&p, 0.0), "the merge");
+        assert_eq!(c.full.load(Ordering::SeqCst), 1, "the fill alone");
         assert!(r.cache.lookup(&key_for(q, &p)).is_none(), "nothing stored");
         assert_eq!(r.cache.usage().1, 0);
     }
@@ -2338,8 +2368,6 @@ mod tests {
         use std::mem::size_of;
         let mut n = size_of::<CacheKey>() + key.query.len() + key.tenant.as_str().len();
         n += size_of::<Entry>() + ENTRY_OVERHEAD_BYTES as usize;
-        n += e.annotations.capacity() * size_of::<String>();
-        n += e.annotations.iter().map(|a| a.capacity()).sum::<usize>();
         n += e.series.capacity() * size_of::<(Vec<(String, String)>, Points)>();
         let mut flat_counted = 0;
         for (labels, points) in &e.series {
@@ -2389,7 +2417,7 @@ mod tests {
                 })
                 .collect(),
         );
-        let e = keep(&floats, p.start_ms, p.end_ms, Vec::new(), 0, 0).expect("a matrix");
+        let e = keep(&floats, p.start_ms, p.end_ms, 0).expect("a matrix");
         assert_eq!(e.series.len(), 3);
         let flats: Vec<&Arc<[(i64, f64)]>> = e
             .series
@@ -2431,7 +2459,7 @@ mod tests {
             labels: labels("h"),
             points: spare,
         }]);
-        let e = keep(&hists, p.start_ms, p.end_ms, Vec::new(), 0, 0).expect("a matrix");
+        let e = keep(&hists, p.start_ms, p.end_ms, 0).expect("a matrix");
         let Points::Mixed(v) = &e.series[0].1 else {
             panic!("a histogram series stays Mixed: {:?}", e.series[0].1)
         };
@@ -2448,28 +2476,207 @@ mod tests {
         assert_eq!(charge(&key, &e) as usize, independent_charge(&key, &e));
     }
 
+    /// T4 (#835): an hour of refreshes stays answerable: each hit is
+    /// judged by its own tail alone.
     #[tokio::test]
-    async fn u14_a_hit_whose_charge_could_pass_the_cap_is_evaluated_in_full() {
+    async fn u14_an_hour_of_refreshes_stays_answerable() {
         let r = rig();
         let c = Calls::default();
         let q = "rate(x[5m])";
-        let p = window(&r, 0);
-        let go = |tail_charge: u64| {
-            run_with(
+        let mut p = window(&r, 0);
+        let first = try_run_with(
+            &r,
+            &c,
+            request(q, p),
+            Annotations::new(),
+            900,
+            Annotations::new(),
+            100,
+            1_000,
+            || {},
+        )
+        .await
+        .expect("answered");
+        assert_eq!(first.header, Header::Miss);
+        let mut hits = 0;
+        loop {
+            r.advance(15_000);
+            r.refresh_identity();
+            p = shifted(&p, 15_000);
+            let a = try_run_with(
                 &r,
                 &c,
-                request(q, p, 1_000),
+                request(q, p),
                 Annotations::new(),
                 900,
                 Annotations::new(),
-                tail_charge,
+                100,
+                1_000,
                 || {},
             )
+            .await
+            .expect("answered");
+            if r.now() - V >= ENTRY_MAX_AGE_MS {
+                assert_eq!(a.outcome, Outcome::Miss, "at first_fill + 1 h");
+                break;
+            }
+            assert_eq!(a.outcome, Outcome::Hit, "refresh {}", hits + 1);
+            hits += 1;
+        }
+        assert_eq!(hits, 239);
+        assert_eq!(c.full.load(Ordering::SeqCst), 2, "the fill and the miss");
+    }
+
+    /// T2 (#835): a growing range is one entry, and every request hits.
+    #[tokio::test]
+    async fn u23_a_growing_range_is_one_entry_and_hits() {
+        let r = rig();
+        let c = Calls::default();
+        let q = "rate(x[5m])";
+        let p0 = window(&r, 0);
+        let (s, e) = (p0.start_ms, p0.end_ms);
+        assert_eq!(run(&r, &c, request(q, p0)).await.header, Header::Miss);
+        for n in 1..=2 {
+            r.advance(60_000);
+            r.refresh_identity();
+            let pn = params(s, e + n * 60_000, 15_000);
+            let a = run(&r, &c, request(q, pn)).await;
+            assert_eq!(a.outcome, Outcome::Hit, "request {n}");
+            assert_eq!(a.result, grid_matrix(&pn, 0.0), "answer {n}");
+        }
+        assert_eq!(counts(&c), (2, 1), "(tail, full)");
+        assert_eq!(r.cache.usage().1, 1, "one entry");
+        let kept = r.cache.lookup(&key_for(q, &p0)).expect("kept");
+        assert_eq!(kept.c0_ms, s);
+        let QueryResult::Matrix(m) =
+            &merge(&kept, QueryResult::Matrix(Vec::new()), s, kept.c1_ms).expect("a matrix")
+        else {
+            panic!("a matrix")
         };
-        assert_eq!(go(0).await.header, Header::Miss);
-        // Control: 900 + 100 is within the cap.
-        assert_eq!(go(100).await.outcome, Outcome::Hit, "control");
-        assert_eq!(go(200).await.outcome, Outcome::Miss);
+        assert_eq!(
+            m[0].points.len() as i64,
+            (kept.c1_ms - s) / 15_000 + 1,
+            "every kept point"
+        );
+    }
+
+    /// T3 (#835): a grown entry past the tenant share keeps the request's
+    /// range instead, with no eviction counted.
+    #[tokio::test]
+    async fn u24_a_grown_entry_past_the_share_keeps_the_request_s_range() {
+        let q = "rate(x[5m])";
+        let six = |r: &Rig| {
+            let end = r.now().div_euclid(15_000) * 15_000;
+            params(end - 21_600_000, end, 15_000)
+        };
+        // The bytes of a 6 h fill.
+        let probe = rig();
+        run(&probe, &Calls::default(), request(q, six(&probe))).await;
+        let b6 = probe.cache.usage().0;
+        assert!(b6 > 0, "a 6 h fill is stored");
+        let r = rig_with(2 * b6, 50, false);
+        r.refresh_identity();
+        let c = Calls::default();
+        let p6 = six(&r);
+        assert_eq!(run(&r, &c, request(q, p6)).await.header, Header::Miss);
+        let evictions = r.cache.snapshot().evictions_total;
+        r.advance(60_000);
+        r.refresh_identity();
+        let end = p6.end_ms + 60_000;
+        let p3 = params(end - 10_800_000, end, 15_000);
+        let a = run(&r, &c, request(q, p3)).await;
+        assert_eq!(a.outcome, Outcome::Hit);
+        let key = key_for(q, &p3);
+        let kept = r.cache.lookup(&key).expect("kept");
+        assert_eq!(kept.c0_ms, p3.start_ms, "the request's range");
+        assert_eq!(r.cache.snapshot().evictions_total, evictions, "no eviction");
+        assert_eq!(kept.bytes, charge(&key, &kept));
+    }
+
+    /// The 6 h fill and the 3 h request one minute later of T5 and T6.
+    async fn shorter_after_longer(tail_charge: u64) -> (Result<Answer, ()>, Calls) {
+        let r = rig();
+        let c = Calls::default();
+        let q = "rate(x[5m])";
+        let end = r.now().div_euclid(15_000) * 15_000;
+        let p6 = params(end - 21_600_000, end, 15_000);
+        let fill = try_run_with(
+            &r,
+            &c,
+            request(q, p6),
+            Annotations::new(),
+            900,
+            Annotations::new(),
+            0,
+            1_000,
+            || {},
+        )
+        .await
+        .expect("the fill");
+        assert_eq!(fill.header, Header::Miss);
+        r.advance(60_000);
+        r.refresh_identity();
+        let p3 = params(end + 60_000 - 10_800_000, end + 60_000, 15_000);
+        let a = try_run_with(
+            &r,
+            &c,
+            request(q, p3),
+            Annotations::new(),
+            900,
+            Annotations::new(),
+            tail_charge,
+            1_000,
+            || {},
+        )
+        .await;
+        (a, c)
+    }
+
+    /// T5 (#835): a shorter unrouted request on a longer entry is judged
+    /// by its tail.
+    #[tokio::test]
+    async fn u25_a_shorter_unrouted_request_on_a_longer_entry_is_judged_by_its_tail() {
+        let (a, c) = shorter_after_longer(200).await;
+        assert_eq!(a.expect("answered").outcome, Outcome::Hit);
+        assert_eq!(counts(&c), (1, 1), "(tail, full)");
+    }
+
+    /// T6 (#835): a tail past the cap is refused, in one statement.
+    #[tokio::test]
+    async fn u27_a_tail_past_the_cap_is_refused_in_one_statement() {
+        let (a, c) = shorter_after_longer(1_001).await;
+        assert!(a.is_err(), "refused");
+        assert_eq!(counts(&c), (1, 1), "(tail, full): the fill alone");
+    }
+
+    /// T7 (#835): an answer with a warning or an info is not kept.
+    #[tokio::test]
+    async fn u26_an_answer_with_a_warning_or_info_is_not_kept() {
+        let q = "rate(x[5m])";
+        for (what, ann) in [("warning", warned("w")), ("info", info("i"))] {
+            let r = rig();
+            let p = window(&r, 0);
+            let c = Calls::default();
+            let a = run_with(
+                &r,
+                &c,
+                request(q, p),
+                ann.clone(),
+                10,
+                ann.clone(),
+                10,
+                || {},
+            )
+            .await;
+            assert_eq!(a.header, Header::Bypass, "{what}");
+            assert!(
+                r.cache.lookup(&key_for(q, &p)).is_none(),
+                "{what}: not kept"
+            );
+            let c = Calls::default();
+            run_with(&r, &c, request(q, p), ann.clone(), 10, ann, 10, || {}).await;
+            assert_eq!(counts(&c), (0, 1), "{what}: the repeat is a full read");
+        }
     }
 
     #[test]
@@ -2523,16 +2730,13 @@ mod tests {
         let c = Calls::default();
         let q = "rate(x[5m])";
         let p = window(&r, 0);
-        assert_eq!(
-            run(&r, &c, request(q, p, u64::MAX)).await.header,
-            Header::Miss
-        );
+        assert_eq!(run(&r, &c, request(q, p)).await.header, Header::Miss);
         let before = r.cache.lookup(&key_for(q, &p)).expect("kept");
         r.advance(60_000);
         r.refresh_identity();
         lag(&r, 9);
         let p2 = shifted(&p, 60_000);
-        let a = run(&r, &c, request(q, p2, u64::MAX)).await;
+        let a = run(&r, &c, request(q, p2)).await;
         assert_eq!(a.outcome, Outcome::Hit);
         assert_eq!(a.through_ms, Some(before.c1_ms));
         let after = r.cache.lookup(&key_for(q, &p2)).expect("still kept");
@@ -2545,19 +2749,13 @@ mod tests {
         let c = Calls::default();
         let q = "rate(x[5m])";
         let p = window(&r, 1_800_000);
-        assert_eq!(
-            run(&r, &c, request(q, p, u64::MAX)).await.header,
-            Header::Miss
-        );
+        assert_eq!(run(&r, &c, request(q, p)).await.header, Header::Miss);
         r.advance(11_000);
-        let a = run(&r, &c, request(q, p, u64::MAX)).await;
+        let a = run(&r, &c, request(q, p)).await;
         assert_eq!(a.header, Header::Bypass, "no hit and nothing stored");
         assert_eq!(a.outcome, Outcome::Miss);
         r.refresh_identity();
-        assert_eq!(
-            run(&r, &c, request(q, p, u64::MAX)).await.outcome,
-            Outcome::Hit
-        );
+        assert_eq!(run(&r, &c, request(q, p)).await.outcome, Outcome::Hit);
     }
 
     #[tokio::test]
@@ -2566,17 +2764,14 @@ mod tests {
         let c = Calls::default();
         let q = "rate(x[5m])";
         let mut p = window(&r, 0);
-        assert_eq!(
-            run(&r, &c, request(q, p, u64::MAX)).await.header,
-            Header::Miss
-        );
+        assert_eq!(run(&r, &c, request(q, p)).await.header, Header::Miss);
         let first = r.cache.lookup(&key_for(q, &p)).expect("kept").first_fill_ms;
         let mut hits = 0;
         loop {
             r.advance(60_000);
             r.refresh_identity();
             p = shifted(&p, 60_000);
-            let a = run(&r, &c, request(q, p, u64::MAX)).await;
+            let a = run(&r, &c, request(q, p)).await;
             if r.now() - first >= ENTRY_MAX_AGE_MS {
                 assert_eq!(a.outcome, Outcome::Miss, "at first_fill + T_max");
                 break;
@@ -2675,21 +2870,21 @@ mod tests {
         }
     }
 
+    /// T10 (#835): identity lapsing during the tail serves the merge.
     #[tokio::test]
-    async fn u21_identity_lapsing_during_the_tail_means_a_full_evaluation() {
+    async fn u21_identity_lapsing_during_the_tail_serves_the_merge() {
         let r = rig();
         let c = Calls::default();
         let q = "rate(x[5m])";
         let p = window(&r, 0);
-        assert_eq!(
-            run(&r, &c, request(q, p, u64::MAX)).await.header,
-            Header::Miss
-        );
+        assert_eq!(run(&r, &c, request(q, p)).await.header, Header::Miss);
+        let key = key_for(q, &p);
+        let before = r.cache.lookup(&key).expect("kept");
         let c = Calls::default();
         let a = run_with(
             &r,
             &c,
-            request(q, p, u64::MAX),
+            request(q, p),
             Annotations::new(),
             10,
             Annotations::new(),
@@ -2697,10 +2892,9 @@ mod tests {
             || r.advance(11_000),
         )
         .await;
-        assert_eq!(c.tail.load(Ordering::SeqCst), 1, "the tail ran");
-        assert_eq!(c.full.load(Ordering::SeqCst), 1, "then a full evaluation");
-        assert_eq!(a.outcome, Outcome::Miss);
-        assert_eq!(a.result, grid_matrix(&p, 0.0), "the full answer");
+        assert_eq!(counts(&c), (1, 0), "(tail, full)");
+        assert_eq!(a.outcome, Outcome::Hit);
+        assert_eq!(*r.cache.lookup(&key).expect("kept"), *before, "unchanged");
     }
 
     fn forced() -> Annotations {
@@ -2713,49 +2907,38 @@ mod tests {
         a
     }
 
+    /// T11 (#835): a mergeable annotation is never kept, and a tail with
+    /// one is answered from it.
     #[tokio::test]
-    async fn u22_a_mergeable_annotation_is_never_kept_nor_answered_from_kept_points() {
+    async fn u22_a_mergeable_annotation_is_never_kept_and_a_tail_with_one_is_answered() {
         let q = "histogram_quantile(0.9, rate(h_bucket[5m]))";
-        // (a) control: rendered annotations equal and no detail: a hit.
+        // (a) control: a clean entry and tail: a hit.
         let r = rig();
         let p = window(&r, 0);
         let c = Calls::default();
-        assert_eq!(
-            run(&r, &c, request(q, p, u64::MAX)).await.header,
-            Header::Miss
-        );
+        assert_eq!(run(&r, &c, request(q, p)).await.header, Header::Miss);
         let c = Calls::default();
-        let a = run(&r, &c, request(q, p, u64::MAX)).await;
-        assert_eq!(c.tail.load(Ordering::SeqCst), 1, "(a) tail");
-        assert_eq!(c.full.load(Ordering::SeqCst), 0, "(a) full");
+        let a = run(&r, &c, request(q, p)).await;
+        assert_eq!(counts(&c), (1, 0), "(a) (tail, full)");
         assert_eq!(a.outcome, Outcome::Hit, "(a)");
-        // (b) the tail carries a forced-monotonicity detail whose rendering
-        // equals the entry's.
-        let entry_text = rendered_annotations(&forced(), q);
+        // (b) the clean entry; the tail carries a forced-monotonicity info.
         let key = key_for(q, &p);
-        let mut e = (*r.cache.lookup(&key).expect("kept")).clone();
-        e.annotations = entry_text;
-        assert!(published(r.cache.store(
-            key.clone(),
-            e,
-            r.cache.generation()
-        )));
         let before = r.cache.lookup(&key).expect("kept");
         let c = Calls::default();
         let a = run_with(
             &r,
             &c,
-            request(q, p, u64::MAX),
-            forced(),
+            request(q, p),
+            Annotations::new(),
             10,
             forced(),
             10,
             || {},
         )
         .await;
-        assert_eq!(c.tail.load(Ordering::SeqCst), 1, "(b) tail");
-        assert_eq!(c.full.load(Ordering::SeqCst), 1, "(b) full");
-        assert_eq!(a.outcome, Outcome::Miss, "(b)");
+        assert_eq!(counts(&c), (1, 0), "(b) (tail, full)");
+        assert_eq!(a.outcome, Outcome::Hit, "(b)");
+        assert!(a.annotations.has_mergeable(), "(b) the tail's annotation");
         assert_eq!(
             *r.cache.lookup(&key).expect("kept"),
             *before,
@@ -2764,32 +2947,35 @@ mod tests {
         // (c) a miss whose answer carries one is not stored.
         let r = rig();
         let c = Calls::default();
-        let a = run_with(
-            &r,
-            &c,
-            request(q, p, u64::MAX),
-            forced(),
-            10,
-            forced(),
-            10,
-            || {},
-        )
-        .await;
+        let a = run_with(&r, &c, request(q, p), forced(), 10, forced(), 10, || {}).await;
         assert_eq!(a.header, Header::Bypass, "(c) not stored");
         let c = Calls::default();
-        run_with(
-            &r,
-            &c,
-            request(q, p, u64::MAX),
-            forced(),
-            10,
-            forced(),
-            10,
-            || {},
-        )
-        .await;
-        assert_eq!(c.tail.load(Ordering::SeqCst), 0, "(c) no tail");
-        assert_eq!(c.full.load(Ordering::SeqCst), 1, "(c) full");
+        run_with(&r, &c, request(q, p), forced(), 10, forced(), 10, || {}).await;
+        assert_eq!(counts(&c), (0, 1), "(c) (tail, full)");
+    }
+
+    /// T15 (#835): a clear after the hit's generation check stores
+    /// nothing; the merge is served.
+    #[tokio::test]
+    async fn u28_a_clear_after_the_check_stores_nothing() {
+        let r = rig();
+        let c = Calls::default();
+        let q = "rate(x[5m])";
+        let p = window(&r, 0);
+        assert_eq!(run(&r, &c, request(q, p)).await.header, Header::Miss);
+        let Rig { cache, clock } = r;
+        let r = Rig {
+            cache: cache.with_after_check(|c| c.clear()),
+            clock,
+        };
+        r.advance(60_000);
+        r.refresh_identity();
+        let p2 = shifted(&p, 60_000);
+        let a = run(&r, &c, request(q, p2)).await;
+        assert_eq!(a.outcome, Outcome::Hit);
+        assert_eq!(a.result, grid_matrix(&p2, 0.0), "the merge");
+        assert!(r.cache.lookup(&key_for(q, &p2)).is_none(), "nothing stored");
+        assert_eq!(r.cache.usage().1, 0);
     }
 
     /// A request with the cache off never reaches a cache, so no bypass
@@ -2819,15 +3005,7 @@ mod tests {
             })
             .collect();
         let (start, c1) = (50, 300);
-        let e = keep(
-            &QueryResult::Matrix(series.clone()),
-            start,
-            c1,
-            Vec::new(),
-            0,
-            0,
-        )
-        .expect("a matrix");
+        let e = keep(&QueryResult::Matrix(series.clone()), start, c1, 0).expect("a matrix");
         assert!(
             e.series.iter().all(|(_, p)| matches!(p, Points::Flat(..))),
             "keep made the float series Flat: {:?}",
@@ -2861,15 +3039,7 @@ mod tests {
                 points: (0..1_441).map(|i| (i * step, (i + j) as f64)).collect(),
             })
             .collect();
-        let e = keep(
-            &QueryResult::Matrix(entry_series.clone()),
-            0,
-            c1,
-            Vec::new(),
-            0,
-            0,
-        )
-        .expect("a matrix");
+        let e = keep(&QueryResult::Matrix(entry_series.clone()), 0, c1, 0).expect("a matrix");
         let tail: Vec<MatrixSeries> = (0..10)
             .map(|j| MatrixSeries {
                 labels: labels(&format!("s{j}")),
@@ -2961,10 +3131,7 @@ mod tests {
         let q = "rate(x[5m])";
         let p = window(&r, 0);
         let c = Calls::default();
-        assert_eq!(
-            run(&r, &c, request(q, p, u64::MAX)).await.header,
-            Header::Miss
-        );
+        assert_eq!(run(&r, &c, request(q, p)).await.header, Header::Miss);
         let Rig { cache, clock } = r;
         let cache = if clear {
             cache.with_after_merge(|c| c.clear())
@@ -2993,21 +3160,16 @@ mod tests {
                 EvalFacts::unrouted(10),
             ))
         };
-        let a = answer_range(
-            &r.cache,
-            request(q, p, u64::MAX),
-            full,
-            tail,
-            |_| (),
-            &always,
-        )
-        .await
-        .expect("answered");
+        let a = answer_range(&r.cache, request(q, p), full, tail, &always)
+            .await
+            .expect("answered");
         (a, p, full_calls.load(Ordering::SeqCst))
     }
 
+    /// U37, after #835: a clear after the merge serves the merge and
+    /// stores nothing; no full evaluation follows.
     #[tokio::test]
-    async fn u37_a_clear_after_the_merge_means_a_full_evaluation() {
+    async fn u37_a_clear_after_the_merge_serves_the_merge_and_stores_nothing() {
         // Control: no clear, a hit, the full closure not called.
         let (a, _, full) = u37_case(false, true, false).await;
         assert_eq!(a.header, Header::Hit, "control");
@@ -3016,15 +3178,15 @@ mod tests {
         assert_eq!(a.header, Header::Hit, "control, no fill");
         assert_eq!(full, 0, "control, no fill");
         // (a) fills allowed: the store finds the generation moved.
-        let (a, p, full) = u37_case(false, true, true).await;
-        assert_eq!(full, 1, "(a) full");
-        assert_eq!(a.result, grid_matrix(&p, 1_000.0), "(a) the full answer");
-        assert_ne!(a.header, Header::Hit, "(a)");
+        let (a, _, full) = u37_case(false, true, true).await;
+        assert_eq!(full, 0, "(a) full");
+        assert_eq!(a.header, Header::Hit, "(a)");
+        assert_eq!(a.through_ms, None, "(a) nothing stored");
         // (b) fills not allowed: the final generation read finds it moved.
-        let (a, p, full) = u37_case(true, false, true).await;
-        assert_eq!(full, 1, "(b) full");
-        assert_eq!(a.result, grid_matrix(&p, 1_000.0), "(b) the full answer");
-        assert_ne!(a.header, Header::Hit, "(b)");
+        let (a, _, full) = u37_case(true, false, true).await;
+        assert_eq!(full, 0, "(b) full");
+        assert_eq!(a.header, Header::Hit, "(b)");
+        assert_eq!(a.through_ms, None, "(b) nothing kept");
     }
 
     // --- addendum 6 -------------------------------------------------------------
@@ -3040,13 +3202,9 @@ mod tests {
     #[tokio::test]
     async fn u40_an_answer_with_no_kept_series_is_not_stored() {
         // (a) empty answers, float and histogram.
+        assert_eq!(keep(&QueryResult::Matrix(vec![]), 0, 100, 0), None, "(a)");
         assert_eq!(
-            keep(&QueryResult::Matrix(vec![]), 0, 100, Vec::new(), 0, 0),
-            None,
-            "(a)"
-        );
-        assert_eq!(
-            keep(&QueryResult::MatrixHist(vec![]), 0, 100, Vec::new(), 0, 0),
+            keep(&QueryResult::MatrixHist(vec![]), 0, 100, 0),
             None,
             "(a) histogram"
         );
@@ -3055,22 +3213,18 @@ mod tests {
             labels: labels("a"),
             points: vec![(110, 1.0), (120, 2.0)],
         }]);
-        assert_eq!(keep(&after, 0, 100, Vec::new(), 0, 0), None, "(b)");
+        assert_eq!(keep(&after, 0, 100, 0), None, "(b)");
         let after_hist = QueryResult::MatrixHist(vec![HistMatrixSeries {
             labels: labels("a"),
             points: vec![(110, HistOrFloat::Hist(hist()))],
         }]);
-        assert_eq!(
-            keep(&after_hist, 0, 100, Vec::new(), 0, 0),
-            None,
-            "(b) histogram"
-        );
+        assert_eq!(keep(&after_hist, 0, 100, 0), None, "(b) histogram");
         // Control: a kept point makes an entry.
         let kept = QueryResult::Matrix(vec![MatrixSeries {
             labels: labels("a"),
             points: vec![(100, 1.0)],
         }]);
-        assert!(keep(&kept, 0, 100, Vec::new(), 0, 0).is_some(), "control");
+        assert!(keep(&kept, 0, 100, 0).is_some(), "control");
         // (c) through `answer_range`: an empty answer, then 41 points.
         let r = rig();
         let end = r.now().div_euclid(15_000) * 15_000;
@@ -3093,14 +3247,7 @@ mod tests {
                     ))
                 }
             };
-            answer_range(
-                &r.cache,
-                request(q, p, u64::MAX),
-                full,
-                tail,
-                |_| (),
-                &always,
-            )
+            answer_range(&r.cache, request(q, p), full, tail, &always)
         };
         let first = go(QueryResult::Matrix(vec![])).await.expect("answered");
         assert_eq!(first.header, Header::Bypass, "(c) first header");
@@ -3159,7 +3306,7 @@ mod tests {
             }
         };
         let guard = || !failed.load(Ordering::SeqCst);
-        answer_range(&r.cache, req, full, tail, |_| (), &guard)
+        answer_range(&r.cache, req, full, tail, &guard)
             .await
             .expect("answered")
     }
@@ -3172,12 +3319,12 @@ mod tests {
         let failed = std::sync::atomic::AtomicBool::new(false);
         // (a) a miss.
         let c = Calls::default();
-        let a = run_guarded(&r, &c, request(q, p, u64::MAX), &failed, true).await;
+        let a = run_guarded(&r, &c, request(q, p), &failed, true).await;
         assert_eq!(a.header, Header::Bypass, "(a) flagged: header");
         assert_eq!(a.outcome, Outcome::Miss, "(a) flagged: outcome");
         assert_eq!(r.cache.usage().1, 0, "(a) flagged: nothing stored");
         failed.store(false, Ordering::SeqCst);
-        let a = run_guarded(&r, &c, request(q, p, u64::MAX), &failed, false).await;
+        let a = run_guarded(&r, &c, request(q, p), &failed, false).await;
         assert_eq!(a.header, Header::Miss, "(a) control");
         assert_eq!(r.cache.usage().1, 1, "(a) control: stored");
         // (b) a hit.
@@ -3186,7 +3333,7 @@ mod tests {
         r.refresh_identity();
         let p2 = shifted(&p, 60_000);
         let c = Calls::default();
-        let a = run_guarded(&r, &c, request(q, p2, u64::MAX), &failed, true).await;
+        let a = run_guarded(&r, &c, request(q, p2), &failed, true).await;
         assert_eq!(a.outcome, Outcome::Hit, "(b) flagged: outcome");
         assert_eq!(c.tail.load(Ordering::SeqCst), 1, "(b) flagged: tail");
         assert_eq!(
@@ -3195,7 +3342,7 @@ mod tests {
             "(b) flagged: the entry is unchanged"
         );
         failed.store(false, Ordering::SeqCst);
-        let a = run_guarded(&r, &c, request(q, p2, u64::MAX), &failed, false).await;
+        let a = run_guarded(&r, &c, request(q, p2), &failed, false).await;
         assert_eq!(a.outcome, Outcome::Hit, "(b) control");
         assert!(
             r.cache.lookup(&key_for(q, &p2)).expect("kept").c1_ms > before.c1_ms,
@@ -3313,16 +3460,9 @@ mod tests {
                                 EvalFacts::unrouted(10),
                             ))
                         };
-                        answer_range(
-                            &shared,
-                            request(q, p2, u64::MAX),
-                            full,
-                            tail,
-                            |_| (),
-                            &always,
-                        )
-                        .await
-                        .expect("answered")
+                        answer_range(&shared, request(q, p2), full, tail, &always)
+                            .await
+                            .expect("answered")
                     });
                     let _ = tx.send((answer, full_calls.load(Ordering::SeqCst)));
                 });
@@ -3363,7 +3503,7 @@ mod tests {
                 EvalFacts::unrouted(10),
             ))
         };
-        let a = answer_range(&cache, request(q, p, u64::MAX), full, tail, |_| (), &always)
+        let a = answer_range(&cache, request(q, p), full, tail, &always)
             .await
             .expect("answered");
         assert_eq!(a.header, Header::Miss, "the fill");
