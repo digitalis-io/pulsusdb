@@ -73,8 +73,8 @@ async fn engine_for(
 /// What a request sets on its engine beyond the defaults: its
 /// `lookback_delta`, and (issues #778 and #810, a range request through the
 /// read cache) the whole request, by which every range evaluation of it is
-/// routed and, over native histograms, read raw, so a cached answer's tail
-/// reads as its whole request reads.
+/// routed, so a cached answer's tail reads the level its whole request
+/// reads.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct EngineOptions {
     pub(super) lookback_ms: Option<i64>,

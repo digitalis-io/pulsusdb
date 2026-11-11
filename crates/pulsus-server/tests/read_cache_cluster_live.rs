@@ -778,12 +778,13 @@ fn push_one_histogram(port: u16, at: i64) {
 /// in the newer points before the repeat. The repeat on A and on B, and the
 /// statements A's repeat sent.
 async fn tail_case(
-    name: &str,
+    db: ClusterDb,
     a_port: u16,
     b_port: u16,
     histogram: bool,
 ) -> (Resp, Resp, Vec<(String, String)>) {
-    let db = ClusterDb::fresh(pulsus_testkit::test_db(name)).await;
+    let name = db.name.clone();
+    let name = name.as_str();
     let b = Server::spawn(b_port, &db, "0");
     let now0 = load_fixture(b.port);
     let built_to = now0.div_euclid(TWELVE) * TWELVE;
@@ -840,7 +841,10 @@ async fn a_cache_tail_keeps_the_lag_guard() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with the cluster fixture");
         return;
     }
-    let (ra, _, sent) = tail_case("pulsus_read_cache_cluster_t810_36", 31_911, 31_912, false).await;
+    let db = ClusterDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_cluster_t810_36")).await;
+    let a_port = 31_911;
+    let b_port = 31_912;
+    let (ra, _, sent) = tail_case(db, a_port, b_port, false).await;
     assert_eq!(ra.status, 200, "T36: {}", ra.body);
     assert_eq!(ra.cache(), "hit", "T36: the repeat");
     assert_eq!(sent.len(), 1, "T36: the tail's statements {sent:#?}");
@@ -858,7 +862,10 @@ async fn a_histogram_tail_keeps_the_lag_guard() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with the cluster fixture");
         return;
     }
-    let (ra, rb, sent) = tail_case("pulsus_read_cache_cluster_t810_40", 31_913, 31_914, true).await;
+    let db = ClusterDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_cluster_t810_40")).await;
+    let a_port = 31_913;
+    let b_port = 31_914;
+    let (ra, rb, sent) = tail_case(db, a_port, b_port, true).await;
     assert_eq!(ra.status, 200, "T40: {}", ra.body);
     assert_eq!(rb.status, 200, "T40: B {}", rb.body);
     assert_eq!(ra.cache(), "hit", "T40: the repeat");

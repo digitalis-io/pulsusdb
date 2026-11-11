@@ -346,12 +346,11 @@ mod t19 {
         a
     }
 
-    fn routed(raw: bool, whole: bool) -> EvalFacts {
+    fn routed(raw: bool) -> EvalFacts {
         EvalFacts {
             charged: 10,
             reads: ReadMix::AllRouted,
             raw,
-            whole,
         }
     }
 
@@ -377,7 +376,7 @@ mod t19 {
     ) -> Answer {
         let full = |q: MetricQueryParams| {
             calls.full.fetch_add(1, Ordering::SeqCst);
-            async move { R::Ok((matrix(&q, 1_000.0), full_ann, routed(false, false))) }
+            async move { R::Ok((matrix(&q, 1_000.0), full_ann, routed(false))) }
         };
         let tail = |q: MetricQueryParams| {
             calls.tail.fetch_add(1, Ordering::SeqCst);
@@ -398,7 +397,7 @@ mod t19 {
             window(0),
             Annotations::new(),
             Annotations::new(),
-            routed(false, false),
+            routed(false),
             || {},
         )
         .await;
@@ -433,7 +432,7 @@ mod t19 {
             p2,
             Annotations::new(),
             info(),
-            routed(false, false),
+            routed(false),
             || {},
         )
         .await;
@@ -454,33 +453,45 @@ mod t19 {
             window(0),
             info(),
             Annotations::new(),
-            routed(false, false),
+            routed(false),
             || {},
         )
         .await;
         assert!(!stored(&c, window(0)), "(b) nothing stored");
 
-        // (c) The tail answers the whole request (read raw).
+        // (c) The tail is read raw (addendum r6): merged with the kept
+        // points and answered, and nothing is stored.
         let c = cache();
         kept(&c).await;
         let before = c.lookup(&request(window(0)).key).expect("kept").c1_ms;
         let calls = Calls::default();
-        let tail_p = MetricQueryParams {
-            start_ms: before + 15_000,
-            ..p2
-        };
         let a = run(
             &c,
             &calls,
             p2,
             Annotations::new(),
             Annotations::new(),
-            routed(true, true),
+            routed(true),
             || {},
         )
         .await;
         assert_eq!(counts(&calls), (1, 0), "(c) tail, full");
-        assert_eq!(a.result, matrix(&tail_p, 0.0), "(c) the tail's result");
+        assert_eq!(a.header, Header::Hit, "(c) a hit");
+        let QueryResult::Matrix(series) = &a.result else {
+            panic!("(c) a matrix: {:?}", a.result)
+        };
+        let want: Vec<(i64, f64)> = {
+            let mut t = p2.start_ms;
+            let mut points = Vec::new();
+            while t <= p2.end_ms {
+                let base = if t <= before { 1_000.0 } else { 0.0 };
+                points.push((t, base + (t / 1000) as f64));
+                t += p2.step_ms;
+            }
+            points
+        };
+        assert_eq!(series.len(), 1, "(c) one series");
+        assert_eq!(series[0].points, want, "(c) kept points, then the tail's");
         assert_eq!(
             c.lookup(&request(p2).key).map(|e| e.c1_ms),
             Some(before),
@@ -498,7 +509,7 @@ mod t19 {
             p2,
             Annotations::new(),
             Annotations::new(),
-            routed(false, false),
+            routed(false),
             move || inner.clear(),
         )
         .await;
@@ -517,7 +528,7 @@ mod t19 {
             p2,
             Annotations::new(),
             Annotations::new(),
-            routed(false, false),
+            routed(false),
             || {},
         )
         .await;
@@ -543,7 +554,7 @@ mod t19 {
             p2,
             Annotations::new(),
             Annotations::new(),
-            routed(false, false),
+            routed(false),
             || {},
         )
         .await;
@@ -560,7 +571,7 @@ mod t19 {
             p2,
             Annotations::new(),
             Annotations::new(),
-            routed(false, false),
+            routed(false),
             || {},
         )
         .await;
@@ -597,7 +608,7 @@ mod t19 {
             p2,
             Annotations::new(),
             Annotations::new(),
-            routed(false, false),
+            routed(false),
             || {},
         )
         .await;

@@ -1254,8 +1254,6 @@ pub struct EvalFacts {
     pub reads: ReadMix,
     /// Read and evaluated raw for native histograms (D9).
     pub raw: bool,
-    /// The result answers the whole request, not only the grid asked.
-    pub whole: bool,
 }
 
 impl EvalFacts {
@@ -1265,7 +1263,6 @@ impl EvalFacts {
             charged,
             reads: ReadMix::Unrouted,
             raw: false,
-            whole: false,
         }
     }
 }
@@ -1481,8 +1478,8 @@ where
 
 /// Issue #810 (D14): the hit of an entry whose every read is routed: the
 /// tail's one read, merged with the kept points, refused past the sample
-/// cap with no full re-read. A tail that answers its whole request (read
-/// raw, D9) is the answer, and nothing is kept.
+/// cap with no full re-read. A merge whose tail was read raw (D9) is
+/// answered and not stored, as a raw answer is not kept (addendum r6).
 #[allow(clippy::too_many_arguments)]
 async fn routed_hit<E, T, TF, R>(
     cache: &ReadCache,
@@ -1510,16 +1507,6 @@ where
     } else {
         tail(tail_p).await?
     };
-    if tail_facts.whole {
-        cache.count(Header::Bypass, Some(BypassReason::NoFill));
-        return Ok(Answer {
-            result: tail_result,
-            annotations: tail_ann,
-            outcome: Outcome::Miss,
-            header: Header::Bypass,
-            through_ms: None,
-        });
-    }
     let bound = e.charge_bound.saturating_add(tail_facts.charged);
     if bound > req.max_samples {
         return Err(refuse(req.max_samples));
@@ -1544,6 +1531,7 @@ where
     let through = keep_through(v, req.facts.reach_ms, &p, res, watermark)
         .filter(|_| matches!(answer, QueryResult::Matrix(_) | QueryResult::MatrixHist(_)));
     let stored = if tail_ann.is_empty()
+        && !tail_facts.raw
         && attempt_ok()
         && cache.fills_allowed(v)
         && cache.identity_fresh()
@@ -1601,7 +1589,6 @@ pub async fn answer_range_on(
             charged: f.charged_samples,
             reads: f.reads,
             raw: f.raw,
-            whole: f.whole,
         };
         Ok::<_, ReadError>((r, a, facts))
     };

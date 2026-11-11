@@ -587,14 +587,31 @@ pub struct RoutedTables<'a> {
 
 /// Issue #810 (D11): the windows one routed statement reads.
 #[derive(Debug, Clone, Copy)]
-pub struct RoutedWindow<'a> {
+pub struct RoutedWindow {
     /// `(lo, hi]`, the selector's fetch window, `hi` at `t_last` less the
     /// offset (D3).
     pub level: (i64, i64),
     /// `(rlo, rhi]`, the selector's window in the routing-off plan.
     pub raw: (i64, i64),
-    /// `{HIST_WHERE}`, the query's routed selectors' histogram condition.
-    pub hist_where: &'a str,
+}
+
+/// Issue #810 (D9, addendum r6): what a routed statement reads.
+#[derive(Debug, Clone, Copy)]
+pub enum RoutedFetch<'a> {
+    /// The level arm, and the raw arms gated on `hist_n`: the statement's
+    /// own series' native-histogram samples, named as it reads them, and
+    /// `others`', each another routed selector's listed condition. The
+    /// `others` are dropped when the statement would pass the text cap.
+    Gated { others: &'a [&'a str] },
+    /// The raw arms alone, ungated: a selector read again raw.
+    Raw,
+}
+
+/// Issue #810 (addendum r6): one routed selector's native-histogram
+/// samples over its raw window, its series named by `series` (a literal
+/// list, or an ID statement on lines of its own).
+pub fn hist_part(series: &str, (rlo, rhi): (i64, i64)) -> String {
+    format!("(fingerprint IN ({series}) AND unix_milli > {rlo} AND unix_milli <= {rhi})")
 }
 
 /// Issue #810 (D11): `metric_hist_samples`' value columns as one tuple.
@@ -605,36 +622,62 @@ Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8)"
 /// names its series by `ids` (with the labels arm) rather than `known`.
 /// `known` is used when the statement it renders is under `text_cap`,
 /// measured over its escaped text as the dispatcher measures it.
+#[allow(clippy::too_many_arguments)]
 pub fn routed_fetch(
     tenant: &Tenant,
     tables: &RoutedTables<'_>,
     name: &str,
-    window: &RoutedWindow<'_>,
+    window: &RoutedWindow,
+    fetch: RoutedFetch<'_>,
     known: Option<&str>,
     ids: &str,
     text_cap: u64,
 ) -> (String, bool) {
+    let fits =
+        |sql: &str| (crate::logql::exec::escape_query_placeholders(sql).len() as u64) < text_cap;
+    let others: &[&str] = match fetch {
+        RoutedFetch::Gated { others } => others,
+        RoutedFetch::Raw => &[],
+    };
+    // The statement's own form first, by the list's fit; then the others'
+    // lists, kept only while the statement fits.
+    let mut forms: Vec<(Option<&str>, &[&str])> = Vec::with_capacity(4);
     if let Some(list) = known {
-        let sql = routed_statement(tenant, tables, name, window, Some(list), ids);
-        if (crate::logql::exec::escape_query_placeholders(&sql).len() as u64) < text_cap {
-            return (sql, false);
+        if !others.is_empty() {
+            forms.push((Some(list), others));
+        }
+        forms.push((Some(list), &[]));
+    }
+    if !others.is_empty() {
+        forms.push((None, others));
+    }
+    let last = (None, &[][..]);
+    for (list, with) in forms {
+        let sql = routed_statement(tenant, tables, name, window, fetch, list, ids, with);
+        if fits(&sql) {
+            return (sql, list.is_none());
         }
     }
     (
-        routed_statement(tenant, tables, name, window, None, ids),
+        routed_statement(tenant, tables, name, window, fetch, last.0, ids, last.1),
         true,
     )
 }
 
 /// Plan section 2.3: the level arm, the raw arms (read only with
 /// `hist_n > 0`), with no list the labels arm, and `hist_n`'s own row.
+/// Read again raw (addendum r6): the raw arms alone, ungated, and with no
+/// list the labels arm.
+#[allow(clippy::too_many_arguments)]
 fn routed_statement(
     tenant: &Tenant,
     tables: &RoutedTables<'_>,
     name: &str,
-    window: &RoutedWindow<'_>,
+    window: &RoutedWindow,
+    fetch: RoutedFetch<'_>,
     known: Option<&str>,
     ids: &str,
+    others: &[&str],
 ) -> String {
     let org = tenant.sql_literal();
     let (lo, hi) = window.level;
@@ -668,6 +711,42 @@ fn routed_statement(
             )
         ),
     };
+    let raw_arms = |gate: &str| {
+        format!(
+            "  SELECT toUInt8(3) AS arm, fingerprint, unix_milli AS t, toInt64(0) AS t_last, value AS last, 0. AS min,
+         0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags, CAST([], '{hist}') AS h, '' AS labels
+  FROM {samples}
+  WHERE org_id = {org} AND unix_milli > {rlo} AND unix_milli <= {rhi} AND {raw_filter}{gate}
+  UNION ALL
+  SELECT toUInt8(1) AS arm, hs.fingerprint AS fingerprint, hs.unix_milli AS t, toInt64(0) AS t_last,
+         0. AS last, 0. AS min, 0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags,
+         [CAST((hs.schema, hs.zero_threshold, hs.zero_count, hs.count, hs.sum, hs.pos_span_offsets,
+                hs.pos_span_lengths, hs.pos_bucket_deltas, hs.neg_span_offsets, hs.neg_span_lengths,
+                hs.neg_bucket_deltas, hs.custom_values, hs.counter_reset_hint), '{HIST_TUPLE}')] AS h, '' AS labels
+  FROM {hist_table} AS hs
+  WHERE hs.org_id = {org} AND hs.unix_milli > {rlo} AND hs.unix_milli <= {rhi} AND {raw_filter}{gate}
+",
+            samples = tables.samples,
+            hist_table = tables.hist,
+        )
+    };
+    if let RoutedFetch::Raw = fetch {
+        return format!(
+            "SELECT arm, fingerprint, t, t_last, last, min, max, sum, count, inc, flags, h, labels FROM (
+{}{labels_arm})
+ORDER BY arm, fingerprint, t, reinterpretAsUInt64(last)",
+            raw_arms("")
+        );
+    }
+    // The statement's own series as it names them, then the others'.
+    let own = match known {
+        Some(list) => hist_part(list, (rlo, rhi)),
+        None => hist_part(&format!("\n{ids}\n"), (rlo, rhi)),
+    };
+    let hist_where = std::iter::once(own.as_str())
+        .chain(others.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" OR ");
     format!(
         "WITH ifNull((SELECT count() FROM {hist_table} WHERE org_id = {org} AND ({hist_where})), 0) AS hist_n
 SELECT arm, fingerprint, t, t_last, last, min, max, sum, count, inc, flags, h, labels FROM (
@@ -676,27 +755,14 @@ SELECT arm, fingerprint, t, t_last, last, min, max, sum, count, inc, flags, h, l
   FROM {level}
   WHERE kind = 0 AND org_id = {org} AND t_end > {lo} AND t_end <= {hi} AND {level_filter} AND hist_n = 0
   UNION ALL
-  SELECT toUInt8(3) AS arm, fingerprint, unix_milli AS t, toInt64(0) AS t_last, value AS last, 0. AS min,
-         0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags, CAST([], '{hist}') AS h, '' AS labels
-  FROM {samples}
-  WHERE org_id = {org} AND unix_milli > {rlo} AND unix_milli <= {rhi} AND {raw_filter} AND hist_n > 0
-  UNION ALL
-  SELECT toUInt8(1) AS arm, hs.fingerprint AS fingerprint, hs.unix_milli AS t, toInt64(0) AS t_last,
-         0. AS last, 0. AS min, 0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags,
-         [CAST((hs.schema, hs.zero_threshold, hs.zero_count, hs.count, hs.sum, hs.pos_span_offsets,
-                hs.pos_span_lengths, hs.pos_bucket_deltas, hs.neg_span_offsets, hs.neg_span_lengths,
-                hs.neg_bucket_deltas, hs.custom_values, hs.counter_reset_hint), '{HIST_TUPLE}')] AS h, '' AS labels
-  FROM {hist_table} AS hs
-  WHERE hs.org_id = {org} AND hs.unix_milli > {rlo} AND hs.unix_milli <= {rhi} AND {raw_filter} AND hist_n > 0
-{labels_arm}  UNION ALL
+{}{labels_arm}  UNION ALL
   SELECT toUInt8(4) AS arm, toUInt128(0) AS fingerprint, toInt64(hist_n) AS t, toInt64(0) AS t_last, 0. AS last,
          0. AS min, 0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags, CAST([], '{hist}') AS h, '' AS labels
 )
 ORDER BY arm, fingerprint, t, reinterpretAsUInt64(last)",
+        raw_arms(" AND hist_n > 0"),
         hist_table = tables.hist,
-        hist_where = window.hist_where,
         level = tables.level,
-        samples = tables.samples,
     )
 }
 
@@ -1451,15 +1517,17 @@ mod tests {
         let window = RoutedWindow {
             level: (1_000, 2_000),
             raw: (900, 2_000),
-            hist_where: "fingerprint IN (SELECT fingerprint FROM metric_series) AND unix_milli > 900 AND unix_milli <= 2000",
         };
         let ids = "SELECT fingerprint FROM metric_series";
-        let (small, by_ids) = routed_fetch(&tenant, &tables, "m", &window, Some(&list), ids, 200);
+        let gated = RoutedFetch::Gated { others: &[] };
+        let (small, by_ids) =
+            routed_fetch(&tenant, &tables, "m", &window, gated, Some(&list), ids, 200);
         assert!(by_ids, "at 200 bytes: by the IDs");
         assert!(small.contains("fingerprint GLOBAL IN ("), "{small}");
         assert!(small.contains("toUInt8(2) AS arm"), "{small}");
         let cap = crate::querytext::MAX_QUERY_TEXT_BYTES;
-        let (big, by_ids) = routed_fetch(&tenant, &tables, "m", &window, Some(&list), ids, cap);
+        let (big, by_ids) =
+            routed_fetch(&tenant, &tables, "m", &window, gated, Some(&list), ids, cap);
         assert!(!by_ids, "at the cap: by the list");
         assert!(big.contains(&list), "{big}");
         assert!(!big.contains("toUInt8(2)"), "{big}");

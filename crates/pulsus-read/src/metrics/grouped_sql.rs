@@ -699,8 +699,8 @@ pub enum SideSeries<'a> {
 
 /// Issue #810 (D9, D10): what a pushed statement counts beside its groups:
 /// its series, when a side is not listed, gated on `cap`, and `hist_n`, the
-/// query's routed selectors' histogram samples (`{HIST_WHERE}`), when the
-/// query has a routed selector.
+/// histogram samples of its `Level` sides and of the other routed
+/// selectors the label cache lists (`{HIST_WHERE}`, addendum r6).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Counts<'a> {
     // `series_n`: the expression counting the statement's series; `cap`:
@@ -740,14 +740,11 @@ FROM (SELECT arrayJoin(CAST([{members}], 'Array(Tuple(UInt128, UInt64, Array(Tup
     )
 }
 
-/// Issue #810 (D10): where a gated read names the cap; [`aggregate_over`]
-/// replaces it with the statement's cap.
-const SERIES_CAP: &str = "__pulsus_series_cap__";
-
 impl SideSeries<'_> {
     /// The statements' series filter: the literal list for a known side,
-    /// else `fingerprint [GLOBAL ]IN (ids)`; on a gated side, with the gate.
-    pub fn filter(&self, global: bool) -> String {
+    /// else `fingerprint [GLOBAL ]IN (ids)`; on a gated side, with the gate
+    /// on `cap` (issue #810, D10).
+    pub fn filter(&self, global: bool, cap: usize) -> String {
         let read = match self {
             SideSeries::Ids { ids, .. } => {
                 let global = if global { "GLOBAL " } else { "" };
@@ -755,16 +752,16 @@ impl SideSeries<'_> {
             }
             SideSeries::Known { list, .. } => format!("fingerprint IN ({list})"),
         };
-        format!("{read}{}", self.gate())
+        format!("{read}{}", self.gate(cap))
     }
 
     /// ` AND series_n * grid_n <= {cap}` on a gated side, else nothing.
-    fn gate(&self) -> String {
+    fn gate(&self, cap: usize) -> String {
         let gated = match self {
             SideSeries::Ids { gated, .. } | SideSeries::Known { gated, .. } => *gated,
         };
         if gated {
-            format!(" AND series_n * grid_n <= {SERIES_CAP}")
+            format!(" AND series_n * grid_n <= {cap}")
         } else {
             String::new()
         }
@@ -800,6 +797,7 @@ pub fn level_rows(
     series: &SideSeries<'_>,
     table: &str,
     (lo, hi): (i64, i64),
+    cap: usize,
 ) -> String {
     format!(
         "SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
@@ -810,20 +808,25 @@ FROM (
 )
 GROUP BY fingerprint",
         tenant.sql_literal(),
-        series.filter(true),
+        series.filter(true, cap),
     )
 }
 
 /// Issue #810: `COUNTER_GATHER`'s elements — the route's level's
 /// `LEVEL_ROWS` rows as `(t_end, width, t_last, last, inc)`.
-fn counter_elements(tenant: &Tenant, series: &SideSeries<'_>, level: &LevelRead<'_>) -> String {
+fn counter_elements(
+    tenant: &Tenant,
+    series: &SideSeries<'_>,
+    level: &LevelRead<'_>,
+    cap: usize,
+) -> String {
     format!(
         "SELECT fingerprint, arrayMap(r -> (r.1, toInt64({}), r.2, r.3, r.4), rows0) AS es
 FROM (
 {}
 )",
         level.res_ms,
-        level_rows(tenant, series, level.table, level.served)
+        level_rows(tenant, series, level.table, level.served, cap)
     )
 }
 
@@ -836,8 +839,13 @@ FROM (
 /// start point. Each point carries its element's position and a sub-order
 /// (the start point first), so points at one time keep the fold's order.
 /// Stale markers are dropped and the groups with no point removed last.
-pub fn counter_gather(tenant: &Tenant, series: &SideSeries<'_>, level: &LevelRead<'_>) -> String {
-    let elements = counter_elements(tenant, series, level);
+pub fn counter_gather(
+    tenant: &Tenant,
+    series: &SideSeries<'_>,
+    level: &LevelRead<'_>,
+    cap: usize,
+) -> String {
+    let elements = counter_elements(tenant, series, level, cap);
     format!(
         "SELECT fingerprint, arm, raw FROM (
 SELECT fingerprint, toUInt8(0) AS arm,
@@ -882,8 +890,9 @@ pub fn raw_gather_within(
     samples_table: &str,
     series: &SideSeries<'_>,
     within: &[(i64, i64)],
+    cap: usize,
 ) -> String {
-    let filter = series.filter(false);
+    let filter = series.filter(false, cap);
     let window = format!(
         "org_id = {} AND {}",
         tenant.sql_literal(),
@@ -902,16 +911,22 @@ pub fn raw_gather_within(
 /// `fingerprint, gi, v`, each step taken from the arm today's route reads
 /// it from: raw where its window reaches time no level covers (the raw
 /// steps), the level elsewhere.
-pub fn series_steps(side: &SideSql<'_>, grid: Grid) -> String {
+pub fn series_steps(side: &SideSql<'_>, grid: Grid, cap: usize) -> String {
     let range = side.range_ms.to_string();
     // Issue #810 (D1): a level side reads its level's rows alone; a raw
     // side its raw samples over the grid's windows.
     let (gather, raw) = match &side.level {
-        Some(level) => (counter_gather(side.tenant, &side.series, level), false),
+        Some(level) => (counter_gather(side.tenant, &side.series, level, cap), false),
         None => {
             let (lo, hi) = range_window(grid, side.range_ms);
             (
-                raw_gather_within(side.tenant, side.samples_table, &side.series, &[(lo, hi)]),
+                raw_gather_within(
+                    side.tenant,
+                    side.samples_table,
+                    &side.series,
+                    &[(lo, hi)],
+                    cap,
+                ),
                 true,
             )
         }
@@ -950,15 +965,15 @@ FROM (
 
 /// Issue #579 part 4: `MEMBERS` — each series' rank in `(name, ID)` order,
 /// the order the evaluator folds in, and its stored label pairs.
-pub fn members(side: &SideSql<'_>) -> String {
-    let gate = side.series.gate();
+pub fn members(side: &SideSql<'_>, cap: usize) -> String {
+    let gate = side.series.gate(cap);
     let ids = match side.series {
         SideSeries::Ids { ids, .. } => ids,
         // Issue #18 part 2c: the label cache's own members. Issue #810:
         // gated after the `arrayJoin` subquery.
         SideSeries::Known { members, .. } if gate.is_empty() => return members.to_string(),
         SideSeries::Known { members, .. } => {
-            return format!("{members}\nWHERE series_n * grid_n <= {SERIES_CAP}");
+            return format!("{members}\nWHERE series_n * grid_n <= {cap}");
         }
     };
     format!(
@@ -1001,7 +1016,7 @@ pub fn group_key_over(grouping: Option<&Grouping>, kv: &str) -> String {
 /// series count, `series_n`. No series' labels make it.
 pub const SERIES_SENTINEL_KEY: &str = "CAST([('', 'series')], 'Array(Tuple(String, String))')";
 
-/// Issue #810 (D9): the key of the row carrying `hist_n`, the query's
+/// Issue #810 (D9): the key of the row carrying `hist_n`, the statement's
 /// routed selectors' native-histogram samples.
 pub const HIST_N_SENTINEL_KEY: &str = "CAST([('', 'hist_n')], 'Array(Tuple(String, String))')";
 
@@ -1041,7 +1056,7 @@ fn aggregate_over(
             "\nUNION ALL\nSELECT {HIST_N_SENTINEL_KEY} AS gid, toUInt32(0) AS gi, toFloat64(hist_n) AS agg"
         ));
     }
-    let sql = format!(
+    format!(
         "WITH {with}
 SELECT gid, gi, agg FROM (
 SELECT gid, gi,
@@ -1058,17 +1073,16 @@ UNION ALL
 SELECT {HISTOGRAM_SENTINEL_KEY} AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM {hist_samples_table} WHERE {sentinel_where})) AS agg{rows}
 ORDER BY gid, gi"
-    );
-    sql.replace(SERIES_CAP, &counts.cap.to_string())
+    )
 }
 
 /// `unix_milli > lo AND unix_milli <= hi AND fingerprint IN (ids)`: one
 /// side's histogram samples in its fetch window.
-fn side_histograms(side: &SideSql<'_>) -> String {
+fn side_histograms(side: &SideSql<'_>, cap: usize) -> String {
     let (lo, hi) = side.window;
     format!(
         "unix_milli > {lo} AND unix_milli <= {hi} AND {}",
-        side.series.filter(false)
+        side.series.filter(false, cap)
     )
 }
 
@@ -1091,15 +1105,15 @@ pub fn level_aggregate_fetch(
 {}
     ) AS m USING (fingerprint)",
         group_key_over(grouping, "m.kv"),
-        series_steps(side, grid),
-        members(side)
+        series_steps(side, grid, counts.cap),
+        members(side, counts.cap)
     );
     let (lo, hi) = side.window;
     let sentinel = format!(
         "org_id = {} AND unix_milli > {lo} AND unix_milli <= {hi}
              AND {}",
         side.tenant.sql_literal(),
-        side.series.filter(false)
+        side.series.filter(false, counts.cap)
     );
     aggregate_over(grid, op, &inner, hist_samples_table, &sentinel, counts)
 }
@@ -1280,19 +1294,19 @@ pub fn match_aggregate_fetch(
     )
     ARRAY JOIN if(bad, [({MATCH_SENTINEL_KEY}, toUInt64(0), nan)], {out}) AS o",
         sig(many.metric_name),
-        series_steps(many, grid),
-        members(many),
+        series_steps(many, grid, counts.cap),
+        members(many, counts.cap),
         sig(one.metric_name),
-        series_steps(one, grid),
-        members(one),
+        series_steps(one, grid, counts.cap),
+        members(one, counts.cap),
     );
     // S3b's histogram condition, its sides in written order.
     let (lhs, rhs) = if right { (one, many) } else { (many, one) };
     let sentinel = format!(
         "org_id = {} AND (({}) OR ({}))",
         lhs.tenant.sql_literal(),
-        side_histograms(lhs),
-        side_histograms(rhs)
+        side_histograms(lhs, counts.cap),
+        side_histograms(rhs, counts.cap)
     );
     aggregate_over(grid, op, &inner, hist_samples_table, &sentinel, counts)
 }
@@ -1364,17 +1378,17 @@ pub fn join_aggregate_fetch(
     INNER JOIN (
 {}
     ) AS r ON r.fingerprint = p.rfp AND r.gi = l.gi{filter}",
-        series_steps(lhs, grid),
+        series_steps(lhs, grid, counts.cap),
         group_key_over(grouping, outkv),
-        members(lhs),
-        members(rhs),
-        series_steps(rhs, grid),
+        members(lhs, counts.cap),
+        members(rhs, counts.cap),
+        series_steps(rhs, grid, counts.cap),
     );
     let sentinel = format!(
         "org_id = {} AND (({}) OR ({}))",
         lhs.tenant.sql_literal(),
-        side_histograms(lhs),
-        side_histograms(rhs)
+        side_histograms(lhs, counts.cap),
+        side_histograms(rhs, counts.cap)
     );
     aggregate_over(grid, op, &inner, hist_samples_table, &sentinel, counts)
 }
@@ -1995,7 +2009,8 @@ mod tests {
                     ids: &ids,
                     gated: false
                 },
-                &a
+                &a,
+                0
             ),
             join_section("counter_gather 720s"),
             "(a)"
@@ -2016,7 +2031,7 @@ mod tests {
             level: Some(t11_level()),
         };
         assert_eq!(
-            series_steps(&side, t11_grid()),
+            series_steps(&side, t11_grid(), 0),
             join_section("series_steps 60s"),
             "(b)"
         );
@@ -2027,7 +2042,8 @@ mod tests {
                     ids: &ids,
                     gated: false
                 },
-                &t11_level()
+                &t11_level(),
+                0
             ),
             join_section("counter_gather 60s"),
             "(c)"
@@ -2075,7 +2091,7 @@ mod tests {
             level: Some(level),
         };
         assert_eq!(
-            series_steps(&side, t11_grid()),
+            series_steps(&side, t11_grid(), 0),
             join_section("series_steps 720s known"),
             "steps"
         );
@@ -2094,7 +2110,7 @@ mod tests {
             "__pulsus_series_cap__".to_string(),
         )]);
         let fp = Fingerprint::from_raw(1).sql_literal();
-        let members = members_known(&[(fp.clone(), &label)]);
+        let members = members_known(&[(fp, &label)]);
         let list = sample_sql::render_fingerprint_list(std::slice::from_ref(&fp));
         let side = |series: SideSeries<'_>, name: &'static str| -> String {
             let side = SideSql {
@@ -2507,15 +2523,15 @@ mod tests {
         ];
         for (key, (many, one, lhs, rhs), grouping, op, bin, bool_modifier, spec) in &cases {
             let matched = join_section(key)
-                .replace("{SERIES_STEPS(M)}", &series_steps(many, t11_grid()))
-                .replace("{MEMBERS(M)}", &members(many))
-                .replace("{SERIES_STEPS(O)}", &series_steps(one, t11_grid()))
-                .replace("{MEMBERS(O)}", &members(one));
+                .replace("{SERIES_STEPS(M)}", &series_steps(many, t11_grid(), 0))
+                .replace("{MEMBERS(M)}", &members(many, 0))
+                .replace("{SERIES_STEPS(O)}", &series_steps(one, t11_grid(), 0))
+                .replace("{MEMBERS(O)}", &members(one, 0));
             let sentinel = format!(
                 "org_id = {} AND (({}) OR ({}))",
                 tenant.sql_literal(),
-                side_histograms(lhs),
-                side_histograms(rhs)
+                side_histograms(lhs, 0),
+                side_histograms(rhs, 0)
             );
             let want = aggregate_over(
                 t11_grid(),
