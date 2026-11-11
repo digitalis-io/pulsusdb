@@ -1262,10 +1262,11 @@ async fn a_pushed_level_node_is_one_statement_on_two_shards() {
     assert!(failures.is_empty(), "T6:\n{}", failures.join("\n"));
 }
 
-/// **T28 (issue #810): a listed selector reads on two shards** in one
-/// statement, under the settings a nested series read needs.
+/// **T28 (issue #810): an unlisted selector reads on two shards** in one
+/// statement, under the settings a nested series read needs: a label cache
+/// never refreshed, so the statement nests its ID statement.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_listed_selector_reads_on_two_shards() {
+async fn an_unlisted_selector_reads_on_two_shards() {
     if skipping() {
         return;
     }
@@ -1277,8 +1278,9 @@ async fn a_listed_selector_reads_on_two_shards() {
     .await;
     build_level(&f).await;
     let (cache, slot) = warm(&f).await;
+    let cold = cold_cache(&f).await;
     let comment = format!("{}_t28_{}", f.db, chrono::Utc::now().timestamp_millis());
-    let on = level_engine(&f, &cache, &slot, false, Some(&comment)).await;
+    let on = level_engine(&f, &cold, &slot, false, Some(&comment)).await;
     let off = MetricsEngine::new(
         ChClient::new(shard1_config(&f.db)).await.expect("connect"),
         Arc::clone(&cache),
@@ -1305,4 +1307,162 @@ async fn a_listed_selector_reads_on_two_shards() {
     assert_eq!(sent.len(), 1, "T28: statements {sent:#?}");
     assert!(!cells(&b).is_empty(), "T28: an answer");
     assert_eq!(cells(&a), cells(&b), "T28: as routing off");
+}
+
+// ------------------------------------------- issue #810, addendum r6, T33
+
+/// Each top-level statement `node` ran under `comment`, with its replica
+/// delay setting (`""` when the statement does not carry it).
+async fn delays_on(node: &ChClient, comment: &str) -> Vec<(String, String)> {
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize)]
+    struct Logged {
+        query: String,
+        delay: String,
+    }
+    settle_query_log(
+        &[node],
+        &format!("is_initial_query AND log_comment = '{comment}'"),
+        1,
+    )
+    .await;
+    let mut stream = node
+        .query_stream::<Logged>(
+            &format!(
+                "SELECT query, Settings['max_replica_delay_for_distributed_queries'] AS delay \
+                 FROM system.query_log \
+                 WHERE type = 'QueryFinish' AND is_initial_query AND log_comment = '{comment}' \
+                 ORDER BY query_start_time_microseconds"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("query_log");
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("decode");
+        out.push((row.query, row.delay));
+    }
+    out
+}
+
+/// **T33 (issue #810, addendum r6): an unlisted selector costs only its own
+/// guard**, and T34, its limit. T63's lagging replica, `a` and `b` of 40
+/// series each, a label cache that lists at most 5 series a selector: over
+/// 3 h `a{s="1"}` is listed and `b` is not, so only `a`'s statement carries
+/// the lag guard, and `a` answers as the replica that does not lag; over
+/// 30 h, past the cache's 24 h window, neither is listed and neither
+/// statement carries it, as before #810.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unlisted_selector_costs_only_its_own_guard() {
+    if skipping() {
+        return;
+    }
+    let f = fixture(
+        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t810_33"),
+        &[("a", 0), ("b", 5000)],
+        true,
+    )
+    .await;
+    build_level_to(&f, f.mid).await;
+    let table = format!("{}.metric_samples_60s", f.db);
+    exec(&f.shard1b, &format!("SYSTEM STOP FETCHES {table}")).await;
+    for node in [&f.shard1, &f.shard2] {
+        exec(node, &first_level_insert(&f.ctx, f.mid, f.hi)).await;
+    }
+    let delay_sql = format!(
+        "SELECT toString(absolute_delay) AS t FROM system.replicas \
+         WHERE database = '{}' AND table = 'metric_samples_60s'",
+        f.db
+    );
+    let mut lag = 0u64;
+    for _ in 0..60 {
+        lag = text_on(&f.shard1b, &delay_sql).await.parse().unwrap_or(0);
+        if lag >= 5 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(lag >= 5, "shard1b's 60 s copy lags {lag} s after a minute");
+    let mut cfg = cache_config(&f.db);
+    cfg.cache_max_series = 5;
+    let cache = Arc::new(LabelCache::new(
+        ChClient::new(shard1b_config(&f.db)).await.expect("connect"),
+        cfg,
+    ));
+    cache.refresh().await.expect("refresh");
+    let slot = Arc::new(LevelSlot::new());
+    refresh_levels(&slot, &f.shard1b, &f.db, "_dist", Some(CLUSTER_NAME))
+        .await
+        .expect("level discovery");
+    let engine = |config: ChConnConfig, comment: String| {
+        let cache = Arc::clone(&cache);
+        let slot = Arc::clone(&slot);
+        let db = f.db.clone();
+        async move {
+            MetricsEngine::new(
+                ChClient::new(config).await.expect("connect"),
+                cache,
+                MetricsConfig {
+                    max_replica_delay_secs: 5,
+                    ..engine_config(&db)
+                },
+            )
+            .with_rollup_levels(slot)
+            .with_query_log_comment(comment)
+        }
+    };
+    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
+    let q = "last_over_time(a{s=\"1\"}[1m]) or last_over_time(b[1m])";
+    let expr = parse(q).expect("parse");
+    let mut failures = Vec::new();
+    for (case, span) in [("T33", 3 * HOUR), ("T34", 30 * HOUR)] {
+        let p = MetricQueryParams {
+            start_ms: f.hi - span,
+            end_ms: f.hi,
+            step_ms: MIN,
+        };
+        let comment = format!("{}_{case}_{}", f.db, uuid::Uuid::new_v4().simple());
+        let e = engine(shard1b_config(&f.db), comment.clone()).await;
+        let (r, _) = e.query(&tenant, &expr, &p).await.expect("query");
+        let sent = delays_on(&f.shard1b, &comment).await;
+        let (b_reads, a_reads): (Vec<_>, Vec<_>) = sent
+            .iter()
+            .partition(|(q, _)| q.contains("FROM metric_series"));
+        let carries = |x: &Vec<&(String, String)>| x.iter().all(|(_, d)| d == "5");
+        let none = |x: &Vec<&(String, String)>| x.iter().all(|(_, d)| d.is_empty());
+        if case == "T33" {
+            if a_reads.len() != 1 || b_reads.len() != 1 || !carries(&a_reads) || !none(&b_reads) {
+                failures.push(format!(
+                    "T33: a's statements {:?}, b's {:?}",
+                    a_reads.iter().map(|(_, d)| d).collect::<Vec<_>>(),
+                    b_reads.iter().map(|(_, d)| d).collect::<Vec<_>>()
+                ));
+            }
+            // `a` answers as the replica that does not lag.
+            let one = parse("last_over_time(a{s=\"1\"}[1m])").expect("parse");
+            let near = engine(shard1_config(&f.db), format!("{comment}_near")).await;
+            let (want, _) = near.query(&tenant, &one, &p).await.expect("near");
+            let (got, want) = (cells(&r), cells(&want));
+            if want.is_empty() || want.iter().any(|(k, v)| got.get(k) != Some(v)) {
+                failures.push(format!(
+                    "T33: a's rows differ from shard 1's: {:?}",
+                    want.keys().collect::<Vec<_>>()
+                ));
+            }
+        } else if sent.is_empty() || !none(&sent.iter().collect()) {
+            failures.push(format!(
+                "T34: {:?}",
+                sent.iter().map(|(_, d)| d).collect::<Vec<_>>()
+            ));
+        }
+    }
+    exec(
+        &f.bootstrap,
+        &format!(
+            "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
+            f.db
+        ),
+    )
+    .await;
+    assert!(failures.is_empty(), "T33:\n{}", failures.join("\n"));
 }

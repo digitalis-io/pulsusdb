@@ -564,11 +564,19 @@ pub struct MetricsEngine {
     /// belong to. A read cache tail is routed by its span, and its
     /// histogram count and raw read (D9) are of it.
     request: Option<MetricQueryParams>,
+    /// TEST SEAM (issue #810): run after a read resolves its selectors and
+    /// before it renders a statement. `None` in production.
+    after_resolution: Option<AfterResolution>,
     /// TEST SEAM (issue #778): a server failure [`MetricsEngine::server_failure`]
     /// reports whatever the reads met.
     #[cfg(test)]
     injected_failure: Option<pulsus_clickhouse::ServerFailure>,
 }
+
+/// TEST SEAM (issue #810): see [`MetricsEngine::with_after_resolution`].
+pub type AfterResolution = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
 
 /// Issue #778: what planning alone says about a query, for the read cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -632,6 +640,7 @@ impl MetricsEngine {
             rollup_levels: None,
             statement_cap: crate::querytext::MAX_QUERY_TEXT_BYTES,
             request: None,
+            after_resolution: None,
             #[cfg(test)]
             injected_failure: None,
         }
@@ -649,6 +658,15 @@ impl MetricsEngine {
     /// to; a read cache tail is routed, and read raw, as its request is.
     pub fn with_request(mut self, request: MetricQueryParams) -> Self {
         self.request = Some(request);
+        self
+    }
+
+    /// TEST SEAM (issue #810): `hook` runs after a read resolves its
+    /// selectors and before it renders a statement. Never called by
+    /// `pulsus-server`.
+    #[doc(hidden)]
+    pub fn with_after_resolution(mut self, hook: AfterResolution) -> Self {
+        self.after_resolution = Some(hook);
         self
     }
 

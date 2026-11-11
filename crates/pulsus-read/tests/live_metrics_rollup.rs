@@ -759,7 +759,10 @@ static H: Shared = Shared::new(
         "a_query_over_native_histograms_reads_raw",
         "the_histogram_count_spans_the_query",
         "a_pushed_node_over_histograms_reads_raw",
-        "a_raw_tail_answers_its_whole_request",
+        "a_raw_tail_answers_its_tail",
+        "a_count_past_the_text_cap_drops_other_lists",
+        "a_kept_node_is_read_again_raw",
+        "a_kept_node_is_read_again_over_its_tail",
         "an_unrouted_join_over_histograms_falls_back",
         "a_mixed_join_falls_back_on_its_raw_side",
         "a_level_node_falls_back_on_another_selectors_histograms",
@@ -5579,7 +5582,8 @@ fn ungated(sql: &str) -> String {
 /// The rows `sql` reads, sent on its own under the settings a routed
 /// statement carries, from its `system.query_log` row.
 async fn rows_read(admin: &ChClient, sql: &str, what: &str) -> u64 {
-    let comment = format!("t810-gate-{what}-{}", now_ms());
+    // Unique across the tests that run at once over a shared database.
+    let comment = format!("t810-gate-{what}-{}", uuid::Uuid::new_v4().simple());
     // The client binds `?`: written `??`, as the dispatcher escapes it.
     admin
         .execute(
@@ -5598,13 +5602,31 @@ async fn rows_read(admin: &ChClient, sql: &str, what: &str) -> u64 {
     sent[0].read_rows
 }
 
+/// The columns of each table a gate holds back, as the routed statements
+/// read them.
+fn gated_columns(table: &str) -> &'static str {
+    if table == "metric_samples" {
+        "org_id String, fingerprint UInt128, unix_milli Int64, value Float64"
+    } else {
+        "kind UInt8, org_id String, fingerprint UInt128, t_end Int64, t_last Int64, \
+         last Float64, min Float64, max Float64, sum Float64, count UInt32, inc Float64, \
+         flags UInt8"
+    }
+}
+
 /// The rows `sql` reads from `{db}.{table}`: its rows read, less those of
-/// the same text with that table replaced by an empty copy of it.
+/// the same text with that table replaced by an empty table of its
+/// columns. The empty table is in a database of its own, so a shared
+/// fixture database is never written to.
 async fn rows_from(admin: &ChClient, db: &str, sql: &str, table: &str, what: &str) -> u64 {
-    let empty = format!("t810_empty_{table}");
+    let scratch = format!("{db}_gate_{}", uuid::Uuid::new_v4().simple());
+    exec(admin, &format!("CREATE DATABASE {scratch}")).await;
     exec(
         admin,
-        &format!("CREATE TABLE IF NOT EXISTS {db}.{empty} AS {db}.{table}"),
+        &format!(
+            "CREATE TABLE {scratch}.empty ({}) ENGINE = MergeTree ORDER BY tuple()",
+            gated_columns(table)
+        ),
     )
     .await;
     let from = format!("FROM {table}\n");
@@ -5612,9 +5634,10 @@ async fn rows_from(admin: &ChClient, db: &str, sql: &str, table: &str, what: &st
         sql.contains(&from),
         "{what}: the statement reads {table}:\n{sql}"
     );
-    let swapped = sql.replace(&from, &format!("FROM {empty}\n"));
+    let swapped = sql.replace(&from, &format!("FROM {scratch}.empty\n"));
     let all = rows_read(admin, sql, what).await;
     let rest = rows_read(admin, &swapped, &format!("{what}-without")).await;
+    exec(admin, &format!("DROP DATABASE {scratch} SYNC")).await;
     all.saturating_sub(rest)
 }
 
@@ -6227,11 +6250,12 @@ async fn a_pushed_node_over_histograms_reads_raw() {
     assert!(failures.is_empty(), "T18:\n{}", failures.join("\n"));
 }
 
-/// **T21 (issue #810, D14): a raw tail answers its whole request.**
+/// **T21 (issue #810, addendum r6): a raw tail answers its tail.** A tail
+/// over native histograms is read raw over the tail alone, in one statement.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_raw_tail_answers_its_whole_request() {
+async fn a_raw_tail_answers_its_tail() {
     skip_unless_live!();
-    let (built, end) = H.lease("a_raw_tail_answers_its_whole_request").await;
+    let (built, end) = H.lease("a_raw_tail_answers_its_tail").await;
     let db = built.db().to_string();
     let whole = h_range(end);
     let tail = range(whole.end_ms - 10 * MIN, whole.end_ms, SCRAPE);
@@ -6244,22 +6268,22 @@ async fn a_raw_tail_answers_its_whole_request() {
         .query_with_facts(&t, &expr, &tail)
         .await
         .expect("the tail");
-    let off = ask(&built.engine(false, None).await, &t, q, &whole).await;
+    let off = ask(&built.engine(false, None).await, &t, q, &tail).await;
     let sent = logged(&built.admin, &comment).await;
     built.finish().await;
     let mut failures = Vec::new();
     if sent.len() != 1 {
         failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
     }
-    if !(facts.raw && facts.whole) {
-        failures.push(format!("raw {}, whole {}", facts.raw, facts.whole));
+    if !facts.raw {
+        failures.push("not read raw".to_string());
     }
     let a = Answer {
         result,
         explain: PlanExplain::new("metrics"),
     };
     if a.cells() != off.cells() || off.cells().is_empty() {
-        failures.push("differs from routing off over the whole range".to_string());
+        failures.push("differs from routing off over the tail".to_string());
     }
     assert!(failures.is_empty(), "T21:\n{}", failures.join("\n"));
 }
@@ -6450,4 +6474,253 @@ async fn a_listed_and_an_unlisted_side_are_gated_over_the_cap() {
     }
     built.finish().await;
     assert!(failures.is_empty(), "T15:\n{}", failures.join("\n"));
+}
+
+// ------------------------------------------------- #810, addendum r6
+
+static DB_T32: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t810_32");
+
+/// The `fingerprint IN (…)` list of a routed statement's level arm.
+fn level_arm_line(sql: &str) -> &str {
+    sql.lines()
+        .find(|l| l.contains("WHERE kind = 0"))
+        .unwrap_or("")
+}
+
+/// The text of a routed statement's `hist_n` clause.
+fn hist_n_clause(sql: &str) -> &str {
+    sql.split_once(") AS hist_n").map_or("", |(head, _)| head)
+}
+
+/// **T31 (issue #810, addendum r6): a count past the text cap drops the
+/// other lists.** `d`'s statement fits the cap only without `c`'s list: it
+/// counts its own series alone and reads its level; `c`'s counts its
+/// histograms; `d` is read again raw.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_count_past_the_text_cap_drops_other_lists() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_count_past_the_text_cap_drops_other_lists").await;
+    let db = built.db().to_string();
+    let p = h_range(end);
+    let t = no_tenant();
+    let q = "last_over_time(d[1m]) or last_over_time(c[1m])";
+    // `d`'s statement as an engine with the default cap renders it.
+    let measure = comment_for(&db, "t31m");
+    ask(&built.engine(true, Some(&measure)).await, &t, q, &p).await;
+    let first = logged(&built.admin, &measure).await;
+    let d_len = first
+        .iter()
+        .find(|r| level_arm_line(&r.query).contains("810004'"))
+        .map(|r| r.query.len() as u64)
+        .expect("d's statement");
+    let comment = comment_for(&db, "t31");
+    let on = built
+        .engine(true, Some(&comment))
+        .await
+        .with_statement_cap(d_len);
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    let sent = logged(&built.admin, &comment).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 3 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    }
+    let d_first: Vec<&LoggedRead> = sent
+        .iter()
+        .filter(|r| level_arm_line(&r.query).contains("810004'"))
+        .collect();
+    if d_first.len() != 1
+        || d_first[0].query.contains("810001'")
+        || d_first[0].query.contains("FROM metric_series")
+    {
+        failures.push(format!(
+            "d's statement names c, or its ID statement: {:#?}",
+            d_first.iter().map(|r| &r.query).collect::<Vec<_>>()
+        ));
+    }
+    if sent
+        .iter()
+        .filter(|r| !r.query.contains("toUInt8(0) AS arm"))
+        .count()
+        != 1
+    {
+        failures.push(format!("no one raw re-read: {:#?}", brief(&sent)));
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+        failures.push("differs from routing off".to_string());
+    }
+    assert!(failures.is_empty(), "T31:\n{}", failures.join("\n"));
+}
+
+/// **T32 (issue #810, addendum r6): one resolution serves the count and the
+/// read.** A series of `c` lands, and the label cache lists it, after the
+/// read resolved its selectors: the statement's read and its count name the
+/// same list, the one resolved, without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_resolution_serves_count_and_read() {
+    skip_unless_live!();
+    let end = p_end();
+    let built = corpus_h(DB_T32.name(), end).await;
+    let db = built.db().to_string();
+    let lo = end - 4 * HOUR;
+    let fp = h_fp(9);
+    let land = vec![
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, 'c', {fp}, \
+                    toInt64({lo}) + toInt64(number) * {HOUR} + 1000, '{{\"s\":\"n\"}}', 0 FROM numbers(5)"
+        ),
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, 'c', {fp}, \
+                    toInt64({lo}) + toInt64(number) * {SCRAPE}, toFloat64(number) \
+             FROM numbers(1, {})",
+            4 * HOUR / SCRAPE
+        ),
+    ];
+    let cache = Arc::clone(&built.cache);
+    let config = test_config(&db);
+    let hook: pulsus_read::metrics::exec::AfterResolution = Arc::new(move || {
+        let (cache, config, land) = (Arc::clone(&cache), config.clone(), land.clone());
+        Box::pin(async move {
+            let c = ChClient::new(config).await.expect("connect");
+            for sql in &land {
+                exec(&c, sql).await;
+            }
+            cache.refresh().await.expect("refresh");
+        })
+    });
+    let comment = comment_for(&db, "t32");
+    let on = built
+        .engine(true, Some(&comment))
+        .await
+        .with_after_resolution(hook);
+    let p = h_range(end);
+    ask(&on, &no_tenant(), "last_over_time(c[1m])", &p).await;
+    let sent = logged(&built.admin, &comment).await;
+    let later = comment_for(&db, "t32later");
+    ask(
+        &built.engine(true, Some(&later)).await,
+        &no_tenant(),
+        "last_over_time(c[1m])",
+        &p,
+    )
+    .await;
+    let after = logged(&built.admin, &later).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 1 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    } else {
+        let sql = &sent[0].query;
+        let arm = level_arm_line(sql);
+        let list = arm
+            .split_once("fingerprint IN (")
+            .and_then(|(_, rest)| rest.split_once(") AND hist_n"))
+            .map(|(l, _)| l)
+            .unwrap_or("");
+        let count = hist_n_clause(sql);
+        if list.is_empty() || !count.contains(&format!("fingerprint IN ({list})")) {
+            failures.push(format!("the count does not name the read's list:\n{sql}"));
+        }
+        if count.contains("FROM metric_series") {
+            failures.push("the count reads an ID statement".to_string());
+        }
+        if sql.contains("810009'") {
+            failures.push("the series landed after the resolution is named".to_string());
+        }
+    }
+    if !after.iter().any(|r| r.query.contains("810009'")) {
+        failures.push("the landed series never reached the label cache".to_string());
+    }
+    assert!(failures.is_empty(), "T32:\n{}", failures.join("\n"));
+}
+
+/// T37's engine: corpus H's database with a label cache that lists at most
+/// two series a selector, so `d` (2) is listed and `c` (3) is not.
+async fn two_series_engine(built: &Built, comment: &str) -> MetricsEngine {
+    let db = built.db().to_string();
+    let mut cfg = cache_config(&db);
+    cfg.window_ms = 16 * DAY;
+    cfg.cache_max_series = 2;
+    let cache = Arc::new(LabelCache::new(
+        ChClient::new(test_config(&db)).await.expect("connect"),
+        cfg,
+    ));
+    cache.refresh().await.expect("refresh");
+    MetricsEngine::new(built.client().await, cache, engine_config(&db, true))
+        .with_rollup_levels(Arc::clone(&built.slot))
+        .with_query_log_comment(comment)
+}
+
+const T37_QUERY: &str = "sum(rate(d[1m])) + count(last_over_time(c[1m]))";
+
+/// **T37 (issue #810, addendum r6): a kept node is read again raw.** `d`'s
+/// node counts `d` alone and keeps its level answer; `c`'s statement counts
+/// its histograms; `d` is read again raw.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_node_is_read_again_raw() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_kept_node_is_read_again_raw").await;
+    let db = built.db().to_string();
+    let p = h_range(end);
+    let t = no_tenant();
+    let comment = comment_for(&db, "t37");
+    let on = two_series_engine(&built, &comment).await;
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, T37_QUERY, &p), ask(&off, &t, T37_QUERY, &p));
+    let sent = logged(&built.admin, &comment).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 3 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    }
+    if a.explain.rollup {
+        failures.push("marked rollup".to_string());
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+        failures.push("differs from routing off".to_string());
+    }
+    assert!(failures.is_empty(), "T37:\n{}", failures.join("\n"));
+}
+
+/// **T38 (issue #810, addendum r6): a kept node is read again over its
+/// tail.** T37's engine with its request; the tail of its last 10 minutes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_node_is_read_again_over_its_tail() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_kept_node_is_read_again_over_its_tail").await;
+    let db = built.db().to_string();
+    let whole = h_range(end);
+    let tail = range(whole.end_ms - 10 * MIN, whole.end_ms, SCRAPE);
+    let t = no_tenant();
+    let comment = comment_for(&db, "t38");
+    let on = two_series_engine(&built, &comment)
+        .await
+        .with_request(whole);
+    let expr = parse(T37_QUERY).expect("parse");
+    let (result, _, facts) = on
+        .query_with_facts(&t, &expr, &tail)
+        .await
+        .expect("the tail");
+    let off = ask(&built.engine(false, None).await, &t, T37_QUERY, &tail).await;
+    let sent = logged(&built.admin, &comment).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 3 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    }
+    if !facts.raw {
+        failures.push("not read raw".to_string());
+    }
+    let a = Answer {
+        result,
+        explain: PlanExplain::new("metrics"),
+    };
+    if vector_or_matrix(&a) != vector_or_matrix(&off) || vector_or_matrix(&off).is_empty() {
+        failures.push("differs from routing off over the tail".to_string());
+    }
+    assert!(failures.is_empty(), "T38:\n{}", failures.join("\n"));
 }

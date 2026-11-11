@@ -1752,3 +1752,190 @@ async fn a_query_with_an_unrouted_read_is_never_kept() {
     assert!(!sb.is_empty(), "T23: B's statements");
     assert_eq!(sa, sb, "T23: the second's statements on A and B");
 }
+
+// -- issue #810, addendum r6 -----------------------------------------------
+
+/// The 60 s level for `(from, to]` from the raw samples, as a build writes
+/// it (no offset), and one run row `(from, to]`.
+async fn write_level_exact(db: &str, from: i64, to: i64) {
+    let c = client(db).await;
+    exec(
+        &c,
+        &format!(
+            "INSERT INTO {db}.metric_samples_60s (kind, org_id, fingerprint, t_end, t_last, last, \
+             min, max, sum, count, inc, flags, built_at) \
+             SELECT 0, org_id, fingerprint, (intDiv(unix_milli - 1, 60000) + 1) * 60000 AS te, \
+             max(unix_milli), argMax(value, unix_milli), min(value), max(value), sum(value), \
+             toUInt32(count()), max(value) - min(value), 0, {to} \
+             FROM {db}.metric_samples WHERE unix_milli > {from} AND unix_milli <= {to} \
+             GROUP BY org_id, fingerprint, te"
+        ),
+    )
+    .await;
+    exec(
+        &c,
+        &format!(
+            "INSERT INTO {db}.metric_samples_60s (kind, org_id, fingerprint, t_last, t_end) \
+             VALUES (1, '', 0, {from}, {to})"
+        ),
+    )
+    .await;
+}
+
+/// One native-histogram sample of a new series `labels` at `at`.
+fn push_one_histogram(port: u16, labels: Vec<(String, String)>, at: i64) {
+    use prost::Message;
+    use pulsus_write::protocols::remote_write::{
+        BucketSpan, Histogram, HistogramCount, Label, TimeSeries, WriteRequest,
+    };
+    let req = WriteRequest {
+        timeseries: vec![TimeSeries {
+            labels: labels
+                .iter()
+                .map(|(n, v)| Label {
+                    name: n.clone(),
+                    value: v.clone(),
+                })
+                .collect(),
+            histograms: vec![Histogram {
+                count: Some(HistogramCount::Int(3)),
+                sum: 1.5,
+                schema: 0,
+                zero_threshold: 0.001,
+                zero_count: Some(HistogramCount::Int(0)),
+                positive_spans: vec![BucketSpan {
+                    offset: 0,
+                    length: 3,
+                }],
+                positive_deltas: vec![1, 0, 0],
+                timestamp: at,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let body = snap::raw::Encoder::new()
+        .compress_vec(&req.encode_to_vec())
+        .expect("snappy");
+    push(port, "a", &body);
+}
+
+/// **T39 (issue #810, addendum r6): a histogram at storage keeps the entry
+/// out.** `c` holds a native-histogram series inside the range: both of its
+/// requests are read raw and nothing is kept; `d`, floats only, is kept and
+/// its repeat is a hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_histogram_at_storage_keeps_the_entry_out() {
+    skip_unless_live!();
+    let a_port: u16 = 31_907;
+    let b_port: u16 = 31_908;
+    let r = rig(
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_t810_39_it")).await,
+        a_port,
+        b_port,
+        &[],
+    )
+    .await;
+    let samples = (r.times.now0 - r.times.t0) / 5_000;
+    let floats: Vec<(i64, f64)> = (1..=samples)
+        .map(|k| (r.times.t0 + k * 5_000, (k % 97) as f64))
+        .collect();
+    push_series(
+        r.b.port,
+        "a",
+        labels("c", &[("x", "f".to_string())]),
+        floats.clone(),
+    );
+    push_series(
+        r.b.port,
+        "a",
+        labels("d", &[("x", "f".to_string())]),
+        floats,
+    );
+    push_histogram(
+        r.b.port,
+        "a",
+        labels("c", &[("x", "h".to_string())]),
+        &r.times,
+    );
+    let end = (r.times.now0 - 30 * MINUTE).div_euclid(MINUTE) * MINUTE;
+    write_level_exact(&r.db, r.times.t0.div_euclid(MINUTE) * MINUTE, end).await;
+    Server::settle_poll();
+    let d = Range::new("last_over_time(d[1m])", end - 4 * HOUR, end, MINUTE);
+    assert_eq!(
+        same(&r.a, &r.b, d, "T39 d").cache(),
+        "miss",
+        "T39: d is kept"
+    );
+    assert_eq!(
+        same(&r.a, &r.b, d.shifted(MINUTE), "T39 d repeat").cache(),
+        "hit",
+        "T39: d's repeat"
+    );
+    let c = Range::new("last_over_time(c[1m])", end - 4 * HOUR, end, MINUTE);
+    assert_eq!(
+        same(&r.a, &r.b, c, "T39 c").cache(),
+        "bypass",
+        "T39: c is not kept"
+    );
+    assert_eq!(
+        same(&r.a, &r.b, c.shifted(MINUTE), "T39 c repeat").cache(),
+        "bypass",
+        "T39: c's repeat"
+    );
+}
+
+/// **T41 (issue #810, addendum r6): a raw-tail merge is answered but not
+/// stored.** A kept answer over floats; a native-histogram sample lands in
+/// the newer points; the repeat is a hit whose tail is read raw, answered as
+/// the cache-off server answers, and the entry kept stays the first one; a
+/// third request is again such a hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_raw_tail_merge_is_answered_but_not_stored() {
+    skip_unless_live!();
+    let a_port: u16 = 31_909;
+    let b_port: u16 = 31_910;
+    let r = rig(
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_t810_41_it")).await,
+        a_port,
+        b_port,
+        &[],
+    )
+    .await;
+    let samples = (r.times.now0 - r.times.t0) / 5_000;
+    let floats: Vec<(i64, f64)> = (1..=samples)
+        .map(|k| (r.times.t0 + k * 5_000, (k % 97) as f64))
+        .collect();
+    push_series(
+        r.b.port,
+        "a",
+        labels("x", &[("s", "f".to_string())]),
+        floats,
+    );
+    let built_to = r.times.now0.div_euclid(MINUTE) * MINUTE;
+    write_level_exact(&r.db, r.times.t0.div_euclid(MINUTE) * MINUTE, built_to).await;
+    Server::settle_poll();
+    let end = built_to;
+    let q = Range::new("last_over_time(x[1m])", end - 4 * HOUR, end, MINUTE);
+    let first = same(&r.a, &r.b, q, "T41 first");
+    assert_eq!(first.cache(), "miss", "T41: kept");
+    let kept = first.through().expect("T41: a Through");
+    // In the newer points: after the kept points' windows, before the
+    // repeat's end.
+    push_one_histogram(
+        r.b.port,
+        labels("x", &[("s", "h".to_string())]),
+        end + 30_000,
+    );
+    let second = same(&r.a, &r.b, q.shifted(MINUTE), "T41 repeat");
+    assert_eq!(second.cache(), "hit", "T41: the repeat");
+    assert_eq!(second.through(), Some(kept), "T41: the merge is not stored");
+    assert!(
+        second.body.contains("\"h\""),
+        "T41: the histogram is in the answer"
+    );
+    let third = same(&r.a, &r.b, q.shifted(2 * MINUTE), "T41 third");
+    assert_eq!(third.cache(), "hit", "T41: the third");
+    assert_eq!(third.through(), Some(kept), "T41: still the first entry");
+}

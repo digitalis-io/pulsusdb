@@ -2081,6 +2081,67 @@ mod tests {
         );
     }
 
+    /// **T35 (issue #810, addendum r6): the cap is a parameter.** A label
+    /// value and a matcher value that read as the old placeholder are
+    /// rendered unchanged.
+    #[test]
+    fn the_cap_is_a_parameter() {
+        let tenant = no_tenant();
+        let ids =
+            "SELECT fingerprint FROM metric_labels WHERE metric_name = '__pulsus_series_cap__'";
+        let label = pulsus_model::LabelSet::from_verbatim([(
+            "instance".to_string(),
+            "__pulsus_series_cap__".to_string(),
+        )]);
+        let fp = Fingerprint::from_raw(1).sql_literal();
+        let members = members_known(&[(fp.clone(), &label)]);
+        let list = sample_sql::render_fingerprint_list(std::slice::from_ref(&fp));
+        let side = |series: SideSeries<'_>, name: &'static str| -> String {
+            let side = SideSql {
+                tenant: &tenant,
+                samples_table: "metric_samples",
+                labels_table: "metric_labels",
+                series,
+                metric_name: name,
+                func: PushedRangeFn::Rate,
+                range_ms: 300_000,
+                scale: None,
+                window: T11_WINDOW,
+                level: Some(t11_level()),
+            };
+            level_aggregate_fetch(
+                &side,
+                "metric_hist_samples",
+                None,
+                t11_grid(),
+                RangeAggOp::Sum,
+                &Counts {
+                    series_n: Some("1"),
+                    cap: 8_192,
+                    hist_where: None,
+                },
+            )
+        };
+        let by_ids = side(SideSeries::Ids { ids, gated: true }, "p_rx_total");
+        assert!(
+            by_ids.contains("metric_name = '__pulsus_series_cap__'"),
+            "{by_ids}"
+        );
+        let known = side(
+            SideSeries::Known {
+                list: &list,
+                members: &members,
+                gated: true,
+            },
+            "p_tx_total",
+        );
+        assert!(
+            known.contains("('instance', '__pulsus_series_cap__')"),
+            "{known}"
+        );
+        assert!(known.contains("series_n * grid_n <= 8192"), "{known}");
+    }
+
     /// **T13 (issue #810, D10): every read of a counted statement is gated.**
     /// Shape C with an `Ids` side and a `Known` side of 3 literals, both
     /// gated, its series counted: every series read of either side, the
