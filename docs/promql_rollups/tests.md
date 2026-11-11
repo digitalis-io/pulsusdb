@@ -103,7 +103,7 @@ The live part B cases build the first level by the first-level view's statement 
 | T19 | `a_routed_hit_is_one_read` (`crates/pulsus-read/src/metrics/read_cache_stub_tests.rs`) | unit | a hit of an all-routed entry reads its tail only; what is kept, and when a clear sends it to the full read |
 | T20 | `a_routed_repeat_with_a_new_info_is_one_statement` (`crates/pulsus-server/tests/read_cache_live.rs`) | live | a routed repeat whose tail raises an info is a hit in one statement |
 | T21 | `a_raw_tail_answers_its_tail` (`crates/pulsus-read/tests/live_metrics_rollup.rs`) | live | a tail over native histograms is read raw over the tail alone, in one statement, equal to routing off over the tail |
-| T22 | `a_routed_hit_past_the_sample_cap_is_refused_in_one_statement` (`crates/pulsus-server/tests/read_cache_live.rs`) | live | a routed hit past the sample cap is refused as the cache-off server refuses it, in one statement |
+| T22 | `a_routed_hit_past_the_sample_cap_is_refused_in_one_statement` (`crates/pulsus-server/tests/read_cache_live.rs`) | live | a routed hit is limited by its newest points (#835): with the whole range past the sample cap, the cache-off server refuses it while the hit answers in one statement |
 | T23 | `a_query_with_an_unrouted_read_is_never_kept` (`crates/pulsus-server/tests/read_cache_live.rs`) | live | a query with a routed and an unrouted read is never kept |
 | T24 | `an_unrouted_join_over_histograms_falls_back` (`crates/pulsus-read/tests/live_metrics_rollup.rs`) | live | a raw join over native histograms falls back on its own count |
 | T25 | `a_mixed_join_falls_back_on_its_raw_side` (`crates/pulsus-read/tests/live_metrics_rollup.rs`) | live | a join with a level side falls back on its raw side's histograms |
