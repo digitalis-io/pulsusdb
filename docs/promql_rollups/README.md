@@ -26,11 +26,11 @@ The user's account is `docs/api.md` §3.6 and the setting's is `docs/configurati
 | D4 | One table per level, each with its expiry in its own `CREATE TABLE`, so each level can carry its own retention and storage placement. One data row per series and bucket, `kind = 0, t_end, t_last, last, min, max, sum, count, inc, flags, built_at`, and one run row per run; `built_at` is `0` on data rows and the run's clock on run rows. No metric type is needed to build a row | owner (one table per level) | `building.md` §2 |
 | D5 | The levels form a chain: the first is built from raw, each other from the one below, each by a refreshable view on its own timer, with the timer and offset derived from the level sizes. A level builds only inside its source's run rows | owner (chain, timers) | `building.md` §3 |
 | D6 | A run reads only its own window | — | `building.md` §3.4 |
-| D7 | A selector reads the level chosen by the query's time range (`reading.md` §2) inside that level's coverage, and the rest of its window from finer levels, then raw, so every chart refresh shows the newest samples | owner (newest samples) | `reading.md` §2, §3 |
+| D7 | A selector reads the level chosen by the query's time range and nothing else; the newest steps take what is built (owner, 2026-11-10, #810) | owner | `reading.md` §2, §3 |
 | D8 | Rollup building runs at a lower priority than inserts and queries: every rollup statement carries `max_threads = 2`, in the schema | owner (lower priority) | `building.md` §5 |
 | D9 | Users can see the levels: in the user documentation, in `runtimeinfo` and in explain | owner | `reading.md` §4 |
 | D10 | Native histograms read raw. Classic histogram buckets are counters | — | `reading.md` §1.2 |
-| D11 | A level's coverage is the union of its run rows' intervals, intersected over shards, read in the same statement as its data. Nothing outside it is read from the level | — | `reading.md` §3 |
+| D11 | No coverage is read: a data row exists only with its run row in one part (`building.md` §2.3) | — | `reading.md` §3 |
 | D12 | The first level drops exact repeats and orders values at one millisecond by value bits, as the raw fetch does | — | `building.md` §3.2 |
 | D13 | A level row keeps the bucket's last sample that is not a stale marker, and `flags` records a stale end and a NaN, so the bit-equal functions read stale markers and NaN as raw | — | `building.md` §2.2, `reading.md` §1 |
 | D14 | The first level's predecessor for `inc` is the previous sample that is not a stale marker, keyed by `(org_id, fingerprint)`, taken from the level's own table when the run holds none, and not used when more than 24 hours old | — | `building.md` §3.1 |

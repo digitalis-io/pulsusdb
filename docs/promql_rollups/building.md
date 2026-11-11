@@ -352,8 +352,8 @@ The server accepted `EVERY 12 MINUTE OFFSET 240 SECOND`, `EVERY 2 HOUR OFFSET 30
 | `d_i = d_{i−1} + 60 s` | the source's run ended at least a minute earlier; runs over their normal window took at most 128 ms (§6.2) |
 | no `DEPENDS ON` | the watermark orders runs by their data on one server or many; `DEPENDS ON` orders views on one server only |
 | a missed or failed run | the next starts from the same watermark. The first level catches up at most 5 periods of samples per run, the others 10 buckets. An empty window still writes its run row, so the watermark moves |
-| never older than landing | a first-level run starts no earlier than `now − H × 3600 s + 720 s`. A stop longer than landing holds leaves a hole in the run rows, which is read from finer levels or raw (`reading.md` §3) |
-| the first run on a database already holding samples | the first level starts one period back and writes a run row from there. Earlier history has no run row and reads raw. A coarser level builds from the level below, back to that level's oldest run row |
+| never older than landing | a first-level run starts no earlier than `now − H × 3600 s + 720 s`. A stop longer than landing holds leaves a hole in the run rows: no value from the level there (`reading.md` §3) |
+| the first run on a database already holding samples | the first level starts one period back and writes a run row from there. Earlier history has no run row: no value from the level there (`reading.md` §3). A coarser level builds from the level below, back to that level's oldest run row |
 | settle 150 s | `received_ms` is stamped at admission, and the insert may commit up to the landing budget, 120 s, later (`WriterRuntime::landing_budget`, `docs/ingest-one-source-table.md:428-432`). A sample later than that stays in raw only |
 | lookback 120 s | the first level reads two minutes before its window for each series' previous sample; a series with none there takes it from the level's own table, up to a day back (§3.1) |
 
@@ -396,17 +396,17 @@ Per day at a 15 s scrape and 4,000 series, a first-level run every minute read 1
 
 | failure | observed | answers |
 |---|---|---|
-| a run fails, on its memory limit, its time limit or a replica that does not answer | no rows and no run row; the next run retries the same window | the window is past the watermark, so it is read from finer levels or raw |
-| a level's view is stopped | its run rows stop; levels above it build up to its last run row and then find no work | queries read the newer part of every window from finer levels or raw |
-| a stop longer than landing holds | the first level resumes at `now − H × 3600 s + 720 s`; the run rows have a hole, and every coarser level leaves unbuilt exactly the buckets it touches | the hole is read raw |
+| a run fails, on its memory limit, its time limit or a replica that does not answer | no rows and no run row; the next run retries the same window | the window is past the watermark: no value from the level there (`reading.md` §3) |
+| a level's view is stopped | its run rows stop; levels above it build up to its last run row and then find no work | no value from the level there (`reading.md` §3) |
+| a stop longer than landing holds | the first level resumes at `now − H × 3600 s + 720 s`; the run rows have a hole, and every coarser level leaves unbuilt exactly the buckets it touches | no value from the level there (`reading.md` §3) |
 | a coarser run fires before its source's | it sees the old watermark and builds less | unchanged |
 | a run's data part is on a replica and its run row is not | cannot happen: they are one part (§2.3) | — |
 | the stage view's insert fails (disk, memory, a refused row) | the level's data and run row are committed; the run reports failure, and the next run starts past it. The stage holds none of the run's rows | unchanged: the next level builds that window as usual, reading those rows from the level itself (§3.1) |
 | the level's insert fails | nothing in the level and nothing in the stage: the view runs after the level's part is written | unchanged |
 | the next level stopped longer than `H` hours | the oldest unread stage rows fall due and can be dropped at any TTL merge from then, with their run rows | unchanged: it builds as usual, reading the dropped rows from the level itself |
 | a stage part dropped by expiry | its run row and data drop together (one part, §2.3) | — |
-| a later-level run over its memory cap | no rows and no run row; the next run retries the same window, so the level stops there, as before the stage | read from the finer level or raw, as for any hole |
-| a fallback read over the 50 s time limit (inferred, §5) | no rows and no run row; the next run retries the same window, so the level stops there, as for the memory cap | read from the finer level or raw while they hold it |
+| a later-level run over its memory cap | no rows and no run row; the next run retries the same window, so the level stops there, as before the stage | no value from the level there (`reading.md` §3) |
+| a fallback read over the 50 s time limit (inferred, §5) | no rows and no run row; the next run retries the same window, so the level stops there, as for the memory cap | no value from the level there (`reading.md` §3) |
 
 ### 4.1 Cluster
 
@@ -416,7 +416,7 @@ Per day at a 15 s scrape and 4,000 series, a first-level run every minute read 1
 | first level's read | `clusterAllReplicas` over `metric_landing` for this shard's fingerprint slice, exact repeats dropped (§3.2), so a replica behind its peer cannot hide a sample and the replicas' copies collapse to one. The read cost multiplies by the replica count |
 | a replica not answering | `skip_unavailable_shards = 0` fails the run; no run row; the next run retries the window |
 | coarser reads | the builder's local source level, only inside its local run rows (§3.2): from the builder's stage where its run rows cover, from its own copy of the level elsewhere. The stage is local to the builder; another replica's stage is empty, and a builder reads its own level where its stage lacks rows |
-| a builder down | its shard's run rows stop. That shard's coverage ends, so every query reads finer levels or raw after it (`reading.md` §3) |
+| a builder down | its shard's run rows stop. That shard's series have no value from the level after its last run |
 | `max_threads` | in the view's statement, so on every replica with no server configuration |
 
 `each_shard_builds_its_slice_once` (`crates/pulsus-schema/tests/live_cluster.rs:2061`) checks one row per bucket per shard and a push counted once with one replica's fetches stopped, and that only the builder's stage holds rows while the level is the same on both replicas. It runs in CI's cluster job; no figure here comes from a cluster.
