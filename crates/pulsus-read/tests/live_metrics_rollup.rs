@@ -765,7 +765,8 @@ static H: Shared = Shared::new(
         "a_kept_node_is_read_again_over_its_tail",
         "an_unrouted_join_over_histograms_falls_back",
         "a_mixed_join_falls_back_on_its_raw_side",
-        "a_level_node_falls_back_on_another_selectors_histograms",
+        "a_level_node_is_read_again_on_another_selectors_histograms",
+        "a_mixed_node_is_read_again_one_statement_a_side",
         "a_raw_only_node_stays_pushed_in_a_raw_query",
     ],
 );
@@ -6336,29 +6337,98 @@ async fn a_mixed_join_falls_back_on_its_raw_side() {
     assert_eq!(vector_or_matrix(&a), vector_or_matrix(&b), "T25");
 }
 
-/// **T26 (issue #810, D9): a level node falls back on another selector's
-/// histograms.**
+/// A routed selector read again raw: the raw arms alone, no count.
+fn is_raw_again(sql: &str) -> bool {
+    sql.starts_with("SELECT arm, fingerprint, t, t_last") && !sql.contains("AS hist_n")
+}
+
+/// **T26 (issue #810, D9; code review r1): a level node is read again on
+/// another selector's histograms.** `d`'s node counts the listed `c`'s
+/// histograms beside its own series, none of its own: it keeps its answer,
+/// which is discarded, and `d` is read again raw in one statement. Three
+/// statements: the node, `c`'s, `d` again.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_level_node_falls_back_on_another_selectors_histograms() {
+async fn a_level_node_is_read_again_on_another_selectors_histograms() {
     skip_unless_live!();
     let (built, end) = H
-        .lease("a_level_node_falls_back_on_another_selectors_histograms")
+        .lease("a_level_node_is_read_again_on_another_selectors_histograms")
         .await;
+    let db = built.db().to_string();
     let p = h_range(end);
     let t = no_tenant();
     let q = "sum(rate(d[1m])) + count(last_over_time(c[1m]))";
-    let on = built.pushed_engine(None).await;
+    let comment = comment_for(&db, "t26");
+    let on = built.pushed_engine(Some(&comment)).await;
     let off = built.engine(false, None).await;
     let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    let sent = logged(&built.admin, &comment).await;
     built.finish().await;
-    assert!(
-        a.declines().contains(&"declined: HistogramSamples"),
-        "T26: declines {:?}",
-        a.declines()
-    );
-    assert!(!a.explain.rollup, "T26: read raw");
-    assert!(!vector_or_matrix(&b).is_empty(), "T26: an answer");
-    assert_eq!(vector_or_matrix(&a), vector_or_matrix(&b), "T26");
+    let mut failures = Vec::new();
+    if sent.len() != 3 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    }
+    if sent.iter().filter(|r| is_raw_again(&r.query)).count() != 1 {
+        failures.push(format!("not one raw re-read: {:#?}", brief(&sent)));
+    }
+    if a.declines().contains(&"declined: HistogramSamples") {
+        failures.push("the node fell back".to_string());
+    }
+    if a.explain.rollup {
+        failures.push("marked rollup".to_string());
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+        failures.push("differs from routing off".to_string());
+    }
+    assert!(failures.is_empty(), "T26:\n{}", failures.join("\n"));
+}
+
+/// **T42 (issue #810, code review r1): a mixed node is read again one
+/// statement a side.** `d` at its level and `e` raw in one node; the listed
+/// `c` holds the histograms, the node's own sides none. The node keeps its
+/// answer, discarded; `d` and `e` are each read again raw in one statement
+/// (`e`'s by its ID statement, as the node read it). Four statements: the
+/// node, `c`'s, `d` again, `e` again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mixed_node_is_read_again_one_statement_a_side() {
+    skip_unless_live!();
+    let (built, end) = H
+        .lease("a_mixed_node_is_read_again_one_statement_a_side")
+        .await;
+    let db = built.db().to_string();
+    let p = h_four_hours(end);
+    let t = no_tenant();
+    let q = "sum(rate(d[5m]) + irate(e[5m])) + count(last_over_time(c[1m]))";
+    let comment = comment_for(&db, "t42");
+    let on = built.pushed_engine(Some(&comment)).await;
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    let sent = logged(&built.admin, &comment).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 4 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    }
+    let again: Vec<&LoggedRead> = sent.iter().filter(|r| is_raw_again(&r.query)).collect();
+    if again.len() != 2 {
+        failures.push(format!("{} raw re-reads: {:#?}", again.len(), brief(&sent)));
+    }
+    // `e`'s re-read names its series by its ID statement, with the labels arm.
+    if !again
+        .iter()
+        .any(|r| r.query.contains("toUInt8(2) AS arm") && r.query.contains("'e'"))
+    {
+        failures.push(format!(
+            "no re-read of e by its ID statement: {:#?}",
+            again.iter().map(|r| &r.query).collect::<Vec<_>>()
+        ));
+    }
+    if a.declines().contains(&"declined: HistogramSamples") {
+        failures.push("the node fell back".to_string());
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+        failures.push("differs from routing off".to_string());
+    }
+    assert!(failures.is_empty(), "T42:\n{}", failures.join("\n"));
 }
 
 /// **T27 (issue #810, D9): a raw-only node stays pushed in a raw query.**
