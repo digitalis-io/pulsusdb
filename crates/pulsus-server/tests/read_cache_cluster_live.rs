@@ -610,3 +610,280 @@ async fn l27_each_poll_reads_on_one_server() {
         "L27: {with_watermarks} polls read the watermarks: {groups:?}"
     );
 }
+
+// -- issue #810, addendum r6 -----------------------------------------------
+
+/// A range request at a 12 minute step, on the 720 s level's grid: a 30 h
+/// `last_over_time(g[1m])` is read at the 720 s level's bucket ends, its
+/// range one bucket, and each step is the last sample before it, as raw.
+const TWELVE: i64 = 12 * MINUTE;
+
+fn query_range_twelve(port: u16, q: &str, start: i64, end: i64) -> Resp {
+    let path = format!(
+        "/api/v1/query_range?query={}&start={}&end={}&step=720",
+        encode(q),
+        secs(start),
+        secs(end),
+    );
+    http(port, "GET", &path, &[("X-Scope-OrgID", "a")], b"")
+}
+
+/// Waits until no replica of `db`'s metrics tables lags 5 s or more, as the
+/// read cache's poll measures it.
+async fn wait_for_no_lag(db: &str, what: &str) {
+    let c = ChClient::new(shard1_config(db)).await.expect("shard1");
+    let sql = format!(
+        "SELECT toString(max(absolute_delay)) AS s FROM clusterAllReplicas('{CLUSTER_NAME}', system.replicas) \
+         WHERE database = '{db}' AND startsWith(table, 'metric_')"
+    );
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let lag: u64 = c
+            .query_strings(&sql, &QuerySettings::new())
+            .await
+            .expect("lag")
+            .first()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if lag < 5 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the replicas still lag {lag} s"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// The 60 s and 720 s levels for `(from, to]` from the raw samples of both
+/// shards, as a build writes them, and their run rows `(from, to]` on each
+/// shard: a 30 h range reads the 720 s level, and both levels' watermarks
+/// count for it. `to` is on both levels' grids.
+async fn write_level_cluster(db: &str, from: i64, to: i64) {
+    let s1 = ChClient::new(shard1_config(db)).await.expect("shard1");
+    for width in [60_000i64, 720_000] {
+        let level = width / 1000;
+        exec(
+            &s1,
+            &format!(
+                "INSERT INTO {db}.metric_samples_{level}s_dist (kind, org_id, fingerprint, t_end, t_last, last, \
+                 min, max, sum, count, inc, flags, built_at) \
+                 SETTINGS insert_distributed_sync = 1 \
+                 SELECT 0, org_id, fingerprint, (intDiv(unix_milli - 1, {width}) + 1) * {width} AS te, \
+                 max(unix_milli), argMax(value, unix_milli), min(value), max(value), sum(value), \
+                 toUInt32(count()), max(value) - min(value), 0, {to} \
+                 FROM {db}.metric_samples_dist WHERE unix_milli > {from} AND unix_milli <= {to} \
+                 GROUP BY org_id, fingerprint, te"
+            ),
+        )
+        .await;
+    }
+    for config in [shard1_config(db), shard2_config(db)] {
+        let node = ChClient::new(config).await.expect("a node");
+        for level in ["60s", "720s"] {
+            exec(
+                &node,
+                &format!(
+                    "INSERT INTO {db}.metric_samples_{level} (kind, org_id, fingerprint, t_last, t_end) \
+                     VALUES (1, '', 0, {from}, {to})"
+                ),
+            )
+            .await;
+        }
+    }
+}
+
+/// Each top-level statement the request `id` sent, on either shard, with
+/// its replica delay setting.
+async fn delays_of(db: &str, id: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for config in [shard1_config(db), shard2_config(db)] {
+        let node = ChClient::new(config).await.expect("a node");
+        exec(&node, "SYSTEM FLUSH LOGS").await;
+        let rows = node
+            .query_strings(
+                &format!(
+                    "SELECT Settings['max_replica_delay_for_distributed_queries'] || '\t' || query AS s \
+                     FROM system.query_log \
+                     WHERE type = 'QueryFinish' AND is_initial_query AND log_comment = '{id}'"
+                ),
+                &QuerySettings::new().set("log_comment", "t810-log"),
+            )
+            .await
+            .expect("query_log");
+        for r in rows {
+            let (d, q) = r.split_once('\t').unwrap_or(("", ""));
+            out.push((q.to_string(), d.to_string()));
+        }
+    }
+    out
+}
+
+/// One native-histogram sample of `g{i="h"}` at `at`, through `port`.
+fn push_one_histogram(port: u16, at: i64) {
+    use prost::Message;
+    use pulsus_write::protocols::remote_write::{
+        BucketSpan, Histogram, HistogramCount, Label, TimeSeries, WriteRequest,
+    };
+    let req = WriteRequest {
+        timeseries: vec![TimeSeries {
+            labels: vec![
+                Label {
+                    name: "__name__".to_string(),
+                    value: "g".to_string(),
+                },
+                Label {
+                    name: "i".to_string(),
+                    value: "h".to_string(),
+                },
+            ],
+            histograms: vec![Histogram {
+                count: Some(HistogramCount::Int(3)),
+                sum: 1.5,
+                schema: 0,
+                zero_threshold: 0.001,
+                zero_count: Some(HistogramCount::Int(0)),
+                positive_spans: vec![BucketSpan {
+                    offset: 0,
+                    length: 3,
+                }],
+                positive_deltas: vec![1, 0, 0],
+                timestamp: at,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let body = snap::raw::Encoder::new()
+        .compress_vec(&req.encode_to_vec())
+        .expect("snappy");
+    let r = http(
+        port,
+        "POST",
+        "/api/v1/write",
+        &[
+            ("Content-Type", "application/x-protobuf"),
+            ("X-Scope-OrgID", "a"),
+        ],
+        &body,
+    );
+    assert!(r.status / 100 == 2, "push: {} {}", r.status, r.body);
+}
+
+/// T36 and T40: the fixture, the 60 s level built over it, servers A and
+/// B, a 30 h `last_over_time(g[1m])` at a 12 minute step kept by A, and
+/// shard 1's second replica made to lag; the repeat is one step later. With `histogram`, a native-histogram sample lands
+/// in the newer points before the repeat. The repeat on A and on B, and the
+/// statements A's repeat sent.
+async fn tail_case(
+    db: ClusterDb,
+    a_port: u16,
+    b_port: u16,
+    histogram: bool,
+) -> (Resp, Resp, Vec<(String, String)>) {
+    let name = db.name.clone();
+    let name = name.as_str();
+    let b = Server::spawn(b_port, &db, "0");
+    let now0 = load_fixture(b.port);
+    let built_to = now0.div_euclid(TWELVE) * TWELVE;
+    write_level_cluster(
+        &db.name,
+        (now0 - 7 * HOUR).div_euclid(TWELVE) * TWELVE,
+        built_to,
+    )
+    .await;
+    let a = Server::spawn(a_port, &db, "64MiB");
+    // The bulk writes replicated, then two lag reads under 5 s since 10 s
+    // before the first request.
+    wait_for_no_lag(&db.name, name).await;
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    let q = "last_over_time(g[1m])";
+    // One step before the newest built bucket, so the repeat's last step
+    // and the sample landed in it are not in the future.
+    let end = built_to - TWELVE;
+    let first = query_range_twelve(a.port, q, end - 30 * HOUR, end);
+    assert_eq!(first.status, 200, "{name}: {}", first.body);
+    assert_eq!(
+        first.cache(),
+        "miss",
+        "{name}: the first is kept: {}",
+        &first.body[..first.body.len().min(300)]
+    );
+    if histogram {
+        // In the repeat's newest step's window, after the kept points'.
+        push_one_histogram(b.port, end + TWELVE - 30_000);
+    }
+    stop_fetches(&db.name).await;
+    push_on_time(b.port, now_ms(), 1.0e9);
+    wait_for_lag(&db.name, name).await;
+    let ra = query_range_twelve(a.port, q, end + TWELVE - 30 * HOUR, end + TWELVE);
+    let rb = query_range_twelve(b.port, q, end + TWELVE - 30 * HOUR, end + TWELVE);
+    let id = ra
+        .header("x-pulsus-query-id")
+        .expect("an X-Pulsus-Query-Id")
+        .to_string();
+    let sent = delays_of(&db.name, &id).await;
+    start_fetches(&db.name).await;
+    drop(a);
+    drop(b);
+    (ra, rb, sent)
+}
+
+/// **T36 (issue #810, addendum r6): a cache tail keeps the lag guard.** A
+/// 30 h range is past the label cache's 24 h window; its repeat's tail is
+/// not, so the tail's one statement names its series by the cache's list
+/// and carries the lag guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cache_tail_keeps_the_lag_guard() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with the cluster fixture");
+        return;
+    }
+    let db = ClusterDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_cluster_t810_36")).await;
+    let a_port = 31_911;
+    let b_port = 31_912;
+    let (ra, _, sent) = tail_case(db, a_port, b_port, false).await;
+    assert_eq!(ra.status, 200, "T36: {}", ra.body);
+    assert_eq!(ra.cache(), "hit", "T36: the repeat");
+    assert_eq!(sent.len(), 1, "T36: the tail's statements {sent:#?}");
+    assert_eq!(sent[0].1, "5", "T36: the lag guard: {}", sent[0].0);
+}
+
+/// **T40 (issue #810, addendum r6): a histogram tail keeps the lag guard.**
+/// As T36, with a native-histogram sample landed in the newer points: the
+/// repeat is a hit whose one tail statement is read raw and carries the lag
+/// guard, no statement reads the whole range, and the answer is the
+/// cache-off server's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_histogram_tail_keeps_the_lag_guard() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with the cluster fixture");
+        return;
+    }
+    let db = ClusterDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_cluster_t810_40")).await;
+    let a_port = 31_913;
+    let b_port = 31_914;
+    let (ra, rb, sent) = tail_case(db, a_port, b_port, true).await;
+    assert_eq!(ra.status, 200, "T40: {}", ra.body);
+    assert_eq!(rb.status, 200, "T40: B {}", rb.body);
+    assert_eq!(ra.cache(), "hit", "T40: the repeat");
+    assert_eq!(sent.len(), 1, "T40: the tail's statements {sent:#?}");
+    assert_eq!(sent[0].1, "5", "T40: the lag guard: {}", sent[0].0);
+    assert!(
+        sent[0].0.contains("hs.unix_milli"),
+        "T40: the tail is read raw: {}",
+        sent[0].0
+    );
+    assert!(
+        ra.body.contains("\"h\""),
+        "T40: the histogram is in the answer"
+    );
+    assert!(
+        ra.body == rb.body,
+        "T40: A and B differ\nA: {}\nB: {}",
+        &ra.body[..ra.body.len().min(2000)],
+        &rb.body[..rb.body.len().min(2000)]
+    );
+}

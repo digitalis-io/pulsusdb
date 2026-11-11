@@ -64,20 +64,21 @@ async fn engine_for(
         Some(ms) => engine.with_lookback_ms(ms),
         None => engine,
     };
-    Ok(match options.routing_span_ms {
-        Some(span) => engine.with_routing_span_ms(span),
+    Ok(match options.request {
+        Some(request) => engine.with_request(request),
         None => engine,
     })
 }
 
 /// What a request sets on its engine beyond the defaults: its
-/// `lookback_delta`, and (issue #778, a range request through the read
-/// cache) the span every range evaluation of the request is routed by, so
-/// a cached answer's tail reads the level its whole request reads.
+/// `lookback_delta`, and (issues #778 and #810, a range request through the
+/// read cache) the whole request, by which every range evaluation of it is
+/// routed, so a cached answer's tail reads the level its whole request
+/// reads.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct EngineOptions {
     pub(super) lookback_ms: Option<i64>,
-    pub(super) routing_span_ms: Option<i64>,
+    pub(super) request: Option<pulsus_read::MetricQueryParams>,
 }
 
 impl From<Option<i64>> for EngineOptions {
@@ -85,7 +86,7 @@ impl From<Option<i64>> for EngineOptions {
     fn from(lookback_ms: Option<i64>) -> Self {
         EngineOptions {
             lookback_ms,
-            routing_span_ms: None,
+            request: None,
         }
     }
 }

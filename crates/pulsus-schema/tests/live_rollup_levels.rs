@@ -2125,3 +2125,120 @@ async fn a_level_and_its_series_outlive_raw() {
     }
     drop_db(&client, db).await;
 }
+
+static DB_ONE_PART: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_levels_one_part");
+
+/// **T9 (issue #810, D2): every bucket is one part with its run row.** The
+/// default levels, merges stopped on every level and stage table. 70,000
+/// series every 15 s, so a first-level bucket is 70,000 rows, over one
+/// output block (65,409): ten minutes landed, one first-level run, five
+/// more minutes landed, the first level until idle, then the later levels
+/// until idle. In every level table no part holds data rows without a run
+/// row, no bucket is in two parts, and every data row is inside a run row
+/// of its own part.
+#[tokio::test]
+async fn every_bucket_is_one_part_with_its_run_row() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = DB_ONE_PART.name();
+    let ctx = RenderCtx::for_tests(db, 7);
+    fresh(&client, &ctx).await;
+    let tables: Vec<String> = rows::<NameRow>(
+        &client,
+        &format!(
+            "SELECT name FROM system.tables WHERE database = '{db}' \
+             AND (match(name, '^metric_samples_[0-9]+s$') OR match(name, '^metric_samples_[0-9]+s_stage$')) ORDER BY name"
+        ),
+    )
+    .await
+    .into_iter()
+    .map(|r| r.name)
+    .collect();
+    for t in &tables {
+        exec(&client, &format!("SYSTEM STOP MERGES {db}.{t}")).await;
+    }
+    let now = now_ms(&client).await;
+    let start = now / MINUTE * MINUTE - 20 * MINUTE;
+    let land = |from: i64, minutes: i64| {
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, '', toUInt128(number % 70000 + 1), \
+                    {from} + (intDiv(number, 70000) + 1) * 15000, toFloat64(number % 97) \
+             FROM numbers({})",
+            70_000 * minutes * 4
+        )
+    };
+    exec(&client, &land(start, 10)).await;
+    // The seed is a run row like any other, with a clock.
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {db}.metric_samples_60s (kind, org_id, fingerprint, t_end, t_last, built_at) \
+             VALUES (1, '', 0, {start}, {}, 1)",
+            start - MINUTE
+        ),
+    )
+    .await;
+    run(&client, db, 60).await;
+    exec(&client, &land(start + 10 * MINUTE, 5)).await;
+    until_idle(&client, db, 60, 20).await;
+    for r in &ctx.rollup_levels[1..] {
+        until_idle(&client, db, *r, 20).await;
+    }
+    let mut failures = Vec::new();
+    for r in &ctx.rollup_levels {
+        let t = format!("{db}.metric_samples_{r}s");
+        let orphans = int(
+            &client,
+            &format!(
+                "SELECT toInt64(count()) AS v FROM (SELECT _part FROM {t} GROUP BY _part \
+                 HAVING countIf(kind = 0) > 0 AND countIf(kind = 1) = 0)"
+            ),
+        )
+        .await;
+        let split = int(
+            &client,
+            &format!(
+                "SELECT toInt64(count()) AS v FROM (SELECT t_end FROM {t} WHERE kind = 0 \
+                 GROUP BY t_end HAVING uniqExact(_part) > 1)"
+            ),
+        )
+        .await;
+        let outside = int(
+            &client,
+            &format!(
+                "SELECT toInt64(count()) AS v FROM (\
+                   SELECT groupArrayIf((t_last, t_end), kind = 1) AS runs, \
+                          groupArrayIf(t_end, kind = 0) AS ends \
+                   FROM {t} GROUP BY _part) ARRAY JOIN ends AS e \
+                 WHERE NOT arrayExists(x -> e > x.1 AND e <= x.2, runs)"
+            ),
+        )
+        .await;
+        let data = int(
+            &client,
+            &format!("SELECT toInt64(countIf(kind = 0)) AS v FROM {t}"),
+        )
+        .await;
+        println!(
+            "{t}: {data} data rows; {orphans} parts without a run row, {split} split buckets, {outside} rows outside"
+        );
+        if orphans != 0 || split != 0 || outside != 0 {
+            failures.push(format!(
+                "{t}: {orphans} parts without a run row, {split} buckets in two parts, {outside} rows outside their part's runs"
+            ));
+        }
+    }
+    let first = int(
+        &client,
+        &format!("SELECT toInt64(countIf(kind = 0)) AS v FROM {db}.metric_samples_60s"),
+    )
+    .await;
+    drop_db(&client, db).await;
+    assert!(
+        first >= 70_000 * 10,
+        "T9: the first level holds {first} rows"
+    );
+    assert!(failures.is_empty(), "T9:\n{}", failures.join("\n"));
+}

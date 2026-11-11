@@ -830,6 +830,18 @@ pub fn is_histogram_sentinel(gid: &[(String, String)]) -> bool {
     matches!(gid, [(k, v)] if k.is_empty() && v.is_empty())
 }
 
+/// Issue #810 (D10): whether a row carries a pushed statement's own series
+/// count, [`super::grouped_sql::SERIES_SENTINEL_KEY`].
+pub fn is_series_sentinel(gid: &[(String, String)]) -> bool {
+    matches!(gid, [(k, v)] if k.is_empty() && v == "series")
+}
+
+/// Issue #810 (D9): whether a row carries `hist_n`,
+/// [`super::grouped_sql::HIST_N_SENTINEL_KEY`].
+pub fn is_hist_n_sentinel(gid: &[(String, String)]) -> bool {
+    matches!(gid, [(k, v)] if k.is_empty() && v == "hist_n")
+}
+
 /// Issue #579 part 5: whether a row is S3c's matching sentinel,
 /// [`super::grouped_sql::MATCH_SENTINEL_KEY`].
 pub fn is_match_sentinel(gid: &[(String, String)]) -> bool {
@@ -887,6 +899,10 @@ pub fn range_node(
             // `ORDER BY` binds only to the last `SELECT` of the union.
             if is_histogram_sentinel(&row.gid) {
                 histograms += row.agg.unwrap_or(0.0);
+                continue;
+            }
+            // Issue #810: the statement's own counts, read by the executor.
+            if is_series_sentinel(&row.gid) || is_hist_n_sentinel(&row.gid) {
                 continue;
             }
             let Some(agg) = row.agg else {
@@ -951,34 +967,6 @@ pub fn range_node(
         steps,
         annotations: Annotations::new(),
     }))
-}
-
-/// Issue #579 part 4: the grid indices of `grid` whose window
-/// `(t - range, t]` reaches into an interval of `todo` — `t - range < b`
-/// and `t > a` for some `(a, b]`, the test `RawOverlay::touches` makes —
-/// as merged half-open ranges `[g0, g1)`.
-pub fn raw_steps(grid: Grid, range_ms: i64, todo: &[(i64, i64)]) -> Vec<(u32, u32)> {
-    let n = i64::from(grid.points);
-    let step = grid.step_ms.max(1);
-    let mut out: Vec<(u32, u32)> = Vec::new();
-    for &(a, b) in todo {
-        // The first index past `a`, and the first at or past `b + range`.
-        let g0 = (a.saturating_sub(grid.start_ms)).div_euclid(step) + 1;
-        let g1 = (b
-            .saturating_add(range_ms)
-            .saturating_sub(grid.start_ms)
-            .saturating_add(step - 1))
-        .div_euclid(step);
-        let (g0, g1) = (g0.clamp(0, n) as u32, g1.clamp(0, n) as u32);
-        if g0 >= g1 {
-            continue;
-        }
-        match out.last_mut() {
-            Some(last) if g0 <= last.1 => last.1 = last.1.max(g1),
-            _ => out.push((g0, g1)),
-        }
-    }
-    out
 }
 
 /// Issue #579: a shape-B node's runs, folded into the node's answer.
@@ -2408,6 +2396,29 @@ mod tests {
         assert_eq!(push.grid, s.grid);
     }
 
+    /// **T7 (issue #810, D8): the split starts above the cap.** A 15 s grid
+    /// of 1,024 points: 1,024 series is 1,048,576 series-steps, one
+    /// statement; 1,025 is 1,049,600, two.
+    #[test]
+    fn the_split_starts_above_the_cap() {
+        let grid = Grid {
+            start_ms: 1_000,
+            step_ms: 15_000,
+            points: 1_024,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
+        };
+        assert_eq!(
+            time_chunks(grid, 1_024, PUSHED_SERIES_STEPS_PER_STATEMENT).len(),
+            1,
+            "at the cap"
+        );
+        assert_eq!(
+            time_chunks(grid, 1_025, PUSHED_SERIES_STEPS_PER_STATEMENT).len(),
+            2,
+            "over the cap"
+        );
+    }
+
     /// Section 3.4: over the cap, the grid is split by time, never by
     /// series. 128 series at 5,761 steps under a cap of 262,144 is 2,048
     /// steps a chunk, three chunks.
@@ -2976,80 +2987,5 @@ mod tests {
         assert!(is_match_sentinel(&kv("", "match")));
         assert!(!is_match_sentinel(&kv("", "")));
         assert!(!is_match_sentinel(&kv("role", "match")));
-    }
-
-    /// A small seeded generator, so T9's cases are the same every run.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self
-                .0
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            self.0 >> 33
-        }
-
-        fn upto(&mut self, n: u64) -> i64 {
-            (self.next() % n) as i64
-        }
-    }
-
-    /// T9: a grid index is in `raw_steps` exactly when the overlay's own
-    /// test, `level_window_exists` at that one step, finds the window
-    /// touching a piece — over 1,000 seeded grids, ranges and up to five
-    /// pieces.
-    #[test]
-    fn raw_steps_agree_with_the_overlay() {
-        let mut rng = Lcg(579);
-        let base = plan_of("rate(rx[5m])", range_params()).selectors[0].clone();
-        let mut covered = 0usize;
-        for case in 0..1_000 {
-            let step_ms = 1_000 * (1 + rng.upto(300));
-            let points = 1 + rng.upto(200) as u32;
-            let start_ms = 1_782_907_200_000 + rng.upto(3_600_000);
-            let range_ms = 1_000 * (1 + rng.upto(900));
-            let grid = Grid {
-                start_ms,
-                step_ms,
-                points,
-                lookback_ms: DEFAULT_LOOKBACK_MS,
-            };
-            let span = step_ms * i64::from(points) + range_ms;
-            let mut at = start_ms - range_ms - rng.upto(600_000);
-            let mut pieces = Vec::new();
-            for _ in 0..rng.upto(6) {
-                let a = at + rng.upto(span as u64 / 3 + 1);
-                let b = a + 1 + rng.upto(span as u64 / 4 + 1);
-                pieces.push((a, b));
-                at = b + 1 + rng.upto(span as u64 / 5 + 1);
-            }
-            let mut sel = base.clone();
-            sel.range_ms = Some(range_ms);
-            let steps = raw_steps(grid, range_ms, &pieces);
-            for gi in 0..points {
-                let t = start_ms + i64::from(gi) * step_ms;
-                let one = PlanParams {
-                    start_ms: t,
-                    end_ms: t,
-                    step_ms: 0,
-                    ..range_params()
-                };
-                let raw = !super::super::rollup::level_window_exists(&sel, &one, &pieces);
-                let listed = steps.iter().any(|&(g0, g1)| gi >= g0 && gi < g1);
-                assert_eq!(
-                    listed, raw,
-                    "case {case}: gi {gi} t {t} range {range_ms} pieces {pieces:?} steps {steps:?}"
-                );
-                covered += usize::from(raw);
-            }
-            // Merged, ascending, non-empty ranges.
-            assert!(
-                steps.windows(2).all(|w| w[0].1 < w[1].0),
-                "case {case}: {steps:?}"
-            );
-            assert!(steps.iter().all(|&(g0, g1)| g0 < g1 && g1 <= points));
-        }
-        assert!(covered > 0, "no case had a raw step");
     }
 }

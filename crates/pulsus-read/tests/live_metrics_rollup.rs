@@ -45,17 +45,12 @@ const HOUR: i64 = 3_600_000;
 const DAY: i64 = 86_400_000;
 const SCRAPE: i64 = 15_000;
 
-static DB_B3: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b3");
-static DB_B4: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b4");
-static DB_B5: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b5");
-static DB_B5B: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b5b");
 static DB_B1F: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b1f");
 static DB_B7: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b7");
 static DB_B10: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b10");
 static DB_S2: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_s2");
 static DB_B2E: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_b2e");
 static DB_T10: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t10");
-static DB_H1: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_h1");
 static DB_L1: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_l1");
 static DB_L7: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_l7");
 static DB_P5: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_p5");
@@ -637,6 +632,8 @@ enum Corpus {
     P,
     /// `corpus_p2(db, p_end())`.
     P2,
+    /// `corpus_h(db, p_end())` (issue #810).
+    H,
 }
 
 impl Corpus {
@@ -654,6 +651,10 @@ impl Corpus {
             Corpus::P2 => {
                 let end = p_end();
                 (corpus_p2(db, end).await, end)
+            }
+            Corpus::H => {
+                let end = p_end();
+                (corpus_h(db, end).await, end)
             }
         }
     }
@@ -730,7 +731,6 @@ static D60_2: Shared = Shared::new(
     Corpus::D(DEFAULTS, 6..8),
     &[
         "a_range_below_the_first_level_reads_raw",
-        "the_lattice_reads_no_finer_level_where_its_own_covers",
         "queries_off_the_lattice_keep_the_request_grid",
         "a_query_that_reads_the_step_time_keeps_its_steps",
     ],
@@ -746,6 +746,28 @@ static P: Shared = Shared::new(
         "unpushed_shapes_take_todays_route",
         "a_split_level_node_reads_its_prefix",
         "a_filled_request_pushes_both_reads",
+        "a_panel_at_a_level_is_one_statement",
+        "an_in_process_routed_selector_is_one_statement",
+        "a_node_the_cache_cannot_list_is_one_statement",
+        "a_listed_and_an_unlisted_side_are_gated_over_the_cap",
+    ],
+);
+static H: Shared = Shared::new(
+    pulsus_testkit::TestDb::new("pulsus_read_it_rollup_h810"),
+    Corpus::H,
+    &[
+        "a_query_over_native_histograms_reads_raw",
+        "the_histogram_count_spans_the_query",
+        "a_pushed_node_over_histograms_reads_raw",
+        "a_raw_tail_answers_its_tail",
+        "a_count_past_the_text_cap_drops_other_lists",
+        "a_kept_node_is_read_again_raw",
+        "a_kept_node_is_read_again_over_its_tail",
+        "an_unrouted_join_over_histograms_falls_back",
+        "a_mixed_join_falls_back_on_its_raw_side",
+        "a_level_node_is_read_again_on_another_selectors_histograms",
+        "a_mixed_node_is_read_again_one_statement_a_side",
+        "a_raw_only_node_stays_pushed_in_a_raw_query",
     ],
 );
 static P2: Shared = Shared::new(
@@ -762,13 +784,14 @@ static P2: Shared = Shared::new(
 );
 
 /// The five groups, by their statics' names.
-fn groups() -> [(&'static str, &'static Shared); 5] {
+fn groups() -> [(&'static str, &'static Shared); 6] {
     [
         ("D5_8", &D5_8),
         ("D60_8", &D60_8),
         ("D60_2", &D60_2),
         ("P", &P),
         ("P2", &P2),
+        ("H", &H),
     ]
 }
 
@@ -1259,516 +1282,6 @@ async fn each_served_function_is_within_its_distance() {
     assert!(failures.is_empty(), "B2 failures:\n{}", failures.join("\n"));
 }
 
-/// The upper bound of a `rollup_piece` note's interval, and its source:
-/// `"raw"` or the table.
-fn piece_of(note: &str) -> (String, i64) {
-    let source = note.split([' ', '.']).next().unwrap_or("").to_string();
-    let hi = note
-        .rsplit(", ")
-        .next()
-        .and_then(|s| s.strip_suffix(']'))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("no interval in {note:?}"));
-    (source, hi)
-}
-
-/// **B3 (issue #18 part B): a window reads the finer levels and raw after
-/// its level.** Corpus D's last two days; the 720 s level's coverage cut after
-/// `B`, the 60 s and 5 s levels' after `B + 30 m`, `B` a 720 s boundary
-/// three hours before the data's end. A 24-hour `last_over_time` (the
-/// 720 s level's band) at step 12 m lists the 720 s piece up to `B`, the
-/// 60 s piece `(B, B + 30 m]`, then raw to the end, in that order, and its
-/// last step equals the raw route's.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_window_reads_the_finer_levels_and_raw_after_its_level() {
-    skip_unless_live!();
-    let day0 = today() - 8 * DAY;
-    let end = day0 + 8 * DAY;
-    let built = corpus_d(DB_B3.name(), FIVE, day0, 6..8).await;
-    let b = end - 3 * HOUR;
-    // Each level is cut from its last bucket end at or before `b`.
-    for (r, from) in [(86_400, end - DAY), (7_200, end - 4 * HOUR), (720, b)] {
-        cut_runs(&built.admin, built.db(), r, from, end + DAY).await;
-    }
-    for r in [60, 5] {
-        cut_runs(&built.admin, built.db(), r, b + 30 * MIN, end + DAY).await;
-    }
-
-    let p = range(end - DAY, end, 12 * MIN);
-    let query = "last_over_time(c_normal[12m])";
-    let a = ask(&built.engine(true, None).await, &no_tenant(), query, &p).await;
-    let raw = ask(&built.engine(false, None).await, &no_tenant(), query, &p).await;
-    // A level whose coverage the cuts removed serves nothing; its stage
-    // names no interval.
-    let pieces: Vec<(String, i64)> = a
-        .stages("rollup_piece")
-        .iter()
-        .filter(|n| !n.ends_with(" served nothing"))
-        .map(|n| piece_of(n))
-        .collect();
-    assert_eq!(
-        pieces,
-        vec![
-            ("metric_samples_720s".to_string(), b),
-            ("metric_samples_60s".to_string(), b + 30 * MIN),
-            ("raw".to_string(), end),
-        ],
-        "{:?}",
-        a.stages("rollup_piece")
-    );
-    let last = |x: &Answer| -> Vec<(String, u64)> {
-        x.points()
-            .into_iter()
-            .filter(|((_, t), _)| *t == end)
-            .map(|((l, _), v)| (l, v.to_bits()))
-            .collect()
-    };
-    assert!(!last(&raw).is_empty());
-    assert_eq!(last(&a), last(&raw), "the last step");
-    built.finish().await;
-}
-
-/// B4 (iii): the per-step distance a stopped or stale counter may read
-/// at 720 s and coarser, twice the 0.0308 measured (owner decision,
-/// 2026-10-25).
-const STOPPED_STEP_ALLOWANCE_720S: f64 = 2.0 * 0.0308;
-
-/// Corpus D's sample time of series `s`, sample `i` (plan section 9).
-fn t_of(day0: i64, s: i64, i: i64) -> i64 {
-    day0 + 15_000 * i + 100 + (7919 * s) % 14_800 + (7 * s + 13 * i) % 201 - 100
-}
-
-/// `c_normal`'s value of series `s` at sample `i`.
-fn normal_v(s: i64, i: i64) -> f64 {
-    (i % (500 + (37 * s) % 300)) as f64
-}
-
-/// The sample numbers of series `s` whose times lie in `[a, b]`.
-fn samples_in(day0: i64, s: i64, a: i64, b: i64) -> Vec<i64> {
-    let first = (a - day0) / 15_000 - 2;
-    (first..first + (b - a) / 15_000 + 4)
-        .filter(|&i| (a..=b).contains(&t_of(day0, s, i)))
-        .collect()
-}
-
-/// B4's own series beside corpus D, landed with it before the levels are
-/// built: `c_stale`, `c_mixed`, `h` and `c_iv`. `floats` are
-/// `(metric, t, v)`, `hists` `(metric, t)`.
-fn b4_land(
-    db: &str,
-    day0: i64,
-    w: i64,
-    floats: &[(&str, i64, f64)],
-    hists: &[(&str, i64)],
-) -> Vec<String> {
-    let mut out = vec![format!(
-        "CREATE TABLE {db}.rd_extra ENGINE = Memory AS \
-         SELECT s, metric, concat('{{\"s\":\"', toString(s), '\"}}') AS labels, \
-                concat(metric, unhex('FF'), 's', unhex('FF'), toString(s), unhex('FF')) AS buf, \
-                bitOr(bitShiftLeft(toUInt128(bitShiftRight(cityHash64(metric), 32)), 96), \
-                      bitAnd(bitOr(bitShiftLeft(toUInt128(cityHash64(buf)), 64), toUInt128(xxHash64(buf))), \
-                             toUInt128('79228162514264337593543950335'))) AS fp \
-         FROM values('s UInt32, metric String', (0, 'c_stale'), (1, 'c_mixed'), (0, 'h'), (0, 'c_iv'))"
-    )];
-    out.push(format!(
-        "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
-         SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, metric, fp, \
-                toInt64({}) + toInt64(n.number) * {HOUR} + 1000, labels, 0 \
-         FROM {db}.rd_extra, numbers(24) AS n",
-        day0 + 7 * DAY
-    ));
-    for chunk in floats.chunks(2_000) {
-        let values: Vec<String> = chunk
-            .iter()
-            .map(|(m, t, v)| {
-                format!(
-                    "('{m}', {t}, reinterpretAsFloat64(toUInt64({})))",
-                    v.to_bits()
-                )
-            })
-            .collect();
-        out.push(format!(
-            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
-             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, e.metric, e.fp, x.t, x.v \
-             FROM (SELECT * FROM values('m String, t Int64, v Float64', {})) AS x \
-             JOIN {db}.rd_extra AS e ON e.metric = x.m",
-            values.join(", ")
-        ));
-    }
-    let _ = w;
-    for chunk in hists.chunks(2_000) {
-        let values: Vec<String> = chunk.iter().map(|(m, t)| format!("('{m}', {t})")).collect();
-        out.push(format!(
-            "INSERT INTO {db}.metric_hist_samples (org_id, fingerprint, unix_milli, schema, zero_threshold, zero_count, \
-                                                   count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
-                                                   neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values) \
-             SELECT '', e.fp, x.t, 0, 0., 0, toUInt64(4 + intDiv(x.t, 15000) % 1000), \
-                    5. + toFloat64(intDiv(x.t, 15000) % 1000), [0], [3], [1, 1, -1], [], [], [], [] \
-             FROM (SELECT * FROM values('m String, t Int64', {})) AS x \
-             JOIN {db}.rd_extra AS e ON e.metric = x.m",
-            values.join(", ")
-        ));
-    }
-    out
-}
-
-/// One answer's points by series and step.
-type Points<V> = BTreeMap<(String, i64), V>;
-
-/// The points of `x` whose step is after `w`, and those at or before it.
-fn split_at_w<V: Clone>(x: &Points<V>, w: i64) -> (Points<V>, Points<V>) {
-    let after = x
-        .iter()
-        .filter(|((_, t), _)| *t > w)
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let before = x
-        .iter()
-        .filter(|((_, t), _)| *t <= w)
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    (after, before)
-}
-
-/// **B4 (issue #18 part B): a window touching raw is raw.** Corpus D's
-/// last two days at every level, with `c_stale`, `c_mixed`, `h` and `c_iv`
-/// beside it; `W = day0 + 7 d 18 h`. (i) to (ii) and (v), over ranges in
-/// the 60 s level's band, with the 60 s and 5 s levels' coverage cut after
-/// `W`; (iii) and (iv), over 24 hours (the 720 s level's band), with the
-/// 720 s level's cut after `W` too, against the same step read before
-/// that cut.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_window_touching_raw_is_raw() {
-    skip_unless_live!();
-    let db = DB_B4.name();
-    let day0 = today() - 8 * DAY;
-    let day = day0 + 7 * DAY;
-    let end = day0 + 8 * DAY;
-    let w = day + 18 * HOUR;
-
-    let mut floats: Vec<(&str, i64, f64)> = Vec::new();
-    let mut hists: Vec<(&str, i64)> = Vec::new();
-    // `c_stale`: `c_normal`'s series 0 to `W + 4 min`, then one stale
-    // marker 15 s after its last sample. It starts 10 minutes before the
-    // queries' `W − 1 h`, so no window of theirs holds the series' start.
-    let stale = samples_in(day0, 0, w - HOUR - 10 * MIN, w + 4 * MIN);
-    for &i in &stale {
-        floats.push(("c_stale", t_of(day0, 0, i), normal_v(0, i)));
-    }
-    let last_stale = t_of(day0, 0, *stale.last().expect("samples"));
-    floats.push((
-        "c_stale",
-        last_stale + SCRAPE,
-        f64::from_bits(9_218_868_437_227_405_314),
-    ));
-    // `c_mixed`: `c_normal`'s series 1 until `W + 2 min`, native
-    // histograms after, to `W + 1 h`.
-    for i in samples_in(day0, 1, day, w + HOUR) {
-        let t = t_of(day0, 1, i);
-        if t <= w + 2 * MIN {
-            floats.push(("c_mixed", t, normal_v(1, i)));
-        } else {
-            hists.push(("c_mixed", t));
-        }
-    }
-    // `h`: native histograms only, from `W − 1 h` to `W + 1 h`.
-    for i in samples_in(day0, 0, w - HOUR, w + HOUR) {
-        hists.push(("h", t_of(day0, 0, i)));
-    }
-    // `c_iv`: rising by 30 a scrape to 900, resetting, again and again,
-    // then a last reset to 10, 40, 70, 100 at `W − 10 s`; after `W`, 130,
-    // 160, ... from `W + 5 s`.
-    for k in 0..=(2 * HOUR / SCRAPE) {
-        let v = if k <= 3 {
-            100 - 30 * k
-        } else {
-            900 - 30 * ((k - 4) % 31)
-        };
-        floats.push(("c_iv", w - 10_000 - k * SCRAPE, v as f64));
-    }
-    for j in 0..(HOUR + 20 * MIN) / SCRAPE {
-        floats.push(("c_iv", w + 5_000 + j * SCRAPE, (130 + 30 * j) as f64));
-    }
-
-    let mut land = vec![
-        corpus_d_series(db),
-        corpus_d_registrations(db, day - DAY, 48),
-        corpus_d_day(db, day0, 6),
-        corpus_d_day(db, day0, 7),
-    ];
-    land.extend(b4_land(db, day0, w, &floats, &hists));
-    let built = build(db, FIVE, &land, day - DAY, end, &[]).await;
-    for r in [60, 5] {
-        cut_runs(&built.admin, built.db(), r, w, end + DAY).await;
-    }
-
-    // (i) and (ii).
-    let counters = [
-        ("c_normal", "normal"),
-        ("c_fast", "fast"),
-        ("c_stop", "stop"),
-        ("c_sparse", "sparse"),
-        ("c_stale", "normal"),
-    ];
-    for (metric, kind) in counters {
-        for f in ["rate", "increase"] {
-            let query = format!("{f}({metric}[5m])");
-            let (a, b) = both(&built, &query, &range(w - HOUR, w + HOUR, MIN), None).await;
-            let (after_a, before_a) = split_at_w(&a.cells(), w);
-            let (after_b, _) = split_at_w(&b.cells(), w);
-            assert!(!after_b.is_empty(), "{query}: steps after W");
-            assert_eq!(
-                after_a, after_b,
-                "(i) {query}: every step after W is the raw route's"
-            );
-            let (_, pa) = split_at_w(&a.points(), w);
-            let (_, pb) = split_at_w(&b.points(), w);
-            let d = distances(&pa, &pb);
-            let (p99, max) = p99_max(&d);
-            let limit = bound(f, kind, 60).expect("a counter kind");
-            println!(
-                "B4 (i) {query}: before W n {} p99 {p99:e} max {max:e} bound {limit:e}",
-                d.len()
-            );
-            assert!(!before_a.is_empty());
-            assert!(p99 <= limit, "(i) {query}: p99 {p99:e} above {limit:e}");
-            assert!(
-                a.explain.rollup,
-                "(i) {query}: a level served the steps before W"
-            );
-
-            // From `W + 1 m`: the grid starts at `start`, and the window
-            // at `W` itself lies wholly in the level's coverage.
-            let (a, b) = both(&built, &query, &range(w + MIN, w + HOUR + MIN, MIN), None).await;
-            assert!(!b.cells().is_empty());
-            assert_eq!(a.cells(), b.cells(), "(ii) {query}: bit-equal everywhere");
-            assert!(!a.explain.rollup, "(ii) {query}: raw-exact");
-        }
-    }
-
-    // (v): histograms on either side of the raw overlay.
-    for metric in ["h", "c_mixed"] {
-        let query = format!("rate({metric}[5m])");
-        let (a, b) = both(&built, &query, &range(w - HOUR, w + HOUR, MIN), None).await;
-        let (after_a, _) = split_at_w(&a.cells(), w);
-        let (after_b, _) = split_at_w(&b.cells(), w);
-        assert!(
-            after_b
-                .values()
-                .any(|v| v.contains('{') || v.contains("Histogram")),
-            "(v) {query}: the raw route answers histograms after W"
-        );
-        assert_eq!(
-            after_a, after_b,
-            "(v) {query}: every step after W is the raw route's"
-        );
-    }
-
-    // (iii): the 720 s level's coverage cut after `W` too, each stopping
-    // and stale step against the same step read before the cut.
-    let p720 = range(w + 2 * HOUR - DAY, w + 2 * HOUR, 12 * MIN);
-    let mut uncut = BTreeMap::new();
-    for metric in ["c_stop", "c_stale"] {
-        let query = format!("rate({metric}[1h])");
-        let (a, b) = both(&built, &query, &p720, None).await;
-        uncut.insert(metric, (a.points(), b.points()));
-    }
-    cut_runs(&built.admin, built.db(), 720, w, end + DAY).await;
-    for (metric, kind) in [("c_normal", "normal"), ("c_fast", "fast")] {
-        let query = format!("rate({metric}[1h])");
-        let (a, b) = both(&built, &query, &p720, None).await;
-        let d = distances(&a.points(), &b.points());
-        let (p99, max) = p99_max(&d);
-        let limit = bound("rate", kind, 720).expect("a counter kind");
-        println!(
-            "B4 (iii) {query}: n {} p99 {p99:e} max {max:e} bound {limit:e}",
-            d.len()
-        );
-        assert!(p99 <= limit, "(iii) {query}: p99 {p99:e} above {limit:e}");
-    }
-    let mut over = Vec::new();
-    for metric in ["c_stop", "c_stale"] {
-        let query = format!("rate({metric}[1h])");
-        let (a, b) = both(&built, &query, &p720, None).await;
-        let (pa, pb) = (a.points(), b.points());
-        let (ua, ub) = &uncut[metric];
-        let keys: std::collections::BTreeSet<&(String, i64)> = pa
-            .keys()
-            .chain(pb.keys())
-            .chain(ua.keys())
-            .chain(ub.keys())
-            .collect();
-        assert!(!keys.is_empty());
-        for key in keys {
-            let now = d_of(pa.get(key), pb.get(key)).unwrap_or(0.0);
-            let before = d_of(ua.get(key), ub.get(key)).unwrap_or(0.0);
-            println!(
-                "B4 (iii) {query} step W{:+}s: d {now:e}, with the level uncut {before:e}",
-                (key.1 - w) / 1000
-            );
-            // Owner decision, 2026-10-25 ("Accept, set limit"): rollups are
-            // approximate, so a stopped or stale counter at 720 s and
-            // coarser may read up to twice the measured 0.0308 (step
-            // W+36m, stale counter) on the per-step distance, the plan's
-            // bound rule; the rule above it, the uncut distance plus
-            // 0.0218, still holds wherever it is the larger.
-            if now > (before + 0.0218).max(STOPPED_STEP_ALLOWANCE_720S) {
-                over.push(format!(
-                    "(iii) {query} step W{:+}s: d {now} against {before} with the level uncut, allowance {}",
-                    (key.1 - w) / 1000,
-                    (before + 0.0218).max(STOPPED_STEP_ALLOWANCE_720S)
-                ));
-            }
-        }
-    }
-
-    // (iv): the raw piece continues the level's counter.
-    let query = "increase(c_iv[1h])";
-    let (a, b) = both(
-        &built,
-        query,
-        &range(w + HOUR - DAY, w + HOUR, 12 * MIN),
-        None,
-    )
-    .await;
-    assert!(
-        a.stages("rollup_piece")
-            .iter()
-            .any(|n| n.starts_with("raw (")),
-        "{:?}",
-        a.stages("rollup_piece")
-    );
-    // The steps from `W − 1 h`, part B's range: an earlier window holds
-    // `c_iv`'s first sample, which part B never compared.
-    let kept = |x: BTreeMap<(String, i64), f64>| -> BTreeMap<(String, i64), f64> {
-        x.into_iter().filter(|((_, t), _)| *t >= w - HOUR).collect()
-    };
-    let (pa, pb) = (kept(a.points()), kept(b.points()));
-    assert!(!pb.is_empty());
-    for (key, y) in &pb {
-        let d = d_of(pa.get(key), Some(y)).expect("present");
-        assert!(
-            d <= 0.00828,
-            "(iv) {key:?}: routed {:?}, raw {y}",
-            pa.get(key)
-        );
-    }
-    assert_eq!(pa.len(), pb.len());
-    built.finish().await;
-    assert!(over.is_empty(), "{}", over.join("\n"));
-}
-
-/// **B5 (issue #18 part B): a hole reads raw.** Corpus D's last day; the
-/// first level's coverage of one hour removed before the later levels are
-/// built, so no level covers it. `sum_over_time` over 1 h, over 22 hours
-/// (the 60 s level's band), lists a raw piece over that hour and equals
-/// the raw route's within 1e-12.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_hole_reads_raw() {
-    skip_unless_live!();
-    let db = DB_B5.name();
-    let day0 = today() - 8 * DAY;
-    let day = day0 + 7 * DAY;
-    let end = day0 + 8 * DAY;
-    let bootstrap = ChClient::new(test_config("default"))
-        .await
-        .expect("connect");
-    let ctx = RenderCtx::for_tests(db, 30);
-    fresh(&bootstrap, &ctx).await;
-    let admin = ChClient::new(test_config(db)).await.expect("connect");
-    for sql in [
-        corpus_d_series(db),
-        corpus_d_registrations(db, day, 24),
-        corpus_d_day(db, day0, 7),
-    ] {
-        exec(&admin, &sql).await;
-    }
-    build_first(&admin, &ctx, day, end, HOUR).await;
-    let hole = day + 10 * HOUR;
-    cut_runs(&admin, db, ctx.rollup_levels[0], hole, hole + HOUR).await;
-    build_later_by_statement(&admin, &ctx).await;
-    let built = warm(bootstrap, admin, ctx, &[]).await;
-
-    let p = range(day + 2 * HOUR, end, HOUR);
-    let query = "sum_over_time(c_normal[1h])";
-    let a = ask(&built.engine(true, None).await, &no_tenant(), query, &p).await;
-    let b = ask(&built.engine(false, None).await, &no_tenant(), query, &p).await;
-    let want = format!("raw ({hole}, {}]", hole + HOUR);
-    assert!(
-        a.stages("rollup_piece").contains(&want),
-        "{want} in {:?}",
-        a.stages("rollup_piece")
-    );
-    let (pa, pb) = (a.points(), b.points());
-    assert_eq!(pa.len(), pb.len());
-    for (key, y) in &pb {
-        let x = pa
-            .get(key)
-            .unwrap_or_else(|| panic!("{key:?} absent when routed"));
-        let d = if *y == 0.0 {
-            x.abs()
-        } else {
-            (x - y).abs() / y.abs()
-        };
-        assert!(d <= 1e-12, "{key:?}: routed {x}, raw {y}");
-    }
-    built.finish().await;
-}
-
-/// **B5b (issue #18 part B): a hole in the middle keeps the counter.**
-/// Corpus D's last two days; the 720 s level's coverage of one hour in the
-/// middle of a 24-hour window (the 720 s level's band) removed, the window
-/// ending before the stopping counters stop. `rate` over 1 h at step 12 m
-/// reads the 720 s level, the 60 s level for the hour, the 720 s level
-/// again, and stays within the 720 s bounds.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_hole_in_the_middle_keeps_the_counter() {
-    skip_unless_live!();
-    let day0 = today() - 8 * DAY;
-    let end = day0 + 8 * DAY;
-    let built = corpus_d(DB_B5B.name(), FIVE, day0, 6..8).await;
-    let hole = end - 14 * HOUR;
-    cut_runs(&built.admin, built.db(), 720, hole, hole + HOUR).await;
-
-    let p = range(end - 32 * HOUR, end - 8 * HOUR, 12 * MIN);
-    for (metric, kind) in &CORPUS_D_METRICS[..4] {
-        let query = format!("rate({metric}[1h])");
-        let (a, b) = both(&built, &query, &p, None).await;
-        let sources: Vec<String> = a
-            .stages("rollup_piece")
-            .iter()
-            .map(|n| piece_of(n).0)
-            .collect();
-        assert_eq!(
-            sources,
-            vec![
-                "metric_samples_720s",
-                "metric_samples_60s",
-                "metric_samples_720s"
-            ],
-            "{query}: {:?}",
-            a.stages("rollup_piece")
-        );
-        assert!(
-            a.stages("rollup_piece").contains(&format!(
-                "metric_samples_60s.last, inc served ({hole}, {}]",
-                hole + HOUR
-            )),
-            "{query}: {:?}",
-            a.stages("rollup_piece")
-        );
-        let d = distances(&a.points(), &b.points());
-        let (p99, max) = p99_max(&d);
-        let limit = bound("rate", kind, 720).expect("a counter kind");
-        println!(
-            "B5b {kind}: n {} p99 {p99:e} max {max:e} bound {limit:e}",
-            d.len()
-        );
-        assert!(p99 <= limit, "{kind}: p99 {p99:e} above {limit:e}");
-    }
-    built.finish().await;
-}
-
 /// **B1f, live half (issue #18 part B): the unrouted classes read raw.**
 /// A selector with no name, each `__name__` matcher form beside the name,
 /// and one under `histogram_count`: no `rollup_route` stage and bit-equal
@@ -1890,26 +1403,24 @@ async fn the_unrouted_classes_read_raw() {
         "SqlFallback: the warm cache's route"
     );
 
-    // The mixed metric: the float series from the level, the histogram
-    // series raw.
+    // The mixed metric (issue #810, D9): a routed selector meets a
+    // native-histogram sample, so the whole query is read raw.
     let a = ask(&routed, &no_tenant(), "rate(rollup_mixed[1h])", &p).await;
     let b = ask(&raw, &no_tenant(), "rate(rollup_mixed[1h])", &p).await;
-    assert!(a.explain.rollup, "the float series is served from a level");
+    assert!(!a.explain.rollup, "the mixed metric is read raw");
     assert!(
         a.stages("rollup_piece")
             .iter()
-            .any(|n| n.starts_with("metric_samples_60s.last, inc served")),
+            .any(|n| n.starts_with("native histograms: read raw")),
         "{:?}",
         a.stages("rollup_piece")
     );
-    let hist = |x: &Answer| -> Vec<String> {
-        canonical(&x.result)
-            .into_iter()
-            .filter(|l| l.contains("\"hist\""))
-            .collect()
-    };
-    assert!(!hist(&b).is_empty());
-    assert_eq!(hist(&a), hist(&b), "the histogram series");
+    assert!(!canonical(&b.result).is_empty());
+    assert_eq!(
+        canonical(&a.result),
+        canonical(&b.result),
+        "the whole answer"
+    );
 
     // The histogram-only metric: routed, served by nothing.
     let a = ask(&routed, &no_tenant(), "rate(rollup_hist[1h])", &p).await;
@@ -1923,6 +1434,32 @@ async fn the_unrouted_classes_read_raw() {
         "nothing was served from a level: raw-exact"
     );
     assert_eq!(canonical(&a.result), canonical(&b.result));
+
+    // T11 (issue #810, D9): a pushed node over the mixed metric is its own
+    // statement, which reads no level, then one statement read raw.
+    let comment = format!("{db}_t11_{}", now_ms());
+    let pushed = MetricsEngine::new(
+        built.client().await,
+        Arc::clone(&built.cache),
+        engine_config(db, true),
+    )
+    .with_rollup_levels(Arc::clone(&built.slot))
+    .with_query_log_comment(&comment);
+    let q = "sum by (s) (rate(rollup_mixed[1h]))";
+    let a = ask(&pushed, &no_tenant(), q, &p).await;
+    let b = ask(&raw, &no_tenant(), q, &p).await;
+    let sent = logged(&built.admin, &comment).await;
+    let tables: Vec<&Vec<String>> = sent.iter().map(|r| &r.tables).collect();
+    assert_eq!(sent.len(), 2, "T11: statements {tables:?}");
+    assert!(
+        sent[1].tables.contains(&format!("{db}.metric_samples"))
+            && sent[1]
+                .tables
+                .contains(&format!("{db}.metric_hist_samples")),
+        "T11: the second reads raw: {tables:?}"
+    );
+    assert!(!vector_or_matrix(&b).is_empty(), "T11: an answer");
+    assert_eq!(vector_or_matrix(&a), vector_or_matrix(&b), "T11: as raw");
     built.finish().await;
 }
 
@@ -2374,13 +1911,13 @@ fn vector_or_matrix(x: &Answer) -> BTreeMap<(String, i64), String> {
 /// and `start` 7 days before it, both on 2 h boundaries, asked at step
 /// 2 h: `max_over_time(g[2h])` and `rate(c_normal[10h])` have 85 points
 /// per series at `start + k × 2 h`; explain resolves the series by SQL,
-/// reads their labels by the `rollup_series` statement and routes to
+/// reads their labels in its one `rollup_piece` statement and routes to
 /// `metric_samples_7200s` at step 2 h. `max_over_time` is bit-equal and
 /// `rate` within its level's bound against the unrouted engine asked at
 /// step 2 h from the same `start`. With both ends 5 minutes later, the
-/// same 85 points read `metric_samples_7200s` at its bucket ends: the
-/// first 84 take the unrouted engine at the bucket end that holds each,
-/// the 85th the unrouted engine at `end`.
+/// points read `metric_samples_7200s` at its bucket ends: the first 84
+/// take the unrouted engine at the bucket end that holds each; the 85th
+/// has no value (issue #810: nothing after the last step is read).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_week_reads_two_hour_rows() {
     skip_unless_live!();
@@ -2437,8 +1974,17 @@ async fn a_week_reads_two_hour_rows() {
             .await;
             let series = per_series(&a);
             assert!(!series.is_empty(), "{query} +{shift}: no series");
+            // Issue #810 (§3): shifted, the 85th point is in the 2 h bucket
+            // after `end`, which nothing after the last step reads:
+            // `max_over_time(g[2h])` has no built bucket in its window there
+            // and no value; `rate(c_normal[10h])` has, and a value.
+            let want_times = if shift == 0 || kind.is_some() {
+                &times[..]
+            } else {
+                &times[..84]
+            };
             for (l, ts) in &series {
-                assert_eq!(ts, &times, "{query} +{shift} {l}: start + k × 2 h");
+                assert_eq!(ts, want_times, "{query} +{shift} {l}: start + k × 2 h");
             }
             let stages = &a.explain.stages;
             let resolved = stages
@@ -2456,13 +2002,16 @@ async fn a_week_reads_two_hour_rows() {
                 &[metric.to_string()],
                 &resolved.sql,
             );
+            // Issue #810 (D11): the one `rollup_piece` statement reads the
+            // series and their labels itself.
             let hydrated = stages
                 .iter()
-                .find(|s| s.name == "rollup_series")
-                .unwrap_or_else(|| panic!("{query}: no rollup_series stage: {stages:?}"));
-            assert_eq!(
-                hydrated.sql, hydrate,
-                "{query}: the rollup_series statement"
+                .find(|s| s.name == "rollup_piece")
+                .unwrap_or_else(|| panic!("{query}: no rollup_piece stage: {stages:?}"));
+            assert!(
+                hydrated.sql.contains(&hydrate),
+                "{query}: the rollup_piece statement reads the labels: {}",
+                hydrated.sql
             );
             let route = a.stages("rollup_route");
             assert!(
@@ -2473,7 +2022,9 @@ async fn a_week_reads_two_hour_rows() {
             );
 
             let off = engine(false, format!("{run}_{shift}_{qi}_off")).await;
-            let pa = a.points();
+            // Shifted, the 85th point is the newest step, computed from the
+            // buckets built (`the_newest_steps_serve_what_the_level_has`).
+            let pa = only(&a.points(), |x| shift == 0 || x <= times[83]);
             let pb = if shift == 0 {
                 ask(&off, &no_tenant(), query, &range(start, end, res))
                     .await
@@ -2486,13 +2037,7 @@ async fn a_week_reads_two_hour_rows() {
                     &range(start - shift + res, end - shift, res),
                 )
                 .await;
-                let mut want = spread(&ends.points(), &times[..84], res, 1.0);
-                want.extend(
-                    ask(&off, &no_tenant(), query, &range(end, end, res))
-                        .await
-                        .points(),
-                );
-                want
+                spread(&ends.points(), &times[..84], res, 1.0)
             };
             match kind {
                 None => assert!(bit_equal(&pa, &pb), "{query} +{shift}: bit-equal"),
@@ -2785,140 +2330,6 @@ async fn statements(admin: &ChClient, comment: &str) -> Vec<(String, u64)> {
     out
 }
 
-/// The raw sample statements among `statements`.
-fn raw_statements(statements: &[(String, u64)]) -> Vec<&(String, u64)> {
-    statements
-        .iter()
-        .filter(|(q, _)| q.starts_with("SELECT fingerprint, unix_milli, value\n"))
-        .collect()
-}
-
-/// The samples of series `s` in each interval `(a, b]` of `within`.
-fn samples_within(day0: i64, s: std::ops::RangeInclusive<i64>, within: &[(i64, i64)]) -> u64 {
-    s.map(|s| {
-        within
-            .iter()
-            .map(|&(a, b)| samples_in(day0, s, a + 1, b).len() as u64)
-            .sum::<u64>()
-    })
-    .sum()
-}
-
-/// **H1 (issue #18): finer levels and raw read only what is not
-/// covered.** Corpus D's last two days at the default levels, with a head
-/// `Hd` and a tail `Tl` cut from the levels' coverage, and 65 one-minute
-/// holes cut from the 60 s level. Each statement names the intervals the
-/// coarser levels left, never their hull, and the raw statements return
-/// only the samples of those intervals; a rounded range inside `Hd` reads
-/// raw.
-#[tokio::test(flavor = "multi_thread")]
-async fn finer_levels_and_raw_read_only_what_is_not_covered() {
-    skip_unless_live!();
-    let day0 = today() - 8 * DAY;
-    let end = day0 + 8 * DAY;
-    let built = corpus_d(DB_H1.name(), DEFAULTS, day0, 6..8).await;
-    let db = built.db().to_string();
-    let run = format!("h1_{db}_{}", now_ms());
-    let st = end - DAY;
-    let hd = (end - 9 * DAY, st + 2 * HOUR);
-    let tl720 = (end - 36 * MIN, end + DAY);
-    let tl60 = (end - 30 * MIN, end + DAY);
-    let raw = built.engine(false, None).await;
-
-    // (C) The 720 s level cut at both ends: the 60 s statement names the
-    // two intervals.
-    for (a, b) in [hd, tl720] {
-        cut_runs(&built.admin, &db, 720, a, b).await;
-    }
-    let p = range(st, end, 12 * MIN);
-    let query = "max_over_time(g[12m])";
-    let on = ask(&built.engine(true, None).await, &no_tenant(), query, &p).await;
-    let off = ask(&raw, &no_tenant(), query, &p).await;
-    assert!(
-        on.stages("rollup_route")
-            .iter()
-            .any(|n| n.starts_with("metric_samples_720s,")),
-        "(C): {:?}",
-        on.stages("rollup_route")
-    );
-    let sixty: Vec<&str> = on
-        .explain
-        .stages
-        .iter()
-        .filter(|s| s.name == "rollup_piece" && s.sql.contains("FROM metric_samples_60s\n"))
-        .map(|s| s.sql.as_str())
-        .collect();
-    let want = format!(
-        "((t_end > {} AND t_end <= {}) OR (t_end > {} AND t_end <= {end}))",
-        st - 1_020_000,
-        st + 7_200_000,
-        end - 2_160_000
-    );
-    assert!(
-        !sixty.is_empty() && sixty.iter().all(|s| s.contains(&want)),
-        "(C): the 60 s statement names {want}: {sixty:?}"
-    );
-    assert_eq!(on.cells(), off.cells(), "(C): bit-equal to no levels");
-
-    // (D) 65 one-minute holes in the 60 s level: two raw statements, 64
-    // intervals and one. Over 3 hours, the 60 s level's switch point.
-    let t0 = day0 + 6 * DAY + 6 * HOUR;
-    let holes: Vec<(i64, i64)> = (0..=64)
-        .map(|k| (t0 + 2 * k * MIN, t0 + (2 * k + 1) * MIN))
-        .collect();
-    for &(a, b) in &holes {
-        cut_runs(&built.admin, &db, 60, a, b).await;
-    }
-    let comment = format!("{run}_h1_d_on");
-    let p = range(t0, t0 + 3 * HOUR, MIN);
-    let query = "max_over_time(g[1m])";
-    let on = ask(
-        &built.engine(true, Some(&comment)).await,
-        &no_tenant(),
-        query,
-        &p,
-    )
-    .await;
-    let off = ask(&raw, &no_tenant(), query, &p).await;
-    let sent = statements(&built.admin, &comment).await;
-    let raws = raw_statements(&sent);
-    assert_eq!(raws.len(), 2, "(D): two raw statements: {raws:?}");
-    let got: u64 = raws.iter().map(|(_, n)| n).sum();
-    assert_eq!(
-        got,
-        samples_within(day0, 160..=259, &holes),
-        "(D): raw rows"
-    );
-    assert_eq!(on.cells(), off.cells(), "(D): bit-equal to no levels");
-
-    // The 60 s level cut at both ends, so (E) reads raw.
-    for (a, b) in [hd, tl60] {
-        cut_runs(&built.admin, &db, 60, a, b).await;
-    }
-
-    // (E) A rounded range read wholly from raw: 15 hours, on the 60 s
-    // level's own steps, inside `Hd`.
-    let p = range(st - DAY, st - DAY + 15 * HOUR, 120_000);
-    let on = ask(
-        &built.engine(true, None).await,
-        &no_tenant(),
-        "rate(c_normal[2m15s])",
-        &p,
-    )
-    .await;
-    let off = ask(&raw, &no_tenant(), "rate(c_normal[5m])", &p).await;
-    assert!(
-        on.stages("rollup_route")
-            .iter()
-            .any(|n| n.ends_with("range 5m (asked 2m15s)")),
-        "(E): {:?}",
-        on.stages("rollup_route")
-    );
-    assert!(on.explain.rollup, "(E): exactness is rollup");
-    assert_eq!(on.cells(), off.cells(), "(E): rate(c_normal[5m]) from raw");
-    built.finish().await;
-}
-
 /// `t` rounded up to a whole number of `w`.
 fn ceil_to(t: i64, w: i64) -> i64 {
     let down = t.div_euclid(w) * w;
@@ -3034,14 +2445,12 @@ async fn a_panel_reads_the_level_its_range_selects() {
     let raw = built.engine(false, None).await;
     let t = no_tenant();
     let lattice = range(s + 6 * MIN, gl, 12 * MIN);
-    let newest = range(gl + 2 * MIN, end - 6 * MIN, 2 * MIN);
     let counter = 0.0211;
-    // (query, the query at the bucket ends, (iii), (iv), scale of (iii)).
-    let cases: [(&str, &str, Cmp, Cmp, f64); 10] = [
+    // (query, the query at the bucket ends, (iii), scale of (iii)).
+    let cases: [(&str, &str, Cmp, f64); 10] = [
         (
             "max_over_time(g[2m])",
             "max_over_time(g[12m])",
-            Cmp::Bits,
             Cmp::Bits,
             1.0,
         ),
@@ -3049,13 +2458,11 @@ async fn a_panel_reads_the_level_its_range_selects() {
             "min_over_time(g[2m])",
             "min_over_time(g[12m])",
             Cmp::Bits,
-            Cmp::Bits,
             1.0,
         ),
         (
             "avg_over_time(g[2m])",
             "avg_over_time(g[12m])",
-            Cmp::Max(1e-12),
             Cmp::Max(1e-12),
             1.0,
         ),
@@ -3063,13 +2470,11 @@ async fn a_panel_reads_the_level_its_range_selects() {
             "last_over_time(g[2m])",
             "last_over_time(g[12m])",
             Cmp::Bits,
-            Cmp::Bits,
             1.0,
         ),
         (
             "present_over_time(g[2m])",
             "present_over_time(g[12m])",
-            Cmp::Bits,
             Cmp::Bits,
             1.0,
         ),
@@ -3077,34 +2482,30 @@ async fn a_panel_reads_the_level_its_range_selects() {
             "absent_over_time(c_stop[2m])",
             "absent_over_time(c_stop[12m])",
             Cmp::Bits,
-            Cmp::Bits,
             1.0,
         ),
-        ("g", "g", Cmp::Bits, Cmp::Bits, 1.0),
+        ("g", "g", Cmp::Bits, 1.0),
         (
             "rate(c_normal[2m15s])",
             "rate(c_normal[12m])",
             Cmp::P99(counter),
-            Cmp::P99(0.0706),
             1.0,
         ),
         (
             "increase(c_normal[2m15s])",
             "increase(c_normal[12m])",
             Cmp::P99(counter),
-            Cmp::P99(0.0706),
             135.0 / 720.0,
         ),
         (
             "sum(rate(c_normal[2m15s]))",
             "sum(rate(c_normal[12m]))",
             Cmp::P99(counter),
-            Cmp::P99(0.0706),
             1.0,
         ),
     ];
     let mut failures = Vec::new();
-    for (query, at_ends, early, late, scale) in cases {
+    for (query, at_ends, early, scale) in cases {
         let a = ask(&routed, &t, query, &p).await;
         // (i) every time of the request.
         let series = per_series(&a);
@@ -3115,11 +2516,15 @@ async fn a_panel_reads_the_level_its_range_selects() {
         if series.len() != want_series {
             failures.push(format!("{query} (i): {} series", series.len()));
         }
+        // Issue #810 (§3): the steps after `gl` read nothing past the last
+        // step, so they hold no built bucket and have no value, but
+        // `absent_over_time`, which returns 1.
+        let built_times: Vec<i64> = times.iter().copied().filter(|x| *x <= gl).collect();
         for (l, ts) in &series {
             let ok = if query.starts_with("absent_over_time") {
                 !ts.is_empty() && ts[..] == times[times.len() - ts.len()..]
             } else {
-                ts == &times
+                ts == &built_times
             };
             if !ok {
                 failures.push(format!(
@@ -3157,27 +2562,16 @@ async fn a_panel_reads_the_level_its_range_selects() {
             &only(&want, |x| x <= gl),
             early,
         ));
-        // (iv) each later step at its own time.
-        let own = ask(&raw, &t, query, &newest).await;
-        failures.extend(compare(
-            &format!("L1 (iv) {query}"),
-            &only(&points, |x| x > gl),
-            &own.points(),
-            late,
-        ));
-        // ... from the second read, at the request's resolution: the 60 s
-        // level at step 2 m (the bucket ends' notes say step 12m).
-        let second = match query {
-            "rate(c_normal[2m15s])" | "increase(c_normal[2m15s])" => {
-                Some("metric_samples_60s, use Counter, step 2m, range 5m (asked 2m15s)")
-            }
-            "max_over_time(g[2m])" => Some("metric_samples_60s, use Max, step 2m, range 2m"),
-            _ => None,
+        // (iv) each later step: no value, or 1 for `absent_over_time`.
+        let late_points = only(&points, |x| x > gl);
+        let late_ok = if query.starts_with("absent_over_time") {
+            late_points.len() == times.iter().filter(|x| **x > gl).count()
+                && late_points.values().all(|v| *v == 1.0)
+        } else {
+            late_points.is_empty()
         };
-        if let Some(head) = second
-            && !route.iter().any(|n| n.starts_with(head))
-        {
-            failures.push(format!("{query} (iv): no route `{head}`: {route:?}"));
+        if !late_ok {
+            failures.push(format!("{query} (iv): after {gl}: {late_points:?}"));
         }
         // (v) the answer is a rollup's.
         if !a.explain.rollup {
@@ -3186,53 +2580,6 @@ async fn a_panel_reads_the_level_its_range_selects() {
     }
     built.finish().await;
     assert!(failures.is_empty(), "L1:\n{}", failures.join("\n"));
-}
-
-/// **L2 (issue #18): the bucket ends read no finer level where their own
-/// covers.** Corpus D's last two days; `rate(c_normal[2m15s])` over the
-/// L1 request with no cut. The 60 s statements return only the newest
-/// steps' windows, about 14 minutes, and their run rows; the 720 s
-/// statement every bucket end.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_lattice_reads_no_finer_level_where_its_own_covers() {
-    skip_unless_live!();
-    let (built, day0) = D60_2
-        .lease("the_lattice_reads_no_finer_level_where_its_own_covers")
-        .await;
-    let end = day0 + 8 * DAY;
-    let comment = format!("{}_l2_on_{}", built.db(), now_ms());
-    let p = range(end - 2 * DAY + 6 * MIN, end - 6 * MIN, 2 * MIN);
-    let a = ask(
-        &built.engine(true, Some(&comment)).await,
-        &no_tenant(),
-        "rate(c_normal[2m15s])",
-        &p,
-    )
-    .await;
-    assert!(
-        a.explain.stages.iter().any(|s| s.name == "rollup_lattice"),
-        "read at the bucket ends: {:?}",
-        a.explain.stages
-    );
-    let sent = statements(&built.admin, &comment).await;
-    let rows = |table: &str| -> Vec<u64> {
-        sent.iter()
-            .filter(|(q, _)| q.contains(&format!("FROM {table}\n")))
-            .map(|(_, n)| *n)
-            .collect()
-    };
-    let (sixty, twelve) = (rows("metric_samples_60s"), rows("metric_samples_720s"));
-    built.finish().await;
-    let sixty_rows: u64 = sixty.iter().sum();
-    assert!(
-        sixty_rows <= 100 * 20 + 20,
-        "the 60 s statements return {sixty_rows} rows: {sixty:?}"
-    );
-    let twelve_rows: u64 = twelve.iter().sum();
-    assert!(
-        twelve_rows >= 100 * 238,
-        "the 720 s statements return {twelve_rows} rows: {twelve:?}"
-    );
 }
 
 /// **L3 (issue #18): a week and three hours fill from their levels.**
@@ -3254,16 +2601,20 @@ async fn a_week_and_three_hours_fill_from_their_levels() {
     let query = "rate(c_normal[10m15s])";
     let p = range(end - 7 * DAY - 10 * MIN, end - 10 * MIN, 10 * MIN);
     let (a, b) = futures::join!(ask(&routed, &t, query, &p), ask(&raw, &t, query, &p));
+    // Issue #810 (§3): nothing after the last step is read, so the steps
+    // after the last 2 h bucket ending by it, `gl`, have one point or none
+    // in their window and no value.
+    let gl = end - 2 * HOUR;
+    let to_gl = times_of(&p).into_iter().filter(|x| *x <= gl).count();
     for (l, ts) in &per_series(&a) {
-        if ts.len() != 1_009 {
-            failures.push(format!("7 d {l}: {} times", ts.len()));
+        if ts.len() != to_gl || ts.iter().any(|x| *x > gl) {
+            failures.push(format!("7 d {l}: {} times, want {to_gl}", ts.len()));
         }
     }
     let note = "metric_samples_7200s, use Counter, step 2h, range 2h (asked 10m15s)";
     if !a.stages("rollup_route").iter().any(|n| n == note) {
         failures.push(format!("7 d: routes {:?}", a.stages("rollup_route")));
     }
-    let gl = end - 2 * HOUR;
     failures.extend(compare(
         "L3 7 d",
         &only(&a.points(), |x| x <= gl),
@@ -3275,9 +2626,12 @@ async fn a_week_and_three_hours_fill_from_their_levels() {
     let p = range(end - 3 * HOUR - 45_000, end - 15_000, 15_000);
     let a = ask(&routed, &t, query, &p).await;
     let times = times_of(&p);
+    // Issue #810 (§3): the last three steps are in the minute bucket after
+    // the last step, which is not read; their windows hold no built bucket.
+    let to_gl: Vec<i64> = times.iter().copied().filter(|x| *x <= end - MIN).collect();
     for (l, ts) in &per_series(&a) {
-        if ts.len() != 723 || ts != &times {
-            failures.push(format!("3 h {l}: {} times", ts.len()));
+        if ts != &to_gl {
+            failures.push(format!("3 h {l}: {} times, want {}", ts.len(), to_gl.len()));
         }
     }
     if !a
@@ -3404,10 +2758,21 @@ async fn pushdown_on_the_request_grid_and_when_filled() {
             a.pushed()
         ));
     }
-    let times = times_of(&p);
+    // Issue #810 (§3): corpus P's 60 s level is built to `end − 10 min`;
+    // every step up to it has a value, and a later step one only while its
+    // window holds two built buckets (`the_newest_steps_serve_what_the_level_has`).
+    let built_to = end - 10 * MIN;
+    let times: Vec<i64> = times_of(&p)
+        .into_iter()
+        .filter(|x| *x <= built_to)
+        .collect();
     for (l, ts) in &per_series(&a) {
-        if ts != &times {
-            failures.push(format!("(b) {l}: {} of {} times", ts.len(), times.len()));
+        if !times.iter().all(|x| ts.contains(x)) {
+            failures.push(format!(
+                "(b) {l}: {} times, not every one of the {} to {built_to}",
+                ts.len(),
+                times.len()
+            ));
         }
     }
     failures.extend(compare("L5 (b)", &a.points(), &b.points(), Cmp::P99(1e-12)));
@@ -3988,9 +3353,8 @@ async fn a_level_rate_aggregate_answers_as_in_process() {
 }
 
 /// **T2 (issue #579 part 4): the panel sends groups, not level rows.** No
-/// level fetch; one coverage statement; one data statement (issue #18
-/// part 2c: with no replica check), returning at most a row per instance
-/// per step and the histogram count.
+/// level fetch; no coverage statement (issue #810); one data statement,
+/// returning at most a row per instance per step and the two counts.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_panel_sends_groups_not_level_rows() {
     skip_unless_live!();
@@ -4019,18 +3383,22 @@ async fn the_panel_sends_groups_not_level_rows() {
             .any(|(q, _)| q.starts_with("SELECT toUInt32(1) AS shard, kind, fingerprint, t_end")),
         "a level fetch was sent: {brief:#?}"
     );
+    // Issue #810 (D2): no coverage statement.
     assert!(
-        sent.iter()
+        !sent
+            .iter()
             .any(|(q, _)| q.starts_with("SELECT toUInt32(1) AS shard, t_last, t_end")),
-        "no coverage statement: {brief:#?}"
+        "a coverage statement: {brief:#?}"
     );
     let data: Vec<&(String, u64)> = sent
         .iter()
         .filter(|(q, _)| q.starts_with("WITH "))
         .collect();
     assert_eq!(data.len(), 1, "one data statement: {brief:#?}");
+    assert_eq!(sent.len(), 1, "one statement: {brief:#?}");
+    // A row per instance per step, the histogram count and `hist_n`.
     assert!(
-        data[0].1 <= 4 * 451 + 1,
+        data[0].1 <= 4 * 451 + 2,
         "the data statement returned {} rows: {brief:#?}",
         data[0].1
     );
@@ -4338,13 +3706,14 @@ async fn a_coarse_level_aggregate_answers_as_in_process() {
         ("2h", &w40, false),
     ];
     let mut failures = Vec::new();
+    // Issue #810 (D1): the 24 h window reads the 720 s level alone.
     let check = |q: &str, b: &Answer, w24: bool, failures: &mut Vec<String>| {
         let notes = b.stages("rollup_piece");
-        let names = |prefix: &str| notes.iter().any(|n| n.starts_with(prefix));
-        if w24 && !(names("metric_samples_720s.") && names("metric_samples_60s.") && names("raw ("))
-        {
+        let alone =
+            !notes.is_empty() && notes.iter().all(|n| n.starts_with("metric_samples_720s."));
+        if w24 && !alone {
             failures.push(format!(
-                "{q}: in process, the 24 h window does not read 720 s, 60 s and raw: {notes:?}"
+                "{q}: in process, the 24 h window does not read the 720 s level alone: {notes:?}"
             ));
         }
     };
@@ -4406,9 +3775,9 @@ async fn a_week_reads_the_two_hour_level_pushed() {
 }
 
 /// **T22 (issue #18 part 2a): a 60 s level over a configured 5 s level
-/// answers as in process.** Corpus P at the five levels, a 60 s cut that
-/// the 5 s level fills: over 6 h at 1 m the 60 s route is pushed and reads
-/// both levels; over 30 min at 15 s the 5 s route, pushed before, still
+/// answers as in process.** Corpus P at the five levels, a 60 s cut: over
+/// 6 h at 1 m the 60 s route is pushed and reads the 60 s level alone
+/// (issue #810); over 30 min at 15 s the 5 s route, pushed before, still
 /// answers as in process.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_level_over_a_finer_level_answers_as_in_process() {
@@ -4444,16 +3813,16 @@ async fn a_level_over_a_finer_level_answers_as_in_process() {
     for q in queries {
         let (a, _, f) = pushed_against_in_process(&on, &off, q, &six).await;
         failures.extend(f);
-        for table in ["metric_samples_60s", "metric_samples_5s"] {
-            if !a
-                .pushed()
+        // Issue #810 (D1): the route's level alone, no finer level.
+        let reads = |table: &str| {
+            a.pushed()
                 .iter()
                 .any(|s| s.contains(&format!("FROM {table}\n")))
-            {
-                failures.push(format!(
-                    "{q} over 6 h: the pushed statement does not read {table}"
-                ));
-            }
+        };
+        if !reads("metric_samples_60s") || reads("metric_samples_5s") {
+            failures.push(format!(
+                "{q} over 6 h: the pushed statement does not read the 60 s level alone"
+            ));
         }
     }
     let half = range(end - 30 * MIN, end, 15_000);
@@ -4495,11 +3864,10 @@ async fn one_histogram(built: &Built, t: i64) {
     .await;
 }
 
-/// **T30 (issue #18 part 2b): a filled request pushes both reads.** (a)
-/// 6 h at 30 s off the minute: the bucket ends' read at 60 s and the
-/// newest step's read at 30 s, both pushed; (b) a day at 2 m, filled from
-/// 720 s, no newest step; (c) a week at 1 h from 7200 s; (d) shape C over a
-/// day.
+/// **T30 (issue #18 part 2b): a filled request pushes its read.** Issue
+/// #810: one read, one pushed statement. (a) 6 h at 30 s off the minute:
+/// the bucket ends' read at 60 s; (b) a day at 2 m, filled from 720 s; (c)
+/// a week at 1 h from 7200 s; (d) shape C over a day.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_filled_request_pushes_both_reads() {
     skip_unless_live!();
@@ -4545,21 +3913,11 @@ async fn a_filled_request_pushes_both_reads() {
         match *case {
             "(a)" => {
                 let first = -(-p.start_ms).div_euclid(MIN) * MIN;
-                if pushed.len() != 2
-                    || on_grid(&a, Some(first), 60_000).len() != 1
-                    || on_grid(&a, Some(end - 30_000), 30_000).len() != 1
-                {
+                if pushed.len() != 1 || on_grid(&a, Some(first), 60_000).len() != 1 {
                     failures.push(format!(
-                        "(a): pushed statements {}, want one on ({first}, 60000) and one on ({}, 30000)",
+                        "(a): pushed statements {}, want one on ({first}, 60000)",
                         pushed.len(),
-                        end - 30_000
                     ));
-                }
-                let times = times_of(p);
-                for (l, ts) in &per_series(&a) {
-                    if ts != &times {
-                        failures.push(format!("(a) {l}: {} of {} times", ts.len(), times.len()));
-                    }
                 }
             }
             "(b)" => {
@@ -4574,17 +3932,14 @@ async fn a_filled_request_pushes_both_reads() {
                 }
             }
             "(c)" => {
-                // The bucket ends' read at 7200 s and, when `end` is not on
-                // a 2-hour bucket end, the newest step's read at 1 h.
+                // The bucket ends' read at 7200 s, and no other.
                 let level = on_grid(&a, None, 7_200_000);
-                let newest = usize::from(end.rem_euclid(2 * HOUR) != 0);
                 if level.len() != 1
                     || !level[0].contains("FROM metric_samples_7200s\n")
-                    || on_grid(&a, Some(end), HOUR).len() != newest
-                    || pushed.len() != 1 + newest
+                    || pushed.len() != 1
                 {
                     failures.push(format!(
-                        "(c): {} pushed statements, want one at 7200 s and {newest} at 1 h",
+                        "(c): {} pushed statements, want one at 7200 s",
                         pushed.len()
                     ));
                 }
@@ -4636,9 +3991,9 @@ async fn a_filled_request_mixes_a_pushed_and_an_evaluated_read() {
     assert!(failures.is_empty(), "T31:\n{}", failures.join("\n"));
 }
 
-/// **T33 (issue #18 part 2b): a filled request pushes only its second
-/// read.** A histogram sample inside the bucket ends' read only: that read
-/// declines and fetches its levels, the newest step's read pushes.
+/// **T33 (issue #18 part 2b): a filled request over a histogram sample
+/// falls back.** Issue #810: one read, which declines and is read in
+/// process.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_filled_request_pushes_only_its_second_read() {
     skip_unless_live!();
@@ -4658,9 +4013,9 @@ async fn a_filled_request_pushes_only_its_second_read() {
     if a.stages("rollup_piece").is_empty() {
         failures.push("the bucket ends' read fetched no level".to_string());
     }
-    if on_grid(&a, Some(end - 30_000), 30_000).len() != 1 {
+    if a.pushed().len() != 1 {
         failures.push(format!(
-            "the second read is not pushed: {} pushed",
+            "one pushed statement, declined: {} pushed",
             a.pushed().len()
         ));
     }
@@ -4751,99 +4106,11 @@ const COVERAGE: &str = "SELECT toUInt32(1) AS shard, t_last, t_end";
 /// The engine's default lookback, which every fetch window subtracts.
 const LOOKBACK: i64 = 5 * MIN;
 
-/// The intervals a coverage statement names, `t_end > a AND t_last < b`
-/// each, in order.
-fn t60_intervals(sql: &str) -> Vec<(i64, i64)> {
-    let one = regex::Regex::new(r"t_end > (-?\d+) AND t_last < (-?\d+)").expect("regex");
-    one.captures_iter(sql)
-        .map(|c| (c[1].parse().expect("a"), c[2].parse().expect("b")))
-        .collect()
-}
-
-/// One run row of a level table, as T60 (e) reads it.
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
-struct Run {
-    shard: u32,
-    t_last: i64,
-    t_end: i64,
-}
-
-/// T60 (e): what the 720 s level leaves of `window`, `(lo, hi]`, computed
-/// here. Its run rows overlapping the window, by shard: each shard's
-/// union, the intersection over shards, and the window less that.
-async fn t60_uncovered(admin: &ChClient, db: &str, window: (i64, i64)) -> Vec<(i64, i64)> {
-    let (lo, hi) = window;
-    let mut stream = admin
-        .query_stream::<Run>(
-            &format!(
-                "SELECT toUInt32(1) AS shard, t_last, t_end FROM {db}.metric_samples_720s \
-                 WHERE kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > {lo} AND t_last < {hi}"
-            ),
-            &QuerySettings::new(),
-        )
-        .await
-        .expect("run rows");
-    let mut by_shard: BTreeMap<u32, Vec<(i64, i64)>> = BTreeMap::new();
-    while let Some(row) = stream.next().await {
-        let r = row.expect("decode");
-        by_shard
-            .entry(r.shard)
-            .or_default()
-            .push((r.t_last, r.t_end));
-    }
-    let merge = |mut v: Vec<(i64, i64)>| -> Vec<(i64, i64)> {
-        v.sort_unstable();
-        let mut out: Vec<(i64, i64)> = Vec::new();
-        for (a, b) in v {
-            match out.last_mut() {
-                Some(l) if a <= l.1 => l.1 = l.1.max(b),
-                _ => out.push((a, b)),
-            }
-        }
-        out
-    };
-    let mut covered: Option<Vec<(i64, i64)>> = None;
-    for runs in by_shard.into_values() {
-        let mine = merge(runs);
-        covered = Some(match covered {
-            None => mine,
-            Some(acc) => {
-                let mut both = Vec::new();
-                for &(a, b) in &acc {
-                    for &(c, d) in &mine {
-                        let (x, y) = (a.max(c), b.min(d));
-                        if x < y {
-                            both.push((x, y));
-                        }
-                    }
-                }
-                merge(both)
-            }
-        });
-    }
-    let mut left = Vec::new();
-    let mut at = lo;
-    for (a, b) in covered.unwrap_or_default() {
-        if b <= at || a >= hi {
-            continue;
-        }
-        if a > at {
-            left.push((at, a));
-        }
-        at = at.max(b);
-    }
-    if at < hi {
-        left.push((at, hi));
-    }
-    left
-}
-
 /// **T60 (issue #18 part 2c): a pushed node reads no more than in
 /// process.** Corpus P2, the cache warm: no pushed statement reads the
-/// series tables, the data statements read at most the in-process level
-/// and raw fetches plus three a statement (`system.one`), no coverage
-/// statement names a series, and the 60 s coverage is sent over exactly
-/// what the 720 s level leaves (plan r12 to r14).
+/// series tables but for `hist_n` (issue #810), the data statements read at
+/// most the in-process statements plus three a statement (`system.one`),
+/// and no coverage statement is sent (issue #810, D2).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pushed_node_reads_no_more_than_in_process() {
     skip_unless_live!();
@@ -4858,8 +4125,6 @@ async fn a_pushed_node_reads_no_more_than_in_process() {
         &range(end - DAY, end, 12 * MIN),
     )
     .await;
-    let series_in = regex::Regex::new(r"fingerprint\s+(GLOBAL\s+)?IN").expect("regex");
-    let fp_eq = regex::Regex::new(r"fingerprint\s*=\s*(\S+)").expect("regex");
     let mut failures = Vec::new();
     for (name, q, p) in t60_queries(end) {
         let stamp = now_ms();
@@ -4884,14 +4149,16 @@ async fn a_pushed_node_reads_no_more_than_in_process() {
             logged(&built.admin, &c_on).await,
             logged(&built.admin, &c_off).await,
         );
+        // (a) Issue #810: the series and labels are read by `hist_n`'s
+        // condition alone; the groups name the cache's own series.
         for r in &son {
-            if r.tables
-                .iter()
-                .any(|t| t == &format!("{db}.metric_series") || t == &format!("{db}.metric_labels"))
-            {
+            let after = r
+                .query
+                .split_once(") AS hist_n")
+                .map_or(r.query.as_str(), |(_, rest)| rest);
+            if after.contains("FROM metric_series") || after.contains("FROM metric_labels") {
                 failures.push(format!(
-                    "{name}: (a) a pushed statement reads {:?}: {}",
-                    r.tables,
+                    "{name}: (a) a pushed statement reads the series beside hist_n: {}",
                     r.query.lines().next().unwrap_or("")
                 ));
             }
@@ -4933,98 +4200,9 @@ async fn a_pushed_node_reads_no_more_than_in_process() {
                 fetches.len()
             ));
         }
-        // (b2), plan r13 and r14: no coverage statement names a series.
-        let covering: Vec<&LoggedRead> = son
-            .iter()
-            .filter(|r| r.query.starts_with(COVERAGE))
-            .collect();
-        if covering.is_empty() {
-            failures.push(format!("{name}: (b2) no coverage statement logged"));
-        }
-        for r in &covering {
-            let named = series_in.is_match(&r.query)
-                || r.query.contains("FROM metric_series")
-                || r.query.contains("FROM metric_labels")
-                || fp_eq.captures_iter(&r.query).any(|c| &c[1] != "0");
-            if named {
-                failures.push(format!(
-                    "{name}: (b2) a coverage statement names series: {}",
-                    r.query
-                ));
-            }
-        }
-        // (e), plan r12: the 60 s statement is sent exactly when the 720 s
-        // level leaves part of the window, over exactly what it leaves.
-        if name != "a6" {
-            let window = (p.start_ms - 12 * MIN - LOOKBACK, p.end_ms);
-            let left = t60_uncovered(&built.admin, db, window).await;
-            let sixty: Vec<Vec<(i64, i64)>> = covering
-                .iter()
-                .filter(|r| r.query.contains("FROM metric_samples_60s\n"))
-                .map(|r| t60_intervals(&r.query))
-                .collect();
-            let want: Vec<Vec<(i64, i64)>> = if left.is_empty() {
-                vec![]
-            } else {
-                vec![left.clone()]
-            };
-            eprintln!(
-                "T60 {name}: (e) the 720 s level leaves {left:?}; 60 s statements over {sixty:?}"
-            );
-            if sixty != want {
-                failures.push(format!(
-                    "{name}: (e) 60 s coverage statements over {sixty:?}, the 720 s level leaves {left:?}"
-                ));
-            }
-        }
-        if name != "c24" {
-            continue;
-        }
-        // (d), issue #18 part 2c r10 and r11: the two sides share each
-        // level's coverage statement — one a level the in-process route
-        // reads — and explain shows one stage for each statement sent.
-        let coverage = |rows: &[LoggedRead]| -> Vec<String> {
-            rows.iter()
-                .filter(|r| r.query.starts_with(COVERAGE))
-                .map(|r| r.query.clone())
-                .collect()
-        };
-        let sent = coverage(&son);
-        let distinct: std::collections::BTreeSet<&String> = sent.iter().collect();
-        let explained_off = ask(&built.engine(true, None).await, &no_tenant(), q, &p).await;
-        let levels = served_tables(&explained_off);
-        if sent.len() != levels.len() || distinct.len() != sent.len() {
-            failures.push(format!(
-                "(d) {} coverage statements ({} distinct) for {} levels {levels:?}",
-                sent.len(),
-                distinct.len(),
-                levels.len()
-            ));
-        }
-        let c_explain = format!("{db}_t60{name}_explain_{stamp}");
-        let explained = ask(
-            &built.pushed_engine(Some(&c_explain)).await,
-            &no_tenant(),
-            q,
-            &p,
-        )
-        .await;
-        let stages: Vec<String> = explained
-            .explain
-            .stages
-            .iter()
-            .filter(|s| s.name == "pushed_coverage")
-            .map(|s| s.sql.clone())
-            .collect();
-        let logged_coverage = coverage(&logged(&built.admin, &c_explain).await);
-        let logged_distinct: std::collections::BTreeSet<&String> = logged_coverage.iter().collect();
-        if stages != logged_coverage || logged_distinct.len() != logged_coverage.len() {
-            failures.push(format!(
-                "(d) {} pushed_coverage stages against {} coverage statements logged ({} distinct)",
-                stages.len(),
-                logged_coverage.len(),
-                logged_distinct.len()
-            ));
+        // (b2) Issue #810 (D2): no coverage statement.
+        if son.iter().any(|r| r.query.starts_with(COVERAGE)) {
+            failures.push(format!("{name}: (b2) a coverage statement logged"));
         }
     }
     built.finish().await;
@@ -6140,7 +5318,11 @@ fn then_two_level_fetches(
     sent.iter().position(first).is_some_and(|at| {
         sent[at + 1..]
             .iter()
-            .filter(|(q, _)| q.starts_with("SELECT toUInt32(1) AS shard, kind, fingerprint, t_end"))
+            // Issue #810: today's route for a routed selector is its one
+            // statement (`routed_fetch`).
+            .filter(|(q, _)| {
+                q.starts_with("WITH ifNull((SELECT count() FROM") && q.contains("toUInt8(0) AS arm")
+            })
             .count()
             >= 2
     })
@@ -6344,4 +5526,1271 @@ async fn a_name_only_include_answers_as_in_process() {
     }
     built.finish().await;
     assert!(failures.is_empty(), "T18:\n{}", failures.join("\n"));
+}
+
+// ---------------------------------------------------------------- #810
+//
+// Issue #810 part 1: a query read at a rollup level sends one statement per
+// read, and that statement reads only the level.
+
+static DB_T2: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t810_2");
+static DB_T8: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t810_8");
+static DB_T14: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t810_14");
+
+/// A per-test comment, unique to this run.
+fn comment_for(db: &str, what: &str) -> String {
+    format!("{db}_{what}_{}", now_ms())
+}
+
+/// Whether a logged statement read `table`.
+fn reads_table(r: &LoggedRead, table: &str) -> bool {
+    r.tables.iter().any(|t| t == table)
+}
+
+/// The tables of every logged statement, one line each.
+fn brief(sent: &[LoggedRead]) -> Vec<String> {
+    sent.iter()
+        .map(|r| {
+            format!(
+                "{} rows, {:?}: {}",
+                r.read_rows,
+                r.tables,
+                r.query.lines().next().unwrap_or("")
+            )
+        })
+        .collect()
+}
+
+/// The text of `sql` with every gate condition of issue #810 replaced by
+/// `1`: the cap gate, the level reads' `hist_n = 0` and the raw arms'
+/// `hist_n > 0`.
+fn ungated(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    let gate = "series_n * grid_n <= ";
+    while let Some(at) = rest.find(gate) {
+        out.push_str(&rest[..at]);
+        out.push('1');
+        let tail = &rest[at + gate.len()..];
+        let digits = tail.chars().take_while(|c| c.is_ascii_digit()).count();
+        rest = &tail[digits..];
+    }
+    out.push_str(rest);
+    out.replace("hist_n = 0", "1").replace("hist_n > 0", "1")
+}
+
+/// The rows `sql` reads, sent on its own under the settings a routed
+/// statement carries, from its `system.query_log` row.
+async fn rows_read(admin: &ChClient, sql: &str, what: &str) -> u64 {
+    // Unique across the tests that run at once over a shared database.
+    let comment = format!("t810-gate-{what}-{}", uuid::Uuid::new_v4().simple());
+    // The client binds `?`: written `??`, as the dispatcher escapes it.
+    admin
+        .execute(
+            &sql.replace('?', "??"),
+            &QuerySettings::new()
+                .set("max_memory_usage", 4_294_967_296u64)
+                .set("join_algorithm", "hash")
+                .set("max_bytes_before_external_group_by", 0u64)
+                .set("log_comment", comment.as_str()),
+            Idempotency::Idempotent,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{what}: {e}\nSQL:\n{sql}"));
+    let sent = logged(admin, &comment).await;
+    assert_eq!(sent.len(), 1, "{what}: one statement");
+    sent[0].read_rows
+}
+
+/// The columns of each table a gate holds back, as the routed statements
+/// read them.
+fn gated_columns(table: &str) -> &'static str {
+    if table == "metric_samples" {
+        "org_id String, fingerprint UInt128, unix_milli Int64, value Float64"
+    } else {
+        "kind UInt8, org_id String, fingerprint UInt128, t_end Int64, t_last Int64, \
+         last Float64, min Float64, max Float64, sum Float64, count UInt32, inc Float64, \
+         flags UInt8"
+    }
+}
+
+/// The rows `sql` reads from `{db}.{table}`: its rows read, less those of
+/// the same text with that table replaced by an empty table of its
+/// columns. The empty table is in a database of its own, so a shared
+/// fixture database is never written to.
+async fn rows_from(admin: &ChClient, db: &str, sql: &str, table: &str, what: &str) -> u64 {
+    let scratch = format!("{db}_gate_{}", uuid::Uuid::new_v4().simple());
+    exec(admin, &format!("CREATE DATABASE {scratch}")).await;
+    exec(
+        admin,
+        &format!(
+            "CREATE TABLE {scratch}.empty ({}) ENGINE = MergeTree ORDER BY tuple()",
+            gated_columns(table)
+        ),
+    )
+    .await;
+    let from = format!("FROM {table}\n");
+    assert!(
+        sql.contains(&from),
+        "{what}: the statement reads {table}:\n{sql}"
+    );
+    let swapped = sql.replace(&from, &format!("FROM {scratch}.empty\n"));
+    let all = rows_read(admin, sql, what).await;
+    let rest = rows_read(admin, &swapped, &format!("{what}-without")).await;
+    exec(admin, &format!("DROP DATABASE {scratch} SYNC")).await;
+    all.saturating_sub(rest)
+}
+
+/// The gate check (issue #810, plan section 6, as built): the rows `sql` as
+/// sent reads from `{db}.{table}`, none, and the rows the same text with
+/// every gate replaced by `1` reads from it, at least `x`, the rows the
+/// gates hold back. Each statement is sent on its own, and again with the
+/// table replaced by an empty copy, so the figures are that table's. The
+/// two figures, and the failures.
+async fn gate_check(
+    admin: &ChClient,
+    db: &str,
+    sql: &str,
+    table: &str,
+    x: u64,
+) -> (u64, u64, Vec<String>) {
+    let gated = rows_from(admin, db, sql, table, "gated").await;
+    let open = rows_from(admin, db, &ungated(sql), table, "ungated").await;
+    let mut failures = Vec::new();
+    if gated != 0 {
+        failures.push(format!("{table}: {gated} rows read under the gate"));
+    }
+    if open < x {
+        failures.push(format!(
+            "{table}: {open} rows read without the gate, under the {x} it holds back"
+        ));
+    }
+    println!(
+        "gate check {db}.{table}: gated {gated} rows, ungated {open} rows, rows held back {x}"
+    );
+    (gated, open, failures)
+}
+
+/// One count from `sql`.
+async fn count_of(admin: &ChClient, sql: &str) -> u64 {
+    let v = ints(admin, &format!("SELECT toInt64(ifNull(({sql}), 0)) AS v")).await;
+    u64::try_from(v[0]).expect("a count")
+}
+
+/// The data rows of `table` of the series of `metric` matching `extra`
+/// with `t_end` in `(lo, hi]`.
+async fn level_rows_of(
+    admin: &ChClient,
+    db: &str,
+    table: &str,
+    metric: &str,
+    extra: &str,
+    (lo, hi): (i64, i64),
+) -> u64 {
+    count_of(
+        admin,
+        &format!(
+            "SELECT count() FROM {db}.{table} WHERE kind = 0 AND t_end > {lo} AND t_end <= {hi} \
+             AND fingerprint IN (SELECT fingerprint FROM {db}.metric_labels \
+                                 WHERE metric_name = '{metric}'{extra})"
+        ),
+    )
+    .await
+}
+
+/// The raw samples of `metric` with `unix_milli` in `(lo, hi]`.
+async fn raw_rows_of(admin: &ChClient, db: &str, metric: &str, (lo, hi): (i64, i64)) -> u64 {
+    count_of(
+        admin,
+        &format!(
+            "SELECT count() FROM {db}.metric_samples WHERE unix_milli > {lo} AND unix_milli <= {hi} \
+             AND fingerprint IN (SELECT fingerprint FROM {db}.metric_labels \
+                                 WHERE metric_name = '{metric}')"
+        ),
+    )
+    .await
+}
+
+/// **T1 (issue #810): a panel at a level is one statement**, reading the
+/// route's level and no raw sample.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panel_at_a_level_is_one_statement() {
+    skip_unless_live!();
+    let (built, end) = P.lease("a_panel_at_a_level_is_one_statement").await;
+    let db = built.db().to_string();
+    let mut failures = Vec::new();
+    for (what, q, p, level, not) in [
+        (
+            "a",
+            "sum by (instance) (rate(p_rx_total[1m]))",
+            range(end - 3 * HOUR - 30_000, end - 30_000, SCRAPE),
+            "metric_samples_60s",
+            vec!["metric_samples"],
+        ),
+        (
+            "b",
+            "sum by (instance) (rate(p_rx_total[2m15s]))",
+            range(end - DAY, end, 2 * MIN),
+            "metric_samples_720s",
+            vec!["metric_samples_60s", "metric_samples"],
+        ),
+    ] {
+        let comment = comment_for(&db, &format!("t1{what}"));
+        let e = built.pushed_engine(Some(&comment)).await;
+        e.query(&no_tenant(), &parse(q).expect("parse"), &p)
+            .await
+            .expect("the panel");
+        let sent = logged(&built.admin, &comment).await;
+        if sent.len() != 1 {
+            failures.push(format!(
+                "({what}) {} statements: {:#?}",
+                sent.len(),
+                brief(&sent)
+            ));
+            continue;
+        }
+        if !reads_table(&sent[0], &format!("{db}.{level}")) {
+            failures.push(format!("({what}) {level} not read: {:#?}", brief(&sent)));
+        }
+        for t in not {
+            if reads_table(&sent[0], &format!("{db}.{t}")) {
+                failures.push(format!("({what}) {t} read: {:#?}", brief(&sent)));
+            }
+        }
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T1:\n{}", failures.join("\n"));
+}
+
+/// Issue #810: one counter `c`, sampled every 15 s on the boundary over
+/// `(end − 4 h, end]`, valued `1e6 +` the seconds since `end − 4 h`, its
+/// first level built to `built_to`. The default levels; only the first is
+/// built.
+async fn one_counter(db: &str, end: i64, built_to: i64) -> Built {
+    let lo = end - 4 * HOUR;
+    let fp = "toUInt128('24000000000000000000000000000000810001')";
+    let land = vec![
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, 'c', {fp}, \
+                    toInt64({lo}) + toInt64(number) * {HOUR} + 1000, '{{\"job\":\"c\"}}', 0 FROM numbers(5)"
+        ),
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, 'c', {fp}, \
+                    toInt64({lo}) + toInt64(number) * {SCRAPE}, 1e6 + toFloat64(number) * 15 \
+             FROM numbers(1, {})",
+            4 * HOUR / SCRAPE
+        ),
+    ];
+    let (bootstrap, admin, ctx) = first_only(db, DEFAULTS, &land, lo, built_to).await;
+    warm(bootstrap, admin, ctx, &[]).await
+}
+
+/// The anchor of [`one_counter`]'s cases: a whole minute, an hour ago.
+fn minute_end() -> i64 {
+    (now_ms() / HOUR) * HOUR - HOUR
+}
+
+/// **T2 (issue #810, D3, §3): the newest steps serve what the level has.**
+#[tokio::test(flavor = "multi_thread")]
+async fn the_newest_steps_serve_what_the_level_has() {
+    skip_unless_live!();
+    let end = minute_end();
+    let w = end - 10 * MIN;
+    let built = one_counter(DB_T2.name(), end, w).await;
+    let q = "sum(rate(c[1m]))";
+    let p = range(end - 3 * HOUR, end, SCRAPE);
+    let t = no_tenant();
+    let mut failures = Vec::new();
+    for (name, e) in [
+        ("pushed", built.pushed_engine(None).await),
+        ("in process", built.engine(true, None).await),
+    ] {
+        let points = ask(&e, &t, q, &p).await.points();
+        for step in times_of(&p) {
+            let g = ceil_to(step, MIN);
+            let k = (g - w) / MIN;
+            let want = match k {
+                ..=1 => Some(1.0),
+                2 => Some(0.7),
+                3 => Some(0.5),
+                _ => None,
+            };
+            let got = points
+                .iter()
+                .find(|((_, at), _)| *at == step)
+                .map(|(_, v)| *v);
+            let ok = match (want, got) {
+                (Some(a), Some(b)) => (a - b).abs() <= 1e-12,
+                (None, None) => true,
+                _ => false,
+            };
+            if !ok {
+                failures.push(format!(
+                    "{name} at {step} (k = {k}): want {want:?}, got {got:?}"
+                ));
+            }
+        }
+    }
+    let raw = ask(&built.engine(false, None).await, &t, q, &p)
+        .await
+        .points();
+    for step in times_of(&p) {
+        let got = raw.iter().find(|((_, at), _)| *at == step).map(|(_, v)| *v);
+        if got.is_none_or(|v| (v - 1.0).abs() > 1e-12) {
+            failures.push(format!("raw at {step}: got {got:?}"));
+        }
+    }
+    built.finish().await;
+    assert!(
+        failures.is_empty(),
+        "T2: {} failures, first 20:\n{}",
+        failures.len(),
+        failures
+            .iter()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// **T3 (issue #810, D11): an in-process routed selector is one statement.**
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_process_routed_selector_is_one_statement() {
+    skip_unless_live!();
+    let (built, end) = P
+        .lease("an_in_process_routed_selector_is_one_statement")
+        .await;
+    let db = built.db().to_string();
+    let t = no_tenant();
+    let mut failures = Vec::new();
+    let q = "max_over_time(p_rx_total[1m])";
+    let p = range(end - 6 * HOUR, end, MIN);
+    let cold = Arc::new(LabelCache::new(
+        ChClient::new(test_config(&db)).await.expect("connect"),
+        cache_config(&db),
+    ));
+    let mut answers = Vec::new();
+    for (what, q, p, warm_cache) in [
+        ("a", q, p, true),
+        ("b", q, p, false),
+        (
+            "c",
+            "max_over_time(p_rx_total[3h])",
+            range(end - 30 * MIN, end - 30 * MIN, 0),
+            true,
+        ),
+    ] {
+        let comment = comment_for(&db, &format!("t3{what}"));
+        let e = if warm_cache {
+            built.engine(true, Some(&comment)).await
+        } else {
+            MetricsEngine::new(
+                built.client().await,
+                Arc::clone(&cold),
+                engine_config(&db, false),
+            )
+            .with_rollup_levels(Arc::clone(&built.slot))
+            .with_query_log_comment(&comment)
+        };
+        let (result, _) = e
+            .query(&t, &parse(q).expect("parse"), &p)
+            .await
+            .unwrap_or_else(|e| panic!("({what}): {e:?}"));
+        answers.push(Answer {
+            result,
+            explain: PlanExplain::new("metrics"),
+        });
+        let sent = logged(&built.admin, &comment).await;
+        if sent.len() != 1 {
+            failures.push(format!(
+                "({what}) {} statements: {:#?}",
+                sent.len(),
+                brief(&sent)
+            ));
+            continue;
+        }
+        let s = &sent[0];
+        if !reads_table(s, &format!("{db}.metric_samples_60s")) {
+            failures.push(format!(
+                "({what}) the 60 s level not read: {:#?}",
+                brief(&sent)
+            ));
+        }
+        if s.query.contains("kind = 1") {
+            failures.push(format!("({what}) run rows read"));
+        }
+        if what == "b" {
+            if !reads_table(s, &format!("{db}.metric_labels")) {
+                failures.push(format!("(b) the labels not read: {:#?}", brief(&sent)));
+            }
+        } else {
+            // The fetch window: the range and the lookback before the
+            // first step.
+            let lo = if p.step_ms == 0 {
+                p.start_ms - 3 * HOUR - LOOKBACK
+            } else {
+                p.start_ms - MIN - LOOKBACK
+            };
+            let x = raw_rows_of(&built.admin, &db, "p_rx_total", (lo, p.end_ms)).await;
+            let (_, _, f) = gate_check(&built.admin, &db, &s.query, "metric_samples", x).await;
+            failures.extend(f.into_iter().map(|f| format!("({what}) {f}")));
+        }
+    }
+    if answers[0].cells() != answers[1].cells() || answers[0].cells().is_empty() {
+        failures.push("(b) differs from (a)".to_string());
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T3:\n{}", failures.join("\n"));
+}
+
+/// **T8 (issue #810, D6): a level with no rows reads as `rollup`.** Only the
+/// 60 s level is built; a 16 h range at 2 m is routed to 720 s.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_level_with_no_rows_reads_as_rollup() {
+    skip_unless_live!();
+    let end = minute_end();
+    let built = one_counter(DB_T8.name(), end, end - 10 * MIN).await;
+    let p = range(end - 16 * HOUR, end, 2 * MIN);
+    let t = no_tenant();
+    let mut failures = Vec::new();
+    for (name, e) in [
+        ("pushed", built.pushed_engine(None).await),
+        ("in process", built.engine(true, None).await),
+    ] {
+        for q in ["sum(rate(c[2m15s]))", "max_over_time(c[2m])"] {
+            let a = ask(&e, &t, q, &p).await;
+            if !a.points().is_empty() {
+                failures.push(format!("{name} {q}: {} points", a.points().len()));
+            }
+            if !a.explain.rollup {
+                failures.push(format!("{name} {q}: not marked rollup"));
+            }
+        }
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T8:\n{}", failures.join("\n"));
+}
+
+/// **T10 (issue #810, D10): a node the cache cannot list is one statement**,
+/// and over the cap the first statement returns only the count, its level
+/// reads gated off.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_the_cache_cannot_list_is_one_statement() {
+    skip_unless_live!();
+    let (built, end) = P
+        .lease("a_node_the_cache_cannot_list_is_one_statement")
+        .await;
+    let db = built.db().to_string();
+    let t = no_tenant();
+    let q = "sum(rate(p_rx_total[2m15s]))";
+    let p = range(end - 15 * HOUR, end, 2 * MIN);
+    let warm = vector_or_matrix(&ask(&built.pushed_engine(None).await, &t, q, &p).await);
+    let cold = Arc::new(LabelCache::new(
+        ChClient::new(test_config(&db)).await.expect("connect"),
+        cache_config(&db),
+    ));
+    let mut failures = Vec::new();
+    for (what, cap, want) in [("a", None, 1usize), ("b", Some(8_192usize), 3)] {
+        let comment = comment_for(&db, &format!("t10{what}"));
+        let mut e = MetricsEngine::new(
+            built.client().await,
+            Arc::clone(&cold),
+            engine_config(&db, true),
+        )
+        .with_rollup_levels(Arc::clone(&built.slot))
+        .with_query_log_comment(&comment);
+        if let Some(cap) = cap {
+            e = e.with_pushed_series_steps_cap(cap);
+        }
+        let a = ask(&e, &t, q, &p).await;
+        if vector_or_matrix(&a) != warm || warm.is_empty() {
+            failures.push(format!("({what}) differs from the warm pushed engine"));
+        }
+        let sent = logged(&built.admin, &comment).await;
+        if sent.len() != want {
+            failures.push(format!(
+                "({what}) {} statements: {:#?}",
+                sent.len(),
+                brief(&sent)
+            ));
+            continue;
+        }
+        if what == "b" {
+            // The fetch window: the 2 m15 s range rounded to 3 m (60 s × 3)
+            // and the lookback, before the first step.
+            let l = level_rows_of(
+                &built.admin,
+                &db,
+                "metric_samples_60s",
+                "p_rx_total",
+                "",
+                (p.start_ms - 3 * MIN - LOOKBACK, p.end_ms),
+            )
+            .await;
+            let (_, _, f) =
+                gate_check(&built.admin, &db, &sent[0].query, "metric_samples_60s", l).await;
+            failures.extend(f.into_iter().map(|f| format!("(b) {f}")));
+        }
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T10:\n{}", failures.join("\n"));
+}
+
+/// The fingerprint literal of issue #810's fixture `H`, series `n`.
+fn h_fp(n: u32) -> String {
+    format!("toUInt128('24000000000000000000000000000000810{n:03}')")
+}
+
+/// Corpus H (issue #810) ending at `end`, every 15 s over `(end − 4 h,
+/// end]`: metric `c` with a float counter `{s="f"}`, a native-histogram
+/// series `{s="h"}`, and `{s="m"}` with histogram samples over `(end − 4 h,
+/// end − 2 h]` and float samples after; metrics `d` and `e`, two float
+/// counters each, `{s="f"}` and `{s="h"}`.
+fn corpus_h_land(db: &str, end: i64) -> Vec<String> {
+    let lo = end - 4 * HOUR;
+    let n = 4 * HOUR / SCRAPE;
+    let mut land = Vec::new();
+    let float = |fp: &str, name: &str, rate: f64, from: i64| {
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, '{name}', {fp}, \
+                    toInt64({lo}) + toInt64(number) * {SCRAPE}, 1e6 + toFloat64(number) * {rate} \
+             FROM numbers({from}, {})",
+            n + 1 - from
+        )
+    };
+    let hist = |fp: &str, upto: i64| {
+        format!(
+            "INSERT INTO {db}.metric_hist_samples (org_id, fingerprint, unix_milli, schema, zero_threshold, zero_count, \
+                                                   count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
+                                                   neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values) \
+             SELECT '', {fp}, toInt64({lo}) + toInt64(number) * {SCRAPE}, 0, 0., 0, 4 + number, \
+                    5. + toFloat64(number), [0], [3], [1, 1, -1], [], [], [], [] \
+             FROM numbers(1, {upto})"
+        )
+    };
+    for (k, (name, s)) in [
+        ("c", "f"),
+        ("c", "h"),
+        ("c", "m"),
+        ("d", "f"),
+        ("d", "h"),
+        ("e", "f"),
+        ("e", "h"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fp = h_fp(k as u32 + 1);
+        land.push(format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, '{name}', {fp}, \
+                    toInt64({lo}) + toInt64(number) * {HOUR} + 1000, '{{\"s\":\"{s}\"}}', 0 FROM numbers(5)"
+        ));
+        let rate = 15.0 * (k as f64 + 1.0);
+        match (name, s) {
+            ("c", "h") => land.push(hist(&fp, n)),
+            ("c", "m") => {
+                land.push(hist(&fp, n / 2));
+                land.push(float(&fp, name, rate, n / 2 + 1));
+            }
+            _ => land.push(float(&fp, name, rate, 1)),
+        }
+    }
+    land
+}
+
+/// Corpus H built at the default levels, its first level to `end`.
+async fn corpus_h(db: &str, end: i64) -> Built {
+    let (bootstrap, admin, ctx) =
+        first_only(db, DEFAULTS, &corpus_h_land(db, end), end - 4 * HOUR, end).await;
+    warm(bootstrap, admin, ctx, &[]).await
+}
+
+/// T16's range over corpus H: 3 h at 15 s, off the minute.
+fn h_range(end: i64) -> MetricQueryParams {
+    range(
+        end - 3 * HOUR - 30 * MIN + SCRAPE,
+        end - 30 * MIN + SCRAPE,
+        SCRAPE,
+    )
+}
+
+/// **T16 (issue #810, D9): a query over native histograms reads raw.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_over_native_histograms_reads_raw() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_query_over_native_histograms_reads_raw").await;
+    let db = built.db().to_string();
+    let p = h_range(end);
+    let t = no_tenant();
+    let off = built.engine(false, None).await;
+    let mut failures = Vec::new();
+    for (k, q) in [
+        "rate(c[1m])",
+        "c",
+        "last_over_time(c[1m])",
+        "absent_over_time(c{s=\"h\"}[1m])",
+        "absent(c)",
+        "sum by (s) (c)",
+        "rate(d[1m])",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let comment = comment_for(&db, &format!("t16_{k}"));
+        let on = built.engine(true, Some(&comment)).await;
+        let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+        let sent = logged(&built.admin, &comment).await;
+        if sent.len() != 1 {
+            failures.push(format!(
+                "{q}: {} statements: {:#?}",
+                sent.len(),
+                brief(&sent)
+            ));
+        }
+        if q.starts_with("rate(d") {
+            if !a.explain.rollup {
+                failures.push(format!("{q}: not marked rollup"));
+            }
+            if !a
+                .stages("rollup_piece")
+                .iter()
+                .any(|n| n.contains("metric_samples_60s"))
+            {
+                failures.push(format!("{q}: rollup_piece {:?}", a.stages("rollup_piece")));
+            }
+            continue;
+        }
+        if a.explain.rollup {
+            failures.push(format!("{q}: marked rollup"));
+        }
+        // `absent` and `absent_over_time` of a present series answer
+        // nothing on either route.
+        if vector_or_matrix(&a) != vector_or_matrix(&b)
+            || (!q.starts_with("absent") && vector_or_matrix(&b).is_empty())
+        {
+            failures.push(format!("{q}: differs from routing off"));
+        }
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T16:\n{}", failures.join("\n"));
+}
+
+/// **T17 (issue #810, D9): the histogram count spans the query.**
+#[tokio::test(flavor = "multi_thread")]
+async fn the_histogram_count_spans_the_query() {
+    skip_unless_live!();
+    let (built, end) = H.lease("the_histogram_count_spans_the_query").await;
+    let db = built.db().to_string();
+    let p = h_range(end);
+    let t = no_tenant();
+    let q = "last_over_time(c[1m]) or last_over_time(d[1m])";
+    let comment = comment_for(&db, "t17");
+    let on = built.engine(true, Some(&comment)).await;
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    let sent = logged(&built.admin, &comment).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 2 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    }
+    let pieces = a.stages("rollup_piece");
+    if pieces.len() != 2 || !pieces.iter().all(|n| n.contains("read raw")) {
+        failures.push(format!("rollup_piece {pieces:?}"));
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+        failures.push("differs from routing off".to_string());
+    }
+    assert!(failures.is_empty(), "T17:\n{}", failures.join("\n"));
+}
+
+/// **T18 (issue #810, D9): a pushed node over histograms reads raw.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pushed_node_over_histograms_reads_raw() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_pushed_node_over_histograms_reads_raw").await;
+    let db = built.db().to_string();
+    let p = h_range(end);
+    let t = no_tenant();
+    let q = "sum by (s) (rate(c[1m]))";
+    let comment = comment_for(&db, "t18");
+    let on = built.pushed_engine(Some(&comment)).await;
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    let sent = logged(&built.admin, &comment).await;
+    let mut failures = Vec::new();
+    if sent.len() != 2 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    } else {
+        // The lattice's fetch window: 5 m (the counter's five buckets) and
+        // the lookback before the first bucket end, to the last step.
+        let lo = ceil_to(p.start_ms, MIN) - 5 * MIN - LOOKBACK;
+        let k = level_rows_of(
+            &built.admin,
+            &db,
+            "metric_samples_60s",
+            "c",
+            "",
+            (lo, p.end_ms),
+        )
+        .await;
+        let (_, _, f) =
+            gate_check(&built.admin, &db, &sent[0].query, "metric_samples_60s", k).await;
+        failures.extend(f);
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+        failures.push("differs from routing off".to_string());
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T18:\n{}", failures.join("\n"));
+}
+
+/// **T21 (issue #810, addendum r6): a raw tail answers its tail.** A tail
+/// over native histograms is read raw over the tail alone, in one statement.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_raw_tail_answers_its_tail() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_raw_tail_answers_its_tail").await;
+    let db = built.db().to_string();
+    let whole = h_range(end);
+    let tail = range(whole.end_ms - 10 * MIN, whole.end_ms, SCRAPE);
+    let t = no_tenant();
+    let q = "rate(c[1m])";
+    let comment = comment_for(&db, "t21");
+    let on = built.engine(true, Some(&comment)).await.with_request(whole);
+    let expr = parse(q).expect("parse");
+    let (result, _, facts) = on
+        .query_with_facts(&t, &expr, &tail)
+        .await
+        .expect("the tail");
+    let off = ask(&built.engine(false, None).await, &t, q, &tail).await;
+    let sent = logged(&built.admin, &comment).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 1 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    }
+    if !facts.raw {
+        failures.push("not read raw".to_string());
+    }
+    let a = Answer {
+        result,
+        explain: PlanExplain::new("metrics"),
+    };
+    if a.cells() != off.cells() || off.cells().is_empty() {
+        failures.push("differs from routing off over the tail".to_string());
+    }
+    assert!(failures.is_empty(), "T21:\n{}", failures.join("\n"));
+}
+
+/// The four-hour range at 60 s of T25 and T27, on the minute.
+fn h_four_hours(end: i64) -> MetricQueryParams {
+    range(end - 4 * HOUR, end, MIN)
+}
+
+/// **T24 (issue #810): an unrouted join over histograms falls back.**
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrouted_join_over_histograms_falls_back() {
+    skip_unless_live!();
+    let (built, end) = H.lease("an_unrouted_join_over_histograms_falls_back").await;
+    let p = range(end - HOUR, end, SCRAPE);
+    let t = no_tenant();
+    let q = "sum(rate(c[5m]) + rate(d[5m]))";
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    built.finish().await;
+    assert!(
+        a.declines().contains(&"declined: HistogramSamples"),
+        "T24: declines {:?}",
+        a.declines()
+    );
+    assert!(!vector_or_matrix(&b).is_empty(), "T24: an answer");
+    assert_eq!(vector_or_matrix(&a), vector_or_matrix(&b), "T24");
+}
+
+/// **T25 (issue #810): a mixed join falls back on its raw side.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mixed_join_falls_back_on_its_raw_side() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_mixed_join_falls_back_on_its_raw_side").await;
+    let p = h_four_hours(end);
+    let t = no_tenant();
+    let q = "sum(rate(d[5m]) + irate(c[5m]))";
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(true, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    built.finish().await;
+    assert!(
+        a.declines().contains(&"declined: HistogramSamples"),
+        "T25: declines {:?}",
+        a.declines()
+    );
+    assert!(a.explain.rollup, "T25: d is read at its level");
+    assert!(!vector_or_matrix(&b).is_empty(), "T25: an answer");
+    assert_eq!(vector_or_matrix(&a), vector_or_matrix(&b), "T25");
+}
+
+/// A routed selector read again raw: the raw arms alone, no count.
+fn is_raw_again(sql: &str) -> bool {
+    sql.starts_with("SELECT arm, fingerprint, t, t_last") && !sql.contains("AS hist_n")
+}
+
+/// **T26 (issue #810, D9; code review r1): a level node is read again on
+/// another selector's histograms.** `d`'s node counts the listed `c`'s
+/// histograms beside its own series, none of its own: it keeps its answer,
+/// which is discarded, and `d` is read again raw in one statement. Three
+/// statements: the node, `c`'s, `d` again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_level_node_is_read_again_on_another_selectors_histograms() {
+    skip_unless_live!();
+    let (built, end) = H
+        .lease("a_level_node_is_read_again_on_another_selectors_histograms")
+        .await;
+    let db = built.db().to_string();
+    let p = h_range(end);
+    let t = no_tenant();
+    let q = "sum(rate(d[1m])) + count(last_over_time(c[1m]))";
+    let comment = comment_for(&db, "t26");
+    let on = built.pushed_engine(Some(&comment)).await;
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    let sent = logged(&built.admin, &comment).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 3 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    }
+    if sent.iter().filter(|r| is_raw_again(&r.query)).count() != 1 {
+        failures.push(format!("not one raw re-read: {:#?}", brief(&sent)));
+    }
+    if a.declines().contains(&"declined: HistogramSamples") {
+        failures.push("the node fell back".to_string());
+    }
+    if a.explain.rollup {
+        failures.push("marked rollup".to_string());
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+        failures.push("differs from routing off".to_string());
+    }
+    assert!(failures.is_empty(), "T26:\n{}", failures.join("\n"));
+}
+
+/// **T42 (issue #810, code review r1): a mixed node is read again one
+/// statement a side.** `d` at its level and `e` raw in one node; the listed
+/// `c` holds the histograms, the node's own sides none. The node keeps its
+/// answer, discarded; `d` and `e` are each read again raw in one statement
+/// (`e`'s by its ID statement, as the node read it). Four statements: the
+/// node, `c`'s, `d` again, `e` again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mixed_node_is_read_again_one_statement_a_side() {
+    skip_unless_live!();
+    let (built, end) = H
+        .lease("a_mixed_node_is_read_again_one_statement_a_side")
+        .await;
+    let db = built.db().to_string();
+    let p = h_four_hours(end);
+    let t = no_tenant();
+    let q = "sum(rate(d[5m]) + irate(e[5m])) + count(last_over_time(c[1m]))";
+    let comment = comment_for(&db, "t42");
+    let on = built.pushed_engine(Some(&comment)).await;
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    let sent = logged(&built.admin, &comment).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 4 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    }
+    let again: Vec<&LoggedRead> = sent.iter().filter(|r| is_raw_again(&r.query)).collect();
+    if again.len() != 2 {
+        failures.push(format!("{} raw re-reads: {:#?}", again.len(), brief(&sent)));
+    }
+    // `e`'s re-read names its series by its ID statement, with the labels arm.
+    if !again
+        .iter()
+        .any(|r| r.query.contains("toUInt8(2) AS arm") && r.query.contains("'e'"))
+    {
+        failures.push(format!(
+            "no re-read of e by its ID statement: {:#?}",
+            again.iter().map(|r| &r.query).collect::<Vec<_>>()
+        ));
+    }
+    if a.declines().contains(&"declined: HistogramSamples") {
+        failures.push("the node fell back".to_string());
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+        failures.push("differs from routing off".to_string());
+    }
+    assert!(failures.is_empty(), "T42:\n{}", failures.join("\n"));
+}
+
+/// **T27 (issue #810, D9): a raw-only node stays pushed in a raw query.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_raw_only_node_stays_pushed_in_a_raw_query() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_raw_only_node_stays_pushed_in_a_raw_query").await;
+    let p = h_four_hours(end);
+    let t = no_tenant();
+    let q = "last_over_time(c[5m]) or sum(irate(d[5m]) + irate(e[5m]))";
+    let on = built.pushed_engine(None).await;
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    built.finish().await;
+    assert!(a.declines().is_empty(), "T27: declines {:?}", a.declines());
+    assert!(!a.pushed().is_empty(), "T27: the join is pushed");
+    assert!(!a.explain.rollup, "T27: read raw");
+    assert!(!vector_or_matrix(&b).is_empty(), "T27: an answer");
+    assert_eq!(vector_or_matrix(&a), vector_or_matrix(&b), "T27");
+}
+
+/// **T14 (issue #810, D3): nothing after the last step is read.**
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_after_the_last_step_is_read() {
+    skip_unless_live!();
+    let end = minute_end();
+    let built = one_counter(DB_T14.name(), end, end).await;
+    let db = built.db().to_string();
+    let e_last = end - 30 * MIN + SCRAPE;
+    let p = range(e_last - 3 * HOUR, e_last, SCRAPE);
+    let q = "rate(c[1m])";
+    let comment = comment_for(&db, "t14");
+    let on = built.engine(true, Some(&comment)).await;
+    let t = no_tenant();
+    let a = ask(&on, &t, q, &p).await;
+    let sent = logged(&built.admin, &comment).await;
+    exec(
+        &built.admin,
+        &format!(
+            "ALTER TABLE {db}.metric_samples_60s UPDATE inc = inc + 1000, last = last + 1000 \
+             WHERE kind = 0 AND t_end = {} SETTINGS mutations_sync = 2",
+            e_last + 45_000
+        ),
+    )
+    .await;
+    let b = ask(&built.engine(true, None).await, &t, q, &p).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 1 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    } else if !sent[0].query.contains(&format!("t_end <= {e_last}")) {
+        failures.push(format!(
+            "the level arm does not end at {e_last}:\n{}",
+            sent[0].query
+        ));
+    }
+    if a.cells() != b.cells() {
+        failures.push("A and B differ".to_string());
+    }
+    if !a.points().keys().any(|(_, at)| *at == e_last) {
+        failures.push(format!("no point at {e_last}"));
+    }
+    assert!(failures.is_empty(), "T14:\n{}", failures.join("\n"));
+}
+
+/// **T15 (issue #810, D10): a listed and an unlisted side are gated over
+/// the cap.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listed_and_an_unlisted_side_are_gated_over_the_cap() {
+    skip_unless_live!();
+    let (built, end) = P
+        .lease("a_listed_and_an_unlisted_side_are_gated_over_the_cap")
+        .await;
+    let db = built.db().to_string();
+    let mut cfg = cache_config(&db);
+    cfg.window_ms = 16 * DAY;
+    cfg.cache_max_series = 20;
+    let cache = Arc::new(LabelCache::new(
+        ChClient::new(test_config(&db)).await.expect("connect"),
+        cfg,
+    ));
+    cache.refresh().await.expect("refresh");
+    let comment = comment_for(&db, "t15");
+    let on = MetricsEngine::new(built.client().await, cache, engine_config(&db, true))
+        .with_rollup_levels(Arc::clone(&built.slot))
+        .with_pushed_series_steps_cap(8_192)
+        .with_query_log_comment(&comment);
+    let q = "sum by (instance) (rate(p_rx_total[2m15s]) + rate(p_tx_total{instance=~\"i0|i1\"}[2m15s]))";
+    let p = range(end - 15 * HOUR, end, 2 * MIN);
+    let t = no_tenant();
+    let off = built.engine(true, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    let sent = logged(&built.admin, &comment).await;
+    let mut failures = Vec::new();
+    if sent.len() != 3 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    } else {
+        let k = level_rows_of(
+            &built.admin,
+            &db,
+            "metric_samples_60s",
+            "p_tx_total",
+            " AND JSONExtractString(labels, 'instance') IN ('i0', 'i1')",
+            (p.start_ms - 3 * MIN - LOOKBACK, p.end_ms),
+        )
+        .await;
+        let (_, _, f) =
+            gate_check(&built.admin, &db, &sent[0].query, "metric_samples_60s", k).await;
+        failures.extend(f);
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+        failures.push("differs from the in-process engine".to_string());
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "T15:\n{}", failures.join("\n"));
+}
+
+// ------------------------------------------------- #810, addendum r6
+
+static DB_T32: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t810_32");
+
+/// The `fingerprint IN (…)` list of a routed statement's level arm.
+fn level_arm_line(sql: &str) -> &str {
+    sql.lines()
+        .find(|l| l.contains("WHERE kind = 0"))
+        .unwrap_or("")
+}
+
+/// The text of a routed statement's `hist_n` clause.
+fn hist_n_clause(sql: &str) -> &str {
+    sql.split_once(") AS hist_n").map_or("", |(head, _)| head)
+}
+
+/// **T31 (issue #810, addendum r6): a count past the text cap drops the
+/// other lists.** `d`'s statement fits the cap only without `c`'s list: it
+/// counts its own series alone and reads its level; `c`'s counts its
+/// histograms; `d` is read again raw.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_count_past_the_text_cap_drops_other_lists() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_count_past_the_text_cap_drops_other_lists").await;
+    let db = built.db().to_string();
+    let p = h_range(end);
+    let t = no_tenant();
+    let q = "last_over_time(d[1m]) or last_over_time(c[1m])";
+    // `d`'s statement as an engine with the default cap renders it.
+    let measure = comment_for(&db, "t31m");
+    ask(&built.engine(true, Some(&measure)).await, &t, q, &p).await;
+    let first = logged(&built.admin, &measure).await;
+    let d_len = first
+        .iter()
+        .find(|r| level_arm_line(&r.query).contains("810004'"))
+        .map(|r| r.query.len() as u64)
+        .expect("d's statement");
+    let comment = comment_for(&db, "t31");
+    let on = built
+        .engine(true, Some(&comment))
+        .await
+        .with_statement_cap(d_len);
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, q, &p), ask(&off, &t, q, &p));
+    let sent = logged(&built.admin, &comment).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 3 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    }
+    let d_first: Vec<&LoggedRead> = sent
+        .iter()
+        .filter(|r| level_arm_line(&r.query).contains("810004'"))
+        .collect();
+    if d_first.len() != 1
+        || d_first[0].query.contains("810001'")
+        || d_first[0].query.contains("FROM metric_series")
+    {
+        failures.push(format!(
+            "d's statement names c, or its ID statement: {:#?}",
+            d_first.iter().map(|r| &r.query).collect::<Vec<_>>()
+        ));
+    }
+    if sent
+        .iter()
+        .filter(|r| !r.query.contains("toUInt8(0) AS arm"))
+        .count()
+        != 1
+    {
+        failures.push(format!("no one raw re-read: {:#?}", brief(&sent)));
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+        failures.push("differs from routing off".to_string());
+    }
+    assert!(failures.is_empty(), "T31:\n{}", failures.join("\n"));
+}
+
+/// **T32 (issue #810, addendum r6): one resolution serves the count and the
+/// read.** A series of `c` lands, and the label cache lists it, after the
+/// read resolved its selectors: the statement's read and its count name the
+/// same list, the one resolved, without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_resolution_serves_count_and_read() {
+    skip_unless_live!();
+    let end = p_end();
+    let built = corpus_h(DB_T32.name(), end).await;
+    let db = built.db().to_string();
+    let lo = end - 4 * HOUR;
+    let fp = h_fp(9);
+    let land = vec![
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, 'c', {fp}, \
+                    toInt64({lo}) + toInt64(number) * {HOUR} + 1000, '{{\"s\":\"n\"}}', 0 FROM numbers(5)"
+        ),
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, 'c', {fp}, \
+                    toInt64({lo}) + toInt64(number) * {SCRAPE}, toFloat64(number) \
+             FROM numbers(1, {})",
+            4 * HOUR / SCRAPE
+        ),
+    ];
+    let cache = Arc::clone(&built.cache);
+    let config = test_config(&db);
+    let hook: pulsus_read::metrics::exec::AfterResolution = Arc::new(move || {
+        let (cache, config, land) = (Arc::clone(&cache), config.clone(), land.clone());
+        Box::pin(async move {
+            let c = ChClient::new(config).await.expect("connect");
+            for sql in &land {
+                exec(&c, sql).await;
+            }
+            cache.refresh().await.expect("refresh");
+        })
+    });
+    let comment = comment_for(&db, "t32");
+    let on = built
+        .engine(true, Some(&comment))
+        .await
+        .with_after_resolution(hook);
+    let p = h_range(end);
+    ask(&on, &no_tenant(), "last_over_time(c[1m])", &p).await;
+    let sent = logged(&built.admin, &comment).await;
+    let later = comment_for(&db, "t32later");
+    ask(
+        &built.engine(true, Some(&later)).await,
+        &no_tenant(),
+        "last_over_time(c[1m])",
+        &p,
+    )
+    .await;
+    let after = logged(&built.admin, &later).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 1 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    } else {
+        let sql = &sent[0].query;
+        let arm = level_arm_line(sql);
+        let list = arm
+            .split_once("fingerprint IN (")
+            .and_then(|(_, rest)| rest.split_once(") AND hist_n"))
+            .map(|(l, _)| l)
+            .unwrap_or("");
+        let count = hist_n_clause(sql);
+        if list.is_empty() || !count.contains(&format!("fingerprint IN ({list})")) {
+            failures.push(format!("the count does not name the read's list:\n{sql}"));
+        }
+        if count.contains("FROM metric_series") {
+            failures.push("the count reads an ID statement".to_string());
+        }
+        if sql.contains("810009'") {
+            failures.push("the series landed after the resolution is named".to_string());
+        }
+    }
+    if !after.iter().any(|r| r.query.contains("810009'")) {
+        failures.push("the landed series never reached the label cache".to_string());
+    }
+    assert!(failures.is_empty(), "T32:\n{}", failures.join("\n"));
+}
+
+/// T37's engine: corpus H's database with a label cache that lists at most
+/// two series a selector, so `d` (2) is listed and `c` (3) is not.
+async fn two_series_engine(built: &Built, comment: &str) -> MetricsEngine {
+    let db = built.db().to_string();
+    let mut cfg = cache_config(&db);
+    cfg.window_ms = 16 * DAY;
+    cfg.cache_max_series = 2;
+    let cache = Arc::new(LabelCache::new(
+        ChClient::new(test_config(&db)).await.expect("connect"),
+        cfg,
+    ));
+    cache.refresh().await.expect("refresh");
+    MetricsEngine::new(built.client().await, cache, engine_config(&db, true))
+        .with_rollup_levels(Arc::clone(&built.slot))
+        .with_query_log_comment(comment)
+}
+
+const T37_QUERY: &str = "sum(rate(d[1m])) + count(last_over_time(c[1m]))";
+
+/// **T37 (issue #810, addendum r6): a kept node is read again raw.** `d`'s
+/// node counts `d` alone and keeps its level answer; `c`'s statement counts
+/// its histograms; `d` is read again raw.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_node_is_read_again_raw() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_kept_node_is_read_again_raw").await;
+    let db = built.db().to_string();
+    let p = h_range(end);
+    let t = no_tenant();
+    let comment = comment_for(&db, "t37");
+    let on = two_series_engine(&built, &comment).await;
+    let off = built.engine(false, None).await;
+    let (a, b) = futures::join!(ask(&on, &t, T37_QUERY, &p), ask(&off, &t, T37_QUERY, &p));
+    let sent = logged(&built.admin, &comment).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 3 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    }
+    if a.explain.rollup {
+        failures.push("marked rollup".to_string());
+    }
+    if vector_or_matrix(&a) != vector_or_matrix(&b) || vector_or_matrix(&b).is_empty() {
+        failures.push("differs from routing off".to_string());
+    }
+    assert!(failures.is_empty(), "T37:\n{}", failures.join("\n"));
+}
+
+/// **T38 (issue #810, addendum r6): a kept node is read again over its
+/// tail.** T37's engine with its request; the tail of its last 10 minutes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_node_is_read_again_over_its_tail() {
+    skip_unless_live!();
+    let (built, end) = H.lease("a_kept_node_is_read_again_over_its_tail").await;
+    let db = built.db().to_string();
+    let whole = h_range(end);
+    let tail = range(whole.end_ms - 10 * MIN, whole.end_ms, SCRAPE);
+    let t = no_tenant();
+    let comment = comment_for(&db, "t38");
+    let on = two_series_engine(&built, &comment)
+        .await
+        .with_request(whole);
+    let expr = parse(T37_QUERY).expect("parse");
+    let (result, _, facts) = on
+        .query_with_facts(&t, &expr, &tail)
+        .await
+        .expect("the tail");
+    let off = ask(&built.engine(false, None).await, &t, T37_QUERY, &tail).await;
+    let sent = logged(&built.admin, &comment).await;
+    built.finish().await;
+    let mut failures = Vec::new();
+    if sent.len() != 3 {
+        failures.push(format!("{} statements: {:#?}", sent.len(), brief(&sent)));
+    }
+    if !facts.raw {
+        failures.push("not read raw".to_string());
+    }
+    let a = Answer {
+        result,
+        explain: PlanExplain::new("metrics"),
+    };
+    if vector_or_matrix(&a) != vector_or_matrix(&off) || vector_or_matrix(&off).is_empty() {
+        failures.push("differs from routing off over the tail".to_string());
+    }
+    assert!(failures.is_empty(), "T38:\n{}", failures.join("\n"));
 }

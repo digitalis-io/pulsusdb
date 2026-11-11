@@ -256,3 +256,364 @@ async fn an_engine_with_a_server_failure_stores_no_fill() {
     assert_eq!(kept, 0, "(a) with a failure: nothing kept");
     assert_eq!(sent, 0, "(a) no statement");
 }
+
+// -- issue #810: a routed hit is one read ------------------------------------
+
+mod t19 {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use pulsus_promql::Annotations;
+
+    use super::super::exec::{MetricQueryParams, PlanFacts, ReadMix};
+    use super::super::pass_failure_tests::stub_client;
+    use super::super::read_cache::{
+        Answer, CacheKey, EvalFacts, Evaluated, Header, PollRead, RangeRequest, ReadCache,
+        ReadCacheConfig, answer_range, poll_once,
+    };
+    use super::super::rollup::{Level, LevelSlot, Levels};
+    use super::super::stub_server::{Mode, StubServer};
+    use super::{T, e_ids, e_lag, e_wm};
+    use crate::logql::{MatrixSeries, QueryResult};
+
+    const Q: &str = "rate(x[5m])";
+
+    /// A single-node cache with a fresh identity and the 60 s level built to
+    /// 10 minutes before `T`.
+    fn cache() -> ReadCache {
+        let c = ReadCache::new(ReadCacheConfig {
+            budget_bytes: 64 * 1024 * 1024,
+            tenant_share_pct: 50,
+            clustered: false,
+        })
+        .with_clock(|| T);
+        commit(&c);
+        c
+    }
+
+    fn commit(c: &ReadCache) {
+        c.commit_poll(PollRead {
+            lag: None,
+            watermarks: Some((T, vec![(60_000, T - 600_000)])),
+            identity: (T, vec!["db".to_string()]),
+        });
+    }
+
+    /// Two hours at 15 s ending 30 minutes before `T`, shifted by `by`.
+    fn window(by: i64) -> MetricQueryParams {
+        let end = (T - 1_800_000).div_euclid(15_000) * 15_000 + by;
+        MetricQueryParams {
+            start_ms: end - 7_200_000,
+            end_ms: end,
+            step_ms: 15_000,
+        }
+    }
+
+    fn request(p: MetricQueryParams) -> RangeRequest<'static> {
+        let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
+        RangeRequest {
+            key: CacheKey::new(tenant, Q, &p, 300_000, Some(60_000)),
+            query: Q,
+            params: p,
+            facts: PlanFacts {
+                shape_allowed: true,
+                oldest_input_ms: 0,
+                reach_ms: 0,
+            },
+            max_samples: u64::MAX,
+            retention_floor_ms: Some(i64::MIN),
+            sweep_time_ms: None,
+        }
+    }
+
+    /// A one-series matrix over the grid of `p`, value `base + t / 1000`.
+    fn matrix(p: &MetricQueryParams, base: f64) -> QueryResult {
+        let mut points = Vec::new();
+        let mut t = p.start_ms;
+        while t <= p.end_ms {
+            points.push((t, base + (t / 1000) as f64));
+            t += p.step_ms;
+        }
+        QueryResult::Matrix(vec![MatrixSeries {
+            labels: vec![("job".to_string(), "x".to_string())],
+            points,
+        }])
+    }
+
+    fn info() -> Annotations {
+        let mut a = Annotations::new();
+        a.info_at(0, "an info");
+        a
+    }
+
+    fn routed(raw: bool) -> EvalFacts {
+        EvalFacts {
+            charged: 10,
+            reads: ReadMix::AllRouted,
+            raw,
+        }
+    }
+
+    #[derive(Default)]
+    struct Calls {
+        full: AtomicUsize,
+        tail: AtomicUsize,
+    }
+
+    type R = Result<Evaluated, ()>;
+
+    /// One request through `cache`: `full` answers `base` 1,000 with
+    /// `full_ann`; `tail` answers `base` 0 with `tail_ann` and `tail_facts`,
+    /// after running `during_tail`.
+    async fn run(
+        cache: &ReadCache,
+        calls: &Calls,
+        p: MetricQueryParams,
+        full_ann: Annotations,
+        tail_ann: Annotations,
+        tail_facts: EvalFacts,
+        during_tail: impl FnOnce(),
+    ) -> Answer {
+        let full = |q: MetricQueryParams| {
+            calls.full.fetch_add(1, Ordering::SeqCst);
+            async move { R::Ok((matrix(&q, 1_000.0), full_ann, routed(false))) }
+        };
+        let tail = |q: MetricQueryParams| {
+            calls.tail.fetch_add(1, Ordering::SeqCst);
+            during_tail();
+            async move { R::Ok((matrix(&q, 0.0), tail_ann, tail_facts)) }
+        };
+        answer_range(cache, request(p), full, tail, |_| (), &|| true)
+            .await
+            .expect("answered")
+    }
+
+    /// The first request, a miss that keeps its points.
+    async fn kept(cache: &ReadCache) {
+        let calls = Calls::default();
+        let a = run(
+            cache,
+            &calls,
+            window(0),
+            Annotations::new(),
+            Annotations::new(),
+            routed(false),
+            || {},
+        )
+        .await;
+        assert_eq!(a.header, Header::Miss, "the first request keeps its points");
+    }
+
+    fn counts(c: &Calls) -> (usize, usize) {
+        (c.tail.load(Ordering::SeqCst), c.full.load(Ordering::SeqCst))
+    }
+
+    /// No kept point in `a`: every point is `full`'s, `base` 1,000.
+    fn all_full(a: &Answer, p: &MetricQueryParams) -> bool {
+        a.result == matrix(p, 1_000.0)
+    }
+
+    fn stored(cache: &ReadCache, p: MetricQueryParams) -> bool {
+        cache.lookup(&request(p).key).is_some()
+    }
+
+    /// **T19 (issue #810, D14): a routed hit is one read.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_routed_hit_is_one_read() {
+        let p2 = window(60_000);
+
+        // (a) A kept answer with no annotation; the tail returns an info.
+        let c = cache();
+        kept(&c).await;
+        let calls = Calls::default();
+        let a = run(
+            &c,
+            &calls,
+            p2,
+            Annotations::new(),
+            info(),
+            routed(false),
+            || {},
+        )
+        .await;
+        assert_eq!(counts(&calls), (1, 0), "(a) tail, full");
+        assert_eq!(a.header, Header::Hit, "(a) header");
+        assert_eq!(
+            a.annotations.base_messages(),
+            info().base_messages(),
+            "(a) the tail's annotations"
+        );
+
+        // (b) The miss path's answer carries an info: nothing is kept.
+        let c = cache();
+        let calls = Calls::default();
+        run(
+            &c,
+            &calls,
+            window(0),
+            info(),
+            Annotations::new(),
+            routed(false),
+            || {},
+        )
+        .await;
+        assert!(!stored(&c, window(0)), "(b) nothing stored");
+
+        // (c) The tail is read raw (addendum r6): merged with the kept
+        // points and answered, and nothing is stored.
+        let c = cache();
+        kept(&c).await;
+        let before = c.lookup(&request(window(0)).key).expect("kept").c1_ms;
+        let calls = Calls::default();
+        let a = run(
+            &c,
+            &calls,
+            p2,
+            Annotations::new(),
+            Annotations::new(),
+            routed(true),
+            || {},
+        )
+        .await;
+        assert_eq!(counts(&calls), (1, 0), "(c) tail, full");
+        assert_eq!(a.header, Header::Hit, "(c) a hit");
+        let QueryResult::Matrix(series) = &a.result else {
+            panic!("(c) a matrix: {:?}", a.result)
+        };
+        let want: Vec<(i64, f64)> = {
+            let mut t = p2.start_ms;
+            let mut points = Vec::new();
+            while t <= p2.end_ms {
+                let base = if t <= before { 1_000.0 } else { 0.0 };
+                points.push((t, base + (t / 1000) as f64));
+                t += p2.step_ms;
+            }
+            points
+        };
+        assert_eq!(series.len(), 1, "(c) one series");
+        assert_eq!(series[0].points, want, "(c) kept points, then the tail's");
+        assert_eq!(
+            c.lookup(&request(p2).key).map(|e| e.c1_ms),
+            Some(before),
+            "(c) nothing stored"
+        );
+
+        // (d) The cache is cleared from inside the tail.
+        let c = Arc::new(cache());
+        kept(&c).await;
+        let calls = Calls::default();
+        let inner = Arc::clone(&c);
+        let a = run(
+            &c,
+            &calls,
+            p2,
+            Annotations::new(),
+            Annotations::new(),
+            routed(false),
+            move || inner.clear(),
+        )
+        .await;
+        assert_eq!(counts(&calls), (1, 0), "(d) tail, full");
+        assert!(!all_full(&a, &p2), "(d) the merge is served");
+        assert!(!stored(&c, p2), "(d) nothing stored");
+
+        // (e) Cleared before the request.
+        let c = cache();
+        kept(&c).await;
+        c.clear();
+        let calls = Calls::default();
+        let a = run(
+            &c,
+            &calls,
+            p2,
+            Annotations::new(),
+            Annotations::new(),
+            routed(false),
+            || {},
+        )
+        .await;
+        assert_eq!(counts(&calls), (0, 1), "(e) tail, full");
+        assert!(all_full(&a, &p2), "(e) the full answer");
+
+        // (f) The identity read is 10 s old.
+        let clock = Arc::new(std::sync::atomic::AtomicI64::new(T));
+        let at = Arc::clone(&clock);
+        let c = ReadCache::new(ReadCacheConfig {
+            budget_bytes: 64 * 1024 * 1024,
+            tenant_share_pct: 50,
+            clustered: false,
+        })
+        .with_clock(move || at.load(Ordering::SeqCst));
+        commit(&c);
+        kept(&c).await;
+        clock.store(T + 10_000, Ordering::SeqCst);
+        let calls = Calls::default();
+        let a = run(
+            &c,
+            &calls,
+            p2,
+            Annotations::new(),
+            Annotations::new(),
+            routed(false),
+            || {},
+        )
+        .await;
+        assert_eq!(counts(&calls), (0, 1), "(f) tail, full");
+        assert!(all_full(&a, &p2), "(f) the full answer");
+
+        // (g) Cleared by a hook after the lookup, before the check.
+        let c = cache().with_after_lookup(|c| c.clear());
+        kept(&c).await;
+        let calls = Calls::default();
+        let a = run(
+            &c,
+            &calls,
+            p2,
+            Annotations::new(),
+            Annotations::new(),
+            routed(false),
+            || {},
+        )
+        .await;
+        assert_eq!(counts(&calls), (0, 1), "(g) tail, full");
+        assert!(all_full(&a, &p2), "(g) the full answer");
+
+        // (h) The hook runs a poll whose identity read returns a new
+        // identity.
+        let s = StubServer::start(Mode::Script(vec![e_lag(), e_wm(), e_ids()]));
+        let client = Arc::new(stub_client(&[&s]).await);
+        let levels = Arc::new(LevelSlot::new());
+        levels.set(Levels {
+            levels: vec![Level {
+                res_ms: 60_000,
+                table: "metric_samples_60s".to_string(),
+                from_ms: 0,
+            }],
+            shards: 1,
+            counter_buckets: 5,
+        });
+        let handle = tokio::runtime::Handle::current();
+        let c = cache().with_after_lookup(move |c| {
+            let (client, levels) = (Arc::clone(&client), Arc::clone(&levels));
+            tokio::task::block_in_place(|| {
+                handle.block_on(poll_once(c, &client, "d", Some("c"), &levels))
+            });
+        });
+        kept(&c).await;
+        let g = c.generation();
+        let calls = Calls::default();
+        let a = run(
+            &c,
+            &calls,
+            p2,
+            Annotations::new(),
+            Annotations::new(),
+            routed(false),
+            || {},
+        )
+        .await;
+        assert_eq!(counts(&calls), (0, 1), "(h) tail, full");
+        assert!(all_full(&a, &p2), "(h) the full answer");
+        assert_eq!(c.generation(), g + 1, "(h) the poll cleared");
+    }
+}

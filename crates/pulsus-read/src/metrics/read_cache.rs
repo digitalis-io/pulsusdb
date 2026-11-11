@@ -39,9 +39,10 @@ use pulsus_promql::{AggOp, Annotations, FillValues, PlanExpr, QueryPlan, Selecto
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
-use super::exec::{MetricQueryParams, MetricsEngine, PlanFacts};
+use super::exec::{MetricQueryParams, MetricsEngine, PlanFacts, ReadMix};
 use super::rollup::{LevelSlot, Levels};
 use crate::ReadError;
+use crate::logql::TooBroadReason;
 use crate::logql::escape::ch_string;
 use crate::logql::{HistMatrixSeries, HistOrFloat, MatrixSeries, QueryResult};
 use pulsus_promql::parser::Expr;
@@ -97,6 +98,9 @@ pub struct CacheKey {
     pub lookback_ms: i64,
     /// The rollup resolution the whole request reads at, `0` raw.
     pub resolution_ms: i64,
+    /// Issue #810 (D14): the identity of the level list the request reads
+    /// (`MetricsEngine::levels_id`), `0` with no levels.
+    pub levels_id: u64,
 }
 
 impl CacheKey {
@@ -116,7 +120,14 @@ impl CacheKey {
             span_ms: p.end_ms - p.start_ms,
             lookback_ms,
             resolution_ms: resolution_ms.unwrap_or(0),
+            levels_id: 0,
         }
+    }
+
+    /// Issue #810 (D14): the key under the level list `id`.
+    pub fn with_levels_id(mut self, id: u64) -> Self {
+        self.levels_id = id;
+        self
     }
 }
 
@@ -171,6 +182,8 @@ pub struct Entry {
     pub charge_bound: u64,
     /// What [`charge`] counted when the entry was stored.
     pub bytes: u64,
+    /// Issue #810 (D14): how the kept answer's reads were routed.
+    pub reads: ReadMix,
 }
 
 /// What [`ReadCache::store`] did, decided in one hold of the store's lock.
@@ -372,6 +385,9 @@ pub struct ReadCache {
     /// generation read.
     #[cfg(test)]
     after_merge: Option<Hook>,
+    /// TEST SEAM (issue #810): run on a hit right after its lookup.
+    #[cfg(test)]
+    after_lookup: Option<Hook>,
     /// TEST SEAM: run by `clear_for_new_identity` immediately before its
     /// clear.
     #[cfg(test)]
@@ -404,6 +420,8 @@ impl ReadCache {
             #[cfg(test)]
             after_merge: None,
             #[cfg(test)]
+            after_lookup: None,
+            #[cfg(test)]
             before_identity_clear: None,
         }
     }
@@ -427,6 +445,15 @@ impl ReadCache {
             identity: poll.identity.as_ref().map(|ids| ids.to_vec()),
             identity_ok_at: poll.identity_ok_at,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_lookup(
+        mut self,
+        hook: impl Fn(&ReadCache) + Send + Sync + 'static,
+    ) -> Self {
+        self.after_lookup = Some(Box::new(hook));
+        self
     }
 
     #[cfg(test)]
@@ -466,7 +493,14 @@ impl ReadCache {
 
     /// The entry under `key`, made most recently used.
     pub fn lookup(&self, key: &CacheKey) -> Option<Arc<Entry>> {
+        self.lookup_at(key).map(|(e, _)| e)
+    }
+
+    /// Issue #810 (D14): [`Self::lookup`] and the generation read under the
+    /// store's lock, which [`Self::clear`] holds while it moves it.
+    pub fn lookup_at(&self, key: &CacheKey) -> Option<(Arc<Entry>, u64)> {
         let mut store = lock(&self.store);
+        let generation = self.generation();
         let store = &mut *store;
         store.tick += 1;
         let tick = store.tick;
@@ -475,7 +509,7 @@ impl ReadCache {
         let old_tick = std::mem::replace(old, tick);
         store.lru.remove(&old_tick);
         store.lru.insert(tick, key.clone());
-        Some(entry)
+        Some((entry, generation))
     }
 
     /// Stores `entry` under `key`, deciding in one hold of the store's lock
@@ -850,6 +884,7 @@ fn keep(
         first_fill_ms,
         charge_bound,
         bytes: 0,
+        reads: ReadMix::Unrouted,
     };
     shrink_entry(&mut entry);
     Some(entry)
@@ -1211,9 +1246,29 @@ pub struct RangeRequest<'a> {
     pub sweep_time_ms: Option<i64>,
 }
 
-/// An evaluation's answer: the result, its annotations, and what it
-/// charged.
-pub type Evaluated = (QueryResult, Annotations, u64);
+/// What an evaluation charged and how it read (issue #810).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvalFacts {
+    /// The sample rows it materialised.
+    pub charged: u64,
+    pub reads: ReadMix,
+    /// Read and evaluated raw for native histograms (D9).
+    pub raw: bool,
+}
+
+impl EvalFacts {
+    /// An evaluation with no routed read.
+    pub fn unrouted(charged: u64) -> Self {
+        EvalFacts {
+            charged,
+            reads: ReadMix::Unrouted,
+            raw: false,
+        }
+    }
+}
+
+/// An evaluation's answer: the result, its annotations, and its facts.
+pub type Evaluated = (QueryResult, Annotations, EvalFacts);
 
 /// What a request is answered with.
 pub struct Answer {
@@ -1230,14 +1285,16 @@ pub struct Answer {
 /// Answers `req` from the cache when it can, else from `full`. `tail` is
 /// evaluated over the points after an entry's last kept one. The caller's
 /// error, if any, is the answer, as it is without the cache.
-pub async fn answer_range<E, F, FF, T, TF>(
+pub async fn answer_range<E, F, FF, T, TF, R>(
     cache: &ReadCache,
     req: RangeRequest<'_>,
     full: F,
     tail: T,
+    too_many: R,
     attempt_ok: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<Answer, E>
 where
+    R: FnOnce(u64) -> E,
     F: FnOnce(MetricQueryParams) -> FF,
     FF: Future<Output = Result<Evaluated, E>>,
     T: FnOnce(MetricQueryParams) -> TF,
@@ -1272,78 +1329,115 @@ where
             .filter(|_| matches!(answer, QueryResult::Matrix(_) | QueryResult::MatrixHist(_)))
     };
 
-    if let Some(e) = cache.lookup(&req.key)
+    if let Some((e, eg)) = cache.lookup_at(&req.key)
         && e.c0_ms <= p.start_ms
         && p.start_ms <= e.c1_ms + p.step_ms
         && now - e.first_fill_ms < ENTRY_MAX_AGE_MS
         && cache.identity_fresh()
     {
+        #[cfg(test)]
+        if let Some(hook) = &cache.after_lookup {
+            hook(cache);
+        }
         let tail_p = MetricQueryParams {
             start_ms: e.c1_ms + p.step_ms,
             end_ms: p.end_ms,
             step_ms: p.step_ms,
         };
-        let (tail_result, tail_ann, tail_charged) = if tail_p.start_ms > tail_p.end_ms {
-            (QueryResult::Matrix(Vec::new()), Annotations::new(), 0)
-        } else {
-            tail(tail_p).await?
-        };
-        let bound = e.charge_bound.saturating_add(tail_charged);
-        if !tail_ann.has_mergeable()
-            && rendered_annotations(&tail_ann, req.query) == e.annotations
-            && bound <= req.max_samples
-            && cache.identity_fresh()
-            && cache.generation() == g0
-            && let Some(answer) = merge(&e, tail_result, p.start_ms, p.end_ms)
-        {
-            #[cfg(test)]
-            if let Some(hook) = &cache.after_merge {
-                hook(cache);
-            }
-            let stored = if attempt_ok()
-                && cache.fills_allowed(v)
-                && cache.identity_fresh()
-                && let Some(c1) = through(&answer)
-                && let Some(entry) = keep(
-                    &answer,
-                    p.start_ms,
-                    c1,
-                    e.annotations.clone(),
-                    e.first_fill_ms,
-                    bound,
-                ) {
-                Some(cache.store(req.key.clone(), entry, g0))
-            } else {
-                None
-            };
-            let through_ms = match stored {
-                Some(StoreOutcome::Published { through })
-                | Some(StoreOutcome::NotPublished { through }) => Some(through),
-                // A clear after the lookup: the merge is discarded.
-                Some(StoreOutcome::Stale) => None,
-                // Nothing stored: the kept points served only while no
-                // clear has run since the lookup.
-                None if cache.generation() == g0 => Some(cache.kept_through(&req.key)),
-                None => None,
-            };
-            if let Some(through_ms) = through_ms {
-                cache.count(Header::Hit, None);
-                return Ok(Answer {
-                    result: answer,
-                    annotations: tail_ann,
-                    outcome: Outcome::Hit,
-                    header: Header::Hit,
-                    through_ms,
-                });
+        if e.reads == ReadMix::AllRouted {
+            // Issue #810 (D14): a hit of an answer whose every read is
+            // routed is answered from the kept points and one read of the
+            // points after them, whatever that read's annotations. It is
+            // served only while no clear has run since the lookup, checked
+            // with no await between.
+            if cache.identity_fresh() && cache.generation() == eg {
+                return routed_hit(cache, &req, &e, tail_p, tail, too_many, attempt_ok, v).await;
             }
             g = cache.generation();
+        } else {
+            let (tail_result, tail_ann, tail_facts) = if tail_p.start_ms > tail_p.end_ms {
+                (
+                    QueryResult::Matrix(Vec::new()),
+                    Annotations::new(),
+                    EvalFacts::unrouted(0),
+                )
+            } else {
+                tail(tail_p).await?
+            };
+            let tail_charged = tail_facts.charged;
+            let bound = e.charge_bound.saturating_add(tail_charged);
+            if !tail_ann.has_mergeable()
+                && rendered_annotations(&tail_ann, req.query) == e.annotations
+                && bound <= req.max_samples
+                && cache.identity_fresh()
+                && cache.generation() == g0
+                && let Some(answer) = merge(&e, tail_result, p.start_ms, p.end_ms)
+            {
+                #[cfg(test)]
+                if let Some(hook) = &cache.after_merge {
+                    hook(cache);
+                }
+                let stored = if attempt_ok()
+                    && cache.fills_allowed(v)
+                    && cache.identity_fresh()
+                    && let Some(c1) = through(&answer)
+                    && let Some(entry) = keep(
+                        &answer,
+                        p.start_ms,
+                        c1,
+                        e.annotations.clone(),
+                        e.first_fill_ms,
+                        bound,
+                    ) {
+                    Some(cache.store(
+                        req.key.clone(),
+                        Entry {
+                            reads: e.reads,
+                            ..entry
+                        },
+                        g0,
+                    ))
+                } else {
+                    None
+                };
+                let through_ms = match stored {
+                    Some(StoreOutcome::Published { through })
+                    | Some(StoreOutcome::NotPublished { through }) => Some(through),
+                    // A clear after the lookup: the merge is discarded.
+                    Some(StoreOutcome::Stale) => None,
+                    // Nothing stored: the kept points served only while no
+                    // clear has run since the lookup.
+                    None if cache.generation() == g0 => Some(cache.kept_through(&req.key)),
+                    None => None,
+                };
+                if let Some(through_ms) = through_ms {
+                    cache.count(Header::Hit, None);
+                    return Ok(Answer {
+                        result: answer,
+                        annotations: tail_ann,
+                        outcome: Outcome::Hit,
+                        header: Header::Hit,
+                        through_ms,
+                    });
+                }
+                g = cache.generation();
+            }
         }
     }
 
-    let (result, annotations, charged) = full(p).await?;
+    let (result, annotations, full_facts) = full(p).await?;
+    let charged = full_facts.charged;
+    // Issue #810 (D14): an answer whose every read is routed is kept only
+    // with no annotation and when it was not read raw; one with a routed
+    // and an unrouted read is never kept.
+    let keepable = match full_facts.reads {
+        ReadMix::Unrouted => !annotations.has_mergeable(),
+        ReadMix::AllRouted => annotations.is_empty() && !full_facts.raw,
+        ReadMix::Mixed => false,
+    };
     let mut stored_through = None;
     if attempt_ok()
-        && !annotations.has_mergeable()
+        && keepable
         && cache.fills_allowed(v)
         && cache.identity_fresh()
         && let Some(c1) = through(&result)
@@ -1355,7 +1449,14 @@ where
             now,
             charged,
         )
-        && let StoreOutcome::Published { through } = cache.store(req.key.clone(), entry, g)
+        && let StoreOutcome::Published { through } = cache.store(
+            req.key.clone(),
+            Entry {
+                reads: full_facts.reads,
+                ..entry
+            },
+            g,
+        )
     {
         stored_through = through;
     }
@@ -1375,6 +1476,103 @@ where
     })
 }
 
+/// Issue #810 (D14): the hit of an entry whose every read is routed: the
+/// tail's one read, merged with the kept points, refused past the sample
+/// cap with no full re-read. A merge whose tail was read raw (D9) is
+/// answered and not stored, as a raw answer is not kept (addendum r6).
+#[allow(clippy::too_many_arguments)]
+async fn routed_hit<E, T, TF, R>(
+    cache: &ReadCache,
+    req: &RangeRequest<'_>,
+    e: &Entry,
+    tail_p: MetricQueryParams,
+    tail: T,
+    refuse: R,
+    attempt_ok: &(dyn Fn() -> bool + Send + Sync),
+    v: i64,
+) -> Result<Answer, E>
+where
+    R: FnOnce(u64) -> E,
+    T: FnOnce(MetricQueryParams) -> TF,
+    TF: Future<Output = Result<Evaluated, E>>,
+{
+    let p = req.params;
+    let g0 = cache.generation();
+    let (tail_result, tail_ann, tail_facts) = if tail_p.start_ms > tail_p.end_ms {
+        (
+            QueryResult::Matrix(Vec::new()),
+            Annotations::new(),
+            EvalFacts::unrouted(0),
+        )
+    } else {
+        tail(tail_p).await?
+    };
+    let bound = e.charge_bound.saturating_add(tail_facts.charged);
+    if bound > req.max_samples {
+        return Err(refuse(req.max_samples));
+    }
+    let answer = if matches!(
+        tail_result,
+        QueryResult::Matrix(_) | QueryResult::MatrixHist(_)
+    ) {
+        match merge(e, tail_result, p.start_ms, p.end_ms) {
+            Some(answer) => answer,
+            None => QueryResult::Matrix(Vec::new()),
+        }
+    } else {
+        tail_result
+    };
+    #[cfg(test)]
+    if let Some(hook) = &cache.after_merge {
+        hook(cache);
+    }
+    let res = req.key.resolution_ms;
+    let watermark = if res > 0 { cache.watermark(res) } else { None };
+    let through = keep_through(v, req.facts.reach_ms, &p, res, watermark)
+        .filter(|_| matches!(answer, QueryResult::Matrix(_) | QueryResult::MatrixHist(_)));
+    let stored = if tail_ann.is_empty()
+        && !tail_facts.raw
+        && attempt_ok()
+        && cache.fills_allowed(v)
+        && cache.identity_fresh()
+        && let Some(c1) = through
+        && let Some(entry) = keep(
+            &answer,
+            p.start_ms,
+            c1,
+            e.annotations.clone(),
+            e.first_fill_ms,
+            bound,
+        ) {
+        Some(cache.store(
+            req.key.clone(),
+            Entry {
+                reads: ReadMix::AllRouted,
+                ..entry
+            },
+            g0,
+        ))
+    } else {
+        None
+    };
+    let through_ms = match stored {
+        Some(StoreOutcome::Published { through })
+        | Some(StoreOutcome::NotPublished { through }) => through,
+        // A clear after the check: the merge is answered, not stored.
+        Some(StoreOutcome::Stale) => None,
+        None if cache.generation() == g0 => cache.kept_through(&req.key),
+        None => None,
+    };
+    cache.count(Header::Hit, None);
+    Ok(Answer {
+        result: answer,
+        annotations: tail_ann,
+        outcome: Outcome::Hit,
+        header: Header::Hit,
+        through_ms,
+    })
+}
+
 /// A range request through the cache, evaluated by `engine`. Nothing is
 /// stored once `engine` has a server failure, read after each evaluation
 /// (issue #803).
@@ -1387,11 +1585,21 @@ pub async fn answer_range_on(
 ) -> Result<Answer, ReadError> {
     let eval = |q: MetricQueryParams| async move {
         let (r, a, f) = engine.query_with_facts(tenant, expr, &q).await?;
-        Ok::<_, ReadError>((r, a, f.charged_samples))
+        let facts = EvalFacts {
+            charged: f.charged_samples,
+            reads: f.reads,
+            raw: f.raw,
+        };
+        Ok::<_, ReadError>((r, a, facts))
     };
-    answer_range(cache, req, eval, eval, &|| {
-        engine.server_failure().is_none()
-    })
+    answer_range(
+        cache,
+        req,
+        eval,
+        eval,
+        |cap| ReadError::QueryTooBroad(TooBroadReason::MetricSamples { cap }),
+        &|| engine.server_failure().is_none(),
+    )
     .await
 }
 
@@ -1404,7 +1612,7 @@ where
     F: FnOnce(MetricQueryParams) -> FF,
     FF: Future<Output = Result<Evaluated, E>>,
 {
-    let (result, annotations, _) = full(p).await?;
+    let (result, annotations, _facts) = full(p).await?;
     Ok(Answer {
         result,
         annotations,
@@ -1736,14 +1944,26 @@ mod tests {
     ) -> Answer {
         let full = |q: MetricQueryParams| {
             calls.full.fetch_add(1, Ordering::SeqCst);
-            async move { R::Ok((grid_matrix(&q, 0.0), full_ann, full_charge)) }
+            async move {
+                R::Ok((
+                    grid_matrix(&q, 0.0),
+                    full_ann,
+                    EvalFacts::unrouted(full_charge),
+                ))
+            }
         };
         let tail = |q: MetricQueryParams| {
             calls.tail.fetch_add(1, Ordering::SeqCst);
             during_tail();
-            async move { R::Ok((grid_matrix(&q, 0.0), tail_ann, tail_charge)) }
+            async move {
+                R::Ok((
+                    grid_matrix(&q, 0.0),
+                    tail_ann,
+                    EvalFacts::unrouted(tail_charge),
+                ))
+            }
         };
-        answer_range(&r.cache, req, full, tail, &always)
+        answer_range(&r.cache, req, full, tail, |_| (), &always)
             .await
             .expect("answered")
     }
@@ -1833,6 +2053,7 @@ mod tests {
             first_fill_ms: 0,
             charge_bound: 0,
             bytes: 0,
+            reads: ReadMix::Unrouted,
         };
         let tail = QueryResult::Matrix(vec![
             MatrixSeries {
@@ -1900,6 +2121,7 @@ mod tests {
             first_fill_ms: 0,
             charge_bound: 0,
             bytes: 0,
+            reads: ReadMix::Unrouted,
         };
         let tail = || {
             QueryResult::MatrixHist(vec![HistMatrixSeries {
@@ -1954,6 +2176,7 @@ mod tests {
             first_fill_ms: 0,
             charge_bound: 0,
             bytes: 0,
+            reads: ReadMix::Unrouted,
         }
     }
 
@@ -2755,14 +2978,31 @@ mod tests {
         let full_calls = AtomicUsize::new(0);
         let full = |q: MetricQueryParams| {
             full_calls.fetch_add(1, Ordering::SeqCst);
-            async move { R::Ok((grid_matrix(&q, 1_000.0), Annotations::new(), 10)) }
+            async move {
+                R::Ok((
+                    grid_matrix(&q, 1_000.0),
+                    Annotations::new(),
+                    EvalFacts::unrouted(10),
+                ))
+            }
         };
         let tail = |q: MetricQueryParams| async move {
-            R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10))
+            R::Ok((
+                grid_matrix(&q, 0.0),
+                Annotations::new(),
+                EvalFacts::unrouted(10),
+            ))
         };
-        let a = answer_range(&r.cache, request(q, p, u64::MAX), full, tail, &always)
-            .await
-            .expect("answered");
+        let a = answer_range(
+            &r.cache,
+            request(q, p, u64::MAX),
+            full,
+            tail,
+            |_| (),
+            &always,
+        )
+        .await
+        .expect("answered");
         (a, p, full_calls.load(Ordering::SeqCst))
     }
 
@@ -2841,13 +3081,26 @@ mod tests {
         let go = |answer: QueryResult| {
             let full = |_: MetricQueryParams| {
                 full_calls.fetch_add(1, Ordering::SeqCst);
-                async move { R::Ok((answer, Annotations::new(), 0)) }
+                async move { R::Ok((answer, Annotations::new(), EvalFacts::unrouted(0))) }
             };
             let tail = |q: MetricQueryParams| {
                 tail_calls.fetch_add(1, Ordering::SeqCst);
-                async move { R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 0)) }
+                async move {
+                    R::Ok((
+                        grid_matrix(&q, 0.0),
+                        Annotations::new(),
+                        EvalFacts::unrouted(0),
+                    ))
+                }
             };
-            answer_range(&r.cache, request(q, p, u64::MAX), full, tail, &always)
+            answer_range(
+                &r.cache,
+                request(q, p, u64::MAX),
+                full,
+                tail,
+                |_| (),
+                &always,
+            )
         };
         let first = go(QueryResult::Matrix(vec![])).await.expect("answered");
         assert_eq!(first.header, Header::Bypass, "(c) first header");
@@ -2884,17 +3137,29 @@ mod tests {
             if flagging {
                 failed.store(true, Ordering::SeqCst);
             }
-            async move { R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10)) }
+            async move {
+                R::Ok((
+                    grid_matrix(&q, 0.0),
+                    Annotations::new(),
+                    EvalFacts::unrouted(10),
+                ))
+            }
         };
         let tail = |q: MetricQueryParams| {
             calls.tail.fetch_add(1, Ordering::SeqCst);
             if flagging {
                 failed.store(true, Ordering::SeqCst);
             }
-            async move { R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10)) }
+            async move {
+                R::Ok((
+                    grid_matrix(&q, 0.0),
+                    Annotations::new(),
+                    EvalFacts::unrouted(10),
+                ))
+            }
         };
         let guard = || !failed.load(Ordering::SeqCst);
-        answer_range(&r.cache, req, full, tail, &guard)
+        answer_range(&r.cache, req, full, tail, |_| (), &guard)
             .await
             .expect("answered")
     }
@@ -3033,14 +3298,31 @@ mod tests {
                     let answer = rt.block_on(async {
                         let full = |q: MetricQueryParams| {
                             full_calls.fetch_add(1, Ordering::SeqCst);
-                            async move { R::Ok((grid_matrix(&q, 1_000.0), Annotations::new(), 10)) }
+                            async move {
+                                R::Ok((
+                                    grid_matrix(&q, 1_000.0),
+                                    Annotations::new(),
+                                    EvalFacts::unrouted(10),
+                                ))
+                            }
                         };
                         let tail = |q: MetricQueryParams| async move {
-                            R::Ok((grid_matrix(&q, 1_000.0), Annotations::new(), 10))
+                            R::Ok((
+                                grid_matrix(&q, 1_000.0),
+                                Annotations::new(),
+                                EvalFacts::unrouted(10),
+                            ))
                         };
-                        answer_range(&shared, request(q, p2, u64::MAX), full, tail, &always)
-                            .await
-                            .expect("answered")
+                        answer_range(
+                            &shared,
+                            request(q, p2, u64::MAX),
+                            full,
+                            tail,
+                            |_| (),
+                            &always,
+                        )
+                        .await
+                        .expect("answered")
                     });
                     let _ = tx.send((answer, full_calls.load(Ordering::SeqCst)));
                 });
@@ -3068,12 +3350,20 @@ mod tests {
         let now = || clock.load(Ordering::SeqCst);
         cache.record_identity(now(), vec!["db".to_string()]);
         let full = |q: MetricQueryParams| async move {
-            R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10))
+            R::Ok((
+                grid_matrix(&q, 0.0),
+                Annotations::new(),
+                EvalFacts::unrouted(10),
+            ))
         };
         let tail = |q: MetricQueryParams| async move {
-            R::Ok((grid_matrix(&q, 0.0), Annotations::new(), 10))
+            R::Ok((
+                grid_matrix(&q, 0.0),
+                Annotations::new(),
+                EvalFacts::unrouted(10),
+            ))
         };
-        let a = answer_range(&cache, request(q, p, u64::MAX), full, tail, &always)
+        let a = answer_range(&cache, request(q, p, u64::MAX), full, tail, |_| (), &always)
             .await
             .expect("answered");
         assert_eq!(a.header, Header::Miss, "the fill");
