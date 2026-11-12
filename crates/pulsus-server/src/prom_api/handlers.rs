@@ -457,7 +457,6 @@ async fn run_range_query(
                 query,
                 params: *p,
                 facts,
-                max_samples: state.config.reader.promql_max_samples,
                 retention_floor_ms: state
                     .retention_days()
                     .map(|d| now - i64::from(d) * 86_400_000 + 86_400_000),
