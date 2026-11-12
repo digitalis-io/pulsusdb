@@ -1842,6 +1842,8 @@ async fn a_query_with_an_unrouted_read_is_never_kept() {
     Server::settle_poll();
     let q = Range::new("rate(a[5m]) + irate(b[5m])", end - 4 * HOUR, end, MINUTE);
     let first = same(&r.a, &r.b, q, "T23 first");
+    // Both servers sweep the tenant slot their first request created.
+    std::thread::sleep(Duration::from_secs(3));
     assert_eq!(first.cache(), "bypass", "T23: the first is not kept");
     let ra = q.shifted(MINUTE).send(r.a.port);
     let rb = q.shifted(MINUTE).send(r.b.port);
@@ -2064,6 +2066,8 @@ async fn a_raw_tail_merge_is_answered_but_not_stored() {
         assert!(Instant::now() < deadline, "T41: the histogram never landed");
         std::thread::sleep(Duration::from_millis(200));
     }
+    // Both servers sweep the new series before the repeat.
+    std::thread::sleep(Duration::from_secs(3));
     let second = same(&r.a, &r.b, q.shifted(MINUTE), "T41 repeat");
     assert_eq!(second.cache(), "hit", "T41: the repeat");
     assert_eq!(second.through(), Some(kept), "T41: the merge is not stored");
