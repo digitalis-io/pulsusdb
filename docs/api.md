@@ -562,6 +562,8 @@ The cap is per-variant only at the root. Any other root — including `variants(
 
 The tie rule is a PulsusDB determinism pin, not a mirror of the reference, which orders on the value alone through an unstable sort and so specifies no order among equal-valued samples. Registered as `sort-tie-order` in the same ledger. A client must key on the value and the label set, never on a sample's position within a run of equal values.
 
+**An ungrouped instant sum of a count (issue #839).** An instant `sum(count_over_time(…))` or `sum(bytes_over_time(…))` with no grouping, and no stage but line filters the database runs (not `ip(…)`), is at most one statement (none when the time range is empty). Stream resolution runs inside it, so the 100,000-stream cap does not apply; the scan budget does.
+
 ### 2.3 Labels & series
 
 ```

@@ -48,8 +48,8 @@ docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:174	crates/pulsus-re
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:2762	crates/pulsus-read/src/logql/plan.rs	2762		line	pipeline	// Defense in depth: the parser only emits the pipeline
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:2791	crates/pulsus-read/src/logql/plan.rs	2791		line	forbids_unwrap	if forbids_unwrap && has_unwrap {
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:2824	crates/pulsus-read/src/logql/plan.rs	2824		prose	QuantileOverTime	RangeAgg
-docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:4360	crates/pulsus-read/src/logql/plan.rs	4360		prose	compile_line_filters	compile_line_filters
-docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:4393	crates/pulsus-read/src/logql/plan.rs	4393		prose	is_pushable_line_filter	is_pushable_line_filter
+docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:4365	crates/pulsus-read/src/logql/plan.rs	4365		prose	compile_line_filters	compile_line_filters
+docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:4398	crates/pulsus-read/src/logql/plan.rs	4398		prose	is_pushable_line_filter	is_pushable_line_filter
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:83	crates/pulsus-read/src/logql/plan.rs	83		line	fetch_until_limit	pub fetch_until_limit: bool,
 docs/query-lowering.md	crates/pulsus-read/src/logql/post_agg.rs:3307-3350	crates/pulsus-read/src/logql/post_agg.rs	3307	3350	line	label_replace_peak_bytes	fn merge_matrix_collisions( items: Vec<MatrixSeries>, l: &Ledger<'_>, ) -> Result<Vec<MatrixSeries>, ReadError> { // Ent
 docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:1132	crates/pulsus-read/src/logql/sql.rs	1132		prose	stage3_keyset	stage3_keyset
@@ -97,12 +97,12 @@ docs/query-lowering.md	plan.rs:3826	crates/pulsus-read/src/logql/plan.rs	3826		p
 docs/query-lowering.md	plan.rs:3869	crates/pulsus-read/src/logql/plan.rs	3869		prose	PipelineInvalid	reject
 docs/query-lowering.md	plan.rs:3877	crates/pulsus-read/src/logql/plan.rs	3877		prose	return	reject
 docs/query-lowering.md	plan.rs:4262	crates/pulsus-read/src/logql/plan.rs	4262		prose	ContradictoryMatchers	ContradictoryMatchers
-docs/query-lowering.md	plan.rs:4333	crates/pulsus-read/src/logql/plan.rs	4333		prose	EmptyMatcherSet	EmptyMatcherSet
-docs/query-lowering.md	plan.rs:4368	crates/pulsus-read/src/logql/plan.rs	4368		prose	is_pushable_line_filter	is_pushable_line_filter
-docs/query-lowering.md	plan.rs:4375	crates/pulsus-read/src/logql/plan.rs	4375		prose	LineFormat	LineFormat
-docs/query-lowering.md	plan.rs:4393	crates/pulsus-read/src/logql/plan.rs	4393		prose	is_pushable_line_filter	is_pushable_line_filter
-docs/query-lowering.md	plan.rs:5002	crates/pulsus-read/src/logql/plan.rs	5002		prose	tests	mod tests
-docs/query-lowering.md	plan.rs:5177	crates/pulsus-read/src/logql/plan.rs	5177		prose	super	use super::*
+docs/query-lowering.md	plan.rs:4338	crates/pulsus-read/src/logql/plan.rs	4338		prose	EmptyMatcherSet	EmptyMatcherSet
+docs/query-lowering.md	plan.rs:4373	crates/pulsus-read/src/logql/plan.rs	4373		prose	is_pushable_line_filter	is_pushable_line_filter
+docs/query-lowering.md	plan.rs:4380	crates/pulsus-read/src/logql/plan.rs	4380		prose	LineFormat	LineFormat
+docs/query-lowering.md	plan.rs:4398	crates/pulsus-read/src/logql/plan.rs	4398		prose	is_pushable_line_filter	is_pushable_line_filter
+docs/query-lowering.md	plan.rs:5017	crates/pulsus-read/src/logql/plan.rs	5017		prose	tests	mod tests
+docs/query-lowering.md	plan.rs:5192	crates/pulsus-read/src/logql/plan.rs	5192		prose	super	use super::*
 docs/query-lowering.md	post_agg.rs:3008-3011	crates/pulsus-read/src/logql/post_agg.rs	3008	3011	prose	vector_aggs	.rev()
 docs/query-lowering.md	post_agg.rs:3307	crates/pulsus-read/src/logql/post_agg.rs	3307		prose	merge_matrix_collisions	merge_matrix_collisions
 docs/query-lowering.md	search_response.rs:513	crates/pulsus-server/src/traces_api/search_response.rs	513		line	group_json	// one-entry list and is served by `group_json` above, so the
@@ -167,22 +167,22 @@ docs/query-to-sql.md	labels.rs:66	crates/pulsus-read/src/logql/labels.rs	66		pro
 docs/query-to-sql.md	logql/charge.rs:1326	crates/pulsus-read/src/logql/charge.rs	1326		line	MAX_STREAMS_RESULT_BYTES	pub const MAX_STREAMS_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
 docs/query-to-sql.md	logql/error.rs:762-768	crates/pulsus-read/src/logql/error.rs	762	768	prose	aggregation	400
 docs/query-to-sql.md	logql/error.rs:769-772	crates/pulsus-read/src/logql/error.rs	769	772	prose	intentionally	pipeline
-docs/query-to-sql.md	logql/exec.rs:1979	crates/pulsus-read/src/logql/exec.rs	1979		line	rate_after_sum	let series = match rate_after_sum(mp) {
-docs/query-to-sql.md	logql/exec.rs:2213	crates/pulsus-read/src/logql/exec.rs	2213		line	one_point_answer	apply_leaf_aggs(mp, one_point_answer(mp, result), 0)
-docs/query-to-sql.md	logql/exec.rs:2626	crates/pulsus-read/src/logql/exec.rs	2626		line	apply_leaf_aggs	apply_leaf_aggs(mp, result, folded)
-docs/query-to-sql.md	logql/exec.rs:2814	crates/pulsus-read/src/logql/exec.rs	2814		prose	apply_vector_aggs	vector_aggs
+docs/query-to-sql.md	logql/exec.rs:2032	crates/pulsus-read/src/logql/exec.rs	2032		line	rate_after_sum	let series = match rate_after_sum(mp) {
+docs/query-to-sql.md	logql/exec.rs:2266	crates/pulsus-read/src/logql/exec.rs	2266		line	one_point_answer	apply_leaf_aggs(mp, one_point_answer(mp, result), 0)
+docs/query-to-sql.md	logql/exec.rs:2679	crates/pulsus-read/src/logql/exec.rs	2679		line	apply_leaf_aggs	apply_leaf_aggs(mp, result, folded)
+docs/query-to-sql.md	logql/exec.rs:2867	crates/pulsus-read/src/logql/exec.rs	2867		prose	apply_vector_aggs	vector_aggs
 docs/query-to-sql.md	logql/fold.rs:543	crates/pulsus-read/src/logql/fold.rs	543		line	SelectFold	pub(in crate::logql) struct SelectFold {
 docs/query-to-sql.md	logql/params.rs:124	crates/pulsus-read/src/logql/params.rs	124		line	DEFAULT_MAX_STREAMS	pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 docs/query-to-sql.md	logql/pipeline.rs:1360	crates/pulsus-read/src/logql/pipeline.rs	1360		line	PipelineError	pub fn compile(stages: &[Stage]) -> Result<Self, PipelineError> {
-docs/query-to-sql.md	logql/predicate.rs:1421	crates/pulsus-read/src/logql/predicate.rs	1421		line	format	sql: format!(
-docs/query-to-sql.md	logql/predicate.rs:1468	crates/pulsus-read/src/logql/predicate.rs	1468		line	regex_predicate	fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
-docs/query-to-sql.md	logql/predicate.rs:2557-2564	crates/pulsus-read/src/logql/predicate.rs	2557	2564	prose	a_contains_line_filter_renders_an_escaped_like_pattern	LIKE
-docs/query-to-sql.md	logql/predicate.rs:2563	crates/pulsus-read/src/logql/predicate.rs	2563		line	test	#[test]
+docs/query-to-sql.md	logql/predicate.rs:1478	crates/pulsus-read/src/logql/predicate.rs	1478		line	format	sql: format!(
+docs/query-to-sql.md	logql/predicate.rs:1525	crates/pulsus-read/src/logql/predicate.rs	1525		line	regex_predicate	fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
+docs/query-to-sql.md	logql/predicate.rs:2615-2622	crates/pulsus-read/src/logql/predicate.rs	2615	2622	prose	a_contains_line_filter_renders_an_escaped_like_pattern	LIKE
+docs/query-to-sql.md	logql/predicate.rs:2621	crates/pulsus-read/src/logql/predicate.rs	2621		line	test	#[test]
 docs/query-to-sql.md	logql/predicate.rs:509	crates/pulsus-read/src/logql/predicate.rs	509		line	or_matches	let core = if lf.or_matches.is_empty() {
-docs/query-to-sql.md	logql/predicate.rs:509-528	crates/pulsus-read/src/logql/predicate.rs	509	528	line	CheckedFragment	let core = if lf.or_matches.is_empty() { disjuncts .into_iter() .next() .expect("a line filter always has a head alterna
-docs/query-to-sql.md	logql/predicate.rs:530	crates/pulsus-read/src/logql/predicate.rs	530		prose	LineFilterOp	NOT
-docs/query-to-sql.md	logql/predicate.rs:601	crates/pulsus-read/src/logql/predicate.rs	601		prose	pattern_captures	pattern_captures
-docs/query-to-sql.md	logql/predicate.rs:963	crates/pulsus-read/src/logql/predicate.rs	963		line	comparison	/// range select, as a key-precise comparison would.
+docs/query-to-sql.md	logql/predicate.rs:509-532	crates/pulsus-read/src/logql/predicate.rs	509	532	line	CheckedFragment	let core = if lf.or_matches.is_empty() { disjuncts .into_iter() .next() .expect("a line filter always has a head alterna
+docs/query-to-sql.md	logql/predicate.rs:534	crates/pulsus-read/src/logql/predicate.rs	534		prose	LineFilterOp	NOT
+docs/query-to-sql.md	logql/predicate.rs:658	crates/pulsus-read/src/logql/predicate.rs	658		prose	pattern_captures	pattern_captures
+docs/query-to-sql.md	logql/predicate.rs:1020	crates/pulsus-read/src/logql/predicate.rs	1020		line	comparison	/// range select, as a key-precise comparison would.
 docs/query-to-sql.md	logql/sql.rs:424	crates/pulsus-read/src/logql/sql.rs	424		prose	json_count_columns	json_count_columns
 docs/query-to-sql.md	logql/window.rs:148	crates/pulsus-read/src/logql/window.rs	148		line	MAX_CLIENT_AGG_BUCKETS	pub const MAX_CLIENT_AGG_BUCKETS: u64 = 11_000;
 docs/query-to-sql.md	logs_api/error.rs:148-153	crates/pulsus-server/src/logs_api/error.rs	148	153	line	X_CONTENT_TYPE_OPTIONS	( status, [ (header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff"), ],
@@ -220,9 +220,9 @@ docs/query-to-sql.md	plan.rs:3192	crates/pulsus-read/src/logql/plan.rs	3192		pro
 docs/query-to-sql.md	plan.rs:3204	crates/pulsus-read/src/logql/plan.rs	3204		prose	bucketed_range	else if bucketed_range
 docs/query-to-sql.md	plan.rs:3255	crates/pulsus-read/src/logql/plan.rs	3255		prose	RouteChoice	RouteChoice::Rollup
 docs/query-to-sql.md	plan.rs:362	crates/pulsus-read/src/logql/plan.rs	362		prose	VectorAggSpec	vector_aggs
-docs/query-to-sql.md	plan.rs:4360	crates/pulsus-read/src/logql/plan.rs	4360		prose	compile_line_filters	compile_line_filters
-docs/query-to-sql.md	plan.rs:4360-4378	crates/pulsus-read/src/logql/plan.rs	4360	4378	prose	is_pushable_line_filter	_ => {}
-docs/query-to-sql.md	plan.rs:4393	crates/pulsus-read/src/logql/plan.rs	4393		prose	is_pushable_line_filter	is_pushable_line_filter
+docs/query-to-sql.md	plan.rs:4365	crates/pulsus-read/src/logql/plan.rs	4365		prose	compile_line_filters	compile_line_filters
+docs/query-to-sql.md	plan.rs:4365-4383	crates/pulsus-read/src/logql/plan.rs	4365	4383	prose	is_pushable_line_filter	_ => {}
+docs/query-to-sql.md	plan.rs:4398	crates/pulsus-read/src/logql/plan.rs	4398		prose	is_pushable_line_filter	is_pushable_line_filter
 docs/query-to-sql.md	post_agg.rs:1042	crates/pulsus-read/src/logql/post_agg.rs	1042		prose	select_k_range	select_k_range
 docs/query-to-sql.md	post_agg.rs:1064-1079	crates/pulsus-read/src/logql/post_agg.rs	1064	1079	line	or_default	let mut groups: HashMap<LabelSet, Vec<BTreeMap<i64, f64>>> = HashMap::new(); for s in series { groups .entry(group_key(&
 docs/query-to-sql.md	post_agg.rs:1110	crates/pulsus-read/src/logql/post_agg.rs	1110		prose	select_k_instant	select_k_instant
