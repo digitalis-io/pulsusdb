@@ -16063,12 +16063,29 @@ mod one_raw_statement {
         (r.answer, s)
     }
 
-    /// The answer's digest, recorded so a run of another build can be
-    /// compared with it.
-    fn record(id: &str, answer: &[String]) {
+    /// The answer's digest, its times taken from the anchor `t`, recorded
+    /// so a run of another build can be compared with it.
+    fn record(id: &str, t: i64, answer: &[String]) {
         use std::hash::{Hash, Hasher};
+        let relative: Vec<String> = answer
+            .iter()
+            .map(|line| {
+                let (labels, points) = line.rsplit_once(' ').unwrap_or((line, ""));
+                let points: Vec<String> = points
+                    .split(',')
+                    .map(|p| match p.split_once(':') {
+                        Some((at, v)) => match at.parse::<i64>() {
+                            Ok(at) => format!("{}:{v}", at - t),
+                            Err(_) => p.to_string(),
+                        },
+                        None => p.to_string(),
+                    })
+                    .collect();
+                format!("{labels} {}", points.join(","))
+            })
+            .collect();
         let mut d = std::collections::hash_map::DefaultHasher::new();
-        answer.hash(&mut d);
+        relative.hash(&mut d);
         println!(
             "{id}: {} series, answer digest {:016x}",
             answer.len(),
@@ -16082,14 +16099,51 @@ mod one_raw_statement {
             .collect()
     }
 
-    /// The statement's text as rendered: the logged text less a trailing
-    /// `FORMAT` clause.
-    fn rendered_len(q: &str) -> u64 {
-        let end = q
-            .rfind("\nFORMAT ")
-            .or_else(|| q.rfind(" FORMAT "))
-            .unwrap_or(q.len());
-        end as u64
+    #[derive(Row, serde::Serialize, serde::Deserialize)]
+    struct Fp {
+        fingerprint: pulsus_model::Fingerprint,
+    }
+
+    /// The length of the one statement a read over `metrics` sent, rendered
+    /// again from its window and the metrics' series: the query log cuts a
+    /// long statement's text.
+    async fn rendered_len(h: &Harness, logged: &str, metrics: &str) -> u64 {
+        use futures::StreamExt;
+        let num = |key: &str| -> i64 {
+            logged
+                .split(key)
+                .nth(1)
+                .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|n| n.parse().ok())
+                .expect("a window bound")
+        };
+        let (lo, hi) = (num("unix_milli > "), num("unix_milli <= "));
+        let mut rows = h
+            .admin
+            .query_stream::<Fp>(
+                &format!(
+                    "SELECT DISTINCT fingerprint FROM metric_labels WHERE metric_name IN ({metrics}) \
+                     ORDER BY fingerprint"
+                ),
+                &QuerySettings::new(),
+            )
+            .await
+            .expect("fingerprints");
+        let mut lits = Vec::new();
+        while let Some(r) = rows.next().await {
+            lits.push(r.expect("a row").fingerprint.sql_literal());
+        }
+        let sql = pulsus_read::metrics::sample_sql::paired_fetch(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            "metric_samples",
+            "metric_hist_samples",
+            pulsus_read::metrics::sample_sql::PairedSeries::List(&lits),
+            lo,
+            hi,
+        );
+        let n = logged.len().min(2_000);
+        assert_eq!(&sql[..n], &logged[..n], "the statement rendered again");
+        sql.len() as u64
     }
 
     /// **R1: a selector the label cache lists is one statement**, its
@@ -16102,7 +16156,7 @@ mod one_raw_statement {
         let h = harness_sql(&db, t, &scale_corpus_sql(t, 1_200, true), None).await;
         let p = h.ten_minutes(60_000);
         let (answer, s) = sent(&h, &h.unpushed, "cpu_seconds", &p).await;
-        record("R1", &answer);
+        record("R1", t, &answer);
         assert!(!answer.is_empty());
         assert_eq!(s.len(), 1, "R1: {:#?}", brief(&s));
         assert!(
@@ -16124,7 +16178,7 @@ mod one_raw_statement {
         let engine = engine_with_cache(&db, 5, false).await;
         let p = h.ten_minutes(60_000);
         let (answer, s) = sent(&h, &engine, "cpu_seconds", &p).await;
-        record("R2", &answer);
+        record("R2", t, &answer);
         assert!(!answer.is_empty());
         assert_eq!(s.len(), 2, "R2: {:#?}", brief(&s));
         let empty = MetricQueryParams {
@@ -16149,7 +16203,7 @@ mod one_raw_statement {
         let engine = engine_with_cache(&db, 50_000, true).await;
         let p = h.ten_minutes(60_000);
         let (answer, s) = sent(&h, &engine, "info(ra)", &p).await;
-        record("R3", &answer);
+        record("R3", t, &answer);
         assert!(!answer.is_empty());
         let info: Vec<&LoggedStatement> = s
             .iter()
@@ -16173,7 +16227,7 @@ mod one_raw_statement {
         let h = harness_sql(&db, t, &small_corpus_sql(t), None).await;
         let p = h.ten_minutes(60_000);
         let (answer, s) = sent(&h, &h.unpushed, r#"{__name__=~"ra|rb"}"#, &p).await;
-        record("R4", &answer);
+        record("R4", t, &answer);
         assert_eq!(answer.len(), 6);
         assert_eq!(s.len(), 1, "R4: {:#?}", brief(&s));
         h.finish().await;
@@ -16188,7 +16242,7 @@ mod one_raw_statement {
         let h = harness_sql(&db, t, &small_corpus_sql(t), None).await;
         let p = h.ten_minutes(60_000);
         let (answer, s) = sent(&h, &h.unpushed, r#"{job="x"}"#, &p).await;
-        record("R5", &answer);
+        record("R5", t, &answer);
         assert_eq!(answer.len(), 9);
         assert_eq!(s.len(), 2, "R5: {:#?}", brief(&s));
         h.finish().await;
@@ -16206,7 +16260,7 @@ mod one_raw_statement {
         // The sum over a float and a histogram rate answers nothing; the
         // statements are what this checks.
         let (answer, s) = sent(&h, &h.pushed, "sum(rate(cpu_seconds[5m]))", &p).await;
-        record("R8", &answer);
+        record("R8", t, &answer);
         assert_eq!(s.len(), 2, "R8: {:#?}", brief(&s));
         assert!(
             s[0].query.contains("AS range_ms") && s[1].query.contains("UNION ALL"),
@@ -16222,16 +16276,28 @@ mod one_raw_statement {
     async fn r4c_one_statement_and_the_split_answer_alike() {
         skip_unless_live!();
         let t = anchor();
-        for (id, q, corpus, split) in [
-            ("listed", "cpu_seconds", scale_corpus_sql(t, 1_200, true), 3),
-            ("multi", r#"{__name__=~"ra|rb"}"#, small_corpus_sql(t), 2),
+        for (id, q, metrics, corpus, split) in [
+            (
+                "listed",
+                "cpu_seconds",
+                "'cpu_seconds'",
+                scale_corpus_sql(t, 1_200, true),
+                3,
+            ),
+            (
+                "multi",
+                r#"{__name__=~"ra|rb"}"#,
+                "'ra', 'rb'",
+                small_corpus_sql(t),
+                2,
+            ),
         ] {
             let db = pulsus_testkit::test_db(&format!("pulsus_read_it_qlog_835_r4c_{id}"));
             let h = harness_sql(&db, t, &corpus, None).await;
             let p = h.ten_minutes(60_000);
             let (whole, s) = sent(&h, &h.unpushed, q, &p).await;
             assert_eq!(s.len(), 1, "R4c {id}: {:#?}", brief(&s));
-            let len = rendered_len(&s[0].query);
+            let len = rendered_len(&h, &s[0].query, metrics).await;
             let mk = |cap: u64| {
                 let cache = Arc::clone(&h.cache);
                 let db = db.clone();
@@ -16325,7 +16391,11 @@ mod one_raw_statement {
                     .expect("query_log");
                 let mut out = Vec::new();
                 while let Some(r) = s.next().await {
-                    out.push(r.expect("a row"));
+                    let r = r.expect("a row");
+                    // The suite's own reads of the query log.
+                    if !r.query.starts_with("SELECT query,") {
+                        out.push(r);
+                    }
                 }
                 out
             }
@@ -16336,7 +16406,7 @@ mod one_raw_statement {
         let one = memory(marker).await;
         assert_eq!(one.len(), 1, "R1m: one statement {one:#?}");
         assert!(
-            one[0].query.contains("UNION ALL"),
+            one[0].query.starts_with("(SELECT toUInt8(3) AS arm"),
             "R1m: the paired statement: {one:#?}"
         );
         let marker = server_marker(&h.admin).await;
