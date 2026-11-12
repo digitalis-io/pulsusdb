@@ -4364,15 +4364,17 @@ fn normalize_matchers(selector: &StreamSelector) -> Result<NormalizedMatchers, R
 /// still returning 500.
 pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Result<Vec<CheckedFragment>, ReadError> {
     let mut out = Vec::new();
+    // Issue #839 addendum F3: the query's filters share one check budget.
+    let mut check_budget = crate::logql::predicate::LINE_FILTER_CHECK_BUDGET_BYTES;
     for stage in pipeline {
         match stage {
             // Non-pushable line filters (`ip(…)` / any `or` alternative that
             // is an `ip`) render no `body` predicate at all and are evaluated
             // in the client pipeline — never emit SQL for them here (doing so
             // would drop lines the client scan must keep / re-test).
-            Stage::LineFilter(lf) if is_pushable_line_filter(lf) => {
-                out.push(crate::logql::predicate::line_filter(lf)?)
-            }
+            Stage::LineFilter(lf) if is_pushable_line_filter(lf) => out.push(
+                crate::logql::predicate::line_filter_within(lf, &mut check_budget)?,
+            ),
             Stage::LineFilter(_) => {}
             // `line_format`/`decolorize`/`unpack` rewrite the line — a line
             // filter after any of them references the rewritten text and must

@@ -2097,7 +2097,9 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // move to bloom-filter indexes adds two more to that test, a negated
     // case-insensitive `match(identity(body), …)` and a plain
     // `match(body, …)`.
-    ("pulsus-read/src/logql/predicate.rs", 23),
+    // Issue #839 adds one: the expected text of the test that pins a check
+    // per alternative.
+    ("pulsus-read/src/logql/predicate.rs", 24),
     // Issue #624, part 3d adds three to `sql.rs`: the `| logfmt` line
     // grammar in its `decided` column, and the out-of-range integer test in
     // each of the two `| json` key readers. Issue #624, part 4 adds twelve:
@@ -2134,7 +2136,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 122;
+const MATCH_RENDER_TOTAL: usize = 123;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
@@ -2420,7 +2422,12 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn index_neq_branch(key: &str, value: &str) -> CheckedFragment",
     "pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError>",
     "pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError>",
-    "fn lowered_prefilter(lf: &LineFilter) -> Option<String>",
+    "pub const LINE_FILTER_CHECK_BUDGET_BYTES: usize = 65_536",
+    "pub(crate) fn line_filter_within(lf: &LineFilter, check_budget: &mut usize) -> Result<CheckedFragment, PipelineError>",
+    "fn alternative_checks(lf: &LineFilter, check_budget: &mut usize) -> Vec<Option<String>>",
+    "fn render_check(sets: &[Vec<String>]) -> String",
+    "fn render_check(sets: &[Vec<String>]) -> String :: fn lit(s: &str) -> String",
+    "fn render_check(sets: &[Vec<String>]) -> String :: fn any(lits: &[String]) -> String",
     "pub fn regexp_captures_column(patterns: &[super::pipeline::RxSource]) -> Result<CheckedFragment, PipelineError>",
     "pub fn regexp_captures_column_skipping(patterns: &[super::pipeline::RxSource], skipped: &[bool]) -> Result<CheckedFragment, PipelineError>",
     "pub fn pattern_captures(pattern: &str) -> Result<CheckedFragment, PipelineError>",
@@ -2543,7 +2550,7 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn metadata_filter_and(a: &CheckedFragment, b: &CheckedFragment) -> CheckedFragment",
     "pub fn metadata_filter_or(a: &CheckedFragment, b: &CheckedFragment) -> CheckedFragment",
     "fn check_partition(classes: &MetadataNameClasses<'_>) -> Result<(), MetadataFilterRefusal>",
-    "fn classified_line_filter(lf: &LineFilter) -> Result<Option<CheckedFragment>, PipelineError>",
+    "fn classified_line_filter(lf: &LineFilter, check_budget: &mut usize) -> Result<Option<CheckedFragment>, PipelineError>",
     "pub fn index_eq_empty_failure_branch(key: &str) -> CheckedFragment",
     "pub fn index_re_failure_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError>",
     "#[cfg(test)]",
@@ -2571,6 +2578,8 @@ const PREDICATE_ITEMS: &[&str] = &[
     "mod tests :: fn the_negative_branches_render_the_committed_shapes()",
     "mod tests :: #[test]",
     "mod tests :: fn the_non_id_values_aggregate_takes_no_caller_input()",
+    "mod tests :: #[test]",
+    "mod tests :: fn each_alternative_carries_its_own_lowered_check()",
     "mod tests :: #[test]",
     "mod tests :: fn a_regex_line_filter_renders_the_bare_unanchored_match()",
     "mod tests :: #[test]",
@@ -2667,8 +2676,10 @@ const PREDICATE_ITEMS: &[&str] = &[
 /// every line and `0` for one that drops every line, and a pruned `or` group
 /// through `line_filter`. **28 at issue #793**: `index_eq_empty_failure_branch`
 /// and `index_re_failure_branch`, the failure branches of a `=`/`=~` whose
-/// key no matcher requires.
-const MINT_COUNT: usize = 28;
+/// key no matcher requires. **29 at issue #839**: `line_filter_within`,
+/// `line_filter` drawing its lowered-literal checks from a budget the
+/// query's filters share.
+const MINT_COUNT: usize = 29;
 
 /// Attributes permitted anywhere in `predicate.rs`.
 const PREDICATE_ATTRIBUTES: &[&str] = &[

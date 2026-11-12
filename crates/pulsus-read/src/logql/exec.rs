@@ -8930,21 +8930,23 @@ mod tests {
         // as a fragment, so the envelope is MINTED at exactly that size and
         // the size is asserted rather than assumed. `-` is neither `%`, `_`
         // nor `\`, so neither `ch_like_contains` nor `ch_string` escapes
-        // anything: a `|=` filter over N dashes renders
-        // `(multiSearchAny(lowerUTF8(body), ['<N dashes>']) AND body LIKE
-        // '%<N dashes>%')`, the lowered-literal check in front of the exact
-        // predicate (issue #839), which is `2N + 58` bytes. N = 32,739 gives
-        // exactly 65,536.
+        // anything: a `|=` filter over N dashes renders its exact predicate
+        // `body LIKE '%<N dashes>%'`, which is `10 + 2 + N + 2` bytes
+        // (issue #450). N = 65,522 gives exactly 65,536. Issue #839 puts the
+        // lowered-literal check in front, `(<check> AND <exact>)`, whose
+        // literal is the run's first 256 bytes: 293 bytes of check and 7 of
+        // joining, 65,836 in all. Sixteen checks are 4,688 bytes, inside the
+        // query's 65,536-byte check budget.
         let filter = super::super::predicate::line_filter(&pulsus_logql::LineFilter {
             op: pulsus_logql::LineFilterOp::Contains,
-            head: pulsus_logql::LineMatch::Text("-".repeat(32_739)),
+            head: pulsus_logql::LineMatch::Text("-".repeat(65_522)),
             or_matches: Vec::new(),
         })
         .expect("a Contains filter compiles no regex");
         assert_eq!(
             filter.as_sql().len(),
-            65_536,
-            "the envelope's per-filter size is the pre-#286 figure, exactly"
+            65_536 + 293 + 7,
+            "the envelope's per-filter size is the pre-#286 figure, exactly, with its check"
         );
         let line_filters: Vec<super::super::predicate::CheckedFragment> =
             std::iter::repeat_n(filter, 16).collect();

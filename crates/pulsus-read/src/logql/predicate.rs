@@ -491,12 +491,33 @@ pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, Pip
 /// only ever sees literal/regex alternatives (`ip(…)` is served
 /// client-side).
 pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
-    if let Some(classified) = classified_line_filter(lf)? {
+    let mut check_budget = LINE_FILTER_CHECK_BUDGET_BYTES;
+    line_filter_within(lf, &mut check_budget)
+}
+
+/// The bytes of lowered-literal check text one query's line filters may
+/// carry, together (issue #839 addendum F3). A filter whose checks do not
+/// fit what is left is rendered with none.
+pub const LINE_FILTER_CHECK_BUDGET_BYTES: usize = 65_536;
+
+/// [`line_filter`], drawing its checks from `check_budget`, which the
+/// query's other filters share.
+pub(crate) fn line_filter_within(
+    lf: &LineFilter,
+    check_budget: &mut usize,
+) -> Result<CheckedFragment, PipelineError> {
+    if let Some(classified) = classified_line_filter(lf, check_budget)? {
         return Ok(classified);
     }
+    let positive = matches!(lf.op, LineFilterOp::Contains | LineFilterOp::Regex);
+    let checks = if positive {
+        alternative_checks(lf, check_budget)
+    } else {
+        vec![None; lf.alternatives().count()]
+    };
     let mut disjuncts: Vec<String> = Vec::new();
-    for alt in lf.alternatives() {
-        disjuncts.push(match alt {
+    for (alt, check) in lf.alternatives().zip(checks) {
+        let exact = match alt {
             LineMatch::Words(ws) => words_predicate(ws),
             // `Ip` is never reached: callers gate on
             // `is_pushable_line_filter`.
@@ -504,6 +525,10 @@ pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
                 LineFilterOp::Contains | LineFilterOp::NotContains => contains_predicate(value),
                 LineFilterOp::Regex | LineFilterOp::NotRegex => regex_predicate(value)?,
             },
+        };
+        disjuncts.push(match check {
+            Some(check) => format!("({check} AND {exact})"),
+            None => exact,
         });
     }
     let core = if lf.or_matches.is_empty() {
@@ -521,14 +546,10 @@ pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
     Ok(CheckedFragment {
         sql: match lf.op {
             LineFilterOp::Contains | LineFilterOp::Regex => {
-                let exact = if lf.or_matches.is_empty() {
+                if lf.or_matches.is_empty() {
                     core
                 } else {
                     format!("({core})")
-                };
-                match lowered_prefilter(lf) {
-                    Some(prefilter) => format!("({prefilter} AND {exact})"),
-                    None => exact,
                 }
             }
             LineFilterOp::NotContains | LineFilterOp::NotRegex => format!("NOT ({core})"),
@@ -536,57 +557,90 @@ pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
     })
 }
 
-/// The lowered-literal check a positive line filter carries in front of
-/// its exact predicate (issue #839), which `idx_body_ngrams`, built on
-/// `lowerUTF8(body)`, reads. The OR of every alternative's strings: a
-/// needle's runs, or a pattern's ([`pulsus_re2::lowered_regex_literals`]).
-/// `None` when an alternative derives none, or is a `word(…)` or `ip(…)`.
+/// The lowered-literal check each alternative of a positive line filter
+/// carries in front of its exact predicate (issue #839, addendum F1), which
+/// `idx_body_ngrams`, built on `lowerUTF8(body)`, reads: a needle's runs, or
+/// a pattern's ([`pulsus_re2::lowered_regex_literals`]). `None` for an
+/// alternative that derives none, and for a `word(…)` one, whose `hasToken`
+/// `idx_body_words` reads. Every alternative is `None` when the filter's
+/// strings pass [`pulsus_re2::LOWERED_MAX_OR_SETS`] sets or
+/// [`pulsus_re2::LOWERED_MAX_STRINGS`] strings, or its check text does not fit
+/// `check_budget`.
 ///
 /// | strings | SQL |
 /// |---|---|
 /// | every AND set has one | `multiSearchAny(lowerUTF8(body), ['a', 'b'])` |
-/// | otherwise | `((lowerUTF8(body) LIKE '%a%' AND lowerUTF8(body) LIKE '%b%') OR (…))` |
-fn lowered_prefilter(lf: &LineFilter) -> Option<String> {
-    let mut sets: Vec<Vec<String>> = Vec::new();
-    for alt in lf.alternatives() {
-        match (alt, lf.op) {
+/// | one AND set | `multiSearchAny(lowerUTF8(body), ['a']) AND multiSearchAny(lowerUTF8(body), ['b'])` |
+/// | otherwise | `((… AND …) OR …)`, each string as in the row above |
+///
+/// A string that is not ASCII is written `lowerUTF8('<run>')`, for the
+/// database to lower (addendum F2).
+fn alternative_checks(lf: &LineFilter, check_budget: &mut usize) -> Vec<Option<String>> {
+    let sets: Vec<Option<Vec<Vec<String>>>> = lf
+        .alternatives()
+        .map(|alt| match (alt, lf.op) {
             (LineMatch::Text(needle), LineFilterOp::Contains) => {
                 let set = pulsus_re2::lowered_needle_literals(needle);
-                if set.is_empty() {
-                    return None;
-                }
-                sets.push(set);
+                (!set.is_empty()).then(|| vec![set])
             }
             (LineMatch::Text(pattern), LineFilterOp::Regex) => {
-                sets.extend(pulsus_re2::lowered_regex_literals(pattern)?);
+                pulsus_re2::lowered_regex_literals(pattern)
             }
-            _ => return None,
-        }
-    }
-    if sets.iter().all(|set| set.len() == 1) {
-        let strings: Vec<String> = sets.iter().map(|set| ch_string(&set[0])).collect();
-        return Some(format!(
-            "multiSearchAny(lowerUTF8(body), [{}])",
-            strings.join(", ")
-        ));
-    }
-    let rendered: Vec<String> = sets
-        .iter()
-        .map(|set| {
-            let likes: Vec<String> = set
-                .iter()
-                .map(|s| format!("lowerUTF8(body) LIKE {}", ch_like_contains(s)))
-                .collect();
-            match likes.as_slice() {
-                [one] => one.clone(),
-                _ => format!("({})", likes.join(" AND ")),
-            }
+            _ => None,
         })
         .collect();
-    Some(match rendered.as_slice() {
-        [one] => one.clone(),
-        _ => format!("({})", rendered.join(" OR ")),
-    })
+    let none = || vec![None; sets.len()];
+    let or_sets: usize = sets.iter().flatten().map(Vec::len).sum();
+    let strings: usize = sets.iter().flatten().flatten().map(Vec::len).sum();
+    if or_sets > pulsus_re2::LOWERED_MAX_OR_SETS || strings > pulsus_re2::LOWERED_MAX_STRINGS {
+        return none();
+    }
+    let checks: Vec<Option<String>> = sets
+        .iter()
+        .map(|s| s.as_ref().map(|s| render_check(s)))
+        .collect();
+    let bytes: usize = checks.iter().flatten().map(String::len).sum();
+    if bytes > *check_budget {
+        return none();
+    }
+    *check_budget -= bytes;
+    checks
+}
+
+fn render_check(sets: &[Vec<String>]) -> String {
+    fn lit(s: &str) -> String {
+        if s.is_ascii() {
+            ch_string(s)
+        } else {
+            format!("lowerUTF8({})", ch_string(s))
+        }
+    }
+    fn any(lits: &[String]) -> String {
+        format!("multiSearchAny(lowerUTF8(body), [{}])", lits.join(", "))
+    }
+    if sets.iter().all(|set| set.len() == 1) {
+        let lits: Vec<String> = sets.iter().map(|set| lit(&set[0])).collect();
+        return any(&lits);
+    }
+    let and = |set: &Vec<String>| -> String {
+        set.iter()
+            .map(|s| any(&[lit(s)]))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    match sets {
+        [one] => and(one),
+        _ => format!(
+            "({})",
+            sets.iter()
+                .map(|set| match set.as_slice() {
+                    [one] => any(&[lit(one)]),
+                    _ => format!("({})", and(set)),
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        ),
+    }
 }
 
 /// The `rx` column of a raw read (issue #624, part 3a, D6): one
@@ -2354,7 +2408,10 @@ fn check_partition(classes: &MetadataNameClasses<'_>) -> Result<(), MetadataFilt
 /// classified (D7.9). A filter that keeps every line renders `1`, one that
 /// drops every line `0`, which reads no part, and a pruned `or` group
 /// renders as written. `None` when the filter is to be rendered as written.
-fn classified_line_filter(lf: &LineFilter) -> Result<Option<CheckedFragment>, PipelineError> {
+fn classified_line_filter(
+    lf: &LineFilter,
+    check_budget: &mut usize,
+) -> Result<Option<CheckedFragment>, PipelineError> {
     if matches!(lf.op, LineFilterOp::Regex | LineFilterOp::NotRegex) {
         for alt in lf.alternatives() {
             if let LineMatch::Text(value) = alt {
@@ -2370,7 +2427,7 @@ fn classified_line_filter(lf: &LineFilter) -> Result<Option<CheckedFragment>, Pi
             sql: "0".to_string(),
         }),
         super::plan::LineFilterEffect::Filters(std::borrow::Cow::Owned(pruned)) => {
-            Some(line_filter(&pruned)?)
+            Some(line_filter_within(&pruned, check_budget)?)
         }
         super::plan::LineFilterEffect::Filters(std::borrow::Cow::Borrowed(_)) => None,
     })

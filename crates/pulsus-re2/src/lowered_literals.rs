@@ -3,10 +3,12 @@
 //!
 //! * [`anchored_matches_every_string`]: whether a stream matcher's anchored
 //!   pattern matches every value, so the matcher can remove no stream.
-//! * [`lowered_regex_literals`] and [`lowered_needle_literals`]: strings that
-//!   the lower-cased line must contain for a line filter to keep it. The
-//!   body's n-gram index is built on `lowerUTF8(body)`, and these are the
-//!   strings a prefilter in front of the exact predicate looks up in it.
+//! * [`lowered_regex_literals`] and [`lowered_needle_literals`]: strings
+//!   whose lowering the lower-cased line must contain for a line filter to
+//!   keep it. The body's n-gram index is built on `lowerUTF8(body)`, and
+//!   these are the strings a check in front of the exact predicate looks up
+//!   in it. ASCII is lowered here; any other character is left for the
+//!   database to lower (issue #839 addendum, F2).
 //!
 //! Both read the pattern as the database's `match` and the reference read
 //! it: through [`crate::re2_pattern_to_rust`], with `.` matching a newline.
@@ -16,12 +18,12 @@ use regex_syntax::hir::{Class, Hir, HirKind};
 /// The fewest characters a run must have to become a string: the n-gram
 /// length of `idx_body_ngrams`.
 const MIN_RUN_CHARS: usize = 4;
-/// A result with more OR sets than this is `None`.
-const MAX_OR_SETS: usize = 16;
+/// A result with more OR sets than this is `None` (addendum F3).
+pub const LOWERED_MAX_OR_SETS: usize = 64;
 /// A result with more strings than this, over all its sets, is `None`.
-const MAX_STRINGS: usize = 64;
-/// An AND set keeps at most this many of its longest strings.
-const MAX_AND_STRINGS: usize = 8;
+pub const LOWERED_MAX_STRINGS: usize = 256;
+/// A run keeps its first this many bytes, cut at a character boundary.
+const MAX_RUN_BYTES: usize = 256;
 
 /// An OR of AND sets of strings.
 type Sets = Vec<Vec<String>>;
@@ -67,17 +69,18 @@ pub fn anchored_matches_every_string(pattern: &str) -> bool {
     }
 }
 
-/// Strings `lowerUTF8(body)` contains on every line the unanchored pattern
-/// matches: an OR of AND sets, with this guarantee — for any line the
-/// pattern matches, the lower-cased line contains every string of at least
-/// one set. `None` when no such strings are derived.
+/// Strings whose lowering `lowerUTF8(body)` contains on every line the
+/// unanchored pattern matches: an OR of AND sets, with this guarantee — for
+/// any line the pattern matches, the lower-cased line contains the lowering
+/// of every string of at least one set. `None` when no such strings are
+/// derived.
 pub fn lowered_regex_literals(pattern: &str) -> Option<Vec<Vec<String>>> {
     let hir = parse(pattern)?;
     walk(&hir)
 }
 
-/// The needle's runs of four or more run characters, lower-cased: one AND
-/// set, empty when the needle has no such run.
+/// The needle's runs of four or more run characters, ASCII lower-cased: one
+/// AND set, empty when the needle has no such run.
 pub fn lowered_needle_literals(needle: &str) -> Vec<String> {
     let mut runs = Runs::default();
     for c in needle.chars() {
@@ -86,20 +89,15 @@ pub fn lowered_needle_literals(needle: &str) -> Vec<String> {
     runs.finish()
 }
 
-/// A character whose form in `lowerUTF8(body)` is known whatever surrounds
-/// it, as it appears there: an ASCII character lower-cased, and a Japanese
-/// kana, CJK ideograph or precomposed Korean syllable as itself. `None` for
-/// every other character.
+/// A character the database lowers the same way whatever surrounds it:
+/// every character but U+03A3 `Σ`, whose lowering depends on the next one
+/// (addendum F2, measured over every code point). ASCII is lowered here; the
+/// rest is kept as written and lowered by the database.
 fn run_char(c: char) -> Option<char> {
-    if c.is_ascii() {
-        Some(c.to_ascii_lowercase())
-    } else if matches!(
-        u32::from(c),
-        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7A3
-    ) {
-        Some(c)
-    } else {
+    if c == '\u{3A3}' {
         None
+    } else {
+        Some(c.to_ascii_lowercase())
     }
 }
 
@@ -148,8 +146,15 @@ impl Runs {
     }
 
     fn end(&mut self) {
-        let run = std::mem::take(&mut self.current);
+        let mut run = std::mem::take(&mut self.current);
         if self.chars >= MIN_RUN_CHARS {
+            if run.len() > MAX_RUN_BYTES {
+                let mut cut = MAX_RUN_BYTES;
+                while !run.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                run.truncate(cut);
+            }
             self.done.push(run);
         }
         self.chars = 0;
@@ -222,7 +227,7 @@ fn concat(items: &[Hir]) -> Option<Sets> {
                 next.push(set);
             }
         }
-        acc = next.into_iter().map(longest).collect();
+        acc = next;
         if !within_limits(&acc) {
             return None;
         }
@@ -230,32 +235,14 @@ fn concat(items: &[Hir]) -> Option<Sets> {
     bounded(acc)
 }
 
-/// The set's [`MAX_AND_STRINGS`] longest strings, in their order. Dropping
-/// strings only weakens the check.
-fn longest(set: Vec<String>) -> Vec<String> {
-    if set.len() <= MAX_AND_STRINGS {
-        return set;
-    }
-    let mut by_length: Vec<usize> = (0..set.len()).collect();
-    by_length.sort_by_key(|&i| std::cmp::Reverse(set[i].chars().count()));
-    let mut keep = vec![false; set.len()];
-    for &i in &by_length[..MAX_AND_STRINGS] {
-        keep[i] = true;
-    }
-    set.into_iter()
-        .zip(keep)
-        .filter_map(|(s, k)| k.then_some(s))
-        .collect()
-}
-
 fn within_limits(sets: &Sets) -> bool {
-    sets.len() <= MAX_OR_SETS && sets.iter().map(Vec::len).sum::<usize>() <= MAX_STRINGS
+    sets.len() <= LOWERED_MAX_OR_SETS
+        && sets.iter().map(Vec::len).sum::<usize>() <= LOWERED_MAX_STRINGS
 }
 
 /// `None` when a set has no string, which makes the OR always true, or the
 /// result is past the limits.
 fn bounded(sets: Sets) -> Option<Sets> {
-    let sets: Sets = sets.into_iter().map(longest).collect();
     (!sets.is_empty() && sets.iter().all(|s| !s.is_empty()) && within_limits(&sets)).then_some(sets)
 }
 

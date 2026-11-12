@@ -110,7 +110,8 @@ pub use compile_budget::{
     regex_compile_transient_bound_with,
 };
 pub use lowered_literals::{
-    anchored_matches_every_string, lowered_needle_literals, lowered_regex_literals,
+    LOWERED_MAX_OR_SETS, LOWERED_MAX_STRINGS, anchored_matches_every_string,
+    lowered_needle_literals, lowered_regex_literals,
 };
 pub use re2_syntax::re2_pattern_to_rust;
 // Issue #331: the ClickHouse `match()` flag-group-head strategy — the
