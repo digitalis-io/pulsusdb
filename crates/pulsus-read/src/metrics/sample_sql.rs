@@ -192,17 +192,47 @@ pub enum PairedSeries<'a> {
     Ids(&'a str),
 }
 
-/// #835 addendum: one statement holding a read's float part and its
-/// histogram part, each with today's predicate and its own order.
+/// #835 addendum: one statement holding a read's float part (`arm` 3) and
+/// its histogram part (`arm` 1), each with today's predicate (the float
+/// part's text is [`sample_fetch`]'s, the histogram part's
+/// [`hist_sample_fetch`]'s with every column `hs.`) and its own order.
 pub fn paired_fetch(
-    _tenant: &Tenant,
-    _samples_table: &str,
-    _hist_table: &str,
-    _series: PairedSeries<'_>,
-    _lower_excl_ms: i64,
-    _upper_incl_ms: i64,
+    tenant: &Tenant,
+    samples_table: &str,
+    hist_table: &str,
+    series: PairedSeries<'_>,
+    lower_excl_ms: i64,
+    upper_incl_ms: i64,
 ) -> String {
-    String::new()
+    use super::rollup::HIST_TUPLE;
+    let org = tenant.sql_literal();
+    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let (float_series, hist_series) = match series {
+        PairedSeries::List(fps) => (
+            fingerprints_predicate(fps),
+            format!("hs.fingerprint IN ({})", render_fingerprint_list(fps)),
+        ),
+        PairedSeries::Ids(ids) => (
+            subquery_predicate(ids),
+            format!("hs.fingerprint IN (\n{ids}\n  )"),
+        ),
+    };
+    let hist_columns = HIST_VALUE_COLUMNS
+        .split(", ")
+        .map(|c| format!("hs.{}", c.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "(SELECT toUInt8(3) AS arm, fingerprint, unix_milli AS t, value AS v, CAST([], 'Array({HIST_TUPLE})') AS h\n\
+FROM {samples_table}\n\
+WHERE org_id = {org} AND {window}\n  AND {float_series}\n\
+ORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value))\n\
+UNION ALL\n\
+(SELECT toUInt8(1), hs.fingerprint AS fingerprint, hs.unix_milli AS t, 0., [CAST(({hist_columns}), '{HIST_TUPLE}')]\n\
+FROM {hist_table} AS hs\n\
+WHERE hs.org_id = {org} AND hs.unix_milli > {lower_excl_ms} AND hs.unix_milli <= {upper_incl_ms}\n  AND {hist_series}\n\
+ORDER BY hs.fingerprint, hs.unix_milli)"
+    )
 }
 
 /// The 13 `metric_hist_samples` value columns, order-locked to the catalog
