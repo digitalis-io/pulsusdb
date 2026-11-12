@@ -1213,32 +1213,27 @@ fn corpus_e(db: &str, end: i64) -> Vec<String> {
 /// at the steps from `day0 + 5 res`. The 5 s column runs on corpus E,
 /// over 30 minutes. The routed explain names the level and reads
 /// `exactness` `"rollup"`; each function is within the bound of plan
-/// section 9 (bit-equal where it says so).
-#[tokio::test(flavor = "multi_thread")]
-async fn each_served_function_is_within_its_distance() {
-    skip_unless_live!();
-    let (built, day0) = D5_8
-        .lease("each_served_function_is_within_its_distance")
-        .await;
-    let end = day0 + 8 * DAY;
-    let levels = built.slot.get().expect("the levels are read");
-    assert_eq!(levels.levels.len(), 5, "{levels:?}");
-    let e_land = corpus_e(DB_B2E.name(), end);
-    let built_e = build(DB_B2E.name(), FIVE, &e_land, end - 2 * HOUR, end, &[]).await;
-
+/// section 9 (bit-equal where it says so). One test per level, so the
+/// levels run side by side and a failure names its level.
+///
+/// Runs one level's column on `built` over `(start, end]`, comparing the
+/// steps from `from`; prints the report and each query's rows read, drops
+/// or releases the corpus, and asserts the column's failures.
+async fn b2_level(built: Built, secs: i64, start: i64, end: i64, from: i64) {
     let mut failures = Vec::new();
     let mut report = Vec::new();
     let mut comments = Vec::new();
     // Each run's statements carry their own comment, so the query log's
-    // rows of an earlier run are not summed into this one's.
-    let run = format!("b2_{}_{}", built.db(), now_ms());
+    // rows of an earlier run, or of another level's test running beside
+    // this one on the same corpus, are not summed into this one's.
+    let run = format!("b2_{}_{secs}_{}", built.db(), now_ms());
     b2_column(
         Column {
-            built: &built_e,
-            secs: 5,
-            start: end - 30 * MIN,
+            built: &built,
+            secs,
+            start,
             end,
-            from: end - 30 * MIN,
+            from,
             run: &run,
         },
         &mut failures,
@@ -1246,30 +1241,7 @@ async fn each_served_function_is_within_its_distance() {
         &mut comments,
     )
     .await;
-    for secs in [60i64, 720, 7200, 86400] {
-        let span = match secs {
-            60 => DAY - HOUR,
-            720 => 3 * DAY,
-            7200 => 8 * DAY,
-            _ => band(secs),
-        };
-        b2_column(
-            Column {
-                built: &built,
-                secs,
-                start: end - span,
-                end,
-                from: day0 + 5 * secs * 1000,
-                run: &run,
-            },
-            &mut failures,
-            &mut report,
-            &mut comments,
-        )
-        .await;
-    }
-    let mut rows = read_rows(&built.admin, &format!("{run}_")).await;
-    rows.extend(read_rows(&built_e.admin, &format!("{run}_")).await);
+    let rows = read_rows(&built.admin, &format!("{run}_")).await;
     for (query, secs, on_c, off_c) in &comments {
         report.push(format!(
             "read_rows {query:<40} {secs:>6}s routed {:>10} raw {:>10}",
@@ -1281,8 +1253,83 @@ async fn each_served_function_is_within_its_distance() {
         println!("{line}");
     }
     built.finish().await;
-    built_e.finish().await;
-    assert!(failures.is_empty(), "B2 failures:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "B2 failures at {secs}s:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// B2's column on corpus D5_8 at level `secs`, over the range inside its
+/// band that ends at `day0 + 8 d`.
+async fn b2_d5_8(built: Built, day0: i64, secs: i64) {
+    let end = day0 + 8 * DAY;
+    let span = match secs {
+        60 => DAY - HOUR,
+        720 => 3 * DAY,
+        7200 => 8 * DAY,
+        _ => band(secs),
+    };
+    b2_level(built, secs, end - span, end, day0 + 5 * secs * 1000).await;
+}
+
+/// B2 at 5 s: corpus E over the 2 hours ending at D5_8's end,
+/// `today() = day0 + 8 d`, compared over the last 30 minutes.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_served_function_is_within_its_distance_at_5s() {
+    skip_unless_live!();
+    let end = today();
+    let e_land = corpus_e(DB_B2E.name(), end);
+    let built_e = build(DB_B2E.name(), FIVE, &e_land, end - 2 * HOUR, end, &[]).await;
+    b2_level(built_e, 5, end - 30 * MIN, end, end - 30 * MIN).await;
+}
+
+/// B2 at 60 s, on corpus D5_8.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_served_function_is_within_its_distance_at_60s() {
+    skip_unless_live!();
+    let (built, day0) = D5_8
+        .lease("each_served_function_is_within_its_distance_at_60s")
+        .await;
+    let levels = built.slot.get().expect("the levels are read");
+    assert_eq!(levels.levels.len(), 5, "{levels:?}");
+    b2_d5_8(built, day0, 60).await;
+}
+
+/// B2 at 720 s, on corpus D5_8.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_served_function_is_within_its_distance_at_720s() {
+    skip_unless_live!();
+    let (built, day0) = D5_8
+        .lease("each_served_function_is_within_its_distance_at_720s")
+        .await;
+    let levels = built.slot.get().expect("the levels are read");
+    assert_eq!(levels.levels.len(), 5, "{levels:?}");
+    b2_d5_8(built, day0, 720).await;
+}
+
+/// B2 at 7200 s, on corpus D5_8.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_served_function_is_within_its_distance_at_7200s() {
+    skip_unless_live!();
+    let (built, day0) = D5_8
+        .lease("each_served_function_is_within_its_distance_at_7200s")
+        .await;
+    let levels = built.slot.get().expect("the levels are read");
+    assert_eq!(levels.levels.len(), 5, "{levels:?}");
+    b2_d5_8(built, day0, 7200).await;
+}
+
+/// B2 at 86400 s, on corpus D5_8.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_served_function_is_within_its_distance_at_86400s() {
+    skip_unless_live!();
+    let (built, day0) = D5_8
+        .lease("each_served_function_is_within_its_distance_at_86400s")
+        .await;
+    let levels = built.slot.get().expect("the levels are read");
+    assert_eq!(levels.levels.len(), 5, "{levels:?}");
+    b2_d5_8(built, day0, 86400).await;
 }
 
 /// **B1f, live half (issue #18 part B): the unrouted classes read raw.**

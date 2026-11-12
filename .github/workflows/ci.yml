@@ -2821,7 +2821,9 @@ jobs:
       - name: Nested-set search over the distributed tables (cluster)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
-        run: cargo test -p pulsus-read --test traces_nested_set_cluster -- --show-output --skip the_job_keeps_up_under_steady_ingest
+        # `--test-threads=5`: the clock-case batch holds one thread asleep;
+        # the other tests keep the runner's 4.
+        run: cargo test -p pulsus-read --test traces_nested_set_cluster -- --show-output --test-threads=5 --skip the_job_keeps_up_under_steady_ingest
 
       # Issue #738: the tenant rows check, single-node and clustered.
       - name: Trace tenant rows (cluster)
@@ -3035,7 +3037,9 @@ jobs:
       - name: Nested-set search and the service graph on 26.10 (cluster)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
-        run: cargo test -p pulsus-read --test traces_nested_set_cluster -- --show-output --skip the_job_keeps_up_under_steady_ingest
+        # `--test-threads=5`: the clock-case batch holds one thread asleep;
+        # the other tests keep the runner's 4.
+        run: cargo test -p pulsus-read --test traces_nested_set_cluster -- --show-output --test-threads=5 --skip the_job_keeps_up_under_steady_ingest
 
       - name: Tear down the cluster
         if: always()

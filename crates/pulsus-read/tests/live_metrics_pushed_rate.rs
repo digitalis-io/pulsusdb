@@ -26,6 +26,8 @@ mod pushed_rate_corpus;
 
 use std::sync::Arc;
 
+use futures::StreamExt;
+
 use pulsus_clickhouse::ChClient;
 use pulsus_read::{LabelCache, MetricQueryParams, MetricsEngine};
 use pushed_rate_corpus::{
@@ -49,6 +51,9 @@ macro_rules! skip_unless_live {
         }
     };
 }
+
+/// Query pairs in flight at once: one per core of the CI runner.
+const PAIRS: usize = 4;
 
 /// The pushed route sent a shape-A statement for `query`.
 fn assert_pushed(query: &str, step_ms: i64, r: &Routed) {
@@ -99,18 +104,26 @@ async fn every_covered_shape_answers_identically() {
     let t = anchor();
     let db = pulsus_testkit::test_db("pulsus_read_it_pushed_rate_t3");
     let h = harness(&db, t, &cpu_corpus(t), None).await;
+    let mut cases: Vec<(MetricQueryParams, String)> = Vec::new();
     for p in [h.day(60_000), h.day(15_000), h.instant()] {
         for func in ["rate", "irate", "increase"] {
             for agg in ["sum", "avg", "count", "min", "max"] {
                 for grouping in ["by (mode) ", "by (cpu) ", "without (cpu) ", ""] {
                     let q = format!("{agg} {grouping}({func}({CPU_METRIC}[5m]))");
-                    let r = h.agree(&q, &p).await;
-                    assert_pushed(&q, p.step_ms, &r);
+                    cases.push((p, q));
                 }
             }
         }
     }
-    let n = 0usize;
+    let hr = &h;
+    let n = futures::stream::iter(&cases)
+        .map(|(p, q)| async move {
+            let r = hr.agree(q, p).await;
+            assert_pushed(q, p.step_ms, &r);
+        })
+        .buffer_unordered(PAIRS)
+        .count()
+        .await;
     assert_eq!(n, 180, "every covered shape was compared");
     h.finish().await;
 }
@@ -423,9 +436,16 @@ async fn multi_name_shapes_answer_identically() {
         "min({__name__=~\"node_nan_.+\"})",
         "max({__name__=~\"node_nan_.+\"})",
     ]);
+    let mut cases: Vec<(MetricQueryParams, &str)> = Vec::new();
     for p in [six_hours(&h, 60_000), six_hours(&h, 15_000), h.instant()] {
         for q in &queries {
-            let (a, b) = h.both(q, &p).await;
+            cases.push((p, q));
+        }
+    }
+    let hr = &h;
+    let n = futures::stream::iter(&cases)
+        .map(|(p, q)| async move {
+            let (a, b) = hr.both(q, p).await;
             assert_eq!(
                 a.answer.iter().map(|l| nan_as_text(l)).collect::<Vec<_>>(),
                 b.answer.iter().map(|l| nan_as_text(l)).collect::<Vec<_>>(),
@@ -434,9 +454,10 @@ async fn multi_name_shapes_answer_identically() {
             );
             assert_eq!(a.annotations, b.annotations, "{q}: the annotations differ");
             assert_pushed_any(q, p.step_ms, &a);
-        }
-    }
-    let n = 0usize;
+        })
+        .buffer_unordered(PAIRS)
+        .count()
+        .await;
     assert_eq!(
         n,
         3 * (multi_name_corpus::QUERIES.len() + 2),

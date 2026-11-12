@@ -2081,17 +2081,15 @@ struct Replicas {
 impl Replicas {
     /// `L` 30 minutes back, its interval eligible long ago.
     async fn new(name: &str) -> Self {
-        Self::build(name, false).await
+        Self::prepare(name)
+            .await
+            .seed(floor_to(now_ns() - 30 * MINUTE, BUCKET), false)
+            .await
     }
 
-    /// Part C: `L` the start of the interval in progress, so an insert now
-    /// queues its fetches before the interval becomes eligible; the marker
-    /// at `L − 1 min` seeded on shard 1 and on `ch-shard2`.
-    async fn new_current(name: &str) -> Self {
-        Self::build(name, true).await
-    }
-
-    async fn build(name: &str, current: bool) -> Self {
+    /// A fresh clustered database and the three clients, `L` not yet
+    /// chosen: [`Self::seed`] sets it.
+    async fn prepare(name: &str) -> Self {
         let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t599b_{name}_{}", now_ns()));
         let bootstrap = ChClient::new(shard1_config("default"))
             .await
@@ -2113,12 +2111,23 @@ impl Replicas {
         let s2 = ChClient::new(shard2_config(&db))
             .await
             .expect("connect shard2");
-        let l = if current {
-            floor_to(server_now_us(&s1).await * 1000, BUCKET)
-        } else {
-            floor_to(now_ns() - 30 * MINUTE, BUCKET)
-        };
-        let r = Replicas { db, l, s1, s1b, s2 };
+        Replicas {
+            db,
+            l: 0,
+            s1,
+            s1b,
+            s2,
+        }
+    }
+
+    /// Every view stopped, merges stopped on both job tables, the marker at
+    /// `l − 1 min` seeded on shard 1 and synced on both replicas. Part C
+    /// (`current`): `l` is an interval not yet eligible, so an insert now
+    /// queues its fetches before it becomes eligible, and the marker is
+    /// seeded on `ch-shard2` too.
+    async fn seed(mut self, l: i64, current: bool) -> Self {
+        self.l = l;
+        let r = self;
         // `STOP MERGES` stops only the running of merges: a replica still
         // assigns merge entries unless its queue limit for them is 0. The
         // setting is per replica and queues nothing; an `OPTIMIZE` still
@@ -2157,9 +2166,13 @@ impl Replicas {
     }
 
     /// Part C: waits until `[L, L + 5 min)` has been eligible for 11 s by
-    /// the server's clock, `L + 8 min + 11 s`: at most 8 min 11 s after
-    /// [`Self::new_current`].
+    /// the server's clock, `L + 8 min + 11 s`: at most 6 min 41 s after
+    /// [`nearest_l`] chose `L`.
     async fn wait_eligible(&self) {
+        assert!(
+            server_now_us(&self.s1).await < (self.l + 8 * MINUTE) / 1000,
+            "the case's pushes ran past the interval's eligibility; MARGIN is too small"
+        );
         let at_us = (self.l + 8 * MINUTE + 11 * S) / 1000;
         let deadline = std::time::Instant::now() + Duration::from_secs(8 * 60 + 41);
         loop {
@@ -2231,14 +2244,80 @@ impl Replicas {
     }
 }
 
+/// The setup a case does between choosing L and its sleep: seed, pushes, queue waits.
+const MARGIN: i64 = 90 * S;
+
+/// The interval whose eligibility, L + 8 min, is the first at least MARGIN from now.
+async fn nearest_l(c: &ChClient) -> i64 {
+    let now = server_now_us(c).await * 1000;
+    floor_to(now + MARGIN - 8 * MINUTE + BUCKET - 1, BUCKET)
+}
+
+/// A case's panic, as text.
+fn panic_text(e: tokio::task::JoinError) -> String {
+    if !e.is_panic() {
+        return e.to_string();
+    }
+    let p = e.into_panic();
+    p.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| p.downcast_ref::<&str>().map(|t| t.to_string()))
+        .unwrap_or_else(|| "a panic with no text".to_string())
+}
+
 /// The seven clock-bound cases (K2, K3, K8, KC6, KC16, KC18, KC19) as one
-/// test: each runs on its own task, so one panic does not hide the others.
-/// Its name sorts first in the file, so it starts first.
+/// test, so their sleeps overlap instead of holding a test thread each in
+/// turn. The six part C cases share one `L`, from [`nearest_l`]; KC16 waits
+/// for an eligibility of its own. Each case runs on its own task, so one
+/// panic does not hide the others. The name sorts first in the file, so
+/// the test starts first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_batch_of_clock_cases_shares_one_eligibility() {
     skip_unless_live!();
-    let failed: Vec<String> = Vec::new();
+    let [r_k2, r_k3, r_k8, r_kc6, r_kc18, r_kc19]: [Replicas; 6] =
+        futures::future::join_all(["k2", "k3", "k8", "kc6", "kc18", "kc19"].map(Replicas::prepare))
+            .await
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("six fixtures prepared"));
+    let l = nearest_l(&r_k2.s1).await;
+    let handles = [
+        (
+            "k2",
+            tokio::spawn(async move { k2(r_k2.seed(l, true).await).await }),
+        ),
+        (
+            "k3",
+            tokio::spawn(async move { k3(r_k3.seed(l, true).await).await }),
+        ),
+        (
+            "k8",
+            tokio::spawn(async move { k8(r_k8.seed(l, true).await).await }),
+        ),
+        (
+            "kc6",
+            tokio::spawn(async move { kc6(r_kc6.seed(l, true).await).await }),
+        ),
+        (
+            "kc18",
+            tokio::spawn(async move { kc18(r_kc18.seed(l, true).await).await }),
+        ),
+        (
+            "kc19",
+            tokio::spawn(async move { kc19(r_kc19.seed(l, true).await).await }),
+        ),
+        (
+            "kc16",
+            tokio::spawn(async move { kc16(Replicas::new("kc16").await).await }),
+        ),
+    ];
+    let mut failed: Vec<String> = Vec::new();
     let mut done: Vec<&str> = Vec::new();
+    for (name, handle) in handles {
+        match handle.await {
+            Ok(()) => done.push(name),
+            Err(e) => failed.push(format!("{name}: {}", panic_text(e))),
+        }
+    }
     assert!(
         failed.is_empty(),
         "{} case(s) failed:\n{}",
@@ -2490,10 +2569,7 @@ async fn two_replicas_share_one_edge_table() {
 /// K2 (issue #599 part B §3): a replica that has copied the log entries of
 /// G's parts but cannot fetch them writes no marker; once it has them, its
 /// run pairs G.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_replica_with_parts_still_to_fetch_writes_nothing() {
-    skip_unless_live!();
-    let r = Replicas::new_current("k2").await;
+async fn k2(r: Replicas) {
     let (db, l) = (r.db.clone(), r.l);
     exec(&r.s1b, "SYSTEM STOP FETCHES spans").await;
     push_g(&r.s1, l, 0..8).await;
@@ -2526,10 +2602,7 @@ async fn a_replica_with_parts_still_to_fetch_writes_nothing() {
 
 /// K3 (issue #599 part B §3): G's pushes split across the two replicas,
 /// neither able to fetch the other's: neither writes a marker.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pushes_split_across_replicas_wait_for_both() {
-    skip_unless_live!();
-    let r = Replicas::new_current("k3").await;
+async fn k3(r: Replicas) {
     let (db, l) = (r.db.clone(), r.l);
     for c in [&r.s1, &r.s1b] {
         exec(c, "SYSTEM STOP FETCHES spans").await;
@@ -2695,10 +2768,7 @@ async fn a_rebuilt_replica_waits_for_the_shard() {
 
 /// K8 (issue #599 part B §3): a replica that has not copied the log entries
 /// of G's parts has nothing queued, and still writes no marker.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_replica_behind_on_the_log_writes_nothing() {
-    skip_unless_live!();
-    let r = Replicas::new_current("k8").await;
+async fn k8(r: Replicas) {
     let (db, l) = (r.db.clone(), r.l);
     exec(&r.s1b, "SYSTEM STOP PULLING REPLICATION LOG spans").await;
     push_g(&r.s1, l, 0..8).await;
@@ -3389,10 +3459,7 @@ async fn a_queued_totals_merge_alone_does_not_hold_the_run() {
 
 /// KC6: a replica's own inserts, queued as fetches of parts it holds, do
 /// not hold its run.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_replica_s_own_parts_do_not_hold_the_run() {
-    skip_unless_live!();
-    let r = Replicas::new_current("kc6").await;
+async fn kc6(r: Replicas) {
     let (db, l) = (r.db.clone(), r.l);
     exec(&r.s2, "SYSTEM STOP REPLICATION QUEUES spans").await;
     push_g(&r.s2, l, 0..8).await;
@@ -3427,10 +3494,7 @@ async fn the_replica_s_own_parts_do_not_hold_the_run() {
 
 /// KC18: a replica's own insert into `service_edges`, queued as a fetch of
 /// a part it holds, does not hold its run.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_replica_s_own_marker_does_not_hold_the_run() {
-    skip_unless_live!();
-    let r = Replicas::new_current("kc18").await;
+async fn kc18(r: Replicas) {
     let (db, l) = (r.db.clone(), r.l);
     push_g(&r.s2, l, 0..8).await;
     exec(&r.s2, "SYSTEM STOP FETCHES service_edges").await;
@@ -3475,10 +3539,7 @@ async fn the_replica_s_own_marker_does_not_hold_the_run() {
 
 /// KC19: a replica's own inserts, queued as fetches of parts a local merge
 /// has since covered, do not hold its run.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_replica_s_merged_own_parts_do_not_hold_the_run() {
-    skip_unless_live!();
-    let r = Replicas::new_current("kc19").await;
+async fn kc19(r: Replicas) {
     let (db, l) = (r.db.clone(), r.l);
     exec(&r.s2, "SYSTEM STOP FETCHES spans").await;
     exec(&r.s2, "SYSTEM START MERGES spans").await;
@@ -4390,10 +4451,7 @@ async fn an_uncopied_late_attach_holds_the_run() {
 /// KC16: uncopied entries committed within 10 s of a later interval's
 /// eligibility are judged against the eligibility of the interval being
 /// finalized, long past, and pass.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn uncopied_entries_are_judged_against_the_interval_being_finalized() {
-    skip_unless_live!();
-    let r = Replicas::new("kc16").await;
+async fn kc16(r: Replicas) {
     let (db, l) = (r.db.clone(), r.l);
     push_g(&r.s1, l, 0..8).await;
     wait_synced(&[&r.s1, &r.s1b], &db, "KC16: G on both replicas").await;
