@@ -544,3 +544,134 @@ async fn the_database_lowers_every_character_but_sigma_without_context() {
         "code points the database lowers differently in context"
     );
 }
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+struct CountRow {
+    n: u64,
+}
+
+async fn count_of(client: &ChClient, sql: &str) -> u64 {
+    let mut stream = client
+        .query_stream::<CountRow>(&sql.replace('?', "??"), &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    stream.next().await.expect("one row").expect("decode").n
+}
+
+/// **A5 (issue #839, code review r1): a parsed-label filter's pushed body
+/// predicate reaches the lowered index.** `| regexp "(?P<level>.*)" |
+/// level="error"` pushes a substring probe of the value; it carries the
+/// lowered-literal check, so `idx_body_ngrams` on `lowerUTF8(body)` keeps
+/// no more blocks than `main`'s probe kept on an index over `body`, and the
+/// answer is the same. `main`'s side is a table with `main`'s index holding
+/// the same rows, read by `main`'s probe, `body LIKE '%error%'`.
+#[tokio::test]
+async fn a_parsed_label_filter_reaches_the_lowered_index() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_839_a5");
+    let client = fresh(&db).await;
+    let ts = now_ns() - 600_000_000_000;
+    let mut rows = vec![stream_row(
+        83_940,
+        "a5",
+        r#"{"service_name":"a5","suite":"a5"}"#,
+        ts,
+    )];
+    for i in 0..200_000usize {
+        let body = if i % 40_000 == 7 {
+            "error".to_string()
+        } else {
+            format!("line {i:06} routine request completed")
+        };
+        rows.push(line_row(83_940, "a5", ts + i as i64 * 1_000, &body));
+    }
+    client
+        .insert_block("log_landing", &rows)
+        .await
+        .expect("seed log_landing");
+    for sql in [
+        "CREATE TABLE main_body (body String, INDEX idx_body_ngrams body \
+         TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) ENGINE = MergeTree ORDER BY tuple()"
+            .to_string(),
+        "INSERT INTO main_body SELECT body FROM log_samples ORDER BY service, fingerprint, \
+         timestamp_ns"
+            .to_string(),
+        "OPTIMIZE TABLE log_samples FINAL".to_string(),
+    ] {
+        client
+            .execute(&sql, &QuerySettings::new(), Idempotency::NonIdempotent)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
+    let fragment = pulsus_read::logql::predicate::parsed_string_filter(
+        "level",
+        pulsus_logql::MatchOp::Eq,
+        "error",
+        &pulsus_logql::ParserStage::Regexp("(?P<level>.*)".to_string()),
+    )
+    .expect("route B serves `=`");
+    let ours = fragment.as_sql();
+    let mains = "body LIKE '%error%'";
+    let ours_blocks = ngram_blocks(
+        &client,
+        &format!("SELECT count() FROM log_samples WHERE {ours}"),
+    )
+    .await;
+    let mains_blocks = ngram_blocks(
+        &client,
+        &format!("SELECT count() FROM main_body WHERE {mains}"),
+    )
+    .await;
+    let ours_n = count_of(
+        &client,
+        &format!("SELECT count() AS n FROM log_samples WHERE {ours}"),
+    )
+    .await;
+    let mains_n = count_of(
+        &client,
+        &format!("SELECT count() AS n FROM main_body WHERE {mains}"),
+    )
+    .await;
+    let unindexed = count_of(
+        &client,
+        &format!("SELECT count() AS n FROM log_samples WHERE {ours} SETTINGS use_skip_indexes = 0"),
+    )
+    .await;
+    let engine = LogQlEngine::new(
+        ChClient::new(test_config(&db)).await.expect("connect"),
+        engine_config(&db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: ts - 1,
+            end_ns: ts + 600_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 1_000,
+        direction: Direction::Backward,
+    };
+    let (result, _) = engine
+        .query(
+            &parse(r#"{suite="a5"} | regexp "(?P<level>.*)" | level="error""#).expect("parse"),
+            &params,
+        )
+        .await
+        .expect("the query answers");
+    let QueryResult::Streams { items, .. } = result else {
+        panic!("expected streams");
+    };
+    let entries: usize = items.iter().map(|s| s.entries.len()).sum();
+    drop_db(&client, &db).await;
+    eprintln!("A5: ours {ours_blocks:?}, main's {mains_blocks:?}, {ours}");
+    let (Some((kept, given)), Some((main_kept, _))) = (ours_blocks, mains_blocks) else {
+        panic!(
+            "both statements must list idx_body_ngrams: ours {ours_blocks:?}, main's {mains_blocks:?}"
+        );
+    };
+    assert!(
+        kept < given && kept <= main_kept,
+        "kept {kept} of {given}; main's probe kept {main_kept}"
+    );
+    assert_eq!((ours_n, mains_n, unindexed, entries), (5, 5, 5, 5));
+}
