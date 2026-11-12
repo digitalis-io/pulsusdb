@@ -5330,6 +5330,75 @@ fn build_chunk_sqls(
         .collect()
 }
 
+/// #835 addendum: the statements a listed selector's read sends, `text_cap`
+/// the dispatcher's limit.
+#[allow(dead_code)]
+fn listed_statements(
+    tenant: &Tenant,
+    samples_table: &str,
+    hist_samples_table: &str,
+    fps: Vec<Fingerprint>,
+    lower_excl_ms: i64,
+    upper_incl_ms: i64,
+    _text_cap: u64,
+) -> Vec<String> {
+    let mut out = build_chunk_sqls(
+        tenant,
+        samples_table,
+        fps.clone(),
+        lower_excl_ms,
+        upper_incl_ms,
+    );
+    out.extend(build_hist_chunk_sqls(
+        tenant,
+        hist_samples_table,
+        fps,
+        lower_excl_ms,
+        upper_incl_ms,
+    ));
+    out
+}
+
+/// #835 addendum: the multi-name read's statements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+enum MultiSql {
+    /// One paired statement.
+    One(String),
+    /// Today's two, past the text limit.
+    Two { sql: String, hist_sql: String },
+}
+
+/// #835 addendum: the multi-name read's statements, `text_cap` the
+/// dispatcher's limit.
+#[allow(dead_code)]
+fn multi_statements(
+    tenant: &Tenant,
+    samples_table: &str,
+    hist_samples_table: &str,
+    fps: &[FpLiteral],
+    lower_excl_ms: i64,
+    upper_incl_ms: i64,
+    _text_cap: u64,
+) -> Result<MultiSql, crate::logql::TooBroadReason> {
+    Ok(MultiSql::Two {
+        sql: sample_sql::sample_fetch_multi(
+            tenant,
+            samples_table,
+            fps,
+            lower_excl_ms,
+            upper_incl_ms,
+        )?,
+        hist_sql: sample_sql::hist_sample_fetch_multi(
+            tenant,
+            hist_samples_table,
+            fps,
+            lower_excl_ms,
+            upper_incl_ms,
+        )?,
+    })
+}
+
 /// Issue #549: one grouped statement per fingerprint chunk, over the
 /// SAME chunker the sample fetch uses — so a chunk boundary falls in the
 /// same place on both routes.
@@ -6637,6 +6706,91 @@ mod tests {
         );
         assert_eq!(sqls.len(), 1);
         assert!(sqls[0].contains("IN ('1', '2', '3')"), "got: {}", sqls[0]);
+    }
+
+    /// **R4b (#835 addendum): one paired statement while it fits the text
+    /// limit, today's chunks or today's two past it.**
+    #[test]
+    fn a_read_is_one_statement_until_the_text_limit() {
+        let t = no_tenant();
+        let fps: Vec<Fingerprint> = (1..=1_200).map(Fingerprint::from_raw).collect();
+        let lits = sql_literals(&fps);
+        let one = sample_sql::paired_fetch(
+            &t,
+            "metric_samples",
+            "metric_hist_samples",
+            sample_sql::PairedSeries::List(&lits),
+            0,
+            100,
+        );
+        let len = crate::logql::exec::escape_query_placeholders(&one).len() as u64;
+        let listed = |cap| {
+            listed_statements(
+                &t,
+                "metric_samples",
+                "metric_hist_samples",
+                fps.clone(),
+                0,
+                100,
+                cap,
+            )
+        };
+        assert_eq!(listed(len + 1), vec![one.clone()], "listed: over, one");
+        let chunks: Vec<String> =
+            sample_sql::chunk_fingerprints(&lits, sample_sql::CHUNK_THRESHOLD)
+                .into_iter()
+                .map(|c| {
+                    sample_sql::paired_fetch(
+                        &t,
+                        "metric_samples",
+                        "metric_hist_samples",
+                        sample_sql::PairedSeries::List(c),
+                        0,
+                        100,
+                    )
+                })
+                .collect();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(listed(len), chunks, "listed: under, today's chunks paired");
+        let ten = &lits[..10];
+        let one = sample_sql::paired_fetch(
+            &t,
+            "metric_samples",
+            "metric_hist_samples",
+            sample_sql::PairedSeries::List(ten),
+            0,
+            100,
+        );
+        let len = crate::logql::exec::escape_query_placeholders(&one).len() as u64;
+        let multi = |cap| {
+            multi_statements(
+                &t,
+                "metric_samples",
+                "metric_hist_samples",
+                ten,
+                0,
+                100,
+                cap,
+            )
+            .expect("fits the set limit")
+        };
+        assert_eq!(multi(len + 1), MultiSql::One(one), "multi: over, one");
+        assert_eq!(
+            multi(len),
+            MultiSql::Two {
+                sql: sample_sql::sample_fetch_multi(&t, "metric_samples", ten, 0, 100)
+                    .expect("sql"),
+                hist_sql: sample_sql::hist_sample_fetch_multi(
+                    &t,
+                    "metric_hist_samples",
+                    ten,
+                    0,
+                    100
+                )
+                .expect("sql"),
+            },
+            "multi: under, today's two"
+        );
     }
 
     #[test]

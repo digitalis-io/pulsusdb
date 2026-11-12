@@ -184,6 +184,27 @@ pub fn sample_fetch_multi(
     ))
 }
 
+/// How a paired read names its series (#835 addendum): a literal list, or
+/// an ID statement inlined as a sub-query.
+#[derive(Debug, Clone, Copy)]
+pub enum PairedSeries<'a> {
+    List(&'a [FpLiteral]),
+    Ids(&'a str),
+}
+
+/// #835 addendum: one statement holding a read's float part and its
+/// histogram part, each with today's predicate and its own order.
+pub fn paired_fetch(
+    _tenant: &Tenant,
+    _samples_table: &str,
+    _hist_table: &str,
+    _series: PairedSeries<'_>,
+    _lower_excl_ms: i64,
+    _upper_incl_ms: i64,
+) -> String {
+    String::new()
+}
+
 /// The 13 `metric_hist_samples` value columns, order-locked to the catalog
 /// `CREATE` (id-23, plus the id-27 additive `counter_reset_hint` — LAST,
 /// issue #125) and [`super::sample_rows::HistSampleRow`]. Appended

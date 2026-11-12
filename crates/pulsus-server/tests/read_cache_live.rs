@@ -1122,10 +1122,10 @@ async fn l28_a_tail_past_the_cap_is_a_422() {
     assert_eq!(rb.status, 422, "L28: B refuses: {}", cut(&rb.body));
     assert_eq!(ra.status, 422, "L28: A refuses: {}", cut(&ra.body));
     assert_eq!(ra.body, rb.body, "L28: the same refusal");
-    // One read of the tail: a raw read is its float statement and its
-    // histogram statement, both over the tail's window alone.
+    // One read of the tail, one statement over the tail's window alone
+    // (#835 addendum).
     let sent = statements_of(&db, &query_id(&ra)).await;
-    assert_eq!(sent.len(), 2, "L28: A's statements {sent:#?}");
+    assert_eq!(sent.len(), 1, "L28: A's statements {sent:#?}");
     let lower = |q: &str| {
         q.split("unix_milli > ")
             .nth(1)
