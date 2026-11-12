@@ -44,7 +44,7 @@ mod source_scan;
 use std::collections::BTreeSet;
 
 use manifest::{RouteStatus, Surface, route_manifest};
-use source_scan::{preprocess_views, workspace_root};
+use source_scan::const_str_slice;
 
 /// The twelve mounted `/api/v1/*` query routes, which answer a deadline
 /// breach with `503` + the PromQL error envelope.
@@ -81,47 +81,13 @@ fn mounted_api_v1() -> Vec<&'static manifest::RouteSpec> {
 }
 
 /// The string literals inside `middleware.rs`'s `DEADLINE_BARE_PATHS`,
-/// read out of the source rather than re-declared here. Comments are
-/// blanked first by the shared lexer, so a commented-out entry cannot be
-/// counted.
+/// read out of the source rather than re-declared here
+/// ([`source_scan::const_str_slice`]).
 fn scanned_bare_paths() -> BTreeSet<String> {
-    let file = workspace_root().join("crates/pulsus-server/src/middleware.rs");
-    let src = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
-    let (stripped, _) = preprocess_views(&src);
-    let decl = stripped
-        .find("DEADLINE_BARE_PATHS")
-        .expect("middleware.rs must declare DEADLINE_BARE_PATHS");
-    // Anchor on the `=` first: the declaration's TYPE is `&[&str]`, so a
-    // naive search for the next `[` lands inside the type and reads an
-    // empty body — which is what the emptiness assertion below caught.
-    let eq = stripped[decl..]
-        .find('=')
-        .expect("DEADLINE_BARE_PATHS must be initialised")
-        + decl;
-    let open = stripped[eq..]
-        .find('[')
-        .expect("DEADLINE_BARE_PATHS must be a slice literal")
-        + eq;
-    let close = stripped[open..]
-        .find(']')
-        .expect("DEADLINE_BARE_PATHS's slice literal must close")
-        + open;
-    let body = &stripped[open + 1..close];
-    let mut out = BTreeSet::new();
-    let mut rest = body;
-    while let Some(a) = rest.find('"') {
-        let tail = &rest[a + 1..];
-        let b = tail
-            .find('"')
-            .expect("unterminated literal in DEADLINE_BARE_PATHS");
-        out.insert(tail[..b].to_string());
-        rest = &tail[b + 1..];
-    }
-    assert!(
-        !out.is_empty(),
-        "the scan found no literals in DEADLINE_BARE_PATHS — it has stopped reading the constant"
-    );
-    out
+    const_str_slice(
+        "crates/pulsus-server/src/middleware.rs",
+        "DEADLINE_BARE_PATHS",
+    )
 }
 
 /// (a) Every mounted `Surface::PromApi` route is in the envelope list, and

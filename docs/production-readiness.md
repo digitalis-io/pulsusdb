@@ -125,7 +125,7 @@ checklist reflects reality, not blockers:
   follow-up, not a shipping blocker.
 - **Additional not-yet-exposed `/metrics` dimensions (🚫 non-goal).** Per
   `architecture.md §8`: per-*protocol* ingest error attribution (today errors are
-  per signal + error-class), per-API / per-planner-stage query latencies,
+  per signal + error-class), per-planner-stage query latencies,
   and tail-session counters.
 - **Multi-cluster federation (#175/#176) (🚫 will-not-implement).** See §7; the
   implemented single-cluster `_dist` reader targeting satisfies the M7

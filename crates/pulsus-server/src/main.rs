@@ -21,6 +21,7 @@ mod modes;
 mod ops;
 mod prom_api;
 mod request_id;
+mod request_metrics;
 mod serve;
 mod subsystems;
 mod tls;

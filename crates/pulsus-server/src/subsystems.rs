@@ -95,6 +95,7 @@ mod tests {
             )),
             started_at: std::time::SystemTime::now(),
             tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
+            request_metrics: crate::request_metrics::RequestMetrics::leak_new(),
         };
         let router = writer_router().with_state(state);
         let request = Request::builder()
