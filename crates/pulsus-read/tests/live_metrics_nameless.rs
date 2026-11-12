@@ -624,14 +624,15 @@ async fn p1_p2_name_less_selectors_answer_through_the_label_index() {
         }
     }
 
-    // P2: the example's range query sends exactly three statements.
+    // P2: the example's range query sends exactly two statements:
+    // statement R, then the one read of both sample tables (#835).
     let marker = fx.marker().await;
     run(&fx.pushed, EXAMPLE, &fx.range())
         .await
         .expect("the example");
     let statements = fx.statements_since(&marker).await;
     let queries: Vec<&str> = statements.iter().map(|s| s.query.as_str()).collect();
-    assert_eq!(statements.len(), 3, "{queries:#?}");
+    assert_eq!(statements.len(), 2, "{queries:#?}");
     let resolution: Vec<&LoggedStatement> = statements
         .iter()
         .filter(|s| reads_label_index(s) && ends_with_limit(&s.query, 50_001))
@@ -643,7 +644,7 @@ async fn p1_p2_name_less_selectors_answer_through_the_label_index() {
             s.query.contains("FROM metric_samples") || s.query.contains("FROM metric_hist_samples")
         })
         .collect();
-    assert_eq!(samples.len(), 2, "the sample statements: {queries:#?}");
+    assert_eq!(samples.len(), 1, "the sample statement: {queries:#?}");
     for s in samples {
         assert!(
             s.query.contains("fingerprint IN (\nSELECT fingerprint\n"),

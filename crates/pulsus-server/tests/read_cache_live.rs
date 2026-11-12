@@ -2051,6 +2051,19 @@ async fn a_raw_tail_merge_is_answered_but_not_stored() {
         labels("x", &[("s", "h".to_string())]),
         end + 30_000,
     );
+    // Visible before the repeat, so A's tail and B's read see the same
+    // samples.
+    let c = client(r.db.name()).await;
+    let landed = format!(
+        "SELECT toString(count()) AS s FROM {}.metric_hist_samples WHERE unix_milli = {}",
+        r.db.name(),
+        end + 30_000
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while count(&c, &landed).await == 0 {
+        assert!(Instant::now() < deadline, "T41: the histogram never landed");
+        std::thread::sleep(Duration::from_millis(200));
+    }
     let second = same(&r.a, &r.b, q.shifted(MINUTE), "T41 repeat");
     assert_eq!(second.cache(), "hit", "T41: the repeat");
     assert_eq!(second.through(), Some(kept), "T41: the merge is not stored");
