@@ -683,9 +683,9 @@ fn check_d_escape_rs_surface_is_allowlisted_and_fail_closed() {
 /// Issue #450 AC3b, issue #757 — the pruning residual is stated where the
 /// renderer is read, not only in the issue trail.
 ///
-/// `idx_body_ngrams`, the `ngrambf_v1` index on `body`, serves
-/// `ch_like_contains`'s `body LIKE` through the needle's four-character
-/// sequences (issue #757). The next reader of this function is entitled to
+/// `idx_body_ngrams`, the `ngrambf_v1` index on `lowerUTF8(body)`, serves
+/// the lowered-literal check in front of `ch_like_contains`'s `body LIKE`
+/// through the needle's four-character sequences (issues #757, #839). The next reader of this function is entitled to
 /// learn that from the function, and where a whole-word search goes
 /// instead. The markers `idx_body_ngrams`, `four-character` and `word(`
 /// each sit on one line of that paragraph. Isolating the contiguous `///`
@@ -2087,7 +2087,9 @@ const TOTAL: usize = 1_817;
 const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-clickhouse/src/error.rs", 1),
     ("pulsus-read/src/logql/exec.rs", 3),
-    ("pulsus-read/src/logql/plan.rs", 2),
+    // Issue #839 adds twelve, all test text: the stage-1 goldens of the
+    // matchers that keep their branches, captured before the change.
+    ("pulsus-read/src/logql/plan.rs", 14),
     // Issue #624, part 3d-3 adds three: a targeted `| logfmt` filter's
     // control-separator test and its `!=` key-with-no-`=` test, and the
     // expected text of the test that pins them. Issue #757 adds one: the
@@ -2132,7 +2134,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 110;
+const MATCH_RENDER_TOTAL: usize = 122;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
@@ -2418,6 +2420,7 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn index_neq_branch(key: &str, value: &str) -> CheckedFragment",
     "pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError>",
     "pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError>",
+    "fn lowered_prefilter(lf: &LineFilter) -> Option<String>",
     "pub fn regexp_captures_column(patterns: &[super::pipeline::RxSource]) -> Result<CheckedFragment, PipelineError>",
     "pub fn regexp_captures_column_skipping(patterns: &[super::pipeline::RxSource], skipped: &[bool]) -> Result<CheckedFragment, PipelineError>",
     "pub fn pattern_captures(pattern: &str) -> Result<CheckedFragment, PipelineError>",

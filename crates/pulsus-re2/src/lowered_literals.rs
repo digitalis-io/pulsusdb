@@ -11,19 +11,252 @@
 //! Both read the pattern as the database's `match` and the reference read
 //! it: through [`crate::re2_pattern_to_rust`], with `.` matching a newline.
 
-/// Stub (issue #839, tests first).
-pub fn anchored_matches_every_string(_pattern: &str) -> bool {
-    false
+use regex_syntax::hir::{Class, Hir, HirKind};
+
+/// The fewest characters a run must have to become a string: the n-gram
+/// length of `idx_body_ngrams`.
+const MIN_RUN_CHARS: usize = 4;
+/// A result with more OR sets than this is `None`.
+const MAX_OR_SETS: usize = 16;
+/// A result with more strings than this, over all its sets, is `None`.
+const MAX_STRINGS: usize = 64;
+/// An AND set keeps at most this many of its longest strings.
+const MAX_AND_STRINGS: usize = 8;
+
+/// An OR of AND sets of strings.
+type Sets = Vec<Vec<String>>;
+
+fn parse(pattern: &str) -> Option<Hir> {
+    let translated = crate::re2_pattern_to_rust(pattern);
+    regex_syntax::ParserBuilder::new()
+        .dot_matches_new_line(true)
+        .build()
+        .parse(&translated)
+        .ok()
 }
 
-/// Stub (issue #839, tests first).
-pub fn lowered_regex_literals(_pattern: &str) -> Option<Vec<Vec<String>>> {
-    None
+/// Whether the anchored pattern `^(?:pattern)$` matches every string,
+/// newlines included. True iff the parsed pattern, `Capture` wrappers
+/// removed, is a `Repetition { min: 0, max: None }` over a class holding
+/// every `char`, or an alternation one of whose branches is. A pattern that
+/// does not parse answers `false`.
+pub fn anchored_matches_every_string(pattern: &str) -> bool {
+    fn strip(hir: &Hir) -> &Hir {
+        match hir.kind() {
+            HirKind::Capture(c) => strip(&c.sub),
+            _ => hir,
+        }
+    }
+    fn any_star(hir: &Hir) -> bool {
+        match strip(hir).kind() {
+            HirKind::Repetition(rep) if rep.min == 0 && rep.max.is_none() => {
+                matches!(strip(&rep.sub).kind(), HirKind::Class(Class::Unicode(class))
+                    if class.ranges().len() == 1
+                        && class.ranges()[0].start() == '\0'
+                        && class.ranges()[0].end() == char::MAX)
+            }
+            _ => false,
+        }
+    }
+    let Some(hir) = parse(pattern) else {
+        return false;
+    };
+    match strip(&hir).kind() {
+        HirKind::Alternation(branches) => branches.iter().any(any_star),
+        _ => any_star(&hir),
+    }
 }
 
-/// Stub (issue #839, tests first).
-pub fn lowered_needle_literals(_needle: &str) -> Vec<String> {
-    Vec::new()
+/// Strings `lowerUTF8(body)` contains on every line the unanchored pattern
+/// matches: an OR of AND sets, with this guarantee — for any line the
+/// pattern matches, the lower-cased line contains every string of at least
+/// one set. `None` when no such strings are derived.
+pub fn lowered_regex_literals(pattern: &str) -> Option<Vec<Vec<String>>> {
+    let hir = parse(pattern)?;
+    walk(&hir)
+}
+
+/// The needle's runs of four or more run characters, lower-cased: one AND
+/// set, empty when the needle has no such run.
+pub fn lowered_needle_literals(needle: &str) -> Vec<String> {
+    let mut runs = Runs::default();
+    for c in needle.chars() {
+        runs.push(run_char(c));
+    }
+    runs.finish()
+}
+
+/// A character whose form in `lowerUTF8(body)` is known whatever surrounds
+/// it, as it appears there: an ASCII character lower-cased, and a Japanese
+/// kana, CJK ideograph or precomposed Korean syllable as itself. `None` for
+/// every other character.
+fn run_char(c: char) -> Option<char> {
+    if c.is_ascii() {
+        Some(c.to_ascii_lowercase())
+    } else if matches!(
+        u32::from(c),
+        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7A3
+    ) {
+        Some(c)
+    } else {
+        None
+    }
+}
+
+/// The run character a class stands for: a class equal to `{c, C}` for an
+/// ASCII letter is `c`, and `{k, K, U+212A}` is `k`, which the database
+/// lowers to `k`. `None` for every other class (`{s, S, U+017F}` among them:
+/// `lowerUTF8` leaves U+017F as it is).
+fn class_run_char(class: &Class) -> Option<char> {
+    let Class::Unicode(class) = class else {
+        return None;
+    };
+    let mut chars = Vec::new();
+    for range in class.ranges() {
+        if range.start() != range.end() || chars.len() == 3 {
+            return None;
+        }
+        chars.push(range.start());
+    }
+    match chars.as_slice() {
+        [one] => run_char(*one),
+        [upper, lower] if upper.is_ascii_uppercase() && upper.to_ascii_lowercase() == *lower => {
+            Some(*lower)
+        }
+        ['K', 'k', '\u{212A}'] => Some('k'),
+        _ => None,
+    }
+}
+
+/// The runs of a concatenation, as its items are read in order.
+#[derive(Default)]
+struct Runs {
+    current: String,
+    chars: usize,
+    done: Vec<String>,
+}
+
+impl Runs {
+    fn push(&mut self, c: Option<char>) {
+        match c {
+            Some(c) => {
+                self.current.push(c);
+                self.chars += 1;
+            }
+            None => self.end(),
+        }
+    }
+
+    fn end(&mut self) {
+        let run = std::mem::take(&mut self.current);
+        if self.chars >= MIN_RUN_CHARS {
+            self.done.push(run);
+        }
+        self.chars = 0;
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        self.end();
+        self.done
+    }
+}
+
+/// The item's characters into `runs`, or `false` when the item is not a
+/// literal or a class.
+fn push_chars(hir: &Hir, runs: &mut Runs) -> bool {
+    match hir.kind() {
+        HirKind::Literal(lit) => {
+            for c in String::from_utf8_lossy(&lit.0).chars() {
+                runs.push(run_char(c));
+            }
+            true
+        }
+        HirKind::Class(class) => {
+            runs.push(class_run_char(class));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `None` is "no constraint".
+fn walk(hir: &Hir) -> Option<Sets> {
+    match hir.kind() {
+        HirKind::Literal(_) | HirKind::Class(_) => concat(std::slice::from_ref(hir)),
+        HirKind::Concat(items) => concat(items),
+        HirKind::Alternation(branches) => {
+            let mut out: Sets = Vec::new();
+            for branch in branches {
+                out.extend(walk(branch)?);
+                if !within_limits(&out) {
+                    return None;
+                }
+            }
+            bounded(out)
+        }
+        HirKind::Capture(c) => walk(&c.sub),
+        HirKind::Repetition(rep) if rep.min >= 1 => walk(&rep.sub),
+        HirKind::Repetition(_) | HirKind::Look(_) | HirKind::Empty => None,
+    }
+}
+
+/// AND of the finished runs and of each other item's result.
+fn concat(items: &[Hir]) -> Option<Sets> {
+    let mut runs = Runs::default();
+    let mut factors: Vec<Sets> = Vec::new();
+    for item in items {
+        if !push_chars(item, &mut runs) {
+            runs.end();
+            if let Some(sets) = walk(item) {
+                factors.push(sets);
+            }
+        }
+    }
+    let mut acc: Sets = vec![runs.finish()];
+    for factor in factors {
+        let mut next: Sets = Vec::with_capacity(acc.len() * factor.len());
+        for a in &acc {
+            for b in &factor {
+                let mut set = a.clone();
+                set.extend(b.iter().cloned());
+                next.push(set);
+            }
+        }
+        acc = next.into_iter().map(longest).collect();
+        if !within_limits(&acc) {
+            return None;
+        }
+    }
+    bounded(acc)
+}
+
+/// The set's [`MAX_AND_STRINGS`] longest strings, in their order. Dropping
+/// strings only weakens the check.
+fn longest(set: Vec<String>) -> Vec<String> {
+    if set.len() <= MAX_AND_STRINGS {
+        return set;
+    }
+    let mut by_length: Vec<usize> = (0..set.len()).collect();
+    by_length.sort_by_key(|&i| std::cmp::Reverse(set[i].chars().count()));
+    let mut keep = vec![false; set.len()];
+    for &i in &by_length[..MAX_AND_STRINGS] {
+        keep[i] = true;
+    }
+    set.into_iter()
+        .zip(keep)
+        .filter_map(|(s, k)| k.then_some(s))
+        .collect()
+}
+
+fn within_limits(sets: &Sets) -> bool {
+    sets.len() <= MAX_OR_SETS && sets.iter().map(Vec::len).sum::<usize>() <= MAX_STRINGS
+}
+
+/// `None` when a set has no string, which makes the OR always true, or the
+/// result is past the limits.
+fn bounded(sets: Sets) -> Option<Sets> {
+    let sets: Sets = sets.into_iter().map(longest).collect();
+    (!sets.is_empty() && sets.iter().all(|s| !s.is_empty()) && within_limits(&sets)).then_some(sets)
 }
 
 #[cfg(test)]

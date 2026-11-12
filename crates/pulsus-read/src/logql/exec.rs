@@ -19,8 +19,8 @@ use super::predicate::{BucketGridRefusal, CheckedFragment, CheckedLiteral};
 use super::rows::{
     DetectedLabelRow, FirstLineRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricInstantRow,
     MetricRangeBucketRow, MetricRangeJsonRow, MetricRangeLogfmtRow, MetricRangeRegexpRow,
-    MetricReducedRow, MetricScanRow, MetricScanRxRow, PatternFetchRow, SampleRow, SampleRxRow,
-    StreamMetaRow, StreamRow, TailSampleRow, TailSampleRxRow, VolumeRow,
+    MetricReducedRow, MetricScanRow, MetricScanRxRow, MetricSumRow, PatternFetchRow, SampleRow,
+    SampleRxRow, StreamMetaRow, StreamRow, TailSampleRow, TailSampleRxRow, VolumeRow,
 };
 use futures::Stream;
 use futures::StreamExt;
@@ -1697,6 +1697,51 @@ impl LogQlEngine {
         }
     }
 
+    /// The one statement of [`is_one_statement_sum`]'s shape (issue #839):
+    /// no row is the empty vector, one row is one sample with no labels.
+    /// The 100,000-stream cap does not apply, as no fingerprint list is held
+    /// here; the scan budget applies to the whole statement.
+    async fn run_metric_one_statement(
+        &self,
+        mp: &MetricPlan,
+        explain: Option<&mut PlanExplain>,
+    ) -> Result<QueryResult, ReadError> {
+        let sql = super::sql::metric_instant_sum_one_statement(
+            &self.tenant,
+            metric_source(mp),
+            &mp.table,
+            &mp.streams_table,
+            &mp.stage1_sql,
+            super::sql::TimeWindow {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+            },
+            mp.scan_lower,
+            &mp.extra_predicates,
+        );
+        if let Some(e) = explain {
+            e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
+        }
+        let mut stream = self
+            .query_stream::<MetricSumRow>(&sql, &self.budget_settings())
+            .await?;
+        let mut samples = Vec::new();
+        while let Some(row) = stream.next().await {
+            let row = row.map_err(|e| {
+                map_read_error(
+                    e,
+                    self.config.scan_budget_bytes,
+                    self.config.read_max_memory_bytes,
+                )
+            })?;
+            samples.push(VectorSample {
+                labels: Vec::new(),
+                value: row.n as f64,
+            });
+        }
+        Ok(QueryResult::Vector(samples))
+    }
+
     /// Executes a [`MetricPlan`] end to end. Same single-pass explain
     /// contract as [`LogQlEngine::run_streams_inner`]. A plan carrying
     /// [`MetricPlan::client`] takes the client-aggregated path (issue
@@ -1727,15 +1772,20 @@ impl LogQlEngine {
             }
             _ => None,
         };
+        // Issue #839: the shape answered by one statement, which resolves
+        // the streams inside it.
+        let one_statement = is_one_statement_sum(mp);
         if let Some(e) = explain.as_mut() {
             e.set_routing(mp.routing.clone());
-            e.push("stage1_stream_resolution", mp.stage1_sql.clone(), None);
-            for probe in &mp.probes {
-                e.push(
-                    "selectivity_probe",
-                    probe.sql.clone(),
-                    Some(format!("key = {}", probe.key)),
-                );
+            if !one_statement {
+                e.push("stage1_stream_resolution", mp.stage1_sql.clone(), None);
+                for probe in &mp.probes {
+                    e.push(
+                        "selectivity_probe",
+                        probe.sql.clone(),
+                        Some(format!("key = {}", probe.key)),
+                    );
+                }
             }
         }
         let is_instant = mp.step_ns.is_none();
@@ -1758,6 +1808,9 @@ impl LogQlEngine {
             } else {
                 QueryResult::Matrix(Vec::new())
             });
+        }
+        if one_statement {
+            return self.run_metric_one_statement(mp, explain).await;
         }
         let fingerprints = self.resolve_fingerprints(&mp.stage1_sql).await?;
         if fingerprints.is_empty() {
@@ -7391,6 +7444,27 @@ pub(in crate::logql) fn apply_rate(n: f64, rate_window_ns: Option<u64>) -> f64 {
 /// crate builds; a `MetricPlan` assembled by hand out-of-crate with a
 /// foreign column pair fails closed here instead of interpolating its text
 /// into SQL.
+/// Whether `mp` is answered by one statement (issue #839, D4): an instant
+/// `sum(count_over_time(…))` or `sum(bytes_over_time(…))`, with no grouping
+/// and no stage but pushable line filters, over a domain on the timestamp
+/// axis. Every field read is the plan's own.
+fn is_one_statement_sum(mp: &MetricPlan) -> bool {
+    use super::sql::{MetricShape, MetricValue};
+    mp.step_ns.is_none()
+        && !mp.empty_domain
+        && matches!(
+            mp.value,
+            MetricValue::Shaped(MetricShape::RawCount | MetricShape::RawBytes)
+        )
+        && mp.client.is_none()
+        && mp.metadata_lowering.is_none()
+        && matches!(
+            mp.vector_aggs.as_slice(),
+            [(pulsus_logql::VectorAggOp::Sum, None, None)]
+        )
+        && matches!(mp.op, RangeAggOp::CountOverTime | RangeAggOp::BytesOverTime)
+}
+
 fn metric_source(mp: &MetricPlan) -> super::sql::MetricSource<'_> {
     super::sql::MetricSource::new(
         &mp.table,
@@ -8857,11 +8931,13 @@ mod tests {
         // the size is asserted rather than assumed. `-` is neither `%`, `_`
         // nor `\`, so neither `ch_like_contains` nor `ch_string` escapes
         // anything: a `|=` filter over N dashes renders
-        // `body LIKE '%<N dashes>%'`, which is `10 + 2 + N + 2` bytes
-        // (issue #450). N = 65,522 gives exactly 65,536.
+        // `(multiSearchAny(lowerUTF8(body), ['<N dashes>']) AND body LIKE
+        // '%<N dashes>%')`, the lowered-literal check in front of the exact
+        // predicate (issue #839), which is `2N + 58` bytes. N = 32,739 gives
+        // exactly 65,536.
         let filter = super::super::predicate::line_filter(&pulsus_logql::LineFilter {
             op: pulsus_logql::LineFilterOp::Contains,
-            head: pulsus_logql::LineMatch::Text("-".repeat(65_522)),
+            head: pulsus_logql::LineMatch::Text("-".repeat(32_739)),
             or_matches: Vec::new(),
         })
         .expect("a Contains filter compiles no regex");

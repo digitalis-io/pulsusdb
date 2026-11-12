@@ -4320,6 +4320,11 @@ fn normalize_matchers(selector: &StreamSelector) -> Result<NormalizedMatchers, R
                 negative_branches.push(super::predicate::index_eq_empty_failure_branch(&group.key));
             }
             for p in &group.re_patterns {
+                // Issue #839: a pattern that matches every string gives a
+                // branch that is never true, so it is not sent.
+                if pulsus_re2::anchored_matches_every_string(p) {
+                    continue;
+                }
                 negative_branches.push(super::predicate::index_re_failure_branch(&group.key, p)?);
             }
         }
@@ -4887,7 +4892,9 @@ pub(crate) fn line_filter_effect(lf: &LineFilter) -> LineFilterEffect<'_> {
 /// The pipeline the reference runs (issue #624, part 7, D7.4): a stage that
 /// keeps every line is removed, a pruned `or` group replaces its stage,
 /// and every other stage, a filter that drops every line among them, is
-/// kept. Borrowed when nothing changes.
+/// kept. A label-filter stage that is one `=~` leaf the reference treats as
+/// matching everything is removed too (issue #839). Borrowed when nothing
+/// changes.
 ///
 /// Every regex alternative is validated first, as it is validated today
 /// at its position (D7.9): unanchored before the first `line_format`,
@@ -4936,6 +4943,14 @@ pub(crate) fn effective_pipeline(
                         | LineFilterEffect::Filters(std::borrow::Cow::Borrowed(_)) => None,
                     }
                 }
+            }
+            // Issue #839: one `=~` leaf the reference turns into
+            // `TrueFilter` (`NoopLabelFilter`), which keeps every line and
+            // changes no label, wherever it stands.
+            Stage::LabelFilter(LabelFilterExpr::Match(m))
+                if m.op == MatchOp::Re && pulsus_re2::reference_true_filter(&m.value) =>
+            {
+                Some(None)
             }
             _ => None,
         };
@@ -10482,53 +10497,13 @@ mod tests {
             assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
         }
 
-        const G1_DOT_NO_NEWLINE: &str = r#"SELECT fingerprint
-FROM log_streams_idx
-WHERE org_id = '' AND month = '1970-01-01'
-  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND NOT match(val, '^(?:(?-s).*)$|$.')))
-GROUP BY fingerprint
-HAVING uniqExactIf((key, val), (key = 'job' AND val = 'a')) = 1
-   AND countIf((key = 'ns' AND NOT match(val, '^(?:(?-s).*)$|$.'))) = 0"#;
-        const G1_EMPTY: &str = r#"SELECT fingerprint
-FROM log_streams_idx
-WHERE org_id = '' AND month = '1970-01-01'
-  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND NOT match(val, '^(?:)$')))
-GROUP BY fingerprint
-HAVING uniqExactIf((key, val), (key = 'job' AND val = 'a')) = 1
-   AND countIf((key = 'ns' AND NOT match(val, '^(?:)$'))) = 0"#;
-        const G1_FLAG_ONLY: &str = r#"SELECT fingerprint
-FROM log_streams_idx
-WHERE org_id = '' AND month = '1970-01-01'
-  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND NOT match(val, '^(?:(?i))$')))
-GROUP BY fingerprint
-HAVING uniqExactIf((key, val), (key = 'job' AND val = 'a')) = 1
-   AND countIf((key = 'ns' AND NOT match(val, '^(?:(?i))$'))) = 0"#;
-        const G1_PLUS: &str = r#"SELECT fingerprint
-FROM log_streams_idx
-WHERE org_id = '' AND month = '1970-01-01'
-  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND match(val, '^(?:.+)$')))
-GROUP BY fingerprint
-HAVING uniqExact(key, val) = 2"#;
-        const G1_NEQ_EMPTY: &str = r#"SELECT fingerprint
-FROM log_streams_idx
-WHERE org_id = '' AND month = '1970-01-01'
-  AND ((key = 'job' AND val = 'a') OR (key = 'ns') OR (key = 'ns' AND val = ''))
-GROUP BY fingerprint
-HAVING uniqExactIf((key, val), (key = 'job' AND val = 'a') OR (key = 'ns')) = 2
-   AND countIf((key = 'ns' AND val = '')) = 0"#;
-        const G1_NRE_EMPTY: &str = r#"SELECT fingerprint
-FROM log_streams_idx
-WHERE org_id = '' AND month = '1970-01-01'
-  AND ((key = 'job' AND val = 'a') OR (key = 'ns') OR (key = 'ns' AND match(val, '^(?:)$')))
-GROUP BY fingerprint
-HAVING uniqExactIf((key, val), (key = 'job' AND val = 'a') OR (key = 'ns')) = 2
-   AND countIf((key = 'ns' AND match(val, '^(?:)$'))) = 0"#;
-        const G1_STAR_X: &str = r#"SELECT fingerprint
-FROM log_streams_idx
-WHERE org_id = '' AND month = '1970-01-01'
-  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND match(val, '^(?:.*x)$')))
-GROUP BY fingerprint
-HAVING uniqExact(key, val) = 2"#;
+        const G1_DOT_NO_NEWLINE: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '1970-01-01'\n  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND NOT match(val, '^(?:(?-s).*)$|$.')))\nGROUP BY fingerprint\nHAVING uniqExactIf((key, val), (key = 'job' AND val = 'a')) = 1\n   AND countIf((key = 'ns' AND NOT match(val, '^(?:(?-s).*)$|$.'))) = 0";
+        const G1_EMPTY: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '1970-01-01'\n  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND NOT match(val, '^(?:)$')))\nGROUP BY fingerprint\nHAVING uniqExactIf((key, val), (key = 'job' AND val = 'a')) = 1\n   AND countIf((key = 'ns' AND NOT match(val, '^(?:)$'))) = 0";
+        const G1_FLAG_ONLY: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '1970-01-01'\n  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND NOT match(val, '^(?:(?i))$')))\nGROUP BY fingerprint\nHAVING uniqExactIf((key, val), (key = 'job' AND val = 'a')) = 1\n   AND countIf((key = 'ns' AND NOT match(val, '^(?:(?i))$'))) = 0";
+        const G1_PLUS: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '1970-01-01'\n  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND match(val, '^(?:.+)$')))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 2";
+        const G1_NEQ_EMPTY: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '1970-01-01'\n  AND ((key = 'job' AND val = 'a') OR (key = 'ns') OR (key = 'ns' AND val = ''))\nGROUP BY fingerprint\nHAVING uniqExactIf((key, val), (key = 'job' AND val = 'a') OR (key = 'ns')) = 2\n   AND countIf((key = 'ns' AND val = '')) = 0";
+        const G1_NRE_EMPTY: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '1970-01-01'\n  AND ((key = 'job' AND val = 'a') OR (key = 'ns') OR (key = 'ns' AND match(val, '^(?:)$')))\nGROUP BY fingerprint\nHAVING uniqExactIf((key, val), (key = 'job' AND val = 'a') OR (key = 'ns')) = 2\n   AND countIf((key = 'ns' AND match(val, '^(?:)$'))) = 0";
+        const G1_STAR_X: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '1970-01-01'\n  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND match(val, '^(?:.*x)$')))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 2";
 
         /// T5: a label-filter stage that is one `=~` leaf the reference
         /// treats as matching everything is removed; every other stage is

@@ -9508,7 +9508,7 @@ struct ExplainLine624p3 {
 /// it returns without the skip indexes.** (a) `match()` keeps the granule
 /// for `(?i)(denied|refused)`; (b) over §2.3's sweep — 16 shapes × 11 flag
 /// placements, 26 bodies, one granule per row, under the body's n-gram
-/// index — every pattern's pushed predicate counts what it counts
+/// index on `lowerUTF8(body)` (issue #839) — every pattern's pushed predicate counts what it counts
 /// unindexed; (c) a `word(…)` filter beside a regex filter in the same
 /// statement prunes on the word index (issue #757); (d) every substring
 /// needle drawn from 21 bodies counts, under the n-gram index, what it
@@ -9569,7 +9569,7 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         &admin,
         &format!(
             "CREATE TABLE {table} (body String, \
-             INDEX idx_body_ngrams body TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) \
+             INDEX idx_body_ngrams lowerUTF8(body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) \
              ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
         ),
     )
@@ -9754,7 +9754,7 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         &admin,
         &format!(
             "CREATE TABLE {table} (body String, \
-             INDEX idx_body_ngrams body TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) \
+             INDEX idx_body_ngrams lowerUTF8(body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) \
              ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
         ),
     )

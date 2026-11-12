@@ -1174,9 +1174,10 @@ fn expected_stage3_prefix() -> Vec<String> {
     ])
 }
 
-/// Issue #757: `|=` renders `body LIKE '%…%'`, which `idx_body_ngrams`
-/// reads; the read is confined to the granules holding the needle's
-/// four-character sequences.
+/// Issue #757: `|=` renders `body LIKE '%…%'`; since issue #839 the
+/// lowered-literal check in front of it is what `idx_body_ngrams` reads, and
+/// the read is confined to the granules holding the needle's four-character
+/// sequences.
 #[tokio::test]
 async fn stage3_contains_line_filter_prunes_on_the_ngram_index() {
     skip_unless_live!();
@@ -1196,11 +1197,11 @@ async fn stage3_contains_line_filter_prunes_on_the_ngram_index() {
     .await;
 }
 
-/// `!=` renders `NOT (body LIKE '%connection refused%')` (issue #450):
-/// `idx_body_ngrams` is listed and, a bloom filter answering only "may
-/// contain", prunes nothing for `NOT (…)` (issue #757).
+/// `!=` renders `NOT (body LIKE '%connection refused%')` (issue #450),
+/// which carries no lowered-literal check: since issue #839 no body index
+/// is listed, and the read prunes nothing.
 #[tokio::test]
-async fn stage3_not_contains_line_filter_lists_the_ngram_index_and_prunes_nothing() {
+async fn stage3_not_contains_line_filter_lists_no_body_index_and_prunes_nothing() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_not_contains");
     let ts_ns = now_ns();
@@ -1212,7 +1213,7 @@ async fn stage3_not_contains_line_filter_lists_the_ngram_index_and_prunes_nothin
         &client,
         r#"{service_name="checkout"} != "connection refused""#,
         PrunesBy::NotAtAll,
-        &["idx_body_ngrams"],
+        &[],
         false,
     )
     .await;
@@ -1220,7 +1221,8 @@ async fn stage3_not_contains_line_filter_lists_the_ngram_index_and_prunes_nothin
 
 /// Issue #450: the `or` group renders `((body LIKE '%a%') OR (body LIKE
 /// '%b%'))` ANDed with the PK bounds. Both arms are at least four
-/// characters, so `idx_body_ngrams` prunes on the disjunction (issue #757).
+/// characters, so the lowered-literal check in front of it holds both and
+/// `idx_body_ngrams` prunes on it (issues #757, #839).
 #[tokio::test]
 async fn stage3_or_group_line_filter_prunes_on_the_ngram_index() {
     skip_unless_live!();
@@ -1240,8 +1242,9 @@ async fn stage3_or_group_line_filter_prunes_on_the_ngram_index() {
     .await;
 }
 
-/// Issue #757: `|~` without a flag group renders `match(body, …)`, which
-/// `idx_body_ngrams` reads through the pattern's required literal.
+/// Issue #757: `|~` without a flag group renders `match(body, …)`; since
+/// issue #839 `idx_body_ngrams` reads the pattern's literal through the
+/// lowered-literal check in front of it.
 #[tokio::test]
 async fn stage3_regex_line_filter_prunes_on_the_ngram_index() {
     skip_unless_live!();
@@ -1262,8 +1265,8 @@ async fn stage3_regex_line_filter_prunes_on_the_ngram_index() {
 }
 
 /// `!~` renders `NOT (match(body, ...))` and nothing else — no prefilter
-/// of any kind is minted (issue #450); `idx_body_ngrams` is listed and
-/// prunes nothing for `NOT (…)` (issue #757).
+/// of any kind is minted (issue #450); since issue #839 no body index is
+/// listed, and the read prunes nothing.
 #[tokio::test]
 async fn stage3_not_regex_line_filter_over_a_metacharacter_pattern_prunes_nothing() {
     skip_unless_live!();
@@ -1277,28 +1280,29 @@ async fn stage3_not_regex_line_filter_over_a_metacharacter_pattern_prunes_nothin
         &client,
         r#"{service_name="checkout"} !~ "err.*""#,
         PrunesBy::NotAtAll,
-        &["idx_body_ngrams"],
+        &[],
         false,
     )
     .await;
 }
 
-/// Issue #757 D5: a `|~` that turns case-insensitivity on renders
-/// `match(identity(body), …)`, which no index reads, so no `Skip` block is
-/// listed: the n-gram index would drop rows for such a pattern.
+/// Issue #839: a `|~` that turns case-insensitivity on renders
+/// `match(identity(body), …)`, which no index reads, behind the
+/// lowered-literal check, which `idx_body_ngrams` on `lowerUTF8(body)` reads:
+/// the read is confined to the granules holding `connection` or `refu`.
 #[tokio::test]
-async fn stage3_case_insensitive_regex_line_filter_reads_no_body_index() {
+async fn stage3_case_insensitive_regex_line_filter_prunes_on_the_ngram_index() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_regex_ci");
     let ts_ns = now_ns();
     let client = setup_with_line_filter_corpus(db, ts_ns).await;
 
     // The n-gram index is added here as well as by the schema, so that the
-    // shape asks whether the predicate keeps an existing index out, not
+    // shape asks whether the predicate reaches an existing index, not
     // whether the index exists.
     for stmt in [
         format!(
-            "ALTER TABLE {db}.log_samples ADD INDEX IF NOT EXISTS idx_body_ngrams body \
+            "ALTER TABLE {db}.log_samples ADD INDEX IF NOT EXISTS idx_body_ngrams lowerUTF8(body) \
              TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1"
         ),
         format!(
@@ -1317,18 +1321,19 @@ async fn stage3_case_insensitive_regex_line_filter_reads_no_body_index() {
         ts_ns,
         &client,
         r#"{service_name="checkout"} |~ "(?i)(connection|refused)""#,
-        PrunesBy::NotAtAll,
-        &[],
+        PrunesBy::Strongly,
+        &["idx_body_ngrams"],
         false,
     )
     .await;
 }
 
 /// Issue #757: a flag group the renderer gives the never-matching arm
-/// renders `match(body, '(?:…)|$.')`; `idx_body_ngrams` is listed, and the
-/// top-level `|$.` leaves it no required substring, so it prunes nothing.
+/// renders `match(body, '(?:…)|$.')`, which no index reads. Since issue
+/// #839 the lowered-literal check in front of it holds the pattern's
+/// `connection refused`, which `idx_body_ngrams` reads.
 #[tokio::test]
-async fn stage3_never_match_arm_regex_line_filter_prunes_nothing() {
+async fn stage3_never_match_arm_regex_line_filter_prunes_on_the_ngram_index() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_regex_nma");
     let ts_ns = now_ns();
@@ -1339,7 +1344,7 @@ async fn stage3_never_match_arm_regex_line_filter_prunes_nothing() {
         ts_ns,
         &client,
         r#"{service_name="checkout"} |~ "(?s:.*connection refused)""#,
-        PrunesBy::NotAtAll,
+        PrunesBy::Strongly,
         &["idx_body_ngrams"],
         false,
     )
@@ -1347,10 +1352,11 @@ async fn stage3_never_match_arm_regex_line_filter_prunes_nothing() {
 }
 
 /// Issue #757: `|= word(…) or "…"` renders `((hasToken(…)) OR (body LIKE
-/// …))`; both body indexes are listed, and the `<Combined skip indexes>`
-/// block that joins them under `OR` confines the read.
+/// …))`. A `word(…)` alternative derives no lowered literal, so since issue
+/// #839 the group carries no lowered-literal check: only the word index is
+/// listed, and with one arm no index reads, the read prunes nothing.
 #[tokio::test]
-async fn stage3_word_or_substring_line_filter_prunes_through_the_combined_block() {
+async fn stage3_word_or_substring_line_filter_prunes_nothing() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_word_or_sub");
     let ts_ns = now_ns();
@@ -1361,9 +1367,9 @@ async fn stage3_word_or_substring_line_filter_prunes_through_the_combined_block(
         ts_ns,
         &client,
         r#"{service_name="checkout"} |= word("refused") or "nomatchzzzz""#,
-        PrunesBy::Strongly,
-        &["idx_body_words", "idx_body_ngrams"],
-        true,
+        PrunesBy::NotAtAll,
+        &["idx_body_words"],
+        false,
     )
     .await;
 }
@@ -1437,8 +1443,7 @@ async fn stage3_not_word_filter_prunes_nothing() {
 }
 
 /// Issue #757: a `word(…)` filter chained with a substring filter prunes on
-/// the word; the negated substring filter lists the n-gram index, which
-/// prunes nothing for it.
+/// the word; the negated substring filter lists no body index (issue #839).
 #[tokio::test]
 async fn stage3_word_filter_chained_with_a_literal_prunes_on_the_word() {
     skip_unless_live!();
@@ -1452,7 +1457,7 @@ async fn stage3_word_filter_chained_with_a_literal_prunes_on_the_word() {
         &client,
         r#"{service_name="checkout"} |= word("refused") != "zzz""#,
         PrunesBy::Strongly,
-        &["idx_body_words", "idx_body_ngrams"],
+        &["idx_body_words"],
         false,
     )
     .await;

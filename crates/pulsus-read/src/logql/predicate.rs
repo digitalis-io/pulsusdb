@@ -477,10 +477,10 @@ pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, Pip
 /// outright (`BAD_ARGUMENTS`). There is no safe subset for us to write —
 /// a token prefilter is equivalence-preserving only when the needle is
 /// token-aligned *in the data*, which the query cannot know. The body's two
-/// indexes read the predicates as written: `idx_body_ngrams`, `ngrambf_v1`
-/// on `body`, serves `body LIKE` and `match(body, …)`; `idx_body_words`,
-/// `tokenbf_v1` on `upperUTF8(lowerUTF8(body))`, serves a `word(…)`
-/// alternative's `hasToken` conjunction.
+/// indexes: `idx_body_ngrams`, `ngrambf_v1` on `lowerUTF8(body)`, serves the
+/// lowered-literal check a positive filter carries ([`lowered_prefilter`],
+/// issue #839), and no exact predicate; `idx_body_words`, `tokenbf_v1` on
+/// `upperUTF8(lowerUTF8(body))`, serves a `word(…)` `hasToken` conjunction.
 ///
 /// An `or` group (M8-LQ2 `linefilter.or`) is a disjunction of the same
 /// per-alternative predicate: `((a) OR (b) …)` for positive ops,
@@ -521,14 +521,71 @@ pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
     Ok(CheckedFragment {
         sql: match lf.op {
             LineFilterOp::Contains | LineFilterOp::Regex => {
-                if lf.or_matches.is_empty() {
+                let exact = if lf.or_matches.is_empty() {
                     core
                 } else {
                     format!("({core})")
+                };
+                match lowered_prefilter(lf) {
+                    Some(prefilter) => format!("({prefilter} AND {exact})"),
+                    None => exact,
                 }
             }
             LineFilterOp::NotContains | LineFilterOp::NotRegex => format!("NOT ({core})"),
         },
+    })
+}
+
+/// The lowered-literal check a positive line filter carries in front of
+/// its exact predicate (issue #839), which `idx_body_ngrams`, built on
+/// `lowerUTF8(body)`, reads. The OR of every alternative's strings: a
+/// needle's runs, or a pattern's ([`pulsus_re2::lowered_regex_literals`]).
+/// `None` when an alternative derives none, or is a `word(…)` or `ip(…)`.
+///
+/// | strings | SQL |
+/// |---|---|
+/// | every AND set has one | `multiSearchAny(lowerUTF8(body), ['a', 'b'])` |
+/// | otherwise | `((lowerUTF8(body) LIKE '%a%' AND lowerUTF8(body) LIKE '%b%') OR (…))` |
+fn lowered_prefilter(lf: &LineFilter) -> Option<String> {
+    let mut sets: Vec<Vec<String>> = Vec::new();
+    for alt in lf.alternatives() {
+        match (alt, lf.op) {
+            (LineMatch::Text(needle), LineFilterOp::Contains) => {
+                let set = pulsus_re2::lowered_needle_literals(needle);
+                if set.is_empty() {
+                    return None;
+                }
+                sets.push(set);
+            }
+            (LineMatch::Text(pattern), LineFilterOp::Regex) => {
+                sets.extend(pulsus_re2::lowered_regex_literals(pattern)?);
+            }
+            _ => return None,
+        }
+    }
+    if sets.iter().all(|set| set.len() == 1) {
+        let strings: Vec<String> = sets.iter().map(|set| ch_string(&set[0])).collect();
+        return Some(format!(
+            "multiSearchAny(lowerUTF8(body), [{}])",
+            strings.join(", ")
+        ));
+    }
+    let rendered: Vec<String> = sets
+        .iter()
+        .map(|set| {
+            let likes: Vec<String> = set
+                .iter()
+                .map(|s| format!("lowerUTF8(body) LIKE {}", ch_like_contains(s)))
+                .collect();
+            match likes.as_slice() {
+                [one] => one.clone(),
+                _ => format!("({})", likes.join(" AND ")),
+            }
+        })
+        .collect();
+    Some(match rendered.as_slice() {
+        [one] => one.clone(),
+        _ => format!("({})", rendered.join(" OR ")),
     })
 }
 
@@ -1460,11 +1517,11 @@ fn words_predicate(words: &[String]) -> String {
     }
 }
 
-/// `match(body, <p>)`, the pushed `|~`/`!~` predicate, read by
-/// `idx_body_ngrams`. A pattern that turns case-insensitivity on renders
-/// `match(identity(body), <p>)`, which no index reads: over a row
-/// `audit DENIED open`, `match(s, '(?i)(denied|refused)')` counts 0 with the
-/// n-gram index and 1 without it.
+/// `match(body, <p>)`, the pushed `|~`/`!~` predicate; no index reads it
+/// since issue #839. A pattern that turns case-insensitivity on renders
+/// `match(identity(body), <p>)`, which no index reads either: over a row
+/// `audit DENIED open`, `match(s, '(?i)(denied|refused)')` counts 0 with an
+/// n-gram index on `s` and 1 without it.
 fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
     let column = if pulsus_re2::sets_case_insensitive(pattern) {
         "identity(body)"
@@ -2360,8 +2417,9 @@ mod tests {
     /// over the case key `upperUTF8(lowerUTF8(body))`, each word keyed in SQL,
     /// kept in the order written and ANDed, which `idx_body_words` serves; a
     /// `|~` that turns case-insensitivity on renders `match(identity(body), …)`,
-    /// which keeps `idx_body_ngrams` out, and any other `|~` renders
-    /// `match(body, …)`.
+    /// which keeps the database's own literal extraction out, and any other
+    /// `|~` renders `match(body, …)`. A positive `|~` carries the lowered-literal
+    /// check in front (issue #839).
     #[test]
     fn a_word_alternative_renders_has_token_and_a_case_insensitive_regex_keeps_the_index_out() {
         fn words(ws: &[&str]) -> LineMatch {
@@ -2394,7 +2452,7 @@ mod tests {
             ),
             (
                 regex_filter("(?i)(denied|refused)"),
-                "match(identity(body), '(?i)(denied|refused)')",
+                "(multiSearchAny(lowerUTF8(body), ['denied', 'refu']) AND match(identity(body), '(?i)(denied|refused)'))",
             ),
             (
                 LineFilter {
@@ -2406,7 +2464,7 @@ mod tests {
             ),
             (
                 regex_filter("connection refused"),
-                "match(body, 'connection refused')",
+                "(multiSearchAny(lowerUTF8(body), ['connection refused']) AND match(body, 'connection refused'))",
             ),
         ];
         for (lf, want) in cases {
@@ -2506,7 +2564,7 @@ mod tests {
             line_filter(&regex_filter("boom"))
                 .expect("`boom` compiles")
                 .as_sql(),
-            "match(body, 'boom')"
+            "(multiSearchAny(lowerUTF8(body), ['boom']) AND match(body, 'boom'))"
         );
     }
 
@@ -2563,9 +2621,18 @@ mod tests {
     #[test]
     fn a_contains_line_filter_renders_an_escaped_like_pattern() {
         for (needle, expected) in [
-            ("connection refused", "body LIKE '%connection refused%'"),
-            ("user_id", "body LIKE '%user\\\\_id%'"),
-            ("100%", "body LIKE '%100\\\\%%'"),
+            (
+                "connection refused",
+                "(multiSearchAny(lowerUTF8(body), ['connection refused']) AND body LIKE '%connection refused%')",
+            ),
+            (
+                "user_id",
+                "(multiSearchAny(lowerUTF8(body), ['user_id']) AND body LIKE '%user\\\\_id%')",
+            ),
+            (
+                "100%",
+                "(multiSearchAny(lowerUTF8(body), ['100%']) AND body LIKE '%100\\\\%%')",
+            ),
             ("a\\b", "body LIKE '%a\\\\\\\\b%'"),
             ("", "1"),
         ] {

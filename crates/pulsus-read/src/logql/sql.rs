@@ -2989,6 +2989,58 @@ pub fn tail_first_lines(
     )
 }
 
+/// The one statement of an instant `sum(count_over_time(…))` or
+/// `sum(bytes_over_time(…))` with no grouping and no stage but pushable line
+/// filters (issue #839, D4): stream resolution, the streams' services and
+/// the sample read, nested as `GLOBAL IN` subqueries.
+///
+/// ```text
+/// SELECT count() AS c, <agg> AS n
+/// FROM <samples>
+/// WHERE org_id = <t>
+///   AND (service, fingerprint) GLOBAL IN (
+///     SELECT service, fingerprint FROM <streams>
+///     WHERE org_id = <t> AND fingerprint GLOBAL IN (
+/// <stage1>))
+///   AND timestamp_ns <lower> <start> AND timestamp_ns <= <end>
+///   AND <extra predicate> …
+/// HAVING c > 0
+/// ```
+///
+/// The `(service, fingerprint)` tuple keeps the `(org_id, service,
+/// fingerprint, timestamp_ns)` key prefix in use. `HAVING c > 0` answers no
+/// row when no line is in the window, and one row when one is, even where
+/// `n` is `0` (`bytes_over_time` over empty bodies).
+#[allow(clippy::too_many_arguments)]
+pub fn metric_instant_sum_one_statement(
+    tenant: &Tenant,
+    source: MetricSource<'_>,
+    samples_table: &str,
+    streams_table: &str,
+    stage1_sql: &str,
+    window: TimeWindow,
+    lower: ScanLowerBound,
+    extra_predicates: &[CheckedFragment],
+) -> String {
+    debug_assert_eq!(source.table(), samples_table);
+    let t = tenant.sql_literal();
+    let agg_expr = source.shape().agg_expr();
+    let TimeWindow { start_ns, end_ns } = window;
+    let lower_op = lower.sql_op();
+    let mut sql = format!(
+        "SELECT count() AS c, {agg_expr} AS n\nFROM {samples_table}\nWHERE org_id = {t}\n  \
+         AND (service, fingerprint) GLOBAL IN (\n    SELECT service, fingerprint FROM \
+         {streams_table}\n    WHERE org_id = {t} AND fingerprint GLOBAL IN (\n{stage1_sql}))\n  \
+         AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+    );
+    for clause in extra_predicates {
+        sql.push_str("\n  AND ");
+        sql.push_str(clause.as_sql());
+    }
+    sql.push_str("\nHAVING c > 0");
+    sql
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3910,7 +3962,7 @@ mod tests {
                 r"PREWHERE service = 'checkout'",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
         ),
@@ -3933,7 +3985,7 @@ mod tests {
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
         ),
@@ -3956,7 +4008,7 @@ mod tests {
                 r"PREWHERE service = 'checkout'",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
         ),
@@ -3979,7 +4031,7 @@ mod tests {
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
         ),
@@ -4002,7 +4054,7 @@ mod tests {
                 r"PREWHERE service = 'checkout'",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
         ),
@@ -4025,7 +4077,7 @@ mod tests {
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
         ),
@@ -4048,7 +4100,7 @@ mod tests {
                 r"PREWHERE service = 'checkout'",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
         ),
@@ -4071,7 +4123,7 @@ mod tests {
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
         ),
@@ -4094,7 +4146,7 @@ mod tests {
                 r"PREWHERE service = 'checkout'",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
         ),
@@ -4117,7 +4169,7 @@ mod tests {
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
         ),
@@ -4140,7 +4192,7 @@ mod tests {
                 r"PREWHERE service = 'checkout'",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
         ),
@@ -4163,7 +4215,7 @@ mod tests {
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
         ),
@@ -4186,7 +4238,7 @@ mod tests {
                 r"PREWHERE service = 'checkout'",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
         ),
@@ -4209,7 +4261,7 @@ mod tests {
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
         ),
@@ -4232,7 +4284,7 @@ mod tests {
                 r"PREWHERE service = 'checkout'",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
         ),
@@ -4255,7 +4307,7 @@ mod tests {
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
         ),
@@ -4623,7 +4675,7 @@ mod tests {
                 r"PREWHERE service = 'checkout'",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
         ),
@@ -4834,7 +4886,7 @@ mod tests {
         );
         let with_predicate = count.replace(
             "AND timestamp_ns <= 1700003600000000000\n",
-            "AND timestamp_ns <= 1700003600000000000\n        AND body LIKE '%CONN\\\\_REFUSED%'\n",
+            "AND timestamp_ns <= 1700003600000000000\n        AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\\\_REFUSED%')\n",
         );
         let cases = [
             (
@@ -4894,7 +4946,7 @@ mod tests {
                 r"SELECT fingerprint, count() AS n, '' AS structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE org_id = '' AND fingerprint IN ('18374', '99120') AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000 AND body LIKE '%CONN\\_REFUSED%'",
+                r"WHERE org_id = '' AND fingerprint IN ('18374', '99120') AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000 AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"GROUP BY fingerprint",
             ]
             .join("\n"),
@@ -4918,7 +4970,7 @@ mod tests {
                 r"PREWHERE service = 'checkout'",
                 r"WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
-                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\_REFUSED%')",
                 r"GROUP BY fingerprint, bucket_ns",
             ]
             .join("\n"),
@@ -4953,7 +5005,7 @@ mod tests {
                 "      PREWHERE service = 'checkout'",
                 "      WHERE org_id = '' AND fingerprint IN ('18374', '99120')",
                 "        AND timestamp_ns > 1699999850000000000 AND timestamp_ns <= 1700003600000000000",
-                "        AND body LIKE '%CONN\\\\_REFUSED%'",
+                "        AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND body LIKE '%CONN\\\\_REFUSED%')",
                 "      GROUP BY fingerprint, lo, hi",
                 "      HAVING lo <= hi",
                 "    )",

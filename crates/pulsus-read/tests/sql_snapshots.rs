@@ -247,7 +247,9 @@ fn line_filter_contains_pushes_down_an_escaped_like_predicate() {
     );
     assert_eq!(
         sqls(&sp.line_filters),
-        vec!["body LIKE '%connection refused%'"]
+        vec![
+            "(multiSearchAny(lowerUTF8(body), ['connection refused']) AND body LIKE '%connection refused%')"
+        ]
     );
 }
 
@@ -280,7 +282,9 @@ fn line_filter_regex_over_a_plain_literal_is_the_same_bare_match() {
     );
     assert_eq!(
         sqls(&sp.line_filters),
-        vec!["match(body, 'connection refused')"]
+        vec![
+            "(multiSearchAny(lowerUTF8(body), ['connection refused']) AND match(body, 'connection refused'))"
+        ]
     );
 }
 
@@ -347,7 +351,7 @@ fn ip_line_filter_is_not_pushed_down_while_a_sibling_literal_filter_is() {
     );
     assert_eq!(
         sqls(&sp.line_filters),
-        vec!["body LIKE '%boot%'"],
+        vec!["(multiSearchAny(lowerUTF8(body), ['boot']) AND body LIKE '%boot%')"],
         "only the literal filter pushes down; the ip() filter is client-side"
     );
     assert!(
@@ -385,7 +389,7 @@ fn stage3_renders_the_canonical_shape_with_a_single_service() {
          PREWHERE service = 'checkout'\n\
          WHERE org_id = '' AND fingerprint IN ('18374', '99120')\n\
          \x20 AND timestamp_ns > 1782907200000000000 AND timestamp_ns <= 1782928800000000000\n\
-         \x20 AND body LIKE '%connection refused%'\n\
+         \x20 AND (multiSearchAny(lowerUTF8(body), ['connection refused']) AND body LIKE '%connection refused%')\n\
          ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC\n\
          LIMIT 100"
     );
@@ -531,7 +535,9 @@ fn a_line_filter_before_a_parser_still_pushes_down_byte_identically() {
     );
     assert_eq!(
         sqls(&with_parser.line_filters),
-        vec!["body LIKE '%connection refused%'"]
+        vec![
+            "(multiSearchAny(lowerUTF8(body), ['connection refused']) AND body LIKE '%connection refused%')"
+        ]
     );
     // The label filter is an unpushed dropping stage: the scan oversamples
     // while the response cap stays put (AC9's plan-side half).
@@ -552,7 +558,9 @@ fn a_line_filter_before_a_parser_still_pushes_down_byte_identically() {
         with_parser.scan_limit,
     );
     assert!(
-        sql.contains("AND body LIKE '%connection refused%'"),
+        sql.contains(
+            "AND (multiSearchAny(lowerUTF8(body), ['connection refused']) AND body LIKE '%connection refused%')"
+        ),
         "stage-3 SQL must render the pushdown predicate: {sql}"
     );
     assert!(sql.ends_with("LIMIT 1000"), "{sql}");
@@ -1889,7 +1897,9 @@ const S2_793: &str = "SELECT fingerprint\n\
      HAVING uniqExactIf((key, val), (key = 'host' AND match(val, '^(?:.+)$'))) = 1\n\
      \x20  AND countIf((key = 'unit' AND val != '')) = 0";
 
-/// S1: a `=~` that matches `""` is a failure branch, not a required key.
+/// S1: a `=~` that matches `""` is a failure branch, not a required key;
+/// one that matches every string, as `.*` does, gives no branch at all
+/// (issue #839).
 #[test]
 fn s1_793_a_regex_matching_empty_does_not_require_its_key() {
     assert_eq!(
@@ -1897,10 +1907,9 @@ fn s1_793_a_regex_matching_empty_does_not_require_its_key() {
         "SELECT fingerprint\n\
          FROM log_streams_idx\n\
          WHERE org_id = '' AND month = '2026-07-01'\n\
-         \x20 AND ((key = 'host' AND match(val, '^(?:.+)$')) OR (key = 'unit' AND NOT match(val, '^(?:.*)$')))\n\
+         \x20 AND ((key = 'host' AND match(val, '^(?:.+)$')))\n\
          GROUP BY fingerprint\n\
-         HAVING uniqExactIf((key, val), (key = 'host' AND match(val, '^(?:.+)$'))) = 1\n\
-         \x20  AND countIf((key = 'unit' AND NOT match(val, '^(?:.*)$'))) = 0"
+         HAVING uniqExact(key, val) = 1"
     );
 }
 
@@ -1967,7 +1976,8 @@ fn s5_793_not_equal_empty_alone_is_served() {
 }
 
 /// S6: failure-branch order — negatives in matcher order, then the
-/// demoted group's.
+/// demoted group's. `unit=~".*"` matches every string, so since issue #839
+/// it gives no branch.
 #[test]
 fn s6_793_failure_branches_keep_negatives_first() {
     assert_eq!(
@@ -1975,10 +1985,10 @@ fn s6_793_failure_branches_keep_negatives_first() {
         "SELECT fingerprint\n\
          FROM log_streams_idx\n\
          WHERE org_id = '' AND month = '2026-07-01'\n\
-         \x20 AND ((key = 'service_name' AND val = 'checkout') OR (key = 'unit' AND val = 'a') OR (key = 'unit' AND NOT match(val, '^(?:.*)$')))\n\
+         \x20 AND ((key = 'service_name' AND val = 'checkout') OR (key = 'unit' AND val = 'a'))\n\
          GROUP BY fingerprint\n\
          HAVING uniqExactIf((key, val), (key = 'service_name' AND val = 'checkout')) = 1\n\
-         \x20  AND countIf((key = 'unit' AND val = 'a') OR (key = 'unit' AND NOT match(val, '^(?:.*)$'))) = 0"
+         \x20  AND countIf((key = 'unit' AND val = 'a')) = 0"
     );
 }
 
