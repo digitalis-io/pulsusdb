@@ -811,9 +811,10 @@ async fn l10_a_recreated_database_is_cleared() {
     same(&r.a, &r.b, l2, "L2 after the rebuild");
 }
 
-/// L12: a gauge under `rate`, twice; the repeat is a hit.
+/// L12 (#835): an answer with an info is not kept: its repeat is read in
+/// full.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l12_an_info_is_kept_with_its_points() {
+async fn l12_an_answer_with_an_info_is_not_kept() {
     skip_unless_live!();
     let a_port: u16 = 31_445;
     let b_port: u16 = 31_446;
@@ -824,10 +825,33 @@ async fn l12_an_info_is_kept_with_its_points() {
         &[],
     )
     .await;
-    let end = now_ms().div_euclid(STEP) * STEP;
-    let q = Range::new("rate(g[5m])", end - 2 * HOUR, end, STEP);
-    same(&r.a, &r.b, q, "L12 first");
-    assert_eq!(same(&r.a, &r.b, q, "L12 second").cache(), "hit");
+    // `max` over native histograms and one float series of the same name
+    // answers the float series and raises the info that histograms were
+    // ignored.
+    load_histograms(r.b.port, &r.times);
+    let samples = (r.times.now0 - r.times.t0) / 5_000;
+    push_series(
+        r.b.port,
+        "a",
+        labels("hh", &[("f", "1".to_string())]),
+        (0..=samples)
+            .map(|k| (r.times.t0 + k * 5_000, k as f64))
+            .collect(),
+    );
+    let q = r.times.l1("max(hh)");
+    let first = same(&r.a, &r.b, q, "L12 first");
+    assert!(
+        first.body.contains("ignored histogram in max aggregation"),
+        "L12: the answer has an info: {}",
+        cut(&first.body)
+    );
+    assert!(points_of(&first.body).unwrap_or(0) > 0, "L12: an answer");
+    let second = same(&r.a, &r.b, q, "L12 second");
+    assert_eq!(second.cache(), "bypass", "L12: nothing was kept");
+    assert!(
+        second.header("x-pulsus-read-cache-through").is_none(),
+        "L12: no Through header"
+    );
 }
 
 /// L13: `limit` is applied after the merge.
@@ -852,6 +876,41 @@ async fn l13_limit_is_applied_after_the_merge() {
         "L2 limit 5",
     );
     assert_eq!(second.cache(), "hit");
+    assert!(
+        second.body.contains("results truncated due to limit"),
+        "L13: the truncation warning: {}",
+        cut(&second.body)
+    );
+}
+
+/// L27 (#835): the `stats` and `limit` notices are added to a hit from its
+/// own request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l27_stats_and_limit_notices_are_added_to_a_hit() {
+    skip_unless_live!();
+    let a_port: u16 = 31_915;
+    let b_port: u16 = 31_916;
+    let r = rig(
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l27_it")).await,
+        a_port,
+        b_port,
+        &[],
+    )
+    .await;
+    let l1 = r.times.l1("rate(rc_total[5m])").extra("&stats=all&limit=1");
+    assert_eq!(same(&r.a, &r.b, l1, "L27 first").cache(), "miss");
+    let second = same(&r.a, &r.b, l1.shifted(MINUTE), "L27 second");
+    assert_eq!(second.cache(), "hit", "L27");
+    assert!(
+        second.body.contains("results truncated due to limit"),
+        "L27: the truncation warning: {}",
+        cut(&second.body)
+    );
+    assert!(
+        second.body.contains("no query statistics are returned"),
+        "L27: the stats notice: {}",
+        cut(&second.body)
+    );
 }
 
 /// L14: a query reading data less than a day inside retention bypasses.
@@ -969,10 +1028,10 @@ async fn charge_of(db: &str, start: i64, end: i64) -> u64 {
     s.next().await.expect("a row").expect("a count").n
 }
 
-/// L17: a hit whose charge could pass the cap is evaluated in full, and
-/// refused as the cache-off server refuses it.
+/// L17 (#835): a hit is limited by the samples of its newest points: A's
+/// tail is under the cap where B's whole range is over it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l17_a_hit_past_the_sample_cap_is_refused_in_full() {
+async fn l17_a_hit_is_limited_by_its_newest_points() {
     skip_unless_live!();
     let a_port: u16 = 31_455;
     let b_port: u16 = 31_456;
@@ -1012,8 +1071,72 @@ async fn l17_a_hit_past_the_sample_cap_is_refused_in_full() {
     let ra = refresh.send(a.port);
     let rb = refresh.send(b.port);
     assert_eq!(rb.status, 422, "B refuses: {}", rb.body);
-    assert_eq!(ra.status, 422, "A refuses: {}", ra.body);
-    assert_eq!(ra.body, rb.body);
+    assert_eq!(ra.status, 200, "A answers: {}", cut(&ra.body));
+    assert_eq!(ra.cache(), "hit", "A from its kept points");
+    drop(a);
+    drop(b);
+}
+
+/// L28 (#835): a tail past the cap is refused with the usual error, in one
+/// statement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l28_a_tail_past_the_cap_is_a_422() {
+    skip_unless_live!();
+    let a_port: u16 = 31_917;
+    let b_port: u16 = 31_918;
+    // The cap is read from the fixture, so the servers start after it.
+    let db = live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_l28_it")).await;
+    stop_levels(&db).await;
+    let times = Times::new();
+    {
+        let loader_port: u16 = 31_919;
+        let loader = Server::spawn(loader_port, &db, "0", &[]);
+        load_fixture(loader.port, &times, 0.0);
+    }
+    let l1 = times.l1("rate(rc_total[5m])");
+    // Exactly L1's charge: L1 passes.
+    let cap = charge_of(&db, l1.start, l1.end).await;
+    let env_cap = cap.to_string();
+    let env = [("PULSUS_PROMQL_MAX_SAMPLES", env_cap.as_str())];
+    let b = Server::spawn(b_port, &db, "0", &env);
+    let a = Server::spawn(a_port, &db, "64MiB", &env);
+    Server::settle_poll();
+    assert_eq!(same(&a, &b, l1, "L1").cache(), "miss", "L28: L1");
+    // New series of 200 samples, one second apart, ending at the
+    // refresh's end: inside its tail's fetch window, past the cap together.
+    let refresh = l1.shifted(MINUTE);
+    let series = (cap + 1).div_ceil(200);
+    for i in 0..series {
+        push_series(
+            a.port,
+            "a",
+            labels("rc_total", &[("i", (100 + i).to_string())]),
+            (0..200)
+                .map(|k| (refresh.end - (199 - k) * 1_000, k as f64))
+                .collect(),
+        );
+    }
+    Server::settle_poll();
+    let ra = refresh.send(a.port);
+    let rb = refresh.send(b.port);
+    assert_eq!(rb.status, 422, "L28: B refuses: {}", cut(&rb.body));
+    assert_eq!(ra.status, 422, "L28: A refuses: {}", cut(&ra.body));
+    assert_eq!(ra.body, rb.body, "L28: the same refusal");
+    // One read of the tail, one statement over the tail's window alone
+    // (#835 addendum).
+    let sent = statements_of(&db, &query_id(&ra)).await;
+    assert_eq!(sent.len(), 1, "L28: A's statements {sent:#?}");
+    let lower = |q: &str| {
+        q.split("unix_milli > ")
+            .nth(1)
+            .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse::<i64>().ok())
+    };
+    assert!(
+        sent.iter()
+            .all(|q| lower(q).is_some_and(|lo| lo > refresh.end - 30 * MINUTE)),
+        "L28: a statement reads more than the tail: {sent:#?}"
+    );
     drop(a);
     drop(b);
 }
@@ -1659,8 +1782,8 @@ async fn a_routed_hit_past_the_sample_cap_is_refused_in_one_statement() {
     let ra = refresh.send(a.port);
     let rb = refresh.send(b.port);
     assert_eq!(rb.status, 422, "T22: B refuses: {}", rb.body);
-    assert_eq!(ra.status, 422, "T22: A refuses: {}", ra.body);
-    assert_eq!(ra.body, rb.body, "T22: the same refusal");
+    assert_eq!(ra.status, 200, "T22: A answers: {}", cut(&ra.body));
+    assert_eq!(ra.cache(), "hit", "T22: A from its kept points");
     let sent = statements_of(&db, &query_id(&ra)).await;
     println!(
         "T22: the refresh's result rows on A {:?}",
@@ -1928,6 +2051,19 @@ async fn a_raw_tail_merge_is_answered_but_not_stored() {
         labels("x", &[("s", "h".to_string())]),
         end + 30_000,
     );
+    // Visible before the repeat, so A's tail and B's read see the same
+    // samples.
+    let c = client(r.db.name()).await;
+    let landed = format!(
+        "SELECT toString(count()) AS s FROM {}.metric_hist_samples WHERE unix_milli = {}",
+        r.db.name(),
+        end + 30_000
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while count(&c, &landed).await == 0 {
+        assert!(Instant::now() < deadline, "T41: the histogram never landed");
+        std::thread::sleep(Duration::from_millis(200));
+    }
     let second = same(&r.a, &r.b, q.shifted(MINUTE), "T41 repeat");
     assert_eq!(second.cache(), "hit", "T41: the repeat");
     assert_eq!(second.through(), Some(kept), "T41: the merge is not stored");

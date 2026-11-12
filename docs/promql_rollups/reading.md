@@ -183,7 +183,7 @@ With `X-Pulsus-Explain: 1`, a routed selector has:
 
 | stage | note |
 |---|---|
-| `rollup_route` | `<table>, use <RollupUse>, step <s>, range <r>`, and ` (asked <written>)` after the range when it was rounded (`push_rollup_route`, `crates/pulsus-read/src/metrics/exec.rs:4693`) |
+| `rollup_route` | `<table>, use <RollupUse>, step <s>, range <r>`, and ` (asked <written>)` after the range when it was rounded (`push_rollup_route`, `crates/pulsus-read/src/metrics/exec.rs:4659`) |
 | `rollup_piece` | the selector's one statement and `<table>.<column> served (lo, hi]`, or `native histograms: read raw (rlo, rhi]` |
 
 `exactness` is `"rollup"` when the query's steps take the value of the bucket that holds them (R2), when a selector's range was rounded (R2a), or when a selector is read at a level, whatever rows it returned; a query read raw for native histograms is `"raw-exact"`, as with routing off (`exactness: if e.rollup`, `crates/pulsus-server/src/prom_api/encode.rs:396`).
