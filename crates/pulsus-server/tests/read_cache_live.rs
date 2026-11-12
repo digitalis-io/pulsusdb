@@ -2079,3 +2079,60 @@ async fn a_raw_tail_merge_is_answered_but_not_stored() {
     assert_eq!(third.cache(), "hit", "T41: the third");
     assert_eq!(third.through(), Some(kept), "T41: still the first entry");
 }
+
+// -- issue #836 ---------------------------------------------------------------
+
+/// The last step answered in a matrix answer, milliseconds.
+fn last_step(body: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(body).expect("a JSON answer");
+    v["data"]["result"]
+        .as_array()
+        .expect("a result array")
+        .iter()
+        .flat_map(|s| s["values"].as_array().cloned().unwrap_or_default())
+        .filter_map(|p| p[0].as_f64())
+        .map(|s| (s * 1000.0).round() as i64)
+        .max()
+}
+
+/// **E4 (issue #836): the read cache keeps no point past the answer's last
+/// answered step, and the next request reads the bucket built since.** An
+/// 8 h routed panel, the first level built to `W`: its answer ends at `W`
+/// and its kept points end at or before it; after one more bucket is built,
+/// the shifted repeat is a hit that answers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e4_the_kept_points_end_at_the_answered_steps() {
+    skip_unless_live!();
+    let a_port: u16 = 31_920;
+    let b_port: u16 = 31_921;
+    let r = rig(
+        live_db::ScopedDb::fresh(pulsus_testkit::test_db("pulsus_read_cache_t836_e4_it")).await,
+        a_port,
+        b_port,
+        &[],
+    )
+    .await;
+    let end = r.times.now0.div_euclid(MINUTE) * MINUTE;
+    let w = end - 10 * MINUTE;
+    write_level(&r.db, r.times.t0.div_euclid(MINUTE) * MINUTE, w).await;
+    Server::settle_poll();
+    let panel = Range::new("rate(rc_total[5m])", end - 8 * HOUR, end, MINUTE);
+    let first = same(&r.a, &r.b, panel, "E4 first");
+    assert_eq!(first.cache(), "miss", "E4: kept");
+    let answered = last_step(&first.body).expect("E4: an answer");
+    assert_eq!(answered, w, "E4: the answer ends at the built bucket");
+    let kept = first.through().expect("E4: a Through header");
+    assert!(
+        kept <= answered,
+        "E4: kept to {kept}, past the last answered step {answered}"
+    );
+    write_level(&r.db, w, w + MINUTE).await;
+    Server::settle_poll();
+    let second = same(&r.a, &r.b, panel.shifted(MINUTE), "E4 second");
+    assert_eq!(second.cache(), "hit", "E4: the repeat");
+    assert_eq!(
+        last_step(&second.body),
+        Some(w + MINUTE),
+        "E4: the bucket built since is answered"
+    );
+}

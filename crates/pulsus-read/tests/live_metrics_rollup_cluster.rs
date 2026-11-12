@@ -1182,9 +1182,10 @@ async fn local_series(f: &Fixture, node: &ChClient, after: i64) -> Vec<String> {
     out
 }
 
-/// **T6 (issue #810): a pushed level node is one statement on two shards**,
-/// each shard's series answered from that shard's own newest bucket: the
-/// last hour is built on shard 1 only, so its steps sum shard 1's series.
+/// **T6 (issue #810; #836): a pushed level node is one statement on two
+/// shards**, and ends at the newest bucket both shards have built: the last
+/// hour is built on shard 1 only, so no step after it is answered, and the
+/// steps before it are routing off's over both shards' series.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pushed_level_node_is_one_statement_on_two_shards() {
     if skipping() {
@@ -1218,11 +1219,10 @@ async fn a_pushed_level_node_is_one_statement_on_two_shards() {
         .await
         .expect("pushed");
     let mine = local_series(&f, &f.shard1, f.hi - HOUR).await;
-    let only = format!("sum(rate(m{{s=~\"{}\"}}[5m]))", mine.join("|"));
     let (b, _) = off
-        .query(&tenant, &parse(&only).expect("parse"), &p)
+        .query(&tenant, &parse("sum(rate(m[5m]))").expect("parse"), &p)
         .await
-        .expect("shard 1's series");
+        .expect("routing off");
     let sent = statements(&f.shard1, &comment).await;
     let mut failures = Vec::new();
     if sent.len() != 1 {
@@ -1239,12 +1239,17 @@ async fn a_pushed_level_node_is_one_statement_on_two_shards() {
                 .map(|(_, v)| f64::from_bits(*v))
         })
     };
-    let mut t = f.hi - HOUR + 6 * MIN;
+    let built = f.hi - HOUR;
+    let mut t = built - HOUR + 6 * MIN;
     let mut compared = 0;
     while t <= f.hi {
         match (at(&ca, t), at(&cb, t)) {
+            (None, _) if t > built => {}
+            (Some(x), _) if t > built => {
+                failures.push(format!("at {t}, past both shards' built point: {x}"))
+            }
             (Some(x), Some(y)) if (x - y).abs() <= 1e-9 * y.abs().max(1.0) => compared += 1,
-            other => failures.push(format!("at {t}: pushed and shard 1's series {other:?}")),
+            other => failures.push(format!("at {t}: pushed and routing off {other:?}")),
         }
         t += MIN;
     }
@@ -1260,6 +1265,111 @@ async fn a_pushed_level_node_is_one_statement_on_two_shards() {
     )
     .await;
     assert!(failures.is_empty(), "T6:\n{}", failures.join("\n"));
+}
+
+/// **E2 (issue #836): a panel ends at the newest bucket every shard has
+/// built.** A counter rising 1 every 15 s on forty series, half on each
+/// shard; shard 2's level 20 minutes behind shard 1's. `sum(rate(m[5m]))`
+/// over 8 h at 60 s, pushed and in process: the last step answered is shard
+/// 2's built point, no step is below the steady sum, one statement each.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panel_ends_at_the_newest_bucket_every_shard_has_built() {
+    if skipping() {
+        return;
+    }
+    let f = fixture(
+        pulsus_testkit::test_db("pulsus_read_it_rollup_cluster_t836_e2"),
+        &[],
+        true,
+    )
+    .await;
+    let fp = fp_of(0);
+    exec(
+        &f.shard1,
+        &format!(
+            "INSERT INTO metric_landing_dist (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+             SETTINGS insert_distributed_sync = 1 SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, 'm', {fp}, \
+                    toInt64({lo}) + toInt64(h) * {HOUR} + 1000, concat('{{\"s\":\"', toString(s), '\"}}'), 0 \
+             FROM (SELECT toUInt32(number) AS s FROM numbers(40)) ARRAY JOIN [0, 1, 2] AS h",
+            lo = f.lo
+        ),
+    )
+    .await;
+    exec(
+        &f.shard1,
+        &format!(
+            "INSERT INTO metric_landing_dist (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SETTINGS insert_distributed_sync = 1 SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, 'm', {fp}, \
+                    toInt64({lo}) + toInt64(i) * 15000 + 2000, toFloat64(i) \
+             FROM (SELECT toUInt32(a.number) AS s, b.number AS i FROM numbers(40) AS a, numbers(1, {}) AS b)",
+            (f.hi - f.lo) / 15_000 - 1,
+            lo = f.lo
+        ),
+    )
+    .await;
+    let behind = f.hi - 20 * MIN;
+    build_level_to(&f, behind).await;
+    exec(&f.shard1, &first_level_insert(&f.ctx, behind, f.hi)).await;
+    exec(
+        &f.shard1b,
+        &format!("SYSTEM SYNC REPLICA {}.metric_samples_60s", f.db),
+    )
+    .await;
+    let (cache, slot) = warm(&f).await;
+    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
+    let p = MetricQueryParams {
+        start_ms: f.hi - 8 * HOUR,
+        end_ms: f.hi,
+        step_ms: MIN,
+    };
+    let steady = 40.0 / 15.0;
+    let mut failures = Vec::new();
+    for push in [true, false] {
+        let comment = format!(
+            "{}_e2_{}_{}",
+            f.db,
+            u8::from(push),
+            chrono::Utc::now().timestamp_millis()
+        );
+        let e = level_engine(&f, &cache, &slot, push, Some(&comment)).await;
+        let (r, _) = e
+            .query(&tenant, &parse("sum(rate(m[5m]))").expect("parse"), &p)
+            .await
+            .expect("the panel");
+        let sent = statements(&f.shard1, &comment).await;
+        if sent.len() != 1 {
+            failures.push(format!("push {push}: {} statements", sent.len()));
+        }
+        let points: Vec<(i64, f64)> = cells(&r)
+            .into_values()
+            .next()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(t, v)| (t, f64::from_bits(v)))
+            .collect();
+        let last = points.last().map(|p| p.0);
+        if last != Some(behind) {
+            failures.push(format!(
+                "push {push}: the last step {last:?}, shard 2 built to {behind}"
+            ));
+        }
+        for (t, v) in &points {
+            if *t >= f.lo + 10 * MIN && *v < steady * (1.0 - 1e-9) {
+                failures.push(format!(
+                    "push {push}: at {t} {v}, under the steady {steady}"
+                ));
+            }
+        }
+    }
+    exec(
+        &f.bootstrap,
+        &format!(
+            "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
+            f.db
+        ),
+    )
+    .await;
+    assert!(failures.is_empty(), "E2:\n{}", failures.join("\n"));
 }
 
 /// **T28 (issue #810): an unlisted selector reads on two shards** in one
@@ -1443,6 +1553,17 @@ async fn an_unlisted_selector_costs_only_its_own_guard() {
             let near = engine(shard1_config(&f.db), format!("{comment}_near")).await;
             let (want, _) = near.query(&tenant, &one, &p).await.expect("near");
             let (got, want) = (cells(&r), cells(&want));
+            // Issue #836: the query ends at its reads' earliest built point;
+            // `b`'s may be the lagging replica's, so `a` is compared to it.
+            let cut = got
+                .values()
+                .filter_map(|pts| pts.last().map(|p| p.0))
+                .max()
+                .unwrap_or(i64::MIN);
+            let want: std::collections::BTreeMap<String, Vec<(i64, u64)>> = want
+                .into_iter()
+                .map(|(k, v)| (k, v.into_iter().filter(|p| p.0 <= cut).collect()))
+                .collect();
             if want.is_empty() || want.iter().any(|(k, v)| got.get(k) != Some(v)) {
                 failures.push(format!(
                     "T33: a's rows differ from shard 1's: {:?}",

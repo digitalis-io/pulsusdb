@@ -280,7 +280,7 @@ stages and collects the ones that become predicates on `body`. `has_unpushed_dro
 |---|---|---|
 | `\|= "text"` | `(multiSearchAny(lowerUTF8(body), ['text']) AND body LIKE '%text%')` | *emitted today*, `logql/predicate.rs:1532` via `escape.rs:87`. `%`, `_` and `\` inside the search text are escaped so they match themselves. The lowered-literal check in front is what `idx_body_ngrams` on `lowerUTF8(body)` reads (issue #839); a needle with no run of four characters has none |
 | `!= "text"` | `NOT (body LIKE '%text%')` | *emitted today*, `logql/predicate.rs:555` |
-| `\|~ "re"` | `(<check> AND match(body, 're'))` | *emitted today*, `logql/predicate.rs:1602`. Not anchored: a LogQL line filter searches for a substring. The check holds the literals the pattern requires, and is absent when it requires none (issue #839) |
+| `\|~ "re"` | `match(body, 're')` | *emitted today*, `logql/predicate.rs:1602`. Not anchored: a LogQL line filter searches for a substring. A pattern that requires a literal run of at least 4 characters is preceded by a lowered-literal check, `(multiSearchAny(lowerUTF8(body), [<runs>]) AND match(body, 'p'))`; `'re'` requires none, so it has no check (issue #839) |
 | `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, `logql/predicate.rs:555` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))`, each alternative behind its own check where it has one | *emitted today*, `logql/predicate.rs:534`. A filter with one value is not wrapped, so its text is unchanged |
 | `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*. `is_pushable_line_filter` returns `false` (`plan.rs:4400`), the stage is skipped, and **the walk continues** — a later literal filter still compiles. What holds it back is pruning, not information — §5.1 |
@@ -2337,7 +2337,7 @@ FROM log_samples
 PREWHERE service = 'checkout'
 WHERE org_id = '' AND fingerprint IN (<fps>)
   AND timestamp_ns > <start> AND timestamp_ns <= <end>
-  AND match(body, 'CONN_REFUSED')
+  AND (multiSearchAny(lowerUTF8(body), ['conn_refused']) AND match(body, 'CONN_REFUSED'))
 ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC
 LIMIT 100
 ```

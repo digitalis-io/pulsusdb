@@ -930,7 +930,12 @@ impl MetricsEngine {
             .collect();
         let reads = read_mix(&arms);
         let rollup_before = explain.as_ref().is_some_and(|e| e.rollup);
-        let (data, raw) = match lattice {
+        // Issue #836: the width the reads are routed at.
+        let route_res = match &lattice {
+            None => routing.as_ref().map(|(_, r)| *r),
+            Some((_, l)) => Some(l.width),
+        };
+        let Read { data, raw, built } = match lattice {
             None => {
                 self.read_selectors(
                     tenant,
@@ -985,7 +990,7 @@ impl MetricsEngine {
         // D9: a statement counted a native-histogram sample of a routed
         // selector: every read returned, or was read again for, the raw
         // samples, and the query is evaluated as with routing off.
-        let plan = if raw {
+        let mut plan = if raw {
             if let Some(e) = explain.as_mut() {
                 e.rollup = rollup_before;
             }
@@ -993,6 +998,19 @@ impl MetricsEngine {
         } else {
             plan
         };
+        // Issue #836: no step after the newest bucket every shard has built
+        // is answered; an instant query read at a level is evaluated as of
+        // that bucket, keeping the request's time.
+        let built = built.filter(|_| !raw);
+        if let (Some(b), Some(res)) = (built, route_res)
+            && p.step_ms == 0
+            && reads == ReadMix::AllRouted
+            && b < p.end_ms
+        {
+            let at = b.div_euclid(res.max(1)) * res.max(1);
+            plan.params.start_ms = at;
+            plan.params.end_ms = at;
+        }
 
         // Issue #93 (finding 2): `pulsus_promql::evaluate` is CPU-bound and
         // multi-hundred-ms at scale — offload it off the reactor onto the
@@ -1045,7 +1063,12 @@ impl MetricsEngine {
                 raw,
             };
         }
-        Ok((value_to_query_result(value), annotations))
+        let result = value_to_query_result(value);
+        let result = match built {
+            Some(b) if p.step_ms > 0 => answered_through(result, b),
+            _ => result,
+        };
+        Ok((result, annotations))
     }
 
     /// Issue #18: a range query filled from a level's bucket ends `(g0,
@@ -1062,7 +1085,7 @@ impl MetricsEngine {
         budget: &SampleBudget,
         explain: Option<&mut PlanExplain>,
         raw_plan: &pulsus_promql::QueryPlan,
-    ) -> Result<(SeriesData, bool), ReadError> {
+    ) -> Result<Read, ReadError> {
         let qa = bucket_ends(p, w, gu);
         let mut first = plan.clone();
         first.params = qa.plan_params(self.config.experimental_functions, self.lookback_ms);
@@ -1106,7 +1129,7 @@ impl MetricsEngine {
         mut explain: Option<&mut PlanExplain>,
         raw_plan: &pulsus_promql::QueryPlan,
         read_until: Option<i64>,
-    ) -> Result<(SeriesData, bool), ReadError> {
+    ) -> Result<Read, ReadError> {
         let plan_params = plan.params;
         // Issue #579 part 4: each selector's arm, by `routed_series`' own
         // test, after the range is rounded and before the verdicts.
@@ -1115,6 +1138,21 @@ impl MetricsEngine {
             .iter()
             .map(|sel| (sel.id, arm_of(sel, &plan_params, routing.as_ref())))
             .collect();
+        // Issue #836: an instant query read at a level starts its window the
+        // level's build delay earlier, so it can be evaluated as of the
+        // newest bucket built.
+        let instant_lead = match routing.as_ref() {
+            Some((levels, res)) if q.step_ms == 0 => super::rollup::build_age_ms(levels, *res),
+            _ => 0,
+        };
+        let read_window =
+            |sel: &SelectorSpec, p: &pulsus_promql::PlanParams, until: Option<i64>| {
+                let (lo, hi) = read_window(sel, p, until);
+                match arms.get(&sel.id) {
+                    Some(super::grouped::Arm::Level(_)) => (lo - instant_lead, hi),
+                    _ => (lo, hi),
+                }
+            };
         // Issue #810 (addendum r6): every concrete-name selector resolved
         // once, over its read's own fetch window, before any statement is
         // rendered; the reads and every histogram count use it.
@@ -1766,6 +1804,9 @@ impl MetricsEngine {
         let pushes = pending.into_iter().map(|p| self.run_push(p, budget));
         let (fetched, pushed) = join(join_all(fetches), join_all(pushes)).await;
 
+        // Issue #836: the earliest built point of the reads served from a
+        // level.
+        let mut built: Option<i64> = None;
         // Addendum r6: the routed reads that returned level rows, read again
         // raw if the query turns out raw.
         let mut again: Vec<(SelectorId, Again)> = Vec::new();
@@ -1777,6 +1818,13 @@ impl MetricsEngine {
             if let Some(mut trace) = trace {
                 if let Some(a) = trace.again.take() {
                     again.push((sel.id, *a));
+                }
+                // In step time: a selector read with an offset reads its
+                // data that much earlier; one pinned by `@` reads the same
+                // data at every step, and cuts none.
+                if let Some(b) = trace.built.filter(|_| sel.at_ms.is_none()) {
+                    let b = b.saturating_add(sel.offset_ms);
+                    built = Some(built.map_or(b, |x: i64| x.min(b)));
                 }
                 if let Some(e) = explain.as_mut() {
                     for (sql, note) in trace.stages {
@@ -1921,6 +1969,13 @@ impl MetricsEngine {
                 if let Some(a) = trace.again.take() {
                     again.push((selector, *a));
                 }
+                if let Some(b) = trace
+                    .built
+                    .filter(|_| plan.selectors[selector].at_ms.is_none())
+                {
+                    let b = b.saturating_add(plan.selectors[selector].offset_ms);
+                    built = Some(built.map_or(b, |x: i64| x.min(b)));
+                }
                 if let Some(e) = explain.as_mut() {
                     let sel = &plan.selectors[selector];
                     for (sql, note) in trace.stages {
@@ -1965,7 +2020,7 @@ impl MetricsEngine {
                 data.insert_pushed(self_pos, node);
             }
         }
-        Ok((data, raw))
+        Ok(Read { data, raw, built })
     }
 
     /// The fetch plan of a concrete-name selector from its resolution —
@@ -2978,6 +3033,12 @@ impl MetricsEngine {
                     table: &l.table,
                     res_ms: l.res_ms,
                     served: (l.window.0, chunk_end.min(l.window.1)),
+                    // Issue #836: on a range grid, no step after the side's
+                    // built point.
+                    built: (shape.grid().points > 1).then(|| super::grouped_sql::BuiltCut {
+                        shard: self.shard_expr(),
+                        shards: self.level_shards(),
+                    }),
                 }),
             })
             .collect();
@@ -3084,6 +3145,7 @@ impl MetricsEngine {
             push_rollup_route(e, sel, &route, p);
         }
         SelectorFetchPlan::Rollup(Box::new(RollupFetch {
+            shards: self.level_shards(),
             route,
             pairs,
             known,
@@ -3102,7 +3164,26 @@ impl MetricsEngine {
             samples: &self.config.samples_table,
             hist: &self.config.hist_samples_table,
             labels: &self.config.labels_table,
+            shard: self.shard_expr(),
         }
+    }
+
+    /// Issue #836: the expression naming a level row's shard: `_shard_num`
+    /// over the distributed tables, else `1`.
+    fn shard_expr(&self) -> &'static str {
+        if self.config.distributed {
+            "_shard_num"
+        } else {
+            "1"
+        }
+    }
+
+    /// Issue #836: the shard count a level's built point is taken over.
+    fn level_shards(&self) -> u32 {
+        self.rollup_levels
+            .as_ref()
+            .and_then(|slot| slot.get())
+            .map_or(1, |l| l.shards.max(1))
     }
 
     /// Addendum r6: a selector read again raw, its floats and native
@@ -3149,6 +3230,7 @@ impl MetricsEngine {
             )],
             served_from_level: false,
             again: None,
+            built: None,
         };
         Ok((series, Some(trace)))
     }
@@ -3171,7 +3253,8 @@ impl MetricsEngine {
                 plan.sql.clone(),
                 &self.series_settings(),
                 budget,
-                |r: &RoutedRow| matches!(r.arm, 0 | 1 | 3),
+                // Issue #836: a run row (ID 0) is not charged.
+                |r: &RoutedRow| matches!(r.arm, 0 | 1 | 3) && r.fingerprint != RUN_ROW_ID,
             )
             .await?;
         let hist_n = rows.iter().find(|r| r.arm == 4).map_or(0, |r| r.t);
@@ -3187,6 +3270,7 @@ impl MetricsEngine {
                 )],
                 served_from_level: false,
                 again: None,
+                built: None,
             };
             return Ok((series, Some(trace)));
         }
@@ -3205,7 +3289,10 @@ impl MetricsEngine {
             }));
             seq.clear();
         };
-        for r in rows.iter().filter(|r| r.arm == 0) {
+        for r in rows
+            .iter()
+            .filter(|r| r.arm == 0 && r.fingerprint != RUN_ROW_ID)
+        {
             if at.is_some_and(|fp| fp != r.fingerprint) {
                 flush(at.expect("a series"), &mut seq, &mut points);
             }
@@ -3238,11 +3325,18 @@ impl MetricsEngine {
             raw_window: plan.raw_window,
         };
         let (lo, hi) = plan.window;
+        // Issue #836: the newest bucket every shard has built.
+        let runs: Vec<(u32, i64)> = rows
+            .iter()
+            .filter(|r| r.arm == 0 && r.fingerprint == RUN_ROW_ID)
+            .map(|r| (r.shard, r.t))
+            .collect();
+        let built = super::rollup::built_point(&runs, plan.shards, lo);
         let trace = RollupTrace {
             stages: vec![(
                 plan.sql,
                 format!(
-                    "{}.{} served ({lo}, {hi}]",
+                    "{}.{} served ({lo}, {hi}], built to {built}",
                     plan.route.table,
                     column_of(use_)
                 ),
@@ -3250,6 +3344,7 @@ impl MetricsEngine {
             // D6: a selector read at a level marks the answer `rollup`.
             served_from_level: true,
             again: Some(Box::new(again)),
+            built: Some(built),
         };
         Ok((series, Some(trace)))
     }
@@ -4549,6 +4644,40 @@ fn read_mix(arms: &[super::grouped::Arm]) -> ReadMix {
     }
 }
 
+/// Issue #836: a range answer's points at or before `b`, a series with
+/// none dropped.
+fn answered_through(result: QueryResult, b: i64) -> QueryResult {
+    match result {
+        QueryResult::Matrix(mut m) => {
+            for s in &mut m {
+                s.points.retain(|(t, _)| *t <= b);
+            }
+            m.retain(|s| !s.points.is_empty());
+            QueryResult::Matrix(m)
+        }
+        QueryResult::MatrixHist(mut m) => {
+            for s in &mut m {
+                s.points.retain(|(t, _)| *t <= b);
+            }
+            m.retain(|s| !s.points.is_empty());
+            QueryResult::MatrixHist(m)
+        }
+        other => other,
+    }
+}
+
+/// Issue #836: the ID a level's run rows carry.
+const RUN_ROW_ID: Fingerprint = Fingerprint::from_raw(0);
+
+/// What [`MetricsEngine::read_selectors`] returns: the data, whether a
+/// statement counted a native histogram (D9), and (issue #836) the earliest
+/// built point of the reads served from a level.
+struct Read {
+    data: SeriesData,
+    raw: bool,
+    built: Option<i64>,
+}
+
 /// Issue #810 (D9, addendum r6): a read's routed selectors the label cache
 /// lists, each with its native-histogram condition over its window in the
 /// routing-off plan; every selector's window there; and whether any
@@ -4996,6 +5125,8 @@ struct RollupFetch {
     window: (i64, i64),
     /// Its window in the routing-off plan, read with `hist_n > 0` (D9).
     raw_window: (i64, i64),
+    /// Issue #836: the shards its built point is taken over.
+    shards: u32,
 }
 
 impl RollupFetch {
@@ -5101,6 +5232,9 @@ pub(super) struct RollupTrace {
     /// Addendum r6: the read returned level rows; how it is read again raw
     /// should the query turn out raw.
     again: Option<Box<Again>>,
+    /// Issue #836: the read's built point, from the run rows its level
+    /// scan returned: no step after it is answered.
+    built: Option<i64>,
 }
 
 /// A selector's fetched series and, for a routed selector, its trace.

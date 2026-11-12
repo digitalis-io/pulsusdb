@@ -680,6 +680,18 @@ pub struct LevelRead<'a> {
     pub res_ms: i64,
     /// `(lo, min(chunk end, hi)]`, `hi` the fetch window's end (D3).
     pub served: (i64, i64),
+    /// Issue #836: on a range grid, the side's built point is read with its
+    /// rows and no step after it is answered; `None` reads as before.
+    pub built: Option<BuiltCut<'a>>,
+}
+
+/// Issue #836: how a level side's built point is read: the expression
+/// naming a row's shard (`_shard_num` over a distributed table, else `1`)
+/// and the shards it is the minimum over.
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltCut<'a> {
+    pub shard: &'a str,
+    pub shards: u32,
 }
 
 /// Issue #18 part 2c: how a side's statements name its series: the ID
@@ -798,7 +810,37 @@ pub fn level_rows(
     table: &str,
     (lo, hi): (i64, i64),
     cap: usize,
+    built: Option<BuiltCut<'_>>,
 ) -> String {
+    // Issue #836: the scan also returns the level's run rows overlapping the
+    // window, so the replica answering a shard's rows answers its built
+    // point: each shard's newest run-row end, the minimum over the shards,
+    // `lo` when a shard has none; every row carries it.
+    if let Some(BuiltCut { shard, shards }) = built {
+        return format!(
+            "SELECT fingerprint, rows0, built FROM (
+SELECT fingerprint, rows0, ifNull(max(b0) OVER (), toInt64({lo})) AS built FROM (
+SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0,
+  if(fingerprint = 0,
+     if(length(arrayDistinct(groupArray(shard))) < {shards}, toInt64({lo}),
+        arrayMin(arrayMap(h -> arrayMax(arrayFilter((e, k) -> k = h, groupArray(t_end), groupArray(shard))),
+                          arrayDistinct(groupArray(shard))))),
+     NULL) AS b0
+FROM (
+  SELECT fingerprint, t_end, t_last, last, inc, toUInt32({shard}) AS shard
+  FROM {table}
+  WHERE kind = 0 AND org_id = {} AND t_end > {lo} AND t_end <= {hi} AND {} AND hist_n = 0
+     OR kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > {lo} AND t_last < {hi} AND hist_n = 0{}
+)
+GROUP BY fingerprint
+)
+)
+WHERE fingerprint != 0",
+            tenant.sql_literal(),
+            series.filter(true, cap),
+            series.gate(cap),
+        );
+    }
     format!(
         "SELECT fingerprint, arraySort(arrayMap(x -> (x.1, x.2, x.3, x.4), groupArray((t_end, t_last, last, inc)))) AS rows0
 FROM (
@@ -820,13 +862,14 @@ fn counter_elements(
     level: &LevelRead<'_>,
     cap: usize,
 ) -> String {
+    let built = if level.built.is_some() { ", built" } else { "" };
     format!(
-        "SELECT fingerprint, arrayMap(r -> (r.1, toInt64({}), r.2, r.3, r.4), rows0) AS es
+        "SELECT fingerprint, arrayMap(r -> (r.1, toInt64({}), r.2, r.3, r.4), rows0) AS es{built}
 FROM (
 {}
 )",
         level.res_ms,
-        level_rows(tenant, series, level.table, level.served, cap)
+        level_rows(tenant, series, level.table, level.served, cap, level.built)
     )
 }
 
@@ -846,9 +889,15 @@ pub fn counter_gather(
     cap: usize,
 ) -> String {
     let elements = counter_elements(tenant, series, level, cap);
+    // Issue #836: the side's built point, carried to its steps.
+    let (b, out, any) = if level.built.is_some() {
+        (" built,", ", built", ", any(built) AS built")
+    } else {
+        ("", "", "")
+    };
     format!(
-        "SELECT fingerprint, arm, raw FROM (
-SELECT fingerprint, toUInt8(0) AS arm,
+        "SELECT fingerprint, arm, raw{out} FROM (
+SELECT fingerprint,{b} toUInt8(0) AS arm,
   arrayMap(q -> (q.1, q.4), arraySort(arrayFilter(q -> q.4 != {STALE_NAN_DECIMAL}, arrayFlatten(arrayMap((x, i, c) ->
     if(s = 0 OR i < s,
        if(isNaN(x.4) AND (x.2 = 0 OR x.3 > 0), [(x.3, i, 1, reinterpretAsUInt64(x.4))], []),
@@ -858,18 +907,18 @@ SELECT fingerprint, toUInt8(0) AS arm,
                [(x.3, i, 1, reinterpretAsUInt64(c))])),
     e, arrayEnumerate(e), cs))))) AS raw
 FROM (
-  SELECT fingerprint, e, s,
+  SELECT fingerprint,{b} e, s,
     arrayConcat(arrayWithConstant(toUInt64(if(s = 0, length(e), s - 1)), 0.),
                 if(s = 0, CAST([], 'Array(Float64)'),
                    arrayCumSum(arrayMap((x, d, i) -> if(i = 1, x.4, d), arraySlice(e, s), arraySlice(ds, s), arrayEnumerate(arraySlice(e, s)))))) AS cs
   FROM (
-    SELECT fingerprint, e, s,
+    SELECT fingerprint,{b} e, s,
       arrayMap((x, pb) -> if(x.2 > 0, x.5, if(isNaN(x.4), 0., if(x.4 >= pb, x.4 - pb, x.4))), e,
                arrayPushFront(arrayPopBack(arrayFill((v, ok) -> ok, arrayMap(x -> x.4, e), sp)), nan)) AS ds
     FROM (
-      SELECT fingerprint, e, arrayMap(x -> (x.2 = 0 OR x.3 > 0) AND NOT isNaN(x.4), e) AS sp, arrayFirstIndex(b -> b, sp) AS s
+      SELECT fingerprint,{b} e, arrayMap(x -> (x.2 = 0 OR x.3 > 0) AND NOT isNaN(x.4), e) AS sp, arrayFirstIndex(b -> b, sp) AS s
       FROM (
-        SELECT fingerprint, arraySort(x -> (x.1, x.2, reinterpretAsUInt64(x.4), x.3, x.5), arrayFlatten(groupArray(es))) AS e
+        SELECT fingerprint, arraySort(x -> (x.1, x.2, reinterpretAsUInt64(x.4), x.3, x.5), arrayFlatten(groupArray(es))) AS e{any}
         FROM (
 {elements}
         )
@@ -931,7 +980,12 @@ pub fn series_steps(side: &SideSql<'_>, grid: Grid, cap: usize) -> String {
             )
         }
     };
+    // Issue #836: a level side's steps after its built point are dropped.
+    let cut = side.level.as_ref().is_some_and(|l| l.built.is_some());
     let mut keep = Vec::new();
+    if cut {
+        keep.push("grid_start + gi * grid_step <= built".to_string());
+    }
     if raw {
         keep.push(format!(
             "arm = toUInt8(arrayExists(x -> gi >= x.1 AND gi < x.2, [(0, {})]))",
@@ -949,13 +1003,14 @@ pub fn series_steps(side: &SideSql<'_>, grid: Grid, cap: usize) -> String {
         format!("\nWHERE {}", keep.join(" AND "))
     };
     let value = value_text(side.func, &range, side.scale);
-    let windows = series_windows(&gather, " arm,", &range, side.func);
+    let carry = if cut { " arm, built," } else { " arm," };
+    let windows = series_windows(&gather, carry, &range, side.func);
     format!(
         "SELECT fingerprint, toUInt32(st.4) AS gi,
   st.1.2 AS i_f, st.1.1 AS t_f, st.1.3 AS y_f, st.2.2 AS i_l, st.2.1 AS t_l, st.2.3 AS y_l, st.3 AS result,
 {value}
 FROM (
-  SELECT fingerprint, arm, arrayJoin(sts) AS st
+  SELECT fingerprint,{carry} arrayJoin(sts) AS st
   FROM (
 {windows}
   )
@@ -1957,6 +2012,7 @@ mod tests {
             table: "metric_samples_60s",
             res_ms: 60_000,
             served: T11_WINDOW,
+            built: None,
         }
     }
 
