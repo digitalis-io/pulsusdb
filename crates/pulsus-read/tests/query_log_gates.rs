@@ -16070,18 +16070,25 @@ mod one_raw_statement {
         let relative: Vec<String> = answer
             .iter()
             .map(|line| {
-                let (labels, points) = line.rsplit_once(' ').unwrap_or((line, ""));
-                let points: Vec<String> = points
-                    .split(',')
-                    .map(|p| match p.split_once(':') {
-                        Some((at, v)) => match at.parse::<i64>() {
-                            Ok(at) => format!("{}:{v}", at - t),
-                            Err(_) => p.to_string(),
-                        },
-                        None => p.to_string(),
-                    })
-                    .collect();
-                format!("{labels} {}", points.join(","))
+                // `{labels} {t}:{value},…`: a time follows the labels' `] `
+                // or a `,`, and is all digits up to its `:`.
+                let (labels, points) = line.split_once("] ").unwrap_or((line, ""));
+                let mut out = format!("{labels}] ");
+                let mut rest = points;
+                let mut at_start = true;
+                while !rest.is_empty() {
+                    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+                    if at_start && digits > 0 && rest[digits..].starts_with(':') {
+                        let at: i64 = rest[..digits].parse().expect("a time");
+                        out.push_str(&(at - t).to_string());
+                        rest = &rest[digits..];
+                    }
+                    let c = rest.chars().next().expect("a char");
+                    out.push(c);
+                    at_start = c == ',';
+                    rest = &rest[c.len_utf8()..];
+                }
+                out
             })
             .collect();
         let mut d = std::collections::hash_map::DefaultHasher::new();
