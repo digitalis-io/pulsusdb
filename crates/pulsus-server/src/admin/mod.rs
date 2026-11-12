@@ -24,7 +24,10 @@ pub(crate) mod views;
 /// The admin routes, behind the admin pair (`Config::admin_pair`). The
 /// pages refuse with the plain `401`, the API with the JSON one; every
 /// response carries the two headers `headers` sets.
-pub(crate) fn router(config: &Config) -> Router<AppState> {
+pub(crate) fn router(
+    config: &Config,
+    _metrics: Option<&'static crate::request_metrics::RequestMetrics>,
+) -> Router<AppState> {
     let page_auth = crate::middleware::admin_auth_layer(config, false);
     let api_auth = crate::middleware::admin_auth_layer(config, true);
     let pages = Router::new()
@@ -110,6 +113,7 @@ mod tests {
             )),
             started_at: SystemTime::now(),
             tail: Arc::new(TailRuntime::for_tests()),
+            request_metrics: crate::request_metrics::RequestMetrics::leak_new(),
         }
     }
 

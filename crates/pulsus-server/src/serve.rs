@@ -185,6 +185,7 @@ pub async fn run(config: Config) -> ExitCode {
             tail_shutdown_rx,
             config.reader.tail_max_connections,
         )),
+        request_metrics: crate::request_metrics::RequestMetrics::leak_new(),
     };
 
     let router = match app::build_router(state, &config) {
@@ -1167,6 +1168,7 @@ mod tests {
                 tail_rx,
                 config.reader.tail_max_connections,
             )),
+            request_metrics: crate::request_metrics::RequestMetrics::leak_new(),
         };
         let router = app::build_router(state, &config).expect("router builds");
 

@@ -77,6 +77,9 @@ pub(crate) struct AppState {
     /// connection-slot semaphore. One bundled field so the ~12
     /// `AppState` constructors stay a one-line change.
     pub(crate) tail: Arc<TailRuntime>,
+    /// Issue #838: this process's request counts and durations per route,
+    /// rendered onto `/metrics`.
+    pub(crate) request_metrics: &'static crate::request_metrics::RequestMetrics,
 }
 
 /// The live-tail runtime (issue #74): `shutdown` is the process-wide
@@ -195,19 +198,34 @@ pub(crate) fn build_router(state: AppState, config: &Config) -> Result<Router, S
     // their `503`, `408` and `401` carry the request's id as well.
     authed = authed.layer(axum::middleware::from_fn(crate::request_id::stamp));
 
-    let router = ops::ops_public_router().merge(authed);
-
-    let router = router
-        .layer(middleware::trace_layer())
-        .layer(middleware::compression_layer())
-        .layer(middleware::cors_layer(config)?);
+    let router = outer_layers(
+        ops::ops_public_router().merge(authed),
+        config,
+        Some(state.request_metrics),
+    )?;
 
     // Issue #746: the admin router, outside the CORS layer. `admin` comes
     // first so the merge keeps the data-plane router's fallback, behind its
     // authentication and CORS layers, for every unmatched path.
-    let router = crate::admin::router(config).merge(router);
+    let router = crate::admin::router(config, Some(state.request_metrics)).merge(router);
 
     Ok(router.with_state(state))
+}
+
+/// The data plane's global layers: trace → compression → CORS, CORS
+/// outermost, and (issue #838) the request-metrics layer outside CORS in
+/// CORS's own router layer. `None` exists only so the allocation test can
+/// measure the same path without the metrics layer; production passes
+/// `Some`.
+fn outer_layers(
+    router: Router<AppState>,
+    config: &Config,
+    _metrics: Option<&'static crate::request_metrics::RequestMetrics>,
+) -> Result<Router<AppState>, ServeError> {
+    Ok(router
+        .layer(middleware::trace_layer())
+        .layer(middleware::compression_layer())
+        .layer(middleware::cors_layer(config)?))
 }
 
 #[cfg(test)]
@@ -238,6 +256,7 @@ mod tests {
             )),
             started_at: std::time::SystemTime::now(),
             tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
+            request_metrics: crate::request_metrics::RequestMetrics::leak_new(),
         }
     }
 
@@ -927,5 +946,172 @@ mod tests {
                 assert_eq!(mounted, StatusCode::OK, "{ctx}: GET /admin/ with a:b");
             }
         }
+    }
+
+    /// Issue #838 T5: with every route mounted, the `route` values are
+    /// exactly the templates plus `unmatched`, whatever paths are sent.
+    #[tokio::test]
+    async fn every_mounted_template_is_its_own_route_value_and_nothing_else() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        use crate::request_metrics::{ROUTE_TEMPLATES, UNMATCHED};
+
+        let state = test_state();
+        let t = state.request_metrics;
+        let cfg = Config {
+            compat_endpoints: true,
+            ..Config::default()
+        };
+        let router = build_router(state, &cfg).expect("router builds");
+        let filled = |template: &str| -> String {
+            let mut out = String::new();
+            let mut in_param = false;
+            for c in template.chars() {
+                match c {
+                    '{' => in_param = true,
+                    '}' => {
+                        in_param = false;
+                        out.push('x');
+                    }
+                    _ if !in_param => out.push(c),
+                    _ => {}
+                }
+            }
+            out
+        };
+        let paths: Vec<String> = ROUTE_TEMPLATES
+            .iter()
+            .map(|t| filled(t))
+            .chain(["/zz/1", "/zz/2", "/api/v1/x"].map(String::from))
+            .collect();
+        for path in &paths {
+            let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let sent = async {
+                let res = router.clone().oneshot(request).await.unwrap();
+                axum::body::to_bytes(res.into_body(), usize::MAX).await.ok();
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), sent)
+                .await
+                .unwrap_or_else(|_| panic!("GET {path} did not finish in 5 s"));
+        }
+        let mut s = String::new();
+        t.render_into(&mut s);
+        let seen: std::collections::BTreeSet<&str> = s
+            .lines()
+            .filter_map(|l| l.strip_prefix("pulsus_http_requests_total{route=\""))
+            .map(|rest| &rest[..rest.find('"').expect("closing quote")])
+            .collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ROUTE_TEMPLATES.iter().copied().chain([UNMATCHED]).collect();
+        assert_eq!(expected.len(), 81);
+        assert_eq!(seen, expected, "{s}");
+    }
+
+    /// Issue #838 T16: the allocations the metrics layer adds per request,
+    /// measured on this thread with the test build's counting allocator.
+    #[test]
+    fn the_metrics_layer_costs_the_stated_allocations() {
+        use axum::body::{Body, Bytes};
+        use axum::http::Request;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        use crate::request_metrics::RequestMetrics;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let fixture = || {
+            Router::<AppState>::new()
+                .route("/ready", get(|| async { "ok" }))
+                .route(
+                    "/s",
+                    get(|| async {
+                        let chunks = [&b"a"[..], &b"b"[..], &b"c"[..]]
+                            .map(|c| Ok::<_, std::convert::Infallible>(Bytes::from_static(c)));
+                        Body::from_stream(futures::stream::iter(chunks))
+                    }),
+                )
+        };
+        let data_plane = |m: Option<&'static RequestMetrics>| {
+            outer_layers(fixture(), &Config::default(), m)
+                .unwrap()
+                .with_state(test_state())
+        };
+        let admin = |m: Option<&'static RequestMetrics>| {
+            crate::admin::router(&Config::default(), m).with_state(test_state())
+        };
+        let get_ready = || Request::get("/ready").body(Body::empty()).unwrap();
+        let preflight = || {
+            Request::options("/ready")
+                .header("Origin", "http://a.test")
+                .header("Access-Control-Request-Method", "GET")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let get_stream = || Request::get("/s").body(Body::empty()).unwrap();
+        let get_css = || {
+            Request::get("/admin/admin.css")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        async fn one(router: &Router, req: Request<Body>) -> StatusCode {
+            let res = router.clone().oneshot(req).await.unwrap();
+            let status = res.status();
+            axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            status
+        }
+        // Ten requests, each measured on its own, counted as ten times the
+        // fewest allocations any of them made. The admin stack's request id
+        // is hex text of random bits, and its formatting costs one more
+        // allocation on some requests (23 of 400 in one measurement), which
+        // a single count over all ten would include.
+        let count = |router: &Router, make: &dyn Fn() -> Request<Body>| -> u64 {
+            for _ in 0..3 {
+                rt.block_on(one(router, make()));
+            }
+            let fewest = (0..10)
+                .map(|_| {
+                    let (status, allocations, _peak) =
+                        crate::probe_alloc::measure(|| rt.block_on(one(router, make())));
+                    assert!(!status.is_server_error(), "{status}");
+                    allocations
+                })
+                .min()
+                .expect("ten requests");
+            10 * fewest
+        };
+
+        let t = RequestMetrics::leak_new();
+        let shapes: [(
+            &str,
+            &dyn Fn(Option<&'static RequestMetrics>) -> Router,
+            &dyn Fn() -> Request<Body>,
+            i64,
+        ); 4] = [
+            ("GET /ready", &data_plane, &get_ready, 10),
+            ("OPTIONS /ready (preflight)", &data_plane, &preflight, 10),
+            ("GET /s (streamed)", &data_plane, &get_stream, 10),
+            ("GET /admin/admin.css (401)", &admin, &get_css, 0),
+        ];
+        let mut measured = Vec::new();
+        let mut expected = Vec::new();
+        for (name, build, make, stated) in shapes {
+            let with = count(&build(Some(t)), make);
+            let without = count(&build(None), make);
+            eprintln!(
+                "{name}: with {with}, without {without}, difference {}",
+                with as i64 - without as i64
+            );
+            measured.push((name, with as i64 - without as i64));
+            expected.push((name, stated));
+        }
+        assert_eq!(measured, expected);
     }
 }

@@ -16,6 +16,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -333,4 +334,50 @@ pub fn blank_spans(text: String, spans: &[(usize, usize)]) -> String {
         }
     }
     String::from_utf8(bytes).expect("blanking preserves UTF-8 validity")
+}
+
+/// The string literals inside the `name` constant of `file` (relative to
+/// the workspace root), read out of the source rather than re-declared by a
+/// test. Comments are blanked first by the shared lexer, so a
+/// commented-out entry cannot be counted. Read by `deadline_partition.rs`
+/// (`DEADLINE_BARE_PATHS`) and `route_inventory.rs` (`ROUTE_TEMPLATES`,
+/// issue #838).
+pub fn const_str_slice(file: &str, name: &str) -> BTreeSet<String> {
+    let file = workspace_root().join(file);
+    let src = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+    let (stripped, _) = preprocess_views(&src);
+    let decl = stripped
+        .find(name)
+        .unwrap_or_else(|| panic!("{file:?} must declare {name}"));
+    // Anchor on the `=` first: the declaration's TYPE is `&[&str]`, so a
+    // naive search for the next `[` lands inside the type and reads an
+    // empty body — which is what the emptiness assertion below caught.
+    let eq = stripped[decl..]
+        .find('=')
+        .unwrap_or_else(|| panic!("{name} must be initialised"))
+        + decl;
+    let open = stripped[eq..]
+        .find('[')
+        .unwrap_or_else(|| panic!("{name} must be a slice literal"))
+        + eq;
+    let close = stripped[open..]
+        .find(']')
+        .unwrap_or_else(|| panic!("{name}'s slice literal must close"))
+        + open;
+    let body = &stripped[open + 1..close];
+    let mut out = BTreeSet::new();
+    let mut rest = body;
+    while let Some(a) = rest.find('"') {
+        let tail = &rest[a + 1..];
+        let b = tail
+            .find('"')
+            .unwrap_or_else(|| panic!("unterminated literal in {name}"));
+        out.insert(tail[..b].to_string());
+        rest = &tail[b + 1..];
+    }
+    assert!(
+        !out.is_empty(),
+        "the scan found no literals in {name} — it has stopped reading the constant"
+    );
+    out
 }

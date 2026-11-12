@@ -501,6 +501,7 @@ mod tests {
             )),
             started_at: std::time::SystemTime::now(),
             tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
+            request_metrics: crate::request_metrics::RequestMetrics::leak_new(),
         }
     }
 
@@ -574,6 +575,7 @@ mod tests {
             )),
             started_at: std::time::SystemTime::now(),
             tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
+            request_metrics: crate::request_metrics::RequestMetrics::leak_new(),
         };
         let res = config_handler(State(state)).await.into_response();
         assert_eq!(res.status(), StatusCode::OK);
@@ -1279,5 +1281,34 @@ mod tests {
                 "missing or empty field {field:?} in {json}"
             );
         }
+    }
+
+    /// Issue #838 T14: `/metrics` carries the request-metrics table.
+    #[tokio::test]
+    async fn metrics_handler_appends_the_request_families() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let state = test_state();
+        let app = Router::new().route("/ready", get(|| async { "ok" })).layer(
+            crate::request_metrics::RequestMetricsLayer::new(state.request_metrics),
+        );
+        let res = app
+            .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let res = metrics_handler(State(state)).await.into_response();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains(r#"pulsus_http_requests_total{route="/ready",status="200"} 1"#),
+            "{text}"
+        );
     }
 }
