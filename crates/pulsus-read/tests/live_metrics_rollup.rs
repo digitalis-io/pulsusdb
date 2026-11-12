@@ -2022,8 +2022,9 @@ async fn a_week_reads_two_hour_rows() {
             );
 
             let off = engine(false, format!("{run}_{shift}_{qi}_off")).await;
-            // Shifted, the 85th point is the newest step, computed from the
-            // buckets built (`the_newest_steps_serve_what_the_level_has`).
+            // Shifted, the 85th point is the newest step answered: no step
+            // after the newest built bucket is
+            // (`a_panel_at_a_level_ends_at_the_newest_built_bucket`).
             let pa = only(&a.points(), |x| shift == 0 || x <= times[83]);
             let pb = if shift == 0 {
                 ask(&off, &no_tenant(), query, &range(start, end, res))
@@ -2516,13 +2517,12 @@ async fn a_panel_reads_the_level_its_range_selects() {
         if series.len() != want_series {
             failures.push(format!("{query} (i): {} series", series.len()));
         }
-        // Issue #810 (§3): the steps after `gl` read nothing past the last
-        // step, so they hold no built bucket and have no value, but
-        // `absent_over_time`, which returns 1.
+        // Issue #836: no step after the newest built bucket `gl` is
+        // answered, `absent_over_time` included.
         let built_times: Vec<i64> = times.iter().copied().filter(|x| *x <= gl).collect();
         for (l, ts) in &series {
             let ok = if query.starts_with("absent_over_time") {
-                !ts.is_empty() && ts[..] == times[times.len() - ts.len()..]
+                !ts.is_empty() && ts[..] == built_times[built_times.len() - ts.len()..]
             } else {
                 ts == &built_times
             };
@@ -2562,14 +2562,9 @@ async fn a_panel_reads_the_level_its_range_selects() {
             &only(&want, |x| x <= gl),
             early,
         ));
-        // (iv) each later step: no value, or 1 for `absent_over_time`.
+        // (iv) each later step: no value (issue #836).
         let late_points = only(&points, |x| x > gl);
-        let late_ok = if query.starts_with("absent_over_time") {
-            late_points.len() == times.iter().filter(|x| **x > gl).count()
-                && late_points.values().all(|v| *v == 1.0)
-        } else {
-            late_points.is_empty()
-        };
+        let late_ok = late_points.is_empty();
         if !late_ok {
             failures.push(format!("{query} (iv): after {gl}: {late_points:?}"));
         }
@@ -2759,8 +2754,8 @@ async fn pushdown_on_the_request_grid_and_when_filled() {
         ));
     }
     // Issue #810 (§3): corpus P's 60 s level is built to `end − 10 min`;
-    // every step up to it has a value, and a later step one only while its
-    // window holds two built buckets (`the_newest_steps_serve_what_the_level_has`).
+    // every step up to it has a value, and no later step
+    // (`a_panel_at_a_level_ends_at_the_newest_built_bucket`).
     let built_to = end - 10 * MIN;
     let times: Vec<i64> = times_of(&p)
         .into_iter()
@@ -5990,8 +5985,15 @@ async fn an_in_process_routed_selector_is_one_statement() {
                 brief(&sent)
             ));
         }
-        if s.query.contains("kind = 1") {
-            failures.push(format!("({what}) run rows read"));
+        // Issue #836: the run rows read are those overlapping the window,
+        // in the level arm's own scan.
+        if !s
+            .query
+            .contains("OR kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > ")
+        {
+            failures.push(format!(
+                "({what}) the run rows not read with the level's rows"
+            ));
         }
         if what == "b" {
             if !reads_table(s, &format!("{db}.metric_labels")) {

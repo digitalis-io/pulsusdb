@@ -1553,6 +1553,17 @@ async fn an_unlisted_selector_costs_only_its_own_guard() {
             let near = engine(shard1_config(&f.db), format!("{comment}_near")).await;
             let (want, _) = near.query(&tenant, &one, &p).await.expect("near");
             let (got, want) = (cells(&r), cells(&want));
+            // Issue #836: the query ends at its reads' earliest built point;
+            // `b`'s may be the lagging replica's, so `a` is compared to it.
+            let cut = got
+                .values()
+                .filter_map(|pts| pts.last().map(|p| p.0))
+                .max()
+                .unwrap_or(i64::MIN);
+            let want: std::collections::BTreeMap<String, Vec<(i64, u64)>> = want
+                .into_iter()
+                .map(|(k, v)| (k, v.into_iter().filter(|p| p.0 <= cut).collect()))
+                .collect();
             if want.is_empty() || want.iter().any(|(k, v)| got.get(k) != Some(v)) {
                 failures.push(format!(
                     "T33: a's rows differ from shard 1's: {:?}",

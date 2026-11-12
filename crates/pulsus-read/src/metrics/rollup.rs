@@ -40,6 +40,47 @@ pub struct Levels {
     pub counter_buckets: u32,
 }
 
+/// Issue #836: how long after a bucket's end the level of width `res_ms`
+/// normally has built it, at worst (`building.md` §3.3): `2p + 150 s` at the
+/// first level, `p = max(R_1, 60 s)`, and `R_i + d_i` above it, with
+/// `d_1 = ⌈150 s ÷ p⌉ × p` and `d_i = d_{i−1} + 60 s`.
+pub fn build_age_ms(levels: &Levels, res_ms: i64) -> i64 {
+    let Some(first) = levels.levels.first() else {
+        return 0;
+    };
+    let p = first.res_ms.max(60_000);
+    if res_ms <= first.res_ms {
+        return 2 * p + 150_000;
+    }
+    let mut d = 150_000_i64.div_euclid(p) * p;
+    if d < 150_000 {
+        d += p;
+    }
+    for l in levels.levels.iter().skip(1) {
+        d += 60_000;
+        if l.res_ms >= res_ms {
+            return l.res_ms + d;
+        }
+    }
+    res_ms + d
+}
+
+/// Issue #836: a read's built point from its run rows, `(shard, newest
+/// run-row end)`: the minimum over the `shards` shards of each one's newest
+/// end; `lo` when a shard has none. Not capped at the window's end: a step
+/// whose bucket a level has built is answered whatever its read's end.
+pub fn built_point(runs: &[(u32, i64)], shards: u32, lo: i64) -> i64 {
+    let mut newest: std::collections::BTreeMap<u32, i64> = std::collections::BTreeMap::new();
+    for &(shard, t_end) in runs {
+        let e = newest.entry(shard).or_insert(t_end);
+        *e = (*e).max(t_end);
+    }
+    if (newest.len() as u32) < shards.max(1) {
+        return lo;
+    }
+    newest.values().copied().min().unwrap_or(lo)
+}
+
 /// The process-wide level list, refreshed every 60 s. Empty until the
 /// first successful discovery; nothing routes before it.
 #[derive(Debug, Default)]
@@ -583,6 +624,9 @@ pub struct RoutedTables<'a> {
     pub samples: &'a str,
     pub hist: &'a str,
     pub labels: &'a str,
+    /// Issue #836: the expression naming the shard a level row was read
+    /// from, `_shard_num` over a distributed table, else `1`.
+    pub shard: &'a str,
 }
 
 /// Issue #810 (D11): the windows one routed statement reads.
@@ -667,7 +711,9 @@ pub fn routed_fetch(
 /// Plan section 2.3: the level arm, the raw arms (read only with
 /// `hist_n > 0`), with no list the labels arm, and `hist_n`'s own row.
 /// Read again raw (addendum r6): the raw arms alone, ungated, and with no
-/// list the labels arm.
+/// list the labels arm. Issue #836: the level arm's scan also returns the
+/// level's run rows overlapping the window (ID `0`, with their shard), so
+/// the replica that answers a shard's data rows answers its built point.
 #[allow(clippy::too_many_arguments)]
 fn routed_statement(
     tenant: &Tenant,
@@ -698,7 +744,7 @@ fn routed_statement(
         None => format!(
             "  UNION ALL
   SELECT toUInt8(2) AS arm, fingerprint, toInt64(0) AS t, toInt64(0) AS t_last, 0. AS last, 0. AS min,
-         0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags, CAST([], '{hist}') AS h, labels
+         0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags, CAST([], '{hist}') AS h, labels, toUInt32(0) AS shard
   FROM (
 {}
   )
@@ -714,7 +760,7 @@ fn routed_statement(
     let raw_arms = |gate: &str| {
         format!(
             "  SELECT toUInt8(3) AS arm, fingerprint, unix_milli AS t, toInt64(0) AS t_last, value AS last, 0. AS min,
-         0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags, CAST([], '{hist}') AS h, '' AS labels
+         0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags, CAST([], '{hist}') AS h, '' AS labels, toUInt32(0) AS shard
   FROM {samples}
   WHERE org_id = {org} AND unix_milli > {rlo} AND unix_milli <= {rhi} AND {raw_filter}{gate}
   UNION ALL
@@ -722,7 +768,7 @@ fn routed_statement(
          0. AS last, 0. AS min, 0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags,
          [CAST((hs.schema, hs.zero_threshold, hs.zero_count, hs.count, hs.sum, hs.pos_span_offsets,
                 hs.pos_span_lengths, hs.pos_bucket_deltas, hs.neg_span_offsets, hs.neg_span_lengths,
-                hs.neg_bucket_deltas, hs.custom_values, hs.counter_reset_hint), '{HIST_TUPLE}')] AS h, '' AS labels
+                hs.neg_bucket_deltas, hs.custom_values, hs.counter_reset_hint), '{HIST_TUPLE}')] AS h, '' AS labels, toUInt32(0) AS shard
   FROM {hist_table} AS hs
   WHERE hs.org_id = {org} AND hs.unix_milli > {rlo} AND hs.unix_milli <= {rhi} AND {raw_filter}{gate}
 ",
@@ -732,7 +778,7 @@ fn routed_statement(
     };
     if let RoutedFetch::Raw = fetch {
         return format!(
-            "SELECT arm, fingerprint, t, t_last, last, min, max, sum, count, inc, flags, h, labels FROM (
+            "SELECT arm, fingerprint, t, t_last, last, min, max, sum, count, inc, flags, h, labels, shard FROM (
 {}{labels_arm})
 ORDER BY arm, fingerprint, t, reinterpretAsUInt64(last)",
             raw_arms("")
@@ -749,20 +795,23 @@ ORDER BY arm, fingerprint, t, reinterpretAsUInt64(last)",
         .join(" OR ");
     format!(
         "WITH ifNull((SELECT count() FROM {hist_table} WHERE org_id = {org} AND ({hist_where})), 0) AS hist_n
-SELECT arm, fingerprint, t, t_last, last, min, max, sum, count, inc, flags, h, labels FROM (
+SELECT arm, fingerprint, t, t_last, last, min, max, sum, count, inc, flags, h, labels, shard FROM (
   SELECT toUInt8(0) AS arm, fingerprint, t_end AS t, t_last, last, min, max, sum, count, inc, flags,
-         CAST([], '{hist}') AS h, '' AS labels
+         CAST([], '{hist}') AS h, '' AS labels, toUInt32({shard}) AS shard
   FROM {level}
   WHERE kind = 0 AND org_id = {org} AND t_end > {lo} AND t_end <= {hi} AND {level_filter} AND hist_n = 0
+     OR kind = 1 AND org_id = '' AND fingerprint = 0 AND t_end > {lo} AND t_last < {hi} AND hist_n = 0
   UNION ALL
 {}{labels_arm}  UNION ALL
   SELECT toUInt8(4) AS arm, toUInt128(0) AS fingerprint, toInt64(hist_n) AS t, toInt64(0) AS t_last, 0. AS last,
-         0. AS min, 0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags, CAST([], '{hist}') AS h, '' AS labels
+         0. AS min, 0. AS max, 0. AS sum, toUInt32(0) AS count, 0. AS inc, toUInt8(0) AS flags, CAST([], '{hist}') AS h, '' AS labels,
+         toUInt32(0) AS shard
 )
 ORDER BY arm, fingerprint, t, reinterpretAsUInt64(last)",
         raw_arms(" AND hist_n > 0"),
         hist_table = tables.hist,
         level = tables.level,
+        shard = tables.shard,
     )
 }
 
@@ -835,6 +884,9 @@ pub struct RoutedRow {
     pub flags: u8,
     pub h: Vec<HistTuple>,
     pub labels: String,
+    /// Issue #836: on a run row (`arm` 0, ID `0`), the shard it was read
+    /// from.
+    pub shard: u32,
 }
 
 /// One data row of a level, as a routed statement's level arm returns it.
@@ -1513,6 +1565,7 @@ mod tests {
             samples: "metric_samples",
             hist: "metric_hist_samples",
             labels: "metric_labels",
+            shard: "1",
         };
         let window = RoutedWindow {
             level: (1_000, 2_000),

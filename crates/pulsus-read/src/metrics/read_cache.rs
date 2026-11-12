@@ -808,6 +808,15 @@ pub fn keep_through(
     Some(p.start_ms + (k - p.start_ms).div_euclid(p.step_ms) * p.step_ms)
 }
 
+/// Issue #836: the last step a matrix answer answers, `None` with no point.
+fn last_answered(result: &QueryResult) -> Option<i64> {
+    match result {
+        QueryResult::Matrix(m) => m.iter().filter_map(|s| s.points.last().map(|p| p.0)).max(),
+        QueryResult::MatrixHist(m) => m.iter().filter_map(|s| s.points.last().map(|p| p.0)).max(),
+        _ => None,
+    }
+}
+
 /// The indices of `points` with a timestamp in `[start, c1]`; the points
 /// are in time order, as an evaluation returns them.
 fn kept_range<P>(points: &[(i64, P)], start_ms: i64, c1_ms: i64) -> Range<usize> {
@@ -1308,9 +1317,11 @@ where
     let res = req.key.resolution_ms;
     // `W`, read before the evaluation.
     let watermark = if res > 0 { cache.watermark(res) } else { None };
+    // Issue #836: no point past the answer's last answered step is kept.
     let through = |answer: &QueryResult| {
         keep_through(v, req.facts.reach_ms, &p, res, watermark)
             .filter(|_| matches!(answer, QueryResult::Matrix(_) | QueryResult::MatrixHist(_)))
+            .and_then(|c1| last_answered(answer).map(|t| c1.min(t)))
     };
 
     if let Some((e, eg)) = cache.lookup_at(&req.key)
@@ -1416,7 +1427,12 @@ where
         tail_result,
         QueryResult::Matrix(_) | QueryResult::MatrixHist(_)
     );
-    let through = keep_through(v, req.facts.reach_ms, &p, res, watermark).filter(|_| matrix);
+    // Issue #836: no point past the request's last answered step, the
+    // tail's last or, with none, the kept points' end.
+    let answered = last_answered(&tail_result).map_or(e.c1_ms, |t| t.max(e.c1_ms));
+    let through = keep_through(v, req.facts.reach_ms, &p, res, watermark)
+        .filter(|_| matrix)
+        .map(|c1| c1.min(answered));
     let keepable = tail_ann.is_empty() && !tail_facts.raw;
     let grown_entry = through
         .filter(|_| keepable)
