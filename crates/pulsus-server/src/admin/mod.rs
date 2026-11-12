@@ -26,7 +26,7 @@ pub(crate) mod views;
 /// response carries the two headers `headers` sets.
 pub(crate) fn router(
     config: &Config,
-    _metrics: Option<&'static crate::request_metrics::RequestMetrics>,
+    metrics: Option<&'static crate::request_metrics::RequestMetrics>,
 ) -> Router<AppState> {
     let page_auth = crate::middleware::admin_auth_layer(config, false);
     let api_auth = crate::middleware::admin_auth_layer(config, true);
@@ -45,11 +45,20 @@ pub(crate) fn router(
         .route("/admin/api/v1/setup/validate", post(api::setup_validate))
         .route("/admin/api/v1/setup/bundle", post(api::setup_bundle))
         .layer(api_auth);
-    pages
+    let router = pages
         .merge(api)
         .layer(axum::middleware::from_fn(headers))
-        .layer(axum::middleware::from_fn(crate::request_id::stamp))
-        .layer(crate::middleware::trace_layer())
+        .layer(axum::middleware::from_fn(crate::request_id::stamp));
+    // Issue #838: the request-metrics layer joins trace's router layer, so
+    // it adds no boxed service of its own.
+    match metrics {
+        Some(t) => router.layer(
+            tower::ServiceBuilder::new()
+                .layer(crate::request_metrics::RequestMetricsLayer::new(t))
+                .layer(crate::middleware::trace_layer()),
+        ),
+        None => router.layer(crate::middleware::trace_layer()),
+    }
 }
 
 /// `Content-Security-Policy: default-src 'self'` and `Cache-Control:

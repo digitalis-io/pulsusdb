@@ -2,9 +2,18 @@
 //! `pulsus_http_requests_total{route, status}` and
 //! `pulsus_http_request_duration_seconds{route}`, rendered onto `/metrics`
 //! by [`RequestMetrics::render_into`].
+//!
+//! The table is fixed atomics: one row per route template plus
+//! `unmatched`, each with 24 status cells, an `other` cell, 14 duration
+//! buckets and a microsecond sum. A request takes no lock, never waits,
+//! and allocates nothing here. [`RequestMetricsLayer`] starts the clock in
+//! `call` and records when the response body is dropped, or with `499`
+//! when the request future is dropped before a response exists.
 
 use std::convert::Infallible;
+use std::fmt::Write as _;
 use std::pin::Pin;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicU16, AtomicU64};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -15,13 +24,116 @@ use axum::extract::MatchedPath;
 use axum::http::{Request, Response};
 use tower::Service;
 
+const REQUESTS_TOTAL: &str = "pulsus_http_requests_total";
+const REQUEST_DURATION: &str = "pulsus_http_request_duration_seconds";
+const BOUNDS_NS: [u64; 13] = [
+    5_000_000,
+    10_000_000,
+    25_000_000,
+    50_000_000,
+    100_000_000,
+    250_000_000,
+    500_000_000,
+    1_000_000_000,
+    2_500_000_000,
+    5_000_000_000,
+    10_000_000_000,
+    30_000_000_000,
+    120_000_000_000,
+];
+const BOUNDS_TEXT: [&str; 13] = [
+    "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "120",
+];
 pub(crate) const UNMATCHED: &str = "unmatched";
+const CANCELLED: u16 = 499;
 const STATUS_CELLS: usize = 24;
 
 /// Every mounted route template, in byte order (binary-searched).
 /// Equal to the manifest's `Mounted` set: tests/route_inventory.rs check 4.
-pub(crate) const ROUTE_TEMPLATES: &[&str] = &[];
+pub(crate) const ROUTE_TEMPLATES: &[&str] = &[
+    "/admin/",
+    "/admin/admin.css",
+    "/admin/api/v1/config",
+    "/admin/api/v1/database",
+    "/admin/api/v1/setup/bundle",
+    "/admin/api/v1/setup/validate",
+    "/admin/api/v1/status",
+    "/admin/config",
+    "/admin/database",
+    "/admin/setup",
+    "/admin/setup/file",
+    "/api/echo",
+    "/api/logs/v1/detected_field/{name}/values",
+    "/api/logs/v1/detected_fields",
+    "/api/logs/v1/detected_labels",
+    "/api/logs/v1/label/{name}/values",
+    "/api/logs/v1/labels",
+    "/api/logs/v1/patterns",
+    "/api/logs/v1/query",
+    "/api/logs/v1/query_range",
+    "/api/logs/v1/series",
+    "/api/logs/v1/stats",
+    "/api/logs/v1/tail",
+    "/api/logs/v1/volume",
+    "/api/metrics/query",
+    "/api/metrics/query_range",
+    "/api/search",
+    "/api/search/tag/{tag}/values",
+    "/api/search/tags",
+    "/api/traces/v1/metrics/query",
+    "/api/traces/v1/metrics/query_range",
+    "/api/traces/v1/search",
+    "/api/traces/v1/service_graph",
+    "/api/traces/v1/tag/{tag}/values",
+    "/api/traces/v1/tags",
+    "/api/traces/v1/trace/{traceId}",
+    "/api/traces/v1/trace/{traceId}/json",
+    "/api/traces/{traceId}",
+    "/api/traces/{traceId}/json",
+    "/api/v1/label/{name}/values",
+    "/api/v1/labels",
+    "/api/v1/metadata",
+    "/api/v1/query",
+    "/api/v1/query_exemplars",
+    "/api/v1/query_range",
+    "/api/v1/series",
+    "/api/v1/status/buildinfo",
+    "/api/v1/status/config",
+    "/api/v1/status/flags",
+    "/api/v1/status/runtimeinfo",
+    "/api/v1/status/tsdb",
+    "/api/v1/write",
+    "/api/v2/search/tag/{tag}/values",
+    "/api/v2/search/tags",
+    "/api/v2/spans",
+    "/api/v2/traces/{traceId}",
+    "/buildinfo",
+    "/config",
+    "/loki/api/v1/detected_field/{name}/values",
+    "/loki/api/v1/detected_fields",
+    "/loki/api/v1/detected_labels",
+    "/loki/api/v1/index/stats",
+    "/loki/api/v1/index/volume",
+    "/loki/api/v1/label/{name}/values",
+    "/loki/api/v1/labels",
+    "/loki/api/v1/patterns",
+    "/loki/api/v1/push",
+    "/loki/api/v1/query",
+    "/loki/api/v1/query_range",
+    "/loki/api/v1/series",
+    "/loki/api/v1/tail",
+    "/metrics",
+    "/ready",
+    "/tempo/api/metrics/query",
+    "/tempo/api/metrics/query_range",
+    "/tempo/api/traces/{traceId}",
+    "/tempo/spans",
+    "/v1/logs",
+    "/v1/metrics",
+    "/v1/traces",
+];
 
+/// One status code's count. `code` 0 means the cell is free.
 struct StatusCell {
     code: AtomicU16,
     count: AtomicU64,
@@ -29,23 +141,31 @@ struct StatusCell {
 
 struct RouteCells {
     statuses: [StatusCell; STATUS_CELLS],
+    /// Statuses past the 24th distinct one.
     other: AtomicU64,
+    /// Per bucket, NOT cumulative; `[13]` is above 120 s.
     buckets: [AtomicU64; 14],
+    /// Whole microseconds; wraps after 2^64 µs.
     sum_us: AtomicU64,
 }
 
-const FREE_CELL: StatusCell = StatusCell {
-    code: AtomicU16::new(0),
-    count: AtomicU64::new(0),
-};
-const ZERO: AtomicU64 = AtomicU64::new(0);
-const EMPTY_ROUTE: RouteCells = RouteCells {
-    statuses: [FREE_CELL; STATUS_CELLS],
-    other: AtomicU64::new(0),
-    buckets: [ZERO; 14],
-    sum_us: AtomicU64::new(0),
-};
+impl RouteCells {
+    const fn empty() -> Self {
+        RouteCells {
+            statuses: [const {
+                StatusCell {
+                    code: AtomicU16::new(0),
+                    count: AtomicU64::new(0),
+                }
+            }; STATUS_CELLS],
+            other: AtomicU64::new(0),
+            buckets: [const { AtomicU64::new(0) }; 14],
+            sum_us: AtomicU64::new(0),
+        }
+    }
+}
 
+/// The table: one row per [`ROUTE_TEMPLATES`] entry, then [`UNMATCHED`].
 pub(crate) struct RequestMetrics {
     routes: [RouteCells; ROUTE_TEMPLATES.len() + 1],
 }
@@ -54,25 +174,133 @@ impl RequestMetrics {
     /// One table per AppState, leaked so the per-request handle is a plain `&'static`.
     pub(crate) fn leak_new() -> &'static Self {
         Box::leak(Box::new(RequestMetrics {
-            routes: [EMPTY_ROUTE; ROUTE_TEMPLATES.len() + 1],
+            routes: [const { RouteCells::empty() }; ROUTE_TEMPLATES.len() + 1],
         }))
     }
 
-    fn route_cells(&'static self, _matched: Option<&MatchedPath>) -> &'static RouteCells {
-        &self.routes[ROUTE_TEMPLATES.len()]
+    fn route_cells(&'static self, matched: Option<&MatchedPath>) -> &'static RouteCells {
+        let i = matched
+            .and_then(|m| ROUTE_TEMPLATES.binary_search(&m.as_str()).ok())
+            .unwrap_or(ROUTE_TEMPLATES.len());
+        &self.routes[i]
     }
 
     /// Appends both families; writes nothing for a family with no request yet.
-    pub(crate) fn render_into(&self, _out: &mut String) {}
+    pub(crate) fn render_into(&self, out: &mut String) {
+        let label = |i: usize| ROUTE_TEMPLATES.get(i).copied().unwrap_or(UNMATCHED);
+        let mut typed = false;
+        let mut type_line = |out: &mut String| {
+            if !typed {
+                out.push_str("# TYPE pulsus_http_requests_total counter\n");
+                typed = true;
+            }
+        };
+        for (i, route) in self.routes.iter().enumerate() {
+            let route_label = label(i);
+            for cell in &route.statuses {
+                let count = cell.count.load(Relaxed);
+                if count == 0 {
+                    continue;
+                }
+                let code = cell.code.load(Relaxed);
+                type_line(out);
+                let _ = writeln!(
+                    out,
+                    "{REQUESTS_TOTAL}{{route=\"{route_label}\",status=\"{code}\"}} {count}"
+                );
+            }
+            let other = route.other.load(Relaxed);
+            if other > 0 {
+                type_line(out);
+                let _ = writeln!(
+                    out,
+                    "{REQUESTS_TOTAL}{{route=\"{route_label}\",status=\"other\"}} {other}"
+                );
+            }
+        }
+
+        let mut typed = false;
+        for (i, route) in self.routes.iter().enumerate() {
+            let buckets: [u64; 14] = std::array::from_fn(|b| route.buckets[b].load(Relaxed));
+            let total = buckets.iter().fold(0u64, |a, &b| a.wrapping_add(b));
+            if total == 0 {
+                continue;
+            }
+            if !typed {
+                out.push_str("# TYPE pulsus_http_request_duration_seconds histogram\n");
+                typed = true;
+            }
+            let route_label = label(i);
+            let mut cumulative = 0u64;
+            for (le, count) in BOUNDS_TEXT.iter().zip(buckets) {
+                cumulative = cumulative.wrapping_add(count);
+                let _ = writeln!(
+                    out,
+                    "{REQUEST_DURATION}_bucket{{route=\"{route_label}\",le=\"{le}\"}} {cumulative}"
+                );
+            }
+            let _ = writeln!(
+                out,
+                "{REQUEST_DURATION}_bucket{{route=\"{route_label}\",le=\"+Inf\"}} {total}"
+            );
+            let sum_us = route.sum_us.load(Relaxed);
+            let _ = writeln!(
+                out,
+                "{REQUEST_DURATION}_sum{{route=\"{route_label}\"}} {}.{:06}",
+                sum_us / 1_000_000,
+                sum_us % 1_000_000
+            );
+            let _ = writeln!(
+                out,
+                "{REQUEST_DURATION}_count{{route=\"{route_label}\"}} {total}"
+            );
+        }
+    }
 }
 
 impl RouteCells {
-    fn record(&self, _status: u16, _elapsed: Duration) {}
+    fn record(&self, status: u16, elapsed: Duration) {
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let b = BOUNDS_NS.iter().position(|&le| ns <= le).unwrap_or(13);
+        self.buckets[b].fetch_add(1, Relaxed);
+        self.sum_us.fetch_add(
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            Relaxed,
+        );
+        // Cells are claimed in order. A scanner meeting a free cell either
+        // claims it or reads who did, and never passes a free cell, so one
+        // status never takes two cells.
+        for cell in &self.statuses {
+            match cell.code.load(Relaxed) {
+                c if c == status => {
+                    cell.count.fetch_add(1, Relaxed);
+                    return;
+                }
+                0 => match cell.code.compare_exchange(0, status, Relaxed, Relaxed) {
+                    Ok(_) => {
+                        cell.count.fetch_add(1, Relaxed);
+                        return;
+                    }
+                    Err(c) if c == status => {
+                        cell.count.fetch_add(1, Relaxed);
+                        return;
+                    }
+                    Err(_) => continue,
+                },
+                _ => continue,
+            }
+        }
+        self.other.fetch_add(1, Relaxed);
+    }
 
     #[cfg(test)]
-    fn set_sum_us(&self, _value: u64) {}
+    fn set_sum_us(&self, value: u64) {
+        self.sum_us.store(value, Relaxed);
+    }
 }
 
+/// Records every request through the service it wraps into one
+/// [`RequestMetrics`] table.
 #[derive(Clone, Copy)]
 pub(crate) struct RequestMetricsLayer {
     table: &'static RequestMetrics,
@@ -116,6 +344,8 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
+        // Before the inner call: CORS and the other inner layers do
+        // synchronous work in their own `call`.
         let start = Instant::now();
         let route = self
             .table
@@ -129,10 +359,18 @@ where
 }
 
 pin_project_lite::pin_project! {
+    /// The inner future; dropped before it answers, it records `499`.
     pub(crate) struct Timed<F> {
         #[pin]
         inner: F,
         pending: Option<(&'static RouteCells, Instant)>,
+    }
+    impl<F> PinnedDrop for Timed<F> {
+        fn drop(this: Pin<&mut Self>) {
+            if let Some((route, start)) = this.project().pending.take() {
+                route.record(CANCELLED, start.elapsed());
+            }
+        }
     }
 }
 
@@ -161,12 +399,19 @@ where
 }
 
 pin_project_lite::pin_project! {
+    /// The response body; the request is recorded when it is dropped.
     pub(crate) struct TimedBody<B> {
         #[pin]
         inner: B,
         route: &'static RouteCells,
         start: Instant,
         status: u16,
+    }
+    impl<B> PinnedDrop for TimedBody<B> {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+            this.route.record(*this.status, this.start.elapsed());
+        }
     }
 }
 
@@ -179,6 +424,14 @@ impl<B: HttpBody> HttpBody for TimedBody<B> {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         self.project().inner.poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 

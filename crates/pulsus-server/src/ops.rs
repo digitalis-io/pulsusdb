@@ -128,10 +128,12 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     }
     record_replica_metrics(&state.rollup_levels);
     record_ingest_metrics(&state);
+    let mut body = state.metrics.render();
+    state.request_metrics.render_into(&mut body);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        state.metrics.render(),
+        body,
     )
 }
 

@@ -220,12 +220,19 @@ pub(crate) fn build_router(state: AppState, config: &Config) -> Result<Router, S
 fn outer_layers(
     router: Router<AppState>,
     config: &Config,
-    _metrics: Option<&'static crate::request_metrics::RequestMetrics>,
+    metrics: Option<&'static crate::request_metrics::RequestMetrics>,
 ) -> Result<Router<AppState>, ServeError> {
-    Ok(router
+    let router = router
         .layer(middleware::trace_layer())
-        .layer(middleware::compression_layer())
-        .layer(middleware::cors_layer(config)?))
+        .layer(middleware::compression_layer());
+    Ok(match metrics {
+        Some(t) => router.layer(
+            tower::ServiceBuilder::new()
+                .layer(crate::request_metrics::RequestMetricsLayer::new(t))
+                .layer(middleware::cors_layer(config)?),
+        ),
+        None => router.layer(middleware::cors_layer(config)?),
+    })
 }
 
 #[cfg(test)]
@@ -1089,12 +1096,9 @@ mod tests {
         };
 
         let t = RequestMetrics::leak_new();
-        let shapes: [(
-            &str,
-            &dyn Fn(Option<&'static RequestMetrics>) -> Router,
-            &dyn Fn() -> Request<Body>,
-            i64,
-        ); 4] = [
+        type Build<'a> = &'a dyn Fn(Option<&'static RequestMetrics>) -> Router;
+        type Make<'a> = &'a dyn Fn() -> Request<Body>;
+        let shapes: [(&str, Build, Make, i64); 4] = [
             ("GET /ready", &data_plane, &get_ready, 10),
             ("OPTIONS /ready (preflight)", &data_plane, &preflight, 10),
             ("GET /s (streamed)", &data_plane, &get_stream, 10),
