@@ -61,7 +61,7 @@ Site	Literal	crates/pulsus-read/src/logql/plan.rs:9205	-	-	<_> <proc>[<pid>]: <_
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:9230	-	-	{pattern}	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:9274	-	-	<q> <_>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:9312	-	-	<a> <_> <b>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/predicate.rs:2791	-	-	{}	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/predicate.rs:2814	-	-	{}	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/reduce.rs:834	-	-	<_> route=<route> x=<x>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/sql.rs:253	-	-	: 	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/sql.rs:5491	-	-	<_> x=<x> route=<route>	accept	accept	-	-	-

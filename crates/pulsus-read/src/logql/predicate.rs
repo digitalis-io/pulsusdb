@@ -1189,7 +1189,7 @@ pub fn parsed_string_filter(
             return Err(ParsedFilterRefusal::OperatorNotServed);
         }
         return Ok(CheckedFragment {
-            sql: contains_predicate(value),
+            sql: checked_contains_predicate(value),
         });
     };
     if !name_is_unambiguous(name) {
@@ -1542,6 +1542,29 @@ pub(super) fn non_id_values_expr() -> CheckedFragment {
 /// written; `schema/schema.sql`'s index expression is `case_key_sql("body")`.
 pub fn case_key_sql(expr: &str) -> String {
     format!("upperUTF8(lowerUTF8({expr}))")
+}
+
+/// [`contains_predicate`] behind the lowered-literal check a `|=` of the
+/// same needle carries (issue #839, code review r1), so a parsed-label
+/// filter's substring probe reaches `idx_body_ngrams` on `lowerUTF8(body)`.
+/// The same derivation and limits as [`alternative_checks`]; the probe has
+/// a check budget of its own.
+fn checked_contains_predicate(phrase: &str) -> String {
+    let probe = LineFilter {
+        op: LineFilterOp::Contains,
+        head: LineMatch::Text(phrase.to_string()),
+        or_matches: Vec::new(),
+    };
+    let mut check_budget = LINE_FILTER_CHECK_BUDGET_BYTES;
+    let exact = contains_predicate(phrase);
+    match alternative_checks(&probe, &mut check_budget)
+        .into_iter()
+        .next()
+        .flatten()
+    {
+        Some(check) => format!("({check} AND {exact})"),
+        None => exact,
+    }
 }
 
 fn contains_predicate(phrase: &str) -> String {

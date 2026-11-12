@@ -2485,6 +2485,7 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn sliding_cover(scan_start_ns: i64, grid_start_ns: i64, end_ns: i64, step_ns: i64, range_ns: i64) -> Result<SlidingCover, BucketGridRefusal>",
     "pub(super) fn non_id_values_expr() -> CheckedFragment",
     "pub fn case_key_sql(expr: &str) -> String",
+    "fn checked_contains_predicate(phrase: &str) -> String",
     "fn contains_predicate(phrase: &str) -> String",
     "fn words_predicate(words: &[String]) -> String",
     "fn regex_predicate(pattern: &str) -> Result<String, PipelineError>",

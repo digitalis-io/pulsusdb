@@ -917,8 +917,8 @@ docs/query-to-sql.md	logql/fold.rs:543	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/params.rs:124	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/pipeline.rs:1360	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:1532	no_name_the_target_file_holds
-docs/query-to-sql.md	logql/predicate.rs:1579	no_name_the_target_file_holds
-docs/query-to-sql.md	logql/predicate.rs:2711	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/predicate.rs:1602	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/predicate.rs:2734	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:534	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:534-553	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:555	no_name_the_target_file_holds

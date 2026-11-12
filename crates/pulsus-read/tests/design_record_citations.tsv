@@ -175,9 +175,9 @@ docs/query-to-sql.md	logql/fold.rs:543	crates/pulsus-read/src/logql/fold.rs	543	
 docs/query-to-sql.md	logql/params.rs:124	crates/pulsus-read/src/logql/params.rs	124		line	DEFAULT_MAX_STREAMS	pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 docs/query-to-sql.md	logql/pipeline.rs:1360	crates/pulsus-read/src/logql/pipeline.rs	1360		line	PipelineError	pub fn compile(stages: &[Stage]) -> Result<Self, PipelineError> {
 docs/query-to-sql.md	logql/predicate.rs:1532	crates/pulsus-read/src/logql/predicate.rs	1532		line	format	sql: format!(
-docs/query-to-sql.md	logql/predicate.rs:1579	crates/pulsus-read/src/logql/predicate.rs	1579		line	regex_predicate	fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
-docs/query-to-sql.md	logql/predicate.rs:2705-2712	crates/pulsus-read/src/logql/predicate.rs	2705	2712	prose	a_contains_line_filter_renders_an_escaped_like_pattern	LIKE
-docs/query-to-sql.md	logql/predicate.rs:2711	crates/pulsus-read/src/logql/predicate.rs	2711		line	test	#[test]
+docs/query-to-sql.md	logql/predicate.rs:1602	crates/pulsus-read/src/logql/predicate.rs	1602		line	regex_predicate	fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
+docs/query-to-sql.md	logql/predicate.rs:2728-2735	crates/pulsus-read/src/logql/predicate.rs	2728	2735	prose	a_contains_line_filter_renders_an_escaped_like_pattern	LIKE
+docs/query-to-sql.md	logql/predicate.rs:2734	crates/pulsus-read/src/logql/predicate.rs	2734		line	test	#[test]
 docs/query-to-sql.md	logql/predicate.rs:534	crates/pulsus-read/src/logql/predicate.rs	534		line	or_matches	let core = if lf.or_matches.is_empty() {
 docs/query-to-sql.md	logql/predicate.rs:534-553	crates/pulsus-read/src/logql/predicate.rs	534	553	line	CheckedFragment	let core = if lf.or_matches.is_empty() { disjuncts .into_iter() .next() .expect("a line filter always has a head alterna
 docs/query-to-sql.md	logql/predicate.rs:555	crates/pulsus-read/src/logql/predicate.rs	555		prose	LineFilterOp	NOT
