@@ -1780,3 +1780,69 @@ async fn a_discovery_answer_past_its_bound_is_cut_and_marked() {
 
     drop_named_db(&db).await;
 }
+
+// =====================================================================
+// Issue #839: a label filter the reference treats as matching everything
+// =====================================================================
+
+/// **T11 (issue #839): `| l=~".*"` and `| l=~""` keep every line, as the
+/// reference keeps them.** The reference turns both into `TrueFilter` and
+/// runs no regex (`pkg/logql/log/label_filter.go`, `NoopLabelFilter`), so
+/// the line whose label value holds a newline and the line whose value is
+/// not empty are both kept.
+#[tokio::test]
+async fn a_label_filter_that_matches_everything_keeps_every_line() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_lfm_839_t11");
+    let client = create_schema(&db).await;
+    let ts = now_ns();
+    let streams = [
+        Stream {
+            fingerprint: 83_911,
+            service: "c839t11",
+            labels: r#"{"l":"a\nb","service_name":"c839t11"}"#,
+        },
+        Stream {
+            fingerprint: 83_912,
+            service: "c839t11",
+            labels: r#"{"l":"x","service_name":"c839t11"}"#,
+        },
+    ];
+    let rows = [
+        Seed {
+            stream: 0,
+            body: "line with a newline label",
+            metadata: "",
+        },
+        Seed {
+            stream: 1,
+            body: "line with x",
+            metadata: "",
+        },
+    ];
+    seed(&client, &db, ts, &streams, &rows).await;
+    let engine = full_engine(&db).await;
+    let mut got = Vec::new();
+    for query in [
+        r#"{service_name="c839t11"} | l=~".*""#,
+        r#"{service_name="c839t11"} | l=~"""#,
+    ] {
+        got.push((query, entries(&engine, query, &window(ts)).await));
+    }
+    client
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop test database");
+    assert_eq!(
+        got,
+        vec![
+            (r#"{service_name="c839t11"} | l=~".*""#, 2),
+            (r#"{service_name="c839t11"} | l=~"""#, 2),
+        ],
+        "both lines are kept"
+    );
+}

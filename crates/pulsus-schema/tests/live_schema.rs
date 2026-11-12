@@ -1966,7 +1966,8 @@ struct SkipIndexRow {
 /// **S-T2 (issue #757): the log body carries a word index and an n-gram
 /// index, both bloom filters.** Every skip index on every table of a fresh
 /// database, read from `system.data_skipping_indices`: on `log_samples`
-/// exactly `idx_body_ngrams` over `body` as `ngrambf_v1(4, 32768, 3, 0)`,
+/// exactly `idx_body_ngrams` over `lowerUTF8(body)` (issue #839) as
+/// `ngrambf_v1(4, 32768, 3, 0)`,
 /// `idx_body_words` over `upperUTF8(lowerUTF8(body))` as
 /// `tokenbf_v1(32768, 3, 0)`, both at granularity 1, and the `minmax` on
 /// `severity` at 4; no `text` index anywhere.
@@ -2006,7 +2007,7 @@ async fn the_log_body_has_a_word_and_an_ngram_index() {
             &(
                 "log_samples".to_string(),
                 "idx_body_ngrams".to_string(),
-                "body".to_string(),
+                "lowerUTF8(body)".to_string(),
                 "ngrambf_v1(4, 32768, 3, 0)".to_string(),
                 1
             ),
