@@ -302,35 +302,63 @@ async fn the_prefilter_changes_no_answer_and_the_index_skips_blocks() {
     };
     let ms = |strings: &str| format!("multiSearchAny(lowerUTF8(body), [{strings}])");
     // (filter, the prefilter it renders)
-    let rows: Vec<(&str, Option<String>)> = vec![
+    // (filter, the checks it renders, whether every alternative has one)
+    let lc = |s: &str| format!("lowerUTF8('{s}')");
+    let rows: Vec<(&str, Vec<String>, bool)> = vec![
         (
             r#"|~ "(?i)(error|fatal|panic|exception|fail)""#,
-            Some(ms("'error', 'fatal', 'panic', 'exception', 'fail'")),
+            vec![ms("'error', 'fatal', 'panic', 'exception', 'fail'")],
+            true,
         ),
-        (r#"|~ "(?i)connection.*reset""#, Some(ms("'connection'"))),
-        (r#"|~ "^ERROR: ""#, Some(ms("'error: '"))),
-        (r#"|~ "(?i)status""#, Some(ms("'tatu'"))),
-        (r#"|~ "(?i)kubelet""#, Some(ms("'kubelet'"))),
-        (r#"|~ "foo(bar)?bazz""#, Some(ms("'bazz'"))),
+        (
+            r#"|~ "(?i)connection.*reset""#,
+            vec![ms("'connection'")],
+            true,
+        ),
+        (r#"|~ "^ERROR: ""#, vec![ms("'error: '")], true),
+        (r#"|~ "(?i)status""#, vec![ms("'tatu'")], true),
+        (r#"|~ "(?i)kubelet""#, vec![ms("'kubelet'")], true),
+        (r#"|~ "foo(bar)?bazz""#, vec![ms("'bazz'")], true),
         (
             r#"|= "Connection refused""#,
-            Some(ms("'connection refused'")),
+            vec![ms("'connection refused'")],
+            true,
         ),
-        (r#"|= "Größe des Puffers""#, Some(ms("'e des puffers'"))),
-        (r#"|= "接続エラー""#, Some(ms("'接続エラー'"))),
-        (r#"|= "abc" or "connection""#, None),
-        (r#"|~ "err.*""#, None),
-        (r#"|~ "(?i)(error|ok)""#, None),
-        (r#"|~ "(?i)task""#, None),
-        (r#"|~ "(?i)ΣΦΑΛΜΑ""#, None),
-        (r#"|= "Größe""#, None),
-        (r#"|= word("x") or "connection""#, None),
-        (r#"|= ip("192.0.2.1")"#, None),
-        (r#"!= "error""#, None),
-        (r#"!~ "(?i)error""#, None),
+        // Issue #839 addendum F2: the database lowers a run that is not
+        // ASCII.
+        (
+            r#"|= "Größe des Puffers""#,
+            vec![ms(&lc("größe des puffers"))],
+            true,
+        ),
+        (r#"|= "接続エラー""#, vec![ms(&lc("接続エラー"))], true),
+        (r#"|= "Größe""#, vec![ms(&lc("größe"))], true),
+        // F1: a check per alternative.
+        (
+            r#"|= "abc" or "connection""#,
+            vec![ms("'connection'")],
+            false,
+        ),
+        (
+            r#"|= word("x") or "connection""#,
+            vec![ms("'connection'")],
+            false,
+        ),
+        (
+            r#"|= word("refused") or "nomatchzzzz""#,
+            vec![ms("'nomatchzzzz'")],
+            false,
+        ),
+        (r#"|~ "err.*""#, vec![], false),
+        (r#"|~ "(?i)(error|ok)""#, vec![], false),
+        (r#"|~ "(?i)task""#, vec![], false),
+        (r#"|~ "(?i)ΣΦΑΛΜΑ""#, vec![], false),
+        (r#"|= ip("192.0.2.1")"#, vec![], false),
+        (r#"!= "error""#, vec![], false),
+        (r#"!~ "(?i)error""#, vec![], false),
     ];
     let mut failures: Vec<String> = Vec::new();
-    for (filter, prefilter) in &rows {
+    for (filter, checks, prunes) in &rows {
         let query = format!(r#"{{suite="t9"}} {filter}"#);
         let expr = parse(&query).expect("parse");
         let (result, _, explain) = match engine.query_explained(&expr, &params).await {
@@ -357,23 +385,17 @@ async fn the_prefilter_changes_no_answer_and_the_index_skips_blocks() {
             failures.push(format!("{query}: no sample statement"));
             continue;
         };
-        let control = match prefilter {
-            Some(p) => {
-                let conjunct = format!("{p} AND ");
-                if !stage3.contains(&conjunct) {
-                    failures.push(format!("{query}: the statement lacks `{p}`"));
-                }
-                stage3.replacen(&conjunct, "", 1)
+        let mut control = stage3.clone();
+        for p in checks {
+            let conjunct = format!("{p} AND ");
+            if !control.contains(&conjunct) {
+                failures.push(format!("{query}: the statement lacks `{p}`"));
             }
-            None => {
-                if stage3.contains("multiSearchAny(lowerUTF8(body)")
-                    || stage3.contains("lowerUTF8(body) LIKE")
-                {
-                    failures.push(format!("{query}: a prefilter is rendered:\n{stage3}"));
-                }
-                stage3.clone()
-            }
-        };
+            control = control.replacen(&conjunct, "", 1);
+        }
+        if control.contains("multiSearchAny(lowerUTF8(body)") {
+            failures.push(format!("{query}: a check beyond the expected:\n{stage3}"));
+        }
         // `ip(…)` runs in the engine, after a statement with no body
         // predicate: no line holds an address, so the answer is empty.
         let want = if filter.contains("ip(") {
@@ -387,7 +409,7 @@ async fn the_prefilter_changes_no_answer_and_the_index_skips_blocks() {
                  and the skip indexes {want:?}"
             ));
         }
-        if prefilter.is_some() {
+        if *prunes {
             match ngram_blocks(&client, &stage3).await {
                 Some((kept, given)) if kept < given => {
                     eprintln!("T9 {query}: idx_body_ngrams kept {kept} of {given} blocks");
@@ -475,4 +497,50 @@ async fn bytes_over_an_empty_line_answer_zero() {
     let got = instant(&db, r#"sum(bytes_over_time({job="a"}[1h]))"#, t).await;
     drop_db(&client, &db).await;
     assert_eq!(got, vec![(Vec::new(), 0f64.to_bits())]);
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+struct LoweringFailures {
+    without_sigma: u64,
+    with_sigma: u64,
+}
+
+/// **G5 (issue #839 addendum F2): the database lowers a character the same
+/// way alone and between neighbours, for every code point but U+03A3.**
+/// One read-only statement over `numbers()`: each code point outside the
+/// surrogates, lowered alone, must appear in the lowering of itself between
+/// any two of ten neighbours. It reads no table, and runs only against the
+/// server this suite is given.
+#[tokio::test]
+async fn the_database_lowers_every_character_but_sigma_without_context() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config("default"))
+        .await
+        .expect("connect");
+    let sql = "SELECT toUInt64(countIf(fails AND cp != 931)) AS without_sigma, \
+                      toUInt64(countIf(fails)) AS with_sigma \
+               FROM (SELECT cp, \
+                       arrayExists(l -> arrayExists(r -> \
+                         position(lowerUTF8(concat(l, x, r)), lowerUTF8(x)) = 0, ns), ns) AS fails \
+                     FROM (SELECT toUInt32(number) AS cp, \
+                             multiIf(cp < 128, char(cp), \
+                                     cp < 2048, char(192 + intDiv(cp, 64), 128 + cp % 64), \
+                                     cp < 65536, char(224 + intDiv(cp, 4096), \
+                                                      128 + intDiv(cp, 64) % 64, 128 + cp % 64), \
+                                     char(240 + intDiv(cp, 262144), 128 + intDiv(cp, 4096) % 64, \
+                                          128 + intDiv(cp, 64) % 64, 128 + cp % 64)) AS x, \
+                             ['A', ' ', '1', 'İ', 'ς', '\u{307}', 'ß', 'Ω', 'Α', 'Σ'] AS ns \
+                           FROM numbers(1114112) \
+                           WHERE number < 55296 OR number > 57343)) \
+               SETTINGS max_memory_usage = 4294967296";
+    let mut stream = client
+        .query_stream::<LoweringFailures>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let got = stream.next().await.expect("one row").expect("decode");
+    assert_eq!(
+        (got.without_sigma, got.with_sigma),
+        (0, 1),
+        "code points the database lowers differently in context"
+    );
 }

@@ -1352,11 +1352,12 @@ async fn stage3_never_match_arm_regex_line_filter_prunes_on_the_ngram_index() {
 }
 
 /// Issue #757: `|= word(…) or "…"` renders `((hasToken(…)) OR (body LIKE
-/// …))`. A `word(…)` alternative derives no lowered literal, so since issue
-/// #839 the group carries no lowered-literal check: only the word index is
-/// listed, and with one arm no index reads, the read prunes nothing.
+/// …))`; both body indexes are listed, and the `<Combined skip indexes>`
+/// block that joins them under `OR` confines the read. Since issue #839 the
+/// substring alternative carries its own lowered-literal check, which is
+/// what `idx_body_ngrams` reads.
 #[tokio::test]
-async fn stage3_word_or_substring_line_filter_prunes_nothing() {
+async fn stage3_word_or_substring_line_filter_prunes_through_the_combined_block() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_word_or_sub");
     let ts_ns = now_ns();
@@ -1367,8 +1368,42 @@ async fn stage3_word_or_substring_line_filter_prunes_nothing() {
         ts_ns,
         &client,
         r#"{service_name="checkout"} |= word("refused") or "nomatchzzzz""#,
-        PrunesBy::NotAtAll,
-        &["idx_body_words"],
+        PrunesBy::Strongly,
+        &["idx_body_words", "idx_body_ngrams"],
+        true,
+    )
+    .await;
+}
+
+/// Issue #839 addendum F2: a case-sensitive needle with characters outside
+/// ASCII carries a check the database lowers, `lowerUTF8('größe')`, which
+/// `idx_body_ngrams` reads. The fixture gains one line holding the needle.
+#[tokio::test]
+async fn stage3_non_ascii_needle_prunes_on_the_ngram_index() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s3_non_ascii");
+    let ts_ns = now_ns();
+    let client = setup_with_line_filter_corpus(db, ts_ns).await;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+                 VALUES ('checkout', {FP_PROD}, toInt64({ts_ns}) - 1800000000000, 0, \
+                 'Größe des Puffers')"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("seed the needle line");
+
+    assert_stage3_usage(
+        db,
+        ts_ns,
+        &client,
+        r#"{service_name="checkout"} |= "Größe""#,
+        PrunesBy::Strongly,
+        &["idx_body_ngrams"],
         false,
     )
     .await;

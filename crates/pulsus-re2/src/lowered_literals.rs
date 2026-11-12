@@ -300,6 +300,9 @@ mod tests {
             ("(?i)(error|ok)", None),
             ("(?i)task", None),
             ("(?i)ΣΦΑΛΜΑ", None),
+            ("Größe", sets(&[&["größe"]])),
+            ("(?i)größe", None),
+            ("ΟΔΟΣ", None),
         ];
         let mut wrong: Vec<String> = Vec::new();
         for (pattern, want) in &patterns {
@@ -308,13 +311,24 @@ mod tests {
                 wrong.push(format!("regex {pattern:?}: got {got:?}, expected {want:?}"));
             }
         }
-        let needles: [(&str, &[&str]); 6] = [
-            ("Connection refused", &["connection refused"]),
-            ("Größe des Puffers", &["e des puffers"]),
-            ("接続エラー", &["接続エラー"]),
-            ("abc", &[]),
-            ("connection", &["connection"]),
-            ("Größe", &[]),
+        let long = "x".repeat(300);
+        let long_cut = "x".repeat(256);
+        let cyrillic_cut = "ж".repeat(128);
+        let cyrillic = "Ж".repeat(200);
+        let needles: Vec<(&str, Vec<String>)> = vec![
+            ("Connection refused", vec!["connection refused".into()]),
+            // Issue #839 addendum F2: any character but U+03A3 joins a run;
+            // ASCII is lowered here, the rest by the database.
+            ("Größe des Puffers", vec!["größe des puffers".into()]),
+            ("接続エラー", vec!["接続エラー".into()]),
+            ("abc", vec![]),
+            ("connection", vec!["connection".into()]),
+            ("Größe", vec!["größe".into()]),
+            ("Ошибка", vec!["Ошибка".into()]),
+            ("ΟΔΟΣ οδος", vec![" οδος".into()]),
+            // F3: the first 256 bytes of a run, cut at a character boundary.
+            (&long, vec![long_cut.clone()]),
+            (&cyrillic, vec![cyrillic_cut.to_uppercase()]),
         ];
         for (needle, want) in needles {
             let got = lowered_needle_literals(needle);

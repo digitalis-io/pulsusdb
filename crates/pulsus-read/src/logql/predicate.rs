@@ -2558,6 +2558,39 @@ mod tests {
         );
     }
 
+    /// Issue #839 addendum F1, F2: each alternative carries its own check,
+    /// a `word(…)` alternative none, and a run that is not ASCII is lowered
+    /// by the database.
+    #[test]
+    fn each_alternative_carries_its_own_lowered_check() {
+        let cases = [
+            (
+                LineFilter {
+                    op: LineFilterOp::Contains,
+                    head: LineMatch::Words(vec!["refused".to_string()]),
+                    or_matches: vec![LineMatch::Text("nomatchzzzz".to_string())],
+                },
+                "((hasToken(upperUTF8(lowerUTF8(body)), upperUTF8(lowerUTF8('refused')))) OR ((multiSearchAny(lowerUTF8(body), ['nomatchzzzz']) AND body LIKE '%nomatchzzzz%')))",
+            ),
+            (
+                LineFilter {
+                    op: LineFilterOp::Contains,
+                    head: LineMatch::Text("Größe".to_string()),
+                    or_matches: Vec::new(),
+                },
+                "(multiSearchAny(lowerUTF8(body), [lowerUTF8('größe')]) AND body LIKE '%Größe%')",
+            ),
+            (
+                regex_filter("(?i)connection.*refused"),
+                "(multiSearchAny(lowerUTF8(body), ['connection']) AND multiSearchAny(lowerUTF8(body), ['refu']) AND match(identity(body), '(?i)connection.*refused'))",
+            ),
+        ];
+        for (lf, want) in cases {
+            let got = line_filter(&lf).expect("every case mints");
+            assert_eq!(got.as_sql(), want, "{lf}");
+        }
+    }
+
     #[test]
     fn a_regex_line_filter_renders_the_bare_unanchored_match() {
         assert_eq!(
