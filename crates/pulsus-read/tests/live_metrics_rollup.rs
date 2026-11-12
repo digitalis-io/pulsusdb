@@ -5793,60 +5793,57 @@ fn minute_end() -> i64 {
     (now_ms() / HOUR) * HOUR - HOUR
 }
 
-/// **T2 (issue #810, D3, §3): the newest steps serve what the level has.**
+/// **E1 (issue #836): a panel read at a level ends at the newest built
+/// bucket.** A counter rising 1 a second over 4 h, the first level built to
+/// `W = end - 10 min`; `sum(rate(c[1m]))` over 8 h at 15 s, pushed and in
+/// process: every step with its window inside the data and at or before
+/// `W` is 1.0, every later step absent, one statement each.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_newest_steps_serve_what_the_level_has() {
+async fn a_panel_at_a_level_ends_at_the_newest_built_bucket() {
     skip_unless_live!();
     let end = minute_end();
     let w = end - 10 * MIN;
     let built = one_counter(DB_T2.name(), end, w).await;
+    let db = built.db().to_string();
     let q = "sum(rate(c[1m]))";
-    let p = range(end - 3 * HOUR, end, SCRAPE);
+    let p = range(end - 8 * HOUR, end, SCRAPE);
+    // The data starts 4 h before `end`; a window wholly inside it.
+    let first = end - 4 * HOUR + 10 * MIN;
     let t = no_tenant();
     let mut failures = Vec::new();
-    for (name, e) in [
-        ("pushed", built.pushed_engine(None).await),
-        ("in process", built.engine(true, None).await),
-    ] {
+    for (name, pushed) in [("pushed", true), ("in process", false)] {
+        let comment = comment_for(&db, &format!("e1{}", u8::from(pushed)));
+        let e = if pushed {
+            built.pushed_engine(Some(&comment)).await
+        } else {
+            built.engine(true, Some(&comment)).await
+        };
         let points = ask(&e, &t, q, &p).await.points();
         for step in times_of(&p) {
-            let g = ceil_to(step, MIN);
-            let k = (g - w) / MIN;
-            let want = match k {
-                ..=1 => Some(1.0),
-                2 => Some(0.7),
-                3 => Some(0.5),
-                _ => None,
-            };
             let got = points
                 .iter()
                 .find(|((_, at), _)| *at == step)
                 .map(|(_, v)| *v);
-            let ok = match (want, got) {
-                (Some(a), Some(b)) => (a - b).abs() <= 1e-12,
-                (None, None) => true,
-                _ => false,
+            let ok = if step > w {
+                got.is_none()
+            } else if step >= first {
+                got.is_some_and(|v| (v - 1.0).abs() <= 1e-12)
+            } else {
+                true
             };
             if !ok {
-                failures.push(format!(
-                    "{name} at {step} (k = {k}): want {want:?}, got {got:?}"
-                ));
+                failures.push(format!("{name} at {step} (W {w}): got {got:?}"));
             }
         }
-    }
-    let raw = ask(&built.engine(false, None).await, &t, q, &p)
-        .await
-        .points();
-    for step in times_of(&p) {
-        let got = raw.iter().find(|((_, at), _)| *at == step).map(|(_, v)| *v);
-        if got.is_none_or(|v| (v - 1.0).abs() > 1e-12) {
-            failures.push(format!("raw at {step}: got {got:?}"));
+        let sent = logged(&built.admin, &comment).await;
+        if sent.len() != 1 {
+            failures.push(format!("{name}: {} statements", sent.len()));
         }
     }
     built.finish().await;
     assert!(
         failures.is_empty(),
-        "T2: {} failures, first 20:\n{}",
+        "E1: {} failures, first 20:\n{}",
         failures.len(),
         failures
             .iter()
@@ -5855,6 +5852,79 @@ async fn the_newest_steps_serve_what_the_level_has() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+static DB_E3: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t836_e3");
+
+/// **E3 (issue #836): an instant query reads the level as of its newest
+/// built bucket.** A gauge at 1 every 15 s over 9 h, one sample of 100 at
+/// `T - 8 h - 2 min`, the first level built to `W = T - 4 min`; instant
+/// `max_over_time(g[8h])` at `T`. The spike is inside the window ending at
+/// `W` and outside the one ending at `T`: the answer is the routing-off
+/// value at `W`, 100, with the request's time; one statement.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instant_query_reads_the_level_as_of_its_built_bucket() {
+    skip_unless_live!();
+    let at = minute_end();
+    let w = at - 4 * MIN;
+    let lo = at - 9 * HOUR;
+    let spike = at - 8 * HOUR - 2 * MIN;
+    let fp = "toUInt128('24000000000000000000000000000000836003')";
+    let land = vec![
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, 'g', {fp}, \
+                    toInt64({lo}) + toInt64(number) * {HOUR} + 1000, '{{\"job\":\"g\"}}', 0 FROM numbers(10)",
+            db = DB_E3.name()
+        ),
+        format!(
+            "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, value) \
+             SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 0, 'g', {fp}, \
+                    toInt64({lo}) + toInt64(number) * {SCRAPE} AS ts, if(ts = {spike}, 100., 1.) \
+             FROM numbers(1, {})",
+            9 * HOUR / SCRAPE,
+            db = DB_E3.name()
+        ),
+    ];
+    let (bootstrap, admin, ctx) = first_only(DB_E3.name(), DEFAULTS, &land, lo, w).await;
+    let built = warm(bootstrap, admin, ctx, &[]).await;
+    let db = built.db().to_string();
+    let q = "max_over_time(g[8h])";
+    let t = no_tenant();
+    let instant = |at: i64| MetricQueryParams {
+        start_ms: at,
+        end_ms: at,
+        step_ms: 0,
+    };
+    let comment = comment_for(&db, "e3");
+    let on = built.engine(true, Some(&comment)).await;
+    let a = ask(&on, &t, q, &instant(at)).await;
+    let sent = logged(&built.admin, &comment).await;
+    let off = built.engine(false, None).await;
+    let at_w = ask(&off, &t, q, &instant(w)).await.points();
+    let at_t = ask(&off, &t, q, &instant(at)).await.points();
+    built.finish().await;
+    let mut failures = Vec::new();
+    if !matches!(a.result, QueryResult::Vector(_)) {
+        failures.push(format!(
+            "not an instant vector, answered at the request's time: {:?}",
+            a.result
+        ));
+    }
+    let got: Vec<f64> = a.points().values().copied().collect();
+    let want: Vec<f64> = at_w.values().copied().collect();
+    if want != vec![100.0] || got != want {
+        failures.push(format!("got {got:?}, routing off at W {want:?}"));
+    }
+    if at_t.values().copied().collect::<Vec<f64>>() != vec![1.0] {
+        failures.push(format!(
+            "routing off at T {at_t:?}: the case does not tell the two apart"
+        ));
+    }
+    if sent.len() != 1 {
+        failures.push(format!("{} statements", sent.len()));
+    }
+    assert!(failures.is_empty(), "E3:\n{}", failures.join("\n"));
 }
 
 /// **T3 (issue #810, D11): an in-process routed selector is one statement.**
