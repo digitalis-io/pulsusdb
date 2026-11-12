@@ -149,3 +149,15 @@ mod tests {
         assert_eq!(a, b);
     }
 }
+
+/// #835 addendum: one row of a paired read ([`super::sample_sql::paired_fetch`]):
+/// a float sample (`arm` 3, `v`) or a native-histogram sample (`arm` 1,
+/// `h`'s one element).
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+pub struct PairedSampleRow {
+    pub arm: u8,
+    pub fingerprint: Fingerprint,
+    pub t: i64,
+    pub v: f64,
+    pub h: Vec<super::rollup::HistTuple>,
+}

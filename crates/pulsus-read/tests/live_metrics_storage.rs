@@ -568,13 +568,13 @@ fn kinds_by_job(result: QueryResult) -> Vec<(String, &'static str)> {
     out
 }
 
-/// **T1 and T3 (issue #623): every fetch path sends `main`'s float read and
-/// histogram read, and the answer is `main`'s.** Float-only, histogram-only
+/// **T1 and T3 (issue #623; #835): every fetch path reads both sample
+/// tables in one statement, and the answer is `main`'s.** Float-only, histogram-only
 /// and mixed series, the mixed one holding a float and a histogram sample at
 /// one millisecond; the histogram wins the shared key. Read through the
 /// cache's chunks, the fallback (a cold cache) and the multi-metric fan-out.
 #[tokio::test]
-async fn every_fetch_path_sends_both_reads_and_the_answer_is_unchanged() {
+async fn every_fetch_path_reads_both_tables_and_the_answer_is_unchanged() {
     skip_unless_live!();
     let (bootstrap, db, client) = fresh(pulsus_testkit::test_db(
         "pulsus_read_it_metrics_storage_union",
@@ -638,9 +638,20 @@ async fn every_fetch_path_sends_both_reads_and_the_answer_is_unchanged() {
             .unwrap_or_else(|e| panic!("{path}: {e}"));
         assert_eq!(
             fetch_stages(&explain),
-            vec!["sample_fetch", "hist_sample_fetch"],
-            "{path}: one float and one histogram statement: {:#?}",
+            vec!["sample_fetch"],
+            "{path}: one statement: {:#?}",
             explain.stages
+        );
+        let fetch = &explain
+            .stages
+            .iter()
+            .find(|s| s.name == "sample_fetch")
+            .expect("the fetch")
+            .sql;
+        assert!(
+            fetch.contains("FROM metric_samples\n")
+                && fetch.contains("FROM metric_hist_samples AS hs"),
+            "{path}: both tables: {fetch}"
         );
         assert_eq!(
             kinds_by_job(result),

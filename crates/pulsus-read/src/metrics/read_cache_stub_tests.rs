@@ -235,7 +235,6 @@ async fn w1_case(fail: bool) -> (Header, u64, usize) {
         query: "1",
         params: p,
         facts: engine.plan_facts(&expr, &p).expect("facts"),
-        max_samples: u64::MAX,
         retention_floor_ms: Some(i64::MIN),
         sweep_time_ms: None,
     };
@@ -320,7 +319,6 @@ mod t19 {
                 oldest_input_ms: 0,
                 reach_ms: 0,
             },
-            max_samples: u64::MAX,
             retention_floor_ms: Some(i64::MIN),
             sweep_time_ms: None,
         }
@@ -383,7 +381,7 @@ mod t19 {
             during_tail();
             async move { R::Ok((matrix(&q, 0.0), tail_ann, tail_facts)) }
         };
-        answer_range(cache, request(p), full, tail, |_| (), &|| true)
+        answer_range(cache, request(p), full, tail, &|| true)
             .await
             .expect("answered")
     }
@@ -615,5 +613,148 @@ mod t19 {
         assert_eq!(counts(&calls), (0, 1), "(h) tail, full");
         assert!(all_full(&a, &p2), "(h) the full answer");
         assert_eq!(c.generation(), g + 1, "(h) the poll cleared");
+    }
+    /// A routed request `p` whose `tail` charges `tail_charge`, refused
+    /// with `Err` past `cap` as the engine's budget refuses it.
+    async fn try_run(
+        cache: &ReadCache,
+        calls: &Calls,
+        p: MetricQueryParams,
+        tail_charge: u64,
+        cap: u64,
+    ) -> Result<Answer, ()> {
+        let full = |q: MetricQueryParams| {
+            calls.full.fetch_add(1, Ordering::SeqCst);
+            async move { R::Ok((matrix(&q, 1_000.0), Annotations::new(), routed(false))) }
+        };
+        let tail = |q: MetricQueryParams| {
+            calls.tail.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if tail_charge > cap {
+                    return Err(());
+                }
+                let facts = EvalFacts {
+                    charged: tail_charge,
+                    ..routed(false)
+                };
+                R::Ok((matrix(&q, 0.0), Annotations::new(), facts))
+            }
+        };
+        answer_range(cache, request(p), full, tail, &|| true).await
+    }
+
+    /// Six hours at 15 s ending `by` after `window(0)`'s end.
+    fn six_hours(by: i64) -> MetricQueryParams {
+        let end = window(0).end_ms + by;
+        MetricQueryParams {
+            start_ms: end - 21_600_000,
+            end_ms: end,
+            step_ms: 15_000,
+        }
+    }
+
+    fn three_hours(by: i64) -> MetricQueryParams {
+        let end = window(0).end_ms + by;
+        MetricQueryParams {
+            start_ms: end - 10_800_000,
+            end_ms: end,
+            step_ms: 15_000,
+        }
+    }
+
+    /// A clean routed request.
+    async fn plain(cache: &ReadCache, calls: &Calls, p: MetricQueryParams) -> Answer {
+        run(
+            cache,
+            calls,
+            p,
+            Annotations::new(),
+            Annotations::new(),
+            routed(false),
+            || {},
+        )
+        .await
+    }
+
+    /// **T12 (issue #835): a 3 h and a 6 h panel share one entry, and both
+    /// hit.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_3h_and_a_6h_panel_share_one_entry_and_both_hit() {
+        let c = cache();
+        let fill = six_hours(0);
+        assert_eq!(
+            plain(&c, &Calls::default(), fill).await.header,
+            Header::Miss
+        );
+        let c1f = c.lookup(&request(fill).key).expect("kept").c1_ms;
+        for (what, p) in [("3 h", three_hours(60_000)), ("6 h", six_hours(120_000))] {
+            let calls = Calls::default();
+            let a = plain(&c, &calls, p).await;
+            assert_eq!(a.header, Header::Hit, "{what}");
+            assert_eq!(counts(&calls), (1, 0), "{what}: (tail, full)");
+            let QueryResult::Matrix(m) = &a.result else {
+                panic!("{what}: a matrix")
+            };
+            for (t, v) in &m[0].points {
+                let base = if *t <= c1f { 1_000.0 } else { 0.0 };
+                assert_eq!(*v, base + (*t / 1000) as f64, "{what} at {t}");
+            }
+            assert_eq!(m[0].points.first().map(|x| x.0), Some(p.start_ms), "{what}");
+            assert_eq!(m[0].points.last().map(|x| x.0), Some(p.end_ms), "{what}");
+        }
+        assert_eq!(
+            c.lookup(&request(fill).key).expect("kept").c0_ms,
+            fill.start_ms,
+            "one entry from the 6 h fill's start"
+        );
+    }
+
+    /// **T13 (issue #835): an entry longer than the request answers only the
+    /// request.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_entry_longer_than_the_request_answers_only_the_request() {
+        let c = cache();
+        let fill = six_hours(0);
+        assert_eq!(
+            plain(&c, &Calls::default(), fill).await.header,
+            Header::Miss
+        );
+        let before = c.lookup(&request(fill).key).expect("kept");
+        let end = fill.end_ms;
+        let p = MetricQueryParams {
+            start_ms: end - 7_200_000,
+            end_ms: end - 3_600_000,
+            step_ms: 15_000,
+        };
+        let calls = Calls::default();
+        let a = plain(&c, &calls, p).await;
+        assert_eq!(a.header, Header::Hit);
+        assert_eq!(counts(&calls), (0, 0), "(tail, full)");
+        assert_eq!(a.result, matrix(&p, 1_000.0), "the request's points");
+        assert_eq!(a.through_ms, Some(before.c1_ms));
+        assert_eq!(
+            *c.lookup(&request(fill).key).expect("kept"),
+            *before,
+            "unchanged"
+        );
+    }
+
+    /// **T14 (issue #835): a shorter routed request on a longer entry is
+    /// judged by its tail.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shorter_routed_request_on_a_longer_entry_is_judged_by_its_tail() {
+        let c = cache();
+        let fill = try_run(&c, &Calls::default(), six_hours(0), 0, 1_000)
+            .await
+            .expect("the fill");
+        assert_eq!(fill.header, Header::Miss);
+        let calls = Calls::default();
+        let a = try_run(&c, &calls, three_hours(60_000), 200, 1_000).await;
+        assert_eq!(a.expect("answered").header, Header::Hit);
+        assert_eq!(counts(&calls), (1, 0), "(tail, full)");
+        let calls = Calls::default();
+        let a = try_run(&c, &calls, three_hours(120_000), 1_001, 1_000).await;
+        assert!(a.is_err(), "refused by the tail's own cap");
+        assert_eq!(counts(&calls), (1, 0), "(tail, full)");
     }
 }

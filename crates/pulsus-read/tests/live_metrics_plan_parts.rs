@@ -431,18 +431,6 @@ impl Harness {
             .expect("query");
     }
 
-    /// The float read this test writes out for `metric`, over the window
-    /// `(start - back, end]`, with `fps` as a rendered list.
-    fn float_read(&self, fps: &str, back: i64) -> String {
-        let p = self.range();
-        format!(
-            "SELECT fingerprint, unix_milli, value\nFROM metric_samples\nWHERE org_id = '' AND unix_milli > {} \
-             AND unix_milli <= {}\n  AND fingerprint IN ({fps})\nORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value)",
-            p.start_ms - back,
-            p.end_ms
-        )
-    }
-
     /// The grouped instant read (issue #549), written out the same way:
     /// ONE statement per fingerprint chunk, reading BOTH sample tables in
     /// a union, returning one row per run of an unchanging answer.
@@ -527,14 +515,26 @@ impl Harness {
     }
 
     /// The complementary histogram read, written out the same way.
-    fn hist_read(&self, fps: &str, back: i64) -> String {
+    /// A selector's one read (#835): its float part and its histogram
+    /// part in one statement, written out by hand.
+    fn paired_read(&self, fps: &str, back: i64) -> String {
         let p = self.range();
+        let (lo, hi) = (p.start_ms - back, p.end_ms);
+        let tuple = "Tuple(Int8, Float64, UInt64, UInt64, Float64, Array(Int32), Array(UInt32), \
+                     Array(Int64), Array(Int32), Array(UInt32), Array(Int64), Array(Float64), UInt8)";
+        let hs: Vec<String> = HIST_COLUMNS
+            .split(", ")
+            .map(|c| format!("hs.{c}"))
+            .collect();
         format!(
-            "SELECT fingerprint, unix_milli, {HIST_COLUMNS}\nFROM \
-             metric_hist_samples\nWHERE org_id = '' AND unix_milli > {} AND \
-             unix_milli <= {}\n  AND fingerprint IN ({fps})\nORDER BY fingerprint, unix_milli",
-            p.start_ms - back,
-            p.end_ms
+            "(SELECT toUInt8(3) AS arm, fingerprint, unix_milli AS t, value AS v, CAST([], 'Array({tuple})') AS h\n\
+             FROM metric_samples\nWHERE org_id = '' AND unix_milli > {lo} AND unix_milli <= {hi}\n  \
+             AND fingerprint IN ({fps})\nORDER BY fingerprint, unix_milli, reinterpretAsUInt64(value))\n\
+             UNION ALL\n\
+             (SELECT toUInt8(1), hs.fingerprint AS fingerprint, hs.unix_milli AS t, 0., [CAST(({}), '{tuple}')]\n\
+             FROM metric_hist_samples AS hs\nWHERE hs.org_id = '' AND hs.unix_milli > {lo} AND hs.unix_milli <= {hi}\n  \
+             AND hs.fingerprint IN ({fps})\nORDER BY hs.fingerprint, hs.unix_milli)",
+            hs.join(", ")
         )
     }
 }
@@ -649,8 +649,8 @@ async fn every_statement_the_database_received_is_the_one_the_test_wrote_out() {
     );
     assert_eq!(unexplained, want, "the unexplained request sends the same");
 
-    // 3 — two chains: four statements, and the window carries the range
-    // as well as the lookback.
+    // 3 — two chains: two statements, one a selector (#835), and the
+    // window carries the range as well as the lookback.
     let mark = now_micros(&h.admin).await;
     h.explained(&format!(
         "rate({METRIC}{{status=\"500\"}}[5m]) / on (instance) rate({ERRORS}{{status=\"500\"}}[5m])"
@@ -664,13 +664,11 @@ async fn every_statement_the_database_received_is_the_one_the_test_wrote_out() {
     );
     let back = LOOKBACK_MS + RANGE_MS;
     let want_two = sorted(vec![
-        h.float_read(FPS_SQL, back),
-        h.hist_read(FPS_SQL, back),
-        h.float_read(ERROR_FPS_SQL, back),
-        h.hist_read(ERROR_FPS_SQL, back),
+        h.paired_read(FPS_SQL, back),
+        h.paired_read(ERROR_FPS_SQL, back),
     ]);
-    assert_eq!(got.len(), 4, "two selectors, two statements each");
-    assert_eq!(got, want_two, "the two chains' four statements");
+    assert_eq!(got.len(), 2, "two selectors, one statement each");
+    assert_eq!(got, want_two, "the two chains' two statements");
 
     // 4 — a query that sends nothing. The poll stops on stability without
     // ever seeing a row.

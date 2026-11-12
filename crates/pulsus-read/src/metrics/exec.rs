@@ -24,7 +24,7 @@
 //! **`X-Pulsus-Explain` carries real SQL** (code review round 1, finding
 //! 5): every `sample_fetch` stage's SQL is built once, synchronously, in
 //! `query_inner`'s phase-1 loop (a pure function of `(selector,
-//! resolution, window)` — see [`build_chunk_sqls`]/
+//! resolution, window)` — see [`listed_statements`]/
 //! [`sample_sql::sample_fetch_subquery`]) and handed pre-built into phase
 //! 2's concurrent fetches, so the explain trace and the actual executed
 //! SQL can never drift. A cache-hit selector splitting into >1 chunk
@@ -48,7 +48,9 @@ use pulsus_promql::{
 use super::compile;
 use super::labels::{LabelledResolution, MetricSeriesGroup, MultiMetricResolution};
 use super::matcher::{DataWindow, DiscoveryFilter};
-use super::sample_rows::{HistSampleRow, MultiHistSampleRow, MultiSampleRow, SampleRow};
+use super::sample_rows::{
+    HistSampleRow, MultiHistSampleRow, MultiSampleRow, PairedSampleRow, SampleRow,
+};
 use super::sample_sql;
 use crate::compile::fold::Pred;
 use crate::logql::error::{ReadError, TooBroadReason};
@@ -1390,7 +1392,7 @@ impl MetricsEngine {
 
             // Issue #82 (retroactive re-review, Finding 1): the info()
             // cardinality cap on the WARM path, enforced BEFORE
-            // `build_chunk_sqls` — the sample query is never issued for
+            // `listed_statements` — the sample query is never issued for
             // an over-cap info-family selector. The degraded (SqlFallback)
             // path's cap is bounded further below, in its own probe.
             if sel.info_family
@@ -1988,58 +1990,54 @@ impl MetricsEngine {
                 let labels_by_fp: HashMap<Fingerprint, LabelSet> = pairs.iter().cloned().collect();
                 let fps: Vec<Fingerprint> = pairs.into_iter().map(|(fp, _)| fp).collect();
                 let total_fps = fps.len();
-                // Issue #548: the leaf carries the FIRST chunk's
-                // fingerprint list, which is the rule the explain
-                // surface already follows for stage SQL — the chunk
-                // driver is not represented and the module doc says
-                // so. Sorted here the way `build_chunk_sqls` sorts,
-                // so the leaf and the statement carry one list.
-                //
-                // **A read is recorded only where a chunk exists, and
-                // that is the same condition as a statement being
-                // sent**: `build_chunk_sqls` renders one statement per
-                // chunk of this same list. An empty fingerprint set —
-                // a concrete metric name the cache does not know —
-                // yields ZERO chunks and zero statements, and a read
-                // recorded there would put a plan naming two
-                // statements on the explain surface for a read the
-                // database never performed (code review round 2).
-                if explain.is_some()
-                    && let Some(reads) = reads
-                {
-                    let mut sorted = fps.clone();
-                    sorted.sort_unstable();
-                    if let Some(first_chunk) = sample_sql::chunk_fingerprints(
-                        &sql_literals(&sorted),
-                        sample_sql::CHUNK_THRESHOLD,
-                    )
-                    .first()
-                    {
-                        reads.push(compile::SelectorRead {
-                            selector: selector_id,
-                            pred: compile::selector_pred(
-                                None,
-                                &sample_sql::window_predicate(lower_excl, upper_incl),
-                                &sample_sql::fingerprints_predicate(first_chunk),
-                            ),
-                            shape: compile::PqlShape::Samples,
-                        });
-                    }
-                }
-                let hist_sqls = build_hist_chunk_sqls(
-                    tenant,
-                    &self.config.hist_samples_table,
-                    fps.clone(),
-                    lower_excl,
-                    upper_incl,
-                );
-                let sqls = build_chunk_sqls(
+                // The plan leaf's list, kept only under the explain header.
+                let leaf_fps = explain.is_some().then(|| fps.clone());
+                // #835 addendum: one paired statement over the whole
+                // list, today's chunks only past the text limit.
+                let sqls = listed_statements(
                     tenant,
                     &self.config.samples_table,
+                    &self.config.hist_samples_table,
                     fps,
                     lower_excl,
                     upper_incl,
+                    self.statement_cap,
                 );
+                // Issue #548: the leaf carries the FIRST statement's
+                // fingerprint list — the whole list, or past the text
+                // limit the first chunk's — which is the rule the explain
+                // surface already follows for stage SQL; the chunk driver
+                // is not represented and the module doc says so. Sorted
+                // here the way `listed_statements` sorts, so the leaf and
+                // the statement carry one list.
+                //
+                // **A read is recorded only where a statement is sent**:
+                // an empty fingerprint set — a concrete metric name the
+                // cache does not know — yields zero statements, and a read
+                // recorded there would put a plan naming a statement on
+                // the explain surface for a read the database never
+                // performed (code review round 2).
+                if let Some(mut sorted) = leaf_fps
+                    && let Some(reads) = reads
+                    && !sqls.is_empty()
+                {
+                    sorted.sort_unstable();
+                    let lits = sql_literals(&sorted);
+                    let first: &[FpLiteral] = if sqls.len() == 1 {
+                        &lits
+                    } else {
+                        sample_sql::chunk_fingerprints(&lits, sample_sql::CHUNK_THRESHOLD)[0]
+                    };
+                    reads.push(compile::SelectorRead {
+                        selector: selector_id,
+                        pred: compile::selector_pred(
+                            None,
+                            &sample_sql::window_predicate(lower_excl, upper_incl),
+                            &sample_sql::fingerprints_predicate(first),
+                        ),
+                        shape: compile::PqlShape::Samples,
+                    });
+                }
                 if let Some(e) = explain.as_mut() {
                     // Chunk elision (finding 5): only the first chunk's
                     // SQL is surfaced verbatim; a note names how many
@@ -2055,18 +2053,8 @@ impl MetricsEngine {
                         });
                         e.push("sample_fetch", first.clone(), note);
                     }
-                    // M7-A5a: the complementary histogram read appears in
-                    // the explain trace beside the float read (built once,
-                    // synchronously — never drifts from what executes).
-                    if let Some(first) = hist_sqls.first() {
-                        e.push("hist_sample_fetch", first.clone(), None);
-                    }
                 }
-                SelectorFetchPlan::Chunks {
-                    sqls,
-                    hist_sqls,
-                    labels_by_fp,
-                }
+                SelectorFetchPlan::Chunks { sqls, labels_by_fp }
             }
             LabelledResolution::SqlFallback { sql, .. } => {
                 if explain.is_some()
@@ -2082,27 +2070,21 @@ impl MetricsEngine {
                         shape: compile::PqlShape::Samples,
                     });
                 }
-                let fetch_sql = sample_sql::sample_fetch_subquery(
+                // #835 addendum: the float and histogram parts in one
+                // statement.
+                let fetch_sql = sample_sql::paired_fetch(
                     tenant,
                     &self.config.samples_table,
-                    &sql,
-                    lower_excl,
-                    upper_incl,
-                );
-                let hist_sql = sample_sql::hist_sample_fetch_subquery(
-                    tenant,
                     &self.config.hist_samples_table,
-                    &sql,
+                    sample_sql::PairedSeries::Ids(&sql),
                     lower_excl,
                     upper_incl,
                 );
                 if let Some(e) = explain.as_mut() {
                     e.push("sample_fetch", fetch_sql.clone(), None);
-                    e.push("hist_sample_fetch", hist_sql.clone(), None);
                 }
                 SelectorFetchPlan::Fallback {
                     sql: fetch_sql,
-                    hist_sql,
                     ids_sql: sql.clone(),
                     // Issue #82 (retroactive re-review, Finding 1):
                     // the degraded-path cap probe, built now (a pure
@@ -2470,24 +2452,19 @@ impl MetricsEngine {
                 labels_by.insert(fp, (g.metric_name.clone(), labels));
             }
         }
-        let sql = sample_sql::sample_fetch_subquery(
+        // #835 addendum: the float and histogram parts in one statement.
+        let sql = sample_sql::paired_fetch(
             tenant,
             &self.config.samples_table,
-            &ids,
-            lower_excl,
-            upper_incl,
-        );
-        let hist_sql = sample_sql::hist_sample_fetch_subquery(
-            tenant,
             &self.config.hist_samples_table,
-            &ids,
+            sample_sql::PairedSeries::Ids(&ids),
             lower_excl,
             upper_incl,
         );
         if let Some(e) = explain.as_mut() {
             e.push("sample_fetch", sql.clone(), None);
-            e.push("hist_sample_fetch", hist_sql.clone(), None);
         }
+        let sql = MultiSql::One(sql);
         let read = explain.is_some().then(|| {
             compile::selector_pred(
                 None,
@@ -2498,7 +2475,6 @@ impl MetricsEngine {
         (
             SelectorFetchPlan::Multi {
                 sql,
-                hist_sql,
                 labels_by,
                 nested: true,
             },
@@ -2538,25 +2514,20 @@ impl MetricsEngine {
             }
         }
 
-        let sql = sample_sql::sample_fetch_multi(
+        // #835 addendum: one paired statement, today's two past the text
+        // limit.
+        let sql = multi_statements(
             tenant,
             &self.config.samples_table,
-            &sql_literals(&fps),
-            lower_excl,
-            upper_incl,
-        )
-        .map_err(ReadError::QueryTooBroad)?;
-        let hist_sql = sample_sql::hist_sample_fetch_multi(
-            tenant,
             &self.config.hist_samples_table,
             &sql_literals(&fps),
             lower_excl,
             upper_incl,
+            self.statement_cap,
         )
         .map_err(ReadError::QueryTooBroad)?;
         if let Some(e) = explain.as_mut() {
-            e.push("sample_fetch", sql.clone(), None);
-            e.push("hist_sample_fetch", hist_sql.clone(), None);
+            push_multi_stages(e, &sql);
         }
         // Issue #548: the fan-out's own predicate, built only under the
         // explain header.
@@ -2570,7 +2541,6 @@ impl MetricsEngine {
         Ok((
             SelectorFetchPlan::Multi {
                 sql,
-                hist_sql,
                 labels_by,
                 nested: false,
             },
@@ -2612,33 +2582,23 @@ impl MetricsEngine {
             SelectorFetchPlan::Rollup(plan) => {
                 return self.fetch_rollup(sel, *plan, budget, scope).await;
             }
-            SelectorFetchPlan::Chunks {
-                sqls,
-                hist_sqls,
-                labels_by_fp,
-            } => {
-                if sqls.is_empty() && hist_sqls.is_empty() {
+            SelectorFetchPlan::Chunks { sqls, labels_by_fp } => {
+                if sqls.is_empty() {
                     return Ok((Vec::new(), None));
                 }
                 let metric_name = concrete_name(sel)?;
-                // M7-A5a: dispatch the float and complementary histogram
-                // chunk reads CONCURRENTLY (A1 v5 latency-hiding — the
-                // single-type complementary read is zero-granule but must
-                // not add a serial round trip).
-                let (rows, hist_rows) = fetch_dual_concurrently(
-                    fetch_all_concurrently(sqls, |sql| {
-                        self.fetch_sample_rows::<SampleRow>(sql, budget)
-                    }),
-                    fetch_all_concurrently(hist_sqls, |sql| {
-                        self.fetch_sample_rows::<HistSampleRow>(sql, budget)
-                    }),
-                )
+                // #835 addendum: each statement holds both parts; past the
+                // text limit the chunks run concurrently, merged in
+                // dispatch order, which is fingerprint order.
+                let paired = fetch_all_concurrently(sqls, |sql| {
+                    self.fetch_sample_rows::<PairedSampleRow>(sql, budget)
+                })
                 .await?;
+                let (rows, hist_rows) = split_paired(paired);
                 group_merged_rows(rows, hist_rows, &labels_by_fp, metric_name)
             }
             SelectorFetchPlan::Fallback {
                 sql,
-                hist_sql,
                 ids_sql,
                 info_series_probe,
             } => {
@@ -2671,12 +2631,10 @@ impl MetricsEngine {
                     self.config.skip_unavailable_shards,
                     self.config.max_replica_delay_secs,
                 );
-                let (rows, hist_rows): (Vec<SampleRow>, Vec<HistSampleRow>) =
-                    fetch_dual_concurrently(
-                        self.fetch_rows_with(sql, &settings, Some(budget)),
-                        self.fetch_rows_with(hist_sql, &settings, Some(budget)),
-                    )
-                    .await?;
+                // #835 addendum: both parts in one statement.
+                let paired: Vec<PairedSampleRow> =
+                    self.fetch_rows_with(sql, &settings, Some(budget)).await?;
+                let (rows, hist_rows) = split_paired(paired);
                 if rows.is_empty() && hist_rows.is_empty() {
                     return Ok((Vec::new(), None));
                 }
@@ -2705,7 +2663,6 @@ impl MetricsEngine {
             }
             SelectorFetchPlan::Multi {
                 sql,
-                hist_sql,
                 labels_by,
                 nested,
             } => {
@@ -2725,12 +2682,22 @@ impl MetricsEngine {
                         self.config.max_replica_delay_secs,
                     )
                 };
-                let (rows, hist_rows): (Vec<MultiSampleRow>, Vec<MultiHistSampleRow>) =
-                    fetch_dual_concurrently(
-                        self.fetch_rows_with(sql, &settings, Some(budget)),
-                        self.fetch_rows_with(hist_sql, &settings, Some(budget)),
-                    )
-                    .await?;
+                let (rows, hist_rows): (Vec<MultiSampleRow>, Vec<MultiHistSampleRow>) = match sql {
+                    // #835 addendum: both parts in one statement.
+                    MultiSql::One(sql) => {
+                        let paired: Vec<PairedSampleRow> =
+                            self.fetch_rows_with(sql, &settings, Some(budget)).await?;
+                        split_paired_multi(paired)
+                    }
+                    // Past the text limit: today's two, concurrently.
+                    MultiSql::Two { sql, hist_sql } => {
+                        fetch_dual_concurrently(
+                            self.fetch_rows_with(sql, &settings, Some(budget)),
+                            self.fetch_rows_with(hist_sql, &settings, Some(budget)),
+                        )
+                        .await?
+                    }
+                };
                 let mut series = group_merged_multi_rows(rows, hist_rows, &labels_by)?;
                 // The order the fan-out answered in before issue #623, when
                 // its rows arrived by name: sorted names, then ascending IDs.
@@ -4716,30 +4683,32 @@ fn push_rollup_route(
     );
 }
 
+/// #835 addendum: the multi-name read's statements, for explain.
+fn push_multi_stages(e: &mut PlanExplain, sql: &MultiSql) {
+    match sql {
+        MultiSql::One(sql) => e.push("sample_fetch", sql.clone(), None),
+        MultiSql::Two { sql, hist_sql } => {
+            e.push("sample_fetch", sql.clone(), None);
+            e.push("hist_sample_fetch", hist_sql.clone(), None);
+        }
+    }
+}
+
 /// Issue #579: the statements a pushed node's fallback sends, for explain.
 fn push_fallback_stages(e: &mut PlanExplain, fallback: &SelectorFetchPlan) {
     match fallback {
-        SelectorFetchPlan::Chunks {
-            sqls, hist_sqls, ..
-        } => {
+        SelectorFetchPlan::Chunks { sqls, .. } => {
             if let Some(first) = sqls.first() {
                 e.push("sample_fetch", first.clone(), None);
             }
-            if let Some(first) = hist_sqls.first() {
-                e.push("hist_sample_fetch", first.clone(), None);
-            }
         }
         // Issue #579 part 2: a multi-name node's fallback is the fan-out's
-        // one fetch.
-        SelectorFetchPlan::Multi { sql, hist_sql, .. } => {
-            e.push("sample_fetch", sql.clone(), None);
-            e.push("hist_sample_fetch", hist_sql.clone(), None);
-        }
+        // fetch.
+        SelectorFetchPlan::Multi { sql, .. } => push_multi_stages(e, sql),
         // Issue #579 part 3: a node pushed over the SQL route falls back to
         // that route's fetch.
-        SelectorFetchPlan::Fallback { sql, hist_sql, .. } => {
+        SelectorFetchPlan::Fallback { sql, .. } => {
             e.push("sample_fetch", sql.clone(), None);
-            e.push("hist_sample_fetch", hist_sql.clone(), None);
         }
         // Part 4: a `Level` side's fallback is the level route, whose
         // pieces reach explain when it runs.
@@ -4925,48 +4894,44 @@ enum PushResult {
 /// for `X-Pulsus-Explain`, code review round 1 finding 5), then executed
 /// in phase 2 without re-deriving anything.
 enum SelectorFetchPlan {
-    /// Cache-hit path: one `sample_fetch` SQL string per chunk (already
-    /// ascending-fingerprint-sorted — see [`build_chunk_sqls`]), plus the
-    /// paired complementary `metric_hist_samples` chunk SQLs (M7-A5a
-    /// dual-read — same chunker/window/PK-prune, order-locked to `sqls`),
-    /// plus the labels the cache already resolved.
+    /// Cache-hit path (#835 addendum): one paired statement over the whole
+    /// ascending list ([`listed_statements`]), or, past the text limit, one
+    /// per 500-fingerprint chunk; plus the labels the cache already
+    /// resolved.
     Chunks {
         sqls: Vec<String>,
-        hist_sqls: Vec<String>,
         labels_by_fp: HashMap<Fingerprint, LabelSet>,
     },
-    /// `SqlFallback` path: the single nested-subquery `sample_fetch` SQL
-    /// and its paired complementary `metric_hist_samples` subquery fetch
-    /// (M7-A5a) — labels are hydrated afterward from the UNION of
-    /// fingerprints both reads return (a histogram-only fingerprint must
-    /// still hydrate labels).
+    /// `SqlFallback` path: the nested-subquery read, its float and
+    /// histogram parts in one statement (#835 addendum) — labels are
+    /// hydrated afterward from every fingerprint it returns (a
+    /// histogram-only fingerprint must still hydrate labels).
     Fallback {
         sql: String,
-        hist_sql: String,
-        /// The series ID statement `sql` and `hist_sql` nest, which the
-        /// label lookup reads by (issue #579 part 3, D2).
+        /// The series ID statement `sql` nests, which the label lookup
+        /// reads by (issue #579 part 3, D2).
         ids_sql: String,
         /// Issue #82 (retroactive re-review, Finding 1): `Some` only for
         /// an `info_family` selector — the `LIMIT cap+1`-bounded
         /// series-selection probe [`MetricsEngine::execute_fetch_plan`]
-        /// runs and counts BEFORE issuing `sql`/`hist_sql`, so an
-        /// over-cap `*_info` fetch never materializes a single sample
-        /// row. `None` for an ordinary selector, which always fetches
-        /// the complete (unbounded) result.
+        /// runs and counts BEFORE issuing `sql`, so an over-cap `*_info`
+        /// fetch never materializes a single sample row. `None` for an
+        /// ordinary selector, which always fetches the complete
+        /// (unbounded) result.
         info_series_probe: Option<String>,
     },
     /// Issue #85 (M6-08c): the name-less/regex-`__name__` fan-out — one
-    /// `fingerprint IN (…)` fetch over every resolved series ID, each ID's
+    /// `fingerprint IN (…)` read over every resolved series ID, each ID's
     /// name and labels pre-resolved (an ID names one series, issue #623),
-    /// plus the paired complementary `metric_hist_samples` fetch (M7-A5a).
-    /// Labels are never fabricated empty — see [`group_multi_rows`].
+    /// its float and histogram parts in one statement, or today's two past
+    /// the text limit (#835 addendum). Labels are never fabricated empty —
+    /// see [`group_multi_rows`].
     ///
-    /// Issue #635 part 3: `nested` when `sql` and `hist_sql` read the IDs
-    /// by statement 1 as a sub-query rather than a literal list — they
-    /// then run with [`series_read_settings`].
+    /// Issue #635 part 3: `nested` when the read takes the IDs by
+    /// statement 1 as a sub-query rather than a literal list — it then
+    /// runs with [`series_read_settings`].
     Multi {
-        sql: String,
-        hist_sql: String,
+        sql: MultiSql,
         labels_by: HashMap<Fingerprint, (String, LabelSet)>,
         nested: bool,
     },
@@ -5306,28 +5271,174 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// Sorts `fps` ascending, then splits into chunks and renders each
-/// chunk's `sample_fetch` SQL (code review round 1, finding 3): the
-/// `sort_unstable` here is a local hardening of the ascending-fingerprint
-/// accumulation-order invariant — it does not rely on the resolver already
-/// returning sorted fingerprints, even though `resolve_labelled` happens
-/// to. Pure — no I/O — so it runs in `query_inner`'s synchronous phase-1
-/// loop, making the real SQL available for explain before any fetch
-/// starts.
-fn build_chunk_sqls(
+/// #835 addendum: the statements a listed selector's read sends: one paired
+/// statement over the whole sorted list, or, when that would pass
+/// `text_cap` (the dispatcher's limit, measured as it measures), one paired
+/// statement per [`sample_sql::CHUNK_THRESHOLD`]-fingerprint chunk.
+fn listed_statements(
     tenant: &Tenant,
     samples_table: &str,
+    hist_samples_table: &str,
     mut fps: Vec<Fingerprint>,
     lower_excl_ms: i64,
     upper_incl_ms: i64,
+    text_cap: u64,
 ) -> Vec<String> {
+    // No series, no statement.
+    if fps.is_empty() {
+        return Vec::new();
+    }
     fps.sort_unstable();
-    sample_sql::chunk_fingerprints(&sql_literals(&fps), sample_sql::CHUNK_THRESHOLD)
+    let lits = sql_literals(&fps);
+    let paired = |chunk: &[FpLiteral]| {
+        sample_sql::paired_fetch(
+            tenant,
+            samples_table,
+            hist_samples_table,
+            sample_sql::PairedSeries::List(chunk),
+            lower_excl_ms,
+            upper_incl_ms,
+        )
+    };
+    let one = paired(&lits);
+    if fits_text(&one, text_cap) {
+        return vec![one];
+    }
+    drop(one);
+    sample_sql::chunk_fingerprints(&lits, sample_sql::CHUNK_THRESHOLD)
         .into_iter()
-        .map(|chunk| {
-            sample_sql::sample_fetch(tenant, samples_table, chunk, lower_excl_ms, upper_incl_ms)
-        })
+        .map(paired)
         .collect()
+}
+
+/// Whether `sql` is under the dispatcher's text limit `cap`, measured over
+/// its escaped text as the dispatcher measures it.
+fn fits_text(sql: &str, cap: u64) -> bool {
+    (crate::logql::exec::escape_query_placeholders(sql).len() as u64) < cap
+}
+
+/// #835 addendum: the multi-name read's statements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MultiSql {
+    /// One paired statement.
+    One(String),
+    /// Today's two, past the text limit.
+    Two { sql: String, hist_sql: String },
+}
+
+/// #835 addendum: the multi-name read's statements: one paired statement
+/// over the flat list, or today's two when that would pass `text_cap`.
+fn multi_statements(
+    tenant: &Tenant,
+    samples_table: &str,
+    hist_samples_table: &str,
+    fps: &[FpLiteral],
+    lower_excl_ms: i64,
+    upper_incl_ms: i64,
+    text_cap: u64,
+) -> Result<MultiSql, crate::logql::TooBroadReason> {
+    crate::querytext::ensure_fingerprint_set_fits(&pulsus_model::FpSet(fps))?;
+    let one = sample_sql::paired_fetch(
+        tenant,
+        samples_table,
+        hist_samples_table,
+        sample_sql::PairedSeries::List(fps),
+        lower_excl_ms,
+        upper_incl_ms,
+    );
+    if fits_text(&one, text_cap) {
+        return Ok(MultiSql::One(one));
+    }
+    Ok(MultiSql::Two {
+        sql: sample_sql::sample_fetch_multi(
+            tenant,
+            samples_table,
+            fps,
+            lower_excl_ms,
+            upper_incl_ms,
+        )?,
+        hist_sql: sample_sql::hist_sample_fetch_multi(
+            tenant,
+            hist_samples_table,
+            fps,
+            lower_excl_ms,
+            upper_incl_ms,
+        )?,
+    })
+}
+
+/// [`split_paired`] for the multi-name read's grouping.
+fn split_paired_multi(
+    rows: Vec<PairedSampleRow>,
+) -> (Vec<MultiSampleRow>, Vec<MultiHistSampleRow>) {
+    let (floats, hists) = split_paired(rows);
+    (
+        floats
+            .into_iter()
+            .map(|r| MultiSampleRow {
+                fingerprint: r.fingerprint,
+                unix_milli: r.unix_milli,
+                value: r.value,
+            })
+            .collect(),
+        hists
+            .into_iter()
+            .map(|h| MultiHistSampleRow {
+                fingerprint: h.fingerprint,
+                unix_milli: h.unix_milli,
+                schema: h.schema,
+                zero_threshold: h.zero_threshold,
+                zero_count: h.zero_count,
+                count: h.count,
+                sum: h.sum,
+                pos_span_offsets: h.pos_span_offsets,
+                pos_span_lengths: h.pos_span_lengths,
+                pos_bucket_deltas: h.pos_bucket_deltas,
+                neg_span_offsets: h.neg_span_offsets,
+                neg_span_lengths: h.neg_span_lengths,
+                neg_bucket_deltas: h.neg_bucket_deltas,
+                custom_values: h.custom_values,
+                counter_reset_hint: h.counter_reset_hint,
+            })
+            .collect(),
+    )
+}
+
+/// #835 addendum: a paired read's rows split by part, each part's order
+/// kept.
+fn split_paired(rows: Vec<PairedSampleRow>) -> (Vec<SampleRow>, Vec<HistSampleRow>) {
+    let mut floats = Vec::new();
+    let mut hists = Vec::new();
+    for r in rows {
+        if r.arm == 1 {
+            if let Some(h) = r.h.into_iter().next() {
+                hists.push(HistSampleRow {
+                    fingerprint: r.fingerprint,
+                    unix_milli: r.t,
+                    schema: h.schema,
+                    zero_threshold: h.zero_threshold,
+                    zero_count: h.zero_count,
+                    count: h.count,
+                    sum: h.sum,
+                    pos_span_offsets: h.pos_span_offsets,
+                    pos_span_lengths: h.pos_span_lengths,
+                    pos_bucket_deltas: h.pos_bucket_deltas,
+                    neg_span_offsets: h.neg_span_offsets,
+                    neg_span_lengths: h.neg_span_lengths,
+                    neg_bucket_deltas: h.neg_bucket_deltas,
+                    custom_values: h.custom_values,
+                    counter_reset_hint: h.counter_reset_hint,
+                });
+            }
+        } else {
+            floats.push(SampleRow {
+                fingerprint: r.fingerprint,
+                unix_milli: r.t,
+                value: r.v,
+            });
+        }
+    }
+    (floats, hists)
 }
 
 /// Issue #549: one grouped statement per fingerprint chunk, over the
@@ -5365,34 +5476,6 @@ fn build_grouped_sqls(
         start += chunk.len();
     }
     out
-}
-
-/// [`build_chunk_sqls`]'s M7-A5a histogram counterpart — same sort, same
-/// chunker (`CHUNK_THRESHOLD`), same window; only the SELECT column list
-/// and table name differ ([`sample_sql::hist_sample_fetch`]). Rendered over
-/// the SAME fingerprint set so the paired chunk SQLs are index-aligned
-/// (both prune the identical granules; the complementary read is zero-
-/// granule for a pure-float fingerprint — the EXPLAIN gate).
-fn build_hist_chunk_sqls(
-    tenant: &Tenant,
-    hist_samples_table: &str,
-    mut fps: Vec<Fingerprint>,
-    lower_excl_ms: i64,
-    upper_incl_ms: i64,
-) -> Vec<String> {
-    fps.sort_unstable();
-    sample_sql::chunk_fingerprints(&sql_literals(&fps), sample_sql::CHUNK_THRESHOLD)
-        .into_iter()
-        .map(|chunk| {
-            sample_sql::hist_sample_fetch(
-                tenant,
-                hist_samples_table,
-                chunk,
-                lower_excl_ms,
-                upper_incl_ms,
-            )
-        })
-        .collect()
 }
 
 /// Fetches every already-built SQL string concurrently via `join_all`,
@@ -6616,17 +6699,18 @@ mod tests {
         }
     }
 
-    // --- build_chunk_sqls / fetch_all_concurrently: cross-chunk merge
+    // --- listed_statements / fetch_all_concurrently: cross-chunk merge
     // determinism (code review round 1, finding 3) ---
 
     #[test]
-    fn build_chunk_sqls_sorts_fingerprints_before_rendering() {
+    fn listed_statements_sort_fingerprints_before_rendering() {
         // Unsorted input: chunk_size large enough for one chunk, so the
         // single resulting SQL's `IN (...)` list must read ascending
         // regardless of input order.
-        let sqls = build_chunk_sqls(
+        let sqls = listed_statements(
             &no_tenant(),
             "metric_samples",
+            "metric_hist_samples",
             vec![
                 Fingerprint::from_raw(3),
                 Fingerprint::from_raw(1),
@@ -6634,15 +6718,110 @@ mod tests {
             ],
             0,
             100,
+            crate::querytext::MAX_QUERY_TEXT_BYTES,
         );
         assert_eq!(sqls.len(), 1);
         assert!(sqls[0].contains("IN ('1', '2', '3')"), "got: {}", sqls[0]);
     }
 
+    /// **R4b (#835 addendum): one paired statement while it fits the text
+    /// limit, today's chunks or today's two past it.**
     #[test]
-    fn build_chunk_sqls_splits_at_the_chunk_threshold() {
+    fn a_read_is_one_statement_until_the_text_limit() {
+        let t = no_tenant();
+        let fps: Vec<Fingerprint> = (1..=1_200).map(Fingerprint::from_raw).collect();
+        let lits = sql_literals(&fps);
+        let one = sample_sql::paired_fetch(
+            &t,
+            "metric_samples",
+            "metric_hist_samples",
+            sample_sql::PairedSeries::List(&lits),
+            0,
+            100,
+        );
+        let len = crate::logql::exec::escape_query_placeholders(&one).len() as u64;
+        let listed = |cap| {
+            listed_statements(
+                &t,
+                "metric_samples",
+                "metric_hist_samples",
+                fps.clone(),
+                0,
+                100,
+                cap,
+            )
+        };
+        assert_eq!(listed(len + 1), vec![one.clone()], "listed: over, one");
+        let chunks: Vec<String> =
+            sample_sql::chunk_fingerprints(&lits, sample_sql::CHUNK_THRESHOLD)
+                .into_iter()
+                .map(|c| {
+                    sample_sql::paired_fetch(
+                        &t,
+                        "metric_samples",
+                        "metric_hist_samples",
+                        sample_sql::PairedSeries::List(c),
+                        0,
+                        100,
+                    )
+                })
+                .collect();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(listed(len), chunks, "listed: under, today's chunks paired");
+        let ten = &lits[..10];
+        let one = sample_sql::paired_fetch(
+            &t,
+            "metric_samples",
+            "metric_hist_samples",
+            sample_sql::PairedSeries::List(ten),
+            0,
+            100,
+        );
+        let len = crate::logql::exec::escape_query_placeholders(&one).len() as u64;
+        let multi = |cap| {
+            multi_statements(
+                &t,
+                "metric_samples",
+                "metric_hist_samples",
+                ten,
+                0,
+                100,
+                cap,
+            )
+            .expect("fits the set limit")
+        };
+        assert_eq!(multi(len + 1), MultiSql::One(one), "multi: over, one");
+        assert_eq!(
+            multi(len),
+            MultiSql::Two {
+                sql: sample_sql::sample_fetch_multi(&t, "metric_samples", ten, 0, 100)
+                    .expect("sql"),
+                hist_sql: sample_sql::hist_sample_fetch_multi(
+                    &t,
+                    "metric_hist_samples",
+                    ten,
+                    0,
+                    100
+                )
+                .expect("sql"),
+            },
+            "multi: under, today's two"
+        );
+    }
+
+    #[test]
+    fn listed_statements_split_at_the_chunk_threshold_past_the_text_limit() {
         let fps: Vec<Fingerprint> = (0..1_200).map(Fingerprint::from_raw).collect();
-        let sqls = build_chunk_sqls(&no_tenant(), "metric_samples", fps, 0, 100);
+        // Past the text limit only (#835 addendum).
+        let sqls = listed_statements(
+            &no_tenant(),
+            "metric_samples",
+            "metric_hist_samples",
+            fps,
+            0,
+            100,
+            1,
+        );
         assert_eq!(sqls.len(), 3);
     }
 

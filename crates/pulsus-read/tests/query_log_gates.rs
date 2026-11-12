@@ -16126,3 +16126,473 @@ const G2_SUM_BY: usize = 3;
 const G2_SUM_RATE: usize = 3;
 const G2_NO_SUM: usize = 3;
 const G2_IP: usize = 3;
+
+// ------------------------------------- #835 addendum: one raw statement
+
+mod one_raw_statement {
+    use std::sync::Arc;
+
+    use super::should_run;
+
+    use pulsus_clickhouse::{ChClient, QuerySettings, Row};
+    use pulsus_read::{LabelCache, MetricQueryParams, MetricsEngine};
+
+    use super::pushed_rate_corpus::{
+        Harness, LoggedStatement, anchor, cache_config, engine_config, harness_sql,
+        scale_corpus_sql, server_marker, statements_since, test_config,
+    };
+
+    /// R3, R4 and R5's corpus: `ra` and `rb`, three series each with job
+    /// `x`, and `target_info` for their instances; one sample a minute over
+    /// the 20 minutes ending a minute before `t`.
+    fn small_corpus_sql(t: i64) -> Vec<String> {
+        let mut series = Vec::new();
+        for (m, name) in ["ra", "rb", "target_info"].into_iter().enumerate() {
+            for i in 0..3 {
+                let extra = if name == "target_info" {
+                    format!(",\"version\":\"v{i}\"")
+                } else {
+                    String::new()
+                };
+                series.push(format!(
+                    "('{name}', toUInt128('{}'), '{{\"instance\":\"i{i}\",\"job\":\"x\"{extra}}}')",
+                    835_000_000_u64 + (m as u64) * 10 + i
+                ));
+            }
+        }
+        let rows = series.join(", ");
+        vec![
+            format!(
+                "CREATE TABLE r_series ENGINE = Memory AS SELECT x.1 AS metric_name, x.2 AS fingerprint, \
+                 x.3 AS labels FROM (SELECT arrayJoin([{rows}]) AS x)"
+            ),
+            format!(
+                "INSERT INTO metric_landing (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+                 SELECT toUnixTimestamp64Milli(now64(3)), 2, metric_name, fingerprint, \
+                        toInt64({t}) - h * 3600000, labels, 0 \
+                 FROM r_series ARRAY JOIN [0, 1] AS h"
+            ),
+            format!(
+                "INSERT INTO metric_samples (fingerprint, unix_milli, value) \
+                 SELECT fingerprint, toInt64({t}) - 1200000 + k * 60000, if(metric_name = 'target_info', 1., toFloat64(k)) \
+                 FROM r_series ARRAY JOIN range(20) AS k"
+            ),
+            "OPTIMIZE TABLE metric_labels FINAL".to_string(),
+            "OPTIMIZE TABLE metric_series FINAL".to_string(),
+        ]
+    }
+
+    /// An unpushed engine over a label cache listing at most `cap` series a
+    /// selector, refreshed unless `cold`; `info()` enabled.
+    async fn engine_with_cache(db: &str, cap: u64, cold: bool) -> MetricsEngine {
+        let mut cfg = cache_config(db);
+        cfg.cache_max_series = cap;
+        let cache = Arc::new(LabelCache::new(
+            ChClient::new(test_config(db)).await.expect("connect"),
+            cfg,
+        ));
+        if !cold {
+            cache.refresh().await.expect("refresh");
+        }
+        let mut config = engine_config(db, false);
+        config.experimental_functions = true;
+        MetricsEngine::new(
+            ChClient::new(test_config(db)).await.expect("connect"),
+            cache,
+            config,
+        )
+    }
+
+    /// Runs `q` over `p` on `engine` and returns its answer and the
+    /// statements it sent.
+    async fn sent(
+        h: &Harness,
+        engine: &MetricsEngine,
+        q: &str,
+        p: &MetricQueryParams,
+    ) -> (Vec<String>, Vec<LoggedStatement>) {
+        let marker = server_marker(&h.admin).await;
+        let r = Harness::run(engine, q, p).await;
+        let s = statements_since(&h.admin, &h.db, &marker).await;
+        (r.answer, s)
+    }
+
+    /// The answer's digest, its times taken from the anchor `t`, recorded
+    /// so a run of another build can be compared with it.
+    fn record(id: &str, t: i64, answer: &[String]) {
+        use std::hash::{Hash, Hasher};
+        let relative: Vec<String> = answer
+            .iter()
+            .map(|line| {
+                // `{labels} {t}:{value},…`: a time follows the labels' `] `
+                // or a `,`, and is all digits up to its `:`.
+                let (labels, points) = line.split_once("] ").unwrap_or((line, ""));
+                let mut out = format!("{labels}] ");
+                let mut rest = points;
+                let mut at_start = true;
+                while !rest.is_empty() {
+                    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+                    if at_start && digits > 0 && rest[digits..].starts_with(':') {
+                        let at: i64 = rest[..digits].parse().expect("a time");
+                        out.push_str(&(at - t).to_string());
+                        rest = &rest[digits..];
+                    }
+                    let c = rest.chars().next().expect("a char");
+                    out.push(c);
+                    at_start = c == ',';
+                    rest = &rest[c.len_utf8()..];
+                }
+                out
+            })
+            .collect();
+        let mut d = std::collections::hash_map::DefaultHasher::new();
+        relative.hash(&mut d);
+        println!(
+            "{id}: {} series, answer digest {:016x}",
+            answer.len(),
+            d.finish()
+        );
+    }
+
+    fn brief(s: &[LoggedStatement]) -> Vec<String> {
+        s.iter()
+            .map(|x| x.query.chars().take(160).collect())
+            .collect()
+    }
+
+    #[derive(Row, serde::Serialize, serde::Deserialize)]
+    struct Fp {
+        fingerprint: pulsus_model::Fingerprint,
+    }
+
+    /// The length of the one statement a read over `metrics` sent, rendered
+    /// again from its window and the metrics' series: the query log cuts a
+    /// long statement's text.
+    async fn rendered_len(h: &Harness, logged: &str, metrics: &str) -> u64 {
+        use futures::StreamExt;
+        let num = |key: &str| -> i64 {
+            logged
+                .split(key)
+                .nth(1)
+                .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|n| n.parse().ok())
+                .expect("a window bound")
+        };
+        let (lo, hi) = (num("unix_milli > "), num("unix_milli <= "));
+        let mut rows = h
+            .admin
+            .query_stream::<Fp>(
+                &format!(
+                    "SELECT DISTINCT fingerprint FROM metric_labels WHERE metric_name IN ({metrics}) \
+                     ORDER BY fingerprint"
+                ),
+                &QuerySettings::new(),
+            )
+            .await
+            .expect("fingerprints");
+        let mut lits = Vec::new();
+        while let Some(r) = rows.next().await {
+            lits.push(r.expect("a row").fingerprint.sql_literal());
+        }
+        let sql = pulsus_read::metrics::sample_sql::paired_fetch(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            "metric_samples",
+            "metric_hist_samples",
+            pulsus_read::metrics::sample_sql::PairedSeries::List(&lits),
+            lo,
+            hi,
+        );
+        let n = logged.len().min(2_000);
+        assert_eq!(&sql[..n], &logged[..n], "the statement rendered again");
+        sql.len() as u64
+    }
+
+    /// **R1: a selector the label cache lists is one statement**, its
+    /// whole list.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn r1_a_listed_selector_is_one_statement() {
+        skip_unless_live!();
+        let t = anchor();
+        let db = pulsus_testkit::test_db("pulsus_read_it_qlog_835_r1");
+        let h = harness_sql(&db, t, &scale_corpus_sql(t, 1_200, true), None).await;
+        let p = h.ten_minutes(60_000);
+        let (answer, s) = sent(&h, &h.unpushed, "cpu_seconds", &p).await;
+        record("R1", t, &answer);
+        assert!(!answer.is_empty());
+        assert_eq!(s.len(), 1, "R1: {:#?}", brief(&s));
+        assert!(
+            s[0].query.contains("UNION ALL") && !s[0].query.contains("FROM metric_series"),
+            "R1: one paired statement by the cache's list: {:#?}",
+            brief(&s)
+        );
+        h.finish().await;
+    }
+
+    /// **R2: a selector the cache cannot list** is its pair, then its
+    /// labels; **R2b**: with no sample in the window, the pair alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn r2_an_unlisted_selector_is_its_pair_then_its_labels() {
+        skip_unless_live!();
+        let t = anchor();
+        let db = pulsus_testkit::test_db("pulsus_read_it_qlog_835_r2");
+        let h = harness_sql(&db, t, &scale_corpus_sql(t, 10, true), None).await;
+        let engine = engine_with_cache(&db, 5, false).await;
+        let p = h.ten_minutes(60_000);
+        let (answer, s) = sent(&h, &engine, "cpu_seconds", &p).await;
+        record("R2", t, &answer);
+        assert!(!answer.is_empty());
+        assert_eq!(s.len(), 2, "R2: {:#?}", brief(&s));
+        let empty = MetricQueryParams {
+            start_ms: t - 3 * 3_600_000 - 600_000,
+            end_ms: t - 3 * 3_600_000,
+            step_ms: 60_000,
+        };
+        let (answer, s) = sent(&h, &engine, "cpu_seconds", &empty).await;
+        assert!(answer.is_empty(), "R2b: no sample in the window");
+        assert_eq!(s.len(), 1, "R2b: {:#?}", brief(&s));
+        h.finish().await;
+    }
+
+    /// **R3: an `info()` metadata selector the cache cannot list, under
+    /// its cap**: its probe, its pair, its labels.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn r3_an_info_selector_is_its_probe_pair_and_labels() {
+        skip_unless_live!();
+        let t = anchor();
+        let db = pulsus_testkit::test_db("pulsus_read_it_qlog_835_r3");
+        let h = harness_sql(&db, t, &small_corpus_sql(t), None).await;
+        let engine = engine_with_cache(&db, 50_000, true).await;
+        let p = h.ten_minutes(60_000);
+        let (answer, s) = sent(&h, &engine, "info(ra)", &p).await;
+        record("R3", t, &answer);
+        assert!(!answer.is_empty());
+        let info: Vec<&LoggedStatement> = s
+            .iter()
+            .filter(|x| x.query.contains("'target_info'"))
+            .collect();
+        assert_eq!(
+            info.len(),
+            3,
+            "R3: target_info's statements {:#?}",
+            brief(&s)
+        );
+        h.finish().await;
+    }
+
+    /// **R4: a `__name__` regex the cache resolves is one statement.**
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn r4_a_name_regex_is_one_statement() {
+        skip_unless_live!();
+        let t = anchor();
+        let db = pulsus_testkit::test_db("pulsus_read_it_qlog_835_r4");
+        let h = harness_sql(&db, t, &small_corpus_sql(t), None).await;
+        let p = h.ten_minutes(60_000);
+        let (answer, s) = sent(&h, &h.unpushed, r#"{__name__=~"ra|rb"}"#, &p).await;
+        record("R4", t, &answer);
+        assert_eq!(answer.len(), 6);
+        assert_eq!(s.len(), 1, "R4: {:#?}", brief(&s));
+        h.finish().await;
+    }
+
+    /// **R5: a selector with no name** is statement R, then one statement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn r5_a_nameless_selector_is_its_resolution_then_one_statement() {
+        skip_unless_live!();
+        let t = anchor();
+        let db = pulsus_testkit::test_db("pulsus_read_it_qlog_835_r5");
+        let h = harness_sql(&db, t, &small_corpus_sql(t), None).await;
+        let p = h.ten_minutes(60_000);
+        let (answer, s) = sent(&h, &h.unpushed, r#"{job="x"}"#, &p).await;
+        record("R5", t, &answer);
+        assert_eq!(answer.len(), 9);
+        assert_eq!(s.len(), 2, "R5: {:#?}", brief(&s));
+        h.finish().await;
+    }
+
+    /// **R8: a pushed node over a listed metric with a native histogram**
+    /// is its statement, then its fallback's one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn r8_a_pushed_node_falls_back_in_one_statement() {
+        skip_unless_live!();
+        let t = anchor();
+        let db = pulsus_testkit::test_db("pulsus_read_it_qlog_835_r8");
+        let h = harness_sql(&db, t, &scale_corpus_sql(t, 10, true), None).await;
+        let p = h.ten_minutes(60_000);
+        // The sum over a float and a histogram rate answers nothing; the
+        // statements are what this checks.
+        let (answer, s) = sent(&h, &h.pushed, "sum(rate(cpu_seconds[5m]))", &p).await;
+        record("R8", t, &answer);
+        assert_eq!(s.len(), 2, "R8: {:#?}", brief(&s));
+        assert!(
+            s[0].query.contains("AS range_ms") && s[1].query.contains("UNION ALL"),
+            "R8: the node, then its fallback's paired statement: {:#?}",
+            brief(&s)
+        );
+        h.finish().await;
+    }
+
+    /// **R4c: the same answer as bits from one statement and from the
+    /// split**, at the two limits of R4b.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn r4c_one_statement_and_the_split_answer_alike() {
+        skip_unless_live!();
+        let t = anchor();
+        for (id, q, metrics, corpus, split) in [
+            (
+                "listed",
+                "cpu_seconds",
+                "'cpu_seconds'",
+                scale_corpus_sql(t, 1_200, true),
+                3,
+            ),
+            (
+                "multi",
+                r#"{__name__=~"ra|rb"}"#,
+                "'ra', 'rb'",
+                small_corpus_sql(t),
+                2,
+            ),
+        ] {
+            let db = pulsus_testkit::test_db(&format!("pulsus_read_it_qlog_835_r4c_{id}"));
+            let h = harness_sql(&db, t, &corpus, None).await;
+            let p = h.ten_minutes(60_000);
+            let (whole, s) = sent(&h, &h.unpushed, q, &p).await;
+            assert_eq!(s.len(), 1, "R4c {id}: {:#?}", brief(&s));
+            let len = rendered_len(&h, &s[0].query, metrics).await;
+            let mk = |cap: u64| {
+                let cache = Arc::clone(&h.cache);
+                let db = db.clone();
+                async move {
+                    MetricsEngine::new(
+                        ChClient::new(test_config(&db)).await.expect("connect"),
+                        cache,
+                        engine_config(&db, false),
+                    )
+                    .with_statement_cap(cap)
+                }
+            };
+            let over = mk(len + 1).await;
+            let (a, s) = sent(&h, &over, q, &p).await;
+            assert_eq!(s.len(), 1, "R4c {id}, over: {:#?}", brief(&s));
+            assert_eq!(a, whole, "R4c {id}, over");
+            let under = mk(len).await;
+            let (b, s) = sent(&h, &under, q, &p).await;
+            assert_eq!(s.len(), split, "R4c {id}, under: {:#?}", brief(&s));
+            assert_eq!(b, whole, "R4c {id}: the split answers as the one statement");
+            h.finish().await;
+        }
+    }
+
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct Memory {
+        memory_usage: u64,
+        cap: String,
+        query: String,
+    }
+
+    /// **R1m: the one statement's memory**, at the label cache's
+    /// per-selector maximum: 50,000 series, 1,000 of them with native
+    /// histograms. Passes when its peak is under a tenth of the statement's
+    /// `max_memory_usage`; prints it and the chunked statements' on the
+    /// same data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn r1m_the_one_statement_at_the_series_maximum_fits_its_memory() {
+        skip_unless_live!();
+        use futures::StreamExt;
+        let t = anchor();
+        let db = pulsus_testkit::test_db("pulsus_read_it_qlog_835_r1m");
+        let corpus = vec![
+            format!(
+                "CREATE TABLE m_series ENGINE = Memory AS \
+                 SELECT toUInt32(number) AS s, toUInt128(835000000000 + number) AS fingerprint, \
+                        concat('{{\"s\":\"', toString(number), '\"}}') AS labels \
+                 FROM numbers(50000)"
+            ),
+            format!(
+                "INSERT INTO metric_landing (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+                 SELECT toUnixTimestamp64Milli(now64(3)), 2, 'mem_scale', fingerprint, \
+                        toInt64({t}) - h * 3600000, labels, 0 \
+                 FROM m_series ARRAY JOIN [0, 1] AS h"
+            ),
+            format!(
+                "INSERT INTO metric_samples (fingerprint, unix_milli, value) \
+                 SELECT fingerprint, toInt64({t}) - 1200000 + k * 60000, toFloat64(k + s) \
+                 FROM m_series ARRAY JOIN range(20) AS k WHERE s >= 1000"
+            ),
+            format!(
+                "INSERT INTO metric_hist_samples (fingerprint, unix_milli, schema, zero_threshold, zero_count, \
+                                                  count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
+                                                  neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values) \
+                 SELECT fingerprint, toInt64({t}) - 1200000 + k * 60000, 0, 0., 0, 4 + k, 5. + toFloat64(k), \
+                        [0], [3], [1, 1, -1], [], [], [], [] \
+                 FROM m_series ARRAY JOIN range(20) AS k WHERE s < 1000"
+            ),
+            "OPTIMIZE TABLE metric_labels FINAL".to_string(),
+            "OPTIMIZE TABLE metric_series FINAL".to_string(),
+        ];
+        let h = harness_sql(&db, t, &corpus, None).await;
+        let p = h.ten_minutes(60_000);
+        let memory = |marker: String| {
+            let admin = &h.admin;
+            let db = h.db.clone();
+            async move {
+                let _ = statements_since(admin, &db, &marker).await;
+                let sql = format!(
+                    "SELECT toUInt64(memory_usage) AS memory_usage, Settings['max_memory_usage'] AS cap, \
+                            substring(query, 1, 120) AS query \
+                     FROM system.query_log \
+                     WHERE current_database = '{db}' AND type = 'QueryFinish' AND query_kind = 'Select' \
+                       AND query_start_time_microseconds >= toDateTime64('{marker}', 6) \
+                       AND query NOT LIKE '%system.query_log%' AND query NOT LIKE '%now64(6)%' \
+                     ORDER BY query_start_time_microseconds"
+                );
+                let mut s = admin
+                    .query_stream::<Memory>(&sql, &QuerySettings::new())
+                    .await
+                    .expect("query_log");
+                let mut out = Vec::new();
+                while let Some(r) = s.next().await {
+                    let r = r.expect("a row");
+                    // The suite's own reads of the query log.
+                    if !r.query.starts_with("SELECT query,") {
+                        out.push(r);
+                    }
+                }
+                out
+            }
+        };
+        let marker = server_marker(&h.admin).await;
+        let r = Harness::run(&h.unpushed, "mem_scale", &p).await;
+        assert_eq!(r.answer.len(), 50_000, "R1m: every series answered");
+        let one = memory(marker).await;
+        assert_eq!(one.len(), 1, "R1m: one statement {one:#?}");
+        assert!(
+            one[0].query.starts_with("(SELECT toUInt8(3) AS arm"),
+            "R1m: the paired statement: {one:#?}"
+        );
+        let marker = server_marker(&h.admin).await;
+        let chunked = MetricsEngine::new(
+            ChClient::new(test_config(&db)).await.expect("connect"),
+            Arc::clone(&h.cache),
+            engine_config(&db, false),
+        )
+        .with_statement_cap(1024 * 1024);
+        let r2 = Harness::run(&chunked, "mem_scale", &p).await;
+        assert_eq!(r2.answer, r.answer, "R1m: the chunks answer alike");
+        let chunks = memory(marker).await;
+        let cap: u64 = one[0].cap.parse().expect("max_memory_usage");
+        let peak_chunk = chunks.iter().map(|c| c.memory_usage).max().unwrap_or(0);
+        println!(
+            "R1m: one statement {} bytes; {} chunk statements, largest {} bytes; max_memory_usage {cap}",
+            one[0].memory_usage,
+            chunks.len(),
+            peak_chunk
+        );
+        assert!(
+            one[0].memory_usage < cap / 10,
+            "R1m: the one statement used {} bytes of {cap}",
+            one[0].memory_usage
+        );
+        h.finish().await;
+    }
+}

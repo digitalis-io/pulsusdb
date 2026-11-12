@@ -1920,10 +1920,12 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
         .await
         .expect("query_explained");
     let fetch_stage = stage(&explain, "sample_fetch");
+    // #835: one statement reads both sample tables.
     assert!(
         fetch_stage
             .sql
-            .contains("SELECT fingerprint, unix_milli, value"),
+            .contains("SELECT toUInt8(3) AS arm, fingerprint, unix_milli AS t, value AS v")
+            && fetch_stage.sql.contains("FROM metric_hist_samples AS hs"),
         "expected real sample_fetch SQL, got: {}",
         fetch_stage.sql
     );
@@ -1938,15 +1940,13 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
     drop_database(&bootstrap, db).await;
 }
 
-/// **T5 (issue #623): every fetch path sends a selector's float read and
-/// histogram read at once.** A [`StatementProbe`] parks the first sample
-/// statement until a second enters (for at most [`StatementProbe::WAIT`]);
-/// a path that awaited one read before sending the other parks its first
-/// for the whole wait and records one statement in flight. A fresh probe
-/// and one chunk per path: the cache's chunks, the fallback (a window
-/// outside the cache) and the multi-metric fan-out.
+/// **T5 (issue #623; #835): every fetch path reads a selector's float and
+/// histogram samples in one statement.** A [`StatementProbe`] counts the
+/// sample statements in flight: one. A fresh probe per path: the cache's
+/// list, the fallback (a window outside the cache) and the multi-metric
+/// fan-out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_fetch_path_sends_both_reads_at_once() {
+async fn every_fetch_path_reads_both_tables_in_one_statement() {
     skip_unless_live!();
 
     let bootstrap = ChClient::new(test_config("default"))
@@ -2032,10 +2032,13 @@ async fn every_fetch_path_sends_both_reads_at_once() {
             "{path}: {fetch}"
         );
         assert!(
-            probe.max_in_flight() >= 2,
-            "{path}: the float and histogram reads must be in flight together; \
-             the probe saw at most {} statement(s) in flight",
-            probe.max_in_flight()
+            fetch.contains("UNION ALL") && fetch.contains("FROM metric_hist_samples AS hs"),
+            "{path}: one statement over both tables: {fetch}"
+        );
+        assert_eq!(
+            probe.max_in_flight(),
+            1,
+            "{path}: one sample statement in flight"
         );
     }
 
