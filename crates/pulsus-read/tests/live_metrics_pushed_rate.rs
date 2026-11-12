@@ -110,6 +110,8 @@ async fn every_covered_shape_answers_identically() {
             }
         }
     }
+    let n = 0usize;
+    assert_eq!(n, 180, "every covered shape was compared");
     h.finish().await;
 }
 
@@ -434,6 +436,12 @@ async fn multi_name_shapes_answer_identically() {
             assert_pushed_any(q, p.step_ms, &a);
         }
     }
+    let n = 0usize;
+    assert_eq!(
+        n,
+        3 * (multi_name_corpus::QUERIES.len() + 2),
+        "every multi-name shape was compared"
+    );
     h.finish().await;
 }
 

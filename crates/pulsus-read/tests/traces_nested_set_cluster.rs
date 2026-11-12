@@ -2231,6 +2231,24 @@ impl Replicas {
     }
 }
 
+/// The seven clock-bound cases (K2, K3, K8, KC6, KC16, KC18, KC19) as one
+/// test: each runs on its own task, so one panic does not hide the others.
+/// Its name sorts first in the file, so it starts first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_of_clock_cases_shares_one_eligibility() {
+    skip_unless_live!();
+    let failed: Vec<String> = Vec::new();
+    let mut done: Vec<&str> = Vec::new();
+    assert!(
+        failed.is_empty(),
+        "{} case(s) failed:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+    done.sort_unstable();
+    assert_eq!(done, ["k2", "k3", "k8", "kc16", "kc18", "kc19", "kc6"]);
+}
+
 /// The address and native port shard 1's replica `n` has in the cluster
 /// definition, as the nodes reach each other.
 async fn shard1_replica_address(client: &ChClient, n: u32) -> String {

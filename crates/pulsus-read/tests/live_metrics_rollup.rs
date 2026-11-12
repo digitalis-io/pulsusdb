@@ -712,7 +712,10 @@ static D5_8: Shared = Shared::new(
     pulsus_testkit::TestDb::new("pulsus_read_it_rollup_d5_8"),
     Corpus::D(FIVE, 0..8),
     &[
-        "each_served_function_is_within_its_distance",
+        "each_served_function_is_within_its_distance_at_60s",
+        "each_served_function_is_within_its_distance_at_720s",
+        "each_served_function_is_within_its_distance_at_7200s",
+        "each_served_function_is_within_its_distance_at_86400s",
         "a_week_reads_two_hour_rows",
         "a_raw_only_query_keeps_its_grid",
         "a_pushed_aggregate_beside_a_routed_selector",
