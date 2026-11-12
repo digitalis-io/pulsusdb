@@ -845,12 +845,23 @@ mod tests {
     fn concurrent_first_use_of_one_status_takes_one_cell() {
         let t = RequestMetrics::leak_new();
         let route = unmatched_route(t);
+        // All eight start together, and half of them record `404` first, so
+        // the first cell is contended by both codes at once.
+        let start = std::sync::Barrier::new(8);
         std::thread::scope(|scope| {
-            for _ in 0..8 {
-                scope.spawn(|| {
+            for thread in 0..8 {
+                let start = &start;
+                scope.spawn(move || {
+                    let codes = if thread % 2 == 0 {
+                        [200, 404]
+                    } else {
+                        [404, 200]
+                    };
+                    start.wait();
                     for _ in 0..1_000 {
-                        route.record(200, Duration::from_millis(1));
-                        route.record(404, Duration::from_millis(1));
+                        for code in codes {
+                            route.record(code, Duration::from_millis(1));
+                        }
                     }
                 });
             }
