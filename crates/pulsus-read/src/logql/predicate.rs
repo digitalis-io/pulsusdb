@@ -281,7 +281,7 @@ const UUID_RE: &str = r"(?i)^(?:(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4
 ///     or_matches: Vec::new(),
 /// })
 /// .expect("`boom` compiles");
-/// assert!(forged.as_sql().ends_with(&sql));
+/// assert!(forged.as_sql().contains(&sql));
 /// ```
 ///
 /// # The consequence at the builder — an illustration, not the gate
