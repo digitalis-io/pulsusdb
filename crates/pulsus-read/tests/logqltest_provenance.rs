@@ -683,9 +683,9 @@ fn check_d_escape_rs_surface_is_allowlisted_and_fail_closed() {
 /// Issue #450 AC3b, issue #757 — the pruning residual is stated where the
 /// renderer is read, not only in the issue trail.
 ///
-/// `idx_body_ngrams`, the `ngrambf_v1` index on `body`, serves
-/// `ch_like_contains`'s `body LIKE` through the needle's four-character
-/// sequences (issue #757). The next reader of this function is entitled to
+/// `idx_body_ngrams`, the `ngrambf_v1` index on `lowerUTF8(body)`, serves
+/// the lowered-literal check in front of `ch_like_contains`'s `body LIKE`
+/// through the needle's four-character sequences (issues #757, #839). The next reader of this function is entitled to
 /// learn that from the function, and where a whole-word search goes
 /// instead. The markers `idx_body_ngrams`, `four-character` and `word(`
 /// each sit on one line of that paragraph. Isolating the contiguous `///`
@@ -2087,7 +2087,9 @@ const TOTAL: usize = 1_817;
 const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-clickhouse/src/error.rs", 1),
     ("pulsus-read/src/logql/exec.rs", 3),
-    ("pulsus-read/src/logql/plan.rs", 2),
+    // Issue #839 adds twelve, all test text: the stage-1 goldens of the
+    // matchers that keep their branches, captured before the change.
+    ("pulsus-read/src/logql/plan.rs", 14),
     // Issue #624, part 3d-3 adds three: a targeted `| logfmt` filter's
     // control-separator test and its `!=` key-with-no-`=` test, and the
     // expected text of the test that pins them. Issue #757 adds one: the
@@ -2095,7 +2097,9 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // move to bloom-filter indexes adds two more to that test, a negated
     // case-insensitive `match(identity(body), …)` and a plain
     // `match(body, …)`.
-    ("pulsus-read/src/logql/predicate.rs", 23),
+    // Issue #839 adds one: the expected text of the test that pins a check
+    // per alternative.
+    ("pulsus-read/src/logql/predicate.rs", 24),
     // Issue #624, part 3d adds three to `sql.rs`: the `| logfmt` line
     // grammar in its `decided` column, and the out-of-range integer test in
     // each of the two `| json` key readers. Issue #624, part 4 adds twelve:
@@ -2132,7 +2136,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 110;
+const MATCH_RENDER_TOTAL: usize = 123;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
@@ -2418,6 +2422,12 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn index_neq_branch(key: &str, value: &str) -> CheckedFragment",
     "pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError>",
     "pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError>",
+    "pub const LINE_FILTER_CHECK_BUDGET_BYTES: usize = 65_536",
+    "pub(crate) fn line_filter_within(lf: &LineFilter, check_budget: &mut usize) -> Result<CheckedFragment, PipelineError>",
+    "fn alternative_checks(lf: &LineFilter, check_budget: &mut usize) -> Vec<Option<String>>",
+    "fn render_check(sets: &[Vec<String>]) -> String",
+    "fn render_check(sets: &[Vec<String>]) -> String :: fn lit(s: &str) -> String",
+    "fn render_check(sets: &[Vec<String>]) -> String :: fn any(lits: &[String]) -> String",
     "pub fn regexp_captures_column(patterns: &[super::pipeline::RxSource]) -> Result<CheckedFragment, PipelineError>",
     "pub fn regexp_captures_column_skipping(patterns: &[super::pipeline::RxSource], skipped: &[bool]) -> Result<CheckedFragment, PipelineError>",
     "pub fn pattern_captures(pattern: &str) -> Result<CheckedFragment, PipelineError>",
@@ -2475,6 +2485,7 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn sliding_cover(scan_start_ns: i64, grid_start_ns: i64, end_ns: i64, step_ns: i64, range_ns: i64) -> Result<SlidingCover, BucketGridRefusal>",
     "pub(super) fn non_id_values_expr() -> CheckedFragment",
     "pub fn case_key_sql(expr: &str) -> String",
+    "fn checked_contains_predicate(phrase: &str) -> String",
     "fn contains_predicate(phrase: &str) -> String",
     "fn words_predicate(words: &[String]) -> String",
     "fn regex_predicate(pattern: &str) -> Result<String, PipelineError>",
@@ -2540,7 +2551,7 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn metadata_filter_and(a: &CheckedFragment, b: &CheckedFragment) -> CheckedFragment",
     "pub fn metadata_filter_or(a: &CheckedFragment, b: &CheckedFragment) -> CheckedFragment",
     "fn check_partition(classes: &MetadataNameClasses<'_>) -> Result<(), MetadataFilterRefusal>",
-    "fn classified_line_filter(lf: &LineFilter) -> Result<Option<CheckedFragment>, PipelineError>",
+    "fn classified_line_filter(lf: &LineFilter, check_budget: &mut usize) -> Result<Option<CheckedFragment>, PipelineError>",
     "pub fn index_eq_empty_failure_branch(key: &str) -> CheckedFragment",
     "pub fn index_re_failure_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError>",
     "#[cfg(test)]",
@@ -2568,6 +2579,8 @@ const PREDICATE_ITEMS: &[&str] = &[
     "mod tests :: fn the_negative_branches_render_the_committed_shapes()",
     "mod tests :: #[test]",
     "mod tests :: fn the_non_id_values_aggregate_takes_no_caller_input()",
+    "mod tests :: #[test]",
+    "mod tests :: fn each_alternative_carries_its_own_lowered_check()",
     "mod tests :: #[test]",
     "mod tests :: fn a_regex_line_filter_renders_the_bare_unanchored_match()",
     "mod tests :: #[test]",
@@ -2664,8 +2677,10 @@ const PREDICATE_ITEMS: &[&str] = &[
 /// every line and `0` for one that drops every line, and a pruned `or` group
 /// through `line_filter`. **28 at issue #793**: `index_eq_empty_failure_branch`
 /// and `index_re_failure_branch`, the failure branches of a `=`/`=~` whose
-/// key no matcher requires.
-const MINT_COUNT: usize = 28;
+/// key no matcher requires. **29 at issue #839**: `line_filter_within`,
+/// `line_filter` drawing its lowered-literal checks from a budget the
+/// query's filters share.
+const MINT_COUNT: usize = 29;
 
 /// Attributes permitted anywhere in `predicate.rs`.
 const PREDICATE_ATTRIBUTES: &[&str] = &[

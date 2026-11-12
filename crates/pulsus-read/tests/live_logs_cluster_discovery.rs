@@ -1186,3 +1186,138 @@ async fn a_logs_read_is_not_cut_short_under_a_break_profile() {
 
     f.teardown(&[&user]).await;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #839: the one-statement instant sum over split placement.
+// ---------------------------------------------------------------------------
+
+/// The issue's example, at `[1h]`.
+const EXAMPLE_839: &str = r#"sum(count_over_time({job=~".+", host=~".+", namespace=~".*", service_name=~".*", pod=~".*", container=~".*", unit=~".*", stream=~".*"} | detected_level=~".*" |~ "(?i)" !~ "(?i)^$" |~ "(?i)(error|fatal|panic|exception|fail)" [1h]))"#;
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+struct InitialQueryRow {
+    query: String,
+}
+
+/// **T7c (issue #839): the example is one statement over split placement**,
+/// and answers as on one node. Each stream's index and stream rows land on
+/// shard 1 and its lines on shard 2, so every subquery of the statement
+/// must read the other shard's rows.
+#[tokio::test]
+async fn the_example_is_one_statement_over_split_placement() {
+    skip_unless_live!();
+    let f = split_fixture(pulsus_testkit::test_db(
+        "pulsus_read_it_logs_cluster_one_statement",
+    ))
+    .await;
+    let streams: [(u128, &str, &str, &[&str]); 3] = [
+        (
+            83_901,
+            "c839a",
+            r#"{\"host\":\"h1\",\"job\":\"a\",\"service_name\":\"c839a\"}"#,
+            &["ERROR one", "all good", "", "fatal two", "Exception three"],
+        ),
+        (
+            83_902,
+            "c839b",
+            r#"{\"host\":\"h2\",\"job\":\"b\",\"namespace\":\"ns1\",\"service_name\":\"c839b\"}"#,
+            &["panic: x", "fail", "PANIC", "ok"],
+        ),
+        (
+            83_903,
+            "c839c",
+            r#"{\"job\":\"c\",\"service_name\":\"c839c\"}"#,
+            &["error without a host"],
+        ),
+    ];
+    let mut on_shard1 = Vec::new();
+    let mut on_shard2 = Vec::new();
+    for (fp, service, labels, lines) in streams {
+        on_shard1.push(format!(
+            "('', {}, 1, '{service}', {fp}, 0, 0, '', '', toDate({}), '{labels}', {}, '', 0, '')",
+            f.ts / 1_000_000,
+            f.month,
+            f.ts
+        ));
+        for (i, body) in lines.iter().enumerate() {
+            on_shard2.push(format!(
+                "('', {}, 0, '{service}', {fp}, {}, 0, '{body}', '', toDate({}), '', 0, '', 0, '')",
+                f.ts / 1_000_000,
+                f.ts - (60 + i as i64) * 1_000_000_000,
+                f.month
+            ));
+        }
+    }
+    for (client, rows) in [(&f.shard1, on_shard1), (&f.shard2, on_shard2)] {
+        insert_on(
+            client,
+            &format!(
+                "INSERT INTO log_landing {LANDING_COLUMNS} VALUES {}",
+                rows.join(", ")
+            ),
+        )
+        .await;
+    }
+    // The placement, each shard read alone.
+    let placed = (
+        counts_on(&f.shard1, "SELECT toUInt64(count()) AS n FROM log_samples").await,
+        counts_on(&f.shard2, "SELECT toUInt64(count()) AS n FROM log_samples").await,
+        counts_on(
+            &f.shard2,
+            "SELECT toUInt64(count()) AS n FROM log_streams_idx",
+        )
+        .await,
+    );
+    assert_eq!(
+        placed,
+        (vec![0], vec![10], vec![0]),
+        "the lines on shard 2 alone, the index on shard 1 alone"
+    );
+
+    let comment = format!("c839t7c-{}", uuid::Uuid::new_v4().simple());
+    let engine = f
+        .engine(None, false)
+        .await
+        .with_query_log_comment(comment.clone());
+    let params = QueryParams {
+        spec: QuerySpec::Instant { at_ns: f.ts },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let got = engine
+        .query(&parse(EXAMPLE_839).expect("parse"), &params)
+        .await
+        .map(|(result, _)| result);
+
+    let filter = format!("log_comment = '{comment}' AND is_initial_query");
+    settle_query_log(&[&f.shard1], &filter, 1).await;
+    let mut stream = f
+        .shard1
+        .query_stream::<InitialQueryRow>(
+            &format!(
+                "SELECT query FROM system.query_log WHERE {filter} AND type != 'QueryStart' \
+                 AND query NOT LIKE '%system.query_log%'"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read system.query_log");
+    let mut logged = Vec::new();
+    while let Some(row) = stream.next().await {
+        logged.push(row.expect("decode").query);
+    }
+    drop(stream);
+    f.teardown(&[]).await;
+
+    match got {
+        Ok(QueryResult::Vector(samples)) => {
+            let got: Vec<(Vec<(String, String)>, u64)> = samples
+                .into_iter()
+                .map(|s| (s.labels, s.value.to_bits()))
+                .collect();
+            assert_eq!(got, vec![(Vec::new(), 6f64.to_bits())], "as on one node");
+        }
+        other => panic!("expected a vector, got {other:?}"),
+    }
+    assert_eq!(logged.len(), 1, "one statement: {logged:#?}");
+}

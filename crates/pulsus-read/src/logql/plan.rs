@@ -4320,6 +4320,11 @@ fn normalize_matchers(selector: &StreamSelector) -> Result<NormalizedMatchers, R
                 negative_branches.push(super::predicate::index_eq_empty_failure_branch(&group.key));
             }
             for p in &group.re_patterns {
+                // Issue #839: a pattern that matches every string gives a
+                // branch that is never true, so it is not sent.
+                if pulsus_re2::anchored_matches_every_string(p) {
+                    continue;
+                }
                 negative_branches.push(super::predicate::index_re_failure_branch(&group.key, p)?);
             }
         }
@@ -4359,15 +4364,17 @@ fn normalize_matchers(selector: &StreamSelector) -> Result<NormalizedMatchers, R
 /// still returning 500.
 pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Result<Vec<CheckedFragment>, ReadError> {
     let mut out = Vec::new();
+    // Issue #839 addendum F3: the query's filters share one check budget.
+    let mut check_budget = crate::logql::predicate::LINE_FILTER_CHECK_BUDGET_BYTES;
     for stage in pipeline {
         match stage {
             // Non-pushable line filters (`ip(…)` / any `or` alternative that
             // is an `ip`) render no `body` predicate at all and are evaluated
             // in the client pipeline — never emit SQL for them here (doing so
             // would drop lines the client scan must keep / re-test).
-            Stage::LineFilter(lf) if is_pushable_line_filter(lf) => {
-                out.push(crate::logql::predicate::line_filter(lf)?)
-            }
+            Stage::LineFilter(lf) if is_pushable_line_filter(lf) => out.push(
+                crate::logql::predicate::line_filter_within(lf, &mut check_budget)?,
+            ),
             Stage::LineFilter(_) => {}
             // `line_format`/`decolorize`/`unpack` rewrite the line — a line
             // filter after any of them references the rewritten text and must
@@ -4887,7 +4894,9 @@ pub(crate) fn line_filter_effect(lf: &LineFilter) -> LineFilterEffect<'_> {
 /// The pipeline the reference runs (issue #624, part 7, D7.4): a stage that
 /// keeps every line is removed, a pruned `or` group replaces its stage,
 /// and every other stage, a filter that drops every line among them, is
-/// kept. Borrowed when nothing changes.
+/// kept. A label-filter stage that is one `=~` leaf the reference treats as
+/// matching everything is removed too (issue #839). Borrowed when nothing
+/// changes.
 ///
 /// Every regex alternative is validated first, as it is validated today
 /// at its position (D7.9): unanchored before the first `line_format`,
@@ -4936,6 +4945,14 @@ pub(crate) fn effective_pipeline(
                         | LineFilterEffect::Filters(std::borrow::Cow::Borrowed(_)) => None,
                     }
                 }
+            }
+            // Issue #839: one `=~` leaf the reference turns into
+            // `TrueFilter` (`NoopLabelFilter`), which keeps every line and
+            // changes no label, wherever it stands.
+            Stage::LabelFilter(LabelFilterExpr::Match(m))
+                if m.op == MatchOp::Re && pulsus_re2::reference_true_filter(&m.value) =>
+            {
+                Some(None)
             }
             _ => None,
         };
@@ -10418,6 +10435,158 @@ mod tests {
                 "{} row(s) differ:\n{}",
                 failures.len(),
                 failures.join("\n")
+            );
+        }
+    }
+
+    /// Issue #839: what matches everything, and the example's one-statement
+    /// shape.
+    mod issue_839 {
+        use super::*;
+
+        fn range() -> QuerySpec {
+            QuerySpec::Range {
+                start_ns: 1_000_000_000_000,
+                end_ns: 1_003_600_000_000,
+                step_ns: 60_000_000_000,
+            }
+        }
+
+        fn streams_stage1(query: &str) -> Result<String, ReadError> {
+            match plan_at(query, range())? {
+                Plan::Streams(sp) => Ok(sp.stage1_sql),
+                other => panic!("{query}: expected a streams plan, got {other:?}"),
+            }
+        }
+
+        /// T3: a selector `=~` matcher whose pattern matches every string
+        /// gives no stage-1 branch.
+        #[test]
+        fn a_matcher_that_matches_every_string_gives_no_stage1_branch() {
+            let with =
+                streams_stage1(r#"{job=~".+", ns=~".*", p=~"(?s).*"} |= "x""#).expect("plan");
+            let without = streams_stage1(r#"{job=~".+"} |= "x""#).expect("plan");
+            assert_eq!(with, without);
+        }
+
+        /// G1: every other matcher keeps today's branches, byte for byte.
+        /// The goldens were captured before issue #839 changed the planner.
+        #[test]
+        fn every_other_matcher_keeps_its_stage1_branches() {
+            let rows: [(&str, &str); 7] = [
+                (r#"{job="a", ns=~"(?-s).*"}"#, G1_DOT_NO_NEWLINE),
+                (r#"{job="a", ns=~""}"#, G1_EMPTY),
+                (r#"{job="a", ns=~"(?i)"}"#, G1_FLAG_ONLY),
+                (r#"{job="a", ns=~".+"}"#, G1_PLUS),
+                (r#"{job="a", ns!=""}"#, G1_NEQ_EMPTY),
+                (r#"{job="a", ns!~""}"#, G1_NRE_EMPTY),
+                (r#"{job="a", ns=~".*x"}"#, G1_STAR_X),
+            ];
+            let mut wrong = Vec::new();
+            for (query, want) in rows {
+                let got = streams_stage1(query).expect("plan");
+                if got != want {
+                    wrong.push(format!("{query}:\n{got}\n--- expected ---\n{want}"));
+                }
+            }
+            assert!(
+                matches!(
+                    streams_stage1(r#"{ns=~".*", p=~".*"}"#),
+                    Err(ReadError::EmptyMatcherSet)
+                ),
+                "a selector of only match-everything matchers is still refused"
+            );
+            assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+        }
+
+        const G1_DOT_NO_NEWLINE: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '1970-01-01'\n  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND NOT match(val, '^(?:(?-s).*)$|$.')))\nGROUP BY fingerprint\nHAVING uniqExactIf((key, val), (key = 'job' AND val = 'a')) = 1\n   AND countIf((key = 'ns' AND NOT match(val, '^(?:(?-s).*)$|$.'))) = 0";
+        const G1_EMPTY: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '1970-01-01'\n  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND NOT match(val, '^(?:)$')))\nGROUP BY fingerprint\nHAVING uniqExactIf((key, val), (key = 'job' AND val = 'a')) = 1\n   AND countIf((key = 'ns' AND NOT match(val, '^(?:)$'))) = 0";
+        const G1_FLAG_ONLY: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '1970-01-01'\n  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND NOT match(val, '^(?:(?i))$')))\nGROUP BY fingerprint\nHAVING uniqExactIf((key, val), (key = 'job' AND val = 'a')) = 1\n   AND countIf((key = 'ns' AND NOT match(val, '^(?:(?i))$'))) = 0";
+        const G1_PLUS: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '1970-01-01'\n  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND match(val, '^(?:.+)$')))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 2";
+        const G1_NEQ_EMPTY: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '1970-01-01'\n  AND ((key = 'job' AND val = 'a') OR (key = 'ns') OR (key = 'ns' AND val = ''))\nGROUP BY fingerprint\nHAVING uniqExactIf((key, val), (key = 'job' AND val = 'a') OR (key = 'ns')) = 2\n   AND countIf((key = 'ns' AND val = '')) = 0";
+        const G1_NRE_EMPTY: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '1970-01-01'\n  AND ((key = 'job' AND val = 'a') OR (key = 'ns') OR (key = 'ns' AND match(val, '^(?:)$')))\nGROUP BY fingerprint\nHAVING uniqExactIf((key, val), (key = 'job' AND val = 'a') OR (key = 'ns')) = 2\n   AND countIf((key = 'ns' AND match(val, '^(?:)$'))) = 0";
+        const G1_STAR_X: &str = "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '1970-01-01'\n  AND ((key = 'job' AND val = 'a') OR (key = 'ns' AND match(val, '^(?:.*x)$')))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 2";
+
+        /// T5: a label-filter stage that is one `=~` leaf the reference
+        /// treats as matching everything is removed; every other stage is
+        /// kept.
+        #[test]
+        fn a_label_filter_that_matches_everything_is_removed() {
+            let base = r#"{a="b"} |= "x""#;
+            let without = plan_at(base, range()).expect("plan");
+            let removed = [
+                r#"| l=~".*""#,
+                r#"| l=~"""#,
+                r#"| l=~"(?i)""#,
+                r#"| l=~".*|.*""#,
+                r#"| l=~"(?:.*)""#,
+            ];
+            let kept = [
+                r#"| l=~"(?s).*""#,
+                r#"| l=~".*|foo""#,
+                r#"| l!~".*""#,
+                r#"| l=~".+""#,
+                r#"| l="v""#,
+                r#"| l=~".*" or m="x""#,
+                r#"| l=~".*", m="x""#,
+            ];
+            let mut wrong = Vec::new();
+            for stage in removed {
+                let query = format!("{base} {stage}");
+                let got = plan_at(&query, range()).expect("plan");
+                if got != without {
+                    wrong.push(format!("{query}: the stage must be removed"));
+                }
+                // Anywhere in the pipeline.
+                let query = format!(r#"{{a="b"}} {stage} |= "x""#);
+                let got = plan_at(&query, range()).expect("plan");
+                if got != without {
+                    wrong.push(format!("{query}: the stage must be removed"));
+                }
+            }
+            for stage in kept {
+                let query = format!("{base} {stage}");
+                let expr = parse(&query).expect("parse");
+                let Expr::Log(le) = &expr else {
+                    panic!("{query}: a log query");
+                };
+                let effective = effective_pipeline(&le.pipeline).expect("effective");
+                if effective.as_ref() != le.pipeline.as_slice() {
+                    wrong.push(format!("{query}: the stage must be kept"));
+                }
+            }
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        /// T6: the example plans in SQL mode, counting raw lines, with its
+        /// two body conjuncts.
+        #[test]
+        fn the_example_plans_in_sql_mode_with_two_body_conjuncts() {
+            let query = r#"sum(count_over_time({job=~".+", host=~".+", namespace=~".*", service_name=~".*", pod=~".*", container=~".*", unit=~".*", stream=~".*"} | detected_level=~".*" |~ "(?i)" !~ "(?i)^$" |~ "(?i)(error|fatal|panic|exception|fail)" [1h]))"#;
+            let mp = metric_mp(
+                query,
+                QuerySpec::Instant {
+                    at_ns: 1_003_600_000_000,
+                },
+            )
+            .expect("plan");
+            let got: Vec<&str> = mp.extra_predicates.iter().map(|f| f.as_sql()).collect();
+            assert_eq!(
+                (
+                    mp.client.is_none(),
+                    mp.metadata_lowering.is_none(),
+                    &mp.value,
+                    got,
+                ),
+                (
+                    true,
+                    true,
+                    &sql::MetricValue::Shaped(sql::MetricShape::RawCount),
+                    vec![
+                        "NOT (match(identity(body), '(?i)^$'))",
+                        "(multiSearchAny(lowerUTF8(body), ['error', 'fatal', 'panic', 'exception', 'fail']) AND match(identity(body), '(?i)(error|fatal|panic|exception|fail)'))",
+                    ],
+                )
             );
         }
     }

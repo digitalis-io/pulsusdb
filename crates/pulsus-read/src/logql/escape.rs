@@ -77,13 +77,13 @@ pub fn ch_string(s: &str) -> String {
 /// [`ch_string`] doubles the backslashes this step introduces, which is
 /// what makes `\%` survive the SQL parser as a LIKE escape.
 ///
-/// **`idx_body_ngrams` on `log_samples.body` serves it.**
-/// ClickHouse tests the needle's four-character sequences against
-/// the `ngrambf_v1` index on `body`; a needle shorter than four
-/// characters, and a negated filter, prune nothing. No prefilter of
-/// our own narrows a substring search: `hasToken` is what issue #450
-/// removed for returning wrong rows. A whole-word search is
-/// `word(…)`.
+/// **`idx_body_ngrams` on `lowerUTF8(log_samples.body)` serves it** when
+/// the pattern is over `lowerUTF8(body)`: the lowered-literal check a
+/// positive filter carries (issue #839). `body LIKE` itself, a needle
+/// without a four-character run the check can lower, and a negated filter
+/// prune nothing. No token prefilter narrows a substring search: `hasToken` is
+/// what issue #450 removed for returning wrong rows. A whole-word search
+/// is `word(…)`.
 pub fn ch_like_contains(needle: &str) -> String {
     let mut pattern = String::with_capacity(needle.len() + 2);
     pattern.push('%');

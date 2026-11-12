@@ -165,7 +165,7 @@ did not lower, and the handoff is a candidate set bounded by its own cap instead
 
 - **The two ceilings are checked at plan time, in O(1), and decide how a part is issued.** A seed
   rendering over either — 50,000 AST elements, or the 8 MiB query-text ceiling
-  `MAX_QUERY_TEXT_BYTES` (`crates/pulsus-read/src/querytext.rs:52`), which answers
+  `MAX_QUERY_TEXT_BYTES` (`crates/pulsus-read/src/querytext.rs:54`), which answers
   `422 query_too_broad` — makes the part `Issue::PerSeed(Driver::Chunks { .. })` rather than
   `Issue::Once`. No round trip and no probe: the language supplies `handoff_cost(n)` and the core
   compares (query-lowering.md §2.2, §2.7.3). Today's phase-2 batch loop at `BATCH_TRACES = 32` is
