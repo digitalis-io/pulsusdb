@@ -3144,6 +3144,7 @@ mod tests {
             )),
             started_at: std::time::SystemTime::now(),
             tail: Arc::new(crate::app::TailRuntime::for_tests()),
+            request_metrics: crate::request_metrics::RequestMetrics::leak_new(),
         };
         let router = Router::new()
             .route("/api/logs/v1/tail", get(tail))

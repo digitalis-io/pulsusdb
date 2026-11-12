@@ -2,7 +2,7 @@
 //! No server, no ClickHouse — runs under the plain `ci` job's
 //! `cargo test --workspace` (not `PULSUS_TEST_CLICKHOUSE`-gated).
 //!
-//! Three independent checks:
+//! Four independent checks:
 //!
 //! 1. [`every_source_route_matches_the_manifest_exactly`] — source-scans
 //!    every `.rs` file under `crates/pulsus-server/src/**` and
@@ -49,6 +49,11 @@
 //!    `Mounted` `RouteSpec`'s `doc_ref` must resolve against
 //!    `docs/api.md`'s actual text (docs-first: a mounted-but-undocumented
 //!    route fails here, not silently).
+//! 4. [`request_metric_templates_equal_the_mounted_manifest`] — issue
+//!    #838: `request_metrics.rs`'s `ROUTE_TEMPLATES`, source-scanned, is
+//!    exactly the manifest's `Mounted` path set, both directions, so a
+//!    route added without its template fails here instead of counting as
+//!    `unmatched`.
 //!
 //! ## Threat model (task-manager adjudication, issue #36 round 6)
 //!
@@ -972,6 +977,29 @@ fn every_source_route_matches_the_manifest_exactly() {
          mounted in source but not in the manifest (add a `RouteSpec`): {missing_from_manifest:?}\n\
          listed as `Mounted` in the manifest but not found in source (fix or remove the \
          `RouteSpec`): {missing_from_source:?}"
+    );
+}
+
+/// Check 4 (issue #838): the request-metrics route templates are the
+/// mounted paths, each difference listed by name.
+#[test]
+fn request_metric_templates_equal_the_mounted_manifest() {
+    let scanned = source_scan::const_str_slice(
+        "crates/pulsus-server/src/request_metrics.rs",
+        "ROUTE_TEMPLATES",
+    );
+    let mounted: BTreeSet<String> = route_manifest()
+        .iter()
+        .filter(|r| r.status == RouteStatus::Mounted)
+        .map(|r| r.path.to_string())
+        .collect();
+    let missing: Vec<_> = mounted.difference(&scanned).collect();
+    let extra: Vec<_> = scanned.difference(&mounted).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "ROUTE_TEMPLATES has drifted from the manifest's mounted paths.\n\
+         mounted but not in ROUTE_TEMPLATES: {missing:?}\n\
+         in ROUTE_TEMPLATES but not mounted: {extra:?}"
     );
 }
 
