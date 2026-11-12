@@ -95,6 +95,7 @@
 use std::borrow::Cow;
 
 mod compile_budget;
+mod lowered_literals;
 mod re2_syntax;
 mod unicode_property_names;
 
@@ -107,6 +108,10 @@ pub use compile_budget::{
     class_ranges_for_test, compile_user_regex, compile_user_regex_anchored,
     compile_user_regex_with, per_atom_hir_charge_for_test, regex_compile_transient_bound,
     regex_compile_transient_bound_with,
+};
+pub use lowered_literals::{
+    LOWERED_MAX_OR_SETS, LOWERED_MAX_STRINGS, anchored_matches_every_string,
+    lowered_needle_literals, lowered_regex_literals,
 };
 pub use re2_syntax::re2_pattern_to_rust;
 // Issue #331: the ClickHouse `match()` flag-group-head strategy — the

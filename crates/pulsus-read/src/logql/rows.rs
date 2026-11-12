@@ -281,6 +281,15 @@ pub struct MetricInstantRow {
     pub structured_metadata: String,
 }
 
+/// The one row of [`crate::logql::sql::metric_instant_sum_one_statement`]
+/// (issue #839): the lines in the window, `c`, and the aggregate, `n`
+/// (`count()` or `sum(length(body))`). No row when `c` is `0`.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricSumRow {
+    pub c: u64,
+    pub n: u64,
+}
+
 /// A bucketed range-query partial (issue #507, W2): one
 /// `(fingerprint, grid point, structured_metadata)` group from
 /// [`crate::logql::sql::metric_range_bucketed`], which counts in the

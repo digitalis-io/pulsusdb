@@ -9508,7 +9508,7 @@ struct ExplainLine624p3 {
 /// it returns without the skip indexes.** (a) `match()` keeps the granule
 /// for `(?i)(denied|refused)`; (b) over §2.3's sweep — 16 shapes × 11 flag
 /// placements, 26 bodies, one granule per row, under the body's n-gram
-/// index — every pattern's pushed predicate counts what it counts
+/// index on `lowerUTF8(body)` (issue #839) — every pattern's pushed predicate counts what it counts
 /// unindexed; (c) a `word(…)` filter beside a regex filter in the same
 /// statement prunes on the word index (issue #757); (d) every substring
 /// needle drawn from 21 bodies counts, under the n-gram index, what it
@@ -9569,7 +9569,7 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         &admin,
         &format!(
             "CREATE TABLE {table} (body String, \
-             INDEX idx_body_ngrams body TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) \
+             INDEX idx_body_ngrams lowerUTF8(body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) \
              ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
         ),
     )
@@ -9754,7 +9754,7 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         &admin,
         &format!(
             "CREATE TABLE {table} (body String, \
-             INDEX idx_body_ngrams body TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) \
+             INDEX idx_body_ngrams lowerUTF8(body) TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) \
              ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
         ),
     )
@@ -15972,6 +15972,160 @@ async fn stats_keep_the_exact_scan_for_a_filter_as_written() {
         "the exact scan"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #839: an instant `sum(count_over_time(…))` with no grouping and no
+// stage but pushable line filters is one statement.
+// ---------------------------------------------------------------------
+
+/// The issue's example, at `[1h]`.
+const EXAMPLE_839: &str = r#"sum(count_over_time({job=~".+", host=~".+", namespace=~".*", service_name=~".*", pod=~".*", container=~".*", unit=~".*", stream=~".*"} | detected_level=~".*" |~ "(?i)" !~ "(?i)^$" |~ "(?i)(error|fatal|panic|exception|fail)" [1h]))"#;
+
+/// The two-stream fixture, and a third stream the selector does not select
+/// (it has no `host`). Every line is inside `[1h]` before `T`, which is
+/// returned. The example counts 3 lines of `c839a` and 3 of `c839b`.
+async fn seed_839(name: &str) -> (ChClient, String, i64) {
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_839_{name}_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    for (fp, service, labels, lines) in [
+        (
+            83_901u64,
+            "c839a",
+            r#"{"host":"h1","job":"a","service_name":"c839a"}"#,
+            &["ERROR one", "all good", "", "fatal two", "Exception three"][..],
+        ),
+        (
+            83_902,
+            "c839b",
+            r#"{"host":"h2","job":"b","namespace":"ns1","service_name":"c839b"}"#,
+            &["panic: x", "fail", "PANIC", "ok"][..],
+        ),
+        (
+            83_903,
+            "c839c",
+            r#"{"job":"c","service_name":"c839c"}"#,
+            &["error without a host"][..],
+        ),
+    ] {
+        land_stream_624(&admin, &db, t, fp, service, labels).await;
+        for (i, body) in lines.iter().enumerate() {
+            land_line_624(
+                &admin,
+                &db,
+                fp,
+                service,
+                t - (60 + i as i64) * sec,
+                body,
+                "",
+            )
+            .await;
+        }
+    }
+    (admin, db, t)
+}
+
+/// Every statement that ended under `comment`, in order: the engine's
+/// statements whatever table they read.
+async fn statements_839(admin: &ChClient, comment: &str) -> Vec<CommentedStatementRow> {
+    settle_query_log(&[admin], &format!("log_comment = '{comment}'"), 1).await;
+    let sql = format!(
+        "SELECT query, exception_code FROM system.query_log \
+         WHERE log_comment = '{comment}' AND type != 'QueryStart' \
+         AND query NOT LIKE '%system.query_log%' \
+         ORDER BY event_time_microseconds ASC"
+    );
+    let mut stream = admin
+        .query_stream::<CommentedStatementRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("read system.query_log");
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode a query_log row"));
+    }
+    out
+}
+
+/// **T7 (issue #839): the example is answered with one statement**, and the
+/// answer is the hand count. The statement carries no fingerprint list.
+#[tokio::test]
+async fn the_example_is_one_statement() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_839("t7").await;
+    let comment = format!("c839t7-{}", uuid::Uuid::new_v4().simple());
+    let got = run_instant_624p4(
+        &db,
+        hooks_624(false, None, None),
+        Some(&comment),
+        EXAMPLE_839,
+        t,
+    )
+    .await;
+    let logged = statements_839(&admin, &comment).await;
+    drop_db_624(&admin, &db).await;
+    assert_eq!(
+        got.expect("the example answers"),
+        vec![(Vec::new(), 6f64.to_bits())],
+        "3 lines of c839a and 3 of c839b"
+    );
+    assert_eq!(logged.len(), 1, "one statement: {logged:#?}");
+    assert!(
+        !logged[0].query.contains("fingerprint IN ('"),
+        "the statement carries no fingerprint list:\n{}",
+        logged[0].query
+    );
+}
+
+/// **G2 (issue #839): every other shape sends the statements it sent
+/// before.** The counts were captured before the change.
+#[tokio::test]
+async fn other_shapes_keep_their_statement_counts() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_839("g2").await;
+    let rows: [(&str, usize); 4] = [
+        (
+            r#"sum by (job) (count_over_time({job=~".+"}[1h]))"#,
+            G2_SUM_BY,
+        ),
+        (r#"sum(rate({job=~".+"}[1h]))"#, G2_SUM_RATE),
+        (r#"count_over_time({job=~".+"}[1h])"#, G2_NO_SUM),
+        (
+            r#"sum(count_over_time({job="a"} |= ip("192.0.2.1") [1h]))"#,
+            G2_IP,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (query, want) in rows {
+        let comment = format!("c839g2-{}", uuid::Uuid::new_v4().simple());
+        if let Err(e) =
+            run_instant_624p4(&db, hooks_624(false, None, None), Some(&comment), query, t).await
+        {
+            failures.push(format!("{query}: {e}"));
+            continue;
+        }
+        let logged = statements_839(&admin, &comment).await;
+        eprintln!("G2 {query}: {} statement(s)", logged.len());
+        if logged.len() != want {
+            failures.push(format!(
+                "{query}: {} statement(s), expected {want}",
+                logged.len()
+            ));
+        }
+    }
+    drop_db_624(&admin, &db).await;
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// G2's counts, captured at `b89af1c0` before the change: stream
+/// resolution, hydration and the sample read.
+const G2_SUM_BY: usize = 3;
+const G2_SUM_RATE: usize = 3;
+const G2_NO_SUM: usize = 3;
+const G2_IP: usize = 3;
 
 // ------------------------------------- #835 addendum: one raw statement
 

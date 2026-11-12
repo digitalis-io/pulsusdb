@@ -31,8 +31,10 @@
 //! the `", "` separator = 43 B/entry ⇒ 4,299,998 B; issue #399), plus 10,000
 //! distinct 64-byte escaped service literals (~660 KB), plus 1 MiB of
 //! pre-rendered line-filter predicate text (16 × 64 KiB filters — a generous
-//! multiple of realistic pipelines), plus template/window/keyset-tuple
-//! overhead (< 400 B) — 6,008,974 B, 1.40× under 8 MiB and well above
+//! multiple of realistic pipelines), plus the 64 KiB of lowered-literal check
+//! text a query's line filters may carry (issue #839), plus
+//! template/window/keyset-tuple overhead (< 400 B) — 6,074,510 B, 1.38×
+//! under 8 MiB and well above
 //! ClickHouse's 262,144-byte default (which admits only ≈6,096 such
 //! elements — below the product's own 100k stream cap).
 //! Requests whose rendered text exceeds this envelope (unbounded

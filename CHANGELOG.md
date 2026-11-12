@@ -12,6 +12,7 @@ is versioned independently — see `deploy/charts/pulsusdb/Chart.yaml` and
 
 ### Added
 
+- Request metrics per route on `/metrics`: `pulsus_http_requests_total{route, status}` and `pulsus_http_request_duration_seconds{route}`, labelled by route template (issue #838). See `docs/api.md` §7.
 - A per-process read cache of PromQL range answers (issue #778 part 1).
 - `service_name` discovery at log ingest, on both receivers (issue #379).
   A stream pushed without a `service_name` label now gains one, as Loki

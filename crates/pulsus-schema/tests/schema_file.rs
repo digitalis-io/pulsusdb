@@ -3583,20 +3583,22 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
         storage_policy: Some("tiered".to_string()),
         ..clustered()
     };
+    // The digests moved with issue #839, which builds `idx_body_ngrams` on
+    // `lowerUTF8(body)`.
     let cases = [
         (
             "single-node",
             vec![],
             vec!["--mode", "single"],
             single(),
-            "34d7f017fc07071d0817521fb879a9c5e289610475109d0a716522ab80414f10",
+            "99f0966d1b0ac9dedc3b1dc94a21af931ae55a7263946a9b20844f69837f3f50",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "9b5d6beefae3621bf0b3f7e0d11a59a9b10e36e92d3f59b879b1f4c9cfb4e913",
+            "3eeba7362dbae1229551e4e6d205c524c1f81cc3c7142c3531041e6d7b7862de",
         ),
         (
             "clustered with a storage policy",
@@ -3606,7 +3608,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "cd6df7143744e74c757259993456fc083d5b6ff38e78aff832af9a970a60b84d",
+            "cfc67b735f0f1fb55446854d1bc7a42f52aba1cda03d79e333cb9a715f57a601",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {

@@ -281,7 +281,7 @@ const UUID_RE: &str = r"(?i)^(?:(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4
 ///     or_matches: Vec::new(),
 /// })
 /// .expect("`boom` compiles");
-/// assert!(forged.as_sql().ends_with(&sql));
+/// assert!(forged.as_sql().contains(&sql));
 /// ```
 ///
 /// # The consequence at the builder — an illustration, not the gate
@@ -477,10 +477,10 @@ pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, Pip
 /// outright (`BAD_ARGUMENTS`). There is no safe subset for us to write —
 /// a token prefilter is equivalence-preserving only when the needle is
 /// token-aligned *in the data*, which the query cannot know. The body's two
-/// indexes read the predicates as written: `idx_body_ngrams`, `ngrambf_v1`
-/// on `body`, serves `body LIKE` and `match(body, …)`; `idx_body_words`,
-/// `tokenbf_v1` on `upperUTF8(lowerUTF8(body))`, serves a `word(…)`
-/// alternative's `hasToken` conjunction.
+/// indexes: `idx_body_ngrams`, `ngrambf_v1` on `lowerUTF8(body)`, serves the
+/// lowered-literal check a positive filter carries ([`lowered_prefilter`],
+/// issue #839), and no exact predicate; `idx_body_words`, `tokenbf_v1` on
+/// `upperUTF8(lowerUTF8(body))`, serves a `word(…)` `hasToken` conjunction.
 ///
 /// An `or` group (M8-LQ2 `linefilter.or`) is a disjunction of the same
 /// per-alternative predicate: `((a) OR (b) …)` for positive ops,
@@ -491,12 +491,33 @@ pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, Pip
 /// only ever sees literal/regex alternatives (`ip(…)` is served
 /// client-side).
 pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
-    if let Some(classified) = classified_line_filter(lf)? {
+    let mut check_budget = LINE_FILTER_CHECK_BUDGET_BYTES;
+    line_filter_within(lf, &mut check_budget)
+}
+
+/// The bytes of lowered-literal check text one query's line filters may
+/// carry, together (issue #839 addendum F3). A filter whose checks do not
+/// fit what is left is rendered with none.
+pub const LINE_FILTER_CHECK_BUDGET_BYTES: usize = 65_536;
+
+/// [`line_filter`], drawing its checks from `check_budget`, which the
+/// query's other filters share.
+pub(crate) fn line_filter_within(
+    lf: &LineFilter,
+    check_budget: &mut usize,
+) -> Result<CheckedFragment, PipelineError> {
+    if let Some(classified) = classified_line_filter(lf, check_budget)? {
         return Ok(classified);
     }
+    let positive = matches!(lf.op, LineFilterOp::Contains | LineFilterOp::Regex);
+    let checks = if positive {
+        alternative_checks(lf, check_budget)
+    } else {
+        vec![None; lf.alternatives().count()]
+    };
     let mut disjuncts: Vec<String> = Vec::new();
-    for alt in lf.alternatives() {
-        disjuncts.push(match alt {
+    for (alt, check) in lf.alternatives().zip(checks) {
+        let exact = match alt {
             LineMatch::Words(ws) => words_predicate(ws),
             // `Ip` is never reached: callers gate on
             // `is_pushable_line_filter`.
@@ -504,6 +525,10 @@ pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
                 LineFilterOp::Contains | LineFilterOp::NotContains => contains_predicate(value),
                 LineFilterOp::Regex | LineFilterOp::NotRegex => regex_predicate(value)?,
             },
+        };
+        disjuncts.push(match check {
+            Some(check) => format!("({check} AND {exact})"),
+            None => exact,
         });
     }
     let core = if lf.or_matches.is_empty() {
@@ -530,6 +555,92 @@ pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
             LineFilterOp::NotContains | LineFilterOp::NotRegex => format!("NOT ({core})"),
         },
     })
+}
+
+/// The lowered-literal check each alternative of a positive line filter
+/// carries in front of its exact predicate (issue #839, addendum F1), which
+/// `idx_body_ngrams`, built on `lowerUTF8(body)`, reads: a needle's runs, or
+/// a pattern's ([`pulsus_re2::lowered_regex_literals`]). `None` for an
+/// alternative that derives none, and for a `word(…)` one, whose `hasToken`
+/// `idx_body_words` reads. Every alternative is `None` when the filter's
+/// strings pass [`pulsus_re2::LOWERED_MAX_OR_SETS`] sets or
+/// [`pulsus_re2::LOWERED_MAX_STRINGS`] strings, or its check text does not fit
+/// `check_budget`.
+///
+/// | strings | SQL |
+/// |---|---|
+/// | every AND set has one | `multiSearchAny(lowerUTF8(body), ['a', 'b'])` |
+/// | one AND set | `multiSearchAny(lowerUTF8(body), ['a']) AND multiSearchAny(lowerUTF8(body), ['b'])` |
+/// | otherwise | `((… AND …) OR …)`, each string as in the row above |
+///
+/// A string that is not ASCII is written `lowerUTF8('<run>')`, for the
+/// database to lower (addendum F2).
+fn alternative_checks(lf: &LineFilter, check_budget: &mut usize) -> Vec<Option<String>> {
+    let sets: Vec<Option<Vec<Vec<String>>>> = lf
+        .alternatives()
+        .map(|alt| match (alt, lf.op) {
+            (LineMatch::Text(needle), LineFilterOp::Contains) => {
+                let set = pulsus_re2::lowered_needle_literals(needle);
+                (!set.is_empty()).then(|| vec![set])
+            }
+            (LineMatch::Text(pattern), LineFilterOp::Regex) => {
+                pulsus_re2::lowered_regex_literals(pattern)
+            }
+            _ => None,
+        })
+        .collect();
+    let none = || vec![None; sets.len()];
+    let or_sets: usize = sets.iter().flatten().map(Vec::len).sum();
+    let strings: usize = sets.iter().flatten().flatten().map(Vec::len).sum();
+    if or_sets > pulsus_re2::LOWERED_MAX_OR_SETS || strings > pulsus_re2::LOWERED_MAX_STRINGS {
+        return none();
+    }
+    let checks: Vec<Option<String>> = sets
+        .iter()
+        .map(|s| s.as_ref().map(|s| render_check(s)))
+        .collect();
+    let bytes: usize = checks.iter().flatten().map(String::len).sum();
+    if bytes > *check_budget {
+        return none();
+    }
+    *check_budget -= bytes;
+    checks
+}
+
+fn render_check(sets: &[Vec<String>]) -> String {
+    fn lit(s: &str) -> String {
+        if s.is_ascii() {
+            ch_string(s)
+        } else {
+            format!("lowerUTF8({})", ch_string(s))
+        }
+    }
+    fn any(lits: &[String]) -> String {
+        format!("multiSearchAny(lowerUTF8(body), [{}])", lits.join(", "))
+    }
+    if sets.iter().all(|set| set.len() == 1) {
+        let lits: Vec<String> = sets.iter().map(|set| lit(&set[0])).collect();
+        return any(&lits);
+    }
+    let and = |set: &Vec<String>| -> String {
+        set.iter()
+            .map(|s| any(&[lit(s)]))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    match sets {
+        [one] => and(one),
+        _ => format!(
+            "({})",
+            sets.iter()
+                .map(|set| match set.as_slice() {
+                    [one] => any(&[lit(one)]),
+                    _ => format!("({})", and(set)),
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        ),
+    }
 }
 
 /// The `rx` column of a raw read (issue #624, part 3a, D6): one
@@ -1078,7 +1189,7 @@ pub fn parsed_string_filter(
             return Err(ParsedFilterRefusal::OperatorNotServed);
         }
         return Ok(CheckedFragment {
-            sql: contains_predicate(value),
+            sql: checked_contains_predicate(value),
         });
     };
     if !name_is_unambiguous(name) {
@@ -1433,6 +1544,29 @@ pub fn case_key_sql(expr: &str) -> String {
     format!("upperUTF8(lowerUTF8({expr}))")
 }
 
+/// [`contains_predicate`] behind the lowered-literal check a `|=` of the
+/// same needle carries (issue #839, code review r1), so a parsed-label
+/// filter's substring probe reaches `idx_body_ngrams` on `lowerUTF8(body)`.
+/// The same derivation and limits as [`alternative_checks`]; the probe has
+/// a check budget of its own.
+fn checked_contains_predicate(phrase: &str) -> String {
+    let probe = LineFilter {
+        op: LineFilterOp::Contains,
+        head: LineMatch::Text(phrase.to_string()),
+        or_matches: Vec::new(),
+    };
+    let mut check_budget = LINE_FILTER_CHECK_BUDGET_BYTES;
+    let exact = contains_predicate(phrase);
+    match alternative_checks(&probe, &mut check_budget)
+        .into_iter()
+        .next()
+        .flatten()
+    {
+        Some(check) => format!("({check} AND {exact})"),
+        None => exact,
+    }
+}
+
 fn contains_predicate(phrase: &str) -> String {
     format!("body LIKE {}", ch_like_contains(phrase))
 }
@@ -1460,11 +1594,11 @@ fn words_predicate(words: &[String]) -> String {
     }
 }
 
-/// `match(body, <p>)`, the pushed `|~`/`!~` predicate, read by
-/// `idx_body_ngrams`. A pattern that turns case-insensitivity on renders
-/// `match(identity(body), <p>)`, which no index reads: over a row
-/// `audit DENIED open`, `match(s, '(?i)(denied|refused)')` counts 0 with the
-/// n-gram index and 1 without it.
+/// `match(body, <p>)`, the pushed `|~`/`!~` predicate; no index reads it
+/// since issue #839. A pattern that turns case-insensitivity on renders
+/// `match(identity(body), <p>)`, which no index reads either: over a row
+/// `audit DENIED open`, `match(s, '(?i)(denied|refused)')` counts 0 with an
+/// n-gram index on `s` and 1 without it.
 fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
     let column = if pulsus_re2::sets_case_insensitive(pattern) {
         "identity(body)"
@@ -2297,7 +2431,10 @@ fn check_partition(classes: &MetadataNameClasses<'_>) -> Result<(), MetadataFilt
 /// classified (D7.9). A filter that keeps every line renders `1`, one that
 /// drops every line `0`, which reads no part, and a pruned `or` group
 /// renders as written. `None` when the filter is to be rendered as written.
-fn classified_line_filter(lf: &LineFilter) -> Result<Option<CheckedFragment>, PipelineError> {
+fn classified_line_filter(
+    lf: &LineFilter,
+    check_budget: &mut usize,
+) -> Result<Option<CheckedFragment>, PipelineError> {
     if matches!(lf.op, LineFilterOp::Regex | LineFilterOp::NotRegex) {
         for alt in lf.alternatives() {
             if let LineMatch::Text(value) = alt {
@@ -2313,7 +2450,7 @@ fn classified_line_filter(lf: &LineFilter) -> Result<Option<CheckedFragment>, Pi
             sql: "0".to_string(),
         }),
         super::plan::LineFilterEffect::Filters(std::borrow::Cow::Owned(pruned)) => {
-            Some(line_filter(&pruned)?)
+            Some(line_filter_within(&pruned, check_budget)?)
         }
         super::plan::LineFilterEffect::Filters(std::borrow::Cow::Borrowed(_)) => None,
     })
@@ -2360,8 +2497,9 @@ mod tests {
     /// over the case key `upperUTF8(lowerUTF8(body))`, each word keyed in SQL,
     /// kept in the order written and ANDed, which `idx_body_words` serves; a
     /// `|~` that turns case-insensitivity on renders `match(identity(body), …)`,
-    /// which keeps `idx_body_ngrams` out, and any other `|~` renders
-    /// `match(body, …)`.
+    /// which keeps the database's own literal extraction out, and any other
+    /// `|~` renders `match(body, …)`. A positive `|~` carries the lowered-literal
+    /// check in front (issue #839).
     #[test]
     fn a_word_alternative_renders_has_token_and_a_case_insensitive_regex_keeps_the_index_out() {
         fn words(ws: &[&str]) -> LineMatch {
@@ -2394,7 +2532,7 @@ mod tests {
             ),
             (
                 regex_filter("(?i)(denied|refused)"),
-                "match(identity(body), '(?i)(denied|refused)')",
+                "(multiSearchAny(lowerUTF8(body), ['denied', 'refu']) AND match(identity(body), '(?i)(denied|refused)'))",
             ),
             (
                 LineFilter {
@@ -2406,7 +2544,7 @@ mod tests {
             ),
             (
                 regex_filter("connection refused"),
-                "match(body, 'connection refused')",
+                "(multiSearchAny(lowerUTF8(body), ['connection refused']) AND match(body, 'connection refused'))",
             ),
         ];
         for (lf, want) in cases {
@@ -2500,13 +2638,46 @@ mod tests {
         );
     }
 
+    /// Issue #839 addendum F1, F2: each alternative carries its own check,
+    /// a `word(…)` alternative none, and a run that is not ASCII is lowered
+    /// by the database.
+    #[test]
+    fn each_alternative_carries_its_own_lowered_check() {
+        let cases = [
+            (
+                LineFilter {
+                    op: LineFilterOp::Contains,
+                    head: LineMatch::Words(vec!["refused".to_string()]),
+                    or_matches: vec![LineMatch::Text("nomatchzzzz".to_string())],
+                },
+                "((hasToken(upperUTF8(lowerUTF8(body)), upperUTF8(lowerUTF8('refused')))) OR ((multiSearchAny(lowerUTF8(body), ['nomatchzzzz']) AND body LIKE '%nomatchzzzz%')))",
+            ),
+            (
+                LineFilter {
+                    op: LineFilterOp::Contains,
+                    head: LineMatch::Text("Größe".to_string()),
+                    or_matches: Vec::new(),
+                },
+                "(multiSearchAny(lowerUTF8(body), [lowerUTF8('größe')]) AND body LIKE '%Größe%')",
+            ),
+            (
+                regex_filter("(?i)connection.*refused"),
+                "(multiSearchAny(lowerUTF8(body), ['connection']) AND multiSearchAny(lowerUTF8(body), ['refu']) AND match(identity(body), '(?i)connection.*refused'))",
+            ),
+        ];
+        for (lf, want) in cases {
+            let got = line_filter(&lf).expect("every case mints");
+            assert_eq!(got.as_sql(), want, "{lf}");
+        }
+    }
+
     #[test]
     fn a_regex_line_filter_renders_the_bare_unanchored_match() {
         assert_eq!(
             line_filter(&regex_filter("boom"))
                 .expect("`boom` compiles")
                 .as_sql(),
-            "match(body, 'boom')"
+            "(multiSearchAny(lowerUTF8(body), ['boom']) AND match(body, 'boom'))"
         );
     }
 
@@ -2563,9 +2734,18 @@ mod tests {
     #[test]
     fn a_contains_line_filter_renders_an_escaped_like_pattern() {
         for (needle, expected) in [
-            ("connection refused", "body LIKE '%connection refused%'"),
-            ("user_id", "body LIKE '%user\\\\_id%'"),
-            ("100%", "body LIKE '%100\\\\%%'"),
+            (
+                "connection refused",
+                "(multiSearchAny(lowerUTF8(body), ['connection refused']) AND body LIKE '%connection refused%')",
+            ),
+            (
+                "user_id",
+                "(multiSearchAny(lowerUTF8(body), ['user_id']) AND body LIKE '%user\\\\_id%')",
+            ),
+            (
+                "100%",
+                "(multiSearchAny(lowerUTF8(body), ['100%']) AND body LIKE '%100\\\\%%')",
+            ),
             ("a\\b", "body LIKE '%a\\\\\\\\b%'"),
             ("", "1"),
         ] {
