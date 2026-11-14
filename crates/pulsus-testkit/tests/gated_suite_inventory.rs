@@ -250,8 +250,7 @@ const DELIBERATELY_UNWIRED: &[(&str, &str)] = &[
 /// `cargo test`, or through `ci/test-summary.sh run <label> … --test <name>`.
 fn suites_with_a_ci_step() -> std::collections::BTreeSet<String> {
     let path = workspace_root().join(".github/workflows/ci.yml");
-    let mut text =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let mut text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
     text.push_str(&pulsus_testkit_ci_suite_lists());
     let mut out = std::collections::BTreeSet::new();
     for (i, part) in text.split("--test").enumerate() {

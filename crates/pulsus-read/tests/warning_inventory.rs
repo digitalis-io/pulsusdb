@@ -366,11 +366,12 @@ fn the_traces_answer_level_claim_names_only_real_suites() {
         let on_a_run_line = workflow
             .lines()
             .any(|l| l.contains(&needle) && l.trim_start().starts_with("run:"))
-            || list_commands
-                .iter()
-                .any(|c| c.split_whitespace().collect::<Vec<_>>().windows(2).any(|w| {
-                    w[0] == "--test" && w[1] == binary
-                }));
+            || list_commands.iter().any(|c| {
+                c.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|w| w[0] == "--test" && w[1] == binary)
+            });
         assert!(
             on_a_run_line,
             "docs/features.md calls {name} CI-enforced, but no `run:` line in \
