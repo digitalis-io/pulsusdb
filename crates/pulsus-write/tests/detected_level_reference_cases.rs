@@ -1442,10 +1442,18 @@ fn harness_positions_are_recorded_and_the_ci_step_exists() {
         );
     }
 
-    let ci = repo_file(".github/workflows/ci.yml");
+    // Issue #843 part 3: the leg is a line of the LogQL job's suite list,
+    // which `ci/live-suites.sh` runs, rather than a workflow step.
+    let list = repo_file("ci/suites/schema-it-logql.tsv");
     assert!(
-        ci.contains("detected_level capture drift leg (issue #483)"),
-        ".github/workflows/ci.yml must run the live replay leg — an env-gated leg no \
-         workflow runs passes by self-skipping"
+        list.lines().filter(|l| !l.starts_with('#')).any(|l| {
+            let fields: Vec<&str> = l.split('\t').collect();
+            fields.len() == 5
+                && fields[0] == "detected_level_reference_cases"
+                && fields[3].contains("PULSUSDB_LOGQL_DIFF_URL=")
+                && fields[4].contains("--test detected_level_reference_cases")
+        }),
+        "ci/suites/schema-it-logql.tsv must run the live replay leg with its endpoint set — \
+         an env-gated leg no workflow runs passes by self-skipping"
     );
 }

@@ -245,12 +245,14 @@ const DELIBERATELY_UNWIRED: &[(&str, &str)] = &[
     ),
 ];
 
-/// Every suite name `ci.yml` invokes as `--test <name>`, however the
-/// command is spelled — a bare `cargo test`, or through
-/// `ci/test-summary.sh run <label> … --test <name>`.
+/// Every suite name `ci.yml` or a job's suite list in `ci/suites/`
+/// invokes as `--test <name>`, however the command is spelled — a bare
+/// `cargo test`, or through `ci/test-summary.sh run <label> … --test <name>`.
 fn suites_with_a_ci_step() -> std::collections::BTreeSet<String> {
     let path = workspace_root().join(".github/workflows/ci.yml");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let mut text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    text.push_str(&pulsus_testkit_ci_suite_lists());
     let mut out = std::collections::BTreeSet::new();
     for (i, part) in text.split("--test").enumerate() {
         // `split` yields the text BEFORE the first separator first.
@@ -373,6 +375,25 @@ fn every_gated_suite_has_a_ci_step_or_a_committed_reason() {
              entry — a list of exemptions that can only grow stops meaning anything"
         );
     }
+}
+
+/// Issue #843 part 3: the text of every list in `ci/suites/`, which
+/// `ci/live-suites.sh` runs in place of one workflow step per suite.
+fn pulsus_testkit_ci_suite_lists() -> String {
+    let dir = workspace_root().join("ci/suites");
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {dir:?}: {e}"))
+        .map(|e| e.expect("a directory entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "tsv"))
+        .collect();
+    paths.sort();
+    assert!(!paths.is_empty(), "no suite list in {dir:?}");
+    let mut text = String::new();
+    for p in paths {
+        text.push('\n');
+        text.push_str(&std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}")));
+    }
+    text
 }
 
 // ---------------------------------------------------------------------
