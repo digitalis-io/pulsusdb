@@ -3,6 +3,11 @@
 # within design r13 section 2's distances; the finer levels and raw
 # after a level; holes; the counter across the raw piece; a window
 # touching raw is raw. Reuses this job's container.
-# Issue #843 part 3: the two 8-day levels; every other test of the
-# suite runs in schema-it-promql-p1.
-live_metrics_rollup	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_rollup -- --exact each_served_function_is_within_its_distance_at_7200s each_served_function_is_within_its_distance_at_86400s
+# Issue #843 part 3: the two 8-day levels, then pushed rate, one after another in
+# lane `heavy`; every other rollup test runs in schema-it-promql-p1.
+live_metrics_rollup	heavy	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_rollup -- --exact each_served_function_is_within_its_distance_at_7200s each_served_function_is_within_its_distance_at_86400s
+# Issue #579: sum/avg/count/min/max over rate/irate/increase answered
+# in the database — the issue's query, every covered shape, the float
+# edges, every named fallback, histogram samples and the time split,
+# each compared with the push on and off.
+live_metrics_pushed_rate	heavy	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_pushed_rate

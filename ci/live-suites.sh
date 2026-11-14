@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Issue #843 part 3: runs one job's live suites 4 at a time.
+# Issue #843 part 3: runs one job's live suites 4 at a time (or the list's
+# own `# slots=N`).
 #
 #   ci/live-suites.sh ci/suites/<job>.tsv
 #
 # The list: one line per suite, five tab-separated fields; `#` lines are
-# comments.
+# comments. A first line `# slots=N` runs at most N at a time instead of 4.
 #
 #   suite    unique within the list; names its log and its summary row
 #   lane     `pool`, or a lane name. A lane's members share one slot and run
@@ -43,6 +44,10 @@ declare -A seen=()
 n=0
 while IFS= read -r line || [ -n "$line" ]; do
   n=$((n + 1))
+  if [ "$n" -eq 1 ] && [[ "$line" =~ ^#\ slots=([1-9][0-9]*)$ ]]; then
+    SLOTS="${BASH_REMATCH[1]}"
+    continue
+  fi
   case "$line" in '' | '#'*) continue ;; esac
   # Tab is whitespace to `read`, which would merge an empty field into the
   # next; split on a character that is not.
@@ -202,6 +207,7 @@ finish_one() {
   done
 }
 
+echo "slots: $SLOTS"
 for unit in "${units[@]}"; do
   while [ "$running" -ge "$SLOTS" ]; do finish_one; done
   (

@@ -944,8 +944,9 @@ jobs:
           if-no-files-found: ignore
 
   # Issue #643: see `schema-it-logql`.
-  # Issue #843 part 3: the PromQL suites run as two jobs, P1 and P2, and
-  # the required check `schema-it-promql` below passes only when both do.
+  # Issue #843 part 3: the PromQL suites run as three jobs, P1, P2 and P3,
+  # one heavy suite per runner, and the required check `schema-it-promql`
+  # below passes only when all three do.
   schema-it-promql-p1:
     runs-on: ubuntu-latest
     steps:
@@ -1086,16 +1087,87 @@ jobs:
           path: target/test-summary/
           if-no-files-found: ignore
 
-  # Issue #843 part 3: the required check `schema-it-promql`. It passes only
-  # when both PromQL jobs above passed, and fails when either failed, was
-  # cancelled or was skipped. P2 runs the rollup suite's two 8-day levels;
-  # P1 runs everything else.
-  schema-it-promql:
-    if: always()
-    needs: [schema-it-promql-p1, schema-it-promql-p2]
+  schema-it-promql-p3:
     runs-on: ubuntu-latest
     steps:
-      - name: Both PromQL jobs passed
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Issue #87: pinned nextest (same pin as the `ci` job) for the
+      # API-suite steps' structured output below.
+      - name: Install cargo-nextest (pinned)
+        run: curl -LsSf https://get.nexte.st/0.9.140/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
+      # Pinned by digest rather than by the floating `26.8` tag, the way the
+      # reference images below already are: that tag moves to each new LTS
+      # patch, so any branch can go red with no commit behind it. This digest
+      # is clickhouse-server 26.8.21.10, the supported floor, read from the
+      # registry on 2026-10-09 (issue #624, part 3d).
+      # The two compose files under `ci/` carry the same digest and the
+      # matching clickhouse-keeper one; this comment is the reason for all
+      # nine references. The object store's image (issue #743 part A) is
+      # pinned by digest too, in `ci/clickhouse-cluster/compose.yaml` and the
+      # `schema-it-tiering` job.
+      #
+      # The 24.8 start further down is deliberately left on its tag: it is
+      # the negative test that the version floor is enforced, so what it
+      # needs is a server below the floor, not a reproducible one.
+      - name: Start ClickHouse 26.8
+        run: |
+          docker run -d --name pulsus-ch-schema-it -p 19123:8123 -p 19000:9000 \
+            -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
+            -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/config.d/storage.xml:/etc/clickhouse-server/config.d/storage.xml:ro \
+            -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/shard1/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro \
+            clickhouse/clickhouse-server@sha256:d3fd302416d9523d5d64239d5713d1c16c20ecea2045ac70d7e941b376cb266e
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:19123/ping && break
+            sleep 1
+          done
+
+      # Issue #843 part 3: this job's live suites, 4 at a time, from
+      # ci/suites/schema-it-promql-p3.tsv; the format and the rules are in
+      # ci/live-suites.sh.
+      - name: Live suites (parallel)
+        run: ci/live-suites.sh ci/suites/schema-it-promql-p3.tsv
+
+      - name: Stop ClickHouse 26.8
+        if: always()
+        run: docker rm -f pulsus-ch-schema-it
+
+      # Issue #87: per-suite results table (plus the api_conformance
+      # matrix dimensions) on every run, pass or fail. The summarizer
+      # never fails a green run — generation problems are warnings only.
+      - name: Write test results summary
+        if: always()
+        run: ci/test-summary.sh render
+
+      - name: Upload test results (JUnit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.job }}
+          path: target/test-summary/
+          if-no-files-found: ignore
+
+  # Issue #843 part 3: the required check `schema-it-promql`. It passes only
+  # when all three PromQL jobs above passed, and fails when any failed, was
+  # cancelled or was skipped. P1 runs the rollup suite without its two 8-day
+  # levels, beside the light suites; P2 the 8-day levels, then pushed rate;
+  # P3 the read cache suite.
+  schema-it-promql:
+    if: always()
+    needs: [schema-it-promql-p1, schema-it-promql-p2, schema-it-promql-p3]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All three PromQL jobs passed
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
