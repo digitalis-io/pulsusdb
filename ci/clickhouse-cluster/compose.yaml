@@ -111,9 +111,13 @@ services:
       - ./config.d/keeper_write.xml:/etc/clickhouse-server/config.d/keeper_write.xml:ro
       - ./config.d/storage.xml:/etc/clickhouse-server/config.d/storage.xml:ro
       - ./config.d/storage_partial.xml:/etc/clickhouse-server/config.d/storage_partial.xml:ro
+    # Below 32768, where Linux starts handing out the ports of outgoing
+    # connections (`net.ipv4.ip_local_port_range` is 32768-60999 by
+    # default). At 38123/39000 an outgoing connection on the runner could
+    # already hold the port, and the container failed to start.
     ports:
-      - "38123:8123" # HTTP
-      - "39000:9000" # native
+      - "13123:8123" # HTTP
+      - "13900:9000" # native
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
       interval: 2s

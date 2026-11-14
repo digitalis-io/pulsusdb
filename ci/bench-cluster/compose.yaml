@@ -127,9 +127,11 @@ services:
       - ./config.d/remote_servers.xml:/etc/clickhouse-server/config.d/remote_servers.xml:ro
       - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
       - ./shard3/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    # Host ports below 32768, out of Linux's range for outgoing connection
+    # ports (32768-60999 by default), so the runner cannot already hold them.
     ports:
-      - "38123:8123"
-      - "39000:9000"
+      - "14123:8123"
+      - "14900:9000"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
       interval: 2s
@@ -154,8 +156,8 @@ services:
       - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
       - ./shard4/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
     ports:
-      - "48123:8123"
-      - "49000:9000"
+      - "15123:8123"
+      - "15900:9000"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
       interval: 2s

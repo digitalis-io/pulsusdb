@@ -2694,7 +2694,7 @@ jobs:
                       WHERE database = 'pulsus' ORDER BY name FORMAT TSV"
           }
           catalogue 18123 > /tmp/cluster-shard1.tsv
-          catalogue 38123 > /tmp/cluster-shard1b.tsv
+          catalogue 13123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
           if [ "$objects" -ne 80 ]; then
@@ -2725,7 +2725,7 @@ jobs:
                              countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          for pair in "18123 1 23_6_0_23_6" "38123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
+          for pair in "18123 1 23_6_0_23_6" "13123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
             set -- $pair
             want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")
@@ -2881,7 +2881,7 @@ jobs:
                       WHERE database = 'pulsus' ORDER BY name FORMAT TSV"
           }
           catalogue 18123 > /tmp/cluster-shard1.tsv
-          catalogue 38123 > /tmp/cluster-shard1b.tsv
+          catalogue 13123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
           if [ "$objects" -ne 80 ]; then
@@ -2912,7 +2912,7 @@ jobs:
                              countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          for pair in "18123 1 23_6_0_23_6" "38123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
+          for pair in "18123 1 23_6_0_23_6" "13123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
             set -- $pair
             want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")
@@ -3028,7 +3028,7 @@ jobs:
                       WHERE database = 'pulsus' ORDER BY name FORMAT TSV"
           }
           catalogue 18123 > /tmp/cluster-shard1.tsv
-          catalogue 38123 > /tmp/cluster-shard1b.tsv
+          catalogue 13123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
           if [ "$objects" -ne 80 ]; then
@@ -3059,7 +3059,7 @@ jobs:
                              countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          for pair in "18123 1 23_6_0_23_6" "38123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
+          for pair in "18123 1 23_6_0_23_6" "13123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
             set -- $pair
             want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")
@@ -3214,7 +3214,7 @@ jobs:
                       WHERE database = 'pulsus' ORDER BY name FORMAT TSV"
           }
           catalogue 18123 > /tmp/cluster-shard1.tsv
-          catalogue 38123 > /tmp/cluster-shard1b.tsv
+          catalogue 13123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
           if [ "$objects" -ne 80 ]; then
@@ -3245,7 +3245,7 @@ jobs:
                              countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          for pair in "18123 1 23_6_0_23_6" "38123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
+          for pair in "18123 1 23_6_0_23_6" "13123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
             set -- $pair
             want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")
