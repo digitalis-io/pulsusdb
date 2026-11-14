@@ -103,6 +103,13 @@ jobs:
           PULSUSDB_DOC_SITES_UPSTREAM: ${{ github.event.pull_request.base.sha || github.sha }}
         run: ci/checks/doc_sites.sh
 
+      # Issue #843 part 3: the runner behind every `Live suites (parallel)`
+      # step — a failing suite and its test are named, a lane's members run
+      # one after another, each suite's output is printed on its own, and a
+      # line whose `when` does not match the event is skipped.
+      - name: Live suites runner self-test
+        run: ci/checks/live_suites_self_test.sh
+
       - name: Format check
         run: cargo fmt --all -- --check
 
