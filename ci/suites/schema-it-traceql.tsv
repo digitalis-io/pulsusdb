@@ -1,0 +1,224 @@
+# suite	lane	when	env	command  (format: ci/live-suites.sh)
+# Issue #588: the span-scope predicate compiler's answers on the
+# worked nine-span fixture and on the seven-span
+# id/boolean/integer fixture. Reuses this job's ClickHouse container.
+traces_query_v2_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test traces_query_v2_live
+# Issue #583 (requirement R9): the window rule at the boundary, over
+# HTTP. Spawns the `pulsusdb` binary and asserts what a client
+# sees at each end of a request window — a span at exactly `start` is
+# returned, one at exactly `end` is not, a window ending at the next
+# UTC midnight reads one day's partitions — plus the guards on the
+# two windows that do NOT move, the service graph's and `compare()`'s
+# own arguments. Reuses this job's ClickHouse 26.8 container.
+traces_api_v2_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test traces_api_v2_live
+tempo_differential	trace-ref	all	PULSUSDB_TEMPO_DIFF_URL=http://localhost:13200 PULSUSDB_TEMPO_VECTORS=1	cargo test -p pulsus-traceql --test tempo_differential
+# Issue #335: the parser accept-surface audit. Replays the whole
+# precedence / operand-position probe matrix against the SAME
+# digest-pinned oracle and asserts every recorded reference verdict
+# still holds, so a divergence can only be added or closed
+# deliberately. Runs before the legs that push spans into the
+# container: the recorded verdicts were captured against both an
+# empty and a populated store and are stable either way, but keeping
+# the syntax legs first keeps that independence obvious.
+accept_surface	trace-ref	all	PULSUSDB_TEMPO_DIFF_URL=http://localhost:13200	cargo test -p pulsus-traceql --test accept_surface
+# Issue #185/#189 (M7-TQ6): the compare() VALUE differential, ENFORCED
+# (non-skipped). Pushes fixture OTLP spans to the reference's :4318
+# receiver, waits for them to become metrics-queryable, then asserts
+# byte-parity of compare()'s statusMessage / rootName / rootServiceName
+# values against PulsusDB (over this job's ClickHouse 26.8 on 19123).
+compare_value_differential	trace-ref	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123 PULSUSDB_COMPARE_DIFF_URL=http://localhost:13200 PULSUSDB_COMPARE_OTLP_URL=http://localhost:4318	cargo test -p pulsus-read --test compare_value_differential
+# Issue #460: the compare() ARITY value differential, ENFORCED
+# (non-skipped). Same digest-pinned oracle and same ClickHouse. Gates
+# what the ARGUMENTS do rather than which values a fixed query emits:
+# that `topN` (reference default 10, so it bites on the one-argument
+# form too) trims each attribute per side, that trimmed values are
+# dropped rather than folded into the `key=nil` complement or the
+# `*_total` denominators, and that the `(start, end]` selection
+# window REPARTITIONS the population into baseline/selection instead
+# of filtering it (both totals still sum to the whole corpus).
+compare_arity_differential	trace-ref	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123 PULSUSDB_COMPARE_DIFF_URL=http://localhost:13200 PULSUSDB_COMPARE_OTLP_URL=http://localhost:4318	cargo test -p pulsus-read --test compare_arity_differential
+# Issue #193: the by()/coalesce() grouped-response VALUE differential,
+# ENFORCED (non-skipped). Reuses the SAME digest-pinned tempo v3.0.2
+# oracle: pushes fixture spans to :4318, then asserts grouped /
+# coalesced spanSet-array parity (per-trace group-tuple set + per-group
+# span-id membership + attributes typing) against PulsusDB's real
+# search executor over this job's ClickHouse 26.8 on 19123.
+traces_search_grouping_differential	trace-ref	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123 PULSUSDB_GROUPING_DIFF_URL=http://localhost:13200 PULSUSDB_GROUPING_OTLP_URL=http://localhost:4318	cargo test -p pulsus-read --test traces_search_grouping_differential
+# Issue #458: the metrics-FILTER accept surface, oracle half. Replays
+# every probe in crates/pulsus-read/tests/fixtures/metrics_filter_accept.json
+# against the SAME digest-pinned oracle and asserts every committed
+# reference verdict (and every rejecting body) still holds. FAIL-CLOSED:
+# `require_live_gate` panics if this env block is dropped in this job,
+# so a missing capture cannot report green (the #320 class). The
+# hermetic half runs in the `ci` job at no container cost.
+traces_metrics_filter_accept	trace-ref	all	PULSUSDB_TEMPO_DIFF_URL=http://localhost:13200	cargo test -p pulsus-read --test traces_metrics_filter_accept
+# Issue #458: the metrics-filter VALUE differential, ENFORCED. Pushes
+# one shared corpus (6 traces x 3 spans, exactly one parentless span
+# per trace) into both systems and asserts that
+# `{ nestedSetParent < 0 } | count_over_time()` totals 6 and
+# `{} | count_over_time()` totals 18 on BOTH sides. This is the only
+# leg that catches an accept-preserving answer corruption of the root
+# lowering against the reference itself.
+traces_metrics_filter_differential	trace-ref	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123 PULSUSDB_METRICS_FILTER_DIFF_URL=http://localhost:13200 PULSUSDB_METRICS_FILTER_OTLP_URL=http://localhost:4318	cargo test -p pulsus-read --test traces_metrics_filter_differential
+# Issue #474: the byte-frozen capture of what the reference answers
+# for a trace whose sender omitted `resource`, `scope` or `status`,
+# and for the v2 fetch envelope. Replays the committed artifact
+# against the SAME digest-pinned oracle, so the capture cannot go
+# stale unnoticed. Pushes its own four-span fixture through the
+# container's OTLP receiver; needs no ClickHouse. FAIL-CLOSED: both
+# endpoint gates panic if this env block is dropped (the #320 class).
+trace_nullable_wire_differential	trace-ref	all	PULSUSDB_NULLABLE_WIRE_DIFF_URL=http://localhost:13200 PULSUSDB_NULLABLE_WIRE_OTLP_URL=http://localhost:4318	cargo test -p pulsus-server --test trace_nullable_wire_differential
+# Issue #55: the trace-by-ID point read's EXPLAIN primary-key gate
+# (PrimaryKey block keyed on trace_id, granules pruned) on a seeded
+# 100k-trace corpus, plus the TraceEngine fetch round-trip. Reuses
+# this job's ClickHouse 26.8 container.
+traces_point_read	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test traces_point_read
+# Issue #57 AC3/AC5: spawns the real `pulsusdb` binary and drives
+# `GET /api/traces/v1/search` end-to-end — exact trace-ID sets for
+# the pre-committed q= cases, legacy-params equivalence, ordering/
+# tiebreak, cap/partial contract, scan-budget 422. Wired here by
+# issue #58 — the step was omitted when #57 landed. Reuses this job's
+# ClickHouse 26.8 container.
+traces_search_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	ci/test-summary.sh run traces_search_live -p pulsus-server --test traces_search_live
+live_schema	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-schema --test live_schema
+# Issue #55: spawns the real `pulsusdb` binary and drives the
+# `/api/traces/v1/trace/{traceId}[/json]` fetch surface end-to-end —
+# OTLP ingest seed, JSON/protobuf negotiation (incl. the 406
+# mapping), dedup, short-id resolution, canonical ordering. Reuses
+# this job's ClickHouse 26.8 container.
+traces_api_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	ci/test-summary.sh run traces_api_live -p pulsus-server --test traces_api_live
+# Issue #54 AC5: the OTLP traces round-trip — POST /v1/traces ->
+# TraceWriter (sync) -> exact count()s on every table the landing
+# views fill, plus a FixedString id read-back.
+# Reuses this job's ClickHouse 26.8 container.
+trace_ingest_roundtrip	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-write --test trace_ingest_roundtrip
+# Issue #43: multi-endpoint connection spreading + transport-failure
+# failover on ONE node — both SHARD endpoints point at this job's
+# 19123 server (spreading observable via per-endpoint selection
+# counts), and the failover case adds a dead port to prove demotion.
+# The cross-node proof runs on the schema-it-cluster leg below.
+live_spreading	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_SHARD1_HOST=localhost PULSUS_TEST_CH_SHARD1_HTTP_PORT=19123 PULSUS_TEST_CH_SHARD2_HOST=localhost PULSUS_TEST_CH_SHARD2_HTTP_PORT=19123	cargo test -p pulsus-clickhouse --test live_spreading
+# Issues #603 and #602: the two registration-backfill live failure
+# injections had their own steps here, and their suites are gone with
+# the mechanism. One push is one insert of one block into its landing
+# table, so there is no separate registration insert to lose and
+# nothing to heal: a push whose insert failed emits its registration
+# rows again next time.
+# Live API/engine suites — every env-gated suite runs here; new issues
+# must wire theirs in. Each test self-isolates via its own throwaway
+# database (`DROP DATABASE IF EXISTS` + a unique `pulsus_*_it_*` name)
+# or, for live_cityhash/live_intdiv/live_clickhouse, read-only queries
+# against the bare image's pre-created `default` database — none of
+# them touch the `pulsus` database `schema/schema.sh` builds below.
+live_clickhouse	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-clickhouse --test live_clickhouse
+# Issue #173 AC9: spawns the real `pulsusdb` binary and drives the §4.5
+# service-graph surface end-to-end — OTLP ingest -> the edge MV ->
+# GET /api/traces/v1/service_graph exact JSON edges (client fan-out,
+# messaging vs cross-kind decoy, error failed count, replay + FINAL
+# invariance, Zipkin shared-span correctness). Reuses this job's
+# ClickHouse 26.8 container.
+traces_graph_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	ci/test-summary.sh run traces_graph_live -p pulsus-server --test traces_graph_live
+# Issue #58 AC8: spawns the real `pulsusdb` binary and drives the
+# §4.3 tags/tag-values surface end-to-end — deduped scoped names,
+# the STORED value type (issue #476), q= superset semantics, the
+# truncation contract, and the zero-payload query_log proof
+# (catalog-only reads). Reuses this job's ClickHouse 26.8 container.
+# Issue #476's acceptance case rides this same step: it pushes its
+# corpus, reads the type back, builds the query a client builds from
+# it and re-queries /api/search and /api/metrics/query_range.
+traces_tags_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	ci/test-summary.sh run traces_tags_live -p pulsus-server --test traces_tags_live
+# Issue #36: the live exhaustive API conformance matrix — every
+# mounted route x case-class over loopback HTTP against five
+# `pulsusdb` spawns (mode/auth/compat permutations), reusing this
+# job's ClickHouse 26.8 container. The hermetic drift-guard/docs-gap
+# half (`route_inventory`) needs no step here — it runs under the
+# `ci` job's plain `cargo test --workspace` above.
+api_conformance	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	ci/test-summary.sh run api_conformance -p pulsus-server --test api_conformance
+traces_search_projection_differential	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123 PULSUSDB_PROJECTION_DIFF_URL=http://localhost:13480 PULSUSDB_PROJECTION_OTLP_URL=http://localhost:14480	cargo test -p pulsus-read --test traces_search_projection_differential
+trace_tag_values_differential	pool	all	PULSUSDB_TAG_VALUES_DIFF_URL=http://localhost:13478 PULSUSDB_TAG_VALUES_OTLP_URL=http://localhost:14478 PULSUSDB_TAG_VALUES_476_DIFF_URL=http://localhost:13479 PULSUSDB_TAG_VALUES_476_OTLP_URL=http://localhost:14479	cargo test -p pulsus-server --test trace_tag_values_differential
+# Issue #585: the span row encoder and the `JSON` column, round-tripped
+# against the landing table the catalogue creates — every value kind,
+# the dotted-key escaping, the non-finite doubles, the resource
+# identity, and the two catalogs. It could not run until the type
+# parser read a named tuple (issue #585, `vendor/clickhouse-types`).
+# Reuses this job's ClickHouse 26.8 container.
+trace_rows_v2	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-write --test trace_rows_v2
+# Issues #584 to #586: the trace landing table, its five views, the
+# five tables the TraceQL reads query, their sorting keys and codecs,
+# the six deduplication windows and the three saturating TTLs. Reuses
+# this job's 26.8 container.
+live_traces_v2	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-schema --test live_traces_v2
+# Issue #586: the trace write path on the landing table — one push is
+# one insert, the three per-push ceilings, the admission over the
+# landing queue, the suppression index, and the two trace transports'
+# refusal containers. Every case but one is hermetic;
+# the one that is not reads `system.asynchronous_insert_log`, which is
+# the only observable that tells a synchronous insert from a queued one.
+# Reuses this job's ClickHouse 26.8 container.
+trace_landing	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-write --test trace_landing
+live_cityhash	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-model --test live_cityhash
+# Spawns the real `pulsusdb` binary against this job's ClickHouse
+# container to drive it over HTTP end-to-end. Every live suite below
+# binds fixed loopback ports declared inline in its own source; that
+# they are distinct from each other is not a convention anyone
+# re-derives by hand, it is enforced by the hermetic
+# `live_port_uniqueness` test in the `ci` job above.
+live_server	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test live_server
+# Issue #478: our leg of the tag-values narrowing surface. Spawns
+# the real `pulsusdb` binary and issues every case in
+# `crates/pulsus-server/tests/fixtures/reference-tag-values.json`
+# against it — the whole `q` matrix with exact ordered value lists,
+# the seven range faults with their exact bodies on the values
+# routes, the two accepting range shapes, the span-name typing
+# corpus including the over-cap name, and the occupied-day /
+# empty-day pair with a query_log assertion that the span read
+# really ran. The reference's half of the same fixture is replayed
+# by the oracle leg in the differential job. Reuses this job's
+# ClickHouse 26.8 container.
+traces_tag_values_narrow_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	ci/test-summary.sh run traces_tag_values_narrow_live -p pulsus-server --test traces_tag_values_narrow_live
+# Issue #58 AC9 (Tier-1, scale-invariant): the tag-discovery index
+# gates on the exact tags_sql shapes — strict (scope)/(scope, key)
+# primary-key-prefix pruning for the scoped shapes (two-shape
+# query_log comparison), the two unscoped degraded paths recorded.
+# Reuses this job's ClickHouse 26.8 container.
+traces_tags_explain	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test traces_tags_explain
+# Issue #75: the Zipkin v2 JSON ingest round-trip — ingest_zipkin ->
+# zipkin::to_otlp -> the landing decode -> TraceWriter (sync) ->
+# ClickHouse. Proves fingerprint identity (Zipkin summary columns
+# byte-identical to the equivalent OTLP ingest) and shared-span
+# storage (a shared RPC span stores both the SERVER and CLIENT sides).
+# Reuses this job's ClickHouse 26.8 container.
+zipkin_ingest_roundtrip	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-write --test zipkin_ingest_roundtrip
+# Issue #803: startup checks move off a server that fails them.
+live_startup_failover	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test live_startup_failover
+# Issue #174: spawns the real `pulsusdb` binary with
+# PULSUS_TLS_CERT/PULSUS_TLS_KEY set (rcgen material generated at
+# run time — no committed keys) and proves the inbound TLS listener
+# end-to-end: /ready reaches 200 over TLS, a plaintext GET on the
+# TLS port gets no valid HTTP response, and /config over TLS shows
+# both path fields. Reuses this job's ClickHouse 26.8 container.
+tls_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	ci/test-summary.sh run tls_live -p pulsus-server --test tls_live
+# Issue #583 (requirement R9), the compile-side half: one window
+# compiled five ways — search, trace fetch, tag-value read, metrics
+# range query, service graph — with the operators asserted on every
+# emitted time bound. Hermetic, and here rather than in the plain
+# `ci` job only to sit beside its live sibling.
+traces_compile_v2	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test traces_compile_v2
+# Issue #376: every setting this workspace injects must exist on the
+# connected server and not be Obsolete — the class of breakage a
+# version bump produces silently, because ClickHouse ignores a
+# retired setting rather than failing the query. Read-only queries
+# against `system.settings`; no database of its own.
+injected_settings	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-clickhouse --test injected_settings
+live_intdiv	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-model --test live_intdiv
+# Issue #549: ADR 0008 D2 asked of ClickHouse's own parser over the
+# whole committed SQL corpus. It needs a server, so it cannot live
+# in the hermetic freeze; `require_live_gate` fails closed here, so
+# a lost `env:` block reddens the build rather than skipping green.
+live_sql_corpus_ast	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	echo "PULSUS_TEST_CLICKHOUSE=$PULSUS_TEST_CLICKHOUSE"; echo "PULSUS_TEST_CH_HTTP_PORT=$PULSUS_TEST_CH_HTTP_PORT"; cargo test -p pulsus-read --test live_sql_corpus_ast
+# Issue #585: a NAMED tuple column on both paths — the insert, whose
+# metadata read is `DESCRIBE TABLE` and so carries the pretty form, and
+# the read, whose response header carries the compact one. Each case
+# creates and drops its own database, so it is not in the read-only
+# `live_clickhouse` step above.
+live_named_tuple	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-clickhouse --test live_named_tuple
