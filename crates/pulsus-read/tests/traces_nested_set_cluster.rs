@@ -1614,18 +1614,33 @@ async fn wait_state(
 /// barrier, because it takes `inserts_in_queue` and `log_pointer` at two
 /// moments and a pull landing between them reads as synced (#704).
 ///
-/// Two minutes for the whole operation, each call inside a timeout of the
-/// time left. Each call's engine wait is at most 30 s, below the client's
-/// 60 s cut, and the call is never retried by the client: a
-/// `TIMEOUT_EXCEEDED` (159) is re-issued here, which pulls the log again.
+/// Two minutes for the whole operation (`sync_replica_within` takes another
+/// budget), each call inside a timeout of the time left. Each call's engine
+/// wait is at most 30 s, below the client's 60 s cut, and the call is never
+/// retried by the client: a `TIMEOUT_EXCEEDED` (159) is re-issued here,
+/// which pulls the log again.
 async fn sync_replica(client: &ChClient, db: &str, table: &str, what: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    sync_replica_within(client, db, table, what, SYNC_BUDGET).await;
+}
+
+/// The budget of every replica sync but KC17's copy wait.
+const SYNC_BUDGET: Duration = Duration::from_secs(120);
+
+/// `sync_replica` with its budget given.
+async fn sync_replica_within(
+    client: &ChClient,
+    db: &str,
+    table: &str,
+    what: &str,
+    budget: Duration,
+) {
+    let deadline = std::time::Instant::now() + budget;
     let sql = format!("SYSTEM SYNC REPLICA {db}.{table} LIGHTWEIGHT");
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         assert!(
             !left.is_zero(),
-            "{what}: {db}.{table} not synced within 120 s"
+            "{what}: {db}.{table} not synced within {budget:?}"
         );
         let wait = left.min(Duration::from_secs(30)).as_secs().max(1);
         let settings = QuerySettings::new().set("receive_timeout", wait);
@@ -1635,7 +1650,7 @@ async fn sync_replica(client: &ChClient, db: &str, table: &str, what: &str) {
         )
         .await
         {
-            Err(_elapsed) => panic!("{what}: {db}.{table} not synced within 120 s"),
+            Err(_elapsed) => panic!("{what}: {db}.{table} not synced within {budget:?}"),
             Ok(Ok(())) => return,
             Ok(Err(ChError::Server { code: 159, .. })) => {}
             Ok(Err(e)) => panic!("{what}: {sql}: {e}"),
@@ -1644,10 +1659,10 @@ async fn sync_replica(client: &ChClient, db: &str, table: &str, what: &str) {
 }
 
 /// Both tables of the job synced on every client given.
-async fn wait_synced(clients: &[&ChClient], db: &str, what: &str) {
+async fn wait_synced(clients: &[&ChClient], db: &str, what: &str, budget: Duration) {
     for c in clients {
         for table in ["spans", "service_edges"] {
-            sync_replica(c, db, table, what).await;
+            sync_replica_within(c, db, table, what, budget).await;
         }
     }
 }
@@ -2217,7 +2232,7 @@ impl Replicas {
 
     /// The route answers fixture G once, after both replicas are synced.
     async fn assert_route_g1(&self, what: &str) {
-        wait_synced(&[&self.s1, &self.s1b], &self.db, what).await;
+        wait_synced(&[&self.s1, &self.s1b], &self.db, what, SYNC_BUDGET).await;
         let prefix = pulsus_testkit::test_ident(&format!("t599b_{}", now_ns()));
         assert_g1(&self.graph(&prefix).await, what);
     }
@@ -2370,9 +2385,15 @@ async fn two_replicas_share_one_edge_table() {
     }
     // K1: ch-shard1 runs G's bucket; ch-shard1b's view is stopped.
     push_g(&r.s1, l, 0..8).await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "K1: G on both replicas").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "K1: G on both replicas", SYNC_BUDGET).await;
     refresh_until(&r.s1, &db, l + 4 * MINUTE, 4, "K1: ch-shard1's run").await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "K1: ch-shard1's run on both").await;
+    wait_synced(
+        &[&r.s1, &r.s1b],
+        &db,
+        "K1: ch-shard1's run on both",
+        SYNC_BUDGET,
+    )
+    .await;
     let written = count(
         &r.s1,
         "SELECT count() AS n FROM service_edges WHERE ver > 1",
@@ -2397,7 +2418,13 @@ async fn two_replicas_share_one_edge_table() {
         )
         .await
         .expect("K1: the second run's rows");
-    wait_synced(&[&r.s1, &r.s1b], &db, "K1: the second run on both").await;
+    wait_synced(
+        &[&r.s1, &r.s1b],
+        &db,
+        "K1: the second run on both",
+        SYNC_BUDGET,
+    )
+    .await;
     let mut finals = Vec::new();
     for (c, node) in [(&r.s1, "ch-shard1"), (&r.s1b, "ch-shard1b")] {
         let held = count(c, "SELECT count() AS n FROM service_edges WHERE ver > 1").await;
@@ -2548,7 +2575,7 @@ async fn two_replicas_share_one_edge_table() {
         "K7: ch-shard1b's run wrote nothing"
     );
     exec(&r.s1b, "SYSTEM START FETCHES service_edges").await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "K7: fetched").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "K7: fetched", SYNC_BUDGET).await;
     assert_eq!(
         markers(&r.s1).await,
         markers(&r.s1b).await,
@@ -2587,7 +2614,7 @@ async fn k2(r: Replicas) {
         "K2: ch-shard1b's run, spans {state:?}, wrote no marker"
     );
     exec(&r.s1b, "SYSTEM START FETCHES spans").await;
-    wait_synced(&[&r.s1b], &db, "K2: fetched").await;
+    wait_synced(&[&r.s1b], &db, "K2: fetched", SYNC_BUDGET).await;
     refresh_until(
         &r.s1b,
         &db,
@@ -2634,7 +2661,7 @@ async fn k3(r: Replicas) {
     for c in [&r.s1, &r.s1b] {
         exec(c, "SYSTEM START FETCHES spans").await;
     }
-    wait_synced(&[&r.s1, &r.s1b], &db, "K3: fetched").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "K3: fetched", SYNC_BUDGET).await;
     refresh_until(&r.s1, &db, l + 4 * MINUTE, 4, "K3: the run after the fetch").await;
     r.assert_route_g1("K3").await;
     r.drop().await;
@@ -2650,9 +2677,15 @@ async fn a_rebuilt_replica_waits_for_the_shard() {
     let r = Replicas::new("k5").await;
     let (db, l) = (r.db.clone(), r.l);
     push_g(&r.s1, l, 0..8).await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "K5: G on both replicas").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "K5: G on both replicas", SYNC_BUDGET).await;
     refresh_until(&r.s1, &db, l + 4 * MINUTE, 4, "K5: ch-shard1's run").await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "K5: ch-shard1's run on both").await;
+    wait_synced(
+        &[&r.s1, &r.s1b],
+        &db,
+        "K5: ch-shard1's run on both",
+        SYNC_BUDGET,
+    )
+    .await;
     let totals_sql = "SELECT concat(conn_type, ' ', toString(minute), ' ', \
                       toString(client_minute), ' ', client, ' ', server, ' ', toString(calls), \
                       ' ', toString(failed), ' ', toString(ver)) AS s \
@@ -2698,7 +2731,13 @@ async fn a_rebuilt_replica_waits_for_the_shard() {
     for table in ["spans", "service_edges"] {
         exec(&r.s1, &format!("SYSTEM START REPLICATED SENDS {table}")).await;
     }
-    wait_synced(&[&r.s1b], &db, "K5: the rebuilt replica fetched the shard").await;
+    wait_synced(
+        &[&r.s1b],
+        &db,
+        "K5: the rebuilt replica fetched the shard",
+        SYNC_BUDGET,
+    )
+    .await;
     assert_eq!(
         strings(&r.s1b, totals_sql).await,
         totals,
@@ -2804,7 +2843,7 @@ async fn k8(r: Replicas) {
         "K8: ch-shard1b's run wrote no marker"
     );
     exec(&r.s1b, "SYSTEM START PULLING REPLICATION LOG spans").await;
-    wait_synced(&[&r.s1b], &db, "K8: pulled and fetched").await;
+    wait_synced(&[&r.s1b], &db, "K8: pulled and fetched", SYNC_BUDGET).await;
     refresh_until(
         &r.s1b,
         &db,
@@ -2850,7 +2889,7 @@ async fn another_database_s_queue_does_not_stop_the_job() {
         |s| s.inserts_in_queue > 0,
     )
     .await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "K9: G on both replicas").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "K9: G on both replicas", SYNC_BUDGET).await;
     refresh_until(&r.s1b, &db, l + 4 * MINUTE, 4, "K9: ch-shard1b's run").await;
     r.assert_route_g1("K9").await;
     exec(&r.s1b, &format!("SYSTEM START FETCHES {other}.spans")).await;
@@ -3238,7 +3277,7 @@ async fn a_pulled_entry_not_yet_in_memory_holds_the_run() {
     assert_no_new_marker(&r.s1b, l, "KC1: ch-shard1b's run").await;
     exec(&r.s1b, "SYSTEM RESTART REPLICA spans").await;
     exec(&r.s1b, "SYSTEM START PULLING REPLICATION LOG spans").await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC1: fetched").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC1: fetched", SYNC_BUDGET).await;
     refresh_until(
         &r.s1b,
         &db,
@@ -3289,7 +3328,7 @@ async fn a_pending_replace_range_holds_the_run() {
     refresh_on(&r.s1b, &db, "KC4: ch-shard1b's run").await;
     assert_no_new_marker(&r.s1b, l, "KC4: ch-shard1b's run").await;
     exec(&r.s1b, "SYSTEM START FETCHES spans").await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC4: fetched").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC4: fetched", SYNC_BUDGET).await;
     refresh_until(
         &r.s1b,
         &db,
@@ -3406,7 +3445,13 @@ async fn a_queued_merge_alone_does_not_hold_the_run() {
     let r = Replicas::new("kc5").await;
     let (db, l) = (r.db.clone(), r.l);
     push_g(&r.s1, l, 0..8).await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC5: G on both replicas").await;
+    wait_synced(
+        &[&r.s1, &r.s1b],
+        &db,
+        "KC5: G on both replicas",
+        SYNC_BUDGET,
+    )
+    .await;
     exec(&r.s1b, "SYSTEM STOP MERGES spans").await;
     exec(&r.s1, "SYSTEM START MERGES spans").await;
     let id = g_partition(&r.s1, &db, "spans").await;
@@ -3434,9 +3479,21 @@ async fn a_queued_totals_merge_alone_does_not_hold_the_run() {
     let r = Replicas::new("kc8").await;
     let (db, l) = (r.db.clone(), r.l);
     push_g(&r.s1, l, 0..8).await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC8: G on both replicas").await;
+    wait_synced(
+        &[&r.s1, &r.s1b],
+        &db,
+        "KC8: G on both replicas",
+        SYNC_BUDGET,
+    )
+    .await;
     refresh_until(&r.s1, &db, l + 4 * MINUTE, 4, "KC8: ch-shard1's run").await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC8: ch-shard1's run on both").await;
+    wait_synced(
+        &[&r.s1, &r.s1b],
+        &db,
+        "KC8: ch-shard1's run on both",
+        SYNC_BUDGET,
+    )
+    .await;
     exec(&r.s1, "SYSTEM START MERGES service_edges").await;
     exec(&r.s1, "OPTIMIZE TABLE service_edges FINAL").await;
     let q = wait_queue(&r.s1b, &db, "service_edges", "KC8: the merge queued", |q| {
@@ -3485,7 +3542,7 @@ async fn kc6(r: Replicas) {
     refresh_on(&r.s2, &db, "KC6: ch-shard2's run").await;
     assert_covers_g(&r.s2, l, "KC6: ch-shard2's run").await;
     exec(&r.s2, "SYSTEM START REPLICATION QUEUES spans").await;
-    wait_synced(&[&r.s2], &db, "KC6: the queue run").await;
+    wait_synced(&[&r.s2], &db, "KC6: the queue run", SYNC_BUDGET).await;
     // From the totals: no span is left to pair.
     exec(&r.s2, "TRUNCATE TABLE spans").await;
     r.assert_route_g1("KC6").await;
@@ -3576,14 +3633,14 @@ async fn kc19(r: Replicas) {
 /// and attached again on `ch-shard1` with the queues of `stopped` stopped.
 async fn attach_g(r: &Replicas, stopped: &ChClient, what: &str) {
     push_g(&r.s1, r.l, 0..8).await;
-    wait_synced(&[&r.s1, &r.s1b], &r.db, what).await;
+    wait_synced(&[&r.s1, &r.s1b], &r.db, what, SYNC_BUDGET).await;
     let id = g_partition(&r.s1, &r.db, "spans").await;
     exec(
         &r.s1,
         &format!("ALTER TABLE spans DETACH PARTITION ID '{id}'"),
     )
     .await;
-    wait_synced(&[&r.s1, &r.s1b], &r.db, what).await;
+    wait_synced(&[&r.s1, &r.s1b], &r.db, what, SYNC_BUDGET).await;
     exec(stopped, "SYSTEM STOP REPLICATION QUEUES spans").await;
     exec(
         &r.s1,
@@ -3649,7 +3706,7 @@ async fn a_late_attach_holds_the_run() {
     refresh_on(&r.s1b, &db, "KC11: ch-shard1b's run").await;
     assert_no_new_marker(&r.s1b, l, "KC11: ch-shard1b's run").await;
     exec(&r.s1b, "SYSTEM START REPLICATION QUEUES spans").await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC11: attached").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC11: attached", SYNC_BUDGET).await;
     refresh_until(
         &r.s1b,
         &db,
@@ -3684,7 +3741,13 @@ async fn the_late_cut_off_is_ten_seconds_after_eligibility() {
     let r = Replicas::new("kc10").await;
     let (db, l) = (r.db.clone(), r.l);
     push_g(&r.s1, l, 0..8).await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC10: G on both replicas").await;
+    wait_synced(
+        &[&r.s1, &r.s1b],
+        &db,
+        "KC10: G on both replicas",
+        SYNC_BUDGET,
+    )
+    .await;
     let source = replica_name(&r.s1).await;
     for (secs, passes) in [(9, false), (10, true)] {
         let t = log_time(&r.s1b, (l + 8 * MINUTE) / S + secs).await;
@@ -3712,7 +3775,13 @@ async fn an_unreadable_or_repair_entry_holds_the_run() {
     let r = Replicas::new("kc7").await;
     let (db, l) = (r.db.clone(), r.l);
     push_g(&r.s1, l, 0..8).await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC7: G on both replicas").await;
+    wait_synced(
+        &[&r.s1, &r.s1b],
+        &db,
+        "KC7: G on both replicas",
+        SYNC_BUDGET,
+    )
+    .await;
     let source = replica_name(&r.s1).await;
     let p = active_spans_parts(&r.s1b, &db)
         .await
@@ -3762,7 +3831,13 @@ async fn a_replica_under_repair_holds_the_run() {
     let r = Replicas::new("kc12").await;
     let (db, l) = (r.db.clone(), r.l);
     push_g(&r.s1, l, 0..8).await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC12: G on both replicas").await;
+    wait_synced(
+        &[&r.s1, &r.s1b],
+        &db,
+        "KC12: G on both replicas",
+        SYNC_BUDGET,
+    )
+    .await;
     let path = replica_path(&r.s1b, &db, "spans").await;
     for (lost, passes) in [("1", false), ("0", true)] {
         exec(
@@ -4361,7 +4436,13 @@ async fn a_replica_copying_its_log_late_still_finalizes() {
     let r = Replicas::new("kc13").await;
     let (db, l) = (r.db.clone(), r.l);
     push_g(&r.s1, l, 0..8).await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC13: G on both replicas").await;
+    wait_synced(
+        &[&r.s1, &r.s1b],
+        &db,
+        "KC13: G on both replicas",
+        SYNC_BUDGET,
+    )
+    .await;
     exec(&r.s1b, "SYSTEM STOP PULLING REPLICATION LOG spans").await;
     one_row_inserts(&r.s1, "kc13", 5).await;
     let late = wait_uncopied(&r.s1b, &db, "KC13: five entries uncopied", 120, |e| {
@@ -4387,7 +4468,13 @@ async fn an_uncopied_merge_does_not_hold_the_run() {
     let r = Replicas::new("kc14").await;
     let (db, l) = (r.db.clone(), r.l);
     push_g(&r.s1, l, 0..8).await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC14: G on both replicas").await;
+    wait_synced(
+        &[&r.s1, &r.s1b],
+        &db,
+        "KC14: G on both replicas",
+        SYNC_BUDGET,
+    )
+    .await;
     exec(&r.s1b, "SYSTEM STOP PULLING REPLICATION LOG spans").await;
     exec(&r.s1, "SYSTEM START MERGES spans").await;
     let id = g_partition(&r.s1, &db, "spans").await;
@@ -4414,14 +4501,20 @@ async fn an_uncopied_late_attach_holds_the_run() {
     let r = Replicas::new("kc15").await;
     let (db, l) = (r.db.clone(), r.l);
     push_g(&r.s1, l, 0..8).await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC15: G on both replicas").await;
+    wait_synced(
+        &[&r.s1, &r.s1b],
+        &db,
+        "KC15: G on both replicas",
+        SYNC_BUDGET,
+    )
+    .await;
     let id = g_partition(&r.s1, &db, "spans").await;
     exec(
         &r.s1,
         &format!("ALTER TABLE spans DETACH PARTITION ID '{id}'"),
     )
     .await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC15: detached").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC15: detached", SYNC_BUDGET).await;
     exec(&r.s1b, "SYSTEM STOP PULLING REPLICATION LOG spans").await;
     exec(
         &r.s1,
@@ -4435,7 +4528,7 @@ async fn an_uncopied_late_attach_holds_the_run() {
     refresh_on(&r.s1b, &db, "KC15: ch-shard1b's run").await;
     assert_no_new_marker(&r.s1b, l, &format!("KC15: the run over {uncopied:?}")).await;
     exec(&r.s1b, "SYSTEM START PULLING REPLICATION LOG spans").await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC15: attached").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC15: attached", SYNC_BUDGET).await;
     refresh_until(
         &r.s1b,
         &db,
@@ -4454,7 +4547,13 @@ async fn an_uncopied_late_attach_holds_the_run() {
 async fn kc16(r: Replicas) {
     let (db, l) = (r.db.clone(), r.l);
     push_g(&r.s1, l, 0..8).await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC16: G on both replicas").await;
+    wait_synced(
+        &[&r.s1, &r.s1b],
+        &db,
+        "KC16: G on both replicas",
+        SYNC_BUDGET,
+    )
+    .await;
     exec(&r.s1b, "SYSTEM STOP PULLING REPLICATION LOG spans").await;
     // An eligibility: 180 s into an interval, at most 5 min away.
     let deadline = std::time::Instant::now() + Duration::from_secs(330);
@@ -4504,7 +4603,13 @@ async fn a_log_over_the_cap_holds_the_run() {
     let r = Replicas::new("kc17").await;
     let (db, l) = (r.db.clone(), r.l);
     push_g(&r.s1, l, 0..8).await;
-    wait_synced(&[&r.s1, &r.s1b], &db, "KC17: G on both replicas").await;
+    wait_synced(
+        &[&r.s1, &r.s1b],
+        &db,
+        "KC17: G on both replicas",
+        SYNC_BUDGET,
+    )
+    .await;
     exec(&r.s1b, "SYSTEM STOP PULLING REPLICATION LOG spans").await;
     // 101 inserts of 100 rows, each row in its own day of the next 100:
     // one part per day per insert.
@@ -4532,7 +4637,7 @@ async fn a_log_over_the_cap_holds_the_run() {
     refresh_on(&r.s1b, &db, "KC17: ch-shard1b's run over the cap").await;
     assert_no_new_marker(&r.s1b, l, &format!("KC17: the run over {n} uncopied")).await;
     exec(&r.s1b, "SYSTEM START PULLING REPLICATION LOG spans").await;
-    wait_synced(&[&r.s1b], &db, "KC17: copied").await;
+    wait_synced(&[&r.s1b], &db, "KC17: copied", Duration::from_secs(300)).await;
     refresh_on(&r.s1b, &db, "KC17: ch-shard1b's run after the copy").await;
     assert_covers_g(&r.s1b, l, "KC17: the run after the copy").await;
     r.drop().await;

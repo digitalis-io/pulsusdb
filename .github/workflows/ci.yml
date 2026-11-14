@@ -2610,7 +2610,10 @@ jobs:
   # Issue #5: the 2-shard + Keeper cluster variant — Replicated engines,
   # `_dist` write/read-back, and the live sharding-identity assertion
   # (docs/schemas.md §7). Fixture at ci/clickhouse-cluster/compose.yaml.
-  schema-it-cluster:
+  # Issue #843 part 2: the `schema-it-cluster` suites in three jobs, each
+  # on its own cluster; this one runs the nested-set, tenant-rows and grouped reads
+  # and the two-node connection suites.
+  schema-it-cluster-c1:
     runs-on: ubuntu-latest
     steps:
       # Issue #602 part 3b-1: the runner's size, so a load-bound case such as
@@ -2691,7 +2694,7 @@ jobs:
                       WHERE database = 'pulsus' ORDER BY name FORMAT TSV"
           }
           catalogue 18123 > /tmp/cluster-shard1.tsv
-          catalogue 38123 > /tmp/cluster-shard1b.tsv
+          catalogue 13123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
           if [ "$objects" -ne 80 ]; then
@@ -2722,7 +2725,7 @@ jobs:
                              countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          for pair in "18123 1 23_6_0_23_6" "38123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
+          for pair in "18123 1 23_6_0_23_6" "13123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
             set -- $pair
             want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")
@@ -2734,68 +2737,6 @@ jobs:
               exit 1
             fi
           done
-
-      - name: Live cluster tests (_dist write/read-back, sharding identity)
-        env:
-          PULSUS_TEST_CLICKHOUSE: "1"
-        run: cargo test -p pulsus-schema --test live_cluster
-
-      # Issue #494 part 1: a landing insert goes through its table's routing
-      # wrapper, keyed on the push's receive stamp, so a push and every
-      # resend of it reach one shard whichever server receives them.
-      - name: Live routed landing insert (cluster)
-        env:
-          PULSUS_TEST_CLICKHOUSE: "1"
-        run: cargo test -p pulsus-write --test live_cluster_landing
-
-      # Issue #18 part B: a rollup level's run row is read with its data
-      # from one replica's answer, so a replica that lacks a new part
-      # cannot cover it.
-      - name: Live metrics rollup cluster tests
-        env:
-          PULSUS_TEST_CLICKHOUSE: "1"
-        run: cargo test -p pulsus-read --test live_metrics_rollup_cluster
-
-      # Issue #778 part 1: the read cache's replica-lag gate, with fetches
-      # stopped on shard 1's second replica.
-      - name: Live read cache cluster tests
-        env:
-          PULSUS_TEST_CLICKHOUSE: "1"
-        run: cargo test -p pulsus-server --test read_cache_cluster_live
-
-      # Issue #136: the metrics SqlFallback fetch's double-distributed
-      # `fingerprint IN (SELECT … FROM metric_series_dist …)` shape, denied
-      # by ClickHouse's default `distributed_product_mode='deny'` without
-      # the `local` rewrite this issue adds — the negative control pins the
-      # exact denial code, the positive control proves the fix end-to-end
-      # over a cross-shard-split corpus.
-      - name: Live metrics SqlFallback fan-out (cluster)
-        env:
-          PULSUS_TEST_CLICKHOUSE: "1"
-        run: cargo test -p pulsus-read --test live_metrics_cluster_fallback
-
-      # Issue #501 part 2: the exemplar read over rows placed on each shard
-      # — a series registered on one shard and its exemplar on the other,
-      # rows stored on both, and an answer thinned over both — answered the
-      # same through either node. The negative control is the count with a
-      # shard-local `IN`, which misses the cross-shard rows.
-      - name: Live metrics exemplars (cluster)
-        env:
-          PULSUS_TEST_CLICKHOUSE: "1"
-        run: cargo test -p pulsus-read --test live_metrics_exemplars_cluster
-
-      # Issue #603: logs label discovery over SPLIT placement — the placement
-      # the landing table produces, now that a push's block is not routed by
-      # fingerprint. The negative control is the nested-subquery shape under
-      # `distributed_product_mode='local'`, which answers incompletely when
-      # the index rows and the activity rows are on different shards; the gate
-      # is that the production path answers completely. A clustered deployment
-      # is the production shape, so this is the primary case for that read.
-      - name: Live logs discovery over split placement (cluster)
-        env:
-          PULSUS_TEST_CLICKHOUSE: "1"
-          PULSUS_TEST_CH_CLUSTER: "pulsus_test_cluster"
-        run: cargo test -p pulsus-read --test live_logs_cluster_discovery
 
       # Issue #549: the grouped instant read over the distributed sample
       # tables. The statement reads both `_dist` tables inside one
@@ -2857,6 +2798,347 @@ jobs:
         if: always()
         run: docker compose -f ci/clickhouse-cluster/compose.yaml down -v
 
+  # Issue #843 part 2: the `schema-it-cluster` suites in three jobs, each
+  # on its own cluster; this one runs the read cache and rollup suites.
+  schema-it-cluster-c2:
+    runs-on: ubuntu-latest
+    steps:
+      # Issue #602 part 3b-1: the runner's size, so a load-bound case such as
+      # `the_job_keeps_up_under_steady_ingest` can be read against it.
+      - name: Runner size
+        run: |
+          nproc
+          free -g
+
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Start the 2-shard cluster
+        run: docker compose -f ci/clickhouse-cluster/compose.yaml up -d
+
+      - name: Wait for cluster health
+        run: |
+          for _ in $(seq 1 60); do
+            h1=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard1-it 2>/dev/null || echo starting)
+            h1b=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard1b-it 2>/dev/null || echo starting)
+            h2=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard2-it 2>/dev/null || echo starting)
+            hk=$(docker inspect -f '{{.State.Health.Status}}' pulsus-keeper-it 2>/dev/null || echo starting)
+            if [ "$h1" = healthy ] && [ "$h1b" = healthy ] && [ "$h2" = healthy ] && [ "$hk" = healthy ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::cluster did not become healthy in time"
+          docker ps -a
+          exit 1
+
+      # Issue #743 part A: the bucket `config.d/storage.xml`'s cold disk
+      # writes to. The second request makes a rerun pass when it exists.
+      - name: Create the object-store bucket
+        run: |
+          sign='--aws-sigv4 aws:amz:us-east-1:s3 --user pulsus-ci:pulsus-ci-secret'
+          ok=0
+          for _ in $(seq 1 30); do
+            # shellcheck disable=SC2086
+            if curl -sS --fail-with-body $sign -X PUT http://127.0.0.1:19900/pulsus-ci -o /dev/null ||
+               curl -sS --fail-with-body $sign "http://127.0.0.1:19900/pulsus-ci?list-type=2" -o /dev/null; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          [ "$ok" = 1 ]
+
+      # The clustered half of `schema/schema.sh`, created rather than
+      # rendered. **This is the only leg that can tell a correct replication
+      # path from the silently broken one**: a path whose `{shard}` macro was
+      # substituted away reaches the same validation point as a correct one
+      # on a single node, and the difference only shows against a keeper —
+      # every shard joins one replica set. So the check is not "the DDL
+      # applied" but what the macros resolved to, read back from
+      # `system.replicas` per shard.
+      - name: "schema.sh: builds the clustered schema on both shards"
+        env:
+          CLICKHOUSE_SERVER: localhost
+          CLICKHOUSE_HTTP_PORT: "18123"
+          CLICKHOUSE_DB: pulsus
+          PULSUS_RETENTION_DAYS: "7"
+          PULSUS_CLUSTER: pulsus_test_cluster
+        run: |
+          ask() { curl -sS --fail-with-body "http://localhost:$1/" --data-binary "$2"; }
+          schema/schema.sh
+
+          catalogue() {
+            ask "$1" "SELECT name, create_table_query FROM system.tables \
+                      WHERE database = 'pulsus' ORDER BY name FORMAT TSV"
+          }
+          catalogue 18123 > /tmp/cluster-shard1.tsv
+          catalogue 13123 > /tmp/cluster-shard1b.tsv
+          catalogue 28123 > /tmp/cluster-shard2.tsv
+          objects=$(wc -l < /tmp/cluster-shard1.tsv)
+          if [ "$objects" -ne 80 ]; then
+            echo "::error::expected 80 objects in the clustered schema, got $objects"
+            cut -f1 /tmp/cluster-shard1.tsv
+            exit 1
+          fi
+          if ! diff -u /tmp/cluster-shard1.tsv /tmp/cluster-shard2.tsv; then
+            echo "::error::ON CLUSTER did not land the identical DDL on both shards"
+            exit 1
+          fi
+          if ! diff -u /tmp/cluster-shard1.tsv /tmp/cluster-shard1b.tsv; then
+            echo "::error::ON CLUSTER did not land the identical DDL on shard 1's second replica"
+            exit 1
+          fi
+
+          # Per-shard replica sets must be per shard: `{shard}` resolved to
+          # this node's own macro, so shard 1's paths say /1/ and shard 2's
+          # say /2/. Shard 1 has two replicas (issue #599 part B), so its
+          # 23 per-shard tables hold two and shard 2's hold one. The six
+          # cluster-wide tables take /all/ and hold all three nodes. A
+          # substituted-away macro collapses the first group onto one path
+          # with three replicas, which this catches.
+          paths() {
+            ask "$1" "SELECT countIf(zookeeper_path LIKE '/clickhouse/tables/$2/%'), \
+                             countIf(zookeeper_path LIKE '/clickhouse/tables/all/%'), \
+                             countIf(total_replicas = 1), countIf(total_replicas = 2), \
+                             countIf(total_replicas = 3) \
+                      FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
+          }
+          for pair in "18123 1 23_6_0_23_6" "13123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
+            set -- $pair
+            want=$(printf '%s' "$3" | tr '_' '\t')
+            got=$(paths "$1" "$2")
+            echo "node on $1: per-shard/all/one/two/three-replica = $got"
+            if [ "$got" != "$want" ]; then
+              echo "::error::shard on $1 resolved its replication paths as '$got', expected '$want'"
+              ask "$1" "SELECT table, zookeeper_path, total_replicas FROM system.replicas \
+                        WHERE database = 'pulsus' ORDER BY table FORMAT TSV"
+              exit 1
+            fi
+          done
+
+      # Issue #18 part B: a rollup level's run row is read with its data
+      # from one replica's answer, so a replica that lacks a new part
+      # cannot cover it.
+      - name: Live metrics rollup cluster tests
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test live_metrics_rollup_cluster
+
+      # Issue #778 part 1: the read cache's replica-lag gate, with fetches
+      # stopped on shard 1's second replica.
+      - name: Live read cache cluster tests
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-server --test read_cache_cluster_live
+
+      - name: Tear down the cluster
+        if: always()
+        run: docker compose -f ci/clickhouse-cluster/compose.yaml down -v
+
+  # Issue #843 part 2: the `schema-it-cluster` suites in three jobs, each
+  # on its own cluster; this one runs the write, fallback, exemplar and
+  # discovery suites.
+  schema-it-cluster-c3:
+    runs-on: ubuntu-latest
+    steps:
+      # Issue #602 part 3b-1: the runner's size, so a load-bound case such as
+      # `the_job_keeps_up_under_steady_ingest` can be read against it.
+      - name: Runner size
+        run: |
+          nproc
+          free -g
+
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Start the 2-shard cluster
+        run: docker compose -f ci/clickhouse-cluster/compose.yaml up -d
+
+      - name: Wait for cluster health
+        run: |
+          for _ in $(seq 1 60); do
+            h1=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard1-it 2>/dev/null || echo starting)
+            h1b=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard1b-it 2>/dev/null || echo starting)
+            h2=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard2-it 2>/dev/null || echo starting)
+            hk=$(docker inspect -f '{{.State.Health.Status}}' pulsus-keeper-it 2>/dev/null || echo starting)
+            if [ "$h1" = healthy ] && [ "$h1b" = healthy ] && [ "$h2" = healthy ] && [ "$hk" = healthy ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::cluster did not become healthy in time"
+          docker ps -a
+          exit 1
+
+      # Issue #743 part A: the bucket `config.d/storage.xml`'s cold disk
+      # writes to. The second request makes a rerun pass when it exists.
+      - name: Create the object-store bucket
+        run: |
+          sign='--aws-sigv4 aws:amz:us-east-1:s3 --user pulsus-ci:pulsus-ci-secret'
+          ok=0
+          for _ in $(seq 1 30); do
+            # shellcheck disable=SC2086
+            if curl -sS --fail-with-body $sign -X PUT http://127.0.0.1:19900/pulsus-ci -o /dev/null ||
+               curl -sS --fail-with-body $sign "http://127.0.0.1:19900/pulsus-ci?list-type=2" -o /dev/null; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          [ "$ok" = 1 ]
+
+      # The clustered half of `schema/schema.sh`, created rather than
+      # rendered. **This is the only leg that can tell a correct replication
+      # path from the silently broken one**: a path whose `{shard}` macro was
+      # substituted away reaches the same validation point as a correct one
+      # on a single node, and the difference only shows against a keeper —
+      # every shard joins one replica set. So the check is not "the DDL
+      # applied" but what the macros resolved to, read back from
+      # `system.replicas` per shard.
+      - name: "schema.sh: builds the clustered schema on both shards"
+        env:
+          CLICKHOUSE_SERVER: localhost
+          CLICKHOUSE_HTTP_PORT: "18123"
+          CLICKHOUSE_DB: pulsus
+          PULSUS_RETENTION_DAYS: "7"
+          PULSUS_CLUSTER: pulsus_test_cluster
+        run: |
+          ask() { curl -sS --fail-with-body "http://localhost:$1/" --data-binary "$2"; }
+          schema/schema.sh
+
+          catalogue() {
+            ask "$1" "SELECT name, create_table_query FROM system.tables \
+                      WHERE database = 'pulsus' ORDER BY name FORMAT TSV"
+          }
+          catalogue 18123 > /tmp/cluster-shard1.tsv
+          catalogue 13123 > /tmp/cluster-shard1b.tsv
+          catalogue 28123 > /tmp/cluster-shard2.tsv
+          objects=$(wc -l < /tmp/cluster-shard1.tsv)
+          if [ "$objects" -ne 80 ]; then
+            echo "::error::expected 80 objects in the clustered schema, got $objects"
+            cut -f1 /tmp/cluster-shard1.tsv
+            exit 1
+          fi
+          if ! diff -u /tmp/cluster-shard1.tsv /tmp/cluster-shard2.tsv; then
+            echo "::error::ON CLUSTER did not land the identical DDL on both shards"
+            exit 1
+          fi
+          if ! diff -u /tmp/cluster-shard1.tsv /tmp/cluster-shard1b.tsv; then
+            echo "::error::ON CLUSTER did not land the identical DDL on shard 1's second replica"
+            exit 1
+          fi
+
+          # Per-shard replica sets must be per shard: `{shard}` resolved to
+          # this node's own macro, so shard 1's paths say /1/ and shard 2's
+          # say /2/. Shard 1 has two replicas (issue #599 part B), so its
+          # 23 per-shard tables hold two and shard 2's hold one. The six
+          # cluster-wide tables take /all/ and hold all three nodes. A
+          # substituted-away macro collapses the first group onto one path
+          # with three replicas, which this catches.
+          paths() {
+            ask "$1" "SELECT countIf(zookeeper_path LIKE '/clickhouse/tables/$2/%'), \
+                             countIf(zookeeper_path LIKE '/clickhouse/tables/all/%'), \
+                             countIf(total_replicas = 1), countIf(total_replicas = 2), \
+                             countIf(total_replicas = 3) \
+                      FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
+          }
+          for pair in "18123 1 23_6_0_23_6" "13123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
+            set -- $pair
+            want=$(printf '%s' "$3" | tr '_' '\t')
+            got=$(paths "$1" "$2")
+            echo "node on $1: per-shard/all/one/two/three-replica = $got"
+            if [ "$got" != "$want" ]; then
+              echo "::error::shard on $1 resolved its replication paths as '$got', expected '$want'"
+              ask "$1" "SELECT table, zookeeper_path, total_replicas FROM system.replicas \
+                        WHERE database = 'pulsus' ORDER BY table FORMAT TSV"
+              exit 1
+            fi
+          done
+
+      - name: Live cluster tests (_dist write/read-back, sharding identity)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-schema --test live_cluster
+
+      # Issue #494 part 1: a landing insert goes through its table's routing
+      # wrapper, keyed on the push's receive stamp, so a push and every
+      # resend of it reach one shard whichever server receives them.
+      - name: Live routed landing insert (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-write --test live_cluster_landing
+
+      # Issue #136: the metrics SqlFallback fetch's double-distributed
+      # `fingerprint IN (SELECT … FROM metric_series_dist …)` shape, denied
+      # by ClickHouse's default `distributed_product_mode='deny'` without
+      # the `local` rewrite this issue adds — the negative control pins the
+      # exact denial code, the positive control proves the fix end-to-end
+      # over a cross-shard-split corpus.
+      - name: Live metrics SqlFallback fan-out (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test live_metrics_cluster_fallback
+
+      # Issue #501 part 2: the exemplar read over rows placed on each shard
+      # — a series registered on one shard and its exemplar on the other,
+      # rows stored on both, and an answer thinned over both — answered the
+      # same through either node. The negative control is the count with a
+      # shard-local `IN`, which misses the cross-shard rows.
+      - name: Live metrics exemplars (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test live_metrics_exemplars_cluster
+
+      # Issue #603: logs label discovery over SPLIT placement — the placement
+      # the landing table produces, now that a push's block is not routed by
+      # fingerprint. The negative control is the nested-subquery shape under
+      # `distributed_product_mode='local'`, which answers incompletely when
+      # the index rows and the activity rows are on different shards; the gate
+      # is that the production path answers completely. A clustered deployment
+      # is the production shape, so this is the primary case for that read.
+      - name: Live logs discovery over split placement (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_CLUSTER: "pulsus_test_cluster"
+        run: cargo test -p pulsus-read --test live_logs_cluster_discovery
+
+      - name: Tear down the cluster
+        if: always()
+        run: docker compose -f ci/clickhouse-cluster/compose.yaml down -v
+
+  # The required check `schema-it-cluster`: it passes only when all three
+  # cluster jobs above passed, and fails when any failed, was cancelled or
+  # was skipped.
+  schema-it-cluster:
+    if: always()
+    needs: [schema-it-cluster-c1, schema-it-cluster-c2, schema-it-cluster-c3]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All three cluster jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "cluster jobs: $RESULTS"
+          for r in $RESULTS; do
+            [ "$r" = success ] || exit 1
+          done
   # Issue #7: e2e harness skeleton. Both legs build the local `pulsusdb:e2e`
   # image once via buildx (GHA layer cache, so the image build itself is
   # fast on both legs) then hand the whole stack lifecycle — up, poll
@@ -2932,7 +3214,7 @@ jobs:
                       WHERE database = 'pulsus' ORDER BY name FORMAT TSV"
           }
           catalogue 18123 > /tmp/cluster-shard1.tsv
-          catalogue 38123 > /tmp/cluster-shard1b.tsv
+          catalogue 13123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
           if [ "$objects" -ne 80 ]; then
@@ -2963,7 +3245,7 @@ jobs:
                              countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          for pair in "18123 1 23_6_0_23_6" "38123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
+          for pair in "18123 1 23_6_0_23_6" "13123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
             set -- $pair
             want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")
