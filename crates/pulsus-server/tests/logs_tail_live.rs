@@ -1020,11 +1020,19 @@ async fn slow_consumer_backpressure_evicts_oldest_with_exact_drop_accounting() {
 
     let start = ts0 - 1_000_000_000;
     let query = "query=%7Bservice_name%3D%22checkout%22%7D&limit=100";
+    // `system.query_log` outlives DROP DATABASE: scope the wait to THIS
+    // run via a wall-clock marker taken just before connecting.
+    let run_marker_us = now_ns() / 1_000;
     let mut ws = WsClient::connect(port, &format!("/api/logs/v1/tail?{query}&start={start}"));
 
-    // Do NOT read for a while: the producer walks the whole backlog into
-    // a depth-1 buffer against a blocked writer — evicting oldest frames.
-    std::thread::sleep(Duration::from_secs(4));
+    // Read nothing until the producer has fetched the whole backlog. The
+    // producer never waits on the writer (the writer takes every page into
+    // its depth-1 queue, evicting the oldest), so once every row is fetched
+    // all ~16MB of frames have been produced against a client that has read
+    // nothing. Undelivered frames survive only in the socket buffers (a few
+    // MB with no reads) plus one frame each in the writer, its queue and
+    // the channel; everything else was evicted.
+    wait_until_the_backlog_is_fetched(&client, db, run_marker_us, TOTAL_ROWS).await;
 
     // Now drain everything and account exactly: every seeded row is
     // either delivered in some frame or counted in a dropped_total.
@@ -1090,6 +1098,76 @@ async fn slow_consumer_backpressure_evicts_oldest_with_exact_drop_accounting() {
     );
     ws.close();
     drop_db(db).await;
+}
+
+#[derive(Debug, Clone, Row, serde::Serialize, serde::Deserialize)]
+struct PollRowsRow {
+    result_rows: u64,
+}
+
+/// Waits until this run's tail polls in `system.query_log` have returned
+/// `total` rows and one more poll has finished after them. The producer
+/// polls, hands the page to the writer, then polls again, so that later
+/// poll proves the last page was handed over. Retries the flush and read
+/// to a deadline, because a flush only writes what is already buffered.
+async fn wait_until_the_backlog_is_fetched(
+    client: &ChClient,
+    db: &str,
+    run_marker_us: i64,
+    total: u64,
+) {
+    let sql = format!(
+        "SELECT result_rows FROM system.query_log \
+         WHERE type = 'QueryFinish' AND current_database = '{db}' \
+           AND query_start_time_microseconds >= fromUnixTimestamp64Micro({run_marker_us}) \
+           AND query LIKE '%cityHash64(body) AS body_hash%' \
+           AND query NOT LIKE '%system.query_log%' \
+         ORDER BY query_start_time_microseconds ASC"
+    );
+    // Shorter than PULSUS_TAIL_SEND_TIMEOUT, so the blocked writer is
+    // still connected when the client starts reading.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut fetched_and_polled_again = false;
+    let mut fetched = 0;
+    while Instant::now() < deadline {
+        client
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush logs");
+        let mut polls: Vec<u64> = Vec::new();
+        {
+            let mut stream = client
+                .query_stream::<PollRowsRow>(&sql, &QuerySettings::new())
+                .await
+                .expect("query_log stream");
+            while let Some(row) = stream.next().await {
+                polls.push(row.expect("query_log row").result_rows);
+            }
+        }
+        let mut sum = 0;
+        let mut polls_after_total = 0;
+        for rows in polls {
+            if sum >= total {
+                polls_after_total += 1;
+            }
+            sum += rows;
+        }
+        fetched = sum;
+        if polls_after_total > 0 {
+            fetched_and_polled_again = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        fetched_and_polled_again,
+        "the tail never fetched the whole {total}-row backlog and polled again \
+         within the wait (fetched {fetched})"
+    );
 }
 
 // ---------------------------------------------------------------------
