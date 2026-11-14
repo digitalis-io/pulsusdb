@@ -1085,6 +1085,11 @@ struct Column<'a> {
 /// machine the suite runs on, each pair two statements.
 const B2_PAIRS: usize = 8;
 
+/// B2's pairs in flight across every level test in this process: the
+/// level tests run side by side, and 8 pairs each overran the CI runner's
+/// 4 cores, so the client stopped reading a body for the server's 30 s.
+static B2_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(B2_PAIRS);
+
 /// Runs one B2 column, pushing its failures, its report lines and its
 /// query-log comments.
 async fn b2_column(
@@ -1134,6 +1139,10 @@ async fn b2_column(
             let off_c = format!("{}_{secs}_{qi}_off", c.run);
             let p = &p;
             async move {
+                let _slot = B2_SLOTS
+                    .acquire()
+                    .await
+                    .expect("the semaphore is never closed");
                 let ab = both(c.built, query, p, Some((&on_c, &off_c))).await;
                 (on_c, off_c, ab)
             }
