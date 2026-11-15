@@ -1094,7 +1094,7 @@ async fn dropping_a_day_drops_no_rows_of_another() {
 }
 
 /// **T-S1, whole.** Every table of the database that is not a view and not
-/// of the logs or metrics family is one of the ten trace tables, and every
+/// of the logs, metrics or profiles family is one of the ten trace tables, and every
 /// column of theirs whose type can hold text is listed below as holding
 /// attribute values or as not holding them. The columns that hold
 /// attribute values are exactly [`ATTRIBUTE_COLUMNS`].
@@ -1112,6 +1112,7 @@ async fn the_attribute_columns_are_exactly_these() {
             "SELECT name FROM system.tables WHERE database = '{db}' \
              AND engine != 'MaterializedView' \
              AND NOT startsWith(name, 'log_') AND NOT startsWith(name, 'metric_') \
+             AND NOT startsWith(name, 'profile_') \
              ORDER BY name"
         ),
     )
