@@ -8,6 +8,7 @@ pub mod compile;
 pub mod eval_gate;
 pub mod logql;
 pub mod metrics;
+pub mod profiles;
 pub mod querytext;
 pub mod traces;
 

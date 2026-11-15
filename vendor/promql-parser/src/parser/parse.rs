@@ -37,6 +37,21 @@ pub fn parse(input: &str) -> Result<Expr, String> {
     }
 }
 
+/// PATCHES.md #9: the operator of a selector matcher, its value kept as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectorOp {
+    Eq,
+    Neq,
+    Re,
+    Nre,
+}
+
+/// PATCHES.md #9: a metric selector as the reference's `ParseMetricSelector`
+/// reads it, without the grammar.
+pub fn parse_metric_selector(input: &str) -> Result<Vec<(String, SelectorOp, String)>, String> {
+    Err(format!("not implemented: {input}"))
+}
+
 /// cases in original prometheus is a huge slices which are constructed more than 3000 lines,
 /// and it is hard to split them based on the original order. So here is the Note:
 ///

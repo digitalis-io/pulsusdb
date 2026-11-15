@@ -29,11 +29,12 @@ pub use eval::aggregation::group_key_of;
 pub use eval::{CancelToken, evaluate, evaluate_cancellable};
 pub use limits::MAX_EXPR_DEPTH;
 pub use math::KahanSum;
-pub use parser::parse;
+pub use parser::{parse, parse_metric_selector};
 pub use plan::{
     AggOp, BinOp, DEFAULT_LOOKBACK_MS, FillValues, Group, Grouping, Matching, MathFn, OverTimeFn,
     OverTimeParamFn, PlanExpr, PlanParams, QueryPlan, RangeFn, RollupUse, ScalarFn, SelectorFill,
-    SelectorId, SelectorSpec, SetOp, exemplar_selectors, plan, reads_eval_time, series_selector,
+    SelectorId, SelectorSpec, SetOp, exemplar_selectors, metric_selector, plan, reads_eval_time,
+    series_selector,
 };
 pub use re2_syntax::re2_pattern_to_rust;
 pub use value::{
