@@ -782,6 +782,80 @@ async fn case_key_ignores_case_for_every_scalar_value() {
     );
 }
 
+/// The D4t alphabet, one SQL expression per symbol.
+const CONTEXT_ALPHABET_SQL: &[&str] = &[
+    "'Σ'",
+    "'σ'",
+    "'ς'",
+    "'A'",
+    "'a'",
+    "'Β'",
+    "'.'",
+    "''''",
+    "' '",
+    "'_'",
+    "'1'",
+    "char(0xCC,0x81)",
+    "char(0xC2,0xAD)",
+    "'İ'",
+    "char(0xE2,0x84,0xAA)",
+    "'ß'",
+    "'ẞ'",
+];
+
+/// The longest D4t string, in symbols.
+const CONTEXT_MAX_LEN: u32 = 5;
+
+/// The most strings one D4t statement reads.
+const CONTEXT_CHUNK_ROWS: u64 = 100_000;
+
+/// One D4t statement: the strings of `len` symbols numbered `lo` to
+/// `lo + count - 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContextChunk {
+    len: u32,
+    lo: u64,
+    count: u64,
+}
+
+/// The D4t statements: for each length, its `n^len` strings in runs of at
+/// most [`CONTEXT_CHUNK_ROWS`].
+fn context_chunks() -> Vec<ContextChunk> {
+    Vec::new()
+}
+
+/// D4t's statements read every string of one to five symbols exactly once,
+/// and none reads more than [`CONTEXT_CHUNK_ROWS`] (issue #843).
+#[test]
+fn the_context_statements_cover_every_short_string_once_in_bounded_runs() {
+    let n = CONTEXT_ALPHABET_SQL.len() as u64;
+    assert_eq!(n, 17, "the alphabet");
+    let chunks = context_chunks();
+    for len in 1..=CONTEXT_MAX_LEN {
+        let mut next = 0u64;
+        for c in chunks.iter().filter(|c| c.len == len) {
+            assert_eq!(c.lo, next, "length {len}: the runs are contiguous");
+            assert!(
+                (1..=CONTEXT_CHUNK_ROWS).contains(&c.count),
+                "length {len}: a run of {} strings",
+                c.count
+            );
+            next += c.count;
+        }
+        assert_eq!(next, n.pow(len), "length {len}: every string");
+    }
+    assert!(
+        chunks
+            .iter()
+            .all(|c| (1..=CONTEXT_MAX_LEN).contains(&c.len))
+    );
+    assert_eq!(
+        chunks.iter().map(|c| c.count).sum::<u64>(),
+        1_508_597,
+        "every string of one to five symbols"
+    );
+}
+
 #[derive(Debug, Row, serde::Serialize, serde::Deserialize)]
 struct ContextRow {
     s: String,
