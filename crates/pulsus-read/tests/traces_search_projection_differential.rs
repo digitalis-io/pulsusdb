@@ -826,6 +826,40 @@ fn workflow_endpoint_assignments(workflow: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Issue #843 part 3: the same `PULSUSDB_*_URL` assignments in the env
+/// column (`K=V`, space-separated) of every job's suite list under
+/// `ci/suites/`, which `ci/live-suites.sh` runs in place of one workflow
+/// step per suite.
+fn suite_list_endpoint_assignments() -> Vec<(String, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root")
+        .join("ci/suites");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("read ci/suites") {
+        let path = entry.expect("a directory entry").path();
+        if path.extension().is_none_or(|x| x != "tsv") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read a suite list");
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            let Some(env) = line.split('\t').nth(3) else {
+                continue;
+            };
+            for kv in env.split_whitespace() {
+                if let Some((key, value)) = kv.split_once('=')
+                    && key.starts_with("PULSUSDB_")
+                    && key.ends_with("_URL")
+                {
+                    out.push((key.to_string(), value.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The workflow's steps, as `(title, body)` — the body being every line
 /// from the `- name:` line to the next one. Scoping the container checks
 /// to a STEP is what makes "the step that starts our instance" a
@@ -921,7 +955,8 @@ fn the_projection_leg_does_not_share_an_instance_with_another_suite() {
             .join(".github/workflows/ci.yml"),
     )
     .expect("read .github/workflows/ci.yml");
-    let assignments = workflow_endpoint_assignments(&workflow);
+    let mut assignments = workflow_endpoint_assignments(&workflow);
+    assignments.extend(suite_list_endpoint_assignments());
 
     let (ours, others): (Vec<_>, Vec<_>) = assignments
         .iter()

@@ -8,8 +8,9 @@
 //!    ClickHouse HTTP port, so the server boots, passes its startup checks and
 //!    warms its label cache normally;
 //! 2. a flag that makes every pump thread stop forwarding — connections
-//!    are accepted and held open, nothing is written to the backend and
-//!    nothing is read from it, so **no response can ever come back**;
+//!    are accepted and held open, and from the moment the flag flips no
+//!    byte is written to the backend or back to the server, so **no
+//!    response can ever come back**;
 //! 3. a server with `PULSUS_QUERY_TIMEOUT=3s` pointed at the proxy.
 //!
 //! Under the stall the request cannot complete, so the only question is
@@ -262,6 +263,13 @@ fn pump(mut from: TcpStream, mut to: TcpStream, stalled: &AtomicBool) {
                 let _ = to.shutdown(Shutdown::Write);
                 return;
             }
+            // The flag is read again once the read returns, and bytes that
+            // arrived after the stall began are dropped. A pump can sit in
+            // `read` for up to its 50ms timeout after the flag flips, and
+            // checking only at the top of the loop let a probe's statement
+            // and ClickHouse's whole answer cross in that time, so the probe
+            // came back `200`.
+            Ok(_) if stalled.load(Ordering::SeqCst) => {}
             Ok(n) => {
                 if to.write_all(&buf[..n]).is_err() {
                     return;

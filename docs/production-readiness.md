@@ -26,6 +26,7 @@ Evidence tokens use fixed, machine-checked forms so the guard can resolve them:
 - lib unit test / function ref — `` `crates/<crate>/src/<file>.rs::<fn>` `` → file exists and contains `fn <fn>`.
 - plain code ref — `` `crates/<crate>/src/<file>.rs` `` → file exists.
 - CI step — `ci.yml: "<step name>"` → that literal step name appears after a `name:` key in `.github/workflows/ci.yml`.
+- CI suite — `ci/suites/<job>.tsv: "<suite>"` → that suite is the first field of a line of `ci/suites/<job>.tsv`.
 - doc section — `` `<doc>.md §N[.M]` `` → `docs/<doc>.md` has a heading line for that exact section number.
 
 Status legend: ✅ implemented + evidenced · 🚫 explicit non-goal (recorded, not a blocker).
@@ -44,7 +45,7 @@ Status legend: ✅ implemented + evidenced · 🚫 explicit non-goal (recorded, 
 | Item | Evidence (test / CI step / doc § / code ref) | Status |
 | --- | --- | --- |
 | Inbound HTTPS listener (cert/key load, bounded handshake accept loop) | `crates/pulsus-server/src/tls.rs` · `tls_cert`/`tls_key` in `crates/pulsus-config/src/model.rs` | ✅ |
-| Live inbound-TLS handshake suite | `cargo test -p pulsus-server --test tls_live` · `ci.yml: "Live inbound TLS suite"` · `api.md §7` | ✅ |
+| Live inbound-TLS handshake suite | `cargo test -p pulsus-server --test tls_live` · `ci/suites/schema-it-traceql.tsv: "tls_live"` · `api.md §7` | ✅ |
 | ClickHouse-side TLS (`ChProto::Https`, `tls_skip_verify`) | `crates/pulsus-clickhouse/src/tls.rs` · `configuration.md §2` | ✅ |
 
 ## 3. Retention / TTL
@@ -54,7 +55,7 @@ Status legend: ✅ implemented + evidenced · 🚫 explicit non-goal (recorded, 
 | TTL declared from `PULSUS_RETENTION_DAYS`, which has no default, on the tables marked `R` in docs/configuration.md §7; on a rollup level, its `PULSUS_ROLLUP_RETENTION_DAYS` item, or `PULSUS_RETENTION_DAYS` when that is unset (`L`); on the metric catalogue, the largest of `PULSUS_RETENTION_DAYS` and every level's item (`C`); from the landing hours on the three landing tables (`H`) (saturating `DateTime`, incl. `u32::MAX`) | `crates/pulsus-schema/tests/schema_file.rs::every_table_expires_exactly_as_documented` · `crates/pulsus-schema/tests/live_schema.rs::the_configured_retention_reaches_every_retained_tables_ttl` | ✅ |
 | TTL applied when the schema is built | `schema/schema.sql` · `schema/schema.sh` · `crates/pulsus-schema/tests/schema_file.rs` | ✅ |
 | Retention/storage-policy config surface | `PULSUS_RETENTION_DAYS` in `schema/schema.sh`, read back from the database comment (`crates/pulsus-server/src/chconfig.rs::read_schema_retention`) · `storage_policy` in `crates/pulsus-config/src/model.rs` · `configuration.md §3`, `§7` | ✅ |
-| Live schema TTL gates (logs/metrics + traces) | `ci.yml: "Live schema tests (single-node, migrations + MVs + crash/retry)"` · `ci.yml: "Live trace landing schema tests (tables + views + TTLs)"` · `architecture.md §3.6` | ✅ |
+| Live schema TTL gates (logs/metrics + traces) | `ci/suites/schema-it-traceql.tsv: "live_schema"` · `ci/suites/schema-it-traceql.tsv: "live_traces_v2"` · `architecture.md §3.6` | ✅ |
 
 ## 4. Backpressure & admission control
 
@@ -70,7 +71,7 @@ Status legend: ✅ implemented + evidenced · 🚫 explicit non-goal (recorded, 
 | --- | --- | --- |
 | Per-surface error enums (logs / metrics / traces query APIs) | `crates/pulsus-server/src/logs_api/error.rs` · `crates/pulsus-server/src/prom_api/error.rs` · `crates/pulsus-server/src/traces_api/error.rs` | ✅ |
 | Ingest & config error domains | `crates/pulsus-write/src/error.rs` · `crates/pulsus-config/src/error.rs` | ✅ |
-| Status-code contract (400 `bad_data`, 422 `query_too_broad`, 429, 503) | `cargo test -p pulsus-server --test api_conformance` · `ci.yml: "API conformance matrix"` · `api.md §1` | ✅ |
+| Status-code contract (400 `bad_data`, 422 `query_too_broad`, 429, 503) | `cargo test -p pulsus-server --test api_conformance` · `ci/suites/schema-it-traceql.tsv: "api_conformance"` · `api.md §1` | ✅ |
 
 ## 6. Self-observability (`/ready`, `/metrics`, `/config`, `/buildinfo`)
 

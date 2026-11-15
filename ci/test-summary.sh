@@ -4,10 +4,16 @@
 #
 # Subcommands:
 #
+#   init
+#       Resets <target>/test-summary/ for this run (`fresh_dir` below).
+#       ci/live-suites.sh calls it once before it starts the suites, so two
+#       `run`s started together never both clear the directory.
+#
 #   run <suite-id> <nextest args...>
-#       Runs `cargo nextest run --config-file ci/nextest.toml --profile ci
-#       <nextest args...>` for one suite, records its JUnit report (copied
-#       to <target>/test-summary/junit/<suite-id>.xml for artifact upload)
+#       Runs `cargo nextest run --config-file <copy of ci/nextest.toml>
+#       --profile ci <nextest args...>` for one suite, records its JUnit
+#       report (copied to <target>/test-summary/junit/<suite-id>.xml for
+#       artifact upload)
 #       plus a results row, and exits with nextest's own exit code — a
 #       failing test fails the step exactly as `cargo test` did. All
 #       bookkeeping is best-effort: it can never change the exit code.
@@ -26,7 +32,6 @@ set -uo pipefail
 
 target_dir="${CARGO_TARGET_DIR:-target}"
 out_dir="$target_dir/test-summary"
-junit_src="$target_dir/nextest/ci/junit.xml"
 manifest="crates/pulsus-server/tests/support/manifest.rs"
 
 warn() { echo "::warning::test-summary: $*" >&2; }
@@ -75,14 +80,26 @@ cmd_run() {
   slug=$(printf '%s' "$suite" | tr -c 'A-Za-z0-9_.-' '_')
 
   fresh_dir || warn "could not reset $out_dir (continuing)"
-  # A cache-restored target/ can also carry a stale junit.xml; remove it so
+  # Issue #843 part 3: each suite writes its own JUnit file, named in a copy
+  # of ci/nextest.toml, so two suites ending together never write one file.
+  local junit_src="$target_dir/nextest/ci/junit-$slug.xml"
+  local config
+  config=$(mktemp) &&
+    sed "s/^path = \"junit.xml\"\$/path = \"junit-$slug.xml\"/" ci/nextest.toml >"$config" &&
+    grep -q "^path = \"junit-$slug.xml\"\$" "$config" || {
+    warn "could not write a nextest config for $suite; using ci/nextest.toml"
+    config=ci/nextest.toml
+    junit_src="$target_dir/nextest/ci/junit.xml"
+  }
+  # A cache-restored target/ can also carry a stale JUnit file; remove it so
   # a run that dies before writing one is never summarized from old data.
   rm -f "$junit_src" 2>/dev/null || true
 
   local console="$out_dir/console-$slug.log"
-  cargo nextest run --config-file ci/nextest.toml --profile ci "$@" 2>&1 |
+  cargo nextest run --config-file "$config" --profile ci "$@" 2>&1 |
     tee "$console"
   local status="${PIPESTATUS[0]}"
+  [ "$config" = ci/nextest.toml ] || rm -f "$config"
 
   # ---- best-effort bookkeeping; $status is returned untouched ----------
   local tests failures errors time skipped passed result
@@ -180,6 +197,9 @@ cmd_render() {
 }
 
 case "${1:-}" in
+init)
+  fresh_dir
+  ;;
 run)
   shift
   cmd_run "$@"
@@ -188,7 +208,7 @@ render)
   cmd_render
   ;;
 *)
-  echo "usage: ci/test-summary.sh {run <suite-id> <nextest args...> | render}" >&2
+  echo "usage: ci/test-summary.sh {init | run <suite-id> <nextest args...> | render}" >&2
   exit 2
   ;;
 esac
