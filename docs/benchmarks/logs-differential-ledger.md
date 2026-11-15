@@ -541,7 +541,7 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
 - **Memory characteristic — CLOSED by issue #398; the measurement that
   motivated it is kept.** Before #398, LogQL reads set `max_bytes_to_read`
   but no `max_memory_usage` (`read_query_settings`,
-  `crates/pulsus-read/src/logql/exec.rs`), so a ClickHouse code 241 fell
+  `crates/pulsus-read/src/logql/exec/settings_errors.rs`), so a ClickHouse code 241 fell
   through `map_read_error` to `ReadError::Clickhouse` and surfaced as
   **500** — carrying the raw server exception in the body — where the
   `QueryTooBroad` family answers 422. It was deliberately NOT fixed under
@@ -4301,8 +4301,8 @@ unexplained.
 - **PulsusDB behaviour (the delta): a malformed query is a `400` in every
   window.** Nothing about our rejection depends on the dates asked for:
   `plan()` and `CompiledPipeline::compile` both run before any I/O
-  (`logql/exec.rs:674`, `:968`, `:2559`, `:2861`, `logql/variants.rs:521`,
-  propagated with `?` and surfaced by `logs_api/error.rs` as a 400), so an
+  (`logql/exec/discovery.rs:88`, `:382`, `logql/exec/metric_routes.rs:245`,
+  `logql/exec/query.rs:144`, `logql/variants.rs:521`, propagated with `?` and surfaced by `logs_api/error.rs` as a 400), so an
   invalid pipeline cannot reach a "no chunks, return empty" path in the
   first place.
 
