@@ -1,0 +1,4 @@
+# suite	lane	when	env	command  (format: ci/live-suites.sh)
+# Issue #778 part 1: the read cache; two `pulsusdb` processes, cache on
+# and cache off, over one database, answers compared byte for byte.
+read_cache_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	ci/test-summary.sh run read_cache_live -p pulsus-server --test read_cache_live

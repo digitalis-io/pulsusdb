@@ -334,11 +334,29 @@ fn the_traces_answer_level_claim_names_only_real_suites() {
         );
     }
 
-    // 2. The two the paragraph calls CI-enforced appear as `run:` steps —
-    //    asserted on the test-binary selector in the `run:` line, not on
+    // 2. The two the paragraph calls CI-enforced appear as `run:` steps, or
+    //    as the command of a line in a job's suite list under `ci/suites/`
+    //    (issue #843 part 3) — asserted on the test-binary selector, not on
     //    the step's `name:`, because the former is what selects the suite.
     let workflow = std::fs::read_to_string(repo.join(".github/workflows/ci.yml"))
         .expect(".github/workflows/ci.yml is readable");
+    let mut list_commands: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(repo.join("ci/suites")).expect("ci/suites is readable") {
+        let path = entry.expect("a directory entry").path();
+        if path.extension().is_none_or(|x| x != "tsv") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("a suite list is readable");
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            if let Some(command) = line.split('\t').nth(4) {
+                list_commands.push(command.to_string());
+            }
+        }
+    }
+    assert!(
+        !list_commands.is_empty(),
+        "no suite list under ci/suites/ has a command"
+    );
     for (name, enforced) in TRACES_ANSWER_LEVEL_SUITES {
         if !enforced {
             continue;
@@ -347,11 +365,18 @@ fn the_traces_answer_level_claim_names_only_real_suites() {
         let needle = format!("--test {binary}");
         let on_a_run_line = workflow
             .lines()
-            .any(|l| l.contains(&needle) && l.trim_start().starts_with("run:"));
+            .any(|l| l.contains(&needle) && l.trim_start().starts_with("run:"))
+            || list_commands.iter().any(|c| {
+                c.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|w| w[0] == "--test" && w[1] == binary)
+            });
         assert!(
             on_a_run_line,
             "docs/features.md calls {name} CI-enforced, but no `run:` line in \
-             .github/workflows/ci.yml selects it with `{needle}`"
+             .github/workflows/ci.yml and no command in ci/suites/*.tsv selects it with \
+             `{needle}`"
         );
     }
 }

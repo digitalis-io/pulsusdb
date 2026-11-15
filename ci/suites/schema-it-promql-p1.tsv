@@ -1,0 +1,148 @@
+# slots=3
+# suite	lane	when	env	command  (format: ci/live-suites.sh)
+# Issue #18 part B: each rollup-served function against the raw route
+# within design r13 section 2's distances; the finer levels and raw
+# after a level; holes; the counter across the raw piece; a window
+# touching raw is raw. Reuses this job's container.
+# Issue #843 part 3: the two 8-day levels run in schema-it-promql-p2, with
+# pushed rate after them; read cache runs in schema-it-promql-p3.
+live_metrics_rollup	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_rollup -- --skip _at_7200s --skip _at_86400s
+# Issue #635 part 4: `X-Scope-OrgID` through the real binary — pushes,
+# the header's rule on every metrics route, push suppression per
+# tenant, and every `/api/v1` route over two tenants' rows.
+prom_api_tenants_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test prom_api_tenants_live
+# Issue #18 part 3: the raw fetch reads two floats at one millisecond
+# in value-bits order, and the window algebra over 5-minute pieces
+# answers as the base revision's functions over the same samples.
+# Reuses this job's container.
+live_metrics_window_algebra	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_window_algebra
+# Issue #32: spawns the real `pulsusdb` binary and drives `/api/v1/*`
+# (discovery incl. matcher-only `match[]`, instant query,
+# `status/tsdb`, malformed-query error shape) over loopback HTTP,
+# same live-suite pattern as the two steps above.
+prom_api_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	ci/test-summary.sh run prom_api_live -p pulsus-server --test prom_api_live
+# Issue #309: replays the committed matcher-pattern corpus against
+# ClickHouse's RE2 and asserts no pattern the Rust `regex` crate
+# accepts and RE2 rejects escapes the warm-cache screen.
+re2_screen_differential	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test re2_screen_differential
+# Issue #653: `X-Scope-OrgID` on every log route through the
+# binary — the sorting keys, three tenants' pushes on every route,
+# the header's rule and its precedence, and push suppression per
+# tenant.
+logs_api_tenants_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test logs_api_tenants_live
+# Issue #270: OTLP/JSON metrics ingest must store the CORRECTLY ROUNDED
+# f64 — POST /v1/metrics (application/json) -> decode_json -> parse ->
+# MetricWriter (sync) -> ClickHouse, read back as
+# reinterpretAsUInt64(value). The literals are chosen so serde_json's
+# default parser and str::parse disagree by 1 ULP, so this step fails if
+# the workspace `float_roundtrip` feature is ever dropped.
+# Reuses this job's ClickHouse 26.8 container.
+metric_ingest_float_roundtrip	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-write --test metric_ingest_float_roundtrip
+# Issue #18 part A: each rollup level's rows equal their aggregates
+# from raw or the level below; run rows, holes, the stage read and its fallback,
+# and expiry. Reuses this job's container.
+live_rollup_levels	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-schema --test live_rollup_levels
+live_metrics_engine	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_engine
+# Issue #738: `X-Scope-OrgID` on every trace route through the
+# binary — three tenants' pushes on every route against each one's
+# own database, the graph job pairing within a tenant, the header's
+# rule and its precedence, and push suppression per tenant.
+traces_api_tenants_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test traces_api_tenants_live
+# Issue #635 part 2: the inverted label index — name-less series reads
+# and the label endpoints answered from it, an empty value read as
+# absent, and escaped labels, each checked against expectations the
+# suite computes from the generator's own label columns.
+live_metrics_label_index	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_label_index
+# Issue #113 (M7-A2): native-histogram storage schema — migrations 23–26
+# apply + idempotent (no MigrationDrift), metric_hist_samples exists, an
+# EXPLAIN indexes=1 series-ID-led PK prune on metric_hist_samples
+# matching the metric_samples gate (issue #623), and a
+# native-histogram row round-trips losslessly for both an exponential and
+# an NHCB sample. Reuses this job's 26.8 container.
+live_hist_schema	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-schema --test live_hist_schema
+# Issue #549: the grouped instant read against the route that ships
+# today — twelve query/grouping combinations compared bit for bit
+# over one shared label-cache snapshot, the NaN cases, the derived
+# row bound, and the boundary pairs that pin what the sample budget
+# charges.
+live_metrics_grouped	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_grouped
+# Issue #548: the statements the database actually received, read
+# back out of `system.query_log` and compared against text the test
+# writes out itself, plus the plan's own SQL part names against the
+# tables those statements read. The hermetic statement freeze cannot
+# see the engine calling the builders with different arguments —
+# measured: a one-millisecond shift of every fetch window leaves the
+# freeze digest unmoved and `pulsus-read --lib` green.
+live_metrics_plan_parts	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_plan_parts
+# Issue #471 M2: spawns the real `pulsusdb` binary behind a TCP
+# proxy that stops forwarding, so a request cannot complete and the
+# request deadline is observed on the wire — `503` + the PromQL
+# error envelope on the query surface, the byte-identical bare `408`
+# on `/api/v1/write` and on the LogQL surface. Reuses this job's
+# ClickHouse container.
+prom_deadline_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	ci/test-summary.sh run prom_deadline_live -p pulsus-server --test prom_deadline_live
+# Issue #635 part 3: PromQL selectors with no metric name and no
+# __name__ matcher, resolved through the label index — exact answers
+# against the generator, the statements sent, a cold cache, the
+# series cap, the pushed aggregates, histogram-only series and the
+# lookback before the range.
+live_metrics_nameless	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_nameless
+# Issue #623: every series read against answers written from the seed,
+# each series answered from its own label row, and the float and
+# histogram reads sent together on every fetch path.
+live_metrics_storage	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_storage
+# Issue #738: a tenant's fetch and searches read the rows the
+# statements before the tenant column read, on the same corpus.
+traces_tenant_rows	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test traces_tenant_rows
+# Issue #547: the only suite that compares a PromQL answer computed
+# through ClickHouse against a known value, bit for bit. The
+# correctness corpus cannot reach the read path, and the live suites
+# above assert labels, statement text and pruning, not values.
+live_metrics_answers	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_answers
+# Issue #635 part 4: two tenants holding the same series IDs; every
+# engine read, cold cache and warm, answers the asking tenant's own
+# rows, as the design's case table writes them.
+live_metrics_tenants	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_tenants
+# Issue #501 part 2: `/api/v1/query_exemplars`' read — the selected
+# series' exemplars, a stored repeat once, the bounds, the tenant, the
+# 100,000 cap counted in distinct exemplars, and the thinned answer.
+live_metrics_exemplars	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_exemplars
+# Issue #603: the metric registration-backfill live failure
+# injection had its own step here, and its suite is gone with the
+# mechanism. One push is one insert of one block into
+# `metric_landing`, so there is no separate registration insert to
+# lose and nothing to heal: a push whose insert failed emits its
+# registration rows again next time, because the series LRU is
+# promoted only when that block commits. The landing block's own live
+# coverage is the `Live metric writer suite` step below.
+live_metrics_cache	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_cache
+# Issue #500: `/api/v1/metadata`'s read returns every distinct
+# descriptor of a name, `limit` counts names after `metric`, and a
+# descriptor not resent within the retention leaves.
+live_metrics_metadata	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_metrics_metadata
+# Issue #793: a matcher that matches the empty string selects the
+# streams without its label, on every read that takes a selector.
+live_logs_empty_matcher	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_logs_empty_matcher
+live_discovery_fallback	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_discovery_fallback
+# Issue #120 (M7-A4): the native-histogram write path — MetricWriter ->
+# metric_hist_samples. Deciding ClickHouse-NaN gate (finite/stale-NaN/
+# absent-NaN `sum` bit patterns survive Float64 RowBinary round-trip
+# distinctly — also the first live proof of the landed float-stale
+# assumption), an OTLP parse(Native) -> writer -> SELECT absolute-count
+# round-trip incl. an internal zero bucket, and the value_type
+# discriminator mask (a cross-request float+histogram at one series
+# lands both kind-2 landing rows, groupBitOr == 3). Reuses this
+# job's ClickHouse 26.8 container.
+live_metric_hist_writer	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-write --test live_metric_hist_writer
+# Issue #653: two tenants' log rows on one fingerprint; every engine
+# read over a log table answers the asking tenant's own rows.
+live_logs_tenants	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test live_logs_tenants
+live_metric_writer	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-write --test live_metric_writer
+# Issue #140: remote-write native-histogram ingest — a real snappy
+# prompb body with a GAUGE-hint and an UNKNOWN-hint integer native
+# histogram through ingest_remote_write (sync) -> MetricWriter ->
+# ClickHouse: counter_reset_hint lands 3 and 0 respectively, the
+# stored row decodes to a Gauge FloatHistogram, and the
+# histograms-only series land kind-2 rows carrying value_type = 1.
+# Reuses this job's ClickHouse 26.8 container.
+live_remote_write_hist	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-write --test live_remote_write_hist

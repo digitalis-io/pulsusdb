@@ -173,6 +173,36 @@ fn ci_step_citations(text: &str) -> Vec<String> {
     out
 }
 
+/// Issue #843 part 3: all `ci/suites/<job>.tsv: "<suite>"` citations, as
+/// `(job, suite)`.
+fn suite_list_citations(text: &str) -> Vec<(String, String)> {
+    let needle = "ci/suites/";
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find(needle) {
+        let after = &rest[pos + needle.len()..];
+        rest = after;
+        let Some((job, tail)) = after.split_once(".tsv: \"") else {
+            continue;
+        };
+        let Some((suite, _)) = tail.split_once('"') else {
+            continue;
+        };
+        if job.contains(char::is_whitespace) || job.contains('<') || suite.contains('<') {
+            continue;
+        }
+        out.push((job.to_string(), suite.to_string()));
+    }
+    out
+}
+
+/// True if `suite` is the first field of a line of the suite list `list`.
+fn suite_list_has(list: &str, suite: &str) -> bool {
+    list.lines()
+        .filter(|line| !line.starts_with('#'))
+        .any(|line| line.split('\t').next() == Some(suite))
+}
+
 /// True if `name` appears as a `name:` step value anywhere in `ci`.
 fn ci_has_step(ci: &str, name: &str) -> bool {
     ci.lines().any(|line| {
@@ -249,6 +279,14 @@ fn every_evidence_pointer_in_the_readiness_doc_resolves() {
         assert!(
             ci_has_step(&ci, &name),
             "CI step cited in the doc is missing from ci.yml: {name:?}"
+        );
+        resolved_any = true;
+    }
+    for (job, suite) in suite_list_citations(&text) {
+        let list = read_or_panic(&root.join(format!("ci/suites/{job}.tsv")));
+        assert!(
+            suite_list_has(&list, &suite),
+            "suite cited in the doc is missing from ci/suites/{job}.tsv: {suite:?}"
         );
         resolved_any = true;
     }
