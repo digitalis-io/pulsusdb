@@ -1623,8 +1623,14 @@ async fn sync_replica(client: &ChClient, db: &str, table: &str, what: &str) {
     sync_replica_within(client, db, table, what, SYNC_BUDGET).await;
 }
 
-/// The budget of every replica sync but KC17's copy wait.
+/// The budget of every replica sync but those given `COPY_BUDGET`.
 const SYNC_BUDGET: Duration = Duration::from_secs(120);
+
+/// The budget of KC17's copy wait, and of a sync on ch-shard1b that can
+/// queue behind that copy: KC17 releases over 10,000 parts to ch-shard1b's
+/// fetch pool at once, and a test running beside it waits for its own
+/// fetches behind them (25 to 55 s on a local copy of the fixture).
+const COPY_BUDGET: Duration = Duration::from_secs(300);
 
 /// `sync_replica` with its budget given.
 async fn sync_replica_within(
@@ -4637,7 +4643,7 @@ async fn a_log_over_the_cap_holds_the_run() {
     refresh_on(&r.s1b, &db, "KC17: ch-shard1b's run over the cap").await;
     assert_no_new_marker(&r.s1b, l, &format!("KC17: the run over {n} uncopied")).await;
     exec(&r.s1b, "SYSTEM START PULLING REPLICATION LOG spans").await;
-    wait_synced(&[&r.s1b], &db, "KC17: copied", Duration::from_secs(300)).await;
+    wait_synced(&[&r.s1b], &db, "KC17: copied", COPY_BUDGET).await;
     refresh_on(&r.s1b, &db, "KC17: ch-shard1b's run after the copy").await;
     assert_covers_g(&r.s1b, l, "KC17: the run after the copy").await;
     r.drop().await;
@@ -5441,15 +5447,9 @@ async fn the_catalogue_and_the_error_table_answer_over_two_shards() {
                   AS s FROM tag_bucket_values GROUP BY service, key, bucket ORDER BY service, key, bucket";
     let mut held = Vec::new();
     for node in [&shard1, &shard1b, &shard2] {
-        let synced = node
-            .execute(
-                &format!("SYSTEM SYNC REPLICA {db}.tag_bucket_values"),
-                &QuerySettings::new(),
-                Idempotency::NonIdempotent,
-            )
-            .await;
+        sync_replica_within(node, &db, "tag_bucket_values", "the catalogue", COPY_BUDGET).await;
         let rows = node.query_strings(groups, &QuerySettings::new()).await;
-        held.push(format!("{synced:?} {rows:?}"));
+        held.push(format!("{rows:?}"));
     }
     eprintln!("tag_bucket_values per node: {held:?}");
     if held[0] != held[1] || held[0] != held[2] || !held[0].contains("checkout") {
@@ -5804,25 +5804,22 @@ async fn the_resource_catalogue_answers_over_two_shards() {
     );
     let mut held = Vec::new();
     for node in &nodes {
-        let synced = node
-            .execute(
-                &format!("SYSTEM SYNC REPLICA {db}.service_bucket_resources"),
-                &QuerySettings::new(),
-                Idempotency::NonIdempotent,
-            )
-            .await
-            .map_err(|e| e.to_string());
-        held.push((
-            synced,
+        sync_replica_within(
+            node,
+            &db,
+            "service_bucket_resources",
+            "the resource catalogue",
+            COPY_BUDGET,
+        )
+        .await;
+        held.push(
             node.query_strings(&rows, &QuerySettings::new())
                 .await
                 .map_err(|e| e.to_string()),
-        ));
+        );
     }
     eprintln!("service_bucket_resources per node: {held:?}");
-    let five = |h: &(Result<(), String>, Result<Vec<String>, String>)| {
-        h.0.is_ok() && h.1.as_ref().is_ok_and(|r| r.len() == 5)
-    };
+    let five = |h: &Result<Vec<String>, String>| h.as_ref().is_ok_and(|r| r.len() == 5);
     if !held.iter().all(five) || held[0] != held[1] || held[0] != held[2] {
         wrong.push(format!(
             "the three replicas do not hold the same five rows: {held:?}"
