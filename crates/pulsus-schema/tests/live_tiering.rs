@@ -433,6 +433,7 @@ async fn the_script_refuses_an_absent_policy_before_it_drops() {
         ("PULSUS_METRICS_HOT_DAYS", "2"),
         ("PULSUS_LOGS_HOT_DAYS", "2"),
         ("PULSUS_TRACES_HOT_DAYS", "2"),
+        ("PULSUS_PROFILES_HOT_DAYS", "2"),
     ];
     let with_volume = |policy: &'static str, volume: &'static str| {
         let mut vars = vec![

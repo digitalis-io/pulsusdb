@@ -36,6 +36,7 @@
 #metrics_dedup_window: 10000           # blocks each metrics table remembers for deduplication
 #log_dedup_window: 10000               # blocks each logs table remembers for deduplication
 #trace_dedup_window: 10000             # blocks each traces table remembers for deduplication
+#profile_dedup_window: 10000           # blocks each profiles table remembers for deduplication
 #cluster: null                    # ClickHouse cluster name; enables distributed DDL
 #dist_suffix: _dist
 #skip_unavailable_shards: false

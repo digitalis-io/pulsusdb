@@ -92,6 +92,14 @@ pub struct Config {
     /// **A count of blocks**, with the same shape as the logs key's: see
     /// [`Self::log_dedup_window`]. Accepted range `1..=1000000`.
     pub trace_dedup_window: u64,
+    /// `PULSUS_PROFILE_DEDUP_WINDOW` (issue #813): how many recent blocks
+    /// the profiles landing table and each of the five derived profile
+    /// tables remember for deduplication, so a resend of a block the server
+    /// already accepted is dropped before it is stored a second time.
+    ///
+    /// **A count of blocks**, with the same shape as the logs key's: see
+    /// [`Self::log_dedup_window`]. Accepted range `1..=1000000`.
+    pub profile_dedup_window: u64,
     // §4 Clustering
     pub cluster: Option<String>,
     pub dist_suffix: String,
@@ -158,6 +166,7 @@ impl Default for Config {
             metrics_dedup_window: 10_000,
             log_dedup_window: 10_000,
             trace_dedup_window: 10_000,
+            profile_dedup_window: 10_000,
             cluster: None,
             dist_suffix: "_dist".to_string(),
             skip_unavailable_shards: false,

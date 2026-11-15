@@ -25,9 +25,11 @@ pub const SCHEMA_VARS: &[&str] = &[
     "PULSUS_METRICS_LANDING_RETENTION_HOURS",
     "PULSUS_LOG_LANDING_RETENTION_HOURS",
     "PULSUS_TRACE_LANDING_RETENTION_HOURS",
+    "PULSUS_PROFILE_LANDING_RETENTION_HOURS",
     "PULSUS_METRICS_DEDUP_WINDOW",
     "PULSUS_LOG_DEDUP_WINDOW",
     "PULSUS_TRACE_DEDUP_WINDOW",
+    "PULSUS_PROFILE_DEDUP_WINDOW",
     "PULSUS_ROLLUP_LEVELS",
     "PULSUS_ROLLUP_RANGES",
     "PULSUS_ROLLUP_COUNTER_BUCKETS",
@@ -35,6 +37,7 @@ pub const SCHEMA_VARS: &[&str] = &[
     "PULSUS_METRICS_HOT_DAYS",
     "PULSUS_LOGS_HOT_DAYS",
     "PULSUS_TRACES_HOT_DAYS",
+    "PULSUS_PROFILES_HOT_DAYS",
     "PULSUS_ROLLUP_RETENTION_DAYS",
     "PULSUS_ROLLUP_HOT_DAYS",
     "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
@@ -141,7 +144,7 @@ pub const REFUSALS: &[(&str, &str)] = &[
         "2",
     ),
     (
-        "<what> is not set; with PULSUS_COLD_VOLUME set each of PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS is required",
+        "<what> is not set; with PULSUS_COLD_VOLUME set each of PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS, PULSUS_TRACES_HOT_DAYS and PULSUS_PROFILES_HOT_DAYS is required",
         "2",
     ),
     ("<what> is set and PULSUS_COLD_VOLUME is not", "2"),
@@ -333,11 +336,12 @@ pub fn ctx_from_vars(
             )
         })?;
 
-    let mut landing = [0u32; 3];
+    let mut landing = [0u32; 4];
     for (slot, name) in landing.iter_mut().zip([
         "PULSUS_METRICS_LANDING_RETENTION_HOURS",
         "PULSUS_LOG_LANDING_RETENTION_HOURS",
         "PULSUS_TRACE_LANDING_RETENTION_HOURS",
+        "PULSUS_PROFILE_LANDING_RETENTION_HOURS",
     ]) {
         let value = or_default(name, "6");
         *slot = whole(value, 3)
@@ -348,11 +352,12 @@ pub fn ctx_from_vars(
             })?;
     }
 
-    let mut dedup = [0u64; 3];
+    let mut dedup = [0u64; 4];
     for (slot, name) in dedup.iter_mut().zip([
         "PULSUS_METRICS_DEDUP_WINDOW",
         "PULSUS_LOG_DEDUP_WINDOW",
         "PULSUS_TRACE_DEDUP_WINDOW",
+        "PULSUS_PROFILE_DEDUP_WINDOW",
     ]) {
         let value = or_default(name, "10000");
         *slot = pulsus_config::parse_dedup_window(value).ok_or_else(|| {
@@ -374,6 +379,7 @@ pub fn ctx_from_vars(
         metrics_hot_days: non_empty("PULSUS_METRICS_HOT_DAYS"),
         logs_hot_days: non_empty("PULSUS_LOGS_HOT_DAYS"),
         traces_hot_days: non_empty("PULSUS_TRACES_HOT_DAYS"),
+        profiles_hot_days: non_empty("PULSUS_PROFILES_HOT_DAYS"),
         levels: &levels,
         ranges: &ranges,
         rollup_retention_days: get("PULSUS_ROLLUP_RETENTION_DAYS"),
@@ -426,6 +432,8 @@ pub fn ctx_from_vars(
         log_dedup_window: dedup[1],
         trace_landing_retention_hours: landing[2],
         trace_dedup_window: dedup[2],
+        profile_landing_retention_hours: landing[3],
+        profile_dedup_window: dedup[3],
         trace_indexed_attributes: attributes,
         graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
         rollup_levels: levels,
@@ -435,6 +443,7 @@ pub fn ctx_from_vars(
         metrics_hot_days: tiering.metrics_hot_days,
         logs_hot_days: tiering.logs_hot_days,
         traces_hot_days: tiering.traces_hot_days,
+        profiles_hot_days: tiering.profiles_hot_days,
         rollup_retention_days: tiering.rollup_retention_days,
         rollup_hot_days: tiering.rollup_hot_days,
     })

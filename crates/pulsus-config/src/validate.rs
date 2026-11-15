@@ -290,6 +290,13 @@ pub const TRACE_DEDUP_WINDOW_FLOOR: u64 = 1;
 /// See [`TRACE_DEDUP_WINDOW_FLOOR`].
 pub const TRACE_DEDUP_WINDOW_CEILING: u64 = 1_000_000;
 
+/// `profile_dedup_window` (issue #813) — how many recent blocks each of the
+/// six tables on the profiles write path remembers, with the traces window's
+/// floor and ceiling and for the same reasons.
+pub const PROFILE_DEDUP_WINDOW_FLOOR: u64 = 1;
+/// See [`PROFILE_DEDUP_WINDOW_FLOOR`].
+pub const PROFILE_DEDUP_WINDOW_CEILING: u64 = 1_000_000;
+
 /// `writer.trace_landing_retries` — resends of a failed traces landing
 /// insert. Zero is meaningful (never resend), and the ceiling is ten: the
 /// landing budget bounds the loop in wall-clock time anyway, so a larger
@@ -657,6 +664,18 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             cfg.trace_dedup_window,
             TRACE_DEDUP_WINDOW_FLOOR,
             TRACE_DEDUP_WINDOW_CEILING,
+            "blocks",
+        ));
+    }
+    // Issue #813: the profiles write path's window.
+    if !(PROFILE_DEDUP_WINDOW_FLOOR..=PROFILE_DEDUP_WINDOW_CEILING)
+        .contains(&cfg.profile_dedup_window)
+    {
+        return Err(range_err(
+            "profile_dedup_window",
+            cfg.profile_dedup_window,
+            PROFILE_DEDUP_WINDOW_FLOOR,
+            PROFILE_DEDUP_WINDOW_CEILING,
             "blocks",
         ));
     }
@@ -1582,6 +1601,7 @@ mod tests {
     fn the_trace_landing_dials_reject_both_sides_and_accept_both_ends() {
         let d = Config::default();
         assert_eq!(d.trace_dedup_window, 10_000);
+        assert_eq!(d.profile_dedup_window, 10_000);
         assert_eq!(d.writer.trace_landing_retries, 3);
         assert_eq!(d.writer.trace_landing_inserters, 4);
         assert_eq!(d.writer.trace_landing_max_rows, 1_048_576);
@@ -1589,12 +1609,19 @@ mod tests {
 
         // (field, setter, bad values, good values)
         type Set = fn(&mut Config, u64);
-        let cases: [(&str, Set, Vec<u64>, Vec<u64>); 4] = [
+        let cases: [(&str, Set, Vec<u64>, Vec<u64>); 5] = [
             (
                 "trace_dedup_window",
                 |c, v| c.trace_dedup_window = v,
                 vec![TRACE_DEDUP_WINDOW_FLOOR - 1, TRACE_DEDUP_WINDOW_CEILING + 1],
                 vec![TRACE_DEDUP_WINDOW_FLOOR, TRACE_DEDUP_WINDOW_CEILING],
+            ),
+            // Issue #813: the profiles write path's window.
+            (
+                "profile_dedup_window",
+                |c, v| c.profile_dedup_window = v,
+                vec![0, 1_000_001],
+                vec![1, 1_000_000],
             ),
             (
                 "writer.trace_landing_retries",

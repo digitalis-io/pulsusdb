@@ -219,6 +219,7 @@ fn schema_field(message: &str) -> &'static str {
         "PULSUS_METRICS_HOT_DAYS",
         "PULSUS_LOGS_HOT_DAYS",
         "PULSUS_TRACES_HOT_DAYS",
+        "PULSUS_PROFILES_HOT_DAYS",
     ]) {
         "raw"
     } else if starts(&[
@@ -533,6 +534,7 @@ fn schema_vars(
             "PULSUS_METRICS_HOT_DAYS",
             "PULSUS_LOGS_HOT_DAYS",
             "PULSUS_TRACES_HOT_DAYS",
+            "PULSUS_PROFILES_HOT_DAYS",
         ] {
             vars.insert(name, raw_local_days.to_string());
         }

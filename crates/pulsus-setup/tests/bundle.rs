@@ -148,6 +148,7 @@ fn c1_schema_env_of_the_example() {
             "PULSUS_COLD_VOLUME=cold",
             "PULSUS_LOGS_HOT_DAYS=7",
             "PULSUS_METRICS_HOT_DAYS=7",
+            "PULSUS_PROFILES_HOT_DAYS=7",
             "PULSUS_RETENTION_DAYS=97",
             "PULSUS_ROLLUP_LEVELS=60,720,7200,86400",
             "PULSUS_ROLLUP_RANGES=3600,86400,604800,7776000",

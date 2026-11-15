@@ -313,6 +313,11 @@ const ROWS: &[Row] = &[
         check: |c| c.trace_dedup_window == 7_000,
     },
     Row {
+        var: "PULSUS_PROFILE_DEDUP_WINDOW",
+        value: "7000",
+        check: |c| c.profile_dedup_window == 7_000,
+    },
+    Row {
         var: "PULSUS_TRACE_LANDING_RETRIES",
         value: "5",
         check: |c| c.writer.trace_landing_retries == 5,
@@ -596,7 +601,8 @@ fn rows_of(tables: &str) -> Vec<DocRow> {
 /// alone reads, and the binary reads none of them. Issue #18 part A added
 /// `PULSUS_ROLLUP_LEVELS`, and its follow-up `PULSUS_ROLLUP_RANGES` and
 /// `PULSUS_ROLLUP_COUNTER_BUCKETS`. Issue #743 part A added the four tiering
-/// variables. Issue #743 part B added the two level lists.
+/// variables. Issue #743 part B added the two level lists, and issue #813
+/// the profiles' landing hours and move age.
 #[test]
 fn section_7_names_the_script_s_retention_variables_and_the_binary_reads_none() {
     let mut got: Vec<String> = rows_of(&sections().1)
@@ -613,6 +619,8 @@ fn section_7_names_the_script_s_retention_variables_and_the_binary_reads_none() 
             "PULSUS_LOG_LANDING_RETENTION_HOURS",
             "PULSUS_METRICS_HOT_DAYS",
             "PULSUS_METRICS_LANDING_RETENTION_HOURS",
+            "PULSUS_PROFILES_HOT_DAYS",
+            "PULSUS_PROFILE_LANDING_RETENTION_HOURS",
             "PULSUS_RETENTION_DAYS",
             "PULSUS_ROLLUP_COUNTER_BUCKETS",
             "PULSUS_ROLLUP_HOT_DAYS",

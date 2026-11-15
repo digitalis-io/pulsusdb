@@ -54,9 +54,11 @@ rollup=${PULSUS_LOG_ROLLUP_RESOLUTION:-5s}
 metrics_landing_hours=${PULSUS_METRICS_LANDING_RETENTION_HOURS:-6}
 log_landing_hours=${PULSUS_LOG_LANDING_RETENTION_HOURS:-6}
 trace_landing_hours=${PULSUS_TRACE_LANDING_RETENTION_HOURS:-6}
+profile_landing_hours=${PULSUS_PROFILE_LANDING_RETENTION_HOURS:-6}
 metrics_dedup=${PULSUS_METRICS_DEDUP_WINDOW:-10000}
 log_dedup=${PULSUS_LOG_DEDUP_WINDOW:-10000}
 trace_dedup=${PULSUS_TRACE_DEDUP_WINDOW:-10000}
+profile_dedup=${PULSUS_PROFILE_DEDUP_WINDOW:-10000}
 rollup_levels=${PULSUS_ROLLUP_LEVELS-60,720,7200,86400}
 rollup_ranges=${PULSUS_ROLLUP_RANGES-10800,57600,604800,7776000}
 counter_buckets=${PULSUS_ROLLUP_COUNTER_BUCKETS-5}
@@ -64,6 +66,7 @@ cold_volume=${PULSUS_COLD_VOLUME:-}
 metrics_hot=${PULSUS_METRICS_HOT_DAYS:-}
 logs_hot=${PULSUS_LOGS_HOT_DAYS:-}
 traces_hot=${PULSUS_TRACES_HOT_DAYS:-}
+profiles_hot=${PULSUS_PROFILES_HOT_DAYS:-}
 rollup_retention=${PULSUS_ROLLUP_RETENTION_DAYS-}
 retention_given=${PULSUS_ROLLUP_RETENTION_DAYS+1}
 rollup_hot=${PULSUS_ROLLUP_HOT_DAYS-}
@@ -112,7 +115,8 @@ if [ "${#retention_days}" -gt 10 ] || [ "$retention_days" -gt 4294967295 ]; then
 fi
 for pair in "PULSUS_METRICS_LANDING_RETENTION_HOURS:$metrics_landing_hours" \
             "PULSUS_LOG_LANDING_RETENTION_HOURS:$log_landing_hours" \
-            "PULSUS_TRACE_LANDING_RETENTION_HOURS:$trace_landing_hours"; do
+            "PULSUS_TRACE_LANDING_RETENTION_HOURS:$trace_landing_hours" \
+            "PULSUS_PROFILE_LANDING_RETENTION_HOURS:$profile_landing_hours"; do
     what=${pair%%:*}
     value=${pair#*:}
     case "$value" in
@@ -128,7 +132,8 @@ for pair in "PULSUS_METRICS_LANDING_RETENTION_HOURS:$metrics_landing_hours" \
 done
 for pair in "PULSUS_METRICS_DEDUP_WINDOW:$metrics_dedup" \
             "PULSUS_LOG_DEDUP_WINDOW:$log_dedup" \
-            "PULSUS_TRACE_DEDUP_WINDOW:$trace_dedup"; do
+            "PULSUS_TRACE_DEDUP_WINDOW:$trace_dedup" \
+            "PULSUS_PROFILE_DEDUP_WINDOW:$profile_dedup"; do
     what=${pair%%:*}
     value=${pair#*:}
     case "$value" in
@@ -273,11 +278,11 @@ if [ -n "$cold_volume" ]; then
     esac
 fi
 for pair in "PULSUS_METRICS_HOT_DAYS:$metrics_hot" "PULSUS_LOGS_HOT_DAYS:$logs_hot" \
-            "PULSUS_TRACES_HOT_DAYS:$traces_hot"; do
+            "PULSUS_TRACES_HOT_DAYS:$traces_hot" "PULSUS_PROFILES_HOT_DAYS:$profiles_hot"; do
     what=${pair%%:*}
     value=${pair#*:}
     if [ -n "$cold_volume" ] && [ -z "$value" ]; then
-        bad_tiering "$what is not set; with PULSUS_COLD_VOLUME set each of PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS is required"
+        bad_tiering "$what is not set; with PULSUS_COLD_VOLUME set each of PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS, PULSUS_TRACES_HOT_DAYS and PULSUS_PROFILES_HOT_DAYS is required"
     fi
     if [ -z "$cold_volume" ] && [ -n "$value" ]; then
         bad_tiering "$what is set and PULSUS_COLD_VOLUME is not"
@@ -295,10 +300,12 @@ done
 cold_metrics='/^--@cold-metrics /d'
 cold_logs='/^--@cold-logs /d'
 cold_traces='/^--@cold-traces /d'
+cold_profiles='/^--@cold-profiles /d'
 if [ -n "$cold_volume" ]; then
     [ "$metrics_hot" -ge "$retention_days" ] || cold_metrics='s/^--@cold-metrics *//'
     [ "$logs_hot" -ge "$retention_days" ] || cold_logs='s/^--@cold-logs *//'
     [ "$traces_hot" -ge "$retention_days" ] || cold_traces='s/^--@cold-traces *//'
+    [ "$profiles_hot" -ge "$retention_days" ] || cold_profiles='s/^--@cold-profiles *//'
 fi
 
 # Issue #743 part B: each rollup level's own retention and move age. The
@@ -563,7 +570,7 @@ expand_levels() {
 
 render() {
     expand_levels < "$sql" | sed -e "/^--@$other /d" -e "s/^--@$mode *//" \
-        -e "$cold_metrics" -e "$cold_logs" -e "$cold_traces" -e "/^--/d" |
+        -e "$cold_metrics" -e "$cold_logs" -e "$cold_traces" -e "$cold_profiles" -e "/^--/d" |
         sed -e "s|{{db}}|$db|g" \
             -e "s|{{on_cluster}}|$on_cluster|g" \
             -e "s|{{cluster}}|$cluster_token|g" \
@@ -575,9 +582,11 @@ render() {
             -e "s|{{metrics_landing_retention_hours}}|$metrics_landing_hours|g" \
             -e "s|{{log_landing_retention_hours}}|$log_landing_hours|g" \
             -e "s|{{trace_landing_retention_hours}}|$trace_landing_hours|g" \
+            -e "s|{{profile_landing_retention_hours}}|$profile_landing_hours|g" \
             -e "s|{{metrics_dedup_window}}|$metrics_dedup|g" \
             -e "s|{{log_dedup_window}}|$log_dedup|g" \
             -e "s|{{trace_dedup_window}}|$trace_dedup|g" \
+            -e "s|{{profile_dedup_window}}|$profile_dedup|g" \
             -e "s|{{dedup_window_seconds}}|$dedup_window_seconds|g" \
             -e "s|{{graph_job_max_rows}}|$graph_job_max_rows|g" \
             -e "s|{{storage_policy}}|$policy_token|g" \
@@ -586,6 +595,7 @@ render() {
             -e "s|{{metrics_hot_days}}|$metrics_hot|g" \
             -e "s|{{logs_hot_days}}|$logs_hot|g" \
             -e "s|{{traces_hot_days}}|$traces_hot|g" \
+            -e "s|{{profiles_hot_days}}|$profiles_hot|g" \
             -e "s|{{metrics_catalogue_retention_days}}|$catalogue_days|g" |
         TRACE_ATTR_INDEXES=$attr_indexes awk '{
             i = index($0, "{{trace_attr_indexes}}")

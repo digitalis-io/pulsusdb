@@ -15,18 +15,19 @@
 -- tables, is the largest of the retention and every rollup level's
 -- (issue #743), so a level's series outlive its rows.
 --
--- COLD MARKERS. A line prefixed `--@cold-metrics`, `--@cold-logs` or
--- `--@cold-traces` is the move clause of a table of that family (issue
--- #743): kept, marker and spaces removed, when PULSUS_COLD_VOLUME is set and
--- the family's move age is under the retention; dropped otherwise. A rollup
+-- COLD MARKERS. A line prefixed `--@cold-metrics`, `--@cold-logs`,
+-- `--@cold-traces` or `--@cold-profiles` is the move clause of a table of
+-- that family (issue #743): kept, marker and spaces removed, when
+-- PULSUS_COLD_VOLUME is set and the family's move age is under the
+-- retention; dropped otherwise. A rollup
 -- level's move clause is the level block's `--@level-cold ` line (below).
 -- `{{storage_policy_local}}` is `{{storage_policy}}` without a cold volume
 -- and empty with one: the tables that never move are then on the server's
 -- `default` policy.
 --
 -- A REPLICATION PATH NAMES ITS OWN TABLE. The paths are written out rather
--- than derived, so a wrong one is a per-table error. Nineteen tables, and
--- one per rollup level, take `/clickhouse/tables/{shard}/` and six take
+-- than derived, so a wrong one is a per-table error. Twenty-three tables, and
+-- one per rollup level, take `/clickhouse/tables/{shard}/` and eight take
 -- `/clickhouse/tables/all/` (docs/architecture.md §3). `tests/schema_file.rs`
 -- holds the relation.
 --
@@ -530,6 +531,164 @@ TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{
 --@single  SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy_local}};
 --@cluster SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
 
+CREATE TABLE IF NOT EXISTS {{db}}.profile_landing{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    received_ms Int64 CODEC(DoubleDelta, ZSTD(1)),
+    kind UInt8 CODEC(ZSTD(1)),
+    type_id LowCardinality(String),
+    service LowCardinality(String),
+    fingerprint UInt128 CODEC(ZSTD(1)),
+    timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)),
+    stack_id UInt128 CODEC(ZSTD(1)),
+    value Int64 CODEC(T64, ZSTD(1)),
+    span_id UInt64 CODEC(ZSTD(1)),
+    trace_id FixedString(16) CODEC(ZSTD(1)),
+    node_ids Array(UInt128) CODEC(ZSTD(1)),
+    names Array(LowCardinality(String)) CODEC(ZSTD(1)),
+    location_ids Array(UInt128) CODEC(ZSTD(1)),
+    location_id UInt128 CODEC(ZSTD(1)),
+    mapping_file String CODEC(ZSTD(1)),
+    mapping_build_id String CODEC(ZSTD(1)),
+    mapping_start UInt64 CODEC(ZSTD(1)),
+    mapping_limit UInt64 CODEC(ZSTD(1)),
+    mapping_offset UInt64 CODEC(ZSTD(1)),
+    address UInt64 CODEC(ZSTD(1)),
+    line_functions Array(String) CODEC(ZSTD(1)),
+    line_system_names Array(String) CODEC(ZSTD(1)),
+    line_files Array(String) CODEC(ZSTD(1)),
+    line_start_lines Array(Int64) CODEC(ZSTD(1)),
+    line_numbers Array(Int64) CODEC(ZSTD(1)),
+    labels String CODEC(ZSTD(5)),
+    profile_id UUID CODEC(ZSTD(1)),
+    upload_id UUID CODEC(ZSTD(1)),
+    upload_name String CODEC(ZSTD(1)),
+    uploaded_at Int64 CODEC(ZSTD(1)),
+    type_ordinal UInt16 CODEC(ZSTD(1)),
+    is_type UInt8 CODEC(ZSTD(1)),
+    upload_format LowCardinality(String),
+    display_name String CODEC(ZSTD(1)),
+    spy_name String CODEC(ZSTD(1)),
+    sample_rate UInt32 CODEC(ZSTD(1)),
+    units LowCardinality(String),
+    duration_ns Int64 CODEC(ZSTD(1)),
+    annotation_keys Array(String) CODEC(ZSTD(1)),
+    annotation_values Array(String) CODEC(ZSTD(1))
+)
+--@single  ENGINE = MergeTree
+--@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.profile_landing', '{replica}')
+PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
+ORDER BY (org_id, kind, type_id, service, fingerprint, timestamp_ns)
+TTL toDateTime(least(intDiv(received_ms, 1000) + ({{profile_landing_retention_hours}} * 3600), 4294967295))
+--@single  SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{profile_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
+
+CREATE TABLE IF NOT EXISTS {{db}}.profile_samples{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    type_id LowCardinality(String),
+    service LowCardinality(String),
+    fingerprint UInt128 CODEC(ZSTD(1)),
+    timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)),
+    stack_id UInt128 CODEC(ZSTD(1)),
+    value Int64 CODEC(T64, ZSTD(1)),
+    span_id UInt64 CODEC(ZSTD(1)),
+    trace_id FixedString(16) CODEC(ZSTD(1)),
+    profile_id UUID CODEC(ZSTD(1))
+)
+--@single  ENGINE = MergeTree
+--@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.profile_samples', '{replica}')
+PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC')
+ORDER BY (org_id, type_id, service, fingerprint, timestamp_ns, profile_id)
+TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@cold-profiles , toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{profiles_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{profile_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+
+CREATE TABLE IF NOT EXISTS {{db}}.profile_entries{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    type_id LowCardinality(String),
+    service LowCardinality(String),
+    fingerprint UInt128 CODEC(ZSTD(1)),
+    timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)),
+    profile_id UUID CODEC(ZSTD(1)),
+    total Int64 CODEC(T64, ZSTD(1)),
+    duration_ns Int64 CODEC(ZSTD(1)),
+    annotation_keys Array(String) CODEC(ZSTD(1)),
+    annotation_values Array(String) CODEC(ZSTD(1))
+)
+--@single  ENGINE = MergeTree
+--@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.profile_entries', '{replica}')
+PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC')
+ORDER BY (org_id, type_id, service, fingerprint, timestamp_ns, profile_id)
+TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@cold-profiles , toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{profiles_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{profile_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+
+CREATE TABLE IF NOT EXISTS {{db}}.profile_series{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    day Date,
+    type_id LowCardinality(String),
+    service LowCardinality(String),
+    fingerprint UInt128 CODEC(ZSTD(1)),
+    labels String CODEC(ZSTD(5)),
+    hours SimpleAggregateFunction(groupBitOr, UInt32)
+)
+--@single  ENGINE = AggregatingMergeTree
+--@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.profile_series', '{replica}')
+PARTITION BY day
+ORDER BY (org_id, type_id, service, fingerprint)
+TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + {{retention_days}}) * 86400, 4294967295))
+-- `labels` is outside the key and not an aggregate. It is a function of
+-- `fingerprint`, so a merge never chooses between two different values.
+--@single  SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{profile_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
+
+CREATE TABLE IF NOT EXISTS {{db}}.profile_stacks{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    day Date,
+    stack_id UInt128 CODEC(ZSTD(1)),
+    node_ids Array(UInt128) CODEC(ZSTD(1)),
+    names Array(LowCardinality(String)) CODEC(ZSTD(1)),
+    location_ids Array(UInt128) CODEC(ZSTD(1))
+)
+--@single  ENGINE = ReplacingMergeTree
+--@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.profile_stacks', '{replica}')
+PARTITION BY day
+ORDER BY (org_id, stack_id)
+TTL toDateTime(least(((toUInt32(day) + 2) * 86400) + ({{retention_days}} * 86400), 4294967295))
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{profile_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
+
+CREATE TABLE IF NOT EXISTS {{db}}.profile_locations{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    day Date,
+    location_id UInt128 CODEC(ZSTD(1)),
+    mapping_file String CODEC(ZSTD(1)),
+    mapping_build_id String CODEC(ZSTD(1)),
+    mapping_start UInt64 CODEC(ZSTD(1)),
+    mapping_limit UInt64 CODEC(ZSTD(1)),
+    mapping_offset UInt64 CODEC(ZSTD(1)),
+    address UInt64 CODEC(ZSTD(1)),
+    line_functions Array(String) CODEC(ZSTD(1)),
+    line_system_names Array(String) CODEC(ZSTD(1)),
+    line_files Array(String) CODEC(ZSTD(1)),
+    line_start_lines Array(Int64) CODEC(ZSTD(1)),
+    line_numbers Array(Int64) CODEC(ZSTD(1))
+)
+--@single  ENGINE = ReplacingMergeTree
+--@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.profile_locations', '{replica}')
+PARTITION BY day
+ORDER BY (org_id, location_id)
+TTL toDateTime(least(((toUInt32(day) + 2) * 86400) + ({{retention_days}} * 86400), 4294967295))
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{profile_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy_local}};
+
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.log_landing{{dist_suffix}}{{on_cluster}} AS {{db}}.log_landing
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'log_landing', cityHash64(received_ms));
 
@@ -579,6 +738,18 @@ TTL toDateTime(least(((intDiv(last_start_ns, 86400000000000) + 1) * 86400) + ({{
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.traces{{dist_suffix}}{{on_cluster}} AS {{db}}.traces
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'traces', cityHash64(trace_id))
 --@cluster SETTINGS fsync_after_insert = 1, fsync_directories = 1;
+
+--@cluster CREATE TABLE IF NOT EXISTS {{db}}.profile_landing{{dist_suffix}}{{on_cluster}} AS {{db}}.profile_landing
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'profile_landing', cityHash64(received_ms));
+
+--@cluster CREATE TABLE IF NOT EXISTS {{db}}.profile_samples{{dist_suffix}}{{on_cluster}} AS {{db}}.profile_samples
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'profile_samples', cityHash64(fingerprint));
+
+--@cluster CREATE TABLE IF NOT EXISTS {{db}}.profile_entries{{dist_suffix}}{{on_cluster}} AS {{db}}.profile_entries
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'profile_entries', cityHash64(fingerprint));
+
+--@cluster CREATE TABLE IF NOT EXISTS {{db}}.profile_series{{dist_suffix}}{{on_cluster}} AS {{db}}.profile_series
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'profile_series', cityHash64(fingerprint));
 
 CREATE MATERIALIZED VIEW {{db}}.log_metrics_{{log_rollup_suffix}}_mv{{on_cluster}} TO {{db}}.log_metrics_{{log_rollup_suffix}}
 AS SELECT
@@ -803,6 +974,78 @@ AS SELECT
     start_ns AS last_start_ns
 FROM {{db}}.trace_landing
 WHERE row_kind = 3;
+
+CREATE MATERIALIZED VIEW {{db}}.profile_samples_mv{{on_cluster}} TO {{db}}.profile_samples
+AS SELECT
+    org_id AS org_id,
+    type_id AS type_id,
+    service AS service,
+    fingerprint AS fingerprint,
+    timestamp_ns AS timestamp_ns,
+    stack_id AS stack_id,
+    value AS value,
+    span_id AS span_id,
+    trace_id AS trace_id,
+    profile_id AS profile_id
+FROM {{db}}.profile_landing
+WHERE kind = 0;
+
+CREATE MATERIALIZED VIEW {{db}}.profile_stacks_mv{{on_cluster}} TO {{db}}.profile_stacks
+AS SELECT
+    org_id AS org_id,
+    toDate(fromUnixTimestamp64Milli(received_ms), 'UTC') AS day,
+    stack_id AS stack_id,
+    node_ids AS node_ids,
+    names AS names,
+    location_ids AS location_ids
+FROM {{db}}.profile_landing
+WHERE kind = 1;
+
+CREATE MATERIALIZED VIEW {{db}}.profile_series_mv{{on_cluster}} TO {{db}}.profile_series
+AS SELECT
+    org_id AS org_id,
+    toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC') AS day,
+    type_id AS type_id,
+    service AS service,
+    fingerprint AS fingerprint,
+    labels AS labels,
+    toUInt32(bitShiftLeft(toUInt32(1), toHour(fromUnixTimestamp64Nano(timestamp_ns), 'UTC'))) AS hours
+FROM {{db}}.profile_landing
+WHERE kind = 2;
+
+CREATE MATERIALIZED VIEW {{db}}.profile_entries_mv{{on_cluster}} TO {{db}}.profile_entries
+AS SELECT
+    org_id AS org_id,
+    type_id AS type_id,
+    service AS service,
+    fingerprint AS fingerprint,
+    timestamp_ns AS timestamp_ns,
+    profile_id AS profile_id,
+    value AS total,
+    duration_ns AS duration_ns,
+    annotation_keys AS annotation_keys,
+    annotation_values AS annotation_values
+FROM {{db}}.profile_landing
+WHERE kind = 3;
+
+CREATE MATERIALIZED VIEW {{db}}.profile_locations_mv{{on_cluster}} TO {{db}}.profile_locations
+AS SELECT
+    org_id AS org_id,
+    toDate(fromUnixTimestamp64Milli(received_ms), 'UTC') AS day,
+    location_id AS location_id,
+    mapping_file AS mapping_file,
+    mapping_build_id AS mapping_build_id,
+    mapping_start AS mapping_start,
+    mapping_limit AS mapping_limit,
+    mapping_offset AS mapping_offset,
+    address AS address,
+    line_functions AS line_functions,
+    line_system_names AS line_system_names,
+    line_files AS line_files,
+    line_start_lines AS line_start_lines,
+    line_numbers AS line_numbers
+FROM {{db}}.profile_landing
+WHERE kind = 4;
 
 CREATE TABLE IF NOT EXISTS {{db}}.service_edges{{on_cluster}}
 (

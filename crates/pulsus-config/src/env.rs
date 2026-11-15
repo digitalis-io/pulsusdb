@@ -75,6 +75,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_TRACE_LANDING_RETRIES",
     "PULSUS_TRACE_LANDING_INSERTERS",
     "PULSUS_TRACE_LANDING_MAX_ROWS",
+    "PULSUS_PROFILE_DEDUP_WINDOW",
     "PULSUS_LANDING_BATCH_MS",
     "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
     "PULSUS_OTLP_TRANSLATION_STRATEGY",
@@ -326,6 +327,14 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
         cfg.trace_dedup_window = parse_dedup_window(&v).ok_or_else(|| {
             env_err(
                 "PULSUS_TRACE_DEDUP_WINDOW",
+                "must be a whole number of blocks from 1 to 1000000, no sign or leading zero",
+            )
+        })?;
+    }
+    if let Some(v) = read("PULSUS_PROFILE_DEDUP_WINDOW") {
+        cfg.profile_dedup_window = parse_dedup_window(&v).ok_or_else(|| {
+            env_err(
+                "PULSUS_PROFILE_DEDUP_WINDOW",
                 "must be a whole number of blocks from 1 to 1000000, no sign or leading zero",
             )
         })?;

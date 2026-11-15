@@ -6,10 +6,11 @@ mod support;
 
 use pulsus_config::HumanDuration;
 
-const DEDUP_VARS: [&str; 3] = [
+const DEDUP_VARS: [&str; 4] = [
     "PULSUS_METRICS_DEDUP_WINDOW",
     "PULSUS_LOG_DEDUP_WINDOW",
     "PULSUS_TRACE_DEDUP_WINDOW",
+    "PULSUS_PROFILE_DEDUP_WINDOW",
 ];
 
 /// **A8b: each dedup window from the environment, and the log rollup
@@ -32,6 +33,7 @@ fn the_binary_reads_the_documented_boundaries() {
                             cfg.metrics_dedup_window,
                             cfg.log_dedup_window,
                             cfg.trace_dedup_window,
+                            cfg.profile_dedup_window,
                         ];
                         assert_eq!(windows[at], v.parse::<u64>().unwrap(), "{var}={v:?}");
                     } else {

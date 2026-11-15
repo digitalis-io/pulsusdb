@@ -51,16 +51,16 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 31 tables, 28 views, and
+/// The inventory, single-node: one database, 37 tables, 33 views, and
 /// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
 /// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 60, "statement count");
+    assert_eq!(stmts.len(), 71, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
-    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 31);
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 28);
+    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 37);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 33);
 
     let text = rendered(&single());
     assert!(
@@ -89,18 +89,18 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     assert!(text.contains("non_replicated_deduplication_window = 10000"));
 }
 
-/// The inventory, clustered: the same statements plus 21 `_dist` wrappers,
+/// The inventory, clustered: the same statements plus 25 `_dist` wrappers,
 /// `ON CLUSTER` on every one, and the macros intact.
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 81, "statement count");
+    assert_eq!(stmts.len(), 96, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        52,
-        "31 tables + 21 wrappers"
+        62,
+        "37 tables + 25 wrappers"
     );
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 28);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 33);
 
     let text = rendered(&clustered());
     assert!(
@@ -109,23 +109,23 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        81,
+        96,
         "every statement carries ON CLUSTER"
     );
 
     // `{shard}` and `{replica}` are the server's own macros and must arrive
-    // literally. 23 tables take a per-shard replica set and 6 take the
-    // cluster-wide one, so 29 paths name `{replica}` and 23 name `{shard}`.
+    // literally. 27 tables take a per-shard replica set and 8 take the
+    // cluster-wide one, so 35 paths name `{replica}` and 27 name `{shard}`.
     // The four default rollup levels are four of the per-shard replica sets.
     assert_eq!(
         text.matches("{shard}").count(),
-        23,
+        27,
         "per-shard replica sets"
     );
-    assert_eq!(text.matches("{replica}").count(), 29, "replicated tables");
+    assert_eq!(text.matches("{replica}").count(), 35, "replicated tables");
     assert_eq!(
         text.matches("/clickhouse/tables/all/").count(),
-        6,
+        8,
         "cluster-wide replica sets"
     );
     assert!(
@@ -184,7 +184,7 @@ fn every_replication_path_names_the_table_of_its_own_create() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 29, "every replicated table's path was checked");
+    assert_eq!(checked, 35, "every replicated table's path was checked");
 }
 
 /// The splitter the script relies on: a statement ends at a line whose last
@@ -292,6 +292,10 @@ fn the_file_holds_only_create_statements() {
 /// per series, keyed like the series, so its wrapper shards on the same
 /// `(metric_name, fingerprint)`. No write goes through it — the view fills
 /// it on the node that received the push.
+///
+/// `profile_landing_dist` joins the landing family (issue #813), and the
+/// three profile tables with a wrapper are a fifth family, keyed on the
+/// series' fingerprint.
 #[test]
 fn every_wrapper_in_a_family_shards_on_the_same_expression() {
     let text = rendered(&clustered());
@@ -322,8 +326,13 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
             .split_whitespace()
             .next()
             .expect("a wrapper has a name");
-        let family = if wrapper == "log_landing_dist" || wrapper == "trace_landing_dist" {
+        let family = if wrapper == "log_landing_dist"
+            || wrapper == "trace_landing_dist"
+            || wrapper == "profile_landing_dist"
+        {
             "landing"
+        } else if name.starts_with("profile") {
+            "profiles"
         } else if name.starts_with("metric") {
             "metrics"
         } else if name.starts_with("log") {
@@ -333,7 +342,7 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         };
         by_family.entry(family).or_default().insert(expr);
     }
-    assert_eq!(by_family.len(), 4, "four families have wrappers");
+    assert_eq!(by_family.len(), 5, "five families have wrappers");
     for (family, exprs) in &by_family {
         assert_eq!(
             exprs.len(),
@@ -342,7 +351,7 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         );
     }
     assert!(text.contains("cityHash64(trace_id)"));
-    for table in ["log_landing", "trace_landing"] {
+    for table in ["log_landing", "trace_landing", "profile_landing"] {
         assert!(
             text.contains(&format!("'{table}', cityHash64(received_ms));")),
             "{table} routes on the push's receive stamp, cityHash64(received_ms)"
@@ -361,6 +370,13 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         "metric_samples_7200s",
         "metric_samples_86400s",
     ] {
+        assert!(
+            text.contains(&format!("'{table}', cityHash64(fingerprint))")),
+            "{table} routes by cityHash64(fingerprint)"
+        );
+    }
+    // Issue #813: the profile tables a read reaches through a wrapper.
+    for table in ["profile_samples", "profile_entries", "profile_series"] {
         assert!(
             text.contains(&format!("'{table}', cityHash64(fingerprint))")),
             "{table} routes by cityHash64(fingerprint)"
@@ -388,7 +404,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 31);
+    assert_eq!(on_tables, 37);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -406,9 +422,11 @@ fn the_configured_values_reach_the_statements() {
         metrics_landing_retention_hours: 11,
         log_landing_retention_hours: 12,
         trace_landing_retention_hours: 13,
+        profile_landing_retention_hours: 14,
         metrics_dedup_window: 21,
         log_dedup_window: 22,
         trace_dedup_window: 23,
+        profile_dedup_window: 24,
         trace_indexed_attributes: Vec::new(),
         dist_suffix: "_routed".to_string(),
         rollup_levels: vec![120, 720],
@@ -439,9 +457,11 @@ fn the_configured_values_reach_the_statements() {
     assert!(text.contains("(11 * 3600)"), "metrics landing retention");
     assert!(text.contains("(12 * 3600)"), "logs landing retention");
     assert!(text.contains("(13 * 3600)"), "traces landing retention");
+    assert!(text.contains("(14 * 3600)"), "profiles landing retention");
     assert!(text.contains("replicated_deduplication_window = 21"));
     assert!(text.contains("replicated_deduplication_window = 22"));
     assert!(text.contains("replicated_deduplication_window = 23"));
+    assert!(text.contains("replicated_deduplication_window = 24"));
     // No table may hard-code the default window instead of the token: a
     // configured window would never reach it.
     assert!(
@@ -501,9 +521,11 @@ fn the_script_renders_exactly_what_this_crate_renders() {
                 metrics_landing_retention_hours: 11,
                 log_landing_retention_hours: 12,
                 trace_landing_retention_hours: 13,
+                profile_landing_retention_hours: 14,
                 metrics_dedup_window: 21,
                 log_dedup_window: 22,
                 trace_dedup_window: 23,
+                profile_dedup_window: 24,
                 trace_indexed_attributes: vec![
                     "span.app.request.id".to_string(),
                     "event.exception.type".to_string(),
@@ -521,6 +543,7 @@ fn the_script_renders_exactly_what_this_crate_renders() {
                 metrics_hot_days: Some(5),
                 logs_hot_days: Some(31),
                 traces_hot_days: Some(6),
+                profiles_hot_days: Some(8),
                 rollup_retention_days: vec![31, 40, 50],
                 // The `60s` level's move age is its retention: it does not move.
                 rollup_hot_days: vec![3, 40, 9],
@@ -534,6 +557,7 @@ fn the_script_renders_exactly_what_this_crate_renders() {
                 metrics_hot_days: Some(7),
                 logs_hot_days: Some(7),
                 traces_hot_days: Some(7),
+                profiles_hot_days: Some(7),
                 ..single()
             },
         ),
@@ -590,6 +614,10 @@ fn the_script_renders_exactly_what_this_crate_renders() {
             ctx.trace_landing_retention_hours.to_string(),
         );
         cmd.env(
+            "PULSUS_PROFILE_LANDING_RETENTION_HOURS",
+            ctx.profile_landing_retention_hours.to_string(),
+        );
+        cmd.env(
             "PULSUS_METRICS_DEDUP_WINDOW",
             ctx.metrics_dedup_window.to_string(),
         );
@@ -597,6 +625,10 @@ fn the_script_renders_exactly_what_this_crate_renders() {
         cmd.env(
             "PULSUS_TRACE_DEDUP_WINDOW",
             ctx.trace_dedup_window.to_string(),
+        );
+        cmd.env(
+            "PULSUS_PROFILE_DEDUP_WINDOW",
+            ctx.profile_dedup_window.to_string(),
         );
         cmd.env(
             "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
@@ -635,6 +667,7 @@ fn the_script_renders_exactly_what_this_crate_renders() {
             "PULSUS_METRICS_HOT_DAYS",
             "PULSUS_LOGS_HOT_DAYS",
             "PULSUS_TRACES_HOT_DAYS",
+            "PULSUS_PROFILES_HOT_DAYS",
             "PULSUS_ROLLUP_RETENTION_DAYS",
             "PULSUS_ROLLUP_HOT_DAYS",
         ] {
@@ -657,6 +690,7 @@ fn the_script_renders_exactly_what_this_crate_renders() {
             ("PULSUS_METRICS_HOT_DAYS", ctx.metrics_hot_days),
             ("PULSUS_LOGS_HOT_DAYS", ctx.logs_hot_days),
             ("PULSUS_TRACES_HOT_DAYS", ctx.traces_hot_days),
+            ("PULSUS_PROFILES_HOT_DAYS", ctx.profiles_hot_days),
         ] {
             if let Some(days) = days {
                 cmd.env(var, days.to_string());
@@ -738,6 +772,43 @@ fn each_view_reads_its_landing_table_under_its_discriminator() {
             projection.contains("WHERE kind = "),
             "{mv} must read the landing table under a kind predicate: {projection}"
         );
+    }
+    // Issue #813: each profile view reads `profile_landing` under its own
+    // `kind`, and projects its target's columns in the target's order.
+    for (mv, target, kind) in [
+        ("profile_samples_mv", "profile_samples", 0),
+        ("profile_stacks_mv", "profile_stacks", 1),
+        ("profile_series_mv", "profile_series", 2),
+        ("profile_entries_mv", "profile_entries", 3),
+        ("profile_locations_mv", "profile_locations", 4),
+    ] {
+        let projection =
+            pulsus_schema::mv_projection(mv, &ctx).unwrap_or_else(|| panic!("{mv} is in the file"));
+        assert!(
+            projection.contains("FROM pulsus.profile_landing\n"),
+            "{mv} must read the profile landing table: {projection}"
+        );
+        assert!(
+            projection.ends_with(&format!("\nWHERE kind = {kind}")),
+            "{mv} must read the landing rows of kind {kind}: {projection}"
+        );
+        let select = projection
+            .strip_prefix("SELECT\n")
+            .and_then(|rest| rest.split_once("\nFROM "))
+            .map(|(cols, _)| cols)
+            .unwrap_or_else(|| panic!("{mv}: SELECT ... FROM: {projection}"));
+        let names: Vec<&str> = select
+            .lines()
+            .map(|l| {
+                l.trim_end_matches(',')
+                    .rsplit_once(" AS ")
+                    .unwrap_or_else(|| panic!("{mv}: a column without AS: {l}"))
+                    .1
+            })
+            .collect();
+        let columns = pulsus_schema::table_column_names(target)
+            .unwrap_or_else(|| panic!("{target} is in the file"));
+        assert_eq!(names, columns, "{mv} projects {target}'s columns in order");
     }
     assert!(pulsus_schema::mv_projection("not_a_view", &ctx).is_none());
 
@@ -929,8 +1000,8 @@ fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
     let no_wrapper = tables_without_a_wrapper();
     assert_eq!(
         no_wrapper.len(),
-        10,
-        "the label values, `service_edges`, six cluster-wide ones and the two \
+        12,
+        "the label values, `service_edges`, eight cluster-wide ones and the two \
          rollup stages: {no_wrapper:?}"
     );
     let all = tables();
@@ -1067,7 +1138,7 @@ fn the_landing_placement_passages_name_every_landing_table() {
         .iter()
         .filter(|t| !t.wrapper && t.name.ends_with("_landing"))
         .collect();
-    assert_eq!(landing.len(), 3, "three landing tables");
+    assert_eq!(landing.len(), 4, "four landing tables");
     let wrapped: Vec<&String> = all.iter().filter(|t| t.wrapper).map(|t| &t.name).collect();
     let routed: Vec<&str> = landing
         .iter()
@@ -1076,7 +1147,12 @@ fn the_landing_placement_passages_name_every_landing_table() {
         .collect();
     assert_eq!(
         routed,
-        vec!["log_landing", "metric_landing", "trace_landing"],
+        vec![
+            "log_landing",
+            "metric_landing",
+            "trace_landing",
+            "profile_landing"
+        ],
         "every landing table has a wrapper"
     );
     let row = doc_line("features.md", "| Clustered ClickHouse |");
@@ -1538,7 +1614,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
                 }
             }
         }
-        assert_eq!(targets.len(), 28, "{variant:?}: twenty-eight views");
+        assert_eq!(targets.len(), 33, "{variant:?}: thirty-three views");
         stage_views.sort();
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
@@ -1610,7 +1686,12 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
         distinct.dedup();
         assert_eq!(
             distinct,
-            vec!["log_landing", "metric_landing", "trace_landing"],
+            vec![
+                "log_landing",
+                "metric_landing",
+                "profile_landing",
+                "trace_landing"
+            ],
             "{variant:?}: an insert-triggered view reads a table outside the pinned source set"
         );
         for source in &sources {
@@ -1623,7 +1704,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
     }
 }
 
-/// **The cluster-wide replica set is exactly these six tables.** A data
+/// **The cluster-wide replica set is exactly these eight tables.** A data
 /// table given an `/all/` path would make every shard a replica of one
 /// table and silently collapse the cluster to one shard's worth of data.
 #[test]
@@ -1638,6 +1719,8 @@ fn the_cluster_wide_replica_set_is_exactly_the_catalog_tables() {
         names,
         vec![
             "metric_metadata",
+            "profile_locations",
+            "profile_stacks",
             "resources",
             "service_bucket_resources",
             "tag_bucket_values",
@@ -2034,6 +2117,8 @@ fn the_write_path_tables_write_with_adaptive_buffers_in_both_modes() {
         "metric_exemplars",
         "metric_labels",
         "metric_label_index",
+        "profile_landing",
+        "profile_samples",
     ] {
         for (mode, ctx) in [("single", single()), ("clustered", clustered())] {
             let create = create_of(&ctx, table);
@@ -2202,6 +2287,98 @@ fn the_trace_tables_lead_with_the_tenant_in_both_forms() {
             }
         } else {
             failures.push(format!("service_edges_mv: created {} times", jobs.len()));
+        }
+        assert!(failures.is_empty(), "{form}: {failures:#?}");
+    }
+}
+
+/// **S1 (issue #813): the profile tables lead with the tenant, in both
+/// forms.** In the single-node and the clustered rendering, each of the six
+/// profile tables is created once, with its `ORDER BY` line and its
+/// clustered `ENGINE` line exactly as written here; only `profile_series`,
+/// whose `labels` sit outside its key, carries
+/// `allow_dimensions_outside_sorting_key`. One assertion per rendering,
+/// naming every failure.
+#[test]
+fn the_profile_tables_lead_with_the_tenant_in_both_forms() {
+    let series_key = "(org_id, type_id, service, fingerprint, timestamp_ns, profile_id)";
+    let tables = [
+        (
+            "profile_landing",
+            "(org_id, kind, type_id, service, fingerprint, timestamp_ns)",
+            "ReplicatedMergeTree('/clickhouse/tables/{shard}/pulsus.profile_landing', '{replica}')",
+        ),
+        (
+            "profile_samples",
+            series_key,
+            "ReplicatedMergeTree('/clickhouse/tables/{shard}/pulsus.profile_samples', '{replica}')",
+        ),
+        (
+            "profile_entries",
+            series_key,
+            "ReplicatedMergeTree('/clickhouse/tables/{shard}/pulsus.profile_entries', '{replica}')",
+        ),
+        (
+            "profile_series",
+            "(org_id, type_id, service, fingerprint)",
+            "ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/pulsus.profile_series', '{replica}')",
+        ),
+        (
+            "profile_stacks",
+            "(org_id, stack_id)",
+            "ReplicatedReplacingMergeTree('/clickhouse/tables/all/pulsus.profile_stacks', '{replica}')",
+        ),
+        (
+            "profile_locations",
+            "(org_id, location_id)",
+            "ReplicatedReplacingMergeTree('/clickhouse/tables/all/pulsus.profile_locations', '{replica}')",
+        ),
+    ];
+    let clustered = RenderCtx {
+        cluster: Some("c1".to_string()),
+        ..RenderCtx::for_tests("pulsus", 7)
+    };
+    for (form, ctx) in [("single-node", single()), ("clustered", clustered)] {
+        let stmts = rendered_statements(&ctx);
+        let mut failures = Vec::new();
+        for (table, key, engine) in tables {
+            let head = format!("CREATE TABLE IF NOT EXISTS pulsus.{table}");
+            let creates: Vec<&String> = stmts
+                .iter()
+                .filter(|s| {
+                    s.trim_start()
+                        .strip_prefix(&head)
+                        .is_some_and(|rest| rest.starts_with([' ', '\n']))
+                })
+                .collect();
+            if creates.len() != 1 {
+                failures.push(format!("{table}: created {} times", creates.len()));
+                continue;
+            }
+            let order: Vec<&str> = creates[0]
+                .lines()
+                .filter(|l| l.trim_start().starts_with("ORDER BY"))
+                .collect();
+            let want = format!("ORDER BY {key}");
+            if order != [want.as_str()] {
+                failures.push(format!("{table}: {order:?}, expected {want:?}"));
+            }
+            if ctx.cluster.is_some() {
+                let engines: Vec<&str> = creates[0]
+                    .lines()
+                    .filter(|l| l.starts_with("ENGINE = "))
+                    .collect();
+                let want = format!("ENGINE = {engine}");
+                if engines != [want.as_str()] {
+                    failures.push(format!("{table}: {engines:?}, expected {want:?}"));
+                }
+            }
+            let outside = creates[0].contains("allow_dimensions_outside_sorting_key");
+            if outside != (table == "profile_series") {
+                failures.push(format!(
+                    "{table}: allow_dimensions_outside_sorting_key {outside}"
+                ));
+            }
         }
         assert!(failures.is_empty(), "{form}: {failures:#?}");
     }
@@ -2571,6 +2748,43 @@ const EXPIRY: &[(&str, Option<&str>, bool, Option<u32>)] = &[
         true,
         None,
     ),
+    // Issue #813: the profile tables.
+    (
+        "profile_entries",
+        Some("TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
+    (
+        "profile_landing",
+        Some("TTL toDateTime(least(intDiv(received_ms, 1000) + (2 * 3600), 4294967295))"),
+        true,
+        Some(3600),
+    ),
+    (
+        "profile_locations",
+        Some("TTL toDateTime(least(((toUInt32(day) + 2) * 86400) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
+    (
+        "profile_samples",
+        Some("TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
+    (
+        "profile_series",
+        Some("TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + 17) * 86400, 4294967295))"),
+        true,
+        None,
+    ),
+    (
+        "profile_stacks",
+        Some("TTL toDateTime(least(((toUInt32(day) + 2) * 86400) + (17 * 86400), 4294967295))"),
+        true,
+        None,
+    ),
     (
         "resources",
         Some("TTL toDateTime(least(((toUInt32(day) + 1) * 86400) + (17 * 86400), 4294967295))"),
@@ -2700,6 +2914,7 @@ fn every_table_expires_exactly_as_documented() {
             metrics_landing_retention_hours: 3,
             log_landing_retention_hours: 4,
             trace_landing_retention_hours: 5,
+            profile_landing_retention_hours: 2,
             ..base
         };
         let mut got = Vec::new();
@@ -2773,6 +2988,7 @@ fn the_script_refuses_a_missing_or_malformed_retention() {
             "PULSUS_METRICS_LANDING_RETENTION_HOURS",
             "PULSUS_LOG_LANDING_RETENTION_HOURS",
             "PULSUS_TRACE_LANDING_RETENTION_HOURS",
+            "PULSUS_PROFILE_LANDING_RETENTION_HOURS",
             "PULSUS_CLUSTER",
         ] {
             cmd.env_remove(var);
@@ -2816,6 +3032,7 @@ fn the_script_refuses_a_missing_or_malformed_retention() {
         "PULSUS_METRICS_LANDING_RETENTION_HOURS",
         "PULSUS_LOG_LANDING_RETENTION_HOURS",
         "PULSUS_TRACE_LANDING_RETENTION_HOURS",
+        "PULSUS_PROFILE_LANDING_RETENTION_HOURS",
     ] {
         for bad in ["0", "06", "169", "1000", "abc"] {
             let (code, err) = run(&[("PULSUS_RETENTION_DAYS", "7"), (var, bad)]);
@@ -3583,22 +3800,22 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
         storage_policy: Some("tiered".to_string()),
         ..clustered()
     };
-    // The digests moved with issue #839, which builds `idx_body_ngrams` on
-    // `lowerUTF8(body)`.
+    // The digests moved with issue #813, which adds the six profile tables,
+    // their four wrappers and five views.
     let cases = [
         (
             "single-node",
             vec![],
             vec!["--mode", "single"],
             single(),
-            "99f0966d1b0ac9dedc3b1dc94a21af931ae55a7263946a9b20844f69837f3f50",
+            "ec0cdd85dda2b77ed36c78ff05d6d8ab8eccbf37d943a45e9cf990f642a65b9d",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "3eeba7362dbae1229551e4e6d205c524c1f81cc3c7142c3531041e6d7b7862de",
+            "2c9dc227bcf5c5c01355732348812bd29f1cfaa96bbc3fd98b3b397a8efa334c",
         ),
         (
             "clustered with a storage policy",
@@ -3608,7 +3825,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "cfc67b735f0f1fb55446854d1bc7a42f52aba1cda03d79e333cb9a715f57a601",
+            "f102203400c986b8dbe45a9d8af0405bc2c97f2ac18da7e260675c37862088e4",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
@@ -3626,15 +3843,17 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
 
 /// The variable a `TieringInput` text comes from, in the order the script
 /// and the crate check them.
-const HOT_DAYS_VARS: [&str; 3] = [
+const HOT_DAYS_VARS: [&str; 4] = [
     "PULSUS_METRICS_HOT_DAYS",
     "PULSUS_LOGS_HOT_DAYS",
     "PULSUS_TRACES_HOT_DAYS",
+    "PULSUS_PROFILES_HOT_DAYS",
 ];
 
 /// One set of tiering inputs: the storage policy, the cold volume and the
-/// metrics, logs and traces move ages; `None` leaves a variable unset.
-type TieringCase<'a> = (Option<&'a str>, Option<&'a str>, [Option<&'a str>; 3]);
+/// metrics, logs, traces and profiles move ages; `None` leaves a variable
+/// unset.
+type TieringCase<'a> = (Option<&'a str>, Option<&'a str>, [Option<&'a str>; 4]);
 
 /// `schema.sh --mode single --print` with `PULSUS_RETENTION_DAYS=30` and
 /// the case's variables, and `validate_tiering` over the same inputs.
@@ -3665,6 +3884,7 @@ fn both_tiering(
         metrics_hot_days: hot[0],
         logs_hot_days: hot[1],
         traces_hot_days: hot[2],
+        profiles_hot_days: hot[3],
         levels: pulsus_schema::DEFAULT_ROLLUP_LEVELS,
         ranges: pulsus_schema::DEFAULT_ROLLUP_RANGES,
         rollup_retention_days: None,
@@ -3679,91 +3899,107 @@ fn both_tiering(
 #[test]
 fn the_script_and_the_crate_refuse_the_same_tiering_settings() {
     const MISSING: &str = "is not set; with PULSUS_COLD_VOLUME set each of \
-        PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS is required";
+        PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS, PULSUS_TRACES_HOT_DAYS and \
+        PULSUS_PROFILES_HOT_DAYS is required";
     let two = Some("2");
     let mut cases: Vec<(&str, TieringCase<'_>, String)> = vec![
         (
             "rule 1",
-            (None, Some("cold"), [two, two, two]),
+            (None, Some("cold"), [two, two, two, two]),
             "PULSUS_COLD_VOLUME is set and PULSUS_STORAGE_POLICY is not".to_string(),
         ),
         (
             "rule 2",
-            (Some("p"), Some("co-ld"), [two, two, two]),
+            (Some("p"), Some("co-ld"), [two, two, two, two]),
             "cold_volume must be letters, digits and underscores: co-ld".to_string(),
         ),
         (
             "3a",
-            (Some("p"), Some("cold"), [None, two, two]),
+            (Some("p"), Some("cold"), [None, two, two, two]),
             format!("PULSUS_METRICS_HOT_DAYS {MISSING}"),
         ),
         (
             "4a",
-            (Some("p"), Some("cold"), [two, None, two]),
+            (Some("p"), Some("cold"), [two, None, two, two]),
             format!("PULSUS_LOGS_HOT_DAYS {MISSING}"),
         ),
         (
             "5a",
-            (Some("p"), Some("cold"), [two, two, None]),
+            (Some("p"), Some("cold"), [two, two, None, two]),
             format!("PULSUS_TRACES_HOT_DAYS {MISSING}"),
         ),
         (
             "3b",
-            (None, None, [two, None, None]),
+            (None, None, [two, None, None, two]),
             "PULSUS_METRICS_HOT_DAYS is set and PULSUS_COLD_VOLUME is not".to_string(),
         ),
         (
             "4b",
-            (Some("p"), None, [None, two, None]),
+            (Some("p"), None, [None, two, None, two]),
             "PULSUS_LOGS_HOT_DAYS is set and PULSUS_COLD_VOLUME is not".to_string(),
         ),
         (
             "5b",
-            (None, None, [None, None, two]),
+            (None, None, [None, None, two, two]),
             "PULSUS_TRACES_HOT_DAYS is set and PULSUS_COLD_VOLUME is not".to_string(),
         ),
         (
             "4c",
-            (Some("p"), Some("cold"), [two, Some("0"), two]),
+            (Some("p"), Some("cold"), [two, Some("0"), two, two]),
             "PULSUS_LOGS_HOT_DAYS must be a whole number of days from 1 to 30: 0".to_string(),
         ),
         (
             "5c",
-            (Some("p"), Some("cold"), [two, two, Some("31")]),
+            (Some("p"), Some("cold"), [two, two, Some("31"), two]),
             "PULSUS_TRACES_HOT_DAYS must be a whole number of days from 1 to 30: 31".to_string(),
+        ),
+        (
+            "6a",
+            (Some("p"), Some("cold"), [two, two, two, None]),
+            format!("PULSUS_PROFILES_HOT_DAYS {MISSING}"),
+        ),
+        (
+            "6b",
+            (None, None, [None, None, None, two]),
+            "PULSUS_PROFILES_HOT_DAYS is set and PULSUS_COLD_VOLUME is not".to_string(),
+        ),
+        (
+            "6c",
+            (Some("p"), Some("cold"), [two, two, two, Some("31")]),
+            "PULSUS_PROFILES_HOT_DAYS must be a whole number of days from 1 to 30: 31".to_string(),
         ),
         // The overlapping cases: each breaks two rules, and the message is
         // the first rule's.
         (
             "(i) rule 1 before rule 2",
-            (None, Some("co-ld"), [None, None, None]),
+            (None, Some("co-ld"), [None, None, None, None]),
             "PULSUS_COLD_VOLUME is set and PULSUS_STORAGE_POLICY is not".to_string(),
         ),
         (
             "(ii) rule 2 before 3a",
-            (Some("p"), Some("co-ld"), [None, None, None]),
+            (Some("p"), Some("co-ld"), [None, None, None, None]),
             "cold_volume must be letters, digits and underscores: co-ld".to_string(),
         ),
         (
             "(iii) 3a before 4c",
-            (Some("p"), Some("cold"), [None, Some("0"), None]),
+            (Some("p"), Some("cold"), [None, Some("0"), None, two]),
             format!("PULSUS_METRICS_HOT_DAYS {MISSING}"),
         ),
         (
             "(iv) 3c before 4a",
-            (Some("p"), Some("cold"), [Some("31"), None, None]),
+            (Some("p"), Some("cold"), [Some("31"), None, None, two]),
             "PULSUS_METRICS_HOT_DAYS must be a whole number of days from 1 to 30: 31".to_string(),
         ),
         (
             "(v) 3b before 3c",
-            (None, None, [Some("0"), Some("0"), None]),
+            (None, None, [Some("0"), Some("0"), None, two]),
             "PULSUS_METRICS_HOT_DAYS is set and PULSUS_COLD_VOLUME is not".to_string(),
         ),
     ];
     for bad in ["0", "31", "030", "abc", "12345678901"] {
         cases.push((
             "3c",
-            (Some("p"), Some("cold"), [Some(bad), two, two]),
+            (Some("p"), Some("cold"), [Some(bad), two, two, two]),
             format!("PULSUS_METRICS_HOT_DAYS must be a whole number of days from 1 to 30: {bad}"),
         ));
     }
@@ -3782,7 +4018,7 @@ fn the_script_and_the_crate_refuse_the_same_tiering_settings() {
     }
 
     let ((code, err), from_crate) =
-        both_tiering((Some("p"), Some("cold"), [Some("1"), Some("30"), two]));
+        both_tiering((Some("p"), Some("cold"), [Some("1"), Some("30"), two, two]));
     assert_eq!(code, Some(0), "every age from 1 to the retention: {err}");
     assert_eq!(
         from_crate,
@@ -3791,11 +4027,12 @@ fn the_script_and_the_crate_refuse_the_same_tiering_settings() {
             metrics_hot_days: Some(1),
             logs_hot_days: Some(30),
             traces_hot_days: Some(2),
+            profiles_hot_days: Some(2),
             rollup_retention_days: Vec::new(),
             rollup_hot_days: Vec::new(),
         })
     );
-    let ((code, err), from_crate) = both_tiering((None, None, [None, None, None]));
+    let ((code, err), from_crate) = both_tiering((None, None, [None, None, None, None]));
     assert_eq!(code, Some(0), "no tiering variable: {err}");
     assert_eq!(
         from_crate,
@@ -3804,6 +4041,7 @@ fn the_script_and_the_crate_refuse_the_same_tiering_settings() {
             metrics_hot_days: None,
             logs_hot_days: None,
             traces_hot_days: None,
+            profiles_hot_days: None,
             rollup_retention_days: Vec::new(),
             rollup_hot_days: Vec::new(),
         })
@@ -3844,8 +4082,9 @@ const TRACES_FAMILY: [&str; 5] = [
     "service_bucket_resources",
     "service_edges",
 ];
-/// The sixteen tables that never move (docs/configuration.md §7).
-const NEVER_MOVE: [&str; 16] = [
+const PROFILES_FAMILY: [&str; 2] = ["profile_samples", "profile_entries"];
+/// The twenty tables that never move (docs/configuration.md §7).
+const NEVER_MOVE: [&str; 20] = [
     "log_landing",
     "log_streams",
     "log_streams_idx",
@@ -3857,6 +4096,10 @@ const NEVER_MOVE: [&str; 16] = [
     "metric_samples_60s_stage",
     "metric_samples_720s_stage",
     "metric_series",
+    "profile_landing",
+    "profile_locations",
+    "profile_series",
+    "profile_stacks",
     "resources",
     "tag_names",
     "tag_values",
@@ -3868,7 +4111,7 @@ const NEVER_MOVE: [&str; 16] = [
 fn move_line(table: &str, days: u32) -> String {
     let time = match table {
         "metric_samples" | "metric_hist_samples" | "metric_exemplars" => "intDiv(unix_milli, 1000)",
-        "log_samples" => "intDiv(timestamp_ns, 1000000000)",
+        "log_samples" | "profile_samples" | "profile_entries" => "intDiv(timestamp_ns, 1000000000)",
         "log_metrics_5s" | "log_patterns" => "intDiv(bucket_ns, 1000000000)",
         "spans" | "error_spans" => "intDiv(start_ns, 1000000000)",
         "tag_bucket_values" | "service_bucket_resources" => {
@@ -3884,7 +4127,7 @@ fn move_line(table: &str, days: u32) -> String {
 /// `storage_policy = 'tiered'`.
 fn assert_tiering(what: &str, ctx: &RenderCtx, moving: &[(&str, u32)]) {
     let tables = local_tables(ctx);
-    assert_eq!(tables.len(), 31, "{what}: thirty-one tables");
+    assert_eq!(tables.len(), 37, "{what}: thirty-seven tables");
     for name in NEVER_MOVE {
         assert!(tables.contains_key(name), "{what}: {name} is rendered");
     }
@@ -3926,6 +4169,7 @@ fn the_move_clauses_render_only_for_a_family_that_moves() {
             metrics_hot_days: Some(2),
             logs_hot_days: Some(3),
             traces_hot_days: Some(30),
+            profiles_hot_days: Some(30),
             ..base.clone()
         };
         let mut moving: Vec<(&str, u32)> = METRICS_FAMILY.iter().map(|t| (*t, 2)).collect();
@@ -3937,6 +4181,7 @@ fn the_move_clauses_render_only_for_a_family_that_moves() {
             metrics_hot_days: None,
             logs_hot_days: None,
             traces_hot_days: None,
+            profiles_hot_days: None,
             ..tiered
         };
         assert_tiering(&format!("{mode}, without the volume"), &untiered, &[]);
@@ -3954,6 +4199,7 @@ fn every_trace_table_carries_its_move_clause() {
             metrics_hot_days: Some(30),
             logs_hot_days: Some(30),
             traces_hot_days: Some(3),
+            profiles_hot_days: Some(30),
             ..base
         };
         let moving: Vec<(&str, u32)> = TRACES_FAMILY.iter().map(|t| (*t, 3)).collect();
@@ -3961,8 +4207,29 @@ fn every_trace_table_carries_its_move_clause() {
     }
 }
 
+/// **S3 (issue #813): every profile table that moves carries its move
+/// clause**, `profile_samples` and `profile_entries` at the profiles' move
+/// age, and no other table moves.
+#[test]
+fn every_profile_table_carries_its_move_clause() {
+    for (mode, base) in [("single-node", single()), ("clustered", clustered())] {
+        let ctx = RenderCtx {
+            retention_days: 30,
+            storage_policy: Some("tiered".to_string()),
+            cold_volume: Some("cold".to_string()),
+            metrics_hot_days: Some(30),
+            logs_hot_days: Some(30),
+            traces_hot_days: Some(30),
+            profiles_hot_days: Some(3),
+            ..base
+        };
+        let moving: Vec<(&str, u32)> = PROFILES_FAMILY.iter().map(|t| (*t, 3)).collect();
+        assert_tiering(mode, &ctx, &moving);
+    }
+}
+
 /// The tiering variables of one B1 case (issue #743 part B): none, part
-/// A's set (`PULSUS_STORAGE_POLICY=p`, `PULSUS_COLD_VOLUME=cold`, the three
+/// A's set (`PULSUS_STORAGE_POLICY=p`, `PULSUS_COLD_VOLUME=cold`, the four
 /// family move ages `2`), or that set without the metrics move age.
 #[derive(Debug, Clone, Copy)]
 enum LevelTiering {
@@ -3986,9 +4253,13 @@ fn both_levels(
     Result<pulsus_schema::Tiering, String>,
 ) {
     let (policy, volume, ages) = match tiering {
-        LevelTiering::Unset => (None, None, [None; 3]),
-        LevelTiering::Set => (Some("p"), Some("cold"), [Some("2"); 3]),
-        LevelTiering::SetWithoutMetrics => (Some("p"), Some("cold"), [None, Some("2"), Some("2")]),
+        LevelTiering::Unset => (None, None, [None; 4]),
+        LevelTiering::Set => (Some("p"), Some("cold"), [Some("2"); 4]),
+        LevelTiering::SetWithoutMetrics => (
+            Some("p"),
+            Some("cold"),
+            [None, Some("2"), Some("2"), Some("2")],
+        ),
     };
     let mut vars = vec![
         ("PULSUS_RETENTION_DAYS", "2"),
@@ -4023,6 +4294,7 @@ fn both_levels(
         metrics_hot_days: ages[0],
         logs_hot_days: ages[1],
         traces_hot_days: ages[2],
+        profiles_hot_days: ages[3],
         levels: &level_list,
         ranges: &range_list,
         rollup_retention_days: retention,
@@ -4052,7 +4324,8 @@ fn the_script_and_the_crate_refuse_the_same_level_day_lists() {
     );
     let no_volume = "PULSUS_ROLLUP_HOT_DAYS is set and PULSUS_COLD_VOLUME is not".to_string();
     let missing = "PULSUS_METRICS_HOT_DAYS is not set; with PULSUS_COLD_VOLUME set each of \
-        PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS is required"
+        PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS, PULSUS_TRACES_HOT_DAYS and \
+        PULSUS_PROFILES_HOT_DAYS is required"
         .to_string();
     let levels = "60,720,7200";
     let ranges = "3600,86400,604800";
@@ -4311,6 +4584,7 @@ fn the_script_and_the_crate_refuse_the_same_level_day_lists() {
         metrics_hot_days: None,
         logs_hot_days: None,
         traces_hot_days: None,
+        profiles_hot_days: None,
         rollup_retention_days: keep,
         rollup_hot_days: Vec::new(),
     };
@@ -4333,6 +4607,7 @@ fn the_script_and_the_crate_refuse_the_same_level_day_lists() {
                 metrics_hot_days: Some(2),
                 logs_hot_days: Some(2),
                 traces_hot_days: Some(2),
+                profiles_hot_days: Some(2),
                 rollup_retention_days: vec![2, 8, 30],
                 rollup_hot_days: vec![1, 8, 29],
             },
@@ -4377,6 +4652,7 @@ fn each_level_keeps_its_own_retention_and_the_catalogue_the_longest() {
             metrics_hot_days: Some(7),
             logs_hot_days: Some(7),
             traces_hot_days: Some(7),
+            profiles_hot_days: Some(7),
             rollup_retention_days: vec![30, 90, 365, 730],
             rollup_hot_days: vec![7, 30, 30, 730],
             ..base
@@ -4634,18 +4910,21 @@ fn the_template_matcher_reads_each_placeholder_as_any_text() {
 }
 
 const MISSING_HOT: &str = "is not set; with PULSUS_COLD_VOLUME set each of \
-    PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS is required";
+    PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS, PULSUS_TRACES_HOT_DAYS and \
+    PULSUS_PROFILES_HOT_DAYS is required";
 
-const LANDING_VARS: [&str; 3] = [
+const LANDING_VARS: [&str; 4] = [
     "PULSUS_METRICS_LANDING_RETENTION_HOURS",
     "PULSUS_LOG_LANDING_RETENTION_HOURS",
     "PULSUS_TRACE_LANDING_RETENTION_HOURS",
+    "PULSUS_PROFILE_LANDING_RETENTION_HOURS",
 ];
 
-const DEDUP_VARS: [&str; 3] = [
+const DEDUP_VARS: [&str; 4] = [
     "PULSUS_METRICS_DEDUP_WINDOW",
     "PULSUS_LOG_DEDUP_WINDOW",
     "PULSUS_TRACE_DEDUP_WINDOW",
+    "PULSUS_PROFILE_DEDUP_WINDOW",
 ];
 
 const RESOLUTION_REFUSED: &str = "PULSUS_LOG_ROLLUP_RESOLUTION must be a whole number with no \
@@ -4973,8 +5252,8 @@ fn the_script_and_the_crate_refuse_every_setting_the_same_way() {
         ));
     }
     // Two failures at once: the earlier rule is the message.
-    let [ml, ll, tl] = LANDING_VARS;
-    let [md, ld, td] = DEDUP_VARS;
+    let [ml, ll, tl, pl] = LANDING_VARS;
+    let [md, ld, td, pd] = DEDUP_VARS;
     let two: Vec<RefusalCase> = vec![
         refusal_case(
             3,
@@ -5002,9 +5281,15 @@ fn the_script_and_the_crate_refuse_every_setting_the_same_way() {
         ),
         refusal_case(
             6,
-            &[(tl, s("0")), (md, s("0"))],
+            &[(tl, s("0")), (pl, s("0"))],
             Single,
             format!("{tl} must be a whole number of hours from 1 to 168: 0"),
+        ),
+        refusal_case(
+            6,
+            &[(pl, s("0")), (md, s("0"))],
+            Single,
+            format!("{pl} must be a whole number of hours from 1 to 168: 0"),
         ),
         refusal_case(
             7,
@@ -5020,9 +5305,15 @@ fn the_script_and_the_crate_refuse_every_setting_the_same_way() {
         ),
         refusal_case(
             7,
-            &[(td, s("0")), (levels, s("7"))],
+            &[(td, s("0")), (pd, s("0"))],
             Single,
             format!("{td} must be a whole number of blocks from 1 to 1000000: 0"),
+        ),
+        refusal_case(
+            7,
+            &[(pd, s("0")), (levels, s("7"))],
+            Single,
+            format!("{pd} must be a whole number of blocks from 1 to 1000000: 0"),
         ),
         refusal_case(
             10,
@@ -5137,9 +5428,11 @@ fn a2_cases() -> Vec<RenderCase> {
                 ("PULSUS_METRICS_LANDING_RETENTION_HOURS", "11"),
                 ("PULSUS_LOG_LANDING_RETENTION_HOURS", "12"),
                 ("PULSUS_TRACE_LANDING_RETENTION_HOURS", "13"),
+                ("PULSUS_PROFILE_LANDING_RETENTION_HOURS", "14"),
                 ("PULSUS_METRICS_DEDUP_WINDOW", "21"),
                 ("PULSUS_LOG_DEDUP_WINDOW", "22"),
                 ("PULSUS_TRACE_DEDUP_WINDOW", "23"),
+                ("PULSUS_PROFILE_DEDUP_WINDOW", "24"),
                 (
                     "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
                     "span.app.request.id,event.exception.type,span.http-x.a_b",
@@ -5151,6 +5444,7 @@ fn a2_cases() -> Vec<RenderCase> {
                 ("PULSUS_METRICS_HOT_DAYS", "5"),
                 ("PULSUS_LOGS_HOT_DAYS", "31"),
                 ("PULSUS_TRACES_HOT_DAYS", "6"),
+                ("PULSUS_PROFILES_HOT_DAYS", "8"),
                 ("PULSUS_ROLLUP_RETENTION_DAYS", "31,40,50"),
                 ("PULSUS_ROLLUP_HOT_DAYS", "3,40,9"),
             ],
@@ -5164,6 +5458,7 @@ fn a2_cases() -> Vec<RenderCase> {
                 ("PULSUS_METRICS_HOT_DAYS", "7"),
                 ("PULSUS_LOGS_HOT_DAYS", "7"),
                 ("PULSUS_TRACES_HOT_DAYS", "7"),
+                ("PULSUS_PROFILES_HOT_DAYS", "7"),
             ]),
             Single,
         ),
@@ -5211,6 +5506,7 @@ fn a2_cases() -> Vec<RenderCase> {
                 ("PULSUS_METRICS_HOT_DAYS", "2"),
                 ("PULSUS_LOGS_HOT_DAYS", "2"),
                 ("PULSUS_TRACES_HOT_DAYS", "2"),
+                ("PULSUS_PROFILES_HOT_DAYS", "2"),
             ]),
             Single,
         ),
@@ -5312,9 +5608,11 @@ fn the_variable_lists_are_every_variable_the_script_reads() {
         "PULSUS_METRICS_LANDING_RETENTION_HOURS",
         "PULSUS_LOG_LANDING_RETENTION_HOURS",
         "PULSUS_TRACE_LANDING_RETENTION_HOURS",
+        "PULSUS_PROFILE_LANDING_RETENTION_HOURS",
         "PULSUS_METRICS_DEDUP_WINDOW",
         "PULSUS_LOG_DEDUP_WINDOW",
         "PULSUS_TRACE_DEDUP_WINDOW",
+        "PULSUS_PROFILE_DEDUP_WINDOW",
         "PULSUS_ROLLUP_LEVELS",
         "PULSUS_ROLLUP_RANGES",
         "PULSUS_ROLLUP_COUNTER_BUCKETS",
@@ -5322,6 +5620,7 @@ fn the_variable_lists_are_every_variable_the_script_reads() {
         "PULSUS_METRICS_HOT_DAYS",
         "PULSUS_LOGS_HOT_DAYS",
         "PULSUS_TRACES_HOT_DAYS",
+        "PULSUS_PROFILES_HOT_DAYS",
         "PULSUS_ROLLUP_RETENTION_DAYS",
         "PULSUS_ROLLUP_HOT_DAYS",
         "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
@@ -5359,7 +5658,7 @@ fn the_variable_lists_are_every_variable_the_script_reads() {
             scanned.insert(name);
         }
     }
-    assert_eq!(scanned.len(), 28, "the scan found {scanned:?}");
+    assert_eq!(scanned.len(), 31, "the scan found {scanned:?}");
     let union: std::collections::BTreeSet<String> = union.into_iter().map(String::from).collect();
     assert_eq!(union, scanned, "the lists against the script");
 }
@@ -5913,6 +6212,7 @@ fn a7_cases() -> Vec<Vec<(String, Option<String>)>> {
                     ("PULSUS_METRICS_HOT_DAYS", "2"),
                     ("PULSUS_LOGS_HOT_DAYS", "2"),
                     ("PULSUS_TRACES_HOT_DAYS", "2"),
+                    ("PULSUS_PROFILES_HOT_DAYS", "2"),
                 ])
             } else {
                 Vec::new()
@@ -6026,6 +6326,7 @@ fn a7_cases() -> Vec<Vec<(String, Option<String>)>> {
                             ("PULSUS_METRICS_HOT_DAYS", hot),
                             ("PULSUS_LOGS_HOT_DAYS", hot),
                             ("PULSUS_TRACES_HOT_DAYS", hot),
+                            ("PULSUS_PROFILES_HOT_DAYS", hot),
                         ]));
                     }
                     cases.push(c);
@@ -6261,6 +6562,7 @@ fn the_script_the_crate_and_the_parsers_hold_the_documented_boundaries() {
                             ctx.metrics_dedup_window,
                             ctx.log_dedup_window,
                             ctx.trace_dedup_window,
+                            ctx.profile_dedup_window,
                         ];
                         let at = DEDUP_VARS.iter().position(|d| *d == var).unwrap();
                         assert_eq!(got[at], n, "{var}={v:?}: the context's window");

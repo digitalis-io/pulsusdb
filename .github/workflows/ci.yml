@@ -1403,8 +1403,8 @@ jobs:
           schema/schema.sh
           catalogue > /tmp/schema-first.tsv
           objects=$(wc -l < /tmp/schema-first.tsv)
-          if [ "$objects" -ne 59 ]; then
-            echo "::error::expected 59 objects in the single-node schema, got $objects"
+          if [ "$objects" -ne 70 ]; then
+            echo "::error::expected 70 objects in the single-node schema, got $objects"
             cut -f1 /tmp/schema-first.tsv
             exit 1
           fi
@@ -1582,8 +1582,8 @@ jobs:
           catalogue 13123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 80 ]; then
-            echo "::error::expected 80 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 95 ]; then
+            echo "::error::expected 95 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -1599,7 +1599,7 @@ jobs:
           # Per-shard replica sets must be per shard: `{shard}` resolved to
           # this node's own macro, so shard 1's paths say /1/ and shard 2's
           # say /2/. Shard 1 has two replicas (issue #599 part B), so its
-          # 23 per-shard tables hold two and shard 2's hold one. The six
+          # 27 per-shard tables hold two and shard 2's hold one. The eight
           # cluster-wide tables take /all/ and hold all three nodes. A
           # substituted-away macro collapses the first group onto one path
           # with three replicas, which this catches.
@@ -1610,7 +1610,7 @@ jobs:
                              countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          for pair in "18123 1 23_6_0_23_6" "13123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
+          for pair in "18123 1 27_8_0_27_8" "13123 1 27_8_0_27_8" "28123 2 27_8_27_0_8"; do
             set -- $pair
             want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")
@@ -1769,8 +1769,8 @@ jobs:
           catalogue 13123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 80 ]; then
-            echo "::error::expected 80 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 95 ]; then
+            echo "::error::expected 95 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -1786,7 +1786,7 @@ jobs:
           # Per-shard replica sets must be per shard: `{shard}` resolved to
           # this node's own macro, so shard 1's paths say /1/ and shard 2's
           # say /2/. Shard 1 has two replicas (issue #599 part B), so its
-          # 23 per-shard tables hold two and shard 2's hold one. The six
+          # 27 per-shard tables hold two and shard 2's hold one. The eight
           # cluster-wide tables take /all/ and hold all three nodes. A
           # substituted-away macro collapses the first group onto one path
           # with three replicas, which this catches.
@@ -1797,7 +1797,7 @@ jobs:
                              countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          for pair in "18123 1 23_6_0_23_6" "13123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
+          for pair in "18123 1 27_8_0_27_8" "13123 1 27_8_0_27_8" "28123 2 27_8_27_0_8"; do
             set -- $pair
             want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")
@@ -1916,8 +1916,8 @@ jobs:
           catalogue 13123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 80 ]; then
-            echo "::error::expected 80 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 95 ]; then
+            echo "::error::expected 95 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -1933,7 +1933,7 @@ jobs:
           # Per-shard replica sets must be per shard: `{shard}` resolved to
           # this node's own macro, so shard 1's paths say /1/ and shard 2's
           # say /2/. Shard 1 has two replicas (issue #599 part B), so its
-          # 23 per-shard tables hold two and shard 2's hold one. The six
+          # 27 per-shard tables hold two and shard 2's hold one. The eight
           # cluster-wide tables take /all/ and hold all three nodes. A
           # substituted-away macro collapses the first group onto one path
           # with three replicas, which this catches.
@@ -1944,7 +1944,7 @@ jobs:
                              countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          for pair in "18123 1 23_6_0_23_6" "13123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
+          for pair in "18123 1 27_8_0_27_8" "13123 1 27_8_0_27_8" "28123 2 27_8_27_0_8"; do
             set -- $pair
             want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")
@@ -2102,8 +2102,8 @@ jobs:
           catalogue 13123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 80 ]; then
-            echo "::error::expected 80 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 95 ]; then
+            echo "::error::expected 95 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -2119,7 +2119,7 @@ jobs:
           # Per-shard replica sets must be per shard: `{shard}` resolved to
           # this node's own macro, so shard 1's paths say /1/ and shard 2's
           # say /2/. Shard 1 has two replicas (issue #599 part B), so its
-          # 23 per-shard tables hold two and shard 2's hold one. The six
+          # 27 per-shard tables hold two and shard 2's hold one. The eight
           # cluster-wide tables take /all/ and hold all three nodes. A
           # substituted-away macro collapses the first group onto one path
           # with three replicas, which this catches.
@@ -2130,7 +2130,7 @@ jobs:
                              countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          for pair in "18123 1 23_6_0_23_6" "13123 1 23_6_0_23_6" "28123 2 23_6_23_0_6"; do
+          for pair in "18123 1 27_8_0_27_8" "13123 1 27_8_0_27_8" "28123 2 27_8_27_0_8"; do
             set -- $pair
             want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")

@@ -146,6 +146,8 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         log_dedup_window: 10_000,
         trace_landing_retention_hours: 6,
         trace_dedup_window: 10_000,
+        profile_landing_retention_hours: 6,
+        profile_dedup_window: 10_000,
         trace_indexed_attributes: Vec::new(),
         graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
         rollup_levels: pulsus_schema::DEFAULT_ROLLUP_LEVELS.to_vec(),
@@ -155,6 +157,7 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         metrics_hot_days: None,
         logs_hot_days: None,
         traces_hot_days: None,
+        profiles_hot_days: None,
         rollup_retention_days: Vec::new(),
         rollup_hot_days: Vec::new(),
     };
