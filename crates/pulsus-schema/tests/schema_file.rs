@@ -3800,22 +3800,22 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
         storage_policy: Some("tiered".to_string()),
         ..clustered()
     };
-    // The digests moved with issue #839, which builds `idx_body_ngrams` on
-    // `lowerUTF8(body)`.
+    // The digests moved with issue #813, which adds the six profile tables,
+    // their four wrappers and five views.
     let cases = [
         (
             "single-node",
             vec![],
             vec!["--mode", "single"],
             single(),
-            "99f0966d1b0ac9dedc3b1dc94a21af931ae55a7263946a9b20844f69837f3f50",
+            "ec0cdd85dda2b77ed36c78ff05d6d8ab8eccbf37d943a45e9cf990f642a65b9d",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "3eeba7362dbae1229551e4e6d205c524c1f81cc3c7142c3531041e6d7b7862de",
+            "2c9dc227bcf5c5c01355732348812bd29f1cfaa96bbc3fd98b3b397a8efa334c",
         ),
         (
             "clustered with a storage policy",
@@ -3825,7 +3825,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "cfc67b735f0f1fb55446854d1bc7a42f52aba1cda03d79e333cb9a715f57a601",
+            "f102203400c986b8dbe45a9d8af0405bc2c97f2ac18da7e260675c37862088e4",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {

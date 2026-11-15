@@ -1,5 +1,5 @@
 //! Token substitution for `schema/schema.sql`: explicit `{{token}}` string
-//! replacement, twenty-four names and nothing else. The level tokens of the
+//! replacement, twenty-seven names and nothing else. The level tokens of the
 //! file's level block are resolved earlier, by [`expand_levels`].
 //!
 //! **Double braces, always.** ClickHouse's own `{shard}` and `{replica}`
@@ -220,7 +220,7 @@ pub fn rollup_suffix(d: Duration) -> String {
 /// ClickHouse's own single-brace `{shard}`/`{replica}` macros — they are
 /// simply absent from double-brace matching.
 ///
-/// `schema.sh` carries the same list as twenty-three `sed` expressions and two
+/// `schema.sh` carries the same list as twenty-six `sed` expressions and two
 /// `awk` steps;
 /// `the_script_renders_exactly_what_this_crate_renders` holds the two
 /// together.
@@ -264,6 +264,10 @@ pub(crate) fn substitute_tokens(tmpl: &str, ctx: &RenderCtx) -> String {
             &ctx.trace_landing_retention_hours.to_string(),
         )
         .replace(
+            "{{profile_landing_retention_hours}}",
+            &ctx.profile_landing_retention_hours.to_string(),
+        )
+        .replace(
             "{{metrics_dedup_window}}",
             &ctx.metrics_dedup_window.to_string(),
         )
@@ -271,6 +275,10 @@ pub(crate) fn substitute_tokens(tmpl: &str, ctx: &RenderCtx) -> String {
         .replace(
             "{{trace_dedup_window}}",
             &ctx.trace_dedup_window.to_string(),
+        )
+        .replace(
+            "{{profile_dedup_window}}",
+            &ctx.profile_dedup_window.to_string(),
         )
         .replace(
             "{{dedup_window_seconds}}",
@@ -289,6 +297,7 @@ pub(crate) fn substitute_tokens(tmpl: &str, ctx: &RenderCtx) -> String {
         .replace("{{metrics_hot_days}}", &days(ctx.metrics_hot_days))
         .replace("{{logs_hot_days}}", &days(ctx.logs_hot_days))
         .replace("{{traces_hot_days}}", &days(ctx.traces_hot_days))
+        .replace("{{profiles_hot_days}}", &days(ctx.profiles_hot_days))
         .replace(
             "{{metrics_catalogue_retention_days}}",
             &ctx.metrics_catalogue_retention_days().to_string(),
@@ -438,7 +447,8 @@ pub fn parse_rollup_counter_buckets(text: &str) -> Result<u32, String> {
 /// `levels` and `ranges` are what the two parsers returned; a list text is
 /// `None` only when its variable is unset; set and empty is `Some("")`,
 /// which `level_items` refuses as an empty item. (The three family texts
-/// keep part A's rule, `None` when unset or empty.)
+/// keep part A's rule, `None` when unset or empty; issue #813's profiles
+/// text is a fourth.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TieringInput<'a> {
     pub storage_policy: Option<&'a str>,
@@ -487,18 +497,19 @@ pub fn validate_tiering(input: &TieringInput<'_>) -> Result<Tiering, String> {
         }
     }
     let r = input.retention_days;
-    let mut days = [None; 3];
+    let mut days = [None; 4];
     for (slot, (name, text)) in days.iter_mut().zip([
         ("PULSUS_METRICS_HOT_DAYS", input.metrics_hot_days),
         ("PULSUS_LOGS_HOT_DAYS", input.logs_hot_days),
         ("PULSUS_TRACES_HOT_DAYS", input.traces_hot_days),
+        ("PULSUS_PROFILES_HOT_DAYS", input.profiles_hot_days),
     ]) {
         let text = match (input.cold_volume, text) {
             (Some(_), None) => {
                 return Err(format!(
                     "{name} is not set; with PULSUS_COLD_VOLUME set each of \
-                     PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS and PULSUS_TRACES_HOT_DAYS \
-                     is required"
+                     PULSUS_METRICS_HOT_DAYS, PULSUS_LOGS_HOT_DAYS, PULSUS_TRACES_HOT_DAYS and \
+                     PULSUS_PROFILES_HOT_DAYS is required"
                 ));
             }
             (None, Some(_)) => return Err(format!("{name} is set and PULSUS_COLD_VOLUME is not")),
@@ -532,7 +543,7 @@ pub fn validate_tiering(input: &TieringInput<'_>) -> Result<Tiering, String> {
         metrics_hot_days: days[0],
         logs_hot_days: days[1],
         traces_hot_days: days[2],
-        profiles_hot_days: None,
+        profiles_hot_days: days[3],
         rollup_retention_days: keep,
         rollup_hot_days: hot,
     })

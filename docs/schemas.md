@@ -62,7 +62,7 @@ Fixes proposed elsewhere that this design deliberately **rejects**, and why:
 - **`minmax` skip indexes on unclustered string columns** — near-zero granule skipping unless data is physically clustered by that column; where we need that clustering we buy it explicitly (ordering key or projection).
 - **`ReplacingMergeTree` for sample data** — merge-time dedup forces `FINAL` or wrong results. Sample tables are plain `MergeTree`; only metadata tables use `ReplacingMergeTree`, and their read shapes (`LIMIT 1 BY`, `GROUP BY`) are duplicate-tolerant by construction.
 
-Conventions used below: `<db>` defaults to `pulsus`; in clustered mode every table but the rollup stages (`metric_samples_60s_stage`, `metric_samples_720s_stage`) becomes `Replicated*`, and every per-shard table but `metric_label_values`, `service_edges` and the rollup stages also gets a `_dist` Distributed wrapper — those and the cluster-wide tables get none (§7 lists all ten at the default levels); a `TTL` clause shows the token of the setting it renders: `{{retention_days}}` is `PULSUS_RETENTION_DAYS`, which has no default; `{{metrics_catalogue_retention_days}}`, on the five metric catalogue tables, the largest of that and every rollup level's retention; `{{level_retention_days}}`, a rollup level's `PULSUS_ROLLUP_RETENTION_DAYS` item, or `PULSUS_RETENTION_DAYS` when that is unset; and `{{metrics_landing_retention_hours}}`, `{{log_landing_retention_hours}}` and `{{trace_landing_retention_hours}}`, the three landing tables' hours ([configuration.md §7](configuration.md)). Label keys follow the canonical label model ([architecture.md §2.3](architecture.md)): log label keys are normalized at ingest (`service.name` → `service_name`, before fingerprinting); trace attribute keys are stored verbatim; **OTLP metric names and label keys follow Prometheus v3.13.0's OTLP receiver instead** (issue #461) — the metric name gains its unit and type suffixes, attribute keys are sanitized with the reference's `key`/`key_` prefix rule and collisions merge with `;`, resource attributes become `job`/`instance` plus a `target_info` series rather than per-series labels, and the strategy is selectable with `PULSUS_OTLP_TRANSLATION_STRATEGY` ([configuration.md §5](configuration.md)); remote-write names and labels arrive already translated and are stored verbatim; the promoted physical column is named `service` on the logs, traces, and profiles tables (metrics deliberately have none — reads there are `metric_name` + `fingerprint` driven). **Every DDL block in this document mirrors `schema/schema.sql`, which is applied to a fresh ClickHouse in CI** (`crates/pulsus-schema/tests/live_schema.rs`) — an unapplyable table definition is a build failure, not a docs bug. **The generated-SQL examples below are a different matter and no suite executes one**: several carry `{placeholders}` and could not run as written. Each is instead bound to the code that renders it where one exists — §2.3's grouped instant read is asserted byte for byte against its builder by `the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders`, and §4.2's shapes by the TraceQL SQL suites' doc-consistency tests. Latency figures in §9 are targets to validate, not guarantees.
+Conventions used below: `<db>` defaults to `pulsus`; in clustered mode every table but the rollup stages (`metric_samples_60s_stage`, `metric_samples_720s_stage`) becomes `Replicated*`, and every per-shard table but `metric_label_values`, `service_edges` and the rollup stages also gets a `_dist` Distributed wrapper — those and the cluster-wide tables get none (§7 lists all twelve at the default levels); a `TTL` clause shows the token of the setting it renders: `{{retention_days}}` is `PULSUS_RETENTION_DAYS`, which has no default; `{{metrics_catalogue_retention_days}}`, on the five metric catalogue tables, the largest of that and every rollup level's retention; `{{level_retention_days}}`, a rollup level's `PULSUS_ROLLUP_RETENTION_DAYS` item, or `PULSUS_RETENTION_DAYS` when that is unset; and `{{metrics_landing_retention_hours}}`, `{{log_landing_retention_hours}}`, `{{trace_landing_retention_hours}}` and `{{profile_landing_retention_hours}}`, the four landing tables' hours ([configuration.md §7](configuration.md)). Label keys follow the canonical label model ([architecture.md §2.3](architecture.md)): log label keys are normalized at ingest (`service.name` → `service_name`, before fingerprinting); trace attribute keys are stored verbatim; **OTLP metric names and label keys follow Prometheus v3.13.0's OTLP receiver instead** (issue #461) — the metric name gains its unit and type suffixes, attribute keys are sanitized with the reference's `key`/`key_` prefix rule and collisions merge with `;`, resource attributes become `job`/`instance` plus a `target_info` series rather than per-series labels, and the strategy is selectable with `PULSUS_OTLP_TRANSLATION_STRATEGY` ([configuration.md §5](configuration.md)); remote-write names and labels arrive already translated and are stored verbatim; the promoted physical column is named `service` on the logs, traces, and profiles tables (metrics deliberately have none — reads there are `metric_name` + `fingerprint` driven). **Every DDL block in this document mirrors `schema/schema.sql`, which is applied to a fresh ClickHouse in CI** (`crates/pulsus-schema/tests/live_schema.rs`) — an unapplyable table definition is a build failure, not a docs bug. **The generated-SQL examples below are a different matter and no suite executes one**: several carry `{placeholders}` and could not run as written. Each is instead bound to the code that renders it where one exists — §2.3's grouped instant read is asserted byte for byte against its builder by `the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders`, and §4.2's shapes by the TraceQL SQL suites' doc-consistency tests. Latency figures in §9 are targets to validate, not guarantees.
 
 ---
 
@@ -927,58 +927,162 @@ The full text of all three is `docs/TraceQL/sql-schema.md` §5.4, which is where
 
 ## 5. Profiles
 
-**Query shapes served:** flamegraph merge over `(profile type, service, selector, time range)`; profile-value time series; diff between two ranges.
+A batch of pushes is one insert of one block into `profile_landing`; five views copy each `kind` to its table. `org_id` leads every sorting key. On a cluster `profile_stacks` and `profile_locations` are one replica set across every shard (`/clickhouse/tables/all/`); the other four are per shard, and a batch's rows sit on the shard that took it. Kinds 5 and 6 are reserved for uploaded files and have no view.
+
+| `kind` | View | Target | Engine | Sorting key | Partition |
+|---|---|---|---|---|---|
+| 0 | `profile_samples_mv` | `profile_samples` | `MergeTree` | `(org_id, type_id, service, fingerprint, timestamp_ns, profile_id)` | UTC day of `timestamp_ns` |
+| 1 | `profile_stacks_mv` | `profile_stacks` | `ReplacingMergeTree` | `(org_id, stack_id)` | `day`, the UTC day of `received_ms` |
+| 2 | `profile_series_mv` | `profile_series` | `AggregatingMergeTree` | `(org_id, type_id, service, fingerprint)` | `day`, the UTC day of `timestamp_ns` |
+| 3 | `profile_entries_mv` | `profile_entries` | `MergeTree` | `(org_id, type_id, service, fingerprint, timestamp_ns, profile_id)` | UTC day of `timestamp_ns` |
+| 4 | `profile_locations_mv` | `profile_locations` | `ReplacingMergeTree` | `(org_id, location_id)` | `day`, the UTC day of `received_ms` |
 
 ```sql
-CREATE TABLE profile_samples (
-    type_id        LowCardinality(String),        -- e.g. process_cpu:cpu:nanoseconds:cpu:nanoseconds
-    service        LowCardinality(String),
-    fingerprint    UInt128,
-    timestamp_ns   Int64  CODEC(DoubleDelta, ZSTD(1)),
-    duration_ns    Int64,
-    payload_type   Int8,
-    payload        String CODEC(ZSTD(3)),         -- original pprof
-    tree           Array(Tuple(UInt64, UInt64, Int64, Int64)) CODEC(ZSTD(3)),
-                   -- (node_id, parent_id, self_value, total_value)
-    functions      Array(Tuple(UInt64, String)) CODEC(ZSTD(3))
-                   -- (node_id, function name)
-) ENGINE = MergeTree
-PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
-ORDER BY (type_id, service, timestamp_ns)
+CREATE TABLE IF NOT EXISTS {{db}}.profile_landing{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    received_ms Int64 CODEC(DoubleDelta, ZSTD(1)),
+    kind UInt8 CODEC(ZSTD(1)),
+    type_id LowCardinality(String),
+    service LowCardinality(String),
+    fingerprint UInt128 CODEC(ZSTD(1)),
+    timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)),
+    stack_id UInt128 CODEC(ZSTD(1)),
+    value Int64 CODEC(T64, ZSTD(1)),
+    span_id UInt64 CODEC(ZSTD(1)),
+    trace_id FixedString(16) CODEC(ZSTD(1)),
+    node_ids Array(UInt128) CODEC(ZSTD(1)),
+    names Array(LowCardinality(String)) CODEC(ZSTD(1)),
+    location_ids Array(UInt128) CODEC(ZSTD(1)),
+    location_id UInt128 CODEC(ZSTD(1)),
+    mapping_file String CODEC(ZSTD(1)),
+    mapping_build_id String CODEC(ZSTD(1)),
+    mapping_start UInt64 CODEC(ZSTD(1)),
+    mapping_limit UInt64 CODEC(ZSTD(1)),
+    mapping_offset UInt64 CODEC(ZSTD(1)),
+    address UInt64 CODEC(ZSTD(1)),
+    line_functions Array(String) CODEC(ZSTD(1)),
+    line_system_names Array(String) CODEC(ZSTD(1)),
+    line_files Array(String) CODEC(ZSTD(1)),
+    line_start_lines Array(Int64) CODEC(ZSTD(1)),
+    line_numbers Array(Int64) CODEC(ZSTD(1)),
+    labels String CODEC(ZSTD(5)),
+    profile_id UUID CODEC(ZSTD(1)),
+    upload_id UUID CODEC(ZSTD(1)),
+    upload_name String CODEC(ZSTD(1)),
+    uploaded_at Int64 CODEC(ZSTD(1)),
+    type_ordinal UInt16 CODEC(ZSTD(1)),
+    is_type UInt8 CODEC(ZSTD(1)),
+    upload_format LowCardinality(String),
+    display_name String CODEC(ZSTD(1)),
+    spy_name String CODEC(ZSTD(1)),
+    sample_rate UInt32 CODEC(ZSTD(1)),
+    units LowCardinality(String),
+    duration_ns Int64 CODEC(ZSTD(1)),
+    annotation_keys Array(String) CODEC(ZSTD(1)),
+    annotation_values Array(String) CODEC(ZSTD(1))
+)
+ENGINE = MergeTree
+PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
+ORDER BY (org_id, kind, type_id, service, fingerprint, timestamp_ns)
+TTL toDateTime(least(intDiv(received_ms, 1000) + ({{profile_landing_retention_hours}} * 3600), 4294967295))
+SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
+
+CREATE TABLE IF NOT EXISTS {{db}}.profile_samples{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    type_id LowCardinality(String),
+    service LowCardinality(String),
+    fingerprint UInt128 CODEC(ZSTD(1)),
+    timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)),
+    stack_id UInt128 CODEC(ZSTD(1)),
+    value Int64 CODEC(T64, ZSTD(1)),
+    span_id UInt64 CODEC(ZSTD(1)),
+    trace_id FixedString(16) CODEC(ZSTD(1)),
+    profile_id UUID CODEC(ZSTD(1))
+)
+ENGINE = MergeTree
+PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC')
+ORDER BY (org_id, type_id, service, fingerprint, timestamp_ns, profile_id)
 TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
-SETTINGS ttl_only_drop_parts = 1;
+--@cold-profiles , toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{profiles_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
+SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy}};
 
-CREATE TABLE profile_series (
-    month        Date,
-    fingerprint  UInt128,
-    type_id      LowCardinality(String),
-    service      LowCardinality(String),
-    labels       String CODEC(ZSTD(5)),
-    updated_ns   Int64
-) ENGINE = ReplacingMergeTree(updated_ns)
-PARTITION BY month
-ORDER BY fingerprint;
+CREATE TABLE IF NOT EXISTS {{db}}.profile_entries{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    type_id LowCardinality(String),
+    service LowCardinality(String),
+    fingerprint UInt128 CODEC(ZSTD(1)),
+    timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)),
+    profile_id UUID CODEC(ZSTD(1)),
+    total Int64 CODEC(T64, ZSTD(1)),
+    duration_ns Int64 CODEC(ZSTD(1)),
+    annotation_keys Array(String) CODEC(ZSTD(1)),
+    annotation_values Array(String) CODEC(ZSTD(1))
+)
+ENGINE = MergeTree
+PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns), 'UTC')
+ORDER BY (org_id, type_id, service, fingerprint, timestamp_ns, profile_id)
+TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@cold-profiles , toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{profiles_hot_days}} * 86400), 4294967295)) TO VOLUME '{{cold_volume}}'
+SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy}};
 
-CREATE TABLE profile_series_idx (
-    month        Date,
-    key          LowCardinality(String),
-    val          String,
-    fingerprint  UInt128
-) ENGINE = ReplacingMergeTree
-PARTITION BY month
-ORDER BY (key, val, fingerprint);
-```
+CREATE TABLE IF NOT EXISTS {{db}}.profile_series{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    day Date,
+    type_id LowCardinality(String),
+    service LowCardinality(String),
+    fingerprint UInt128 CODEC(ZSTD(1)),
+    labels String CODEC(ZSTD(5)),
+    hours SimpleAggregateFunction(groupBitOr, UInt32)
+)
+ENGINE = AggregatingMergeTree
+PARTITION BY day
+ORDER BY (org_id, type_id, service, fingerprint)
+TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + {{retention_days}}) * 86400, 4294967295))
+-- `labels` is outside the key and not an aggregate. It is a function of
+-- `fingerprint`, so a merge never chooses between two different values.
+SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
 
-- The dominant read (`merge flamegraph for type T, service S, last hour`) is a pure primary-prefix scan of `profile_samples` — no index round trip at all; the series index is consulted only when the selector uses labels beyond type/service.
-- **Trees are precomputed at ingest** (from pprof or OTLP profiles): the engine merges compact `(node, parent, self, total)` arrays instead of re-parsing pprof, which is what makes `render` latency independent of original profile size.
+CREATE TABLE IF NOT EXISTS {{db}}.profile_stacks{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    day Date,
+    stack_id UInt128 CODEC(ZSTD(1)),
+    node_ids Array(UInt128) CODEC(ZSTD(1)),
+    names Array(LowCardinality(String)) CODEC(ZSTD(1)),
+    location_ids Array(UInt128) CODEC(ZSTD(1))
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY day
+ORDER BY (org_id, stack_id)
+TTL toDateTime(least(((toUInt32(day) + 2) * 86400) + ({{retention_days}} * 86400), 4294967295))
+SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
 
-Read path — flamegraph for `process_cpu:...{service_name="checkout"}`, last hour:
-
-```sql
-SELECT tree, functions
-FROM profile_samples
-PREWHERE type_id = 'process_cpu:cpu:nanoseconds:cpu:nanoseconds' AND service = 'checkout'
-WHERE timestamp_ns > {now - 1h} AND timestamp_ns <= {now}
+CREATE TABLE IF NOT EXISTS {{db}}.profile_locations{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    day Date,
+    location_id UInt128 CODEC(ZSTD(1)),
+    mapping_file String CODEC(ZSTD(1)),
+    mapping_build_id String CODEC(ZSTD(1)),
+    mapping_start UInt64 CODEC(ZSTD(1)),
+    mapping_limit UInt64 CODEC(ZSTD(1)),
+    mapping_offset UInt64 CODEC(ZSTD(1)),
+    address UInt64 CODEC(ZSTD(1)),
+    line_functions Array(String) CODEC(ZSTD(1)),
+    line_system_names Array(String) CODEC(ZSTD(1)),
+    line_files Array(String) CODEC(ZSTD(1)),
+    line_start_lines Array(Int64) CODEC(ZSTD(1)),
+    line_numbers Array(Int64) CODEC(ZSTD(1))
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY day
+ORDER BY (org_id, location_id)
+TTL toDateTime(least(((toUInt32(day) + 2) * 86400) + ({{retention_days}} * 86400), 4294967295))
+SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{profile_dedup_window}}{{storage_policy_local}};
 ```
 
 ---
@@ -1007,9 +1111,9 @@ PULSUS_CLUSTER=prod schema/schema.sh  # clustered
 schema/schema.sh --print              # render the statements, send nothing
 ```
 
-The script reads the same environment variables the binary does ([configuration.md §3](configuration.md)), gates on the server version, **drops the configured database**, creates it, and sends one statement per request — the HTTP interface refuses a multi-statement body. 60 statements single-node, 81 clustered, at the default levels, after the drop.
+The script reads the same environment variables the binary does ([configuration.md §3](configuration.md)), gates on the server version, **drops the configured database**, creates it, and sends one statement per request — the HTTP interface refuses a multi-statement body. 71 statements single-node, 96 clustered, at the default levels, after the drop.
 
-**There are no migrations.** No numbered list, no bookkeeping table, no checksum drift guard. A schema change is an edit to `schema.sql` and another run of the script; the cost is the data in the database, and the development workflow is to drop and recreate. Nothing is upgraded in place, including retention: `PULSUS_RETENTION_DAYS`, `PULSUS_ROLLUP_RETENTION_DAYS` and the three landing hours are each declared in the `CREATE` of the tables whose TTL they set ([configuration.md §7](configuration.md)), so changing one is a rebuild.
+**There are no migrations.** No numbered list, no bookkeeping table, no checksum drift guard. A schema change is an edit to `schema.sql` and another run of the script; the cost is the data in the database, and the development workflow is to drop and recreate. Nothing is upgraded in place, including retention: `PULSUS_RETENTION_DAYS`, `PULSUS_ROLLUP_RETENTION_DAYS` and the four landing hours are each declared in the `CREATE` of the tables whose TTL they set ([configuration.md §7](configuration.md)), so changing one is a rebuild.
 
 **One file, two variants.** A line prefixed `--@single` is used on a single node, one prefixed `--@cluster` on a cluster, and every other line by both. A statement that exists in one variant only carries the prefix on all of its lines. The clustered side is where the `Replicated*` engines, `ON CLUSTER`, the `_dist` wrappers and the replication paths live.
 
@@ -1021,7 +1125,7 @@ The script reads the same environment variables the binary does ([configuration.
 
 ## 7. Distributed layout
 
-Enabled by `PULSUS_CLUSTER`. Every table but the rollup stages becomes `ReplicatedMergeTree`-family, and every **per-shard** table but `metric_label_values`, `service_edges` and the rollup stages gets a Distributed wrapper. Ten tables get none at the default levels. The three landing tables have a wrapper each, and on a cluster are written through it (issue #494). `metric_label_values` is per-shard and gets none because every statement names it locally, inside a read dispatched with `distributed_product_mode = 'local'`, beside the same shard's label index rows (issue #635). `service_edges` is per-shard and has none because the service graph reads it only through `cluster(…, view(…))`, one per-shard statement that also pairs that shard's spans (issue #599). The rollup stages, `metric_samples_60s_stage` and `metric_samples_720s_stage` at the default levels, have none because only their shard's builder reads them. The other six are the cluster-wide ones, one replica set each spanning every shard (`/clickhouse/tables/all/<db>.<table>`), read from the local replica without fan-out, so a wrapper would put a row on one shard and leave every other shard's read missing it permanently: `metric_metadata`, `resources`, `tag_names`, `tag_values`, `tag_bucket_values` and `service_bucket_resources` — the last row of the table below is theirs. **Sharding keys are chosen so that reads join and aggregate shard-locally** (finding #2):
+Enabled by `PULSUS_CLUSTER`. Every table but the rollup stages becomes `ReplicatedMergeTree`-family, and every **per-shard** table but `metric_label_values`, `service_edges` and the rollup stages gets a Distributed wrapper. Twelve tables get none at the default levels. The four landing tables have a wrapper each, and on a cluster are written through it (issue #494). `metric_label_values` is per-shard and gets none because every statement names it locally, inside a read dispatched with `distributed_product_mode = 'local'`, beside the same shard's label index rows (issue #635). `service_edges` is per-shard and has none because the service graph reads it only through `cluster(…, view(…))`, one per-shard statement that also pairs that shard's spans (issue #599). The rollup stages, `metric_samples_60s_stage` and `metric_samples_720s_stage` at the default levels, have none because only their shard's builder reads them. The other eight are the cluster-wide ones, one replica set each spanning every shard (`/clickhouse/tables/all/<db>.<table>`), read from the local replica without fan-out, so a wrapper would put a row on one shard and leave every other shard's read missing it permanently: `metric_metadata`, `resources`, `tag_names`, `tag_values`, `tag_bucket_values`, `service_bucket_resources`, `profile_stacks` and `profile_locations` — the last row of the table below is theirs. **Sharding keys are chosen so that reads join and aggregate shard-locally** (finding #2):
 
 | Table | Sharding key | Why |
 |-------|--------------|-----|
@@ -1029,7 +1133,7 @@ Enabled by `PULSUS_CLUSTER`. Every table but the rollup stages becomes `Replicat
 | `metric_labels` | `cityHash64(fingerprint)` | one lookup row per series (issue #623). **Nothing is inserted through the wrapper**: one kind-2 landing row writes a series' activity row and its lookup row on the node that took the push, so every series read that nests the two runs shard-local (`distributed_product_mode = 'local'`) and finds a series' lookup row beside its activity |
 | `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_5s`, `log_patterns` | `cityHash64(fingerprint)` | **this expression governs reads, not writes** (issue #603). The writer inserts into `log_landing` under its bare name and the views write that shard's local targets, so a fingerprint's rows sit wherever its pushes landed and can sit on several shards. The reads tolerate it: the stream-resolution `GROUP BY fingerprint HAVING ...` counts distinct `(key, val)` pairs and `log_streams_idx`'s sorting key covers its whole row, so a cross-shard duplicate changes nothing; stage-2 hydration already keeps one row per fingerprint; the rollup, `/patterns` and volume reads merge partial aggregates at the initiator. What it ends is shard-local **label discovery**, whose semi-join asked whether a fingerprint was active *anywhere* and could only be answered per shard while one fingerprint's index and rollup rows co-resided — see the paragraph below the tables  **The key hashes the column rather than being the column** (issue #498): a `Distributed` sharding key must evaluate to an integer type ClickHouse accepts, and `UInt128` is not one. Measured on ClickHouse 26.3.29.7, a two-shard fixture: `Distributed(..., fingerprint)` creates without complaint and then answers every insert with `Code: 53. DB::Exception: Sharding key expression does not evaluate to an integer type`, leaving `count()` at 0; `Distributed(..., cityHash64(fingerprint))` creates, inserts and reads the 128-bit value back intact. One fingerprint still maps to one shard, now through both 64-bit halves rather than the low one. |
 | `spans`, `traces`, `error_spans` | `cityHash64(trace_id)` | a trace is whole on one shard; span-level intersections, trace assembly, and the service-graph half-row pairing (both edge halves share `trace_id`, so the query-time join is shard-local) are all shard-local. `spans` and `traces` are the two tables the TraceQL read design queries (issues #584 to #586); their wrappers carry the key as a literal rather than through `Ddl::Dist`, and `the_routing_wrappers_use_the_family_sharding_expression` is what keeps the two forms identical |
-| `profile_samples`, `profile_series`, `profile_series_idx` | `cityHash64(fingerprint)` | same co-sharding argument as logs |
+| `profile_samples`, `profile_entries`, `profile_series` | `cityHash64(fingerprint)` | reads only. On a cluster a batch reaches `profile_landing` through its wrapper, keyed `cityHash64(received_ms)`, so it is one block on one shard, and the views write that shard's tables: a series' entries and samples sit beside the series rows of the same block |
 | `rules`, catalogs, bookkeeping | (replicated to all shards via a shard-less replication path — one cluster-wide replica set, no Distributed writes) | tiny, read-everywhere; **prerequisite: `{replica}` macros must be unique across the whole cluster**, not merely within a shard |
 
 Fan-out analysis for the canonical operations:
@@ -1044,7 +1148,7 @@ Fan-out analysis for the canonical operations:
 | TraceQL search | all; intersections shard-local (a trace's index rows and spans co-reside) | top-K candidates per shard |
 | Label/tag discovery | all, twice for logs: the activity scan, then the index scan | deduplicated key/value sets, plus (logs) the active-fingerprint set once to the initiator and once into each shard's copy of the rendered index scan |
 
-Every table but the ten listed at the start of this section gets a Distributed wrapper of this shape (the schema controller renders one per table from the sharding-key column above):
+Every table but the twelve listed at the start of this section gets a Distributed wrapper of this shape (the schema controller renders one per table from the sharding-key column above):
 
 ```sql
 CREATE TABLE log_samples_dist AS log_samples
@@ -1112,4 +1216,4 @@ The schemas are accepted only with benchmark evidence, produced by the M-milesto
 
 **Rollup accuracy (M3).** Issue #18 part B compares each rollup-served function with the raw route over aligned windows and asserts that each stays within the distance from raw measured for it on issue #18.
 
-**Storage amplification (M5).** Profile rows carry tree/function arrays plus the original payload; the M5 run measures bytes/profile at high frequency with shared symbol tables. If amplification is unacceptable, the fallback design (payload, function dictionary, and compact tree samples in separate tables) replaces it behind the same read path.
+**Storage amplification (M5).** A profile's frames are stored once per stack and location per tenant per UTC day, in `profile_stacks` and `profile_locations`, not on each sample row; the M5 run measures bytes per profile at high frequency.

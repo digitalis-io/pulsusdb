@@ -505,7 +505,8 @@ defaults equal to the binary's. Retention has no default (issue #497):
       "log_rollup_resolution" "PULSUS_LOG_ROLLUP_RESOLUTION"
       "metrics_dedup_window" "PULSUS_METRICS_DEDUP_WINDOW"
       "log_dedup_window" "PULSUS_LOG_DEDUP_WINDOW"
-      "trace_dedup_window" "PULSUS_TRACE_DEDUP_WINDOW" }}
+      "trace_dedup_window" "PULSUS_TRACE_DEDUP_WINDOW"
+      "profile_dedup_window" "PULSUS_PROFILE_DEDUP_WINDOW" }}
 {{- with (index $cfg $key) }}
 - name: {{ $var }}
   value: {{ . | quote }}

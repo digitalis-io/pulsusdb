@@ -2498,7 +2498,8 @@ async fn the_script_refuses_a_policy_missing_on_one_host_before_it_drops() {
             .env("PULSUS_COLD_VOLUME", "cold")
             .env("PULSUS_METRICS_HOT_DAYS", "2")
             .env("PULSUS_LOGS_HOT_DAYS", "2")
-            .env("PULSUS_TRACES_HOT_DAYS", "2");
+            .env("PULSUS_TRACES_HOT_DAYS", "2")
+            .env("PULSUS_PROFILES_HOT_DAYS", "2");
         let out = cmd.output().expect("run schema.sh");
         (
             out.status.code(),

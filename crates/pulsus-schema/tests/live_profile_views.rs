@@ -37,6 +37,10 @@ const TABLES: [&str; 6] = [
 /// count.
 const FIXTURE_COUNTS: [u64; 6] = [15, 5, 3, 1, 2, 4];
 
+/// The most databases the retry case builds before a failure leaves rows in
+/// a target other than the one that refused.
+const RETRY_DATABASES: u32 = 3;
+
 /// The landing insert's row ceiling, as the writer pins it.
 const MAX_ROWS: u64 = 1_048_576;
 
@@ -350,55 +354,73 @@ async fn a_resent_block_stores_nothing_twice() {
 }
 
 /// **V2, after a failure: a block retried after one view failed stores every
-/// row once.** `profile_locations` refuses every row while a constraint is
-/// on it, so the first send fails after the landing table and the other
-/// targets have stored theirs. The constraint is dropped and the block sent
-/// again under the same token: every table then holds the fixture's count,
-/// nothing doubled and nothing missing.
+/// row once.** A constraint on one target refuses every row, so the send
+/// fails part way through the views. The constraint is dropped and the block
+/// sent again under the same token: every table then holds the fixture's
+/// count, nothing doubled and nothing missing.
+///
+/// Which other targets have committed their rows when the refusal stops the
+/// insert is the server's choice, and it differs between databases. So each
+/// target refuses in turn, the tables emptied and a new token taken each
+/// time, and then the same in a new database, until a failed send has left
+/// rows in a target other than the one that refused; at most
+/// [`RETRY_DATABASES`] databases. Every attempt checks its retry.
 #[tokio::test]
 async fn a_block_retried_after_a_view_failed_stores_each_row_once() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_schema_it_profile_views_v2_retry");
-    fresh(&client, db).await;
-    stop_target_merges(&client, db).await;
-    exec(
-        &client,
-        &format!(
-            "ALTER TABLE {db}.profile_locations ADD CONSTRAINT p813_refuse CHECK location_id = 0"
-        ),
-    )
-    .await;
-
     let block = fixture(db, now_ms());
-    let first = push(&client, &block, "p813-v2-retry").await;
-    assert!(first.is_err(), "the first send fails: {first:?}");
-    let partial = counts(&client, db).await;
-    let locations = partial
-        .iter()
-        .find(|(t, _)| *t == "profile_locations")
-        .map(|(_, n)| *n);
-    let others_stored = partial
-        .iter()
-        .filter(|(t, _)| *t != "profile_landing" && *t != "profile_locations")
-        .any(|(_, n)| *n > 0);
-    assert!(
-        locations == Some(0) && others_stored,
-        "after the failed send, another target holds rows and profile_locations none: {partial:?}"
-    );
+    let mut after_another = None;
+    'databases: for round in 1..=RETRY_DATABASES {
+        fresh(&client, db).await;
+        stop_target_merges(&client, db).await;
+        for refusing in &TABLES[1..] {
+            let token = format!("p813-v2-retry-{round}-{refusing}");
+            exec(
+                &client,
+                &format!("ALTER TABLE {db}.{refusing} ADD CONSTRAINT p813_refuse CHECK 0"),
+            )
+            .await;
+            let first = push(&client, &block, &token).await;
+            assert!(first.is_err(), "{token}: the first send fails: {first:?}");
+            let partial = counts(&client, db).await;
+            let refused = partial.iter().find(|(t, _)| t == refusing).map(|(_, n)| *n);
+            assert_eq!(
+                refused,
+                Some(0),
+                "{token}: {refusing} stores nothing: {partial:?}"
+            );
+            let stored_elsewhere = partial
+                .iter()
+                .any(|(t, n)| *t != "profile_landing" && t != refusing && *n > 0);
 
-    exec(
-        &client,
-        &format!("ALTER TABLE {db}.profile_locations DROP CONSTRAINT p813_refuse"),
-    )
-    .await;
-    push(&client, &block, "p813-v2-retry")
-        .await
-        .expect("the retry commits");
-    assert_eq!(
-        counts(&client, db).await,
-        expected_counts(),
-        "row counts after the retry"
+            exec(
+                &client,
+                &format!("ALTER TABLE {db}.{refusing} DROP CONSTRAINT p813_refuse"),
+            )
+            .await;
+            push(&client, &block, &token)
+                .await
+                .unwrap_or_else(|e| panic!("{token}: the retry commits: {e}"));
+            assert_eq!(
+                counts(&client, db).await,
+                expected_counts(),
+                "{token}: row counts after the retry, from {partial:?}"
+            );
+            if stored_elsewhere {
+                after_another = Some(partial);
+                break 'databases;
+            }
+            for table in TABLES {
+                exec(&client, &format!("TRUNCATE TABLE {db}.{table}")).await;
+            }
+        }
+    }
+    assert!(
+        after_another.is_some(),
+        "in {RETRY_DATABASES} databases no failed send left rows in a target other than the \
+         one that refused"
     );
 
     exec(&client, &format!("DROP DATABASE IF EXISTS {db} SYNC")).await;
