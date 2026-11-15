@@ -15,6 +15,7 @@ pub use ingest::metrics::{
     ExemplarPoint, HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics,
     SeriesRef,
 };
+pub use ingest::profiles::{ParsedProfileLanding, ProfileInput, ProfileRefusal};
 pub use ingest::traces::{
     LandingEvent, LandingLink, LandingResource, LandingSpan, LandingTagName, LandingTagValue,
     ParsedTraceLanding, TagScope, TraceSink,
@@ -35,6 +36,7 @@ pub use protocols::otlp_metrics::{
 pub use protocols::otlp_traces::{
     decode as decode_traces, parse_landing as parse_trace_landing, resource_identity,
 };
+pub use protocols::profile_model::{decode_pprof, parse_profiles};
 pub use protocols::remote_write::{
     WriteRequest, decode as decode_remote_write, parse as parse_remote_write,
 };
