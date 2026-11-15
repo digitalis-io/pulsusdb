@@ -1914,6 +1914,29 @@ mod tests {
         assert_eq!(by_len(25), Some(reference(&r)), "R is unchanged");
     }
 
+    /// The repair's last group starts after the number of groups: the
+    /// reference's loop over it runs no times, so it is left as it is.
+    #[test]
+    fn a15_a_last_group_past_the_group_count_is_left_alone() {
+        // R sorts first (its root-side suffix starts at id 49), three times;
+        // S sorts last (its suffix starts at id 241) and overlaps R by a
+        // token, so it is a repair candidate. Groups start at 0 and 3.
+        let mut r: Vec<u64> = vec![100];
+        r.extend(49..=72);
+        let mut s: Vec<u64> = (201..=248).collect();
+        s.extend(49..=64);
+        let mut b = numbered(300, "x.go");
+        b.sample(&r, &[1], &[])
+            .sample(&r, &[2], &[])
+            .sample(&r, &[3], &[])
+            .sample(&s, &[1], &[]);
+        let l = parse_one(PUSH, b.build());
+        assert_eq!(l.stacks.len(), 2, "two stacks");
+        let mut lens: Vec<usize> = l.stacks.iter().map(|st| st.location_ids.len()).collect();
+        lens.sort_unstable();
+        assert_eq!(lens, [25, 64], "neither stack changes");
+    }
+
     #[test]
     fn a16_references_follow_the_reference_rules() {
         let mut b = Pb::new();
