@@ -821,7 +821,18 @@ struct ContextChunk {
 /// The D4t statements: for each length, its `n^len` strings in runs of at
 /// most [`CONTEXT_CHUNK_ROWS`].
 fn context_chunks() -> Vec<ContextChunk> {
-    Vec::new()
+    let n = CONTEXT_ALPHABET_SQL.len() as u64;
+    let mut out = Vec::new();
+    for len in 1..=CONTEXT_MAX_LEN {
+        let total = n.pow(len);
+        let mut lo = 0;
+        while lo < total {
+            let count = CONTEXT_CHUNK_ROWS.min(total - lo);
+            out.push(ContextChunk { len, lo, count });
+            lo += count;
+        }
+    }
+    out
 }
 
 /// D4t's statements read every string of one to five symbols exactly once,
@@ -874,35 +885,46 @@ async fn case_key_equals_the_databases_over_every_short_context_string() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let k = predicate::case_key_sql;
-    let sql = format!(
-        "WITH ['Σ','σ','ς','A','a','Β','.','''',' ','_','1',char(0xCC,0x81),char(0xC2,0xAD),\
-         'İ',char(0xE2,0x84,0xAA),'ß','ẞ'] AS al, length(al) AS n \
-         SELECT s, {key} AS key, \
-           key = {ku} AND key = {kl} AS invariant, \
-           tokens(key, 'splitByNonAlpha') = arrayMap(t -> {kt}, tokens(s, 'splitByNonAlpha')) AS commutes \
-         FROM ( \
-           SELECT arrayStringConcat(arrayMap(i -> al[(intDiv(number, pow(n, i)) % n) + 1], range(len))) AS s \
-           FROM numbers(1419857) ARRAY JOIN [1, 2, 3, 4, 5] AS len WHERE number < pow(n, len))",
-        key = k("s"),
-        ku = k("upperUTF8(s)"),
-        kl = k("lowerUTF8(s)"),
-        kt = k("t"),
-    );
-    let mut stream = client
-        .query_stream::<ContextRow>(&sql, &QuerySettings::new())
-        .await
-        .expect("the context statement runs");
+    let alphabet = CONTEXT_ALPHABET_SQL.join(",");
     let (mut rows, mut not_invariant, mut not_commuting) = (0u64, 0u64, 0u64);
     let mut differ: Vec<(String, String, String)> = Vec::new();
-    while let Some(row) = stream.next().await {
-        let row = row.expect("row decodes");
-        rows += 1;
-        not_invariant += u64::from(row.invariant != 1);
-        not_commuting += u64::from(row.commutes != 1);
-        let ours = pulsus_logql::word::case_key(&row.s);
-        if ours != row.key {
-            differ.push((row.s, row.key, ours));
+    // One statement per run of at most `CONTEXT_CHUNK_ROWS` strings, each
+    // inside its own stream deadline: the 1,508,597 strings as one
+    // statement ran past it on a loaded runner (issue #843).
+    for ContextChunk { len, lo, count } in context_chunks() {
+        let sql = format!(
+            "WITH [{alphabet}] AS al, length(al) AS n \
+             SELECT s, {key} AS key, \
+               key = {ku} AND key = {kl} AS invariant, \
+               tokens(key, 'splitByNonAlpha') = arrayMap(t -> {kt}, tokens(s, 'splitByNonAlpha')) AS commutes \
+             FROM ( \
+               SELECT arrayStringConcat(arrayMap(i -> al[(intDiv(number, pow(n, i)) % n) + 1], range({len}))) AS s \
+               FROM numbers({lo}, {count}))",
+            key = k("s"),
+            ku = k("upperUTF8(s)"),
+            kl = k("lowerUTF8(s)"),
+            kt = k("t"),
+        );
+        let mut stream = client
+            .query_stream::<ContextRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("the context statement runs");
+        let mut chunk_rows = 0u64;
+        while let Some(row) = stream.next().await {
+            let row = row.expect("row decodes");
+            chunk_rows += 1;
+            not_invariant += u64::from(row.invariant != 1);
+            not_commuting += u64::from(row.commutes != 1);
+            let ours = pulsus_logql::word::case_key(&row.s);
+            if ours != row.key {
+                differ.push((row.s, row.key, ours));
+            }
         }
+        assert_eq!(
+            chunk_rows, count,
+            "length {len} from {lo}: every string of the run"
+        );
+        rows += chunk_rows;
     }
     assert_eq!(rows, 1_508_597, "every string of one to five symbols");
     assert_eq!(
