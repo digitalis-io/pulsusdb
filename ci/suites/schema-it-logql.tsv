@@ -1,3 +1,4 @@
+# slots=3
 # suite	lane	when	env	command  (format: ci/live-suites.sh)
 # Issue #16, docs/schemas.md §9's two-tier model, Tier 1: the
 # scale-invariant system.query_log ratio gate for the logs read path
