@@ -62,6 +62,10 @@ static TEST_DB_LATE_ROW: pulsus_testkit::TestDb =
 // Issue #18 part A: each shard builds its slice of the first level once.
 static TEST_DB_LEVELS: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_levels");
+// Issue #813: the profile stacks and locations are one replica set across
+// the cluster, the samples one per shard.
+static TEST_DB_PROFILE_STACKS: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_profile_stacks");
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -139,6 +143,8 @@ fn cluster_ctx(db: &str) -> SchemaParams {
         log_dedup_window: 10_000,
         trace_landing_retention_hours: 6,
         trace_dedup_window: 10_000,
+        profile_landing_retention_hours: 6,
+        profile_dedup_window: 10_000,
         trace_indexed_attributes: Vec::new(),
         graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
         rollup_levels: pulsus_schema::DEFAULT_ROLLUP_LEVELS.to_vec(),
@@ -148,6 +154,7 @@ fn cluster_ctx(db: &str) -> SchemaParams {
         metrics_hot_days: None,
         logs_hot_days: None,
         traces_hot_days: None,
+        profiles_hot_days: None,
         rollup_retention_days: Vec::new(),
         rollup_hot_days: Vec::new(),
     }
@@ -297,6 +304,13 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         ("metric_samples_720s_dist", METRICS_KEY),
         ("metric_samples_7200s_dist", METRICS_KEY),
         ("metric_samples_86400s_dist", METRICS_KEY),
+        // Issue #813: the profile landing table routes a batch on its
+        // receive stamp; the three profile tables a read reaches through a
+        // wrapper are keyed on the series' fingerprint.
+        ("profile_landing_dist", "cityHash64(received_ms)"),
+        ("profile_samples_dist", "cityHash64(fingerprint)"),
+        ("profile_entries_dist", "cityHash64(fingerprint)"),
+        ("profile_series_dist", "cityHash64(fingerprint)"),
     ];
     for (table, sharding_expr) in dist_tables {
         assert!(
@@ -703,9 +717,10 @@ async fn the_cluster_windows_are_the_replicated_pair_on_every_write_path_table()
     let mut ctx = cluster_ctx(db);
     ctx.metrics_dedup_window = 5_000;
     ctx.log_dedup_window = 5_000;
+    ctx.profile_dedup_window = 5_000;
     run_init(&shard1, &ctx).await.expect("run_init (clustered)");
 
-    const WRITE_PATH_TABLES: [&str; 15] = [
+    const WRITE_PATH_TABLES: [&str; 21] = [
         "log_landing",
         "log_samples",
         "log_streams",
@@ -721,6 +736,12 @@ async fn the_cluster_windows_are_the_replicated_pair_on_every_write_path_table()
         "metric_labels",
         "metric_label_index",
         "metric_label_values",
+        "profile_landing",
+        "profile_samples",
+        "profile_entries",
+        "profile_series",
+        "profile_stacks",
+        "profile_locations",
     ];
 
     for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {
@@ -1832,6 +1853,92 @@ async fn the_catalog_targets_reach_every_shard() {
         &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
     )
     .await;
+}
+
+/// **C1 (issue #813): the profile stacks and locations reach every shard,
+/// and a sample stays on the shard that took it.** One block goes into
+/// shard 1's own `profile_landing`, with two stacks, two locations and one
+/// sample. `profile_stacks` and `profile_locations` are one replica set across
+/// the cluster, so shard 2 holds both of each; `profile_samples` is one replica
+/// set per shard, so shard 1's second replica holds the sample and shard 2
+/// does not. Every replica read is synced first, shard 2's samples included,
+/// so a sample path shared across the cluster cannot pass while replication
+/// is still pending.
+#[tokio::test]
+async fn the_profile_stacks_and_locations_reach_every_shard() {
+    skip_unless_live!();
+    let shard1 = ChClient::new(shard1_config())
+        .await
+        .expect("connect shard1");
+    let shard1b = ChClient::new(shard1b_config())
+        .await
+        .expect("connect shard1b");
+    let shard2 = ChClient::new(shard2_config())
+        .await
+        .expect("connect shard2");
+    require_two_shard_topology(&shard1, &shard2).await;
+
+    let db = &TEST_DB_PROFILE_STACKS;
+    fresh_cluster_db(&shard1, db).await;
+    let ns = cluster_now_ns();
+    let ms = ns / 1_000_000;
+    let kind = "'process_cpu:cpu:nanoseconds:cpu:nanoseconds'";
+    let zero = "toUUID('00000000-0000-0000-0000-000000000000')";
+    let p1 = "toUUID('00000000-0000-7000-8000-000000000001')";
+    let rows = [
+        format!("('t1',{ms},0,{kind},'checkout',11,{ns},101,10,[],[],[],0,0,[],'',{p1})"),
+        format!("('t1',{ms},1,'','',0,0,101,0,[1,2],['main','a'],[201,202],0,0,[],'',{zero})"),
+        format!("('t1',{ms},1,'','',0,0,102,0,[1,3],['main','b'],[201],0,0,[],'',{zero})"),
+        format!("('t1',{ms},4,'','',0,0,0,0,[],[],[],201,4096,['main'],'',{zero})"),
+        format!("('t1',{ms},4,'','',0,0,0,0,[],[],[],202,4112,['a'],'',{zero})"),
+    ];
+    let sql = format!(
+        "INSERT INTO {db}.profile_landing (org_id, received_ms, kind, type_id, service, \
+         fingerprint, timestamp_ns, stack_id, value, node_ids, names, location_ids, \
+         location_id, address, line_functions, labels, profile_id) VALUES {}",
+        rows.join(", ")
+    );
+    let sent = shard1
+        .execute(
+            &sql,
+            &QuerySettings::landing_insert("p813-c1", 1_048_576),
+            Idempotency::NonIdempotent,
+        )
+        .await;
+    assert!(sent.is_ok(), "the block commits on shard 1: {sent:?}");
+
+    for table in ["profile_stacks", "profile_locations", "profile_samples"] {
+        exec_on(&shard2, &format!("SYSTEM SYNC REPLICA {db}.{table}")).await;
+    }
+    exec_on(
+        &shard1b,
+        &format!("SYSTEM SYNC REPLICA {db}.profile_samples"),
+    )
+    .await;
+
+    let on = |client: &'static str, table: &str| format!("{client}: {table}");
+    let mut got = Vec::new();
+    for (name, client, table) in [
+        ("shard2", &shard2, "profile_stacks"),
+        ("shard2", &shard2, "profile_locations"),
+        ("shard2", &shard2, "profile_samples"),
+        ("shard1b", &shard1b, "profile_samples"),
+    ] {
+        let n = count_on(client, &format!("SELECT count() AS n FROM {db}.{table}")).await;
+        got.push((on(name, table), n));
+    }
+    assert_eq!(
+        got,
+        vec![
+            (on("shard2", "profile_stacks"), 2),
+            (on("shard2", "profile_locations"), 2),
+            (on("shard2", "profile_samples"), 0),
+            (on("shard1b", "profile_samples"), 1),
+        ],
+        "stacks and locations on every shard, the sample on its own shard's replicas"
+    );
+
+    drop_cluster_db(&shard1, db).await;
 }
 
 /// Issue #497: the binary takes its retention from the database only when

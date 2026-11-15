@@ -63,6 +63,13 @@ pub struct RenderCtx {
     /// block-deduplication window the traces landing table and the five
     /// derived trace tables carry.
     pub trace_dedup_window: u64,
+    /// `PULSUS_PROFILE_LANDING_RETENTION_HOURS` (issue #813): the profiles
+    /// landing table's delete-TTL, in hours.
+    pub profile_landing_retention_hours: u32,
+    /// `PULSUS_PROFILE_DEDUP_WINDOW` (issue #813): the block-deduplication
+    /// window the profiles landing table and the five derived profile tables
+    /// carry.
+    pub profile_dedup_window: u64,
     /// `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` (issue #595 part 2): validated
     /// `span.<key>` / `event.<key>` items, each rendered into one index on
     /// `spans` by `{{trace_attr_indexes}}`.
@@ -94,6 +101,9 @@ pub struct RenderCtx {
     /// A): the days a span and the trace tables read by time stay on the
     /// local volume.
     pub traces_hot_days: Option<u32>,
+    /// `PULSUS_PROFILES_HOT_DAYS` (docs/configuration.md §7, issue #813):
+    /// the days a profile sample and entry stay on the local volume.
+    pub profiles_hot_days: Option<u32>,
     /// `PULSUS_ROLLUP_RETENTION_DAYS` (docs/configuration.md §7, issue #743
     /// part B): each level's retention in days, one per level; empty: every
     /// level keeps `retention_days`.
@@ -437,6 +447,7 @@ pub struct TieringInput<'a> {
     pub metrics_hot_days: Option<&'a str>,
     pub logs_hot_days: Option<&'a str>,
     pub traces_hot_days: Option<&'a str>,
+    pub profiles_hot_days: Option<&'a str>,
     /// What `parse_rollup_levels` returned (issue #743 part B).
     pub levels: &'a [u32],
     /// What `parse_rollup_ranges` returned.
@@ -452,6 +463,7 @@ pub struct Tiering {
     pub metrics_hot_days: Option<u32>,
     pub logs_hot_days: Option<u32>,
     pub traces_hot_days: Option<u32>,
+    pub profiles_hot_days: Option<u32>,
     pub rollup_retention_days: Vec<u32>,
     pub rollup_hot_days: Vec<u32>,
 }
@@ -520,6 +532,7 @@ pub fn validate_tiering(input: &TieringInput<'_>) -> Result<Tiering, String> {
         metrics_hot_days: days[0],
         logs_hot_days: days[1],
         traces_hot_days: days[2],
+        profiles_hot_days: None,
         rollup_retention_days: keep,
         rollup_hot_days: hot,
     })
@@ -831,6 +844,8 @@ mod tests {
             log_dedup_window: 10_000,
             trace_landing_retention_hours: 6,
             trace_dedup_window: 10_000,
+            profile_landing_retention_hours: 6,
+            profile_dedup_window: 10_000,
             trace_indexed_attributes: Vec::new(),
             graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
             rollup_levels: DEFAULT_ROLLUP_LEVELS.to_vec(),
@@ -840,6 +855,7 @@ mod tests {
             metrics_hot_days: None,
             logs_hot_days: None,
             traces_hot_days: None,
+            profiles_hot_days: None,
             rollup_retention_days: Vec::new(),
             rollup_hot_days: Vec::new(),
         }

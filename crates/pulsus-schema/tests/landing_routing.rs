@@ -4,18 +4,26 @@
 //! trace block, and every resend the writer makes of it, to one shard.
 //! `metric_landing` is keyed on `cityHash64(fingerprint)`, the key of every
 //! metrics table's wrapper, so all of a series' rows sit on one shard.
+//! `profile_landing` (issue #813) is keyed on the receive stamp, as the log
+//! and trace landing tables are.
 //! Single-node renders no wrapper. Read from what `schema/schema.sh --print`
 //! writes, which is what a deployment applies.
 
 use std::process::Command;
 
-const LANDING: [&str; 3] = ["log_landing", "metric_landing", "trace_landing"];
+const LANDING: [&str; 4] = [
+    "log_landing",
+    "metric_landing",
+    "trace_landing",
+    "profile_landing",
+];
 
 /// Each landing table and the expression its wrapper is keyed on.
-const KEYED: [(&str, &str); 3] = [
+const KEYED: [(&str, &str); 4] = [
     ("log_landing", "cityHash64(received_ms)"),
     ("metric_landing", "cityHash64(fingerprint)"),
     ("trace_landing", "cityHash64(received_ms)"),
+    ("profile_landing", "cityHash64(received_ms)"),
 ];
 
 /// `schema.sh --print` with an empty environment but for `PATH` and `vars`:

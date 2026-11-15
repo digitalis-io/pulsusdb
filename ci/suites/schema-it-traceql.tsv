@@ -81,6 +81,7 @@ traces_point_read	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=191
 # ClickHouse 26.8 container.
 traces_search_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	ci/test-summary.sh run traces_search_live -p pulsus-server --test traces_search_live
 live_schema	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-schema --test live_schema
+live_profile_views	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-schema --test live_profile_views
 # Issue #55: spawns the real `pulsusdb` binary and drives the
 # `/api/traces/v1/trace/{traceId}[/json]` fetch surface end-to-end —
 # OTLP ingest seed, JSON/protobuf negotiation (incl. the 406
