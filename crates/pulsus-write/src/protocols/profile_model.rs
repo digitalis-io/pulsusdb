@@ -25,6 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::ops::Range;
 use std::sync::Arc;
 
 use prost::Message;
@@ -730,7 +731,9 @@ fn repair_go_truncated_stacktraces(p: &mut Profile) {
             continue;
         }
         let missing = appx[appx.len() - off as usize..].to_vec();
-        for &s in &samples[g..group_end(i)] {
+        // `for j := g; j < n; j++`: a last group starting at or after the
+        // number of groups is not appended to.
+        for &s in samples.iter().take(group_end(i)).skip(g) {
             p.sample[s].location_id.extend_from_slice(&missing);
         }
     }
@@ -759,7 +762,8 @@ struct ResolvedLine<'a> {
     line: i64,
 }
 
-/// A location after the reference cleanup and `clearAddresses`.
+/// A location after the reference cleanup and `clearAddresses`. Its lines
+/// are a range of [`Resolved::lines`].
 struct ResolvedLocation<'a> {
     file: &'a str,
     build_id: &'a str,
@@ -767,39 +771,45 @@ struct ResolvedLocation<'a> {
     limit: u64,
     offset: u64,
     address: u64,
-    lines: Vec<ResolvedLine<'a>>,
+    lines: Range<usize>,
 }
 
 impl ResolvedLocation<'_> {
-    /// The location's content id: every column the row stores.
-    fn id(&self) -> u128 {
-        let mut buf = Vec::with_capacity(64 + self.lines.len() * 48);
+    /// The location's content id: every column the row stores. `buf` is a
+    /// scratch buffer, reused across calls.
+    fn id(&self, lines: &[ResolvedLine<'_>], buf: &mut Vec<u8>) -> u128 {
+        buf.clear();
         let s = |buf: &mut Vec<u8>, v: &str| {
             buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
             buf.extend_from_slice(v.as_bytes());
         };
-        s(&mut buf, self.file);
-        s(&mut buf, self.build_id);
+        s(buf, self.file);
+        s(buf, self.build_id);
         for n in [self.start, self.limit, self.offset, self.address] {
             buf.extend_from_slice(&n.to_le_bytes());
         }
-        buf.extend_from_slice(&(self.lines.len() as u64).to_le_bytes());
-        for l in &self.lines {
-            s(&mut buf, l.name);
-            s(&mut buf, l.system_name);
-            s(&mut buf, l.filename);
+        let lines = &lines[self.lines.clone()];
+        buf.extend_from_slice(&(lines.len() as u64).to_le_bytes());
+        for l in lines {
+            s(buf, l.name);
+            s(buf, l.system_name);
+            s(buf, l.filename);
             buf.extend_from_slice(&l.start_line.to_le_bytes());
             buf.extend_from_slice(&l.line.to_le_bytes());
         }
-        id128(&buf)
+        id128(buf)
     }
 }
 
-/// The surviving locations, and for each surviving sample its index and its
-/// locations (leaf first) as indices into them.
+/// The surviving locations and their lines, and for each surviving sample
+/// its index and a range of `sample_locations`: its locations, leaf first,
+/// as indices into `locations`. Flat vectors, so resolving allocates per
+/// profile, not per location or per sample.
 struct Resolved<'a> {
     locations: Vec<ResolvedLocation<'a>>,
-    samples: Vec<(usize, Vec<usize>)>,
+    lines: Vec<ResolvedLine<'a>>,
+    samples: Vec<(usize, Range<usize>)>,
+    sample_locations: Vec<usize>,
 }
 
 /// `sanitizeProfile`'s reference rules (`pkg/pprof/pprof.go:1393-1560`) and
@@ -810,6 +820,7 @@ fn resolve(p: &Profile) -> Resolved<'_> {
     let mappings: HashMap<u64, &Mapping> = p.mapping.iter().map(|m| (m.id, m)).collect();
     let functions: HashMap<u64, &Function> = p.function.iter().map(|f| (f.id, f)).collect();
     let mut locations = Vec::with_capacity(p.location.len());
+    let mut all_lines = Vec::with_capacity(p.location.iter().map(|l| l.line.len()).sum());
     let mut by_id: HashMap<u64, usize> = HashMap::with_capacity(p.location.len());
     'loc: for l in &p.location {
         if l.line.is_empty() && l.address == 0 {
@@ -823,12 +834,13 @@ fn resolve(p: &Profile) -> Resolved<'_> {
                 None => continue,
             }
         };
-        let mut lines = Vec::with_capacity(l.line.len());
+        let first = all_lines.len();
         for line in &l.line {
             let Some(f) = functions.get(&line.function_id) else {
+                all_lines.truncate(first);
                 continue 'loc;
             };
-            lines.push(ResolvedLine {
+            all_lines.push(ResolvedLine {
                 name: st(table, f.name),
                 system_name: st(table, f.system_name),
                 filename: st(table, f.filename),
@@ -836,6 +848,7 @@ fn resolve(p: &Profile) -> Resolved<'_> {
                 line: line.line,
             });
         }
+        let lines = first..all_lines.len();
         let resolved = match mapping {
             None => ResolvedLocation {
                 file: "",
@@ -868,20 +881,26 @@ fn resolve(p: &Profile) -> Resolved<'_> {
         by_id.insert(l.id, locations.len());
         locations.push(resolved);
     }
-    let samples = p
-        .sample
-        .iter()
-        .enumerate()
-        .filter_map(|(i, s)| {
-            let locs: Option<Vec<usize>> = s
-                .location_id
-                .iter()
-                .map(|id| by_id.get(id).copied())
-                .collect();
-            locs.map(|locs| (i, locs))
-        })
-        .collect();
-    Resolved { locations, samples }
+    let mut samples = Vec::with_capacity(p.sample.len());
+    let mut sample_locations =
+        Vec::with_capacity(p.sample.iter().map(|s| s.location_id.len()).sum());
+    'sample: for (i, s) in p.sample.iter().enumerate() {
+        let first = sample_locations.len();
+        for id in &s.location_id {
+            let Some(&li) = by_id.get(id) else {
+                sample_locations.truncate(first);
+                continue 'sample;
+            };
+            sample_locations.push(li);
+        }
+        samples.push((i, first..sample_locations.len()));
+    }
+    Resolved {
+        locations,
+        lines: all_lines,
+        samples,
+        sample_locations,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -901,6 +920,8 @@ struct Push {
     strings: HashSet<Arc<str>>,
     stacks: HashSet<u128>,
     locations: HashSet<u128>,
+    /// Scratch for the id buffers, reused for every id in the push.
+    buf: Vec<u8>,
 }
 
 impl Push {
@@ -957,11 +978,16 @@ impl Push {
             .filter(|(k, _)| !empty.contains(k.as_str()))
             .cloned()
             .collect();
-        let mut groups: Vec<SampleGroup> = Vec::new();
-        let mut group_of: HashMap<Labels, usize> = HashMap::new();
+        // Samples are first grouped by the labels they add to the push's,
+        // borrowed from the string table, so the push's labels are not
+        // copied per sample; the common push adds none and has one group.
+        type Added<'s> = Vec<(&'s str, &'s str)>;
+        type Member = (usize, u64, [u8; 16]);
+        let mut by_added: Vec<(Added<'_>, Vec<Member>)> = Vec::new();
+        let mut added_of: HashMap<Added<'_>, usize> = HashMap::new();
         for (ri, (si, _)) in resolved.samples.iter().enumerate() {
             let sample = &profile.sample[*si];
-            let mut ls = base.clone();
+            let mut added: Added<'_> = Vec::new();
             let mut span: Option<u64> = None;
             let mut trace: Option<[u8; 16]> = None;
             for l in &sample.label {
@@ -978,21 +1004,47 @@ impl Push {
                     trace = trace.or_else(|| parse_trace_id(value));
                     continue;
                 }
-                if l.str <= 0 || !get(&ls, name).is_empty() {
+                // A name the push already carries keeps the push's value,
+                // and the first sample label of a name wins.
+                if l.str <= 0
+                    || value.is_empty()
+                    || !get(&base, name).is_empty()
+                    || added.iter().any(|(k, _)| *k == name)
+                {
                     continue;
                 }
-                set(&mut ls, name, value);
+                added.push((name, value));
             }
+            added.sort_unstable();
+            let member = (ri, span.unwrap_or(0), trace.unwrap_or([0; 16]));
+            match added_of.get(&added) {
+                Some(&g) => by_added[g].1.push(member),
+                None => {
+                    added_of.insert(added.clone(), by_added.len());
+                    by_added.push((added, vec![member]));
+                }
+            }
+        }
+        // Then once per group: the push's labels plus the added ones, the
+        // relabel rules, and a merge of groups whose results are equal.
+        let mut groups: Vec<SampleGroup> = Vec::with_capacity(by_added.len());
+        let mut group_of: HashMap<Labels, usize> = HashMap::new();
+        for (added, members) in by_added {
+            let mut ls = base.clone();
+            ls.extend(
+                added
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            );
             relabel(&mut ls);
             sort_labels(&mut ls);
-            let member = (ri, span.unwrap_or(0), trace.unwrap_or([0; 16]));
             match group_of.get(&ls) {
-                Some(&g) => groups[g].members.push(member),
+                Some(&g) => groups[g].members.extend(members),
                 None => {
                     group_of.insert(ls.clone(), groups.len());
                     groups.push(SampleGroup {
                         labels: ls,
-                        members: vec![member],
+                        members,
                     });
                 }
             }
@@ -1097,44 +1149,58 @@ impl Push {
     }
 
     /// The stack id of resolved sample `ri`; the first time a stack is seen
-    /// in the push, its row and any new location rows are added.
+    /// in the push, its row and any new location rows are added. The id
+    /// buffers reuse one scratch vector, so a stack already seen allocates
+    /// nothing and a new one allocates only the vectors its row keeps.
     fn stack(
         &mut self,
         resolved: &Resolved<'_>,
         ri: usize,
         location_ids: &mut [Option<u128>],
     ) -> u128 {
-        let locs = &resolved.samples[ri].1;
-        let ids: Vec<u128> = locs
-            .iter()
-            .map(|&li| *location_ids[li].get_or_insert_with(|| resolved.locations[li].id()))
-            .collect();
-        let mut buf = Vec::with_capacity(ids.len() * 16);
-        for id in &ids {
-            buf.extend_from_slice(&id.to_le_bytes());
+        let mut buf = std::mem::take(&mut self.buf);
+        let locs = &resolved.sample_locations[resolved.samples[ri].1.clone()];
+        for &li in locs {
+            if location_ids[li].is_none() {
+                location_ids[li] = Some(resolved.locations[li].id(&resolved.lines, &mut buf));
+            }
+        }
+        let id_of = |li: usize| location_ids[li].expect("filled above");
+        buf.clear();
+        for &li in locs {
+            buf.extend_from_slice(&id_of(li).to_le_bytes());
         }
         let stack_id = id128(&buf);
         if !self.stacks.insert(stack_id) {
+            self.buf = buf;
             return stack_id;
         }
-        let mut names = Vec::new();
-        let mut node_ids = Vec::new();
+        let frames: usize = locs
+            .iter()
+            .map(|&li| resolved.locations[li].lines.len())
+            .sum();
+        let mut names = Vec::with_capacity(frames);
+        let mut node_ids = Vec::with_capacity(frames);
         let mut parent: u128 = 0;
         for &li in locs.iter().rev() {
-            for line in resolved.locations[li].lines.iter().rev() {
-                let mut nb = Vec::with_capacity(16 + line.name.len());
-                nb.extend_from_slice(&parent.to_le_bytes());
-                nb.extend_from_slice(line.name.as_bytes());
-                parent = id128(&nb);
+            let lines = &resolved.lines[resolved.locations[li].lines.clone()];
+            for line in lines.iter().rev() {
+                buf.clear();
+                buf.extend_from_slice(&parent.to_le_bytes());
+                buf.extend_from_slice(line.name.as_bytes());
+                parent = id128(&buf);
                 node_ids.push(parent);
                 names.push(self.intern(line.name));
             }
         }
-        for (&li, &location_id) in locs.iter().zip(&ids) {
+        self.buf = buf;
+        for &li in locs {
+            let location_id = id_of(li);
             if !self.locations.insert(location_id) {
                 continue;
             }
             let loc = &resolved.locations[li];
+            let lines = &resolved.lines[loc.lines.clone()];
             let row = LandingLocation {
                 location_id,
                 mapping_file: self.intern(loc.file),
@@ -1143,15 +1209,11 @@ impl Push {
                 mapping_limit: loc.limit,
                 mapping_offset: loc.offset,
                 address: loc.address,
-                line_functions: loc.lines.iter().map(|l| self.intern(l.name)).collect(),
-                line_system_names: loc
-                    .lines
-                    .iter()
-                    .map(|l| self.intern(l.system_name))
-                    .collect(),
-                line_files: loc.lines.iter().map(|l| self.intern(l.filename)).collect(),
-                line_start_lines: loc.lines.iter().map(|l| l.start_line).collect(),
-                line_numbers: loc.lines.iter().map(|l| l.line).collect(),
+                line_functions: lines.iter().map(|l| self.intern(l.name)).collect(),
+                line_system_names: lines.iter().map(|l| self.intern(l.system_name)).collect(),
+                line_files: lines.iter().map(|l| self.intern(l.filename)).collect(),
+                line_start_lines: lines.iter().map(|l| l.start_line).collect(),
+                line_numbers: lines.iter().map(|l| l.line).collect(),
             };
             self.out.locations.push(row);
         }
@@ -1159,7 +1221,7 @@ impl Push {
             stack_id,
             node_ids,
             names,
-            location_ids: ids,
+            location_ids: locs.iter().map(|&li| id_of(li)).collect(),
         });
         stack_id
     }
