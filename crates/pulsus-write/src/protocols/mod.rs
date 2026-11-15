@@ -14,6 +14,7 @@ pub mod otlp_logs;
 pub mod otlp_metrics;
 pub mod otlp_prescan;
 pub mod otlp_traces;
+pub mod profile_model;
 pub mod prom_metric_name;
 pub mod remote_write;
 pub mod service_name;
