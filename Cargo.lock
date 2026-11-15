@@ -1754,6 +1754,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsus-profiles-wire"
+version = "0.0.0"
+dependencies = [
+ "prost",
+]
+
+[[package]]
 name = "pulsus-promql"
 version = "0.0.0"
 dependencies = [
@@ -1935,6 +1942,7 @@ dependencies = [
  "pulsus-clickhouse",
  "pulsus-config",
  "pulsus-model",
+ "pulsus-profiles-wire",
  "pulsus-schema",
  "pulsus-schema-testkit",
  "pulsus-testkit",
