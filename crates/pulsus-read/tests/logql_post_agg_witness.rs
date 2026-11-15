@@ -6002,8 +6002,8 @@ fn classify(m: &Member) -> Option<RegionClass> {
 fn the_token_taking_set_is_derived_from_the_call_graph() {
     let (files, members) = census_members();
     assert!(
-        files.contains(&"exec.rs".to_string()),
-        "the census did not read exec.rs; files = {files:?}"
+        files.contains(&"exec/mod.rs".to_string()),
+        "the census did not read exec/mod.rs; files = {files:?}"
     );
     assert!(
         members.len() >= 20,

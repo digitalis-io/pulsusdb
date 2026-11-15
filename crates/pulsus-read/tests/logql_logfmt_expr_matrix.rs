@@ -1375,10 +1375,23 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
              their extraction lists are empty by construction",
         ),
         (
-            "exec.rs",
-            12,
+            "exec/detected_reads.rs",
+            1,
             0,
-            "streams :1160, metric :1444 (incl. every binary leaf), the bucketed range \
+            "detected_fields; see the `exec/metric.rs` row for all twelve `exec/` sites",
+        ),
+        (
+            "exec/explain_read.rs",
+            3,
+            0,
+            "the three EXPLAIN sites of issue #624 part 3a; see the `exec/metric.rs` row",
+        ),
+        (
+            "exec/metric.rs",
+            5,
+            0,
+            "the twelve `exec/` sites, five here and the rest in the five sibling rows: \
+             streams :1160, metric :1444 (incl. every binary leaf), the bucketed range \
              read's capability-join fallback, detected_fields, tail, and — since issue #544 — the restored client stage a \
              metric read swaps in when its structured-metadata fragment exceeds its budget. \
              That seventh site compiles `MetadataLowering::client_without_lowering`, which \
@@ -1410,6 +1423,19 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
              compiles",
         ),
         (
+            "exec/metric_routes.rs",
+            1,
+            0,
+            "the bucketed fallback; see the `exec/metric.rs` row",
+        ),
+        (
+            "exec/streams.rs",
+            1,
+            0,
+            "streams; see the `exec/metric.rs` row",
+        ),
+        ("exec/tail.rs", 1, 0, "tail; see the `exec/metric.rs` row"),
+        (
             "plan.rs",
             1,
             0,
@@ -1425,7 +1451,7 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
             "the reduced fold (issue #624, parts 4 and 4b) compiles a reduced plan's key \
              stages: its pipeline less the line filters and the filters the statement \
              applied, so any logfmt expression in them (part 4b's one parser) is one the \
-             metric site in `exec.rs` already compiles for the same query",
+             metric site in `exec/metric.rs` already compiles for the same query",
         ),
         (
             "variants.rs",
@@ -1443,8 +1469,11 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
 
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql");
     let mut found: Vec<(String, usize, usize)> = Vec::new();
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+    let mut files: Vec<std::path::PathBuf> = [dir.clone(), dir.join("exec")]
+        .iter()
+        .flat_map(|d| {
+            std::fs::read_dir(d).unwrap_or_else(|e| panic!("reading {}: {e}", d.display()))
+        })
         .map(|e| e.expect("dir entry").path())
         .filter(|p| p.extension().is_some_and(|x| x == "rs"))
         .collect();
@@ -1476,8 +1505,8 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
         let extends = production.matches(".extended_with(").count();
         if compiles > 0 || extends > 0 {
             found.push((
-                path.file_name()
-                    .expect("file name")
+                path.strip_prefix(&dir)
+                    .expect("under src/logql")
                     .to_string_lossy()
                     .into_owned(),
                 compiles,
