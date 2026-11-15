@@ -1603,24 +1603,6 @@ pub fn series_selector(expr: &Expr) -> Result<ExtractedSelector, PromqlError> {
     extract_name_and_matchers(vs)
 }
 
-/// Issue #820: the matchers of a profiles label selector, in written order,
-/// each value as written: a regex reaches the database uncompiled.
-pub fn metric_selector(q: &str) -> Result<Vec<LabelMatcher>, PromqlError> {
-    Ok(crate::parser::parse_metric_selector(q)?
-        .into_iter()
-        .map(|(key, op, value)| LabelMatcher {
-            key,
-            op: match op {
-                SelectorOp::Eq => MatchOp::Eq,
-                SelectorOp::Neq => MatchOp::Neq,
-                SelectorOp::Re => MatchOp::Re,
-                SelectorOp::Nre => MatchOp::Nre,
-            },
-            value,
-        })
-        .collect())
-}
-
 /// Issue #501 part 2: every vector selector in `expr`, in the order the
 /// expression is written, a selector equal to an earlier one dropped —
 /// the selectors `/api/v1/query_exemplars` reads exemplars for, as the
@@ -3591,6 +3573,24 @@ fn range_source_invariant(source: &RangeSource, selectors: &[SelectorSpec]) -> b
 /// `double_exponential_smoothing` are safe.
 fn over_time_param_fn_is_at_modifier_unsafe(func: OverTimeParamFn) -> bool {
     matches!(func, OverTimeParamFn::PredictLinear)
+}
+
+/// Issue #820: the matchers of a profiles label selector, in written order,
+/// each value as written: a regex reaches the database uncompiled.
+pub fn metric_selector(q: &str) -> Result<Vec<LabelMatcher>, PromqlError> {
+    Ok(crate::parser::parse_metric_selector(q)?
+        .into_iter()
+        .map(|(key, op, value)| LabelMatcher {
+            key,
+            op: match op {
+                SelectorOp::Eq => MatchOp::Eq,
+                SelectorOp::Neq => MatchOp::Neq,
+                SelectorOp::Re => MatchOp::Re,
+                SelectorOp::Nre => MatchOp::Nre,
+            },
+            value,
+        })
+        .collect())
 }
 
 #[cfg(test)]
