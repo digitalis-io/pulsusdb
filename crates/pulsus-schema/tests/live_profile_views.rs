@@ -360,11 +360,12 @@ async fn a_resent_block_stores_nothing_twice() {
 /// count, nothing doubled and nothing missing.
 ///
 /// Which other targets have committed their rows when the refusal stops the
-/// insert is the server's choice, and it differs between databases. So each
-/// target refuses in turn, the tables emptied and a new token taken each
-/// time, and then the same in a new database, until a failed send has left
-/// rows in a target other than the one that refused; at most
-/// [`RETRY_DATABASES`] databases. Every attempt checks its retry.
+/// insert is the server's choice, and it differs between databases. So in
+/// each database every one of the five targets refuses once, in turn, the
+/// tables emptied and a new token taken each time, and every retry is
+/// checked. A new database follows only when none of the five failed sends
+/// left rows in a target other than the one that refused; at most
+/// [`RETRY_DATABASES`] databases.
 #[tokio::test]
 async fn a_block_retried_after_a_view_failed_stores_each_row_once() {
     skip_unless_live!();
@@ -372,7 +373,7 @@ async fn a_block_retried_after_a_view_failed_stores_each_row_once() {
     let db = &pulsus_testkit::test_db("pulsus_schema_it_profile_views_v2_retry");
     let block = fixture(db, now_ms());
     let mut after_another = None;
-    'databases: for round in 1..=RETRY_DATABASES {
+    for round in 1..=RETRY_DATABASES {
         fresh(&client, db).await;
         stop_target_merges(&client, db).await;
         for refusing in &TABLES[1..] {
@@ -410,11 +411,13 @@ async fn a_block_retried_after_a_view_failed_stores_each_row_once() {
             );
             if stored_elsewhere {
                 after_another = Some(partial);
-                break 'databases;
             }
             for table in TABLES {
                 exec(&client, &format!("TRUNCATE TABLE {db}.{table}")).await;
             }
+        }
+        if after_another.is_some() {
+            break;
         }
     }
     assert!(
