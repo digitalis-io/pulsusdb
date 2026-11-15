@@ -319,6 +319,31 @@ outcome or AST *shape* changes.
   naturally be a full `PositionRange` port, a larger API change —
   recorded here as the divergence ledger instead).
 
+## 9. Metric-selector entry point (issue #820)
+
+- **Files:** `src/parser/parse.rs` (`SelectorOp`, `parse_metric_selector`),
+  `src/parser/mod.rs` (the export).
+- **Reference behaviour:** the profiles label selector is read by the
+  reference's `ParseMetricSelector`, which reads the selector production
+  alone and runs no AST check: `{}` and `{env!="p"}` are accepted, where
+  `parse` refuses both with the empty-selector check (entry #6).
+- **What:** a new entry that walks the lexer's tokens for the selector shape
+  alone, `[name] [ '{' [m (',' m)* [',']] '}' ]`, `m` = (IDENTIFIER | STRING)
+  op STRING, and returns each matcher's name, operator and value text. The
+  input must end at the lexer's `T_EOF`. A label name inside the braces is
+  read as an identifier, a keyword too (`{sum="x"}`), as the lexer scans it
+  there; `or` followed by a space is the lexer's `T_LOR` and is refused. A
+  keyword or quoted metric name is refused, though the grammar accepts both.
+- **No regex is compiled.** The grammar's `label_matcher` action compiles
+  every `=~`/`!~` value in process; the profiles path hands every pattern to
+  the database instead, so this entry keeps the value as text.
+- **Patch class:** leaf. No grammar production, token, lexer state or
+  precedence declaration is touched, and `parse` is unchanged.
+- **Tests:** `crates/pulsus-promql/src/parser.rs` (M1) and
+  `crates/pulsus-promql/src/plan.rs` (M2), since this crate does not ride
+  the root `cargo test --workspace`.
+- **Upstream PR:** not filed (an entry for this project's profiles path).
+
 ## G1. Grammar-production patch: duration expressions (issue #84, M6-08b)
 
 - **Files:** `src/parser/promql.y`, `src/parser/token.rs`,

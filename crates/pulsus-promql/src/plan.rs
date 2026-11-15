@@ -32,7 +32,7 @@ use pulsus_model::{LabelMatcher, MatchOp};
 use crate::error::PromqlError;
 use crate::parser::{
     self, AggregateExpr, BinaryExpr, Call, DurationExpr, Expr, LabelModifier, MatrixSelector,
-    Offset, PLabelMatchOp, SubqueryExpr, VectorMatchCardinality, VectorSelector, token,
+    Offset, PLabelMatchOp, SelectorOp, SubqueryExpr, VectorMatchCardinality, VectorSelector, token,
 };
 
 /// Instant query = `start_ms == end_ms`, `step_ms == 0` (a single-step
@@ -1606,8 +1606,19 @@ pub fn series_selector(expr: &Expr) -> Result<ExtractedSelector, PromqlError> {
 /// Issue #820: the matchers of a profiles label selector, in written order,
 /// each value as written: a regex reaches the database uncompiled.
 pub fn metric_selector(q: &str) -> Result<Vec<LabelMatcher>, PromqlError> {
-    let _ = q;
-    Ok(Vec::new())
+    Ok(crate::parser::parse_metric_selector(q)?
+        .into_iter()
+        .map(|(key, op, value)| LabelMatcher {
+            key,
+            op: match op {
+                SelectorOp::Eq => MatchOp::Eq,
+                SelectorOp::Neq => MatchOp::Neq,
+                SelectorOp::Re => MatchOp::Re,
+                SelectorOp::Nre => MatchOp::Nre,
+            },
+            value,
+        })
+        .collect())
 }
 
 /// Issue #501 part 2: every vector selector in `expr`, in the order the

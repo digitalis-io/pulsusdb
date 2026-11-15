@@ -13,18 +13,28 @@ pub const PROFILE_TABLES: [&str; 6] = [
     "profile_locations",
 ];
 
+/// Tables that carry a `<dist_suffix>` wrapper (`schema/schema.sql`).
+const WRAPPED: [&str; 4] = [
+    "profile_landing",
+    "profile_samples",
+    "profile_entries",
+    "profile_series",
+];
+
 /// The names `check` scopes: the six, and the four wrappers under
 /// `dist_suffix` when it is not empty.
 pub fn tables(dist_suffix: &str) -> Vec<String> {
-    let _ = dist_suffix;
-    Vec::new()
+    let mut out: Vec<String> = PROFILE_TABLES.iter().map(|t| t.to_string()).collect();
+    if !dist_suffix.is_empty() {
+        out.extend(WRAPPED.iter().map(|t| format!("{t}{dist_suffix}")));
+    }
+    out
 }
 
 /// Whether every read of a profile table in `sql`, subqueries included, leads
 /// its `WHERE` with `term` — the traces check over the profile tables.
 pub fn check(sql: &str, term: &TenantTerm, tables: &[String]) -> Result<(), String> {
-    let _ = (sql, term, tables);
-    Err("not implemented".to_string())
+    crate::traces::tenant_scope::check(sql, term, tables)
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@
 //! `fingerprint IN (…)`.
 
 use pulsus_clickhouse::ChError;
-use pulsus_model::Tenant;
+use pulsus_model::{LabelMatcher, MatchOp, Tenant};
 
 use crate::metrics::DataWindow;
 
@@ -56,7 +56,13 @@ pub enum SelectorError {
     InvalidArgument(String),
 }
 
-/// Compiles `req` for `tenant` over `series_table`.
+/// Compiles `req` for `tenant` over `series_table` (`profile_series`, or
+/// its wrapper on a cluster), in the reference's order: the window, then
+/// the profile type, then the selectors. Each refusal carries the
+/// reference's text.
+///
+/// Every selector regex is left to the database: rendered anchored, with
+/// its compile probe, and never compiled here.
 pub fn compile(
     tenant: &Tenant,
     series_table: &str,
@@ -64,17 +70,100 @@ pub fn compile(
     now_ms: i64,
     limits: WindowLimits,
 ) -> Result<Compiled, SelectorError> {
-    let _ = (tenant, series_table, req, now_ms, limits);
-    Err(SelectorError::InvalidArgument(
-        "not implemented".to_string(),
-    ))
+    let invalid = |m: String| Err(SelectorError::InvalidArgument(m));
+    let end_ms = req.end_ms;
+    if req.start_ms == 0 || end_ms == 0 {
+        return invalid("missing time range in the query".to_string());
+    }
+    if req.start_ms > end_ms {
+        return invalid("query start time is after end time".to_string());
+    }
+    let floor = now_ms.saturating_sub(limits.max_lookback_ms);
+    if end_ms < floor {
+        return Ok(Compiled::Empty);
+    }
+    let start_ms = req.start_ms.max(floor);
+    let length = end_ms - start_ms;
+    if length > limits.max_length_ms {
+        return invalid(format!(
+            "the query time range exceeds the limit (max_query_length, actual: {}, limit: {})",
+            crate::traces::go_duration_string(length.saturating_mul(1_000_000)),
+            model_duration(limits.max_length_ms)
+        ));
+    }
+    let type_matcher = match req.profile_type {
+        Some(id) => Some(profile_type_matcher(id).map_err(SelectorError::InvalidArgument)?),
+        None => None,
+    };
+    let mut matchers = Vec::new();
+    for s in req.selectors {
+        let parsed = pulsus_promql::metric_selector(s).map_err(|e| {
+            SelectorError::InvalidArgument(format!("parsing label selector {s:?}: {e}"))
+        })?;
+        matchers.extend(parsed);
+    }
+    matchers.extend(type_matcher);
+    let window = DataWindow { start_ms, end_ms };
+    Ok(Compiled::Series {
+        sql: crate::metrics::profile_series(tenant, window, series_table, &matchers),
+        window,
+    })
 }
 
 /// `Some(InvalidArgument(detail))` for a statement refused with code 427 —
 /// a selector regex RE2 cannot compile; `None` for every other error.
 pub fn read_error(e: &ChError) -> Option<SelectorError> {
-    let _ = e;
-    None
+    crate::metrics::regex_rejection_detail(e).map(SelectorError::InvalidArgument)
+}
+
+/// A profile type id as the reference reads it: five parts, or six with a
+/// trailing `delta`, selected by its first five.
+fn profile_type_matcher(id: &str) -> Result<LabelMatcher, String> {
+    let parts: Vec<&str> = id.split(':').collect();
+    if parts.len() != 5 && parts.len() != 6 {
+        return Err(format!(
+            "profile-type selection must be of the form \
+             <name>:<sample-type>:<sample-unit>:<period-type>:<period-unit>(:delta), \
+             got({}): {id:?}",
+            parts.len()
+        ));
+    }
+    Ok(LabelMatcher {
+        key: "__profile_type__".to_string(),
+        op: MatchOp::Eq,
+        value: parts[..5].join(":"),
+    })
+}
+
+/// A millisecond count as the reference's duration text: years and weeks
+/// only when they divide it exactly, then days, hours, minutes, seconds and
+/// milliseconds (24 h is `1d`).
+fn model_duration(ms: i64) -> String {
+    const UNITS: [(&str, i64, bool); 7] = [
+        ("y", 365 * 86_400_000, true),
+        ("w", 7 * 86_400_000, true),
+        ("d", 86_400_000, false),
+        ("h", 3_600_000, false),
+        ("m", 60_000, false),
+        ("s", 1_000, false),
+        ("ms", 1, false),
+    ];
+    if ms == 0 {
+        return "0s".to_string();
+    }
+    let mut rest = ms;
+    let mut out = String::new();
+    for (unit, mult, exact) in UNITS {
+        if exact && rest % mult != 0 {
+            continue;
+        }
+        let v = rest / mult;
+        if v > 0 {
+            out.push_str(&format!("{v}{unit}"));
+            rest -= v * mult;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
