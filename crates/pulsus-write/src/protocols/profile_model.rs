@@ -306,11 +306,15 @@ fn relabel(ls: &mut Labels) {
     }
 }
 
-/// 16 hex digits read big-endian; `None` when malformed.
+/// 16 hex digits, decoded to 8 bytes and read little-endian, as the
+/// reference reads them (`pkg/pprof/pprof.go:1131-1141`); `None` when
+/// malformed. The `UInt64` column is written little-endian, so the stored
+/// bytes are the decoded bytes in order: the 8 bytes a trace row's
+/// `span_id FixedString(8)` holds for the same span.
 fn parse_span_id(s: &str) -> Option<u64> {
     let mut out = [0u8; 8];
     decode_hex(s, &mut out)?;
-    Some(u64::from_be_bytes(out))
+    Some(u64::from_le_bytes(out))
 }
 
 /// 32 hex digits; `None` when malformed.
@@ -1475,7 +1479,16 @@ mod tests {
         ];
         let l = parse_one(&labels, b.build());
         assert_eq!(l.samples.len(), 2, "one row per type");
-        assert!(l.samples.iter().all(|s| s.span_id == 0x00f0_0000_0000_0001));
+        // The reference's reading: the decoded bytes, little-endian.
+        assert!(l.samples.iter().all(|s| s.span_id == 0x0100_0000_0000_f000));
+        // Its stored bytes are what a trace row holds for that span: the
+        // OTLP span id bytes, verbatim, in `span_id FixedString(8)`.
+        let trace_row_span_id: [u8; 8] = [0x00, 0xf0, 0, 0, 0, 0, 0, 0x01];
+        assert!(
+            l.samples
+                .iter()
+                .all(|s| s.span_id.to_le_bytes() == trace_row_span_id)
+        );
         assert_eq!(l.series.len(), 2, "two series");
         let set = labels_of(&l.series[0].labels);
         assert_eq!(set.get("pod").map(String::as_str), Some("p0"));
@@ -1522,7 +1535,7 @@ mod tests {
         assert_eq!(l.series.len(), 1, "one series");
         assert_eq!(l.samples.len(), 2, "one row per span");
         let spans: Vec<u64> = l.samples.iter().map(|s| s.span_id).collect();
-        assert_eq!(spans, [1, 2]);
+        assert_eq!(spans, [1 << 56, 2 << 56]);
     }
 
     #[test]
