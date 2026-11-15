@@ -1403,8 +1403,8 @@ jobs:
           schema/schema.sh
           catalogue > /tmp/schema-first.tsv
           objects=$(wc -l < /tmp/schema-first.tsv)
-          if [ "$objects" -ne 59 ]; then
-            echo "::error::expected 59 objects in the single-node schema, got $objects"
+          if [ "$objects" -ne 70 ]; then
+            echo "::error::expected 70 objects in the single-node schema, got $objects"
             cut -f1 /tmp/schema-first.tsv
             exit 1
           fi
@@ -1582,8 +1582,8 @@ jobs:
           catalogue 13123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 80 ]; then
-            echo "::error::expected 80 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 95 ]; then
+            echo "::error::expected 95 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -1769,8 +1769,8 @@ jobs:
           catalogue 13123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 80 ]; then
-            echo "::error::expected 80 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 95 ]; then
+            echo "::error::expected 95 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -1916,8 +1916,8 @@ jobs:
           catalogue 13123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 80 ]; then
-            echo "::error::expected 80 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 95 ]; then
+            echo "::error::expected 95 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -2102,8 +2102,8 @@ jobs:
           catalogue 13123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 80 ]; then
-            echo "::error::expected 80 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 95 ]; then
+            echo "::error::expected 95 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
