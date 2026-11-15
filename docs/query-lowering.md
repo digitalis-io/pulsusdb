@@ -2404,7 +2404,7 @@ beside the figures they govern rather than once here, and this list is the index
 | `use_query_condition_cache` | **0**, or the cache dropped before each request | otherwise a repeat read reports an order of magnitude fewer rows (§9.5's first trap). Two routes, below |
 | `optimize_aggregation_in_order` | **1**, named on the rows that need it | it is what lets the span-ordered index stream the aggregation instead of holding a hash table over every span-group. On the current index order it buys nothing, because `(trace_id, span_id)` is not a prefix of that sorting key |
 | `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:698` @ 1cdb3e5e), applied by `generator_settings` (`exec.rs:3267` @ 1cdb3e5e) |
-| `max_bytes_before_external_group_by` | **0** | shipped: the generator throws rather than spilling (`exec.rs:3267`) |
+| `max_bytes_before_external_group_by` | **0** | shipped: the generator throws rather than spilling (`exec.rs:3267` @ 1cdb3e5e) |
 | `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:693` @ 1cdb3e5e), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:1403-1405`) |
 | `min_bytes_for_wide_part` | **10485760** | pinned in the corpus recipe so the part format is reproducible; ClickHouse's own 26.3 default happens to be the same value, and neither trace `CREATE TABLE` pins it |
 
@@ -5541,25 +5541,25 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 652 |
-| of those, citing a bare basename | 474 |
+| citation occurrences in the five artefacts | 650 |
+| of those, citing a bare basename | 472 |
 | of those, written as a continuation of a citation earlier in the paragraph | 65 |
 | of those continuations, on a later line than the citation they continue | 26 |
 | `(document, token)` pairs the rule resolves | 256 |
-| occurrences those resolved pairs cover | 350 |
-| `(document, token)` pairs it cannot resolve | 195 |
-| occurrences those frozen pairs cover | 302 |
+| occurrences those resolved pairs cover | 349 |
+| `(document, token)` pairs it cannot resolve | 194 |
+| occurrences those frozen pairs cover | 301 |
 | resolved rows anchored on a token the citing prose prints | 139 |
 | resolved rows anchored on a snapshot of the cited line | 117 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 86 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `ambiguous_basename` | 85 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `not_a_tracked_file` | 109 | the citation names a file the tree does not hold: a throwaway probe that was never committed, which §10 records deliberately, a file of the previous search engine that #602 part 2c-2b deleted, or a file of the previous metrics and graph SQL that #602 part 3a deleted |
 
 | the reviewed verdict on a fallback disagreement | cases |
 |---|---|
-| the fallback answers a file the citing prose does not describe | 1 |
+| the fallback answers a file the citing prose does not describe | 0 |
 | the fallback is right and the anchor rule points elsewhere | 0 |
 | the sentence describes both candidates, so neither answer is wrong | 0 |
 
@@ -5568,11 +5568,11 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 652 citation occurrences the five artefacts make, 474 name a bare basename and 65 are written as a continuation of a citation earlier on the same line. The rule resolves 256 `(document, token)` pairs covering 350 occurrences, and cannot resolve 195 covering 302. Of the resolved rows, 139 are anchored on a token the citing prose prints and 117 on a snapshot of the cited line.
+Of the 650 citation occurrences the five artefacts make, 472 name a bare basename and 65 are written as a continuation of a citation earlier on the same line. The rule resolves 256 `(document, token)` pairs covering 349 occurrences, and cannot resolve 194 covering 301. Of the resolved rows, 139 are anchored on a token the citing prose prints and 117 on a snapshot of the cited line.
 
-The language fallback and the anchor rule disagree on 1 citations, all of them read one at a time. 1 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
+The language fallback and the anchor rule disagree on 0 citations, all of them read one at a time. 0 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
-The citations where the fallback answers a file the citing prose does not describe are `exec.rs:1403-1405` in `docs/query-lowering.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
+The citations where the fallback answers a file the citing prose does not describe are . Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
 
 <!-- end generated -->
 

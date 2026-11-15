@@ -2023,15 +2023,12 @@ enum ReviewedVerdict {
 // 2428 no longer carries the unrelated `let` the anchor rule matched; the
 // citation is an ambiguous basename again, read by neither rule, and there
 // is no divergence left to hold a judgement about.
-const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 1] = [(
-    "docs/query-lowering.md",
-    "exec.rs:1403-1405",
-    0,
-    ReviewedVerdict::FallbackWrong,
-    "the search settings block the same section quotes; it is in traces/exec.rs \
-         (`exec.rs:3227-3233` before #602 part 2c-2b-2 renumbered it, and \
-         `exec.rs:1360-1362` before #803 did)",
-)];
+//
+// Issue #234: `exec.rs:1403-1405` leaves. Splitting `logql/exec.rs` into
+// `logql/exec/` took away the LogQL candidate the fallback answered, so the
+// fallback declines that citation and there is no divergence left to hold a
+// judgement about.
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 0] = [];
 
 /// **Where the language fallback and the anchor rule disagree, and what a
 /// person concluded about each.**
@@ -2196,7 +2193,11 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
         // Issue #18 (the request's grid) removes that `plan.rs:2263` row:
         // the PromQL planner's lines moved again, and neither rule reads
         // the citation as the PromQL planner any more.
-        (1, 0, 0),
+        //
+        // Issue #234 removes the last `FallbackWrong` row, `exec.rs:1403-1405`:
+        // with `logql/exec.rs` split into `logql/exec/`, the fallback no
+        // longer has a LogQL candidate for it and declines.
+        (0, 0, 0),
         "the reviewed verdicts moved; re-read §12.3's decision against them"
     );
 }

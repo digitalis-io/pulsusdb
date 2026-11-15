@@ -209,8 +209,9 @@ fn blank_comments_and_strings(file: &str, src: &str) -> String {
 
 fn logql_source_files() -> Vec<(String, String)> {
     let dir = manifest_path("src/logql");
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("logql src dir")
+    let mut files: Vec<PathBuf> = [dir.clone(), dir.join("exec")]
+        .iter()
+        .flat_map(|d| std::fs::read_dir(d).expect("logql src dir"))
         .map(|e| e.expect("entry").path())
         .filter(|p| p.extension().is_some_and(|x| x == "rs"))
         .collect();
@@ -219,7 +220,7 @@ fn logql_source_files() -> Vec<(String, String)> {
     files
         .into_iter()
         .map(|p| {
-            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            let name = p.strip_prefix(&dir).unwrap().to_string_lossy().to_string();
             let text = std::fs::read_to_string(&p).expect("read");
             (name, text)
         })
@@ -299,7 +300,14 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
         // #240's sweep numbers stand: it carries no regex and no
         // reference-verbatim text.
         ("plan.rs", 17),
-        ("exec.rs", 13),
+        // Issue #234 split `exec.rs` into `exec/`; its 13 are now these.
+        ("exec/detected_reads.rs", 1),
+        ("exec/discovery.rs", 1),
+        ("exec/metric_routes.rs", 2),
+        ("exec/pushdown_range.rs", 1),
+        ("exec/stats.rs", 4),
+        ("exec/tail_state.rs", 1),
+        ("exec/volume.rs", 3),
         ("client_agg.rs", 1),
         ("fold.rs", 1),
         ("post_agg.rs", 5),
@@ -2086,7 +2094,7 @@ const TOTAL: usize = 1_817;
 /// empty string.
 const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-clickhouse/src/error.rs", 1),
-    ("pulsus-read/src/logql/exec.rs", 3),
+    ("pulsus-read/src/logql/exec/settings_errors.rs", 3),
     // Issue #839 adds twelve, all test text: the stage-1 goldens of the
     // matchers that keep their branches, captured before the change.
     ("pulsus-read/src/logql/plan.rs", 14),

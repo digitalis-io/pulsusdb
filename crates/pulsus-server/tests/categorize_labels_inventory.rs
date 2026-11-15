@@ -184,10 +184,10 @@ fn the_categorised_emission_paths_are_exactly_the_enumerated_ones() {
     assert_eq!(
         files
             .iter()
-            .filter(|f| f.ends_with("logql/exec.rs"))
+            .filter(|f| f.ends_with("logql/exec/streams.rs"))
             .count(),
         4,
-        "exec.rs holds four constructors: {sites:?}"
+        "exec/streams.rs holds four constructors: {sites:?}"
     );
     assert_eq!(
         files

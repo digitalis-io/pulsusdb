@@ -2,7 +2,7 @@
 //! `src/logql/` that grows a streams-retention container.
 //!
 //! **What it does.** It parses every `.rs` file directly in
-//! `crates/pulsus-read/src/logql/` with `syn` and records the
+//! `crates/pulsus-read/src/logql/` and in its `exec/` with `syn` and records the
 //! `(file, fn, site)` of every place that grows one of the
 //! streams-retention containers, then requires that set to equal a pinned
 //! literal list.
@@ -47,8 +47,9 @@
 //! `groups`/`rows` (`post_agg.rs`, `client_agg.rs`, `fold.rs` — different
 //! types entirely) off the list. The set is per FILE, not per scope, so a
 //! same-named container of a DIFFERENT type in the same file is
-//! over-included; `exec.rs`'s metric-path `chunk`/`by_fp`/`rows` are
-//! there for that reason and are marked. Over-inclusion is the safe
+//! over-included; `exec/`'s metric-path `chunk`/`by_fp`/`rows` are
+//! there for that reason and are marked. `exec/` is one module split
+//! across files, so pass A reads it as one unit. Over-inclusion is the safe
 //! direction for a tripwire: it can add a finding, never hide one.
 
 use std::collections::BTreeSet;
@@ -289,8 +290,9 @@ impl Visit<'_> for Inv {
 
 fn collect() -> BTreeSet<(String, String, String)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql");
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-        .expect("the logql source directory")
+    let mut files: Vec<std::path::PathBuf> = [dir.clone(), dir.join("exec")]
+        .iter()
+        .flat_map(|d| std::fs::read_dir(d).expect("the logql source directory"))
         .map(|e| e.expect("dir entry").path())
         .filter(|p| p.extension().is_some_and(|x| x == "rs"))
         .collect();
@@ -300,21 +302,41 @@ fn collect() -> BTreeSet<(String, String, String)> {
         "only {} source files found in {dir:?} — the inventory is looking in the wrong place",
         files.len()
     );
+    let parsed: Vec<(String, syn::File)> = files
+        .iter()
+        .map(|path| {
+            let file = path
+                .strip_prefix(&dir)
+                .expect("under src/logql")
+                .to_string_lossy()
+                .into_owned();
+            let text = std::fs::read_to_string(path).expect("read source");
+            let ast = syn::parse_file(&text)
+                .unwrap_or_else(|e| panic!("{file} does not parse as Rust: {e}"));
+            (file, ast)
+        })
+        .collect();
+    // Pass A reads one unit: a file, or the whole of `exec/`, which is one
+    // module split across files (issue #234).
+    let unit = |f: &str| -> String {
+        if f.starts_with("exec/") {
+            "exec/".to_string()
+        } else {
+            f.to_string()
+        }
+    };
     let mut inv = Inv::default();
-    for path in &files {
-        inv.file = path
-            .file_name()
-            .expect("file name")
-            .to_string_lossy()
-            .into_owned();
-        let text = std::fs::read_to_string(path).expect("read source");
-        let parsed = syn::parse_file(&text)
-            .unwrap_or_else(|e| panic!("{} does not parse as Rust: {e}", inv.file));
-        // Pass A, then pass B over the same file.
+    for (file, ast) in &parsed {
+        // Pass A over the file's unit, then pass B over the file.
         let mut decls = Decls::default();
-        decls.visit_file(&parsed);
+        for (other, other_ast) in &parsed {
+            if unit(other) == unit(file) {
+                decls.visit_file(other_ast);
+            }
+        }
+        inv.file = file.clone();
         inv.receivers = decls.names;
-        inv.visit_file(&parsed);
+        inv.visit_file(ast);
     }
     inv.found
 }
@@ -339,9 +361,9 @@ const PINNED: &[(&str, &str, &str)] = &[
     ("detected_probe.rs", "into_streams", "groups.collect"),
     ("detected_probe.rs", "push_fanout_entry", "FanOutGroup{..}"),
     ("detected_probe.rs", "push_fanout_entry", "entries.push"),
-    // --- exec.rs: the declared containers.
+    // --- exec/: the declared containers.
     (
-        "exec.rs",
+        "exec/streams.rs",
         "<item>",
         "field:by_fp:HashMap<Fingerprint,StreamResult>",
     ),
@@ -351,48 +373,52 @@ const PINNED: &[(&str, &str, &str)] = &[
     // including `entry_category_bytes`) before `line.into_owned()` — so
     // this container has no charge of its own to read.
     (
-        "exec.rs",
+        "exec/streams.rs",
         "<item>",
         "field:cat_groups:HashMap<String,FanOutGroup>",
     ),
-    ("exec.rs", "<item>", "field:chunk:Vec<SampleRow>"),
-    ("exec.rs", "<item>", "field:entries:Vec<(i64,String)>"),
+    ("exec/streams.rs", "<item>", "field:chunk:Vec<SampleRow>"),
     (
-        "exec.rs",
+        "exec/results.rs",
+        "<item>",
+        "field:entries:Vec<(i64,String)>",
+    ),
+    (
+        "exec/streams.rs",
         "<item>",
         "field:fp_groups:HashMap<Fingerprint,StreamResult>",
     ),
-    ("exec.rs", "<item>", "field:items:Vec<StreamResult>"),
+    ("exec/results.rs", "<item>", "field:items:Vec<StreamResult>"),
     (
-        "exec.rs",
+        "exec/streams.rs",
         "<item>",
         "field:label_groups:HashMap<String,FanOutGroup>",
     ),
-    ("exec.rs", "<item>", "field:streams:Vec<StreamResult>"),
-    // --- exec.rs: the accumulator's two retention branches.
-    ("exec.rs", "feed", "StreamResult{..}"),
-    ("exec.rs", "feed", "entries.push"),
-    // --- exec.rs: the line-filter-only fast path.
-    ("exec.rs", "push_row", "StreamResult{..}"),
-    ("exec.rs", "push_row", "entries.push"),
-    // --- exec.rs: the byte-denominated staging chunk (issue #312).
-    ("exec.rs", "push_row", "chunk.push"),
-    // --- exec.rs: the drains.
-    ("exec.rs", "into_streams", "StreamResult{..}"),
-    ("exec.rs", "into_streams", "by_fp.collect"),
-    ("exec.rs", "into_streams", "fp_groups.collect"),
-    ("exec.rs", "into_streams", "let:Vec<StreamResult>"),
-    ("exec.rs", "into_streams", "streams.extend"),
-    // --- OVER-INCLUDED: metric-path containers in `exec.rs` that share a
+    ("exec/tail.rs", "<item>", "field:streams:Vec<StreamResult>"),
+    // --- exec/streams.rs: the accumulator's two retention branches.
+    ("exec/streams.rs", "feed", "StreamResult{..}"),
+    ("exec/streams.rs", "feed", "entries.push"),
+    // --- exec/streams.rs: the line-filter-only fast path.
+    ("exec/streams.rs", "push_row", "StreamResult{..}"),
+    ("exec/streams.rs", "push_row", "entries.push"),
+    // --- exec/streams.rs: the byte-denominated staging chunk (issue #312).
+    ("exec/streams.rs", "push_row", "chunk.push"),
+    // --- exec/streams.rs: the drains.
+    ("exec/streams.rs", "into_streams", "StreamResult{..}"),
+    ("exec/streams.rs", "into_streams", "by_fp.collect"),
+    ("exec/streams.rs", "into_streams", "fp_groups.collect"),
+    ("exec/streams.rs", "into_streams", "let:Vec<StreamResult>"),
+    ("exec/streams.rs", "into_streams", "streams.extend"),
+    // --- OVER-INCLUDED: metric-path containers in `exec/` that share a
     // --- name with a streams one (see the header's per-FILE note). These
     // --- are NOT streams retention and are charged, where they are
     // --- charged at all, against the metric caps.
-    ("exec.rs", "run_metric_client", "chunk.push"),
+    ("exec/metric_routes.rs", "run_metric_client", "chunk.push"),
     // Issue #241 removed `run_metric_inner`'s three `by_fp` rows with the
     // SQL-aggregated RANGE arm that held them: that arm was structurally
     // unreachable (`metric_plan` forces `client = Some(..)` for every
     // `QuerySpec::Range`), so the sites are gone rather than re-homed.
-    ("exec.rs", "run_variants", "chunk.push"),
+    ("exec/metric_routes.rs", "run_variants", "chunk.push"),
 ];
 
 #[test]
