@@ -2858,7 +2858,18 @@ mod tests {
             // same series. Same counter, same cap, and still an XOR arm: the
             // staged fold is dropped before today's route runs on a refusal
             // or a memory failure, and runs only when `value` is `Staged`.
-            ("exec.rs", "charge_group_bytes", "&mut self.charged", 6),
+            (
+                "exec/pushdown_instant.rs",
+                "charge_group_bytes",
+                "&mut self.charged",
+                1,
+            ),
+            (
+                "exec/pushdown_range.rs",
+                "charge_group_bytes",
+                "&mut self.charged",
+                5,
+            ),
             // Issue #624: `PushdownRangeGroups::points`, the bucketed range
             // path's dense slots, one grid's width per series. A further XOR
             // arm of `MAX_METRIC_RESULT_POINTS`: it runs only when
@@ -2867,7 +2878,12 @@ mod tests {
             // `MAX_LEAF_RETAINED_BYTES` are unmoved.
             // Issue #624 part 2: x4 — the staged mode's two series kinds and
             // `absent_over_time`'s one grid at finish, under the same XOR.
-            ("exec.rs", "charge_result_points", "&mut self.points", 4),
+            (
+                "exec/pushdown_range.rs",
+                "charge_result_points",
+                "&mut self.points",
+                4,
+            ),
             // Issue #624, part 4: `ReducedFold::charged` and
             // `ReducedFold::points`, one charge each at a new series, as
             // today's route charges the same series. A further XOR arm of
@@ -3012,17 +3028,28 @@ mod tests {
             // mode twice more, at a new per-fingerprint and a new
             // per-label-set series.
             (
-                "exec.rs",
+                "exec/pushdown_instant.rs",
                 "group_bytes",
-                6,
-                "PushdownInstantGroups::charged | PushdownRangeGroups::charged",
+                1,
+                "PushdownInstantGroups::charged",
+            ),
+            (
+                "exec/pushdown_range.rs",
+                "group_bytes",
+                5,
+                "PushdownRangeGroups::charged",
             ),
             // Issue #624: the bucketed range fold's dense slots, one grid's
             // width per series. XOR with the slider and the fold (see the
             // charge census), so `LEAF_COUNTERS` is unmoved. Part 2's
             // staged mode reads it three times more: its two series kinds
             // and `absent_over_time`'s grid at finish.
-            ("exec.rs", "result_points", 4, "PushdownRangeGroups::points"),
+            (
+                "exec/pushdown_range.rs",
+                "result_points",
+                4,
+                "PushdownRangeGroups::points",
+            ),
             // Issue #624, part 4: the reduced fold's new-series charges, XOR
             // with today's route (the fold is dropped before it starts).
             (
@@ -3196,7 +3223,7 @@ mod tests {
             .collect();
         assert_eq!(
             callers,
-            vec![("exec.rs", 1), ("client_agg.rs", 1)],
+            vec![("exec/metric_routes.rs", 1), ("client_agg.rs", 1)],
             "a new `attach_fold` caller may put a fold on the variants path, which would \
              make the group-byte multiplicity 3 — re-run the runtime leg named above before \
              re-pinning this list"
@@ -3212,7 +3239,40 @@ mod tests {
     /// the second and third readers of it).
     fn census_sources() -> &'static [(&'static str, &'static str)] {
         const SOURCES: &[(&str, &str)] = &[
-            ("exec.rs", include_str!("exec.rs")),
+            (
+                "exec/detected_reads.rs",
+                include_str!("exec/detected_reads.rs"),
+            ),
+            ("exec/discovery.rs", include_str!("exec/discovery.rs")),
+            ("exec/explain_read.rs", include_str!("exec/explain_read.rs")),
+            ("exec/fetch.rs", include_str!("exec/fetch.rs")),
+            ("exec/metric.rs", include_str!("exec/metric.rs")),
+            ("exec/metric_read.rs", include_str!("exec/metric_read.rs")),
+            (
+                "exec/metric_routes.rs",
+                include_str!("exec/metric_routes.rs"),
+            ),
+            ("exec/mod.rs", include_str!("exec/mod.rs")),
+            ("exec/predicates.rs", include_str!("exec/predicates.rs")),
+            (
+                "exec/pushdown_instant.rs",
+                include_str!("exec/pushdown_instant.rs"),
+            ),
+            (
+                "exec/pushdown_range.rs",
+                include_str!("exec/pushdown_range.rs"),
+            ),
+            ("exec/query.rs", include_str!("exec/query.rs")),
+            ("exec/results.rs", include_str!("exec/results.rs")),
+            (
+                "exec/settings_errors.rs",
+                include_str!("exec/settings_errors.rs"),
+            ),
+            ("exec/stats.rs", include_str!("exec/stats.rs")),
+            ("exec/streams.rs", include_str!("exec/streams.rs")),
+            ("exec/tail.rs", include_str!("exec/tail.rs")),
+            ("exec/tail_state.rs", include_str!("exec/tail_state.rs")),
+            ("exec/volume.rs", include_str!("exec/volume.rs")),
             ("error.rs", include_str!("error.rs")),
             ("plan.rs", include_str!("plan.rs")),
             // Issue #492: the LogQL fit of the shared compile core.

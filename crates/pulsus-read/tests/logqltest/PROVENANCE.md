@@ -1004,7 +1004,7 @@ bare-instant shape, which plans `client == None` and so takes the
 SQL-pushdown path, which `logqltest`'s runner cannot hold (`eval_leaf`
 refuses a plan with no client aggregation). They are asserted instead by
 `pushdown_and_client_agree_with_the_reference_on_metadata_series`
-(`src/logql/exec.rs`), which compares the pushdown re-grouping against
+(`src/logql/exec/pushdown_instant.rs`), which compares the pushdown re-grouping against
 BOTH these captured values and `run_client_agg_rows` — so joint wrongness
 of the two internal paths cannot pass.
 
@@ -1014,7 +1014,7 @@ of the two internal paths cannot pass.
   (400, byte-identical body). The `.test` file uses the RANGE form,
   because the instant form plans to the pushdown path the runner refuses.
   The pushdown path's own copy is
-  `a_metadata_error_fails_the_pushdown_query_too` (`src/logql/exec.rs`).
+  `a_metadata_error_fails_the_pushdown_query_too` (`src/logql/exec/pushdown_instant.rs`).
 - **`sm-selector-not-index`** — that a metadata key in the STREAM SELECTOR
   matches no stream — is NOT in the corpus. `logqltest`'s store feeds every
   loaded row to the leaf and never applies the selector (`eval_leaf`), so

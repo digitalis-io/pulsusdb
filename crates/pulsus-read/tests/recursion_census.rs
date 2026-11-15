@@ -65,22 +65,27 @@ const ROOTS: &[(&str, &str)] = &[
 
 /// Every `.rs` file under [`ROOTS`], as `(display path, source)`.
 /// Non-recursive, matching the two directory censuses that already exist
-/// over `src/logql/` (`charge.rs`).
+/// over `src/logql/` (`charge.rs`), except that `src/logql/exec/` is read
+/// too: it is one module split across files (issue #234).
 fn sweep() -> Vec<(String, String)> {
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut out = Vec::new();
     for (label, rel) in ROOTS {
         let dir = base.join(rel);
-        let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+        let mut names: Vec<std::path::PathBuf> = [dir.clone(), dir.join("exec")]
+            .iter()
+            .filter(|d| d.is_dir())
+            .flat_map(|d| {
+                std::fs::read_dir(d).unwrap_or_else(|e| panic!("reading {}: {e}", d.display()))
+            })
             .map(|e| e.expect("dir entry").path())
             .filter(|p| p.extension().is_some_and(|x| x == "rs"))
             .collect();
         names.sort();
         for path in names {
             let name = path
-                .file_name()
-                .expect("file name")
+                .strip_prefix(&dir)
+                .expect("under the root")
                 .to_string_lossy()
                 .into_owned();
             let src = std::fs::read_to_string(&path).expect("source");
