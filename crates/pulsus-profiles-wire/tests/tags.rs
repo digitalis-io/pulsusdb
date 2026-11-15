@@ -1,0 +1,207 @@
+//! A18: every field of every `google_v1` message encodes under the tag and
+//! wire type `proto/google/v1/profile.proto` gives it. Each value sets every
+//! field to a non-default value, so a field with a mistyped tag, a wrong
+//! scalar type or a missing `repeated` changes the bytes. The expected bytes
+//! are built field by field with `prost::encoding`, in tag order, with the
+//! tag and type read off the proto file.
+
+use prost::Message;
+use prost::encoding;
+use pulsus_profiles_wire::google_v1::{
+    Function, Label, Line, Location, Mapping, Profile, Sample, ValueType,
+};
+
+fn value_type() -> ValueType {
+    ValueType { r#type: 3, unit: 4 }
+}
+
+fn value_type_bytes(v: &ValueType) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::int64::encode(1, &v.r#type, &mut b);
+    encoding::int64::encode(2, &v.unit, &mut b);
+    b
+}
+
+fn label() -> Label {
+    Label {
+        key: 1,
+        str: 2,
+        num: -3,
+        num_unit: 4,
+    }
+}
+
+fn label_bytes(l: &Label) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::int64::encode(1, &l.key, &mut b);
+    encoding::int64::encode(2, &l.str, &mut b);
+    encoding::int64::encode(3, &l.num, &mut b);
+    encoding::int64::encode(4, &l.num_unit, &mut b);
+    b
+}
+
+fn sample() -> Sample {
+    Sample {
+        location_id: vec![1, 2, 300],
+        value: vec![5, -6],
+        label: vec![label()],
+    }
+}
+
+fn sample_bytes(s: &Sample) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::uint64::encode_packed(1, &s.location_id, &mut b);
+    encoding::int64::encode_packed(2, &s.value, &mut b);
+    encoding::message::encode_repeated(3, &s.label, &mut b);
+    b
+}
+
+fn mapping() -> Mapping {
+    Mapping {
+        id: 1,
+        memory_start: 4096,
+        memory_limit: 8192,
+        file_offset: 16,
+        filename: 5,
+        build_id: 6,
+        has_functions: true,
+        has_filenames: true,
+        has_line_numbers: true,
+        has_inline_frames: true,
+    }
+}
+
+fn mapping_bytes(m: &Mapping) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::uint64::encode(1, &m.id, &mut b);
+    encoding::uint64::encode(2, &m.memory_start, &mut b);
+    encoding::uint64::encode(3, &m.memory_limit, &mut b);
+    encoding::uint64::encode(4, &m.file_offset, &mut b);
+    encoding::int64::encode(5, &m.filename, &mut b);
+    encoding::int64::encode(6, &m.build_id, &mut b);
+    encoding::bool::encode(7, &m.has_functions, &mut b);
+    encoding::bool::encode(8, &m.has_filenames, &mut b);
+    encoding::bool::encode(9, &m.has_line_numbers, &mut b);
+    encoding::bool::encode(10, &m.has_inline_frames, &mut b);
+    b
+}
+
+fn line() -> Line {
+    Line {
+        function_id: 7,
+        line: 42,
+    }
+}
+
+fn line_bytes(l: &Line) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::uint64::encode(1, &l.function_id, &mut b);
+    encoding::int64::encode(2, &l.line, &mut b);
+    b
+}
+
+fn location() -> Location {
+    Location {
+        id: 2,
+        mapping_id: 1,
+        address: 77,
+        line: vec![line()],
+        is_folded: true,
+    }
+}
+
+fn location_bytes(l: &Location) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::uint64::encode(1, &l.id, &mut b);
+    encoding::uint64::encode(2, &l.mapping_id, &mut b);
+    encoding::uint64::encode(3, &l.address, &mut b);
+    encoding::message::encode_repeated(4, &l.line, &mut b);
+    encoding::bool::encode(5, &l.is_folded, &mut b);
+    b
+}
+
+fn function() -> Function {
+    Function {
+        id: 7,
+        name: 8,
+        system_name: 9,
+        filename: 10,
+        start_line: 11,
+    }
+}
+
+fn function_bytes(f: &Function) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::uint64::encode(1, &f.id, &mut b);
+    encoding::int64::encode(2, &f.name, &mut b);
+    encoding::int64::encode(3, &f.system_name, &mut b);
+    encoding::int64::encode(4, &f.filename, &mut b);
+    encoding::int64::encode(5, &f.start_line, &mut b);
+    b
+}
+
+fn profile() -> Profile {
+    Profile {
+        sample_type: vec![value_type()],
+        sample: vec![sample()],
+        mapping: vec![mapping()],
+        location: vec![location()],
+        function: vec![function()],
+        string_table: vec![String::new(), "cpu".to_string()],
+        drop_frames: 12,
+        keep_frames: 13,
+        time_nanos: 1_800_000_000_000_000_000,
+        duration_nanos: 10_000_000_000,
+        period_type: Some(ValueType { r#type: 1, unit: 2 }),
+        period: 100,
+        comment: vec![1, 2],
+        default_sample_type: 1,
+    }
+}
+
+fn profile_bytes(p: &Profile) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::message::encode_repeated(1, &p.sample_type, &mut b);
+    encoding::message::encode_repeated(2, &p.sample, &mut b);
+    encoding::message::encode_repeated(3, &p.mapping, &mut b);
+    encoding::message::encode_repeated(4, &p.location, &mut b);
+    encoding::message::encode_repeated(5, &p.function, &mut b);
+    encoding::string::encode_repeated(6, &p.string_table, &mut b);
+    encoding::int64::encode(7, &p.drop_frames, &mut b);
+    encoding::int64::encode(8, &p.keep_frames, &mut b);
+    encoding::int64::encode(9, &p.time_nanos, &mut b);
+    encoding::int64::encode(10, &p.duration_nanos, &mut b);
+    encoding::message::encode(11, p.period_type.as_ref().expect("set"), &mut b);
+    encoding::int64::encode(12, &p.period, &mut b);
+    encoding::int64::encode_packed(13, &p.comment, &mut b);
+    encoding::int64::encode(14, &p.default_sample_type, &mut b);
+    b
+}
+
+fn check<M: Message>(name: &str, value: &M, expected: Vec<u8>) {
+    assert_eq!(
+        value.encode_to_vec(),
+        expected,
+        "{name}: encoded bytes differ from the proto's tags"
+    );
+}
+
+#[test]
+fn every_field_encodes_under_the_proto_tag() {
+    let vt = value_type();
+    check("ValueType", &vt, value_type_bytes(&vt));
+    let l = label();
+    check("Label", &l, label_bytes(&l));
+    let s = sample();
+    check("Sample", &s, sample_bytes(&s));
+    let m = mapping();
+    check("Mapping", &m, mapping_bytes(&m));
+    let li = line();
+    check("Line", &li, line_bytes(&li));
+    let lo = location();
+    check("Location", &lo, location_bytes(&lo));
+    let f = function();
+    check("Function", &f, function_bytes(&f));
+    let p = profile();
+    check("Profile", &p, profile_bytes(&p));
+}
