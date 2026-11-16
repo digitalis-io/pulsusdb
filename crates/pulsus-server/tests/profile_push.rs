@@ -3,14 +3,8 @@
 //! batch of one push, pushes over loopback HTTP on both transports, and reads
 //! what was stored and what statements each push sent.
 //!
-//! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
-//!
-//! ```text
-//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:26.8.21.10
-//! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-server --test profile_push
-//! podman rm -f pulsus-ch-test
-//! ```
+//! Gated behind `PULSUS_TEST_CLICKHOUSE=1`, with `PULSUS_TEST_CH_HTTP_PORT`
+//! naming a ClickHouse server's HTTP port.
 
 #[path = "support/live_db.rs"]
 mod live_db;
