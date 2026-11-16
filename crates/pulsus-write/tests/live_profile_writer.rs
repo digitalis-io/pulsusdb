@@ -258,6 +258,7 @@ async fn one_push_is_one_landing_insert_filling_every_table() {
             decompressed_bytes: 1_000,
             id: None,
             annotations: Vec::new(),
+            language: None,
         }],
         now_ms,
     )

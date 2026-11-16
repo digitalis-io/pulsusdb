@@ -76,6 +76,9 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
+use opentelemetry_proto::tonic::collector::profiles::v1development::{
+    ExportProfilesServiceRequest, ExportProfilesServiceResponse,
+};
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
@@ -459,6 +462,121 @@ fn valid_otlp_traces_body() -> Vec<u8> {
     req.encode_to_vec()
 }
 
+/// The OTLP profiles route's valid request: the design's example, one CPU
+/// profile of two samples timed now.
+fn valid_otlp_profiles_request() -> ExportProfilesServiceRequest {
+    use opentelemetry_proto::tonic::common::v1::KeyValue;
+    use opentelemetry_proto::tonic::profiles::v1development::{
+        Function, KeyValueAndUnit, Line, Link, Location, Mapping, Profile, ProfilesDictionary,
+        ResourceProfiles, Sample, ScopeProfiles, Stack, ValueType,
+    };
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_nanos() as u64;
+    let line = |function_index| Location {
+        lines: vec![Line {
+            function_index,
+            ..Line::default()
+        }],
+        ..Location::default()
+    };
+    let kv = |key: &str, value: &str| KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(Value::StringValue(value.to_string())),
+        }),
+        ..KeyValue::default()
+    };
+    ExportProfilesServiceRequest {
+        dictionary: Some(ProfilesDictionary {
+            string_table: [
+                "",
+                "samples",
+                "count",
+                "cpu",
+                "nanoseconds",
+                "main.work",
+                "runtime.mallocgc",
+            ]
+            .map(String::from)
+            .to_vec(),
+            mapping_table: vec![Mapping::default()],
+            function_table: vec![
+                Function::default(),
+                Function {
+                    name_strindex: 5,
+                    ..Function::default()
+                },
+                Function {
+                    name_strindex: 6,
+                    ..Function::default()
+                },
+            ],
+            location_table: vec![Location::default(), line(1), line(2)],
+            stack_table: vec![
+                Stack::default(),
+                Stack {
+                    location_indices: vec![1],
+                },
+                Stack {
+                    location_indices: vec![2, 1],
+                },
+            ],
+            link_table: vec![
+                Link::default(),
+                Link {
+                    trace_id: vec![0xaa; 16],
+                    span_id: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                },
+            ],
+            attribute_table: vec![KeyValueAndUnit::default()],
+        }),
+        resource_profiles: vec![ResourceProfiles {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", "checkout"), kv("host.name", "h1")],
+                ..Resource::default()
+            }),
+            scope_profiles: vec![ScopeProfiles {
+                profiles: vec![Profile {
+                    sample_type: Some(ValueType {
+                        type_strindex: 1,
+                        unit_strindex: 2,
+                    }),
+                    period_type: Some(ValueType {
+                        type_strindex: 3,
+                        unit_strindex: 4,
+                    }),
+                    period: 10_000_000,
+                    time_unix_nano: now_ns,
+                    duration_nano: 10_000_000_000,
+                    samples: vec![
+                        Sample {
+                            stack_index: 1,
+                            values: vec![3],
+                            ..Sample::default()
+                        },
+                        Sample {
+                            stack_index: 2,
+                            values: vec![1],
+                            link_index: 1,
+                            ..Sample::default()
+                        },
+                    ],
+                    ..Profile::default()
+                }],
+                ..ScopeProfiles::default()
+            }],
+            ..ResourceProfiles::default()
+        }],
+    }
+}
+
+fn valid_otlp_profiles_body() -> Vec<u8> {
+    valid_otlp_profiles_request().encode_to_vec()
+}
+
 // OTLP/JSON (proto3-JSON) bodies for the content-negotiation cells (issue
 // #76). The SAME logical `Export*ServiceRequest` as the protobuf builders
 // above, serialized through `opentelemetry-proto`'s `with-serde` impls (hex
@@ -537,6 +655,10 @@ fn valid_otlp_traces_json_body() -> Vec<u8> {
         }],
     };
     serde_json::to_vec(&req).expect("serialize OTLP/JSON traces body")
+}
+
+fn valid_otlp_profiles_json_body() -> Vec<u8> {
+    serde_json::to_vec(&valid_otlp_profiles_request()).expect("serialize OTLP/JSON profiles body")
 }
 
 fn valid_remote_write_body() -> Vec<u8> {
@@ -1396,6 +1518,12 @@ fn assert_case_envelope(res: &RawResponse, expect: &ExpectedError, ctx: &str) {
                      rejection — the body ends in exactly one newline, got {:?}",
                     String::from_utf8_lossy(&res.body)
                 ),
+                PlainTextWriter::OtlpProfilesHttpError => assert!(
+                    res.body.ends_with(b"\n") && !res.body.ends_with(b"\n\n"),
+                    "{ctx}: the reference `http.Error`s an OTLP profiles body that \
+                     does not decode — the body ends in exactly one newline, got {:?}",
+                    String::from_utf8_lossy(&res.body)
+                ),
             }
         }
     }
@@ -2072,6 +2200,10 @@ fn assert_ingest_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str
         ExportTraceServiceResponse::decode(res.body.as_slice()).unwrap_or_else(|e| {
             panic!("{ctx}: success body must decode as ExportTraceServiceResponse: {e}")
         });
+    } else if spec.path == "/v1development/profiles" {
+        ExportProfilesServiceResponse::decode(res.body.as_slice()).unwrap_or_else(|e| {
+            panic!("{ctx}: success body must decode as ExportProfilesServiceResponse: {e}")
+        });
     } else {
         ExportMetricsServiceResponse::decode(res.body.as_slice()).unwrap_or_else(|e| {
             panic!("{ctx}: success body must decode as ExportMetricsServiceResponse: {e}")
@@ -2100,6 +2232,7 @@ fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
             "/v1/logs" => valid_otlp_logs_body(),
             "/v1/metrics" => valid_otlp_metrics_body(),
             "/v1/traces" => valid_otlp_traces_body(),
+            "/v1development/profiles" => valid_otlp_profiles_body(),
             "/api/v1/write" => valid_remote_write_body(),
             "/loki/api/v1/push" => valid_loki_push_body(),
             "/api/v2/spans" | "/tempo/spans" => valid_zipkin_body(),
@@ -2160,6 +2293,7 @@ fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
                 "/v1/logs" => valid_otlp_logs_json_body(),
                 "/v1/metrics" => valid_otlp_metrics_json_body(),
                 "/v1/traces" => valid_otlp_traces_json_body(),
+                "/v1development/profiles" => valid_otlp_profiles_json_body(),
                 other => panic!("no OTLP/JSON body builder registered for ingest route {other}"),
             }
         };
@@ -2195,17 +2329,31 @@ fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
             "{ctx}: a protobuf body under Content-Type: application/json is now undecodable-as-JSON \
              (the #76 conformance flip)"
         );
-        assert_eq!(
-            res.content_type(),
-            Some("application/x-protobuf"),
-            "{ctx}: OTLP error content-type"
-        );
-        let status = Status::decode(res.body.as_slice())
-            .unwrap_or_else(|e| panic!("{ctx}: invalid google.rpc.Status protobuf: {e}"));
-        assert_eq!(
-            status.code, 3,
-            "{ctx}: google.rpc.Status.code (INVALID_ARGUMENT)"
-        );
+        if spec.path == "/v1development/profiles" {
+            // The reference's plain text for a JSON body that does not decode.
+            assert_eq!(
+                res.content_type(),
+                Some("text/plain; charset=utf-8"),
+                "{ctx}: error content-type"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&res.body),
+                "Failed to parse JSON request\n",
+                "{ctx}"
+            );
+        } else {
+            assert_eq!(
+                res.content_type(),
+                Some("application/x-protobuf"),
+                "{ctx}: OTLP error content-type"
+            );
+            let status = Status::decode(res.body.as_slice())
+                .unwrap_or_else(|e| panic!("{ctx}: invalid google.rpc.Status protobuf: {e}"));
+            assert_eq!(
+                status.code, 3,
+                "{ctx}: google.rpc.Status.code (INVALID_ARGUMENT)"
+            );
+        }
     }
 
     let ctx = format!(
@@ -2486,6 +2634,7 @@ async fn all_mode_auth_on_perimeter() {
                 "/v1/logs" => valid_otlp_logs_body(),
                 "/v1/metrics" => valid_otlp_metrics_body(),
                 "/v1/traces" => valid_otlp_traces_body(),
+                "/v1development/profiles" => valid_otlp_profiles_body(),
                 "/api/v1/write" => valid_remote_write_body(),
                 "/loki/api/v1/push" => valid_loki_push_body(),
                 "/api/v2/spans" | "/tempo/spans" => valid_zipkin_body(),
@@ -2848,6 +2997,7 @@ async fn reader_only_mode_writer_routes_404() {
                     "/v1/logs" => valid_otlp_logs_body(),
                     "/v1/metrics" => valid_otlp_metrics_body(),
                     "/v1/traces" => valid_otlp_traces_body(),
+                    "/v1development/profiles" => valid_otlp_profiles_body(),
                     "/api/v1/write" => valid_remote_write_body(),
                     other => panic!("no valid-body builder for {other}"),
                 };

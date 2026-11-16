@@ -172,6 +172,9 @@ pub async fn run(config: Config) -> ExitCode {
         build: BuildInfo::from_build_env(),
         writer: Arc::new(WriterSink::new(Arc::clone(&writer_slot))),
         metric_writer: Arc::new(MetricWriterSink::new(Arc::clone(&metric_writer_slot))),
+        profile_writer: Arc::new(crate::ingest::ProfileWriterSink::new(Arc::new(
+            std::sync::OnceLock::new(),
+        ))),
         trace_writer: Arc::new(TraceWriterSink::new(Arc::clone(&trace_writer_slot))),
         label_cache: Arc::clone(&label_cache_slot),
         rollup_levels: Arc::clone(&rollup_levels_slot),
@@ -1155,6 +1158,9 @@ mod tests {
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(OnceLock::new()))),
+            profile_writer: Arc::new(crate::ingest::ProfileWriterSink::new(Arc::new(
+                std::sync::OnceLock::new(),
+            ))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(OnceLock::new()))),
             label_cache: Arc::new(OnceLock::new()),
             rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),

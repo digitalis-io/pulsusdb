@@ -50,6 +50,9 @@ pub struct ProfileInput {
     /// The push's profile id when it is a UUID, else `None`.
     pub id: Option<[u8; 16]>,
     pub annotations: Vec<(String, String)>,
+    /// The language the sender names for the profile, `None` when it names
+    /// none.
+    pub language: Option<String>,
 }
 
 /// The rows one push becomes. `stacks` and `locations` are distinct across

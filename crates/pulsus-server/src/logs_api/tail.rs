@@ -3130,6 +3130,9 @@ mod tests {
             metric_writer: Arc::new(crate::ingest::MetricWriterSink::new(Arc::new(
                 OnceLock::new(),
             ))),
+            profile_writer: Arc::new(crate::ingest::ProfileWriterSink::new(Arc::new(
+                std::sync::OnceLock::new(),
+            ))),
             trace_writer: Arc::new(crate::ingest::TraceWriterSink::new(Arc::new(
                 OnceLock::new(),
             ))),

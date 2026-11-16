@@ -1692,3 +1692,31 @@ fn over_budget_metrics_with_malformed_tail_defers_to_prost() {
         other => panic!("full decode must classify as prost Decode, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------
+
+/// A profiles request whose one profile holds `n` empty samples (`12 00`
+/// each).
+fn profiles_with_samples(n: usize) -> Vec<u8> {
+    let profile = empty_repeated(2, n);
+    let scope = ld(2, &profile);
+    let resource = ld(2, &scope);
+    ld(1, &resource)
+}
+
+/// **P1.** A profile's samples are counted on the wire: one past the
+/// per-profile cap is refused before decode, the cap itself is not.
+#[test]
+fn p1_profile_samples_per_level_cap() {
+    assert!(matches!(
+        prescan_profiles(&profiles_with_samples(1_000_001), false),
+        Err(LogsIngestError::OversizeMessage {
+            field: "samples",
+            limit: 1_000_000,
+            actual: 1_000_001,
+        })
+    ));
+    assert!(prescan_profiles(&profiles_with_samples(1_000_000), false).is_ok());
+}

@@ -149,6 +149,9 @@ mod tests {
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
+            profile_writer: Arc::new(crate::ingest::ProfileWriterSink::new(Arc::new(
+                std::sync::OnceLock::new(),
+            ))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
             rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),

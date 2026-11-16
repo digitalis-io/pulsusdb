@@ -52,6 +52,7 @@ pub(crate) struct AppState {
     pub(crate) writer: Arc<WriterSink>,
     pub(crate) metric_writer: Arc<MetricWriterSink>,
     pub(crate) trace_writer: Arc<TraceWriterSink>,
+    pub(crate) profile_writer: Arc<crate::ingest::ProfileWriterSink>,
     pub(crate) label_cache: Arc<OnceLock<Arc<LabelCache>>>,
     /// Issue #18 part B: the rollup levels the database holds, refreshed
     /// every 60 s by the level loop; empty until its first discovery.
@@ -251,6 +252,9 @@ mod tests {
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
+            profile_writer: Arc::new(crate::ingest::ProfileWriterSink::new(Arc::new(
+                std::sync::OnceLock::new(),
+            ))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
             rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
@@ -1012,7 +1016,7 @@ mod tests {
             .collect();
         let expected: std::collections::BTreeSet<&str> =
             ROUTE_TEMPLATES.iter().copied().chain([UNMATCHED]).collect();
-        assert_eq!(expected.len(), 93);
+        assert_eq!(expected.len(), 94);
         assert_eq!(seen, expected, "{s}");
     }
 

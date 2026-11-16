@@ -941,6 +941,7 @@ impl Push {
             decompressed_bytes,
             id,
             annotations,
+            language: _,
         } = src;
 
         // 1. service name, then sort.
@@ -1352,6 +1353,7 @@ mod tests {
             decompressed_bytes: 1000,
             id: None,
             annotations: Vec::new(),
+            language: None,
         }
     }
 

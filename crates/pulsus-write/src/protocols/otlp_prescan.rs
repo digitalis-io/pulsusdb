@@ -1366,5 +1366,10 @@ pub fn prescan_logs(body: &[u8]) -> Result<(), LogsIngestError> {
     walk(MsgType::ExportLogsServiceRequest, body)
 }
 
+/// Wire pre-scan for an OTLP profiles protobuf body.
+pub fn prescan_profiles(_body: &[u8], _header_less: bool) -> Result<(), LogsIngestError> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;

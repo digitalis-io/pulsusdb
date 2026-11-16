@@ -72,6 +72,15 @@ pub fn decompress(encoding: Encoding, body: &[u8]) -> Result<Vec<u8>, LogsIngest
     }
 }
 
+/// Decompresses `body` per `encoding`, refusing output over `cap` bytes.
+pub fn decompress_capped(
+    encoding: Encoding,
+    body: &[u8],
+    _cap: usize,
+) -> Result<Vec<u8>, LogsIngestError> {
+    decompress(encoding, body)
+}
+
 /// Reads `reader` to the end, capped at [`MAX_DECOMPRESSED_BYTES`] + 1
 /// bytes: gzip/zstd streams do not declare their decompressed size up
 /// front, so the only safe zip-bomb guard is bounding the read itself
@@ -243,6 +252,48 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// `decompress_capped` refuses output over its own cap, on every
+    /// encoding, naming that cap.
+    #[test]
+    fn decompress_capped_honours_its_cap() {
+        let data = vec![7u8; 1_001];
+        for (encoding, body) in [
+            (Encoding::Identity, data.clone()),
+            (Encoding::Gzip, gzip(&data)),
+            (Encoding::Zstd, zstd_compress(&data)),
+            (Encoding::Snappy, snappy(&data)),
+        ] {
+            let err = decompress_capped(encoding, &body, 1_000).unwrap_err();
+            assert!(
+                matches!(err, LogsIngestError::OversizeBody { limit: 1_000 }),
+                "{encoding:?}: {err:?}"
+            );
+            assert_eq!(
+                decompress_capped(encoding, &body, 1_001).unwrap(),
+                data,
+                "{encoding:?}"
+            );
+        }
+    }
+
+    /// A cap of `usize::MAX` is no cap, even past the fixed decompressed cap
+    /// the other routes keep: the bounded read adds one to the cap, and that
+    /// must not overflow.
+    #[test]
+    fn decompress_capped_takes_usize_max_as_no_cap() {
+        let data = vec![0u8; MAX_DECOMPRESSED_BYTES + 1];
+        for (encoding, body) in [
+            (Encoding::Identity, data.clone()),
+            (Encoding::Gzip, gzip(&data)),
+            (Encoding::Zstd, zstd_compress(&data)),
+            (Encoding::Snappy, snappy(&data)),
+        ] {
+            let out = decompress_capped(encoding, &body, usize::MAX)
+                .unwrap_or_else(|e| panic!("{encoding:?}: {e}"));
+            assert!(out == data, "{encoding:?}: {} bytes", out.len());
+        }
     }
 
     #[test]

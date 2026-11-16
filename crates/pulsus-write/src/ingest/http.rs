@@ -56,6 +56,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 use crate::error::LogsIngestError;
 use crate::ingest::decompress::{self, Encoding};
 use crate::ingest::metrics::MetricSink;
+use crate::ingest::profiles::ProfileSink;
 use crate::ingest::traces::ParsedTraceLanding;
 use crate::ingest::traces::TraceSink;
 use crate::ingest::{
@@ -338,6 +339,23 @@ pub async fn ingest_traces(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
         },
         Err(refusal) => otlp_refusal_response(refusal),
     }
+}
+
+/// `POST /v1development/profiles`.
+pub async fn ingest_otlp_profiles(
+    _sink: &dyn ProfileSink,
+    _headers: HeaderMap,
+    _body: Body,
+    _max_body_bytes: u64,
+) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
+    response
+}
+
+/// A byte count as the reference's byte humanizer writes it.
+pub fn humanize_bytes(_n: u64) -> String {
+    String::new()
 }
 
 /// This crate's own generic-`State` mount point for [`ingest_traces`] —

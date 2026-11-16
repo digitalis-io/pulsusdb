@@ -33,7 +33,8 @@ use pulsus_write::writer::{
 };
 use pulsus_write::{
     AdmitRefusal, FlushWait, LogSink, LogWriter, MetricSink, MetricWriter, ParsedLogs,
-    ParsedMetrics, ParsedTraceLanding, PushHeaders, TraceSink, TraceWriter,
+    ParsedMetrics, ParsedProfileLanding, ParsedTraceLanding, ProfileSink, ProfileWriter,
+    PushHeaders, TraceSink, TraceWriter,
 };
 
 use crate::app::AppState;
@@ -236,6 +237,71 @@ impl TraceSink for TraceWriterSink {
         &self,
         tenant: &Tenant,
         landing: ParsedTraceLanding,
+        push: PushHeaders,
+    ) -> Result<FlushWait, AdmitRefusal> {
+        match self.slot.get() {
+            Some(writer) => writer.admit_flush(tenant, landing, push),
+            None => Err(AdmitRefusal::Backpressure),
+        }
+    }
+}
+
+/// [`TraceWriterSink`]'s profiles counterpart: adapts
+/// `Arc<OnceLock<Arc<ProfileWriter>>>` to [`ProfileSink`], same
+/// "backpressure while empty" contract.
+pub(crate) struct ProfileWriterSink {
+    slot: Arc<OnceLock<Arc<ProfileWriter>>>,
+    /// Test-only snapshot seam; see [`WriterSink`].
+    #[cfg(test)]
+    metrics_override: Option<TraceWriterMetricsSnapshot>,
+}
+
+impl ProfileWriterSink {
+    pub(crate) fn new(slot: Arc<OnceLock<Arc<ProfileWriter>>>) -> Self {
+        ProfileWriterSink {
+            slot,
+            #[cfg(test)]
+            metrics_override: None,
+        }
+    }
+
+    /// Test-only constructor seeding [`ProfileWriterSink::metrics`].
+    #[cfg(test)]
+    pub(crate) fn with_metrics_snapshot(snap: TraceWriterMetricsSnapshot) -> Self {
+        ProfileWriterSink {
+            slot: Arc::new(OnceLock::new()),
+            metrics_override: Some(snap),
+        }
+    }
+
+    /// The profile writer's ingest-metrics snapshot, else `None` on an
+    /// empty slot. See [`WriterSink::metrics`].
+    pub(crate) fn metrics(&self) -> Option<TraceWriterMetricsSnapshot> {
+        #[cfg(test)]
+        if let Some(snap) = self.metrics_override {
+            return Some(snap);
+        }
+        self.slot.get().map(|w| w.metrics())
+    }
+}
+
+impl ProfileSink for ProfileWriterSink {
+    fn admit(
+        &self,
+        tenant: &Tenant,
+        landing: ParsedProfileLanding,
+        push: PushHeaders,
+    ) -> Result<(), AdmitRefusal> {
+        match self.slot.get() {
+            Some(writer) => writer.admit(tenant, landing, push),
+            None => Err(AdmitRefusal::Backpressure),
+        }
+    }
+
+    fn admit_flush(
+        &self,
+        tenant: &Tenant,
+        landing: ParsedProfileLanding,
         push: PushHeaders,
     ) -> Result<FlushWait, AdmitRefusal> {
         match self.slot.get() {
