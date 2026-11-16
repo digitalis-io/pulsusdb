@@ -857,6 +857,171 @@ fn spooling_a_trace_block_holds_no_copy_of_the_push() {
     });
 }
 
+// -- the profiles half (issue #814 part B) ---------------------------------
+
+/// One distinct stack of 1,000 frames whose names total `bytes`, under one
+/// series, one entry and one sample: the kind-1 row whose arrays grow with
+/// the push.
+fn wide_stack_profile_push(bytes: usize) -> pulsus_write::ParsedProfileLanding {
+    use pulsus_write::ingest::profiles::{
+        LandingEntry, LandingSample, LandingSeries, LandingStack,
+    };
+
+    const FRAMES: usize = 1_000;
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is past the epoch")
+        .as_nanos() as i64;
+    pulsus_write::ParsedProfileLanding {
+        series: vec![LandingSeries {
+            type_id: Arc::from("process_cpu:cpu:nanoseconds:cpu:nanoseconds"),
+            service: Arc::from("checkout"),
+            fingerprint: Fingerprint::from_raw(7),
+            timestamp_ns: now_ns,
+            time_defaulted: false,
+            labels: "{}".to_string(),
+        }],
+        entries: vec![LandingEntry {
+            series: 0,
+            input: 0,
+            profile_id: None,
+            total: 1,
+            duration_ns: 1,
+            annotation_keys: Vec::new(),
+            annotation_values: Vec::new(),
+        }],
+        samples: vec![LandingSample {
+            entry: 0,
+            stack_id: 1,
+            value: 1,
+            span_id: 0,
+            trace_id: [0; 16],
+        }],
+        stacks: vec![LandingStack {
+            stack_id: 1,
+            node_ids: (0..FRAMES as u128).collect(),
+            names: (0..FRAMES)
+                .map(|i| Arc::from(format!("{i:06}{}", long_text(bytes / FRAMES))))
+                .collect(),
+            location_ids: (0..FRAMES as u128).collect(),
+        }],
+        locations: Vec::new(),
+    }
+}
+
+/// [`peak_over_trace_push`]'s profiles twin.
+async fn peak_over_profile_push(
+    landed: pulsus_write::ParsedProfileLanding,
+    poison: bool,
+) -> Measured {
+    use pulsus_write::ProfileSink;
+    use pulsus_write::writer::{ProfileWriter, ProfileWriterTables};
+
+    let root = spool_root(if poison {
+        "profile-poison"
+    } else {
+        "profile-commit"
+    });
+    let mut runtime = WriterRuntime::from_config(&WriterConfig {
+        profile_landing_inserters: 1,
+        profile_landing_retries: 0,
+        batch_bytes: pulsus_config::ByteSize(1024 * 1024 * 1024),
+        ingest_queue_bytes: pulsus_config::ByteSize(1024 * 1024 * 1024),
+        ..Default::default()
+    });
+    runtime.spool_dir = root.clone();
+    let writer = ProfileWriter::with_inserters_and_runtime(
+        Arc::new(FixedInserter { poison }),
+        runtime,
+        ProfileWriterTables::profiles_default(),
+    );
+    let peak = peak_bytes_of(async {
+        let wait = writer
+            .admit_flush(&no_tenant(), landed, PushHeaders::default())
+            .expect("the queue has room");
+        let answer = tokio::time::timeout(Duration::from_secs(60), wait)
+            .await
+            .expect("the landing block settles");
+        assert_eq!(answer.is_err(), poison, "{answer:?}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while spooled_of(&root, "profile_landing").len() < usize::from(poison) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the poisoned landing block never reached the spool"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+
+    let documents = spooled_of(&root, "profile_landing");
+    assert_eq!(
+        documents.len(),
+        usize::from(poison),
+        "the poisoned block is on disk and the committed one is not"
+    );
+    let spooled_bytes = documents.iter().sum();
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+    Measured {
+        peak,
+        spooled_bytes,
+    }
+}
+
+/// **W11: spooling a profile landing block holds no copy of the push.** A
+/// stack row's frame names grow with the push. The default encoder builds a
+/// `serde_json::Value` of the row, a copy of every name, before writing it;
+/// the override writes the names straight into the sink, so its overhead
+/// stays fixed as the stack widens. **Keeping the default encoder reddens
+/// both assertions.**
+#[test]
+fn spooling_a_profile_block_holds_no_copy_of_the_push() {
+    let _measuring = MEASURE.lock().expect("the measurement mutex is poisoned");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("build a current-thread runtime");
+
+    runtime.block_on(async {
+        // Warm-up, so no measured window pays a one-time cost.
+        let _ = peak_over_profile_push(wide_stack_profile_push(1_000), true).await;
+        let _ = peak_over_profile_push(wide_stack_profile_push(1_000), false).await;
+
+        let mut extras = Vec::new();
+        for (label, bytes) in [("S", STRING_BYTES), ("4S", STRING_BYTES_4X)] {
+            let commit = peak_over_profile_push(wide_stack_profile_push(bytes), false)
+                .await
+                .peak;
+            let spooled = peak_over_profile_push(wide_stack_profile_push(bytes), true).await;
+            let extra = spooled.peak.saturating_sub(commit);
+            assert!(
+                spooled.spooled_bytes > 4 * SPOOL_CHUNK_BYTES as u64,
+                "the {label} case must cross the {SPOOL_CHUNK_BYTES} byte chunk \
+                 boundary several times over: its document is {} bytes",
+                spooled.spooled_bytes
+            );
+            assert!(
+                extra <= SPOOL_CEILING_BYTES,
+                "spooling one stack of 1000 frames whose names total {bytes} \
+                 bytes ({label}) held {extra} bytes more than committing it, \
+                 over the ceiling {SPOOL_CEILING_BYTES}: the encoder holds a \
+                 copy of the row's arrays (commit peak {commit}, spool peak {})",
+                spooled.peak
+            );
+            extras.push(extra);
+        }
+        let (short, long) = (extras[0], extras[1]);
+        assert!(
+            long.abs_diff(short) <= WIDTH_SLACK_BYTES,
+            "four times the frame text moved the spool path's overhead by {} \
+             bytes ({short} at {STRING_BYTES} bytes, {long} at \
+             {STRING_BYTES_4X}): it must stay fixed as the stack widens",
+            long.abs_diff(short)
+        );
+    });
+}
+
 /// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
 #[allow(dead_code)]
 fn no_tenant() -> pulsus_model::Tenant {

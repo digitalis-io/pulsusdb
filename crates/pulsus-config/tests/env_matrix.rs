@@ -333,6 +333,21 @@ const ROWS: &[Row] = &[
         check: |c| c.writer.trace_landing_max_rows == 2_000_000,
     },
     Row {
+        var: "PULSUS_PROFILE_LANDING_RETRIES",
+        value: "5",
+        check: |c| c.writer.profile_landing_retries == 5,
+    },
+    Row {
+        var: "PULSUS_PROFILE_LANDING_INSERTERS",
+        value: "8",
+        check: |c| c.writer.profile_landing_inserters == 8,
+    },
+    Row {
+        var: "PULSUS_PROFILE_LANDING_MAX_ROWS",
+        value: "2000000",
+        check: |c| c.writer.profile_landing_max_rows == 2_000_000,
+    },
+    Row {
         var: "PULSUS_LANDING_BATCH_MS",
         value: "250",
         check: |c| c.writer.landing_batch_ms == 250,

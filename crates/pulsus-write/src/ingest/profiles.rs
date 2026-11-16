@@ -1,6 +1,7 @@
 //! The seam between the pprof model (`crate::protocols::profile_model`) and
-//! the profile writer: the input a receiver hands the model, and the rows the
-//! model returns. Pure data, no I/O — the traces split (`ingest/traces.rs`).
+//! the profile writer: the input a receiver hands the model, the rows the
+//! model returns, and [`ProfileSink`], which takes them. Pure data and a
+//! trait, no I/O — the traces split (`ingest/traces.rs`).
 //!
 //! One [`ParsedProfileLanding`] is one push. Every row kind is a vector, and
 //! rows name each other by position: an entry names its series, a sample its
@@ -8,8 +9,35 @@
 
 use std::sync::Arc;
 
-use pulsus_model::Fingerprint;
+use pulsus_model::{Fingerprint, Tenant};
 use pulsus_profiles_wire::google_v1::Profile;
+
+use crate::ingest::{AdmitRefusal, FlushWait, PushHeaders};
+
+/// The boundary a profiles receiver hands a parsed push across, the shape of
+/// [`crate::ingest::traces::TraceSink`]: admission only. `landing` is parsed
+/// in the receiver, so a [`ProfileRefusal`] leaves through the route's own
+/// error writer. `tenant` is the request's `X-Scope-OrgID`.
+pub trait ProfileSink: Send + Sync {
+    /// Admits `landing` for async-mode requests: the caller responds once
+    /// this returns `Ok`.
+    fn admit(
+        &self,
+        tenant: &Tenant,
+        landing: ParsedProfileLanding,
+        push: PushHeaders,
+    ) -> Result<(), AdmitRefusal>;
+
+    /// Admits `landing` for sync-mode requests: the returned [`FlushWait`]
+    /// resolves once the landing insert has committed or failed. For a
+    /// suppressed push it resolves to the original push's outcome.
+    fn admit_flush(
+        &self,
+        tenant: &Tenant,
+        landing: ParsedProfileLanding,
+        push: PushHeaders,
+    ) -> Result<FlushWait, AdmitRefusal>;
+}
 
 /// One profile of a push, as a receiver decoded it.
 #[derive(Debug, Clone, PartialEq)]

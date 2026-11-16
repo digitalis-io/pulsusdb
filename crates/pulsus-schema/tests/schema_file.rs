@@ -3801,21 +3801,22 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
         ..clustered()
     };
     // The digests moved with issue #813, which adds the six profile tables,
-    // their four wrappers and five views.
+    // their four wrappers and five views, and with issue #814, which gives
+    // `profile_landing`'s ten upload columns a `DEFAULT`.
     let cases = [
         (
             "single-node",
             vec![],
             vec!["--mode", "single"],
             single(),
-            "ec0cdd85dda2b77ed36c78ff05d6d8ab8eccbf37d943a45e9cf990f642a65b9d",
+            "0fa35c6e8deccbf9702a3b067d90f6539049d89bb6fe75df3174103aa71c2157",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "2c9dc227bcf5c5c01355732348812bd29f1cfaa96bbc3fd98b3b397a8efa334c",
+            "7617e94d52ff561b63d6efb5d75e5d986f7de7c70598c1d9b34560daa1731ef2",
         ),
         (
             "clustered with a storage policy",
@@ -3825,7 +3826,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "f102203400c986b8dbe45a9d8af0405bc2c97f2ac18da7e260675c37862088e4",
+            "d166858d3524a2f3861c8222590b5fa3ebe54e1d0f375283c7407e2f26c377c6",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
@@ -6776,4 +6777,61 @@ fn the_documents_say_how_a_log_or_trace_push_is_batched() {
         first_text, flat,
         "the drawing's first text line is the banner"
     );
+}
+
+/// **S-D (issue #814 part B): in `profile_landing`, exactly the ten upload
+/// columns carry a `DEFAULT`**, each the expression below, in both modes.
+/// The profile writer's row leaves those ten out, and the client refuses a
+/// struct that leaves out a column with no default, so a missing one refuses
+/// every profile insert.
+#[test]
+fn the_profile_landing_upload_columns_carry_defaults() {
+    let want: [(&str, &str); 10] = [
+        (
+            "upload_id",
+            "DEFAULT toUUID('00000000-0000-0000-0000-000000000000')",
+        ),
+        ("upload_name", "DEFAULT ''"),
+        ("uploaded_at", "DEFAULT 0"),
+        ("type_ordinal", "DEFAULT 0"),
+        ("is_type", "DEFAULT 0"),
+        ("upload_format", "DEFAULT ''"),
+        ("display_name", "DEFAULT ''"),
+        ("spy_name", "DEFAULT ''"),
+        ("sample_rate", "DEFAULT 0"),
+        ("units", "DEFAULT ''"),
+    ];
+    for (what, ctx) in [("single-node", single()), ("clustered", clustered())] {
+        let stmts = rendered_statements(&ctx);
+        let create = stmts
+            .iter()
+            .find(|s| {
+                s.trim_start()
+                    .starts_with("CREATE TABLE IF NOT EXISTS pulsus.profile_landing")
+                    && s.contains("received_ms Int64")
+            })
+            .unwrap_or_else(|| panic!("{what}: no profile_landing table"));
+        let defaulted: Vec<(String, String)> = create
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains(" DEFAULT "))
+            .map(|l| {
+                let name = l.split_whitespace().next().unwrap_or("").to_string();
+                let from = l.find("DEFAULT ").expect("contains DEFAULT");
+                let rest = &l[from..];
+                let end = rest
+                    .find(" CODEC(")
+                    .unwrap_or_else(|| rest.trim_end_matches(',').len());
+                (name, rest[..end].to_string())
+            })
+            .collect();
+        let want: Vec<(String, String)> = want
+            .iter()
+            .map(|(n, d)| (n.to_string(), d.to_string()))
+            .collect();
+        assert_eq!(
+            defaulted, want,
+            "{what}: the columns of profile_landing that carry a DEFAULT"
+        );
+    }
 }

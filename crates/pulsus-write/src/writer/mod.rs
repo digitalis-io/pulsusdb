@@ -21,6 +21,7 @@ mod landing;
 mod log;
 mod metric;
 mod metrics;
+mod profile;
 mod push_dedup;
 mod registration;
 pub(crate) mod rows;
@@ -45,17 +46,18 @@ pub use metrics::{
     MetricWriterMetrics, MetricWriterMetricsSnapshot, TableMetricsSnapshot, TraceWriterMetrics,
     TraceWriterMetricsSnapshot, WriterMetrics, WriterMetricsSnapshot,
 };
+pub use profile::{ProfileWriter, ProfileWriterTables};
 pub use push_dedup::{
     Admission, Capacities, ClaimGuard, ClaimOutcome, DedupMetrics, DedupMetricsSnapshot, PushDedup,
     PushDigest, PushIdentity, TargetOutcome, WaitGuard, WaitMode, index_bytes, log_identity,
-    metric_identity, plan_capacities, trace_identity,
+    metric_identity, plan_capacities, profile_identity, trace_identity,
 };
 pub use registration::{SeriesLru, StreamLru};
 pub use rows::{
     LANDING_ROW_SLOT_BYTES, LOG_LANDING_ROW_SLOT_BYTES, LogLandingRow, LogPatternRow, LogSampleRow,
     LogStreamRow, MetricHistSampleRow, MetricLandingRow, MetricMetadataRow, MetricSampleRow,
-    MetricSeriesRow, TRACE_LANDING_ROW_SLOT_BYTES, TraceEventTuple, TraceLandingRow,
-    TraceLinkTuple,
+    MetricSeriesRow, PROFILE_LANDING_ROW_SLOT_BYTES, ProfileLandingRow,
+    TRACE_LANDING_ROW_SLOT_BYTES, TraceEventTuple, TraceLandingRow, TraceLinkTuple,
 };
 pub use spool::SPOOL_CHUNK_BYTES;
 pub use table::{BlockInserter, ChBlockInserter};

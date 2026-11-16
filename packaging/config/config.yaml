@@ -88,6 +88,9 @@ clickhouse:
   #trace_landing_retries: 3       # resends of a failed traces landing insert
   #trace_landing_inserters: 4     # insert workers on the traces landing queue
   #trace_landing_max_rows: 1048576     # per-push landing row ceiling
+  #profile_landing_retries: 3     # resends of a failed profiles landing insert
+  #profile_landing_inserters: 4   # insert workers on the profiles landing queue
+  #profile_landing_max_rows: 1048576   # per-push landing row ceiling
   #landing_batch_ms: 1000        # log and trace batch window; 0 sends every push alone
 
 #reader:

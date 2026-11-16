@@ -1704,4 +1704,137 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// **W11, the shape half.** Each PROFILES landing row kind streams the
+    /// shape that kind declares, with ids above `u64::MAX` as decimal text.
+    /// Like its trace twin it cannot see a missing override; the memory half
+    /// in `tests/spool_stream_alloc.rs` does.
+    #[tokio::test]
+    async fn every_profile_landing_row_kind_streams_the_shape_it_declares() {
+        use crate::ingest::profiles::{
+            LandingEntry, LandingLocation, LandingSample, LandingSeries, LandingStack,
+        };
+        use crate::writer::rows::{ProfileLandingRow, ProfileSeriesColumns};
+        use std::sync::Arc;
+
+        let big: u128 = u128::MAX - 5;
+        let org: Arc<str> = Arc::from("t1");
+        let long: Arc<str> = Arc::from("y".repeat(STRING_PAST_CHUNK));
+        let series = LandingSeries {
+            type_id: Arc::from("process_cpu:cpu:nanoseconds:cpu:nanoseconds"),
+            service: Arc::from("checkout"),
+            fingerprint: Fingerprint::from_raw(big),
+            timestamp_ns: 1_700_000_000_000_000_000,
+            time_defaulted: false,
+            labels: "{\"service_name\":\"checkout\"}".to_string(),
+        };
+        let cols = ProfileSeriesColumns::of(&series);
+        let id = (0x0001_0203_0405_0607, 0x8809_0a0b_0c0d_0e0f);
+        let rows = vec![
+            (
+                "sample",
+                ProfileLandingRow::sample(
+                    &org,
+                    7,
+                    &cols,
+                    LandingSample {
+                        entry: 0,
+                        stack_id: big,
+                        value: -3,
+                        span_id: 9,
+                        trace_id: [0xab; 16],
+                    },
+                    id,
+                ),
+            ),
+            (
+                "stack",
+                ProfileLandingRow::stack(
+                    &org,
+                    7,
+                    LandingStack {
+                        stack_id: big,
+                        node_ids: vec![big, 1],
+                        names: vec![Arc::clone(&long), Arc::from("main")],
+                        location_ids: vec![big - 1, 2],
+                    },
+                ),
+            ),
+            ("series", ProfileLandingRow::series(&org, 7, series.clone())),
+            (
+                "entry",
+                ProfileLandingRow::entry(
+                    &org,
+                    7,
+                    &cols,
+                    LandingEntry {
+                        series: 0,
+                        input: 0,
+                        profile_id: None,
+                        total: 40,
+                        duration_ns: 10,
+                        annotation_keys: vec!["k".to_string()],
+                        annotation_values: vec!["\"v\"\n".to_string()],
+                    },
+                    id,
+                ),
+            ),
+            (
+                "location",
+                ProfileLandingRow::location(
+                    &org,
+                    7,
+                    LandingLocation {
+                        location_id: big,
+                        mapping_file: Arc::clone(&long),
+                        mapping_build_id: Arc::from("abc"),
+                        mapping_start: 1,
+                        mapping_limit: 2,
+                        mapping_offset: 3,
+                        address: u64::MAX,
+                        line_functions: vec![Arc::from("f")],
+                        line_system_names: vec![Arc::from("f_sys")],
+                        line_files: vec![Arc::from("main.go")],
+                        line_start_lines: vec![1],
+                        line_numbers: vec![-2],
+                    },
+                ),
+            ),
+        ];
+        let dir = tempdir();
+        for (name, row) in rows {
+            let path = dir.join(format!("{name}.json"));
+            let whole = serde_json::to_vec(&SpoolRecord {
+                table: "profile_landing",
+                error: "boom",
+                spooled_at_ns: 1_700_000_000_123_456_789,
+                rows: vec![row.to_spool_value()],
+            })
+            .expect("the record serializes");
+            write_record(
+                &path,
+                "profile_landing",
+                "boom",
+                1_700_000_000_123_456_789,
+                &[row],
+            )
+            .await
+            .expect("the document is written");
+            let streamed = std::fs::read(&path).expect("read the document back");
+            let text = String::from_utf8(streamed).expect("the document is UTF-8");
+            assert_eq!(
+                text,
+                String::from_utf8(whole).expect("the record is UTF-8"),
+                "the streamed {name} row is not the shape it declares"
+            );
+            if name != "series" {
+                assert!(
+                    text.contains(&format!("\"{big}\"")),
+                    "the {name} row's 128-bit id is decimal text: {}",
+                    &text[..text.len().min(400)]
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -190,6 +190,15 @@ impl LandingRow for crate::writer::rows::TraceLandingRow {
     }
 }
 
+impl LandingRow for crate::writer::rows::ProfileLandingRow {
+    fn received_ms(&self) -> i64 {
+        self.received_ms
+    }
+    fn set_received_ms(&mut self, received_ms: i64) {
+        crate::writer::rows::ProfileLandingRow::set_received_ms(self, received_ms);
+    }
+}
+
 impl LandingRow for crate::writer::rows::MetricLandingRow {
     fn received_ms(&self) -> i64 {
         self.received_ms

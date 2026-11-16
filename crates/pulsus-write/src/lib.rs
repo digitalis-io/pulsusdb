@@ -15,7 +15,7 @@ pub use ingest::metrics::{
     ExemplarPoint, HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics,
     SeriesRef,
 };
-pub use ingest::profiles::{ParsedProfileLanding, ProfileInput, ProfileRefusal};
+pub use ingest::profiles::{ParsedProfileLanding, ProfileInput, ProfileRefusal, ProfileSink};
 pub use ingest::traces::{
     LandingEvent, LandingLink, LandingResource, LandingSpan, LandingTagName, LandingTagValue,
     ParsedTraceLanding, TagScope, TraceSink,
@@ -47,11 +47,13 @@ pub use protocols::zipkin::{
 pub use writer::{
     Admission, Capacities, ClaimGuard, ClaimOutcome, DedupMetricsSnapshot, LANDING_ROW_SLOT_BYTES,
     LogPatternRow, LogWriter, MetricHistSampleRow, MetricLandingRow, MetricMetadataRow,
-    MetricSampleRow, MetricSeriesRow, MetricWriter, MetricWriterTables, PushDedup, PushDigest,
-    PushIdentity, TRACE_LANDING_ROW_SLOT_BYTES, TargetOutcome, TraceEventTuple, TraceJson,
-    TraceJsonEntry, TraceJsonScalar, TraceJsonValue, TraceLandingRow, TraceLinkTuple, TraceWriter,
-    TraceWriterTables, WaitGuard, WaitMode, WriteError, WriterTables, escape_json_path,
-    index_bytes, log_identity, metric_identity, plan_capacities, trace_identity,
+    MetricSampleRow, MetricSeriesRow, MetricWriter, MetricWriterTables,
+    PROFILE_LANDING_ROW_SLOT_BYTES, ProfileLandingRow, ProfileWriter, ProfileWriterTables,
+    PushDedup, PushDigest, PushIdentity, TRACE_LANDING_ROW_SLOT_BYTES, TargetOutcome,
+    TraceEventTuple, TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue, TraceLandingRow,
+    TraceLinkTuple, TraceWriter, TraceWriterTables, WaitGuard, WaitMode, WriteError, WriterTables,
+    escape_json_path, index_bytes, log_identity, metric_identity, plan_capacities,
+    profile_identity, trace_identity,
 };
 
 #[cfg(test)]
