@@ -839,3 +839,107 @@ async fn j2_an_old_json_key() {
     assert_eq!(a.status, StatusCode::OK, "{:?}", a.text());
     assert_eq!(mock.count(), 0);
 }
+
+/// **J4.** An attribute value given as a string-table index is resolved
+/// against the dictionary on OTLP/JSON as on protobuf: the resource's
+/// `service.name` and a sample's label both arrive as `stringValueStrindex`
+/// and both are stored.
+#[tokio::test]
+async fn j4_string_table_values_are_resolved_on_json() {
+    let time = now_ns();
+    let strings = [
+        "",
+        "samples",
+        "count",
+        "cpu",
+        "nanoseconds",
+        "main.work",
+        "runtime.mallocgc",
+        "checkout",
+        "region",
+        "eu",
+        "service.name",
+    ];
+    let indexed = |i: i32| AnyValue {
+        value: Some(Value::StringValueStrindex(i)),
+    };
+    let mut proto = r_at(time);
+    let dict = proto.dictionary.as_mut().expect("a dictionary");
+    dict.string_table = st(&strings);
+    dict.attribute_table.push(KeyValueAndUnit {
+        key_strindex: 8,
+        value: Some(indexed(9)),
+        unit_strindex: 0,
+    });
+    proto.resource_profiles[0].resource = Some(Resource {
+        attributes: vec![KeyValue {
+            key: "service.name".to_owned(),
+            value: Some(indexed(7)),
+            ..KeyValue::default()
+        }],
+        ..Resource::default()
+    });
+    proto.resource_profiles[0].scope_profiles[0].profiles[0].samples[0].attribute_indices = vec![1];
+
+    let table: Vec<String> = strings.iter().map(|s| format!("\"{s}\"")).collect();
+    let json = format!(
+        r#"{{
+  "resourceProfiles": [{{
+    "resource": {{"attributes": [{{"key": "service.name", "value": {{"stringValueStrindex": 7}}}}]}},
+    "scopeProfiles": [{{"profiles": [{{
+      "sampleType": {{"typeStrindex": 1, "unitStrindex": 2}},
+      "periodType": {{"typeStrindex": 3, "unitStrindex": 4}},
+      "period": "10000000",
+      "timeUnixNano": "{time}",
+      "durationNano": "10000000000",
+      "profileId": "{profile_id}",
+      "samples": [
+        {{"stackIndex": 1, "values": ["3"], "attributeIndices": [1]}},
+        {{"stackIndex": 2, "values": ["1"], "linkIndex": 1}}
+      ]
+    }}]}}]
+  }}],
+  "dictionary": {{
+    "stringTable": [{table}],
+    "mappingTable": [{{}}],
+    "functionTable": [{{}}, {{"nameStrindex": 5}}, {{"nameStrindex": 6}}],
+    "locationTable": [{{}}, {{"lines": [{{"functionIndex": 1}}]}}, {{"lines": [{{"functionIndex": 2}}]}}],
+    "stackTable": [{{}}, {{"locationIndices": [1]}}, {{"locationIndices": [2, 1]}}],
+    "linkTable": [{{}}, {{"traceId": "{trace_id}", "spanId": "0102030405060708"}}],
+    "attributeTable": [{{}}, {{"keyStrindex": 8, "value": {{"stringValueStrindex": 9}}}}]
+  }}
+}}"#,
+        table = table.join(", "),
+        profile_id = hex(&P),
+        trace_id = hex(&[0xaa; 16]),
+    );
+
+    let mock = Mock::default();
+    let a = send(&mock, &[], proto.encode_to_vec()).await;
+    assert_eq!(a.status, StatusCode::OK, "{:?}", a.text());
+    let a = send(
+        &mock,
+        &[("content-type", "application/json")],
+        json.into_bytes(),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::OK, "{:?}", a.text());
+    let landings = mock.landings();
+    assert_eq!(landings.len(), 2);
+    for (name, landing) in ["protobuf", "JSON"].iter().zip(&landings) {
+        let services: Vec<&str> = landing.series.iter().map(|s| &*s.service).collect();
+        assert!(
+            services.iter().all(|s| *s == "checkout"),
+            "{name}: {services:?}"
+        );
+        assert!(
+            landing
+                .series
+                .iter()
+                .any(|s| s.labels.contains(r#""region":"eu""#)),
+            "{name}: {:?}",
+            landing.series
+        );
+    }
+    assert_eq!(landings[0], landings[1]);
+}

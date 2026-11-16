@@ -260,12 +260,16 @@ fn m2_a_resource_without_a_service_is_unknown_service() {
         vec![string_kv("process.executable.name", "x")],
         profile(time),
     );
-    assert_eq!(
-        &*parse(&with_exe, now).series[0].service,
-        "unknown_service:x"
-    );
+    let services = |req: &ExportProfilesServiceRequest| -> Vec<String> {
+        parse(req, now)
+            .series
+            .iter()
+            .map(|s| s.service.to_string())
+            .collect()
+    };
+    assert_eq!(services(&with_exe), ["unknown_service:x"]);
     let bare = request(dictionary(), Vec::new(), profile(time));
-    assert_eq!(&*parse(&bare, now).series[0].service, "unknown_service");
+    assert_eq!(services(&bare), ["unknown_service"]);
 }
 
 /// A dictionary whose attribute table holds `service.name` = `a` (1) and
