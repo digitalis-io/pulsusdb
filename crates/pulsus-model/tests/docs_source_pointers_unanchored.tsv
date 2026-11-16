@@ -675,7 +675,6 @@ docs/features.md	pkg/validation/limits.go:371	pinned_to_another_version
 docs/features.md	syntax/extractor.go:46-47	not_in_this_repository
 docs/features.md	tempodb/encoding/vparquet4/nested_set_model.go:11-12	pinned_to_another_version
 docs/features.md	tempodb/encoding/vparquet4/nested_set_model.go:57	pinned_to_another_version
-docs/promql_rollups/reading.md	docs/api.md:1005	no_name_the_target_file_holds
 docs/query-lowering.md	../crates/pulsus-read/src/traces/filter.rs:2732	not_in_this_repository
 docs/query-lowering.md	../crates/pulsus-read/src/traces/metrics_sql.rs:209	not_in_this_repository
 docs/query-lowering.md	../crates/pulsus-read/src/traces/metrics_sql.rs:361	not_in_this_repository
