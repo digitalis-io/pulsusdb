@@ -405,6 +405,21 @@ pub struct WriterConfig {
     /// fits one block; the same figure is pinned as the insert's own
     /// `max_insert_block_size`. Accepted range `1000..=10000000`.
     pub trace_landing_max_rows: u64,
+    /// `PULSUS_PROFILE_LANDING_RETRIES`: how many times the writer resends a
+    /// failed profiles landing insert. The wall-clock bound on the whole loop
+    /// is the landing budget, not this count — whichever binds first ends
+    /// it. Accepted range `0..=10`.
+    pub profile_landing_retries: u32,
+    /// `PULSUS_PROFILE_LANDING_INSERTERS`: how many insert workers take
+    /// blocks off the profiles landing queue, so how many landing inserts
+    /// can be in flight at once. Accepted range `1..=64`.
+    pub profile_landing_inserters: u32,
+    /// `PULSUS_PROFILE_LANDING_MAX_ROWS`: the per-push landing row ceiling,
+    /// counted over all five landed kinds. A push at or above it is refused
+    /// whole, never split, so an admitted push always fits one block; the
+    /// same figure is pinned as the insert's own `max_insert_block_size`.
+    /// Accepted range `1000..=10000000`.
+    pub profile_landing_max_rows: u64,
     /// `PULSUS_LANDING_BATCH_MS` (issue #494 part 2): how long a landing
     /// worker keeps adding queued log or trace blocks to the insert it is
     /// forming, from the moment it takes the batch's first block. `0` sends
@@ -434,6 +449,9 @@ impl Default for WriterConfig {
             trace_landing_retries: 3,
             trace_landing_inserters: 4,
             trace_landing_max_rows: 1_048_576,
+            profile_landing_retries: 3,
+            profile_landing_inserters: 4,
+            profile_landing_max_rows: 1_048_576,
             landing_batch_ms: 1_000,
         }
     }

@@ -83,6 +83,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::ingest::PushHeaders;
 use crate::ingest::metrics::ParsedMetrics;
+use crate::ingest::profiles::ParsedProfileLanding;
 use crate::ingest::traces::ParsedTraceLanding;
 use crate::protocols::otlp_logs::ParsedLogs;
 use crate::writer::rows::MetricLandingRow;
@@ -476,6 +477,69 @@ pub fn trace_identity(
     tenant: &Tenant,
 ) -> PushIdentity {
     identity_from(trace_content_digest(landing), headers, Some(tenant))
+}
+
+/// A profiles push's content digest: every parsed row, count-prefixed by
+/// kind, in the model's order.
+///
+/// Left out: the id the writer mints (an absent id enters as 16 zero
+/// bytes), a time defaulted from the receive time (it enters as 0), and
+/// `received_ms`, so a client resending a push that carries neither is
+/// suppressed. A stack's and a location's content is fixed by its id, so the
+/// ids alone stand for them. The digest is over the push's whole stack and
+/// location lists, before the writer drops the ones it has cached.
+fn profile_content_digest(landing: &ParsedProfileLanding) -> PushDigest {
+    let mut d = DigestBuilder::new();
+    d.str("profiles");
+    d.u64(landing.series.len() as u64);
+    for s in &landing.series {
+        d.fingerprint(s.fingerprint)
+            .str(&s.type_id)
+            .str(&s.service)
+            .i64(if s.time_defaulted { 0 } else { s.timestamp_ns })
+            .str(&s.labels);
+    }
+    d.u64(landing.entries.len() as u64);
+    for e in &landing.entries {
+        d.u64(u64::from(e.series))
+            .u64(u64::from(e.input))
+            .bytes(&e.profile_id.unwrap_or([0u8; 16]))
+            .i64(e.total)
+            .i64(e.duration_ns);
+        d.u64(e.annotation_keys.len() as u64);
+        for (k, v) in e.annotation_keys.iter().zip(&e.annotation_values) {
+            d.str(k).str(v);
+        }
+    }
+    d.u64(landing.samples.len() as u64);
+    for s in &landing.samples {
+        d.u64(u64::from(s.entry))
+            .u64((s.stack_id >> 64) as u64)
+            .u64(s.stack_id as u64)
+            .i64(s.value)
+            .u64(s.span_id)
+            .bytes(&s.trace_id);
+    }
+    d.u64(landing.stacks.len() as u64);
+    for s in &landing.stacks {
+        d.u64((s.stack_id >> 64) as u64).u64(s.stack_id as u64);
+    }
+    d.u64(landing.locations.len() as u64);
+    for l in &landing.locations {
+        d.u64((l.location_id >> 64) as u64)
+            .u64(l.location_id as u64);
+    }
+    d.finish()
+}
+
+/// Resolves a profiles push's identity — see [`log_identity`]. The push's
+/// tenant is in the key on both branches, as for the other three signals.
+pub fn profile_identity(
+    landing: &ParsedProfileLanding,
+    headers: &PushHeaders,
+    tenant: &Tenant,
+) -> PushIdentity {
+    identity_from(profile_content_digest(landing), headers, Some(tenant))
 }
 
 /// A metric, log or trace push's tenant (issues #635, #653, #738) is
