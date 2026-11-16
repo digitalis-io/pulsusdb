@@ -516,9 +516,11 @@ async fn each_profile_push_is_stored_by_one_insert_and_no_read() {
 
     // L5: every statement attributable to each push. A statement is the
     // push's when it carries the push's own request id as its log comment,
-    // or names a table of this test's database; the test's clock reads are
-    // left out by their own log comment, and a background probe of the
-    // server, which names no table here, is not the push's.
+    // or names a profile table of this test's database; the test's clock
+    // reads are left out by their own log comment. A background probe of the
+    // server names no table, and the database's refreshable views (the
+    // rollup levels, the service graph) write only their own tables, never a
+    // profile table, so neither is counted as the push's.
     client
         .execute(
             "SYSTEM FLUSH LOGS",
@@ -535,7 +537,7 @@ async fn each_profile_push_is_stored_by_one_insert_and_no_read() {
              WHERE type != 'QueryStart' \
                AND event_time_microseconds BETWEEN toDateTime64('{t0}', 6) AND toDateTime64('{t1}', 6) \
                AND log_comment != '{PROBE}' \
-               AND (log_comment = '{id}' OR arrayExists(t -> startsWith(t, '{db}.'), tables)) \
+               AND (log_comment = '{id}' OR arrayExists(t -> startsWith(t, '{db}.profile_'), tables)) \
              ORDER BY event_time_microseconds",
             t0 = p.t0,
             t1 = p.t1,
