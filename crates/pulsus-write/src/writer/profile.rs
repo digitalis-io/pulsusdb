@@ -1,23 +1,88 @@
-//! `ProfileWriter`: one profiles push is one `INSERT` of one block into
-//! `profile_landing`. Not built yet.
+//! `ProfileWriter`: **one profiles push is one `INSERT` of one block into
+//! `profile_landing`**, the shape the log and trace writers have. Implements
+//! [`crate::ingest::profiles::ProfileSink`].
+//!
+//! Five materialized views maintain `profile_samples`, `profile_stacks`,
+//! `profile_series`, `profile_entries` and `profile_locations` from that one
+//! source table, and this writer inserts into none of them. The loop, its two
+//! fates, the budget, the shutdown boundary, the byte accounting and the
+//! spool copy are `writer::landing`'s; what is here is what profiles decide
+//! for themselves.
+//!
+//! **The stack and location cache** is the log stream cache's rule: keyed
+//! `(tenant, id, receive UTC day)`, filled only at a commit from the
+//! committed kind-1 and kind-4 rows, and emptied whole at every other ending.
+//! A stack or location the cache holds is left out of the block. The day in
+//! the key is what rewrites each stack on every day it is used, so there is
+//! no hourly reset. A false miss writes a row the target's
+//! `ReplacingMergeTree` collapses.
+//!
+//! **The acknowledgement is the landing insert's.** The claim is not replay
+//! safe: samples are an append-only table, so a replayed sample doubles a
+//! value, which is the log block's case. A retry after an insert that may
+//! have sent is answered the original's outcome.
+//!
+//! **Nothing here subtracts the landing counter.** The reservation is taken
+//! at admission and released exactly once, by whichever ending settles the
+//! block, through `writer::landing`'s `LandingBlock::release`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pulsus_clickhouse::ChClient;
+use pulsus_clickhouse::{ChClient, QuerySettings};
 use pulsus_config::WriterConfig;
 use pulsus_model::Tenant;
+use tokio::sync::{mpsc, oneshot};
 
+use crate::error::LogsIngestError;
 use crate::ingest::profiles::{ParsedProfileLanding, ProfileSink};
 use crate::ingest::{AdmitRefusal, FlushWait, PushHeaders};
 use crate::writer::config::WriterRuntime;
-use crate::writer::metrics::TraceWriterMetricsSnapshot;
-use crate::writer::push_dedup::PushDedup;
-use crate::writer::rows::ProfileLandingRow;
-use crate::writer::table::{BlockInserter, ChBlockInserter};
-use crate::writer::{AdmitMode, Admitted};
+use crate::writer::drain::{AdmissionPass, DrainBoundary};
+use crate::writer::error::WriteError;
+use crate::writer::landing::{
+    CommitHook, FailureHook, LandingBlock, LandingContext, LandingFate, LandingQueue,
+    MSG_SHUTDOWN_QUEUED, TerminalCause, day_span, landing_charge, settle_block,
+    spawn_landing_worker,
+};
+use crate::writer::metrics::{TraceWriterMetrics, TraceWriterMetricsSnapshot};
+use crate::writer::push_dedup::{self, Admission, ClaimTicket, PushDedup};
+use crate::writer::registration::LruSet;
+use crate::writer::rows::{ProfileLandingRow, ProfileSeriesColumns};
+use crate::writer::spool::SpoolWriter;
+use crate::writer::table::{BlockInserter, ChBlockInserter, XorShift64, spawn_dedup_ticker};
+use crate::writer::{AdmitMode, Admitted, Suppressed, note_target};
 
-/// The one table a [`ProfileWriter`] inserts into.
+/// The bare landing table's name. On a cluster the writer names its
+/// `Distributed` wrapper instead, `profile_landing<PULSUS_DIST_SUFFIX>`,
+/// keyed on `cityHash64(received_ms)`: every row of a push carries one
+/// receive stamp, so the push and every resend of it reach one shard.
+pub(crate) const LANDING_TABLE: &str = "profile_landing";
+
+/// One millisecond-resolution UTC day.
+const MS_PER_DAY: i64 = 86_400_000;
+/// One nanosecond-resolution UTC day.
+const NS_PER_DAY: i64 = 86_400_000_000_000;
+
+/// The UTC day, as days since the epoch, of a millisecond stamp: the day
+/// the stacks and locations views store a row under.
+fn receive_day(received_ms: i64) -> u16 {
+    received_ms.div_euclid(MS_PER_DAY) as u16
+}
+
+/// A cache key: the tenant, a stack or location id, and the receive day.
+type CacheKey = (Arc<str>, u128, u16);
+
+/// What this writer's commits wrote since the cache was last emptied.
+struct ProfileCache {
+    stacks: LruSet<CacheKey>,
+    locations: LruSet<CacheKey>,
+}
+
+/// The one table a [`ProfileWriter`] inserts into: the landing table's
+/// `Distributed` wrapper on a cluster, the bare table single-node.
 #[derive(Debug, Clone)]
 pub struct ProfileWriterTables {
     pub landing: Arc<str>,
@@ -27,19 +92,49 @@ impl ProfileWriterTables {
     /// The bare landing table's name.
     pub fn profiles_default() -> Self {
         ProfileWriterTables {
-            landing: Arc::from(""),
+            landing: Arc::from(LANDING_TABLE),
         }
     }
 
-    /// The landing table for a deployment.
-    pub fn landing_for(_dist_suffix: Option<&str>) -> Self {
-        Self::profiles_default()
+    /// The landing table for a deployment: the bare name for `None`, and
+    /// `profile_landing<suffix>` for `Some(suffix)`.
+    pub fn landing_for(dist_suffix: Option<&str>) -> Self {
+        ProfileWriterTables {
+            landing: Arc::from(format!("{LANDING_TABLE}{}", dist_suffix.unwrap_or(""))),
+        }
     }
 }
 
-/// Implements [`ProfileSink`] over one landing table.
+struct Shared {
+    /// The landing queue's sender. Bounded by **bytes, not by length**: the
+    /// reservation is the only gate.
+    tx: mpsc::UnboundedSender<LandingBlock<ProfileLandingRow>>,
+    ctx: Arc<LandingContext<ProfileLandingRow>>,
+    queued_bytes: Arc<AtomicU64>,
+    runtime: Arc<WriterRuntime>,
+    metrics: Arc<TraceWriterMetrics>,
+    /// The push-suppression index. `None` while `PULSUS_INGEST_DEDUP` is
+    /// off.
+    dedup: Option<Arc<PushDedup>>,
+    cache: Arc<Mutex<ProfileCache>>,
+    /// The generator of the profile ids this writer mints.
+    id_rng: Mutex<XorShift64>,
+    /// The shutdown boundary: the admission gate, the announced deadline and
+    /// every task this writer spawned (`writer::drain`).
+    boundary: DrainBoundary,
+}
+
+/// Cancels the drain boundary **before** any field is dropped, so no insert
+/// worker is authorized an attempt once the writer's teardown has begun.
+impl Drop for Shared {
+    fn drop(&mut self) {
+        self.boundary.cancel();
+    }
+}
+
+/// Implements [`ProfileSink`] over one landing table. See the module docs.
 pub struct ProfileWriter {
-    _runtime: Arc<WriterRuntime>,
+    shared: Arc<Shared>,
 }
 
 impl ProfileWriter {
@@ -57,7 +152,8 @@ impl ProfileWriter {
         Self::with_inserters_with_tables(Arc::new(ChBlockInserter::new(client)), cfg, tables)
     }
 
-    /// Test/mock constructor: any landing [`BlockInserter`].
+    /// Test/mock constructor: any landing [`BlockInserter`] against
+    /// `tables`.
     pub fn with_inserters_with_tables(
         landing_inserter: Arc<dyn BlockInserter<ProfileLandingRow>>,
         cfg: &WriterConfig,
@@ -67,40 +163,418 @@ impl ProfileWriter {
     }
 
     /// [`Self::with_inserters_with_tables`], but against a caller-supplied
-    /// [`WriterRuntime`].
+    /// [`WriterRuntime`], so a test can point the spool anywhere. No
+    /// production call site depends on it.
     #[doc(hidden)]
     pub fn with_inserters_and_runtime(
-        _landing_inserter: Arc<dyn BlockInserter<ProfileLandingRow>>,
+        landing_inserter: Arc<dyn BlockInserter<ProfileLandingRow>>,
         runtime: WriterRuntime,
-        _tables: ProfileWriterTables,
+        tables: ProfileWriterTables,
     ) -> Self {
+        let runtime = Arc::new(runtime);
+        let metrics = Arc::new(TraceWriterMetrics::default());
+        let queued_bytes = Arc::new(AtomicU64::new(0));
+        let spool = Arc::new(SpoolWriter::new(runtime.spool_dir.clone(), metrics.clone()));
+        let boundary = DrainBoundary::new();
+        let dedup = runtime.ingest_dedup.then(|| {
+            PushDedup::new(
+                runtime.ingest_dedup_max_bytes,
+                runtime.ingest_dedup_window,
+                runtime.claim_deadline,
+            )
+        });
+        let cache = Arc::new(Mutex::new(ProfileCache {
+            stacks: LruSet::new(runtime.lru_capacity),
+            locations: LruSet::new(runtime.lru_capacity),
+        }));
+
+        // Filled only here, from a committed batch's own kind-1 and kind-4
+        // rows, under the day the views store them under.
+        let promote = cache.clone();
+        let on_commit: CommitHook<ProfileLandingRow> =
+            Arc::new(move |parts: &[&[ProfileLandingRow]]| {
+                let mut cache = promote.lock().expect("profile cache mutex poisoned");
+                for row in parts.iter().flat_map(|rows| rows.iter()) {
+                    let day = receive_day(row.received_ms);
+                    match row.kind {
+                        ProfileLandingRow::KIND_STACK => {
+                            cache
+                                .stacks
+                                .insert((Arc::clone(&row.org_id), row.stack_id, day))
+                        }
+                        ProfileLandingRow::KIND_LOCATION => {
+                            cache
+                                .locations
+                                .insert((Arc::clone(&row.org_id), row.location_id, day))
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        // Every ending but a commit empties both, and what they held is
+        // dropped after the lock is released.
+        let forget = cache.clone();
+        let on_failure: FailureHook = Arc::new(move || {
+            let dropped = {
+                let mut cache = forget.lock().expect("profile cache mutex poisoned");
+                (cache.stacks.take(), cache.locations.take())
+            };
+            drop(dropped);
+        });
+
+        let ctx = Arc::new(LandingContext {
+            table: tables.landing,
+            inserter: landing_inserter,
+            runtime: runtime.clone(),
+            table_metrics: metrics.landing.clone(),
+            queued_bytes: queued_bytes.clone(),
+            spool,
+            on_commit: Some(on_commit),
+            on_failure: Some(on_failure),
+            retries: runtime.profile_landing_retries,
+            max_rows: runtime.profile_landing_max_rows,
+            // Profile blocks are batched, and each batch's insert is built
+            // when it closes, under a token minted for it.
+            batch_settings: Some(QuerySettings::landing_insert),
+            token_rng: Mutex::new(XorShift64::seeded()),
+        });
+
+        let (tx, rx) = mpsc::unbounded_channel::<LandingBlock<ProfileLandingRow>>();
+        let rx = Arc::new(tokio::sync::Mutex::new(LandingQueue::new(rx)));
+        boundary.track_background(
+            (0..runtime.profile_landing_inserters.max(1))
+                .map(|_| spawn_landing_worker(ctx.clone(), rx.clone(), boundary.watch()))
+                .collect::<Vec<_>>(),
+        );
+        boundary.track_background(
+            dedup
+                .clone()
+                .map(|d| spawn_dedup_ticker(d, runtime.batch_age, boundary.watch())),
+        );
+
         ProfileWriter {
-            _runtime: Arc::new(runtime),
+            shared: Arc::new(Shared {
+                tx,
+                ctx,
+                queued_bytes,
+                runtime,
+                metrics,
+                dedup,
+                cache,
+                id_rng: Mutex::new(XorShift64::seeded()),
+                boundary,
+            }),
         }
     }
 
+    /// Admits `landing` as one sealed block.
+    ///
+    /// The order is the suppression index, the cache, the per-push ceilings,
+    /// then the byte reservation; any refusal stores nothing. A `Sync`
+    /// push's block carries the waiter its answer comes from.
     fn admit_batch(
         &self,
-        _tenant: &Tenant,
-        _landing: ParsedProfileLanding,
-        _mode: AdmitMode,
-        _push: PushHeaders,
+        tenant: &Tenant,
+        mut landing: ParsedProfileLanding,
+        mode: AdmitMode,
+        push: PushHeaders,
     ) -> Result<Admitted, AdmitRefusal> {
-        Err(AdmitRefusal::Backpressure)
+        // The admission gate, held for the whole of this body, which never
+        // awaits.
+        let Some(pass) = self.shared.boundary.enter() else {
+            return Err(AdmitRefusal::Backpressure);
+        };
+        // Every landing row of a push carries the same stamp, so the block
+        // lies in one landing partition.
+        let received_ms = now_unix_millis();
+        let admitted_at = tokio::time::Instant::now();
+        let day = receive_day(received_ms);
+
+        // The claim, taken before the byte reservation, so a request refused
+        // by backpressure leaves no claim behind. **A suppressed push sends
+        // nothing at all.**
+        let mut suppressed: Option<Suppressed> = None;
+        let mut guard = match &self.shared.dedup {
+            Some(dedup) => {
+                let id = push_dedup::profile_identity(&landing, &push, tenant);
+                let rows = landing.samples.len() as u64;
+                match dedup.admit(id, mode.wait_mode()) {
+                    Admission::Admit(guard) => Some(guard),
+                    Admission::SuppressedSettled(outcome) => {
+                        dedup.count_suppressed(id.declared_retry, rows);
+                        suppressed = Some(Suppressed::Settled(outcome));
+                        None
+                    }
+                    Admission::SuppressedPending { guard, rx } => {
+                        dedup.count_suppressed(id.declared_retry, rows);
+                        suppressed = Some(Suppressed::Pending(guard, rx));
+                        None
+                    }
+                    Admission::KeyReused => return Err(AdmitRefusal::KeyReused),
+                    Admission::Shed => return Err(AdmitRefusal::DedupShed),
+                    Admission::WaitShed => return Err(AdmitRefusal::DedupWaitShed),
+                }
+            }
+            None => None,
+        };
+
+        // The stacks and locations this writer has committed today for this
+        // tenant are left out. The lookup runs for a suppressed push too,
+        // because the size decision below is over what would be sent.
+        {
+            let mut cache = self
+                .shared
+                .cache
+                .lock()
+                .expect("profile cache mutex poisoned");
+            let org = tenant.as_arc();
+            landing
+                .stacks
+                .retain(|s| !cache.stacks.contains(&(Arc::clone(org), s.stack_id, day)));
+            landing.locations.retain(|l| {
+                !cache
+                    .locations
+                    .contains(&(Arc::clone(org), l.location_id, day))
+            });
+        }
+
+        // **A push with no entries makes no block and no insert** and is
+        // charged for nothing. Its claim seals with no targets.
+        if landing.is_empty() {
+            if let Some(suppressed) = suppressed {
+                return Ok(Admitted::Suppressed(suppressed));
+            }
+            if let Some(guard) = guard {
+                guard.seal();
+            }
+            return Ok(Admitted::Stored(Vec::new()));
+        }
+
+        // The per-push ceilings, over every kind that would be sent.
+        // Returning here drops the un-sealed guard, which removes the claim.
+        let landing_rows = landing.total_rows();
+        let landing_bytes = charge_of(&landing) + tenant.as_str().len() as u64;
+        if landing_rows >= self.shared.runtime.profile_landing_max_rows
+            || landing_bytes > self.shared.runtime.batch_bytes
+        {
+            return Err(AdmitRefusal::PushTooLarge {
+                rows: landing_rows,
+                row_limit: self.shared.runtime.profile_landing_max_rows,
+                bytes: landing_bytes,
+                byte_limit: self.shared.runtime.batch_bytes,
+            });
+        }
+
+        // The suppressed push stops here, having stored nothing, and is
+        // answered what the original caller was told.
+        if let Some(suppressed) = suppressed {
+            return Ok(Admitted::Suppressed(suppressed));
+        }
+
+        super::reserve_queued_bytes(
+            &self.shared.queued_bytes,
+            &self.shared.metrics.backpressure_total,
+            landing_bytes,
+            self.shared.runtime.queue_bytes_limit,
+        )
+        .map_err(AdmitRefusal::from)?;
+
+        let span = day_span(landing.entries.iter().map(|e| {
+            landing.series[e.series as usize]
+                .timestamp_ns
+                .div_euclid(NS_PER_DAY)
+        }));
+        let rows = self.rows_of(tenant.as_arc(), received_ms, landing);
+        debug_assert_eq!(
+            rows.len() as u64,
+            landing_rows,
+            "the rows materialized are the rows the push was charged and measured for"
+        );
+
+        let mut claim = ClaimTicket::new(self.shared.dedup.clone(), true);
+        if let Some(g) = guard.as_ref() {
+            claim.push(g.key());
+        }
+        note_target(&mut guard, true);
+        let mut receivers = Vec::new();
+        let waiter = if mode == AdmitMode::Sync {
+            let (tx, rx) = oneshot::channel();
+            receivers.push(rx);
+            Some(tx)
+        } else {
+            None
+        };
+        self.queue(&pass, rows, landing_bytes, claim, waiter, admitted_at, span);
+
+        // Arms the claim: from here a drop no longer removes it, and the
+        // target set is closed.
+        if let Some(guard) = guard {
+            guard.seal();
+        }
+        Ok(Admitted::Stored(receivers))
+    }
+
+    /// The push's landed rows, every kind in one vector: series, entries,
+    /// samples, then the stacks and locations not already cached.
+    ///
+    /// One profile id is minted per input whose entries carry none, and
+    /// every entry of that input and every sample of those entries takes it.
+    fn rows_of(
+        &self,
+        org_id: &Arc<str>,
+        received_ms: i64,
+        landing: ParsedProfileLanding,
+    ) -> Vec<ProfileLandingRow> {
+        let ParsedProfileLanding {
+            series,
+            entries,
+            samples,
+            stacks,
+            locations,
+        } = landing;
+        let mut rows = Vec::with_capacity(
+            series.len() + entries.len() + samples.len() + stacks.len() + locations.len(),
+        );
+
+        let columns: Vec<ProfileSeriesColumns> =
+            series.iter().map(ProfileSeriesColumns::of).collect();
+        rows.extend(
+            series
+                .into_iter()
+                .map(|s| ProfileLandingRow::series(org_id, received_ms, s)),
+        );
+
+        let mut minted: HashMap<u32, (u64, u64)> = HashMap::new();
+        let mut entry_meta: Vec<(u32, (u64, u64))> = Vec::with_capacity(entries.len());
+        for e in entries {
+            let id = match &e.profile_id {
+                Some(bytes) => ProfileLandingRow::profile_id_of(bytes),
+                None => *minted
+                    .entry(e.input)
+                    .or_insert_with(|| self.mint_profile_id(received_ms)),
+            };
+            entry_meta.push((e.series, id));
+            let cols = &columns[e.series as usize];
+            rows.push(ProfileLandingRow::entry(org_id, received_ms, cols, e, id));
+        }
+
+        rows.extend(samples.into_iter().map(|s| {
+            let (series, id) = entry_meta[s.entry as usize];
+            ProfileLandingRow::sample(org_id, received_ms, &columns[series as usize], s, id)
+        }));
+        rows.extend(
+            stacks
+                .into_iter()
+                .map(|s| ProfileLandingRow::stack(org_id, received_ms, s)),
+        );
+        rows.extend(
+            locations
+                .into_iter()
+                .map(|l| ProfileLandingRow::location(org_id, received_ms, l)),
+        );
+        rows
+    }
+
+    /// A fresh time-ordered UUID (version 7) as the column's two halves,
+    /// laid out as `mint_landing_token` lays out its text: 48 bits of the
+    /// push's receive milliseconds, the version nibble `7`, 12 random bits,
+    /// the variant bits `10` and 62 more random bits.
+    fn mint_profile_id(&self, received_ms: i64) -> (u64, u64) {
+        let mut rng = self.shared.id_rng.lock().expect("profile id rng poisoned");
+        let ms = (received_ms as u64) & 0xFFFF_FFFF_FFFF;
+        let rand_a = rng.next_u64() & 0x0FFF;
+        let rand_b = rng.next_u64() & 0x3FFF_FFFF_FFFF_FFFF;
+        ((ms << 16) | 0x7000 | rand_a, 0x8000_0000_0000_0000 | rand_b)
+    }
+
+    /// Seals one block and hands it to the queue. Its insert's settings and
+    /// token are the batch's, built when the batch closes. A block that
+    /// reaches here after the queue closed is settled by a task of this
+    /// admission's own, as a shut-down ending.
+    #[allow(clippy::too_many_arguments)] // one admission's pass, claim and waiter travel together
+    fn queue(
+        &self,
+        pass: &AdmissionPass<'_>,
+        rows: Vec<ProfileLandingRow>,
+        bytes: u64,
+        claim: ClaimTicket,
+        waiter: Option<oneshot::Sender<Result<(), WriteError>>>,
+        admitted_at: tokio::time::Instant,
+        span: Option<(i64, i64)>,
+    ) {
+        let block = LandingBlock::seal(
+            rows,
+            bytes,
+            QuerySettings::new(),
+            claim,
+            waiter,
+            admitted_at,
+            span,
+        );
+        if let Err(closed) = self.shared.tx.send(block) {
+            let ctx = self.shared.ctx.clone();
+            let block = closed.0;
+            let mut fate = LandingFate::NeverSent(String::new());
+            fate.saw_pre_send(MSG_SHUTDOWN_QUEUED.to_string());
+            self.shared.boundary.spawn_settlement(pass, async move {
+                settle_block(&ctx, block, fate, TerminalCause::ShuttingDown).await;
+            });
+        }
     }
 
     /// A point-in-time metrics snapshot.
     pub fn metrics(&self) -> TraceWriterMetricsSnapshot {
-        TraceWriterMetricsSnapshot::default()
+        self.shared.metrics.snapshot(
+            self.shared.queued_bytes.load(Ordering::Relaxed),
+            self.shared
+                .dedup
+                .as_ref()
+                .map(|d| d.snapshot())
+                .unwrap_or_default(),
+        )
     }
 
-    /// This writer's push-suppression index.
+    /// This writer's push-suppression index, or `None` while
+    /// `PULSUS_INGEST_DEDUP` is off.
     pub fn dedup(&self) -> Option<&Arc<PushDedup>> {
-        None
+        self.shared.dedup.as_ref()
     }
 
-    /// Graceful shutdown.
-    pub async fn shutdown(&self, _deadline: Duration) {}
+    /// Graceful shutdown, which is the boundary's whole job
+    /// (`writer::drain`). Idempotent.
+    pub async fn shutdown(&self, deadline: Duration) {
+        self.shared.boundary.shutdown(deadline).await;
+    }
+}
+
+/// What the queue is charged for one push's landed rows, over the kinds
+/// that would be sent, plus what the block itself holds. Taken before any
+/// row is built. Shared text is charged on every row that holds it, which
+/// over-charges: the safe direction.
+fn charge_of(landing: &ParsedProfileLanding) -> u64 {
+    let est = ProfileLandingRow::est_landing_bytes;
+    let series: u64 = landing
+        .series
+        .iter()
+        .map(|s| est(ProfileLandingRow::est_series_bytes(s)))
+        .sum();
+    let entries: u64 = landing
+        .entries
+        .iter()
+        .map(|e| est(ProfileLandingRow::est_entry_bytes(e)))
+        .sum();
+    let samples = landing.samples.len() as u64 * est(0);
+    let stacks: u64 = landing
+        .stacks
+        .iter()
+        .map(|s| est(ProfileLandingRow::est_stack_bytes(s)))
+        .sum();
+    let locations: u64 = landing
+        .locations
+        .iter()
+        .map(|l| est(ProfileLandingRow::est_location_bytes(l)))
+        .sum();
+    landing_charge::<ProfileLandingRow>(series + entries + samples + stacks + locations)
 }
 
 impl ProfileSink for ProfileWriter {
@@ -121,9 +595,23 @@ impl ProfileSink for ProfileWriter {
         push: PushHeaders,
     ) -> Result<FlushWait, AdmitRefusal> {
         match self.admit_batch(tenant, landing, AdmitMode::Sync, push)? {
-            Admitted::Stored(_) | Admitted::Suppressed(_) => Ok(FlushWait::new(async { Ok(()) })),
+            Admitted::Stored(receivers) => Ok(FlushWait::new(async move {
+                super::join_generations(receivers)
+                    .await
+                    .map_err(|e| LogsIngestError::FlushFailed(e.to_string()))
+            })),
+            Admitted::Suppressed(suppressed) => Ok(FlushWait::new(suppressed.into_answer())),
         }
     }
+}
+
+/// The writer's UTC epoch-millisecond stamp for one push. A clock before the
+/// epoch degrades to `0` rather than panicking.
+fn now_unix_millis() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]

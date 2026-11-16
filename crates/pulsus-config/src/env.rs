@@ -76,6 +76,9 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_TRACE_LANDING_INSERTERS",
     "PULSUS_TRACE_LANDING_MAX_ROWS",
     "PULSUS_PROFILE_DEDUP_WINDOW",
+    "PULSUS_PROFILE_LANDING_RETRIES",
+    "PULSUS_PROFILE_LANDING_INSERTERS",
+    "PULSUS_PROFILE_LANDING_MAX_ROWS",
     "PULSUS_LANDING_BATCH_MS",
     "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
     "PULSUS_OTLP_TRANSLATION_STRATEGY",
@@ -410,6 +413,15 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("PULSUS_TRACE_LANDING_MAX_ROWS") {
         cfg.writer.trace_landing_max_rows = parse_int("PULSUS_TRACE_LANDING_MAX_ROWS", &v)?;
+    }
+    if let Some(v) = read("PULSUS_PROFILE_LANDING_RETRIES") {
+        cfg.writer.profile_landing_retries = parse_int("PULSUS_PROFILE_LANDING_RETRIES", &v)?;
+    }
+    if let Some(v) = read("PULSUS_PROFILE_LANDING_INSERTERS") {
+        cfg.writer.profile_landing_inserters = parse_int("PULSUS_PROFILE_LANDING_INSERTERS", &v)?;
+    }
+    if let Some(v) = read("PULSUS_PROFILE_LANDING_MAX_ROWS") {
+        cfg.writer.profile_landing_max_rows = parse_int("PULSUS_PROFILE_LANDING_MAX_ROWS", &v)?;
     }
     if let Some(v) = read("PULSUS_LANDING_BATCH_MS") {
         cfg.writer.landing_batch_ms = parse_int("PULSUS_LANDING_BATCH_MS", &v)?;

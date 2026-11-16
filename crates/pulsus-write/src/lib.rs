@@ -52,7 +52,8 @@ pub use writer::{
     PushDedup, PushDigest, PushIdentity, TRACE_LANDING_ROW_SLOT_BYTES, TargetOutcome,
     TraceEventTuple, TraceJson, TraceJsonEntry, TraceJsonScalar, TraceJsonValue, TraceLandingRow,
     TraceLinkTuple, TraceWriter, TraceWriterTables, WaitGuard, WaitMode, WriteError, WriterTables,
-    escape_json_path, index_bytes, log_identity, metric_identity, plan_capacities, trace_identity,
+    escape_json_path, index_bytes, log_identity, metric_identity, plan_capacities,
+    profile_identity, trace_identity,
 };
 
 #[cfg(test)]

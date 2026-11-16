@@ -131,6 +131,9 @@ Deployment topologies:
 | `PULSUS_TRACE_LANDING_RETRIES` | `3` | resends of a failed traces landing insert. Every resend carries the same minted `insert_deduplication_token` and the identical batch of pushes ([api.md §1.0](api.md)), so a resend of one the server already accepted stores nothing twice while `PULSUS_TRACE_DEDUP_WINDOW` still holds it. The **wall-clock** bound on the whole loop — the queue wait, every attempt and every sleep, from the push's admission — is 120 s, not this count; whichever binds first ends it. Accepted range `0..=10` |
 | `PULSUS_TRACE_LANDING_INSERTERS` | `4` | insert workers on the traces landing queue, so how many landing inserts can be in flight at once. The queue itself is bounded by bytes, not by length: `PULSUS_INGEST_QUEUE_BYTES` is the only gate. Accepted range `1..=64` |
 | `PULSUS_TRACE_LANDING_MAX_ROWS` | `1048576` | per-push landing row ceiling, counted over spans, resources, tag names and tag values together. A push at or above it is refused `413` naming its own size and both limits, never split — two blocks can commit a prefix, and a prefix is not all-or-nothing. `PULSUS_BATCH_BYTES` is the matching per-push byte ceiling, and a push whose spans fall on more than 100 distinct UTC dates is refused `413` as well. The same figure is pinned as each landing insert's `max_insert_block_size`, exactly as the other two signals' keys are. Accepted range `1000..=10000000` |
+| `PULSUS_PROFILE_LANDING_RETRIES` | `3` | resends of a failed profiles landing insert. Every resend carries the same minted `insert_deduplication_token` and the identical batch of pushes ([api.md §1.0](api.md)), so a resend of one the server already accepted stores nothing twice while `PULSUS_PROFILE_DEDUP_WINDOW` still holds it. The **wall-clock** bound on the whole loop — the queue wait, every attempt and every sleep, from the push's admission — is 120 s, not this count; whichever binds first ends it. Accepted range `0..=10` |
+| `PULSUS_PROFILE_LANDING_INSERTERS` | `4` | insert workers on the profiles landing queue, so how many landing inserts can be in flight at once. The queue itself is bounded by bytes, not by length: `PULSUS_INGEST_QUEUE_BYTES` is the only gate. Accepted range `1..=64` |
+| `PULSUS_PROFILE_LANDING_MAX_ROWS` | `1048576` | per-push landing row ceiling, counted over series, entries, samples, stacks and locations together. A push at or above it is refused `413` naming its own size and both limits, never split — two blocks can commit a prefix, and a prefix is not all-or-nothing. `PULSUS_BATCH_BYTES` is the matching per-push byte ceiling. The same figure is pinned as each landing insert's `max_insert_block_size`, exactly as the other signals' keys are. Accepted range `1000..=10000000` |
 | `PULSUS_METRICS_EXP_HISTOGRAM_MODE` | `classic` | `classic` \| `native` \| `dual` — how OTLP exponential histograms are stored (see below) |
 | `PULSUS_OTLP_TRANSLATION_STRATEGY` | `UnderscoreEscapingWithSuffixes` | `NoUTF8EscapingWithSuffixes` \| `UnderscoreEscapingWithSuffixes` \| `UnderscoreEscapingWithoutSuffixes` \| `NoTranslation` — how OTLP metric and label names are rewritten on `POST /v1/metrics` (see below) |
 | `PULSUS_OTLP_PROMOTE_SCOPE_METADATA` | `false` | promote the instrumentation scope's name, version, schema URL and attributes onto every metric series as `otel_scope_*` labels |
@@ -459,6 +462,9 @@ writer:
   trace_landing_retries: 3       # resends of a failed traces landing insert
   trace_landing_inserters: 4     # insert workers on the traces landing queue
   trace_landing_max_rows: 1048576     # per-push landing row ceiling
+  profile_landing_retries: 3     # resends of a failed profiles landing insert
+  profile_landing_inserters: 4   # insert workers on the profiles landing queue
+  profile_landing_max_rows: 1048576   # per-push landing row ceiling
 
 reader:
   cache_ttl: 60s

@@ -50,7 +50,7 @@ pub use profile::{ProfileWriter, ProfileWriterTables};
 pub use push_dedup::{
     Admission, Capacities, ClaimGuard, ClaimOutcome, DedupMetrics, DedupMetricsSnapshot, PushDedup,
     PushDigest, PushIdentity, TargetOutcome, WaitGuard, WaitMode, index_bytes, log_identity,
-    metric_identity, plan_capacities, trace_identity,
+    metric_identity, plan_capacities, profile_identity, trace_identity,
 };
 pub use registration::{SeriesLru, StreamLru};
 pub use rows::{

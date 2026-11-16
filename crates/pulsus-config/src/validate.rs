@@ -728,6 +728,37 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             "rows",
         ));
     }
+    if cfg.writer.profile_landing_retries > PROFILE_LANDING_RETRIES_CEILING {
+        return Err(range_err(
+            "writer.profile_landing_retries",
+            u64::from(cfg.writer.profile_landing_retries),
+            0,
+            u64::from(PROFILE_LANDING_RETRIES_CEILING),
+            "resends",
+        ));
+    }
+    if !(PROFILE_LANDING_INSERTERS_FLOOR..=PROFILE_LANDING_INSERTERS_CEILING)
+        .contains(&cfg.writer.profile_landing_inserters)
+    {
+        return Err(range_err(
+            "writer.profile_landing_inserters",
+            u64::from(cfg.writer.profile_landing_inserters),
+            u64::from(PROFILE_LANDING_INSERTERS_FLOOR),
+            u64::from(PROFILE_LANDING_INSERTERS_CEILING),
+            "workers",
+        ));
+    }
+    if !(PROFILE_LANDING_MAX_ROWS_FLOOR..=PROFILE_LANDING_MAX_ROWS_CEILING)
+        .contains(&cfg.writer.profile_landing_max_rows)
+    {
+        return Err(range_err(
+            "writer.profile_landing_max_rows",
+            cfg.writer.profile_landing_max_rows,
+            PROFILE_LANDING_MAX_ROWS_FLOOR,
+            PROFILE_LANDING_MAX_ROWS_CEILING,
+            "rows",
+        ));
+    }
     if cfg.writer.landing_batch_ms > LANDING_BATCH_MS_CEILING {
         return Err(range_err(
             "writer.landing_batch_ms",

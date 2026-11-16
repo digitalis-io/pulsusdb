@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::ingest::metrics::{
     ExemplarPoint, HistogramPoint, MetricMetadata, MetricPoint, SeriesRef,
 };
+use crate::ingest::profiles::{
+    LandingEntry, LandingLocation, LandingSample, LandingSeries, LandingStack,
+};
 use crate::ingest::traces::{LandingResource, LandingSpan, LandingTagName, LandingTagValue};
 use crate::protocols::otlp_logs::{LogRow, StreamRow};
 use crate::writer::spool::{FiniteOrNull, SpoolEncode, SpoolSink};
@@ -3482,31 +3485,371 @@ mod trace_landing_tests {
 // The profiles landing row
 // ---------------------------------------------------------------------
 
-/// One `profile_landing` row.
+/// One `profile_landing` row: the union of the five profile kinds' columns,
+/// which is the one block shape a profiles push inserts.
+///
+/// `kind` says which row it is; a row sets that kind's columns and leaves the
+/// rest at the type's default. The fields are the landing table's 41 columns
+/// **less the ten upload columns** (`upload_id` to `units`), in the table's
+/// own order: the insert's column list is this type's `COLUMN_NAMES`, so the
+/// server fills those ten with their type defaults. They belong to the
+/// upload kinds, which this writer does not land.
+///
+/// `value` is a sample's value on kind 0 and an entry's total on kind 3,
+/// which `profile_entries_mv` aliases back to `total`.
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct ProfileLandingRow {
+    /// The push's tenant, one shared string per push.
     pub org_id: Arc<str>,
     pub received_ms: i64,
     pub kind: u8,
     pub type_id: Arc<str>,
+    pub service: Arc<str>,
+    pub fingerprint: Fingerprint,
+    pub timestamp_ns: i64,
     pub stack_id: u128,
+    pub value: i64,
+    pub span_id: u64,
+    pub trace_id: [u8; 16],
+    pub node_ids: Vec<u128>,
+    pub names: Vec<Arc<str>>,
+    pub location_ids: Vec<u128>,
     pub location_id: u128,
+    pub mapping_file: Arc<str>,
+    pub mapping_build_id: Arc<str>,
+    pub mapping_start: u64,
+    pub mapping_limit: u64,
+    pub mapping_offset: u64,
+    pub address: u64,
+    pub line_functions: Vec<Arc<str>>,
+    pub line_system_names: Vec<Arc<str>>,
+    pub line_files: Vec<Arc<str>>,
+    pub line_start_lines: Vec<i64>,
+    pub line_numbers: Vec<i64>,
+    pub labels: String,
+    /// The `UUID` column as the client checks it: two `UInt64` halves
+    /// ([`Self::profile_id_of`]).
     pub profile_id: (u64, u64),
+    pub duration_ns: i64,
+    pub annotation_keys: Vec<String>,
+    pub annotation_values: Vec<String>,
 }
 
-/// One profiles landing row's own inline footprint.
+/// One profiles landing row's own inline footprint, in the shape the writer
+/// queue holds it. Taken from `size_of`, [`LANDING_ROW_SLOT_BYTES`]'s rule:
+/// every row of every kind holds every slot.
 pub const PROFILE_LANDING_ROW_SLOT_BYTES: u64 = std::mem::size_of::<ProfileLandingRow>() as u64;
 
+/// The columns a sample or an entry row takes from its series.
+#[derive(Debug, Clone)]
+pub(crate) struct ProfileSeriesColumns {
+    pub(crate) type_id: Arc<str>,
+    pub(crate) service: Arc<str>,
+    pub(crate) fingerprint: Fingerprint,
+    pub(crate) timestamp_ns: i64,
+}
+
+impl ProfileSeriesColumns {
+    pub(crate) fn of(series: &LandingSeries) -> Self {
+        ProfileSeriesColumns {
+            type_id: Arc::clone(&series.type_id),
+            service: Arc::clone(&series.service),
+            fingerprint: series.fingerprint,
+            timestamp_ns: series.timestamp_ns,
+        }
+    }
+}
+
+/// The empty text every row's unused `Arc<str>` columns share, so a default
+/// column allocates nothing.
+fn empty_text() -> Arc<str> {
+    static EMPTY: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::from("")))
+}
+
+/// What a vector of `Arc<str>` owns: one 16-byte slot per element and each
+/// element's text.
+fn arc_texts_bytes(texts: &[Arc<str>]) -> u64 {
+    texts.iter().map(|t| 16 + t.len() as u64).sum()
+}
+
 impl ProfileLandingRow {
+    /// A stack-value row, whose target is `profile_samples`.
     pub const KIND_SAMPLE: u8 = 0;
+    /// A distinct stack, whose target is `profile_stacks`.
     pub const KIND_STACK: u8 = 1;
+    /// A series, whose target is `profile_series`.
     pub const KIND_SERIES: u8 = 2;
+    /// A profile of one sample type, whose target is `profile_entries`.
     pub const KIND_ENTRY: u8 = 3;
+    /// A distinct location, whose target is `profile_locations`.
     pub const KIND_LOCATION: u8 = 4;
 
-    /// A profile id's 16 bytes as the `UUID` column's two `UInt64` halves.
-    pub fn profile_id_of(_id: &[u8; 16]) -> (u64, u64) {
-        (0, 0)
+    /// Sets the receive stamp: a landing batch's rows all take its first
+    /// member's.
+    pub fn set_received_ms(&mut self, received_ms: i64) {
+        self.received_ms = received_ms;
+    }
+
+    /// A profile id's 16 bytes as the `UUID` column's two `UInt64` halves,
+    /// each read big-endian: the pair the client's own UUID codec writes.
+    pub fn profile_id_of(id: &[u8; 16]) -> (u64, u64) {
+        let (hi, lo) = id.split_at(8);
+        (
+            u64::from_be_bytes(hi.try_into().expect("eight bytes")),
+            u64::from_be_bytes(lo.try_into().expect("eight bytes")),
+        )
+    }
+
+    /// What the ingest queue is charged for one landing row whose kind's
+    /// owned text and arrays price `owned`.
+    pub fn est_landing_bytes(owned: u64) -> u64 {
+        owned + PROFILE_LANDING_ROW_SLOT_BYTES
+    }
+
+    /// A stack row's owned bytes: 16 per id and per name slot, and the
+    /// names' text.
+    pub(crate) fn est_stack_bytes(s: &LandingStack) -> u64 {
+        16 * (s.node_ids.len() + s.location_ids.len()) as u64 + arc_texts_bytes(&s.names)
+    }
+
+    /// A series row's owned bytes: its labels and its two texts.
+    pub(crate) fn est_series_bytes(s: &LandingSeries) -> u64 {
+        (s.labels.len() + s.type_id.len() + s.service.len()) as u64
+    }
+
+    /// An entry row's owned bytes: a 24-byte `String` header and the text,
+    /// for each annotation key and value.
+    pub(crate) fn est_entry_bytes(e: &LandingEntry) -> u64 {
+        e.annotation_keys
+            .iter()
+            .chain(&e.annotation_values)
+            .map(|t| 24 + t.len() as u64)
+            .sum()
+    }
+
+    /// A location row's owned bytes: the two mapping texts, and per line
+    /// three name slots, their text and the two line numbers.
+    pub(crate) fn est_location_bytes(l: &LandingLocation) -> u64 {
+        (l.mapping_file.len() + l.mapping_build_id.len()) as u64
+            + arc_texts_bytes(&l.line_functions)
+            + arc_texts_bytes(&l.line_system_names)
+            + arc_texts_bytes(&l.line_files)
+            + 16 * l.line_numbers.len() as u64
+    }
+
+    /// A row of `kind` with every kind-specific column at its default.
+    fn of_kind(org_id: &Arc<str>, received_ms: i64, kind: u8) -> Self {
+        ProfileLandingRow {
+            org_id: Arc::clone(org_id),
+            received_ms,
+            kind,
+            type_id: empty_text(),
+            service: empty_text(),
+            fingerprint: Fingerprint::from_raw(0),
+            timestamp_ns: 0,
+            stack_id: 0,
+            value: 0,
+            span_id: 0,
+            trace_id: [0u8; 16],
+            node_ids: Vec::new(),
+            names: Vec::new(),
+            location_ids: Vec::new(),
+            location_id: 0,
+            mapping_file: empty_text(),
+            mapping_build_id: empty_text(),
+            mapping_start: 0,
+            mapping_limit: 0,
+            mapping_offset: 0,
+            address: 0,
+            line_functions: Vec::new(),
+            line_system_names: Vec::new(),
+            line_files: Vec::new(),
+            line_start_lines: Vec::new(),
+            line_numbers: Vec::new(),
+            labels: String::new(),
+            profile_id: (0, 0),
+            duration_ns: 0,
+            annotation_keys: Vec::new(),
+            annotation_values: Vec::new(),
+        }
+    }
+
+    /// A kind-0 row: one stack's value in one entry, with the entry's series
+    /// columns and id.
+    pub(crate) fn sample(
+        org_id: &Arc<str>,
+        received_ms: i64,
+        series: &ProfileSeriesColumns,
+        s: LandingSample,
+        profile_id: (u64, u64),
+    ) -> Self {
+        ProfileLandingRow {
+            type_id: Arc::clone(&series.type_id),
+            service: Arc::clone(&series.service),
+            fingerprint: series.fingerprint,
+            timestamp_ns: series.timestamp_ns,
+            stack_id: s.stack_id,
+            value: s.value,
+            span_id: s.span_id,
+            trace_id: s.trace_id,
+            profile_id,
+            ..Self::of_kind(org_id, received_ms, Self::KIND_SAMPLE)
+        }
+    }
+
+    /// A kind-1 row, moving the stack's vectors in.
+    pub(crate) fn stack(org_id: &Arc<str>, received_ms: i64, s: LandingStack) -> Self {
+        ProfileLandingRow {
+            stack_id: s.stack_id,
+            node_ids: s.node_ids,
+            names: s.names,
+            location_ids: s.location_ids,
+            ..Self::of_kind(org_id, received_ms, Self::KIND_STACK)
+        }
+    }
+
+    /// A kind-2 row, moving the series' labels in.
+    pub(crate) fn series(org_id: &Arc<str>, received_ms: i64, s: LandingSeries) -> Self {
+        ProfileLandingRow {
+            type_id: s.type_id,
+            service: s.service,
+            fingerprint: s.fingerprint,
+            timestamp_ns: s.timestamp_ns,
+            labels: s.labels,
+            ..Self::of_kind(org_id, received_ms, Self::KIND_SERIES)
+        }
+    }
+
+    /// A kind-3 row: the entry's total in `value`, with its series columns
+    /// and id.
+    pub(crate) fn entry(
+        org_id: &Arc<str>,
+        received_ms: i64,
+        series: &ProfileSeriesColumns,
+        e: LandingEntry,
+        profile_id: (u64, u64),
+    ) -> Self {
+        ProfileLandingRow {
+            type_id: Arc::clone(&series.type_id),
+            service: Arc::clone(&series.service),
+            fingerprint: series.fingerprint,
+            timestamp_ns: series.timestamp_ns,
+            value: e.total,
+            profile_id,
+            duration_ns: e.duration_ns,
+            annotation_keys: e.annotation_keys,
+            annotation_values: e.annotation_values,
+            ..Self::of_kind(org_id, received_ms, Self::KIND_ENTRY)
+        }
+    }
+
+    /// A kind-4 row, moving the location's vectors in.
+    pub(crate) fn location(org_id: &Arc<str>, received_ms: i64, l: LandingLocation) -> Self {
+        ProfileLandingRow {
+            location_id: l.location_id,
+            mapping_file: l.mapping_file,
+            mapping_build_id: l.mapping_build_id,
+            mapping_start: l.mapping_start,
+            mapping_limit: l.mapping_limit,
+            mapping_offset: l.mapping_offset,
+            address: l.address,
+            line_functions: l.line_functions,
+            line_system_names: l.line_system_names,
+            line_files: l.line_files,
+            line_start_lines: l.line_start_lines,
+            line_numbers: l.line_numbers,
+            ..Self::of_kind(org_id, received_ms, Self::KIND_LOCATION)
+        }
+    }
+}
+
+/// A 128-bit id as the decimal text the column's `toString` gives. A JSON
+/// number cannot hold it: `serde_json` refuses a `u128` above `u64::MAX`.
+fn id_text(id: u128) -> String {
+    id.to_string()
+}
+
+fn texts_of(texts: &[Arc<str>]) -> Vec<&str> {
+    texts.iter().map(|t| &**t).collect()
+}
+
+impl SpoolEncode for ProfileLandingRow {
+    /// `org_id`, `kind` and `received_ms`, then exactly the columns that kind
+    /// sets, `LogLandingRow`'s rule. The 128-bit ids and the fingerprint are
+    /// decimal text, for the reason [`id_text`] gives.
+    fn to_spool_value(&self) -> serde_json::Value {
+        let fingerprint = serde_json::to_string(&self.fingerprint).unwrap_or_default();
+        let profile_id = format!("{:016x}{:016x}", self.profile_id.0, self.profile_id.1);
+        match self.kind {
+            Self::KIND_SAMPLE => serde_json::json!({
+                "org_id": &*self.org_id,
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "type_id": &*self.type_id,
+                "service": &*self.service,
+                "fingerprint": fingerprint,
+                "timestamp_ns": self.timestamp_ns,
+                "stack_id": id_text(self.stack_id),
+                "value": self.value,
+                "span_id": self.span_id,
+                "trace_id": hex_lower(&self.trace_id),
+                "profile_id": profile_id,
+            }),
+            Self::KIND_STACK => serde_json::json!({
+                "org_id": &*self.org_id,
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "stack_id": id_text(self.stack_id),
+                "node_ids": self.node_ids.iter().map(|&id| id_text(id)).collect::<Vec<_>>(),
+                "names": texts_of(&self.names),
+                "location_ids": self.location_ids.iter().map(|&id| id_text(id)).collect::<Vec<_>>(),
+            }),
+            Self::KIND_SERIES => serde_json::json!({
+                "org_id": &*self.org_id,
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "type_id": &*self.type_id,
+                "service": &*self.service,
+                "fingerprint": fingerprint,
+                "timestamp_ns": self.timestamp_ns,
+                "labels": self.labels,
+            }),
+            Self::KIND_ENTRY => serde_json::json!({
+                "org_id": &*self.org_id,
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "type_id": &*self.type_id,
+                "service": &*self.service,
+                "fingerprint": fingerprint,
+                "timestamp_ns": self.timestamp_ns,
+                "profile_id": profile_id,
+                "total": self.value,
+                "duration_ns": self.duration_ns,
+                "annotation_keys": self.annotation_keys,
+                "annotation_values": self.annotation_values,
+            }),
+            // Every row is one of the five kinds, so this arm is the
+            // location's, as the fallback rather than a panic on a failure
+            // path, `LogLandingRow`'s rule.
+            _ => serde_json::json!({
+                "org_id": &*self.org_id,
+                "kind": self.kind,
+                "received_ms": self.received_ms,
+                "location_id": id_text(self.location_id),
+                "mapping_file": &*self.mapping_file,
+                "mapping_build_id": &*self.mapping_build_id,
+                "mapping_start": self.mapping_start,
+                "mapping_limit": self.mapping_limit,
+                "mapping_offset": self.mapping_offset,
+                "address": self.address,
+                "line_functions": texts_of(&self.line_functions),
+                "line_system_names": texts_of(&self.line_system_names),
+                "line_files": texts_of(&self.line_files),
+                "line_start_lines": self.line_start_lines,
+                "line_numbers": self.line_numbers,
+            }),
+        }
     }
 }
 
