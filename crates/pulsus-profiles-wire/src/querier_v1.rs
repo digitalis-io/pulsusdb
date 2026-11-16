@@ -249,3 +249,26 @@ impl ProfileFormat {
         .find(|f| f.as_str_name() == name)
     }
 }
+
+/// `SelectSeries`' request (issue #824). Not written yet.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelectSeriesRequest {
+    pub profile_type_id: String,
+    pub label_selector: String,
+    pub start: i64,
+    pub end: i64,
+    pub group_by: Vec<String>,
+    pub step: f64,
+    pub aggregation: Option<i32>,
+    pub stack_trace_selector: Option<crate::types_v1::StackTraceSelector>,
+    pub limit: Option<i64>,
+    pub exemplar_type: i32,
+}
+
+/// `SelectSeries`' response (issue #824). Not written yet.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelectSeriesResponse {
+    pub series: Vec<crate::types_v1::Series>,
+}

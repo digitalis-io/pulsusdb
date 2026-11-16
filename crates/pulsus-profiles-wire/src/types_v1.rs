@@ -201,3 +201,38 @@ pub struct ProfileAnnotation {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub value: String,
 }
+
+/// Issue #824: one time series. Not written yet.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Series {
+    pub labels: Vec<LabelPair>,
+    pub points: Vec<Point>,
+}
+
+/// Issue #824: one point of a time series. Not written yet.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Point {
+    pub value: f64,
+    pub timestamp: i64,
+    pub annotations: Vec<ProfileAnnotation>,
+}
+
+/// Issue #824: how a time series' step combines its profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum TimeSeriesAggregationType {
+    Sum = 0,
+    Average = 1,
+}
+
+/// Issue #824: the exemplars a time series request asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ExemplarType {
+    Unspecified = 0,
+    None = 1,
+    Individual = 2,
+    Span = 3,
+}

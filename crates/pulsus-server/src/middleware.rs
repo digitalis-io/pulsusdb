@@ -522,8 +522,8 @@ mod tests {
         }
     }
 
-    /// C6 (issue #821, #823): the ten Connect paths answer a deadline as a
-    /// Connect error, the five `GET` routes (`{name}` as `env`) as the
+    /// C6 (issue #821, #823, #824): the twelve Connect paths answer a
+    /// deadline as a Connect error, the six `GET` routes (`{name}` as `env`) as the
     /// reference's HTTP handlers do; the profiles ingest path keeps the bare
     /// `408`.
     #[test]
@@ -539,6 +539,8 @@ mod tests {
             "/api/profiles/v1/querier.v1.QuerierService/Series",
             "/querier.v1.QuerierService/SelectMergeStacktraces",
             "/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces",
+            "/querier.v1.QuerierService/SelectSeries",
+            "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::Connect, "{path}");
         }
@@ -548,6 +550,7 @@ mod tests {
             "/api/profiles/v1/label/env/values",
             "/api/profiles/v1/series",
             "/api/profiles/v1/merge",
+            "/api/profiles/v1/select_series",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::ProfilesHttp, "{path}");
         }
@@ -563,9 +566,9 @@ mod tests {
     #[test]
     fn an_unrelated_path_under_a_profiles_prefix_keeps_its_class() {
         for path in [
-            "/querier.v1.QuerierService/SelectSeries",
+            "/querier.v1.QuerierService/SelectMergeProfile",
             "/querier.v1.QuerierService/LabelNamesX",
-            "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
+            "/api/profiles/v1/querier.v1.QuerierService/SelectMergeProfile",
             "/api/profiles/v1/querier.v1.QuerierService/",
             "/api/profiles/v1/render",
             "/api/profiles/v1/label/a/b/values",

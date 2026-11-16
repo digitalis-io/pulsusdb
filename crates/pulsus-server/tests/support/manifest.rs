@@ -3067,6 +3067,40 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: PROFILES_CONNECT_BASE_BODY,
         cases: &[],
     },
+    // -- Profiles time series (issue #824, docs/api.md §5) ---------------
+    RouteSpec {
+        path: "/api/profiles/v1/select_series",
+        methods: &[Method::Get],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_GET_BASE_QUERY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/querier.v1.QuerierService/SelectSeries",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
     // -- Planned (documented, not yet mounted) ---------------------------
     // Representative, not exhaustive (deviation, see issue #36 implementation
     // notes): every M4-M8 §4-§8 row is out of scope for a guard whose only

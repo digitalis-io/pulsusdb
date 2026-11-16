@@ -11,6 +11,8 @@ pub(crate) mod connect;
 mod engine;
 mod merge;
 pub(crate) mod routes;
+#[allow(dead_code)]
+mod series;
 
 use axum::Router;
 use axum::routing::{get, post};

@@ -63,3 +63,33 @@ pub mod profile_format {
         *v == 0
     }
 }
+
+/// Issue #824: a message whose encoding is not written yet: it encodes
+/// nothing and skips every field it reads.
+macro_rules! stub_message {
+    ($($t:ty),*) => {$(
+        impl prost::Message for $t {
+            fn encode_raw(&self, _buf: &mut impl prost::bytes::BufMut) {}
+            fn merge_field(
+                &mut self,
+                tag: u32,
+                wire_type: prost::encoding::WireType,
+                buf: &mut impl prost::bytes::Buf,
+                ctx: prost::encoding::DecodeContext,
+            ) -> Result<(), prost::DecodeError> {
+                prost::encoding::skip_field(wire_type, tag, buf, ctx)
+            }
+            fn encoded_len(&self) -> usize {
+                0
+            }
+            fn clear(&mut self) {}
+        }
+    )*};
+}
+
+stub_message!(
+    types_v1::Series,
+    types_v1::Point,
+    querier_v1::SelectSeriesRequest,
+    querier_v1::SelectSeriesResponse
+);

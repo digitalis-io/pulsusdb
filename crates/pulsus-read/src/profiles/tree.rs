@@ -389,6 +389,7 @@ GROUP BY node";
         ProfilesReadConfig {
             series_table: "profile_series".to_string(),
             samples_table: "profile_samples".to_string(),
+            entries_table: "profile_entries".to_string(),
             dist_suffix: String::new(),
             limits: WindowLimits::default(),
             scan_budget_rows: 50_000_000,
@@ -406,6 +407,7 @@ GROUP BY node";
         ProfilesReadConfig {
             series_table: "profile_series_dist".to_string(),
             samples_table: "profile_samples_dist".to_string(),
+            entries_table: "profile_entries_dist".to_string(),
             dist_suffix: "_dist".to_string(),
             distributed: true,
             ..single()
