@@ -24,7 +24,7 @@ The points each level row gives (`level_points`, `crates/pulsus-read/src/metrics
 | `Last` | `(t_last, last)` when `t_last > 0`; then `(t_end, stale marker)` when `flags & 1` |
 | `Max`, `Min` | `(t_end, max)` or `(t_end, min)` when `count > 0`; else `(t_end, last)` when `flags & 2`, every value being NaN and `last` the last of them, its payload kept; else none |
 | `Sum`, `Avg` | `(t_end, NaN)` when `flags & 2`; else `(t_end, sum)` or `(t_end, sum / count)` when `count > 0`; else none |
-| `Counter` | a counter `c` that never resets: the first row's `last`, then plus each later row's `inc`; the point `(t_last, c)`. At levels of 720 s and more, also `(t_end − res + 1, c − inc)` before it, one millisecond after the bucket's start. A row with `t_last = 0` gives no point and still adds its `inc`; a row whose `last` is NaN gives `(t_last, last)`, adds its `inc` and leaves `p` |
+| `Counter` | a counter `c` that never resets: the first row's `last`, then plus each later row's `inc`; the point `(t_last, c)`. At levels of 720 s and more, also `(t_end − res + 1, c′)` before it, one millisecond after the bucket's start, `c′` the counter before the row (issue #863), or `last − inc` for the first row. A row with `t_last = 0` gives no point and still adds its `inc`; a row whose `last` is NaN gives `(t_last, last)`, adds its `inc` and leaves `p` |
 
 Stale markers and NaN read as raw for the bit-equal functions: a routed `Last` selector is evaluated only at bucket ends (§2), so a stale marker's exact time inside its bucket never decides an answer, and a marker placed at `t_end` gives what raw gives there; range functions drop markers, so only the last non-stale sample matters to them.
 

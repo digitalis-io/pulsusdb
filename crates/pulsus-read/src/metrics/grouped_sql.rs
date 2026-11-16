@@ -879,7 +879,8 @@ FROM (
 /// elements in time order. A level row adds its increase; a raw sample its
 /// step from the last value, or itself on a drop; the first row or sample
 /// with a number starts the counter. From 720 s a level row also gives a
-/// start point. Each point carries its element's position and a sub-order
+/// start point: the counter before the row (issue #863), or `last − inc`
+/// for the first. Each point carries its element's position and a sub-order
 /// (the start point first), so points at one time keep the fold's order.
 /// Stale markers are dropped and the groups with no point removed last.
 pub fn counter_gather(
@@ -903,7 +904,7 @@ SELECT fingerprint,{b} toUInt8(0) AS arm,
        if(isNaN(x.4) AND (x.2 = 0 OR x.3 > 0), [(x.3, i, 1, reinterpretAsUInt64(x.4))], []),
        multiIf(x.2 > 0 AND x.3 = 0, CAST([], 'Array(Tuple(Int64, UInt64, UInt8, UInt64))'),
                isNaN(x.4), [(x.3, i, 1, reinterpretAsUInt64(x.4))],
-               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(c - x.5)), (x.3, i, 1, reinterpretAsUInt64(c))],
+               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(if(i > s, cs[i - 1], c - x.5))), (x.3, i, 1, reinterpretAsUInt64(c))],
                [(x.3, i, 1, reinterpretAsUInt64(c))])),
     e, arrayEnumerate(e), cs))))) AS raw
 FROM (

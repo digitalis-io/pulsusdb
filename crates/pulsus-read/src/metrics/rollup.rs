@@ -1097,6 +1097,9 @@ fn counter(seq: &[Tagged], out: &mut Vec<Sample>) {
                 }
             }
             Tagged::Level { res_ms, row } => {
+                // Issue #863: the start point is `c` before this row, not
+                // `now − inc`, which can round below the previous point.
+                let before = c;
                 let now = match c {
                     Some(c) => c + row.inc,
                     None if row.last.is_nan() => {
@@ -1111,7 +1114,8 @@ fn counter(seq: &[Tagged], out: &mut Vec<Sample>) {
                     continue;
                 }
                 if *res_ms >= START_POINT_FROM_MS {
-                    out.push(Sample::float(row.t_end - res_ms + 1, now - row.inc));
+                    let start = before.unwrap_or(row.last - row.inc);
+                    out.push(Sample::float(row.t_end - res_ms + 1, start));
                 }
                 out.push(Sample::float(row.t_last, now));
                 p = Some(row.last);
@@ -1967,6 +1971,46 @@ mod tests {
         assert_eq!(
             at(RollupUse::Last, r),
             vec![(e1 - 5_000, 4.0), (e2 - 9_000, 6.0), (e2 + 1_000, 7.5)]
+        );
+    }
+
+    /// **Issue #863: a row's start point is the previous point exactly.**
+    /// Two 720 s rows from a series whose counter had reset: `c + inc`
+    /// rounds, so `c + inc − inc` lands one unit in the last place below
+    /// `c`, which a rate reads as a reset. The start point is the counter
+    /// as it was before the row, so no point falls below the one before it.
+    #[test]
+    fn a_start_point_never_falls_below_the_previous_point() {
+        let r = 720_000;
+        let (e1, e2) = (BASE + r, BASE + 2 * r);
+        let rows = [
+            row(
+                e1,
+                e1 - 5_000,
+                553_667.740_000_000_1,
+                167.010_000_000_002_04,
+                48,
+            ),
+            row(e2, e2 - 5_000, 553_834.55, 166.809_999_999_997_67, 48),
+        ];
+        let seq: Vec<Tagged> = rows
+            .iter()
+            .map(|&row| Tagged::Level { res_ms: r, row })
+            .collect();
+        let (pts, _) = assemble(RollupUse::Counter, r, &seq, &Vec::new());
+        assert_eq!(pts.len(), 4, "a start point and an end point per row");
+        for w in pts.windows(2) {
+            assert!(
+                w[1].v >= w[0].v,
+                "a point below the one before it: {:?} after {:?}",
+                (w[1].t_ms, w[1].v),
+                (w[0].t_ms, w[0].v)
+            );
+        }
+        assert_eq!(
+            pts[2].v.to_bits(),
+            pts[1].v.to_bits(),
+            "the second row's start point is the first row's end point"
         );
     }
 
