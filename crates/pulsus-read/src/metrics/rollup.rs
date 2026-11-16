@@ -1970,6 +1970,46 @@ mod tests {
         );
     }
 
+    /// **Issue #863: a row's start point is the previous point exactly.**
+    /// Two 720 s rows from a series whose counter had reset: `c + inc`
+    /// rounds, so `c + inc − inc` lands one unit in the last place below
+    /// `c`, which a rate reads as a reset. The start point is the counter
+    /// as it was before the row, so no point falls below the one before it.
+    #[test]
+    fn a_start_point_never_falls_below_the_previous_point() {
+        let r = 720_000;
+        let (e1, e2) = (BASE + r, BASE + 2 * r);
+        let rows = [
+            row(
+                e1,
+                e1 - 5_000,
+                553_667.740_000_000_1,
+                167.010_000_000_002_04,
+                48,
+            ),
+            row(e2, e2 - 5_000, 553_834.55, 166.809_999_999_997_67, 48),
+        ];
+        let seq: Vec<Tagged> = rows
+            .iter()
+            .map(|&row| Tagged::Level { res_ms: r, row })
+            .collect();
+        let (pts, _) = assemble(RollupUse::Counter, r, &seq, &Vec::new());
+        assert_eq!(pts.len(), 4, "a start point and an end point per row");
+        for w in pts.windows(2) {
+            assert!(
+                w[1].v >= w[0].v,
+                "a point below the one before it: {:?} after {:?}",
+                (w[1].t_ms, w[1].v),
+                (w[0].t_ms, w[0].v)
+            );
+        }
+        assert_eq!(
+            pts[2].v.to_bits(),
+            pts[1].v.to_bits(),
+            "the second row's start point is the first row's end point"
+        );
+    }
+
     fn bits(s: &[Sample]) -> Vec<(i64, u64)> {
         s.iter().map(|x| (x.t_ms, x.v.to_bits())).collect()
     }

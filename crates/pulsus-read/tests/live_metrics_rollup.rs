@@ -3150,6 +3150,77 @@ async fn a_level_older_than_raw_answers() {
     drop_database(&bootstrap, db).await;
 }
 
+static DB_T863: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_read_it_rollup_t863");
+
+/// **Issue #863: a rate over the 720 s level does not spike on rounding.**
+/// Two hand-made 720 s rows of one counter whose running total sits where
+/// `c + inc − inc` rounds one unit in the last place below `c`, and one run
+/// row over them. `sum(rate(c863[24m]))` over the day at step 12 min, pushed
+/// (the grouped statement) and in process: the step whose window holds both
+/// rows is the second row's increase over its window, about 0.23, and no
+/// step reads the drop as a counter reset.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rate_over_the_720s_level_does_not_read_rounding_as_a_reset() {
+    skip_unless_live!();
+    let db = DB_T863.name();
+    let d0 = today() - DAY;
+    let fp = "toUInt128('24000000000000000000000000000000863001')";
+    let land = vec![format!(
+        "INSERT INTO {db}.metric_landing (org_id, received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+         SELECT '', toInt64(toUnixTimestamp64Milli(now64(3))), 2, 'c863', {fp}, \
+                toInt64({}) + toInt64(number) * {HOUR} + 1000, '{{\"job\":\"c863\"}}', 0 FROM numbers(72)",
+        d0 - DAY
+    )];
+    let (bootstrap, admin, ctx) = first_only(db, (&[60, 720], &[60, 86400]), &land, d0, d0).await;
+    let (e1, e2) = (d0 + 11 * 720_000, d0 + 12 * 720_000);
+    exec(
+        &admin,
+        &format!(
+            "INSERT INTO {db}.metric_samples_720s (kind, org_id, fingerprint, t_end, t_last, last, min, max, sum, count, inc, flags, built_at) VALUES \
+             (0, '', {fp}, {e1}, {}, 553667.7400000001, 0, 0, 0, 48, 167.01000000000204, 0, 0), \
+             (0, '', {fp}, {e2}, {}, 553834.55, 0, 0, 0, 48, 166.80999999999767, 0, 0), \
+             (1, '', 0, {}, {}, 0, 0, 0, 0, 0, 0, 0, 0)",
+            e1 - 5_000,
+            e2 - 5_000,
+            d0 + DAY,
+            d0 - DAY,
+        ),
+    )
+    .await;
+    let built = warm(bootstrap, admin, ctx, &[]).await;
+    let q = "sum(rate(c863[24m]))";
+    let p = range(d0, d0 + DAY, 12 * MIN);
+    let t = no_tenant();
+    let mut failures = Vec::new();
+    for (name, pushed) in [("pushed", true), ("in process", false)] {
+        let e = if pushed {
+            built.pushed_engine(None).await
+        } else {
+            built.engine(true, None).await
+        };
+        let a = ask(&e, &t, q, &p).await;
+        if pushed && a.pushed().is_empty() {
+            failures.push(format!("{name}: not pushed: {:?}", a.declines()));
+        }
+        let points = a.points();
+        for ((_, at), v) in &points {
+            if !(*v > 0.0 && *v < 0.25) {
+                failures.push(format!("{name} at {at}: {v}"));
+            }
+        }
+        match points
+            .iter()
+            .find(|((_, at), _)| *at == e2)
+            .map(|(_, v)| *v)
+        {
+            Some(v) if (v - 0.233).abs() < 0.005 => {}
+            got => failures.push(format!("{name} at {e2}: {got:?}, want about 0.23")),
+        }
+    }
+    built.finish().await;
+    assert!(failures.is_empty(), "#863:\n{}", failures.join("\n"));
+}
+
 // ------------------------------------------ issue #579 part 4, corpus P
 
 /// The panel part 4 was measured on: shape C over two counters read from
