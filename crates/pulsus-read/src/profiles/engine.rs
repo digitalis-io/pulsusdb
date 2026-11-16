@@ -11,6 +11,7 @@ use crate::traces::tenant_scope::TenantTerm;
 use super::catalogue::{Read, compat_sets};
 use super::dispatch::ProfileDispatch;
 use super::selector::WindowLimits;
+use super::tree::TreeRow;
 
 /// ClickHouse's `TOO_MANY_ROWS` (`max_rows_to_read`).
 const CODE_TOO_MANY_ROWS: i32 = 158;
@@ -43,6 +44,8 @@ pub enum ProfilesReadError {
 pub struct ProfilesReadConfig {
     /// `profile_series`, or its wrapper on a cluster.
     pub series_table: String,
+    /// Issue #823: `profile_samples`, or its wrapper on a cluster.
+    pub samples_table: String,
     /// The wrapper suffix when clustered, else empty: the tenant check's
     /// table list.
     pub dist_suffix: String,
@@ -53,6 +56,11 @@ pub struct ProfilesReadConfig {
     pub query_memory_bytes: u64,
     pub distributed: bool,
     pub skip_unavailable_shards: bool,
+    /// Issue #823: the flame graph's `max_nodes` when a request sends none
+    /// or 0.
+    pub max_nodes_default: i64,
+    /// Issue #823: the largest `max_nodes` a request may send.
+    pub max_nodes_max: i64,
 }
 
 impl ProfilesReadConfig {
@@ -66,6 +74,7 @@ impl ProfilesReadConfig {
         let r = &config.reader;
         ProfilesReadConfig {
             series_table: format!("profile_series{dist}"),
+            samples_table: String::new(),
             dist_suffix: dist.to_string(),
             limits: WindowLimits {
                 max_length_ms: millis(r.profiles_max_query_length.0),
@@ -77,6 +86,8 @@ impl ProfilesReadConfig {
             query_memory_bytes: r.profiles_query_memory_bytes,
             distributed: config.cluster.is_some(),
             skip_unavailable_shards: config.skip_unavailable_shards,
+            max_nodes_default: 0,
+            max_nodes_max: 0,
         }
     }
 }
@@ -105,6 +116,12 @@ fn read_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> Quer
         s = s.set("log_comment", comment);
     }
     s
+}
+
+/// Issue #823: the settings S5 carries — [`read_settings`], and the join's
+/// build side kept on the aggregated samples.
+fn tree_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> QuerySettings {
+    read_settings(config, log_comment)
 }
 
 /// The class of a failed profiles statement (plan §6).
@@ -202,6 +219,14 @@ impl ProfilesEngine {
             }
         }
     }
+
+    /// Issue #823: sends S5 (`super::tree`) and returns the merged tree's
+    /// rows.
+    pub async fn read_tree(&self, sql: &str) -> Result<Vec<TreeRow>, ProfilesReadError> {
+        let settings = tree_settings(&self.config, self.log_comment.as_deref());
+        let _ = (sql, settings);
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +236,7 @@ mod tests {
     fn off_default() -> ProfilesReadConfig {
         ProfilesReadConfig {
             series_table: "profile_series".to_string(),
+            samples_table: "profile_samples".to_string(),
             dist_suffix: String::new(),
             limits: WindowLimits::default(),
             scan_budget_rows: 11,
@@ -219,6 +245,8 @@ mod tests {
             query_memory_bytes: 19,
             distributed: false,
             skip_unavailable_shards: true,
+            max_nodes_default: 23,
+            max_nodes_max: 29,
         }
     }
 
@@ -256,6 +284,19 @@ mod tests {
             clustered.contains(r#"("distributed_product_mode", "local")"#),
             "{clustered}"
         );
+        // Issue #823 (D4): S5 carries every setting above, and keeps the
+        // join's build side on the aggregated samples; the catalogue reads
+        // do not carry it.
+        let tree = format!("{:?}", tree_settings(&off_default(), Some("abc")));
+        for expected in [
+            r#"("max_rows_to_read", "11")"#,
+            r#"("max_result_rows", "13")"#,
+            r#"("log_comment", "abc")"#,
+            r#"("query_plan_join_swap_table", "false")"#,
+        ] {
+            assert!(tree.contains(expected), "{expected} missing from {tree}");
+        }
+        assert!(!single.contains("query_plan_join_swap_table"), "{single}");
     }
 
     /// Q6: each server code and transport failure maps to its class.
@@ -337,8 +378,13 @@ mod tests {
             config.reader.profiles_max_tree_nodes = 9;
             config.reader.profiles_max_result_bytes = 11;
             config.reader.profiles_query_memory_bytes = 13;
+            config.reader.profiles_max_nodes_default = 17;
+            config.reader.profiles_max_nodes_max = 19;
             let c = ProfilesReadConfig::from_config(&config);
             assert_eq!(c.series_table, format!("profile_series{dist}"));
+            assert_eq!(c.samples_table, format!("profile_samples{dist}"));
+            assert_eq!(c.max_nodes_default, 17);
+            assert_eq!(c.max_nodes_max, 19);
             assert_eq!(c.dist_suffix, dist);
             assert_eq!(
                 c.limits,

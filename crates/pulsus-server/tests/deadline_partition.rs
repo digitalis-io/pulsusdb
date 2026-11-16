@@ -165,6 +165,8 @@ const CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/LabelNames",
     "/api/profiles/v1/querier.v1.QuerierService/LabelValues",
     "/api/profiles/v1/querier.v1.QuerierService/Series",
+    "/querier.v1.QuerierService/SelectMergeStacktraces",
+    "/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces",
 ];
 
 /// Issue #821: the four profiles `GET` routes, which answer it as the
@@ -174,6 +176,7 @@ const PROFILES_HTTP_PATHS: &[&str] = &[
     "/api/profiles/v1/labels",
     "/api/profiles/v1/label/{name}/values",
     "/api/profiles/v1/series",
+    "/api/profiles/v1/merge",
 ];
 
 fn mounted_of(surface: Surface) -> BTreeSet<String> {

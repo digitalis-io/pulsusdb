@@ -81,3 +81,83 @@ pub struct SeriesResponse {
     )]
     pub labels_set: Vec<Labels>,
 }
+
+/// A message without its encoding yet (issue #823's tests-first commit).
+macro_rules! unencoded {
+    ($t:ty) => {
+        impl ::prost::Message for $t {
+            fn encode_raw(&self, _buf: &mut impl ::prost::bytes::BufMut) {}
+            fn merge_field(
+                &mut self,
+                tag: u32,
+                wire_type: ::prost::encoding::WireType,
+                buf: &mut impl ::prost::bytes::Buf,
+                ctx: ::prost::encoding::DecodeContext,
+            ) -> Result<(), ::prost::DecodeError> {
+                ::prost::encoding::skip_field(wire_type, tag, buf, ctx)
+            }
+            fn encoded_len(&self) -> usize {
+                0
+            }
+            fn clear(&mut self) {
+                *self = Self::default();
+            }
+        }
+    };
+}
+pub(crate) use unencoded;
+
+/// `SelectMergeStacktraces`' request.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelectMergeStacktracesRequest {
+    pub profile_type_id: String,
+    pub label_selector: String,
+    pub start: i64,
+    pub end: i64,
+    pub max_nodes: Option<i64>,
+    pub format: i32,
+    pub stack_trace_selector: Option<crate::types_v1::StackTraceSelector>,
+    pub profile_id_selector: Vec<String>,
+    pub trace_id_selector: Vec<String>,
+    pub span_selector: Vec<String>,
+}
+unencoded!(SelectMergeStacktracesRequest);
+
+/// `SelectMergeStacktraces`' response.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelectMergeStacktracesResponse {
+    pub flamegraph: Option<FlameGraph>,
+}
+unencoded!(SelectMergeStacktracesResponse);
+
+/// A flame graph.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlameGraph {
+    pub names: Vec<String>,
+    pub levels: Vec<Level>,
+    pub total: i64,
+    pub max_self: i64,
+}
+unencoded!(FlameGraph);
+
+/// One level of a flame graph.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Level {
+    pub values: Vec<i64>,
+}
+unencoded!(Level);
+
+/// The answer's format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ProfileFormat {
+    Unspecified = 0,
+    Flamegraph = 1,
+    Tree = 2,
+    Dot = 3,
+    Pprof = 4,
+}

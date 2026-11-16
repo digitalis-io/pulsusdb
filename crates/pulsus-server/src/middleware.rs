@@ -532,6 +532,8 @@ mod tests {
             "/api/profiles/v1/querier.v1.QuerierService/LabelNames",
             "/api/profiles/v1/querier.v1.QuerierService/LabelValues",
             "/api/profiles/v1/querier.v1.QuerierService/Series",
+            "/querier.v1.QuerierService/SelectMergeStacktraces",
+            "/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::Connect, "{path}");
         }
@@ -540,6 +542,7 @@ mod tests {
             "/api/profiles/v1/labels",
             "/api/profiles/v1/label/env/values",
             "/api/profiles/v1/series",
+            "/api/profiles/v1/merge",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::ProfilesHttp, "{path}");
         }
@@ -555,7 +558,7 @@ mod tests {
     #[test]
     fn an_unrelated_path_under_a_profiles_prefix_keeps_its_class() {
         for path in [
-            "/querier.v1.QuerierService/SelectMergeStacktraces",
+            "/querier.v1.QuerierService/SelectSeries",
             "/querier.v1.QuerierService/LabelNamesX",
             "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
             "/api/profiles/v1/querier.v1.QuerierService/",

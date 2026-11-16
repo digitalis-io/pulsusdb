@@ -7,6 +7,7 @@
 
 pub(crate) mod connect;
 mod engine;
+mod merge;
 pub(crate) mod routes;
 
 use axum::Router;

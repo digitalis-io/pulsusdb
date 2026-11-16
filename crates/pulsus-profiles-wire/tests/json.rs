@@ -1,12 +1,16 @@
 //! W2 and W3 (issue #821): the query messages' proto3 JSON mapping. Out:
 //! lowerCamelCase names, a field at its default omitted. In: a field by its
 //! JSON name or its proto name, an `int64` as a number or a decimal string,
-//! an unknown field ignored.
+//! an unknown field ignored. W4 and W5 (issue #823): the merge's messages,
+//! an enum by its name or its number.
 
 use pulsus_profiles_wire::querier_v1::{
-    ProfileTypesRequest, ProfileTypesResponse, SeriesRequest, SeriesResponse,
+    FlameGraph, Level, ProfileFormat, ProfileTypesRequest, ProfileTypesResponse,
+    SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SeriesRequest, SeriesResponse,
 };
-use pulsus_profiles_wire::types_v1::{LabelPair, Labels, ProfileType};
+use pulsus_profiles_wire::types_v1::{
+    GoPgo, LabelPair, Labels, Location, ProfileType, StackTraceSelector,
+};
 
 fn split(id: &str) -> ProfileType {
     let parts: Vec<&str> = id.split(':').collect();
@@ -70,4 +74,103 @@ fn w3_requests_read_either_name_and_either_int64_form() {
     let r = serde_json::from_str::<SeriesRequest>(r#"{"x":1}"#).map_err(|e| e.to_string());
     assert_eq!(r, Ok(SeriesRequest::default()));
     assert!(serde_json::from_str::<ProfileTypesRequest>(r#"{"start":"x"}"#).is_err());
+}
+
+fn level(values: &[i64]) -> Level {
+    Level {
+        values: values.to_vec(),
+    }
+}
+
+/// W4: the flame graph as the reference writes it — plan §3.1's first row,
+/// and the empty flame graph with its zero total and max self omitted.
+#[test]
+fn w4_the_flame_graph_is_written_as_the_reference_writes_it() {
+    let row1 = SelectMergeStacktracesResponse {
+        flamegraph: Some(FlameGraph {
+            names: ["total", "main", "other", "e", "f", "d", "a", "c", "b"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            levels: vec![
+                level(&[0, 32, 0, 0]),
+                level(&[0, 32, 0, 1]),
+                level(&[0, 24, 2, 6, 0, 3, 3, 5, 0, 1, 0, 3, 0, 4, 4, 2]),
+                level(&[2, 17, 17, 8, 0, 5, 5, 7, 3, 1, 1, 4]),
+            ],
+            total: 32,
+            max_self: 17,
+        }),
+    };
+    assert_eq!(
+        serde_json::to_string(&row1).expect("encode"),
+        r#"{"flamegraph":{"names":["total","main","other","e","f","d","a","c","b"],"levels":[{"values":["0","32","0","0"]},{"values":["0","32","0","1"]},{"values":["0","24","2","6","0","3","3","5","0","1","0","3","0","4","4","2"]},{"values":["2","17","17","8","0","5","5","7","3","1","1","4"]}],"total":"32","maxSelf":"17"}}"#
+    );
+    let empty = SelectMergeStacktracesResponse {
+        flamegraph: Some(FlameGraph {
+            names: vec!["total".to_string()],
+            levels: vec![level(&[0, 0, 0, 0])],
+            total: 0,
+            max_self: 0,
+        }),
+    };
+    assert_eq!(
+        serde_json::to_string(&empty).expect("encode"),
+        r#"{"flamegraph":{"names":["total"],"levels":[{"values":["0","0","0","0"]}]}}"#
+    );
+}
+
+/// W5: the request reads either name, `maxNodes` as a number or a string,
+/// `format` as its name or its number, and ignores `async`.
+#[test]
+fn w5_the_merge_request_reads_either_form() {
+    let expected = SelectMergeStacktracesRequest {
+        profile_type_id: "a:b:c:d:e".to_string(),
+        label_selector: "{x=\"1\"}".to_string(),
+        start: 1000,
+        end: 2000,
+        max_nodes: Some(4),
+        format: ProfileFormat::Flamegraph as i32,
+        stack_trace_selector: Some(StackTraceSelector {
+            call_site: vec![Location {
+                name: "main".to_string(),
+            }],
+            go_pgo: Some(GoPgo {
+                keep_locations: 2,
+                aggregate_callees: true,
+            }),
+        }),
+        profile_id_selector: vec!["p".to_string()],
+        trace_id_selector: vec!["t".to_string()],
+        span_selector: vec!["s".to_string()],
+    };
+    for body in [
+        r#"{"profileTypeID":"a:b:c:d:e","labelSelector":"{x=\"1\"}","start":"1000","end":"2000","maxNodes":4,"format":"PROFILE_FORMAT_FLAMEGRAPH","stackTraceSelector":{"callSite":[{"name":"main"}],"goPgo":{"keepLocations":2,"aggregateCallees":true}},"profileIdSelector":["p"],"traceIdSelector":["t"],"spanSelector":["s"]}"#,
+        r#"{"profile_typeID":"a:b:c:d:e","label_selector":"{x=\"1\"}","start":1000,"end":2000,"max_nodes":"4","format":1,"stack_trace_selector":{"call_site":[{"name":"main"}],"go_pgo":{"keep_locations":2,"aggregate_callees":true}},"profile_id_selector":["p"],"trace_id_selector":["t"],"span_selector":["s"],"async":{"x":1}}"#,
+    ] {
+        let r = serde_json::from_str::<SelectMergeStacktracesRequest>(body)
+            .map_err(|e| e.to_string());
+        assert_eq!(r, Ok(expected.clone()), "{body}");
+    }
+    // Absent, `maxNodes` is `None`; `format` is unspecified.
+    let r = serde_json::from_str::<SelectMergeStacktracesRequest>("{}")
+        .map(|r| (r.max_nodes, r.format))
+        .map_err(|e| e.to_string());
+    assert_eq!(r, Ok((None, 0)));
+    for (name, n) in [
+        ("PROFILE_FORMAT_UNSPECIFIED", 0),
+        ("PROFILE_FORMAT_TREE", 2),
+        ("PROFILE_FORMAT_DOT", 3),
+        ("PROFILE_FORMAT_PPROF", 4),
+    ] {
+        let r = serde_json::from_str::<SelectMergeStacktracesRequest>(&format!(
+            r#"{{"format":"{name}"}}"#
+        ))
+        .map(|r| r.format)
+        .map_err(|e| e.to_string());
+        assert_eq!(r, Ok(n), "{name}");
+    }
+    assert!(
+        serde_json::from_str::<SelectMergeStacktracesRequest>(r#"{"format":"NOPE"}"#).is_err()
+    );
 }

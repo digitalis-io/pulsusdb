@@ -688,6 +688,12 @@ pub struct ReaderConfig {
     pub profiles_max_result_bytes: u64,
     /// Issue #821: `max_memory_usage` on every profiles read. >= 1.
     pub profiles_query_memory_bytes: u64,
+    /// Issue #823: the flame graph's node count when a request sends none
+    /// or 0. >= 1 and <= `profiles_max_nodes_max`.
+    pub profiles_max_nodes_default: u64,
+    /// Issue #823: the largest node count a flame graph request may send.
+    /// >= 1.
+    pub profiles_max_nodes_max: u64,
 }
 
 impl Default for ReaderConfig {
@@ -736,6 +742,8 @@ impl Default for ReaderConfig {
             profiles_max_tree_nodes: 4_194_304,
             profiles_max_result_bytes: 268_435_456,
             profiles_query_memory_bytes: 4_294_967_296,
+            profiles_max_nodes_default: 8_192,
+            profiles_max_nodes_max: 1_048_576,
         }
     }
 }

@@ -483,6 +483,16 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.profiles_query_memory_bytes == 2_097_152,
     },
     Row {
+        var: "PULSUS_PROFILES_MAX_NODES_DEFAULT",
+        value: "4096",
+        check: |c| c.reader.profiles_max_nodes_default == 4_096,
+    },
+    Row {
+        var: "PULSUS_PROFILES_MAX_NODES_MAX",
+        value: "65536",
+        check: |c| c.reader.profiles_max_nodes_max == 65_536,
+    },
+    Row {
         var: "PULSUS_LOGQL_READ_MAX_MEMORY_BYTES",
         value: "2097152",
         check: |c| c.reader.logql_read_max_memory_bytes == 2_097_152,

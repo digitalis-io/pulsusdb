@@ -1659,6 +1659,13 @@ jobs:
           PULSUS_TEST_CH_CLUSTER: "pulsus_test_cluster"
         run: cargo test -p pulsus-read --test traces_tenant_rows
 
+      # Issue #823: the merged flame graph over the distributed sample table,
+      # the samples split across both shards, in one statement.
+      - name: Merged flame graph over the distributed tables (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test profiles_tree_cluster
+
       # Issue #43: cross-node connection spreading over the two DISTINCT real
       # nodes (SHARD1/SHARD2 default to the fixture IPs 172.28.0.11/12:8123),
       # proving the pool selects both nodes and fails over off a dead port,

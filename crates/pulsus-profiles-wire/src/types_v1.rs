@@ -131,3 +131,29 @@ pub struct LabelValuesResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<String>,
 }
+
+/// A stack trace selector.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StackTraceSelector {
+    pub call_site: Vec<Location>,
+    pub go_pgo: Option<GoPgo>,
+}
+crate::querier_v1::unencoded!(StackTraceSelector);
+
+/// A call site frame.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Location {
+    pub name: String,
+}
+crate::querier_v1::unencoded!(Location);
+
+/// The Go PGO selector.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoPgo {
+    pub keep_locations: u32,
+    pub aggregate_callees: bool,
+}
+crate::querier_v1::unencoded!(GoPgo);
