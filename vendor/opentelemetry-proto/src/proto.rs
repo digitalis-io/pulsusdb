@@ -690,6 +690,54 @@ pub(crate) mod serializers {
         deserializer.deserialize_any(I64Visitor)
     }
 
+    // PATCH (PulsusDB, docs/decisions/0004, item P8): `Sample.values` of the
+    // profiles signal, an `int64` vector: each element written as a string,
+    // read from a string or a number.
+    pub mod vec_i64_string {
+        use serde::de::{self, SeqAccess, Visitor};
+        use serde::ser::SerializeSeq;
+        use serde::{Deserializer, Serializer};
+        use std::fmt;
+
+        pub fn serialize<S: Serializer>(value: &[i64], serializer: S) -> Result<S::Ok, S::Error> {
+            let mut seq = serializer.serialize_seq(Some(value.len()))?;
+            for v in value {
+                seq.serialize_element(&v.to_string())?;
+            }
+            seq.end()
+        }
+
+        struct Element(i64);
+
+        impl<'de> de::Deserialize<'de> for Element {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                super::deserialize_string_to_i64(d).map(Element)
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<i64>, D::Error> {
+            struct VecVisitor;
+
+            impl<'de> Visitor<'de> for VecVisitor {
+                type Value = Vec<i64>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a sequence of i64 integers or strings containing i64 integers")
+                }
+
+                fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<i64>, A::Error> {
+                    let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
+                    while let Some(Element(v)) = seq.next_element()? {
+                        out.push(v);
+                    }
+                    Ok(out)
+                }
+            }
+
+            d.deserialize_seq(VecVisitor)
+        }
+    }
+
     // Special serializer and deserializer for NaN, Infinity, and -Infinity
     pub fn serialize_f64_special<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
     where

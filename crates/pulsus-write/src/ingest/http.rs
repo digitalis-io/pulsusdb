@@ -49,6 +49,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
+use opentelemetry_proto::tonic::collector::profiles::v1development::ExportProfilesServiceResponse;
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
@@ -65,7 +66,10 @@ use crate::ingest::{
 };
 use crate::protocols::otlp_logs::LogIngestSettings;
 use crate::protocols::otlp_metrics::MetricIngestSettings;
-use crate::protocols::{loki_push, otlp_logs, otlp_metrics, otlp_traces, remote_write, zipkin};
+use crate::protocols::{
+    loki_push, otlp_logs, otlp_metrics, otlp_profiles, otlp_traces, profile_model, remote_write,
+    zipkin,
+};
 
 /// `X-Pulsus-Async` request header (docs/api.md "Request headers"): `1`
 /// selects async-mode (enqueue, `202`); absent or any other value selects
@@ -341,21 +345,182 @@ pub async fn ingest_traces(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
     }
 }
 
-/// `POST /v1development/profiles`.
+/// `POST /v1development/profiles` (docs/api.md §1.1): OTLP profiles,
+/// development version 1, as protobuf or OTLP/JSON. The tenant, then the
+/// version header, then the body under `max_body_bytes` as read and as
+/// decompressed (`0` is no cap), then decode, conversion and the profile
+/// model; every check finishes before admission, so a push is admitted whole
+/// or not at all.
+///
+/// The answers are the other OTLP routes', with three of the reference's: a
+/// body over the cap is `413` and one that does not decode `400`, both in
+/// the reference's plain text ([`go_http_error_response`]); success is the
+/// empty `ExportProfilesServiceResponse` whatever the request's encoding.
 pub async fn ingest_otlp_profiles(
-    _sink: &dyn ProfileSink,
-    _headers: HeaderMap,
-    _body: Body,
-    _max_body_bytes: u64,
+    sink: &dyn ProfileSink,
+    headers: HeaderMap,
+    body: Body,
+    max_body_bytes: u64,
 ) -> Response {
-    let mut response = Response::new(Body::empty());
-    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    response
+    let tenant = match pulsus_model::tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(err) => return status_response(StatusCode::BAD_REQUEST, 3, err.to_string()),
+    };
+    let header_less = match profiles_version(&headers) {
+        Ok(header_less) => header_less,
+        Err(message) => return status_response(StatusCode::BAD_REQUEST, 3, message),
+    };
+    let cap = match max_body_bytes {
+        0 => usize::MAX,
+        n => usize::try_from(n).unwrap_or(usize::MAX),
+    };
+    let body = match read_capped_body(body, cap).await {
+        Ok(body) => body,
+        Err(LogsIngestError::OversizeBody { .. }) => {
+            return profiles_too_large("profile payload size exceeds limit", max_body_bytes);
+        }
+        Err(err) => return error_response(err),
+    };
+    let encoding = match content_encoding(&headers) {
+        Ok(encoding) => encoding,
+        Err(err) => return error_response(err),
+    };
+    let bytes = match decompress::decompress_capped(encoding, &body, cap) {
+        Ok(bytes) => bytes,
+        Err(LogsIngestError::OversizeBody { .. }) => {
+            return profiles_too_large(
+                "uncompressed profile payload size exceeds limit",
+                max_body_bytes,
+            );
+        }
+        Err(err) => return error_response(err),
+    };
+    drop(body);
+
+    let decoded = if is_json_content_type(&headers) {
+        otlp_profiles::decode_json(&bytes, header_less)
+    } else {
+        otlp_profiles::decode(&bytes, header_less)
+    };
+    let request = match decoded {
+        Ok(request) => request,
+        Err(LogsIngestError::Decode(_)) => {
+            return go_http_error_response(
+                StatusCode::BAD_REQUEST,
+                "Failed to parse protobuf request\n".to_string(),
+            );
+        }
+        Err(LogsIngestError::DecodeJson(_)) => {
+            return go_http_error_response(
+                StatusCode::BAD_REQUEST,
+                "Failed to parse JSON request\n".to_string(),
+            );
+        }
+        Err(err) => return error_response(err),
+    };
+    drop(bytes);
+
+    let inputs = match otlp_profiles::to_inputs(&request, header_less) {
+        Ok(inputs) => inputs,
+        Err(refusal) => return error_response(LogsIngestError::ProfilesRequest(refusal.message)),
+    };
+    drop(request);
+    let accepted = if is_async(&headers) {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    // A request with no samples stores nothing and is a success.
+    if inputs.is_empty() {
+        return export_profiles_response(accepted);
+    }
+    let landing = match profile_model::parse_profiles(inputs, now_unix_nanos() / 1_000_000) {
+        Ok(landing) => landing,
+        Err(refusal) => return error_response(LogsIngestError::ProfilesRequest(refusal.message)),
+    };
+    let push = push_headers(&headers);
+
+    if is_async(&headers) {
+        return match sink.admit(&tenant, landing, push) {
+            Ok(()) => export_profiles_response(accepted),
+            Err(refusal) => otlp_refusal_response(refusal),
+        };
+    }
+    match sink.admit_flush(&tenant, landing, push) {
+        Ok(wait) => match wait.await {
+            Ok(()) => export_profiles_response(accepted),
+            Err(err) => error_response(err),
+        },
+        Err(refusal) => otlp_refusal_response(refusal),
+    }
 }
 
-/// A byte count as the reference's byte humanizer writes it.
-pub fn humanize_bytes(_n: u64) -> String {
-    String::new()
+/// `OTLP-Profiles-Development-Version`: the OTLP profiles development version
+/// the sender writes.
+const PROFILES_VERSION_HEADER: &str = "otlp-profiles-development-version";
+
+/// Reads [`PROFILES_VERSION_HEADER`]: `Ok(true)` when it is absent (the
+/// request is read as version 1, with the stricter checks), `Ok(false)` for
+/// version 1, else the refusal's message.
+fn profiles_version(headers: &HeaderMap) -> Result<bool, String> {
+    let mut values = headers.get_all(PROFILES_VERSION_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(true);
+    };
+    let more = values.count();
+    if more > 0 {
+        return Err(format!(
+            "OTLP-Profiles-Development-Version must be sent once; it was sent {} times",
+            more + 1
+        ));
+    }
+    let raw = value.as_bytes();
+    let blank = |b: &u8| *b == b' ' || *b == b'\t';
+    let start = raw.iter().position(|b| !blank(b)).unwrap_or(raw.len());
+    let end = raw.iter().rposition(|b| !blank(b)).map_or(start, |i| i + 1);
+    let trimmed = &raw[start..end];
+    let text = String::from_utf8_lossy(trimmed);
+    let well_formed = trimmed.first().is_some_and(|b| (b'1'..=b'9').contains(b))
+        && trimmed.iter().all(u8::is_ascii_digit);
+    if !well_formed {
+        return Err(format!(
+            "malformed OTLP-Profiles-Development-Version \"{text}\": a positive integer without \
+             leading zeros is required"
+        ));
+    }
+    if trimmed != b"1" {
+        return Err(format!(
+            "unsupported OTLP-Profiles-Development-Version {text}: this server reads version 1"
+        ));
+    }
+    Ok(false)
+}
+
+/// A profiles body over the cap: `413`, the reference's plain text.
+fn profiles_too_large(what: &str, max_body_bytes: u64) -> Response {
+    go_http_error_response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!("{what} of {}\n", humanize_bytes(max_body_bytes)),
+    )
+}
+
+/// A byte count as the reference's byte humanizer writes it: SI units, one
+/// decimal below 10 and none from 10 (`268435456` is `268 MB`, `1000` is
+/// `1.0 kB`), and a count below 10 in bytes.
+pub fn humanize_bytes(n: u64) -> String {
+    const SIZES: [&str; 7] = ["B", "kB", "MB", "GB", "TB", "PB", "EB"];
+    if n < 10 {
+        return format!("{n} B");
+    }
+    let base = 1000f64;
+    let e = ((n as f64).ln() / base.ln()).floor();
+    let suffix = SIZES[(e as usize).min(SIZES.len() - 1)];
+    let val = ((n as f64) / base.powf(e) * 10.0 + 0.5).floor() / 10.0;
+    if val < 10.0 {
+        format!("{val:.1} {suffix}")
+    } else {
+        format!("{val:.0} {suffix}")
+    }
 }
 
 /// This crate's own generic-`State` mount point for [`ingest_traces`] —
@@ -934,6 +1099,7 @@ fn classify(err: &LogsIngestError) -> (StatusCode, i32) {
         // (issue #461) — see `LogsIngestError::InvalidMetricName`.
         | LogsIngestError::InvalidMetricName(_)
         | LogsIngestError::ZipkinDecode(_)
+        | LogsIngestError::ProfilesRequest(_)
         | LogsIngestError::Decode(_)
         | LogsIngestError::DecodeJson(_) => (StatusCode::BAD_REQUEST, 3),
         // A push with no streams is `422`, not `400` (issue #374): the
@@ -1151,6 +1317,17 @@ fn export_traces_response(
         error_message: rejected_message.unwrap_or_default(),
     });
     let body = ExportTraceServiceResponse { partial_success }.encode_to_vec();
+    protobuf_response(status, body)
+}
+
+/// Success/accepted response body for `/v1development/profiles`: the empty
+/// `ExportProfilesServiceResponse`. A push is refused whole or stored whole,
+/// so `partial_success` is never set.
+fn export_profiles_response(status: StatusCode) -> Response {
+    let body = ExportProfilesServiceResponse {
+        partial_success: None,
+    }
+    .encode_to_vec();
     protobuf_response(status, body)
 }
 

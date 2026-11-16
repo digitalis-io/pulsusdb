@@ -143,6 +143,7 @@ pub(crate) const ROUTE_TEMPLATES: &[&str] = &[
     "/v1/logs",
     "/v1/metrics",
     "/v1/traces",
+    "/v1development/profiles",
 ];
 
 /// One status code's count. `code` 0 means the cell is free.

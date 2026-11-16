@@ -10,7 +10,8 @@ use crate::app::AppState;
 
 /// Ingestion APIs (OTLP, Prometheus remote write, native profile ingest).
 /// `POST /v1/logs` (issue #15), `POST /v1/metrics` (issue #27),
-/// `POST /v1/traces` (issue #54), and `POST /api/v1/write` (issue #28,
+/// `POST /v1/traces` (issue #54), `POST /v1development/profiles` (OTLP
+/// profiles) and `POST /api/v1/write` (issue #28,
 /// docs/api.md §1.1-1.2) are wired; the remaining signals' ingest routes
 /// are still empty until their own issues land. `/api/v1/write` coexists
 /// with the PromQL query surface's `/api/v1/query*` routes (mounted
@@ -21,6 +22,10 @@ pub(crate) fn writer_router() -> Router<AppState> {
         .route("/v1/logs", post(crate::ingest::ingest_logs))
         .route("/v1/metrics", post(crate::ingest::ingest_metrics))
         .route("/v1/traces", post(crate::ingest::ingest_traces))
+        .route(
+            "/v1development/profiles",
+            post(crate::ingest::ingest_otlp_profiles),
+        )
         .route("/api/v1/write", post(crate::ingest::ingest_remote_write))
 }
 

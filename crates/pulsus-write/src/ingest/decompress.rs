@@ -49,16 +49,24 @@ impl Encoding {
 /// exceed [`MAX_DECOMPRESSED_BYTES`] once decompressed (the zip-bomb
 /// guard) rather than allocating an unbounded buffer first.
 pub fn decompress(encoding: Encoding, body: &[u8]) -> Result<Vec<u8>, LogsIngestError> {
+    decompress_capped(encoding, body, MAX_DECOMPRESSED_BYTES)
+}
+
+/// [`decompress`] with its own cap: output over `cap` bytes is refused with
+/// `OversizeBody { limit: cap }`. `usize::MAX` is no cap.
+pub fn decompress_capped(
+    encoding: Encoding,
+    body: &[u8],
+    cap: usize,
+) -> Result<Vec<u8>, LogsIngestError> {
     match encoding {
         Encoding::Identity => {
-            if body.len() > MAX_DECOMPRESSED_BYTES {
-                return Err(LogsIngestError::OversizeBody {
-                    limit: MAX_DECOMPRESSED_BYTES,
-                });
+            if body.len() > cap {
+                return Err(LogsIngestError::OversizeBody { limit: cap });
             }
             Ok(body.to_vec())
         }
-        Encoding::Gzip => read_capped(flate2::read::GzDecoder::new(body), "gzip"),
+        Encoding::Gzip => read_capped(flate2::read::GzDecoder::new(body), "gzip", cap),
         Encoding::Zstd => {
             let decoder = zstd::stream::read::Decoder::new(body).map_err(|source| {
                 LogsIngestError::Decompress {
@@ -66,29 +74,25 @@ pub fn decompress(encoding: Encoding, body: &[u8]) -> Result<Vec<u8>, LogsIngest
                     reason: source.to_string(),
                 }
             })?;
-            read_capped(decoder, "zstd")
+            read_capped(decoder, "zstd", cap)
         }
-        Encoding::Snappy => decompress_snappy(body),
+        Encoding::Snappy => decompress_snappy(body, cap),
     }
 }
 
-/// Decompresses `body` per `encoding`, refusing output over `cap` bytes.
-pub fn decompress_capped(
-    encoding: Encoding,
-    body: &[u8],
-    _cap: usize,
+/// Reads `reader` to the end, capped at `cap` + 1 bytes: gzip/zstd streams
+/// do not declare their decompressed size up front, so the only safe
+/// zip-bomb guard is bounding the read itself rather than the eventual
+/// buffer length — `Read::take` stops pulling bytes from the (potentially
+/// still-expanding) decoder the instant the cap is exceeded. The `+ 1`
+/// saturates, so `usize::MAX` reads without a bound.
+fn read_capped(
+    reader: impl Read,
+    encoding: &'static str,
+    cap: usize,
 ) -> Result<Vec<u8>, LogsIngestError> {
-    decompress(encoding, body)
-}
-
-/// Reads `reader` to the end, capped at [`MAX_DECOMPRESSED_BYTES`] + 1
-/// bytes: gzip/zstd streams do not declare their decompressed size up
-/// front, so the only safe zip-bomb guard is bounding the read itself
-/// rather than the eventual buffer length — `Read::take` stops pulling
-/// bytes from the (potentially still-expanding) decoder the instant the
-/// cap is exceeded.
-fn read_capped(reader: impl Read, encoding: &'static str) -> Result<Vec<u8>, LogsIngestError> {
-    let mut limited = reader.take(MAX_DECOMPRESSED_BYTES as u64 + 1);
+    let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+    let mut limited = reader.take(limit);
     let mut out = Vec::new();
     limited
         .read_to_end(&mut out)
@@ -96,10 +100,8 @@ fn read_capped(reader: impl Read, encoding: &'static str) -> Result<Vec<u8>, Log
             encoding,
             reason: source.to_string(),
         })?;
-    if out.len() > MAX_DECOMPRESSED_BYTES {
-        return Err(LogsIngestError::OversizeBody {
-            limit: MAX_DECOMPRESSED_BYTES,
-        });
+    if out.len() > cap {
+        return Err(LogsIngestError::OversizeBody { limit: cap });
     }
     Ok(out)
 }
@@ -109,16 +111,14 @@ fn read_capped(reader: impl Read, encoding: &'static str) -> Result<Vec<u8>, Log
 /// a raw Snappy block declares its uncompressed length up front
 /// ([`snap::raw::decompress_len`]), so the zip-bomb guard checks the
 /// declared length *before* allocating the output buffer.
-fn decompress_snappy(body: &[u8]) -> Result<Vec<u8>, LogsIngestError> {
+fn decompress_snappy(body: &[u8], cap: usize) -> Result<Vec<u8>, LogsIngestError> {
     let declared_len =
         snap::raw::decompress_len(body).map_err(|source| LogsIngestError::Decompress {
             encoding: "snappy",
             reason: source.to_string(),
         })?;
-    if declared_len > MAX_DECOMPRESSED_BYTES {
-        return Err(LogsIngestError::OversizeBody {
-            limit: MAX_DECOMPRESSED_BYTES,
-        });
+    if declared_len > cap {
+        return Err(LogsIngestError::OversizeBody { limit: cap });
     }
     let mut decoder = snap::raw::Decoder::new();
     decoder

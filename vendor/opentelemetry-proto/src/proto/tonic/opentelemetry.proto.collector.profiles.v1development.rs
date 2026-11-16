@@ -2,6 +2,8 @@
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P8): an omitted field is its default.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExportProfilesServiceRequest {
     /// An array of ResourceProfiles.

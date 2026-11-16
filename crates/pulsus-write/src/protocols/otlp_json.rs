@@ -127,6 +127,13 @@ pub(crate) struct JsonAggregates {
     /// of the protobuf pre-scan's `AggKind::LogRecords` — charged once per
     /// accumulated `LogRecord`, capped at [`MAX_TOTAL_LOG_RECORDS`].
     pub(crate) log_records: Cell<usize>,
+    /// Cross-request profile-sample count, the JSON analog of the protobuf
+    /// pre-scan's `AggKind::Samples`, capped at `MAX_TOTAL_SAMPLES`.
+    pub(crate) samples: Cell<usize>,
+    /// Cross-request profiles dictionary entry count, every table and each
+    /// location's lines together — the JSON analog of
+    /// `AggKind::ProfileEntries`, capped at `MAX_TOTAL_PROFILE_ENTRIES`.
+    pub(crate) profile_entries: Cell<usize>,
     /// Running estimate of the bytes the accumulated elements materialize
     /// (issue #127), the JSON analog of the protobuf pre-scan's
     /// `decoded_bytes`: every bounded sequence charges `size_of` of its
@@ -1791,6 +1798,7 @@ impl<'de> Visitor<'de> for LogRecordSeed<'_> {
 }
 
 pub(crate) mod metrics;
+pub(crate) mod profiles;
 
 #[cfg(test)]
 mod tests;

@@ -25,6 +25,8 @@
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P8): an omitted field is its default.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProfilesDictionary {
     /// Mappings from address ranges to the image/binary/library mapped
@@ -94,6 +96,8 @@ pub struct ProfilesDictionary {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P8): an omitted field is its default.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProfilesData {
     /// An array of ResourceProfiles.
@@ -115,6 +119,8 @@ pub struct ProfilesData {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P8): an omitted field is its default.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResourceProfiles {
     /// The resource for the profiles in this message.
@@ -137,6 +143,8 @@ pub struct ResourceProfiles {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P8): an omitted field is its default.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScopeProfiles {
     /// The instrumentation scope information for the profiles in this message.
@@ -167,6 +175,8 @@ pub struct ScopeProfiles {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P8): an omitted field is its default.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Profile {
     /// The type and unit of all Sample.values in this profile.
@@ -181,6 +191,14 @@ pub struct Profile {
     pub samples: ::prost::alloc::vec::Vec<Sample>,
     /// Time of collection. Value is UNIX Epoch time in nanoseconds since 00:00:00
     /// UTC on 1 January 1970.
+    // PATCH (PulsusDB, docs/decisions/0004, item P8): a 64-bit integer is a string.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            serialize_with = "crate::proto::serializers::serialize_u64_to_string",
+            deserialize_with = "crate::proto::serializers::deserialize_string_to_u64"
+        )
+    )]
     #[prost(fixed64, tag = "3")]
     pub time_unix_nano: u64,
     /// Duration of the profile. For instant profiles like live heap snapshot, the
@@ -188,6 +206,14 @@ pub struct Profile {
     /// process start time and duration_nano to the relative time when the profile
     /// was gathered. This ensures Sample.timestamps_unix_nano values such as
     /// allocation timestamp fall into the profile time range.
+    // PATCH (PulsusDB, docs/decisions/0004, item P8): a 64-bit integer is a string.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            serialize_with = "crate::proto::serializers::serialize_u64_to_string",
+            deserialize_with = "crate::proto::serializers::deserialize_string_to_u64"
+        )
+    )]
     #[prost(uint64, tag = "4")]
     pub duration_nano: u64,
     /// The kind of events between sampled occurrences.
@@ -195,6 +221,14 @@ pub struct Profile {
     #[prost(message, optional, tag = "5")]
     pub period_type: ::core::option::Option<ValueType>,
     /// The number of events between sampled occurrences.
+    // PATCH (PulsusDB, docs/decisions/0004, item P8): a 64-bit integer is a string.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            serialize_with = "crate::proto::serializers::serialize_i64_to_string",
+            deserialize_with = "crate::proto::serializers::deserialize_string_to_i64"
+        )
+    )]
     #[prost(int64, tag = "6")]
     pub period: i64,
     /// A globally unique identifier for a profile. The ID is a 16-byte array. An ID with
@@ -251,13 +285,31 @@ pub struct Profile {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P8): an omitted field is its default.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Link {
     /// A unique identifier of a trace that this linked span is part of. The ID is a
     /// 16-byte array.
+    // PATCH (PulsusDB, docs/decisions/0004, item P8): hex, as `Profile.profile_id`.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            serialize_with = "crate::proto::serializers::serialize_to_hex_string",
+            deserialize_with = "crate::proto::serializers::deserialize_from_hex_string"
+        )
+    )]
     #[prost(bytes = "vec", tag = "1")]
     pub trace_id: ::prost::alloc::vec::Vec<u8>,
     /// A unique identifier for the linked span. The ID is an 8-byte array.
+    // PATCH (PulsusDB, docs/decisions/0004, item P8): hex, as `Profile.profile_id`.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            serialize_with = "crate::proto::serializers::serialize_to_hex_string",
+            deserialize_with = "crate::proto::serializers::deserialize_from_hex_string"
+        )
+    )]
     #[prost(bytes = "vec", tag = "2")]
     pub span_id: ::prost::alloc::vec::Vec<u8>,
 }
@@ -265,6 +317,8 @@ pub struct Link {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P8): an omitted field is its default.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValueType {
     /// Index into ProfilesDictionary.string_table.
@@ -306,6 +360,8 @@ pub struct ValueType {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P8): an omitted field is its default.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Sample {
     /// Reference to stack in ProfilesDictionary.stack_table.
@@ -319,6 +375,8 @@ pub struct Sample {
     #[prost(int32, tag = "3")]
     pub link_index: i32,
     /// The type and unit of each value is defined by Profile.sample_type.
+    // PATCH (PulsusDB, docs/decisions/0004, item P8): each value a string, or a number.
+    #[cfg_attr(feature = "with-serde", serde(with = "crate::proto::serializers::vec_i64_string"))]
     #[prost(int64, repeated, tag = "4")]
     pub values: ::prost::alloc::vec::Vec<i64>,
     /// Timestamps associated with Sample. Value is UNIX Epoch time in nanoseconds
@@ -340,15 +398,41 @@ pub struct Sample {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P8): an omitted field is its default.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Mapping {
     /// Address at which the binary (or DLL) is loaded into memory.
+    // PATCH (PulsusDB, docs/decisions/0004, item P8): a 64-bit integer is a string.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            serialize_with = "crate::proto::serializers::serialize_u64_to_string",
+            deserialize_with = "crate::proto::serializers::deserialize_string_to_u64"
+        )
+    )]
     #[prost(uint64, tag = "1")]
     pub memory_start: u64,
     /// The limit of the address range occupied by this mapping.
+    // PATCH (PulsusDB, docs/decisions/0004, item P8): a 64-bit integer is a string.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            serialize_with = "crate::proto::serializers::serialize_u64_to_string",
+            deserialize_with = "crate::proto::serializers::deserialize_string_to_u64"
+        )
+    )]
     #[prost(uint64, tag = "2")]
     pub memory_limit: u64,
     /// Offset in the binary that corresponds to the first mapped address.
+    // PATCH (PulsusDB, docs/decisions/0004, item P8): a 64-bit integer is a string.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            serialize_with = "crate::proto::serializers::serialize_u64_to_string",
+            deserialize_with = "crate::proto::serializers::deserialize_string_to_u64"
+        )
+    )]
     #[prost(uint64, tag = "3")]
     pub file_offset: u64,
     /// The object this entry is loaded from.  This can be a filename on
@@ -366,6 +450,8 @@ pub struct Mapping {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P8): an omitted field is its default.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Stack {
     /// References to locations in ProfilesDictionary.location_table.
@@ -377,6 +463,8 @@ pub struct Stack {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P8): an omitted field is its default.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Location {
     /// Reference to mapping in ProfilesDictionary.mapping_table.
@@ -389,6 +477,14 @@ pub struct Location {
     /// for the corresponding mapping. A non-leaf address may be in the
     /// middle of a call instruction. It is up to display tools to find
     /// the beginning of the instruction if necessary.
+    // PATCH (PulsusDB, docs/decisions/0004, item P8): a 64-bit integer is a string.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            serialize_with = "crate::proto::serializers::serialize_u64_to_string",
+            deserialize_with = "crate::proto::serializers::deserialize_string_to_u64"
+        )
+    )]
     #[prost(uint64, tag = "2")]
     pub address: u64,
     /// Multiple line indicates this location has inlined functions,
@@ -408,15 +504,33 @@ pub struct Location {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P8): an omitted field is its default.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Line {
     /// Reference to function in ProfilesDictionary.function_table.
     #[prost(int32, tag = "1")]
     pub function_index: i32,
     /// Line number in source code. 0 means unset.
+    // PATCH (PulsusDB, docs/decisions/0004, item P8): a 64-bit integer is a string.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            serialize_with = "crate::proto::serializers::serialize_i64_to_string",
+            deserialize_with = "crate::proto::serializers::deserialize_string_to_i64"
+        )
+    )]
     #[prost(int64, tag = "2")]
     pub line: i64,
     /// Column number in source code. 0 means unset.
+    // PATCH (PulsusDB, docs/decisions/0004, item P8): a 64-bit integer is a string.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            serialize_with = "crate::proto::serializers::serialize_i64_to_string",
+            deserialize_with = "crate::proto::serializers::deserialize_string_to_i64"
+        )
+    )]
     #[prost(int64, tag = "3")]
     pub column: i64,
 }
@@ -439,6 +553,14 @@ pub struct Function {
     #[prost(int32, tag = "3")]
     pub filename_strindex: i32,
     /// Line number in source file. 0 means unset.
+    // PATCH (PulsusDB, docs/decisions/0004, item P8): a 64-bit integer is a string.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            serialize_with = "crate::proto::serializers::serialize_i64_to_string",
+            deserialize_with = "crate::proto::serializers::deserialize_string_to_i64"
+        )
+    )]
     #[prost(int64, tag = "4")]
     pub start_line: i64,
 }
@@ -448,6 +570,8 @@ pub struct Function {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P8): an omitted field is its default.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KeyValueAndUnit {
     /// The index into the string table for the attribute's key.

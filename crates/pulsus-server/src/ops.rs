@@ -306,6 +306,9 @@ fn record_ingest_metrics(state: &AppState) {
     if let Some(snap) = state.trace_writer.metrics() {
         record_trace_ingest_snapshot(&snap);
     }
+    if let Some(snap) = state.profile_writer.metrics() {
+        record_profile_ingest_snapshot(&snap);
+    }
 }
 
 /// Emits the per-table `pulsus_ingest_*` series (label `table`) shared by all
@@ -446,6 +449,25 @@ fn record_trace_ingest_snapshot(s: &TraceWriterMetricsSnapshot) {
         .absolute(s.rejected_total);
 
     record_dedup_metrics("traces", &s.dedup);
+}
+
+/// The profile writer's `pulsus_ingest_*` series:
+/// [`record_trace_ingest_snapshot`]'s set, for `table="profile_landing"`
+/// and `signal="profiles"`.
+fn record_profile_ingest_snapshot(s: &TraceWriterMetricsSnapshot) {
+    record_table_metrics("profile_landing", &s.landing);
+
+    metrics::gauge!("pulsus_ingest_queue_bytes", "signal" => "profiles").set(s.queue_bytes as f64);
+    metrics::counter!("pulsus_ingest_backpressure_total", "signal" => "profiles")
+        .absolute(s.backpressure_total);
+    metrics::counter!("pulsus_ingest_spool_poison_total", "signal" => "profiles")
+        .absolute(s.spool_poison_total);
+    metrics::counter!("pulsus_ingest_spool_uncertain_total", "signal" => "profiles")
+        .absolute(s.spool_uncertain_total);
+    metrics::counter!("pulsus_ingest_rejected_total", "signal" => "profiles")
+        .absolute(s.rejected_total);
+
+    record_dedup_metrics("profiles", &s.dedup);
 }
 
 /// `GET /config`: effective configuration, secrets redacted

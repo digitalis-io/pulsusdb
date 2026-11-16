@@ -195,6 +195,13 @@ pub enum LogsIngestError {
     #[error("malformed Zipkin v2 request: {0}")]
     ZipkinDecode(String),
 
+    /// An OTLP profiles request refused before admission: a version
+    /// mismatch the pre-scan or the JSON decoder found, a profile that does
+    /// not convert, or the profile model's refusal. The message is the
+    /// whole answer, so the `Display` adds nothing. `400`, `code = 3`.
+    #[error("{0}")]
+    ProfilesRequest(String),
+
     /// A log push carried no streams at all (issue #374). The reference
     /// answers this before it validates anything: `PushWithResolver` returns
     /// `httpgrpc.Errorf(http.StatusUnprocessableEntity,

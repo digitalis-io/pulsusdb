@@ -9,8 +9,8 @@
 //! 1. a missing `service_name` becomes `unknown_service`; labels are sorted;
 //! 2. the profile checks (`pkg/validation/validate.go:323-445`), with the
 //!    stack-depth and symbol-length caps;
-//! 3. language detection (`pkg/distributor/model/push.go:57-80`,
-//!    `pkg/pprof/pprof.go:1245-1269`);
+//! 3. language: the one the sender names, else detection
+//!    (`pkg/distributor/model/push.go:57-80`, `pkg/pprof/pprof.go:1245-1269`);
 //! 4. for Go, the type-parameter fix and the truncated-stack repair
 //!    (`pkg/pprof/fix_go_profile.go`, `pkg/pprof/fix_go_truncated.go`);
 //! 5. normalisation (`pkg/pprof/pprof.go:489-523`);
@@ -941,7 +941,7 @@ impl Push {
             decompressed_bytes,
             id,
             annotations,
-            language: _,
+            language: sender_language,
         } = src;
 
         // 1. service name, then sort.
@@ -957,8 +957,13 @@ impl Push {
         let (timestamp_ns, time_defaulted) =
             validate_profile(&mut profile, decompressed_bytes, &text, now_ms)?;
 
-        // 3-4. language and the Go fix-ups.
-        if language(&labels, &profile) == "go" {
+        // 3-4. language and the Go fix-ups. The language the sender names
+        // comes first (`pkg/distributor/distributor.go:434-443`).
+        let is_go = match sender_language.as_deref() {
+            Some(named) => named == "go",
+            None => language(&labels, &profile) == "go",
+        };
+        if is_go {
             fix_go_profile(&mut profile);
         }
 

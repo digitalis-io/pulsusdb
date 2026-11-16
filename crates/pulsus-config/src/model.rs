@@ -421,7 +421,8 @@ pub struct WriterConfig {
     /// Accepted range `1000..=10000000`.
     pub profile_landing_max_rows: u64,
     /// `PULSUS_PROFILE_MAX_BODY_BYTES`: the largest request body
-    /// `/v1development/profiles` reads.
+    /// `/v1development/profiles` reads, both as sent and once decompressed;
+    /// a larger one is refused `413`. `0` turns the cap off.
     pub profile_max_body_bytes: ByteSize,
     /// `PULSUS_LANDING_BATCH_MS` (issue #494 part 2): how long a landing
     /// worker keeps adding queued log or trace blocks to the insert it is
@@ -455,7 +456,7 @@ impl Default for WriterConfig {
             profile_landing_retries: 3,
             profile_landing_inserters: 4,
             profile_landing_max_rows: 1_048_576,
-            profile_max_body_bytes: ByteSize(0),
+            profile_max_body_bytes: ByteSize(256 * 1024 * 1024),
             landing_batch_ms: 1_000,
         }
     }
