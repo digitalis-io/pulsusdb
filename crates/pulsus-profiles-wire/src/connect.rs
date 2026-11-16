@@ -69,6 +69,8 @@ pub fn error_json(code: Code, message: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
             '<' | '>' | '&' | '\u{2028}' | '\u{2029}' => {
                 out.push_str(&format!("\\u{:04x}", c as u32))
             }
@@ -87,8 +89,8 @@ mod tests {
     #[test]
     fn the_error_body_escapes_as_go_does() {
         assert_eq!(
-            error_json(Code::InvalidArgument, "a \"b\" <c> & \\ \n\u{1}"),
-            r#"{"code":"invalid_argument","message":"a \"b\" \u003cc\u003e \u0026 \\ \n\u0001"}"#
+            error_json(Code::InvalidArgument, "a \"b\" <c> & \\ \n\u{1}\u{8}\u{c}"),
+            r#"{"code":"invalid_argument","message":"a \"b\" \u003cc\u003e \u0026 \\ \n\u0001\b\f"}"#
         );
     }
 }

@@ -99,7 +99,10 @@ pub fn push_inputs(req: PushRequest) -> Result<Vec<ProfileInput>, PushInputError
 /// 36 characters with hyphens, 32 hex digits, either inside `{}` or after
 /// `urn:uuid:`, any case (`distributor.go:410-424`).
 pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
-    let s = if s.len() == 45 && s[..9].eq_ignore_ascii_case("urn:uuid:") {
+    let s = if s.len() == 45
+        && s.get(..9)
+            .is_some_and(|p| p.eq_ignore_ascii_case("urn:uuid:"))
+    {
         &s[9..]
     } else if s.len() == 38 && s.starts_with('{') && s.ends_with('}') {
         &s[1..37]
@@ -1171,5 +1174,17 @@ mod tests {
                 .iter()
                 .all(|i| i.decompressed_bytes == i.profile.encoded_len() as u64)
         );
+    }
+
+    /// A 45-byte id whose ninth byte falls inside a character is not a
+    /// UUID, and is ignored rather than panicking.
+    #[test]
+    fn a_45_byte_id_split_inside_a_character_is_ignored() {
+        let id = format!("urn:uuid\u{e9}{}", "0".repeat(35));
+        assert_eq!(id.len(), 45);
+        assert!(!id.is_char_boundary(9));
+        assert_eq!(parse_uuid(&id), None);
+        let urn = "URN:UUID:734fd599-6865-419e-9475-932762d8f469";
+        assert_eq!(parse_uuid(urn).map(|b| b[0]), Some(0x73));
     }
 }
