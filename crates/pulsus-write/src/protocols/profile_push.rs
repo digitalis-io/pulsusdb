@@ -81,6 +81,7 @@ pub fn push_inputs(req: PushRequest) -> Result<Vec<ProfileInput>, PushInputError
                 profile,
                 id: parse_uuid(&sample.id),
                 annotations: Vec::new(),
+                language: None,
             });
         }
     }
@@ -730,6 +731,7 @@ pub fn legacy_pprof_input(
         profile,
         id: None,
         annotations: Vec::new(),
+        language: None,
     }
 }
 

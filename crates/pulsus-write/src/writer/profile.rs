@@ -809,6 +809,7 @@ mod tests {
             decompressed_bytes: 1_000,
             id: None,
             annotations: Vec::new(),
+            language: None,
         }
     }
 

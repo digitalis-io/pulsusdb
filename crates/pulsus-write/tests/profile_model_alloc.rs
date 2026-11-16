@@ -130,6 +130,7 @@ fn common_push() -> ProfileInput {
         decompressed_bytes: 1_000_000,
         id: None,
         annotations: Vec::new(),
+        language: None,
     }
 }
 

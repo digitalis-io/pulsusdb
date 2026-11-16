@@ -147,6 +147,7 @@ pub(crate) const ROUTE_TEMPLATES: &[&str] = &[
     "/v1/logs",
     "/v1/metrics",
     "/v1/traces",
+    "/v1development/profiles",
 ];
 
 /// One status code's count. `code` 0 means the cell is free.
@@ -615,7 +616,7 @@ mod tests {
             ROUTE_TEMPLATES.windows(2).all(|w| w[0] < w[1]),
             "{ROUTE_TEMPLATES:?}"
         );
-        assert_eq!(ROUTE_TEMPLATES.len(), 96);
+        assert_eq!(ROUTE_TEMPLATES.len(), 97);
         assert!(
             ROUTE_TEMPLATES
                 .iter()

@@ -18,7 +18,7 @@ for the decision this vendored copy implements.
   (`.cargo_vcs_info.json`)
 
 Only the files needed to build the `gen-tonic-messages` + `logs`/`metrics`/
-`trace` + `with-serde` feature set are vendored (`src/lib.rs`, `src/proto.rs`,
+`profiles`/`trace` + `with-serde` feature set are vendored (`src/lib.rs`, `src/proto.rs`,
 `src/proto/tonic/*.rs`, `src/transform/*.rs`, `Cargo.toml`, `LICENSE`,
 `README.md`, `CHANGELOG.md`). The upstream `src/proto/opentelemetry-proto/`
 `.proto` source tree and `tests/` are omitted: there is no `build.rs`/codegen
@@ -220,6 +220,23 @@ and `EntityRef` through these derives and drops its own two `values` refusals an
 change. Gated by `the_generated_decoder_reads_an_omitted_field_as_its_default` (these derives directly) and
 `an_omitted_default_field_decodes_on_every_signal` (the three signals' decoders), both in
 `crates/pulsus-write/tests/otlp_json_vendor_patch.rs`.
+
+### P8. The profiles derives read OTLP/JSON — `src/proto/tonic/opentelemetry.proto.{profiles,collector.profiles}.v1development.rs`, `src/proto.rs`
+
+The profiles structs lacked what the other signals' have, so a spec-valid OTLP/JSON profiles body did not decode.
+Each change is `#[cfg_attr(feature = "with-serde", …)]` and wire-neutral:
+
+| Item | Change |
+|---|---|
+| struct-level `serde(default)` | `ExportProfilesServiceRequest`, `ProfilesDictionary`, `ProfilesData`, `ResourceProfiles`, `ScopeProfiles`, `Profile`, `Link`, `ValueType`, `Sample`, `Mapping`, `Stack`, `Location`, `Line`, `KeyValueAndUnit` (`Function` had it) |
+| `Link.trace_id`, `Link.span_id` | `serialize_to_hex_string` / `deserialize_from_hex_string`, as `Profile.profile_id` |
+| `Profile.time_unix_nano`, `Profile.duration_nano`, `Mapping.memory_start`, `memory_limit`, `file_offset`, `Location.address` | `serialize_u64_to_string` / `deserialize_string_to_u64` |
+| `Profile.period`, `Line.line`, `Line.column`, `Function.start_line` | `serialize_i64_to_string` / `deserialize_string_to_i64` |
+| `Sample.values` | new `serializers::vec_i64_string`: each element written as a string, read from a string or a number |
+
+The ingest decoder is the bounded one in `crates/pulsus-write/src/protocols/otlp_json/profiles.rs`, which finishes
+these messages' scalars through the derives. Gated by `the_profiles_derives_read_hex_ids_defaults_and_string_integers`
+in `crates/pulsus-write/tests/otlp_json_vendor_patch.rs`.
 
 ## Out of scope (pre-existing upstream behavior, NOT introduced here)
 

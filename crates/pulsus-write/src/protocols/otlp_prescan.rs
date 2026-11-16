@@ -200,6 +200,21 @@ pub const MAX_ENTITY_REFS: usize = 65_536;
 /// Per-`EntityRef` id-key / description-key cap.
 pub const MAX_ENTITY_REF_KEYS: usize = 65_536;
 
+/// Per-`ExportProfilesServiceRequest` resource-profiles cap.
+pub const MAX_RESOURCE_PROFILES: usize = 65_536;
+/// Per-`ResourceProfiles` scope-profiles cap.
+pub const MAX_SCOPE_PROFILES: usize = 65_536;
+/// Per-`ScopeProfiles` profile cap.
+pub const MAX_PROFILES: usize = 65_536;
+/// Per-`Profile` sample cap, and the per-array cap of a profiles scalar
+/// array on the OTLP/JSON path.
+pub const MAX_SAMPLES: usize = 1_000_000;
+/// Cross-request aggregate sample cap.
+pub const MAX_TOTAL_SAMPLES: usize = 5_000_000;
+/// Cross-request aggregate cap on the profiles dictionary's entries, every
+/// table together, and each location's lines.
+pub const MAX_TOTAL_PROFILE_ENTRIES: usize = 5_000_000;
+
 /// Cross-request aggregate cap on `ArrayValue`/`KvlistValue` element count —
 /// the fan-out width of a nested `AnyValue` tree (complements the
 /// [`MAX_ANYVALUE_DEPTH`] nesting-depth bound).
@@ -303,6 +318,21 @@ enum MsgType {
     AnyValue,
     ArrayValue,
     KeyValueList,
+    // profiles
+    ExportProfilesServiceRequest,
+    ResourceProfiles,
+    ScopeProfiles,
+    Profile,
+    ProfilesDictionary,
+    Sample,
+    Mapping,
+    Location,
+    Line,
+    Function,
+    Link,
+    ValueType,
+    Stack,
+    KeyValueAndUnit,
 }
 
 /// Which cross-request aggregate counter a repeated field charges. Each kind's
@@ -317,6 +347,8 @@ enum AggKind {
     Exemplars,
     AnyValueElements,
     LogRecords,
+    Samples,
+    ProfileEntries,
 }
 
 impl AggKind {
@@ -337,12 +369,14 @@ impl AggKind {
             AggKind::Exemplars => (MAX_TOTAL_EXEMPLARS, "total exemplars"),
             AggKind::AnyValueElements => (MAX_ANYVALUE_ELEMENTS, "total AnyValue elements"),
             AggKind::LogRecords => (MAX_TOTAL_LOG_RECORDS, "total log records"),
+            AggKind::Samples => (MAX_TOTAL_SAMPLES, "total samples"),
+            AggKind::ProfileEntries => (MAX_TOTAL_PROFILE_ENTRIES, "total dictionary entries"),
         }
     }
 }
 
 /// Number of distinct [`AggKind`]s (array length for [`Aggregates`]).
-const AGG_KINDS: usize = 8;
+const AGG_KINDS: usize = 10;
 
 /// The counting rule for one repeated field: its per-frame slot, its optional
 /// per-level cap (`None` for the `AnyValue` element vectors, which are bounded
@@ -683,7 +717,190 @@ fn field_action(ty: MsgType, field: u32) -> Action {
             },
             _ => Action::Skip,
         },
+        // ---- profiles ----
+        ExportProfilesServiceRequest => match field {
+            1 => repeated_msg(
+                ResourceProfiles,
+                0,
+                MAX_RESOURCE_PROFILES,
+                "resource_profiles",
+                None,
+            ),
+            2 => Action::SingularMessage {
+                child: ProfilesDictionary,
+            },
+            _ => Action::Skip,
+        },
+        ResourceProfiles => match field {
+            1 => Action::MergeableMessage {
+                child: Resource,
+                acc_base: 0,
+            },
+            2 => repeated_msg(ScopeProfiles, 0, MAX_SCOPE_PROFILES, "scope_profiles", None),
+            _ => Action::Skip,
+        },
+        ScopeProfiles => match field {
+            1 => Action::SingularMessage {
+                child: InstrumentationScope,
+            },
+            2 => repeated_msg(Profile, 0, MAX_PROFILES, "profiles", None),
+            _ => Action::Skip,
+        },
+        Profile => match field {
+            1 | 5 => Action::SingularMessage { child: ValueType },
+            2 => repeated_msg(Sample, 0, MAX_SAMPLES, "samples", Some(AggKind::Samples)),
+            11 => Action::PackedVarint {
+                count: byte_budget_only(),
+            },
+            _ => Action::Skip,
+        },
+        ProfilesDictionary => match field {
+            1 => dictionary_table(Mapping),
+            2 => dictionary_table(Location),
+            3 => dictionary_table(Function),
+            4 => dictionary_table(Link),
+            5 => Action::RepeatedString {
+                count: profile_entries(),
+            },
+            6 => dictionary_table(KeyValueAndUnit),
+            7 => dictionary_table(Stack),
+            _ => Action::Skip,
+        },
+        Sample => match field {
+            2 | 4 => Action::PackedVarint {
+                count: byte_budget_only(),
+            },
+            5 => Action::PackedFixed64 {
+                count: byte_budget_only(),
+            },
+            _ => Action::Skip,
+        },
+        Mapping => match field {
+            5 => Action::PackedVarint {
+                count: byte_budget_only(),
+            },
+            _ => Action::Skip,
+        },
+        Location => match field {
+            3 => dictionary_table(Line),
+            4 => Action::PackedVarint {
+                count: byte_budget_only(),
+            },
+            _ => Action::Skip,
+        },
+        Stack => match field {
+            1 => Action::PackedVarint {
+                count: byte_budget_only(),
+            },
+            _ => Action::Skip,
+        },
+        KeyValueAndUnit => match field {
+            2 => Action::SingularMessage { child: AnyValue },
+            _ => Action::Skip,
+        },
+        Line | Function | Link | ValueType => Action::Skip,
     }
+}
+
+/// A count charged to the decode byte budget only: no per-level cap, no
+/// aggregate. The profiles scalar vectors.
+const fn byte_budget_only() -> Count {
+    Count {
+        slot: 0,
+        per_level: None,
+        agg: None,
+    }
+}
+
+/// The profiles dictionary's entries, every table together, charged to
+/// [`MAX_TOTAL_PROFILE_ENTRIES`] in aggregate only.
+const fn profile_entries() -> Count {
+    Count {
+        slot: 0,
+        per_level: None,
+        agg: Some(AggKind::ProfileEntries),
+    }
+}
+
+/// One dictionary table (or a location's lines): repeated `child`, counted
+/// by [`profile_entries`].
+fn dictionary_table(child: MsgType) -> Action {
+    Action::RepeatedMessage {
+        child,
+        count: profile_entries(),
+    }
+}
+
+/// The wire type development version 1 gives `field` of a profiles message
+/// `ty` — `0` varint, `1` 64-bit, `2` length-delimited — `Some(None)` when
+/// it defines no such field, `None` when `ty` is not a profiles message.
+fn profiles_wire_type(ty: MsgType, field: u32) -> Option<Option<u8>> {
+    use MsgType::*;
+    const V: Option<u8> = Some(0);
+    const I: Option<u8> = Some(1);
+    const L: Option<u8> = Some(2);
+    let wire = match (ty, field) {
+        (ExportProfilesServiceRequest, 1 | 2) => L,
+        (ResourceProfiles | ScopeProfiles, 1..=3) => L,
+        (Profile, 1 | 2 | 5 | 7 | 9 | 10 | 11) => L,
+        (Profile, 3) => I,
+        (Profile, 4 | 6 | 8) => V,
+        (ProfilesDictionary, 1..=7) => L,
+        (Sample, 1 | 3) => V,
+        (Sample, 2 | 4 | 5) => L,
+        (Mapping, 1..=4) => V,
+        (Mapping, 5) => L,
+        (Location, 1 | 2) => V,
+        (Location, 3 | 4) => L,
+        (Line, 1..=3) => V,
+        (Function, 1..=4) => V,
+        (Link, 1 | 2) => L,
+        (ValueType, 1 | 2) => V,
+        (Stack, 1) => L,
+        (KeyValueAndUnit, 1 | 3) => V,
+        (KeyValueAndUnit, 2) => L,
+        (
+            ExportProfilesServiceRequest
+            | ResourceProfiles
+            | ScopeProfiles
+            | Profile
+            | ProfilesDictionary
+            | Sample
+            | Mapping
+            | Location
+            | Line
+            | Function
+            | Link
+            | ValueType
+            | Stack
+            | KeyValueAndUnit,
+            _,
+        ) => None,
+        _ => return None,
+    };
+    Some(wire)
+}
+
+/// The sentence a profiles refusal that only a request without
+/// `OTLP-Profiles-Development-Version` can meet ends with.
+pub const PROFILES_HEADER_LESS_NOTE: &str = " A request without OTLP-Profiles-Development-Version is read as development version 1. Send the header, or use an OpenTelemetry Collector at v0.148.0 or later.";
+
+/// H1 or H2 for `field` of `ty` read with wire type `wire`, when
+/// development version 1 does not send it so.
+fn strict_refusal(ty: MsgType, field: u32, wire: u8) -> Option<LogsIngestError> {
+    let message = match profiles_wire_type(ty, field)? {
+        None => {
+            format!("OTLP profiles: {ty:?} field {field} is not defined in development version 1.")
+        }
+        Some(expected) if expected != wire => format!(
+            "OTLP profiles: {ty:?} field {field} has wire type {wire}; development version 1 \
+             sends wire type {expected}."
+        ),
+        Some(_) => return None,
+    };
+    Some(LogsIngestError::ProfilesRequest(format!(
+        "{message}{PROFILES_HEADER_LESS_NOTE}"
+    )))
 }
 
 /// Shorthand constructor for a repeated sub-message field with a per-level cap
@@ -778,10 +995,12 @@ fn materialized_weight(child: MsgType) -> usize {
 
     use opentelemetry_proto::tonic::collector::logs::v1 as clogs;
     use opentelemetry_proto::tonic::collector::metrics::v1 as cmetrics;
+    use opentelemetry_proto::tonic::collector::profiles::v1development as cprofiles;
     use opentelemetry_proto::tonic::collector::trace::v1 as ctrace;
     use opentelemetry_proto::tonic::common::v1 as common;
     use opentelemetry_proto::tonic::logs::v1 as logs;
     use opentelemetry_proto::tonic::metrics::v1 as metrics;
+    use opentelemetry_proto::tonic::profiles::v1development as profiles;
     use opentelemetry_proto::tonic::resource::v1 as resource;
     use opentelemetry_proto::tonic::trace::v1 as trace;
 
@@ -827,6 +1046,23 @@ fn materialized_weight(child: MsgType) -> usize {
         MsgType::AnyValue => size_of::<common::AnyValue>(),
         MsgType::ArrayValue => size_of::<common::ArrayValue>(),
         MsgType::KeyValueList => size_of::<common::KeyValueList>(),
+        // profiles
+        MsgType::ExportProfilesServiceRequest => {
+            size_of::<cprofiles::ExportProfilesServiceRequest>()
+        }
+        MsgType::ResourceProfiles => size_of::<profiles::ResourceProfiles>(),
+        MsgType::ScopeProfiles => size_of::<profiles::ScopeProfiles>(),
+        MsgType::Profile => size_of::<profiles::Profile>(),
+        MsgType::ProfilesDictionary => size_of::<profiles::ProfilesDictionary>(),
+        MsgType::Sample => size_of::<profiles::Sample>(),
+        MsgType::Mapping => size_of::<profiles::Mapping>(),
+        MsgType::Location => size_of::<profiles::Location>(),
+        MsgType::Line => size_of::<profiles::Line>(),
+        MsgType::Function => size_of::<profiles::Function>(),
+        MsgType::Link => size_of::<profiles::Link>(),
+        MsgType::ValueType => size_of::<profiles::ValueType>(),
+        MsgType::Stack => size_of::<profiles::Stack>(),
+        MsgType::KeyValueAndUnit => size_of::<profiles::KeyValueAndUnit>(),
     }
 }
 
@@ -925,6 +1161,8 @@ fn child_depth(parent: MsgType, parent_depth: usize, child: MsgType) -> usize {
         (KeyValue, AnyValue) => parent_depth,
         // A log record body is a top-level (level-1) `AnyValue`.
         (LogRecord, AnyValue) => 1,
+        // So is a profiles dictionary attribute's value.
+        (KeyValueAndUnit, AnyValue) => 1,
         // Array/Kvlist containers sit at the same level as their `AnyValue`.
         (AnyValue, ArrayValue) | (AnyValue, KeyValueList) => parent_depth,
         // A kvlist entry carries the level its value `AnyValue` will hold.
@@ -1061,10 +1299,16 @@ enum CountOutcome {
 /// whose per-level / aggregate counter is blown can record the reject yet STILL
 /// descend into the length-validated child (issue #115 review round 3), keeping
 /// the structural malformed scan complete inside over-cap children.
+///
+/// `strict` (a profiles request without `OTLP-Profiles-Development-Version`)
+/// compares every profiles message field's wire type with development
+/// version 1's, recording a field it does not define (H1) or one of another
+/// wire type (H2) and walking on, so malformed wire still defers to `prost`.
 fn step<'a>(
     frame: &mut Frame<'a>,
     agg: &mut Aggregates,
     recorded: &mut Option<LogsIngestError>,
+    strict: bool,
 ) -> Result<Outcome<'a>, ScanErr> {
     if frame.pos >= frame.buf.len() {
         return Ok(Outcome::Done);
@@ -1073,6 +1317,9 @@ fn step<'a>(
     let (tag, after_tag) = read_varint(buf, frame.pos).ok_or(ScanErr::Malformed)?;
     let field = (tag >> 3) as u32;
     let wire = (tag & 7) as u8;
+    if strict && let Some(err) = strict_refusal(frame.ty, field, wire) {
+        record(recorded, err);
+    }
     let action = field_action(frame.ty, field);
 
     match wire {
@@ -1282,7 +1529,7 @@ fn descend_merge<'a>(
 /// so the whole walk stays a single linear O(body) pass with no materialization
 /// and decode still skipped — the DoS protection is preserved because the
 /// over-cap structure is walked, never decoded.
-fn walk(root: MsgType, body: &[u8]) -> Result<(), LogsIngestError> {
+fn walk(root: MsgType, body: &[u8], strict: bool) -> Result<(), LogsIngestError> {
     let mut agg = Aggregates::default();
     let mut stack: Vec<Frame<'_>> = Vec::with_capacity(MAX_WIRE_DEPTH.min(64));
     stack.push(Frame::new(root, body, 0));
@@ -1290,7 +1537,7 @@ fn walk(root: MsgType, body: &[u8]) -> Result<(), LogsIngestError> {
     // rest of the body carries no malformed wire (see the fn doc). Recorded once.
     let mut recorded: Option<LogsIngestError> = None;
     while let Some(frame) = stack.last_mut() {
-        match step(frame, &mut agg, &mut recorded) {
+        match step(frame, &mut agg, &mut recorded, strict) {
             Ok(Outcome::Advanced) => {}
             Ok(Outcome::Done) => {
                 // Pop the finished frame; if it was a singular MERGEABLE child,
@@ -1351,19 +1598,28 @@ fn walk(root: MsgType, body: &[u8]) -> Result<(), LogsIngestError> {
 /// over-deep request before `ExportTraceServiceRequest::decode` materializes
 /// it. `Ok` for any in-bounds or malformed body (the latter deferred to decode).
 pub fn prescan_traces(body: &[u8]) -> Result<(), LogsIngestError> {
-    walk(MsgType::ExportTraceServiceRequest, body)
+    walk(MsgType::ExportTraceServiceRequest, body, false)
 }
 
 /// Wire pre-scan for an OTLP `/v1/metrics` protobuf body — the metrics analog
 /// of [`prescan_traces`].
 pub fn prescan_metrics(body: &[u8]) -> Result<(), LogsIngestError> {
-    walk(MsgType::ExportMetricsServiceRequest, body)
+    walk(MsgType::ExportMetricsServiceRequest, body, false)
 }
 
 /// Wire pre-scan for an OTLP `/v1/logs` protobuf body — the logs analog of
 /// [`prescan_traces`].
 pub fn prescan_logs(body: &[u8]) -> Result<(), LogsIngestError> {
-    walk(MsgType::ExportLogsServiceRequest, body)
+    walk(MsgType::ExportLogsServiceRequest, body, false)
+}
+
+/// Wire pre-scan for an OTLP `/v1development/profiles` protobuf body — the
+/// profiles analog of [`prescan_traces`]. `header_less` (no
+/// `OTLP-Profiles-Development-Version`) adds the strict check: a field
+/// development version 1 does not define, or sends with another wire type,
+/// refuses the request with [`LogsIngestError::ProfilesRequest`].
+pub fn prescan_profiles(body: &[u8], header_less: bool) -> Result<(), LogsIngestError> {
+    walk(MsgType::ExportProfilesServiceRequest, body, header_less)
 }
 
 #[cfg(test)]

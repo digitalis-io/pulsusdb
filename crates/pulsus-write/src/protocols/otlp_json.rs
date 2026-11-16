@@ -127,6 +127,17 @@ pub(crate) struct JsonAggregates {
     /// of the protobuf pre-scan's `AggKind::LogRecords` — charged once per
     /// accumulated `LogRecord`, capped at [`MAX_TOTAL_LOG_RECORDS`].
     pub(crate) log_records: Cell<usize>,
+    /// Cross-request profile-sample count, the JSON analog of the protobuf
+    /// pre-scan's `AggKind::Samples`, capped at `MAX_TOTAL_SAMPLES`.
+    pub(crate) samples: Cell<usize>,
+    /// Cross-request profiles dictionary entry count, every table and each
+    /// location's lines together — the JSON analog of
+    /// `AggKind::ProfileEntries`, capped at `MAX_TOTAL_PROFILE_ENTRIES`.
+    pub(crate) profile_entries: Cell<usize>,
+    /// `true` on the profiles signal only: an `AnyValue`'s
+    /// `stringValueStrindex` is read, to be resolved against the request's
+    /// dictionary. Every other signal skips the key, as before.
+    pub(crate) string_value_strindex: bool,
     /// Running estimate of the bytes the accumulated elements materialize
     /// (issue #127), the JSON analog of the protobuf pre-scan's
     /// `decoded_bytes`: every bounded sequence charges `size_of` of its
@@ -549,10 +560,11 @@ where
 /// container element WIDTH (shared aggregate [`MAX_ANYVALUE_ELEMENTS`]) and
 /// nesting DEPTH ([`MAX_ANYVALUE_DEPTH`], reused from track 1 / the wire
 /// pre-scan), accepting BOTH spellings of the two container keys. Every scalar
-/// arm (`stringValue`/`boolValue`/`intValue`/`doubleValue`/`bytesValue`/
-/// `stringValueStrindex`) is buffered and finished through the vendored derive so
-/// ADR-0004 P1 (non-finite doubles), the int64-as-string and base64 leaves
-/// decode byte-identically.
+/// arm (`stringValue`/`boolValue`/`intValue`/`doubleValue`/`bytesValue`) is
+/// buffered and finished through the vendored derive so ADR-0004 P1
+/// (non-finite doubles), the int64-as-string and base64 leaves decode
+/// byte-identically. `stringValueStrindex` is read on the profiles signal
+/// only ([`JsonAggregates::string_value_strindex`]).
 pub(crate) struct AnyValueSeed<'a> {
     pub(crate) agg: &'a JsonAggregates,
     /// The nesting level of THIS `AnyValue` (1 for a top-level attribute value;
@@ -606,7 +618,7 @@ impl<'de> Visitor<'de> for AnyValueVisitor<'_> {
         // (issue #115 finding 1): iterate ALL keys in order, the LAST recognized
         // oneof key wins (no single-member rejection), unknown keys — including
         // the profiling `stringValueStrindex`, which the P2 visitor does not
-        // recognize — are skipped, and a map with no recognized key is an
+        // recognize, on every signal but profiles — are skipped, and a map with no recognized key is an
         // `AnyValue` with no value, as the protobuf encoding decodes it. The
         // ONLY divergence from the vendored decode is the width/depth REJECTION
         // the container seeds add; every scalar arm is finished through the
@@ -642,6 +654,21 @@ impl<'de> Visitor<'de> for AnyValueVisitor<'_> {
                     let av: AnyValue = serde_json::from_value(serde_json::Value::Object(one))
                         .map_err(de::Error::custom)?;
                     value = av.value;
+                }
+                "stringValueStrindex" if self.agg.string_value_strindex => {
+                    // Profiles only: an index into the dictionary's string
+                    // table, an `int32` written as a number or a string.
+                    let raw = map.next_value::<serde_json::Value>()?;
+                    let index = match &raw {
+                        serde_json::Value::Number(n) => n.as_i64(),
+                        serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                        _ => None,
+                    }
+                    .and_then(|i| i32::try_from(i).ok())
+                    .ok_or_else(|| {
+                        de::Error::custom(format!("invalid stringValueStrindex {raw}"))
+                    })?;
+                    value = Some(AnyValueVariant::StringValueStrindex(index));
                 }
                 _ => {
                     // Unknown key (the P2 visitor `continue`s past these).
@@ -1791,6 +1818,7 @@ impl<'de> Visitor<'de> for LogRecordSeed<'_> {
 }
 
 pub(crate) mod metrics;
+pub(crate) mod profiles;
 
 #[cfg(test)]
 mod tests;
