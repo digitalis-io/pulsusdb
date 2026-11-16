@@ -1077,6 +1077,23 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         "reader.profiles_query_memory_bytes",
         cfg.reader.profiles_query_memory_bytes,
     )?;
+    // Issue #823: the flame graph's node counts; the default may not exceed
+    // the largest a request may send.
+    positive_u64(
+        "reader.profiles_max_nodes_default",
+        cfg.reader.profiles_max_nodes_default,
+    )?;
+    positive_u64(
+        "reader.profiles_max_nodes_max",
+        cfg.reader.profiles_max_nodes_max,
+    )?;
+    if cfg.reader.profiles_max_nodes_default > cfg.reader.profiles_max_nodes_max {
+        return Err(value_err(
+            "reader.profiles_max_nodes_default",
+            "must not exceed reader.profiles_max_nodes_max",
+            "<= reader.profiles_max_nodes_max",
+        ));
+    }
     positive_duration("reader.tail_poll_interval", cfg.reader.tail_poll_interval)?;
     positive_u64(
         "reader.tail_max_connections",

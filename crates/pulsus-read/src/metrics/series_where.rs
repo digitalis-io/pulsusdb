@@ -46,7 +46,7 @@
 //!
 //! # Boundary inventory
 //!
-//! Twenty declarations carry a visibility modifier, pinned by the in-file
+//! Twenty-one declarations carry a visibility modifier, pinned by the in-file
 //! census test `the_boundary_inventory_is_pinned` because a
 //! hand-maintained inventory here was wrong once (review round 3 found
 //! it listing three of the six). That pin reads `pub`-prefixed lines and
@@ -71,6 +71,8 @@
 //! * [`profile_series`] — the profiles series subquery, whole (issue #820).
 //! * [`profile_series_where`] — that subquery without its `SELECT` line, for
 //!   the catalogue reads' own `SELECT` (issue #821).
+//! * [`profile_service_terms`] — the `service_name` matchers on a sample
+//!   read's `service` column (issue #823).
 //! * [`SeriesTables`] — the tables a read names (`pub(super)`, with four
 //!   `pub(super)` fields): table names, nothing renderable.
 //! * [`Lookup`] — `activity`'s input (`pub(super)`), with three
@@ -515,6 +517,17 @@ pub(crate) fn profile_series_where(t: &Tenant, w: DataWindow, f: &str, ms: &[Mat
         lines.push(format!("  AND 0 * match('', {literal}) = 0"));
     }
     lines.join("\n")
+}
+
+/// Issue #823: each `service_name` matcher of `ms`, in order, on a sample
+/// read's `service` column, one `AND` line each, so the read's index serves
+/// it. One line, as [`profile_series`], so the census reads the whole
+/// declaration.
+pub(crate) fn profile_service_terms(ms: &[Matcher]) -> String {
+    ms.iter()
+        .filter(|m| m.key == "service_name")
+        .map(|m| format!("\n      AND {}", predicate(m, MatcherTarget::ServiceColumn)))
+        .collect()
 }
 
 /// The column a profiles matcher reads: the two labels the series table

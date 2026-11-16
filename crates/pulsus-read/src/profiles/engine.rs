@@ -74,7 +74,7 @@ impl ProfilesReadConfig {
         let r = &config.reader;
         ProfilesReadConfig {
             series_table: format!("profile_series{dist}"),
-            samples_table: String::new(),
+            samples_table: format!("profile_samples{dist}"),
             dist_suffix: dist.to_string(),
             limits: WindowLimits {
                 max_length_ms: millis(r.profiles_max_query_length.0),
@@ -86,8 +86,8 @@ impl ProfilesReadConfig {
             query_memory_bytes: r.profiles_query_memory_bytes,
             distributed: config.cluster.is_some(),
             skip_unavailable_shards: config.skip_unavailable_shards,
-            max_nodes_default: 0,
-            max_nodes_max: 0,
+            max_nodes_default: i64::try_from(r.profiles_max_nodes_default).unwrap_or(i64::MAX),
+            max_nodes_max: i64::try_from(r.profiles_max_nodes_max).unwrap_or(i64::MAX),
         }
     }
 }
@@ -121,7 +121,7 @@ fn read_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> Quer
 /// Issue #823: the settings S5 carries — [`read_settings`], and the join's
 /// build side kept on the aggregated samples.
 fn tree_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> QuerySettings {
-    read_settings(config, log_comment)
+    read_settings(config, log_comment).set("query_plan_join_swap_table", "false")
 }
 
 /// The class of a failed profiles statement (plan §6).
@@ -224,8 +224,7 @@ impl ProfilesEngine {
     /// rows.
     pub async fn read_tree(&self, sql: &str) -> Result<Vec<TreeRow>, ProfilesReadError> {
         let settings = tree_settings(&self.config, self.log_comment.as_deref());
-        let _ = (sql, settings);
-        Ok(Vec::new())
+        self.dispatch.rows(sql, &settings).await
     }
 }
 

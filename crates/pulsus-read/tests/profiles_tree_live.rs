@@ -100,7 +100,10 @@ fn node_id(path: &[&str]) -> u128 {
 }
 
 fn sql_array<T: std::fmt::Display>(v: impl Iterator<Item = T>) -> String {
-    format!("[{}]", v.map(|x| x.to_string()).collect::<Vec<_>>().join(", "))
+    format!(
+        "[{}]",
+        v.map(|x| x.to_string()).collect::<Vec<_>>().join(", ")
+    )
 }
 
 /// A kind-1 row: the stack's node ids and names, root first.
@@ -291,9 +294,7 @@ impl Fixture {
             Ok(Some(p)) => p,
             other => panic!("expected a plan for {req:?}, got {other:?}"),
         };
-        let client = ChClient::new(test_config(&self.db))
-            .await
-            .expect("connect");
+        let client = ChClient::new(test_config(&self.db)).await.expect("connect");
         ProfilesEngine::new(client, config, tenant(org))
             .read_tree(&planned.sql)
             .await

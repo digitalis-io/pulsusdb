@@ -9,16 +9,20 @@
 use pulsus_model::Tenant;
 use serde::{Deserialize, Serialize};
 
+use crate::logql::escape::ch_string;
+use crate::traces::tenant_scope::TenantTerm;
+
 use super::engine::{ProfilesReadConfig, ProfilesReadError};
+use super::selector::{Compiled, SelectorError, SelectorRequest, compile};
 
 /// The earliest a stack row's receive day can fall before the window: a
 /// sample stamped `t` is admitted only when it was received no more than
 /// 10 minutes before `t` (`profile_model::REJECT_NEWER_THAN_MS`).
-pub const STACK_DAY_BEFORE_MS: i64 = 0;
+pub const STACK_DAY_BEFORE_MS: i64 = 600_000;
 /// The latest a stack row's receive day can fall after the window: a sample
 /// is admitted only when it was received no more than 1 hour after its
 /// time (`profile_model::REJECT_OLDER_THAN_MS`).
-pub const STACK_DAY_AFTER_MS: i64 = 0;
+pub const STACK_DAY_AFTER_MS: i64 = 3_600_000;
 
 /// What a `SelectMergeStacktraces` request selects.
 #[derive(Debug, Clone, Copy, Default)]
@@ -58,15 +62,276 @@ pub struct TreeRow {
 }
 
 /// Plans `req` for `tenant`: `Ok(None)` when its window ends before the
-/// lookback floor, so nothing is read.
+/// lookback floor, so nothing is read. In the reference's order, except
+/// that `max_nodes` is checked after the type and the selector: a span
+/// selector with a trace selector, then the window, the type and the
+/// selector, then `max_nodes`, then the id lists.
 pub fn plan(
     tenant: &Tenant,
     config: &ProfilesReadConfig,
     req: &TreeRequest<'_>,
     now_ms: i64,
 ) -> Result<Option<Planned>, ProfilesReadError> {
-    let _ = (tenant, config, req, now_ms);
-    Ok(None)
+    refuse_span_with_trace(req.span_selector, req.trace_id_selector)?;
+    let selectors = [req.label_selector];
+    let compiled = compile(
+        tenant,
+        &config.series_table,
+        &SelectorRequest {
+            selectors: &selectors,
+            profile_type: Some(req.profile_type),
+            start_ms: req.start_ms,
+            end_ms: req.end_ms,
+        },
+        now_ms,
+        config.limits,
+    )
+    .map_err(|SelectorError::InvalidArgument(m)| ProfilesReadError::InvalidArgument(m))?;
+    let (series, window, matchers) = match compiled {
+        Compiled::Empty => return Ok(None),
+        Compiled::Series {
+            sql,
+            window,
+            matchers,
+        } => (sql, window, matchers),
+    };
+    let raw_max_nodes = req.max_nodes.unwrap_or(0);
+    let max_nodes = resolve_max_nodes(raw_max_nodes, config)?;
+    let invalid = ProfilesReadError::InvalidArgument;
+    let spans = req
+        .span_selector
+        .iter()
+        .map(|s| span_id(s))
+        .collect::<Result<Vec<u64>, String>>()
+        .map_err(invalid)?;
+    let traces = req
+        .trace_id_selector
+        .iter()
+        .map(|s| trace_id(s))
+        .collect::<Result<Vec<String>, String>>()
+        .map_err(invalid)?;
+    let profiles = req
+        .profile_id_selector
+        .iter()
+        .map(|s| uuid(s))
+        .collect::<Result<Vec<String>, String>>()
+        .map_err(invalid)?;
+
+    let tenant_term = TenantTerm::of(tenant);
+    let type_id = matchers
+        .iter()
+        .rev()
+        .find(|m| m.key == "__profile_type__")
+        .map(|m| m.value.as_str())
+        .unwrap_or_default();
+    let call_site = if req.call_site.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = req.call_site.iter().map(|n| ch_string(n)).collect();
+        format!(
+            "\n      AND arraySlice(names, 1, {}) = [{}]",
+            names.len(),
+            names.join(", ")
+        )
+    };
+    let mut filters = String::new();
+    if !spans.is_empty() {
+        let list: Vec<String> = spans.iter().map(u64::to_string).collect();
+        filters.push_str(&format!("\n      AND span_id IN ({})", list.join(", ")));
+    }
+    if !traces.is_empty() {
+        let list: Vec<String> = traces.iter().map(|t| format!("unhex('{t}')")).collect();
+        filters.push_str(&format!("\n      AND trace_id IN ({})", list.join(", ")));
+    }
+    if !profiles.is_empty() {
+        let list: Vec<String> = profiles.iter().map(|p| format!("'{p}'")).collect();
+        filters.push_str(&format!("\n      AND profile_id IN ({})", list.join(", ")));
+    }
+    let sql = format!(
+        "SELECT node_ids[i] AS node,
+       any(if(i = 1, toUInt128(0), node_ids[i - 1])) AS parent,
+       any(names[i]) AS name,
+       sum(v) AS total,
+       sumIf(v, i = length(node_ids)) AS self_value
+FROM (
+  SELECT st.stack_id AS stack_id, any(st.node_ids) AS node_ids, any(st.names) AS names, any(agg.v) AS v
+  FROM (
+    SELECT stack_id, node_ids, names
+    FROM profile_stacks
+    WHERE {tenant_term} AND day BETWEEN '{d0}' AND '{d1}'{call_site}
+  ) AS st
+  INNER JOIN (
+    SELECT stack_id, sum(value) AS v
+    FROM {samples}
+    WHERE {tenant_term} AND type_id = {type_id}{service_terms}
+      AND fingerprint IN ({series})
+      AND timestamp_ns >= {start_ns} AND timestamp_ns <= {end_ns}{filters}
+    GROUP BY stack_id
+  ) AS agg ON st.stack_id = agg.stack_id
+  GROUP BY st.stack_id
+)
+ARRAY JOIN arrayEnumerate(node_ids) AS i
+GROUP BY node",
+        d0 = utc_date(window.start_ms.saturating_sub(STACK_DAY_BEFORE_MS)),
+        d1 = utc_date(window.end_ms.saturating_add(STACK_DAY_AFTER_MS)),
+        samples = config.samples_table,
+        type_id = ch_string(type_id),
+        service_terms = crate::metrics::profile_service_terms(&matchers),
+        start_ns = window.start_ms.saturating_mul(1_000_000),
+        end_ns = window.end_ms.saturating_mul(1_000_000),
+    );
+    Ok(Some(Planned {
+        sql,
+        max_nodes,
+        raw_max_nodes,
+    }))
+}
+
+/// The reference refuses a span selector with a trace selector before
+/// anything else it checks.
+pub fn refuse_span_with_trace(
+    spans: &[String],
+    traces: &[String],
+) -> Result<(), ProfilesReadError> {
+    if !spans.is_empty() && !traces.is_empty() {
+        return Err(ProfilesReadError::InvalidArgument(
+            "span_selector and trace_id_selector cannot be combined".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// `max_nodes` as the reference resolves it (`ValidateMaxNodes`): 0 is the
+/// default; above the largest allowed, or negative, is refused.
+fn resolve_max_nodes(raw: i64, config: &ProfilesReadConfig) -> Result<i64, ProfilesReadError> {
+    if raw == 0 {
+        return Ok(config.max_nodes_default);
+    }
+    let max = config.max_nodes_max;
+    if raw > max {
+        return Err(ProfilesReadError::InvalidArgument(format!(
+            "max flamegraph nodes limit {raw} is greater than allowed {max}"
+        )));
+    }
+    if raw < 0 {
+        return Err(ProfilesReadError::InvalidArgument(format!(
+            "max flamegraph nodes limit must be set (max allowed {max})"
+        )));
+    }
+    Ok(raw)
+}
+
+/// `ms` as its UTC date, `YYYY-MM-DD`.
+fn utc_date(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| t.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// A span id as ingest stores it: 16 hex digits, 8 bytes read
+/// little-endian (`NewSpanSelector`).
+fn span_id(s: &str) -> Result<u64, String> {
+    if s.len() != 16 {
+        return Err(format!("invalid span id length: {s:?}"));
+    }
+    let mut b = [0u8; 8];
+    hex_decode(s.as_bytes(), &mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+/// A trace id: 32 hex digits, rendered in lower case (`DecodeTraceID`).
+fn trace_id(s: &str) -> Result<String, String> {
+    if s.len() != 32 {
+        return Err(format!("invalid trace id length: {s:?}"));
+    }
+    let mut b = [0u8; 16];
+    hex_decode(s.as_bytes(), &mut b)?;
+    Ok(s.to_ascii_lowercase())
+}
+
+/// A UUID in any form the reference's parser reads — 36 characters, 38 in
+/// braces, 45 with `urn:uuid:`, or 32 hex digits — rendered canonical and
+/// lower case.
+fn uuid(s: &str) -> Result<String, String> {
+    const FORMAT: &str = "invalid UUID format";
+    let b = s.as_bytes();
+    let mut out = [0u8; 16];
+    let hyphenated = match b.len() {
+        36 => b,
+        45 => {
+            if !b[..9].eq_ignore_ascii_case(b"urn:uuid:") {
+                let prefix = String::from_utf8_lossy(&b[..9]);
+                return Err(format!("invalid urn prefix: {prefix:?}"));
+            }
+            &b[9..]
+        }
+        38 => &b[1..],
+        32 => {
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = hex_pair(b[2 * i], b[2 * i + 1]).ok_or(FORMAT)?;
+            }
+            return Ok(canonical(&out));
+        }
+        n => return Err(format!("invalid UUID length: {n}")),
+    };
+    if hyphenated[8] != b'-'
+        || hyphenated[13] != b'-'
+        || hyphenated[18] != b'-'
+        || hyphenated[23] != b'-'
+    {
+        return Err(FORMAT.to_string());
+    }
+    const AT: [usize; 16] = [0, 2, 4, 6, 9, 11, 14, 16, 19, 21, 24, 26, 28, 30, 32, 34];
+    for (o, x) in out.iter_mut().zip(AT) {
+        *o = hex_pair(hyphenated[x], hyphenated[x + 1]).ok_or(FORMAT)?;
+    }
+    Ok(canonical(&out))
+}
+
+fn canonical(b: &[u8; 16]) -> String {
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
+fn hex_digit(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_pair(hi: u8, lo: u8) -> Option<u8> {
+    Some(hex_digit(hi)? << 4 | hex_digit(lo)?)
+}
+
+/// Hex digits into `out`, refused at the first byte that is not one with
+/// the reference's text (`encoding/hex`'s `InvalidByteError`).
+fn hex_decode(src: &[u8], out: &mut [u8]) -> Result<(), String> {
+    let digit = |c: u8| hex_digit(c).ok_or_else(|| invalid_byte(c));
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = digit(src[2 * i])? << 4 | digit(src[2 * i + 1])?;
+    }
+    Ok(())
+}
+
+/// `encoding/hex: invalid byte: %#U`: the code point, and the character
+/// quoted when it prints.
+fn invalid_byte(c: u8) -> String {
+    let ch = char::from(c);
+    if ch == ' ' || (!ch.is_control() && !ch.is_whitespace() && ch != '\u{ad}') {
+        format!("encoding/hex: invalid byte: U+{c:04X} '{ch}'")
+    } else {
+        format!("encoding/hex: invalid byte: U+{c:04X}")
+    }
 }
 
 #[cfg(test)]
@@ -413,7 +678,8 @@ GROUP BY node";
                 end,
             )
             .sql;
-            let expected = format!("FROM profile_stacks\n    WHERE org_id = 't1' AND day BETWEEN {days}\n");
+            let expected =
+                format!("FROM profile_stacks\n    WHERE org_id = 't1' AND day BETWEEN {days}\n");
             assert!(sql.contains(&expected), "{expected:?} missing from\n{sql}");
         }
     }

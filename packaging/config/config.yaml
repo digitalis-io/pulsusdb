@@ -132,6 +132,8 @@ clickhouse:
   #profiles_max_tree_nodes: 4194304
   #profiles_max_result_bytes: 268435456
   #profiles_query_memory_bytes: 4294967296
+  #profiles_max_nodes_default: 8192
+  #profiles_max_nodes_max: 1048576
 
 #ruler:
   #enabled: false

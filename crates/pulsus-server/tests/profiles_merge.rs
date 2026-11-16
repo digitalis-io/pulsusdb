@@ -42,7 +42,10 @@ const FP: u128 = 101;
 
 /// `svc`'s stacks (low-level §7.2): id, frames, and its samples as
 /// `(value, ms after T)`.
-const STACKS: [(u128, &str, &[(i64, i64)]); 6] = [
+/// One stack's id, frames and `(value, ms after T)` samples.
+type Stack = (u128, &'static str, &'static [(i64, i64)]);
+
+const STACKS: [Stack; 6] = [
     (1, "main,a", &[(2, 1_000)]),
     (2, "main,a,b", &[(10, 1_000), (7, 2_000)]),
     (3, "main,a,c", &[(5, 1_000)]),
@@ -72,7 +75,10 @@ fn node_id(path: &[&str]) -> u128 {
 }
 
 fn list<T: std::fmt::Display>(v: impl Iterator<Item = T>) -> String {
-    format!("[{}]", v.map(|x| x.to_string()).collect::<Vec<_>>().join(", "))
+    format!(
+        "[{}]",
+        v.map(|x| x.to_string()).collect::<Vec<_>>().join(", ")
+    )
 }
 
 fn insert(rows: &[String]) -> String {
@@ -556,7 +562,12 @@ async fn the_merged_flame_graph_answers_in_one_statement() {
 
     // M6: `maxNodes` above the largest allowed.
     let id = refused(
-        &connect(a, native_path(), "t1", &body(json!({"maxNodes": "1048577"}))),
+        &connect(
+            a,
+            native_path(),
+            "t1",
+            &body(json!({"maxNodes": "1048577"})),
+        ),
         400,
         "invalid_argument",
         "max flamegraph nodes limit 1048577 is greater than allowed 1048576",

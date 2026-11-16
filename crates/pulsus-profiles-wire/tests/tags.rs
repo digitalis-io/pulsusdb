@@ -497,7 +497,9 @@ fn every_merge_message_field_encodes_under_the_proto_tag() {
     let mut b = Vec::new();
     encoding::int64::encode(5, &0, &mut b);
     assert_eq!(zero.encode_to_vec(), b, "max_nodes 0");
-    assert!(SelectMergeStacktracesRequest::default()
-        .encode_to_vec()
-        .is_empty());
+    assert!(
+        SelectMergeStacktracesRequest::default()
+            .encode_to_vec()
+            .is_empty()
+    );
 }

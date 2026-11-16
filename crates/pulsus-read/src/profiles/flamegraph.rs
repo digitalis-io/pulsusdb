@@ -12,6 +12,8 @@
 //! named `other` takes the cut siblings' sum, its self and its total each
 //! growing by it. The reference overwrites that sum.
 
+use std::collections::{HashMap, HashSet};
+
 use super::engine::ProfilesReadError;
 use super::tree::TreeRow;
 
@@ -47,23 +49,287 @@ pub struct Tree {
 }
 
 /// Steps 0 and 1: S5's rows as a tree, every child whose total is below
-/// the `m`-th largest total cut into a child `other`.
+/// the `m`-th largest total cut into a child `other`
+/// (`TreeFromStacktraceTree`, `pkg/model/stacktraces.go`).
 pub fn merged_tree(rows: &[TreeRow], m: i64) -> Result<Tree, ProfilesReadError> {
-    let _ = (rows, m);
-    Ok(Tree::default())
+    let mut children: HashMap<u128, Vec<usize>> = HashMap::with_capacity(rows.len());
+    let ids: HashSet<u128> = rows.iter().map(|r| r.node).collect();
+    for (i, r) in rows.iter().enumerate() {
+        if r.parent != 0 && !ids.contains(&r.parent) {
+            return Err(ProfilesReadError::Internal(
+                "malformed merged tree".to_string(),
+            ));
+        }
+        children.entry(r.parent).or_default().push(i);
+    }
+    // The reference's tree has a root of total 0 besides the N nodes, so
+    // `m ≥ N + 1` keeps every node.
+    let n = rows.len() as i64;
+    let min1 = if m < 1 || m > n {
+        0
+    } else {
+        kth(rows.iter().map(|r| r.total).chain([0]), m)
+    };
+    let mut tree = Tree::default();
+    // (the row's node id, the tree node it becomes; `None` for the root)
+    let mut stack: Vec<(u128, Option<usize>)> = vec![(0, None)];
+    while let Some((id, at)) = stack.pop() {
+        let mut kept = Vec::new();
+        let mut cut: i64 = 0;
+        for &i in children.get(&id).map(Vec::as_slice).unwrap_or(&[]) {
+            let r = &rows[i];
+            if r.total >= min1 {
+                let index = tree.push(TreeNode {
+                    name: r.name.clone(),
+                    self_value: r.self_value,
+                    total: r.total,
+                    children: Vec::new(),
+                });
+                kept.push(index);
+                stack.push((r.node, Some(index)));
+            } else {
+                cut += r.total;
+            }
+        }
+        if cut > 0 {
+            match kept.iter().find(|&&k| tree.nodes[k].name == OTHER) {
+                // D11: the named node keeps the cut siblings' values.
+                Some(&k) => {
+                    tree.nodes[k].self_value += cut;
+                    tree.nodes[k].total += cut;
+                }
+                None => kept.push(tree.push(TreeNode {
+                    name: OTHER.to_string(),
+                    self_value: cut,
+                    total: cut,
+                    children: Vec::new(),
+                })),
+            }
+        }
+        tree.sort_by_name(&mut kept);
+        *tree.children_mut(at) = kept;
+    }
+    Ok(tree)
 }
 
-/// Step 2: the reference's marshal with truncation, then its unmarshal.
-pub fn truncated(tree: Tree, m: i64) -> Tree {
-    let _ = m;
-    tree
+/// Step 2: the reference's `MarshalTruncate` then `UnmarshalTree`
+/// (`pkg/model/tree.go`). With more than `m` nodes, every child whose total
+/// is below the `m`-th largest total, and is not named `other`, is cut into
+/// its parent's child `other`; then every total is rebuilt from the selves.
+pub fn truncated(mut tree: Tree, m: i64) -> Tree {
+    let reachable = tree.reachable();
+    let size = reachable.len() as i64;
+    let min2 = if m < 1 || size <= m {
+        0
+    } else {
+        kth(reachable.iter().map(|&i| tree.nodes[i].total), m)
+    };
+    let mut stack: Vec<Option<usize>> = vec![None];
+    while let Some(at) = stack.pop() {
+        let mut kept = Vec::new();
+        let mut cut: i64 = 0;
+        for c in tree.children(at).to_vec() {
+            let node = &tree.nodes[c];
+            if node.total >= min2 || node.name == OTHER {
+                kept.push(c);
+            } else {
+                cut += node.total;
+            }
+        }
+        if cut > 0 {
+            match kept.iter().find(|&&k| tree.nodes[k].name == OTHER) {
+                Some(&k) => {
+                    tree.nodes[k].self_value += cut;
+                    tree.nodes[k].total += cut;
+                }
+                None => kept.push(tree.push(TreeNode {
+                    name: OTHER.to_string(),
+                    self_value: cut,
+                    total: cut,
+                    children: Vec::new(),
+                })),
+            }
+        }
+        tree.sort_by_name(&mut kept);
+        stack.extend(kept.iter().map(|&k| Some(k)));
+        *tree.children_mut(at) = kept;
+    }
+    tree.rebuild_totals();
+    tree.compacted()
 }
 
 /// The flame graph of S5's rows: steps 1 and 2 with `m` (the resolved
 /// `max_nodes`), step 3 with `raw` (the request's value, 0 when absent).
 pub fn flame_graph(rows: &[TreeRow], m: i64, raw: i64) -> Result<FlameGraph, ProfilesReadError> {
-    let _ = (rows, m, raw);
-    Ok(FlameGraph::default())
+    let tree = truncated(merged_tree(rows, m)?, m);
+    Ok(flame_graph_of(&tree, raw))
+}
+
+/// Step 3: the reference's `NewFlameGraph` (`pkg/model/flamegraph.go`). A
+/// depth-first walk from a virtual root, last pushed first; each node
+/// appends `[name index, self, total, x]` to its level, and every child
+/// below the `raw`-th largest total, or named `other`, is summed into one
+/// generated `other`, pushed last. Each level is then reversed and its x
+/// offsets delta-encoded.
+fn flame_graph_of(tree: &Tree, raw: i64) -> FlameGraph {
+    enum Item {
+        Root,
+        Node(usize),
+        Other(i64),
+    }
+    let reachable = tree.reachable();
+    let size = reachable.len() as i64;
+    let min3 = if raw < 1 || size <= raw {
+        0
+    } else {
+        kth(reachable.iter().map(|&i| tree.nodes[i].total), raw)
+    };
+    let total: i64 = tree.roots.iter().map(|&r| tree.nodes[r].total).sum();
+    let mut names: Vec<String> = Vec::new();
+    let mut cache: HashMap<String, i64> = HashMap::new();
+    let mut levels: Vec<Vec<i64>> = Vec::new();
+    let mut max_self: i64 = 0;
+    let mut stack: Vec<(Item, i64, usize)> = vec![(Item::Root, 0, 0)];
+    while let Some((item, mut x, level)) = stack.pop() {
+        let (name, self_value, node_total, children): (&str, i64, i64, &[usize]) = match item {
+            Item::Root => ("", 0, total, &tree.roots),
+            Item::Node(i) => {
+                let n = &tree.nodes[i];
+                (&n.name, n.self_value, n.total, &n.children)
+            }
+            Item::Other(v) => (OTHER, v, v, &[]),
+        };
+        max_self = max_self.max(self_value);
+        let index = match cache.get(name) {
+            Some(&i) => i,
+            None => {
+                let i = names.len() as i64;
+                // The virtual root's name, and its cache key, is `total`.
+                let key = if i == 0 { "total" } else { name };
+                cache.insert(key.to_string(), i);
+                names.push(key.to_string());
+                i
+            }
+        };
+        if level == levels.len() {
+            levels.push(Vec::new());
+        }
+        levels[level].extend([index, self_value, node_total, x]);
+        x += self_value;
+        let mut other: i64 = 0;
+        for &c in children {
+            let child = &tree.nodes[c];
+            if child.total >= min3 && child.name != OTHER {
+                stack.push((Item::Node(c), x, level + 1));
+                x += child.total;
+            } else {
+                other += child.total;
+            }
+        }
+        if other != 0 {
+            stack.push((Item::Other(other), x, level + 1));
+        }
+    }
+    for l in &mut levels {
+        l.reverse();
+        let mut prev: i64 = 0;
+        for i in (0..l.len()).step_by(4) {
+            l[i] -= prev;
+            prev += l[i] + l[i + 1];
+        }
+    }
+    FlameGraph {
+        names,
+        levels,
+        total,
+        max_self,
+    }
+}
+
+/// The `k`-th largest of `values`, `k` from 1; 0 when there are fewer.
+fn kth(values: impl Iterator<Item = i64>, k: i64) -> i64 {
+    let mut v: Vec<i64> = values.collect();
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    usize::try_from(k - 1)
+        .ok()
+        .and_then(|i| v.get(i).copied())
+        .unwrap_or(0)
+}
+
+impl Tree {
+    fn push(&mut self, node: TreeNode) -> usize {
+        self.nodes.push(node);
+        self.nodes.len() - 1
+    }
+
+    /// The children of `at`, or the roots when `at` is `None`.
+    fn children(&self, at: Option<usize>) -> &[usize] {
+        match at {
+            Some(i) => &self.nodes[i].children,
+            None => &self.roots,
+        }
+    }
+
+    fn children_mut(&mut self, at: Option<usize>) -> &mut Vec<usize> {
+        match at {
+            Some(i) => &mut self.nodes[i].children,
+            None => &mut self.roots,
+        }
+    }
+
+    /// Sorts `nodes` by name, in byte order.
+    fn sort_by_name(&self, nodes: &mut [usize]) {
+        nodes.sort_by(|a, b| self.nodes[*a].name.cmp(&self.nodes[*b].name));
+    }
+
+    /// Every node reachable from the roots, parents before children.
+    pub fn reachable(&self) -> Vec<usize> {
+        let mut out = Vec::with_capacity(self.nodes.len());
+        let mut stack: Vec<usize> = self.roots.clone();
+        while let Some(i) = stack.pop() {
+            out.push(i);
+            stack.extend(&self.nodes[i].children);
+        }
+        out
+    }
+
+    /// The reachable nodes alone, renumbered.
+    fn compacted(&self) -> Tree {
+        let order = self.reachable();
+        let mut renumbered: HashMap<usize, usize> = HashMap::with_capacity(order.len());
+        for (new, &old) in order.iter().enumerate() {
+            renumbered.insert(old, new);
+        }
+        let nodes = order
+            .iter()
+            .map(|&old| {
+                let n = &self.nodes[old];
+                TreeNode {
+                    name: n.name.clone(),
+                    self_value: n.self_value,
+                    total: n.total,
+                    children: n.children.iter().map(|c| renumbered[c]).collect(),
+                }
+            })
+            .collect();
+        Tree {
+            nodes,
+            roots: self.roots.iter().map(|r| renumbered[r]).collect(),
+        }
+    }
+
+    /// Every total rebuilt as the node's self plus its children's totals,
+    /// as the reference's `UnmarshalTree` rebuilds them.
+    fn rebuild_totals(&mut self) {
+        for &i in self.reachable().iter().rev() {
+            let children: i64 = self.nodes[i]
+                .children
+                .iter()
+                .map(|&c| self.nodes[c].total)
+                .sum();
+            self.nodes[i].total = self.nodes[i].self_value + children;
+        }
+    }
 }
 
 #[cfg(test)]

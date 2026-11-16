@@ -31,12 +31,12 @@ use super::engine::with_engine;
 /// The capability parameter (`pkg/featureflags/client_capability.go:86`).
 const UTF8_LABEL_NAMES: &str = "allow-utf8-labelnames";
 
-fn tenant_of(headers: &HeaderMap) -> Result<Tenant, ConnectError> {
+pub(super) fn tenant_of(headers: &HeaderMap) -> Result<Tenant, ConnectError> {
     tenant_from_headers(headers)
         .map_err(|_| ConnectError::new(Code::InvalidArgument, "invalid X-Scope-OrgID"))
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
@@ -312,7 +312,7 @@ async fn series_answer(
 // ---------------------------------------------------------------------
 
 /// Why a Connect call is answered before its method runs.
-enum Refused {
+pub(super) enum Refused {
     Connect(ConnectError),
     Media(connect::UnsupportedMedia),
 }
@@ -327,7 +327,7 @@ impl IntoResponse for Refused {
 }
 
 /// The tenant, then the codec, then the body, then the message.
-async fn prelude<M>(
+pub(super) async fn prelude<M>(
     headers: &HeaderMap,
     body: Body,
     full_name: &str,
@@ -344,7 +344,7 @@ where
     Ok((tenant, codec, msg))
 }
 
-fn finish<M>(codec: Codec, answer: Result<M, ConnectError>) -> Response
+pub(super) fn finish<M>(codec: Codec, answer: Result<M, ConnectError>) -> Response
 where
     M: prost::Message + serde::Serialize,
 {
@@ -422,7 +422,7 @@ pub(crate) async fn series(
 // ---------------------------------------------------------------------
 
 /// The query string's pairs, then a form body's.
-async fn form_pairs(
+pub(super) async fn form_pairs(
     headers: &HeaderMap,
     raw: Option<&str>,
     body: Body,
@@ -445,7 +445,7 @@ async fn form_pairs(
 }
 
 /// A time parameter's first non-empty value through [`attime`], or 0.
-fn time_param(pairs: &[(String, String)], key: &str, now: i64) -> i64 {
+pub(super) fn time_param(pairs: &[(String, String)], key: &str, now: i64) -> i64 {
     pairs
         .iter()
         .find(|(k, v)| k == key && !v.is_empty())
@@ -454,7 +454,7 @@ fn time_param(pairs: &[(String, String)], key: &str, now: i64) -> i64 {
 }
 
 /// Every non-empty value of `key`.
-fn all(pairs: &[(String, String)], key: &str) -> Vec<String> {
+pub(super) fn all(pairs: &[(String, String)], key: &str) -> Vec<String> {
     pairs
         .iter()
         .filter(|(k, v)| k == key && !v.is_empty())

@@ -106,6 +106,8 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_PROFILES_MAX_TREE_NODES",
     "PULSUS_PROFILES_MAX_RESULT_BYTES",
     "PULSUS_PROFILES_QUERY_MEMORY_BYTES",
+    "PULSUS_PROFILES_MAX_NODES_DEFAULT",
+    "PULSUS_PROFILES_MAX_NODES_MAX",
     "PULSUS_LOGQL_READ_MAX_MEMORY_BYTES",
     "PULSUS_PROMQL_READ_MAX_MEMORY_BYTES",
     "PULSUS_PROMQL_MAX_REPLICA_DELAY",
@@ -518,6 +520,13 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_PROFILES_QUERY_MEMORY_BYTES") {
         cfg.reader.profiles_query_memory_bytes =
             parse_int("PULSUS_PROFILES_QUERY_MEMORY_BYTES", &v)?;
+    }
+    // Issue #823: the flame graph's node counts.
+    if let Some(v) = read("PULSUS_PROFILES_MAX_NODES_DEFAULT") {
+        cfg.reader.profiles_max_nodes_default = parse_int("PULSUS_PROFILES_MAX_NODES_DEFAULT", &v)?;
+    }
+    if let Some(v) = read("PULSUS_PROFILES_MAX_NODES_MAX") {
+        cfg.reader.profiles_max_nodes_max = parse_int("PULSUS_PROFILES_MAX_NODES_MAX", &v)?;
     }
     // Issue #398: the three per-surface read memory ceilings. Plain
     // integers (bytes), rather than the `ByteSize`-parsed `PULSUS_LOGQL_SCAN_BUDGET_BYTES`.

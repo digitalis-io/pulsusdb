@@ -148,8 +148,8 @@ fn w5_the_merge_request_reads_either_form() {
         r#"{"profileTypeID":"a:b:c:d:e","labelSelector":"{x=\"1\"}","start":"1000","end":"2000","maxNodes":4,"format":"PROFILE_FORMAT_FLAMEGRAPH","stackTraceSelector":{"callSite":[{"name":"main"}],"goPgo":{"keepLocations":2,"aggregateCallees":true}},"profileIdSelector":["p"],"traceIdSelector":["t"],"spanSelector":["s"]}"#,
         r#"{"profile_typeID":"a:b:c:d:e","label_selector":"{x=\"1\"}","start":1000,"end":2000,"max_nodes":"4","format":1,"stack_trace_selector":{"call_site":[{"name":"main"}],"go_pgo":{"keep_locations":2,"aggregate_callees":true}},"profile_id_selector":["p"],"trace_id_selector":["t"],"span_selector":["s"],"async":{"x":1}}"#,
     ] {
-        let r = serde_json::from_str::<SelectMergeStacktracesRequest>(body)
-            .map_err(|e| e.to_string());
+        let r =
+            serde_json::from_str::<SelectMergeStacktracesRequest>(body).map_err(|e| e.to_string());
         assert_eq!(r, Ok(expected.clone()), "{body}");
     }
     // Absent, `maxNodes` is `None`; `format` is unspecified.
@@ -170,7 +170,5 @@ fn w5_the_merge_request_reads_either_form() {
         .map_err(|e| e.to_string());
         assert_eq!(r, Ok(n), "{name}");
     }
-    assert!(
-        serde_json::from_str::<SelectMergeStacktracesRequest>(r#"{"format":"NOPE"}"#).is_err()
-    );
+    assert!(serde_json::from_str::<SelectMergeStacktracesRequest>(r#"{"format":"NOPE"}"#).is_err());
 }

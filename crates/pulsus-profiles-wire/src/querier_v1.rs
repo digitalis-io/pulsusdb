@@ -82,76 +82,138 @@ pub struct SeriesResponse {
     pub labels_set: Vec<Labels>,
 }
 
-/// A message without its encoding yet (issue #823's tests-first commit).
-macro_rules! unencoded {
-    ($t:ty) => {
-        impl ::prost::Message for $t {
-            fn encode_raw(&self, _buf: &mut impl ::prost::bytes::BufMut) {}
-            fn merge_field(
-                &mut self,
-                tag: u32,
-                wire_type: ::prost::encoding::WireType,
-                buf: &mut impl ::prost::bytes::Buf,
-                ctx: ::prost::encoding::DecodeContext,
-            ) -> Result<(), ::prost::DecodeError> {
-                ::prost::encoding::skip_field(wire_type, tag, buf, ctx)
-            }
-            fn encoded_len(&self) -> usize {
-                0
-            }
-            fn clear(&mut self) {
-                *self = Self::default();
-            }
-        }
-    };
-}
-pub(crate) use unencoded;
-
-/// `SelectMergeStacktraces`' request.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// `SelectMergeStacktraces`' request (issue #823). Tag 9, `async`, is
+/// read and ignored.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SelectMergeStacktracesRequest {
+    #[prost(string, tag = "1")]
+    #[serde(
+        rename = "profileTypeID",
+        alias = "profile_typeID",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub profile_type_id: String,
+    #[prost(string, tag = "2")]
+    #[serde(
+        rename = "labelSelector",
+        alias = "label_selector",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub label_selector: String,
+    #[prost(int64, tag = "3")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub start: i64,
+    #[prost(int64, tag = "4")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub end: i64,
+    #[prost(int64, optional, tag = "5")]
+    #[serde(
+        rename = "maxNodes",
+        alias = "max_nodes",
+        serialize_with = "crate::int64::ser_opt",
+        deserialize_with = "crate::int64::de_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_nodes: Option<i64>,
+    #[prost(enumeration = "ProfileFormat", tag = "6")]
+    #[serde(
+        serialize_with = "crate::profile_format::ser",
+        deserialize_with = "crate::profile_format::de",
+        skip_serializing_if = "crate::profile_format::is_unspecified"
+    )]
     pub format: i32,
+    #[prost(message, optional, tag = "7")]
+    #[serde(
+        rename = "stackTraceSelector",
+        alias = "stack_trace_selector",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub stack_trace_selector: Option<crate::types_v1::StackTraceSelector>,
+    #[prost(string, repeated, tag = "8")]
+    #[serde(
+        rename = "profileIdSelector",
+        alias = "profile_id_selector",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub profile_id_selector: Vec<String>,
+    #[prost(string, repeated, tag = "10")]
+    #[serde(
+        rename = "traceIdSelector",
+        alias = "trace_id_selector",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub trace_id_selector: Vec<String>,
+    #[prost(string, repeated, tag = "11")]
+    #[serde(
+        rename = "spanSelector",
+        alias = "span_selector",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub span_selector: Vec<String>,
 }
-unencoded!(SelectMergeStacktracesRequest);
 
-/// `SelectMergeStacktraces`' response.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// `SelectMergeStacktraces`' response: the flame graph, field 1. The
+/// tree, DOT and pprof fields are later parts' (#828, #829).
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SelectMergeStacktracesResponse {
+    #[prost(message, optional, tag = "1")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub flamegraph: Option<FlameGraph>,
 }
-unencoded!(SelectMergeStacktracesResponse);
 
-/// A flame graph.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// A flame graph: the names, and per level the nodes as
+/// `[x offset delta, total, self, name index]`.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FlameGraph {
+    #[prost(string, repeated, tag = "1")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<String>,
+    #[prost(message, repeated, tag = "2")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub levels: Vec<Level>,
+    #[prost(int64, tag = "3")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub total: i64,
+    #[prost(int64, tag = "4")]
+    #[serde(
+        rename = "maxSelf",
+        alias = "max_self",
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub max_self: i64,
 }
-unencoded!(FlameGraph);
 
 /// One level of a flame graph.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Level {
+    #[prost(int64, repeated, tag = "1")]
+    #[serde(
+        serialize_with = "crate::int64::ser_vec",
+        deserialize_with = "crate::int64::de_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub values: Vec<i64>,
 }
-unencoded!(Level);
 
-/// The answer's format.
+/// The format `SelectMergeStacktraces` answers in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ProfileFormat {
@@ -160,4 +222,30 @@ pub enum ProfileFormat {
     Tree = 2,
     Dot = 3,
     Pprof = 4,
+}
+
+impl ProfileFormat {
+    /// The value's name in the proto.
+    pub fn as_str_name(self) -> &'static str {
+        match self {
+            ProfileFormat::Unspecified => "PROFILE_FORMAT_UNSPECIFIED",
+            ProfileFormat::Flamegraph => "PROFILE_FORMAT_FLAMEGRAPH",
+            ProfileFormat::Tree => "PROFILE_FORMAT_TREE",
+            ProfileFormat::Dot => "PROFILE_FORMAT_DOT",
+            ProfileFormat::Pprof => "PROFILE_FORMAT_PPROF",
+        }
+    }
+
+    /// The value a proto name names.
+    pub fn from_str_name(name: &str) -> Option<Self> {
+        [
+            ProfileFormat::Unspecified,
+            ProfileFormat::Flamegraph,
+            ProfileFormat::Tree,
+            ProfileFormat::Dot,
+            ProfileFormat::Pprof,
+        ]
+        .into_iter()
+        .find(|f| f.as_str_name() == name)
+    }
 }

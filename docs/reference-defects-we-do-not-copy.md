@@ -93,6 +93,7 @@ replaces one.
 | [38](#38-one-span-missing-an-operand-fails-a-whole-grouped-query) | trace reference | queries | A | `by(-span.x)` fails every trace when one span lacks `x`, where `by(span.x / 1000)` groups that span under `false`. |
 | [39](#39-an-attribute-quantile-drops-every-integer-below-2) | trace reference | queries | C, D | `quantile_over_time(span.n, .01)` over `-4`, `1` and `7` answers from `7` alone. |
 | [40](#40--over-a-condition-the-store-can-filter-answers-nothing-on-search-and-is-ignored-on-metrics) | trace reference | queries | A, D | `{ !(status = error) }` answers no span on search and the error spans' count on metrics. |
+| [41](#41-a-function-named-other-that-survives-the-flame-graph-cut-loses-its-cut-siblings-values) | profiles reference | queries | C, D | A flame graph whose function named `other` survives the cut reports a total below the samples' sum. |
 
 ---
 
@@ -2295,6 +2296,39 @@ The expression's value on every route: `{ !(status = error) }` matches the three
 
 Ledger row `traceql-negation-of-a-filtered-condition`. Pinned by
 `an_intrinsic_presence_answers_on_every_route` in `crates/pulsus-read/tests/traces_query_v2_live.rs`.
+
+---
+
+## 41. A function named `other` that survives the flame-graph cut loses its cut siblings' values
+
+**The profiles reference · queries · tests C, D**
+
+### What the reference does
+
+Building a flame graph's tree with a node limit, the reference cuts every child whose total is below the
+limit's value and sums the cut ones into a stub it names `other` (`pkg/model/stacktraces.go:255-273`).
+It inserts the stub into the parent before the kept children, and inserting a name the parent already
+holds returns that child (`pkg/model/tree.go:345-366`). When a kept child is itself named `other`, its
+insert finds the stub and overwrites its self, total and children with its own
+(`pkg/model/stacktraces.go:355-358`). The stub's sum is gone.
+
+### Why that is wrong rather than different
+
+The cut values are dropped without a word (**C**): the graph's total falls below the sum of the selected
+samples. The stub exists to keep the cut values in the graph; no reading of that intent supports losing
+them because a function happens to share its name (**D**). On the rows `main→a` 10, `main→b` 1 and
+`main→other` 5 with a limit of 3, `b` is cut and the reference answers a total of 15 for samples summing
+to 16.
+
+### What PulsusDB does
+
+The kept node named `other` takes the stub's sum: its self and its total each grow by it. The example
+answers 16, with `other` 6 (`docs/api.md` §5).
+
+### Evidence
+
+Ledger row `flamegraph-named-other-keeps-cut-values` (the profiles differential's ledger, issue #822).
+Pinned by `f5_a_named_other_keeps_its_cut_siblings` in `crates/pulsus-read/src/profiles/flamegraph.rs`.
 
 ---
 

@@ -125,7 +125,10 @@ fn node_id(path: &[&str]) -> u128 {
 }
 
 fn list<T: std::fmt::Display>(v: impl Iterator<Item = T>) -> String {
-    format!("[{}]", v.map(|x| x.to_string()).collect::<Vec<_>>().join(", "))
+    format!(
+        "[{}]",
+        v.map(|x| x.to_string()).collect::<Vec<_>>().join(", ")
+    )
 }
 
 fn insert(rows: &[String]) -> String {

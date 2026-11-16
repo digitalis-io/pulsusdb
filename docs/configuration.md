@@ -192,6 +192,8 @@ A trace request is also bounded **before** any of that, by a fixed ceiling on th
 | `PULSUS_PROFILES_MAX_QUERY_LOOKBACK` | `7d` | how far back a profiles query may reach: a window's start is raised to now minus this, and a window that ends before it answers empty with no statement sent. Must be > 0 |
 | `PULSUS_PROFILES_SCAN_BUDGET_ROWS` | `50000000` | per-statement row cap on every profiles read (`max_rows_to_read`, throw); exceeding returns `429 resource_exhausted`, `query_too_broad: PULSUS_PROFILES_SCAN_BUDGET_ROWS`. Must be >= 1 (`0` is ClickHouse's *unlimited*) |
 | `PULSUS_PROFILES_MAX_TREE_NODES` | `4194304` | the most result rows one profiles statement may return (`max_result_rows`, throw); exceeding returns `429 resource_exhausted`. Must be >= 1 |
+| `PULSUS_PROFILES_MAX_NODES_DEFAULT` | `8192` | the flame graph's node count when a `SelectMergeStacktraces` request sends no `maxNodes` or `0` (issue #823, `docs/api.md` §5): the merged tree is trimmed to it. Must be >= 1 and <= `PULSUS_PROFILES_MAX_NODES_MAX` |
+| `PULSUS_PROFILES_MAX_NODES_MAX` | `1048576` | the largest `maxNodes` a flame graph request may send; above it, or negative, is `400 invalid_argument`. Must be >= 1 |
 | `PULSUS_PROFILES_MAX_RESULT_BYTES` | `268435456` | the most result bytes one profiles statement may return (`max_result_bytes`, throw); exceeding returns `429 resource_exhausted`. Must be >= 1 |
 | `PULSUS_PROFILES_QUERY_MEMORY_BYTES` | `4294967296` | per-statement ClickHouse memory ceiling on every profiles read (`max_memory_usage` + `max_bytes_before_external_group_by=0`, throw-not-spill); a breach returns `429 resource_exhausted`. Must be >= 1 |
 
@@ -511,6 +513,8 @@ reader:
   profiles_max_tree_nodes: 4194304
   profiles_max_result_bytes: 268435456
   profiles_query_memory_bytes: 4294967296
+  profiles_max_nodes_default: 8192
+  profiles_max_nodes_max: 1048576
 
 ruler:
   enabled: false
