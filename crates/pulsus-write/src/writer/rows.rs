@@ -3777,7 +3777,8 @@ fn texts_of(texts: &[Arc<str>]) -> Vec<&str> {
 impl SpoolEncode for ProfileLandingRow {
     /// `org_id`, `kind` and `received_ms`, then exactly the columns that kind
     /// sets, `LogLandingRow`'s rule. The 128-bit ids and the fingerprint are
-    /// decimal text, for the reason [`id_text`] gives.
+    /// decimal text, for the reason [`id_text`] gives. The spool writes it
+    /// through [`Self::write_spool_json`], which streams the same document.
     fn to_spool_value(&self) -> serde_json::Value {
         let fingerprint = serde_json::to_string(&self.fingerprint).unwrap_or_default();
         let profile_id = format!("{:016x}{:016x}", self.profile_id.0, self.profile_id.1);
@@ -3801,9 +3802,9 @@ impl SpoolEncode for ProfileLandingRow {
                 "kind": self.kind,
                 "received_ms": self.received_ms,
                 "stack_id": id_text(self.stack_id),
-                "node_ids": self.node_ids.iter().map(|&id| id_text(id)).collect::<Vec<_>>(),
+                "node_ids": self.node_ids.iter().copied().map(id_text).collect::<Vec<_>>(),
                 "names": texts_of(&self.names),
-                "location_ids": self.location_ids.iter().map(|&id| id_text(id)).collect::<Vec<_>>(),
+                "location_ids": self.location_ids.iter().copied().map(id_text).collect::<Vec<_>>(),
             }),
             Self::KIND_SERIES => serde_json::json!({
                 "org_id": &*self.org_id,
@@ -3850,6 +3851,98 @@ impl SpoolEncode for ProfileLandingRow {
                 "line_numbers": self.line_numbers,
             }),
         }
+    }
+
+    /// [`Self::to_spool_value`]'s document, written field by field into the
+    /// sink, as the log and trace landing rows do: a stack row's arrays and
+    /// a location row's lines grow with the push, and the default would
+    /// build a value of the row first. The keys are in sorted order, the
+    /// order the declared shape serialises in (`serde_json::Map` is a
+    /// `BTreeMap` here); `every_profile_landing_row_kind_streams_the_shape_it_declares`
+    /// compares the two documents byte for byte.
+    async fn write_spool_json(&self, out: &mut SpoolSink) -> std::io::Result<()> {
+        let fingerprint = serde_json::to_string(&self.fingerprint).unwrap_or_default();
+        let profile_id = format!("{:016x}{:016x}", self.profile_id.0, self.profile_id.1);
+        let mut o = out.begin_object().await?;
+        match self.kind {
+            Self::KIND_SAMPLE => {
+                o.str_field("fingerprint", &fingerprint).await?;
+                o.field("kind", &self.kind).await?;
+                o.str_field("org_id", &self.org_id).await?;
+                o.str_field("profile_id", &profile_id).await?;
+                o.field("received_ms", &self.received_ms).await?;
+                o.str_field("service", &self.service).await?;
+                o.field("span_id", &self.span_id).await?;
+                o.str_field("stack_id", &id_text(self.stack_id)).await?;
+                o.field("timestamp_ns", &self.timestamp_ns).await?;
+                o.str_field("trace_id", &hex_lower(&self.trace_id)).await?;
+                o.str_field("type_id", &self.type_id).await?;
+                o.field("value", &self.value).await?;
+            }
+            Self::KIND_STACK => {
+                o.field("kind", &self.kind).await?;
+                o.str_array(
+                    "location_ids",
+                    self.location_ids.iter().copied().map(id_text),
+                )
+                .await?;
+                o.str_array("names", &self.names).await?;
+                o.str_array("node_ids", self.node_ids.iter().copied().map(id_text))
+                    .await?;
+                o.str_field("org_id", &self.org_id).await?;
+                o.field("received_ms", &self.received_ms).await?;
+                o.str_field("stack_id", &id_text(self.stack_id)).await?;
+            }
+            Self::KIND_SERIES => {
+                o.str_field("fingerprint", &fingerprint).await?;
+                o.field("kind", &self.kind).await?;
+                o.str_field("labels", &self.labels).await?;
+                o.str_field("org_id", &self.org_id).await?;
+                o.field("received_ms", &self.received_ms).await?;
+                o.str_field("service", &self.service).await?;
+                o.field("timestamp_ns", &self.timestamp_ns).await?;
+                o.str_field("type_id", &self.type_id).await?;
+            }
+            Self::KIND_ENTRY => {
+                o.str_array("annotation_keys", &self.annotation_keys)
+                    .await?;
+                o.str_array("annotation_values", &self.annotation_values)
+                    .await?;
+                o.field("duration_ns", &self.duration_ns).await?;
+                o.str_field("fingerprint", &fingerprint).await?;
+                o.field("kind", &self.kind).await?;
+                o.str_field("org_id", &self.org_id).await?;
+                o.str_field("profile_id", &profile_id).await?;
+                o.field("received_ms", &self.received_ms).await?;
+                o.str_field("service", &self.service).await?;
+                o.field("timestamp_ns", &self.timestamp_ns).await?;
+                o.field("total", &self.value).await?;
+                o.str_field("type_id", &self.type_id).await?;
+            }
+            // The location's arm, as the fallback, for the reason
+            // [`Self::to_spool_value`]'s own fallback gives.
+            _ => {
+                o.field("address", &self.address).await?;
+                o.field("kind", &self.kind).await?;
+                o.str_array("line_files", &self.line_files).await?;
+                o.str_array("line_functions", &self.line_functions).await?;
+                o.array("line_numbers", &self.line_numbers).await?;
+                o.array("line_start_lines", &self.line_start_lines).await?;
+                o.str_array("line_system_names", &self.line_system_names)
+                    .await?;
+                o.str_field("location_id", &id_text(self.location_id))
+                    .await?;
+                o.str_field("mapping_build_id", &self.mapping_build_id)
+                    .await?;
+                o.str_field("mapping_file", &self.mapping_file).await?;
+                o.field("mapping_limit", &self.mapping_limit).await?;
+                o.field("mapping_offset", &self.mapping_offset).await?;
+                o.field("mapping_start", &self.mapping_start).await?;
+                o.str_field("org_id", &self.org_id).await?;
+                o.field("received_ms", &self.received_ms).await?;
+            }
+        }
+        o.end().await
     }
 }
 

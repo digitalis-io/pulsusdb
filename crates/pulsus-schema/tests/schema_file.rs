@@ -3801,21 +3801,22 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
         ..clustered()
     };
     // The digests moved with issue #813, which adds the six profile tables,
-    // their four wrappers and five views.
+    // their four wrappers and five views, and with issue #814, which gives
+    // `profile_landing`'s ten upload columns a `DEFAULT`.
     let cases = [
         (
             "single-node",
             vec![],
             vec!["--mode", "single"],
             single(),
-            "ec0cdd85dda2b77ed36c78ff05d6d8ab8eccbf37d943a45e9cf990f642a65b9d",
+            "0fa35c6e8deccbf9702a3b067d90f6539049d89bb6fe75df3174103aa71c2157",
         ),
         (
             "clustered",
             vec![("PULSUS_CLUSTER", "prod")],
             vec![],
             clustered(),
-            "2c9dc227bcf5c5c01355732348812bd29f1cfaa96bbc3fd98b3b397a8efa334c",
+            "7617e94d52ff561b63d6efb5d75e5d986f7de7c70598c1d9b34560daa1731ef2",
         ),
         (
             "clustered with a storage policy",
@@ -3825,7 +3826,7 @@ fn with_no_cold_volume_the_schema_renders_as_it_did_before_743() {
             ],
             vec![],
             tiered_ctx,
-            "f102203400c986b8dbe45a9d8af0405bc2c97f2ac18da7e260675c37862088e4",
+            "d166858d3524a2f3861c8222590b5fa3ebe54e1d0f375283c7407e2f26c377c6",
         ),
     ];
     for (what, extra, args, ctx, digest) in cases {
