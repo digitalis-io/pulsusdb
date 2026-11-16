@@ -598,6 +598,78 @@ fn valid_zipkin_body() -> Vec<u8> {
         .to_vec()
 }
 
+/// The profile push routes' valid request (issue #817), `None` for every
+/// other path: on the Connect route an `application/proto` `PushRequest`
+/// carrying one series and one pprof profile timed now; on the three
+/// `/ingest` paths that profile as the whole body, `format=pprof`.
+fn profile_ingest_request(path: &str) -> Option<manifest::Req> {
+    use pulsus_profiles_wire::google_v1::{Function, Line, Location, Profile, Sample, ValueType};
+    use pulsus_profiles_wire::push_v1::{PushRequest, RawProfileSeries, RawSample};
+    use pulsus_profiles_wire::types_v1::LabelPair;
+
+    if !matches!(
+        path,
+        "/push.v1.PusherService/Push" | "/ingest" | "/pyroscope/ingest" | "/api/profiles/v1/ingest"
+    ) {
+        return None;
+    }
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_nanos() as i64;
+    let profile = Profile {
+        sample_type: vec![ValueType { r#type: 1, unit: 2 }],
+        sample: vec![Sample {
+            location_id: vec![1],
+            value: vec![1],
+            label: Vec::new(),
+        }],
+        location: vec![Location {
+            id: 1,
+            line: vec![Line {
+                function_id: 1,
+                line: 1,
+            }],
+            ..Location::default()
+        }],
+        function: vec![Function {
+            id: 1,
+            name: 3,
+            filename: 4,
+            ..Function::default()
+        }],
+        string_table: ["", "samples", "count", "main", "main.go"]
+            .map(String::from)
+            .to_vec(),
+        time_nanos: now_ns,
+        ..Profile::default()
+    }
+    .encode_to_vec();
+    let mut req = manifest::Req::new("POST", path);
+    if path == "/push.v1.PusherService/Push" {
+        req.content_type = Some("application/proto");
+        req.body = PushRequest {
+            series: vec![RawProfileSeries {
+                labels: vec![LabelPair {
+                    name: "service_name".to_string(),
+                    value: "conformance".to_string(),
+                }],
+                samples: vec![RawSample {
+                    raw_profile: profile,
+                    id: String::new(),
+                }],
+                annotations: Vec::new(),
+            }],
+        }
+        .encode_to_vec();
+    } else {
+        req.query = "name=app&format=pprof".to_string();
+        req.content_type = Some("application/octet-stream");
+        req.body = profile;
+    }
+    Some(req)
+}
+
 /// The ingest handlers' hand-rolled `google.rpc.Status { code, message }`
 /// protobuf (mirrors `pulsus-write/src/ingest/http.rs`'s private `Status`
 /// type — not exported, so this test binary defines its own decode-only
@@ -2043,6 +2115,22 @@ fn run_case(port: u16, spec: &RouteSpec, case: &CaseClass, spawn: &str) {
 /// (round-9 finding: failures name the exact cell, including header/
 /// credential variant, not just the path).
 fn assert_ingest_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
+    // The profile push routes (issue #817): an empty body, with the
+    // Connect route naming the request's media type and the `/ingest`
+    // paths no `Content-Type` at all.
+    if profile_ingest_request(spec.path).is_some() {
+        let want = (spec.path == "/push.v1.PusherService/Push").then_some("application/proto");
+        assert_eq!(
+            res.content_type(),
+            want,
+            "{ctx}: a profile push success's Content-Type"
+        );
+        assert!(
+            res.body.is_empty(),
+            "{ctx}: a profile push success must have an empty body"
+        );
+        return;
+    }
     // The empty-body family (remote-write `/api/v1/write` + the Loki push
     // receiver `/loki/api/v1/push` at 204, issue #77; the Zipkin v2 JSON
     // receiver `/api/v2/spans` + `/tempo/spans` at 202, issue #75): the sync
@@ -2108,7 +2196,11 @@ fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
     };
 
     let sync = spec.success_status;
-    let async_cases: &[(Option<&str>, u16)] = if is_empty_body {
+    let is_profile = profile_ingest_request(spec.path).is_some();
+    let async_cases: &[(Option<&str>, u16)] = if spec.path == "/push.v1.PusherService/Push" {
+        // A Connect client treats any status but `200` as an error.
+        &[(None, 200), (Some("0"), 200), (Some("1"), 200)]
+    } else if is_empty_body {
         &[(None, sync), (Some("0"), sync), (Some("1"), 202)]
     } else {
         &[(None, 200), (Some("0"), 200), (Some("1"), 202)]
@@ -2119,19 +2211,26 @@ fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
             spec.path,
             header.unwrap_or("<absent>")
         );
-        let mut req = manifest::Req::new("POST", spec.path);
+        let mut req = match profile_ingest_request(spec.path) {
+            Some(req) => req,
+            None => {
+                let mut req = manifest::Req::new("POST", spec.path);
+                // Review round-1 finding (medium): send the documented
+                // request headers (docs/api.md §1.1-1.2) on the success
+                // path, not just an unlabeled body — `Content-Type:
+                // application/x-protobuf` for OTLP, plus `Content-Encoding:
+                // snappy` for remote-write.
+                req.content_type = Some("application/x-protobuf");
+                if is_remote_write {
+                    req.headers.push(("content-encoding", "snappy".to_string()));
+                }
+                req.body = body_for(spec.path);
+                req
+            }
+        };
         if let Some(v) = header {
             req.headers.push(("x-pulsus-async", v.to_string()));
         }
-        // Review round-1 finding (medium): send the documented request
-        // headers (docs/api.md §1.1-1.2) on the success path, not just an
-        // unlabeled body — `Content-Type: application/x-protobuf` for OTLP,
-        // plus `Content-Encoding: snappy` for remote-write.
-        req.content_type = Some("application/x-protobuf");
-        if is_remote_write {
-            req.headers.push(("content-encoding", "snappy".to_string()));
-        }
-        req.body = body_for(spec.path);
         let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
         assert_eq!(res.status, *expect_status, "{ctx}: status");
         assert_ingest_success_envelope(spec, &res, &ctx);
@@ -2154,7 +2253,7 @@ fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
     // receiver (issue #75) always decodes JSON (Content-Type is not a fork
     // discriminator) — all pinned by the `ingest/http.rs` handler tests +
     // `LOKI_PUSH_CASES`/`ZIPKIN_CASES` instead.
-    if !is_empty_body {
+    if !is_empty_body && !is_profile {
         let json_body_for = |path: &str| -> Vec<u8> {
             match path {
                 "/v1/logs" => valid_otlp_logs_json_body(),
@@ -2476,7 +2575,9 @@ async fn all_mode_auth_on_perimeter() {
         }
         let method = spec.methods[0];
         let is_ingest = spec.surface == Surface::Ingest;
-        let mut req = if is_ingest {
+        let mut req = if let Some(r) = profile_ingest_request(spec.path) {
+            r
+        } else if is_ingest {
             let mut r = manifest::Req::new("POST", spec.path);
             r.content_type = Some("application/x-protobuf");
             if spec.path == "/api/v1/write" {
@@ -2736,9 +2837,12 @@ async fn all_mode_compat_off_alias_404() {
                 "[spawn=all,auth=off,compat=off] POST {} case=compat-flag-off-404",
                 spec.path
             );
-            let mut req = manifest::Req::new("POST", spec.path);
-            req.content_type = Some("application/x-protobuf");
-            req.body = valid_loki_push_body();
+            let req = profile_ingest_request(spec.path).unwrap_or_else(|| {
+                let mut req = manifest::Req::new("POST", spec.path);
+                req.content_type = Some("application/x-protobuf");
+                req.body = valid_loki_push_body();
+                req
+            });
             let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
             assert_404_empty(&res, &ctx);
             continue;
@@ -2837,6 +2941,13 @@ async fn reader_only_mode_writer_routes_404() {
         }
         let spawn = "spawn=reader-only";
         match spec.gate {
+            Gate::WriterMode if profile_ingest_request(spec.path).is_some() => {
+                let ctx = format!("[{spawn}] POST {} case=out-of-mode-404", spec.path);
+                let req = profile_ingest_request(spec.path).expect("a profile route");
+                let res =
+                    raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+                assert_404_empty(&res, &ctx);
+            }
             Gate::WriterMode => {
                 let ctx = format!("[{spawn}] POST {} case=out-of-mode-404", spec.path);
                 let mut req = manifest::Req::new("POST", spec.path);

@@ -569,6 +569,74 @@ mod tests {
         );
     }
 
+    /// G1 and G2: the three profile compat push routes mount with the flag
+    /// and the Writer subsystem; `/api/profiles/v1/ingest` mounts with the
+    /// Writer subsystem alone.
+    #[tokio::test]
+    async fn profile_push_routes_are_gated_on_the_flag_and_the_writer_subsystem() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use pulsus_config::Mode;
+        use tower::ServiceExt;
+
+        const COMPAT: [&str; 3] = [
+            "/push.v1.PusherService/Push",
+            "/ingest",
+            "/pyroscope/ingest",
+        ];
+        const NATIVE: &str = "/api/profiles/v1/ingest";
+
+        async fn status(router: &Router, path: &str) -> StatusCode {
+            let request = Request::builder()
+                .uri(path)
+                .method("POST")
+                .body(Body::empty())
+                .unwrap();
+            router.clone().oneshot(request).await.unwrap().status()
+        }
+        let router_for = |compat_endpoints: bool, mode: Mode| {
+            let cfg = Config {
+                compat_endpoints,
+                mode,
+                ..Config::default()
+            };
+            build_router(test_state(), &cfg).expect("router builds")
+        };
+
+        // G1: flag off, `Mode::All`.
+        let router = router_for(false, Mode::All);
+        for path in COMPAT {
+            assert_eq!(
+                status(&router, path).await,
+                StatusCode::NOT_FOUND,
+                "{path}, flag off"
+            );
+        }
+        assert_ne!(
+            status(&router, NATIVE).await,
+            StatusCode::NOT_FOUND,
+            "{NATIVE}, flag off"
+        );
+
+        // G2: flag on, the writer; then the reader.
+        let router = router_for(true, Mode::Writer);
+        for path in COMPAT.into_iter().chain([NATIVE]) {
+            assert_ne!(
+                status(&router, path).await,
+                StatusCode::NOT_FOUND,
+                "{path}, writer"
+            );
+        }
+        let router = router_for(true, Mode::Reader);
+        for path in COMPAT.into_iter().chain([NATIVE]) {
+            assert_eq!(
+                status(&router, path).await,
+                StatusCode::NOT_FOUND,
+                "{path}, reader"
+            );
+        }
+    }
+
     /// Architect adjudication on issue #14's code review (auth-vs-404
     /// finding: REJECTED as a defect, test-gap accepted — no production
     /// change). With auth configured, the alias surface is **not**

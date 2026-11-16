@@ -131,3 +131,12 @@ pub struct LabelValuesResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<String>,
 }
+
+/// A profile annotation. The push route drops the client's.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct ProfileAnnotation {
+    pub key: String,
+    pub value: String,
+}
+
+crate::stub_message!(ProfileAnnotation);

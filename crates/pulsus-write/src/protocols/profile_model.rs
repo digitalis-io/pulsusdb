@@ -70,7 +70,7 @@ const SPAN_ID: &str = "span_id";
 const TRACE_ID: &str = "trace_id";
 const PROFILE_ID: &str = "profile_id";
 /// `pkg/model/labels.go:57`.
-const SPY_LABEL: &str = "pyroscope_spy";
+pub(crate) const SPY_LABEL: &str = "pyroscope_spy";
 
 /// Decodes one pprof body: gzipped when it starts `1f 8b`, else the raw
 /// message. Output over `limit` bytes is refused
