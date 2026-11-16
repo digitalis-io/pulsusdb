@@ -262,7 +262,7 @@ async fn server_now(client: &ChClient) -> String {
 
 /// **L1.** One OTLP push as tenant `t1` is answered `200`, stores the
 /// example's rows under `t1`, and sends exactly one statement: the landing
-/// insert.
+/// insert, and no read.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_otlp_profiles_push_is_stored_by_one_insert_and_no_read() {
     if !should_run() {
@@ -274,6 +274,22 @@ async fn an_otlp_profiles_push_is_stored_by_one_insert_and_no_read() {
     let client = ChClient::new(live_db::conn_config(db.name()))
         .await
         .expect("connect to the live ClickHouse");
+
+    // The writer's first insert into `profile_landing` in a process also
+    // reads the table's columns once (`DESCRIBE TABLE`), and keeps them for
+    // the process. A push as tenant `t0` takes that read, so the push
+    // measured below is one every later push looks like.
+    let (status, answer) = request(
+        PORT,
+        "POST",
+        "/v1development/profiles",
+        &[
+            ("content-type", "application/x-protobuf"),
+            ("x-scope-orgid", "t0"),
+        ],
+        &r().encode_to_vec(),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
 
     let body = r().encode_to_vec();
     let t0 = server_now(&client).await;
@@ -293,7 +309,8 @@ async fn an_otlp_profiles_push_is_stored_by_one_insert_and_no_read() {
     let none = QuerySettings::new();
     let series = strings(
         &client,
-        "SELECT concat(org_id, ' ', type_id, ' ', service) AS s FROM profile_series",
+        "SELECT concat(org_id, ' ', type_id, ' ', service) AS s FROM profile_series \
+         WHERE org_id = 't1'",
         &none,
     )
     .await;

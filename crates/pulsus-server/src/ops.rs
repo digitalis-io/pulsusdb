@@ -1131,7 +1131,7 @@ mod tests {
     }
 
     /// The profile writer's ingest series reach `/metrics` through
-    /// [`ProfileWriterSink`]: the real handler renders one
+    /// [`ProfileWriterSink`]: the handler renders one
     /// `table="profile_landing"` set, the `signal="profiles"` set and the
     /// push-suppression set, each at its seeded value, and none of the
     /// series profiles do not have. Seeds: table base 300, per-signal
