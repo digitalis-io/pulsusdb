@@ -249,3 +249,95 @@ impl ProfileFormat {
         .find(|f| f.as_str_name() == name)
     }
 }
+
+/// `SelectSeries`' request (issue #824).
+#[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelectSeriesRequest {
+    #[prost(string, tag = "1")]
+    #[serde(
+        rename = "profileTypeID",
+        alias = "profile_typeID",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub profile_type_id: String,
+    #[prost(string, tag = "2")]
+    #[serde(
+        rename = "labelSelector",
+        alias = "label_selector",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub label_selector: String,
+    #[prost(int64, tag = "3")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
+    pub start: i64,
+    #[prost(int64, tag = "4")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
+    pub end: i64,
+    #[prost(string, repeated, tag = "5")]
+    #[serde(
+        rename = "groupBy",
+        alias = "group_by",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub group_by: Vec<String>,
+    /// Seconds.
+    #[prost(double, tag = "6")]
+    #[serde(
+        serialize_with = "crate::double::ser",
+        deserialize_with = "crate::double::de",
+        skip_serializing_if = "crate::double::is_zero"
+    )]
+    pub step: f64,
+    #[prost(
+        enumeration = "crate::types_v1::TimeSeriesAggregationType",
+        optional,
+        tag = "7"
+    )]
+    #[serde(
+        serialize_with = "crate::aggregation_type::ser",
+        deserialize_with = "crate::aggregation_type::de",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aggregation: Option<i32>,
+    #[prost(message, optional, tag = "8")]
+    #[serde(
+        rename = "stackTraceSelector",
+        alias = "stack_trace_selector",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stack_trace_selector: Option<crate::types_v1::StackTraceSelector>,
+    #[prost(int64, optional, tag = "9")]
+    #[serde(
+        serialize_with = "crate::int64::ser_opt",
+        deserialize_with = "crate::int64::de_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub limit: Option<i64>,
+    #[prost(enumeration = "crate::types_v1::ExemplarType", tag = "10")]
+    #[serde(
+        rename = "exemplarType",
+        alias = "exemplar_type",
+        serialize_with = "crate::exemplar_type::ser",
+        deserialize_with = "crate::exemplar_type::de",
+        skip_serializing_if = "crate::exemplar_type::is_unspecified"
+    )]
+    pub exemplar_type: i32,
+}
+
+/// `SelectSeries`' response (issue #824).
+#[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelectSeriesResponse {
+    #[prost(message, repeated, tag = "1")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub series: Vec<crate::types_v1::Series>,
+}

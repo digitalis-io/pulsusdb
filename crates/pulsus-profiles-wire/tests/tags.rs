@@ -7,7 +7,8 @@
 //!
 //! W1 (issue #821): the same for every `types_v1` and `querier_v1` message
 //! the query API uses, against `proto/types/v1/types.proto` and
-//! `proto/querier/v1/querier.proto`. Issue #823 adds the merge's messages.
+//! `proto/querier/v1/querier.proto`. Issue #823 adds the merge's messages,
+//! issue #824 the time series'.
 //!
 //! T1 (issue #817): the same for `ProfileAnnotation` and the `push_v1`
 //! messages, against `proto/types/v1/types.proto` and
@@ -21,12 +22,13 @@ use pulsus_profiles_wire::google_v1::{
 use pulsus_profiles_wire::push_v1::{PushRequest, RawProfileSeries, RawSample};
 use pulsus_profiles_wire::querier_v1::{
     FlameGraph, Level, ProfileFormat, ProfileTypesRequest, ProfileTypesResponse,
-    SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SeriesRequest, SeriesResponse,
+    SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SelectSeriesRequest,
+    SelectSeriesResponse, SeriesRequest, SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
     GoPgo, LabelNamesRequest, LabelNamesResponse, LabelPair, LabelValuesRequest,
-    LabelValuesResponse, Labels, Location as CallSite, ProfileAnnotation, ProfileType,
-    StackTraceSelector,
+    LabelValuesResponse, Labels, Location as CallSite, Point, ProfileAnnotation, ProfileType,
+    Series, StackTraceSelector,
 };
 
 fn value_type() -> ValueType {
@@ -592,4 +594,89 @@ fn every_push_field_encodes_under_the_proto_tag() {
     check("RawProfileSeries", &rs, raw_series_bytes(&rs));
     let r = push_request();
     check("PushRequest", &r, push_request_bytes(&r));
+}
+
+fn point() -> Point {
+    Point {
+        value: 2.5,
+        timestamp: 1_794_819_600_000,
+        annotations: vec![annotation()],
+    }
+}
+
+fn point_bytes(p: &Point) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::double::encode(1, &p.value, &mut b);
+    encoding::int64::encode(2, &p.timestamp, &mut b);
+    nested(3, &annotation_bytes(&p.annotations[0]), &mut b);
+    b
+}
+
+fn series() -> Series {
+    Series {
+        labels: vec![label_pair()],
+        points: vec![point(), point()],
+    }
+}
+
+fn series_bytes(s: &Series) -> Vec<u8> {
+    let mut b = Vec::new();
+    nested(1, &label_pair_bytes(&s.labels[0]), &mut b);
+    for p in &s.points {
+        nested(2, &point_bytes(p), &mut b);
+    }
+    b
+}
+
+/// W1 (issue #824): the time series' messages, every field set.
+#[test]
+fn every_time_series_message_field_encodes_under_the_proto_tag() {
+    let p = point();
+    check("Point", &p, point_bytes(&p));
+    let s = series();
+    check("Series", &s, series_bytes(&s));
+    let r = SelectSeriesResponse {
+        series: vec![series()],
+    };
+    let mut b = Vec::new();
+    nested(1, &series_bytes(&series()), &mut b);
+    check("SelectSeriesResponse", &r, b);
+
+    let m = SelectSeriesRequest {
+        profile_type_id: "process_cpu:cpu:nanoseconds:cpu:nanoseconds".to_string(),
+        label_selector: "{service_name=\"a\"}".to_string(),
+        start: 1000,
+        end: 2000,
+        group_by: strings(&["service_name", "pod"]),
+        step: 15.0,
+        aggregation: Some(1),
+        stack_trace_selector: Some(selector()),
+        limit: Some(3),
+        exemplar_type: 2,
+    };
+    let mut b = Vec::new();
+    encoding::string::encode(1, &m.profile_type_id, &mut b);
+    encoding::string::encode(2, &m.label_selector, &mut b);
+    encoding::int64::encode(3, &m.start, &mut b);
+    encoding::int64::encode(4, &m.end, &mut b);
+    encoding::string::encode_repeated(5, &m.group_by, &mut b);
+    encoding::double::encode(6, &15.0, &mut b);
+    encoding::int32::encode(7, &1, &mut b);
+    nested(8, &selector_bytes(&selector()), &mut b);
+    encoding::int64::encode(9, &3, &mut b);
+    encoding::int32::encode(10, &2, &mut b);
+    check("SelectSeriesRequest", &m, b);
+
+    // An explicit `aggregation` of SUM and `limit` of 0 are present on the
+    // wire, as `optional` has them; absent ones are not.
+    let zero = SelectSeriesRequest {
+        aggregation: Some(0),
+        limit: Some(0),
+        ..SelectSeriesRequest::default()
+    };
+    let mut b = Vec::new();
+    encoding::int32::encode(7, &0, &mut b);
+    encoding::int64::encode(9, &0, &mut b);
+    check("aggregation and limit 0", &zero, b);
+    check("default", &SelectSeriesRequest::default(), Vec::new());
 }
