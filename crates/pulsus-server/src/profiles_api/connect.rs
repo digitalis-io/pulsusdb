@@ -23,39 +23,12 @@ pub(crate) enum Codec {
     Json,
 }
 
-/// The Connect error codes this surface answers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Code {
-    InvalidArgument,
-    ResourceExhausted,
-    Unimplemented,
-    Internal,
-    Unavailable,
-    DeadlineExceeded,
-}
+/// The Connect error codes, the wire crate's table (issue #817).
+pub(crate) use pulsus_profiles_wire::connect::Code;
 
-impl Code {
-    fn name(self) -> &'static str {
-        match self {
-            Code::InvalidArgument => "invalid_argument",
-            Code::ResourceExhausted => "resource_exhausted",
-            Code::Unimplemented => "unimplemented",
-            Code::Internal => "internal",
-            Code::Unavailable => "unavailable",
-            Code::DeadlineExceeded => "deadline_exceeded",
-        }
-    }
-
-    fn status(self) -> StatusCode {
-        match self {
-            Code::InvalidArgument => StatusCode::BAD_REQUEST,
-            Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
-            Code::Unimplemented => StatusCode::NOT_IMPLEMENTED,
-            Code::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-            Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-            Code::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
-        }
-    }
+/// `code`'s HTTP status.
+fn status_of(code: Code) -> StatusCode {
+    StatusCode::from_u16(code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// A Connect error: its code and message.
@@ -90,9 +63,9 @@ impl From<ProfilesReadError> for ConnectError {
 
 impl IntoResponse for ConnectError {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({"code": self.code.name(), "message": self.message});
+        let body = serde_json::json!({"code": self.code.as_str(), "message": self.message});
         (
-            self.code.status(),
+            status_of(self.code),
             [(header::CONTENT_TYPE, "application/json")],
             body.to_string(),
         )
@@ -111,9 +84,9 @@ pub(crate) fn deadline_response() -> Response {
 /// `json.Encoder`'s trailing newline.
 pub(crate) fn http_deadline_response() -> Response {
     let body =
-        serde_json::json!({"code": Code::DeadlineExceeded.name(), "message": DEADLINE_MESSAGE});
+        serde_json::json!({"code": Code::DeadlineExceeded.as_str(), "message": DEADLINE_MESSAGE});
     (
-        Code::DeadlineExceeded.status(),
+        status_of(Code::DeadlineExceeded),
         [
             (header::CONTENT_TYPE, "application/json"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),

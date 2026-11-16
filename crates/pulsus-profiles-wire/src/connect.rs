@@ -2,7 +2,8 @@
 //! code, its HTTP status (`protocol_connect.go:1269-1308` of the Connect
 //! library), and the JSON error body.
 
-/// A Connect error code: the ones the profiles routes answer.
+/// A Connect error code: the ones the profiles routes answer, ingest and
+/// query alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Code {
     InvalidArgument,
@@ -11,6 +12,7 @@ pub enum Code {
     Unavailable,
     Internal,
     Unknown,
+    DeadlineExceeded,
 }
 
 impl Code {
@@ -23,6 +25,7 @@ impl Code {
             Code::Unavailable => "unavailable",
             Code::Internal => "internal",
             Code::Unknown => "unknown",
+            Code::DeadlineExceeded => "deadline_exceeded",
         }
     }
 
@@ -34,6 +37,7 @@ impl Code {
             Code::Unimplemented => 501,
             Code::Unavailable => 503,
             Code::Internal | Code::Unknown => 500,
+            Code::DeadlineExceeded => 504,
         }
     }
 
@@ -45,6 +49,7 @@ impl Code {
             404 => Code::Unimplemented,
             429 | 431 => Code::ResourceExhausted,
             502 | 503 => Code::Unavailable,
+            504 => Code::DeadlineExceeded,
             _ => Code::Unknown,
         }
     }
