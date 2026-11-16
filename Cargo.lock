@@ -1757,6 +1757,7 @@ dependencies = [
 name = "pulsus-profiles-wire"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "prost",
  "serde",
  "serde_json",

@@ -3,36 +3,436 @@
 //! legacy route, of which the pprof path is served here. Each reads the
 //! tenant first, reads the body under [`MAX_PROFILE_BODY_BYTES`], decodes and
 //! validates every profile, and only then admits the push whole, the shape of
-//! the other receivers in `ingest/http.rs`.
+//! the trace JSON receiver in `ingest/http.rs`. Nothing is read from
+//! ClickHouse; the sink's one landing insert is the push's only statement.
+
+use std::io::Read;
 
 use axum::body::Body;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::Response;
+use http_body_util::BodyExt;
+use prost::Message;
+use pulsus_profiles_wire::connect::{Code, error_json};
+use pulsus_profiles_wire::push_v1::PushRequest;
 
-use crate::ingest::profiles::ProfileSink;
+use crate::error::LogsIngestError;
+use crate::ingest::http::{is_async, push_headers, read_capped_body};
+use crate::ingest::profiles::{ParsedProfileLanding, ProfileSink};
+use crate::ingest::{
+    AdmitRefusal, KEY_REUSED_MESSAGE, push_too_large_message, push_too_many_days_message,
+};
+use crate::protocols::profile_model::{MAX_PROFILE_SIZE_BYTES, decode_pprof_sized, parse_profiles};
+use crate::protocols::profile_push::{
+    Multipart, legacy_pprof_input, parse_legacy_query, parse_multipart, push_inputs,
+};
 
 /// The bound on a request body as read, and on the push route's body after
 /// gzip: the reference's `distributor.ingestion-body-limit-mb` default
 /// (`pkg/validation/limits.go:24,164`).
 pub const MAX_PROFILE_BODY_BYTES: usize = 268_435_456;
 
-/// Stub.
-pub async fn ingest_profile_push(
-    _sink: &dyn ProfileSink,
-    _headers: HeaderMap,
-    _body: Body,
-) -> Response {
-    StatusCode::NOT_IMPLEMENTED.into_response()
+/// The text every backpressure refusal carries, on both routes.
+const BACKPRESSURE_MESSAGE: &str = "sink is applying backpressure: buffers are full";
+
+/// The push route's two media types.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Media {
+    Proto,
+    Json,
 }
 
-/// Stub.
-pub async fn ingest_profile_legacy(
-    _sink: &dyn ProfileSink,
-    _query: Option<&str>,
-    _headers: HeaderMap,
-    _body: Body,
+impl Media {
+    fn as_str(self) -> &'static str {
+        match self {
+            Media::Proto => "application/proto",
+            Media::Json => "application/json",
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn json_response(status: StatusCode, body: String, nosniff: bool) -> Response {
+    let mut res = Response::new(Body::from(body));
+    *res.status_mut() = status;
+    let headers = res.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    if nosniff {
+        headers.insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        );
+    }
+    res
+}
+
+// ---------------------------------------------------------------------------
+// The push route
+// ---------------------------------------------------------------------------
+
+/// A Connect unary error (§3.2): the code's status and its JSON body.
+fn connect_error(code: Code, message: impl AsRef<str>) -> Response {
+    let status =
+        StatusCode::from_u16(code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    json_response(status, error_json(code, message.as_ref()), false)
+}
+
+fn connect_refusal(refusal: AdmitRefusal) -> Response {
+    match refusal {
+        AdmitRefusal::Backpressure | AdmitRefusal::DedupShed | AdmitRefusal::DedupWaitShed => {
+            connect_error(Code::ResourceExhausted, BACKPRESSURE_MESSAGE)
+        }
+        AdmitRefusal::KeyReused => connect_error(Code::InvalidArgument, KEY_REUSED_MESSAGE),
+        AdmitRefusal::PushTooLarge {
+            rows,
+            row_limit,
+            bytes,
+            byte_limit,
+        } => connect_error(
+            Code::InvalidArgument,
+            push_too_large_message(rows, row_limit, bytes, byte_limit),
+        ),
+        AdmitRefusal::PushTooManyDays { days, day_limit } => connect_error(
+            Code::InvalidArgument,
+            push_too_many_days_message(days, day_limit),
+        ),
+    }
+}
+
+/// The request's media type, lower-cased with its parameters dropped
+/// (`handler.go:282-295` of the Connect library).
+fn media_of(headers: &HeaderMap) -> Option<Media> {
+    let value = headers.get(header::CONTENT_TYPE)?.to_str().ok()?;
+    let media = value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match media.as_str() {
+        "application/proto" => Some(Media::Proto),
+        "application/json" => Some(Media::Json),
+        _ => None,
+    }
+}
+
+/// A Connect error before the push is decoded: its code and message.
+type Refusal = (Code, String);
+
+fn too_big(n: usize) -> Refusal {
+    (
+        Code::ResourceExhausted,
+        format!("message size {n} is larger than configured max {MAX_PROFILE_BODY_BYTES}"),
+    )
+}
+
+/// Reads the body under [`MAX_PROFILE_BODY_BYTES`]; over it, the bytes read
+/// when the bound tripped.
+async fn read_connect_body(mut body: Body) -> Result<Vec<u8>, Refusal> {
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| (Code::Unknown, format!("read message: {e}")))?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if out.len() + data.len() > MAX_PROFILE_BODY_BYTES {
+            return Err(too_big(out.len() + data.len()));
+        }
+        out.extend_from_slice(&data);
+    }
+    Ok(out)
+}
+
+/// `Content-Encoding` as Connect reads it (`protocol.go:307-323`,
+/// `compression.go:82-106`): identity or gzip, the output under the body
+/// bound.
+fn decode_content(headers: &HeaderMap, body: Vec<u8>) -> Result<Vec<u8>, Refusal> {
+    let encoding = headers
+        .get(header::CONTENT_ENCODING)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .unwrap_or_default();
+    match encoding.as_str() {
+        "" | "identity" => Ok(body),
+        "gzip" => {
+            if body.is_empty() {
+                return Ok(body);
+            }
+            let mut out = Vec::new();
+            flate2::read::MultiGzDecoder::new(body.as_slice())
+                .take(MAX_PROFILE_BODY_BYTES as u64 + 1)
+                .read_to_end(&mut out)
+                .map_err(|e| (Code::InvalidArgument, format!("decompress: {e}")))?;
+            if out.len() > MAX_PROFILE_BODY_BYTES {
+                return Err(too_big(out.len()));
+            }
+            Ok(out)
+        }
+        other => Err((
+            Code::Unimplemented,
+            format!("unknown compression \"{other}\": supported encodings are gzip"),
+        )),
+    }
+}
+
+/// `POST /push.v1.PusherService/Push` (§3): a Connect unary `PushRequest`,
+/// protobuf or proto3 JSON. Every profile is decoded and validated before
+/// the push is admitted; success is `200` and an empty `PushResponse`.
+pub async fn ingest_profile_push(
+    sink: &dyn ProfileSink,
+    headers: HeaderMap,
+    body: Body,
 ) -> Response {
-    StatusCode::NOT_IMPLEMENTED.into_response()
+    let tenant = match pulsus_model::tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(err) => return connect_error(Code::InvalidArgument, err.to_string()),
+    };
+    let Some(media) = media_of(&headers) else {
+        let mut res = Response::new(Body::empty());
+        *res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+        res.headers_mut().insert(
+            "accept-post",
+            HeaderValue::from_static("application/json, application/proto"),
+        );
+        return res;
+    };
+    let now_ms = now_ms();
+    let body = match read_connect_body(body).await {
+        Ok(body) => decode_content(&headers, body),
+        Err(refusal) => Err(refusal),
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err((code, message)) => return connect_error(code, message),
+    };
+    let request = match media {
+        Media::Proto => PushRequest::decode(body.as_slice()).map_err(|e| e.to_string()),
+        Media::Json => serde_json::from_slice::<PushRequest>(&body).map_err(|e| e.to_string()),
+    };
+    let request = match request {
+        Ok(request) => request,
+        Err(e) => return connect_error(Code::InvalidArgument, format!("unmarshal message: {e}")),
+    };
+    let inputs = match push_inputs(request) {
+        Ok(inputs) => inputs,
+        Err(e) => return connect_error(e.code, e.message),
+    };
+    let landing = match parse_profiles(inputs, now_ms) {
+        Ok(landing) => landing,
+        Err(r) => return connect_error(Code::InvalidArgument, r.message),
+    };
+    let outcome = admit(sink, &headers, &tenant, landing).await;
+    match outcome {
+        Ok(()) => {
+            let body = match media {
+                Media::Proto => Body::empty(),
+                Media::Json => Body::from("{}"),
+            };
+            let mut res = Response::new(body);
+            res.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(media.as_str()),
+            );
+            res
+        }
+        Err(Failure::Refused(r)) => connect_refusal(r),
+        Err(Failure::Insert(e)) => connect_error(Code::Internal, e.to_string()),
+    }
+}
+
+/// Why an admission stored nothing.
+enum Failure {
+    Refused(AdmitRefusal),
+    Insert(LogsIngestError),
+}
+
+/// `X-Pulsus-Async: 1` admits without waiting; otherwise the landing insert
+/// is awaited.
+async fn admit(
+    sink: &dyn ProfileSink,
+    headers: &HeaderMap,
+    tenant: &pulsus_model::Tenant,
+    landing: ParsedProfileLanding,
+) -> Result<(), Failure> {
+    let push = push_headers(headers);
+    if is_async(headers) {
+        return sink.admit(tenant, landing, push).map_err(Failure::Refused);
+    }
+    sink.admit_flush(tenant, landing, push)
+        .map_err(Failure::Refused)?
+        .await
+        .map_err(Failure::Insert)
+}
+
+// ---------------------------------------------------------------------------
+// `/ingest`
+// ---------------------------------------------------------------------------
+
+/// The reference's plain-HTTP error (`pkg/util/http/error.go:44-58`): the
+/// code named from the status, `nosniff`, and a trailing newline.
+fn legacy_error(status: StatusCode, message: impl AsRef<str>) -> Response {
+    let mut body = error_json(Code::from_http_status(status.as_u16()), message.as_ref());
+    body.push('\n');
+    json_response(status, body, true)
+}
+
+fn legacy_refusal(refusal: AdmitRefusal) -> Response {
+    match refusal {
+        AdmitRefusal::Backpressure | AdmitRefusal::DedupShed | AdmitRefusal::DedupWaitShed => {
+            legacy_error(StatusCode::TOO_MANY_REQUESTS, BACKPRESSURE_MESSAGE)
+        }
+        AdmitRefusal::KeyReused => legacy_error(StatusCode::BAD_REQUEST, KEY_REUSED_MESSAGE),
+        AdmitRefusal::PushTooLarge {
+            rows,
+            row_limit,
+            bytes,
+            byte_limit,
+        } => legacy_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            push_too_large_message(rows, row_limit, bytes, byte_limit),
+        ),
+        AdmitRefusal::PushTooManyDays { days, day_limit } => legacy_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            push_too_many_days_message(days, day_limit),
+        ),
+    }
+}
+
+fn empty(status: StatusCode) -> Response {
+    let mut res = Response::new(Body::empty());
+    *res.status_mut() = status;
+    res
+}
+
+/// The body `/ingest` serves, by `format` and `Content-Type`, first match
+/// winning (`pkg/ingester/…/ingest_handler.go:207-245`).
+enum Format {
+    Pprof,
+    Multipart,
+    Unsupported(String),
+}
+
+fn format_of(format: Option<&str>, content_type: &str) -> Format {
+    let f = format.unwrap_or("");
+    let unsupported = |name: &str| Format::Unsupported(name.to_string());
+    if f == "trie" || content_type == "binary/octet-stream+trie" {
+        return unsupported(if f == "trie" { f } else { content_type });
+    }
+    if f == "tree" || content_type == "binary/octet-stream+tree" {
+        return unsupported(if f == "tree" { f } else { content_type });
+    }
+    match f {
+        "lines" | "jfr" | "speedscope" => return unsupported(f),
+        "pprof" => return Format::Pprof,
+        _ => {}
+    }
+    if content_type.contains("multipart/form-data") {
+        Format::Multipart
+    } else {
+        unsupported("groups")
+    }
+}
+
+/// `POST /ingest`, `/<ref>/ingest` and `/api/profiles/v1/ingest` (§4): the
+/// pprof path, a whole-body profile or a multipart form. Success is `200`
+/// with an empty body, `202` under `X-Pulsus-Async: 1`.
+pub async fn ingest_profile_legacy(
+    sink: &dyn ProfileSink,
+    query: Option<&str>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let tenant = match pulsus_model::tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(err) => return legacy_error(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+    let now_ms = now_ms();
+    let query = match parse_legacy_query(query, now_ms.saturating_mul(1_000_000)) {
+        Ok(query) => query,
+        Err(message) => return legacy_error(StatusCode::BAD_REQUEST, message),
+    };
+    let body = match read_capped_body(body, MAX_PROFILE_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(LogsIngestError::BodyRead(e)) => return legacy_error(StatusCode::REQUEST_TIMEOUT, e),
+        Err(_) => {
+            return legacy_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "request body too large: error reading request body bytes_read \
+                     {MAX_PROFILE_BODY_BYTES}: http: request body too large"
+                ),
+            );
+        }
+    };
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let form = match format_of(query.format.as_deref(), content_type) {
+        Format::Unsupported(f) => {
+            return legacy_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("format {f} is not supported"),
+            );
+        }
+        Format::Pprof => Multipart {
+            profile: Some(body),
+            sample_type_config: None,
+        },
+        Format::Multipart => match parse_multipart(content_type, &body) {
+            Ok(form) => form,
+            Err(e) => {
+                return legacy_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "parsing IngestInput-pprof failed failed to parse pprof /ingest \
+                         multipart form {e}"
+                    ),
+                );
+            }
+        },
+    };
+    let Some(bytes) = form.profile.filter(|b| !b.is_empty()) else {
+        return empty(StatusCode::OK);
+    };
+    let profile = match decode_pprof_sized(&bytes, MAX_PROFILE_SIZE_BYTES) {
+        Ok((profile, _)) => profile,
+        Err(e) => {
+            return legacy_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("parsing IngestInput-pprof failed invalid_argument: {e}"),
+            );
+        }
+    };
+    let input = legacy_pprof_input(profile, &query, form.sample_type_config.as_ref());
+    let landing = match parse_profiles(vec![input], now_ms) {
+        Ok(landing) => landing,
+        Err(r) => {
+            return legacy_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "pushing IngestInput-pprof failed push series with index 0 and id  failed: \
+                     invalid_argument: {}",
+                    r.message
+                ),
+            );
+        }
+    };
+    let asynchronous = is_async(&headers);
+    match admit(sink, &headers, &tenant, landing).await {
+        Ok(()) if asynchronous => empty(StatusCode::ACCEPTED),
+        Ok(()) => empty(StatusCode::OK),
+        Err(Failure::Refused(r)) => legacy_refusal(r),
+        Err(Failure::Insert(e)) => legacy_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 #[cfg(test)]

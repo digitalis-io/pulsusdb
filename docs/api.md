@@ -22,7 +22,7 @@ Conventions:
 |--------|-----------|--------|
 | `X-Pulsus-Database` | ingest + query | route to an alternate ClickHouse database (retention is per-database configuration; there is no per-write TTL override in v1) |
 | `X-Pulsus-Async` | ingest | `1` = answer `202` once admitted: accepted, not stored — except a log push some of whose streams fail their label checks, which is answered `400` (§1.0). A log or trace push is then held in memory until its batch's insert settles — its wait in the queue, up to `PULSUS_LANDING_BATCH_MS` while its batch forms, then the insert and its resends, within 120 s of the admission of its batch's oldest push — and a process that ends without its drain loses it until that insert's first attempt is sent; a failure is reported to nobody. `0` = answer once the insert that answers the push has settled (§1.0) (default from config) |
-| `X-Scope-OrgID` | log, metric and trace ingest and query, and profile query | the tenant (issues #635, #653, #738). No header is the empty tenant, the single-tenant deployment; 1 to 150 bytes of `[A-Za-z0-9_.-]` is that tenant; an empty value, a longer one, any other byte, or the header given twice is `400` (`invalid X-Scope-OrgID`), read before any other parameter, and nothing is stored or read. Every write stores the tenant and every read answers that tenant's rows alone; a trace id stored only under another tenant is absent to this one |
+| `X-Scope-OrgID` | log, metric, trace and profile ingest, and query | the tenant (issues #635, #653, #738). No header is the empty tenant, the single-tenant deployment; 1 to 150 bytes of `[A-Za-z0-9_.-]` is that tenant; an empty value, a longer one, any other byte, or the header given twice is `400` (`invalid X-Scope-OrgID`), read before any other parameter, and nothing is stored or read. Every write stores the tenant and every read answers that tenant's rows alone; a trace id stored only under another tenant is absent to this one |
 | `X-Pulsus-Explain` | query | `1` = include generated SQL, plan, and `exactness` in the response envelope. `exactness` is `"raw-exact"`, or `"rollup"` when a rollup level served part of a selector (§3.6) |
 | `X-Loki-Response-Encoding-Flags` | log query (`query`, `query_range`, `tail`) | comma-separated encoding flags. `categorize-labels` switches the `streams` result to the three-element `values` shape — see §2.1. Unknown flags are echoed back and change nothing. Absent, the response is exactly what it was before the header existed |
 | `Idempotency-Key` | log, metric and trace ingest | issue #494, extended to the trace push by issue #586. Namespaces a push's identity in the writer process's suppression index (§1.0), while that index is on and still holds the key — until `PULSUS_INGEST_DEDUP_WINDOW` has passed: two requests with **different** keys are then two pushes whatever they carry, and the same key with the same content is one push. The same key carrying **different** content is then a client error — `400`, and nothing is stored. At another writer process, after the window, or with `PULSUS_INGEST_DEDUP=false`, the key decides nothing. Absent, a push is identified by its own content. Two tenants' identical log, metric or trace pushes, with or without one key, are two pushes. A metrics push's deduplication token in ClickHouse never reads the key, so a metrics push of the same parsed content stores its samples, series and exemplars once whatever its key (§1.0). Read on every ingest route, `/v1/traces` and the Zipkin receiver included |
@@ -221,11 +221,45 @@ never sent, matching the reference, which never sets it either.
 ### 1.3 Profile ingest (native)
 
 ```
-POST /api/profiles/v1/ingest?name=<app>{tags}&from=<ts>&until=<ts>&sampleRate=<hz>&format=<fmt>
-Content-Type: multipart/form-data | binary pprof
+POST /api/profiles/v1/ingest?name=<app>{tags}&from=<ts>&spyName=<spy>&format=pprof
+Content-Type: multipart/form-data | any, with the whole body one pprof profile
 ```
 
-Direct pprof ingestion for SDKs/agents that don't route through the collector. Flamegraph tree + function table precomputed at ingest. Success: `200`.
+The pprof path of the reference's `/ingest`, which is also mounted at `/ingest` and `/pyroscope/ingest` (§8.2). A pprof body, raw or gzipped (found by its magic bytes; `Content-Encoding` is not read), becomes one profile, validated and stored as a push to `POST /push.v1.PusherService/Push` is (§8.2). Each push is one insert into `profile_landing` and no read.
+
+| Parameter | Absent | Used |
+|---|---|---|
+| `name` | refused | `<service>{k=v,...}`: the service name is `service_name` unless the set holds one, and each label not starting `__` is a series label. A bad name is `400` `name: <error>` |
+| `from` | now | the profile's time when its own is in 1970: Unix seconds, milliseconds (13 digits), microseconds (16) or nanoseconds (19), `YYYYMMDD`, or `now-1h`-style offsets |
+| `spyName` | `unknown` | the spy label; `pyspy`, `rbspy` and `scripting` name each function `"<file> <name>"`, and `dotnetspy` repairs .NET function ids |
+| `format` | — | below |
+| `until`, `sampleRate`, `units`, `aggregationType` | — | not read on the pprof path |
+
+| Condition, first match wins | Body | Answer |
+|---|---|---|
+| `format=trie`, `tree`, `lines`, `jfr` or `speedscope`, or `Content-Type: binary/octet-stream+trie` or `+tree` | not served | `422` `format <f> is not supported` |
+| `format=pprof` | the whole body is one pprof profile | stored |
+| `Content-Type` contains `multipart/form-data` | the `profile` file part; `sample_type_config` (type name to `{"display-name": ...}`) names the series; `prev_profile` is refused | stored |
+| otherwise | not served | `422` `format groups is not supported` |
+
+The series name comes from the sample types: `wall`; else the first type whose name, or its display name, contains `cpu` (`process_cpu`), `alloc_` or `inuse_` or is `space` or `objects` (`memory`), `mutex_` (`mutex`), `block_` (`block`) or `goroutines` (`goroutines`); else the last type. The default display names are `samples` to `cpu`, `goroutine` to `goroutines`, `contentions` to `mutex_count` and `delay` to `mutex_duration`; a `sample_type_config` replaces them whole.
+
+Success is `200` with an empty body and no `Content-Type`; under `X-Pulsus-Async: 1` it is `202`, admitted without waiting for the insert. A body with no profile (empty, or a form without `profile`) is `200` and stores nothing. Every error is `application/json` with `X-Content-Type-Options: nosniff`, the body `{"code":"<code>","message":"<message>"}` and a newline, the code named from the status:
+
+| Case | Status | Code | Message |
+|---|---|---|---|
+| `X-Scope-OrgID` | 400 | `invalid_argument` | `invalid X-Scope-OrgID` |
+| `name` | 400 | `invalid_argument` | `name: <error>` |
+| body over 256 MiB | 413 | `invalid_argument` | `request body too large: ...` |
+| body read failed | 408 | `unknown` | the read error |
+| a bad multipart form | 422 | `unknown` | `parsing IngestInput-pprof failed failed to parse pprof /ingest multipart form <error>` |
+| a profile that does not decode | 422 | `unknown` | `parsing IngestInput-pprof failed invalid_argument: <error>` |
+| a profile the checks refuse | 422 | `unknown` | `pushing IngestInput-pprof failed push series with index 0 and id  failed: invalid_argument: <error>` |
+| an unsupported format | 422 | `unknown` | above |
+| backpressure | 429 | `resource_exhausted` | `sink is applying backpressure: buffers are full` |
+| a reused `Idempotency-Key` | 400 | `invalid_argument` | §1.0 |
+| a push over its size ceiling or its UTC dates | 413 | `invalid_argument` | §1.1 |
+| the insert failed | 500 | `unknown` | the error |
 
 ---
 
@@ -1685,12 +1719,32 @@ Routing note: the alias `GET /api/traces/{traceId}` coexists with native `/api/t
 |--------------------|--------|
 | `POST /loki/api/v1/push` | log push, JSON or snappy protobuf |
 | `POST /tempo/spans`, `POST /api/v2/spans` | Zipkin v2 JSON |
-| `POST /ingest` | pprof multipart (alias of `/api/profiles/v1/ingest`, ships M5) |
+| `POST /ingest`, `POST /pyroscope/ingest` | pprof, whole-body or multipart (`/api/profiles/v1/ingest`, §1.3) |
+| `POST /push.v1.PusherService/Push` | Connect unary `PushRequest`, `application/proto` or `application/json`, gzip or identity |
 | `POST /influx/api/v2/write` (+ health endpoints) | line protocol, `?precision=` honored |
 | `POST /api/v2/logs` | Datadog logs JSON |
 | `POST /api/v2/series` | Datadog metrics JSON |
 | `POST /_bulk`, `/{target}/_bulk`, `/{target}/_doc[/{id}]`, `/{target}/_create/{id}` | Elastic NDJSON / doc |
 | remote-write aliases `/api/prom/push`, `/api/v1/prom/remote/write`, `/prom/remote/write`, `/api/prom/remote/write` | snappy prompb (native path `/api/v1/write` is always on) |
+
+**Profile push receiver (`POST /push.v1.PusherService/Push`).** A Connect unary call carrying a `PushRequest`: series, each with its labels and its pprof profiles, raw or gzipped. `Content-Type: application/proto` is protobuf and `application/json` is proto3 JSON (field names in either form, `bytes` as base64); any other is `415` with an empty body and `Accept-Post: application/json, application/proto`. `Content-Encoding` is absent, `identity` or `gzip`. The body is bounded at 256 MiB as read and after gzip; each profile at 4 MiB decompressed, and a push at 256 MiB of decompressed profiles. A sample's `ID` is the profile id when it is a UUID. Client annotations are dropped. Every profile is decoded and validated before the push is admitted, so a push is stored whole or not at all, by one insert into `profile_landing` and no read. Success is `200`, `Content-Type` the request's, an empty `PushResponse` (`{}` in JSON); under `X-Pulsus-Async: 1` it is still `200`, because a Connect client treats any other status as an error. Every error is `application/json`, `{"code":"<code>","message":"<message>"}` with no newline:
+
+| Case | Status | Code | Message |
+|---|---|---|---|
+| `X-Scope-OrgID` | 400 | `invalid_argument` | `invalid X-Scope-OrgID` |
+| body over its bound | 429 | `resource_exhausted` | `message size <n> is larger than configured max 268435456` |
+| a gzip error | 400 | `invalid_argument` | `decompress: <error>` |
+| another `Content-Encoding` | 501 | `unimplemented` | `unknown compression "<v>": supported encodings are gzip` |
+| a body that does not decode | 400 | `invalid_argument` | `unmarshal message: <error>` |
+| a profile over 4 MiB | 400 | `invalid_argument` | `uncompressed profile payload size exceeds limit of 4.2 MB` |
+| a profile that does not decode | 500 | `unknown` | the error |
+| a push over 256 MiB decompressed | 400 | `invalid_argument` | `uncompressed batched profile payload size exceeds limit of 268 MB` |
+| no profiles | 400 | `invalid_argument` | `no profiles received` |
+| a profile the checks refuse | 400 | `invalid_argument` | the check's message |
+| backpressure | 429 | `resource_exhausted` | `sink is applying backpressure: buffers are full` |
+| a reused `Idempotency-Key` | 400 | `invalid_argument` | §1.0 |
+| a push over its size ceiling or its UTC dates | 400 | `invalid_argument` | §1.1 |
+| the insert failed | 500 | `internal` | the error |
 
 **Zipkin v2 JSON receiver (M6, `POST /api/v2/spans`, `POST /tempo/spans`).** A foreign-format decoder + model adapter feeding the *native* trace-storage path — each Zipkin v2 JSON span is adapted into one self-contained OTLP `ResourceSpans` and handed to the same parser the native `POST /v1/traces` receiver uses, so a Zipkin-ingested span stores with `payload_type = 1` (OTLP) and is queryable via trace-by-ID (§4.1) and TraceQL search (§4.2) with no read-path difference. Both documented paths bind to the same handler. Mounts iff `PULSUS_COMPAT_ENDPOINTS=true` **and** the Writer subsystem is mounted (`Gate::CompatAndWriter`, the Loki push precedent below); it 404s wherever the writer subsystem does. **Scope is Zipkin v2 JSON only** (v1 JSON, protobuf, and thrift are deferred). The body is always decoded as a Zipkin v2 JSON span array — `Content-Type` is not a fork discriminator (v2 JSON is the sole supported encoding, so there is nothing to content-negotiate, unlike native OTLP which forks JSON vs protobuf on CT) — decompressed per `Content-Encoding` for gzip; the decompressed body is capped at 64 MiB (400). **Documented `Content-Type` divergence:** because the decode is unconditionally JSON, a well-formed JSON span array sent under `Content-Type: application/x-protobuf` is accepted (**202**) where the OpenZipkin oracle would answer 400. This is the sole divergence — no real Zipkin client emits it, and it lets the ratified conformance harness (which sends `application/x-protobuf` generically on ingest success paths) pass; a genuinely non-JSON body under any CT is a clean JSON-parse **400** (never a mis-parse or panic). Field mapping: `traceId` (16-hex 64-bit → left-padded to 16 bytes, 32-hex 128-bit verbatim — byte-identical to the same trace sent as OTLP) / `id` / `parentId` (absent → root); `name`; `kind` CLIENT/SERVER/PRODUCER/CONSUMER → OTLP `SpanKind` (missing → INTERNAL); `timestamp` + `duration` **microseconds** → nanoseconds; `localEndpoint.serviceName` → the `service` dimension (resource `service.name`), its `ipv4`/`ipv6`/`port` → resource `net.host.ip`/`net.host.port`; `remoteEndpoint` → span `net.peer.*`; `tags` → span attributes (verbatim); `annotations` (timestamp + value) → span events; `debug`/`shared` → span attributes `zipkin.debug`/`zipkin.shared`. **Shared spans:** a Zipkin shared span reports the same `(traceId, id)` from both RPC ends with different `kind` (SERVER vs CLIENT); both are stored and **both are returned by trace-by-ID** — the assembler de-duplicates on `(span_id, kind)`, so neither side is dropped (a genuine no-op for native OTLP, whose span ids are unique per trace). Success is an empty **202** Accepted (both sync and async `X-Pulsus-Async: 1` — the OpenZipkin oracle answers 202 regardless), matched against openzipkin/zipkin:3. The **error-shape oracle is Tempo**, not OpenZipkin (issue #385): our reference stack is Loki/Prometheus/Tempo, and Tempo accepts Zipkin through the OpenTelemetry Collector's Zipkin receiver (`grafana/tempo` v3.0.2 `0c4b926d`, the CI-pinned digest). Measured there, every pre-admission rejection — malformed body, bad ids, unsupported `Content-Encoding` — is Go's `http.Error` container: `text/plain; charset=utf-8`, `X-Content-Type-Options: nosniff`, and exactly one trailing newline, which is what PulsusDB now writes. Concretely: a malformed span array, or any span with a non-hex/wrong-length id or an unrepresentable timestamp, is a whole-request **400** plain-text error (Zipkin has no partial-success channel — all-or-nothing, unlike the native OTLP receiver's per-span rejection), an unsupported `Content-Encoding` is **400**. **Two answers this receiver gains with issue #586**, both raised at the sink and therefore in this endpoint's post-admission container (below): **413** for a push that does not fit one landing block or covers more than `100` distinct UTC dates (§1.1 gives both ceilings and both messages), and **400** for an `Idempotency-Key` reused with different content. The reference's Zipkin receiver has neither, and neither takes a ledger row: the precedent is this section's own Loki-push paragraph, which states that receiver's `413` in prose because Loki has no equivalent code for it.
 
