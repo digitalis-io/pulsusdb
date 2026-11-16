@@ -105,10 +105,27 @@ pub(crate) fn deadline_response() -> Response {
     ConnectError::new(Code::DeadlineExceeded, DEADLINE_MESSAGE).into_response()
 }
 
+/// A request `Content-Type` this surface does not read: `415`, an empty
+/// body and `Accept-Post`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnsupportedMedia;
+
+impl IntoResponse for UnsupportedMedia {
+    fn into_response(self) -> Response {
+        let mut res = Response::new(Body::empty());
+        *res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+        res.headers_mut().insert(
+            "accept-post",
+            HeaderValue::from_static("application/json, application/proto"),
+        );
+        res
+    }
+}
+
 /// The codec `Content-Type` names: `application/proto`, or `application/json`
-/// with or without parameters. Anything else, or none, is `415` with an
-/// empty body and `Accept-Post`.
-pub(crate) fn request_codec(headers: &HeaderMap) -> Result<Codec, Response> {
+/// with or without parameters. Anything else, or none, is
+/// [`UnsupportedMedia`].
+pub(crate) fn request_codec(headers: &HeaderMap) -> Result<Codec, UnsupportedMedia> {
     let media = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -122,15 +139,7 @@ pub(crate) fn request_codec(headers: &HeaderMap) -> Result<Codec, Response> {
     match media.as_deref() {
         Some("application/proto") => Ok(Codec::Proto),
         Some("application/json") => Ok(Codec::Json),
-        _ => {
-            let mut res = Response::new(Body::empty());
-            *res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
-            res.headers_mut().insert(
-                "accept-post",
-                HeaderValue::from_static("application/json, application/proto"),
-            );
-            Err(res)
-        }
+        _ => Err(UnsupportedMedia),
     }
 }
 
@@ -243,7 +252,7 @@ mod tests {
             );
         }
         for h in [headers(&[("content-type", "text/plain")]), HeaderMap::new()] {
-            let res = request_codec(&h).expect_err("refused");
+            let res = request_codec(&h).expect_err("refused").into_response();
             assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{h:?}");
             assert_eq!(
                 res.headers()

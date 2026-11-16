@@ -302,21 +302,36 @@ async fn series_answer(
 // The Connect calls
 // ---------------------------------------------------------------------
 
+/// Why a Connect call is answered before its method runs.
+enum Refused {
+    Connect(ConnectError),
+    Media(connect::UnsupportedMedia),
+}
+
+impl IntoResponse for Refused {
+    fn into_response(self) -> Response {
+        match self {
+            Refused::Connect(e) => e.into_response(),
+            Refused::Media(m) => m.into_response(),
+        }
+    }
+}
+
 /// The tenant, then the codec, then the body, then the message.
 async fn prelude<M>(
     headers: &HeaderMap,
     body: Body,
     full_name: &str,
-) -> Result<(Tenant, Codec, M), Response>
+) -> Result<(Tenant, Codec, M), Refused>
 where
     M: prost::Message + Default + serde::de::DeserializeOwned,
 {
-    let tenant = tenant_of(headers).map_err(IntoResponse::into_response)?;
-    let codec = connect::request_codec(headers)?;
+    let tenant = tenant_of(headers).map_err(Refused::Connect)?;
+    let codec = connect::request_codec(headers).map_err(Refused::Media)?;
     let bytes = connect::read_body(headers, body)
         .await
-        .map_err(IntoResponse::into_response)?;
-    let msg = connect::decode(codec, &bytes, full_name).map_err(IntoResponse::into_response)?;
+        .map_err(Refused::Connect)?;
+    let msg = connect::decode(codec, &bytes, full_name).map_err(Refused::Connect)?;
     Ok((tenant, codec, msg))
 }
 
@@ -344,7 +359,7 @@ pub(crate) async fn profile_types(
     .await
     {
         Ok(p) => p,
-        Err(res) => return res,
+        Err(refused) => return refused.into_response(),
     };
     finish(codec, profile_types_answer(&state, &tenant, msg).await)
 }
@@ -358,7 +373,7 @@ pub(crate) async fn label_names(
     let (tenant, codec, msg) =
         match prelude::<LabelNamesRequest>(&headers, body, "types.v1.LabelNamesRequest").await {
             Ok(p) => p,
-            Err(res) => return res,
+            Err(refused) => return refused.into_response(),
         };
     let utf8 = allows_utf8_label_names(&headers);
     finish(codec, label_names_answer(&state, &tenant, msg, utf8).await)
@@ -373,7 +388,7 @@ pub(crate) async fn label_values(
     let (tenant, codec, msg) =
         match prelude::<LabelValuesRequest>(&headers, body, "types.v1.LabelValuesRequest").await {
             Ok(p) => p,
-            Err(res) => return res,
+            Err(refused) => return refused.into_response(),
         };
     finish(codec, label_values_answer(&state, &tenant, msg).await)
 }
@@ -387,7 +402,7 @@ pub(crate) async fn series(
     let (tenant, codec, msg) =
         match prelude::<SeriesRequest>(&headers, body, "querier.v1.SeriesRequest").await {
             Ok(p) => p,
-            Err(res) => return res,
+            Err(refused) => return refused.into_response(),
         };
     let utf8 = allows_utf8_label_names(&headers);
     finish(codec, series_answer(&state, &tenant, msg, utf8).await)

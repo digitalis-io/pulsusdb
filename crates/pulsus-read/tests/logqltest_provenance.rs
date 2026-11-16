@@ -2155,7 +2155,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 130;
+const MATCH_RENDER_TOTAL: usize = 134;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
