@@ -194,7 +194,10 @@ pub(crate) fn decode_profiles(
     body: &[u8],
     header_less: bool,
 ) -> Result<ExportProfilesServiceRequest, LogsIngestError> {
-    let agg = JsonAggregates::default();
+    let agg = JsonAggregates {
+        string_value_strindex: true,
+        ..JsonAggregates::default()
+    };
     let refusal = RefCell::new(None);
     let ctx = Ctx {
         agg: &agg,
