@@ -61,8 +61,7 @@ pub(crate) fn cors_layer(config: &Config) -> Result<CorsLayer, ServeError> {
 /// surface, and a query-shaped JSON error envelope would be wrong on it.
 pub(crate) const DEADLINE_BARE_PATHS: &[&str] = &["/api/v1/write"];
 
-/// Issue #821: the profiles query paths, named one by one — the eight
-/// Connect paths and the four `GET` routes, `{name}` one path segment. They
+/// Issue #821: the eight profiles Connect paths, named one by one. They
 /// answer a deadline with the reference's Connect error; another path under
 /// either service prefix keeps the class it had. Source-scanned by
 /// `tests/deadline_partition.rs` and compared with the route manifest.
@@ -75,6 +74,13 @@ pub(crate) const DEADLINE_CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/LabelNames",
     "/api/profiles/v1/querier.v1.QuerierService/LabelValues",
     "/api/profiles/v1/querier.v1.QuerierService/Series",
+];
+
+/// Issue #821: the four profiles `GET` routes, `{name}` one path segment.
+/// They answer a deadline as the reference's HTTP read handlers answer one
+/// ([`DeadlineClass::ProfilesHttp`]). Source-scanned like
+/// [`DEADLINE_CONNECT_PATHS`].
+pub(crate) const DEADLINE_PROFILES_HTTP_PATHS: &[&str] = &[
     "/api/profiles/v1/types",
     "/api/profiles/v1/labels",
     "/api/profiles/v1/label/{name}/values",
@@ -103,8 +109,15 @@ pub(crate) enum DeadlineClass {
     /// `Response::new(B::default())` plus a status, nothing else).
     Bare,
     /// `504` + the Connect `deadline_exceeded` body (issue #821): the
-    /// reference's answer on the profiles query paths.
+    /// reference's answer on the profiles Connect paths.
     Connect,
+    /// `504` + the same body with a trailing newline and
+    /// `X-Content-Type-Options: nosniff` (issue #821): the reference's HTTP
+    /// read handlers write a deadline through `httputil.Error`
+    /// (`pkg/querier/http.go:50,59`), which answers `504` with its deadline
+    /// message (`pkg/util/http/error.go:80-82`) through `ErrorWithStatus`
+    /// (`:44-58`), a `json.Encoder` that ends the body with `\n`.
+    ProfilesHttp,
 }
 
 /// Total over the `/api/v1/` prefix by construction (issue #471 M2): a
@@ -124,6 +137,12 @@ pub(crate) fn deadline_class(path: &str) -> DeadlineClass {
         .any(|t| matches_template(t, path))
     {
         return DeadlineClass::Connect;
+    }
+    if DEADLINE_PROFILES_HTTP_PATHS
+        .iter()
+        .any(|t| matches_template(t, path))
+    {
+        return DeadlineClass::ProfilesHttp;
     }
     if path.starts_with("/api/v1/") && !DEADLINE_BARE_PATHS.contains(&path) {
         DeadlineClass::PromApiEnvelope
@@ -241,6 +260,9 @@ where
                             crate::prom_api::deadline_response(timeout)
                         }
                         DeadlineClass::Connect => crate::profiles_api::connect::deadline_response(),
+                        DeadlineClass::ProfilesHttp => {
+                            crate::profiles_api::connect::http_deadline_response()
+                        }
                         DeadlineClass::Bare => {
                             let mut res = Response::new(Body::default());
                             *res.status_mut() = StatusCode::REQUEST_TIMEOUT;
@@ -495,28 +517,31 @@ mod tests {
         }
     }
 
-    /// The twelve profiles query paths (issue #821), `{name}` as `env`.
-    const PROFILES_PATHS: [&str; 12] = [
-        "/querier.v1.QuerierService/ProfileTypes",
-        "/querier.v1.QuerierService/LabelNames",
-        "/querier.v1.QuerierService/LabelValues",
-        "/querier.v1.QuerierService/Series",
-        "/api/profiles/v1/querier.v1.QuerierService/ProfileTypes",
-        "/api/profiles/v1/querier.v1.QuerierService/LabelNames",
-        "/api/profiles/v1/querier.v1.QuerierService/LabelValues",
-        "/api/profiles/v1/querier.v1.QuerierService/Series",
-        "/api/profiles/v1/types",
-        "/api/profiles/v1/labels",
-        "/api/profiles/v1/label/env/values",
-        "/api/profiles/v1/series",
-    ];
-
-    /// C6 (issue #821): the twelve profiles query paths answer a deadline
-    /// as a Connect error; the profiles ingest path keeps the bare `408`.
+    /// C6 (issue #821): the eight Connect paths answer a deadline as a
+    /// Connect error, the four `GET` routes (`{name}` as `env`) as the
+    /// reference's HTTP handlers do; the profiles ingest path keeps the bare
+    /// `408`.
     #[test]
     fn c6_the_profiles_query_paths_answer_a_connect_deadline() {
-        for path in PROFILES_PATHS {
+        for path in [
+            "/querier.v1.QuerierService/ProfileTypes",
+            "/querier.v1.QuerierService/LabelNames",
+            "/querier.v1.QuerierService/LabelValues",
+            "/querier.v1.QuerierService/Series",
+            "/api/profiles/v1/querier.v1.QuerierService/ProfileTypes",
+            "/api/profiles/v1/querier.v1.QuerierService/LabelNames",
+            "/api/profiles/v1/querier.v1.QuerierService/LabelValues",
+            "/api/profiles/v1/querier.v1.QuerierService/Series",
+        ] {
             assert_eq!(deadline_class(path), DeadlineClass::Connect, "{path}");
+        }
+        for path in [
+            "/api/profiles/v1/types",
+            "/api/profiles/v1/labels",
+            "/api/profiles/v1/label/env/values",
+            "/api/profiles/v1/series",
+        ] {
+            assert_eq!(deadline_class(path), DeadlineClass::ProfilesHttp, "{path}");
         }
         assert_eq!(
             deadline_class("/api/profiles/v1/ingest"),
@@ -584,6 +609,48 @@ mod tests {
                 r#"{"code":"deadline_exceeded","message":"request timed out, decrease the "#,
                 r#"duration of the request or add more label matchers (prefer exact match "#,
                 r#"over regex match) to reduce the amount of data processed"}"#
+            )
+        );
+    }
+
+    /// Issue #821: a stalled profiles `GET` route answers `504` with the
+    /// reference's HTTP handler body: `nosniff` and a trailing newline.
+    #[tokio::test]
+    async fn a_stalled_profiles_get_route_answers_the_http_deadline_body() {
+        use axum::body::Body;
+        use axum::routing::get;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let cfg = Config {
+            query_timeout: pulsus_config::HumanDuration(Duration::from_millis(1)),
+            ..Config::default()
+        };
+        let router: axum::Router = axum::Router::new()
+            .route(
+                "/api/profiles/v1/label/{name}/values",
+                get(std::future::pending::<&'static str>),
+            )
+            .layer(timeout_layer(&cfg));
+        let request = Request::builder()
+            .uri("/api/profiles/v1/label/env/values")
+            .body(Body::empty())
+            .unwrap();
+        let res = router.oneshot(request).await.unwrap();
+        assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
+        let h = |name| res.headers().get(name).and_then(|v| v.to_str().ok());
+        assert_eq!(h(header::CONTENT_TYPE), Some("application/json"));
+        assert_eq!(h(header::X_CONTENT_TYPE_OPTIONS), Some("nosniff"));
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            concat!(
+                r#"{"code":"deadline_exceeded","message":"request timed out, decrease the "#,
+                r#"duration of the request or add more label matchers (prefer exact match "#,
+                r#"over regex match) to reduce the amount of data processed"}"#,
+                "\n"
             )
         );
     }

@@ -100,9 +100,27 @@ impl IntoResponse for ConnectError {
     }
 }
 
-/// The answer to a request deadline on the profiles query paths (D15).
+/// The answer to a request deadline on the profiles Connect paths (D15).
 pub(crate) fn deadline_response() -> Response {
     ConnectError::new(Code::DeadlineExceeded, DEADLINE_MESSAGE).into_response()
+}
+
+/// The answer to a request deadline on the profiles `GET` routes: the
+/// reference's `ErrorWithStatus` (`pkg/util/http/error.go:44-58`) — the
+/// same status and body as [`deadline_response`], `nosniff`, and the
+/// `json.Encoder`'s trailing newline.
+pub(crate) fn http_deadline_response() -> Response {
+    let body =
+        serde_json::json!({"code": Code::DeadlineExceeded.name(), "message": DEADLINE_MESSAGE});
+    (
+        Code::DeadlineExceeded.status(),
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        format!("{body}\n"),
+    )
+        .into_response()
 }
 
 /// A request `Content-Type` this surface does not read: `415`, an empty

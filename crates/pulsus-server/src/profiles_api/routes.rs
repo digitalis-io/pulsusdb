@@ -64,7 +64,8 @@ pub(crate) fn allows_utf8_label_names(headers: &HeaderMap) -> bool {
 /// is a date when it is eight digits forming a valid `YYYYMMDD` (UTC
 /// midnight), else milliseconds at 13 digits, microseconds at 16,
 /// nanoseconds at 19 and seconds at any other length. Otherwise `now` plus
-/// the offset after the first `+` (or, with none, the first `-`).
+/// the offset after the first `+` (or, with none, the first `-`), every
+/// number–unit pair of it added ([`offset_seconds`]).
 pub(crate) fn attime(s: &str, now_ms: i64) -> i64 {
     let s: String = s
         .trim()
@@ -97,30 +98,39 @@ pub(crate) fn attime(s: &str, now_ms: i64) -> i64 {
     now_ms.saturating_add(offset_seconds(offset).saturating_mul(1_000))
 }
 
-/// The reference's `parseTimeOffset`: an optional sign, a number, and the
-/// rest of the text as its unit, chosen by prefix. The reference's unit
-/// loop takes every byte to the end (`attime.go:79-85`), so only the first
-/// number counts: `1h30m` is one hour.
+/// A relative offset: an optional sign, then number–unit pairs, each unit
+/// chosen by prefix as the reference chooses it, every pair added — so
+/// `now-1h30m` is 90 minutes ago, as a Go duration or PromQL reads it.
+/// Deliberate difference (owner, 2026-11-16, "Parse correctly"): the
+/// reference's unit loop (`pkg/og/util/attime/attime.go:79-85`) takes every
+/// byte after the first number as its unit, so it reads `now-1h30m` as one
+/// hour.
 fn offset_seconds(offset: &str) -> i64 {
-    if offset.is_empty() {
-        return 0;
-    }
-    let (sign, rest) = if let Some(r) = offset.strip_prefix('-') {
+    let (sign, mut rest) = if let Some(r) = offset.strip_prefix('-') {
         (-1, r)
     } else {
         (1, offset.strip_prefix('+').unwrap_or(offset))
     };
-    if rest.is_empty() {
-        return 0;
+    let mut total: i64 = 0;
+    while !rest.is_empty() {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let num: i64 = if digits == 0 {
+            0
+        } else {
+            rest[..digits].parse().unwrap_or(i64::MAX)
+        };
+        rest = &rest[digits..];
+        let unit_len = rest.bytes().take_while(|b| !b.is_ascii_digit()).count();
+        let mult = unit_seconds(&rest[..unit_len]);
+        rest = &rest[unit_len..];
+        total = total.saturating_add(num.saturating_mul(mult));
     }
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    let num: i64 = if digits == 0 {
-        0
-    } else {
-        rest[..digits].parse().unwrap_or(i64::MAX)
-    };
-    let unit = &rest[digits..];
-    let mult = if unit.starts_with('s') {
+    total.saturating_mul(sign)
+}
+
+/// A unit's seconds by prefix (`attime.go:88-111`); anything else is 0.
+fn unit_seconds(unit: &str) -> i64 {
+    if unit.starts_with('s') {
         1
     } else if unit.starts_with("mon") || unit.starts_with('M') {
         30 * 86_400
@@ -136,8 +146,7 @@ fn offset_seconds(offset: &str) -> i64 {
         365 * 86_400
     } else {
         0
-    };
-    num.saturating_mul(sign).saturating_mul(mult)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -584,10 +593,9 @@ mod tests {
         }
     }
 
-    /// C5: the reference's time parser. A compound offset reads its first
-    /// number with the rest of the text as its unit: the reference's unit
-    /// loop (`pkg/og/util/attime/attime.go:79-85`) takes every byte up to
-    /// the end, so `1h30m` is one hour.
+    /// C5: the reference's time parser, except that a compound offset adds
+    /// every number–unit pair (`now-1h30m` is 90 minutes; the reference
+    /// reads one hour — see `offset_seconds`).
     #[test]
     fn c5_attime_reads_the_reference_forms() {
         const N: i64 = 1_794_750_000_000;
@@ -597,7 +605,7 @@ mod tests {
             ("1794744600000000000", 1_794_744_600_000),
             ("20261115", 1_794_700_800_000),
             ("now-1h", N - 3_600_000),
-            ("now-1h30m", N - 3_600_000),
+            ("now-1h30m", N - 5_400_000),
             ("now-30m", N - 1_800_000),
             ("now", N),
         ] {

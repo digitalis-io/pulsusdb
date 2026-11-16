@@ -1548,7 +1548,7 @@ Messages, with their JSON names (proto3 JSON: a field at its default is omitted,
 | `querier.v1.SeriesResponse` | `labelsSet`: `{labels: [{name, value}]}` |
 
 - **Window.** `start` and `end` are milliseconds. Both 0 on `ProfileTypes` is the last hour. A start older than 7 days (`PULSUS_PROFILES_MAX_QUERY_LOOKBACK`) is raised to it, and a window ending before it answers `{}` with no statement sent; a window longer than 24 hours (`PULSUS_PROFILES_MAX_QUERY_LENGTH`) after that is `invalid_argument`. A series is selected by the hours it holds a profile in, so a series whose last profile fell in the window's first or last hour, outside the window, may be listed.
-- **`GET` routes.** `from` and `until` are read as the reference reads them: digits are seconds, or milliseconds at 13 digits, microseconds at 16 and nanoseconds at 19, or a `YYYYMMDD` date; otherwise `now` plus an offset such as `now-1h`. An absent one is 0. On `POST` the form body's pairs follow the query string's.
+- **`GET` routes.** `from` and `until` are read as the reference reads them: digits are seconds, or milliseconds at 13 digits, microseconds at 16 and nanoseconds at 19, or a `YYYYMMDD` date; otherwise `now` plus an offset such as `now-1h`, every number and unit of it added, so `now-1h30m` is 90 minutes ago (the reference reads it as one hour). An absent one is 0. On `POST` the form body's pairs follow the query string's.
 - **Label names.** Without `allow-utf8-labelnames=true` as a parameter of an `Accept` value, `LabelNames` and `Series` answer only names matching `^[a-zA-Z_][a-zA-Z0-9_]*$`.
 - **`Series` with no matcher and `labelNames` `__name__`, `__profile_type__`, `__type__`, `service_name` and the reference's app label** answers, per type and service, the four pairs `__name__`, `__profile_type__`, `__type__` and `service_name`.
 - **Each request sends one statement** over `profile_series`, scoped to the tenant (`X-Scope-OrgID`, read first), or none for an empty window.
@@ -1562,7 +1562,7 @@ Messages, with their JSON names (proto3 JSON: a field at its default is omitted,
 | `unimplemented` | `501` | an unknown `Content-Encoding` |
 | `internal` | `500` | anything else |
 | `unavailable` | `503` | the database cannot be reached |
-| `deadline_exceeded` | `504` | `PULSUS_QUERY_TIMEOUT` passed: the message is `request timed out, decrease the duration of the request or add more label matchers (prefer exact match over regex match) to reduce the amount of data processed` |
+| `deadline_exceeded` | `504` | `PULSUS_QUERY_TIMEOUT` passed: the message is `request timed out, decrease the duration of the request or add more label matchers (prefer exact match over regex match) to reduce the amount of data processed`. On the four `GET` routes the body ends with a newline and carries `X-Content-Type-Options: nosniff`, as the reference's HTTP handlers write it |
 
 Served by later parts:
 

@@ -55,14 +55,19 @@ fn w2_responses_are_lower_camel_case_with_defaults_omitted() {
 /// ignore what they do not know.
 #[test]
 fn w3_requests_read_either_name_and_either_int64_form() {
-    let r: ProfileTypesRequest =
-        serde_json::from_str(r#"{"start":"1000","end":2000}"#).expect("decode");
-    assert_eq!((r.start, r.end), (1000, 2000));
+    // Each decode is compared as a `Result`, so a refusal fails the
+    // assertion rather than stopping before it.
+    let r = serde_json::from_str::<ProfileTypesRequest>(r#"{"start":"1000","end":2000}"#)
+        .map(|r| (r.start, r.end))
+        .map_err(|e| e.to_string());
+    assert_eq!(r, Ok((1000, 2000)));
     for body in [r#"{"label_names":["a"]}"#, r#"{"labelNames":["a"]}"#] {
-        let r: SeriesRequest = serde_json::from_str(body).expect("decode");
-        assert_eq!(r.label_names, ["a"], "{body}");
+        let r = serde_json::from_str::<SeriesRequest>(body)
+            .map(|r| r.label_names)
+            .map_err(|e| e.to_string());
+        assert_eq!(r, Ok(vec!["a".to_string()]), "{body}");
     }
-    let r: SeriesRequest = serde_json::from_str(r#"{"x":1}"#).expect("decode");
-    assert_eq!(r, SeriesRequest::default());
+    let r = serde_json::from_str::<SeriesRequest>(r#"{"x":1}"#).map_err(|e| e.to_string());
+    assert_eq!(r, Ok(SeriesRequest::default()));
     assert!(serde_json::from_str::<ProfileTypesRequest>(r#"{"start":"x"}"#).is_err());
 }

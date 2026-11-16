@@ -1037,7 +1037,7 @@ async fn l14_a_stalled_read_answers_the_connect_deadline() {
         start: now - 20 * MINUTE_MS,
         end: now - 10 * MINUTE_MS,
     };
-    for (ctx, res) in [
+    for (ctx, res, newline, nosniff) in [
         (
             "L14 Connect",
             connect(
@@ -1046,6 +1046,8 @@ async fn l14_a_stalled_read_answers_the_connect_deadline() {
                 "t1",
                 &w.body(json!({"matchers": []})),
             ),
+            "",
+            None,
         ),
         (
             "L14 GET",
@@ -1054,6 +1056,8 @@ async fn l14_a_stalled_read_answers_the_connect_deadline() {
                 &format!("/api/profiles/v1/labels?{}", w.query()),
                 "t1",
             ),
+            "\n",
+            Some("nosniff"),
         ),
     ] {
         assert_eq!(res.status, 504, "{ctx}: {}", res.text());
@@ -1062,6 +1066,7 @@ async fn l14_a_stalled_read_answers_the_connect_deadline() {
             Some("application/json"),
             "{ctx}"
         );
-        assert_eq!(res.text(), DEADLINE_BODY, "{ctx}");
+        assert_eq!(res.text(), format!("{DEADLINE_BODY}{newline}"), "{ctx}");
+        assert_eq!(res.header("x-content-type-options"), nosniff, "{ctx}");
     }
 }

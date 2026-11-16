@@ -25,11 +25,12 @@
 //!
 //! ## The profiles query paths (issue #821)
 //!
-//! A third class answers the reference's Connect error: the eight profiles
-//! Connect paths and the four profiles `GET` routes, named one by one in
-//! `middleware.rs`'s `DEADLINE_CONNECT_PATHS`. That constant is
-//! source-scanned and compared with the manifest's `ProfilesQuery` and
-//! `ProfilesConnect` rows in both directions.
+//! Two more classes: the eight profiles Connect paths answer the reference's
+//! Connect error (`DEADLINE_CONNECT_PATHS`), and the four profiles `GET`
+//! routes answer as the reference's HTTP read handlers do
+//! (`DEADLINE_PROFILES_HTTP_PATHS`). Both constants are source-scanned and
+//! compared with the manifest's `ProfilesConnect` and `ProfilesQuery` rows
+//! in both directions.
 //!
 //! ## Two things this cannot see, recorded rather than closed
 //!
@@ -153,7 +154,7 @@ fn the_two_classes_partition_the_mounted_prefix_exactly_once() {
     assert_eq!(envelope.len() + kept_bare.len(), mounted_api_v1().len());
 }
 
-/// Issue #821: the twelve profiles query paths, which answer a deadline
+/// Issue #821: the eight profiles Connect paths, which answer a deadline
 /// breach with the Connect `deadline_exceeded` body.
 const CONNECT_PATHS: &[&str] = &[
     "/querier.v1.QuerierService/ProfileTypes",
@@ -164,30 +165,38 @@ const CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/LabelNames",
     "/api/profiles/v1/querier.v1.QuerierService/LabelValues",
     "/api/profiles/v1/querier.v1.QuerierService/Series",
+];
+
+/// Issue #821: the four profiles `GET` routes, which answer it as the
+/// reference's HTTP read handlers do.
+const PROFILES_HTTP_PATHS: &[&str] = &[
     "/api/profiles/v1/types",
     "/api/profiles/v1/labels",
     "/api/profiles/v1/label/{name}/values",
     "/api/profiles/v1/series",
 ];
 
-/// (d) Issue #821: the Connect class is exactly the mounted
-/// `ProfilesQuery` and `ProfilesConnect` routes, and the production
-/// constant names exactly those.
+fn mounted_of(surface: Surface) -> BTreeSet<String> {
+    route_manifest()
+        .iter()
+        .filter(|r| r.status == RouteStatus::Mounted && r.surface == surface)
+        .map(|r| r.path.to_string())
+        .collect()
+}
+
+/// (d) Issue #821: each profiles class is exactly its surface's mounted
+/// routes, and each production constant names exactly those.
 #[test]
 fn the_connect_paths_are_exactly_the_mounted_profiles_query_routes() {
-    let from_manifest: BTreeSet<String> = route_manifest()
-        .iter()
-        .filter(|r| r.status == RouteStatus::Mounted)
-        .filter(|r| matches!(r.surface, Surface::ProfilesQuery | Surface::ProfilesConnect))
-        .map(|r| r.path.to_string())
-        .collect();
-    assert_eq!(from_manifest, set(CONNECT_PATHS));
-    assert_eq!(from_manifest.len(), 12);
+    let middleware = "crates/pulsus-server/src/middleware.rs";
+    assert_eq!(mounted_of(Surface::ProfilesConnect), set(CONNECT_PATHS));
     assert_eq!(
-        const_str_slice(
-            "crates/pulsus-server/src/middleware.rs",
-            "DEADLINE_CONNECT_PATHS",
-        ),
+        const_str_slice(middleware, "DEADLINE_CONNECT_PATHS"),
         set(CONNECT_PATHS)
+    );
+    assert_eq!(mounted_of(Surface::ProfilesQuery), set(PROFILES_HTTP_PATHS));
+    assert_eq!(
+        const_str_slice(middleware, "DEADLINE_PROFILES_HTTP_PATHS"),
+        set(PROFILES_HTTP_PATHS)
     );
 }
