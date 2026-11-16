@@ -37,6 +37,103 @@ pub fn parse(input: &str) -> Result<Expr, String> {
     }
 }
 
+/// PATCHES.md #9: the operator of a selector matcher, its value kept as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectorOp {
+    Eq,
+    Neq,
+    Re,
+    Nre,
+}
+
+/// PATCHES.md #9: a metric selector as the reference's `ParseMetricSelector`
+/// reads it, without the grammar: `[name] [ '{' [m (',' m)* [',']] '}' ]`,
+/// `m` = (IDENTIFIER | STRING) op STRING, at least one of name and braces.
+/// Strings unquoted by `util::unquote_string`. No regex is compiled and no
+/// empty-selector check runs. A metric name `n` comes first as `__name__ = n`.
+///
+/// A label name inside the braces is read as an identifier, a keyword too
+/// (`{sum="x"}`), as the lexer scans it there; `or` followed by a space is
+/// the lexer's `T_LOR`, and is refused. A keyword or quoted metric name is
+/// refused, though the grammar accepts both.
+pub fn parse_metric_selector(input: &str) -> Result<Vec<(String, SelectorOp, String)>, String> {
+    use crate::parser::production::span_to_string;
+    use crate::parser::token::{
+        T_COMMA, T_EOF, T_EQL, T_EQL_REGEX, T_IDENTIFIER, T_LEFT_BRACE, T_METRIC_IDENTIFIER, T_NEQ,
+        T_NEQ_REGEX, T_RIGHT_BRACE, T_STRING, TokenId, token_display,
+    };
+    use crate::util::unquote_string;
+    use lrpar::{Lexeme, Lexer};
+
+    let lexer = lex::lexer(input)?;
+    let mut toks: Vec<(TokenId, String)> = Vec::new();
+    for lexeme in lexer.iter() {
+        let l = lexeme.map_err(|_| String::from(INVALID_QUERY_INFO))?;
+        toks.push((l.tok_id(), span_to_string(&lexer, l.span())));
+    }
+    let id = |i: usize| toks.get(i).map(|t| t.0);
+    let unexpected = |i: usize| match id(i) {
+        Some(t) => format!("unexpected {} in metric selector", token_display(t)),
+        None => String::from("unexpected end of input in metric selector"),
+    };
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    let named = matches!(id(0), Some(T_METRIC_IDENTIFIER | T_IDENTIFIER));
+    if named {
+        out.push((String::from("__name__"), SelectorOp::Eq, toks[0].1.clone()));
+        i = 1;
+    }
+    let braced = id(i) == Some(T_LEFT_BRACE);
+    if braced {
+        i += 1;
+        loop {
+            let key = match id(i) {
+                Some(T_RIGHT_BRACE) => {
+                    i += 1;
+                    break;
+                }
+                Some(T_IDENTIFIER) => toks[i].1.clone(),
+                Some(T_STRING) => unquote_string(&toks[i].1)?,
+                _ => return Err(unexpected(i)),
+            };
+            let op = match id(i + 1) {
+                Some(T_EQL) => SelectorOp::Eq,
+                Some(T_NEQ) => SelectorOp::Neq,
+                Some(T_EQL_REGEX) => SelectorOp::Re,
+                Some(T_NEQ_REGEX) => SelectorOp::Nre,
+                _ => return Err(unexpected(i + 1)),
+            };
+            if id(i + 2) != Some(T_STRING) {
+                return Err(unexpected(i + 2));
+            }
+            let value = unquote_string(&toks[i + 2].1)?;
+            if named && key == "__name__" {
+                return Err(String::from(
+                    "metric name must not be set twice in metric selector",
+                ));
+            }
+            out.push((key, op, value));
+            i += 3;
+            match id(i) {
+                Some(T_COMMA) => i += 1,
+                Some(T_RIGHT_BRACE) => {
+                    i += 1;
+                    break;
+                }
+                _ => return Err(unexpected(i)),
+            }
+        }
+    }
+    if !named && !braced {
+        return Err(unexpected(0));
+    }
+    if id(i) != Some(T_EOF) || i + 1 != toks.len() {
+        return Err(unexpected(i));
+    }
+    Ok(out)
+}
+
 /// cases in original prometheus is a huge slices which are constructed more than 3000 lines,
 /// and it is hard to split them based on the original order. So here is the Note:
 ///

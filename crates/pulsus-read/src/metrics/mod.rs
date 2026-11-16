@@ -113,6 +113,9 @@ mod read_cache_stub_tests;
 #[path = "../../../pulsus-clickhouse/tests/common/stub_server.rs"]
 pub(crate) mod stub_server;
 
+/// Issue #820: the profiles series subquery and the 427 detail, for
+/// [`crate::profiles::selector`].
+pub(crate) use dispatch::regex_rejection_detail;
 /// The issue #240 capability token, re-exported so
 /// [`crate::logql::escape::ch_regex_anchored_promql_re2`]'s pinned
 /// signature can keep naming it as `crate::metrics::PromqlRe2Fallback`.
@@ -122,6 +125,7 @@ pub(crate) mod stub_server;
 /// argument, with the measured rustc rejections for every other module,
 /// is on the type itself.
 pub(crate) use series_where::PromqlRe2Fallback;
+pub(crate) use series_where::profile_series;
 
 pub use exec::{
     FetchProbe, MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, StatementProbe,

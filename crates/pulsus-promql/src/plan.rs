@@ -32,7 +32,7 @@ use pulsus_model::{LabelMatcher, MatchOp};
 use crate::error::PromqlError;
 use crate::parser::{
     self, AggregateExpr, BinaryExpr, Call, DurationExpr, Expr, LabelModifier, MatrixSelector,
-    Offset, PLabelMatchOp, SubqueryExpr, VectorMatchCardinality, VectorSelector, token,
+    Offset, PLabelMatchOp, SelectorOp, SubqueryExpr, VectorMatchCardinality, VectorSelector, token,
 };
 
 /// Instant query = `start_ms == end_ms`, `step_ms == 0` (a single-step
@@ -3575,6 +3575,24 @@ fn over_time_param_fn_is_at_modifier_unsafe(func: OverTimeParamFn) -> bool {
     matches!(func, OverTimeParamFn::PredictLinear)
 }
 
+/// Issue #820: the matchers of a profiles label selector, in written order,
+/// each value as written: a regex reaches the database uncompiled.
+pub fn metric_selector(q: &str) -> Result<Vec<LabelMatcher>, PromqlError> {
+    Ok(crate::parser::parse_metric_selector(q)?
+        .into_iter()
+        .map(|(key, op, value)| LabelMatcher {
+            key,
+            op: match op {
+                SelectorOp::Eq => MatchOp::Eq,
+                SelectorOp::Neq => MatchOp::Neq,
+                SelectorOp::Re => MatchOp::Re,
+                SelectorOp::Nre => MatchOp::Nre,
+            },
+            value,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -7071,5 +7089,50 @@ mod tests {
                 (Some(RollupUse::Last), false)
             ]
         );
+    }
+
+    /// M2 (issue #820): a profiles label selector's matchers, in written
+    /// order, with a regex value verbatim; anything but a bare selector is
+    /// refused.
+    #[test]
+    fn m2_metric_selector_returns_the_matchers_as_written() {
+        let m = |op, key: &str, value: &str| LabelMatcher {
+            key: key.to_string(),
+            op,
+            value: value.to_string(),
+        };
+        assert_eq!(metric_selector("{}"), Ok(vec![]));
+        assert_eq!(
+            metric_selector(r#"{env!="p"}"#),
+            Ok(vec![m(MatchOp::Neq, "env", "p")])
+        );
+        assert_eq!(
+            metric_selector(r#"{env!~"prod"}"#),
+            Ok(vec![m(MatchOp::Nre, "env", "prod")])
+        );
+        assert_eq!(
+            metric_selector(r#"process_cpu{a="b"}"#),
+            Ok(vec![
+                m(MatchOp::Eq, "__name__", "process_cpu"),
+                m(MatchOp::Eq, "a", "b"),
+            ])
+        );
+        assert_eq!(
+            metric_selector(r#"{env=~"("}"#),
+            Ok(vec![m(MatchOp::Re, "env", "(")]),
+            "the pattern reaches the caller verbatim, never compiled"
+        );
+        for refused in [
+            "sum(x)",
+            "x offset 1m",
+            "x[5m]",
+            r#"{a="1" or b="2"}"#,
+            r#"x{__name__="y"}"#,
+        ] {
+            assert!(
+                metric_selector(refused).is_err(),
+                "{refused:?} must be refused"
+            );
+        }
     }
 }
