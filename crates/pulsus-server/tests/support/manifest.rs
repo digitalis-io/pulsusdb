@@ -3132,16 +3132,17 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/compat.rs",
         function: "apply_aliases",
-        // Re-pinned for issue #75 (M6-12): the Zipkin v2 JSON receiver's
+        // Re-pinned for issue #821: the profiles Connect paths join the
+        // Reader block. Re-pinned for issue #75 (M6-12): the Zipkin v2 JSON receiver's
         // `CompatAndWriter` merge joins the Loki push receiver in the
         // Writer-gated branch. (Previously re-pinned for issue #77's Loki
         // push mount, and #61's Tempo trace-alias merge in the Reader block.)
-        body: "if !cfg.compat_endpoints {return router;} let mut router = router; if modes::mounted(cfg).contains(&Subsystem::Reader) {router = router.merge(crate::logs_api::compat_router()); router = router.merge(crate::traces_api::compat_router());} if modes::mounted(cfg).contains(&Subsystem::Writer) {router = router.merge(crate::ingest::loki_push_compat_router()); router = router.merge(crate::ingest::zipkin_compat_router());} router",
+        body: "if !cfg.compat_endpoints {return router;} let mut router = router; if modes::mounted(cfg).contains(&Subsystem::Reader) {router = router.merge(crate::logs_api::compat_router()); router = router.merge(crate::traces_api::compat_router()); router = router.merge(crate::profiles_api::compat_router());} if modes::mounted(cfg).contains(&Subsystem::Writer) {router = router.merge(crate::ingest::loki_push_compat_router()); router = router.merge(crate::ingest::zipkin_compat_router());} router",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/subsystems.rs",
         function: "reader_router",
-        body: "crate::logs_api::router().merge(crate::prom_api::router()).merge(crate::traces_api::router())",
+        body: "crate::logs_api::router().merge(crate::prom_api::router()).merge(crate::traces_api::router()).merge(crate::profiles_api::router())",
     },
     // Re-pinned for issue #406 Part B2: `/stats`, `/volume` and
     // `/patterns` gained a `POST` binding on both surfaces. (Previously

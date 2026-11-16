@@ -28,12 +28,13 @@ pub(crate) fn writer_router() -> Router<AppState> {
 /// `/api/logs/v1` is wired (issue #13); `/api/v1` (the standard Prometheus
 /// HTTP API — PulsusDB's *native* metrics surface, issue #32) is wired
 /// too; `/api/traces/v1`'s trace-by-ID fetch is wired (issue #55, search/
-/// tags/metrics land with their own M4 issues); `/api/profiles/v1` is
-/// still empty until its own issues land.
+/// tags/metrics land with their own M4 issues); `/api/profiles/v1` serves
+/// the profiles query API's catalogue methods (issue #821).
 pub(crate) fn reader_router() -> Router<AppState> {
     crate::logs_api::router()
         .merge(crate::prom_api::router())
         .merge(crate::traces_api::router())
+        .merge(crate::profiles_api::router())
 }
 
 /// Rules API (`/api/rules/v1`). Empty until pulsus-ruler lands its handlers.

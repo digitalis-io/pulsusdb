@@ -61,6 +61,37 @@ pub(crate) fn cors_layer(config: &Config) -> Result<CorsLayer, ServeError> {
 /// surface, and a query-shaped JSON error envelope would be wrong on it.
 pub(crate) const DEADLINE_BARE_PATHS: &[&str] = &["/api/v1/write"];
 
+/// Issue #821: the profiles query paths, named one by one — the eight
+/// Connect paths and the four `GET` routes, `{name}` one path segment. They
+/// answer a deadline with the reference's Connect error; another path under
+/// either service prefix keeps the class it had. Source-scanned by
+/// `tests/deadline_partition.rs` and compared with the route manifest.
+pub(crate) const DEADLINE_CONNECT_PATHS: &[&str] = &[
+    "/querier.v1.QuerierService/ProfileTypes",
+    "/querier.v1.QuerierService/LabelNames",
+    "/querier.v1.QuerierService/LabelValues",
+    "/querier.v1.QuerierService/Series",
+    "/api/profiles/v1/querier.v1.QuerierService/ProfileTypes",
+    "/api/profiles/v1/querier.v1.QuerierService/LabelNames",
+    "/api/profiles/v1/querier.v1.QuerierService/LabelValues",
+    "/api/profiles/v1/querier.v1.QuerierService/Series",
+    "/api/profiles/v1/types",
+    "/api/profiles/v1/labels",
+    "/api/profiles/v1/label/{name}/values",
+    "/api/profiles/v1/series",
+];
+
+/// `path` matches `template`, whose one `{name}` is a non-empty segment.
+fn matches_template(template: &str, path: &str) -> bool {
+    match template.split_once("{name}") {
+        None => template == path,
+        Some((head, tail)) => path
+            .strip_prefix(head)
+            .and_then(|rest| rest.strip_suffix(tail))
+            .is_some_and(|name| !name.is_empty() && !name.contains('/')),
+    }
+}
+
 /// How a request-deadline breach is answered on a given path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeadlineClass {
@@ -71,8 +102,8 @@ pub(crate) enum DeadlineClass {
     /// (`tower-http-0.6.11/src/timeout/service.rs:144-146`:
     /// `Response::new(B::default())` plus a status, nothing else).
     Bare,
-    /// Stub.
-    #[allow(dead_code)]
+    /// `504` + the Connect `deadline_exceeded` body (issue #821): the
+    /// reference's answer on the profiles query paths.
     Connect,
 }
 
@@ -88,6 +119,12 @@ pub(crate) enum DeadlineClass {
 /// Cheap: one `starts_with` plus at most `DEADLINE_BARE_PATHS.len()`
 /// string compares, no allocation.
 pub(crate) fn deadline_class(path: &str) -> DeadlineClass {
+    if DEADLINE_CONNECT_PATHS
+        .iter()
+        .any(|t| matches_template(t, path))
+    {
+        return DeadlineClass::Connect;
+    }
     if path.starts_with("/api/v1/") && !DEADLINE_BARE_PATHS.contains(&path) {
         DeadlineClass::PromApiEnvelope
     } else {
@@ -203,7 +240,8 @@ where
                         DeadlineClass::PromApiEnvelope => {
                             crate::prom_api::deadline_response(timeout)
                         }
-                        DeadlineClass::Bare | DeadlineClass::Connect => {
+                        DeadlineClass::Connect => crate::profiles_api::connect::deadline_response(),
+                        DeadlineClass::Bare => {
                             let mut res = Response::new(Body::default());
                             *res.status_mut() = StatusCode::REQUEST_TIMEOUT;
                             res

@@ -1001,6 +1001,33 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     // limit renders `LIMIT 0` (a tail that can never deliver); a zero
     // catch-up slice renders an empty scan window (catch-up never
     // progresses).
+    // Issue #821: the profiles read limits. A zero length or lookback
+    // refuses or empties every window; a zero ceiling is ClickHouse's
+    // "unlimited".
+    positive_duration(
+        "reader.profiles_max_query_length",
+        cfg.reader.profiles_max_query_length,
+    )?;
+    positive_duration(
+        "reader.profiles_max_query_lookback",
+        cfg.reader.profiles_max_query_lookback,
+    )?;
+    positive_u64(
+        "reader.profiles_scan_budget_rows",
+        cfg.reader.profiles_scan_budget_rows,
+    )?;
+    positive_u64(
+        "reader.profiles_max_tree_nodes",
+        cfg.reader.profiles_max_tree_nodes,
+    )?;
+    positive_u64(
+        "reader.profiles_max_result_bytes",
+        cfg.reader.profiles_max_result_bytes,
+    )?;
+    positive_u64(
+        "reader.profiles_query_memory_bytes",
+        cfg.reader.profiles_query_memory_bytes,
+    )?;
     positive_duration("reader.tail_poll_interval", cfg.reader.tail_poll_interval)?;
     positive_u64(
         "reader.tail_max_connections",

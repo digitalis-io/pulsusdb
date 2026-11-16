@@ -1,23 +1,50 @@
-//! Stub.
+//! Issue #821: the profiles read engine — the tables and ceilings a
+//! process's configuration implies, the settings every statement carries,
+//! the classification of a failed statement, and [`ProfilesEngine`], which
+//! sends a catalogue read through the private [`super::dispatch`].
 
-use pulsus_clickhouse::{ChError, QuerySettings};
+use pulsus_clickhouse::{ChClient, ChError, QuerySettings, Row};
+use serde::{Deserialize, Serialize};
 
+use crate::traces::tenant_scope::TenantTerm;
+
+use super::catalogue::{Read, compat_sets};
+use super::dispatch::ProfileDispatch;
 use super::selector::WindowLimits;
+
+/// ClickHouse's `TOO_MANY_ROWS` (`max_rows_to_read`).
+const CODE_TOO_MANY_ROWS: i32 = 158;
+/// ClickHouse's `TIMEOUT_EXCEEDED`.
+const CODE_TIMEOUT_EXCEEDED: i32 = 159;
+/// ClickHouse's `MEMORY_LIMIT_EXCEEDED`.
+const CODE_MEMORY_LIMIT_EXCEEDED: i32 = 241;
+/// ClickHouse's `TOO_MANY_ROWS_OR_BYTES` (`max_result_rows`,
+/// `max_result_bytes`).
+const CODE_TOO_MANY_ROWS_OR_BYTES: i32 = 396;
 
 /// A profiles read's failure, by the Connect code it answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfilesReadError {
+    /// `invalid_argument`: a refused window or selector, a missing name, or
+    /// a regex the database cannot compile.
     InvalidArgument(String),
+    /// `resource_exhausted`: a ceiling was reached; the text names it.
     TooBroad(String),
+    /// `deadline_exceeded`.
     DeadlineExceeded,
+    /// `unavailable`: no server could be reached.
     Unavailable(String),
+    /// `internal`: anything else.
     Internal(String),
 }
 
 /// The tables and ceilings every profiles read uses.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProfilesReadConfig {
+    /// `profile_series`, or its wrapper on a cluster.
     pub series_table: String,
+    /// The wrapper suffix when clustered, else empty: the tenant check's
+    /// table list.
     pub dist_suffix: String,
     pub limits: WindowLimits,
     pub scan_budget_rows: u64,
@@ -29,17 +56,152 @@ pub struct ProfilesReadConfig {
 }
 
 impl ProfilesReadConfig {
-    pub fn from_config(_config: &pulsus_config::Config) -> Self {
-        Self::default()
+    /// The mapping the server uses from a process's configuration.
+    pub fn from_config(config: &pulsus_config::Config) -> Self {
+        let dist = if config.cluster.is_some() {
+            config.dist_suffix.as_str()
+        } else {
+            ""
+        };
+        let r = &config.reader;
+        ProfilesReadConfig {
+            series_table: format!("profile_series{dist}"),
+            dist_suffix: dist.to_string(),
+            limits: WindowLimits {
+                max_length_ms: millis(r.profiles_max_query_length.0),
+                max_lookback_ms: millis(r.profiles_max_query_lookback.0),
+            },
+            scan_budget_rows: r.profiles_scan_budget_rows,
+            max_tree_nodes: r.profiles_max_tree_nodes,
+            max_result_bytes: r.profiles_max_result_bytes,
+            query_memory_bytes: r.profiles_query_memory_bytes,
+            distributed: config.cluster.is_some(),
+            skip_unavailable_shards: config.skip_unavailable_shards,
+        }
     }
 }
 
-fn read_settings(_config: &ProfilesReadConfig, _log_comment: Option<&str>) -> QuerySettings {
-    QuerySettings::new()
+fn millis(d: std::time::Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
+/// The settings every profiles statement carries: the answer pins (every
+/// overflow mode `throw`), the four ceilings, no spill, the raised query
+/// size, the request id as `log_comment`, and on a cluster
+/// `distributed_product_mode = 'local'`.
+fn read_settings(config: &ProfilesReadConfig, log_comment: Option<&str>) -> QuerySettings {
+    let mut s = QuerySettings::new()
+        .answer_pins(false, config.skip_unavailable_shards)
+        .set("max_rows_to_read", config.scan_budget_rows)
+        .set("max_result_rows", config.max_tree_nodes)
+        .set("max_result_bytes", config.max_result_bytes)
+        .set("max_memory_usage", config.query_memory_bytes)
+        .set("max_bytes_before_external_group_by", 0u64)
+        .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES);
+    if config.distributed {
+        s = s.set("distributed_product_mode", "local");
+    }
+    if let Some(comment) = log_comment {
+        s = s.set("log_comment", comment);
+    }
+    s
+}
+
+/// The class of a failed profiles statement (plan §6).
 pub fn map_read_error(e: ChError) -> ProfilesReadError {
-    ProfilesReadError::Internal(e.to_string())
+    if let Some(super::selector::SelectorError::InvalidArgument(d)) =
+        super::selector::read_error(&e)
+    {
+        return ProfilesReadError::InvalidArgument(d);
+    }
+    let too_broad =
+        |setting: &str| ProfilesReadError::TooBroad(format!("query_too_broad: {setting}"));
+    match e {
+        ChError::Server {
+            code: CODE_TOO_MANY_ROWS,
+            ..
+        } => too_broad("PULSUS_PROFILES_SCAN_BUDGET_ROWS"),
+        ChError::Server {
+            code: CODE_TOO_MANY_ROWS_OR_BYTES,
+            ..
+        } => too_broad("PULSUS_PROFILES_MAX_TREE_NODES or PULSUS_PROFILES_MAX_RESULT_BYTES"),
+        ChError::Server {
+            code: CODE_MEMORY_LIMIT_EXCEEDED,
+            ..
+        } => too_broad("PULSUS_PROFILES_QUERY_MEMORY_BYTES"),
+        ChError::Server {
+            code: CODE_TIMEOUT_EXCEEDED,
+            ..
+        }
+        | ChError::Timeout(_) => ProfilesReadError::DeadlineExceeded,
+        ChError::Connect(_) | ChError::Io(_) => ProfilesReadError::Unavailable(e.to_string()),
+        other => ProfilesReadError::Internal(other.to_string()),
+    }
+}
+
+/// What a catalogue read answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// S1–S3: the values, in the statement's order.
+    Strings(Vec<String>),
+    /// S4: the label sets, each in name order.
+    Sets(Vec<Vec<(String, String)>>),
+}
+
+#[derive(Row, Serialize, Deserialize)]
+struct StringRow {
+    s: String,
+}
+
+#[derive(Row, Serialize, Deserialize)]
+struct SeriesRow {
+    ls: Vec<(String, String)>,
+}
+
+/// One request's profiles reads, bound to one server by its client.
+pub struct ProfilesEngine {
+    dispatch: ProfileDispatch,
+    config: ProfilesReadConfig,
+    log_comment: Option<String>,
+}
+
+impl ProfilesEngine {
+    /// An engine reading `tenant`'s profiles.
+    pub fn new(client: ChClient, config: ProfilesReadConfig, tenant: pulsus_model::Tenant) -> Self {
+        let tables = super::tenant_scope::tables(&config.dist_suffix);
+        Self {
+            dispatch: ProfileDispatch::new(client, TenantTerm::of(&tenant), tables),
+            config,
+            log_comment: None,
+        }
+    }
+
+    /// Tags every statement with `log_comment = comment` (the request id).
+    pub fn with_query_log_comment(mut self, comment: impl Into<String>) -> Self {
+        self.log_comment = Some(comment.into());
+        self
+    }
+
+    /// The first server failure this engine's reads met.
+    pub fn server_failure(&self) -> Option<pulsus_clickhouse::ServerFailure> {
+        self.dispatch.server_failure()
+    }
+
+    /// Sends `read`'s one statement and returns its answer.
+    pub async fn read(&self, read: &Read) -> Result<Answer, ProfilesReadError> {
+        let settings = read_settings(&self.config, self.log_comment.as_deref());
+        match read {
+            Read::Strings(sql) => {
+                let rows: Vec<StringRow> = self.dispatch.rows(sql, &settings).await?;
+                Ok(Answer::Strings(rows.into_iter().map(|r| r.s).collect()))
+            }
+            Read::Series { sql, compat } => {
+                let rows: Vec<SeriesRow> = self.dispatch.rows(sql, &settings).await?;
+                let sets: Vec<Vec<(String, String)>> = rows.into_iter().map(|r| r.ls).collect();
+                Ok(Answer::Sets(if *compat { compat_sets(sets) } else { sets }))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

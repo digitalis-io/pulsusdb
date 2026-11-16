@@ -46,8 +46,14 @@ pub struct SelectorRequest<'a> {
 pub enum Compiled {
     /// The window ends before the lookback floor: answer empty, send nothing.
     Empty,
-    /// SERIES, and the window the outer read bounds its own time column by.
-    Series { sql: String, window: DataWindow },
+    /// SERIES, the window the outer read bounds its own time column by,
+    /// and the matchers SERIES renders (issue #821: the catalogue reads
+    /// render them under their own `SELECT`), the type's matcher last.
+    Series {
+        sql: String,
+        window: DataWindow,
+        matchers: Vec<LabelMatcher>,
+    },
 }
 
 /// A request the reference refuses as an invalid argument.
@@ -107,6 +113,7 @@ pub fn compile(
     Ok(Compiled::Series {
         sql: crate::metrics::profile_series(tenant, window, series_table, &matchers),
         window,
+        matchers,
     })
 }
 
@@ -216,7 +223,7 @@ WHERE org_id = 't1' AND day BETWEEN '2026-11-15' AND '2026-11-15'
 
     fn series(r: Result<Compiled, SelectorError>) -> (String, DataWindow) {
         match r {
-            Ok(Compiled::Series { sql, window }) => (sql, window),
+            Ok(Compiled::Series { sql, window, .. }) => (sql, window),
             other => panic!("expected Series, got {other:?}"),
         }
     }

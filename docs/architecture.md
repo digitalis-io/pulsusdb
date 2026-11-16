@@ -316,7 +316,7 @@ In-house parser → planner → SQL generator over `trace_attrs_idx` + `trace_sp
 
 ### 5.5 Profiles
 
-Query endpoints (`/api/profiles/v1/{merge,select_series,export,render,render-diff}` and the label APIs) resolve profile series via `profile_series_idx`, then merge the precomputed `tree` structures across the selected time range in the engine, emitting flamebearer JSON, pprof, or Graphviz DOT (with `maxNodes`, unit-aware value formatting, and self-percentage-scaled font sizes).
+The label APIs (profile types, label names, label values and series, issue #821) each send one statement over `profile_series`, scoped to the tenant by `org_id` and to the window by the day partition and the series' hour mask. Query endpoints (`/api/profiles/v1/{merge,select_series,export,render,render-diff}`) resolve profile series via `profile_series_idx`, then merge the precomputed `tree` structures across the selected time range in the engine, emitting flamebearer JSON, pprof, or Graphviz DOT (with `maxNodes`, unit-aware value formatting, and self-percentage-scaled font sizes).
 
 ### 5.6 Budgeted seams: two disciplines
 

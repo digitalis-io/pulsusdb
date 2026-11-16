@@ -1,7 +1,20 @@
-//! Stub.
+//! Issue #821: the Connect protocol's unary calls, as the profiles query
+//! API serves them — the request codec by `Content-Type`, the body's
+//! `Content-Encoding`, the response in the request's codec, and the error
+//! body `{"code","message"}` with each code's status.
+//!
+//! `Connect-Protocol-Version` and `Connect-Timeout-Ms` are read by nothing.
 
-use axum::http::{HeaderMap, StatusCode};
+use axum::body::Body;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use pulsus_read::profiles::ProfilesReadError;
+use pulsus_write::ingest::decompress::{Encoding, MAX_DECOMPRESSED_BYTES, decompress};
+
+/// The reference's deadline message (`pkg/util/http/error.go:25`), chosen
+/// for a deadline at `:80-82` and answered as `deadline_exceeded` by
+/// `pkg/util/connectgrpc/connectgrpc.go:297-298`.
+pub(crate) const DEADLINE_MESSAGE: &str = "request timed out, decrease the duration of the request or add more label matchers (prefer exact match over regex match) to reduce the amount of data processed";
 
 /// A request body's codec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +34,30 @@ pub(crate) enum Code {
     DeadlineExceeded,
 }
 
+impl Code {
+    fn name(self) -> &'static str {
+        match self {
+            Code::InvalidArgument => "invalid_argument",
+            Code::ResourceExhausted => "resource_exhausted",
+            Code::Unimplemented => "unimplemented",
+            Code::Internal => "internal",
+            Code::Unavailable => "unavailable",
+            Code::DeadlineExceeded => "deadline_exceeded",
+        }
+    }
+
+    fn status(self) -> StatusCode {
+        match self {
+            Code::InvalidArgument => StatusCode::BAD_REQUEST,
+            Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
+            Code::Unimplemented => StatusCode::NOT_IMPLEMENTED,
+            Code::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Code::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
+        }
+    }
+}
+
 /// A Connect error: its code and message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConnectError {
@@ -37,26 +74,136 @@ impl ConnectError {
     }
 }
 
-impl IntoResponse for ConnectError {
-    fn into_response(self) -> Response {
-        StatusCode::OK.into_response()
+impl From<ProfilesReadError> for ConnectError {
+    fn from(e: ProfilesReadError) -> Self {
+        match e {
+            ProfilesReadError::InvalidArgument(m) => ConnectError::new(Code::InvalidArgument, m),
+            ProfilesReadError::TooBroad(m) => ConnectError::new(Code::ResourceExhausted, m),
+            ProfilesReadError::DeadlineExceeded => {
+                ConnectError::new(Code::DeadlineExceeded, DEADLINE_MESSAGE)
+            }
+            ProfilesReadError::Unavailable(m) => ConnectError::new(Code::Unavailable, m),
+            ProfilesReadError::Internal(m) => ConnectError::new(Code::Internal, m),
+        }
     }
 }
 
-pub(crate) fn request_codec(_headers: &HeaderMap) -> Result<Codec, Response> {
-    Err(StatusCode::OK.into_response())
+impl IntoResponse for ConnectError {
+    fn into_response(self) -> Response {
+        let body = serde_json::json!({"code": self.code.name(), "message": self.message});
+        (
+            self.code.status(),
+            [(header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response()
+    }
 }
 
-pub(crate) fn request_bytes(_headers: &HeaderMap, raw: &[u8]) -> Result<Vec<u8>, ConnectError> {
-    Ok(raw.to_vec())
+/// The answer to a request deadline on the profiles query paths (D15).
+pub(crate) fn deadline_response() -> Response {
+    ConnectError::new(Code::DeadlineExceeded, DEADLINE_MESSAGE).into_response()
 }
 
-pub(crate) fn decode<M: Default>(
-    _codec: Codec,
-    _bytes: &[u8],
-    _full_name: &str,
-) -> Result<M, ConnectError> {
-    Ok(M::default())
+/// The codec `Content-Type` names: `application/proto`, or `application/json`
+/// with or without parameters. Anything else, or none, is `415` with an
+/// empty body and `Accept-Post`.
+pub(crate) fn request_codec(headers: &HeaderMap) -> Result<Codec, Response> {
+    let media = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        });
+    match media.as_deref() {
+        Some("application/proto") => Ok(Codec::Proto),
+        Some("application/json") => Ok(Codec::Json),
+        _ => {
+            let mut res = Response::new(Body::empty());
+            *res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+            res.headers_mut().insert(
+                "accept-post",
+                HeaderValue::from_static("application/json, application/proto"),
+            );
+            Err(res)
+        }
+    }
+}
+
+/// The request body after its `Content-Encoding`: absent or `identity` as
+/// is, `gzip` through the ingest decompressor (64 MiB cap), anything else
+/// `unimplemented`.
+pub(crate) fn request_bytes(headers: &HeaderMap, raw: &[u8]) -> Result<Vec<u8>, ConnectError> {
+    let encoding = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    if encoding.is_empty() || encoding.eq_ignore_ascii_case("identity") {
+        return Ok(raw.to_vec());
+    }
+    if encoding.eq_ignore_ascii_case("gzip") {
+        return decompress(Encoding::Gzip, raw)
+            .map_err(|e| ConnectError::new(Code::InvalidArgument, e.to_string()));
+    }
+    Err(ConnectError::new(
+        Code::Unimplemented,
+        format!("unknown compression {encoding:?}: supported encodings are gzip"),
+    ))
+}
+
+/// Reads a request body, at most the decompressor's cap.
+pub(crate) async fn read_body(headers: &HeaderMap, body: Body) -> Result<Vec<u8>, ConnectError> {
+    let raw = axum::body::to_bytes(body, MAX_DECOMPRESSED_BYTES)
+        .await
+        .map_err(|e| ConnectError::new(Code::InvalidArgument, e.to_string()))?;
+    request_bytes(headers, &raw)
+}
+
+/// Decodes a request message in `codec`; a bad body is `invalid_argument`,
+/// `unmarshal into <full_name>: <decoder text>`.
+pub(crate) fn decode<M>(codec: Codec, bytes: &[u8], full_name: &str) -> Result<M, ConnectError>
+where
+    M: prost::Message + Default + serde::de::DeserializeOwned,
+{
+    let decoded = match codec {
+        Codec::Proto => M::decode(bytes).map_err(|e| e.to_string()),
+        Codec::Json => serde_json::from_slice(bytes).map_err(|e| e.to_string()),
+    };
+    decoded.map_err(|e| {
+        ConnectError::new(
+            Code::InvalidArgument,
+            format!("unmarshal into {full_name}: {e}"),
+        )
+    })
+}
+
+/// A `200` carrying `msg` in `codec`.
+pub(crate) fn respond<M>(codec: Codec, msg: &M) -> Response
+where
+    M: prost::Message + serde::Serialize,
+{
+    match codec {
+        Codec::Proto => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/proto")],
+            msg.encode_to_vec(),
+        )
+            .into_response(),
+        Codec::Json => match serde_json::to_vec(msg) {
+            Ok(body) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response(),
+            Err(e) => ConnectError::new(Code::Internal, e.to_string()).into_response(),
+        },
+    }
 }
 
 #[cfg(test)]

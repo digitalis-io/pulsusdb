@@ -97,6 +97,12 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_TRACEQL_MAX_DEPTH",
     "PULSUS_TRACEQL_MAX_SERIES",
     "PULSUS_TRACEQL_TAG_LOOKBACK",
+    "PULSUS_PROFILES_MAX_QUERY_LENGTH",
+    "PULSUS_PROFILES_MAX_QUERY_LOOKBACK",
+    "PULSUS_PROFILES_SCAN_BUDGET_ROWS",
+    "PULSUS_PROFILES_MAX_TREE_NODES",
+    "PULSUS_PROFILES_MAX_RESULT_BYTES",
+    "PULSUS_PROFILES_QUERY_MEMORY_BYTES",
     "PULSUS_LOGQL_READ_MAX_MEMORY_BYTES",
     "PULSUS_PROMQL_READ_MAX_MEMORY_BYTES",
     "PULSUS_PROMQL_MAX_REPLICA_DELAY",
@@ -479,6 +485,27 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("PULSUS_TRACEQL_TAG_LOOKBACK") {
         cfg.reader.traceql_tag_lookback = parse_dur("PULSUS_TRACEQL_TAG_LOOKBACK", &v)?;
+    }
+    // Issue #821: the profiles read limits and ceilings.
+    if let Some(v) = read("PULSUS_PROFILES_MAX_QUERY_LENGTH") {
+        cfg.reader.profiles_max_query_length = parse_dur("PULSUS_PROFILES_MAX_QUERY_LENGTH", &v)?;
+    }
+    if let Some(v) = read("PULSUS_PROFILES_MAX_QUERY_LOOKBACK") {
+        cfg.reader.profiles_max_query_lookback =
+            parse_dur("PULSUS_PROFILES_MAX_QUERY_LOOKBACK", &v)?;
+    }
+    if let Some(v) = read("PULSUS_PROFILES_SCAN_BUDGET_ROWS") {
+        cfg.reader.profiles_scan_budget_rows = parse_int("PULSUS_PROFILES_SCAN_BUDGET_ROWS", &v)?;
+    }
+    if let Some(v) = read("PULSUS_PROFILES_MAX_TREE_NODES") {
+        cfg.reader.profiles_max_tree_nodes = parse_int("PULSUS_PROFILES_MAX_TREE_NODES", &v)?;
+    }
+    if let Some(v) = read("PULSUS_PROFILES_MAX_RESULT_BYTES") {
+        cfg.reader.profiles_max_result_bytes = parse_int("PULSUS_PROFILES_MAX_RESULT_BYTES", &v)?;
+    }
+    if let Some(v) = read("PULSUS_PROFILES_QUERY_MEMORY_BYTES") {
+        cfg.reader.profiles_query_memory_bytes =
+            parse_int("PULSUS_PROFILES_QUERY_MEMORY_BYTES", &v)?;
     }
     // Issue #398: the three per-surface read memory ceilings. Plain
     // integers (bytes), rather than the `ByteSize`-parsed `PULSUS_LOGQL_SCAN_BUDGET_BYTES`.

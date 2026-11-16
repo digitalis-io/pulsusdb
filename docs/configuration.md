@@ -185,6 +185,12 @@ A trace request is also bounded **before** any of that, by a fixed ceiling on th
 | `PULSUS_TAIL_CATCHUP_SLICE` | `60s` | maximum time window one tail query may read lines from or sort; backlog catch-up proceeds one slice per query, re-polling immediately until caught up (must be > 0). One query reads timestamps only and may span more: when a stream's labels become readable late, it finds where that stream's lines between `start` and the cursor begin (docs/api.md §2.4) |
 | `PULSUS_READ_CACHE_BYTES` | `256MiB` | memory for the read cache of `/api/v1/query_range` answers ([api.md §3.2](api.md)), counted over every allocation an answer keeps; past it the least recently used answer is evicted. `0` turns the cache off. Reader and `all` roles; each process keeps its own. A sample sent more than 60 s after its own timestamp can be missing from the points an answer kept before it arrived, or before the label cache next listed its series, until they are evaluated again, at most an hour after they were first kept (api.md §3.2) |
 | `PULSUS_READ_CACHE_TENANT_SHARE` | `50` | an eviction priority, in percent of `PULSUS_READ_CACHE_BYTES`, `1` to `100`: when room is needed, a tenant whose kept answers hold more than this loses its own least recently used answer first; an answer larger than this share is not kept. It is not a cap: a tenant may hold more while the cache has room |
+| `PULSUS_PROFILES_MAX_QUERY_LENGTH` | `24h` | the longest window a profiles query may cover (issue #821, `docs/api.md` §5), measured after the start is raised to the lookback floor; longer is `400 invalid_argument`, `the query time range exceeds the limit`. Must be > 0 |
+| `PULSUS_PROFILES_MAX_QUERY_LOOKBACK` | `7d` | how far back a profiles query may reach: a window's start is raised to now minus this, and a window that ends before it answers empty with no statement sent. Must be > 0 |
+| `PULSUS_PROFILES_SCAN_BUDGET_ROWS` | `50000000` | per-statement row cap on every profiles read (`max_rows_to_read`, throw); exceeding returns `429 resource_exhausted`, `query_too_broad: PULSUS_PROFILES_SCAN_BUDGET_ROWS`. Must be >= 1 (`0` is ClickHouse's *unlimited*) |
+| `PULSUS_PROFILES_MAX_TREE_NODES` | `4194304` | the most result rows one profiles statement may return (`max_result_rows`, throw); exceeding returns `429 resource_exhausted`. Must be >= 1 |
+| `PULSUS_PROFILES_MAX_RESULT_BYTES` | `268435456` | the most result bytes one profiles statement may return (`max_result_bytes`, throw); exceeding returns `429 resource_exhausted`. Must be >= 1 |
+| `PULSUS_PROFILES_QUERY_MEMORY_BYTES` | `4294967296` | per-statement ClickHouse memory ceiling on every profiles read (`max_memory_usage` + `max_bytes_before_external_group_by=0`, throw-not-spill); a breach returns `429 resource_exhausted`. Must be >= 1 |
 
 ## 7. Retention (`schema/schema.sh`)
 
@@ -493,6 +499,12 @@ reader:
   tail_catchup_slice: 60s
   read_cache_bytes: 256MiB
   read_cache_tenant_share: 50
+  profiles_max_query_length: 24h
+  profiles_max_query_lookback: 7d
+  profiles_scan_budget_rows: 50000000
+  profiles_max_tree_nodes: 4194304
+  profiles_max_result_bytes: 268435456
+  profiles_query_memory_bytes: 4294967296
 
 ruler:
   enabled: false

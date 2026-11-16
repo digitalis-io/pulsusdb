@@ -48,6 +48,12 @@ impl LogComment for pulsus_read::LogQlEngine {
     }
 }
 
+impl LogComment for pulsus_read::profiles::ProfilesEngine {
+    fn with_log_comment(self, comment: String) -> Self {
+        self.with_query_log_comment(comment)
+    }
+}
+
 /// The trace engine numbers its statements `<id>-<n>` and tags each with
 /// `log_comment = <id>` (`TraceDispatch::stamped`).
 impl LogComment for pulsus_read::TraceEngine {

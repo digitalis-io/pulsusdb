@@ -4,8 +4,9 @@
 //! and the engine that sends them.
 
 pub mod catalogue;
+mod dispatch;
 pub mod engine;
 pub mod selector;
 pub mod tenant_scope;
 
-pub use engine::{ProfilesReadConfig, ProfilesReadError};
+pub use engine::{Answer, ProfilesEngine, ProfilesReadConfig, ProfilesReadError};

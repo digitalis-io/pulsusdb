@@ -1,9 +1,50 @@
-//! Stub.
+//! Issue #821: the profiles catalogue reads — profile types, label names,
+//! label values and series — as one statement each over the series table.
+//!
+//! Every statement is SERIES's `FROM` and `WHERE` lines (#820's leaf,
+//! [`crate::metrics::profile_series_where`]) under the method's own
+//! `SELECT`, so a series is selected by its tenant, its day partitions, its
+//! hour mask (owner, 2026-11-15, "By the hour") and the request's matchers,
+//! and no other table is read.
+//!
+//! | Id | `SELECT` | order |
+//! |---|---|---|
+//! | S1 | `DISTINCT type_id AS s`, no matcher | `s` |
+//! | S2 | `DISTINCT arrayJoin(<keys>) AS s` | `s` |
+//! | S3 | `DISTINCT JSONExtractString(labels, <name>) AS s`, `s != ''` | `s` |
+//! | S4 | `DISTINCT <pairs> AS ls` | `ls` |
+//!
+//! Without the client's `allow-utf8-labelnames` capability, S2 and S4 keep
+//! only the names the reference's legacy rule accepts
+//! (`model/metric.go:184-196` of the Go module the reference pins), in the
+//! statement, so S4 deduplicates after the filter.
 
-use pulsus_model::Tenant;
+use pulsus_model::{LabelMatcher, Tenant};
+
+use crate::logql::escape::ch_string;
 
 use super::engine::ProfilesReadError;
-use super::selector::WindowLimits;
+use super::selector::{Compiled, SelectorError, SelectorRequest, WindowLimits, compile};
+
+/// The reference's legacy label-name rule, as a statement literal.
+const LEGACY_NAME: &str = "'^[a-zA-Z_][a-zA-Z0-9_]*$'";
+
+/// The reference's five-name `Series` request (`query_series_labels_compat.go:31-37`),
+/// sorted.
+const FIVE_NAMES: [&str; 5] = [
+    "__name__",
+    "__profile_type__",
+    "__type__",
+    "pyroscope_app",
+    "service_name",
+];
+
+/// The pairs the five-name request reads.
+const TYPE_AND_SERVICE: &str = "has(['__profile_type__', 'service_name'], kv.1)";
+
+/// The reference's default `ProfileTypes` window, the last hour
+/// (`query_profile_types.go:31-35`).
+const DEFAULT_TYPES_WINDOW_MS: i64 = 3_600_000;
 
 /// The method a catalogue request is.
 #[derive(Debug, Clone, Copy)]
@@ -21,7 +62,8 @@ pub enum Method<'a> {
     },
 }
 
-/// A catalogue request.
+/// A catalogue request: its method, its matchers (ignored by
+/// `ProfileTypes`) and its window in milliseconds.
 #[derive(Debug, Clone, Copy)]
 pub struct CatalogueRequest<'a> {
     pub method: Method<'a>,
@@ -30,7 +72,9 @@ pub struct CatalogueRequest<'a> {
     pub end_ms: i64,
 }
 
-/// The one statement a request sends.
+/// The one statement a request sends: a list of strings (S1–S3), or label
+/// sets (S4). `compat` marks the five-name `Series` request, whose rows the
+/// engine rebuilds as the reference does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Read {
     Strings(String),
@@ -38,6 +82,7 @@ pub enum Read {
 }
 
 impl Read {
+    /// The statement's text.
     pub fn sql(&self) -> &str {
         match self {
             Read::Strings(sql) | Read::Series { sql, .. } => sql,
@@ -45,14 +90,157 @@ impl Read {
     }
 }
 
+/// Plans `req` for `tenant` over `series_table`: `None` when the window ends
+/// before the lookback floor (the answer is empty and nothing is sent), else
+/// the one statement. Every refusal carries the reference's text.
 pub fn plan(
-    _tenant: &Tenant,
-    _series_table: &str,
-    _limits: WindowLimits,
-    _req: &CatalogueRequest<'_>,
-    _now_ms: i64,
+    tenant: &Tenant,
+    series_table: &str,
+    limits: WindowLimits,
+    req: &CatalogueRequest<'_>,
+    now_ms: i64,
 ) -> Result<Option<Read>, ProfilesReadError> {
-    Ok(Some(Read::Strings(String::new())))
+    let (mut start_ms, mut end_ms) = (req.start_ms, req.end_ms);
+    let selectors: &[&str] = match req.method {
+        Method::ProfileTypes => {
+            if start_ms == 0 && end_ms == 0 {
+                start_ms = now_ms - DEFAULT_TYPES_WINDOW_MS;
+                end_ms = now_ms;
+            }
+            &[]
+        }
+        _ => req.matchers,
+    };
+    let compiled = compile(
+        tenant,
+        series_table,
+        &SelectorRequest {
+            selectors,
+            profile_type: None,
+            start_ms,
+            end_ms,
+        },
+        now_ms,
+        limits,
+    )
+    .map_err(|SelectorError::InvalidArgument(m)| ProfilesReadError::InvalidArgument(m))?;
+    let (window, matchers) = match compiled {
+        Compiled::Empty => return Ok(None),
+        Compiled::Series {
+            window, matchers, ..
+        } => (window, matchers),
+    };
+    let from_where = |ms: &[LabelMatcher]| {
+        crate::metrics::profile_series_where(tenant, window, series_table, ms)
+    };
+    Ok(Some(match req.method {
+        Method::ProfileTypes => Read::Strings(format!(
+            "SELECT DISTINCT type_id AS s\n{}\nORDER BY s",
+            from_where(&[])
+        )),
+        Method::LabelNames { utf8 } => {
+            let keys = if utf8 {
+                "JSONExtractKeys(labels)".to_string()
+            } else {
+                format!("arrayFilter(n -> match(n, {LEGACY_NAME}), JSONExtractKeys(labels))")
+            };
+            Read::Strings(format!(
+                "SELECT DISTINCT arrayJoin({keys}) AS s\n{}\nORDER BY s",
+                from_where(&matchers)
+            ))
+        }
+        Method::LabelValues { name } => {
+            if name.is_empty() {
+                return Err(ProfilesReadError::InvalidArgument(
+                    "name is required".to_string(),
+                ));
+            }
+            Read::Strings(format!(
+                "SELECT DISTINCT JSONExtractString(labels, {}) AS s\n{}\n  AND s != ''\nORDER BY s",
+                ch_string(name),
+                from_where(&matchers)
+            ))
+        }
+        Method::Series { label_names, utf8 } => {
+            let compat = matchers.is_empty() && is_five_names(label_names);
+            let names: Vec<&String> = label_names
+                .iter()
+                .filter(|n| utf8 || is_legacy_name(n))
+                .collect();
+            let keep = if compat {
+                Some(TYPE_AND_SERVICE.to_string())
+            } else if !names.is_empty() {
+                let list: Vec<String> = names.iter().map(|n| ch_string(n)).collect();
+                Some(format!("has([{}], kv.1)", list.join(", ")))
+            } else if !utf8 {
+                Some(format!("match(kv.1, {LEGACY_NAME})"))
+            } else {
+                None
+            };
+            let pairs = "JSONExtractKeysAndValues(labels, 'String')";
+            let select = match keep {
+                Some(keep) => format!("arrayFilter(kv -> {keep}, {pairs})"),
+                None => pairs.to_string(),
+            };
+            Read::Series {
+                sql: format!(
+                    "SELECT DISTINCT {select} AS ls\n{}\nORDER BY ls",
+                    from_where(&matchers)
+                ),
+                compat,
+            }
+        }
+    }))
+}
+
+/// The reference's five-name list, in any order.
+fn is_five_names(names: &[String]) -> bool {
+    let mut sorted: Vec<&str> = names.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted == FIVE_NAMES
+}
+
+/// The reference's legacy label-name rule, `^[a-zA-Z_][a-zA-Z0-9_]*$`.
+pub fn is_legacy_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(b) if b == b'_' || b.is_ascii_alphabetic())
+        && bytes.all(|b| b == b'_' || b.is_ascii_alphanumeric())
+}
+
+/// The five-name `Series` answer built from S4's rows of `__profile_type__`
+/// and `service_name` pairs, as the reference builds it
+/// (`query_series_labels_compat.go:105-129`): four pairs per row — the type,
+/// the service, the type's name and its sample type — sorted by name; a row
+/// lacking either pair, or whose type has not five or six parts, is dropped;
+/// the sets in `CompareLabelPairs` order.
+pub fn compat_sets(rows: Vec<Vec<(String, String)>>) -> Vec<Vec<(String, String)>> {
+    let mut out: Vec<Vec<(String, String)>> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let find = |key: &str| {
+                row.iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.clone())
+                    .filter(|v| !v.is_empty())
+            };
+            let service = find("service_name")?;
+            let id = find("__profile_type__")?;
+            let parts: Vec<&str> = id.split(':').collect();
+            if parts.len() != 5 && parts.len() != 6 {
+                return None;
+            }
+            let mut set = vec![
+                ("__profile_type__".to_string(), id.clone()),
+                ("service_name".to_string(), service),
+                ("__name__".to_string(), parts[0].to_string()),
+                ("__type__".to_string(), parts[1].to_string()),
+            ];
+            set.sort_by(|a, b| a.0.cmp(&b.0));
+            Some(set)
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 #[cfg(test)]

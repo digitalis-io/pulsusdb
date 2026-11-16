@@ -85,6 +85,10 @@ live_profile_views	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19
 # Issue #820: the profiles label selector's series subquery, run
 # over its tenant's rows. Reuses this job's ClickHouse container.
 profiles_selector_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test profiles_selector_live
+# Issue #821: the profiles catalogue methods over the Connect protocol and
+# the native GET routes, against the spawned binary. Reuses this job's
+# ClickHouse container.
+profiles_catalogue	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profiles_catalogue
 # Issue #55: spawns the real `pulsusdb` binary and drives the
 # `/api/traces/v1/trace/{traceId}[/json]` fetch surface end-to-end —
 # OTLP ingest seed, JSON/protobuf negotiation (incl. the 406

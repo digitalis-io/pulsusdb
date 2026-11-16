@@ -123,6 +123,12 @@ clickhouse:
   #tail_catchup_slice: 60s
   #read_cache_bytes: 256MiB
   #read_cache_tenant_share: 50
+  #profiles_max_query_length: 24h
+  #profiles_max_query_lookback: 7d
+  #profiles_scan_budget_rows: 50000000
+  #profiles_max_tree_nodes: 4194304
+  #profiles_max_result_bytes: 268435456
+  #profiles_query_memory_bytes: 4294967296
 
 #ruler:
   #enabled: false

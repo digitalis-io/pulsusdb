@@ -22,7 +22,7 @@ Conventions:
 |--------|-----------|--------|
 | `X-Pulsus-Database` | ingest + query | route to an alternate ClickHouse database (retention is per-database configuration; there is no per-write TTL override in v1) |
 | `X-Pulsus-Async` | ingest | `1` = answer `202` once admitted: accepted, not stored — except a log push some of whose streams fail their label checks, which is answered `400` (§1.0). A log or trace push is then held in memory until its batch's insert settles — its wait in the queue, up to `PULSUS_LANDING_BATCH_MS` while its batch forms, then the insert and its resends, within 120 s of the admission of its batch's oldest push — and a process that ends without its drain loses it until that insert's first attempt is sent; a failure is reported to nobody. `0` = answer once the insert that answers the push has settled (§1.0) (default from config) |
-| `X-Scope-OrgID` | log, metric and trace ingest and query | the tenant (issues #635, #653, #738). No header is the empty tenant, the single-tenant deployment; 1 to 150 bytes of `[A-Za-z0-9_.-]` is that tenant; an empty value, a longer one, any other byte, or the header given twice is `400` (`invalid X-Scope-OrgID`), read before any other parameter, and nothing is stored or read. Every write stores the tenant and every read answers that tenant's rows alone; a trace id stored only under another tenant is absent to this one |
+| `X-Scope-OrgID` | log, metric and trace ingest and query, and profile query | the tenant (issues #635, #653, #738). No header is the empty tenant, the single-tenant deployment; 1 to 150 bytes of `[A-Za-z0-9_.-]` is that tenant; an empty value, a longer one, any other byte, or the header given twice is `400` (`invalid X-Scope-OrgID`), read before any other parameter, and nothing is stored or read. Every write stores the tenant and every read answers that tenant's rows alone; a trace id stored only under another tenant is absent to this one |
 | `X-Pulsus-Explain` | query | `1` = include generated SQL, plan, and `exactness` in the response envelope. `exactness` is `"raw-exact"`, or `"rollup"` when a rollup level served part of a selector (§3.6) |
 | `X-Loki-Response-Encoding-Flags` | log query (`query`, `query_range`, `tail`) | comma-separated encoding flags. `categorize-labels` switches the `streams` result to the three-element `values` shape — see §2.1. Unknown flags are echoed back and change nothing. Absent, the response is exactly what it was before the header existed |
 | `Idempotency-Key` | log, metric and trace ingest | issue #494, extended to the trace push by issue #586. Namespaces a push's identity in the writer process's suppression index (§1.0), while that index is on and still holds the key — until `PULSUS_INGEST_DEDUP_WINDOW` has passed: two requests with **different** keys are then two pushes whatever they carry, and the same key with the same content is one push. The same key carrying **different** content is then a client error — `400`, and nothing is stored. At another writer process, after the window, or with `PULSUS_INGEST_DEDUP=false`, the key decides nothing. Absent, a push is identified by its own content. Two tenants' identical log, metric or trace pushes, with or without one key, are two pushes. A metrics push's deduplication token in ClickHouse never reads the key, so a metrics push of the same parsed content stores its samples, series and exemplars once whatever its key (§1.0). Read on every ingest route, `/v1/traces` and the Zipkin receiver included |
@@ -33,7 +33,7 @@ Conventions:
 
 | Header | Sent by | Meaning |
 |--------|---------|---------|
-| `X-Pulsus-Query-Id` | every route but `/ready` and `/metrics`, and not on a CORS preflight (`OPTIONS`), which the CORS layer answers before any route runs; none of the three runs a statement (issues #587, #614) | 32 lowercase hex characters, one per request, on every response, errors included — the authentication layer's `401` and the request deadline's `503` or `408` as well. Every statement a PromQL (§3), LogQL (§2, the tail included) or TraceQL (§4) read issues carries it as `log_comment`, so `system.query_log` filtered on it returns that request's statements and no other's; TraceQL statements are also numbered `<id>-1`, `<id>-2`, … as their `query_id`. A route that reads nothing (the `/api/v1/status/*` routes, `/config`, `/buildinfo`, and `/api/v1/query_exemplars` for a `query` with no selector) names an empty set, and so does a write route: its statements carry no request's id |
+| `X-Pulsus-Query-Id` | every route but `/ready` and `/metrics`, and not on a CORS preflight (`OPTIONS`), which the CORS layer answers before any route runs; none of the three runs a statement (issues #587, #614) | 32 lowercase hex characters, one per request, on every response, errors included — the authentication layer's `401` and the request deadline's `503` or `408` as well. Every statement a PromQL (§3), LogQL (§2, the tail included), TraceQL (§4) or profiles query API (§5) read issues carries it as `log_comment`, so `system.query_log` filtered on it returns that request's statements and no other's; TraceQL statements are also numbered `<id>-1`, `<id>-2`, … as their `query_id`. A route that reads nothing (the `/api/v1/status/*` routes, `/config`, `/buildinfo`, and `/api/v1/query_exemplars` for a `query` with no selector) names an empty set, and so does a write route: its statements carry no request's id |
 | `X-Pulsus-Read-Cache` | `/api/v1/query_range` | `hit`: part of the answer was kept by this process's read cache and the rest evaluated (§3.2); `miss`: evaluated in full, and what can no longer change was kept; `bypass`: evaluated in full and nothing kept. Sent on successful responses only; an error response carries neither read-cache header. With the cache off every successful response says `bypass` |
 | `X-Pulsus-Read-Cache-Through` | `/api/v1/query_range` | with `hit` or `miss`, the time in milliseconds of the last point the read cache keeps for this query (§3.2) |
 
@@ -1525,11 +1525,48 @@ There is no `q` expression and no `step`: the read is a fixed `(client, server, 
 
 ## 5. Profiles query API
 
+Four methods are served (issue #821): `ProfileTypes`, `LabelNames`, `LabelValues` and `Series`. Each is one handler bound at three paths:
+
+| Method | Native Connect path (`POST`) | Compat Connect path (`POST`, `PULSUS_COMPAT_ENDPOINTS=true`) | Native `GET` route and parameters |
+|---|---|---|---|
+| `ProfileTypes` | `/api/profiles/v1/querier.v1.QuerierService/ProfileTypes` | `/querier.v1.QuerierService/ProfileTypes` | `GET /api/profiles/v1/types` — `from`, `until` |
+| `LabelNames` | `/api/profiles/v1/querier.v1.QuerierService/LabelNames` | `/querier.v1.QuerierService/LabelNames` | `GET\|POST /api/profiles/v1/labels` — `query` (repeated), `from`, `until` |
+| `LabelValues` | `/api/profiles/v1/querier.v1.QuerierService/LabelValues` | `/querier.v1.QuerierService/LabelValues` | `GET /api/profiles/v1/label/{name}/values` — `query` (repeated), `from`, `until` |
+| `Series` | `/api/profiles/v1/querier.v1.QuerierService/Series` | `/querier.v1.QuerierService/Series` | `GET\|POST /api/profiles/v1/series` — `match[]`, `label_names[]`, `from`, `until` |
+
+Messages, with their JSON names (proto3 JSON: a field at its default is omitted, so an empty answer is `{}`; an `int64` is written as a string and read as a number or a string; a field is read by its JSON or its proto name; an unknown field is ignored):
+
+| Message | Fields |
+|---|---|
+| `querier.v1.ProfileTypesRequest` | `start`, `end` (ms) |
+| `querier.v1.ProfileTypesResponse` | `profileTypes`: `{ID, name, sampleType, sampleUnit, periodType, periodUnit}` |
+| `types.v1.LabelNamesRequest` | `matchers` (label selectors), `start`, `end` |
+| `types.v1.LabelNamesResponse` | `names` |
+| `types.v1.LabelValuesRequest` | `name`, `matchers`, `start`, `end` |
+| `types.v1.LabelValuesResponse` | `names` |
+| `querier.v1.SeriesRequest` | `matchers`, `labelNames`, `start`, `end` |
+| `querier.v1.SeriesResponse` | `labelsSet`: `{labels: [{name, value}]}` |
+
+- **Window.** `start` and `end` are milliseconds. Both 0 on `ProfileTypes` is the last hour. A start older than 7 days (`PULSUS_PROFILES_MAX_QUERY_LOOKBACK`) is raised to it, and a window ending before it answers `{}` with no statement sent; a window longer than 24 hours (`PULSUS_PROFILES_MAX_QUERY_LENGTH`) after that is `invalid_argument`. A series is selected by the hours it holds a profile in, so a series whose last profile fell in the window's first or last hour, outside the window, may be listed.
+- **`GET` routes.** `from` and `until` are read as the reference reads them: digits are seconds, or milliseconds at 13 digits, microseconds at 16 and nanoseconds at 19, or a `YYYYMMDD` date; otherwise `now` plus an offset such as `now-1h`. An absent one is 0. On `POST` the form body's pairs follow the query string's.
+- **Label names.** Without `allow-utf8-labelnames=true` as a parameter of an `Accept` value, `LabelNames` and `Series` answer only names matching `^[a-zA-Z_][a-zA-Z0-9_]*$`.
+- **`Series` with no matcher and `labelNames` `__name__`, `__profile_type__`, `__type__`, `service_name` and the reference's app label** answers, per type and service, the four pairs `__name__`, `__profile_type__`, `__type__` and `service_name`.
+- **Each request sends one statement** over `profile_series`, scoped to the tenant (`X-Scope-OrgID`, read first), or none for an empty window.
+- **Connect.** Request `Content-Type` `application/proto` or `application/json` (with or without parameters); any other is `415` with `Accept-Post: application/json, application/proto`. `Content-Encoding: gzip` is read; another encoding is `unimplemented`. The answer is in the request's codec. The `GET` routes answer the JSON body.
+- **Errors** are `Content-Type: application/json`, body `{"code":"<code>","message":"<text>"}`, on every path:
+
+| Code | Status | When |
+|---|---|---|
+| `invalid_argument` | `400` | an invalid `X-Scope-OrgID`, a bad body, selector or window, an empty `name`, a regex the database cannot compile |
+| `resource_exhausted` | `429` | a ceiling was reached: the message is `query_too_broad: <setting>` (`PULSUS_PROFILES_SCAN_BUDGET_ROWS`, `PULSUS_PROFILES_MAX_TREE_NODES`, `PULSUS_PROFILES_MAX_RESULT_BYTES`, `PULSUS_PROFILES_QUERY_MEMORY_BYTES`) |
+| `unimplemented` | `501` | an unknown `Content-Encoding` |
+| `internal` | `500` | anything else |
+| `unavailable` | `503` | the database cannot be reached |
+| `deadline_exceeded` | `504` | `PULSUS_QUERY_TIMEOUT` passed: the message is `request timed out, decrease the duration of the request or add more label matchers (prefer exact match over regex match) to reduce the amount of data processed` |
+
+Served by later parts:
+
 ```
-GET      /api/profiles/v1/types                            → available profile types
-GET|POST /api/profiles/v1/labels          ?query=&from=&until=
-GET      /api/profiles/v1/label/{name}/values
-GET|POST /api/profiles/v1/series          ?match[]=&from=&until=
 GET      /api/profiles/v1/merge           ?query=<type>{selector}&from=&until=   → merged flamegraph tree (JSON)
 GET      /api/profiles/v1/select_series   ?query=&from=&until=&step=             → time series of profile values
 GET      /api/profiles/v1/export          ?query=&from=&until=                   → merged pprof (binary)
@@ -1626,7 +1663,8 @@ When `PULSUS_AUTH_*` is set, the perimeter returns 401 to every unauthenticated 
 | `/api/v2/search/tags`, `/api/v2/search/tag/{tag}/values` | `/api/traces/v1/tags`, `/api/traces/v1/tag/{tag}/values` (native shape minus `truncated`) | M4 |
 | `/api/echo` | — (constant `echo` body) | M4 |
 | `/api/metrics/query_range`, `/api/metrics/query`, `/tempo/api/metrics/query_range`, `/tempo/api/metrics/query` | `/api/traces/v1/metrics/query_range`, `/api/traces/v1/metrics/query` | M4 |
-| `POST /querier.v1.QuerierService/{ProfileTypes,LabelNames,LabelValues,Series,SelectMergeStacktraces,SelectSeries,SelectMergeProfile,GetProfileStats,AnalyzeQuery}`, `POST /settings.v1.SettingsService/Get` (Connect-protocol, protobuf) | `/api/profiles/v1/*` | M5 |
+| `POST /querier.v1.QuerierService/ProfileTypes`, `POST /querier.v1.QuerierService/LabelNames`, `POST /querier.v1.QuerierService/LabelValues`, `POST /querier.v1.QuerierService/Series` (Connect protocol, served, §5) | `/api/profiles/v1/querier.v1.QuerierService/ProfileTypes`, `/api/profiles/v1/querier.v1.QuerierService/LabelNames`, `/api/profiles/v1/querier.v1.QuerierService/LabelValues`, `/api/profiles/v1/querier.v1.QuerierService/Series` | M5 |
+| `POST /querier.v1.QuerierService/{SelectMergeStacktraces,SelectSeries,SelectMergeProfile,GetProfileStats,AnalyzeQuery}`, `POST /settings.v1.SettingsService/Get` (Connect protocol, later parts) | `/api/profiles/v1/*` | M5 |
 | `/pyroscope/render`, `/pyroscope/render-diff` | `/api/profiles/v1/render{,-diff}` | M5 |
 | `/loki/api/v1/rules[...]`, `/api/prom/rules[...]`, `/prometheus/api/v1/rules` | `/api/rules/v1/*` | M7 |
 
