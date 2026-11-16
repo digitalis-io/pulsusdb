@@ -36,7 +36,7 @@ pub use ast::{
 };
 pub use function::{Function, FunctionArgs};
 pub use lex::lexer;
-pub use parse::parse;
+pub use parse::{SelectorOp, parse, parse_metric_selector};
 
 // FIXME: show more helpful error message to some invalid promql queries.
 const INVALID_QUERY_INFO: &str = "invalid promql query";

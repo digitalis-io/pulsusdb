@@ -169,16 +169,23 @@ fn map_metrics_read_error(e: ChError, read_max_memory_bytes: u64) -> ReadError {
             budget_bytes: read_max_memory_bytes,
         });
     }
-    if let ChError::Server {
-        code: CODE_CANNOT_COMPILE_REGEXP,
-        message,
-    } = &e
-    {
-        return ReadError::Promql(PromqlError::InvalidRegexMatcher {
-            detail: re2_reject_detail(message),
-        });
+    if let Some(detail) = regex_rejection_detail(&e) {
+        return ReadError::Promql(PromqlError::InvalidRegexMatcher { detail });
     }
     ReadError::Clickhouse(e)
+}
+
+/// The client-facing detail of a statement refused with code 427 — a label
+/// matcher's regex RE2 cannot compile — and `None` for every other error.
+/// The one 427 rule of the metrics and profiles paths (issue #820).
+pub(crate) fn regex_rejection_detail(e: &ChError) -> Option<String> {
+    match e {
+        ChError::Server {
+            code: CODE_CANNOT_COMPILE_REGEXP,
+            message,
+        } => Some(re2_reject_detail(message)),
+        _ => None,
+    }
 }
 
 /// `ChClient` is not `Debug` (it owns a connection pool), so the seal is

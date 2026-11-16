@@ -11,8 +11,8 @@ pub use promql_parser::label::{
 pub use promql_parser::parser::value::ValueType;
 pub use promql_parser::parser::{
     AggregateExpr, AtModifier, BinModifier, BinaryExpr, Call, DurationExpr, Expr, LabelModifier,
-    MatrixSelector, NumberLiteral, Offset, ParenExpr, StringLiteral, SubqueryExpr, UnaryExpr,
-    VectorMatchCardinality, VectorSelector, token,
+    MatrixSelector, NumberLiteral, Offset, ParenExpr, SelectorOp, StringLiteral, SubqueryExpr,
+    UnaryExpr, VectorMatchCardinality, VectorSelector, token,
 };
 
 /// Parses `q` into the vendored parser's AST. The `Err` case's `Display`
@@ -43,6 +43,11 @@ pub fn parse(q: &str) -> Result<Expr, PromqlError> {
         });
     }
     Ok(expr)
+}
+
+/// Issue #820: `q`'s matchers as the profiles label selector reads them.
+pub fn parse_metric_selector(q: &str) -> Result<Vec<(String, SelectorOp, String)>, PromqlError> {
+    promql_parser::parser::parse_metric_selector(q).map_err(PromqlError::Parse)
 }
 
 #[cfg(test)]
@@ -338,5 +343,34 @@ mod tests {
             PromqlError::Parse(msg) => assert!(!msg.is_empty()),
             other => panic!("expected Parse, got {other:?}"),
         }
+    }
+
+    /// M1 (issue #820): the profiles selector entry reads the selector shape
+    /// alone — `{}` and a keyword label name are accepted, input after `}` is
+    /// not — and the PromQL path is unchanged.
+    #[test]
+    fn m1_the_metric_selector_entry_reads_the_selector_alone() {
+        let owned = |v: &[(&str, SelectorOp, &str)]| -> Vec<(String, SelectorOp, String)> {
+            v.iter()
+                .map(|(k, op, val)| (k.to_string(), *op, val.to_string()))
+                .collect()
+        };
+        assert_eq!(parse_metric_selector("{}"), Ok(vec![]));
+        assert_eq!(
+            parse_metric_selector(r#"{service_name="a"}"#),
+            Ok(owned(&[("service_name", SelectorOp::Eq, "a")]))
+        );
+        assert_eq!(
+            parse_metric_selector(r#"{sum="x"}"#),
+            Ok(owned(&[("sum", SelectorOp::Eq, "x")]))
+        );
+        assert!(
+            parse_metric_selector(r#"{a="b"} x"#).is_err(),
+            "input after the closing brace must be refused"
+        );
+        let empty = parse("{}").unwrap_err().to_string();
+        assert!(empty.contains("at least one non-empty matcher"), "{empty}");
+        let regex = parse(r#"{env=~"("}"#).unwrap_err().to_string();
+        assert!(regex.contains("illegal regex"), "{regex}");
     }
 }

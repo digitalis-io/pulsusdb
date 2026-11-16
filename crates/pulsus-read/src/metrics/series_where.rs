@@ -46,7 +46,7 @@
 //!
 //! # Boundary inventory
 //!
-//! Eighteen declarations carry a visibility modifier, pinned by the in-file
+//! Nineteen declarations carry a visibility modifier, pinned by the in-file
 //! census test `the_boundary_inventory_is_pinned` because a
 //! hand-maintained inventory here was wrong once (review round 3 found
 //! it listing three of the six). That pin reads `pub`-prefixed lines and
@@ -68,6 +68,7 @@
 //!   (issue #635).
 //! * [`SeriesWhere::label_values`] — `/label/{name}/values` over the label
 //!   index, whole (issue #635).
+//! * [`profile_series`] — the profiles series subquery, whole (issue #820).
 //! * [`SeriesTables`] — the tables a read names (`pub(super)`, with four
 //!   `pub(super)` fields): table names, nothing renderable.
 //! * [`Lookup`] — `activity`'s input (`pub(super)`), with three
@@ -185,6 +186,12 @@ pub(super) enum MatcherTarget {
     /// `__name__` matchers, which address the lookup's **`metric_name`
     /// column** — never a stored label (docs/schemas.md §2.1).
     MetricNameColumn,
+    /// Issue #820: a profiles `__profile_type__` matcher, on
+    /// `profile_series.type_id`.
+    ProfileTypeColumn,
+    /// Issue #820: a profiles `service_name` matcher, on
+    /// `profile_series.service`.
+    ServiceColumn,
 }
 
 /// The tables a series read names (issue #635): the activity table, the
@@ -469,6 +476,43 @@ impl SeriesWhere {
     }
 }
 
+/// Issue #820: the profiles series subquery, whole — the fingerprints of
+/// table `from`'s rows for tenant `t` in window `w`'s days and hours that every
+/// matcher of `ms` selects, with the compile probe for every regex. One
+/// line, so the census below reads the whole declaration.
+pub(crate) fn profile_series(t: &Tenant, w: DataWindow, from: &str, ms: &[LabelMatcher]) -> String {
+    let (first, _) = day_and_hour(w.start_ms);
+    let (last, _) = day_and_hour(w.end_ms);
+    let mut lines = vec![
+        "SELECT fingerprint".to_string(),
+        format!("FROM {from}"),
+        format!(
+            "WHERE org_id = {} AND day BETWEEN '{}' AND '{}'",
+            t.sql_literal(),
+            day_text(first),
+            day_text(last)
+        ),
+        format!("  AND bitAnd(hours, {}) != 0", hour_mask(w)),
+    ];
+    for m in ms {
+        lines.push(format!("  AND {}", predicate(m, profile_target(&m.key))));
+    }
+    for literal in ms.iter().filter_map(matcher_regex_literal) {
+        lines.push(format!("  AND 0 * match('', {literal}) = 0"));
+    }
+    lines.join("\n")
+}
+
+/// The column a profiles matcher reads: the two labels the series table
+/// keys by, and every other label from its JSON.
+fn profile_target(key: &str) -> MatcherTarget {
+    match key {
+        "__profile_type__" => MatcherTarget::ProfileTypeColumn,
+        "service_name" => MatcherTarget::ServiceColumn,
+        _ => MatcherTarget::Labels,
+    }
+}
+
 /// A narrow, `#[doc(hidden)]` test seam, re-exported by `super` next to
 /// `re2_authority`'s seam, which is its shape and precedent. Not a
 /// `cfg(test)` or feature gate, for that precedent's reason: the consumer
@@ -516,6 +560,8 @@ fn predicate(m: &LabelMatcher, target: MatcherTarget) -> String {
     let column = match target {
         MatcherTarget::Labels => format!("JSONExtractString(labels, {})", ch_string(&m.key)),
         MatcherTarget::MetricNameColumn => "metric_name".to_string(),
+        MatcherTarget::ProfileTypeColumn => "type_id".to_string(),
+        MatcherTarget::ServiceColumn => "service".to_string(),
     };
     match m.op {
         MatchOp::Eq => format!("{column} = {}", ch_string(&m.value)),
@@ -851,6 +897,7 @@ mod tests {
                 "pub(super) fn with_labels(&self, t: SeriesTables<'_>) -> String {",
                 "pub(super) fn label_keys(&self, t: SeriesTables<'_>) -> String {",
                 "pub(super) fn label_values(&self, key: &str, t: SeriesTables<'_>) -> String {",
+                "pub(crate) fn profile_series(t: &Tenant, w: DataWindow, from: &str, ms: &[LabelMatcher]) -> String {",
                 "pub fn anchored_re2_literal_for_test(pattern: &str) -> String {",
             ],
             "series_where.rs declarations drifted from this test's list"
@@ -896,6 +943,7 @@ mod tests {
                 "SeriesWhere::with_labels",
                 "SeriesWhere::label_keys",
                 "SeriesWhere::label_values",
+                "profile_series",
                 "SeriesTables",
                 "Lookup",
                 "MatcherTarget",
