@@ -127,6 +127,7 @@ pub(crate) use dispatch::regex_rejection_detail;
 pub(crate) use series_where::PromqlRe2Fallback;
 pub(crate) use series_where::profile_series;
 pub(crate) use series_where::profile_series_where;
+pub(crate) use series_where::profile_service_terms;
 
 pub use exec::{
     FetchProbe, MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, StatementProbe,

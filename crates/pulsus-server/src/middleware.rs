@@ -61,7 +61,8 @@ pub(crate) fn cors_layer(config: &Config) -> Result<CorsLayer, ServeError> {
 /// surface, and a query-shaped JSON error envelope would be wrong on it.
 pub(crate) const DEADLINE_BARE_PATHS: &[&str] = &["/api/v1/write"];
 
-/// Issue #821: the eight profiles Connect paths, named one by one. They
+/// Issue #821: the profiles Connect paths, named one by one (#823 adds
+/// `SelectMergeStacktraces`'s two). They
 /// answer a deadline with the reference's Connect error; another path under
 /// either service prefix keeps the class it had. Source-scanned by
 /// `tests/deadline_partition.rs` and compared with the route manifest.
@@ -74,9 +75,12 @@ pub(crate) const DEADLINE_CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/LabelNames",
     "/api/profiles/v1/querier.v1.QuerierService/LabelValues",
     "/api/profiles/v1/querier.v1.QuerierService/Series",
+    "/querier.v1.QuerierService/SelectMergeStacktraces",
+    "/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces",
 ];
 
-/// Issue #821: the four profiles `GET` routes, `{name}` one path segment.
+/// Issue #821: the profiles `GET` routes, `{name}` one path segment (#823
+/// adds `/merge`).
 /// They answer a deadline as the reference's HTTP read handlers answer one
 /// ([`DeadlineClass::ProfilesHttp`]). Source-scanned like
 /// [`DEADLINE_CONNECT_PATHS`].
@@ -85,6 +89,7 @@ pub(crate) const DEADLINE_PROFILES_HTTP_PATHS: &[&str] = &[
     "/api/profiles/v1/labels",
     "/api/profiles/v1/label/{name}/values",
     "/api/profiles/v1/series",
+    "/api/profiles/v1/merge",
 ];
 
 /// `path` matches `template`, whose one `{name}` is a non-empty segment.
@@ -517,8 +522,8 @@ mod tests {
         }
     }
 
-    /// C6 (issue #821): the eight Connect paths answer a deadline as a
-    /// Connect error, the four `GET` routes (`{name}` as `env`) as the
+    /// C6 (issue #821, #823): the ten Connect paths answer a deadline as a
+    /// Connect error, the five `GET` routes (`{name}` as `env`) as the
     /// reference's HTTP handlers do; the profiles ingest path keeps the bare
     /// `408`.
     #[test]
@@ -532,6 +537,8 @@ mod tests {
             "/api/profiles/v1/querier.v1.QuerierService/LabelNames",
             "/api/profiles/v1/querier.v1.QuerierService/LabelValues",
             "/api/profiles/v1/querier.v1.QuerierService/Series",
+            "/querier.v1.QuerierService/SelectMergeStacktraces",
+            "/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::Connect, "{path}");
         }
@@ -540,6 +547,7 @@ mod tests {
             "/api/profiles/v1/labels",
             "/api/profiles/v1/label/env/values",
             "/api/profiles/v1/series",
+            "/api/profiles/v1/merge",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::ProfilesHttp, "{path}");
         }
@@ -555,7 +563,7 @@ mod tests {
     #[test]
     fn an_unrelated_path_under_a_profiles_prefix_keeps_its_class() {
         for path in [
-            "/querier.v1.QuerierService/SelectMergeStacktraces",
+            "/querier.v1.QuerierService/SelectSeries",
             "/querier.v1.QuerierService/LabelNamesX",
             "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
             "/api/profiles/v1/querier.v1.QuerierService/",

@@ -2136,6 +2136,9 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // probe lines in S1 and S8, and S1's text again in T2. No renderer.
     ("pulsus-read/src/profiles/selector.rs", 4),
     ("pulsus-read/src/profiles/tenant_scope.rs", 2),
+    // Issue #823: a test expectation only — T8's `service_name` regex line,
+    // rendered by the leaf. No renderer.
+    ("pulsus-read/src/profiles/tree.rs", 1),
     // Issue #602 part 3a removes `traces/filter.rs` and its twelve with the
     // previous metrics SQL; its regex renderer moved to `traces/sql_text.rs`,
     // which spells no `match(`.
@@ -2155,7 +2158,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 134;
+const MATCH_RENDER_TOTAL: usize = 135;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.

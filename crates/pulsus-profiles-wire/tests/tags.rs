@@ -7,7 +7,7 @@
 //!
 //! W1 (issue #821): the same for every `types_v1` and `querier_v1` message
 //! the query API uses, against `proto/types/v1/types.proto` and
-//! `proto/querier/v1/querier.proto`.
+//! `proto/querier/v1/querier.proto`. Issue #823 adds the merge's messages.
 //!
 //! T1 (issue #817): the same for `ProfileAnnotation` and the `push_v1`
 //! messages, against `proto/types/v1/types.proto` and
@@ -20,11 +20,13 @@ use pulsus_profiles_wire::google_v1::{
 };
 use pulsus_profiles_wire::push_v1::{PushRequest, RawProfileSeries, RawSample};
 use pulsus_profiles_wire::querier_v1::{
-    ProfileTypesRequest, ProfileTypesResponse, SeriesRequest, SeriesResponse,
+    FlameGraph, Level, ProfileFormat, ProfileTypesRequest, ProfileTypesResponse,
+    SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SeriesRequest, SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
-    LabelNamesRequest, LabelNamesResponse, LabelPair, LabelValuesRequest, LabelValuesResponse,
-    Labels, ProfileAnnotation, ProfileType,
+    GoPgo, LabelNamesRequest, LabelNamesResponse, LabelPair, LabelValuesRequest,
+    LabelValuesResponse, Labels, Location as CallSite, ProfileAnnotation, ProfileType,
+    StackTraceSelector,
 };
 
 fn value_type() -> ValueType {
@@ -370,6 +372,142 @@ fn every_query_message_field_encodes_under_the_proto_tag() {
         nested(2, &labels_bytes(l), &mut b);
     }
     assert_eq!(m.encode_to_vec(), b, "SeriesResponse");
+}
+
+fn call_site(name: &str) -> CallSite {
+    CallSite {
+        name: name.to_string(),
+    }
+}
+
+fn call_site_bytes(l: &CallSite) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::string::encode(1, &l.name, &mut b);
+    b
+}
+
+fn go_pgo() -> GoPgo {
+    GoPgo {
+        keep_locations: 3,
+        aggregate_callees: true,
+    }
+}
+
+fn go_pgo_bytes(g: &GoPgo) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::uint32::encode(1, &g.keep_locations, &mut b);
+    encoding::bool::encode(2, &g.aggregate_callees, &mut b);
+    b
+}
+
+fn selector() -> StackTraceSelector {
+    StackTraceSelector {
+        call_site: vec![call_site("main"), call_site("a")],
+        go_pgo: Some(go_pgo()),
+    }
+}
+
+fn selector_bytes(s: &StackTraceSelector) -> Vec<u8> {
+    let mut b = Vec::new();
+    for l in &s.call_site {
+        nested(1, &call_site_bytes(l), &mut b);
+    }
+    nested(2, &go_pgo_bytes(s.go_pgo.as_ref().expect("set")), &mut b);
+    b
+}
+
+fn level(values: &[i64]) -> Level {
+    Level {
+        values: values.to_vec(),
+    }
+}
+
+fn level_bytes(l: &Level) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::int64::encode_packed(1, &l.values, &mut b);
+    b
+}
+
+fn flame_graph() -> FlameGraph {
+    FlameGraph {
+        names: strings(&["total", "main"]),
+        levels: vec![level(&[0, 32, 0, 0]), level(&[0, 32, -1, 1])],
+        total: 32,
+        max_self: 17,
+    }
+}
+
+fn flame_graph_bytes(f: &FlameGraph) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::string::encode_repeated(1, &f.names, &mut b);
+    for l in &f.levels {
+        nested(2, &level_bytes(l), &mut b);
+    }
+    encoding::int64::encode(3, &f.total, &mut b);
+    encoding::int64::encode(4, &f.max_self, &mut b);
+    b
+}
+
+/// W1 (issue #823): the merge's messages, every field set.
+#[test]
+fn every_merge_message_field_encodes_under_the_proto_tag() {
+    let l = call_site("main");
+    assert_eq!(l.encode_to_vec(), call_site_bytes(&l), "Location");
+    let g = go_pgo();
+    assert_eq!(g.encode_to_vec(), go_pgo_bytes(&g), "GoPGO");
+    let s = selector();
+    assert_eq!(s.encode_to_vec(), selector_bytes(&s), "StackTraceSelector");
+    let l = level(&[1, -2, 300]);
+    assert_eq!(l.encode_to_vec(), level_bytes(&l), "Level");
+    let f = flame_graph();
+    assert_eq!(f.encode_to_vec(), flame_graph_bytes(&f), "FlameGraph");
+
+    let m = SelectMergeStacktracesResponse {
+        flamegraph: Some(flame_graph()),
+    };
+    let mut b = Vec::new();
+    nested(1, &flame_graph_bytes(&flame_graph()), &mut b);
+    assert_eq!(m.encode_to_vec(), b, "SelectMergeStacktracesResponse");
+
+    let m = SelectMergeStacktracesRequest {
+        profile_type_id: "process_cpu:cpu:nanoseconds:cpu:nanoseconds".to_string(),
+        label_selector: "{service_name=\"a\"}".to_string(),
+        start: 1000,
+        end: 2000,
+        max_nodes: Some(4),
+        format: ProfileFormat::Tree as i32,
+        stack_trace_selector: Some(selector()),
+        profile_id_selector: strings(&["7c9e6679-7425-40de-944b-e07fc1f90ae7"]),
+        trace_id_selector: strings(&["0102030405060708090a0b0c0d0e0f10"]),
+        span_selector: strings(&["0000000000000001", "0000000000000002"]),
+    };
+    let mut b = Vec::new();
+    encoding::string::encode(1, &m.profile_type_id, &mut b);
+    encoding::string::encode(2, &m.label_selector, &mut b);
+    encoding::int64::encode(3, &m.start, &mut b);
+    encoding::int64::encode(4, &m.end, &mut b);
+    encoding::int64::encode(5, &4, &mut b);
+    encoding::int32::encode(6, &2, &mut b);
+    nested(7, &selector_bytes(&selector()), &mut b);
+    encoding::string::encode_repeated(8, &m.profile_id_selector, &mut b);
+    encoding::string::encode_repeated(10, &m.trace_id_selector, &mut b);
+    encoding::string::encode_repeated(11, &m.span_selector, &mut b);
+    assert_eq!(m.encode_to_vec(), b, "SelectMergeStacktracesRequest");
+
+    // An explicit `max_nodes` of 0 is present on the wire, as `optional`
+    // has it; an absent one is not.
+    let zero = SelectMergeStacktracesRequest {
+        max_nodes: Some(0),
+        ..SelectMergeStacktracesRequest::default()
+    };
+    let mut b = Vec::new();
+    encoding::int64::encode(5, &0, &mut b);
+    assert_eq!(zero.encode_to_vec(), b, "max_nodes 0");
+    assert!(
+        SelectMergeStacktracesRequest::default()
+            .encode_to_vec()
+            .is_empty()
+    );
 }
 
 fn label_pair() -> LabelPair {

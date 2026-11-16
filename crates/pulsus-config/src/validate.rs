@@ -1077,6 +1077,23 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         "reader.profiles_query_memory_bytes",
         cfg.reader.profiles_query_memory_bytes,
     )?;
+    // Issue #823: the flame graph's node counts; the default may not exceed
+    // the largest a request may send.
+    positive_u64(
+        "reader.profiles_max_nodes_default",
+        cfg.reader.profiles_max_nodes_default,
+    )?;
+    positive_u64(
+        "reader.profiles_max_nodes_max",
+        cfg.reader.profiles_max_nodes_max,
+    )?;
+    if cfg.reader.profiles_max_nodes_default > cfg.reader.profiles_max_nodes_max {
+        return Err(value_err(
+            "reader.profiles_max_nodes_default",
+            "must not exceed reader.profiles_max_nodes_max",
+            "<= reader.profiles_max_nodes_max",
+        ));
+    }
     positive_duration("reader.tail_poll_interval", cfg.reader.tail_poll_interval)?;
     positive_u64(
         "reader.tail_max_connections",
@@ -2209,6 +2226,12 @@ mod tests {
             ("reader.profiles_query_memory_bytes", |c| {
                 c.reader.profiles_query_memory_bytes = 0
             }),
+            ("reader.profiles_max_nodes_default", |c| {
+                c.reader.profiles_max_nodes_default = 0
+            }),
+            ("reader.profiles_max_nodes_max", |c| {
+                c.reader.profiles_max_nodes_max = 0
+            }),
         ];
         for (field, mutate) in cases {
             let mut cfg = Config::default();
@@ -2220,6 +2243,23 @@ mod tests {
                 other => panic!("{field}: expected a Value error, got {other:?}"),
             }
         }
+    }
+
+    /// Issue #823: the flame graph's default node count may not exceed the
+    /// largest a request may send; equal is accepted.
+    #[test]
+    fn the_flame_graph_node_default_is_at_most_the_max() {
+        let mut cfg = Config::default();
+        cfg.reader.profiles_max_nodes_default = 9;
+        cfg.reader.profiles_max_nodes_max = 8;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "reader.profiles_max_nodes_default")
+            }
+            other => panic!("expected a Value error, got {other:?}"),
+        }
+        cfg.reader.profiles_max_nodes_max = 9;
+        assert!(validate(&cfg).is_ok(), "{:?}", validate(&cfg));
     }
 
     /// Issue #778: the read cache's tenant share is a percent from 1 to

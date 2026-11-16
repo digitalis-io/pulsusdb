@@ -110,6 +110,8 @@ pkg/logql/syntax/parser.go
 pkg/logql/syntax/query_scanner.go
 pkg/logql/syntax/syntax.y
 pkg/logql/vector.go
+pkg/model/stacktraces.go
+pkg/model/tree.go
 pkg/pattern/drain/chunk.go
 pkg/pattern/ingester.go
 pkg/pattern/ingester_querier.go

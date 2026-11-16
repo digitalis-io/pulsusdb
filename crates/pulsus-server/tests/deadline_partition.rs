@@ -25,8 +25,8 @@
 //!
 //! ## The profiles query paths (issue #821)
 //!
-//! Two more classes: the eight profiles Connect paths answer the reference's
-//! Connect error (`DEADLINE_CONNECT_PATHS`), and the four profiles `GET`
+//! Two more classes: the ten profiles Connect paths answer the reference's
+//! Connect error (`DEADLINE_CONNECT_PATHS`), and the five profiles `GET`
 //! routes answer as the reference's HTTP read handlers do
 //! (`DEADLINE_PROFILES_HTTP_PATHS`). Both constants are source-scanned and
 //! compared with the manifest's `ProfilesConnect` and `ProfilesQuery` rows
@@ -154,8 +154,8 @@ fn the_two_classes_partition_the_mounted_prefix_exactly_once() {
     assert_eq!(envelope.len() + kept_bare.len(), mounted_api_v1().len());
 }
 
-/// Issue #821: the eight profiles Connect paths, which answer a deadline
-/// breach with the Connect `deadline_exceeded` body.
+/// Issue #821 (#823 adds two): the ten profiles Connect paths, which answer
+/// a deadline breach with the Connect `deadline_exceeded` body.
 const CONNECT_PATHS: &[&str] = &[
     "/querier.v1.QuerierService/ProfileTypes",
     "/querier.v1.QuerierService/LabelNames",
@@ -165,15 +165,18 @@ const CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/LabelNames",
     "/api/profiles/v1/querier.v1.QuerierService/LabelValues",
     "/api/profiles/v1/querier.v1.QuerierService/Series",
+    "/querier.v1.QuerierService/SelectMergeStacktraces",
+    "/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces",
 ];
 
-/// Issue #821: the four profiles `GET` routes, which answer it as the
-/// reference's HTTP read handlers do.
+/// Issue #821 (#823 adds `/merge`): the five profiles `GET` routes, which
+/// answer it as the reference's HTTP read handlers do.
 const PROFILES_HTTP_PATHS: &[&str] = &[
     "/api/profiles/v1/types",
     "/api/profiles/v1/labels",
     "/api/profiles/v1/label/{name}/values",
     "/api/profiles/v1/series",
+    "/api/profiles/v1/merge",
 ];
 
 fn mounted_of(surface: Surface) -> BTreeSet<String> {

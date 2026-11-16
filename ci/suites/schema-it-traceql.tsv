@@ -89,6 +89,13 @@ profiles_selector_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_POR
 # the native GET routes, against the spawned binary. Reuses this job's
 # ClickHouse container.
 profiles_catalogue	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profiles_catalogue
+# Issue #823: the merged flame graph's one statement over its tenant's
+# samples and stacks. Reuses this job's ClickHouse container.
+profiles_tree_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test profiles_tree_live
+# Issue #823: SelectMergeStacktraces over the Connect protocol and the
+# native GET route, against the spawned binary. Reuses this job's
+# ClickHouse container.
+profiles_merge	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profiles_merge
 # Issue #55: spawns the real `pulsusdb` binary and drives the
 # `/api/traces/v1/trace/{traceId}[/json]` fetch surface end-to-end —
 # OTLP ingest seed, JSON/protobuf negotiation (incl. the 406

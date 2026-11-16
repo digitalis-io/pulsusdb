@@ -1575,7 +1575,7 @@ There is no `q` expression and no `step`: the read is a fixed `(client, server, 
 
 ## 5. Profiles query API
 
-Four methods are served (issue #821): `ProfileTypes`, `LabelNames`, `LabelValues` and `Series`. Each is one handler bound at three paths:
+Five methods are served: `ProfileTypes`, `LabelNames`, `LabelValues` and `Series` (issue #821), and `SelectMergeStacktraces`, the merged flame graph (issue #823). Each is one handler bound at three paths:
 
 | Method | Native Connect path (`POST`) | Compat Connect path (`POST`, `PULSUS_COMPAT_ENDPOINTS=true`) | Native `GET` route and parameters |
 |---|---|---|---|
@@ -1583,6 +1583,7 @@ Four methods are served (issue #821): `ProfileTypes`, `LabelNames`, `LabelValues
 | `LabelNames` | `/api/profiles/v1/querier.v1.QuerierService/LabelNames` | `/querier.v1.QuerierService/LabelNames` | `GET\|POST /api/profiles/v1/labels` — `query` (repeated), `from`, `until` |
 | `LabelValues` | `/api/profiles/v1/querier.v1.QuerierService/LabelValues` | `/querier.v1.QuerierService/LabelValues` | `GET /api/profiles/v1/label/{name}/values` — `query` (repeated), `from`, `until` |
 | `Series` | `/api/profiles/v1/querier.v1.QuerierService/Series` | `/querier.v1.QuerierService/Series` | `GET\|POST /api/profiles/v1/series` — `match[]`, `label_names[]`, `from`, `until` |
+| `SelectMergeStacktraces` | `/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces` | `/querier.v1.QuerierService/SelectMergeStacktraces` | `GET /api/profiles/v1/merge` — `query` (`<type>{selector}`), `from`, `until`, `maxNodes`, `spanSelector[]`, `traceIdSelector[]` |
 
 Messages, with their JSON names (proto3 JSON: a field at its default is omitted, so an empty answer is `{}`; an `int64` is written as a string and read as a number or a string; a field is read by its JSON or its proto name; an unknown field is ignored):
 
@@ -1596,12 +1597,16 @@ Messages, with their JSON names (proto3 JSON: a field at its default is omitted,
 | `types.v1.LabelValuesResponse` | `names` |
 | `querier.v1.SeriesRequest` | `matchers`, `labelNames`, `start`, `end` |
 | `querier.v1.SeriesResponse` | `labelsSet`: `{labels: [{name, value}]}` |
+| `querier.v1.SelectMergeStacktracesRequest` | `profileTypeID`, `labelSelector`, `start`, `end`, `maxNodes`, `format` (a name or a number), `stackTraceSelector`: `{callSite: [{name}], goPgo}`, `profileIdSelector`, `traceIdSelector`, `spanSelector`; `async` is read and ignored |
+| `querier.v1.SelectMergeStacktracesResponse` | `flamegraph`: a `querier.v1.FlameGraph` |
+| `querier.v1.FlameGraph` | `names`, `levels`: `[{values}]`, `total`, `maxSelf`. Each level holds its nodes as `[x offset, total, self, name index]`, x offsets delta-encoded; `names[0]` is `total` |
 
 - **Window.** `start` and `end` are milliseconds. Both 0 on `ProfileTypes` is the last hour. A start older than 7 days (`PULSUS_PROFILES_MAX_QUERY_LOOKBACK`) is raised to it, and a window ending before it answers `{}` with no statement sent; a window longer than 24 hours (`PULSUS_PROFILES_MAX_QUERY_LENGTH`) after that is `invalid_argument`. A series is selected by the hours it holds a profile in, so a series whose last profile fell in the window's first or last hour, outside the window, may be listed.
 - **`GET` routes.** `from` and `until` are read as the reference reads them: digits are seconds, or milliseconds at 13 digits, microseconds at 16 and nanoseconds at 19, or a `YYYYMMDD` date; otherwise `now` plus an offset such as `now-1h`, every number and unit of it added, so `now-1h30m` is 90 minutes ago (the reference reads it as one hour). An absent one is 0. On `POST` the form body's pairs follow the query string's.
 - **Label names.** Without `allow-utf8-labelnames=true` as a parameter of an `Accept` value, `LabelNames` and `Series` answer only names matching `^[a-zA-Z_][a-zA-Z0-9_]*$`.
 - **`Series` with no matcher and `labelNames` `__name__`, `__profile_type__`, `__type__`, `service_name` and the reference's app label** answers, per type and service, the four pairs `__name__`, `__profile_type__`, `__type__` and `service_name`.
-- **Each request sends one statement** over `profile_series`, scoped to the tenant (`X-Scope-OrgID`, read first), or none for an empty window.
+- **Each request sends one statement**, scoped to the tenant (`X-Scope-OrgID`, read first), or none for an empty window: the four catalogue methods over `profile_series`; `SelectMergeStacktraces` over `profile_samples`, `profile_stacks` and `profile_series`, the merged tree computed in the database.
+- **`SelectMergeStacktraces`.** The merged tree is trimmed to `maxNodes` as the reference trims it: absent or 0 is `PULSUS_PROFILES_MAX_NODES_DEFAULT`, 8192 by default; above `PULSUS_PROFILES_MAX_NODES_MAX`, 1048576 by default, is `invalid_argument` `max flamegraph nodes limit <n> is greater than allowed <max>`, and negative is `invalid_argument` `max flamegraph nodes limit must be set (max allowed <max>)`. One difference, recorded in [reference-defects-we-do-not-copy.md](reference-defects-we-do-not-copy.md) §41: a function named `other` that survives the cut keeps its cut siblings' values. `spanSelector` and `traceIdSelector` together are `invalid_argument` `span_selector and trace_id_selector cannot be combined`. A span id is 16 hex digits (`invalid span id length: "<s>"`), a trace id 32 (`invalid trace id length: "<s>"`), a profile id a UUID (`invalid UUID length: <n>`, `invalid UUID format`). `stackTraceSelector.callSite` keeps the stacks that begin with those frames, root first; `goPgo` is read and not served yet. `format` `PROFILE_FORMAT_TREE`, `PROFILE_FORMAT_DOT` and `PROFILE_FORMAT_PPROF` are `unimplemented`, `profile format <NAME> is not served yet`; unspecified and `PROFILE_FORMAT_FLAMEGRAPH` answer the flame graph. An empty window answers the empty flame graph, `{"flamegraph":{"names":["total"],"levels":[{"values":["0","0","0","0"]}]}}`. `GET /api/profiles/v1/merge` answers the `FlameGraph` object itself; its `query` is the type up to the first `{` and the selector from it (`{}` when there is none), and a `maxNodes` that is not an integer is `invalid_argument` `invalid maxNodes "<v>"`.
 - **Connect.** Request `Content-Type` `application/proto` or `application/json` (with or without parameters); any other is `415` with `Accept-Post: application/json, application/proto`. `Content-Encoding: gzip` is read; another encoding is `unimplemented`. The answer is in the request's codec. The `GET` routes answer the JSON body.
 - **Errors** are `Content-Type: application/json`, body `{"code":"<code>","message":"<text>"}`, on every path:
 
@@ -1609,15 +1614,14 @@ Messages, with their JSON names (proto3 JSON: a field at its default is omitted,
 |---|---|---|
 | `invalid_argument` | `400` | an invalid `X-Scope-OrgID`, a bad body, selector or window, an empty `name`, a regex the database cannot compile |
 | `resource_exhausted` | `429` | a ceiling was reached: the message is `query_too_broad: <setting>` (`PULSUS_PROFILES_SCAN_BUDGET_ROWS`, `PULSUS_PROFILES_MAX_TREE_NODES`, `PULSUS_PROFILES_MAX_RESULT_BYTES`, `PULSUS_PROFILES_QUERY_MEMORY_BYTES`) |
-| `unimplemented` | `501` | an unknown `Content-Encoding` |
+| `unimplemented` | `501` | an unknown `Content-Encoding`; a `SelectMergeStacktraces` format not served yet |
 | `internal` | `500` | anything else |
 | `unavailable` | `503` | the database cannot be reached |
-| `deadline_exceeded` | `504` | `PULSUS_QUERY_TIMEOUT` passed: the message is `request timed out, decrease the duration of the request or add more label matchers (prefer exact match over regex match) to reduce the amount of data processed`. On the four `GET` routes the body ends with a newline and carries `X-Content-Type-Options: nosniff`, as the reference's HTTP handlers write it |
+| `deadline_exceeded` | `504` | `PULSUS_QUERY_TIMEOUT` passed: the message is `request timed out, decrease the duration of the request or add more label matchers (prefer exact match over regex match) to reduce the amount of data processed`. On the five `GET` routes the body ends with a newline and carries `X-Content-Type-Options: nosniff`, as the reference's HTTP handlers write it |
 
 Served by later parts:
 
 ```
-GET      /api/profiles/v1/merge           ?query=<type>{selector}&from=&until=   → merged flamegraph tree (JSON)
 GET      /api/profiles/v1/select_series   ?query=&from=&until=&step=             → time series of profile values
 GET      /api/profiles/v1/export          ?query=&from=&until=                   → merged pprof (binary)
 GET      /api/profiles/v1/stats                                                  → ingested-profile stats
@@ -1713,8 +1717,8 @@ When `PULSUS_AUTH_*` is set, the perimeter returns 401 to every unauthenticated 
 | `/api/v2/search/tags`, `/api/v2/search/tag/{tag}/values` | `/api/traces/v1/tags`, `/api/traces/v1/tag/{tag}/values` (native shape minus `truncated`) | M4 |
 | `/api/echo` | — (constant `echo` body) | M4 |
 | `/api/metrics/query_range`, `/api/metrics/query`, `/tempo/api/metrics/query_range`, `/tempo/api/metrics/query` | `/api/traces/v1/metrics/query_range`, `/api/traces/v1/metrics/query` | M4 |
-| `POST /querier.v1.QuerierService/ProfileTypes`, `POST /querier.v1.QuerierService/LabelNames`, `POST /querier.v1.QuerierService/LabelValues`, `POST /querier.v1.QuerierService/Series` (Connect protocol, served, §5) | `/api/profiles/v1/querier.v1.QuerierService/ProfileTypes`, `/api/profiles/v1/querier.v1.QuerierService/LabelNames`, `/api/profiles/v1/querier.v1.QuerierService/LabelValues`, `/api/profiles/v1/querier.v1.QuerierService/Series` | M5 |
-| `POST /querier.v1.QuerierService/{SelectMergeStacktraces,SelectSeries,SelectMergeProfile,GetProfileStats,AnalyzeQuery}`, `POST /settings.v1.SettingsService/Get` (Connect protocol, later parts) | `/api/profiles/v1/*` | M5 |
+| `POST /querier.v1.QuerierService/ProfileTypes`, `POST /querier.v1.QuerierService/LabelNames`, `POST /querier.v1.QuerierService/LabelValues`, `POST /querier.v1.QuerierService/Series`, `POST /querier.v1.QuerierService/SelectMergeStacktraces` (Connect protocol, served, §5) | `/api/profiles/v1/querier.v1.QuerierService/ProfileTypes`, `/api/profiles/v1/querier.v1.QuerierService/LabelNames`, `/api/profiles/v1/querier.v1.QuerierService/LabelValues`, `/api/profiles/v1/querier.v1.QuerierService/Series`, `/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces` | M5 |
+| `POST /querier.v1.QuerierService/{SelectSeries,SelectMergeProfile,GetProfileStats,AnalyzeQuery}`, `POST /settings.v1.SettingsService/Get` (Connect protocol, later parts) | `/api/profiles/v1/*` | M5 |
 | `/pyroscope/render`, `/pyroscope/render-diff` | `/api/profiles/v1/render{,-diff}` | M5 |
 | `/loki/api/v1/rules[...]`, `/api/prom/rules[...]`, `/prometheus/api/v1/rules` | `/api/rules/v1/*` | M7 |
 

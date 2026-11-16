@@ -4,9 +4,12 @@
 //! native Connect path `/api/profiles/v1/querier.v1.QuerierService/<M>`,
 //! and the native `GET` route. Every request sends one statement over the
 //! series table, or none when its window ends before the lookback floor.
+//! Issue #823: `SelectMergeStacktraces`, the merged flame graph, at the two
+//! Connect paths and `GET /api/profiles/v1/merge`, in one statement.
 
 pub(crate) mod connect;
 mod engine;
+mod merge;
 pub(crate) mod routes;
 
 use axum::Router;
@@ -14,8 +17,8 @@ use axum::routing::{get, post};
 
 use crate::app::AppState;
 
-/// The native surface: the four Connect paths under `/api/profiles/v1`
-/// and the four `GET` routes. `.route`-only with literal paths.
+/// The native surface: the Connect paths under `/api/profiles/v1` and the
+/// `GET` routes. `.route`-only with literal paths.
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -34,6 +37,10 @@ pub(crate) fn router() -> Router<AppState> {
             "/api/profiles/v1/querier.v1.QuerierService/Series",
             post(routes::series),
         )
+        .route(
+            "/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces",
+            post(merge::select_merge_stacktraces),
+        )
         .route("/api/profiles/v1/types", get(routes::types_get))
         .route(
             "/api/profiles/v1/labels",
@@ -47,9 +54,10 @@ pub(crate) fn router() -> Router<AppState> {
             "/api/profiles/v1/series",
             get(routes::series_get).post(routes::series_get),
         )
+        .route("/api/profiles/v1/merge", get(merge::merge_get))
 }
 
-/// The compat surface: the four Connect paths at the root. Mounting it is
+/// The compat surface: the Connect paths at the root. Mounting it is
 /// `crate::compat::apply_aliases`'s job.
 pub(crate) fn compat_router() -> Router<AppState> {
     Router::new()
@@ -66,6 +74,10 @@ pub(crate) fn compat_router() -> Router<AppState> {
             post(routes::label_values),
         )
         .route("/querier.v1.QuerierService/Series", post(routes::series))
+        .route(
+            "/querier.v1.QuerierService/SelectMergeStacktraces",
+            post(merge::select_merge_stacktraces),
+        )
 }
 
 #[cfg(test)]

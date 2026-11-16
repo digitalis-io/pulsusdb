@@ -1082,6 +1082,9 @@ docs/reference-defects-we-do-not-copy.md	pkg/logql/range_vector.go:195	not_in_th
 docs/reference-defects-we-do-not-copy.md	pkg/logql/range_vector.go:286-353	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/logql/range_vector.go:355	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/logql/shardmapper.go:476-534	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/model/stacktraces.go:255-273	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/model/stacktraces.go:355-358	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/model/tree.go:345-366	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/ingester_querier.go:68	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/batch.go:9-38	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/merge.go:30-48	not_in_this_repository

@@ -132,6 +132,64 @@ pub struct LabelValuesResponse {
     pub names: Vec<String>,
 }
 
+/// Issue #823: the samples a merge keeps by their stack. Root at
+/// `call_site[0]`.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StackTraceSelector {
+    #[prost(message, repeated, tag = "1")]
+    #[serde(
+        rename = "callSite",
+        alias = "call_site",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub call_site: Vec<Location>,
+    #[prost(message, optional, tag = "2")]
+    #[serde(
+        rename = "goPgo",
+        alias = "go_pgo",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub go_pgo: Option<GoPgo>,
+}
+
+/// One frame of a call site.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Location {
+    #[prost(string, tag = "1")]
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
+}
+
+/// `GoPGO`: read, and not served yet (#828).
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoPgo {
+    #[prost(uint32, tag = "1")]
+    #[serde(
+        rename = "keepLocations",
+        alias = "keep_locations",
+        skip_serializing_if = "is_zero_u32"
+    )]
+    pub keep_locations: u32,
+    #[prost(bool, tag = "2")]
+    #[serde(
+        rename = "aggregateCallees",
+        alias = "aggregate_callees",
+        skip_serializing_if = "is_false"
+    )]
+    pub aggregate_callees: bool,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 /// A profile annotation (issue #817). The push route drops the client's.
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
