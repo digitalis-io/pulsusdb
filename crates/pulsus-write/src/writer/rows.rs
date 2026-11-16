@@ -3477,3 +3477,95 @@ mod trace_landing_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// The profiles landing row
+// ---------------------------------------------------------------------
+
+/// One `profile_landing` row.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct ProfileLandingRow {
+    pub org_id: Arc<str>,
+    pub received_ms: i64,
+    pub kind: u8,
+    pub type_id: Arc<str>,
+    pub stack_id: u128,
+    pub location_id: u128,
+    pub profile_id: (u64, u64),
+}
+
+/// One profiles landing row's own inline footprint.
+pub const PROFILE_LANDING_ROW_SLOT_BYTES: u64 = std::mem::size_of::<ProfileLandingRow>() as u64;
+
+impl ProfileLandingRow {
+    pub const KIND_SAMPLE: u8 = 0;
+    pub const KIND_STACK: u8 = 1;
+    pub const KIND_SERIES: u8 = 2;
+    pub const KIND_ENTRY: u8 = 3;
+    pub const KIND_LOCATION: u8 = 4;
+
+    /// A profile id's 16 bytes as the `UUID` column's two `UInt64` halves.
+    pub fn profile_id_of(_id: &[u8; 16]) -> (u64, u64) {
+        (0, 0)
+    }
+}
+
+#[cfg(test)]
+mod profile_landing_tests {
+    use super::*;
+
+    /// **W8.** The insert's column list is `profile_landing`'s 41 columns
+    /// less the ten upload columns, in the table's own order, so the server
+    /// fills those ten with their type defaults.
+    #[test]
+    fn the_profile_landing_row_is_the_tables_columns_less_the_upload_ten() {
+        let names = <ProfileLandingRow as pulsus_clickhouse::Row>::COLUMN_NAMES;
+        assert_eq!(
+            names,
+            &[
+                "org_id",
+                "received_ms",
+                "kind",
+                "type_id",
+                "service",
+                "fingerprint",
+                "timestamp_ns",
+                "stack_id",
+                "value",
+                "span_id",
+                "trace_id",
+                "node_ids",
+                "names",
+                "location_ids",
+                "location_id",
+                "mapping_file",
+                "mapping_build_id",
+                "mapping_start",
+                "mapping_limit",
+                "mapping_offset",
+                "address",
+                "line_functions",
+                "line_system_names",
+                "line_files",
+                "line_start_lines",
+                "line_numbers",
+                "labels",
+                "profile_id",
+                "duration_ns",
+                "annotation_keys",
+                "annotation_values",
+            ][..]
+        );
+    }
+
+    /// **W9.** A profile id is the `UUID` column's two big-endian `UInt64`
+    /// halves, the pair the client checks the column against.
+    #[test]
+    fn profile_id_serialises_as_the_uuid_u64_pair() {
+        let id: [u8; 16] = std::array::from_fn(|i| i as u8);
+        assert_eq!(
+            ProfileLandingRow::profile_id_of(&id),
+            (0x0001_0203_0405_0607, 0x0809_0a0b_0c0d_0e0f)
+        );
+    }
+}

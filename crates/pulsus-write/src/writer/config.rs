@@ -147,6 +147,17 @@ pub struct WriterRuntime {
     /// admitted push is strictly under the count the server would end a
     /// block at.
     pub trace_landing_max_rows: u64,
+    /// `PULSUS_PROFILE_LANDING_RETRIES`: resends of a failed profiles
+    /// landing insert. [`Self::landing_budget`] is the wall-clock bound on
+    /// the whole loop; whichever binds first ends it.
+    pub profile_landing_retries: u32,
+    /// `PULSUS_PROFILE_LANDING_INSERTERS`: insert workers on the profiles
+    /// landing queue, so the landing inserts in flight at once.
+    pub profile_landing_inserters: u32,
+    /// `PULSUS_PROFILE_LANDING_MAX_ROWS`: the per-push profiles landing row
+    /// ceiling, counted over **all five landed kinds**, and the value both
+    /// row limits every profiles landing insert pins carry.
+    pub profile_landing_max_rows: u64,
     /// `PULSUS_LANDING_BATCH_MS` (issue #494 part 2): how long a landing
     /// worker keeps adding queued log or trace blocks to the batch it is
     /// forming, counted from its take of the batch's first block. Zero sends
@@ -189,6 +200,9 @@ impl WriterRuntime {
             trace_landing_retries: cfg.trace_landing_retries,
             trace_landing_inserters: cfg.trace_landing_inserters,
             trace_landing_max_rows: cfg.trace_landing_max_rows,
+            profile_landing_retries: cfg.profile_landing_retries,
+            profile_landing_inserters: cfg.profile_landing_inserters,
+            profile_landing_max_rows: cfg.profile_landing_max_rows,
             landing_batch: Duration::from_millis(cfg.landing_batch_ms),
             #[cfg(test)]
             test_lapse: Duration::ZERO,

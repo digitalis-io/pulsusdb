@@ -325,6 +325,24 @@ pub const TRACE_LANDING_MAX_ROWS_FLOOR: u64 = 1_000;
 /// See [`TRACE_LANDING_MAX_ROWS_FLOOR`].
 pub const TRACE_LANDING_MAX_ROWS_CEILING: u64 = 10_000_000;
 
+/// `writer.profile_landing_retries` — resends of a failed profiles landing
+/// insert, [`TRACE_LANDING_RETRIES_CEILING`]'s rule.
+pub const PROFILE_LANDING_RETRIES_CEILING: u32 = 10;
+
+/// `writer.profile_landing_inserters` — insert workers on the profiles
+/// landing queue, [`TRACE_LANDING_INSERTERS_FLOOR`]'s rule.
+pub const PROFILE_LANDING_INSERTERS_FLOOR: u32 = 1;
+/// See [`PROFILE_LANDING_INSERTERS_FLOOR`].
+pub const PROFILE_LANDING_INSERTERS_CEILING: u32 = 64;
+
+/// `writer.profile_landing_max_rows` — the per-push profiles landing row
+/// ceiling, counted over all five landed kinds, and the
+/// `max_insert_block_size` every profiles landing insert pins. The range is
+/// [`TRACE_LANDING_MAX_ROWS_FLOOR`]'s, for the reason given there.
+pub const PROFILE_LANDING_MAX_ROWS_FLOOR: u64 = 1_000;
+/// See [`PROFILE_LANDING_MAX_ROWS_FLOOR`].
+pub const PROFILE_LANDING_MAX_ROWS_CEILING: u64 = 10_000_000;
+
 /// `writer.landing_batch_ms` — how long a landing worker forms a log or
 /// trace batch (issue #494 part 2). Ten seconds at most: a sync push waits up
 /// to this long before its insert begins, inside its 120 s landing budget.
@@ -1605,11 +1623,14 @@ mod tests {
         assert_eq!(d.writer.trace_landing_retries, 3);
         assert_eq!(d.writer.trace_landing_inserters, 4);
         assert_eq!(d.writer.trace_landing_max_rows, 1_048_576);
+        assert_eq!(d.writer.profile_landing_retries, 3);
+        assert_eq!(d.writer.profile_landing_inserters, 4);
+        assert_eq!(d.writer.profile_landing_max_rows, 1_048_576);
         assert!(validate(&d).is_ok());
 
         // (field, setter, bad values, good values)
         type Set = fn(&mut Config, u64);
-        let cases: [(&str, Set, Vec<u64>, Vec<u64>); 5] = [
+        let cases: [(&str, Set, Vec<u64>, Vec<u64>); 8] = [
             (
                 "trace_dedup_window",
                 |c, v| c.trace_dedup_window = v,
@@ -1647,6 +1668,33 @@ mod tests {
                     TRACE_LANDING_MAX_ROWS_CEILING + 1,
                 ],
                 vec![TRACE_LANDING_MAX_ROWS_FLOOR, TRACE_LANDING_MAX_ROWS_CEILING],
+            ),
+            (
+                "writer.profile_landing_retries",
+                |c, v| c.writer.profile_landing_retries = v as u32,
+                vec![u64::from(PROFILE_LANDING_RETRIES_CEILING) + 1],
+                vec![0, u64::from(PROFILE_LANDING_RETRIES_CEILING)],
+            ),
+            (
+                "writer.profile_landing_inserters",
+                |c, v| c.writer.profile_landing_inserters = v as u32,
+                vec![0, u64::from(PROFILE_LANDING_INSERTERS_CEILING) + 1],
+                vec![
+                    u64::from(PROFILE_LANDING_INSERTERS_FLOOR),
+                    u64::from(PROFILE_LANDING_INSERTERS_CEILING),
+                ],
+            ),
+            (
+                "writer.profile_landing_max_rows",
+                |c, v| c.writer.profile_landing_max_rows = v,
+                vec![
+                    PROFILE_LANDING_MAX_ROWS_FLOOR - 1,
+                    PROFILE_LANDING_MAX_ROWS_CEILING + 1,
+                ],
+                vec![
+                    PROFILE_LANDING_MAX_ROWS_FLOOR,
+                    PROFILE_LANDING_MAX_ROWS_CEILING,
+                ],
             ),
         ];
 
