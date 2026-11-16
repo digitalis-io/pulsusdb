@@ -6777,3 +6777,60 @@ fn the_documents_say_how_a_log_or_trace_push_is_batched() {
         "the drawing's first text line is the banner"
     );
 }
+
+/// **S-D (issue #814 part B): in `profile_landing`, exactly the ten upload
+/// columns carry a `DEFAULT`**, each the expression below, in both modes.
+/// The profile writer's row leaves those ten out, and the client refuses a
+/// struct that leaves out a column with no default, so a missing one refuses
+/// every profile insert.
+#[test]
+fn the_profile_landing_upload_columns_carry_defaults() {
+    let want: [(&str, &str); 10] = [
+        (
+            "upload_id",
+            "DEFAULT toUUID('00000000-0000-0000-0000-000000000000')",
+        ),
+        ("upload_name", "DEFAULT ''"),
+        ("uploaded_at", "DEFAULT 0"),
+        ("type_ordinal", "DEFAULT 0"),
+        ("is_type", "DEFAULT 0"),
+        ("upload_format", "DEFAULT ''"),
+        ("display_name", "DEFAULT ''"),
+        ("spy_name", "DEFAULT ''"),
+        ("sample_rate", "DEFAULT 0"),
+        ("units", "DEFAULT ''"),
+    ];
+    for (what, ctx) in [("single-node", single()), ("clustered", clustered())] {
+        let stmts = rendered_statements(&ctx);
+        let create = stmts
+            .iter()
+            .find(|s| {
+                s.trim_start()
+                    .starts_with("CREATE TABLE IF NOT EXISTS pulsus.profile_landing")
+                    && s.contains("received_ms Int64")
+            })
+            .unwrap_or_else(|| panic!("{what}: no profile_landing table"));
+        let defaulted: Vec<(String, String)> = create
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains(" DEFAULT "))
+            .map(|l| {
+                let name = l.split_whitespace().next().unwrap_or("").to_string();
+                let from = l.find("DEFAULT ").expect("contains DEFAULT");
+                let rest = &l[from..];
+                let end = rest
+                    .find(" CODEC(")
+                    .unwrap_or_else(|| rest.trim_end_matches(',').len());
+                (name, rest[..end].to_string())
+            })
+            .collect();
+        let want: Vec<(String, String)> = want
+            .iter()
+            .map(|(n, d)| (n.to_string(), d.to_string()))
+            .collect();
+        assert_eq!(
+            defaulted, want,
+            "{what}: the columns of profile_landing that carry a DEFAULT"
+        );
+    }
+}
