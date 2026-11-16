@@ -287,14 +287,15 @@ pub enum Surface {
     /// `/admin/…` (issue #746) — always mounted, behind the admin pair, HTML
     /// or JSON.
     Admin,
-    /// The profiles query API's four `GET` routes (issue #821, docs/api.md
-    /// §5): `types`, `labels`, `label/{name}/values` and `series`. Success is
+    /// The profiles query API's six `GET` routes (issue #821, docs/api.md
+    /// §5): `types`, `labels`, `label/{name}/values` and `series`, `merge`
+    /// (#823) and `select_series` (#824). Success is
     /// the method's JSON response message; against this suite's empty
     /// databases the base window ends before the lookback floor, so the
     /// body is `{}` and nothing is read. Errors are the Connect JSON body
     /// `{"code","message"}`.
     ProfilesQuery,
-    /// The profiles query API's eight Connect paths (issue #821): the four
+    /// The profiles query API's twelve Connect paths (issue #821): the six
     /// methods at `/querier.v1.QuerierService/<M>` (compat) and
     /// `/api/profiles/v1/querier.v1.QuerierService/<M>` (native), `POST`
     /// only. The base request is a JSON body; success and errors as
@@ -3058,6 +3059,40 @@ static MANIFEST: &[RouteSpec] = &[
     },
     RouteSpec {
         path: "/querier.v1.QuerierService/SelectMergeStacktraces",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
+    // -- Profiles time series (issue #824, docs/api.md §5) ---------------
+    RouteSpec {
+        path: "/api/profiles/v1/select_series",
+        methods: &[Method::Get],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_GET_BASE_QUERY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/querier.v1.QuerierService/SelectSeries",
         methods: &[Method::Post],
         surface: Surface::ProfilesConnect,
         gate: Gate::CompatAndReader,

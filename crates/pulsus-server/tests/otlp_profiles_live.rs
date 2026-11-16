@@ -67,6 +67,18 @@ fn request(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> (u16, Vec<u8>) {
+    let (status, _, body) = request_with_id(port, method, path, headers, body);
+    (status, body)
+}
+
+/// `(status, x-pulsus-query-id, body)` of one HTTP/1.1 request.
+fn request_with_id(
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, Option<String>, Vec<u8>) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -87,12 +99,19 @@ fn request(
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .expect("a header end");
-    let status = String::from_utf8_lossy(&buf[..split])
+    let head = String::from_utf8_lossy(&buf[..split]).into_owned();
+    let status = head
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
         .expect("a status");
-    (status, buf[split + 4..].to_vec())
+    let query_id = head.lines().find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim()
+            .eq_ignore_ascii_case("x-pulsus-query-id")
+            .then(|| v.trim().to_owned())
+    });
+    (status, query_id, buf[split + 4..].to_vec())
 }
 
 /// The binary in `all` mode over `db`, one push per landing insert.
@@ -293,7 +312,7 @@ async fn an_otlp_profiles_push_is_stored_by_one_insert_and_no_read() {
 
     let body = r().encode_to_vec();
     let t0 = server_now(&client).await;
-    let (status, answer) = request(
+    let (status, query_id, answer) = request_with_id(
         PORT,
         "POST",
         "/v1development/profiles",
@@ -305,6 +324,7 @@ async fn an_otlp_profiles_push_is_stored_by_one_insert_and_no_read() {
     );
     let t1 = server_now(&client).await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let query_id = query_id.expect("the answer names its request id");
 
     let none = QuerySettings::new();
     let series = strings(
@@ -344,15 +364,22 @@ async fn an_otlp_profiles_push_is_stored_by_one_insert_and_no_read() {
         .execute("SYSTEM FLUSH LOGS", &none, Idempotency::Idempotent)
         .await
         .expect("flush logs");
+    // A statement is the push's when it carries the push's request id as
+    // its log comment or names a profile table of this test's database. The
+    // database's refreshable views (the rollup levels, the service graph)
+    // run on their own timers and write only their own tables, so they are
+    // not counted as the push's; nor are the test's clock reads.
     let statements = strings(
         &client,
         &format!(
             "SELECT concat(query_kind, '|', toString(has(tables, '{db}.profile_landing')), '|', query) AS s \
              FROM system.query_log \
-             WHERE type != 'QueryStart' AND current_database = '{db}' \
+             WHERE type != 'QueryStart' \
                AND log_comment != '{PROBE}' \
+               AND (log_comment = '{id}' OR arrayExists(t -> startsWith(t, '{db}.profile_'), tables)) \
                AND event_time_microseconds BETWEEN toDateTime64('{t0}', 6) AND toDateTime64('{t1}', 6)",
             db = db.name(),
+            id = query_id,
         ),
         &none,
     )

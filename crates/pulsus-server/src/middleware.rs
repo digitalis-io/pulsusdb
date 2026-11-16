@@ -62,7 +62,7 @@ pub(crate) fn cors_layer(config: &Config) -> Result<CorsLayer, ServeError> {
 pub(crate) const DEADLINE_BARE_PATHS: &[&str] = &["/api/v1/write"];
 
 /// Issue #821: the profiles Connect paths, named one by one (#823 adds
-/// `SelectMergeStacktraces`'s two). They
+/// `SelectMergeStacktraces`'s two, #824 `SelectSeries`'s two). They
 /// answer a deadline with the reference's Connect error; another path under
 /// either service prefix keeps the class it had. Source-scanned by
 /// `tests/deadline_partition.rs` and compared with the route manifest.
@@ -77,10 +77,12 @@ pub(crate) const DEADLINE_CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/Series",
     "/querier.v1.QuerierService/SelectMergeStacktraces",
     "/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces",
+    "/querier.v1.QuerierService/SelectSeries",
+    "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
 ];
 
 /// Issue #821: the profiles `GET` routes, `{name}` one path segment (#823
-/// adds `/merge`).
+/// adds `/merge`, #824 `/select_series`).
 /// They answer a deadline as the reference's HTTP read handlers answer one
 /// ([`DeadlineClass::ProfilesHttp`]). Source-scanned like
 /// [`DEADLINE_CONNECT_PATHS`].
@@ -90,6 +92,7 @@ pub(crate) const DEADLINE_PROFILES_HTTP_PATHS: &[&str] = &[
     "/api/profiles/v1/label/{name}/values",
     "/api/profiles/v1/series",
     "/api/profiles/v1/merge",
+    "/api/profiles/v1/select_series",
 ];
 
 /// `path` matches `template`, whose one `{name}` is a non-empty segment.
@@ -522,8 +525,8 @@ mod tests {
         }
     }
 
-    /// C6 (issue #821, #823): the ten Connect paths answer a deadline as a
-    /// Connect error, the five `GET` routes (`{name}` as `env`) as the
+    /// C6 (issue #821, #823, #824): the twelve Connect paths answer a
+    /// deadline as a Connect error, the six `GET` routes (`{name}` as `env`) as the
     /// reference's HTTP handlers do; the profiles ingest path keeps the bare
     /// `408`.
     #[test]
@@ -539,6 +542,8 @@ mod tests {
             "/api/profiles/v1/querier.v1.QuerierService/Series",
             "/querier.v1.QuerierService/SelectMergeStacktraces",
             "/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces",
+            "/querier.v1.QuerierService/SelectSeries",
+            "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::Connect, "{path}");
         }
@@ -548,6 +553,7 @@ mod tests {
             "/api/profiles/v1/label/env/values",
             "/api/profiles/v1/series",
             "/api/profiles/v1/merge",
+            "/api/profiles/v1/select_series",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::ProfilesHttp, "{path}");
         }
@@ -557,15 +563,15 @@ mod tests {
         );
     }
 
-    /// Issue #821 review note 1: the class names the eight Connect paths
+    /// Issue #821 review note 1: the class names the twelve Connect paths
     /// exactly. Another method under either service prefix, and a deeper
     /// path under the values route, keep the class they had.
     #[test]
     fn an_unrelated_path_under_a_profiles_prefix_keeps_its_class() {
         for path in [
-            "/querier.v1.QuerierService/SelectSeries",
+            "/querier.v1.QuerierService/SelectMergeProfile",
             "/querier.v1.QuerierService/LabelNamesX",
-            "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
+            "/api/profiles/v1/querier.v1.QuerierService/SelectMergeProfile",
             "/api/profiles/v1/querier.v1.QuerierService/",
             "/api/profiles/v1/render",
             "/api/profiles/v1/label/a/b/values",

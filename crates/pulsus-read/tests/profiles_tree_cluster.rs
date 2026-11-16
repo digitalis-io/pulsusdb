@@ -234,6 +234,7 @@ async fn the_merged_tree_merges_both_shards_in_one_statement() {
     let config = ProfilesReadConfig {
         series_table: "profile_series_dist".to_string(),
         samples_table: "profile_samples_dist".to_string(),
+        entries_table: "profile_entries_dist".to_string(),
         dist_suffix: "_dist".to_string(),
         limits: WindowLimits::default(),
         scan_budget_rows: 50_000_000,
