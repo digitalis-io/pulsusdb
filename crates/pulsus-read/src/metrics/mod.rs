@@ -126,6 +126,7 @@ pub(crate) use dispatch::regex_rejection_detail;
 /// is on the type itself.
 pub(crate) use series_where::PromqlRe2Fallback;
 pub(crate) use series_where::profile_series;
+pub(crate) use series_where::profile_series_where;
 
 pub use exec::{
     FetchProbe, MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, StatementProbe,

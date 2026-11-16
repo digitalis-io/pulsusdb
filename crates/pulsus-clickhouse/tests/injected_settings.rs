@@ -94,6 +94,8 @@ const INJECTED_SETTINGS: &[&str] = &[
     "max_query_size",
     "max_recursive_cte_evaluation_depth",
     "max_result_bytes",
+    // Issue #821: the profiles reads' result row cap.
+    "max_result_rows",
     "max_rows_in_distinct",
     "max_rows_in_set",
     // Issue #501 part 2: the exemplar read's row cap, which decides whether

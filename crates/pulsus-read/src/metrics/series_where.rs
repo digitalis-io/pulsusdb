@@ -46,7 +46,7 @@
 //!
 //! # Boundary inventory
 //!
-//! Nineteen declarations carry a visibility modifier, pinned by the in-file
+//! Twenty declarations carry a visibility modifier, pinned by the in-file
 //! census test `the_boundary_inventory_is_pinned` because a
 //! hand-maintained inventory here was wrong once (review round 3 found
 //! it listing three of the six). That pin reads `pub`-prefixed lines and
@@ -69,6 +69,8 @@
 //! * [`SeriesWhere::label_values`] — `/label/{name}/values` over the label
 //!   index, whole (issue #635).
 //! * [`profile_series`] — the profiles series subquery, whole (issue #820).
+//! * [`profile_series_where`] — that subquery without its `SELECT` line, for
+//!   the catalogue reads' own `SELECT` (issue #821).
 //! * [`SeriesTables`] — the tables a read names (`pub(super)`, with four
 //!   `pub(super)` fields): table names, nothing renderable.
 //! * [`Lookup`] — `activity`'s input (`pub(super)`), with three
@@ -134,6 +136,7 @@
 //! seam's bare literal.
 
 use crate::logql::escape::{ch_regex_anchored_promql_re2, ch_string};
+use pulsus_model::LabelMatcher as Matcher;
 
 use super::TenantSql;
 use super::matcher::{DataWindow, LabelMatcher, MatchOp, matches_empty};
@@ -481,11 +484,22 @@ impl SeriesWhere {
 /// matcher of `ms` selects, with the compile probe for every regex. One
 /// line, so the census below reads the whole declaration.
 pub(crate) fn profile_series(t: &Tenant, w: DataWindow, from: &str, ms: &[LabelMatcher]) -> String {
+    format!(
+        "SELECT fingerprint\n{}",
+        profile_series_where(t, w, from, ms)
+    )
+}
+
+/// Issue #821: [`profile_series`] without its `SELECT` line — the `FROM`,
+/// the `WHERE` and every matcher and probe line — under which a catalogue
+/// read puts its own `SELECT`.
+/// One line, as [`profile_series`], so the census reads the whole
+/// declaration; `Matcher` is `LabelMatcher`, aliased to fit it.
+pub(crate) fn profile_series_where(t: &Tenant, w: DataWindow, f: &str, ms: &[Matcher]) -> String {
     let (first, _) = day_and_hour(w.start_ms);
     let (last, _) = day_and_hour(w.end_ms);
     let mut lines = vec![
-        "SELECT fingerprint".to_string(),
-        format!("FROM {from}"),
+        format!("FROM {f}"),
         format!(
             "WHERE org_id = {} AND day BETWEEN '{}' AND '{}'",
             t.sql_literal(),
@@ -898,6 +912,7 @@ mod tests {
                 "pub(super) fn label_keys(&self, t: SeriesTables<'_>) -> String {",
                 "pub(super) fn label_values(&self, key: &str, t: SeriesTables<'_>) -> String {",
                 "pub(crate) fn profile_series(t: &Tenant, w: DataWindow, from: &str, ms: &[LabelMatcher]) -> String {",
+                "pub(crate) fn profile_series_where(t: &Tenant, w: DataWindow, f: &str, ms: &[Matcher]) -> String {",
                 "pub fn anchored_re2_literal_for_test(pattern: &str) -> String {",
             ],
             "series_where.rs declarations drifted from this test's list"
@@ -944,6 +959,7 @@ mod tests {
                 "SeriesWhere::label_keys",
                 "SeriesWhere::label_values",
                 "profile_series",
+                "profile_series_where",
                 "SeriesTables",
                 "Lookup",
                 "MatcherTarget",

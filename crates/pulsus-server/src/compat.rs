@@ -28,6 +28,7 @@ pub(crate) fn apply_aliases(router: Router<AppState>, cfg: &Config) -> Router<Ap
     if modes::mounted(cfg).contains(&Subsystem::Reader) {
         router = router.merge(crate::logs_api::compat_router());
         router = router.merge(crate::traces_api::compat_router());
+        router = router.merge(crate::profiles_api::compat_router());
     }
     // The §8.2 WRITER-side compat receivers — the Loki push receiver
     // (issue #77) and the Zipkin v2 JSON trace receiver (issue #75) — mount

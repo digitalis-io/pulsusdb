@@ -675,6 +675,19 @@ pub struct ReaderConfig {
     /// Issue #778: the percent of `read_cache_bytes` past which a tenant's answers
     /// are evicted first; an answer larger than it is not kept. `1..=100` (validated).
     pub read_cache_tenant_share: u8,
+    /// Issue #821: the longest window a profiles query may cover. > 0.
+    pub profiles_max_query_length: HumanDuration,
+    /// Issue #821: how far back a profiles query may reach; a window ending
+    /// before it answers empty. > 0.
+    pub profiles_max_query_lookback: HumanDuration,
+    /// Issue #821: `max_rows_to_read` on every profiles read. >= 1.
+    pub profiles_scan_budget_rows: u64,
+    /// Issue #821: `max_result_rows` on every profiles read. >= 1.
+    pub profiles_max_tree_nodes: u64,
+    /// Issue #821: `max_result_bytes` on every profiles read. >= 1.
+    pub profiles_max_result_bytes: u64,
+    /// Issue #821: `max_memory_usage` on every profiles read. >= 1.
+    pub profiles_query_memory_bytes: u64,
 }
 
 impl Default for ReaderConfig {
@@ -717,6 +730,12 @@ impl Default for ReaderConfig {
             tail_catchup_slice: HumanDuration(Duration::from_secs(60)),
             read_cache_bytes: ByteSize(256 * 1024 * 1024),
             read_cache_tenant_share: 50,
+            profiles_max_query_length: HumanDuration(Duration::from_secs(24 * 3_600)),
+            profiles_max_query_lookback: HumanDuration(Duration::from_secs(7 * 86_400)),
+            profiles_scan_budget_rows: 50_000_000,
+            profiles_max_tree_nodes: 4_194_304,
+            profiles_max_result_bytes: 268_435_456,
+            profiles_query_memory_bytes: 4_294_967_296,
         }
     }
 }

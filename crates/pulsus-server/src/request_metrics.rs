@@ -77,6 +77,14 @@ pub(crate) const ROUTE_TEMPLATES: &[&str] = &[
     "/api/logs/v1/volume",
     "/api/metrics/query",
     "/api/metrics/query_range",
+    "/api/profiles/v1/label/{name}/values",
+    "/api/profiles/v1/labels",
+    "/api/profiles/v1/querier.v1.QuerierService/LabelNames",
+    "/api/profiles/v1/querier.v1.QuerierService/LabelValues",
+    "/api/profiles/v1/querier.v1.QuerierService/ProfileTypes",
+    "/api/profiles/v1/querier.v1.QuerierService/Series",
+    "/api/profiles/v1/series",
+    "/api/profiles/v1/types",
     "/api/search",
     "/api/search/tag/{tag}/values",
     "/api/search/tags",
@@ -123,6 +131,10 @@ pub(crate) const ROUTE_TEMPLATES: &[&str] = &[
     "/loki/api/v1/series",
     "/loki/api/v1/tail",
     "/metrics",
+    "/querier.v1.QuerierService/LabelNames",
+    "/querier.v1.QuerierService/LabelValues",
+    "/querier.v1.QuerierService/ProfileTypes",
+    "/querier.v1.QuerierService/Series",
     "/ready",
     "/tempo/api/metrics/query",
     "/tempo/api/metrics/query_range",
@@ -599,7 +611,7 @@ mod tests {
             ROUTE_TEMPLATES.windows(2).all(|w| w[0] < w[1]),
             "{ROUTE_TEMPLATES:?}"
         );
-        assert_eq!(ROUTE_TEMPLATES.len(), 80);
+        assert_eq!(ROUTE_TEMPLATES.len(), 92);
         assert!(
             ROUTE_TEMPLATES
                 .iter()

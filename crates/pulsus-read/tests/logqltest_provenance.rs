@@ -2127,6 +2127,11 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // `profile_series`, rendered by the leaf like the others.
     ("pulsus-read/src/metrics/series_where.rs", 27),
     ("pulsus-read/src/metrics/sql.rs", 24),
+    // Issue #821: the catalogue reads' legacy label-name rule, in the label
+    // names and series statements and their two test expectations. A fixed
+    // pattern, never user text; a selector's regex still renders in the
+    // leaf.
+    ("pulsus-read/src/profiles/catalogue.rs", 4),
     // Issue #820: test expectations only — the series subquery's regex and
     // probe lines in S1 and S8, and S1's text again in T2. No renderer.
     ("pulsus-read/src/profiles/selector.rs", 4),
@@ -2150,7 +2155,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 130;
+const MATCH_RENDER_TOTAL: usize = 134;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.

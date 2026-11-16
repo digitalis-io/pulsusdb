@@ -453,6 +453,36 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.traceql_tag_lookback.0 == Duration::from_secs(6 * 3_600),
     },
     Row {
+        var: "PULSUS_PROFILES_MAX_QUERY_LENGTH",
+        value: "2h",
+        check: |c| c.reader.profiles_max_query_length.0 == Duration::from_secs(2 * 3_600),
+    },
+    Row {
+        var: "PULSUS_PROFILES_MAX_QUERY_LOOKBACK",
+        value: "3d",
+        check: |c| c.reader.profiles_max_query_lookback.0 == Duration::from_secs(3 * 86_400),
+    },
+    Row {
+        var: "PULSUS_PROFILES_SCAN_BUDGET_ROWS",
+        value: "12345",
+        check: |c| c.reader.profiles_scan_budget_rows == 12_345,
+    },
+    Row {
+        var: "PULSUS_PROFILES_MAX_TREE_NODES",
+        value: "4096",
+        check: |c| c.reader.profiles_max_tree_nodes == 4_096,
+    },
+    Row {
+        var: "PULSUS_PROFILES_MAX_RESULT_BYTES",
+        value: "65536",
+        check: |c| c.reader.profiles_max_result_bytes == 65_536,
+    },
+    Row {
+        var: "PULSUS_PROFILES_QUERY_MEMORY_BYTES",
+        value: "2097152",
+        check: |c| c.reader.profiles_query_memory_bytes == 2_097_152,
+    },
+    Row {
         var: "PULSUS_LOGQL_READ_MAX_MEMORY_BYTES",
         value: "2097152",
         check: |c| c.reader.logql_read_max_memory_bytes == 2_097_152,

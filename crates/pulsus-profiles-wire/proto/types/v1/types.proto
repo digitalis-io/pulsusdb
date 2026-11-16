@@ -1,0 +1,185 @@
+syntax = "proto3";
+
+package types.v1;
+
+import "gnostic/openapi/v3/annotations.proto";
+
+message LabelPair {
+  // Label name
+  string name = 1 [(gnostic.openapi.v3.property).example = {yaml: "service_name"}];
+
+  // Label value
+  string value = 2 [(gnostic.openapi.v3.property).example = {yaml: "my_service"}];
+}
+
+message ProfileType {
+  string ID = 1;
+  string name = 2;
+  string sample_type = 4;
+  string sample_unit = 5;
+  string period_type = 6;
+  string period_unit = 7;
+}
+
+message Labels {
+  // LabelPair is the key value pairs to identify the corresponding profile
+  repeated LabelPair labels = 1;
+}
+
+message Series {
+  repeated LabelPair labels = 1;
+  repeated Point points = 2;
+}
+
+message Point {
+  double value = 1;
+  // Milliseconds unix timestamp
+  int64 timestamp = 2;
+  repeated ProfileAnnotation annotations = 3;
+  // Exemplars are samples of individual profiles that contributed to this aggregated point
+  repeated Exemplar exemplars = 4;
+}
+
+// Annotations provide additional metadata for a profile.
+//
+// The main differences between labels and annotations are:
+//   - annotations cannot be used in query selectors
+//   - annotation keys don't have to be unique
+//
+// Currently annotations are applied internally by distributors,
+// any annotation passed via the push API will be dropped.
+message ProfileAnnotation {
+  // Annotation key [hidden]
+  string key = 1;
+  // Annotation value [hidden]
+  string value = 2;
+}
+
+message LabelValuesRequest {
+  // Name of the label
+  string name = 1 [(gnostic.openapi.v3.property).example = {yaml: "service_name"}];
+  // List of Label selectors
+  repeated string matchers = 2;
+  // Query from this point in time, given in Milliseconds since epoch.
+  int64 start = 3 [(gnostic.openapi.v3.property).example = {yaml: "1676282400000"}];
+  // Query to this point in time, given in Milliseconds since epoch.
+  int64 end = 4 [(gnostic.openapi.v3.property).example = {yaml: "1676289600000"}];
+}
+
+message LabelValuesResponse {
+  repeated string names = 1;
+}
+
+message LabelNamesRequest {
+  // List of Label selectors
+  repeated string matchers = 1;
+  // Query from this point in time, given in Milliseconds since epoch.
+  int64 start = 2 [(gnostic.openapi.v3.property).example = {yaml: "1676282400000"}];
+  // Query to this point in time, given in Milliseconds since epoch.
+  int64 end = 3 [(gnostic.openapi.v3.property).example = {yaml: "1676289600000"}];
+}
+
+message LabelNamesResponse {
+  repeated string names = 1;
+}
+
+message BlockInfo {
+  string ulid = 1;
+  int64 min_time = 2;
+  int64 max_time = 3;
+  BlockCompaction compaction = 4;
+  repeated LabelPair labels = 5;
+}
+
+message BlockCompaction {
+  int32 level = 1;
+  repeated string sources = 2;
+  repeated string parents = 3;
+}
+
+enum TimeSeriesAggregationType {
+  TIME_SERIES_AGGREGATION_TYPE_SUM = 0;
+  TIME_SERIES_AGGREGATION_TYPE_AVERAGE = 1;
+}
+
+enum ExemplarType {
+  EXEMPLAR_TYPE_UNSPECIFIED = 0;
+  EXEMPLAR_TYPE_NONE = 1;
+  EXEMPLAR_TYPE_INDIVIDUAL = 2;
+  EXEMPLAR_TYPE_SPAN = 3;
+}
+
+// StackTraceSelector is used for filtering stack traces by locations.
+message StackTraceSelector {
+  // Stack trace of the call site. Root at call_site[0].
+  // Only stack traces having the prefix provided will be selected.
+  // If empty, the filter is ignored.
+  repeated Location call_site = 1;
+  // Stack trace selector for profiles purposed for Go PGO.
+  // If set, call_site is ignored.
+  GoPGO go_pgo = 2;
+}
+
+message Location {
+  string name = 1;
+}
+
+message GoPGO {
+  // Specifies the number of leaf locations to keep.
+  uint32 keep_locations = 1;
+  // Aggregate callees causes the leaf location line number to be ignored,
+  // thus aggregating all callee samples (but not callers).
+  bool aggregate_callees = 2;
+}
+
+message GetProfileStatsRequest {}
+
+message GetProfileStatsResponse {
+  // Whether we received any data at any time in the past.
+  bool data_ingested = 1;
+  // Milliseconds since epoch.
+  int64 oldest_profile_time = 2;
+  // Milliseconds since epoch.
+  int64 newest_profile_time = 3;
+}
+
+// Exemplar represents metadata for an individual profile sample.
+// Exemplars allow users to drill down from aggregated timeline views
+// to specific profile instances.
+message Exemplar {
+  // Milliseconds since epoch when the profile was captured.
+  int64 timestamp = 1 [(gnostic.openapi.v3.property).example = {yaml: "1730000023000"}];
+
+  // Unique identifier for the profile (UUID).
+  string profile_id = 2 [(gnostic.openapi.v3.property).example = {yaml: "7c9e6679-7425-40de-944b-e07fc1f90ae7"}];
+
+  // Span ID if this profile was split by span during ingestion.
+  string span_id = 3 [(gnostic.openapi.v3.property).example = {yaml: "00f067aa0ba902b7"}];
+
+  // Total sample value for this profile (e.g., CPU nanoseconds, bytes allocated).
+  int64 value = 4 [(gnostic.openapi.v3.property).example = {yaml: "2450000000"}];
+
+  // Labels specific to this exemplar (e.g., pod name, node name). When an exemplar
+  // label overlaps with the series label, it is not included here.
+  repeated LabelPair labels = 5;
+
+  // Trace ID associated with the span, encoded as 32 lowercase hexadecimal characters.
+  string trace_id = 6 [(gnostic.openapi.v3.property).example = {yaml: "4bf92f3577b34da6a3ce929d0e0e4736"}];
+}
+
+message HeatmapSeries {
+  repeated LabelPair labels = 1;
+  repeated HeatmapSlot slots = 2;
+}
+
+message HeatmapSlot {
+  // Milliseconds unix timestamp of the right edge (x_max) of this slot.
+  // The slot covers the half-open interval (timestamp - step, timestamp].
+  int64 timestamp = 1;
+  // Minimum y value
+  repeated double y_min = 2;
+  // How many matches
+  repeated int32 counts = 3;
+  // Provide exemplars
+  repeated Exemplar exemplars = 4;
+}

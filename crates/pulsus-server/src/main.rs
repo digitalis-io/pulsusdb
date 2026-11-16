@@ -19,6 +19,7 @@ mod logs_api;
 mod middleware;
 mod modes;
 mod ops;
+mod profiles_api;
 mod prom_api;
 mod request_id;
 mod request_metrics;

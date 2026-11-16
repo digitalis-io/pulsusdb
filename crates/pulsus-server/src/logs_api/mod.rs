@@ -29,7 +29,7 @@ mod encode;
 mod engine;
 mod error;
 mod handlers;
-mod params;
+pub(crate) mod params;
 mod patterns;
 mod stats;
 mod tail;

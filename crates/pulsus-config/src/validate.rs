@@ -1050,6 +1050,33 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     // limit renders `LIMIT 0` (a tail that can never deliver); a zero
     // catch-up slice renders an empty scan window (catch-up never
     // progresses).
+    // Issue #821: the profiles read limits. A zero length or lookback
+    // refuses or empties every window; a zero ceiling is ClickHouse's
+    // "unlimited".
+    positive_duration(
+        "reader.profiles_max_query_length",
+        cfg.reader.profiles_max_query_length,
+    )?;
+    positive_duration(
+        "reader.profiles_max_query_lookback",
+        cfg.reader.profiles_max_query_lookback,
+    )?;
+    positive_u64(
+        "reader.profiles_scan_budget_rows",
+        cfg.reader.profiles_scan_budget_rows,
+    )?;
+    positive_u64(
+        "reader.profiles_max_tree_nodes",
+        cfg.reader.profiles_max_tree_nodes,
+    )?;
+    positive_u64(
+        "reader.profiles_max_result_bytes",
+        cfg.reader.profiles_max_result_bytes,
+    )?;
+    positive_u64(
+        "reader.profiles_query_memory_bytes",
+        cfg.reader.profiles_query_memory_bytes,
+    )?;
     positive_duration("reader.tail_poll_interval", cfg.reader.tail_poll_interval)?;
     positive_u64(
         "reader.tail_max_connections",
@@ -2143,6 +2170,43 @@ mod tests {
             }),
             ("reader.tail_catchup_slice", |c| {
                 c.reader.tail_catchup_slice = HumanDuration(std::time::Duration::ZERO)
+            }),
+        ];
+        for (field, mutate) in cases {
+            let mut cfg = Config::default();
+            mutate(&mut cfg);
+            match validate(&cfg) {
+                Err(ConfigError::Value { field: got, .. }) => {
+                    assert_eq!(&got, field, "wrong field named for {field}")
+                }
+                other => panic!("{field}: expected a Value error, got {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #821: each of the six profiles read settings refuses zero,
+    /// naming its field. A zero ceiling is ClickHouse's "unlimited".
+    #[test]
+    fn each_profiles_read_setting_refuses_zero() {
+        type Mutator = fn(&mut Config);
+        let cases: &[(&str, Mutator)] = &[
+            ("reader.profiles_max_query_length", |c| {
+                c.reader.profiles_max_query_length = HumanDuration(std::time::Duration::ZERO)
+            }),
+            ("reader.profiles_max_query_lookback", |c| {
+                c.reader.profiles_max_query_lookback = HumanDuration(std::time::Duration::ZERO)
+            }),
+            ("reader.profiles_scan_budget_rows", |c| {
+                c.reader.profiles_scan_budget_rows = 0
+            }),
+            ("reader.profiles_max_tree_nodes", |c| {
+                c.reader.profiles_max_tree_nodes = 0
+            }),
+            ("reader.profiles_max_result_bytes", |c| {
+                c.reader.profiles_max_result_bytes = 0
+            }),
+            ("reader.profiles_query_memory_bytes", |c| {
+                c.reader.profiles_query_memory_bytes = 0
             }),
         ];
         for (field, mutate) in cases {

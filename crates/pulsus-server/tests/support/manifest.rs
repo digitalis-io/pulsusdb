@@ -287,6 +287,19 @@ pub enum Surface {
     /// `/admin/…` (issue #746) — always mounted, behind the admin pair, HTML
     /// or JSON.
     Admin,
+    /// The profiles query API's four `GET` routes (issue #821, docs/api.md
+    /// §5): `types`, `labels`, `label/{name}/values` and `series`. Success is
+    /// the method's JSON response message; against this suite's empty
+    /// databases the base window ends before the lookback floor, so the
+    /// body is `{}` and nothing is read. Errors are the Connect JSON body
+    /// `{"code","message"}`.
+    ProfilesQuery,
+    /// The profiles query API's eight Connect paths (issue #821): the four
+    /// methods at `/querier.v1.QuerierService/<M>` (compat) and
+    /// `/api/profiles/v1/querier.v1.QuerierService/<M>` (native), `POST`
+    /// only. The base request is a JSON body; success and errors as
+    /// [`Surface::ProfilesQuery`].
+    ProfilesConnect,
 }
 
 /// Mode/flag gating (issue #36 plan v2 finding 3): mirrors
@@ -1749,6 +1762,14 @@ const SETUP_FILE_FORM: &str = "cluster=pulsus_cluster&cores=32&database=pulsus&d
 /// The same example as the setup API's JSON object.
 const SETUP_JSON: &str = r#"{"cluster":"pulsus_cluster","cores":"32","database":"pulsus","disk_gib":"2048","hosts":"ch1\nch2\nch3\nch4\nch5\nch6","keepers":"kp1\nkp2\nkp3","l1_from":"3600","l1_local":"365","l1_width":"60","l2_from":"86400","l2_local":"365","l2_width":"720","l3_from":"604800","l3_local":"365","l3_width":"7200","l4_from":"7776000","l4_local":"365","l4_width":"86400","local_path":"/var/lib/clickhouse/","memory_gib":"128","raw_local_days":"7","raw_remote_days":"90","remote_url":"https://bucket.example/pulsus/","replicas":"3","shards":"2","tls_ca":"/etc/ch/ca.crt","tls_cert":"/etc/ch/server.crt","tls_key":"/etc/ch/server.key"}"#;
 
+/// Issue #821: the profiles `GET` routes' base window, 1,000 s to 4,000 s
+/// after the epoch — before the lookback floor, so the answer is `{}` with
+/// no statement sent.
+const PROFILES_GET_BASE_QUERY: &str = "from=1000&until=4000";
+
+/// Issue #821: the same window as a Connect JSON body, in milliseconds.
+const PROFILES_CONNECT_BASE_BODY: &str = r#"{"start":"1000","end":"4000"}"#;
+
 static MANIFEST: &[RouteSpec] = &[
     // -- Ops (always mounted, mode/flag independent) --------------------
     RouteSpec {
@@ -2788,6 +2809,139 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: TRACES_METRICS_BASE_QUERY,
         cases: TRACES_METRICS_INSTANT_CASES,
     },
+    // -- Profiles query API (issue #821, docs/api.md §5) ------------------
+    RouteSpec {
+        path: "/api/profiles/v1/types",
+        methods: &[Method::Get],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_GET_BASE_QUERY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/labels",
+        methods: &[Method::Get, Method::Post],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_GET_BASE_QUERY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/label/{name}/values",
+        methods: &[Method::Get],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_GET_BASE_QUERY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/series",
+        methods: &[Method::Get, Method::Post],
+        surface: Surface::ProfilesQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_GET_BASE_QUERY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/querier.v1.QuerierService/ProfileTypes",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/querier.v1.QuerierService/LabelNames",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/querier.v1.QuerierService/LabelValues",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/profiles/v1/querier.v1.QuerierService/Series",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/querier.v1.QuerierService/ProfileTypes",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/querier.v1.QuerierService/LabelNames",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/querier.v1.QuerierService/LabelValues",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/querier.v1.QuerierService/Series",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
     // -- Planned (documented, not yet mounted) ---------------------------
     // Representative, not exhaustive (deviation, see issue #36 implementation
     // notes): every M4-M8 §4-§8 row is out of scope for a guard whose only
@@ -2821,17 +2975,6 @@ static MANIFEST: &[RouteSpec] = &[
     // and moves up into the native logs section above; the compat alias joins
     // the `/loki/api/v1` block. (The detected_labels/detected_fields rows
     // flipped similarly in #170.)
-    RouteSpec {
-        path: "/api/profiles/v1/types",
-        methods: &[Method::Get],
-        surface: Surface::PromApi,
-        gate: Gate::ReaderMode,
-        status: RouteStatus::Planned { milestone: "M5" },
-        doc_ref: DocRef::Skip,
-        success_status: 0,
-        base_query: "",
-        cases: &[],
-    },
     RouteSpec {
         path: "/api/rules/v1/{kind}",
         methods: &[Method::Get, Method::Post],
@@ -2989,16 +3132,17 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/compat.rs",
         function: "apply_aliases",
-        // Re-pinned for issue #75 (M6-12): the Zipkin v2 JSON receiver's
+        // Re-pinned for issue #821: the profiles Connect paths join the
+        // Reader block. Re-pinned for issue #75 (M6-12): the Zipkin v2 JSON receiver's
         // `CompatAndWriter` merge joins the Loki push receiver in the
         // Writer-gated branch. (Previously re-pinned for issue #77's Loki
         // push mount, and #61's Tempo trace-alias merge in the Reader block.)
-        body: "if !cfg.compat_endpoints {return router;} let mut router = router; if modes::mounted(cfg).contains(&Subsystem::Reader) {router = router.merge(crate::logs_api::compat_router()); router = router.merge(crate::traces_api::compat_router());} if modes::mounted(cfg).contains(&Subsystem::Writer) {router = router.merge(crate::ingest::loki_push_compat_router()); router = router.merge(crate::ingest::zipkin_compat_router());} router",
+        body: "if !cfg.compat_endpoints {return router;} let mut router = router; if modes::mounted(cfg).contains(&Subsystem::Reader) {router = router.merge(crate::logs_api::compat_router()); router = router.merge(crate::traces_api::compat_router()); router = router.merge(crate::profiles_api::compat_router());} if modes::mounted(cfg).contains(&Subsystem::Writer) {router = router.merge(crate::ingest::loki_push_compat_router()); router = router.merge(crate::ingest::zipkin_compat_router());} router",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/subsystems.rs",
         function: "reader_router",
-        body: "crate::logs_api::router().merge(crate::prom_api::router()).merge(crate::traces_api::router())",
+        body: "crate::logs_api::router().merge(crate::prom_api::router()).merge(crate::traces_api::router()).merge(crate::profiles_api::router())",
     },
     // Re-pinned for issue #406 Part B2: `/stats`, `/volume` and
     // `/patterns` gained a `POST` binding on both surfaces. (Previously
