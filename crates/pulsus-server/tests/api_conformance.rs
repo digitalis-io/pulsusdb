@@ -650,10 +650,16 @@ fn profile_ingest_request(path: &str) -> Option<manifest::Req> {
         req.content_type = Some("application/proto");
         req.body = PushRequest {
             series: vec![RawProfileSeries {
-                labels: vec![LabelPair {
-                    name: "service_name".to_string(),
-                    value: "conformance".to_string(),
-                }],
+                labels: vec![
+                    LabelPair {
+                        name: "__name__".to_string(),
+                        value: "process_cpu".to_string(),
+                    },
+                    LabelPair {
+                        name: "service_name".to_string(),
+                        value: "conformance".to_string(),
+                    },
+                ],
                 samples: vec![RawSample {
                     raw_profile: profile,
                     id: String::new(),
