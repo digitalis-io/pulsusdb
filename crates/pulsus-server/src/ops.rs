@@ -451,7 +451,7 @@ fn record_trace_ingest_snapshot(s: &TraceWriterMetricsSnapshot) {
     record_dedup_metrics("traces", &s.dedup);
 }
 
-/// The profile writer's `pulsus_ingest_*` series:
+/// The profile writer's `pulsus_ingest_*` series (issue #817):
 /// [`record_trace_ingest_snapshot`]'s set, for `table="profile_landing"`
 /// and `signal="profiles"`.
 fn record_profile_ingest_snapshot(s: &TraceWriterMetricsSnapshot) {

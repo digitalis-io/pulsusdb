@@ -100,6 +100,8 @@ http-body = "1"
 
 [dev-dependencies]
 pulsus-schema-testkit = { path = "../pulsus-schema-testkit" }
+# Issue #817: the profile push tests build `PushRequest` and pprof bodies.
+pulsus-profiles-wire = { path = "../pulsus-profiles-wire" }
 # Issue #587: TEST-ONLY — the fetch's byte-valued attribute carriers are
 # read as `serde_bytes::ByteBuf`, and `assemble.rs`'s own fixtures build
 # them. No production path in this crate names the crate.

@@ -22,7 +22,7 @@ use std::sync::{Arc, OnceLock};
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::routing::post;
@@ -246,7 +246,7 @@ impl TraceSink for TraceWriterSink {
     }
 }
 
-/// [`TraceWriterSink`]'s profiles counterpart: adapts
+/// [`TraceWriterSink`]'s profiles counterpart (issue #817): adapts
 /// `Arc<OnceLock<Arc<ProfileWriter>>>` to [`ProfileSink`], same
 /// "backpressure while empty" contract.
 pub(crate) struct ProfileWriterSink {
@@ -460,6 +460,47 @@ pub(crate) fn zipkin_compat_router() -> Router<AppState> {
     Router::new()
         .route("/api/v2/spans", post(ingest_zipkin))
         .route("/tempo/spans", post(ingest_zipkin))
+}
+
+/// `POST /push.v1.PusherService/Push` (docs/api.md §8.2, issue #817): the
+/// Connect push route. Pulls `AppState`'s `ProfileWriterSink` and hands
+/// straight into `pulsus_write::ingest_profile_push`.
+pub(crate) async fn ingest_profile_push(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    pulsus_write::ingest_profile_push(state.profile_writer.as_ref(), headers, body).await
+}
+
+/// `POST /ingest`, its second compat path and `POST /api/profiles/v1/ingest`
+/// (docs/api.md §1.3, issue #817): the pprof `/ingest`. Pulls `AppState`'s
+/// `ProfileWriterSink` and hands straight into
+/// `pulsus_write::ingest_profile_legacy`.
+pub(crate) async fn ingest_profile_legacy(
+    State(state): State<AppState>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    pulsus_write::ingest_profile_legacy(
+        state.profile_writer.as_ref(),
+        query.as_deref(),
+        headers,
+        body,
+    )
+    .await
+}
+
+/// The profile push compat surface (issue #817): the Connect push route and
+/// `/ingest` at both of the reference's paths, merged by
+/// `compat::apply_aliases` iff `PULSUS_COMPAT_ENDPOINTS` **and** the Writer
+/// subsystem is mounted (`Gate::CompatAndWriter`).
+pub(crate) fn profiles_compat_router() -> Router<AppState> {
+    Router::new()
+        .route("/push.v1.PusherService/Push", post(ingest_profile_push))
+        .route("/ingest", post(ingest_profile_legacy))
+        .route("/pyroscope/ingest", post(ingest_profile_legacy))
 }
 
 #[cfg(test)]

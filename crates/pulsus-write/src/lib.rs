@@ -17,6 +17,7 @@ pub use ingest::metrics::{
     SeriesRef,
 };
 pub use ingest::profiles::{ParsedProfileLanding, ProfileInput, ProfileRefusal, ProfileSink};
+pub use ingest::profiles_http::{ingest_profile_legacy, ingest_profile_push};
 pub use ingest::traces::{
     LandingEvent, LandingLink, LandingResource, LandingSpan, LandingTagName, LandingTagValue,
     ParsedTraceLanding, TagScope, TraceSink,

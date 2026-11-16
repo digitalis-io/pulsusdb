@@ -109,7 +109,7 @@ pub async fn run(config: Config) -> ExitCode {
     // writer slots — constructed by the reconnect loop in writer-enabled
     // modes, drained alongside them at shutdown.
     let trace_writer_slot: Arc<OnceLock<Arc<TraceWriter>>> = Arc::new(OnceLock::new());
-    // `ProfileWriter`'s slot, the same lifecycle again.
+    // `ProfileWriter`'s slot (issue #817), the same lifecycle again.
     let profile_writer_slot: Arc<OnceLock<Arc<ProfileWriter>>> = Arc::new(OnceLock::new());
     // The label cache's async-filled slot (issue #30 architect plan): same
     // shape as `writer_slot`/`metric_writer_slot`, constructed by the
@@ -175,10 +175,10 @@ pub async fn run(config: Config) -> ExitCode {
         build: BuildInfo::from_build_env(),
         writer: Arc::new(WriterSink::new(Arc::clone(&writer_slot))),
         metric_writer: Arc::new(MetricWriterSink::new(Arc::clone(&metric_writer_slot))),
+        trace_writer: Arc::new(TraceWriterSink::new(Arc::clone(&trace_writer_slot))),
         profile_writer: Arc::new(crate::ingest::ProfileWriterSink::new(Arc::clone(
             &profile_writer_slot,
         ))),
-        trace_writer: Arc::new(TraceWriterSink::new(Arc::clone(&trace_writer_slot))),
         label_cache: Arc::clone(&label_cache_slot),
         rollup_levels: Arc::clone(&rollup_levels_slot),
         graph_target: pulsus_read::GraphTargetCache::default(),
@@ -305,7 +305,7 @@ pub async fn run(config: Config) -> ExitCode {
     if let Some(trace_writer) = trace_writer_slot.get() {
         trace_writer.shutdown(WRITER_DRAIN_DEADLINE).await;
     }
-    // And for `ProfileWriter`.
+    // And for `ProfileWriter` (issue #817).
     if let Some(profile_writer) = profile_writer_slot.get() {
         profile_writer.shutdown(WRITER_DRAIN_DEADLINE).await;
     }
@@ -572,8 +572,7 @@ fn spawn_reconnect_loop(
                         ));
                         let _ = writer_slots.trace.set(trace_writer);
 
-                        // `ProfileWriter`: same shared client, same
-                        // lifecycle gate.
+                        // `ProfileWriter` (issue #817): the same again.
                         let profile_writer = Arc::new(ProfileWriter::new_with_tables(
                             client,
                             &config.writer,

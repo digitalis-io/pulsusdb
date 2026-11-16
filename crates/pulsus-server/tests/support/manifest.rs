@@ -2025,6 +2025,19 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: "",
         cases: REMOTE_WRITE_CASES,
     },
+    // Issue #817: the reference's `/ingest`, served for pprof bodies, at its
+    // native path. Success is `200` with an empty body.
+    RouteSpec {
+        path: "/api/profiles/v1/ingest",
+        methods: &[Method::Post],
+        surface: Surface::Ingest,
+        gate: Gate::WriterMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
     // -- Logs query, native (ReaderMode) ----------------------------------
     RouteSpec {
         path: "/api/logs/v1/query_range",
@@ -2428,6 +2441,42 @@ static MANIFEST: &[RouteSpec] = &[
         success_status: 202,
         base_query: "",
         cases: ZIPKIN_CASES,
+    },
+    // -- Profile push receivers (CompatAndWriter, issue #817) -------------
+    // The reference's Connect push route and its `/ingest` at both of its
+    // paths. Success is `200` on all three.
+    RouteSpec {
+        path: "/push.v1.PusherService/Push",
+        methods: &[Method::Post],
+        surface: Surface::Ingest,
+        gate: Gate::CompatAndWriter,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/ingest",
+        methods: &[Method::Post],
+        surface: Surface::Ingest,
+        gate: Gate::CompatAndWriter,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/pyroscope/ingest",
+        methods: &[Method::Post],
+        surface: Surface::Ingest,
+        gate: Gate::CompatAndWriter,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
     },
     // -- Prom API (ReaderMode, no compat aliases) ------------------------
     RouteSpec {
@@ -2991,17 +3040,6 @@ static MANIFEST: &[RouteSpec] = &[
     // the endpoint inventory's own documentation value and are excluded
     // from both the drift guard (never `Mounted`) and the docs-gap check
     // (`DocRef::Skip`).
-    RouteSpec {
-        path: "/api/profiles/v1/ingest",
-        methods: &[Method::Post],
-        surface: Surface::Ingest,
-        gate: Gate::WriterMode,
-        status: RouteStatus::Planned { milestone: "M5" },
-        doc_ref: DocRef::Skip,
-        success_status: 0,
-        base_query: "",
-        cases: &[],
-    },
     // Issue #171 (M7-C3): the former Planned `/patterns` row flips to Mounted
     // and moves up into the native logs section above; the compat alias joins
     // the `/loki/api/v1` block. (The detected_labels/detected_fields rows
@@ -3163,12 +3201,12 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/compat.rs",
         function: "apply_aliases",
-        // Re-pinned for issue #821: the profiles Connect paths join the
-        // Reader block. Re-pinned for issue #75 (M6-12): the Zipkin v2 JSON receiver's
-        // `CompatAndWriter` merge joins the Loki push receiver in the
-        // Writer-gated branch. (Previously re-pinned for issue #77's Loki
-        // push mount, and #61's Tempo trace-alias merge in the Reader block.)
-        body: "if !cfg.compat_endpoints {return router;} let mut router = router; if modes::mounted(cfg).contains(&Subsystem::Reader) {router = router.merge(crate::logs_api::compat_router()); router = router.merge(crate::traces_api::compat_router()); router = router.merge(crate::profiles_api::compat_router());} if modes::mounted(cfg).contains(&Subsystem::Writer) {router = router.merge(crate::ingest::loki_push_compat_router()); router = router.merge(crate::ingest::zipkin_compat_router());} router",
+        // Re-pinned for issue #817: the profile push receivers' merge joins
+        // the Writer-gated branch. Re-pinned for issue #821: the profiles
+        // Connect paths join the Reader block. (Previously re-pinned for
+        // issue #75's Zipkin receiver, #77's Loki push mount, and #61's Tempo
+        // trace-alias merge in the Reader block.)
+        body: "if !cfg.compat_endpoints {return router;} let mut router = router; if modes::mounted(cfg).contains(&Subsystem::Reader) {router = router.merge(crate::logs_api::compat_router()); router = router.merge(crate::traces_api::compat_router()); router = router.merge(crate::profiles_api::compat_router());} if modes::mounted(cfg).contains(&Subsystem::Writer) {router = router.merge(crate::ingest::loki_push_compat_router()); router = router.merge(crate::ingest::zipkin_compat_router()); router = router.merge(crate::ingest::profiles_compat_router());} router",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/subsystems.rs",

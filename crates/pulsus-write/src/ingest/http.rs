@@ -949,13 +949,13 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
 
 /// Reads issue #494's two push-identity headers. Header reads only — every
 /// decision about what they mean lives in the writer.
-fn push_headers(headers: &HeaderMap) -> PushHeaders {
+pub(super) fn push_headers(headers: &HeaderMap) -> PushHeaders {
     let value = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     PushHeaders::from_values(value(IDEMPOTENCY_KEY_HEADER), value(RETRY_ATTEMPT_HEADER))
 }
 
 /// `true` when `X-Pulsus-Async: 1` selects async-mode admission.
-fn is_async(headers: &HeaderMap) -> bool {
+pub(super) fn is_async(headers: &HeaderMap) -> bool {
     headers
         .get(ASYNC_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -979,7 +979,10 @@ fn is_async(headers: &HeaderMap) -> bool {
 /// failure (e.g. the client disconnects mid-upload) is not attributable to
 /// the payload's shape, so it maps to `BodyRead` (500/13), not an oversize/
 /// malformed-payload class.
-async fn read_capped_body(mut body: Body, cap: usize) -> Result<Vec<u8>, LogsIngestError> {
+pub(super) async fn read_capped_body(
+    mut body: Body,
+    cap: usize,
+) -> Result<Vec<u8>, LogsIngestError> {
     let mut out = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|source| LogsIngestError::BodyRead(source.to_string()))?;
