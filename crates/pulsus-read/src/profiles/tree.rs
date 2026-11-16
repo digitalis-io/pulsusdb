@@ -127,12 +127,7 @@ pub fn plan(
     let call_site = if req.call_site.is_empty() {
         String::new()
     } else {
-        let names: Vec<String> = req.call_site.iter().map(|n| ch_string(n)).collect();
-        format!(
-            "\n      AND arraySlice(names, 1, {}) = [{}]",
-            names.len(),
-            names.join(", ")
-        )
+        format!("\n      AND {}", call_site_predicate(req.call_site))
     };
     let mut filters = String::new();
     if !spans.is_empty() {
@@ -221,8 +216,19 @@ fn resolve_max_nodes(raw: i64, config: &ProfilesReadConfig) -> Result<i64, Profi
     Ok(raw)
 }
 
+/// Issue #824: the stack rows a call site keeps — those whose frames begin
+/// with `names`, root first.
+pub(super) fn call_site_predicate(names: &[String]) -> String {
+    let names: Vec<String> = names.iter().map(|n| ch_string(n)).collect();
+    format!(
+        "arraySlice(names, 1, {}) = [{}]",
+        names.len(),
+        names.join(", ")
+    )
+}
+
 /// `ms` as its UTC date, `YYYY-MM-DD`.
-fn utc_date(ms: i64) -> String {
+pub(super) fn utc_date(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|t| t.format("%Y-%m-%d").to_string())
         .unwrap_or_default()

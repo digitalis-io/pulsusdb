@@ -24,7 +24,7 @@ use crate::logs_api::params::parse_pairs;
 
 use super::connect::{Code, Codec, ConnectError};
 use super::engine::with_engine;
-use super::routes::{all, finish, now_ms, prelude, tenant_of, time_param};
+use super::routes::{all, finish, now_ms, prelude, split_query, tenant_of, time_param};
 
 /// The flame graph `msg` asks for, in one statement, or none when its
 /// window ends before the lookback floor.
@@ -138,11 +138,7 @@ fn merge_request(
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
     };
-    let query = first("query").unwrap_or("");
-    let (profile_type_id, label_selector) = match query.find('{') {
-        Some(i) => (&query[..i], &query[i..]),
-        None => (query, "{}"),
-    };
+    let (profile_type_id, label_selector) = split_query(first("query").unwrap_or(""));
     let max_nodes = match first("maxNodes") {
         None => None,
         Some(v) => Some(v.parse::<i64>().map_err(|_| {

@@ -96,6 +96,14 @@ profiles_tree_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19
 # native GET route, against the spawned binary. Reuses this job's
 # ClickHouse container.
 profiles_merge	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profiles_merge
+# Issue #824: the time series' one statement over its tenant's entries,
+# and with a call site over its samples. Reuses this job's ClickHouse
+# container.
+profiles_series_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test profiles_series_live
+# Issue #824: SelectSeries over the Connect protocol and the native GET
+# route, against the spawned binary. Reuses this job's ClickHouse
+# container.
+profiles_series	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profiles_series
 # Issue #55: spawns the real `pulsusdb` binary and drives the
 # `/api/traces/v1/trace/{traceId}[/json]` fetch surface end-to-end —
 # OTLP ingest seed, JSON/protobuf negotiation (incl. the 406

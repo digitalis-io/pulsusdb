@@ -202,37 +202,100 @@ pub struct ProfileAnnotation {
     pub value: String,
 }
 
-/// Issue #824: one time series. Not written yet.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// Issue #824: one time series — its labels and its points.
+#[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Series {
+    #[prost(message, repeated, tag = "1")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<LabelPair>,
+    #[prost(message, repeated, tag = "2")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub points: Vec<Point>,
 }
 
-/// Issue #824: one point of a time series. Not written yet.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// Issue #824: one point of a time series. Tag 4, exemplars, is #826's;
+/// `annotations` is always empty: no ingest path stores one.
+#[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Point {
+    #[prost(double, tag = "1")]
+    #[serde(
+        serialize_with = "crate::double::ser",
+        deserialize_with = "crate::double::de",
+        skip_serializing_if = "crate::double::is_zero"
+    )]
     pub value: f64,
+    #[prost(int64, tag = "2")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub timestamp: i64,
+    #[prost(message, repeated, tag = "3")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub annotations: Vec<ProfileAnnotation>,
 }
 
 /// Issue #824: how a time series' step combines its profiles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum TimeSeriesAggregationType {
     Sum = 0,
     Average = 1,
 }
 
+impl TimeSeriesAggregationType {
+    /// The value's name in the proto.
+    pub fn as_str_name(self) -> &'static str {
+        match self {
+            TimeSeriesAggregationType::Sum => "TIME_SERIES_AGGREGATION_TYPE_SUM",
+            TimeSeriesAggregationType::Average => "TIME_SERIES_AGGREGATION_TYPE_AVERAGE",
+        }
+    }
+
+    /// The value a proto name names.
+    pub fn from_str_name(name: &str) -> Option<Self> {
+        [
+            TimeSeriesAggregationType::Sum,
+            TimeSeriesAggregationType::Average,
+        ]
+        .into_iter()
+        .find(|t| t.as_str_name() == name)
+    }
+}
+
 /// Issue #824: the exemplars a time series request asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ExemplarType {
     Unspecified = 0,
     None = 1,
     Individual = 2,
     Span = 3,
+}
+
+impl ExemplarType {
+    /// The value's name in the proto.
+    pub fn as_str_name(self) -> &'static str {
+        match self {
+            ExemplarType::Unspecified => "EXEMPLAR_TYPE_UNSPECIFIED",
+            ExemplarType::None => "EXEMPLAR_TYPE_NONE",
+            ExemplarType::Individual => "EXEMPLAR_TYPE_INDIVIDUAL",
+            ExemplarType::Span => "EXEMPLAR_TYPE_SPAN",
+        }
+    }
+
+    /// The value a proto name names.
+    pub fn from_str_name(name: &str) -> Option<Self> {
+        [
+            ExemplarType::Unspecified,
+            ExemplarType::None,
+            ExemplarType::Individual,
+            ExemplarType::Span,
+        ]
+        .into_iter()
+        .find(|t| t.as_str_name() == name)
+    }
 }

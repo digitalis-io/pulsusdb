@@ -453,6 +453,15 @@ pub(super) fn time_param(pairs: &[(String, String)], key: &str, now: i64) -> i64
         .unwrap_or(0)
 }
 
+/// A `GET` route's `query`: the type up to the first `{`, and the
+/// selector from it; `{}` when there is no `{`.
+pub(super) fn split_query(query: &str) -> (&str, &str) {
+    match query.find('{') {
+        Some(i) => (&query[..i], &query[i..]),
+        None => (query, "{}"),
+    }
+}
+
 /// Every non-empty value of `key`.
 pub(super) fn all(pairs: &[(String, String)], key: &str) -> Vec<String> {
     pairs

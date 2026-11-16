@@ -94,6 +94,7 @@ replaces one.
 | [39](#39-an-attribute-quantile-drops-every-integer-below-2) | trace reference | queries | C, D | `quantile_over_time(span.n, .01)` over `-4`, `1` and `7` answers from `7` alone. |
 | [40](#40--over-a-condition-the-store-can-filter-answers-nothing-on-search-and-is-ignored-on-metrics) | trace reference | queries | A, D | `{ !(status = error) }` answers no span on search and the error spans' count on metrics. |
 | [41](#41-a-function-named-other-that-survives-the-flame-graph-cut-loses-its-cut-siblings-values) | profiles reference | queries | C, D | A flame graph whose function named `other` survives the cut reports a total below the samples' sum. |
+| [42](#42-the-time-series-ignores-aggregation-and-the-call-site) | profiles reference | queries | A, C | A time series asked for the average answers the sum, and one asked for a call site answers every stack's total. |
 
 ---
 
@@ -2329,6 +2330,41 @@ answers 16, with `other` 6 (`docs/api.md` §5).
 
 Ledger row `flamegraph-named-other-keeps-cut-values` (the profiles differential's ledger, issue #822).
 Pinned by `f5_a_named_other_keeps_its_cut_siblings` in `crates/pulsus-read/src/profiles/flamegraph.rs`.
+
+---
+
+## 42. The time series ignores `aggregation` and the call site
+
+**The profiles reference · queries · tests A, C**
+
+### What the reference does
+
+`SelectSeries` takes an `aggregation`, the sum or the average of each step's profiles, and a
+`stack_trace_selector`, whose call site keeps only the samples on stacks beginning with those frames.
+The current query path builds its query from the step, the grouping, the limit and the exemplar type
+alone, so the selector never reaches the backend
+(`pkg/frontend/readpath/queryfrontend/query_select_time_series.go:78-83`), and the backend builds every
+series with the sum (`pkg/querybackend/query_time_series.go:240-243`). The older query path passes both
+on: the aggregation to its series builder (`pkg/querier/querier.go:1101`) and the selector to its
+store query (`pkg/querier/querier.go:1142`).
+
+### Why that is wrong rather than different
+
+The two paths of the same product answer one request differently (**A**). On the current path both
+fields are dropped without a word (**C**): a request for the average gets the sum, and a request for one
+call site gets every stack's total.
+
+### What PulsusDB does
+
+`TIME_SERIES_AGGREGATION_TYPE_AVERAGE` answers the mean of the step's profile totals, and a call site
+restricts each profile's total to the samples on its stacks before the step's value is taken
+(`docs/api.md` §5).
+
+### Evidence
+
+Ledger rows `series-average-is-the-mean` and `series-call-site-filters-the-totals` (the profiles
+differential's ledger, issue #822). Pinned by cases L2 and L3 of
+`the_time_series_answers_its_tenants_totals` in `crates/pulsus-read/tests/profiles_series_live.rs`.
 
 ---
 

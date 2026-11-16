@@ -79,6 +79,7 @@ pkg/distributor/validator.go
 pkg/engine/basic_engine.go
 pkg/engine/engine.go
 pkg/engine/handler.go
+pkg/frontend/readpath/queryfrontend/query_select_time_series.go
 pkg/iter/entry_iterator.go
 pkg/loghttp/params.go
 pkg/loghttp/patterns.go
@@ -130,6 +131,7 @@ pkg/querier/queryrange/roundtrip.go
 pkg/querier/queryrange/shard_resolver.go
 pkg/querier/queryrange/splitters.go
 pkg/querier/tail/querier.go
+pkg/querybackend/query_time_series.go
 pkg/storage/detected/fields.go
 pkg/storage/store.go
 pkg/storage/stores/shipper/indexshipper/tsdb/single_file_index.go

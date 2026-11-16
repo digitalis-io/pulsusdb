@@ -78,7 +78,7 @@ impl ProfilesReadConfig {
         ProfilesReadConfig {
             series_table: format!("profile_series{dist}"),
             samples_table: format!("profile_samples{dist}"),
-            entries_table: String::new(),
+            entries_table: format!("profile_entries{dist}"),
             dist_suffix: dist.to_string(),
             limits: WindowLimits {
                 max_length_ms: millis(r.profiles_max_query_length.0),
@@ -234,8 +234,8 @@ impl ProfilesEngine {
     /// Issue #824: sends S6 (`super::series`) and returns one row per
     /// series.
     pub async fn read_series(&self, sql: &str) -> Result<Vec<TimeSeriesRow>, ProfilesReadError> {
-        let _ = sql;
-        Ok(Vec::new())
+        let settings = read_settings(&self.config, self.log_comment.as_deref());
+        self.dispatch.rows(sql, &settings).await
     }
 }
 

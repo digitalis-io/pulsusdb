@@ -11,7 +11,13 @@
 use pulsus_model::Tenant;
 use serde::{Deserialize, Serialize};
 
+use crate::logql::escape::ch_string;
+use crate::metrics::DataWindow;
+use crate::traces::tenant_scope::TenantTerm;
+
 use super::engine::{ProfilesReadConfig, ProfilesReadError};
+use super::selector::{Compiled, SelectorError, SelectorRequest, compile};
+use super::tree::{STACK_DAY_AFTER_MS, STACK_DAY_BEFORE_MS, call_site_predicate, utc_date};
 
 /// What a `SelectSeries` request selects.
 #[derive(Debug, Clone, Copy, Default)]
@@ -60,25 +66,186 @@ pub struct Series {
 /// 1 ms (and NaN), then the step's nanoseconds truncated, then whole
 /// milliseconds.
 pub fn step_ms(step: f64) -> Result<i64, ProfilesReadError> {
-    let _ = step;
-    Ok(0)
+    if step.is_nan() || step < 0.001 {
+        return Err(ProfilesReadError::InvalidArgument(
+            "step must be >= 1ms".to_string(),
+        ));
+    }
+    Ok((step * 1e9) as i64 / 1_000_000)
 }
 
-/// Plans `req` for `tenant`. Not written yet.
+/// Plans `req` for `tenant`: `Ok(None)` when its window ends before the
+/// lookback floor, so nothing is read. In the reference's order, except
+/// that the step is checked after the selector: the window, the type and
+/// the selector, then the step.
 pub fn plan(
     tenant: &Tenant,
     config: &ProfilesReadConfig,
     req: &SeriesRequest<'_>,
     now_ms: i64,
 ) -> Result<Option<String>, ProfilesReadError> {
-    let _ = (tenant, config, req, now_ms);
-    Ok(None)
+    let selectors = [req.label_selector];
+    let compiled = compile(
+        tenant,
+        &config.series_table,
+        &SelectorRequest {
+            selectors: &selectors,
+            profile_type: Some(req.profile_type),
+            start_ms: req.start_ms,
+            end_ms: req.end_ms,
+        },
+        now_ms,
+        config.limits,
+    )
+    .map_err(|SelectorError::InvalidArgument(m)| ProfilesReadError::InvalidArgument(m))?;
+    let (window, matchers) = match compiled {
+        Compiled::Empty => return Ok(None),
+        Compiled::Series {
+            window, matchers, ..
+        } => (window, matchers),
+    };
+    let step = step_ms(req.step)?;
+
+    let start = window.start_ms;
+    let end = window.end_ms;
+    let read_start = start.saturating_sub(step);
+    let last = start + (end - start) / step * step;
+    let lo_ns = read_start.saturating_mul(1_000_000);
+    let hi_ns = end
+        .saturating_mul(1_000_000)
+        .min(last.saturating_mul(1_000_000).saturating_add(999_999));
+    let w = DataWindow {
+        start_ms: read_start,
+        end_ms: end,
+    };
+    let series_table = config.series_table.as_str();
+    let series = crate::metrics::profile_series(tenant, w, series_table, &matchers);
+    let tenant_term = TenantTerm::of(tenant);
+    let type_id = matchers
+        .iter()
+        .rev()
+        .find(|m| m.key == "__profile_type__")
+        .map(|m| m.value.as_str())
+        .unwrap_or_default();
+    let type_id = ch_string(type_id);
+    let service_terms = crate::metrics::profile_service_terms(&matchers);
+
+    let (g, join) = if req.group_by.is_empty() {
+        ("CAST([] AS Array(String))".to_string(), String::new())
+    } else {
+        let labels: Vec<String> = req
+            .group_by
+            .iter()
+            .map(|l| format!("JSONExtractString(labels, {})", ch_string(l)))
+            .collect();
+        let join = format!(
+            "\n  INNER JOIN (\n    SELECT fingerprint, any([{}]) AS g\n{}\n    GROUP BY fingerprint\n  ) AS s ON e.fingerprint = s.fingerprint",
+            labels.join(", "),
+            crate::metrics::profile_series_where(tenant, w, series_table, &matchers)
+        );
+        ("s.g".to_string(), join)
+    };
+    let source = if req.call_site.is_empty() {
+        format!(
+            "FROM {entries} AS e{join}
+  WHERE {tenant_term} AND e.type_id = {type_id}{service_terms}
+      AND e.fingerprint IN ({series})
+      AND e.timestamp_ns >= {lo_ns} AND e.timestamp_ns <= {hi_ns}",
+            entries = config.entries_table,
+        )
+    } else {
+        format!(
+            "FROM (
+    SELECT fingerprint, timestamp_ns, sum(value) AS total
+    FROM {samples}
+    WHERE {tenant_term} AND type_id = {type_id}{service_terms}
+      AND fingerprint IN ({series})
+      AND timestamp_ns >= {lo_ns} AND timestamp_ns <= {hi_ns}
+      AND stack_id IN (SELECT stack_id
+FROM profile_stacks
+WHERE {tenant_term} AND day BETWEEN '{d0}' AND '{d1}'
+  AND {call_site})
+    GROUP BY fingerprint, timestamp_ns, profile_id
+  ) AS e{join}",
+            samples = config.samples_table,
+            d0 = utc_date(read_start.saturating_sub(STACK_DAY_BEFORE_MS)),
+            d1 = utc_date(end.saturating_add(STACK_DAY_AFTER_MS)),
+            call_site = call_site_predicate(req.call_site),
+        )
+    };
+    let v = if req.average {
+        "avg(e.total)"
+    } else {
+        "toFloat64(sum(e.total))"
+    };
+    let limit = match req.limit {
+        Some(n) if n > 0 => format!("\nLIMIT {n}"),
+        _ => String::new(),
+    };
+    Ok(Some(format!(
+        "SELECT g, sum(v) AS series_total, arraySort(groupArray((ts, v))) AS points
+FROM (
+  SELECT {g} AS g,
+         {start} + intDiv(intDiv(e.timestamp_ns, 1000000) - {start} + {step_minus_1}, {step}) * {step} AS ts,
+         {v} AS v
+  {source}
+  GROUP BY g, ts
+)
+GROUP BY g
+ORDER BY series_total DESC, g{limit}",
+        step_minus_1 = step - 1,
+    )))
 }
 
-/// The rows as the reference answers them. Not written yet.
+/// The rows as the reference answers them: each series labelled by the
+/// `group_by` names it holds a value for, in request order; ordered by the
+/// sum of its points, descending, then by its labels; cut to `limit` when
+/// it is above 0.
 pub fn series(rows: Vec<TimeSeriesRow>, group_by: &[String], limit: Option<i64>) -> Vec<Series> {
-    let _ = (rows, group_by, limit);
-    Vec::new()
+    let mut out: Vec<(f64, Series)> = rows
+        .into_iter()
+        .map(|row| {
+            let labels: Vec<(String, String)> = group_by
+                .iter()
+                .zip(row.g)
+                .filter(|(_, value)| !value.is_empty())
+                .map(|(name, value)| (name.clone(), value))
+                .collect();
+            let points: Vec<Point> = row
+                .points
+                .into_iter()
+                .map(|(timestamp, value)| Point { timestamp, value })
+                .collect();
+            let sum = points.iter().fold(0.0, |acc, p| acc + p.value);
+            (sum, Series { labels, points })
+        })
+        .collect();
+    out.sort_by(|(a_sum, a), (b_sum, b)| {
+        b_sum
+            .partial_cmp(a_sum)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| compare_label_pairs(&a.labels, &b.labels))
+    });
+    let mut out: Vec<Series> = out.into_iter().map(|(_, s)| s).collect();
+    if let Some(k) = limit.filter(|k| *k > 0) {
+        out.truncate(usize::try_from(k).unwrap_or(usize::MAX));
+    }
+    out
+}
+
+/// Two label sets compared pairwise, name then value, in byte order; when
+/// one is a prefix of the other, the shorter first.
+fn compare_label_pairs(a: &[(String, String)], b: &[(String, String)]) -> std::cmp::Ordering {
+    for ((an, av), (bn, bv)) in a.iter().zip(b) {
+        let c = an
+            .as_bytes()
+            .cmp(bn.as_bytes())
+            .then_with(|| av.as_bytes().cmp(bv.as_bytes()));
+        if c.is_ne() {
+            return c;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 #[cfg(test)]
@@ -86,7 +253,6 @@ mod tests {
     use super::*;
     use crate::profiles::selector::WindowLimits;
     use crate::profiles::tenant_scope;
-    use crate::traces::tenant_scope::TenantTerm;
 
     const CPU: &str = "process_cpu:cpu:nanoseconds:cpu:nanoseconds";
     /// 2026-11-16T09:00Z and 10:00Z.
