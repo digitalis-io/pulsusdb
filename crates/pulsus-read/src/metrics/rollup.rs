@@ -1097,6 +1097,9 @@ fn counter(seq: &[Tagged], out: &mut Vec<Sample>) {
                 }
             }
             Tagged::Level { res_ms, row } => {
+                // Issue #863: the start point is `c` before this row, not
+                // `now − inc`, which can round below the previous point.
+                let before = c;
                 let now = match c {
                     Some(c) => c + row.inc,
                     None if row.last.is_nan() => {
@@ -1111,7 +1114,8 @@ fn counter(seq: &[Tagged], out: &mut Vec<Sample>) {
                     continue;
                 }
                 if *res_ms >= START_POINT_FROM_MS {
-                    out.push(Sample::float(row.t_end - res_ms + 1, now - row.inc));
+                    let start = before.unwrap_or(row.last - row.inc);
+                    out.push(Sample::float(row.t_end - res_ms + 1, start));
                 }
                 out.push(Sample::float(row.t_last, now));
                 p = Some(row.last);

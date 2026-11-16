@@ -6,7 +6,7 @@ SELECT fingerprint, toUInt8(0) AS arm,
        if(isNaN(x.4) AND (x.2 = 0 OR x.3 > 0), [(x.3, i, 1, reinterpretAsUInt64(x.4))], []),
        multiIf(x.2 > 0 AND x.3 = 0, CAST([], 'Array(Tuple(Int64, UInt64, UInt8, UInt64))'),
                isNaN(x.4), [(x.3, i, 1, reinterpretAsUInt64(x.4))],
-               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(c - x.5)), (x.3, i, 1, reinterpretAsUInt64(c))],
+               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(if(i > s, cs[i - 1], c - x.5))), (x.3, i, 1, reinterpretAsUInt64(c))],
                [(x.3, i, 1, reinterpretAsUInt64(c))])),
     e, arrayEnumerate(e), cs))))) AS raw
 FROM (
@@ -111,7 +111,7 @@ SELECT fingerprint, toUInt8(0) AS arm,
        if(isNaN(x.4) AND (x.2 = 0 OR x.3 > 0), [(x.3, i, 1, reinterpretAsUInt64(x.4))], []),
        multiIf(x.2 > 0 AND x.3 = 0, CAST([], 'Array(Tuple(Int64, UInt64, UInt8, UInt64))'),
                isNaN(x.4), [(x.3, i, 1, reinterpretAsUInt64(x.4))],
-               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(c - x.5)), (x.3, i, 1, reinterpretAsUInt64(c))],
+               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(if(i > s, cs[i - 1], c - x.5))), (x.3, i, 1, reinterpretAsUInt64(c))],
                [(x.3, i, 1, reinterpretAsUInt64(c))])),
     e, arrayEnumerate(e), cs))))) AS raw
 FROM (
@@ -173,7 +173,7 @@ SELECT fingerprint, toUInt8(0) AS arm,
        if(isNaN(x.4) AND (x.2 = 0 OR x.3 > 0), [(x.3, i, 1, reinterpretAsUInt64(x.4))], []),
        multiIf(x.2 > 0 AND x.3 = 0, CAST([], 'Array(Tuple(Int64, UInt64, UInt8, UInt64))'),
                isNaN(x.4), [(x.3, i, 1, reinterpretAsUInt64(x.4))],
-               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(c - x.5)), (x.3, i, 1, reinterpretAsUInt64(c))],
+               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(if(i > s, cs[i - 1], c - x.5))), (x.3, i, 1, reinterpretAsUInt64(c))],
                [(x.3, i, 1, reinterpretAsUInt64(c))])),
     e, arrayEnumerate(e), cs))))) AS raw
 FROM (
@@ -294,7 +294,7 @@ SELECT fingerprint, toUInt8(0) AS arm,
        if(isNaN(x.4) AND (x.2 = 0 OR x.3 > 0), [(x.3, i, 1, reinterpretAsUInt64(x.4))], []),
        multiIf(x.2 > 0 AND x.3 = 0, CAST([], 'Array(Tuple(Int64, UInt64, UInt8, UInt64))'),
                isNaN(x.4), [(x.3, i, 1, reinterpretAsUInt64(x.4))],
-               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(c - x.5)), (x.3, i, 1, reinterpretAsUInt64(c))],
+               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(if(i > s, cs[i - 1], c - x.5))), (x.3, i, 1, reinterpretAsUInt64(c))],
                [(x.3, i, 1, reinterpretAsUInt64(c))])),
     e, arrayEnumerate(e), cs))))) AS raw
 FROM (
@@ -452,7 +452,7 @@ SELECT fingerprint, toUInt8(0) AS arm,
        if(isNaN(x.4) AND (x.2 = 0 OR x.3 > 0), [(x.3, i, 1, reinterpretAsUInt64(x.4))], []),
        multiIf(x.2 > 0 AND x.3 = 0, CAST([], 'Array(Tuple(Int64, UInt64, UInt8, UInt64))'),
                isNaN(x.4), [(x.3, i, 1, reinterpretAsUInt64(x.4))],
-               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(c - x.5)), (x.3, i, 1, reinterpretAsUInt64(c))],
+               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(if(i > s, cs[i - 1], c - x.5))), (x.3, i, 1, reinterpretAsUInt64(c))],
                [(x.3, i, 1, reinterpretAsUInt64(c))])),
     e, arrayEnumerate(e), cs))))) AS raw
 FROM (
@@ -609,7 +609,7 @@ SELECT fingerprint, toUInt8(0) AS arm,
        if(isNaN(x.4) AND (x.2 = 0 OR x.3 > 0), [(x.3, i, 1, reinterpretAsUInt64(x.4))], []),
        multiIf(x.2 > 0 AND x.3 = 0, CAST([], 'Array(Tuple(Int64, UInt64, UInt8, UInt64))'),
                isNaN(x.4), [(x.3, i, 1, reinterpretAsUInt64(x.4))],
-               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(c - x.5)), (x.3, i, 1, reinterpretAsUInt64(c))],
+               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(if(i > s, cs[i - 1], c - x.5))), (x.3, i, 1, reinterpretAsUInt64(c))],
                [(x.3, i, 1, reinterpretAsUInt64(c))])),
     e, arrayEnumerate(e), cs))))) AS raw
 FROM (
@@ -869,7 +869,7 @@ SELECT fingerprint, toUInt8(0) AS arm,
        if(isNaN(x.4) AND (x.2 = 0 OR x.3 > 0), [(x.3, i, 1, reinterpretAsUInt64(x.4))], []),
        multiIf(x.2 > 0 AND x.3 = 0, CAST([], 'Array(Tuple(Int64, UInt64, UInt8, UInt64))'),
                isNaN(x.4), [(x.3, i, 1, reinterpretAsUInt64(x.4))],
-               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(c - x.5)), (x.3, i, 1, reinterpretAsUInt64(c))],
+               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(if(i > s, cs[i - 1], c - x.5))), (x.3, i, 1, reinterpretAsUInt64(c))],
                [(x.3, i, 1, reinterpretAsUInt64(c))])),
     e, arrayEnumerate(e), cs))))) AS raw
 FROM (
@@ -985,7 +985,7 @@ SELECT fingerprint, toUInt8(0) AS arm,
        if(isNaN(x.4) AND (x.2 = 0 OR x.3 > 0), [(x.3, i, 1, reinterpretAsUInt64(x.4))], []),
        multiIf(x.2 > 0 AND x.3 = 0, CAST([], 'Array(Tuple(Int64, UInt64, UInt8, UInt64))'),
                isNaN(x.4), [(x.3, i, 1, reinterpretAsUInt64(x.4))],
-               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(c - x.5)), (x.3, i, 1, reinterpretAsUInt64(c))],
+               x.2 >= 720000, [(x.1 - x.2 + 1, i, 0, reinterpretAsUInt64(if(i > s, cs[i - 1], c - x.5))), (x.3, i, 1, reinterpretAsUInt64(c))],
                [(x.3, i, 1, reinterpretAsUInt64(c))])),
     e, arrayEnumerate(e), cs))))) AS raw
 FROM (
