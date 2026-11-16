@@ -7,14 +7,16 @@
 //! reached the pool, or built an engine, itself would escape both.
 //!
 //! What it checks, over every `.rs` file under `src/logs_api`,
-//! `src/prom_api` and `src/traces_api` except `engine.rs` and `*_tests.rs`,
+//! `src/prom_api`, `src/traces_api` and `src/profiles_api` (issue #821)
+//! except `engine.rs` and `*_tests.rs`,
 //! each read up to its first `#[cfg(test)]` line:
 //!
 //! * none contains `.pool` followed by a character that cannot continue an
 //!   identifier (so `.pool_size` does not match), `from_shared_pool`,
 //!   `LogQlEngine::new`, `MetricsEngine::new`, `TraceEngine::new`,
-//!   `logql_engine(`, `metrics_engine(` or `trace_engine(`;
-//! * each of the three `engine.rs` exists and calls `engine_for(` only
+//!   `ProfilesEngine::new`, `logql_engine(`, `metrics_engine(`,
+//!   `trace_engine(` or `profiles_engine(`;
+//! * each of the four `engine.rs` exists and calls `engine_for(` only
 //!   inside `with_engine` and `tail_engine` (the nearest `fn` before each
 //!   call);
 //! * `tail_engine(` occurs in no file of `src/logs_api` other than
@@ -28,16 +30,23 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const DIRS: [&str; 3] = ["src/logs_api", "src/prom_api", "src/traces_api"];
+const DIRS: [&str; 4] = [
+    "src/logs_api",
+    "src/prom_api",
+    "src/traces_api",
+    "src/profiles_api",
+];
 
-const FORBIDDEN: [&str; 7] = [
+const FORBIDDEN: [&str; 9] = [
     "from_shared_pool",
     "LogQlEngine::new",
     "MetricsEngine::new",
     "TraceEngine::new",
+    "ProfilesEngine::new",
     "logql_engine(",
     "metrics_engine(",
     "trace_engine(",
+    "profiles_engine(",
 ];
 
 fn crate_root() -> PathBuf {

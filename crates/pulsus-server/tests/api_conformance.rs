@@ -646,6 +646,12 @@ fn valid_request(spec: &RouteSpec, method: Method) -> manifest::Req {
         "ingest routes build their own bodies"
     );
     let mut req = manifest::Req::new(method.as_str(), resolve_path(spec.path));
+    if spec.surface == Surface::ProfilesConnect {
+        // Issue #821: a Connect call's request is a JSON body.
+        req.content_type = Some("application/json");
+        req.body = spec.base_query.as_bytes().to_vec();
+        return req;
+    }
     match method {
         Method::Get => req.query = spec.base_query.to_string(),
         Method::Post => {
@@ -759,6 +765,21 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                     "{ctx}: data must be a JSON object, got {data}"
                 );
             }
+        }
+        (Surface::ProfilesQuery, _) | (Surface::ProfilesConnect, _) => {
+            // Issue #821: the base window ends before the lookback floor, so
+            // the method's response message is empty and nothing is read.
+            assert_eq!(
+                res.content_type(),
+                Some("application/json"),
+                "{ctx}: profiles content-type"
+            );
+            assert_eq!(
+                res.body,
+                b"{}",
+                "{ctx}: profiles body, got {:?}",
+                String::from_utf8_lossy(&res.body)
+            );
         }
         (Surface::LogsTail, _) => {
             // The pinned bare-GET `WebSocketUpgrade` rejection (issue

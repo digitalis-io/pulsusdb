@@ -43,6 +43,7 @@ pulsus-model = { path = "../pulsus-model" }
 # and reuses `pulsus_promql::plan`'s already-tested `__name__`-extraction
 # for `match[]` selectors — mirrors `pulsus-logql`'s own role on the log
 # query surface.
+pulsus-profiles-wire = { path = "../pulsus-profiles-wire" }
 pulsus-promql = { path = "../pulsus-promql" }
 pulsus-read = { path = "../pulsus-read" }
 # `traces_api/search.rs` (issue #57) parses TraceQL (`pulsus_traceql::parse`)

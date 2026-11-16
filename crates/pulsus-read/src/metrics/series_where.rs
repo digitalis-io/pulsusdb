@@ -898,6 +898,7 @@ mod tests {
                 "pub(super) fn label_keys(&self, t: SeriesTables<'_>) -> String {",
                 "pub(super) fn label_values(&self, key: &str, t: SeriesTables<'_>) -> String {",
                 "pub(crate) fn profile_series(t: &Tenant, w: DataWindow, from: &str, ms: &[LabelMatcher]) -> String {",
+                "pub(crate) fn profile_series_where(",
                 "pub fn anchored_re2_literal_for_test(pattern: &str) -> String {",
             ],
             "series_where.rs declarations drifted from this test's list"
@@ -944,6 +945,7 @@ mod tests {
                 "SeriesWhere::label_keys",
                 "SeriesWhere::label_values",
                 "profile_series",
+                "profile_series_where",
                 "SeriesTables",
                 "Lookup",
                 "MatcherTarget",

@@ -2078,6 +2078,43 @@ mod tests {
         }
     }
 
+    /// Issue #821: each of the six profiles read settings refuses zero,
+    /// naming its field. A zero ceiling is ClickHouse's "unlimited".
+    #[test]
+    fn each_profiles_read_setting_refuses_zero() {
+        type Mutator = fn(&mut Config);
+        let cases: &[(&str, Mutator)] = &[
+            ("reader.profiles_max_query_length", |c| {
+                c.reader.profiles_max_query_length = HumanDuration(std::time::Duration::ZERO)
+            }),
+            ("reader.profiles_max_query_lookback", |c| {
+                c.reader.profiles_max_query_lookback = HumanDuration(std::time::Duration::ZERO)
+            }),
+            ("reader.profiles_scan_budget_rows", |c| {
+                c.reader.profiles_scan_budget_rows = 0
+            }),
+            ("reader.profiles_max_tree_nodes", |c| {
+                c.reader.profiles_max_tree_nodes = 0
+            }),
+            ("reader.profiles_max_result_bytes", |c| {
+                c.reader.profiles_max_result_bytes = 0
+            }),
+            ("reader.profiles_query_memory_bytes", |c| {
+                c.reader.profiles_query_memory_bytes = 0
+            }),
+        ];
+        for (field, mutate) in cases {
+            let mut cfg = Config::default();
+            mutate(&mut cfg);
+            match validate(&cfg) {
+                Err(ConfigError::Value { field: got, .. }) => {
+                    assert_eq!(&got, field, "wrong field named for {field}")
+                }
+                other => panic!("{field}: expected a Value error, got {other:?}"),
+            }
+        }
+    }
+
     /// Issue #778: the read cache's tenant share is a percent from 1 to
     /// 100, refused outside it naming its field; the defaults are 256 MiB
     /// and 50.

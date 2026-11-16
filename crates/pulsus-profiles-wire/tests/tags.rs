@@ -4,11 +4,22 @@
 //! scalar type or a missing `repeated` changes the bytes. The expected bytes
 //! are built field by field with `prost::encoding`, in tag order, with the
 //! tag and type read off the proto file.
+//!
+//! W1 (issue #821): the same for every `types_v1` and `querier_v1` message
+//! the query API uses, against `proto/types/v1/types.proto` and
+//! `proto/querier/v1/querier.proto`.
 
 use prost::Message;
 use prost::encoding;
 use pulsus_profiles_wire::google_v1::{
     Function, Label, Line, Location, Mapping, Profile, Sample, ValueType,
+};
+use pulsus_profiles_wire::querier_v1::{
+    ProfileTypesRequest, ProfileTypesResponse, SeriesRequest, SeriesResponse,
+};
+use pulsus_profiles_wire::types_v1::{
+    LabelNamesRequest, LabelNamesResponse, LabelPair, LabelValuesRequest, LabelValuesResponse,
+    Labels, ProfileType,
 };
 
 fn value_type() -> ValueType {
@@ -204,4 +215,154 @@ fn every_field_encodes_under_the_proto_tag() {
     check("Function", &f, function_bytes(&f));
     let p = profile();
     check("Profile", &p, profile_bytes(&p));
+}
+
+fn pair(name: &str, value: &str) -> LabelPair {
+    LabelPair {
+        name: name.to_string(),
+        value: value.to_string(),
+    }
+}
+
+fn pair_bytes(p: &LabelPair) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::string::encode(1, &p.name, &mut b);
+    encoding::string::encode(2, &p.value, &mut b);
+    b
+}
+
+fn profile_type() -> ProfileType {
+    ProfileType {
+        id: "a:b:c:d:e".to_string(),
+        name: "a".to_string(),
+        sample_type: "b".to_string(),
+        sample_unit: "c".to_string(),
+        period_type: "d".to_string(),
+        period_unit: "e".to_string(),
+    }
+}
+
+fn profile_type_bytes(t: &ProfileType) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::string::encode(1, &t.id, &mut b);
+    encoding::string::encode(2, &t.name, &mut b);
+    encoding::string::encode(4, &t.sample_type, &mut b);
+    encoding::string::encode(5, &t.sample_unit, &mut b);
+    encoding::string::encode(6, &t.period_type, &mut b);
+    encoding::string::encode(7, &t.period_unit, &mut b);
+    b
+}
+
+fn labels() -> Labels {
+    Labels {
+        labels: vec![pair("a", "1"), pair("b", "2")],
+    }
+}
+
+fn labels_bytes(l: &Labels) -> Vec<u8> {
+    let mut b = Vec::new();
+    for p in &l.labels {
+        nested(1, &pair_bytes(p), &mut b);
+    }
+    b
+}
+
+/// One length-delimited field holding `inner`, written without the nested
+/// type's own encoder.
+fn nested(tag: u32, inner: &[u8], b: &mut Vec<u8>) {
+    encoding::encode_key(tag, encoding::WireType::LengthDelimited, b);
+    encoding::encode_varint(inner.len() as u64, b);
+    b.extend_from_slice(inner);
+}
+
+fn strings(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn every_query_message_field_encodes_under_the_proto_tag() {
+    let p = pair("n", "v");
+    assert_eq!(p.encode_to_vec(), pair_bytes(&p), "LabelPair");
+    let t = profile_type();
+    assert_eq!(t.encode_to_vec(), profile_type_bytes(&t), "ProfileType");
+    let l = labels();
+    assert_eq!(l.encode_to_vec(), labels_bytes(&l), "Labels");
+
+    let m = LabelNamesRequest {
+        matchers: strings(&["{a=\"1\"}", "{b=\"2\"}"]),
+        start: 1000,
+        end: 2000,
+    };
+    let mut b = Vec::new();
+    encoding::string::encode_repeated(1, &m.matchers, &mut b);
+    encoding::int64::encode(2, &m.start, &mut b);
+    encoding::int64::encode(3, &m.end, &mut b);
+    assert_eq!(m.encode_to_vec(), b, "LabelNamesRequest");
+
+    let m = LabelNamesResponse {
+        names: strings(&["a", "b"]),
+    };
+    let mut b = Vec::new();
+    encoding::string::encode_repeated(1, &m.names, &mut b);
+    assert_eq!(m.encode_to_vec(), b, "LabelNamesResponse");
+
+    let m = LabelValuesRequest {
+        name: "env".to_string(),
+        matchers: strings(&["{a=\"1\"}"]),
+        start: 1000,
+        end: 2000,
+    };
+    let mut b = Vec::new();
+    encoding::string::encode(1, &m.name, &mut b);
+    encoding::string::encode_repeated(2, &m.matchers, &mut b);
+    encoding::int64::encode(3, &m.start, &mut b);
+    encoding::int64::encode(4, &m.end, &mut b);
+    assert_eq!(m.encode_to_vec(), b, "LabelValuesRequest");
+
+    let m = LabelValuesResponse {
+        names: strings(&["dev", "prod"]),
+    };
+    let mut b = Vec::new();
+    encoding::string::encode_repeated(1, &m.names, &mut b);
+    assert_eq!(m.encode_to_vec(), b, "LabelValuesResponse");
+
+    let m = ProfileTypesRequest {
+        start: 1000,
+        end: 2000,
+    };
+    let mut b = Vec::new();
+    encoding::int64::encode(1, &m.start, &mut b);
+    encoding::int64::encode(2, &m.end, &mut b);
+    assert_eq!(m.encode_to_vec(), b, "ProfileTypesRequest");
+
+    let m = ProfileTypesResponse {
+        profile_types: vec![profile_type(), profile_type()],
+    };
+    let mut b = Vec::new();
+    for t in &m.profile_types {
+        nested(1, &profile_type_bytes(t), &mut b);
+    }
+    assert_eq!(m.encode_to_vec(), b, "ProfileTypesResponse");
+
+    let m = SeriesRequest {
+        matchers: strings(&["{a=\"1\"}"]),
+        label_names: strings(&["a", "b"]),
+        start: 1000,
+        end: 2000,
+    };
+    let mut b = Vec::new();
+    encoding::string::encode_repeated(1, &m.matchers, &mut b);
+    encoding::string::encode_repeated(2, &m.label_names, &mut b);
+    encoding::int64::encode(3, &m.start, &mut b);
+    encoding::int64::encode(4, &m.end, &mut b);
+    assert_eq!(m.encode_to_vec(), b, "SeriesRequest");
+
+    let m = SeriesResponse {
+        labels_set: vec![labels(), Labels::default()],
+    };
+    let mut b = Vec::new();
+    for l in &m.labels_set {
+        nested(2, &labels_bytes(l), &mut b);
+    }
+    assert_eq!(m.encode_to_vec(), b, "SeriesResponse");
 }

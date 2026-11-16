@@ -71,6 +71,9 @@ pub(crate) enum DeadlineClass {
     /// (`tower-http-0.6.11/src/timeout/service.rs:144-146`:
     /// `Response::new(B::default())` plus a status, nothing else).
     Bare,
+    /// Stub.
+    #[allow(dead_code)]
+    Connect,
 }
 
 /// Total over the `/api/v1/` prefix by construction (issue #471 M2): a
@@ -200,7 +203,7 @@ where
                         DeadlineClass::PromApiEnvelope => {
                             crate::prom_api::deadline_response(timeout)
                         }
-                        DeadlineClass::Bare => {
+                        DeadlineClass::Bare | DeadlineClass::Connect => {
                             let mut res = Response::new(Body::default());
                             *res.status_mut() = StatusCode::REQUEST_TIMEOUT;
                             res
@@ -452,6 +455,99 @@ mod tests {
                 "{path} must keep the bare 408"
             );
         }
+    }
+
+    /// The twelve profiles query paths (issue #821), `{name}` as `env`.
+    const PROFILES_PATHS: [&str; 12] = [
+        "/querier.v1.QuerierService/ProfileTypes",
+        "/querier.v1.QuerierService/LabelNames",
+        "/querier.v1.QuerierService/LabelValues",
+        "/querier.v1.QuerierService/Series",
+        "/api/profiles/v1/querier.v1.QuerierService/ProfileTypes",
+        "/api/profiles/v1/querier.v1.QuerierService/LabelNames",
+        "/api/profiles/v1/querier.v1.QuerierService/LabelValues",
+        "/api/profiles/v1/querier.v1.QuerierService/Series",
+        "/api/profiles/v1/types",
+        "/api/profiles/v1/labels",
+        "/api/profiles/v1/label/env/values",
+        "/api/profiles/v1/series",
+    ];
+
+    /// C6 (issue #821): the twelve profiles query paths answer a deadline
+    /// as a Connect error; the profiles ingest path keeps the bare `408`.
+    #[test]
+    fn c6_the_profiles_query_paths_answer_a_connect_deadline() {
+        for path in PROFILES_PATHS {
+            assert_eq!(deadline_class(path), DeadlineClass::Connect, "{path}");
+        }
+        assert_eq!(
+            deadline_class("/api/profiles/v1/ingest"),
+            DeadlineClass::Bare
+        );
+    }
+
+    /// Issue #821 review note 1: the class names the eight Connect paths
+    /// exactly. Another method under either service prefix, and a deeper
+    /// path under the values route, keep the class they had.
+    #[test]
+    fn an_unrelated_path_under_a_profiles_prefix_keeps_its_class() {
+        for path in [
+            "/querier.v1.QuerierService/SelectMergeStacktraces",
+            "/querier.v1.QuerierService/LabelNamesX",
+            "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
+            "/api/profiles/v1/querier.v1.QuerierService/",
+            "/api/profiles/v1/render",
+            "/api/profiles/v1/label/a/b/values",
+            "/api/profiles/v1/label//values",
+            "/settings.v1.SettingsService/Get",
+        ] {
+            assert_eq!(deadline_class(path), DeadlineClass::Bare, "{path}");
+        }
+    }
+
+    /// C6: a stalled Connect call answers `504` with the reference's
+    /// Connect body.
+    #[tokio::test]
+    async fn c6_a_stalled_connect_call_answers_the_deadline_body() {
+        use axum::body::Body;
+        use axum::routing::post;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let cfg = Config {
+            query_timeout: pulsus_config::HumanDuration(Duration::from_millis(1)),
+            ..Config::default()
+        };
+        let router: axum::Router = axum::Router::new()
+            .route(
+                "/querier.v1.QuerierService/LabelNames",
+                post(std::future::pending::<&'static str>),
+            )
+            .layer(timeout_layer(&cfg));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/querier.v1.QuerierService/LabelNames")
+            .body(Body::empty())
+            .unwrap();
+        let res = router.oneshot(request).await.unwrap();
+        assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            res.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            concat!(
+                r#"{"code":"deadline_exceeded","message":"request timed out, decrease the "#,
+                r#"duration of the request or add more label matchers (prefer exact match "#,
+                r#"over regex match) to reduce the amount of data processed"}"#
+            )
+        );
     }
 
     #[tokio::test]
