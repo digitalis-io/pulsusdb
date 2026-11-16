@@ -1130,6 +1130,72 @@ mod tests {
         assert!(!r.contains("pulsus_ingest_backfill_"));
     }
 
+    /// The profile writer's ingest series reach `/metrics` through
+    /// [`ProfileWriterSink`]: the handler renders one
+    /// `table="profile_landing"` set, the `signal="profiles"` set and the
+    /// push-suppression set, each at its seeded value, and none of the
+    /// series profiles do not have. Seeds: table base 300, per-signal
+    /// 81..=84, dedup base 330.
+    #[test]
+    fn profile_ingest_snapshot_reaches_metrics_through_its_sink() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let snap = TraceWriterMetricsSnapshot {
+            landing: table_snap(300),
+            queue_bytes: 600,
+            backpressure_total: 81,
+            spool_poison_total: 82,
+            spool_uncertain_total: 83,
+            rejected_total: 84,
+            dedup: dedup_snap(330),
+        };
+        let mut state = test_state();
+        state.metrics = handle.clone();
+        state.profile_writer = Arc::new(crate::ingest::ProfileWriterSink::with_metrics_snapshot(
+            snap,
+        ));
+        let body = metrics::with_local_recorder(&recorder, || {
+            futures::executor::block_on(async {
+                let res = metrics_handler(State(state)).await.into_response();
+                axum::body::to_bytes(res.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+            })
+        });
+        let r = String::from_utf8(body.to_vec()).unwrap();
+
+        assert_table_types(&r);
+        assert_signal_types(&r);
+        assert_table_series(&r, "profile_landing", 300);
+        assert_sample(&r, r#"pulsus_ingest_queue_bytes{signal="profiles"}"#, 600.0);
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_backpressure_total{signal="profiles"}"#,
+            81.0,
+        );
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_spool_poison_total{signal="profiles"}"#,
+            82.0,
+        );
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_spool_uncertain_total{signal="profiles"}"#,
+            83.0,
+        );
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_rejected_total{signal="profiles"}"#,
+            84.0,
+        );
+        assert_dedup_types(&r);
+        assert_dedup_series(&r, "profiles", 330);
+        assert!(!r.contains("pulsus_ingest_registrations_total"));
+        assert!(!r.contains("pulsus_ingest_collisions_total"));
+        assert!(!r.contains("pulsus_ingest_patterns_dropped_total"));
+        assert!(!r.contains("pulsus_ingest_backfill_"));
+    }
+
     /// AC-3 / reader-only guard: `metrics_handler` with empty writer slots
     /// (a reader-only or not-yet-warm process) renders a body with NO line
     /// starting `pulsus_ingest_` — the `Option::None` short-circuit holds

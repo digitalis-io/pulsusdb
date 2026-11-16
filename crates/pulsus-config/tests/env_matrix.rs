@@ -348,6 +348,11 @@ const ROWS: &[Row] = &[
         check: |c| c.writer.profile_landing_max_rows == 2_000_000,
     },
     Row {
+        var: "PULSUS_PROFILE_MAX_BODY_BYTES",
+        value: "1MiB",
+        check: |c| c.writer.profile_max_body_bytes == ByteSize(1024 * 1024),
+    },
+    Row {
         var: "PULSUS_LANDING_BATCH_MS",
         value: "250",
         check: |c| c.writer.landing_batch_ms == 250,
@@ -1031,4 +1036,18 @@ fn the_replica_delay_variable_takes_whole_seconds_in_range() {
             "{refused}: {got:?}"
         );
     }
+}
+
+/// `PULSUS_PROFILE_MAX_BODY_BYTES`: 256 MiB by default, and `0` turns the
+/// cap off.
+#[test]
+fn the_profile_body_cap_defaults_to_256_mib_and_zero_turns_it_off() {
+    let _guard = support::lock_env();
+    support::clear_all();
+    let cfg = pulsus_config::parse(None, None).expect("defaults parse");
+    assert_eq!(cfg.writer.profile_max_body_bytes, ByteSize(268_435_456));
+    support::set("PULSUS_PROFILE_MAX_BODY_BYTES", "0");
+    let cfg = pulsus_config::parse(None, None).expect("0 parses");
+    assert_eq!(cfg.writer.profile_max_body_bytes, ByteSize(0));
+    support::clear_all();
 }

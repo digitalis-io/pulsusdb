@@ -128,7 +128,7 @@ zmij = "1"
 # OTLP logs (issue #8), metrics (issue #27), and traces (issue #54)
 # receivers. `opentelemetry-proto` supplies `prost`-generated OTLP message
 # types with the transport/tonic runtime disabled (`default-features =
-# false`, `gen-tonic-messages` + `logs` + `metrics` + `trace` only) — no
+# false`, `gen-tonic-messages` + `logs` + `metrics` + `profiles` + `trace` only) — no
 # protoc in CI, no gRPC transport pulled in for what is a pure
 # protobuf-decode + axum handler. Exact-pinned so a future
 # `opentelemetry-proto` release cannot silently change wire-compatible
@@ -147,6 +147,7 @@ opentelemetry-proto = { version = "=0.32.0", default-features = false, features 
     "gen-tonic-messages",
     "logs",
     "metrics",
+    "profiles",
     "trace",
     "with-serde",
 ] }

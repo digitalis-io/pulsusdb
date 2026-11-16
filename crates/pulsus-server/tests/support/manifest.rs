@@ -525,6 +525,12 @@ pub enum PlainTextWriter {
     /// hermetic
     /// `zipkin_sink_error_container_omits_nosniff_and_terminator`.
     ZipkinDecodeHttpError,
+    /// `/v1development/profiles`, a body that does not decode — the
+    /// reference's OTLP profiles handler writes it through `http.Error`
+    /// (`pkg/ingester/otlp/ingest_handler.go:190-200`). Asserted: `nosniff`
+    /// PRESENT and **exactly one** trailing `\n`. Every other refusal on
+    /// that route is [`ExpectedError::Otlp`].
+    OtlpProfilesHttpError,
 }
 
 /// What a writer's reference says about `X-Content-Type-Options`.
@@ -584,7 +590,8 @@ impl PlainTextWriter {
             PlainTextWriter::LogqlWriteError
             | PlainTextWriter::LokiPushHttpError
             | PlainTextWriter::PromRemoteWriteHttpError
-            | PlainTextWriter::ZipkinDecodeHttpError => NosniffRule::Present,
+            | PlainTextWriter::ZipkinDecodeHttpError
+            | PlainTextWriter::OtlpProfilesHttpError => NosniffRule::Present,
             // Tempo's frontend sets no headers at all.
             PlainTextWriter::TempoFrontendResponse => NosniffRule::Absent,
         }
@@ -1315,6 +1322,30 @@ const OTLP_TRACES_INGEST_CASES: &[CaseClass] = &[
     },
 ];
 
+/// `/v1development/profiles`: [`OTLP_TRACES_INGEST_CASES`]' first three
+/// cases. A body that does not decode answers the reference's plain text;
+/// an unsupported `Content-Encoding` keeps the OTLP envelope.
+const OTLP_PROFILES_INGEST_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "malformed_body",
+        build: otlp_malformed_body,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::OtlpProfilesHttpError),
+    },
+    CaseClass {
+        name: "unsupported_content_encoding",
+        build: otlp_wrong_content_encoding,
+        expect_status: 400,
+        expect: ExpectedError::Otlp { code: 3 },
+    },
+    CaseClass {
+        name: "undecodable_body_correct_content_type",
+        build: otlp_undecodable_with_correct_content_type,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::OtlpProfilesHttpError),
+    },
+];
+
 /// The valid-but-absent 32-hex trace id every `{traceId}` placeholder
 /// resolves to (issue #55 verification finding: the old 8-char `abcd1234`
 /// placeholder is invalid under the 16-or-32-hex rule and would 400 on the
@@ -1971,6 +2002,17 @@ static MANIFEST: &[RouteSpec] = &[
         success_status: 200,
         base_query: "",
         cases: OTLP_TRACES_INGEST_CASES,
+    },
+    RouteSpec {
+        path: "/v1development/profiles",
+        methods: &[Method::Post],
+        surface: Surface::Ingest,
+        gate: Gate::WriterMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: OTLP_PROFILES_INGEST_CASES,
     },
     RouteSpec {
         path: "/api/v1/write",
@@ -3032,17 +3074,6 @@ static MANIFEST: &[RouteSpec] = &[
     // the endpoint inventory's own documentation value and are excluded
     // from both the drift guard (never `Mounted`) and the docs-gap check
     // (`DocRef::Skip`).
-    RouteSpec {
-        path: "/v1development/profiles",
-        methods: &[Method::Post],
-        surface: Surface::Ingest,
-        gate: Gate::WriterMode,
-        status: RouteStatus::Planned { milestone: "M5" },
-        doc_ref: DocRef::Skip,
-        success_status: 0,
-        base_query: "",
-        cases: &[],
-    },
     // Issue #171 (M7-C3): the former Planned `/patterns` row flips to Mounted
     // and moves up into the native logs section above; the compat alias joins
     // the `/loki/api/v1` block. (The detected_labels/detected_fields rows

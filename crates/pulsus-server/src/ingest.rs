@@ -251,16 +251,36 @@ impl TraceSink for TraceWriterSink {
 /// "backpressure while empty" contract.
 pub(crate) struct ProfileWriterSink {
     slot: Arc<OnceLock<Arc<ProfileWriter>>>,
+    /// Test-only snapshot seam; see [`WriterSink`].
+    #[cfg(test)]
+    metrics_override: Option<TraceWriterMetricsSnapshot>,
 }
 
 impl ProfileWriterSink {
     pub(crate) fn new(slot: Arc<OnceLock<Arc<ProfileWriter>>>) -> Self {
-        ProfileWriterSink { slot }
+        ProfileWriterSink {
+            slot,
+            #[cfg(test)]
+            metrics_override: None,
+        }
+    }
+
+    /// Test-only constructor seeding [`ProfileWriterSink::metrics`].
+    #[cfg(test)]
+    pub(crate) fn with_metrics_snapshot(snap: TraceWriterMetricsSnapshot) -> Self {
+        ProfileWriterSink {
+            slot: Arc::new(OnceLock::new()),
+            metrics_override: Some(snap),
+        }
     }
 
     /// The profile writer's ingest-metrics snapshot, else `None` on an
     /// empty slot. See [`WriterSink::metrics`].
     pub(crate) fn metrics(&self) -> Option<TraceWriterMetricsSnapshot> {
+        #[cfg(test)]
+        if let Some(snap) = self.metrics_override {
+            return Some(snap);
+        }
         self.slot.get().map(|w| w.metrics())
     }
 }
@@ -356,6 +376,23 @@ pub(crate) async fn ingest_traces(
     body: Body,
 ) -> Response {
     pulsus_write::ingest_traces(state.trace_writer.as_ref(), headers, body).await
+}
+
+/// `POST /v1development/profiles` (docs/api.md §1.1): pulls `AppState`'s
+/// `ProfileWriterSink` and the configured body cap and hands straight into
+/// `pulsus_write::ingest_otlp_profiles`.
+pub(crate) async fn ingest_otlp_profiles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    pulsus_write::ingest_otlp_profiles(
+        state.profile_writer.as_ref(),
+        headers,
+        body,
+        state.config.writer.profile_max_body_bytes.0,
+    )
+    .await
 }
 
 /// `POST /api/v1/write` (docs/api.md §1.2, issue #28): Prometheus remote-

@@ -745,3 +745,38 @@ fn the_generated_decoder_reads_an_omitted_field_as_its_default() {
     check::<MetricsData>(&mut w, "{}", |v| v.resource_metrics.is_empty());
     assert!(w.is_empty(), "{} of 12 refused:\n{}", w.len(), w.join("\n"));
 }
+
+/// **J3.** Patch P8, on the profiles derives directly: hex link ids, an
+/// omitted field read as its default, values as strings or numbers, and
+/// 64-bit integers as strings.
+#[test]
+fn the_profiles_derives_read_hex_ids_defaults_and_string_integers() {
+    use opentelemetry_proto::tonic::profiles::v1development::{Link, Profile, Sample};
+    let mut w: Vec<String> = Vec::new();
+    let link = r#"{"traceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","spanId":"0102030405060708"}"#;
+    match serde_json::from_str::<Link>(link) {
+        Ok(v) if v.trace_id == [0xaa; 16] && v.span_id == [1, 2, 3, 4, 5, 6, 7, 8] => {}
+        other => w.push(format!("Link {link}: {other:?}")),
+    }
+    let sample = r#"{"stackIndex":1}"#;
+    match serde_json::from_str::<Sample>(sample) {
+        Ok(v)
+            if v.stack_index == 1
+                && v.link_index == 0
+                && v.values.is_empty()
+                && v.attribute_indices.is_empty()
+                && v.timestamps_unix_nano.is_empty() => {}
+        other => w.push(format!("Sample {sample}: {other:?}")),
+    }
+    let values = r#"{"values":["2",3]}"#;
+    match serde_json::from_str::<Sample>(values) {
+        Ok(v) if v.values == [2, 3] => {}
+        other => w.push(format!("Sample {values}: {other:?}")),
+    }
+    let profile = r#"{"timeUnixNano":"5","period":"7"}"#;
+    match serde_json::from_str::<Profile>(profile) {
+        Ok(v) if v.time_unix_nano == 5 && v.period == 7 => {}
+        other => w.push(format!("Profile {profile}: {other:?}")),
+    }
+    assert!(w.is_empty(), "{} of 4 refused:\n{}", w.len(), w.join("\n"));
+}

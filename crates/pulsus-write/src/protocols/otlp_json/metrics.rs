@@ -246,7 +246,7 @@ impl<'de> serde::Deserialize<'de> for ScalarToken {
 /// for `HistogramDataPoint.bucketCounts`/`explicitBounds` and
 /// `Buckets.bucketCounts`, whose per-element special-double / u64-as-string
 /// codec lives in the vendor crate's private `serializers` module.
-fn accumulate_bounded_scalar_array<'de, A>(
+pub(super) fn accumulate_bounded_scalar_array<'de, A>(
     map: &mut A,
     per_level: (usize, &'static str),
     bytes: ByteBudget<'_>,

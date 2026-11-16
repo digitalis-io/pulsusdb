@@ -1701,6 +1701,7 @@ mod tests {
         assert_eq!(d.writer.profile_landing_retries, 3);
         assert_eq!(d.writer.profile_landing_inserters, 4);
         assert_eq!(d.writer.profile_landing_max_rows, 1_048_576);
+        assert_eq!(d.writer.profile_max_body_bytes, ByteSize(268_435_456));
         assert!(validate(&d).is_ok());
 
         // (field, setter, bad values, good values)

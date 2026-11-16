@@ -162,6 +162,7 @@ fn input(time_nanos: i64) -> ProfileInput {
         decompressed_bytes: 1_000,
         id: None,
         annotations: Vec::new(),
+        language: None,
     }
 }
 
@@ -321,4 +322,127 @@ async fn a_retry_after_a_failed_insert_is_stored() {
         "the refusal, then the retry's commit"
     );
     assert_eq!(calls, 2, "the retry reaches the insert");
+}
+
+/// An OTLP profiles request whose three samples name the services `a`,
+/// `b`, `a`, timed `time_ns`.
+fn otlp_three_services(
+    time_ns: u64,
+) -> opentelemetry_proto::tonic::collector::profiles::v1development::ExportProfilesServiceRequest {
+    use opentelemetry_proto::tonic::collector::profiles::v1development::ExportProfilesServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value::Value};
+    use opentelemetry_proto::tonic::profiles::v1development as otlp;
+    let string = |s: &str| {
+        Some(AnyValue {
+            value: Some(Value::StringValue(s.to_owned())),
+        })
+    };
+    let dictionary = otlp::ProfilesDictionary {
+        string_table: [
+            "",
+            "samples",
+            "count",
+            "cpu",
+            "nanoseconds",
+            "main",
+            "service.name",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect(),
+        mapping_table: vec![otlp::Mapping::default()],
+        function_table: vec![
+            otlp::Function::default(),
+            otlp::Function {
+                name_strindex: 5,
+                ..otlp::Function::default()
+            },
+        ],
+        location_table: vec![
+            otlp::Location::default(),
+            otlp::Location {
+                lines: vec![otlp::Line {
+                    function_index: 1,
+                    ..otlp::Line::default()
+                }],
+                ..otlp::Location::default()
+            },
+        ],
+        stack_table: vec![
+            otlp::Stack::default(),
+            otlp::Stack {
+                location_indices: vec![1],
+            },
+        ],
+        link_table: vec![otlp::Link::default()],
+        attribute_table: vec![
+            otlp::KeyValueAndUnit::default(),
+            otlp::KeyValueAndUnit {
+                key_strindex: 6,
+                value: string("a"),
+                unit_strindex: 0,
+            },
+            otlp::KeyValueAndUnit {
+                key_strindex: 6,
+                value: string("b"),
+                unit_strindex: 0,
+            },
+        ],
+    };
+    let samples = [1, 2, 1]
+        .iter()
+        .map(|&a| otlp::Sample {
+            stack_index: 1,
+            values: vec![1],
+            attribute_indices: vec![a],
+            ..otlp::Sample::default()
+        })
+        .collect();
+    ExportProfilesServiceRequest {
+        dictionary: Some(dictionary),
+        resource_profiles: vec![otlp::ResourceProfiles {
+            scope_profiles: vec![otlp::ScopeProfiles {
+                profiles: vec![otlp::Profile {
+                    sample_type: Some(otlp::ValueType {
+                        type_strindex: 1,
+                        unit_strindex: 2,
+                    }),
+                    period_type: Some(otlp::ValueType {
+                        type_strindex: 3,
+                        unit_strindex: 4,
+                    }),
+                    period: 10_000_000,
+                    time_unix_nano: time_ns,
+                    samples,
+                    ..otlp::Profile::default()
+                }],
+                ..otlp::ScopeProfiles::default()
+            }],
+            ..otlp::ResourceProfiles::default()
+        }],
+    }
+}
+
+/// An OTLP profiles request with samples grouped by their own service
+/// converts the same way each time, so the same request sent twice is one
+/// insert.
+#[tokio::test]
+async fn an_otlp_request_converted_twice_is_one_insert() {
+    let now = now_ms();
+    let request = otlp_three_services(now as u64 * 1_000_000);
+    let convert = || {
+        let inputs = pulsus_write::protocols::otlp_profiles::to_inputs(&request, false)
+            .unwrap_or_else(|r| panic!("converted: {}", r.message));
+        parse_profiles(inputs, now).expect("the push is accepted")
+    };
+    let (first, again) = (convert(), convert());
+    assert_eq!(first.series.len(), 2, "two services: {:?}", first.series);
+    let (answers, calls) = run(
+        "otlp",
+        vec![Act::Ok],
+        vec![(tenant("t1"), first), (tenant("t1"), again)],
+    )
+    .await;
+    assert_eq!(answers, vec![true, true]);
+    assert_eq!(calls, 1, "the second conversion is suppressed");
 }

@@ -9,7 +9,8 @@ pub mod writer;
 
 pub use error::LogsIngestError;
 pub use ingest::http::{
-    ingest, ingest_loki_push, ingest_metrics, ingest_remote_write, ingest_traces, ingest_zipkin,
+    ingest, ingest_loki_push, ingest_metrics, ingest_otlp_profiles, ingest_remote_write,
+    ingest_traces, ingest_zipkin,
 };
 pub use ingest::metrics::{
     ExemplarPoint, HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics,
