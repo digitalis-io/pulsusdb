@@ -11,6 +11,7 @@ use crate::traces::tenant_scope::TenantTerm;
 use super::catalogue::{Read, compat_sets};
 use super::dispatch::ProfileDispatch;
 use super::selector::WindowLimits;
+use super::series::TimeSeriesRow;
 use super::tree::TreeRow;
 
 /// ClickHouse's `TOO_MANY_ROWS` (`max_rows_to_read`).
@@ -46,6 +47,8 @@ pub struct ProfilesReadConfig {
     pub series_table: String,
     /// Issue #823: `profile_samples`, or its wrapper on a cluster.
     pub samples_table: String,
+    /// Issue #824: `profile_entries`, or its wrapper on a cluster.
+    pub entries_table: String,
     /// The wrapper suffix when clustered, else empty: the tenant check's
     /// table list.
     pub dist_suffix: String,
@@ -75,6 +78,7 @@ impl ProfilesReadConfig {
         ProfilesReadConfig {
             series_table: format!("profile_series{dist}"),
             samples_table: format!("profile_samples{dist}"),
+            entries_table: format!("profile_entries{dist}"),
             dist_suffix: dist.to_string(),
             limits: WindowLimits {
                 max_length_ms: millis(r.profiles_max_query_length.0),
@@ -226,6 +230,13 @@ impl ProfilesEngine {
         let settings = tree_settings(&self.config, self.log_comment.as_deref());
         self.dispatch.rows(sql, &settings).await
     }
+
+    /// Issue #824: sends S6 (`super::series`) and returns one row per
+    /// series.
+    pub async fn read_series(&self, sql: &str) -> Result<Vec<TimeSeriesRow>, ProfilesReadError> {
+        let settings = read_settings(&self.config, self.log_comment.as_deref());
+        self.dispatch.rows(sql, &settings).await
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +247,7 @@ mod tests {
         ProfilesReadConfig {
             series_table: "profile_series".to_string(),
             samples_table: "profile_samples".to_string(),
+            entries_table: "profile_entries".to_string(),
             dist_suffix: String::new(),
             limits: WindowLimits::default(),
             scan_budget_rows: 11,
@@ -382,6 +394,7 @@ mod tests {
             let c = ProfilesReadConfig::from_config(&config);
             assert_eq!(c.series_table, format!("profile_series{dist}"));
             assert_eq!(c.samples_table, format!("profile_samples{dist}"));
+            assert_eq!(c.entries_table, format!("profile_entries{dist}"));
             assert_eq!(c.max_nodes_default, 17);
             assert_eq!(c.max_nodes_max, 19);
             assert_eq!(c.dist_suffix, dist);

@@ -6,11 +6,14 @@
 //! series table, or none when its window ends before the lookback floor.
 //! Issue #823: `SelectMergeStacktraces`, the merged flame graph, at the two
 //! Connect paths and `GET /api/profiles/v1/merge`, in one statement.
+//! Issue #824: `SelectSeries`, the time series of profile totals, at the two
+//! Connect paths and `GET /api/profiles/v1/select_series`, in one statement.
 
 pub(crate) mod connect;
 mod engine;
 mod merge;
 pub(crate) mod routes;
+mod series;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -41,6 +44,10 @@ pub(crate) fn router() -> Router<AppState> {
             "/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces",
             post(merge::select_merge_stacktraces),
         )
+        .route(
+            "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
+            post(series::select_series),
+        )
         .route("/api/profiles/v1/types", get(routes::types_get))
         .route(
             "/api/profiles/v1/labels",
@@ -55,6 +62,10 @@ pub(crate) fn router() -> Router<AppState> {
             get(routes::series_get).post(routes::series_get),
         )
         .route("/api/profiles/v1/merge", get(merge::merge_get))
+        .route(
+            "/api/profiles/v1/select_series",
+            get(series::select_series_get),
+        )
 }
 
 /// The compat surface: the Connect paths at the root. Mounting it is
@@ -77,6 +88,10 @@ pub(crate) fn compat_router() -> Router<AppState> {
         .route(
             "/querier.v1.QuerierService/SelectMergeStacktraces",
             post(merge::select_merge_stacktraces),
+        )
+        .route(
+            "/querier.v1.QuerierService/SelectSeries",
+            post(series::select_series),
         )
 }
 

@@ -1059,6 +1059,7 @@ docs/reference-defects-we-do-not-copy.md	metrics_to_prw.go:218-233	not_in_this_r
 docs/reference-defects-we-do-not-copy.md	metrics_to_prw.go:235-239	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	modules/livestore/instance_search.go:257-259	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	parser.go:521	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/frontend/readpath/queryfrontend/query_select_time_series.go:78-83	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/loghttp/params.go:38-46	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/logql/engine.go:452-469	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/logql/engine.go:489	not_in_this_repository
@@ -1091,8 +1092,11 @@ docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/merge.go:30-48	not_in_
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/merge.go:50-78	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/stream.go:133	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/intervals.go:32-40	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/querier/querier.go:1101	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/querier/querier.go:1142	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/queryrange/shard_resolver.go:268	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/queryrange/shard_resolver.go:275	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/querybackend/query_time_series.go:240-243	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/tempopb/tempo.proto:139	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_conditions.go:127-146	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_conditions.go:128	not_in_this_repository

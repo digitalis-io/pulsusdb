@@ -2,14 +2,16 @@
 //! lowerCamelCase names, a field at its default omitted. In: a field by its
 //! JSON name or its proto name, an `int64` as a number or a decimal string,
 //! an unknown field ignored. W4 and W5 (issue #823): the merge's messages,
-//! an enum by its name or its number.
+//! an enum by its name or its number. W6 and W7 (issue #824): the time
+//! series' messages, a `double` written as the reference writes it.
 
 use pulsus_profiles_wire::querier_v1::{
     FlameGraph, Level, ProfileFormat, ProfileTypesRequest, ProfileTypesResponse,
-    SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SeriesRequest, SeriesResponse,
+    SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SelectSeriesRequest,
+    SelectSeriesResponse, SeriesRequest, SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
-    GoPgo, LabelPair, Labels, Location, ProfileType, StackTraceSelector,
+    GoPgo, LabelPair, Labels, Location, Point, ProfileType, Series, StackTraceSelector,
 };
 
 fn split(id: &str) -> ProfileType {
@@ -171,4 +173,75 @@ fn w5_the_merge_request_reads_either_form() {
         assert_eq!(r, Ok(n), "{name}");
     }
     assert!(serde_json::from_str::<SelectMergeStacktracesRequest>(r#"{"format":"NOPE"}"#).is_err());
+}
+
+/// W6 (issue #824): the request reads a `double` as a number or a string,
+/// an enum by its name or its number, and an `optional int64` as a string.
+#[test]
+fn w6_the_series_request_reads_either_form() {
+    let expected = SelectSeriesRequest {
+        profile_type_id: "a:b:c:d:e".to_string(),
+        label_selector: "{}".to_string(),
+        start: 1000,
+        end: 2000,
+        group_by: vec!["service_name".to_string()],
+        step: 15.0,
+        aggregation: Some(1),
+        limit: Some(1),
+        exemplar_type: 1,
+        ..SelectSeriesRequest::default()
+    };
+    for body in [
+        r#"{"profileTypeID":"a:b:c:d:e","labelSelector":"{}","start":"1000","end":"2000","groupBy":["service_name"],"step":15,"aggregation":"TIME_SERIES_AGGREGATION_TYPE_AVERAGE","limit":"1","exemplarType":"EXEMPLAR_TYPE_NONE"}"#,
+        r#"{"profile_typeID":"a:b:c:d:e","label_selector":"{}","start":1000,"end":2000,"group_by":["service_name"],"step":"15","aggregation":1,"limit":1,"exemplar_type":1}"#,
+    ] {
+        let got: SelectSeriesRequest = serde_json::from_str(body).expect(body);
+        assert_eq!(got, expected, "{body}");
+    }
+    let got: SelectSeriesRequest =
+        serde_json::from_str(r#"{"step":0.5,"exemplarType":"EXEMPLAR_TYPE_INDIVIDUAL"}"#)
+            .expect("decode");
+    assert_eq!(
+        (got.step, got.aggregation, got.exemplar_type),
+        (0.5, None, 2)
+    );
+}
+
+/// W7 (issue #824): an integral point value is written as an integer, as
+/// the reference writes it; another as a number; defaults omitted.
+#[test]
+fn w7_a_point_value_is_written_as_the_reference_writes_it() {
+    let point = |value: f64| Point {
+        value,
+        timestamp: 1_794_819_600_000,
+        annotations: Vec::new(),
+    };
+    assert_eq!(
+        serde_json::to_string(&point(28_885_319_484.0)).expect("encode"),
+        r#"{"value":28885319484,"timestamp":"1794819600000"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&point(2.5)).expect("encode"),
+        r#"{"value":2.5,"timestamp":"1794819600000"}"#
+    );
+    let response = SelectSeriesResponse {
+        series: vec![
+            Series {
+                labels: vec![LabelPair {
+                    name: "pod".to_string(),
+                    value: "b".to_string(),
+                }],
+                points: vec![point(6.0)],
+            },
+            Series::default(),
+        ],
+    };
+    assert_eq!(
+        serde_json::to_string(&response).expect("encode"),
+        r#"{"series":[{"labels":[{"name":"pod","value":"b"}],"points":[{"value":6,"timestamp":"1794819600000"}]},{}]}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&SelectSeriesResponse::default()).expect("encode"),
+        "{}"
+    );
 }
