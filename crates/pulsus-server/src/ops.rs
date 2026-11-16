@@ -306,6 +306,9 @@ fn record_ingest_metrics(state: &AppState) {
     if let Some(snap) = state.trace_writer.metrics() {
         record_trace_ingest_snapshot(&snap);
     }
+    if let Some(snap) = state.profile_writer.metrics() {
+        record_profile_ingest_snapshot(&snap);
+    }
 }
 
 /// Emits the per-table `pulsus_ingest_*` series (label `table`) shared by all
@@ -448,6 +451,25 @@ fn record_trace_ingest_snapshot(s: &TraceWriterMetricsSnapshot) {
     record_dedup_metrics("traces", &s.dedup);
 }
 
+/// The profile writer's `pulsus_ingest_*` series (issue #817):
+/// [`record_trace_ingest_snapshot`]'s set, for `table="profile_landing"`
+/// and `signal="profiles"`.
+fn record_profile_ingest_snapshot(s: &TraceWriterMetricsSnapshot) {
+    record_table_metrics("profile_landing", &s.landing);
+
+    metrics::gauge!("pulsus_ingest_queue_bytes", "signal" => "profiles").set(s.queue_bytes as f64);
+    metrics::counter!("pulsus_ingest_backpressure_total", "signal" => "profiles")
+        .absolute(s.backpressure_total);
+    metrics::counter!("pulsus_ingest_spool_poison_total", "signal" => "profiles")
+        .absolute(s.spool_poison_total);
+    metrics::counter!("pulsus_ingest_spool_uncertain_total", "signal" => "profiles")
+        .absolute(s.spool_uncertain_total);
+    metrics::counter!("pulsus_ingest_rejected_total", "signal" => "profiles")
+        .absolute(s.rejected_total);
+
+    record_dedup_metrics("profiles", &s.dedup);
+}
+
 /// `GET /config`: effective configuration, secrets redacted
 /// (`Config::to_redacted_yaml`).
 async fn config_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -491,6 +513,9 @@ mod tests {
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
+            profile_writer: Arc::new(crate::ingest::ProfileWriterSink::new(Arc::new(
+                std::sync::OnceLock::new(),
+            ))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
             rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
@@ -565,6 +590,9 @@ mod tests {
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
+            profile_writer: Arc::new(crate::ingest::ProfileWriterSink::new(Arc::new(
+                std::sync::OnceLock::new(),
+            ))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
             rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),

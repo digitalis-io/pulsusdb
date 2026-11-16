@@ -8,6 +8,7 @@ pub mod decompress;
 pub mod http;
 pub mod metrics;
 pub mod profiles;
+pub mod profiles_http;
 pub mod traces;
 
 use std::fmt;

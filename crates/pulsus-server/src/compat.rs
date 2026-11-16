@@ -31,7 +31,8 @@ pub(crate) fn apply_aliases(router: Router<AppState>, cfg: &Config) -> Router<Ap
         router = router.merge(crate::profiles_api::compat_router());
     }
     // The §8.2 WRITER-side compat receivers — the Loki push receiver
-    // (issue #77) and the Zipkin v2 JSON trace receiver (issue #75) — mount
+    // (issue #77), the Zipkin v2 JSON trace receiver (issue #75) and the
+    // profile push receivers (issue #817) — mount
     // iff the flag is on (guarded by the early return above) AND the Writer
     // subsystem is mounted — never on the Reader compat flag alone
     // (`Gate::CompatAndWriter`). Kept a separate block from the Reader one so
@@ -39,6 +40,7 @@ pub(crate) fn apply_aliases(router: Router<AppState>, cfg: &Config) -> Router<Ap
     if modes::mounted(cfg).contains(&Subsystem::Writer) {
         router = router.merge(crate::ingest::loki_push_compat_router());
         router = router.merge(crate::ingest::zipkin_compat_router());
+        router = router.merge(crate::ingest::profiles_compat_router());
     }
     router
 }
@@ -71,6 +73,9 @@ mod tests {
                 std::sync::OnceLock::new(),
             ))),
             metric_writer: Arc::new(crate::ingest::MetricWriterSink::new(Arc::new(
+                std::sync::OnceLock::new(),
+            ))),
+            profile_writer: Arc::new(crate::ingest::ProfileWriterSink::new(Arc::new(
                 std::sync::OnceLock::new(),
             ))),
             trace_writer: Arc::new(crate::ingest::TraceWriterSink::new(Arc::new(

@@ -15,7 +15,7 @@ use pulsus_clickhouse::{
 use pulsus_config::Config;
 use pulsus_read::{EngineConfig, LabelCache, LabelCacheConfig, MetricsConfig, TraceReadConfig};
 use pulsus_schema::{NameCatalogue, SchemaError};
-use pulsus_write::{MetricWriterTables, TraceWriterTables, WriterTables};
+use pulsus_write::{MetricWriterTables, ProfileWriterTables, TraceWriterTables, WriterTables};
 
 /// Maps `Config` to the connection settings any part of this binary dials
 /// ClickHouse with, targeting the configured `clickhouse.database`. Callers
@@ -304,6 +304,14 @@ pub(crate) fn metric_writer_tables_from(config: &Config) -> MetricWriterTables {
 /// resend reaches that shard. Single-node it is the bare `trace_landing`.
 pub(crate) fn trace_writer_tables_from(config: &Config) -> TraceWriterTables {
     TraceWriterTables::landing_for(landing_suffix(config))
+}
+
+/// Maps `Config` to [`pulsus_write::ProfileWriterTables`]: the landing
+/// table a profile push is inserted into, for [`trace_writer_tables_from`]'s
+/// reasons — `profile_landing<PULSUS_DIST_SUFFIX>` on a cluster, the bare
+/// `profile_landing` single-node.
+pub(crate) fn profile_writer_tables_from(config: &Config) -> ProfileWriterTables {
+    ProfileWriterTables::landing_for(landing_suffix(config))
 }
 
 /// Maps `Config` to [`pulsus_read::LabelCacheConfig`] (issue #30 architect
@@ -678,6 +686,10 @@ mod tests {
             &*trace_writer_tables_from(&clustered).landing,
             "trace_landing_d"
         );
+        assert_eq!(
+            &*profile_writer_tables_from(&clustered).landing,
+            "profile_landing_d"
+        );
 
         for (name, single) in [
             ("default", Config::default()),
@@ -702,6 +714,11 @@ mod tests {
             assert_eq!(
                 &*trace_writer_tables_from(&single).landing,
                 "trace_landing",
+                "{name}"
+            );
+            assert_eq!(
+                &*profile_writer_tables_from(&single).landing,
+                "profile_landing",
                 "{name}"
             );
         }

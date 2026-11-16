@@ -52,6 +52,7 @@ pub(crate) struct AppState {
     pub(crate) writer: Arc<WriterSink>,
     pub(crate) metric_writer: Arc<MetricWriterSink>,
     pub(crate) trace_writer: Arc<TraceWriterSink>,
+    pub(crate) profile_writer: Arc<crate::ingest::ProfileWriterSink>,
     pub(crate) label_cache: Arc<OnceLock<Arc<LabelCache>>>,
     /// Issue #18 part B: the rollup levels the database holds, refreshed
     /// every 60 s by the level loop; empty until its first discovery.
@@ -251,6 +252,9 @@ mod tests {
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
+            profile_writer: Arc::new(crate::ingest::ProfileWriterSink::new(Arc::new(
+                std::sync::OnceLock::new(),
+            ))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
             rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
@@ -567,6 +571,74 @@ mod tests {
             status(&writer_only_router, Method::GET, "/loki/api/v1/labels").await,
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// G1 and G2: the three profile compat push routes mount with the flag
+    /// and the Writer subsystem; `/api/profiles/v1/ingest` mounts with the
+    /// Writer subsystem alone.
+    #[tokio::test]
+    async fn profile_push_routes_are_gated_on_the_flag_and_the_writer_subsystem() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use pulsus_config::Mode;
+        use tower::ServiceExt;
+
+        const COMPAT: [&str; 3] = [
+            "/push.v1.PusherService/Push",
+            "/ingest",
+            "/pyroscope/ingest",
+        ];
+        const NATIVE: &str = "/api/profiles/v1/ingest";
+
+        async fn status(router: &Router, path: &str) -> StatusCode {
+            let request = Request::builder()
+                .uri(path)
+                .method("POST")
+                .body(Body::empty())
+                .unwrap();
+            router.clone().oneshot(request).await.unwrap().status()
+        }
+        let router_for = |compat_endpoints: bool, mode: Mode| {
+            let cfg = Config {
+                compat_endpoints,
+                mode,
+                ..Config::default()
+            };
+            build_router(test_state(), &cfg).expect("router builds")
+        };
+
+        // G1: flag off, `Mode::All`.
+        let router = router_for(false, Mode::All);
+        for path in COMPAT {
+            assert_eq!(
+                status(&router, path).await,
+                StatusCode::NOT_FOUND,
+                "{path}, flag off"
+            );
+        }
+        assert_ne!(
+            status(&router, NATIVE).await,
+            StatusCode::NOT_FOUND,
+            "{NATIVE}, flag off"
+        );
+
+        // G2: flag on, the writer; then the reader.
+        let router = router_for(true, Mode::Writer);
+        for path in COMPAT.into_iter().chain([NATIVE]) {
+            assert_ne!(
+                status(&router, path).await,
+                StatusCode::NOT_FOUND,
+                "{path}, writer"
+            );
+        }
+        let router = router_for(true, Mode::Reader);
+        for path in COMPAT.into_iter().chain([NATIVE]) {
+            assert_eq!(
+                status(&router, path).await,
+                StatusCode::NOT_FOUND,
+                "{path}, reader"
+            );
+        }
     }
 
     /// Architect adjudication on issue #14's code review (auth-vs-404
@@ -1012,7 +1084,7 @@ mod tests {
             .collect();
         let expected: std::collections::BTreeSet<&str> =
             ROUTE_TEMPLATES.iter().copied().chain([UNMATCHED]).collect();
-        assert_eq!(expected.len(), 93);
+        assert_eq!(expected.len(), 97);
         assert_eq!(seen, expected, "{s}");
     }
 

@@ -23,39 +23,13 @@ pub(crate) enum Codec {
     Json,
 }
 
-/// The Connect error codes this surface answers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Code {
-    InvalidArgument,
-    ResourceExhausted,
-    Unimplemented,
-    Internal,
-    Unavailable,
-    DeadlineExceeded,
-}
+/// The Connect error codes, the wire crate's table (issue #817).
+pub(crate) use pulsus_profiles_wire::connect::Code;
+use pulsus_profiles_wire::connect::error_json;
 
-impl Code {
-    fn name(self) -> &'static str {
-        match self {
-            Code::InvalidArgument => "invalid_argument",
-            Code::ResourceExhausted => "resource_exhausted",
-            Code::Unimplemented => "unimplemented",
-            Code::Internal => "internal",
-            Code::Unavailable => "unavailable",
-            Code::DeadlineExceeded => "deadline_exceeded",
-        }
-    }
-
-    fn status(self) -> StatusCode {
-        match self {
-            Code::InvalidArgument => StatusCode::BAD_REQUEST,
-            Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
-            Code::Unimplemented => StatusCode::NOT_IMPLEMENTED,
-            Code::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-            Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-            Code::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
-        }
-    }
+/// `code`'s HTTP status.
+fn status_of(code: Code) -> StatusCode {
+    StatusCode::from_u16(code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// A Connect error: its code and message.
@@ -90,11 +64,10 @@ impl From<ProfilesReadError> for ConnectError {
 
 impl IntoResponse for ConnectError {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({"code": self.code.name(), "message": self.message});
         (
-            self.code.status(),
+            status_of(self.code),
             [(header::CONTENT_TYPE, "application/json")],
-            body.to_string(),
+            error_json(self.code, &self.message),
         )
             .into_response()
     }
@@ -110,10 +83,9 @@ pub(crate) fn deadline_response() -> Response {
 /// same status and body as [`deadline_response`], `nosniff`, and the
 /// `json.Encoder`'s trailing newline.
 pub(crate) fn http_deadline_response() -> Response {
-    let body =
-        serde_json::json!({"code": Code::DeadlineExceeded.name(), "message": DEADLINE_MESSAGE});
+    let body = error_json(Code::DeadlineExceeded, DEADLINE_MESSAGE);
     (
-        Code::DeadlineExceeded.status(),
+        status_of(Code::DeadlineExceeded),
         [
             (header::CONTENT_TYPE, "application/json"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
@@ -309,6 +281,17 @@ mod tests {
                 format!(r#"{{"code":"{name}","message":"a\"b"}}"#)
             );
         }
+    }
+
+    /// The error body escapes `<`, `>` and `&` as the reference's JSON
+    /// marshalling does, through the wire crate's one writer (issue #817).
+    #[tokio::test]
+    async fn the_error_body_escapes_angle_brackets_and_ampersands() {
+        let res = ConnectError::new(Code::InvalidArgument, "{a=~\"<x>&y\"}").into_response();
+        assert_eq!(
+            String::from_utf8(body_of(res).await).expect("utf-8"),
+            r#"{"code":"invalid_argument","message":"{a=~\"\u003cx\u003e\u0026y\"}"}"#
+        );
     }
 
     /// C3: a gzip body is read through the ingest decompressor; another

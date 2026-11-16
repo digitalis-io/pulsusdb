@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+// This is the API to send profiles to Pyroscope
+package push.v1;
+
+import "gnostic/openapi/v3/annotations.proto";
+import "types/v1/types.proto";
+
+service PusherService {
+  rpc Push(PushRequest) returns (PushResponse) {
+    option (gnostic.openapi.v3.operation).tags = "scope/public";
+  }
+}
+
+message PushResponse {}
+
+// WriteRawRequest writes a pprof profile
+message PushRequest {
+  // series is a set raw pprof profiles and accompanying labels
+  repeated RawProfileSeries series = 1;
+}
+
+// RawProfileSeries represents the pprof profile and its associated labels
+message RawProfileSeries {
+  // LabelPair is the key value pairs to identify the corresponding profile
+  repeated types.v1.LabelPair labels = 1;
+
+  // samples are the set of profile bytes
+  repeated RawSample samples = 2;
+
+  // Annotations provide additional metadata for a profile.
+  //
+  // The main differences between labels and annotations are:
+  //  - annotations cannot be used in query selectors
+  //  - annotation keys don't have to be unique
+  //
+  // Currently annotations are applied internally by distributors,
+  // any annotation passed via the push API will be dropped.
+  repeated types.v1.ProfileAnnotation annotations = 3;
+}
+
+// RawSample is the set of bytes that correspond to a pprof profile
+message RawSample {
+  // raw_profile is the set of bytes of the pprof profile
+  bytes raw_profile = 1 [(gnostic.openapi.v3.property).example = {yaml: "PROFILE_BASE64"}];
+  // UUID of the profile
+  string ID = 2 [(gnostic.openapi.v3.property).example = {yaml: "734FD599-6865-419E-9475-932762D8F469"}];
+}

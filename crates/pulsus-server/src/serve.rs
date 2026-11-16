@@ -19,7 +19,7 @@ use pulsus_clickhouse::{Attempt, ChClient, ChError, ChPool, run_read_request, sp
 use pulsus_config::{Config, LogLevel, Mode};
 use pulsus_read::LabelCache;
 use pulsus_schema::{NameCatalogue, REQUIRED_SERVER_NAMES, SchemaError};
-use pulsus_write::{LogWriter, MetricWriter, TraceWriter};
+use pulsus_write::{LogWriter, MetricWriter, ProfileWriter, TraceWriter};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -30,8 +30,8 @@ use tracing_subscriber::EnvFilter;
 use crate::app::{self, AppState, BuildInfo};
 use crate::chconfig::{
     NameCheckError, bootstrap_conn_config_from, build_label_cache, check_server_names,
-    conn_config_from, consistency_from, metric_writer_tables_from, read_schema_retention,
-    trace_writer_tables_from, writer_tables_from,
+    conn_config_from, consistency_from, metric_writer_tables_from, profile_writer_tables_from,
+    read_schema_retention, trace_writer_tables_from, writer_tables_from,
 };
 use crate::ingest::{MetricWriterSink, TraceWriterSink, WriterSink};
 
@@ -109,6 +109,8 @@ pub async fn run(config: Config) -> ExitCode {
     // writer slots — constructed by the reconnect loop in writer-enabled
     // modes, drained alongside them at shutdown.
     let trace_writer_slot: Arc<OnceLock<Arc<TraceWriter>>> = Arc::new(OnceLock::new());
+    // `ProfileWriter`'s slot (issue #817), the same lifecycle again.
+    let profile_writer_slot: Arc<OnceLock<Arc<ProfileWriter>>> = Arc::new(OnceLock::new());
     // The label cache's async-filled slot (issue #30 architect plan): same
     // shape as `writer_slot`/`metric_writer_slot`, constructed by the
     // reconnect loop only in reader-enabled modes (see `reader_enabled`).
@@ -144,6 +146,7 @@ pub async fn run(config: Config) -> ExitCode {
             log: Arc::clone(&writer_slot),
             metric: Arc::clone(&metric_writer_slot),
             trace: Arc::clone(&trace_writer_slot),
+            profile: Arc::clone(&profile_writer_slot),
         },
         Arc::clone(&label_cache_slot),
         Arc::clone(&config),
@@ -173,6 +176,9 @@ pub async fn run(config: Config) -> ExitCode {
         writer: Arc::new(WriterSink::new(Arc::clone(&writer_slot))),
         metric_writer: Arc::new(MetricWriterSink::new(Arc::clone(&metric_writer_slot))),
         trace_writer: Arc::new(TraceWriterSink::new(Arc::clone(&trace_writer_slot))),
+        profile_writer: Arc::new(crate::ingest::ProfileWriterSink::new(Arc::clone(
+            &profile_writer_slot,
+        ))),
         label_cache: Arc::clone(&label_cache_slot),
         rollup_levels: Arc::clone(&rollup_levels_slot),
         graph_target: pulsus_read::GraphTargetCache::default(),
@@ -298,6 +304,10 @@ pub async fn run(config: Config) -> ExitCode {
     // And for `TraceWriter` (issue #54), same contract.
     if let Some(trace_writer) = trace_writer_slot.get() {
         trace_writer.shutdown(WRITER_DRAIN_DEADLINE).await;
+    }
+    // And for `ProfileWriter` (issue #817).
+    if let Some(profile_writer) = profile_writer_slot.get() {
+        profile_writer.shutdown(WRITER_DRAIN_DEADLINE).await;
     }
 
     shutdown_background_tasks(
@@ -440,6 +450,7 @@ struct WriterSlots {
     log: Arc<OnceLock<Arc<LogWriter>>>,
     metric: Arc<OnceLock<Arc<MetricWriter>>>,
     trace: Arc<OnceLock<Arc<TraceWriter>>>,
+    profile: Arc<OnceLock<Arc<ProfileWriter>>>,
 }
 
 /// The one-shot channels the reconnect loop hands its spawned background
@@ -555,11 +566,19 @@ fn spawn_reconnect_loop(
                         // `TraceWriter` (issue #54): same shared client,
                         // same lifecycle gate as the other two writers.
                         let trace_writer = Arc::new(TraceWriter::new_with_tables(
-                            client,
+                            client.clone(),
                             &config.writer,
                             trace_writer_tables_from(&config),
                         ));
                         let _ = writer_slots.trace.set(trace_writer);
+
+                        // `ProfileWriter` (issue #817): the same again.
+                        let profile_writer = Arc::new(ProfileWriter::new_with_tables(
+                            client,
+                            &config.writer,
+                            profile_writer_tables_from(&config),
+                        ));
+                        let _ = writer_slots.profile.set(profile_writer);
                     }
                     // The label cache (issue #30 architect plan; code-review
                     // round-1 fix): built and stored *before* `pool_slot` is
@@ -961,6 +980,7 @@ mod tests {
             log: Arc::new(OnceLock::new()),
             metric: Arc::new(OnceLock::new()),
             trace: Arc::new(OnceLock::new()),
+            profile: Arc::new(OnceLock::new()),
         };
         let (refresh_tx, _refresh_rx) = oneshot::channel();
         let (reprobe_tx, _reprobe_rx) = oneshot::channel();
@@ -971,6 +991,7 @@ mod tests {
                 log: Arc::clone(&slots.log),
                 metric: Arc::clone(&slots.metric),
                 trace: Arc::clone(&slots.trace),
+                profile: Arc::clone(&slots.profile),
             },
             Arc::new(OnceLock::new()),
             Arc::clone(&cfg),
@@ -993,6 +1014,7 @@ mod tests {
         assert!(slots.log.get().is_none());
         assert!(slots.metric.get().is_none());
         assert!(slots.trace.get().is_none());
+        assert!(slots.profile.get().is_none());
     }
 
     #[tokio::test]
@@ -1009,6 +1031,7 @@ mod tests {
                 log: Arc::new(OnceLock::new()),
                 metric: Arc::new(OnceLock::new()),
                 trace: Arc::new(OnceLock::new()),
+                profile: Arc::new(OnceLock::new()),
             },
             Arc::new(OnceLock::new()),
             Arc::new(cfg),
@@ -1155,6 +1178,9 @@ mod tests {
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(OnceLock::new()))),
+            profile_writer: Arc::new(crate::ingest::ProfileWriterSink::new(Arc::new(
+                std::sync::OnceLock::new(),
+            ))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(OnceLock::new()))),
             label_cache: Arc::new(OnceLock::new()),
             rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),
