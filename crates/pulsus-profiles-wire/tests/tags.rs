@@ -8,19 +8,25 @@
 //! W1 (issue #821): the same for every `types_v1` and `querier_v1` message
 //! the query API uses, against `proto/types/v1/types.proto` and
 //! `proto/querier/v1/querier.proto`. Issue #823 adds the merge's messages.
+//!
+//! T1 (issue #817): the same for `ProfileAnnotation` and the `push_v1`
+//! messages, against `proto/types/v1/types.proto` and
+//! `proto/push/v1/push.proto`.
 
 use prost::Message;
 use prost::encoding;
 use pulsus_profiles_wire::google_v1::{
     Function, Label, Line, Location, Mapping, Profile, Sample, ValueType,
 };
+use pulsus_profiles_wire::push_v1::{PushRequest, RawProfileSeries, RawSample};
 use pulsus_profiles_wire::querier_v1::{
     FlameGraph, Level, ProfileFormat, ProfileTypesRequest, ProfileTypesResponse,
     SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SeriesRequest, SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
     GoPgo, LabelNamesRequest, LabelNamesResponse, LabelPair, LabelValuesRequest,
-    LabelValuesResponse, Labels, Location as CallSite, ProfileType, StackTraceSelector,
+    LabelValuesResponse, Labels, Location as CallSite, ProfileAnnotation, ProfileType,
+    StackTraceSelector,
 };
 
 fn value_type() -> ValueType {
@@ -502,4 +508,88 @@ fn every_merge_message_field_encodes_under_the_proto_tag() {
             .encode_to_vec()
             .is_empty()
     );
+}
+
+fn label_pair() -> LabelPair {
+    LabelPair {
+        name: "service_name".to_string(),
+        value: "checkout".to_string(),
+    }
+}
+
+fn label_pair_bytes(l: &LabelPair) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::string::encode(1, &l.name, &mut b);
+    encoding::string::encode(2, &l.value, &mut b);
+    b
+}
+
+fn annotation() -> ProfileAnnotation {
+    ProfileAnnotation {
+        key: "k".to_string(),
+        value: "v".to_string(),
+    }
+}
+
+fn annotation_bytes(a: &ProfileAnnotation) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::string::encode(1, &a.key, &mut b);
+    encoding::string::encode(2, &a.value, &mut b);
+    b
+}
+
+fn raw_sample() -> RawSample {
+    RawSample {
+        raw_profile: vec![0x1f, 0x8b, 1, 2],
+        id: "734FD599-6865-419E-9475-932762D8F469".to_string(),
+    }
+}
+
+fn raw_sample_bytes(s: &RawSample) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::bytes::encode(1, &s.raw_profile, &mut b);
+    encoding::string::encode(2, &s.id, &mut b);
+    b
+}
+
+fn raw_series() -> RawProfileSeries {
+    RawProfileSeries {
+        labels: vec![label_pair()],
+        samples: vec![raw_sample()],
+        annotations: vec![annotation()],
+    }
+}
+
+fn raw_series_bytes(s: &RawProfileSeries) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::message::encode_repeated(1, &s.labels, &mut b);
+    encoding::message::encode_repeated(2, &s.samples, &mut b);
+    encoding::message::encode_repeated(3, &s.annotations, &mut b);
+    b
+}
+
+fn push_request() -> PushRequest {
+    PushRequest {
+        series: vec![raw_series(), raw_series()],
+    }
+}
+
+fn push_request_bytes(r: &PushRequest) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::message::encode_repeated(1, &r.series, &mut b);
+    b
+}
+
+#[test]
+fn every_push_field_encodes_under_the_proto_tag() {
+    let l = label_pair();
+    check("LabelPair", &l, label_pair_bytes(&l));
+    let a = annotation();
+    check("ProfileAnnotation", &a, annotation_bytes(&a));
+    let s = raw_sample();
+    check("RawSample", &s, raw_sample_bytes(&s));
+    let rs = raw_series();
+    check("RawProfileSeries", &rs, raw_series_bytes(&rs));
+    let r = push_request();
+    check("PushRequest", &r, push_request_bytes(&r));
 }

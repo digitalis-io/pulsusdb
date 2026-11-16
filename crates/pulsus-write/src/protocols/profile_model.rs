@@ -70,28 +70,61 @@ const SPAN_ID: &str = "span_id";
 const TRACE_ID: &str = "trace_id";
 const PROFILE_ID: &str = "profile_id";
 /// `pkg/model/labels.go:57`.
-const SPY_LABEL: &str = "pyroscope_spy";
+pub(crate) const SPY_LABEL: &str = "pyroscope_spy";
 
 /// Decodes one pprof body: gzipped when it starts `1f 8b`, else the raw
 /// message. Output over `limit` bytes is refused
 /// (`pkg/pprof/pprof.go:96-129`); receivers pass [`MAX_PROFILE_SIZE_BYTES`].
 pub fn decode_pprof(bytes: &[u8], limit: u64) -> Result<Profile, String> {
-    let too_big = || format!("decompressed size exceeds maximum allowed size of {limit} bytes");
+    decode_pprof_sized(bytes, limit)
+        .map(|(profile, _)| profile)
+        .map_err(|e| e.to_string())
+}
+
+/// Why [`decode_pprof_sized`] refused a body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PprofDecodeError {
+    /// The decompressed body is over the limit.
+    TooLarge { limit: u64 },
+    /// Any other failure, with [`decode_pprof`]'s text.
+    Other(String),
+}
+
+impl std::fmt::Display for PprofDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PprofDecodeError::TooLarge { limit } => write!(
+                f,
+                "decompressed size exceeds maximum allowed size of {limit} bytes"
+            ),
+            PprofDecodeError::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+/// [`decode_pprof`], with the decompressed length beside the profile and the
+/// size refusal told apart from the others.
+pub fn decode_pprof_sized(bytes: &[u8], limit: u64) -> Result<(Profile, u64), PprofDecodeError> {
+    let decode = |b: &[u8]| {
+        Profile::decode(b)
+            .map(|p| (p, b.len() as u64))
+            .map_err(|e| PprofDecodeError::Other(e.to_string()))
+    };
     if bytes.starts_with(&[0x1f, 0x8b]) {
         let mut buf = Vec::new();
         flate2::read::MultiGzDecoder::new(bytes)
             .take(limit.saturating_add(1))
             .read_to_end(&mut buf)
-            .map_err(|e| format!("copy to buffer: {e}"))?;
+            .map_err(|e| PprofDecodeError::Other(format!("copy to buffer: {e}")))?;
         if buf.len() as u64 > limit {
-            return Err(too_big());
+            return Err(PprofDecodeError::TooLarge { limit });
         }
-        Profile::decode(buf.as_slice()).map_err(|e| e.to_string())
+        decode(&buf)
     } else {
         if bytes.len() as u64 > limit {
-            return Err(too_big());
+            return Err(PprofDecodeError::TooLarge { limit });
         }
-        Profile::decode(bytes).map_err(|e| e.to_string())
+        decode(bytes)
     }
 }
 

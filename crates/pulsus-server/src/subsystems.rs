@@ -10,8 +10,9 @@ use crate::app::AppState;
 
 /// Ingestion APIs (OTLP, Prometheus remote write, native profile ingest).
 /// `POST /v1/logs` (issue #15), `POST /v1/metrics` (issue #27),
-/// `POST /v1/traces` (issue #54), and `POST /api/v1/write` (issue #28,
-/// docs/api.md §1.1-1.2) are wired; the remaining signals' ingest routes
+/// `POST /v1/traces` (issue #54), `POST /api/v1/write` (issue #28,
+/// docs/api.md §1.1-1.2) and `POST /api/profiles/v1/ingest` (issue #817,
+/// §1.3) are wired; the remaining signals' ingest routes
 /// are still empty until their own issues land. `/api/v1/write` coexists
 /// with the PromQL query surface's `/api/v1/query*` routes (mounted
 /// separately by `reader_router`) because `mount_subsystems` merges
@@ -22,6 +23,10 @@ pub(crate) fn writer_router() -> Router<AppState> {
         .route("/v1/metrics", post(crate::ingest::ingest_metrics))
         .route("/v1/traces", post(crate::ingest::ingest_traces))
         .route("/api/v1/write", post(crate::ingest::ingest_remote_write))
+        .route(
+            "/api/profiles/v1/ingest",
+            post(crate::ingest::ingest_profile_legacy),
+        )
 }
 
 /// Query APIs (`/api/logs/v1`, `/api/v1`, `/api/traces/v1`, `/api/profiles/v1`).
@@ -84,6 +89,9 @@ mod tests {
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(OnceLock::new()))),
+            profile_writer: Arc::new(crate::ingest::ProfileWriterSink::new(Arc::new(
+                std::sync::OnceLock::new(),
+            ))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(OnceLock::new()))),
             label_cache: Arc::new(OnceLock::new()),
             rollup_levels: Arc::new(pulsus_read::metrics::rollup::LevelSlot::new()),

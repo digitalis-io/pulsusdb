@@ -189,3 +189,15 @@ fn is_zero_u32(v: &u32) -> bool {
 fn is_false(v: &bool) -> bool {
     !*v
 }
+
+/// A profile annotation (issue #817). The push route drops the client's.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileAnnotation {
+    #[prost(string, tag = "1")]
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub key: String,
+    #[prost(string, tag = "2")]
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub value: String,
+}
