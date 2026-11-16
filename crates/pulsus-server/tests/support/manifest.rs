@@ -287,14 +287,15 @@ pub enum Surface {
     /// `/admin/…` (issue #746) — always mounted, behind the admin pair, HTML
     /// or JSON.
     Admin,
-    /// The profiles query API's four `GET` routes (issue #821, docs/api.md
-    /// §5): `types`, `labels`, `label/{name}/values` and `series`. Success is
+    /// The profiles query API's six `GET` routes (issue #821, docs/api.md
+    /// §5): `types`, `labels`, `label/{name}/values` and `series`, `merge`
+    /// (#823) and `select_series` (#824). Success is
     /// the method's JSON response message; against this suite's empty
     /// databases the base window ends before the lookback floor, so the
     /// body is `{}` and nothing is read. Errors are the Connect JSON body
     /// `{"code","message"}`.
     ProfilesQuery,
-    /// The profiles query API's eight Connect paths (issue #821): the four
+    /// The profiles query API's twelve Connect paths (issue #821): the six
     /// methods at `/querier.v1.QuerierService/<M>` (compat) and
     /// `/api/profiles/v1/querier.v1.QuerierService/<M>` (native), `POST`
     /// only. The base request is a JSON body; success and errors as

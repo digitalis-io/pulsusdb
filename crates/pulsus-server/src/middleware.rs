@@ -563,7 +563,7 @@ mod tests {
         );
     }
 
-    /// Issue #821 review note 1: the class names the eight Connect paths
+    /// Issue #821 review note 1: the class names the twelve Connect paths
     /// exactly. Another method under either service prefix, and a deeper
     /// path under the values route, keep the class they had.
     #[test]
