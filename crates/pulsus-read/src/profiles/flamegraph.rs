@@ -426,6 +426,28 @@ mod tests {
                 17,
             ))
         );
+        // Step 2 cuts `c` whichever way step 1 compares, so step 1's tree
+        // is read directly: `c` (5, equal to `min1`) is kept, and `d`, `e`
+        // and `other` are cut into a stub of 8.
+        let tree = merged_tree(&fixture(), 4).expect("a tree");
+        let shape = |at: &[usize]| -> Vec<(String, i64, i64)> {
+            at.iter()
+                .map(|&i| {
+                    let n = &tree.nodes[i];
+                    (n.name.clone(), n.total, n.self_value)
+                })
+                .collect()
+        };
+        let main = &tree.nodes[tree.roots[0]];
+        assert_eq!(
+            shape(&main.children),
+            [("a".to_string(), 24, 2), ("other".to_string(), 8, 8)]
+        );
+        let a = &tree.nodes[main.children[0]];
+        assert_eq!(
+            shape(&a.children),
+            [("b".to_string(), 17, 17), ("c".to_string(), 5, 5)]
+        );
     }
 
     /// F3: no rows is the reference's empty flame graph.
