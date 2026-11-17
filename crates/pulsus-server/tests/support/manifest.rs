@@ -301,6 +301,12 @@ pub enum Surface {
     /// only. The base request is a JSON body; success and errors as
     /// [`Surface::ProfilesQuery`].
     ProfilesConnect,
+    /// The four OTLP gRPC `Export` paths (issue #816, docs/api.md §1.1),
+    /// `POST` only: the `/v1/*` export handlers behind a unary gRPC shim.
+    /// Exercised over HTTP/2 by `otlp_grpc.rs` and `serve.rs`'s tests; the
+    /// conformance matrix sends one gRPC frame over HTTP/1.1 and reads the
+    /// trailers-only answer from the headers.
+    OtlpGrpc,
 }
 
 /// Mode/flag gating (issue #36 plan v2 finding 3): mirrors
@@ -3100,6 +3106,51 @@ static MANIFEST: &[RouteSpec] = &[
         doc_ref: DocRef::Verbatim,
         success_status: 200,
         base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
+    // -- OTLP over gRPC (issue #816, docs/api.md §1.1) -------------------
+    RouteSpec {
+        path: "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+        methods: &[Method::Post],
+        surface: Surface::OtlpGrpc,
+        gate: Gate::WriterMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+        methods: &[Method::Post],
+        surface: Surface::OtlpGrpc,
+        gate: Gate::WriterMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+        methods: &[Method::Post],
+        surface: Surface::OtlpGrpc,
+        gate: Gate::WriterMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/opentelemetry.proto.collector.profiles.v1development.ProfilesService/Export",
+        methods: &[Method::Post],
+        surface: Surface::OtlpGrpc,
+        gate: Gate::WriterMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
         cases: &[],
     },
     // -- Planned (documented, not yet mounted) ---------------------------

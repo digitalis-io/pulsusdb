@@ -97,6 +97,12 @@ libc = "0.2"
 # are already in the lock through axum.
 pin-project-lite = "0.2"
 http-body = "1"
+# Issue #816: the OTLP gRPC shim's success body (`Full` with trailers) and
+# its tests' trailer reads. Already in the lock through axum.
+http-body-util.workspace = true
+# Issue #816: `grpc-status-details-bin` is base64 without padding. Already in
+# the lock through other crates.
+base64 = "0.22"
 
 [dev-dependencies]
 pulsus-schema-testkit = { path = "../pulsus-schema-testkit" }
@@ -135,3 +141,9 @@ rcgen = "0.13"
 # `test-util` enables `#[tokio::test(start_paused = true)]` for the issue
 # #174 accept-error backoff test in `tls.rs` (the pulsus-write precedent).
 tokio = { workspace = true, features = ["test-util"] }
+# Issue #816: TEST-ONLY gRPC clients for the OTLP gRPC export paths
+# (`serve.rs` tests and `tests/otlp_grpc.rs`). The release binary serves
+# gRPC through its own shim (`grpc.rs`) and links neither; resolver 2 keeps
+# these features out of it.
+opentelemetry-proto = { workspace = true, features = ["gen-tonic"] }
+tonic = { version = "0.14", default-features = false, features = ["gzip", "tls-ring"] }

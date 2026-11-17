@@ -627,6 +627,45 @@ mod tests {
         );
     }
 
+    /// Issue #816: a stalled OTLP gRPC export answers `DEADLINE_EXCEEDED`,
+    /// which the exporter retries, not the bare `408` it reads as `UNKNOWN`.
+    #[tokio::test]
+    async fn a_stalled_grpc_export_answers_deadline_exceeded() {
+        use axum::body::Body;
+        use axum::routing::post;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        const PATH: &str = "/opentelemetry.proto.collector.logs.v1.LogsService/Export";
+        let cfg = Config {
+            query_timeout: pulsus_config::HumanDuration(Duration::from_millis(1)),
+            ..Config::default()
+        };
+        let router: axum::Router = axum::Router::new()
+            .route(PATH, post(std::future::pending::<&'static str>))
+            .layer(timeout_layer(&cfg));
+        let request = Request::builder()
+            .method("POST")
+            .uri(PATH)
+            .body(Body::empty())
+            .unwrap();
+        let res = router.oneshot(request).await.unwrap();
+        let header = |name: &str| {
+            res.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(header("content-type").as_deref(), Some("application/grpc"));
+        assert_eq!(header("grpc-status").as_deref(), Some("4"));
+        assert_eq!(header("grpc-message").as_deref(), Some("deadline exceeded"));
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "{body:?}");
+    }
+
     /// Issue #821: a stalled profiles `GET` route answers `504` with the
     /// reference's HTTP handler body: `nosniff` and a trailing newline.
     #[tokio::test]
