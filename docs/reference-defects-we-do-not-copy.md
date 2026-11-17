@@ -95,6 +95,10 @@ replaces one.
 | [40](#40--over-a-condition-the-store-can-filter-answers-nothing-on-search-and-is-ignored-on-metrics) | trace reference | queries | A, D | `{ !(status = error) }` answers no span on search and the error spans' count on metrics. |
 | [41](#41-a-function-named-other-that-survives-the-flame-graph-cut-loses-its-cut-siblings-values) | profiles reference | queries | C, D | A flame graph whose function named `other` survives the cut reports a total below the samples' sum. |
 | [42](#42-the-time-series-ignores-aggregation-and-the-call-site) | profiles reference | queries | A, C | A time series asked for the average answers the sum, and one asked for a call site answers every stack's total. |
+| [43](#43-a-folded-line-of-64-kib-ends-the-push-and-drops-the-rest) | profiles reference | ingest | C | A folded push with one stack of 65,536 bytes or more stores the lines before it, drops the rest, and answers `200`. |
+| [44](#44-a-push-whose-name-carries-profile_id-stores-nothing-and-answers-200) | profiles reference | ingest | C | `name=app{profile_id=p1}` with folded stacks answers `200` and stores nothing. |
+| [45](#45-speedscope-values-are-truncated-before-they-are-scaled) | profiles reference | ingest | A, C | A speedscope weight of `0.5` s stores 0, a parent's self time is 100 times too small, and a `nanoseconds` file stores nothing. |
+| [46](#46-two-tree-siblings-of-one-name-keep-only-the-later-ones-value) | profiles reference | ingest | C | A tree body with two children named `b` under `a` stores only the second one's value. |
 
 ---
 
@@ -2365,6 +2369,126 @@ restricts each profile's total to the samples on its stacks before the step's va
 Ledger rows `series-average-is-the-mean` and `series-call-site-filters-the-totals` (the profiles
 differential's ledger, issue #822). Pinned by cases L2 and L3 of
 `the_time_series_answers_its_tenants_totals` in `crates/pulsus-read/tests/profiles_series_live.rs`.
+
+---
+
+## 43. A folded line of 64 KiB ends the push and drops the rest
+
+**The profiles reference · ingest · test C**
+
+### What the reference does
+
+`/ingest` reads a folded body with a line scanner whose largest line is 65,536 bytes
+(`pkg/og/convert/parser.go:42-67`). A longer line stops the scan, and the loop never reads the
+scanner's error after it ends. The lines before the long one are stored, the long line and every
+line after it are dropped, and the push answers `200`.
+
+### Why that is wrong rather than different
+
+Part of the input is dropped without a word (**C**). A stack of 33,000 two-byte frames is one such
+line. The same reference's `lines` format reads its scanner's error and refuses
+the push.
+
+### What PulsusDB does
+
+Every line is read, however long; the 256 MiB body limit bounds it (`docs/api.md` §1.3).
+
+### Evidence
+
+Ledger row `ingest-folded-long-line-is-read` (the profiles differential's ledger, issue #822). Pinned
+by `f6_a_folded_line_of_any_length_is_read` in
+`crates/pulsus-write/src/protocols/profileql_legacy/folded.rs`.
+
+---
+
+## 44. A push whose `name` carries `profile_id` stores nothing and answers `200`
+
+**The profiles reference · ingest · test C**
+
+### What the reference does
+
+The ingester adapter returns before converting anything when the push's label set holds a non-empty
+`profile_id` (`pkg/ingester/…/ingest_adapter.go:78-80`). The folded, lines, trie, tree and speedscope
+paths all pass through it; pprof and JFR do not. The push answers `200`.
+
+### Why that is wrong rather than different
+
+The whole push is dropped and the client is told it was stored (**C**).
+
+### What PulsusDB does
+
+The profile is stored, and `profile_id` is a series label like any other (`docs/api.md` §1.3).
+
+### Evidence
+
+Ledger row `ingest-profile-id-push-is-stored` (the profiles differential's ledger, issue #822).
+Pinned by `f10_a_profile_id_label_is_stored_as_a_label` in
+`crates/pulsus-write/src/protocols/profileql_legacy/mod.rs`.
+
+---
+
+## 45. Speedscope values are truncated before they are scaled
+
+**The profiles reference · ingest · tests A, C**
+
+### What the reference does
+
+The speedscope parser multiplies each value by 100 to keep two decimal places
+(`pkg/og/convert/speedscope/units.go:45-54`), and gets it wrong three ways:
+
+- a weight or a time gap is converted to an integer first and multiplied after
+  (`pkg/og/convert/speedscope/parser.go:182,227`), so a weight of `0.5` stores 0;
+- the time before a child frame opens is added to the parent without the multiplier
+  (`parser.go:188`), while the time at a close takes it (`parser.go:182`);
+- the `nanoseconds` unit's sample rate is `100 × 10^9` in 32-bit arithmetic
+  (`units.go:28`), which wraps to 1,215,752,192, so the period `10^9 / 1,215,752,192` is 0 and every
+  value is 0.
+
+### Why that is wrong rather than different
+
+The multiplier exists to keep fractions, and the first defect discards them before it applies
+(**C**). The parser times open and close gaps two ways (**A**): on `O a@0, O b@3, C b@5, C a@6` in
+unit `none`, `a` runs alone for 4 units and `b` for 2, and the reference stores `b` as 20,000,000 and
+`a` as 10,300,000, where 40,000,000 is `a` at `b`'s scale. A `nanoseconds` file stores nothing and answers `200` (**C**).
+
+### What PulsusDB does
+
+A value is multiplied before it is truncated, both gaps take the multiplier, and `nanoseconds` has
+the multiplier 1 and the rate `10^9`, so each nanosecond is stored as one (`docs/api.md` §1.3).
+
+### Evidence
+
+Ledger row `ingest-speedscope-values-computed-before-truncation` (the profiles differential's
+ledger, issue #822). Pinned by `s5_speedscope_values_are_computed_correctly` in
+`crates/pulsus-write/src/protocols/profileql_legacy/speedscope.rs`.
+
+---
+
+## 46. Two tree siblings of one name keep only the later one's value
+
+**The profiles reference · ingest · test C**
+
+### What the reference does
+
+Reading a tree body, each node is inserted under its parent by name, and inserting a name the
+parent already holds returns that child (`pkg/og/storage/tree/tree.go:158-171`). The node's self
+value is then assigned, not added (`pkg/og/storage/tree/serialize.go:41-43`), so the second sibling's
+value replaces the first's.
+
+### Why that is wrong rather than different
+
+The first sibling's samples are dropped without a word (**C**).
+
+### What PulsusDB does
+
+Siblings of one name sum, as the same stack sent twice in any other format does (`docs/api.md`
+§1.3).
+
+### Evidence
+
+Ledger row `ingest-tree-same-name-siblings-sum` (the profiles differential's ledger, issue #822).
+No test of its own: the tree reader adds every node to the stack set that every format shares
+(`crates/pulsus-write/src/protocols/profileql_legacy/tree.rs`), and the set sums equal stacks.
 
 ---
 

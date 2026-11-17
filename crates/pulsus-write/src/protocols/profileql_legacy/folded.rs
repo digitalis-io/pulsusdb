@@ -2,16 +2,80 @@
 //! individual lines, one stack per line counted (`lines`)
 //! (`pkg/og/convert/parser.go:42-100`).
 
+use std::collections::HashMap;
+
 use super::{LegacyError, StackSet};
 
-/// `groups`: each line's stack and count, summed per stack.
-pub fn parse_groups(_body: &[u8]) -> Result<StackSet, LegacyError> {
-    Err(LegacyError::Parse("not built".to_string()))
+/// `bufio.MaxScanTokenSize`: the reference's line scanner refuses a line
+/// this long or longer before its `\n`.
+const MAX_LINE_BYTES: usize = 65_536;
+
+/// The body's lines as `bufio.ScanLines` gives them, each with its `\r`
+/// still on: split on `\n`, the empty piece after a final `\n` skipped.
+fn raw_lines(body: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let body = body.strip_suffix(b"\n").unwrap_or(body);
+    let empty = body.is_empty();
+    body.split(|&b| b == b'\n').filter(move |_| !empty)
 }
 
-/// `lines`: each line is one stack, counted.
-pub fn parse_lines(_body: &[u8]) -> Result<StackSet, LegacyError> {
-    Err(LegacyError::Parse("not built".to_string()))
+/// One trailing `\r` removed (`bufio.dropCR`).
+fn drop_cr(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+/// Go's `strconv.Atoi` of a count, refused with its text.
+fn atoi(count: &[u8]) -> Result<i64, LegacyError> {
+    use std::num::IntErrorKind;
+    let text = String::from_utf8_lossy(count);
+    text.parse::<i64>().map_err(|e| {
+        let why = match e.kind() {
+            IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => "value out of range",
+            _ => "invalid syntax",
+        };
+        let quoted = text.replace('\\', "\\\\").replace('"', "\\\"");
+        LegacyError::Parse(format!("strconv.Atoi: parsing \"{quoted}\": {why}"))
+    })
+}
+
+/// `groups`: each line's stack, before its last space, and count, after it,
+/// summed per stack (`parser.go:42-67`). A line without a space is skipped.
+/// Every line is read, however long (issue #818, Q1).
+pub fn parse_groups(body: &[u8]) -> Result<StackSet, LegacyError> {
+    let mut counts: HashMap<&[u8], u64> = HashMap::new();
+    for line in raw_lines(body).map(drop_cr) {
+        let Some(space) = line.iter().rposition(|&b| b == b' ') else {
+            continue;
+        };
+        let n = atoi(&line[space + 1..])?;
+        let sum = counts.entry(&line[..space]).or_insert(0);
+        *sum = sum.wrapping_add(n as u64);
+    }
+    let mut set = StackSet::default();
+    for (text, v) in counts {
+        set.add_text(text, v);
+    }
+    Ok(set)
+}
+
+/// `lines`: each line is one stack, counted; an empty line is skipped, and
+/// a line of 64 KiB or more refuses the push (`parser.go:73-100`).
+pub fn parse_lines(body: &[u8]) -> Result<StackSet, LegacyError> {
+    let mut counts: HashMap<&[u8], u64> = HashMap::new();
+    for raw in raw_lines(body) {
+        if raw.len() >= MAX_LINE_BYTES {
+            return Err(LegacyError::Parse(
+                "bufio.Scanner: token too long".to_string(),
+            ));
+        }
+        *counts.entry(drop_cr(raw)).or_insert(0) += 1;
+    }
+    let mut set = StackSet::default();
+    for (text, v) in counts {
+        if !text.is_empty() {
+            set.add_text(text, v);
+        }
+    }
+    Ok(set)
 }
 
 #[cfg(test)]

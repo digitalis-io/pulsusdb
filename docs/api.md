@@ -237,30 +237,53 @@ never sent, matching the reference, which never sets it either.
 ### 1.3 Profile ingest (native)
 
 ```
-POST /api/profiles/v1/ingest?name=<app>{tags}&from=<ts>&spyName=<spy>&format=pprof
-Content-Type: multipart/form-data | any, with the whole body one pprof profile
+POST /api/profiles/v1/ingest?name=<app>{tags}&from=<ts>&spyName=<spy>&sampleRate=<hz>&format=<format>
+Content-Type: multipart/form-data | binary/octet-stream+trie | binary/octet-stream+tree | any
 ```
 
-The pprof path of the reference's `/ingest`, which is also mounted at `/ingest` and `/pyroscope/ingest` (§8.2). A pprof body, raw or gzipped (found by its magic bytes; `Content-Encoding` is not read), becomes one profile, validated and stored as a push to `POST /push.v1.PusherService/Push` is (§8.2). Each push is one insert into `profile_landing` and no read.
+The reference's `/ingest`, also mounted at `/ingest` and `/pyroscope/ingest` (§8.2), in every format but JFR. A pprof body, raw or gzipped (found by its magic bytes; `Content-Encoding` is not read), becomes one profile. A folded, lines, trie or tree body becomes one profile, and a speedscope file one profile for each profile it holds. Each is validated and stored as a push to `POST /push.v1.PusherService/Push` is (§8.2). Each push is one insert into `profile_landing` and no read, a speedscope file of several profiles included: its profiles are stored together or not at all.
 
 | Parameter | Absent | Used |
 |---|---|---|
-| `name` | refused | `<service>{k=v,...}`: the service name is `service_name` unless the set holds one, and each label not starting `__` is a series label. A bad name is `400` `name: <error>` |
-| `from` | now | the profile's time when its own is in 1970: Unix seconds, milliseconds (13 digits), microseconds (16) or nanoseconds (19), `YYYYMMDD`, or `now-1h`-style offsets |
-| `spyName` | `unknown` | the spy label; `pyspy`, `rbspy` and `scripting` name each function `"<file> <name>"`, and `dotnetspy` repairs .NET function ids |
+| `name` | refused | `<service>{k=v,...}`: the service name is `service_name` unless the set holds one, and each label not starting `__` is a series label (`profile_id` included), with `__session_id__` too on the folded, lines, trie, tree and speedscope paths. On those paths the service's last `.` part is the profile type (below). A bad name is `400` `name: <error>` |
+| `from` | now | pprof: the profile's time when its own is in 1970; the other formats: the profile's time. Unix seconds, milliseconds (13 digits), microseconds (16) or nanoseconds (19), `YYYYMMDD`, or `now-1h`-style offsets |
+| `spyName` | `unknown` | the spy label; on the pprof path `pyspy`, `rbspy` and `scripting` name each function `"<file> <name>"`, and `dotnetspy` repairs .NET function ids |
+| `sampleRate` | 100 | not read on the pprof path. Elsewhere, a `process_cpu` or `wall` profile at a rate other than 0 is stored in nanoseconds: each value is multiplied by the period `10^9 / sampleRate`, so 3 samples at 100 store 30,000,000. A value that is not an integer, or is negative, is 100 |
 | `format` | — | below |
-| `until`, `sampleRate`, `units`, `aggregationType` | — | not read on the pprof path |
+| `until`, `units`, `aggregationType` | — | not read |
 
 | Condition, first match wins | Body | Answer |
 |---|---|---|
-| `format=trie`, `tree`, `lines`, `jfr` or `speedscope`, or `Content-Type: binary/octet-stream+trie` or `+tree` | not served | `422` `format <f> is not supported` |
+| `format=trie`, or `Content-Type: binary/octet-stream+trie` | the trie binary: per node a varint name length, the name appended to the key, a varint value and a varint descendant count; a value adds to the stack its key spells, split on `;` | stored |
+| `format=tree`, or `Content-Type: binary/octet-stream+tree` | the tree binary: per node, depth first, a varint name length (at most 65,535), the name, a varint self value and a varint child count (at most 16,000); a self value adds to the stack of the names below the root. Two siblings of one name sum | stored |
+| `format=lines` | one stack per line, `a;b;c`, each line counted; empty lines are skipped, and a line of 65,536 bytes or more refuses the push | stored |
+| `format=jfr` | not served | `422` `format jfr is not supported` |
 | `format=pprof` | the whole body is one pprof profile | stored |
+| `format=speedscope` | a speedscope JSON file, evented or sampled profiles (below) | stored |
 | `Content-Type` contains `multipart/form-data` | the `profile` file part; `sample_type_config` (type name to `{"display-name": ...}`) names the series; `prev_profile` is refused | stored |
-| otherwise | not served | `422` `format groups is not supported` |
+| otherwise, any other `format` value included | folded stacks, `a;b;c <count>` per line: the stack before the last space, the count after it, summed per stack. A line without a space is skipped; a line of any length is read; a trailing `;` adds no frame | stored |
 
-The series name comes from the sample types: `wall`; else the first type whose name, or its display name, contains `cpu` (`process_cpu`), `alloc_` or `inuse_` or is `space` or `objects` (`memory`), `mutex_` (`mutex`), `block_` (`block`) or `goroutines` (`goroutines`); else the last type. The default display names are `samples` to `cpu`, `goroutine` to `goroutines`, `contentions` to `mutex_count` and `delay` to `mutex_duration`; a `sample_type_config` replaces them whole.
+On the pprof path the series name comes from the sample types: `wall`; else the first type whose name, or its display name, contains `cpu` (`process_cpu`), `alloc_` or `inuse_` or is `space` or `objects` (`memory`), `mutex_` (`mutex`), `block_` (`block`) or `goroutines` (`goroutines`); else the last type. The default display names are `samples` to `cpu`, `goroutine` to `goroutines`, `contentions` to `mutex_count` and `delay` to `mutex_duration`; a `sample_type_config` replaces them whole.
 
-Success is `200` with an empty body and no `Content-Type`; under `X-Pulsus-Async: 1` it is `202`, admitted without waiting for the insert. A body with no profile (empty, or a form without `profile`) is `200` and stores nothing. Every error is `application/json` with `X-Content-Type-Options: nosniff`, the body `{"code":"<code>","message":"<message>"}` and a newline, the code named from the status:
+On the other paths the type is the service's last `.` part, and the service name is what precedes it: `checkout.alloc_space` is type `alloc_space` of `checkout`, and a name without a `.` is type `cpu`. Any other type is refused.
+
+| Type | Series name | Sample type |
+|---|---|---|
+| `cpu`, `itimer` | `process_cpu` | `samples` `count` |
+| `wall`, `seconds`, `nanoseconds`, `microseconds`, `milliseconds` | `wall` | `samples` `count` |
+| `inuse_objects`, `alloc_objects`, `alloc_in_new_tlab_objects`, `alloc_outside_tlab_objects`, `live` | `memory` | the type, `count` |
+| `inuse_space`, `alloc_space`, `alloc_in_new_tlab_bytes`, `alloc_outside_tlab_bytes` | `memory` | the type, `bytes` |
+| `bytes` | `memory` | `samples` `bytes` |
+| `goroutines` | `goroutine` | `goroutines` `count` |
+| `mutex_count`, `mutex_duration` | `mutex` | `contentions` `count`, `delay` `nanoseconds` |
+| `block_count`, `lock_count`, `block_duration`, `lock_duration` | `block` | `contentions` `count`, `delay` `nanoseconds` |
+| `exceptions` | `exceptions` | `samples` `count` |
+
+At a `sampleRate` other than 0, a `process_cpu` profile's sample type is `cpu` `nanoseconds` and a `wall` profile's `wall` `nanoseconds`, with the period type `cpu` `nanoseconds`. The series is labelled `service_name` with the service name, or, when `name` holds a `service_name`, `app_name` unless it holds that too.
+
+A speedscope file's profiles of one name, type, unit and start are merged. A file of more than one profile after the merge names each `<service>.<unit>`, so the unit is its type, and every profile carries its name, when it has one, as `profile_name`. At the default `sampleRate` each unit takes its own rate: `nanoseconds` 10^9, `microseconds` 10^8, `milliseconds` 10^5, `seconds` 100, `none` 10^4, `bytes` 0. Each weight and each time between events is multiplied by 100 (by 1 for `nanoseconds` and `bytes`) before it is truncated to an integer.
+
+Success is `200` with an empty body and no `Content-Type`; under `X-Pulsus-Async: 1` it is `202`, admitted without waiting for the insert. A body with no profile (empty, a form without `profile`, or stacks whose values are all 0) is `200` and stores nothing. Every error is `application/json` with the body `{"code":"<code>","message":"<message>"}`. Most are the reference's plain-HTTP form, with `X-Content-Type-Options: nosniff` and a newline, the code named from the status:
 
 | Case | Status | Code | Message |
 |---|---|---|---|
@@ -271,11 +294,26 @@ Success is `200` with an empty body and no `Content-Type`; under `X-Pulsus-Async
 | a bad multipart form | 422 | `unknown` | `parsing IngestInput-pprof failed failed to parse pprof /ingest multipart form <error>` |
 | a profile that does not decode | 422 | `unknown` | `parsing IngestInput-pprof failed invalid_argument: <error>` |
 | a profile the checks refuse | 422 | `unknown` | `pushing IngestInput-pprof failed push series with index 0 and id  failed: invalid_argument: <error>` |
-| an unsupported format | 422 | `unknown` | above |
+| `format=jfr` | 422 | `unknown` | above |
+| a folded, lines, trie, tree or speedscope body that does not parse | 422 | `unknown` | the parser's error, such as `strconv.Atoi: parsing "x": invalid syntax`, `bufio.Scanner: token too long`, `EOF`, `tree node children count 16001 exceeds maximum 16000` or `Unknown schema: <schema>` |
 | backpressure | 429 | `resource_exhausted` | `sink is applying backpressure: buffers are full` |
 | a reused `Idempotency-Key` | 400 | `invalid_argument` | §1.0 |
 | a push over its size ceiling or its UTC dates | 413 | `invalid_argument` | §1.1 |
 | the insert failed | 500 | `unknown` | the error |
+
+A parsed folded, lines, trie or tree body that is then refused answers in the push route's form instead (§8.2): no newline, no `nosniff`. A speedscope file keeps the plain-HTTP form. `<adapter>` is the reference adapter's type name, which these texts carry:
+
+| Case | Folded, lines, trie, tree | Speedscope |
+|---|---|---|
+| an unknown type | `400` `invalid_argument` `<adapter> failed to convert metadata: unknown profile type: <type>` | `422` `unknown` `invalid_argument: <adapter> failed to convert metadata: unknown profile type: <type>` |
+| a frame name that is not UTF-8 | `400` `invalid_argument` `<adapter> failed to marshal pprof: string field contains invalid UTF-8` | — (JSON text is UTF-8) |
+| a profile over 4 MiB | `400` `invalid_argument` `uncompressed profile payload size exceeds limit of 4.2 MB` | `422` `unknown` `<adapter> failed to push: invalid_argument: ` and the same |
+| a profile the checks refuse | `400` `invalid_argument` the check's text | `422` `unknown` `<adapter> failed to push: invalid_argument: <text>` |
+| backpressure | `429` `resource_exhausted` | as above |
+| a reused `Idempotency-Key`, a push over its size ceiling or its UTC dates | `400` `invalid_argument` | as above |
+| the insert failed | `500` `internal` | `500` `unknown` |
+
+Four behaviours differ from the reference on purpose: a folded line of 65,536 bytes or more is read, a `name` carrying `profile_id` is stored, speedscope values are computed as described above, and tree siblings of one name sum (`docs/reference-defects-we-do-not-copy.md` entries 43 to 46).
 
 ---
 
@@ -1742,7 +1780,7 @@ Routing note: the alias `GET /api/traces/{traceId}` coexists with native `/api/t
 |--------------------|--------|
 | `POST /loki/api/v1/push` | log push, JSON or snappy protobuf |
 | `POST /tempo/spans`, `POST /api/v2/spans` | Zipkin v2 JSON |
-| `POST /ingest`, `POST /pyroscope/ingest` | pprof, whole-body or multipart (`/api/profiles/v1/ingest`, §1.3) |
+| `POST /ingest`, `POST /pyroscope/ingest` | pprof, whole-body or multipart; folded stacks, lines, trie, tree and speedscope (`/api/profiles/v1/ingest`, §1.3) |
 | `POST /push.v1.PusherService/Push` | Connect unary `PushRequest`, `application/proto` or `application/json`, gzip or identity |
 | `POST /influx/api/v2/write` (+ health endpoints) | line protocol, `?precision=` honored |
 | `POST /api/v2/logs` | Datadog logs JSON |

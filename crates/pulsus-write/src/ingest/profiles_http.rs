@@ -1,6 +1,6 @@
 //! The profile push receivers: `POST /push.v1.PusherService/Push`, a Connect
 //! unary call carrying a `PushRequest`, and `POST /ingest`, the reference's
-//! legacy route, of which the pprof path is served here. Each reads the
+//! legacy route, which serves every format but JFR. Each reads the
 //! tenant first, reads the body under [`MAX_PROFILE_BODY_BYTES`], decodes and
 //! validates every profile, and only then admits the push whole, the shape of
 //! the trace JSON receiver in `ingest/http.rs`. Nothing is read from
@@ -24,8 +24,13 @@ use crate::ingest::{
 };
 use crate::protocols::profile_model::{MAX_PROFILE_SIZE_BYTES, decode_pprof_sized, parse_profiles};
 use crate::protocols::profile_push::{
-    Multipart, legacy_pprof_input, parse_legacy_query, parse_multipart, push_inputs,
+    LegacyQuery, Multipart, legacy_pprof_input, parse_legacy_query, parse_multipart, push_inputs,
 };
+use crate::protocols::profileql_legacy::folded::{parse_groups, parse_lines};
+use crate::protocols::profileql_legacy::speedscope::parse_speedscope;
+use crate::protocols::profileql_legacy::tree::parse_tree;
+use crate::protocols::profileql_legacy::trie::parse_trie;
+use crate::protocols::profileql_legacy::{ADAPTER, LegacyError, put_input};
 
 /// The bound on a request body as read, and on the push route's body after
 /// gzip: the reference's `distributor.ingestion-body-limit-mb` default
@@ -314,36 +319,110 @@ fn empty(status: StatusCode) -> Response {
 
 /// The body `/ingest` serves, by `format` and `Content-Type`, first match
 /// winning (`pkg/ingester/…/ingest_handler.go:207-245`).
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Format {
     Pprof,
     Multipart,
-    Unsupported(String),
+    Groups,
+    Lines,
+    Trie,
+    Tree,
+    Speedscope,
+    Jfr,
 }
 
 fn format_of(format: Option<&str>, content_type: &str) -> Format {
     let f = format.unwrap_or("");
-    let unsupported = |name: &str| Format::Unsupported(name.to_string());
     if f == "trie" || content_type == "binary/octet-stream+trie" {
-        return unsupported(if f == "trie" { f } else { content_type });
+        return Format::Trie;
     }
     if f == "tree" || content_type == "binary/octet-stream+tree" {
-        return unsupported(if f == "tree" { f } else { content_type });
+        return Format::Tree;
     }
     match f {
-        "lines" | "jfr" | "speedscope" => return unsupported(f),
-        "pprof" => return Format::Pprof,
-        _ => {}
-    }
-    if content_type.contains("multipart/form-data") {
-        Format::Multipart
-    } else {
-        unsupported("groups")
+        "lines" => Format::Lines,
+        "jfr" => Format::Jfr,
+        "pprof" => Format::Pprof,
+        "speedscope" => Format::Speedscope,
+        _ if content_type.contains("multipart/form-data") => Format::Multipart,
+        _ => Format::Groups,
     }
 }
 
-/// `POST /ingest`, `/<ref>/ingest` and `/api/profiles/v1/ingest` (§4): the
-/// pprof path, a whole-body profile or a multipart form. Success is `200`
-/// with an empty body, `202` under `X-Pulsus-Async: 1`.
+/// A converted body's refusal, in its format's family (§3.5): speedscope
+/// answers as the legacy route does, every other format as the push route.
+fn converted_error(speedscope: bool, e: LegacyError) -> Response {
+    match (e, speedscope) {
+        (LegacyError::Parse(m), _) => legacy_error(StatusCode::UNPROCESSABLE_ENTITY, m),
+        (LegacyError::Metadata(m) | LegacyError::Size(m), false) => {
+            connect_error(Code::InvalidArgument, m)
+        }
+        (LegacyError::Metadata(m), true) => legacy_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid_argument: {m}"),
+        ),
+        (LegacyError::Size(m), true) => legacy_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{ADAPTER} failed to push: invalid_argument: {m}"),
+        ),
+    }
+}
+
+/// Folded stacks, lines, trie, tree and speedscope (§3.5): the body becomes
+/// stack sets, each one profile, and the push is one model call and one
+/// admission. A push whose profiles hold no sample stores nothing.
+async fn ingest_converted(
+    sink: &dyn ProfileSink,
+    headers: &HeaderMap,
+    tenant: &pulsus_model::Tenant,
+    query: &LegacyQuery,
+    format: Format,
+    body: &[u8],
+    now_ms: i64,
+) -> Response {
+    let speedscope = format == Format::Speedscope;
+    let one = |set| put_input(set, query, &query.name).map(|input| vec![input]);
+    let inputs = match format {
+        Format::Lines => parse_lines(body).and_then(one),
+        Format::Trie => parse_trie(body).and_then(one),
+        Format::Tree => parse_tree(body).and_then(one),
+        Format::Speedscope => parse_speedscope(body, query),
+        _ => parse_groups(body).and_then(one),
+    };
+    let inputs = match inputs {
+        Ok(inputs) => inputs,
+        Err(e) => return converted_error(speedscope, e),
+    };
+    let landing = match parse_profiles(inputs, now_ms) {
+        Ok(landing) => landing,
+        Err(r) if speedscope => {
+            return legacy_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("{ADAPTER} failed to push: invalid_argument: {}", r.message),
+            );
+        }
+        Err(r) => return connect_error(Code::InvalidArgument, r.message),
+    };
+    if landing.is_empty() {
+        return empty(StatusCode::OK);
+    }
+    let asynchronous = is_async(headers);
+    match admit(sink, headers, tenant, landing).await {
+        Ok(()) if asynchronous => empty(StatusCode::ACCEPTED),
+        Ok(()) => empty(StatusCode::OK),
+        Err(Failure::Refused(r)) if speedscope => legacy_refusal(r),
+        Err(Failure::Refused(r)) => connect_refusal(r),
+        Err(Failure::Insert(e)) if speedscope => {
+            legacy_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+        Err(Failure::Insert(e)) => connect_error(Code::Internal, e.to_string()),
+    }
+}
+
+/// `POST /ingest`, `/<ref>/ingest` and `/api/profiles/v1/ingest` (§4): a
+/// whole-body pprof profile, a multipart form, or a body of one of the
+/// converted formats. Success is `200` with an empty body, `202` under
+/// `X-Pulsus-Async: 1`.
 pub async fn ingest_profile_legacy(
     sink: &dyn ProfileSink,
     query: Option<&str>,
@@ -377,10 +456,10 @@ pub async fn ingest_profile_legacy(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let form = match format_of(query.format.as_deref(), content_type) {
-        Format::Unsupported(f) => {
+        Format::Jfr => {
             return legacy_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                format!("format {f} is not supported"),
+                "format jfr is not supported",
             );
         }
         Format::Pprof => Multipart {
@@ -399,6 +478,9 @@ pub async fn ingest_profile_legacy(
                 );
             }
         },
+        format => {
+            return ingest_converted(sink, &headers, &tenant, &query, format, &body, now_ms).await;
+        }
     };
     let Some(bytes) = form.profile.filter(|b| !b.is_empty()) else {
         return empty(StatusCode::OK);
@@ -1052,7 +1134,9 @@ mod tests {
     async fn h17_each_format_is_found_by_format_or_content_type() {
         use crate::protocols::profileql_legacy::test_support::{TREE, TRIE, two_sampled};
         let tree = ("content-type", "binary/octet-stream+tree");
-        let cases: [(&str, &[(&str, &str)], Vec<u8>, usize, usize); 6] = [
+        // The URI, the headers, the body, and the series and stacks stored.
+        type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], Vec<u8>, usize, usize);
+        let cases: [Case; 6] = [
             ("/ingest?name=app&format=trie", &[], TRIE.to_vec(), 1, 2),
             ("/ingest?name=app", &[tree], TREE.to_vec(), 1, 2),
             (

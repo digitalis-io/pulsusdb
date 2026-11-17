@@ -13,7 +13,13 @@ pub mod trie;
 
 use std::collections::HashMap;
 
+use prost::Message;
+use pulsus_profiles_wire::google_v1::{
+    Function, Line, Location, Mapping, Profile, Sample, ValueType,
+};
+
 use crate::ingest::profiles::ProfileInput;
+use crate::protocols::profile_model::{MAX_PROFILE_SIZE_BYTES, SPY_LABEL};
 use crate::protocols::profile_push::{Labels, LegacyQuery};
 
 /// The reference adapter's type name, which its error texts carry
@@ -43,21 +49,311 @@ pub struct StackSet {
 }
 
 impl StackSet {
-    /// Adds `v` to the stack `text`, its frames split on `;`.
-    pub fn add_text(&mut self, _text: &[u8], _v: u64) {}
+    /// Adds `v` to the stack `text`, its frames split on `;`: the last piece
+    /// is dropped when empty, so `a;b;` is `a;b`, `""` has no frame and `";"`
+    /// one empty frame. A zero adds nothing, since a zero stack is never a
+    /// sample.
+    pub fn add_text(&mut self, text: &[u8], v: u64) {
+        if v == 0 {
+            return;
+        }
+        self.scratch.clear();
+        let mut pieces = text.split(|&b| b == b';').peekable();
+        while let Some(frame) = pieces.next() {
+            if pieces.peek().is_none() && frame.is_empty() {
+                break;
+            }
+            let id = self.name_id(frame);
+            self.scratch.push(id);
+        }
+        self.commit(v);
+    }
 
     /// Adds `v` to the stack `frames`, each taken whole.
-    pub fn add_frames(&mut self, _frames: &[&str], _v: u64) {}
+    pub fn add_frames(&mut self, frames: &[&str], v: u64) {
+        if v == 0 {
+            return;
+        }
+        self.scratch.clear();
+        for frame in frames {
+            let id = self.name_id(frame.as_bytes());
+            self.scratch.push(id);
+        }
+        self.commit(v);
+    }
+
+    /// The frame's id, 1-based in first-seen order.
+    fn name_id(&mut self, name: &[u8]) -> u64 {
+        if let Some(&id) = self.names.get(name) {
+            return id;
+        }
+        let id = self.names.len() as u64 + 1;
+        self.names.insert(name.into(), id);
+        id
+    }
+
+    /// Adds `v` to the stack in `scratch`, wrapping as the reference's
+    /// unsigned sums do.
+    fn commit(&mut self, v: u64) {
+        match self.stacks.get_mut(self.scratch.as_slice()) {
+            Some(sum) => *sum = sum.wrapping_add(v),
+            None => {
+                self.stacks.insert(self.scratch.clone(), v);
+            }
+        }
+    }
+}
+
+/// A cursor over a binary body, failing as Go's readers fail.
+pub(crate) struct Reader<'a> {
+    body: &'a [u8],
+    pos: usize,
+}
+
+/// Go's `io.EOF`: the read found no byte at all.
+pub(crate) const EOF: &str = "EOF";
+
+impl<'a> Reader<'a> {
+    pub(crate) fn new(body: &'a [u8]) -> Self {
+        Reader { body, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.body.len() - self.pos
+    }
+
+    /// `binary.ReadUvarint`: `EOF` before the first byte, `unexpected EOF`
+    /// after it, and an overflow past 64 bits refused with Go's text.
+    pub(crate) fn uvarint(&mut self) -> Result<u64, &'static str> {
+        let mut x: u64 = 0;
+        for i in 0..10 {
+            let Some(&b) = self.body.get(self.pos) else {
+                return Err(if i == 0 { EOF } else { "unexpected EOF" });
+            };
+            self.pos += 1;
+            if b < 0x80 {
+                if i == 9 && b > 1 {
+                    return Err("binary: varint overflows a 64-bit integer");
+                }
+                return Ok(x | u64::from(b) << (7 * i));
+            }
+            x |= u64::from(b & 0x7f) << (7 * i);
+        }
+        Err("binary: varint overflows a 64-bit integer")
+    }
+
+    /// Up to `n` bytes, fewer at the end of the body.
+    pub(crate) fn take_up_to(&mut self, n: usize) -> &'a [u8] {
+        let n = n.min(self.remaining());
+        let out = &self.body[self.pos..self.pos + n];
+        self.pos += n;
+        out
+    }
+
+    /// `io.ReadAtLeast` of exactly `n` bytes: `EOF` when none is left,
+    /// `unexpected EOF` when some but too few are.
+    pub(crate) fn take_exact(&mut self, n: usize) -> Result<&'a [u8], &'static str> {
+        if n > self.remaining() {
+            return Err(if self.remaining() == 0 {
+                EOF
+            } else {
+                "unexpected EOF"
+            });
+        }
+        Ok(self.take_up_to(n))
+    }
+}
+
+fn parse_error(e: &str) -> LegacyError {
+    LegacyError::Parse(e.to_string())
+}
+
+/// The metric, sample type and unit of a type key
+/// (`ingest_adapter.go:208-306`).
+fn type_of(key: &str) -> Option<(&'static str, &str, &'static str)> {
+    const COUNT: &str = "count";
+    const BYTES: &str = "bytes";
+    Some(match key {
+        "cpu" | "itimer" => ("process_cpu", "samples", COUNT),
+        "wall" | "seconds" | "nanoseconds" | "microseconds" | "milliseconds" => {
+            ("wall", "samples", COUNT)
+        }
+        "inuse_objects"
+        | "alloc_objects"
+        | "alloc_in_new_tlab_objects"
+        | "alloc_outside_tlab_objects"
+        | "live" => ("memory", key, COUNT),
+        "inuse_space" | "alloc_space" | "alloc_in_new_tlab_bytes" | "alloc_outside_tlab_bytes" => {
+            ("memory", key, BYTES)
+        }
+        "bytes" => ("memory", "samples", BYTES),
+        "goroutines" => ("goroutine", "goroutines", COUNT),
+        "mutex_count" => ("mutex", "contentions", COUNT),
+        "mutex_duration" => ("mutex", "delay", "nanoseconds"),
+        "block_count" | "lock_count" => ("block", "contentions", COUNT),
+        "block_duration" | "lock_duration" => ("block", "delay", "nanoseconds"),
+        "exceptions" => ("exceptions", "samples", COUNT),
+        _ => return None,
+    })
+}
+
+/// A string table that gives the few type and unit strings one index each,
+/// as the reference's interning does (`pprof.go:141-149`); frame names are
+/// distinct already.
+struct Strings {
+    table: Vec<String>,
+}
+
+impl Strings {
+    fn index(&mut self, s: &str) -> i64 {
+        if let Some(i) = self.table.iter().position(|t| t == s) {
+            return i as i64;
+        }
+        self.table.push(s.to_string());
+        (self.table.len() - 1) as i64
+    }
 }
 
 /// One stack set as the model's input (§3.3): its type from `name`'s
-/// service, its values scaled by the sample rate, and the reference's labels.
+/// service, its values scaled by the sample rate, and the reference's labels
+/// (`ingest_adapter.go:77-176`).
 pub fn put_input(
-    _set: StackSet,
-    _query: &LegacyQuery,
-    _name: &Labels,
+    set: StackSet,
+    query: &LegacyQuery,
+    name: &Labels,
 ) -> Result<ProfileInput, LegacyError> {
-    Err(LegacyError::Metadata("not built".to_string()))
+    let service = name
+        .iter()
+        .find(|(k, _)| k == "__name__")
+        .map_or("", |(_, v)| v.as_str());
+    let (key, app) = match service.rsplit_once('.') {
+        Some((app, key)) => (key, app),
+        None => ("cpu", service),
+    };
+    let (metric, mut st_type, mut st_unit) = type_of(key).ok_or_else(|| {
+        LegacyError::Metadata(format!(
+            "{ADAPTER} failed to convert metadata: unknown profile type: {key}"
+        ))
+    })?;
+    let mut scale: u64 = 1;
+    let mut period: i64 = 0;
+    if query.sample_rate != 0 && (metric == "wall" || metric == "process_cpu") {
+        period = 1_000_000_000 / i64::from(query.sample_rate);
+        st_type = if metric == "wall" { "wall" } else { "cpu" };
+        st_unit = "nanoseconds";
+        scale = period as u64;
+    }
+
+    let mut strings = Strings {
+        table: vec![String::new()],
+    };
+    let sample_type = vec![ValueType {
+        r#type: strings.index(st_type),
+        unit: strings.index(st_unit),
+    }];
+    let period_type = (period != 0).then(|| ValueType {
+        r#type: strings.index("cpu"),
+        unit: strings.index("nanoseconds"),
+    });
+    let meta = strings.table.len();
+
+    let StackSet { names, stacks, .. } = set;
+    let mut by_id: Vec<Option<Box<[u8]>>> = (0..names.len()).map(|_| None).collect();
+    for (name, id) in names {
+        by_id[(id - 1) as usize] = Some(name);
+    }
+    let mut function = Vec::with_capacity(by_id.len());
+    let mut location = Vec::with_capacity(by_id.len());
+    for (i, name) in by_id.into_iter().enumerate() {
+        let id = i as u64 + 1;
+        let name = String::from_utf8(name.unwrap_or_default().into_vec()).map_err(|_| {
+            LegacyError::Metadata(format!(
+                "{ADAPTER} failed to marshal pprof: string field contains invalid UTF-8"
+            ))
+        })?;
+        let index = match strings.table[..meta].iter().position(|t| *t == name) {
+            Some(i) => i as i64,
+            None => {
+                strings.table.push(name);
+                (strings.table.len() - 1) as i64
+            }
+        };
+        function.push(Function {
+            id,
+            name: index,
+            system_name: index,
+            ..Function::default()
+        });
+        location.push(Location {
+            id,
+            mapping_id: 1,
+            line: vec![Line {
+                function_id: id,
+                line: 0,
+            }],
+            ..Location::default()
+        });
+    }
+    let mut sample = Vec::with_capacity(stacks.len());
+    for (mut stack, v) in stacks {
+        let value = v.wrapping_mul(scale) as i64;
+        if value == 0 {
+            continue;
+        }
+        stack.reverse();
+        sample.push(Sample {
+            location_id: stack,
+            value: vec![value],
+            label: Vec::new(),
+        });
+    }
+    let profile = Profile {
+        sample_type,
+        sample,
+        mapping: vec![Mapping {
+            id: 1,
+            ..Mapping::default()
+        }],
+        location,
+        function,
+        string_table: strings.table,
+        time_nanos: query.from_ns.unwrap_or(0),
+        period_type,
+        period,
+        ..Profile::default()
+    };
+    let size = profile.encoded_len() as u64;
+    if size > MAX_PROFILE_SIZE_BYTES {
+        return Err(LegacyError::Size(
+            "uncompressed profile payload size exceeds limit of 4.2 MB".to_string(),
+        ));
+    }
+
+    let mut labels: Labels = vec![
+        ("__name__".to_string(), metric.to_string()),
+        ("__delta__".to_string(), "false".to_string()),
+    ];
+    if !query.spy_name.is_empty() {
+        labels.push((SPY_LABEL.to_string(), query.spy_name.clone()));
+    }
+    labels.extend(
+        name.iter()
+            .filter(|(k, _)| !k.starts_with("__") || k == "__session_id__")
+            .cloned(),
+    );
+    if !name.iter().any(|(k, _)| k == "service_name") {
+        labels.push(("service_name".to_string(), app.to_string()));
+    } else if !name.iter().any(|(k, _)| k == "app_name") {
+        labels.push(("app_name".to_string(), app.to_string()));
+    }
+    Ok(ProfileInput {
+        labels,
+        profile,
+        decompressed_bytes: size,
+        id: None,
+        annotations: Vec::new(),
+        language: None,
+    })
 }
 
 #[cfg(test)]
