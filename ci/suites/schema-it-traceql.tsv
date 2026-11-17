@@ -104,6 +104,13 @@ profiles_series_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=
 # route, against the spawned binary. Reuses this job's ClickHouse
 # container.
 profiles_series	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profiles_series
+# Issue #825: the heatmap's one statement over its tenant's entries, and
+# with HEATMAP_QUERY_TYPE_SPAN over its samples. Reuses this job's
+# ClickHouse container.
+profileql_heatmap_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test profileql_heatmap_live
+# Issue #825: SelectHeatmap over the Connect protocol, against the spawned
+# binary. Reuses this job's ClickHouse container.
+profileql_heatmap	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profileql_heatmap
 # Issue #55: spawns the real `pulsusdb` binary and drives the
 # `/api/traces/v1/trace/{traceId}[/json]` fetch surface end-to-end —
 # OTLP ingest seed, JSON/protobuf negotiation (incl. the 406

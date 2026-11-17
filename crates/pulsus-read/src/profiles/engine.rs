@@ -241,8 +241,9 @@ impl ProfilesEngine {
 
     /// Issue #825: sends S8 (`super::heatmap`) and returns one row per
     /// series.
-    pub async fn read_heatmap(&self, _sql: &str) -> Result<Vec<HeatmapRow>, ProfilesReadError> {
-        Ok(Vec::new())
+    pub async fn read_heatmap(&self, sql: &str) -> Result<Vec<HeatmapRow>, ProfilesReadError> {
+        let settings = read_settings(&self.config, self.log_comment.as_deref());
+        self.dispatch.rows(sql, &settings).await
     }
 }
 

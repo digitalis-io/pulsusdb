@@ -8,9 +8,12 @@
 //! Connect paths and `GET /api/profiles/v1/merge`, in one statement.
 //! Issue #824: `SelectSeries`, the time series of profile totals, at the two
 //! Connect paths and `GET /api/profiles/v1/select_series`, in one statement.
+//! Issue #825: `SelectHeatmap`, the heatmap of profile and span totals, at
+//! the two Connect paths, in one statement.
 
 pub(crate) mod connect;
 mod engine;
+mod heatmap;
 mod merge;
 pub(crate) mod routes;
 mod series;
@@ -47,6 +50,10 @@ pub(crate) fn router() -> Router<AppState> {
         .route(
             "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
             post(series::select_series),
+        )
+        .route(
+            "/api/profiles/v1/querier.v1.QuerierService/SelectHeatmap",
+            post(heatmap::select_heatmap),
         )
         .route("/api/profiles/v1/types", get(routes::types_get))
         .route(
@@ -92,6 +99,10 @@ pub(crate) fn compat_router() -> Router<AppState> {
         .route(
             "/querier.v1.QuerierService/SelectSeries",
             post(series::select_series),
+        )
+        .route(
+            "/querier.v1.QuerierService/SelectHeatmap",
+            post(heatmap::select_heatmap),
         )
 }
 

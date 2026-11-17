@@ -8,7 +8,7 @@
 //! total over the stacks beginning with the call site from
 //! `profile_samples`.
 
-use pulsus_model::Tenant;
+use pulsus_model::{LabelMatcher, Tenant};
 use serde::{Deserialize, Serialize};
 
 use crate::logql::escape::ch_string;
@@ -84,25 +84,17 @@ pub fn plan(
     req: &SeriesRequest<'_>,
     now_ms: i64,
 ) -> Result<Option<String>, ProfilesReadError> {
-    let selectors = [req.label_selector];
-    let compiled = compile(
+    let Some((window, matchers)) = select(
         tenant,
-        &config.series_table,
-        &SelectorRequest {
-            selectors: &selectors,
-            profile_type: Some(req.profile_type),
-            start_ms: req.start_ms,
-            end_ms: req.end_ms,
-        },
+        config,
+        req.profile_type,
+        req.label_selector,
+        req.start_ms,
+        req.end_ms,
         now_ms,
-        config.limits,
-    )
-    .map_err(|SelectorError::InvalidArgument(m)| ProfilesReadError::InvalidArgument(m))?;
-    let (window, matchers) = match compiled {
-        Compiled::Empty => return Ok(None),
-        Compiled::Series {
-            window, matchers, ..
-        } => (window, matchers),
+    )?
+    else {
+        return Ok(None);
     };
     let step = step_ms(req.step)?;
 
@@ -130,21 +122,7 @@ pub fn plan(
     let type_id = ch_string(type_id);
     let service_terms = crate::metrics::profile_service_terms(&matchers);
 
-    let (g, join) = if req.group_by.is_empty() {
-        ("CAST([] AS Array(String))".to_string(), String::new())
-    } else {
-        let labels: Vec<String> = req
-            .group_by
-            .iter()
-            .map(|l| format!("JSONExtractString(labels, {})", ch_string(l)))
-            .collect();
-        let join = format!(
-            "\n  INNER JOIN (\n    SELECT fingerprint, any([{}]) AS g\n{}\n    GROUP BY fingerprint\n  ) AS s ON e.fingerprint = s.fingerprint",
-            labels.join(", "),
-            crate::metrics::profile_series_where(tenant, w, series_table, &matchers)
-        );
-        ("s.g".to_string(), join)
-    };
+    let (g, join) = group(tenant, w, series_table, &matchers, req.group_by);
     let source = if req.call_site.is_empty() {
         format!(
             "FROM {entries} AS e{join}
@@ -197,6 +175,65 @@ ORDER BY series_total DESC, g{limit}",
     )))
 }
 
+/// The window and the matchers `profile_type`, `label_selector` and
+/// `[start_ms, end_ms]` select for `tenant`, checked in the reference's
+/// order (the window, the type, the selector); `None` when the window ends
+/// before the lookback floor.
+pub(super) fn select(
+    tenant: &Tenant,
+    config: &ProfilesReadConfig,
+    profile_type: &str,
+    label_selector: &str,
+    start_ms: i64,
+    end_ms: i64,
+    now_ms: i64,
+) -> Result<Option<(DataWindow, Vec<LabelMatcher>)>, ProfilesReadError> {
+    let selectors = [label_selector];
+    let compiled = compile(
+        tenant,
+        &config.series_table,
+        &SelectorRequest {
+            selectors: &selectors,
+            profile_type: Some(profile_type),
+            start_ms,
+            end_ms,
+        },
+        now_ms,
+        config.limits,
+    )
+    .map_err(|SelectorError::InvalidArgument(m)| ProfilesReadError::InvalidArgument(m))?;
+    Ok(match compiled {
+        Compiled::Empty => None,
+        Compiled::Series {
+            window, matchers, ..
+        } => Some((window, matchers)),
+    })
+}
+
+/// A grouped read's `g` and its join to the selected series' labels over
+/// `w`: without `group_by`, the empty array and no join.
+pub(super) fn group(
+    tenant: &Tenant,
+    w: DataWindow,
+    series_table: &str,
+    matchers: &[LabelMatcher],
+    group_by: &[String],
+) -> (String, String) {
+    if group_by.is_empty() {
+        return ("CAST([] AS Array(String))".to_string(), String::new());
+    }
+    let labels: Vec<String> = group_by
+        .iter()
+        .map(|l| format!("JSONExtractString(labels, {})", ch_string(l)))
+        .collect();
+    let join = format!(
+        "\n  INNER JOIN (\n    SELECT fingerprint, any([{}]) AS g\n{}\n    GROUP BY fingerprint\n  ) AS s ON e.fingerprint = s.fingerprint",
+        labels.join(", "),
+        crate::metrics::profile_series_where(tenant, w, series_table, matchers)
+    );
+    ("s.g".to_string(), join)
+}
+
 /// The rows as the reference answers them: each series labelled by the
 /// `group_by` names it holds a value for, in request order; ordered by the
 /// sum of its points, descending, then by its labels; cut to `limit` when
@@ -235,7 +272,10 @@ pub fn series(rows: Vec<TimeSeriesRow>, group_by: &[String], limit: Option<i64>)
 
 /// Two label sets compared pairwise, name then value, in byte order; when
 /// one is a prefix of the other, the shorter first.
-fn compare_label_pairs(a: &[(String, String)], b: &[(String, String)]) -> std::cmp::Ordering {
+pub(super) fn compare_label_pairs(
+    a: &[(String, String)],
+    b: &[(String, String)],
+) -> std::cmp::Ordering {
     for ((an, av), (bn, bv)) in a.iter().zip(b) {
         let c = an
             .as_bytes()

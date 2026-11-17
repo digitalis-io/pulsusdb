@@ -301,20 +301,39 @@ impl ExemplarType {
 }
 
 /// Issue #825: one heatmap series — its labels and its slots.
-#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HeatmapSeries {
+    #[prost(message, repeated, tag = "1")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<LabelPair>,
+    #[prost(message, repeated, tag = "2")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub slots: Vec<HeatmapSlot>,
 }
-empty_message!(HeatmapSeries);
 
-/// Issue #825: one slot of a heatmap series.
-#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+/// Issue #825: one slot of a heatmap series — its right edge, the 20
+/// bucket starts and each bucket's count. Tag 4, exemplars, is #826's.
+#[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HeatmapSlot {
+    #[prost(int64, tag = "1")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub timestamp: i64,
+    #[prost(double, repeated, tag = "2")]
+    #[serde(
+        rename = "yMin",
+        alias = "y_min",
+        serialize_with = "crate::double::ser_vec",
+        deserialize_with = "crate::double::de_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub y_min: Vec<f64>,
+    #[prost(int32, repeated, tag = "3")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub counts: Vec<i32>,
 }
-empty_message!(HeatmapSlot);

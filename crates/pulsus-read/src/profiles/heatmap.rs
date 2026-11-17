@@ -9,7 +9,12 @@
 use pulsus_model::Tenant;
 use serde::{Deserialize, Serialize};
 
+use crate::logql::escape::ch_string;
+use crate::metrics::DataWindow;
+use crate::traces::tenant_scope::TenantTerm;
+
 use super::engine::{ProfilesReadConfig, ProfilesReadError};
+use super::series;
 
 /// `querier.v1.HeatmapQueryType` `INDIVIDUAL`.
 pub const QUERY_TYPE_INDIVIDUAL: i32 = 1;
@@ -61,19 +66,166 @@ pub struct Series {
 }
 
 /// Plans `req` for `tenant`: `Ok(None)` when its window ends before the
-/// lookback floor, so nothing is read.
+/// lookback floor, so nothing is read. In the reference's order: the step,
+/// the limit, the window's order, then the window, the type and the
+/// selector, then the query type. The exemplar type is the caller's.
 pub fn plan(
-    _tenant: &Tenant,
-    _config: &ProfilesReadConfig,
-    _req: &HeatmapRequest<'_>,
-    _now_ms: i64,
+    tenant: &Tenant,
+    config: &ProfilesReadConfig,
+    req: &HeatmapRequest<'_>,
+    now_ms: i64,
 ) -> Result<Option<String>, ProfilesReadError> {
-    Ok(Some(String::new()))
+    let invalid = |m: String| Err(ProfilesReadError::InvalidArgument(m));
+    if req.step.is_nan() || req.step < 0.001 {
+        return invalid(format!("step must be >= 1ms, got {:.6}", req.step));
+    }
+    if let Some(limit) = req.limit.filter(|l| *l < 0) {
+        return invalid(format!("limit must be non-negative, got {limit}"));
+    }
+    if req.start_ms >= req.end_ms {
+        return invalid(format!(
+            "start time must be before end time, got start={} end={}",
+            req.start_ms, req.end_ms
+        ));
+    }
+    let Some((window, matchers)) = series::select(
+        tenant,
+        config,
+        req.profile_type,
+        req.label_selector,
+        req.start_ms,
+        req.end_ms,
+        now_ms,
+    )?
+    else {
+        return Ok(None);
+    };
+    let span = match req.query_type {
+        QUERY_TYPE_INDIVIDUAL => false,
+        QUERY_TYPE_SPAN => true,
+        _ => return invalid("valid heatmap query type must be specified".to_string()),
+    };
+    let step = series::step_ms(req.step)?;
+
+    let start = window.start_ms;
+    let end = window.end_ms;
+    let read_start = start.saturating_sub(step);
+    let lo_ns = read_start.saturating_mul(1_000_000);
+    let hi_ns = end.saturating_mul(1_000_000);
+    let w = DataWindow {
+        start_ms: read_start,
+        end_ms: end,
+    };
+    let series_table = config.series_table.as_str();
+    let series = crate::metrics::profile_series(tenant, w, series_table, &matchers);
+    let tenant_term = TenantTerm::of(tenant);
+    let type_id = matchers
+        .iter()
+        .rev()
+        .find(|m| m.key == "__profile_type__")
+        .map(|m| m.value.as_str())
+        .unwrap_or_default();
+    let type_id = ch_string(type_id);
+    let service_terms = crate::metrics::profile_service_terms(&matchers);
+    let (g, join) = series::group(tenant, w, series_table, &matchers, req.group_by);
+    let source = if span {
+        format!(
+            "FROM (
+      SELECT fingerprint, timestamp_ns, sum(value) AS total
+      FROM {samples}
+      WHERE {tenant_term} AND type_id = {type_id}{service_terms}
+        AND fingerprint IN ({series})
+        AND timestamp_ns >= {lo_ns} AND timestamp_ns <= {hi_ns}
+        AND span_id != 0
+      GROUP BY fingerprint, timestamp_ns, profile_id, trace_id, span_id
+    ) AS e{join}",
+            samples = config.samples_table,
+        )
+    } else {
+        format!(
+            "FROM {entries} AS e{join}
+    WHERE {tenant_term} AND e.type_id = {type_id}{service_terms}
+      AND e.fingerprint IN ({series})
+      AND e.timestamp_ns >= {lo_ns} AND e.timestamp_ns <= {hi_ns}",
+            entries = config.entries_table,
+        )
+    };
+    let limit = match req.limit {
+        Some(n) if n > 0 => format!("\nLIMIT {}", n.saturating_add(1)),
+        _ => String::new(),
+    };
+    Ok(Some(format!(
+        "SELECT g, sum(length(b)) AS n, arraySort(groupArray((ts, arrayMap(k -> toUInt32(countEqual(b, k)), range(20))))) AS slots,
+       any(arrayMap(i -> toFloat64(lo + toInt64(i * w)), range(20))) AS y_min
+FROM (
+  SELECT g, ts, lo, w,
+         arrayMap(v -> least(19, toInt64((v - lo + 1) / w)), vs) AS b0,
+         arrayMap((c, v) -> c - (toInt64(c * w) > v - lo), b0, vs) AS b1,
+         arrayMap((c, v) -> c + (c < 19 AND toInt64((c + 1) * w) <= v - lo), b1, vs) AS b
+  FROM (
+    SELECT g, ts, vs, lo, toFloat64(if(hi = lo, 1, hi - lo)) / 20 AS w
+    FROM (
+      SELECT g, ts, vs, min(v_min) OVER () AS lo, greatest(max(v_max) OVER (), 0) AS hi
+      FROM (
+        SELECT {g} AS g, {start} + intDiv(intDiv(e.timestamp_ns, 1000000) - {start} + {step_minus_1}, {step}) * {step} AS ts, groupArray(e.total) AS vs, min(e.total) AS v_min, max(e.total) AS v_max
+        {source}
+        GROUP BY g, ts
+      )
+    )
+  )
+)
+GROUP BY g
+ORDER BY n DESC, g{limit}",
+        step_minus_1 = step - 1,
+    )))
 }
 
-/// The rows as series, ordered and cut to `limit`.
-pub fn heatmap(_rows: Vec<HeatmapRow>, _group_by: &[String], _limit: Option<i64>) -> Vec<Series> {
-    Vec::new()
+/// The rows as the answer's series: each labelled by the `group_by` names
+/// it holds a value for, in request order; every slot carries the row's
+/// bucket starts. With more rows than a positive `limit`, ordered by their
+/// value counts, descending, then by their labels, and cut to `limit`;
+/// otherwise ordered by their labels.
+pub fn heatmap(rows: Vec<HeatmapRow>, group_by: &[String], limit: Option<i64>) -> Vec<Series> {
+    let mut out: Vec<(u64, Series)> = rows
+        .into_iter()
+        .map(|row| {
+            let labels: Vec<(String, String)> = group_by
+                .iter()
+                .zip(row.g)
+                .filter(|(_, value)| !value.is_empty())
+                .map(|(name, value)| (name.clone(), value))
+                .collect();
+            let y_min = row.y_min;
+            let slots: Vec<Slot> = row
+                .slots
+                .into_iter()
+                .map(|(timestamp, counts)| Slot {
+                    timestamp,
+                    y_min: y_min.clone(),
+                    counts: counts
+                        .into_iter()
+                        .map(|c| i32::try_from(c).unwrap_or(i32::MAX))
+                        .collect(),
+                })
+                .collect();
+            (row.n, Series { labels, slots })
+        })
+        .collect();
+    let cut = limit
+        .filter(|k| *k > 0)
+        .map(|k| usize::try_from(k).unwrap_or(usize::MAX))
+        .filter(|k| out.len() > *k);
+    match cut {
+        Some(k) => {
+            out.sort_by(|(a_n, a), (b_n, b)| {
+                b_n.cmp(a_n)
+                    .then_with(|| series::compare_label_pairs(&a.labels, &b.labels))
+            });
+            out.truncate(k);
+        }
+        None => out.sort_by(|(_, a), (_, b)| series::compare_label_pairs(&a.labels, &b.labels)),
+    }
+    out.into_iter().map(|(_, s)| s).collect()
 }
 
 #[cfg(test)]
@@ -81,7 +233,6 @@ mod tests {
     use super::*;
     use crate::profiles::selector::WindowLimits;
     use crate::profiles::tenant_scope;
-    use crate::traces::tenant_scope::TenantTerm;
 
     const CPU: &str = "process_cpu:cpu:nanoseconds:cpu:nanoseconds";
     /// 2026-11-16T09:00Z and 10:00Z.
