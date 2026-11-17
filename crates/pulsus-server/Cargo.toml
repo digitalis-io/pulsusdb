@@ -19,8 +19,9 @@ path = "src/main.rs"
 getrandom.workspace = true
 # `ws` (issue #74): the `/api/logs/v1/tail` live-tail WebSocket
 # (`axum::extract::ws`) — a feature flag on the existing dependency, not a
-# new one.
-axum = { workspace = true, features = ["ws"] }
+# new one. `http2` (issue #816): the listener serves HTTP/2 beside
+# HTTP/1.1, for OTLP over gRPC.
+axum = { workspace = true, features = ["ws", "http2"] }
 bytes.workspace = true
 # RFC3339 timestamp parsing for `/api/logs/v1`'s `start`/`end`/`time` params
 # (issue #13 architect plan interfaces: "else RFC3339 (chrono) ⇒ ns"); no
@@ -97,6 +98,12 @@ libc = "0.2"
 # are already in the lock through axum.
 pin-project-lite = "0.2"
 http-body = "1"
+# Issue #816: the OTLP gRPC shim's success body (`Full` with trailers) and
+# its tests' trailer reads. Already in the lock through axum.
+http-body-util.workspace = true
+# Issue #816: `grpc-status-details-bin` is base64 without padding. Already in
+# the lock through other crates.
+base64 = "0.22"
 
 [dev-dependencies]
 pulsus-schema-testkit = { path = "../pulsus-schema-testkit" }
@@ -135,3 +142,9 @@ rcgen = "0.13"
 # `test-util` enables `#[tokio::test(start_paused = true)]` for the issue
 # #174 accept-error backoff test in `tls.rs` (the pulsus-write precedent).
 tokio = { workspace = true, features = ["test-util"] }
+# Issue #816: TEST-ONLY gRPC clients for the OTLP gRPC export paths
+# (`serve.rs` tests and `tests/otlp_grpc.rs`). The release binary serves
+# gRPC through its own shim (`grpc.rs`) and links neither; resolver 2 keeps
+# these features out of it.
+opentelemetry-proto = { workspace = true, features = ["gen-tonic"] }
+tonic = { version = "0.14", default-features = false, features = ["gzip", "tls-ring"] }

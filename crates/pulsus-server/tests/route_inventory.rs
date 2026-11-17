@@ -1136,6 +1136,9 @@ fn every_mounted_route_spec_has_a_surface_consistent_gate() {
             Surface::ProfilesConnect => {
                 matches!(spec.gate, Gate::ReaderMode | Gate::CompatAndReader)
             }
+            // Issue #816: the gRPC export paths are mounted with the HTTP
+            // ingest routes.
+            Surface::OtlpGrpc => spec.gate == Gate::WriterMode,
         };
         assert!(
             ok,

@@ -1167,6 +1167,39 @@ mod tests {
     async fn serve_plaintext(
         config: Config,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let router = test_router(&config);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (addr, server)
+    }
+
+    /// `run()`'s TLS arm in miniature: [`serve_plaintext`]'s shape behind
+    /// the `TlsListener`, with the production ALPN. Also returns the
+    /// certificate's PEM, for a client's trust store.
+    async fn serve_tls(
+        config: Config,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, String) {
+        let router = test_router(&config);
+        let (tls_config, pem) = crate::tls::test_server_config();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(crate::tls::TlsListener::new(listener, tls_config), router).await;
+        });
+        (addr, server, pem)
+    }
+
+    /// The full router over a state with no pool and every writer slot
+    /// empty, so every admitted push answers `429`: the refusal a full
+    /// writer queue gives.
+    fn test_router(config: &Config) -> axum::Router {
         let (_tail_tx, tail_rx) = tokio::sync::watch::channel(false);
         let state = AppState {
             pool: Arc::new(RwLock::new(None)),
@@ -1196,63 +1229,296 @@ mod tests {
             )),
             request_metrics: crate::request_metrics::RequestMetrics::leak_new(),
         };
-        let router = app::build_router(state, &config).expect("router builds");
-
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
-        });
-        (addr, server)
+        app::build_router(state, config).expect("router builds")
     }
 
-    /// docs/api.md §8.3 (issue #480): the server speaks HTTP/1.1 only, so a
-    /// gRPC call — HTTP/2 — has nothing to answer it. Sends the HTTP/2
-    /// connection preface a plaintext gRPC client opens with, on the same
-    /// `build_router` + `axum::serve(listener, router)` shape `run()`'s
-    /// plaintext arm uses, and records what comes back.
-    #[tokio::test]
-    async fn plaintext_listener_does_not_speak_http2() {
+    /// Issue #816: the OTLP gRPC export paths over HTTP/2, through tonic's
+    /// generated clients.
+    mod grpc {
+        use super::*;
+
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+        use opentelemetry_proto::tonic::collector::profiles::v1development::ExportProfilesServiceRequest;
+        use opentelemetry_proto::tonic::collector::profiles::v1development::profiles_service_client::ProfilesServiceClient;
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::profiles::v1development::ProfilesDictionary;
+        use prost::Message;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tonic::Code;
+        use tonic::codec::CompressionEncoding;
+        use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
-        let config = Config {
-            compat_endpoints: true,
-            ..Config::default()
-        };
-        let (addr, server) = serve_plaintext(config).await;
+        const BACKPRESSURE: &str = "sink is applying backpressure: buffers are full";
+        const RETRY_INFO: &str = "type.googleapis.com/google.rpc.RetryInfo";
 
-        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
-        // The connection preface, then an empty SETTINGS frame.
-        stream
-            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
-            .await
-            .expect("write preface");
-        // Everything the server sends before it closes the connection. A
-        // reset after the bytes is a close too; the bytes are what count.
-        let mut response = Vec::new();
-        let mut buf = [0u8; 1024];
-        let closed = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match stream.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => response.extend_from_slice(&buf[..n]),
-                }
+        /// `google.rpc.Status`, read from `grpc-status-details-bin`.
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        struct RpcStatus {
+            #[prost(int32, tag = "1")]
+            code: i32,
+            #[prost(string, tag = "2")]
+            message: String,
+            #[prost(message, repeated, tag = "3")]
+            details: Vec<RpcAny>,
+        }
+
+        /// `google.protobuf.Any`.
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        struct RpcAny {
+            #[prost(string, tag = "1")]
+            type_url: String,
+            #[prost(bytes = "vec", tag = "2")]
+            value: Vec<u8>,
+        }
+
+        /// A channel that connects at the first call, so a transport
+        /// failure is the call's status.
+        fn h2c_channel(addr: std::net::SocketAddr) -> Channel {
+            Endpoint::from_shared(format!("http://{addr}"))
+                .expect("an endpoint")
+                .connect_lazy()
+        }
+
+        fn tls_channel(addr: std::net::SocketAddr, pem: &str) -> Channel {
+            Endpoint::from_shared(format!("https://127.0.0.1:{}", addr.port()))
+                .expect("an endpoint")
+                .tls_config(
+                    ClientTlsConfig::new()
+                        .ca_certificate(Certificate::from_pem(pem))
+                        .domain_name("localhost"),
+                )
+                .expect("a TLS config")
+                .connect_lazy()
+        }
+
+        /// The call's error status, or `None` when it succeeded. Bounded,
+        /// so a server that never answers fails the test.
+        async fn status_of<T>(
+            call: impl std::future::Future<Output = Result<T, tonic::Status>>,
+        ) -> Option<tonic::Status> {
+            tokio::time::timeout(Duration::from_secs(10), call)
+                .await
+                .expect("an answer within 10s")
+                .err()
+        }
+
+        fn code_and_message(status: &Option<tonic::Status>) -> Option<(Code, String)> {
+            status.as_ref().map(|s| (s.code(), s.message().to_string()))
+        }
+
+        /// One log record timed now, body `x`.
+        fn one_log_record() -> ExportLogsServiceRequest {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after 1970")
+                .as_nanos() as u64;
+            ExportLogsServiceRequest {
+                resource_logs: vec![ResourceLogs {
+                    scope_logs: vec![ScopeLogs {
+                        log_records: vec![LogRecord {
+                            time_unix_nano: now,
+                            body: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue("x".to_string())),
+                            }),
+                            ..LogRecord::default()
+                        }],
+                        ..ScopeLogs::default()
+                    }],
+                    ..ResourceLogs::default()
+                }],
             }
-        })
-        .await;
-        assert!(
-            closed.is_ok(),
-            "the server must close an HTTP/2 connection within 5s, sent: {response:?}"
-        );
-        assert!(
-            response.is_empty(),
-            "an HTTP/2 connection must be closed with no reply, got: {response:?}"
-        );
+        }
 
-        server.abort();
-        let _ = server.await;
+        fn with_tenant<T>(message: T, tenant: &str) -> tonic::Request<T> {
+            let mut request = tonic::Request::new(message);
+            request
+                .metadata_mut()
+                .insert("x-scope-orgid", tenant.parse().expect("ASCII metadata"));
+            request
+        }
+
+        #[tokio::test]
+        async fn h2c_logs_export_reaches_the_handler() {
+            let (addr, server) = serve_plaintext(Config::default()).await;
+            let mut client = LogsServiceClient::new(h2c_channel(addr))
+                .send_compressed(CompressionEncoding::Gzip);
+            let status = status_of(client.export(one_log_record())).await;
+            assert_eq!(
+                code_and_message(&status),
+                Some((Code::ResourceExhausted, BACKPRESSURE.to_string())),
+                "{status:?}"
+            );
+            let details = status
+                .as_ref()
+                .map(|s| RpcStatus::decode(s.details()).expect("a google.rpc.Status"));
+            assert_eq!(
+                details.map(|d| d
+                    .details
+                    .into_iter()
+                    .map(|a| a.type_url)
+                    .collect::<Vec<_>>()),
+                Some(vec![RETRY_INFO.to_string()])
+            );
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn tls_h2_reaches_each_export_handler() {
+            let (addr, server, pem) = serve_tls(Config::default()).await;
+            let channel = tls_channel(addr, &pem);
+            let expected = Some((Code::InvalidArgument, "invalid X-Scope-OrgID".to_string()));
+
+            let mut logs = LogsServiceClient::new(channel.clone());
+            let status =
+                status_of(logs.export(with_tenant(ExportLogsServiceRequest::default(), "a|b")))
+                    .await;
+            assert_eq!(code_and_message(&status), expected, "logs: {status:?}");
+
+            let mut metrics = MetricsServiceClient::new(channel.clone());
+            let status = status_of(
+                metrics.export(with_tenant(ExportMetricsServiceRequest::default(), "a|b")),
+            )
+            .await;
+            assert_eq!(code_and_message(&status), expected, "metrics: {status:?}");
+
+            let mut traces = TraceServiceClient::new(channel.clone());
+            let status =
+                status_of(traces.export(with_tenant(ExportTraceServiceRequest::default(), "a|b")))
+                    .await;
+            assert_eq!(code_and_message(&status), expected, "traces: {status:?}");
+
+            let mut profiles = ProfilesServiceClient::new(channel);
+            let status = status_of(
+                profiles.export(with_tenant(ExportProfilesServiceRequest::default(), "a|b")),
+            )
+            .await;
+            assert_eq!(code_and_message(&status), expected, "profiles: {status:?}");
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn h2c_tenant_sent_twice_is_invalid_argument() {
+            let (addr, server) = serve_plaintext(Config::default()).await;
+            let mut client = LogsServiceClient::new(h2c_channel(addr));
+            let mut request = tonic::Request::new(one_log_record());
+            for _ in 0..2 {
+                request
+                    .metadata_mut()
+                    .append("x-scope-orgid", "t1".parse().expect("ASCII metadata"));
+            }
+            let status = status_of(client.export(request)).await;
+            assert_eq!(
+                code_and_message(&status),
+                Some((Code::InvalidArgument, "invalid X-Scope-OrgID".to_string())),
+                "{status:?}"
+            );
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn h2c_profiles_over_the_body_cap_is_invalid_argument() {
+            let mut config = Config::default();
+            config.writer.profile_max_body_bytes = pulsus_config::ByteSize(1000);
+            let (addr, server) = serve_plaintext(config).await;
+            let mut client = ProfilesServiceClient::new(h2c_channel(addr));
+            let request = ExportProfilesServiceRequest {
+                dictionary: Some(ProfilesDictionary {
+                    string_table: vec!["a".repeat(2000)],
+                    ..ProfilesDictionary::default()
+                }),
+                ..ExportProfilesServiceRequest::default()
+            };
+            let status = status_of(client.export(request)).await;
+            assert_eq!(
+                code_and_message(&status),
+                Some((
+                    Code::InvalidArgument,
+                    "profile payload size exceeds limit of 1.0 kB".to_string()
+                )),
+                "{status:?}"
+            );
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn h2c_without_credentials_is_unauthenticated() {
+            let config = Config {
+                auth_user: Some("u".to_string()),
+                auth_password: Some(pulsus_config::Secret::new("p")),
+                ..Config::default()
+            };
+            let (addr, server) = serve_plaintext(config).await;
+            let mut client = LogsServiceClient::new(h2c_channel(addr));
+
+            let status = status_of(client.export(one_log_record())).await;
+            assert_eq!(
+                status.as_ref().map(|s| s.code()),
+                Some(Code::Unauthenticated),
+                "{status:?}"
+            );
+
+            let mut request = tonic::Request::new(one_log_record());
+            request
+                .metadata_mut()
+                .insert("authorization", "Basic dTpw".parse().expect("ASCII"));
+            let status = status_of(client.export(request)).await;
+            assert_eq!(
+                status.as_ref().map(|s| s.code()),
+                Some(Code::ResourceExhausted),
+                "{status:?}"
+            );
+            server.abort();
+        }
+
+        /// A regression check, green before issue #816 too: a client
+        /// offering both protocols stays on HTTP/1.1. With the server's
+        /// ALPN order reversed it fails.
+        #[tokio::test]
+        async fn tls_client_offering_both_protocols_gets_http11() {
+            let (addr, server, pem) = serve_tls(Config::default()).await;
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in rustls_pemfile::certs(&mut pem.as_bytes()) {
+                roots.add(cert.expect("a PEM certificate")).expect("a root");
+            }
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let mut client = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("safe default protocol versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            client.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+            let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            let name = rustls_pki_types::ServerName::try_from("localhost").expect("a name");
+            let mut tls = connector.connect(name, tcp).await.expect("a handshake");
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+
+            tls.write_all(
+                b"GET /buildinfo HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write request");
+            let mut response = Vec::new();
+            let mut buf = [0u8; 4096];
+            let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match tls.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => response.extend_from_slice(&buf[..n]),
+                    }
+                }
+            })
+            .await;
+            let text = String::from_utf8_lossy(&response);
+            assert!(text.starts_with("HTTP/1.1 200"), "got: {text}");
+            server.abort();
+        }
     }
 
     /// Issue #18 part B: a level loop that was never started — its sender

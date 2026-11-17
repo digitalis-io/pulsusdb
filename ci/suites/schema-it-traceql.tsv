@@ -136,6 +136,10 @@ live_profile_writer	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=1
 # and that the push sends one insert and no read. Reuses this job's
 # ClickHouse 26.8 container.
 otlp_profiles_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test otlp_profiles_live
+# Issue #816: each signal's OTLP export over gRPC (h2c and TLS h2, gzip and
+# identity) stores the rows its HTTP route stores. Reuses this job's
+# ClickHouse 26.8 container.
+otlp_grpc	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test otlp_grpc
 # Issue #43: multi-endpoint connection spreading + transport-failure
 # failover on ONE node — both SHARD endpoints point at this job's
 # 19123 server (spreading observable via per-endpoint selection

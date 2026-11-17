@@ -138,6 +138,10 @@ pub(crate) const ROUTE_TEMPLATES: &[&str] = &[
     "/loki/api/v1/series",
     "/loki/api/v1/tail",
     "/metrics",
+    "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+    "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+    "/opentelemetry.proto.collector.profiles.v1development.ProfilesService/Export",
+    "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
     "/push.v1.PusherService/Push",
     "/pyroscope/ingest",
     "/querier.v1.QuerierService/Diff",
@@ -624,7 +628,7 @@ mod tests {
             ROUTE_TEMPLATES.windows(2).all(|w| w[0] < w[1]),
             "{ROUTE_TEMPLATES:?}"
         );
-        assert_eq!(ROUTE_TEMPLATES.len(), 105);
+        assert_eq!(ROUTE_TEMPLATES.len(), 109);
         assert!(
             ROUTE_TEMPLATES
                 .iter()

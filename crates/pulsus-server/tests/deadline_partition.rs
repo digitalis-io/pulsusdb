@@ -209,3 +209,26 @@ fn the_connect_paths_are_exactly_the_mounted_profiles_query_routes() {
         set(PROFILES_HTTP_PATHS)
     );
 }
+
+/// Issue #816: the four OTLP gRPC export paths, which answer a deadline
+/// breach with a trailers-only `DEADLINE_EXCEEDED`.
+const GRPC_PATHS: &[&str] = &[
+    "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+    "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+    "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+    "/opentelemetry.proto.collector.profiles.v1development.ProfilesService/Export",
+];
+
+/// (e) Issue #816: the gRPC class is exactly the mounted `OtlpGrpc` routes,
+/// and the production constant names exactly those.
+#[test]
+fn the_grpc_paths_are_exactly_the_mounted_otlp_grpc_routes() {
+    assert_eq!(mounted_of(Surface::OtlpGrpc), set(GRPC_PATHS));
+    assert_eq!(
+        const_str_slice(
+            "crates/pulsus-server/src/middleware.rs",
+            "DEADLINE_GRPC_PATHS"
+        ),
+        set(GRPC_PATHS)
+    );
+}

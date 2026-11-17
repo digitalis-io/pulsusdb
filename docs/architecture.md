@@ -52,7 +52,7 @@ PulsusDB compiles to a **single static binary** (`pulsusdb`). The role of a proc
 
 No mode creates the schema: `schema/schema.sh` does (docs/configuration.md §10).
 
-All durable state lives in ClickHouse. PulsusDB processes are stateless (the reader's in-memory caches are rebuildable) and can be scaled, restarted, and load-balanced freely. One HTTP listener per process serves every mounted API.
+All durable state lives in ClickHouse. PulsusDB processes are stateless (the reader's in-memory caches are rebuildable) and can be scaled, restarted, and load-balanced freely. One listener per process, HTTP/1.1 and HTTP/2, serves every mounted API, OTLP over gRPC included.
 
 **API surfaces.** The primary ingestion path is the OpenTelemetry Collector: OTLP endpoints for logs, metrics, traces, and profiles are always on, alongside Prometheus remote write (the collector's alternative metrics exporter). Query APIs live under product-neutral paths (`/api/logs/v1`, `/api/traces/v1`, `/api/profiles/v1`, `/api/rules/v1`, and the standard Prometheus `/api/v1` for metrics). Third-party API surfaces — foreign push protocols and datasource-compatible query aliases — are mounted only when `PULSUS_COMPAT_ENDPOINTS=true`; they bind to the same handlers and add no semantics (see [api.md §8](api.md)).
 

@@ -149,6 +149,35 @@ POST /v1development/profiles     ExportProfilesServiceRequest (OTLP profiles, ex
 Content-Type: application/x-protobuf   (default; OTLP/JSON via application/json since M6)
 ```
 
+**OTLP over gRPC.** The same four exports are served as OTLP/gRPC unary calls, on the same port:
+
+```
+POST /opentelemetry.proto.collector.logs.v1.LogsService/Export
+POST /opentelemetry.proto.collector.metrics.v1.MetricsService/Export
+POST /opentelemetry.proto.collector.trace.v1.TraceService/Export
+POST /opentelemetry.proto.collector.profiles.v1development.ProfilesService/Export
+Content-Type: application/grpc
+```
+
+- The listener speaks HTTP/1.1 and HTTP/2. Without TLS a gRPC client connects with HTTP/2 directly (h2c, the exporter's `tls: { insecure: true }`); with `PULSUS_TLS_CERT` set it negotiates `h2` over TLS ([configuration.md](configuration.md)). A client that offers both `http/1.1` and `h2` gets `http/1.1`.
+- Each call is answered by the matching `/v1/*` route above, with the message bytes as sent: the same checks, the same rows, the same answers. gRPC metadata are read as the HTTP headers of the same name: `X-Scope-OrgID`, `Idempotency-Key`, `Retry-Attempt`, `X-Pulsus-Async`, `OTLP-Profiles-Development-Version` and `Authorization`.
+- `grpc-encoding: gzip` and `identity` are accepted; another encoding is `UNIMPLEMENTED`. One message per call; a cut-off message or a second one is `INTERNAL`.
+- The route's HTTP status becomes the gRPC status, with the route's error message as `grpc-message`:
+
+  | route answer | gRPC status | retried by the collector's exporter |
+  |---|---|---|
+  | `200`, `202` | `OK` | — |
+  | `400`, `413` | `INVALID_ARGUMENT` | no |
+  | `429` | `RESOURCE_EXHAUSTED`, with a `google.rpc.RetryInfo` detail | yes |
+  | `500`, `503` | `UNAVAILABLE` | yes |
+  | any other | `INTERNAL` | no |
+  | missing or wrong credentials (`PULSUS_AUTH_USER`, `PULSUS_AUTH_PASSWORD`) | `UNAUTHENTICATED`, answered on these paths instead of the `401` every other path gets | no |
+  | the request deadline, `PULSUS_QUERY_TIMEOUT` | `DEADLINE_EXCEEDED` | yes |
+
+  The exporter retries `RESOURCE_EXHAUSTED` only when it carries a `RetryInfo`, so every `RESOURCE_EXHAUSTED` carries one, with no delay; the exporter backs off as it does after an HTTP `429`. `grpc-timeout` is not read.
+- Limits are the HTTP route's: 64 MiB as sent and once decompressed for logs, metrics and traces, `PULSUS_PROFILE_MAX_BODY_BYTES` for profiles (the 5-byte gRPC prefix is not counted), and the push ceilings below. HTTP/2 allows 200 concurrent calls per connection and 16 KiB of headers.
+- The paths are mounted in `writer` and `all` modes, as the HTTP ingest routes are; in `reader` mode a call is `UNIMPLEMENTED`.
+
 - Content negotiation: the body encoding is selected by `Content-Type` — `application/json` decodes the body as OTLP/JSON (proto3-JSON: hex `trace_id`/`span_id`, camelCase fields, u64 timestamps as strings, non-finite doubles as `"NaN"`/`"Infinity"`/`"-Infinity"`); anything else (including absent, or `application/x-protobuf`) decodes as protobuf. Both encodings feed the identical parse/row path, so they are byte-identical downstream. A field at its proto3 default may be omitted, as proto3-JSON writes it — an empty `arrayValue` or `kvlistValue` (`{}`), an `AnyValue` with no value (`{}`), a `KeyValue` with no `key`, an `EntityRef` with no `schemaUrl` or `type` — and decodes to that default, as the protobuf encoding does. A `values`, `key` or `value` given twice in one object is still `400`; an `AnyValue` naming two value arms keeps the last, as it did before. Enum fields are accepted as either the integer form (the form real OTLP/JSON emitters send) or the proto3-JSON string name (e.g. `"kind": "SPAN_KIND_SERVER"`); an unknown enum name is rejected `400`. `Content-Encoding` (gzip/zstd/snappy) applies to a JSON body unchanged.
 
 - **Logs, traces, profiles.** Resource + scope attributes flatten into labels under the canonical label model ([architecture.md §2.3](architecture.md)): for logs, attribute keys are renamed at ingest by the log rule of architecture.md §2.3 (`service.name` → `service_name`, `a..b` → `a_b`, `9zone` → `key_9zone`); trace attributes keep their OTel names verbatim and are queried as such in TraceQL. Log body → line; spans → trace tables with original protobuf retained as payload; profiles → pprof-equivalent tree precomputation.
@@ -1864,7 +1893,7 @@ One datasource surface is not served at all:
 
 | Surface | What PulsusDB does | What to do |
 |---------|--------------------|------------|
-| Streaming search and streaming metrics | PulsusDB speaks HTTP/1.1 only and has no gRPC endpoint. Over TLS it offers only `http/1.1`; on a plaintext port a connection that opens with HTTP/2, as a gRPC call does, is closed with no reply. With streaming on, the datasource sends its health check and its queries as gRPC calls, so Save & Test and search fail. | Leave both streaming options off. |
+| Streaming search and streaming metrics | PulsusDB serves no streaming search or streaming metrics service. Its listener speaks HTTP/2, so the datasource's gRPC call reaches it and is answered as an unknown path; Save & Test and search fail. | Leave both streaming options off. |
 
 **The Service Graph tab, and the service graph check in the datasource settings, are served from series a collector derives.** They read the `traces_service_graph_*` and `traces_spanmetrics_*` series from the metrics datasource set as the trace datasource's service graph source, not from the trace datasource. PulsusDB does not derive these series from stored spans. A collector's `servicegraph` and `spanmetrics` connectors derive them from the spans it receives and send them to PulsusDB by remote write (§1.2) or OTLP (§1.1). With that metrics datasource pointed at PulsusDB, the tab's graph and table are served from those series. The table's duration column reads `traces_spanmetrics_latency_bucket`, so a collector that names the histogram differently needs it renamed to that. The trace datasource does not call `GET /api/traces/v1/service_graph` (§4.5).
 

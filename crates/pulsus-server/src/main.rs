@@ -14,6 +14,7 @@ mod app;
 mod azdetect;
 mod chconfig;
 mod compat;
+mod grpc;
 mod ingest;
 mod logs_api;
 mod middleware;

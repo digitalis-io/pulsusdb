@@ -51,6 +51,9 @@ pub(crate) enum TlsError {
     Rustls(#[from] rustls::Error),
 }
 
+/// The listener's ALPN protocols, in the server's order of preference.
+pub(crate) const ALPN: [&[u8]; 2] = [b"http/1.1", b"h2"];
+
 /// PEM files → rustls `ServerConfig`. The `ring` provider is bound
 /// explicitly via `builder_with_provider` (the
 /// `pulsus-clickhouse/src/tls.rs` precedent): both `ring` and `aws-lc-rs`
@@ -58,9 +61,10 @@ pub(crate) enum TlsError {
 /// process-default-resolving `ServerConfig::builder()` would panic on
 /// provider ambiguity. Protocol versions are rustls' safe defaults
 /// (TLS 1.2 + 1.3, no knobs — issue #174 open-question resolution 2).
-/// ALPN pins `http/1.1` only: axum's `http2` feature is not compiled into
-/// this binary, so advertising `h2` would negotiate a protocol the server
-/// cannot speak (resolution 3).
+/// ALPN is [`ALPN`]: `http/1.1` first, then `h2` (issue #816). rustls
+/// picks the first protocol in the server's list that the client offers,
+/// so a client offering both stays on HTTP/1.1, and a gRPC client, which
+/// offers only `h2`, gets HTTP/2.
 pub(crate) fn load_server_config(
     cert_path: &str,
     key_path: &str,
@@ -101,7 +105,7 @@ pub(crate) fn load_server_config(
         // Also verifies the key actually matches the certificate, so a
         // mixed-up pair fails here at startup, not at first handshake.
         .with_single_cert(certs, key)?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.alpn_protocols = ALPN.iter().map(|p| p.to_vec()).collect();
     Ok(Arc::new(config))
 }
 
@@ -328,6 +332,26 @@ impl axum::serve::Listener for TlsListener {
     }
 }
 
+/// The production config shape, in memory, with the certificate's PEM for
+/// a client's trust store: for the listener tests in `serve.rs`.
+#[cfg(test)]
+pub(crate) fn test_server_config() -> (Arc<rustls::ServerConfig>, String) {
+    let ck =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("rcgen self-signed generation");
+    let cert = ck.cert.der().clone();
+    let key = rustls_pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("safe default protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("rcgen pair is consistent");
+    config.alpn_protocols = ALPN.iter().map(|p| p.to_vec()).collect();
+    (Arc::new(config), ck.cert.pem())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,12 +394,12 @@ mod tests {
             .with_no_client_auth()
             .with_single_cert(vec![cert], key)
             .expect("rcgen pair is consistent");
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = ALPN.iter().map(|p| p.to_vec()).collect();
         Arc::new(config)
     }
 
     #[test]
-    fn valid_pair_loads_with_http11_only_alpn() {
+    fn valid_pair_loads_with_http11_then_h2_alpn() {
         let ck = self_signed();
         let cert_path = write_temp_pem("valid-cert", &ck.cert.pem());
         let key_path = write_temp_pem("valid-key", &ck.key_pair.serialize_pem());
@@ -387,8 +411,8 @@ mod tests {
         .expect("a freshly generated pair must load");
         assert_eq!(
             config.alpn_protocols,
-            vec![b"http/1.1".to_vec()],
-            "ALPN must pin http/1.1 only — axum's http2 feature is not compiled"
+            vec![b"http/1.1".to_vec(), b"h2".to_vec()],
+            "ALPN offers http/1.1 first, then h2 for gRPC clients"
         );
 
         let _ = std::fs::remove_file(cert_path);
