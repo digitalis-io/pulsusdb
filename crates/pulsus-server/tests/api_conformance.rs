@@ -1403,6 +1403,9 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
         (Surface::Ingest, _) => {
             unreachable!("{ctx}: ingest routes assert via assert_ingest_family")
         }
+        (Surface::OtlpGrpc, _) => {
+            unreachable!("{ctx}: gRPC routes assert via assert_otlp_grpc_route")
+        }
         (Surface::Admin, path) => {
             // Issue #746: every admin response carries both headers and no
             // CORS header; the content type follows the route's kind.
@@ -2315,6 +2318,40 @@ fn assert_ingest_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str
     }
 }
 
+/// Issue #816: one gRPC call to an OTLP gRPC export path, sent over
+/// HTTP/1.1 — an empty message under an invalid tenant, so the handler
+/// refuses it before reading anything.
+fn grpc_request(path: &str) -> manifest::Req {
+    let mut req = manifest::Req::new("POST", path);
+    req.content_type = Some("application/grpc");
+    req.headers.push(("x-scope-orgid", "a|b".to_string()));
+    req.body = vec![0, 0, 0, 0, 0];
+    req
+}
+
+/// Issue #816: the gRPC export path is mounted and answers the handler's
+/// refusal as a trailers-only `INVALID_ARGUMENT`, which HTTP/1.1 carries in
+/// the headers.
+fn assert_otlp_grpc_route(port: u16, spec: &RouteSpec, spawn: &str) {
+    let ctx = format!("[{spawn}] POST {} case=grpc-invalid-tenant", spec.path);
+    let res = raw_request(port, &grpc_request(spec.path))
+        .unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+    assert_eq!(res.status, 200, "{ctx}: status");
+    assert_eq!(res.header("grpc-status"), Some("3"), "{ctx}: grpc-status");
+}
+
+/// The authentication refusal: the pinned `401` everywhere except the gRPC
+/// export paths, which answer `UNAUTHENTICATED` as a gRPC server does
+/// (issue #816).
+fn assert_auth_refusal(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
+    if spec.surface == Surface::OtlpGrpc {
+        assert_eq!(res.status, 200, "{ctx}: status");
+        assert_eq!(res.header("grpc-status"), Some("16"), "{ctx}: grpc-status");
+    } else {
+        assert_401_unauthorized(res, ctx);
+    }
+}
+
 /// The three `Surface::Ingest` routes' full matrix: `X-Pulsus-Async` ∈
 /// {absent, `0`, `1`} against the documented exact sync/async status per
 /// route (plan v2 finding 2, restored/pinned), the per-outcome envelope
@@ -2324,6 +2361,9 @@ fn assert_ingest_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str
 /// `text/plain; charset=utf-8`), a sibling-404, an undocumented-method-405,
 /// and every `CaseClass` in the manifest.
 fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
+    if spec.surface == Surface::OtlpGrpc {
+        return assert_otlp_grpc_route(port, spec, spawn);
+    }
     let is_remote_write = spec.path == "/api/v1/write";
     // The empty-body family: remote-write and the Loki push receiver (204,
     // issue #77) plus the Zipkin v2 JSON receiver (202, issue #75) — all
@@ -2680,6 +2720,7 @@ async fn all_mode_auth_off_compat_on_full_matrix() {
         }
         match spec.surface {
             Surface::Ingest => assert_ingest_route(port, spec, "spawn=all,auth=off,compat=on"),
+            Surface::OtlpGrpc => assert_otlp_grpc_route(port, spec, "spawn=all,auth=off,compat=on"),
             Surface::TracesFetch => {
                 assert_traces_fetch_route(port, spec, "spawn=all,auth=off,compat=on")
             }
@@ -2739,7 +2780,9 @@ async fn all_mode_auth_on_perimeter() {
         }
         let method = spec.methods[0];
         let is_ingest = spec.surface == Surface::Ingest;
-        let mut req = if let Some(r) = profile_ingest_request(spec.path) {
+        let mut req = if spec.surface == Surface::OtlpGrpc {
+            grpc_request(spec.path)
+        } else if let Some(r) = profile_ingest_request(spec.path) {
             r
         } else if is_ingest {
             let mut r = manifest::Req::new("POST", spec.path);
@@ -2788,7 +2831,7 @@ async fn all_mode_auth_on_perimeter() {
             assert_success_envelope(spec, &res, &ctx);
             continue;
         }
-        assert_401_unauthorized(&res, &ctx);
+        assert_auth_refusal(spec, &res, &ctx);
 
         let ctx = format!(
             "[{spawn}] {} {} case=auth creds=wrong",
@@ -2796,7 +2839,7 @@ async fn all_mode_auth_on_perimeter() {
         );
         req.headers.push(("authorization", invalid.clone()));
         let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
-        assert_401_unauthorized(&res, &ctx);
+        assert_auth_refusal(spec, &res, &ctx);
 
         let ctx = format!(
             "[{spawn}] {} {} case=auth creds=valid",
@@ -2811,7 +2854,9 @@ async fn all_mode_auth_on_perimeter() {
             "{ctx}: valid credentials must reach the exact documented success status (body: {:?})",
             String::from_utf8_lossy(&res.body)
         );
-        if is_ingest {
+        if spec.surface == Surface::OtlpGrpc {
+            assert_eq!(res.header("grpc-status"), Some("3"), "{ctx}: grpc-status");
+        } else if is_ingest {
             assert_ingest_success_envelope(spec, &res, &ctx);
         } else {
             assert_success_envelope(spec, &res, &ctx);
@@ -3106,6 +3151,12 @@ async fn reader_only_mode_writer_routes_404() {
         }
         let spawn = "spawn=reader-only";
         match spec.gate {
+            Gate::WriterMode if spec.surface == Surface::OtlpGrpc => {
+                let ctx = format!("[{spawn}] POST {} case=out-of-mode-404", spec.path);
+                let res = raw_request(port, &grpc_request(spec.path))
+                    .unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+                assert_404_empty(&res, &ctx);
+            }
             Gate::WriterMode if profile_ingest_request(spec.path).is_some() => {
                 let ctx = format!("[{spawn}] POST {} case=out-of-mode-404", spec.path);
                 let req = profile_ingest_request(spec.path).expect("a profile route");

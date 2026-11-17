@@ -317,6 +317,98 @@ mod tests {
         assert!(build_router(test_state(), &cfg).is_err());
     }
 
+    /// Issue #816: a gRPC export without credentials is refused as a gRPC
+    /// server refuses it: `200`, `application/grpc`, `grpc-status: 16`. A
+    /// client that reads the HTTP status and content type first (the Go
+    /// client) and one that reads the gRPC status (tonic, see
+    /// `serve::tests::grpc::h2c_without_credentials_is_unauthenticated`)
+    /// both see `UNAUTHENTICATED`.
+    #[tokio::test]
+    async fn a_grpc_export_without_credentials_is_unauthenticated() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use pulsus_config::Secret;
+        use tower::ServiceExt;
+
+        let cfg = Config {
+            auth_user: Some("alice".to_string()),
+            auth_password: Some(Secret::new("hunter2")),
+            ..Config::default()
+        };
+        let router = build_router(test_state(), &cfg).expect("router builds");
+        for path in crate::middleware::DEADLINE_GRPC_PATHS {
+            let request = Request::builder()
+                .method("POST")
+                .uri(*path)
+                .header("content-type", "application/grpc")
+                .body(Body::from(vec![0u8, 0, 0, 0, 0]))
+                .unwrap();
+            let res = router.clone().oneshot(request).await.unwrap();
+            let header = |name: &str| {
+                res.headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            };
+            // The status-first read: a non-200 status or a non-gRPC content
+            // type is mapped from the HTTP status; only then is
+            // `grpc-status` read.
+            let is_grpc =
+                header("content-type").is_some_and(|ct| ct.starts_with("application/grpc"));
+            let status_first = if res.status() != StatusCode::OK || !is_grpc {
+                crate::grpc::grpc_code(res.status())
+            } else {
+                header("grpc-status")
+                    .and_then(|c| c.parse().ok())
+                    .unwrap_or(2)
+            };
+            assert_eq!(status_first, 16, "{path}: status-first read");
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+            assert!(is_grpc, "{path}: content type");
+            assert_eq!(header("grpc-status").as_deref(), Some("16"), "{path}");
+            assert_eq!(
+                header("grpc-message").as_deref(),
+                Some("unauthorized"),
+                "{path}"
+            );
+        }
+    }
+
+    /// Issue #816: every other path keeps the plain `401`.
+    #[tokio::test]
+    async fn a_non_grpc_path_without_credentials_keeps_the_plain_401() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use pulsus_config::Secret;
+        use tower::ServiceExt;
+
+        let cfg = Config {
+            auth_user: Some("alice".to_string()),
+            auth_password: Some(Secret::new("hunter2")),
+            ..Config::default()
+        };
+        let router = build_router(test_state(), &cfg).expect("router builds");
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header("content-type", "application/x-protobuf")
+            .body(Body::empty())
+            .unwrap();
+        let res = router.oneshot(request).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            res.headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok()),
+            Some("Basic")
+        );
+        assert!(res.headers().get("grpc-status").is_none());
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"unauthorized");
+    }
+
     /// The amendment's load-bearing ops auth matrix: `/ready` and
     /// `/metrics` must stay reachable with no credentials at all (probes
     /// and scrapers), while `/config` and `/buildinfo` require the
@@ -1084,7 +1176,7 @@ mod tests {
             .collect();
         let expected: std::collections::BTreeSet<&str> =
             ROUTE_TEMPLATES.iter().copied().chain([UNMATCHED]).collect();
-        assert_eq!(expected.len(), 104);
+        assert_eq!(expected.len(), 108);
         assert_eq!(seen, expected, "{s}");
     }
 

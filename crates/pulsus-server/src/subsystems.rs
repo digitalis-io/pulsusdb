@@ -12,7 +12,9 @@ use crate::app::AppState;
 /// `POST /v1/logs` (issue #15), `POST /v1/metrics` (issue #27),
 /// `POST /v1/traces` (issue #54), `POST /v1development/profiles` (OTLP
 /// profiles), `POST /api/v1/write` (issue #28, docs/api.md §1.1-1.2) and
-/// `POST /api/profiles/v1/ingest` (issue #817, §1.3) are wired; the
+/// `POST /api/profiles/v1/ingest` (issue #817, §1.3) are wired, and so
+/// are the four OTLP gRPC `Export` paths (issue #816, §1.1), each the
+/// matching `/v1/*` handler behind `grpc.rs`'s unary shim; the
 /// remaining signals' ingest routes
 /// are still empty until their own issues land. `/api/v1/write` coexists
 /// with the PromQL query surface's `/api/v1/query*` routes (mounted
@@ -31,6 +33,22 @@ pub(crate) fn writer_router() -> Router<AppState> {
         .route(
             "/api/profiles/v1/ingest",
             post(crate::ingest::ingest_profile_legacy),
+        )
+        .route(
+            "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+            post(crate::grpc::export_logs),
+        )
+        .route(
+            "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+            post(crate::grpc::export_metrics),
+        )
+        .route(
+            "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+            post(crate::grpc::export_traces),
+        )
+        .route(
+            "/opentelemetry.proto.collector.profiles.v1development.ProfilesService/Export",
+            post(crate::grpc::export_profiles),
         )
 }
 
