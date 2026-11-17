@@ -2408,7 +2408,7 @@ by `f6_a_folded_line_of_any_length_is_read` in
 ### What the reference does
 
 The ingester adapter returns before converting anything when the push's label set holds a non-empty
-`profile_id` (`pkg/ingester/…/ingest_adapter.go:78-80`). The folded, lines, trie, tree and speedscope
+`profile_id` (`ingest_adapter.go:78-80`). The folded, lines, trie, tree and speedscope
 paths all pass through it; pprof and JFR do not. The push answers `200`.
 
 ### Why that is wrong rather than different
