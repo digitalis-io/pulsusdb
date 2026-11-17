@@ -412,3 +412,118 @@ pub struct FlameGraphDiff {
     )]
     pub right_ticks: i64,
 }
+
+/// Issue #825: what a heatmap counts — each profile's total, or each
+/// span's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum HeatmapQueryType {
+    Unspecified = 0,
+    Individual = 1,
+    Span = 2,
+}
+
+impl HeatmapQueryType {
+    /// The value's name in the proto.
+    pub fn as_str_name(self) -> &'static str {
+        match self {
+            HeatmapQueryType::Unspecified => "HEATMAP_QUERY_TYPE_UNSPECIFIED",
+            HeatmapQueryType::Individual => "HEATMAP_QUERY_TYPE_INDIVIDUAL",
+            HeatmapQueryType::Span => "HEATMAP_QUERY_TYPE_SPAN",
+        }
+    }
+
+    /// The value a proto name names.
+    pub fn from_str_name(name: &str) -> Option<Self> {
+        [
+            HeatmapQueryType::Unspecified,
+            HeatmapQueryType::Individual,
+            HeatmapQueryType::Span,
+        ]
+        .into_iter()
+        .find(|t| t.as_str_name() == name)
+    }
+}
+
+/// `SelectHeatmap`'s request (issue #825).
+#[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelectHeatmapRequest {
+    #[prost(string, tag = "1")]
+    #[serde(
+        rename = "profileTypeID",
+        alias = "profile_typeID",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub profile_type_id: String,
+    #[prost(string, tag = "2")]
+    #[serde(
+        rename = "labelSelector",
+        alias = "label_selector",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub label_selector: String,
+    #[prost(int64, tag = "3")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
+    pub start: i64,
+    #[prost(int64, tag = "4")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
+    pub end: i64,
+    /// Seconds.
+    #[prost(double, tag = "5")]
+    #[serde(
+        serialize_with = "crate::double::ser",
+        deserialize_with = "crate::double::de",
+        skip_serializing_if = "crate::double::is_zero"
+    )]
+    pub step: f64,
+    #[prost(string, repeated, tag = "6")]
+    #[serde(
+        rename = "groupBy",
+        alias = "group_by",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub group_by: Vec<String>,
+    #[prost(enumeration = "HeatmapQueryType", tag = "7")]
+    #[serde(
+        rename = "queryType",
+        alias = "query_type",
+        serialize_with = "crate::heatmap_query_type::ser",
+        deserialize_with = "crate::heatmap_query_type::de",
+        skip_serializing_if = "crate::heatmap_query_type::is_unspecified"
+    )]
+    pub query_type: i32,
+    #[prost(enumeration = "crate::types_v1::ExemplarType", tag = "8")]
+    #[serde(
+        rename = "exemplarType",
+        alias = "exemplar_type",
+        serialize_with = "crate::exemplar_type::ser",
+        deserialize_with = "crate::exemplar_type::de",
+        skip_serializing_if = "crate::exemplar_type::is_unspecified"
+    )]
+    pub exemplar_type: i32,
+    #[prost(int64, optional, tag = "9")]
+    #[serde(
+        serialize_with = "crate::int64::ser_opt",
+        deserialize_with = "crate::int64::de_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub limit: Option<i64>,
+}
+
+/// `SelectHeatmap`'s response (issue #825).
+#[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelectHeatmapResponse {
+    #[prost(message, repeated, tag = "1")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub series: Vec<crate::types_v1::HeatmapSeries>,
+}

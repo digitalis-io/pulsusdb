@@ -114,6 +114,8 @@ pkg/logql/syntax/parser.go
 pkg/logql/syntax/query_scanner.go
 pkg/logql/syntax/syntax.y
 pkg/logql/vector.go
+pkg/model/heatmap/merger.go
+pkg/model/heatmap/points_builder.go
 pkg/model/stacktraces.go
 pkg/model/tree.go
 pkg/og/convert/parser.go
@@ -139,6 +141,7 @@ pkg/querier/queryrange/roundtrip.go
 pkg/querier/queryrange/shard_resolver.go
 pkg/querier/queryrange/splitters.go
 pkg/querier/tail/querier.go
+pkg/querybackend/query_heatmap.go
 pkg/querybackend/query_time_series.go
 pkg/storage/detected/fields.go
 pkg/storage/store.go

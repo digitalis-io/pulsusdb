@@ -4,16 +4,18 @@
 //! an unknown field ignored. W4 and W5 (issue #823): the merge's messages,
 //! an enum by its name or its number. W6 and W7 (issue #824): the time
 //! series' messages, a `double` written as the reference writes it. W8
-//! (issue #827): the diff's messages.
+//! (issue #827): the diff's messages. W9 and W10 (issue #825): the
+//! heatmap's messages.
 
 use pulsus_profiles_wire::querier_v1::{
     DiffRequest, DiffResponse, FlameGraph, FlameGraphDiff, Level, ProfileFormat,
-    ProfileTypesRequest, ProfileTypesResponse, SelectMergeStacktracesRequest,
-    SelectMergeStacktracesResponse, SelectSeriesRequest, SelectSeriesResponse, SeriesRequest,
-    SeriesResponse,
+    ProfileTypesRequest, ProfileTypesResponse, SelectHeatmapRequest, SelectHeatmapResponse,
+    SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SelectSeriesRequest,
+    SelectSeriesResponse, SeriesRequest, SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
-    GoPgo, LabelPair, Labels, Location, Point, ProfileType, Series, StackTraceSelector,
+    GoPgo, HeatmapSeries, HeatmapSlot, LabelPair, Labels, Location, Point, ProfileType, Series,
+    StackTraceSelector,
 };
 
 fn split(id: &str) -> ProfileType {
@@ -294,5 +296,83 @@ fn w8_the_diff_is_written_as_the_reference_writes_it() {
             }),
             right: None,
         })
+    );
+}
+
+/// W9 (issue #825): the heatmap request reads the query type by its name
+/// or its number, a `double` as a number or a string, and an `optional
+/// int64` as a string.
+#[test]
+fn w9_the_heatmap_request_reads_either_form() {
+    let expected = SelectHeatmapRequest {
+        profile_type_id: "a:b:c:d:e".to_string(),
+        label_selector: "{}".to_string(),
+        start: 1000,
+        end: 2000,
+        step: 15.0,
+        group_by: vec!["service_name".to_string()],
+        query_type: 2,
+        exemplar_type: 1,
+        limit: Some(1),
+    };
+    for body in [
+        r#"{"profileTypeID":"a:b:c:d:e","labelSelector":"{}","start":"1000","end":"2000","step":15,"groupBy":["service_name"],"queryType":"HEATMAP_QUERY_TYPE_SPAN","exemplarType":"EXEMPLAR_TYPE_NONE","limit":"1"}"#,
+        r#"{"profile_typeID":"a:b:c:d:e","label_selector":"{}","start":1000,"end":2000,"step":"15","group_by":["service_name"],"query_type":2,"exemplar_type":1,"limit":1}"#,
+    ] {
+        let got: SelectHeatmapRequest = serde_json::from_str(body).expect(body);
+        assert_eq!(got, expected, "{body}");
+    }
+    let got: SelectHeatmapRequest =
+        serde_json::from_str(r#"{"queryType":"HEATMAP_QUERY_TYPE_INDIVIDUAL"}"#).expect("decode");
+    assert_eq!((got.query_type, got.limit), (1, None));
+    assert!(
+        serde_json::from_str::<SelectHeatmapRequest>(r#"{"queryType":"HEATMAP_QUERY_TYPE_NOPE"}"#)
+            .is_err()
+    );
+    assert_eq!(
+        serde_json::to_string(&SelectHeatmapRequest {
+            query_type: 1,
+            ..SelectHeatmapRequest::default()
+        })
+        .expect("encode"),
+        r#"{"queryType":"HEATMAP_QUERY_TYPE_INDIVIDUAL"}"#
+    );
+}
+
+/// W10 (issue #825): a slot's `yMin` is written as the reference writes a
+/// double, each integral one as an integer; `counts` as numbers; zeros in
+/// both kept; defaults omitted.
+#[test]
+fn w10_a_slot_is_written_as_the_reference_writes_it() {
+    let slot = HeatmapSlot {
+        timestamp: 1_794_819_600_000,
+        y_min: vec![0.0, 2.5],
+        counts: vec![1, 0],
+    };
+    let text = r#"{"timestamp":"1794819600000","yMin":[0,2.5],"counts":[1,0]}"#;
+    assert_eq!(serde_json::to_string(&slot).expect("encode"), text);
+    let back: HeatmapSlot = serde_json::from_str(text).expect("decode");
+    assert_eq!(back, slot);
+    let response = SelectHeatmapResponse {
+        series: vec![
+            HeatmapSeries {
+                labels: vec![LabelPair {
+                    name: "pod".to_string(),
+                    value: "b".to_string(),
+                }],
+                slots: vec![slot],
+            },
+            HeatmapSeries::default(),
+        ],
+    };
+    assert_eq!(
+        serde_json::to_string(&response).expect("encode"),
+        format!(
+            r#"{{"series":[{{"labels":[{{"name":"pod","value":"b"}}],"slots":[{text}]}},{{}}]}}"#
+        )
+    );
+    assert_eq!(
+        serde_json::to_string(&SelectHeatmapResponse::default()).expect("encode"),
+        "{}"
     );
 }

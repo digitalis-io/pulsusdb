@@ -10,7 +10,8 @@
 //!
 //! Issue #824: `double` is a `double` field's JSON form, and
 //! `aggregation_type` and `exemplar_type` are the time series request's
-//! two enums, in the shape of `profile_format`.
+//! two enums, in the shape of `profile_format`. Issue #825:
+//! `heatmap_query_type`, and `double`'s repeated form.
 
 pub mod connect;
 pub mod google_v1;
@@ -121,6 +122,34 @@ pub mod double {
     pub fn is_zero(v: &f64) -> bool {
         v.to_bits() == 0
     }
+
+    /// One element of a repeated `double`, in [`ser`]'s and [`de`]'s form.
+    struct Element(f64);
+
+    impl serde::Serialize for Element {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            ser(&self.0, s)
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for Element {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            de(d).map(Element)
+        }
+    }
+
+    /// Issue #825: writes a repeated `double`, each element as [`ser`]
+    /// writes it.
+    pub fn ser_vec<S: Serializer>(v: &[f64], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(v.iter().map(|x| Element(*x)))
+    }
+
+    /// Issue #825: reads a repeated `double`, each element as [`de`] reads
+    /// it.
+    pub fn de_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f64>, D::Error> {
+        let v: Vec<Element> = serde::Deserialize::deserialize(d)?;
+        Ok(v.into_iter().map(|e| e.0).collect())
+    }
 }
 
 /// Reads an enum's name or its number; `name` maps a name to its number.
@@ -208,6 +237,36 @@ pub mod exemplar_type {
     pub fn de<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
         super::enum_visitor(d, "exemplar_type", |n| {
             ExemplarType::from_str_name(n).map(|t| t as i32)
+        })
+        .map(Option::unwrap_or_default)
+    }
+
+    /// `true` for the proto3 default, so the field is omitted.
+    pub fn is_unspecified(v: &i32) -> bool {
+        *v == 0
+    }
+}
+
+/// Issue #825: the proto3 JSON form of `querier.v1.HeatmapQueryType` —
+/// written as its name, read from its name or its number.
+pub mod heatmap_query_type {
+    use serde::Serializer;
+    use serde::de::Deserializer;
+
+    use crate::querier_v1::HeatmapQueryType;
+
+    /// Writes a known value as its name, another as its number.
+    pub fn ser<S: Serializer>(v: &i32, s: S) -> Result<S::Ok, S::Error> {
+        match HeatmapQueryType::try_from(*v) {
+            Ok(t) => s.serialize_str(t.as_str_name()),
+            Err(_) => s.serialize_i32(*v),
+        }
+    }
+
+    /// Reads a value's name or its number; an unknown name is refused.
+    pub fn de<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+        super::enum_visitor(d, "query_type", |n| {
+            HeatmapQueryType::from_str_name(n).map(|t| t as i32)
         })
         .map(Option::unwrap_or_default)
     }

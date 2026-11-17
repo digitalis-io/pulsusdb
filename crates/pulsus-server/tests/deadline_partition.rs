@@ -25,7 +25,7 @@
 //!
 //! ## The profiles query paths (issue #821)
 //!
-//! Two more classes: the fourteen profiles Connect paths answer the reference's
+//! Two more classes: the sixteen profiles Connect paths answer the reference's
 //! Connect error (`DEADLINE_CONNECT_PATHS`), and the six profiles `GET`
 //! routes answer as the reference's HTTP read handlers do
 //! (`DEADLINE_PROFILES_HTTP_PATHS`). Both constants are source-scanned and
@@ -154,7 +154,7 @@ fn the_two_classes_partition_the_mounted_prefix_exactly_once() {
     assert_eq!(envelope.len() + kept_bare.len(), mounted_api_v1().len());
 }
 
-/// Issue #821 (#823, #824 and #827 add two each): the fourteen profiles
+/// Issue #821 (#823, #824, #827 and #825 add two each): the sixteen profiles
 /// Connect paths, which answer a deadline breach with the Connect
 /// `deadline_exceeded` body.
 const CONNECT_PATHS: &[&str] = &[
@@ -172,6 +172,8 @@ const CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
     "/querier.v1.QuerierService/Diff",
     "/api/profiles/v1/querier.v1.QuerierService/Diff",
+    "/querier.v1.QuerierService/SelectHeatmap",
+    "/api/profiles/v1/querier.v1.QuerierService/SelectHeatmap",
 ];
 
 /// Issue #821 (#823 adds `/merge`, #824 `/select_series`): the six profiles
