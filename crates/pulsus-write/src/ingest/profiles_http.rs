@@ -949,17 +949,11 @@ mod tests {
     #[tokio::test]
     async fn h13_ingest_refuses_the_formats_not_served_yet() {
         let sink = MockProfileSink::new(Outcome::Ok);
-        let res = send(
-            &sink,
-            "/ingest?name=app",
-            &[("content-type", "text/plain")],
-            b"main;a 1\n".to_vec(),
-        )
-        .await;
+        let res = send(&sink, "/ingest?name=app&format=jfr", &[], b"JFR".to_vec()).await;
         assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             res.text(),
-            "{\"code\":\"unknown\",\"message\":\"format groups is not supported\"}\n"
+            "{\"code\":\"unknown\",\"message\":\"format jfr is not supported\"}\n"
         );
         assert!(sink.landings().is_empty());
     }
@@ -1011,5 +1005,175 @@ mod tests {
             "{}",
             res.text()
         );
+    }
+
+    fn nosniff(res: &Answer) -> bool {
+        res.headers
+            .get("x-content-type-options")
+            .is_some_and(|v| v == "nosniff")
+    }
+
+    /// §0's push: folded stacks, no `format`, no `Content-Type`.
+    #[tokio::test]
+    async fn h16_a_folded_push_is_stored_as_one_cpu_profile() {
+        let sink = MockProfileSink::new(Outcome::Ok);
+        let res = send(
+            &sink,
+            "/ingest?name=checkout.cpu%7Benv%3Dprod%7D",
+            &[("x-scope-orgid", "t1")],
+            b"main;work 3\nmain;idle 2\n".to_vec(),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+        assert!(res.body.is_empty());
+        let landings = sink.landings();
+        assert_eq!(landings.len(), 1);
+        let (landing, mode) = &landings[0];
+        assert_eq!(*mode, Mode::AdmitFlush);
+        assert_eq!(landing.series.len(), 1);
+        assert_eq!(
+            &*landing.series[0].type_id,
+            "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+        );
+        assert_eq!(
+            landing.series[0].labels,
+            r#"{"__name__":"process_cpu","__period_type__":"cpu","__period_unit__":"nanoseconds","__profile_type__":"process_cpu:cpu:nanoseconds:cpu:nanoseconds","__service_name__":"checkout","__type__":"cpu","__unit__":"nanoseconds","env":"prod","pyroscope_spy":"unknown","service_name":"checkout"}"#
+        );
+        assert_eq!(landing.entries.len(), 1);
+        assert_eq!(landing.entries[0].total, 50_000_000);
+        let mut values: Vec<i64> = landing.samples.iter().map(|s| s.value).collect();
+        values.sort();
+        assert_eq!(values, [20_000_000, 30_000_000]);
+        assert_eq!(landing.stacks.len(), 2);
+        assert_eq!(landing.locations.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn h17_each_format_is_found_by_format_or_content_type() {
+        use crate::protocols::profileql_legacy::test_support::{TREE, TRIE, two_sampled};
+        let tree = ("content-type", "binary/octet-stream+tree");
+        let cases: [(&str, &[(&str, &str)], Vec<u8>, usize, usize); 6] = [
+            ("/ingest?name=app&format=trie", &[], TRIE.to_vec(), 1, 2),
+            ("/ingest?name=app", &[tree], TREE.to_vec(), 1, 2),
+            (
+                "/ingest?name=app&format=lines",
+                &[],
+                b"a;b\na;b\na;c\n".to_vec(),
+                1,
+                2,
+            ),
+            (
+                "/ingest?name=app&format=groups",
+                &[],
+                b"a;b 1\na;c 2\n".to_vec(),
+                1,
+                2,
+            ),
+            (
+                "/ingest?name=app&format=bogus",
+                &[],
+                b"a;b 1\na;c 2\n".to_vec(),
+                1,
+                2,
+            ),
+            (
+                "/ingest?name=foo%7Bx%3Dy%7D&format=speedscope",
+                &[],
+                two_sampled().into_bytes(),
+                2,
+                3,
+            ),
+        ];
+        for (uri, headers, body, series, stacks) in cases {
+            let sink = MockProfileSink::new(Outcome::Ok);
+            let res = send(&sink, uri, headers, body).await;
+            assert_eq!(res.status, StatusCode::OK, "{uri}: {}", res.text());
+            let landings = sink.landings();
+            assert_eq!(landings.len(), 1, "{uri}");
+            assert_eq!(landings[0].0.series.len(), series, "{uri}");
+            assert_eq!(landings[0].0.stacks.len(), stacks, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn h18_converted_errors_take_the_references_two_families() {
+        use crate::protocols::profileql_legacy::test_support::SIMPLE;
+        let sink = MockProfileSink::new(Outcome::Ok);
+        let res = send(&sink, "/ingest?name=app", &[], b"a x".to_vec()).await;
+        assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(nosniff(&res));
+        assert_eq!(
+            res.text(),
+            "{\"code\":\"unknown\",\"message\":\"strconv.Atoi: parsing \\\"x\\\": invalid syntax\"}\n"
+        );
+
+        let res = send(&sink, "/ingest?name=my.app", &[], b"a 1\n".to_vec()).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST);
+        assert!(!nosniff(&res));
+        assert_eq!(
+            res.text(),
+            r#"{"code":"invalid_argument","message":"pyroscopeIngesterAdapter failed to convert metadata: unknown profile type: app"}"#
+        );
+
+        let res = send(
+            &sink,
+            "/ingest?name=my.app&format=speedscope",
+            &[],
+            SIMPLE.as_bytes().to_vec(),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(nosniff(&res));
+        assert_eq!(
+            res.text(),
+            "{\"code\":\"unknown\",\"message\":\"invalid_argument: pyroscopeIngesterAdapter failed to convert metadata: unknown profile type: app\"}\n"
+        );
+
+        let res = send(
+            &sink,
+            "/ingest?name=app&from=now-2h",
+            &[],
+            b"a 1\n".to_vec(),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.text());
+        assert!(
+            res.text()
+                .starts_with(r#"{"code":"invalid_argument","message":"profile with labels '"#),
+            "{}",
+            res.text()
+        );
+        assert!(!res.text().ends_with('\n'));
+        assert!(sink.landings().is_empty());
+    }
+
+    #[tokio::test]
+    async fn h19_an_empty_folded_body_stores_nothing() {
+        let sink = MockProfileSink::new(Outcome::Ok);
+        let res = send(&sink, "/ingest?name=app", &[], Vec::new()).await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+        assert!(res.body.is_empty());
+        assert!(sink.landings().is_empty());
+    }
+
+    #[tokio::test]
+    async fn h20_backpressure_answers_in_each_formats_family() {
+        use crate::protocols::profileql_legacy::test_support::two_sampled;
+        let sink = MockProfileSink::new(Outcome::Backpressure);
+        let message = r#"{"code":"resource_exhausted","message":"sink is applying backpressure: buffers are full"}"#;
+        let res = send(&sink, "/ingest?name=app", &[], b"a 1\n".to_vec()).await;
+        assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(res.text(), message);
+        assert!(!nosniff(&res));
+        let res = send(
+            &sink,
+            "/ingest?name=foo&format=speedscope",
+            &[],
+            two_sampled().into_bytes(),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(res.text(), format!("{message}\n"));
+        assert!(nosniff(&res));
     }
 }

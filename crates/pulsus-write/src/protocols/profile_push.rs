@@ -147,6 +147,8 @@ pub struct LegacyQuery {
     pub spy_name: String,
     /// `format`, when given.
     pub format: Option<String>,
+    /// `sampleRate`: 100 when absent, unreadable or negative.
+    pub sample_rate: u32,
 }
 
 /// Reads the query string as Go's `url.URL.Query().Get` does: the first
@@ -196,6 +198,7 @@ pub fn parse_legacy_query(raw: Option<&str>, now_ns: i64) -> Result<LegacyQuery,
         from_ns: get("from").map(|f| parse_at_time(f, now_ns)),
         spy_name: get("spyName").unwrap_or("unknown").to_string(),
         format: get("format").map(str::to_string),
+        sample_rate: 0,
     })
 }
 
@@ -928,6 +931,7 @@ mod tests {
             from_ns,
             spy_name: spy.to_string(),
             format: None,
+            sample_rate: 100,
         }
     }
 
