@@ -63,7 +63,7 @@ pub(crate) const DEADLINE_BARE_PATHS: &[&str] = &["/api/v1/write"];
 
 /// Issue #821: the profiles Connect paths, named one by one (#823 adds
 /// `SelectMergeStacktraces`'s two, #824 `SelectSeries`'s two, #827
-/// `Diff`'s two). They
+/// `Diff`'s two, #825 `SelectHeatmap`'s two). They
 /// answer a deadline with the reference's Connect error; another path under
 /// either service prefix keeps the class it had. Source-scanned by
 /// `tests/deadline_partition.rs` and compared with the route manifest.
@@ -82,6 +82,8 @@ pub(crate) const DEADLINE_CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
     "/querier.v1.QuerierService/Diff",
     "/api/profiles/v1/querier.v1.QuerierService/Diff",
+    "/querier.v1.QuerierService/SelectHeatmap",
+    "/api/profiles/v1/querier.v1.QuerierService/SelectHeatmap",
 ];
 
 /// Issue #816: the four OTLP gRPC export paths. They answer a deadline
@@ -555,7 +557,7 @@ mod tests {
         }
     }
 
-    /// C6 (issue #821, #823, #824, #827): the fourteen Connect paths answer a
+    /// C6 (issue #821, #823, #824, #827, #825): the sixteen Connect paths answer a
     /// deadline as a Connect error, the six `GET` routes (`{name}` as `env`) as the
     /// reference's HTTP handlers do; the profiles ingest path keeps the bare
     /// `408`.
@@ -576,6 +578,8 @@ mod tests {
             "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
             "/querier.v1.QuerierService/Diff",
             "/api/profiles/v1/querier.v1.QuerierService/Diff",
+            "/querier.v1.QuerierService/SelectHeatmap",
+            "/api/profiles/v1/querier.v1.QuerierService/SelectHeatmap",
         ] {
             assert_eq!(deadline_class(path), DeadlineClass::Connect, "{path}");
         }
@@ -595,7 +599,7 @@ mod tests {
         );
     }
 
-    /// Issue #821 review note 1: the class names the fourteen Connect paths
+    /// Issue #821 review note 1: the class names the sixteen Connect paths
     /// exactly. Another method under either service prefix, and a deeper
     /// path under the values route, keep the class they had.
     #[test]
