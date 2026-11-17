@@ -1673,6 +1673,13 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-read --test profiles_series_cluster
 
+      # Issue #827: the diff over the distributed sample and series tables,
+      # one side's samples split across both shards, in one statement.
+      - name: Profile diff over the distributed tables (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test profileql_diff_cluster
+
       # Issue #43: cross-node connection spreading over the two DISTINCT real
       # nodes (SHARD1/SHARD2 default to the fixture IPs 172.28.0.11/12:8123),
       # proving the pool selects both nodes and fails over off a dead port,
