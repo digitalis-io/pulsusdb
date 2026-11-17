@@ -361,6 +361,12 @@ impl<B> ValidateRequest<B> for BasicAuth {
         if matches {
             return Ok(());
         }
+        // Issue #816: a gRPC export is refused as a gRPC server refuses it.
+        // A client that decodes the body before the HTTP status (tonic)
+        // would read this `401`'s text body as a broken frame.
+        if DEADLINE_GRPC_PATHS.contains(&request.uri().path()) {
+            return Err(crate::grpc::unauthenticated_response());
+        }
         let mut res = if self.json {
             let mut res = Response::new(Body::from(
                 r#"{"errors":[{"field":null,"message":"unauthorized"}]}"#,

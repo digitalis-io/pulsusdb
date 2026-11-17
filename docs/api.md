@@ -171,7 +171,7 @@ Content-Type: application/grpc
   | `429` | `RESOURCE_EXHAUSTED`, with a `google.rpc.RetryInfo` detail | yes |
   | `500`, `503` | `UNAVAILABLE` | yes |
   | any other | `INTERNAL` | no |
-  | `401` (authentication) | `UNAUTHENTICATED` | no |
+  | missing or wrong credentials (`PULSUS_AUTH_USER`, `PULSUS_AUTH_PASSWORD`) | `UNAUTHENTICATED`, answered on these paths instead of the `401` every other path gets | no |
   | the request deadline, `PULSUS_QUERY_TIMEOUT` | `DEADLINE_EXCEEDED` | yes |
 
   The exporter retries `RESOURCE_EXHAUSTED` only when it carries a `RetryInfo`, so every `RESOURCE_EXHAUSTED` carries one, with no delay; the exporter backs off as it does after an HTTP `429`. `grpc-timeout` is not read.

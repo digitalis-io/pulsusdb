@@ -51,6 +51,7 @@ const DEADLINE_EXCEEDED: i32 = 4;
 const RESOURCE_EXHAUSTED: i32 = 8;
 const UNIMPLEMENTED: i32 = 12;
 const INTERNAL: i32 = 13;
+const UNAUTHENTICATED: i32 = 16;
 
 const TRUNCATED: &str = "truncated gRPC message";
 const EXTRA_MESSAGE: &str = "more than one message in a unary call";
@@ -82,13 +83,13 @@ struct ProtoAny {
 
 /// The gRPC code for a handler's HTTP status (docs/api.md §1.1). `500` and
 /// `503` are `UNAVAILABLE`, which the collector's exporter retries; `401`
-/// is answered by the authentication layer before the shim runs, and the
-/// client reads its HTTP `401` as `UNAUTHENTICATED`.
+/// is answered by the authentication layer before the shim runs, as a
+/// trailers-only `UNAUTHENTICATED` ([`unauthenticated_response`]).
 pub(crate) fn grpc_code(status: StatusCode) -> i32 {
     match status.as_u16() {
         200..=299 => 0,
         400 | 413 => 3,
-        401 => 16,
+        401 => UNAUTHENTICATED,
         429 => RESOURCE_EXHAUSTED,
         500 | 503 => 14,
         _ => INTERNAL,
@@ -322,6 +323,12 @@ pub(crate) fn encode_message(message: &str) -> String {
         }
     }
     out
+}
+
+/// The authentication layer's refusal on the gRPC export paths:
+/// `UNAUTHENTICATED`, read the same way by every gRPC client.
+pub(crate) fn unauthenticated_response() -> Response {
+    trailers_only(UNAUTHENTICATED, "unauthorized")
 }
 
 /// The request deadline's answer on the gRPC export paths:
