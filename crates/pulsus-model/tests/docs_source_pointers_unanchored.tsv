@@ -1054,10 +1054,13 @@ docs/reference-defects-we-do-not-copy.md	encoding/vparquet4/block_traceql.go:359
 docs/reference-defects-we-do-not-copy.md	encoding/vparquet4/block_traceql.go:3606-3613	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	encoding/vparquet4/block_traceql.go:66-105	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	engine_metrics.go:2039-2041	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	ingest_adapter.go:78-80	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	metrics_to_prw.go:217	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	metrics_to_prw.go:218-233	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	metrics_to_prw.go:235-239	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	modules/livestore/instance_search.go:257-259	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	parser.go:182	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	parser.go:188	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	parser.go:521	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/frontend/readpath/queryfrontend/query_diff.go:65-67	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/frontend/readpath/queryfrontend/query_select_merge_stacktraces.go:39-42	not_in_this_repository
@@ -1088,6 +1091,12 @@ docs/reference-defects-we-do-not-copy.md	pkg/logql/shardmapper.go:476-534	not_in
 docs/reference-defects-we-do-not-copy.md	pkg/model/stacktraces.go:255-273	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/model/stacktraces.go:355-358	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/model/tree.go:345-366	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/og/convert/parser.go:42-67	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/og/convert/speedscope/parser.go:182	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/og/convert/speedscope/parser.go:227	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/og/convert/speedscope/units.go:45-54	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/og/storage/tree/serialize.go:41-43	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/og/storage/tree/tree.go:158-171	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/ingester_querier.go:68	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/batch.go:9-38	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/merge.go:30-48	not_in_this_repository
@@ -1118,6 +1127,7 @@ docs/reference-defects-we-do-not-copy.md	tempodb/encoding/vparquet4/block_traceq
 docs/reference-defects-we-do-not-copy.md	tempodb/encoding/vparquet4/block_traceql.go:128-152	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	tempodb/encoding/vparquet4/block_traceql.go:228-246	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	tempodb/encoding/vparquet5/block_traceql.go:1073	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	units.go:28	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	vendor/github.com/dustin/go-humanize/bytes.go:68-91	pinned_to_another_version
 docs/reference-defects-we-do-not-copy.md	vendor/github.com/grafana/jsonparser/parser.go:1086-1093	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	vendor/github.com/grafana/jsonparser/parser.go:1108-1112	not_in_this_repository

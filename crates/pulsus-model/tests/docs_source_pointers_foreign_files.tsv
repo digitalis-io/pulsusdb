@@ -43,6 +43,7 @@ helper.go
 http-1.4.2/src/uri/mod.rs
 http.go
 hyperloglog.go
+ingest_adapter.go
 iter_float.go
 iter_object.go
 iter_skip.go
@@ -115,6 +116,11 @@ pkg/logql/syntax/syntax.y
 pkg/logql/vector.go
 pkg/model/stacktraces.go
 pkg/model/tree.go
+pkg/og/convert/parser.go
+pkg/og/convert/speedscope/parser.go
+pkg/og/convert/speedscope/units.go
+pkg/og/storage/tree/serialize.go
+pkg/og/storage/tree/tree.go
 pkg/pattern/drain/chunk.go
 pkg/pattern/ingester.go
 pkg/pattern/ingester_querier.go
@@ -193,6 +199,7 @@ traces/search_sql.rs
 traces_search_plan_parts.rs
 tsdb/head_append.go
 tsdb/head_append_v2.go
+units.go
 utils.go
 validator.go
 vendor/.../utils.go
