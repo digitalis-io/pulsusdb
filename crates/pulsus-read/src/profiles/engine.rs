@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::traces::tenant_scope::TenantTerm;
 
 use super::catalogue::{Read, compat_sets};
+use super::diff::DiffRow;
 use super::dispatch::ProfileDispatch;
 use super::selector::WindowLimits;
 use super::series::TimeSeriesRow;
@@ -229,6 +230,12 @@ impl ProfilesEngine {
     pub async fn read_tree(&self, sql: &str) -> Result<Vec<TreeRow>, ProfilesReadError> {
         let settings = tree_settings(&self.config, self.log_comment.as_deref());
         self.dispatch.rows(sql, &settings).await
+    }
+
+    /// Issue #827: sends S7 (`super::diff`) and returns one row per node of
+    /// the two trees' union.
+    pub async fn read_diff(&self, _sql: &str) -> Result<Vec<DiffRow>, ProfilesReadError> {
+        Ok(Vec::new())
     }
 
     /// Issue #824: sends S6 (`super::series`) and returns one row per

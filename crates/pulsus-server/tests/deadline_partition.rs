@@ -154,8 +154,8 @@ fn the_two_classes_partition_the_mounted_prefix_exactly_once() {
     assert_eq!(envelope.len() + kept_bare.len(), mounted_api_v1().len());
 }
 
-/// Issue #821 (#823 and #824 add two each): the twelve profiles Connect
-/// paths, which answer a deadline breach with the Connect
+/// Issue #821 (#823, #824 and #827 add two each): the fourteen profiles
+/// Connect paths, which answer a deadline breach with the Connect
 /// `deadline_exceeded` body.
 const CONNECT_PATHS: &[&str] = &[
     "/querier.v1.QuerierService/ProfileTypes",
@@ -170,6 +170,8 @@ const CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces",
     "/querier.v1.QuerierService/SelectSeries",
     "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
+    "/querier.v1.QuerierService/Diff",
+    "/api/profiles/v1/querier.v1.QuerierService/Diff",
 ];
 
 /// Issue #821 (#823 adds `/merge`, #824 `/select_series`): the six profiles

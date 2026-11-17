@@ -3,12 +3,14 @@
 //! JSON name or its proto name, an `int64` as a number or a decimal string,
 //! an unknown field ignored. W4 and W5 (issue #823): the merge's messages,
 //! an enum by its name or its number. W6 and W7 (issue #824): the time
-//! series' messages, a `double` written as the reference writes it.
+//! series' messages, a `double` written as the reference writes it. W8
+//! (issue #827): the diff's messages.
 
 use pulsus_profiles_wire::querier_v1::{
-    FlameGraph, Level, ProfileFormat, ProfileTypesRequest, ProfileTypesResponse,
-    SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SelectSeriesRequest,
-    SelectSeriesResponse, SeriesRequest, SeriesResponse,
+    DiffRequest, DiffResponse, FlameGraph, FlameGraphDiff, Level, ProfileFormat,
+    ProfileTypesRequest, ProfileTypesResponse, SelectMergeStacktracesRequest,
+    SelectMergeStacktracesResponse, SelectSeriesRequest, SelectSeriesResponse, SeriesRequest,
+    SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
     GoPgo, LabelPair, Labels, Location, Point, ProfileType, Series, StackTraceSelector,
@@ -243,5 +245,54 @@ fn w7_a_point_value_is_written_as_the_reference_writes_it() {
     assert_eq!(
         serde_json::to_string(&SelectSeriesResponse::default()).expect("encode"),
         "{}"
+    );
+}
+
+/// W8 (issue #827): plan §3.2's g1 body is written as the reference writes
+/// it and read back; a request with `left` alone reads `right` as absent.
+#[test]
+fn w8_the_diff_is_written_as_the_reference_writes_it() {
+    const G1: &str = r#"{"flamegraph":{"names":["total","main","b","a"],"levels":[{"values":["0","3","0","0","5","0","0"]},{"values":["0","3","0","0","5","0","1"]},{"values":["0","3","3","0","0","0","3","0","0","0","0","5","5","2"]}],"total":"8","maxSelf":"5","leftTicks":"3","rightTicks":"5"}}"#;
+    let g1 = DiffResponse {
+        flamegraph: Some(FlameGraphDiff {
+            names: ["total", "main", "b", "a"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            levels: vec![
+                level(&[0, 3, 0, 0, 5, 0, 0]),
+                level(&[0, 3, 0, 0, 5, 0, 1]),
+                level(&[0, 3, 3, 0, 0, 0, 3, 0, 0, 0, 0, 5, 5, 2]),
+            ],
+            total: 8,
+            max_self: 5,
+            left_ticks: 3,
+            right_ticks: 5,
+        }),
+    };
+    assert_eq!(serde_json::to_string(&g1).expect("encode"), G1);
+    let r = serde_json::from_str::<DiffResponse>(G1).map_err(|e| e.to_string());
+    assert_eq!(r, Ok(g1));
+    // The proto names read too.
+    let r = serde_json::from_str::<FlameGraphDiff>(r#"{"left_ticks":"3","right_ticks":5}"#)
+        .map(|f| (f.left_ticks, f.right_ticks))
+        .map_err(|e| e.to_string());
+    assert_eq!(r, Ok((3, 5)));
+
+    let r = serde_json::from_str::<DiffRequest>(
+        r#"{"left":{"profileTypeID":"a:b:c:d:e","start":"1000","end":"2000"}}"#,
+    )
+    .map_err(|e| e.to_string());
+    assert_eq!(
+        r,
+        Ok(DiffRequest {
+            left: Some(SelectMergeStacktracesRequest {
+                profile_type_id: "a:b:c:d:e".to_string(),
+                start: 1000,
+                end: 2000,
+                ..SelectMergeStacktracesRequest::default()
+            }),
+            right: None,
+        })
     );
 }

@@ -1802,6 +1802,10 @@ const PROFILES_GET_BASE_QUERY: &str = "from=1000&until=4000";
 /// Issue #821: the same window as a Connect JSON body, in milliseconds.
 const PROFILES_CONNECT_BASE_BODY: &str = r#"{"start":"1000","end":"4000"}"#;
 
+/// Issue #827: that window on both sides of a `Diff`.
+const PROFILES_DIFF_BASE_BODY: &str =
+    r#"{"left":{"start":"1000","end":"4000"},"right":{"start":"1000","end":"4000"}}"#;
+
 static MANIFEST: &[RouteSpec] = &[
     // -- Ops (always mounted, mode/flag independent) --------------------
     RouteSpec {
@@ -3100,6 +3104,29 @@ static MANIFEST: &[RouteSpec] = &[
         doc_ref: DocRef::Verbatim,
         success_status: 200,
         base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
+    // -- Profiles diff (issue #827, docs/api.md §5) ---------------------
+    RouteSpec {
+        path: "/api/profiles/v1/querier.v1.QuerierService/Diff",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_DIFF_BASE_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/querier.v1.QuerierService/Diff",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_DIFF_BASE_BODY,
         cases: &[],
     },
     // -- Planned (documented, not yet mounted) ---------------------------

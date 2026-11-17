@@ -970,7 +970,8 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             // Issue #821: the base window ends before the lookback floor, so
             // the method's response message is empty and nothing is read.
             // Issue #823: the merge paths answer the empty flame graph, as
-            // the reference answers an empty window.
+            // the reference answers an empty window. Issue #827: the diff
+            // paths answer the empty diff.
             assert_eq!(
                 res.content_type(),
                 Some("application/json"),
@@ -980,6 +981,9 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                 r#"{"names":["total"],"levels":[{"values":["0","0","0","0"]}]}"#;
             let expected = if spec.path.ends_with("/SelectMergeStacktraces") {
                 format!(r#"{{"flamegraph":{EMPTY_FLAME_GRAPH}}}"#)
+            } else if spec.path.ends_with("/Diff") {
+                r#"{"flamegraph":{"names":["total"],"levels":[{"values":["0","0","0","0","0","0","0"]}]}}"#
+                    .to_string()
             } else if spec.path == "/api/profiles/v1/merge" {
                 EMPTY_FLAME_GRAPH.to_string()
             } else {

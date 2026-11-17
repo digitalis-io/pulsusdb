@@ -341,3 +341,65 @@ pub struct SelectSeriesResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub series: Vec<crate::types_v1::Series>,
 }
+
+/// A message with no wire or JSON form yet: it encodes nothing and skips
+/// every field it is sent.
+macro_rules! unbuilt_message {
+    ($t:ty) => {
+        impl ::prost::Message for $t {
+            fn encode_raw(&self, _buf: &mut impl ::prost::bytes::BufMut) {}
+            fn merge_field(
+                &mut self,
+                tag: u32,
+                wire_type: ::prost::encoding::WireType,
+                buf: &mut impl ::prost::bytes::Buf,
+                ctx: ::prost::encoding::DecodeContext,
+            ) -> Result<(), ::prost::DecodeError> {
+                ::prost::encoding::skip_field(wire_type, tag, buf, ctx)
+            }
+            fn encoded_len(&self) -> usize {
+                0
+            }
+            fn clear(&mut self) {}
+        }
+    };
+}
+
+/// `Diff`'s request (issue #827).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiffRequest {
+    #[serde(skip)]
+    pub left: Option<SelectMergeStacktracesRequest>,
+    #[serde(skip)]
+    pub right: Option<SelectMergeStacktracesRequest>,
+}
+unbuilt_message!(DiffRequest);
+
+/// `Diff`'s response (issue #827).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiffResponse {
+    #[serde(skip)]
+    pub flamegraph: Option<FlameGraphDiff>,
+}
+unbuilt_message!(DiffResponse);
+
+/// A diff flame graph (issue #827).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlameGraphDiff {
+    #[serde(skip)]
+    pub names: Vec<String>,
+    #[serde(skip)]
+    pub levels: Vec<Level>,
+    #[serde(skip)]
+    pub total: i64,
+    #[serde(skip)]
+    pub max_self: i64,
+    #[serde(skip)]
+    pub left_ticks: i64,
+    #[serde(skip)]
+    pub right_ticks: i64,
+}
+unbuilt_message!(FlameGraphDiff);
