@@ -1090,6 +1090,7 @@ docs/reference-defects-we-do-not-copy.md	pkg/logql/range_vector.go:355	not_in_th
 docs/reference-defects-we-do-not-copy.md	pkg/logql/shardmapper.go:476-534	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/model/heatmap/merger.go:122-131	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/model/heatmap/merger.go:88-106	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/model/heatmap/points_builder.go:39-86	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/model/stacktraces.go:255-273	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/model/stacktraces.go:355-358	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/model/tree.go:345-366	not_in_this_repository
@@ -1109,6 +1110,7 @@ docs/reference-defects-we-do-not-copy.md	pkg/querier/querier.go:1101	not_in_this
 docs/reference-defects-we-do-not-copy.md	pkg/querier/querier.go:1142	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/queryrange/shard_resolver.go:268	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/queryrange/shard_resolver.go:275	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/querybackend/query_heatmap.go:121-128	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querybackend/query_heatmap.go:170-181	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querybackend/query_time_series.go:240-243	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/tempopb/tempo.proto:139	not_in_this_repository

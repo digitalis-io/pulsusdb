@@ -147,6 +147,17 @@ async fn land(client: &ChClient, s: i64) {
     ] {
         rows.push(entry_row("t1", s, "x", 2, ns(ts_ms), total));
     }
+    // Three series of service `w`, one value each: two hold only `b`, one
+    // only `a`, so the label order and the raw values' order differ.
+    for (fp, labels) in [(6, r#""b":"x","#), (7, r#""b":"y","#), (8, r#""a":"v","#)] {
+        let labels = format!(r#"{{"__profile_type__":"{CPU}",{labels}"service_name":"w"}}"#);
+        rows.push(format!(
+            "('t1', {s}, 2, '{CPU}', 'w', {fp}, {}, 0, 0, 0, unhex('{NO_TRACE}'), [], [], \
+             '{labels}', '{PROFILE}')",
+            s * 1_000_000
+        ));
+        rows.push(entry_row("t1", s, "w", fp, ns(s + 5 * SECOND_MS), 5));
+    }
     rows.push(series_row("t1", s, "x", 3, None));
     rows.push(entry_row("t1", s, "x", 3, ns(s + 50 * SECOND_MS), 10));
     // Both profiles at one time, so a key without the profile merges
@@ -313,7 +324,7 @@ async fn the_heatmap_answers_its_tenants_bucket_counts() {
     let e = s + MINUTE_MS;
     let by_pod = vec!["pod".to_string()];
 
-    // L0: the fixture holds `t1`'s seven entries.
+    // L0: the fixture holds `t1`'s ten entries.
     let client = ChClient::new(test_config(&fx.db)).await.expect("connect");
     let n = client
         .query_strings(
@@ -322,7 +333,7 @@ async fn the_heatmap_answers_its_tenants_bucket_counts() {
         )
         .await
         .expect("count");
-    assert_eq!(n, ["7"], "L0");
+    assert_eq!(n, ["10"], "L0");
 
     // L1: a value on a bucket start lands in that bucket; a time 500 µs
     // past a slot's edge is in that slot.
@@ -437,6 +448,25 @@ async fn the_heatmap_answers_its_tenants_bucket_counts() {
         .flat_map(|(_, c)| c.values())
         .sum();
     assert_eq!(held, 3, "L5: t1 holds its own three values");
+
+    // L7: past a limit, equal counts tie on the labels, so `{a="v"}` is
+    // kept ahead of `{b="x"}` and `{b="y"}`.
+    let by_ab = vec!["a".to_string(), "b".to_string()];
+    let w = r#"{service_name="w"}"#;
+    let kept: Vec<Vec<(String, String)>> = fx
+        .got(
+            "t1",
+            &HeatmapRequest {
+                group_by: &by_ab,
+                limit: Some(1),
+                ..fx.request(w)
+            },
+        )
+        .await
+        .into_iter()
+        .map(|(labels, _, _)| labels)
+        .collect();
+    assert_eq!(kept, vec![vec![("a".to_string(), "v".to_string())]], "L7");
 
     // L6: the scan budget.
     let budget = ProfilesReadConfig {

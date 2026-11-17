@@ -2577,16 +2577,24 @@ they are named so nobody adds them later.
   on the reference's part. Entries 11 and 22 are different: each has a
   self-contradiction or a violated stated intent behind it, not just a
   code we would have chosen differently.
-- **Two heatmap choices (issue #825, the owner's decision of
-  2026-11-17).** The reference answers a `SelectHeatmap` without a query
-  type with `500` `valid heatmap query type must be specified` when the
-  window holds data, and with an empty answer when it holds none
-  (`pkg/querybackend/query_heatmap.go:170-181`); PulsusDB answers `400`
-  with that text whenever the window is read. Below the limit, the
+- **Three heatmap choices (issue #825; the first two the owner's
+  decision of 2026-11-17).** The reference answers a `SelectHeatmap`
+  without a query type with `500` `valid heatmap query type must be
+  specified` when the window holds data, and with an empty answer when it
+  holds none (`pkg/querybackend/query_heatmap.go:170-181`); PulsusDB
+  answers `400` with that text on every window. Below the limit, the
   reference orders the heatmap's series by the text of internal reference
   numbers written in hex (`pkg/model/heatmap/merger.go:88-106`,
   `:122-131`), which follows no label or value order; PulsusDB orders
-  them by their labels (`docs/api.md` §5).
+  them by their labels. With `HEATMAP_QUERY_TYPE_SPAN`, the reference
+  adds a span's samples without their profile
+  (`pkg/querybackend/query_heatmap.go:121-128`) and merges equal
+  millisecond, span and trace keys within a series group
+  (`pkg/model/heatmap/points_builder.go:39-86`), so two profiles carrying
+  one span count as one value when they share a millisecond and as two
+  when they are a millisecond apart. PulsusDB counts one value per profile
+  and span either way, so the count does not depend on whether two
+  timestamps coincide (`docs/api.md` §5).
 - **Everything that follows from our architecture.** Storing spans and
   log lines as ClickHouse rows rather than in the reference's own file
   formats decides a great deal — which parameters are meaningful, what

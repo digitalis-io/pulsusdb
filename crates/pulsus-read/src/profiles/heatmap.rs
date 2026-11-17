@@ -65,6 +65,18 @@ pub struct Series {
     pub slots: Vec<Slot>,
 }
 
+/// Whether `query_type` is `SPAN`; refused unless it is `INDIVIDUAL` or
+/// `SPAN`, whatever the window (the owner's decision of 2026-11-17).
+fn query_type(query_type: i32) -> Result<bool, ProfilesReadError> {
+    match query_type {
+        QUERY_TYPE_INDIVIDUAL => Ok(false),
+        QUERY_TYPE_SPAN => Ok(true),
+        _ => Err(ProfilesReadError::InvalidArgument(
+            "valid heatmap query type must be specified".to_string(),
+        )),
+    }
+}
+
 /// Plans `req` for `tenant`: `Ok(None)` when its window ends before the
 /// lookback floor, so nothing is read. In the reference's order: the step,
 /// the limit, the window's order, then the window, the type and the
@@ -98,13 +110,9 @@ pub fn plan(
         now_ms,
     )?
     else {
-        return Ok(None);
+        return query_type(req.query_type).map(|_| None);
     };
-    let span = match req.query_type {
-        QUERY_TYPE_INDIVIDUAL => false,
-        QUERY_TYPE_SPAN => true,
-        _ => return invalid("valid heatmap query type must be specified".to_string()),
-    };
+    let span = query_type(req.query_type)?;
     let step = series::step_ms(req.step)?;
 
     let start = window.start_ms;
@@ -150,9 +158,21 @@ pub fn plan(
             entries = config.entries_table,
         )
     };
-    let limit = match req.limit {
-        Some(n) if n > 0 => format!("\nLIMIT {}", n.saturating_add(1)),
-        _ => String::new(),
+    // With a limit, the statement's cut ties on the labels as `heatmap`
+    // orders them: the non-empty `(name, value)` pairs in request order.
+    let (order, limit) = match req.limit {
+        Some(n) if n > 0 && !req.group_by.is_empty() => {
+            let names: Vec<String> = req.group_by.iter().map(|l| ch_string(l)).collect();
+            (
+                format!(
+                    "arrayFilter(p -> p.2 != '', arrayZip([{}], g))",
+                    names.join(", ")
+                ),
+                format!("\nLIMIT {}", n.saturating_add(1)),
+            )
+        }
+        Some(n) if n > 0 => ("g".to_string(), format!("\nLIMIT {}", n.saturating_add(1))),
+        _ => ("g".to_string(), String::new()),
     };
     Ok(Some(format!(
         "SELECT g, sum(length(b)) AS n, arraySort(groupArray((ts, arrayMap(k -> toUInt32(countEqual(b, k)), range(20))))) AS slots,
@@ -175,7 +195,7 @@ FROM (
   )
 )
 GROUP BY g
-ORDER BY n DESC, g{limit}",
+ORDER BY n DESC, {order}{limit}",
         step_minus_1 = step - 1,
     )))
 }
@@ -454,7 +474,12 @@ ORDER BY n DESC, g";
             },
             END,
         );
-        assert!(sql.ends_with("ORDER BY n DESC, g\nLIMIT 4"), "{sql}");
+        assert!(
+            sql.ends_with(
+                "ORDER BY n DESC, arrayFilter(p -> p.2 != '', arrayZip(['service_name'], g))\nLIMIT 4"
+            ),
+            "{sql}"
+        );
         for limit in [Some(0), None] {
             let sql = planned(
                 &single(),
@@ -519,6 +544,45 @@ ORDER BY n DESC, g";
         assert_eq!(
             plan(&t, &single(), &example(&g), END + 8 * DAY_MS),
             Ok(None)
+        );
+    }
+
+    /// H9: an absent or unknown query type is refused also when the window
+    /// ends before the lookback floor.
+    #[test]
+    fn h9_the_query_type_is_checked_on_every_window() {
+        let g = by_service();
+        for query_type in [0, 3] {
+            let req = HeatmapRequest {
+                query_type,
+                ..example(&g)
+            };
+            assert_eq!(
+                plan(&tenant("t1"), &single(), &req, END + 8 * DAY_MS),
+                invalid("valid heatmap query type must be specified"),
+                "{query_type}"
+            );
+        }
+    }
+
+    /// H10: with a limit, the statement's cut ties on the labels, empty
+    /// values dropped, so the series it keeps are the ones `heatmap` keeps.
+    #[test]
+    fn h10_the_limit_ties_on_the_labels() {
+        let g = vec!["a".to_string(), "b".to_string()];
+        let sql = planned(
+            &single(),
+            &HeatmapRequest {
+                limit: Some(1),
+                ..example(&g)
+            },
+            END,
+        );
+        assert!(
+            sql.ends_with(
+                "ORDER BY n DESC, arrayFilter(p -> p.2 != '', arrayZip(['a', 'b'], g))\nLIMIT 2"
+            ),
+            "{sql}"
         );
     }
 
