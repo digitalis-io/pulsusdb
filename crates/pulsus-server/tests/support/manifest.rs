@@ -295,8 +295,8 @@ pub enum Surface {
     /// body is `{}` and nothing is read. Errors are the Connect JSON body
     /// `{"code","message"}`.
     ProfilesQuery,
-    /// The profiles query API's twelve Connect paths (issue #821): the six
-    /// methods at `/querier.v1.QuerierService/<M>` (compat) and
+    /// The profiles query API's fourteen Connect paths (issue #821): the
+    /// seven methods at `/querier.v1.QuerierService/<M>` (compat) and
     /// `/api/profiles/v1/querier.v1.QuerierService/<M>` (native), `POST`
     /// only. The base request is a JSON body; success and errors as
     /// [`Surface::ProfilesQuery`].
@@ -1808,6 +1808,11 @@ const PROFILES_GET_BASE_QUERY: &str = "from=1000&until=4000";
 /// Issue #821: the same window as a Connect JSON body, in milliseconds.
 const PROFILES_CONNECT_BASE_BODY: &str = r#"{"start":"1000","end":"4000"}"#;
 
+/// Issue #825: the same window for `SelectHeatmap`, with a step and a query
+/// type: its step is checked before its window.
+const PROFILES_HEATMAP_BASE_BODY: &str =
+    r#"{"start":"1000","end":"4000","step":15,"queryType":"HEATMAP_QUERY_TYPE_INDIVIDUAL"}"#;
+
 static MANIFEST: &[RouteSpec] = &[
     // -- Ops (always mounted, mode/flag independent) --------------------
     RouteSpec {
@@ -3106,6 +3111,29 @@ static MANIFEST: &[RouteSpec] = &[
         doc_ref: DocRef::Verbatim,
         success_status: 200,
         base_query: PROFILES_CONNECT_BASE_BODY,
+        cases: &[],
+    },
+    // -- Profiles heatmap (issue #825, docs/api.md §5) -------------------
+    RouteSpec {
+        path: "/api/profiles/v1/querier.v1.QuerierService/SelectHeatmap",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_HEATMAP_BASE_BODY,
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/querier.v1.QuerierService/SelectHeatmap",
+        methods: &[Method::Post],
+        surface: Surface::ProfilesConnect,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: PROFILES_HEATMAP_BASE_BODY,
         cases: &[],
     },
     // -- OTLP over gRPC (issue #816, docs/api.md §1.1) -------------------

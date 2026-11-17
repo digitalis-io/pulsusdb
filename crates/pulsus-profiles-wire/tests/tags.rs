@@ -8,7 +8,7 @@
 //! W1 (issue #821): the same for every `types_v1` and `querier_v1` message
 //! the query API uses, against `proto/types/v1/types.proto` and
 //! `proto/querier/v1/querier.proto`. Issue #823 adds the merge's messages,
-//! issue #824 the time series'.
+//! issue #824 the time series', issue #825 the heatmap's.
 //!
 //! T1 (issue #817): the same for `ProfileAnnotation` and the `push_v1`
 //! messages, against `proto/types/v1/types.proto` and
@@ -22,13 +22,14 @@ use pulsus_profiles_wire::google_v1::{
 use pulsus_profiles_wire::push_v1::{PushRequest, RawProfileSeries, RawSample};
 use pulsus_profiles_wire::querier_v1::{
     FlameGraph, Level, ProfileFormat, ProfileTypesRequest, ProfileTypesResponse,
-    SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SelectSeriesRequest,
-    SelectSeriesResponse, SeriesRequest, SeriesResponse,
+    SelectHeatmapRequest, SelectHeatmapResponse, SelectMergeStacktracesRequest,
+    SelectMergeStacktracesResponse, SelectSeriesRequest, SelectSeriesResponse, SeriesRequest,
+    SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
-    GoPgo, LabelNamesRequest, LabelNamesResponse, LabelPair, LabelValuesRequest,
-    LabelValuesResponse, Labels, Location as CallSite, Point, ProfileAnnotation, ProfileType,
-    Series, StackTraceSelector,
+    GoPgo, HeatmapSeries, HeatmapSlot, LabelNamesRequest, LabelNamesResponse, LabelPair,
+    LabelValuesRequest, LabelValuesResponse, Labels, Location as CallSite, Point,
+    ProfileAnnotation, ProfileType, Series, StackTraceSelector,
 };
 
 fn value_type() -> ValueType {
@@ -679,4 +680,85 @@ fn every_time_series_message_field_encodes_under_the_proto_tag() {
     encoding::int64::encode(9, &0, &mut b);
     check("aggregation and limit 0", &zero, b);
     check("default", &SelectSeriesRequest::default(), Vec::new());
+}
+
+fn heatmap_slot() -> HeatmapSlot {
+    HeatmapSlot {
+        timestamp: 1_794_819_600_000,
+        y_min: vec![0.0, 2.5, 5.0],
+        counts: vec![1, 0, 3],
+    }
+}
+
+fn heatmap_slot_bytes(s: &HeatmapSlot) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::int64::encode(1, &s.timestamp, &mut b);
+    encoding::double::encode_packed(2, &s.y_min, &mut b);
+    encoding::int32::encode_packed(3, &s.counts, &mut b);
+    b
+}
+
+fn heatmap_series() -> HeatmapSeries {
+    HeatmapSeries {
+        labels: vec![label_pair()],
+        slots: vec![heatmap_slot(), heatmap_slot()],
+    }
+}
+
+fn heatmap_series_bytes(s: &HeatmapSeries) -> Vec<u8> {
+    let mut b = Vec::new();
+    nested(1, &label_pair_bytes(&s.labels[0]), &mut b);
+    for slot in &s.slots {
+        nested(2, &heatmap_slot_bytes(slot), &mut b);
+    }
+    b
+}
+
+/// W1 (issue #825): the heatmap's messages, every field set.
+#[test]
+fn every_heatmap_message_field_encodes_under_the_proto_tag() {
+    let slot = heatmap_slot();
+    check("HeatmapSlot", &slot, heatmap_slot_bytes(&slot));
+    let s = heatmap_series();
+    check("HeatmapSeries", &s, heatmap_series_bytes(&s));
+    let r = SelectHeatmapResponse {
+        series: vec![heatmap_series()],
+    };
+    let mut b = Vec::new();
+    nested(1, &heatmap_series_bytes(&heatmap_series()), &mut b);
+    check("SelectHeatmapResponse", &r, b);
+
+    let m = SelectHeatmapRequest {
+        profile_type_id: "process_cpu:cpu:nanoseconds:cpu:nanoseconds".to_string(),
+        label_selector: "{service_name=\"a\"}".to_string(),
+        start: 1000,
+        end: 2000,
+        step: 15.0,
+        group_by: strings(&["service_name", "pod"]),
+        query_type: 2,
+        exemplar_type: 3,
+        limit: Some(3),
+    };
+    let mut b = Vec::new();
+    encoding::string::encode(1, &m.profile_type_id, &mut b);
+    encoding::string::encode(2, &m.label_selector, &mut b);
+    encoding::int64::encode(3, &m.start, &mut b);
+    encoding::int64::encode(4, &m.end, &mut b);
+    encoding::double::encode(5, &15.0, &mut b);
+    encoding::string::encode_repeated(6, &m.group_by, &mut b);
+    encoding::int32::encode(7, &2, &mut b);
+    encoding::int32::encode(8, &3, &mut b);
+    encoding::int64::encode(9, &3, &mut b);
+    check("SelectHeatmapRequest", &m, b);
+
+    // An explicit `limit` of 0 is present on the wire, as `optional` has
+    // it; an absent one is not.
+    let zero = SelectHeatmapRequest {
+        limit: Some(0),
+        ..SelectHeatmapRequest::default()
+    };
+    let mut b = Vec::new();
+    encoding::int64::encode(9, &0, &mut b);
+    check("limit 0", &zero, b);
+    check("default", &SelectHeatmapRequest::default(), Vec::new());
 }

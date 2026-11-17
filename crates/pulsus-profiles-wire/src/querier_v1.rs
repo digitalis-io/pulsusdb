@@ -341,3 +341,27 @@ pub struct SelectSeriesResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub series: Vec<crate::types_v1::Series>,
 }
+
+/// `SelectHeatmap`'s request (issue #825).
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelectHeatmapRequest {
+    pub profile_type_id: String,
+    pub label_selector: String,
+    pub start: i64,
+    pub end: i64,
+    pub step: f64,
+    pub group_by: Vec<String>,
+    pub query_type: i32,
+    pub exemplar_type: i32,
+    pub limit: Option<i64>,
+}
+empty_message!(SelectHeatmapRequest);
+
+/// `SelectHeatmap`'s response (issue #825).
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelectHeatmapResponse {
+    pub series: Vec<crate::types_v1::HeatmapSeries>,
+}
+empty_message!(SelectHeatmapResponse);

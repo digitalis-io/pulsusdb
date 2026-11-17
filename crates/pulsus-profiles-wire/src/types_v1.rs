@@ -299,3 +299,22 @@ impl ExemplarType {
         .find(|t| t.as_str_name() == name)
     }
 }
+
+/// Issue #825: one heatmap series — its labels and its slots.
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeatmapSeries {
+    pub labels: Vec<LabelPair>,
+    pub slots: Vec<HeatmapSlot>,
+}
+empty_message!(HeatmapSeries);
+
+/// Issue #825: one slot of a heatmap series.
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeatmapSlot {
+    pub timestamp: i64,
+    pub y_min: Vec<f64>,
+    pub counts: Vec<i32>,
+}
+empty_message!(HeatmapSlot);

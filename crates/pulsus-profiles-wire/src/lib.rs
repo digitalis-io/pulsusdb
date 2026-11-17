@@ -12,6 +12,30 @@
 //! `aggregation_type` and `exemplar_type` are the time series request's
 //! two enums, in the shape of `profile_format`.
 
+/// Tests-first stub: a message that encodes nothing.
+macro_rules! empty_message {
+    ($t:ty) => {
+        impl ::prost::Message for $t {
+            fn encode_raw(&self, _buf: &mut impl ::prost::bytes::BufMut) {}
+            fn merge_field(
+                &mut self,
+                tag: u32,
+                wire_type: ::prost::encoding::WireType,
+                buf: &mut impl ::prost::bytes::Buf,
+                ctx: ::prost::encoding::DecodeContext,
+            ) -> Result<(), ::prost::DecodeError> {
+                ::prost::encoding::skip_field(wire_type, tag, buf, ctx)
+            }
+            fn encoded_len(&self) -> usize {
+                0
+            }
+            fn clear(&mut self) {
+                *self = Self::default();
+            }
+        }
+    };
+}
+
 pub mod connect;
 pub mod google_v1;
 pub mod int64;

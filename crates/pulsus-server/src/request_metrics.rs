@@ -626,7 +626,7 @@ mod tests {
             ROUTE_TEMPLATES.windows(2).all(|w| w[0] < w[1]),
             "{ROUTE_TEMPLATES:?}"
         );
-        assert_eq!(ROUTE_TEMPLATES.len(), 107);
+        assert_eq!(ROUTE_TEMPLATES.len(), 109);
         assert!(
             ROUTE_TEMPLATES
                 .iter()
