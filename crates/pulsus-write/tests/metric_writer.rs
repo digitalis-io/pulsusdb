@@ -1349,6 +1349,10 @@ async fn the_drain_accounts_for_every_push_it_admitted() {
     let accepted = Arc::new(AtomicUsize::new(0));
     let refused = Arc::new(AtomicUsize::new(0));
     let answered = Arc::new(AtomicUsize::new(0));
+    // How many pushers have made their first admission. The drain begins only
+    // once every pusher has, so it always races pushers that are mid-stream,
+    // however slowly a loaded machine schedules them.
+    let (pushing_tx, mut pushing_rx) = tokio::sync::watch::channel(0u128);
 
     let mut pushers = Vec::new();
     for p in 0..PUSHERS {
@@ -1356,17 +1360,22 @@ async fn the_drain_accounts_for_every_push_it_admitted() {
         let accepted = accepted.clone();
         let refused = refused.clone();
         let answered = answered.clone();
+        let pushing_tx = pushing_tx.clone();
         pushers.push(tokio::spawn(async move {
             let template = wide_template();
             // Staggered, so the pushers are spread over the phases of one
             // admission rather than stepping through it in lockstep.
             tokio::time::sleep(Duration::from_micros(120 * p as u64)).await;
             for i in 0..CAP {
-                match writer.admit_flush(
+                let admission = writer.admit_flush(
                     &no_tenant(),
                     restamped(&template, p * CAP + i + 1),
                     PushHeaders::default(),
-                ) {
+                );
+                if i == 0 {
+                    pushing_tx.send_modify(|n| *n += 1);
+                }
+                match admission {
                     Ok(wait) => {
                         accepted.fetch_add(1, Ordering::SeqCst);
                         // Every admitted push is answered — `Ok` or an error.
@@ -1391,7 +1400,10 @@ async fn the_drain_accounts_for_every_push_it_admitted() {
     let drain = {
         let writer = writer.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            pushing_rx
+                .wait_for(|n| *n == PUSHERS)
+                .await
+                .expect("the test holds a sender");
             writer.shutdown(Duration::from_secs(5)).await;
             writer.metrics().queue_bytes
         })
