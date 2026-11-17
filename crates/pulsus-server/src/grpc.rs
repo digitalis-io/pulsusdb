@@ -1,13 +1,24 @@
 //! OTLP over gRPC (issue #816, docs/api.md §1.1): a unary shim in front of
 //! the four OTLP/HTTP export handlers.
+//!
+//! The shim strips the 5-byte gRPC frame and hands the message bytes, as
+//! sent, to the signal's own `/v1/*` handler, then turns that handler's
+//! HTTP answer into a gRPC one. It decodes nothing itself: a generated
+//! gRPC server decodes before the handler runs, and the handler would then
+//! see a re-encoded message, without the unknown fields the profiles route
+//! refuses.
 
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use base64::Engine;
+use futures::StreamExt;
+use http_body_util::{BodyExt, Full};
+use prost::Message;
 
 use crate::app::AppState;
 
@@ -16,7 +27,37 @@ pub(crate) async fn export_logs(State(s): State<AppState>, h: HeaderMap, b: Body
     unary(h, b, |h, b| crate::ingest::ingest_logs(State(s), h, b)).await
 }
 
-/// The frame error the message stream met, if any.
+/// `MetricsService/Export`: the `/v1/metrics` handler behind the shim.
+pub(crate) async fn export_metrics(State(s): State<AppState>, h: HeaderMap, b: Body) -> Response {
+    unary(h, b, |h, b| crate::ingest::ingest_metrics(State(s), h, b)).await
+}
+
+/// `TraceService/Export`: the `/v1/traces` handler behind the shim.
+pub(crate) async fn export_traces(State(s): State<AppState>, h: HeaderMap, b: Body) -> Response {
+    unary(h, b, |h, b| crate::ingest::ingest_traces(State(s), h, b)).await
+}
+
+/// `ProfilesService/Export`: the `/v1development/profiles` handler behind
+/// the shim.
+pub(crate) async fn export_profiles(State(s): State<AppState>, h: HeaderMap, b: Body) -> Response {
+    unary(h, b, |h, b| {
+        crate::ingest::ingest_otlp_profiles(State(s), h, b)
+    })
+    .await
+}
+
+const GRPC_CONTENT_TYPE: &str = "application/grpc";
+const DEADLINE_EXCEEDED: i32 = 4;
+const RESOURCE_EXHAUSTED: i32 = 8;
+const UNIMPLEMENTED: i32 = 12;
+const INTERNAL: i32 = 13;
+
+const TRUNCATED: &str = "truncated gRPC message";
+const EXTRA_MESSAGE: &str = "more than one message in a unary call";
+const RETRY_INFO: &str = "type.googleapis.com/google.rpc.RetryInfo";
+
+/// The frame error the message stream met, if any. Set by the stream the
+/// handler reads, read by [`to_grpc`] once the handler has answered.
 type FrameError = Arc<OnceLock<String>>;
 
 /// `google.rpc.Status`.
@@ -39,28 +80,254 @@ struct ProtoAny {
     value: Vec<u8>,
 }
 
-pub(crate) fn grpc_code(_status: StatusCode) -> i32 {
-    2
+/// The gRPC code for a handler's HTTP status (docs/api.md §1.1). `500` and
+/// `503` are `UNAVAILABLE`, which the collector's exporter retries; `401`
+/// is answered by the authentication layer before the shim runs, and the
+/// client reads its HTTP `401` as `UNAUTHENTICATED`.
+pub(crate) fn grpc_code(status: StatusCode) -> i32 {
+    match status.as_u16() {
+        200..=299 => 0,
+        400 | 413 => 3,
+        401 => 16,
+        429 => RESOURCE_EXHAUSTED,
+        500 | 503 => 14,
+        _ => INTERNAL,
+    }
 }
 
+/// Reads the 5-byte prefix: the compressed flag and the message length.
+/// The returned body yields the rest, exactly the length's bytes, and
+/// fails if more arrive or the stream ends short, recording why in the
+/// returned [`FrameError`].
 async fn unframe(body: Body) -> Result<(bool, Body, FrameError), String> {
-    Ok((false, body, FrameError::default()))
+    let mut stream = body.into_data_stream();
+    let mut head = Vec::with_capacity(5);
+    while head.len() < 5 {
+        match stream.next().await {
+            Some(Ok(chunk)) => head.extend_from_slice(&chunk),
+            Some(Err(e)) => return Err(e.to_string()),
+            None => return Err(TRUNCATED.to_string()),
+        }
+    }
+    let flag = head[0];
+    if flag > 1 {
+        return Err(format!("invalid gRPC compressed flag {flag}"));
+    }
+    let len = u64::from(u32::from_be_bytes([head[1], head[2], head[3], head[4]]));
+    let rest = Bytes::from(head).slice(5..);
+    let error = FrameError::default();
+    let state = Unframing {
+        stream,
+        pending: (!rest.is_empty()).then_some(rest),
+        remaining: len,
+        error: Arc::clone(&error),
+        done: false,
+    };
+    let message = futures::stream::unfold(state, |mut s| async move {
+        let item = s.next().await?;
+        Some((item, s))
+    });
+    Ok((flag == 1, Body::from_stream(message), error))
 }
 
-async fn unary<F, Fut>(headers: HeaderMap, body: Body, handler: F) -> Response
+/// The state of the message stream [`unframe`] returns.
+struct Unframing {
+    stream: axum::body::BodyDataStream,
+    pending: Option<Bytes>,
+    remaining: u64,
+    error: FrameError,
+    done: bool,
+}
+
+impl Unframing {
+    async fn next(&mut self) -> Option<Result<Bytes, std::io::Error>> {
+        while !self.done {
+            let chunk = match self.pending.take() {
+                Some(chunk) => Some(Ok(chunk)),
+                None => self.stream.next().await,
+            };
+            match chunk {
+                Some(Ok(chunk)) if chunk.is_empty() => {}
+                Some(Ok(chunk)) => {
+                    let n = chunk.len() as u64;
+                    if n > self.remaining {
+                        return Some(Err(self.fail(EXTRA_MESSAGE)));
+                    }
+                    self.remaining -= n;
+                    return Some(Ok(chunk));
+                }
+                Some(Err(e)) => {
+                    self.done = true;
+                    return Some(Err(std::io::Error::other(e)));
+                }
+                None if self.remaining > 0 => return Some(Err(self.fail(TRUNCATED))),
+                None => self.done = true,
+            }
+        }
+        None
+    }
+
+    fn fail(&mut self, message: &str) -> std::io::Error {
+        self.done = true;
+        let _ = self.error.set(message.to_string());
+        std::io::Error::other(message)
+    }
+}
+
+/// One unary call: the gRPC request becomes the handler's HTTP request, and
+/// the handler's answer becomes the gRPC answer.
+async fn unary<F, Fut>(mut headers: HeaderMap, body: Body, handler: F) -> Response
 where
     F: FnOnce(HeaderMap, Body) -> Fut,
     Fut: Future<Output = Response>,
 {
-    handler(headers, body).await
+    let is_grpc = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with(GRPC_CONTENT_TYPE));
+    if !is_grpc {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    let gzip = match headers.get("grpc-encoding").map(HeaderValue::as_bytes) {
+        None | Some(b"identity") => false,
+        Some(b"gzip") => true,
+        Some(other) => {
+            let mut res = trailers_only(
+                UNIMPLEMENTED,
+                &format!(
+                    "grpc-encoding {} is not supported",
+                    String::from_utf8_lossy(other)
+                ),
+            );
+            res.headers_mut()
+                .insert("grpc-accept-encoding", HeaderValue::from_static("gzip"));
+            return res;
+        }
+    };
+    let (compressed, message, frame_error) = match unframe(body).await {
+        Ok(unframed) => unframed,
+        Err(message) => return trailers_only(INTERNAL, &message),
+    };
+    if compressed && !gzip {
+        return trailers_only(INTERNAL, "compressed flag set without grpc-encoding");
+    }
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-protobuf"),
+    );
+    headers.remove(header::CONTENT_LENGTH);
+    if compressed {
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+    } else {
+        headers.remove(header::CONTENT_ENCODING);
+    }
+    let resp = handler(headers, message).await;
+    to_grpc(resp, &frame_error).await
 }
 
+/// The handler's answer as a gRPC answer. A frame error wins over whatever
+/// the handler said, so a malformed message is never retried.
+async fn to_grpc(resp: Response, frame_error: &OnceLock<String>) -> Response {
+    let status = resp.status();
+    let protobuf = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes() == b"application/x-protobuf");
+    // These bodies are small: an export response or an error text.
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await;
+    if let Some(message) = frame_error.get() {
+        return trailers_only(INTERNAL, message);
+    }
+    let body = match body {
+        Ok(body) => body,
+        Err(e) => return trailers_only(INTERNAL, &e.to_string()),
+    };
+    if status.is_success() {
+        return success(&body);
+    }
+    let message = if protobuf {
+        RpcStatus::decode(body)
+            .map(|s| s.message)
+            .unwrap_or_default()
+    } else {
+        let text = body.strip_suffix(b"\n").unwrap_or(&body);
+        String::from_utf8_lossy(text).into_owned()
+    };
+    trailers_only(grpc_code(status), &message)
+}
+
+/// `200`, the message in one frame, and `grpc-status: 0` in the trailers.
+fn success(message: &[u8]) -> Response {
+    let len = u32::try_from(message.len()).unwrap_or(u32::MAX);
+    let mut frame = Vec::with_capacity(5 + message.len());
+    frame.push(0);
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(message);
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", HeaderValue::from_static("0"));
+    let body = Full::new(Bytes::from(frame))
+        .with_trailers(async move { Some(Ok::<_, std::convert::Infallible>(trailers)) });
+    let mut res = Response::new(Body::new(body));
+    res.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(GRPC_CONTENT_TYPE),
+    );
+    res
+}
+
+/// A trailers-only answer: `200`, the status in the headers, no body. A
+/// `RESOURCE_EXHAUSTED` carries a `RetryInfo` detail, without which the
+/// collector's exporter does not retry it.
+fn trailers_only(code: i32, message: &str) -> Response {
+    let mut res = Response::new(Body::empty());
+    let headers = res.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(GRPC_CONTENT_TYPE),
+    );
+    headers.insert("grpc-status", HeaderValue::from(code));
+    if !message.is_empty()
+        && let Ok(value) = HeaderValue::try_from(encode_message(message))
+    {
+        headers.insert("grpc-message", value);
+    }
+    if code == RESOURCE_EXHAUSTED {
+        let details = RpcStatus {
+            code,
+            message: message.to_string(),
+            details: vec![ProtoAny {
+                type_url: RETRY_INFO.to_string(),
+                value: vec![],
+            }],
+        }
+        .encode_to_vec();
+        let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(details);
+        if let Ok(value) = HeaderValue::try_from(encoded) {
+            headers.insert("grpc-status-details-bin", value);
+        }
+    }
+    res
+}
+
+/// `grpc-message`'s percent-encoding: every byte outside `0x20..=0x7E`, and
+/// `%` itself, as `%XX`.
 pub(crate) fn encode_message(message: &str) -> String {
-    message.to_string()
+    use std::fmt::Write;
+    let mut out = String::with_capacity(message.len());
+    for &b in message.as_bytes() {
+        if (0x20..=0x7E).contains(&b) && b != b'%' {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
+/// The request deadline's answer on the gRPC export paths:
+/// `DEADLINE_EXCEEDED`, which the exporter retries.
 pub(crate) fn deadline_response() -> Response {
-    Response::default()
+    trailers_only(DEADLINE_EXCEEDED, "deadline exceeded")
 }
 
 #[cfg(test)]

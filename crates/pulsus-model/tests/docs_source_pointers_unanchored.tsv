@@ -538,7 +538,7 @@ docs/benchmarks/traces-differential-ledger.md	crates/pulsus-schema/src/catalog.r
 docs/benchmarks/traces-differential-ledger.md	crates/pulsus-server/tests/traces_search_live.rs:1643-1646	no_name_the_target_file_holds
 docs/benchmarks/traces-differential-ledger.md	crates/pulsus-traceql/src/ast.rs:555	no_name_the_target_file_holds
 docs/benchmarks/traces-differential-ledger.md	crates/pulsus-traceql/src/ast.rs:560	no_name_the_target_file_holds
-docs/benchmarks/traces-differential-ledger.md	docs/api.md:1037	no_name_the_target_file_holds
+docs/benchmarks/traces-differential-ledger.md	docs/api.md:1066	no_name_the_target_file_holds
 docs/benchmarks/traces-differential-ledger.md	encoding/vparquet4/block_traceql.go:3595-3605	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	engine.go:296-306	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	engine.go:351	not_in_this_repository

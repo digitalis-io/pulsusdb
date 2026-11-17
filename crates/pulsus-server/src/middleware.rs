@@ -81,6 +81,17 @@ pub(crate) const DEADLINE_CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
 ];
 
+/// Issue #816: the four OTLP gRPC export paths. They answer a deadline
+/// with a trailers-only `DEADLINE_EXCEEDED` ([`DeadlineClass::Grpc`]).
+/// Source-scanned by `tests/deadline_partition.rs` and compared with the
+/// route manifest.
+pub(crate) const DEADLINE_GRPC_PATHS: &[&str] = &[
+    "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+    "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+    "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+    "/opentelemetry.proto.collector.profiles.v1development.ProfilesService/Export",
+];
+
 /// Issue #821: the profiles `GET` routes, `{name}` one path segment (#823
 /// adds `/merge`, #824 `/select_series`).
 /// They answer a deadline as the reference's HTTP read handlers answer one
@@ -119,6 +130,10 @@ pub(crate) enum DeadlineClass {
     /// `504` + the Connect `deadline_exceeded` body (issue #821): the
     /// reference's answer on the profiles Connect paths.
     Connect,
+    /// `200` + a trailers-only `DEADLINE_EXCEEDED` (issue #816): the OTLP
+    /// gRPC export paths, where the exporter retries that code and reads a
+    /// bare `408` as `UNKNOWN`, which it does not retry.
+    Grpc,
     /// `504` + the same body with a trailing newline and
     /// `X-Content-Type-Options: nosniff` (issue #821): the reference's HTTP
     /// read handlers write a deadline through `httputil.Error`
@@ -131,7 +146,9 @@ pub(crate) enum DeadlineClass {
 /// Total over the `/api/v1/` prefix by construction (issue #471 M2): a
 /// query route added later cannot land on the wrong side, and the only way
 /// to get the bare answer under that prefix is to be named in
-/// [`DEADLINE_BARE_PATHS`]. Everything outside `/api/v1/` — the LogQL and
+/// [`DEADLINE_BARE_PATHS`]. Everything outside `/api/v1/` other than the
+/// paths named in [`DEADLINE_GRPC_PATHS`], [`DEADLINE_CONNECT_PATHS`] and
+/// [`DEADLINE_PROFILES_HTTP_PATHS`] — the LogQL and
 /// TraceQL surfaces and their compat aliases, the OTLP receivers, the ops
 /// routes — is [`DeadlineClass::Bare`] by construction; those surfaces
 /// write bare `text/plain` error bodies by decision (issue #264) and must
@@ -140,6 +157,9 @@ pub(crate) enum DeadlineClass {
 /// Cheap: one `starts_with` plus at most `DEADLINE_BARE_PATHS.len()`
 /// string compares, no allocation.
 pub(crate) fn deadline_class(path: &str) -> DeadlineClass {
+    if DEADLINE_GRPC_PATHS.contains(&path) {
+        return DeadlineClass::Grpc;
+    }
     if DEADLINE_CONNECT_PATHS
         .iter()
         .any(|t| matches_template(t, path))
@@ -271,6 +291,7 @@ where
                         DeadlineClass::ProfilesHttp => {
                             crate::profiles_api::connect::http_deadline_response()
                         }
+                        DeadlineClass::Grpc => crate::grpc::deadline_response(),
                         DeadlineClass::Bare => {
                             let mut res = Response::new(Body::default());
                             *res.status_mut() = StatusCode::REQUEST_TIMEOUT;
