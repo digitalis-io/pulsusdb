@@ -104,6 +104,12 @@ profiles_series_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=
 # route, against the spawned binary. Reuses this job's ClickHouse
 # container.
 profiles_series	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profiles_series
+# Issue #827: the diff's one statement over both sides' samples and their
+# stacks. Reuses this job's ClickHouse container.
+profileql_diff_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test profileql_diff_live
+# Issue #827: Diff over the Connect protocol, against the spawned binary.
+# Reuses this job's ClickHouse container.
+profileql_diff	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profileql_diff
 # Issue #825: the heatmap's one statement over its tenant's entries, and
 # with HEATMAP_QUERY_TYPE_SPAN over its samples. Reuses this job's
 # ClickHouse container.

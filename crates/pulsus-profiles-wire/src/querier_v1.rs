@@ -342,6 +342,77 @@ pub struct SelectSeriesResponse {
     pub series: Vec<crate::types_v1::Series>,
 }
 
+/// `Diff`'s request (issue #827): the two selections. Each side's
+/// `format` is ignored.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiffRequest {
+    #[prost(message, optional, tag = "1")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left: Option<SelectMergeStacktracesRequest>,
+    #[prost(message, optional, tag = "2")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right: Option<SelectMergeStacktracesRequest>,
+}
+
+/// `Diff`'s response (issue #827): the diff flame graph, field 1.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiffResponse {
+    #[prost(message, optional, tag = "1")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flamegraph: Option<FlameGraphDiff>,
+}
+
+/// A diff flame graph (issue #827): the names, and per level the node pairs
+/// as `[left x offset, left total, left self, right x offset, right total,
+/// right self, name index]`, both x offsets delta-encoded; each side's
+/// ticks.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlameGraphDiff {
+    #[prost(string, repeated, tag = "1")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
+    #[prost(message, repeated, tag = "2")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub levels: Vec<Level>,
+    #[prost(int64, tag = "3")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
+    pub total: i64,
+    #[prost(int64, tag = "4")]
+    #[serde(
+        rename = "maxSelf",
+        alias = "max_self",
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
+    pub max_self: i64,
+    #[prost(int64, tag = "5")]
+    #[serde(
+        rename = "leftTicks",
+        alias = "left_ticks",
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
+    pub left_ticks: i64,
+    #[prost(int64, tag = "6")]
+    #[serde(
+        rename = "rightTicks",
+        alias = "right_ticks",
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
+    pub right_ticks: i64,
+}
+
 /// Issue #825: what a heatmap counts — each profile's total, or each
 /// span's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]

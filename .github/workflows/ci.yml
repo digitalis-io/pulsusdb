@@ -1673,6 +1673,13 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-read --test profiles_series_cluster
 
+      # Issue #827: the diff over the distributed sample and series tables,
+      # one side's samples split across both shards, in one statement.
+      - name: Profile diff over the distributed tables (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test profileql_diff_cluster
+
       # Issue #825: the heatmap over the distributed entry and series
       # tables, the series split across both shards, in one statement.
       - name: Profile heatmap over the distributed tables (cluster)

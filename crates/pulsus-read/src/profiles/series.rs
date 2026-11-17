@@ -148,7 +148,7 @@ WHERE {tenant_term} AND day BETWEEN '{d0}' AND '{d1}'
             samples = config.samples_table,
             d0 = utc_date(read_start.saturating_sub(STACK_DAY_BEFORE_MS)),
             d1 = utc_date(end.saturating_add(STACK_DAY_AFTER_MS)),
-            call_site = call_site_predicate(req.call_site),
+            call_site = call_site_predicate("names", req.call_site),
         )
     };
     let v = if req.average {

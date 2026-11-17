@@ -8,7 +8,8 @@
 //! W1 (issue #821): the same for every `types_v1` and `querier_v1` message
 //! the query API uses, against `proto/types/v1/types.proto` and
 //! `proto/querier/v1/querier.proto`. Issue #823 adds the merge's messages,
-//! issue #824 the time series', issue #825 the heatmap's.
+//! issue #824 the time series', issue #827 the diff's, issue #825 the
+//! heatmap's.
 //!
 //! T1 (issue #817): the same for `ProfileAnnotation` and the `push_v1`
 //! messages, against `proto/types/v1/types.proto` and
@@ -21,10 +22,10 @@ use pulsus_profiles_wire::google_v1::{
 };
 use pulsus_profiles_wire::push_v1::{PushRequest, RawProfileSeries, RawSample};
 use pulsus_profiles_wire::querier_v1::{
-    FlameGraph, Level, ProfileFormat, ProfileTypesRequest, ProfileTypesResponse,
-    SelectHeatmapRequest, SelectHeatmapResponse, SelectMergeStacktracesRequest,
-    SelectMergeStacktracesResponse, SelectSeriesRequest, SelectSeriesResponse, SeriesRequest,
-    SeriesResponse,
+    DiffRequest, DiffResponse, FlameGraph, FlameGraphDiff, Level, ProfileFormat,
+    ProfileTypesRequest, ProfileTypesResponse, SelectHeatmapRequest, SelectHeatmapResponse,
+    SelectMergeStacktracesRequest, SelectMergeStacktracesResponse, SelectSeriesRequest,
+    SelectSeriesResponse, SeriesRequest, SeriesResponse,
 };
 use pulsus_profiles_wire::types_v1::{
     GoPgo, HeatmapSeries, HeatmapSlot, LabelNamesRequest, LabelNamesResponse, LabelPair,
@@ -510,6 +511,73 @@ fn every_merge_message_field_encodes_under_the_proto_tag() {
         SelectMergeStacktracesRequest::default()
             .encode_to_vec()
             .is_empty()
+    );
+}
+
+fn flame_graph_diff() -> FlameGraphDiff {
+    FlameGraphDiff {
+        names: strings(&["total", "main"]),
+        levels: vec![
+            level(&[0, 3, 0, 0, 5, 0, 0]),
+            level(&[0, 3, -1, 0, 5, 0, 1]),
+        ],
+        total: 8,
+        max_self: 5,
+        left_ticks: 3,
+        right_ticks: 5,
+    }
+}
+
+fn flame_graph_diff_bytes(f: &FlameGraphDiff) -> Vec<u8> {
+    let mut b = Vec::new();
+    encoding::string::encode_repeated(1, &f.names, &mut b);
+    for l in &f.levels {
+        nested(2, &level_bytes(l), &mut b);
+    }
+    encoding::int64::encode(3, &f.total, &mut b);
+    encoding::int64::encode(4, &f.max_self, &mut b);
+    encoding::int64::encode(5, &f.left_ticks, &mut b);
+    encoding::int64::encode(6, &f.right_ticks, &mut b);
+    b
+}
+
+/// W1 (issue #827): the diff's messages, every field set.
+#[test]
+fn every_diff_message_field_encodes_under_the_proto_tag() {
+    let f = flame_graph_diff();
+    assert_eq!(
+        f.encode_to_vec(),
+        flame_graph_diff_bytes(&f),
+        "FlameGraphDiff"
+    );
+
+    let m = DiffResponse {
+        flamegraph: Some(flame_graph_diff()),
+    };
+    let mut b = Vec::new();
+    nested(1, &flame_graph_diff_bytes(&flame_graph_diff()), &mut b);
+    assert_eq!(m.encode_to_vec(), b, "DiffResponse");
+
+    let side = |service: &str| SelectMergeStacktracesRequest {
+        profile_type_id: "process_cpu:cpu:nanoseconds:cpu:nanoseconds".to_string(),
+        label_selector: format!("{{service_name=\"{service}\"}}"),
+        start: 1000,
+        end: 2000,
+        max_nodes: Some(4),
+        ..SelectMergeStacktracesRequest::default()
+    };
+    let m = DiffRequest {
+        left: Some(side("a")),
+        right: Some(side("b")),
+    };
+    let mut b = Vec::new();
+    nested(1, &side("a").encode_to_vec(), &mut b);
+    nested(2, &side("b").encode_to_vec(), &mut b);
+    assert_eq!(m.encode_to_vec(), b, "DiffRequest");
+    assert_eq!(
+        DiffRequest::decode(&b[..]).map_err(|e| e.to_string()),
+        Ok(m),
+        "DiffRequest decode"
     );
 }
 
