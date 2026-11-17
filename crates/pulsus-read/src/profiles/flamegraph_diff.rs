@@ -1,10 +1,19 @@
 //! Issue #827: the diff of two merged trees, a port of the reference's
 //! `NewFlamegraphDiff` (`pkg/model/flamegraph_diff.go`), run on the rows S7
 //! returns (`super::diff`). Pure: no I/O.
+//!
+//! Each side is trimmed as the flame graph's tree is (steps 1 and 2 of
+//! `super::flamegraph`, #823's D11 included). The two trees are then
+//! aligned under virtual roots, cut once on the larger of each pair's
+//! totals, and walked into one graph. The reference's check for a negative
+//! self is not ported: ingest stores no value of 0 or below.
+
+use std::collections::HashMap;
 
 use super::diff::DiffRow;
 use super::engine::ProfilesReadError;
-use super::flamegraph::Tree;
+use super::flamegraph::{OTHER, Tree, merged_tree, truncated};
+use super::tree::TreeRow;
 
 /// A diff flame graph: the names, and per level the node pairs as
 /// `[left x offset delta, left total, left self, right x offset delta,
@@ -19,14 +28,168 @@ pub struct FlameGraphDiff {
     pub right_ticks: i64,
 }
 
-/// The diff of S7's rows with the resolved `max_nodes` `m`.
-pub fn flame_graph_diff(_rows: &[DiffRow], _m: i64) -> Result<FlameGraphDiff, ProfilesReadError> {
-    Ok(FlameGraphDiff::default())
+/// The diff of S7's rows with the resolved `max_nodes` `m`: steps 1 and 2
+/// on each side, then [`diff_of`].
+pub fn flame_graph_diff(rows: &[DiffRow], m: i64) -> Result<FlameGraphDiff, ProfilesReadError> {
+    let side = |total: fn(&DiffRow) -> (i64, i64)| -> Vec<TreeRow> {
+        rows.iter()
+            .filter(|r| total(r).0 > 0)
+            .map(|r| TreeRow {
+                node: r.node,
+                parent: r.parent,
+                name: r.name.clone(),
+                total: total(r).0,
+                self_value: total(r).1,
+            })
+            .collect()
+    };
+    let left = truncated(merged_tree(&side(|r| (r.left_total, r.left_self)), m)?, m);
+    let right = truncated(merged_tree(&side(|r| (r.right_total, r.right_self)), m)?, m);
+    Ok(diff_of(&left, &right, m))
 }
 
-/// The diff of two trimmed trees with `m`.
-pub fn diff_of(_left: &Tree, _right: &Tree, _m: i64) -> FlameGraphDiff {
-    FlameGraphDiff::default()
+/// One node of the two aligned trees: each side's total and self, 0 on a
+/// side that does not hold it.
+struct Pair {
+    name: String,
+    left: (i64, i64),
+    right: (i64, i64),
+    children: Vec<usize>,
+}
+
+/// Steps 3 to 6: the reference's `combineTree`, `combineMinValues` and
+/// `NewFlamegraphDiff` walk over two trimmed trees, with `m`.
+pub fn diff_of(left: &Tree, right: &Tree, m: i64) -> FlameGraphDiff {
+    // Step 3: the virtual roots, then the children aligned by name.
+    let ticks = |t: &Tree| t.roots.iter().map(|&r| t.nodes[r].total).sum::<i64>();
+    let (left_ticks, right_ticks) = (ticks(left), ticks(right));
+    let mut pairs = vec![Pair {
+        name: String::new(),
+        left: (left_ticks, 0),
+        right: (right_ticks, 0),
+        children: Vec::new(),
+    }];
+    // (the pair, its left node's children, its right node's children)
+    let mut stack: Vec<(usize, &[usize], &[usize])> = vec![(0, &left.roots, &right.roots)];
+    while let Some((at, l, r)) = stack.pop() {
+        let (mut i, mut j) = (0, 0);
+        while i < l.len() || j < r.len() {
+            let ln = l.get(i).map(|&x| &left.nodes[x]);
+            let rn = r.get(j).map(|&x| &right.nodes[x]);
+            let (ln, rn) = match (ln, rn) {
+                (Some(a), Some(b)) => match a.name.as_bytes().cmp(b.name.as_bytes()) {
+                    std::cmp::Ordering::Equal => (Some(a), Some(b)),
+                    std::cmp::Ordering::Less => (Some(a), None),
+                    std::cmp::Ordering::Greater => (None, Some(b)),
+                },
+                other => other,
+            };
+            i += usize::from(ln.is_some());
+            j += usize::from(rn.is_some());
+            let name = ln.or(rn).map(|n| n.name.clone()).unwrap_or_default();
+            let index = pairs.len();
+            pairs.push(Pair {
+                name,
+                left: ln.map(|n| (n.total, n.self_value)).unwrap_or((0, 0)),
+                right: rn.map(|n| (n.total, n.self_value)).unwrap_or((0, 0)),
+                children: Vec::new(),
+            });
+            pairs[at].children.push(index);
+            stack.push((
+                index,
+                ln.map(|n| n.children.as_slice()).unwrap_or(&[]),
+                rn.map(|n| n.children.as_slice()).unwrap_or(&[]),
+            ));
+        }
+    }
+
+    // Step 4: with more than `m` pairs, the `m`-th largest of each pair's
+    // larger total.
+    let min = if m < 1 || pairs.len() as i64 <= m {
+        0
+    } else {
+        let mut v: Vec<i64> = pairs.iter().map(|p| p.left.0.max(p.right.0)).collect();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        usize::try_from(m - 1)
+            .ok()
+            .and_then(|i| v.get(i).copied())
+            .unwrap_or(0)
+    };
+
+    // Step 5: the walk, last pushed first.
+    enum Item {
+        Pair(usize),
+        Other(i64, i64),
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut cache: HashMap<String, i64> = HashMap::new();
+    let mut levels: Vec<Vec<i64>> = Vec::new();
+    let mut max_self: i64 = 0;
+    let mut stack: Vec<(Item, i64, i64, usize)> = vec![(Item::Pair(0), 0, 0, 0)];
+    while let Some((item, mut xl, mut xr, level)) = stack.pop() {
+        let (name, (lt, ls), (rt, rs), children): (&str, _, _, &[usize]) = match item {
+            Item::Pair(i) => {
+                let p = &pairs[i];
+                (&p.name, p.left, p.right, &p.children)
+            }
+            Item::Other(l, r) => (OTHER, (l, l), (r, r), &[]),
+        };
+        if !(lt >= min || rt >= min || name == OTHER) {
+            continue;
+        }
+        let index = match cache.get(name) {
+            Some(&i) => i,
+            None => {
+                let i = names.len() as i64;
+                cache.insert(name.to_string(), i);
+                names.push(if i == 0 { "total" } else { name }.to_string());
+                i
+            }
+        };
+        if level == levels.len() {
+            levels.push(Vec::new());
+        }
+        max_self = max_self.max(ls).max(rs);
+        levels[level].extend([xl, lt, ls, xr, rt, rs, index]);
+        xl += ls;
+        xr += rs;
+        let (mut ol, mut or) = (0i64, 0i64);
+        for &c in children {
+            let child = &pairs[c];
+            if child.left.0 >= min || child.right.0 >= min {
+                stack.push((Item::Pair(c), xl, xr, level + 1));
+                xl += child.left.0;
+                xr += child.right.0;
+            } else {
+                ol += child.left.0;
+                or += child.right.0;
+            }
+        }
+        if ol != 0 || or != 0 {
+            stack.push((Item::Other(ol, or), xl, xr, level + 1));
+        }
+    }
+
+    // Step 6: each level's pairs reversed, both x offsets delta-encoded.
+    for l in &mut levels {
+        let chunks: Vec<&[i64]> = l.chunks(7).rev().collect();
+        *l = chunks.concat();
+        for start in [0, 3] {
+            let mut prev: i64 = 0;
+            for i in (start..l.len()).step_by(7) {
+                l[i] -= prev;
+                prev += l[i] + l[i + 1];
+            }
+        }
+    }
+    FlameGraphDiff {
+        names,
+        levels,
+        total: left_ticks + right_ticks,
+        max_self,
+        left_ticks,
+        right_ticks,
+    }
 }
 
 #[cfg(test)]

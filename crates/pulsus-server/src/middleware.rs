@@ -62,7 +62,8 @@ pub(crate) fn cors_layer(config: &Config) -> Result<CorsLayer, ServeError> {
 pub(crate) const DEADLINE_BARE_PATHS: &[&str] = &["/api/v1/write"];
 
 /// Issue #821: the profiles Connect paths, named one by one (#823 adds
-/// `SelectMergeStacktraces`'s two, #824 `SelectSeries`'s two). They
+/// `SelectMergeStacktraces`'s two, #824 `SelectSeries`'s two, #827
+/// `Diff`'s two). They
 /// answer a deadline with the reference's Connect error; another path under
 /// either service prefix keeps the class it had. Source-scanned by
 /// `tests/deadline_partition.rs` and compared with the route manifest.
@@ -79,6 +80,8 @@ pub(crate) const DEADLINE_CONNECT_PATHS: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces",
     "/querier.v1.QuerierService/SelectSeries",
     "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
+    "/querier.v1.QuerierService/Diff",
+    "/api/profiles/v1/querier.v1.QuerierService/Diff",
 ];
 
 /// Issue #821: the profiles `GET` routes, `{name}` one path segment (#823
@@ -565,7 +568,7 @@ mod tests {
         );
     }
 
-    /// Issue #821 review note 1: the class names the twelve Connect paths
+    /// Issue #821 review note 1: the class names the fourteen Connect paths
     /// exactly. Another method under either service prefix, and a deeper
     /// path under the values route, keep the class they had.
     #[test]

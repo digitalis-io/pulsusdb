@@ -79,6 +79,8 @@ pkg/distributor/validator.go
 pkg/engine/basic_engine.go
 pkg/engine/engine.go
 pkg/engine/handler.go
+pkg/frontend/readpath/queryfrontend/query_diff.go
+pkg/frontend/readpath/queryfrontend/query_select_merge_stacktraces.go
 pkg/frontend/readpath/queryfrontend/query_select_time_series.go
 pkg/iter/entry_iterator.go
 pkg/loghttp/params.go

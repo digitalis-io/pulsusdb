@@ -44,8 +44,11 @@ const MAIN_A: (u128, &str) = (1, "main,a");
 const MAIN_B: (u128, &str) = (2, "main,b");
 const MAIN_C: (u128, &str) = (3, "main,c");
 
+/// A node's left total, left self, right total and right self.
+type Sides = (i64, i64, i64, i64);
+
 /// `{path → (left total, left self, right total, right self)}`.
-type Paths = BTreeMap<String, (i64, i64, i64, i64)>;
+type Paths = BTreeMap<String, Sides>;
 
 fn should_run() -> bool {
     pulsus_testkit::live_clickhouse_enabled()
@@ -302,7 +305,7 @@ fn paths(rows: &[DiffRow]) -> Paths {
         .collect()
 }
 
-fn expected(rows: &[(&str, (i64, i64, i64, i64))]) -> Paths {
+fn expected(rows: &[(&str, Sides)]) -> Paths {
     rows.iter().map(|(p, v)| (p.to_string(), *v)).collect()
 }
 

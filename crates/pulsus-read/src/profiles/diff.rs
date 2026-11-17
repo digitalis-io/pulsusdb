@@ -10,8 +10,11 @@
 use pulsus_model::Tenant;
 use serde::{Deserialize, Serialize};
 
+use crate::logql::escape::ch_string;
+use crate::traces::tenant_scope::TenantTerm;
+
 use super::engine::{ProfilesReadConfig, ProfilesReadError};
-use super::tree::TreeRequest;
+use super::tree::{self, TreeRequest};
 
 /// A planned `Diff`: S7's text and the resolved `max_nodes` both sides and
 /// the diff use.
@@ -36,15 +39,117 @@ pub struct DiffRow {
 }
 
 /// Plans `left` against `right` for `tenant`: `Ok(None)` when both windows
-/// end before the lookback floor, so nothing is read.
+/// end before the lookback floor, so nothing is read. In the order: the
+/// larger `max_nodes` of the two, then the left side, then the right
+/// ([`tree::side`]). A side whose window ends before the floor has no
+/// branch, and its sums are 0.
 pub fn plan(
-    _tenant: &Tenant,
-    _config: &ProfilesReadConfig,
-    _left: &TreeRequest<'_>,
-    _right: &TreeRequest<'_>,
-    _now_ms: i64,
+    tenant: &Tenant,
+    config: &ProfilesReadConfig,
+    left: &TreeRequest<'_>,
+    right: &TreeRequest<'_>,
+    now_ms: i64,
 ) -> Result<Option<Planned>, ProfilesReadError> {
-    Err(ProfilesReadError::Internal("not built yet".to_string()))
+    let raw = left
+        .max_nodes
+        .unwrap_or(0)
+        .max(right.max_nodes.unwrap_or(0));
+    let max_nodes = tree::resolve_max_nodes(raw, config)?;
+    let sides = [
+        tree::side(tenant, config, left, now_ms)?,
+        tree::side(tenant, config, right, now_ms)?,
+    ];
+    if sides.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let tenant_term = TenantTerm::of(tenant);
+
+    let mut ranges: Vec<String> = Vec::new();
+    for side in sides.iter().flatten() {
+        let (d0, d1) = side.days();
+        let range = format!("day BETWEEN '{d0}' AND '{d1}'");
+        if !ranges.contains(&range) {
+            ranges.push(range);
+        }
+    }
+    let days = if ranges.len() == 1 {
+        ranges.remove(0)
+    } else {
+        format!("({})", ranges.join(" OR "))
+    };
+
+    // A present side's call site, tested on the joined stack's frames.
+    let call_sites: Vec<Option<String>> = [left.call_site, right.call_site]
+        .iter()
+        .zip(&sides)
+        .map(|(names, side)| {
+            (side.is_some() && !names.is_empty())
+                .then(|| tree::call_site_predicate("any(st.names)", names))
+        })
+        .collect();
+    let sum = |k: usize, column: &str| match &call_sites[k] {
+        Some(cs) => format!("if({cs}, any(agg.{column}), 0)"),
+        None => format!("any(agg.{column})"),
+    };
+    let (vl, vr) = (sum(0, "vl"), sum(1, "vr"));
+    let having = if call_sites.iter().any(Option::is_some) {
+        "\n  HAVING vl > 0 OR vr > 0"
+    } else {
+        ""
+    };
+
+    let branches: Vec<String> = sides
+        .iter()
+        .enumerate()
+        .filter_map(|(k, side)| side.as_ref().map(|s| (k, s)))
+        .map(|(k, side)| {
+            format!(
+                "      SELECT {k} AS side, stack_id, sum(value) AS v
+      FROM {samples}
+      WHERE {tenant_term} AND type_id = {type_id}{service_terms}
+      AND fingerprint IN ({series})
+      AND timestamp_ns >= {start_ns} AND timestamp_ns <= {end_ns}{filters}
+      GROUP BY stack_id",
+                samples = config.samples_table,
+                type_id = ch_string(side.type_id()),
+                service_terms = crate::metrics::profile_service_terms(&side.matchers),
+                series = side.series,
+                start_ns = side.window.start_ms.saturating_mul(1_000_000),
+                end_ns = side.window.end_ms.saturating_mul(1_000_000),
+                filters = side.filters,
+            )
+        })
+        .collect();
+    let sql = format!(
+        "SELECT node_ids[i] AS node,
+       any(if(i = 1, toUInt128(0), node_ids[i - 1])) AS parent,
+       any(names[i]) AS name,
+       sum(vl) AS left_total,
+       sumIf(vl, i = length(node_ids)) AS left_self,
+       sum(vr) AS right_total,
+       sumIf(vr, i = length(node_ids)) AS right_self
+FROM (
+  SELECT st.stack_id AS stack_id, any(st.node_ids) AS node_ids, any(st.names) AS names,
+         {vl} AS vl, {vr} AS vr
+  FROM (
+    SELECT stack_id, node_ids, names
+    FROM profile_stacks
+    WHERE {tenant_term} AND {days}
+  ) AS st
+  INNER JOIN (
+    SELECT stack_id, sumIf(v, side = 0) AS vl, sumIf(v, side = 1) AS vr
+    FROM (
+{branches}
+    )
+    GROUP BY stack_id
+  ) AS agg ON st.stack_id = agg.stack_id
+  GROUP BY st.stack_id{having}
+)
+ARRAY JOIN arrayEnumerate(node_ids) AS i
+GROUP BY node",
+        branches = branches.join("\n      UNION ALL\n"),
+    );
+    Ok(Some(Planned { sql, max_nodes }))
 }
 
 #[cfg(test)]

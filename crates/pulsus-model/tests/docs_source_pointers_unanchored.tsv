@@ -1059,6 +1059,8 @@ docs/reference-defects-we-do-not-copy.md	metrics_to_prw.go:218-233	not_in_this_r
 docs/reference-defects-we-do-not-copy.md	metrics_to_prw.go:235-239	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	modules/livestore/instance_search.go:257-259	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	parser.go:521	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/frontend/readpath/queryfrontend/query_diff.go:65-67	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/frontend/readpath/queryfrontend/query_select_merge_stacktraces.go:39-42	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/frontend/readpath/queryfrontend/query_select_time_series.go:78-83	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/loghttp/params.go:38-46	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/logql/engine.go:452-469	not_in_this_repository

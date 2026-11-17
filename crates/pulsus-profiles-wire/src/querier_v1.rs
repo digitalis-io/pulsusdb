@@ -342,64 +342,73 @@ pub struct SelectSeriesResponse {
     pub series: Vec<crate::types_v1::Series>,
 }
 
-/// A message with no wire or JSON form yet: it encodes nothing and skips
-/// every field it is sent.
-macro_rules! unbuilt_message {
-    ($t:ty) => {
-        impl ::prost::Message for $t {
-            fn encode_raw(&self, _buf: &mut impl ::prost::bytes::BufMut) {}
-            fn merge_field(
-                &mut self,
-                tag: u32,
-                wire_type: ::prost::encoding::WireType,
-                buf: &mut impl ::prost::bytes::Buf,
-                ctx: ::prost::encoding::DecodeContext,
-            ) -> Result<(), ::prost::DecodeError> {
-                ::prost::encoding::skip_field(wire_type, tag, buf, ctx)
-            }
-            fn encoded_len(&self) -> usize {
-                0
-            }
-            fn clear(&mut self) {}
-        }
-    };
-}
-
-/// `Diff`'s request (issue #827).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// `Diff`'s request (issue #827): the two selections. Each side's
+/// `format` is ignored.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiffRequest {
-    #[serde(skip)]
+    #[prost(message, optional, tag = "1")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub left: Option<SelectMergeStacktracesRequest>,
-    #[serde(skip)]
+    #[prost(message, optional, tag = "2")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub right: Option<SelectMergeStacktracesRequest>,
 }
-unbuilt_message!(DiffRequest);
 
-/// `Diff`'s response (issue #827).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// `Diff`'s response (issue #827): the diff flame graph, field 1.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiffResponse {
-    #[serde(skip)]
+    #[prost(message, optional, tag = "1")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub flamegraph: Option<FlameGraphDiff>,
 }
-unbuilt_message!(DiffResponse);
 
-/// A diff flame graph (issue #827).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// A diff flame graph (issue #827): the names, and per level the node pairs
+/// as `[left x offset, left total, left self, right x offset, right total,
+/// right self, name index]`, both x offsets delta-encoded; each side's
+/// ticks.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FlameGraphDiff {
-    #[serde(skip)]
+    #[prost(string, repeated, tag = "1")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<String>,
-    #[serde(skip)]
+    #[prost(message, repeated, tag = "2")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub levels: Vec<Level>,
-    #[serde(skip)]
+    #[prost(int64, tag = "3")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub total: i64,
-    #[serde(skip)]
+    #[prost(int64, tag = "4")]
+    #[serde(
+        rename = "maxSelf",
+        alias = "max_self",
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub max_self: i64,
-    #[serde(skip)]
+    #[prost(int64, tag = "5")]
+    #[serde(
+        rename = "leftTicks",
+        alias = "left_ticks",
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub left_ticks: i64,
-    #[serde(skip)]
+    #[prost(int64, tag = "6")]
+    #[serde(
+        rename = "rightTicks",
+        alias = "right_ticks",
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub right_ticks: i64,
 }
-unbuilt_message!(FlameGraphDiff);

@@ -682,10 +682,7 @@ async fn the_diff_answers_both_sides_in_one_statement() {
         assert_eq!(sent[id], *want, "{ctx}: statements for {id}");
     }
     // R1: the statement keeps the join's build side on the aggregated
-    // samples.
-    assert_eq!(
-        swap_setting(&client, &r1_id).await,
-        ["false"],
-        "R1 settings"
-    );
+    // samples. `query_log` prints the boolean as `0`; a statement without
+    // the setting prints an empty value.
+    assert_eq!(swap_setting(&client, &r1_id).await, ["0"], "R1 settings");
 }

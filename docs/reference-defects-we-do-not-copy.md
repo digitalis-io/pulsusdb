@@ -95,6 +95,7 @@ replaces one.
 | [40](#40--over-a-condition-the-store-can-filter-answers-nothing-on-search-and-is-ignored-on-metrics) | trace reference | queries | A, D | `{ !(status = error) }` answers no span on search and the error spans' count on metrics. |
 | [41](#41-a-function-named-other-that-survives-the-flame-graph-cut-loses-its-cut-siblings-values) | profiles reference | queries | C, D | A flame graph whose function named `other` survives the cut reports a total below the samples' sum. |
 | [42](#42-the-time-series-ignores-aggregation-and-the-call-site) | profiles reference | queries | A, C | A time series asked for the average answers the sum, and one asked for a call site answers every stack's total. |
+| [43](#43-a-diff-answers-every-failure-of-either-side-as-an-invalid-argument) | profiles reference | queries | A | A diff that reaches a resource limit is told its request is invalid, where the same selection on its own is told the limit was reached. |
 
 ---
 
@@ -2324,7 +2325,8 @@ to 16.
 ### What PulsusDB does
 
 The kept node named `other` takes the stub's sum: its self and its total each grow by it. The example
-answers 16, with `other` 6 (`docs/api.md` §5).
+answers 16, with `other` 6 (`docs/api.md` §5). The diff (issue #827) trims each side the same way, so its
+side ticks and `total` are the samples' sums.
 
 ### Evidence
 
@@ -2365,6 +2367,36 @@ restricts each profile's total to the samples on its stacks before the step's va
 Ledger rows `series-average-is-the-mean` and `series-call-site-filters-the-totals` (the profiles
 differential's ledger, issue #822). Pinned by cases L2 and L3 of
 `the_time_series_answers_its_tenants_totals` in `crates/pulsus-read/tests/profiles_series_live.rs`.
+
+---
+
+## 43. A diff answers every failure of either side as an invalid argument
+
+**The profiles reference · queries · test A**
+
+### What the reference does
+
+`Diff` reads its two sides with the function `SelectMergeStacktraces` uses for its tree, and answers any
+error either side returns as `invalid_argument`
+(`pkg/frontend/readpath/queryfrontend/query_diff.go:65-67`). `SelectMergeStacktraces` returns the same
+function's error with its own code
+(`pkg/frontend/readpath/queryfrontend/query_select_merge_stacktraces.go:39-42`).
+
+### Why that is wrong rather than different
+
+One selection that fails one way answers two codes on two routes of the same product (**A**). A client
+told `invalid_argument` treats the request as one to fix, not one that was too large or met a failure.
+
+### What PulsusDB does
+
+A failed statement keeps its own code on `Diff` as on every profiles route: a ceiling reached by either
+side is `resource_exhausted` (`429`), `query_too_broad: <setting>` (`docs/api.md` §5).
+
+### Evidence
+
+Ledger row `diff-side-failure-keeps-its-code` (the profiles differential's ledger, issue #822). Pinned by
+case V7 of `the_diff_answers_both_sides_in_one_statement` in
+`crates/pulsus-read/tests/profileql_diff_live.rs`.
 
 ---
 
