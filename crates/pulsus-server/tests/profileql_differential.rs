@@ -9,7 +9,9 @@
 //! ledger case pins both answers, and fails when the two agree.
 //!
 //! Gated behind `PULSUSDB_PROFILEQL_DIFF_URL` (the reference) and
-//! `PULSUS_TEST_CLICKHOUSE=1`:
+//! `PULSUS_TEST_CLICKHOUSE=1`. The live test skips only when both are unset
+//! outside a live CI job; either one set without the other fails it, and in
+//! a live CI job either one missing fails it:
 //!
 //! ```text
 //! PULSUSDB_PROFILEQL_DIFF_URL=http://localhost:<port> \
@@ -1398,6 +1400,16 @@ fn landing_sets(t1: bool) -> BTreeSet<LabelSet> {
     out
 }
 
+/// Checks one server's answer to a fixture case, `None` when it holds.
+/// Every fixture case is a success: an error status fails here, whatever
+/// its body decodes as.
+fn fixture_failure(fixture: Fixture, case: &Case, t1: bool, res: &Res) -> Option<String> {
+    if res.status != 200 {
+        return Some(format!("status {}, want 200", res.status));
+    }
+    check_fixture(fixture, case, t1, &res.body)
+}
+
 /// Checks a decoded answer against `fixture`, `None` when it holds.
 fn check_fixture(fixture: Fixture, case: &Case, t1: bool, body: &[u8]) -> Option<String> {
     let method = &case.request.method;
@@ -1781,32 +1793,57 @@ async fn send_push(server: &Server, push: &Push, tenant: &str, key: &str) -> Res
             h.push(("Idempotency-Key", key));
             call(server, "POST", path, &h, body)
         }
-        Transport::Grpc(message) => {
-            let channel = tonic::transport::Endpoint::from_shared(server.base())
-                .expect("an endpoint")
-                .connect_lazy();
-            let mut client = ProfilesServiceClient::new(channel);
-            let mut request = tonic::Request::new(message.clone());
-            let md = request.metadata_mut();
-            md.insert("x-scope-orgid", tenant.parse().expect("ASCII metadata"));
-            md.insert("idempotency-key", key.parse().expect("ASCII metadata"));
-            md.insert(
-                "otlp-profiles-development-version",
-                "1".parse().expect("ASCII metadata"),
-            );
-            match client.export(request).await {
-                Ok(answer) => Res {
-                    status: 0,
-                    content_type: Some("grpc ok".to_string()),
-                    body: answer.into_inner().encode_to_vec(),
-                },
-                Err(status) => Res {
-                    status: status.code() as u16,
-                    content_type: Some("grpc error".to_string()),
-                    body: status.message().as_bytes().to_vec(),
-                },
-            }
+        Transport::Grpc(message) => grpc_export(server, message, tenant, key, GRPC_DEADLINE).await,
+    }
+}
+
+/// The [`Res`] content type of a gRPC push the deadline cut off.
+const GRPC_NO_ANSWER: &str = "grpc no answer";
+
+/// How long a gRPC push may take before it fails.
+const GRPC_DEADLINE: Duration = Duration::from_secs(30);
+
+/// One OTLP gRPC export to `server`, as an HTTP-like [`Res`].
+async fn grpc_export(
+    server: &Server,
+    message: &ExportProfilesServiceRequest,
+    tenant: &str,
+    key: &str,
+    deadline: Duration,
+) -> Res {
+    let export = async {
+        let channel = tonic::transport::Endpoint::from_shared(server.base())
+            .expect("an endpoint")
+            .connect_lazy();
+        let mut client = ProfilesServiceClient::new(channel);
+        let mut request = tonic::Request::new(message.clone());
+        let md = request.metadata_mut();
+        md.insert("x-scope-orgid", tenant.parse().expect("ASCII metadata"));
+        md.insert("idempotency-key", key.parse().expect("ASCII metadata"));
+        md.insert(
+            "otlp-profiles-development-version",
+            "1".parse().expect("ASCII metadata"),
+        );
+        match client.export(request).await {
+            Ok(answer) => Res {
+                status: 0,
+                content_type: Some("grpc ok".to_string()),
+                body: answer.into_inner().encode_to_vec(),
+            },
+            Err(status) => Res {
+                status: status.code() as u16,
+                content_type: Some("grpc error".to_string()),
+                body: status.message().as_bytes().to_vec(),
+            },
         }
+    };
+    match tokio::time::timeout(deadline, export).await {
+        Ok(res) => res,
+        Err(_) => Res {
+            status: tonic::Code::DeadlineExceeded as u16,
+            content_type: Some(GRPC_NO_ANSWER.to_string()),
+            body: format!("{}: no answer within {deadline:?}", server.name).into_bytes(),
+        },
     }
 }
 
@@ -1931,14 +1968,29 @@ fn assert_reference_identity(reference: &Server, tenant: &str) {
 /// values and isolation; every difference is reported at once.
 #[tokio::test(flavor = "multi_thread")]
 async fn profileql_matches_the_reference() {
-    let Some(url) = pulsus_testkit::live_endpoint("PULSUSDB_PROFILEQL_DIFF_URL") else {
-        eprintln!("skipping: set PULSUSDB_PROFILEQL_DIFF_URL (see module docs)");
-        return;
+    // It skips only when both gates are unset outside a live CI job. In a
+    // live CI job either gate missing panics (`pulsus_testkit`); anywhere,
+    // one gate set without the other panics.
+    let url = pulsus_testkit::live_endpoint("PULSUSDB_PROFILEQL_DIFF_URL");
+    let database = pulsus_testkit::live_clickhouse_enabled();
+    let url = match (url, database) {
+        (Some(url), true) => url,
+        (None, false) => {
+            eprintln!(
+                "skipping: neither PULSUSDB_PROFILEQL_DIFF_URL nor PULSUS_TEST_CLICKHOUSE=1 \
+                 is set (see module docs)"
+            );
+            return;
+        }
+        (None, true) => panic!(
+            "PULSUSDB_PROFILEQL_DIFF_URL is not set, but PULSUS_TEST_CLICKHOUSE=1 is: \
+             the differential needs the reference's address as well as the database"
+        ),
+        (Some(_), false) => panic!(
+            "PULSUS_TEST_CLICKHOUSE is not set, but PULSUSDB_PROFILEQL_DIFF_URL is: \
+             the differential needs the database as well as the reference"
+        ),
     };
-    if !pulsus_testkit::live_clickhouse_enabled() {
-        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
-        return;
-    }
     let reference = parse_url("reference", &url);
     let run = run_id();
     let t1 = format!("t1-{run}");
@@ -1976,7 +2028,10 @@ async fn profileql_matches_the_reference() {
                     (method, compare_push(*answer, &a, &b))
                 }
                 Transport::Grpc(_) => {
-                    let why = if a.status != b.status {
+                    let silent = |r: &Res| r.content_type.as_deref() == Some(GRPC_NO_ANSWER);
+                    let why = if silent(&a) || silent(&b) {
+                        Some("no answer within the gRPC deadline")
+                    } else if a.status != b.status {
                         Some("gRPC outcome differs")
                     } else if a.status == 0 && a.body != b.body {
                         Some("decoded responses differ")
@@ -2065,7 +2120,7 @@ async fn profileql_matches_the_reference() {
                         mismatches.both(&what, why, &a, &b, method, enc);
                     }
                     for (res, server) in [(&a, &ours), (&b, &reference)] {
-                        if let Some(why) = check_fixture(fixture, case, is_t1, &res.body) {
+                        if let Some(why) = fixture_failure(fixture, case, is_t1, res) {
                             mismatches.one(
                                 &what,
                                 &format!("{}: not what the fixture says: {why}", server.name),
@@ -2163,5 +2218,108 @@ async fn profileql_matches_the_reference() {
         "{} difference(s) from the reference or the fixture:\n\n{}",
         mismatches.0.len(),
         mismatches.0.join("\n\n")
+    );
+}
+
+// ---------------------------------------------------------------------
+// Review round 1: the success status, the gRPC deadline, the skip
+// ---------------------------------------------------------------------
+
+/// A fixture case answered by an error status fails its fixture check,
+/// even when the error body decodes as the expected answer (C1's empty
+/// body does).
+#[test]
+fn a_fixture_case_needs_its_success_status() {
+    let c1 = CASES.iter().find(|c| c.id == "C1").expect("C1");
+    let Expect::Parity(fixture) = c1.expect else {
+        panic!("C1 is a parity case");
+    };
+    let error = Res {
+        status: 500,
+        content_type: None,
+        body: Vec::new(),
+    };
+    assert!(
+        fixture_failure(fixture, c1, true, &error).is_some(),
+        "a 500 with an empty body passed C1's fixture check"
+    );
+    let ok = Res {
+        status: 200,
+        content_type: Some("application/proto".to_string()),
+        body: Vec::new(),
+    };
+    assert_eq!(fixture_failure(fixture, c1, true, &ok), None);
+}
+
+/// A gRPC push to a server that accepts the connection and never answers
+/// fails within its deadline instead of holding the suite.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grpc_push_that_never_answers_fails_within_its_deadline() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind a silent listener");
+    let addr = listener.local_addr().expect("its address");
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for conn in listener.incoming() {
+            held.push(conn);
+        }
+    });
+    let silent = Server {
+        name: "silent",
+        host: "127.0.0.1".to_string(),
+        port: addr.port(),
+    };
+    let message = otlp_profile(1_000_000_000, 1, &[("service.name", "s")]);
+    let answer = tokio::time::timeout(
+        Duration::from_secs(10),
+        grpc_export(&silent, &message, "t", "k", Duration::from_secs(1)),
+    )
+    .await;
+    let res = answer.expect("the push held for 10 s against a 1 s deadline");
+    assert_eq!(
+        res.content_type.as_deref(),
+        Some(GRPC_NO_ANSWER),
+        "a push that was never answered reported {res:?}"
+    );
+}
+
+/// Runs L1 in a child process with `set` and every other gate removed, and
+/// returns whether it succeeded and its stderr.
+fn run_l1_with(set: &[(&str, &str)]) -> (bool, String) {
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut command = Command::new(exe);
+    command
+        .args(["profileql_matches_the_reference", "--exact", "--nocapture"])
+        .env_remove("GITHUB_JOB")
+        .env_remove("PULSUS_TEST_CLICKHOUSE")
+        .env_remove("PULSUSDB_PROFILEQL_DIFF_URL");
+    for (k, v) in set {
+        command.env(k, v);
+    }
+    let output = command.output().expect("spawn the child test process");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// L1 skips only with both gates unset outside a live CI job. With the
+/// database gate set and no reference address, or the address set and no
+/// database gate, it fails.
+#[test]
+fn one_gate_without_the_other_fails_the_run() {
+    let (ok, stderr) = run_l1_with(&[("PULSUS_TEST_CLICKHOUSE", "1")]);
+    assert!(
+        !ok && stderr.contains("PULSUSDB_PROFILEQL_DIFF_URL is not set"),
+        "a set database with no reference address did not fail\n--- stderr ---\n{stderr}"
+    );
+    let (ok, stderr) = run_l1_with(&[("PULSUSDB_PROFILEQL_DIFF_URL", "http://127.0.0.1:9")]);
+    assert!(
+        !ok && stderr.contains("PULSUS_TEST_CLICKHOUSE is not set"),
+        "a reference address with no database did not fail\n--- stderr ---\n{stderr}"
+    );
+    let (ok, stderr) = run_l1_with(&[]);
+    assert!(
+        ok,
+        "with both gates unset outside CI, L1 must skip\n{stderr}"
     );
 }
