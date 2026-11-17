@@ -188,8 +188,9 @@ that is not a row here fails the suite.
 
 - **Route:** `Diff`.
 - **Request:** one side fails, a ceiling included.
-- **PulsusDB:** the side's own code: a ceiling is `429 resource_exhausted`,
-  `query_too_broad`.
-- **Reference:** `400 invalid_argument` for any failure.
-- **Why:** defects entry 47, which lands with #827 part A.
+- **PulsusDB:** the side's own code, as on every profiles route: a ceiling
+  reached by either side is `429 resource_exhausted`,
+  `query_too_broad: <setting>`.
+- **Reference:** `400 invalid_argument` for any failure of either side.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 47.
 - **Case:** #827 part B.
