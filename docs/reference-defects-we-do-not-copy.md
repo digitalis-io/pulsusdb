@@ -39,6 +39,7 @@ records it. File and line numbers are from these trees.
 | Grafana Loki (end-to-end oracle) | 3.4.2 | `4fa045d3807f4de0543b06e6ce79b89afb741adc` | `deploy/e2e/compose.single.yaml`, image `grafana/loki:3.4.2@sha256:58a6c186ce78ba04d58bfe2a927eff296ba733a430df09645d56cdc158f3ba08` |
 | Grafana Tempo | v3.0.2 | `0c4b926d09234186de39833e9c7ecb5b7614c8b9` | `deploy/e2e/compose.single.yaml`, image `grafana/tempo:3.0.2@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3` |
 | Prometheus | v3.13.0 | `40af9c2cdc0eda00f3622e867a27f6359f7295f3` | `deploy/e2e/compose.single.yaml`, image `prom/prometheus:v3.13.0` |
+| profiles reference | v2.4.3 | `860ef8d7093f9b6c824a7528010b15d782645e4f` | `.github/workflows/ci.yml`, image `grafana/pyroscope@sha256:bf667534cd403320573063894e3faba20a5a5d1bfb92eddaecfabeb2446c502b` |
 
 Where a line number below sits in a `vendor/` path, it is a library the
 reference ships inside its own binary, so it is the reference's behaviour

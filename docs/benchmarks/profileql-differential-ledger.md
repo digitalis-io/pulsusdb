@@ -1,0 +1,195 @@
+# Profiles differential ledger
+
+The profiles differential (issue #822) sends one fixture through every
+profiles receiver of PulsusDB and of the pinned profiles reference, under two
+tenants, and compares the answers to the requests the datasource and the
+exploration app send. The suite is
+`crates/pulsus-server/tests/profileql_differential.rs`.
+
+Each row below is one recorded difference: a route and a request on which
+PulsusDB answers differently from the reference on purpose. A difference
+that is not a row here fails the suite.
+
+- **Rows are never deleted.** A row the reference stops differing on is
+  marked retired, with the date and the reason, and keeps its heading.
+- **A row is added by decision, not by the suite's author.** A new
+  difference is reported with both answers; fixing PulsusDB or recording
+  the difference is decided outside the change that found it, and a
+  recorded difference is the owner's decision.
+- **Case** names the suite's case that pins both answers, the issue whose
+  part adds one, or `none` with the reason. A pinned case fails when the
+  two answers agree, because then the reference has changed and the row is
+  to be retired.
+
+### `tenancy-absent-header-is-the-empty-tenant`
+
+- **Route:** any profiles route.
+- **Request:** no `X-Scope-OrgID` header.
+- **PulsusDB:** the request is served as the empty tenant: `ProfileTypes`
+  answers `200` with an empty body.
+- **Reference:** `401`.
+- **Why:** owner decision, Q13 answer; high-level design §2.1.
+- **Case:** `C0` in `crates/pulsus-server/tests/profileql_differential.rs`.
+
+### `tenancy-header-bytes-refused`
+
+- **Route:** any profiles route.
+- **Request:** `X-Scope-OrgID: a|b`, or a tenant holding any of `!*'()`.
+- **PulsusDB:** `400`.
+- **Reference:** reads both tenants of `a|b`, and accepts those bytes in a
+  tenant.
+- **Why:** owner decision, Q12 answer.
+- **Case:** `none`.
+
+### `catalogue-exact-window`
+
+- **Route:** the four catalogue methods: profile types, label names, label
+  values and series.
+- **Request:** a window excluding a profile that shares a storage block with
+  one inside it.
+- **PulsusDB:** the profile outside the window is not listed.
+- **Reference:** it is listed.
+- **Why:** R7; high-level design §12.
+- **Case:** `none`: it needs control of the reference's blocks.
+
+### `selector-parse-error-text`
+
+- **Route:** label names, label values, series.
+- **Request:** an invalid label selector.
+- **PulsusDB:** `400 invalid_argument`, with our selector parser's text.
+- **Reference:** `400`, with its own parser's text.
+- **Why:** #820 plan §2.
+- **Case:** `none`.
+
+### `otlp-unconvertible-is-400`
+
+- **Route:** `/v1development/profiles`.
+- **Request:** a profile that cannot be converted, or a request with no
+  dictionary.
+- **PulsusDB:** `400`, a `google.rpc.Status` body.
+- **Reference:** `500`, a plain-text body.
+- **Why:** owner, 2026-11-16, "400, a recorded difference" (#815).
+- **Case:** `none`.
+
+### `relative-time-adds-every-pair`
+
+- **Route:** a route that parses relative times.
+- **Request:** `from=now-1h30m`.
+- **PulsusDB:** 90 minutes ago.
+- **Reference:** 1 hour ago.
+- **Why:** owner, 2026-11-16, "Parse correctly" (#821).
+- **Case:** P17 (the render routes).
+
+### `flamegraph-named-other-keeps-cut-values`
+
+- **Route:** the merged flame graph.
+- **Request:** a node limit that cuts a parent's small children while a kept
+  child is named `other`; for example the rows `main→a` 10, `main→b` 1 and
+  `main→other` 5 with a limit of 3.
+- **PulsusDB:** the kept `other` takes the cut children's sum: total 16,
+  `other` 6.
+- **Reference:** the cut children's sum is lost: total 15.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 41.
+- **Case:** #823 part B.
+
+### `series-average-is-the-mean`
+
+- **Route:** `SelectSeries`.
+- **Request:** `aggregation` `TIME_SERIES_AGGREGATION_TYPE_AVERAGE`.
+- **PulsusDB:** each step's value is the mean of the step's profile totals.
+- **Reference:** the sum, whatever the aggregation asked for.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 42.
+- **Case:** #824 part B.
+
+### `series-call-site-filters-the-totals`
+
+- **Route:** `SelectSeries`.
+- **Request:** a `stack_trace_selector` with a call site.
+- **PulsusDB:** each profile's total counts only the samples on stacks
+  beginning with the call site.
+- **Reference:** the selector is dropped: every stack's total.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 42.
+- **Case:** #824 part B.
+
+### `ingest-folded-long-line-is-read`
+
+- **Route:** `/ingest`, folded format.
+- **Request:** a body with a line of 64 KiB or more.
+- **PulsusDB:** every line is stored, however long.
+- **Reference:** the lines before the long one are stored, the long line and
+  every line after it are dropped, and the push answers `200`.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 43.
+- **Case:** #823 part B.
+
+### `ingest-profile-id-push-is-stored`
+
+- **Route:** `/ingest`, folded, lines, trie, tree or speedscope format.
+- **Request:** a `name` whose labels hold a non-empty `profile_id`.
+- **PulsusDB:** the profile is stored, and `profile_id` is a series label.
+- **Reference:** nothing is stored, and the push answers `200`.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 44.
+- **Case:** #823 part B.
+
+### `ingest-speedscope-values-computed-before-truncation`
+
+- **Route:** `/ingest`, speedscope format.
+- **Request:** fractional weights, open and close gaps, or the
+  `nanoseconds` unit; for example `O a@0, O b@3, C b@5, C a@6` in unit
+  `none`.
+- **PulsusDB:** a value is multiplied before it is truncated, both gaps take
+  the multiplier, and a nanosecond is stored as one: `a` 40,000,000 and `b`
+  20,000,000 in the example.
+- **Reference:** a weight of `0.5` stores 0, the example stores `a` as
+  10,300,000, and a `nanoseconds` file stores nothing and answers `200`.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 45.
+- **Case:** #823 part B.
+
+### `ingest-tree-same-name-siblings-sum`
+
+- **Route:** `/ingest`, tree format.
+- **Request:** two sibling nodes of one name under one parent.
+- **PulsusDB:** their values sum.
+- **Reference:** the later sibling's value replaces the earlier one's.
+- **Why:** `docs/reference-defects-we-do-not-copy.md` entry 46.
+- **Case:** #823 part B.
+
+### `ingest-speedscope-error-text`
+
+- **Route:** `/ingest`, speedscope format.
+- **Request:** a malformed speedscope body.
+- **PulsusDB:** our JSON reader's text.
+- **Reference:** its JSON reader's text.
+- **Why:** #818 plan §8.
+- **Case:** #823 part B.
+
+### `otlp-multiple-values-are-summed`
+
+- **Route:** `/v1development/profiles`.
+- **Request:** a sample with several `values`, for example `[2,2,3,3]`.
+- **PulsusDB:** each value is one observation, so the sample's value is
+  their sum, `10`, for every sample type.
+- **Reference:** keeps one value (`2`) or refuses the profile, summing only
+  for off-CPU profiles.
+- **Why:** R3; high-level design §6, the mapping.
+- **Case:** #823 part B.
+
+### `otlp-json-link-ids-are-hex`
+
+- **Route:** `/v1development/profiles`, OTLP/JSON.
+- **Request:** a sample with a link.
+- **PulsusDB:** span and trace ids are read as hex, as every OTLP/JSON
+  route reads them (`docs/api.md` §1.1).
+- **Reference:** read as base64 under the generic JSON mapping, so other
+  ids are stored.
+- **Why:** high-level design §6, last paragraph.
+- **Case:** #823 part B (the span selector).
+
+### `diff-side-failure-keeps-its-code`
+
+- **Route:** `Diff`.
+- **Request:** one side fails, a ceiling included.
+- **PulsusDB:** the side's own code: a ceiling is `429 resource_exhausted`,
+  `query_too_broad`.
+- **Reference:** `400 invalid_argument` for any failure.
+- **Why:** defects entry 47, which lands with #827 part A.
+- **Case:** #827 part B.
