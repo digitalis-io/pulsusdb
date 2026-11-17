@@ -2340,6 +2340,18 @@ fn assert_otlp_grpc_route(port: u16, spec: &RouteSpec, spawn: &str) {
     assert_eq!(res.header("grpc-status"), Some("3"), "{ctx}: grpc-status");
 }
 
+/// The authentication refusal: the pinned `401` everywhere except the gRPC
+/// export paths, which answer `UNAUTHENTICATED` as a gRPC server does
+/// (issue #816).
+fn assert_auth_refusal(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
+    if spec.surface == Surface::OtlpGrpc {
+        assert_eq!(res.status, 200, "{ctx}: status");
+        assert_eq!(res.header("grpc-status"), Some("16"), "{ctx}: grpc-status");
+    } else {
+        assert_401_unauthorized(res, ctx);
+    }
+}
+
 /// The three `Surface::Ingest` routes' full matrix: `X-Pulsus-Async` ∈
 /// {absent, `0`, `1`} against the documented exact sync/async status per
 /// route (plan v2 finding 2, restored/pinned), the per-outcome envelope
@@ -2819,7 +2831,7 @@ async fn all_mode_auth_on_perimeter() {
             assert_success_envelope(spec, &res, &ctx);
             continue;
         }
-        assert_401_unauthorized(&res, &ctx);
+        assert_auth_refusal(spec, &res, &ctx);
 
         let ctx = format!(
             "[{spawn}] {} {} case=auth creds=wrong",
@@ -2827,7 +2839,7 @@ async fn all_mode_auth_on_perimeter() {
         );
         req.headers.push(("authorization", invalid.clone()));
         let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
-        assert_401_unauthorized(&res, &ctx);
+        assert_auth_refusal(spec, &res, &ctx);
 
         let ctx = format!(
             "[{spawn}] {} {} case=auth creds=valid",
