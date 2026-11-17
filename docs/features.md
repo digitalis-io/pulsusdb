@@ -24,7 +24,7 @@ M1 and M2 are deliberately **narrow proof milestones**: the project exists becau
 | OTLP traces | `POST /v1/traces` | protobuf | M4 |
 | OTLP profiles | `POST /v1development/profiles` | protobuf (experimental OTLP signal) | M5 |
 | Prometheus remote write | `POST /api/v1/write` | snappy protobuf (`prompb.WriteRequest`) — supports the collector's `prometheusremotewrite` exporter | M2 |
-| Profile ingest (native) | `POST /api/profiles/v1/ingest` | pprof | M5 |
+| Profile ingest (native) | `POST /api/profiles/v1/ingest` | pprof; folded stacks, lines, trie, tree and speedscope | M5 |
 | OTLP/JSON encoding | all OTLP endpoints | JSON per OTLP/HTTP spec | M6 |
 
 ### 1.2 Compatibility receivers (flag-gated, M6)

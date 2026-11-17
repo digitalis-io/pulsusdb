@@ -17,6 +17,7 @@ pub mod otlp_profiles;
 pub mod otlp_traces;
 pub mod profile_model;
 pub mod profile_push;
+pub mod profileql_legacy;
 pub mod prom_metric_name;
 pub mod remote_write;
 pub mod service_name;

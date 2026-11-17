@@ -1,4 +1,5 @@
-//! Live tests for the profile push receivers (issue #817, L1 to L5): spawns
+//! Live tests for the profile push receivers (issue #817, L1 to L5; issue
+//! #818, L6): spawns
 //! the `pulsusdb` binary as a writer with the compat routes on and a landing
 //! batch of one push, pushes over loopback HTTP on both transports, and reads
 //! what was stored and what statements each push sent.
@@ -302,6 +303,12 @@ struct SeriesRow {
     labels: String,
 }
 
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+struct TotalsRow {
+    n: String,
+    v: String,
+}
+
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
 struct StatementRow {
     r#type: String,
@@ -498,12 +505,54 @@ async fn each_profile_push_is_stored_by_one_insert_and_no_read() {
         "L3: {t4:?}"
     );
 
+    // L6: `/ingest`, folded stacks with no `format` and no `Content-Type`,
+    // as `t5`.
+    pushes.push(
+        push(
+            &client,
+            "L6 folded",
+            "/ingest?name=checkout.cpu%7Benv%3Dprod%7D",
+            &[("x-scope-orgid", "t5")],
+            b"main;work 3\nmain;idle 2\n",
+        )
+        .await,
+    );
+    let t5 = series(&client, "t5").await;
+    assert_eq!(t5.len(), 1, "L6: {t5:?}");
+    assert_eq!(
+        t5[0].type_id, "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+        "L6"
+    );
+    for part in [
+        r#""service_name":"checkout""#,
+        r#""env":"prod""#,
+        r#""__name__":"process_cpu""#,
+    ] {
+        assert!(t5[0].labels.contains(part), "L6: {part} in {:?}", t5[0]);
+    }
+    assert!(!t5[0].labels.contains("app_name"), "L6: {:?}", t5[0]);
+    let totals: Vec<TotalsRow> = rows(
+        &client,
+        "SELECT toString(count()) AS n, toString(sum(value)) AS v \
+         FROM profile_samples WHERE org_id = 't5'",
+        &QuerySettings::new(),
+    )
+    .await;
+    assert_eq!(
+        totals,
+        [TotalsRow {
+            n: "2".to_string(),
+            v: "50000000".to_string()
+        }],
+        "L6"
+    );
+
     // L4: the request and ingest metrics.
     let res = request(PORT, "GET", "/metrics", &[], b"").expect("/metrics reachable");
     let text = String::from_utf8_lossy(&res.body).into_owned();
     for line in [
         r#"pulsus_http_requests_total{route="/push.v1.PusherService/Push",status="200"} 2"#,
-        r#"pulsus_http_requests_total{route="/ingest",status="200"} 2"#,
+        r#"pulsus_http_requests_total{route="/ingest",status="200"} 3"#,
     ] {
         assert!(text.lines().any(|l| l == line), "L4: {line} in\n{text}");
     }

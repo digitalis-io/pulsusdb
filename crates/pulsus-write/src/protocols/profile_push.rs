@@ -147,6 +147,8 @@ pub struct LegacyQuery {
     pub spy_name: String,
     /// `format`, when given.
     pub format: Option<String>,
+    /// `sampleRate`: 100 when absent, unreadable or negative.
+    pub sample_rate: u32,
 }
 
 /// Reads the query string as Go's `url.URL.Query().Get` does: the first
@@ -186,7 +188,8 @@ fn query_pairs(raw: &str) -> HashMap<String, String> {
 }
 
 /// Reads `/ingest`'s query string (`pkg/ingester/…/ingest_handler.go:120-185`).
-/// A bad `name` is refused with `name: {error}`.
+/// A bad `name` is refused with `name: {error}`; a `sampleRate` that does
+/// not read as an integer, or is negative, is the default 100.
 pub fn parse_legacy_query(raw: Option<&str>, now_ns: i64) -> Result<LegacyQuery, String> {
     let q = query_pairs(raw.unwrap_or(""));
     let get = |k: &str| q.get(k).map(String::as_str).filter(|v| !v.is_empty());
@@ -196,6 +199,10 @@ pub fn parse_legacy_query(raw: Option<&str>, now_ns: i64) -> Result<LegacyQuery,
         from_ns: get("from").map(|f| parse_at_time(f, now_ns)),
         spy_name: get("spyName").unwrap_or("unknown").to_string(),
         format: get("format").map(str::to_string),
+        sample_rate: get("sampleRate")
+            .and_then(|r| r.parse::<i64>().ok())
+            .filter(|r| *r >= 0)
+            .map_or(100, |r| r as u32),
     })
 }
 
@@ -928,6 +935,7 @@ mod tests {
             from_ns,
             spy_name: spy.to_string(),
             format: None,
+            sample_rate: 100,
         }
     }
 

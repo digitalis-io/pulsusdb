@@ -56,7 +56,7 @@ use pulsus_clickhouse::ChError;
 pub const MAX_PROJECTION_GROUPS: usize = 255;
 
 /// The response-string ceiling, in bytes, and what a longer value is cut
-/// to, in code points (`docs/api.md:1056`).
+/// to, in code points (`docs/api.md:1094`).
 const CEILING_BYTES: usize = 8192;
 const CUT_CODE_POINTS: usize = 2048;
 
@@ -632,7 +632,7 @@ fn operand_fields<'a>(expr: &'a FieldExpr, out: &mut Vec<&'a Field>) {
 }
 
 /// The field a comparison names, when it names exactly ONE distinct field
-/// across both operands (`docs/api.md:1052`; today's
+/// across both operands (`docs/api.md:1090`; today's
 /// `single_field_of_comparison`).
 fn single_field_of_comparison<'a>(lhs: &'a FieldExpr, rhs: &'a FieldExpr) -> Option<&'a Field> {
     let mut fields = Vec::new();
