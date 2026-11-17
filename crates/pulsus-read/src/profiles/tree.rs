@@ -10,6 +10,7 @@ use pulsus_model::Tenant;
 use serde::{Deserialize, Serialize};
 
 use crate::logql::escape::ch_string;
+use crate::metrics::{DataWindow, LabelMatcher};
 use crate::traces::tenant_scope::TenantTerm;
 
 use super::engine::{ProfilesReadConfig, ProfilesReadError};
@@ -61,17 +62,47 @@ pub struct TreeRow {
     pub self_value: i64,
 }
 
-/// Plans `req` for `tenant`: `Ok(None)` when its window ends before the
-/// lookback floor, so nothing is read. In the reference's order, except
-/// that `max_nodes` is checked after the type and the selector: a span
-/// selector with a trace selector, then the window, the type and the
-/// selector, then `max_nodes`, then the id lists.
-pub fn plan(
+/// One selection's checked parts (issue #827): the series subquery, the
+/// window, the matchers, and the span, trace and profile-id lines of the
+/// sample read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Side {
+    pub series: String,
+    pub window: DataWindow,
+    pub matchers: Vec<LabelMatcher>,
+    pub filters: String,
+}
+
+impl Side {
+    /// The type id the matchers select.
+    pub(super) fn type_id(&self) -> &str {
+        self.matchers
+            .iter()
+            .rev()
+            .find(|m| m.key == "__profile_type__")
+            .map(|m| m.value.as_str())
+            .unwrap_or_default()
+    }
+
+    /// The stack rows' receive days the window's samples can have.
+    pub(super) fn days(&self) -> (String, String) {
+        (
+            utc_date(self.window.start_ms.saturating_sub(STACK_DAY_BEFORE_MS)),
+            utc_date(self.window.end_ms.saturating_add(STACK_DAY_AFTER_MS)),
+        )
+    }
+}
+
+/// Checks one selection in the reference's order — a span selector with a
+/// trace selector, then the window, the type and the selector, then the id
+/// lists — and renders its parts: `Ok(None)` when its window ends before
+/// the lookback floor.
+pub(super) fn side(
     tenant: &Tenant,
     config: &ProfilesReadConfig,
     req: &TreeRequest<'_>,
     now_ms: i64,
-) -> Result<Option<Planned>, ProfilesReadError> {
+) -> Result<Option<Side>, ProfilesReadError> {
     refuse_span_with_trace(req.span_selector, req.trace_id_selector)?;
     let selectors = [req.label_selector];
     let compiled = compile(
@@ -95,8 +126,6 @@ pub fn plan(
             matchers,
         } => (sql, window, matchers),
     };
-    let raw_max_nodes = req.max_nodes.unwrap_or(0);
-    let max_nodes = resolve_max_nodes(raw_max_nodes, config)?;
     let invalid = ProfilesReadError::InvalidArgument;
     let spans = req
         .span_selector
@@ -116,19 +145,6 @@ pub fn plan(
         .map(|s| uuid(s))
         .collect::<Result<Vec<String>, String>>()
         .map_err(invalid)?;
-
-    let tenant_term = TenantTerm::of(tenant);
-    let type_id = matchers
-        .iter()
-        .rev()
-        .find(|m| m.key == "__profile_type__")
-        .map(|m| m.value.as_str())
-        .unwrap_or_default();
-    let call_site = if req.call_site.is_empty() {
-        String::new()
-    } else {
-        format!("\n      AND {}", call_site_predicate(req.call_site))
-    };
     let mut filters = String::new();
     if !spans.is_empty() {
         let list: Vec<String> = spans.iter().map(u64::to_string).collect();
@@ -142,6 +158,39 @@ pub fn plan(
         let list: Vec<String> = profiles.iter().map(|p| format!("'{p}'")).collect();
         filters.push_str(&format!("\n      AND profile_id IN ({})", list.join(", ")));
     }
+    Ok(Some(Side {
+        series,
+        window,
+        matchers,
+        filters,
+    }))
+}
+
+/// Plans `req` for `tenant`: `Ok(None)` when its window ends before the
+/// lookback floor, so nothing is read. The selection is checked by
+/// [`side`], then `max_nodes`.
+pub fn plan(
+    tenant: &Tenant,
+    config: &ProfilesReadConfig,
+    req: &TreeRequest<'_>,
+    now_ms: i64,
+) -> Result<Option<Planned>, ProfilesReadError> {
+    let Some(side) = side(tenant, config, req, now_ms)? else {
+        return Ok(None);
+    };
+    let raw_max_nodes = req.max_nodes.unwrap_or(0);
+    let max_nodes = resolve_max_nodes(raw_max_nodes, config)?;
+
+    let tenant_term = TenantTerm::of(tenant);
+    let call_site = if req.call_site.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n      AND {}",
+            call_site_predicate("names", req.call_site)
+        )
+    };
+    let (d0, d1) = side.days();
     let sql = format!(
         "SELECT node_ids[i] AS node,
        any(if(i = 1, toUInt128(0), node_ids[i - 1])) AS parent,
@@ -167,13 +216,13 @@ FROM (
 )
 ARRAY JOIN arrayEnumerate(node_ids) AS i
 GROUP BY node",
-        d0 = utc_date(window.start_ms.saturating_sub(STACK_DAY_BEFORE_MS)),
-        d1 = utc_date(window.end_ms.saturating_add(STACK_DAY_AFTER_MS)),
         samples = config.samples_table,
-        type_id = ch_string(type_id),
-        service_terms = crate::metrics::profile_service_terms(&matchers),
-        start_ns = window.start_ms.saturating_mul(1_000_000),
-        end_ns = window.end_ms.saturating_mul(1_000_000),
+        type_id = ch_string(side.type_id()),
+        service_terms = crate::metrics::profile_service_terms(&side.matchers),
+        series = side.series,
+        start_ns = side.window.start_ms.saturating_mul(1_000_000),
+        end_ns = side.window.end_ms.saturating_mul(1_000_000),
+        filters = side.filters,
     );
     Ok(Some(Planned {
         sql,
@@ -198,7 +247,10 @@ pub fn refuse_span_with_trace(
 
 /// `max_nodes` as the reference resolves it (`ValidateMaxNodes`): 0 is the
 /// default; above the largest allowed, or negative, is refused.
-fn resolve_max_nodes(raw: i64, config: &ProfilesReadConfig) -> Result<i64, ProfilesReadError> {
+pub(super) fn resolve_max_nodes(
+    raw: i64,
+    config: &ProfilesReadConfig,
+) -> Result<i64, ProfilesReadError> {
     if raw == 0 {
         return Ok(config.max_nodes_default);
     }
@@ -216,12 +268,13 @@ fn resolve_max_nodes(raw: i64, config: &ProfilesReadConfig) -> Result<i64, Profi
     Ok(raw)
 }
 
-/// Issue #824: the stack rows a call site keeps — those whose frames begin
-/// with `names`, root first.
-pub(super) fn call_site_predicate(names: &[String]) -> String {
+/// Issue #824: the stack rows a call site keeps — those whose frames,
+/// `column`, begin with `names`, root first. Issue #827 passes the frames
+/// as an aggregate of the joined stack rows.
+pub(super) fn call_site_predicate(column: &str, names: &[String]) -> String {
     let names: Vec<String> = names.iter().map(|n| ch_string(n)).collect();
     format!(
-        "arraySlice(names, 1, {}) = [{}]",
+        "arraySlice({column}, 1, {}) = [{}]",
         names.len(),
         names.join(", ")
     )
