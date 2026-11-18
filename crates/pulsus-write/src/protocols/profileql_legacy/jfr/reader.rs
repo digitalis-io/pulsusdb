@@ -439,19 +439,50 @@ struct ClassDef {
     fields: Vec<FieldDef>,
 }
 
+/// The most bytes of one body-derived name an error text carries.
+const ERROR_NAME_BYTES: usize = 256;
+/// The most fields a class description in an error text lists.
+const ERROR_FIELDS: usize = 32;
+
+/// `s` as an error text may carry it: whole when short, else its first
+/// [`ERROR_NAME_BYTES`] bytes and `...`.
+fn short(s: &str) -> Cow<'_, str> {
+    if s.len() <= ERROR_NAME_BYTES {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(format!(
+        "{}...",
+        &s[..s.floor_char_boundary(ERROR_NAME_BYTES)]
+    ))
+}
+
 impl fmt::Display for ClassDef {
-    /// `class{name: N, id: I, fields: [{Name:n Type:t ConstantPool:b Array:b} ...]}`.
+    /// `class{name: N, id: I, fields: [{Name:n Type:t ConstantPool:b Array:b} ...]}`,
+    /// the library's text. Each name is cut at [`ERROR_NAME_BYTES`] bytes and
+    /// the list at [`ERROR_FIELDS`] fields, so the text stays short whatever
+    /// the body declares.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "class{{name: {}, id: {}, fields: [", self.name, self.id)?;
-        for (i, field) in self.fields.iter().enumerate() {
+        write!(
+            f,
+            "class{{name: {}, id: {}, fields: [",
+            short(&self.name),
+            self.id
+        )?;
+        for (i, field) in self.fields.iter().take(ERROR_FIELDS).enumerate() {
             if i > 0 {
                 f.write_str(" ")?;
             }
             write!(
                 f,
                 "{{Name:{} Type:{} ConstantPool:{} Array:{}}}",
-                field.name, field.ty, field.cp, field.array
+                short(&field.name),
+                field.ty,
+                field.cp,
+                field.array
             )?;
+        }
+        if self.fields.len() > ERROR_FIELDS {
+            write!(f, " ... {} more", self.fields.len() - ERROR_FIELDS)?;
         }
         f.write_str("]}")
     }
@@ -515,6 +546,9 @@ fn read_element(
     };
     let name = index()?;
     let count = cur.count()?;
+    if with_attrs {
+        budget.take(2 * 16 * count as u64 + 64)?;
+    }
     let mut attrs = Vec::new();
     for _ in 0..count {
         let k = {
@@ -535,7 +569,6 @@ fn read_element(
             attrs.push((k, v));
         }
     }
-    budget.take(2 * 16 * attrs.len() as u64 + 64)?;
     let children = cur.count()? as u32;
     Ok(Element {
         name,
@@ -569,7 +602,7 @@ fn read_metadata(buf: &[u8], lo: usize, pos: i64, budget: &Budget) -> Read<Vec<C
     if &*strings[root.name] != "root" {
         return Err(message(format!(
             "expected root element, got {}",
-            strings[root.name]
+            short(&strings[root.name])
         )));
     }
     for _ in 0..root.children {
@@ -605,7 +638,7 @@ fn read_metadata(buf: &[u8], lo: usize, pos: i64, budget: &Budget) -> Read<Vec<C
                 }
             }
             "region" => {}
-            other => return Err(message(format!("unexpected element {other}"))),
+            other => return Err(message(format!("unexpected element {}", short(other)))),
         }
     }
     Ok(classes)
@@ -622,7 +655,7 @@ fn field_def(e: &Element, strings: &[Rc<str>]) -> Read<FieldDef> {
     let array = match e.attr(strings, "dimension") {
         "" => false,
         "1" => true,
-        d => return Err(message(format!("unsupported dimension {d}"))),
+        d => return Err(message(format!("unsupported dimension {}", short(d)))),
     };
     Ok(FieldDef {
         name: Rc::clone(&strings[name]),
@@ -923,14 +956,18 @@ impl Meta {
             events: Vec::new(),
             frame_plans: Vec::new(),
         };
+        let fields: usize = std::iter::once("jdk.types.StackFrame")
+            .chain(EVENT_NAMES)
+            .filter_map(|name| meta.class_index(name))
+            .map(|c| meta.classes[c].fields.len())
+            .sum();
+        budget.take(fields as u64 * std::mem::size_of::<Plan>() as u64)?;
         meta.frame_plans = meta.plans_by_name("jdk.types.StackFrame", &FRAME_SPECS, false);
         for (i, name) in EVENT_NAMES.iter().enumerate() {
             let id = meta.class_index(name).map(|c| meta.classes[c].id);
             let plans = meta.plans_by_name(name, &event_specs(i), false);
             meta.events.push((id, plans));
         }
-        let plans = meta.frame_plans.len() + meta.events.iter().map(|e| e.1.len()).sum::<usize>();
-        budget.take(plans as u64 * std::mem::size_of::<Plan>() as u64)?;
         Ok(meta)
     }
 
@@ -1471,9 +1508,10 @@ impl<'a> Reader<'a> {
                 if meta.pools[class].is_none() {
                     let kind = pool_kind(&meta.classes[class].name);
                     let frames = kind == PoolKind::StackTrace;
-                    let plans = meta.plans(class, &pool_specs(kind), frames);
+                    let fields = meta.classes[class].fields.len() as u64;
                     self.budget
-                        .take(plans.len() as u64 * std::mem::size_of::<Plan>() as u64)?;
+                        .take(fields * std::mem::size_of::<Plan>() as u64)?;
+                    let plans = meta.plans(class, &pool_specs(kind), frames);
                     meta.pools[class] = Some((kind, plans));
                 }
                 self.read_pool(class).map_err(|e| {
