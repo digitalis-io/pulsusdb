@@ -14,7 +14,7 @@
 //! [`resolve_over`] is the pure algorithmic core, factored out of
 //! [`LabelCache`] itself so it is unit-testable against a hand-built
 //! [`LabelIndex`] with no `ChClient`/network dependency at all — only
-//! [`LabelCache::new`]/[`LabelCache::refresh`] need a real connection.
+//! [`LabelCache::new`]/[`LabelCache::refresh`] need a ClickHouse connection.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;

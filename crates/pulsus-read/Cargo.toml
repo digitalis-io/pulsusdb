@@ -67,7 +67,7 @@ base64 = "0.22"
 xxhash-rust.workspace = true
 # The refresh loop (`spawn_refresh_loop`) and the `tokio::task::JoinHandle`
 # it runs in are the first async/task-spawning code in this crate (issue
-# #30) — promoted from a dev-only dependency to a real one.
+# #30) — promoted from a dev-only dependency to a normal one.
 tokio = { workspace = true, features = ["time", "rt", "sync", "macros"] }
 # `refresh.rs`'s self-healing loop logs a failed pass rather than stopping
 # (architect plan) — the same `tracing::warn!` convention every other crate
