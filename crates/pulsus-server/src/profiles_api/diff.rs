@@ -4,7 +4,7 @@
 //! One statement per request (`pulsus_read::profiles::diff`), both merged
 //! trees computed in ClickHouse; each side's trim and the diff run here
 //! (`pulsus_read::profiles::flamegraph_diff`). In the order: the tenant, the
-//! codec and the body, then the planner's own checks — the larger
+//! codec and the body, then the planner's own checks — each side's
 //! `max_nodes`, the left side, the right side. An absent side is the
 //! default request; each side's `format` is ignored.
 

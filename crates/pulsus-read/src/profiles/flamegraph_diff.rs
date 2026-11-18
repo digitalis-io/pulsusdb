@@ -2,10 +2,11 @@
 //! `NewFlamegraphDiff` (`pkg/model/flamegraph_diff.go`), run on the rows S7
 //! returns (`super::diff`). Pure: no I/O.
 //!
-//! Each side is trimmed as the flame graph's tree is (steps 1 and 2 of
-//! `super::flamegraph`, #823's D11 included). The two trees are then
-//! aligned under virtual roots, cut once on the larger of each pair's
-//! totals, and walked into one graph. The reference's check for a negative
+//! Each side is trimmed with its own `max_nodes` as the flame graph's tree
+//! is (steps 1 and 2 of `super::flamegraph`, #823's D11 included). The two
+//! trees are then aligned under virtual roots and walked into one graph,
+//! not cut again: the reference's mounted `Diff` runs its diff with no
+//! limit. The reference's check for a negative
 //! self is not ported: ingest stores no value of 0 or below.
 
 use std::collections::HashMap;
@@ -28,14 +29,13 @@ pub struct FlameGraphDiff {
     pub right_ticks: i64,
 }
 
-/// The diff of S7's rows with the resolved `max_nodes` `m`: steps 1 and 2
-/// on each side, then [`diff_of`].
+/// The diff of S7's rows: steps 1 and 2 on each side with its own resolved
+/// `max_nodes`, then [`diff_of`] with no cut.
 pub fn flame_graph_diff(
     rows: &[DiffRow],
     left_m: i64,
     right_m: i64,
 ) -> Result<FlameGraphDiff, ProfilesReadError> {
-    let m = left_m.max(right_m);
     let side = |total: fn(&DiffRow) -> (i64, i64)| -> Vec<TreeRow> {
         rows.iter()
             .filter(|r| total(r).0 > 0)
@@ -48,9 +48,15 @@ pub fn flame_graph_diff(
             })
             .collect()
     };
-    let left = truncated(merged_tree(&side(|r| (r.left_total, r.left_self)), m)?, m);
-    let right = truncated(merged_tree(&side(|r| (r.right_total, r.right_self)), m)?, m);
-    Ok(diff_of(&left, &right, m))
+    let left = truncated(
+        merged_tree(&side(|r| (r.left_total, r.left_self)), left_m)?,
+        left_m,
+    );
+    let right = truncated(
+        merged_tree(&side(|r| (r.right_total, r.right_self)), right_m)?,
+        right_m,
+    );
+    Ok(diff_of(&left, &right, 0))
 }
 
 /// One node of the two aligned trees: each side's total and self, 0 on a

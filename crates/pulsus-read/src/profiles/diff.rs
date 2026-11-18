@@ -1,6 +1,7 @@
 //! Issue #827: `Diff` planned as one statement (S7) — both selections'
 //! merged trees side by side, one row per node of their union, computed in
-//! ClickHouse. `super::flamegraph_diff` trims each side and combines them.
+//! ClickHouse. `super::flamegraph_diff` trims each side with its own
+//! `max_nodes` and combines them.
 //!
 //! Each side is one branch that sums its own samples per stack; the
 //! branches are `UNION ALL`-ed and summed per stack into `vl` and `vr`,
@@ -16,8 +17,7 @@ use crate::traces::tenant_scope::TenantTerm;
 use super::engine::{ProfilesReadConfig, ProfilesReadError};
 use super::tree::{self, TreeRequest};
 
-/// A planned `Diff`: S7's text and the resolved `max_nodes` both sides and
-/// the diff use.
+/// A planned `Diff`: S7's text and each side's resolved `max_nodes`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Planned {
     pub sql: String,
@@ -41,8 +41,8 @@ pub struct DiffRow {
 
 /// Plans `left` against `right` for `tenant`: `Ok(None)` when both windows
 /// end before the lookback floor, so nothing is read. In the order: the
-/// larger `max_nodes` of the two, then the left side, then the right
-/// ([`tree::side`]). A side whose window ends before the floor has no
+/// left side's `max_nodes`, then the right's, then the left side, then the
+/// right ([`tree::side`]). A side whose window ends before the floor has no
 /// branch, and its sums are 0.
 pub fn plan(
     tenant: &Tenant,
@@ -51,12 +51,8 @@ pub fn plan(
     right: &TreeRequest<'_>,
     now_ms: i64,
 ) -> Result<Option<Planned>, ProfilesReadError> {
-    let raw = left
-        .max_nodes
-        .unwrap_or(0)
-        .max(right.max_nodes.unwrap_or(0));
-    let max_nodes = tree::resolve_max_nodes(raw, config)?;
-    let (left_max_nodes, right_max_nodes) = (max_nodes, max_nodes);
+    let left_max_nodes = tree::resolve_max_nodes(left.max_nodes.unwrap_or(0), config)?;
+    let right_max_nodes = tree::resolve_max_nodes(right.max_nodes.unwrap_or(0), config)?;
     let sides = [
         tree::side(tenant, config, left, now_ms)?,
         tree::side(tenant, config, right, now_ms)?,

@@ -4,7 +4,8 @@
 //!
 //! Step 1 is the reference's `TreeFromStacktraceTree`, step 2 its
 //! `MarshalTruncate` followed by `UnmarshalTree`, step 3 its
-//! `NewFlameGraph`. Children are kept sorted by name, in byte order, at
+//! `NewFlameGraph`. The Connect answer also carries step 2's tree as
+//! `MarshalTruncate` writes it ([`tree_bytes`]). Children are kept sorted by name, in byte order, at
 //! every step, as the reference's `insert` keeps them.
 //!
 //! One deliberate difference from the reference
@@ -176,9 +177,43 @@ pub fn flame_graph_with_tree(
     Ok((flame_graph_of(&tree, raw), tree_bytes(&tree)))
 }
 
-/// The tree's bytes as the reference's `MarshalTruncate` writes them.
-pub fn tree_bytes(_tree: &Tree) -> Vec<u8> {
-    Vec::new()
+/// The tree's bytes as the reference's `MarshalTruncate` writes them
+/// (`pkg/model/tree.go`): depth first from a virtual root (name `""`, self
+/// 0), last pushed first; per node `uvarint(name length)`, the name,
+/// `uvarint(self)`, then `uvarint(child count)`. Children are pushed in
+/// name order, so written in reverse name order. An empty tree is no bytes.
+///
+/// Cost: one walk over the trimmed tree and one buffer the size of the
+/// answer; no read and no statement. The trimmed tree is not bounded by
+/// `max_nodes`: every node whose total equals the cut is kept, so is every
+/// node named `other`, and each generated `other` adds one more.
+pub fn tree_bytes(tree: &Tree) -> Vec<u8> {
+    if tree.roots.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut stack: Vec<Option<usize>> = vec![None];
+    while let Some(at) = stack.pop() {
+        let (name, self_value) = match at {
+            Some(i) => (tree.nodes[i].name.as_str(), tree.nodes[i].self_value),
+            None => ("", 0),
+        };
+        let children = tree.children(at);
+        uvarint(&mut out, name.len() as u64);
+        out.extend_from_slice(name.as_bytes());
+        uvarint(&mut out, self_value as u64);
+        uvarint(&mut out, children.len() as u64);
+        stack.extend(children.iter().map(|&c| Some(c)));
+    }
+    out
+}
+
+fn uvarint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
 }
 
 /// Step 3: the reference's `NewFlameGraph` (`pkg/model/flamegraph.go`). A
