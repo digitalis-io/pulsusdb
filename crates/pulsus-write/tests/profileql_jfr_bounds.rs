@@ -736,3 +736,24 @@ fn r8_a_parse_holds_no_more_than_its_budget() {
         );
     }
 }
+
+/// Code review r3: a pool of a class whose 10,000 fields share one UTF-16
+/// name of 200,000 characters, cut short, so its error describes the class.
+#[test]
+fn r9_an_error_describing_a_class_stays_short() {
+    let long = leak("b".repeat(200_000));
+    let mut types = classes(frame_fields());
+    types.push((
+        200,
+        "x",
+        (0..10_000).map(|_| (long, INT, false, false)).collect(),
+    ));
+    let body = recording(
+        metadata_with(&types, 0, &[long]),
+        vec![pool_event(0, &[(200, 1, vec![1])])],
+        &[],
+    );
+    let out = parse_within("an error naming a long field many times", body);
+    let e = out.map(|o| o.profiles.len()).expect_err("a pool cut short");
+    assert!(e.len() < 64 * 1024, "an error of {} bytes", e.len());
+}
