@@ -110,6 +110,13 @@ profileql_diff_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=1
 # Issue #827: Diff over the Connect protocol, against the spawned binary.
 # Reuses this job's ClickHouse container.
 profileql_diff	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profileql_diff
+# Issue #825: the heatmap's one statement over its tenant's entries, and
+# with HEATMAP_QUERY_TYPE_SPAN over its samples. Reuses this job's
+# ClickHouse container.
+profileql_heatmap_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-read --test profileql_heatmap_live
+# Issue #825: SelectHeatmap over the Connect protocol, against the spawned
+# binary. Reuses this job's ClickHouse container.
+profileql_heatmap	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test profileql_heatmap
 # Issue #55: spawns the real `pulsusdb` binary and drives the
 # `/api/traces/v1/trace/{traceId}[/json]` fetch surface end-to-end —
 # OTLP ingest seed, JSON/protobuf negotiation (incl. the 406
@@ -136,6 +143,12 @@ live_profile_writer	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=1
 # and that the push sends one insert and no read. Reuses this job's
 # ClickHouse 26.8 container.
 otlp_profiles_live	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123	cargo test -p pulsus-server --test otlp_profiles_live
+# Issue #822: the profiles differential. Pushes one fixture through
+# every receiver to the spawned binary and to the pinned profiles
+# reference started above, under two tenants, and compares the
+# catalogue answers and the stored values. Reuses this job's ClickHouse
+# container.
+profileql_differential	pool	all	PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19123 PULSUSDB_PROFILEQL_DIFF_URL=http://localhost:14040	cargo test -p pulsus-server --test profileql_differential
 # Issue #816: each signal's OTLP export over gRPC (h2c and TLS h2, gzip and
 # identity) stores the rows its HTTP route stores. Reuses this job's
 # ClickHouse 26.8 container.

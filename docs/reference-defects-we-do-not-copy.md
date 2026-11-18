@@ -39,6 +39,7 @@ records it. File and line numbers are from these trees.
 | Grafana Loki (end-to-end oracle) | 3.4.2 | `4fa045d3807f4de0543b06e6ce79b89afb741adc` | `deploy/e2e/compose.single.yaml`, image `grafana/loki:3.4.2@sha256:58a6c186ce78ba04d58bfe2a927eff296ba733a430df09645d56cdc158f3ba08` |
 | Grafana Tempo | v3.0.2 | `0c4b926d09234186de39833e9c7ecb5b7614c8b9` | `deploy/e2e/compose.single.yaml`, image `grafana/tempo:3.0.2@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3` |
 | Prometheus | v3.13.0 | `40af9c2cdc0eda00f3622e867a27f6359f7295f3` | `deploy/e2e/compose.single.yaml`, image `prom/prometheus:v3.13.0` |
+| profiles reference | v2.4.3 | `860ef8d7093f9b6c824a7528010b15d782645e4f` | `.github/workflows/ci.yml`, image `grafana/pyroscope@sha256:bf667534cd403320573063894e3faba20a5a5d1bfb92eddaecfabeb2446c502b` |
 
 Where a line number below sits in a `vendor/` path, it is a library the
 reference ships inside its own binary, so it is the reference's behaviour
@@ -2577,6 +2578,24 @@ they are named so nobody adds them later.
   on the reference's part. Entries 11 and 22 are different: each has a
   self-contradiction or a violated stated intent behind it, not just a
   code we would have chosen differently.
+- **Three heatmap choices (issue #825; the first two the owner's
+  decision of 2026-11-17).** The reference answers a `SelectHeatmap`
+  without a query type with `500` `valid heatmap query type must be
+  specified` when the window holds data, and with an empty answer when it
+  holds none (`pkg/querybackend/query_heatmap.go:170-181`); PulsusDB
+  answers `400` with that text on every window. Below the limit, the
+  reference orders the heatmap's series by the text of internal reference
+  numbers written in hex (`pkg/model/heatmap/merger.go:88-106`,
+  `:122-131`), which follows no label or value order; PulsusDB orders
+  them by their labels. With `HEATMAP_QUERY_TYPE_SPAN`, the reference
+  adds a span's samples without their profile
+  (`pkg/querybackend/query_heatmap.go:121-128`) and merges equal
+  millisecond, span and trace keys within a series group
+  (`pkg/model/heatmap/points_builder.go:39-86`), so two profiles carrying
+  one span count as one value when they share a millisecond and as two
+  when they are a millisecond apart. PulsusDB counts one value per profile
+  and span either way, so the count does not depend on whether two
+  timestamps coincide (`docs/api.md` §5).
 - **Everything that follows from our architecture.** Storing spans and
   log lines as ClickHouse rows rather than in the reference's own file
   formats decides a great deal — which parameters are meaningful, what

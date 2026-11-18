@@ -1355,6 +1355,20 @@ jobs:
             curl -sf "http://localhost:$port/ready"
           done
 
+      # Issue #822: the profiles differential's reference, the official
+      # image of its latest release pinned by digest, started unmodified:
+      # its own bundled config (every field commented out, so the defaults),
+      # multitenancy on, and self-profiling pushes off. Capped at 2 GB so it
+      # cannot crowd ClickHouse and the trace references. Its readiness is
+      # waited for by the suite itself (`profileql_differential`), so the
+      # 60 s startup overlaps the test-binary build below.
+      - name: Start the profiles reference (differential)
+        run: |
+          docker run -d --name pulsus-profileql-822 --memory=2g --memory-swap=2g -p 14040:4040 \
+            grafana/pyroscope@sha256:bf667534cd403320573063894e3faba20a5a5d1bfb92eddaecfabeb2446c502b \
+            -config.file=/etc/pyroscope/config.yaml \
+            -auth.multitenancy-enabled=true -self-profiling.disable-push=true
+
       # Issue #843 part 3: this job's live suites, 4 at a time, from
       # ci/suites/schema-it-traceql.tsv; the format and the rules are in
       # ci/live-suites.sh.
@@ -1372,6 +1386,10 @@ jobs:
       - name: Stop Tempo differential oracle
         if: always()
         run: docker rm -f pulsus-tempo-diff || true
+
+      - name: Stop the profiles reference
+        if: always()
+        run: docker rm -f pulsus-profileql-822 || true
 
       - name: Build pulsusdb
         run: cargo build -p pulsus-server --bin pulsusdb
@@ -1679,6 +1697,13 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-read --test profileql_diff_cluster
+
+      # Issue #825: the heatmap over the distributed entry and series
+      # tables, the series split across both shards, in one statement.
+      - name: Profile heatmap over the distributed tables (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test profileql_heatmap_cluster
 
       # Issue #43: cross-node connection spreading over the two DISTINCT real
       # nodes (SHARD1/SHARD2 default to the fixture IPs 172.28.0.11/12:8123),

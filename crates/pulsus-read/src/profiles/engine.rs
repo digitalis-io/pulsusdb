@@ -11,6 +11,7 @@ use crate::traces::tenant_scope::TenantTerm;
 use super::catalogue::{Read, compat_sets};
 use super::diff::DiffRow;
 use super::dispatch::ProfileDispatch;
+use super::heatmap::HeatmapRow;
 use super::selector::WindowLimits;
 use super::series::TimeSeriesRow;
 use super::tree::TreeRow;
@@ -243,6 +244,13 @@ impl ProfilesEngine {
     /// Issue #824: sends S6 (`super::series`) and returns one row per
     /// series.
     pub async fn read_series(&self, sql: &str) -> Result<Vec<TimeSeriesRow>, ProfilesReadError> {
+        let settings = read_settings(&self.config, self.log_comment.as_deref());
+        self.dispatch.rows(sql, &settings).await
+    }
+
+    /// Issue #825: sends S8 (`super::heatmap`) and returns one row per
+    /// series.
+    pub async fn read_heatmap(&self, sql: &str) -> Result<Vec<HeatmapRow>, ProfilesReadError> {
         let settings = read_settings(&self.config, self.log_comment.as_deref());
         self.dispatch.rows(sql, &settings).await
     }

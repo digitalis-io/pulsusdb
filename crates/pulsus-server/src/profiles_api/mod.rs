@@ -10,10 +10,13 @@
 //! Connect paths and `GET /api/profiles/v1/select_series`, in one statement.
 //! Issue #827: `Diff`, the diff of two selections, at the two Connect paths
 //! only, in one statement.
+//! Issue #825: `SelectHeatmap`, the heatmap of profile and span totals, at
+//! the two Connect paths, in one statement.
 
 pub(crate) mod connect;
 mod diff;
 mod engine;
+mod heatmap;
 mod merge;
 pub(crate) mod routes;
 mod series;
@@ -54,6 +57,10 @@ pub(crate) fn router() -> Router<AppState> {
         .route(
             "/api/profiles/v1/querier.v1.QuerierService/Diff",
             post(diff::diff),
+        )
+        .route(
+            "/api/profiles/v1/querier.v1.QuerierService/SelectHeatmap",
+            post(heatmap::select_heatmap),
         )
         .route("/api/profiles/v1/types", get(routes::types_get))
         .route(
@@ -101,6 +108,10 @@ pub(crate) fn compat_router() -> Router<AppState> {
             post(series::select_series),
         )
         .route("/querier.v1.QuerierService/Diff", post(diff::diff))
+        .route(
+            "/querier.v1.QuerierService/SelectHeatmap",
+            post(heatmap::select_heatmap),
+        )
 }
 
 #[cfg(test)]

@@ -85,6 +85,7 @@ pub(crate) const ROUTE_TEMPLATES: &[&str] = &[
     "/api/profiles/v1/querier.v1.QuerierService/LabelNames",
     "/api/profiles/v1/querier.v1.QuerierService/LabelValues",
     "/api/profiles/v1/querier.v1.QuerierService/ProfileTypes",
+    "/api/profiles/v1/querier.v1.QuerierService/SelectHeatmap",
     "/api/profiles/v1/querier.v1.QuerierService/SelectMergeStacktraces",
     "/api/profiles/v1/querier.v1.QuerierService/SelectSeries",
     "/api/profiles/v1/querier.v1.QuerierService/Series",
@@ -148,6 +149,7 @@ pub(crate) const ROUTE_TEMPLATES: &[&str] = &[
     "/querier.v1.QuerierService/LabelNames",
     "/querier.v1.QuerierService/LabelValues",
     "/querier.v1.QuerierService/ProfileTypes",
+    "/querier.v1.QuerierService/SelectHeatmap",
     "/querier.v1.QuerierService/SelectMergeStacktraces",
     "/querier.v1.QuerierService/SelectSeries",
     "/querier.v1.QuerierService/Series",
@@ -628,7 +630,7 @@ mod tests {
             ROUTE_TEMPLATES.windows(2).all(|w| w[0] < w[1]),
             "{ROUTE_TEMPLATES:?}"
         );
-        assert_eq!(ROUTE_TEMPLATES.len(), 109);
+        assert_eq!(ROUTE_TEMPLATES.len(), 111);
         assert!(
             ROUTE_TEMPLATES
                 .iter()
