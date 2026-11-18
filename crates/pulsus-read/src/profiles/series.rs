@@ -7,6 +7,12 @@
 //! selected series' labels when grouped. With one it reads each profile's
 //! total over the stacks beginning with the call site from
 //! `profile_samples`.
+//!
+//! Issue #826: with exemplars, each point also names its largest profile
+//! (`argMax`), and a second `UNION ALL` branch of the same statement
+//! returns each selected series' labels; [`series_exemplars`] joins them.
+
+use std::collections::HashMap;
 
 use pulsus_model::{LabelMatcher, Tenant};
 use serde::{Deserialize, Serialize};
@@ -36,7 +42,8 @@ pub struct SeriesRequest<'a> {
     pub call_site: &'a [String],
     /// The request's `limit`, `None` when absent.
     pub limit: Option<i64>,
-    /// Issue #826: stub.
+    /// Issue #826: `EXEMPLAR_TYPE_INDIVIDUAL`: each point names its
+    /// largest profile.
     pub exemplars: bool,
 }
 
@@ -49,7 +56,11 @@ pub struct TimeSeriesRow {
     pub points: Vec<(i64, f64)>,
 }
 
-/// Issue #826: stub.
+/// Issue #826: one row of S6 with exemplars. `kind` 0 is a series as
+/// [`TimeSeriesRow`], each point `(timestamp ms, value, the largest
+/// profile's total, its id, its time ms, its fingerprint)`; `kind` 1 is one
+/// selected series' `fingerprint` and its stored `labels` less the
+/// `group_by` names.
 #[derive(Debug, Clone, PartialEq, clickhouse::Row, Serialize, Deserialize)]
 pub struct TimeSeriesExemplarRow {
     pub kind: u8,
@@ -60,7 +71,9 @@ pub struct TimeSeriesExemplarRow {
     pub labels: Vec<(String, String)>,
 }
 
-/// Issue #826: stub.
+/// Issue #826: one profile that contributed to a point or a heatmap cell.
+/// `span_id` and `trace_id` are `""` for an `INDIVIDUAL` exemplar,
+/// `profile_id` for a `SPAN` one.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Exemplar {
     pub timestamp: i64,
@@ -76,6 +89,8 @@ pub struct Exemplar {
 pub struct Point {
     pub timestamp: i64,
     pub value: f64,
+    /// Issue #826: the point's largest profile, when exemplars are asked
+    /// for.
     pub exemplar: Option<Exemplar>,
 }
 
@@ -159,7 +174,7 @@ pub fn plan(
     } else {
         format!(
             "FROM (
-    SELECT fingerprint, timestamp_ns, sum(value) AS total
+    SELECT fingerprint, timestamp_ns, {profile}sum(value) AS total
     FROM {samples}
     WHERE {tenant_term} AND type_id = {type_id}{service_terms}
       AND fingerprint IN ({series})
@@ -174,6 +189,7 @@ WHERE {tenant_term} AND day BETWEEN '{d0}' AND '{d1}'
             d0 = utc_date(read_start.saturating_sub(STACK_DAY_BEFORE_MS)),
             d1 = utc_date(end.saturating_add(STACK_DAY_AFTER_MS)),
             call_site = call_site_predicate("names", req.call_site),
+            profile = if req.exemplars { "profile_id, " } else { "" },
         )
     };
     let v = if req.average {
@@ -185,8 +201,9 @@ WHERE {tenant_term} AND day BETWEEN '{d0}' AND '{d1}'
         Some(n) if n > 0 => format!("\nLIMIT {n}"),
         _ => String::new(),
     };
-    Ok(Some(format!(
-        "SELECT g, sum(v) AS series_total, arraySort(groupArray((ts, v))) AS points
+    if !req.exemplars {
+        return Ok(Some(format!(
+            "SELECT g, sum(v) AS series_total, arraySort(groupArray((ts, v))) AS points
 FROM (
   SELECT {g} AS g,
          {start} + intDiv(intDiv(e.timestamp_ns, 1000000) - {start} + {step_minus_1}, {step}) * {step} AS ts,
@@ -196,8 +213,52 @@ FROM (
 )
 GROUP BY g
 ORDER BY series_total DESC, g{limit}",
+            step_minus_1 = step - 1,
+        )));
+    }
+    let labels = labels_branch(tenant, w, series_table, &matchers, req.group_by, "");
+    Ok(Some(format!(
+        "SELECT 0 AS kind, g, sum(v) AS series_total, arraySort(groupArray((ts, v, m, toString(x.1), intDiv(x.2, 1000000), x.3))) AS points, toUInt128(0) AS fingerprint, CAST([] AS Array(Tuple(String, String))) AS labels
+FROM (
+  SELECT {g} AS g,
+         {start} + intDiv(intDiv(e.timestamp_ns, 1000000) - {start} + {step_minus_1}, {step}) * {step} AS ts,
+         {v} AS v,
+         max(e.total) AS m,
+         argMax((e.profile_id, e.timestamp_ns, e.fingerprint), e.total) AS x
+  {source}
+  GROUP BY g, ts
+)
+GROUP BY g
+ORDER BY series_total DESC, g{limit}{labels}",
         step_minus_1 = step - 1,
     )))
+}
+
+/// Issue #826: the `UNION ALL` branch that returns each selected series'
+/// fingerprint and its stored labels less the `group_by` names, padded to
+/// the first branch's columns with `pad` after the empty points.
+pub(super) fn labels_branch(
+    tenant: &Tenant,
+    w: DataWindow,
+    series_table: &str,
+    matchers: &[LabelMatcher],
+    group_by: &[String],
+    pad: &str,
+) -> String {
+    let all = "JSONExtractKeysAndValues(any(labels), 'String')";
+    let labels = if group_by.is_empty() {
+        all.to_string()
+    } else {
+        let names: Vec<String> = group_by.iter().map(|l| ch_string(l)).collect();
+        format!(
+            "arrayFilter(p -> NOT has([{}], p.1), {all})",
+            names.join(", ")
+        )
+    };
+    format!(
+        "\nUNION ALL\nSELECT 1, CAST([] AS Array(String)), 0, [], {pad}fingerprint, {labels}\n{}\nGROUP BY fingerprint",
+        crate::metrics::profile_series_where(tenant, w, series_table, matchers)
+    )
 }
 
 /// The window and the matchers `profile_type`, `label_selector` and
@@ -264,27 +325,98 @@ pub(super) fn group(
 /// sum of its points, descending, then by its labels; cut to `limit` when
 /// it is above 0.
 pub fn series(rows: Vec<TimeSeriesRow>, group_by: &[String], limit: Option<i64>) -> Vec<Series> {
-    let mut out: Vec<(f64, Series)> = rows
+    order_and_cut(
+        rows.into_iter()
+            .map(|row| {
+                let points = row
+                    .points
+                    .into_iter()
+                    .map(|(timestamp, value)| Point {
+                        timestamp,
+                        value,
+                        exemplar: None,
+                    })
+                    .collect();
+                Series {
+                    labels: group_labels(group_by, row.g),
+                    points,
+                }
+            })
+            .collect(),
+        limit,
+    )
+}
+
+/// Issue #826: S6's exemplar rows as [`series`] answers them, each point
+/// carrying its largest profile, labelled with the `kind` 1 row of its
+/// fingerprint.
+pub fn series_exemplars(
+    rows: Vec<TimeSeriesExemplarRow>,
+    group_by: &[String],
+    limit: Option<i64>,
+) -> Vec<Series> {
+    let (rows, labels) = split_labels(rows, |r| r.kind == 0, |r| (r.fingerprint, r.labels));
+    order_and_cut(
+        rows.into_iter()
+            .map(|row| {
+                let points = row
+                    .points
+                    .into_iter()
+                    .map(|(timestamp, value, total, profile_id, at, fp)| Point {
+                        timestamp,
+                        value,
+                        exemplar: Some(Exemplar {
+                            timestamp: at,
+                            profile_id,
+                            span_id: String::new(),
+                            trace_id: String::new(),
+                            value: total,
+                            labels: labels.get(&fp).cloned().unwrap_or_default(),
+                        }),
+                    })
+                    .collect();
+                Series {
+                    labels: group_labels(group_by, row.g),
+                    points,
+                }
+            })
+            .collect(),
+        limit,
+    )
+}
+
+/// Issue #826: each selected series' labels by its fingerprint.
+pub(super) type LabelsByFingerprint = HashMap<u128, Vec<(String, String)>>;
+
+/// Issue #826: an exemplar statement's rows split into the series rows,
+/// those `is_series` holds for, and the map each other row's
+/// `(fingerprint, labels)` makes.
+pub(super) fn split_labels<R>(
+    rows: Vec<R>,
+    is_series: impl Fn(&R) -> bool,
+    labels: impl Fn(R) -> (u128, Vec<(String, String)>),
+) -> (Vec<R>, LabelsByFingerprint) {
+    let (series, other): (Vec<R>, Vec<R>) = rows.into_iter().partition(|r| is_series(r));
+    (series, other.into_iter().map(labels).collect())
+}
+
+/// A series' labels: the `group_by` names it holds a value for, in request
+/// order.
+pub(super) fn group_labels(group_by: &[String], g: Vec<String>) -> Vec<(String, String)> {
+    group_by
+        .iter()
+        .zip(g)
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(name, value)| (name.clone(), value))
+        .collect()
+}
+
+/// The series ordered by the sum of their points, descending, then by
+/// their labels; cut to `limit` when it is above 0.
+fn order_and_cut(series: Vec<Series>, limit: Option<i64>) -> Vec<Series> {
+    let mut out: Vec<(f64, Series)> = series
         .into_iter()
-        .map(|row| {
-            let labels: Vec<(String, String)> = group_by
-                .iter()
-                .zip(row.g)
-                .filter(|(_, value)| !value.is_empty())
-                .map(|(name, value)| (name.clone(), value))
-                .collect();
-            let points: Vec<Point> = row
-                .points
-                .into_iter()
-                .map(|(timestamp, value)| Point {
-                    timestamp,
-                    value,
-                    exemplar: None,
-                })
-                .collect();
-            let sum = points.iter().fold(0.0, |acc, p| acc + p.value);
-            (sum, Series { labels, points })
-        })
+        .map(|s| (s.points.iter().fold(0.0, |acc, p| acc + p.value), s))
         .collect();
     out.sort_by(|(a_sum, a), (b_sum, b)| {
         b_sum
@@ -297,24 +429,6 @@ pub fn series(rows: Vec<TimeSeriesRow>, group_by: &[String], limit: Option<i64>)
         out.truncate(usize::try_from(k).unwrap_or(usize::MAX));
     }
     out
-}
-
-/// Issue #826: stub.
-pub fn series_exemplars(
-    rows: Vec<TimeSeriesExemplarRow>,
-    group_by: &[String],
-    limit: Option<i64>,
-) -> Vec<Series> {
-    let rows = rows
-        .into_iter()
-        .filter(|r| r.kind == 0)
-        .map(|r| TimeSeriesRow {
-            g: r.g,
-            series_total: r.series_total,
-            points: r.points.into_iter().map(|p| (p.0, p.1)).collect(),
-        })
-        .collect();
-    series(rows, group_by, limit)
 }
 
 /// Two label sets compared pairwise, name then value, in byte order; when

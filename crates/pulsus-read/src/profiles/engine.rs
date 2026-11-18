@@ -255,53 +255,24 @@ impl ProfilesEngine {
         self.dispatch.rows(sql, &settings).await
     }
 
-    /// Issue #826: stub.
+    /// Issue #826: sends S6 with exemplars (`super::series`) and returns
+    /// one row per series and one per selected series' labels.
     pub async fn read_series_exemplars(
         &self,
         sql: &str,
     ) -> Result<Vec<TimeSeriesExemplarRow>, ProfilesReadError> {
-        Ok(self
-            .read_series(sql)
-            .await?
-            .into_iter()
-            .map(|r| TimeSeriesExemplarRow {
-                kind: 0,
-                g: r.g,
-                series_total: r.series_total,
-                points: r
-                    .points
-                    .into_iter()
-                    .map(|(t, v)| (t, v, 0, String::new(), 0, 0))
-                    .collect(),
-                fingerprint: 0,
-                labels: Vec::new(),
-            })
-            .collect())
+        let settings = read_settings(&self.config, self.log_comment.as_deref());
+        self.dispatch.rows(sql, &settings).await
     }
 
-    /// Issue #826: stub.
+    /// Issue #826: sends S8 with exemplars (`super::heatmap`) and returns
+    /// one row per series and one per selected series' labels.
     pub async fn read_heatmap_exemplars(
         &self,
         sql: &str,
     ) -> Result<Vec<HeatmapExemplarRow>, ProfilesReadError> {
-        Ok(self
-            .read_heatmap(sql)
-            .await?
-            .into_iter()
-            .map(|r| HeatmapExemplarRow {
-                kind: 0,
-                g: r.g,
-                n: r.n,
-                slots: r
-                    .slots
-                    .into_iter()
-                    .map(|(t, c)| (t, c, Vec::new()))
-                    .collect(),
-                y_min: r.y_min,
-                fingerprint: 0,
-                labels: Vec::new(),
-            })
-            .collect())
+        let settings = read_settings(&self.config, self.log_comment.as_deref());
+        self.dispatch.rows(sql, &settings).await
     }
 }
 

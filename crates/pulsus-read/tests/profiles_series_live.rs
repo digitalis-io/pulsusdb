@@ -204,12 +204,11 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        Self::in_database("pulsus_read_it_profiles_series").await
+        Self::in_database(pulsus_testkit::test_db("pulsus_read_it_profiles_series")).await
     }
 
-    /// The fixture in a database of its own, `name`.
-    async fn in_database(name: &str) -> Self {
-        let db = pulsus_testkit::test_db(name);
+    /// The fixture in the database `db`.
+    async fn in_database(db: String) -> Self {
         let bootstrap = ChClient::new(test_config("default"))
             .await
             .expect("connect (bootstrap)");
@@ -475,7 +474,10 @@ async fn exemplars_name_each_points_largest_profile() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
         return;
     }
-    let fx = Fixture::in_database("pulsus_read_it_profiles_series_exemplars").await;
+    let fx = Fixture::in_database(pulsus_testkit::test_db(
+        "pulsus_read_it_profiles_series_exemplars",
+    ))
+    .await;
     let s = fx.s;
     let client = ChClient::new(test_config(&fx.db)).await.expect("connect");
     exec(

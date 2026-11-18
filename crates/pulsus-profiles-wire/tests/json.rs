@@ -452,6 +452,8 @@ fn w11_an_exemplar_is_written_as_the_reference_writes_it() {
         value: 0,
         ..exemplar
     };
-    let text = serde_json::to_string(&zero).expect("encode");
-    assert!(!text.contains(r#""value""#), "{text}");
+    assert_eq!(
+        serde_json::to_string(&zero).expect("encode"),
+        r#"{"timestamp":"1794819625000","profileId":"00000000-0000-0000-0000-0000000000c2","spanId":"0a00000000000000","labels":[{"name":"pod","value":"e"}],"traceId":"00000000000000000000000000000002"}"#
+    );
 }

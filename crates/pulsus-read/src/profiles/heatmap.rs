@@ -5,6 +5,11 @@
 //!
 //! `INDIVIDUAL` reads each profile's total from `profile_entries`; `SPAN`
 //! reads each profile's samples of one span from `profile_samples`, summed.
+//!
+//! Issue #826: with exemplars, each value carries its ids until the window
+//! has the range, each cell's largest value is its exemplar, and a second
+//! `UNION ALL` branch returns each selected series' labels;
+//! [`heatmap_exemplars`] joins them.
 
 use pulsus_model::Tenant;
 use serde::{Deserialize, Serialize};
@@ -36,7 +41,7 @@ pub struct HeatmapRequest<'a> {
     pub query_type: i32,
     /// The request's `limit`, `None` when absent.
     pub limit: Option<i64>,
-    /// Issue #826: stub.
+    /// Issue #826: exemplars of the query type, one per cell.
     pub exemplars: bool,
 }
 
@@ -51,13 +56,20 @@ pub struct HeatmapRow {
     pub y_min: Vec<f64>,
 }
 
-/// Issue #826: stub.
+/// Issue #826: one cell's exemplar as S8 returns it: `(total, time ms,
+/// profile id, span id, trace id in hex, fingerprint)`.
+pub type ExemplarTuple = (i64, i64, String, u64, String, u128);
+
+/// Issue #826: one row of S8 with exemplars. `kind` 0 is a series as
+/// [`HeatmapRow`], each slot also carrying its cells' exemplars in bucket
+/// order; `kind` 1 is one selected series' `fingerprint` and its
+/// stored `labels` less the `group_by` names.
 #[derive(Debug, Clone, PartialEq, clickhouse::Row, Serialize, Deserialize)]
 pub struct HeatmapExemplarRow {
     pub kind: u8,
     pub g: Vec<String>,
     pub n: u64,
-    pub slots: Vec<(i64, Vec<u32>, Vec<(i64, i64, String, u64, String, u128)>)>,
+    pub slots: Vec<(i64, Vec<u32>, Vec<ExemplarTuple>)>,
     pub y_min: Vec<f64>,
     pub fingerprint: u128,
     pub labels: Vec<(String, String)>,
@@ -69,6 +81,7 @@ pub struct Slot {
     pub timestamp: i64,
     pub y_min: Vec<f64>,
     pub counts: Vec<i32>,
+    /// Issue #826: one per non-empty bucket, lowest bucket first.
     pub exemplars: Vec<Exemplar>,
 }
 
@@ -154,7 +167,7 @@ pub fn plan(
     let source = if span {
         format!(
             "FROM (
-      SELECT fingerprint, timestamp_ns, sum(value) AS total
+      SELECT fingerprint, timestamp_ns, sum(value) AS total{ids}
       FROM {samples}
       WHERE {tenant_term} AND type_id = {type_id}{service_terms}
         AND fingerprint IN ({series})
@@ -163,6 +176,11 @@ pub fn plan(
       GROUP BY fingerprint, timestamp_ns, profile_id, trace_id, span_id
     ) AS e{join}",
             samples = config.samples_table,
+            ids = if req.exemplars {
+                ", span_id, trace_id"
+            } else {
+                ""
+            },
         )
     } else {
         format!(
@@ -189,6 +207,45 @@ pub fn plan(
         Some(n) if n > 0 => ("g".to_string(), format!("\nLIMIT {}", n.saturating_add(1))),
         _ => ("g".to_string(), String::new()),
     };
+    if req.exemplars {
+        let (xs, exemplar) = if span {
+            (
+                "arraySort(x -> (-x.1, x.2, x.3, x.4), groupArray((e.total, e.timestamp_ns, e.span_id, e.trace_id, e.fingerprint)))",
+                "(x.1, intDiv(x.2, 1000000), '', x.3, lower(hex(x.4)), x.5)",
+            )
+        } else {
+            (
+                "arraySort(x -> (-x.1, x.2, x.3), groupArray((e.total, e.timestamp_ns, e.profile_id, e.fingerprint)))",
+                "(x.1, intDiv(x.2, 1000000), toString(x.3), toUInt64(0), '', x.4)",
+            )
+        };
+        let labels =
+            series::labels_branch(tenant, w, series_table, &matchers, req.group_by, "[], ");
+        return Ok(Some(format!(
+            "SELECT 0 AS kind, g, sum(length(b)) AS n, arraySort(groupArray((ts, arrayMap(k -> toUInt32(countEqual(b, k)), range(20)), arrayReverse(arrayMap((x, c) -> {exemplar}, arrayFilter((x, c, p) -> c != p, xs, b, arrayPopBack(arrayPushFront(b, -1))), arrayFilter((c, p) -> c != p, b, arrayPopBack(arrayPushFront(b, -1)))))))) AS slots,
+       any(arrayMap(i -> toFloat64(lo + toInt64(i * w)), range(20))) AS y_min, toUInt128(0) AS fingerprint, CAST([] AS Array(Tuple(String, String))) AS labels
+FROM (
+  SELECT g, ts, lo, w, xs,
+         arrayMap(v -> least(19, toInt64((v - lo + 1) / w)), xs.1) AS b0,
+         arrayMap((c, v) -> c - (toInt64(c * w) > v - lo), b0, xs.1) AS b1,
+         arrayMap((c, v) -> c + (c < 19 AND toInt64((c + 1) * w) <= v - lo), b1, xs.1) AS b
+  FROM (
+    SELECT g, ts, xs, lo, toFloat64(if(hi = lo, 1, hi - lo)) / 20 AS w
+    FROM (
+      SELECT g, ts, xs, min(v_min) OVER () AS lo, greatest(max(v_max) OVER (), 0) AS hi
+      FROM (
+        SELECT {g} AS g, {start} + intDiv(intDiv(e.timestamp_ns, 1000000) - {start} + {step_minus_1}, {step}) * {step} AS ts, {xs} AS xs, min(e.total) AS v_min, max(e.total) AS v_max
+        {source}
+        GROUP BY g, ts
+      )
+    )
+  )
+)
+GROUP BY g
+ORDER BY n DESC, {order}{limit}{labels}",
+            step_minus_1 = step - 1,
+        )));
+    }
     Ok(Some(format!(
         "SELECT g, sum(length(b)) AS n, arraySort(groupArray((ts, arrayMap(k -> toUInt32(countEqual(b, k)), range(20))))) AS slots,
        any(arrayMap(i -> toFloat64(lo + toInt64(i * w)), range(20))) AS y_min
@@ -221,32 +278,92 @@ ORDER BY n DESC, {order}{limit}",
 /// value counts, descending, then by their labels, and cut to `limit`;
 /// otherwise ordered by their labels.
 pub fn heatmap(rows: Vec<HeatmapRow>, group_by: &[String], limit: Option<i64>) -> Vec<Series> {
-    let mut out: Vec<(u64, Series)> = rows
+    order_and_cut(
+        rows.into_iter()
+            .map(|row| {
+                let y_min = row.y_min;
+                let slots = row
+                    .slots
+                    .into_iter()
+                    .map(|(timestamp, counts)| Slot {
+                        timestamp,
+                        y_min: y_min.clone(),
+                        counts: slot_counts(counts),
+                        exemplars: Vec::new(),
+                    })
+                    .collect();
+                let labels = series::group_labels(group_by, row.g);
+                (row.n, Series { labels, slots })
+            })
+            .collect(),
+        limit,
+    )
+}
+
+/// Issue #826: S8's exemplar rows as [`heatmap`] answers them, each slot
+/// carrying its cells' exemplars, labelled with the `kind` 1 row of their
+/// fingerprint: a span id 0 as `""`, another as 16 hex digits of its
+/// bytes little-endian; an all-zero trace id as `""`.
+pub fn heatmap_exemplars(
+    rows: Vec<HeatmapExemplarRow>,
+    group_by: &[String],
+    limit: Option<i64>,
+) -> Vec<Series> {
+    let (rows, labels) = series::split_labels(rows, |r| r.kind == 0, |r| (r.fingerprint, r.labels));
+    order_and_cut(
+        rows.into_iter()
+            .map(|row| {
+                let y_min = row.y_min;
+                let slots = row
+                    .slots
+                    .into_iter()
+                    .map(|(timestamp, counts, exemplars)| Slot {
+                        timestamp,
+                        y_min: y_min.clone(),
+                        counts: slot_counts(counts),
+                        exemplars: exemplars
+                            .into_iter()
+                            .map(|(total, at, profile_id, span, trace, fp)| Exemplar {
+                                timestamp: at,
+                                profile_id,
+                                span_id: if span == 0 {
+                                    String::new()
+                                } else {
+                                    span.to_le_bytes()
+                                        .iter()
+                                        .map(|b| format!("{b:02x}"))
+                                        .collect()
+                                },
+                                trace_id: if trace.bytes().all(|b| b == b'0') {
+                                    String::new()
+                                } else {
+                                    trace
+                                },
+                                value: total,
+                                labels: labels.get(&fp).cloned().unwrap_or_default(),
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                let labels = series::group_labels(group_by, row.g);
+                (row.n, Series { labels, slots })
+            })
+            .collect(),
+        limit,
+    )
+}
+
+fn slot_counts(counts: Vec<u32>) -> Vec<i32> {
+    counts
         .into_iter()
-        .map(|row| {
-            let labels: Vec<(String, String)> = group_by
-                .iter()
-                .zip(row.g)
-                .filter(|(_, value)| !value.is_empty())
-                .map(|(name, value)| (name.clone(), value))
-                .collect();
-            let y_min = row.y_min;
-            let slots: Vec<Slot> = row
-                .slots
-                .into_iter()
-                .map(|(timestamp, counts)| Slot {
-                    timestamp,
-                    y_min: y_min.clone(),
-                    counts: counts
-                        .into_iter()
-                        .map(|c| i32::try_from(c).unwrap_or(i32::MAX))
-                        .collect(),
-                    exemplars: Vec::new(),
-                })
-                .collect();
-            (row.n, Series { labels, slots })
-        })
-        .collect();
+        .map(|c| i32::try_from(c).unwrap_or(i32::MAX))
+        .collect()
+}
+
+/// With more series than a positive `limit`, ordered by their value
+/// counts, descending, then by their labels, and cut to `limit`; otherwise
+/// ordered by their labels.
+fn order_and_cut(mut out: Vec<(u64, Series)>, limit: Option<i64>) -> Vec<Series> {
     let cut = limit
         .filter(|k| *k > 0)
         .map(|k| usize::try_from(k).unwrap_or(usize::MAX))
@@ -262,25 +379,6 @@ pub fn heatmap(rows: Vec<HeatmapRow>, group_by: &[String], limit: Option<i64>) -
         None => out.sort_by(|(_, a), (_, b)| series::compare_label_pairs(&a.labels, &b.labels)),
     }
     out.into_iter().map(|(_, s)| s).collect()
-}
-
-/// Issue #826: stub.
-pub fn heatmap_exemplars(
-    rows: Vec<HeatmapExemplarRow>,
-    group_by: &[String],
-    limit: Option<i64>,
-) -> Vec<Series> {
-    let rows = rows
-        .into_iter()
-        .filter(|r| r.kind == 0)
-        .map(|r| HeatmapRow {
-            g: r.g,
-            n: r.n,
-            slots: r.slots.into_iter().map(|s| (s.0, s.1)).collect(),
-            y_min: r.y_min,
-        })
-        .collect();
-    heatmap(rows, group_by, limit)
 }
 
 #[cfg(test)]

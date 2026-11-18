@@ -214,8 +214,8 @@ pub struct Series {
     pub points: Vec<Point>,
 }
 
-/// Issue #824: one point of a time series. Tag 4, exemplars, is #826's;
-/// `annotations` is always empty: no ingest path stores one.
+/// Issue #824: one point of a time series; `annotations` is always empty:
+/// no ingest path stores one. Issue #826: `exemplars`.
 #[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Point {
@@ -236,26 +236,52 @@ pub struct Point {
     #[prost(message, repeated, tag = "3")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub annotations: Vec<ProfileAnnotation>,
-    #[prost(message, repeated, tag = "14")]
+    #[prost(message, repeated, tag = "4")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exemplars: Vec<Exemplar>,
 }
 
-/// Issue #826: stub.
+/// Issue #826: one profile that contributed to a point or a heatmap cell.
 #[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Exemplar {
-    #[prost(int64, tag = "11")]
+    #[prost(int64, tag = "1")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub timestamp: i64,
-    #[prost(string, tag = "12")]
+    #[prost(string, tag = "2")]
+    #[serde(
+        rename = "profileId",
+        alias = "profile_id",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub profile_id: String,
-    #[prost(string, tag = "13")]
+    #[prost(string, tag = "3")]
+    #[serde(
+        rename = "spanId",
+        alias = "span_id",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub span_id: String,
-    #[prost(int64, tag = "14")]
+    #[prost(int64, tag = "4")]
+    #[serde(
+        serialize_with = "crate::int64::ser",
+        deserialize_with = "crate::int64::de",
+        skip_serializing_if = "crate::int64::is_zero"
+    )]
     pub value: i64,
-    #[prost(message, repeated, tag = "15")]
+    #[prost(message, repeated, tag = "5")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<LabelPair>,
-    #[prost(string, tag = "16")]
+    #[prost(string, tag = "6")]
+    #[serde(
+        rename = "traceId",
+        alias = "trace_id",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub trace_id: String,
 }
 
@@ -334,7 +360,7 @@ pub struct HeatmapSeries {
 }
 
 /// Issue #825: one slot of a heatmap series — its right edge, the 20
-/// bucket starts and each bucket's count. Tag 4, exemplars, is #826's.
+/// bucket starts and each bucket's count. Issue #826: `exemplars`.
 #[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HeatmapSlot {
@@ -357,7 +383,7 @@ pub struct HeatmapSlot {
     #[prost(int32, repeated, tag = "3")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub counts: Vec<i32>,
-    #[prost(message, repeated, tag = "14")]
+    #[prost(message, repeated, tag = "4")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exemplars: Vec<Exemplar>,
 }

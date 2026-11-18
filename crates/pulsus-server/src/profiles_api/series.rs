@@ -6,6 +6,9 @@
 //! limit here. In the order: the tenant, the codec and the body, the
 //! planner's checks (the window, the type, the selector, then the step),
 //! then the exemplar type.
+//!
+//! Issue #826: `EXEMPLAR_TYPE_INDIVIDUAL` names each point's largest
+//! profile, in the same one statement.
 
 use axum::body::Body;
 use axum::extract::{RawQuery, State};
@@ -14,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use pulsus_model::Tenant;
 use pulsus_profiles_wire::querier_v1::{SelectSeriesRequest, SelectSeriesResponse};
 use pulsus_profiles_wire::types_v1::{
-    ExemplarType, LabelPair, Point, Series, TimeSeriesAggregationType,
+    Exemplar, ExemplarType, LabelPair, Point, Series, TimeSeriesAggregationType,
 };
 use pulsus_read::profiles::ProfilesReadConfig;
 use pulsus_read::profiles::series::{self, SeriesRequest};
@@ -26,14 +29,10 @@ use super::connect::{Code, Codec, ConnectError};
 use super::engine::with_engine;
 use super::routes::{all, finish, now_ms, prelude, split_query, tenant_of, time_param};
 
-/// The exemplar types served: none yet. Individual exemplars are #826's.
+/// The exemplar types served: unspecified, `NONE` and `INDIVIDUAL`.
 fn check_exemplar_type(v: i32) -> Result<(), ConnectError> {
     match ExemplarType::try_from(v) {
-        Ok(ExemplarType::Unspecified | ExemplarType::None) => Ok(()),
-        Ok(ExemplarType::Individual) => Err(ConnectError::new(
-            Code::Unimplemented,
-            "exemplars are not served yet",
-        )),
+        Ok(ExemplarType::Unspecified | ExemplarType::None | ExemplarType::Individual) => Ok(()),
         Ok(ExemplarType::Span) => Err(ConnectError::new(
             Code::Unimplemented,
             "exemplar type span is not implemented",
@@ -67,13 +66,24 @@ async fn time_series(
         average: msg.aggregation == Some(TimeSeriesAggregationType::Average as i32),
         call_site: &call_site,
         limit: msg.limit,
-        exemplars: false,
+        exemplars: msg.exemplar_type == ExemplarType::Individual as i32,
     };
     let Some(sql) = series::plan(tenant, &config, &req, now_ms())? else {
         return Ok(SelectSeriesResponse::default());
     };
     check_exemplar_type(msg.exemplar_type)?;
     let sql = sql.as_str();
+    if req.exemplars {
+        let rows = with_engine(state, tenant, |engine| async move {
+            Ok(engine.read_series_exemplars(sql).await?)
+        })
+        .await?;
+        return Ok(wire(series::series_exemplars(
+            rows,
+            &msg.group_by,
+            msg.limit,
+        )));
+    }
     let rows = with_engine(state, tenant, |engine| async move {
         Ok(engine.read_series(sql).await?)
     })
@@ -98,11 +108,27 @@ fn wire(series: Vec<series::Series>) -> SelectSeriesResponse {
                         value: p.value,
                         timestamp: p.timestamp,
                         annotations: Vec::new(),
-                        exemplars: Vec::new(),
+                        exemplars: p.exemplar.into_iter().map(exemplar).collect(),
                     })
                     .collect(),
             })
             .collect(),
+    }
+}
+
+/// Issue #826: an exemplar as `types.v1.Exemplar`.
+pub(super) fn exemplar(e: series::Exemplar) -> Exemplar {
+    Exemplar {
+        timestamp: e.timestamp,
+        profile_id: e.profile_id,
+        span_id: e.span_id,
+        value: e.value,
+        labels: e
+            .labels
+            .into_iter()
+            .map(|(name, value)| LabelPair { name, value })
+            .collect(),
+        trace_id: e.trace_id,
     }
 }
 
