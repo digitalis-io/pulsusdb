@@ -71,7 +71,7 @@ async fn flame_graph_diff(
         now_ms(),
     )?
     else {
-        return Ok(wire(flamegraph_diff::flame_graph_diff(&[], 0)?));
+        return Ok(wire(flamegraph_diff::flame_graph_diff(&[], 0, 0)?));
     };
     let sql = planned.sql.as_str();
     let rows = with_engine(state, tenant, |engine| async move {
@@ -80,7 +80,8 @@ async fn flame_graph_diff(
     .await?;
     Ok(wire(flamegraph_diff::flame_graph_diff(
         &rows,
-        planned.max_nodes,
+        planned.left_max_nodes,
+        planned.right_max_nodes,
     )?))
 }
 

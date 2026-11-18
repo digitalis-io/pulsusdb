@@ -169,6 +169,9 @@ pub struct SelectMergeStacktracesResponse {
     #[prost(message, optional, tag = "1")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flamegraph: Option<FlameGraph>,
+    #[prost(bytes = "vec", tag = "15")]
+    #[serde(skip)]
+    pub tree: Vec<u8>,
 }
 
 /// A flame graph: the names, and per level the nodes as

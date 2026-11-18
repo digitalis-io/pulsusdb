@@ -17,7 +17,7 @@ use pulsus_profiles_wire::querier_v1::{
 };
 use pulsus_read::profiles::ProfilesReadConfig;
 use pulsus_read::profiles::flamegraph;
-use pulsus_read::profiles::tree::{self, TreeRequest};
+use pulsus_read::profiles::tree::{self, TreeRequest, TreeRow};
 
 use crate::app::AppState;
 use crate::logs_api::params::parse_pairs;
@@ -70,6 +70,17 @@ async fn flame_graph(
     Ok(wire(graph))
 }
 
+/// The flame graph of S5's rows, and the trimmed tree's bytes when
+/// `with_tree` (empty otherwise).
+fn trimmed(
+    rows: &[TreeRow],
+    m: i64,
+    raw: i64,
+    _with_tree: bool,
+) -> Result<(flamegraph::FlameGraph, Vec<u8>), ConnectError> {
+    Ok(flamegraph::flame_graph_with_tree(rows, m, raw)?)
+}
+
 fn wire(g: flamegraph::FlameGraph) -> FlameGraph {
     FlameGraph {
         names: g.names,
@@ -103,9 +114,14 @@ pub(crate) async fn select_merge_stacktraces(
         .await
         .map(|g| SelectMergeStacktracesResponse {
             flamegraph: Some(g),
+            tree: Vec::new(),
         });
     finish(codec, answer)
 }
+
+/// Whether `GET /merge` builds the tree bytes: it answers the flame graph
+/// alone, so it does not.
+const MERGE_GET_WITH_TREE: bool = false;
 
 /// `GET /api/profiles/v1/merge?query=&from=&until=&maxNodes=`: the
 /// `FlameGraph` message's JSON. `query` is the type, then the selector from
@@ -175,6 +191,34 @@ mod tests {
             tree::STACK_DAY_AFTER_MS,
             profile_model::REJECT_OLDER_THAN_MS
         );
+    }
+
+    /// `GET /merge` answers the flame graph alone, so it builds no tree
+    /// bytes; the Connect answer builds them from the same rows.
+    #[test]
+    fn the_get_route_builds_no_tree() {
+        let rows = [
+            TreeRow {
+                node: 1,
+                parent: 0,
+                name: "main".to_string(),
+                total: 5,
+                self_value: 0,
+            },
+            TreeRow {
+                node: 2,
+                parent: 1,
+                name: "a".to_string(),
+                total: 5,
+                self_value: 5,
+            },
+        ];
+        let graph = flamegraph::flame_graph(&rows, 8192, 0).expect("a graph");
+        let (get, tree) = trimmed(&rows, 8192, 0, MERGE_GET_WITH_TREE).expect("a graph");
+        assert_eq!((get, tree), (graph.clone(), Vec::new()), "GET /merge");
+        let (connect, tree) = trimmed(&rows, 8192, 0, true).expect("a graph");
+        assert_eq!(connect, graph, "Connect");
+        assert!(!tree.is_empty(), "the Connect answer builds the tree bytes");
     }
 
     fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {

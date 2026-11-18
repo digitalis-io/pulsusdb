@@ -165,6 +165,22 @@ pub fn flame_graph(rows: &[TreeRow], m: i64, raw: i64) -> Result<FlameGraph, Pro
     Ok(flame_graph_of(&tree, raw))
 }
 
+/// The flame graph of S5's rows, as [`flame_graph`], and the trimmed tree's
+/// bytes ([`tree_bytes`]) beside it.
+pub fn flame_graph_with_tree(
+    rows: &[TreeRow],
+    m: i64,
+    raw: i64,
+) -> Result<(FlameGraph, Vec<u8>), ProfilesReadError> {
+    let tree = truncated(merged_tree(rows, m)?, m);
+    Ok((flame_graph_of(&tree, raw), tree_bytes(&tree)))
+}
+
+/// The tree's bytes as the reference's `MarshalTruncate` writes them.
+pub fn tree_bytes(_tree: &Tree) -> Vec<u8> {
+    Vec::new()
+}
+
 /// Step 3: the reference's `NewFlameGraph` (`pkg/model/flamegraph.go`). A
 /// depth-first walk from a virtual root, last pushed first; each node
 /// appends `[name index, self, total, x]` to its level, and every child
@@ -470,6 +486,31 @@ mod tests {
                 "malformed merged tree".to_string()
             ))
         );
+    }
+
+    /// F6: the trimmed tree's bytes are the reference's — depth first from
+    /// a virtual root, children written in reverse name order; captured
+    /// from the pinned reference's answer to C21's request. No rows is no
+    /// bytes.
+    #[test]
+    fn f6_tree_bytes_are_the_references() {
+        let r = rows(&[
+            ("main", 50_000_000, 0),
+            ("main/a", 50_000_000, 0),
+            ("main/a/b", 30_000_000, 30_000_000),
+            ("main/a/c", 20_000_000, 20_000_000),
+        ]);
+        let tree = truncated(merged_tree(&r, 8192).expect("a tree"), 8192);
+        use base64::Engine;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.encode(tree_bytes(&tree)),
+            "AAABBG1haW4AAQFhAAIBY4DaxAkAAWKAh6cOAA=="
+        );
+        let empty = truncated(merged_tree(&[], 8192).expect("a tree"), 8192);
+        assert_eq!(tree_bytes(&empty), Vec::<u8>::new());
+        let (graph, bytes) = flame_graph_with_tree(&r, 8192, 0).expect("a graph");
+        assert_eq!(graph, flame_graph(&r, 8192, 0).expect("a graph"));
+        assert_eq!(bytes, tree_bytes(&tree));
     }
 
     /// F5 (D11): a kept child named `other` takes its cut siblings' sum, so

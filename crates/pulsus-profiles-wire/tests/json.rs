@@ -5,7 +5,7 @@
 //! an enum by its name or its number. W6 and W7 (issue #824): the time
 //! series' messages, a `double` written as the reference writes it. W8
 //! (issue #827): the diff's messages. W9 and W10 (issue #825): the
-//! heatmap's messages.
+//! heatmap's messages. W11 (#823 part B): the flame graph's tree bytes.
 
 use pulsus_profiles_wire::querier_v1::{
     DiffRequest, DiffResponse, FlameGraph, FlameGraphDiff, Level, ProfileFormat,
@@ -107,6 +107,7 @@ fn w4_the_flame_graph_is_written_as_the_reference_writes_it() {
             total: 32,
             max_self: 17,
         }),
+        tree: Vec::new(),
     };
     assert_eq!(
         serde_json::to_string(&row1).expect("encode"),
@@ -119,11 +120,56 @@ fn w4_the_flame_graph_is_written_as_the_reference_writes_it() {
             total: 0,
             max_self: 0,
         }),
+        tree: Vec::new(),
     };
     assert_eq!(
         serde_json::to_string(&empty).expect("encode"),
         r#"{"flamegraph":{"names":["total"],"levels":[{"values":["0","0","0","0"]}]}}"#
     );
+}
+
+/// W11 (#823 part B): the tree bytes beside the flame graph, field 2, as
+/// standard padded base64 in JSON; no bytes, no key.
+#[test]
+fn w11_the_tree_bytes_are_written_as_the_reference_writes_them() {
+    use prost::Message;
+    let graph = FlameGraph {
+        names: vec!["total".to_string()],
+        levels: vec![level(&[0, 0, 0, 0])],
+        total: 0,
+        max_self: 0,
+    };
+    let with = SelectMergeStacktracesResponse {
+        flamegraph: Some(graph.clone()),
+        tree: vec![0, 0, 1],
+    };
+    let text = serde_json::to_string(&with).expect("encode");
+    assert_eq!(
+        text,
+        r#"{"flamegraph":{"names":["total"],"levels":[{"values":["0","0","0","0"]}]},"tree":"AAAB"}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<SelectMergeStacktracesResponse>(&text).expect("decode"),
+        with
+    );
+    let without = SelectMergeStacktracesResponse {
+        flamegraph: Some(graph.clone()),
+        tree: Vec::new(),
+    };
+    assert!(
+        !serde_json::to_string(&without)
+            .expect("encode")
+            .contains("tree"),
+        "an empty tree is written"
+    );
+    let graph_bytes = SelectMergeStacktracesResponse {
+        flamegraph: Some(graph),
+        tree: Vec::new(),
+    }
+    .encode_to_vec();
+    let mut want = graph_bytes.clone();
+    want.extend_from_slice(&[0x12, 3, 0, 0, 1]);
+    assert_eq!(with.encode_to_vec(), want, "tree is field 2");
 }
 
 /// W5: the request reads either name, `maxNodes` as a number or a string,
