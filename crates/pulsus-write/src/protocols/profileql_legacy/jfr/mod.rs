@@ -621,10 +621,10 @@ fn decompress(bytes: &[u8]) -> Result<Cow<'_, [u8]>, String> {
 pub const LABELS_BYTES_PER_PART_BYTE: u64 = 32;
 
 /// The form's `jfr` part and its `labels` part, not yet decoded.
-fn read_form<'b>(
-    content_type: &str,
-    body: &'b [u8],
-) -> Result<(Cow<'b, [u8]>, Option<Cow<'b, [u8]>>), String> {
+type FormParts<'b> = (Cow<'b, [u8]>, Option<Cow<'b, [u8]>>);
+
+/// The form's `jfr` part and its `labels` part, not yet decoded.
+fn read_form<'b>(content_type: &str, body: &'b [u8]) -> Result<FormParts<'b>, String> {
     let boundary = boundary_of(content_type).ok_or("malformed multipart content type header")?;
     let parts = file_parts(body, &boundary)?;
     let field = |name: &str| {
